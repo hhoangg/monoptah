@@ -159,6 +159,22 @@ fn operator_is_refused_provider_file_removal_but_may_keep_them() {
 }
 
 #[test]
+fn operator_may_archive_cloud_sessions_keeping_or_stopping_but_not_deleting() {
+    for cloud in ["keep", "stop"] {
+        assert!(
+            validate_operator("sessions.archive", &json!({"sessionId":1,"cloud":cloud})).is_ok()
+        );
+    }
+    assert_eq!(
+        validate_operator("sessions.archive", &json!({"sessionId":1,"cloud":"delete"}))
+            .unwrap_err(),
+        "Deleting a cloud instance is only available to a Mono"
+    );
+    assert!(validate_operator("sessions.archive", &json!({"sessionId":1,"cloud":"x"})).is_err());
+    assert!(validate_operator("sessions.archive", &json!({"sessionId":1})).is_ok());
+}
+
+#[test]
 fn conversation_pages_keep_source_cursors_prose_boundaries_and_character_caps() {
     let blocks = vec![
         json!({"id":"u1","role":"user","text":"/operator First"}),
@@ -381,29 +397,60 @@ fn operator_sessions_cannot_use_today_actions() {
 }
 
 #[test]
-fn operator_may_use_codespaces_except_delete() {
+fn operator_may_use_cloud_actions_except_delete() {
     for (action, input) in [
-        ("codespaces.list", json!({})),
-        ("codespaces.secretsStatus", json!({})),
-        ("codespaces.create", json!({"branch":"main"})),
-        ("codespaces.stop", json!({"name":"octo-abc"})),
+        ("cloud.list", json!({})),
+        ("cloud.status", json!({"kind":"sandbox"})),
+        ("cloud.create", json!({"kind":"codespace","branch":"main"})),
+        (
+            "cloud.stop",
+            json!({"kind":"codespace","instance":"octo-abc"}),
+        ),
+        ("cloud.stop", json!({"sessionId":-5})),
+        ("cloud.resume", json!({"kind":"sandbox","instance":"box-1"})),
         (
             "sessions.start",
-            json!({"prompt":"x","target":{"codespace":"new"}}),
+            json!({"prompt":"x","target":{"kind":"codespace","instance":"new"}}),
+        ),
+        (
+            "sessions.start",
+            json!({"prompt":"x","target":{"kind":"sandbox","instance":{"session":-5}}}),
         ),
     ] {
         assert!(validate_operator(action, &input).is_ok(), "{action}");
     }
-    assert_eq!(
-        validate_operator("codespaces.delete", &json!({"name":"octo-abc"})).unwrap_err(),
-        "Deleting a codespace is only available to a Mono"
-    );
+    for input in [
+        json!({"kind":"codespace","instance":"octo-abc"}),
+        json!({"sessionId":-5}),
+    ] {
+        assert_eq!(
+            validate_operator("cloud.delete", &input).unwrap_err(),
+            "Deleting a cloud instance is only available to a Mono"
+        );
+    }
+    // The codespace-only actions no longer exist.
+    for action in [
+        "codespaces.list",
+        "codespaces.create",
+        "codespaces.stop",
+        "codespaces.delete",
+        "codespaces.secretsStatus",
+    ] {
+        assert!(
+            validate_operator(action, &json!({}))
+                .unwrap_err()
+                .starts_with("Unknown Operator action"),
+            "{action}"
+        );
+    }
     // Invalid input is still refused for the allowed ones.
-    assert!(validate_operator("codespaces.stop", &json!({"name":"a b"})).is_err());
+    assert!(
+        validate_operator("cloud.stop", &json!({"kind":"codespace","instance":"a b"})).is_err()
+    );
     // A completion notification stays Mono-only for cloud sessions too.
     assert!(validate_operator(
         "sessions.start",
-        &json!({"prompt":"x","notifyOnComplete":true,"target":{"codespace":"new"}})
+        &json!({"prompt":"x","notifyOnComplete":true,"target":{"kind":"codespace","instance":"new"}})
     )
     .is_err());
 }

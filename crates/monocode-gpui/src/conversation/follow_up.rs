@@ -59,6 +59,16 @@ impl Conversation {
     pub(super) fn save_follow_ups(&mut self, cx: &mut Context<Self>) {
         self.follow_ups.state.revision += 1;
         let mut snapshot = self.follow_ups.state.clone();
+        // The prompt held for a cloud create belongs to the session being created, never to
+        // this local draft: it is shown but not stored, and put back after the save.
+        let held = self
+            .cloud_draft
+            .as_ref()
+            .and_then(|draft| draft.queued.clone())
+            .and_then(|id| {
+                let at = snapshot.messages.iter().position(|m| m.id == id)?;
+                Some((at, snapshot.messages.remove(at)))
+            });
         let revision = snapshot.revision;
         let store = self.store.clone();
         let id = self.summary.id;
@@ -75,6 +85,23 @@ impl Conversation {
                     Ok(snapshot) => {
                         if this.follow_ups.state.revision == revision {
                             this.follow_ups.state = snapshot;
+                            // Only while the create still holds it: once it finished the prompt
+                            // belongs to the new session (or the composer), not this queue.
+                            if let Some((at, message)) = held
+                                && this
+                                    .cloud_draft
+                                    .as_ref()
+                                    .is_some_and(|d| d.queued.as_deref() == Some(&message.id))
+                                && !this
+                                    .follow_ups
+                                    .state
+                                    .messages
+                                    .iter()
+                                    .any(|m| m.id == message.id)
+                            {
+                                let at = at.min(this.follow_ups.state.messages.len());
+                                this.follow_ups.state.messages.insert(at, message);
+                            }
                             let draft = this.follow_ups.state.draft.clone();
                             this.transcript
                                 .update(cx, |view, cx| view.set_saved_draft(draft, cx));
@@ -374,6 +401,10 @@ impl Conversation {
                 }
             }
         } else {
+            if self.is_remote() {
+                self.drain_remote_follow_up(message, cx);
+                return;
+            }
             if self.settings.new_worktree && self.settings.worktree_cwd.is_none() {
                 self.prepare_worktree(cx);
                 return;
@@ -418,12 +449,24 @@ impl Conversation {
             self.settings.orchestrator,
         ) = previous;
     }
-    fn resume_queue(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn resume_queue(&mut self, cx: &mut Context<Self>) {
         if self.stopping {
             self.defer_history_action(|this, cx| this.resume_queue(cx), cx);
             return;
         }
         if self.busy || !self.follow_ups.state.paused || self.follow_ups.state.messages.is_empty() {
+            return;
+        }
+        if self.is_remote() {
+            // The cloud agent keeps its own history: a synthetic "continue" prompt would be
+            // sent to it as a real message. Retry just releases the queue.
+            self.follow_ups.state.paused = false;
+            for message in &mut self.follow_ups.state.messages {
+                message.error = None;
+            }
+            self.save_follow_ups(cx);
+            self.pump_follow_ups(cx);
+            cx.notify();
             return;
         }
         // Resume the interrupted provider turn before releasing its outbox,
@@ -550,6 +593,7 @@ impl Conversation {
             .iter()
             .any(|m| m.error.is_some());
         let card = composer_shelf::card("message-queue-card", self.classic_layout)
+            .debug_selector(|| "message-queue-card".into())
             .when(self.follow_ups.state.paused && !self.follow_ups.resuming, |d| d.child(
                 div().h(px(28.)).flex().items_center().gap_2().border_b_1().border_color(content(0.1))
                     .child(icon("queue-pause", 14.))
@@ -569,7 +613,7 @@ impl Conversation {
                     } else {
                         let (steer, edit, remove) = (id.clone(), id.clone(), id);
                         row.child(div().flex_1().min_w_0().py_1().child(div().id("queued-message-text").role(Role::Label).aria_label(message.label()).truncate().text_color(content(0.75)).child(message.label())).when_some(message.error.clone(), |d, error| d.child(div().id("queue-error").role(Role::Alert).text_color(gpui::rgb(0xf87171)).child(error))))
-                            .when(Kind::from_id(&self.summary.provider).can_steer(), |d| d.child(queue_button("queue-steer", "Steer queued message", "queue-steer").w_auto().px_2().gap(px(6.)).opacity(if sending { 0.4 } else { 1. }).child("Steer").on_click(cx.listener(move |this, _, _, cx| {
+                            .when(Kind::from_id(&self.summary.provider).can_steer() && !self.is_remote(), |d| d.child(queue_button("queue-steer", "Steer queued message", "queue-steer").w_auto().px_2().gap(px(6.)).opacity(if sending { 0.4 } else { 1. }).child("Steer").on_click(cx.listener(move |this, _, _, cx| {
                                 if !sending && let Some(message) = this.follow_ups.state.messages.iter_mut().find(|m| m.id == steer) {
                                     if !message.can_steer() && this.busy { return; }
                                     message.steer = true;

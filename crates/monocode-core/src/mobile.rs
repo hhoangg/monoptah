@@ -3,6 +3,7 @@
 //! app answers [`host::Event`]s from its own state.
 pub mod catalog;
 pub mod host;
+pub(crate) mod identity_store;
 pub mod notify;
 mod router;
 pub mod watch;

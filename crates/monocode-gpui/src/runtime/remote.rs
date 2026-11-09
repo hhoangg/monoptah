@@ -537,7 +537,7 @@ pub(crate) fn run_with_client(
             // and its host before anything is dispatched. This closure runs on a
             // background executor thread (conversation.rs spawns it there), so
             // blocking for the boot is fine. Attaching never wakes.
-            if binding.project.codespace.is_some() {
+            if binding.project.cloud().is_some() {
                 monocode_core::cloud_sessions::require_claude(&binding.summary.provider)?;
                 // Stop cancels the wake; the status line shows it only when a
                 // reconnect actually starts (a connected codespace is instant).
@@ -647,6 +647,13 @@ pub(crate) fn run_with_client(
             binding.summary.has_messages = true;
             binding.summary.updated_at = monocode_core::time::now_ms();
             journal(&store, &binding)?;
+            // The command is durable now: a queued message that started this turn may leave
+            // the send queue (same receipt as the local runtime).
+            if let Some(id) = settings.mono_message_id.clone() {
+                let mut receipt = update("Working…", false);
+                receipt.delivered = Some(id);
+                let _ = tx.send_blocking(receipt);
+            }
             let descriptor = client.request(&machine.id, "environment.describe", json!({}))?;
             if !descriptor["providers"].as_array().is_some_and(|providers| {
                 providers
@@ -814,10 +821,14 @@ pub(crate) fn run_with_client(
         // A stopped or unreachable codespace is a state of the cloud session,
         // not a failure: say so plainly instead of surfacing the transport error.
         let error = if monocode_core::cloud_sessions::is_not_connected(&error) {
-            if attaching_run {
-                "Codespace is stopped. Send a message to wake it.".to_string()
-            } else {
-                "Could not reach the codespace. Try sending again.".to_string()
+            // A sandbox is never woken from here (this thread can not tell a user's send
+            // from a Mono's); the Reconnect button and a send typed in the session do it.
+            let sandbox = error.starts_with("Sandbox is not connected");
+            match (sandbox, attaching_run) {
+                (false, true) => "Codespace is stopped. Send a message to wake it.".to_string(),
+                (false, false) => "Could not reach the codespace. Try sending again.".to_string(),
+                (true, true) => "Sandbox is stopped. Choose Reconnect to start it.".to_string(),
+                (true, false) => "Could not reach the sandbox. Choose Reconnect.".to_string(),
             }
         } else if error == monocode_core::remote::WAKE_CANCELLED {
             "Ready".to_string()

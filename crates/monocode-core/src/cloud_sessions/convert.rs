@@ -23,8 +23,37 @@
 //!    stop itself) does not convert twice.
 //!
 //! Code is bundled to the local disk, never pushed anywhere.
+//!
+//! # Files-only archive (Docker sandboxes)
+//!
+//! When the sandbox reconnect reports that the devcontainer was recreated, or that the Host
+//! cannot be brought back although the sandbox itself is fine, the session is still archived
+//! in a reduced "files only" mode so unpushed work can be saved before a stop or delete:
+//!
+//! * a recreated container is archived this way directly. A Host that merely could not be
+//!   brought back may still hold the conversation, so that case needs the user's
+//!   confirmation first ([`CloudSessions::convert_session_confirmed`]);
+//! * the conversation is read only if a connected Host still answers (nothing is woken for
+//!   it); otherwise the copy has no history, and the warnings say the history may be
+//!   incomplete (the store keeps no copy of a remote transcript);
+//! * the git snapshot (steps 4 and 5 above) runs against the workspace in the OUTER sandbox,
+//!   a bind mount that survives a container recreate, with the same script and the same
+//!   verified tar stream, but over `sh -s` in the outer sandbox instead of
+//!   `devcontainer exec`;
+//! * Claude's JSONL lives in the old container, so it is skipped (a warning says so) and
+//!   `.evidence` is not pulled.
+//!
+//! A sandbox without a devcontainer ([`crate::remote::SandboxMode::Plain`]) has no container
+//! to lose: its scripts and copies run in the workspace of the outer sandbox, the session's
+//! folder is that workspace, and the files-only mode only applies when its Host cannot be
+//! brought back.
+//!
+//! Only [`CloudSessions::convert_session`] chooses this mode, and it is the user's archive
+//! action. Nothing in a background path (polls, Monos, the app API) reaches it.
 use super::*;
 use crate::codespaces::valid_remote_path;
+use crate::remote::SandboxTarget;
+use backend::docker::DockerBackend;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -40,13 +69,19 @@ pub const RAW_JSONL: &str = "claude.jsonl";
 /// Written by [`restore_code`]; its presence means the action was used.
 pub const RESTORED: &str = "restored.json";
 /// Session setting recording where a converted session came from.
-pub fn origin_key(local_id: i64) -> String {
-    format!("codespace-origin:{local_id}")
+pub fn origin_key(backend: CloudBackendKind, local_id: i64) -> String {
+    match backend {
+        CloudBackendKind::Codespaces => format!("codespace-origin:{local_id}"),
+        CloudBackendKind::DockerSandbox => format!("sandbox-origin:{local_id}"),
+    }
 }
 
-/// Session-independent setting listing what deleting a codespace would lose.
-pub fn unsaved_key(codespace: &str) -> String {
-    format!("codespace-unsaved:{codespace}")
+/// Session-independent setting listing what deleting a workspace would lose.
+pub fn unsaved_key(cloud: &CloudRef) -> String {
+    match cloud.kind {
+        CloudBackendKind::Codespaces => format!("codespace-unsaved:{}", cloud.name),
+        CloudBackendKind::DockerSandbox => format!("sandbox-unsaved:{}", cloud.name),
+    }
 }
 
 /// Runs on the codespace with `sh -s`. `@WS@` and `@ID@` are substituted (validated first).
@@ -329,6 +364,43 @@ pub struct Converted {
     pub evidence_partial: bool,
     /// Problems that did not stop the conversion.
     pub warnings: Vec<String>,
+    /// Whether the conversation itself was saved. `false` for a files-only archive that
+    /// could not read the history: only the code state is in the local copy.
+    pub history_saved: bool,
+}
+
+/// Why [`CloudSessions::convert_session_confirmed`] did not convert.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConvertError {
+    /// The sandbox is fine but its Host could not be brought back, so the conversation may
+    /// still be intact there. Converting files-only would forget the cloud record and the
+    /// history with it, so it needs the user's explicit confirmation: call again with
+    /// `files_only_confirmed` set. Nothing was changed.
+    NeedsFilesOnlyConfirm {
+        reason: String,
+    },
+    Failed(String),
+}
+impl std::fmt::Display for ConvertError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NeedsFilesOnlyConfirm { reason } => write!(
+                f,
+                "The conversation of this session could not be reached ({reason}). Retry, or archive only its files."
+            ),
+            Self::Failed(text) => f.write_str(text),
+        }
+    }
+}
+impl From<String> for ConvertError {
+    fn from(text: String) -> Self {
+        Self::Failed(text)
+    }
+}
+impl From<&str> for ConvertError {
+    fn from(text: &str) -> Self {
+        Self::Failed(text.into())
+    }
 }
 
 /// Names a converted session's refs under `refs/codespace/`, so sessions that share a HEAD
@@ -417,6 +489,12 @@ pub fn unsaved_lines(converted: &[Converted]) -> Vec<String> {
             "Ignored files are not part of the local copy: {list}{more}.{cut}"
         ));
     }
+    for c in converted.iter().filter(|c| !c.history_saved) {
+        lines.push(format!(
+            "The conversation of \u{201c}{}\u{201d} was not saved.",
+            c.title.split_whitespace().collect::<Vec<_>>().join(" ")
+        ));
+    }
     for c in converted.iter().filter(|c| c.evidence_partial) {
         lines.push(format!(
             "Some evidence files of \u{201c}{}\u{201d} could not be copied.",
@@ -492,12 +570,29 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 impl CloudSessions {
+    /// Tells the sandbox backend where the container of `cloud` is (from the paired machine,
+    /// no ssh). A no-op for a codespace.
+    pub(super) fn prime_backend(&self, cloud: &CloudRef) {
+        if cloud.kind != CloudBackendKind::DockerSandbox {
+            return;
+        }
+        let Some(deps) = &self.sandbox else { return };
+        if let Some(target) = self.host.machines().ok().and_then(|machines| {
+            machines
+                .into_iter()
+                .filter_map(|m| m.sandbox)
+                .find(|s| s.name == cloud.name)
+        }) {
+            deps.backend.remember_target(&target);
+        }
+    }
+
     /// Whether `id` is (still) a cloud session record. A converted one is not.
     pub fn is_cloud_session(&self, id: i64) -> bool {
         self.store()
             .ok()
             .and_then(|store| store.remote_session(id).ok().flatten())
-            .is_some_and(|s| s.project.codespace.is_some())
+            .is_some_and(|s| s.project.cloud().is_some())
     }
 
     /// Where Claude Code keeps its own sessions (`CLAUDE_CONFIG_DIR` or `~/.claude`).
@@ -507,9 +602,14 @@ impl CloudSessions {
 
     /// Every cloud session bound to `codespace`, archived or not.
     pub fn sessions_in_codespace(&self, codespace: &str) -> Vec<i64> {
+        self.sessions_in_cloud(&CloudRef::codespace(codespace))
+    }
+
+    /// Every cloud session bound to `cloud`, archived or not.
+    pub fn sessions_in_cloud(&self, cloud: &CloudRef) -> Vec<i64> {
         self.store()
             .ok()
-            .and_then(|store| store.cloud_session_ids(codespace).ok())
+            .and_then(|store| store.cloud_session_ids(cloud).ok())
             .unwrap_or_default()
     }
 
@@ -521,15 +621,32 @@ impl CloudSessions {
         cloud_id: i64,
         progress: &mut dyn FnMut(&str),
     ) -> Result<Converted, String> {
+        self.convert_session_confirmed(cloud_id, false, progress)
+            .map_err(|e| e.to_string())
+    }
+
+    /// [`Self::convert_session`] with a typed error and the files-only confirmation.
+    ///
+    /// A sandbox whose container was recreated is archived files-only without asking (its
+    /// history is gone with the old container). A sandbox whose Host merely could not be
+    /// brought back returns [`ConvertError::NeedsFilesOnlyConfirm`] and changes nothing,
+    /// unless `files_only_confirmed` is true, which a caller may pass only after the user
+    /// agreed to lose access to the conversation. A codespace ignores the flag.
+    pub fn convert_session_confirmed(
+        &self,
+        cloud_id: i64,
+        files_only_confirmed: bool,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<Converted, ConvertError> {
         let remote = self
             .store()?
             .remote_session(cloud_id)?
             .ok_or("Session not found")?;
-        let codespace = remote
+        let cloud = remote
             .project
-            .codespace
-            .clone()
+            .cloud()
             .ok_or("This session does not run in a codespace.")?;
+        let codespace = cloud.name.clone();
         let local_project = remote
             .project
             .local_project
@@ -541,40 +658,123 @@ impl CloudSessions {
             .store()?
             .thread_dir(cloud_id)?
             .ok_or("This store keeps no session folders, so a local copy cannot be made.")?;
-        let machine = self
-            .host
-            .machines()?
-            .into_iter()
+        let machines = self.host.machines()?;
+        let machine = machines
+            .iter()
             .find(|m| m.environment_id == remote.project.environment_id)
-            .ok_or("Codespace machine is no longer connected.")?;
+            .cloned();
+        let no_machine = || format!("{} machine is no longer connected.", cloud.title());
 
-        progress("Waking the codespace");
-        self.host
-            .ensure(&machine.id, &AtomicBool::new(false), progress)?;
+        // Set when a sandbox can only be archived as files (see the module docs).
+        let mut files_only: Option<SandboxTarget> = None;
+        match cloud.kind {
+            CloudBackendKind::Codespaces => {
+                let machine = machine.as_ref().ok_or_else(no_machine)?;
+                progress("Waking the codespace");
+                self.host
+                    .ensure(&machine.id, &AtomicBool::new(false), progress)?;
+            }
+            // Archiving is the user's own action, so it may resume the sandbox. A connected
+            // one is left alone; this also brings the relay and the Host back.
+            CloudBackendKind::DockerSandbox => {
+                progress("Reconnecting the sandbox");
+                match self.reconnect_sandbox_typed(cloud_id, progress, &AtomicBool::new(false)) {
+                    Ok(()) => {
+                        if machine.is_none() {
+                            return Err(no_machine().into());
+                        }
+                    }
+                    Err(docker_start::ReconnectError::HostUnreachable(reason))
+                        if !files_only_confirmed =>
+                    {
+                        return Err(ConvertError::NeedsFilesOnlyConfirm { reason });
+                    }
+                    Err(
+                        error @ (docker_start::ReconnectError::Recreated
+                        | docker_start::ReconnectError::HostUnreachable(_)),
+                    ) => {
+                        // The paired machine may already name the new Host, so the sandbox is
+                        // found by its name.
+                        let target = machines
+                            .iter()
+                            .filter_map(|m| m.sandbox.clone())
+                            .find(|s| s.name == cloud.name)
+                            .ok_or_else(|| error.to_string())?;
+                        crate::remote::validate_sandbox_target(&target)?;
+                        progress("The sandbox session cannot be reached; saving its files only");
+                        files_only = Some(target);
+                    }
+                    Err(error) => return Err(error.to_string().into()),
+                }
+            }
+        }
+        self.prime_backend(&cloud);
 
         let mut snapshot = None;
+        let mut warnings: Vec<String> = vec![];
         if let Some(host_id) = &remote.session_id {
-            progress("Reading the conversation");
-            let sync = crate::remote::protocol::read_session_sync(host_id, None, |m, p| {
-                self.host.request(&machine.id, m, p)
-            })?;
-            let mut value = crate::remote::protocol::apply_session_sync(None, &sync)?;
-            crate::remote::attachments::qualify_snapshot(
-                &mut value,
-                &remote.project.environment_id,
-                host_id,
-            );
-            snapshot = Some(value);
+            let read = |machine: &Machine| -> Result<Value, String> {
+                let sync = crate::remote::protocol::read_session_sync(host_id, None, |m, p| {
+                    self.host.request(&machine.id, m, p)
+                })?;
+                let mut value = crate::remote::protocol::apply_session_sync(None, &sync)?;
+                crate::remote::attachments::qualify_snapshot(
+                    &mut value,
+                    &remote.project.environment_id,
+                    host_id,
+                );
+                Ok(value)
+            };
+            if files_only.is_some() {
+                // Best effort and never a wake: a connected Host that still knows the session
+                // answers, anything else leaves the copy without history.
+                progress("Reading the conversation");
+                snapshot = machine.as_ref().and_then(|m| read(m).ok());
+            } else {
+                progress("Reading the conversation");
+                snapshot = Some(read(machine.as_ref().ok_or_else(no_machine)?)?);
+            }
+        }
+        if let Some(target) = &files_only {
+            // A plain sandbox has no container to recreate: only its Host was unreachable.
+            let cause = if target.mode == crate::remote::SandboxMode::Plain {
+                "the sandbox's Host could not be reached"
+            } else {
+                "the sandbox's container was recreated or its Host could not be reached"
+            };
+            warnings.push(if snapshot.is_some() {
+                format!("History may be incomplete: {cause}, so the conversation is whatever the Host still held.")
+            } else {
+                format!("History may be incomplete: {cause}, so the conversation could not be read and this copy has none. Only the files were saved.")
+            });
         }
         // The session may run in its own host worktree: that is the tree to save.
-        let session_cwd = snapshot
+        let host_cwd = snapshot
             .as_ref()
             .and_then(|v| v["session"]["cwd"].as_str())
+            .map(str::to_string)
+            .or_else(|| {
+                // Without a Host the session's own folder is what the store last saw.
+                files_only.as_ref()?;
+                let settings = self.store().ok()?.agent_settings(cloud_id).ok().flatten()?;
+                // A removed worktree is not a place to look any more.
+                (!settings.worktree_removed)
+                    .then_some(settings.worktree_cwd)
+                    .flatten()
+            });
+        let workspace_root = self.workspace_root_of(&cloud);
+        let session_cwd = host_cwd
             .map(|c| c.trim_end_matches('/').to_string())
             .filter(|c| {
-                c.starts_with(&format!("{}/", self.workspace_root)) && valid_remote_path(c).is_ok()
+                c.starts_with(&format!("{}/", workspace_root)) && valid_remote_path(c).is_ok()
             });
         let workspace = session_cwd.clone().unwrap_or_else(|| project_cwd.clone());
+        // Where the snapshot script looks: the same tree, at its path in the outer sandbox
+        // for a files-only archive.
+        let scan_dir = match &files_only {
+            Some(target) => outer_path(target, &project_cwd, &workspace)?,
+            None => workspace.clone(),
+        };
         let mut cwds = vec![project_cwd.clone()];
         cwds.extend(session_cwd);
         let (rows, turns) = match &snapshot {
@@ -601,18 +801,43 @@ impl CloudSessions {
                         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
             });
 
-        progress("Copying evidence");
-        let pulled = self.pull_evidence(cloud_id, None)?;
+        let pulled = if let Some(target) = &files_only {
+            // `.evidence` is pulled through the Host's machine, which is what is gone.
+            let why = if target.mode == crate::remote::SandboxMode::Plain {
+                "it is read through the sandbox, which is unreachable"
+            } else {
+                "it is read through the container, which was recreated or is unreachable"
+            };
+            EvidencePull {
+                session_id: cloud_id,
+                kind: cloud.kind,
+                instance: codespace.clone(),
+                remote_path: String::new(),
+                local_dir: remote_thread.join(EVIDENCE_DIR),
+                files: vec![],
+                message: None,
+                warning: Some(format!("The evidence folder was not copied: {why}.")),
+            }
+        } else {
+            progress("Copying evidence");
+            self.pull_evidence(cloud_id, None)?
+        };
         let evidence_partial = pulled.warning.is_some();
-        let mut warnings: Vec<String> = pulled.warning.into_iter().collect();
+        warnings.extend(pulled.warning);
 
         let staging = remote_thread.join(format!("convert.{}-{}", std::process::id(), nanos()));
         let result = self.convert_staged(
             Plan {
                 remote: &remote,
+                cloud: &cloud,
                 codespace: &codespace,
                 local_project: &local_project,
                 workspace: &workspace,
+                scan_dir: &scan_dir,
+                files_only: files_only.is_some(),
+                history_saved: files_only.is_none()
+                    || snapshot.is_some()
+                    || remote.session_id.is_none(),
                 cwds: &cwds,
                 provider_id: provider_id.as_deref(),
                 title: &title,
@@ -650,47 +875,92 @@ impl CloudSessions {
     ) -> Result<Converted, String> {
         let Plan {
             remote,
+            cloud,
             codespace,
             local_project,
             workspace,
+            scan_dir,
+            files_only,
+            history_saved,
             cwds,
             provider_id,
             title,
         } = plan;
         std::fs::create_dir_all(staging).map_err(|e| e.to_string())?;
         progress("Saving the code state");
-        let script = SNAPSHOT_SCRIPT
-            .replace("@WS@", workspace)
-            .replace("@ID@", provider_id.unwrap_or(""));
-        let out = codespaces::run_script(&*self.gh, codespace, &script, true)?;
+        // A files-only archive never looks for Claude's JSONL: it is in the old container.
+        let script = SNAPSHOT_SCRIPT.replace("@WS@", scan_dir).replace(
+            "@ID@",
+            if files_only {
+                ""
+            } else {
+                provider_id.unwrap_or("")
+            },
+        );
+        let backend = if files_only {
+            CodeSource::Outer(
+                self.sandbox
+                    .as_ref()
+                    .map(|deps| deps.backend.clone())
+                    .ok_or("Docker sandboxes are not available.")?,
+                scan_dir,
+            )
+        } else {
+            CodeSource::Cloud(self.backend(cloud.kind)?)
+        };
+        let noun = cloud.noun();
+        let script = if files_only {
+            // git may refuse a folder it does not trust; say the workspace is trusted (env
+            // config is protected configuration, unlike a repo's own).
+            format!(
+                "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='{scan_dir}'\n{script}"
+            )
+        } else {
+            script
+        };
+        let out = backend
+            .run_script(codespace, &script, true)
+            .map_err(|e| outer_git_error(e, files_only))?;
         let snap = parse_snapshot(&out)?;
-        let drop_stage = |this: &Self| {
+        let drop_stage = || {
             // The stage lives in /tmp on the codespace; failing to remove it is harmless.
             if snap.stage.starts_with(STAGE_PREFIX) {
-                let _ = codespaces::run_script(
-                    &*this.gh,
-                    codespace,
-                    &format!("rm -rf '{}'\n", snap.stage),
-                    false,
-                );
+                let _ = backend.run_script(codespace, &format!("rm -rf '{}'\n", snap.stage), false);
             }
         };
+        if snap.nogit && files_only {
+            // The script reports "not a repository" for any git failure; find out why.
+            let why = backend
+                .run_script(
+                    codespace,
+                    &format!("git -C '{scan_dir}' rev-parse --git-dir 2>&1 || true\n"),
+                    false,
+                )
+                .unwrap_or_default();
+            if why.contains("dubious ownership") {
+                drop_stage();
+                return Err(format!(
+                    "{scan_dir} in the sandbox belongs to another user than the one running git, so its git state cannot be read."
+                ));
+            }
+        }
         if snap.nogit || snap.nohead {
-            drop_stage(self);
+            drop_stage();
             return Err(format!(
-                "{workspace} on the codespace is not a git repository with at least one commit, so its files cannot be saved."
+                "{scan_dir} on the {noun} is not a git repository with at least one commit, so its files cannot be saved."
             ));
         }
         if snap.size_kb > SIZE_LIMIT_KB {
-            drop_stage(self);
+            drop_stage();
             return Err(format!(
                 "The code state is {} MB, over the {} MB limit for a local copy.",
                 snap.size_kb / 1024,
                 SIZE_LIMIT_KB / 1024
             ));
         }
-        let copied = codespaces::copy_from(&*self.gh, codespace, &snap.stage, staging);
-        drop_stage(self);
+        let copied = backend.copy_from(codespace, &snap.stage, staging);
+        warnings.extend(backend.take_copy_notes());
+        drop_stage();
         copied?;
         let staged = staging.join(snap.stage.rsplit('/').next().unwrap_or_default());
         let code = staged.join(CODESPACE_DIR);
@@ -703,7 +973,7 @@ impl CloudSessions {
         ] {
             if reported && !file.exists() {
                 return Err(format!(
-                    "{} was staged on the codespace but did not arrive",
+                    "{} was staged on the {noun} but did not arrive",
                     file.file_name().unwrap_or_default().to_string_lossy()
                 ));
             }
@@ -740,7 +1010,7 @@ impl CloudSessions {
                 if let Some(item) = &remote.summary.work_item {
                     store.set_work_item(local_id, Some(item))?;
                 }
-                let origin = json!({
+                let mut origin = json!({
                     "codespace": codespace,
                     "remoteCwd": workspace,
                     "hostSessionId": remote.session_id,
@@ -749,7 +1019,14 @@ impl CloudSessions {
                     "localProject": local_project,
                     "convertedAt": crate::time::now_ms(),
                 });
-                store.save_setting(&origin_key(local_id), &origin.to_string())
+                if cloud.kind != CloudBackendKind::Codespaces {
+                    // `codespace` keeps naming the workspace; this says which backend owns it.
+                    origin["backend"] = json!(cloud.kind);
+                }
+                if files_only {
+                    origin["filesOnly"] = json!(true);
+                }
+                store.save_setting(&origin_key(cloud.kind, local_id), &origin.to_string())
             })();
             if let Err(error) = filled {
                 let _ = store.delete(local_id);
@@ -782,6 +1059,9 @@ impl CloudSessions {
                         Err(e) => Resume::Missing(e),
                     }
                 }
+                (Some(_), false) if files_only => Resume::Missing(
+                    "Claude's own transcript lived in the old container and was not saved".into(),
+                ),
                 (Some(_), false) => {
                     Resume::Missing("Claude's own transcript was not found on the codespace".into())
                 }
@@ -793,6 +1073,9 @@ impl CloudSessions {
                         self.store()?.provider_id(local_id, id)?;
                     }
                 }
+                Resume::Missing(why) if files_only => warnings.push(format!(
+                    "Claude cannot resume this conversation locally ({why}); the next message starts a fresh one."
+                )),
                 Resume::Missing(why) => warnings.push(format!(
                     "Claude cannot resume this conversation locally ({why}); the next message starts a fresh one. The raw transcript is kept in the session folder."
                 )),
@@ -882,6 +1165,7 @@ impl CloudSessions {
                 ignored_truncated: snap.ignored_truncated,
                 evidence_partial: false,
                 warnings: vec![],
+                history_saved,
             })
         };
         let converted = match finish() {
@@ -942,13 +1226,87 @@ impl CloudSessions {
     }
 }
 
+/// Where the snapshot script and the copy of its stage run.
+enum CodeSource<'a> {
+    /// The backend's own workspace (a codespace, or a sandbox's container).
+    Cloud(Arc<dyn CloudBackend>),
+    /// The outer sandbox around the container, for a files-only archive. The path is the
+    /// workspace there, whose owner the scripts run as.
+    Outer(Arc<DockerBackend>, &'a str),
+}
+impl CodeSource<'_> {
+    fn run_script(&self, name: &str, script: &str, long: bool) -> Result<String, String> {
+        match self {
+            Self::Cloud(backend) => backend.run_script(name, script, long),
+            Self::Outer(backend, owner) => backend.run_outer_script(name, owner, script, long),
+        }
+    }
+    fn copy_from(&self, name: &str, remote: &str, local: &Path) -> Result<(), String> {
+        match self {
+            Self::Cloud(backend) => backend.copy_from(name, remote, local),
+            Self::Outer(backend, owner) => backend.copy_from_outer(name, owner, remote, local),
+        }
+    }
+    fn take_copy_notes(&self) -> Vec<String> {
+        match self {
+            Self::Cloud(backend) => backend.take_copy_notes(),
+            Self::Outer(backend, _) => CloudBackend::take_copy_notes(&**backend),
+        }
+    }
+}
+
+/// Makes a git failure of the outer sandbox understandable (files-only archives only).
+fn outer_git_error(error: String, files_only: bool) -> String {
+    if files_only && error.contains("index extension") {
+        "The git in the outer sandbox is older than the one in the container, so it cannot read the repository's index. Rebuild or upgrade git in the sandbox, or keep the sandbox and recover the files by hand."
+            .to_string()
+    } else {
+        error
+    }
+}
+
+/// The outer-sandbox path of `workspace`, a container path at or under `project_cwd`
+/// (`/workspaces/<repo>` in the container is `target.workspace` outside).
+///
+/// Only the workspace folder is a bind mount, so a session whose own folder lies elsewhere in
+/// the container (a Host worktree such as `/workspaces/<repo>-worktrees/...`) cannot be read
+/// from outside. That is an error, not a silent fallback to the main workspace: archiving the
+/// wrong tree and then deleting the sandbox would lose the worktree's work. A custom
+/// `workspaceMount` or `workspaceFolder` in the devcontainer config is not supported for a
+/// files-only archive in v1: the outer path is always the checkout the start provisioned.
+fn outer_path(
+    target: &SandboxTarget,
+    project_cwd: &str,
+    workspace: &str,
+) -> Result<String, String> {
+    let outer = target.workspace.trim_end_matches('/');
+    let path = if workspace == project_cwd {
+        outer.to_string()
+    } else {
+        let rest = workspace
+            .strip_prefix(&format!("{project_cwd}/"))
+            .ok_or("The session's worktree lived only in the container and cannot be archived; the main workspace can.")?;
+        format!("{outer}/{rest}")
+    };
+    valid_remote_path(&path)?;
+    Ok(path)
+}
+
 /// What one conversion works on.
 struct Plan<'a> {
     remote: &'a RemoteSession,
+    cloud: &'a CloudRef,
+    /// The workspace name (a codespace or a sandbox).
     codespace: &'a str,
     local_project: &'a str,
     /// The tree that is saved: the session's own cwd on the host.
     workspace: &'a str,
+    /// Where `workspace` is read: the same path, or its outer-sandbox path when `files_only`.
+    scan_dir: &'a str,
+    /// A sandbox archived without its container, see the module docs.
+    files_only: bool,
+    /// Whether the conversation was read (see [`Converted::history_saved`]).
+    history_saved: bool,
     /// Codespace paths to rewrite in Claude's transcript.
     cwds: &'a [String],
     provider_id: Option<&'a str>,

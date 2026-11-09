@@ -66,6 +66,8 @@ pub(super) fn open(
         // Encrypted provider account credentials live here, never in the
         // desktop schema, which this app does not change.
         sql(conn.execute_batch(crate::accounts::CREDENTIALS_TABLE))?;
+        sql(conn.execute_batch(crate::git_credentials::GIT_CREDENTIALS_TABLE))?;
+        sql(conn.execute_batch(crate::mobile::identity_store::MOBILE_IDENTITY_TABLE))?;
         if version == 0 {
             // Another native window may have finished the import while this
             // connection waited. Acquire the writer before checking its marker.

@@ -109,6 +109,9 @@ impl Conversation {
         draft: bool,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
+        if self.cloud_locked {
+            return Err(crate::shell::CLOUD_ARCHIVING.into());
+        }
         if self.busy
             || self.stopping
             || self.mono_ui.external.is_some()

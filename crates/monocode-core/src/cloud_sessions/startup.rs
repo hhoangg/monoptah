@@ -21,8 +21,9 @@
 //!    "Open in browser" URL.
 //!
 //! Readers need only a `&Store`: [`start_record`], [`pending_starts`], [`starting_refusal`]
-//! (the text for a send to a starting session) and [`queued_start_message`]. A message typed
-//! while starting is kept with [`queue_start_message`] as the session's first prompt.
+//! (the text for a send to a starting session) and [`queued_start_message`] (an app-launched
+//! first prompt). A message typed while starting is kept with [`queue_start_message`] in the
+//! session's send queue.
 //!
 //! # Steps
 //!
@@ -45,6 +46,8 @@
 //!   `Running blocking commands...`, `Configuring codespace...`, `Running oryx...`,
 //!   `Running commands...`, `Running the postCreateCommand from Feature '...'...`,
 //!   `Finished configuring codespace.`, each prefixed `2026-11-07 04:01:54.456Z: `.
+use super::backend::{CloudBackendKind, CloudRef};
+use super::docker_start::SandboxStart;
 use super::{
     created_note, require_claude, CloudBinding, CloudSessions, ResolvedCodespace, Target, WaitPlan,
     START_ABORTED,
@@ -59,6 +62,9 @@ use std::time::{Duration, Instant};
 
 /// Store setting holding the JSON map `session id -> StartRecord`.
 const SETTING: &str = "cloud-starts.v1";
+/// Same map for sandbox starts. A separate key keeps `cloud-starts.v1` readable and
+/// untouched for an older app that does not know sandboxes.
+const SETTING_SANDBOX: &str = "cloud-starts-sbx.v1";
 /// How long [`CloudSessions::run_start`] tracks a codespace that is still provisioning.
 pub const START_READY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// Log lines older than the record's `started_at` by more than this do not update steps.
@@ -67,8 +73,10 @@ const LOG_STALE_MARGIN_MS: u64 = 60_000;
 pub const PROGRESS_PREFIX: &str = "[monoptah] ";
 /// Number of log lines kept in a [`StartRecord`] and persisted with a failure.
 pub const LOG_TAIL_LINES: usize = 40;
-/// Prefix of the id of the draft [`queue_start_message`] stores.
+/// Prefix of the id of the draft an app-launched first prompt is stored as.
 const APP_PROMPT: &str = "app-prompt-";
+/// Prefix of the id of a message [`queue_start_message`] adds to the send queue.
+const START_QUEUE: &str = "cloud-start-";
 /// How often the creation-log follower is (re)started while one start runs.
 const FOLLOW_ATTEMPTS: usize = 4;
 /// Refusal for a send to a session whose codespace is still starting, when the phase is not
@@ -76,6 +84,7 @@ const FOLLOW_ATTEMPTS: usize = 4;
 pub const STILL_STARTING: &str =
     "This cloud session is still starting its codespace. Send again when it is ready.";
 const NOT_STARTING: &str = "This cloud session is not starting a codespace.";
+const NO_WORKSPACE: &str = "This cloud session start has no workspace.";
 
 /// One step of starting a cloud session, in display order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -128,6 +137,24 @@ impl StepKind {
             Self::Connect => "Connecting",
             Self::OpenProject => "Opening project",
             Self::LifecycleCommands => "Running background commands",
+        }
+    }
+    /// [`Self::label`] as `backend` words it. Differs from the codespace text only where
+    /// the step is about the codespace itself.
+    pub fn label_for(self, backend: CloudBackendKind) -> &'static str {
+        match (backend, self) {
+            (CloudBackendKind::DockerSandbox, Self::ConfigureCodespace) => "Configure environment",
+            _ => self.label(),
+        }
+    }
+    /// [`Self::running_label`] as `backend` words it.
+    pub fn running_label_for(self, backend: CloudBackendKind) -> &'static str {
+        match (backend, self) {
+            (CloudBackendKind::DockerSandbox, Self::Create) => "Creating sandbox",
+            (CloudBackendKind::DockerSandbox, Self::ConfigureCodespace) => {
+                "Configuring environment"
+            }
+            _ => self.running_label(),
         }
     }
     /// camelCase identifier, as in the app API (`startup.step`).
@@ -183,7 +210,7 @@ pub struct Step {
 }
 
 impl Step {
-    fn pending(kind: StepKind) -> Self {
+    pub(super) fn pending(kind: StepKind) -> Self {
         Self {
             kind,
             status: StepStatus::Pending,
@@ -235,7 +262,12 @@ pub fn log_step(text: &str) -> Option<LogMark> {
 pub struct StartRecord {
     pub session_id: i64,
     pub local_project: String,
+    /// Name of the codespace; empty for a sandbox start (see [`Self::sandbox`]).
     pub codespace: String,
+    /// Name of the Docker sandbox. Set only on records stored under [`SETTING_SANDBOX`],
+    /// which an older app never reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
     /// `owner/repo`.
     pub repo: String,
     pub branch: Option<String>,
@@ -261,6 +293,9 @@ pub struct StartRecord {
     /// (connecting starts a stopped codespace).
     #[serde(default)]
     pub track_ready: bool,
+    /// What only a sandbox start has. Set exactly when [`Self::sandbox`] is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_start: Option<SandboxStart>,
 }
 
 impl StartRecord {
@@ -274,6 +309,7 @@ impl StartRecord {
             session_id,
             local_project: local_cwd.into(),
             codespace: resolved.name.clone(),
+            sandbox: None,
             repo: resolved.repo.clone(),
             branch: resolved.branch.clone(),
             machine: resolved.machine.clone(),
@@ -289,6 +325,22 @@ impl StartRecord {
             started_at: now,
             finished_at: None,
             track_ready: resolved.created,
+            sandbox_start: None,
+        }
+    }
+    /// The backend this start runs on.
+    pub fn backend(&self) -> CloudBackendKind {
+        if self.sandbox.is_some() {
+            CloudBackendKind::DockerSandbox
+        } else {
+            CloudBackendKind::Codespaces
+        }
+    }
+    /// The workspace being started, `None` for a record that names none.
+    pub fn cloud(&self) -> Option<CloudRef> {
+        match &self.sandbox {
+            Some(name) => Some(CloudRef::sandbox(name)),
+            None => Some(CloudRef::codespace(&self.codespace)).filter(|c| !c.name.is_empty()),
         }
     }
     /// The step called `kind`. A record always has all of them; one read from damaged
@@ -476,20 +528,32 @@ pub enum StartEvent {
     Failed(StartRecord),
 }
 
-fn load_all(store: &Store) -> BTreeMap<i64, StartRecord> {
+fn load_key(store: &Store, key: &str) -> BTreeMap<i64, StartRecord> {
     store
-        .setting(SETTING)
+        .setting(key)
         .ok()
         .flatten()
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_default()
 }
 
-fn save_all(store: &Store, all: &BTreeMap<i64, StartRecord>) -> Result<(), String> {
-    store.save_setting(
-        SETTING,
-        &serde_json::to_string(all).map_err(|e| e.to_string())?,
-    )
+fn save_key(store: &Store, key: &str, all: &BTreeMap<i64, StartRecord>) -> Result<(), String> {
+    store.save_setting(key, &serde_json::to_string(all).map_err(|e| e.to_string())?)
+}
+
+/// The setting a record is stored under.
+fn key_of(record: &StartRecord) -> &'static str {
+    match record.backend() {
+        CloudBackendKind::Codespaces => SETTING,
+        CloudBackendKind::DockerSandbox => SETTING_SANDBOX,
+    }
+}
+
+/// Every stored record, codespace and sandbox starts together.
+fn load_all(store: &Store) -> BTreeMap<i64, StartRecord> {
+    let mut all = load_key(store, SETTING);
+    all.extend(load_key(store, SETTING_SANDBOX));
+    all
 }
 
 /// The start record of a session, `None` once it is ready (or never started this way).
@@ -516,22 +580,25 @@ pub fn pending_starts(store: &Store) -> Vec<StartRecord> {
 
 /// Saves (inserts or replaces) a record.
 pub fn save_start_record(store: &Store, record: &StartRecord) -> Result<(), String> {
-    let mut all = load_all(store);
+    let key = key_of(record);
+    let mut all = load_key(store, key);
     all.insert(record.session_id, record.clone());
-    save_all(store, &all)
+    save_key(store, key, &all)
 }
 
-/// Removes a record; no-op when there is none.
+/// Removes a record; no-op when there is none. Only the setting that held it is written.
 pub fn remove_start_record(store: &Store, id: i64) -> Result<(), String> {
-    let mut all = load_all(store);
-    if all.remove(&id).is_some() {
-        save_all(store, &all)?;
+    for key in [SETTING, SETTING_SANDBOX] {
+        let mut all = load_key(store, key);
+        if all.remove(&id).is_some() {
+            save_key(store, key, &all)?;
+        }
     }
     Ok(())
 }
 
 /// Pauses a pending session before archive or an explicit stop. Retry remains available.
-pub(crate) fn pause_start(store: &Store, id: i64, reason: &str) -> Result<(), String> {
+pub fn pause_start(store: &Store, id: i64, reason: &str) -> Result<(), String> {
     if let Some(mut record) = start_record(store, id) {
         record.fail(reason.into(), crate::time::now_ms());
         save_start_record(store, &record)?;
@@ -539,13 +606,15 @@ pub(crate) fn pause_start(store: &Store, id: i64, reason: &str) -> Result<(), St
     Ok(())
 }
 
-/// Drops the records of a codespace that no longer exists (called by `forget_codespace`).
-pub(crate) fn forget_codespace_starts(store: &Store, codespace: &str) -> Result<(), String> {
-    let mut all = load_all(store);
-    let before = all.len();
-    all.retain(|_, record| record.codespace != codespace);
-    if all.len() != before {
-        save_all(store, &all)?;
+/// Drops the records of a workspace that no longer exists (called by `forget_cloud`).
+pub(crate) fn forget_cloud_starts(store: &Store, cloud: &CloudRef) -> Result<(), String> {
+    for key in [SETTING, SETTING_SANDBOX] {
+        let mut all = load_key(store, key);
+        let before = all.len();
+        all.retain(|_, record| record.cloud().as_ref() != Some(cloud));
+        if all.len() != before {
+            save_key(store, key, &all)?;
+        }
     }
     Ok(())
 }
@@ -567,34 +636,41 @@ pub fn starting_refusal(store: &Store, id: i64) -> Option<String> {
             record
                 .current()
                 .unwrap_or(StepKind::Provision)
-                .running_label()
+                .running_label_for(record.backend())
         ),
     })
 }
 
-/// Keeps `text` as the session's first prompt while its codespace starts: an unsent draft
-/// whose id starts with `app-prompt-` (the same mechanism as an app-launched prompt). When
-/// such a draft exists the text is appended after a blank line. An unrelated draft of the
-/// user is never touched: that is an `Err`.
+/// Keeps `text` as a message in the session's normal send queue while its workspace starts,
+/// exactly like a message queued behind a running turn. The conversation drains the queue once
+/// the workspace is ready and its history is loaded. The id starts with `cloud-start-`.
 pub fn queue_start_message(store: &Store, session_id: i64, text: &str) -> Result<(), String> {
     let mut state = store.follow_ups(session_id)?;
-    match state.draft.as_mut() {
-        Some(draft) if draft.id.starts_with(APP_PROMPT) => {
-            draft.text.push_str("\n\n");
-            draft.text.push_str(text);
-            state.revision += 1;
-            store.save_follow_ups(session_id, &state)
-        }
-        Some(_) => Err("This session already has a draft. Send or clear it first.".into()),
-        None => store.prepare_app_prompt(
-            session_id,
-            &format!("cloud-start-{}", uuid::Uuid::new_v4()),
-            text,
-        ),
-    }
+    state.messages.push(crate::follow_up::Message {
+        id: format!("{START_QUEUE}{}", uuid::Uuid::new_v4()),
+        text: text.to_owned(),
+        ..Default::default()
+    });
+    state.revision += 1;
+    store.save_follow_ups(session_id, &state)
 }
 
-/// The text [`queue_start_message`] kept for a session, if any.
+/// The texts [`queue_start_message`] left in the session's send queue, oldest first.
+pub fn queued_start_messages(store: &Store, id: i64) -> Vec<String> {
+    store
+        .follow_ups(id)
+        .map(|state| {
+            state
+                .messages
+                .into_iter()
+                .filter(|message| message.id.starts_with(START_QUEUE))
+                .map(|message| message.text)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The text of the app-launched first prompt kept as the session's unsent draft, if any.
 pub fn queued_start_message(store: &Store, id: i64) -> Option<String> {
     let draft = store.follow_ups(id).ok()?.draft?;
     draft.id.starts_with(APP_PROMPT).then_some(draft.text)
@@ -690,7 +766,7 @@ impl Drop for Follower {
 }
 
 impl CloudSessions {
-    fn now(&self) -> u64 {
+    pub(super) fn now(&self) -> u64 {
         (self.clock)()
     }
 
@@ -724,7 +800,11 @@ impl CloudSessions {
     ) -> Result<(Session, StartRecord), String> {
         let now = self.now();
         let store = self.store()?;
-        let project = pending_cloud_project(local_cwd, &resolved.name, &resolved.remote_cwd);
+        let project = pending_cloud_project(
+            local_cwd,
+            &CloudRef::codespace(&resolved.name),
+            &resolved.remote_cwd,
+        );
         let session = store.create_pending_cloud_session(harness, project)?;
         let mut record = StartRecord::fresh(resolved, session.id, local_cwd, began);
         let create = record.step_mut(StepKind::Create);
@@ -747,7 +827,7 @@ impl CloudSessions {
         Ok((session, record))
     }
 
-    fn start_aborted(&self, session_id: i64, cancel: &AtomicBool) -> bool {
+    pub(super) fn start_aborted(&self, session_id: i64, cancel: &AtomicBool) -> bool {
         cancel.load(Ordering::Relaxed)
             || self.store().is_ok_and(|store| {
                 start_record(&store, session_id).is_none_or(|record| record.is_failed())
@@ -762,7 +842,7 @@ impl CloudSessions {
             }
         }
     }
-    fn publish(&self, record: &StartRecord, events: &mut dyn FnMut(StartEvent)) {
+    pub(super) fn publish(&self, record: &StartRecord, events: &mut dyn FnMut(StartEvent)) {
         self.persist_start(record);
         events(StartEvent::Updated(record.clone()));
     }
@@ -784,9 +864,23 @@ impl CloudSessions {
             Some(session) if session.summary.archived => {
                 Some("Session is archived. Choose Retry to start it again.".to_string())
             }
-            Some(_) => match codespaces::state(&*self.gh, &record.codespace) {
-                Ok(state) if matches!(state.as_str(), "Shutdown" | "ShuttingDown") => {
-                    Some("Codespace stopped. Choose Retry to start it again.".to_string())
+            Some(_) => match self.cloud_start_state(&record) {
+                Ok(state) if self.start_is_stopped(&record, &state) => Some(format!(
+                    "{} stopped. Choose Retry to start it again.",
+                    record.backend().title()
+                )),
+                // Resuming runs ssh, which resumes (and bills) a sandbox: only a sandbox that
+                // is running now may continue on its own; every other state waits for Retry.
+                Ok(state)
+                    if record.backend() == CloudBackendKind::DockerSandbox
+                        && !self.backend(record.backend()).is_ok_and(|backend| {
+                            backend.display_state(&state) == super::CloudState::Available
+                        }) =>
+                {
+                    Some(format!(
+                        "Sandbox is {}. Choose Retry to start it again.",
+                        state.trim().to_ascii_lowercase()
+                    ))
                 }
                 Ok(_) => None,
                 Err(error) => Some(error),
@@ -809,6 +903,9 @@ impl CloudSessions {
         cancel: &AtomicBool,
     ) -> Result<CloudBinding, String> {
         let mut record = start_record(&*self.store()?, session_id).ok_or(NOT_STARTING)?;
+        if record.backend() == CloudBackendKind::DockerSandbox {
+            return self.run_sandbox_start(record, events, cancel);
+        }
         record.reset_for_run();
         if cancel.load(Ordering::Relaxed) {
             return Err(START_ABORTED.into());
@@ -889,8 +986,8 @@ impl CloudSessions {
         );
         let halt = Arc::new(AtomicBool::new(false));
         {
-            let (gh, host, store, halt, tx) = (
-                self.gh.clone(),
+            let (backend, host, store, halt, tx) = (
+                self.backend(record.backend())?,
                 self.host.clone(),
                 self.store.clone(),
                 halt.clone(),
@@ -900,14 +997,15 @@ impl CloudSessions {
             std::thread::spawn(move || {
                 let request = super::OpenRequest {
                     local_cwd: &record.local_project,
-                    codespace: &record.codespace,
+                    cloud: &CloudRef::codespace(&record.codespace),
+                    sandbox: None,
                     display: &record.display,
                     repo: &record.repo,
                     remote_cwd: &record.remote_cwd,
                 };
                 let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     super::open_project(
-                        &*gh,
+                        &*backend,
                         &*host,
                         &store,
                         &request,
@@ -1006,8 +1104,12 @@ impl CloudSessions {
     /// from Provision. `Err` when the session has no start record. Returns the new record.
     pub fn rebuild_start(&self, session_id: i64) -> Result<StartRecord, String> {
         let mut record = start_record(&*self.store()?, session_id).ok_or(NOT_STARTING)?;
-        codespaces::rebuild(&*self.gh, &record.codespace)?;
-        self.invalidate(&record.codespace);
+        if record.backend() == CloudBackendKind::DockerSandbox {
+            return self.rebuild_sandbox_start(record);
+        }
+        let cloud = record.cloud().ok_or(NO_WORKSPACE)?;
+        self.backend(cloud.kind)?.rebuild(&cloud.name)?;
+        self.invalidate_ref(&cloud);
         let now = self.now();
         for step in &mut record.steps {
             if step.kind != StepKind::Create {
@@ -1032,13 +1134,27 @@ impl CloudSessions {
         Ok(record)
     }
 
-    /// Browser URL of the start's codespace: the one returned at creation, else asked from
-    /// GitHub. `Err` when the session has no start record or GitHub knows no URL.
+    /// Browser URL of the start's workspace: the one returned at creation, else asked from
+    /// its backend. `Err` when the session has no start record, or the backend has no URL.
     pub fn start_web_url(&self, session_id: i64) -> Result<String, String> {
         let record = start_record(&*self.store()?, session_id).ok_or(NOT_STARTING)?;
         match record.web_url {
             Some(url) => Ok(url),
-            None => codespaces::web_url(&*self.gh, &record.codespace),
+            None => {
+                let cloud = record.cloud().ok_or(NO_WORKSPACE)?;
+                self.backend(cloud.kind)?
+                    .web_url(&cloud.name)
+                    .unwrap_or_else(|| Err(format!("A {} has no web page.", cloud.noun())))
+            }
         }
+    }
+    fn start_is_stopped(&self, record: &StartRecord, raw: &str) -> bool {
+        self.backend(record.backend())
+            .is_ok_and(|backend| backend.is_stopped(raw))
+    }
+    /// Raw backend state of the workspace a start runs on. Never wakes it.
+    fn cloud_start_state(&self, record: &StartRecord) -> Result<String, String> {
+        let cloud = record.cloud().ok_or(NO_WORKSPACE)?;
+        self.backend(cloud.kind)?.state(&cloud.name)
     }
 }

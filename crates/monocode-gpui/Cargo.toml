@@ -55,6 +55,8 @@ qrcode = { version = "0.14", default-features = false }
 embed-resource = "3"
 
 [dev-dependencies]
+# The Docker sandbox secret seam returns `Zeroizing<String>`; the test fakes implement it.
+zeroize = "1"
 gpui = { package = "gpui-pre", version = "=0.3.9", default-features = false, features = ["test-support"] }
 
 # The vendored renderer's backdrop-blur marker for frosted popovers.
@@ -68,7 +70,7 @@ block2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "block2", "NSEvent", "NSApplication", "NSDockTile", "NSButton", "NSControl", "NSLayoutAnchor", "NSLayoutConstraint", "NSResponder", "NSView", "NSWindow", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSMenu", "NSMenuItem", "NSImage"] }
 raw-window-handle = "0.6"
 objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "objc2-app-kit", "objc2-core-foundation", "WKWebView", "WKWebViewConfiguration", "WKPreferences", "WKWebsiteDataStore", "WKNavigation", "WKNavigationDelegate", "WKNavigationAction", "block2"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSGeometry", "NSData", "NSRange", "NSArray", "NSSet", "NSError", "NSBundle"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSURL", "NSGeometry", "NSData", "NSRange", "NSArray", "NSSet", "NSError", "NSBundle"] }
 objc2-user-notifications = "0.3"
 # libmalloc keeps freed large spans dirty, so startup and image churn stayed
 # resident. mimalloc 3 retains churn the same way; the v2 feature pins 2.x.

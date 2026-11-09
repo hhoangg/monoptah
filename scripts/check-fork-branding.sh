@@ -49,8 +49,10 @@ hits=$(printf '%s\n' "$hits" | grep -vE '^src-tauri/src/fs\.rs:[0-9]+: *("nameWi
 
 # Deliberate keeps inside the native crates (crates/monocode-core, crates/monocode-gpui),
 # matched by exact line content for the same reason as the fs.rs fixtures above.
-#  - remote/ssh.rs host download URL: native version 0.16.x has no Monoptah host release;
-#    release infra is out of scope, so the host package still comes from upstream.
+#  - remote/ssh.rs host download URL: the fork's own v0.16.0 Host packages predate the
+#    upstream fix that runs the Host without systemd, so on codespaces they fail with
+#    "needs systemd user services and lingering". The packages come from upstream until
+#    this fork publishes a newer Host release.
 #  - remote/protocol.rs doc line: names the MonoCode Host wire protocol, which is the
 #    protocol's own identity (`monocode-host`), not product copy.
 #  - skills.rs fixture: a sample SKILL.md description fed to the skill parser and asserted

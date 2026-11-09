@@ -243,6 +243,11 @@ impl Shell {
             },
         );
     }
+    /// Test support: an archive is working on the workspace `cloud`.
+    #[cfg(test)]
+    pub(crate) fn mono_test_busy_cloud(&mut self, cloud: &monocode_core::cloud_sessions::CloudRef) {
+        self.cloud_workspaces_busy.insert(cloud.key());
+    }
     /// Test support: a detached file pane of the session sits in a tab.
     #[cfg(test)]
     pub(crate) fn mono_test_pin_pane(&mut self, session: i64) {

@@ -36,6 +36,7 @@ import {
   indexHostFiles,
   listHostFiles,
   readHostFile,
+  readHostFileChunk,
   searchHostContent,
   searchHostFiles,
   writeHostFile,
@@ -278,6 +279,7 @@ export function createHostServer(
                 "git.worktrees",
                 "git.worktreeCreate",
                 "files.read",
+                "files.readBytes",
                 "files.list",
                 "files.index",
                 "workspace.run",
@@ -505,6 +507,18 @@ export function createHostServer(
             result = await readHostFile(
               await resolveHostWorktreeAsync(project.cwd, params.cwd),
               params.path,
+            );
+            break;
+          }
+          case "files.readBytes": {
+            const project = engine.store.project(
+              String(params.projectId ?? ""),
+            );
+            result = await readHostFileChunk(
+              await resolveHostWorktreeAsync(project.cwd, params.cwd),
+              params.path,
+              params.offset,
+              params.length,
             );
             break;
           }

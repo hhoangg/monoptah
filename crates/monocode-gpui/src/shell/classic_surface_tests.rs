@@ -454,6 +454,26 @@ fn original_app_surfaces_mono_uses_identity_header_and_restores_sessions(cx: &mu
 }
 
 #[gpui::test]
+fn original_mono_chat_keeps_the_usage_footer_under_its_composer(cx: &mut TestAppContext) {
+    let (window, _) = setup(cx, true, false);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.refresh().unwrap();
+    assert!(visual.debug_bounds("usage-footer").is_some());
+    window
+        .update(visual, |shell, window, cx| {
+            Surface::Mono.open(shell, window, cx)
+        })
+        .unwrap();
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    assert!(window.read_with(visual, |s, cx| s.mono_active(cx)).unwrap());
+    assert!(
+        visual.debug_bounds("usage-footer").is_some(),
+        "a classic Mono chat shows the quota row like Focus does"
+    );
+}
+
+#[gpui::test]
 fn original_app_surfaces_mono_overview_and_rail_back_use_original_controls(
     cx: &mut TestAppContext,
 ) {

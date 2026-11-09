@@ -1,0 +1,4462 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>Monoptah · Docker Sandbox integration - Final spec v1</title>
+    <style>
+      :root {
+        --paper: #f7f7f3;
+        --ink: #202820;
+        --muted: #687269;
+        --line: #dfe4dc;
+        --green: #316044;
+        --soft: #e9f0e8;
+        --amber: #8a631f;
+        --dark: #17191c;
+        --panel: #202329;
+        --dim: #a6adb8;
+        --blue: #8eb8ff;
+        --red: #ffacaa;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html {
+        scroll-behavior: smooth;
+        scroll-padding-top: 24px;
+      }
+      body {
+        margin: 0;
+        background: var(--paper);
+        color: var(--ink);
+        font:
+          15px/1.65 -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          sans-serif;
+      }
+      button,
+      input,
+      select {
+        font: inherit;
+      }
+      button,
+      a,
+      input,
+      select {
+        outline-offset: 4px;
+      }
+      button {
+        cursor: pointer;
+      }
+      a {
+        color: var(--green);
+        text-underline-offset: 3px;
+      }
+      code {
+        font:
+          12px/1.5 ui-monospace,
+          SFMono-Regular,
+          Consolas,
+          monospace;
+        background: #edf0e9;
+        border-radius: 4px;
+        padding: 2px 5px;
+        overflow-wrap: anywhere;
+      }
+      h1,
+      h2,
+      h3,
+      h4,
+      p {
+        margin-top: 0;
+      }
+      h1 {
+        font-size: 44px;
+        line-height: 1.14;
+        letter-spacing: -1.9px;
+        margin-bottom: 20px;
+      }
+      h2 {
+        font-size: 27px;
+        line-height: 1.3;
+        letter-spacing: -0.7px;
+        margin-bottom: 14px;
+      }
+      h3 {
+        font-size: 17px;
+        margin-bottom: 9px;
+      }
+      h4 {
+        font-size: 14px;
+        margin-bottom: 7px;
+      }
+      p {
+        margin-bottom: 14px;
+      }
+      ul,
+      ol {
+        padding-left: 22px;
+      }
+      li {
+        margin: 7px 0;
+      }
+      .sidebar {
+        position: fixed;
+        inset: 0 auto 0 0;
+        width: 232px;
+        background: #fff;
+        border-right: 1px solid var(--line);
+        padding: 30px 23px;
+        overflow: auto;
+      }
+      .brand {
+        font-size: 21px;
+        font-weight: 750;
+        letter-spacing: -0.8px;
+      }
+      .brand span {
+        color: #6f9472;
+      }
+      .side-caption,
+      .eyebrow {
+        font-size: 11px;
+        font-weight: 750;
+        text-transform: uppercase;
+        letter-spacing: 1.7px;
+        color: var(--muted);
+      }
+      .side-caption {
+        margin: 5px 0 28px;
+      }
+      .sidebar nav a {
+        display: block;
+        padding: 9px 10px;
+        text-decoration: none;
+        color: #637065;
+        font-size: 13px;
+        border-radius: 6px;
+      }
+      .sidebar nav a:hover,
+      .sidebar nav a.current {
+        background: var(--soft);
+        color: var(--green);
+      }
+      .side-note {
+        margin-top: 32px;
+        border-top: 1px solid var(--line);
+        padding-top: 17px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      main {
+        max-width: 1430px;
+        margin-left: 232px;
+        padding: 52px 56px 80px;
+      }
+      .hero {
+        max-width: 890px;
+      }
+      .eyebrow {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        margin-bottom: 21px;
+      }
+      .pill {
+        display: inline-block;
+        background: var(--soft);
+        border: 1px solid #d8e4d6;
+        color: var(--green);
+        padding: 3px 9px;
+        border-radius: 20px;
+        font-size: 11px;
+        letter-spacing: 0.2px;
+        white-space: nowrap;
+      }
+      .pill.warn {
+        background: #fff4d9;
+        border-color: #efdfb4;
+        color: var(--amber);
+      }
+      .lead {
+        max-width: 750px;
+        color: #5c675e;
+        font-size: 18px;
+        line-height: 1.7;
+      }
+      .decisions {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 12px;
+        margin: 30px 0 0;
+      }
+      .decision {
+        padding: 17px;
+        background: #fff;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+      }
+      .decision small {
+        display: block;
+        color: var(--muted);
+        font-size: 11px;
+        margin-bottom: 7px;
+      }
+      .decision strong {
+        font-size: 14px;
+      }
+      section {
+        padding-top: 51px;
+        margin-top: 8px;
+      }
+      .section-number {
+        font-size: 11px;
+        letter-spacing: 1px;
+        font-weight: 700;
+        color: #78917b;
+        margin-bottom: 8px;
+      }
+      .section-intro {
+        max-width: 780px;
+        color: var(--muted);
+      }
+      .grid2 {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 18px;
+      }
+      .card {
+        background: #fff;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 22px;
+      }
+      .callout {
+        border-left: 3px solid #9bb99a;
+        padding: 14px 18px;
+        background: #edf2ea;
+        border-radius: 0 8px 8px 0;
+        margin: 20px 0;
+      }
+      .callout.warning {
+        border-color: #caac6a;
+        background: #fff6e4;
+      }
+      .callout p:last-child {
+        margin-bottom: 0;
+      }
+      .small {
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .table-wrap {
+        overflow: auto;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: white;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 13px;
+      }
+      th,
+      td {
+        text-align: left;
+        padding: 13px 16px;
+        border-bottom: 1px solid var(--line);
+        vertical-align: top;
+      }
+      th {
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.6px;
+        color: var(--muted);
+        background: #fafbf8;
+      }
+      tr:last-child td {
+        border-bottom: 0;
+      }
+      .flow {
+        counter-reset: step;
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 12px;
+        margin: 22px 0;
+      }
+      .flow article {
+        background: #fff;
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        padding: 17px;
+        position: relative;
+      }
+      .flow article:before {
+        counter-increment: step;
+        content: counter(step, decimal-leading-zero);
+        font:
+          12px ui-monospace,
+          monospace;
+        color: #7c987e;
+        display: block;
+        margin-bottom: 12px;
+      }
+      .flow p {
+        font-size: 12px;
+        color: var(--muted);
+        margin: 0;
+      }
+      .flow h3 {
+        font-size: 14px;
+      }
+      .checks {
+        list-style: none;
+        padding: 0;
+      }
+      .checks li {
+        padding-left: 23px;
+        position: relative;
+      }
+      .checks li:before {
+        content: "✓";
+        position: absolute;
+        left: 0;
+        color: var(--green);
+      }
+      details {
+        border-top: 1px solid var(--line);
+        padding: 16px 0;
+      }
+      summary {
+        cursor: pointer;
+        font-weight: 650;
+      }
+      details p,
+      details ul {
+        margin-top: 12px;
+      }
+      .reference-list li {
+        font-size: 13px;
+      }
+      .footer {
+        margin-top: 45px;
+        padding-top: 18px;
+        border-top: 1px solid var(--line);
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      /* Native mockup: palette/metrics from theme.rs, popover.rs and TelegramDialog. */
+      .native-review {
+        margin-top: 22px;
+      }
+      .n-reviewbar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin: 10px 0;
+      }
+      .n-reviewbar button,
+      .n-reviewbar select {
+        background: #fff;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 6px 9px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .n-reviewbar button[aria-selected="true"] {
+        color: var(--ink);
+        border-color: #8b9c8c;
+        background: #edf1e9;
+      }
+      .n-reviewbar label {
+        font-size: 11px;
+        color: var(--muted);
+        margin-left: auto;
+      }
+      .n-window {
+        --n-bg: #0d0d0d;
+        --n-pane: #141414;
+        --n-pop: #181818;
+        --n-fg: #ebebeb;
+        --n-muted: #969696;
+        --n-border: #ffffff12;
+        --n-control: #ffffff0d;
+        --n-select: #ffffff14;
+        --n-danger: #f87171;
+        --n-sidebar-total: 260px;
+        position: relative;
+        isolation: isolate;
+        height: 730px;
+        min-width: 680px;
+        background: var(--n-bg);
+        color: var(--n-fg);
+        border: 1px solid #ffffff20;
+        border-radius: 10px;
+        overflow: hidden;
+        font:
+          13px/1.5 -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          sans-serif;
+        box-shadow: 0 12px 36px #1112;
+      }
+      .n-window[data-theme="light"] {
+        --n-bg: #f5f5f5;
+        --n-pane: #fff;
+        --n-pop: #fff;
+        --n-fg: #2e2e2e;
+        --n-muted: #777;
+        --n-border: #00000012;
+        --n-control: #00000004;
+        --n-select: #0000000c;
+        --n-danger: #dc2626;
+        border-color: #d5d5d5;
+      }
+      .n-window button,
+      .n-window input,
+      .n-window select {
+        font-family: inherit;
+      }
+      .n-window code {
+        font-size: 11px;
+        background: var(--n-select);
+        color: inherit;
+      }
+      .n-window .n-topbar {
+        height: 40px;
+        border-bottom: 1px solid var(--n-border);
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        padding: 0 13px;
+        font-size: 12px;
+        color: var(--n-muted);
+      }
+      .n-traffic {
+        display: flex;
+        gap: 7px;
+        width: 73px;
+        flex-shrink: 0;
+      }
+      .n-traffic i {
+        display: block;
+        width: 11px;
+        height: 11px;
+        border-radius: 50%;
+        background: #ff5f57;
+      }
+      .n-traffic i:nth-child(2) {
+        background: #febc2e;
+      }
+      .n-traffic i:nth-child(3) {
+        background: #28c840;
+      }
+      .n-tab {
+        height: 27px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 0 12px;
+        color: var(--n-fg);
+        background: var(--n-select);
+        border-radius: 5px;
+        font-size: 12px;
+        max-width: 224px;
+      }
+      .n-topbar-spacer {
+        flex: 1;
+      }
+      .n-sessions {
+        position: absolute;
+        left: 0;
+        top: 40px;
+        bottom: 0;
+        width: 260px;
+        border-right: 1px solid var(--n-border);
+        background: var(--n-bg);
+        padding: 10px;
+      }
+      .n-project-head {
+        display: flex;
+        align-items: center;
+        height: 34px;
+        gap: 7px;
+        margin-bottom: 8px;
+      }
+      .n-project-trigger {
+        flex: 1;
+        text-align: left;
+        font-weight: 600;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        color: inherit;
+        background: transparent;
+        border: 0;
+        padding: 6px;
+        font-size: 13px;
+        border-radius: 5px;
+      }
+      .n-project-trigger:hover,
+      .n-icon-btn:hover {
+        background: var(--n-select);
+      }
+      .n-mascot {
+        font-size: 15px;
+        color: #be9b75;
+        line-height: 1;
+      }
+      .n-icon-btn {
+        width: 26px;
+        height: 26px;
+        border: 0;
+        border-radius: 5px;
+        display: inline-grid;
+        place-items: center;
+        background: transparent;
+        color: var(--n-muted);
+        padding: 0;
+        font-size: 16px;
+        flex-shrink: 0;
+      }
+      .n-workspace-links {
+        display: flex;
+        flex-direction: column;
+        gap: 1px;
+        margin: 7px 0 15px;
+        padding-bottom: 12px;
+        border-bottom: 1px solid var(--n-border);
+      }
+      .n-workspace-links div {
+        display: flex;
+        gap: 9px;
+        align-items: center;
+        padding: 5px 7px;
+        font-size: 12px;
+        color: var(--n-muted);
+      }
+      .n-section-label {
+        display: flex;
+        justify-content: space-between;
+        color: var(--n-muted);
+        font-size: 11px;
+        letter-spacing: 0.15px;
+        padding: 6px;
+      }
+      .n-session-card {
+        padding: 10px 9px;
+        border-radius: 6px;
+        margin: 3px 0;
+      }
+      .n-session-card.active {
+        background: var(--n-select);
+      }
+      .n-session-card small {
+        font-size: 11px;
+        color: var(--n-muted);
+      }
+      .n-session-card strong {
+        font-size: 12px;
+        font-weight: 600;
+        display: block;
+        margin: 4px 0;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .n-side-bottom {
+        position: absolute;
+        bottom: 12px;
+        left: 15px;
+        right: 15px;
+        display: flex;
+        justify-content: space-between;
+        color: var(--n-muted);
+        font-size: 11px;
+      }
+      .n-rail {
+        display: none;
+      }
+      .n-window[data-layout="classic"] {
+        --n-sidebar-total: 480px;
+      }
+      .n-window[data-layout="classic"] .n-rail {
+        display: block;
+        position: absolute;
+        top: 40px;
+        bottom: 0;
+        left: 0;
+        width: 220px;
+        border-right: 1px solid var(--n-border);
+        padding: 12px;
+      }
+      .n-window[data-layout="classic"] .n-sessions {
+        left: 220px;
+      }
+      .n-rail-title {
+        font-size: 11px;
+        color: var(--n-muted);
+        margin: 8px 6px 14px;
+      }
+      .n-rail .n-project-trigger {
+        background: var(--n-select);
+        width: 100%;
+        font-weight: 500;
+      }
+      .n-underlay {
+        position: absolute;
+        left: var(--n-sidebar-total);
+        right: 0;
+        top: 40px;
+        bottom: 0;
+        background: var(--n-pane);
+        display: flex;
+        flex-direction: column;
+      }
+      .n-pane-head {
+        height: 36px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        border-bottom: 1px solid var(--n-border);
+        padding: 0 14px;
+        font-size: 12px;
+        color: var(--n-muted);
+      }
+      .n-chat-content {
+        width: 100%;
+        max-width: 832px;
+        margin: 0 auto;
+        padding: 28px 24px;
+        flex: 1;
+        min-height: 0;
+        overflow: auto;
+      }
+      .n-chat-content h3 {
+        font-size: 14px;
+        font-weight: 600;
+        letter-spacing: 0;
+        margin-bottom: 15px;
+      }
+      .n-chat-content p {
+        font-size: 13px;
+        line-height: 1.8;
+        color: var(--n-muted);
+      }
+      .n-user-message {
+        margin: 8px 0 24px auto;
+        padding: 10px 13px;
+        border-radius: 9px;
+        background: var(--n-select);
+        font-size: 13px;
+        max-width: 90%;
+      }
+      .n-agent-label {
+        font-size: 11px;
+        color: var(--n-muted);
+        margin: 12px 0;
+      }
+      .n-composer {
+        margin: 12px 16px 16px;
+        border: 1px solid color-mix(in srgb, var(--n-fg) 12%, transparent);
+        border-radius: 12px;
+        background: color-mix(in srgb, var(--n-fg) 3%, transparent);
+        padding: 11px 12px;
+        color: var(--n-muted);
+      }
+      .n-composer-path {
+        font-size: 11px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 10px;
+        flex-wrap: wrap;
+      }
+      .n-composer-text {
+        font-size: 13px;
+        min-height: 47px;
+        color: var(--n-muted);
+        padding-top: 4px;
+      }
+      .n-composer-controls {
+        display: flex;
+        gap: 5px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      .n-chip {
+        background: var(--n-control);
+        border: 1px solid var(--n-border);
+        color: var(--n-muted);
+        border-radius: 6px;
+        padding: 4px 7px;
+        font-size: 11px;
+        line-height: 16px;
+        white-space: nowrap;
+      }
+      .n-chip.selected {
+        background: var(--n-select);
+        color: var(--n-fg);
+      }
+      .n-send {
+        margin-left: auto;
+        background: var(--n-select);
+        color: var(--n-fg);
+        border: 1px solid var(--n-border);
+        border-radius: 6px;
+        width: 28px;
+        height: 28px;
+        font-size: 16px;
+      }
+      .n-stage-scroll {
+        overflow: auto;
+        border-radius: 10px;
+      }
+      .n-window .screen {
+        position: absolute;
+        margin: 0;
+        padding: 0;
+        min-height: 0;
+      }
+      .n-reviewbar[hidden] {
+        display: none;
+      }
+      .n-window [hidden] {
+        display: none !important;
+      }
+      .n-window .n-overlay {
+        inset: 40px 0 0;
+        background: #0007;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 16px;
+        z-index: 5;
+      }
+      .n-dialog {
+        display: flex;
+        flex-direction: column;
+        width: 420px;
+        max-width: 100%;
+        max-height: 100%;
+        background: var(--n-pop);
+        border: 1px solid color-mix(in srgb, var(--n-fg) 10%, transparent);
+        border-radius: 12px;
+        box-shadow: 0 20px 55px #0005;
+        overflow: hidden;
+      }
+      .n-dialog-header {
+        padding: 14px 16px 10px;
+        display: flex;
+        gap: 10px;
+        align-items: flex-start;
+        flex-shrink: 0;
+      }
+      .n-dialog-header > div {
+        min-width: 0;
+        flex: 1;
+      }
+      .n-dialog-header h3 {
+        font-size: 16px;
+        line-height: 20px;
+        letter-spacing: 0;
+        margin: 0 0 3px;
+        font-weight: 600;
+      }
+      .n-dialog-header p {
+        font-size: 12px;
+        color: color-mix(in srgb, var(--n-fg) 50%, transparent);
+        line-height: 16.5px;
+        margin: 0;
+      }
+      .n-dialog-body {
+        padding: 6px 16px 16px;
+        overflow: auto;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+      }
+      .n-dialog-footer {
+        border-top: 1px solid var(--n-border);
+        padding: 11px 16px;
+        display: flex;
+        justify-content: flex-end;
+        gap: 7px;
+        align-items: center;
+        flex-wrap: wrap;
+        flex-shrink: 0;
+      }
+      .n-field label {
+        display: block;
+        font-size: 12px;
+        color: var(--n-fg);
+        margin-bottom: 6px;
+      }
+      .n-field input,
+      .n-field select,
+      .n-select {
+        display: block;
+        width: 100%;
+        height: 34px;
+        min-width: 0;
+        padding: 6px 9px;
+        font-size: 13px;
+        color: var(--n-fg);
+        background: transparent;
+        border: 1px solid color-mix(in srgb, var(--n-fg) 10%, transparent);
+        border-radius: 6px;
+      }
+      .n-field select option,
+      .n-select option {
+        background: var(--n-pop);
+        color: var(--n-fg);
+      }
+      .n-field input[readonly] {
+        color: color-mix(in srgb, var(--n-fg) 75%, transparent);
+      }
+      .n-help {
+        font-size: 11px;
+        line-height: 17px;
+        color: color-mix(in srgb, var(--n-fg) 45%, transparent);
+        margin-top: 5px;
+      }
+      .n-line {
+        border-top: 1px solid color-mix(in srgb, var(--n-fg) 8%, transparent);
+        padding-top: 15px;
+      }
+      .n-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        font-size: 12px;
+      }
+      .n-row .n-status {
+        font-size: 11px;
+      }
+      .n-status {
+        color: var(--n-muted);
+      }
+      .n-status.good {
+        color: #86bb96;
+      }
+      .n-status.bad {
+        color: var(--n-danger);
+      }
+      .n-button {
+        border: 1px solid color-mix(in srgb, var(--n-fg) 10%, transparent);
+        border-radius: 6px;
+        background: transparent;
+        color: color-mix(in srgb, var(--n-fg) 70%, transparent);
+        font-size: 12px;
+        line-height: 16px;
+        padding: 6px 10px;
+        min-height: 28px;
+        white-space: nowrap;
+      }
+      .n-button:hover {
+        background: var(--n-select);
+        color: var(--n-fg);
+      }
+      .n-button.primary {
+        background: var(--n-fg);
+        color: var(--n-bg);
+        border-color: var(--n-fg);
+      }
+      .n-button.danger {
+        color: var(--n-danger);
+      }
+      .n-button:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+      }
+      .n-link {
+        font-size: 11px;
+        color: var(--n-muted);
+        border: 0;
+        background: transparent;
+        padding: 0;
+        text-decoration: underline;
+        text-underline-offset: 3px;
+      }
+      .n-inline-note {
+        font-size: 11px;
+        line-height: 17px;
+        padding: 8px 10px;
+        border-radius: 8px;
+        background: #fbbf241a;
+        color: #e5bd69;
+      }
+      .n-window[data-theme="light"] .n-inline-note {
+        color: #b45309;
+      }
+      .n-fields2 {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px;
+      }
+      .n-window details {
+        border-color: var(--n-border);
+        padding: 0;
+      }
+      .n-window summary {
+        font-size: 12px;
+        font-weight: 500;
+        color: var(--n-muted);
+      }
+      .n-window details[open] summary {
+        margin-bottom: 12px;
+      }
+      .n-menu-screen {
+        inset: 40px 0 0;
+        pointer-events: none;
+        z-index: 6;
+      }
+      .n-context {
+        pointer-events: auto;
+        position: absolute;
+        left: 12px;
+        top: 42px;
+        width: 260px;
+        border: 1px solid color-mix(in srgb, var(--n-fg) 10%, transparent);
+        border-radius: 10px;
+        background: var(--n-pop);
+        padding: 6px;
+        box-shadow: 0 14px 35px #0005;
+        font-size: 12px;
+      }
+      .n-menu-name {
+        padding: 5px 7px 9px;
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        font-weight: 500;
+      }
+      .n-swatches {
+        display: flex;
+        gap: 6px;
+        padding: 0 8px 10px;
+      }
+      .n-swatches i {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        background: #ba9471;
+      }
+      .n-swatches i:nth-child(2) {
+        background: #9aaa80;
+      }
+      .n-swatches i:nth-child(3) {
+        background: #87a4b4;
+      }
+      .n-swatches i:nth-child(4) {
+        background: #ab91b2;
+      }
+      .n-swatches i:nth-child(5) {
+        background: #b4898b;
+      }
+      .n-menu-rule {
+        height: 1px;
+        background: var(--n-border);
+        margin: 4px 0;
+      }
+      .n-menu-button {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        width: 100%;
+        padding: 6px 8px;
+        border: 0;
+        border-radius: 5px;
+        background: transparent;
+        color: color-mix(in srgb, var(--n-fg) 75%, transparent);
+        font-size: 12px;
+        text-align: left;
+        line-height: 18px;
+      }
+      .n-menu-button:hover,
+      .n-menu-button:focus-visible {
+        background: var(--n-select);
+        color: var(--n-fg);
+      }
+      .n-menu-icon {
+        font-size: 13px;
+        width: 16px;
+        text-align: center;
+        color: var(--n-muted);
+        flex-shrink: 0;
+      }
+      .n-menu-button .n-arrow {
+        margin-left: auto;
+        color: var(--n-muted);
+      }
+      .n-menu-item {
+        position: relative;
+      }
+      .n-submenu {
+        position: absolute;
+        left: 100%;
+        top: -6px;
+        width: 190px;
+        background: var(--n-pop);
+        border: 1px solid color-mix(in srgb, var(--n-fg) 10%, transparent);
+        border-radius: 9px;
+        box-shadow: 0 10px 25px #0005;
+        padding: 5px;
+        display: none;
+      }
+      .n-menu-item.open > .n-submenu {
+        display: block;
+      }
+      .n-pane-screen {
+        top: 40px;
+        bottom: 0;
+        left: var(--n-sidebar-total);
+        right: 0;
+        background: var(--n-pane);
+        display: flex;
+        flex-direction: column;
+        z-index: 2;
+      }
+      .n-empty-space {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex: 1;
+        min-height: 0;
+        color: color-mix(in srgb, var(--n-fg) 30%, transparent);
+        font-size: 13px;
+      }
+      .n-session-toolbar {
+        display: flex;
+        gap: 5px;
+        padding: 7px 13px;
+        border-bottom: 1px solid var(--n-border);
+        align-items: center;
+        font-size: 11px;
+        flex-wrap: wrap;
+        color: var(--n-muted);
+      }
+      .n-log {
+        font:
+          11px/1.7 ui-monospace,
+          SFMono-Regular,
+          monospace;
+        color: var(--n-muted);
+        white-space: pre-wrap;
+        background: var(--n-control);
+        border: 1px solid var(--n-border);
+        border-radius: 6px;
+        padding: 10px;
+        max-height: 130px;
+        overflow: auto;
+      }
+      .n-actions {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        margin-top: 12px;
+      }
+      .n-archive-list {
+        font-size: 12px;
+        line-height: 1.7;
+        padding-left: 18px;
+        color: var(--n-muted);
+        margin: 0;
+      }
+      .n-confirm {
+        font-size: 12px;
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+      }
+      .n-confirm input {
+        margin-top: 3px;
+        accent-color: #969696;
+      }
+      .n-new-col {
+        width: 100%;
+        max-width: 832px;
+        margin: 0 auto;
+        padding: 0 16px 16px;
+        position: relative;
+      }
+      .n-new-col .n-composer {
+        margin: 0;
+      }
+      .n-new-heading {
+        font-size: 18px;
+        line-height: 24px;
+        font-weight: 600;
+        margin: 0 0 16px;
+        color: var(--n-fg);
+      }
+      .n-composer-text.n-field-ph {
+        min-height: 40px;
+      }
+      .n-pill {
+        height: 26px;
+        padding: 0 6px;
+        border-radius: 7px;
+        border: 0;
+        background: color-mix(in srgb, var(--n-fg) 10%, transparent);
+        color: var(--n-fg);
+        font-size: 11px;
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        white-space: nowrap;
+      }
+      .n-pill.sq {
+        width: 26px;
+        justify-content: center;
+        padding: 0;
+        font-size: 14px;
+      }
+      .n-send26 {
+        margin-left: auto;
+        width: 26px;
+        height: 26px;
+        border-radius: 7px;
+        border: 0;
+        background: var(--n-fg);
+        color: var(--n-bg);
+        font-size: 14px;
+        line-height: 1;
+      }
+      .n-composer-controls .n-help {
+        margin: 0 0 0 auto;
+      }
+      .n-composer-controls .n-help + .n-send26 {
+        margin-left: 6px;
+      }
+      .n-send26[aria-disabled="true"] {
+        opacity: 0.4;
+        cursor: not-allowed;
+      }
+      .n-bar {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 6px 15px 0;
+        flex-wrap: wrap;
+      }
+      .n-bar-trigger {
+        height: 24px;
+        padding: 0 6px;
+        border: 0;
+        border-radius: 6px;
+        background: transparent;
+        font-size: 12px;
+        color: color-mix(in srgb, var(--n-fg) 55%, transparent);
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        white-space: nowrap;
+      }
+      .n-bar-trigger:hover {
+        background: var(--n-select);
+        color: var(--n-fg);
+      }
+      .n-bar-right {
+        margin-left: auto;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 12px;
+        color: color-mix(in srgb, var(--n-fg) 55%, transparent);
+      }
+      .n-ring {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        border: 2px solid color-mix(in srgb, var(--n-fg) 25%, transparent);
+        flex: none;
+      }
+      .n-state-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        height: 22px;
+        padding: 0 9px;
+        border-radius: 11px;
+        font-size: 11px;
+        background: color-mix(in srgb, var(--n-fg) 8%, transparent);
+        color: var(--n-fg);
+      }
+      .n-dot7 {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #f59e0b;
+        flex: none;
+      }
+      .n-dot7.bad {
+        background: var(--n-danger);
+      }
+      .n-ws-wrap {
+        position: relative;
+        display: inline-flex;
+      }
+      .n-pop {
+        position: absolute;
+        left: 0;
+        bottom: calc(100% + 4px);
+        width: 240px;
+        padding: 6px;
+        border-radius: 12px;
+        background: var(--n-pop);
+        border: 1px solid color-mix(in srgb, var(--n-fg) 10%, transparent);
+        box-shadow: 0 12px 36px #0005;
+        z-index: 8;
+      }
+      .n-pop-head {
+        font-size: 10px;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: var(--n-muted);
+        padding: 6px 10px 4px;
+      }
+      .n-pop-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        width: 100%;
+        height: 36px;
+        padding: 0 10px;
+        border: 0;
+        border-radius: 8px;
+        background: transparent;
+        color: var(--n-fg);
+        font-size: 13px;
+        text-align: left;
+      }
+      .n-pop-row:hover {
+        background: var(--n-select);
+      }
+      .n-pop-row .ic {
+        width: 16px;
+        text-align: center;
+        color: var(--n-muted);
+      }
+      .n-pop-row .chk {
+        margin-left: auto;
+        color: var(--n-muted);
+      }
+      .n-pop-sep {
+        height: 1px;
+        background: var(--n-border);
+        margin: 4px 0;
+      }
+      .n-cloud-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 15px 0;
+        flex-wrap: wrap;
+      }
+      .n-cloud-row .n-help {
+        margin: 0;
+        flex: 1;
+        min-width: 220px;
+      }
+      .n-button.n-btn-modal {
+        height: 32px;
+        min-height: 32px;
+        border-radius: 9px;
+        font-size: 13px;
+        padding: 0 14px;
+      }
+      .n-button.danger.solid {
+        background: #dc2626;
+        border-color: #dc2626;
+        color: #fff;
+      }
+      .n-button.danger.solid:hover {
+        background: #b91c1c;
+        color: #fff;
+      }
+      #screen-delete .n-dialog {
+        width: 560px;
+      }
+      #screen-delete .n-dialog-body p {
+        font-size: 12px;
+        line-height: 17px;
+        margin: 0;
+      }
+      .n-dim {
+        color: color-mix(in srgb, var(--n-fg) 50%, transparent);
+      }
+      .n-cs-head {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 13px;
+        color: var(--n-fg);
+      }
+      .n-cs-head .el {
+        font-size: 12px;
+        color: var(--n-muted);
+      }
+      .n-cs-head .n-link {
+        margin-left: auto;
+      }
+      .n-chev {
+        width: 12px;
+        color: var(--n-muted);
+        font-size: 11px;
+      }
+      .n-spin {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        border: 2px solid #f59e0b44;
+        border-top-color: #f59e0b;
+        animation: n-spin 0.9s linear infinite;
+        flex: none;
+        display: inline-block;
+      }
+      .n-xmark {
+        width: 12px;
+        text-align: center;
+        color: var(--n-danger);
+        font-size: 12px;
+        flex: none;
+      }
+      .n-okmark {
+        width: 12px;
+        text-align: center;
+        color: #4ade80;
+        font-size: 12px;
+        flex: none;
+      }
+      .n-hollow {
+        width: 10px;
+        height: 10px;
+        margin: 0 1px;
+        border-radius: 50%;
+        border: 1.5px solid color-mix(in srgb, var(--n-fg) 35%, transparent);
+        flex: none;
+        display: inline-block;
+      }
+      .n-shimmer {
+        background: linear-gradient(
+          90deg,
+          var(--n-muted) 30%,
+          var(--n-fg) 50%,
+          var(--n-muted) 70%
+        );
+        background-size: 200% 100%;
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+        animation: n-shimmer 2.2s linear infinite;
+      }
+      .n-cs-steps {
+        list-style: none;
+        margin: 8px 0 0;
+        padding: 0 0 0 22px;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        font-size: 12px;
+      }
+      .n-cs-steps li {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .n-cs-steps li.pend {
+        color: var(--n-muted);
+      }
+      .n-cs-steps .dur {
+        margin-left: auto;
+        color: var(--n-muted);
+      }
+      .n-cs-log {
+        margin: 10px 0 0 22px;
+        font:
+          11.5px/1.6 ui-monospace,
+          SFMono-Regular,
+          monospace;
+        color: var(--n-muted);
+        white-space: pre-wrap;
+      }
+      .n-queued {
+        margin: 18px 0 0 auto;
+        max-width: 90%;
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        gap: 4px;
+      }
+      .n-queued .n-user-message {
+        margin: 0;
+      }
+      .n-queued-note {
+        font-size: 12px;
+        color: var(--n-muted);
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .n-fail-box {
+        margin: 10px 0 0 22px;
+        padding: 10px 12px;
+        border-radius: 10px;
+        border: 1px solid color-mix(in srgb, var(--n-danger) 25%, transparent);
+        background: color-mix(in srgb, var(--n-danger) 8%, transparent);
+        font-size: 12px;
+      }
+      .n-fail-box .n-actions {
+        justify-content: flex-start;
+        margin-top: 10px;
+      }
+      .n-progress {
+        position: absolute;
+        left: 0;
+        top: 0;
+        height: 2px;
+        width: 60%;
+        background: #f59e0b;
+        border-radius: 12px 2px 2px 0;
+      }
+      .n-progress.bad {
+        background: var(--n-danger);
+      }
+      .n-composer.rel {
+        position: relative;
+        overflow: hidden;
+      }
+      @keyframes n-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      @keyframes n-shimmer {
+        to {
+          background-position: -200% 0;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .n-spin,
+        .n-shimmer {
+          animation: none;
+        }
+      }
+      .n-caption {
+        font-size: 12px;
+        color: var(--muted);
+        margin: 12px 0;
+      }
+      .n-caption strong {
+        color: var(--ink);
+      }
+      .n-source-note {
+        font-size: 11px;
+        color: var(--muted);
+        margin: 15px 0 0;
+      }
+      .toast {
+        position: fixed;
+        bottom: 24px;
+        right: 24px;
+        max-width: 420px;
+        z-index: 100;
+        background: #202020;
+        color: #ebebeb;
+        border: 1px solid #ffffff26;
+        padding: 12px 17px;
+        border-radius: 8px;
+        font-size: 12px;
+        box-shadow: 0 8px 25px #0003;
+      }
+      .toast[hidden] {
+        display: none;
+      }
+      @media (max-width: 1100px) {
+        main {
+          padding: 35px 27px 60px;
+          margin-left: 195px;
+        }
+        .sidebar {
+          width: 195px;
+          padding: 25px 15px;
+        }
+        .decisions,
+        .flow {
+          grid-template-columns: repeat(2, 1fr);
+        }
+      }
+      @media (max-width: 800px) {
+        .sidebar {
+          position: static;
+          width: auto;
+          padding: 18px 22px;
+          border-bottom: 1px solid var(--line);
+        }
+        .side-caption,
+        .side-note {
+          display: none;
+        }
+        .sidebar nav {
+          display: flex;
+          overflow: auto;
+          margin-top: 12px;
+          gap: 5px;
+        }
+        .sidebar nav a {
+          white-space: nowrap;
+          padding: 7px 10px;
+        }
+        .brand {
+          font-size: 18px;
+        }
+        main {
+          margin: 0;
+          padding: 30px 20px 60px;
+        }
+        h1 {
+          font-size: 34px;
+        }
+        .grid2 {
+          grid-template-columns: 1fr;
+        }
+        .lead {
+          font-size: 16px;
+        }
+        .decisions {
+          gap: 8px;
+        }
+        .decision {
+          padding: 12px;
+        }
+        .n-reviewbar label {
+          margin-left: 0;
+        }
+        .n-caption {
+          font-size: 11px;
+        }
+      }
+      @media print {
+        .sidebar,
+        .n-reviewbar,
+        .toast {
+          display: none;
+        }
+        main {
+          margin: 0;
+          padding: 0;
+        }
+        .n-stage-scroll {
+          overflow: visible;
+        }
+        .n-window {
+          min-width: 0;
+          height: 730px;
+          print-color-adjust: exact;
+          -webkit-print-color-adjust: exact;
+        }
+        .card,
+        .flow article {
+          break-inside: avoid;
+        }
+        section {
+          padding-top: 24px;
+        }
+        h1 {
+          font-size: 30px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <aside class="sidebar">
+      <div class="brand">monoptah<span> /</span></div>
+      <div class="side-caption">Product specification</div>
+      <nav aria-label="Mục lục">
+        <a href="#overview">01 · Phạm vi & quyết định</a>
+        <a href="#prototype">02 · Mockup tương tác</a>
+        <a href="#flow">03 · Flow hoàn chỉnh</a>
+        <a href="#configuration">04 · Cấu hình & credentials</a>
+        <a href="#lifecycle">05 · Lifecycle & recovery</a>
+        <a href="#architecture">06 · Tích hợp native</a>
+        <a href="#acceptance">07 · Acceptance criteria</a>
+        <a href="#review">08 · Quyết định đã chốt</a>
+        <a href="#evidence">09 · Bằng chứng & nguồn</a>
+      </nav>
+      <div class="side-note">
+        Final v1.1<br />08 tháng 11, 2026<br />Đối chiếu với main 65bec991<br /><br />Tài liệu review độc lập.<br />Chưa
+        triển khai tính năng vào app.
+      </div>
+    </aside>
+    <main>
+      <header class="hero">
+        <div class="eyebrow">
+          Native desktop <span class="pill">Final · Scope & UX chốt</span>
+        </div>
+        <h1>Một chức năng.<br />Một cloud workspace.</h1>
+        <p class="lead">
+          Docker Sandbox trở thành lựa chọn chạy session của Monoptah: tự tạo
+          môi trường từ devcontainer, lấy source bằng HTTPS token, chạy Claude
+          Code và xoá sandbox khi công việc kết thúc.
+        </p>
+        <div class="decisions">
+          <div class="decision">
+            <small>WORKSPACE</small><strong>1 sandbox / feature session</strong>
+          </div>
+          <div class="decision">
+            <small>SOURCE V1</small><strong>GitHub · GitLab · Bitbucket</strong>
+          </div>
+          <div class="decision">
+            <small>AUTHENTICATION</small><strong>HTTPS + access token</strong>
+          </div>
+          <div class="decision">
+            <small>AGENT V1</small><strong>Claude Code nguyên bản</strong>
+          </div>
+        </div>
+      </header>
+
+      <section id="overview">
+        <div class="section-number">01 / PRODUCT CONTRACT</div>
+        <h2>Thiết lập một lần. Mỗi task có môi trường riêng.</h2>
+        <p class="section-intro">
+          Docker là execution backend. Repository và environment thuộc project.
+          Agent/account được chọn ở session. Các phần này không gắn cứng với
+          nhau.
+        </p>
+        <div class="grid2">
+          <article class="card">
+            <h3>Trong v1</h3>
+            <ul class="checks">
+              <li>
+                Native app quản lý list/create/status/stop/resume/delete bằng
+                <code>sbx --cloud</code>.
+              </li>
+              <li>
+                GitHub, GitLab.com / GitLab self-managed và Bitbucket Cloud qua
+                HTTPS token; public repo có thể dùng anonymous.
+              </li>
+              <li>
+                Devcontainer từ image, Dockerfile, Features và Compose; chỉ công
+                bố support sau khi qua compatibility tests.
+              </li>
+              <li>
+                Bootstrap Claude Code + Monoptah Host vào môi trường
+                development, kết nối qua transport riêng.
+              </li>
+              <li>
+                Chat, transcript, approvals, files và Git dùng remote session
+                experience hiện có trong phạm vi host hỗ trợ. Lưu ý: với cloud
+                session Codespaces trên <code>main</code>, Explorer/Changes vẫn
+                hiển thị checkout local (banner "Local files - this session runs
+                in codespace ...") và Git write local bị khoá
+                (<code>crates/monocode-gpui/src/git_gate.rs</code>); muốn
+                Files/Git của sandbox là phần việc mới.
+              </li>
+            </ul>
+          </article>
+          <article class="card">
+            <h3>Không nằm trong v1</h3>
+            <ul>
+              <li>
+                Git SSH keys/agent forwarding; mật khẩu tài khoản Git; nhận SSH
+                host do user nhập cho Docker backend.
+              </li>
+              <li>
+                Codex hoặc agent khác trên Docker: kiến trúc để mở, UI chưa cho
+                chọn khi chưa được kiểm chứng.
+              </li>
+              <li>
+                Bitbucket Server/Data Center; API tạo PR/MR đa nền tảng;
+                auto-merge hoặc tự động push.
+              </li>
+              <li>
+                Đồng bộ hai chiều working tree laptop ↔ cloud, upload
+                uncommitted files tự động.
+              </li>
+              <li>
+                Tái tạo nguyên trạng mọi devcontainer/Codespaces extension,
+                hardware hoặc host integration.
+              </li>
+            </ul>
+          </article>
+        </div>
+        <div class="callout">
+          <strong>Ranh giới “SSH”:</strong> loại bỏ SSH cho
+          <em>Git authentication</em>. App vẫn dùng SSH do Docker CLI cung cấp
+          để bootstrap/tunnel vào sandbox; user tự chạy
+          <code>sbx login</code> và <code>sbx --cloud setup ssh</code> một lần
+          trên máy (sau đó SSH dạng <code>ssh &lt;sandbox-id&gt;@sbx_cloud</code>).
+          App không chạy login hay setup thay user, chỉ kiểm tra và hướng dẫn.
+        </div>
+        <p class="small">
+          Phạm vi, UX và defaults đã chốt. Provisioning dùng lại flow/UI
+          Codespaces hiện có; không thiết kế UI riêng cho Docker. Các release
+          gates kỹ thuật vẫn phải kiểm chứng trước khi phát hành: PoC hiện chỉ
+          xác nhận devcontainer, chưa xác nhận toàn bộ agent/auth/host.
+        </p>
+      </section>
+
+      <section id="prototype">
+        <div class="section-number">02 / INTERACTIVE REVIEW</div>
+        <h2>Mockup các màn hình chính</h2>
+        <p class="section-intro">
+          Docker setup mở bằng dialog ngay trên workspace, theo pattern Telegram
+          hiện có. Quản lý credential trong dialog con; chọn nơi chạy ở
+          composer. Không thêm một màn hình Project settings. Dùng các nút
+          review bên ngoài khung app để xem từng trạng thái, đổi theme hoặc
+          layout hiện có.
+        </p>
+
+        <div class="native-review" id="demo">
+          <div
+            class="n-reviewbar"
+            role="tablist"
+            aria-label="Review storyboards - not app navigation"
+          >
+            <button
+              id="tab-menu"
+              role="tab"
+              aria-controls="screen-menu"
+              aria-selected="true"
+              data-screen="menu"
+            >
+              01 Project menu</button
+            ><button
+              id="tab-setup"
+              role="tab"
+              aria-controls="screen-setup"
+              aria-selected="false"
+              data-screen="setup"
+            >
+              02 Docker setup</button
+            ><button
+              id="tab-credentials"
+              role="tab"
+              aria-controls="screen-credentials"
+              aria-selected="false"
+              data-screen="credentials"
+            >
+              03 Git credential</button
+            ><button
+              id="tab-new"
+              role="tab"
+              aria-controls="screen-new"
+              aria-selected="false"
+              data-screen="new"
+            >
+              04 New session</button
+            ><button
+              id="tab-provision"
+              role="tab"
+              aria-controls="screen-provision"
+              aria-selected="false"
+              data-screen="provision"
+            >
+              05 Provisioning</button
+            ><button
+              id="tab-session"
+              role="tab"
+              aria-controls="screen-session"
+              aria-selected="false"
+              data-screen="session"
+            >
+              06 Session</button
+            ><button
+              id="tab-delete"
+              role="tab"
+              aria-controls="screen-delete"
+              aria-selected="false"
+              data-screen="delete"
+            >
+              07 Archive
+            </button>
+          </div>
+          <div class="n-reviewbar">
+            <label for="preview-layout">Existing layout</label
+            ><select id="preview-layout" aria-label="Existing native layout">
+              <option value="current">Sidebar · current default</option>
+              <option value="classic">Classic · project rail</option></select
+            ><select id="preview-theme" aria-label="Preview theme">
+              <option value="dark">Default dark</option>
+              <option value="light">Default light</option>
+            </select>
+          </div>
+          <p class="small">
+            Các nút đánh số ở trên là điều khiển review, không thuộc app. Mockup
+            dùng palette Default và pattern dialog/popover của native; không có
+            trang Project settings mới. Dữ liệu giả, không API, không lưu
+            secret.
+          </p>
+          <div class="n-reviewbar" id="session-review" hidden>
+            <label for="connection-demo">Review control, not part of the app</label
+            ><button id="connection-demo">Disconnect demo</button>
+          </div>
+          <div class="n-stage-scroll">
+            <div
+              class="n-window"
+              id="native-window"
+              data-theme="dark"
+              data-layout="current"
+            >
+              <div class="n-topbar">
+                <div class="n-traffic" aria-hidden="true">
+                  <i></i><i></i><i></i>
+                </div>
+                <span style="margin-right: 12px">▥ &nbsp;⌕</span>
+                <div class="n-tab">
+                  <span class="n-mascot">▦</span> storefront
+                  <span style="color: var(--n-muted)">×</span>
+                </div>
+                <button
+                  class="n-icon-btn"
+                  data-go="new"
+                  aria-label="New session tab"
+                >
+                  +</button
+                ><span class="n-topbar-spacer"></span><span>⑂ main</span>
+              </div>
+              <aside class="n-rail">
+                <div class="n-rail-title">PROJECTS &nbsp; +</div>
+                <button class="n-project-trigger" id="rail-project-trigger">
+                  <span class="n-mascot">▦</span> storefront
+                </button>
+                <div class="n-rail-title">◇ design-system</div>
+              </aside>
+              <aside class="n-sessions">
+                <div class="n-project-head">
+                  <button
+                    class="n-project-trigger"
+                    id="project-trigger"
+                    aria-label="Open storefront project menu"
+                  >
+                    <span class="n-mascot">▦</span> storefront
+                    <span
+                      style="
+                        margin-left: auto;
+                        font-weight: 400;
+                        color: var(--n-muted);
+                      "
+                      >⌄</span
+                    ></button
+                  ><button
+                    class="n-icon-btn"
+                    data-go="new"
+                    aria-label="New session"
+                  >
+                    +
+                  </button>
+                </div>
+                <div class="n-workspace-links">
+                  <div>◷ &nbsp; Today</div>
+                  <div>▱ &nbsp; Inbox</div>
+                  <div>≡ &nbsp; Notes</div>
+                  <div>ϟ &nbsp; Automations</div>
+                </div>
+                <div class="n-section-label">
+                  <span>Sessions</span><span>⌕ &nbsp; +</span>
+                </div>
+                <div class="n-session-card active" id="sidebar-active-session">
+                  <small
+                    >✳ Claude Code <span style="float: right">now</span></small
+                  ><strong id="sidebar-session-title">Add checkout flow</strong
+                  ><small>⑂ feat/checkout-flow</small>
+                </div>
+                <div class="n-session-card">
+                  <small
+                    >✳ Claude Code <span style="float: right">18m</span></small
+                  ><strong>Refine account settings</strong><small>⑂ main</small>
+                </div>
+                <div class="n-side-bottom">
+                  <span>↻ &nbsp; Monoptah</span><span>⚙</span>
+                </div>
+              </aside>
+              <div class="n-underlay" aria-hidden="true">
+                <div class="n-pane-head">
+                  <span>Add checkout flow</span><span>⋯</span>
+                </div>
+                <div class="n-chat-content">
+                  <div class="n-agent-label">✳ Claude Code</div>
+                  <p>The checkout module is ready for the next change.</p>
+                </div>
+                <div class="n-new-col">
+                  <div class="n-composer">
+                    <div class="n-composer-text n-field-ph">
+                      Ask, build, or describe a change…
+                    </div>
+                    <div class="n-composer-controls">
+                      <span class="n-pill sq">+</span
+                      ><span class="n-pill">✳ Opus 4.7 ⌄</span
+                      ><span class="n-pill">🔒 Supervised ⌄</span
+                      ><span class="n-send26">↑</span>
+                    </div>
+                  </div>
+                  <div class="n-bar">
+                    <span class="n-bar-trigger">▭ Current checkout</span
+                    ><span class="n-bar-trigger">⑂ main</span>
+                    <span class="n-bar-right"
+                      ><span>Ready</span><i class="n-ring"></i
+                    ></span>
+                  </div>
+                </div>
+              </div>
+
+              <div
+                class="screen n-menu-screen"
+                id="screen-menu"
+                role="tabpanel"
+                tabindex="0"
+                aria-labelledby="tab-menu"
+              >
+                <div
+                  class="n-context"
+                  role="menu"
+                  aria-label="Project actions for storefront"
+                >
+                  <div class="n-menu-name">
+                    <span class="n-mascot">▦</span> storefront
+                  </div>
+                  <div class="n-swatches" aria-hidden="true">
+                    <i></i><i></i><i></i><i></i><i></i>
+                  </div>
+                  <div class="n-menu-rule"></div>
+                  <button
+                    class="n-menu-button"
+                    role="menuitem"
+                    data-note="Existing project appearance flyout."
+                  >
+                    <span class="n-menu-icon" aria-hidden="true">◉</span>Theme
+                    colors</button
+                  ><button
+                    class="n-menu-button"
+                    role="menuitem"
+                    data-note="Existing background dialog."
+                  >
+                    <span class="n-menu-icon" aria-hidden="true">▧</span
+                    >Background image</button
+                  ><button
+                    class="n-menu-button"
+                    role="menuitem"
+                    data-note="Existing project-scoped Telegram dialog; the Docker dialog follows this pattern."
+                  >
+                    <span class="n-menu-icon" aria-hidden="true">➤</span
+                    >Telegram…
+                  </button>
+                  <div class="n-menu-item" id="cloud-menu">
+                    <button
+                      class="n-menu-button"
+                      id="cloud-trigger"
+                      role="menuitem"
+                      aria-haspopup="menu"
+                      aria-expanded="false"
+                    >
+                      <span class="n-menu-icon">☁</span>Cloud setup<span
+                        class="n-arrow"
+                        >›</span
+                      >
+                    </button>
+                    <div class="n-submenu" role="menu" aria-label="Cloud setup">
+                      <button
+                        class="n-menu-button"
+                        role="menuitem"
+                        data-note="Mở dialog Codespaces setup hiện có (kiểm tra gh và repo, quản lý secrets CLAUDE_CODE_OAUTH_TOKEN và secrets khai báo trong devcontainer.json). Không thêm trang settings."
+                      >
+                        <span class="n-menu-icon" aria-hidden="true">◇</span
+                        >Codespaces</button
+                      ><button
+                        class="n-menu-button"
+                        role="menuitem"
+                        data-go="setup"
+                      >
+                        <span class="n-menu-icon" aria-hidden="true">▱</span
+                        >Docker Sandbox
+                      </button>
+                    </div>
+                  </div>
+                  <div class="n-menu-rule"></div>
+                  <button
+                    class="n-menu-button"
+                    role="menuitem"
+                    data-note="Existing project action."
+                  >
+                    <span class="n-menu-icon" aria-hidden="true">▱</span>Reveal
+                    in Finder</button
+                  ><button
+                    class="n-menu-button"
+                    role="menuitem"
+                    data-note="Existing editor submenu."
+                  >
+                    <span class="n-menu-icon" aria-hidden="true">⌘</span>Open in
+                    editor <span class="n-arrow">›</span></button
+                  ><button
+                    class="n-menu-button"
+                    role="menuitem"
+                    data-note="Existing notification submenu."
+                  >
+                    <span class="n-menu-icon" aria-hidden="true">♧</span
+                    >Notifications <span class="n-arrow">›</span>
+                  </button>
+                  <div class="n-menu-rule"></div>
+                  <button
+                    class="n-menu-button"
+                    role="menuitem"
+                    data-note="Existing project archive action - different from sandbox deletion."
+                  >
+                    <span class="n-menu-icon" aria-hidden="true">▣</span
+                    >Archive</button
+                  ><button
+                    class="n-menu-button"
+                    role="menuitem"
+                    data-note="Existing project removal action - unchanged."
+                  >
+                    <span class="n-menu-icon" aria-hidden="true">×</span>Delete
+                  </button>
+                </div>
+              </div>
+
+              <div
+                class="screen n-overlay"
+                id="screen-setup"
+                role="tabpanel"
+                tabindex="0"
+                aria-labelledby="tab-setup"
+                hidden
+              >
+                <div
+                  class="n-dialog"
+                  role="dialog"
+                  aria-label="Docker Sandbox"
+                  aria-modal="true"
+                >
+                  <div class="n-dialog-header">
+                    <div>
+                      <h3>Docker Sandbox</h3>
+                      <p>Cloud setup for storefront</p>
+                    </div>
+                    <button
+                      class="n-icon-btn"
+                      aria-label="Close Docker Sandbox"
+                      data-go="menu"
+                    >
+                      ×
+                    </button>
+                  </div>
+                  <div class="n-dialog-body">
+                    <div>
+                      <div class="n-row">
+                        <span>Docker cloud access</span
+                        ><span class="n-status good">✓ Ready</span>
+                      </div>
+                      <div class="n-help">
+                        sbx v0.51.0 · signed in · SSH configured
+                        <button
+                          class="n-link"
+                          data-note="Demo recheck only; no sbx command is executed."
+                        >
+                          Recheck
+                        </button>
+                      </div>
+                    </div>
+                    <div class="n-line">
+                      <div class="n-field">
+                        <label for="repo-url">Repository URL</label
+                        ><input
+                          id="repo-url"
+                          type="text"
+                          value="https://github.com/acme/storefront.git"
+                          readonly
+                        />
+                        <div class="n-help">
+                          HTTPS · GitHub, GitLab or Bitbucket Cloud.
+                        </div>
+                      </div>
+                    </div>
+                    <div>
+                      <div class="n-field">
+                        <label for="project-credential">Git credential</label
+                        ><select id="project-credential">
+                          <option>Work repositories · github.com</option>
+                          <option>None · public repository</option>
+                        </select>
+                      </div>
+                      <div class="n-help">
+                        <button class="n-link" data-go="credentials">
+                          Add or manage credentials…
+                        </button>
+                        &nbsp; Saved on this computer, reusable across projects.
+                      </div>
+                    </div>
+                    <div class="n-field">
+                      <label for="devcontainer-path"
+                        >Devcontainer configuration</label
+                      ><input
+                        id="devcontainer-path"
+                        type="text"
+                        value=".devcontainer/devcontainer.json"
+                        readonly
+                      />
+                      <div class="n-help">
+                        Relative to repository root. Source comes from Git, not
+                        your local changes.
+                      </div>
+                    </div>
+                    <details class="n-line">
+                      <summary>Defaults & project secrets</summary>
+                      <div
+                        style="display: flex; flex-direction: column; gap: 13px"
+                      >
+                        <div class="n-field">
+                          <label for="base-branch">Base branch</label
+                          ><input
+                            id="base-branch"
+                            type="text"
+                            value="main"
+                            readonly
+                          />
+                        </div>
+                        <div class="n-fields2">
+                          <div class="n-field">
+                            <label for="compute">Compute</label
+                            ><select id="compute">
+                              <option>2 vCPU / 4 GiB</option>
+                              <option>4 vCPU / 8 GiB</option>
+                            </select>
+                          </div>
+                          <div class="n-field">
+                            <label for="timeout">Runtime limit</label
+                            ><select id="timeout">
+                              <option>2 hours → stop</option>
+                              <option>1 hour → stop</option>
+                            </select>
+                          </div>
+                        </div>
+                        <div class="n-row">
+                          <span>Project secret bindings</span
+                          ><button
+                            class="n-link"
+                            data-note="Proposed scoped secret picker; no credential values in Git."
+                          >
+                            Manage…
+                          </button>
+                        </div>
+                      </div>
+                    </details>
+                    <div class="n-help">
+                      Saving configures this project only. A sandbox is created
+                      when you click Create and open.
+                    </div>
+                  </div>
+                  <div class="n-dialog-footer">
+                    <button class="n-button" data-go="menu">Cancel</button
+                    ><button
+                      class="n-button"
+                      data-note="Demo: read-only validation. No cloud resource or lifecycle script."
+                    >
+                      Validate</button
+                    ><button class="n-button primary" id="save-project">
+                      Save
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div
+                class="screen n-overlay"
+                id="screen-credentials"
+                role="tabpanel"
+                tabindex="0"
+                aria-labelledby="tab-credentials"
+                hidden
+              >
+                <div
+                  class="n-dialog"
+                  role="dialog"
+                  aria-label="Git credential"
+                  aria-modal="true"
+                >
+                  <div class="n-dialog-header">
+                    <div>
+                      <h3>Git credential</h3>
+                      <p>Reusable HTTPS profile · for storefront</p>
+                    </div>
+                    <button
+                      class="n-icon-btn"
+                      aria-label="Close Git credential"
+                      data-go="setup"
+                    >
+                      ×
+                    </button>
+                  </div>
+                  <div class="n-dialog-body">
+                    <div class="n-help">
+                      Select a saved profile or add an HTTPS access token. This
+                      credential can be reused across projects.
+                    </div>
+                    <div class="n-field">
+                      <label for="saved-profile">Saved profile</label
+                      ><select id="saved-profile">
+                        <option>Work repositories</option>
+                        <option>New credential…</option>
+                      </select>
+                    </div>
+                    <div class="n-field">
+                      <label for="credential-name">Profile name</label
+                      ><input
+                        id="credential-name"
+                        type="text"
+                        value="Work repositories"
+                        readonly
+                      />
+                    </div>
+                    <div class="n-field">
+                      <label for="platform">Platform</label
+                      ><select id="platform">
+                        <option value="github">GitHub</option>
+                        <option value="gitlab">GitLab</option>
+                        <option value="bitbucket">Bitbucket Cloud</option>
+                      </select>
+                    </div>
+                    <div class="n-fields2">
+                      <div class="n-field">
+                        <label for="git-host">Host</label
+                        ><input
+                          id="git-host"
+                          type="text"
+                          value="github.com"
+                          readonly
+                        />
+                      </div>
+                      <div class="n-field">
+                        <label for="git-user">Username</label
+                        ><input
+                          id="git-user"
+                          type="text"
+                          value="developer"
+                          readonly
+                        />
+                      </div>
+                    </div>
+                    <div class="n-help" id="user-help">
+                      GitHub username. The token supplies authentication.
+                    </div>
+                    <div class="n-field">
+                      <label for="demo-token">Access token</label
+                      ><input
+                        id="demo-token"
+                        type="password"
+                        value="DEMO_ONLY_NOT_A_REAL_TOKEN"
+                        readonly
+                        autocomplete="off"
+                      />
+                      <div class="n-help">
+                        Encrypted on this computer. No account password.
+                      </div>
+                    </div>
+                    <div class="n-help" id="scope-help">
+                      Read access for clone/fetch; write permission for push.
+                      Choose only the required repositories.
+                    </div>
+                    <div class="n-row n-line">
+                      <span
+                        class="n-status"
+                        id="credential-result"
+                        role="status"
+                        >Not checked · demo</span
+                      ><button class="n-button" id="test-credential">
+                        Check access
+                      </button>
+                    </div>
+                  </div>
+                  <div class="n-dialog-footer">
+                    <button class="n-button" data-go="setup">Cancel</button
+                    ><button class="n-button primary" id="save-credential">
+                      Save credential
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div
+                class="screen n-pane-screen"
+                id="screen-new"
+                role="tabpanel"
+                tabindex="0"
+                aria-labelledby="tab-new"
+                hidden
+              >
+                <div class="n-pane-head">
+                  <span>New session</span><span>⋯</span>
+                </div>
+                <div class="n-empty-space"></div>
+                <div class="n-new-col">
+                  <h3 class="n-new-heading">
+                    What should we work on in storefront?
+                  </h3>
+                  <div class="n-composer">
+                    <div class="n-composer-text n-field-ph">
+                      Ask, build, or describe a change…
+                    </div>
+                    <div class="n-composer-controls">
+                      <button
+                        class="n-pill sq"
+                        aria-label="Add"
+                        data-note="Existing composer attachments."
+                      >
+                        +</button
+                      ><button
+                        class="n-pill"
+                        data-note="Existing model picker. Claude enabled on Docker v1."
+                      >
+                        ✳ Opus 4.7 ⌄</button
+                      ><button
+                        class="n-pill"
+                        data-note="Existing access mode picker."
+                      >
+                        🔒 Supervised ⌄</button
+                      ><span class="n-help" id="send-hint" role="status" hidden
+                        >Create and open first</span
+                      ><button
+                        class="n-send26"
+                        id="new-send"
+                        aria-label="Send"
+                      >
+                        ↑
+                      </button>
+                    </div>
+                  </div>
+                  <div class="n-cloud-row" id="new-cloud-row" hidden>
+                    <button class="n-bar-trigger" id="cloud-machine">
+                      2 vCPU / 4 GiB · 2h then stop
+                    </button>
+                    <span class="n-help" id="cloud-note"
+                      >Creates paid cloud compute in your Docker account. Your
+                      prompt is queued until the sandbox is ready.</span
+                    ><button
+                      class="n-button primary n-btn-modal"
+                      id="create-session"
+                    >
+                      Create and open
+                    </button>
+                  </div>
+                  <div class="n-bar">
+                    <span class="n-ws-wrap"
+                      ><button
+                        class="n-bar-trigger"
+                        id="ws-trigger"
+                        aria-haspopup="menu"
+                        aria-expanded="false"
+                      >
+                        <span id="ws-trigger-label">▭ Current checkout</span>
+                      </button>
+                      <div
+                        class="n-pop"
+                        id="ws-menu"
+                        role="menu"
+                        aria-label="Workspace"
+                        hidden
+                      >
+                        <div class="n-pop-head" role="presentation">Workspace</div>
+                        <button
+                          class="n-pop-row"
+                          role="menuitemradio"
+                          aria-checked="false"
+                          data-target="checkout"
+                        >
+                          <span class="ic">▭</span>Current checkout<span
+                            class="chk"
+                            >✓</span
+                          ></button
+                        ><button
+                          class="n-pop-row"
+                          role="menuitemradio"
+                          aria-checked="false"
+                          data-target="worktree"
+                        >
+                          <span class="ic">⑂</span>New worktree<span
+                            class="chk"
+                          ></span></button
+                        >
+                        <div class="n-pop-sep" role="separator"></div>
+                        <button
+                          class="n-pop-row"
+                          role="menuitem"
+                          data-note="Existing worktrees submenu - không đổi."
+                        >
+                          Existing worktrees<span class="chk">›</span>
+                        </button>
+                        <div class="n-pop-sep" role="separator"></div>
+                        <div class="n-pop-head" role="presentation">Run on cloud</div>
+                        <button
+                          class="n-pop-row"
+                          role="menuitemradio"
+                          aria-checked="false"
+                          data-target="codespace"
+                        >
+                          <span class="ic">☁</span>Codespace<span
+                            class="chk"
+                          ></span></button
+                        ><button
+                          class="n-pop-row"
+                          role="menuitemradio"
+                          aria-checked="false"
+                          data-target="docker"
+                        >
+                          <span class="ic">☁</span>Docker Sandbox<span
+                            class="chk"
+                          ></span>
+                        </button>
+                      </div> </span
+                    ><button class="n-bar-trigger" id="branch-trigger">
+                      <span id="branch-label">⑂ main</span></button
+                    ><button
+                      class="n-bar-trigger"
+                      id="newbranch-trigger"
+                      hidden
+                    >
+                      → feat/checkout-flow
+                    </button>
+                    <span class="n-bar-right"
+                      ><span>Ready</span><i class="n-ring"></i
+                    ></span>
+                  </div>
+                </div>
+              </div>
+
+              <div
+                class="screen n-pane-screen"
+                id="screen-session"
+                role="tabpanel"
+                tabindex="0"
+                aria-labelledby="tab-session"
+                hidden
+              >
+                <div class="n-pane-head">
+                  <span>Add checkout flow</span
+                  ><button
+                    class="n-icon-btn"
+                    id="session-more"
+                    aria-label="Session cloud actions"
+                    aria-haspopup="true"
+                    aria-controls="session-cloud-actions"
+                    aria-expanded="false"
+                  >
+                    ⋯
+                  </button>
+                </div>
+                <div class="n-session-toolbar">
+                  <span id="session-status" class="n-status good"
+                    >Connected</span
+                  ><span>·</span><span>Docker Sandbox</span><span>·</span
+                  ><span>2h runtime limit</span>
+                </div>
+                <div
+                  class="n-session-toolbar"
+                  id="session-cloud-actions"
+                  hidden
+                >
+                  <button class="n-button" id="stop-demo">Stop sandbox</button
+                  ><button class="n-button danger" data-go="delete">
+                    Archive…
+                  </button>
+                </div>
+                <div class="n-chat-content">
+                  <div class="n-user-message">
+                    Add checkout validation and cover the missing cases.
+                  </div>
+                  <div class="n-agent-label">✳ Claude Code</div>
+                  <p>
+                    I’ll inspect the checkout module and run its tests in the
+                    project’s development environment.
+                  </p>
+                  <div class="n-log">
+Workspace: /workspaces/storefront
+Branch: feat/checkout-flow
+Environment: project devcontainer
+Session owned by Monoptah Host</div>
+                  <div class="n-help" style="margin-top: 16px">
+                    Existing transcript, approvals, files and Git views. No
+                    separate cloud dashboard or new chat layout.
+                  </div>
+                </div>
+                <div class="n-new-col">
+                  <div class="n-composer">
+                    <div class="n-composer-text n-field-ph">
+                      Ask, build, or describe a change…
+                    </div>
+                    <div class="n-composer-controls">
+                      <span class="n-pill sq">+</span
+                      ><button class="n-pill" data-note="Existing model picker; Claude enabled on Docker v1.">✳ Opus 4.7 ⌄</button
+                      ><span class="n-pill">🔒 Supervised ⌄</span
+                      ><button class="n-send26" data-note="Mockup only; no prompt/model request." aria-label="Send follow-up">↑</button>
+                    </div>
+                  </div>
+                  <div class="n-bar">
+                    <span class="n-bar-trigger">☁ Docker Sandbox</span
+                    ><span class="n-bar-trigger">⑂ feat/checkout-flow</span>
+                    <span class="n-bar-right"
+                      ><span>Connected</span><i class="n-ring"></i
+                    ></span>
+                  </div>
+                </div>
+              </div>
+
+              <div
+                class="screen n-overlay"
+                id="screen-delete"
+                role="tabpanel"
+                tabindex="0"
+                aria-labelledby="tab-delete"
+                hidden
+              >
+                <div
+                  class="n-dialog"
+                  role="dialog"
+                  aria-label="Archive cloud session?"
+                  aria-modal="true"
+                >
+                  <div id="archive-step1">
+                    <div class="n-dialog-header">
+                      <div>
+                        <h3>Archive cloud session?</h3>
+                      </div>
+                    </div>
+                    <div class="n-dialog-body">
+                      <p>
+                        ‘Add checkout flow’ runs in the Docker sandbox
+                        monoptah-feat-checkout-flow. A running sandbox keeps
+                        costing money until its runtime limit stops it. Stopping
+                        or deleting it first saves an archived local copy with
+                        the conversation, evidence and code (branches, the stash
+                        and uncommitted changes; ignored files are listed but
+                        not saved).
+                      </p>
+                    </div>
+                    <div class="n-dialog-footer">
+                      <button class="n-button n-btn-modal" data-go="session">
+                        Cancel</button
+                      ><button class="n-button n-btn-modal" id="keep-running">
+                        Keep running</button
+                      ><button
+                        class="n-button danger solid n-btn-modal"
+                        id="archive-delete"
+                      >
+                        Delete sandbox</button
+                      ><button
+                        class="n-button primary n-btn-modal"
+                        id="stop-keep"
+                      >
+                        Stop sandbox
+                      </button>
+                    </div>
+                  </div>
+                  <div id="archive-step2" hidden>
+                    <div class="n-dialog-header">
+                      <div>
+                        <h3>Some files are not saved</h3>
+                      </div>
+                    </div>
+                    <div class="n-dialog-body">
+                      <ul class="n-archive-list">
+                        <li>.env (ignored)</li>
+                        <li>tmp/seed.sql (ignored)</li>
+                      </ul>
+                      <p class="n-dim">
+                        The local copy is saved without them. Deleting the
+                        sandbox removes them for good; stopping it keeps them.
+                      </p>
+                    </div>
+                    <div class="n-dialog-footer">
+                      <button
+                        class="n-button n-btn-modal"
+                        id="keep-running-2"
+                      >
+                        Keep running</button
+                      ><button
+                        class="n-button danger solid n-btn-modal"
+                        id="delete-anyway"
+                      >
+                        Delete anyway</button
+                      ><button
+                        class="n-button primary n-btn-modal"
+                        id="stop-instead"
+                      >
+                        Stop instead
+                      </button>
+                    </div>
+                  </div>
+                  <div
+                    class="n-help"
+                    id="delete-result"
+                    role="status"
+                    style="padding: 0 16px 12px"
+                    hidden
+                  >
+                    <span id="delete-status"
+                      >Demo only. Remote branch and saved credentials are
+                      retained.</span
+                    >
+                    <button class="n-link" data-go="session">
+                      Back to session
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div
+                class="screen n-pane-screen"
+                id="screen-provision"
+                role="tabpanel"
+                tabindex="0"
+                aria-labelledby="tab-provision"
+                hidden
+              >
+                <div class="n-pane-head">
+                  <span>Add checkout flow</span
+                  ><button
+                    class="n-button"
+                    id="toggle-failure"
+                    aria-pressed="false"
+                    title="Review control, not part of the app"
+                  >
+                    Review: Show failure
+                  </button>
+                </div>
+                <div class="n-chat-content">
+                  <div class="n-cs-head">
+                    <span class="n-chev">⌄</span>
+                    <span class="n-spin" data-show="running"></span>
+                    <span class="n-xmark" data-show="failed">✕</span>
+                    <span class="n-shimmer" data-show="running"
+                      >Starting <span class="noun">sandbox</span> · Building
+                      container</span
+                    ><span data-show="failed"
+                      ><span class="Noun">Sandbox</span> failed at Build
+                      container</span
+                    >
+                    <span class="el" data-show="running">1m 12s</span
+                    ><span class="el" data-show="failed">1m 23s</span
+                    ><button
+                      class="n-link"
+                      data-note="Opens the existing creation log (cloud_start_view.rs)."
+                    >
+                      View log
+                    </button>
+                  </div>
+                  <ul class="n-cs-steps">
+                    <li>
+                      <span class="n-okmark">✓</span>Create<span class="dur"
+                        >4s</span
+                      >
+                    </li>
+                    <li>
+                      <span class="n-okmark">✓</span>Provision<span class="dur"
+                        >38s</span
+                      >
+                    </li>
+                    <li>
+                      <span class="n-spin" data-show="running"></span
+                      ><span class="n-xmark" data-show="failed">✕</span>Build
+                      container<span class="dur" data-show="running">30s</span
+                      ><span class="dur" data-show="failed">41s</span>
+                    </li>
+                    <li class="pend">
+                      <span class="n-hollow"></span>Lifecycle commands
+                      (waitFor)
+                    </li>
+                    <li class="pend">
+                      <span class="n-hollow"></span>Configure environment
+                    </li>
+                    <li class="pend">
+                      <span class="n-hollow"></span>Connect over SSH
+                    </li>
+                    <li class="pend"><span class="n-hollow"></span>Open project</li>
+                    <li class="pend">
+                      <span class="n-hollow"></span>Background lifecycle
+                      commands
+                    </li>
+                  </ul>
+                  <div class="n-cs-log">
+#7 [dev 2/5] COPY package*.json ./
+#8 [dev 3/5] RUN npm ci<span data-show="failed">
+ERROR: process "/bin/sh -c npm ci" exited with code 1</span></div>
+                  <div class="n-fail-box" data-show="failed">
+                    devcontainer build failed. The <span class="noun">sandbox</span>
+                    is kept, so a retry reuses it.
+                    <div class="n-actions">
+                      <button class="n-button" data-note="Demo: Retry.">
+                        Retry</button
+                      ><button class="n-button" data-note="Demo: Rebuild container.">
+                        Rebuild container</button
+                      ><button class="n-button danger" data-note="Demo only.">
+                        Delete <span class="noun">sandbox</span>
+                      </button>
+                    </div>
+                  </div>
+                  <div class="n-queued">
+                    <div class="n-user-message">
+                      Add checkout validation and cover the missing cases.
+                    </div>
+                    <span class="n-queued-note"
+                      ><i class="n-dot7"></i>Queued, sends when the
+                      <span class="noun">sandbox</span> is ready</span
+                    >
+                  </div>
+                  <div class="n-help" style="margin-top: 22px">
+                    Review: tái dùng UI start của Codespaces
+                    (<code>cloud_start_view.rs</code>,
+                    <code>transcript/cloud_start.rs</code>) với label trung tính.
+                  </div>
+                  <button
+                    class="n-button"
+                    id="open-session"
+                    data-go="session"
+                    style="margin-top: 10px"
+                  >
+                    Xem session sau khi Ready · demo →
+                  </button>
+                </div>
+                <div class="n-new-col" style="padding-top: 0">
+                  <div class="n-composer rel">
+                    <i class="n-progress" data-show="running"></i
+                    ><i class="n-progress bad" data-show="failed"></i>
+                    <div class="n-composer-text n-field-ph">
+                      Ask, build, or describe a change… (sent when the
+                      <span class="noun">sandbox</span> is ready)
+                    </div>
+                    <div class="n-composer-controls">
+                      <span class="n-pill sq">+</span
+                      ><span class="n-pill">✳ Opus 4.7 ⌄</span
+                      ><span class="n-pill">🔒 Supervised ⌄</span
+                      ><button
+                        class="n-send26"
+                        aria-label="Send"
+                        data-note="Prompt đã được xếp hàng, gửi một lần khi Ready."
+                      >
+                        ↑
+                      </button>
+                    </div>
+                  </div>
+                  <div class="n-bar">
+                    <span class="n-bar-trigger" id="prov-target">☁ Docker Sandbox</span
+                    ><span class="n-bar-trigger">⑂ main</span
+                    ><span class="n-bar-trigger">→ feat/checkout-flow</span>
+                    <span class="n-bar-right"
+                      ><span class="n-state-chip" data-show="running"
+                        ><i class="n-dot7"></i>Building container</span
+                      ><span class="n-state-chip" data-show="failed"
+                        ><i class="n-dot7 bad"></i>Failed at Build container</span
+                      ><i class="n-ring"></i
+                    ></span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <p class="n-caption" id="screen-caption">
+            <strong>Project menu.</strong> Existing appearance controls +
+            actions; the existing "Codespaces setup…" entry becomes the Cloud
+            setup submenu.
+          </p>
+          <p class="n-source-note">
+            UI reference: <code>theme.rs</code> /
+            <code>settings/palettes.rs</code> (neutral Default),
+            <code>popover.rs</code> (menus), <code>telegram_dialog.rs</code> +
+            <code>shell/telegram.rs</code> (420px centred modal, 16px title,
+            12-13px fields, 16px padding), <code>workspace.rs</code> (260px
+            sidebar, optional 220px project rail). New controls are marked by
+            the storyboard; they extend existing surfaces.
+          </p>
+        </div>
+        <div class="callout">
+          <strong>Menu contract:</strong> thay entry "Codespaces setup…"
+          (action <code>codespaces</code>, <code>crates/monocode-gpui/src/shell.rs</code>,
+          ngay sau "Telegram…", chỉ hiện cho project local) bằng
+          <code>Cloud setup ›</code>; submenu gồm <code>Codespaces</code> và
+          <code>Docker Sandbox</code>, cùng điều kiện project local. Hover chỉ
+          mở submenu, không provision tài nguyên. Click Codespaces mở
+          <code>open_codespaces_dialog</code> như cũ; Docker mở dialog cấu hình
+          theo project, không điều hướng sang trang settings mới. Entry header
+          "New session in Codespace…" giữ nguyên. Submenu tự đổi
+          hướng khi gần mép cửa sổ; hỗ trợ keyboard và screen reader trong
+          native implementation.
+        </div>
+      </section>
+
+      <section id="flow">
+        <div class="section-number">03 / END-TO-END FLOW</div>
+        <h2>Từ cấu hình đến session dùng được</h2>
+        <div class="flow">
+          <article>
+            <h3>Chuẩn bị trên máy</h3>
+            <p>
+              User cài sbx, login Docker, setup cloud SSH. App chỉ
+              diagnose/check (<code>sbx --cloud diagnose</code>: CLI, sign-in,
+              API, account access), không mở login flow hoặc ghi SSH config
+              ngầm. Kiểm tra cả network policy của account
+              (<code>sbx --cloud policy ls</code>).
+            </p>
+          </article>
+          <article>
+            <h3>Credential dùng lại</h3>
+            <p>
+              Tạo Git profile: platform, host, username, token. Agent account
+              cấu hình riêng. Project chỉ lưu secret references.
+            </p>
+          </article>
+          <article>
+            <h3>Cloud setup theo project</h3>
+            <p>
+              Chọn HTTPS repo, credential, base ref, devcontainer, secret
+              bindings, architecture, compute và runtime limit.
+            </p>
+          </article>
+          <article>
+            <h3>New feature session</h3>
+            <p>
+              Trong composer của session mới: menu Workspace (dưới composer)
+              chọn Local, Codespace hoặc Docker Sandbox; chọn base branch,
+              compute rồi bấm "Create and open" (có thông báo trả phí). Như
+              Codespaces: session có ngay, step list chạy đến Ready, prompt gõ
+              trong lúc chờ được queue bằng <code>queue_start_message</code> và
+              gửi một lần sau Ready.
+            </p>
+          </article>
+          <article>
+            <h3>Provision & clone</h3>
+            <p>
+              Ghi request ID → tạo Shell sandbox → persist sandbox ID ngay → SSH
+              → cấp Git helper → clone ref và tạo feature branch.
+            </p>
+          </article>
+          <article>
+            <h3>Build environment</h3>
+            <p>
+              Chuẩn bị Dev Container CLI → resolve private registry bindings →
+              devcontainer up → Features/Compose/lifecycle → readiness checks.
+            </p>
+          </article>
+          <article>
+            <h3>Agent + Host</h3>
+            <p>
+              Trong devcontainer: cài Claude nguyên bản, host đúng app version +
+              bundled Node, cấp auth và Git helper, pair/tunnel riêng → Ready.
+            </p>
+          </article>
+          <article>
+            <h3>Develop → archive → delete</h3>
+            <p>
+              App chat/files/Git qua host. Reconnect dùng ID cũ. Hoàn tất:
+              review diff, push khi user yêu cầu, archive history, xác nhận rồi
+              xoá.
+            </p>
+          </article>
+        </div>
+        <div class="grid2">
+          <article class="card">
+            <h3>Readiness là điều kiện, không phải timer</h3>
+            <p>
+              Chỉ mở session tương tác khi đúng workspace/user, CLI Claude chạy
+              được, host health/auth/capabilities hợp lệ, đường kết nối riêng
+              hoạt động và project lifecycle hoàn tất.
+            </p>
+            <p class="small">
+              Nếu user nhập prompt trong lúc provision: giữ draft bằng
+              <code>queue_start_message</code>, gửi đúng một lần sau Ready. Không chạy setup-token hay tự gửi model request để
+              “test auth” khi chưa có hành động user rõ ràng.
+            </p>
+          </article>
+          <article class="card">
+            <h3>Source of truth nằm trên cloud</h3>
+            <p>
+              Clone Git ref đã commit, không upload working tree laptop. Trong
+              một feature session, workspace/branch cố định; mỗi session Docker
+              mới có sandbox riêng.
+            </p>
+            <p class="small">
+              Mở lại cùng session → reconnect/resume sandbox cũ. Tạo session mới
+              → sandbox mới. Đổi config project chỉ áp dụng session tạo sau.
+            </p>
+          </article>
+        </div>
+        <div class="callout warning">
+          <strong>Repository trust:</strong> devcontainer/Dockerfile/lifecycle
+          là code được chạy. Trước lần đầu chạy một config/ref chưa được tin
+          cậy, hiển thị repo + ref + config và credential bindings sẽ được cấp.
+          Không chạy project scripts ở bước Validate. Chỉ cấp agent token sau
+          build; secret cần cho build phải được liệt kê riêng.
+        </div>
+      </section>
+
+      <section id="configuration">
+        <div class="section-number">04 / CONFIGURATION & AUTH</div>
+        <h2>Profile một lần, binding theo project</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Nơi lưu</th>
+                <th>Dữ liệu</th>
+                <th>Quy tắc</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Git credential profile</td>
+                <td>
+                  ID, label, platform, exact HTTPS origin, username, secret
+                  reference, expiry metadata nếu biết
+                </td>
+                <td>
+                  Secret mã hoá AES-256-GCM trong SQLite của app, key ở
+                  <code>credentials.key</code> (0600), cùng cơ chế với account
+                  Claude (<code>accounts/token.rs</code>); không dùng Keychain,
+                  không sync lên Monoptah backend. Không lưu vào repo hoặc settings JSON plaintext. Khác
+                  tài khoản trên cùng host có profile riêng.
+                </td>
+              </tr>
+              <tr>
+                <td>Project cloud config</td>
+                <td>
+                  Repo URL, credential profile ID, base ref, devcontainer path,
+                  secret bindings, compute, architecture, timeout action
+                </td>
+                <td>
+                  Thông tin không mật. Credential binding có thể theo host +
+                  repo path. URL chứa token/password bị từ chối; không tự
+                  redirect secret sang origin khác.
+                </td>
+              </tr>
+              <tr>
+                <td>Agent selection</td>
+                <td>
+                  Provider ID + account reference; default provider có thể đặt
+                  theo project
+                </td>
+                <td>
+                  V1 chỉ Claude Code được enable trên Docker. Token/cách login
+                  không nằm trong repository profile. Các phương thức auth tương
+                  lai do agent adapter chịu trách nhiệm.
+                </td>
+              </tr>
+              <tr>
+                <td>Session snapshot</td>
+                <td>
+                  Local session ID, create request ID, sandbox ID/name, config
+                  version, resolved base commit, branch, host
+                  environment/session ID, provisioning checkpoint
+                </td>
+                <td>
+                  Persist trước/sau các side effect quan trọng để khôi phục.
+                  Không chứa raw secrets, command argv hoặc log có token.
+                </td>
+              </tr>
+              <tr>
+                <td>Devcontainer trong Git</td>
+                <td>
+                  Image/Dockerfile, Features, Compose, workspace/runtime/env
+                  không mật và lifecycle
+                </td>
+                <td>
+                  Giữ portable, không nhét cấu hình sbx hoặc agent account bắt
+                  buộc vào repo. App overlay công cụ host/agent; không sửa
+                  tracked devcontainer tự động.
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <h3 style="margin-top: 25px">HTTPS token adapters v1</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Platform</th>
+                <th>Git HTTPS credential</th>
+                <th>Phạm vi / kiểm tra</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>GitHub</td>
+                <td>GitHub username + personal access token</td>
+                <td>
+                  Repo phải thuộc quyền token; clone/fetch và push phụ thuộc
+                  quyền riêng. Fine-grained permissions, SSO/org approval có thể
+                  cần. API tạo PR không nằm trong generic Git auth.
+                </td>
+              </tr>
+              <tr>
+                <td>GitLab</td>
+                <td>
+                  Username không rỗng + access token; PAT có thể dùng
+                  <code>oauth2</code> làm username
+                </td>
+                <td>
+                  GitLab.com và self-managed HTTPS. Gợi ý
+                  <code>read_repository</code>/<code>write_repository</code> cho
+                  PAT phù hợp. Không mặc định cấp API scope rộng.
+                </td>
+              </tr>
+              <tr>
+                <td>Bitbucket Cloud</td>
+                <td>
+                  API token có scopes + username hoặc
+                  <code>x-bitbucket-api-token-auth</code>
+                </td>
+                <td>
+                  Clone cần <code>read:repository:bitbucket</code>; push thêm
+                  write scope. Không dùng account password/app passwords cũ.
+                  Server/DC để ngoài v1.
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="small" style="margin-top: 12px">
+          “Check repository access” chỉ kiểm tra read bằng thao tác Git
+          read-only, không push thử hoặc tạo branch trên remote. Read thành công
+          không chứng minh write permission; UI phải nói rõ.
+        </p>
+        <div class="grid2" style="margin-top: 22px">
+          <article class="card">
+            <h3>Cấp token cho sandbox mới</h3>
+            <ol>
+              <li>
+                App giải mã profile từ store của app tại thời điểm provision.
+              </li>
+              <li>
+                Chuyển qua kênh authenticated/private; không token trong argv,
+                clone URL, prompt hay log.
+              </li>
+              <li>
+                Git helper/broker trong sandbox giữ credential trong memory, cấp
+                theo exact host/path đã bind.
+              </li>
+              <li>
+                Helper dùng được ở outer sandbox lúc clone và bên trong
+                devcontainer cho fetch/push, kể cả app disconnect.
+              </li>
+              <li>
+                Process restart mất memory → cần app cấp lại; hiển thị
+                “Credential required”, không fallback sang password hoặc profile
+                khác.
+              </li>
+            </ol>
+            <p class="small">
+              Đây là thiết kế đề xuất cần PoC riêng. Không hứa snapshot an toàn:
+              memory checkpoint có thể chứa token. Agent chạy cùng OS user có
+              thể sử dụng credential được cấp; không coi helper là isolation
+              tuyệt đối.
+            </p>
+          </article>
+          <article class="card">
+            <h3>Agent authentication</h3>
+            <p>
+              V1 chạy Claude Code do Anthropic phát hành, không sửa binary.
+              Không tạo flow setup-token mới trong sandbox. Codespaces trên
+              <code>main</code> đặt <code>CLAUDE_CODE_OAUTH_TOKEN</code> làm
+              user codespace secret qua <code>gh</code> (giá trị chỉ đi qua
+              stdin); bootstrap restart Host khi hash token đổi. Dialog
+              Codespaces setup chạy <code>claude setup-token</code> trong
+              terminal nhúng và tự bắt token từ output
+              (<code>crates/monocode-gpui/src/codespaces_dialog.rs</code>); named
+              accounts (PR #52) lưu setup-token/API key mã hoá trong DB local và
+              chỉ inject cho process Claude local. Docker chưa có kênh tương
+              đương được xác nhận.
+            </p>
+            <p class="small">
+              Setup-token có hạn một năm, chỉ dùng cho model requests (không
+              Remote Control, không claude.ai connectors) và yêu cầu plan
+              Pro/Max/Ultra/Team/Enterprise. Bare mode không đọc
+              <code>CLAUDE_CODE_OAUTH_TOKEN</code>.
+            </p>
+            <p>
+              <strong>Chốt v1:</strong> dùng account Claude đã cấu hình trong app
+              (<code>ClaudeCredential</code> của PR #52). Setup-token →
+              <code>CLAUDE_CODE_OAUTH_TOKEN</code>, API key →
+              <code>ANTHROPIC_API_KEY</code>; adapter chỉ đặt đúng một biến cho
+              Host/Claude trong devcontainer và gỡ biến còn lại cùng
+              <code>ANTHROPIC_AUTH_TOKEN</code>: với setup-token, hai biến API
+              key/auth token thắng <code>CLAUDE_CODE_OAUTH_TOKEN</code> trong thứ
+              tự auth; với API key, gỡ token OAuth để biết chắc nguồn tính phí. Không login
+              hay chạy setup-token trong sandbox.
+            </p>
+            <p class="small">
+              Docker cloud credentials chỉ tài liệu hoá đường Anthropic API key
+              (<code>sbx --cloud secret set anthropic</code>, proxy gắn header).
+              App không dùng secret store này mà tự đặt env, nên cần PoC rằng
+              request của Claude với <code>CLAUDE_CODE_OAUTH_TOKEN</code> đi qua
+              network policy/proxy của Docker cloud mà không bị chặn hoặc ghi đè
+              header.
+            </p>
+            <p>
+              Điều khoản Anthropic cho phép end user đăng nhập binary nguyên bản
+              bằng subscription của chính họ, kể cả khi platform host Claude
+              Code; nhưng cấm developer thu thập, lưu hoặc intermediate Claude.ai
+              credentials/session tokens và khuyến nghị API key cho sản phẩm.
+            </p>
+            <p class="small">
+              Release gate: kiểm chứng kỹ thuật và làm rõ cách lưu/chuyển token
+              được phép. Flow Codespaces hiện có (app chuyển token vào codespace
+              secret) cũng thuộc cùng câu hỏi điều khoản, nên không được coi là
+              bằng chứng hợp lệ cho Docker cloud.
+            </p>
+          </article>
+        </div>
+        <details>
+          <summary>
+            Private registry, package secrets, submodules và custom CA
+          </summary>
+          <p>
+            Registry auth cần trước khi pull/build devcontainer, không chỉ sau
+            khi host Ready. Docker cloud secret commands không hỗ trợ registry
+            credentials, nên app phải tự cấp (ví dụ <code>docker login</code>
+            qua stdin trong outer sandbox) và đó là phần cần PoC. Package credentials chỉ cấp ở bước cần, không qua
+            Docker build args/layers. Cấu hình secret references theo host và
+            mục đích; không commit giá trị vào <code>.npmrc</code>, Compose hoặc
+            image.
+          </p>
+          <p>
+            V1 phát hiện private submodule/LFS domain chưa có binding và dừng rõ
+            “Additional repository credential required”. Không gửi token chính
+            sang domain khác. Các tổ hợp này phải qua compatibility tests riêng
+            trước khi công bố hỗ trợ.
+          </p>
+          <p>
+            Self-managed HTTPS cần CA/proxy được cấu hình riêng nếu có; không
+            tắt TLS/host verification. URL SSH/local path không được nhận cho
+            Docker source v1.
+          </p>
+        </details>
+      </section>
+
+      <section id="lifecycle">
+        <div class="section-number">05 / STATE & RECOVERY</div>
+        <h2>Không tạo lại sandbox khi chỉ mất kết nối</h2>
+        <div class="trace">
+          Preflight → Create → Provision → Build container → Lifecycle commands
+          (waitFor) → Configure environment → Connect over SSH → Open project →
+          Ready (Background lifecycle commands chạy tiếp, không chặn Ready)<br />
+          Ready ↔ Disconnected (task có thể vẫn chạy)<br />
+          Ready → Stopping → Stopped → Resuming → Connect over SSH → Ready<br />
+          Failed(step) → Retry (cùng sandbox ID nếu còn tồn tại) hoặc Rebuild
+          (dựng lại devcontainer trong cùng sandbox)<br />
+          Ready / Failed / Stopped → Archiving (convert) → Keep running /
+          Stopped (mặc định) / Deleted (history read-only)<br />
+          Any live state → Missing / Expired (không tự tạo và replay prompt)
+        </div>
+        <p class="small">
+          Các state provisioning hiển thị qua <code>StepKind</code> và
+          <code>StartRecord</code> hiện có (mục 06), không thêm state machine UI
+          riêng. Stopped/Missing dùng lại <code>CloudState</code>.
+        </p>
+        <div class="table-wrap" style="margin-top: 18px">
+          <table>
+            <thead>
+              <tr>
+                <th>Trường hợp</th>
+                <th>Hành vi bắt buộc</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Save setup / Validate</td>
+                <td>
+                  Không provision, không compute charge, không chạy lifecycle.
+                  Thiếu sbx/login/SSH → hướng dẫn lệnh user tự chạy, có Recheck.
+                </td>
+              </tr>
+              <tr>
+                <td>Create timeout / app crash</td>
+                <td>
+                  Không create mù lần nữa. Reconcile bằng request/session name +
+                  persisted ID; claim lại sandbox khớp. Không attach sandbox
+                  cùng tên nhưng khác ownership metadata.
+                </td>
+              </tr>
+              <tr>
+                <td>Git token sai/hết hạn</td>
+                <td>
+                  Failed ở clone/fetch/push; update credential → cấp lại đúng
+                  scope → retry. Không chuyển sang account password. Không xoá
+                  working tree để clone lại nếu có thay đổi.
+                </td>
+              </tr>
+              <tr>
+                <td>Devcontainer build/lifecycle lỗi</td>
+                <td>
+                  Hiển thị stage + redacted logs. Retry cùng sandbox, bảo vệ
+                  thay đổi workspace; rebuild có cảnh báo data container. Cho
+                  Stop hoặc Delete rõ ràng.
+                </td>
+              </tr>
+              <tr>
+                <td>Desktop ngủ / tunnel mất</td>
+                <td>
+                  Hiển thị Disconnected, không coi task đã dừng. Reconnect cùng
+                  host/session, nhận transcript mới; giữ command IDs để tránh
+                  gửi prompt hai lần.
+                </td>
+              </tr>
+              <tr>
+                <td>Stop / runtime limit</td>
+                <td>
+                  Stop là tạm dừng cả agent, devcontainer và infra. App theo dõi
+                  trạng thái thực đến stopped; không hứa tiếp tục model/tool
+                  request đang dở. Khi resume phải reconcile provider operation,
+                  không tự replay.
+                </td>
+              </tr>
+              <tr>
+                <td>Runtime limit hết khi user offline</td>
+                <td>
+                  Luôn truyền <code>--on-timeout stop</code> tường minh: nếu bỏ
+                  trống, server stop sandbox resumable và xoá phần còn lại. TTL là
+                  wall-clock runtime limit, không phải idle timer; mỗi lần resume
+                  bắt đầu một TTL mới. Chỉ dùng non-volume-backed sandbox v1
+                  (volume-backed không stop được; hành vi của
+                  <code>--on-timeout stop</code> với loại này chưa rõ).
+                </td>
+              </tr>
+              <tr>
+                <td>Runtime limit sắp hết khi đang có turn</td>
+                <td>
+                  Hiển thị thời gian còn lại trước khi hết hạn. Gia hạn chỉ khi
+                  user bấm (<code>sbx --cloud ttl +&lt;duration&gt;</code>); Docker
+                  không cho gia hạn quá 24 giờ kể từ lúc tạo. Không tự gia hạn.
+                </td>
+              </tr>
+              <tr>
+                <td>Plan/billing/quota từ chối create</td>
+                <td>
+                  Failed(Create) với thông báo của Docker, không retry tự động.
+                  Theo docs Docker, cloud sandbox cần Docker Agentic Platform
+                  (pay-as-you-go) trên account Docker Personal/Pro; chưa thấy
+                  nguồn chính thức gọi tính năng là experimental (chỉ volume là
+                  experimental). App không suy diễn số dư credits; usage của
+                  Docker có thể trễ tới 48 giờ nên UI không hiển thị "còn bao
+                  nhiêu credits".
+                </td>
+              </tr>
+              <tr>
+                <td>Kết thúc turn / đóng tab</td>
+                <td>
+                  Không auto-delete theo agent turn. Đóng tab/app không stop.
+                  User archive session qua dialog chung "Archive cloud session?"
+                  (Keep running / Stop / Delete); UI luôn hiển thị cloud
+                  state/runtime limit.
+                </td>
+              </tr>
+              <tr>
+                <td>Archive (Stop / Delete)</td>
+                <td>
+                  Cùng flow Codespaces: cancel/wait active turn → convert sang
+                  local session đã archive (transcript, JSONL, bundle/patch code
+                  chưa push) → nếu còn file chưa lưu thì review "Delete anyway" /
+                  "Stop instead" → stop hoặc xoá đúng sandbox ID → verify. Không
+                  push, xoá branch remote hay xoá project credential.
+                </td>
+              </tr>
+              <tr>
+                <td>Archive lỗi / host unreachable</td>
+                <td>
+                  Không báo archive đầy đủ và không xoá tự động. Giữ sandbox,
+                  cho reconnect/resume rồi retry. Nếu user vẫn muốn xoá:
+                  confirmation riêng nói rõ mất history/data chưa tải.
+                </td>
+              </tr>
+              <tr>
+                <td>Sandbox bị xoá bên ngoài</td>
+                <td>
+                  Đánh dấu Missing, giữ local metadata/history đã sync. Tạo
+                  replacement là hành động mới có charge và workspace mới; không
+                  giả vờ resume task cũ.
+                </td>
+              </tr>
+              <tr>
+                <td>Network policy chặn egress</td>
+                <td>
+                  Policy account/sandbox (<code>allow-all</code>,
+                  <code>balanced</code>, <code>deny-all</code>) có thể chặn Git
+                  host, Anthropic API, <code>claude.ai/install.sh</code>, GitHub
+                  release của Host, registry/Features. Preflight liệt kê các
+                  destination cần; khi lỗi hiển thị stage + host bị chặn (gợi ý
+                  <code>sbx --cloud policy log</code>), không tự sửa policy của
+                  user.
+                </td>
+              </tr>
+              <tr>
+                <td>Stop/resume báo "not found"</td>
+                <td>
+                  Docs: operation có thể bị tắt cho account. Không coi là
+                  Missing ngay; inspect theo ID rồi mới kết luận, không create
+                  thay thế.
+                </td>
+              </tr>
+              <tr>
+                <td>Gửi prompt khi sandbox Stopped</td>
+                <td>
+                  Codespaces hiện tự wake khi user gửi/retry
+                  (<code>cloud_wake.rs</code>, <code>ensure_before_send</code>).
+                  Với Docker, resume tốn compute: chỉ resume theo hành động user,
+                  không resume từ background polling. <code>--env</code> và
+                  <code>--allow-network</code> bị từ chối khi resume, nên mọi
+                  env/network rule phải đặt lúc create.
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="small" style="margin-top: 12px">
+          Default v1: small 2 CPU/4 GiB (cũng là default của Docker), runtime
+          limit 2 giờ (Docker default là 1 giờ nên app phải truyền
+          <code>--ttl</code>), timeout stop. Không tự gia hạn TTL làm tăng chi
+          phí. Architecture lấy từ project/session đã chọn qua
+          <code>--platform linux/arm64|linux/amd64</code> trong phạm vi account
+          hỗ trợ; PoC chỉ chạy ARM64, không mặc định mọi image đều có ARM64.
+        </p>
+      </section>
+
+      <section id="architecture">
+        <div class="section-number">06 / NATIVE INTEGRATION</div>
+        <h2>Tổng quát hoá cloud session Codespaces, thêm Docker backend</h2>
+        <p>
+          <code>main</code> đã có GitHub Codespaces đầy đủ trong native app.
+          Cloud session là remote session bình thường
+          (<code>remote://&lt;env&gt;/workspaces/&lt;repo&gt;</code>) mà
+          <code>store::RemoteProject</code> mang binding
+          <code>local_project</code> + <code>codespace</code>; chat, composer,
+          stop, archive đi qua remote session path có sẵn. Docker Sandbox là
+          backend thứ hai của cùng flow này, không phải manager tách rời.
+        </p>
+        <div class="grid2">
+          <article class="card">
+            <h3>Dùng lại (có sẵn trên main)</h3>
+            <ul>
+              <li>
+                <code>crates/monocode-core/src/cloud_sessions.rs</code>:
+                <code>CloudSessions</code>, <code>CloudBinding</code>,
+                <code>CloudState</code>, <code>SessionTarget</code>,
+                <code>ensure_before_send</code> (chỉ wake khi user gửi/retry),
+                <code>require_claude</code> (Claude-only), stop/delete,
+                <code>pull_evidence</code>.
+              </li>
+              <li>
+                <code>cloud_sessions/startup.rs</code>: non-blocking start
+                <code>begin_start</code> → <code>run_start</code> (idempotent cho
+                first run, Retry và resume sau restart); Rebuild gọi
+                <code>rebuild_start</code> để reset steps rồi chạy lại
+                <code>run_start</code>; <code>StartRecord</code> persist ở
+                setting <code>cloud-starts.v1</code>; prompt gõ khi đang start
+                được giữ bằng <code>queue_start_message</code>.
+              </li>
+              <li>
+                <code>cloud_sessions/convert.rs</code>: archive trước khi
+                stop/delete. Sync transcript, pull <code>.evidence</code>, stage
+                JSONL của Claude, <code>git bundle</code> commit chưa có trên
+                remote, patch thay đổi chưa commit (kể cả untracked) vào một
+                local session đã archive; <code>restore_code</code> khôi phục.
+              </li>
+              <li>
+                UI: <code>cloud_start_view.rs</code>,
+                <code>transcript/cloud_start.rs</code>,
+                <code>codespace_pane.rs</code> (tab
+                <code>RightTab::Codespace</code>),
+                <code>shell/cloud_start.rs</code> (Retry, Rebuild, Open in
+                browser, Delete, View log), <code>shell/cloud.rs</code> (dialog
+                "Archive cloud session?" với Keep running / Stop / Delete, cảnh
+                báo "Some files are not saved"), <code>cloud_wake.rs</code>.
+              </li>
+              <li>
+                Remote host: <code>crates/monocode-core/src/remote.rs</code>,
+                <code>remote/ssh.rs</code> (tunnel, pairing,
+                <code>codespace_bootstrap_script</code>),
+                <code>remote/remote_bootstrap.sh</code> (cài Host đúng version có
+                checksum, cài Claude Code nếu thiếu, restart Host khi hash
+                <code>CLAUDE_CODE_OAUTH_TOKEN</code> đổi),
+                <code>store/remote.rs</code>, <code>host/child-backend.ts</code>.
+              </li>
+            </ul>
+          </article>
+          <article class="card">
+            <h3>Cần làm mới cho Docker</h3>
+            <ul>
+              <li>
+                Backend seam: core hiện gắn cứng Codespaces
+                (<code>GhRunner</code>, <code>StartRecord.codespace</code>,
+                <code>RemoteProject.codespace</code>,
+                <code>SshTarget.codespace</code>, endpoint
+                <code>codespace://</code>, <code>CODESPACE_NOT_CONNECTED</code>).
+                Cần một trait backend (create/state/stop/resume/delete/log/
+                transport) với Codespaces là implementation đầu tiên.
+              </li>
+              <li>
+                <code>sbx</code> runner tương đương <code>codespaces.rs</code>
+                (injectable cho test, secret chỉ qua stdin), dùng
+                <code>sbx --cloud create/ls/inspect/exec/stop/rm/ttl</code>;
+                resume qua <code>attach</code>/<code>run --name</code> (không có
+                lệnh <code>start</code>; <code>sbx --help</code> v0.51.0: attach
+                "starting it first if it is stopped"). Luôn chạy với
+                <code>--no-input</code> để lệnh cần hỏi sẽ fail thay vì treo.
+              </li>
+              <li>
+                Transport hai lớp: <code>gh codespace ssh</code> vào thẳng dev
+                container, còn <code>ssh &lt;id&gt;@sbx_cloud</code> vào outer
+                Shell sandbox. Cần wrapper <code>devcontainer exec</code> để
+                bootstrap Host đúng container/remoteUser/home và route port Host
+                của container ra loopback của outer sandbox.
+              </li>
+              <li>
+                Repo URL HTTPS + Git credential profile + broker: Codespaces lấy
+                repo từ <code>origin</code> của project local và GitHub tự cấp
+                quyền Git, nên không có gì để dùng lại.
+              </li>
+              <li>
+                Cấp Claude auth: Codespaces dựa vào user codespace secret do
+                GitHub inject; Docker cloud không có kênh OAuth được tài liệu
+                hoá (xem 04).
+              </li>
+              <li>
+                Label trung tính: <code>StepKind::label</code> và
+                <code>running_label</code> ("Configure codespace", "Creating
+                codespace"), headline "Starting codespace" trong
+                <code>cloud_start_view.rs</code>, "Delete codespace", "Rebuild
+                this codespace?" đang ghi cứng chữ codespace.
+              </li>
+            </ul>
+          </article>
+        </div>
+        <div class="table-wrap" style="margin-top: 20px">
+          <table>
+            <thead>
+              <tr>
+                <th>StepKind trên main (id)</th>
+                <th>Codespaces hôm nay</th>
+                <th>Docker adapter</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Create (<code>create</code>)</td>
+                <td>REST <code>POST repos/{repo}/codespaces</code>, có tên ngay</td>
+                <td>
+                  <code>sbx --cloud create</code> với tên chứa request ID,
+                  <code>--ttl</code>, <code>--on-timeout stop</code>,
+                  <code>--platform</code>; persist sandbox ID ngay
+                </td>
+              </tr>
+              <tr>
+                <td>Provision (<code>provision</code>)</td>
+                <td>Poll gh state đến Available (wall clock)</td>
+                <td>
+                  Chờ sandbox running, cấp Git helper, clone ref, tạo feature
+                  branch
+                </td>
+              </tr>
+              <tr>
+                <td>Build container (<code>buildContainer</code>)</td>
+                <td>Từ creation log</td>
+                <td>
+                  Cài Dev Container CLI (standalone installer), resolve registry
+                  bindings, rồi build; tiến độ từ output của
+                  <code>devcontainer up</code>
+                </td>
+              </tr>
+              <tr>
+                <td>
+                  Lifecycle commands (waitFor) (<code>blockingCommands</code>)
+                </td>
+                <td>Từ creation log, chạy trước Available</td>
+                <td>
+                  Lifecycle commands đến <code>waitFor</code>:
+                  <code>devcontainer up --skip-non-blocking-commands</code>
+                </td>
+              </tr>
+              <tr>
+                <td>Configure codespace (<code>configureCodespace</code>)</td>
+                <td>Từ creation log</td>
+                <td>
+                  Không có tương đương; dùng cho bước overlay Git helper +
+                  Claude + Host vào container (đổi label)
+                </td>
+              </tr>
+              <tr>
+                <td>Connect over SSH (<code>connect</code>)</td>
+                <td><code>gh codespace ssh</code> + bootstrap + tunnel</td>
+                <td>SSH vào outer sandbox → exec vào container → tunnel</td>
+              </tr>
+              <tr>
+                <td>Open project (<code>openProject</code>)</td>
+                <td>Mở <code>/workspaces/&lt;repo&gt;</code>, rebind session</td>
+                <td>Như Codespaces, với workspace folder của devcontainer</td>
+              </tr>
+              <tr>
+                <td>
+                  Background lifecycle commands (<code>lifecycleCommands</code>)
+                </td>
+                <td>Sau Available, không chặn Ready</td>
+                <td>Phần còn lại: <code>devcontainer run-user-commands</code> chạy nền, không chặn Ready</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="small">
+          Readiness ở mục 03 (CLI Claude chạy được, host health/auth hợp lệ) nằm
+          trong Connect/Open project; không thêm step mới. Rebuild ánh xạ sang
+          dựng lại devcontainer trong cùng sandbox (không tạo sandbox mới).
+          "Open in browser" chưa có tương đương Docker được tài liệu hoá nên ẩn. Dev Container
+          CLI có sẵn cờ <code>--skip-non-blocking-commands</code> (dừng sau
+          <code>waitFor</code>) và lệnh <code>run-user-commands</code>; chỉ cần
+          PoC chạy hai bước này nối nhau và lấy log
+          (<code>--log-format json</code>) cho step list.
+        </p>
+        <div class="table-wrap" style="margin-top: 20px">
+          <table>
+            <thead>
+              <tr>
+                <th>Module / responsibility</th>
+                <th>Yêu cầu tích hợp</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Source adapter (mới)</td>
+                <td>
+                  Parse/validate HTTPS URL, platform preset, username
+                  conventions, credential context. Generic Git operations tách
+                  khỏi GitHub/GitLab/Bitbucket API integrations.
+                </td>
+              </tr>
+              <tr>
+                <td>Environment adapter (mới)</td>
+                <td>
+                  Official Dev Container CLI, pinned bootstrap versions, build
+                  logs, config selection, lifecycle readiness, state path
+                  persist qua container rebuild. Lưu ý: Host đã pin theo app
+                  version + checksum, nhưng bootstrap hiện cài Claude Code bản
+                  mới nhất qua <code>claude.ai/install.sh</code> (best effort,
+                  không pin); quyết định pin hay không là việc của adapter.
+                </td>
+              </tr>
+              <tr>
+                <td>Agent adapter (mở rộng)</td>
+                <td>
+                  Mở rộng bootstrap hiện có (<code>MONOCODE_HOST_INSTALL_CLAUDE</code>
+                  cài bằng installer chính thức). Provider không hardcode vào
+                  Docker backend; giữ <code>require_claude</code> cho v1. Không
+                  giả client hoặc bypass gateway.
+                </td>
+              </tr>
+              <tr>
+                <td>Credential service (mới)</td>
+                <td>
+                  Secret references, scoped delivery/rotation, redaction. Git
+                  credential broker và agent auth có contract riêng; không dùng
+                  universal token field. Lưu như <code>accounts/token.rs</code>
+                  (AES-256-GCM + <code>credentials.key</code>), không Keychain.
+                </td>
+              </tr>
+              <tr>
+                <td>Remote session runtime (dùng lại)</td>
+                <td>
+                  Prompt/events/approval/cancel/files/Git protocol và durable
+                  command receipts. Host package có Node riêng; Node của project
+                  không thay thế runtime được pin của Host. Children kế thừa
+                  environment của Host (<code>host/child-backend.ts</code>), nên
+                  cần scoping credentials trước khi launch.
+                </td>
+              </tr>
+              <tr>
+                <td>Archive (dùng lại <code>convert.rs</code>)</td>
+                <td>
+                  Chạy convert qua backend seam trước khi xoá sandbox: transcript,
+                  evidence, Claude JSONL, bundle/patch code chưa push. Thay
+                  <code>gh codespace cp</code> bằng copy qua sbx SSH. Giữ read-only;
+                  không reuse remote device token.
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warning">
+          <strong>Không đồng nghĩa full local parity:</strong> remote host hiện
+          có các giới hạn capability, gồm terminal, named provider accounts
+          và một số workflows local (<code>docs/remote-access.md</code>). Cloud
+          session Codespaces bù terminal bằng "Open terminal in codespace"
+          (<code>gh codespace ssh</code> local, vào thẳng container); với Docker
+          <code>ssh &lt;id&gt;@sbx_cloud</code> vào outer sandbox nên cần exec
+          thêm vào devcontainer. Explorer/Changes của cloud session hiện là
+          checkout local (<code>git_gate.rs</code>). V1 dùng capability
+          negotiation, không bật control giả. Browser
+          preview/port forwarding là workstream riêng nếu muốn đưa vào scope;
+          <code>sbx --cloud ports --publish</code> tạo URL public nên không dùng
+          cho Host.
+        </div>
+        <details>
+          <summary>Khác biệt có chủ đích so với Codespaces</summary>
+          <ul>
+            <li>
+              Codespaces cho nhiều session dùng chung một codespace
+              (<code>CodespaceChoice::Named</code>; archive mặc định Keep khi
+              codespace còn được chia sẻ). Docker v1 là 1 session = 1 sandbox.
+            </li>
+            <li>
+              Codespaces dùng idle timeout 30m và retention 72h
+              (<code>IDLE_TIMEOUT</code>, <code>RETENTION_PERIOD</code>); Docker
+              là wall-clock TTL, mặc định Docker 1h, tối đa 24h kể từ lúc tạo
+              khi gia hạn.
+            </li>
+            <li>
+              Cả hai backend tạo tài nguyên khi user bấm "Create and open".
+              Composer thêm lối vào thủ công cho cả hai; cloud picker ở header
+              menu của Codespaces giữ nguyên.
+            </li>
+            <li>
+              Dữ liệu cũ: <code>remote-projects.v2</code>,
+              <code>remote-sessions.v1</code>, <code>cloud-starts.v1</code> và
+              trường <code>codespace</code> phải đọc được như cũ; Docker thêm
+              trường mới với <code>serde(default)</code>, không đổi tên.
+            </li>
+            <li>
+              Không sửa provider adapters, menu, settings hay transport trong
+              task viết spec này.
+            </li>
+          </ul>
+        </details>
+      </section>
+
+      <section id="acceptance">
+        <div class="section-number">07 / DEFINITION OF DONE</div>
+        <h2>Các điều kiện để tính năng được coi là hoàn tất</h2>
+        <div class="grid2">
+          <article class="card">
+            <h3>UX & provisioning</h3>
+            <ul class="checks">
+              <li>
+                Docker dùng lại flow/UI start của Codespaces hiện có: step list
+                <code>StepKind</code>, creation log, error, Retry / Rebuild /
+                Delete và chuyển vào session. Không có wizard, progress card
+                hoặc cloud dashboard mới.
+              </li>
+              <li>
+                Right click project → Cloud setup → Codespaces/Docker; hover,
+                click, keyboard và edge placement đúng. Menu Workspace dưới
+                composer của session mới có mục RUN ON CLOUD (Codespace / Docker
+                Sandbox); cloud picker ở header của Codespaces giữ nguyên. Codespaces setup, cloud
+                picker, start, archive/convert giữ nguyên hành vi; dữ liệu
+                <code>remote-projects.v2</code>, <code>cloud-starts.v1</code> cũ
+                vẫn đọc được.
+              </li>
+              <li>
+                Dialog Save không charge; chỉ hành động Create rõ ràng của user
+                ("Create and open") mới provision. Thiếu prerequisites có remediation rõ, không cần nhập
+                SSH target.
+              </li>
+              <li>
+                Mỗi feature session mới có đúng một sandbox; retry/restart app
+                không tạo trùng. Mọi create truyền <code>--ttl</code> và
+                <code>--on-timeout stop</code> tường minh.
+              </li>
+              <li>
+                Clone đúng resolved commit, branch/session riêng; local dirty
+                files không bị gửi lên.
+              </li>
+              <li>
+                Ready chỉ khi devcontainer, agent, host và connection đều dùng
+                được.
+              </li>
+              <li>
+                GitHub, GitLab và Bitbucket Cloud đều có smoke test private
+                clone/fetch; write test vào repo test do user cho phép.
+              </li>
+            </ul>
+          </article>
+          <article class="card">
+            <h3>Auth, lifecycle & data</h3>
+            <ul class="checks">
+              <li>
+                Process Claude trong sandbox có đúng một trong
+                <code>CLAUDE_CODE_OAUTH_TOKEN</code> /
+                <code>ANTHROPIC_API_KEY</code> theo account đã chọn;
+                <code>ANTHROPIC_AUTH_TOKEN</code> và biến còn lại bị gỡ.
+              </li>
+              <li>
+                Git token lưu AES-256-GCM với <code>credentials.key</code> như
+                account Claude; archive dùng dialog chung, mặc định Stop.
+              </li>
+              <li>
+                Profile dùng lại được qua nhiều sandbox; account password/Git
+                SSH không xuất hiện trong v1.
+              </li>
+              <li>
+                Token không lộ trong argv, logs, Git config, tracked files hoặc
+                archive. Rotation/revocation có hành vi xác định.
+              </li>
+              <li>
+                Prompt/approval/cancel/files/Git hoạt động theo host capability;
+                reconnect không nhân đôi lệnh.
+              </li>
+              <li>
+                Stop xác nhận trạng thái; resume cùng sandbox/workspace/history,
+                xử lý operation bị ngắt rõ ràng.
+              </li>
+              <li>
+                Archive đọc được sau khi sandbox xoá, gồm attachments cần thiết
+                và bundle/patch code chưa push (như <code>convert.rs</code>);
+                thiếu sync chặn auto-delete.
+              </li>
+              <li>
+                Delete chỉ đúng tài nguyên session, không tự push hoặc xoá
+                remote branch; các sandbox khác không bị ảnh hưởng.
+              </li>
+            </ul>
+          </article>
+        </div>
+        <div class="callout warning">
+          <strong>Release gates chưa qua:</strong> Claude OAuth qua Docker
+          proxy; cách app lưu/chuyển subscription credential được phép; Git
+          credential helper outer/inner hoạt động khi desktop disconnect;
+          private registry flow; Host trong devcontainer + private tunnel;
+          archive sau delete; API key/placeholder trong sandbox không override
+          auth đã chọn; network policy mặc định của account cho phép các
+          destination cần thiết. PoC devcontainer đã pass không thay thế các kiểm chứng
+          này. Kết luận điều khoản về chuyển subscription token cũng áp dụng
+          cho flow Codespaces đang ship.
+        </div>
+      </section>
+
+      <section id="review">
+        <div class="section-number">08 / AGREED DECISIONS</div>
+        <h2>Phạm vi và defaults đã chốt</h2>
+        <div class="callout">
+          <strong>Provisioning:</strong> tái sử dụng flow Codespaces đang có
+          (<code>cloud_sessions/startup.rs</code>). Docker adapter điền các
+          <code>StepKind</code> hiện có qua một backend seam (mục 06); giữ cách
+          hiển thị và thao tác hiện tại. Mockup không định nghĩa một UI thay
+          thế.
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Quyết định</th>
+                <th>Quyết định v1</th>
+                <th>Lý do / trade-off</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Đơn vị cách ly</td>
+                <td>
+                  1 Docker feature session = 1 sandbox; không share sandbox giữa
+                  session độc lập
+                </td>
+                <td>
+                  Cô lập source, agent, dependencies và infra; đổi lại mỗi task
+                  có cold start/build riêng.
+                </td>
+              </tr>
+              <tr>
+                <td>Hết runtime limit</td>
+                <td>Stop, giữ workspace; không auto-delete</td>
+                <td>
+                  Giảm rủi ro mất code. Xoá là thao tác rõ của user sau khi xong
+                  feature.
+                </td>
+              </tr>
+              <tr>
+                <td>Kết thúc task</td>
+                <td>
+                  Dialog chung "Archive cloud session?" như Codespaces: Keep
+                  running / Stop / Delete, mặc định Stop; convert giữ code chưa
+                  push trên máy
+                </td>
+                <td>
+                  Một flow cho cả hai backend; không ép push hoặc mất history.
+                  Chốt 08/11/2026, thay cho "Archive &amp; delete là chính".
+                </td>
+              </tr>
+              <tr>
+                <td>Thiếu devcontainer</td>
+                <td>
+                  Chặn create ở preflight nếu biết; nếu phát hiện sau clone,
+                  dừng và cho sửa config/retry hoặc cleanup
+                </td>
+                <td>
+                  Không tự sinh/commit môi trường chưa được user chọn. Fallback
+                  generic Shell development để ngoài v1.
+                </td>
+              </tr>
+              <tr>
+                <td>Git host</td>
+                <td>
+                  3 platform presets; GitLab custom HTTPS host; Bitbucket Cloud
+                  only
+                </td>
+                <td>
+                  Giữ auth adapter generic nhưng support matrix v1 có giới hạn
+                  test rõ ràng.
+                </td>
+              </tr>
+              <tr>
+                <td>Credential lifecycle</td>
+                <td>
+                  Profile local + cấp runtime theo project; rotate cho lần dùng
+                  sau
+                </td>
+                <td>
+                  Hoạt động khi desktop offline nếu host/broker còn sống;
+                  process restart cần cấp lại. Snapshot memory có thể giữ
+                  secret.
+                </td>
+              </tr>
+              <tr>
+                <td>Agent roadmap</td>
+                <td>
+                  Cloud provider picker chỉ enable Claude; adapter cho agent
+                  khác bổ sung sau
+                </td>
+                <td>
+                  Không giới hạn kiến trúc vào Claude, không hứa auth path chưa
+                  nghiên cứu.
+                </td>
+              </tr>
+              <tr>
+                <td>Chi phí</td>
+                <td>
+                  Composer nhắc compute trước "Create and open"; default 2h stop;
+                  không tự tăng TTL
+                </td>
+                <td>
+                  User tự chuẩn bị account và billing Docker (credits khuyến
+                  mãi nếu có là chuyện của user). App không đọc hay suy diễn số
+                  dư. Inference đi theo auth của Claude (setup-token hoặc API key
+                  của user), không qua Docker.
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <h3 style="margin-top: 25px">Đã chốt thêm ngày 08/11/2026</h3>
+        <ul>
+          <li>
+            <strong>Điểm vào:</strong> menu Workspace dưới composer của session
+            mới có thêm nơi chạy Codespace / Docker Sandbox, để user tự tạo cloud
+            session thủ công, không phụ thuộc Mono. Cloud picker ở header menu
+            của Codespaces giữ nguyên.
+          </li>
+          <li>
+            <strong>Thời điểm tạo:</strong> một hành vi cho cả hai backend, theo
+            Codespaces: "Create and open" tạo tài nguyên ngay, session có ngay
+            với step list đến Ready, prompt gõ trong lúc chờ được queue.
+          </li>
+          <li>
+            <strong>Archive/xoá:</strong> dùng chung dialog "Archive cloud
+            session?" của Codespaces (Keep running / Stop / Delete, mặc định
+            Stop); label theo backend ("Stop sandbox", "Delete sandbox" cho
+            Docker, giữ "Stop codespace", "Delete codespace" cho Codespaces).
+          </li>
+          <li>
+            <strong>Nơi lưu Git token:</strong> AES-256-GCM trong SQLite +
+            <code>credentials.key</code> như <code>accounts/token.rs</code>;
+            không Keychain (tránh hỏi mật khẩu sau mỗi lần upgrade app).
+          </li>
+          <li>
+            <strong>Claude auth:</strong> dùng account Claude đã cấu hình trong
+            app. Setup-token → <code>CLAUDE_CODE_OAUTH_TOKEN</code>, API key →
+            <code>ANTHROPIC_API_KEY</code>; adapter chỉ đặt đúng một biến cho
+            process Claude, gỡ biến còn lại cùng
+            <code>ANTHROPIC_AUTH_TOKEN</code>. Không login trong sandbox. Vẫn giữ release gate ở mục
+            04 và 07.
+          </li>
+          <li>
+            <strong>Bitbucket:</strong> chỉ API token có scope, không app
+            password. Scope GitLab/Bitbucket/GitHub là việc của user khi tạo
+            token; app chỉ gợi ý và kiểm tra read.
+          </li>
+          <li>
+            <strong>Docker account/billing:</strong> user tự chuẩn bị
+            (<code>sbx login</code>, setup SSH, credits hay thanh toán); app chỉ
+            kiểm tra và hướng dẫn.
+          </li>
+        </ul>
+        <h3 style="margin-top: 25px">Còn chờ quyết định</h3>
+        <ol>
+          <li>
+            <strong>Thu hẹp v1.</strong> GitLab self-managed, Bitbucket, private
+            registry, Compose và submodules đều là compatibility test riêng. Cân
+            nhắc v1 = GitHub + GitLab.com với image/Dockerfile/Features, phần
+            còn lại là v1.x.
+          </li>
+          <li>
+            <strong>Files/Git của sandbox.</strong> Cloud session Codespaces
+            hiện giữ Explorer/Changes ở checkout local và khoá Git write
+            (<code>git_gate.rs</code>). Nếu Docker dùng lại nguyên mô hình này,
+            user không xem/commit được thay đổi của agent trong app trước khi
+            archive. Quyết định: chấp nhận cho v1 (review qua transcript +
+            archive bundle/patch) hay nối Explorer/Changes vào host như remote
+            project thường.
+          </li>
+          <li>
+            <strong>Claude account picker.</strong> Đã chốt dùng account trong
+            app (xem trên); chỉ còn mở chuyện cố định theo sandbox hay chọn theo
+            session. Remote host chưa hỗ trợ named provider accounts; chọn account nào thì app phải đặt biến tương
+            ứng vào env của Host trong sandbox (Host chỉ truyền env nó được start
+            cùng cho Claude). Chọn: một account cố định cho mỗi sandbox (đổi
+            account thì restart Host như flow token-hash của Codespaces), hay
+            làm thêm phần chọn account theo session ở host.
+          </li>
+          <li>
+            <strong>App API / Mono.</strong> <code>sessions.start</code> với
+            <code>target</code> codespace và các action
+            <code>codespaces.*</code> (<code>mono/cloud_api.rs</code>) đã có cho
+            Codespaces. Cần quyết định Docker v1 có parity ở app API hay chỉ UI;
+            nếu có thì Mono có thể tạo tài nguyên trả phí, cần cùng cost notice.
+          </li>
+          <li>
+            <strong>Template / move.</strong> Docs Docker cảnh báo credential
+            ghi trong sandbox có thể nằm trong template và snapshot của
+            <code>sbx move</code>. Đề xuất v1 không dùng
+            <code>template save</code>/<code>move</code> cho sandbox của
+            Monoptah.
+          </li>
+        </ol>
+      </section>
+
+      <section id="evidence">
+        <div class="section-number">09 / VERIFIED VS OPEN</div>
+        <h2>Bằng chứng thử nghiệm & tài liệu</h2>
+        <article class="card">
+          <span class="pill">Verified PoC · 07 Nov 2026 UTC</span>
+          <h3 style="margin-top: 15px">
+            Dev Container CLI chạy được trong Docker cloud Shell sandbox
+          </h3>
+          <p>
+            Sandbox test: <code>monoptah-devcontainer-probe-20261107</code>,
+            <code>sbx_001m6vepddy3j15sw6d0t9qkbdv</code>; Linux ARM64, 2 CPU / 4
+            GiB, Docker 29.9.3, Compose v5.7.0, Dev Container CLI 0.90.0.
+          </p>
+          <p>
+            Pass: Docker exec đúng filesystem; Dockerfile build; source mount;
+            remoteUser/env; postCreate/postStart; devcontainer exec; Compose
+            healthcheck + exec; Node Feature v22.23.4; stop/resume giữ dữ liệu.
+            Shell kit này thiếu Node/npm và xz; official standalone installer +
+            xz-utils đã chạy được.
+          </p>
+          <p>
+            Không tái hiện hạn chế Docker exec được Docker công bố. Đây là kết
+            quả fixture cụ thể, không phải xác nhận mọi cấu hình. CLI v0.51.0
+            <code>run shell --name</code> thử create lại kit-backed sandbox;
+            <code>exec</code> theo ID resume đúng. Stop bất đồng bộ, có lúc
+            list/inspect lệch trạng thái.
+          </p>
+          <p class="small">
+            Sandbox đã được xác nhận stopped sau test; tài liệu này không gọi
+            lại cloud hay tạo tài nguyên. Chưa test Claude/OAuth, repo private,
+            credential broker hoặc Host tunnel.
+          </p>
+        </article>
+        <ul class="reference-list">
+          <li>
+            <a
+              href="https://docs.docker.com/ai/sandboxes/cloud/usage/"
+              target="_blank"
+              rel="noreferrer"
+              >Docker cloud usage</a
+            >
+            - SSH, file transfer, lifecycle, TTL (mặc định 1 giờ, gia hạn tối
+            đa 24 giờ từ lúc tạo), <code>--platform</code>, public ports và
+            known exec/healthcheck limitation.
+          </li>
+          <li>
+            <a
+              href="https://docs.docker.com/ai/sandboxes/cloud/credentials/"
+              target="_blank"
+              rel="noreferrer"
+              >Docker cloud credentials</a
+            >
+            - secret store riêng; Anthropic API key là đường cloud được tài liệu
+            hoá cho Claude Code; không hỗ trợ registry credentials.
+          </li>
+          <li>
+            <a
+              href="https://docs.docker.com/ai/sandboxes/cloud/network-policy/"
+              target="_blank"
+              rel="noreferrer"
+              >Docker cloud network policy</a
+            >
+            - preset <code>allow-all</code>/<code>balanced</code>/<code>deny-all</code>,
+            rule theo account hoặc sandbox, <code>policy log</code>.
+            ·
+            <a
+              href="https://docs.docker.com/agentic-platform/signup/"
+              target="_blank"
+              rel="noreferrer"
+              >Signup & billing</a
+            >
+            - pay-as-you-go tính theo giây; credits chỉ bù compute, không trả
+            inference; usage trễ tới 48 giờ.
+          </li>
+          <li>
+            <a
+              href="https://github.com/devcontainers/cli"
+              target="_blank"
+              rel="noreferrer"
+              >Official Dev Container CLI</a
+            >
+            - up/exec, installer, lifecycle và reusable environment.
+          </li>
+          <li>
+            <a
+              href="https://git-scm.com/docs/gitcredentials"
+              target="_blank"
+              rel="noreferrer"
+              >Git credential helpers</a
+            >
+            - HTTPS credential context và helper contract.
+          </li>
+          <li>
+            <a
+              href="https://docs.github.com/en/get-started/git-basics/about-remote-repositories"
+              target="_blank"
+              rel="noreferrer"
+              >GitHub HTTPS authentication</a
+            >
+            ·
+            <a
+              href="https://docs.gitlab.com/user/profile/personal_access_tokens/"
+              target="_blank"
+              rel="noreferrer"
+              >GitLab tokens</a
+            >
+            ·
+            <a
+              href="https://support.atlassian.com/bitbucket-cloud/docs/using-api-tokens/"
+              target="_blank"
+              rel="noreferrer"
+              >Bitbucket Cloud API tokens</a
+            >.
+          </li>
+          <li>
+            <a
+              href="https://code.claude.com/docs/en/authentication"
+              target="_blank"
+              rel="noreferrer"
+              >Claude Code authentication</a
+            >
+            - setup-token, auth precedence và token limits.
+          </li>
+          <li>
+            <a
+              href="https://code.claude.com/docs/en/legal-and-compliance"
+              target="_blank"
+              rel="noreferrer"
+              >Anthropic legal & compliance</a
+            >
+            - unmodified hosted CLI, end-user authentication và credential
+            restrictions.
+          </li>
+          <li>
+            Local architecture (đối chiếu với <code>main</code> tại
+            <code>65bec991</code>): Codespaces trong
+            <code>crates/monocode-core/src/codespaces.rs</code>,
+            <code>cloud_sessions.rs</code> và <code>cloud_sessions/</code>
+            (<code>startup.rs</code>, <code>convert.rs</code>); remote host trong
+            <code>remote.rs</code>, <code>remote/ssh.rs</code>,
+            <code>remote/remote_bootstrap.sh</code>,
+            <code>store/remote.rs</code>, <code>host/child-backend.ts</code>; UI
+            trong <code>crates/monocode-gpui/src/</code>
+            (<code>codespaces_dialog.rs</code>, <code>shell/codespaces.rs</code>,
+            <code>shell/cloud_picker.rs</code>, <code>shell/cloud_start.rs</code>,
+            <code>shell/cloud.rs</code>, <code>cloud_start_view.rs</code>,
+            <code>codespace_pane.rs</code>). <code>docs/remote-access.md</code>
+            mô tả remote host, chưa có tài liệu riêng cho Codespaces.
+          </li>
+        </ul>
+      </section>
+      <footer class="footer">
+        Monoptah · Final feature specification v1 · Self-contained HTML, no
+        external assets, no telemetry or persistence. Mockup interactions are
+        illustrative only. Select each storyboard to review its native surface.
+      </footer>
+    </main>
+    <div class="toast" id="toast" role="status" hidden></div>
+    <script>
+      (() => {
+        "use strict";
+        const $ = (id) => document.getElementById(id);
+        const tabs = [...document.querySelectorAll("[data-screen]")];
+        let toastTimer,
+          active = "menu";
+        const captions = {
+          menu: "<strong>Project menu.</strong> Menu appearance/actions hiện có; entry Codespaces setup… hiện có thành Cloud setup › Codespaces / Docker Sandbox. Không mở trang Project settings.",
+          setup:
+            "<strong>Docker setup dialog.</strong> Mở trực tiếp từ menu, đè lên workspace như Telegram setup. Form 420px, Advanced thu gọn; Save rồi đóng dialog.",
+          credentials:
+            "<strong>Git credential dialog.</strong> Mở từ Docker setup và quay về đó sau khi lưu; không thêm một trang settings riêng. Profile vẫn dùng lại giữa project/sandbox.",
+          new: "<strong>New session.</strong> Nơi chạy (Local / Codespace / Docker Sandbox) chọn trong menu Workspace hiện có dưới composer, mục mới RUN ON CLOUD. Chọn cloud thì hiện một hàng nhỏ; Create and open tạo resource ngay như Codespaces, không còn 'gửi lần đầu mới provision'.",
+          provision:
+            "<strong>Provisioning.</strong> Session tồn tại ngay, hiện step list đến Ready; prompt gõ trong lúc chờ được xếp hàng và gửi đúng một lần khi Ready. Dùng nút Review để xem trạng thái lỗi.",
+          session:
+            "<strong>Session layout hiện có.</strong> Chat/composer giữ nguyên; cloud status nhỏ trong pane, Stop sandbox / Archive… trong menu ⋯. Chỉ tái sử dụng capability remote đã có.",
+          delete:
+            "<strong>Archive cloud session?</strong> Cùng dialog với Codespaces, label theo backend (Stop/Delete sandbox). Mặc định Stop; Delete sandbox có bước phụ liệt kê file ignored sẽ mất.",
+        };
+        function toast(message) {
+          $("toast").textContent = message;
+          $("toast").hidden = false;
+          clearTimeout(toastTimer);
+          toastTimer = setTimeout(() => ($("toast").hidden = true), 4000);
+        }
+        function showScreen(name) {
+          active = name;
+          document
+            .querySelectorAll(".screen")
+            .forEach((el) => (el.hidden = el.id !== "screen-" + name));
+          tabs.forEach((el) => {
+            const on = el.dataset.screen === name;
+            el.setAttribute("aria-selected", String(on));
+            el.tabIndex = on ? 0 : -1;
+          });
+          $("screen-caption").innerHTML = captions[name];
+          if (name !== "menu") menuOpen(false);
+          if (name !== "new") wsMenuOpen(false);
+          $("session-review").hidden = name !== "session";
+          if (name === "delete") archiveStep(1);
+        }
+        tabs.forEach((button, i) => {
+          button.addEventListener("click", () =>
+            showScreen(button.dataset.screen),
+          );
+          button.addEventListener("keydown", (event) => {
+            if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key))
+              return;
+            event.preventDefault();
+            const next =
+              event.key === "Home"
+                ? 0
+                : event.key === "End"
+                  ? tabs.length - 1
+                  : (i + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) %
+                    tabs.length;
+            showScreen(tabs[next].dataset.screen);
+            tabs[next].focus();
+          });
+        });
+        document
+          .querySelectorAll("[data-go]")
+          .forEach((el) =>
+            el.addEventListener("click", () => showScreen(el.dataset.go)),
+          );
+        document
+          .querySelectorAll("[data-note]")
+          .forEach((el) =>
+            el.addEventListener("click", () => toast(el.dataset.note)),
+          );
+        $("preview-layout").addEventListener(
+          "change",
+          () => ($("native-window").dataset.layout = $("preview-layout").value),
+        );
+        $("preview-theme").addEventListener(
+          "change",
+          () => ($("native-window").dataset.theme = $("preview-theme").value),
+        );
+        const menu = $("cloud-menu"),
+          trigger = $("cloud-trigger");
+        function menuOpen(open, focus = false) {
+          menu.classList.toggle("open", open);
+          trigger.setAttribute("aria-expanded", String(open));
+          if (open && focus) menu.querySelector(".n-submenu button").focus();
+        }
+        menu.addEventListener("mouseenter", () => menuOpen(true));
+        menu.addEventListener("mouseleave", () => menuOpen(false));
+        trigger.addEventListener("click", () => menuOpen(true));
+        menu.addEventListener("focusin", () => menuOpen(true));
+        menu.addEventListener("focusout", (event) => {
+          if (!menu.contains(event.relatedTarget)) menuOpen(false);
+        });
+        menu.addEventListener("keydown", (event) => {
+          if (event.key === "ArrowRight") {
+            event.preventDefault();
+            menuOpen(true, true);
+          }
+          if (event.key === "ArrowLeft" || event.key === "Escape") {
+            event.preventDefault();
+            event.stopPropagation();
+            trigger.focus();
+            menuOpen(false);
+          }
+          if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+            const items = [...menu.querySelectorAll(".n-submenu button")],
+              at = items.indexOf(document.activeElement);
+            if (at >= 0) {
+              event.preventDefault();
+              items[
+                (at + (event.key === "ArrowDown" ? 1 : -1) + items.length) %
+                  items.length
+              ].focus();
+            }
+          }
+        });
+        for (const id of ["project-trigger", "rail-project-trigger"]) {
+          $(id).addEventListener("click", () => showScreen("menu"));
+          $(id).addEventListener("contextmenu", (event) => {
+            event.preventDefault();
+            showScreen("menu");
+          });
+        }
+        $("native-window").addEventListener("keydown", (event) => {
+          if (event.key !== "Escape") return;
+          if (active === "session" && !$("session-cloud-actions").hidden) {
+            $("session-cloud-actions").hidden = true;
+            $("session-more").setAttribute("aria-expanded", "false");
+            $("session-more").focus();
+          } else if (active === "credentials") showScreen("setup");
+          else if (active === "new" && !$("ws-menu").hidden) {
+            wsMenuOpen(false);
+            $("ws-trigger").focus();
+          } else if (["setup", "delete"].includes(active))
+            showScreen(active === "setup" ? "menu" : "session");
+          else if (active === "menu") {
+            showScreen("new");
+            const classic = $("native-window").dataset.layout === "classic";
+            $(classic && $("rail-project-trigger") ? "rail-project-trigger" : "project-trigger").focus();
+          }
+        });
+        const platforms = {
+          github: {
+            host: "github.com",
+            username: "developer",
+            repo: "https://github.com/acme/storefront.git",
+            help: "GitHub username. Authentication uses the access token.",
+            scope:
+              "Read for clone/fetch; write for push. Choose only the required repositories.",
+          },
+          gitlab: {
+            host: "gitlab.company.com",
+            username: "oauth2",
+            repo: "https://gitlab.company.com/team/storefront.git",
+            help: "GitLab PAT: non-empty username; oauth2 in this example. GitLab.com or self-managed HTTPS.",
+            scope:
+              "PAT: read_repository for clone/fetch, write_repository for push. API permissions are separate.",
+          },
+          bitbucket: {
+            host: "bitbucket.org",
+            username: "x-bitbucket-api-token-auth",
+            repo: "https://bitbucket.org/acme/storefront.git",
+            help: "Bitbucket Cloud scoped API token. Static username is supported for Git HTTPS.",
+            scope:
+              "read:repository:bitbucket for clone; add write:repository:bitbucket for push. No account password.",
+          },
+        };
+        $("platform").addEventListener("change", () => {
+          const p = platforms[$("platform").value];
+          $("git-host").value = p.host;
+          $("git-user").value = p.username;
+          $("repo-url").value = p.repo;
+          $("user-help").textContent = p.help;
+          $("scope-help").textContent = p.scope;
+          $("project-credential").options[0].textContent =
+            "Work repositories · " + p.host;
+          $("credential-result").textContent = "Not checked · demo";
+        });
+        $("test-credential").addEventListener("click", () => {
+          $("credential-result").textContent = "Readable · push not verified";
+          toast("Demo: kiểm tra read access; không gửi Git/API request.");
+        });
+        $("save-credential").addEventListener("click", () => {
+          showScreen("setup");
+          toast(
+            "Demo: credential selected for project. Không lưu secret thật.",
+          );
+        });
+        $("save-project").addEventListener("click", () => {
+          showScreen("new");
+          toast("Demo: dialog đóng, project config saved. Chưa tạo sandbox.");
+        });
+        const targets = {
+          checkout: { label: "▭ Current checkout" },
+          worktree: { label: "⑂ New worktree" },
+          codespace: {
+            label: "☁ Codespace",
+            machine: "basicLinux32gb",
+            noun: "codespace",
+            note: "Creates a GitHub codespace (billed to your GitHub account). Your prompt is queued until it is ready.",
+          },
+          docker: {
+            label: "☁ Docker Sandbox",
+            machine: "2 vCPU / 4 GiB · 2h then stop",
+            noun: "sandbox",
+            note: "Creates paid cloud compute in your Docker account. Your prompt is queued until the sandbox is ready.",
+          },
+        };
+        let target = "checkout";
+        function wsMenuOpen(open) {
+          $("ws-menu").hidden = !open;
+          $("ws-trigger").setAttribute("aria-expanded", String(open));
+          if (open) $("ws-menu").querySelector("button").focus();
+        }
+        function setTarget(name) {
+          target = name;
+          const t = targets[name],
+            cloud = Boolean(t.machine);
+          $("ws-trigger-label").textContent = t.label;
+          $("new-cloud-row").hidden = !cloud;
+          $("newbranch-trigger").hidden = !cloud;
+          if (cloud) {
+            $("cloud-machine").textContent = t.machine;
+            $("cloud-note").textContent = t.note;
+          }
+          $("new-send").setAttribute("aria-disabled", String(cloud));
+          $("send-hint").hidden = true;
+          document.querySelectorAll("#ws-menu [data-target]").forEach((el) => {
+            const on = el.dataset.target === name;
+            el.querySelector(".chk").textContent = on ? "✓" : "";
+            el.setAttribute("aria-checked", String(on));
+          });
+        }
+        $("ws-trigger").addEventListener("click", () =>
+          wsMenuOpen($("ws-menu").hidden),
+        );
+        document.querySelectorAll("#ws-menu [data-target]").forEach((el) =>
+          el.addEventListener("click", () => {
+            setTarget(el.dataset.target);
+            wsMenuOpen(false);
+          }),
+        );
+        $("branch-trigger").addEventListener("click", () =>
+          toast("Existing branch picker."),
+        );
+        $("newbranch-trigger").addEventListener("click", () =>
+          toast("Demo: tên branch mới, sửa được."),
+        );
+        $("cloud-machine").addEventListener("click", () =>
+          toast("Demo: machine / runtime limit lấy từ Cloud setup của project."),
+        );
+        document.addEventListener("click", (event) => {
+          if (!$("ws-menu").hidden && !$("ws-menu").parentElement.contains(event.target))
+            wsMenuOpen(false);
+        });
+        $("new-send").addEventListener("click", () => {
+          if (targets[target].machine) $("send-hint").hidden = false;
+          else toast("Local session flow hiện có - không thay đổi.");
+        });
+        let failed = false;
+        function updateProvision() {
+          const noun = (targets[target].noun || "sandbox");
+          document.querySelectorAll("#screen-provision .noun").forEach((el) => (el.textContent = noun));
+          document.querySelectorAll("#screen-provision .Noun").forEach((el) => (el.textContent = noun[0].toUpperCase() + noun.slice(1)));
+          $("prov-target").textContent = targets[target].machine ? targets[target].label : targets.docker.label;
+          document
+            .querySelectorAll("#screen-provision [data-show]")
+            .forEach(
+              (el) => (el.hidden = el.dataset.show !== (failed ? "failed" : "running")),
+            );
+          $("toggle-failure").textContent = failed
+            ? "Review: Show progress"
+            : "Review: Show failure";
+          $("toggle-failure").setAttribute("aria-pressed", String(failed));
+        }
+        $("toggle-failure").addEventListener("click", () => {
+          failed = !failed;
+          updateProvision();
+        });
+        $("create-session").addEventListener("click", () => {
+          failed = false;
+          updateProvision();
+          showScreen("provision");
+        });
+        updateProvision();
+        $("session-more").addEventListener("click", () => {
+          const open = $("session-cloud-actions").hidden;
+          $("session-cloud-actions").hidden = !open;
+          $("session-more").setAttribute("aria-expanded", String(open));
+        });
+        let disconnected = false,
+          stopped = false;
+        function updateSession() {
+          $("session-status").textContent = disconnected
+            ? "Disconnected · task may still run"
+            : stopped
+              ? "Stopped · workspace preserved"
+              : "Connected";
+          $("session-status").classList.toggle(
+            "good",
+            !disconnected && !stopped,
+          );
+          $("connection-demo").textContent = disconnected
+            ? "Reconnect same session"
+            : "Disconnect demo";
+          $("stop-demo").textContent = stopped
+            ? "Resume sandbox"
+            : "Stop sandbox";
+        }
+        $("connection-demo").addEventListener("click", () => {
+          disconnected = !disconnected;
+          updateSession();
+        });
+        $("stop-demo").addEventListener("click", () => {
+          stopped = !stopped;
+          disconnected = false;
+          updateSession();
+        });
+        const archiveButtons = () =>
+          document.querySelectorAll("#screen-delete .n-dialog-footer button");
+        function archiveStep(n) {
+          $("archive-step1").hidden = n !== 1;
+          $("archive-step2").hidden = n !== 2;
+          $("delete-result").hidden = true;
+          archiveButtons().forEach((b) => (b.disabled = false));
+          $(n === 1 ? "stop-keep" : "stop-instead").focus();
+        }
+        function archiveDone(stop, keep = false) {
+          if (stop) {
+            stopped = true;
+            disconnected = false;
+            updateSession();
+          }
+          $("delete-status").textContent = keep
+            ? "Demo only. The sandbox keeps running."
+            : "Demo only. Remote branch and saved credentials are retained.";
+          archiveButtons().forEach((b) => (b.disabled = true));
+          $("delete-result").hidden = false;
+        }
+        $("archive-delete").addEventListener("click", () => archiveStep(2));
+        $("stop-keep").addEventListener("click", () => archiveDone(true));
+        $("stop-instead").addEventListener("click", () => archiveDone(true));
+        $("keep-running").addEventListener("click", () => archiveDone(false, true));
+        $("keep-running-2").addEventListener("click", () => archiveDone(false, true));
+        $("delete-anyway").addEventListener("click", () => archiveDone(false));
+        const observer = new IntersectionObserver(
+          (entries) =>
+            entries.forEach((entry) => {
+              if (entry.isIntersecting)
+                document
+                  .querySelectorAll(".sidebar nav a")
+                  .forEach((a) =>
+                    a.classList.toggle(
+                      "current",
+                      a.hash === "#" + entry.target.id,
+                    ),
+                  );
+            }),
+          { rootMargin: "-5% 0px -75% 0px" },
+        );
+        document
+          .querySelectorAll("main section")
+          .forEach((section) => observer.observe(section));
+        showScreen("menu");
+      })();
+    </script>
+  </body>
+</html>

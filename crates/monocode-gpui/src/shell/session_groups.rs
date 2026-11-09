@@ -6,6 +6,7 @@ use super::project_removal::{
 use super::*;
 use chrono::{Local, NaiveDateTime, TimeZone};
 use gpui::EventEmitter;
+use monocode_core::cloud_sessions::{CloudBackendKind, CloudState};
 use monocode_core::{
     session_groups::{
         Entry, Groups, build_list, format_reminder, navigation_ids, parse_github_work_item,
@@ -512,10 +513,95 @@ impl Shell {
                 )
                 .into(),
             ]);
-            if self.is_cloud(id) {
+            if let Some(mark) = self.cloud_marks.get(&id) {
                 items.push(
-                    MenuAction::new("codespace-terminal", "Open terminal in codespace").into(),
+                    MenuAction::new(
+                        "codespace-terminal",
+                        format!("Open terminal in {}", mark.kind.noun()),
+                    )
+                    .into(),
                 );
+                if mark.kind == CloudBackendKind::Codespaces && !mark.codespace.is_empty() {
+                    // A start that has no name yet has nothing to stop. Only a codespace that
+                    // is (or may be) up offers it.
+                    let state = self
+                        .cloud_states
+                        .get(&mark.key())
+                        .copied()
+                        .unwrap_or(CloudState::Unknown);
+                    if matches!(
+                        state,
+                        CloudState::Available | CloudState::Starting | CloudState::Unknown
+                    ) {
+                        let target = mark.cloud();
+                        let others = self
+                            .cloud_marks
+                            .iter()
+                            .filter(|(other, m)| {
+                                **other != id
+                                    && !m.codespace.is_empty()
+                                    && m.cloud() == target
+                                    && !self
+                                        .session_summaries
+                                        .get(*other)
+                                        .is_some_and(|s| s.archived)
+                            })
+                            .count();
+                        let label = match others {
+                            0 => format!("Stop codespace {}", mark.codespace),
+                            1 => format!(
+                                "Stop codespace {} (also stops 1 other session)",
+                                mark.codespace
+                            ),
+                            n => format!(
+                                "Stop codespace {} (also stops {n} other sessions)",
+                                mark.codespace
+                            ),
+                        };
+                        items.push(MenuAction::new("codespace-stop-live", label).into());
+                    }
+                }
+                // A stopped workspace is resumed only by this click: the cached state is
+                // Stopped (not Stopping or Unavailable) and the name is known.
+                if !mark.codespace.is_empty()
+                    && self.cloud_states.get(&mark.key()) == Some(&CloudState::Stopped)
+                {
+                    items.push(
+                        MenuAction::new(
+                            "cloud-resume",
+                            format!("Resume {} {}", mark.kind.noun(), mark.codespace),
+                        )
+                        .into(),
+                    );
+                }
+                if mark.kind == CloudBackendKind::DockerSandbox {
+                    let state = self.cloud_states.get(&mark.key()).copied();
+                    let stopped = state == Some(CloudState::Stopped);
+                    if !stopped && state != Some(CloudState::Stopping) {
+                        items.push(
+                            MenuAction::new(
+                                "sandbox-stop",
+                                format!("Stop sandbox {}", mark.codespace),
+                            )
+                            .into(),
+                        );
+                    }
+                    items.push(
+                        MenuAction::new(
+                            "sandbox-delete",
+                            format!("Delete sandbox {}", mark.codespace),
+                        )
+                        .danger()
+                        .into(),
+                    );
+                    // A stopped sandbox cannot be reached without resuming (and billing) it,
+                    // so the session can also be dropped from Monoptah alone.
+                    if stopped {
+                        items.push(
+                            MenuAction::new("sandbox-remove-local", "Remove from Monoptah").into(),
+                        );
+                    }
+                }
             }
             if self.codespace_restore_pending(id) {
                 items.push(
@@ -601,12 +687,52 @@ impl Shell {
             "codespace-stop" => {
                 self.run_origin_codespace_action(id, cloud::ArchiveChoice::Stop, window, cx)
             }
+            "codespace-stop-live" => {
+                let Some(mark) = self
+                    .cloud_marks
+                    .get(&id)
+                    .filter(|m| m.kind == CloudBackendKind::Codespaces)
+                else {
+                    return;
+                };
+                let target = mark.cloud();
+                self.run_workspace_action(target, cloud::ArchiveChoice::Stop, window, cx)
+            }
+            "cloud-resume" => {
+                let stopped = self.cloud_marks.get(&id).is_some_and(|mark| {
+                    !mark.codespace.is_empty()
+                        && self.cloud_states.get(&mark.key()) == Some(&CloudState::Stopped)
+                });
+                if stopped && let Some(view) = self.ensure_session(id, cx) {
+                    // The user's own click: the same path as the Reconnect button.
+                    view.update(cx, |view, cx| {
+                        view.reconnect_cloud(cx);
+                    });
+                }
+            }
             "codespace-delete" => {
                 self.run_origin_codespace_action(id, cloud::ArchiveChoice::Delete, window, cx)
             }
             "codespace-terminal" => {
-                if let Some(codespace) = self.cloud_marks.get(&id).map(|m| m.codespace.clone()) {
-                    self.new_codespace_terminal(codespace, window, cx);
+                self.new_cloud_terminal(id, window, cx);
+            }
+            "sandbox-stop" | "sandbox-delete" | "sandbox-remove-local" => {
+                let Some(mark) = self
+                    .cloud_marks
+                    .get(&id)
+                    .filter(|m| m.kind == CloudBackendKind::DockerSandbox)
+                else {
+                    return;
+                };
+                let target = mark.cloud();
+                match action {
+                    "sandbox-stop" => {
+                        self.run_workspace_action(target, cloud::ArchiveChoice::Stop, window, cx)
+                    }
+                    "sandbox-delete" => {
+                        self.run_workspace_action(target, cloud::ArchiveChoice::Delete, window, cx)
+                    }
+                    _ => self.confirm_remove_cloud_session(id, window, cx),
                 }
             }
             "copy-harness-session-id" | "copy-monocode-session-id" | "copy-database-session-id" => {

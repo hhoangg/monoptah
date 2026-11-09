@@ -38,8 +38,18 @@ impl Shell {
                         monos.update(cx, |m, cx| m.account_changed(*kind, id, false, cx));
                     }
                     this.update_usage_provider(cx);
+                    if this.settings.is_some() {
+                        this.prefetch_settings_catalogs(cx);
+                    }
                 }
-                AccountEvent::Updated => this.update_usage_provider(cx),
+                AccountEvent::Updated => {
+                    this.update_usage_provider(cx);
+                    // A new default account has its own model catalog.
+                    if this.settings.is_some() {
+                        this.prefetch_settings_catalogs(cx);
+                        this.sync_settings(cx);
+                    }
+                }
                 AccountEvent::PickerDismiss | AccountEvent::AuthStarted => {}
                 AccountEvent::Manage => {
                     cx.spawn(async move |this, cx| {

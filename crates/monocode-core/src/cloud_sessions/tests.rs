@@ -78,6 +78,7 @@ fn machine(codespace: &str) -> Machine {
         environment_id: format!("env-{codespace}"),
         ssh: None,
         codespace: Some(codespace.into()),
+        sandbox: None,
     }
 }
 impl Host for FakeHost {
@@ -628,7 +629,7 @@ fn pull_evidence_copies_the_default_folder_into_the_session_folder() {
     });
     let (svc, id) = evidence_service(gh.clone(), dir.path());
     let pull = svc.pull_evidence(id, None).unwrap();
-    assert_eq!(pull.codespace, "octo-abc");
+    assert_eq!(pull.instance, "octo-abc");
     assert_eq!(pull.remote_path, "/workspaces/widgets/.evidence");
     assert_eq!(pull.files.len(), 2, "{pull:?}");
     assert!(pull.files.iter().all(|f| f.starts_with(&pull.local_dir)));
@@ -948,4 +949,277 @@ fn live_codespace_deletion_still_requires_the_host_to_accept_the_delete() {
     assert!(store.remote_session(id).unwrap().is_none());
     assert_eq!(host.log().len(), 2);
     assert!(host.log()[0].contains("sessions.delete"));
+}
+
+/// Records the calls of a backend registered as the Docker sandbox one.
+#[derive(Default)]
+struct FakeSandboxBackend {
+    calls: Mutex<Vec<String>>,
+}
+impl FakeSandboxBackend {
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+    fn note(&self, call: String) {
+        self.calls.lock().unwrap().push(call);
+    }
+}
+impl CloudBackend for FakeSandboxBackend {
+    fn kind(&self) -> CloudBackendKind {
+        CloudBackendKind::DockerSandbox
+    }
+    fn display_state(&self, raw: &str) -> CloudState {
+        match raw {
+            "Available" => CloudState::Available,
+            "Stopped" => CloudState::Stopped,
+            _ => CloudState::Unknown,
+        }
+    }
+    fn is_stopped(&self, raw: &str) -> bool {
+        raw == "Stopped"
+    }
+    fn is_deleted_state(&self, raw: &str) -> bool {
+        raw == "Removed"
+    }
+    fn is_missing_error(&self, error: &str) -> bool {
+        error.contains("no such sandbox")
+    }
+    fn state(&self, name: &str) -> Result<String, String> {
+        self.note(format!("state {name}"));
+        Ok("Available".into())
+    }
+    fn exists(&self, name: &str) -> Result<bool, String> {
+        self.note(format!("exists {name}"));
+        Ok(true)
+    }
+    fn stop(&self, name: &str) -> Result<(), String> {
+        self.note(format!("stop {name}"));
+        Ok(())
+    }
+    fn delete(&self, name: &str) -> Result<(), String> {
+        self.note(format!("delete {name}"));
+        Ok(())
+    }
+    fn rebuild(&self, name: &str) -> Result<(), String> {
+        self.note(format!("rebuild {name}"));
+        Ok(())
+    }
+    fn web_url(&self, _name: &str) -> Option<Result<String, String>> {
+        None
+    }
+    fn run_script(&self, name: &str, _script: &str, _long: bool) -> Result<String, String> {
+        self.note(format!("run_script {name}"));
+        Ok(String::new())
+    }
+    fn copy_from(&self, name: &str, remote: &str, _local: &Path) -> Result<(), String> {
+        self.note(format!("copy_from {name} {remote}"));
+        Ok(())
+    }
+    fn prepare_evidence(&self, name: &str, _workspace: &str) -> Result<(), String> {
+        self.note(format!("prepare_evidence {name}"));
+        Ok(())
+    }
+}
+
+#[test]
+fn a_sandbox_bound_project_is_stopped_and_deleted_through_its_own_backend() {
+    // Any gh call would panic: FakeGh has no rule for it.
+    let gh = FakeGh::new(vec![]);
+    let host = FakeHost::with_machine("octo-abc");
+    let sandbox = Arc::new(FakeSandboxBackend::default());
+    let svc = service(&gh, &host).with_backend(sandbox.clone());
+    let cloud = CloudRef::sandbox("sbx-1");
+    let session = {
+        let store = svc.store().unwrap();
+        let project =
+            crate::store::pending_cloud_project("/Users/me/widgets", &cloud, "/workspaces/widgets");
+        assert_eq!(project.cloud(), Some(cloud.clone()));
+        assert_eq!(project.codespace, None);
+        store
+            .create_pending_cloud_session("claude", project)
+            .unwrap()
+    };
+    assert_eq!(svc.cloud_state_of(&cloud), CloudState::Available);
+    assert_eq!(svc.sessions_in_cloud(&cloud), vec![session.id]);
+    // The listing includes it, tagged with its backend so callers can tell it from a codespace.
+    let listed = svc.cloud_sessions_for("/Users/me/widgets").unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].cloud, cloud);
+    assert_eq!(listed[0].summary.id, session.id);
+
+    svc.stop_cloud(&cloud).unwrap();
+    assert_eq!(
+        svc.delete_cloud_outcome(&cloud).unwrap(),
+        DeleteOutcome::Deleted
+    );
+    assert!(svc.sessions_in_cloud(&cloud).is_empty());
+    assert_eq!(
+        sandbox.calls(),
+        vec!["state sbx-1", "stop sbx-1", "delete sbx-1"]
+    );
+    assert_eq!(gh.calls(), Vec::<String>::new());
+    // The sandbox namespace never touched the machine of the codespace with another name.
+    assert_eq!(host.log(), Vec::<String>::new());
+}
+
+#[test]
+fn state_and_gone_caches_keep_codespaces_and_sandboxes_apart() {
+    let gh = FakeGh::new(vec![("codespace view", ok(r#"{"state":"Shutdown"}"#))]);
+    let host = FakeHost::with_machine("octo-abc");
+    let sandbox = Arc::new(FakeSandboxBackend::default());
+    let svc = service(&gh, &host).with_backend(sandbox.clone());
+    // Same name, two backends: each answers for itself.
+    assert_eq!(svc.cloud_state("same"), CloudState::Stopped);
+    assert_eq!(
+        svc.cloud_state_of(&CloudRef::sandbox("same")),
+        CloudState::Available
+    );
+    svc.mark_gone(&CloudRef::sandbox("same"));
+    assert!(svc.cloud_gone(&CloudRef::sandbox("same")));
+    assert!(!svc.codespace_gone("same"));
+}
+
+#[test]
+fn an_unregistered_backend_is_an_error_not_a_panic() {
+    let gh = FakeGh::new(vec![]);
+    let svc = service(&gh, &FakeHost::with_machine("octo-abc"));
+    let error = svc.stop_cloud(&CloudRef::sandbox("sbx-1")).unwrap_err();
+    assert!(error.contains("sandbox"), "{error}");
+}
+
+fn resolved(name: &str) -> ResolvedCodespace {
+    ResolvedCodespace {
+        name: name.into(),
+        display: "monoptah-main".into(),
+        repo: "octo/widgets".into(),
+        remote_cwd: "/workspaces/widgets".into(),
+        created: true,
+        web_url: None,
+        state: "Provisioning".into(),
+        branch: Some("main".into()),
+        machine: None,
+    }
+}
+
+/// Stores a pending session and a start record for `cloud` and returns the session id.
+fn begin_pending_start(svc: &CloudSessions, cloud: &CloudRef) -> i64 {
+    let store = svc.store().unwrap();
+    let project =
+        crate::store::pending_cloud_project("/Users/me/widgets", cloud, "/workspaces/widgets");
+    let session = store
+        .create_pending_cloud_session("claude", project)
+        .unwrap();
+    let mut record = StartRecord::fresh(
+        &resolved(&cloud.name),
+        session.id,
+        "/Users/me/widgets",
+        // Codespace starts are older, so the pending order is deterministic.
+        if cloud.kind == CloudBackendKind::Codespaces {
+            1
+        } else {
+            2
+        },
+    );
+    if cloud.kind == CloudBackendKind::DockerSandbox {
+        record.codespace = String::new();
+        record.sandbox = Some(cloud.name.clone());
+    }
+    startup::save_start_record(&store, &record).unwrap();
+    session.id
+}
+
+#[test]
+fn a_sandbox_start_without_sandbox_support_never_reaches_gh() {
+    let gh = FakeGh::new(vec![]);
+    let host = FakeHost::with_machine("octo-abc");
+    let sandbox = Arc::new(FakeSandboxBackend::default());
+    let svc = service(&gh, &host).with_backend(sandbox.clone());
+    let id = begin_pending_start(&svc, &CloudRef::sandbox("sbx-1"));
+    let cancel = AtomicBool::new(false);
+    let mut events = |_: StartEvent| {};
+
+    let resumed = svc.resume_start(id, &mut events, &cancel).unwrap_err();
+    let run = svc.run_start(id, &mut events, &cancel).unwrap_err();
+    let rebuilt = svc.rebuild_start(id).unwrap_err();
+    let url = svc.start_web_url(id).unwrap_err();
+
+    assert!(resumed.contains("not available"), "{resumed}");
+    assert!(run.contains("not available"), "{run}");
+    assert!(rebuilt.contains("not provisioned"), "{rebuilt}");
+    assert!(url.contains("sandbox"), "{url}");
+    assert_eq!(gh.calls(), Vec::<String>::new());
+    assert_eq!(host.log(), Vec::<String>::new());
+    // Only the read-only state lookup of resume reached the backend; nothing was rebuilt.
+    assert_eq!(sandbox.calls(), vec!["state sbx-1"]);
+    // The refused record is untouched.
+    let record = startup::start_record(&svc.store().unwrap(), id).unwrap();
+    assert!(!record.is_failed());
+    assert_eq!(record.sandbox.as_deref(), Some("sbx-1"));
+}
+
+#[test]
+fn sandbox_starts_live_under_their_own_setting() {
+    let gh = FakeGh::new(vec![]);
+    let svc = service(&gh, &FakeHost::with_machine("octo-abc"));
+    let codespace_id = begin_pending_start(&svc, &CloudRef::codespace("cs-1"));
+    let old = svc.store().unwrap().setting("cloud-starts.v1").unwrap();
+    assert!(old.is_some());
+
+    let sandbox_id = begin_pending_start(&svc, &CloudRef::sandbox("sbx-1"));
+    let store = svc.store().unwrap();
+    assert_eq!(store.setting("cloud-starts.v1").unwrap(), old);
+    let new = store.setting("cloud-starts-sbx.v1").unwrap().unwrap();
+    assert!(new.contains("\"sandbox\":\"sbx-1\""), "{new}");
+    assert!(!old.as_ref().unwrap().contains("sandbox"));
+    let ids: Vec<i64> = startup::pending_starts(&store)
+        .iter()
+        .map(|r| r.session_id)
+        .collect();
+    assert_eq!(ids, vec![codespace_id, sandbox_id]);
+
+    store.forget_cloud(&CloudRef::sandbox("sbx-1")).unwrap();
+    assert_eq!(store.setting("cloud-starts.v1").unwrap(), old);
+    assert!(startup::start_record(&store, sandbox_id).is_none());
+    assert!(startup::start_record(&store, codespace_id).is_some());
+}
+
+#[test]
+fn stopping_a_sandbox_pauses_its_pending_start() {
+    let gh = FakeGh::new(vec![]);
+    let sandbox = Arc::new(FakeSandboxBackend::default());
+    let svc = service(&gh, &FakeHost::with_machine("octo-abc")).with_backend(sandbox.clone());
+    let cloud = CloudRef::sandbox("sbx-1");
+    let id = begin_pending_start(&svc, &cloud);
+    let other = begin_pending_start(&svc, &CloudRef::sandbox("sbx-2"));
+
+    svc.stop_cloud(&cloud).unwrap();
+
+    let store = svc.store().unwrap();
+    let record = startup::start_record(&store, id).unwrap();
+    assert_eq!(
+        record.error.as_deref(),
+        Some("Sandbox stopped. Choose Retry to start it again.")
+    );
+    assert!(!startup::start_record(&store, other).unwrap().is_failed());
+    assert_eq!(sandbox.calls(), vec!["stop sbx-1"]);
+    assert_eq!(gh.calls(), Vec::<String>::new());
+}
+
+#[test]
+fn split_created_note_reads_what_created_note_for_writes() {
+    for (cloud, kind) in [
+        (CloudRef::codespace("octo-1"), CloudBackendKind::Codespaces),
+        (CloudRef::sandbox("box-1"), CloudBackendKind::DockerSandbox),
+    ] {
+        let note = created_note_for(&cloud, "it broke");
+        assert_eq!(
+            split_created_note(&note),
+            Some(("it broke", kind, cloud.name.as_str()))
+        );
+    }
+    assert_eq!(split_created_note("plain error"), None);
+    assert_eq!(
+        split_created_note("x (sandbox  was created and kept; y)"),
+        None
+    );
 }

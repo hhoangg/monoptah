@@ -12,12 +12,49 @@ pub(crate) enum Mode {
     Branch,
     Base,
     Worktree,
+    /// A fixed list of ref names handed in by the caller (the cloud panel's remote branches).
+    Refs,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn a_refs_picker_offers_the_typed_text_when_the_validator_accepts_it(cx: &mut TestAppContext) {
+        let picker = cx.new(|cx| {
+            GitPicker::refs(
+                vec!["main".into(), "dev".into()],
+                None,
+                true,
+                None,
+                |name| !name.starts_with('-') && !name.contains(' '),
+                cx,
+            )
+        });
+        let labels = |picker: &Entity<GitPicker>, query: &str, cx: &mut TestAppContext| {
+            picker.update(cx, |view, cx| {
+                view.search
+                    .update(cx, |input, cx| input.set_text(query.into(), cx));
+                view.choices(cx)
+                    .into_iter()
+                    .map(|choice| match choice {
+                        Choice::Ref(None) => "default".to_owned(),
+                        Choice::Ref(Some(name)) => name,
+                        Choice::Typed(name) => format!("use {name}"),
+                        _ => "other".into(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(labels(&picker, "", cx), ["default", "main", "dev"]);
+        // A tag or SHA that is not in the list can be used as typed.
+        assert_eq!(labels(&picker, "v1.0", cx), ["use v1.0"]);
+        // A listed name is not offered twice; a refused one is not offered at all.
+        assert_eq!(labels(&picker, "main", cx), ["main"]);
+        assert!(labels(&picker, "-x", cx).is_empty());
+    }
 
     #[gpui::test]
     fn all_picker_modes_start_with_cached_choices_and_keep_them_after_refresh_failure(
@@ -81,6 +118,8 @@ pub(crate) enum Picked {
     Changed,
     Base(String),
     Worktree(String),
+    /// `Refs` mode: the ref name, or `None` for the "Default branch" entry.
+    Ref(Option<String>),
     Dismissed,
 }
 pub(crate) struct GitPicker {
@@ -93,6 +132,12 @@ pub(crate) struct GitPicker {
     busy: bool,
     existing_only: bool,
     error: Option<String>,
+    /// `Refs` mode: the names offered.
+    refs: Vec<String>,
+    default_entry: bool,
+    /// `Refs` mode: whether a typed query may be used as a ref of its own.
+    accept_typed: Option<fn(&str) -> bool>,
+    footer: Option<String>,
     _changed: Subscription,
 }
 #[derive(Clone)]
@@ -100,6 +145,10 @@ enum Choice {
     Branch(git::Branch),
     Create(String),
     Worktree(git::Worktree),
+    /// `Refs` mode; `None` is the "Default branch" entry.
+    Ref(Option<String>),
+    /// `Refs` mode: the query itself.
+    Typed(String),
 }
 impl EventEmitter<Picked> for GitPicker {}
 impl GitPicker {
@@ -155,6 +204,56 @@ impl GitPicker {
             busy: false,
             existing_only: false,
             error: None,
+            refs: Vec::new(),
+            default_entry: false,
+            accept_typed: None,
+            footer: None,
+            _changed: changed,
+        }
+    }
+    /// A picker over a fixed list of ref names, with no git work of its own. `selected` is the
+    /// ref checked now (`None` checks the "Default branch" entry, when `default_entry` is set).
+    pub(crate) fn refs(
+        refs: Vec<String>,
+        selected: Option<String>,
+        default_entry: bool,
+        footer: Option<String>,
+        accept_typed: fn(&str) -> bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut picker = Self::bare(Mode::Refs, selected, cx);
+        picker.accept_typed = Some(accept_typed);
+        picker.refs = refs;
+        picker.default_entry = default_entry;
+        picker.footer = footer;
+        picker
+    }
+    /// Replaces the names of a `Refs` picker, for a list that was refreshed while it is open.
+    pub(crate) fn set_refs(&mut self, refs: Vec<String>, cx: &mut Context<Self>) {
+        self.refs = refs;
+        cx.notify();
+    }
+    fn bare(mode: Mode, selected: Option<String>, cx: &mut Context<Self>) -> Self {
+        let search = cx
+            .new(|cx| input::Input::field("Search branches", "Search branches…", content(0.4), cx));
+        let changed = cx.subscribe(&search, |this, _, _: &input::Changed, cx| {
+            this.active = 0;
+            cx.notify();
+        });
+        Self {
+            cwd: PathBuf::new(),
+            mode,
+            selected,
+            state: None,
+            search,
+            active: 0,
+            busy: false,
+            existing_only: false,
+            error: None,
+            refs: Vec::new(),
+            default_entry: false,
+            accept_typed: None,
+            footer: None,
             _changed: changed,
         }
     }
@@ -170,9 +269,36 @@ impl GitPicker {
         self.existing_only = true;
         self
     }
+    /// The names a `Refs` picker holds, for tests.
+    #[cfg(test)]
+    pub(crate) fn offered(&self) -> &[String] {
+        &self.refs
+    }
     fn choices(&self, cx: &gpui::App) -> Vec<Choice> {
         let query = self.search.read(cx).content.trim().to_owned();
         let needle = query.to_lowercase();
+        if self.mode == Mode::Refs {
+            let mut choices = Vec::new();
+            if self.default_entry && "default branch".contains(&needle) {
+                choices.push(Choice::Ref(None));
+            }
+            choices.extend(
+                self.refs
+                    .iter()
+                    .filter(|name| name.to_lowercase().contains(&needle))
+                    .cloned()
+                    .map(|name| Choice::Ref(Some(name))),
+            );
+            // A tag, a SHA or a branch the list lacks: the typed text stands for itself.
+            if let Some(accept) = self.accept_typed
+                && !query.is_empty()
+                && accept(&query)
+                && !self.refs.contains(&query)
+            {
+                choices.push(Choice::Typed(query));
+            }
+            return choices;
+        }
         let Some(state) = &self.state else {
             return Vec::new();
         };
@@ -231,6 +357,8 @@ impl GitPicker {
             return;
         };
         match choice {
+            Choice::Ref(name) => cx.emit(Picked::Ref(name)),
+            Choice::Typed(name) => cx.emit(Picked::Ref(Some(name))),
             Choice::Worktree(tree) => {
                 if !tree.missing {
                     cx.emit(Picked::Worktree(tree.path));
@@ -301,6 +429,17 @@ impl gpui::Render for GitPicker {
                         };
                         (branch.name, branch.remote, selected, false, "git-branch")
                     }
+                    Choice::Ref(name) => {
+                        let selected = self.selected == name;
+                        (
+                            name.unwrap_or_else(|| "Default branch".into()),
+                            None,
+                            selected,
+                            false,
+                            "git-branch",
+                        )
+                    }
+                    Choice::Typed(name) => (format!("Use ‘{name}’"), None, false, false, "plus"),
                     Choice::Create(name) => (
                         format!("Create branch ‘{name}’"),
                         None,
@@ -403,6 +542,8 @@ impl gpui::Render for GitPicker {
                 "Working copies"
             } else if self.mode == Mode::Base {
                 "Worktree base branch"
+            } else if self.mode == Mode::Refs {
+                "Remote branches"
             } else {
                 "Branches"
             })
@@ -474,15 +615,20 @@ impl gpui::Render for GitPicker {
                                 .p(px(12.))
                                 .text_size(px(12.))
                                 .text_color(content(0.45))
-                                .child(if self.state.is_none() && self.error.is_none() {
-                                    "Loading…"
-                                } else if existing_only
-                                    && self.search.read(cx).content.trim().is_empty()
-                                {
-                                    "No existing worktrees"
-                                } else {
-                                    "No matches"
-                                }),
+                                .child(
+                                    if self.state.is_none()
+                                        && self.error.is_none()
+                                        && self.mode != Mode::Refs
+                                    {
+                                        "Loading…"
+                                    } else if existing_only
+                                        && self.search.read(cx).content.trim().is_empty()
+                                    {
+                                        "No existing worktrees"
+                                    } else {
+                                        "No matches"
+                                    },
+                                ),
                         )
                     }),
             )
@@ -494,6 +640,16 @@ impl gpui::Render for GitPicker {
                         .text_size(px(10.))
                         .text_color(content(0.4))
                         .child("Type a new name to create a branch"),
+                )
+            })
+            .when_some(self.footer.clone(), |d, footer| {
+                d.child(
+                    div()
+                        .px(px(12.))
+                        .py(px(6.))
+                        .text_size(px(10.))
+                        .text_color(content(0.4))
+                        .child(footer),
                 )
             })
             .when_some(self.error.clone(), |d, error| {

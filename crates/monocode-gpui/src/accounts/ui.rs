@@ -253,6 +253,7 @@ impl Accounts {
         let mut rows = Vec::new();
         for kind in accounts::PROVIDERS {
             let accounts = self.book.list(kind);
+            let preferred = self.book.preferred(kind);
             let count = accounts.len();
             let adding = self.editor.as_ref().is_some_and(|e| {
                 e.kind == kind && e.id.is_none() && e.surface == Surface::Settings
@@ -354,19 +355,33 @@ impl Accounts {
                     .and_then(|i| i.organization.as_ref().or(i.plan.as_ref()))
                     .cloned();
                 let mut controls = div()
-                    .w(px(96.))
+                    .w(px(112.))
                     .flex_shrink_0()
                     .flex()
                     .items_center()
                     .justify_end()
                     .gap_1();
-                if account.is_default() {
+                if preferred == id {
                     controls = controls.child(
                         div()
                             .mr_1()
                             .text_size(px(10.))
                             .text_color(content(0.3))
                             .child("DEFAULT"),
+                    );
+                } else if accounts::supports_profiles(kind) {
+                    let default_id = id.clone();
+                    controls = controls.child(
+                        account_button(
+                            SharedString::from(format!("default-{id}-{}", kind.id())),
+                            SharedString::from(format!("Set {} as default", account.label)),
+                            "pin",
+                        )
+                        .size_7()
+                        .when(self.working, |d| d.opacity(0.5))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_default(kind, &default_id, cx)
+                        })),
                     );
                 }
                 controls = controls.child(

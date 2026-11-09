@@ -2,13 +2,14 @@
 //! host pairs devices, serves the link and checks every request; the app
 //! answers them from its own state. No arbitrary app commands are exposed.
 use super::catalog::{recent_sessions, session_page};
+use super::identity_store::{self, IdentityKeychain, SystemKeychain};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use monocode_mobile_link::{now, Address, Gate, Identity, WatchSink, PORT, VERSION};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock,
@@ -195,8 +196,10 @@ pub struct MobileHost {
     path: PathBuf,
     events: async_channel::Sender<Event>,
     runtime: Arc<OnceLock<tokio::runtime::Runtime>>,
-    /// Serializes keyring access without holding `inner`, which the UI reads.
+    /// Serializes identity loading without holding `inner`, which the UI reads.
     identity_load: Arc<Mutex<()>>,
+    /// Only read to migrate an identity an earlier version saved in the keychain.
+    keychain: Arc<dyn IdentityKeychain>,
     pending: Arc<AtomicUsize>,
     shut_down: Arc<AtomicBool>,
 }
@@ -241,6 +244,14 @@ impl MobileHost {
     /// Loads `path` (the desktop's `mobile-access.json`) and starts serving
     /// when mobile access is on. The app reads phone requests from the receiver.
     pub fn open(path: PathBuf) -> Result<(Self, async_channel::Receiver<Event>), String> {
+        let keychain = Arc::new(SystemKeychain::new(identity_store::account_for(&path)));
+        Self::open_with(path, keychain)
+    }
+
+    pub(crate) fn open_with(
+        path: PathBuf,
+        keychain: Arc<dyn IdentityKeychain>,
+    ) -> Result<(Self, async_channel::Receiver<Event>), String> {
         let config: Config = if path.exists() {
             serde_json::from_slice(&std::fs::read(&path).map_err(|e| e.to_string())?)
                 .map_err(|e| format!("Mobile settings are invalid: {e}"))?
@@ -271,11 +282,13 @@ impl MobileHost {
             events,
             runtime: Arc::default(),
             identity_load: Arc::default(),
+            keychain,
             pending: Arc::default(),
             shut_down: Arc::default(),
         };
-        // The keyring read can wait on securityd or an access prompt, and the
-        // app opens the host while launching.
+        // Loading the identity reads the database (and, once, the legacy
+        // keychain entry, which can wait on an access prompt), and the app opens
+        // the host while launching.
         if enabled {
             let starting = host.clone();
             std::thread::Builder::new()
@@ -555,8 +568,9 @@ impl MobileHost {
         std::fs::rename(&temporary, &self.path).map_err(|e| e.to_string())
     }
 
-    /// The desktop's long-lived identity, kept in the OS keyring under the same
-    /// entry the earlier desktop app used, so paired phones stay paired.
+    /// The desktop's long-lived identity, sealed in the native store database.
+    /// An identity saved in the OS keychain by an earlier version is migrated
+    /// once, so paired phones stay paired.
     fn identity(&self) -> Result<Identity, String> {
         let _loading = self.identity_load.lock().map_err(unavailable)?;
         let paired = {
@@ -566,23 +580,13 @@ impl MobileHost {
             }
             !inner.config.devices.is_empty()
         };
-        let entry = keyring::Entry::new("com.monocode.mobile", &keyring_account(&self.path))
-            .map_err(|e| e.to_string())?;
-        let identity = match entry.get_password() {
-            Ok(value) => serde_json::from_str(&value)
-                .map_err(|_| "Saved desktop mobile identity is invalid")?,
-            Err(keyring::Error::NoEntry) => {
-                if paired {
-                    return Err("Desktop mobile identity is missing. Remove paired devices before creating a new identity.".into());
-                }
-                let identity = Identity::generate()?;
-                entry
-                    .set_password(&serde_json::to_string(&identity).map_err(|e| e.to_string())?)
-                    .map_err(|e| e.to_string())?;
-                identity
-            }
-            Err(error) => return Err(format!("Cannot read desktop mobile identity: {error}")),
-        };
+        let database = self.path.parent().and_then(crate::accounts::database_for);
+        let identity = identity_store::load(
+            database.as_deref(),
+            &identity_store::account_for(&self.path),
+            paired,
+            self.keychain.as_ref(),
+        )?;
         self.inner.lock().map_err(unavailable)?.identity = Some(identity.clone());
         Ok(identity)
     }
@@ -841,10 +845,6 @@ impl MobileHost {
     }
 }
 
-fn keyring_account(path: &Path) -> String {
-    format!("desktop:{}", path.display())
-}
-
 fn addresses(inner: &Inner) -> Vec<Address> {
     let mut result: Vec<Address> = if_addrs::get_if_addrs()
         .unwrap_or_default()
@@ -948,6 +948,28 @@ mod tests {
     #[test]
     fn pending_start_does_not_listen_after_shutdown() {
         check_pending_start_stays_stopped(true);
+    }
+
+    #[test]
+    fn identity_persists_in_the_store_across_hosts_without_the_keychain() {
+        use super::super::identity_store::tests::FakeKeychain;
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("store.db");
+        rusqlite::Connection::open(&database).unwrap();
+        crate::accounts::register_database(dir.path(), &database);
+        let config = dir.path().join("mobile-access.json");
+        let first_keychain = Arc::new(FakeKeychain::default());
+        let (first, _events) =
+            MobileHost::open_with(config.clone(), first_keychain.clone()).unwrap();
+        let created = first.identity().unwrap();
+        let second_keychain = Arc::new(FakeKeychain::default());
+        let (second, _events) = MobileHost::open_with(config, second_keychain.clone()).unwrap();
+        let loaded = second.identity().unwrap();
+        assert_eq!(
+            created.fingerprint().unwrap(),
+            loaded.fingerprint().unwrap()
+        );
+        assert_eq!(second_keychain.gets.load(Ordering::SeqCst), 0);
     }
 
     #[test]

@@ -763,7 +763,8 @@ fn ambiguous_legacy_requests_block_send_retry_and_restore_without_consuming_draf
 #[gpui::test]
 fn sending_to_an_unloaded_cloud_session_reconnects_its_codespace(cx: &mut TestAppContext) {
     use crate::cloud_wake::fakes::{AUTH_OK, github_project, install};
-    use monocode_core::cloud_sessions::{CodespaceChoice, Target};
+    use monocode_core::cloud_sessions::CloudBackendKind;
+    use monocode_core::mono::cloud_api::{CloudTarget, InstanceChoice};
     let dir = github_project();
     let store: Database = Arc::new(Mutex::new(
         monocode_core::store::Store::open(Path::new(":memory:")).unwrap(),
@@ -773,11 +774,10 @@ fn sending_to_an_unloaded_cloud_session_reconnects_its_codespace(cx: &mut TestAp
     let binding = api
         .prepare(
             dir.0.to_str().unwrap(),
-            Target {
-                codespace: CodespaceChoice::Named("octo-run".into()),
-                branch: None,
-                machine: None,
-            },
+            CloudTarget::new(
+                CloudBackendKind::Codespaces,
+                InstanceChoice::Named("octo-run".into()),
+            ),
             &mut |_| {},
         )
         .unwrap();
@@ -813,4 +813,1255 @@ fn sending_to_an_unloaded_cloud_session_reconnects_its_codespace(cx: &mut TestAp
         "{calls:?}"
     );
     cx.update(|cx| view.update(cx, |view, _| assert!(!view.remote_state.waking)));
+}
+
+/// A send from a Mono or the app API wakes through the view's own `reconnect_cloud`: a failed
+/// wake lands in the view's connection-error path (not swallowed) and clears the in-flight
+/// flag, and a wake already in flight is not started twice.
+#[gpui::test]
+fn a_background_send_wake_failure_reaches_the_view_and_shares_its_in_flight_flag(
+    cx: &mut TestAppContext,
+) {
+    use crate::cloud_wake::fakes::{AUTH_OK, github_project, install};
+    use monocode_core::cloud_sessions::CloudBackendKind;
+    use monocode_core::mono::cloud_api::{CloudTarget, InstanceChoice};
+    let dir = github_project();
+    let store: Database = Arc::new(Mutex::new(
+        monocode_core::store::Store::open(Path::new(":memory:")).unwrap(),
+    ));
+    let (_gh, host) = install(store.clone(), AUTH_OK, "Shutdown");
+    let api = monocode_core::mono::cloud_api::CloudApi::shared(&store).unwrap();
+    let binding = api
+        .prepare(
+            dir.0.to_str().unwrap(),
+            CloudTarget::new(
+                CloudBackendKind::Codespaces,
+                InstanceChoice::Named("octo-run".into()),
+            ),
+            &mut |_| {},
+        )
+        .unwrap();
+    let summary = api.create_session(&binding, "claude").unwrap();
+    let id = summary.id;
+    host.0.lock().unwrap().clear();
+    host.2.store(true, std::sync::atomic::Ordering::Relaxed);
+    let view = cx.update(|cx| {
+        cx.new(|cx| {
+            let mut view = Conversation::new(summary, store.clone(), cx);
+            view.loaded = false;
+            view.remote_state.online = true;
+            view
+        })
+    });
+    // A wake already in flight (the user's Reconnect) is shared, not duplicated.
+    cx.update(|cx| view.update(cx, |view, _| view.remote_state.waking = true));
+    let shared = cx.update(|cx| {
+        let (store, view) = (store.clone(), view.clone());
+        cx.spawn(async move |cx| crate::cloud_wake::wake_for_send(store, id, view, cx).await)
+    });
+    cx.run_until_parked();
+    assert!(cx.foreground_executor().block_test(shared));
+    assert!(host.0.lock().unwrap().is_empty(), "no second wake");
+    cx.update(|cx| view.update(cx, |view, _| view.remote_state.waking = false));
+    // Otherwise the wake runs, fails, and the view shows the error.
+    let woke = cx.update(|cx| {
+        let (store, view) = (store.clone(), view.clone());
+        cx.spawn(async move |cx| crate::cloud_wake::wake_for_send(store, id, view, cx).await)
+    });
+    cx.run_until_parked();
+    assert!(cx.foreground_executor().block_test(woke));
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            assert!(!view.remote_state.waking);
+            assert_eq!(view.remote_state.error.as_deref(), Some("ssh refused"));
+            assert!(!view.remote_state.online);
+        })
+    });
+}
+
+/// A Docker sandbox session is reconnected through `CloudApi::reconnect_sandbox`, never the
+/// codespace wake (`ensure`), and a send from a Mono or the app API (`wake_for_send`) wakes it
+/// just like the user's Reconnect does.
+#[gpui::test]
+fn a_sandbox_session_reconnects_through_the_sandbox_path_and_a_background_send_wakes_it(
+    cx: &mut TestAppContext,
+) {
+    use crate::cloud_wake::fakes::{
+        AUTH_OK, github_project, install_with_sandbox, sandbox_session,
+    };
+    let dir = github_project();
+    let store: Database = Arc::new(Mutex::new(
+        monocode_core::store::Store::open(Path::new(":memory:")).unwrap(),
+    ));
+    let (gh, host, sbx, _) = install_with_sandbox(store.clone(), AUTH_OK, "Shutdown", "stopped");
+    let summary = sandbox_session(&store, dir.0.to_str().unwrap());
+    let id = summary.id;
+    host.0.lock().unwrap().clear();
+    gh.calls.lock().unwrap().clear();
+    let view = cx.update(|cx| {
+        cx.new(|cx| {
+            let mut view = Conversation::new(summary, store.clone(), cx);
+            assert!(view.is_cloud_session());
+            assert_eq!(view.cloud_noun(), Some("sandbox"));
+            view.loaded = false;
+            view.remote_state.online = false;
+            // The reload that follows a wake is not under test (it would open real connections).
+            view.remote_state.refreshing = true;
+            view
+        })
+    });
+    let describe = |host: &crate::cloud_wake::fakes::FakeHost| {
+        host.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| *l == "request m-sbx-box-1 environment.describe")
+            .count()
+    };
+    // A Mono or app API send wakes the sandbox through the sandbox path.
+    let woke = cx.update(|cx| {
+        let store = store.clone();
+        let view = view.clone();
+        cx.spawn(async move |cx| crate::cloud_wake::wake_for_send(store, id, view, cx).await)
+    });
+    cx.run_until_parked();
+    assert!(cx.foreground_executor().block_test(woke));
+    assert_eq!(describe(&host), 1, "{:?}", host.0.lock().unwrap());
+    // The user's Reconnect: sandbox wording and the same sandbox path.
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            assert!(view.reconnect_cloud(cx));
+            assert!(
+                view.status.contains("Reconnecting the sandbox"),
+                "{}",
+                view.status
+            );
+        })
+    });
+    cx.run_until_parked();
+    cx.update(|cx| view.update(cx, |view, _| assert!(!view.remote_state.waking)));
+    assert_eq!(describe(&host), 2, "{:?}", host.0.lock().unwrap());
+    assert!(
+        !host
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("ensure")),
+        "the codespace wake is never used for a sandbox"
+    );
+    assert!(gh.calls.lock().unwrap().is_empty());
+    assert!(!sbx.calls.lock().unwrap().iter().any(|c| c.contains(" rm ")));
+}
+
+/// A send that is not the user's own hand (Mono, workflow, app API) reaches the same guard and
+/// wakes a stopped sandbox view like a codespace's; the composer's own submit does too.
+#[gpui::test]
+fn any_send_reconnects_a_stopped_sandbox_view(cx: &mut TestAppContext) {
+    use crate::cloud_wake::fakes::{
+        AUTH_OK, github_project, install_with_sandbox, sandbox_session,
+    };
+    let dir = github_project();
+    let store: Database = Arc::new(Mutex::new(
+        monocode_core::store::Store::open(Path::new(":memory:")).unwrap(),
+    ));
+    let (_gh, host, _, _) = install_with_sandbox(store.clone(), AUTH_OK, "Shutdown", "stopped");
+    let summary = sandbox_session(&store, dir.0.to_str().unwrap());
+    host.0.lock().unwrap().clear();
+    let view = cx.update(|cx| {
+        cx.new(|cx| {
+            let mut view = Conversation::new(summary, store.clone(), cx);
+            view.loaded = true;
+            view.remote_state.online = false;
+            view.remote_state.refreshing = true;
+            view.input
+                .update(cx, |input, cx| input.set_text("hello".into(), cx));
+            view
+        })
+    });
+    // Mono external send, workflow send and app API send all end in send / app prompt.
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.send(cx);
+            assert!(view.remote_state.waking, "{}", view.status);
+            assert!(
+                view.status.contains("Reconnecting the sandbox"),
+                "{}",
+                view.status
+            );
+            // A second send while waking does not start another wake.
+            view.send_remote_app_prompt(cx);
+            assert!(view.remote_state.waking);
+        })
+    });
+    cx.run_until_parked();
+    let calls = host.0.lock().unwrap().clone();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|l| *l == "request m-sbx-box-1 environment.describe")
+            .count(),
+        1,
+        "{calls:?}"
+    );
+}
+
+// ------------------------------------------------- sandbox reconnect banner
+
+const RECREATED: &str =
+    "The sandbox container was recreated, so this session's history is gone. Start a new session.";
+
+/// A window with the conversation of a stored cloud session of `cloud`.
+fn cloud_conversation(
+    cx: &mut TestAppContext,
+    cloud: monocode_core::cloud_sessions::CloudRef,
+) -> gpui::WindowHandle<Conversation> {
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let store = monocode_core::store::Store::open(Path::new(":memory:")).unwrap();
+    let project = store
+        .remember_cloud_ref_project(
+            "env-box",
+            &serde_json::json!({"id":"project-1","cwd":"/workspaces/widgets"}),
+            "/work/widgets",
+            &cloud,
+        )
+        .unwrap();
+    let mut summary = store.create("claude", &project.key).unwrap();
+    summary.has_messages = true;
+    cx.update(|cx| {
+        crate::input::bind(cx);
+        cx.open_window(Default::default(), |_, cx| {
+            cx.new(|cx| {
+                let mut view = Conversation::new(summary, Arc::new(Mutex::new(store)), cx);
+                view.loaded = true;
+                view
+            })
+        })
+        .unwrap()
+    })
+}
+
+#[gpui::test]
+fn a_recreated_or_deleted_sandbox_offers_archive_and_new_session_not_reconnect(
+    cx: &mut TestAppContext,
+) {
+    use monocode_core::cloud_sessions::CloudRef;
+    for error in [RECREATED, "Sandbox was deleted. Start a new session."] {
+        let window = cloud_conversation(cx, CloudRef::sandbox("monoptah-fix-1234"));
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let log = seen.clone();
+        let view = window.root(cx).unwrap();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(
+                &view,
+                move |_, event: &crate::cloud_start_view::CloudStartAction, _| {
+                    log.borrow_mut().push(event.action)
+                },
+            )
+        });
+        window
+            .update(cx, |view, _, cx| {
+                view.remote_state.online = false;
+                view.remote_state.error = Some(error.into());
+                cx.notify();
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("remote-reconnect").is_none(), "{error}");
+        assert!(visual.debug_bounds("remote-retry").is_none(), "{error}");
+        for (id, action) in [
+            (
+                "remote-archive-session",
+                crate::cloud_start_view::StartAction::ArchiveSession,
+            ),
+            (
+                "remote-new-session",
+                crate::cloud_start_view::StartAction::NewSession,
+            ),
+        ] {
+            let bounds = visual.debug_bounds(id).unwrap_or_else(|| panic!("{id}"));
+            visual.simulate_click(bounds.center(), Default::default());
+            assert_eq!(seen.borrow().last(), Some(&action), "{id}");
+        }
+    }
+}
+
+#[gpui::test]
+fn another_sandbox_error_and_every_codespace_error_keep_reconnect_and_retry(
+    cx: &mut TestAppContext,
+) {
+    use monocode_core::cloud_sessions::CloudRef;
+    for (cloud, error) in [
+        (
+            CloudRef::sandbox("monoptah-fix-1234"),
+            "Could not reach sbx",
+        ),
+        (CloudRef::codespace("octo-abc"), RECREATED),
+    ] {
+        let window = cloud_conversation(cx, cloud);
+        window
+            .update(cx, |view, _, cx| {
+                view.remote_state.online = false;
+                view.remote_state.error = Some(error.into());
+                cx.notify();
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("remote-reconnect").is_some(), "{error}");
+        assert!(visual.debug_bounds("remote-retry").is_some(), "{error}");
+        assert!(visual.debug_bounds("remote-archive-session").is_none());
+    }
+}
+
+#[gpui::test]
+fn the_first_sandbox_reconnect_attempt_shows_progress_and_cancel(cx: &mut TestAppContext) {
+    use monocode_core::cloud_sessions::CloudRef;
+    // A sandbox: the banner appears while the first attempt runs, with Cancel only.
+    let window = cloud_conversation(cx, CloudRef::sandbox("monoptah-fix-1234"));
+    window
+        .update(cx, |view, _, cx| {
+            view.remote_state.online = false;
+            view.remote_state.waking = true;
+            view.remote_state.wake_cancel =
+                Some(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+            view.status = "Starting the container".into();
+            cx.notify();
+        })
+        .unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    assert!(visual.debug_bounds("remote-reconnect-cancel").is_some());
+    assert!(visual.debug_bounds("remote-retry").is_none());
+    window
+        .update(visual, |view, _, cx| {
+            assert!(view.sandbox_reconnecting());
+            view.cancel_cloud_reconnect(cx);
+            let cancelled = view
+                .remote_state
+                .wake_cancel
+                .as_ref()
+                .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+            assert!(cancelled);
+        })
+        .unwrap();
+    // A codespace wake with no error keeps showing no banner, as before.
+    let window = cloud_conversation(cx, CloudRef::codespace("octo-abc"));
+    window
+        .update(cx, |view, _, cx| {
+            view.remote_state.online = false;
+            view.remote_state.waking = true;
+            cx.notify();
+        })
+        .unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    assert!(visual.debug_bounds("remote-reconnect-cancel").is_none());
+}
+
+// ------------------------------------------------------ stopped workspace banner
+
+fn banner_shown(cx: &mut gpui::VisualTestContext) -> bool {
+    cx.run_until_parked();
+    cx.refresh().unwrap();
+    cx.debug_bounds("cloud-resume").is_some()
+}
+
+#[gpui::test]
+fn the_stopped_banner_shows_only_while_the_workspace_is_stopped(cx: &mut TestAppContext) {
+    use monocode_core::cloud_sessions::CloudRef;
+    for (cloud, words) in [
+        (CloudRef::codespace("octo-abc"), "Codespace stopped"),
+        (CloudRef::sandbox("monoptah-fix-1234"), "Sandbox stopped"),
+    ] {
+        let window = cloud_conversation(cx, cloud);
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        assert!(!banner_shown(visual), "{words}: running");
+        window
+            .update(visual, |view, _, cx| view.set_cloud_stopped(true, cx))
+            .unwrap();
+        assert!(banner_shown(visual), "{words}: stopped");
+        window
+            .update(visual, |view, _, cx| {
+                assert!(view.cloud_stopped_banner());
+                // An error is shown by its own banner, with Reconnect and Retry.
+                view.remote_state.error = Some("Could not reach sbx".into());
+                cx.notify();
+            })
+            .unwrap();
+        assert!(!banner_shown(visual), "{words}: error banner instead");
+        assert!(visual.debug_bounds("remote-reconnect").is_some());
+        window
+            .update(visual, |view, _, cx| {
+                view.remote_state.error = None;
+                view.set_cloud_stopped(false, cx);
+            })
+            .unwrap();
+        assert!(!banner_shown(visual), "{words}: resumed");
+    }
+    // A local session never shows it, whatever the shell says.
+    let store = monocode_core::store::Store::open(Path::new(":memory:")).unwrap();
+    let mut summary = store.create("claude", "/work/widgets").unwrap();
+    summary.has_messages = true;
+    let window = cx.update(|cx| {
+        crate::input::bind(cx);
+        cx.open_window(Default::default(), |_, cx| {
+            cx.new(|cx| {
+                let mut view = Conversation::new(summary, Arc::new(Mutex::new(store)), cx);
+                view.loaded = true;
+                view
+            })
+        })
+        .unwrap()
+    });
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    window
+        .update(visual, |view, _, cx| view.set_cloud_stopped(true, cx))
+        .unwrap();
+    assert!(!banner_shown(visual));
+}
+
+#[gpui::test]
+fn the_stopped_banner_text_names_the_workspace(cx: &mut TestAppContext) {
+    use monocode_core::cloud_sessions::CloudRef;
+    for (cloud, words) in [
+        (CloudRef::codespace("octo-abc"), "Codespace stopped"),
+        (CloudRef::sandbox("monoptah-fix-1234"), "Sandbox stopped"),
+    ] {
+        let window = cloud_conversation(cx, cloud);
+        window
+            .update(cx, |view, _, cx| view.set_cloud_stopped(true, cx))
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        assert!(banner_shown(visual));
+        // While it reconnects the banner keeps a disabled "Resuming..." button and Cancel.
+        window
+            .update(visual, |view, _, cx| {
+                view.remote_state.waking = true;
+                view.remote_state.wake_cancel =
+                    Some(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+                view.status = "Starting".into();
+                cx.notify();
+            })
+            .unwrap();
+        // No second Resume to press: the button stays, disabled, and says so.
+        assert!(banner_shown(visual));
+        assert!(visual.debug_bounds("remote-reconnect-cancel").is_some());
+        let text = window
+            .update(visual, |view, _, _| (view.status.clone(), words))
+            .unwrap();
+        assert_eq!(text.0, "Starting");
+    }
+}
+
+/// Resume is the user's click: the codespace wake runs once for it and never without it.
+#[gpui::test]
+fn clicking_resume_wakes_the_codespace_once_and_nothing_runs_without_a_click(
+    cx: &mut TestAppContext,
+) {
+    use crate::cloud_wake::fakes::{AUTH_OK, github_project, install};
+    use monocode_core::cloud_sessions::CloudBackendKind;
+    use monocode_core::mono::cloud_api::{CloudTarget, InstanceChoice};
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let dir = github_project();
+    let store: Database = Arc::new(Mutex::new(
+        monocode_core::store::Store::open(Path::new(":memory:")).unwrap(),
+    ));
+    let (_gh, host) = install(store.clone(), AUTH_OK, "Shutdown");
+    let api = monocode_core::mono::cloud_api::CloudApi::shared(&store).unwrap();
+    let binding = api
+        .prepare(
+            dir.0.to_str().unwrap(),
+            CloudTarget::new(
+                CloudBackendKind::Codespaces,
+                InstanceChoice::Named("octo-run".into()),
+            ),
+            &mut |_| {},
+        )
+        .unwrap();
+    let mut summary = api.create_session(&binding, "claude").unwrap();
+    summary.has_messages = true;
+    host.0.lock().unwrap().clear();
+    let window = cx.update(|cx| {
+        crate::input::bind(cx);
+        cx.open_window(Default::default(), |_, cx| {
+            cx.new(|cx| {
+                let mut view = Conversation::new(summary, store.clone(), cx);
+                view.loaded = true;
+                view.remote_state.refreshing = true;
+                view.set_cloud_stopped(true, cx);
+                view
+            })
+        })
+        .unwrap()
+    });
+    let resumed = Arc::new(Mutex::new(0));
+    let count = resumed.clone();
+    let view = window.root(cx).unwrap();
+    let _subscription = cx.update(|cx| {
+        cx.subscribe(&view, move |_, _: &super::CloudResumed, _| {
+            *count.lock().unwrap() += 1
+        })
+    });
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    assert!(banner_shown(visual));
+    // Rendering and waiting wake nothing.
+    visual.run_until_parked();
+    assert!(host.0.lock().unwrap().is_empty());
+    let button = visual.debug_bounds("cloud-resume").unwrap();
+    visual.simulate_click(button.center(), Default::default());
+    visual.run_until_parked();
+    let calls = host.0.lock().unwrap().clone();
+    assert_eq!(
+        calls.iter().filter(|c| *c == "ensure m-octo-run").count(),
+        1,
+        "{calls:?}"
+    );
+    assert_eq!(*resumed.lock().unwrap(), 1);
+    window
+        .update(visual, |view, _, _| {
+            assert!(!view.remote_state.waking);
+            assert!(!view.cloud_stopped);
+        })
+        .unwrap();
+    assert!(!banner_shown(visual));
+}
+
+/// A sandbox is resumed through the same user-initiated path as the Reconnect button.
+#[gpui::test]
+fn clicking_resume_on_a_sandbox_uses_the_user_reconnect_path(cx: &mut TestAppContext) {
+    use crate::cloud_wake::fakes::{AUTH_OK, github_project, install};
+    use monocode_core::cloud_sessions::CloudRef;
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let dir = github_project();
+    let store: Database = Arc::new(Mutex::new(
+        monocode_core::store::Store::open(Path::new(":memory:")).unwrap(),
+    ));
+    let (gh, host) = install(store.clone(), AUTH_OK, "Shutdown");
+    let summary = {
+        let guard = store.lock().unwrap();
+        let project = guard
+            .remember_cloud_ref_project(
+                "env-box",
+                &serde_json::json!({"id":"project-1","cwd":"/workspaces/widgets"}),
+                dir.0.to_str().unwrap(),
+                &CloudRef::sandbox("monoptah-fix-1234"),
+            )
+            .unwrap();
+        let mut summary = guard.create("claude", &project.key).unwrap();
+        summary.has_messages = true;
+        summary
+    };
+    host.0.lock().unwrap().clear();
+    gh.calls.lock().unwrap().clear();
+    let window = cx.update(|cx| {
+        crate::input::bind(cx);
+        cx.open_window(Default::default(), |_, cx| {
+            cx.new(|cx| {
+                let mut view = Conversation::new(summary, store.clone(), cx);
+                view.loaded = true;
+                view.remote_state.refreshing = true;
+                view.set_cloud_stopped(true, cx);
+                view
+            })
+        })
+        .unwrap()
+    });
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    assert!(banner_shown(visual));
+    let button = visual.debug_bounds("cloud-resume").unwrap();
+    visual.simulate_click(button.center(), Default::default());
+    visual.run_until_parked();
+    // The codespace wake is never used for a sandbox.
+    assert!(host.0.lock().unwrap().is_empty());
+    assert!(gh.calls.lock().unwrap().is_empty());
+    window
+        .update(visual, |view, _, _| {
+            // The sandbox path ran (this fake service has no sandbox backend, so it says so).
+            assert!(!view.remote_state.waking);
+            assert!(view.status.contains("sandbox"), "{}", view.status);
+        })
+        .unwrap();
+}
+
+/// A stopped codespace session with the fake wake services, `text` typed in the composer.
+fn stopped_codespace(
+    cx: &mut TestAppContext,
+    text: &str,
+) -> (
+    gpui::WindowHandle<Conversation>,
+    Arc<crate::cloud_wake::fakes::FakeHost>,
+) {
+    use crate::cloud_wake::fakes::{AUTH_OK, github_project, install};
+    use monocode_core::cloud_sessions::CloudBackendKind;
+    use monocode_core::mono::cloud_api::{CloudTarget, InstanceChoice};
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let dir = github_project();
+    let store: Database = Arc::new(Mutex::new(
+        monocode_core::store::Store::open(Path::new(":memory:")).unwrap(),
+    ));
+    let (_gh, host) = install(store.clone(), AUTH_OK, "Shutdown");
+    let api = monocode_core::mono::cloud_api::CloudApi::shared(&store).unwrap();
+    let binding = api
+        .prepare(
+            dir.0.to_str().unwrap(),
+            CloudTarget::new(
+                CloudBackendKind::Codespaces,
+                InstanceChoice::Named("octo-run".into()),
+            ),
+            &mut |_| {},
+        )
+        .unwrap();
+    let mut summary = api.create_session(&binding, "claude").unwrap();
+    summary.has_messages = true;
+    host.0.lock().unwrap().clear();
+    let text = text.to_owned();
+    let window = cx.update(|cx| {
+        crate::input::bind(cx);
+        cx.open_window(Default::default(), |_, cx| {
+            cx.new(|cx| {
+                let mut view = Conversation::new(summary, store.clone(), cx);
+                view.loaded = true;
+                view.remote_state.refreshing = true;
+                // The refresh after a resume reaches the (fake) host and succeeds.
+                view.remote_state.refresh_stub = Some(Ok(()));
+                view.set_cloud_stopped(true, cx);
+                view.input.update(cx, |input, cx| input.set_text(text, cx));
+                view
+            })
+        })
+        .unwrap()
+    });
+    (window, host)
+}
+
+fn ensures(host: &Arc<crate::cloud_wake::fakes::FakeHost>) -> usize {
+    host.0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| *c == "ensure m-octo-run")
+        .count()
+}
+
+#[gpui::test]
+fn the_send_button_is_a_resume_pill_only_while_the_workspace_is_stopped(cx: &mut TestAppContext) {
+    use monocode_core::cloud_sessions::CloudRef;
+    for (cloud, noun) in [
+        (CloudRef::codespace("octo-abc"), "codespace"),
+        (CloudRef::sandbox("monoptah-fix-1234"), "sandbox"),
+    ] {
+        let window = cloud_conversation(cx, cloud);
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        window
+            .update(visual, |view, _, _| {
+                assert!(view.cloud_resume_tip().is_none())
+            })
+            .unwrap();
+        window
+            .update(visual, |view, _, cx| view.set_cloud_stopped(true, cx))
+            .unwrap();
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        window
+            .update(visual, |view, _, _| {
+                // Usable with or without a prompt.
+                let (tip, usable) = view.cloud_resume_tip().unwrap();
+                assert_eq!(tip.as_ref(), format!("Resume {noun} and send"));
+                assert!(usable);
+                view.remote_state.waking = true;
+                let (tip, usable) = view.cloud_resume_tip().unwrap();
+                assert_eq!(tip.as_ref(), format!("Resuming {noun}\u{2026}"));
+                assert!(!usable);
+                view.remote_state.waking = false;
+            })
+            .unwrap();
+        let send = visual.debug_bounds("send-or-stop").expect("the pill shows");
+        // The pill is wider than the square resting button.
+        assert!(send.size.width > gpui::px(40.), "{:?}", send.size);
+        window
+            .update(visual, |view, _, cx| view.set_cloud_stopped(false, cx))
+            .unwrap();
+        window
+            .update(visual, |view, _, _| {
+                assert!(view.cloud_resume_tip().is_none())
+            })
+            .unwrap();
+    }
+}
+
+/// Presses Enter in the composer (the user's own submit).
+fn submit(window: gpui::WindowHandle<Conversation>, cx: &mut TestAppContext) {
+    window
+        .update(cx, |view, _, cx| {
+            view.input
+                .update(cx, |_, cx| cx.emit(crate::input::Submitted))
+        })
+        .unwrap();
+}
+
+fn launched(window: gpui::WindowHandle<Conversation>, cx: &mut TestAppContext) -> Vec<String> {
+    window
+        .update(cx, |view, _, _| view.launched.clone())
+        .unwrap()
+}
+
+/// Marks the stopped session as already loaded and online, so the resume can finish its send
+/// without a real host (the fake host answers `ensure` only).
+fn loaded_and_online(window: gpui::WindowHandle<Conversation>, cx: &mut TestAppContext) {
+    window
+        .update(cx, |view, _, _| {
+            view.remote_state.online = true;
+            view.remote_state.refreshing = false;
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn enter_with_text_while_stopped_wakes_once_and_sends_once_after_connect(cx: &mut TestAppContext) {
+    let (window, host) = stopped_codespace(cx, "fix it");
+    loaded_and_online(window, cx);
+    for _ in 0..3 {
+        submit(window, cx);
+    }
+    cx.run_until_parked();
+    assert_eq!(ensures(&host), 1, "{:?}", host.0.lock().unwrap());
+    assert_eq!(launched(window, cx), vec!["fix it".to_owned()]);
+    window
+        .update(cx, |view, _, cx| {
+            assert!(!view.cloud_stopped);
+            // The message stays queued until the runtime reports the command journaled. The
+            // fake host cannot take the turn, so it is still there (failed, never lost); the
+            // composer was emptied at once.
+            assert_eq!(view.follow_ups.state.messages.len(), 1);
+            let id = view.follow_ups.state.messages[0].id.clone();
+            view.follow_up_delivered(&id, cx);
+            assert!(view.follow_ups.state.messages.is_empty());
+            assert_eq!(view.input.read(cx).content.as_ref(), "");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn enter_with_text_while_stopped_moves_the_prompt_into_the_queue_before_the_resume_ends(
+    cx: &mut TestAppContext,
+) {
+    let (window, host) = stopped_codespace(cx, "fix it");
+    // Not online yet: the queue keeps the prompt while the wake runs.
+    submit(window, cx);
+    window
+        .update(cx, |view, _, cx| {
+            let queued: Vec<_> = view
+                .follow_ups
+                .state
+                .messages
+                .iter()
+                .map(|m| (m.text.clone(), m.steer))
+                .collect();
+            assert_eq!(queued, vec![("fix it".to_owned(), false)]);
+            assert_eq!(view.input.read(cx).content.as_ref(), "");
+            assert!(view.remote_state.waking);
+            // The queue holds still until the host is back.
+            view.pump_follow_ups(cx);
+        })
+        .unwrap();
+    assert!(launched(window, cx).is_empty());
+    assert_eq!(ensures(&host), 0, "the wake runs on a worker");
+    cx.run_until_parked();
+    assert_eq!(ensures(&host), 1);
+    // Reconnected, but the history load did not come back online in this fixture.
+    window
+        .update(cx, |view, _, cx| {
+            assert!(view.follow_ups.state.messages.len() <= 1);
+            view.remote_state.online = true;
+            view.pump_follow_ups(cx);
+            view.pump_follow_ups(cx);
+        })
+        .unwrap();
+    assert_eq!(launched(window, cx), vec!["fix it".to_owned()]);
+}
+
+#[gpui::test]
+fn enter_on_an_empty_composer_resumes_nothing_but_the_pill_does(cx: &mut TestAppContext) {
+    let (window, host) = stopped_codespace(cx, "");
+    loaded_and_online(window, cx);
+    submit(window, cx);
+    cx.run_until_parked();
+    assert_eq!(ensures(&host), 0);
+    window
+        .update(cx, |view, _, _| assert!(view.cloud_stopped))
+        .unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    let send = visual.debug_bounds("send-or-stop").unwrap();
+    visual.simulate_click(send.center(), Default::default());
+    visual.run_until_parked();
+    assert_eq!(ensures(&host), 1, "{:?}", host.0.lock().unwrap());
+    assert!(launched(window, visual).is_empty());
+}
+
+#[gpui::test]
+fn attachments_only_while_stopped_ask_for_a_prompt(cx: &mut TestAppContext) {
+    let (window, host) = stopped_codespace(cx, "");
+    window
+        .update(cx, |view, _, _| view.attachments.push("/tmp/a.png".into()))
+        .unwrap();
+    submit(window, cx);
+    cx.run_until_parked();
+    assert_eq!(ensures(&host), 0);
+    window
+        .update(cx, |view, _, _| {
+            assert!(
+                view.status.contains("Attachments need a prompt"),
+                "{}",
+                view.status
+            )
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_sandbox_resume_with_text_goes_through_the_user_path_and_never_the_codespace_wake(
+    cx: &mut TestAppContext,
+) {
+    use crate::cloud_wake::fakes::{AUTH_OK, github_project, install};
+    use monocode_core::cloud_sessions::CloudRef;
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let dir = github_project();
+    let store: Database = Arc::new(Mutex::new(
+        monocode_core::store::Store::open(Path::new(":memory:")).unwrap(),
+    ));
+    let (gh, host) = install(store.clone(), AUTH_OK, "Shutdown");
+    let summary = {
+        let guard = store.lock().unwrap();
+        let project = guard
+            .remember_cloud_ref_project(
+                "env-box",
+                &serde_json::json!({"id":"project-1","cwd":"/workspaces/widgets"}),
+                dir.0.to_str().unwrap(),
+                &CloudRef::sandbox("monoptah-fix-1234"),
+            )
+            .unwrap();
+        let mut summary = guard.create("claude", &project.key).unwrap();
+        summary.has_messages = true;
+        summary
+    };
+    host.0.lock().unwrap().clear();
+    gh.calls.lock().unwrap().clear();
+    let window = cx.update(|cx| {
+        crate::input::bind(cx);
+        cx.open_window(Default::default(), |_, cx| {
+            cx.new(|cx| {
+                let mut view = Conversation::new(summary, store.clone(), cx);
+                view.loaded = true;
+                view.remote_state.online = true;
+                view.set_cloud_stopped(true, cx);
+                view.input
+                    .update(cx, |input, cx| input.set_text("fix it".into(), cx));
+                view
+            })
+        })
+        .unwrap()
+    });
+    // The user's Enter takes the sandbox path; this fake has no sandbox backend, so the resume
+    // fails: nothing is sent and the prompt stays in the queue.
+    submit(window, cx);
+    cx.run_until_parked();
+    assert!(host.0.lock().unwrap().is_empty());
+    assert!(gh.calls.lock().unwrap().is_empty());
+    assert!(launched(window, cx).is_empty());
+    window
+        .update(cx, |view, _, cx| {
+            assert!(!view.remote_state.waking);
+            assert_eq!(view.input.read(cx).content.as_ref(), "");
+            let queued: Vec<_> = view
+                .follow_ups
+                .state
+                .messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect();
+            assert_eq!(queued, vec!["fix it"]);
+            assert!(view.status.contains("sandbox"), "{}", view.status);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_failed_resume_keeps_the_prompt_in_the_queue_and_shows_the_error(cx: &mut TestAppContext) {
+    let (window, _host) = stopped_codespace(cx, "fix it");
+    window
+        .update(cx, |view, _, cx| {
+            view.queue_composer_prompt(true, cx).unwrap();
+            view.remote_connection_error("Could not reach the codespace", cx);
+            assert_eq!(view.follow_ups.state.messages.len(), 1);
+            assert_eq!(view.follow_ups.state.messages[0].text, "fix it");
+            assert_eq!(
+                view.remote_state.error.as_deref(),
+                Some("Could not reach the codespace")
+            );
+            // Offline: the queue sends nothing, now or on a later pump.
+            view.pump_follow_ups(cx);
+        })
+        .unwrap();
+    assert!(launched(window, cx).is_empty());
+    cx.run_until_parked();
+    // Back online (a successful Retry or Reconnect): the same prompt goes out, once.
+    window
+        .update(cx, |view, _, cx| {
+            view.remote_state.online = true;
+            view.cloud_stopped = false;
+            view.pump_follow_ups(cx);
+        })
+        .unwrap();
+    assert_eq!(launched(window, cx), vec!["fix it".to_owned()]);
+}
+
+#[gpui::test]
+fn a_running_turn_found_after_the_resume_leaves_the_prompt_waiting_in_the_queue(
+    cx: &mut TestAppContext,
+) {
+    let (window, _host) = stopped_codespace(cx, "fix it");
+    window
+        .update(cx, |view, _, cx| {
+            view.queue_composer_prompt(true, cx).unwrap();
+            view.remote_state.online = true;
+            view.cloud_stopped = false;
+            // The load attached a turn that was already running.
+            view.busy = true;
+            view.pump_follow_ups(cx);
+            assert_eq!(view.follow_ups.state.messages.len(), 1);
+        })
+        .unwrap();
+    assert!(launched(window, cx).is_empty());
+}
+
+#[gpui::test]
+fn a_still_stopped_workspace_does_not_drain_the_queue(cx: &mut TestAppContext) {
+    let (window, _host) = stopped_codespace(cx, "fix it");
+    window
+        .update(cx, |view, _, cx| {
+            view.queue_composer_prompt(true, cx).unwrap();
+            view.remote_state.online = true;
+            assert!(view.cloud_stopped);
+            view.pump_follow_ups(cx);
+            view.remote_state.waking = true;
+            view.cloud_stopped = false;
+            view.pump_follow_ups(cx);
+            assert_eq!(view.follow_ups.state.messages.len(), 1);
+        })
+        .unwrap();
+    assert!(launched(window, cx).is_empty());
+}
+
+#[gpui::test]
+fn a_send_that_is_not_the_users_never_auto_sends_after_a_resume(cx: &mut TestAppContext) {
+    let (window, _host) = stopped_codespace(cx, "fix it");
+    window
+        .update(cx, |view, _, cx| {
+            assert!(!view.user_send);
+            // The codespace keeps its existing wake path, but no prompt is queued for later.
+            view.send(cx);
+            assert!(view.follow_ups.state.messages.is_empty());
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(launched(window, cx).is_empty());
+}
+
+#[gpui::test]
+fn every_remote_notice_variant_sits_above_the_composer(cx: &mut TestAppContext) {
+    use monocode_core::cloud_sessions::CloudRef;
+    type Setup = fn(&mut Conversation);
+    let sandbox = || CloudRef::sandbox("monoptah-fix-1234");
+    let cases: Vec<(&str, CloudRef, Setup, &str)> = vec![
+        (
+            "error",
+            CloudRef::codespace("octo-abc"),
+            |v| v.remote_state.error = Some("The host request did not complete.".into()),
+            "remote-retry",
+        ),
+        (
+            "rejected",
+            CloudRef::codespace("octo-abc"),
+            |v| {
+                v.remote_state.error = Some("Rejected".into());
+                v.remote_state.rejected = Some("text".into());
+            },
+            "remote-retry",
+        ),
+        (
+            "pending",
+            CloudRef::codespace("octo-abc"),
+            |v| v.remote_state.pending = true,
+            "remote-retry",
+        ),
+        (
+            "stopped",
+            CloudRef::codespace("octo-abc"),
+            |v| v.cloud_stopped = true,
+            "cloud-resume",
+        ),
+        (
+            "reconnecting",
+            sandbox(),
+            |v| {
+                v.remote_state.waking = true;
+                v.remote_state.wake_cancel =
+                    Some(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+            },
+            "remote-reconnect-cancel",
+        ),
+        (
+            "dead",
+            sandbox(),
+            |v| v.remote_state.error = Some(RECREATED.into()),
+            "remote-archive-session",
+        ),
+    ];
+    for (name, cloud, setup, button) in cases {
+        let window = cloud_conversation(cx, cloud);
+        window
+            .update(cx, |view, _, cx| {
+                view.remote_state.online = false;
+                setup(view);
+                cx.notify();
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        let notice = visual
+            .debug_bounds("remote-notice")
+            .unwrap_or_else(|| panic!("{name}: no notice"));
+        let composer = visual.debug_bounds("composer-box").expect("composer");
+        assert!(
+            notice.bottom() <= composer.top(),
+            "{name}: {notice:?} {composer:?}"
+        );
+        let action = visual
+            .debug_bounds(button)
+            .unwrap_or_else(|| panic!("{name}: no {button}"));
+        // The actions are inside the card and right of the title.
+        let title = visual.debug_bounds("remote-notice-title").expect("title");
+        assert!(action.left() > title.left(), "{name}");
+        assert!(action.right() <= notice.right(), "{name}");
+    }
+}
+
+// ------------------------------------------------------ resume ordering and queue safety
+
+#[gpui::test]
+fn a_refresh_that_began_before_a_reconnect_is_ignored(cx: &mut TestAppContext) {
+    let (window, _host) = stopped_codespace(cx, "");
+    window
+        .update(cx, |view, _, cx| {
+            view.cloud_stopped = false;
+            view.remote_state.online = true;
+            view.remote_state.refreshing = false;
+            // The old tunnel accepts but the stopped host never answers: a timeout.
+            view.remote_state.refresh_stub = Some(Err("The host request did not complete.".into()));
+            view.refresh_remote_snapshot(cx);
+            assert!(view.remote_state.refreshing);
+            // The reconnect starts while that request is still in flight.
+            view.remote_state.epoch += 1;
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, _| {
+            assert!(view.remote_state.online);
+            assert!(view.remote_state.error.is_none());
+            // No newer refresh took over, so the stale one released the flag.
+            assert!(!view.remote_state.refreshing);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_stale_refresh_does_not_keep_the_flag_when_no_newer_refresh_runs_and_yields_to_one_that_does(
+    cx: &mut TestAppContext,
+) {
+    let (window, _host) = stopped_codespace(cx, "");
+    window
+        .update(cx, |view, _, cx| {
+            view.cloud_stopped = false;
+            view.remote_state.refreshing = false;
+            view.remote_state.refresh_stub = Some(Ok(()));
+            view.refresh_remote_snapshot(cx);
+            // The reconnect failed or was cancelled: epoch moved, nothing new started.
+            view.remote_state.epoch += 1;
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            assert!(!view.remote_state.refreshing);
+            // A newer refresh in flight keeps its flag when an older answer lands.
+            view.refresh_remote_snapshot(cx);
+            view.remote_state.epoch += 1;
+            view.remote_state.refreshing = false;
+            view.refresh_remote_snapshot(cx);
+            assert!(view.remote_state.refreshing);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, _| assert!(!view.remote_state.refreshing))
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_clock_skips_a_stopped_or_waking_workspace(cx: &mut TestAppContext) {
+    let (window, _host) = stopped_codespace(cx, "");
+    window
+        .update(cx, |view, _, _| {
+            view.history_unloaded = false;
+            assert!(view.cloud_stopped);
+            assert!(!view.background_refresh_due());
+            view.cloud_stopped = false;
+            assert!(view.background_refresh_due());
+            view.remote_state.waking = true;
+            assert!(!view.background_refresh_due());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_resume_whose_fresh_refresh_fails_sends_nothing_and_keeps_the_prompt(cx: &mut TestAppContext) {
+    let (window, host) = stopped_codespace(cx, "fix it");
+    window
+        .update(cx, |view, _, _| {
+            view.remote_state.online = true;
+            view.remote_state.refreshing = false;
+            view.remote_state.refresh_stub = Some(Err("The host request did not complete.".into()));
+        })
+        .unwrap();
+    submit(window, cx);
+    cx.run_until_parked();
+    assert_eq!(ensures(&host), 1);
+    assert!(launched(window, cx).is_empty());
+    window
+        .update(cx, |view, _, _| {
+            assert!(!view.remote_state.online);
+            assert_eq!(view.follow_ups.state.messages.len(), 1);
+            assert!(view.remote_state.error.is_some());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_drained_prompt_stays_queued_while_it_is_being_sent(cx: &mut TestAppContext) {
+    let (window, _host) = stopped_codespace(cx, "fix it");
+    let id = window
+        .update(cx, |view, _, cx| {
+            view.cloud_stopped = false;
+            view.remote_state.online = true;
+            view.queue_composer_prompt(true, cx).unwrap()
+        })
+        .unwrap();
+    // The save comes back and the queue pumps; the worker has not run yet.
+    cx.executor().run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            assert_eq!(view.launched, vec!["fix it".to_owned()]);
+            // Not removed at launch: only the runtime's receipt does that.
+            assert_eq!(view.follow_ups.state.messages.len(), 1);
+            assert_eq!(view.settings.mono_message_id, None);
+            // A failure before the command was journaled keeps the prompt with its error.
+            view.fail_follow_up(&id, "boom".into(), cx);
+            assert_eq!(view.follow_ups.state.messages.len(), 1);
+            assert_eq!(
+                view.follow_ups.state.messages[0].error.as_deref(),
+                Some("boom")
+            );
+            assert!(view.follow_ups.state.paused);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn retrying_a_remote_queue_sends_no_continue_prompt(cx: &mut TestAppContext) {
+    let (window, _host) = stopped_codespace(cx, "");
+    window
+        .update(cx, |view, _, cx| {
+            view.cloud_stopped = false;
+            view.remote_state.online = false;
+            view.input
+                .update(cx, |input, cx| input.set_text("fix it".into(), cx));
+            let id = view.queue_composer_prompt(true, cx).unwrap();
+            view.fail_follow_up(&id, "boom".into(), cx);
+        })
+        .unwrap();
+    cx.executor().run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            view.remote_state.online = true;
+            view.resume_queue(cx);
+            assert!(!view.follow_ups.state.paused);
+            assert!(view.follow_ups.state.messages[0].error.is_none());
+        })
+        .unwrap();
+    cx.executor().run_until_parked();
+    window
+        .update(cx, |view, _, _| {
+            // The queued prompt itself goes out; the synthetic continue text never does.
+            assert_eq!(view.launched, vec!["fix it".to_owned()]);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_blocked_head_message_pauses_the_queue_with_a_retry(cx: &mut TestAppContext) {
+    let (window, _host) = stopped_codespace(cx, "");
+    window
+        .update(cx, |view, _, cx| {
+            view.cloud_stopped = false;
+            view.remote_state.online = true;
+            view.remote_state.capabilities.clear();
+            view.attachments = vec![PathBuf::from("/tmp/a.png")];
+            view.input
+                .update(cx, |input, cx| input.set_text("see this".into(), cx));
+            view.queue_composer_prompt(true, cx).unwrap();
+        })
+        .unwrap();
+    cx.executor().run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            assert!(view.launched.is_empty());
+            assert!(view.follow_ups.state.paused);
+            assert!(view.follow_ups.state.messages[0].error.is_some());
+            // Retry clears it; the capability is still missing, so it blocks again, visibly.
+            view.resume_queue(cx);
+        })
+        .unwrap();
+    cx.executor().run_until_parked();
+    window
+        .update(cx, |view, _, _| {
+            assert!(view.follow_ups.state.paused);
+            assert!(view.follow_ups.state.messages[0].error.is_some());
+            assert!(view.launched.is_empty());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn queued_messages_of_a_remote_session_offer_no_steer(cx: &mut TestAppContext) {
+    let (window, _host) = stopped_codespace(cx, "fix it");
+    submit(window, cx);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    window
+        .update(visual, |view, _, _| {
+            assert!(!view.follow_ups.state.messages.is_empty() || !view.launched.is_empty())
+        })
+        .unwrap();
+    assert!(visual.debug_bounds("queue-steer").is_none());
 }

@@ -946,3 +946,73 @@ fn observer_reports_a_host_title_change_once_and_never_writes_it_back() {
         "Named by the host"
     );
 }
+
+fn run_queued_send(
+    store: &Database,
+    host: &Host,
+    binding: &RemoteSession,
+    provider_model: Option<&str>,
+) -> Vec<Update> {
+    let (tx, rx) = async_channel::unbounded();
+    let (_controls_tx, controls) = std::sync::mpsc::channel();
+    run_with_client(
+        host.client.clone(),
+        binding.summary.clone(),
+        "hello".into(),
+        Settings {
+            model: provider_model.map(str::to_owned),
+            mono_message_id: Some("queued-1".into()),
+            ..Default::default()
+        },
+        controls,
+        store.clone(),
+        Arc::new(AtomicBool::new(false)),
+        tx,
+    );
+    let mut updates = Vec::new();
+    loop {
+        let update = receive(&rx);
+        let finished = update.finished;
+        updates.push(update);
+        if finished {
+            return updates;
+        }
+    }
+}
+
+#[test]
+fn a_queued_send_is_reported_delivered_only_once_its_command_is_journaled() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let binding = binding(&store);
+    let saved = store.clone();
+    let desktop_id = binding.summary.id;
+    let host = Host::new(move |_| {
+        // The first host request comes after the receipt, so the command is durable by then.
+        let durable = locked(&saved)
+            .unwrap()
+            .remote_session(desktop_id)
+            .unwrap()
+            .unwrap();
+        assert!(!durable.outbox.is_empty());
+        Some(json!({"error":"stop here"}))
+    });
+    let updates = run_queued_send(&store, &host, &binding, Some("codex:fixture"));
+    let delivered = updates
+        .iter()
+        .position(|u| u.delivered.as_deref() == Some("queued-1"))
+        .expect("a journaled send is acknowledged");
+    assert!(!updates[delivered].finished);
+}
+
+#[test]
+fn a_queued_send_that_fails_before_the_journal_is_never_acknowledged() {
+    let dir = Directory::new();
+    let store = dir.store();
+    // A cloud session of another harness is refused before anything is journaled.
+    let binding = cloud_binding(&store, "codex");
+    let host = Host::new(|_| panic!("nothing may be dispatched"));
+    let updates = run_queued_send(&store, &host, &binding, None);
+    assert!(updates.iter().all(|u| u.delivered.is_none()));
+    assert!(updates.last().unwrap().finished);
+}

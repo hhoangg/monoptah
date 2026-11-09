@@ -257,6 +257,17 @@ pub fn cached_models_for(kind: Kind, account: &crate::accounts::Profile) -> Opti
         .find(|(k, profile, _, _)| *k == kind && profile == account)
         .map(|(_, _, models, _)| models.clone())
 }
+/// Stores a catalog as if it had been discovered, for the app's tests.
+#[doc(hidden)]
+pub fn seed_cached(kind: Kind, account: &crate::accounts::Profile, models: Vec<Model>) {
+    let mut cache = cache().lock().unwrap_or_else(|e| e.into_inner());
+    cache
+        .entries
+        .retain(|(k, profile, _, _)| *k != kind || profile != account);
+    cache
+        .entries
+        .push((kind, account.clone(), models, Instant::now()));
+}
 pub fn models(kind: Kind) -> Result<Vec<Model>, String> {
     models_for(kind, &crate::accounts::Profile::default())
 }

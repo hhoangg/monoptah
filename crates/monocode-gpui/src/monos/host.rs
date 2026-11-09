@@ -447,6 +447,62 @@ impl Monos {
         })
         .detach();
     }
+    /// `sessions.archive` with `cloud`: saves a local copy of the cloud session, then keeps,
+    /// stops or deletes its workspace. The launch flags dismissed for the archive go back if
+    /// nothing was archived.
+    fn archive_cloud(
+        &mut self,
+        call: Call,
+        session: i64,
+        flipped: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (reply, answer) = async_channel::bounded(1);
+        let owner = self.owner.clone();
+        let handle = window.window_handle();
+        let choice = call.input["cloud"].as_str().unwrap_or_default().to_owned();
+        let app: &mut App = cx;
+        app.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, cx| {
+                let _ = owner.update(cx, |owner, cx| {
+                    owner.app_archive_cloud(session, &choice, reply, window, cx)
+                });
+            });
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = match answer.recv().await {
+                Ok(result) => result,
+                Err(_) => Err(crate::shell::ArchiveFailure {
+                    message:
+                        "The outcome of the archive is unknown. Check sessions.list before retrying"
+                            .into(),
+                    archived: false,
+                }),
+            };
+            let archived = match &outcome {
+                Ok(value) => value["archived"] == true,
+                Err(failure) => failure.archived,
+            };
+            let result = outcome.map_err(|failure| failure.message);
+            let _ = this.update(cx, |this, cx| {
+                if !archived {
+                    for m in &mut this.roster.monos {
+                        if flipped.contains(&m.id) {
+                            for launch in &mut m.launches {
+                                if launch.session_id == session {
+                                    launch.dismissed = false;
+                                }
+                            }
+                        }
+                    }
+                    this.save(cx);
+                }
+                this.finish_call(call, result, cx);
+            });
+        })
+        .detach();
+    }
     fn call_work(
         &mut self,
         call: Call,
@@ -673,7 +729,7 @@ impl Monos {
         let project = if action.starts_with("sessions.")
             || action.starts_with("folders.")
             || action.starts_with("worktrees.")
-            || action.starts_with("codespaces.")
+            || action.starts_with("cloud.")
         {
             match mono.project(input.get("project").and_then(Value::as_str)) {
                 Ok(p) => p,
@@ -759,7 +815,9 @@ impl Monos {
                 };
                 // Only other regular project sessions can be deleted. Checked before
                 // anything is opened or changed.
-                if action == "sessions.delete"
+                if (action == "sessions.delete"
+                    || (action == "sessions.archive"
+                        && matches!(input["cloud"].as_str(), Some("stop" | "delete"))))
                     && (session == call.session
                         || self.is_mono_session(session)
                         || self.running.contains_key(&session)
@@ -800,6 +858,16 @@ impl Monos {
                     );
                     return;
                 };
+                if matches!(action.as_str(), "sessions.send" | "sessions.draft")
+                    && (view.read(cx).cloud_locked
+                        || self
+                            .owner
+                            .upgrade()
+                            .is_some_and(|o| o.read(cx).cloud_archive_in_progress(session)))
+                {
+                    self.finish_call(call, Err(crate::shell::CLOUD_ARCHIVING.into()), cx);
+                    return;
+                }
                 if action == "sessions.send"
                     && let Some(error) = locked(&self.store).ok().and_then(|store| {
                         monocode_core::cloud_sessions::starting_refusal(&store, session)
@@ -830,8 +898,8 @@ impl Monos {
                                 self.finish_call(call, Err(e), cx);
                                 return;
                             }
-                            // The send is queued until the history loads, which a stopped codespace
-                            // never allows: (re)connect it (a draft never does), and the queue flushes.
+                            // The send is queued until the history loads, which a stopped instance
+                            // never allows: wake or reconnect it (a draft never does), and the queue flushes.
                             if action == "sessions.send" && !view.read(cx).ready_for_external(cx) {
                                 let store = self.store.clone();
                                 let view = view.clone();
@@ -899,6 +967,10 @@ impl Monos {
                         self.delete_removing_worktree(call, session, flipped, window, cx);
                         return;
                     }
+                    if action == "sessions.archive" && input.get("cloud").is_some() {
+                        self.archive_cloud(call, session, flipped, window, cx);
+                        return;
+                    }
                     if action == "sessions.delete" && flag(&input, "providerFiles", false) {
                         self.delete_with_files(call, session, flipped, window, cx);
                         return;
@@ -949,25 +1021,23 @@ impl Monos {
                 );
                 return;
             }
-            "codespaces.list"
-            | "codespaces.create"
-            | "codespaces.stop"
-            | "codespaces.delete"
-            | "codespaces.secretsStatus" => {
-                // gh calls, and for create minutes of waiting: always off the UI thread.
+            "cloud.list" | "cloud.status" | "cloud.create" | "cloud.stop" | "cloud.resume"
+            | "cloud.delete" => {
+                // The keys of the workspaces an archive is converting, copied now: the worker
+                // runs off the UI thread and cannot read the shell.
+                let busy = self
+                    .owner
+                    .upgrade()
+                    .map(|o| o.read(cx).cloud_busy_snapshot(cx))
+                    .unwrap_or_default();
+                // gh/sbx/ssh calls, and for create or resume minutes of waiting: always off
+                // the UI thread.
                 self.call_work(
                     call,
                     target,
                     move |store| {
-                        let api = CloudApi::shared(&store)?;
-                        let name = || text(&input, "name", 100);
-                        let value = match action.as_str() {
-                            "codespaces.list" => api.list(&project)?,
-                            "codespaces.create" => api.create(&project, &input, &mut |_| {})?,
-                            "codespaces.stop" => api.stop(&project, &name()?)?,
-                            "codespaces.delete" => api.delete(&project, &name()?)?,
-                            _ => api.secrets_status(&project)?,
-                        };
+                        let value =
+                            crate::cloud_actions::run(&store, &action, &project, &input, &busy)?;
                         Ok((value, Effect::None))
                     },
                     cx,
@@ -1320,7 +1390,7 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
             options,
         } = context;
         let prompt = app::prompt(&input)?;
-        let cloud = cloud_api::target_from_input(&input);
+        let cloud = cloud_api::target_from_input(&input)?;
         let provider = input["harness"]
             .as_str()
             .map(str::to_owned)
@@ -1445,16 +1515,11 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
                 }
                 None => None,
             };
-            let note = |e: String| match &startup {
-                Some((_, record)) if record.created => {
-                    cloud_api::created_note(&record.codespace, &e)
-                }
-                _ => e,
-            };
+            let note = |e: String| crate::cloud_actions::failure_note(startup.as_ref(), e);
             let mut db = locked(&store).map_err(note)?;
             // Always a chat: the app drives this session, whatever the surface preference.
             let mut summary = match &startup {
-                Some((summary, _)) => summary.clone(),
+                Some(start) => start.session().clone(),
                 None => db.create(&provider, &project).map_err(note)?,
             };
             let mut made = None;
@@ -1482,8 +1547,14 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
                 Ok::<_, String>(())
             })();
             if let Err(e) = built {
-                // Nothing else refers to the row or its worktree yet.
-                let _ = db.delete(summary.id);
+                // Nothing else refers to the row or its worktree yet (a sandbox row is kept:
+                // it is the only handle on the sandbox, see `discard_failed_start`).
+                crate::cloud_actions::discard_failed_start(
+                    &mut db,
+                    startup.as_ref(),
+                    summary.id,
+                    &e,
+                );
                 let e = match made.map(|tree| {
                     monocode_core::worktree_management::discard_new(&tree).map_err(|c| (tree, c))
                 }) {
@@ -1496,11 +1567,8 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
                 return Err(note(e));
             }
             let mut result = json!({"sessionId":summary.id,"accepted":true,"project":project});
-            if let Some((_, record)) = &startup {
-                result["target"] =
-                    json!({"kind":"codespace","codespace":record.codespace,"state":"starting"});
-                result["codespaceState"] = json!("starting");
-                result["startup"] = json!({"step":record.current().map(|step| step.id())});
+            if let Some(start) = &startup {
+                crate::cloud_actions::describe_start(&mut result, start);
             }
             if let Some((id, name)) = filed {
                 result["folderId"] = json!(id);
