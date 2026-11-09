@@ -1578,13 +1578,18 @@ each batch ends with an explicit release-and-pin ticket (HR1-HR3).
     `skills/synced/`. None of the three has a `settings.json` or a user-authored
     `skills/<name>/SKILL.md`.
   - `~/.claude` holds `settings.json` (with `enabledPlugins`), `skills/` (20 dirs, 12
-    symlinks, 1 file), `plugins/` (with `installed_plugins.json`, `cache/`), `CLAUDE.md`,
+    symlinks, 0 files), `plugins/` (with `installed_plugins.json`, `cache/`), `CLAUDE.md`,
     `agents/` and more. `~/.claude.json` holds the user and local MCP servers.
   - So an account dir is a **full config root of its own** (it carries its own
     `.claude.json` and `plugins/`), not an overlay on `~/.claude`. That matches what the
     docs say for `CLAUDE_CONFIG_DIR`, which relocates the config root. The merge is not
     confirmed at runtime (that needs a `claude` run), so assume the worst: a session
     under an account may not see `~/.claude/skills` or `~/.claude/settings.json`.
+  - Not examined: `skills/synced/<bucket>/<name>/SKILL.md` and `plugins/synced/` of
+    accounts with account sync. F3-1 ignores them **on purpose for now**: it only reads
+    `skills/<name>/SKILL.md`, so synced skills are not offered. Also unexamined: an
+    account's `remote-settings.json` and `policy-limits.json`, which could be another
+    source of `enabledPlugins` (managed settings) that F3-1 does not read.
   - What F3-1 does: read the account dir first and `~/.claude` second, label every item
     with its source (`Account` or `User`), and let the account win on a name clash. This
     is a superset of what either interpretation shows. A plugin is offered only if the
