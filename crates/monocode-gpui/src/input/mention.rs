@@ -18,8 +18,9 @@ pub(super) enum MentionIcon {
     Workflow,
     /// A Today task, `@today/<key>`.
     Today,
-    /// A provider account, `@claude/<label>`. Only Mono composers mark one as known, so a
-    /// plain session never draws it.
+    /// A provider account, `@claude/<label>`. Never inferred from the text: only a token the
+    /// composer resolved to an account (`Input::account_tokens`) draws it, so a real file under
+    /// a `claude/` folder keeps its file icon.
     Account,
 }
 impl MentionIcon {
@@ -39,12 +40,6 @@ impl MentionIcon {
             .strip_prefix('"')
             .and_then(|p| p.strip_suffix('"'))
             .map_or_else(|| path.to_owned(), |p| p.replace("\\\"", "\""));
-        if ["claude/", "codex/", "devin/"]
-            .iter()
-            .any(|provider| path.starts_with(provider))
-        {
-            return Some(Self::Account);
-        }
         let name = path.rsplit('/').next().unwrap_or(&path);
         Some(Self::File(
             format!("mi/{}.svg", crate::file_icons::file_icon_name(name)).into(),
@@ -106,6 +101,19 @@ impl DisplayLayout {
 }
 
 impl Input {
+    /// The icon kinds drawn for the current mentions, in order (for tests).
+    #[cfg(test)]
+    pub(crate) fn mention_icon_kinds(&self) -> Vec<&'static str> {
+        self.display_layout()
+            .mentions
+            .iter()
+            .map(|(_, icon)| match icon {
+                MentionIcon::File(_) => "file",
+                MentionIcon::Account => "account",
+                _ => "other",
+            })
+            .collect()
+    }
     pub(super) fn display_layout(&self) -> DisplayLayout {
         let command = self.command_layout();
         if self.secret || self.content.is_empty() {
@@ -125,7 +133,14 @@ impl Input {
                     // A leading `/command` owns byte 0.
                     && !(range.start == 0 && command.is_some())
             })
-            .filter_map(|range| Some((range.start, MentionIcon::of(&self.content[range.clone()])?)))
+            .filter_map(|range| {
+                let icon = if self.account_tokens.contains(range) {
+                    MentionIcon::Account
+                } else {
+                    MentionIcon::of(&self.content[range.clone()])?
+                };
+                Some((range.start, icon))
+            })
             .collect();
         mentions.sort_by_key(|(at, _)| *at);
         DisplayLayout { command, mentions }

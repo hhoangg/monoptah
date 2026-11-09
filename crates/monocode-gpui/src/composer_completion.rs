@@ -562,7 +562,7 @@ impl Completion {
             self.choices.clear();
             self.token = None;
             self.input.update(cx, |input, cx| {
-                input.highlight_composer_tokens(Vec::new(), cx)
+                input.highlight_composer_tokens(Vec::new(), Vec::new(), cx)
             });
             return;
         }
@@ -896,7 +896,7 @@ impl Completion {
         for kind in monocode_core::accounts::PROVIDERS {
             tokens.insert(format!("@{}/default", kind.id()));
             for account in book.list(kind) {
-                tokens.insert(account_mention::mention_text(kind.id(), &account.label));
+                tokens.insert(account_mention::mention_text(&book, kind, &account));
                 if kind == monocode_core::provider::Kind::Claude
                     && let Some(credential) = center.claude_credential(&account.id)
                 {
@@ -956,7 +956,7 @@ impl Completion {
                     Choice {
                         label: account.label.clone(),
                         detail: format!("{} account · {}", kind.id(), auth_label(auth)),
-                        insertion: account_mention::mention_text(kind.id(), &account.label),
+                        insertion: account_mention::mention_text(&snapshot.book, kind, &account),
                         builtin: None,
                         mode: None,
                         file: false,
@@ -1026,14 +1026,21 @@ impl Completion {
     }
     fn highlight(&self, cx: &mut Context<Self>) {
         let content = &self.input.read(cx).content;
-        let ranges = if self.account_tokens.is_empty() {
-            composer::highlight_ranges(content, &self.known)
+        let mut ranges = composer::highlight_ranges(content, &self.known);
+        let accounts = if self.account_tokens.is_empty() {
+            Vec::new()
         } else {
-            let known = self.known.union(&self.account_tokens).cloned().collect();
-            composer::highlight_ranges(content, &known)
+            composer::highlight_ranges(content, &self.account_tokens)
         };
-        self.input
-            .update(cx, |input, cx| input.highlight_composer_tokens(ranges, cx));
+        for range in &accounts {
+            if !ranges.contains(range) {
+                ranges.push(range.clone());
+            }
+        }
+        ranges.sort_by_key(|range| range.start);
+        self.input.update(cx, |input, cx| {
+            input.highlight_composer_tokens(ranges, accounts, cx)
+        });
     }
     fn rank(&mut self) {
         self.choices.clear();
@@ -2315,6 +2322,107 @@ mod tests {
             })
             .unwrap();
         let _ = work;
+    }
+
+    #[gpui::test]
+    fn ambiguous_or_reserved_labels_are_offered_by_id(cx: &mut TestAppContext) {
+        install_accounts(cx);
+        let (first, second, literal, named) = cx.update(|cx| {
+            crate::accounts::get(cx).unwrap().update(cx, |center, _| {
+                use monocode_core::provider::Kind;
+                let mut add = |label: &str| center.book.add(Kind::Codex, label).unwrap().id;
+                (
+                    add("Team"),
+                    add("team"),
+                    add("default"),
+                    add("Default account"),
+                )
+            })
+        });
+        let window = window(cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.set_mono(PathBuf::from("/none"), "mono-a".into(), cx);
+                view.input
+                    .update(cx, |input, cx| input.set_text("@codex/".into(), cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, cx| {
+                let insertions: Vec<_> = view
+                    .choices
+                    .iter()
+                    .filter(|c| c.account)
+                    .map(|c| c.insertion.clone())
+                    .collect();
+                for id in [&first, &second, &literal, &named] {
+                    assert!(
+                        insertions.contains(&format!("@codex/{id}")),
+                        "{insertions:?}"
+                    );
+                }
+                // The real default account is the literal, never a label another account owns.
+                assert!(
+                    insertions.contains(&"@codex/default".to_owned()),
+                    "{insertions:?}"
+                );
+                assert!(
+                    !insertions
+                        .iter()
+                        .any(|t| t.contains("Team") || t.contains("team"))
+                );
+                // Whatever was inserted resolves to the account it was offered for.
+                view.refresh_accounts(cx);
+                for choice in view.choices.iter().filter(|c| c.account) {
+                    let found = monocode_core::mono::account_mention::mentioned_accounts(
+                        &choice.insertion,
+                        &view.accounts.as_ref().unwrap().book,
+                    );
+                    assert_eq!(found.len(), 1, "{}", choice.insertion);
+                    assert!(
+                        found[0].1.label == choice.label,
+                        "{} resolved to {}",
+                        choice.insertion,
+                        found[0].1.label
+                    );
+                }
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn only_resolved_account_mentions_draw_the_account_icon(cx: &mut TestAppContext) {
+        install_accounts(cx);
+        for mono in [false, true] {
+            let window = window(cx);
+            window
+                .update(cx, |view, _, cx| {
+                    if mono {
+                        view.set_mono(PathBuf::from("/none"), "mono-a".into(), cx);
+                        // A reload would rebuild `known` from the (empty) project.
+                        view.loaded = Some(Instant::now());
+                    }
+                    view.known.insert("@codex/main.rs".into());
+                    view.input.update(cx, |input, cx| {
+                        input.set_text("see @codex/main.rs and @codex/hoangxuan2402".into(), cx)
+                    });
+                })
+                .unwrap();
+            cx.run_until_parked();
+            window
+                .update(cx, |view, _, cx| {
+                    let kinds = view.input.read(cx).mention_icon_kinds();
+                    // The real file keeps its file icon; only a Mono resolves the account.
+                    let expected: &[&str] = if mono {
+                        &["file", "account"]
+                    } else {
+                        &["file"]
+                    };
+                    assert_eq!(kinds, expected, "mono: {mono}");
+                })
+                .unwrap();
+        }
     }
 
     #[gpui::test]

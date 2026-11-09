@@ -6,17 +6,26 @@ use crate::provider::Kind;
 
 const INSTRUCTION: &str = "Referenced provider account (context only: when the user's request starts a local session for it, pass account:\"<id>\" with harness:\"<provider>\" to sessions.start; cloud sessions cannot take an account):";
 
-/// The text a composer inserts for an account: `@claude/can.le`, or `@"claude/Work account"` when
-/// the label has a character outside `[A-Za-z0-9._-]`.
-pub fn mention_text(provider: &str, label: &str) -> String {
-    if !label.is_empty()
+/// The text a composer inserts for `account`. The label form (`@claude/can.le`, or
+/// `@"claude/Work account"` when the label has a character outside `[A-Za-z0-9._-]`) is used only
+/// when it resolves back to this very account; otherwise (a duplicate label, a label that equals
+/// `default` or the default account's name, or one containing a quote the tokenizer cannot carry)
+/// the id form `@claude/<id>` is inserted, so a mention can never select another credential.
+pub fn mention_text(book: &Book, kind: Kind, account: &Account) -> String {
+    let provider = kind.id();
+    let label = account.label.as_str();
+    let plain = !label.is_empty()
         && label
             .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
-    {
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'));
+    let resolves = !label.contains('"')
+        && accounts::resolve(book, kind, label).is_ok_and(|id| id == account.id);
+    if !resolves {
+        format!("@{provider}/{}", account.id)
+    } else if plain {
         format!("@{provider}/{label}")
     } else {
-        format!("@\"{provider}/{}\"", label.replace('"', "\\\""))
+        format!("@\"{provider}/{label}\"")
     }
 }
 
@@ -25,7 +34,7 @@ pub fn mention_text(provider: &str, label: &str) -> String {
 fn account_of(book: &Book, token: &str) -> Option<(Kind, Account)> {
     let (provider, rest) = token.split_once('/')?;
     let kind = Kind::parse(provider).filter(|kind| accounts::supports_accounts(*kind))?;
-    let rest = rest.replace("\\\"", "\"");
+    let rest = rest.to_owned();
     let stripped = rest.trim_end_matches([')', ']', '}', '.', '!', '?', ';', ',', ':']);
     let found = [rest.as_str(), stripped]
         .into_iter()

@@ -13,14 +13,57 @@ fn none(_: &str) -> Option<ClaudeCredential> {
 
 #[test]
 fn mention_text_quotes_labels_outside_the_plain_set() {
-    assert_eq!(mention_text("claude", "can.le"), "@claude/can.le");
-    assert_eq!(mention_text("codex", "a_b-1"), "@codex/a_b-1");
-    assert_eq!(
-        mention_text("claude", "Work account"),
-        "@\"claude/Work account\""
-    );
-    assert_eq!(mention_text("claude", "Café"), "@\"claude/Café\"");
-    assert_eq!(mention_text("claude", "a\"b"), "@\"claude/a\\\"b\"");
+    let mut book = Book::default();
+    let plain = book.add(Kind::Claude, "can.le").unwrap();
+    let spaced = book.add(Kind::Claude, "Work account").unwrap();
+    let accent = book.add(Kind::Claude, "Café").unwrap();
+    let text = |a: &Account| mention_text(&book, Kind::Claude, a);
+    assert_eq!(text(&plain), "@claude/can.le");
+    assert_eq!(text(&spaced), "@\"claude/Work account\"");
+    assert_eq!(text(&accent), "@\"claude/Café\"");
+    // The default account answers to its own label.
+    let default = book.list(Kind::Claude).remove(0);
+    assert_eq!(text(&default), "@\"claude/Default account\"");
+}
+
+#[test]
+fn a_label_that_would_pick_another_credential_inserts_the_id() {
+    let mut book = Book::default();
+    let first = book.add(Kind::Claude, "Team").unwrap();
+    let second = book.add(Kind::Claude, "team").unwrap();
+    let literal = book.add(Kind::Claude, "default").unwrap();
+    let named = book.add(Kind::Claude, "Default account").unwrap();
+    let quoted = book.add(Kind::Claude, "say \"hi\"").unwrap();
+    for account in [&first, &second, &literal, &named, &quoted] {
+        let text = mention_text(&book, Kind::Claude, account);
+        assert_eq!(text, format!("@claude/{}", account.id));
+        // Insert then resolve lands on the same account.
+        let found = mentioned_accounts(&text, &book);
+        assert_eq!(found.len(), 1, "{text}");
+        assert_eq!(found[0].1.id, account.id);
+    }
+    // The real default account keeps working through the literal.
+    let default = book.list(Kind::Claude).remove(0);
+    let text = mention_text(&book, Kind::Claude, &default);
+    assert_eq!(text, "@claude/default");
+    assert_eq!(mentioned_accounts(&text, &book)[0].1.id, "default");
+}
+
+#[test]
+fn inserted_mentions_round_trip_through_the_parser() {
+    let mut book = Book::default();
+    for label in ["can.le", "Work account", "Café", "a,b", "x."] {
+        book.add(Kind::Claude, label).unwrap();
+    }
+    for account in book.list(Kind::Claude) {
+        let text = format!(
+            "start with {} please",
+            mention_text(&book, Kind::Claude, &account)
+        );
+        let found = mentioned_accounts(&text, &book);
+        assert_eq!(found.len(), 1, "{text}");
+        assert_eq!(found[0].1.id, account.id, "{text}");
+    }
 }
 
 #[test]
