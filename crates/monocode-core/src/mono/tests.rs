@@ -227,6 +227,18 @@ fn the_prompt_and_help_describe_each_delivery_and_habit_reporting() {
         assert!(bridge::HELP.contains(needle), "help lacks {needle}");
     }
     assert!(!bridge::HELP.contains("Ignored for drafts"));
+    for needle in [
+        "accounts.list {provider?}",
+        "target?,account?}",
+        "sessions.start account:",
+        "local sessions only",
+        "the cloud setup",
+    ] {
+        assert!(bridge::HELP.contains(needle), "help lacks {needle}");
+    }
+    for needle in ["model and account", "@provider/label", "local sessions only"] {
+        assert!(context.contains(needle), "context lacks {needle}");
+    }
 }
 #[test]
 fn the_prompt_and_help_describe_workflows() {

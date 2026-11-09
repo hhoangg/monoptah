@@ -6132,11 +6132,20 @@ fn sessions_start_runs_with_the_named_account_and_validates_models_against_it(
     let base = json!({"project":s.project,"prompt":"Go","draft":true,"harness":"claude"});
     let with = |extra: Value| {
         let mut input = base.clone();
-        input.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        input
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
         input
     };
     // Label, case-insensitive; the account wins over the provider default (home).
-    let started = start(&s, "acc-label", with(json!({"account":"  work   ACCOUNT "})), cx).unwrap();
+    let started = start(
+        &s,
+        "acc-label",
+        with(json!({"account":"  work   ACCOUNT "})),
+        cx,
+    )
+    .unwrap();
     assert_eq!(started_account(&s, &started, cx), work);
     // Exact id.
     let started = start(&s, "acc-id", with(json!({"account":home})), cx).unwrap();
@@ -6168,15 +6177,26 @@ fn sessions_start_runs_with_the_named_account_and_validates_models_against_it(
     assert_eq!(session_count(&s), before, "a refused start leaves no row");
     // Errors name the provider and list valid choices; another provider's account says so.
     let unknown = start(&s, "acc-unknown", with(json!({"account":"Wor"})), cx).unwrap_err();
-    assert!(unknown.contains("Work account") && unknown.contains(&work), "{unknown}");
+    assert!(
+        unknown.contains("Work account") && unknown.contains(&work),
+        "{unknown}"
+    );
     let other = start(&s, "acc-other", with(json!({"account":"Codex Pro"})), cx).unwrap_err();
     assert!(other.contains("belongs to codex"), "{other}");
     let other_id = start(&s, "acc-other-id", with(json!({"account":codex})), cx).unwrap_err();
     assert!(other_id.contains("belongs to codex"), "{other_id}");
     // A harness without accounts.
-    let none = start(&s, "acc-cursor", with(json!({"account":"x","harness":"cursor"})), cx)
-        .unwrap_err();
-    assert!(none.contains("does not support provider accounts"), "{none}");
+    let none = start(
+        &s,
+        "acc-cursor",
+        with(json!({"account":"x","harness":"cursor"})),
+        cx,
+    )
+    .unwrap_err();
+    assert!(
+        none.contains("does not support provider accounts"),
+        "{none}"
+    );
     assert_eq!(session_count(&s), before, "no refusal left a row");
     // Codex resolves against its own accounts.
     let started = start(
@@ -6204,10 +6224,16 @@ fn accounts_list_returns_ids_labels_and_kinds_only(cx: &mut TestAppContext) {
     assert_eq!(row(&work)["isDefault"], false);
     assert_eq!(row("default")["provider"], "claude");
     assert_eq!(row(&codex)["authKind"], "cli");
-    let claude = call(&s, "list-claude", "accounts.list", json!({"provider":"claude"}), cx)
-        .try_recv()
-        .unwrap()
-        .unwrap();
+    let claude = call(
+        &s,
+        "list-claude",
+        "accounts.list",
+        json!({"provider":"claude"}),
+        cx,
+    )
+    .try_recv()
+    .unwrap()
+    .unwrap();
     assert!(
         claude["accounts"]
             .as_array()

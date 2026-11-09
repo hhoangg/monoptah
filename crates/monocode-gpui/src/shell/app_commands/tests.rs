@@ -1979,7 +1979,10 @@ fn operator_cannot_pick_an_account_but_can_list_them(cx: &mut TestAppContext) {
     assert_eq!(refused, Err("account is available to Monos only".into()));
     let listed = call(window, caller, "acct-list", "accounts.list", json!({}), cx).unwrap();
     let rows = listed["accounts"].as_array().unwrap();
-    assert!(rows.iter().any(|r| r["label"] == "Work account" && r["provider"] == "claude"));
+    assert!(
+        rows.iter()
+            .any(|r| r["label"] == "Work account" && r["provider"] == "claude")
+    );
     assert!(rows.iter().all(|r| r.as_object().unwrap().len() == 5));
     let claude = call(
         window,
@@ -1990,7 +1993,13 @@ fn operator_cannot_pick_an_account_but_can_list_them(cx: &mut TestAppContext) {
         cx,
     )
     .unwrap();
-    assert!(claude["accounts"].as_array().unwrap().iter().all(|r| r["provider"] == "claude"));
+    assert!(
+        claude["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["provider"] == "claude")
+    );
     assert!(
         call(
             window,

@@ -507,7 +507,10 @@ fn a_mono_start_with_an_account_and_a_cloud_target_is_refused_before_any_cloud_c
     cx: &mut TestAppContext,
 ) {
     let ((s, gh, host, _guard), sbx) = sandbox_setup(cx, "Shutdown", "running");
-    let (gh_before, sbx_before) = (gh.calls.lock().unwrap().len(), sbx.calls.lock().unwrap().len());
+    let (gh_before, sbx_before) = (
+        gh.calls.lock().unwrap().len(),
+        sbx.calls.lock().unwrap().len(),
+    );
     let sessions = super::tests::session_count(&s);
     for (request, target) in [
         ("a1", json!({"kind":"codespace","instance":"new"})),
@@ -524,7 +527,11 @@ fn a_mono_start_with_an_account_and_a_cloud_target_is_refused_before_any_cloud_c
             cx,
         )
         .unwrap_err();
-        assert_eq!(error, monocode_core::mono::api::ACCOUNT_LOCAL_ONLY, "{request}");
+        assert_eq!(
+            error,
+            monocode_core::mono::api::ACCOUNT_LOCAL_ONLY,
+            "{request}"
+        );
     }
     assert_eq!(gh.calls.lock().unwrap().len(), gh_before, "no gh call");
     assert_eq!(sbx.calls.lock().unwrap().len(), sbx_before, "no sbx call");

@@ -249,11 +249,7 @@ mod tests {
         let start = |input| validate("sessions.start", &input);
         assert!(start(json!({"prompt":"x","account":"Work"})).is_ok());
         assert!(start(json!({"prompt":"x","account":"a".repeat(128)})).is_ok());
-        for bad in [
-            json!(""),
-            json!("  "),
-            json!("a".repeat(129)),
-        ] {
+        for bad in [json!(""), json!("  "), json!("a".repeat(129))] {
             assert_eq!(
                 start(json!({"prompt":"x","account":bad})).unwrap_err(),
                 "account must be a non-empty string of at most 128 characters"
