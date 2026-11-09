@@ -283,17 +283,25 @@ pub(super) fn default_claude_dir() -> PathBuf {
 }
 
 /// Replaces every path in `from` (matched on boundaries) by `to` in a JSONL text. `to` is
-/// escaped for use inside a JSON string. Longer paths are tried first. A match must not be
+/// and every `from` are escaped for use inside a JSON string. Longer paths are tried first. A match must not be
 /// the tail of a longer path (`/tmp/workspaces/app`) or the head of a longer name
 /// (`/workspaces/app-two`, `/workspaces/app.git`).
 pub(super) fn rewrite_cwd(text: &str, from: &[&str], to: &str) -> String {
     let escaped = serde_json::to_string(to).unwrap_or_default();
     let to = &escaped[1..escaped.len().saturating_sub(1).max(1)];
-    let mut froms: Vec<&str> = from.iter().copied().filter(|f| !f.is_empty()).collect();
+    // The text is JSONL, so a path with a quote or backslash is stored escaped.
+    let mut froms: Vec<String> = from
+        .iter()
+        .filter(|f| !f.is_empty())
+        .map(|f| {
+            let escaped = serde_json::to_string(f).unwrap_or_default();
+            escaped[1..escaped.len().saturating_sub(1).max(1)].to_string()
+        })
+        .collect();
     froms.sort_by_key(|f| std::cmp::Reverse(f.len()));
     froms.dedup();
     let mut text = text.to_string();
-    for from in froms {
+    for from in froms.iter().map(String::as_str) {
         let mut out = String::with_capacity(text.len());
         let mut rest = text.as_str();
         let mut before: Option<char> = None;
@@ -1037,6 +1045,7 @@ impl CloudSessions {
             .session_id
             .as_deref()
             .map(|host| (remote.project.environment_id.clone(), host.to_string()));
+        let mut forked_file: Option<PathBuf> = None;
         let mut finish = || -> Result<Converted, String> {
             let local_thread = self
                 .store()?
@@ -1066,6 +1075,12 @@ impl CloudSessions {
                 }
                 (None, _) => Resume::Missing("The session never ran Claude".into()),
             };
+            if let Resume::Forked(new_id) = &resume {
+                forked_file = self
+                    .transcript_dir(local_project)
+                    .ok()
+                    .map(|(dir, _)| dir.join(format!("{new_id}.jsonl")));
+            }
             match &resume {
                 Resume::Installed(_) | Resume::AlreadyThere(_) | Resume::Replaced(_) => {
                     if let Some(id) = provider_id {
@@ -1182,6 +1197,10 @@ impl CloudSessions {
                     }
                     let _ = store.delete(local_id);
                 }
+                // A retry forks again, so the fork made by this attempt would be an orphan.
+                if let Some(file) = &forked_file {
+                    let _ = std::fs::remove_file(file);
+                }
                 return Err(error);
             }
         };
@@ -1203,6 +1222,59 @@ impl CloudSessions {
         provider_id: &str,
     ) -> Result<Resume, String> {
         use super::transcript_sync::{decide, fork, Decision};
+        let (dir, local) = self.transcript_dir(local_cwd)?;
+        let dest = dir.join(format!("{provider_id}.jsonl"));
+        let text = std::fs::read_to_string(source)
+            .map_err(|e| format!("cannot read Claude's transcript: {e}"))?;
+        let text = rewrite_cwd(&text, remote_cwds, &local);
+        // A writer that races in after the check is decided again, never trusted blindly.
+        for _ in 0..3 {
+            let existing = match std::fs::read(&dest) {
+                Ok(bytes) => Some(bytes),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(format!("cannot read the local transcript: {e}")),
+            };
+            let decision = decide(existing.as_deref(), text.as_bytes());
+            if decision == Decision::AlreadyCurrent {
+                return Ok(Resume::AlreadyThere(dest));
+            }
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let tmp = dir.join(format!(".{provider_id}.{}.tmp", nanos()));
+            match decision {
+                Decision::AlreadyCurrent => unreachable!("returned above"),
+                Decision::Install => {
+                    std::fs::write(&tmp, &text).map_err(|e| e.to_string())?;
+                    // A hard link fails when the name exists, so a concurrent writer is never replaced.
+                    let linked = std::fs::hard_link(&tmp, &dest);
+                    let _ = std::fs::remove_file(&tmp);
+                    match linked {
+                        Ok(()) => return Ok(Resume::Installed(dest)),
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                        Err(e) => return Err(e.to_string()),
+                    }
+                }
+                Decision::Replace => {
+                    write_synced(&tmp, &text).map_err(|e| e.to_string())?;
+                    let result = replace_keeping_backup(&dir, &tmp, &dest, provider_id);
+                    let _ = std::fs::remove_file(&tmp);
+                    return result.map(|()| Resume::Replaced(dest));
+                }
+                Decision::Diverged => {
+                    let new_id = uuid::Uuid::new_v4().to_string();
+                    let forked = dir.join(format!("{new_id}.jsonl"));
+                    std::fs::write(&tmp, fork(&text, &new_id)).map_err(|e| e.to_string())?;
+                    let linked = std::fs::hard_link(&tmp, &forked);
+                    let _ = std::fs::remove_file(&tmp);
+                    linked.map_err(|e| e.to_string())?;
+                    return Ok(Resume::Forked(new_id));
+                }
+            }
+        }
+        Err("the local transcript keeps changing".into())
+    }
+
+    /// The Claude project folder for a local cwd, and the canonical cwd text.
+    fn transcript_dir(&self, local_cwd: &str) -> Result<(PathBuf, String), String> {
         let local = std::fs::canonicalize(local_cwd).map_or_else(
             |_| local_cwd.to_string(),
             |p| p.to_string_lossy().into_owned(),
@@ -1211,54 +1283,16 @@ impl CloudSessions {
         if name.len() > CLAUDE_NAME_LIMIT {
             return Err("the local project path is too long for Claude's session folder".into());
         }
-        let dir = self.claude_dir.join("projects").join(name);
-        let dest = dir.join(format!("{provider_id}.jsonl"));
-        let text = std::fs::read_to_string(source)
-            .map_err(|e| format!("cannot read Claude's transcript: {e}"))?;
-        let text = rewrite_cwd(&text, remote_cwds, &local);
-        let existing = match std::fs::read(&dest) {
-            Ok(bytes) => Some(bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(format!("cannot read the local transcript: {e}")),
-        };
-        let decision = decide(existing.as_deref(), text.as_bytes());
-        if decision == Decision::AlreadyCurrent {
-            return Ok(Resume::AlreadyThere(dest));
-        }
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let tmp = dir.join(format!(".{provider_id}.{}.tmp", nanos()));
-        match decision {
-            Decision::AlreadyCurrent => unreachable!("returned above"),
-            Decision::Install => {
-                std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
-                // A hard link fails when the name exists, so a concurrent writer is never replaced.
-                let linked = std::fs::hard_link(&tmp, &dest);
-                let _ = std::fs::remove_file(&tmp);
-                match linked {
-                    Ok(()) => Ok(Resume::Installed(dest)),
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                        Ok(Resume::AlreadyThere(dest))
-                    }
-                    Err(e) => Err(e.to_string()),
-                }
-            }
-            Decision::Replace => {
-                std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
-                let result = replace_keeping_backup(&dir, &tmp, &dest, provider_id);
-                let _ = std::fs::remove_file(&tmp);
-                result.map(|()| Resume::Replaced(dest))
-            }
-            Decision::Diverged => {
-                let new_id = uuid::Uuid::new_v4().to_string();
-                let forked = dir.join(format!("{new_id}.jsonl"));
-                std::fs::write(&tmp, fork(&text, &new_id)).map_err(|e| e.to_string())?;
-                let linked = std::fs::hard_link(&tmp, &forked);
-                let _ = std::fs::remove_file(&tmp);
-                linked.map_err(|e| e.to_string())?;
-                Ok(Resume::Forked(new_id))
-            }
-        }
+        Ok((self.claude_dir.join("projects").join(name), local))
     }
+}
+
+/// Writes a file and flushes it to disk, so a rename that follows never exposes a hollow file.
+fn write_synced(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()
 }
 
 /// Puts `tmp` in place of `dest` without a moment where `dest` is missing, keeping the

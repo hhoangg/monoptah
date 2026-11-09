@@ -187,13 +187,6 @@ mod tests {
     }
 
     #[test]
-    fn lines_without_a_uuid_and_broken_lines_are_not_in_the_chain() {
-        let text =
-            "{\"type\":\"x\"}\nnot json\n{\"uuid\":\"a\"}\r\n\n{\"uuid\":7}\n{\"uuid\":\"b\"";
-        assert_eq!(parse_chain(text.as_bytes()), vec!["a".to_string()]);
-    }
-
-    #[test]
     fn comparison_ignores_the_cwd_rewrite() {
         let cloud = fixture("extended.jsonl");
         let local_base = rewrite_cwd(

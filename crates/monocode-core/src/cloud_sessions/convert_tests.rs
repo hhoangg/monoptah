@@ -939,6 +939,53 @@ fn a_diverged_local_transcript_is_never_overwritten_and_the_cloud_copy_forks() {
 }
 
 #[test]
+fn a_failed_conversion_removes_the_fork_it_made_so_retries_do_not_pile_up() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = world(true);
+    let file = local_transcript(&w);
+    let mine = "{\"uuid\":\"u1\"}\n{\"uuid\":\"other\"}\n";
+    std::fs::write(&file, mine).unwrap();
+    // An unreadable evidence file fails the conversion after the transcript was installed.
+    let evidence = w
+        .svc
+        .store()
+        .unwrap()
+        .thread_dir(w.cloud_id)
+        .unwrap()
+        .unwrap()
+        .join(crate::cloud_sessions::EVIDENCE_DIR);
+    let locked = evidence.join("locked.txt");
+    let result = w.svc.convert_session(w.cloud_id, &mut |step| {
+        if step == "Creating the local copy" {
+            std::fs::create_dir_all(&evidence).unwrap();
+            std::fs::write(&locked, "x").unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+    });
+    let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644));
+    assert!(result.is_err());
+    let names: Vec<_> = std::fs::read_dir(file.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec![format!("{SESSION}.jsonl")]);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), mine);
+}
+
+#[test]
+fn cwd_rewrites_round_trip_for_paths_with_quotes_and_backslashes() {
+    let local = r#"C:\Users\me\"q" app"#;
+    let escaped = serde_json::to_string(local).unwrap();
+    let text = format!(
+        "{{\"cwd\":{escaped}}} {}/sub",
+        &escaped[1..escaped.len() - 1]
+    );
+    let cloud = rewrite_cwd(&text, &[local], "/workspaces/app");
+    assert_eq!(cloud, "{\"cwd\":\"/workspaces/app\"} /workspaces/app/sub");
+    assert_eq!(rewrite_cwd(&cloud, &["/workspaces/app"], local), text);
+}
+
+#[test]
 fn a_session_that_never_ran_claude_is_kept_without_a_resume_id() {
     let w = world(false);
     let done = w.svc.convert_session(w.cloud_id, &mut |_| {}).unwrap();
