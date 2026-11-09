@@ -151,6 +151,17 @@ fn url_classification_table() {
         "http://192.168.1.5/mcp",
         "http://169.254.169.254/mcp",
         "http://[fe80::1]/mcp",
+        "http://0.0.0.0:9/mcp",
+        "http://[::]/mcp",
+        "http://100.64.0.1/mcp",
+        "http://100.127.255.255/mcp",
+        // The URL parser normalizes short and hex IPv4 forms, so these are loopback.
+        "http://127.1/mcp",
+        "http://0x7f000001/mcp",
+        "http://[::ffff:127.0.0.1]/mcp",
+        "http://[::ffff:10.0.0.1]/mcp",
+        // The host is what follows the userinfo.
+        "http://user:pass@localhost/mcp",
     ];
     for url in private {
         assert_eq!(
@@ -164,7 +175,14 @@ fn url_classification_table() {
         "http://172.32.0.1/mcp",
         "http://11.0.0.1/mcp",
         "https://localhost.example.com/mcp",
+        // Parses as a domain named "${host}".
         "https://${HOST}/mcp",
+        // No scheme: unparseable, so not judged.
+        "${BASE_URL}/mcp",
+        "http://100.63.255.255/mcp",
+        "http://100.128.0.1/mcp",
+        // The userinfo is "localhost"; the host is evil.com.
+        "http://localhost@evil.com/mcp",
     ];
     for url in public {
         assert_eq!(compat_one(json!({"type": "sse", "url": url})), Ok, "{url}");
@@ -655,14 +673,16 @@ fn symlinks_inside_home_are_followed_and_outside_are_refused() {
 
 #[cfg(unix)]
 #[test]
-fn a_plugin_installed_outside_home_is_refused() {
+fn a_plugin_install_path_that_links_out_of_home_is_refused() {
     let env = env();
-    let outside = tempfile::tempdir().unwrap();
-    write(&outside.path().join(".claude-plugin/plugin.json"), "{}");
+    let target = tempfile::tempdir().unwrap();
+    write(&target.path().join(".claude-plugin/plugin.json"), "{}");
+    let outside = env.roots.home.join("link-to-outside");
+    std::os::unix::fs::symlink(target.path(), &outside).unwrap();
     let registry = env.roots.claude_home.join("plugins/installed_plugins.json");
     write_json(
         &registry,
-        json!({"version": 2, "plugins": {"far@mk": [{"scope": "user", "version": "1", "installPath": outside.path()}]}}),
+        json!({"version": 2, "plugins": {"far@mk": [{"scope": "user", "version": "1", "installPath": outside}]}}),
     );
     write_json(
         &env.roots.claude_home.join("settings.json"),
@@ -768,4 +788,97 @@ fn account_source_reads_its_own_plugins_and_settings() {
     );
     let inventory = build_inventory(&env.roots, Workspace::Codespace);
     assert_eq!(inventory.plugins[0].source, KitSource::Account);
+}
+
+#[cfg(unix)]
+#[test]
+fn dead_symlinks_are_skipped_not_refused() {
+    use std::os::unix::fs::symlink;
+    let env = env();
+    let skills = env.roots.claude_home.join("skills");
+    skill(&skills, "dead", "x");
+    symlink(env.roots.home.join("nowhere"), skills.join("dead/gone.txt")).unwrap();
+    // A dead link loop too.
+    symlink(skills.join("dead/a"), skills.join("dead/b")).unwrap();
+    symlink(skills.join("dead/b"), skills.join("dead/a")).unwrap();
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    assert_eq!(inventory.skills.len(), 1);
+    assert_eq!(inventory.skills[0].exclusion, None);
+    assert_eq!(inventory.skills[0].size, 1);
+}
+
+#[test]
+fn a_project_outside_home_still_offers_its_skills() {
+    let env = env();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let project = std::fs::canonicalize(elsewhere.path()).unwrap();
+    skill(&project.join(".claude/skills"), "local", "abc");
+    let roots = KitRoots {
+        project,
+        ..env.roots.clone()
+    };
+    let inventory = build_inventory(&roots, Workspace::Codespace);
+    assert_eq!(inventory.skills.len(), 1);
+    assert_eq!(inventory.skills[0].exclusion, None);
+    assert_eq!(inventory.skills[0].size, 3);
+}
+
+#[test]
+fn a_plugin_installed_outside_home_as_a_real_dir_is_offered() {
+    let env = env();
+    let outside = tempfile::tempdir().unwrap();
+    write(&outside.path().join(".claude-plugin/plugin.json"), "{}");
+    write_json(
+        &env.roots.claude_home.join("plugins/installed_plugins.json"),
+        json!({"version": 2, "plugins": {"far@mk": [{"scope": "user", "version": "1", "installPath": outside.path()}]}}),
+    );
+    write_json(
+        &env.roots.claude_home.join("settings.json"),
+        json!({"enabledPlugins": {"far@mk": true}}),
+    );
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    assert_eq!(inventory.plugins[0].exclusion, None);
+    assert_eq!(inventory.plugins[0].size, 2);
+}
+
+#[test]
+fn a_timed_out_scan_is_incomplete_and_never_under_the_cap() {
+    let env = env();
+    fixture(&env);
+    let complete = build_inventory(&env.roots, Workspace::Codespace);
+    assert!(!complete.incomplete);
+    let timed_out = build_inventory_budgeted(
+        &env.roots,
+        Workspace::Codespace,
+        &|_| None,
+        std::time::Duration::ZERO,
+    );
+    assert!(timed_out.incomplete);
+    assert!(timed_out.over_total_cap);
+    assert!(timed_out
+        .skills
+        .iter()
+        .any(|s| s.exclusion == Some(Exclusion::ScanTimedOut)));
+    assert_ne!(timed_out.content_hash, complete.content_hash);
+    assert!(!timed_out.content_hash.is_empty());
+}
+
+#[test]
+fn committed_symlink_skills_count_as_committed() {
+    let env = env();
+    let project = &env.roots.project;
+    git(project, &["init", "-q"]);
+    let skills = project.join(".claude/skills");
+    skill(&project.join("shared"), "linked", "x");
+    std::fs::create_dir_all(&skills).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(project.join("shared/linked"), skills.join("linked")).unwrap();
+    skill(&skills, "plain", "x");
+    git(project, &["add", ".claude/skills/linked"]);
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    let names: Vec<_> = inventory.skills.iter().map(|s| s.name.as_str()).collect();
+    #[cfg(unix)]
+    assert_eq!(names, vec!["plain"]);
+    #[cfg(not(unix))]
+    let _ = names;
 }

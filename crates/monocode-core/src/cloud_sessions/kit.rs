@@ -22,7 +22,6 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -105,6 +104,8 @@ pub struct KitSkill {
     pub path: PathBuf,
     pub size: u64,
     pub hash: String,
+    /// Gzip size of the files; 0 when excluded.
+    pub compressed: u64,
     pub exclusion: Option<Exclusion>,
 }
 
@@ -189,6 +190,8 @@ pub struct KitPlugin {
     /// `bin/`, `.lsp.json` or a native `*.node` file: it may not run on Linux.
     pub has_native_bin: bool,
     pub hash: String,
+    /// Gzip size of the files; 0 when excluded.
+    pub compressed: u64,
     pub exclusion: Option<Exclusion>,
 }
 
@@ -200,7 +203,12 @@ pub struct KitInventory {
     /// Compressed size of every item that is not excluded (plugin skills count with
     /// their plugin).
     pub total_compressed: u64,
+    /// True when the total is not known to be under the cap: it is over it, or an item
+    /// timed out so the total is a lower bound.
     pub over_total_cap: bool,
+    /// An item hit the scan budget. The totals and the hash are then not comparable
+    /// between runs, so callers must not treat them as a stable fingerprint.
+    pub incomplete: bool,
     /// Same inputs, same hash. Covers names, scopes, sources, file contents and server
     /// configs including secrets (only a digest of them is kept).
     pub content_hash: String,
@@ -254,7 +262,20 @@ pub fn build_inventory_with(
     workspace: Workspace,
     probe: &dyn Fn(&KitMcpServer) -> Option<bool>,
 ) -> KitInventory {
-    let started = Instant::now();
+    build_inventory_budgeted(roots, workspace, probe, SCAN_BUDGET)
+}
+
+/// [`build_inventory_with`] with an explicit scan budget (tests use a tiny one).
+pub fn build_inventory_budgeted(
+    roots: &KitRoots,
+    workspace: Workspace,
+    probe: &dyn Fn(&KitMcpServer) -> Option<bool>,
+    budget: Duration,
+) -> KitInventory {
+    let started = Clock {
+        started: Instant::now(),
+        budget,
+    };
     let home = std::fs::canonicalize(&roots.home).unwrap_or_else(|_| roots.home.clone());
     let sources = sources(roots);
     let mut inventory = KitInventory::default();
@@ -297,8 +318,16 @@ pub fn build_inventory_with(
         ))
     });
 
-    inventory.total_compressed = total_compressed(&inventory, &home);
-    inventory.over_total_cap = inventory.total_compressed > MAX_KIT_COMPRESSED_BYTES;
+    inventory.incomplete = inventory
+        .skills
+        .iter()
+        .map(|s| s.exclusion)
+        .chain(inventory.plugins.iter().map(|p| p.exclusion))
+        .any(|e| e == Some(Exclusion::ScanTimedOut));
+    inventory.total_compressed = total_compressed(&inventory);
+    // A timed-out item has no size, so the total is only a lower bound: report over-cap.
+    inventory.over_total_cap =
+        inventory.incomplete || inventory.total_compressed > MAX_KIT_COMPRESSED_BYTES;
     inventory.content_hash = content_hash(&inventory);
     inventory
 }
@@ -336,6 +365,13 @@ enum ItemKind {
     Plugin,
 }
 
+/// The scan deadline, shared by every item of one inventory.
+#[derive(Clone, Copy)]
+struct Clock {
+    started: Instant,
+    budget: Duration,
+}
+
 struct Scan {
     files: Vec<PathBuf>,
     size: u64,
@@ -345,7 +381,7 @@ struct Scan {
 
 /// Walk one skill or plugin directory. Files come back sorted, so every later step is
 /// deterministic. Symlinks are resolved, and a link that leaves `home` excludes the item.
-fn scan_item(root: &Path, kind: ItemKind, home: &Path, started: Instant) -> Scan {
+fn scan_item(root: &Path, kind: ItemKind, home: &Path, started: Clock) -> Scan {
     let mut scan = Scan {
         files: Vec::new(),
         size: 0,
@@ -356,10 +392,18 @@ fn scan_item(root: &Path, kind: ItemKind, home: &Path, started: Instant) -> Scan
         ItemKind::Skill => MAX_SKILL_BYTES,
         ItemKind::Plugin => MAX_PLUGIN_BYTES,
     };
-    let Some(real_root) = resolve_within(root, home) else {
-        scan.exclusion = Some(Exclusion::LinkOutsideHome);
+    // The item root may live anywhere (a project outside `$HOME`, a plugin installed
+    // elsewhere). Only links met while walking are held to `home`. A root that is itself
+    // a link out of `home` is refused, so callers pass a root they already trust.
+    let Ok(real_root) = std::fs::canonicalize(root) else {
         return scan;
     };
+    if std::fs::symlink_metadata(root).is_ok_and(|m| m.file_type().is_symlink())
+        && !real_root.starts_with(home)
+    {
+        scan.exclusion = Some(Exclusion::LinkOutsideHome);
+        return scan;
+    }
     if kind == ItemKind::Plugin && (root.join("bin").exists() || root.join(".lsp.json").exists()) {
         scan.has_native = true;
     }
@@ -385,7 +429,7 @@ fn walk(
     dir: &Path,
     kind: ItemKind,
     home: &Path,
-    started: Instant,
+    started: Clock,
     cap: u64,
     visited: &mut HashSet<PathBuf>,
     entries: &mut usize,
@@ -413,7 +457,7 @@ fn walk(
             scan.exclusion = Some(Exclusion::TooManyFiles);
             return;
         }
-        if started.elapsed() > SCAN_BUDGET {
+        if started.started.elapsed() >= started.budget {
             scan.exclusion = Some(Exclusion::ScanTimedOut);
             return;
         }
@@ -422,9 +466,13 @@ fn walk(
             continue;
         };
         let (path, meta) = if meta.file_type().is_symlink() {
-            let Some(real) = resolve_within(&path, home) else {
-                scan.exclusion = Some(Exclusion::LinkOutsideHome);
-                return;
+            let real = match resolve_link(&path, home) {
+                Link::Inside(real) => real,
+                Link::Outside => {
+                    scan.exclusion = Some(Exclusion::LinkOutsideHome);
+                    return;
+                }
+                Link::Dead => continue,
             };
             let Ok(meta) = std::fs::metadata(&real) else {
                 continue;
@@ -452,10 +500,23 @@ fn walk(
     }
 }
 
-/// Canonicalize `path` (resolving every link) and keep it only inside `home`.
-fn resolve_within(path: &Path, home: &Path) -> Option<PathBuf> {
-    let real = std::fs::canonicalize(path).ok()?;
-    real.starts_with(home).then_some(real)
+enum Link {
+    /// Resolves to a path inside `home`.
+    Inside(PathBuf),
+    /// Resolves to a path outside `home`: refused.
+    Outside,
+    /// Dead or unreadable: skipped.
+    Dead,
+}
+
+/// Resolve a symlink. Only a link that resolves outside `home` is refused; a dead one
+/// is simply skipped.
+fn resolve_link(path: &Path, home: &Path) -> Link {
+    match std::fs::canonicalize(path) {
+        Ok(real) if real.starts_with(home) => Link::Inside(real),
+        Ok(_) => Link::Outside,
+        Err(_) => Link::Dead,
+    }
 }
 
 struct CountingSink(u64);
@@ -519,15 +580,16 @@ fn skill_from_dir(
     source: KitSource,
     plugin: Option<String>,
     home: &Path,
-    started: Instant,
+    started: Clock,
 ) -> KitSkill {
     let scan = scan_item(dir, ItemKind::Skill, home, started);
-    let hash = if scan.exclusion.is_none() {
-        digest_files(dir, &scan.files).0
+    let (hash, compressed) = if scan.exclusion.is_none() {
+        digest_files(dir, &scan.files)
     } else {
-        String::new()
+        (String::new(), 0)
     };
     KitSkill {
+        compressed,
         name: name.to_string(),
         scope,
         source,
@@ -557,7 +619,7 @@ fn skill_dirs(root: &Path) -> Vec<(String, PathBuf)> {
     out
 }
 
-fn collect_user_skills(source: &Source, home: &Path, started: Instant, out: &mut Vec<KitSkill>) {
+fn collect_user_skills(source: &Source, home: &Path, started: Clock, out: &mut Vec<KitSkill>) {
     for (name, dir) in skill_dirs(&source.dir.join("skills")) {
         // The account wins over `~/.claude` for the same name.
         if out
@@ -578,23 +640,18 @@ fn collect_user_skills(source: &Source, home: &Path, started: Instant, out: &mut
     }
 }
 
-/// Names under `.claude/skills` that have at least one tracked file. `None` when the
-/// project is not a git repository (nothing is committed then).
+/// Names under `.claude/skills` that git knows (`git ls-files`, so the index). A name
+/// counts as committed when any entry is under it, or when it is itself an entry (a
+/// symlink or a gitlink has no trailing `/`). Staged but unpushed skills are therefore
+/// skipped too. `None` when git fails or this is not a repository: treated as unknown,
+/// so every project skill is offered.
 fn tracked_skill_names(project: &Path) -> Option<BTreeSet<String>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(project)
-        .args(["ls-files", "-z", "--", ".claude/skills"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    let listing = crate::git::git(project, &["ls-files", "-z", "--", ".claude/skills"]).ok()?;
     let mut names = BTreeSet::new();
-    for entry in output.stdout.split(|byte| *byte == 0) {
-        let entry = String::from_utf8_lossy(entry);
+    for entry in listing.split('\0') {
         if let Some(rest) = entry.strip_prefix(".claude/skills/") {
-            if let Some((name, _)) = rest.split_once('/') {
+            let name = rest.split_once('/').map_or(rest, |(name, _)| name);
+            if !name.is_empty() {
                 names.insert(name.to_string());
             }
         }
@@ -602,12 +659,7 @@ fn tracked_skill_names(project: &Path) -> Option<BTreeSet<String>> {
     Some(names)
 }
 
-fn collect_project_skills(
-    roots: &KitRoots,
-    home: &Path,
-    started: Instant,
-    out: &mut Vec<KitSkill>,
-) {
+fn collect_project_skills(roots: &KitRoots, home: &Path, started: Clock, out: &mut Vec<KitSkill>) {
     let tracked = tracked_skill_names(&roots.project).unwrap_or_default();
     for (name, dir) in skill_dirs(&roots.project.join(".claude/skills")) {
         // Committed skills arrive with the clone.
@@ -631,7 +683,7 @@ fn collect_plugin_skills(
     install_path: &Path,
     source: KitSource,
     home: &Path,
-    started: Instant,
+    started: Clock,
     out: &mut Vec<KitSkill>,
 ) {
     for (name, dir) in skill_dirs(&install_path.join("skills")) {
@@ -665,7 +717,7 @@ fn collect_plugins(
     source: &Source,
     roots: &KitRoots,
     home: &Path,
-    started: Instant,
+    started: Clock,
     out: &mut Vec<KitPlugin>,
 ) {
     let Some(registry) = crate::mcp::read_json(&source.dir.join("plugins/installed_plugins.json"))
@@ -702,12 +754,13 @@ fn collect_plugins(
         };
         let install_path = resolve_install_path(raw_path, &roots.home);
         let scan = scan_item(&install_path, ItemKind::Plugin, home, started);
-        let hash = if scan.exclusion.is_none() {
-            digest_files(&install_path, &scan.files).0
+        let (hash, compressed) = if scan.exclusion.is_none() {
+            digest_files(&install_path, &scan.files)
         } else {
-            String::new()
+            (String::new(), 0)
         };
         out.push(KitPlugin {
+            compressed,
             id: id.clone(),
             version: entry
                 .get("version")
@@ -931,8 +984,11 @@ fn runtime_of(command: &str) -> Option<Runtime> {
     }
 }
 
-/// Localhost, loopback, `*.local`, RFC 1918 and link-local hosts. An unparseable URL
-/// (for example one starting with `${HOST}`) is not judged.
+/// Localhost, loopback, `*.local`, RFC 1918, link-local, CGNAT and unspecified hosts. An
+/// unparseable URL (for example one starting with `${HOST}`) is not judged. The `url`
+/// crate normalizes the short and hex IPv4 forms (`127.1`, `0x7f000001`) to
+/// `127.0.0.1` before this runs, so they are local; and it takes the host after any
+/// userinfo, so `http://localhost@evil.com` is `evil.com`, not local.
 fn is_private_url(raw: &str) -> bool {
     let Ok(url) = url::Url::parse(raw) else {
         return false;
@@ -951,7 +1007,13 @@ fn is_private_url(raw: &str) -> bool {
 }
 
 fn private_v4(ip: Ipv4Addr) -> bool {
-    ip.is_loopback() || ip.is_private() || ip.is_link_local()
+    let [a, b, ..] = ip.octets();
+    ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        // CGNAT, 100.64.0.0/10
+        || (a == 100 && (b & 0xc0) == 64)
 }
 
 fn private_v6(ip: Ipv6Addr) -> bool {
@@ -959,7 +1021,10 @@ fn private_v6(ip: Ipv6Addr) -> bool {
         return private_v4(v4);
     }
     let first = ip.segments()[0];
-    ip.is_loopback() || (first & 0xffc0) == 0xfe80 || (first & 0xfe00) == 0xfc00
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || (first & 0xffc0) == 0xfe80
+        || (first & 0xfe00) == 0xfc00
 }
 
 /// `${NAME}` and nothing else.
@@ -1049,33 +1114,24 @@ fn canonical_json(value: &Value, out: &mut String) {
 // Totals and hash
 // ---------------------------------------------------------------------------
 
-/// Compressed size of every item that would be sent. Plugin skills are inside their
-/// plugin, so they are not counted twice.
-fn total_compressed(inventory: &KitInventory, home: &Path) -> u64 {
-    let started = Instant::now();
-    let mut total = 0;
-    let mut dirs: Vec<(&Path, ItemKind)> = Vec::new();
-    for skill in &inventory.skills {
-        if skill.scope != SkillScope::Plugin && skill.exclusion.is_none() {
-            dirs.push((&skill.path, ItemKind::Skill));
-        }
-    }
-    for plugin in &inventory.plugins {
-        if plugin.exclusion.is_none() {
-            dirs.push((&plugin.install_path, ItemKind::Plugin));
-        }
-    }
-    for (dir, kind) in dirs {
-        let scan = scan_item(dir, kind, home, started);
-        if scan.exclusion.is_none() {
-            total += digest_files(dir, &scan.files).1;
-        }
-    }
-    total
+/// Compressed size of every item that would be sent, from the first pass. Plugin
+/// skills are inside their plugin, so they are not counted twice.
+fn total_compressed(inventory: &KitInventory) -> u64 {
+    let skills = inventory
+        .skills
+        .iter()
+        .filter(|skill| skill.scope != SkillScope::Plugin)
+        .map(|skill| skill.compressed);
+    let plugins = inventory.plugins.iter().map(|plugin| plugin.compressed);
+    skills.chain(plugins).sum()
 }
 
 fn content_hash(inventory: &KitInventory) -> String {
     let mut hasher = Sha256::new();
+    if inventory.incomplete {
+        // Which items made it before the deadline depends on machine load.
+        hasher.update(b"incomplete");
+    }
     let mut line = |parts: &[&str]| {
         hasher.update(digest_str(parts).as_bytes());
     };
