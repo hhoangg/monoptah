@@ -21,6 +21,8 @@ impl GhRunner for NoGh {
 struct FileHost {
     files: Mutex<HashMap<String, Vec<u8>>>,
     log: Mutex<Vec<String>>,
+    /// The `cwd` param of every file read (`None`: the request carried none).
+    cwds: Mutex<Vec<Option<String>>>,
     disconnected: AtomicBool,
     legacy: bool,
     /// Every call answers like a machine the connection store no longer knows.
@@ -37,6 +39,9 @@ impl FileHost {
             .lock()
             .unwrap()
             .insert(rel.into(), bytes.to_vec());
+    }
+    fn cwds(&self) -> Vec<Option<String>> {
+        self.cwds.lock().unwrap().clone()
     }
     fn log(&self) -> Vec<String> {
         self.log.lock().unwrap().clone()
@@ -79,6 +84,10 @@ impl Host for FileHost {
         assert_eq!(params["projectId"], "project-1");
         let path = params["path"].as_str().unwrap().to_string();
         self.log.lock().unwrap().push(format!("{method} {path}"));
+        self.cwds
+            .lock()
+            .unwrap()
+            .push(params["cwd"].as_str().map(str::to_owned));
         if self.disconnected.load(Ordering::SeqCst) {
             return Err(remote::CODESPACE_NOT_CONNECTED.into());
         }
@@ -980,4 +989,81 @@ fn downloaded_files_are_quarantined_on_macos() {
         .unwrap();
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).starts_with("0083;"));
+}
+
+const WORKTREE: &str = "/workspaces/widgets-feature";
+
+/// Records `worktree` (as the store keeps it: `remote://<env>/<path>`) for session `id`.
+fn set_worktree(svc: &CloudSessions, id: i64, worktree: Option<&str>, removed: bool) {
+    let settings = crate::agent::Settings {
+        worktree_cwd: worktree.map(|path| format!("remote://env-octo-abc{path}")),
+        worktree_removed: removed,
+        ..Default::default()
+    };
+    svc.store()
+        .unwrap()
+        .save_agent_settings(id, &settings)
+        .unwrap();
+}
+
+#[test]
+fn reads_carry_the_worktree_cwd_and_stay_inside_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = FileHost::default();
+    host.put("src/main.rs", b"fn main() {}\n");
+    let (svc, host, id) = setup(host, dir.path());
+    set_worktree(&svc, id, Some(WORKTREE), false);
+    let file = svc
+        .resolve_cloud_file(id, &format!("{WORKTREE}/src/main.rs"))
+        .unwrap();
+    assert_eq!(file.cwd.as_deref(), Some(WORKTREE));
+    assert_eq!(file.rel, "src/main.rs");
+    svc.open_cloud_file(&file, &AtomicBool::new(false)).unwrap();
+    assert_eq!(host.log(), vec!["files.readBytes src/main.rs"]);
+    assert_eq!(host.cwds(), vec![Some(WORKTREE.to_owned())]);
+    // The project root is outside this session's worktree: refused, nothing sent.
+    let outside = svc
+        .resolve_cloud_file(id, &format!("{ROOT}/src/main.rs"))
+        .unwrap_err();
+    assert!(matches!(outside, ViewError::Refused(_)), "{outside:?}");
+    assert_eq!(host.log().len(), 1);
+}
+
+#[test]
+fn the_older_text_read_also_carries_the_worktree_cwd() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = FileHost {
+        legacy: true,
+        ..Default::default()
+    };
+    host.put("notes.md", b"# Notes\n");
+    let (svc, host, id) = setup(host, dir.path());
+    set_worktree(&svc, id, Some(WORKTREE), false);
+    open(&svc, id, "notes.md").unwrap();
+    assert_eq!(host.log(), vec!["files.read notes.md"]);
+    assert_eq!(host.cwds(), vec![Some(WORKTREE.to_owned())]);
+}
+
+#[test]
+fn no_cwd_is_sent_without_a_usable_worktree() {
+    let cases = [
+        (None, false),
+        // A removed worktree falls back to the project folder.
+        (Some(WORKTREE), true),
+        // A recorded folder outside the workspace is never trusted.
+        (Some("/etc"), false),
+        (Some("/workspaces"), false),
+    ];
+    for (worktree, removed) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let host = FileHost::default();
+        host.put("a.txt", b"hello");
+        let (svc, host, id) = setup(host, dir.path());
+        set_worktree(&svc, id, worktree, removed);
+        let file = svc.resolve_cloud_file(id, "a.txt").unwrap();
+        assert_eq!(file.cwd, None, "{worktree:?} {removed}");
+        assert_eq!(file.root, ROOT);
+        svc.open_cloud_file(&file, &AtomicBool::new(false)).unwrap();
+        assert_eq!(host.cwds(), vec![None], "{worktree:?} {removed}");
+    }
 }

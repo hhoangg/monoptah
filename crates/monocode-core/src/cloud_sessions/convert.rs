@@ -749,7 +749,8 @@ impl CloudSessions {
             });
         }
         // The session may run in its own host worktree: that is the tree to save.
-        let host_cwd = snapshot
+        let workspace_root = self.workspace_root_of(&cloud);
+        let session_cwd = snapshot
             .as_ref()
             .and_then(|v| v["session"]["cwd"].as_str())
             .map(str::to_string)
@@ -757,17 +758,9 @@ impl CloudSessions {
                 // Without a Host the session's own folder is what the store last saw.
                 files_only.as_ref()?;
                 let settings = self.store().ok()?.agent_settings(cloud_id).ok().flatten()?;
-                // A removed worktree is not a place to look any more.
-                (!settings.worktree_removed)
-                    .then_some(settings.worktree_cwd)
-                    .flatten()
-            });
-        let workspace_root = self.workspace_root_of(&cloud);
-        let session_cwd = host_cwd
-            .map(|c| c.trim_end_matches('/').to_string())
-            .filter(|c| {
-                c.starts_with(&format!("{}/", workspace_root)) && valid_remote_path(c).is_ok()
-            });
+                stored_worktree_cwd(&settings)
+            })
+            .and_then(|cwd| confine_host_cwd(&cwd, &workspace_root));
         let workspace = session_cwd.clone().unwrap_or_else(|| project_cwd.clone());
         // Where the snapshot script looks: the same tree, at its path in the outer sandbox
         // for a files-only archive.

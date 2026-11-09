@@ -3256,6 +3256,27 @@ mod files_only {
     }
 
     #[test]
+    fn a_stored_remote_form_worktree_is_refused_like_a_plain_path() {
+        let a = archivable();
+        a.recreate();
+        {
+            let store = a.fx.store.lock().unwrap();
+            let mut settings = store.agent_settings(a.id).unwrap().unwrap_or_default();
+            // The form the store keeps in production: remote://<env>/<path>.
+            settings.worktree_cwd =
+                Some("remote://env-1/workspaces/widgets-worktrees/fix-login".into());
+            settings.worktree_removed = false;
+            store.save_agent_settings(a.id, &settings).unwrap();
+        }
+        let error = a.convert().0.unwrap_err();
+        assert!(
+            error.contains("worktree lived only in the container"),
+            "{error}"
+        );
+        assert!(a.archive_calls().is_empty());
+    }
+
+    #[test]
     fn a_deleted_sandbox_is_not_archived_as_files_only() {
         let a = archivable();
         a.fx.sbx.remove(&sandbox_id(&a.fx));
