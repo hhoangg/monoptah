@@ -1866,20 +1866,15 @@ impl TranscriptView {
     /// groupMonoTurnItems: prose stays in the activity trail while its run is
     /// live, and when later work in the run follows it.
     fn mono_prose_hidden(&self, at: usize) -> bool {
-        // Yielded to background tasks, the live run reads as if it had ended
-        // where it yielded: its final reply shows, and what it said earlier
-        // follows the settled rules. Once the run resumes (rows past the mark)
-        // or the source no longer matches the mark, the normal live rules
-        // apply to every row, so nothing changes again when the run settles.
-        let yielded =
-            self.streaming && at < self.yield_mark && self.source.len() == self.yield_mark;
+        // Rows before the yield mark were the live run's reply when it yielded
+        // to background tasks. They follow the settled rules over the whole
+        // source, so a text-only follow-up leaves them shown, later work
+        // moves them into the trail at once, and settling changes nothing.
+        let yielded = self.streaming && at < self.yield_mark;
         let streaming = self.streaming && !yielded;
-        let found = (at + 1..self.source.len()).find(|&i| self.source[i].is_prompt());
-        let end = if yielded {
-            found.map_or(self.yield_mark, |end| end.min(self.yield_mark))
-        } else {
-            found.unwrap_or(self.source.len())
-        };
+        let end = (at + 1..self.source.len())
+            .find(|&i| self.source[i].is_prompt())
+            .unwrap_or(self.source.len());
         let turn = self.source[..at]
             .iter()
             .rposition(Row::is_prompt)
@@ -7128,8 +7123,13 @@ mod scroll_tests {
             assert!(!view.mono_prose_hidden(5), "an earlier turn's answer shows");
             let yielded = hidden(view);
 
+            view.entrances.clear();
             view.streaming(false, cx);
             assert_eq!(hidden(view), yielded, "nothing flips when the run settles");
+            assert!(
+                !view.entrances.contains_key(&11),
+                "the shown reply does not enter again on settle"
+            );
         });
 
         let view = cx.new(|_| {
@@ -7166,6 +7166,33 @@ mod scroll_tests {
                 [1, 3, 5].map(|at| view.mono_prose_hidden(at)),
                 yielded,
                 "nothing flips when the run settles"
+            );
+        });
+
+        let view = cx.new(|_| {
+            let mut view = TranscriptView::new();
+            view.mono_mode("cat", 0xe86b5f, "MonoCat");
+            view
+        });
+        view.update(cx, |view, cx| {
+            view.patch(0, vec![row("user", "Go")], cx);
+            view.streaming(true, cx);
+            view.patch(1, vec![row("assistant", "Running.")], cx);
+            view.set_yielded(1, cx);
+            assert!(!view.mono_prose_hidden(1));
+            // The tasks finish and Claude only says one more thing.
+            view.set_yielded(0, cx);
+            view.patch(2, vec![row("assistant", "It finished.")], cx);
+            assert!(
+                !view.mono_prose_hidden(1),
+                "a text follow-up keeps it shown"
+            );
+            view.entrances.clear();
+            view.streaming(false, cx);
+            assert!(!view.mono_prose_hidden(1), "settling does not hide it");
+            assert!(
+                !view.entrances.contains_key(&1),
+                "the reply does not enter again on settle"
             );
         });
     }
