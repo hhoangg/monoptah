@@ -127,6 +127,11 @@ in `host/VERSION` as `X.Y.Z+monoptah` (semver build metadata marks the fork flav
    `scripts/pin-host-release.mjs` from the run's `host-release.json`). Release the Host before
    the app that pins it.
 
+Note: the paused Tauri `release.yml` still packages the Host, but those packages now report
+`X.Y.Z+monoptah` while the Tauri app's bootstrap expects its own version. A Tauri release cut
+after H1 would fail to install the Host until the Tauri bootstrap is handled (H2a covers the
+native app only).
+
 ### Releasing the native app
 
 Monoptah Native (GPUI) ships for macOS arm64 (ad-hoc signed, not notarized), Linux x86_64 and

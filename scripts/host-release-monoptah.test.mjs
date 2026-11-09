@@ -86,6 +86,40 @@ test("writes host/VERSION, commits and tags", async () => {
   }
 });
 
+test("tags HEAD only when host/VERSION already is the requested version", async () => {
+  const dir = await repo();
+  try {
+    const head = git(dir, "rev-parse", "HEAD");
+    const result = await prepareHostRelease("1.0.0", { cwd: dir });
+    assert.equal(result.tag, "host-v1.0.0");
+    assert.equal(git(dir, "rev-parse", "HEAD"), head);
+    assert.equal(git(dir, "rev-parse", "host-v1.0.0^{commit}"), head);
+    assert.equal(git(dir, "status", "--porcelain"), "");
+    await assert.rejects(
+      prepareHostRelease("1.0.0", { cwd: dir }),
+      /already exists/,
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("restores host/VERSION when the commit fails", async () => {
+  const dir = await repo();
+  try {
+    await writeFile(
+      join(dir, ".git", "hooks", "pre-commit"),
+      "#!/bin/sh\nexit 1\n",
+      { mode: 0o755 },
+    );
+    await assert.rejects(prepareHostRelease("1.0.1", { cwd: dir }), /commit/);
+    assert.equal(git(dir, "status", "--porcelain"), "");
+    assert.equal(git(dir, "tag", "--list"), "");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("refuses a dirty tree and leaves it untouched", async () => {
   const dir = await repo();
   try {
@@ -104,7 +138,7 @@ test("refuses a dirty tree and leaves it untouched", async () => {
   }
 });
 
-test("refuses an invalid, existing or non-newer version", async () => {
+test("refuses an invalid, existing or lower version", async () => {
   const dir = await repo();
   try {
     await assert.rejects(
@@ -112,7 +146,7 @@ test("refuses an invalid, existing or non-newer version", async () => {
       /Invalid Host version/,
     );
     await assert.rejects(
-      prepareHostRelease("1.0.0", { cwd: dir }),
+      prepareHostRelease("0.9.0", { cwd: dir }),
       /must be newer/,
     );
     git(dir, "tag", "host-v2.0.0");

@@ -71,8 +71,12 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+          # Only "release not found" lets the run proceed; any other gh error fails it.
+          if out=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" 2>&1); then
             echo "::error::Release $TAG already exists. Published Host assets are never re-uploaded because the app pins their hashes; bump the version instead."
+            exit 1
+          elif ! grep -qi "release not found" <<<"$out"; then
+            echo "::error::Could not check whether release $TAG exists: $out"
             exit 1
           fi
 
@@ -155,8 +159,11 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+          if out=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" 2>&1); then
             echo "::error::Release $TAG already exists; refusing to upload again"
+            exit 1
+          elif ! grep -qi "release not found" <<<"$out"; then
+            echo "::error::Could not check whether release $TAG exists: $out"
             exit 1
           fi
           version="${TAG#host-v}"

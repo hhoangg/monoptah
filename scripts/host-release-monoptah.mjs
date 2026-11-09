@@ -1,7 +1,8 @@
 // Fork-local (Monoptah). Prepares a Monoptah Host release:
 //   npm run host:release -- X.Y.Z
 // It requires a clean tree, writes host/VERSION (X.Y.Z+monoptah), commits
-// "Release Monoptah Host X.Y.Z" and creates the tag host-vX.Y.Z. It never pushes:
+// "Release Monoptah Host X.Y.Z" and creates the tag host-vX.Y.Z. When host/VERSION
+// already is X.Y.Z+monoptah it only tags HEAD. It never pushes:
 // it prints the push commands, and publishing stays an explicit step the user
 // approves. Pushing the tag starts .github/workflows/host-release-monoptah.yml.
 import { spawnSync } from "node:child_process";
@@ -65,13 +66,23 @@ export async function prepareHostRelease(
     throw new Error(`Tag ${tag} already exists`);
   const file = join(cwd, "host", "VERSION");
   const current = (await readFile(file, "utf8")).trim();
-  if (compareVersions(version, current) <= 0)
+  const cmp = compareVersions(version, current);
+  if (cmp < 0 || (cmp === 0 && current !== hostVersion(version)))
     throw new Error(
       `Version ${version} must be newer than the current Host version ${current}`,
     );
-  await writeFile(file, `${hostVersion(version)}\n`);
-  gitOk(cwd, ["add", "host/VERSION"]);
-  gitOk(cwd, ["commit", "-m", commitMessage(version)]);
+  // Same X.Y.Z already recorded as X.Y.Z+monoptah and not yet tagged: only tag HEAD.
+  if (cmp > 0) {
+    await writeFile(file, `${hostVersion(version)}\n`);
+    try {
+      gitOk(cwd, ["add", "host/VERSION"]);
+      gitOk(cwd, ["commit", "-m", commitMessage(version)]);
+    } catch (error) {
+      git(cwd, ["reset", "-q", "HEAD", "--", "host/VERSION"]);
+      git(cwd, ["checkout", "--", "host/VERSION"]);
+      throw error;
+    }
+  }
   gitOk(cwd, ["tag", tag]);
   return {
     tag,
