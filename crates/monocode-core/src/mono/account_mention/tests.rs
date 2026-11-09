@@ -32,11 +32,14 @@ fn mentions_resolve_labels_ids_and_quoted_labels() {
             .map(|(_, a)| a.id)
             .collect()
     };
-    assert_eq!(ids("use @claude/can.le now"), [can.id.clone()]);
-    assert_eq!(ids("use @claude/CAN.LE now"), [can.id.clone()]);
-    assert_eq!(ids("use @\"claude/Work account\" now"), [work.id.clone()]);
-    assert_eq!(ids(&format!("@claude/{}", work.id)), [work.id.clone()]);
-    assert_eq!(ids("@codex/hoangxuan2402"), [codex.id.clone()]);
+    assert_eq!(ids("use @claude/can.le now"), vec![can.id.clone()]);
+    assert_eq!(ids("use @claude/CAN.LE now"), vec![can.id.clone()]);
+    assert_eq!(
+        ids("use @\"claude/Work account\" now"),
+        vec![work.id.clone()]
+    );
+    assert_eq!(ids(&format!("@claude/{}", work.id)), vec![work.id.clone()]);
+    assert_eq!(ids("@codex/hoangxuan2402"), vec![codex.id.clone()]);
     assert_eq!(ids("@claude/default"), ["default"]);
     // Trailing punctuation does not belong to the label.
     assert_eq!(
