@@ -777,6 +777,11 @@ pub(crate) struct TranscriptView {
     work_folds: HashMap<usize, bool>,
     reveals: HashMap<usize, PacedText>,
     live_start: usize,
+    /// Background tasks a Claude run has yielded to, and the source length
+    /// when it yielded. The run stays live until they finish, but what it
+    /// said before yielding is its reply and shows at once.
+    yielded: usize,
+    yield_mark: usize,
     motions: HashMap<(usize, usize), Motion>,
     reflow: crate::reflow_motion::ReflowMotion,
     frame_scheduled: bool,
@@ -1237,9 +1242,16 @@ impl TranscriptView {
                     && self.mono_prose_hidden(message)
             });
         let group = self.mono_group_start(latest);
+        let waiting = self.yielded > 0 && self.source.len() == self.yield_mark;
         Some((
             group,
-            if typing {
+            if waiting {
+                format!(
+                    "Waiting on {} background task{}",
+                    self.yielded,
+                    if self.yielded == 1 { "" } else { "s" }
+                )
+            } else if typing {
                 "Typing…".into()
             } else {
                 mono_work_label(&self.source, group)
@@ -1854,6 +1866,12 @@ impl TranscriptView {
     /// groupMonoTurnItems: prose stays in the activity trail while its run is
     /// live, and when later work in the run follows it.
     fn mono_prose_hidden(&self, at: usize) -> bool {
+        // Rows before the yield mark were the live run's reply when it yielded
+        // to background tasks. They follow the settled rules over the whole
+        // source, so a text-only follow-up leaves them shown, later work
+        // moves them into the trail at once, and settling changes nothing.
+        let yielded = self.streaming && at < self.yield_mark;
+        let streaming = self.streaming && !yielded;
         let end = (at + 1..self.source.len())
             .find(|&i| self.source[i].is_prompt())
             .unwrap_or(self.source.len());
@@ -1870,7 +1888,7 @@ impl TranscriptView {
             .rposition(|r| r.first)
             .unwrap_or(at);
         let complete = (start + 1..self.source.len()).any(|i| self.source[i].first)
-            || !(self.streaming && start >= self.live_start);
+            || !(streaming && start >= self.live_start);
         if !internal
             && self.source[turn..start]
                 .iter()
@@ -1880,7 +1898,7 @@ impl TranscriptView {
         }
         // Starting a request precedes delivery of its prompt. History remains
         // settled during that gap, even though it is still the source's tail.
-        (self.streaming && at >= self.live_start && end == self.source.len())
+        (streaming && at >= self.live_start && end == self.source.len())
             || (self.source.get(end).is_some_and(|row| row.role == "user")
                 && self.mono_next_run_continues(turn, end))
             || self.source[at + 1..end].iter().any(|r| {
@@ -2570,6 +2588,8 @@ impl TranscriptView {
             work_folds: HashMap::new(),
             reveals: HashMap::new(),
             live_start: 0,
+            yielded: 0,
+            yield_mark: 0,
             motions: HashMap::new(),
             reflow: Default::default(),
             frame_scheduled: false,
@@ -2679,6 +2699,27 @@ impl TranscriptView {
         cx.notify();
     }
 
+    /// The live run has yielded to `tasks` background tasks (0: none are
+    /// pending). Text already streamed is its reply and shows; anything a
+    /// follow-up run adds afterwards stays hidden while it streams, as usual.
+    pub(crate) fn set_yielded(&mut self, tasks: usize, cx: &mut Context<Self>) {
+        // Only a Mono's transcript hides prose, and every session reports here.
+        if !self.mono || !self.streaming {
+            return;
+        }
+        // The mark only holds while the source ends at it; a resumed run or a
+        // replaced source is marked afresh.
+        let mark = if tasks > 0 && (self.yielded == 0 || self.source.len() != self.yield_mark) {
+            self.source.len()
+        } else {
+            self.yield_mark
+        };
+        if (tasks, mark) != (self.yielded, self.yield_mark) {
+            self.yielded = tasks;
+            self.yield_mark = mark;
+            self.rebuild(0, cx);
+        }
+    }
     pub(crate) fn streaming(&mut self, streaming: bool, cx: &mut Context<Self>) {
         if self.streaming == streaming {
             return;
@@ -2698,6 +2739,8 @@ impl TranscriptView {
             HashSet::new()
         };
         self.streaming = streaming;
+        self.yielded = 0;
+        self.yield_mark = 0;
         if streaming {
             self.active_provider_turn_id = None;
             self.live_start = self.source.len();
@@ -6956,6 +6999,201 @@ mod scroll_tests {
             assert_eq!(view.last_assistant_text(), "Start middle end.");
             view.patch(7, vec![row("assistant", "   ")], cx);
             assert_eq!(view.last_assistant_text(), "Start middle end.");
+        });
+    }
+
+    #[gpui::test]
+    fn mono_reply_shows_while_the_run_waits_on_background_tasks(cx: &mut TestAppContext) {
+        let view = cx.new(|_| {
+            let mut view = TranscriptView::new();
+            view.mono_mode("cat", 0xe86b5f, "MonoCat");
+            view
+        });
+        view.update(cx, |view, cx| {
+            let bash = || {
+                let mut call = ToolCall::new("t", "Bash");
+                call.input = r#"{"command":"npm run native:dev"}"#.into();
+                row("tool", &serde_json::to_string(&call).unwrap())
+            };
+            view.patch(0, vec![row("user", "Start the dev app")], cx);
+            view.streaming(true, cx);
+            view.patch(1, vec![row("assistant", "Starting it."), bash()], cx);
+            view.patch(3, vec![row("assistant", "The app is running.")], cx);
+            assert!(view.mono_prose_hidden(3), "a live reply appears whole");
+            assert_eq!(view.mono_activity().unwrap().1, "Typing…");
+
+            // Claude ends its turn; the background task keeps the run live.
+            view.set_yielded(1, cx);
+            assert!(
+                !view.mono_prose_hidden(3),
+                "the reply before a background task is the answer"
+            );
+            assert_eq!(
+                view.mono_activity().unwrap().1,
+                "Waiting on 1 background task"
+            );
+            view.set_yielded(2, cx);
+            assert_eq!(
+                view.mono_activity().unwrap().1,
+                "Waiting on 2 background tasks"
+            );
+
+            // The task finishes and Claude follows up in the same run: the
+            // earlier reply is commentary now, and settling changes nothing.
+            view.set_yielded(0, cx);
+            view.patch(
+                4,
+                vec![bash(), row("assistant", "It exited; restarting.")],
+                cx,
+            );
+            assert!(
+                view.mono_prose_hidden(3),
+                "the earlier reply joins the trail once the run resumes"
+            );
+            assert!(
+                view.mono_prose_hidden(5),
+                "the follow-up's commentary hides while it streams"
+            );
+            assert_eq!(view.mono_activity().unwrap().1, "Typing…");
+
+            view.entrances.clear();
+            view.streaming(false, cx);
+            assert!(
+                view.mono_prose_hidden(3),
+                "the earlier reply does not flip at settle"
+            );
+            assert!(
+                !view.mono_prose_hidden(5),
+                "the follow-up's reply shows once the run settles"
+            );
+            assert!(
+                view.entrances.contains_key(&5),
+                "the follow-up's reply enters when the run settles"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn mono_yielded_run_shows_only_its_final_reply(cx: &mut TestAppContext) {
+        let view = cx.new(|_| {
+            let mut view = TranscriptView::new();
+            view.mono_mode("cat", 0xe86b5f, "MonoCat");
+            view
+        });
+        view.update(cx, |view, cx| {
+            let bash = || {
+                let mut call = ToolCall::new("t", "Bash");
+                call.input = r#"{"command":"ls"}"#.into();
+                row("tool", &serde_json::to_string(&call).unwrap())
+            };
+            view.patch(
+                0,
+                vec![
+                    row("user", "Look"),
+                    row("assistant", "Looking."),
+                    bash(),
+                    row("assistant", "Old mid."),
+                    bash(),
+                    row("assistant", "Answer 1."),
+                    row("user", "Go"),
+                ],
+                cx,
+            );
+            view.streaming(true, cx);
+            view.patch(
+                7,
+                vec![
+                    row("assistant", "Starting."),
+                    bash(),
+                    row("assistant", "New mid."),
+                    bash(),
+                    row("assistant", "Running."),
+                ],
+                cx,
+            );
+            view.set_yielded(1, cx);
+            let hidden =
+                |view: &TranscriptView| [1, 3, 5, 7, 9, 11].map(|at| view.mono_prose_hidden(at));
+            assert!(!view.mono_prose_hidden(11), "the live final reply shows");
+            assert!(view.mono_prose_hidden(9), "live mid-run commentary hides");
+            assert!(
+                view.mono_prose_hidden(3),
+                "an earlier turn's commentary hides"
+            );
+            assert!(!view.mono_prose_hidden(5), "an earlier turn's answer shows");
+            let yielded = hidden(view);
+
+            view.entrances.clear();
+            view.streaming(false, cx);
+            assert_eq!(hidden(view), yielded, "nothing flips when the run settles");
+            assert!(
+                !view.entrances.contains_key(&11),
+                "the shown reply does not enter again on settle"
+            );
+        });
+
+        let view = cx.new(|_| {
+            let mut view = TranscriptView::new();
+            view.mono_mode("cat", 0xe86b5f, "MonoCat");
+            view
+        });
+        view.update(cx, |view, cx| {
+            let bash = || {
+                let mut call = ToolCall::new("t", "Bash");
+                call.input = r#"{"command":"ls"}"#.into();
+                row("tool", &serde_json::to_string(&call).unwrap())
+            };
+            view.patch(0, vec![row("mono-system", "Session 7 finished")], cx);
+            view.streaming(true, cx);
+            view.patch(
+                1,
+                vec![
+                    row("assistant", "Checking."),
+                    bash(),
+                    row("assistant", "Mid note."),
+                    bash(),
+                    row("assistant", "Done."),
+                ],
+                cx,
+            );
+            view.set_yielded(1, cx);
+            assert!(view.mono_prose_hidden(1), "notification commentary hides");
+            assert!(view.mono_prose_hidden(3), "notification commentary hides");
+            assert!(!view.mono_prose_hidden(5), "its final message shows");
+            let yielded = [1, 3, 5].map(|at| view.mono_prose_hidden(at));
+            view.streaming(false, cx);
+            assert_eq!(
+                [1, 3, 5].map(|at| view.mono_prose_hidden(at)),
+                yielded,
+                "nothing flips when the run settles"
+            );
+        });
+
+        let view = cx.new(|_| {
+            let mut view = TranscriptView::new();
+            view.mono_mode("cat", 0xe86b5f, "MonoCat");
+            view
+        });
+        view.update(cx, |view, cx| {
+            view.patch(0, vec![row("user", "Go")], cx);
+            view.streaming(true, cx);
+            view.patch(1, vec![row("assistant", "Running.")], cx);
+            view.set_yielded(1, cx);
+            assert!(!view.mono_prose_hidden(1));
+            // The tasks finish and Claude only says one more thing.
+            view.set_yielded(0, cx);
+            view.patch(2, vec![row("assistant", "It finished.")], cx);
+            assert!(
+                !view.mono_prose_hidden(1),
+                "a text follow-up keeps it shown"
+            );
+            view.entrances.clear();
+            view.streaming(false, cx);
+            assert!(!view.mono_prose_hidden(1), "settling does not hide it");
+            assert!(
+                !view.entrances.contains_key(&1),
+                "the reply does not enter again on settle"
+            );
         });
     }
 
