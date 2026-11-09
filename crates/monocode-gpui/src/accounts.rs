@@ -646,6 +646,20 @@ impl Accounts {
             session,
         });
     }
+    /// Marks `id` as the account new sessions of `kind` use when their project
+    /// has no choice of its own.
+    pub(crate) fn set_default(&mut self, kind: Kind, id: &str, cx: &mut Context<Self>) {
+        if self.working || self.book.preferred(kind) == id {
+            return;
+        }
+        let mut book = self.book.clone();
+        if let Err(error) = book.set_preferred(kind, id) {
+            self.error = Some(error);
+            cx.notify();
+            return;
+        }
+        self.persist(book, cx);
+    }
     pub(crate) fn start_edit(
         &mut self,
         kind: Kind,

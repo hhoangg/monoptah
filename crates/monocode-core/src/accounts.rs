@@ -254,6 +254,9 @@ impl Account {
 pub struct Book {
     pub accounts: Vec<Account>,
     pub selections: HashMap<String, HashMap<String, String>>,
+    /// Per provider id, the account new sessions use when a project has no
+    /// choice of its own. Missing or stale entries fall back to [`DEFAULT`].
+    pub defaults: HashMap<String, String>,
 }
 impl Book {
     pub fn list(&self, kind: Kind) -> Vec<Account> {
@@ -340,15 +343,43 @@ impl Book {
                 selections.remove(kind.id());
             }
         }
+        if self.defaults.get(kind.id()).is_some_and(|v| v == id) {
+            self.defaults.remove(kind.id());
+        }
         Ok(())
     }
+    /// The account for a new session in `project`: the project's own choice,
+    /// else the provider's default account.
     pub fn selected(&self, kind: Kind, project: &str) -> String {
+        self.chosen(kind, project)
+            .unwrap_or_else(|| self.preferred(kind))
+    }
+    /// Only the project's explicit, still-existing choice.
+    pub(crate) fn chosen(&self, kind: Kind, project: &str) -> Option<String> {
         self.selections
             .get(&project_key(project))
             .and_then(|s| s.get(kind.id()))
             .filter(|id| self.exists(kind, id))
             .cloned()
+    }
+    /// The account marked as default for `kind`, or the provider CLI profile.
+    pub fn preferred(&self, kind: Kind) -> String {
+        self.defaults
+            .get(kind.id())
+            .filter(|id| self.exists(kind, id))
+            .cloned()
             .unwrap_or_else(default_id)
+    }
+    pub fn set_preferred(&mut self, kind: Kind, id: &str) -> Result<(), String> {
+        if !self.exists(kind, id) {
+            return Err("Provider account no longer exists".into());
+        }
+        if id == DEFAULT {
+            self.defaults.remove(kind.id());
+        } else {
+            self.defaults.insert(kind.id().into(), id.into());
+        }
+        Ok(())
     }
     pub fn select(&mut self, kind: Kind, project: &str, id: &str) -> Result<(), String> {
         if !self.exists(kind, id) {

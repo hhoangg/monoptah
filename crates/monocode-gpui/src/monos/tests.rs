@@ -6022,3 +6022,47 @@ fn imports_respect_the_habit_limit(cx: &mut TestAppContext) {
     assert!(over.is_err());
     assert_eq!(habits::load(&s.root, &s.id).unwrap().len(), habits::MAX);
 }
+
+/// A new Mono's chat starts on the provider's default account, not the CLI
+/// login: its settings arrive through `install_transfer`, which marks the chat
+/// loaded, so `load` never gets to apply the account selection.
+#[gpui::test]
+fn a_new_mono_chat_starts_on_the_providers_default_account(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("native-monos-{}", mono::new_id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let project = dir.to_string_lossy().to_string();
+    let store = Arc::new(Mutex::new(Store::open(&dir.join("native.sqlite")).unwrap()));
+    let cwd = project.clone();
+    let window = cx.update(|cx| {
+        cx.open_window(Default::default(), |_, cx| {
+            cx.new(|cx| Shell::new(store, Vec::new(), cwd, None, cx))
+        })
+        .unwrap()
+    });
+    cx.run_until_parked();
+    let (manager, account) = window
+        .update(cx, |shell, _, cx| {
+            let center = crate::accounts::get(cx).unwrap();
+            let account = center.update(cx, |center, _| {
+                let account = center.book.add(Kind::Codex, "Token").unwrap();
+                center.book.set_preferred(Kind::Codex, &account.id).unwrap();
+                account.id
+            });
+            (shell.mono_manager(), account)
+        })
+        .unwrap();
+    let handle: gpui::AnyWindowHandle = window.into();
+    handle
+        .update(cx, |_, w, cx| {
+            manager.update(cx, |m, cx| m.create(vec![project.clone()], w, cx))
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let m = manager.read(cx);
+        let id = m.current().unwrap().id.clone();
+        let chat = m.chats[&id].read(cx);
+        assert_eq!(chat.summary.provider, "codex");
+        assert_eq!(chat.settings.account.id, account);
+    });
+}

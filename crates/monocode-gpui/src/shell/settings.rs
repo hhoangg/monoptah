@@ -31,16 +31,10 @@ impl Shell {
                         .cloned()
                 })
             });
-        let mut profiles: HashMap<_, _> = Kind::ALL
-            .into_iter()
-            .map(|kind| {
-                (
-                    kind,
-                    crate::accounts::get(cx)
-                        .map(|center| center.read(cx).selected(kind, &self.workspace.project).id)
-                        .unwrap_or_else(|| monocode_core::accounts::DEFAULT.into()),
-                )
-            })
+        let accounts = self.settings_profiles(cx);
+        let mut profiles: HashMap<_, _> = accounts
+            .iter()
+            .map(|(kind, profile)| (*kind, profile.id.clone()))
             .collect();
         if let Some(active) = &active {
             let v = active.read(cx);
@@ -62,6 +56,18 @@ impl Shell {
             let models = session.settings_models();
             if !models.is_empty() {
                 catalogs.insert(session.summary.provider.clone(), models);
+            }
+        }
+        // Without an open session, use the catalog discovered for the account
+        // new sessions will use (see `prefetch_settings_catalogs`).
+        for (kind, profile) in &accounts {
+            if catalogs.contains_key(kind.id()) {
+                continue;
+            }
+            let models =
+                monocode_core::catalog::cached_models_for(*kind, profile).unwrap_or_default();
+            if !models.is_empty() {
+                catalogs.insert(kind.id().into(), settings_rows(*kind, &models));
             }
         }
         SettingsContext {
@@ -149,6 +155,7 @@ impl Shell {
         let context = self.settings_context(cx);
         let prefs = self.workspace.preferences.clone();
         let view = cx.new(|cx| SettingsView::new(section, prefs, context, cx));
+        self.prefetch_settings_catalogs(cx);
         self.settings_events = Some(cx.subscribe_in(
             &view,
             window,
@@ -295,6 +302,51 @@ impl Shell {
         self.sidebar_fraction = 1.;
         window.focus(&view.focus_handle(cx), cx);
         this_update(self, cx);
+    }
+    /// The account each provider's new sessions use in the current project.
+    fn settings_profiles(&self, cx: &App) -> Vec<(Kind, monocode_core::accounts::Profile)> {
+        Kind::ALL
+            .into_iter()
+            .map(|kind| {
+                let profile = crate::accounts::get(cx)
+                    .map(|center| center.read(cx).selected(kind, &self.workspace.project))
+                    .unwrap_or_default();
+                (kind, profile)
+            })
+            .collect()
+    }
+    /// Settings lists models per Agent CLI, but only open sessions carried a
+    /// catalog. Discover the rest for the account new sessions use (which may
+    /// be a setup-token account), so a provider without a session is not
+    /// shown with no models and cannot be made the default.
+    pub(super) fn prefetch_settings_catalogs(&mut self, cx: &mut Context<Self>) {
+        // Tests must never start an installed provider CLI.
+        if cfg!(test) {
+            return;
+        }
+        let shown = self.settings_context(cx).catalogs;
+        let missing: Vec<_> = self
+            .settings_profiles(cx)
+            .into_iter()
+            .filter(|(kind, _)| !shown.contains_key(kind.id()))
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let work = cx.background_executor().spawn(async move {
+            for (kind, profile) in missing {
+                if monocode_core::provider::resolve(kind).is_some() {
+                    // Fills the account-scoped cache that settings_context reads;
+                    // a failure leaves the provider as before.
+                    let _ = monocode_core::catalog::models_for(kind, &profile);
+                }
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            work.await;
+            let _ = this.update(cx, |this, cx| this.sync_settings(cx));
+        })
+        .detach();
     }
     pub(super) fn select_settings(&mut self, section: Section, cx: &mut Context<Self>) {
         if let Some(view) = &self.settings {
@@ -579,6 +631,22 @@ fn this_update(this: &mut Shell, cx: &mut Context<Shell>) {
     this.invalidate_chrome(cx);
     this.update_chat_visibility(cx);
     cx.notify();
+}
+
+/// A discovered catalog as the Settings model menus list it: id and name.
+pub(super) fn settings_rows(
+    kind: Kind,
+    models: &[monocode_core::catalog::Model],
+) -> Vec<(String, String)> {
+    models
+        .iter()
+        .map(|m| {
+            (
+                m.id.clone(),
+                crate::pickers::model_display_name(kind, &m.id, &m.name).to_string(),
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
