@@ -364,7 +364,7 @@ impl Shell {
             .clone()
             .filter(|_| right_shown && self.settings.is_none())
             .map(|panel| self.right_panel_frame(panel, right_width, full, window, cx));
-        let footer = (!self.classic_surface_open(cx)).then(|| self.footer_row(cx));
+        let footer = self.classic_footer_shown().then(|| self.footer_row(cx));
         let spans_window = self.classic_titlebar_spans_window(cx);
         let original = self.workspace.classic_layout;
         let compact_surface = cfg!(target_os = "macos")

@@ -10,6 +10,14 @@ impl Shell {
                 || self.mono_active(cx))
     }
 
+    /// The usage/terminal footer sits under every chat composer, so a Mono
+    /// chat keeps it like a session does; settings, app views and search hide it.
+    pub(super) fn classic_footer_shown(&self) -> bool {
+        // Same as classic_surface_open, minus the Mono chat.
+        !self.workspace.classic_layout
+            || (self.settings.is_none() && !self.app_view_open() && !self.search_page())
+    }
+
     pub(super) fn session_sidebar_available(&self, cx: &App) -> bool {
         !self.classic_surface_open(cx)
     }

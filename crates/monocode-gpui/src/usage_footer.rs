@@ -862,6 +862,7 @@ impl Render for UsageFooter {
         let classic = self.classic;
         div()
             .id("usage-footer")
+            .debug_selector(|| "usage-footer".into())
             .role(Role::Group)
             .aria_label("Provider usage")
             .h(px(if classic { 28. } else { 30. }))
