@@ -773,6 +773,9 @@ impl Monos {
                 );
                 return;
             }
+            "accounts.list" => crate::accounts::get(cx)
+                .ok_or_else(|| "Provider accounts are unavailable".to_owned())
+                .and_then(|center| center.read(cx).app_list(&input)),
             "sessions.start" => {
                 self.start_call(call, &input, mono, project, source, cx);
                 return;
@@ -1416,6 +1419,19 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
             settings.account = crate::accounts::get(cx)
                 .map(|center| center.read(cx).selected(kind, &project))
                 .unwrap_or_default();
+        }
+        // An explicit account (a Mono's own request) wins over inheritance and the project's
+        // choice. It is resolved against the same book the GUI uses and before the model
+        // catalog below, so models are validated for the chosen account.
+        if let Some(selector) = input.get("account").and_then(Value::as_str) {
+            if cloud.is_some() {
+                return Err(mono::api::ACCOUNT_LOCAL_ONLY.into());
+            }
+            let center = crate::accounts::get(cx).ok_or("Provider accounts are unavailable")?;
+            let center = center.read(cx);
+            let id = monocode_core::accounts::resolve(&center.book, kind, selector)
+                .map_err(|error| error.to_string())?;
+            settings.account = center.profile(&id);
         }
         let launches = mono.launches.clone();
         let draft = flag(&input, "draft", false);

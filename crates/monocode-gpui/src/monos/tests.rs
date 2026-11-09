@@ -6066,3 +6066,161 @@ fn a_new_mono_chat_starts_on_the_providers_default_account(cx: &mut TestAppConte
         assert_eq!(chat.settings.account.id, account);
     });
 }
+
+fn catalog_model(id: &str) -> monocode_core::catalog::Model {
+    monocode_core::catalog::Model {
+        id: id.into(),
+        name: id.into(),
+        alias_target: None,
+        efforts: Vec::new(),
+        default_effort: None,
+        fast: false,
+        thinking: false,
+        default: true,
+        tiers: Vec::new(),
+        controls: Vec::new(),
+    }
+}
+/// Adds named Claude accounts and Codex ones (fakes: no credential is stored) and returns
+/// their ids as `(work, home, codex)`.
+fn add_accounts(s: &Setup, cx: &mut TestAppContext) -> (String, String, String) {
+    s.window
+        .update(cx, |_, _, cx| {
+            crate::accounts::get(cx).unwrap().update(cx, |center, _| {
+                let work = center.book.add(Kind::Claude, "Work account").unwrap().id;
+                let home = center.book.add(Kind::Claude, "Home").unwrap().id;
+                let codex = center.book.add(Kind::Codex, "Codex Pro").unwrap().id;
+                center.book.set_preferred(Kind::Claude, &home).unwrap();
+                (work, home, codex)
+            })
+        })
+        .unwrap()
+}
+fn started_account(s: &Setup, started: &Value, cx: &mut TestAppContext) -> String {
+    let child = started["sessionId"].as_i64().unwrap();
+    cx.update(|cx| {
+        let owner = s.manager.read(cx).owner.upgrade().unwrap();
+        let view = owner.read(cx).mono_session_entity(child).unwrap();
+        let live = view.read(cx).settings.account.id.clone();
+        let saved = locked(&s.store)
+            .unwrap()
+            .agent_settings(child)
+            .unwrap()
+            .map(|settings| settings.account.id);
+        assert_eq!(saved.as_deref(), Some(live.as_str()), "persisted account");
+        live
+    })
+}
+
+#[gpui::test]
+fn sessions_start_runs_with_the_named_account_and_validates_models_against_it(
+    cx: &mut TestAppContext,
+) {
+    let s = setup(cx);
+    let (work, home, codex) = add_accounts(&s, cx);
+    cx.update(|cx| {
+        let center = crate::accounts::get(cx).unwrap();
+        let center = center.read(cx);
+        for (id, model) in [(&work, "only-work-model"), (&home, "only-home-model")] {
+            monocode_core::catalog::seed_cached(
+                Kind::Claude,
+                &center.profile(id),
+                vec![catalog_model(model)],
+            );
+        }
+    });
+    let base = json!({"project":s.project,"prompt":"Go","draft":true,"harness":"claude"});
+    let with = |extra: Value| {
+        let mut input = base.clone();
+        input.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        input
+    };
+    // Label, case-insensitive; the account wins over the provider default (home).
+    let started = start(&s, "acc-label", with(json!({"account":"  work   ACCOUNT "})), cx).unwrap();
+    assert_eq!(started_account(&s, &started, cx), work);
+    // Exact id.
+    let started = start(&s, "acc-id", with(json!({"account":home})), cx).unwrap();
+    assert_eq!(started_account(&s, &started, cx), home);
+    // The literal default is the CLI login.
+    let started = start(&s, "acc-default", with(json!({"account":"default"})), cx).unwrap();
+    assert_eq!(started_account(&s, &started, cx), "default");
+    // Without account the provider default account still applies (PR #62).
+    let started = start(&s, "acc-none", base.clone(), cx).unwrap();
+    assert_eq!(started_account(&s, &started, cx), home);
+    // A model only the chosen account lists is accepted, and one it lacks is refused.
+    let started = start(
+        &s,
+        "acc-model-ok",
+        with(json!({"account":"Work account","model":"only-work-model"})),
+        cx,
+    )
+    .unwrap();
+    assert_eq!(started_account(&s, &started, cx), work);
+    let before = session_count(&s);
+    let refused = start(
+        &s,
+        "acc-model-bad",
+        with(json!({"account":"Work account","model":"only-home-model"})),
+        cx,
+    )
+    .unwrap_err();
+    assert!(refused.contains("Unknown model"), "{refused}");
+    assert_eq!(session_count(&s), before, "a refused start leaves no row");
+    // Errors name the provider and list valid choices; another provider's account says so.
+    let unknown = start(&s, "acc-unknown", with(json!({"account":"Wor"})), cx).unwrap_err();
+    assert!(unknown.contains("Work account") && unknown.contains(&work), "{unknown}");
+    let other = start(&s, "acc-other", with(json!({"account":"Codex Pro"})), cx).unwrap_err();
+    assert!(other.contains("belongs to codex"), "{other}");
+    let other_id = start(&s, "acc-other-id", with(json!({"account":codex})), cx).unwrap_err();
+    assert!(other_id.contains("belongs to codex"), "{other_id}");
+    // A harness without accounts.
+    let none = start(&s, "acc-cursor", with(json!({"account":"x","harness":"cursor"})), cx)
+        .unwrap_err();
+    assert!(none.contains("does not support provider accounts"), "{none}");
+    assert_eq!(session_count(&s), before, "no refusal left a row");
+    // Codex resolves against its own accounts.
+    let started = start(
+        &s,
+        "acc-codex",
+        with(json!({"account":"codex pro","harness":"codex"})),
+        cx,
+    )
+    .unwrap();
+    assert_eq!(started_account(&s, &started, cx), codex);
+}
+
+#[gpui::test]
+fn accounts_list_returns_ids_labels_and_kinds_only(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let (work, home, codex) = add_accounts(&s, cx);
+    let listed = call(&s, "list-all", "accounts.list", json!({}), cx)
+        .try_recv()
+        .unwrap()
+        .unwrap();
+    let rows = listed["accounts"].as_array().unwrap();
+    let row = |id: &str| rows.iter().find(|r| r["id"] == id).unwrap();
+    assert_eq!(row(&work)["label"], "Work account");
+    assert_eq!(row(&home)["isDefault"], true);
+    assert_eq!(row(&work)["isDefault"], false);
+    assert_eq!(row("default")["provider"], "claude");
+    assert_eq!(row(&codex)["authKind"], "cli");
+    let claude = call(&s, "list-claude", "accounts.list", json!({"provider":"claude"}), cx)
+        .try_recv()
+        .unwrap()
+        .unwrap();
+    assert!(
+        claude["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["provider"] == "claude")
+    );
+    for bad in [json!({"provider":"cursor"}), json!({"provider":"nope"})] {
+        assert!(
+            call(&s, "list-bad", "accounts.list", bad, cx)
+                .try_recv()
+                .unwrap()
+                .is_err()
+        );
+    }
+}

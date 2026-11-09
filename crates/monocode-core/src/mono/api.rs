@@ -1,13 +1,16 @@
 use super::cloud_api::validate as cloud;
 use serde_json::Value;
+/// Refusal for `sessions.start` with both `account` and a cloud `target`.
+pub const ACCOUNT_LOCAL_ONLY: &str = "account applies to local sessions only; a cloud session uses the cloud setup (the API key or setup token configured for Codespaces or Docker Sandbox)";
 /// Reject misspelled fields and ambiguous types before any app mutation.
 pub fn validate(action: &str, input: &Value) -> Result<(), String> {
     let cloud_fields;
     let fields=match action{
         "models.list"|"soul.read"|"habits.list"=>"",
+        "accounts.list"=>"provider",
         "sessions.list"|"folders.list"|"worktrees.list"=>"project",
         "sessions.read"=>"sessionId project before limit maxChars",
-        "sessions.start"=>"prompt project harness model modelSettings effort runtimeMode title draft reveal workspaceMode worktreeBase worktreeCwd placement besideSessionId notifyOnComplete completionDelivery parentSessionId folderName folderId target",
+        "sessions.start"=>"prompt project harness model modelSettings effort runtimeMode title draft reveal workspaceMode worktreeBase worktreeCwd placement besideSessionId notifyOnComplete completionDelivery parentSessionId folderName folderId target account",
         action if action.starts_with("cloud.") => {
             cloud_fields = cloud::fields(action).ok_or("Unknown app action. Run app help")?;
             cloud_fields.as_str()
@@ -141,8 +144,22 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             "removeWorktree and providerFiles cannot be combined; choose one per call".into(),
         );
     }
+    if let Some(account) = input.get("account") {
+        let account = account.as_str().unwrap_or_default();
+        if account.trim().is_empty() || account.chars().count() > 128 {
+            return Err("account must be a non-empty string of at most 128 characters".into());
+        }
+    }
+    if action == "accounts.list" {
+        if let Some(provider) = input.get("provider") {
+            crate::accounts::parse_provider(provider.as_str().unwrap_or_default())?;
+        }
+    }
     if let Some(target) = input.get("target") {
         cloud::validate_target(target, input)?;
+        if input.get("account").is_some() {
+            return Err(ACCOUNT_LOCAL_ONLY.into());
+        }
     }
     if action.starts_with("cloud.") {
         cloud::validate_action(action, input)?;
@@ -226,6 +243,58 @@ mod tests {
             &json!({"prompt":"x","project":"/code","draft":true})
         )
         .is_ok());
+    }
+    #[test]
+    fn account_is_bounded_text_for_local_starts_only() {
+        let start = |input| validate("sessions.start", &input);
+        assert!(start(json!({"prompt":"x","account":"Work"})).is_ok());
+        assert!(start(json!({"prompt":"x","account":"a".repeat(128)})).is_ok());
+        for bad in [
+            json!(""),
+            json!("  "),
+            json!("a".repeat(129)),
+        ] {
+            assert_eq!(
+                start(json!({"prompt":"x","account":bad})).unwrap_err(),
+                "account must be a non-empty string of at most 128 characters"
+            );
+        }
+        for bad in [json!(1), json!(null), json!(true)] {
+            assert_eq!(
+                start(json!({"prompt":"x","account":bad})).unwrap_err(),
+                "account must be text"
+            );
+        }
+        for target in [
+            json!({"kind":"codespace","instance":"new"}),
+            json!({"kind":"codespace","instance":"my-box"}),
+            json!({"kind":"sandbox","instance":{"session":5}}),
+            json!({"kind":"sandbox"}),
+        ] {
+            assert_eq!(
+                start(json!({"prompt":"x","account":"Work","target":target})).unwrap_err(),
+                ACCOUNT_LOCAL_ONLY
+            );
+        }
+        assert_eq!(
+            validate("sessions.send", &json!({"sessionId":1,"account":"Work"})).unwrap_err(),
+            "sessions.send does not take account"
+        );
+    }
+    #[test]
+    fn accounts_list_takes_an_optional_account_capable_provider() {
+        let list = |input| validate("accounts.list", &input);
+        assert!(list(json!({})).is_ok());
+        assert!(list(json!({"provider":"claude"})).is_ok());
+        assert!(list(json!({"provider":"codex"})).is_ok());
+        assert!(list(json!({"provider":"devin"})).is_ok());
+        for bad in [json!("cursor"), json!("nope"), json!(1), json!("")] {
+            assert!(list(json!({"provider":bad})).is_err());
+        }
+        assert_eq!(
+            list(json!({"bogus":1})).unwrap_err(),
+            "accounts.list does not take bogus"
+        );
     }
     #[test]
     fn provider_files_is_a_boolean_on_delete_only() {

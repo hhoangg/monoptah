@@ -500,3 +500,15 @@ fn follow_ups_of_a_remote_session_with_a_draft_load_on_a_shared_store() {
     let state = store.follow_ups(session.id).unwrap();
     assert_eq!(state.draft.unwrap().text, "Do the thing");
 }
+
+#[test]
+fn operator_is_refused_an_account_but_may_list_accounts() {
+    assert_eq!(
+        validate_operator("sessions.start", &json!({"prompt":"x","account":"Work"})).unwrap_err(),
+        "account is available to Monos only"
+    );
+    assert!(validate_operator("sessions.start", &json!({"prompt":"x"})).is_ok());
+    assert!(validate_operator("accounts.list", &json!({})).is_ok());
+    assert!(validate_operator("accounts.list", &json!({"provider":"claude"})).is_ok());
+    assert!(validate_operator("accounts.list", &json!({"provider":"cursor"})).is_err());
+}

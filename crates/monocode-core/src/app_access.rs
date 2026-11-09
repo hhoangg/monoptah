@@ -16,6 +16,7 @@ pub fn validate_operator(action: &str, input: &Value) -> Result<(), String> {
     if !matches!(
         action,
         "models.list"
+            | "accounts.list"
             | "sessions.list"
             | "sessions.read"
             | "sessions.start"
@@ -52,6 +53,9 @@ pub fn validate_operator(action: &str, input: &Value) -> Result<(), String> {
     }
     if input["providerFiles"] == true {
         return Err("Removing provider session files is only available to a Mono".into());
+    }
+    if input.get("account").is_some() {
+        return Err("account is available to Monos only".into());
     }
     Ok(())
 }
