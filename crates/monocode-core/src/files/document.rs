@@ -1,10 +1,11 @@
 //! Bounded file reads and atomic editor saves, extracted from Tauri's fs service.
 use super::*;
 use std::io::Read;
+use std::sync::atomic::AtomicBool;
 
 pub const MAX_TEXT_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_LINE_BYTES: usize = 16 * 1024;
-const MAX_PREVIEW_BYTES: u64 = 32 * 1024 * 1024;
+pub(super) const MAX_PREVIEW_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct TextDocument {
@@ -84,8 +85,18 @@ pub fn resolve_path(path: &Path, cwd: &Path) -> PathBuf {
 }
 
 pub fn read_document(path: &Path) -> Result<Document, String> {
+    read_document_with(path, &mut |_, _| {}, &AtomicBool::new(false))
+}
+
+/// [`read_document`] that reports `(done, total)` bytes of a remote read after every
+/// chunk and stops with [`super::remote_read::READ_CANCELLED`] once `cancel` is set.
+pub fn read_document_with(
+    path: &Path,
+    progress: &mut dyn FnMut(u64, u64),
+    cancel: &AtomicBool,
+) -> Result<Document, String> {
     if super::remote::is_remote(path) {
-        let bytes = read_remote_bytes(path)?;
+        let bytes = super::remote_read::read_default(path, progress, cancel)?;
         if is_video_path(path) {
             #[derive(Deserialize)]
             #[serde(rename_all = "camelCase")]
@@ -160,19 +171,6 @@ pub fn read_document(path: &Path) -> Result<Document, String> {
         ));
     }
     document_from_bytes(&path, bytes, MAX_TEXT_BYTES)
-}
-
-fn read_remote_bytes(path: &Path) -> Result<Vec<u8>, String> {
-    use base64::Engine;
-    let encoded: String =
-        super::remote::command("read_binary_file", serde_json::json!({"path":path}))?;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .map_err(|error| format!("Invalid remote file content: {error}"))?;
-    if bytes.len() > 10 * 1024 * 1024 {
-        return Err("File is too large to preview (maximum 10 MB).".into());
-    }
-    Ok(bytes)
 }
 
 fn document_from_bytes(
@@ -304,7 +302,9 @@ pub fn save_document(path: &Path, document: &TextDocument, text: &str) -> Result
         return Err("Text exceeds the editor size limit.".into());
     }
     if super::remote::is_remote(path) {
-        if read_remote_bytes(path)? != document.disk {
+        let current =
+            super::remote_read::read_default(path, &mut |_, _| {}, &AtomicBool::new(false))?;
+        if current != document.disk {
             return Err("The file changed on disk. Reload it before saving your edits.".into());
         }
         let bytes = document.encode(text);

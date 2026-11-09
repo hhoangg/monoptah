@@ -38,7 +38,7 @@ pub(crate) fn command<T: DeserializeOwned>(command: &str, args: Value) -> Result
         .map_err(|error| format!("Invalid remote workspace response: {error}"))
 }
 
-fn workspace_error(error: String) -> String {
+pub(super) fn workspace_error(error: String) -> String {
     let lower = error.to_ascii_lowercase();
     if [
         "unsupported host method",
