@@ -1465,7 +1465,7 @@ ticket, after review and after merge.
 | F4-0 | 1 | todo | - | needs the user's OK (model requests) |
 | F4-J | 1 | merged | csi-f4-j | merge 307d3d84. Opus review: no blockers; fixed install race re-decide, fsync, edge fixtures as TS contract (duplicate key line is skipped), rewrite_cwd escaping, orphan fork cleanup. Known: incoming strictly shorter than existing = Diverged (per spec); fork does not copy file-history/<id>; .pre-cloud overwritten on second replace. |
 | F4-1 | 1 | todo | - | |
-| A1 | 1 | todo | - | needs step 0 (`origin/main` merge); local sessions only, account + cloud target = validation error |
+| A1 | 1 | merged | csi-a1 | merge 740e6434. Local only. Opus review x2: fixed mention insertion picking another credential (id form when label ambiguous/reserved), icon only for resolved accounts, quote labels use id form. Pending, needs the user: manual verification (real accounts). Known Low: trailing punctuation can resolve to sibling label (x vs x.); steered Mono message uses last account snapshot (pre-existing path). |
 | HR1 | 2 | todo | - | release: stop and ask |
 | H2a | 2 | todo | - | |
 | H2b | 2 | todo | - | |
