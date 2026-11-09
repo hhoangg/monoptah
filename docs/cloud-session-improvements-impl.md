@@ -1456,7 +1456,7 @@ ticket, after review and after merge.
 
 | Ticket | Wave | Status | Worktree | Notes |
 |---|---|---|---|---|
-| F2-0 | 1 | todo | - | |
+| F2-0 | 1 | merged | csi-f2-0 | merge 835a1b89. Steps 1-4 done, Opus review clean. Pending, needs the user: step 5 manual check (panels in running app, idle timer); recorded in design 2.1/7. Follow-up for F2-1: reword git_gate::REFUSED copy (asserted in file_editor/tests.rs); docs/docker-sandbox-spec.html lines ~1659,3598,3903 still say local checkout. list_dir cap: 5000 entries, hard error. |
 | F1-2 | 1 | merged | csi-f1-2 | merge 3ce07020. Opus review clean; added remote:// convert test. convert.rs store fallback for remote://-form worktree_cwd now works (was dead code). native:check green in ticket worktree; re-run on integration branch pending after wave batch. |
 | F1-3 | 1 | todo | - | |
 | H1 | 1 | merged | csi-h1 | merge 9b6cba91. Opus review: fixed first-release tag path, gh not-found check, dirty tree on commit fail. actionlint unavailable. Note: describe.host.version is bare X.Y.Z; --version prints X.Y.Z+monoptah. |
