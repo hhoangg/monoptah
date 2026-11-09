@@ -275,6 +275,8 @@ pub fn build_inventory_budgeted(
     let started = Clock {
         started: Instant::now(),
         budget,
+        raw_home: &roots.home,
+        project: &roots.project,
     };
     let home = std::fs::canonicalize(&roots.home).unwrap_or_else(|_| roots.home.clone());
     let sources = sources(roots);
@@ -367,9 +369,14 @@ enum ItemKind {
 
 /// The scan deadline, shared by every item of one inventory.
 #[derive(Clone, Copy)]
-struct Clock {
+struct Clock<'a> {
     started: Instant,
     budget: Duration,
+    /// `roots.home` as given, before canonicalizing (it may sit behind a link such as
+    /// macOS `/var`).
+    raw_home: &'a Path,
+    /// The local project; an item inside it may link anywhere inside it.
+    project: &'a Path,
 }
 
 struct Scan {
@@ -381,7 +388,7 @@ struct Scan {
 
 /// Walk one skill or plugin directory. Files come back sorted, so every later step is
 /// deterministic. Symlinks are resolved, and a link that leaves `home` excludes the item.
-fn scan_item(root: &Path, kind: ItemKind, home: &Path, started: Clock) -> Scan {
+fn scan_item(root: &Path, kind: ItemKind, home: &Path, started: Clock<'_>) -> Scan {
     let mut scan = Scan {
         files: Vec::new(),
         size: 0,
@@ -393,14 +400,13 @@ fn scan_item(root: &Path, kind: ItemKind, home: &Path, started: Clock) -> Scan {
         ItemKind::Plugin => MAX_PLUGIN_BYTES,
     };
     // The item root may live anywhere (a project outside `$HOME`, a plugin installed
-    // elsewhere). Only links met while walking are held to `home`. A root that is itself
-    // a link out of `home` is refused, so callers pass a root they already trust.
+    // elsewhere). But a root whose own path is under `$HOME` must not resolve out of it
+    // through a link in any component (`~/.claude/skills -> /Volumes/x`).
     let Ok(real_root) = std::fs::canonicalize(root) else {
         return scan;
     };
-    if std::fs::symlink_metadata(root).is_ok_and(|m| m.file_type().is_symlink())
-        && !real_root.starts_with(home)
-    {
+    let named_inside = root.starts_with(home) || root.starts_with(started.raw_home);
+    if named_inside && !real_root.starts_with(home) {
         scan.exclusion = Some(Exclusion::LinkOutsideHome);
         return scan;
     }
@@ -410,8 +416,15 @@ fn scan_item(root: &Path, kind: ItemKind, home: &Path, started: Clock) -> Scan {
     let mut visited: HashSet<PathBuf> = HashSet::new();
     visited.insert(real_root.clone());
     let mut entries = 0usize;
+    // Links may stay inside the item, or inside the project when the item is a project
+    // item living outside `$HOME`.
+    let boundary = std::fs::canonicalize(started.project)
+        .ok()
+        .filter(|project| !named_inside && real_root.starts_with(project))
+        .unwrap_or_else(|| real_root.clone());
     walk(
         &real_root,
+        &boundary,
         kind,
         home,
         started,
@@ -427,9 +440,10 @@ fn scan_item(root: &Path, kind: ItemKind, home: &Path, started: Clock) -> Scan {
 #[allow(clippy::too_many_arguments)]
 fn walk(
     dir: &Path,
+    item_root: &Path,
     kind: ItemKind,
     home: &Path,
-    started: Clock,
+    started: Clock<'_>,
     cap: u64,
     visited: &mut HashSet<PathBuf>,
     entries: &mut usize,
@@ -466,7 +480,7 @@ fn walk(
             continue;
         };
         let (path, meta) = if meta.file_type().is_symlink() {
-            let real = match resolve_link(&path, home) {
+            let real = match resolve_link(&path, home, item_root) {
                 Link::Inside(real) => real,
                 Link::Outside => {
                     scan.exclusion = Some(Exclusion::LinkOutsideHome);
@@ -485,7 +499,9 @@ fn walk(
             if !visited.insert(path.clone()) {
                 continue;
             }
-            walk(&path, kind, home, started, cap, visited, entries, scan);
+            walk(
+                &path, item_root, kind, home, started, cap, visited, entries, scan,
+            );
         } else if meta.is_file() {
             scan.size += meta.len();
             if scan.size > cap {
@@ -511,9 +527,10 @@ enum Link {
 
 /// Resolve a symlink. Only a link that resolves outside `home` is refused; a dead one
 /// is simply skipped.
-fn resolve_link(path: &Path, home: &Path) -> Link {
+fn resolve_link(path: &Path, home: &Path, item_root: &Path) -> Link {
     match std::fs::canonicalize(path) {
-        Ok(real) if real.starts_with(home) => Link::Inside(real),
+        // Inside `home`, or inside the item itself (a root that lives outside `home`).
+        Ok(real) if real.starts_with(home) || real.starts_with(item_root) => Link::Inside(real),
         Ok(_) => Link::Outside,
         Err(_) => Link::Dead,
     }
@@ -580,7 +597,7 @@ fn skill_from_dir(
     source: KitSource,
     plugin: Option<String>,
     home: &Path,
-    started: Clock,
+    started: Clock<'_>,
 ) -> KitSkill {
     let scan = scan_item(dir, ItemKind::Skill, home, started);
     let (hash, compressed) = if scan.exclusion.is_none() {
@@ -619,7 +636,7 @@ fn skill_dirs(root: &Path) -> Vec<(String, PathBuf)> {
     out
 }
 
-fn collect_user_skills(source: &Source, home: &Path, started: Clock, out: &mut Vec<KitSkill>) {
+fn collect_user_skills(source: &Source, home: &Path, started: Clock<'_>, out: &mut Vec<KitSkill>) {
     for (name, dir) in skill_dirs(&source.dir.join("skills")) {
         // The account wins over `~/.claude` for the same name.
         if out
@@ -659,7 +676,12 @@ fn tracked_skill_names(project: &Path) -> Option<BTreeSet<String>> {
     Some(names)
 }
 
-fn collect_project_skills(roots: &KitRoots, home: &Path, started: Clock, out: &mut Vec<KitSkill>) {
+fn collect_project_skills(
+    roots: &KitRoots,
+    home: &Path,
+    started: Clock<'_>,
+    out: &mut Vec<KitSkill>,
+) {
     let tracked = tracked_skill_names(&roots.project).unwrap_or_default();
     for (name, dir) in skill_dirs(&roots.project.join(".claude/skills")) {
         // Committed skills arrive with the clone.
@@ -683,7 +705,7 @@ fn collect_plugin_skills(
     install_path: &Path,
     source: KitSource,
     home: &Path,
-    started: Clock,
+    started: Clock<'_>,
     out: &mut Vec<KitSkill>,
 ) {
     for (name, dir) in skill_dirs(&install_path.join("skills")) {
@@ -717,7 +739,7 @@ fn collect_plugins(
     source: &Source,
     roots: &KitRoots,
     home: &Path,
-    started: Clock,
+    started: Clock<'_>,
     out: &mut Vec<KitPlugin>,
 ) {
     let Some(registry) = crate::mcp::read_json(&source.dir.join("plugins/installed_plugins.json"))

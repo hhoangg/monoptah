@@ -826,6 +826,8 @@ fn a_project_outside_home_still_offers_its_skills() {
 #[test]
 fn a_plugin_installed_outside_home_as_a_real_dir_is_offered() {
     let env = env();
+    // Not canonicalized on purpose: on macOS the temp dir sits behind /var -> /private/var,
+    // and a root whose own path is outside home must still be offered.
     let outside = tempfile::tempdir().unwrap();
     write(&outside.path().join(".claude-plugin/plugin.json"), "{}");
     write_json(
@@ -881,4 +883,127 @@ fn committed_symlink_skills_count_as_committed() {
     assert_eq!(names, vec!["plain"]);
     #[cfg(not(unix))]
     let _ = names;
+}
+
+#[cfg(unix)]
+mod links {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn only_skill(env: &Env) -> KitSkill {
+        let inventory = build_inventory(&env.roots, Workspace::Codespace);
+        assert_eq!(inventory.skills.len(), 1, "{inventory:?}");
+        inventory.skills.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn parent_link_of_a_skills_root_out_of_home_is_refused() {
+        let env = env();
+        let outside = tempfile::tempdir().unwrap();
+        skill(&outside.path().join("skills"), "far", "x");
+        // ~/.claude/skills -> outside
+        symlink(
+            outside.path().join("skills"),
+            env.roots.claude_home.join("skills"),
+        )
+        .unwrap();
+        assert_eq!(only_skill(&env).exclusion, Some(Exclusion::LinkOutsideHome));
+    }
+
+    #[test]
+    fn parent_link_of_a_plugin_install_path_out_of_home_is_refused() {
+        let env = env();
+        let outside = tempfile::tempdir().unwrap();
+        write(&outside.path().join("foo/.claude-plugin/plugin.json"), "{}");
+        // ~/plug -> outside, installPath ~/plug/foo
+        symlink(outside.path(), env.roots.home.join("plug")).unwrap();
+        write_json(
+            &env.roots.claude_home.join("plugins/installed_plugins.json"),
+            json!({"version": 2, "plugins": {"p@mk": [{"scope": "user", "version": "1", "installPath": env.roots.home.join("plug/foo")}]}}),
+        );
+        write_json(
+            &env.roots.claude_home.join("settings.json"),
+            json!({"enabledPlugins": {"p@mk": true}}),
+        );
+        let inventory = build_inventory(&env.roots, Workspace::Codespace);
+        assert_eq!(
+            inventory.plugins[0].exclusion,
+            Some(Exclusion::LinkOutsideHome)
+        );
+    }
+
+    #[test]
+    fn relative_link_escaping_with_dotdot_is_refused() {
+        let env = env();
+        let skills = env.roots.claude_home.join("skills");
+        skill(&skills, "esc", "x");
+        let outside = tempfile::tempdir().unwrap();
+        write(&outside.path().join("f.txt"), "outside");
+        // A relative target that climbs out of home.
+        let depth = env
+            .roots
+            .claude_home
+            .join("skills/esc")
+            .components()
+            .count();
+        let mut target = PathBuf::new();
+        for _ in 0..depth {
+            target.push("..");
+        }
+        target.push(outside.path().strip_prefix("/").unwrap());
+        target.push("f.txt");
+        symlink(&target, skills.join("esc/rel.txt")).unwrap();
+        assert_eq!(only_skill(&env).exclusion, Some(Exclusion::LinkOutsideHome));
+    }
+
+    #[test]
+    fn link_chain_ending_outside_home_is_refused() {
+        let env = env();
+        let skills = env.roots.claude_home.join("skills");
+        skill(&skills, "chain", "x");
+        let outside = tempfile::tempdir().unwrap();
+        write(&outside.path().join("f.txt"), "outside");
+        // inside-home link -> inside-home link -> outside file
+        symlink(outside.path().join("f.txt"), env.roots.home.join("hop2")).unwrap();
+        symlink(env.roots.home.join("hop2"), env.roots.home.join("hop1")).unwrap();
+        symlink(env.roots.home.join("hop1"), skills.join("chain/c.txt")).unwrap();
+        assert_eq!(only_skill(&env).exclusion, Some(Exclusion::LinkOutsideHome));
+    }
+
+    #[test]
+    fn project_outside_home_may_link_inside_itself_but_not_out() {
+        let env = env();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let project = elsewhere.path().to_path_buf();
+        write(&project.join("shared/lib/util.txt"), "abc");
+        skill(&project.join(".claude/skills"), "foo", "x");
+        symlink(
+            "../../../shared/lib",
+            project.join(".claude/skills/foo/lib"),
+        )
+        .unwrap();
+        let roots = KitRoots {
+            project: project.clone(),
+            ..env.roots.clone()
+        };
+        let inventory = build_inventory(&roots, Workspace::Codespace);
+        assert_eq!(inventory.skills.len(), 1);
+        assert_eq!(inventory.skills[0].exclusion, None);
+        // SKILL.md (1) + util.txt (3)
+        assert_eq!(inventory.skills[0].size, 4);
+
+        // A link leaving both home and the project is still refused.
+        let other = tempfile::tempdir().unwrap();
+        write(&other.path().join("o.txt"), "o");
+        symlink(
+            other.path().join("o.txt"),
+            project.join(".claude/skills/foo/out.txt"),
+        )
+        .unwrap();
+        let inventory = build_inventory(&roots, Workspace::Codespace);
+        assert_eq!(
+            inventory.skills[0].exclusion,
+            Some(Exclusion::LinkOutsideHome)
+        );
+    }
 }
