@@ -403,14 +403,14 @@ step.** The fork ships its own Host precisely so that every cloud Host has
   - It disables every git write in Changes (`changes.rs:478,728,817`), Review
     (`review.rs:1300-1303,1400`) and editor hunks (`file_editor/diff.rs:82`).
   - It does not gate Explorer create/rename/delete or editor save.
-  - Banner: "Local files - this session runs in {codespace|sandbox} {name}"
-    (`shell/cloud.rs:620-626`).
-- **The panels already show the remote workspace. The banner is wrong, and that is a live
-  bug.** This was settled from the code during review; it is not yet confirmed in the
+  - Banner: now "Cloud files - {codespace|sandbox} {name}" (`shell/cloud.rs`
+    `banner_text`, fixed by F2-0; it used to say "Local files - this session runs in ...").
+- **The panels already show the remote workspace. The banner used to be wrong (fixed by
+  F2-0).** This was settled from the code during review; it is not yet confirmed in the
   running app.
-  - The banner, the gate comment (`git_gate.rs:3-5`) and the sandbox spec
-    (`docs/docker-sandbox-spec.html:1659,3598,3903`) all say the panels show the local
-    checkout. They do not:
+  - The banner and the gate comment (`git_gate.rs:3-5`) used to say, and the sandbox spec
+    (`docs/docker-sandbox-spec.html:1659,3598,3903`) still says, that the panels show the
+    local checkout. They do not:
     - `Shell::add_loaded` (`gpui/shell.rs:1585`) and `ensure_session`
       (`gpui/shell/session_loading.rs:50-65`) create a `Conversation` for every shown
       session.
@@ -420,15 +420,19 @@ step.** The fork ships its own Host precisely so that every cloud Host has
     - a Host worktree's `worktree_cwd` is built with `remote::remote_path`
       (`core/store/remote.rs:165`).
   - `working_copy()` is only the fallback when no session is active.
-  - So today Files and Changes list the **remote** tree, polled every 2 s, under a banner
-    saying "Local files".
+  - So Files and Changes list the **remote** tree, polled every 2 s (before F2-0 under a
+    banner saying "Local files").
   - `git_gate` blocks git writes to the **remote**. Meanwhile Explorer
     create/rename/delete and editor save **already write to the cloud workspace**, with no
     gate and the two-RPC conflict check only.
   - The existing test (`shell/cloud_tests.rs:1373-1396`) creates no `Conversation`, so it
     never covered this.
-  - F2-0 confirms it in the running app and fixes the banner wording right away (ticket
-    F2-0 below).
+  - F2-0 fixed the banner wording and added the missing tests (ticket F2-0 below). Result:
+    two GPUI tests (`shell/cloud_tests.rs`) create the `Conversation` entity through
+    `ensure_session` and assert that `ProjectGit`'s root is the `remote://` project key,
+    and the Host worktree path for a worktree session. They fail when `sync_git` is made
+    to use `working_copy()`. Manual check in the running app: manual check pending: needs
+    the user.
 - **Host:** has no file or git watcher on main (no `fs.watch` in `host/*.ts`).
   `origin/codex/event-driven-git-refresh` has one (§0.1).
 
@@ -461,7 +465,11 @@ enum PanelRoot {
 - Keep the lazy per-directory `list_dir`. The Host already filters with
   `git check-ignore` (`host/workspace.ts:117-154`) and confines paths to registered roots
   (`workspace-commands.ts:216-273`).
-- **Large directories.** I am not sure whether `list_dir` has a cap; F2-0 measures it.
+- **Large directories.** F2-0 result (read from the code): the Host `list_dir` has a hard
+  cap, not a truncation. `listHostFiles` (`host/workspace.ts`) reads the whole directory
+  and throws "Directory has too many entries to display" above 5,000 entries (before
+  `.DS_Store` is filtered), so the client gets an error and no partial listing. There is
+  no `limit` argument. The two items below still apply.
   - The design adds a per-folder cap of 5,000 entries with a "N more items…" row.
   - It is enforced client-side, and also Host-side as an optional `limit` argument when
     the capability `workspace.listDir.limit` is present.
@@ -509,7 +517,7 @@ enum PanelRoot {
 - **Not sure:** whether RPC traffic over the ssh tunnel counts as activity for the
   codespace idle timeout, or the sandbox `--ttl`. If it does, an open panel could keep a
   workspace alive, which costs money. The 10-minute input rule bounds that either way.
-  F2-0 measures it.
+  F2-0 result: manual check pending: needs the user.
 
 #### 2.2.3 Caching and offline
 
@@ -1556,9 +1564,13 @@ each batch ends with an explicit release-and-pin ticket (HR1-HR3).
 ## 7. Things I could not verify ("not sure")
 
 - **The running app:** the panels showing the remote tree for an open cloud session is
-  settled from the code (§2.1), not yet seen in the running app. F2-0.
+  settled from the code (§2.1) and pinned by two GPUI tests, not yet seen in the running
+  app. F2-0: manual check pending: needs the user.
+- **`list_dir` cap:** answered by F2-0 from the code. The Host rejects a directory with
+  more than 5,000 entries with an error ("Directory has too many entries to display");
+  it does not truncate and has no `limit` argument (`host/workspace.ts` `listHostFiles`).
 - **Idle timers:** whether tunnel RPC traffic resets the codespace idle timeout or the
-  sandbox `--ttl`. F2-0.
+  sandbox `--ttl`. F2-0: manual check pending: needs the user.
 - **MCP sign-ins:** where and in what format Claude Code stores MCP OAuth sign-ins
   (undocumented), and whether those servers rotate refresh tokens. F3-5a.
 - **Same session id across machines:** whether `--resume <id>` keeps the id and appends to

@@ -1372,7 +1372,7 @@ fn a_partial_delete_still_drops_the_sessions_and_keeps_the_warning(cx: &mut Test
 }
 
 #[gpui::test]
-fn files_and_git_say_they_are_local_and_refuse_writes_while_a_cloud_session_is_active(
+fn files_and_git_say_they_are_cloud_and_refuse_writes_while_a_cloud_session_is_active(
     cx: &mut TestAppContext,
 ) {
     let (window, id, _) = shell_with_cloud(cx);
@@ -1387,10 +1387,60 @@ fn files_and_git_say_they_are_local_and_refuse_writes_while_a_cloud_session_is_a
             shell.sync_cloud_panel(cx);
             assert_eq!(
                 panel.read(cx).cloud_banner(),
-                Some("Local files - this session runs in codespace octo-abc")
+                Some("Cloud files - codespace octo-abc")
             );
             assert!(!crate::git_gate::writes_allowed());
             assert_eq!(crate::git_gate::codespace().as_deref(), Some("octo-abc"));
+        })
+        .unwrap();
+}
+
+/// The panels follow the session in view: for a cloud session that is its `remote://`
+/// project key, so Files and Changes list the cloud workspace, not the local checkout.
+#[gpui::test]
+fn files_and_git_are_bound_to_the_remote_project_of_the_active_cloud_session(
+    cx: &mut TestAppContext,
+) {
+    let (window, id, _) = shell_with_cloud(cx);
+    window
+        .update(cx, |shell, _, cx| {
+            let cwd = shell.session_summaries[&id].cwd.clone();
+            assert!(cwd.starts_with("remote://"), "{cwd}");
+            shell.ensure_session(id, cx).expect("conversation");
+            shell.workspace.active = Some(id);
+            shell.sync_git(cx);
+            let root = shell.git.read(cx).project().to_owned();
+            assert_eq!(root, cwd);
+            assert_ne!(root, "/work/monocode");
+        })
+        .unwrap();
+}
+
+/// A session that runs in a Host worktree binds the panels to that worktree, which is
+/// also a `remote://` path.
+#[gpui::test]
+fn files_and_git_are_bound_to_the_host_worktree_of_the_active_cloud_session(
+    cx: &mut TestAppContext,
+) {
+    let (window, id, _) = shell_with_cloud(cx);
+    window
+        .update(cx, |shell, _, cx| {
+            let worktree =
+                monocode_core::remote::remote_path("env-octo-abc", "/workspaces/widgets-wt");
+            assert!(worktree.starts_with("remote://"), "{worktree}");
+            shell.session_worktrees.insert(id, Some(worktree.clone()));
+            let view = shell.ensure_session(id, cx).expect("conversation");
+            assert_eq!(
+                view.read(cx).settings.worktree_cwd.as_deref(),
+                Some(worktree.as_str())
+            );
+            shell.workspace.active = Some(id);
+            shell.sync_git(cx);
+            assert_eq!(shell.git.read(cx).project(), worktree);
+            assert_ne!(
+                shell.git.read(cx).project(),
+                shell.session_summaries[&id].cwd
+            );
         })
         .unwrap();
 }
@@ -2280,11 +2330,11 @@ fn the_archive_copy_names_the_sandbox_and_keeps_the_codespace_text_byte_identica
     assert_eq!(cloud::default_choice(0), ArchiveChoice::Stop);
     assert_eq!(
         cloud::banner_text(&CloudRef::sandbox("box")),
-        "Local files - this session runs in sandbox box"
+        "Cloud files - sandbox box"
     );
     assert_eq!(
         cloud::banner_text(&CloudRef::codespace("octo-abc")),
-        "Local files - this session runs in codespace octo-abc"
+        "Cloud files - codespace octo-abc"
     );
 }
 
