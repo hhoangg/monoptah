@@ -1374,6 +1374,30 @@ pub struct SandboxTerminal {
     pub remote: String,
 }
 
+/// The Host worktree a session runs in, as the store recorded it, unless that worktree was
+/// removed (then the session is back in the project folder). May still be a `remote://`
+/// path: see [`confine_host_cwd`].
+pub(crate) fn stored_worktree_cwd(settings: &crate::agent::Settings) -> Option<String> {
+    if settings.worktree_removed {
+        return None;
+    }
+    settings.worktree_cwd.clone().filter(|cwd| !cwd.is_empty())
+}
+
+/// A session's Host cwd: `cwd` (a Host path, or the `remote://<env>/<path>` form the store
+/// keeps) when it lies strictly inside the workspace folder `workspace_root` and is a valid
+/// remote path. Anything else is `None`, and the caller uses the project cwd.
+pub(crate) fn confine_host_cwd(cwd: &str, workspace_root: &str) -> Option<String> {
+    let cwd = match crate::remote::parse_remote_path(cwd.trim()) {
+        Some(remote) => remote.host_path,
+        None => cwd.to_owned(),
+    };
+    let cwd = cwd.trim_end_matches('/').to_owned();
+    (cwd.starts_with(&format!("{}/", workspace_root.trim_end_matches('/')))
+        && crate::codespaces::valid_remote_path(&cwd).is_ok())
+    .then_some(cwd)
+}
+
 impl CloudSessions {
     /// The folder that holds the workspaces of `cloud`: `/workspaces`, or for a sandbox
     /// without a devcontainer the parent of its checkout in the outer sandbox. Reads the

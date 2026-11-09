@@ -214,7 +214,11 @@ pub struct CloudFile {
     /// The Connections machine of the session's workspace.
     pub machine_id: String,
     pub project_id: String,
-    /// The session's remote cwd, the only root files are served from.
+    /// The session's Host worktree, sent as `cwd` in file reads; `None` when it runs in the
+    /// project folder (or its worktree was removed).
+    pub cwd: Option<String>,
+    /// The session's remote cwd (its worktree when it has one), the only root files are
+    /// served from.
     pub root: String,
     /// Path below `root`, `/` separated, every segment validated.
     pub rel: String,
@@ -384,12 +388,13 @@ impl<'a> Fetcher<'a> {
     /// Reads up to `length` bytes of `rel` at `offset`.
     fn range(&self, rel: &str, offset: u64, length: u64) -> Result<Chunk, ViewError> {
         if self.has_bytes()? {
-            let params = json!({
+            let mut params = json!({
                 "projectId": self.file.project_id,
                 "path": rel,
                 "offset": offset,
                 "length": length.min(CHUNK_BYTES),
             });
+            self.add_cwd(&mut params);
             return match self
                 .host
                 .request(&self.file.machine_id, "files.readBytes", params)
@@ -407,7 +412,8 @@ impl<'a> Fetcher<'a> {
         {
             return Err(ViewError::OldHost);
         }
-        let params = json!({"projectId": self.file.project_id, "path": rel});
+        let mut params = json!({"projectId": self.file.project_id, "path": rel});
+        self.add_cwd(&mut params);
         match self
             .host
             .request(&self.file.machine_id, "files.read", params)
@@ -421,6 +427,13 @@ impl<'a> Fetcher<'a> {
             )),
             Err(error) if super::is_not_connected(&error) => Err(self.map_error(error)),
             Err(_) => Err(ViewError::OldHost),
+        }
+    }
+
+    /// Adds the session's worktree `cwd` to file read `params`, when it has one.
+    fn add_cwd(&self, params: &mut Value) {
+        if let Some(cwd) = &self.file.cwd {
+            params["cwd"] = json!(cwd);
         }
     }
 
@@ -499,7 +512,7 @@ impl CloudSessions {
     /// Resolves a path mentioned in session `session_id` into a [`CloudFile`]. Reads the
     /// store and the machine list; sends nothing to the workspace.
     pub fn resolve_cloud_file(&self, session_id: i64, raw: &str) -> Result<CloudFile, ViewError> {
-        let (session, cache_dir) = {
+        let (session, cache_dir, settings) = {
             let store = self.store().map_err(ViewError::Failed)?;
             let session = store
                 .remote_session(session_id)
@@ -508,7 +521,10 @@ impl CloudSessions {
             let cache_dir = store
                 .cloud_cache_dir(session_id)
                 .map_err(ViewError::Failed)?;
-            (session, cache_dir)
+            let settings = store
+                .agent_settings(session_id)
+                .map_err(ViewError::Failed)?;
+            (session, cache_dir, settings)
         };
         let cloud = session.project.cloud().ok_or_else(|| {
             ViewError::Refused("This session does not run in a cloud workspace.".into())
@@ -516,7 +532,12 @@ impl CloudSessions {
         if is_pending_cloud_environment(&session.project.environment_id) {
             return Err(ViewError::Failed(super::startup::STILL_STARTING.into()));
         }
-        let root = session.project.cwd.clone();
+        // A session in a Host worktree reads from that worktree, not the project root.
+        let cwd = settings
+            .as_ref()
+            .and_then(super::stored_worktree_cwd)
+            .and_then(|cwd| super::confine_host_cwd(&cwd, &self.workspace_root_of(&cloud)));
+        let root = cwd.clone().unwrap_or_else(|| session.project.cwd.clone());
         // A `remote://<environment>/path` link must name this session's own machine.
         let raw = match crate::remote::parse_remote_path(raw.trim()) {
             Some(remote) if remote.environment_id == session.project.environment_id => {
@@ -548,6 +569,7 @@ impl CloudSessions {
             cloud,
             machine_id: machine.id,
             project_id: session.project.project_id.clone(),
+            cwd,
             root,
             rel,
             cache_dir,
