@@ -655,7 +655,7 @@ fn transport(config: &Value) -> &str {
         })
 }
 
-fn read_json(path: &Path) -> Option<Value> {
+pub(crate) fn read_json(path: &Path) -> Option<Value> {
     let raw = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&raw)
         .or_else(|_| serde_json::from_str(&strip_jsonc(&raw)))

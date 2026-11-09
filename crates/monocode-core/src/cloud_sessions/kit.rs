@@ -1,0 +1,1111 @@
+//! The global kit: what a local Claude setup can take to a cloud workspace.
+//!
+//! [`build_inventory`] lists skills, MCP servers and plugins for one local project and one
+//! provider account, and classifies each item (design 3.2.1, rules D6 and D7). It is pure
+//! reading: no network, no Keychain, no writes. Transfer is a later ticket.
+//!
+//! # Sources
+//!
+//! Each item is labelled with the [`KitSource`] it came from: the account's own config dir
+//! (`CLAUDE_CONFIG_DIR`) first, then the user's `~/.claude` (with `~/.claude.json`). When
+//! both define the same item the account wins. See design 7 for what is known about how
+//! Claude Code merges the two.
+//!
+//! # Secrets
+//!
+//! Every MCP `env` and `headers` value is a secret unless it is exactly a `${VAR}`
+//! reference, and so is a URL with a query string. Values live in [`Secret`], which
+//! redacts itself in `Debug` and `Display`, so an inventory is safe to log.
+
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::fmt;
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+use crate::accounts::Profile;
+use crate::provider::Kind;
+
+/// Largest single skill, measured on disk.
+pub const MAX_SKILL_BYTES: u64 = 10 * 1024 * 1024;
+/// Largest single plugin, measured on disk.
+pub const MAX_PLUGIN_BYTES: u64 = 25 * 1024 * 1024;
+/// Largest whole kit after compression.
+pub const MAX_KIT_COMPRESSED_BYTES: u64 = 50 * 1024 * 1024;
+/// Most entries walked for one skill or plugin.
+pub const MAX_ENTRIES_PER_ITEM: usize = 20_000;
+/// Most skills read from one directory.
+pub const MAX_SKILLS_PER_ROOT: usize = 5_000;
+/// Wall-clock budget for one inventory; later items are reported as timed out.
+pub const SCAN_BUDGET: Duration = Duration::from_secs(20);
+
+/// A value that must never be printed. `Debug` and `Display` both redact.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+    /// The real value. Call this only when sending it to the workspace.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Secret(<redacted>)")
+    }
+}
+impl fmt::Display for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+/// Where an item was found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum KitSource {
+    /// The provider account's own config dir.
+    Account,
+    /// The user's `~/.claude` and `~/.claude.json`.
+    User,
+    /// The local project itself.
+    Project,
+}
+
+/// Why an item cannot be sent as is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Exclusion {
+    TooLarge,
+    LinkOutsideHome,
+    TooManyFiles,
+    ScanTimedOut,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SkillScope {
+    User,
+    ProjectUntracked,
+    Plugin,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KitSkill {
+    pub name: String,
+    pub scope: SkillScope,
+    pub source: KitSource,
+    /// The plugin id for [`SkillScope::Plugin`]; such a skill travels with its plugin.
+    pub plugin: Option<String>,
+    pub path: PathBuf,
+    pub size: u64,
+    pub hash: String,
+    pub exclusion: Option<Exclusion>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum McpScope {
+    User,
+    Local,
+    Project,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Runtime {
+    Npx,
+    Uvx,
+    Bunx,
+    Node,
+    Python,
+    Docker,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalOnlyReason {
+    /// A stdio command that is an absolute local path.
+    AbsoluteCommand,
+    /// A URL on localhost, loopback, `*.local`, a private or a link-local address.
+    PrivateUrl,
+    /// A stdio `docker` command on a Docker sandbox.
+    DockerOnSandbox,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpCompat {
+    Ok,
+    LocalOnly(LocalOnlyReason),
+    NeedsRuntime(Runtime),
+    SignedIn,
+    NotSignedIn,
+    Project,
+}
+
+/// Which kind of workspace the kit is for. Only the Docker rule depends on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Workspace {
+    Codespace,
+    Sandbox,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SecretLocation {
+    Env(String),
+    Header(String),
+    UrlQuery,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SecretField {
+    pub location: SecretLocation,
+    pub value: Secret,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KitMcpServer {
+    pub name: String,
+    pub scope: McpScope,
+    pub source: KitSource,
+    pub config_path: PathBuf,
+    pub transport: String,
+    pub compat: McpCompat,
+    pub secrets: Vec<SecretField>,
+    /// Hash of the canonical server config, secrets included.
+    pub config_hash: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KitPlugin {
+    /// `name@marketplace`.
+    pub id: String,
+    pub version: String,
+    pub source: KitSource,
+    pub install_path: PathBuf,
+    pub size: u64,
+    /// `bin/`, `.lsp.json` or a native `*.node` file: it may not run on Linux.
+    pub has_native_bin: bool,
+    pub hash: String,
+    pub exclusion: Option<Exclusion>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct KitInventory {
+    pub skills: Vec<KitSkill>,
+    pub mcp_servers: Vec<KitMcpServer>,
+    pub plugins: Vec<KitPlugin>,
+    /// Compressed size of every item that is not excluded (plugin skills count with
+    /// their plugin).
+    pub total_compressed: u64,
+    pub over_total_cap: bool,
+    /// Same inputs, same hash. Covers names, scopes, sources, file contents and server
+    /// configs including secrets (only a digest of them is kept).
+    pub content_hash: String,
+}
+
+/// Where to look. Build with [`KitRoots::for_profile`], or by hand in tests.
+#[derive(Clone, Debug)]
+pub struct KitRoots {
+    /// The account config dir. `None`, or equal to `claude_home`, for the default account.
+    pub account_dir: Option<PathBuf>,
+    /// The user's home. Symlinks may not leave it.
+    pub home: PathBuf,
+    /// `~/.claude`. Its JSON sibling is `<home>/.claude.json`.
+    pub claude_home: PathBuf,
+    /// The local project root.
+    pub project: PathBuf,
+}
+
+impl KitRoots {
+    pub fn for_profile(profile: &Profile, project: &Path) -> Result<Self, String> {
+        let home = crate::scm::shell::dirs_home()
+            .map(PathBuf::from)
+            .ok_or("Home directory not found")?;
+        let claude_home = home.join(".claude");
+        let account = profile.home(Kind::Claude)?;
+        let account_dir = (account != claude_home).then_some(account);
+        Ok(Self {
+            account_dir,
+            home,
+            claude_home,
+            project: project.to_path_buf(),
+        })
+    }
+}
+
+/// The seam for MCP OAuth sign-in state (F3-5a). `None` means unknown, and an
+/// http/sse server without an `Authorization` header then stays `Ok`.
+pub fn signed_in(_server: &KitMcpServer) -> Option<bool> {
+    None
+}
+
+/// Inventory with the real sign-in seam.
+pub fn build_inventory(roots: &KitRoots, workspace: Workspace) -> KitInventory {
+    build_inventory_with(roots, workspace, &signed_in)
+}
+
+/// Inventory with an injected sign-in probe. The probe sees the server before its
+/// compat is final (it is `Ok` at that point).
+pub fn build_inventory_with(
+    roots: &KitRoots,
+    workspace: Workspace,
+    probe: &dyn Fn(&KitMcpServer) -> Option<bool>,
+) -> KitInventory {
+    let started = Instant::now();
+    let home = std::fs::canonicalize(&roots.home).unwrap_or_else(|_| roots.home.clone());
+    let sources = sources(roots);
+    let mut inventory = KitInventory::default();
+    let mut plugin_dirs: Vec<(String, PathBuf, KitSource)> = Vec::new();
+
+    for source in &sources {
+        collect_plugins(source, roots, &home, started, &mut inventory.plugins);
+    }
+    for plugin in &inventory.plugins {
+        plugin_dirs.push((
+            plugin.id.clone(),
+            plugin.install_path.clone(),
+            plugin.source,
+        ));
+    }
+    for source in &sources {
+        collect_user_skills(source, &home, started, &mut inventory.skills);
+    }
+    collect_project_skills(roots, &home, started, &mut inventory.skills);
+    for (id, dir, source) in &plugin_dirs {
+        collect_plugin_skills(id, dir, *source, &home, started, &mut inventory.skills);
+    }
+    for source in &sources {
+        collect_mcp(source, roots, workspace, probe, &mut inventory.mcp_servers);
+    }
+    collect_project_mcp(roots, &mut inventory.mcp_servers);
+
+    inventory.skills.sort_by(|a, b| {
+        (&a.name, a.scope, a.source, &a.path).cmp(&(&b.name, b.scope, b.source, &b.path))
+    });
+    inventory
+        .plugins
+        .sort_by(|a, b| (&a.id, a.source).cmp(&(&b.id, b.source)));
+    inventory.mcp_servers.sort_by(|a, b| {
+        (&a.name, a.scope, a.source, &a.config_path).cmp(&(
+            &b.name,
+            b.scope,
+            b.source,
+            &b.config_path,
+        ))
+    });
+
+    inventory.total_compressed = total_compressed(&inventory, &home);
+    inventory.over_total_cap = inventory.total_compressed > MAX_KIT_COMPRESSED_BYTES;
+    inventory.content_hash = content_hash(&inventory);
+    inventory
+}
+
+struct Source {
+    label: KitSource,
+    dir: PathBuf,
+    claude_json: PathBuf,
+}
+
+fn sources(roots: &KitRoots) -> Vec<Source> {
+    let mut out = Vec::new();
+    if let Some(dir) = &roots.account_dir {
+        out.push(Source {
+            label: KitSource::Account,
+            claude_json: dir.join(".claude.json"),
+            dir: dir.clone(),
+        });
+    }
+    out.push(Source {
+        label: KitSource::User,
+        dir: roots.claude_home.clone(),
+        claude_json: roots.home.join(".claude.json"),
+    });
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Files: measuring, symlink rules, hashing
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ItemKind {
+    Skill,
+    Plugin,
+}
+
+struct Scan {
+    files: Vec<PathBuf>,
+    size: u64,
+    has_native: bool,
+    exclusion: Option<Exclusion>,
+}
+
+/// Walk one skill or plugin directory. Files come back sorted, so every later step is
+/// deterministic. Symlinks are resolved, and a link that leaves `home` excludes the item.
+fn scan_item(root: &Path, kind: ItemKind, home: &Path, started: Instant) -> Scan {
+    let mut scan = Scan {
+        files: Vec::new(),
+        size: 0,
+        has_native: false,
+        exclusion: None,
+    };
+    let cap = match kind {
+        ItemKind::Skill => MAX_SKILL_BYTES,
+        ItemKind::Plugin => MAX_PLUGIN_BYTES,
+    };
+    let Some(real_root) = resolve_within(root, home) else {
+        scan.exclusion = Some(Exclusion::LinkOutsideHome);
+        return scan;
+    };
+    if kind == ItemKind::Plugin && (root.join("bin").exists() || root.join(".lsp.json").exists()) {
+        scan.has_native = true;
+    }
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    visited.insert(real_root.clone());
+    let mut entries = 0usize;
+    walk(
+        &real_root,
+        kind,
+        home,
+        started,
+        cap,
+        &mut visited,
+        &mut entries,
+        &mut scan,
+    );
+    scan.files.sort();
+    scan
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk(
+    dir: &Path,
+    kind: ItemKind,
+    home: &Path,
+    started: Instant,
+    cap: u64,
+    visited: &mut HashSet<PathBuf>,
+    entries: &mut usize,
+    scan: &mut Scan,
+) {
+    let Ok(reader) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut children: Vec<_> = reader.flatten().collect();
+    children.sort_by_key(|entry| entry.file_name());
+    for entry in children {
+        if scan.exclusion.is_some() {
+            return;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == ".git" || name == ".DS_Store" {
+            continue;
+        }
+        if kind == ItemKind::Skill && name == "node_modules" {
+            continue;
+        }
+        *entries += 1;
+        if *entries > MAX_ENTRIES_PER_ITEM {
+            scan.exclusion = Some(Exclusion::TooManyFiles);
+            return;
+        }
+        if started.elapsed() > SCAN_BUDGET {
+            scan.exclusion = Some(Exclusion::ScanTimedOut);
+            return;
+        }
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let (path, meta) = if meta.file_type().is_symlink() {
+            let Some(real) = resolve_within(&path, home) else {
+                scan.exclusion = Some(Exclusion::LinkOutsideHome);
+                return;
+            };
+            let Ok(meta) = std::fs::metadata(&real) else {
+                continue;
+            };
+            (real, meta)
+        } else {
+            (path, meta)
+        };
+        if meta.is_dir() {
+            if !visited.insert(path.clone()) {
+                continue;
+            }
+            walk(&path, kind, home, started, cap, visited, entries, scan);
+        } else if meta.is_file() {
+            scan.size += meta.len();
+            if scan.size > cap {
+                scan.exclusion = Some(Exclusion::TooLarge);
+                return;
+            }
+            if path.extension().is_some_and(|ext| ext == "node") {
+                scan.has_native = true;
+            }
+            scan.files.push(path);
+        }
+    }
+}
+
+/// Canonicalize `path` (resolving every link) and keep it only inside `home`.
+fn resolve_within(path: &Path, home: &Path) -> Option<PathBuf> {
+    let real = std::fs::canonicalize(path).ok()?;
+    real.starts_with(home).then_some(real)
+}
+
+struct CountingSink(u64);
+impl Write for CountingSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len() as u64;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// SHA-256 over the files (relative path and bytes) and their gzip size, in one read.
+fn digest_files(root: &Path, files: &[PathBuf]) -> (String, u64) {
+    let real_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut hasher = Sha256::new();
+    let mut gzip = flate2::write::GzEncoder::new(CountingSink(0), flate2::Compression::fast());
+    let mut buffer = vec![0u8; 64 * 1024];
+    for file in files {
+        let relative = file.strip_prefix(&real_root).unwrap_or(file);
+        hasher.update(relative.to_string_lossy().as_bytes());
+        hasher.update([0]);
+        let Ok(mut handle) = std::fs::File::open(file) else {
+            continue;
+        };
+        while let Ok(read) = handle.read(&mut buffer) {
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            let _ = gzip.write_all(&buffer[..read]);
+        }
+        hasher.update([0]);
+    }
+    let compressed = gzip.finish().map(|sink| sink.0).unwrap_or(0);
+    (hex(&hasher.finalize()), compressed)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn digest_str(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    hex(&hasher.finalize())
+}
+
+// ---------------------------------------------------------------------------
+// Skills
+// ---------------------------------------------------------------------------
+
+fn skill_from_dir(
+    name: &str,
+    dir: &Path,
+    scope: SkillScope,
+    source: KitSource,
+    plugin: Option<String>,
+    home: &Path,
+    started: Instant,
+) -> KitSkill {
+    let scan = scan_item(dir, ItemKind::Skill, home, started);
+    let hash = if scan.exclusion.is_none() {
+        digest_files(dir, &scan.files).0
+    } else {
+        String::new()
+    };
+    KitSkill {
+        name: name.to_string(),
+        scope,
+        source,
+        plugin,
+        path: dir.to_path_buf(),
+        size: scan.size,
+        hash,
+        exclusion: scan.exclusion,
+    }
+}
+
+/// Skill directories (those holding a `SKILL.md`) directly under `root`, by name.
+fn skill_dirs(root: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(reader) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, PathBuf)> = reader
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_string();
+            let path = entry.path();
+            (!name.starts_with('.') && path.join("SKILL.md").is_file()).then_some((name, path))
+        })
+        .collect();
+    out.sort();
+    out.truncate(MAX_SKILLS_PER_ROOT);
+    out
+}
+
+fn collect_user_skills(source: &Source, home: &Path, started: Instant, out: &mut Vec<KitSkill>) {
+    for (name, dir) in skill_dirs(&source.dir.join("skills")) {
+        // The account wins over `~/.claude` for the same name.
+        if out
+            .iter()
+            .any(|skill| skill.scope == SkillScope::User && skill.name == name)
+        {
+            continue;
+        }
+        out.push(skill_from_dir(
+            &name,
+            &dir,
+            SkillScope::User,
+            source.label,
+            None,
+            home,
+            started,
+        ));
+    }
+}
+
+/// Names under `.claude/skills` that have at least one tracked file. `None` when the
+/// project is not a git repository (nothing is committed then).
+fn tracked_skill_names(project: &Path) -> Option<BTreeSet<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(project)
+        .args(["ls-files", "-z", "--", ".claude/skills"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut names = BTreeSet::new();
+    for entry in output.stdout.split(|byte| *byte == 0) {
+        let entry = String::from_utf8_lossy(entry);
+        if let Some(rest) = entry.strip_prefix(".claude/skills/") {
+            if let Some((name, _)) = rest.split_once('/') {
+                names.insert(name.to_string());
+            }
+        }
+    }
+    Some(names)
+}
+
+fn collect_project_skills(
+    roots: &KitRoots,
+    home: &Path,
+    started: Instant,
+    out: &mut Vec<KitSkill>,
+) {
+    let tracked = tracked_skill_names(&roots.project).unwrap_or_default();
+    for (name, dir) in skill_dirs(&roots.project.join(".claude/skills")) {
+        // Committed skills arrive with the clone.
+        if tracked.contains(&name) {
+            continue;
+        }
+        out.push(skill_from_dir(
+            &name,
+            &dir,
+            SkillScope::ProjectUntracked,
+            KitSource::Project,
+            None,
+            home,
+            started,
+        ));
+    }
+}
+
+fn collect_plugin_skills(
+    plugin: &str,
+    install_path: &Path,
+    source: KitSource,
+    home: &Path,
+    started: Instant,
+    out: &mut Vec<KitSkill>,
+) {
+    for (name, dir) in skill_dirs(&install_path.join("skills")) {
+        out.push(skill_from_dir(
+            &name,
+            &dir,
+            SkillScope::Plugin,
+            source,
+            Some(plugin.to_string()),
+            home,
+            started,
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plugins
+// ---------------------------------------------------------------------------
+
+fn resolve_install_path(raw: &str, home: &Path) -> PathBuf {
+    if raw == "~" {
+        return home.to_path_buf();
+    }
+    match raw.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None => PathBuf::from(raw),
+    }
+}
+
+fn collect_plugins(
+    source: &Source,
+    roots: &KitRoots,
+    home: &Path,
+    started: Instant,
+    out: &mut Vec<KitPlugin>,
+) {
+    let Some(registry) = crate::mcp::read_json(&source.dir.join("plugins/installed_plugins.json"))
+    else {
+        return;
+    };
+    let Some(plugins) = registry.get("plugins").and_then(Value::as_object) else {
+        return;
+    };
+    let enabled = crate::mcp::read_json(&source.dir.join("settings.json"))
+        .and_then(|settings| settings.get("enabledPlugins").cloned());
+    for (id, installed) in plugins {
+        let is_enabled = enabled
+            .as_ref()
+            .and_then(|map| map.get(id))
+            .and_then(Value::as_bool)
+            == Some(true);
+        if !is_enabled || out.iter().any(|plugin| &plugin.id == id) {
+            continue;
+        }
+        let entries: Vec<&Value> = match installed.as_array() {
+            Some(entries) => entries.iter().collect(),
+            None if installed.is_object() => vec![installed],
+            None => continue,
+        };
+        let Some(entry) = entries
+            .into_iter()
+            .find(|entry| plugin_applies(entry, roots))
+        else {
+            continue;
+        };
+        let Some(raw_path) = entry.get("installPath").and_then(Value::as_str) else {
+            continue;
+        };
+        let install_path = resolve_install_path(raw_path, &roots.home);
+        let scan = scan_item(&install_path, ItemKind::Plugin, home, started);
+        let hash = if scan.exclusion.is_none() {
+            digest_files(&install_path, &scan.files).0
+        } else {
+            String::new()
+        };
+        out.push(KitPlugin {
+            id: id.clone(),
+            version: entry
+                .get("version")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            source: source.label,
+            install_path,
+            size: scan.size,
+            has_native_bin: scan.has_native,
+            hash,
+            exclusion: scan.exclusion,
+        });
+    }
+}
+
+/// User-scope entries always apply; project and local entries only for their project.
+fn plugin_applies(entry: &Value, roots: &KitRoots) -> bool {
+    match entry.get("scope").and_then(Value::as_str) {
+        Some("user") | None => true,
+        Some("project" | "local") => entry
+            .get("projectPath")
+            .and_then(Value::as_str)
+            .map(|path| {
+                let path = resolve_install_path(path, &roots.home);
+                roots.project.starts_with(&path)
+            })
+            .unwrap_or(false),
+        Some(_) => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MCP servers
+// ---------------------------------------------------------------------------
+
+fn collect_mcp(
+    source: &Source,
+    roots: &KitRoots,
+    workspace: Workspace,
+    probe: &dyn Fn(&KitMcpServer) -> Option<bool>,
+    out: &mut Vec<KitMcpServer>,
+) {
+    let Some(config) = crate::mcp::read_json(&source.claude_json) else {
+        return;
+    };
+    let project_key = roots.project.to_string_lossy().into_owned();
+    let local = config
+        .get("projects")
+        .and_then(|projects| projects.get(&project_key))
+        .and_then(|entry| entry.get("mcpServers"));
+    for (scope, servers) in [
+        (McpScope::User, config.get("mcpServers")),
+        (McpScope::Local, local),
+    ] {
+        let Some(servers) = servers.and_then(Value::as_object) else {
+            continue;
+        };
+        for (name, server) in servers {
+            // The account wins over `~/.claude.json` for the same name and scope.
+            if out
+                .iter()
+                .any(|existing| existing.name == *name && existing.scope == scope)
+            {
+                continue;
+            }
+            if let Some(built) = build_server(
+                name,
+                scope,
+                source.label,
+                &source.claude_json,
+                server,
+                workspace,
+                probe,
+            ) {
+                out.push(built);
+            }
+        }
+    }
+}
+
+/// `.mcp.json` from the project up to the repository boundary. Listed for information:
+/// these arrive with the clone.
+fn collect_project_mcp(roots: &KitRoots, out: &mut Vec<KitMcpServer>) {
+    for directory in roots.project.ancestors() {
+        if directory == roots.home {
+            break;
+        }
+        let path = directory.join(".mcp.json");
+        if let Some(config) = crate::mcp::read_json(&path) {
+            if let Some(servers) = config.get("mcpServers").and_then(Value::as_object) {
+                for (name, server) in servers {
+                    if out
+                        .iter()
+                        .any(|e| e.name == *name && e.scope == McpScope::Project)
+                    {
+                        continue;
+                    }
+                    if let Some(built) = build_server(
+                        name,
+                        McpScope::Project,
+                        KitSource::Project,
+                        &path,
+                        server,
+                        Workspace::Codespace,
+                        &|_| None,
+                    ) {
+                        out.push(built);
+                    }
+                }
+            }
+        }
+        if directory.join(".git").exists() {
+            break;
+        }
+    }
+}
+
+fn build_server(
+    name: &str,
+    scope: McpScope,
+    source: KitSource,
+    config_path: &Path,
+    config: &Value,
+    workspace: Workspace,
+    probe: &dyn Fn(&KitMcpServer) -> Option<bool>,
+) -> Option<KitMcpServer> {
+    let object = config.as_object()?;
+    let transport = object
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or(if object.contains_key("url") {
+            "http"
+        } else {
+            "stdio"
+        })
+        .to_string();
+    let mut canonical = String::new();
+    canonical_json(config, &mut canonical);
+    let mut server = KitMcpServer {
+        name: name.to_string(),
+        scope,
+        source,
+        config_path: config_path.to_path_buf(),
+        compat: McpCompat::Ok,
+        secrets: find_secrets(object),
+        config_hash: digest_str(&[&canonical]),
+        transport,
+    };
+    server.compat = if scope == McpScope::Project {
+        McpCompat::Project
+    } else {
+        classify(&server, object, workspace, probe)
+    };
+    Some(server)
+}
+
+fn classify(
+    server: &KitMcpServer,
+    object: &serde_json::Map<String, Value>,
+    workspace: Workspace,
+    probe: &dyn Fn(&KitMcpServer) -> Option<bool>,
+) -> McpCompat {
+    if server.transport == "stdio" {
+        let command = object.get("command").and_then(Value::as_str).unwrap_or("");
+        if is_absolute_command(command) {
+            return McpCompat::LocalOnly(LocalOnlyReason::AbsoluteCommand);
+        }
+        return match runtime_of(command) {
+            Some(Runtime::Docker) if workspace == Workspace::Sandbox => {
+                McpCompat::LocalOnly(LocalOnlyReason::DockerOnSandbox)
+            }
+            Some(runtime) => McpCompat::NeedsRuntime(runtime),
+            None => McpCompat::Ok,
+        };
+    }
+    if let Some(url) = object.get("url").and_then(Value::as_str) {
+        if is_private_url(url) {
+            return McpCompat::LocalOnly(LocalOnlyReason::PrivateUrl);
+        }
+    }
+    let has_auth = object
+        .get("headers")
+        .and_then(Value::as_object)
+        .is_some_and(|headers| {
+            headers
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("authorization"))
+        });
+    if has_auth {
+        return McpCompat::Ok;
+    }
+    match probe(server) {
+        Some(true) => McpCompat::SignedIn,
+        Some(false) => McpCompat::NotSignedIn,
+        None => McpCompat::Ok,
+    }
+}
+
+fn is_absolute_command(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    command.starts_with('/')
+        || command.starts_with("~/")
+        || command.starts_with('\\')
+        || (bytes.len() > 2
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'\\' || bytes[2] == b'/'))
+}
+
+fn runtime_of(command: &str) -> Option<Runtime> {
+    let base = command.rsplit(['/', '\\']).next().unwrap_or(command);
+    match base.to_ascii_lowercase().as_str() {
+        "npx" => Some(Runtime::Npx),
+        "uvx" => Some(Runtime::Uvx),
+        "bunx" => Some(Runtime::Bunx),
+        "node" => Some(Runtime::Node),
+        "python" | "python3" => Some(Runtime::Python),
+        "docker" => Some(Runtime::Docker),
+        _ => None,
+    }
+}
+
+/// Localhost, loopback, `*.local`, RFC 1918 and link-local hosts. An unparseable URL
+/// (for example one starting with `${HOST}`) is not judged.
+fn is_private_url(raw: &str) -> bool {
+    let Ok(url) = url::Url::parse(raw) else {
+        return false;
+    };
+    let Some(host) = url.host() else {
+        return false;
+    };
+    match host {
+        url::Host::Domain(domain) => {
+            let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+            domain == "localhost" || domain.ends_with(".localhost") || domain.ends_with(".local")
+        }
+        url::Host::Ipv4(ip) => private_v4(ip),
+        url::Host::Ipv6(ip) => private_v6(ip),
+    }
+}
+
+fn private_v4(ip: Ipv4Addr) -> bool {
+    ip.is_loopback() || ip.is_private() || ip.is_link_local()
+}
+
+fn private_v6(ip: Ipv6Addr) -> bool {
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return private_v4(v4);
+    }
+    let first = ip.segments()[0];
+    ip.is_loopback() || (first & 0xffc0) == 0xfe80 || (first & 0xfe00) == 0xfc00
+}
+
+/// `${NAME}` and nothing else.
+fn is_pure_reference(value: &str) -> bool {
+    let Some(inner) = value.strip_prefix("${").and_then(|v| v.strip_suffix('}')) else {
+        return false;
+    };
+    let mut chars = inner.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn find_secrets(object: &serde_json::Map<String, Value>) -> Vec<SecretField> {
+    let mut secrets = Vec::new();
+    for (key, location) in [("env", true), ("headers", false)] {
+        let Some(map) = object.get(key).and_then(Value::as_object) else {
+            continue;
+        };
+        let mut names: Vec<&String> = map.keys().collect();
+        names.sort();
+        for field in names {
+            let value = match &map[field] {
+                Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            if is_pure_reference(&value) {
+                continue;
+            }
+            secrets.push(SecretField {
+                location: if location {
+                    SecretLocation::Env(field.clone())
+                } else {
+                    SecretLocation::Header(field.clone())
+                },
+                value: Secret::new(value),
+            });
+        }
+    }
+    if let Some(raw) = object.get("url").and_then(Value::as_str) {
+        let has_query = url::Url::parse(raw)
+            .map(|url| url.query().is_some_and(|q| !q.is_empty()))
+            // A URL we cannot parse still counts if it carries a `?query`.
+            .unwrap_or_else(|_| raw.split_once('?').is_some_and(|(_, q)| !q.is_empty()));
+        if has_query {
+            secrets.push(SecretField {
+                location: SecretLocation::UrlQuery,
+                value: Secret::new(raw),
+            });
+        }
+    }
+    secrets
+}
+
+/// Compact JSON with object keys sorted, independent of the map implementation.
+fn canonical_json(value: &Value, out: &mut String) {
+    match value {
+        Value::Object(map) => {
+            let sorted: BTreeMap<&String, &Value> = map.iter().collect();
+            out.push('{');
+            for (index, (key, item)) in sorted.into_iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(&Value::String(key.clone()).to_string());
+                out.push(':');
+                canonical_json(item, out);
+            }
+            out.push('}');
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                canonical_json(item, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&other.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Totals and hash
+// ---------------------------------------------------------------------------
+
+/// Compressed size of every item that would be sent. Plugin skills are inside their
+/// plugin, so they are not counted twice.
+fn total_compressed(inventory: &KitInventory, home: &Path) -> u64 {
+    let started = Instant::now();
+    let mut total = 0;
+    let mut dirs: Vec<(&Path, ItemKind)> = Vec::new();
+    for skill in &inventory.skills {
+        if skill.scope != SkillScope::Plugin && skill.exclusion.is_none() {
+            dirs.push((&skill.path, ItemKind::Skill));
+        }
+    }
+    for plugin in &inventory.plugins {
+        if plugin.exclusion.is_none() {
+            dirs.push((&plugin.install_path, ItemKind::Plugin));
+        }
+    }
+    for (dir, kind) in dirs {
+        let scan = scan_item(dir, kind, home, started);
+        if scan.exclusion.is_none() {
+            total += digest_files(dir, &scan.files).1;
+        }
+    }
+    total
+}
+
+fn content_hash(inventory: &KitInventory) -> String {
+    let mut hasher = Sha256::new();
+    let mut line = |parts: &[&str]| {
+        hasher.update(digest_str(parts).as_bytes());
+    };
+    for skill in &inventory.skills {
+        line(&[
+            "skill",
+            &skill.name,
+            &format!("{:?}", skill.scope),
+            &format!("{:?}", skill.source),
+            skill.plugin.as_deref().unwrap_or(""),
+            &skill.hash,
+        ]);
+    }
+    for plugin in &inventory.plugins {
+        line(&[
+            "plugin",
+            &plugin.id,
+            &plugin.version,
+            &format!("{:?}", plugin.source),
+            &plugin.hash,
+        ]);
+    }
+    for server in &inventory.mcp_servers {
+        line(&[
+            "mcp",
+            &server.name,
+            &format!("{:?}", server.scope),
+            &format!("{:?}", server.source),
+            &server.config_hash,
+        ]);
+    }
+    hex(&hasher.finalize())
+}
