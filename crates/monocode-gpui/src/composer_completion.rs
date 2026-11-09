@@ -13,6 +13,7 @@ use gpui::{
 use monocode_core::{
     composer::{self, Token, Trigger},
     files::ProjectFile,
+    mono::account_mention,
     mono::workflows::{
         mention::{self, MentionFacts, RequiresView, WorkflowSlug},
         model::{Workflow, WorkflowId},
@@ -66,6 +67,8 @@ struct Choice {
     builtin: Option<&'static str>,
     mode: Option<&'static str>,
     file: bool,
+    /// A provider account, `@claude/<label>`.
+    account: bool,
     server: Option<monocode_core::mcp::McpConnection>,
 }
 impl Choice {
@@ -85,6 +88,8 @@ impl Choice {
                         "note"
                     } else if self.insertion.starts_with("@workflow/") {
                         "git-branch"
+                    } else if self.account {
+                        "account-user"
                     } else {
                         "sparkles"
                     },
@@ -100,6 +105,13 @@ impl Choice {
         (path, color)
     }
 }
+/// What a Mono composer knows about provider accounts, refreshed from the live account book
+/// before it is read, so a mention resolves against the same accounts the GUI shows.
+#[derive(Clone)]
+struct AccountSnapshot {
+    book: monocode_core::accounts::Book,
+    credentials: HashMap<String, monocode_core::accounts::ClaudeCredential>,
+}
 pub(crate) struct Completion {
     input: Entity<input::Input>,
     store: Option<crate::runtime::Database>,
@@ -107,6 +119,10 @@ pub(crate) struct Completion {
     /// The Mono this composer belongs to (root, id). `None` for every other composer, which then
     /// offers and expands no `@workflow/` mention.
     mono: Option<(PathBuf, String)>,
+    /// Provider accounts for `@claude/<label>` mentions; `None` outside a Mono composer.
+    accounts: Option<AccountSnapshot>,
+    /// The `@provider/label` tokens of those accounts, highlighted like any known mention.
+    account_tokens: std::collections::HashSet<String>,
     workflows: Vec<Workflow>,
     workflow_slugs: Vec<WorkflowSlug>,
     workflows_loaded: Option<Instant>,
@@ -173,6 +189,13 @@ fn short_mentions(files: &[ProjectFile]) -> std::collections::HashMap<String, St
         })
         .collect()
 }
+fn auth_label(auth: &str) -> &'static str {
+    match auth {
+        "setupToken" => "setup token",
+        "apiKey" => "API key",
+        _ => "CLI login",
+    }
+}
 impl Drop for Completion {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
@@ -189,6 +212,8 @@ impl Completion {
             today_marked: Default::default(),
             notes: Vec::new(),
             mono: None,
+            accounts: None,
+            account_tokens: Default::default(),
             workflows: Vec::new(),
             workflow_slugs: Vec::new(),
             workflows_loaded: None,
@@ -457,7 +482,8 @@ impl Completion {
         };
         // Last, so a workflow's own text is never scanned for MCP tokens.
         if typed_by_user {
-            self.attach_workflows(text, typed)
+            let text = self.attach_workflows(text, typed);
+            self.attach_accounts(text, typed)
         } else {
             text
         }
@@ -549,6 +575,7 @@ impl Completion {
             self.loaded = None;
             self.token = None;
         }
+        self.refresh_accounts(cx);
         self.highlight(cx);
         self.check_requirements(cx);
         // A Mono composer offers `@` mentions only; `/` stays plain text so
@@ -850,6 +877,98 @@ impl Completion {
             .detach();
         }
     }
+    /// Re-reads the provider accounts a Mono composer can mention. Called when the text changes
+    /// and before a message is prepared; it never notifies.
+    pub(crate) fn refresh_accounts(&mut self, cx: &mut Context<Self>) {
+        let center = self
+            .mono
+            .as_ref()
+            .and_then(|_| crate::accounts::get(cx))
+            .map(|center| center.read(cx));
+        let Some(center) = center else {
+            self.accounts = None;
+            self.account_tokens.clear();
+            return;
+        };
+        let book = center.book.clone();
+        let mut credentials = HashMap::new();
+        let mut tokens = std::collections::HashSet::new();
+        for kind in monocode_core::accounts::PROVIDERS {
+            tokens.insert(format!("@{}/default", kind.id()));
+            for account in book.list(kind) {
+                tokens.insert(account_mention::mention_text(kind.id(), &account.label));
+                if kind == monocode_core::provider::Kind::Claude
+                    && let Some(credential) = center.claude_credential(&account.id)
+                {
+                    credentials.insert(account.id, credential);
+                }
+            }
+        }
+        self.accounts = Some(AccountSnapshot { book, credentials });
+        self.account_tokens = tokens;
+    }
+    /// The context block for each provider account the user mentioned. Mono composers only.
+    fn attach_accounts(&self, prompt: String, typed: &str) -> String {
+        let Some(snapshot) = &self.accounts else {
+            return prompt;
+        };
+        account_mention::attach_accounts(&prompt, typed, &snapshot.book, &|id| {
+            snapshot.credentials.get(id).copied()
+        })
+    }
+    /// `@claude/<label>` choices for the query after `@`: the provider's accounts once the query
+    /// is `claude/...` (with an optional label filter) or a bare prefix of a provider name.
+    fn account_choices(&self, query: &str) -> Vec<Choice> {
+        let Some(snapshot) = &self.accounts else {
+            return Vec::new();
+        };
+        let slashed = query.contains('/');
+        let (provider, label) = match query.split_once('/') {
+            Some((provider, label)) => (provider.to_lowercase(), label),
+            None if !query.is_empty() => (query.to_lowercase(), ""),
+            None => return Vec::new(),
+        };
+        let mut rows = Vec::new();
+        for kind in monocode_core::accounts::PROVIDERS {
+            let matches = if slashed {
+                kind.id() == provider
+            } else {
+                kind.id().starts_with(&provider)
+            };
+            if !matches {
+                continue;
+            }
+            for account in snapshot.book.list(kind) {
+                let score = if label.is_empty() {
+                    Some(0)
+                } else {
+                    composer::score(label, &account.label).max(composer::score(label, &account.id))
+                };
+                let Some(score) = score else {
+                    continue;
+                };
+                let auth = monocode_core::accounts::auth_kind(
+                    kind,
+                    snapshot.credentials.get(&account.id).copied(),
+                );
+                rows.push((
+                    score,
+                    Choice {
+                        label: account.label.clone(),
+                        detail: format!("{} account · {}", kind.id(), auth_label(auth)),
+                        insertion: account_mention::mention_text(kind.id(), &account.label),
+                        builtin: None,
+                        mode: None,
+                        file: false,
+                        account: true,
+                        server: None,
+                    },
+                ));
+            }
+        }
+        rows.sort_by(|(a, _), (b, _)| b.cmp(a));
+        rows.into_iter().take(8).map(|(_, choice)| choice).collect()
+    }
     /// The context block for each workflow the user typed, read fresh from the Mono's files so a
     /// removed workflow stops resolving. Reads files only; it never runs a preflight.
     fn attach_workflows(&self, prompt: String, typed: &str) -> String {
@@ -906,7 +1025,13 @@ impl Completion {
         self.highlight(cx);
     }
     fn highlight(&self, cx: &mut Context<Self>) {
-        let ranges = composer::highlight_ranges(&self.input.read(cx).content, &self.known);
+        let content = &self.input.read(cx).content;
+        let ranges = if self.account_tokens.is_empty() {
+            composer::highlight_ranges(content, &self.known)
+        } else {
+            let known = self.known.union(&self.account_tokens).cloned().collect();
+            composer::highlight_ranges(content, &known)
+        };
         self.input
             .update(cx, |input, cx| input.highlight_composer_tokens(ranges, cx));
     }
@@ -944,6 +1069,7 @@ impl Completion {
                     builtin: None,
                     mode: None,
                     file: false,
+                    account: false,
                     server: Some(server),
                 })
                 .collect();
@@ -957,9 +1083,18 @@ impl Completion {
                     builtin: None,
                     mode: None,
                     file: true,
+                    account: false,
                     server: None,
                 })
                 .collect();
+            // An account mention starts with its provider, so a slashed query puts the accounts
+            // ahead of same-named folders; a bare provider prefix lists them after the files.
+            let accounts = self.account_choices(&token.query);
+            if token.query.contains('/') {
+                self.choices.splice(0..0, accounts);
+            } else {
+                self.choices.extend(accounts);
+            }
             let only_workflow = self.mono.is_some() && token.query.starts_with("workflow/");
             let only_note = token.query.starts_with("note/");
             if only_workflow {
@@ -1000,6 +1135,7 @@ impl Completion {
                         builtin: None,
                         mode: None,
                         file: false,
+                        account: false,
                         server: None,
                     }));
             }
@@ -1028,6 +1164,7 @@ impl Completion {
                         builtin: None,
                         mode: None,
                         file: false,
+                        account: false,
                         server: None,
                     }));
             }
@@ -1114,6 +1251,7 @@ impl Completion {
                             ))
                             .then_some(id),
                             file: false,
+                            account: false,
                             server: None,
                         },
                     ));
@@ -1154,6 +1292,7 @@ impl Completion {
                             builtin: None,
                             mode: None,
                             file: false,
+                            account: false,
                             server: None,
                         },
                     ));
@@ -1192,6 +1331,7 @@ impl Completion {
                             builtin: None,
                             mode: None,
                             file: false,
+                            account: false,
                             server: None,
                         },
                     ));
@@ -2082,6 +2222,176 @@ mod tests {
                 assert_eq!(sent.matches("Referenced workflow").count(), 1);
                 // Sending reads the cache; it never runs a check itself.
                 assert_eq!(checks("wf-cnt1"), 1);
+            })
+            .unwrap();
+    }
+
+    /// Installs the shared account center over an in-memory store and adds Claude accounts
+    /// "Work account" and "can.le", plus a Codex one; returns their ids.
+    fn install_accounts(cx: &mut TestAppContext) -> (String, String, String) {
+        cx.update(|cx| {
+            let store: crate::runtime::Database = Arc::new(std::sync::Mutex::new(
+                monocode_core::store::Store::open(std::path::Path::new(":memory:")).unwrap(),
+            ));
+            crate::accounts::install(store, cx);
+            crate::accounts::get(cx).unwrap().update(cx, |center, _| {
+                use monocode_core::provider::Kind;
+                let work = center.book.add(Kind::Claude, "Work account").unwrap().id;
+                let can = center.book.add(Kind::Claude, "can.le").unwrap().id;
+                let codex = center.book.add(Kind::Codex, "hoangxuan2402").unwrap().id;
+                (work, can, codex)
+            })
+        })
+    }
+
+    #[gpui::test]
+    fn a_mono_composer_offers_provider_accounts_and_quotes_spaced_labels(cx: &mut TestAppContext) {
+        let (work, _, _) = install_accounts(cx);
+        let window = window(cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.set_mono(PathBuf::from("/none"), "mono-a".into(), cx);
+                view.files = vec![ProjectFile {
+                    name: "src".into(),
+                    path: "/p/claude/src".into(),
+                    relative: "claude/src".into(),
+                }];
+                view.input
+                    .update(cx, |input, cx| input.set_text("@claude/".into(), cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, w, cx| {
+                let accounts: Vec<_> = view
+                    .choices
+                    .iter()
+                    .filter(|c| c.account)
+                    .map(|c| (c.label.as_str(), c.insertion.as_str(), c.detail.as_str()))
+                    .collect();
+                assert_eq!(
+                    accounts,
+                    [
+                        (
+                            "Default account",
+                            "@\"claude/Default account\"",
+                            "claude account · CLI login"
+                        ),
+                        (
+                            "Work account",
+                            "@\"claude/Work account\"",
+                            "claude account · CLI login"
+                        ),
+                        ("can.le", "@claude/can.le", "claude account · CLI login"),
+                    ]
+                );
+                assert!(view.choices.iter().all(|c| !c.account
+                    || c.insertion.starts_with("@\"claude/")
+                    || c.insertion.starts_with("@claude/")));
+                assert!(
+                    view.choices.iter().any(|c| c.file),
+                    "the folder stays offered"
+                );
+                assert_eq!(view.choices[0].icon().0, "account-user");
+                // Filtering by label, then picking the spaced one inserts it quoted.
+                view.input
+                    .update(cx, |input, cx| input.set_text("@claude/wor".into(), cx));
+                let _ = w;
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, w, cx| {
+                assert_eq!(view.choices[0].label, "Work account");
+                let ix = view.choices.iter().position(|c| c.account).unwrap();
+                view.pick(ix, w, cx);
+                assert_eq!(view.input.read(cx).content, "@\"claude/Work account\" ");
+                assert!(view.account_tokens.contains("@\"claude/Work account\""));
+                let typed = view.input.read(cx).content.clone();
+                assert_eq!(
+                    composer::highlight_ranges(&typed, &view.account_tokens).len(),
+                    1
+                );
+            })
+            .unwrap();
+        let _ = work;
+    }
+
+    #[gpui::test]
+    fn a_bare_provider_prefix_lists_that_providers_accounts(cx: &mut TestAppContext) {
+        install_accounts(cx);
+        let window = window(cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.set_mono(PathBuf::from("/none"), "mono-a".into(), cx);
+                view.input
+                    .update(cx, |input, cx| input.set_text("@cod".into(), cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, _| {
+                let insertions: Vec<_> = view
+                    .choices
+                    .iter()
+                    .filter(|c| c.account)
+                    .map(|c| c.insertion.as_str())
+                    .collect();
+                assert_eq!(
+                    insertions,
+                    ["@\"codex/Default account\"", "@codex/hoangxuan2402"]
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_plain_composer_offers_and_attaches_no_account_mentions(cx: &mut TestAppContext) {
+        install_accounts(cx);
+        let window = window(cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.input
+                    .update(cx, |input, cx| input.set_text("@claude/".into(), cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, cx| {
+                assert!(view.choices.iter().all(|c| !c.account));
+                assert!(view.account_tokens.is_empty());
+                view.refresh_accounts(cx);
+                let text = "use @claude/can.le";
+                assert_eq!(view.prepare_prompt(text), text);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn the_prepared_prompt_carries_the_account_id_and_file_mentions_stay_files(
+        cx: &mut TestAppContext,
+    ) {
+        let (work, can, _) = install_accounts(cx);
+        let window = window(cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.set_mono(PathBuf::from("/none"), "mono-a".into(), cx);
+                view.refresh_accounts(cx);
+                let text = "start it with @\"claude/Work account\" and @claude/can.le.";
+                let sent = view.prepare_prompt(text);
+                assert!(sent.starts_with(&format!("{text}\n\n---\nReferenced provider account")));
+                assert!(sent.contains(&format!("\"id\":\"{work}\"")), "{sent}");
+                assert!(sent.contains(&format!("\"id\":\"{can}\"")), "{sent}");
+                assert!(sent.contains("\"authKind\":\"cli\""), "{sent}");
+                assert_eq!(sent.matches("Referenced provider account").count(), 1);
+                // No such account: still a file mention, nothing attached.
+                let file = "look at @claude/src and @claude/wor";
+                assert_eq!(view.prepare_prompt(file), file);
+                // A message the app wrote never attaches account context.
+                assert_eq!(view.prepare_prompt_for(text, false), text);
+                // A quoted line is not the user's own words.
+                let quoted = "> @claude/can.le";
+                assert_eq!(view.prepare_prompt(quoted), quoted);
             })
             .unwrap();
     }

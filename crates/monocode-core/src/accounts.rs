@@ -527,6 +527,14 @@ pub fn parse_provider(text: &str) -> Result<Kind, String> {
             )
         })
 }
+/// How an account signs in: "cli" (the provider CLI's own login), "setupToken" or "apiKey".
+pub fn auth_kind(kind: Kind, credential: Option<ClaudeCredential>) -> &'static str {
+    match (kind, credential) {
+        (Kind::Claude, Some(ClaudeCredential::SetupToken)) => "setupToken",
+        (Kind::Claude, Some(ClaudeCredential::ApiKey)) => "apiKey",
+        _ => "cli",
+    }
+}
 /// The `accounts.list` result: ids, labels and credential kinds only, never a
 /// token, an email or a path. `claude_credential` reports the kind of a named
 /// Claude account; anything without one (and every other provider) is "cli".
@@ -543,11 +551,7 @@ pub fn list_value(
     for kind in kinds {
         let preferred = book.preferred(kind);
         for account in book.list(kind) {
-            let auth = match (kind, claude_credential(&account.id)) {
-                (Kind::Claude, Some(ClaudeCredential::SetupToken)) => "setupToken",
-                (Kind::Claude, Some(ClaudeCredential::ApiKey)) => "apiKey",
-                _ => "cli",
-            };
+            let auth = auth_kind(kind, claude_credential(&account.id));
             rows.push(serde_json::json!({
                 "provider": kind.id(),
                 "id": account.id,

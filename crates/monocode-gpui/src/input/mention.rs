@@ -18,6 +18,9 @@ pub(super) enum MentionIcon {
     Workflow,
     /// A Today task, `@today/<key>`.
     Today,
+    /// A provider account, `@claude/<label>`. Only Mono composers mark one as known, so a
+    /// plain session never draws it.
+    Account,
 }
 impl MentionIcon {
     /// `@path`, `@"spaced path"`, or `@note/slug`, `@workflow/slug`, or `@today/key`.
@@ -36,6 +39,12 @@ impl MentionIcon {
             .strip_prefix('"')
             .and_then(|p| p.strip_suffix('"'))
             .map_or_else(|| path.to_owned(), |p| p.replace("\\\"", "\""));
+        if ["claude/", "codex/", "devin/"]
+            .iter()
+            .any(|provider| path.starts_with(provider))
+        {
+            return Some(Self::Account);
+        }
         let name = path.rsplit('/').next().unwrap_or(&path);
         Some(Self::File(
             format!("mi/{}.svg", crate::file_icons::file_icon_name(name)).into(),

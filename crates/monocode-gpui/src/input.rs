@@ -1881,12 +1881,16 @@ impl Element for InputElement {
                                     );
                                 }
                             }
-                            MentionIcon::Note | MentionIcon::Workflow | MentionIcon::Today => {
+                            MentionIcon::Note
+                            | MentionIcon::Workflow
+                            | MentionIcon::Today
+                            | MentionIcon::Account => {
                                 let _ = w.paint_svg(
                                     icon_bounds,
                                     match icon {
                                         MentionIcon::Note => "note",
                                         MentionIcon::Today => "check-circle",
+                                        MentionIcon::Account => "account-user",
                                         _ => "git-branch",
                                     }
                                     .into(),
@@ -2058,12 +2062,15 @@ mod tests {
             Some(MentionIcon::Note) => "note".into(),
             Some(MentionIcon::Workflow) => "git-branch".into(),
             Some(MentionIcon::Today) => "check-circle".into(),
+            Some(MentionIcon::Account) => "account-user".into(),
             None => String::new(),
         };
         assert_eq!(asset("@src/main.rs"), "mi/rust.svg");
         assert_eq!(asset("@\"docs/My Notes.md\""), "mi/markdown.svg");
         assert_eq!(asset("@note/todo"), "note");
         assert_eq!(asset("@workflow/nightly"), "git-branch");
+        assert_eq!(asset("@claude/can.le"), "account-user");
+        assert_eq!(asset("@\"codex/Work account\""), "account-user");
         assert_eq!(asset("@today/clickup:42"), "check-circle");
         assert_eq!(asset("/plan"), "");
     }

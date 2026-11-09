@@ -1,5 +1,6 @@
 //! Persistent Mono identities and app-owned context, shared by native views,
 //! scheduled runs and the local app CLI. React's monos/model is the reference.
+pub mod account_mention;
 pub mod api;
 pub mod bridge;
 pub mod cards;
