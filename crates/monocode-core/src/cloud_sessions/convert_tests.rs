@@ -252,8 +252,8 @@ fn world_with(ran_claude: bool, worktree: bool, extras: bool) -> World {
         std::fs::write(
             dir.join(format!("{SESSION}.jsonl")),
             format!(
-                "{{\"type\":\"user\",\"cwd\":\"{ws_text}\",\"sessionId\":\"{SESSION}\"}}\n\
-                 {{\"type\":\"assistant\",\"cwd\":\"{ws_text}/sub\",\"note\":\"{ws_text}-other\"}}\n"
+                "{{\"type\":\"user\",\"uuid\":\"u1\",\"cwd\":\"{ws_text}\",\"sessionId\":\"{SESSION}\"}}\n\
+                 {{\"type\":\"assistant\",\"uuid\":\"u2\",\"cwd\":\"{ws_text}/sub\",\"note\":\"{ws_text}-other\"}}\n"
             ),
         )
         .unwrap();
@@ -864,19 +864,125 @@ fn a_failed_snapshot_creates_nothing_and_leaves_the_cloud_session_for_a_retry() 
     assert_eq!(w.svc.store().unwrap().sessions().unwrap().len(), before);
 }
 
-#[test]
-fn an_existing_local_claude_file_is_never_overwritten() {
-    let w = world(true);
+fn local_transcript(w: &World) -> PathBuf {
     let dir = w
         .claude
         .join("projects")
         .join(claude_project_dir_name(w.project.to_str().unwrap()));
     std::fs::create_dir_all(&dir).unwrap();
-    let file = dir.join(format!("{SESSION}.jsonl"));
-    std::fs::write(&file, "mine\n").unwrap();
+    dir.join(format!("{SESSION}.jsonl"))
+}
+
+#[test]
+fn an_equal_local_transcript_is_left_alone() {
+    let w = world(true);
+    let file = local_transcript(&w);
+    let mine = "{\"uuid\":\"u1\",\"mine\":true}\n{\"uuid\":\"u2\"}\n";
+    std::fs::write(&file, mine).unwrap();
     let done = w.svc.convert_session(w.cloud_id, &mut |_| {}).unwrap();
     assert_eq!(done.resume, Resume::AlreadyThere(file.clone()));
-    assert_eq!(std::fs::read_to_string(file).unwrap(), "mine\n");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), mine);
+    assert!(!file.with_extension("jsonl.pre-cloud").exists());
+}
+
+#[test]
+fn a_local_transcript_the_cloud_extended_is_replaced_and_backed_up() {
+    let w = world(true);
+    let file = local_transcript(&w);
+    let old = "{\"uuid\":\"u1\",\"old\":true}\n";
+    std::fs::write(&file, old).unwrap();
+    let done = w.svc.convert_session(w.cloud_id, &mut |_| {}).unwrap();
+    assert_eq!(done.resume, Resume::Replaced(file.clone()));
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(text.contains("\"u2\"") && !text.contains("\"old\""));
+    assert!(text.contains(&format!("\"cwd\":\"{}\"", w.project.display())));
+    let backup = file.with_extension("jsonl.pre-cloud");
+    assert_eq!(std::fs::read_to_string(backup).unwrap(), old);
+    let local = w
+        .svc
+        .store()
+        .unwrap()
+        .sessions()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id == done.local_id)
+        .unwrap();
+    assert_eq!(local.provider_id.as_deref(), Some(SESSION));
+}
+
+#[test]
+fn a_diverged_local_transcript_is_never_overwritten_and_the_cloud_copy_forks() {
+    let w = world(true);
+    let file = local_transcript(&w);
+    let mine = "{\"uuid\":\"u1\"}\n{\"uuid\":\"other\"}\n";
+    std::fs::write(&file, mine).unwrap();
+    let done = w.svc.convert_session(w.cloud_id, &mut |_| {}).unwrap();
+    let Resume::Forked(new_id) = &done.resume else {
+        panic!("{:?}", done.resume);
+    };
+    assert_ne!(new_id, SESSION);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), mine);
+    let forked = file.with_file_name(format!("{new_id}.jsonl"));
+    let text = std::fs::read_to_string(forked).unwrap();
+    assert!(text.contains(new_id.as_str()) && !text.contains(SESSION));
+    assert!(done.warnings.iter().any(|w| w.contains("diverged")));
+    let local = w
+        .svc
+        .store()
+        .unwrap()
+        .sessions()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id == done.local_id)
+        .unwrap();
+    assert_eq!(local.provider_id.as_deref(), Some(new_id.as_str()));
+}
+
+#[test]
+fn a_failed_conversion_removes_the_fork_it_made_so_retries_do_not_pile_up() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = world(true);
+    let file = local_transcript(&w);
+    let mine = "{\"uuid\":\"u1\"}\n{\"uuid\":\"other\"}\n";
+    std::fs::write(&file, mine).unwrap();
+    // An unreadable evidence file fails the conversion after the transcript was installed.
+    let evidence = w
+        .svc
+        .store()
+        .unwrap()
+        .thread_dir(w.cloud_id)
+        .unwrap()
+        .unwrap()
+        .join(crate::cloud_sessions::EVIDENCE_DIR);
+    let locked = evidence.join("locked.txt");
+    let result = w.svc.convert_session(w.cloud_id, &mut |step| {
+        if step == "Creating the local copy" {
+            std::fs::create_dir_all(&evidence).unwrap();
+            std::fs::write(&locked, "x").unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+    });
+    let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644));
+    assert!(result.is_err());
+    let names: Vec<_> = std::fs::read_dir(file.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec![format!("{SESSION}.jsonl")]);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), mine);
+}
+
+#[test]
+fn cwd_rewrites_round_trip_for_paths_with_quotes_and_backslashes() {
+    let local = r#"C:\Users\me\"q" app"#;
+    let escaped = serde_json::to_string(local).unwrap();
+    let text = format!(
+        "{{\"cwd\":{escaped}}} {}/sub",
+        &escaped[1..escaped.len() - 1]
+    );
+    let cloud = rewrite_cwd(&text, &[local], "/workspaces/app");
+    assert_eq!(cloud, "{\"cwd\":\"/workspaces/app\"} /workspaces/app/sub");
+    assert_eq!(rewrite_cwd(&cloud, &["/workspaces/app"], local), text);
 }
 
 #[test]

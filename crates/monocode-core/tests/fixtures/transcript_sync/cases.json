@@ -1,0 +1,172 @@
+{
+  "sessionId": "11111111-1111-4111-8111-111111111111",
+  "cwd": "/workspaces/app",
+  "cases": [
+    {
+      "name": "fresh install",
+      "existing": null,
+      "incoming": "base.jsonl",
+      "decision": "install"
+    },
+    {
+      "name": "extension replaces",
+      "existing": "base.jsonl",
+      "incoming": "extended.jsonl",
+      "decision": "replace"
+    },
+    {
+      "name": "equal is already current",
+      "existing": "base.jsonl",
+      "incoming": "base.jsonl",
+      "decision": "already_current"
+    },
+    {
+      "name": "different third turn diverges",
+      "existing": "base.jsonl",
+      "incoming": "diverged.jsonl",
+      "decision": "diverged"
+    },
+    {
+      "name": "extension of the diverged copy diverges from base",
+      "existing": "diverged.jsonl",
+      "incoming": "extended.jsonl",
+      "decision": "diverged"
+    },
+    {
+      "name": "an incoming prefix of the existing file diverges",
+      "existing": "extended.jsonl",
+      "incoming": "base.jsonl",
+      "decision": "diverged"
+    },
+    {
+      "name": "a shorter existing file is replaced",
+      "existing": "shorter.jsonl",
+      "incoming": "base.jsonl",
+      "decision": "replace"
+    },
+    {
+      "name": "a shorter incoming file diverges",
+      "existing": "base.jsonl",
+      "incoming": "shorter.jsonl",
+      "decision": "diverged"
+    },
+    {
+      "name": "empty existing file is replaced",
+      "existing": "empty.jsonl",
+      "incoming": "base.jsonl",
+      "decision": "replace"
+    },
+    {
+      "name": "empty incoming against content diverges",
+      "existing": "base.jsonl",
+      "incoming": "empty.jsonl",
+      "decision": "diverged"
+    },
+    {
+      "name": "two empty files are equal",
+      "existing": "empty.jsonl",
+      "incoming": "empty.jsonl",
+      "decision": "already_current"
+    },
+    {
+      "name": "a truncated last line is not an entry, so the complete prefix is equal",
+      "existing": "edge_truncated_last_line.jsonl",
+      "incoming": "edge_truncated_last_line.jsonl",
+      "decision": "already_current"
+    },
+    {
+      "name": "CRLF and LF files with the same uuids are equal",
+      "existing": "edge_no_final_newline.jsonl",
+      "incoming": "edge_no_final_newline.jsonl",
+      "decision": "already_current"
+    }
+  ],
+  "chains": [
+    {
+      "file": "base.jsonl",
+      "uuids": [
+        "00000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-000000000002",
+        "00000000-0000-4000-8000-000000000003"
+      ]
+    },
+    {
+      "file": "extended.jsonl",
+      "uuids": [
+        "00000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-000000000002",
+        "00000000-0000-4000-8000-000000000003",
+        "00000000-0000-4000-8000-000000000004",
+        "00000000-0000-4000-8000-000000000005"
+      ]
+    },
+    {
+      "file": "empty.jsonl",
+      "uuids": []
+    },
+    {
+      "file": "edge_crlf.jsonl",
+      "uuids": [
+        "c1",
+        "c2"
+      ]
+    },
+    {
+      "file": "edge_uuid_not_string.jsonl",
+      "uuids": [
+        "s1"
+      ]
+    },
+    {
+      "file": "edge_non_json_line.jsonl",
+      "uuids": [
+        "n1",
+        "n2"
+      ]
+    },
+    {
+      "file": "edge_whitespace_line.jsonl",
+      "uuids": [
+        "w1",
+        "w2"
+      ]
+    },
+    {
+      "file": "edge_truncated_last_line.jsonl",
+      "uuids": [
+        "t1",
+        "t2"
+      ]
+    },
+    {
+      "file": "edge_duplicate_keys.jsonl",
+      "uuids": [
+        "d1",
+        "d5"
+      ]
+    },
+    {
+      "file": "edge_no_final_newline.jsonl",
+      "uuids": [
+        "f1",
+        "f2"
+      ]
+    },
+    {
+      "file": "edge_same_uuid_twice.jsonl",
+      "uuids": [
+        "r1",
+        "r2",
+        "r1"
+      ]
+    }
+  ],
+  "edgeRules": [
+    "Input is split on LF. A trailing CR is stripped from each line. A line of only ASCII whitespace is ignored.",
+    "Each line is parsed on its own as one JSON value. A line that does not parse as a JSON object (not JSON, truncated, an array, a string) contributes nothing to the chain.",
+    "Only a top-level string `uuid` joins the chain, in file order. A uuid that is not a string (number, null, array, object) is ignored. Duplicate uuid values in the file stay in the chain, in order.",
+    "A line that repeats a key (`uuid` or `sessionId` twice in the same object) is skipped as a whole, like serde's duplicate-field error. Mirrors must reject such a line too.",
+    "Only `uuid` and `sessionId` are interpreted. Every other field and unknown line shape is ignored.",
+    "Chains are compared as exact string sequences: equal means AlreadyCurrent, a strict prefix of the incoming chain means Replace, anything else means Diverged."
+  ]
+}

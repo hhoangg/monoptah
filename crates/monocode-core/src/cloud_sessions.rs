@@ -1636,6 +1636,7 @@ pub use backend::{CloudBackend, CloudBackendKind, CloudRef, CodespacesBackend};
 
 mod convert;
 pub use convert::*;
+pub mod transcript_sync;
 
 pub mod startup;
 pub mod view;
