@@ -55,7 +55,7 @@ impl Conversation {
             );
             // A stopped codespace never loads in the background: wake it, as a send would.
             if send && !self.cloud_start_blocks() {
-                self.reconnect_cloud(false, cx);
+                self.reconnect_cloud(cx);
             }
             return;
         }

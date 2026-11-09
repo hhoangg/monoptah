@@ -3893,6 +3893,7 @@ dependencies = [
  "tree-sitter-yaml",
  "tree-sitter-zig",
  "unicode-segmentation",
+ "zeroize",
 ]
 
 [[package]]

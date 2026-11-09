@@ -13,6 +13,7 @@ mod assets;
 mod attachment_tray;
 mod automations;
 mod changes;
+mod cloud_actions;
 mod cloud_dialog_ui;
 mod cloud_start_view;
 mod cloud_wake;

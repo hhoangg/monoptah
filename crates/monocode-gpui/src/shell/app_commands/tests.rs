@@ -1023,9 +1023,11 @@ fn deleting_with_remove_worktree_refuses_first_and_cleans_up_after(cx: &mut Test
 mod cloud {
     use super::*;
     use crate::cloud_wake::fakes::{
-        AUTH_NO_SCOPE, AUTH_OK, Dir, FakeHost, Gh, github_project, install,
+        AUTH_NO_SCOPE, AUTH_OK, Dir, FakeHost, Gh, SANDBOX, Sbx, github_project, install,
+        install_with_sandbox, sandbox_session,
     };
-    use monocode_core::cloud_sessions::{CodespaceChoice, Target};
+    use monocode_core::cloud_sessions::CloudBackendKind;
+    use monocode_core::mono::cloud_api::{CloudTarget, InstanceChoice};
     use std::sync::Arc;
 
     /// Operator whose project is a real git repo with a GitHub origin, with fake gh and host
@@ -1055,6 +1057,45 @@ mod cloud {
         let (gh, host) = install(store, auth, state);
         (window, caller, path, host, gh, dir)
     }
+    type SandboxSetup = (
+        WindowHandle<Shell>,
+        i64,
+        String,
+        Arc<FakeHost>,
+        Arc<Gh>,
+        Arc<Sbx>,
+        Dir,
+    );
+    /// [`setup_cloud_in`] with the fake Docker sandbox `box-1` (in `sandbox_state`) as well.
+    fn setup_sandbox(cx: &mut TestAppContext, sandbox_state: &str) -> SandboxSetup {
+        let (window, _, caller) = setup(cx);
+        let dir = github_project();
+        let path = dir.0.to_str().unwrap().to_owned();
+        let store = window
+            .update(cx, |shell, _, cx| {
+                shell.sessions[&caller].update(cx, |v, _| v.summary.cwd = path.clone());
+                shell.session_summaries.get_mut(&caller).unwrap().cwd = path.clone();
+                shell.store.clone()
+            })
+            .unwrap();
+        let (gh, host, sbx, _) = install_with_sandbox(store, AUTH_OK, "Shutdown", sandbox_state);
+        (window, caller, path, host, gh, sbx, dir)
+    }
+    /// A session of `path` on the fake sandbox, added to the shell.
+    fn add_sandbox_session(
+        window: WindowHandle<Shell>,
+        path: &str,
+        cx: &mut TestAppContext,
+    ) -> i64 {
+        window
+            .update(cx, |shell, _, cx| {
+                let summary = sandbox_session(&shell.store, path);
+                let id = summary.id;
+                shell.add(summary, cx);
+                id
+            })
+            .unwrap()
+    }
     fn setup_cloud(
         cx: &mut TestAppContext,
         auth: &'static str,
@@ -1076,11 +1117,10 @@ mod cloud {
                 let binding = api
                     .prepare(
                         path,
-                        Target {
-                            codespace: CodespaceChoice::Named("octo-run".into()),
-                            branch: None,
-                            machine: None,
-                        },
+                        CloudTarget::new(
+                            CloudBackendKind::Codespaces,
+                            InstanceChoice::Named("octo-run".into()),
+                        ),
                         &mut |_| {},
                     )
                     .unwrap();
@@ -1178,7 +1218,7 @@ mod cloud {
     }
 
     #[gpui::test]
-    fn cloud_sessions_list_and_read_with_a_target_and_never_wake_the_codespace(
+    fn cloud_sessions_list_and_read_with_a_target_and_never_wake_the_instance(
         cx: &mut TestAppContext,
     ) {
         let (window, caller, path, host, _, _dir) = setup_cloud(cx, AUTH_OK);
@@ -1188,7 +1228,7 @@ mod cloud {
         let rows = list["sessions"].as_array().unwrap();
         let find = |id: i64| rows.iter().find(|s| s["id"] == id).unwrap().clone();
         assert_eq!(find(caller)["target"], json!({"kind":"local"}));
-        assert!(find(caller).get("codespaceState").is_none());
+        assert!(find(caller).get("cloudState").is_none());
         for id in [caller, cloud] {
             for field in [
                 "archivedAt",
@@ -1203,9 +1243,10 @@ mod cloud {
         assert!(find(cloud)["worktreePath"].is_null());
         assert_eq!(
             find(cloud)["target"],
-            json!({"kind":"codespace","codespace":"octo-run","state":"stopped"})
+            json!({"kind":"codespace","instance":"octo-run","state":"stopped"})
         );
-        assert_eq!(find(cloud)["codespaceState"], "stopped");
+        assert_eq!(find(cloud)["cloudState"], "stopped");
+        assert!(find(cloud).get("codespaceState").is_none());
         let read = call(
             window,
             caller,
@@ -1215,8 +1256,8 @@ mod cloud {
             cx,
         )
         .unwrap();
-        assert_eq!(read["target"]["codespace"], "octo-run");
-        assert_eq!(read["codespaceState"], "stopped");
+        assert_eq!(read["target"]["instance"], "octo-run");
+        assert_eq!(read["cloudState"], "stopped");
         let local = call(
             window,
             caller,
@@ -1229,7 +1270,7 @@ mod cloud {
         assert_eq!(local["target"], json!({"kind":"local"}));
         assert!(
             host.0.lock().unwrap().is_empty(),
-            "listing and reading must not wake or contact the codespace"
+            "listing and reading must not wake or contact the instance"
         );
     }
 
@@ -1243,7 +1284,7 @@ mod cloud {
             caller,
             "cs1",
             "sessions.start",
-            json!({"prompt":"go","target":{"codespace":"octo-run"}}),
+            json!({"prompt":"go","target":{"kind":"codespace","instance":"octo-run"}}),
             cx,
         )
         .unwrap();
@@ -1272,7 +1313,7 @@ mod cloud {
         cx: &mut TestAppContext,
     ) {
         let (window, caller, _, host, gh, _dir) = setup_cloud_in(cx, AUTH_OK, "Failed");
-        let input = json!({"prompt":"inspect the environment","target":{"codespace":"new","branch":"main"}});
+        let input = json!({"prompt":"inspect the environment","target":{"kind":"codespace","instance":"new","branch":"main"}});
         let started = call(
             window,
             caller,
@@ -1283,7 +1324,10 @@ mod cloud {
         )
         .unwrap();
         let session_id = started["sessionId"].as_i64().unwrap();
-        assert_eq!(started["codespaceState"], "starting");
+        assert_eq!(started["cloudState"], "starting");
+        assert_eq!(started["target"]["kind"], "codespace");
+        assert_eq!(started["target"]["state"], "starting");
+        assert!(started["startup"].get("step").is_some());
         window
             .update(cx, |shell, window, cx| {
                 assert!(shell.session_summaries[&session_id].has_messages);
@@ -1428,35 +1472,42 @@ mod cloud {
     }
 
     #[gpui::test]
-    fn codespace_actions_list_stop_and_report_secrets(cx: &mut TestAppContext) {
-        let (window, caller, _, _, gh, _dir) = setup_cloud(cx, AUTH_OK);
-        let list = call(window, caller, "c1", "codespaces.list", json!({}), cx).unwrap();
-        assert_eq!(list["repo"], "octo/widgets");
-        assert_eq!(list["codespaces"][0]["name"], "octo-run");
-        assert_eq!(list["codespaces"][0]["state"], "stopped");
-        let secrets = call(
+    fn cloud_actions_list_both_backends_report_status_and_stop(cx: &mut TestAppContext) {
+        let (window, caller, path, _, gh, sbx, _dir) = setup_sandbox(cx, "running");
+        let codespace = add_cloud_session(window, &path, cx);
+        let sandbox = add_sandbox_session(window, &path, cx);
+        let list = call(window, caller, "c1", "cloud.list", json!({}), cx).unwrap();
+        assert_eq!(list["backends"]["codespace"]["ok"], true, "{list}");
+        assert_eq!(list["backends"]["sandbox"]["ok"], true, "{list}");
+        let rows = list["instances"].as_array().unwrap();
+        let find = |kind: &str| rows.iter().find(|row| row["kind"] == kind).unwrap().clone();
+        assert_eq!(find("codespace")["instance"], "octo-run");
+        assert_eq!(find("codespace")["state"], "stopped");
+        assert_eq!(find("codespace")["sessions"][0]["sessionId"], codespace);
+        assert_eq!(find("sandbox")["instance"], SANDBOX);
+        assert_eq!(find("sandbox")["state"], "available");
+        assert_eq!(find("sandbox")["sessions"][0]["sessionId"], sandbox);
+        let status = call(window, caller, "c2", "cloud.status", json!({}), cx).unwrap();
+        assert_eq!(
+            status["backends"]["codespace"]["secrets"][0]["key"],
+            "CLAUDE_CODE_OAUTH_TOKEN"
+        );
+        assert_eq!(
+            status["backends"]["codespace"]["secrets"][0]["status"],
+            "missing"
+        );
+        assert_eq!(status["backends"]["sandbox"]["installed"], true);
+        let stopped = call(
             window,
             caller,
-            "c2",
-            "codespaces.secretsStatus",
-            json!({}),
+            "c3",
+            "cloud.stop",
+            json!({"kind":"codespace","instance":"octo-run"}),
             cx,
         )
         .unwrap();
-        assert_eq!(secrets["secrets"][0]["key"], "CLAUDE_CODE_OAUTH_TOKEN");
-        assert_eq!(secrets["secrets"][0]["status"], "missing");
-        assert_eq!(
-            call(
-                window,
-                caller,
-                "c3",
-                "codespaces.stop",
-                json!({"name":"octo-run"}),
-                cx
-            )
-            .unwrap(),
-            json!({"codespace":"octo-run","stopped":true})
-        );
+        assert_eq!(stopped["stopped"], true, "{stopped}");
+        assert_eq!(stopped["kind"], "codespace");
         assert!(
             gh.calls
                 .lock()
@@ -1466,13 +1517,34 @@ mod cloud {
             "{:?}",
             gh.calls.lock().unwrap()
         );
+        // A sandbox is stopped through one of its sessions.
+        let stopped = call(
+            window,
+            caller,
+            "c4",
+            "cloud.stop",
+            json!({"sessionId":sandbox}),
+            cx,
+        )
+        .unwrap();
+        assert_eq!(
+            (stopped["kind"].as_str(), stopped["instance"].as_str()),
+            (Some("sandbox"), Some(SANDBOX))
+        );
+        assert!(
+            sbx.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.contains(" stop "))
+        );
         // A codespace of another repository is refused before gh is asked to stop it.
         let error = call(
             window,
             caller,
-            "c4",
-            "codespaces.stop",
-            json!({"name":"elsewhere-1"}),
+            "c5",
+            "cloud.stop",
+            json!({"kind":"codespace","instance":"elsewhere-1"}),
             cx,
         )
         .unwrap_err();
@@ -1487,22 +1559,49 @@ mod cloud {
     }
 
     #[gpui::test]
-    fn an_operator_cannot_delete_codespaces_and_read_only_threads_only_read(
+    fn cloud_resume_reconnects_a_codespace_or_a_sandbox_through_its_session(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, caller, path, host, _, _, _dir) = setup_sandbox(cx, "stopped");
+        let codespace = add_cloud_session(window, &path, cx);
+        let sandbox = add_sandbox_session(window, &path, cx);
+        host.0.lock().unwrap().clear();
+        for (request, id) in [("u1", codespace), ("u2", sandbox)] {
+            let resumed = call(
+                window,
+                caller,
+                request,
+                "cloud.resume",
+                json!({"sessionId":id}),
+                cx,
+            )
+            .unwrap();
+            assert_eq!(resumed["resumed"], true, "{resumed}");
+        }
+        let log = host.0.lock().unwrap().clone();
+        assert!(log.iter().any(|l| l == "ensure m-octo-run"), "{log:?}");
+        assert!(
+            log.iter()
+                .any(|l| l == "request m-sbx-box-1 environment.describe"),
+            "{log:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn an_operator_cannot_delete_instances_and_read_only_threads_only_read(
         cx: &mut TestAppContext,
     ) {
         let (window, caller, _, _, gh, _dir) = setup_cloud(cx, AUTH_OK);
-        assert_eq!(
-            call(
-                window,
-                caller,
-                "x1",
-                "codespaces.delete",
-                json!({"name":"octo-run"}),
-                cx
-            )
-            .unwrap_err(),
-            "Deleting a codespace is only available to a Mono"
-        );
+        for (request, input) in [
+            ("x1", json!({"kind":"codespace","instance":"octo-run"})),
+            ("x1b", json!({"kind":"sandbox","instance":SANDBOX})),
+            ("x1c", json!({"sessionId":-1})),
+        ] {
+            assert_eq!(
+                call(window, caller, request, "cloud.delete", input, cx).unwrap_err(),
+                "Deleting a cloud instance is only available to a Mono"
+            );
+        }
         assert!(
             !gh.calls
                 .lock()
@@ -1517,30 +1616,195 @@ mod cloud {
                 })
             })
             .unwrap();
-        assert!(call(window, caller, "x2", "codespaces.list", json!({}), cx).is_ok());
-        assert!(
-            call(
-                window,
-                caller,
-                "x3",
-                "codespaces.secretsStatus",
-                json!({}),
-                cx
-            )
-            .is_ok()
-        );
+        assert!(call(window, caller, "x2", "cloud.list", json!({}), cx).is_ok());
+        assert!(call(window, caller, "x3", "cloud.status", json!({}), cx).is_ok());
         for (request, action, input) in [
-            ("x4", "codespaces.stop", json!({"name":"octo-run"})),
-            ("x5", "codespaces.create", json!({})),
             (
-                "x6",
+                "x4",
+                "cloud.stop",
+                json!({"kind":"codespace","instance":"octo-run"}),
+            ),
+            (
+                "x5",
+                "cloud.resume",
+                json!({"kind":"codespace","instance":"octo-run"}),
+            ),
+            ("x6", "cloud.create", json!({"kind":"codespace"})),
+            (
+                "x7",
                 "sessions.start",
-                json!({"prompt":"x","target":{"codespace":"new"}}),
+                json!({"prompt":"x","target":{"kind":"codespace","instance":"new"}}),
             ),
         ] {
             let error = call(window, caller, request, action, input, cx).unwrap_err();
             assert!(error.contains("read-only"), "{action}: {error}");
         }
+    }
+
+    /// The Operator has no archive state of its own to consult, but the shell's busy keys are
+    /// passed to the core as the extra predicate: stop is refused while an archive is in flight.
+    #[gpui::test]
+    fn cloud_stop_is_refused_while_an_archive_works_on_the_instance(cx: &mut TestAppContext) {
+        let (window, caller, _, _, _, _dir) = setup_cloud(cx, AUTH_OK);
+        window
+            .update(cx, |shell, _, _| {
+                shell.mono_test_busy_cloud(&monocode_core::cloud_sessions::CloudRef::codespace(
+                    "octo-run",
+                ))
+            })
+            .unwrap();
+        let error = call(
+            window,
+            caller,
+            "w1",
+            "cloud.stop",
+            json!({"kind":"codespace","instance":"octo-run"}),
+            cx,
+        )
+        .unwrap_err();
+        assert!(
+            error.starts_with("Cannot stop codespace octo-run"),
+            "{error}"
+        );
+        assert!(error.contains("archiving or converting"), "{error}");
+    }
+
+    #[gpui::test]
+    fn an_operator_starts_a_session_on_an_existing_sandbox_and_a_send_wakes_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, caller, path, host, _, _, _dir) = setup_sandbox(cx, "stopped");
+        let existing = add_sandbox_session(window, &path, cx);
+        host.0.lock().unwrap().clear();
+        let started = call(
+            window,
+            caller,
+            "sb1",
+            "sessions.start",
+            json!({"prompt":"go","target":{"kind":"sandbox","instance":{"session":existing}}}),
+            cx,
+        )
+        .unwrap();
+        let id = started["sessionId"].as_i64().unwrap();
+        assert!(id < 0 && id != existing, "{started}");
+        assert_eq!(
+            started["target"],
+            json!({"kind":"sandbox","instance":SANDBOX,"state":"stopped"})
+        );
+        assert_eq!(started["cloudState"], "stopped");
+        assert!(started.get("startup").is_none(), "{started}");
+        window
+            .update(cx, |shell, _, _| {
+                assert!(shell.is_cloud(id));
+                assert!(
+                    shell.cloud_start_snapshot(id).is_none(),
+                    "nothing to provision"
+                );
+            })
+            .unwrap();
+        // The first prompt of an attached session wakes the stopped sandbox.
+        assert!(
+            host.0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l == "request m-sbx-box-1 environment.describe"),
+            "{:?}",
+            host.0.lock().unwrap()
+        );
+        // Listing shows the same shape as for a codespace.
+        let list = call(window, caller, "sb2", "sessions.list", json!({}), cx).unwrap();
+        let row = list["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == existing)
+            .unwrap();
+        assert_eq!(
+            row["target"],
+            json!({"kind":"sandbox","instance":SANDBOX,"state":"stopped"})
+        );
+        assert_eq!(row["cloudState"], "stopped");
+        // A session of the project on another backend is refused.
+        let error = call(
+            window,
+            caller,
+            "sb3",
+            "sessions.start",
+            json!({"prompt":"go","target":{"kind":"codespace","instance":{"session":existing}}}),
+            cx,
+        )
+        .unwrap_err();
+        assert!(error.contains("runs in a"), "{error}");
+    }
+
+    #[gpui::test]
+    fn a_send_to_a_session_on_a_stopped_sandbox_wakes_it_then_asks_for_a_retry(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, caller, path, host, _, _, _dir) = setup_sandbox(cx, "stopped");
+        let sandbox = add_sandbox_session(window, &path, cx);
+        host.0.lock().unwrap().clear();
+        let draft = call(
+            window,
+            caller,
+            "sw1",
+            "sessions.draft",
+            json!({"sessionId":sandbox,"prompt":"later"}),
+            cx,
+        )
+        .unwrap_err();
+        assert!(draft.contains("busy, loading"), "{draft}");
+        assert!(host.0.lock().unwrap().is_empty(), "a draft never wakes");
+        let error = call(
+            window,
+            caller,
+            "sw2",
+            "sessions.send",
+            json!({"sessionId":sandbox,"prompt":"hello"}),
+            cx,
+        )
+        .unwrap_err();
+        assert!(error.contains("woken or reconnected"), "{error}");
+        assert!(
+            host.0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l == "request m-sbx-box-1 environment.describe"),
+            "{:?}",
+            host.0.lock().unwrap()
+        );
+    }
+
+    #[gpui::test]
+    fn pull_evidence_accepts_a_sandbox_session_of_the_project(cx: &mut TestAppContext) {
+        let (window, caller, path, _, gh, _, _dir) = setup_sandbox(cx, "running");
+        let sandbox = add_sandbox_session(window, &path, cx);
+        let calls = gh.calls.lock().unwrap().len();
+        // Bad input is refused first; a good call reaches the core, which is the only layer
+        // that knows the backend (the in-memory store keeps no session folders).
+        let bad = call(
+            window,
+            caller,
+            "se1",
+            "sessions.pullEvidence",
+            json!({"sessionId":sandbox,"path":"../x"}),
+            cx,
+        )
+        .unwrap_err();
+        assert!(bad.contains(".."), "{bad}");
+        let reached = call(
+            window,
+            caller,
+            "se2",
+            "sessions.pullEvidence",
+            json!({"sessionId":sandbox}),
+            cx,
+        )
+        .unwrap_err();
+        assert!(reached.contains("no session folders"), "{reached}");
+        assert_eq!(gh.calls.lock().unwrap().len(), calls);
     }
 
     #[gpui::test]
@@ -1556,7 +1820,7 @@ mod cloud {
             caller,
             "t1",
             "sessions.start",
-            json!({"prompt":"x","target":{"codespace":"new","branch":"main"}}),
+            json!({"prompt":"x","target":{"kind":"codespace","instance":"new","branch":"main"}}),
             cx,
         )
         .unwrap_err();
@@ -1576,15 +1840,15 @@ mod cloud {
         for (request, input) in [
             (
                 "t2",
-                json!({"prompt":"x","harness":"codex","target":{"codespace":"new"}}),
+                json!({"prompt":"x","harness":"codex","target":{"kind":"codespace","instance":"new"}}),
             ),
             (
                 "t3",
-                json!({"prompt":"x","target":{"codespace":"new"},"workspaceMode":"worktree"}),
+                json!({"prompt":"x","target":{"kind":"codespace","instance":"new"},"workspaceMode":"worktree"}),
             ),
             (
                 "t4",
-                json!({"prompt":"x","target":{"codespace":"has space"}}),
+                json!({"prompt":"x","target":{"kind":"codespace","instance":"has space"}}),
             ),
         ] {
             assert!(call(window, caller, request, "sessions.start", input, cx).is_err());

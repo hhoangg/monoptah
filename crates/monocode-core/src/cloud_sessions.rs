@@ -36,16 +36,17 @@
 //!   the GUI remote run path before dispatching. No-op for non-cloud sessions;
 //!   for cloud sessions it enforces the Claude-only rule and calls
 //!   `Connections::ensure_codespace` (wakes after an idle stop). BLOCKS; only
-//!   call from a worker thread on a user-initiated send/retry/stop, never from
-//!   background polling.
+//!   call from a worker thread on an explicit send/retry/stop (the GUI, a Mono or the app
+//!   API), never from background polling. A sandbox session is woken through
+//!   [`CloudSessions::reconnect_sandbox`] instead.
 //!
 //! * [`CloudSessions::pull_evidence`] `(session_id, Option<remote_path>) -> EvidencePull`:
-//!   copy the files an agent left in the codespace (default
+//!   copy the files an agent left in the codespace or sandbox (default
 //!   `/workspaces/<repo>/.evidence`) into the session's own folder
 //!   `<db>.threads/<session>/evidence/` (a custom path lands in `evidence/<its name>`),
 //!   merging over earlier pulls, and return the local
 //!   file paths. A missing remote folder is `Ok` with no files and a `message`. This is a
-//!   user action: `gh codespace cp` starts a stopped codespace. BLOCKS (gh).
+//!   user action: copying starts a stopped codespace or sandbox. BLOCKS (gh or ssh).
 //!
 //! * Viewing a workspace file from the chat ([`view`], [`view_cache`]):
 //!   [`CloudSessions::resolve_cloud_file`] / [`CloudSessions::open_cloud_file`] read a
@@ -65,7 +66,11 @@
 //!   side-panel actions. Readers that need only a `&Store`: [`start_record`],
 //!   [`pending_starts`], [`starting_refusal`], [`queue_start_message`],
 //!   [`queued_start_messages`] and [`queued_start_message`]. [`SessionTarget::startup`] carries the phase to the app API.
-//!   `prepare_target` keeps its blocking behaviour (used by `sessions.start`).
+//!   `prepare_target` keeps its blocking behaviour.
+//!
+//! * Shared instances: [`CloudSessions::sessions_on`] lists the live sessions of one
+//!   codespace or sandbox (any project) and [`CloudSessions::attach_session`] starts another
+//!   session on an instance that already has a ready one, without a start record.
 //!
 //! * Docker sandbox starts ([`docker_start`]): after [`CloudSessions::with_sandboxes`],
 //!   [`CloudSessions::begin_sandbox_start`] `(local_cwd, &DockerProjectConfig, branch,
@@ -99,8 +104,42 @@ pub fn is_not_connected(error: &str) -> bool {
 /// Error text for a start that failed after its codespace was created.
 pub fn created_note(codespace: &str, error: &str) -> String {
     format!(
-        "{error} (codespace {codespace} was created and kept; retry with target {{\"codespace\":\"{codespace}\"}} or remove it with codespaces.delete)"
+        "{error} (codespace {codespace} was created and kept; retry with target {{\"kind\":\"codespace\",\"instance\":\"{codespace}\"}} or remove it with cloud.delete: an operator must ask the user to, a Mono may use it on explicit request)"
     )
+}
+
+/// Error text for a start that failed after the instance `cloud` was created, worded for its
+/// backend. A sandbox cannot be targeted again until its session is ready, so the advice is
+/// to resume the pending session (kept by [`startup::pause_start`]) or remove the sandbox.
+pub fn created_note_for(cloud: &CloudRef, error: &str) -> String {
+    match cloud.kind {
+        CloudBackendKind::Codespaces => created_note(&cloud.name, error),
+        CloudBackendKind::DockerSandbox => format!(
+            "{error} (sandbox {} was created and kept with its pending session; use Retry on that session in the app to continue, or remove it with cloud.delete: an operator must ask the user to, a Mono may use it on explicit request)",
+            cloud.name
+        ),
+    }
+}
+
+const CODESPACE_NOTE_OPEN: &str = " (codespace ";
+const SANDBOX_NOTE_OPEN: &str = " (sandbox ";
+const NOTE_MARK: &str = " was created and kept";
+
+/// Splits an error built by [`created_note_for`] into the plain error, the backend and the
+/// name of the instance the failed start created. `None` for any other text. This is the one
+/// parser of that format, so the wording cannot drift from the builders.
+pub fn split_created_note(error: &str) -> Option<(&str, CloudBackendKind, &str)> {
+    [
+        (CODESPACE_NOTE_OPEN, CloudBackendKind::Codespaces),
+        (SANDBOX_NOTE_OPEN, CloudBackendKind::DockerSandbox),
+    ]
+    .into_iter()
+    .find_map(|(open, kind)| {
+        let at = error.find(open)?;
+        let (name, tail) = error[at + open.len()..].split_once(NOTE_MARK)?;
+        (!name.is_empty() && !tail.is_empty() && !name.contains(' '))
+            .then(|| (error[..at].trim(), kind, name))
+    })
 }
 
 /// Error text of a start that was cancelled or whose session disappeared. Not a failure: no
@@ -334,10 +373,6 @@ pub trait Host: Send + Sync {
         display: &str,
         progress: &mut dyn FnMut(&str),
     ) -> Result<Machine, String>;
-    /// Wake the codespace and reconnect if needed (blocking, no-op when
-    /// connected). `progress` fires only when a wake actually starts; `cancel`
-    /// aborts the wait with `remote::WAKE_CANCELLED`. Concurrent calls for one
-    /// machine share a single reconnect.
     /// Pair with the Host in a Docker Sandbox's devcontainer; blocks until done. The relay
     /// on `sandbox.relay_port` must already run. A host without sandbox support refuses.
     fn connect_sandbox(
@@ -349,6 +384,16 @@ pub trait Host: Send + Sync {
         let _ = (sandbox, display, progress);
         Err("This host cannot connect to a Docker sandbox.".into())
     }
+    /// Wake the codespace and reconnect if needed (blocking, no-op when
+    /// connected). `progress` fires only when a wake actually starts; `cancel`
+    /// aborts the wait with `remote::WAKE_CANCELLED`. Concurrent calls for one
+    /// machine share a single reconnect.
+    ///
+    /// BLOCKS for minutes: call it from a worker thread, never the UI thread. A Mono or the
+    /// app API may call it for an explicit send or `cloud.resume`; background polling must
+    /// not. A sandbox machine is refused (`SANDBOX_NOT_CONNECTED`) on purpose: sandboxes are
+    /// woken by [`CloudSessions::reconnect_sandbox`], which also restores their relay and
+    /// credentials.
     fn ensure(
         &self,
         machine_id: &str,
@@ -845,6 +890,22 @@ impl CloudSessions {
         self.store()?.create(harness, &binding.project_key)
     }
 
+    /// Whether `local_cwd` has a cloud session, or a start in progress or failed, bound to
+    /// a `kind` instance. Reads only the local store: it never runs a CLI.
+    pub fn project_uses(&self, local_cwd: &str, kind: CloudBackendKind) -> bool {
+        let session = self
+            .cloud_sessions_for(local_cwd)
+            .unwrap_or_default()
+            .iter()
+            .any(|s| s.cloud.kind == kind);
+        session
+            || self.store().is_ok_and(|store| {
+                pending_starts(&store).iter().any(|r| {
+                    r.local_project == local_cwd && r.cloud().is_some_and(|c| c.kind == kind)
+                })
+            })
+    }
+
     /// Sessions of `local_cwd` that live in codespaces or Docker sandboxes, newest first.
     pub fn cloud_sessions_for(&self, local_cwd: &str) -> Result<Vec<CloudSession>, String> {
         Ok(self
@@ -1113,7 +1174,7 @@ impl CloudSessions {
             let cloud = session
                 .project
                 .cloud()
-                .ok_or("This session does not run in a codespace.")?;
+                .ok_or("This session does not run in a cloud workspace.")?;
             let thread = store
                 .thread_dir(session_id)?
                 .ok_or("This store keeps no session folders, so evidence cannot be saved.")?;
@@ -1121,13 +1182,14 @@ impl CloudSessions {
         };
         let backend = self.backend(cloud.kind)?;
         self.prime_backend(&cloud);
-        let codespace = cloud.name.clone();
+        let instance = cloud.name.clone();
         let root = self.workspace_root_of(&cloud);
         let remote = evidence_remote_path(&root, &workspace, remote_path)?;
         let local_dir = thread.join(EVIDENCE_DIR);
         let mut pull = EvidencePull {
             session_id,
-            codespace: codespace.clone(),
+            kind: cloud.kind,
+            instance: instance.clone(),
             remote_path: remote.clone(),
             local_dir: local_dir.clone(),
             files: vec![],
@@ -1201,11 +1263,84 @@ impl CloudSessions {
         }
         if pull.files.is_empty() {
             pull.message = Some(format!(
-                "No evidence files found at {remote} in {} {codespace}.",
+                "No evidence files found at {remote} in {} {instance}.",
                 cloud.noun()
             ));
         }
         Ok(pull)
+    }
+
+    /// The live (non-archived) sessions bound to `cloud`, whatever project they belong to,
+    /// newest first. A session whose start is still in progress is included (`pending`) and
+    /// counts as busy until the start fails. Reads the store only.
+    pub fn sessions_on(&self, cloud: &CloudRef) -> Vec<InstanceSession> {
+        let Ok(store) = self.store() else {
+            return vec![];
+        };
+        let mut found: Vec<InstanceSession> = store
+            .cloud_session_ids(cloud)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|id| store.remote_session(id).ok().flatten())
+            .filter(|s| !s.summary.archived)
+            .map(|s| {
+                let pending = crate::store::is_pending_cloud_environment(&s.project.environment_id);
+                let starting =
+                    pending && start_record(&store, s.summary.id).is_some_and(|r| !r.is_failed());
+                InstanceSession {
+                    id: s.summary.id,
+                    title: s.summary.title.clone(),
+                    local_project: s.project.local_project.clone(),
+                    running: s.running,
+                    needs_input: s.needs_input,
+                    pending,
+                    starting,
+                    updated_at: s.summary.updated_at,
+                }
+            })
+            .collect();
+        found.sort_by_key(|s| (std::cmp::Reverse(s.updated_at), std::cmp::Reverse(s.id)));
+        found
+    }
+
+    /// Starts a ready session on the existing workspace `cloud` of the local project: it
+    /// reuses the remote project of an existing, connected session of that project on the same
+    /// instance. No start record and no provisioning; the first send wakes a stopped
+    /// instance. `Err` when the project has no ready session on `cloud`, because the remote
+    /// project (and the pairing behind it) is only known through one. Claude only.
+    pub fn attach_session(
+        &self,
+        local_cwd: &str,
+        cloud: &CloudRef,
+        harness: &str,
+    ) -> Result<crate::store::Session, String> {
+        require_claude(harness)?;
+        let store = self.store()?;
+        let on_instance: Vec<RemoteSession> = store
+            .cloud_sessions(local_cwd)?
+            .into_iter()
+            .filter(|s| s.project.cloud().as_ref() == Some(cloud) && !s.summary.archived)
+            .collect();
+        if on_instance.is_empty() {
+            return Err(format!(
+                "No session of this project runs in {} {}. Start a new {} with sessions.start target {{\"kind\":\"{}\",\"instance\":\"new\"}}.",
+                cloud.noun(),
+                cloud.name,
+                cloud.noun(),
+                cloud.kind.api_name()
+            ));
+        }
+        let ready = on_instance
+            .iter()
+            .find(|s| !crate::store::is_pending_cloud_environment(&s.project.environment_id))
+            .ok_or_else(|| {
+                format!(
+                    "The only sessions on {} {} are still starting. Try again when one is ready.",
+                    cloud.noun(),
+                    cloud.name
+                )
+            })?;
+        store.create(harness, &ready.project.key)
     }
 
     /// Codespace binding of one session (desktop session id), with its cached
@@ -1326,8 +1461,11 @@ pub const EVIDENCE_DIR: &str = "evidence";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EvidencePull {
     pub session_id: i64,
-    pub codespace: String,
-    /// The folder or file that was copied, as an absolute codespace path.
+    /// The backend that hosts the session.
+    pub kind: CloudBackendKind,
+    /// Name of the codespace or sandbox the files came from.
+    pub instance: String,
+    /// The folder or file that was copied, as an absolute path in the workspace.
     pub remote_path: String,
     /// The session's local evidence folder.
     pub local_dir: std::path::PathBuf,
@@ -1348,7 +1486,7 @@ fn evidence_remote_path(
 ) -> Result<String, String> {
     let workspace = workspace.trim_end_matches('/');
     if !workspace.starts_with(&format!("{}/", root.trim_end_matches('/'))) {
-        return Err("This session has no codespace workspace to pull from.".into());
+        return Err("This session has no cloud workspace to pull from.".into());
     }
     let Some(path) = given else {
         return Ok(format!("{workspace}/.evidence"));
@@ -1412,6 +1550,29 @@ pub enum DeleteOutcome {
     DeletedWithWarning(String),
 }
 
+/// One live session on a cloud instance, see [`CloudSessions::sessions_on`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstanceSession {
+    pub id: i64,
+    pub title: String,
+    /// The local project the session belongs to.
+    pub local_project: Option<String>,
+    pub running: bool,
+    pub needs_input: bool,
+    /// Still on the provisional project of a start.
+    pub pending: bool,
+    /// A start in progress (pending and not failed).
+    pub starting: bool,
+    pub updated_at: u64,
+}
+impl InstanceSession {
+    /// Doing something that stopping or deleting the instance would interrupt: a turn is
+    /// running, it waits for input, or its start is in progress.
+    pub fn busy(&self) -> bool {
+        self.running || self.needs_input || self.starting
+    }
+}
+
 /// A session's codespace and its (cached) state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionTarget {
@@ -1456,8 +1617,8 @@ pub mod startup;
 pub mod view;
 pub mod view_cache;
 pub use startup::{
-    pending_starts, queue_start_message, queued_start_message, queued_start_messages, start_record,
-    starting_refusal, StartEvent, StartRecord, Step, StepKind, StepStatus,
+    pause_start, pending_starts, queue_start_message, queued_start_message, queued_start_messages,
+    start_record, starting_refusal, StartEvent, StartRecord, Step, StepKind, StepStatus,
 };
 
 // These fixtures execute the Linux host scripts against local Unix paths.

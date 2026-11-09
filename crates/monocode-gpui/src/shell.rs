@@ -33,7 +33,7 @@ mod idle_agents;
 mod image_lightbox_tests;
 mod layout;
 mod live_agents;
-pub(crate) use app_commands::{CLOUD_ARCHIVING, CODESPACE_BUSY};
+pub(crate) use app_commands::CLOUD_ARCHIVING;
 pub(crate) use cloud_app_archive::ArchiveFailure;
 pub(crate) use live_agents::live_elapsed;
 mod mobile_host;

@@ -683,6 +683,11 @@ fn a_created_codespace_error_locks_the_button(cx: &mut TestAppContext) {
     let note = monocode_core::cloud_sessions::created_note("octo-abc", "store failed");
     assert_eq!(created_codespace(&note), Some("octo-abc"));
     assert_eq!(created_codespace("Could not create it"), None);
+    let sandbox = monocode_core::cloud_sessions::created_note_for(
+        &monocode_core::cloud_sessions::CloudRef::sandbox("sbx-2"),
+        "x",
+    );
+    assert_eq!(created_codespace(&sandbox), Some("sbx-2"));
     window
         .update(cx, |view, _, cx| {
             view.cloud_create_finished(id, Err(note), cx);

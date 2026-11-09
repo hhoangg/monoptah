@@ -598,7 +598,7 @@ pub fn remove_start_record(store: &Store, id: i64) -> Result<(), String> {
 }
 
 /// Pauses a pending session before archive or an explicit stop. Retry remains available.
-pub(crate) fn pause_start(store: &Store, id: i64, reason: &str) -> Result<(), String> {
+pub fn pause_start(store: &Store, id: i64, reason: &str) -> Result<(), String> {
     if let Some(mut record) = start_record(store, id) {
         record.fail(reason.into(), crate::time::now_ms());
         save_start_record(store, &record)?;

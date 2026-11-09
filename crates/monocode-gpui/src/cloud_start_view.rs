@@ -184,11 +184,9 @@ impl CloudStartSnapshot {
     /// offers the buttons).
     pub(crate) fn short_error(&self) -> Option<String> {
         let error = self.error()?;
-        let cut = error
-            .find(" (codespace ")
-            .filter(|at| error[*at..].contains("was created and kept"))
-            .unwrap_or(error.len());
-        Some(error[..cut].trim().to_owned())
+        let plain = monocode_core::cloud_sessions::split_created_note(error)
+            .map_or(error, |(plain, _, _)| plain);
+        Some(plain.trim().to_owned())
     }
 }
 
@@ -526,6 +524,20 @@ mod tests {
         let snapshot = failed(2, &note);
         assert_eq!(snapshot.short_error().unwrap(), "cargo fetch failed");
         assert_eq!(failed(2, "plain").short_error().unwrap(), "plain");
+    }
+
+    #[test]
+    fn short_error_drops_the_sandbox_advice_too() {
+        let cloud = monocode_core::cloud_sessions::CloudRef::sandbox("sbx-1");
+        let note = monocode_core::cloud_sessions::created_note_for(&cloud, "clone failed");
+        assert_eq!(failed(2, &note).short_error().unwrap(), "clone failed");
+        let (plain, kind, name) = monocode_core::cloud_sessions::split_created_note(&note).unwrap();
+        assert_eq!(plain, "clone failed");
+        assert_eq!(
+            kind,
+            monocode_core::cloud_sessions::CloudBackendKind::DockerSandbox
+        );
+        assert_eq!(name, "sbx-1");
     }
     #[test]
     fn missing_or_implausible_step_times_never_show_a_duration() {
