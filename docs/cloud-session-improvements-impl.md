@@ -1459,7 +1459,7 @@ ticket, after review and after merge.
 | F2-0 | 1 | todo | - | |
 | F1-2 | 1 | todo | - | |
 | F1-3 | 1 | todo | - | |
-| H1 | 1 | todo | - | |
+| H1 | 1 | merged | csi-h1 | merge 9b6cba91. Opus review: fixed first-release tag path, gh not-found check, dirty tree on commit fail. actionlint unavailable. Note: describe.host.version is bare X.Y.Z; --version prints X.Y.Z+monoptah. |
 | F3-1 | 1 | todo | - | |
 | F3-5a | 1 | todo | - | needs the user (Keychain) |
 | F4-0 | 1 | todo | - | needs the user's OK (model requests) |
