@@ -1,7 +1,8 @@
 //! Tests for opening files of a cloud workspace from chat links.
 use super::cloud::CloudMark;
 use super::cloud_view::{
-    Cached, Outcome, cached_open, cloud_target, read_for_view, takes_cloud_link,
+    self, Cached, Outcome, cached_open, cloud_target, read_for_click, read_for_view,
+    takes_cloud_link,
 };
 use super::*;
 use crate::document_lightbox::{Kind, MAX_BYTES};
@@ -54,6 +55,10 @@ struct FileHost {
     files: Mutex<std::collections::HashMap<String, Vec<u8>>>,
     log: Mutex<Vec<String>>,
     disconnected: bool,
+    /// Whether `ensure` may be called; it brings a disconnected host back.
+    may_reconnect: bool,
+    reconnected: AtomicBool,
+    ensured: Mutex<u32>,
 }
 impl Host for FileHost {
     fn machines(&self) -> Result<Vec<Machine>, String> {
@@ -71,7 +76,11 @@ impl Host for FileHost {
         panic!("viewing must not connect");
     }
     fn ensure(&self, _: &str, _: &AtomicBool, _: &mut dyn FnMut(&str)) -> Result<(), String> {
-        panic!("viewing must not wake the workspace");
+        assert!(self.may_reconnect, "viewing must not wake the workspace");
+        *self.ensured.lock().unwrap() += 1;
+        self.reconnected
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
     fn request(&self, _: &str, method: &str, params: Value) -> Result<Value, String> {
         if method == "environment.describe" {
@@ -80,7 +89,7 @@ impl Host for FileHost {
         assert_eq!(method, "files.readBytes");
         let path = params["path"].as_str().unwrap().to_owned();
         self.log.lock().unwrap().push(path.clone());
-        if self.disconnected {
+        if self.disconnected && !self.reconnected.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(monocode_core::remote::CODESPACE_NOT_CONNECTED.into());
         }
         let files = self.files.lock().unwrap();
@@ -141,6 +150,170 @@ fn clicked_links_become_workspace_paths() {
         cloud_target("file:///workspaces/widgets/my%20file.md"),
         "/workspaces/widgets/my file.md"
     );
+}
+
+fn idle_workspace(tag: &str, may_reconnect: bool) -> (Scratch, CloudSessions, Arc<FileHost>, i64) {
+    let dir = Scratch::new(tag);
+    let host = FileHost {
+        disconnected: true,
+        may_reconnect,
+        ..FileHost::default()
+    };
+    host.files
+        .lock()
+        .unwrap()
+        .insert("notes.md".into(), b"# Hi".to_vec());
+    let (svc, host, id) = service(host, dir.path());
+    (dir, svc, host, id)
+}
+
+/// A plain read (a background one) of an idle workspace never wakes it: it says to reconnect.
+#[test]
+fn reading_an_idle_workspace_without_a_click_never_wakes_it() {
+    let (_dir, svc, host, id) = idle_workspace("idle-read", false);
+    let never = AtomicBool::new(false);
+    match read_for_view(&svc, id, "notes.md", &never) {
+        Outcome::Message(text) => assert!(text.starts_with("Reconnect to view"), "{text}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(*host.ensured.lock().unwrap(), 0);
+}
+
+/// A click on a file link reconnects the idle workspace, opens the file, says it reconnected
+/// and hands the reconnect progress lines to the card.
+#[test]
+fn clicking_a_link_in_an_idle_workspace_reconnects_then_opens_the_file() {
+    let (_dir, svc, host, id) = idle_workspace("idle-click", true);
+    let never = AtomicBool::new(false);
+    let mut lines = Vec::new();
+    let (outcome, reconnected) = read_for_click(
+        &svc,
+        id,
+        "notes.md",
+        &never,
+        &|progress| {
+            progress("Starting the Host");
+            host.ensure("env-octo-abc", &never, progress)?;
+            Ok(true)
+        },
+        &mut |line| lines.push(line.to_owned()),
+    );
+    match outcome {
+        Outcome::Document { doc, .. } => assert_eq!(doc.text.as_deref(), Some("# Hi")),
+        other => panic!("{other:?}"),
+    }
+    assert!(reconnected);
+    assert_eq!(lines, ["Starting the Host"]);
+    assert_eq!(*host.ensured.lock().unwrap(), 1);
+}
+
+/// A connected workspace is read at once: no reconnect and nothing to report.
+#[test]
+fn clicking_a_link_in_a_connected_workspace_does_not_reconnect() {
+    let dir = Scratch::new("connected-click");
+    let host = FileHost::default();
+    host.files
+        .lock()
+        .unwrap()
+        .insert("notes.md".into(), b"# Hi".to_vec());
+    let (svc, _host, id) = service(host, dir.path());
+    let never = AtomicBool::new(false);
+    let (outcome, reconnected) = read_for_click(
+        &svc,
+        id,
+        "notes.md",
+        &never,
+        &|_| panic!("a connected workspace is not reconnected"),
+        &mut |_| {},
+    );
+    assert!(matches!(outcome, Outcome::Document { .. }), "{outcome:?}");
+    assert!(!reconnected);
+}
+
+/// Every way a click reconnect can end without a file shows a message on the card.
+#[test]
+fn a_click_reconnect_that_does_not_happen_or_fails_shows_why() {
+    let (_dir, svc, _host, id) = idle_workspace("click-fails", false);
+    let never = AtomicBool::new(false);
+    let click = |reconnect: &cloud_view::Reconnect<'_>| {
+        let (outcome, reconnected) =
+            read_for_click(&svc, id, "notes.md", &never, reconnect, &mut |_| {});
+        assert!(!reconnected);
+        match outcome {
+            Outcome::Message(text) => text,
+            other => panic!("{other:?}"),
+        }
+    };
+    // Unavailable (or local): nothing to reconnect, the normal "Reconnect to view" answer.
+    assert!(click(&|_| Ok(false)).starts_with("Reconnect to view"));
+    // The reconnect fails: its message is shown.
+    assert_eq!(
+        click(&|_| Err("Sandbox was deleted. Start a new session.".into())),
+        "Sandbox was deleted. Start a new session."
+    );
+    // Another reconnect of the same sandbox is running.
+    assert_eq!(
+        click(&|_| Err("This sandbox is already reconnecting.".into())),
+        "A reconnect of this sandbox is already in progress. Try again in a moment."
+    );
+    // Cancelled by the user: the card just closes.
+    let cancelled = AtomicBool::new(true);
+    let (outcome, reconnected) = read_for_click(
+        &svc,
+        id,
+        "notes.md",
+        &cancelled,
+        &|_| Err("Cancelled".into()),
+        &mut |_| {},
+    );
+    assert_eq!(outcome, Outcome::Message(String::new()));
+    assert!(!reconnected);
+}
+
+/// A Docker sandbox is reconnected through the shared service's sandbox path (the one the
+/// Reconnect button uses), never the codespace wake. This fake service has no sandbox backend,
+/// so the click says so on the card and touches neither `gh` nor the host.
+#[gpui::test]
+fn clicking_a_link_in_a_stopped_sandbox_uses_the_sandbox_reconnect_path(cx: &mut TestAppContext) {
+    use crate::cloud_wake::fakes::{AUTH_OK, github_project, install};
+    let _ = cx;
+    let repo = github_project();
+    // The file service is disconnected, so the read asks for a reconnect.
+    let (_dir, svc, _file_host, file_id) = idle_workspace("sandbox-click", false);
+    let store: Database = Arc::new(Mutex::new(
+        monocode_core::store::Store::open(std::path::Path::new(":memory:")).unwrap(),
+    ));
+    let (gh, host) = install(store.clone(), AUTH_OK, "Shutdown");
+    let id = {
+        let guard = store.lock().unwrap();
+        let project = guard
+            .remember_cloud_ref_project(
+                "env-box",
+                &json!({"id":"project-1","cwd":ROOT}),
+                repo.0.to_str().unwrap(),
+                &monocode_core::cloud_sessions::CloudRef::sandbox("monoptah-fix-1234"),
+            )
+            .unwrap();
+        guard.create("claude", &project.key).unwrap().id
+    };
+    host.0.lock().unwrap().clear();
+    gh.calls.lock().unwrap().clear();
+    let never = AtomicBool::new(false);
+    let (outcome, reconnected) = read_for_click(
+        &svc,
+        file_id,
+        "notes.md",
+        &never,
+        &|progress| crate::cloud_wake::reconnect_blocking(&store, id, &never, progress),
+        &mut |_| {},
+    );
+    assert!(!reconnected);
+    assert_eq!(
+        outcome,
+        Outcome::Message("Docker sandboxes are not available.".into())
+    );
+    assert!(host.0.lock().unwrap().is_empty());
+    assert!(gh.calls.lock().unwrap().is_empty());
 }
 
 #[test]

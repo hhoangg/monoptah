@@ -4,7 +4,10 @@
 //! show that file in the app even though it only exists in the cloud. Everything here goes
 //! through the Host's file calls over the session's live tunnel, so it never wakes or
 //! resumes anything: without a tunnel the answer is [`ViewError::NotConnected`] ("Reconnect
-//! to view ..."). The ssh based `CloudBackend::copy_from` is deliberately not used.
+//! to view ..."). A click on a link is a user action, so the app then reconnects the
+//! workspace through its own user-initiated door (the same one as the Reconnect button, see
+//! `docker_start::reconnect` for a sandbox) and reads again; this module never does.
+//! The ssh based `CloudBackend::copy_from` is deliberately not used.
 //!
 //! # Host calls
 //!

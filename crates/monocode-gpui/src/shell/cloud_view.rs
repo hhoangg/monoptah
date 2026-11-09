@@ -2,9 +2,10 @@
 //!
 //! In a cloud session the agent mentions paths that exist only in the codespace or sandbox.
 //! A click on one that is not a local file is read through the Host over the session's live
-//! tunnel (`monocode_core::cloud_sessions::view`), never by waking anything:
+//! tunnel (`monocode_core::cloud_sessions::view`). The workspace idles between turns, so a
+//! click (a user action) reconnects or resumes it first, off the UI thread:
 //!
-//! * not connected: the card says "Reconnect to view <file>";
+//! * cannot be reconnected: the card says why;
 //! * previewable and up to 5 MB: opened in memory in the image or document viewer;
 //! * anything else: downloaded into the session's `cloud-cache/` behind a card with a
 //!   progress bar and Cancel (a confirmation first above 500 MB), then opened from there, or
@@ -32,7 +33,11 @@ pub(super) struct CloudView {
 
 enum Phase {
     /// Asking the Host for the file.
-    Reading { cancel: Arc<AtomicBool> },
+    /// `status` is the latest line of a reconnect that the click started, if any.
+    Reading {
+        cancel: Arc<AtomicBool>,
+        status: Arc<Mutex<String>>,
+    },
     /// Nothing more to do; `text` says why.
     Message(String),
     /// Over the per-file threshold: waiting for the user.
@@ -89,21 +94,66 @@ pub(super) fn cloud_target(raw: &str) -> String {
 }
 
 /// Reads the file `raw` of session `session` for display. BLOCKS; run it on a worker.
+/// Never wakes anything: without a live tunnel the outcome says to reconnect.
 pub(super) fn read_for_view(
     cloud: &CloudSessions,
     session: i64,
     raw: &str,
     cancel: &AtomicBool,
 ) -> Outcome {
-    let file = match cloud.resolve_cloud_file(session, raw) {
-        Ok(file) => file,
-        Err(error) => return Outcome::Message(error.to_string()),
-    };
-    let name = file.name().to_owned();
-    match cloud.open_cloud_file(&file, cancel) {
+    match read_file(cloud, session, raw, cancel) {
+        Ok(outcome) => outcome,
         Err(ViewError::Cancelled) => Outcome::Message(String::new()),
         Err(error) => Outcome::Message(error.to_string()),
-        Ok(Opened::Image { bytes, mime }) => {
+    }
+}
+
+/// Brings a workspace back, reporting progress lines; `Ok(false)` means there is nothing to do.
+pub(super) type Reconnect<'a> = dyn Fn(&mut dyn FnMut(&str)) -> Result<bool, String> + 'a;
+
+/// Shown when a click finds the sandbox already being reconnected by someone else.
+const ALREADY_RECONNECTING: &str =
+    "A reconnect of this sandbox is already in progress. Try again in a moment.";
+
+/// [`read_for_view`] for a click on a link, which is a user action: when the workspace is not
+/// connected (it idles between turns) `reconnect` brings it back first (`Ok(false)` means there
+/// is nothing to reconnect, e.g. it is unavailable), then the read is tried once more.
+/// `progress` hears the lines of the reconnect. The flag says that a reconnect succeeded.
+/// BLOCKS; run it on a worker.
+pub(super) fn read_for_click(
+    cloud: &CloudSessions,
+    session: i64,
+    raw: &str,
+    cancel: &AtomicBool,
+    reconnect: &Reconnect<'_>,
+    progress: &mut dyn FnMut(&str),
+) -> (Outcome, bool) {
+    match read_file(cloud, session, raw, cancel) {
+        Err(ViewError::NotConnected(text)) => match reconnect(progress) {
+            Ok(true) => (read_for_view(cloud, session, raw, cancel), true),
+            Ok(false) => (Outcome::Message(text), false),
+            Err(_) if cancel.load(Ordering::Relaxed) => (Outcome::Message(String::new()), false),
+            Err(error) if error == "This sandbox is already reconnecting." => {
+                (Outcome::Message(ALREADY_RECONNECTING.into()), false)
+            }
+            Err(error) => (Outcome::Message(error), false),
+        },
+        Ok(outcome) => (outcome, false),
+        Err(ViewError::Cancelled) => (Outcome::Message(String::new()), false),
+        Err(error) => (Outcome::Message(error.to_string()), false),
+    }
+}
+
+fn read_file(
+    cloud: &CloudSessions,
+    session: i64,
+    raw: &str,
+    cancel: &AtomicBool,
+) -> Result<Outcome, ViewError> {
+    let file = cloud.resolve_cloud_file(session, raw)?;
+    let name = file.name().to_owned();
+    Ok(match cloud.open_cloud_file(&file, cancel)? {
+        Opened::Image { bytes, mime } => {
             use base64::Engine;
             Outcome::Image {
                 data: base64::engine::general_purpose::STANDARD.encode(bytes),
@@ -111,7 +161,7 @@ pub(super) fn read_for_view(
                 name,
             }
         }
-        Ok(Opened::Text { kind, text }) => Outcome::Document {
+        Opened::Text { kind, text } => Outcome::Document {
             path: PathBuf::from(&file.rel),
             doc: CloudDoc {
                 kind: if kind == FileKind::Markdown {
@@ -124,7 +174,7 @@ pub(super) fn read_for_view(
             },
             name,
         },
-        Ok(Opened::Html { html }) => Outcome::Document {
+        Opened::Html { html } => Outcome::Document {
             path: PathBuf::from(&file.rel),
             doc: CloudDoc {
                 kind: crate::document_lightbox::Kind::Html,
@@ -133,9 +183,9 @@ pub(super) fn read_for_view(
             },
             name,
         },
-        Ok(Opened::Download(plan)) => Outcome::Download { file, plan },
-        Ok(Opened::CopyOnly { .. }) => Outcome::CopyOnly { file },
-    }
+        Opened::Download(plan) => Outcome::Download { file, plan },
+        Opened::CopyOnly { .. } => Outcome::CopyOnly { file },
+    })
 }
 
 /// How a downloaded file is shown.
@@ -230,6 +280,7 @@ impl Shell {
         self.dismiss_cloud_view(cx);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let cancel = Arc::new(AtomicBool::new(false));
+        let status = Arc::new(Mutex::new(String::new()));
         let name = target.rsplit('/').next().unwrap_or(&target).to_owned();
         self.cloud_view = Some(CloudView {
             id,
@@ -237,20 +288,72 @@ impl Shell {
             name,
             phase: Phase::Reading {
                 cancel: cancel.clone(),
+                status: status.clone(),
             },
         });
         let cloud = self.cloud.clone();
-        let work = cx
-            .background_executor()
-            .spawn(async move { read_for_view(&cloud, session, &target, &cancel) });
+        let store = self.store.clone();
+        let work = cx.background_executor().spawn(async move {
+            let stop = cancel.clone();
+            read_for_click(
+                &cloud,
+                session,
+                &target,
+                &cancel,
+                &|progress| crate::cloud_wake::reconnect_blocking(&store, session, &stop, progress),
+                &mut |line| {
+                    if let Ok(mut current) = status.lock() {
+                        *current = line.to_owned();
+                    }
+                },
+            )
+        });
+        // The worker cannot touch the window, so the card polls the reconnect status.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(250))
+                    .await;
+                let reading = this
+                    .update(cx, |this, cx| {
+                        let reading = this.live(id)
+                            && matches!(
+                                this.cloud_view.as_ref().map(|v| &v.phase),
+                                Some(Phase::Reading { .. })
+                            );
+                        if reading {
+                            cx.notify();
+                        }
+                        reading
+                    })
+                    .unwrap_or(false);
+                if !reading {
+                    break;
+                }
+            }
+        })
+        .detach();
         cx.spawn_in(window, async move |this, cx| {
-            let outcome = work.await;
+            let (outcome, reconnected) = work.await;
             let _ = this.update_in(cx, |this, window, cx| {
+                if reconnected {
+                    this.cloud_reconnected_by_click(session, cx);
+                }
                 this.finish_cloud_read(id, outcome, window, cx)
             });
         })
         .detach();
         cx.notify();
+    }
+
+    /// A click brought the workspace of `session` back: the session's view clears its error
+    /// and reloads its history, and the shell clears the cached Stopped state and banner.
+    fn cloud_reconnected_by_click(&mut self, session: i64, cx: &mut Context<Self>) {
+        match self.sessions.get(&session).cloned() {
+            // The view emits `CloudResumed`, which the shell hears (`cloud_resumed`).
+            Some(view) => view.update(cx, |view, cx| view.cloud_reconnected(cx)),
+            None => self.cloud_resumed(session, cx),
+        }
     }
 
     fn live(&self, id: u64) -> bool {
@@ -475,7 +578,7 @@ impl Shell {
     /// Closes the card and stops whatever it was doing.
     pub(super) fn dismiss_cloud_view(&mut self, cx: &mut Context<Self>) {
         if let Some(view) = self.cloud_view.take() {
-            if let Phase::Reading { cancel }
+            if let Phase::Reading { cancel, .. }
             | Phase::Downloading { cancel, .. }
             | Phase::Copying { cancel } = &view.phase
             {
@@ -533,9 +636,13 @@ impl Shell {
         };
         let (line, detail, bar, actions): (String, Option<String>, Option<f32>, Vec<AnyElement>) =
             match &view.phase {
-                Phase::Reading { .. } => (
+                Phase::Reading { status, .. } => (
                     format!("Reading {}...", view.name),
-                    None,
+                    status
+                        .lock()
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.clone()),
                     None,
                     vec![
                         button("cloud-view-cancel", "Cancel")
