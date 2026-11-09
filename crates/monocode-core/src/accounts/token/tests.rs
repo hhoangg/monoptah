@@ -424,3 +424,54 @@ fn a_failed_save_leaves_a_damaged_key_in_place() {
         .to_string_lossy()
         .starts_with(".credentials.key.")));
 }
+
+#[test]
+fn account_list_reports_kinds_without_secrets_paths_or_emails() {
+    use crate::accounts::{list_value, Book};
+    let fx = Fixture::new();
+    let mut book = Book::default();
+    let token = book.add(Kind::Claude, "Token account").unwrap();
+    let key = book.add(Kind::Claude, "Key account").unwrap();
+    let plain = book.add(Kind::Claude, "Browser login").unwrap();
+    let codex = book.add(Kind::Codex, "Codex work").unwrap();
+    fx.profile(&token.id).save_claude_token(TOKEN).unwrap();
+    fx.profile(&key.id)
+        .save_claude_credential(ClaudeCredential::ApiKey, "sk-ant-api03-fixture-key")
+        .unwrap();
+    book.set_preferred(Kind::Claude, &key.id).unwrap();
+    let kind_of = |id: &str| fx.profile(id).claude_credential().ok().flatten();
+    let value = list_value(&book, Some(Kind::Claude), &kind_of);
+    let rows = value["accounts"].as_array().unwrap();
+    let row = |id: &str| rows.iter().find(|r| r["id"] == id).unwrap();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(row(&token.id)["authKind"], "setupToken");
+    assert_eq!(row(&key.id)["authKind"], "apiKey");
+    assert_eq!(row(&plain.id)["authKind"], "cli");
+    assert_eq!(row("default")["authKind"], "cli");
+    assert_eq!(row(&key.id)["isDefault"], true);
+    assert_eq!(row("default")["isDefault"], false);
+    assert!(rows.iter().all(|r| r["provider"] == "claude"));
+    for r in rows {
+        let mut names: Vec<_> = r.as_object().unwrap().keys().cloned().collect();
+        names.sort();
+        assert_eq!(names, ["authKind", "id", "isDefault", "label", "provider"]);
+    }
+    // No filter lists every account-capable provider; codex is always "cli".
+    let all = list_value(&book, None, &kind_of);
+    let all_rows = all["accounts"].as_array().unwrap();
+    assert!(all_rows.iter().any(|r| r["provider"] == "devin"));
+    let codex_row = all_rows
+        .iter()
+        .find(|r| r["id"] == codex.id.as_str())
+        .unwrap();
+    assert_eq!(codex_row["authKind"], "cli");
+    let text = all.to_string();
+    for forbidden in [
+        TOKEN,
+        "sk-ant-api03-fixture-key",
+        fx.root.path().to_str().unwrap(),
+        "@",
+    ] {
+        assert!(!text.contains(forbidden), "leaked {forbidden}");
+    }
+}

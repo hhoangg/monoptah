@@ -352,7 +352,7 @@ pub fn highlight_ranges(
         })
         .collect()
 }
-fn mentions(text: &str) -> Vec<String> {
+pub(crate) fn mentions(text: &str) -> Vec<String> {
     text.lines()
         .filter(|line| !line.trim_start().starts_with('>'))
         .flat_map(mentions_in_line)

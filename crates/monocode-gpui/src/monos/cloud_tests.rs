@@ -503,6 +503,43 @@ fn a_mono_start_with_a_target_fails_before_creating_anything_when_validation_fai
 }
 
 #[gpui::test]
+fn a_mono_start_with_an_account_and_a_cloud_target_is_refused_before_any_cloud_call(
+    cx: &mut TestAppContext,
+) {
+    let ((s, gh, host, _guard), sbx) = sandbox_setup(cx, "Shutdown", "running");
+    let (gh_before, sbx_before) = (
+        gh.calls.lock().unwrap().len(),
+        sbx.calls.lock().unwrap().len(),
+    );
+    let sessions = super::tests::session_count(&s);
+    for (request, target) in [
+        ("a1", json!({"kind":"codespace","instance":"new"})),
+        ("a2", json!({"kind":"codespace","instance":"octo-run"})),
+        ("a3", json!({"kind":"sandbox","instance":"new"})),
+        ("a4", json!({"kind":"sandbox","instance":"box-1"})),
+        ("a5", json!({"kind":"sandbox","instance":{"session":1}})),
+    ] {
+        let error = run(
+            &s,
+            request,
+            "sessions.start",
+            json!({"prompt":"x","account":"Work","target":target}),
+            cx,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            monocode_core::mono::api::ACCOUNT_LOCAL_ONLY,
+            "{request}"
+        );
+    }
+    assert_eq!(gh.calls.lock().unwrap().len(), gh_before, "no gh call");
+    assert_eq!(sbx.calls.lock().unwrap().len(), sbx_before, "no sbx call");
+    assert!(host.0.lock().unwrap().is_empty());
+    assert_eq!(super::tests::session_count(&s), sessions, "no session row");
+}
+
+#[gpui::test]
 fn a_draft_for_a_cloud_session_never_wakes_its_codespace(cx: &mut TestAppContext) {
     let _clis = crate::shell::surface_tests::NoClis::new();
     let (s, _, host, _guard) = cloud_setup(cx, "Shutdown");

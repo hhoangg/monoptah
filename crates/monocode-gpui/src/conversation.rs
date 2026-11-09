@@ -1333,6 +1333,8 @@ impl Conversation {
         });
         let fresh_prompt = settings.prepared_prompt.is_none();
         if !self.is_remote() && settings.prepared_prompt.is_none() {
+            self.completion
+                .update(cx, |completion, cx| completion.refresh_accounts(cx));
             let prepared = self
                 .completion
                 .read(cx)

@@ -1957,3 +1957,58 @@ fn a_non_operator_thread_still_cannot_use_other_app_actions(cx: &mut TestAppCont
     let error = call(window, caller, "list-5", "sessions.list", json!({}), cx).unwrap_err();
     assert_eq!(error, "Operator is not enabled for this thread.");
 }
+
+#[gpui::test]
+fn operator_cannot_pick_an_account_but_can_list_them(cx: &mut TestAppContext) {
+    let (window, _, caller) = setup(cx);
+    window
+        .update(cx, |_, _, cx| {
+            crate::accounts::get(cx).unwrap().update(cx, |center, _| {
+                center.book.add(Kind::Claude, "Work account").unwrap();
+            });
+        })
+        .unwrap();
+    let refused = call(
+        window,
+        caller,
+        "acct-start",
+        "sessions.start",
+        json!({"draft":true,"prompt":"x","account":"Work account"}),
+        cx,
+    );
+    assert_eq!(refused, Err("account is available to Monos only".into()));
+    let listed = call(window, caller, "acct-list", "accounts.list", json!({}), cx).unwrap();
+    let rows = listed["accounts"].as_array().unwrap();
+    assert!(
+        rows.iter()
+            .any(|r| r["label"] == "Work account" && r["provider"] == "claude")
+    );
+    assert!(rows.iter().all(|r| r.as_object().unwrap().len() == 5));
+    let claude = call(
+        window,
+        caller,
+        "acct-claude",
+        "accounts.list",
+        json!({"provider":"claude"}),
+        cx,
+    )
+    .unwrap();
+    assert!(
+        claude["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["provider"] == "claude")
+    );
+    assert!(
+        call(
+            window,
+            caller,
+            "acct-bad",
+            "accounts.list",
+            json!({"provider":"cursor"}),
+            cx
+        )
+        .is_err()
+    );
+}
