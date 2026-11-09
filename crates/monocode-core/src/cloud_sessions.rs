@@ -1632,7 +1632,11 @@ impl StartupSummary {
 pub mod backend;
 pub mod docker_config;
 pub mod docker_start;
+<<<<<<< HEAD
 pub mod kit;
+=======
+pub mod move_out;
+>>>>>>> csi/f4-1
 pub use backend::{CloudBackend, CloudBackendKind, CloudRef, CodespacesBackend};
 
 mod convert;
@@ -1655,7 +1659,11 @@ mod docker_config_tests;
 #[cfg(test)]
 mod docker_start_tests;
 #[cfg(test)]
+<<<<<<< HEAD
 mod kit_tests;
+=======
+mod move_out_tests;
+>>>>>>> csi/f4-1
 #[cfg(test)]
 mod startup_tests;
 #[cfg(test)]
