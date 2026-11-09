@@ -66,6 +66,11 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> Ttl<K, V> {
             ttl,
         }
     }
+    fn forget(&self, key: &K) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.remove(key);
+        }
+    }
     fn get_or(&self, key: &K, load: impl FnOnce() -> Result<V, String>) -> Result<V, String> {
         if let Ok(entries) = self.entries.lock() {
             if let Some((at, value)) = entries.get(key) {
@@ -85,7 +90,8 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> Ttl<K, V> {
 
 pub(crate) struct Cache {
     projects: Ttl<String, Vec<Project>>,
-    worktrees: Ttl<(String, String), Vec<Worktree>>,
+    /// `None` caches a failed listing, so a read does not ask again for every project.
+    worktrees: Ttl<(String, String), Option<Vec<Worktree>>>,
     capable: Ttl<String, bool>,
 }
 impl Default for Cache {
@@ -141,6 +147,13 @@ fn locate(
     host_path: &str,
 ) -> Result<Located, String> {
     let outside = || format!("{host_path} is outside every project on this machine.");
+    // Dot segments are not resolved here (symlinks make that the Host's job).
+    if host_path
+        .split(['/', '\\'])
+        .any(|part| part == ".." || part == ".")
+    {
+        return Err(outside());
+    }
     let projects = cache.projects.get_or(&machine.to_owned(), || {
         serde_json::from_value(transport.request(machine, "projects.list", json!({}))?)
             .map_err(|error| format!("Invalid project list: {error}"))
@@ -149,15 +162,15 @@ fn locate(
         cache
             .worktrees
             .get_or(&(machine.to_owned(), project.id.clone()), || {
-                let listed = transport.request(
-                    machine,
-                    "git.worktrees",
-                    json!({"projectId": project.id}),
-                )?;
-                serde_json::from_value::<Worktrees>(listed)
-                    .map(|listed| listed.worktrees)
-                    .map_err(|error| format!("Invalid worktree list: {error}"))
+                let listed = transport
+                    .request(machine, "git.worktrees", json!({"projectId": project.id}))
+                    .and_then(|listed| {
+                        serde_json::from_value::<Worktrees>(listed).map_err(|e| e.to_string())
+                    });
+                Ok(listed.ok().map(|listed| listed.worktrees))
             })
+            .ok()
+            .flatten()
             .unwrap_or_default()
     };
     // The longest root wins, so a project nested in another is read through itself.
@@ -212,24 +225,40 @@ fn invalid(what: &str) -> String {
     format!("Invalid remote file content: {what}")
 }
 
+/// The outcome of [`read_bytes`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum Fetched {
+    Bytes(Vec<u8>),
+    /// `accept` turned the file down after its first chunk; no further chunk was asked for.
+    Refused(String),
+}
+
 /// Reads the whole host file behind a `remote://` path into memory.
 ///
 /// `progress(done, total)` is called after every chunk. `cancel` is checked before every
 /// chunk, so a cancel stops after the chunk in flight and returns [`READ_CANCELLED`].
+/// `accept(first chunk, total size)` runs once the size is known and can refuse the file
+/// before any more of it is downloaded.
+///
+/// When the path cannot be mapped onto a project, or the Host turns out not to know
+/// `files.readBytes`, the single reply `read_binary_file` is used and the Host decides.
 pub(crate) fn read_bytes(
     transport: &dyn Transport,
     cache: &Cache,
     path: &std::path::Path,
     progress: &mut dyn FnMut(u64, u64),
     cancel: &AtomicBool,
-) -> Result<Vec<u8>, String> {
+    accept: &dyn Fn(&[u8], u64) -> Option<String>,
+) -> Result<Fetched, String> {
     let remote = crate::remote::parse_remote_path(&path.to_string_lossy())
         .ok_or("Invalid remote file path")?;
     let machine = transport.machine_for_environment(&remote.environment_id)?;
     if !has_capability(transport, cache, &machine)? {
         return legacy(transport, &machine, &remote.host_path);
     }
-    let found = locate(transport, cache, &machine, &remote.host_path)?;
+    let Ok(found) = locate(transport, cache, &machine, &remote.host_path) else {
+        return legacy(transport, &machine, &remote.host_path);
+    };
     let mut out = Vec::new();
     let mut size = None;
     loop {
@@ -246,7 +275,20 @@ pub(crate) fn read_bytes(
         if let Some(cwd) = &found.cwd {
             params["cwd"] = json!(cwd);
         }
-        let reply = transport.request(&machine, "files.readBytes", params)?;
+        let reply = match transport.request(&machine, "files.readBytes", params) {
+            Ok(reply) => reply,
+            Err(error)
+                if offset == 0
+                    && error
+                        .to_ascii_lowercase()
+                        .contains("unsupported host method") =>
+            {
+                // The capability cache was stale (the Host was replaced by an older one).
+                cache.capable.forget(&machine);
+                return legacy(transport, &machine, &remote.host_path);
+            }
+            Err(error) => return Err(error),
+        };
         let data = base64::engine::general_purpose::STANDARD
             .decode(reply["data"].as_str().ok_or_else(|| invalid("no data"))?)
             .map_err(|error| invalid(&error.to_string()))?;
@@ -262,17 +304,22 @@ pub(crate) fn read_bytes(
         if size.is_some_and(|first| first != total) || (data.is_empty() && offset < total) {
             return Err("The file changed while it was being read. Try again.".into());
         }
+        if size.is_none() {
+            if let Some(reason) = accept(&data, total) {
+                return Ok(Fetched::Refused(reason));
+            }
+        }
         size = Some(total);
         out.extend_from_slice(&data);
         progress(out.len() as u64, total);
         if out.len() as u64 >= total {
-            return Ok(out);
+            return Ok(Fetched::Bytes(out));
         }
     }
 }
 
 /// Today's single reply read, for a Host without `files.readBytes`.
-fn legacy(transport: &dyn Transport, machine: &str, host_path: &str) -> Result<Vec<u8>, String> {
+fn legacy(transport: &dyn Transport, machine: &str, host_path: &str) -> Result<Fetched, String> {
     let encoded = transport
         .request(
             machine,
@@ -286,7 +333,7 @@ fn legacy(transport: &dyn Transport, machine: &str, host_path: &str) -> Result<V
     if bytes.len() > MAX_LEGACY_BYTES {
         return Err("File is too large to preview (maximum 10 MB).".into());
     }
-    Ok(bytes)
+    Ok(Fetched::Bytes(bytes))
 }
 
 /// [`read_bytes`] over the app's shared connections.
@@ -294,9 +341,10 @@ pub(crate) fn read_default(
     path: &std::path::Path,
     progress: &mut dyn FnMut(u64, u64),
     cancel: &AtomicBool,
-) -> Result<Vec<u8>, String> {
+    accept: &dyn Fn(&[u8], u64) -> Option<String>,
+) -> Result<Fetched, String> {
     let connections = crate::remote::default_connections()?;
-    read_bytes(&*connections, &CACHE, path, progress, cancel)
+    read_bytes(&*connections, &CACHE, path, progress, cancel, accept)
 }
 
 #[cfg(test)]
@@ -311,6 +359,10 @@ mod tests {
         calls: RefCell<Vec<(String, Value)>>,
         /// Set this flag once the n-th `files.readBytes` call was served.
         cancel_after: Option<(usize, &'static AtomicBool)>,
+        projects_fail: bool,
+        worktrees_fail: bool,
+        /// Advertises `files.readBytes` but refuses it, like a Host replaced by an old one.
+        stale_capability: bool,
     }
     impl Fake {
         fn new(capable: bool, data: Vec<u8>) -> Self {
@@ -319,6 +371,9 @@ mod tests {
                 data,
                 calls: RefCell::new(Vec::new()),
                 cancel_after: None,
+                projects_fail: false,
+                worktrees_fail: false,
+                stale_capability: false,
             }
         }
         fn methods(&self, method: &str) -> Vec<Value> {
@@ -343,11 +398,15 @@ mod tests {
                 .push((method.to_owned(), params.clone()));
             let engine = base64::engine::general_purpose::STANDARD;
             match method {
-                "environment.describe" => Ok(json!({"capabilities": if self.capable {
-                    json!(["files.read", "files.readBytes"])
-                } else {
-                    json!(["files.read"])
-                }})),
+                "environment.describe" => Ok(
+                    json!({"capabilities": if self.capable || self.stale_capability {
+                        json!(["files.read", "files.readBytes"])
+                    } else {
+                        json!(["files.read"])
+                    }}),
+                ),
+                "projects.list" if self.projects_fail => Err("Host is busy".into()),
+                "git.worktrees" if self.worktrees_fail => Err("git failed".into()),
                 "projects.list" => Ok(json!([
                     {"id": "p1", "cwd": "/work/repo"},
                     {"id": "p2", "cwd": "/work/other"},
@@ -361,6 +420,9 @@ mod tests {
                 } else {
                     json!({"worktrees": []})
                 }),
+                "files.readBytes" if self.stale_capability => {
+                    Err("Unsupported host method: files.readBytes".into())
+                }
                 "files.readBytes" => {
                     assert!(self.capable, "a Host without the capability was asked");
                     let offset = params["offset"].as_u64().unwrap() as usize;
@@ -386,7 +448,18 @@ mod tests {
                 }
                 "workspace.run" => {
                     assert_eq!(params["command"], "read_binary_file");
-                    if params["args"]["path"] == "/work/repo/src/big.bin" {
+                    // The Host canonicalises, so dot segments are resolved before the lookup.
+                    let mut parts: Vec<&str> = Vec::new();
+                    for part in params["args"]["path"].as_str().unwrap().split('/') {
+                        match part {
+                            "" | "." => {}
+                            ".." => {
+                                parts.pop();
+                            }
+                            part => parts.push(part),
+                        }
+                    }
+                    if parts.join("/") == "work/repo/src/big.bin" {
                         Ok(json!(engine.encode(&self.data)))
                     } else {
                         Err("No such file".into())
@@ -410,7 +483,12 @@ mod tests {
             std::path::Path::new(path),
             &mut |d, t| seen.push((d, t)),
             cancel,
+            &|_, _| None,
         );
+        let result = result.map(|fetched| match fetched {
+            Fetched::Bytes(bytes) => bytes,
+            Fetched::Refused(reason) => panic!("refused: {reason}"),
+        });
         (result, seen)
     }
 
@@ -477,18 +555,16 @@ mod tests {
     }
 
     #[test]
-    fn a_path_outside_every_project_is_an_error() {
+    fn a_path_outside_every_project_is_left_to_the_host_and_is_an_error() {
         let host = Fake::new(true, pattern(10));
         for path in [
             "remote://env/etc/passwd",
             "remote://env/work/repository/a",
             "remote://env/work",
+            "remote://env/work/repo",
         ] {
             let (result, _) = read(&host, path, &AtomicBool::new(false));
-            assert!(
-                result.unwrap_err().contains("outside every project"),
-                "{path}"
-            );
+            assert_eq!(result.unwrap_err(), "No such file", "{path}");
         }
         assert!(host.methods("files.readBytes").is_empty());
         let (result, _) = read(
@@ -497,8 +573,88 @@ mod tests {
             &AtomicBool::new(false),
         );
         assert_eq!(result.unwrap_err(), "Machine is no longer connected");
-        let (result, _) = read(&host, "remote://env/work/repo", &AtomicBool::new(false));
-        assert!(result.unwrap_err().contains("folder"));
+    }
+
+    #[test]
+    fn dot_dot_paths_are_resolved_by_the_host_through_the_legacy_read() {
+        let data = pattern(1000);
+        let host = Fake::new(true, data.clone());
+        let (result, _) = read(
+            &host,
+            "remote://env/work/repo/../repo/src/big.bin",
+            &AtomicBool::new(false),
+        );
+        assert_eq!(result.unwrap(), data);
+        assert!(host.methods("files.readBytes").is_empty());
+        assert_eq!(host.methods("workspace.run").len(), 1);
+    }
+
+    #[test]
+    fn a_failing_project_list_falls_back_to_the_legacy_read() {
+        let data = pattern(1000);
+        let mut host = Fake::new(true, data.clone());
+        host.projects_fail = true;
+        let (result, _) = read(
+            &host,
+            "remote://env/work/repo/src/big.bin",
+            &AtomicBool::new(false),
+        );
+        assert_eq!(result.unwrap(), data);
+        assert_eq!(host.methods("workspace.run").len(), 1);
+    }
+
+    #[test]
+    fn a_failing_worktree_list_is_asked_once_per_burst() {
+        let mut host = Fake::new(true, pattern(10));
+        host.worktrees_fail = true;
+        let cache = Cache::default();
+        for _ in 0..3 {
+            let found = locate(&host, &cache, "machine", "/work/other/a.rs").unwrap();
+            assert_eq!(found.project_id, "p2");
+        }
+        assert_eq!(host.methods("git.worktrees").len(), 1);
+    }
+
+    #[test]
+    fn a_stale_capability_is_forgotten_and_the_legacy_read_serves_the_file() {
+        let data = pattern(1000);
+        let mut host = Fake::new(false, data.clone());
+        host.stale_capability = true;
+        let cache = Cache::default();
+        let read_once = |host: &Fake| {
+            read_bytes(
+                host,
+                &cache,
+                std::path::Path::new("remote://env/work/repo/src/big.bin"),
+                &mut |_, _| {},
+                &AtomicBool::new(false),
+                &|_, _| None,
+            )
+        };
+        assert_eq!(read_once(&host).unwrap(), Fetched::Bytes(data));
+        assert_eq!(host.methods("files.readBytes").len(), 1);
+        // The cached answer was dropped, so the next read probes the Host again.
+        read_once(&host).unwrap();
+        assert_eq!(host.methods("environment.describe").len(), 2);
+    }
+
+    #[test]
+    fn a_large_file_is_refused_after_its_first_chunk() {
+        let host = Fake::new(true, pattern(20 * 1024 * 1024));
+        let result = read_bytes(
+            &host,
+            &Cache::default(),
+            std::path::Path::new("remote://env/work/repo/src/big.bin"),
+            &mut |_, _| {},
+            &AtomicBool::new(false),
+            &|first, size| {
+                assert_eq!(first.len() as u64, MAX_READ_CHUNK);
+                (size > 1024 * 1024).then(|| "too large".to_owned())
+            },
+        )
+        .unwrap();
+        assert_eq!(result, Fetched::Refused("too large".into()));
+        assert_eq!(host.methods("files.readBytes").len(), 1);
     }
 
     #[test]
@@ -551,6 +707,7 @@ mod tests {
             std::path::Path::new("remote://env/work/repo/a"),
             &mut |_, _| {},
             &AtomicBool::new(false),
+            &|_, _| None,
         )
         .unwrap_err();
         assert!(error.contains("maximum 32 MB"));
