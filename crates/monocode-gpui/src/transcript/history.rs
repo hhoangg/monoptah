@@ -298,6 +298,9 @@ impl TranscriptView {
         self.anchor_turn = self.anchor_turn.and_then(row);
         self.introduced_prompt = self.introduced_prompt.and_then(f);
         self.live_start = f(self.live_start).unwrap_or(0);
+        if self.yield_mark > 0 {
+            self.yield_mark = f(self.yield_mark).unwrap_or(0);
+        }
         if let Some(burst) = &mut self.burst {
             match f(burst.prompt) {
                 Some(prompt) => burst.prompt = prompt,
@@ -462,6 +465,8 @@ impl TranscriptView {
         // Reopening also handles a source that became empty in another window.
         self.source = Vec::new();
         self.source_bytes = 0;
+        self.yielded = 0;
+        self.yield_mark = 0;
         self.messages = Vec::new();
         self.rows = Vec::new();
         self.history_start = 0;
@@ -612,6 +617,43 @@ mod tests {
             assert_eq!(view.search_match, Some((1, "Answer".into())));
             assert!(view.messages.iter().any(|message| message.start == 1));
             assert_eq!(view.source.len(), 70);
+        });
+    }
+
+    #[gpui::test]
+    fn yielded_mono_run_keeps_its_boundary_across_history_changes(cx: &mut TestAppContext) {
+        let view = cx.new(|_| TranscriptView::new());
+        view.update(cx, |view, cx| {
+            view.mono_mode("mono", 0xffffff, "Mono");
+            view.install_prepared_history(PreparedHistory::new(long_mono(35), true), cx);
+            let at = view.source.len() - view.base;
+            let row = |role: &str, text: &str| Row {
+                role: role.into(),
+                text: text.into(),
+                first: true,
+                sent_at: None,
+            };
+            view.patch(at, vec![row("user", "Go")], cx);
+            view.streaming(true, cx);
+            view.patch(at + 1, vec![row("assistant", "Running.")], cx);
+            view.set_yielded(1, cx);
+            let reply = view.source.len() - 1;
+            assert!(!view.mono_prose_hidden(reply));
+            view.load_older_history(cx);
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            let reply = view.source.len() - 1;
+            assert_eq!(view.yield_mark, view.source.len(), "the mark moved down");
+            assert!(!view.mono_prose_hidden(reply), "the reply stays shown");
+            assert_eq!(
+                view.mono_activity().unwrap().1,
+                "Waiting on 1 background task"
+            );
+            // A replaced source forgets the yield instead of indexing past it.
+            view.replace_history(long_mono(1), cx);
+            assert_eq!((view.yielded, view.yield_mark), (0, 0));
+            let _ = view.mono_prose_hidden(1);
         });
     }
 

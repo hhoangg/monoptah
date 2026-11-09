@@ -1868,8 +1868,11 @@ impl TranscriptView {
     fn mono_prose_hidden(&self, at: usize) -> bool {
         // Yielded to background tasks, the live run reads as if it had ended
         // where it yielded: its final reply shows, and what it said earlier
-        // follows the settled rules. Follow-up work after the mark is live.
-        let yielded = self.streaming && at < self.yield_mark;
+        // follows the settled rules. Once the run resumes (rows past the mark)
+        // or the source no longer matches the mark, the normal live rules
+        // apply to every row, so nothing changes again when the run settles.
+        let yielded =
+            self.streaming && at < self.yield_mark && self.source.len() == self.yield_mark;
         let streaming = self.streaming && !yielded;
         let found = (at + 1..self.source.len()).find(|&i| self.source[i].is_prompt());
         let end = if yielded {
@@ -2709,7 +2712,8 @@ impl TranscriptView {
         if !self.mono || !self.streaming {
             return;
         }
-        // A source that shrank under the mark is a new run's: mark it afresh.
+        // The mark only holds while the source ends at it; a resumed run or a
+        // replaced source is marked afresh.
         let mark = if tasks > 0 && (self.yielded == 0 || self.source.len() != self.yield_mark) {
             self.source.len()
         } else {
@@ -7039,14 +7043,18 @@ mod scroll_tests {
                 "Waiting on 2 background tasks"
             );
 
-            // The task finishes and Claude follows up in the same run.
+            // The task finishes and Claude follows up in the same run: the
+            // earlier reply is commentary now, and settling changes nothing.
             view.set_yielded(0, cx);
             view.patch(
                 4,
                 vec![bash(), row("assistant", "It exited; restarting.")],
                 cx,
             );
-            assert!(!view.mono_prose_hidden(3), "the shown reply stays shown");
+            assert!(
+                view.mono_prose_hidden(3),
+                "the earlier reply joins the trail once the run resumes"
+            );
             assert!(
                 view.mono_prose_hidden(5),
                 "the follow-up's commentary hides while it streams"
@@ -7056,8 +7064,12 @@ mod scroll_tests {
             view.entrances.clear();
             view.streaming(false, cx);
             assert!(
-                !view.entrances.contains_key(&3),
-                "the reply already shown does not enter again on settle"
+                view.mono_prose_hidden(3),
+                "the earlier reply does not flip at settle"
+            );
+            assert!(
+                !view.mono_prose_hidden(5),
+                "the follow-up's reply shows once the run settles"
             );
             assert!(
                 view.entrances.contains_key(&5),
