@@ -1579,8 +1579,37 @@ each batch ends with an explicit release-and-pin ticket (HR1-HR3).
 - **`claude plugin` flags:** the exact `install` / `marketplace add` flags, and
   `claude mcp add-json` flags. `--help` printed "Not logged in" here. Not needed by the
   chosen design.
-- **Account config dirs:** how Claude Code merges `~/.claude` with an account
-  `CLAUDE_CONFIG_DIR` for skills and settings. F3-1.
+- **Account config dirs (answered by F3-1, layout only):** inspected with real profile
+  dirs, names only, no values and no `claude` run.
+  - An account dir under `provider-accounts/claude/<id>` holds its own `.claude.json`
+    (top-level keys such as `oauthAccount`, `userID`, `pluginUsage`, caches; `mcpServers`
+    and `projects` only when something was added), its own `plugins/`
+    (`installed_plugins.json`, `known_marketplaces.json`, `marketplaces/`, `store/`,
+    and `synced/` on an account with account sync) and runtime state (`projects/`,
+    `sessions/`, `session-env/`, `shell-snapshots/`, `backups/`). One account also has
+    `skills/synced/`. None of the three has a `settings.json` or a user-authored
+    `skills/<name>/SKILL.md`.
+  - `~/.claude` holds `settings.json` (with `enabledPlugins`), `skills/` (20 dirs, 12
+    symlinks, 0 files), `plugins/` (with `installed_plugins.json`, `cache/`), `CLAUDE.md`,
+    `agents/` and more. `~/.claude.json` holds the user and local MCP servers.
+  - So an account dir is a **full config root of its own** (it carries its own
+    `.claude.json` and `plugins/`), not an overlay on `~/.claude`. That matches what the
+    docs say for `CLAUDE_CONFIG_DIR`, which relocates the config root. The merge is not
+    confirmed at runtime (that needs a `claude` run), so assume the worst: a session
+    under an account may not see `~/.claude/skills` or `~/.claude/settings.json`.
+  - Not examined: `skills/synced/<bucket>/<name>/SKILL.md` and `plugins/synced/` of
+    accounts with account sync. F3-1 ignores them **on purpose for now**: it only reads
+    `skills/<name>/SKILL.md`, so synced skills are not offered. Also unexamined: an
+    account's `remote-settings.json` and `policy-limits.json`, which could be another
+    source of `enabledPlugins` (managed settings) that F3-1 does not read.
+  - What F3-1 does: read the account dir first and `~/.claude` second, label every item
+    with its source (`Account` or `User`), and let the account win on a name clash. This
+    is a superset of what either interpretation shows. A plugin is offered only if the
+    `settings.json` of the **same** source enables it, so an account without a
+    `settings.json` offers no plugins from itself. If a runtime check later shows that
+    Claude does not read `~/.claude` under an account, F3-2 should show the `User` items
+    as "not used by this account" or F3-1 should drop that source: the label makes this a
+    small change.
 - **Unapproved project MCP servers:** how a headless (stream-json) Claude treats
   unapproved project `.mcp.json` servers.
 - **Docker features on cloud sandboxes:** whether `sbx mcp`, `sbx skills` and

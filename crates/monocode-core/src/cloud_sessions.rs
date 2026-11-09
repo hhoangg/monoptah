@@ -1632,6 +1632,7 @@ impl StartupSummary {
 pub mod backend;
 pub mod docker_config;
 pub mod docker_start;
+pub mod kit;
 pub use backend::{CloudBackend, CloudBackendKind, CloudRef, CodespacesBackend};
 
 mod convert;
@@ -1653,6 +1654,8 @@ mod convert_tests;
 mod docker_config_tests;
 #[cfg(test)]
 mod docker_start_tests;
+#[cfg(test)]
+mod kit_tests;
 #[cfg(test)]
 mod startup_tests;
 #[cfg(test)]
