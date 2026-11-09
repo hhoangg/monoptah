@@ -121,6 +121,8 @@ fn run(
         .arg(root)
         .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
@@ -129,7 +131,10 @@ fn run(
     if let Some(scratch) = scratch {
         cmd.env("GIT_INDEX_FILE", &scratch.index)
             .env("GIT_OBJECT_DIRECTORY", &scratch.objects)
-            .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", &scratch.real_objects);
+            .env(
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                c_quote(&scratch.real_objects),
+            );
     }
     let to_file = stdout.is_some();
     if let Some(stdout) = stdout {
@@ -142,6 +147,22 @@ fn run(
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_owned());
     }
     Ok(if to_file { Vec::new() } else { out.stdout })
+}
+
+/// The alternates list is separated by `:` (`;` on Windows); git reads an entry that starts
+/// with a double quote as C-style quoted, so a path containing the separator still works.
+fn c_quote(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
 }
 
 fn git_text(root: &Path, args: &[&str], scratch: Option<&Scratch>) -> Result<String, String> {
@@ -157,6 +178,8 @@ fn git_ok(root: &Path, args: &[&str]) -> Result<bool, String> {
         .arg(root)
         .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .map_err(|e| format!("Could not run Git: {e}"))?;
     match out.status.code() {
@@ -276,11 +299,11 @@ pub fn push_target(cwd: &Path) -> Result<PushTarget, String> {
 
     // An upstream that is itself the default branch counts as no upstream: the branch
     // keeps its own name instead.
-    let plain = if defaults.contains(&branch) {
+    let plain = if defaults.may_be_default(&branch) {
         branch.clone()
     } else {
         upstream_on_origin(&root, &branch)
-            .filter(|up| !defaults.contains(up))
+            .filter(|up| !defaults.may_be_default(up))
             .unwrap_or_else(|| branch.clone())
     };
     let tip = remote_tip(&root, &plain);
@@ -293,7 +316,7 @@ pub fn push_target(cwd: &Path) -> Result<PushTarget, String> {
             creates_branch: false,
         });
     }
-    if !defaults.contains(&plain) {
+    if !defaults.may_be_default(&plain) {
         match tip {
             None => {
                 return Ok(PushTarget {
@@ -366,12 +389,30 @@ fn upstream_on_origin(root: &Path, branch: &str) -> Option<String> {
     remote_tip(root, &name).map(|_| name)
 }
 
-/// Every branch that may be origin's default: the target of `refs/remotes/origin/HEAD`
-/// while it still exists, `main` and `master` when they exist on origin, and what a
-/// read-only `ls-remote --symref` reports (skipped quietly when origin is unreachable).
-/// A stale `origin/HEAD` or an unusual default such as `develop` must not let the push
-/// target be the default branch.
-fn default_branches(root: &Path) -> Vec<String> {
+/// What is known about origin's default branch.
+struct Defaults {
+    names: Vec<String>,
+    /// origin itself named its default branch just now (`ls-remote --symref`).
+    confirmed: bool,
+}
+
+impl Defaults {
+    /// Whether pushing to `name` might change origin's default branch.
+    ///
+    /// Fail closed: when origin did not confirm its default (it was unreachable, timed out,
+    /// or reported no symref), any name could be the default, because `origin/HEAD` may be
+    /// missing or stale and a default such as `develop` has no telltale name. Only a
+    /// confirmed answer that does not list `name` clears it.
+    fn may_be_default(&self, name: &str) -> bool {
+        !self.confirmed || self.names.iter().any(|n| n == name)
+    }
+}
+
+/// Every branch that may be origin's default: what a read-only `ls-remote --symref`
+/// reports, the target of `refs/remotes/origin/HEAD` while it still exists, and `main` and
+/// `master` when they exist on origin. See [`Defaults::may_be_default`] for the case where
+/// origin cannot be asked.
+fn default_branches(root: &Path) -> Defaults {
     let mut names: Vec<String> = Vec::new();
     let head = format!("refs/remotes/{REMOTE}/HEAD");
     let prefix = format!("refs/remotes/{REMOTE}/");
@@ -387,20 +428,24 @@ fn default_branches(root: &Path) -> Vec<String> {
             names.push(name.to_owned());
         }
     }
+    let mut confirmed = false;
     if let Ok(text) = run_timed(
         root,
         &["ls-remote", "--symref", REMOTE, "HEAD"],
         LS_REMOTE_TIMEOUT,
     ) {
-        names.extend(text.lines().filter_map(|line| {
+        for name in text.lines().filter_map(|line| {
             line.strip_prefix("ref: refs/heads/")
                 .and_then(|rest| rest.split_whitespace().next())
                 .map(str::to_owned)
-        }));
+        }) {
+            confirmed = true;
+            names.push(name);
+        }
     }
     names.sort();
     names.dedup();
-    names
+    Defaults { names, confirmed }
 }
 
 // ---------------------------------------------------------------- step 2: snapshot
@@ -439,24 +484,25 @@ fn too_big(bytes: u64, max: u64) -> String {
     )
 }
 
-/// Refuses early when the files that would go into the patch already exceed the limit, so
-/// nothing huge is hashed or written first.
+/// Refuses early when the untracked files alone already exceed the limit, so nothing huge
+/// is hashed first. Tracked files are not counted: a one-line edit of a big file is a small
+/// patch, and the size of the finished patch is checked after it is written (into the
+/// scratch object store, never the real one).
 fn precheck(root: &Path, max: u64) -> Result<(), String> {
     let mut total = 0u64;
-    let lists: [&[&str]; 2] = [
+    for path in run(
+        root,
         &["ls-files", "-z", "--others", "--exclude-standard"],
-        &["ls-files", "-z", "--modified"],
-    ];
-    for args in lists {
-        for path in run(root, args, None, None)?
-            .split(|b| *b == 0)
-            .filter(|p| !p.is_empty())
-        {
-            let path = root.join(String::from_utf8_lossy(path).as_ref());
-            total += std::fs::symlink_metadata(path).map_or(0, |m| m.len());
-            if total > max {
-                return Err(too_big(total, max));
-            }
+        None,
+        None,
+    )?
+    .split(|b| *b == 0)
+    .filter(|p| !p.is_empty())
+    {
+        let path = root.join(String::from_utf8_lossy(path).as_ref());
+        total += std::fs::symlink_metadata(path).map_or(0, |m| m.len());
+        if total > max {
+            return Err(too_big(total, max));
         }
     }
     Ok(())

@@ -44,7 +44,10 @@ struct Fixture {
 impl Fixture {
     /// A bare `origin` with `main`, and a clone `work` on `main` tracking it.
     fn new() -> Self {
-        let tmp = tempfile::tempdir().unwrap();
+        Self::in_dir(tempfile::tempdir().unwrap())
+    }
+
+    fn in_dir(tmp: tempfile::TempDir) -> Self {
         let root = tmp.path().canonicalize().unwrap();
         let origin = root.join("origin.git");
         let work = root.join("work");
@@ -299,6 +302,46 @@ fn an_unusual_default_branch_is_found_without_origin_head() {
     git(&f.work, &["remote", "set-head", "origin", "-d"]);
     commit_file(&f.work, "a.txt", "a\n");
     assert_eq!(f.target(), pt("develop-cloud", true, true));
+}
+
+/// origin cannot be asked (`ls-remote` fails), so its default cannot be confirmed.
+fn origin_unreachable(f: &Fixture) {
+    git(
+        &f.work,
+        &["remote", "set-url", "origin", "/nonexistent/path.git"],
+    );
+}
+
+#[test]
+fn an_unconfirmed_default_branch_is_never_pushed_to() {
+    let f = Fixture::new();
+    develop_is_the_default(&f);
+    git(&f.work, &["remote", "set-head", "origin", "-d"]);
+    commit_file(&f.work, "a.txt", "a\n");
+    origin_unreachable(&f);
+    // develop is ahead of origin/develop, which would be a plain fast-forward push to the
+    // default branch if the name were trusted.
+    assert_eq!(
+        push_target(&f.work).unwrap(),
+        pt("develop-cloud", true, true)
+    );
+}
+
+#[test]
+fn an_unconfirmed_default_makes_every_branch_use_the_cloud_name_unless_at_tip() {
+    let f = Fixture::new();
+    git(&f.work, &["checkout", "-q", "-b", "feature"]);
+    commit_file(&f.work, "a.txt", "a\n");
+    git(&f.work, &["push", "-q", "-u", "origin", "feature"]);
+    commit_file(&f.work, "b.txt", "b\n");
+    assert_eq!(f.target(), pt("feature", true, false));
+    origin_unreachable(&f);
+    assert_eq!(
+        push_target(&f.work).unwrap(),
+        pt("feature-cloud", true, true)
+    );
+    git(&f.work, &["reset", "-q", "--hard", "origin/feature"]);
+    assert_eq!(push_target(&f.work).unwrap(), pt("feature", false, false));
 }
 
 #[test]
@@ -994,4 +1037,31 @@ fn symlinked_roots_of_the_transcript_are_not_followed() {
     let err =
         collect_transcript(&home, Path::new("/p"), "sess-7", &tmp.path().join("s2")).unwrap_err();
     assert!(err.contains("Could not find"), "{err}");
+}
+
+#[test]
+fn a_repository_path_with_a_colon_works() {
+    let tmp = tempfile::Builder::new().prefix("a:b;c-").tempdir().unwrap();
+    let f = Fixture::in_dir(tmp);
+    assert!(f.work.to_string_lossy().contains(':'));
+    dirty(&f);
+    let snap = snapshot(&f.work, &f._tmp.path().join("s")).unwrap();
+    assert_eq!(
+        rebuilt_tree(&f, snap.patch_path.as_ref().unwrap(), "c"),
+        snap.tree
+    );
+}
+
+#[test]
+fn a_big_tracked_file_with_a_small_edit_is_not_refused() {
+    let f = Fixture::new();
+    let lines: String = (1..=500).map(|n| format!("line {n}\n")).collect();
+    commit_file(&f.work, "big.txt", &lines);
+    std::fs::write(f.work.join("big.txt"), lines.replace("line 5\n", "five\n")).unwrap();
+    assert!(std::fs::metadata(f.work.join("big.txt")).unwrap().len() > 3000);
+    let snap = snapshot_with_limit_for_test(&f.work, &f._tmp.path().join("s"), 2000).unwrap();
+    assert_eq!(snap.sizes.changed, 1);
+    // The finished patch is still checked against the limit.
+    let err = snapshot_with_limit_for_test(&f.work, &f._tmp.path().join("s2"), 100).unwrap_err();
+    assert!(err.contains("limit"), "{err}");
 }
