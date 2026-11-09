@@ -150,6 +150,13 @@ pub(crate) enum FileEvent {
     },
 }
 
+/// Largest remote text file that the poll keeps refreshing.
+const REMOTE_POLL_BYTES: usize = 256 * 1024;
+
+fn poll_reloads(remote: bool, open_text_bytes: Option<usize>) -> bool {
+    !remote || open_text_bytes.is_some_and(|len| len <= REMOTE_POLL_BYTES)
+}
+
 pub(crate) struct FileEditor {
     pub path: String,
     git: Entity<ProjectGit>,
@@ -300,7 +307,9 @@ impl FileEditor {
                 if this
                     .update(cx, |this, cx| {
                         if this.visible && !this.saving {
-                            this.load(false, cx);
+                            if this.poll_reloads() {
+                                this.load(false, cx);
+                            }
                             this.refresh_git(cx);
                         }
                     })
@@ -314,6 +323,8 @@ impl FileEditor {
             if let Some(image) = this.svg_preview.take() {
                 cx.drop_image(image, None);
             }
+            // A closed editor stops a remote read after the chunk in flight.
+            this.read_cancel.store(true, Ordering::Relaxed);
         })
         .detach();
         Self {
@@ -420,6 +431,18 @@ impl FileEditor {
             self.refresh_git(cx);
             self.catch_up_blame(cx);
         }
+    }
+    /// Whether the 2 s poll may read the file again.
+    ///
+    /// A local file is cheap to re-read. A remote one costs a round trip per 384 KB chunk, so
+    /// the poll only re-reads a small text file that is already open; a cancelled read, a
+    /// read error, an image, a video, or a file the editor refused stays as it is until the
+    /// user presses Retry, shows the tab again, or saves (a save re-checks the disk).
+    fn poll_reloads(&self) -> bool {
+        poll_reloads(
+            monocode_core::files::remote::is_remote(std::path::Path::new(&self.path)),
+            self.document.as_ref().map(|doc| doc.disk.len()),
+        )
     }
     fn read_total(&self) -> u64 {
         self.read_progress.1.load(Ordering::Relaxed)
@@ -1483,6 +1506,18 @@ mod tests {
         Bounds, EntityInputHandler, TestAppContext, VisualTestContext, WindowBounds, WindowOptions,
         point, size,
     };
+    #[test]
+    fn the_poll_never_re_downloads_a_remote_file_it_cannot_refresh_cheaply() {
+        // Local files are always re-read.
+        assert!(poll_reloads(false, None));
+        assert!(poll_reloads(false, Some(50_000_000)));
+        // A small open remote text file is refreshed.
+        assert!(poll_reloads(true, Some(REMOTE_POLL_BYTES)));
+        // A big one, an image, a refused or cancelled file, or a read error (no document)
+        // is left alone until the user retries.
+        assert!(!poll_reloads(true, Some(REMOTE_POLL_BYTES + 1)));
+        assert!(!poll_reloads(true, None));
+    }
     #[gpui::test]
     fn file_overview_tracks_unsaved_syntax_and_staged_or_unstaged_git_baselines(
         cx: &mut TestAppContext,
