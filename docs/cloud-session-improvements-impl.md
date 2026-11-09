@@ -1460,7 +1460,7 @@ ticket, after review and after merge.
 | F1-2 | 1 | merged | csi-f1-2 | merge 3ce07020. Opus review clean; added remote:// convert test. convert.rs store fallback for remote://-form worktree_cwd now works (was dead code). native:check green in ticket worktree; re-run on integration branch pending after wave batch. |
 | F1-3 | 1 | todo | - | |
 | H1 | 1 | merged | csi-h1 | merge 9b6cba91. Opus review: fixed first-release tag path, gh not-found check, dirty tree on commit fail. actionlint unavailable. Note: describe.host.version is bare X.Y.Z; --version prints X.Y.Z+monoptah. |
-| F3-1 | 1 | todo | - | |
+| F3-1 | 1 | merged | csi-f3-1 | merge 29deb2f9. Opus review x2 fixed: dead symlinks, roots outside home, total/timeouts flagged incomplete, URL classes, parent-link escape. Design 7 account-config-dirs answered (runtime merge of ~/.claude NOT verified, needs a claude run). Open design questions for the user: (1) links inside a skill that point elsewhere under HOME are followed (could pull ~/.aws); (2) config_hash is an unsalted SHA-256 of configs incl. secrets (shown in Debug); (3) secrets in url userinfo/args are not detected; (4) plugin installPath outside ~/.claude/plugins is offered (F3-3/F3-4 should validate). |
 | F3-5a | 1 | todo | - | needs the user (Keychain) |
 | F4-0 | 1 | todo | - | needs the user's OK (model requests) |
 | F4-J | 1 | merged | csi-f4-j | merge 307d3d84. Opus review: no blockers; fixed install race re-decide, fsync, edge fixtures as TS contract (duplicate key line is skipped), rewrite_cwd escaping, orphan fork cleanup. Known: incoming strictly shorter than existing = Diverged (per spec); fork does not copy file-history/<id>; .pre-cloud overwritten on second replace. |
