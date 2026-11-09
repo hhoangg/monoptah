@@ -1,10 +1,8 @@
-# Monoptah Native 0.50.2
+# Monoptah Native 0.50.3
 
-## Changes since 0.50.1
+## Changes since 0.50.2
 
-- Clicking a file path in a cloud session chat (Markdown, image, HTML and other files) now opens the preview even after the agent has finished. Before, once the workspace tunnel was gone the card only said "Reconnect to view"; a click now reconnects the Codespace or Docker Sandbox, shows the progress and then opens the file.
-- Monos and the app API now treat Codespaces and Docker Sandbox sessions the same way. The `codespaces.*` actions are replaced by `cloud.list`, `cloud.status`, `cloud.create`, `cloud.stop`, `cloud.resume` and `cloud.delete`, and `sessions.start` takes `target {kind, instance}` (an existing instance can also be given as `{session: <id>}`). Sessions report `target` and `cloudState` for both backends.
-- A Mono can resume a stopped Docker Sandbox like a Codespace, including by sending to a session on it, and `sessions.pullEvidence` works for sandbox sessions. Stopping or deleting an instance lists the sessions on it, and deleting is refused while any of them is busy.
+- macOS no longer asks for your login password after every upgrade. The desktop mobile identity used to live in the Keychain, and because the app is ad-hoc signed each build looked like a new app to it. The identity is now kept in the app's encrypted store. On first launch the existing Keychain entry is moved over unchanged, so paired phones stay paired, and then removed.
 
 ## Downloads and updates
 
