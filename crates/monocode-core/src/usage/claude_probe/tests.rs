@@ -187,6 +187,44 @@ fn changing_the_credential_forgets_the_previous_reading() {
 }
 
 #[test]
+fn a_reading_written_after_the_token_changed_is_ignored() {
+    let fx = Fixture::new();
+    let profile = fx.setup_token();
+    let cache = profile
+        .directory(Kind::Claude)
+        .unwrap()
+        .unwrap()
+        .join(CACHE);
+    let (server, requests) = serve(OK);
+    point_at(&server);
+    crate::usage::fetch_with(Kind::Claude, &profile, None, true).unwrap();
+    requests.recv().unwrap();
+    let old = std::fs::read_to_string(&cache).unwrap();
+    assert!(!old.contains(TOKEN));
+
+    // A probe that outlived the change writes its reading after `forget`.
+    profile
+        .save_claude_token("sk-ant-oat01-replacement")
+        .unwrap();
+    std::fs::write(&cache, &old).unwrap();
+    let error = crate::usage::fetch_for(Kind::Claude, &profile, None).unwrap_err();
+    assert_eq!(error.message, IDLE);
+
+    // Same after the token is removed or replaced by an API key.
+    profile.remove_claude_token().unwrap();
+    std::fs::write(&cache, &old).unwrap();
+    assert!(crate::usage::fetch_for(Kind::Claude, &profile, None).is_err());
+    profile
+        .save_claude_credential(
+            crate::accounts::ClaudeCredential::ApiKey,
+            "sk-ant-api03-fixture",
+        )
+        .unwrap();
+    std::fs::write(&cache, &old).unwrap();
+    assert!(crate::usage::fetch_for(Kind::Claude, &profile, None).is_err());
+}
+
+#[test]
 fn manual_check_sends_one_minimal_haiku_message_with_the_setup_token() {
     let fx = Fixture::new();
     let profile = fx.setup_token();
@@ -216,7 +254,7 @@ fn api_key_accounts_never_probe() {
             "sk-ant-api03-fixture",
         )
         .unwrap();
-    assert_eq!(profile.claude_setup_token().unwrap(), None);
+    assert_eq!(profile.claude_setup_token_stamped().unwrap(), None);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     point_at(&listener);

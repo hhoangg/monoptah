@@ -370,6 +370,13 @@ impl Profile {
         Ok(())
     }
     pub(super) fn claude_secret(&self) -> Result<Option<(ClaudeCredential, String)>, String> {
+        Ok(self
+            .claude_secret_stamped()?
+            .map(|(kind, secret, _)| (kind, secret)))
+    }
+    /// The secret with the row's nonce, read from one row so the two always
+    /// belong together. The nonce is random on every save and not secret.
+    fn claude_secret_stamped(&self) -> Result<Option<(ClaudeCredential, String, Vec<u8>)>, String> {
         let Some((name, nonce, ciphertext)) = self.stored()? else {
             return Ok(None);
         };
@@ -389,14 +396,23 @@ impl Profile {
             .map_err(|_| UNAVAILABLE)?;
         let secret = String::from_utf8(plain).map_err(|_| UNAVAILABLE)?;
         kind.normalize(&secret)
-            .map(|secret| Some((kind, secret)))
+            .map(|secret| Some((kind, secret, nonce)))
             .map_err(|_| UNAVAILABLE.into())
     }
-    /// The saved setup token, for the manual usage check. Never an API key.
-    pub(crate) fn claude_setup_token(&self) -> Result<Option<String>, String> {
+    /// The saved setup token with its row's nonce, for the manual usage check.
+    /// Never an API key.
+    pub(crate) fn claude_setup_token_stamped(&self) -> Result<Option<(String, Vec<u8>)>, String> {
         Ok(self
-            .claude_secret()?
-            .and_then(|(kind, secret)| (kind == ClaudeCredential::SetupToken).then_some(secret)))
+            .claude_secret_stamped()?
+            .and_then(|(kind, secret, nonce)| {
+                (kind == ClaudeCredential::SetupToken).then_some((secret, nonce))
+            }))
+    }
+    /// Identifies the saved setup token without decrypting it: changes on
+    /// every save, and is `None` for no credential or an API key.
+    pub(crate) fn claude_setup_stamp(&self) -> Option<Vec<u8>> {
+        let (name, nonce, _) = self.stored().ok()??;
+        (ClaudeCredential::parse(&name)? == ClaudeCredential::SetupToken).then_some(nonce)
     }
     #[cfg(test)]
     fn claude_token(&self) -> Result<Option<String>, String> {

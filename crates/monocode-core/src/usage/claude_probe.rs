@@ -37,16 +37,17 @@ pub(super) fn fetch(profile: &Profile, manual: bool) -> Result<Snapshot, FetchEr
     if !manual {
         return cache
             .as_deref()
-            .and_then(load)
+            .zip(profile.claude_setup_stamp())
+            .and_then(|(path, stamp)| load(path, &stamp))
             .ok_or_else(|| FetchError::failed(IDLE));
     }
-    let token = profile
-        .claude_setup_token()
+    let (token, stamp) = profile
+        .claude_setup_token_stamped()
         .map_err(FetchError::failed)?
         .ok_or_else(|| FetchError::failed(IDLE))?;
     let snapshot = probe(&url(), &token)?;
     if let Some(path) = cache {
-        save(&path, &snapshot);
+        save(&path, &stamp, &snapshot);
     }
     Ok(snapshot)
 }
@@ -128,11 +129,20 @@ fn parse_headers(header: impl Fn(&str) -> Option<String>) -> Result<Snapshot, Fe
     })
 }
 
-fn load(path: &Path) -> Option<Snapshot> {
-    let snapshot: Snapshot = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
-    (!snapshot.windows.is_empty()).then_some(Snapshot {
+/// The cached reading with the credential it was taken with. A probe that
+/// outlives a token change can write after `forget`; the stamp lets `load`
+/// reject it. Holds no secret: the stamp is the credential row's nonce.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Cached {
+    stamp: Vec<u8>,
+    snapshot: Snapshot,
+}
+
+fn load(path: &Path, stamp: &[u8]) -> Option<Snapshot> {
+    let cached: Cached = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    (cached.stamp == stamp && !cached.snapshot.windows.is_empty()).then_some(Snapshot {
         manual: true,
-        ..snapshot
+        ..cached.snapshot
     })
 }
 /// Drop the last reading when the account's credential changes, so a new
@@ -140,11 +150,15 @@ fn load(path: &Path) -> Option<Snapshot> {
 pub(crate) fn forget(dir: &Path) {
     let _ = std::fs::remove_file(dir.join(CACHE));
 }
-fn save(path: &Path, snapshot: &Snapshot) {
+fn save(path: &Path, stamp: &[u8], snapshot: &Snapshot) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Ok(json) = serde_json::to_string(snapshot) {
+    let cached = Cached {
+        stamp: stamp.to_vec(),
+        snapshot: snapshot.clone(),
+    };
+    if let Ok(json) = serde_json::to_string(&cached) {
         let _ = std::fs::write(path, json);
     }
 }
