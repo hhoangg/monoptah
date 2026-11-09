@@ -1,8 +1,10 @@
-# Monoptah Native 0.50.1
+# Monoptah Native 0.50.2
 
-## Changes since 0.50.0
+## Changes since 0.50.1
 
-- Fixed new codespaces (and SSH machines without systemd) failing at "Connect over SSH" with "This host needs systemd user services and lingering". 0.50.0 downloaded an older Monoptah Host package that could not run without systemd; the Host now comes from the same source as before 0.50.0. Retry a failed start to reuse its codespace.
+- Clicking a file path in a cloud session chat (Markdown, image, HTML and other files) now opens the preview even after the agent has finished. Before, once the workspace tunnel was gone the card only said "Reconnect to view"; a click now reconnects the Codespace or Docker Sandbox, shows the progress and then opens the file.
+- Monos and the app API now treat Codespaces and Docker Sandbox sessions the same way. The `codespaces.*` actions are replaced by `cloud.list`, `cloud.status`, `cloud.create`, `cloud.stop`, `cloud.resume` and `cloud.delete`, and `sessions.start` takes `target {kind, instance}` (an existing instance can also be given as `{session: <id>}`). Sessions report `target` and `cloudState` for both backends.
+- A Mono can resume a stopped Docker Sandbox like a Codespace, including by sending to a session on it, and `sessions.pullEvidence` works for sandbox sessions. Stopping or deleting an instance lists the sessions on it, and deleting is refused while any of them is busy.
 
 ## Downloads and updates
 
