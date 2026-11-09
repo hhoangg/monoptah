@@ -1,9 +1,10 @@
-//! One switch for every local git write while a cloud session is in view.
+//! One switch for every git write while a cloud session is in view.
 //!
-//! The File and Git panels keep showing the local project when the session in
-//! view runs in a codespace, so the changes they list are not the agent's.
-//! Staging, discarding and committing them would act on the wrong work, so the
-//! Changes panel, the review view and the file editor's diff all ask here.
+//! The File and Git panels show the cloud workspace while a cloud session is
+//! in view (the panels are bound to its `remote://` root), so the changes they
+//! list are the agent's. Until remote git writes are confirmed user actions,
+//! the Changes panel, the review view and the file editor's diff all ask here
+//! and refuse to stage, discard or commit.
 //! The shell sets it from the active session on the UI thread, where every
 //! caller also runs.
 use std::cell::RefCell;

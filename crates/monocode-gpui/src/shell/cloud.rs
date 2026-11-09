@@ -618,11 +618,7 @@ pub(super) fn delete_note(groups: &[CodespaceGroup]) -> String {
 
 /// What the File and Git panels say while a cloud session is active.
 pub(super) fn banner_text(cloud: &CloudRef) -> String {
-    format!(
-        "Local files - this session runs in {} {}",
-        cloud.noun(),
-        cloud.name
-    )
+    format!("Cloud files - {} {}", cloud.noun(), cloud.name)
 }
 
 /// `ssh -t <id>@sbx_cloud <devcontainer exec ... bash -l>`: an interactive shell in a
