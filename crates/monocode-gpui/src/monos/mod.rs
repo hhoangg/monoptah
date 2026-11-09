@@ -874,7 +874,14 @@ impl Monos {
                     .unwrap_or_default();
                 view.update(cx, |view, cx| {
                     view.configure_mono(mono, root, env, cx);
-                    if let Some(settings) = settings {
+                    if let Some(mut settings) = settings {
+                        // A new chat was saved without an account. Keep the one
+                        // Conversation::new chose (the project's choice, else the
+                        // provider's default account): install_transfer marks the
+                        // chat loaded, so load() would never apply it.
+                        if settings.account.id == monocode_core::accounts::DEFAULT {
+                            settings.account = view.settings.account.clone();
+                        }
                         let config = view.settings.mono.take();
                         let env = std::mem::take(&mut view.settings.environment);
                         view.install_transfer(settings, None, cx);
