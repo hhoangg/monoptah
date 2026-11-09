@@ -397,14 +397,12 @@ mod tests {
         }
     }
 
+    type Progress = Vec<(u64, u64)>;
+
     fn pattern(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i * 31 % 251) as u8).collect()
     }
-    fn read(
-        host: &Fake,
-        path: &str,
-        cancel: &AtomicBool,
-    ) -> (Result<Vec<u8>, String>, Vec<(u64, u64)>) {
+    fn read(host: &Fake, path: &str, cancel: &AtomicBool) -> (Result<Vec<u8>, String>, Progress) {
         let mut seen = Vec::new();
         let result = read_bytes(
             host,
