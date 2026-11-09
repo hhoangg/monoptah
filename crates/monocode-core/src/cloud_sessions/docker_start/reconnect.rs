@@ -4,7 +4,8 @@
 //! ssh resumes and bills it), so `Connections::request` and `ensure_codespace_with` answer
 //! `SANDBOX_NOT_CONNECTED` and stay that way. [`CloudSessions::reconnect_sandbox`] is the one
 //! door for an explicit wake: a click on Reconnect, a send typed in the session's own view, or
-//! a send / `cloud.resume` through the app API (a Mono included, via `CloudApi::wake`). It
+//! a click on a file link in its transcript (the app reconnects, then reads the file), or a send /
+//! `cloud.resume` through the app API (a Mono included, via `CloudApi::wake`). It
 //! BLOCKS for minutes, so callers use a worker thread, never the UI thread. Background polling
 //! and listings never reach it.
 //!

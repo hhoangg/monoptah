@@ -404,21 +404,7 @@ impl Conversation {
                 this.remote_state.waking = false;
                 this.remote_state.wake_cancel = None;
                 match result {
-                    Ok(true) => {
-                        this.remote_state.error = None;
-                        this.cloud_stopped = false;
-                        cx.emit(CloudResumed);
-                        // Whatever refresh was in flight talked to the stopped host. Start
-                        // over: the queue drains only when a fresh refresh has reached the
-                        // host (its success path marks the view online and pumps the queue).
-                        this.remote_state.epoch += 1;
-                        this.remote_state.refreshing = false;
-                        if !this.busy {
-                            this.remote_state.online = false;
-                        }
-                        this.load_remote(cx);
-                        this.refresh_remote_snapshot(cx);
-                    }
+                    Ok(true) => this.cloud_reconnected(cx),
                     Ok(false) => this.remote_connection_error(
                         &format!("This {noun} is unavailable. It may have been deleted."),
                         cx,
@@ -430,6 +416,24 @@ impl Conversation {
         })
         .detach();
         true
+    }
+    /// The workspace of this session was brought back by a user action (the Reconnect button, a
+    /// send or a click on a file link): clears the error, tells the shell and reloads.
+    pub(crate) fn cloud_reconnected(&mut self, cx: &mut Context<Self>) {
+        self.remote_state.error = None;
+        self.cloud_stopped = false;
+        cx.emit(CloudResumed);
+        // Whatever refresh was in flight talked to the stopped host. Start
+        // over: the queue drains only when a fresh refresh has reached the
+        // host (its success path marks the view online and pumps the queue).
+        self.remote_state.epoch += 1;
+        self.remote_state.refreshing = false;
+        if !self.busy {
+            self.remote_state.online = false;
+        }
+        self.load_remote(cx);
+        self.refresh_remote_snapshot(cx);
+        cx.notify();
     }
     /// Whether the 3 second clock may refresh now. A stopped or waking workspace answers
     /// nothing (its old tunnel can still accept), so polling it only produces timeouts.

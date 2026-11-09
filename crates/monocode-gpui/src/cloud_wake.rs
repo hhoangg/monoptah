@@ -38,8 +38,8 @@ pub(crate) async fn wake_for_send(
     wake && view.update(cx, |v, cx| v.reconnect_cloud(cx))
 }
 
-/// Reconnects the instance of cloud session `id` for the conversation view's "Reconnect" button
-/// or a send typed in the session, and waits for it. `Ok(false)` means nothing was done (local
+/// Reconnects the instance of cloud session `id` for the conversation view's "Reconnect" button,
+/// a send typed in the session or a click on a file link in its transcript, and waits for it. `Ok(false)` means nothing was done (local
 /// session or the instance is Unavailable). Runs gh, sbx and the SSH bootstrap on the background
 /// executor. A sandbox reports its steps on `progress` and honors `cancel`; a codespace wake has
 /// neither.
@@ -52,23 +52,35 @@ pub(crate) async fn reconnect(
 ) -> Result<bool, String> {
     cx.background_executor()
         .spawn(async move {
-            let api = CloudApi::shared(&store)?;
-            match api.target_of(id) {
-                Some(target) if !should_wake(target.state) => Ok(false),
-                Some(target) if target.cloud.kind == CloudBackendKind::DockerSandbox => api
-                    .reconnect_sandbox(
-                        id,
-                        &mut |line| {
-                            let _ = progress.send_blocking(line.to_string());
-                        },
-                        &cancel,
-                    )
-                    .map(|()| true),
-                Some(_) => api.wake(id, &store).map(|()| true),
-                None => Ok(false),
-            }
+            reconnect_blocking(&store, id, &cancel, &mut |line| {
+                let _ = progress.send_blocking(line.to_string());
+            })
         })
         .await
+}
+
+/// [`reconnect`] for a worker thread: BLOCKS, for minutes. It goes through the shared
+/// [`CloudApi`], whose in-flight set is the one the Reconnect button uses, so two callers never
+/// run the sandbox flow of the same sandbox at once.
+pub(crate) fn reconnect_blocking(
+    store: &Database,
+    id: i64,
+    cancel: &std::sync::atomic::AtomicBool,
+    progress: &mut dyn FnMut(&str),
+) -> Result<bool, String> {
+    let api = CloudApi::shared(store)?;
+    match api.target_of(id) {
+        // User-initiated by construction: this is the Reconnect button, a send typed in the
+        // session's own view or a click on a file link in its transcript.
+        Some(target) if target.cloud.kind == CloudBackendKind::DockerSandbox => {
+            if !should_wake(target.state) {
+                return Ok(false);
+            }
+            api.reconnect_sandbox(id, progress, cancel).map(|()| true)
+        }
+        Some(target) if should_wake(target.state) => api.wake(id, store).map(|()| true),
+        _ => Ok(false),
+    }
 }
 
 /// Doubles for tests of the dispatchers: a git project with a GitHub origin, a fake `gh`
