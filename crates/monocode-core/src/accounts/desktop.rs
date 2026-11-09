@@ -80,9 +80,12 @@ impl Book {
             }
             for project in source.selections.keys().chain(self.selections.keys()) {
                 // Explicit choices only: the default account must not be
-                // frozen into every project the desktop client knows.
-                let id = self.chosen(kind, project).unwrap_or_else(default_id);
-                if id != source.chosen(kind, project).unwrap_or_else(default_id) {
+                // frozen into every project the desktop client knows. An
+                // explicit choice of the CLI login still counts as a choice,
+                // so it is compared as `Some`, not folded into "no choice".
+                let chosen = self.chosen(kind, project);
+                if chosen != source.chosen(kind, project) {
+                    let id = chosen.unwrap_or_else(default_id);
                     changes
                         .selections
                         .entry(project_key(project))
@@ -223,5 +226,21 @@ mod tests {
         assert_eq!(reloaded.selected(Kind::Claude, "/new"), "account-token");
         // An explicit desktop choice of the CLI profile still wins.
         assert_eq!(reloaded.selected(Kind::Claude, "/other"), DEFAULT);
+    }
+
+    #[test]
+    fn an_explicit_cli_login_choice_survives_a_reload_over_a_native_default() {
+        let source = Book::from_desktop(
+            &json!({"claude":[{"id":"account-token","label":"Token"}]}),
+            &json!({}),
+        )
+        .unwrap();
+        let mut native = source.clone();
+        native.set_preferred(Kind::Claude, "account-token").unwrap();
+        native.select(Kind::Claude, "/proj", DEFAULT).unwrap();
+        let mut reloaded = source.clone();
+        reloaded.apply_desktop_overrides(native.desktop_overrides(&source));
+        assert_eq!(reloaded.selected(Kind::Claude, "/proj"), DEFAULT);
+        assert_eq!(reloaded.selected(Kind::Claude, "/new"), "account-token");
     }
 }
