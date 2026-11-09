@@ -28,7 +28,7 @@ import {
   type RemoteProvider,
 } from "../src/features/connections/model/protocol";
 import { connectionInfo, installService, uninstallService } from "./service";
-import { version } from "../package.json";
+import { HOST_VERSION } from "./host-version";
 import { protectWindowsDirectory } from "./windows";
 
 process.umask(0o077);
@@ -71,7 +71,7 @@ const lifecycle = async (state: Running, action: "status" | "stop") => {
 
 async function main() {
   if (command === "--version") {
-    console.log(version);
+    console.log(HOST_VERSION);
     return;
   }
   if (command === "help" || command === "--help") {

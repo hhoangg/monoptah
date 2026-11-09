@@ -102,3 +102,14 @@ it(
   },
   process.platform === "win32" ? 60_000 : 20_000,
 );
+
+it("prints the Host version from host/VERSION for --version", async () => {
+  const expected = readFileSync(resolve("host/VERSION"), "utf8").trim();
+  expect(expected).toMatch(/\+monoptah$/);
+  const { stdout } = await exec(
+    process.execPath,
+    [resolve("build/host/monocode-host.mjs"), "--version"],
+    { timeout: 10_000 },
+  );
+  expect(stdout.trim()).toBe(expected);
+});
