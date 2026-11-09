@@ -777,6 +777,11 @@ pub(crate) struct TranscriptView {
     work_folds: HashMap<usize, bool>,
     reveals: HashMap<usize, PacedText>,
     live_start: usize,
+    /// Background tasks a Claude run has yielded to, and the source length
+    /// when it yielded. The run stays live until they finish, but what it
+    /// said before yielding is its reply and shows at once.
+    yielded: usize,
+    yield_mark: usize,
     motions: HashMap<(usize, usize), Motion>,
     reflow: crate::reflow_motion::ReflowMotion,
     frame_scheduled: bool,
@@ -1237,9 +1242,16 @@ impl TranscriptView {
                     && self.mono_prose_hidden(message)
             });
         let group = self.mono_group_start(latest);
+        let waiting = self.yielded > 0 && self.source.len() <= self.yield_mark;
         Some((
             group,
-            if typing {
+            if waiting {
+                format!(
+                    "Waiting on {} background task{}",
+                    self.yielded,
+                    if self.yielded == 1 { "" } else { "s" }
+                )
+            } else if typing {
                 "Typing…".into()
             } else {
                 mono_work_label(&self.source, group)
@@ -1854,6 +1866,11 @@ impl TranscriptView {
     /// groupMonoTurnItems: prose stays in the activity trail while its run is
     /// live, and when later work in the run follows it.
     fn mono_prose_hidden(&self, at: usize) -> bool {
+        // What the run said before yielding to background tasks is already
+        // on screen; follow-up work must not pull it back into the trail.
+        if self.streaming && at < self.yield_mark {
+            return false;
+        }
         let end = (at + 1..self.source.len())
             .find(|&i| self.source[i].is_prompt())
             .unwrap_or(self.source.len());
@@ -2570,6 +2587,8 @@ impl TranscriptView {
             work_folds: HashMap::new(),
             reveals: HashMap::new(),
             live_start: 0,
+            yielded: 0,
+            yield_mark: 0,
             motions: HashMap::new(),
             reflow: Default::default(),
             frame_scheduled: false,
@@ -2679,6 +2698,24 @@ impl TranscriptView {
         cx.notify();
     }
 
+    /// The live run has yielded to `tasks` background tasks (0: none are
+    /// pending). Text already streamed is its reply and shows; anything a
+    /// follow-up run adds afterwards stays hidden while it streams, as usual.
+    pub(crate) fn set_yielded(&mut self, tasks: usize, cx: &mut Context<Self>) {
+        if !self.streaming {
+            return;
+        }
+        let mark = if tasks > 0 && (self.yielded == 0 || self.source.len() > self.yield_mark) {
+            self.source.len()
+        } else {
+            self.yield_mark
+        };
+        if (tasks, mark) != (self.yielded, self.yield_mark) {
+            self.yielded = tasks;
+            self.yield_mark = mark;
+            self.rebuild(0, cx);
+        }
+    }
     pub(crate) fn streaming(&mut self, streaming: bool, cx: &mut Context<Self>) {
         if self.streaming == streaming {
             return;
@@ -2698,6 +2735,8 @@ impl TranscriptView {
             HashSet::new()
         };
         self.streaming = streaming;
+        self.yielded = 0;
+        self.yield_mark = 0;
         if streaming {
             self.active_provider_turn_id = None;
             self.live_start = self.source.len();
@@ -6956,6 +6995,69 @@ mod scroll_tests {
             assert_eq!(view.last_assistant_text(), "Start middle end.");
             view.patch(7, vec![row("assistant", "   ")], cx);
             assert_eq!(view.last_assistant_text(), "Start middle end.");
+        });
+    }
+
+    #[gpui::test]
+    fn mono_reply_shows_while_the_run_waits_on_background_tasks(cx: &mut TestAppContext) {
+        let view = cx.new(|_| {
+            let mut view = TranscriptView::new();
+            view.mono_mode("cat", 0xe86b5f, "MonoCat");
+            view
+        });
+        view.update(cx, |view, cx| {
+            let bash = || {
+                let mut call = ToolCall::new("t", "Bash");
+                call.input = r#"{"command":"npm run native:dev"}"#.into();
+                row("tool", &serde_json::to_string(&call).unwrap())
+            };
+            view.patch(0, vec![row("user", "Start the dev app")], cx);
+            view.streaming(true, cx);
+            view.patch(1, vec![row("assistant", "Starting it."), bash()], cx);
+            view.patch(3, vec![row("assistant", "The app is running.")], cx);
+            assert!(view.mono_prose_hidden(3), "a live reply appears whole");
+            assert_eq!(view.mono_activity().unwrap().1, "Typing…");
+
+            // Claude ends its turn; the background task keeps the run live.
+            view.set_yielded(1, cx);
+            assert!(
+                !view.mono_prose_hidden(3),
+                "the reply before a background task is the answer"
+            );
+            assert_eq!(
+                view.mono_activity().unwrap().1,
+                "Waiting on 1 background task"
+            );
+            view.set_yielded(2, cx);
+            assert_eq!(
+                view.mono_activity().unwrap().1,
+                "Waiting on 2 background tasks"
+            );
+
+            // The task finishes and Claude follows up in the same run.
+            view.set_yielded(0, cx);
+            view.patch(
+                4,
+                vec![bash(), row("assistant", "It exited; restarting.")],
+                cx,
+            );
+            assert!(!view.mono_prose_hidden(3), "the shown reply stays shown");
+            assert!(
+                view.mono_prose_hidden(5),
+                "the follow-up's commentary hides while it streams"
+            );
+            assert_eq!(view.mono_activity().unwrap().1, "Typing…");
+
+            view.entrances.clear();
+            view.streaming(false, cx);
+            assert!(
+                !view.entrances.contains_key(&3),
+                "the reply already shown does not enter again on settle"
+            );
+            assert!(
+                view.entrances.contains_key(&5),
+                "the follow-up's reply enters when the run settles"
+            );
         });
     }
 

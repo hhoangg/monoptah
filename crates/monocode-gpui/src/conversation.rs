@@ -1579,6 +1579,8 @@ impl Conversation {
                             this.status = update.status;
                         }
                         if let Some(tasks) = update.background.filter(|_| !stopping) {
+                            let count = tasks.len();
+                            this.transcript.update(cx, |v, cx| v.set_yielded(count, cx));
                             this.set_background(tasks, cx);
                         }
                         if !stopping {
