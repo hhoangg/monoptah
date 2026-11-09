@@ -419,3 +419,59 @@ fn only_the_user_facing_paths_may_create_a_terminal_session() {
         );
     }
 }
+
+/// Settings lists an Agent CLI's models from the catalog discovered for the
+/// account new sessions use, even with no open session of that provider, so a
+/// setup-token default account makes Claude selectable as the default agent.
+#[gpui::test]
+fn settings_lists_models_discovered_for_the_default_account(cx: &mut TestAppContext) {
+    let (window, _, _) = window(cx);
+    window
+        .update(cx, |shell, _, cx| {
+            if crate::accounts::get(cx).is_none() {
+                crate::accounts::install(shell.store.clone(), cx);
+            }
+            let center = crate::accounts::get(cx).unwrap();
+            let profile = center.update(cx, |center, _| {
+                let account = center.book.add(Kind::Claude, "Setup token").unwrap();
+                center
+                    .book
+                    .set_preferred(Kind::Claude, &account.id)
+                    .unwrap();
+                center.selected(Kind::Claude, PROJECT)
+            });
+            assert_ne!(profile.id, monocode_core::accounts::DEFAULT);
+            shell.workspace.project = PROJECT.into();
+            let model = monocode_core::catalog::Model {
+                id: "settings-catalog-test".into(),
+                name: "Settings catalog test".into(),
+                alias_target: None,
+                efforts: Vec::new(),
+                default_effort: None,
+                fast: false,
+                thinking: false,
+                default: true,
+                tiers: Vec::new(),
+                controls: Vec::new(),
+            };
+            // The CLI login's catalog is not the one new sessions would use.
+            assert!(
+                !shell
+                    .settings_context(cx)
+                    .catalogs
+                    .get("claude")
+                    .is_some_and(|rows| rows.iter().any(|(id, _)| id == "settings-catalog-test"))
+            );
+            monocode_core::catalog::seed_cached(Kind::Claude, &profile, vec![model]);
+            let rows = shell.settings_context(cx).catalogs.remove("claude");
+            monocode_core::catalog::invalidate(Kind::Claude, &profile);
+            assert_eq!(
+                rows.unwrap()[0],
+                (
+                    "settings-catalog-test".to_owned(),
+                    "Settings catalog test".to_owned()
+                )
+            );
+        })
+        .unwrap();
+}
