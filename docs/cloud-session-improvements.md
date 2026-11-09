@@ -405,12 +405,12 @@ step.** The fork ships its own Host precisely so that every cloud Host has
   - It does not gate Explorer create/rename/delete or editor save.
   - Banner: now "Cloud files - {codespace|sandbox} {name}" (`shell/cloud.rs`
     `banner_text`, fixed by F2-0; it used to say "Local files - this session runs in ...").
-- **The panels already show the remote workspace. The banner is wrong, and that is a live
-  bug.** This was settled from the code during review; it is not yet confirmed in the
+- **The panels already show the remote workspace. The banner used to be wrong (fixed by
+  F2-0).** This was settled from the code during review; it is not yet confirmed in the
   running app.
-  - The banner, the gate comment (`git_gate.rs:3-5`) and the sandbox spec
-    (`docs/docker-sandbox-spec.html:1659,3598,3903`) all say the panels show the local
-    checkout. They do not:
+  - The banner and the gate comment (`git_gate.rs:3-5`) used to say, and the sandbox spec
+    (`docs/docker-sandbox-spec.html:1659,3598,3903`) still says, that the panels show the
+    local checkout. They do not:
     - `Shell::add_loaded` (`gpui/shell.rs:1585`) and `ensure_session`
       (`gpui/shell/session_loading.rs:50-65`) create a `Conversation` for every shown
       session.
@@ -420,8 +420,8 @@ step.** The fork ships its own Host precisely so that every cloud Host has
     - a Host worktree's `worktree_cwd` is built with `remote::remote_path`
       (`core/store/remote.rs:165`).
   - `working_copy()` is only the fallback when no session is active.
-  - So today Files and Changes list the **remote** tree, polled every 2 s, under a banner
-    saying "Local files".
+  - So Files and Changes list the **remote** tree, polled every 2 s (before F2-0 under a
+    banner saying "Local files").
   - `git_gate` blocks git writes to the **remote**. Meanwhile Explorer
     create/rename/delete and editor save **already write to the cloud workspace**, with no
     gate and the two-RPC conflict check only.
