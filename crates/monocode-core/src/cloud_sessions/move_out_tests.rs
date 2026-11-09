@@ -1,4 +1,5 @@
 use super::move_out::*;
+use super::move_out::{fetch_with_timeout_for_test, snapshot_with_limit_for_test};
 use std::{
     path::{Path, PathBuf},
     process::Command,
@@ -233,19 +234,30 @@ fn the_default_branch_is_never_pushed_to() {
 }
 
 #[test]
-fn the_default_branch_is_never_pushed_to_even_when_up_to_date() {
+fn the_default_branch_at_its_tip_needs_no_push() {
     let f = Fixture::new();
+    assert_eq!(f.target(), pt("main", false, false));
+}
+
+#[test]
+fn a_diverged_default_branch_uses_the_cloud_name() {
+    let f = Fixture::new();
+    f.push_from_elsewhere("main", "theirs.txt");
+    commit_file(&f.work, "mine.txt", "mine\n");
     assert_eq!(f.target(), pt("main-cloud", true, true));
 }
 
 #[test]
-fn a_branch_tracking_the_default_branch_is_not_pushed_to_it() {
+fn a_branch_tracking_the_default_branch_keeps_its_own_name() {
     let f = Fixture::new();
     git(
         &f.work,
         &["checkout", "-q", "-b", "feature", "--track", "origin/main"],
     );
     commit_file(&f.work, "a.txt", "a\n");
+    assert_eq!(f.target(), pt("feature", true, true));
+    // Once that name exists on origin and has diverged, it moves to the cloud name.
+    f.push_from_elsewhere("feature", "theirs.txt");
     assert_eq!(f.target(), pt("feature-cloud", true, true));
 }
 
@@ -267,8 +279,51 @@ fn the_default_branch_follows_origin_head() {
     assert_eq!(f.target(), pt("trunk-cloud", true, true));
     git(&f.work, &["checkout", "-q", "main"]);
     commit_file(&f.work, "b.txt", "b\n");
-    // main is no longer the default, and it is behind or equal on origin
-    assert_eq!(f.target(), pt("main", true, false));
+    // main is still protected: it also holds the conventional default name.
+    assert_eq!(f.target(), pt("main-cloud", true, true));
+}
+
+/// Origin's default is `develop` and `main` is gone from origin.
+fn develop_is_the_default(f: &Fixture) {
+    git(&f.work, &["checkout", "-q", "-b", "develop"]);
+    git(&f.work, &["push", "-q", "-u", "origin", "develop"]);
+    git(&f.origin, &["symbolic-ref", "HEAD", "refs/heads/develop"]);
+    git(&f.work, &["push", "-q", "origin", "--delete", "main"]);
+    git(&f.work, &["fetch", "-q", "--prune", "origin"]);
+}
+
+#[test]
+fn an_unusual_default_branch_is_found_without_origin_head() {
+    let f = Fixture::new();
+    develop_is_the_default(&f);
+    git(&f.work, &["remote", "set-head", "origin", "-d"]);
+    commit_file(&f.work, "a.txt", "a\n");
+    assert_eq!(f.target(), pt("develop-cloud", true, true));
+}
+
+#[test]
+fn a_stale_origin_head_does_not_hide_the_default_branch() {
+    let f = Fixture::new();
+    develop_is_the_default(&f);
+    git(
+        &f.work,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/deleted",
+        ],
+    );
+    commit_file(&f.work, "a.txt", "a\n");
+    assert_eq!(f.target(), pt("develop-cloud", true, true));
+}
+
+#[test]
+fn a_branch_named_like_a_tag_still_has_its_plain_name() {
+    let f = Fixture::new();
+    git(&f.work, &["checkout", "-q", "-b", "feature"]);
+    git(&f.work, &["tag", "feature"]);
+    commit_file(&f.work, "a.txt", "a\n");
+    assert_eq!(f.target(), pt("feature", true, true));
 }
 
 #[test]
@@ -330,11 +385,20 @@ fn fetch_brings_in_new_remote_branches() {
 
 #[cfg(unix)]
 #[test]
-fn fetch_gives_up_after_the_timeout() {
+fn fetch_gives_up_after_the_timeout_and_leaves_no_orphan() {
     use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new();
-    let script = f.work.parent().unwrap().join("slow.sh");
-    std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+    let dir = f.work.parent().unwrap();
+    let pidfile = dir.join("grandchild.pid");
+    let script = dir.join("slow.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nsleep 60 &\necho $! > '{}'\nwait\n",
+            pidfile.display()
+        ),
+    )
+    .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     git(
         &f.work,
@@ -350,9 +414,24 @@ fn fetch_gives_up_after_the_timeout() {
         ],
     );
     let started = std::time::Instant::now();
-    let err = super::move_out::fetch_with_timeout_for_test(&f.work, 300).unwrap_err();
+    let err = fetch_with_timeout_for_test(&f.work, 1500).unwrap_err();
     assert!(err.contains("longer than"), "{err}");
     assert!(started.elapsed().as_secs() < 10);
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // The grandchild (`sleep 60`) must be dead; give the kernel a moment to reap it.
+    let mut alive = true;
+    for _ in 0..40 {
+        alive = unsafe { libc::kill(pid, 0) } == 0;
+        if !alive {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(!alive, "the grandchild process {pid} outlived the fetch");
 }
 
 #[test]
@@ -493,8 +572,20 @@ fn snapshot_leaves_index_stash_branches_and_files_untouched() {
     );
 }
 
+fn rebuilt_tree(f: &Fixture, patch: &Path, name: &str) -> String {
+    let clone = f._tmp.path().join(name);
+    git(
+        f._tmp.path(),
+        &["clone", "-q", f.origin.to_str().unwrap(), name],
+    );
+    configure(&clone);
+    git(&clone, &["apply", "--binary", patch.to_str().unwrap()]);
+    git(&clone, &["add", "-A"]);
+    git(&clone, &["write-tree"])
+}
+
 #[test]
-fn the_tree_is_deterministic_and_ignores_diff_and_autocrlf_config() {
+fn the_tree_is_deterministic_and_ignores_diff_config() {
     let f = Fixture::new();
     dirty(&f);
     let stage = |name: &str| f._tmp.path().join(name);
@@ -515,6 +606,157 @@ fn the_tree_is_deterministic_and_ignores_diff_and_autocrlf_config() {
     let patch = std::fs::read(third.patch_path.unwrap()).unwrap();
     assert!(patch.starts_with(b"diff --git a/"));
     assert_eq!(patch, std::fs::read(first.patch_path.unwrap()).unwrap());
+}
+
+/// `core.autocrlf` is the user's own choice and is honoured on purpose: it decides what a
+/// commit would store, so the snapshot stores the same. Because the patch is made from the
+/// same staged content, the cloud (which has no autocrlf) rebuilds the same tree id.
+#[test]
+fn autocrlf_changes_the_stored_line_endings_and_the_patch_still_rebuilds_the_tree() {
+    let f = Fixture::new();
+    std::fs::write(f.work.join("crlf.txt"), "a\r\nb\r\n").unwrap();
+    let keep = snapshot(&f.work, &f._tmp.path().join("s1")).unwrap();
+    git(&f.work, &["config", "core.autocrlf", "input"]);
+    let normalised = snapshot(&f.work, &f._tmp.path().join("s2")).unwrap();
+    assert_ne!(keep.tree, normalised.tree);
+    let patch = std::fs::read(normalised.patch_path.as_ref().unwrap()).unwrap();
+    assert!(!String::from_utf8_lossy(&patch).contains('\r'));
+    assert_eq!(
+        rebuilt_tree(&f, normalised.patch_path.as_ref().unwrap(), "c1"),
+        normalised.tree
+    );
+    assert_eq!(
+        rebuilt_tree(&f, keep.patch_path.as_ref().unwrap(), "c2"),
+        keep.tree
+    );
+    // The same setting twice is stable.
+    let again = snapshot(&f.work, &f._tmp.path().join("s3")).unwrap();
+    assert_eq!(again.tree, normalised.tree);
+}
+
+#[test]
+fn a_user_diff_context_does_not_break_the_patch() {
+    let f = Fixture::new();
+    let lines: String = (1..=30).map(|n| format!("line {n}\n")).collect();
+    commit_file(&f.work, "long.txt", &lines);
+    git(&f.work, &["push", "-q", "origin", "main"]);
+    git(&f.work, &["config", "diff.context", "0"]);
+    let edited = lines
+        .replace("line 10\n", "ten\n")
+        .replace("line 20\n", "twenty\n");
+    std::fs::write(f.work.join("long.txt"), edited).unwrap();
+    let snap = snapshot(&f.work, &f._tmp.path().join("s")).unwrap();
+    let patch = snap.patch_path.unwrap();
+    assert!(std::fs::read_to_string(&patch)
+        .unwrap()
+        .contains(" line 9\n"));
+    assert_eq!(rebuilt_tree(&f, &patch, "c"), snap.tree);
+}
+
+#[test]
+fn submodule_ignore_settings_do_not_hide_a_moved_submodule() {
+    let f = Fixture::new();
+    let sub_src = f._tmp.path().join("sub-src");
+    std::fs::create_dir_all(&sub_src).unwrap();
+    git(&sub_src, &["init", "-q", "-b", "main"]);
+    configure(&sub_src);
+    commit_file(&sub_src, "lib.txt", "lib\n");
+    git(
+        &f.work,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            sub_src.to_str().unwrap(),
+            "vendor",
+        ],
+    );
+    git(&f.work, &["commit", "-q", "-m", "add submodule"]);
+    let vendor = f.work.join("vendor");
+    configure(&vendor);
+    commit_file(&vendor, "more.txt", "more\n");
+    git(&f.work, &["config", "diff.ignoreSubmodules", "all"]);
+    git(&f.work, &["config", "submodule.vendor.ignore", "all"]);
+    let snap = snapshot(&f.work, &f._tmp.path().join("s")).unwrap();
+    assert_ne!(snap.tree, tree_of_head(&f.work));
+    assert_eq!(snap.sizes.changed, 1);
+    let text = std::fs::read_to_string(snap.patch_path.unwrap()).unwrap();
+    assert!(text.contains("Subproject commit"), "{text}");
+}
+
+fn listing(dir: &Path) -> Vec<String> {
+    fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            out.push(path.strip_prefix(base).unwrap().display().to_string());
+            if entry.file_type().unwrap().is_dir() {
+                walk(base, &path, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
+#[test]
+fn a_split_index_leaks_no_shared_index_into_the_repository() {
+    let f = Fixture::new();
+    git(&f.work, &["config", "core.splitIndex", "true"]);
+    git(&f.work, &["update-index", "--split-index"]);
+    std::fs::write(f.work.join("README.md"), "hello\nmore\n").unwrap();
+    std::fs::write(f.work.join("new.txt"), "new\n").unwrap();
+    let before = listing(&f.work.join(".git"));
+    assert!(before.iter().any(|n| n.starts_with("sharedindex.")));
+    let snap = snapshot(&f.work, &f._tmp.path().join("s")).unwrap();
+    assert!(snap.patch_path.is_some());
+    assert_eq!(listing(&f.work.join(".git")), before);
+}
+
+#[test]
+fn no_object_reaches_the_real_object_store() {
+    let f = Fixture::new();
+    dirty(&f);
+    let before = listing(&f.work.join(".git/objects"));
+    let snap = snapshot(&f.work, &f._tmp.path().join("s")).unwrap();
+    assert!(snap.patch_path.is_some());
+    assert_eq!(listing(&f.work.join(".git/objects")), before);
+    assert!(!f._tmp.path().join("s/objects.tmp").exists());
+    assert!(!f._tmp.path().join("s/index.tmp").exists());
+}
+
+#[test]
+fn files_over_the_limit_are_refused_before_anything_is_written() {
+    let f = Fixture::new();
+    std::fs::write(f.work.join("big.bin"), vec![7u8; 4096]).unwrap();
+    let before = listing(&f.work.join(".git/objects"));
+    let err = snapshot_with_limit_for_test(&f.work, &f._tmp.path().join("s"), 1000).unwrap_err();
+    assert!(err.contains("limit"), "{err}");
+    assert_eq!(listing(&f.work.join(".git/objects")), before);
+    assert!(!f._tmp.path().join("s/uncommitted.patch").exists());
+    // Under the limit it works.
+    assert!(snapshot_with_limit_for_test(&f.work, &f._tmp.path().join("s"), 1 << 20).is_ok());
+}
+
+#[test]
+fn a_relative_staging_path_works() {
+    let f = Fixture::new();
+    std::fs::write(f.work.join("new.txt"), "new\n").unwrap();
+    // Reach the temp dir from the current directory without a single absolute component.
+    let cwd = std::env::current_dir().unwrap();
+    let mut rel = PathBuf::new();
+    for _ in cwd.components().skip(1) {
+        rel.push("..");
+    }
+    rel.push(f._tmp.path().strip_prefix("/").unwrap());
+    rel.push("relative-stage");
+    assert!(rel.is_relative());
+    let snap = snapshot(&f.work, &rel).unwrap();
+    assert!(snap.patch_path.unwrap().is_absolute());
+    assert_ne!(snap.tree, tree_of_head(&f.work));
 }
 
 #[test]
@@ -725,4 +967,31 @@ fn symlinks_in_the_transcript_folders_are_not_followed() {
     std::os::unix::fs::symlink(&secret, home.join("projects/-p/sess-4/link.txt")).unwrap();
     let t = collect_transcript(&home, Path::new("/p"), "sess-4", &tmp.path().join("s")).unwrap();
     assert!(!t.root.join("projects/-p/sess-4/link.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_roots_of_the_transcript_are_not_followed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = claude_home(tmp.path(), "sess-5", "-p");
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+    let project = home.join("projects/-p");
+    // The id folder and the file-history folder are links to somewhere else.
+    std::fs::remove_dir_all(project.join("sess-5")).unwrap();
+    std::os::unix::fs::symlink(&outside, project.join("sess-5")).unwrap();
+    std::fs::remove_dir_all(home.join("file-history/sess-5")).unwrap();
+    std::os::unix::fs::symlink(&outside, home.join("file-history/sess-5")).unwrap();
+    let t = collect_transcript(&home, Path::new("/p"), "sess-5", &tmp.path().join("s")).unwrap();
+    assert!(!t.root.join("projects/-p/sess-5").exists());
+    assert!(!t.root.join("file-history/sess-5").exists());
+
+    // A transcript that is itself a link is not a transcript.
+    let real = project.join("sess-6.jsonl");
+    std::fs::write(&real, "x").unwrap();
+    std::os::unix::fs::symlink(&real, project.join("sess-7.jsonl")).unwrap();
+    let err =
+        collect_transcript(&home, Path::new("/p"), "sess-7", &tmp.path().join("s2")).unwrap_err();
+    assert!(err.contains("Could not find"), "{err}");
 }

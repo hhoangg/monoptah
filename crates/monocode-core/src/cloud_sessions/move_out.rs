@@ -17,12 +17,13 @@ pub const MAX_PATCH_BYTES: u64 = 500 * 1024 * 1024;
 /// The Claude transcript (`<id>.jsonl`) may not exceed this size.
 pub const MAX_JSONL_BYTES: u64 = 50 * 1024 * 1024;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+const LS_REMOTE_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE: &str = "origin";
 /// Bound on the entries visited to size one ignored directory.
 const SIZE_WALK_BUDGET: usize = 200_000;
 
 /// Config that would otherwise change the shape of the patch or of what is staged.
-const NEUTRAL: [&str; 8] = [
+const NEUTRAL: [&str; 12] = [
     "-c",
     "diff.noprefix=false",
     "-c",
@@ -31,6 +32,12 @@ const NEUTRAL: [&str; 8] = [
     "core.fsmonitor=false",
     "-c",
     "core.quotepath=false",
+    // A split index would write `sharedindex.*` into the real `.git`.
+    "-c",
+    "core.splitIndex=false",
+    // Never fail (or warn) on mixed line endings while staging into the scratch index.
+    "-c",
+    "core.safecrlf=false",
 ];
 
 /// Where the branch is pushed. `branch` is the name on origin.
@@ -93,10 +100,18 @@ pub struct Transcript {
 
 // ---------------------------------------------------------------- git plumbing
 
+/// Where a snapshot writes: its own index and its own object directory, so nothing lands
+/// in the user's `.git`. Reads still see the real objects through the alternate.
+struct Scratch {
+    index: PathBuf,
+    objects: PathBuf,
+    real_objects: PathBuf,
+}
+
 fn run(
     root: &Path,
     args: &[&str],
-    index: Option<&Path>,
+    scratch: Option<&Scratch>,
     stdout: Option<Stdio>,
 ) -> Result<Vec<u8>, String> {
     let mut cmd = git_cmd();
@@ -108,9 +123,13 @@ fn run(
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE");
-    if let Some(index) = index {
-        cmd.env("GIT_INDEX_FILE", index);
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES");
+    if let Some(scratch) = scratch {
+        cmd.env("GIT_INDEX_FILE", &scratch.index)
+            .env("GIT_OBJECT_DIRECTORY", &scratch.objects)
+            .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", &scratch.real_objects);
     }
     let to_file = stdout.is_some();
     if let Some(stdout) = stdout {
@@ -125,8 +144,8 @@ fn run(
     Ok(if to_file { Vec::new() } else { out.stdout })
 }
 
-fn git_text(root: &Path, args: &[&str], index: Option<&Path>) -> Result<String, String> {
-    let out = run(root, args, index, None)?;
+fn git_text(root: &Path, args: &[&str], scratch: Option<&Scratch>) -> Result<String, String> {
+    let out = run(root, args, scratch, None)?;
     Ok(String::from_utf8_lossy(&out).trim().to_owned())
 }
 
@@ -164,59 +183,88 @@ fn remote_tip(root: &Path, branch: &str) -> Option<String> {
 
 // ---------------------------------------------------------------- step 1: fetch
 
-/// `git fetch origin`, killed after 60 s, never prompting for credentials. This updates
-/// only the remote-tracking refs.
+enum Timed {
+    TimedOut,
+    Failed(String),
+}
+
+/// Runs git with a deadline. On timeout the whole process group is killed, so helpers such
+/// as `ssh` or a credential program do not outlive the call.
+fn run_timed(root: &Path, args: &[&str], timeout: Duration) -> Result<String, Timed> {
+    let failed = |e: String| Timed::Failed(e);
+    let mut out = tempfile::tempfile().map_err(|e| failed(e.to_string()))?;
+    let mut err = tempfile::tempfile().map_err(|e| failed(e.to_string()))?;
+    let mut cmd = git_cmd();
+    cmd.args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .stdin(Stdio::null())
+        .stdout(out.try_clone().map_err(|e| failed(e.to_string()))?)
+        .stderr(err.try_clone().map_err(|e| failed(e.to_string()))?);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| failed(format!("Could not run Git: {e}")))?;
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait().map_err(|e| failed(e.to_string()))? {
+            Some(status) => break status,
+            None if started.elapsed() >= timeout => {
+                crate::process::terminate(&mut child);
+                return Err(Timed::TimedOut);
+            }
+            None => std::thread::sleep(Duration::from_millis(25)),
+        }
+    };
+    let read = |file: &mut std::fs::File| {
+        let mut text = String::new();
+        let _ = std::io::Seek::rewind(file);
+        let _ = file.read_to_string(&mut text);
+        text
+    };
+    if status.success() {
+        Ok(read(&mut out))
+    } else {
+        Err(Timed::Failed(read(&mut err).trim().to_owned()))
+    }
+}
+
+/// A plain `git fetch origin`, killed (with its children) after 60 s and never prompting
+/// for credentials. It updates only the remote-tracking refs, as any fetch does.
 pub fn fetch_origin(cwd: &Path) -> Result<(), String> {
     fetch_with_timeout(cwd, FETCH_TIMEOUT)
 }
 
 fn fetch_with_timeout(cwd: &Path, timeout: Duration) -> Result<(), String> {
     let root = toplevel(cwd)?;
-    let mut stderr = tempfile::tempfile().map_err(|e| e.to_string())?;
-    let mut cmd = git_cmd();
-    cmd.args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
-        .arg("-C")
-        .arg(&root)
-        .args(["fetch", "--prune", "--no-tags", REMOTE])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_INDEX_FILE")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(stderr.try_clone().map_err(|e| e.to_string())?);
-    let mut child = cmd.spawn().map_err(|e| format!("Could not run Git: {e}"))?;
-    let started = Instant::now();
-    let status = loop {
-        match child.try_wait().map_err(|e| e.to_string())? {
-            Some(status) => break status,
-            None if started.elapsed() >= timeout => {
-                crate::process::terminate(&mut child);
-                let _ = child.wait();
-                return Err(format!(
-                    "Fetching {REMOTE} took longer than {} seconds",
-                    timeout.as_secs()
-                ));
-            }
-            None => std::thread::sleep(Duration::from_millis(25)),
-        }
-    };
-    if status.success() {
-        return Ok(());
+    match run_timed(&root, &["fetch", "--no-tags", REMOTE], timeout) {
+        Ok(_) => Ok(()),
+        Err(Timed::TimedOut) => Err(format!(
+            "Fetching {REMOTE} took longer than {} seconds",
+            timeout.as_secs()
+        )),
+        Err(Timed::Failed(e)) => Err(format!("Could not fetch {REMOTE}: {e}")),
     }
-    let mut text = String::new();
-    let _ = std::io::Seek::rewind(&mut stderr);
-    let _ = stderr.read_to_string(&mut text);
-    Err(format!("Could not fetch {REMOTE}: {}", text.trim()))
 }
 
 // ---------------------------------------------------------------- step 2: push target
 
 /// Chooses the branch to push, from the remote-tracking refs as they are now (call
-/// [`fetch_origin`] first). Never a force push and never origin's default branch.
+/// [`fetch_origin`] first). Never a force push and never a push that changes origin's
+/// default branch.
 pub fn push_target(cwd: &Path) -> Result<PushTarget, String> {
     let root = toplevel(cwd)?;
-    let branch = git_text(&root, &["symbolic-ref", "--short", "-q", "HEAD"], None)
+    let branch = git_text(&root, &["symbolic-ref", "-q", "HEAD"], None)
         .ok()
+        .and_then(|r| r.strip_prefix("refs/heads/").map(str::to_owned))
         .filter(|b| !b.is_empty())
         .ok_or("HEAD is detached. Switch to a branch before continuing in the cloud.")?;
     let head = git_text(&root, &["rev-parse", "--verify", "HEAD"], None)
@@ -225,24 +273,33 @@ pub fn push_target(cwd: &Path) -> Result<PushTarget, String> {
         return Err(format!("This project has no {REMOTE} remote to push to"));
     }
     let defaults = default_branches(&root);
-    let upstream = upstream_on_origin(&root, &branch);
 
-    // The branch an ordinary push would use, if the rules allow it.
-    let plain = upstream.clone().unwrap_or_else(|| branch.clone());
-    if !defaults.contains(&branch) && !defaults.contains(&plain) {
-        match remote_tip(&root, &plain) {
+    // An upstream that is itself the default branch counts as no upstream: the branch
+    // keeps its own name instead.
+    let plain = if defaults.contains(&branch) {
+        branch.clone()
+    } else {
+        upstream_on_origin(&root, &branch)
+            .filter(|up| !defaults.contains(up))
+            .unwrap_or_else(|| branch.clone())
+    };
+    let tip = remote_tip(&root, &plain);
+    let at_tip = tip.as_deref() == Some(head.as_str());
+    if at_tip {
+        // Nothing to push, so even the default branch is left untouched.
+        return Ok(PushTarget {
+            branch: plain,
+            needs_push: false,
+            creates_branch: false,
+        });
+    }
+    if !defaults.contains(&plain) {
+        match tip {
             None => {
                 return Ok(PushTarget {
                     branch: plain,
                     needs_push: true,
                     creates_branch: true,
-                })
-            }
-            Some(tip) if tip == head => {
-                return Ok(PushTarget {
-                    branch: plain,
-                    needs_push: false,
-                    creates_branch: false,
                 })
             }
             Some(tip) if is_ancestor(&root, &tip, &head)? => {
@@ -309,51 +366,118 @@ fn upstream_on_origin(root: &Path, branch: &str) -> Option<String> {
     remote_tip(root, &name).map(|_| name)
 }
 
-/// Origin's default branch from `refs/remotes/origin/HEAD`. When the clone has no such
-/// ref, `main` and `master` count as default if they exist on origin.
+/// Every branch that may be origin's default: the target of `refs/remotes/origin/HEAD`
+/// while it still exists, `main` and `master` when they exist on origin, and what a
+/// read-only `ls-remote --symref` reports (skipped quietly when origin is unreachable).
+/// A stale `origin/HEAD` or an unusual default such as `develop` must not let the push
+/// target be the default branch.
 fn default_branches(root: &Path) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
     let head = format!("refs/remotes/{REMOTE}/HEAD");
-    if let Ok(target) = git_text(root, &["symbolic-ref", "-q", &head], None) {
-        let prefix = format!("refs/remotes/{REMOTE}/");
-        if let Some(name) = target.strip_prefix(&prefix) {
-            return vec![name.to_owned()];
+    let prefix = format!("refs/remotes/{REMOTE}/");
+    if let Some(name) = git_text(root, &["symbolic-ref", "-q", &head], None)
+        .ok()
+        .and_then(|t| t.strip_prefix(&prefix).map(str::to_owned))
+        .filter(|name| remote_tip(root, name).is_some())
+    {
+        names.push(name);
+    }
+    for name in ["main", "master"] {
+        if remote_tip(root, name).is_some() {
+            names.push(name.to_owned());
         }
     }
-    ["main", "master"]
-        .into_iter()
-        .filter(|name| remote_tip(root, name).is_some())
-        .map(str::to_owned)
-        .collect()
+    if let Ok(text) = run_timed(
+        root,
+        &["ls-remote", "--symref", REMOTE, "HEAD"],
+        LS_REMOTE_TIMEOUT,
+    ) {
+        names.extend(text.lines().filter_map(|line| {
+            line.strip_prefix("ref: refs/heads/")
+                .and_then(|rest| rest.split_whitespace().next())
+                .map(str::to_owned)
+        }));
+    }
+    names.sort();
+    names.dedup();
+    names
 }
 
 // ---------------------------------------------------------------- step 2: snapshot
 
 /// Reads the working copy at `cwd` and writes the patch into `staging`. The real index,
-/// working tree, branches and stash are only read.
+/// working tree, branches, stash and object store are only read.
 pub fn snapshot(cwd: &Path, staging: &Path) -> Result<Snapshot, String> {
+    snapshot_with_limit(cwd, staging, MAX_PATCH_BYTES)
+}
+
+fn snapshot_with_limit(cwd: &Path, staging: &Path, max_patch: u64) -> Result<Snapshot, String> {
     let root = toplevel(cwd)?;
     let head = git_text(&root, &["rev-parse", "--verify", "HEAD"], None)
         .map_err(|_| "This branch has no commits yet".to_string())?;
     std::fs::create_dir_all(staging).map_err(|e| e.to_string())?;
-    let index = staging.join("index.tmp");
-    let result = snapshot_with_index(&root, staging, &index, head);
-    let _ = std::fs::remove_file(&index);
+    // The scratch paths go into environment variables of git runs in another directory.
+    let staging = staging.canonicalize().map_err(|e| e.to_string())?;
+    let objects = git_text(&root, &["rev-parse", "--git-path", "objects"], None)?;
+    let scratch = Scratch {
+        index: staging.join("index.tmp"),
+        objects: staging.join("objects.tmp"),
+        real_objects: root.join(objects),
+    };
+    let result = precheck(&root, max_patch)
+        .and_then(|()| snapshot_in(&root, &staging, &scratch, head, max_patch));
+    let _ = std::fs::remove_file(&scratch.index);
+    let _ = std::fs::remove_dir_all(&scratch.objects);
     result
 }
 
-fn snapshot_with_index(
+fn too_big(bytes: u64, max: u64) -> String {
+    format!(
+        "The uncommitted changes are {} MB, over the {} MB limit",
+        bytes / (1024 * 1024),
+        max / (1024 * 1024)
+    )
+}
+
+/// Refuses early when the files that would go into the patch already exceed the limit, so
+/// nothing huge is hashed or written first.
+fn precheck(root: &Path, max: u64) -> Result<(), String> {
+    let mut total = 0u64;
+    let lists: [&[&str]; 2] = [
+        &["ls-files", "-z", "--others", "--exclude-standard"],
+        &["ls-files", "-z", "--modified"],
+    ];
+    for args in lists {
+        for path in run(root, args, None, None)?
+            .split(|b| *b == 0)
+            .filter(|p| !p.is_empty())
+        {
+            let path = root.join(String::from_utf8_lossy(path).as_ref());
+            total += std::fs::symlink_metadata(path).map_or(0, |m| m.len());
+            if total > max {
+                return Err(too_big(total, max));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_in(
     root: &Path,
     staging: &Path,
-    index: &Path,
+    scratch: &Scratch,
     head: String,
+    max_patch: u64,
 ) -> Result<Snapshot, String> {
-    seed_index(root, index, true)?;
-    if run(root, &["add", "-A"], Some(index), None).is_err() {
+    let _ = std::fs::remove_dir_all(&scratch.objects);
+    std::fs::create_dir_all(&scratch.objects).map_err(|e| e.to_string())?;
+    seed_index(root, scratch, true)?;
+    if run(root, &["add", "-A"], Some(scratch), None).is_err() {
         // A split or unreadable index cannot be borrowed; start from HEAD instead.
-        seed_index(root, index, false)?;
-        run(root, &["add", "-A"], Some(index), None)?;
+        seed_index(root, scratch, false)?;
+        run(root, &["add", "-A"], Some(scratch), None)?;
     }
-    let tree = git_text(root, &["write-tree"], Some(index))?;
+    let tree = git_text(root, &["write-tree"], Some(scratch))?;
 
     let status = run(
         root,
@@ -362,10 +486,11 @@ fn snapshot_with_index(
             "--cached",
             "--name-status",
             "--no-renames",
+            "--ignore-submodules=none",
             "-z",
             "HEAD",
         ],
-        Some(index),
+        Some(scratch),
         None,
     )?;
     let mut sizes = Sizes::default();
@@ -395,11 +520,13 @@ fn snapshot_with_index(
                 "--no-ext-diff",
                 "--no-textconv",
                 "--no-color",
+                "--ignore-submodules=none",
+                "-U3",
                 "--src-prefix=a/",
                 "--dst-prefix=b/",
                 "HEAD",
             ],
-            Some(index),
+            Some(scratch),
             Some(Stdio::from(file)),
         );
         if let Err(e) = made {
@@ -407,18 +534,14 @@ fn snapshot_with_index(
             return Err(e);
         }
         sizes.patch = std::fs::metadata(&patch).map_err(|e| e.to_string())?.len();
-        if sizes.patch > MAX_PATCH_BYTES {
+        if sizes.patch > max_patch {
             let _ = std::fs::remove_file(&patch);
-            return Err(format!(
-                "The uncommitted changes are {} MB, over the {} MB limit",
-                sizes.patch / (1024 * 1024),
-                MAX_PATCH_BYTES / (1024 * 1024)
-            ));
+            return Err(too_big(sizes.patch, max_patch));
         }
         Some(patch)
     };
 
-    let ignored = ignored_files(root, index)?;
+    let ignored = ignored_files(root, scratch)?;
     sizes.ignored = ignored.iter().map(|(_, size)| size).sum();
     let warnings = Warnings {
         lfs: uses_lfs(root),
@@ -434,21 +557,21 @@ fn snapshot_with_index(
     })
 }
 
-/// Fills the temporary index: a copy of the real one, or `HEAD`'s tree.
-fn seed_index(root: &Path, index: &Path, copy: bool) -> Result<(), String> {
-    let _ = std::fs::remove_file(index);
+/// Fills the scratch index: a copy of the real one, or `HEAD`'s tree.
+fn seed_index(root: &Path, scratch: &Scratch, copy: bool) -> Result<(), String> {
+    let _ = std::fs::remove_file(&scratch.index);
     if copy {
         let real = git_text(root, &["rev-parse", "--git-path", "index"], None)?;
         let real = root.join(real);
-        if std::fs::copy(&real, index).is_ok() {
+        if std::fs::copy(&real, &scratch.index).is_ok() {
             return Ok(());
         }
     }
-    run(root, &["read-tree", "HEAD"], Some(index), None).map(|_| ())
+    run(root, &["read-tree", "HEAD"], Some(scratch), None).map(|_| ())
 }
 
 /// Ignored paths with sizes. Fully ignored directories are one entry ending in `/`.
-fn ignored_files(root: &Path, index: &Path) -> Result<Vec<(String, u64)>, String> {
+fn ignored_files(root: &Path, scratch: &Scratch) -> Result<Vec<(String, u64)>, String> {
     let out = run(
         root,
         &[
@@ -459,7 +582,7 @@ fn ignored_files(root: &Path, index: &Path) -> Result<Vec<(String, u64)>, String
             "--exclude-standard",
             "--directory",
         ],
-        Some(index),
+        Some(scratch),
         None,
     )?;
     let mut files: Vec<(String, u64)> = out
@@ -585,7 +708,8 @@ pub fn collect_transcript(
     let name = format!("{provider_id}.jsonl");
     let projects = account_home.join("projects");
     let preferred = projects.join(encode_cwd(cwd));
-    let project = if preferred.join(&name).is_file() {
+    let holds = |dir: &Path| is_real_dir(dir) && is_regular(&dir.join(&name));
+    let project = if holds(&preferred) {
         preferred
     } else {
         std::fs::read_dir(&projects)
@@ -593,7 +717,7 @@ pub fn collect_transcript(
             .and_then(|dirs| {
                 let mut dirs: Vec<PathBuf> = dirs.flatten().map(|d| d.path()).collect();
                 dirs.sort();
-                dirs.into_iter().find(|d| d.join(&name).is_file())
+                dirs.into_iter().find(|d| holds(d))
             })
             .ok_or("Could not find the Claude conversation to move")?
     };
@@ -637,7 +761,20 @@ fn encode_cwd(cwd: &Path) -> String {
         .collect()
 }
 
+/// A regular file, not a symlink to one.
+fn is_regular(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
+}
+
+/// A directory, not a symlink to one.
+fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+}
+
 fn copy_tree(source: &Path, dest: &Path) -> Result<u64, String> {
+    if !is_real_dir(source) {
+        return Ok(0);
+    }
     let entries = match std::fs::read_dir(source) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -661,4 +798,13 @@ fn copy_tree(source: &Path, dest: &Path) -> Result<u64, String> {
 #[cfg(test)]
 pub(super) fn fetch_with_timeout_for_test(cwd: &Path, millis: u64) -> Result<(), String> {
     fetch_with_timeout(cwd, Duration::from_millis(millis))
+}
+
+#[cfg(test)]
+pub(super) fn snapshot_with_limit_for_test(
+    cwd: &Path,
+    staging: &Path,
+    max_patch: u64,
+) -> Result<Snapshot, String> {
+    snapshot_with_limit(cwd, staging, max_patch)
 }
