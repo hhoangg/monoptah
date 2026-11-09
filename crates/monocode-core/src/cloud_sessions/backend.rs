@@ -79,6 +79,22 @@ impl CloudRef {
 }
 
 impl CloudBackendKind {
+    /// Every backend kind. Adding a kind means extending this list, [`Self::api_name`] and
+    /// the provider registry of the app API (`mono::cloud_api`).
+    pub const ALL: [Self; 2] = [Self::Codespaces, Self::DockerSandbox];
+
+    /// The name the app API uses for this backend in JSON (`kind`): `"codespace"` or
+    /// `"sandbox"`. Distinct from the persisted serde name.
+    pub fn api_name(self) -> &'static str {
+        match self {
+            Self::Codespaces => "codespace",
+            Self::DockerSandbox => "sandbox",
+        }
+    }
+    /// Inverse of [`Self::api_name`].
+    pub fn from_api_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.api_name() == name)
+    }
     pub fn noun(self) -> &'static str {
         match self {
             Self::Codespaces => "codespace",

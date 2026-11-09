@@ -516,11 +516,17 @@ impl CloudSessions {
     }
     /// Uses `home` to look for the `sbx_cloud` ssh alias.
     #[cfg(test)]
-    pub(super) fn with_sandbox_home(mut self, home: PathBuf) -> Self {
+    pub(crate) fn with_sandbox_home(mut self, home: PathBuf) -> Self {
         if let Some(deps) = self.sandbox.as_mut() {
             deps.home = home;
         }
         self
+    }
+    /// The `sbx` runner and the home directory the sandbox seams were registered with.
+    /// `Err` when [`Self::with_sandboxes`] was not called.
+    pub(crate) fn sandbox_tools(&self) -> Result<(Arc<dyn SbxRunner>, PathBuf), String> {
+        let deps = self.sandbox_deps()?;
+        Ok((deps.runner, deps.home))
     }
     fn sandbox_deps(&self) -> Result<SandboxDeps, String> {
         self.sandbox

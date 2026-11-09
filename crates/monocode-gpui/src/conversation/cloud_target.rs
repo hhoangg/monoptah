@@ -151,12 +151,10 @@ pub(super) struct CloudDraft {
     _events: Vec<Subscription>,
 }
 
-/// The codespace named by a start error that happened after it was created
-/// (`created_note`), if any.
+/// The codespace or sandbox named by a start error that happened after it was created
+/// (`created_note_for`), if any.
 pub(crate) fn created_codespace(error: &str) -> Option<&str> {
-    let rest = error.split_once("(codespace ")?.1;
-    let (name, tail) = rest.split_once(" was created and kept")?;
-    (!name.is_empty() && !tail.is_empty() && !name.contains(' ')).then_some(name)
+    monocode_core::cloud_sessions::split_created_note(error).map(|(_, _, name)| name)
 }
 
 /// `4g` -> `4 GiB`, `512m` -> `512 MiB`; anything else as saved.

@@ -19,9 +19,6 @@ mod tests;
 pub(crate) const CLOUD_ARCHIVING: &str =
     "This cloud session is being archived; the message would be lost. Nothing was sent.";
 
-/// Why `codespaces.stop` / `delete` wait while a session archive works on that codespace.
-pub(crate) const CODESPACE_BUSY: &str = "A session archive is still working on this codespace. Nothing was changed; try again when it finishes.";
-
 type Placement = Option<(i64, Edge)>;
 enum Effect {
     None,
@@ -232,8 +229,8 @@ impl Shell {
                     | "notes.list"
                     | "notes.read"
                     | "worktrees.list"
-                    | "codespaces.list"
-                    | "codespaces.secretsStatus"
+                    | "cloud.list"
+                    | "cloud.status"
             )
         {
             return Err("This thread's access policy allows read-only app actions.".into());
@@ -551,7 +548,13 @@ impl Shell {
                 let caller = call.session;
                 let request = call.request_id.clone();
                 let fingerprint = app::fingerprint(&action, &input);
-                let cloud = cloud_api::target_from_input(&input);
+                let cloud = match cloud_api::target_from_input(&input) {
+                    Ok(cloud) => cloud,
+                    Err(e) => {
+                        self.finish_app_call(call, Err(e), cx);
+                        return;
+                    }
+                };
                 self.app_background(call,move|store| {
                     let models=if input.get("model").is_some() || input.get("modelSettings").is_some() || input.get("effort").is_some() {
                         monocode_core::catalog::models_for(kind,&settings.account)?
@@ -570,7 +573,7 @@ impl Shell {
                     // Always a chat: the app drives this session, whatever the surface preference.
                     let mut store=locked(&store)?;
                     let (mut summary,fresh)=match &startup {
-                        Some((summary,_)) => (summary.clone(),true),
+                        Some(start) => (start.session().clone(),true),
                         None => store.create_app_session(caller,&request,&fingerprint,kind.id(),&project)?,
                     };
                     if fresh {
@@ -585,15 +588,19 @@ impl Shell {
                     }
                     let draft=input["draft"].as_bool().unwrap_or(false);let reveal=input["reveal"].as_bool().unwrap_or(false);
                     let mut value=json!({"id":summary.id,"sessionId":summary.id,"cwd":project,"harness":kind.id(),"model":settings.model,"submitted":!draft,"draft":draft,"accepted":true});
-                    if let Some((_,record))=&startup {
-                        value["target"]=json!({"kind":"codespace","codespace":record.codespace,"state":"starting"});
-                        value["codespaceState"]=json!("starting");
-                        value["startup"]=json!({"step":record.current().map(|step|step.id())});
+                    if let Some(start)=&startup {
+                        crate::cloud_actions::describe_start(&mut value,start);
                     }
                     Ok((value,if fresh {Effect::Start(Box::new((summary,settings,draft,reveal,placement)))}else{Effect::None}))
                     })();
-                    // A codespace created for this start is kept: say so, so a retry targets it.
-                    built.map_err(|e| match &startup { Some((_,record)) if record.created => cloud_api::created_note(&record.codespace,&e), _ => e })
+                    // An instance created for this start is kept: say so, so a retry targets it.
+                    built.map_err(|e| {
+                        // A sandbox row is the only handle on the sandbox: keep it, failed.
+                        if let Ok(db)=locked(&store) {
+                            crate::cloud_actions::keep_failed_sandbox_start(&db,startup.as_ref(),&e);
+                        }
+                        crate::cloud_actions::failure_note(startup.as_ref(),e)
+                    })
                 },cx);
                 return;
             }
@@ -775,7 +782,7 @@ impl Shell {
                                         this.finish_app_call(
                                             call,
                                             Err(if woke {
-                                                "The session's codespace is being woken or reconnected. Retry in a minute (with a new request ID)."
+                                                "The session's cloud instance is being woken or reconnected. Retry in a minute (with a new request ID)."
                                             } else {
                                                 "Session is busy, loading, or has an unsent draft. Its draft was preserved."
                                             }
@@ -846,30 +853,17 @@ impl Shell {
                     Err(e) => Err(e),
                 }
             }
-            "codespaces.list"
-            | "codespaces.create"
-            | "codespaces.stop"
-            | "codespaces.secretsStatus" => {
-                if action == "codespaces.stop"
-                    && input["name"]
-                        .as_str()
-                        .is_some_and(|name| self.codespace_busy(name))
-                {
-                    self.finish_app_call(call, Err(CODESPACE_BUSY.into()), cx);
-                    return;
-                }
-                // gh calls, and for create minutes of waiting: always off the UI thread.
+            "cloud.list" | "cloud.status" | "cloud.create" | "cloud.stop" | "cloud.resume"
+            | "cloud.delete" => {
+                // Keys of the workspaces an archive is converting, copied for the worker.
+                let busy = self.cloud_busy_snapshot(cx);
+                // gh/sbx/ssh calls, and for create or resume minutes of waiting: always off
+                // the UI thread.
                 self.app_background(
                     call,
                     move |store| {
-                        let api = CloudApi::shared(&store)?;
-                        let name = || app::text(&input, "name", 100);
-                        let value = match action.as_str() {
-                            "codespaces.list" => api.list(&project)?,
-                            "codespaces.create" => api.create(&project, &input, &mut |_| {})?,
-                            "codespaces.stop" => api.stop(&project, &name()?)?,
-                            _ => api.secrets_status(&project)?,
-                        };
+                        let value =
+                            crate::cloud_actions::run(&store, &action, &project, &input, &busy)?;
                         Ok((value, Effect::None))
                     },
                     cx,
@@ -1004,8 +998,8 @@ fn mutating(action: &str) -> bool {
             | "notes.list"
             | "notes.read"
             | "worktrees.list"
-            | "codespaces.list"
-            | "codespaces.secretsStatus"
+            | "cloud.list"
+            | "cloud.status"
     )
 }
 fn worktree_json(tree: &monocode_core::git::Worktree) -> Value {

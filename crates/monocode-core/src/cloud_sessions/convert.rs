@@ -810,7 +810,8 @@ impl CloudSessions {
             };
             EvidencePull {
                 session_id: cloud_id,
-                codespace: codespace.clone(),
+                kind: cloud.kind,
+                instance: codespace.clone(),
                 remote_path: String::new(),
                 local_dir: remote_thread.join(EVIDENCE_DIR),
                 files: vec![],

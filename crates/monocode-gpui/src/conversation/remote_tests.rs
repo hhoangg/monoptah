@@ -763,7 +763,8 @@ fn ambiguous_legacy_requests_block_send_retry_and_restore_without_consuming_draf
 #[gpui::test]
 fn sending_to_an_unloaded_cloud_session_reconnects_its_codespace(cx: &mut TestAppContext) {
     use crate::cloud_wake::fakes::{AUTH_OK, github_project, install};
-    use monocode_core::cloud_sessions::{CodespaceChoice, Target};
+    use monocode_core::cloud_sessions::CloudBackendKind;
+    use monocode_core::mono::cloud_api::{CloudTarget, InstanceChoice};
     let dir = github_project();
     let store: Database = Arc::new(Mutex::new(
         monocode_core::store::Store::open(Path::new(":memory:")).unwrap(),
@@ -773,11 +774,10 @@ fn sending_to_an_unloaded_cloud_session_reconnects_its_codespace(cx: &mut TestAp
     let binding = api
         .prepare(
             dir.0.to_str().unwrap(),
-            Target {
-                codespace: CodespaceChoice::Named("octo-run".into()),
-                branch: None,
-                machine: None,
-            },
+            CloudTarget::new(
+                CloudBackendKind::Codespaces,
+                InstanceChoice::Named("octo-run".into()),
+            ),
             &mut |_| {},
         )
         .unwrap();
@@ -815,32 +815,86 @@ fn sending_to_an_unloaded_cloud_session_reconnects_its_codespace(cx: &mut TestAp
     cx.update(|cx| view.update(cx, |view, _| assert!(!view.remote_state.waking)));
 }
 
-/// A Docker sandbox session is reconnected only by a user action in its own view, through
-/// `CloudApi::reconnect_sandbox`; the codespace wake (`ensure`) is never used for it, and a
-/// Mono or app API send (`wake_for_send`) wakes nothing.
+/// A send from a Mono or the app API wakes through the view's own `reconnect_cloud`: a failed
+/// wake lands in the view's connection-error path (not swallowed) and clears the in-flight
+/// flag, and a wake already in flight is not started twice.
 #[gpui::test]
-fn a_sandbox_session_reconnects_through_the_sandbox_path_and_background_sends_wake_nothing(
+fn a_background_send_wake_failure_reaches_the_view_and_shares_its_in_flight_flag(
     cx: &mut TestAppContext,
 ) {
     use crate::cloud_wake::fakes::{AUTH_OK, github_project, install};
-    use monocode_core::cloud_sessions::CloudRef;
+    use monocode_core::cloud_sessions::CloudBackendKind;
+    use monocode_core::mono::cloud_api::{CloudTarget, InstanceChoice};
     let dir = github_project();
     let store: Database = Arc::new(Mutex::new(
         monocode_core::store::Store::open(Path::new(":memory:")).unwrap(),
     ));
-    let (gh, host) = install(store.clone(), AUTH_OK, "Shutdown");
-    let summary = {
-        let guard = store.lock().unwrap();
-        let project = guard
-            .remember_cloud_ref_project(
-                "env-box",
-                &serde_json::json!({"id":"project-1","cwd":"/workspaces/widgets"}),
-                dir.0.to_str().unwrap(),
-                &CloudRef::sandbox("monoptah-fix-1234"),
-            )
-            .unwrap();
-        guard.create("claude", &project.key).unwrap()
+    let (_gh, host) = install(store.clone(), AUTH_OK, "Shutdown");
+    let api = monocode_core::mono::cloud_api::CloudApi::shared(&store).unwrap();
+    let binding = api
+        .prepare(
+            dir.0.to_str().unwrap(),
+            CloudTarget::new(
+                CloudBackendKind::Codespaces,
+                InstanceChoice::Named("octo-run".into()),
+            ),
+            &mut |_| {},
+        )
+        .unwrap();
+    let summary = api.create_session(&binding, "claude").unwrap();
+    let id = summary.id;
+    host.0.lock().unwrap().clear();
+    host.2.store(true, std::sync::atomic::Ordering::Relaxed);
+    let view = cx.update(|cx| {
+        cx.new(|cx| {
+            let mut view = Conversation::new(summary, store.clone(), cx);
+            view.loaded = false;
+            view.remote_state.online = true;
+            view
+        })
+    });
+    // A wake already in flight (the user's Reconnect) is shared, not duplicated.
+    cx.update(|cx| view.update(cx, |view, _| view.remote_state.waking = true));
+    let shared = cx.update(|cx| {
+        let (store, view) = (store.clone(), view.clone());
+        cx.spawn(async move |cx| crate::cloud_wake::wake_for_send(store, id, view, cx).await)
+    });
+    cx.run_until_parked();
+    assert!(cx.foreground_executor().block_test(shared));
+    assert!(host.0.lock().unwrap().is_empty(), "no second wake");
+    cx.update(|cx| view.update(cx, |view, _| view.remote_state.waking = false));
+    // Otherwise the wake runs, fails, and the view shows the error.
+    let woke = cx.update(|cx| {
+        let (store, view) = (store.clone(), view.clone());
+        cx.spawn(async move |cx| crate::cloud_wake::wake_for_send(store, id, view, cx).await)
+    });
+    cx.run_until_parked();
+    assert!(cx.foreground_executor().block_test(woke));
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            assert!(!view.remote_state.waking);
+            assert_eq!(view.remote_state.error.as_deref(), Some("ssh refused"));
+            assert!(!view.remote_state.online);
+        })
+    });
+}
+
+/// A Docker sandbox session is reconnected through `CloudApi::reconnect_sandbox`, never the
+/// codespace wake (`ensure`), and a send from a Mono or the app API (`wake_for_send`) wakes it
+/// just like the user's Reconnect does.
+#[gpui::test]
+fn a_sandbox_session_reconnects_through_the_sandbox_path_and_a_background_send_wakes_it(
+    cx: &mut TestAppContext,
+) {
+    use crate::cloud_wake::fakes::{
+        AUTH_OK, github_project, install_with_sandbox, sandbox_session,
     };
+    let dir = github_project();
+    let store: Database = Arc::new(Mutex::new(
+        monocode_core::store::Store::open(Path::new(":memory:")).unwrap(),
+    ));
+    let (gh, host, sbx, _) = install_with_sandbox(store.clone(), AUTH_OK, "Shutdown", "stopped");
+    let summary = sandbox_session(&store, dir.0.to_str().unwrap());
     let id = summary.id;
     host.0.lock().unwrap().clear();
     gh.calls.lock().unwrap().clear();
@@ -851,23 +905,32 @@ fn a_sandbox_session_reconnects_through_the_sandbox_path_and_background_sends_wa
             assert_eq!(view.cloud_noun(), Some("sandbox"));
             view.loaded = false;
             view.remote_state.online = false;
+            // The reload that follows a wake is not under test (it would open real connections).
             view.remote_state.refreshing = true;
             view
         })
     });
-    // A Mono or app API send: no wake of any kind.
+    let describe = |host: &crate::cloud_wake::fakes::FakeHost| {
+        host.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| *l == "request m-sbx-box-1 environment.describe")
+            .count()
+    };
+    // A Mono or app API send wakes the sandbox through the sandbox path.
     let woke = cx.update(|cx| {
         let store = store.clone();
         let view = view.clone();
         cx.spawn(async move |cx| crate::cloud_wake::wake_for_send(store, id, view, cx).await)
     });
     cx.run_until_parked();
-    assert!(!cx.foreground_executor().block_test(woke));
-    // The user's Reconnect: sandbox wording, and the sandbox path (not configured in this
-    // fake service, so it says so) instead of the codespace wake.
+    assert!(cx.foreground_executor().block_test(woke));
+    assert_eq!(describe(&host), 1, "{:?}", host.0.lock().unwrap());
+    // The user's Reconnect: sandbox wording and the same sandbox path.
     cx.update(|cx| {
         view.update(cx, |view, cx| {
-            assert!(view.reconnect_cloud(true, cx));
+            assert!(view.reconnect_cloud(cx));
             assert!(
                 view.status.contains("Reconnecting the sandbox"),
                 "{}",
@@ -876,45 +939,35 @@ fn a_sandbox_session_reconnects_through_the_sandbox_path_and_background_sends_wa
         })
     });
     cx.run_until_parked();
-    cx.update(|cx| {
-        view.update(cx, |view, _| {
-            assert!(!view.remote_state.waking);
-            assert!(view.status.contains("sandbox"), "{}", view.status);
-        })
-    });
+    cx.update(|cx| view.update(cx, |view, _| assert!(!view.remote_state.waking)));
+    assert_eq!(describe(&host), 2, "{:?}", host.0.lock().unwrap());
     assert!(
-        host.0.lock().unwrap().is_empty(),
-        "{:?}",
-        host.0.lock().unwrap()
+        !host
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("ensure")),
+        "the codespace wake is never used for a sandbox"
     );
     assert!(gh.calls.lock().unwrap().is_empty());
+    assert!(!sbx.calls.lock().unwrap().iter().any(|c| c.contains(" rm ")));
 }
 
 /// A send that is not the user's own hand (Mono, workflow, app API) reaches the same guard and
-/// must not resume a sandbox; the composer's own submit does.
+/// wakes a stopped sandbox view like a codespace's; the composer's own submit does too.
 #[gpui::test]
-fn only_a_user_submit_reconnects_a_stopped_sandbox_view(cx: &mut TestAppContext) {
-    use crate::cloud_wake::fakes::{AUTH_OK, github_project, install};
-    use monocode_core::cloud_sessions::CloudRef;
+fn any_send_reconnects_a_stopped_sandbox_view(cx: &mut TestAppContext) {
+    use crate::cloud_wake::fakes::{
+        AUTH_OK, github_project, install_with_sandbox, sandbox_session,
+    };
     let dir = github_project();
     let store: Database = Arc::new(Mutex::new(
         monocode_core::store::Store::open(Path::new(":memory:")).unwrap(),
     ));
-    let (gh, host) = install(store.clone(), AUTH_OK, "Shutdown");
-    let summary = {
-        let guard = store.lock().unwrap();
-        let project = guard
-            .remember_cloud_ref_project(
-                "env-box",
-                &serde_json::json!({"id":"project-1","cwd":"/workspaces/widgets"}),
-                dir.0.to_str().unwrap(),
-                &CloudRef::sandbox("monoptah-fix-1234"),
-            )
-            .unwrap();
-        guard.create("claude", &project.key).unwrap()
-    };
+    let (_gh, host, _, _) = install_with_sandbox(store.clone(), AUTH_OK, "Shutdown", "stopped");
+    let summary = sandbox_session(&store, dir.0.to_str().unwrap());
     host.0.lock().unwrap().clear();
-    gh.calls.lock().unwrap().clear();
     let view = cx.update(|cx| {
         cx.new(|cx| {
             let mut view = Conversation::new(summary, store.clone(), cx);
@@ -926,44 +979,31 @@ fn only_a_user_submit_reconnects_a_stopped_sandbox_view(cx: &mut TestAppContext)
             view
         })
     });
-    // Mono external send, workflow send and app API send all end in send / draft / app prompt.
+    // Mono external send, workflow send and app API send all end in send / app prompt.
     cx.update(|cx| {
         view.update(cx, |view, cx| {
             view.send(cx);
-            assert_eq!(view.status, super::remote::SANDBOX_STOPPED);
-            assert!(!view.remote_state.waking);
-            view.status.clear();
-            view.remote_save_draft(cx);
-            assert_eq!(view.status, super::remote::SANDBOX_STOPPED);
-            assert!(!view.remote_state.waking);
-            view.status.clear();
-            view.send_remote_app_prompt(cx);
-            assert_eq!(view.status, super::remote::SANDBOX_STOPPED);
-            assert!(!view.remote_state.waking);
-            assert!(!view.reconnect_cloud(false, cx));
-            assert!(!view.remote_state.waking);
-        })
-    });
-    cx.run_until_parked();
-    assert!(host.0.lock().unwrap().is_empty());
-    assert!(gh.calls.lock().unwrap().is_empty());
-    // The user's own submit reconnects.
-    cx.update(|cx| {
-        view.update(cx, |view, cx| {
-            let input = view.input.clone();
-            input.update(cx, |_, cx| cx.emit(crate::input::Submitted));
-        })
-    });
-    cx.update(|cx| {
-        view.update(cx, |view, _| {
             assert!(view.remote_state.waking, "{}", view.status);
             assert!(
                 view.status.contains("Reconnecting the sandbox"),
                 "{}",
                 view.status
             );
+            // A second send while waking does not start another wake.
+            view.send_remote_app_prompt(cx);
+            assert!(view.remote_state.waking);
         })
     });
+    cx.run_until_parked();
+    let calls = host.0.lock().unwrap().clone();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|l| *l == "request m-sbx-box-1 environment.describe")
+            .count(),
+        1,
+        "{calls:?}"
+    );
 }
 
 // ------------------------------------------------- sandbox reconnect banner
@@ -1225,7 +1265,8 @@ fn clicking_resume_wakes_the_codespace_once_and_nothing_runs_without_a_click(
     cx: &mut TestAppContext,
 ) {
     use crate::cloud_wake::fakes::{AUTH_OK, github_project, install};
-    use monocode_core::cloud_sessions::{CodespaceChoice, Target};
+    use monocode_core::cloud_sessions::CloudBackendKind;
+    use monocode_core::mono::cloud_api::{CloudTarget, InstanceChoice};
     cx.update(|cx| cx.set_reduce_motion(true));
     let dir = github_project();
     let store: Database = Arc::new(Mutex::new(
@@ -1236,11 +1277,10 @@ fn clicking_resume_wakes_the_codespace_once_and_nothing_runs_without_a_click(
     let binding = api
         .prepare(
             dir.0.to_str().unwrap(),
-            Target {
-                codespace: CodespaceChoice::Named("octo-run".into()),
-                branch: None,
-                machine: None,
-            },
+            CloudTarget::new(
+                CloudBackendKind::Codespaces,
+                InstanceChoice::Named("octo-run".into()),
+            ),
             &mut |_| {},
         )
         .unwrap();
@@ -1358,7 +1398,8 @@ fn stopped_codespace(
     Arc<crate::cloud_wake::fakes::FakeHost>,
 ) {
     use crate::cloud_wake::fakes::{AUTH_OK, github_project, install};
-    use monocode_core::cloud_sessions::{CodespaceChoice, Target};
+    use monocode_core::cloud_sessions::CloudBackendKind;
+    use monocode_core::mono::cloud_api::{CloudTarget, InstanceChoice};
     cx.update(|cx| cx.set_reduce_motion(true));
     let dir = github_project();
     let store: Database = Arc::new(Mutex::new(
@@ -1369,11 +1410,10 @@ fn stopped_codespace(
     let binding = api
         .prepare(
             dir.0.to_str().unwrap(),
-            Target {
-                codespace: CodespaceChoice::Named("octo-run".into()),
-                branch: None,
-                machine: None,
-            },
+            CloudTarget::new(
+                CloudBackendKind::Codespaces,
+                InstanceChoice::Named("octo-run".into()),
+            ),
             &mut |_| {},
         )
         .unwrap();
@@ -1629,18 +1669,6 @@ fn a_sandbox_resume_with_text_goes_through_the_user_path_and_never_the_codespace
         })
         .unwrap()
     });
-    // A send that is not the user's (Mono, API) wakes and sends nothing.
-    window.update(cx, |view, _, cx| view.send(cx)).unwrap();
-    cx.run_until_parked();
-    window
-        .update(cx, |view, _, cx| {
-            assert_eq!(view.status, super::remote::SANDBOX_STOPPED);
-            assert!(!view.remote_state.waking);
-            assert_eq!(view.input.read(cx).content.as_ref(), "fix it");
-            assert!(view.follow_ups.state.messages.is_empty());
-        })
-        .unwrap();
-    assert!(host.0.lock().unwrap().is_empty() && gh.calls.lock().unwrap().is_empty());
     // The user's Enter takes the sandbox path; this fake has no sandbox backend, so the resume
     // fails: nothing is sent and the prompt stays in the queue.
     submit(window, cx);

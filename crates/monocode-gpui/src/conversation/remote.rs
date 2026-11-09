@@ -38,9 +38,6 @@ impl State {
 pub(crate) struct CloudResumed;
 impl EventEmitter<CloudResumed> for Conversation {}
 
-/// Shown instead of reconnecting a Docker sandbox for a send that is not the user's own.
-pub(super) const SANDBOX_STOPPED: &str = "Sandbox is stopped. Choose Reconnect to start it.";
-
 impl Conversation {
     /// Everything that decides whether a remote view can send, for live-debugging tests.
     #[cfg(test)]
@@ -364,14 +361,11 @@ impl Conversation {
     /// user action (send or "Reconnect") comes through here. Returns whether this is a cloud
     /// session (a wake is running or was started).
     ///
-    /// `user` says the call comes from the user's own hand (the Reconnect button or a send
-    /// typed in this view). A Docker sandbox is resumed (and billed) only then: for any other
-    /// origin (a Mono, a workflow, the app API) this refuses and returns false.
-    pub(crate) fn reconnect_cloud(&mut self, user: bool, cx: &mut Context<Self>) -> bool {
+    /// Wakes a codespace and a Docker sandbox alike: sending is an explicit act whoever performs
+    /// it (the user, a Mono, a workflow or the app API). Drafts and background loads never come
+    /// here.
+    pub(crate) fn reconnect_cloud(&mut self, cx: &mut Context<Self>) -> bool {
         if !self.is_cloud_session() {
-            return false;
-        }
-        if !user && self.cloud_noun() == Some("sandbox") {
             return false;
         }
         if self.remote_state.waking {
@@ -701,11 +695,6 @@ impl Conversation {
         };
         if let Some(error) = error {
             let unreachable = !self.loaded || !self.remote_state.online;
-            if unreachable && !self.user_send && self.cloud_noun() == Some("sandbox") {
-                self.status = SANDBOX_STOPPED.into();
-                cx.notify();
-                return true;
-            }
             let typed = self.input.read(cx).has_message_text();
             // Only a typed prompt from the user's own hand wakes a workspace from here, and it
             // goes through the send queue: it is sent once, when the reconnect has loaded.
@@ -716,14 +705,14 @@ impl Conversation {
                     return true;
                 }
                 if self.queue_composer_prompt(true, cx).is_some() {
-                    self.reconnect_cloud(true, cx);
+                    self.reconnect_cloud(cx);
                     let noun = self.cloud_noun().unwrap_or("codespace");
                     self.status =
                         format!("Reconnecting the {noun}. Your message is sent when it is ready.");
                     cx.notify();
                     return true;
                 }
-            } else if unreachable && !self.user_send && self.reconnect_cloud(false, cx) {
+            } else if unreachable && !self.user_send && self.reconnect_cloud(cx) {
                 let noun = self.cloud_noun().unwrap_or("codespace");
                 self.status = format!("Reconnecting the {noun}...");
                 cx.notify();
@@ -811,9 +800,7 @@ impl Conversation {
     pub(super) fn send_remote_app_prompt(&mut self, cx: &mut Context<Self>) {
         if self.busy || self.stopping || self.remote_state.pending || !self.remote_state.online {
             self.remote_state.app_prompt_waiting = true;
-            if self.cloud_noun() == Some("sandbox") {
-                self.status = SANDBOX_STOPPED.into();
-            } else if self.reconnect_cloud(false, cx) {
+            if self.reconnect_cloud(cx) {
                 let noun = self.cloud_noun().unwrap_or("codespace");
                 self.status = format!("Reconnecting the {noun} to send the first prompt…");
             } else {
@@ -946,18 +933,13 @@ impl Conversation {
     }
     /// A send while the workspace is known to be stopped. The user's own submit with a prompt
     /// queues it, resumes the workspace and sends the queue once connected; clicking the Resume pill resumes without
-    /// one. Enter on an empty composer never resumes. A Mono or the app API never resumes: a
-    /// sandbox says it is stopped, a codespace keeps its existing path.
+    /// one. Enter on an empty composer never resumes. A Mono or the app API does not come through
+    /// here: its send is queued and wakes the instance through `reconnect_cloud`.
     pub(super) fn resume_for_user_send(&mut self, cx: &mut Context<Self>) -> bool {
         if !(self.cloud_stopped && self.is_cloud_session() && self.is_remote()) {
             return false;
         }
         if !self.user_send {
-            if self.cloud_noun() == Some("sandbox") {
-                self.status = SANDBOX_STOPPED.into();
-                cx.notify();
-                return true;
-            }
             return false;
         }
         let typed = self.input.read(cx).has_message_text();
@@ -978,7 +960,7 @@ impl Conversation {
             // resume has connected and the history is loaded.
             self.queue_composer_prompt(true, cx);
         }
-        self.reconnect_cloud(true, cx);
+        self.reconnect_cloud(cx);
         true
     }
     /// The Send button while the workspace is stopped: its tooltip and whether it can be used.
@@ -1175,7 +1157,7 @@ impl Conversation {
                     .child(label)
                     .on_click(cx.listener(|this, _, _, cx| {
                         if !this.remote_state.waking {
-                            this.reconnect_cloud(true, cx);
+                            this.reconnect_cloud(cx);
                         }
                     })),
                 )
@@ -1212,7 +1194,7 @@ impl Conversation {
                         .debug_selector(|| "remote-reconnect".into())
                         .child("Reconnect")
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.reconnect_cloud(true, cx);
+                            this.reconnect_cloud(cx);
                         })),
                     )
                 },

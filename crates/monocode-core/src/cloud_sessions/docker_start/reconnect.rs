@@ -1,10 +1,12 @@
-//! User-initiated reconnect of a Docker sandbox session.
+//! Explicit reconnect of a Docker sandbox session.
 //!
 //! A stopped sandbox keeps its disk and memory, but background code must never wake it (any
 //! ssh resumes and bills it), so `Connections::request` and `ensure_codespace_with` answer
 //! `SANDBOX_NOT_CONNECTED` and stay that way. [`CloudSessions::reconnect_sandbox`] is the one
-//! door for a user: a click on Reconnect, or a send typed in the session's own view. A send
-//! that comes from a Mono, the app API or any other background caller never reaches it.
+//! door for an explicit wake: a click on Reconnect, a send typed in the session's own view, or
+//! a send / `cloud.resume` through the app API (a Mono included, via `CloudApi::wake`). It
+//! BLOCKS for minutes, so callers use a worker thread, never the UI thread. Background polling
+//! and listings never reach it.
 //!
 //! It never creates a sandbox. It inspects the state first (read-only), then re-runs the
 //! idempotent parts of the start flow that a stop or resume can lose, in this order:
@@ -95,8 +97,8 @@ impl Drop for InFlight<'_> {
 
 impl CloudSessions {
     /// Brings the sandbox of cloud session `session_id` back after a stop, a resume or an app
-    /// restart. BLOCKS for minutes: call it from a worker. User-initiated only, see the module
-    /// docs. `progress` hears human-readable lines (already scrubbed of secrets); setting
+    /// restart. BLOCKS for minutes: call it from a worker thread, never the UI thread. Explicit
+    /// callers only (the user, or a Mono / the app API sending a message), see the module docs. `progress` hears human-readable lines (already scrubbed of secrets); setting
     /// `cancel` aborts at the next step.
     pub fn reconnect_sandbox(
         &self,
@@ -108,7 +110,7 @@ impl CloudSessions {
             .map_err(|e| e.to_string())
     }
 
-    /// [`Self::reconnect_sandbox`] with a typed error. Same rules: user-initiated only.
+    /// [`Self::reconnect_sandbox`] with a typed error. Same rules: explicit callers only.
     pub(crate) fn reconnect_sandbox_typed(
         &self,
         session_id: i64,

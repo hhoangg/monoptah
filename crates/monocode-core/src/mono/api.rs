@@ -1,14 +1,17 @@
+use super::cloud_api::validate as cloud;
 use serde_json::Value;
 /// Reject misspelled fields and ambiguous types before any app mutation.
 pub fn validate(action: &str, input: &Value) -> Result<(), String> {
+    let cloud_fields;
     let fields=match action{
         "models.list"|"soul.read"|"habits.list"=>"",
         "sessions.list"|"folders.list"|"worktrees.list"=>"project",
         "sessions.read"=>"sessionId project before limit maxChars",
         "sessions.start"=>"prompt project harness model modelSettings effort runtimeMode title draft reveal workspaceMode worktreeBase worktreeCwd placement besideSessionId notifyOnComplete completionDelivery parentSessionId folderName folderId target",
-        "codespaces.list"|"codespaces.secretsStatus"=>"project",
-        "codespaces.create"=>"branch machine displayName project",
-        "codespaces.stop"|"codespaces.delete"=>"name project",
+        action if action.starts_with("cloud.") => {
+            cloud_fields = cloud::fields(action).ok_or("Unknown app action. Run app help")?;
+            cloud_fields.as_str()
+        }
         "sessions.send"=>"sessionId prompt project notifyOnComplete completionDelivery",
         "sessions.draft"=>"sessionId prompt project",
         "sessions.pullEvidence"=>"sessionId project path taskId",
@@ -139,10 +142,10 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         );
     }
     if let Some(target) = input.get("target") {
-        validate_target(target, input)?;
+        cloud::validate_target(target, input)?;
     }
-    if action.starts_with("codespaces.") {
-        validate_codespace_fields(input)?;
+    if action.starts_with("cloud.") {
+        cloud::validate_action(action, input)?;
     }
     if input
         .get("cloud")
@@ -205,118 +208,6 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         })
     {
         return Err("tags must be an array of up to 20 short strings".into());
-    }
-    Ok(())
-}
-
-/// Valid codespace names are letters, digits and hyphens (they become `gh` argv).
-fn codespace_name(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 100
-        && !value.starts_with('-')
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-}
-fn branch_name(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 250
-        && !value.starts_with('-')
-        && !value.chars().any(|c| c.is_whitespace() || c.is_control())
-}
-fn machine_name(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 64
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-}
-
-/// `target` of sessions.start: `{codespace:"new"|"<name>", branch?, machine?}`. A cloud session
-/// is a Claude chat in a codespace of the project's GitHub repository, so options that only make
-/// sense for a local checkout are refused here, before anything is created.
-fn validate_target(target: &Value, input: &Value) -> Result<(), String> {
-    let target = target.as_object().ok_or(
-        "target must be an object like {\"codespace\":\"new\"} or {\"codespace\":\"<name>\"}",
-    )?;
-    for key in target.keys() {
-        if !["codespace", "branch", "machine"].contains(&key.as_str()) {
-            return Err(format!("target does not take {key}"));
-        }
-    }
-    let name = target
-        .get("codespace")
-        .and_then(Value::as_str)
-        .ok_or("target.codespace must be \"new\" or the name of an existing codespace")?;
-    if name != "new" && !codespace_name(name) {
-        return Err(
-            "target.codespace must be \"new\" or a codespace name (letters, digits and hyphens)"
-                .into(),
-        );
-    }
-    for (key, valid) in [
-        ("branch", branch_name as fn(&str) -> bool),
-        ("machine", machine_name),
-    ] {
-        if let Some(value) = target.get(key) {
-            if !value.as_str().is_some_and(valid) {
-                return Err(format!("target.{key} is not a valid {key} name"));
-            }
-            if name != "new" {
-                return Err(format!(
-                    "target.{key} only applies when creating a codespace (codespace \"new\")"
-                ));
-            }
-        }
-    }
-    if input
-        .get("harness")
-        .is_some_and(|h| h.as_str() != Some("claude"))
-    {
-        return Err("Cloud sessions support Claude only for now (harness \"claude\")".into());
-    }
-    if input["draft"] == true {
-        return Err("A cloud session cannot be started as a draft".into());
-    }
-    if input
-        .get("workspaceMode")
-        .is_some_and(|v| v.as_str() != Some("current"))
-        || input.get("worktreeBase").is_some()
-        || input.get("worktreeCwd").is_some()
-    {
-        return Err("A cloud session runs in its codespace; workspaceMode, worktreeBase and worktreeCwd do not apply".into());
-    }
-    Ok(())
-}
-
-fn validate_codespace_fields(input: &Value) -> Result<(), String> {
-    if let Some(name) = input.get("name").and_then(Value::as_str) {
-        if !codespace_name(name) {
-            return Err("name must be a codespace name (letters, digits and hyphens)".into());
-        }
-    }
-    if input
-        .get("branch")
-        .and_then(Value::as_str)
-        .is_some_and(|b| !branch_name(b))
-    {
-        return Err("branch is not a valid branch name".into());
-    }
-    if input
-        .get("machine")
-        .and_then(Value::as_str)
-        .is_some_and(|m| !machine_name(m))
-    {
-        return Err("machine is not a valid machine type name".into());
-    }
-    if input
-        .get("displayName")
-        .and_then(Value::as_str)
-        .is_some_and(|d| {
-            d.trim().is_empty() || d.chars().count() > 48 || d.chars().any(char::is_control)
-        })
-    {
-        return Err("displayName must be 1 to 48 characters".into());
     }
     Ok(())
 }
@@ -565,72 +456,193 @@ mod tests {
     #[test]
     fn cloud_target_is_validated_before_anything_is_created() {
         let ok = |input| validate("sessions.start", &input);
-        assert!(ok(json!({"prompt":"x","target":{"codespace":"new"}})).is_ok());
-        assert!(ok(json!({"prompt":"x","harness":"claude","target":{"codespace":"new","branch":"feat/x","machine":"standardLinux32gb"}})).is_ok());
-        assert!(ok(json!({"prompt":"x","target":{"codespace":"octo-abc123"}})).is_ok());
+        // Instance forms: omitted and "new" create, a name or {session} reuse.
+        assert!(ok(json!({"prompt":"x","target":{"kind":"codespace"}})).is_ok());
+        assert!(ok(json!({"prompt":"x","target":{"kind":"codespace","instance":"new"}})).is_ok());
+        assert!(ok(json!({"prompt":"x","harness":"claude","target":{"kind":"codespace","instance":"new","branch":"feat/x","machine":"standardLinux32gb"}})).is_ok());
         assert!(
-            ok(json!({"prompt":"x","workspaceMode":"current","target":{"codespace":"new"}}))
+            ok(json!({"prompt":"x","target":{"kind":"codespace","instance":"octo-abc123"}}))
+                .is_ok()
+        );
+        assert!(ok(json!({"prompt":"x","target":{"kind":"sandbox","instance":"new"}})).is_ok());
+        assert!(ok(
+            json!({"prompt":"x","target":{"kind":"sandbox","instance":"monoptah-fix-1234"}})
+        )
+        .is_ok());
+        assert!(
+            ok(json!({"prompt":"x","target":{"kind":"sandbox","instance":"sbx_abc123"}})).is_ok()
+        );
+        assert!(ok(json!({"prompt":"x","target":{"kind":"sandbox","instance":"new","branch":"feat/x","cpus":4,"memory":"8g","ttl":"1h"}})).is_ok());
+        for session in [json!(-5), json!(7), json!("-5"), json!("12")] {
+            for kind in ["codespace", "sandbox"] {
+                assert!(
+                    ok(json!({"prompt":"x","target":{"kind":kind,"instance":{"session":session}}}))
+                        .is_ok(),
+                    "{kind} {session}"
+                );
+            }
+        }
+        assert!(
+            ok(json!({"prompt":"x","workspaceMode":"current","target":{"kind":"codespace","instance":"new"}}))
                 .is_ok()
         );
         for (bad, why) in [
             (json!("new"), "must be an object"),
-            (json!({}), "target.codespace must be"),
-            (json!({"codespace":5}), "target.codespace must be"),
-            (json!({"codespace":"-x"}), "letters, digits and hyphens"),
-            (json!({"codespace":"a b"}), "letters, digits and hyphens"),
-            (json!({"codespace":"a;rm"}), "letters, digits and hyphens"),
-            (json!({"codespace":"new","extra":1}), "does not take extra"),
+            (json!({}), "target.kind must be codespace or sandbox"),
+            (json!({"kind":"vm"}), "target.kind must be"),
+            (json!({"kind":5}), "target.kind must be"),
+            (json!({"codespace":"new"}), "target.codespace was replaced"),
             (
-                json!({"codespace":"new","branch":"--force"}),
+                json!({"kind":"codespace","instance":5}),
+                "target.instance must be",
+            ),
+            (
+                json!({"kind":"codespace","instance":"-x"}),
+                "letters, digits and hyphens",
+            ),
+            (
+                json!({"kind":"codespace","instance":"a b"}),
+                "letters, digits and hyphens",
+            ),
+            (
+                json!({"kind":"codespace","instance":"a;rm"}),
+                "letters, digits and hyphens",
+            ),
+            (
+                json!({"kind":"sandbox","instance":"a;rm"}),
+                "target.instance must be",
+            ),
+            (
+                json!({"kind":"sandbox","instance":"sbx_UPPER"}),
+                "target.instance must be",
+            ),
+            (
+                json!({"kind":"sandbox","instance":"x"}),
+                "target.instance must be",
+            ),
+            (
+                json!({"kind":"codespace","instance":{}}),
+                "target.instance must be",
+            ),
+            (
+                json!({"kind":"codespace","instance":{"session":0}}),
+                "target.instance must be",
+            ),
+            (
+                json!({"kind":"codespace","instance":{"session":"abc"}}),
+                "target.instance must be",
+            ),
+            (
+                json!({"kind":"codespace","instance":{"session":1.5}}),
+                "target.instance must be",
+            ),
+            (
+                json!({"kind":"codespace","instance":{"session":1,"x":2}}),
+                "target.instance must be",
+            ),
+            (
+                json!({"kind":"codespace","extra":1}),
+                "target does not take extra",
+            ),
+            (
+                json!({"kind":"codespace","cpus":2}),
+                "target does not take cpus for a codespace",
+            ),
+            (
+                json!({"kind":"sandbox","machine":"basicLinux32gb"}),
+                "target does not take machine for a sandbox",
+            ),
+            (
+                json!({"kind":"codespace","instance":"new","branch":"--force"}),
                 "target.branch",
             ),
-            (json!({"codespace":"new","branch":"a b"}), "target.branch"),
-            (json!({"codespace":"new","branch":3}), "target.branch"),
             (
-                json!({"codespace":"new","machine":"bad machine"}),
+                json!({"kind":"codespace","instance":"new","branch":"a b"}),
+                "target.branch",
+            ),
+            (
+                json!({"kind":"codespace","instance":"new","branch":3}),
+                "target.branch",
+            ),
+            (
+                json!({"kind":"codespace","instance":"new","machine":"bad machine"}),
                 "target.machine",
             ),
             (
-                json!({"codespace":"octo-abc","branch":"main"}),
+                json!({"kind":"sandbox","instance":"new","branch":"a b"}),
+                "target.branch",
+            ),
+            (
+                json!({"kind":"sandbox","instance":"new","cpus":0}),
+                "target.cpus",
+            ),
+            (
+                json!({"kind":"sandbox","instance":"new","cpus":"2"}),
+                "target.cpus",
+            ),
+            (
+                json!({"kind":"sandbox","instance":"new","memory":"lots"}),
+                "target.memory",
+            ),
+            (
+                json!({"kind":"sandbox","instance":"new","ttl":"48h"}),
+                "target.ttl",
+            ),
+            (
+                json!({"kind":"codespace","instance":"octo-abc","branch":"main"}),
                 "only applies when creating",
             ),
             (
-                json!({"codespace":"octo-abc","machine":"basicLinux32gb"}),
+                json!({"kind":"codespace","instance":"octo-abc","machine":"basicLinux32gb"}),
+                "only applies when creating",
+            ),
+            (
+                json!({"kind":"codespace","instance":{"session":-5},"branch":"main"}),
+                "only applies when creating",
+            ),
+            (
+                json!({"kind":"sandbox","instance":"box-1","cpus":4}),
+                "only applies when creating",
+            ),
+            (
+                json!({"kind":"sandbox","instance":{"session":-5},"ttl":"1h"}),
                 "only applies when creating",
             ),
         ] {
-            let error = ok(json!({"prompt":"x","target":bad})).unwrap_err();
-            assert!(error.contains(why), "{error}");
+            let error = ok(json!({"prompt":"x","target":bad.clone()})).unwrap_err();
+            assert!(error.contains(why), "{bad}: {error}");
         }
     }
     #[test]
     fn cloud_target_rejects_options_that_need_a_local_checkout() {
-        let target = json!({"codespace":"new"});
-        for (extra, why) in [
-            (json!({"harness":"codex"}), "Claude only"),
-            (json!({"draft":true}), "cannot be started as a draft"),
-            (json!({"workspaceMode":"worktree"}), "workspaceMode"),
-            (json!({"workspaceMode":"checkout"}), "workspaceMode"),
-            (json!({"worktreeBase":"main"}), "workspaceMode"),
-            (json!({"worktreeCwd":"/x"}), "workspaceMode"),
-        ] {
-            let mut input = json!({"prompt":"x","target":target});
-            input
-                .as_object_mut()
-                .unwrap()
-                .extend(extra.as_object().unwrap().clone());
-            let error = validate("sessions.start", &input).unwrap_err();
-            assert!(error.contains(why), "{error}");
+        for kind in ["codespace", "sandbox"] {
+            let target = json!({"kind":kind,"instance":"new"});
+            for (extra, why) in [
+                (json!({"harness":"codex"}), "Claude only"),
+                (json!({"draft":true}), "cannot be started as a draft"),
+                (json!({"workspaceMode":"worktree"}), "workspaceMode"),
+                (json!({"workspaceMode":"checkout"}), "workspaceMode"),
+                (json!({"worktreeBase":"main"}), "workspaceMode"),
+                (json!({"worktreeCwd":"/x"}), "workspaceMode"),
+            ] {
+                let mut input = json!({"prompt":"x","target":target});
+                input
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                let error = validate("sessions.start", &input).unwrap_err();
+                assert!(error.contains(why), "{error}");
+            }
+            // Only sessions.start takes a target.
+            assert_eq!(
+                validate(
+                    "sessions.send",
+                    &json!({"sessionId":1,"prompt":"x","target":target})
+                )
+                .unwrap_err(),
+                "sessions.send does not take target"
+            );
         }
-        // Only sessions.start takes a target.
-        assert_eq!(
-            validate(
-                "sessions.send",
-                &json!({"sessionId":1,"prompt":"x","target":target})
-            )
-            .unwrap_err(),
-            "sessions.send does not take target"
-        );
     }
     #[test]
     fn session_ids_may_be_negative_because_cloud_sessions_are_remote() {
@@ -668,36 +680,67 @@ mod tests {
         }
     }
     #[test]
-    fn codespace_actions_take_exactly_their_fields() {
-        assert!(validate("codespaces.list", &json!({})).is_ok());
-        assert!(validate("codespaces.list", &json!({"project":"/p"})).is_ok());
-        assert!(validate("codespaces.secretsStatus", &json!({})).is_ok());
-        assert!(validate(
-            "codespaces.create",
-            &json!({"branch":"main","machine":"basicLinux32gb","displayName":"mine"})
-        )
-        .is_ok());
-        assert!(validate("codespaces.create", &json!({})).is_ok());
-        assert!(validate("codespaces.stop", &json!({"name":"octo-abc"})).is_ok());
-        assert!(validate("codespaces.delete", &json!({"name":"octo-abc"})).is_ok());
-        for (action, input) in [
-            ("codespaces.list", json!({"name":"x"})),
-            ("codespaces.secretsStatus", json!({"value":"s"})),
-            ("codespaces.create", json!({"name":"x"})),
-            ("codespaces.stop", json!({"branch":"main"})),
-            ("codespaces.delete", json!({"force":true})),
-            ("codespaces.nope", json!({})),
+    fn cloud_actions_take_exactly_their_fields() {
+        for ok in [
+            ("cloud.list", json!({})),
+            ("cloud.list", json!({"project":"/p","kind":"sandbox"})),
+            ("cloud.status", json!({})),
+            ("cloud.status", json!({"kind":"codespace"})),
+            (
+                "cloud.create",
+                json!({"kind":"codespace","branch":"main","machine":"basicLinux32gb","displayName":"mine"}),
+            ),
+            ("cloud.create", json!({"kind":"codespace"})),
+            // A sandbox cannot be created alone; the capability error comes at run time.
+            ("cloud.create", json!({"kind":"sandbox"})),
+            ("cloud.create", json!({"kind":"sandbox","branch":"x"})),
+            ("cloud.stop", json!({"sessionId":-5})),
+            ("cloud.stop", json!({"sessionId":"-5","project":"/p"})),
+            (
+                "cloud.resume",
+                json!({"kind":"codespace","instance":"octo-abc"}),
+            ),
+            ("cloud.delete", json!({"kind":"sandbox","instance":"box-1"})),
+            ("cloud.delete", json!({"sessionId":7})),
         ] {
-            assert!(validate(action, &input).is_err(), "{action}");
+            assert!(validate(ok.0, &ok.1).is_ok(), "{} {}", ok.0, ok.1);
         }
         for (action, input) in [
-            ("codespaces.stop", json!({"name":"a b"})),
-            ("codespaces.delete", json!({"name":"-rf"})),
-            ("codespaces.delete", json!({"name":5})),
-            ("codespaces.create", json!({"branch":"--x"})),
-            ("codespaces.create", json!({"machine":"a;b"})),
-            ("codespaces.create", json!({"displayName":""})),
-            ("codespaces.create", json!({"displayName":"x".repeat(49)})),
+            ("cloud.list", json!({"name":"x"})),
+            ("cloud.status", json!({"value":"s"})),
+            ("cloud.list", json!({"kind":"vm"})),
+            ("cloud.list", json!({"kind":5})),
+            ("cloud.create", json!({})),
+            ("cloud.create", json!({"kind":"vm"})),
+            ("cloud.create", json!({"kind":"codespace","name":"x"})),
+            ("cloud.create", json!({"kind":"codespace","branch":"--x"})),
+            ("cloud.create", json!({"kind":"codespace","machine":"a;b"})),
+            ("cloud.create", json!({"kind":"codespace","displayName":""})),
+            (
+                "cloud.create",
+                json!({"kind":"codespace","displayName":"x".repeat(49)}),
+            ),
+            ("cloud.stop", json!({})),
+            ("cloud.stop", json!({"kind":"codespace"})),
+            ("cloud.stop", json!({"instance":"octo-abc"})),
+            (
+                "cloud.stop",
+                json!({"sessionId":1,"kind":"codespace","instance":"octo-abc"}),
+            ),
+            ("cloud.stop", json!({"sessionId":1,"instance":"octo-abc"})),
+            ("cloud.stop", json!({"kind":"codespace","instance":"a b"})),
+            ("cloud.delete", json!({"kind":"codespace","instance":"-rf"})),
+            ("cloud.delete", json!({"kind":"codespace","instance":5})),
+            ("cloud.delete", json!({"kind":"sandbox","instance":"a;b"})),
+            ("cloud.delete", json!({"sessionId":null})),
+            ("cloud.resume", json!({"sessionId":1,"force":true})),
+            ("cloud.nope", json!({})),
+            // The old codespace-only actions are gone, without aliases.
+            ("codespaces.list", json!({})),
+            ("codespaces.create", json!({})),
+            ("codespaces.stop", json!({"name":"octo-abc"})),
+            ("codespaces.delete", json!({"name":"octo-abc"})),
+            ("codespaces.secretsStatus", json!({})),
         ] {
             assert!(validate(action, &input).is_err(), "{action} {input}");
         }

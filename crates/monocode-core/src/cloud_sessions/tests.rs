@@ -629,7 +629,7 @@ fn pull_evidence_copies_the_default_folder_into_the_session_folder() {
     });
     let (svc, id) = evidence_service(gh.clone(), dir.path());
     let pull = svc.pull_evidence(id, None).unwrap();
-    assert_eq!(pull.codespace, "octo-abc");
+    assert_eq!(pull.instance, "octo-abc");
     assert_eq!(pull.remote_path, "/workspaces/widgets/.evidence");
     assert_eq!(pull.files.len(), 2, "{pull:?}");
     assert!(pull.files.iter().all(|f| f.starts_with(&pull.local_dir)));
@@ -1203,4 +1203,23 @@ fn stopping_a_sandbox_pauses_its_pending_start() {
     assert!(!startup::start_record(&store, other).unwrap().is_failed());
     assert_eq!(sandbox.calls(), vec!["stop sbx-1"]);
     assert_eq!(gh.calls(), Vec::<String>::new());
+}
+
+#[test]
+fn split_created_note_reads_what_created_note_for_writes() {
+    for (cloud, kind) in [
+        (CloudRef::codespace("octo-1"), CloudBackendKind::Codespaces),
+        (CloudRef::sandbox("box-1"), CloudBackendKind::DockerSandbox),
+    ] {
+        let note = created_note_for(&cloud, "it broke");
+        assert_eq!(
+            split_created_note(&note),
+            Some(("it broke", kind, cloud.name.as_str()))
+        );
+    }
+    assert_eq!(split_created_note("plain error"), None);
+    assert_eq!(
+        split_created_note("x (sandbox  was created and kept; y)"),
+        None
+    );
 }

@@ -89,6 +89,29 @@ pub fn valid_ref(value: &str) -> bool {
             .all(|part| !part.starts_with('.') && !part.ends_with(".lock"))
 }
 
+/// Validates a CPU count (the same rule [`DockerProjectConfig::validated`] applies).
+pub fn check_cpus(cpus: u32) -> Result<(), String> {
+    if (1..=MAX_CPUS).contains(&cpus) {
+        Ok(())
+    } else {
+        Err(format!("CPUs must be between 1 and {MAX_CPUS}."))
+    }
+}
+/// Validates a lower-case memory size such as `512m` or `4g`.
+pub fn check_memory(memory: &str) -> Result<(), String> {
+    match memory_mib(memory) {
+        Some(mib) if (MIN_MEMORY_MIB..=MAX_MEMORY_MIB).contains(&mib) => Ok(()),
+        _ => Err("Memory must look like 512m or 4g, between 512m and 64g.".into()),
+    }
+}
+/// Validates a lower-case lifetime such as `30m` or `2h`.
+pub fn check_ttl(ttl: &str) -> Result<(), String> {
+    match ttl_minutes(ttl) {
+        Some(minutes) if (1..=MAX_TTL_MINUTES).contains(&minutes) => Ok(()),
+        _ => Err("Lifetime must look like 30m or 2h, at most 24h.".into()),
+    }
+}
+
 impl DockerProjectConfig {
     /// Trim the text fields and check every value. Returns the cleaned config.
     pub fn validated(&self) -> Result<Self, String> {
@@ -122,17 +145,9 @@ impl DockerProjectConfig {
         {
             return Err("The devcontainer path must be relative to the repository root.".into());
         }
-        if !(1..=MAX_CPUS).contains(&cfg.cpus) {
-            return Err(format!("CPUs must be between 1 and {MAX_CPUS}."));
-        }
-        match memory_mib(&cfg.memory) {
-            Some(mib) if (MIN_MEMORY_MIB..=MAX_MEMORY_MIB).contains(&mib) => {}
-            _ => return Err("Memory must look like 512m or 4g, between 512m and 64g.".into()),
-        }
-        match ttl_minutes(&cfg.ttl) {
-            Some(minutes) if (1..=MAX_TTL_MINUTES).contains(&minutes) => {}
-            _ => return Err("Lifetime must look like 30m or 2h, at most 24h.".into()),
-        }
+        check_cpus(cfg.cpus)?;
+        check_memory(&cfg.memory)?;
+        check_ttl(&cfg.ttl)?;
         if let Some(platform) = &cfg.platform {
             let parts: Vec<&str> = platform.split('/').collect();
             if !(2..=3).contains(&parts.len())

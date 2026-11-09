@@ -706,7 +706,7 @@ impl Shell {
                 if stopped && let Some(view) = self.ensure_session(id, cx) {
                     // The user's own click: the same path as the Reconnect button.
                     view.update(cx, |view, cx| {
-                        view.reconnect_cloud(true, cx);
+                        view.reconnect_cloud(cx);
                     });
                 }
             }

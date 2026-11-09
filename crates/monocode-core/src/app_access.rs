@@ -32,13 +32,14 @@ pub fn validate_operator(action: &str, input: &Value) -> Result<(), String> {
             | "notes.write"
             | "worktrees.list"
             | "worktrees.create"
-            | "codespaces.list"
-            | "codespaces.create"
-            | "codespaces.stop"
-            | "codespaces.secretsStatus"
+            | "cloud.list"
+            | "cloud.status"
+            | "cloud.create"
+            | "cloud.stop"
+            | "cloud.resume"
     ) {
-        if action == "codespaces.delete" {
-            return Err("Deleting a codespace is only available to a Mono".into());
+        if action == "cloud.delete" {
+            return Err("Deleting a cloud instance is only available to a Mono".into());
         }
         return Err("Unknown Operator action. Run app help for project actions; memory, habits and artifacts require a Mono.".into());
     }
@@ -47,7 +48,7 @@ pub fn validate_operator(action: &str, input: &Value) -> Result<(), String> {
         return Err("Completion notifications are only available in a Mono's chat".into());
     }
     if action == "sessions.archive" && input["cloud"] == "delete" {
-        return Err("Deleting a codespace or sandbox is only available to a Mono".into());
+        return Err("Deleting a cloud instance is only available to a Mono".into());
     }
     if input["providerFiles"] == true {
         return Err("Removing provider session files is only available to a Mono".into());

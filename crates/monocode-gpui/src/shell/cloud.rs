@@ -1162,10 +1162,20 @@ impl Shell {
         self.cloud_marks.get(&id).map(CloudMark::cloud)
     }
 
-    /// Whether an archive is working on codespace `name` (for `codespaces.stop` / `delete`).
-    pub(crate) fn codespace_busy(&self, name: &str) -> bool {
-        self.cloud_workspaces_busy
-            .contains(&CloudRef::codespace(name).key())
+    /// What a worker thread needs to answer "is this instance busy" for `cloud.stop` /
+    /// `cloud.delete`: the workspaces an archive is working on right now and the cloud sessions
+    /// whose live view is working or waiting (the stored flags lag behind both).
+    pub(crate) fn cloud_busy_snapshot(&self, cx: &App) -> crate::cloud_actions::LiveBusy {
+        crate::cloud_actions::LiveBusy {
+            workspaces: self.cloud_workspaces_busy.clone(),
+            sessions: self
+                .session_summaries
+                .iter()
+                .filter(|(_, summary)| summary.cwd.starts_with("remote://"))
+                .map(|(id, _)| *id)
+                .filter(|id| self.session_metadata(*id, cx).busy)
+                .collect(),
+        }
     }
 
     /// Whether a cloud archive is converting session `id` right now.
