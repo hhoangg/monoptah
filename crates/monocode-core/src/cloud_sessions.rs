@@ -1657,6 +1657,7 @@ mod docker_config_tests;
 mod docker_start_tests;
 #[cfg(test)]
 mod kit_tests;
+#[cfg(test)]
 mod move_out_tests;
 #[cfg(test)]
 mod startup_tests;
