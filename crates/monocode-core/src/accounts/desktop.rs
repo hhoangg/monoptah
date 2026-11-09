@@ -81,11 +81,13 @@ impl Book {
             for project in source.selections.keys().chain(self.selections.keys()) {
                 // Explicit choices only: the default account must not be
                 // frozen into every project the desktop client knows. An
-                // explicit choice of the CLI login still counts as a choice,
-                // so it is compared as `Some`, not folded into "no choice".
-                let chosen = self.chosen(kind, project);
-                if chosen != source.chosen(kind, project) {
-                    let id = chosen.unwrap_or_else(default_id);
+                // explicit choice of the CLI login still counts as a choice.
+                // A project that lost its choice (its account was removed)
+                // falls back to the default and writes nothing.
+                if let Some(id) = self
+                    .chosen(kind, project)
+                    .filter(|id| Some(id) != source.chosen(kind, project).as_ref())
+                {
                     changes
                         .selections
                         .entry(project_key(project))
@@ -242,5 +244,21 @@ mod tests {
         reloaded.apply_desktop_overrides(native.desktop_overrides(&source));
         assert_eq!(reloaded.selected(Kind::Claude, "/proj"), DEFAULT);
         assert_eq!(reloaded.selected(Kind::Claude, "/new"), "account-token");
+    }
+
+    #[test]
+    fn removing_a_projects_chosen_account_does_not_pin_it_to_the_cli_login() {
+        let source = Book::from_desktop(
+            &json!({"claude":[{"id":"account-token","label":"Token"},{"id":"account-old","label":"Old"}]}),
+            &json!({"/proj":{"claude":"account-old"}}),
+        )
+        .unwrap();
+        let mut native = source.clone();
+        native.set_preferred(Kind::Claude, "account-token").unwrap();
+        native.remove(Kind::Claude, "account-old").unwrap();
+        assert_eq!(native.selected(Kind::Claude, "/proj"), "account-token");
+        let mut reloaded = source.clone();
+        reloaded.apply_desktop_overrides(native.desktop_overrides(&source));
+        assert_eq!(reloaded.selected(Kind::Claude, "/proj"), "account-token");
     }
 }
