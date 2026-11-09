@@ -7,6 +7,7 @@ pub use index::{list_project_files, list_project_files_sync_cancellable, Project
 mod name;
 mod paths;
 pub mod remote;
+pub mod remote_read;
 pub use remote::run_remote_command;
 
 use std::collections::HashSet;
