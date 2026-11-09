@@ -6,6 +6,7 @@
 - Settings now lists each Agent CLI's models for the account new sessions use, so Claude no longer shows "0 models" with "Use by default" disabled when no session is open.
 - Choosing the CLI login for a project now survives a desktop reload, and removing an account a project had chosen no longer pins that project to the CLI login after a restart.
 - Claude accounts added with `claude setup-token` can now show their 5-hour and 7-day quota. Their tokens cannot read the usage API, so clicking refresh on the usage chip sends one tiny request and reads the quota from its response; this only happens on that click, never in the background. The result is shown as "Checked Xm ago" and is forgotten when the token is changed or removed. API key accounts still show no quota, now with a message that says why.
+- A Mono that ends its turn while a background task is still running (for example a long-lived dev server) now shows its reply right away. Before, the chat kept showing "Typing..." and hid the reply until you sent another message; the header now reads "Waiting on N background task(s)" instead.
 - In the Classic layout, the usage quota row (with refresh and terminal controls) now stays under the composer while a Mono chat is open.
 
 ## Downloads and updates
