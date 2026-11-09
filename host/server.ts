@@ -3,6 +3,7 @@ import {
   type IncomingMessage,
   type ServerResponse,
 } from "node:http";
+import { HOST_FLAVOR, HOST_VERSION_BASE } from "./host-version";
 import { hostname, homedir } from "node:os";
 import { execFile } from "node:child_process";
 import { realpath, stat } from "node:fs/promises";
@@ -260,6 +261,7 @@ export function createHostServer(
               environmentId: engine.store.environmentId,
               name: hostname(),
               platform: process.platform,
+              host: { flavor: HOST_FLAVOR, version: HOST_VERSION_BASE },
               // Older clients validate this list against Codex and Claude only.
               providers: providers.filter((provider) =>
                 Array.isArray(params.supportedProviders)

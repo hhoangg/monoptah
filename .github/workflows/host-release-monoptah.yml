@@ -1,0 +1,176 @@
+# Fork-local release workflow (Monoptah Host). Pushing a tag host-vX.Y.Z (made by
+# `npm run host:release -- X.Y.Z`) builds every Host package that
+# `npm run host:package -- --all` produces and publishes them to a GitHub Release
+# host-vX.Y.Z on this repository:
+#   monocode-host-<target>.tar.gz   darwin-arm64, darwin-x64, linux-arm64, linux-x64
+#   monocode-host-<target>.zip      win32-x64, win32-arm64
+#   each with its .sha256, plus host-release.json ({version, assets: {target: sha256}}).
+# Asset names keep "monocode-host" (the CLI name is an identifier, see CLAUDE.md).
+# Windows packages are published too: the SSH bootstrap also serves Windows machines,
+# so a Windows upgrade must not 404.
+#
+# The release is created with --latest=false. It must never become "latest": the
+# Tauri updater reads releases/latest/download/latest.json.
+#
+# The workflow refuses to run when the release already exists, and a version is
+# never re-uploaded: the app pins the sha256 of every asset (host_release.rs), so
+# replacing a published file would break installs. To redo a failed release, bump
+# the version.
+#
+# host-release.json is also uploaded as a workflow artifact and attested with
+# actions/attest-build-provenance; scripts/pin-host-release.mjs (H2a) reads it from
+# the run and verifies the attestation instead of trusting the release alone.
+#
+# Every target is built on one Ubuntu runner: the Node runtimes are pinned downloads
+# and host/package.mjs unpacks Windows archives with unzip. Only the runner's own
+# target is smoke-tested (--version), which checks the version from host/VERSION.
+name: Host Release (Monoptah)
+
+on:
+  push:
+    tags:
+      - "host-v*"
+  # Run with --ref host-vX.Y.Z (a tag), never a branch.
+  workflow_dispatch:
+
+concurrency:
+  group: host-release-monoptah
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Validate tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the tag against host/VERSION
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$REF_TYPE" != "tag" ]; then
+            echo "::error::Run this workflow on a tag (host-vX.Y.Z), not on a branch"
+            exit 1
+          fi
+          if ! printf '%s' "$TAG" | grep -Eq '^host-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+            echo "::error::Tag $TAG must look like host-vX.Y.Z (plain version, no pre-release)"
+            exit 1
+          fi
+          version="$(tr -d '[:space:]' < host/VERSION)"
+          if [ "${TAG#host-v}+monoptah" != "$version" ]; then
+            echo "::error::Tag $TAG does not match host/VERSION ($version minus +monoptah)"
+            exit 1
+          fi
+      - name: Refuse when the release already exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Only "release not found" lets the run proceed; any other gh error fails it.
+          if out=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" 2>&1); then
+            echo "::error::Release $TAG already exists. Published Host assets are never re-uploaded because the app pins their hashes; bump the version instead."
+            exit 1
+          elif ! grep -qi "release not found" <<<"$out"; then
+            echo "::error::Could not check whether release $TAG exists: $out"
+            exit 1
+          fi
+
+  build:
+    name: Build packages
+    needs: plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Build every Host package
+        run: npm run host:package -- --all
+      - name: Check that all targets were produced
+        run: |
+          set -euo pipefail
+          for target in darwin-arm64 darwin-x64 linux-arm64 linux-x64; do
+            test -s "build/host-packages/monocode-host-$target.tar.gz"
+            test -s "build/host-packages/monocode-host-$target.tar.gz.sha256"
+          done
+          for target in win32-x64 win32-arm64; do
+            test -s "build/host-packages/monocode-host-$target.zip"
+            test -s "build/host-packages/monocode-host-$target.zip.sha256"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: host-packages
+          path: build/host-packages/
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: host-packages
+          path: dist
+      - name: Write host-release.json
+        run: |
+          set -euo pipefail
+          node --input-type=module -e '
+            import { readdirSync, readFileSync, writeFileSync } from "node:fs";
+            const version = readFileSync("host/VERSION", "utf8").trim();
+            const assets = {};
+            for (const name of readdirSync("dist").sort()) {
+              const match = /^monocode-host-(.+)\.(?:tar\.gz|zip)\.sha256$/.exec(name);
+              if (!match) continue;
+              const hash = readFileSync(`dist/${name}`, "utf8").trim().split(/\s+/)[0];
+              if (!/^[0-9a-f]{64}$/.test(hash)) throw new Error(`Bad checksum in ${name}`);
+              assets[match[1]] = hash;
+            }
+            if (Object.keys(assets).length !== 6)
+              throw new Error(`Expected 6 targets, found ${Object.keys(assets).length}`);
+            writeFileSync("dist/host-release.json", JSON.stringify({ version, assets }, null, 2) + "\n");
+          '
+          cat dist/host-release.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: host-release-json
+          path: dist/host-release.json
+          if-no-files-found: error
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/host-release.json
+            dist/monocode-host-*
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if out=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" 2>&1); then
+            echo "::error::Release $TAG already exists; refusing to upload again"
+            exit 1
+          elif ! grep -qi "release not found" <<<"$out"; then
+            echo "::error::Could not check whether release $TAG exists: $out"
+            exit 1
+          fi
+          version="${TAG#host-v}"
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --latest=false \
+            --title "Monoptah Host $version" \
+            --notes "Monoptah Host $version (monocode-host $version+monoptah). Packages for every target, each with its sha256, and host-release.json." \
+            dist/monocode-host-* dist/host-release.json

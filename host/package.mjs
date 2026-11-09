@@ -59,7 +59,8 @@ const output = resolve("build/host-packages");
 const cache = resolve("build/host-runtime-cache");
 await mkdir(output, { recursive: true });
 await mkdir(cache, { recursive: true });
-const { version } = JSON.parse(await readFile("package.json", "utf8"));
+// The Host version is decoupled from the app: host/VERSION, e.g. 1.0.0+monoptah.
+const version = (await readFile("host/VERSION", "utf8")).trim();
 for (const target of targets) {
   if (!(target in runtimes))
     throw new Error(`Unsupported host target: ${target}`);

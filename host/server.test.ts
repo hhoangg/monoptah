@@ -14,6 +14,7 @@ import { request } from "node:http";
 import { HostEngine } from "./engine";
 import { HostStore } from "./store";
 import { createHostServer } from "./server";
+import { HOST_VERSION } from "./host-version";
 import { HostChildBackend } from "./child-backend";
 import { configureChildBackend } from "../src/integrations/harness/core/child";
 import type { SendTurnInput } from "../src/integrations/harness/core/types";
@@ -296,6 +297,15 @@ describe("remote host API", () => {
       { id: "codex:test", name: "Test" },
     ]);
     expect(modelProbe).toHaveBeenCalledTimes(2);
+  });
+  it("identifies itself as the Monoptah flavor in describe.host", async () => {
+    const s = await setup();
+    const version = HOST_VERSION;
+    expect(version).toMatch(/^\d+\.\d+\.\d+\+monoptah$/);
+    expect((await s.call("environment.describe")).value.result.host).toEqual({
+      flavor: "monoptah",
+      version: version.replace("+monoptah", ""),
+    });
   });
   it("advertises newer providers only to desktops that request them", async () => {
     const s = await setup(["codex", "cursor"]);
