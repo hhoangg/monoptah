@@ -13,7 +13,14 @@ use gpui::{
     Subscription, Task, Window, actions, div, img, prelude::*, px, rgb,
 };
 use monocode_core::files::document::{self, Document, TextDocument};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 pub(crate) mod blame;
 mod chrome;
@@ -190,6 +197,10 @@ pub(crate) struct FileEditor {
     error: Option<String>,
     disk_changed: bool,
     loading: bool,
+    /// Progress of a remote read in bytes (done, total; total 0 until the first chunk), and
+    /// the flag that stops it after the chunk in flight.
+    read_progress: Arc<(AtomicU64, AtomicU64)>,
+    read_cancel: Arc<AtomicBool>,
     pub saving: bool,
     pub dirty: bool,
     visible: bool,
@@ -348,6 +359,8 @@ impl FileEditor {
             error: None,
             disk_changed: false,
             loading: false,
+            read_progress: Arc::default(),
+            read_cancel: Arc::new(AtomicBool::new(false)),
             saving: false,
             dirty: false,
             visible: false,
@@ -408,6 +421,18 @@ impl FileEditor {
             self.catch_up_blame(cx);
         }
     }
+    fn read_total(&self) -> u64 {
+        self.read_progress.1.load(Ordering::Relaxed)
+    }
+    /// "Opening file…", with the percentage once a chunked remote read has started.
+    fn opening_text(&self) -> String {
+        let total = self.read_total();
+        if !self.loading || total == 0 {
+            return "Opening file…".into();
+        }
+        let done = self.read_progress.0.load(Ordering::Relaxed).min(total);
+        format!("Opening file… {}%", done * 100 / total)
+    }
     fn is_markdown(&self) -> bool {
         matches!(
             PathBuf::from(&self.path)
@@ -422,9 +447,39 @@ impl FileEditor {
         }
         self.loading = true;
         let path = PathBuf::from(&self.path);
-        let work = cx
-            .background_executor()
-            .spawn(async move { document::read_document(&path).and_then(media::prepare_document) });
+        let remote = monocode_core::files::remote::is_remote(&path);
+        let progress = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.read_progress = progress.clone();
+        self.read_cancel = cancel.clone();
+        let work = cx.background_executor().spawn(async move {
+            document::read_document_with(
+                &path,
+                &mut |done, total| {
+                    progress.0.store(done, Ordering::Relaxed);
+                    progress.1.store(total, Ordering::Relaxed);
+                },
+                &cancel,
+            )
+            .and_then(media::prepare_document)
+        });
+        if remote {
+            // The read runs on a worker, so poll its progress for the "Opening" line.
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(200))
+                        .await;
+                    let Ok(true) = this.update(cx, |this, cx| {
+                        cx.notify();
+                        this.loading
+                    }) else {
+                        break;
+                    };
+                }
+            })
+            .detach();
+        }
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
@@ -1222,8 +1277,25 @@ impl gpui::Render for FileEditor {
                     self.unsupported
                         .clone()
                         .or(self.error.clone())
-                        .unwrap_or_else(|| "Opening file…".into()),
+                        .unwrap_or_else(|| self.opening_text()),
                 )
+                .when(self.loading && self.read_total() > 0, |d| {
+                    d.child(
+                        div()
+                            .id("cancel-read")
+                            .role(Role::Button)
+                            .aria_label("Cancel")
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .bg(content(0.1))
+                            .child("Cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.read_cancel.store(true, Ordering::Relaxed);
+                                cx.notify();
+                            })),
+                    )
+                })
                 .when(!self.loading, |d| {
                     d.child(
                         div()
