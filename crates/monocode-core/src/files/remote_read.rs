@@ -114,7 +114,7 @@ impl Default for Cache {
     }
 }
 
-static CACHE: LazyLock<Cache> = LazyLock::new(Cache::default);
+pub(crate) static CACHE: LazyLock<Cache> = LazyLock::new(Cache::default);
 
 /// Where `files.readBytes` finds a file: a project, its relative path, and the worktree.
 #[derive(Debug, PartialEq, Eq)]
