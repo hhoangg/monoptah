@@ -61,10 +61,16 @@ impl Gate {
 
 /// Whether `operation` may start at local row `row` of a session at `location`.
 pub fn rewind_gate(location: &SessionLocation, operation: Operation, row: usize) -> Gate {
-    let Some(cloud) = location.cloud() else {
+    gate_at(location.cloud().map(|c| c.moved_at_row), operation, row)
+}
+
+/// [`rewind_gate`] for a caller that only knows the move point: `Some(moved_at_row)` while
+/// the session is in the cloud, `None` while it is local.
+pub fn gate_at(moved_at_row: Option<usize>, operation: Operation, row: usize) -> Gate {
+    let Some(moved_at_row) = moved_at_row else {
         return Gate::Allowed;
     };
-    if row < cloud.moved_at_row {
+    if row < moved_at_row {
         Gate::Disabled(BEFORE_MOVE)
     } else if operation.rewrites_local_history() {
         Gate::Disabled(CLOUD_OWNED)
@@ -139,6 +145,23 @@ mod tests {
                 Gate::Disabled(CLOUD_OWNED),
                 "{op:?}"
             );
+        }
+    }
+
+    #[test]
+    fn the_move_point_form_agrees_with_the_location_form() {
+        for row in [0, 9, 10, 11] {
+            for op in [
+                Operation::EditLastTurn,
+                Operation::Fork,
+                Operation::RestoreFiles,
+            ] {
+                assert_eq!(
+                    gate_at(Some(10), op, row),
+                    rewind_gate(&cloud_at(10), op, row)
+                );
+                assert_eq!(gate_at(None, op, row), Gate::Allowed);
+            }
         }
     }
 

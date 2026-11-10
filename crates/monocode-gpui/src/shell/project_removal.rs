@@ -82,6 +82,8 @@ pub(super) struct DeleteDialog {
     pub(super) ids: Vec<i64>,
     title: String,
     pub(super) provider_files: Option<ProviderFiles>,
+    /// What deleting leaves behind in cloud workspaces, when a session lives in one.
+    pub(super) cloud_notice: Option<String>,
     /// Each session's worktree that nothing else uses, so deleting leaves it unused.
     worktrees: Vec<(i64, String)>,
     pub(super) delete_provider_files: bool,
@@ -479,7 +481,19 @@ impl Shell {
         };
         let provider_files =
             ProviderFiles::of(ids.iter().filter_map(|id| self.local_files_kind(*id, cx)));
+        // The location, not the Host record, says whether a session lives in the cloud.
+        let clouds: Vec<monocode_core::cloud_sessions::CloudRef> = locked(&self.store)
+            .map(|store| {
+                ids.iter()
+                    .filter_map(|id| match store.cloud_location(*id) {
+                        Ok(location) => location.cloud().map(|c| c.cloud.clone()),
+                        Err(_) => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let dialog = DeleteDialog {
+            cloud_notice: provider_cleanup::cloud_delete_notice(&clouds),
             ids,
             title,
             provider_files,
@@ -652,6 +666,17 @@ impl Shell {
                                         .text_size(px(12.))
                                         .child(delete_summary(&dialog.title, count)),
                                 )
+                                .when_some(dialog.cloud_notice.clone(), |d, notice| {
+                                    d.child(
+                                        div()
+                                            .id("delete-cloud-notice")
+                                            .debug_selector(|| "delete-cloud-notice".into())
+                                            .role(Role::Note)
+                                            .text_size(px(12.))
+                                            .text_color(content(0.55))
+                                            .child(notice),
+                                    )
+                                })
                                 .when_some(dialog.provider_files, |d, files| {
                                     d.child(
                                         option(

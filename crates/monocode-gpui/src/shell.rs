@@ -11,6 +11,8 @@ mod classic_surfaces;
 mod cloud;
 mod cloud_app_archive;
 mod cloud_create;
+#[cfg(test)]
+mod cloud_location_tests;
 mod cloud_picker;
 mod cloud_start;
 #[cfg(test)]
@@ -724,6 +726,8 @@ pub(crate) struct Shell {
     /// Converted local sessions and the codespace each came from, and which of those no longer
     /// exist.
     cloud_origins: HashMap<i64, String>,
+    /// Local sessions whose location is Cloud (design 4.2.1): move point and sync error.
+    cloud_located: HashMap<i64, monocode_core::cloud_sessions::LocatedSession>,
     cloud_gone: std::collections::HashSet<String>,
     cloud_refreshing: bool,
     /// A resume happened while a refresh was in flight: its answer is stale, read again.
@@ -1188,6 +1192,7 @@ impl Shell {
             cloud_view: None,
             cloud_states: HashMap::new(),
             cloud_origins: HashMap::new(),
+            cloud_located: HashMap::new(),
             cloud_gone: Default::default(),
             cloud_refreshing: false,
             cloud_refresh_again: false,
@@ -1606,6 +1611,7 @@ impl Shell {
                 }),
                 cx,
             );
+            view.set_cloud_location(self.cloud_located.get(&id).cloned(), cx);
             view.set_project_appearance(appearance, cx);
             view.transcript.update(cx, |transcript, cx| {
                 transcript.apply_preferences(&self.workspace.preferences, cx)
@@ -1617,6 +1623,10 @@ impl Shell {
         self.observations.push(cx.subscribe(
             &view,
             move |this, _, _: &crate::conversation::CloudResumed, cx| this.cloud_resumed(id, cx),
+        ));
+        self.observations.push(cx.subscribe(
+            &view,
+            |this, _, _: &crate::conversation::CloudLocationReset, cx| this.refresh_cloud(cx),
         ));
         self.observations.push(cx.subscribe(
             &view,
