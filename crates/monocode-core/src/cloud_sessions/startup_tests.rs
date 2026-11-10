@@ -133,6 +133,8 @@ struct Host {
     kit: Mutex<Option<KitHost>>,
 }
 
+type Hook = Arc<dyn Fn() + Send + Sync>;
+
 /// What the scripted Host does for the Claude setup, and what it saw.
 #[derive(Default)]
 struct KitHost {
@@ -151,7 +153,7 @@ struct KitHost {
     health_params: Vec<Value>,
     methods: Vec<String>,
     /// Runs when the Host receives `method`, before it answers.
-    on_call: Vec<(&'static str, Arc<dyn Fn() + Send + Sync>)>,
+    on_call: Vec<(&'static str, Hook)>,
 }
 
 impl KitHost {
