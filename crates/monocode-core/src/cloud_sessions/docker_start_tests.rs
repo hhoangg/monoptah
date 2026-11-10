@@ -1649,6 +1649,65 @@ mod scripts {
     }
 
     #[test]
+    fn feature_equal_to_base_checks_out_the_tracking_branch_even_in_an_older_clone() {
+        let outer = Outer::new();
+        let repo = upstream();
+        let url = repo.path().display().to_string();
+        let script = |base: &str, branch: &str| {
+            with_vars(
+                &[
+                    ("PHASE", "clone"),
+                    ("REPO_URL", &url),
+                    ("REPO_DIR", "w"),
+                    ("BASE_REF", base),
+                    ("BRANCH", branch),
+                ],
+                PROVISION_SCRIPT,
+            )
+        };
+        // An older clone that has never seen the branch that is pushed next.
+        let (ok, _, stderr) = outer.run(&script("main", "feat/x"), "");
+        assert!(ok, "{stderr}");
+        git(repo.path(), &["checkout", "-q", "-b", "moved", "dev"]);
+        std::fs::write(repo.path().join("a.txt"), "moved\n").unwrap();
+        git(repo.path(), &["commit", "-qam", "moved"]);
+        git(repo.path(), &["checkout", "-q", "main"]);
+        let (ok, _, stderr) = outer.run(&script("moved", "moved"), "");
+        assert!(ok, "{stderr}");
+        let ws = outer.home.path().join("workspaces/w");
+        let config = |key: &str| {
+            String::from_utf8(
+                Command::new("git")
+                    .args(["-C", &ws.display().to_string(), "config", key])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+            .trim()
+            .to_string()
+        };
+        assert_eq!(config("branch.moved.remote"), "origin");
+        assert_eq!(config("branch.moved.merge"), "refs/heads/moved");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("a.txt")).unwrap(),
+            "moved\n"
+        );
+        // A second run keeps the branch and any work on it.
+        std::fs::write(ws.join("a.txt"), "my work\n").unwrap();
+        let (ok, _, stderr) = outer.run(&script("moved", "moved"), "");
+        assert!(ok, "{stderr}");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("a.txt")).unwrap(),
+            "my work\n"
+        );
+        // A branch origin does not have is an error, not a silent new branch.
+        let (ok, _, stderr) = outer.run(&script("ghost", "ghost"), "");
+        assert!(!ok);
+        assert!(stderr.contains("does not exist"), "{stderr}");
+    }
+
+    #[test]
     fn up_runs_detached_with_the_documented_flags_and_follow_replays_the_log() {
         let outer = Outer::new();
         let dc = outer.home.path().join(".devcontainers/bin");

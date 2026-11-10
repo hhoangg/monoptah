@@ -260,6 +260,14 @@ impl Store {
         let _ = self.save_setting(&Self::sync_error_key(session), "");
         self.save_setting(&Self::location_key(session), "")
     }
+    /// Every stored `cloud-move:<session id>` record (the move in progress), by session id.
+    pub fn cloud_move_settings(&self) -> Result<Vec<(i64, String)>, String> {
+        Ok(self
+            .settings_with_prefix("cloud-move:")?
+            .into_iter()
+            .filter(|(_, raw)| !raw.is_empty())
+            .collect())
+    }
     /// Only the move (F4-3a) and the return (F4-5) may call this in production.
     pub fn set_cloud_location(
         &self,

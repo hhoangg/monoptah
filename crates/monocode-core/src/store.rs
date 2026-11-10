@@ -9,7 +9,7 @@ pub use location::{
     UNREADABLE_NOTICE, WORKSPACE_LOST,
 };
 mod cloud_rows;
-pub use cloud_rows::AppendOutcome;
+pub use cloud_rows::{AppendOutcome, RowAnchor};
 mod managed_sessions;
 mod monocode_import;
 mod monos;

@@ -1038,6 +1038,46 @@ fn push_for(root: &Path) -> Result<(), String> {
     git_checked(root, &["push", "-u", &remote, "HEAD"])
 }
 
+/// Pushes the commit `head` to `refs/heads/<branch>` on `remote` for "Continue in cloud"
+/// (design 4.2.2 step 2). Never a force push: the refspec has no `+` and no force flag is
+/// ever passed, so git refuses a non-fast-forward update. The caller must have chosen a branch
+/// that is not origin's default. `set_upstream` adds `-u`, and only takes effect when the
+/// checked out branch is `branch` itself and still at `head`: setting the upstream of a
+/// local branch to a differently named `-cloud` branch would change what its plain
+/// `git push` does.
+pub(crate) fn push_commit_to_branch(
+    root: &Path,
+    remote: &str,
+    head: &str,
+    branch: &str,
+    set_upstream: bool,
+) -> Result<(), String> {
+    let hex = |s: &str| matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit());
+    if !hex(head) {
+        return Err("Invalid commit to push".into());
+    }
+    if branch.is_empty()
+        || branch.starts_with(['-', '+', '/'])
+        || branch.contains([':', ' ', '\0', '\n'])
+        || git_checked(root, &["check-ref-format", &format!("refs/heads/{branch}")]).is_err()
+    {
+        return Err("Invalid branch name to push".into());
+    }
+    if remote.is_empty() || remote.starts_with('-') {
+        return Err("Invalid remote to push to".into());
+    }
+    let on_branch = set_upstream
+        && git_stdout(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]).as_deref()
+            == Some(branch)
+        && git_stdout(root, &["rev-parse", "--verify", "HEAD"]).as_deref() == Some(head);
+    let dst = format!("refs/heads/{branch}");
+    if on_branch {
+        git_checked(root, &["push", "-u", remote, &format!("HEAD:{dst}")])
+    } else {
+        git_checked(root, &["push", remote, &format!("{head}:{dst}")])
+    }
+}
+
 fn pr_status_for(root: &Path) -> Option<Pr> {
     let branch = git_branch(root)?;
     let repo = github_repo_for(root).ok()?;

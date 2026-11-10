@@ -448,6 +448,30 @@ fn default_branches(root: &Path) -> Defaults {
     Defaults { names, confirmed }
 }
 
+/// Whether pushing to `branch` might change origin's default branch. Fails closed when
+/// origin cannot be asked (see [`Defaults::may_be_default`]). The move refuses such a push.
+pub fn may_be_default_branch(cwd: &Path, branch: &str) -> Result<bool, String> {
+    let root = toplevel(cwd)?;
+    Ok(default_branches(&root).may_be_default(branch))
+}
+
+/// The tip of `refs/heads/<branch>` on origin, asked with a read-only `ls-remote`
+/// (10 s cap). `None` when the branch does not exist there. Used to see that a push already
+/// went through, so a retried push step does not push again.
+pub fn origin_branch_tip(cwd: &Path, branch: &str) -> Result<Option<String>, String> {
+    let root = toplevel(cwd)?;
+    let name = format!("refs/heads/{branch}");
+    match run_timed(&root, &["ls-remote", REMOTE, &name], LS_REMOTE_TIMEOUT) {
+        Ok(text) => Ok(text
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .find(|(_, name_found)| *name_found == name)
+            .map(|(sha, _)| sha.trim().to_owned())),
+        Err(Timed::TimedOut) => Err(format!("Asking {REMOTE} took longer than 10 seconds")),
+        Err(Timed::Failed(e)) => Err(format!("Could not ask {REMOTE}: {e}")),
+    }
+}
+
 // ---------------------------------------------------------------- step 2: snapshot
 
 /// Reads the working copy at `cwd` and writes the patch into `staging`. The real index,
