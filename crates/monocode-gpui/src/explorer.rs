@@ -4,7 +4,7 @@
 //! every file operation run off the UI thread.
 use crate::{
     file_icons::file_type_icon,
-    git_status::{GitChanged, ProjectGit},
+    git_status::{GitChanged, ProjectGit, ReloadDirs},
     input::{self, Input},
     popover::{Anchor, Menu, MenuAction, MenuEvent, MenuItem, menu_popover},
     project_search::{ProjectSearch, SearchEvent},
@@ -286,6 +286,9 @@ impl Explorer {
         let name_focus = name_input.read(cx).focus_handle(cx);
         let subscriptions = vec![
             cx.subscribe(&git, |this, _, _: &GitChanged, cx| this.git_changed(cx)),
+            cx.subscribe(&git, |this, _, event: &ReloadDirs, cx| {
+                this.reload_dirs(event, cx)
+            }),
             cx.observe(&git, |this, git, cx| {
                 // Git colours follow every status read.
                 if this.enabled {
@@ -365,6 +368,7 @@ impl Explorer {
             if !was {
                 self.refresh_loaded(cx);
             }
+            self.publish_watch_dirs(cx);
         }
         if let Some(search) = &self.search {
             search.update(cx, |search, cx| search.set_active(enabled, cx));
@@ -415,6 +419,68 @@ impl Explorer {
         if self.enabled {
             self.refresh_loaded(cx);
         }
+    }
+    /// The Host reported changes in some folders of the cloud workspace shown (or in all of
+    /// them, when it dropped events or cannot watch): list the ones that are loaded again.
+    fn reload_dirs(&mut self, event: &ReloadDirs, cx: &mut Context<Self>) {
+        if !self.enabled || !self.available() || event.root != self.cwd || self.is_offline(cx) {
+            return;
+        }
+        let Some(dirs) = &event.dirs else {
+            self.refresh_loaded(cx);
+            return;
+        };
+        for dir in dirs {
+            let shown = *dir == self.cwd
+                || (self.expanded.contains(dir) && self.dirs.contains_key(&parent_of(dir)));
+            if shown {
+                self.read_dir(dir.clone(), cx);
+            }
+        }
+    }
+    /// The open folders that are on screen and present in the listings: the root, and each
+    /// open folder whose parent is shown and lists it. A folder the loaded parent listing no
+    /// longer has is gone: it leaves `expanded` (and its listings) for good.
+    fn shown_dirs(&mut self) -> Vec<String> {
+        let gone: Vec<String> = self
+            .expanded
+            .iter()
+            .filter(|path| **path != self.cwd)
+            .filter(|path| match self.dirs.get(&parent_of(path)) {
+                Some(Ok(entries)) => !entries.iter().any(|e| e.is_dir && e.path == **path),
+                _ => false,
+            })
+            .cloned()
+            .collect();
+        for path in &gone {
+            self.expanded.remove(path);
+            self.forget(path);
+        }
+        let mut open: Vec<&String> = self.expanded.iter().collect();
+        open.sort_by_key(|path| path.matches('/').count());
+        let mut shown = HashSet::from([self.cwd.clone()]);
+        for path in open {
+            let listed = match self.dirs.get(&parent_of(path)) {
+                Some(Ok(entries)) => entries.iter().any(|e| e.is_dir && e.path == *path),
+                _ => false,
+            };
+            if listed && shown.contains(&parent_of(path)) {
+                shown.insert(path.clone());
+            }
+        }
+        shown.into_iter().collect()
+    }
+    /// Tells the Host which folders are open, so it watches those and no others.
+    fn publish_watch_dirs(&mut self, cx: &mut Context<Self>) {
+        if !self.enabled || !self.available() || !self.is_remote_root() {
+            return;
+        }
+        let dirs = self.shown_dirs();
+        self.git.update(cx, |git, cx| {
+            if git.root == self.cwd {
+                git.set_watch_dirs(dirs, cx)
+            }
+        });
     }
     fn git_changed(&mut self, cx: &mut Context<Self>) {
         if self.enabled {
@@ -616,6 +682,7 @@ impl Explorer {
         let old = self.lines.len();
         self.lines = lines;
         self.list.splice(0..old, self.lines.len());
+        self.publish_watch_dirs(cx);
         cx.notify();
     }
     fn push_children(&self, parent: &str, depth: usize, lines: &mut Vec<Line>, cx: &App) {
@@ -2464,5 +2531,65 @@ mod tests {
             "results container has no height: {results:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[gpui::test]
+    fn host_events_list_only_the_loaded_folders_named_and_the_open_ones_are_published(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, git) = explorer_window(cx);
+        let src = format!("{ROOT}/dir-src");
+        let lib = format!("{ROOT}/dir-lib");
+        window
+            .update(cx, |explorer, _, cx| {
+                git.update(cx, |git, cx| git.bind(ROOT.into(), false, cx));
+                explorer.cwd = ROOT.into();
+                explorer.enabled = true;
+                let build = format!("{ROOT}/dir-build");
+                explorer.expanded = HashSet::from([ROOT.into(), src.clone(), build.clone()]);
+                explorer.dirs.insert(
+                    ROOT.into(),
+                    Ok(listing(ROOT, &["dir-src", "dir-lib", "a.rs"])),
+                );
+                explorer
+                    .dirs
+                    .insert(src.clone(), Ok(listing(&src, &["b.rs"])));
+                explorer.rebuild(cx);
+                // The open folders that exist (and the root) are what the Host is asked to
+                // watch; `dir-build` is open but the listing no longer has it, so it is dropped
+                // for good.
+                git.update(cx, |git, _| {
+                    assert_eq!(
+                        git.watch_dirs_for_test(),
+                        vec![ROOT.to_owned(), src.clone()]
+                    );
+                });
+                assert!(!explorer.expanded.contains(&build));
+                // A named folder that is open is listed again; one that is not open is not;
+                // another root's event is ignored.
+                let event = |root: &str, dirs: Option<Vec<String>>| ReloadDirs {
+                    root: root.into(),
+                    dirs,
+                };
+                explorer.reload_dirs(&event(ROOT, Some(vec![lib.clone()])), cx);
+                assert!(explorer.reading.is_empty());
+                explorer.reload_dirs(&event("remote://other/x", Some(vec![src.clone()])), cx);
+                assert!(explorer.reading.is_empty());
+                explorer.reload_dirs(&event(ROOT, Some(vec![src.clone()])), cx);
+                assert_eq!(explorer.reading, HashSet::from([src.clone()]));
+                explorer.reading.clear();
+                // An overflow lists every loaded folder.
+                explorer.reload_dirs(&event(ROOT, None), cx);
+                assert_eq!(
+                    explorer.reading,
+                    HashSet::from([ROOT.to_owned(), src.clone()])
+                );
+                // A disconnected workspace is not listed.
+                explorer.reading.clear();
+                git.update(cx, |git, cx| git.bind(ROOT.into(), true, cx));
+                explorer.reload_dirs(&event(ROOT, None), cx);
+                assert!(explorer.reading.is_empty());
+            })
+            .unwrap();
     }
 }
