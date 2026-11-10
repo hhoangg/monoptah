@@ -238,7 +238,7 @@ fn open_project(
     };
     // Phase 2 of the Host upgrade, inside this user-initiated connect. Never fatal: a
     // deferral or a failure is a status line and the session goes on with the Host it has.
-    host.upgrade_host(&machine.id, request.auth, progress);
+    host.upgrade_host(&machine.id, request.auth, halt, progress);
     step(StepKind::Connect, StepStatus::Done);
     if aborted() {
         return Err(START_ABORTED.into());
@@ -443,9 +443,10 @@ pub trait Host: Send + Sync {
         &self,
         machine_id: &str,
         auth: Option<remote::host_upgrade::SandboxAuth<'_>>,
+        cancel: &AtomicBool,
         progress: &mut dyn FnMut(&str),
     ) -> remote::host_upgrade::Outcome {
-        let _ = (machine_id, auth, progress);
+        let _ = (machine_id, auth, cancel, progress);
         remote::host_upgrade::Outcome::Current
     }
     fn disconnect(&self, machine_id: &str) -> Result<(), String>;
@@ -494,9 +495,10 @@ impl Host for Arc<Connections> {
         &self,
         machine_id: &str,
         auth: Option<remote::host_upgrade::SandboxAuth<'_>>,
+        cancel: &AtomicBool,
         progress: &mut dyn FnMut(&str),
     ) -> remote::host_upgrade::Outcome {
-        self.upgrade_host_if_needed(machine_id, auth, progress)
+        self.upgrade_host_if_needed(machine_id, auth, cancel, progress)
     }
     fn disconnect(&self, machine_id: &str) -> Result<(), String> {
         Connections::disconnect(self, machine_id)

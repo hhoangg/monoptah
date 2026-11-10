@@ -42,22 +42,83 @@ EOF_PIN
   [ "$_b_pre" -eq 0 ] || [ "$_installed" != "$_pin" ]
 }
 
-# The two-phase cloud upgrade replaces an older or foreign Host and leaves a current one
-# alone (another connect may have upgraded it in the meantime). A launcher that cannot print
-# its version counts as foreign.
-if [ "$FORCE_UPGRADE" != 1 ] && [ "$EXISTED" = 1 ] && [ "${MONOCODE_HOST_UPGRADE_IF_OLDER:-0}" = 1 ]; then
-  INSTALLED=$("$ENTRY" --version 2>/dev/null || true)
-  ! is_older_or_foreign "$INSTALLED" "$VERSION" || FORCE_UPGRADE=1
+# The two-phase cloud upgrade (MONOCODE_HOST_UPGRADE_IF_OLDER=1) replaces an older or foreign
+# Host and leaves a current one alone (another connect may have upgraded it in the meantime).
+# A launcher that cannot print its version counts as foreign. The app drives it in steps
+# through MONOCODE_HOST_UPGRADE_PHASE so a turn is never cut off:
+#   stage    download and verify the package into a staging directory; the running Host and
+#            its launcher are not touched. Prints {"staged":true} or {"staged":false} (current).
+#   swap     the app has seen the Host idle and holds sends back: install the staged package
+#            and restart the Host. If the new Host does not start, the previous runtime and
+#            launcher are restored and started again (exit 75; exit 76 if even that failed).
+#   discard  drop the staged package.
+PHASE=${MONOCODE_HOST_UPGRADE_PHASE:-}
+STAGED_FILE="$BASE/staged-runtime"
+SWAP_ACTIVE=0
+TMP=
+
+# Puts the previous runtime and launcher back and starts the old Host. 0 when it answers.
+rollback_swap() {
+  set +e
+  [ -f "$BASE/runtime-path.prev" ] && [ -f "$BASE/bin/monocode-host.prev" ] || return 1
+  cp -p "$BASE/runtime-path.prev" "$BASE/runtime-path" || return 1
+  cp -p "$BASE/bin/monocode-host.prev" "$ENTRY" || return 1
+  "$ENTRY" service uninstall >/dev/null 2>&1
+  (
+    if command -v before_service_install >/dev/null 2>&1; then before_service_install || exit 1; fi
+    "$ENTRY" service install --port "$HOST_PORT" 2>/dev/null >/dev/null || exit 1
+  ) || return 1
+  _r=0
+  until "$ENTRY" connection-info >/dev/null 2>&1; do
+    _r=$((_r + 1))
+    [ "$_r" -lt 30 ] || return 1
+    sleep 1
+  done
+}
+on_exit() {
+  _code=$?
+  set +e
+  [ -z "$TMP" ] || rm -rf "$TMP"
+  if [ "$SWAP_ACTIVE" = 1 ] && [ "$_code" -ne 0 ]; then
+    SWAP_ACTIVE=0
+    if rollback_swap; then
+      echo 'Monoptah Host update failed; the previous Host was restored.' >&2
+      exit 75
+    fi
+    echo 'Monoptah Host update failed and the previous Host could not be restored.' >&2
+    exit 76
+  fi
+}
+
+if [ "$PHASE" = discard ]; then
+  if [ -f "$STAGED_FILE" ]; then
+    _staged=$(cat "$STAGED_FILE")
+    case "$_staged" in "$BASE"/runtime/staged-*) rm -rf "$_staged" ;; esac
+    rm -f "$STAGED_FILE"
+  fi
+  echo '{"staged":false}'
+  exit 0
 fi
+if [ "$FORCE_UPGRADE" != 1 ] && [ "$EXISTED" = 1 ] && [ "${MONOCODE_HOST_UPGRADE_IF_OLDER:-0}" = 1 ] && [ "$PHASE" != swap ]; then
+  INSTALLED=$("$ENTRY" --version 2>/dev/null || true)
+  if is_older_or_foreign "$INSTALLED" "$VERSION"; then
+    FORCE_UPGRADE=1
+  elif [ "$PHASE" = stage ]; then
+    echo '{"staged":false}'
+    exit 0
+  fi
+fi
+[ "$PHASE" != swap ] || FORCE_UPGRADE=1
 
 if [ ! -x "$ENTRY" ] || [ "$FORCE_UPGRADE" = 1 ]; then
+  mkdir -p "$BASE/runtime" "$BASE/bin"
+  TMP=$(mktemp -d "$BASE/runtime/.install.XXXXXXXX")
+  trap on_exit EXIT
+  trap 'exit 130' HUP INT TERM
+  if [ "$PHASE" != swap ]; then
   case "$(uname -s)" in Darwin) OS=darwin ;; Linux) OS=linux ;; *) echo 'Monoptah Host supports Linux and macOS.' >&2; exit 1 ;; esac
   case "$(uname -m)" in arm64|aarch64) ARCH=arm64 ;; x86_64|amd64) ARCH=x64 ;; *) echo 'Unsupported host architecture.' >&2; exit 1 ;; esac
   FILE="monocode-host-$OS-$ARCH.tar.gz"
-  mkdir -p "$BASE/runtime" "$BASE/bin"
-  TMP=$(mktemp -d "$BASE/runtime/.install.XXXXXXXX")
-  trap 'rm -rf "$TMP"' EXIT
-  trap 'exit 130' HUP INT TERM
   download() {
     if command -v curl >/dev/null 2>&1; then
       curl --proto '=https' --proto-redir '=https' -fLsS --connect-timeout 15 --max-time 180 "$1" -o "$2"
@@ -91,10 +152,35 @@ if [ ! -x "$ENTRY" ] || [ "$FORCE_UPGRADE" = 1 ]; then
   mkdir "$TMP/unpacked"
   tar -xzf "$TMP/$FILE" -C "$TMP/unpacked"
   [ "$("$TMP/unpacked/monocode-host" --version)" = "$VERSION" ] || { echo 'Monoptah Host version mismatch.' >&2; exit 1; }
-  DEST="$BASE/runtime/$VERSION-$OS-$ARCH-$(basename "$TMP")"
-  # Concurrent installations never replace a directory used by a running host.
-  mv "$TMP/unpacked" "$DEST"
-  [ "$("$DEST/monocode-host" --version)" = "$VERSION" ] || exit 1
+  fi
+  if [ "$PHASE" = stage ]; then
+    # Phase A: the verified package waits next to the running Host, which is not touched.
+    _old_staged=$(cat "$STAGED_FILE" 2>/dev/null || true)
+    case "$_old_staged" in "$BASE"/runtime/staged-*) rm -rf "$_old_staged" ;; esac
+    DEST="$BASE/runtime/staged-$VERSION-$OS-$ARCH-$(basename "$TMP")"
+    mv "$TMP/unpacked" "$DEST"
+    [ "$("$DEST/monocode-host" --version)" = "$VERSION" ] || exit 1
+    printf '%s\n' "$DEST" > "$STAGED_FILE"
+    echo '{"staged":true}'
+    exit 0
+  fi
+  if [ "$PHASE" = swap ]; then
+    DEST=$(cat "$STAGED_FILE" 2>/dev/null || true)
+    case "$DEST" in "$BASE"/runtime/staged-*) ;; *) echo 'No staged Monoptah Host package.' >&2; exit 3 ;; esac
+    [ "$("$DEST/monocode-host" --version 2>/dev/null)" = "$VERSION" ] || { echo 'The staged Monoptah Host package is not usable.' >&2; exit 3; }
+    rm -f "$STAGED_FILE"
+    # Keep what is running now, so a Host that fails to start can be put back.
+    if [ "$EXISTED" = 1 ] && [ -f "$BASE/runtime-path" ]; then
+      cp -p "$BASE/runtime-path" "$BASE/runtime-path.prev"
+      cp -p "$ENTRY" "$BASE/bin/monocode-host.prev"
+      SWAP_ACTIVE=1
+    fi
+  else
+    DEST="$BASE/runtime/$VERSION-$OS-$ARCH-$(basename "$TMP")"
+    # Concurrent installations never replace a directory used by a running host.
+    mv "$TMP/unpacked" "$DEST"
+    [ "$("$DEST/monocode-host" --version)" = "$VERSION" ] || exit 1
+  fi
   # Keep a real wrapper (rather than a symlink): it resolves the packaged Node
   # relative to the versioned executable, not this bin directory.
   printf '%s\n' "$DEST" > "$TMP/runtime-path"
@@ -157,4 +243,13 @@ fi
 "$ENTRY" service install --port "$HOST_PORT" >/dev/null
 [ -z "$TOKEN_HASH" ] || printf '%s\n' "$TOKEN_HASH" > "$TOKEN_MARKER"
 [ -z "$CLAUDE_PATH" ] || printf '%s\n' "$CLAUDE_PATH" > "$CLAUDE_MARKER"
+if [ "$PHASE" = swap ]; then
+  # The new Host answers, or the trap puts the previous one back.
+  _wait=0
+  until "$ENTRY" connection-info >/dev/null 2>&1; do
+    _wait=$((_wait + 1))
+    [ "$_wait" -lt 30 ] || { echo 'The updated Monoptah Host did not start.' >&2; exit 1; }
+    sleep 1
+  done
+fi
 "$ENTRY" connection-info

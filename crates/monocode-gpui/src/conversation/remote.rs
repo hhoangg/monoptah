@@ -368,7 +368,7 @@ impl Conversation {
         });
         if waiting {
             format!(
-                "Monoptah Host {} will be installed when the current turn ends. Then you can {action}.",
+                "Monoptah Host {} will be installed the next time this workspace connects. Then you can {action}.",
                 monocode_core::remote::host_upgrade::pinned_version()
             )
         } else {

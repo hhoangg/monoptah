@@ -491,6 +491,7 @@ impl Host for FakeHost {
         &self,
         machine_id: &str,
         auth: Option<crate::remote::host_upgrade::SandboxAuth<'_>>,
+        _: &AtomicBool,
         progress: &mut dyn FnMut(&str),
     ) -> crate::remote::host_upgrade::Outcome {
         self.log

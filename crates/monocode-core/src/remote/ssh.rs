@@ -751,15 +751,44 @@ pub fn sandbox_bootstrap_script(prelude: Option<&str>) -> String {
     sandbox_script_with(prelude, "")
 }
 
-/// Phase 2 of the cloud Host upgrade in a sandbox: the connect bootstrap, with the SAME
-/// prelude (the restarted Host needs the Claude credential in its environment), replacing
-/// the Host only when it is older or foreign.
-pub(crate) fn sandbox_upgrade_script(prelude: Option<&str>, port: u16) -> String {
-    sandbox_script_with(prelude, &upgrade_flags(port))
+/// One step of the cloud Host upgrade (see `remote_bootstrap.sh`): `Stage` downloads and
+/// verifies the package without touching the running Host, `Swap` installs it (and puts the
+/// previous Host back if the new one does not start), `Discard` drops a staged package.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UpgradePhase {
+    Stage,
+    Swap,
+    Discard,
+}
+impl UpgradePhase {
+    fn word(self) -> &'static str {
+        match self {
+            Self::Stage => "stage",
+            Self::Swap => "swap",
+            Self::Discard => "discard",
+        }
+    }
 }
 
-fn upgrade_flags(port: u16) -> String {
-    format!("MONOCODE_HOST_UPGRADE_IF_OLDER=1\nMONOCODE_HOST_PORT={port}\n")
+/// Printed on stderr by a `Swap` that failed but put the previous Host back.
+pub(crate) const RESTORED_MARKER: &str = "the previous Host was restored";
+
+/// A step of the cloud Host upgrade in a sandbox: the connect bootstrap, with the SAME prelude
+/// (a restarted Host needs the Claude credential in its environment), replacing the Host only
+/// when it is older or foreign.
+pub(crate) fn sandbox_upgrade_script(
+    prelude: Option<&str>,
+    port: u16,
+    phase: UpgradePhase,
+) -> String {
+    sandbox_script_with(prelude, &upgrade_flags(port, phase))
+}
+
+fn upgrade_flags(port: u16, phase: UpgradePhase) -> String {
+    format!(
+        "MONOCODE_HOST_UPGRADE_IF_OLDER=1\nMONOCODE_HOST_UPGRADE_PHASE={}\nMONOCODE_HOST_PORT={port}\n",
+        phase.word()
+    )
 }
 
 /// `extra` lines run right after the prelude, before the bootstrap.
@@ -798,11 +827,14 @@ pub fn codespace_bootstrap_script() -> String {
     )
 }
 
-/// Phase 2 of the cloud Host upgrade in a codespace: the connect bootstrap that replaces the
-/// Host only when it is older or foreign. Codespace secrets reach the login shell, so the
-/// restarted Host inherits the Claude token without a prelude.
-pub(crate) fn codespace_upgrade_script(port: u16) -> String {
-    format!("{}{}", upgrade_flags(port), codespace_bootstrap_script())
+/// A step of the cloud Host upgrade in a codespace. Codespace secrets reach the login shell,
+/// so the restarted Host inherits the Claude token without a prelude.
+pub(crate) fn codespace_upgrade_script(port: u16, phase: UpgradePhase) -> String {
+    format!(
+        "{}{}",
+        upgrade_flags(port, phase),
+        codespace_bootstrap_script()
+    )
 }
 
 pub fn upgrade_script(platform: HostPlatform, port: u16) -> String {
@@ -828,6 +860,12 @@ pub struct Tunnel {
     child: Child,
     pub port: u16,
     stderr: Arc<Mutex<String>>,
+    /// Distinguishes this tunnel from every other one ever started, even on a reused port.
+    id: u64,
+}
+static NEXT_TUNNEL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+fn next_tunnel_id() -> u64 {
+    NEXT_TUNNEL_ID.fetch_add(1, Ordering::Relaxed)
 }
 impl Drop for Tunnel {
     fn drop(&mut self) {
@@ -836,6 +874,23 @@ impl Drop for Tunnel {
     }
 }
 impl Tunnel {
+    /// A tunnel that forwards nothing itself: `port` is wherever a test serves the Host.
+    #[cfg(test)]
+    pub(super) fn for_test(port: u16) -> Self {
+        let child = Command::new("sleep")
+            .arg("600")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        Self {
+            child,
+            port,
+            stderr: Arc::default(),
+            id: next_tunnel_id(),
+        }
+    }
     fn alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
     }
@@ -903,6 +958,7 @@ impl Tunnel {
             child,
             port,
             stderr,
+            id: next_tunnel_id(),
         };
         // gh starts a stopped codespace before it can forward, and a sandbox
         // resumes on connect, which takes a while.
@@ -964,6 +1020,8 @@ struct Slot {
 
 pub struct TunnelLease {
     pub endpoint: String,
+    /// The tunnel this lease is on (see `Tunnel::id`).
+    pub tunnel_id: u64,
     slot: Arc<Mutex<Slot>>,
     generation: u64,
     /// The tunnel was started for this lease (not reused).
@@ -1002,16 +1060,17 @@ impl Tunnels {
     pub fn existing(&self, id: &str) -> Option<TunnelLease> {
         let slot = self.slots().get(id).cloned()?;
         let mut current = slot.lock().unwrap_or_else(PoisonError::into_inner);
-        let port = {
+        let (port, tunnel_id) = {
             let tunnel = current.tunnel.as_mut()?;
             if !tunnel.alive() {
                 current.tunnel = None;
                 return None;
             }
-            tunnel.port
+            (tunnel.port, tunnel.id)
         };
         Some(TunnelLease {
             endpoint: format!("http://127.0.0.1:{port}"),
+            tunnel_id,
             slot: slot.clone(),
             generation: current.generation,
             fresh: false,
@@ -1024,6 +1083,7 @@ impl Tunnels {
             if tunnel.alive() {
                 return Ok(TunnelLease {
                     endpoint: format!("http://127.0.0.1:{}", tunnel.port),
+                    tunnel_id: tunnel.id,
                     slot: slot.clone(),
                     generation: current.generation,
                     fresh: false,
@@ -1039,11 +1099,13 @@ impl Tunnels {
         match Tunnel::start(target, None, None) {
             Ok(tunnel) => {
                 let endpoint = format!("http://127.0.0.1:{}", tunnel.port);
+                let tunnel_id = tunnel.id;
                 current.failure = None;
                 current.generation = current.generation.wrapping_add(1);
                 current.tunnel = Some(tunnel);
                 Ok(TunnelLease {
                     endpoint,
+                    tunnel_id,
                     slot: slot.clone(),
                     generation: current.generation,
                     fresh: true,
@@ -1136,6 +1198,7 @@ mod tests {
         tunnels.slots().insert("host".into(), old.clone());
         let old_lease = TunnelLease {
             endpoint: String::new(),
+            tunnel_id: 0,
             slot: old,
             generation: 1,
             fresh: false,
@@ -1146,6 +1209,7 @@ mod tests {
         assert!(newer.lock().unwrap().failure.is_some());
         let stale_lease = TunnelLease {
             endpoint: String::new(),
+            tunnel_id: 0,
             slot: newer.clone(),
             generation: 1,
             fresh: false,
@@ -1750,7 +1814,7 @@ mod tests {
         let host = pkg.join("monocode-host");
         std::fs::write(
             &host,
-            "#!/bin/sh\necho \"$@\" >> \"$HOME/calls.log\"\ncase \"$1\" in --version) echo '1.1.0+monoptah' ;; connection-info) echo '{\"port\":3774}' ;; esac\nexit 0\n",
+            "#!/bin/sh\necho \"new $@\" >> \"$HOME/calls.log\"\ncase \"$1\" in --version) echo '1.1.0+monoptah' ;; connection-info) [ ! -f \"$HOME/fail-new\" ] || exit 1; echo '{\"port\":3774}' ;; service) [ \"$2\" != install ] || [ ! -f \"$HOME/fail-new\" ] || exit 1 ;; esac\nexit 0\n",
         )
         .unwrap();
         std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1799,15 +1863,7 @@ mod tests {
         }
         let home = tempfile::tempdir().unwrap();
         if let Some(version) = installed {
-            let bin = home.path().join(".monocode-host/bin");
-            std::fs::create_dir_all(&bin).unwrap();
-            let entry = bin.join("monocode-host");
-            std::fs::write(
-                &entry,
-                format!("#!/bin/sh\necho \"old $@\" >> \"$HOME/calls.log\"\ncase \"$1\" in --version) echo '{version}' ;; connection-info) echo '{{\"port\":3774}}' ;; esac\nexit 0\n"),
-            )
-            .unwrap();
-            std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0o755)).unwrap();
+            install_old_host(home.path(), version);
         }
         let mut child = Command::new("sh")
             .arg("-s")
@@ -1884,13 +1940,66 @@ mod tests {
         assert!(!ok);
         assert!(stderr.contains("pinned checksum mismatch"), "{stderr}");
     }
-    /// The cloud upgrade flags in front of the plain bootstrap (no Claude install, which would
+    /// An installed Host as the bootstrap leaves it: a versioned runtime that reports `version`,
+    /// `runtime-path` and the generic launcher. Every call it gets is logged as `old ...`.
+    #[cfg(unix)]
+    fn install_old_host(home: &std::path::Path, version: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let base = home.join(".monocode-host");
+        let runtime = base.join("runtime/old");
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::create_dir_all(base.join("bin")).unwrap();
+        let host = runtime.join("monocode-host");
+        std::fs::write(
+            &host,
+            format!("#!/bin/sh\necho \"old $@\" >> \"$HOME/calls.log\"\ncase \"$1\" in --version) echo '{version}' ;; connection-info) echo '{{\"port\":3774}}' ;; service) [ \"$2\" != install ] || [ ! -f \"$HOME/fail-old\" ] || exit 1 ;; esac\nexit 0\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            base.join("runtime-path"),
+            format!("{}\n", runtime.display()),
+        )
+        .unwrap();
+        let launcher = base.join("bin/monocode-host");
+        std::fs::write(
+            &launcher,
+            "#!/bin/sh\nset -eu\nBASE=$(CDPATH= cd -- \"$(dirname -- \"$0\")/..\" && pwd)\nRUNTIME=$(cat \"$BASE/runtime-path\")\nexec \"$RUNTIME/monocode-host\" \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    /// Runs a script in an existing HOME (no stub `curl`: the swap downloads nothing).
+    #[cfg(unix)]
+    fn run_in_home(home: &std::path::Path, script: &str) -> (Option<i32>, String, String) {
+        let mut child = Command::new("sh")
+            .arg("-s")
+            .env("HOME", home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+        )
+    }
+    /// The cloud upgrade step in front of the plain bootstrap (no Claude install, which would
     /// call the stub `curl`).
     #[cfg(unix)]
-    fn upgrade_only_script() -> String {
+    fn upgrade_step(phase: UpgradePhase) -> String {
         format!(
             "{}{}",
-            upgrade_flags(3774),
+            upgrade_flags(3774, phase),
             bootstrap_script(HostPlatform::Unix)
         )
     }
@@ -1899,8 +2008,15 @@ mod tests {
         std::fs::read_to_string(home.path().join("calls.log")).unwrap_or_default()
     }
     #[cfg(unix)]
+    fn runtime_path(home: &std::path::Path) -> String {
+        std::fs::read_to_string(home.join(".monocode-host/runtime-path"))
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+    #[cfg(unix)]
     #[test]
-    fn the_cloud_upgrade_replaces_an_older_or_foreign_host_and_leaves_a_current_one() {
+    fn staging_downloads_and_verifies_without_touching_the_running_host() {
         for installed in [
             "1.0.0+monoptah",
             "0.9.4",
@@ -1908,21 +2024,41 @@ mod tests {
             "1.1.0-rc.1+monoptah",
             "",
         ] {
-            let (ok, stderr, urls, home) =
-                run_bootstrap_on(true, None, false, Some(installed), upgrade_only_script());
+            let (ok, stderr, urls, home) = run_bootstrap_on(
+                true,
+                None,
+                false,
+                Some(installed),
+                upgrade_step(UpgradePhase::Stage),
+            );
             assert!(ok, "{installed}: {stderr}");
             assert_eq!(urls.len(), 2, "{installed}: {urls:?}");
+            let base = home.path().join(".monocode-host");
+            // The old runtime and launcher are exactly as they were, and the Host was not stopped.
+            assert!(
+                runtime_path(home.path()).ends_with("runtime/old"),
+                "{installed}"
+            );
+            assert!(!base.join("runtime-path.prev").exists());
             let calls = host_calls(&home);
-            assert!(calls.contains("service uninstall"), "{installed}: {calls}");
-            assert!(calls.contains("service install"), "{installed}: {calls}");
+            assert!(!calls.contains("service"), "{installed}: {calls}");
+            // A verified package waits in a staging directory.
+            let staged = std::fs::read_to_string(base.join("staged-runtime")).unwrap();
+            assert!(std::path::Path::new(staged.trim())
+                .join("monocode-host")
+                .is_file());
         }
         for installed in ["1.1.0+monoptah", "1.2.0+monoptah"] {
-            let (ok, stderr, urls, home) =
-                run_bootstrap_on(true, None, false, Some(installed), upgrade_only_script());
+            let (ok, stderr, urls, home) = run_bootstrap_on(
+                true,
+                None,
+                false,
+                Some(installed),
+                upgrade_step(UpgradePhase::Stage),
+            );
             assert!(ok, "{installed}: {stderr}");
             assert!(urls.is_empty(), "{installed}: {urls:?}");
-            let calls = host_calls(&home);
-            assert!(!calls.contains("service uninstall"), "{installed}: {calls}");
+            assert!(!home.path().join(".monocode-host/staged-runtime").exists());
         }
         // Without the flag an installed Host is never replaced: the plain connect rule.
         let (ok, _, urls, home) = run_bootstrap_on(
@@ -1938,8 +2074,7 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
-    fn a_failed_cloud_upgrade_keeps_the_old_host_running() {
-        // The checksum mismatch ends the script before the Host is stopped.
+    fn a_failed_stage_leaves_the_old_host_and_launcher_alone() {
         for (pin, publish, tamper, message) in [
             (false, None, false, "checksum mismatch"),
             (true, None, true, "package checksum mismatch"),
@@ -1955,40 +2090,147 @@ mod tests {
                 publish.as_deref(),
                 tamper,
                 Some("0.9.4"),
-                upgrade_only_script(),
+                upgrade_step(UpgradePhase::Stage),
             );
             assert!(!ok);
             assert!(stderr.contains(message), "{stderr}");
-            let calls = host_calls(&home);
-            assert!(!calls.contains("service uninstall"), "{calls}");
-            assert!(!calls.contains("service install"), "{calls}");
-            // The launcher is still the old one.
-            let launcher =
-                std::fs::read_to_string(home.path().join(".monocode-host/bin/monocode-host"))
-                    .unwrap();
-            assert!(launcher.contains("echo \"old"), "{launcher}");
+            assert!(!host_calls(&home).contains("service"));
+            assert!(runtime_path(home.path()).ends_with("runtime/old"));
+            assert!(!home.path().join(".monocode-host/staged-runtime").exists());
         }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn the_swap_installs_the_staged_package_and_keeps_the_previous_host_as_prev() {
+        let (ok, stderr, _, home) = run_bootstrap_on(
+            true,
+            None,
+            false,
+            Some("0.9.4"),
+            upgrade_step(UpgradePhase::Stage),
+        );
+        assert!(ok, "{stderr}");
+        let (code, stderr, stdout) = run_in_home(home.path(), &upgrade_step(UpgradePhase::Swap));
+        assert_eq!(code, Some(0), "{stderr}");
+        assert!(stdout.trim_end().ends_with("{\"port\":3774}"), "{stdout}");
+        let base = home.path().join(".monocode-host");
+        assert!(!runtime_path(home.path()).ends_with("runtime/old"));
+        assert!(std::fs::read_to_string(base.join("runtime-path.prev"))
+            .unwrap()
+            .trim()
+            .ends_with("runtime/old"));
+        assert!(base.join("bin/monocode-host.prev").is_file());
+        assert!(!base.join("staged-runtime").exists());
+        let calls = host_calls(&home);
+        assert!(calls.contains("new service install"), "{calls}");
+        // A swap with nothing staged is refused and changes nothing.
+        let (code, stderr, _) = run_in_home(home.path(), &upgrade_step(UpgradePhase::Swap));
+        assert_eq!(code, Some(3), "{stderr}");
+        assert!(stderr.contains("No staged"), "{stderr}");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_new_host_that_fails_to_start_is_rolled_back_to_the_old_one() {
+        let (ok, stderr, _, home) = run_bootstrap_on(
+            true,
+            None,
+            false,
+            Some("0.9.4"),
+            upgrade_step(UpgradePhase::Stage),
+        );
+        assert!(ok, "{stderr}");
+        // The new Host's `service install` fails.
+        std::fs::write(home.path().join("fail-new"), "").unwrap();
+        let (code, stderr, _) = run_in_home(home.path(), &upgrade_step(UpgradePhase::Swap));
+        assert_eq!(code, Some(75), "restored: {stderr}");
+        assert!(stderr.contains(RESTORED_MARKER), "{stderr}");
+        // The old runtime and launcher are back and the old Host was started again.
+        assert!(runtime_path(home.path()).ends_with("runtime/old"));
+        let calls = host_calls(&home);
+        assert!(calls.contains("old service install"), "{calls}");
+        let (code, _, out) = {
+            let launcher = home.path().join(".monocode-host/bin/monocode-host");
+            let output = Command::new(launcher)
+                .arg("connection-info")
+                .env("HOME", home.path())
+                .output()
+                .unwrap();
+            (
+                output.status.code(),
+                String::new(),
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+            )
+        };
+        assert_eq!(code, Some(0));
+        assert!(out.contains("3774"), "{out}");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_rollback_that_cannot_restart_the_old_host_exits_with_its_own_code() {
+        let (ok, stderr, _, home) = run_bootstrap_on(
+            true,
+            None,
+            false,
+            Some("0.9.4"),
+            upgrade_step(UpgradePhase::Stage),
+        );
+        assert!(ok, "{stderr}");
+        std::fs::write(home.path().join("fail-new"), "").unwrap();
+        // The old Host does not start again either.
+        std::fs::write(home.path().join("fail-old"), "").unwrap();
+        let (code, stderr, _) = run_in_home(home.path(), &upgrade_step(UpgradePhase::Swap));
+        assert_eq!(code, Some(76), "{stderr}");
+        assert!(!stderr.contains(RESTORED_MARKER), "{stderr}");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn discard_drops_a_staged_package() {
+        let (ok, stderr, _, home) = run_bootstrap_on(
+            true,
+            None,
+            false,
+            Some("0.9.4"),
+            upgrade_step(UpgradePhase::Stage),
+        );
+        assert!(ok, "{stderr}");
+        let base = home.path().join(".monocode-host");
+        let staged = std::fs::read_to_string(base.join("staged-runtime")).unwrap();
+        let (code, stderr, _) = run_in_home(home.path(), &upgrade_step(UpgradePhase::Discard));
+        assert_eq!(code, Some(0), "{stderr}");
+        assert!(!std::path::Path::new(staged.trim()).exists());
+        assert!(!base.join("staged-runtime").exists());
+        assert!(runtime_path(home.path()).ends_with("runtime/old"));
     }
     #[test]
     fn cloud_upgrade_scripts_carry_the_flags_and_the_same_prelude_as_connect() {
         let prelude = "unset ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN\nexport CLAUDE_CODE_OAUTH_TOKEN='sk-test'\n";
-        let sandbox = sandbox_upgrade_script(Some(prelude), 3790);
-        assert!(sandbox.starts_with(prelude), "{sandbox}");
-        let flags = "MONOCODE_HOST_UPGRADE_IF_OLDER=1\nMONOCODE_HOST_PORT=3790\n";
-        assert!(sandbox.contains(flags));
-        // Same body as the connect step, with the same detached start.
-        let connect = sandbox_bootstrap_script(Some(prelude));
-        assert!(
-            sandbox.replace(flags, "") == connect,
-            "only the flags differ"
-        );
-        assert!(sandbox.contains("ensure_detached_host"));
-        assert!(!sandbox_upgrade_script(None, 3774).contains("sk-test"));
-        let codespace = codespace_upgrade_script(3774);
-        assert!(
-            codespace.starts_with("MONOCODE_HOST_UPGRADE_IF_OLDER=1\nMONOCODE_HOST_PORT=3774\n")
-        );
-        assert!(codespace.ends_with(&codespace_bootstrap_script()));
+        for phase in [
+            UpgradePhase::Stage,
+            UpgradePhase::Swap,
+            UpgradePhase::Discard,
+        ] {
+            let sandbox = sandbox_upgrade_script(Some(prelude), 3790, phase);
+            assert!(sandbox.starts_with(prelude), "{sandbox}");
+            let flags = format!(
+                "MONOCODE_HOST_UPGRADE_IF_OLDER=1\nMONOCODE_HOST_UPGRADE_PHASE={}\nMONOCODE_HOST_PORT=3790\n",
+                phase.word()
+            );
+            assert!(sandbox.contains(&flags));
+            // Same body as the connect step, with the same detached start.
+            let connect = sandbox_bootstrap_script(Some(prelude));
+            assert!(
+                sandbox.replace(&flags, "") == connect,
+                "only the flags differ"
+            );
+            assert!(sandbox.contains("ensure_detached_host"));
+            assert!(!sandbox_upgrade_script(None, 3774, phase).contains("sk-test"));
+            let codespace = codespace_upgrade_script(3774, phase);
+            assert!(codespace.starts_with(&format!(
+                "MONOCODE_HOST_UPGRADE_IF_OLDER=1\nMONOCODE_HOST_UPGRADE_PHASE={}\nMONOCODE_HOST_PORT=3774\n",
+                phase.word()
+            )));
+            assert!(codespace.ends_with(&codespace_bootstrap_script()));
+        }
         // The user's explicit Upgrade is untouched: it forces the install.
         assert!(
             upgrade_script(HostPlatform::Unix, 3774).starts_with("MONOCODE_HOST_FORCE_UPGRADE=1\n")

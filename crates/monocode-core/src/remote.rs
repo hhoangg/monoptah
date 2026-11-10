@@ -2,6 +2,8 @@
 //! saved bearer credential. Workspace requests never fall back to local calls.
 pub mod attachments;
 mod cloud_upgrade;
+#[cfg(test)]
+mod cloud_upgrade_tests;
 pub mod host_info;
 pub mod host_release;
 pub mod host_upgrade;
@@ -10,6 +12,7 @@ mod ssh;
 pub mod ssh_askpass;
 pub mod uploads;
 
+pub use cloud_upgrade::HOST_UPDATING;
 pub(crate) use ssh::{
     sandbox_bootstrap_script, shell_quote, validate_sandbox as validate_sandbox_target,
     validate_sandbox_workspace,
@@ -34,6 +37,12 @@ pub struct Connections {
     wakes: Mutex<HashMap<String, WakeSlot>>,
     /// Flavor, version and capabilities of each machine's Host, from `environment.describe`.
     host_info: host_info::HostInfoCache,
+    /// Machines whose Host is being swapped: requests that could start a turn are refused.
+    upgrading: Mutex<std::collections::HashSet<String>>,
+    /// Machine id to the tunnel its last Host upgrade pass ran on (once per connect).
+    upgrade_passes: Mutex<HashMap<String, u64>>,
+    /// How the Host upgrade reaches a machine (replaced in tests).
+    runner: Mutex<Arc<dyn cloud_upgrade::CloudRunner>>,
 }
 
 type WakeSlot = Arc<(Mutex<Option<Result<(), String>>>, Condvar)>;
@@ -53,6 +62,9 @@ impl Connections {
             jobs: Mutex::new(HashMap::new()),
             wakes: Mutex::new(HashMap::new()),
             host_info: host_info::HostInfoCache::default(),
+            upgrading: Mutex::new(Default::default()),
+            upgrade_passes: Mutex::new(HashMap::new()),
+            runner: Mutex::new(Arc::new(cloud_upgrade::SshRunner)),
         }
     }
 
@@ -583,6 +595,15 @@ impl Connections {
         if !supported_remote_method(method) {
             return Err("Unsupported remote operation".into());
         }
+        if cloud_upgrade::starts_turn(method)
+            && self
+                .upgrading
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(machine_id)
+        {
+            return Err(cloud_upgrade::HOST_UPDATING.into());
+        }
         let machine = {
             let _guard = self
                 .store
@@ -1091,7 +1112,7 @@ impl Connections {
             woke?;
             // Phase 2 of the Host upgrade. This is a user-initiated connect (a send, a
             // retry), so it may run; a failure is a warning line, never an error.
-            self.upgrade_host_if_needed(machine_id, None, progress);
+            self.upgrade_host_if_needed(machine_id, None, cancel, progress);
             Ok(())
         })
     }
