@@ -23,7 +23,7 @@ const TOO_LARGE: &str = "File is too large to preview (maximum 32 MB).";
 const PROJECT_TTL: Duration = Duration::from_secs(5);
 
 /// What the chunked read needs from a connection, so tests can stand in a fake Host.
-pub(crate) trait Transport {
+pub trait Transport {
     /// The connection machine id of a remote environment.
     fn machine_for_environment(&self, environment: &str) -> Result<String, String>;
     fn request(&self, machine: &str, method: &str, params: Value) -> Result<Value, String>;
@@ -100,7 +100,7 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> Ttl<K, V> {
     }
 }
 
-pub(crate) struct Cache {
+pub struct Cache {
     projects: Ttl<String, Vec<Project>>,
     /// `None` caches a failed listing, so a read does not ask again for every project.
     worktrees: Ttl<(String, String), Option<Vec<Worktree>>>,

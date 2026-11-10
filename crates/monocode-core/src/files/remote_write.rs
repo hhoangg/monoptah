@@ -101,7 +101,7 @@ fn read_current(transport: &dyn Transport, cache: &Cache, path: &Path) -> Result
 }
 
 /// Saves `text` over the host file behind `path` and returns the bytes written.
-pub(crate) fn save_remote(
+pub fn save_remote(
     transport: &dyn Transport,
     cache: &Cache,
     path: &Path,
@@ -152,7 +152,7 @@ pub(crate) fn save_remote(
 
 /// Keep mine: saves over the version the user was shown (`shown` bytes, `None` when the
 /// file did not exist), never over a newer one.
-pub(crate) fn overwrite_remote(
+pub fn overwrite_remote(
     transport: &dyn Transport,
     cache: &Cache,
     path: &Path,

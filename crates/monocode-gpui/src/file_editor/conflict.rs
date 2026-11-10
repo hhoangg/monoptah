@@ -6,12 +6,14 @@
 //! cloud version's hash), Take cloud replaces the editor text, Cancel closes the dialog.
 use super::*;
 use crate::modal;
-use monocode_core::files::document::Document;
+use monocode_core::files::{document::Document, remote_write::sha256_hex};
 
 /// How the file looks on the cloud workspace now.
 pub(super) enum Cloud {
     Text(Box<TextDocument>),
-    /// The file is gone or cannot be shown as text; only Keep mine applies.
+    /// The file did not exist when the dialog opened; Keep mine creates it.
+    Missing,
+    /// The cloud version cannot be shown as text, so it cannot be knowingly replaced.
     Unavailable(String),
 }
 
@@ -25,13 +27,17 @@ pub(super) struct Conflict {
 
 type SaveFn =
     dyn Fn(&std::path::Path, &TextDocument, &str) -> Result<Vec<u8>, String> + Send + Sync;
+/// Keep mine: the cloud bytes the user was shown (`None`: the file did not exist).
+type OverwriteFn = dyn Fn(&std::path::Path, &TextDocument, &str, Option<&[u8]>) -> Result<Vec<u8>, String>
+    + Send
+    + Sync;
 type ReadFn = dyn Fn(&std::path::Path) -> Result<Document, String> + Send + Sync;
 
 /// What the editor does to the file. Tests stand in a fake Host here.
 #[derive(Clone)]
 pub(super) struct FileIo {
     pub(super) save: Arc<SaveFn>,
-    pub(super) overwrite: Arc<SaveFn>,
+    pub(super) overwrite: Arc<OverwriteFn>,
     pub(super) read: Arc<ReadFn>,
 }
 impl Default for FileIo {
@@ -70,8 +76,26 @@ impl FileEditor {
                     Ok(Document::Text(doc)) => Cloud::Text(Box::new(doc)),
                     Ok(Document::Unsupported(reason)) => Cloud::Unavailable(reason),
                     Ok(_) => Cloud::Unavailable("The cloud version is not text.".into()),
+                    Err(error) if monocode_core::files::remote_write::is_missing(&error) => {
+                        Cloud::Missing
+                    }
                     Err(error) => Cloud::Unavailable(error),
                 };
+                // The "conflict" is our own earlier save that did land (its reply was
+                // lost): adopt it as the baseline and save once more on top of it.
+                if let Cloud::Text(cloud) = &cloud
+                    && !this.own_retry
+                    && this.prior_attempt.as_deref() == Some(&sha256_hex(&cloud.disk))
+                {
+                    this.own_retry = true;
+                    if let Some(doc) = &mut this.document {
+                        doc.disk = cloud.disk.clone();
+                        doc.text = cloud.text.clone();
+                    }
+                    this.edited(cx);
+                    this.save(cx);
+                    return;
+                }
                 this.show_conflict(mine, cloud, cx);
             });
         })
@@ -80,6 +104,7 @@ impl FileEditor {
 
     pub(super) fn show_conflict(&mut self, mine: String, cloud: Cloud, cx: &mut Context<Self>) {
         self.autosave = None;
+        self.own_retry = false;
         self.conflict = Some(Conflict {
             mine,
             cloud,
@@ -93,6 +118,7 @@ impl FileEditor {
 
     pub(super) fn close_conflict(&mut self, cx: &mut Context<Self>) {
         if self.conflict.take().is_some() {
+            // Polls were skipped meanwhile; the next one catches up.
             self.sync_read_only(cx);
             self.schedule_autosave(cx);
             cx.notify();
@@ -117,15 +143,22 @@ impl FileEditor {
         let Some(doc) = self.document.clone() else {
             return;
         };
+        // Only the version the dialog shows may be replaced.
+        let shown: Option<Vec<u8>> = match &conflict.cloud {
+            Cloud::Text(cloud) => Some(cloud.disk.clone()),
+            Cloud::Missing => None,
+            Cloud::Unavailable(_) => return,
+        };
         conflict.working = true;
         let mine = conflict.mine.clone();
+        self.prior_attempt = self.last_attempt.replace(sha256_hex(&doc.encode(&mine)));
         let path = PathBuf::from(&self.path);
         let overwrite = self.io.overwrite.clone();
         self.saving = true;
         let text = mine.clone();
         let work = cx
             .background_executor()
-            .spawn(async move { overwrite(&path, &doc, &text) });
+            .spawn(async move { overwrite(&path, &doc, &text, shown.as_deref()) });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
@@ -157,6 +190,8 @@ impl FileEditor {
         };
         let text = doc.text.clone();
         self.error = None;
+        self.last_attempt = None;
+        self.prior_attempt = None;
         self.disk_changed = false;
         self.document = Some(*doc);
         self.input
@@ -178,8 +213,10 @@ impl FileEditor {
         let can_take = matches!(conflict.cloud, Cloud::Text(_)) && !conflict.working;
         let cloud_text = match &conflict.cloud {
             Cloud::Text(doc) => excerpt(&doc.text),
+            Cloud::Missing => "The file no longer exists on the cloud workspace.".to_owned(),
             Cloud::Unavailable(reason) => reason.clone(),
         };
+        let can_keep = !matches!(conflict.cloud, Cloud::Unavailable(_)) && !conflict.working;
         let column = |id: &'static str, label: &'static str, text: String| {
             div()
                 .id(id)
@@ -257,7 +294,7 @@ impl FileEditor {
                                 modal::disabled(
                                     modal::danger_button("conflict-keep-mine", "Keep mine")
                                         .debug_selector(|| "conflict-keep-mine".into()),
-                                    conflict.working,
+                                    !can_keep,
                                 )
                                 .on_click(cx.listener(|this, _, _, cx| this.keep_mine(cx))),
                             ),

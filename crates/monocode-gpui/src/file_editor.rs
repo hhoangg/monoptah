@@ -12,7 +12,10 @@ use gpui::{
     ImageFormat, ImageSource, KeyBinding, ObjectFit, PromptLevel, RenderImage, Role, SharedString,
     Subscription, Task, Window, actions, div, img, prelude::*, px, rgb,
 };
-use monocode_core::files::document::{self, Document, TextDocument};
+use monocode_core::files::{
+    document::{self, Document, TextDocument},
+    remote_write::sha256_hex,
+};
 use std::{
     path::PathBuf,
     sync::{
@@ -206,6 +209,16 @@ pub(crate) struct FileEditor {
     /// A remote save the Host refused because the file changed there; the dialog is open.
     conflict: Option<conflict::Conflict>,
     io: conflict::FileIo,
+    /// SHA-256 of the bytes of the last remote save that was sent and not confirmed: its
+    /// write may have landed (a timeout), which a later conflict must not mistake for
+    /// someone else's edit.
+    last_attempt: Option<String>,
+    /// The attempt before the one in flight: what a conflict is compared with.
+    prior_attempt: Option<String>,
+    /// The save that follows adopting our own earlier write is under way.
+    own_retry: bool,
+    /// A reload was asked for while the compare dialog was open; it is asked again after.
+    pending_reload: bool,
     disk_changed: bool,
     loading: bool,
     /// Progress of a remote read in bytes (done, total; total 0 until the first chunk), and
@@ -374,6 +387,10 @@ impl FileEditor {
             error: None,
             conflict: None,
             io: Default::default(),
+            last_attempt: None,
+            prior_attempt: None,
+            own_retry: false,
+            pending_reload: false,
             disk_changed: false,
             loading: false,
             read_progress: Arc::default(),
@@ -475,7 +492,8 @@ impl FileEditor {
         )
     }
     fn load(&mut self, force: bool, cx: &mut Context<Self>) {
-        if self.loading || self.saving {
+        // The dialog compares two versions: neither may change under it.
+        if self.loading || self.saving || self.conflict.is_some() {
             return;
         }
         self.loading = true;
@@ -948,14 +966,18 @@ impl FileEditor {
         }));
     }
     pub(crate) fn save(&mut self, cx: &mut Context<Self>) {
-        if self.saving
-            || self.conflict.is_some()
+        if self.saving {
+            return;
+        }
+        // A save that cannot start must not leave a pending close waiting for it.
+        if self.conflict.is_some()
             || self.input.read(cx).is_composing()
             || self
                 .document
                 .as_ref()
                 .is_none_or(|doc| doc.read_only.is_some())
         {
+            cx.emit(FileEvent::SaveFailed);
             return;
         }
         let source = self.input.read(cx).content.clone();
@@ -997,12 +1019,19 @@ impl FileEditor {
                     cx.emit(FileEvent::SaveFailed);
                     return None;
                 }
-                Some((
-                    PathBuf::from(&this.path),
-                    this.document.clone()?,
-                    this.input.read(cx).content.to_string(),
-                    this.io.save.clone(),
-                ))
+                let doc = this.document.clone()?;
+                let text = this.input.read(cx).content.to_string();
+                if this.is_remote_path() {
+                    if text == doc.text {
+                        // Nothing to save: no conditional write for an unchanged buffer.
+                        this.saving = false;
+                        cx.emit(FileEvent::Saved);
+                        cx.notify();
+                        return None;
+                    }
+                    this.prior_attempt = this.last_attempt.replace(sha256_hex(&doc.encode(&text)));
+                }
+                Some((PathBuf::from(&this.path), doc, text, this.io.save.clone()))
             }) else {
                 return;
             };
@@ -1027,6 +1056,9 @@ impl FileEditor {
         self.saving = false;
         match result {
             Ok(disk) => {
+                self.last_attempt = None;
+                self.prior_attempt = None;
+                self.own_retry = false;
                 if let Some(doc) = &mut self.document {
                     doc.disk = disk;
                     doc.text = saved;
@@ -1040,6 +1072,7 @@ impl FileEditor {
                 self.open_conflict(saved, cx);
             }
             Err(error) => {
+                self.own_retry = false;
                 self.error = Some(error);
                 cx.emit(FileEvent::SaveFailed);
             }
@@ -1056,11 +1089,21 @@ impl FileEditor {
         self.input
             .update(cx, |input, _| input.set_read_only(read_only));
     }
+    /// Opens the compare dialog without a Host (tests of the panes around the editor).
+    #[cfg(test)]
+    pub(crate) fn open_conflict_for_test(&mut self, cx: &mut Context<Self>) {
+        let mine = self.input.read(cx).content.to_string();
+        self.show_conflict(mine, conflict::Cloud::Missing, cx);
+    }
     /// A turn is running in this file's cloud workspace.
     fn agent_working(&self) -> bool {
         crate::git_gate::turn_running(&self.path)
     }
     fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.conflict.is_some() {
+            self.pending_reload = true;
+            return;
+        }
         if !self.dirty {
             self.load(true, cx);
             return;
@@ -1278,6 +1321,10 @@ impl gpui::Render for FileEditor {
         });
         let selection_menu = self.code_selection_menu(window, cx);
         let conflict_dialog = self.conflict_dialog(cx);
+        if self.pending_reload && self.conflict.is_none() {
+            self.pending_reload = false;
+            cx.defer_in(window, |this, window, cx| this.reload(window, cx));
+        }
         self.input.update(cx, |i, _| {
             i.set_editor_diff(self.show_diff, !self.git_staged)
         });

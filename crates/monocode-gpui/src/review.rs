@@ -2620,6 +2620,64 @@ mod tests {
             .unwrap();
     }
     #[gpui::test]
+    fn a_pending_close_is_cancelled_when_the_save_cannot_complete(cx: &mut gpui::TestAppContext) {
+        use gpui::EntityInputHandler;
+        let repo = Repo::new();
+        cx.update(|cx| cx.set_global(crate::settings::Preferences::default()));
+        let cwd = repo.cwd();
+        let path = repo.0.join("a.txt").to_string_lossy().into_owned();
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                let git = cx.new(|cx| ProjectGit::new(cwd.clone(), cx));
+                cx.new(|cx| {
+                    let mut pane = ReviewPane::new(git, Default::default(), cx);
+                    pane.open(
+                        ReviewTab::File {
+                            cwd: cwd.clone(),
+                            path: path.clone(),
+                        },
+                        cx,
+                    );
+                    pane.set_visible(true, cx);
+                    pane
+                })
+            })
+            .unwrap()
+        });
+        cx.run_until_parked();
+        let editor = window
+            .update(cx, |pane, w, cx| {
+                let editor = pane.active_editor().unwrap();
+                editor
+                    .read(cx)
+                    .input
+                    .clone()
+                    .update(cx, |i, cx| i.replace_text_in_range(None, "draft ", w, cx));
+                editor
+            })
+            .unwrap();
+        cx.run_until_parked();
+        // A cloud save was refused and the compare dialog is open on the dirty file.
+        window
+            .update(cx, |pane, _, cx| {
+                editor.update(cx, |e, cx| e.open_conflict_for_test(cx));
+                pane.close_tab(0, cx);
+                assert!(pane.pending_close.is_some());
+                // The close prompt's "Save" asks the editor to save; it cannot start.
+                editor.update(cx, |e, cx| e.save(cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |pane, _, cx| {
+                assert!(pane.pending_close.is_none(), "the close was cancelled");
+                assert!(!pane.close_prompted);
+                assert_eq!(pane.sources.len(), 1);
+                assert!(editor.read(cx).dirty);
+            })
+            .unwrap();
+    }
+    #[gpui::test]
     fn clicking_blame_in_a_file_tab_opens_the_commit_beside_it(cx: &mut gpui::TestAppContext) {
         let repo = Repo::new();
         cx.update(|cx| cx.set_global(crate::settings::Preferences::default()));
