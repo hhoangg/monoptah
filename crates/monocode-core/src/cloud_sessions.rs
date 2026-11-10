@@ -194,6 +194,9 @@ struct OpenRequest<'a> {
     /// The sandbox's Claude prelude, so the Host upgrade restarts the Host with the same
     /// credential the connect step gave it. `None` for a codespace.
     auth: Option<remote::host_upgrade::SandboxAuth<'a>>,
+    /// The Claude setup to run before the project is handed over, for a start that created
+    /// its workspace. `None` for everything else (an attach, a reconnect, the kit off).
+    setup: Option<claude_setup::SetupPlan>,
 }
 
 /// Step (c) of a start: connect (pair, or wake an already paired machine), open the project,
@@ -260,6 +263,28 @@ fn open_project(
     }
     if aborted() {
         return Err(START_ABORTED.into());
+    }
+    // One way, once, and only for a workspace this start created. It never fails the start:
+    // `run` turns every problem into a warning.
+    if let Some(plan) = &request.setup {
+        step(startup::StepKind::ClaudeSetup, startup::StepStatus::Running);
+        let env = claude_setup::Env {
+            host,
+            store,
+            halt,
+            now: crate::time::now_ms(),
+        };
+        let target = claude_setup::Target {
+            local_project: request.local_cwd,
+            cloud: request.cloud,
+            machine_id: &machine.id,
+            project_id: project.get("id").and_then(Value::as_str),
+        };
+        claude_setup::run(&env, &target, plan, progress);
+        step(startup::StepKind::ClaudeSetup, startup::StepStatus::Done);
+        if aborted() {
+            return Err(START_ABORTED.into());
+        }
     }
     let remembered = store
         .lock()
@@ -623,6 +648,8 @@ pub struct CloudSessions {
     follower_retry: Duration,
     /// Sandboxes with a user-initiated reconnect in flight, by name.
     reconnecting: Mutex<std::collections::HashSet<String>>,
+    /// Where the Claude setup step reads the user's kit preferences and local setup.
+    kit_seams: claude_setup::KitSeams,
 }
 
 impl CloudSessions {
@@ -645,7 +672,13 @@ impl CloudSessions {
             clock: Box::new(crate::time::now_ms),
             follower_retry: Duration::from_secs(2),
             reconnecting: Mutex::new(Default::default()),
+            kit_seams: claude_setup::KitSeams::system(),
         }
+    }
+    #[cfg(test)]
+    fn with_kit_seams(mut self, seams: claude_setup::KitSeams) -> Self {
+        self.kit_seams = seams;
+        self
     }
     #[cfg(test)]
     fn with_timing(
@@ -786,6 +819,7 @@ impl CloudSessions {
                 repo: &resolved.repo,
                 remote_cwd: &resolved.remote_cwd,
                 auth: None,
+                setup: None,
             },
             &AtomicBool::new(false),
             &mut |_, _| {},
@@ -1763,9 +1797,11 @@ impl StartupSummary {
 }
 
 pub mod backend;
+pub mod claude_setup;
 pub mod docker_config;
 pub mod docker_start;
 pub mod kit;
+pub mod kit_pack;
 pub mod kit_prefs;
 pub mod move_out;
 pub use backend::{CloudBackend, CloudBackendKind, CloudRef, CodespacesBackend};
@@ -1789,6 +1825,8 @@ mod convert_tests;
 mod docker_config_tests;
 #[cfg(test)]
 mod docker_start_tests;
+#[cfg(test)]
+mod kit_pack_tests;
 #[cfg(test)]
 mod kit_prefs_tests;
 #[cfg(test)]

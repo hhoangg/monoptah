@@ -129,6 +129,101 @@ struct Host {
     log: Mutex<Vec<String>>,
     connect_error: Mutex<Option<String>>,
     wait_for: Mutex<Option<Arc<AtomicBool>>>,
+    /// A scripted Host kit (`kit.*`, `uploads.*`); `None` answers like any other request.
+    kit: Mutex<Option<KitHost>>,
+}
+
+/// What the scripted Host does for the Claude setup, and what it saw.
+#[derive(Default)]
+struct KitHost {
+    capabilities: Vec<&'static str>,
+    present: Vec<&'static str>,
+    /// Methods that fail, with the error text.
+    errors: Vec<(&'static str, String)>,
+    /// The `warnings` of the `kit.apply` reply.
+    apply_warnings: Vec<String>,
+    /// The reply of `kit.health`.
+    health: Value,
+    uploads: std::collections::HashMap<String, Vec<u8>>,
+    applied: Vec<Vec<u8>>,
+    hash_matched: Vec<bool>,
+    secrets: Vec<Value>,
+    health_params: Vec<Value>,
+    methods: Vec<String>,
+}
+
+impl KitHost {
+    fn new() -> Self {
+        Self {
+            capabilities: vec!["claude.kit", "uploads"],
+            present: vec!["npx", "node", "python3"],
+            health: json!({"servers": [], "kitServers": true, "timedOut": false, "exitCode": 0}),
+            ..Default::default()
+        }
+    }
+
+    fn call(&mut self, method: &str, params: &Value) -> Option<Result<Value, String>> {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        if !(method.starts_with("kit.")
+            || method.starts_with("uploads.")
+            || method == "environment.describe")
+        {
+            return None;
+        }
+        self.methods.push(method.to_string());
+        if let Some((_, error)) = self.errors.iter().find(|(m, _)| *m == method) {
+            return Some(Err(error.clone()));
+        }
+        let id = || params["uploadId"].as_str().unwrap_or_default().to_string();
+        Some(Ok(match method {
+            "environment.describe" => {
+                json!({"host": {"flavor": "monoptah", "version": "1.1.0"}, "capabilities": self.capabilities})
+            }
+            "kit.probe" => json!({"present": self.present}),
+            "uploads.begin" => {
+                let id = format!("{:032x}", self.uploads.len() + 1);
+                self.uploads.insert(id.clone(), Vec::new());
+                json!({"uploadId": id, "offset": 0, "chunkSize": 524288})
+            }
+            "uploads.chunk" => {
+                let data = base64::engine::general_purpose::STANDARD
+                    .decode(params["data"].as_str().unwrap())
+                    .unwrap();
+                let bytes = self.uploads.get_mut(&id()).unwrap();
+                bytes.extend(data);
+                json!({"offset": bytes.len()})
+            }
+            "uploads.commit" => {
+                let bytes = &self.uploads[&id()];
+                let sha: String = Sha256::digest(bytes)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                json!({"path": "/tmp/kit.tar", "sha256": sha})
+            }
+            "uploads.discard" => json!({}),
+            "kit.apply" => {
+                let bytes = self.uploads[&id()].clone();
+                let sha: String = Sha256::digest(&bytes)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                self.hash_matched.push(params["hash"] == sha.as_str());
+                self.applied.push(bytes);
+                json!({"hash": params["hash"], "warnings": self.apply_warnings})
+            }
+            "kit.secrets" => {
+                self.secrets.push(params["values"].clone());
+                json!({"count": params["values"].as_object().map_or(0, |m| m.len())})
+            }
+            "kit.health" => {
+                self.health_params.push(params.clone());
+                self.health.clone()
+            }
+            _ => unreachable!(),
+        }))
+    }
 }
 fn machine(codespace: &str) -> Machine {
     Machine {
@@ -178,6 +273,11 @@ impl super::Host for Host {
             .lock()
             .unwrap()
             .push(format!("request {machine_id} {method}"));
+        if let Some(kit) = self.kit.lock().unwrap().as_mut() {
+            if let Some(reply) = kit.call(method, &params) {
+                return reply;
+            }
+        }
         Ok(json!({"id":"project-1","cwd":params["cwd"]}))
     }
     fn disconnect(&self, machine_id: &str) -> Result<(), String> {
@@ -245,9 +345,10 @@ fn status(record: &StartRecord, kind: StepKind) -> StepStatus {
 
 #[test]
 fn steps_have_a_fixed_order_labels_and_ids() {
-    assert_eq!(StepKind::ALL.len(), 8);
+    assert_eq!(StepKind::ALL.len(), 9);
     assert_eq!(StepKind::ALL[0], StepKind::Create);
-    assert_eq!(StepKind::ALL[7], StepKind::LifecycleCommands);
+    assert_eq!(StepKind::ALL[7], StepKind::ClaudeSetup);
+    assert_eq!(StepKind::ALL[8], StepKind::LifecycleCommands);
     let ids: Vec<_> = StepKind::ALL.iter().map(|k| k.id()).collect();
     assert_eq!(
         ids,
@@ -259,6 +360,7 @@ fn steps_have_a_fixed_order_labels_and_ids() {
             "configureCodespace",
             "connect",
             "openProject",
+            "claudeSetup",
             "lifecycleCommands"
         ]
     );
@@ -344,7 +446,7 @@ fn replay(record: &mut StartRecord, lines: &[&str]) {
 #[test]
 fn replaying_the_log_gives_real_durations_and_the_chip_step() {
     let mut record = fresh_record();
-    assert_eq!(record.steps.len(), 8);
+    assert_eq!(record.steps.len(), 9);
     // Up to "Running oryx": configuring is running and is what the chip shows.
     replay(&mut record, &LOG[..10]);
     let build = record.step(StepKind::BuildContainer);
@@ -605,7 +707,13 @@ fn run_start_tracks_the_codespace_follows_the_log_and_rebinds_the_session() {
         panic!("{events:?}");
     };
     for kind in StepKind::ALL {
-        assert_eq!(status(last, kind), StepStatus::Done, "{kind:?}");
+        // The kit is off by default (no preference published), so the step never ran.
+        let want = if kind == StepKind::ClaudeSetup {
+            StepStatus::Skipped
+        } else {
+            StepStatus::Done
+        };
+        assert_eq!(status(last, kind), want, "{kind:?}");
     }
     assert_eq!(
         f.host.log.lock().unwrap()[0],
@@ -1052,3 +1160,6 @@ fn a_start_record_without_a_codespace_names_no_workspace() {
     let record: StartRecord = serde_json::from_value(value).unwrap();
     assert_eq!(record.cloud(), None);
 }
+
+#[path = "claude_setup_tests.rs"]
+mod claude_setup;

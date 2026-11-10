@@ -1627,6 +1627,42 @@ fn a_named_start_error_is_not_decorated() {
 }
 
 #[test]
+fn kit_none_marks_the_pending_start_so_no_kit_is_sent() {
+    let gh = FakeGh::new(vec![
+        ("auth status", ok(AUTH_OK)),
+        ("codespace list", ok(LIST)),
+        (
+            "--method POST",
+            ok(r#"{"name":"octo-new1","state":"Provisioning"}"#),
+        ),
+    ]);
+    let fx = fixture(&gh);
+    let new = || start_target(CloudBackendKind::Codespaces, InstanceChoice::New);
+    // The default leaves the user's choice alone.
+    let CloudStart::Pending(session, record) =
+        fx.api.begin_start(&fx.path(), new(), "claude").unwrap()
+    else {
+        panic!("not pending");
+    };
+    assert!(!record.kit_off);
+    let stored = |id| {
+        let store = fx.store.lock().unwrap();
+        crate::cloud_sessions::start_record(&store, id).unwrap()
+    };
+    assert!(!stored(session.id).kit_off);
+    // `kit: "none"` turns it off for this start, in the answer and in the stored record.
+    let mut target = new();
+    target.kit = ApiKit::None;
+    let CloudStart::Pending(session, record) =
+        fx.api.begin_start(&fx.path(), target, "claude").unwrap()
+    else {
+        panic!("not pending");
+    };
+    assert!(record.kit_off);
+    assert!(stored(session.id).kit_off);
+}
+
+#[test]
 fn starting_a_codespace_session_resolves_every_instance_form() {
     let gh = FakeGh::new(vec![
         ("auth status", ok(AUTH_OK)),

@@ -783,6 +783,7 @@ impl CloudSessions {
         let at = self.now();
         let record = run.record;
         record.finish_step(StepKind::OpenProject, at);
+        record.skip_unrun_claude_setup(at);
         if record.step(StepKind::BlockingCommands).status == StepStatus::Pending {
             record.step_mut(StepKind::BlockingCommands).status = StepStatus::Skipped;
         }
@@ -1564,6 +1565,7 @@ impl CloudSessions {
         let backend = self.backend(CloudBackendKind::DockerSandbox)?;
         // The Host upgrade restarts the Host through the SAME prelude as the connect step.
         let prelude = auth.map(ClaudeAuth::prelude);
+        let setup = self.setup_plan(run.record);
         let request = OpenRequest {
             local_cwd: &run.record.local_project.clone(),
             cloud: &cloud,
@@ -1577,6 +1579,7 @@ impl CloudSessions {
                     prelude: prelude.as_str(),
                     secret: auth.secret(),
                 }),
+            setup,
         };
         let cell = std::cell::RefCell::new((&mut *run.record, &mut *run.events));
         let halt = AtomicBool::new(false);
@@ -1797,5 +1800,6 @@ fn fresh_sandbox_record(
         finished_at: None,
         track_ready: false,
         sandbox_start: Some(start),
+        kit_off: false,
     }
 }
