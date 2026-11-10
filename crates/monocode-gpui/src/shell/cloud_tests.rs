@@ -1676,7 +1676,8 @@ fn a_disconnected_workspace_keeps_its_cached_panels_read_only_and_connect_reload
             view.update(cx, |view, _| view.set_online_for_test(true));
             shell.sync_cloud_panel(cx);
             let git = shell.git.read(cx);
-            assert!(!git.offline() && git.reads > reads_before && !git.poll_is_off_for_test());
+            // Only the recovery's own read runs; the watch and the timers wait for it to land.
+            assert!(!git.offline() && git.reads > reads_before && git.poll_is_off_for_test());
             // Between the reconnect and the end of the first reload the old snapshot is not
             // live data: still dimmed, and still no writes.
             assert!(git.stale());
@@ -1695,6 +1696,10 @@ fn a_disconnected_workspace_keeps_its_cached_panels_read_only_and_connect_reload
         .update(cx, |shell, _, cx| {
             shell.sync_cloud_panel(cx);
             assert!(!shell.git.read(cx).stale());
+            assert!(
+                !shell.git.read(cx).poll_is_off_for_test(),
+                "polling resumes when the recovery ends"
+            );
             assert!(crate::git_gate::writes_allowed(&remote));
             let panel = shell.right_panel.clone().unwrap();
             let chrome = panel.read(cx).cloud_chrome().unwrap().clone();
