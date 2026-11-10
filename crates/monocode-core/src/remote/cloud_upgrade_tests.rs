@@ -502,6 +502,51 @@ fn a_failed_download_in_a_sandbox_keeps_the_old_host_and_shows_the_policy_hint()
 }
 
 #[test]
+fn a_later_successful_upgrade_clears_the_recorded_failure() {
+    let fx = setup_happy(vec!["idle"]);
+    *fx.runner.on_script.lock().unwrap() = Box::new(|_, _| {
+        Err("SSH setup failed: curl: (6) Could not resolve host: github.com".into())
+    });
+    let (outcome, _) = upgrade(&fx, None);
+    assert!(matches!(outcome, Outcome::Failed(_)), "{outcome:?}");
+    assert!(fx.connections.host_upgrade_failure(MACHINE).is_some());
+    // The next connect (a new tunnel) upgrades.
+    *fx.runner.on_script.lock().unwrap() = happy(&fx.host.state);
+    fx.connections
+        .tunnels
+        .insert(MACHINE.into(), Tunnel::for_test(fx.host.port));
+    let (outcome, _) = upgrade(&fx, None);
+    assert!(matches!(outcome, Outcome::Upgraded(_)), "{outcome:?}");
+    assert_eq!(fx.connections.host_upgrade_failure(MACHINE), None);
+}
+
+#[test]
+fn the_stored_failure_warning_never_carries_the_device_token() {
+    let fx = setup(
+        true,
+        "upstream",
+        "",
+        vec![],
+        Box::new(|_, _| Ok(String::new())),
+    );
+    let device = "t".repeat(43);
+    *fx.runner.on_script.lock().unwrap() = Box::new(move |_, _| {
+        Err(format!(
+            "SSH setup failed: curl: (6) Could not resolve host: github.com token {device}"
+        ))
+    });
+    let (outcome, _) = upgrade(&fx, None);
+    let Outcome::Failed(warning) = outcome else {
+        panic!("expected a warning");
+    };
+    let stored = fx.connections.host_upgrade_failure(MACHINE).unwrap();
+    for text in [&warning, &stored] {
+        assert!(!text.contains(&"t".repeat(43)), "{text}");
+    }
+    assert_eq!(warning, stored);
+}
+
+#[test]
 fn a_sandbox_upgrade_uses_the_connect_prelude_and_no_secret_reaches_what_is_shown() {
     let secret = "plainsecretvalue99";
     let token = "sk-ant-oat01-ABCDEFGHIJKLMN";

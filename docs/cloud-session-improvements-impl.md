@@ -961,8 +961,10 @@ same Phase 2 run. It does not depend on a Host release.
   2. A large file auto-opens after its streaming download completes (only above
      `CONFIRM_BYTES` = 500 MB, ask first).
   3. Capability missing:
-     - with `pending_host_upgrade`: show "opens after the current turn", queue the path,
-       and open it when a later connect finishes the upgrade;
+     - with `pending_host_upgrade`: show "opens after the Host update" (the Host is
+       installed the next time the workspace connects), queue the path (latest click per
+       session) and open it at the next connect that finishes the upgrade, not at the end of
+       the turn;
      - with an upgrade failure: show "Monoptah Host could not be updated: <host> blocked
        by the sandbox network policy" plus the `sbx policy allow` hint;
      - no Download button in any case.

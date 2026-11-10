@@ -501,25 +501,57 @@ fn a_blocked_host_update_shows_the_policy_hint_and_queues_nothing() {
 }
 
 #[test]
-fn the_open_queue_is_bounded_deduplicated_and_cleared_on_a_session_switch() {
+fn the_open_queue_keeps_the_latest_click_per_session_bounded_and_cleared_on_a_switch() {
     let mut queue = OpenQueue::default();
     queue.push(1, "a.png".into());
-    queue.push(1, "a.png".into());
-    assert_eq!(queue.len(), 1);
+    queue.push(1, "b.png".into());
+    assert_eq!(queue.len(), 1, "one entry per session");
     for n in 0..MAX_QUEUED_OPENS + 3 {
-        queue.push(1, format!("f{n}.png"));
+        queue.push(100 + n as i64, "f.png".into());
     }
     assert_eq!(queue.len(), MAX_QUEUED_OPENS);
+    assert!(!queue.has(1), "the oldest session went");
     queue.push(2, "other.png".into());
-    assert!(queue.has(1) && queue.has(2));
-    queue.keep_only(2);
-    assert!(!queue.has(1));
-    assert_eq!(queue.take(2), ["other.png"]);
+    assert!(queue.has(2));
+    queue.keep_only(Some(2));
+    assert!(!queue.has(100 + MAX_QUEUED_OPENS as i64));
+    assert_eq!(queue.take(2).as_deref(), Some("other.png"));
+    assert_eq!(queue.take(2), None);
+    queue.push(3, "x".into());
+    queue.keep_only(None);
     assert_eq!(queue.len(), 0);
 }
 
-/// The whole path in the shell: the click is queued while the Host is old, a later connect that
-/// finished the update opens the file by itself, and the host is never woken for it.
+fn mark(shell: &mut Shell, id: i64) {
+    // The background refresh forgets the fake mark (the store has no such codespace).
+    shell.cloud_marks.insert(
+        id,
+        CloudMark {
+            local_project: "/Users/me/widgets".into(),
+            codespace: "octo-abc".into(),
+            kind: CloudBackendKind::Codespaces,
+        },
+    );
+}
+
+/// A queued open that has to wait again stays quiet and a "not connected" answer is not shown.
+#[test]
+fn a_queued_read_that_is_not_connected_stays_quiet_and_waits() {
+    let (_dir, svc, host, id) = idle_workspace("queued-idle", false);
+    let never = AtomicBool::new(false);
+    match cloud_view::read_queued(&svc, id, "notes.md", &never) {
+        Outcome::HostUpdate { text, queue } => {
+            assert!(queue);
+            assert!(text.starts_with("Reconnect to view"), "{text}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(*host.ensured.lock().unwrap(), 0, "nothing was woken");
+}
+
+/// The whole path in the shell, through the render: the click is queued while the Host is old
+/// (its message card stays on screen), a connect that leaves the Host old changes nothing, and
+/// the connect that finishes the update opens the file by itself, without any wake.
 #[gpui::test]
 fn a_queued_open_runs_after_the_connect_that_finishes_the_update(cx: &mut TestAppContext) {
     let (window, _, _) = crate::shell::tests::window(cx);
@@ -530,59 +562,46 @@ fn a_queued_open_runs_after_the_connect_that_finishes_the_update(cx: &mut TestAp
         .update(cx, |shell, w, cx| {
             shell.cloud = Arc::new(svc);
             shell.workspace.active = Some(id);
-            shell.cloud_marks.insert(
-                id,
-                CloudMark {
-                    local_project: "/Users/me/widgets".into(),
-                    codespace: "octo-abc".into(),
-                    kind: CloudBackendKind::Codespaces,
-                },
-            );
+            mark(shell, id);
             assert!(shell.open_cloud_path("shot.png", w, cx));
         })
         .unwrap();
     cx.run_until_parked();
     window
-        .update(cx, |shell, w, cx| {
+        .update(cx, |shell, _, _| {
             let text = shell.cloud_view_text();
             assert!(text.contains("opens after the Host update"), "{text}");
             assert!(shell.queued_cloud_opens.has(id));
-            // The Host is still old at the next connect: nothing opens, nothing is shown.
-            shell.dismiss_cloud_view(cx);
-            shell.cloud_resumed(id, cx);
-            assert_eq!(shell.cloud_open_due, Some(id));
-            shell.flush_queued_cloud_opens(id, w, cx);
+            // The card is still on screen at the next connect (no dismiss); the Host is still old.
+            mark(shell, id);
         })
         .unwrap();
+    window
+        .update(cx, |shell, _, cx| shell.cloud_resumed(id, cx))
+        .unwrap();
+    cx.refresh().unwrap();
     cx.run_until_parked();
     window
         .update(cx, |shell, _, _| {
-            assert!(shell.cloud_view.is_none(), "a queued retry stays quiet");
+            assert!(
+                shell.cloud_view.is_none(),
+                "a queued retry replaces the card quietly"
+            );
             assert!(
                 shell.queued_cloud_opens.has(id),
                 "and waits for the next connect"
             );
+            assert_eq!(shell.cloud_open_due, None);
+            mark(shell, id);
         })
         .unwrap();
     // A later connect installed the new Host.
     host.legacy
         .store(false, std::sync::atomic::Ordering::SeqCst);
     window
-        .update(cx, |shell, w, cx| {
-            // The background refresh forgot the fake mark (the store has no such codespace).
-            shell.cloud_marks.insert(
-                id,
-                CloudMark {
-                    local_project: "/Users/me/widgets".into(),
-                    codespace: "octo-abc".into(),
-                    kind: CloudBackendKind::Codespaces,
-                },
-            );
-            shell.cloud_resumed(id, cx);
-            shell.flush_queued_cloud_opens(id, w, cx);
-            assert!(shell.cloud_view.is_some(), "the open is reading the file");
-        })
+        .update(cx, |shell, _, cx| shell.cloud_resumed(id, cx))
         .unwrap();
+    cx.refresh().unwrap();
     cx.run_until_parked();
     window
         .update(cx, |shell, _, _| {
@@ -598,14 +617,106 @@ fn a_queued_open_runs_after_the_connect_that_finishes_the_update(cx: &mut TestAp
     assert_eq!(*host.ensured.lock().unwrap(), 0, "nothing was woken");
 }
 
+/// A click on a PDF streams it to the cache and the shell hands it to the default app; a
+/// program is only revealed.
+#[gpui::test]
+fn the_shell_opens_a_streamed_pdf_by_itself_and_only_reveals_a_program(cx: &mut TestAppContext) {
+    let (window, _, _) = crate::shell::tests::window(cx);
+    let dir = Scratch::new("pdf-shell");
+    let host = FileHost::default();
+    host.files
+        .lock()
+        .unwrap()
+        .insert("out/report.pdf".into(), vec![7; 1024 * 1024]);
+    host.files
+        .lock()
+        .unwrap()
+        .insert("setup.pkg".into(), vec![1; 10]);
+    let (svc, _host, id) = service(host, dir.path());
+    cloud_view::OPENED.lock().unwrap().clear();
+    window
+        .update(cx, |shell, w, cx| {
+            shell.cloud = Arc::new(svc);
+            shell.workspace.active = Some(id);
+            mark(shell, id);
+            assert!(shell.open_cloud_path("out/report.pdf", w, cx));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    {
+        let opened = cloud_view::OPENED.lock().unwrap();
+        assert_eq!(opened.len(), 1, "{opened:?}");
+        assert!(
+            opened[0].ends_with("cloud-cache/out/report.pdf"),
+            "{opened:?}"
+        );
+        assert_eq!(std::fs::metadata(&opened[0]).unwrap().len(), 1024 * 1024);
+    }
+    window
+        .update(cx, |shell, w, cx| {
+            assert!(shell.cloud_view.is_none(), "no card is left behind");
+            mark(shell, id);
+            assert!(shell.open_cloud_path("setup.pkg", w, cx));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, _| assert!(shell.cloud_view_saved()))
+        .unwrap();
+    assert_eq!(
+        cloud_view::OPENED.lock().unwrap().len(),
+        1,
+        "the installer was not opened"
+    );
+}
+
+/// A queued stream that ends after the user switched away is dropped: nothing opens and the
+/// downloaded file is deleted.
+#[gpui::test]
+fn a_queued_open_is_dropped_when_the_session_is_left(cx: &mut TestAppContext) {
+    let (window, _, _) = crate::shell::tests::window(cx);
+    let dir = Scratch::new("queued-switch");
+    let host = FileHost::default();
+    host.files
+        .lock()
+        .unwrap()
+        .insert("report.pdf".into(), vec![7; 1024 * 1024]);
+    let (svc, _host, id) = service(host, dir.path());
+    let cache = svc
+        .resolve_cloud_file(id, "report.pdf")
+        .unwrap()
+        .cache_dir
+        .unwrap();
+    cloud_view::OPENED.lock().unwrap().clear();
+    window
+        .update(cx, |shell, w, cx| {
+            shell.cloud = Arc::new(svc);
+            shell.workspace.active = Some(id);
+            mark(shell, id);
+            shell.queued_cloud_opens.push(id, "report.pdf".into());
+            shell.flush_queued_cloud_opens(id, w, cx);
+            assert!(shell.cloud_view.is_some());
+            // The user goes to a Mono or terminal pane (not a cloud session) before it ends.
+            shell.leave_queued_cloud_opens(None, cx);
+            assert!(shell.cloud_view.is_none(), "the queued read was cancelled");
+            assert!(!shell.queued_cloud_opens.has(id));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(cloud_view::OPENED.lock().unwrap().is_empty());
+    assert!(!cache.join("report.pdf").exists());
+}
+
 #[gpui::test]
 fn switching_sessions_drops_the_queued_opens_of_the_other_one(cx: &mut TestAppContext) {
     let (window, a, _) = crate::shell::tests::window(cx);
     window
         .update(cx, |shell, w, cx| {
             shell.queued_cloud_opens.push(a + 1000, "x.png".into());
+            shell.cloud_open_due = Some(a + 1000);
             shell.activate_session(a, w, cx);
             assert!(!shell.queued_cloud_opens.has(a + 1000));
+            assert_eq!(shell.cloud_open_due, None);
         })
         .unwrap();
 }

@@ -130,38 +130,60 @@ pub(crate) fn name_for_message(name: &str) -> String {
     super::view_cache::sanitize_name(name)
 }
 
-/// Files a double click would run or install (apps, scripts, installers, shortcuts).
-/// They are only revealed, never opened with the default app.
-pub fn runs_code(name: &str) -> bool {
+/// Whether a downloaded file may be opened by itself with the default app: only known inert
+/// document and media types, judged by the LAST extension (`report.pdf.app` is an app),
+/// case-insensitively. Everything else (unknown or no extension, scripts, bundles, installers,
+/// disk images, location and shortcut files, macro-enabled office files, archives) is only
+/// revealed. This is the one barrier between a chat link and a launch.
+pub fn opens_with_default_app(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    let ext = lower.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+    let Some((stem, ext)) = lower.rsplit_once('.') else {
+        return false;
+    };
+    // A dotfile such as `.pdf` has no extension of its own.
+    if stem.is_empty() {
+        return false;
+    }
     matches!(
         ext,
-        "app"
-            | "command"
-            | "terminal"
-            | "webloc"
-            | "tool"
-            | "sh"
-            | "bash"
-            | "zsh"
-            | "pkg"
-            | "dmg"
-            | "exe"
-            | "msi"
-            | "bat"
-            | "cmd"
-            | "ps1"
-            | "jar"
-            | "scpt"
-            | "workflow"
-            | "action"
-            | "service"
-            | "desktop"
-            | "appimage"
-            | "run"
-            | "inetloc"
-            | "url"
+        "pdf"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "bmp"
+            | "tiff"
+            | "tif"
+            | "heic"
+            | "ico"
+            | "mp3"
+            | "wav"
+            | "m4a"
+            | "flac"
+            | "ogg"
+            | "mp4"
+            | "mov"
+            | "m4v"
+            | "webm"
+            | "mkv"
+            | "doc"
+            | "docx"
+            | "xls"
+            | "xlsx"
+            | "ppt"
+            | "pptx"
+            | "odt"
+            | "ods"
+            | "odp"
+            | "rtf"
+            | "csv"
+            | "tsv"
+            | "txt"
+            | "md"
+            | "markdown"
+            | "json"
+            | "log"
     )
 }
 
@@ -456,8 +478,10 @@ impl<'a> Fetcher<'a> {
             Ok(_) => Err(ViewError::Failed(
                 "The host sent an unexpected reply.".into(),
             )),
-            Err(error) if super::is_not_connected(&error) => Err(self.map_error(error)),
-            Err(_) => Err(self.host_update(name)),
+            // Only "this Host does not have the call" means the file needs the update; a missing
+            // file, a binary or a file over 1 MB keep their own message.
+            Err(error) if error.contains("Unsupported host method") => Err(self.host_update(name)),
+            Err(error) => Err(self.map_error(error)),
         }
     }
 

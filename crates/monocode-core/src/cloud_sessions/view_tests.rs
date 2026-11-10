@@ -25,6 +25,8 @@ struct FileHost {
     cwds: Mutex<Vec<Option<String>>>,
     disconnected: AtomicBool,
     legacy: bool,
+    /// `files.read` is unsupported too (a Host older than both calls).
+    no_read: bool,
     /// Every call answers like a machine the connection store no longer knows.
     gone: bool,
     describes: std::sync::atomic::AtomicUsize,
@@ -120,6 +122,7 @@ impl Host for FileHost {
                     "size": size,
                 }))
             }
+            "files.read" if self.no_read => Err("Unsupported host method".into()),
             "files.read" => {
                 if bytes.len() > 1024 * 1024 || bytes.contains(&0) {
                     return Err("File is too large to preview".into());
@@ -351,6 +354,39 @@ fn an_older_host_still_opens_small_text_but_not_binary_files() {
 }
 
 #[test]
+fn only_an_unsupported_call_is_a_host_update_other_old_host_errors_keep_their_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = FileHost {
+        legacy: true,
+        ..Default::default()
+    };
+    host.put("big.md", &vec![b'a'; 1024 * 1024 + 1]);
+    host.put("bin.txt", b"a\0b");
+    let (svc, _host, id) = setup(host, dir.path());
+    for (name, wanted) in [
+        ("missing.md", "ENOENT"),
+        ("big.md", "too large"),
+        ("bin.txt", "too large"),
+    ] {
+        match open(&svc, id, name).unwrap_err() {
+            ViewError::Failed(text) => assert!(text.contains(wanted), "{name}: {text}"),
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+    let host = FileHost {
+        legacy: true,
+        no_read: true,
+        ..Default::default()
+    };
+    host.put("a.md", b"x");
+    let (svc, _host, id) = setup(host, dir.path());
+    assert!(matches!(
+        open(&svc, id, "a.md").unwrap_err(),
+        ViewError::HostUpdate { .. }
+    ));
+}
+
+#[test]
 fn the_host_update_text_tells_a_deferred_update_and_a_blocked_one() {
     let pending = ViewError::HostUpdate {
         name: "a.pdf".into(),
@@ -416,20 +452,70 @@ fn remote_links_must_name_this_sessions_machine() {
 }
 
 #[test]
-fn only_files_that_cannot_run_are_opened_by_the_default_app() {
+fn only_known_inert_types_are_opened_by_the_default_app() {
+    for name in [
+        "a.pdf",
+        "A.PDF",
+        "shot.png",
+        "x.JPEG",
+        "clip.mp4",
+        "song.mp3",
+        "r.docx",
+        "t.xlsx",
+        "s.pptx",
+        "n.rtf",
+        "d.csv",
+        "n.txt",
+        "n.md",
+        "d.json",
+        "x.log",
+        "v1.2.final.pdf",
+    ] {
+        assert!(opens_with_default_app(name), "{name}");
+    }
     for name in [
         "x.app",
         "run.COMMAND",
         "a.sh",
         "i.pkg",
+        "i.mpkg",
         "d.dmg",
         "w.webloc",
         "t.terminal",
+        "l.fileloc",
+        "l.afploc",
+        "l.ftploc",
+        "l.inetloc",
+        "s.py",
+        "s.pyw",
+        "s.pl",
+        "s.rb",
+        "a.jnlp",
+        "a.jar",
+        "a.exe",
+        "a.bat",
+        "a.ps1",
+        "a.scpt",
+        "a.workflow",
+        "a.url",
+        "m.docm",
+        "m.xlsm",
+        "m.pptm",
+        "bundle.zip",
+        "bundle.tar.gz",
+        "image.iso",
+        "report.pdf.app",
+        "report.pdf.sh",
+        "REPORT.PDF.COMMAND",
+        "script",
+        "Makefile",
+        ".pdf",
+        ".hidden",
+        "trailingdot.",
+        "a.pdf ",
+        "",
     ] {
-        assert!(runs_code(name), "{name}");
-    }
-    for name in ["a.png", "r.html", "notes.md", "data.bin", "script"] {
-        assert!(!runs_code(name), "{name}");
+        assert!(!opens_with_default_app(name), "{name:?}");
     }
 }
 
