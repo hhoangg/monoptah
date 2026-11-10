@@ -1383,7 +1383,7 @@ fn files_and_git_show_the_cloud_workspace_by_default_and_the_local_switch_refuse
             let panel = shell.right_panel.clone().expect("panel");
             shell.sync_cloud_panel(cx);
             assert_eq!(panel.read(cx).cloud_banner(), None);
-            assert!(crate::git_gate::writes_allowed());
+            assert!(crate::git_gate::writes_allowed(LOCAL));
             shell.workspace.active = Some(id);
             shell.sync_cloud_panel(cx);
             let remote = shell.session_summaries[&id].cwd.clone();
@@ -1396,7 +1396,8 @@ fn files_and_git_show_the_cloud_workspace_by_default_and_the_local_switch_refuse
                 panel.read(cx).cloud_chrome().unwrap().mode,
                 PanelMode::Cloud
             );
-            assert!(crate::git_gate::writes_allowed());
+            assert!(crate::git_gate::writes_allowed(&remote));
+            assert!(!crate::git_gate::writes_allowed(LOCAL));
             assert_eq!(crate::git_gate::codespace().as_deref(), Some("octo-abc"));
             assert_eq!(shell.git.read(cx).project(), remote);
 
@@ -1408,13 +1409,15 @@ fn files_and_git_show_the_cloud_workspace_by_default_and_the_local_switch_refuse
                 Some("Local files - this session runs in the codespace octo-abc")
             );
             assert_eq!(panel.read(cx).cloud_chrome().unwrap().link, None);
-            assert!(!crate::git_gate::writes_allowed());
+            assert!(!crate::git_gate::writes_allowed(LOCAL));
             assert_eq!(shell.git.read(cx).project(), "/work/monocode");
 
-            // And back; the choice is remembered per session.
+            // And back; the choice is remembered per session. A view opened on a local cwd stays
+            // refused after the switch: the answer follows the path, not the visible panel.
             shell.set_panel_mode(PanelMode::Cloud, cx);
             shell.sync_cloud_panel(cx);
-            assert!(crate::git_gate::writes_allowed());
+            assert!(crate::git_gate::writes_allowed(&remote));
+            assert!(!crate::git_gate::writes_allowed(LOCAL));
             assert_eq!(shell.git.read(cx).project(), remote);
             assert_eq!(shell.panel_modes.get(&id), Some(&PanelMode::Cloud));
 
@@ -1422,10 +1425,12 @@ fn files_and_git_show_the_cloud_workspace_by_default_and_the_local_switch_refuse
             shell.workspace.active = None;
             shell.sync_cloud_panel(cx);
             assert_eq!(panel.read(cx).cloud_banner(), None);
-            assert!(crate::git_gate::writes_allowed());
+            assert!(crate::git_gate::writes_allowed(LOCAL));
         })
         .unwrap();
 }
+
+const LOCAL: &str = "/work/monocode";
 
 /// The panels (binding, the Local switch, the connection strip, the policy) only read cached
 /// state. A counting fake host and `gh` prove that no background path wakes a stopped workspace,
@@ -1535,7 +1540,51 @@ fn a_pending_workspace_shows_a_placeholder_instead_of_reading_the_workspace(
             assert_eq!(chrome.link, Some(Link::Starting));
             // Nothing is read from a workspace that does not exist yet.
             assert_eq!(shell.git.read(cx).project(), "/work/monocode");
-            assert!(!crate::git_gate::writes_allowed());
+            assert!(!crate::git_gate::writes_allowed(LOCAL));
+            assert!(!crate::git_gate::writes_allowed(
+                "remote://pending-octo-abc/workspaces/widgets"
+            ));
+        })
+        .unwrap();
+}
+
+/// Session ids can be reused: a deleted or archived session must not leave its Local choice
+/// behind for the next session with that id.
+#[gpui::test]
+fn a_deleted_or_archived_session_forgets_its_panel_mode(cx: &mut TestAppContext) {
+    use crate::panel_root::PanelMode;
+    let (window, id, _) = shell_with_cloud(cx);
+    window
+        .update(cx, |shell, window, cx| {
+            shell.workspace.active = Some(id);
+            shell.set_panel_mode(PanelMode::Local, cx);
+            assert_eq!(shell.panel_modes.get(&id), Some(&PanelMode::Local));
+            shell.apply_archived(id, true, window, cx);
+            assert!(!shell.panel_modes.contains_key(&id));
+            shell.panel_modes.insert(id, PanelMode::Local);
+            shell.forget_session(id, cx);
+            assert!(!shell.panel_modes.contains_key(&id));
+        })
+        .unwrap();
+}
+
+/// Connect is the session's Reconnect, so a cloud session without a live conversation (for
+/// example one that runs in a terminal) gets no Connect action instead of a dead button.
+#[gpui::test]
+fn the_connect_action_needs_a_live_conversation(cx: &mut TestAppContext) {
+    let (window, id, _) = shell_with_cloud(cx);
+    window
+        .update(cx, |shell, window, cx| {
+            shell.ensure_right_panel(window, cx);
+            let panel = shell.right_panel.clone().expect("panel");
+            shell.workspace.active = Some(id);
+            shell.sync_cloud_panel(cx);
+            let chrome = panel.read(cx).cloud_chrome().unwrap().clone();
+            assert_eq!(chrome.link, Some(crate::panel_root::Link::NotConnected));
+            assert!(!chrome.can_connect);
+            shell.ensure_session(id, cx).expect("conversation");
+            shell.sync_cloud_panel(cx);
+            assert!(panel.read(cx).cloud_chrome().unwrap().can_connect);
         })
         .unwrap();
 }
@@ -1546,25 +1595,39 @@ fn the_remote_policy_sees_a_turn_running_in_the_workspace_of_the_panels(cx: &mut
     let (window, id, _) = shell_with_cloud(cx);
     window
         .update(cx, |shell, _, cx| {
+            let remote = shell.session_summaries[&id].cwd.clone();
             shell.workspace.active = Some(id);
             shell.sync_cloud_panel(cx);
-            assert_eq!(decide(Op::Discard), Decision::Allow);
+            assert_eq!(decide(Op::Discard, &remote), Decision::Allow);
             // The session is working: discard is refused, commit asks first, push goes on.
             shell.remote_marks.insert(id, (true, false));
             shell.sync_cloud_panel(cx);
-            assert!(crate::git_gate::turn_running());
-            assert!(matches!(decide(Op::Discard), Decision::Refuse(_)));
-            assert!(matches!(decide(Op::Commit), Decision::Confirm { .. }));
-            assert_eq!(decide(Op::Push), Decision::Allow);
+            assert!(crate::git_gate::turn_running(&remote));
+            assert!(matches!(decide(Op::Discard, &remote), Decision::Refuse(_)));
+            assert!(matches!(
+                decide(Op::Commit, &remote),
+                Decision::Confirm { .. }
+            ));
+            assert!(matches!(
+                decide(Op::ChangeBranch, &remote),
+                Decision::Refuse(_)
+            ));
+            assert_eq!(decide(Op::Push, &remote), Decision::Allow);
+            // The Local switch shows another checkout: the remote policy does not apply to it,
+            // but a remote Review of the same workspace still gets it.
+            shell.set_panel_mode(crate::panel_root::PanelMode::Local, cx);
+            shell.sync_cloud_panel(cx);
+            assert_eq!(decide(Op::Discard, LOCAL), Decision::Allow);
+            assert!(matches!(decide(Op::Discard, &remote), Decision::Refuse(_)));
+            // A local session in view: the remote Review still sees the running turn.
+            shell.workspace.active = None;
+            shell.sync_cloud_panel(cx);
+            assert!(matches!(decide(Op::Discard, &remote), Decision::Refuse(_)));
+            assert!(crate::git_gate::writes_allowed(LOCAL));
             // The session is done again.
             shell.remote_marks.insert(id, (false, false));
             shell.sync_cloud_panel(cx);
-            assert_eq!(decide(Op::Discard), Decision::Allow);
-            // The Local switch shows another checkout: the remote policy does not apply to it.
-            shell.remote_marks.insert(id, (true, false));
-            shell.set_panel_mode(crate::panel_root::PanelMode::Local, cx);
-            shell.sync_cloud_panel(cx);
-            assert_eq!(decide(Op::Discard), Decision::Allow);
+            assert_eq!(decide(Op::Discard, &remote), Decision::Allow);
         })
         .unwrap();
 }

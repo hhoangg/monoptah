@@ -443,11 +443,11 @@ impl Changes {
         self.git.update(cx, |git, cx| git.changed(cx));
     }
     /// `window.alert`.
-    fn fail(error: String, window: &mut Window, cx: &mut App) {
+    pub(crate) fn fail(error: String, window: &mut Window, cx: &mut App) {
         drop(window.prompt(PromptLevel::Critical, &error, None, &["OK"], cx));
     }
     /// confirmNative: Tauri's `ask` with the OK label it was given.
-    fn confirm(
+    pub(crate) fn confirm(
         message: String,
         ok: &'static str,
         window: &mut Window,
@@ -468,8 +468,8 @@ impl Changes {
     }
     /// Whether a discard may start. A cloud workspace refuses while a turn runs there (the
     /// agent may be editing these files); the reason is shown as an alert.
-    fn discard_allowed(window: &mut Window, cx: &mut App) -> bool {
-        match crate::git_gate::decide(crate::git_gate::Op::Discard) {
+    fn discard_allowed(cwd: &str, window: &mut Window, cx: &mut App) -> bool {
+        match crate::git_gate::decide(crate::git_gate::Op::Discard, cwd) {
             crate::git_gate::Decision::Refuse(reason) => {
                 Self::fail(reason.into(), window, cx);
                 false
@@ -486,7 +486,7 @@ impl Changes {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.busy.is_some() || !crate::git_gate::writes_allowed() {
+        if self.busy.is_some() || !crate::git_gate::writes_allowed(&self.cwd) {
             return;
         }
         self.busy = Some(busy);
@@ -520,6 +520,10 @@ impl Changes {
         }
         let relative = file.relative.clone();
         let start = move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+            // The dialog may have been open for a while: a turn can have started meanwhile.
+            if action == FileAction::Discard && !Self::discard_allowed(&this.cwd, window, cx) {
+                return;
+            }
             this.run_git(
                 relative.clone(),
                 move |path| match action {
@@ -536,7 +540,7 @@ impl Changes {
             start(self, window, cx);
             return;
         }
-        if !Self::discard_allowed(window, cx) {
+        if !Self::discard_allowed(&self.cwd, window, cx) {
             return;
         }
         let name = basename(&file.relative).to_owned();
@@ -568,6 +572,10 @@ impl Changes {
             FileAction::Discard => "discard",
         };
         let start = move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+            // The dialog may have been open for a while: a turn can have started meanwhile.
+            if action == FileAction::Discard && !Self::discard_allowed(&this.cwd, window, cx) {
+                return;
+            }
             this.run_git(
                 key.into(),
                 move |path| match action {
@@ -584,7 +592,7 @@ impl Changes {
             start(self, window, cx);
             return;
         }
-        if !Self::discard_allowed(window, cx) {
+        if !Self::discard_allowed(&self.cwd, window, cx) {
             return;
         }
         let index = self.index(cx);
@@ -742,7 +750,7 @@ impl Changes {
     fn can_commit(&self, cx: &App) -> bool {
         let index = self.git.read(cx).index.as_ref();
         let staged = index.is_some_and(|i| i.files.iter().any(|f| f.staged));
-        crate::git_gate::writes_allowed()
+        crate::git_gate::writes_allowed(&self.cwd)
             && (staged || self.amend.is_some())
             && !self.message.read(cx).content.trim().is_empty()
             && self.busy.is_none()
@@ -777,7 +785,7 @@ impl Changes {
         }
         // On a cloud workspace the agent may be committing too: ask first.
         if let crate::git_gate::Decision::Confirm { message, ok } =
-            crate::git_gate::decide(crate::git_gate::Op::Commit)
+            crate::git_gate::decide(crate::git_gate::Op::Commit, &self.cwd)
         {
             questions.push((message.to_owned(), ok));
         }
@@ -837,7 +845,7 @@ impl Changes {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !crate::git_gate::writes_allowed() {
+        if !crate::git_gate::writes_allowed(&self.cwd) {
             return;
         }
         self.busy = Some("pr".into());
@@ -2059,7 +2067,12 @@ mod tests {
             .unwrap()
         });
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        set(Gate::remote_of("octo-abc", true));
+        window
+            .update(visual, |changes, _, _| {
+                changes.cwd = "remote://octo-abc/workspaces/widgets".into()
+            })
+            .unwrap();
+        set(Gate::running_in(&["octo-abc"]));
         window
             .update(visual, |changes, window, cx| {
                 changes.run_file(f("a.rs", "modified"), FileAction::Discard, window, cx);
@@ -2084,7 +2097,7 @@ mod tests {
             .update(visual, |changes, _, _| assert!(changes.busy.is_none()))
             .unwrap();
 
-        set(Gate::remote_of("octo-abc", false));
+        set(Gate::running_in(&[]));
         window
             .update(visual, |changes, window, cx| {
                 changes.run_file(f("a.rs", "modified"), FileAction::Discard, window, cx)
@@ -2093,6 +2106,44 @@ mod tests {
         let (message, _) = visual.pending_prompt().expect("the confirmation");
         assert!(message.starts_with("Discard changes in a.rs?"), "{message}");
         visual.simulate_prompt_answer("Cancel");
+        visual.run_until_parked();
+        window
+            .update(visual, |changes, _, _| assert!(changes.busy.is_none()))
+            .unwrap();
+        set(Gate::default());
+    }
+    /// A turn can start while the confirmation is open: the answer re-runs the policy.
+    #[gpui::test]
+    fn discard_is_checked_again_after_the_confirmation(cx: &mut gpui::TestAppContext) {
+        use crate::git_gate::{Gate, set};
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                let git = cx.new(|cx| ProjectGit::new("~".into(), cx));
+                cx.new(|cx| Changes::new(git, window, cx))
+            })
+            .unwrap()
+        });
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        window
+            .update(visual, |changes, _, _| {
+                changes.cwd = "remote://octo-abc/workspaces/widgets".into()
+            })
+            .unwrap();
+        set(Gate::running_in(&[]));
+        window
+            .update(visual, |changes, window, cx| {
+                changes.run_file(f("a.rs", "modified"), FileAction::Discard, window, cx);
+            })
+            .unwrap();
+        let (message, _) = visual.pending_prompt().expect("the confirmation");
+        assert!(message.starts_with("Discard changes in a.rs?"), "{message}");
+        // The agent starts working while the dialog is open.
+        set(Gate::running_in(&["octo-abc"]));
+        visual.simulate_prompt_answer("Discard");
+        visual.run_until_parked();
+        let (message, _) = visual.pending_prompt().expect("a refusal");
+        assert!(message.contains("agent is working"), "{message}");
+        visual.simulate_prompt_answer("OK");
         visual.run_until_parked();
         window
             .update(visual, |changes, _, _| assert!(changes.busy.is_none()))

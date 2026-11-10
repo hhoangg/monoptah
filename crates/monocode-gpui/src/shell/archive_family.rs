@@ -117,6 +117,10 @@ impl Shell {
         if let Some(summary) = self.session_summaries.get_mut(&id) {
             summary.archived = archived;
         }
+        if archived {
+            // Ids can be reused: a stale Local choice must not follow a later session.
+            self.panel_modes.remove(&id);
+        }
         if let Some(view) = self.sessions.get(&id) {
             view.update(cx, |session, cx| {
                 session.summary.archived = archived;

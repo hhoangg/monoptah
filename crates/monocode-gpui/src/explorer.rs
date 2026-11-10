@@ -205,6 +205,9 @@ pub(crate) struct Explorer {
     menu: Option<OpenMenu>,
     /// The panels show a codespace, so the menu offers "Open in browser".
     offers_browser: bool,
+    /// The cloud workspace of the session in view is still being created: the tree is bound to
+    /// nothing real, so create, rename, delete, paste and duplicate are refused.
+    read_only: bool,
     search: Option<Entity<ProjectSearch>>,
     search_events: Option<Subscription>,
     drag_over: Option<String>,
@@ -240,6 +243,8 @@ impl EventEmitter<OpenSearchMatch> for Explorer {}
 /// The user asked to open the workspace of the panels in the browser (VS Code for the web).
 pub(crate) struct OpenInBrowser;
 impl EventEmitter<OpenInBrowser> for Explorer {}
+const WORKSPACE_STARTING: &str =
+    "The cloud workspace is still starting. Files can be changed once it is ready.";
 
 /// The menu rows that act on this machine (Finder) or in the browser. A remote root has no
 /// local file to reveal: the row stays but is disabled, and a codespace gets "Open in browser".
@@ -314,6 +319,7 @@ impl Explorer {
             clip: None,
             menu: None,
             offers_browser: false,
+            read_only: false,
             search: None,
             search_events: None,
             drag_over: None,
@@ -667,6 +673,10 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            self.fail(WORKSPACE_STARTING.into(), cx);
+            return;
+        }
         let parent = self.create_parent(at.as_deref().or(self.selected.as_deref()));
         self.next_id += 1;
         self.expand(&[self.cwd.clone(), parent.clone()], cx);
@@ -682,6 +692,10 @@ impl Explorer {
         );
     }
     fn start_rename(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            self.fail(WORKSPACE_STARTING.into(), cx);
+            return;
+        }
         if path == self.cwd {
             return;
         }
@@ -881,6 +895,10 @@ impl Explorer {
         .detach();
     }
     fn delete(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            self.fail(WORKSPACE_STARTING.into(), cx);
+            return;
+        }
         if path == self.cwd {
             return;
         }
@@ -929,6 +947,10 @@ impl Explorer {
         .detach();
     }
     fn paste(&mut self, at: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            self.fail(WORKSPACE_STARTING.into(), cx);
+            return;
+        }
         let dest = self.create_parent(Some(&at));
         let Some(clip) = self.clip.clone() else {
             // clipboardFilePaths: files copied in Finder.
@@ -1016,6 +1038,10 @@ impl Explorer {
         );
     }
     fn duplicate(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            self.fail(WORKSPACE_STARTING.into(), cx);
+            return;
+        }
         if path == self.cwd {
             return;
         }
@@ -1032,6 +1058,16 @@ impl Explorer {
     /// The tree lists a workspace on another machine, so local-only actions do not apply.
     fn is_remote_root(&self) -> bool {
         files::remote::is_remote(Path::new(&self.cwd))
+    }
+    #[cfg(test)]
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+    pub(crate) fn set_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {
+        if self.read_only != read_only {
+            self.read_only = read_only;
+            cx.notify();
+        }
     }
     pub(crate) fn set_offers_browser(&mut self, offers: bool, cx: &mut Context<Self>) {
         if self.offers_browser != offers {
@@ -1872,14 +1908,14 @@ mod tests {
                     window,
                     cx,
                 );
-                // Reveal reaches no operation on a remote root.
+                // Reveal reaches no operation on a remote root. Without the guard it would spawn
+                // one that fails; that is checked after the executor ran.
                 explorer.run_action(
                     "reveal",
                     target("remote://env-octo-abc/workspaces/widgets/a.rs"),
                     window,
                     cx,
                 );
-                assert!(explorer.op_error.is_none());
                 // A local root never emits the browser request.
                 explorer.cwd = "/work/monocode".into();
                 assert!(!explorer.is_remote_root());
@@ -1888,6 +1924,38 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         assert_eq!(opened.get(), 1);
+        window
+            .update(cx, |explorer, _, _| assert_eq!(explorer.op_error, None))
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_pending_workspace_refuses_create_rename_delete_and_paste(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                let git = cx.new(|cx| ProjectGit::new("~".into(), cx));
+                cx.new(|cx| Explorer::new(git, window, cx))
+            })
+            .unwrap()
+        });
+        window
+            .update(cx, |explorer, window, cx| {
+                explorer.cwd = "/work/monocode".into();
+                explorer.set_read_only(true, cx);
+                let attempts: [&dyn Fn(&mut Explorer, &mut Window, &mut Context<Explorer>); 5] = [
+                    &|e, w, cx| e.start_create(false, None, w, cx),
+                    &|e, w, cx| e.start_rename("/work/monocode/a.rs".into(), w, cx),
+                    &|e, w, cx| e.delete("/work/monocode/a.rs".into(), w, cx),
+                    &|e, w, cx| e.paste("/work/monocode".into(), w, cx),
+                    &|e, w, cx| e.duplicate("/work/monocode/a.rs".into(), w, cx),
+                ];
+                for attempt in attempts {
+                    explorer.op_error = None;
+                    attempt(explorer, window, cx);
+                    assert_eq!(explorer.op_error.as_deref(), Some(WORKSPACE_STARTING));
+                }
+            })
+            .unwrap();
     }
 
     #[gpui::test]

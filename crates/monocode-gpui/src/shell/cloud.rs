@@ -1187,6 +1187,14 @@ impl Shell {
             })
     }
 
+    /// Whether the session in view has a live conversation for the Connect action to reconnect.
+    fn panel_can_connect(&self) -> bool {
+        self.workspace
+            .active
+            .map(|pane| self.workspace.session_for_pane(pane))
+            .is_some_and(|id| self.sessions.contains_key(&id))
+    }
+
     /// The Connect action of the connection strip. It is the Reconnect button of the session in
     /// view, a user action: the only way the panels ever wake a workspace.
     pub(super) fn connect_panel_workspace(&self, cx: &mut Context<Self>) {
@@ -1201,14 +1209,34 @@ impl Shell {
         }
     }
 
-    /// Whether any session in the workspace of the panels has a turn running. The app-side half
-    /// of the "not while the agent works" rule, see `git_gate::turn_running`.
-    fn workspace_turn_running(&self, cloud: &CloudRef, cx: &App) -> bool {
-        self.cloud_marks.iter().any(|(id, mark)| {
-            mark.cloud() == *cloud
-                && self.session_summaries.contains_key(id)
-                && self.session_metadata(*id, cx).busy
-        })
+    /// The Host environments where a cloud session has a turn running. The app-side half of the
+    /// "not while the agent works" rule, see `git_gate::turn_running`. Every cloud session counts,
+    /// not just the one in view: a Review of another workspace asks the same gate.
+    fn running_environments(&self, cx: &App) -> Vec<String> {
+        let mut envs = Vec::new();
+        for id in self.cloud_marks.keys() {
+            if !self.session_summaries.contains_key(id) || !self.session_metadata(*id, cx).busy {
+                continue;
+            }
+            let cwds = self
+                .session_summaries
+                .get(id)
+                .map(|s| s.cwd.as_str())
+                .into_iter()
+                .chain(
+                    self.sessions
+                        .get(id)
+                        .and_then(|v| v.read(cx).settings.worktree_cwd.as_deref()),
+                );
+            for cwd in cwds {
+                if let Some(path) = monocode_core::remote::parse_remote_path(cwd)
+                    && !envs.contains(&path.environment_id)
+                {
+                    envs.push(path.environment_id);
+                }
+            }
+        }
+        envs
     }
 
     /// Opens the codespace of the panels in the browser (VS Code for the web). The URL is read
@@ -1247,10 +1275,9 @@ impl Shell {
             let project = root.project().to_owned();
             self.git.update(cx, |git, cx| git.set_project(project, cx));
         }
-        let running = root
-            .cloud()
-            .is_some_and(|cloud| self.workspace_turn_running(cloud, cx));
-        let chrome = crate::panel_root::Chrome::of(&root, self.panel_link(cx));
+        let running = self.running_environments(cx);
+        let chrome =
+            crate::panel_root::Chrome::of(&root, self.panel_link(cx), self.panel_can_connect());
         self.sync_codespace_pane(cx);
         let flipped = crate::git_gate::set(crate::git_gate::Gate::of(&root, running));
         if let Some(panel) = &self.right_panel {

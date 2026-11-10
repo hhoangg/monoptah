@@ -113,6 +113,73 @@ mod tests {
         }
         assert!(crate::git_cache::get(cwd).is_some());
     }
+
+    /// Checkout and create-branch change the agent's directory: refused while a turn runs in the
+    /// workspace, confirmed when idle. A local checkout is not asked.
+    #[gpui::test]
+    fn changing_branch_in_a_cloud_workspace_follows_the_remote_policy(cx: &mut TestAppContext) {
+        use crate::git_gate::{Gate, set};
+        let cwd = "remote://env-octo-abc/workspaces/widgets";
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|cx| {
+                    let mut picker = GitPicker::bare(Mode::Branch, None, cx);
+                    picker.cwd = cwd.into();
+                    picker.state = Some(Snapshot::default());
+                    picker
+                })
+            })
+            .unwrap()
+        });
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        let create = |visual: &mut gpui::VisualTestContext| {
+            window
+                .update(visual, |picker, window, cx| {
+                    picker.change_or_ask(Choice::Create("topic".into()), window, cx);
+                })
+                .unwrap();
+            visual.run_until_parked();
+        };
+        set(Gate::running_in(&["env-octo-abc"]));
+        create(visual);
+        assert!(!visual.has_pending_prompt());
+        window
+            .update(visual, |picker, _, _| {
+                assert!(
+                    picker
+                        .error
+                        .as_deref()
+                        .unwrap()
+                        .contains("agent is working")
+                );
+                assert!(!picker.busy);
+            })
+            .unwrap();
+        set(Gate::running_in(&[]));
+        create(visual);
+        let (message, _) = visual.pending_prompt().expect("the confirmation");
+        assert!(
+            message.contains("changes the working directory"),
+            "{message}"
+        );
+        // A turn starts while the dialog is open: the answer is refused.
+        set(Gate::running_in(&["env-octo-abc"]));
+        visual.simulate_prompt_answer("Continue");
+        visual.run_until_parked();
+        window
+            .update(visual, |picker, _, _| {
+                assert!(
+                    picker
+                        .error
+                        .as_deref()
+                        .unwrap()
+                        .contains("agent is working")
+                );
+                assert!(!picker.busy);
+            })
+            .unwrap();
+        set(Gate::default());
+    }
 }
 pub(crate) enum Picked {
     Changed,
@@ -349,7 +416,7 @@ impl GitPicker {
             .min(self.choices(cx).len().saturating_sub(1));
         cx.notify();
     }
-    fn pick(&mut self, ix: usize, cx: &mut Context<Self>) {
+    fn pick(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
@@ -378,24 +445,31 @@ impl GitPicker {
             {
                 cx.emit(Picked::Dismissed)
             }
-            choice => {
+            choice => self.change_or_ask(choice, window, cx),
+        }
+        cx.notify();
+    }
+    /// Checks out a branch or creates one, under the remote git policy. Both change the
+    /// directory the agent works in: on a cloud workspace that is refused while any session there
+    /// runs, and confirmed when idle.
+    fn change_or_ask(&mut self, choice: Choice, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::git_gate::{Decision, Op, decide};
+        let cwd = self.cwd.to_string_lossy().into_owned();
+        match decide(Op::ChangeBranch, &cwd) {
+            Decision::Allow => self.change(choice, cx),
+            Decision::Refuse(reason) => self.error = Some(reason.into()),
+            Decision::Confirm { message, ok } => {
+                let ask = crate::changes::Changes::confirm(message.into(), ok, window, cx);
                 self.busy = true;
-                self.error = None;
-                let cwd = self.cwd.clone();
-                let work = cx.background_executor().spawn(async move {
-                    match choice {
-                        Choice::Branch(branch) => git::checkout(&cwd, &branch),
-                        Choice::Create(name) => git::create_branch(&cwd, &name),
-                        _ => unreachable!(),
-                    }
-                });
                 cx.spawn(async move |this, cx| {
-                    let result = work.await;
+                    let confirmed = ask.await;
                     let _ = this.update(cx, |this, cx| {
                         this.busy = false;
-                        match result {
-                            Ok(()) => cx.emit(Picked::Changed),
-                            Err(error) => this.error = Some(error),
+                        // The dialog may have been open for a while: ask again.
+                        match decide(Op::ChangeBranch, &cwd) {
+                            _ if !confirmed => {}
+                            Decision::Refuse(reason) => this.error = Some(reason.into()),
+                            _ => this.change(choice, cx),
                         }
                         cx.notify();
                     });
@@ -403,6 +477,34 @@ impl GitPicker {
                 .detach();
             }
         }
+        cx.notify();
+    }
+}
+impl GitPicker {
+    /// Checks out the branch or creates it, then tells the owner.
+    fn change(&mut self, choice: Choice, cx: &mut Context<Self>) {
+        self.busy = true;
+        self.error = None;
+        let cwd = self.cwd.clone();
+        let work = cx.background_executor().spawn(async move {
+            match choice {
+                Choice::Branch(branch) => git::checkout(&cwd, &branch),
+                Choice::Create(name) => git::create_branch(&cwd, &name),
+                _ => unreachable!(),
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |this, cx| {
+                this.busy = false;
+                match result {
+                    Ok(()) => cx.emit(Picked::Changed),
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
         cx.notify();
     }
 }
@@ -521,7 +623,7 @@ impl gpui::Render for GitPicker {
                             cx.notify();
                         }
                     }))
-                    .on_click(cx.listener(move |this, _, _, cx| this.pick(ix, cx)))
+                    .on_click(cx.listener(move |this, _, window, cx| this.pick(ix, window, cx)))
                     .into_any_element()
             })
             .collect();
@@ -569,8 +671,8 @@ impl gpui::Render for GitPicker {
                 this.step(1, cx);
                 cx.stop_propagation();
             }))
-            .capture_action(cx.listener(|this, _: &input::Submit, _, cx| {
-                this.pick(this.active, cx);
+            .capture_action(cx.listener(|this, _: &input::Submit, window, cx| {
+                this.pick(this.active, window, cx);
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(|_, _: &popover::Cancel, _, cx| {

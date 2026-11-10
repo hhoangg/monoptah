@@ -6,50 +6,48 @@
 //! confirmed user actions under [`policy`]. When the user switches the panels to Local, they show
 //! the local checkout, which is not the session's: the Changes panel, the review view and the file
 //! editor's diff all ask here and refuse to stage, discard or commit there.
-//! The shell sets it from the active session on the UI thread, where every caller also runs.
+//! Every question carries the cwd the caller works on, so the answer follows the path, not the
+//! panel in view. The shell sets the state each frame on the UI thread, where every caller runs.
 use crate::panel_root::PanelRoot;
+use monocode_core::{remote::parse_remote_path, store::is_pending_cloud_environment};
 use std::cell::RefCell;
 
-/// What the shell knows about the panels, as far as git writes care.
+/// What the shell knows about the sessions, as far as git writes care.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Gate {
     /// Cache key of the cloud session's workspace in view; `None` for a local session.
     cloud: Option<String>,
-    /// Writes are refused: the panels show the local checkout, or no workspace yet.
-    refuses: bool,
-    /// The panels show the cloud workspace, so writes go to the remote under [`policy`].
-    remote: bool,
-    /// A turn is running in the workspace (see [`turn_running`]).
-    running: bool,
+    /// A cloud session is in view, so writes to a local checkout are refused: those files are
+    /// not the session's, whichever side the panels show right now.
+    local_refused: bool,
+    /// Host environments where some session has a turn running (see [`turn_running`]).
+    running: Vec<String>,
 }
 
 impl Gate {
-    pub(crate) fn of(root: &PanelRoot, running: bool) -> Self {
+    pub(crate) fn of(root: &PanelRoot, running: Vec<String>) -> Self {
         Self {
             cloud: root
                 .cloud()
                 .map(monocode_core::cloud_sessions::CloudRef::key),
-            refuses: root.refuses_writes(),
-            remote: root.is_cloud_workspace(),
+            local_refused: root.cloud().is_some(),
             running,
         }
     }
-    /// The panels show the local checkout of a cloud session (tests).
+    /// A cloud session is in view (tests).
     #[cfg(test)]
     pub(crate) fn local_of(cloud_key: &str) -> Self {
         Self {
             cloud: Some(cloud_key.into()),
-            refuses: true,
+            local_refused: true,
             ..Self::default()
         }
     }
-    /// The panels show the cloud workspace `cloud_key` (tests).
+    /// A turn runs in each of the Host environments `envs` (tests).
     #[cfg(test)]
-    pub(crate) fn remote_of(cloud_key: &str, running: bool) -> Self {
+    pub(crate) fn running_in(envs: &[&str]) -> Self {
         Self {
-            cloud: Some(cloud_key.into()),
-            remote: true,
-            running,
+            running: envs.iter().map(|env| (*env).to_owned()).collect(),
             ..Self::default()
         }
     }
@@ -57,6 +55,11 @@ impl Gate {
 
 thread_local! {
     static STATE: RefCell<Gate> = RefCell::new(Gate::default());
+}
+
+/// The Host environment of a `remote://` path.
+fn environment(cwd: &str) -> Option<String> {
+    parse_remote_path(cwd).map(|path| path.environment_id)
 }
 
 /// Why a write was refused.
@@ -78,26 +81,35 @@ pub(crate) fn codespace() -> Option<String> {
     STATE.with(|state| state.borrow().cloud.clone())
 }
 
-/// Whether stage, unstage, discard and commit may run at all. False only when the panels show
-/// the local checkout of a cloud session (or its workspace is not created yet).
-pub(crate) fn writes_allowed() -> bool {
-    STATE.with(|state| !state.borrow().refuses)
+/// Whether stage, unstage, discard and commit may run at all in `cwd`. A cloud workspace is
+/// allowed under [`policy`], unless it is still being created. A local checkout is refused while
+/// a cloud session is in view: those files are not the session's. The answer depends on the cwd
+/// the caller works on, not on which panel is visible, so a view opened earlier stays right when
+/// the panels switch.
+pub(crate) fn writes_allowed(cwd: &str) -> bool {
+    match environment(cwd) {
+        Some(env) => !is_pending_cloud_environment(&env),
+        None => STATE.with(|state| !state.borrow().local_refused),
+    }
 }
 
-/// Whether a turn runs in the workspace the panels show. This is the app-side check for the
-/// policy below.
+/// Whether a turn runs in the workspace of `cwd`. This is the app-side check for the policy
+/// below.
 ///
 /// It is racy and best effort until the Host refuses by itself (F2-5h, capability
-/// `git.idleGuard`): the answer is the app's last view of the sessions, so a turn can start
-/// between this check and the request reaching the Host.
-#[cfg(test)]
-pub(crate) fn turn_running() -> bool {
-    STATE.with(|state| state.borrow().running)
+/// `git.idleGuard`). The answer is the app's last view of the sessions, refreshed every frame.
+/// A turn can start while a confirmation dialog is open, or between the check and the request
+/// reaching the Host, so callers ask again when the dialog is answered.
+pub(crate) fn turn_running(cwd: &str) -> bool {
+    let Some(env) = environment(cwd) else {
+        return false;
+    };
+    STATE.with(|state| state.borrow().running.contains(&env))
 }
 
 /// A git write the panels can ask for. The table is complete on purpose: the operations that are
-/// always allowed (stage, unstage, push, pull, sync, PR) and `ChangeBranch` (no panel offers it
-/// yet) are named so the policy is tested whole, and the first panel that offers one asks here.
+/// always allowed (unstage, push, pull, sync, PR) are named so the policy is tested whole, though
+/// no panel asks about them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) enum Op {
@@ -155,12 +167,9 @@ pub(crate) fn policy(op: Op, remote: bool, running: bool) -> Decision {
     }
 }
 
-/// [`policy`] for the panels in view.
-pub(crate) fn decide(op: Op) -> Decision {
-    STATE.with(|state| {
-        let state = state.borrow();
-        policy(op, state.remote, state.running)
-    })
+/// [`policy`] for a write in `cwd`: remote when it is a `remote://` path.
+pub(crate) fn decide(op: Op, cwd: &str) -> Decision {
+    policy(op, environment(cwd).is_some(), turn_running(cwd))
 }
 
 #[cfg(test)]
@@ -215,18 +224,49 @@ mod tests {
         }
     }
 
+    const REMOTE: &str = "remote://env-octo-abc/workspaces/widgets";
+
     #[test]
-    fn the_gate_decides_from_what_the_shell_set() {
-        set(Gate::remote_of("octo-abc", true));
-        assert!(writes_allowed());
-        assert!(turn_running());
-        assert!(matches!(decide(Op::Discard), Decision::Refuse(_)));
-        set(Gate::remote_of("octo-abc", false));
-        assert_eq!(decide(Op::Discard), Decision::Allow);
-        set(Gate::local_of("octo-abc"));
-        assert!(!writes_allowed());
-        assert_eq!(decide(Op::Discard), Decision::Allow);
+    fn the_gate_decides_per_cwd_from_what_the_shell_set() {
+        set(Gate::running_in(&["env-octo-abc"]));
+        assert!(writes_allowed(REMOTE));
+        assert!(turn_running(REMOTE));
+        assert!(matches!(decide(Op::Discard, REMOTE), Decision::Refuse(_)));
+        // Another workspace, and a local checkout, are not affected by that turn.
+        assert!(!turn_running("remote://env-other/workspaces/w"));
+        assert_eq!(decide(Op::Discard, "/work/local"), Decision::Allow);
+        set(Gate::running_in(&[]));
+        assert_eq!(decide(Op::Discard, REMOTE), Decision::Allow);
         set(Gate::default());
-        assert!(writes_allowed());
+        assert!(writes_allowed("/work/local"));
+    }
+
+    #[test]
+    fn a_local_cwd_is_refused_while_a_cloud_session_is_in_view_whatever_the_panel_shows() {
+        set(Gate::local_of("octo-abc"));
+        assert!(!writes_allowed("/work/local"));
+        // A remote cwd gets the remote policy even then.
+        assert!(writes_allowed(REMOTE));
+        set(Gate::default());
+        assert!(writes_allowed("/work/local"));
+    }
+
+    #[test]
+    fn a_remote_cwd_gets_the_remote_policy_while_a_local_session_is_active() {
+        set(Gate::running_in(&["env-octo-abc"]));
+        assert!(writes_allowed(REMOTE));
+        assert!(matches!(decide(Op::Discard, REMOTE), Decision::Refuse(_)));
+        assert!(matches!(
+            decide(Op::ChangeBranch, REMOTE),
+            Decision::Refuse(_)
+        ));
+        set(Gate::default());
+    }
+
+    #[test]
+    fn a_pending_workspace_is_never_written() {
+        assert!(!writes_allowed(
+            "remote://pending-octo-abc/workspaces/widgets"
+        ));
     }
 }

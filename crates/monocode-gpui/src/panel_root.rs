@@ -126,6 +126,7 @@ impl PanelRoot {
         }
     }
     /// The panels list a real cloud workspace (not the placeholder).
+    #[cfg(test)]
     pub(crate) fn is_cloud_workspace(&self) -> bool {
         matches!(self, Self::Cloud { .. })
     }
@@ -134,6 +135,7 @@ impl PanelRoot {
     }
     /// A cloud session is in view but its panels show the local checkout, or nothing yet:
     /// writes to the local checkout stay refused (they are not the session's files).
+    #[cfg(test)]
     pub(crate) fn refuses_writes(&self) -> bool {
         matches!(
             self,
@@ -195,10 +197,13 @@ pub(crate) struct Chrome {
     /// Show a placeholder instead of the tree: the workspace does not exist yet.
     pub placeholder: bool,
     pub browser: bool,
+    /// The strip may offer Connect: the Connect action is the session's Reconnect, so it needs
+    /// a live conversation (a session that runs in a terminal has none).
+    pub can_connect: bool,
 }
 
 impl Chrome {
-    pub(crate) fn of(root: &PanelRoot, link: Link) -> Option<Self> {
+    pub(crate) fn of(root: &PanelRoot, link: Link, can_connect: bool) -> Option<Self> {
         Some(Self {
             banner: root.banner()?,
             mode: root.mode(),
@@ -209,6 +214,7 @@ impl Chrome {
             }),
             placeholder: root.is_pending(),
             browser: root.offers_browser(),
+            can_connect,
         })
     }
 }
@@ -357,18 +363,22 @@ mod tests {
     #[test]
     fn the_chrome_follows_the_mode_and_the_backend() {
         let cloud_root = resolve(session(PROJECT, None), PanelMode::Cloud, false, "/o");
-        let chrome = Chrome::of(&cloud_root, Link::NotConnected).unwrap();
+        let chrome = Chrome::of(&cloud_root, Link::NotConnected, true).unwrap();
         assert_eq!(chrome.banner, "Cloud files - codespace octo-abc");
         assert_eq!(chrome.link, Some(Link::NotConnected));
-        assert!(chrome.browser && !chrome.placeholder);
+        assert!(chrome.browser && !chrome.placeholder && chrome.can_connect);
+        // Without a live conversation there is nothing to reconnect with: no Connect action.
+        let terminal = Chrome::of(&cloud_root, Link::NotConnected, false).unwrap();
+        assert_eq!(terminal.link, Some(Link::NotConnected));
+        assert!(!terminal.can_connect);
 
         let local_root = resolve(session(PROJECT, None), PanelMode::Local, false, "/o");
-        let chrome = Chrome::of(&local_root, Link::Connected).unwrap();
+        let chrome = Chrome::of(&local_root, Link::Connected, true).unwrap();
         assert_eq!((chrome.link, chrome.browser), (None, false));
 
         let pending = "remote://pending-octo-abc/workspaces/widgets";
         let pending_root = resolve(session(pending, None), PanelMode::Cloud, false, "/o");
-        let chrome = Chrome::of(&pending_root, Link::Connected).unwrap();
+        let chrome = Chrome::of(&pending_root, Link::Connected, true).unwrap();
         assert_eq!(chrome.link, Some(Link::Starting));
         assert!(chrome.placeholder);
 
@@ -385,6 +395,6 @@ mod tests {
         assert!(!sandbox_root.offers_browser());
 
         let plain = resolve(None, PanelMode::Cloud, false, "/o");
-        assert_eq!(Chrome::of(&plain, Link::Connected), None);
+        assert_eq!(Chrome::of(&plain, Link::Connected, true), None);
     }
 }

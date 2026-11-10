@@ -2008,20 +2008,12 @@ impl Shell {
         let Some(panel) = &self.right_panel else {
             return div().into_any_element();
         };
-        let panel = panel.read(cx);
-        match self.classic_sidebar_tab {
-            classic_sidebar::ClassicSidebarTab::Files => panel
-                .explorer
-                .clone()
-                .cached(StyleRefinement::default().size_full())
-                .into_any_element(),
-            classic_sidebar::ClassicSidebarTab::Changes => panel
-                .changes
-                .clone()
-                .cached(StyleRefinement::default().size_full())
-                .into_any_element(),
-            classic_sidebar::ClassicSidebarTab::Sessions => div().into_any_element(),
-        }
+        let tab = match self.classic_sidebar_tab {
+            classic_sidebar::ClassicSidebarTab::Files => crate::right_panel::RightTab::Files,
+            classic_sidebar::ClassicSidebarTab::Changes => crate::right_panel::RightTab::Changes,
+            classic_sidebar::ClassicSidebarTab::Sessions => return div().into_any_element(),
+        };
+        panel.update(cx, |panel, cx| panel.classic_tool(tab, cx))
     }
     fn toggle_right_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.set_right_panel_open(!self.workspace.right_panel_open, window, cx);
