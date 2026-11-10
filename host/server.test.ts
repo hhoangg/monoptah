@@ -61,7 +61,9 @@ async function setup(providers: RemoteProvider[] = ["codex"]) {
   // Follow production's canonicalization, including Windows 8.3 paths such
   // as RUNNER~1 in the CI runner's temporary directory.
   const project = await engine.openProject(directory);
-  const server = createHostServer(engine, providers);
+  const server = createHostServer(engine, providers, undefined, {
+    kitHome: join(directory, "kit-home"),
+  });
   try {
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
@@ -804,6 +806,46 @@ describe("host uploads over the API", () => {
     expect(readFileSync(done.value.result.path).equals(data)).toBe(true);
     expect((await s.call("uploads.discard", { uploadId })).value.result).toEqual({ discarded: true });
     expect((await s.call("uploads.begin", { ...params, name: "../x" })).status).not.toBe(200);
+  });
+
+  it("applies a kit over RPC, advertises it and scrubs secrets from errors", async () => {
+    const s = await setup();
+    const described = await s.call("environment.describe");
+    expect(described.value.result.capabilities).toEqual(expect.arrayContaining(["kit", "claude.kit"]));
+    const block = (name: string, data: Buffer, type = "0") => {
+      const h = Buffer.alloc(512);
+      h.write(name, 0);
+      h.write("0000644\0", 100);
+      h.write(data.length.toString(8).padStart(11, "0") + "\0", 124);
+      h.write("        ", 148);
+      h.write(type, 156);
+      let sum = 0;
+      for (const b of h) sum += b;
+      h.write(sum.toString(8).padStart(6, "0") + "\0 ", 148);
+      return Buffer.concat([h, data, Buffer.alloc((512 - (data.length % 512)) % 512)]);
+    };
+    const archive = Buffer.concat([block("skills/demo/", Buffer.alloc(0), "5"), block("skills/demo/SKILL.md", Buffer.from("# demo")), Buffer.alloc(1024)]);
+    const sha256 = createHash("sha256").update(archive).digest("hex");
+    const { uploadId } = (await s.call("uploads.begin", { name: "kit.tar", size: archive.length, sha256 })).value.result;
+    await s.call("uploads.chunk", { uploadId, offset: 0, data: archive.toString("base64") });
+    await s.call("uploads.commit", { uploadId });
+    const hash = "c".repeat(64);
+    expect((await s.call("kit.apply", { uploadId, hash }, "invalid")).status).toBe(401);
+    expect((await s.call("kit.apply", { uploadId, hash: "xyz" })).status).toBe(400);
+    const applied = await s.call("kit.apply", { uploadId, hash });
+    expect(applied.value.result).toMatchObject({ hash, skills: ["demo"], skipped: [] });
+    expect(readFileSync(join(s.directory, "kit-home", ".monoptah-kit", hash, "skills", "demo", "SKILL.md"), "utf8")).toBe("# demo");
+    expect((await s.call("kit.probe", { commands: ["node"] })).value.result.present).toContain("node");
+    const secret = "rpc-secret-value-4242";
+    expect((await s.call("kit.secrets", { values: { MONOPTAH_KIT_A: secret } })).value.result.count).toBe(1);
+    // An error that happens to contain the secret must not echo it.
+    vi.spyOn(s.store, "project").mockImplementation(() => {
+      throw new Error(`lookup failed for ${secret}`);
+    });
+    const failed = await s.call("kit.health", { projectId: "p" });
+    expect(failed.status).toBe(400);
+    expect(failed.value.error).toBe("lookup failed for [redacted]");
+    expect(JSON.stringify(failed.value)).not.toContain(secret);
   });
 
   it("runs an unref'd sweeper and clears it when the server closes", async () => {

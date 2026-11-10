@@ -278,3 +278,56 @@ setInterval(() => {}, 1000);
     });
   }
 }, 10_000);
+
+it("loads kit secrets into a Claude child only, never into process.env", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "monocode-kit-env-"));
+  const file = join(directory, "provider.cjs");
+  writeFileSync(
+    file,
+    `console.log(JSON.stringify({ t: process.env.MONOPTAH_KIT_X_T || null }));
+console.error('stderr echo ' + process.env.MONOPTAH_KIT_X_T);
+setInterval(() => {}, 1000);
+`,
+  );
+  const secret = "kit-secret-value-123";
+  const backend = new HostChildBackend();
+  const out: string[] = [];
+  const err: string[] = [];
+  const stopOut = await backend.listen<{ line: string }>("harness-stdout", ({ payload }) => out.push(payload.line));
+  const stopErr = await backend.listen<{ line: string }>("harness-stderr", ({ payload }) => err.push(payload.line));
+  const { HostKit } = await import("./kit");
+  try {
+    // Registers the value with the scrubber, as the Host does on startup.
+    new HostKit({ committedPath: () => "" }, { home: directory }).secrets({
+      values: { MONOPTAH_KIT_X_T: secret },
+    });
+    await backend.invoke("harness_spawn", {
+      sessionId: "kit",
+      command: file,
+      args: [],
+      cwd: directory,
+      binaryProvider: "claude",
+      env: { MONOPTAH_KIT_X_T: secret },
+    });
+    await vi.waitFor(() => expect(out.length).toBeGreaterThan(0));
+    expect(JSON.parse(out[0])).toEqual({ t: secret });
+    await vi.waitFor(() => expect(err.length).toBeGreaterThan(0));
+    expect(err.join("\n")).not.toContain(secret);
+    expect(process.env.MONOPTAH_KIT_X_T).toBeUndefined();
+    await backend.kill("kit");
+    // Not for other providers, and only MONOPTAH_KIT_ names.
+    for (const [binaryProvider, env] of [
+      ["codex", { MONOPTAH_KIT_X_T: secret }],
+      ["claude", { LD_PRELOAD: "/x.so" }],
+      ["claude", { MONOPTAH_KIT_X_T: 5 }],
+    ] as const)
+      await expect(
+        backend.invoke("harness_spawn", { sessionId: "kit2", command: file, args: [], cwd: directory, binaryProvider, env }),
+      ).rejects.toThrow("Unsupported child environment");
+  } finally {
+    stopOut();
+    stopErr();
+    await backend.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+}, 15_000);
