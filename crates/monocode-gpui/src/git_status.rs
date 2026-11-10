@@ -81,6 +81,11 @@ pub(crate) struct ProjectGit {
     /// The panels show a cloud workspace that has no live connection: nothing is read, the last
     /// snapshot stays, and the panels are read-only until the link is back.
     link_offline: bool,
+    /// The link is back but the first full reload since has not finished: what is shown is still
+    /// the old snapshot, so it stays dimmed and read-only until the reload lands.
+    recovering: bool,
+    /// The workspace is being woken (the strip says "Workspace starting").
+    starting: bool,
     /// Status should be read while visible, whether or not a read can run right now.
     polling_wanted: bool,
     /// Reads started, for tests that prove a disconnected workspace is left alone.
@@ -109,6 +114,8 @@ impl ProjectGit {
             remembered: HashMap::new(),
             remote: RemoteCache::default(),
             link_offline: false,
+            recovering: false,
+            starting: false,
             polling_wanted: false,
             #[cfg(test)]
             reads: 0,
@@ -136,6 +143,21 @@ impl ProjectGit {
     pub(crate) fn offline(&self) -> bool {
         self.link_offline
     }
+    /// What is shown is not live data: the link is down, or the reload after it came back has
+    /// not landed yet. Writes stay refused and the panels stay dimmed meanwhile.
+    pub(crate) fn stale(&self) -> bool {
+        self.link_offline || self.recovering
+    }
+    /// The workspace is being woken, for the wording of the notes.
+    pub(crate) fn starting(&self) -> bool {
+        self.starting
+    }
+    pub(crate) fn set_starting(&mut self, starting: bool, cx: &mut Context<Self>) {
+        if self.starting != starting {
+            self.starting = starting;
+            cx.notify();
+        }
+    }
     /// How long ago the live workspace of the project was last read, for a remote project.
     pub(crate) fn cached_age(&self) -> Option<std::time::Duration> {
         self.remote.age(&self.project, Instant::now())
@@ -159,7 +181,9 @@ impl ProjectGit {
             cx.notify();
             return;
         }
-        // Back online: a user action (Connect) brought the workspace back. Start over.
+        // Back online: a user action (Connect) brought the workspace back. Start over; the old
+        // snapshot stays read-only until the first reload lands.
+        self.recovering = self.available();
         self.epoch += 1;
         cx.emit(GitChanged);
         cx.notify();
@@ -188,6 +212,7 @@ impl ProjectGit {
         }
         self.project = project.clone();
         self.root = project.clone();
+        self.recovering = false;
         self.index = self.remembered_index(&project);
         self.stats = self.index.as_ref().map(stats_of);
         self.statuses = self
@@ -323,6 +348,10 @@ impl ProjectGit {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
                 this.in_flight = false;
+                if this.project == project && !this.pending && std::mem::take(&mut this.recovering)
+                {
+                    cx.notify();
+                }
                 // A slow or unavailable checkout keeps its last snapshot, and
                 // never takes another checkout's.
                 if this.project == project
@@ -467,6 +496,10 @@ mod tests {
             let (reads, epoch) = (git.reads, git.epoch);
             git.bind(A.into(), false, cx);
             assert!(!git.offline() && git.poll.is_some());
+            assert!(
+                git.stale(),
+                "the old snapshot is not live until the reload lands"
+            );
             assert_eq!(git.reads, reads + 1);
             assert!(git.epoch > epoch, "the views reread");
             // Binding again with the same link changes nothing.
@@ -540,5 +573,20 @@ mod tests {
             assert_eq!(git.remote.len(), crate::remote_cache::CAPACITY);
             assert!(git.remembered.contains_key("/work/local"));
         });
+    }
+
+    #[gpui::test]
+    fn the_snapshot_stays_stale_after_reconnecting_until_the_first_reload_lands(
+        cx: &mut TestAppContext,
+    ) {
+        let git = cx.new(|cx| ProjectGit::new("~".into(), cx));
+        git.update(cx, |git, cx| {
+            git.bind(A.into(), true, cx);
+            assert!(git.stale());
+            git.bind(A.into(), false, cx);
+            assert!(!git.offline() && git.stale());
+        });
+        cx.run_until_parked();
+        git.update(cx, |git, _| assert!(!git.stale()));
     }
 }

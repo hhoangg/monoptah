@@ -1947,7 +1947,7 @@ impl Shell {
             .map(|view| Kind::from_id(&view.read(cx).summary.provider));
         let root = self.panel_root(cx);
         let project = root.project().to_owned();
-        let offline = crate::panel_root::is_offline(&root, self.panel_link(cx));
+        let offline = self.panel_offline(&root, cx);
         self.git
             .update(cx, |git, cx| git.bind(project, offline, cx));
         if let (Some(panel), Some(kind)) = (&self.right_panel, provider) {

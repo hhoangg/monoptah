@@ -22,15 +22,16 @@ pub(crate) struct Gate {
     local_refused: bool,
     /// Host environments where some session has a turn running (see [`turn_running`]).
     running: Vec<String>,
-    /// The Host environment of the workspace the panels show while the app has no connection to
-    /// it: its files are only remembered, so writes to it are refused.
-    offline: Option<String>,
+    /// Every Host environment the app has no live connection to (or has not finished reloading
+    /// since it came back): what the app shows of it is only remembered, so writes to it are
+    /// refused wherever they come from (the panels, a Review tab, an editor).
+    offline: Vec<String>,
 }
 
 impl Gate {
-    pub(crate) fn of(root: &PanelRoot, running: Vec<String>, offline: bool) -> Self {
+    pub(crate) fn of(root: &PanelRoot, running: Vec<String>, offline: Vec<String>) -> Self {
         Self {
-            offline: offline.then(|| environment(root.project())).flatten(),
+            offline,
             cloud: root
                 .cloud()
                 .map(monocode_core::cloud_sessions::CloudRef::key),
@@ -51,7 +52,7 @@ impl Gate {
     #[cfg(test)]
     pub(crate) fn offline_in(env: &str) -> Self {
         Self {
-            offline: Some(env.to_owned()),
+            offline: vec![env.to_owned()],
             ..Self::default()
         }
     }
@@ -109,7 +110,7 @@ pub(crate) fn writes_allowed(cwd: &str) -> bool {
 }
 
 fn offline(env: &str) -> bool {
-    STATE.with(|state| state.borrow().offline.as_deref() == Some(env))
+    STATE.with(|state| state.borrow().offline.iter().any(|e| e == env))
 }
 
 /// The reason `writes_allowed(cwd)` is false.
@@ -196,6 +197,9 @@ pub(crate) fn policy(op: Op, remote: bool, running: bool) -> Decision {
 
 /// [`policy`] for a write in `cwd`: remote when it is a `remote://` path.
 pub(crate) fn decide(op: Op, cwd: &str) -> Decision {
+    if environment(cwd).is_some_and(|env| offline(&env)) {
+        return Decision::Refuse(REFUSED_OFFLINE);
+    }
     policy(op, environment(cwd).is_some(), turn_running(cwd))
 }
 
@@ -295,12 +299,27 @@ mod tests {
         set(Gate::offline_in("env-octo-abc"));
         assert!(!writes_allowed(REMOTE));
         assert_eq!(refusal(REMOTE), REFUSED_OFFLINE);
+        assert!(matches!(
+            decide(Op::ChangeBranch, REMOTE),
+            Decision::Refuse(REFUSED_OFFLINE)
+        ));
         // Another workspace and a local checkout are not affected by that disconnect.
         assert!(writes_allowed("remote://env-other/workspaces/w"));
         assert!(writes_allowed("/work/local"));
         assert_eq!(refusal("/work/local"), REFUSED);
         set(Gate::default());
         assert!(writes_allowed(REMOTE));
+    }
+
+    #[test]
+    fn every_offline_environment_is_refused_not_only_the_one_in_the_panels() {
+        let mut gate = Gate::offline_in("env-octo-abc");
+        gate.offline.push("env-other".into());
+        set(gate);
+        assert!(!writes_allowed(REMOTE));
+        assert!(!writes_allowed("remote://env-other/workspaces/w"));
+        assert!(writes_allowed("remote://env-third/workspaces/w"));
+        set(Gate::default());
     }
 
     #[test]

@@ -1187,6 +1187,50 @@ impl Shell {
             })
     }
 
+    /// Whether the link of the session in view is a fact: a live conversation says the workspace
+    /// is up, waking or down. A session without one (it runs in a terminal) or one that has not
+    /// finished its first refresh knows nothing, and its panels read as they always did.
+    fn panel_link_known(&self, cx: &App) -> bool {
+        self.workspace
+            .active
+            .map(|pane| self.workspace.session_for_pane(pane))
+            .and_then(|id| self.sessions.get(&id))
+            .is_some_and(|view| view.read(cx).panel_link_known())
+    }
+
+    /// The panels show remembered data of a workspace the app knows is down.
+    pub(super) fn panel_offline(&self, root: &crate::panel_root::PanelRoot, cx: &App) -> bool {
+        crate::panel_root::is_offline(root, self.panel_link(cx)) && self.panel_link_known(cx)
+    }
+
+    /// Every Host environment of a cloud session whose link is known to be down, for the git
+    /// gate: a Review tab of workspace B must be refused while the panels show A or Local.
+    fn offline_environments(&self, cx: &App) -> Vec<String> {
+        let mut envs = Vec::new();
+        for id in self.cloud_marks.keys() {
+            let Some(view) = self.sessions.get(id).map(|view| view.read(cx)) else {
+                continue;
+            };
+            if !view.panel_link_known() || view.panel_link() == crate::panel_root::Link::Connected {
+                continue;
+            }
+            let cwds = self
+                .session_summaries
+                .get(id)
+                .map(|s| s.cwd.as_str())
+                .into_iter()
+                .chain(view.settings.worktree_cwd.as_deref());
+            for cwd in cwds {
+                if let Some(path) = monocode_core::remote::parse_remote_path(cwd)
+                    && !envs.contains(&path.environment_id)
+                {
+                    envs.push(path.environment_id);
+                }
+            }
+        }
+        envs
+    }
+
     /// Whether the session in view has a live conversation for the Connect action to reconnect.
     fn panel_can_connect(&self) -> bool {
         self.workspace
@@ -1270,7 +1314,8 @@ impl Shell {
     pub(super) fn sync_cloud_panel(&self, cx: &mut Context<Self>) {
         let root = self.panel_root(cx);
         let link = self.panel_link(cx);
-        let offline = crate::panel_root::is_offline(&root, link);
+        let known = self.panel_link_known(cx);
+        let offline = self.panel_offline(&root, cx);
         // A cloud session's root can change without the session changing (the Local switch, a
         // pending workspace that became real). Offline: the panels keep the last data and read
         // nothing; back online: a full reload.
@@ -1282,12 +1327,25 @@ impl Shell {
             self.git
                 .update(cx, |git, cx| git.set_link_offline(false, cx));
         }
+        self.git.update(cx, |git, cx| {
+            git.set_starting(offline && link == crate::panel_root::Link::Starting, cx)
+        });
         let running = self.running_environments(cx);
-        let age = self.git.read(cx).cached_age();
+        let (age, recovering) = {
+            let git = self.git.read(cx);
+            (git.cached_age(), git.stale() && !git.offline())
+        };
         let chrome = crate::panel_root::Chrome::of(&root, link, self.panel_can_connect())
-            .map(|chrome| chrome.with_age(age));
+            .map(|chrome| chrome.with_state(known, recovering).with_age(age));
         self.sync_codespace_pane(cx);
-        let flipped = crate::git_gate::set(crate::git_gate::Gate::of(&root, running, offline));
+        let mut offline_envs = self.offline_environments(cx);
+        if chrome.as_ref().is_some_and(|chrome| chrome.offline)
+            && let Some(path) = monocode_core::remote::parse_remote_path(root.project())
+            && !offline_envs.contains(&path.environment_id)
+        {
+            offline_envs.push(path.environment_id);
+        }
+        let flipped = crate::git_gate::set(crate::git_gate::Gate::of(&root, running, offline_envs));
         if let Some(panel) = &self.right_panel {
             panel.update(cx, |panel, cx| {
                 panel.set_cloud_chrome(chrome, cx);

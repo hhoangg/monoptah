@@ -1387,9 +1387,9 @@ fn files_and_git_show_the_cloud_workspace_by_default_and_the_local_switch_refuse
             shell.workspace.active = Some(id);
             shell.sync_cloud_panel(cx);
             let remote = shell.session_summaries[&id].cwd.clone();
-            // Default: the cloud workspace, and its git writes go to the remote under the policy
-            // once the app is connected to it. This session has no live conversation, so it is
-            // not connected and its remembered files are read-only (see the disconnected test).
+            // Default: the cloud workspace, and its git writes go to the remote under the policy.
+            // This session has no live conversation (it runs in a terminal): its link is
+            // unknown, not down, so the panels read it as before, neither dimmed nor read-only.
             assert_eq!(
                 panel.read(cx).cloud_banner(),
                 Some("Cloud files - codespace octo-abc")
@@ -1398,9 +1398,11 @@ fn files_and_git_show_the_cloud_workspace_by_default_and_the_local_switch_refuse
                 panel.read(cx).cloud_chrome().unwrap().mode,
                 PanelMode::Cloud
             );
-            assert!(!crate::git_gate::writes_allowed(&remote));
+            assert!(crate::git_gate::writes_allowed(&remote));
             assert!(!crate::git_gate::writes_allowed(LOCAL));
             assert_eq!(crate::git_gate::codespace().as_deref(), Some("octo-abc"));
+            assert!(!panel.read(cx).cloud_chrome().unwrap().offline);
+            assert!(!shell.git.read(cx).stale());
             assert_eq!(shell.git.read(cx).project(), remote);
 
             // Local: the local checkout, where writes are refused.
@@ -1418,7 +1420,7 @@ fn files_and_git_show_the_cloud_workspace_by_default_and_the_local_switch_refuse
             // refused after the switch: the answer follows the path, not the visible panel.
             shell.set_panel_mode(PanelMode::Cloud, cx);
             shell.sync_cloud_panel(cx);
-            assert!(!crate::git_gate::writes_allowed(&remote));
+            assert!(crate::git_gate::writes_allowed(&remote));
             assert!(!crate::git_gate::writes_allowed(LOCAL));
             assert_eq!(shell.git.read(cx).project(), remote);
             assert_eq!(shell.panel_modes.get(&id), Some(&PanelMode::Cloud));
@@ -1641,6 +1643,13 @@ fn a_disconnected_workspace_keeps_its_cached_panels_read_only_and_connect_reload
             shell.set_panel_mode(PanelMode::Cloud, cx);
             shell.sync_cloud_panel(cx);
             assert!(shell.git.read(cx).offline());
+            // A Review tab of this workspace is refused even when the panels show something
+            // else: the gate knows every environment that is down, not only the panels' root.
+            shell.workspace.active = None;
+            shell.sync_cloud_panel(cx);
+            assert!(!crate::git_gate::writes_allowed(&remote));
+            shell.workspace.active = Some(id);
+            shell.sync_cloud_panel(cx);
             (remote, reads_before)
         })
         .unwrap();
@@ -1668,6 +1677,19 @@ fn a_disconnected_workspace_keeps_its_cached_panels_read_only_and_connect_reload
             shell.sync_cloud_panel(cx);
             let git = shell.git.read(cx);
             assert!(!git.offline() && git.reads > reads_before && !git.poll_is_off_for_test());
+            // Between the reconnect and the end of the first reload the old snapshot is not
+            // live data: still dimmed, and still no writes.
+            assert!(git.stale());
+            assert!(!crate::git_gate::writes_allowed(&remote));
+            let panel = shell.right_panel.clone().unwrap();
+            assert!(panel.read(cx).cloud_chrome().unwrap().offline);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            shell.sync_cloud_panel(cx);
+            assert!(!shell.git.read(cx).stale());
             assert!(crate::git_gate::writes_allowed(&remote));
             let panel = shell.right_panel.clone().unwrap();
             let chrome = panel.read(cx).cloud_chrome().unwrap().clone();

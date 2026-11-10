@@ -14,8 +14,13 @@ use std::{
 
 /// How many remote roots are remembered; the least recently used one goes first.
 pub(crate) const CAPACITY: usize = 16;
-/// A snapshot with more files than this is not kept: the memory is bounded by roots, and by this.
+/// A snapshot with more files than this is not kept.
 const MAX_INDEX_FILES: usize = 20_000;
+/// Listing rows kept for one root; the shallowest folders are kept first.
+const MAX_ROOT_ROWS: usize = 20_000;
+/// Rows (listing rows and snapshot files) kept across all roots; the least recently used roots
+/// give way first, so the memory is bounded however many roots are visited.
+const MAX_TOTAL_ROWS: usize = 120_000;
 
 /// What is remembered for one remote root.
 #[derive(Clone, Default)]
@@ -29,6 +34,13 @@ pub(crate) struct Entry {
     pub index: Option<DiffIndex>,
     /// The last time a read from the live workspace was stored.
     pub updated: Option<Instant>,
+}
+
+impl Entry {
+    fn rows(&self) -> usize {
+        self.dirs.values().map(Vec::len).sum::<usize>()
+            + self.index.as_ref().map_or(0, |index| index.files.len())
+    }
 }
 
 #[derive(Default)]
@@ -93,34 +105,56 @@ impl RemoteCache {
             .then_some(())?;
         self.touch(root).map(|entry| entry.clone())
     }
-    /// Stores the Explorer's state for `root`. Nothing is stored for an empty tree.
+    /// Stores the Explorer's state for `root`. Nothing is stored for an empty tree. This does not
+    /// touch `updated`: leaving a root is not a read of the workspace.
     pub(crate) fn put_tree(
         &mut self,
         root: &str,
-        dirs: HashMap<String, Vec<DirEntry>>,
+        mut dirs: HashMap<String, Vec<DirEntry>>,
         expanded: HashSet<String>,
         selected: Option<String>,
-        now: Instant,
     ) {
         if dirs.is_empty() {
             return;
+        }
+        // Over the per-root budget, the shallowest folders stay.
+        let mut rows = dirs.values().map(Vec::len).sum::<usize>();
+        if rows > MAX_ROOT_ROWS {
+            let mut paths: Vec<String> = dirs.keys().cloned().collect();
+            paths.sort_by_key(|path| std::cmp::Reverse((path.len(), path.clone())));
+            for path in paths {
+                if rows <= MAX_ROOT_ROWS {
+                    break;
+                }
+                if let Some(gone) = dirs.remove(&path) {
+                    rows -= gone.len();
+                }
+            }
         }
         if let Some(entry) = self.touch(root) {
             entry.dirs = dirs;
             entry.expanded = Some(expanded);
             entry.selected = selected;
-            entry.updated = Some(now);
+        }
+        self.trim();
+    }
+    /// Evicts the least recently used roots while the total is over budget; the root used last
+    /// always stays.
+    fn trim(&mut self) {
+        let mut total: usize = self.entries.iter().map(|(_, entry)| entry.rows()).sum();
+        while total > MAX_TOTAL_ROWS && self.entries.len() > 1 {
+            let (_, gone) = self.entries.remove(0);
+            total -= gone.rows();
         }
     }
     /// Stores a git snapshot read from the live workspace.
     pub(crate) fn put_index(&mut self, root: &str, index: &DiffIndex, now: Instant) {
-        if index.files.len() > MAX_INDEX_FILES {
-            return;
-        }
         if let Some(entry) = self.touch(root) {
-            entry.index = Some(index.clone());
+            // Too big to keep: the older snapshot is stale now, so it goes too.
+            entry.index = (index.files.len() <= MAX_INDEX_FILES).then(|| index.clone());
             entry.updated = Some(now);
         }
+        self.trim();
     }
     /// Records that the live workspace was read for `root` just now.
     pub(crate) fn confirm(&mut self, root: &str, now: Instant) {
@@ -167,7 +201,8 @@ mod tests {
         HashMap::from([(root.to_owned(), entries)])
     }
     fn put(cache: &mut RemoteCache, root: &str, now: Instant) {
-        cache.put_tree(root, dirs_of(root, &["a.rs"]), HashSet::new(), None, now);
+        let _ = now;
+        cache.put_tree(root, dirs_of(root, &["a.rs"]), HashSet::new(), None);
     }
 
     #[test]
@@ -212,7 +247,7 @@ mod tests {
         let now = Instant::now();
         let mut cache = RemoteCache::default();
         put(&mut cache, "/work/monocode", now);
-        cache.put_tree(&root(1), HashMap::new(), HashSet::new(), None, now);
+        cache.put_tree(&root(1), HashMap::new(), HashSet::new(), None);
         cache.put_index("/work/monocode", &DiffIndex::default(), now);
         cache.confirm("~", now);
         assert_eq!(cache.len(), 0);
@@ -237,10 +272,79 @@ mod tests {
             ..Default::default()
         };
         cache.put_index(&root(1), &index, now);
-        assert_eq!(cache.len(), 0);
+        assert!(cache.peek(&root(1)).unwrap().index.is_none());
         index.files.truncate(2);
         cache.put_index(&root(1), &index, now);
         assert_eq!(cache.peek(&root(1)).unwrap().index.as_ref(), Some(&index));
+    }
+
+    #[test]
+    fn an_oversized_snapshot_clears_the_older_one() {
+        let now = Instant::now();
+        let mut cache = RemoteCache::default();
+        cache.put_index(&root(1), &DiffIndex::default(), now);
+        let big = DiffIndex {
+            files: (0..=MAX_INDEX_FILES)
+                .map(|n| monocode_core::scm::ChangedFile {
+                    path: format!("/r/{n}"),
+                    relative: n.to_string(),
+                    status: "modified".into(),
+                    additions: 0,
+                    deletions: 0,
+                    staged: false,
+                    unstaged: true,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        cache.put_index(&root(1), &big, now);
+        assert!(cache.peek(&root(1)).unwrap().index.is_none());
+    }
+
+    #[test]
+    fn memory_is_bounded_per_root_and_across_roots() {
+        let mut cache = RemoteCache::default();
+        // One root over its budget keeps its shallowest folders only.
+        let big = root(1);
+        let mut dirs = HashMap::new();
+        dirs.insert(big.clone(), dirs_of(&big, &["a.rs"]).remove(&big).unwrap());
+        for n in 0..5 {
+            let dir = format!("{big}/d{n}/deep");
+            let names: Vec<String> = (0..MAX_ROOT_ROWS / 2).map(|i| format!("f{i}")).collect();
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            dirs.insert(dir.clone(), dirs_of(&dir, &refs).remove(&dir).unwrap());
+        }
+        cache.put_tree(&big, dirs, HashSet::new(), None);
+        let kept = cache.peek(&big).unwrap();
+        assert!(kept.rows() <= MAX_ROOT_ROWS);
+        assert!(kept.dirs.contains_key(&big), "the shallowest folder stays");
+        // Many roots near the per-root limit evict the oldest ones by the total budget.
+        for n in 10..20 {
+            let r = root(n);
+            let names: Vec<String> = (0..MAX_ROOT_ROWS - 10).map(|i| format!("f{i}")).collect();
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            cache.put_tree(&r, dirs_of(&r, &refs), HashSet::new(), None);
+        }
+        let total: usize = cache
+            .roots()
+            .iter()
+            .map(|r| cache.peek(r).unwrap().rows())
+            .sum();
+        assert!(total <= MAX_TOTAL_ROWS, "{total}");
+        assert!(cache.peek(&root(19)).is_some(), "the newest root stays");
+        assert!(cache.peek(&big).is_none(), "the oldest gave way");
+    }
+
+    #[test]
+    fn leaving_a_root_does_not_make_its_data_look_newer() {
+        let t0 = Instant::now();
+        let mut cache = RemoteCache::default();
+        cache.confirm(&root(1), t0);
+        cache.put_tree(&root(1), dirs_of(&root(1), &["a.rs"]), HashSet::new(), None);
+        assert_eq!(
+            cache.age(&root(1), t0 + Duration::from_secs(600)),
+            Some(Duration::from_secs(600))
+        );
     }
 
     #[test]

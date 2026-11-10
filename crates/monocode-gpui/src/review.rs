@@ -2302,7 +2302,7 @@ mod tests {
             },
         ];
         for root in roots {
-            crate::git_gate::set(crate::git_gate::Gate::of(&root, Vec::new(), false));
+            crate::git_gate::set(crate::git_gate::Gate::of(&root, Vec::new(), Vec::new()));
             discard_event(window, "a.txt", visual);
             assert!(!visual.has_pending_prompt(), "{root:?}");
             assert_eq!(

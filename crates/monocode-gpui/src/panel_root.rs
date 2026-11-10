@@ -230,6 +230,14 @@ impl Chrome {
             cached: None,
         })
     }
+    /// Applies what is known about the link. A link nobody has reported on yet is not offline
+    /// (the panels read as before); a link that came back but whose first reload has not landed
+    /// is still not live data.
+    pub(crate) fn with_state(mut self, known: bool, recovering: bool) -> Self {
+        let cloud = self.link.is_some() && !self.placeholder;
+        self.offline = (self.offline && known) || (recovering && cloud);
+        self
+    }
     /// Says how old the remembered data is; only shown while it is the data on screen.
     pub(crate) fn with_age(mut self, age: Option<std::time::Duration>) -> Self {
         self.cached = age

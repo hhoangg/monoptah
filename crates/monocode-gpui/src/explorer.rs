@@ -208,6 +208,8 @@ pub(crate) struct Explorer {
     /// The cloud workspace of the session in view is still being created: the tree is bound to
     /// nothing real, so create, rename, delete, paste and duplicate are refused.
     read_only: bool,
+    /// (stale, starting) as of the last rebuild, to redraw the notes when the link changes.
+    link_state: (bool, bool),
     search: Option<Entity<ProjectSearch>>,
     search_events: Option<Subscription>,
     drag_over: Option<String>,
@@ -245,6 +247,10 @@ pub(crate) struct OpenInBrowser;
 impl EventEmitter<OpenInBrowser> for Explorer {}
 const WORKSPACE_STARTING: &str =
     "The cloud workspace is still starting. Files can be changed once it is ready.";
+// Follow-up: opening a file while disconnected should offer Connect, like a chat link does
+// (design 2.2.3). It is not part of F2-2.
+const REFRESHING: &str =
+    "Refreshing the files after reconnecting. They can be changed once that finishes.";
 const NOT_CONNECTED: &str =
     "Not connected to the workspace. Files can be changed once you choose Connect.";
 
@@ -280,12 +286,21 @@ impl Explorer {
         let name_focus = name_input.read(cx).focus_handle(cx);
         let subscriptions = vec![
             cx.subscribe(&git, |this, _, _: &GitChanged, cx| this.git_changed(cx)),
-            cx.observe(&git, |this, _, cx| {
+            cx.observe(&git, |this, git, cx| {
                 // Git colours follow every status read.
                 if this.enabled {
                     cx.notify();
+                    // The notes of a tree that is not live follow the link without waiting for
+                    // the next rebuild.
+                    let state = {
+                        let git = git.read(cx);
+                        (git.stale(), git.starting())
+                    };
+                    if state != this.link_state {
+                        this.link_state = state;
+                        this.rebuild(cx);
+                    }
                 }
-                let _ = this;
             }),
             cx.subscribe_in(
                 &name_input,
@@ -322,6 +337,7 @@ impl Explorer {
             menu: None,
             offers_browser: false,
             read_only: false,
+            link_state: (false, false),
             search: None,
             search_events: None,
             drag_over: None,
@@ -458,8 +474,7 @@ impl Explorer {
             false
         });
         self.git.update(cx, |git, _| {
-            git.remote
-                .put_tree(&root, mine, expanded, selected, Instant::now())
+            git.remote.put_tree(&root, mine, expanded, selected)
         });
     }
     /// What the root being entered looked like when it was left. A cloud root also brings back
@@ -512,6 +527,10 @@ impl Explorer {
         result: Result<Vec<DirEntry>, String>,
         cx: &mut Context<Self>,
     ) {
+        // A late answer for another root (the panels switched meanwhile) is not this tree's.
+        if self.is_remote_root() && !crate::remote_cache::within(&self.cwd, &path) {
+            return;
+        }
         match &result {
             Err(error)
                 if monocode_core::cloud_sessions::is_not_connected(error)
@@ -618,7 +637,9 @@ impl Explorer {
         }
         if listing.is_none() {
             // Nothing was read here before the link dropped, and nothing is read until Connect.
-            let text = if self.is_offline(cx) {
+            let text = if self.is_offline(cx) && self.git.read(cx).starting() {
+                "Workspace starting"
+            } else if self.is_offline(cx) {
                 "Not loaded. Choose Connect to load it."
             } else {
                 "…"
@@ -1144,17 +1165,25 @@ impl Explorer {
     /// Why the tree cannot be changed right now: its workspace is still starting, or the app has
     /// no connection to it and the tree shown is the last one seen.
     fn write_block(&self, cx: &App) -> Option<&'static str> {
-        if self.read_only {
+        let git = self.git.read(cx);
+        if self.read_only || (git.starting() && self.is_offline(cx)) {
             Some(WORKSPACE_STARTING)
         } else if self.is_offline(cx) {
             Some(NOT_CONNECTED)
+        } else if self.is_stale(cx) {
+            Some(REFRESHING)
         } else {
             None
         }
     }
-    /// The tree shows remembered data from a workspace the app is not connected to.
+    /// The tree shows remembered data from a workspace the app is not connected to. Nothing is
+    /// read meanwhile.
     pub(crate) fn is_offline(&self, cx: &App) -> bool {
         self.git.read(cx).offline() && self.is_remote_root()
+    }
+    /// The tree is not live data yet: offline, or the reload after reconnecting has not landed.
+    fn is_stale(&self, cx: &App) -> bool {
+        self.git.read(cx).stale() && self.is_remote_root()
     }
     /// Refuses a write when `write_block` says so, and says why. Returns whether it refused.
     fn refuse_write(&mut self, cx: &mut Context<Self>) -> bool {
@@ -2146,12 +2175,91 @@ mod tests {
                     assert!(explorer.naming.is_none());
                 }
 
-                // Connect brought the link back: writes work again and the tree is read again.
+                // Connect brought the link back: the tree is read again, but it stays read-only
+                // (and says why) until the first reload lands.
                 git.update(cx, |git, cx| git.bind(ROOT.into(), false, cx));
-                assert!(!explorer.is_offline(cx));
+                assert!(!explorer.is_offline(cx) && explorer.is_stale(cx));
+                explorer.op_error = None;
+                explorer.start_create(false, None, window, cx);
+                assert_eq!(explorer.op_error.as_deref(), Some(REFRESHING));
+                assert!(explorer.naming.is_none());
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |explorer, window, cx| {
+                assert!(!explorer.is_stale(cx));
                 explorer.op_error = None;
                 explorer.start_create(false, None, window, cx);
                 assert!(explorer.naming.is_some() && explorer.op_error.is_none());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_workspace_that_is_starting_says_so_and_the_note_follows_the_link(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, git) = explorer_window(cx);
+        window
+            .update(cx, |explorer, window, cx| {
+                explorer.cwd = ROOT.into();
+                explorer.enabled = true;
+                explorer.expanded.insert(ROOT.into());
+                git.update(cx, |git, cx| git.bind(ROOT.into(), true, cx));
+                explorer.link_state = (true, false);
+                explorer.rebuild(cx);
+                let note = |explorer: &Explorer| match explorer.lines.first() {
+                    Some(Line::Note { text, .. }) => text.to_string(),
+                    _ => String::new(),
+                };
+                assert!(note(explorer).starts_with("Not loaded"));
+                git.update(cx, |git, cx| git.set_starting(true, cx));
+                explorer.start_create(false, None, window, cx);
+                assert_eq!(explorer.op_error.as_deref(), Some(WORKSPACE_STARTING));
+                explorer.rebuild(cx);
+                assert_eq!(note(explorer), "Workspace starting");
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_late_listing_of_another_root_is_dropped(cx: &mut gpui::TestAppContext) {
+        let (window, git) = explorer_window(cx);
+        let other = "remote://env-octo-xyz/workspaces/widgets";
+        window
+            .update(cx, |explorer, _, cx| {
+                explorer.cwd = ROOT.into();
+                explorer.apply_listing(other.into(), Ok(listing(other, &["secret.rs"])), cx);
+                assert!(explorer.dirs.is_empty());
+                assert!(git.read(cx).remote.peek(other).is_none());
+                assert!(git.read(cx).remote.peek(ROOT).is_none());
+                // A sibling that shares the prefix is another root too.
+                let sibling = format!("{ROOT}-wt");
+                explorer.apply_listing(sibling.clone(), Ok(listing(&sibling, &["x"])), cx);
+                assert!(explorer.dirs.is_empty());
+                // The root's own answer is kept and confirms the root.
+                explorer.apply_listing(ROOT.into(), Ok(listing(ROOT, &["a.rs"])), cx);
+                assert_eq!(explorer.dirs.len(), 1);
+                assert!(git.read(cx).remote.peek(ROOT).unwrap().updated.is_some());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn leaving_a_root_keeps_the_time_of_its_last_live_read(cx: &mut gpui::TestAppContext) {
+        let (window, git) = explorer_window(cx);
+        window
+            .update(cx, |explorer, _, cx| {
+                explorer.cwd = ROOT.into();
+                explorer.apply_listing(ROOT.into(), Ok(listing(ROOT, &["a.rs"])), cx);
+                let read_at = git.read(cx).remote.peek(ROOT).unwrap().updated.unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                explorer.leave_root(cx);
+                assert_eq!(
+                    git.read(cx).remote.peek(ROOT).unwrap().updated,
+                    Some(read_at)
+                );
             })
             .unwrap();
     }

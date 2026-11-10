@@ -2099,3 +2099,37 @@ fn queued_messages_of_a_remote_session_offer_no_steer(cx: &mut TestAppContext) {
         .unwrap();
     assert!(visual.debug_bounds("queue-steer").is_none());
 }
+
+/// The panels dim and refuse writes only for a link that is known to be down. A conversation that
+/// has not finished its first refresh knows nothing, and neither does a session without one.
+#[gpui::test]
+fn the_panel_link_is_known_only_after_the_workspace_answered_or_failed(cx: &mut TestAppContext) {
+    let view = conversation(cx);
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            // First refresh not finished: not online yet, but nothing says it is down.
+            view.remote_state.online = false;
+            assert!(!view.panel_link_known());
+            // Live.
+            view.set_online_for_test(true);
+            assert!(view.panel_link_known());
+            // It was live and then dropped: a known drop.
+            view.set_online_for_test(false);
+            assert!(view.panel_link_known());
+        });
+    });
+    let view = conversation(cx);
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            view.remote_state.online = false;
+            view.remote_state.error = Some("Could not reach the codespace.".into());
+            assert!(view.panel_link_known());
+            view.remote_state.error = None;
+            view.remote_state.waking = true;
+            assert!(view.panel_link_known());
+            view.remote_state.waking = false;
+            view.cloud_stopped = true;
+            assert!(view.panel_link_known());
+        })
+    });
+}
