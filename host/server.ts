@@ -16,6 +16,8 @@ import {
 import { HostEngine } from "./engine";
 import { writeAttachmentChunk, readAttachmentChunk } from "./attachments";
 import { HostUploads } from "./uploads";
+import { HostKit, installLogScrubber, scrubSecrets } from "./kit";
+import { setClaudeKitProvider } from "../src/integrations/harness/providers/claude/claudeKit";
 import type { LinkedWorkItem } from "../src/features/sessions/model/session";
 import { parseGithubWorkItemUrl } from "../src/features/sessions/model/sessionWorkItem";
 import { SyncTransfers } from "./sync-transfer";
@@ -138,6 +140,7 @@ export function createHostServer(
   engine: HostEngine,
   providers: RemoteProvider[],
   lifecycle?: (request: IncomingMessage, response: ServerResponse) => void,
+  options: { kitHome?: string } = {},
 ) {
   const catalogs = new Map<
     string,
@@ -197,6 +200,13 @@ export function createHostServer(
   // Sweeps expired staging at startup, on a timer, and on begin/chunk/commit.
   const uploads = new HostUploads(engine.store.uploadDir);
   uploads.startSweeper();
+  // The kit's secrets must never reach Host logs or error text.
+  const restoreConsole = installLogScrubber();
+  const kit = new HostKit(uploads, {
+    home: options.kitHome,
+    resolveClaude: async () => (await resolveBinary.claude()).path,
+  });
+  setClaudeKitProvider(() => kit.current());
   const server = createServer(
     { requestTimeout: 20_000, headersTimeout: 10_000, maxHeaderSize: 8192 },
     async (request, response) => {
@@ -301,6 +311,8 @@ export function createHostServer(
                 "attachments.upload",
                 "attachments.read",
                 "uploads",
+                "kit",
+                "claude.kit",
                 "sessions.draft",
                 "sessions.plan",
                 "workspace.watch",
@@ -440,6 +452,23 @@ export function createHostServer(
           case "uploads.discard":
             result = uploads.discard(params);
             break;
+          case "kit.apply":
+            result = await kit.apply(params);
+            break;
+          case "kit.secrets":
+            result = kit.secrets(params);
+            break;
+          case "kit.probe":
+            result = kit.probe(params);
+            break;
+          case "kit.health": {
+            const cwd =
+              typeof params.projectId === "string"
+                ? engine.store.project(params.projectId).cwd
+                : homedir();
+            result = await kit.health(cwd);
+            break;
+          }
           case "devices.revokeSelf":
             // Only the caller's own credential. Sessions and other devices
             // are unaffected; the host keeps running.
@@ -657,7 +686,9 @@ export function createHostServer(
           response.writeHead(400).end(
             JSON.stringify({
               error:
-                error instanceof Error ? error.message : "Host request failed",
+                error instanceof Error
+                  ? scrubSecrets(error.message)
+                  : "Host request failed",
             }),
           );
       }
@@ -665,6 +696,10 @@ export function createHostServer(
   );
   // Shutdown (and tests) close the server: release every change watcher.
   server.on("close", () => workspace.close());
-  server.once("close", () => uploads.stopSweeper());
+  server.once("close", () => {
+    uploads.stopSweeper();
+    setClaudeKitProvider(undefined);
+    restoreConsole();
+  });
   return server;
 }

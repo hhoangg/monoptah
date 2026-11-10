@@ -18,6 +18,7 @@ import {
   type RemoteProvider,
 } from "../src/features/connections/model/protocol";
 import { providerLaunch, resolveProvider } from "./process";
+import { pinKitArgs, scrubSecrets } from "./kit";
 
 const exec = promisify(execFile);
 const ALLOWED_EXEC_ARGS: readonly (readonly string[])[] = [
@@ -38,6 +39,31 @@ const OPENCODE_EXEC_ARGS: readonly (readonly string[])[] = [
 ];
 // Devin reads its login location from `auth status`.
 const DEVIN_EXEC_ARGS: readonly (readonly string[])[] = [["auth", "status"]];
+
+const KIT_ENV_NAME = /^MONOPTAH_KIT_[A-Z0-9_]{1,128}$/;
+
+/** Kit secrets for a Claude child only; never merged into process.env. */
+function kitEnv(args: Record<string, unknown>): Record<string, string> {
+  if (args.env === undefined) return {};
+  if (
+    args.binaryProvider !== "claude" ||
+    typeof args.env !== "object" ||
+    args.env === null ||
+    Array.isArray(args.env)
+  )
+    throw new Error("Unsupported child environment");
+  const out: Record<string, string> = {};
+  for (const [name, value] of Object.entries(args.env)) {
+    if (
+      !KIT_ENV_NAME.test(name) ||
+      typeof value !== "string" ||
+      value.includes("\0")
+    )
+      throw new Error("Unsupported child environment");
+    out[name] = value;
+  }
+  return out;
+}
 
 function execArgsAllowed(provider: RemoteProvider, args: string[]): boolean {
   const matches = (allowed: readonly string[]) =>
@@ -355,10 +381,14 @@ export class HostChildBackend implements ChildBackend {
         stdio: ["pipe", "pipe", "pipe", "pipe"],
         detached: process.platform !== "win32",
         windowsHide: true,
-        env: { ...process.env, MONOCODE_HOST: "1" },
+        env: { ...process.env, ...kitEnv(args), MONOCODE_HOST: "1" },
       },
     );
     this.children.set(id, child);
+    // A kit dir a running child was launched with must outlive a newer apply.
+    const unpin = pinKitArgs(launch.args);
+    child.once("close", unpin);
+    child.once("error", unpin);
     child.stdin.on("error", () => {
       /* write callbacks report failures */
     });
@@ -382,6 +412,10 @@ export class HostChildBackend implements ChildBackend {
   ): void {
     let buffer = "";
     child[stream].setEncoding("utf8");
+    // stdout is the provider protocol; stderr is diagnostic text that may
+    // echo a secret, so only it is scrubbed.
+    const scrubLine = (line: string) =>
+      stream === "stderr" ? scrubSecrets(line) : line;
     child[stream].on("data", (data: string) => {
       buffer += data;
       let index: number;
@@ -392,7 +426,7 @@ export class HostChildBackend implements ChildBackend {
           void this.kill(id);
           return;
         }
-        this.emit(`harness-${stream}`, { sessionId: id, line });
+        this.emit(`harness-${stream}`, { sessionId: id, line: scrubLine(line) });
       }
       if (buffer.length > 8 * 1024 * 1024) {
         buffer = "";
@@ -401,7 +435,10 @@ export class HostChildBackend implements ChildBackend {
     });
     child[stream].on("end", () => {
       if (buffer)
-        this.emit(`harness-${stream}`, { sessionId: id, line: buffer });
+        this.emit(`harness-${stream}`, {
+          sessionId: id,
+          line: scrubLine(buffer),
+        });
     });
   }
 

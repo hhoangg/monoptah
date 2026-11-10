@@ -10,6 +10,7 @@ import {
 
 const sent: string[] = [];
 const spawned: string[][] = [];
+const spawnedEnv: (Record<string, string> | undefined)[] = [];
 let onLine: ((line: string) => void) | undefined;
 let onExit: ((code?: number | null) => void) | undefined;
 const writeChild = vi.fn(async (_id: string, line: string) => {
@@ -18,8 +19,19 @@ const writeChild = vi.fn(async (_id: string, line: string) => {
 
 vi.mock("../../core/child", () => ({
   resolveClaudeBinary: async () => ({ path: "/fake/claude" }),
-  spawnChild: async (_id: string, _path: string, args: string[]) => {
+  spawnChild: async (
+    _id: string,
+    _path: string,
+    args: string[],
+    _cwd?: string,
+    _account?: unknown,
+    _binaryProvider?: unknown,
+    _codexStore?: unknown,
+    _devinAskEdits?: unknown,
+    env?: Record<string, string>,
+  ) => {
     spawned.push(args);
+    spawnedEnv.push(env);
   },
   killChild: async () => undefined,
   unwatchChild: () => undefined,
@@ -45,6 +57,7 @@ const {
   stopClaudeSession,
   __claudeTestReset,
 } = await import("./claude");
+import { setClaudeKitProvider, type ClaudeKit } from "./claudeKit";
 import type { HarnessEvent } from "../../core/types";
 import type { RuntimeMode, TurnIntent } from "../../../../features/sessions/model/session";
 
@@ -258,6 +271,8 @@ function backgroundUpdates(events: HarnessEvent[]): string[][] {
 beforeEach(() => {
   sent.length = 0;
   spawned.length = 0;
+  spawnedEnv.length = 0;
+  setClaudeKitProvider(undefined);
   onLine = undefined;
   onExit = undefined;
   writeChild.mockClear();
@@ -2043,5 +2058,101 @@ describe("claude manual compaction", () => {
       text: "Compacted context",
     });
     expect(events.some((event) => event.type === "message.delta")).toBe(false);
+  });
+});
+
+describe("claude kit", () => {
+  const kit = (over: Partial<ClaudeKit> = {}): ClaudeKit => ({
+    hash: "a".repeat(64),
+    secretsHash: "s1",
+    pluginDirs: ["/k/current/plugins/p"],
+    mcpConfig: "/k/current/mcp.json",
+    env: { MONOPTAH_KIT_X_TOKEN: "secret-value" },
+    ...over,
+  });
+
+  it("gives the interactive spawn the plugin dirs, MCP config and env", async () => {
+    setClaudeKitProvider(() => kit());
+    await startTurn("s1");
+    expect(spawned[0]).toEqual(
+      expect.arrayContaining([
+        "--plugin-dir",
+        "/k/current/plugins/p",
+        "--mcp-config",
+        "/k/current/mcp.json",
+      ]),
+    );
+    expect(spawnedEnv[0]).toEqual({ MONOPTAH_KIT_X_TOKEN: "secret-value" });
+  });
+
+  it("leases the kit at snapshot time and releases it once the child is spawned", async () => {
+    const release = vi.fn();
+    const lease = vi.fn(() => release);
+    setClaudeKitProvider(() => kit({ lease }));
+    await startTurn("s1");
+    expect(lease).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it("spawns with no kit flags and no env when none is applied", async () => {
+    await startTurn("s1");
+    expect(spawned[0]).not.toContain("--plugin-dir");
+    expect(spawned[0]).not.toContain("--mcp-config");
+    expect(spawnedEnv[0]).toBeUndefined();
+  });
+
+  it.each([
+    ["kit hash", { hash: "b".repeat(64) }],
+    ["secrets-file hash", { secretsHash: "s2" }],
+  ])("respawns with --resume when the %s changes", async (_label, change) => {
+    let current = kit();
+    setClaudeKitProvider(() => current);
+    const first = await startTurn("s1");
+    emit({ type: "result", subtype: "success", session_id: "sess_1" });
+    await first.turn;
+    current = kit(change);
+    const second = sendClaudeTurn({
+      sessionId: "s1",
+      cwd: "/repo",
+      model: "claude:claude-sonnet-5",
+      modelSettings: {},
+      runtimeMode: "supervised",
+      text: "again",
+      attachments: [],
+      onEvent: () => undefined,
+    });
+    await waitFor(() => spawned.length === 2, "replacement Claude process");
+    expect(spawned[1]).toEqual(expect.arrayContaining(["--resume", "sess_1"]));
+    emit({ type: "system", subtype: "init", session_id: "sess_1" });
+    await waitFor(
+      () => parse().filter((m) => m.type === "user").length === 2,
+      "second prompt",
+    );
+    emit({ type: "result", subtype: "success", session_id: "sess_1" });
+    await second;
+  });
+
+  it("keeps the live process when the kit is unchanged", async () => {
+    setClaudeKitProvider(() => kit());
+    const first = await startTurn("s1");
+    emit({ type: "result", subtype: "success", session_id: "sess_1" });
+    await first.turn;
+    const second = sendClaudeTurn({
+      sessionId: "s1",
+      cwd: "/repo",
+      model: "claude:claude-sonnet-5",
+      modelSettings: {},
+      runtimeMode: "supervised",
+      text: "again",
+      attachments: [],
+      onEvent: () => undefined,
+    });
+    await waitFor(
+      () => parse().filter((m) => m.type === "user").length === 2,
+      "second prompt",
+    );
+    expect(spawned).toHaveLength(1);
+    emit({ type: "result", subtype: "success", session_id: "sess_1" });
+    await second;
   });
 });

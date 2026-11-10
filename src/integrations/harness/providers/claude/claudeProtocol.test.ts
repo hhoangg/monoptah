@@ -154,6 +154,22 @@ describe("buildClaudeSpawnArgs", () => {
     expect(args).not.toContain("--permission-prompt-tool");
   });
 
+  it("adds the kit plugin dirs and MCP config to interactive spawns only", () => {
+    const kit = {
+      pluginDirs: ["/k/current/plugins/a", "/k/current/plugins/b"],
+      mcpConfig: "/k/current/mcp.json",
+    };
+    const args = buildClaudeSpawnArgs({ model: "claude-sonnet-5", kit });
+    expect(args.filter((arg) => arg === "--plugin-dir")).toHaveLength(2);
+    expect(args[args.indexOf("--plugin-dir") + 1]).toBe(kit.pluginDirs[0]);
+    expect(args[args.indexOf("--mcp-config") + 1]).toBe(kit.mcpConfig);
+    expect(args).not.toContain("--strict-mcp-config");
+    const isolated = buildClaudeSpawnArgs({ isolated: true, kit });
+    expect(isolated).not.toContain("--plugin-dir");
+    expect(isolated).not.toContain(kit.mcpConfig);
+    expect(isolated).toContain("--strict-mcp-config");
+  });
+
   it("locks isolated read-only prompts to plan mode", () => {
     const args = buildClaudeSpawnArgs({
       isolated: true,

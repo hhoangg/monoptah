@@ -250,6 +250,8 @@ export function buildClaudeSpawnArgs(input: {
   includePartialMessages?: boolean;
   maxTurns?: number;
   isolated?: boolean;
+  /** Interactive spawns only; isolated helper spawns never get the kit. */
+  kit?: { pluginDirs: string[]; mcpConfig?: string };
 }): string[] {
   const args = [
     "--output-format",
@@ -279,6 +281,10 @@ export function buildClaudeSpawnArgs(input: {
   } else {
     args.push(`--setting-sources=${CLAUDE_SETTING_SOURCES}`);
     args.push("--settings", JSON.stringify(settings));
+    for (const dir of input.kit?.pluginDirs ?? [])
+      args.push("--plugin-dir", dir);
+    // Additive: the remote's own MCP servers stay (no --strict-mcp-config).
+    if (input.kit?.mcpConfig) args.push("--mcp-config", input.kit.mcpConfig);
   }
   if (input.model) args.push("--model", input.model);
   if (input.effort) args.push("--effort", input.effort);
@@ -1106,6 +1112,8 @@ export function claudeSettingsKey(input: {
   context?: string;
   runtimeMode: RuntimeMode;
   hooks?: boolean;
+  /** Kit hash plus secrets-file hash; empty when no kit is applied. */
+  kit?: string;
 }): string {
   return [
     input.model,
@@ -1115,6 +1123,7 @@ export function claudeSettingsKey(input: {
     input.context ?? "",
     input.runtimeMode,
     input.hooks === false ? "nohooks" : "hooks",
+    input.kit ?? "",
   ].join("|");
 }
 
