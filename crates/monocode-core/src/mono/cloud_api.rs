@@ -30,6 +30,7 @@
 //! Listings only read cached or read-only state.
 //!
 //! Secret values never pass through this module.
+use crate::cloud_sessions::kit_prefs::ApiKit;
 use crate::cloud_sessions::{
     CloudBackendKind, CloudBinding, CloudRef, CloudSessions, CloudState, DeleteOutcome,
     InstanceSession, SessionTarget, StartupSummary,
@@ -146,6 +147,8 @@ pub struct CloudTarget {
     pub instance: InstanceChoice,
     /// Backend options (`branch`, `machine`, `cpus`, ...), only with [`InstanceChoice::New`].
     pub options: Map<String, Value>,
+    /// `target.kit`. The API can only turn the user's kit off, never widen it.
+    pub kit: ApiKit,
 }
 
 impl CloudTarget {
@@ -154,6 +157,7 @@ impl CloudTarget {
             kind,
             instance,
             options: Map::new(),
+            kit: ApiKit::Default,
         }
     }
     /// Text option `key`, e.g. `branch`.
@@ -185,15 +189,21 @@ pub fn target_from_input(input: &Value) -> Result<Option<CloudTarget>, String> {
         ),
         Some(_) => return Err("target.instance is not valid".into()),
     };
+    let kit = map
+        .get(validate::KIT_OPTION)
+        .map(ApiKit::parse)
+        .transpose()?
+        .unwrap_or(ApiKit::Default);
     let options = map
         .iter()
-        .filter(|(key, _)| !matches!(key.as_str(), "kind" | "instance"))
+        .filter(|(key, _)| !matches!(key.as_str(), "kind" | "instance" | validate::KIT_OPTION))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
     Ok(Some(CloudTarget {
         kind,
         instance,
         options,
+        kit,
     }))
 }
 

@@ -404,6 +404,21 @@ fn parses_the_target_of_sessions_start() {
     assert_eq!(omitted.kind, CloudBackendKind::DockerSandbox);
     assert_eq!(omitted.instance, InstanceChoice::New);
     assert_eq!(omitted.options["cpus"], 4);
+    // The kit option is not a backend option; it defaults to the user's kit.
+    assert_eq!(new.kit, ApiKit::Default);
+    assert!(!new.options.contains_key("kit"));
+    let none = target_from_input(&json!({"target":{"kind":"sandbox","kit":"none","cpus":4}}))
+        .unwrap()
+        .unwrap();
+    assert_eq!(none.kit, ApiKit::None);
+    assert_eq!(none.options.len(), 1, "only cpus stays an option");
+    let default = target_from_input(&json!({"target":{"kind":"sandbox","kit":"default"}}))
+        .unwrap()
+        .unwrap();
+    assert_eq!(default.kit, ApiKit::Default);
+    assert!(
+        target_from_input(&json!({"target":{"kind":"sandbox","kit":{"skills":["a"]}}})).is_err()
+    );
     let named = target_from_input(&json!({"target":{"kind":"codespace","instance":"octo-abc"}}))
         .unwrap()
         .unwrap();

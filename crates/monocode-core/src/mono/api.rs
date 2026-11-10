@@ -679,6 +679,46 @@ mod tests {
         }
     }
     #[test]
+    fn cloud_target_kit_may_only_narrow_the_users_kit() {
+        let ok = |input| validate("sessions.start", &input);
+        for kind in ["codespace", "sandbox"] {
+            for kit in ["none", "default"] {
+                assert!(
+                    ok(json!({"prompt":"x","target":{"kind":kind,"instance":"new","kit":kit}}))
+                        .is_ok(),
+                    "{kind} {kit}"
+                );
+            }
+        }
+        // No way to name items, add servers or switch secrets on.
+        for kit in [
+            json!({"skills":["review"]}),
+            json!({"mcpServers":{"x":{"command":"npx"}}}),
+            json!(["mcp:user:github"]),
+            json!("all"),
+            json!("secrets"),
+            json!(true),
+            json!(null),
+        ] {
+            let error =
+                ok(json!({"prompt":"x","target":{"kind":"codespace","instance":"new","kit":kit.clone()}}))
+                    .unwrap_err();
+            assert!(error.contains("target.kit must be"), "{kit}: {error}");
+        }
+        for key in ["skills", "mcpServers", "plugins", "kitItems", "secrets"] {
+            let error =
+                ok(json!({"prompt":"x","target":{"kind":"codespace","instance":"new",key:["a"]}}))
+                    .unwrap_err();
+            assert!(error.contains("target does not take"), "{key}: {error}");
+        }
+        // A reconnect never sends the kit again.
+        let error = ok(
+            json!({"prompt":"x","target":{"kind":"codespace","instance":"octo-abc","kit":"none"}}),
+        )
+        .unwrap_err();
+        assert!(error.contains("only applies when creating"), "{error}");
+    }
+    #[test]
     fn cloud_target_rejects_options_that_need_a_local_checkout() {
         for kind in ["codespace", "sandbox"] {
             let target = json!({"kind":kind,"instance":"new"});
