@@ -1496,8 +1496,8 @@ ticket, after review and after merge.
 | F4-J | 1 | merged | csi-f4-j | merge 307d3d84. Opus review: no blockers; fixed install race re-decide, fsync, edge fixtures as TS contract (duplicate key line is skipped), rewrite_cwd escaping, orphan fork cleanup. Known: incoming strictly shorter than existing = Diverged (per spec); fork does not copy file-history/<id>; .pre-cloud overwritten on second replace. |
 | F4-1 | 1 | merged | csi-f4-1 | merge a4103dad (conflict markers fixed in 62b35640 and the cfg(test) gate in the next commit). Opus review x2 fixed: default-branch detection fails closed (-cloud when origin default unconfirmed), stale origin/HEAD, tag/branch name clash, -U3, ignore-submodules=none, splitIndex, scratch object dir, fetch process-group kill, ':' in alternates path. Decisions: at origin tip needs_push=false even on default; upstream = default counts as no upstream; behind upstream goes to <branch>-cloud (beyond spec, user to confirm). push_target makes one ls-remote call (10 s cap). |
 | A1 | 1 | merged | csi-a1 | merge 740e6434. Local only. Opus review x2: fixed mention insertion picking another credential (id form when label ambiguous/reserved), icon only for resolved accounts, quote labels use id form. Pending, needs the user: manual verification (real accounts). Known Low: trailing punctuation can resolve to sibling label (x vs x.); steered Mono message uses last account snapshot (pre-existing path). |
-| HR1 | 2 | todo | - | release: stop and ask |
-| H2a | 2 | todo | - | |
+| HR1 | 2 | merged | - | COMBINED release by user decision (2026-11-10): one host-v1.1.0 (1.1.0+monoptah) carrying H1+HR2+HR3 content (H3, F2-3h/4h/5h, F3-3h, F4-2h); 1.0.0 skipped. Tag host-v1.1.0 on commit 29af739d (only the tag was pushed, no remote branch). Run https://github.com/hhoangg/monoptah/actions/runs/42845756841 succeeded; release has 6 targets + .sha256 + host-release.json, not latest (latest stays v0.33.0), attestation verified (gh attestation verify exit 0). |
+| H2a | 2 | in progress | csi-h2a | pin host-v1.1.0 (1.1.0+monoptah) |
 | H2b | 2 | todo | - | |
 | F1-4 | 2 | todo | - | |
 | F2-1 | 2 | merged | csi-f2-1 | merge f0c7d2af. Opus review x3 fixed: Review discard bypassed running-turn policy, per-cwd gate, classic layout chrome, GitPicker branch policy, cwd captured at click time. Pending, needs the user: manual in-app check. docs/docker-sandbox-spec.html sandbox Explorer/Changes stays an OPEN DECISION for the owner. Known: running check is app-side and racy until F2-5h; list_dir client cap not implemented (Host hard-errors above 5000; move to a Host ticket). |
@@ -1509,14 +1509,14 @@ ticket, after review and after merge.
 | F2-3h | 3 | merged | csi-f2-3h-5h | merge 813f30c3. Opus review fixed: idempotent retry, linked-dir cross-project, per-path mutex, stale temp sweep. Contract for F2-3 client: Host hashes RAW BYTES (BOM not stripped); missing target with expectedSha256 = mismatch. |
 | F2-4h | 3 | merged | csi-f2-4h | merge 64f9c10e. Opus review x4 fixed: dir watch retry (wanted vs live), recreated ref dirs, replaced client dirs by dev:ino, confinement on re-create, async rate-limited heal with generation tokens, once-per-episode overflow. Host only; reaches users after HR2. |
 | F2-5h | 3 | merged | csi-f2-3h-5h | merge 813f30c3. Idle guard on discard/stash (project lock atomic), 90 s push/pull/sync. Known: 90 s timeout kills git only (not its process group); push now holds the project lock up to 90 s. |
-| HR2 | 3 | todo | - | release: stop and ask |
+| HR2 | 3 | merged | - | see HR1: covered by the combined host-v1.1.0 release; pin 1.1.0 (H2a) |
 | F2-3 | 3 | todo | - | |
 | F2-4 | 3 | todo | - | |
 | F2-5 | 3 | todo | - | |
 | F3-3h | 4 | merged | csi-f3-3h | merge c7113999. Opus review x3 fixed: tar unpacker hardened, fresh unpack per apply, async unpack, secrets scrub (single pass), child env allowlist MONOPTAH_KIT_*, kit.health via temp CLAUDE_CONFIG_DIR in own process group with hard timeout (signInNeeded vs failed; sign-in state not observable, D12), rollback + crash recovery, leases vs prune. Result field kitServers (app side must use it). No claude mcp list --mcp-config (2.1.322 has no such flag). |
 | F3-5h | 4 | skipped: dropped by user decision D12 | - | no OAuth sign-in merge on the Host |
 | F4-2h | 4 | merged | csi-f4-2h | merge be7abcb2 (server.ts and spec conflicts resolved keeping both; host tests 438 passed, check:web green). Opus review x3 fixed: cwd rewrite only named roots (fromCwds REQUIRED), TS/Rust serde parity pinned by shared fixtures, instance:new rollback, force-added files, deterministic fork id, 50 MB cap, default branch refused only when head != origin tip (no ls-remote). Contract for F4-3a: delete/unbind the old Host session before re-import; send fromCwds. |
-| HR3 | 4 | todo | - | release: stop and ask |
+| HR3 | 4 | merged | - | see HR1: covered by the combined host-v1.1.0 release; pin 1.1.0 (H2a) |
 | F3-4 | 4 | todo | - | |
 | F3-5 | 4 | todo | - | reduced (D12): config-only OAuth servers, 'Sign in in the cloud'; depends on F3-4 only |
 | F4-3a | 4 | todo | - | |
