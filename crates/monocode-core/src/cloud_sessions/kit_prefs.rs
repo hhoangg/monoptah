@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::kit::{
-    Exclusion, KitInventory, KitMcpServer, KitPlugin, KitSkill, LocalOnlyReason, McpCompat,
-    McpScope, Runtime, SecretLocation, SkillScope,
+    build_inventory, Exclusion, KitInventory, KitMcpServer, KitPlugin, KitRoots, KitSkill,
+    LocalOnlyReason, McpCompat, McpScope, Runtime, SecretLocation, SkillScope, Workspace,
 };
 
 /// Shown once, the first time the kit is enabled. The wording is fixed by design 3.2.2.
@@ -389,6 +389,17 @@ fn items(inventory: &KitInventory) -> Vec<Item> {
         .chain(inventory.mcp_servers.iter().map(mcp_item))
         .chain(inventory.plugins.iter().map(plugin_item))
         .collect()
+}
+
+/// The inventory the Settings page and the start panel show: the default account of this
+/// computer, for `project`. Reads many files: call it from a worker, never from the UI
+/// thread.
+///
+/// It is built for a codespace, the more permissive of the two workspaces (only the Docker
+/// rule differs). The start flow re-checks the final kit for the workspace it really targets.
+pub fn scan(project: &std::path::Path) -> Result<KitInventory, String> {
+    let roots = KitRoots::for_profile(&crate::accounts::Profile::default(), project)?;
+    Ok(build_inventory(&roots, Workspace::Codespace))
 }
 
 /// The rows of one tab, with the preferences applied.

@@ -2,6 +2,7 @@
 mod appearance;
 mod archive;
 mod chat;
+mod cloud;
 mod connections;
 mod general;
 mod inbox;
@@ -16,6 +17,7 @@ mod worktrees;
 
 pub(super) use appearance::parse_hex;
 pub(crate) use appearance::{ACCENTS, swatch};
+pub(super) use cloud::{CloudState, Load as CloudLoad};
 pub(super) use connections::ConnectionsState;
 pub(crate) use keybindings::command_shortcut;
 pub(super) use mobile::MobileState;
@@ -45,6 +47,7 @@ impl SettingsView {
             Section::Inbox => self.inbox_page(cx),
             Section::Archive => self.archive_page(cx),
             Section::Worktrees => self.worktrees_page(cx),
+            Section::Cloud => self.cloud_page(cx),
         }
     }
 }
