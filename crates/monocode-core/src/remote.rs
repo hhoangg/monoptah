@@ -261,24 +261,40 @@ fn rpc(
     method: &str,
     params: Value,
 ) -> Result<Value, String> {
-    rpc_with(endpoint, token, environment_id, method, params, false)
+    rpc_with(endpoint, token, environment_id, method, params, None, false)
 }
+
+/// Total time any ordinary RPC may take.
+const DEFAULT_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Total time a push, pull or sync may take. The Host stops git after 90 s, so this
+/// leaves room for its own error reply to arrive first.
+pub const GIT_REMOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The result of a long operation that timed out on our side. The host may still be
+/// running it, so callers must re-read state instead of reporting a failure.
+pub const MAY_STILL_RUN: &str = "The operation may still be running on the host. Checking...";
 
 /// `closed_is_dead`: a connection reset or closed without a reply also means
 /// the route is gone. Behind a codespace tunnel that is what a stopped host
 /// looks like: the local forward accepts, then the remote side hangs up.
+///
+/// `timeout`: `None` is the ordinary 30 s limit. `Some(limit)` is for operations that may
+/// outlive the client (push, pull, sync): hitting it returns `MAY_STILL_RUN`, and the
+/// connection is dropped, so a reply that arrives later is never read.
 fn rpc_with(
     endpoint: &str,
     token: &str,
     environment_id: Option<&str>,
     method: &str,
     params: Value,
+    timeout: Option<std::time::Duration>,
     closed_is_dead: bool,
 ) -> Result<Value, String> {
     let agent = ureq::AgentBuilder::new()
         .redirects(0)
         .timeout_connect(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(timeout.unwrap_or(DEFAULT_RPC_TIMEOUT))
         .build();
     let payload = json!({ "version": 1, "environmentId": environment_id, "method": method, "params": params });
     let response = agent
@@ -296,6 +312,9 @@ fn rpc_with(
                 "Machine is unreachable. Check the host and SSH tunnel, then reconnect.".into(),
             )
         }
+        Err(ureq::Error::Transport(error)) if timeout.is_some() && timed_out(&error) => {
+            return Err(MAY_STILL_RUN.into())
+        }
         Err(_) => {
             return Err("The host request did not complete. Retry to confirm its result.".into())
         }
@@ -306,7 +325,13 @@ fn rpc_with(
         .into_reader()
         .take(MAX_RESPONSE_BYTES + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            if timeout.is_some() && e.kind() == std::io::ErrorKind::TimedOut {
+                MAY_STILL_RUN.to_string()
+            } else {
+                e.to_string()
+            }
+        })?;
     if bytes.len() as u64 > MAX_RESPONSE_BYTES {
         return Err("Host response is too large".into());
     }
@@ -335,6 +360,20 @@ fn connection_closed(error: &ureq::Transport) -> bool {
                 ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof
             )
         }) {
+            return true;
+        }
+        source = error.source();
+    }
+    false
+}
+
+fn timed_out(error: &ureq::Transport) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = source {
+        if error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::TimedOut)
+        {
             return true;
         }
         source = error.source();
@@ -440,11 +479,18 @@ impl Connections {
         Ok(())
     }
 
-    pub fn request(
+    pub fn request(&self, machine_id: &str, method: &str, params: Value) -> Result<Value, String> {
+        self.request_timeout(machine_id, method, params, None)
+    }
+
+    /// Like `request` with a per-request limit for long operations; see `rpc_with`.
+    /// Never wakes a workspace: cloud machines still need a live tunnel.
+    pub fn request_timeout(
         &self,
         machine_id: &str,
         method: &str,
         mut params: Value,
+        timeout: Option<std::time::Duration>,
     ) -> Result<Value, String> {
         if method == "environment.describe" {
             let values = params
@@ -495,6 +541,7 @@ impl Connections {
             Some(&machine.environment_id),
             method,
             params,
+            timeout,
             cloud,
         );
         if response
@@ -1397,13 +1444,88 @@ else:
                 let _ = stream.read(&mut buffer);
             }
         });
-        let call = |dead| rpc_with(&endpoint, "t", None, "projects.list", json!({}), dead);
+        let call = |dead| rpc_with(&endpoint, "t", None, "projects.list", json!({}), None, dead);
         assert!(call(true)
             .unwrap_err()
             .starts_with("Machine is unreachable"));
         assert!(call(false)
             .unwrap_err()
             .starts_with("The host request did not complete"));
+        server.join().unwrap();
+    }
+
+    /// A server that accepts, reads the request, and answers only after `delay`.
+    fn slow_server(delay: std::time::Duration) -> (String, std::thread::JoinHandle<bool>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0; 4096];
+            let _ = stream.read(&mut buffer);
+            std::thread::sleep(delay);
+            let body = r#"{"result":{"late":true}}"#;
+            // True when the late reply could still be written to a client that gave up.
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .is_ok()
+        });
+        (endpoint, server)
+    }
+
+    #[test]
+    fn a_timeout_on_a_long_operation_says_it_may_still_be_running() {
+        let (endpoint, server) = slow_server(std::time::Duration::from_millis(600));
+        let started = std::time::Instant::now();
+        let error = rpc_with(
+            &endpoint,
+            "t",
+            None,
+            "workspace.run",
+            json!({}),
+            Some(std::time::Duration::from_millis(150)),
+            false,
+        )
+        .unwrap_err();
+        // The passed limit applied (not the 30 s default), and the late reply is ignored.
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(error, MAY_STILL_RUN);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn the_long_limit_is_120_seconds_and_other_requests_keep_30() {
+        assert_eq!(GIT_REMOTE_TIMEOUT, std::time::Duration::from_secs(120));
+        assert_eq!(DEFAULT_RPC_TIMEOUT, std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_timeout_without_a_long_limit_is_a_plain_incomplete_request() {
+        // Same slow server, but the caller asked for the ordinary kind of request:
+        // simulated with a tiny closed-connection case, since 30 s is too long to wait.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0; 4096];
+            let _ = stream.read(&mut buffer);
+        });
+        let error = rpc_with(
+            &endpoint,
+            "t",
+            None,
+            "projects.list",
+            json!({}),
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(error.starts_with("The host request did not complete"));
         server.join().unwrap();
     }
 
