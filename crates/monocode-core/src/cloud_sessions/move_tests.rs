@@ -1834,3 +1834,23 @@ fn a_start_that_failed_resumes_after_a_restart_without_creating_a_second_codespa
         .count();
     assert_eq!(creates, 1, "a second codespace was created");
 }
+
+#[test]
+fn the_default_branch_is_used_only_when_head_is_origins_tip_and_nothing_is_pushed() {
+    let fx = Fx::with(|work| {
+        // On `main` exactly at origin's tip, with only uncommitted changes.
+        git(work, &["stash", "-q", "-u"]);
+        git(work, &["checkout", "-q", "main"]);
+        git(work, &["stash", "pop", "-q"]);
+    });
+    fx.install_push_counter();
+    let main_before = fx.origin_ref("main").unwrap();
+    fx.run().0.unwrap();
+    assert_eq!(fx.count_pushes(), 0, "the default branch is never pushed");
+    assert_eq!(fx.origin_ref("main").as_deref(), Some(main_before.as_str()));
+    assert_eq!(
+        fx.host.calls("workspace.applySnapshot")[0]["branch"],
+        "main"
+    );
+    assert_eq!(fx.origin_ref("main-cloud"), None);
+}
