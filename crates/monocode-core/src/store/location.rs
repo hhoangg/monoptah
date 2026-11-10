@@ -69,19 +69,50 @@ impl SessionLocation {
     }
 }
 
+/// Why a session with a stored but unparsable location is refused.
+pub const UNREADABLE_LOCATION: &str = "unreadable cloud location";
+
 impl Store {
     fn location_key(session: i64) -> String {
         format!("cloud-location:{session}")
     }
-    /// The location of a local session. A missing, empty or unreadable value is `Local`, so a
-    /// session never becomes unusable because of a bad setting.
+    /// The location of a local session. A missing or empty value is `Local`. A value that
+    /// is present but unreadable fails closed: guessing Local could start a second writer
+    /// on a session that lives in the cloud (design 4.9 R2).
     pub fn cloud_location(&self, session: i64) -> Result<SessionLocation, String> {
-        Ok(self
+        match self
             .setting(&Self::location_key(session))?
             .filter(|raw| !raw.is_empty())
-            .and_then(|raw| serde_json::from_str::<CloudLocation>(&raw).ok())
-            .map_or(SessionLocation::Local, SessionLocation::Cloud))
+        {
+            None => Ok(SessionLocation::Local),
+            Some(raw) => serde_json::from_str::<CloudLocation>(&raw)
+                .map(SessionLocation::Cloud)
+                .map_err(|_| UNREADABLE_LOCATION.to_string()),
+        }
     }
+    /// Explicit way back to Local when the cloud side is gone (for example the linked Host
+    /// record was deleted). Also clears the link and the sync cursor.
+    // TODO(part B): the UI (and F4-5, the return) calls this; nothing else may flip a
+    // Cloud session back to Local without the transcript reconciliation of F4-5.
+    pub fn reset_cloud_location_to_local(&self, session: i64) -> Result<(), String> {
+        if let Ok(SessionLocation::Cloud(location)) = self.cloud_location(session) {
+            self.save_setting(
+                &Self::synced_key(&location.environment_id, &location.host_session_id),
+                "",
+            )?;
+        }
+        let linked: Vec<i64> = self
+            .remote_sessions()?
+            .into_iter()
+            .filter(|(_, r)| r.linked_to == Some(session))
+            .map(|(id, _)| id)
+            .collect();
+        for id in linked {
+            self.link_remote_session(id, None)?;
+        }
+        self.save_setting(&Self::location_key(session), "")
+    }
+    // TODO(part B): only the move (F4-3a) and the return (F4-5) may call this.
     pub fn set_cloud_location(
         &self,
         session: i64,
@@ -151,12 +182,24 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn unreadable_location_reads_as_local_and_delete_forgets_it() {
+    fn unreadable_location_fails_closed_and_delete_forgets_it() {
         let mut store = Store::open(Path::new(":memory:")).unwrap();
         let session = store.create("claude", "/Users/me/repo").unwrap();
-        store
-            .save_setting(&format!("cloud-location:{}", session.id), "not json")
-            .unwrap();
+        let key = format!("cloud-location:{}", session.id);
+        store.save_setting(&key, "not json").unwrap();
+        assert_eq!(
+            store.cloud_location(session.id).unwrap_err(),
+            UNREADABLE_LOCATION
+        );
+        let row = crate::transcript::Row {
+            role: "user".into(),
+            text: "x".into(),
+            first: true,
+            sent_at: None,
+        };
+        assert!(store.write_rows(session.id, 0, &[row]).is_err());
+        // Missing and empty values are Local.
+        store.save_setting(&key, "").unwrap();
         assert_eq!(
             store.cloud_location(session.id).unwrap(),
             SessionLocation::Local
@@ -165,11 +208,31 @@ pub(crate) mod tests {
             .set_cloud_location(session.id, &SessionLocation::Cloud(cloud_location()))
             .unwrap();
         store.delete(session.id).unwrap();
+        assert_eq!(store.setting(&key).unwrap(), None);
+    }
+
+    #[test]
+    fn reset_to_local_clears_location_link_and_cursor() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let session = store.create("claude", "/Users/me/repo").unwrap();
+        store
+            .set_cloud_location(session.id, &SessionLocation::Cloud(cloud_location()))
+            .unwrap();
+        store.save_setting("cloud-synced:env:host-1", "4").unwrap();
+        store.reset_cloud_location_to_local(session.id).unwrap();
         assert_eq!(
-            store
-                .setting(&format!("cloud-location:{}", session.id))
-                .unwrap(),
-            None
+            store.cloud_location(session.id).unwrap(),
+            SessionLocation::Local
+        );
+        assert_eq!(store.cloud_synced_revision("env", "host-1").unwrap(), None);
+        // An unreadable value can be reset too.
+        store
+            .save_setting(&format!("cloud-location:{}", session.id), "junk")
+            .unwrap();
+        store.reset_cloud_location_to_local(session.id).unwrap();
+        assert_eq!(
+            store.cloud_location(session.id).unwrap(),
+            SessionLocation::Local
         );
     }
 }

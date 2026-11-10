@@ -13,7 +13,7 @@ use serde_json::Value;
 /// What one append changed, in local row indexes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AppendOutcome {
-    /// First row that was written or removed (the common prefix length).
+    /// First local row that was written or removed.
     pub start: usize,
     /// Rows upserted from `start`.
     pub written: usize,
@@ -21,11 +21,12 @@ pub struct AppendOutcome {
     pub truncated: usize,
 }
 
-/// Why the append refuses a Host history that disagrees with rows written before the move.
-pub const DIVERGED: &str = "The cloud conversation differs from the local conversation before the move point. Nothing was overwritten.";
+/// Why the append refuses: the local rows written before the move are missing, so the Host
+/// rows have no place to go. Nothing is written.
+pub const DIVERGED: &str = "The local conversation is shorter than its move point, so the cloud messages cannot be placed. Nothing was overwritten.";
 
 impl Store {
-    fn synced_key(environment: &str, host_session: &str) -> String {
+    pub(super) fn synced_key(environment: &str, host_session: &str) -> String {
         format!("cloud-synced:{environment}:{host_session}")
     }
     /// The Host revision last appended for this Host session, if any.
@@ -93,28 +94,30 @@ impl Store {
             return Err("Remote transcripts are owned by the host".into());
         }
         self.require_native_rows()?;
-        let frozen = match self.cloud_location(local_session)? {
+        // A Host session created by a move holds only the turns that ran in the cloud, so
+        // Host row `i` is local row `moved_at_row + i`. Rows before `moved_at_row` are never
+        // compared, written or deleted.
+        let base = match self.cloud_location(local_session)? {
             SessionLocation::Cloud(location) => location.moved_at_row,
             SessionLocation::Local => 0,
         };
         let local = self.native_rows(local_session)?;
-        let prefix = local
+        if local.len() < base {
+            return Err(DIVERGED.into());
+        }
+        let tail = &local[base..];
+        let prefix = tail
             .iter()
             .zip(host)
             .take_while(|(a, b)| a.role == b.role && a.text == b.text)
             .count();
-        // Divergence is never overwritten (design 4.9 R2): rows written before the move
-        // stay as they are.
-        if prefix < frozen.min(local.len()) {
-            return Err(DIVERGED.into());
-        }
-        let truncated = local.len().saturating_sub(host.len());
+        let truncated = tail.len().saturating_sub(host.len());
         let tx = self.conn.transaction().map_err(|e| e.to_string())?;
-        upsert_rows(&tx, local_session, prefix, &host[prefix..])?;
+        upsert_rows(&tx, local_session, base + prefix, &host[prefix..])?;
         if truncated > 0 {
             tx.execute(
                 "DELETE FROM native_rows WHERE session_id=?1 AND row_ix>=?2",
-                params![local_session, host.len() as i64],
+                params![local_session, (base + host.len()) as i64],
             )
             .map_err(|e| e.to_string())?;
         }
@@ -136,20 +139,9 @@ impl Store {
             ],
         )
         .map_err(|e| e.to_string())?;
-        // Delivery receipt for a message that reached the cloud; only a new prompt row is one,
-        // so a streaming reply does not add a key per revision.
-        if host[prefix..].iter().any(Row::is_prompt) {
-            tx.execute(
-                "INSERT INTO native_settings(key,value) VALUES(?1,'1') ON CONFLICT(key) DO UPDATE SET value='1'",
-                [format!(
-                    "mono-delivered:{local_session}:cloud:{host_session}:{revision}"
-                )],
-            )
-            .map_err(|e| e.to_string())?;
-        }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(AppendOutcome {
-            start: prefix,
+            start: base + prefix,
             written: host.len() - prefix,
             truncated,
         })
@@ -351,58 +343,125 @@ mod tests {
         assert_eq!(store.load(plain.id).unwrap().rows.len(), 1);
     }
 
-    #[test]
-    fn rows_before_the_move_point_are_never_overwritten() {
-        let mut store = Store::open(Path::new(":memory:")).unwrap();
+    fn local_history(store: &mut Store, count: usize) -> (i64, Vec<Row>) {
         let session = store.create("claude", "/Users/me/repo").unwrap();
-        store
-            .write_rows(
-                session.id,
-                0,
-                &[
-                    Row {
-                        role: "user".into(),
-                        text: "local".into(),
-                        first: true,
-                        sent_at: None,
-                    },
-                    Row {
-                        role: "assistant".into(),
-                        text: "answer".into(),
-                        first: true,
-                        sent_at: None,
-                    },
-                ],
-            )
-            .unwrap();
+        let rows: Vec<Row> = (0..count)
+            .map(|i| Row {
+                role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+                text: format!("local {i}"),
+                first: true,
+                sent_at: Some(i as u64 + 1),
+            })
+            .collect();
+        store.write_rows(session.id, 0, &rows).unwrap();
         let mut location = cloud_location();
-        location.moved_at_row = 2;
+        location.moved_at_row = count;
         store
             .set_cloud_location(session.id, &SessionLocation::Cloud(location))
             .unwrap();
-        let error = store
-            .append_remote_rows(session.id, &snapshot(1, &[("user", "other")]))
-            .unwrap_err();
-        assert_eq!(error, DIVERGED);
-        assert_eq!(
-            texts(&store, session.id),
-            ["user:local", "assistant:answer"]
+        (session.id, rows)
+    }
+
+    #[test]
+    fn a_moved_session_appends_cloud_turns_after_the_local_rows() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let (id, before) = local_history(&mut store, 10);
+        // The Host session made by the move holds only the turns that ran in the cloud.
+        let first = snapshot(1, &[("user", "cloud q"), ("assistant", "cloud a")]);
+        let out = store.append_remote_rows(id, &first).unwrap();
+        assert_eq!((out.start, out.written, out.truncated), (10, 2, 0));
+        assert_eq!(&store.native_rows(id).unwrap()[..10], &before[..]);
+        assert_eq!(store.native_rows(id).unwrap().len(), 12);
+        // Re-sync changes nothing.
+        let again = store.append_remote_rows(id, &first).unwrap();
+        assert_eq!((again.written, again.truncated), (0, 0));
+        // A rewritten cloud row rewrites only the cloud tail.
+        let next = snapshot(
+            2,
+            &[
+                ("user", "cloud q"),
+                ("assistant", "cloud a2"),
+                ("user", "more"),
+            ],
         );
-        // A history that keeps the local rows and adds the cloud turns is appended.
-        let ok = store
-            .append_remote_rows(
-                session.id,
-                &snapshot(
-                    2,
-                    &[
-                        ("user", "local"),
-                        ("assistant", "answer"),
-                        ("user", "cloud"),
-                    ],
-                ),
+        let out = store.append_remote_rows(id, &next).unwrap();
+        assert_eq!((out.start, out.written), (11, 2));
+        // A shorter Host history truncates only cloud rows.
+        let out = store.append_remote_rows(id, &snapshot(3, &[])).unwrap();
+        assert_eq!(out.truncated, 3);
+        assert_eq!(store.native_rows(id).unwrap(), before);
+    }
+
+    #[test]
+    fn a_host_that_replays_pre_move_history_is_not_required_to_match() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let (id, before) = local_history(&mut store, 4);
+        let replay = snapshot(1, &[("user", "unrelated"), ("assistant", "unrelated too")]);
+        store.append_remote_rows(id, &replay).unwrap();
+        let rows = store.native_rows(id).unwrap();
+        assert_eq!(&rows[..4], &before[..]);
+        assert_eq!(rows.len(), 6);
+    }
+
+    #[test]
+    fn missing_pre_move_rows_refuse_without_writing() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let (id, _) = local_history(&mut store, 4);
+        store
+            .conn
+            .execute(
+                "DELETE FROM native_rows WHERE session_id=?1 AND row_ix>=2",
+                [id],
             )
             .unwrap();
-        assert_eq!((ok.start, ok.written), (2, 1));
+        let error = store
+            .append_remote_rows(id, &snapshot(1, &[("user", "q")]))
+            .unwrap_err();
+        assert_eq!(error, DIVERGED);
+        assert_eq!(store.native_rows(id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn edit_and_other_row_writers_are_refused_while_cloud() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let (id, rows) = local_history(&mut store, 2);
+        let snapshot_edit = store.prepare_edit_last_turn(id, &rows, None).unwrap_err();
+        assert_eq!(snapshot_edit, CLOUD_OWNED);
+        let edit = crate::store::EditSnapshot {
+            start: 0,
+            prompt: String::new(),
+            attachments: vec![],
+            provider_turn_id: None,
+            provider_id: String::new(),
+            account_id: String::new(),
+            cwd: String::new(),
+            rows: vec![],
+            blocks: None,
+            block_start: 0,
+            provider: "claude".into(),
+        };
+        assert_eq!(
+            store
+                .finish_edit_last_turn(id, &edit, "thread")
+                .unwrap_err(),
+            CLOUD_OWNED
+        );
+        assert_eq!(store.native_rows(id).unwrap(), rows);
+    }
+
+    #[test]
+    fn deleting_the_session_forgets_the_sync_cursor() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let id = cloud_session(&store, 0);
+        store
+            .append_remote_rows(id, &snapshot(7, &[("user", "a")]))
+            .unwrap();
+        assert_eq!(
+            store.cloud_synced_revision("env", "host-1").unwrap(),
+            Some(7)
+        );
+        store.delete(id).unwrap();
+        assert_eq!(store.cloud_synced_revision("env", "host-1").unwrap(), None);
     }
 
     #[test]
@@ -444,6 +503,12 @@ mod tests {
             .is_err());
     }
 
+    fn host_value(id: &str) -> Value {
+        json!({"projectId":"project","revision":1,"status":"idle","updatedAt":5,
+            "session":{"id":id,"harness":"claude","title":"T","model":"claude:opus",
+            "runtimeMode":"auto","blocks":[]}})
+    }
+
     #[test]
     fn a_linked_host_session_is_recognisable_and_survives_registration() {
         let store = Store::open(Path::new(":memory:")).unwrap();
@@ -451,9 +516,7 @@ mod tests {
             .remember_remote_project("env", &json!({"id":"project","cwd":"/host/repo"}))
             .unwrap();
         let local = store.create("claude", "/Users/me/repo").unwrap();
-        let host = json!({"projectId":"project","revision":1,"status":"idle","updatedAt":5,
-            "session":{"id":"host-1","harness":"claude","title":"T","model":"claude:opus",
-            "runtimeMode":"auto","blocks":[]}});
+        let host = host_value("host-1");
         let remote = store.register_remote_summary(&project, &host).unwrap();
         assert!(store.linked_remote_session(local.id).unwrap().is_none());
         assert!(!store
@@ -467,7 +530,6 @@ mod tests {
         let (found, session) = store.linked_remote_session(local.id).unwrap().unwrap();
         assert_eq!(found, remote.id);
         assert!(session.is_linked());
-        // A later poll re-registers the record; the link must stay.
         store.register_remote_summary(&project, &host).unwrap();
         assert_eq!(
             store.remote_session(remote.id).unwrap().unwrap().linked_to,
@@ -475,5 +537,74 @@ mod tests {
         );
         store.link_remote_session(remote.id, None).unwrap();
         assert!(store.linked_remote_session(local.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn linking_replaces_older_links_and_a_stale_journal_cannot_restore_one() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store
+            .remember_remote_project("env", &json!({"id":"project","cwd":"/host/repo"}))
+            .unwrap();
+        let local = store.create("claude", "/Users/me/repo").unwrap();
+        let old = store
+            .register_remote_summary(&project, &host_value("old"))
+            .unwrap();
+        let new = store
+            .register_remote_summary(&project, &host_value("new"))
+            .unwrap();
+        store.link_remote_session(old.id, Some(local.id)).unwrap();
+        // A worker loaded the record while it was linked.
+        let stale = store.remote_session(old.id).unwrap().unwrap();
+        store.link_remote_session(new.id, Some(local.id)).unwrap();
+        assert_eq!(
+            store.remote_session(old.id).unwrap().unwrap().linked_to,
+            None
+        );
+        // The stale worker journals its copy: the link must not come back.
+        store.save_remote_session(&stale).unwrap();
+        assert_eq!(
+            store.remote_session(old.id).unwrap().unwrap().linked_to,
+            None
+        );
+        assert_eq!(
+            store.linked_remote_session(local.id).unwrap().unwrap().0,
+            new.id
+        );
+        // Unlink during an observation: a journal of the linked copy keeps it unlinked.
+        let linked_copy = store.remote_session(new.id).unwrap().unwrap();
+        store.link_remote_session(new.id, None).unwrap();
+        store.save_remote_session(&linked_copy).unwrap();
+        assert!(store.linked_remote_session(local.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn the_host_record_is_found_by_the_location_not_by_the_first_link() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store
+            .remember_remote_project("env", &json!({"id":"project","cwd":"/host/repo"}))
+            .unwrap();
+        let local = cloud_session(&store, 0);
+        let stale = store
+            .register_remote_summary(&project, &host_value("stale"))
+            .unwrap();
+        let wanted = store
+            .register_remote_summary(&project, &host_value("host-1"))
+            .unwrap();
+        assert_eq!(
+            store.cloud_host_record(local).unwrap_err(),
+            crate::store::MISSING_HOST
+        );
+        store.link_remote_session(wanted.id, Some(local)).unwrap();
+        // A stale link on another record is ignored (and cleared by the new link).
+        store.link_remote_session(stale.id, Some(local)).unwrap();
+        assert_eq!(
+            store.cloud_host_record(local).unwrap_err(),
+            crate::store::MISSING_HOST
+        );
+        store.link_remote_session(wanted.id, Some(local)).unwrap();
+        assert_eq!(store.cloud_host_record(local).unwrap().0, wanted.id);
+        // A plain local session has no host record.
+        let plain = store.create("claude", "/p").unwrap();
+        assert!(store.cloud_host_record(plain.id).is_err());
     }
 }

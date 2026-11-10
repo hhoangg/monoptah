@@ -87,6 +87,9 @@ impl Store {
         expected: &[Row],
         turn_id: Option<&str>,
     ) -> Result<EditSnapshot, String> {
+        if self.cloud_location(id)?.is_cloud() {
+            return Err(super::CLOUD_OWNED.into());
+        }
         if let Some(reason) = self.edit_recovery_reason(id)? {
             return Err(reason);
         }
@@ -209,6 +212,9 @@ impl Store {
         edit: &EditSnapshot,
         provider_id: &str,
     ) -> Result<(), String> {
+        if self.cloud_location(id)?.is_cloud() {
+            return Err(super::CLOUD_OWNED.into());
+        }
         // This API is called only after provider confirmation. A failed local
         // transaction or crash must leave a durable guard against resuming it.
         self.mark_edit_recovery_required(id)?;

@@ -1,7 +1,7 @@
 //! Host-owned sessions keep only their desktop identity and command receipts here.
 //! Transcripts remain on the host and use the same lossless block projection as
 //! desktop conversations; no remote row is inserted into the local session table.
-use super::{shared, Session, Store};
+use super::{shared, Session, SessionLocation, Store};
 use crate::{
     agent::{Settings, TurnInfo},
     cloud_sessions::{CloudBackendKind, CloudRef},
@@ -14,6 +14,9 @@ use std::collections::{BTreeMap, HashMap};
 
 const PROJECTS: &str = "remote-projects.v2";
 const SESSIONS: &str = "remote-sessions.v1";
+/// Why a Cloud-located session cannot run: its Host record is gone or not linked.
+pub const MISSING_HOST: &str =
+    "This conversation is in the cloud, but its cloud session is missing. Reconnect it first.";
 /// `register_remote_summary` refuses a host session that was saved as a local copy.
 pub const CONVERTED: &str = "This session was saved as a local copy.";
 
@@ -338,14 +341,37 @@ impl Store {
     /// `None`).
     pub fn link_remote_session(&self, remote: i64, local: Option<i64>) -> Result<(), String> {
         let mut sessions = self.stored_remote_sessions()?;
-        sessions
-            .get_mut(&remote)
-            .ok_or("Remote session no longer exists")?
-            .linked_to = local;
+        if !sessions.contains_key(&remote) {
+            return Err("Remote session no longer exists".into());
+        }
+        // One Host record per local session: any older link is dropped.
+        if let Some(local) = local {
+            for other in sessions.values_mut() {
+                if other.linked_to == Some(local) {
+                    other.linked_to = None;
+                }
+            }
+        }
+        sessions.get_mut(&remote).unwrap().linked_to = local;
         self.save_setting(
             SESSIONS,
             &serde_json::to_string(&sessions).map_err(|e| e.to_string())?,
         )
+    }
+    /// The Host record that backs the Cloud-located local session `local`: found by the
+    /// location's own `host_session_id` and environment, and it must be linked to `local`.
+    pub fn cloud_host_record(&self, local: i64) -> Result<(i64, RemoteSession), String> {
+        let SessionLocation::Cloud(location) = self.cloud_location(local)? else {
+            return Err("This conversation is not in the cloud".into());
+        };
+        self.remote_sessions()?
+            .into_iter()
+            .find(|(_, r)| {
+                r.session_id.as_deref() == Some(location.host_session_id.as_str())
+                    && r.project.environment_id == location.environment_id
+                    && r.linked_to == Some(local)
+            })
+            .ok_or_else(|| MISSING_HOST.to_string())
     }
     /// The Host session record linked to the local session `local`, with its id.
     pub fn linked_remote_session(
@@ -417,7 +443,7 @@ impl Store {
             })
             .unwrap_or_else(|| Ok(BTreeMap::new()))
     }
-    fn remote_sessions(&self) -> Result<BTreeMap<i64, RemoteSession>, String> {
+    pub(super) fn remote_sessions(&self) -> Result<BTreeMap<i64, RemoteSession>, String> {
         let hidden = self.hidden_legacy_remote_sessions()?;
         let mut sessions = self.legacy_remote_sessions()?;
         sessions.retain(|id, _| !hidden.contains(id));
@@ -499,6 +525,13 @@ impl Store {
         }
         self.claim_legacy_remote_commands(session)?;
         let mut sessions = self.stored_remote_sessions()?;
+        // The link is owned by `link_remote_session`. A worker holds a record loaded long ago
+        // and journals it on every poll: it must not restore a stale link.
+        let mut session = session.clone();
+        session.linked_to = sessions
+            .get(&session.summary.id)
+            .and_then(|current| current.linked_to);
+        let session = &session;
         if session.summary.id >= 0 && session.session_id.is_some() {
             sessions.retain(|id, existing| {
                 *id == session.summary.id

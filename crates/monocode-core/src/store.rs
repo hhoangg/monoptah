@@ -14,7 +14,7 @@ mod remote;
 mod remote_legacy;
 pub use remote::{
     is_pending_cloud_environment, pending_cloud_project, RemoteProject, RemoteSession,
-    RemoteUpload, CONVERTED, SANDBOX_STOPPED_DELETE,
+    RemoteUpload, CONVERTED, MISSING_HOST, SANDBOX_STOPPED_DELETE,
 };
 pub(crate) use shared::handle as desktop_session_handle;
 mod session_metadata;
@@ -1256,6 +1256,10 @@ impl Store {
     ) -> Result<(), String> {
         // Resolve the folder first; the persisted id is gone after deletion.
         let dir = self.thread_dir(id).ok().flatten();
+        let cloud_cursor = match self.cloud_location(id) {
+            Ok(SessionLocation::Cloud(l)) => Some((l.environment_id, l.host_session_id)),
+            _ => None,
+        };
         // A converted cloud session's host copy may come back once its local copy is gone.
         let origin = self
             .setting(&format!("codespace-origin:{id}"))
@@ -1263,6 +1267,9 @@ impl Store {
             .flatten()
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
         delete_rows(self)?;
+        if let Some((env, host)) = cloud_cursor {
+            let _ = self.save_setting(&Self::synced_key(&env, &host), "");
+        }
         if let Some(origin) = origin {
             // The refs kept for a restore that never happened; after a restore they hold the
             // other saved branches, which stay.
