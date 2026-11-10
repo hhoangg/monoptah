@@ -673,8 +673,10 @@ mod kit_tests {
     fn globals(cx: &mut TestAppContext, flag: bool, enabled: bool) {
         cx.update(|cx| {
             cx.set_global(KitScanner(fixture::scan));
-            let mut prefs = crate::settings::Preferences::default();
-            prefs.cloud_kit_enabled = flag;
+            let mut prefs = crate::settings::Preferences {
+                cloud_kit_enabled: flag,
+                ..Default::default()
+            };
             if enabled {
                 prefs.cloud_kit.acknowledge_notice();
             }
