@@ -261,7 +261,7 @@ impl SettingsView {
                 for (ix, row) in list.into_iter().enumerate() {
                     rows.push(self.kit_row(ix, row, cx));
                 }
-                if inventory.incomplete {
+                if inventory.scan_timed_out {
                     rows.push(note(
                         "Reading some items took too long. They are listed but cannot be copied. Press Refresh to try again.",
                     ));

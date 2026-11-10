@@ -798,6 +798,10 @@ Size limits:
 - Symlinks: an item root may be a link that resolves anywhere under the user's home
   (dotfiles setups). Links inside an item must resolve inside the item's own canonical
   root, or the whole item is excluded ("A link points outside this item").
+  A root that resolves to `$HOME`, a folder containing it, a credentials folder (`.ssh`,
+  `.aws`, ...) or a system folder is refused too. Known limit: hard links cannot be traced
+  cheaply, so a multi-link file is refused only when it is on another device than the item
+  root (pnpm and Nix store hard links on the same device are accepted).
 - MCP secret values are kept out of the plain config and content hashes. Changes to them
   are tracked by an HMAC-SHA256 keyed with a per-installation random key
   (`kit-hash.key`, mode 0600), so digests are not comparable across installs.

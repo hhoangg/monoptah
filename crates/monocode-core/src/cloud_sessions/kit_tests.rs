@@ -1242,3 +1242,260 @@ mod keyed_secrets {
         );
     }
 }
+
+mod key_file {
+    use super::*;
+
+    fn key_path(env: &Env) -> PathBuf {
+        env.roots.home.join("app-data/kit-hash.key")
+    }
+
+    fn secret_env() -> Env {
+        let env = env();
+        servers_json(
+            &env,
+            json!({"a": {"command": "npx", "env": {"K": "fake-k"}}}),
+        );
+        env
+    }
+
+    #[test]
+    fn an_empty_or_malformed_key_file_is_recreated_as_a_valid_one() {
+        for garbage in ["", "   \n", "not a key", &"zz".repeat(32), &"ab".repeat(10)] {
+            let env = secret_env();
+            write(&key_path(&env), garbage);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(key_path(&env), std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+            }
+            let inventory = build_inventory(&env.roots, Workspace::Codespace);
+            assert!(!inventory.incomplete, "{garbage:?}");
+            assert!(inventory.mcp_servers[0].secrets_digest.is_some());
+            let saved = std::fs::read_to_string(key_path(&env)).unwrap();
+            assert_eq!(saved.trim().len(), 64);
+            // A valid key is never replaced.
+            build_inventory(&env.roots, Workspace::Codespace);
+            assert_eq!(std::fs::read_to_string(key_path(&env)).unwrap(), saved);
+            // No temp files are left behind.
+            let names: Vec<_> = std::fs::read_dir(key_path(&env).parent().unwrap())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(names.len(), 1, "{names:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_group_or_world_readable_key_is_refused_and_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let env = secret_env();
+        let valid = "ab".repeat(32);
+        write(&key_path(&env), &valid);
+        std::fs::set_permissions(key_path(&env), std::fs::Permissions::from_mode(0o644)).unwrap();
+        let inventory = build_inventory(&env.roots, Workspace::Codespace);
+        assert!(inventory.key_unavailable && inventory.incomplete);
+        assert_eq!(std::fs::read_to_string(key_path(&env)).unwrap(), valid);
+    }
+
+    #[test]
+    fn a_missing_key_does_not_count_as_a_timed_out_scan() {
+        let env = secret_env();
+        let none = KitRoots {
+            key_dir: None,
+            ..env.roots.clone()
+        };
+        let inventory = build_inventory(&none, Workspace::Codespace);
+        assert!(inventory.incomplete && inventory.key_unavailable);
+        assert!(!inventory.scan_timed_out, "caching must stay on");
+        assert!(!inventory.over_total_cap);
+
+        skill(&env.roots.claude_home.join("skills"), "s", "x");
+        let timed = build_inventory_budgeted(
+            &env.roots,
+            Workspace::Codespace,
+            &|_| None,
+            std::time::Duration::ZERO,
+        );
+        assert!(timed.scan_timed_out && timed.incomplete);
+        assert!(!timed.key_unavailable);
+    }
+
+    #[test]
+    fn empty_or_relative_data_dirs_are_ignored() {
+        let home = Path::new("/home/u");
+        let default = home.join(".cache/monocode-native");
+        let dir = |v: &str| data_dir_from(Some(v.into()), home);
+        assert_eq!(dir(""), default);
+        assert_eq!(dir("relative/dir"), default);
+        assert_eq!(dir("/abs/data"), PathBuf::from("/abs/data"));
+        assert_eq!(data_dir_from(None, home), default);
+    }
+}
+
+#[test]
+fn a_url_query_secret_masks_only_the_query_in_the_plain_hash() {
+    let env = env();
+    let hash = |url: &str| {
+        servers_json(&env, json!({"b": {"type": "http", "url": url}}));
+        build_inventory(&env.roots, Workspace::Codespace).mcp_servers[0].clone()
+    };
+    let base = hash("https://one.example.com/mcp?key=aaa");
+    let other_host = hash("https://two.example.com/mcp?key=aaa");
+    let other_path = hash("https://one.example.com/other?key=aaa");
+    let other_secret = hash("https://one.example.com/mcp?key=bbb");
+    assert_ne!(base.config_hash, other_host.config_hash);
+    assert_ne!(base.config_hash, other_path.config_hash);
+    assert_eq!(base.config_hash, other_secret.config_hash);
+    assert_ne!(base.secrets_digest, other_secret.secrets_digest);
+}
+
+#[test]
+fn hard_links_are_refused_only_across_devices() {
+    use super::kit::hard_link_elsewhere_for_test as elsewhere;
+    assert!(elsewhere(2, 7, 8));
+    assert!(!elsewhere(1, 7, 8));
+    assert!(!elsewhere(2, 8, 8));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hard_link_on_the_same_device_is_accepted_as_a_known_limit() {
+    let env = env();
+    let skills = env.roots.claude_home.join("skills");
+    skill(&skills, "hl", "x");
+    write(&env.roots.home.join("other/file.txt"), "abc");
+    std::fs::hard_link(
+        env.roots.home.join("other/file.txt"),
+        skills.join("hl/file.txt"),
+    )
+    .unwrap();
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    assert_eq!(inventory.skills[0].exclusion, None);
+}
+
+#[cfg(unix)]
+mod roots {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn first_skill(env: &Env) -> KitSkill {
+        build_inventory(&env.roots, Workspace::Codespace)
+            .skills
+            .into_iter()
+            .next()
+            .expect("a skill")
+    }
+
+    #[test]
+    fn a_skill_root_linking_to_a_credentials_folder_is_excluded() {
+        for dir in [
+            ".ssh",
+            ".aws",
+            ".gnupg",
+            ".config/gcloud",
+            "Library/Keychains/x",
+        ] {
+            let env = env();
+            let target = env.roots.home.join(dir);
+            write(&target.join("SKILL.md"), "x");
+            let skills = env.roots.claude_home.join("skills");
+            std::fs::create_dir_all(&skills).unwrap();
+            symlink(&target, skills.join("foo")).unwrap();
+            assert_eq!(
+                first_skill(&env).exclusion,
+                Some(Exclusion::UnsafeRoot),
+                "{dir}"
+            );
+        }
+    }
+
+    #[test]
+    fn roots_that_are_home_or_contain_it_or_contain_their_own_path_are_excluded() {
+        let env = env();
+        let skills = env.roots.claude_home.join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        write(&env.roots.home.join("SKILL.md"), "x");
+        symlink(&env.roots.home, skills.join("home")).unwrap();
+        // foo -> the skills folder that holds it
+        write(&skills.join("SKILL.md"), "x");
+        symlink(&skills, skills.join("up")).unwrap();
+        let inventory = build_inventory(&env.roots, Workspace::Codespace);
+        for skill in &inventory.skills {
+            assert_eq!(
+                skill.exclusion,
+                Some(Exclusion::UnsafeRoot),
+                "{}",
+                skill.name
+            );
+        }
+        assert_eq!(inventory.skills.len(), 2);
+    }
+
+    #[test]
+    fn plugin_install_paths_that_are_unsafe_are_excluded() {
+        for raw in ["~", "/", "/etc", "~/.ssh"] {
+            let env = env();
+            write(&env.roots.home.join(".ssh/id"), "fake");
+            write_json(
+                &env.roots.claude_home.join("plugins/installed_plugins.json"),
+                json!({"version": 2, "plugins": {"p@mk": [{"scope": "user", "version": "1", "installPath": raw}]}}),
+            );
+            write_json(
+                &env.roots.claude_home.join("settings.json"),
+                json!({"enabledPlugins": {"p@mk": true}}),
+            );
+            let inventory = build_inventory(&env.roots, Workspace::Codespace);
+            assert_eq!(
+                inventory.plugins[0].exclusion,
+                Some(Exclusion::UnsafeRoot),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_root_outside_home_must_stay_in_the_project_or_beside_its_link() {
+        let env = env();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(elsewhere.path()).unwrap();
+        let skills = project.join(".claude/skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        // Inside the project: fine.
+        write(&project.join("shared/ok/SKILL.md"), "x");
+        symlink(project.join("shared/ok"), skills.join("ok")).unwrap();
+        // Somewhere else on disk: refused.
+        let stray = tempfile::tempdir().unwrap();
+        write(&stray.path().join("SKILL.md"), "x");
+        symlink(stray.path(), skills.join("stray")).unwrap();
+        let roots = KitRoots {
+            project,
+            ..env.roots.clone()
+        };
+        let rows: Vec<_> = build_inventory(&roots, Workspace::Codespace)
+            .skills
+            .iter()
+            .map(|s| (s.name.clone(), s.exclusion))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("ok".to_string(), None),
+                ("stray".to_string(), Some(Exclusion::UnsafeRoot))
+            ]
+        );
+    }
+
+    #[test]
+    fn a_dotfiles_root_is_still_accepted() {
+        let env = env();
+        let target = env.roots.home.join("dotfiles/skills/foo");
+        write(&target.join("SKILL.md"), "x");
+        let skills = env.roots.claude_home.join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        symlink(&target, skills.join("foo")).unwrap();
+        assert_eq!(first_skill(&env).exclusion, None);
+    }
+}

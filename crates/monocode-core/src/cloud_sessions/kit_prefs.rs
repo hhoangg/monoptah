@@ -281,6 +281,8 @@ fn exclusion_reason(exclusion: Exclusion) -> &'static str {
         Exclusion::TooManyFiles => "Too many files to send",
         Exclusion::ScanTimedOut => "Reading it took too long",
         Exclusion::LinkLeavesItem => "A link points outside this item",
+        Exclusion::UnsafeRoot => "This folder is not a safe place to copy from",
+        Exclusion::HardLinkElsewhere => "A file is a hard link to another disk",
     }
 }
 

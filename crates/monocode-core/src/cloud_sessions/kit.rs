@@ -25,7 +25,17 @@
 //! digests, and a low-entropy secret cannot be guessed offline without the key. The
 //! digest type redacts itself in `Debug`. Use [`KitInventory::change_token`] to detect
 //! "the kit changed", secrets included. If the key cannot be read or created, secrets are
-//! left out of the digests and the inventory is flagged `incomplete`.
+//! left out of the digests and the inventory is flagged `incomplete` (and
+//! `key_unavailable`, which unlike a timeout does not stop caching).
+//!
+//! # For the transfer (F3-3)
+//!
+//! The scan checks links once. A link swapped afterwards could still point out of the
+//! item, so the digest and tar steps must open files without following links: re-
+//! canonicalize each path and check `starts_with(root)`, ideally comparing the dev and
+//! inode recorded at scan time. Hard links inside an item are accepted when the file is
+//! on the item's device (see `scan_item`); pnpm and Nix store hard links are a known
+//! limit that cannot be told apart cheaply.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
@@ -97,6 +107,11 @@ pub enum Exclusion {
     ScanTimedOut,
     /// A link inside the item resolves to a path outside the item's own root.
     LinkLeavesItem,
+    /// The item root resolves to a place that is never a skill or plugin: `$HOME` itself,
+    /// a folder that contains it, a credentials folder or a system folder.
+    UnsafeRoot,
+    /// A file with several hard links that lives on another device than the item root.
+    HardLinkElsewhere,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -225,6 +240,12 @@ pub struct KitInventory {
     /// An item hit the scan budget. The totals and the hash are then not comparable
     /// between runs, so callers must not treat them as a stable fingerprint.
     pub incomplete: bool,
+    /// An item hit the scan budget (a subset of `incomplete`). Only this makes a scan not
+    /// worth caching.
+    pub scan_timed_out: bool,
+    /// The local key was unavailable, so secrets are not in the digests (a subset of
+    /// `incomplete`). A rescan would not change that, so it does not block caching.
+    pub key_unavailable: bool,
     /// Same inputs, same hash. Covers names, scopes, sources, file contents and server
     /// configs with secret values masked, so it is comparable across installs. For
     /// change detection that includes the secrets use [`KitInventory::change_token`].
@@ -303,11 +324,17 @@ impl KitRoots {
 /// The app data dir, as other core modules find it: `MONOCODE_NATIVE_DATA_DIR`, else
 /// `~/.cache/monocode-native`.
 fn app_data_dir(home: &Path) -> Option<PathBuf> {
-    Some(
-        std::env::var_os("MONOCODE_NATIVE_DATA_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".cache/monocode-native")),
-    )
+    Some(data_dir_from(
+        std::env::var_os("MONOCODE_NATIVE_DATA_DIR"),
+        home,
+    ))
+}
+
+/// An empty or relative value would put the key in the process cwd: ignore it.
+pub(super) fn data_dir_from(var: Option<std::ffi::OsString>, home: &Path) -> PathBuf {
+    var.map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .unwrap_or_else(|| home.join(".cache/monocode-native"))
 }
 
 /// The seam for MCP OAuth sign-in state (F3-5a). `None` means unknown, and an
@@ -342,6 +369,7 @@ pub fn build_inventory_budgeted(
         started: Instant::now(),
         budget,
         raw_home: &roots.home,
+        project: &roots.project,
     };
     let home = std::fs::canonicalize(&roots.home).unwrap_or_else(|_| roots.home.clone());
     let sources = sources(roots);
@@ -405,6 +433,8 @@ pub fn build_inventory_budgeted(
             None => key_missing = true,
         }
     }
+    inventory.scan_timed_out = timed_out;
+    inventory.key_unavailable = key_missing;
     inventory.incomplete = timed_out || key_missing;
     inventory.total_compressed = total_compressed(&inventory);
     // A timed-out item has no size, so the total is only a lower bound: report over-cap.
@@ -454,6 +484,8 @@ struct Clock<'a> {
     /// `roots.home` as given, before canonicalizing (it may sit behind a link such as
     /// macOS `/var`).
     raw_home: &'a Path,
+    /// The local project, for roots that live outside `$HOME`.
+    project: &'a Path,
 }
 
 struct Scan {
@@ -461,6 +493,52 @@ struct Scan {
     size: u64,
     has_native: bool,
     exclusion: Option<Exclusion>,
+    /// Device of the item root, to spot hard links to another device.
+    root_dev: Option<u64>,
+}
+
+/// Folders under `$HOME` that hold credentials. An item root never resolves into one.
+const SENSITIVE_HOME_DIRS: [&str; 7] = [
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".kube",
+    ".docker",
+    ".config/gcloud",
+    ".config/gh",
+];
+
+/// System folders an item root never resolves into.
+const SYSTEM_DIRS: [&str; 8] = [
+    "/etc",
+    "/private/etc",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/System",
+    "/Library",
+    "/private/var/root",
+];
+
+/// Is `real_root` a place that is never a skill or plugin? `root` is the path as named.
+fn unsafe_root(root: &Path, real_root: &Path, homes: [&Path; 2]) -> bool {
+    if real_root.parent().is_none() || SYSTEM_DIRS.iter().any(|d| real_root.starts_with(d)) {
+        return true;
+    }
+    // `$HOME` itself or any folder that contains it.
+    if homes.iter().any(|home| home.starts_with(real_root)) {
+        return true;
+    }
+    // A folder that contains the path that names the root (`foo -> ..`).
+    if real_root != root && root.starts_with(real_root) {
+        return true;
+    }
+    homes.iter().any(|home| {
+        SENSITIVE_HOME_DIRS
+            .iter()
+            .any(|dir| real_root.starts_with(home.join(dir)))
+            || real_root.starts_with(home.join("Library/Keychains"))
+    })
 }
 
 /// Walk one skill or plugin directory. Files come back sorted, so every later step is
@@ -484,6 +562,7 @@ fn scan_item(root: &Path, kind: ItemKind, home: &Path, started: Clock<'_>) -> Sc
         size: 0,
         has_native: false,
         exclusion: None,
+        root_dev: None,
     };
     let cap = match kind {
         ItemKind::Skill => MAX_SKILL_BYTES,
@@ -497,6 +576,22 @@ fn scan_item(root: &Path, kind: ItemKind, home: &Path, started: Clock<'_>) -> Sc
         scan.exclusion = Some(Exclusion::LinkOutsideHome);
         return scan;
     }
+    if unsafe_root(root, &real_root, [home, started.raw_home]) {
+        scan.exclusion = Some(Exclusion::UnsafeRoot);
+        return scan;
+    }
+    if !named_inside {
+        // Outside `$HOME` the root must stay in the project or next to where it is named.
+        let project = std::fs::canonicalize(started.project).ok();
+        let parent = root.parent().and_then(|p| std::fs::canonicalize(p).ok());
+        let allowed = project.is_some_and(|p| real_root.starts_with(p))
+            || parent.is_some_and(|p| real_root.starts_with(p));
+        if !allowed {
+            scan.exclusion = Some(Exclusion::UnsafeRoot);
+            return scan;
+        }
+    }
+    scan.root_dev = device_of(&real_root);
     if kind == ItemKind::Plugin && (root.join("bin").exists() || root.join(".lsp.json").exists()) {
         scan.has_native = true;
     }
@@ -580,6 +675,13 @@ fn walk(
             }
             walk(&path, item_root, kind, started, cap, visited, entries, scan);
         } else if meta.is_file() {
+            // Hard links cannot be traced cheaply. A multi-link file on another device
+            // than the item root is refused; one on the same device is accepted, which
+            // is a known limit (pnpm and Nix store hard links look the same).
+            if hard_link_elsewhere(link_count(&meta), device_of_meta(&meta), scan.root_dev) {
+                scan.exclusion = Some(Exclusion::HardLinkElsewhere);
+                return;
+            }
             scan.size += meta.len();
             if scan.size > cap {
                 scan.exclusion = Some(Exclusion::TooLarge);
@@ -591,6 +693,37 @@ fn walk(
             scan.files.push(path);
         }
     }
+}
+
+fn hard_link_elsewhere(links: u64, dev: Option<u64>, root_dev: Option<u64>) -> bool {
+    links > 1 && dev.is_some() && root_dev.is_some() && dev != root_dev
+}
+
+#[cfg(unix)]
+fn link_count(meta: &std::fs::Metadata) -> u64 {
+    std::os::unix::fs::MetadataExt::nlink(meta)
+}
+#[cfg(not(unix))]
+fn link_count(_meta: &std::fs::Metadata) -> u64 {
+    1
+}
+#[cfg(unix)]
+fn device_of_meta(meta: &std::fs::Metadata) -> Option<u64> {
+    Some(std::os::unix::fs::MetadataExt::dev(meta))
+}
+#[cfg(not(unix))]
+fn device_of_meta(_meta: &std::fs::Metadata) -> Option<u64> {
+    None
+}
+fn device_of(path: &Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|m| device_of_meta(&m))
+}
+
+#[cfg(test)]
+pub(super) fn hard_link_elsewhere_for_test(links: u64, dev: u64, root_dev: u64) -> bool {
+    hard_link_elsewhere(links, Some(dev), Some(root_dev))
 }
 
 enum Link {
@@ -1196,7 +1329,12 @@ fn mask_secrets(config: &Value, secrets: &[SecretField]) -> Value {
             SecretLocation::Env(field) => mask_field(object, "env", field, marker),
             SecretLocation::Header(field) => mask_field(object, "headers", field, marker),
             SecretLocation::UrlQuery => {
-                object.insert("url".to_string(), marker);
+                // Keep scheme, host and path in the plain hash; mask only the query.
+                if let Some(raw) = object.get("url").and_then(Value::as_str) {
+                    let base = raw.split_once('?').map_or(raw, |(base, _)| base);
+                    let masked = format!("{base}?{SECRET_MARKER}");
+                    object.insert("url".to_string(), Value::String(masked));
+                }
             }
         }
     }
@@ -1221,18 +1359,62 @@ fn mask_field(
 const KEY_FILE: &str = "kit-hash.key";
 const KEY_BYTES: usize = 32;
 
-/// The per-installation key, created on first use. Any failure (unreadable, corrupt, not
-/// writable) gives `None`: the caller degrades, it never panics and never overwrites an
-/// existing file it could not read.
+/// The per-installation key, created on first use. Any failure gives `None`: the caller
+/// degrades, it never panics.
+///
+/// - A symlink at the key path is never followed or replaced.
+/// - A key file readable by group or others is refused (degrade), never replaced.
+/// - A file that cannot be read is left alone. A file that is empty or malformed is
+///   garbage (for example a crash while writing an older version) and is recreated.
+///   A valid key is never replaced.
+/// - A new key is written to a temp file (0600) in the same dir and published with a
+///   hard link, which fails instead of replacing, so a crash never leaves a partial key
+///   and two processes agree on one key.
 fn load_or_create_key(dir: &Path) -> Option<[u8; KEY_BYTES]> {
     let path = dir.join(KEY_FILE);
-    match std::fs::read_to_string(&path) {
-        Ok(text) => return parse_key(&text),
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => return None,
+        Ok(meta) => {
+            if key_file_too_open(&meta) {
+                return None;
+            }
+            let text = std::fs::read_to_string(&path).ok()?;
+            if let Some(key) = parse_key(&text) {
+                return Some(key);
+            }
+            // Garbage: recheck right before removing so a key another process just
+            // published is not lost.
+            let again = std::fs::read_to_string(&path).ok()?;
+            if let Some(key) = parse_key(&again) {
+                return Some(key);
+            }
+            std::fs::remove_file(&path).ok()?;
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => return None,
     }
+    create_key(dir, &path)
+}
+
+#[cfg(unix)]
+fn key_file_too_open(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o077 != 0
+}
+
+#[cfg(not(unix))]
+fn key_file_too_open(_meta: &std::fs::Metadata) -> bool {
+    false
+}
+
+fn create_key(dir: &Path, path: &Path) -> Option<[u8; KEY_BYTES]> {
     std::fs::create_dir_all(dir).ok()?;
     let key: [u8; KEY_BYTES] = rand::random();
+    let temp = dir.join(format!(
+        "{KEY_FILE}.tmp-{}-{:08x}",
+        std::process::id(),
+        rand::random::<u32>()
+    ));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -1240,19 +1422,17 @@ fn load_or_create_key(dir: &Path) -> Option<[u8; KEY_BYTES]> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    match options.open(&path) {
-        Ok(mut file) => {
-            if file.write_all(hex(&key).as_bytes()).is_err() {
-                drop(file);
-                // Do not leave a truncated key that every later run would reject.
-                let _ = std::fs::remove_file(&path);
-                return None;
-            }
-            Some(key)
-        }
-        // Another process created it first: use theirs.
+    let written = options.open(&temp).and_then(|mut file| {
+        file.write_all(hex(&key).as_bytes())?;
+        file.sync_all()
+    });
+    let published = written.is_ok().then(|| std::fs::hard_link(&temp, path));
+    let _ = std::fs::remove_file(&temp);
+    match published? {
+        Ok(()) => Some(key),
+        // Another process published first: use theirs.
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            parse_key(&std::fs::read_to_string(&path).ok()?)
+            parse_key(&std::fs::read_to_string(path).ok()?)
         }
         Err(_) => None,
     }
