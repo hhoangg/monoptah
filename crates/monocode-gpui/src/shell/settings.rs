@@ -155,7 +155,6 @@ impl Shell {
         let context = self.settings_context(cx);
         let prefs = self.workspace.preferences.clone();
         let view = cx.new(|cx| SettingsView::new(section, prefs, context, cx));
-        self.prefetch_settings_catalogs(cx);
         self.settings_events = Some(cx.subscribe_in(
             &view,
             window,
@@ -296,6 +295,7 @@ impl Shell {
             }
         }));
         self.settings = Some(view.clone());
+        self.settings_accounts_changed(true, cx);
         // Settings has its own complete rail, even when the project rail was hidden.
         self.settings_nav_visible = true;
         self.sidebar_slide = None;
@@ -328,6 +328,9 @@ impl Shell {
         let missing: Vec<_> = self
             .settings_profiles(cx)
             .into_iter()
+            // Only providers with accounts: the rest have one catalog that a
+            // session already carries, and other CLIs cache it for only 5 minutes.
+            .filter(|(kind, _)| monocode_core::accounts::supports_accounts(*kind))
             .filter(|(kind, _)| !shown.contains_key(kind.id()))
             .collect();
         if missing.is_empty() {
@@ -347,6 +350,21 @@ impl Shell {
             let _ = this.update(cx, |this, cx| this.sync_settings(cx));
         })
         .detach();
+    }
+    /// After an account update: discover catalogs only when the accounts new
+    /// sessions use changed (a new default, sign-in), not on a rename.
+    pub(super) fn settings_accounts_changed(&mut self, force: bool, cx: &mut Context<Self>) {
+        let accounts: Vec<_> = self
+            .settings_profiles(cx)
+            .into_iter()
+            .filter(|(kind, _)| monocode_core::accounts::supports_accounts(*kind))
+            .map(|(kind, profile)| (kind, profile.id))
+            .collect();
+        let changed = accounts != self.settings_catalog_accounts;
+        self.settings_catalog_accounts = accounts;
+        if self.settings.is_some() && (force || changed) {
+            self.prefetch_settings_catalogs(cx);
+        }
     }
     pub(super) fn select_settings(&mut self, section: Section, cx: &mut Context<Self>) {
         if let Some(view) = &self.settings {
