@@ -1470,9 +1470,9 @@ ticket, after review and after merge.
 | H2a | 2 | todo | - | |
 | H2b | 2 | todo | - | |
 | F1-4 | 2 | todo | - | |
-| F2-1 | 2 | todo | - | |
+| F2-1 | 2 | in progress | csi-f2-1 | |
 | F2-2 | 2 | todo | - | |
-| F3-2 | 2 | todo | - | |
+| F3-2 | 2 | in progress | csi-f3-2 | |
 | F4-L | 2 | todo | - | L, sub-PRs |
 | H3 | 3 | todo | - | |
 | F2-3h | 3 | todo | - | |
