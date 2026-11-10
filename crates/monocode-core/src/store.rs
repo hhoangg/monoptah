@@ -983,8 +983,8 @@ impl Store {
             return Err("Remote transcripts are owned by the host".into());
         }
         // Single writer (design 4.9 R2): while the session is in the cloud, only the remote
-        // row append (`append_projected_rows`) writes its rows.
-        // TODO(part B): the local runtime itself must also be refused before it starts a turn.
+        // row append (`append_projected_rows`) writes its rows. The local runtime is refused
+        // earlier, before it starts a turn (`require_local_run`); this stays as the backstop.
         if self.cloud_location(session)?.is_cloud() {
             return Err(CLOUD_OWNED.into());
         }
