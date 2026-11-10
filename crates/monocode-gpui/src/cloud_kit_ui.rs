@@ -231,6 +231,7 @@ pub(crate) mod fixture {
                 Vec::new()
             },
             config_hash: "c".into(),
+            secrets_digest: None,
         }
     }
 

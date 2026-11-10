@@ -37,6 +37,7 @@ fn server(name: &str, compat: McpCompat, secret: bool) -> KitMcpServer {
             Vec::new()
         },
         config_hash: "c".into(),
+        secrets_digest: None,
     }
 }
 

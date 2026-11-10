@@ -16,6 +16,16 @@
 //! Every MCP `env` and `headers` value is a secret unless it is exactly a `${VAR}`
 //! reference, and so is a URL with a query string. Values live in [`Secret`], which
 //! redacts itself in `Debug` and `Display`, so an inventory is safe to log.
+//!
+//! Secret values never enter a plain hash. `config_hash` and `content_hash` cover the
+//! config with secret values replaced by a marker, so they are equal across installs and
+//! say nothing about the secrets. Changes to the secrets are tracked separately by
+//! [`KitMcpServer::secrets_digest`]: an HMAC-SHA256 keyed with a random per-installation
+//! key (`kit-hash.key` in the app data dir, mode 0600). Two installs produce unrelated
+//! digests, and a low-entropy secret cannot be guessed offline without the key. The
+//! digest type redacts itself in `Debug`. Use [`KitInventory::change_token`] to detect
+//! "the kit changed", secrets included. If the key cannot be read or created, secrets are
+//! left out of the digests and the inventory is flagged `incomplete`.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
@@ -177,8 +187,12 @@ pub struct KitMcpServer {
     pub transport: String,
     pub compat: McpCompat,
     pub secrets: Vec<SecretField>,
-    /// Hash of the canonical server config, secrets included.
+    /// Hash of the canonical server config with every secret value replaced by a marker,
+    /// so it is the same whatever the secrets are.
     pub config_hash: String,
+    /// Keyed digest of the secret values (see the module docs). `None` when the server
+    /// has no secrets, or when the local key is unavailable.
+    pub secrets_digest: Option<KeyedDigest>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -212,8 +226,43 @@ pub struct KitInventory {
     /// between runs, so callers must not treat them as a stable fingerprint.
     pub incomplete: bool,
     /// Same inputs, same hash. Covers names, scopes, sources, file contents and server
-    /// configs including secrets (only a digest of them is kept).
+    /// configs with secret values masked, so it is comparable across installs. For
+    /// change detection that includes the secrets use [`KitInventory::change_token`].
     pub content_hash: String,
+}
+
+impl KitInventory {
+    /// A token that changes when anything in the kit changes, secret values included.
+    /// It mixes in the keyed secret digests, so it is only comparable on this install.
+    /// Do not log it.
+    pub fn change_token(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.content_hash.as_bytes());
+        for server in &self.mcp_servers {
+            hasher.update([0]);
+            if let Some(digest) = &server.secrets_digest {
+                hasher.update(digest.0.as_bytes());
+            }
+        }
+        hex(&hasher.finalize())
+    }
+}
+
+/// An HMAC-SHA256 hex digest. It never appears in `Debug` output.
+#[derive(Clone, PartialEq, Eq)]
+pub struct KeyedDigest(String);
+
+#[cfg(test)]
+impl KeyedDigest {
+    pub(super) fn hex_for_test(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for KeyedDigest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("KeyedDigest(<redacted>)")
+    }
 }
 
 /// Where to look. Build with [`KitRoots::for_profile`], or by hand in tests.
@@ -227,6 +276,9 @@ pub struct KitRoots {
     pub claude_home: PathBuf,
     /// The local project root.
     pub project: PathBuf,
+    /// Where the local `kit-hash.key` lives. `None` means no key: secrets are then left
+    /// out of the digests and the inventory is flagged `incomplete`.
+    pub key_dir: Option<PathBuf>,
 }
 
 impl KitRoots {
@@ -237,13 +289,25 @@ impl KitRoots {
         let claude_home = home.join(".claude");
         let account = profile.home(Kind::Claude)?;
         let account_dir = (account != claude_home).then_some(account);
+        let key_dir = app_data_dir(&home);
         Ok(Self {
             account_dir,
             home,
             claude_home,
             project: project.to_path_buf(),
+            key_dir,
         })
     }
+}
+
+/// The app data dir, as other core modules find it: `MONOCODE_NATIVE_DATA_DIR`, else
+/// `~/.cache/monocode-native`.
+fn app_data_dir(home: &Path) -> Option<PathBuf> {
+    Some(
+        std::env::var_os("MONOCODE_NATIVE_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".cache/monocode-native")),
+    )
 }
 
 /// The seam for MCP OAuth sign-in state (F3-5a). `None` means unknown, and an
@@ -283,6 +347,7 @@ pub fn build_inventory_budgeted(
     let sources = sources(roots);
     let mut inventory = KitInventory::default();
     let mut plugin_dirs: Vec<(String, PathBuf, KitSource)> = Vec::new();
+    let key = roots.key_dir.as_deref().and_then(load_or_create_key);
 
     for source in &sources {
         collect_plugins(source, roots, &home, started, &mut inventory.plugins);
@@ -321,16 +386,29 @@ pub fn build_inventory_budgeted(
         ))
     });
 
-    inventory.incomplete = inventory
+    let timed_out = inventory
         .skills
         .iter()
         .map(|s| s.exclusion)
         .chain(inventory.plugins.iter().map(|p| p.exclusion))
         .any(|e| e == Some(Exclusion::ScanTimedOut));
+    // Without a key the secrets cannot be digested, so a change in them would go
+    // unseen: flag the inventory instead of looking complete. This does not make the
+    // size total a lower bound, so `over_total_cap` ignores it.
+    let mut key_missing = false;
+    for server in &mut inventory.mcp_servers {
+        if server.secrets.is_empty() {
+            continue;
+        }
+        match &key {
+            Some(key) => server.secrets_digest = Some(secrets_digest(key, &server.secrets)),
+            None => key_missing = true,
+        }
+    }
+    inventory.incomplete = timed_out || key_missing;
     inventory.total_compressed = total_compressed(&inventory);
     // A timed-out item has no size, so the total is only a lower bound: report over-cap.
-    inventory.over_total_cap =
-        inventory.incomplete || inventory.total_compressed > MAX_KIT_COMPRESSED_BYTES;
+    inventory.over_total_cap = timed_out || inventory.total_compressed > MAX_KIT_COMPRESSED_BYTES;
     inventory.content_hash = content_hash(&inventory);
     inventory
 }
@@ -918,16 +996,18 @@ fn build_server(
             "stdio"
         })
         .to_string();
+    let secrets = find_secrets(object);
     let mut canonical = String::new();
-    canonical_json(config, &mut canonical);
+    canonical_json(&mask_secrets(config, &secrets), &mut canonical);
     let mut server = KitMcpServer {
         name: name.to_string(),
         scope,
         source,
         config_path: config_path.to_path_buf(),
         compat: McpCompat::Ok,
-        secrets: find_secrets(object),
+        secrets,
         config_hash: digest_str(&[&canonical]),
+        secrets_digest: None,
         transport,
     };
     server.compat = if scope == McpScope::Project {
@@ -1098,6 +1178,134 @@ fn find_secrets(object: &serde_json::Map<String, Value>) -> Vec<SecretField> {
         }
     }
     secrets
+}
+
+const SECRET_MARKER: &str = "<secret>";
+
+/// A copy of the config with every secret value replaced by a marker, so the plain
+/// config hash does not depend on them. Which fields are secret is decided by
+/// [`find_secrets`]; the field names and the shape stay.
+fn mask_secrets(config: &Value, secrets: &[SecretField]) -> Value {
+    let mut masked = config.clone();
+    let Some(object) = masked.as_object_mut() else {
+        return masked;
+    };
+    for secret in secrets {
+        let marker = Value::String(SECRET_MARKER.to_string());
+        match &secret.location {
+            SecretLocation::Env(field) => mask_field(object, "env", field, marker),
+            SecretLocation::Header(field) => mask_field(object, "headers", field, marker),
+            SecretLocation::UrlQuery => {
+                object.insert("url".to_string(), marker);
+            }
+        }
+    }
+    masked
+}
+
+fn mask_field(
+    object: &mut serde_json::Map<String, Value>,
+    group: &str,
+    field: &str,
+    marker: Value,
+) {
+    if let Some(map) = object.get_mut(group).and_then(Value::as_object_mut) {
+        map.insert(field.to_string(), marker);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Keyed digest of secrets
+// ---------------------------------------------------------------------------
+
+const KEY_FILE: &str = "kit-hash.key";
+const KEY_BYTES: usize = 32;
+
+/// The per-installation key, created on first use. Any failure (unreadable, corrupt, not
+/// writable) gives `None`: the caller degrades, it never panics and never overwrites an
+/// existing file it could not read.
+fn load_or_create_key(dir: &Path) -> Option<[u8; KEY_BYTES]> {
+    let path = dir.join(KEY_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => return parse_key(&text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return None,
+    }
+    std::fs::create_dir_all(dir).ok()?;
+    let key: [u8; KEY_BYTES] = rand::random();
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(&path) {
+        Ok(mut file) => {
+            if file.write_all(hex(&key).as_bytes()).is_err() {
+                drop(file);
+                // Do not leave a truncated key that every later run would reject.
+                let _ = std::fs::remove_file(&path);
+                return None;
+            }
+            Some(key)
+        }
+        // Another process created it first: use theirs.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            parse_key(&std::fs::read_to_string(&path).ok()?)
+        }
+        Err(_) => None,
+    }
+}
+
+fn parse_key(text: &str) -> Option<[u8; KEY_BYTES]> {
+    let text = text.trim();
+    if text.len() != KEY_BYTES * 2 || !text.is_ascii() {
+        return None;
+    }
+    let mut key = [0u8; KEY_BYTES];
+    for (index, byte) in key.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(key)
+}
+
+/// HMAC-SHA256 (RFC 2104), built on `sha2`.
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut block = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Sha256::new();
+    inner.update(block.map(|b| b ^ 0x36));
+    inner.update(data);
+    let mut outer = Sha256::new();
+    outer.update(block.map(|b| b ^ 0x5c));
+    outer.update(inner.finalize());
+    outer.finalize().into()
+}
+
+#[cfg(test)]
+pub(super) fn hmac_for_test(key: &[u8], data: &[u8]) -> String {
+    hex(&hmac_sha256(key, data))
+}
+
+/// Keyed digest of a server's secrets, unambiguous (every part is length-prefixed).
+fn secrets_digest(key: &[u8; KEY_BYTES], secrets: &[SecretField]) -> KeyedDigest {
+    let mut data = b"monoptah-kit-secrets-v1".to_vec();
+    for secret in secrets {
+        for part in [
+            format!("{:?}", secret.location).as_bytes(),
+            secret.value.expose().as_bytes(),
+        ] {
+            data.extend_from_slice(&(part.len() as u64).to_le_bytes());
+            data.extend_from_slice(part);
+        }
+    }
+    KeyedDigest(hex(&hmac_sha256(key, &data)))
 }
 
 /// Compact JSON with object keys sorted, independent of the map implementation.

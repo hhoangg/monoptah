@@ -22,6 +22,7 @@ fn env() -> Env {
         account_dir: None,
         claude_home: home.join(".claude"),
         project,
+        key_dir: Some(home.join("app-data")),
         home,
     };
     Env { dir, roots }
@@ -747,8 +748,10 @@ fn hash_ignores_key_order_and_follows_content() {
         &env.roots.home.join(".claude.json"),
         r#"{"mcpServers":{"y":{"url":"https://y.example.com","type":"http"},"z":{"env":{"K":"fake-other-value"},"command":"npx"}}}"#,
     );
-    let secret_changed = build_inventory(&env.roots, Workspace::Codespace).content_hash;
-    assert_ne!(secret_changed, skill_changed);
+    // The secret value is no longer in `content_hash`: only `change_token` follows it.
+    let secret_inventory = build_inventory(&env.roots, Workspace::Codespace);
+    let secret_changed = secret_inventory.content_hash;
+    assert_eq!(secret_changed, skill_changed);
     let plugin = env.roots.claude_home.join("plugins/cache/mk/p/1.0.0");
     write(&plugin.join("extra.txt"), "new file");
     assert_ne!(
@@ -1059,6 +1062,183 @@ mod links {
         assert_eq!(
             inventory.plugins[0].exclusion,
             Some(Exclusion::LinkLeavesItem)
+        );
+    }
+}
+
+mod keyed_secrets {
+    use super::*;
+
+    fn with_secret(env: &Env, token: &str) {
+        servers_json(
+            env,
+            json!({
+                "a": {"command": "npx", "env": {"K": token, "REF": "${HOME}"}},
+                "b": {"type": "http", "url": "https://b.example.com/mcp?key=abc"},
+                "plain": {"command": "npx"}
+            }),
+        );
+    }
+
+    #[test]
+    fn a_secret_change_changes_the_keyed_digest_and_token_but_not_the_plain_hashes() {
+        let env = env();
+        with_secret(&env, "fake-one-1111");
+        let one = build_inventory(&env.roots, Workspace::Codespace);
+        with_secret(&env, "fake-two-2222");
+        let two = build_inventory(&env.roots, Workspace::Codespace);
+        let (a1, a2) = (&one.mcp_servers[0], &two.mcp_servers[0]);
+        assert_eq!(a1.name, "a");
+        assert_eq!(a1.config_hash, a2.config_hash);
+        assert_eq!(one.content_hash, two.content_hash);
+        assert!(a1.secrets_digest.is_some());
+        assert_ne!(a1.secrets_digest, a2.secrets_digest);
+        assert_ne!(one.change_token(), two.change_token());
+        // Same inputs, same token.
+        assert_eq!(
+            two.change_token(),
+            build_inventory(&env.roots, Workspace::Codespace).change_token()
+        );
+        // A server without secrets has no digest.
+        assert_eq!(two.mcp_servers[2].name, "plain");
+        assert_eq!(two.mcp_servers[2].secrets_digest, None);
+    }
+
+    #[test]
+    fn a_url_query_secret_is_masked_in_the_plain_hash_and_keyed() {
+        let env = env();
+        let hash_with = |query: &str| {
+            servers_json(
+                &env,
+                json!({"b": {"type": "http", "url": format!("https://b.example.com/mcp?key={query}")}}),
+            );
+            build_inventory(&env.roots, Workspace::Codespace).mcp_servers[0].clone()
+        };
+        let (x, y) = (hash_with("fake-x"), hash_with("fake-y"));
+        assert_eq!(x.config_hash, y.config_hash);
+        assert_ne!(x.secrets_digest, y.secrets_digest);
+    }
+
+    #[test]
+    fn two_installs_with_different_keys_produce_unrelated_digests() {
+        let env = env();
+        with_secret(&env, "fake-one-1111");
+        let first = build_inventory(&env.roots, Workspace::Codespace);
+        let other = KitRoots {
+            key_dir: Some(env.roots.home.join("other-install")),
+            ..env.roots.clone()
+        };
+        let second = build_inventory(&other, Workspace::Codespace);
+        assert_eq!(first.content_hash, second.content_hash);
+        assert_ne!(
+            first.mcp_servers[0].secrets_digest,
+            second.mcp_servers[0].secrets_digest
+        );
+        assert_ne!(first.change_token(), second.change_token());
+    }
+
+    #[test]
+    fn debug_output_has_no_secret_digest() {
+        let env = env();
+        with_secret(&env, FAKE_TOKEN);
+        let inventory = build_inventory(&env.roots, Workspace::Codespace);
+        let digest = inventory.mcp_servers[0].secrets_digest.clone().unwrap();
+        let hex = digest.hex_for_test();
+        let token = inventory.change_token();
+        for text in [format!("{inventory:?}"), format!("{inventory:#?}")] {
+            assert!(!text.contains(hex));
+            assert!(!text.contains(&token));
+            assert!(!text.contains(FAKE_TOKEN));
+            assert!(text.contains("KeyedDigest(<redacted>)"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_key_file_is_created_with_mode_0600_and_reused() {
+        use std::os::unix::fs::PermissionsExt;
+        let env = env();
+        let key_path = env.roots.home.join("app-data/kit-hash.key");
+        assert!(!key_path.exists());
+        with_secret(&env, "fake-one-1111");
+        let first = build_inventory(&env.roots, Workspace::Codespace);
+        let mode = std::fs::metadata(&key_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let saved = std::fs::read_to_string(&key_path).unwrap();
+        assert_eq!(saved.trim().len(), 64);
+        // A second run reuses the same key, so the digests match.
+        let second = build_inventory(&env.roots, Workspace::Codespace);
+        assert_eq!(std::fs::read_to_string(&key_path).unwrap(), saved);
+        assert_eq!(first.change_token(), second.change_token());
+        assert!(!first.incomplete);
+    }
+
+    #[test]
+    fn an_unusable_key_degrades_without_panicking() {
+        let env = env();
+        with_secret(&env, "fake-one-1111");
+        let key_path = env.roots.home.join("app-data/kit-hash.key");
+
+        // Corrupt content: not replaced, secrets left out, inventory flagged.
+        write(&key_path, "not a key");
+        let corrupt = build_inventory(&env.roots, Workspace::Codespace);
+        assert_eq!(std::fs::read_to_string(&key_path).unwrap(), "not a key");
+        assert!(corrupt.incomplete);
+        assert!(corrupt
+            .mcp_servers
+            .iter()
+            .all(|s| s.secrets_digest.is_none()));
+        assert!(!corrupt.content_hash.is_empty());
+
+        // No key location at all.
+        let none = KitRoots {
+            key_dir: None,
+            ..env.roots.clone()
+        };
+        assert!(build_inventory(&none, Workspace::Codespace).incomplete);
+
+        // A key location that is a file, so the key cannot be created.
+        let blocked = env.roots.home.join("blocked");
+        write(&blocked, "file");
+        let roots = KitRoots {
+            key_dir: Some(blocked),
+            ..env.roots.clone()
+        };
+        assert!(build_inventory(&roots, Workspace::Codespace).incomplete);
+
+        // Without secrets nothing needs a key, so nothing is flagged.
+        servers_json(&env, json!({"plain": {"command": "npx"}}));
+        assert!(!build_inventory(&none, Workspace::Codespace).incomplete);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_key_file_degrades_without_panicking() {
+        use std::os::unix::fs::PermissionsExt;
+        let env = env();
+        with_secret(&env, "fake-one-1111");
+        let key_path = env.roots.home.join("app-data/kit-hash.key");
+        write(&key_path, &"ab".repeat(32));
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = std::fs::read_to_string(&key_path).is_ok(); // true when running as root
+        let inventory = build_inventory(&env.roots, Workspace::Codespace);
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if !readable {
+            assert!(inventory.incomplete);
+            assert!(inventory
+                .mcp_servers
+                .iter()
+                .all(|s| s.secrets_digest.is_none()));
+        }
+    }
+
+    #[test]
+    fn hmac_matches_the_rfc_4231_vector() {
+        // RFC 4231 test case 2.
+        let mac = super::super::kit::hmac_for_test(b"Jefe", b"what do ya want for nothing?");
+        assert_eq!(
+            mac,
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
         );
     }
 }
