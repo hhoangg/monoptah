@@ -1496,9 +1496,9 @@ ticket, after review and after merge.
 | F2-3 | 3 | todo | - | |
 | F2-4 | 3 | todo | - | |
 | F2-5 | 3 | todo | - | |
-| F3-3h | 4 | todo | - | |
+| F3-3h | 4 | in progress | csi-f3-3h | |
 | F3-5h | 4 | skipped: dropped by user decision D12 | - | no OAuth sign-in merge on the Host |
-| F4-2h | 4 | todo | - | |
+| F4-2h | 4 | in progress | csi-f4-2h | |
 | HR3 | 4 | todo | - | release: stop and ask |
 | F3-4 | 4 | todo | - | |
 | F3-5 | 4 | todo | - | reduced (D12): config-only OAuth servers, 'Sign in in the cloud'; depends on F3-4 only |
