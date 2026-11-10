@@ -39,6 +39,7 @@ impl std::fmt::Display for UploadError {
 }
 impl std::error::Error for UploadError {}
 
+#[derive(Default)]
 pub struct UploadOptions<'a> {
     /// An earlier `UploadError::upload_id` to continue from.
     pub resume_id: Option<String>,
@@ -46,15 +47,6 @@ pub struct UploadOptions<'a> {
     pub progress: Option<&'a mut dyn FnMut(u64, u64)>,
     /// Checked between chunks; set it to stop the transfer.
     pub cancel: Option<&'a AtomicBool>,
-}
-impl Default for UploadOptions<'_> {
-    fn default() -> Self {
-        Self {
-            resume_id: None,
-            progress: None,
-            cancel: None,
-        }
-    }
 }
 
 pub fn sha256_file(path: &Path) -> Result<(String, u64), String> {
