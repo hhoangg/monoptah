@@ -269,7 +269,7 @@ impl Book {
             .find(|a| a.provider == kind.id() && a.is_default())
             .map(|a| clean_label(&a.label))
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "Default account".into());
+            .unwrap_or_else(|| "CLI login".into());
         let mut rows = vec![Account {
             id: DEFAULT.into(),
             provider: kind.id().into(),

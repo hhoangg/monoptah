@@ -620,3 +620,57 @@ fn switching_project_in_the_picker_clears_the_selection(cx: &mut TestAppContext)
         })
         .unwrap();
 }
+
+/// The DEFAULT badge marks the account new sessions use, and the pin button on
+/// another account makes that one the default and moves the badge to it.
+#[gpui::test]
+fn the_default_badge_follows_the_account_chosen_with_the_pin_button(cx: &mut TestAppContext) {
+    use monocode_core::{accounts::DEFAULT, provider::Kind};
+    let _clis = crate::shell::surface_tests::NoClis::new();
+    let dir = std::env::temp_dir().join(format!(
+        "native-settings-accounts-{}",
+        monocode_core::mono::new_id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = std::sync::Arc::new(std::sync::Mutex::new(
+        monocode_core::store::Store::open(&dir.join("native.sqlite")).unwrap(),
+    ));
+    cx.update(|cx| crate::accounts::install(store, cx));
+    let account = cx.update(|cx| {
+        crate::accounts::get(cx).unwrap().update(cx, |center, _| {
+            center.book.add(Kind::Claude, "Token").unwrap().id
+        })
+    });
+    let window = window(Section::Providers, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    let badge = |id: &str| format!("account-default-badge-claude-{id}");
+    let pin = |id: &str| format!("account-set-default-claude-{id}");
+    let has = |visual: &mut VisualTestContext, selector: String| {
+        visual
+            .debug_bounds(Box::leak(selector.into_boxed_str()))
+            .is_some()
+    };
+    // The CLI login is the default until another account is chosen.
+    assert!(has(visual, badge(DEFAULT)));
+    assert!(!has(visual, pin(DEFAULT)));
+    assert!(!has(visual, badge(&account)));
+    let button = visual
+        .debug_bounds(Box::leak(pin(&account).into_boxed_str()))
+        .unwrap();
+    visual.simulate_click(button.center(), Default::default());
+    visual.run_until_parked();
+    let preferred = visual.update(|_, cx| {
+        crate::accounts::get(cx)
+            .unwrap()
+            .read(cx)
+            .book
+            .preferred(Kind::Claude)
+    });
+    assert_eq!(preferred, account);
+    assert!(has(visual, badge(&account)));
+    assert!(!has(visual, badge(DEFAULT)));
+    // The CLI login can be made the default again.
+    assert!(has(visual, pin(DEFAULT)));
+    let _ = std::fs::remove_dir_all(dir);
+}
