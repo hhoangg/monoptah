@@ -14,6 +14,8 @@ import { request } from "node:http";
 import { HostEngine } from "./engine";
 import { HostStore } from "./store";
 import { createHostServer } from "./server";
+import { WorkspaceCommands } from "./workspace-commands";
+import { WorkspaceWatchHost } from "./workspace-watch";
 import { HOST_VERSION } from "./host-version";
 import { HostChildBackend } from "./child-backend";
 import { configureChildBackend } from "../src/integrations/harness/core/child";
@@ -103,6 +105,7 @@ async function setup(providers: RemoteProvider[] = ["codex"]) {
   });
   return {
     url,
+    server,
     directory,
     engine,
     store,
@@ -505,6 +508,24 @@ describe("remote host API", () => {
       (await s.call("files.read", { projectId: s.project.id, path: ".." }))
         .value.error,
     ).toContain("outside");
+  });
+
+  it("advertises workspace.watch and releases watchers when the server closes", async () => {
+    const s = await setup();
+    const run = async (command: string, args: Record<string, unknown>) =>
+      (await s.call("workspace.run", { command, args })).value;
+    const closeAll = vi.spyOn(WorkspaceWatchHost.prototype, "close");
+    const closeCommands = vi.spyOn(WorkspaceCommands.prototype, "close");
+    const { result } = await run("watch_changes", { cwd: s.project.cwd, dirs: [""] });
+    expect(typeof result.id).toBe("string");
+    const pending = run("wait_changes", { id: result.id });
+    s.server.closeAllConnections();
+    await new Promise<void>((resolve) => s.server.close(() => resolve()));
+    expect(closeCommands).toHaveBeenCalled();
+    expect(closeAll).toHaveBeenCalled();
+    await pending.catch(() => undefined);
+    closeAll.mockRestore();
+    closeCommands.mockRestore();
   });
 
   it("answers this app's file commands inside host projects only", async () => {
