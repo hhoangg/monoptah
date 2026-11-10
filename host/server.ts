@@ -15,6 +15,7 @@ import {
 } from "../src/features/connections/model/protocol";
 import { HostEngine } from "./engine";
 import { writeAttachmentChunk, readAttachmentChunk } from "./attachments";
+import { HostUploads } from "./uploads";
 import type { LinkedWorkItem } from "../src/features/sessions/model/session";
 import { parseGithubWorkItemUrl } from "../src/features/sessions/model/sessionWorkItem";
 import { SyncTransfers } from "./sync-transfer";
@@ -193,6 +194,8 @@ export function createHostServer(
     }
     return catalog;
   };
+  // Sweeps expired staging at startup; begin sweeps again.
+  const uploads = new HostUploads(engine.store.uploadDir);
   return createServer(
     { requestTimeout: 20_000, headersTimeout: 10_000, maxHeaderSize: 8192 },
     async (request, response) => {
@@ -294,6 +297,7 @@ export function createHostServer(
                 "git.action",
                 "attachments.upload",
                 "attachments.read",
+                "uploads",
                 "sessions.draft",
                 "sessions.plan",
               ],
@@ -419,6 +423,18 @@ export function createHostServer(
             break;
           case "attachments.read":
             result = readAttachmentChunk(engine.store, params);
+            break;
+          case "uploads.begin":
+            result = uploads.begin(params);
+            break;
+          case "uploads.chunk":
+            result = uploads.chunk(params);
+            break;
+          case "uploads.commit":
+            result = uploads.commit(params);
+            break;
+          case "uploads.discard":
+            result = uploads.discard(params);
             break;
           case "devices.revokeSelf":
             // Only the caller's own credential. Sessions and other devices

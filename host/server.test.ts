@@ -2,10 +2,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -754,5 +756,25 @@ describe("remote host API", () => {
     expect(
       (await s.call("git.index", { projectId: project.id })).value.result.files,
     ).toEqual([]);
+  });
+});
+
+describe("host uploads over the API", () => {
+  it("advertises the capability and round-trips an authenticated upload", async () => {
+    const s = await setup();
+    const described = await s.call("environment.describe");
+    expect(described.value.result.capabilities).toContain("uploads");
+    const data = Buffer.from("kit bytes");
+    const sha256 = createHash("sha256").update(data).digest("hex");
+    const params = { name: "kit.tar", size: data.length, sha256 };
+    expect((await s.call("uploads.begin", params, "invalid")).status).toBe(401);
+    const { uploadId } = (await s.call("uploads.begin", params)).value.result;
+    const chunk = await s.call("uploads.chunk", { uploadId, offset: 0, data: data.toString("base64") });
+    expect(chunk.value.result).toEqual({ offset: data.length });
+    const done = await s.call("uploads.commit", { uploadId });
+    expect(done.value.result).toMatchObject({ name: "kit.tar", size: data.length, sha256 });
+    expect(readFileSync(done.value.result.path).equals(data)).toBe(true);
+    expect((await s.call("uploads.discard", { uploadId })).value.result).toEqual({ discarded: true });
+    expect((await s.call("uploads.begin", { ...params, name: "../x" })).status).not.toBe(200);
   });
 });
