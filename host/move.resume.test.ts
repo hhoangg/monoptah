@@ -55,7 +55,7 @@ it("the first turn after an import resumes the SAME Claude session id and never 
   uploads.commit({ uploadId });
   const id = "11111111-1111-4111-8111-111111111111";
   const imported = await moves.importSession({
-    projectId: project.id, providerSessionId: id, uploadId, cwd: dir, model: "claude:claude-sonnet-5",
+    projectId: project.id, providerSessionId: id, uploadId, cwd: dir, fromCwds: ["/workspaces/app"], model: "claude:claude-sonnet-5",
   });
   expect(store.session(imported.sessionId).session.blocks).toHaveLength(0);
 

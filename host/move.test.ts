@@ -26,6 +26,7 @@ import {
   installTranscript,
   patchPathProblem,
   defaultBranches,
+  removePatchLeftovers,
   validateBranch,
   worktreeTree,
 } from "./move";
@@ -371,27 +372,111 @@ describe("workspace.applySnapshot", () => {
   });
 
   describe("default branch protection", () => {
-    it("still refuses main and master when origin/HEAD is unset", async () => {
+    /** The sender is on `main` at origin's tip with only uncommitted changes. */
+    const onMain = (w: World) => {
+      git(w.local, "checkout", "-q", "-f", "main");
+      rmSync(join(w.local, "b.txt"), { force: true });
+      rmSync(join(w.local, "bin.dat"), { force: true });
+      writeFileSync(join(w.local, "a.txt"), "one\nlocal edit\n");
+      writeFileSync(join(w.local, "c.txt"), "new\n");
+    };
+
+    it("accepts main at origin's tip with an uncommitted patch (new instance)", async () => {
+      const w = world({ rootBranch: "main" });
+      onMain(w);
+      const snap = snapshotOf(w.local);
+      expect(snap.head).toBe(git(w.origin, "rev-parse", "main"));
+      const patchUploadId = upload(w.uploads, "changes.patch", snap.patch);
+      const out = await w.moves.applySnapshot({ projectId: w.projectId, instance: "new", branch: "main", ...snap, patchUploadId });
+      expect(out.cwd).toBe(w.root);
+      expect(readFileSync(join(w.root, "c.txt"), "utf8")).toBe("new\n");
+    });
+
+    it("accepts main at origin's tip on a shared instance with a detached worktree", async () => {
       const w = world();
-      git(w.root, "remote", "set-head", "origin", "-d");
-      expect(() => git(w.root, "symbolic-ref", "refs/remotes/origin/HEAD")).toThrow();
+      onMain(w);
+      const snap = snapshotOf(w.local);
+      const patchUploadId = upload(w.uploads, "changes.patch", snap.patch);
+      const out = await w.moves.applySnapshot({ projectId: w.projectId, branch: "main", ...snap, patchUploadId });
+      expect(out).toMatchObject({ createdWorktree: true });
+      expect(out.cwd).not.toBe(w.root);
+      expect(git(out.cwd, "rev-parse", "HEAD")).toBe(snap.head);
+      expect(() => git(out.cwd, "symbolic-ref", "-q", "HEAD")).toThrow();
+      expect(git(w.root, "symbolic-ref", "--short", "HEAD")).toBe("main");
+      expect(readFileSync(join(out.cwd, "c.txt"), "utf8")).toBe("new\n");
+    });
+
+    it("refuses main when it is ahead of origin/main", async () => {
+      const w = world();
+      onMain(w);
+      git(w.local, "commit", "-q", "-am", "unpushed");
+      const snap = snapshotOf(w.local);
+      await expect(w.moves.applySnapshot({ projectId: w.projectId, branch: "main", ...snap })).rejects.toThrow(/default branch/);
+      expect(existsSync(`${w.root}-worktrees`)).toBe(false);
+    });
+
+    it("still refuses main and master when origin/HEAD is unset and they are ahead", async () => {
+      const w = world();
       git(w.local, "push", "-q", "origin", "feat:master");
+      git(w.root, "fetch", "-q", "origin");
+      git(w.root, "remote", "set-head", "origin", "-d");
+      git(w.local, "commit", "-q", "--allow-empty", "-m", "ahead");
       const snap = snapshotOf(w.local);
       for (const branch of ["main", "master"])
         await expect(w.moves.applySnapshot({ projectId: w.projectId, branch, ...snap })).rejects.toThrow(/default branch/);
-      expect(await defaultBranches(w.root)).toContain("main");
+      expect(await defaultBranches(w.root)).toEqual(expect.arrayContaining(["main", "master"]));
     });
 
-    it("refuses a default that only origin names, such as develop", async () => {
+    it("treats the target of origin/HEAD as the default, such as develop", async () => {
       const w = world();
       git(w.local, "push", "-q", "origin", "feat:develop");
-      git(w.origin, "symbolic-ref", "HEAD", "refs/heads/develop");
-      git(w.root, "remote", "set-head", "origin", "-d");
+      git(w.root, "fetch", "-q", "origin");
+      git(w.root, "remote", "set-head", "origin", "develop");
+      git(w.local, "commit", "-q", "--allow-empty", "-m", "ahead");
       const snap = snapshotOf(w.local);
-      expect(await defaultBranches(w.root)).toEqual(expect.arrayContaining(["develop"]));
+      expect(await defaultBranches(w.root)).toContain("develop");
+      await expect(w.moves.applySnapshot({ projectId: w.projectId, branch: "develop", ...snap })).rejects.toThrow(/default branch/);
+    });
+
+    it("makes no network call", async () => {
+      const w = world();
+      git(w.root, "remote", "set-url", "origin", "/nonexistent/origin.git");
+      const start = Date.now();
+      await defaultBranches(w.root);
+      expect(Date.now() - start).toBeLessThan(5_000);
+    });
+  });
+
+  describe("fast-forward on a new instance", () => {
+    it("refuses when it would overwrite an ignored file", async () => {
+      const w = world({ rootBranch: "feat" });
+      writeFileSync(join(w.local, "extra.txt"), "from the sender\n");
+      git(w.local, "add", "extra.txt");
+      git(w.local, "commit", "-q", "-m", "add extra");
+      git(w.local, "push", "-q", "origin", "feat");
+      git(w.root, "fetch", "-q", "origin");
+      writeFileSync(join(w.root, ".git", "info", "exclude"), "extra.txt\n");
+      writeFileSync(join(w.root, "extra.txt"), "precious local data\n");
+      const before = git(w.root, "rev-parse", "HEAD");
+      const snap = snapshotOf(w.local);
       await expect(
-        w.moves.applySnapshot({ projectId: w.projectId, branch: "develop", ...snap }),
-      ).rejects.toThrow(/default branch/);
+        w.moves.applySnapshot({ projectId: w.projectId, instance: "new", branch: "feat", ...snap }),
+      ).rejects.toThrow(/would overwrite the ignored file extra\.txt/);
+      expect(git(w.root, "rev-parse", "HEAD")).toBe(before);
+      expect(readFileSync(join(w.root, "extra.txt"), "utf8")).toBe("precious local data\n");
+    });
+
+    it("removes what a patch left behind and restores the old tip", async () => {
+      const w = world({ rootBranch: "feat" });
+      const tip = git(w.root, "rev-parse", "HEAD");
+      writeFileSync(join(w.root, "a.txt"), "changed\n");
+      writeFileSync(join(w.root, "b.txt"), "created by the patch\n");
+      mkdirSync(join(w.root, "dir"));
+      writeFileSync(join(w.root, "dir", "c.txt"), "x\n");
+      await removePatchLeftovers(w.root, tip, ["a.txt", "b.txt", "dir/c.txt"]);
+      expect(git(w.root, "status", "--porcelain", "--untracked-files=all")).toBe("");
+      expect(existsSync(join(w.root, "b.txt"))).toBe(false);
+      expect(readFileSync(join(w.root, "a.txt"), "utf8")).toBe("one\ntwo\n");
     });
   });
 
@@ -557,11 +642,16 @@ describe("sessions.import", () => {
     expect(w.provider.bind).toHaveBeenCalledWith(result.sessionId, ID, w.root);
   });
 
-  it("detects the source cwd from the entries when none is given", async () => {
+  it.each([
+    ["missing", undefined],
+    ["empty", []],
+    ["relative", ["workspaces/app"]],
+    ["not a list", "/workspaces/app"],
+  ])("requires fromCwds (%s)", async (_label, fromCwds) => {
     const w = world();
     const uploadId = upload(w.uploads, "t.jsonl", fixture("base.jsonl"));
-    await imported(w, uploadId, { fromCwds: undefined });
-    expect(readFileSync(fileOf(w), "utf8")).not.toContain("/workspaces/app");
+    await expect(imported(w, uploadId, { fromCwds })).rejects.toThrow(/fromCwds/);
+    expect(existsSync(join(w.claudeDir, "projects"))).toBe(false);
   });
 
   it("extends: replaces an older copy, keeps it as .pre-cloud and reuses the untouched session", async () => {
@@ -614,7 +704,7 @@ describe("sessions.import", () => {
       { type: "user", uuid: "a3", sessionId: ID, cwd: "/home/someone", other: "/tmp/x /workspaces/app-two" },
     ];
     const text = entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n";
-    for (const fromCwds of [["/workspaces/app"], undefined]) {
+    for (const fromCwds of [["/workspaces/app"], ["/workspaces/app/"], ["", "/workspaces/app//", "/workspaces/app"]]) {
       const w = world();
       await imported(w, upload(w.uploads, "t.jsonl", text), { fromCwds });
       const out = readFileSync(fileOf(w), "utf8").trim().split("\n").map((line) => JSON.parse(line));
@@ -689,7 +779,6 @@ describe("sessions.import", () => {
     ["a relative cwd", { cwd: "relative/dir" }],
     ["a missing model", { model: "" }],
     ["a bad mode", { runtimeMode: "chaos" }],
-    ["bad source paths", { fromCwds: "not-a-list" }],
   ])("refuses %s", async (_label, bad) => {
     const w = world();
     const uploadId = upload(w.uploads, "t.jsonl", fixture("base.jsonl"));

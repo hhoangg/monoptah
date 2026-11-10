@@ -29,7 +29,6 @@ import {
   forkNotice,
   forkTranscript,
   parseChain,
-  probeLine,
   rewriteCwd,
   type Decision,
 } from "./transcript-sync";
@@ -191,10 +190,9 @@ export async function worktreeTree(cwd: string, extra: string[] = []): Promise<s
 }
 
 /**
- * Branches that may be origin's default (the Rust `default_branches`, without failing
- * closed when origin cannot be asked: the pushed branch must be fetchable anyway):
- * the target of `origin/HEAD`, `main` / `master` when they exist on origin, and what a
- * read-only `ls-remote --symref` reports.
+ * Branches that may be origin's default: the target of `origin/HEAD`, and `main` / `master`
+ * when origin has them (as remote-tracking refs). Local refs only: the Host never pushes,
+ * so there is no network call and no need to fail closed on an unreachable origin.
  */
 export async function defaultBranches(root: string): Promise<string[]> {
   const names = new Set<string>();
@@ -204,17 +202,24 @@ export async function defaultBranches(root: string): Promise<string[]> {
   for (const name of ["main", "master"])
     if (await gitOk(root, ["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${name}`]))
       names.add(name);
-  const remote = await git(root, ["ls-remote", "--symref", "origin", "HEAD"], {}, 15_000).catch(() => "");
-  for (const line of remote.split("\n")) {
-    const match = /^ref: refs\/heads\/(\S+)/.exec(line);
-    if (match) names.add(match[1]);
-  }
-  const heads = await git(root, ["ls-remote", "--heads", "origin", "refs/heads/main", "refs/heads/master"], {}, 15_000).catch(() => "");
-  for (const line of heads.split("\n")) {
-    const match = /\trefs\/heads\/(main|master)$/.exec(line);
-    if (match) names.add(match[1]);
-  }
   return [...names];
+}
+
+/**
+ * Cleans up after a failed patch on the project root. The tree was clean when the call
+ * started, so `reset --hard` to the old tip loses nothing; whatever the patch created and
+ * a failed reverse-apply left behind (untracked files) is removed too, so a retry is not
+ * blocked by "The workspace has changes".
+ */
+export async function removePatchLeftovers(target: string, tip: string, paths: string[]): Promise<void> {
+  await git(target, ["reset", "--hard", "--quiet", tip]).catch(() => undefined);
+  for (const path of paths) {
+    if (patchPathProblem(path)) continue;
+    const full = resolve(target, path);
+    if (!full.startsWith(target + sep)) continue;
+    if (await gitOk(target, ["ls-files", "--error-unmatch", "--", path])) continue;
+    rmSync(full, { recursive: true, force: true });
+  }
 }
 
 export interface SnapshotResult {
@@ -359,27 +364,6 @@ export function installTranscript(input: {
   throw new Error("The transcript on this machine keeps changing");
 }
 
-/**
- * The session's own cwd: the top-level `cwd` of the first entry that has one. Other cwds in
- * the file (a subdirectory the session moved into, a path outside the project) are NOT
- * sources: the Rust side rewrites only the project cwd and the session cwd, and
- * `rewriteCwd` keeps the rest of a path (`/src/app/pkg` becomes `/dst/app/pkg`).
- */
-function firstSessionCwd(text: string): string | undefined {
-  for (const line of text.split("\n")) {
-    if (!line.includes('"cwd"')) continue;
-    const body = line.replace(/\r$/, "");
-    if (!probeLine(body)) continue;
-    try {
-      const cwd = (JSON.parse(body) as { cwd?: unknown }).cwd;
-      if (typeof cwd === "string" && cwd) return cwd;
-    } catch {
-      // Not an entry: nothing to rewrite.
-    }
-  }
-  return undefined;
-}
-
 function str(value: unknown, label: string, max: number): string {
   if (typeof value !== "string" || !value.trim() || value.length > max || value.includes("\0"))
     throw new Error(`Invalid ${label}`);
@@ -442,8 +426,13 @@ export class HostMoves {
     patch?: string;
   }): Promise<SnapshotResult> {
     const { root, branch, head, tree, patch } = input;
-    // The default branch of origin is never the target of a move.
-    if ((await defaultBranches(root)).includes(branch))
+    // Origin's default branch is only used where nothing would have to move it: HEAD must
+    // be the tip of origin's copy (uncommitted changes alone travel). A default branch that
+    // is ahead would have to be pushed, which a move never does.
+    const defaultTip = (await defaultBranches(root)).includes(branch)
+      ? (await git(root, ["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}`]).catch(() => "")).trim()
+      : undefined;
+    if (defaultTip !== undefined && defaultTip !== head)
       throw new Error("A moved session never uses the default branch of origin");
     // Refuse a bad patch before anything is created.
     const paths = patch ? await validatePatch(root, patch) : [];
@@ -472,46 +461,55 @@ export class HostMoves {
       }
       if ((await git(root, ["status", "--porcelain", "--untracked-files=all"])).trim())
         throw new Error("The workspace has changes; it cannot take a snapshot");
-      let moved = false;
       if (at !== head) {
         if (!(await gitOk(root, ["merge-base", "--is-ancestor", at, head])))
           throw new Error("HEAD of the workspace is not an ancestor of the snapshot head");
+        // The fast-forward must not overwrite or remove an ignored file of the workspace.
+        const ignored = new Set(
+          (await git(root, ["ls-files", "-o", "-i", "--exclude-standard", "-z"])).split("\0").filter(Boolean),
+        );
+        const changed = (await git(root, ["diff", "--name-only", "--no-renames", "-z", at, head])).split("\0").filter(Boolean);
+        const clash = changed.find((path) => ignored.has(path));
+        if (clash) throw new Error(`The fast-forward would overwrite the ignored file ${clash}`);
         await git(root, ["merge", "--ff-only", head]);
-        moved = true;
       }
       // The tree was clean at the start (checked above), so putting the branch back to its
       // old tip with reset --hard loses nothing.
-      const restoreTip = async () => {
-        if (moved) await git(root, ["reset", "--hard", "--quiet", at]);
-      };
+      const restoreTip = () => removePatchLeftovers(root, at, paths);
       return this.finish(root, root, patch, paths, tree, head, restoreTip, result(root, false, false));
     }
 
     const listed = await hostWorktrees(root);
     const existing = listed.worktrees.find((entry) => entry.branch === branch && !entry.missing);
-    if (existing) {
+    // A default branch at origin's tip is usually checked out in the project root already;
+    // the moved session then gets a detached worktree at the same commit.
+    const detached = existing !== undefined && defaultTip !== undefined;
+    if (existing && !detached) {
       if (existing.head === head && (await worktreeTree(existing.path, paths)) === tree)
         return result(existing.path, false, true);
       throw new Error("This branch already has a working copy. Select it from the picker.");
     }
-    const path = join(listed.defaultRoot, `wt-${branch.replace(/[^a-zA-Z0-9_-]/g, "-")}`);
+    const path = join(listed.defaultRoot, `wt-${branch.replace(/[^a-zA-Z0-9_-]/g, "-")}${detached ? "-snapshot" : ""}`);
     if (existsSync(path)) throw new Error(`${path} already exists. Choose another branch name.`);
     const local = (
       await git(root, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]).catch(() => "")
     ).trim();
-    if (local && local !== head)
+    if (local && local !== head && !detached)
       throw new Error("The branch exists here at a different commit; it is not moved");
     mkdirSync(listed.defaultRoot, { recursive: true });
-    if (local) await git(root, ["worktree", "add", "--", path, branch]);
+    if (detached) await git(root, ["worktree", "add", "--detach", "--", path, head]);
+    else if (local) await git(root, ["worktree", "add", "--", path, branch]);
     else await git(root, ["worktree", "add", "--no-track", "-b", branch, "--", path, head]);
-    const created = (await hostWorktrees(root)).worktrees.find((entry) => entry.path !== root && entry.branch === branch);
+    const created = detached
+      ? (await hostWorktrees(root)).worktrees.find((entry) => entry.path === path)
+      : (await hostWorktrees(root)).worktrees.find((entry) => entry.path !== root && entry.branch === branch);
     const target = created?.path ?? path;
     const rollback = async () => {
       await git(root, ["worktree", "remove", "--force", "--", target]).catch(() => {
         rmSync(target, { recursive: true, force: true });
       });
       await git(root, ["worktree", "prune"]).catch(() => undefined);
-      if (!local) {
+      if (!local && !detached) {
         const now = (await git(root, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]).catch(() => "")).trim();
         if (now === head) await git(root, ["branch", "-D", "--", branch]).catch(() => undefined);
       }
@@ -589,13 +587,21 @@ export class HostMoves {
     const settings = modelSettings(params.modelSettings);
     const runtimeMode = (params.runtimeMode ?? "supervised") as Session["runtimeMode"];
     if (!RUNTIME_MODES.includes(runtimeMode)) throw new Error("Invalid permission mode");
-    const given = params.fromCwds ?? [];
+    const given = params.fromCwds;
     if (
       !Array.isArray(given) ||
       given.length > 16 ||
-      given.some((entry) => typeof entry !== "string" || entry.length > 4096 || entry.includes("\0"))
+      !given.some((entry) => typeof entry === "string" && entry.trim() !== "") ||
+      given.some(
+        (entry) =>
+          typeof entry !== "string" ||
+          entry.length > 4096 ||
+          entry.includes("\0") ||
+          // Empty entries are dropped below; the rest must be absolute.
+          (entry.trim() !== "" && !(isAbsolute(entry) || /^[A-Za-z]:[\\/]/.test(entry))),
+      )
     )
-      throw new Error("Invalid source paths");
+      throw new Error("fromCwds must list the absolute project and session paths of the transcript");
     if (typeof params.cwd !== "string") throw new Error("Invalid working copy");
     const cwd = await resolveHostWorktreeAsync(project.cwd, params.cwd);
     const name = claudeProjectDirName(cwd);
@@ -625,11 +631,15 @@ export class HostMoves {
       reusable ??= bound.id;
     }
 
-    // Only the roots the client names (project cwd and session cwd) are rewritten; with
-    // none named, only the session's own cwd. Anything outside them stays as it was.
-    const named = (given as string[]).length ? (given as string[]) : [firstSessionCwd(incoming)];
+    // Only the roots the client names (project cwd and session cwd) are rewritten, with a
+    // trailing separator stripped so the boundary check can match. Anything outside them
+    // stays as it was, and a subpath is kept (`/src/app/pkg` -> `/dst/app/pkg`).
     const sources = [
-      ...new Set([...named, params.cwd].filter((entry): entry is string => !!entry)),
+      ...new Set(
+        [...(given as string[]), params.cwd]
+          .map((entry) => (entry.length > 1 ? entry.replace(/[\\/]+$/, "") : entry))
+          .filter((entry) => entry !== "" && entry !== "/"),
+      ),
     ].filter((entry) => entry !== cwd);
     const text = rewriteCwd(incoming, sources, cwd);
     const dir = join(this.claudeDir(), "projects", name);

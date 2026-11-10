@@ -62,7 +62,7 @@ it("advertises both methods and imports a transcript over the API", async () => 
 
   const args = {
     projectId: project.id, providerSessionId: "11111111-1111-4111-8111-111111111111",
-    uploadId, cwd: directory, title: "Moved", model: "claude:test",
+    uploadId, cwd: directory, fromCwds: ["/workspaces/app"], title: "Moved", model: "claude:test",
   };
   expect((await call("sessions.import", args, "invalid")).status).toBe(401);
   const done = await call("sessions.import", args);
