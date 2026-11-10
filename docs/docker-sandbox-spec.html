@@ -1656,12 +1656,15 @@
               <li>
                 Chat, transcript, approvals, files và Git dùng remote session
                 experience hiện có trong phạm vi host hỗ trợ. Note: for cloud
-                sessions (Codespaces today), Explorer/Changes show the cloud
-                workspace (banner "Cloud files - codespace ..."), with a
-                Cloud / Local switch; Local shows the local checkout and local
-                git writes are refused there
+                sessions (Codespaces and sandboxes alike), Explorer/Changes
+                show the cloud workspace (banner "Cloud files - codespace ..."
+                or "Cloud files - sandbox ..."), with a Cloud / Local switch;
+                Local shows the local checkout and local git writes are
+                refused there
                 (<code>crates/monocode-gpui/src/git_gate.rs</code>). Remote git
-                writes follow the policy of ticket F2-1.
+                writes follow the policy of ticket F2-1. While the workspace is
+                still being created (a pending workspace) the panels show a
+                placeholder, and every write to it is refused.
               </li>
             </ul>
           </article>
@@ -3901,13 +3904,17 @@ ERROR: process "/bin/sh -c npm ci" exited with code 1</span></div>
           </li>
           <li>
             <strong>Files/Git của sandbox.</strong> Cloud sessions
-            (Codespaces today) show the cloud workspace in Explorer/Changes by
-            default, with a Cloud / Local switch (<code>git_gate.rs</code>,
-            F2-1); git writes are refused only in Local mode. A sandbox reuses
-            the same model once its Host serves the workspace commands. Open decision:
-            whether v1 relies on the transcript plus the archive bundle/patch,
-            or connects Explorer/Changes to the sandbox Host like a normal
-            remote project.
+            (Codespaces and sandboxes) show the cloud workspace in
+            Explorer/Changes by default, with a Cloud / Local switch
+            (<code>git_gate.rs</code>, F2-1). Git writes to the local checkout
+            are refused while a cloud session is in view; writes to the cloud
+            workspace follow the remote git policy. While a sandbox is still
+            being created (a pending workspace) the panels show a placeholder
+            and writes are refused. Decided: the code treats sandboxes like
+            codespaces, so Explorer/Changes connect to the sandbox Host like a
+            normal remote project (the only difference is that a sandbox has no
+            "Open in browser"). The transcript plus the archive bundle/patch
+            remain the fallback when the Host is not reachable.
           </li>
           <li>
             <strong>Claude account picker.</strong> Đã chốt dùng account trong
