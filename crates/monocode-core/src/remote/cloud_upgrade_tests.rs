@@ -404,6 +404,10 @@ fn an_older_host_with_a_running_turn_is_deferred_before_any_script_runs() {
     assert!(fx.runner.phases().is_empty());
     assert!(fx.connections.host_upgrade_pending(MACHINE));
     assert_eq!(lines.len(), 1);
+    assert_eq!(
+        crate::cloud_sessions::Host::host_update(&fx.connections, MACHINE),
+        crate::cloud_sessions::view::HostUpdate::Pending
+    );
 }
 
 #[test]
@@ -488,6 +492,13 @@ fn a_failed_download_in_a_sandbox_keeps_the_old_host_and_shows_the_policy_hint()
         "nothing was restarted"
     );
     assert_eq!(lines.last(), Some(&warning));
+    // The file viewer reads the failure back through the Host seam: no pending flag, the
+    // warning itself (with the policy hint).
+    assert!(!fx.connections.host_upgrade_pending(MACHINE));
+    assert_eq!(
+        crate::cloud_sessions::Host::host_update(&fx.connections, MACHINE),
+        crate::cloud_sessions::view::HostUpdate::Failed(warning)
+    );
 }
 
 #[test]
