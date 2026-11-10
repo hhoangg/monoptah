@@ -6,10 +6,14 @@
 use crate::{settings::Preferences, theme::*};
 use gpui::{App, Div, ElementId, Role, SharedString, Stateful, Task, div, prelude::*, px};
 use monocode_core::cloud_sessions::{
-    kit::KitInventory,
+    kit::{KitInventory, Workspace},
     kit_prefs::{self, ApiKit, CloudKitPrefs, KitSummary},
 };
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 /// What the row knows about the kit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,23 +44,82 @@ pub(crate) fn default_on(prefs: &CloudKitPrefs) -> bool {
 
 /// How the inventory is read. The app reads this computer; tests install a fixture.
 #[derive(Clone, Copy)]
-pub(crate) struct KitScanner(pub fn(&Path) -> Result<KitInventory, String>);
+pub(crate) struct KitScanner(pub fn(&Path, Workspace) -> Result<KitInventory, String>);
 impl gpui::Global for KitScanner {}
 
 /// The function that reads the inventory.
-pub(crate) fn scanner(cx: &App) -> fn(&Path) -> Result<KitInventory, String> {
+pub(crate) fn scanner(cx: &App) -> fn(&Path, Workspace) -> Result<KitInventory, String> {
     cx.try_global::<KitScanner>()
-        .map_or(kit_prefs::scan as fn(&Path) -> _, |scanner| scanner.0)
+        .map_or(kit_prefs::scan as fn(&Path, Workspace) -> _, |scanner| {
+            scanner.0
+        })
 }
 
-/// Counts what the selection takes from `project`, off the UI thread.
-pub(crate) fn load_summary(project: String, prefs: CloudKitPrefs, cx: &App) -> Task<Summary> {
-    let scan = scanner(cx);
-    cx.background_executor().spawn(async move {
-        match scan(Path::new(&project)) {
-            Ok(inventory) => Summary::Ready(KitSummary::of(&inventory, &prefs)),
-            Err(_) => Summary::Unavailable,
+/// How long a scan result serves the panel and the picker without reading the disk again.
+const FRESH: Duration = Duration::from_secs(30);
+
+struct Cached {
+    project: String,
+    workspace: Workspace,
+    at: Instant,
+    inventory: Arc<KitInventory>,
+}
+
+/// Recent scans, so opening a panel or picker does not read every skill again.
+#[derive(Clone, Default)]
+pub(crate) struct KitCache(Arc<Mutex<Vec<Cached>>>);
+impl gpui::Global for KitCache {}
+
+impl KitCache {
+    fn get(&self, project: &str, workspace: Workspace) -> Option<Arc<KitInventory>> {
+        let entries = self.0.lock().ok()?;
+        entries
+            .iter()
+            .find(|e| e.project == project && e.workspace == workspace && e.at.elapsed() < FRESH)
+            .map(|e| e.inventory.clone())
+    }
+    fn put(&self, project: &str, workspace: Workspace, inventory: Arc<KitInventory>) {
+        if let Ok(mut entries) = self.0.lock() {
+            entries.retain(|e| {
+                e.at.elapsed() < FRESH && !(e.project == project && e.workspace == workspace)
+            });
+            entries.push(Cached {
+                project: project.to_owned(),
+                workspace,
+                at: Instant::now(),
+                inventory,
+            });
         }
+    }
+}
+
+/// Counts what the selection takes from `project` for a `workspace`, off the UI thread. A
+/// scan younger than 30 seconds for the same project and workspace is reused; the counts
+/// are always recomputed from the current preferences.
+pub(crate) fn load_summary(
+    project: String,
+    workspace: Workspace,
+    prefs: CloudKitPrefs,
+    cx: &mut App,
+) -> Task<Summary> {
+    let scan = scanner(cx);
+    let cache = cx.default_global::<KitCache>().clone();
+    cx.background_executor().spawn(async move {
+        let inventory = match cache.get(&project, workspace) {
+            Some(inventory) => inventory,
+            None => match scan(Path::new(&project), workspace) {
+                Ok(inventory) => {
+                    let inventory = Arc::new(inventory);
+                    // A scan that hit its budget is not worth keeping.
+                    if !inventory.incomplete {
+                        cache.put(&project, workspace, inventory.clone());
+                    }
+                    inventory
+                }
+                Err(_) => return Summary::Unavailable,
+            },
+        };
+        Summary::Ready(KitSummary::of(&inventory, &prefs))
     })
 }
 
@@ -211,7 +274,17 @@ pub(crate) mod fixture {
         }
     }
 
-    pub(crate) fn scan(_: &Path) -> Result<KitInventory, String> {
-        Ok(inventory())
+    /// Like the real scan, a stdio `docker` server is local-only on a sandbox.
+    pub(crate) fn scan(_: &Path, workspace: Workspace) -> Result<KitInventory, String> {
+        let mut inventory = inventory();
+        inventory.mcp_servers.push(server(
+            "dock",
+            match workspace {
+                Workspace::Codespace => McpCompat::NeedsRuntime(Runtime::Docker),
+                Workspace::Sandbox => McpCompat::LocalOnly(LocalOnlyReason::DockerOnSandbox),
+            },
+            false,
+        ));
+        Ok(inventory)
     }
 }

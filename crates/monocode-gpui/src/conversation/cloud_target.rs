@@ -12,6 +12,7 @@ use super::cloud_branches::BranchList;
 use super::*;
 use crate::docker_dialog::model::AccountChoice;
 use monocode_core::cloud_sessions::docker_config::{self, DockerProjectConfig};
+use monocode_core::cloud_sessions::kit::Workspace;
 use monocode_core::codespaces::MachineType;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -451,6 +452,9 @@ impl Conversation {
         });
         let events = vec![
             cx.subscribe(&branch, |_, _, _: &input::Changed, cx| cx.notify()),
+            // Settings changed while the panel is open: count again with the new selection
+            // (this also picks up the flag being turned on).
+            cx.observe_global::<crate::settings::Preferences>(|this, cx| this.load_kit_summary(cx)),
             cx.subscribe(&base, |this, base, _: &input::Changed, cx| {
                 let text = base.read(cx).content.to_string();
                 if let Some(draft) = &mut this.cloud_draft {
@@ -517,11 +521,16 @@ impl Conversation {
     /// Counts the Claude setup this project would take, on a worker. Does nothing while the
     /// `cloudKitEnabled` flag is off.
     fn load_kit_summary(&mut self, cx: &mut Context<Self>) {
-        if !crate::cloud_kit_ui::flag_on(cx) {
+        if self.cloud_draft.is_none() || !crate::cloud_kit_ui::flag_on(cx) {
             return;
         }
+        let workspace = match self.cloud_draft.as_ref().map(|draft| draft.target) {
+            Some(CloudTarget::DockerSandbox) => Workspace::Sandbox,
+            _ => Workspace::Codespace,
+        };
         let task = crate::cloud_kit_ui::load_summary(
             self.summary.cwd.clone(),
+            workspace,
             crate::cloud_kit_ui::kit_prefs(cx),
             cx,
         );
@@ -733,8 +742,11 @@ impl Conversation {
             config,
             machine,
             prompt: (!prompt.is_empty()).then_some(prompt),
+            // The switch is this start's own choice, but it can only narrow Settings: if the
+            // kit was turned off while the panel was open, nothing is sent.
             kit: self.cloud_draft.as_ref().is_some_and(|draft| draft.kit)
-                && crate::cloud_kit_ui::flag_on(cx),
+                && crate::cloud_kit_ui::flag_on(cx)
+                && crate::cloud_kit_ui::default_on(&crate::cloud_kit_ui::kit_prefs(cx)),
         };
         if let Some(draft) = &mut self.cloud_draft {
             draft.creating = true;

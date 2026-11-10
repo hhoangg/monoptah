@@ -139,6 +139,8 @@ impl CodespacePicker {
             cx.subscribe(&branch, |this, _, _: &input::Submitted, cx| {
                 this.start(CodespaceChoice::New, cx)
             }),
+            // Settings changed while the picker is open: count again.
+            cx.observe_global::<crate::settings::Preferences>(|this, cx| this.load_kit_summary(cx)),
         ];
         let mut this = Self {
             cloud,
@@ -192,6 +194,7 @@ impl CodespacePicker {
         }
         let task = crate::cloud_kit_ui::load_summary(
             self.local_project.clone(),
+            monocode_core::cloud_sessions::kit::Workspace::Codespace,
             crate::cloud_kit_ui::kit_prefs(cx),
             cx,
         );
@@ -719,7 +722,7 @@ mod kit_tests {
                 picker.kit_summary,
                 Summary::Ready(KitSummary {
                     skills: 2,
-                    mcp_servers: 3,
+                    mcp_servers: 4,
                     plugins: 1
                 })
             );
@@ -736,5 +739,40 @@ mod kit_tests {
         let visual = &mut VisualTestContext::from_window(window.into(), cx);
         assert!(visual.debug_bounds("codespace-picker").is_some());
         assert!(visual.debug_bounds("codespace-kit-row").is_none());
+    }
+
+    static SCANS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    fn counting_scan(
+        path: &std::path::Path,
+        workspace: monocode_core::cloud_sessions::kit::Workspace,
+    ) -> Result<monocode_core::cloud_sessions::kit::KitInventory, String> {
+        SCANS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        fixture::scan(path, workspace)
+    }
+
+    #[gpui::test]
+    fn a_fresh_scan_is_reused_and_settings_changes_update_the_summary(cx: &mut TestAppContext) {
+        SCANS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let (window, picker) = open(cx, true, true);
+        cx.update(|cx| cx.set_global(KitScanner(counting_scan)));
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        // A change in Settings counts again with the new selection, without a second scan
+        // of the disk (the first picker scan is still fresh and cached).
+        let first = SCANS.load(std::sync::atomic::Ordering::SeqCst);
+        cx.update(|cx| {
+            let mut prefs = cx.global::<crate::settings::Preferences>().clone();
+            prefs
+                .cloud_kit
+                .set_selected(&fixture::inventory(), "skill:user:review", false);
+            cx.set_global(prefs);
+        });
+        visual.run_until_parked();
+        visual.read_entity(&picker, |picker, _| {
+            assert!(matches!(
+                picker.kit_summary,
+                Summary::Ready(counts) if counts.skills == 1
+            ));
+        });
+        assert_eq!(SCANS.load(std::sync::atomic::Ordering::SeqCst), first);
     }
 }

@@ -437,10 +437,8 @@ impl SettingsView {
             this.probe_notification_permission(false, cx);
         }
         this.notification_deadline(cx);
+        // `refresh` also reads the Cloud page when it is the open section.
         this.refresh(cx);
-        if this.section == Section::Cloud {
-            this.refresh_cloud(cx);
-        }
         this
     }
     pub(super) fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -495,6 +493,12 @@ impl SettingsView {
     pub(crate) fn set_preferences(&mut self, prefs: &Preferences, cx: &mut Context<Self>) {
         if &self.prefs != prefs {
             self.prefs = prefs.clone();
+            // The Cloud page has no rail entry without its flag, so leave it. (Settings
+            // search lists only `Section::ALL`, so Cloud is not searchable yet.)
+            if self.section == Section::Cloud && !prefs.cloud_kit_enabled {
+                self.select_section(Section::General, cx);
+                cx.emit(SettingsEvent::Section(Section::General));
+            }
             self.notification_deadline(cx);
             cx.notify();
         }

@@ -12,7 +12,7 @@ use crate::{
 };
 use gpui::{AnyElement, Context, Role, SharedString, Task, div, prelude::*, px};
 use monocode_core::cloud_sessions::{
-    kit::KitInventory,
+    kit::{KitInventory, MAX_KIT_COMPRESSED_BYTES, Workspace},
     kit_prefs::{self, Badge, Enable, KitRow, KitSummary, KitTab, NOTICE},
 };
 use std::{path::Path, sync::Arc};
@@ -65,9 +65,10 @@ impl SettingsView {
         }
         self.cloud.load = Load::Loading;
         let scan = crate::cloud_kit_ui::scanner(cx);
+        // Settings shows the codespace view; a start re-checks for its own workspace.
         let work = cx
             .background_executor()
-            .spawn(async move { scan(Path::new(&project)) });
+            .spawn(async move { scan(Path::new(&project), Workspace::Codespace) });
         self.cloud.task = Some(cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
@@ -262,12 +263,16 @@ impl SettingsView {
                 }
                 if inventory.incomplete {
                     rows.push(note(
-                        "Reading some items took too long, so they are not listed. Refresh to try again.",
+                        "Reading some items took too long. They are listed but cannot be copied. Press Refresh to try again.",
                     ));
-                } else if inventory.over_total_cap {
-                    rows.push(note(
-                        "Everything together is larger than 50 MB compressed, the most a workspace takes. Uncheck some items.",
-                    ));
+                }
+                let (bytes, _) = kit_prefs::selected_compressed(inventory, kit);
+                if bytes > MAX_KIT_COMPRESSED_BYTES {
+                    rows.push(note(format!(
+                        "The checked items are about {} compressed, more than the {} a workspace takes. Uncheck some items.",
+                        kit_prefs::size_label(bytes),
+                        kit_prefs::size_label(MAX_KIT_COMPRESSED_BYTES),
+                    )));
                 }
             }
             (Load::Ready(_), None) => {}
@@ -296,7 +301,7 @@ impl SettingsView {
                 .child("What to copy")
                 .child(project),
             Some(
-                "One selection for every cloud workspace. Items that only work on this computer cannot be checked."
+                "One selection for every cloud workspace. Items that only work on this computer cannot be checked. Docker servers do not work in Docker sandboxes. Items of a single project follow that project."
                     .into(),
             ),
             Some(
@@ -305,6 +310,13 @@ impl SettingsView {
                     .items_center()
                     .gap_2()
                     .child(tabs)
+                    .child(
+                        secondary_button("refresh-cloud", "Refresh", false, false)
+                            .debug_selector(|| "refresh-cloud".into())
+                            .child(icon("refresh-cw", 14.))
+                            .child("Refresh")
+                            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                    )
                     .child(reset)
                     .into_any_element(),
             ),
@@ -314,7 +326,8 @@ impl SettingsView {
 
     fn kit_row(&self, ix: usize, row: KitRow, cx: &mut Context<Self>) -> AnyElement {
         let id = row.id.clone();
-        let selectable = row.selectable;
+        // A project item follows its own project: shown checked, not editable here.
+        let selectable = row.selectable && !row.locked;
         let checked = row.checked;
         let selector = format!("cloud-kit-row-{}", row.id);
         let box_selector = format!("cloud-kit-check-{}", row.id);
@@ -372,15 +385,21 @@ impl SettingsView {
                                 None => row.detail.clone(),
                             }),
                     )
-                    .when_some(row.reason.clone(), |d, reason| {
-                        d.child(
-                            div()
-                                .mt(px(2.))
-                                .text_size(px(12.))
-                                .text_color(content(0.55))
-                                .child(reason),
-                        )
-                    }),
+                    .when_some(
+                        row.locked
+                            .then(|| "Follows its project automatically".to_owned())
+                            .filter(|_| row.selectable)
+                            .or_else(|| row.reason.clone()),
+                        |d, reason| {
+                            d.child(
+                                div()
+                                    .mt(px(2.))
+                                    .text_size(px(12.))
+                                    .text_color(content(0.55))
+                                    .child(reason),
+                            )
+                        },
+                    ),
             )
             .into_any_element()
     }

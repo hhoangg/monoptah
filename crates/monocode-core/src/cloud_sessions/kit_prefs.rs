@@ -11,8 +11,14 @@
 //! # Defaults
 //!
 //! `selection: None` means "the defaults": every item that can be sent is checked, secrets
-//! and sign-ins included. The first edit turns the defaults into an explicit list, so an
-//! item that appears later is left unchecked until the user ticks it.
+//! and sign-ins included. The first edit turns the defaults into an explicit list of
+//! **user-scope** items, so a user-scope item that appears later is left unchecked until the
+//! user ticks it.
+//!
+//! Project-scoped items (`skill:project:*`, `mcp:local:*`) are never in that list. They
+//! belong to one project, and the same name in another project is a different item, so a
+//! list frozen from the project open in Settings would be wrong for every other project.
+//! They follow their own project: checked whenever they can be sent and the kit is on.
 
 use std::collections::BTreeSet;
 
@@ -104,14 +110,18 @@ impl CloudKitPrefs {
     /// stored.
     pub fn is_selected(&self, id: &str, selectable: bool) -> bool {
         selectable
-            && match &self.selection {
-                None => true,
-                Some(ids) => ids.contains(id),
-            }
+            && (follows_project(id)
+                || match &self.selection {
+                    None => true,
+                    Some(ids) => ids.contains(id),
+                })
     }
 
     /// Check or uncheck one item. Items that cannot be sent are ignored.
     pub fn set_selected(&mut self, inventory: &KitInventory, id: &str, checked: bool) {
+        if follows_project(id) {
+            return;
+        }
         let items = items(inventory);
         if !items.iter().any(|item| item.id == id && item.selectable) {
             return;
@@ -119,7 +129,7 @@ impl CloudKitPrefs {
         let ids = self.selection.get_or_insert_with(|| {
             items
                 .iter()
-                .filter(|item| item.selectable)
+                .filter(|item| item.selectable && !follows_project(&item.id))
                 .map(|item| item.id.clone())
                 .collect()
         });
@@ -218,6 +228,8 @@ pub struct KitRow {
     pub badges: Vec<Badge>,
     /// False for local-only items and items that cannot be sent: the box cannot be ticked.
     pub selectable: bool,
+    /// Follows its own project: always checked when it can be sent, not editable here.
+    pub locked: bool,
     pub checked: bool,
     /// Why the item cannot be ticked.
     pub reason: Option<String>,
@@ -233,6 +245,11 @@ struct Item {
     badges: Vec<Badge>,
     selectable: bool,
     reason: Option<String>,
+}
+
+/// Items of one project (`skill:project:*`, `mcp:local:*`). They follow that project.
+pub fn follows_project(id: &str) -> bool {
+    id.starts_with("skill:project:") || id.starts_with("mcp:local:")
 }
 
 pub fn skill_id(skill: &KitSkill) -> String {
@@ -395,11 +412,44 @@ fn items(inventory: &KitInventory) -> Vec<Item> {
 /// computer, for `project`. Reads many files: call it from a worker, never from the UI
 /// thread.
 ///
-/// It is built for a codespace, the more permissive of the two workspaces (only the Docker
-/// rule differs). The start flow re-checks the final kit for the workspace it really targets.
-pub fn scan(project: &std::path::Path) -> Result<KitInventory, String> {
+/// `workspace` decides the Docker rule: a stdio `docker` server is local-only on a sandbox.
+/// Settings uses [`Workspace::Codespace`], the more permissive view; a start uses the kind it
+/// really targets.
+pub fn scan(project: &std::path::Path, workspace: Workspace) -> Result<KitInventory, String> {
     let roots = KitRoots::for_profile(&crate::accounts::Profile::default(), project)?;
-    Ok(build_inventory(&roots, Workspace::Codespace))
+    Ok(build_inventory(&roots, workspace))
+}
+
+/// Compressed size of the checked items, for the 50 MB cap. Items that cannot be sent count
+/// for nothing. The flag is false when an item timed out, so the total is only a lower bound.
+/// The second value is true when the total is exact.
+pub fn selected_compressed(inventory: &KitInventory, prefs: &CloudKitPrefs) -> (u64, bool) {
+    let mut total = 0u64;
+    let mut exact = true;
+    for skill in inventory
+        .skills
+        .iter()
+        .filter(|skill| skill.scope != SkillScope::Plugin)
+    {
+        if prefs.is_selected(&skill_id(skill), skill.exclusion.is_none()) {
+            total += skill.compressed;
+        }
+    }
+    for plugin in &inventory.plugins {
+        if prefs.is_selected(&plugin_id(plugin), plugin.exclusion.is_none()) {
+            total += plugin.compressed;
+        }
+    }
+    if inventory
+        .skills
+        .iter()
+        .map(|s| s.exclusion)
+        .chain(inventory.plugins.iter().map(|p| p.exclusion))
+        .any(|e| e == Some(Exclusion::ScanTimedOut))
+    {
+        exact = false;
+    }
+    (total, exact)
 }
 
 /// The rows of one tab, with the preferences applied.
@@ -409,6 +459,7 @@ pub fn rows(inventory: &KitInventory, prefs: &CloudKitPrefs, tab: KitTab) -> Vec
         .filter(|item| item.tab == tab)
         .map(|item| KitRow {
             checked: prefs.is_selected(&item.id, item.selectable),
+            locked: follows_project(&item.id),
             id: item.id,
             name: item.name,
             detail: item.detail,

@@ -167,7 +167,14 @@ fn local_only_items_are_not_selectable_and_say_why() {
     };
     let servers = rows(&inventory, &forced, KitTab::McpServers);
     assert!(!row(&servers, "mine").checked);
-    assert_eq!(KitSummary::of(&inventory, &forced), KitSummary::default());
+    // Only the untracked project skill counts: it follows its project, whatever is stored.
+    assert_eq!(
+        KitSummary::of(&inventory, &forced),
+        KitSummary {
+            skills: 1,
+            ..Default::default()
+        }
+    );
 }
 
 #[test]
@@ -300,4 +307,69 @@ fn sizes_read_naturally() {
     assert_eq!(size_label(300), "300 B");
     assert_eq!(size_label(12 * 1024), "12 KB");
     assert_eq!(size_label(3 * 1024 * 1024 / 2), "1.5 MB");
+}
+
+fn project_inventory(local: &str) -> KitInventory {
+    let mut local_server = server(local, McpCompat::Ok, true);
+    local_server.scope = McpScope::Local;
+    KitInventory {
+        skills: vec![
+            skill("review", SkillScope::User, None),
+            skill("draft", SkillScope::ProjectUntracked, None),
+        ],
+        mcp_servers: vec![server("github", McpCompat::Ok, false), local_server],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn project_scoped_items_follow_their_own_project_and_are_never_frozen() {
+    let a = project_inventory("db");
+    let b = project_inventory("db");
+    let mut c = project_inventory("cache");
+    c.skills.retain(|s| s.scope == SkillScope::User);
+    let mut prefs = CloudKitPrefs::default();
+
+    // The first edit happens while project A is open.
+    prefs.set_selected(&a, "mcp:user:github", false);
+    let frozen = prefs.selection.clone().unwrap();
+    assert!(frozen.contains("skill:user:review"));
+    assert!(
+        !frozen.iter().any(|id| follows_project(id)),
+        "no project item in the global list: {frozen:?}"
+    );
+
+    // Project B has its own server with the same name: on, not inherited from A's state.
+    let servers = rows(&b, &prefs, KitTab::McpServers);
+    assert!(row(&servers, "db").checked && row(&servers, "db").locked);
+    assert!(
+        !row(&servers, "github").checked,
+        "the user-scope edit applies everywhere"
+    );
+    // Project C has other project items: also on, though A never listed them.
+    let servers = rows(&c, &prefs, KitTab::McpServers);
+    assert!(row(&servers, "cache").checked);
+    let skills = rows(&a, &prefs, KitTab::Skills);
+    assert!(row(&skills, "draft").checked && row(&skills, "draft").locked);
+
+    // They cannot be edited from the global page.
+    prefs.set_selected(&a, "mcp:local:db", false);
+    prefs.set_selected(&a, "skill:project:draft", false);
+    assert_eq!(prefs.selection.as_ref().unwrap(), &frozen);
+    assert_eq!(KitSummary::of(&b, &prefs).mcp_servers, 1);
+}
+
+#[test]
+fn the_cap_counts_checked_items_only() {
+    let mut inventory = fixture();
+    inventory.skills[0].compressed = 1000;
+    inventory.skills[1].compressed = 500;
+    let mut prefs = CloudKitPrefs::default();
+    let (total, exact) = selected_compressed(&inventory, &prefs);
+    // review 1000 + local-only-draft 500 + plugin fmt 200 (big and huge are excluded).
+    assert_eq!((total, exact), (1700, true));
+    prefs.set_selected(&inventory, "skill:user:review", false);
+    assert_eq!(selected_compressed(&inventory, &prefs).0, 700);
+    inventory.skills[0].exclusion = Some(Exclusion::ScanTimedOut);
+    assert!(!selected_compressed(&inventory, &prefs).1);
 }
