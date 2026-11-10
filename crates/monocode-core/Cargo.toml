@@ -62,5 +62,9 @@ keyring = { version = "3.6", default-features = false, features = ["linux-native
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[features]
+# Test helpers for the app's tests; never enabled in a release build.
+test-support = []
+
 [dev-dependencies]
 tempfile = "3"

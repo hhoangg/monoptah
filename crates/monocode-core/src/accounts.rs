@@ -363,6 +363,12 @@ impl Book {
             .cloned()
     }
     /// The account marked as default for `kind`, or the provider CLI profile.
+    ///
+    /// Only existence is checked, not whether the account can still sign in:
+    /// an expired or revoked setup token stays the default, so new sessions
+    /// fail authentication until the user saves a new token or picks another
+    /// default. That is deliberate; silently moving sessions to a different
+    /// account (and its config dir and billing) would be worse.
     pub fn preferred(&self, kind: Kind) -> String {
         self.defaults
             .get(kind.id())
