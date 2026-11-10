@@ -1189,11 +1189,10 @@ mod tests {
         }
     }
 
+    type Events = Rc<RefCell<Vec<Option<Vec<String>>>>>;
+
     /// A project bound to `A` and polling, with `host` as its Host.
-    fn watched(
-        host: &Arc<FakeHost>,
-        cx: &mut TestAppContext,
-    ) -> (Entity<ProjectGit>, Rc<RefCell<Vec<Option<Vec<String>>>>>) {
+    fn watched(host: &Arc<FakeHost>, cx: &mut TestAppContext) -> (Entity<ProjectGit>, Events) {
         let git = cx.new(|cx| ProjectGit::new("~".into(), cx));
         let events = Rc::new(RefCell::new(Vec::new()));
         let sink = events.clone();
