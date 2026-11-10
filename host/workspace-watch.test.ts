@@ -294,6 +294,10 @@ it("sees real file system changes with real fs.watch", async () => {
   const cwd = repo();
   const host = new WorkspaceWatchHost();
   const id = await host.start(cwd, [dir(cwd, "src")]);
+  // fs.watch registers its native stream asynchronously; a write made right
+  // away can be missed, so let the watches settle first.
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 300));
+  await settle();
   // FSEvents on macOS can replay events from just before the watch started, so
   // collect responses until the expected change has arrived.
   const collect = async (done: (seen: { git: boolean; dirs: Set<string> }) => boolean) => {
@@ -310,6 +314,7 @@ it("sees real file system changes with real fs.watch", async () => {
     writeFileSync(join(cwd, "src", "a.ts"), "x");
     expect((await first).dirs.has("src")).toBe(true);
 
+    await settle();
     writeFileSync(join(cwd, "other", "b.ts"), "x");
     execFileSync("git", ["checkout", "-q", "-b", "topic"], { cwd });
     const second = await collect((seen) => seen.git);
