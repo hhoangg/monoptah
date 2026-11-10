@@ -3689,6 +3689,7 @@ fn the_create_request_turns_the_panel_picks_into_begin_start_arguments() {
         config: None,
         machine: machine.map(str::to_owned),
         prompt: None,
+        kit: false,
         request_id: 1,
     };
     let picked =

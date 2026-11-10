@@ -1929,3 +1929,117 @@ fn a_save_that_returns_after_the_create_finished_does_not_requeue_the_prompt(
         })
         .unwrap();
 }
+
+fn kit_globals(cx: &mut TestAppContext, flag: bool, enabled: bool) {
+    cx.update(|cx| {
+        cx.set_global(crate::cloud_kit_ui::KitScanner(
+            crate::cloud_kit_ui::fixture::scan,
+        ));
+        let mut prefs = crate::settings::Preferences::default();
+        prefs.cloud_kit_enabled = flag;
+        if enabled {
+            prefs.cloud_kit.acknowledge_notice();
+        }
+        cx.set_global(prefs);
+    });
+}
+
+fn choose_docker(window: WindowHandle<Conversation>, visual: &mut gpui::VisualTestContext) {
+    window
+        .update(visual, |view, _, cx| {
+            save_config(view);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+        })
+        .unwrap();
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+}
+
+#[gpui::test]
+fn the_panel_shows_the_kit_summary_and_a_switch_for_this_start(cx: &mut TestAppContext) {
+    use crate::cloud_kit_ui::Summary;
+    use monocode_core::cloud_sessions::kit_prefs::KitSummary;
+    kit_globals(cx, true, true);
+    let window = conversation(cx, PROJECT, false);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    choose_docker(window, visual);
+    assert!(visual.debug_bounds("cloud-row-kit").is_some());
+    assert!(visual.debug_bounds("cloud-kit-settings").is_some());
+    window
+        .update(visual, |view, _, _| {
+            let draft = view.cloud_draft.as_ref().unwrap();
+            assert!(draft.kit, "a start begins with the user's standing choice");
+            assert_eq!(
+                draft.kit_summary,
+                Summary::Ready(KitSummary {
+                    skills: 2,
+                    mcp_servers: 3,
+                    plugins: 1
+                })
+            );
+        })
+        .unwrap();
+
+    // The switch turns the kit off for this start only.
+    let switch = visual.debug_bounds("cloud-kit-switch").unwrap();
+    visual.simulate_click(switch.center(), Default::default());
+    visual.run_until_parked();
+    window
+        .update(visual, |view, _, cx| {
+            assert!(!view.cloud_draft.as_ref().unwrap().kit);
+            assert!(
+                crate::cloud_kit_ui::kit_prefs(cx).enabled,
+                "Settings is untouched"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_settings_link_asks_the_shell_to_open_cloud_settings(cx: &mut TestAppContext) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    kit_globals(cx, true, true);
+    let window = conversation(cx, PROJECT, false);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    let opened = Arc::new(AtomicUsize::new(0));
+    let sink = opened.clone();
+    window
+        .update(visual, |_, _, cx| {
+            cx.subscribe(&cx.entity(), move |_, _, _: &OpenCloudSettings, _| {
+                sink.fetch_add(1, Ordering::SeqCst);
+            })
+            .detach();
+        })
+        .unwrap();
+    choose_docker(window, visual);
+    let link = visual.debug_bounds("cloud-kit-settings").unwrap();
+    visual.simulate_click(link.center(), Default::default());
+    visual.run_until_parked();
+    assert_eq!(opened.load(Ordering::SeqCst), 1);
+}
+
+#[gpui::test]
+fn the_kit_row_is_off_without_the_flag_and_locked_while_the_kit_is_off(cx: &mut TestAppContext) {
+    // Flag off: no row, whatever was saved.
+    kit_globals(cx, false, true);
+    let window = conversation(cx, PROJECT, false);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    choose_docker(window, visual);
+    assert!(visual.debug_bounds("cloud-target-panel").is_some());
+    assert!(visual.debug_bounds("cloud-row-kit").is_none());
+
+    // Flag on but the kit is off in Settings: the row says so and the switch does nothing.
+    kit_globals(cx, true, false);
+    let window = conversation(cx, PROJECT, false);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    choose_docker(window, visual);
+    assert!(visual.debug_bounds("cloud-row-kit").is_some());
+    let switch = visual.debug_bounds("cloud-kit-switch").unwrap();
+    visual.simulate_click(switch.center(), Default::default());
+    visual.run_until_parked();
+    window
+        .update(visual, |view, _, _| {
+            assert!(!view.cloud_draft.as_ref().unwrap().kit);
+        })
+        .unwrap();
+}
