@@ -1471,7 +1471,7 @@ ticket, after review and after merge.
 | H2b | 2 | todo | - | |
 | F1-4 | 2 | todo | - | |
 | F2-1 | 2 | merged | csi-f2-1 | merge f0c7d2af. Opus review x3 fixed: Review discard bypassed running-turn policy, per-cwd gate, classic layout chrome, GitPicker branch policy, cwd captured at click time. Pending, needs the user: manual in-app check. docs/docker-sandbox-spec.html sandbox Explorer/Changes stays an OPEN DECISION for the owner. Known: running check is app-side and racy until F2-5h; list_dir client cap not implemented (Host hard-errors above 5000; move to a Host ticket). |
-| F2-2 | 2 | in progress | csi-f2-2 | |
+| F2-2 | 2 | in review | csi-f2-2 | Implemented, Opus review x2 findings fixed (stuck recovery, env liveness, wrong ages, memory budget). Round-3 Opus review was stopped before reporting; not merged yet. Branch csi/f2-2 HEAD has native:check green. |
 | F3-2 | 2 | merged | csi-f3-2 | merge 290dd55f. Opus review x2 fixed: Create re-checks kit pref (D11), project-scoped items follow their project (not frozen), sandbox scan, cache, cap warning, Refresh. Flag cloudKitEnabled off. OPEN DESIGN QUESTION for the user: project-scoped secret-bearing servers (mcp:local:*) are always on and cannot be excluded individually (only by turning the kit off); notice does not say so. Known Low: Settings Refresh does not invalidate KitCache (30 s); target.kit parsed but unused until F3-4; Cloud page not searchable. |
 | F4-L | 2 | todo | - | L, sub-PRs |
 | H3 | 3 | todo | - | |
