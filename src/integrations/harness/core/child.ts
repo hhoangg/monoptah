@@ -357,6 +357,8 @@ export async function spawnChild(
   codexStore?: "mono",
   /** `devin acp` only: start with an approval rule for every edit. */
   devinAskEdits?: boolean,
+  /** Extra variables for this child only (the Host's Claude kit secrets). */
+  env?: Record<string, string>,
 ): Promise<void> {
   livePid.delete(sessionId);
   pendingExit.delete(sessionId);
@@ -374,6 +376,7 @@ export async function spawnChild(
     binaryPath,
     ...(codexStore ? { codexStore } : {}),
     ...(devinAskEdits ? { devinAskEdits } : {}),
+    ...(env && Object.keys(env).length > 0 ? { env } : {}),
   });
   if (typeof pid !== "number" || pid <= 0) return;
   livePid.set(sessionId, pid);

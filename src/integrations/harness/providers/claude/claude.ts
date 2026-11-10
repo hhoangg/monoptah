@@ -8,6 +8,11 @@ import type {
 } from "../../../../features/sessions/model/session";
 import { loadClaudeHooks } from "../../../../features/settings/model/settings";
 import {
+  claudeKitKey,
+  currentClaudeKit,
+  type ClaudeKit,
+} from "./claudeKit";
+import {
   killChild,
   resolveClaudeBinary,
   spawnChild,
@@ -423,7 +428,8 @@ export function restoreClaudeTaskLists(
 }
 
 async function ensureLive(input: HarnessSessionInput): Promise<Live> {
-  const settingsKey = settingsKeyFor(input);
+  const kit = currentClaudeKit();
+  const settingsKey = settingsKeyFor(input, kit);
   const planning = input.intent === "plan";
   const existing = liveByThread.get(input.sessionId);
   if (
@@ -542,10 +548,16 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
   await spawnChild(
     input.sessionId,
     path,
-    buildClaudeSpawnArgs(launch),
+    buildClaudeSpawnArgs({
+      ...launch,
+      kit: kit && { pluginDirs: kit.pluginDirs, mcpConfig: kit.mcpConfig },
+    }),
     input.cwd,
     { provider: "claude", id: input.providerAccountId ?? "default" },
     "claude",
+    undefined,
+    undefined,
+    kit?.env,
   );
 
   liveByThread.set(input.sessionId, live);
@@ -1760,7 +1772,10 @@ function writeJson(
   return writeChild(sessionId, JSON.stringify(payload));
 }
 
-function settingsKeyFor(input: HarnessSessionInput): string {
+function settingsKeyFor(
+  input: HarnessSessionInput,
+  kit: ClaudeKit | undefined = currentClaudeKit(),
+): string {
   return `${input.providerAccountId ?? "default"}:${claudeSettingsKey({
     model: nativeModelId(input.model),
     effort: input.modelSettings?.effort,
@@ -1769,6 +1784,7 @@ function settingsKeyFor(input: HarnessSessionInput): string {
     context: input.modelSettings?.context,
     runtimeMode: input.runtimeMode,
     hooks: loadClaudeHooks(),
+    kit: claudeKitKey(kit),
   })}`;
 }
 
