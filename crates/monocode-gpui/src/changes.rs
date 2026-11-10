@@ -19,6 +19,7 @@ use gpui::{
 use monocode_core::{
     agent::{AccessMode, Settings},
     provider::{self, Event, Kind, Request},
+    remote::MAY_STILL_RUN,
     scm::{self, ChangedFile, DiffIndex, Pr},
 };
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,10 @@ use std::{
     },
     time::Duration,
 };
+
+/// Seconds after a timeout at which ahead/behind is re-read. The Host stops a git step at
+/// 90 s, and a sync runs two, so the last look is at 90 s.
+const CHECK_AT: [u64; 4] = [5, 15, 45, 90];
 
 const MOD: &str = if cfg!(target_os = "macos") {
     "⌘"
@@ -221,6 +226,11 @@ pub(crate) struct Changes {
     busy: Option<String>,
     status: Option<String>,
     status_clear: Option<Task<()>>,
+    /// The follow-up re-reads after a push, pull or sync timed out; `busy` is "checking"
+    /// while it runs, which blocks every other git action.
+    checking: Option<Task<()>>,
+    /// Offsets from the timeout at which ahead/behind is re-read (tests shorten them).
+    check_at: Vec<Duration>,
     pr: Option<Pr>,
     pr_branch: Option<String>,
     pr_request: u64,
@@ -259,6 +269,8 @@ impl Changes {
             busy: None,
             status: None,
             status_clear: None,
+            checking: None,
+            check_at: CHECK_AT.iter().map(|s| Duration::from_secs(*s)).collect(),
             pr: None,
             pr_branch: None,
             pr_request: 0,
@@ -527,15 +539,60 @@ impl Changes {
             let result = task.await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.busy = None;
+                // Refreshes ahead/behind, which also settles a timed-out push, pull or sync.
                 this.mutated(cx);
-                match result {
-                    Ok(()) => then(this, window, cx),
-                    Err(error) => Self::fail(error, window, cx),
+                match settle(result) {
+                    Settled::Done => then(this, window, cx),
+                    Settled::MayStillRun => this.start_checking(cwd, cx),
+                    Settled::Failed(error) => Self::fail(error, window, cx),
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// A remote push, pull or sync timed out and may still be running on the host. Keep the
+    /// panel busy (so a second one cannot start in parallel) and re-read ahead/behind a few
+    /// times until it changes or the last look is done.
+    fn start_checking(&mut self, cwd: String, cx: &mut Context<Self>) {
+        self.busy = Some("checking".into());
+        self.status_clear = None;
+        self.status = Some(MAY_STILL_RUN.into());
+        let before = self.counts(cx);
+        let schedule = self.check_at.clone();
+        self.checking = Some(cx.spawn(async move |this, cx| {
+            let mut elapsed = Duration::ZERO;
+            for (n, at) in schedule.iter().enumerate() {
+                cx.background_executor().timer(*at - elapsed).await;
+                elapsed = *at;
+                let last = n + 1 == schedule.len();
+                let finished = this.update(cx, |this, cx| {
+                    let moved = this.cwd != cwd;
+                    // The previous re-read already landed: if it differs, the host is done.
+                    let settled = this.counts(cx) != before;
+                    if moved || settled || last {
+                        if !moved {
+                            this.mutated(cx);
+                        }
+                        this.busy = None;
+                        this.status = None;
+                        this.checking = None;
+                    } else {
+                        this.mutated(cx);
+                    }
+                    cx.notify();
+                    moved || settled || last
+                });
+                if finished.unwrap_or(true) {
+                    return;
+                }
+            }
+        }));
+        cx.notify();
+    }
+    fn counts(&self, cx: &App) -> Option<(i64, i64)> {
+        self.index(cx).map(|i| (i.ahead, i.behind))
     }
 
     fn run_file(
@@ -2080,9 +2137,156 @@ impl Render for Changes {
     }
 }
 
+/// How a git action ended. A client timeout on a remote push, pull or sync is not a
+/// failure: the host may still be running it.
+#[derive(Debug, PartialEq)]
+enum Settled {
+    Done,
+    MayStillRun,
+    Failed(String),
+}
+
+fn settle(result: Result<(), String>) -> Settled {
+    match result {
+        Ok(()) => Settled::Done,
+        Err(error) if error == MAY_STILL_RUN => Settled::MayStillRun,
+        Err(error) => Settled::Failed(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_the_exact_timeout_text_is_not_a_failure() {
+        assert_eq!(settle(Ok(())), Settled::Done);
+        assert_eq!(settle(Err(MAY_STILL_RUN.into())), Settled::MayStillRun);
+        assert_eq!(
+            settle(Err("rejected".into())),
+            Settled::Failed("rejected".into())
+        );
+    }
+    fn changes_window(
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<ProjectGit>, gpui::WindowHandle<Changes>) {
+        cx.update(|cx| {
+            let git = cx.new(|cx| ProjectGit::new("~".into(), cx));
+            let handle = git.clone();
+            let window = cx
+                .open_window(Default::default(), |window, cx| {
+                    cx.new(|cx| Changes::new(git, window, cx))
+                })
+                .unwrap();
+            (handle, window)
+        })
+    }
+    /// A timed-out push is not an alert: the panel stays busy "checking" (so nothing else
+    /// starts), re-reads ahead/behind at each look, and frees itself after the last one. A real
+    /// failure still alerts.
+    #[gpui::test]
+    fn a_timed_out_push_keeps_checking_the_host_instead_of_failing(cx: &mut gpui::TestAppContext) {
+        let (git_handle, window) = changes_window(cx);
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        let epoch = |cx: &mut gpui::VisualTestContext| git_handle.read_with(cx, |g, _| g.epoch);
+        window
+            .update(visual, |changes, _, _| {
+                changes.check_at = [1u64, 2, 3, 4].map(Duration::from_millis).to_vec();
+                // The checkout the git model reports; otherwise the first re-read looks like
+                // the panel moving to another checkout.
+                changes.cwd = "~".into();
+            })
+            .unwrap();
+        let before = epoch(visual);
+        window
+            .update(visual, |changes, window, cx| {
+                let cwd = changes.cwd.clone();
+                changes.run_git_at(
+                    cwd,
+                    "push".into(),
+                    |_| Err(MAY_STILL_RUN.into()),
+                    |_, _, _| panic!("a timeout is not a success"),
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(!visual.has_pending_prompt(), "a timeout is not an alert");
+        assert_eq!(epoch(visual), before + 1, "the first re-read is immediate");
+        window
+            .update(visual, |changes, _, _| {
+                assert_eq!(changes.busy.as_deref(), Some("checking"));
+                assert_eq!(changes.status.as_deref(), Some(MAY_STILL_RUN));
+            })
+            .unwrap();
+        // A second push while checking is refused and never runs.
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        window
+            .update(visual, |changes, window, cx| {
+                let cwd = changes.cwd.clone();
+                changes.run_git_at(
+                    cwd,
+                    "push".into(),
+                    move |_| {
+                        flag.store(true, Ordering::SeqCst);
+                        Ok(())
+                    },
+                    |_, _, _| {},
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(!ran.load(Ordering::SeqCst), "a second push must not start");
+        // Each look re-reads once; the last one frees the panel.
+        for (n, millis) in [1u64, 1, 1].into_iter().enumerate() {
+            visual
+                .executor()
+                .advance_clock(Duration::from_millis(millis));
+            visual.run_until_parked();
+            assert_eq!(
+                epoch(visual),
+                before + 2 + n as u64,
+                "look {n}, before {before}"
+            );
+            window
+                .update(visual, |changes, _, _| {
+                    assert_eq!(changes.busy.as_deref(), Some("checking"))
+                })
+                .unwrap();
+        }
+        visual.executor().advance_clock(Duration::from_millis(1));
+        visual.run_until_parked();
+        assert_eq!(
+            epoch(visual),
+            before + 5,
+            "one immediate read and four looks"
+        );
+        window
+            .update(visual, |changes, _, _| {
+                assert!(changes.busy.is_none());
+                assert!(changes.status.is_none());
+            })
+            .unwrap();
+        window
+            .update(visual, |changes, window, cx| {
+                let cwd = changes.cwd.clone();
+                changes.run_git_at(
+                    cwd,
+                    "push".into(),
+                    |_| Err("rejected".into()),
+                    |_, _, _| {},
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let (message, _) = visual.pending_prompt().expect("a failure alerts");
+        assert_eq!(message, "rejected");
+    }
     #[gpui::test]
     fn enabling_an_enabled_changes_panel_does_not_reload(cx: &mut gpui::TestAppContext) {
         let window = cx.update(|cx| {
