@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
@@ -267,6 +267,123 @@ it("degrades fs.watch failures to overflow instead of crashing", async () => {
   rmSync(join(cwd, "src"), { recursive: true });
   src.emit("rename", "src");
   await vi.waitFor(() => expect(src.closed).toBe(true));
+  await settle();
+  expect(await host.wait(id)).toMatchObject({ overflow: true });
+  host.close();
+});
+
+it("retries a client directory whose first watch could not be created", async () => {
+  const cwd = repo();
+  const f = fakes();
+  const host = new WorkspaceWatchHost(f.watchFn);
+  const id = await host.start(cwd, []);
+  f.failNext(Object.assign(new Error("ENOSPC"), { code: "ENOSPC" }));
+  host.update(id, [dir(cwd, "src")]);
+  await settle();
+  expect(await host.wait(id)).toMatchObject({ overflow: true });
+  expect(f.open().some((fake) => fake.path === join(cwd, "src"))).toBe(false);
+
+  // The same update again must try again, not skip the directory.
+  host.update(id, [dir(cwd, "src")]);
+  const pending = host.wait(id);
+  f.at(join(cwd, "src")).emit("change", "a.ts");
+  await settle();
+  expect(await pending).toMatchObject({ dirs: ["src"] });
+
+  // A handle that errors later is released and can be watched again.
+  const pendingError = host.wait(id);
+  f.at(join(cwd, "src")).fail(new Error("EMFILE"));
+  await settle();
+  expect(await pendingError).toMatchObject({ overflow: true });
+  host.update(id, [dir(cwd, "src")]);
+  expect(f.at(join(cwd, "src"))).toBeDefined();
+  host.close();
+});
+
+it("re-watches a ref directory that was deleted and recreated", async () => {
+  const cwd = repo();
+  const heads = join(cwd, ".git", "refs", "heads");
+  const feature = join(heads, "feature");
+  mkdirSync(feature, { recursive: true });
+  const f = fakes();
+  const host = new WorkspaceWatchHost(f.watchFn);
+  const id = await host.start(cwd, []);
+  const first = f.at(feature);
+  rmSync(feature, { recursive: true });
+  f.at(heads).emit("rename", "feature");
+  await settle();
+  await vi.waitFor(() => expect(first.closed).toBe(true));
+  mkdirSync(feature);
+  f.at(heads).emit("rename", "feature");
+  await settle();
+  await vi.waitFor(() => expect(f.open().some((fake) => fake.path === feature)).toBe(true));
+  expect(f.at(feature)).not.toBe(first);
+  const pending = host.wait(id);
+  f.at(feature).emit("rename", "x");
+  await settle();
+  expect((await pending).git).toBe(true);
+  host.close();
+});
+
+it("re-watches a directory replaced by a new one of the same name", async () => {
+  const cwd = repo();
+  const f = fakes();
+  const host = new WorkspaceWatchHost(f.watchFn);
+  const id = await host.start(cwd, [dir(cwd, "src")]);
+  const old = f.at(join(cwd, "src"));
+  renameSync(join(cwd, "src"), join(cwd, "src.old"));
+  mkdirSync(join(cwd, "src"));
+  host.update(id, [dir(cwd, "src")]);
+  expect(old.closed).toBe(true);
+  const fresh = f.at(join(cwd, "src"));
+  expect(fresh).not.toBe(old);
+  const replaced = host.wait(id);
+  await settle();
+  expect(await replaced).toMatchObject({ dirs: ["src"] });
+
+  // Without an update, a rename-self event heals it too.
+  renameSync(join(cwd, "src"), join(cwd, "src.old2"));
+  mkdirSync(join(cwd, "src"));
+  fresh.emit("rename", null);
+  expect(fresh.closed).toBe(true);
+  const healed = f.at(join(cwd, "src"));
+  expect(healed).not.toBe(fresh);
+
+  // So does the next poll.
+  renameSync(join(cwd, "src"), join(cwd, "src.old3"));
+  mkdirSync(join(cwd, "src"));
+  const polled = host.wait(id);
+  await settle();
+  await polled;
+  expect(healed.closed).toBe(true);
+  expect(f.at(join(cwd, "src"))).not.toBe(healed);
+  host.close();
+});
+
+it("reports ref overflow once per episode and immediately", async () => {
+  const cwd = repo();
+  const heads = join(cwd, ".git", "refs", "heads");
+  for (let i = 0; i < 70; i++) mkdirSync(join(heads, `b${i}`), { recursive: true });
+  mkdirSync(join(heads, "d", "e", "f", "g", "h"), { recursive: true });
+  const f = fakes();
+  const host = new WorkspaceWatchHost(f.watchFn);
+  const id = await host.start(cwd, []);
+  await settle();
+  expect(await host.wait(id)).toMatchObject({ overflow: true });
+  // Later ref events resync, but the same degraded state is not reported again.
+  const pending = host.wait(id);
+  f.at(heads).emit("rename", "x");
+  await settle();
+  await settle();
+  expect(await pending).toEqual({ git: true, dirs: [], overflow: false });
+  host.close();
+});
+
+it("reports overflow when the git directory cannot be found", async () => {
+  const cwd = tmp();
+  const f = fakes();
+  const host = new WorkspaceWatchHost(f.watchFn);
+  const id = await host.start(cwd, []);
   await settle();
   expect(await host.wait(id)).toMatchObject({ overflow: true });
   host.close();
