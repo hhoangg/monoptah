@@ -1,5 +1,5 @@
-import { statSync, watch as fsWatch } from "node:fs";
-import { readdir } from "node:fs/promises";
+import { realpathSync, statSync, watch as fsWatch } from "node:fs";
+import { readdir, realpath, stat } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { join, sep } from "node:path";
@@ -12,6 +12,9 @@ export const WAIT_MS = 15_000;
 export const LEASE_MS = 60_000;
 export const MAX_WATCHERS = 128;
 export const MAX_DIRS = 256;
+/** Minimum gap between self-healing passes, and the cap on one pass. */
+export const HEAL_INTERVAL_MS = 2_000;
+export const HEAL_TIMEOUT_MS = 5_000;
 /** Ref directories are watched one by one (no recursion). */
 const MAX_REF_DIRS = 64;
 const MAX_REF_DEPTH = 4;
@@ -63,9 +66,29 @@ const identity = (path: string): string | undefined => {
   }
 };
 
+const identityAsync = async (path: string): Promise<string | undefined> => {
+  try {
+    const { dev, ino } = await stat(path);
+    return `${dev}:${ino}`;
+  } catch {
+    return undefined;
+  }
+};
+
+type Wanted = WatchDir & { real?: string };
+
 class Watch {
   private handles = new Map<string, WatchHandle>();
+  /** Live client-dir watches with the inode they were created on. */
   private dirKeys = new Map<string, WatchDir & { id?: string }>();
+  /** What the client last asked for, kept even when a handle is lost. */
+  private wanted = new Map<string, Wanted>();
+  private gitWanted: string[] = [];
+  private healing = false;
+  private cooling = false;
+  private healAgain = false;
+  private cooldown?: ReturnType<typeof setTimeout>;
+  private healTimer?: ReturnType<typeof setTimeout>;
   private refDirs = new Map<string, string | undefined>();
   private refRoots: string[] = [];
   private degraded = new Set<string>();
@@ -95,15 +118,25 @@ class Watch {
     // Nothing to watch for git: tell the client to fall back to refreshing.
     if (!gitDirList.length) this.degrade();
     for (const dir of gitDirList) {
-      this.add(`git:${dir}`, dir, (name) => {
-        if (name === null) return this.gitChanged();
-        if (name.endsWith(".lock")) return;
-        if (GIT_FILES.has(name) || name === "refs") this.gitChanged();
-      });
+      this.gitWanted.push(dir);
+      this.addGit(dir, false);
       this.refRoots.push(join(dir, "refs"));
     }
     await this.syncAllRefs();
     this.setDirs(dirs);
+  }
+
+  private addGit(dir: string, quiet: boolean): boolean {
+    return this.add(
+      `git:${dir}`,
+      dir,
+      (name) => {
+        if (name === null) return this.gitChanged();
+        if (name.endsWith(".lock")) return;
+        if (GIT_FILES.has(name) || name === "refs") this.gitChanged();
+      },
+      quiet,
+    );
   }
 
   private degrade() {
@@ -115,6 +148,7 @@ class Watch {
     key: string,
     path: string,
     onEvent: (name: string | null) => void,
+    quiet = false,
   ): boolean {
     if (this.closed || this.handles.has(key)) return false;
     try {
@@ -126,7 +160,8 @@ class Watch {
       return true;
     } catch {
       // ENOSPC, EMFILE or a directory that vanished: the client refreshes.
-      this.degrade();
+      // Quiet retries stay silent so a persistent failure is reported once.
+      if (!quiet) this.degrade();
       return false;
     }
   }
@@ -153,12 +188,25 @@ class Watch {
         this.refQueued = false;
         if (this.closed) return;
         const hits = new Set<string>();
-        const seen = new Set<string>();
-        for (const root of this.refRoots) await this.syncRefs(root, 0, hits, seen);
-        // Release watches on directories that are gone.
-        if (!this.closed)
-          for (const known of [...this.refDirs.keys()])
-            if (!seen.has(known)) this.drop(`ref:${known}`, false);
+        const found: string[] = [];
+        for (const root of this.refRoots) await this.walkRefs(root, 0, hits, found);
+        if (this.closed) return;
+        // Phase 1: release watches on directories that are gone or were
+        // replaced, so stale entries never count toward the cap.
+        for (const [known, id] of [...this.refDirs]) {
+          if (!found.includes(known) || id !== (await identityAsync(known)))
+            this.drop(`ref:${known}`, false);
+        }
+        // Phase 2: watch what is missing, up to the cap.
+        for (const dir of found) {
+          if (this.closed || this.refDirs.has(dir)) continue;
+          if (this.refDirs.size >= MAX_REF_DIRS) {
+            hits.add("cap");
+            break;
+          }
+          const id = await identityAsync(dir);
+          if (this.add(`ref:${dir}`, dir, () => this.gitChanged())) this.refDirs.set(dir, id);
+        }
         // Report each degraded state once per episode, not on every sync.
         let fresh = false;
         for (const hit of hits) if (!this.degraded.has(hit)) fresh = true;
@@ -169,84 +217,143 @@ class Watch {
     return this.refChain;
   }
 
-  /** Watches `dir` and its sub-directories of refs, one non-recursive watch each.
-   * A directory that was replaced (new inode) or removed is re-watched or released. */
-  private async syncRefs(
+  /** Lists `dir` and its ref sub-directories (depth first, bounded depth). */
+  private async walkRefs(
     dir: string,
     depth: number,
     hits: Set<string>,
-    seen: Set<string>,
+    found: string[],
   ): Promise<void> {
     if (this.closed) return;
     if (depth > MAX_REF_DEPTH) {
       hits.add("depth");
       return;
     }
-    seen.add(dir);
     const entries = await readdir(dir, { withFileTypes: true }).catch(() => undefined);
-    if (this.closed) return;
-    if (!entries) {
-      if (this.refDirs.has(dir)) this.drop(`ref:${dir}`, false);
-      return;
-    }
-    const known = this.refDirs.has(dir);
-    if (known && this.refDirs.get(dir) !== identity(dir)) this.drop(`ref:${dir}`, false);
-    if (!this.refDirs.has(dir)) {
-      if (this.refDirs.size >= MAX_REF_DIRS) {
-        hits.add("cap");
-        return;
-      }
-      const id = identity(dir);
-      const added = this.add(`ref:${dir}`, dir, () => {
-        this.gitChanged();
-      });
-      if (!added) return;
-      this.refDirs.set(dir, id);
-    }
+    if (!entries) return;
+    found.push(dir);
     for (const entry of entries)
-      if (entry.isDirectory()) await this.syncRefs(join(dir, entry.name), depth + 1, hits, seen);
+      if (entry.isDirectory()) await this.walkRefs(join(dir, entry.name), depth + 1, hits, found);
   }
 
   /** Replaces the watched client directories. A directory whose inode changed
    * since it was watched (removed and recreated) is watched again. */
   setDirs(dirs: WatchDir[]) {
     this.renew();
-    const wanted = new Map(dirs.map((dir) => [dir.rel, dir]));
+    this.wanted = new Map(
+      dirs.map((dir) => {
+        let real: string | undefined;
+        try {
+          real = realpathSync.native(dir.path);
+        } catch {
+          // Healing keeps retrying while it does not resolve.
+        }
+        return [dir.rel, { ...dir, real }] as const;
+      }),
+    );
     for (const [rel] of [...this.dirKeys])
-      if (!wanted.has(rel)) this.drop(`dir:${rel}`, false);
-    for (const [rel, dir] of wanted) this.watchDir(rel, dir);
+      if (!this.wanted.has(rel)) this.drop(`dir:${rel}`, false);
+    for (const [rel, dir] of this.wanted) this.watchDir(rel, dir, false);
   }
 
-  private watchDir(rel: string, dir: WatchDir) {
+  private watchDir(rel: string, dir: WatchDir, quiet: boolean) {
     const id = identity(dir.path);
     const current = this.dirKeys.get(rel);
     if (current && current.path === dir.path && current.id === id && this.handles.has(`dir:${rel}`))
       return;
     const replaced = current !== undefined && current.id !== id;
     this.drop(`dir:${rel}`, false);
-    const added = this.add(`dir:${rel}`, dir.path, (name) => {
-      if (name === ".git") return;
-      this.pendingDirs.add(rel);
-      this.schedule();
-      // A watched directory that was deleted, renamed away or replaced is
-      // re-checked: a gone one degrades to a full refresh, a replaced one is
-      // watched again.
-      if (name === null || name === dir.path.split(sep).pop()) this.recheck(rel);
-    });
+    const added = this.add(
+      `dir:${rel}`,
+      dir.path,
+      (name) => {
+        if (name === ".git") return;
+        this.pendingDirs.add(rel);
+        this.schedule();
+        // A watched directory that was deleted, renamed away or replaced is
+        // re-checked by a healing pass.
+        if (name === null || name === dir.path.split(sep).pop()) this.requestHeal();
+      },
+      quiet,
+    );
     // Remember the directory only while a live handle exists.
     if (added) this.dirKeys.set(rel, { ...dir, id });
-    if (replaced) {
+    if (replaced || (added && quiet)) {
       this.pendingDirs.add(rel);
       this.schedule();
     }
   }
 
-  private recheck(rel: string) {
-    const dir = this.dirKeys.get(rel);
-    if (!dir || this.closed) return;
-    const id = identity(dir.path);
-    if (id === undefined) this.drop(`dir:${rel}`, true);
-    else if (id !== dir.id) this.watchDir(rel, dir);
+  /** Runs a healing pass now, or right after the current cool-down. */
+  private requestHeal() {
+    if (this.closed) return;
+    if (this.cooling || this.healing) {
+      this.healAgain = true;
+      return;
+    }
+    void this.heal();
+  }
+
+  private healIfAsked() {
+    if (!this.healAgain || this.cooling || this.healing) return;
+    this.healAgain = false;
+    this.requestHeal();
+  }
+
+  private async heal() {
+    if (this.closed) return;
+    this.healing = true;
+    this.cooling = true;
+    this.cooldown = setTimeout(() => {
+      this.cooling = false;
+      this.cooldown = undefined;
+      this.healIfAsked();
+    }, HEAL_INTERVAL_MS);
+    this.cooldown.unref?.();
+    const run = this.healPass()
+      .catch(() => undefined)
+      .finally(() => {
+        this.healing = false;
+        this.healIfAsked();
+      });
+    try {
+      await Promise.race([
+        run,
+        new Promise<void>((resolve) => {
+          this.healTimer = setTimeout(resolve, HEAL_TIMEOUT_MS);
+          this.healTimer.unref?.();
+        }),
+      ]);
+    } finally {
+      clearTimeout(this.healTimer);
+    }
+  }
+
+  /** Restores watches that were lost and re-checks the live ones, without
+   * blocking the event loop. Every re-created watch is confined again. */
+  private async healPass() {
+    for (const [rel, dir] of [...this.wanted]) {
+      if (this.closed) return;
+      const live = this.dirKeys.get(rel);
+      const real = await realpath(dir.path).catch(() => undefined);
+      if (this.closed || this.wanted.get(rel) !== dir) continue;
+      if (real === undefined || real !== (dir.real ?? dir.path)) {
+        // Gone, or swapped for a link that leads elsewhere: never watch it.
+        if (live) this.drop(`dir:${rel}`, true);
+        continue;
+      }
+      const id = await identityAsync(real);
+      if (this.closed || this.wanted.get(rel) !== dir) continue;
+      if (id === undefined) {
+        if (live) this.drop(`dir:${rel}`, true);
+      } else if (!live || live.id !== id || !this.handles.has(`dir:${rel}`)) {
+        this.watchDir(rel, dir, true);
+      }
+    }
+    if (this.closed) return;
+    for (const dir of this.gitWanted)
+      if (!this.handles.has(`git:${dir}`) && this.addGit(dir, true)) this.gitChanged();
+    await this.syncAllRefs();
   }
 
   private gitChanged() {
@@ -303,8 +410,8 @@ class Watch {
     // A newer request supersedes a pending one (a retry after a lost response).
     this.finish({ git: false, dirs: [], overflow: false });
     this.renew();
-    // Heal directories replaced since the last poll (git checkout, mv + mkdir).
-    for (const rel of [...this.dirKeys.keys()]) this.recheck(rel);
+    // Heal lost or replaced watches (git checkout, mv + mkdir), rate limited.
+    this.requestHeal();
     // While a batch window is open, wait for it so one burst is one response.
     if (!this.batch) {
       const ready = this.take();
@@ -325,6 +432,9 @@ class Watch {
     this.closed = true;
     clearTimeout(this.batch);
     clearTimeout(this.lease);
+    clearTimeout(this.cooldown);
+    clearTimeout(this.healTimer);
+    this.cooldown = undefined;
     this.batch = undefined;
     const waiter = this.waiter;
     this.waiter = undefined;

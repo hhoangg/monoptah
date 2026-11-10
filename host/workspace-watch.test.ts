@@ -1,10 +1,19 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import {
   BATCH_MS,
+  HEAL_INTERVAL_MS,
   LEASE_MS,
   MAX_DIRS,
   MAX_WATCHERS,
@@ -84,6 +93,16 @@ afterEach(() => {
 
 const dir = (cwd: string, rel: string) => ({ rel, path: rel ? join(cwd, rel) : cwd });
 const settle = () => vi.advanceTimersByTimeAsync(BATCH_MS);
+/** Waits for real file system work without moving the fake clock. */
+const until = async (check: () => boolean) => {
+  const end = Date.now() + 3000;
+  while (!check() && Date.now() < end) await new Promise((resolve) => setImmediate(resolve));
+  expect(check()).toBe(true);
+};
+const real = async (ms: number) => {
+  const end = Date.now() + ms;
+  while (Date.now() < end) await new Promise((resolve) => setImmediate(resolve));
+};
 
 it("reports a git metadata change as git: true after the batch window", async () => {
   const cwd = repo();
@@ -265,8 +284,9 @@ it("degrades fs.watch failures to overflow instead of crashing", async () => {
   host.update(id, [dir(cwd, "src")]);
   const src = f.at(join(cwd, "src"));
   rmSync(join(cwd, "src"), { recursive: true });
+  await vi.advanceTimersByTimeAsync(HEAL_INTERVAL_MS);
   src.emit("rename", "src");
-  await vi.waitFor(() => expect(src.closed).toBe(true));
+  await until(() => src.closed);
   await settle();
   expect(await host.wait(id)).toMatchObject({ overflow: true });
   host.close();
@@ -342,21 +362,155 @@ it("re-watches a directory replaced by a new one of the same name", async () => 
   expect(await replaced).toMatchObject({ dirs: ["src"] });
 
   // Without an update, a rename-self event heals it too.
+  await vi.advanceTimersByTimeAsync(HEAL_INTERVAL_MS);
   renameSync(join(cwd, "src"), join(cwd, "src.old2"));
   mkdirSync(join(cwd, "src"));
   fresh.emit("rename", null);
-  expect(fresh.closed).toBe(true);
+  await until(() => fresh.closed);
+  await until(() => f.open().some((fake) => fake.path === join(cwd, "src")));
   const healed = f.at(join(cwd, "src"));
   expect(healed).not.toBe(fresh);
 
   // So does the next poll.
+  await vi.advanceTimersByTimeAsync(HEAL_INTERVAL_MS);
   renameSync(join(cwd, "src"), join(cwd, "src.old3"));
   mkdirSync(join(cwd, "src"));
   const polled = host.wait(id);
+  await until(() => healed.closed);
   await settle();
-  await polled;
-  expect(healed.closed).toBe(true);
+  expect(await polled).toMatchObject({ dirs: ["src"] });
   expect(f.at(join(cwd, "src"))).not.toBe(healed);
+  host.close();
+});
+
+it("re-watches a wanted directory that was removed and recreated, without a new update", async () => {
+  const cwd = repo();
+  mkdirSync(join(cwd, "dist"));
+  const f = fakes();
+  const host = new WorkspaceWatchHost(f.watchFn);
+  const id = await host.start(cwd, [dir(cwd, "dist")]);
+  const first = f.at(join(cwd, "dist"));
+  rmSync(join(cwd, "dist"), { recursive: true });
+  first.emit("rename", "dist");
+  await until(() => first.closed);
+  mkdirSync(join(cwd, "dist"));
+  await vi.advanceTimersByTimeAsync(HEAL_INTERVAL_MS);
+  const pending = host.wait(id);
+  await until(() => f.open().some((fake) => fake.path === join(cwd, "dist")));
+  await settle();
+  // The earlier drop reported overflow; the restored watch reports the dir.
+  expect(await pending).toMatchObject({ dirs: ["dist"] });
+  host.close();
+});
+
+it("recovers a wanted directory after ENOSPC, silently", async () => {
+  const cwd = repo();
+  const f = fakes();
+  const host = new WorkspaceWatchHost(f.watchFn);
+  const id = await host.start(cwd, [dir(cwd, "src")]);
+  const src = () => f.open().some((fake) => fake.path === join(cwd, "src"));
+  f.at(join(cwd, "src")).fail(new Error("EMFILE"));
+  f.failNext(Object.assign(new Error("ENOSPC"), { code: "ENOSPC" }));
+  // The drop reports overflow; the first retry hits ENOSPC and adds no more noise.
+  const first = host.wait(id);
+  await real(100);
+  await settle();
+  expect(await first).toEqual({ git: false, dirs: [], overflow: true });
+  expect(src()).toBe(false);
+  await vi.advanceTimersByTimeAsync(HEAL_INTERVAL_MS);
+  const second = host.wait(id);
+  await until(src);
+  await settle();
+  expect(await second).toEqual({ git: false, dirs: ["src"], overflow: false });
+  host.close();
+});
+
+it("never re-creates a watch through a swapped symlink", async () => {
+  const cwd = repo();
+  const secret = tmp();
+  const f = fakes();
+  const host = new WorkspaceWatchHost(f.watchFn);
+  const id = await host.start(cwd, [dir(cwd, "src")]);
+  const first = f.at(join(cwd, "src"));
+  rmSync(join(cwd, "src"), { recursive: true });
+  symlinkSync(secret, join(cwd, "src"));
+  first.emit("rename", null);
+  await until(() => first.closed);
+  await vi.advanceTimersByTimeAsync(HEAL_INTERVAL_MS);
+  const pending = host.wait(id);
+  await settle();
+  expect(await pending).toMatchObject({ overflow: true });
+  await vi.advanceTimersByTimeAsync(HEAL_INTERVAL_MS);
+  void host.wait(id);
+  await real(100);
+  for (const fake of f.all) {
+    expect(fake.path).not.toBe(secret);
+    expect(fake.path.startsWith(secret)).toBe(false);
+  }
+  expect(f.all.filter((fake) => fake.path === join(cwd, "src"))).toHaveLength(1);
+  host.close();
+});
+
+it("re-creates a git watch after its handle errored", async () => {
+  const cwd = repo();
+  const f = fakes();
+  const host = new WorkspaceWatchHost(f.watchFn);
+  const id = await host.start(cwd, []);
+  const git = f.at(join(cwd, ".git"));
+  git.fail(new Error("EMFILE"));
+  expect(git.closed).toBe(true);
+  await settle();
+  const first = host.wait(id);
+  await until(() => f.open().some((fake) => fake.path === join(cwd, ".git")));
+  await settle();
+  expect(await first).toMatchObject({ overflow: true, git: true });
+  const again = host.wait(id);
+  f.at(join(cwd, ".git")).emit("change", "HEAD");
+  await settle();
+  expect((await again).git).toBe(true);
+  host.close();
+});
+
+it("releases vanished ref dirs before counting toward the cap", async () => {
+  const cwd = repo();
+  const heads = join(cwd, ".git", "refs", "heads");
+  for (let i = 0; i < 60; i++) mkdirSync(join(heads, `old${i}`), { recursive: true });
+  const f = fakes();
+  const host = new WorkspaceWatchHost(f.watchFn);
+  const id = await host.start(cwd, []);
+  await settle();
+  for (let i = 0; i < 60; i++) rmSync(join(heads, `old${i}`), { recursive: true });
+  for (let i = 0; i < 40; i++) mkdirSync(join(heads, `new${i}`), { recursive: true });
+  const pending = host.wait(id);
+  f.at(heads).emit("rename", "x");
+  await settle();
+  const news = () => f.open().filter((fake) => fake.path.includes("new")).length;
+  await until(() => news() === 40);
+  await settle();
+  // 40 new dirs fit only because the 60 stale ones were released first.
+  expect(news()).toBe(40);
+  expect(await pending).toMatchObject({ overflow: false });
+  host.close();
+});
+
+it("rate limits healing passes", async () => {
+  const cwd = repo();
+  const f = fakes();
+  const host = new WorkspaceWatchHost(f.watchFn);
+  const id = await host.start(cwd, [dir(cwd, "src")]);
+  const lose = () => f.at(join(cwd, "src")).fail(new Error("EMFILE"));
+  const count = () => f.all.filter((fake) => fake.path === join(cwd, "src")).length;
+  lose();
+  void host.wait(id); // first pass re-watches src
+  await until(() => count() === 2);
+  lose();
+  void host.wait(id);
+  void host.wait(id);
+  await real(100);
+  expect(count()).toBe(2); // still cooling down
+  await vi.advanceTimersByTimeAsync(HEAL_INTERVAL_MS);
+  void host.wait(id);
+  await until(() => count() === 3);
   host.close();
 });
 
