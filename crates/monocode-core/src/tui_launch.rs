@@ -49,6 +49,14 @@ pub struct TuiLaunch {
     pub minted_id: Option<String>,
 }
 
+/// The local terminal must not open for a session that lives in the cloud: a second Claude
+/// process on the same shared id would be a second writer (design 4.9 R2). Callers run this
+/// before `build` and show the message as the reason the terminal did not open. An unreadable
+/// location refuses too.
+pub fn refuse_while_cloud(store: &crate::store::Store, session: i64) -> Result<(), String> {
+    store.require_local_tui(session)
+}
+
 fn non_blank(value: &Option<String>) -> Option<&str> {
     value.as_deref().filter(|v| !v.trim().is_empty())
 }

@@ -68,6 +68,15 @@ impl Shell {
         }
     }
 
+    /// Tells every open conversation whether its session lives in the cloud (the location,
+    /// not the Host record, decides), so it can gate rewinds and show a sync error.
+    pub(super) fn sync_cloud_location(&mut self, cx: &mut Context<Self>) {
+        for (id, view) in &self.sessions {
+            let located = self.cloud_located.get(id).cloned();
+            view.update(cx, |view, cx| view.set_cloud_location(located, cx));
+        }
+    }
+
     /// How a conversation lists the machine types of its repository: `gh api` on the worker.
     pub(super) fn machine_loader(&self) -> crate::conversation::cloud_target::MachineLoader {
         let cloud = self.cloud.clone();

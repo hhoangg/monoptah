@@ -23,6 +23,8 @@ mod notifications;
 mod question_api;
 pub(crate) use question_api::{QuestionAsked, QuestionSettled};
 mod cloud_branches;
+mod cloud_location;
+pub(crate) use cloud_location::CloudLocationReset;
 mod cloud_panel;
 mod remote;
 pub(crate) use remote::CloudResumed;
@@ -170,6 +172,8 @@ pub(crate) struct Conversation {
     cloud_offers_codespace: bool,
     /// The shell's cached state says this cloud session's workspace is stopped.
     cloud_stopped: bool,
+    /// The shell says this local session lives in the cloud (design 4.2.1).
+    cloud_location: cloud_location::State,
     /// Lists the machine types of a project's repository for the codespace panel.
     machine_loader: Option<cloud_target::MachineLoader>,
     cloud_anchors: [AnchorSlot; 4],
@@ -790,6 +794,7 @@ impl Conversation {
             cloud_placeholder: None,
             cloud_offers_codespace: false,
             cloud_stopped: false,
+            cloud_location: Default::default(),
             machine_loader: None,
             cloud_anchors: Default::default(),
             cloud_ref_anchors: Default::default(),
@@ -1223,6 +1228,11 @@ impl Conversation {
                 .is_some_and(|center| !center.read(cx).book.exists(kind, &self.settings.account.id))
     }
     fn launch_prompt(&mut self, prompt: String, cx: &mut Context<Self>) {
+        if self.reset_in_progress() {
+            self.status = "Resetting to local. Send again in a moment.".into();
+            cx.notify();
+            return;
+        }
         #[cfg(test)]
         self.launched.push(prompt.clone());
         if self.stopping && self.is_remote() {
@@ -3053,6 +3063,7 @@ impl Conversation {
             .child(self.background_shelf(window, cx))
             .child(self.cloud_target_panel(window, cx))
             .children(self.remote_notice(cx))
+            .children(self.cloud_sync_notice(cx))
             .child(self.cloud_start_panel(cx))
             .child(self.message_queue(window, cx))
             .children(if self.is_remote() { None } else { self.auth_notice(cx) })

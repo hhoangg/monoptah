@@ -9,6 +9,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
+#[cfg(test)]
+mod cloud_location_tests;
 pub(crate) mod contributions;
 #[cfg(all(test, unix))]
 mod follow_up_tests;
@@ -122,6 +124,15 @@ pub(crate) fn run_turn(
         }
         Ok(None) => {}
         Err(error) => {
+            // Durable, so the notice with Reset to local shows without a successful append.
+            if let Ok(store) = locked(&store) {
+                let message = if error == monocode_core::store::UNREADABLE_LOCATION_TEXT {
+                    monocode_core::store::UNREADABLE_NOTICE
+                } else {
+                    error.as_str()
+                };
+                let _ = store.record_cloud_sync_error(summary.id, message);
+            }
             let _ = tx.send_blocking(remote::failed(error));
             return;
         }
@@ -153,6 +164,13 @@ fn run_turn_using(
         prompt,
         mut settings,
     } = input;
+    // Single writer (design 4.9 R2): a session that lives in the cloud never runs the local
+    // provider. Refused before anything is configured or written, so the user sees this
+    // message and not a late row-write failure.
+    if let Err(error) = locked(&store).and_then(|store| store.require_local_run(summary.id)) {
+        let _ = tx.send_blocking(remote::failed(error));
+        return;
+    }
     if settings.account.root.is_none() && settings.account.id != monocode_core::accounts::DEFAULT {
         settings.account.root = locked(&store)
             .ok()

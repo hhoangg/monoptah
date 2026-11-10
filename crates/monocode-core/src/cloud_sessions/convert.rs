@@ -623,7 +623,22 @@ impl CloudSessions {
     pub fn sessions_in_cloud(&self, cloud: &CloudRef) -> Vec<i64> {
         self.store()
             .ok()
-            .and_then(|store| store.cloud_session_ids(cloud).ok())
+            .and_then(|store| {
+                // A Host record that backs a Cloud-located local session is not a session of
+                // its own: converting it would save a second copy of the same conversation.
+                let ids = store.cloud_session_ids(cloud).ok()?;
+                Some(
+                    ids.into_iter()
+                        .filter(|id| {
+                            !store
+                                .remote_session(*id)
+                                .ok()
+                                .flatten()
+                                .is_some_and(|r| store.host_record_is_hidden(&r))
+                        })
+                        .collect(),
+                )
+            })
             .unwrap_or_default()
     }
 

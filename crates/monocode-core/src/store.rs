@@ -3,7 +3,11 @@ mod app_access;
 pub use app_access::ArchiveTimes;
 mod contributions;
 mod location;
-pub use location::{CloudLocation, SessionLocation};
+pub use location::UNREADABLE_LOCATION as UNREADABLE_LOCATION_TEXT;
+pub use location::{
+    CloudLocation, SessionLocation, HOST_TURN_RUNNING, LOCAL_RUN_REFUSED, LOCAL_TUI_REFUSED,
+    UNREADABLE_NOTICE, WORKSPACE_LOST,
+};
 mod cloud_rows;
 pub use cloud_rows::AppendOutcome;
 mod managed_sessions;
@@ -983,8 +987,8 @@ impl Store {
             return Err("Remote transcripts are owned by the host".into());
         }
         // Single writer (design 4.9 R2): while the session is in the cloud, only the remote
-        // row append (`append_projected_rows`) writes its rows.
-        // TODO(part B): the local runtime itself must also be refused before it starts a turn.
+        // row append (`append_projected_rows`) writes its rows. The local runtime is refused
+        // earlier, before it starts a turn (`require_local_run`); this stays as the backstop.
         if self.cloud_location(session)?.is_cloud() {
             return Err(CLOUD_OWNED.into());
         }
@@ -1266,7 +1270,20 @@ impl Store {
             .ok()
             .flatten()
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+        // The Host record that backed a Cloud-located session. Once the location is gone it
+        // would show up as a cloud session of its own, so the local record goes with the
+        // session. The conversation on the workspace itself is not touched (design 4.9 R8).
+        let backing: Vec<i64> = self
+            .linked_remote_session(id)
+            .ok()
+            .flatten()
+            .map(|(remote, _)| remote)
+            .into_iter()
+            .collect();
         delete_rows(self)?;
+        for remote in backing {
+            let _ = self.forget_cloud_session(remote);
+        }
         if let Some((env, host)) = cloud_cursor {
             let _ = self.save_setting(&Self::synced_key(&env, &host), "");
         }

@@ -1287,3 +1287,33 @@ fn restart_keeps_the_keyboard(cx: &mut TestAppContext) {
     visual.refresh().unwrap();
     assert!(terminal_has_keyboard(&view, visual));
 }
+
+#[test]
+fn the_local_terminal_is_refused_while_the_session_lives_in_the_cloud() {
+    let store = store_in(&temp("cloud-refused"));
+    let summary = terminal_session(&store, "claude", Some("conv-1"));
+    locked(&store)
+        .unwrap()
+        .set_cloud_location(
+            summary.id,
+            &monocode_core::store::SessionLocation::Cloud(monocode_core::store::CloudLocation {
+                cloud: monocode_core::cloud_sessions::CloudRef::codespace("octo-abc"),
+                environment_id: "env".into(),
+                project_id: "project".into(),
+                host_session_id: "host-session".into(),
+                remote_cwd: "/host/repo".into(),
+                local_cwd: "/Users/me/repo".into(),
+                moved_at_row: 10,
+                pushed_branch: None,
+            }),
+        )
+        .unwrap();
+    let error = prepare(request(&store, &summary)).err().unwrap();
+    assert_eq!(error, monocode_core::store::LOCAL_TUI_REFUSED);
+    assert_eq!(saved_id(&store, summary.id).as_deref(), Some("conv-1"));
+    locked(&store)
+        .unwrap()
+        .reset_cloud_location_to_local(summary.id)
+        .unwrap();
+    assert!(prepare(request(&store, &summary)).is_ok());
+}

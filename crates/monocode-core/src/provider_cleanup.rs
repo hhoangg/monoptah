@@ -11,6 +11,7 @@ use crate::{
         },
         Profile,
     },
+    cloud_sessions::CloudRef,
     provider::Kind,
     store::Session,
 };
@@ -83,6 +84,32 @@ pub fn cleanup_request(session: &Session, side_threads: &[String]) -> Option<Cle
         return None;
     }
     Some(CleanupRequest { provider, ids })
+}
+
+/// The note the delete dialog adds when the sessions being deleted live in cloud workspaces
+/// (design 4.9 R8). Deleting removes the local rows, the local record and the local provider
+/// files only; the conversation on the workspace is never touched, so it stays there until
+/// the workspace itself is deleted. `None` when no session is in the cloud.
+pub fn cloud_delete_notice(clouds: &[CloudRef], unreadable: usize) -> Option<String> {
+    match clouds {
+        [] if unreadable > 0 => Some(format!(
+            "{} of these conversations may also be in a cloud workspace (their cloud location cannot be read). Deleting them here removes only the copies on this computer. Any copy in a workspace stays until you delete the workspace.",
+            unreadable
+        )),
+        [] => None,
+        [cloud] => Some(format!(
+            "This conversation is also in the {noun} {name}. Deleting it here removes only the \
+             copy on this computer. The copy in the {noun} stays until you delete the {noun}.",
+            noun = cloud.noun(),
+            name = cloud.name,
+        )),
+        many => Some(format!(
+            "{} of these conversations are also in cloud workspaces. Deleting them here removes \
+             only the copies on this computer. The copies in the workspaces stay until you \
+             delete the workspaces.",
+            many.len()
+        )),
+    }
 }
 
 /// Shortens text that came from the caller before it goes into a message.
@@ -562,6 +589,26 @@ fn remove_inside(root: &Path, target: &Path) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cloud_delete_notice_says_the_workspace_copy_stays() {
+        assert_eq!(cloud_delete_notice(&[], 0), None);
+        let one = cloud_delete_notice(&[CloudRef::codespace("octo-abc")], 0).unwrap();
+        assert!(one.contains("codespace octo-abc"), "{one}");
+        assert!(one.contains("only the copy on this computer"), "{one}");
+        assert!(
+            one.contains("stays until you delete the codespace"),
+            "{one}"
+        );
+        let sandbox = cloud_delete_notice(&[CloudRef::sandbox("box-1")], 0).unwrap();
+        assert!(sandbox.contains("sandbox box-1"), "{sandbox}");
+        let many =
+            cloud_delete_notice(&[CloudRef::codespace("a"), CloudRef::sandbox("b")], 0).unwrap();
+        assert!(many.starts_with("2 of these conversations"), "{many}");
+        let unreadable = cloud_delete_notice(&[], 1).unwrap();
+        assert!(unreadable.contains("cannot be read"), "{unreadable}");
+        assert!(!one.contains('\u{2014}') && !many.contains('\u{2014}'));
+    }
 
     fn id(n: u32) -> String {
         format!("00000000-0000-4000-8000-{n:012x}")

@@ -140,6 +140,8 @@ pub(crate) fn prepare(request: Request) -> Result<Prepared, String> {
         root,
         binary,
     } = request;
+    // Single writer (design 4.9 R2): no local terminal for a session that lives in the cloud.
+    tui_launch::refuse_while_cloud(&*locked(&store)?, id)?;
     let saved = provider_id
         .filter(|saved| !saved.trim().is_empty() && !fresh)
         .map(|saved| saved.trim().to_owned());

@@ -64,7 +64,14 @@ impl Store {
     /// Remembers why the row append failed, so the UI can say so after a reload. Does
     /// nothing when the session is not in the cloud (for example it was just deleted).
     pub fn record_cloud_sync_error(&self, session: i64, message: &str) -> Result<(), String> {
-        if !matches!(self.cloud_location(session), Ok(SessionLocation::Cloud(_))) {
+        // A Local session (or a deleted one) has nothing to report. An unreadable location is
+        // still a location: the session fails closed and the notice must say so.
+        if matches!(self.cloud_location(session), Ok(SessionLocation::Local)) {
+            return Ok(());
+        }
+        // The deleted-workspace marker is the most specific one: a later, vaguer failure (for
+        // example a missing Host record) must not replace it.
+        if self.cloud_sync_error(session)?.as_deref() == Some(super::location::WORKSPACE_LOST) {
             return Ok(());
         }
         self.save_setting(&Self::sync_error_key(session), message)
@@ -132,6 +139,12 @@ impl Store {
         };
         if location.environment_id != environment || location.host_session_id != host_session {
             return Err(NOT_CLOUD.into());
+        }
+        // The workspace is gone: there is nothing to append, and the marker and the cursor
+        // must stay as `forget_cloud` left them.
+        if self.cloud_sync_error(local_session)?.as_deref() == Some(super::location::WORKSPACE_LOST)
+        {
+            return Err(super::location::WORKSPACE_LOST.into());
         }
         let base = location.moved_at_row;
         let local = self.native_rows(local_session)?;

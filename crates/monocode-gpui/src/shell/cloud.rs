@@ -8,7 +8,8 @@ use super::*;
 use monocode_core::{
     cloud_sessions::{
         CloudBackendKind, CloudRef, CloudSessions, CloudState, ConvertError, Converted,
-        DeleteOutcome, Restored, SandboxTerminal, pending_restore_for, restore_code,
+        DeleteOutcome, LocatedSession, Restored, SandboxTerminal, pending_restore_for,
+        restore_code,
     },
     codespaces::GhRunner,
 };
@@ -81,6 +82,9 @@ pub(super) struct Snapshot {
     pub origins: HashMap<i64, String>,
     /// Codespaces among `origins` that gh says no longer exist.
     pub gone: std::collections::HashSet<String>,
+    /// The marked sessions that are LOCAL sessions whose location is Cloud, by session id:
+    /// their move point and durable sync error. Sessions born in the cloud are not here.
+    pub located: HashMap<i64, LocatedSession>,
 }
 
 /// Reads every cloud session of `projects` from the store and the cached state of
@@ -128,6 +132,11 @@ pub(super) fn collect(
             {
                 slot.insert(cloud.cloud_state_of(&session.cloud));
             }
+        }
+        // A local session whose location is Cloud is already among the marked sessions above
+        // (the listing is driven by the location); this adds what its panels need.
+        for located in cloud.located_sessions_for(project).unwrap_or_default() {
+            snapshot.located.insert(located.id, located);
         }
     }
     snapshot
@@ -943,8 +952,10 @@ impl Shell {
         let changed = snapshot.marks != self.cloud_marks
             || snapshot.states != self.cloud_states
             || snapshot.origins != self.cloud_origins
-            || snapshot.gone != self.cloud_gone;
+            || snapshot.gone != self.cloud_gone
+            || snapshot.located != self.cloud_located;
         self.cloud_origins = snapshot.origins;
+        self.cloud_located = snapshot.located;
         self.cloud_gone = snapshot.gone;
         for (id, activity) in &snapshot.activity {
             // Host activity of the project is only polled for remote projects.
@@ -955,6 +966,7 @@ impl Shell {
         self.cloud_marks = snapshot.marks;
         self.cloud_states = snapshot.states;
         self.sync_cloud_stopped(cx);
+        self.sync_cloud_location(cx);
         if changed {
             self.invalidate_chrome(cx);
             cx.notify();
@@ -1985,16 +1997,27 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A local session that lives in the workspace is never dropped: it keeps its rows and
+        // shows the "cloud side lost" notice with Reset to local (read from the store).
         let gone: Vec<i64> = self
             .cloud_marks
             .iter()
-            .filter(|(_, mark)| mark.cloud() == *target)
+            .filter(|(id, mark)| mark.cloud() == *target && !self.cloud_located.contains_key(id))
             .map(|(id, _)| *id)
             .collect();
         for id in gone {
             self.forget_cloud_row(id, window, cx);
         }
         self.cloud_states.remove(&target.key());
+        // The located sessions read their marker (the store wrote it) on this refresh. Only
+        // then: a refresh reads codespace states through gh, which nothing else here needs.
+        if self
+            .cloud_marks
+            .iter()
+            .any(|(id, mark)| mark.cloud() == *target && self.cloud_located.contains_key(id))
+        {
+            self.refresh_cloud(cx);
+        }
     }
 
     /// Drops one cloud session from the window; its record is gone from the store already.
@@ -2004,6 +2027,10 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The store never forgets a located local session with its workspace; neither does the window.
+        if self.cloud_located.contains_key(&id) {
+            return;
+        }
         if self.workspace.tab_of(id).is_some() {
             self.close_pane(id, window, cx);
         }
@@ -2022,6 +2049,9 @@ impl Shell {
         let Some(mark) = self.cloud_marks.get(&id).cloned() else {
             return;
         };
+        if self.cloud_located.contains_key(&id) {
+            return;
+        }
         if self.cloud_archive.is_some() || self.cloud_busy.contains(&id) {
             return;
         }
@@ -2064,7 +2094,10 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.is_cloud(id) || self.cloud_busy.contains(&id) {
+        if !self.is_cloud(id)
+            || self.cloud_located.contains_key(&id)
+            || self.cloud_busy.contains(&id)
+        {
             return;
         }
         self.cloud_busy.insert(id);

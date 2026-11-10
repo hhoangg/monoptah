@@ -328,6 +328,26 @@ pub struct CloudSession {
     pub needs_input: bool,
 }
 
+/// A local session whose location is Cloud, as the sidebar needs it besides the
+/// [`CloudSession`] row: the move point (rewind gating) and the durable sync error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocatedSession {
+    pub id: i64,
+    pub moved_at_row: usize,
+    /// Why the session needs attention, which makes the shell offer "Reset to local": the
+    /// stored row-append error, an unreadable location, or a missing Host record. A session
+    /// that runs fine has none.
+    pub sync_error: Option<String>,
+    /// The stored location cannot be read (the session fails closed).
+    pub unreadable: bool,
+    /// The Host side is running a turn (or waits for input): resetting now would leave two
+    /// writers.
+    pub host_active: bool,
+    /// The cloud copy may hold turns that were not copied here (see
+    /// `Store::cloud_may_hold_unsynced`): Reset asks with the stronger text.
+    pub unsynced: bool,
+}
+
 /// Displayable codespace lifecycle state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CloudState {
@@ -916,11 +936,15 @@ impl CloudSessions {
     }
 
     /// Sessions of `local_cwd` that live in codespaces or Docker sandboxes, newest first.
+    /// Two kinds: sessions born in the cloud (a Host record of their own), and local sessions
+    /// whose location is Cloud (design 4.2.1). The Host record that backs a located session
+    /// is not listed: the local session is the one row, and carries the activity flags.
     pub fn cloud_sessions_for(&self, local_cwd: &str) -> Result<Vec<CloudSession>, String> {
-        Ok(self
-            .store()?
+        let store = self.store()?;
+        let mut found: Vec<CloudSession> = store
             .cloud_sessions(local_cwd)?
             .into_iter()
+            .filter(|s| !store.host_record_is_hidden(s))
             .filter_map(|s| {
                 let cloud = s.project.cloud()?;
                 Some(CloudSession {
@@ -933,7 +957,63 @@ impl CloudSessions {
                     summary: s.summary,
                 })
             })
-            .collect())
+            .collect();
+        for (summary, location) in store.cloud_located_sessions(local_cwd)? {
+            let backing = store.linked_remote_session(summary.id)?.map(|(_, r)| r);
+            found.push(CloudSession {
+                codespace: location.cloud.name.clone(),
+                cloud: location.cloud,
+                environment_id: location.environment_id,
+                session_id: Some(location.host_session_id),
+                running: backing.as_ref().is_some_and(|r| r.running),
+                needs_input: backing.as_ref().is_some_and(|r| r.needs_input),
+                summary,
+            });
+        }
+        found.sort_by_key(|s| {
+            (
+                std::cmp::Reverse(s.summary.updated_at),
+                std::cmp::Reverse(s.summary.id),
+            )
+        });
+        Ok(found)
+    }
+
+    /// The local sessions of `local_cwd` that have a cloud location (readable or not), with
+    /// their move point and whatever needs the user's attention.
+    pub fn located_sessions_for(&self, local_cwd: &str) -> Result<Vec<LocatedSession>, String> {
+        let store = self.store()?;
+        let located = store.cloud_located_raw()?;
+        if located.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut found = Vec::new();
+        for summary in store.sessions()?.into_iter().filter(|s| s.cwd == local_cwd) {
+            let Some((_, location)) = located.iter().find(|(id, _)| *id == summary.id) else {
+                continue;
+            };
+            let backing = store.linked_remote_session(summary.id)?.map(|(_, r)| r);
+            let stored = store.cloud_sync_error(summary.id).ok().flatten();
+            let derived = match location {
+                None => Some(crate::store::UNREADABLE_NOTICE.to_string()),
+                Some(_) if store.cloud_host_record(summary.id).is_err() => {
+                    Some(crate::store::MISSING_HOST.to_string())
+                }
+                Some(_) => None,
+            };
+            let sync_error = stored.or(derived);
+            found.push(LocatedSession {
+                id: summary.id,
+                moved_at_row: location.as_ref().map_or(0, |l| l.moved_at_row),
+                unreadable: location.is_none(),
+                // Fresh `running` only, and never next to a problem: see `leave_cloud`.
+                host_active: backing.as_ref().is_some_and(|r| r.running_now())
+                    && sync_error.is_none(),
+                unsynced: store.cloud_may_hold_unsynced(summary.id),
+                sync_error,
+            });
+        }
+        Ok(found)
     }
 
     /// Raw gh state of a codespace, cached for the TTL. Never wakes it.

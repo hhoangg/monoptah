@@ -94,6 +94,18 @@ impl Conversation {
             cx.notify();
             return;
         }
+        // Rewinds are gated by where the session lives (design 4.5, 4.9 R2 and R6).
+        if let Some(reason) = self
+            .rewind_gate(
+                monocode_core::checkpoint::gate::Operation::EditLastTurn,
+                turn,
+            )
+            .reason()
+        {
+            self.status = reason.into();
+            cx.notify();
+            return;
+        }
         // The action is tied to a painted source row. A history restoration may
         // replace that row, so never replay this intent against an empty cache.
         if !self.can_prepare_edit(cx) {
