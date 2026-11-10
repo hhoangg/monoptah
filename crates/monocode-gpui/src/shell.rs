@@ -9196,8 +9196,11 @@ impl Render for Shell {
         };
         let right_shown = self.right_panel_shown(cx);
         self.right_drawn = if right_shown { right_width } else { 0. };
-        let poll_git = self.window_active && !self.mono_active(cx);
+        let poll_git = !self.mono_active(cx);
+        let window_active = self.window_active;
         self.git.update(cx, |git, cx| {
+            git.set_window_active(window_active, cx);
+            git.set_panel_visible(right_shown, cx);
             git.set_polling(poll_git && git.available(), cx)
         });
         self.sync_cloud_panel(cx);
@@ -9285,9 +9288,14 @@ impl Render for Shell {
             .text_color(content(1.))
             .font_family(crate::fonts::UI)
             .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                this.git.update(cx, |git, cx| git.note_input(cx));
                 this.quit_hotkey_down(event, cfg!(target_os = "macos"), window, cx)
             }))
+            .on_scroll_wheel(cx.listener(|this, _: &gpui::ScrollWheelEvent, _, cx| {
+                this.git.update(cx, |git, cx| git.note_input(cx));
+            }))
             .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                this.git.update(cx, |git, cx| git.note_input(cx));
                 if this.session_preview.as_ref().is_some_and(|preview| {
                     !preview
                         .surface

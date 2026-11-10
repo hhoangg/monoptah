@@ -488,12 +488,7 @@ impl Connections {
             .ok_or_else(|| "Machine is no longer connected".into())
     }
 
-    pub fn request(
-        &self,
-        machine_id: &str,
-        method: &str,
-        params: Value,
-    ) -> Result<Value, String> {
+    pub fn request(&self, machine_id: &str, method: &str, params: Value) -> Result<Value, String> {
         self.request_timeout(machine_id, method, params, REQUEST_TIMEOUT)
     }
 
@@ -1585,7 +1580,17 @@ else:
                 let _ = stream.read(&mut buffer);
             }
         });
-        let call = |dead| rpc_with(&endpoint, "t", None, "projects.list", json!({}), dead, REQUEST_TIMEOUT);
+        let call = |dead| {
+            rpc_with(
+                &endpoint,
+                "t",
+                None,
+                "projects.list",
+                json!({}),
+                dead,
+                REQUEST_TIMEOUT,
+            )
+        };
         assert!(call(true)
             .unwrap_err()
             .starts_with("Machine is unreachable"));
