@@ -782,21 +782,15 @@ impl CloudApi {
         harness: &str,
     ) -> Result<CloudStart, String> {
         let instance = self.instance_name(project, &target)?;
-        let mut start = self.provider(target.kind)?.start(
+        // `kit: "none"` can only narrow the user's choice (rule D11). It goes into the first
+        // record the start persists, so no later write can turn the kit back on.
+        self.provider(target.kind)?.start(
             project,
             harness,
             instance.as_deref(),
             &target.options,
-        )?;
-        // `kit: "none"` can only narrow the user's choice (rule D11): the start is recorded
-        // as sending no kit before it runs.
-        if target.kit == ApiKit::None {
-            if let CloudStart::Pending(session, record) = &mut start {
-                self.cloud.set_start_kit_off(session.id)?;
-                record.kit_off = true;
-            }
-        }
-        Ok(start)
+            target.kit != ApiKit::None,
+        )
     }
     /// A blank session on the binding (Claude only).
     pub fn create_session(&self, binding: &CloudBinding, harness: &str) -> Result<Session, String> {

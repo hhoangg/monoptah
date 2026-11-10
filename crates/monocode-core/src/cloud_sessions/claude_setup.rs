@@ -72,13 +72,16 @@ pub const SIGN_IN_LABEL: &str = "Sign in in the cloud";
 /// Text for a project server that waits for approval (design 7).
 pub const APPROVAL_LABEL: &str = "Needs approval";
 
+/// Finds the local setup of a project.
+pub type RootsFn = Arc<dyn Fn(&Path) -> Result<KitRoots, String> + Send + Sync>;
+
 /// The seams the step reads the user's setup through. Tests install fixtures.
 #[derive(Clone)]
 pub struct KitSeams {
     /// The global kit preferences as set in Settings.
     pub prefs: Arc<dyn Fn() -> CloudKitPrefs + Send + Sync>,
     /// Where the local setup lives, for a local project.
-    pub roots: Arc<dyn Fn(&Path) -> Result<KitRoots, String> + Send + Sync>,
+    pub roots: RootsFn,
 }
 
 impl KitSeams {
@@ -197,72 +200,112 @@ impl SetupState {
 // ---------------------------------------------------------------------------
 
 /// Removes secret values (and the parts of a URL secret) from text.
-pub struct Scrub(Vec<Zeroizing<String>>);
+///
+/// It learns values twice: from the scanned inventory, and again from the values that are
+/// really packed, because a config can change between the scan and the pack. A value shorter
+/// than [`MIN_SCRUB`] cannot be masked without mangling ordinary text, so it makes the scrub
+/// opaque: text that came from the Host is then replaced by a fixed sentence
+/// ([`Scrub::host_text`]) instead of being trusted.
+#[derive(Default)]
+pub struct Scrub {
+    forms: std::cell::RefCell<Vec<Zeroizing<String>>>,
+    opaque: std::cell::Cell<bool>,
+}
 
 /// Values shorter than this are not scrubbed: they would mangle ordinary text.
 const MIN_SCRUB: usize = 4;
+/// Shown in place of Host text while a secret too short to mask is in play.
+const HIDDEN: &str = "(details hidden: a secret is too short to mask)";
 
 impl Scrub {
     fn from_inventory(inventory: &KitInventory, prefs: &CloudKitPrefs) -> Self {
-        let mut forms: BTreeSet<String> = BTreeSet::new();
-        let mut add = |text: &str| {
-            if text.len() >= MIN_SCRUB {
-                forms.insert(text.to_owned());
-            }
-        };
+        let scrub = Self::default();
         for server in kit_prefs::selected(inventory, prefs).servers {
             for field in &server.secrets {
-                let value = field.value.expose();
-                add(value);
-                add(&Value::String(value.to_owned())
-                    .to_string()
-                    .trim_matches('"')
-                    .to_owned());
-                if matches!(
+                let url = matches!(
                     field.location,
                     SecretLocation::UrlQuery
                         | SecretLocation::UrlUserinfo
                         | SecretLocation::UrlFragment
-                ) {
-                    if let Ok(url) = url::Url::parse(value) {
-                        add(url.query().unwrap_or(""));
-                        // A query value on its own is what a tool prints back.
-                        for (_, part) in url.query_pairs() {
-                            add(&part);
-                        }
-                        add(url.fragment().unwrap_or(""));
-                        add(url.username());
-                        add(url.password().unwrap_or(""));
-                    }
-                }
-                for line in value.lines().map(str::trim).filter(|l| l.len() >= 8) {
-                    add(line);
-                }
+                );
+                scrub.add_value(field.value.expose(), url);
             }
         }
-        let mut forms: Vec<Zeroizing<String>> = forms.into_iter().map(Zeroizing::new).collect();
+        scrub
+    }
+
+    /// Learns the values that are actually about to be sent.
+    fn learn_packed(&self, packed: &Packed) {
+        for (name, value) in &packed.secrets {
+            self.add_value(value.as_str(), name.ends_with("_URL"));
+        }
+    }
+
+    fn add_value(&self, value: &str, url: bool) {
+        if value.is_empty() {
+            return;
+        }
+        if value.len() < MIN_SCRUB {
+            self.opaque.set(true);
+        }
+        let mut found: BTreeSet<String> = BTreeSet::new();
+        let mut add = |text: &str| {
+            if text.len() >= MIN_SCRUB {
+                found.insert(text.to_owned());
+            }
+        };
+        add(value);
+        add(Value::String(value.to_owned())
+            .to_string()
+            .trim_matches('"'));
+        if url {
+            if let Ok(parsed) = url::Url::parse(value) {
+                add(parsed.query().unwrap_or(""));
+                // A query value on its own is what a tool prints back.
+                for (_, part) in parsed.query_pairs() {
+                    add(&part);
+                }
+                add(parsed.fragment().unwrap_or(""));
+                add(parsed.username());
+                add(parsed.password().unwrap_or(""));
+            }
+        }
+        for line in value.lines().map(str::trim).filter(|l| l.len() >= 8) {
+            add(line);
+        }
+        let mut forms = self.forms.borrow_mut();
+        forms.extend(found.into_iter().map(Zeroizing::new));
         // Longest first, so a secret that contains another one is removed whole.
         forms.sort_by_key(|form| std::cmp::Reverse(form.len()));
-        Self(forms)
+        forms.dedup();
     }
 
     #[cfg(test)]
     pub(super) fn from_values_for_test(values: &[&str]) -> Self {
-        Self(
-            values
-                .iter()
-                .map(|v| Zeroizing::new((*v).to_owned()))
-                .collect(),
-        )
+        let scrub = Self::default();
+        for value in values {
+            scrub.add_value(value, false);
+        }
+        scrub
     }
 
     /// `text` without any secret.
     pub fn apply(&self, text: &str) -> String {
         let mut out = crate::sandboxes::redact(text);
-        for form in &self.0 {
+        for form in self.forms.borrow().iter() {
             out = out.replace(form.as_str(), "[redacted]");
         }
         out
+    }
+
+    /// Text that came from the Host (errors, warnings, status lines). Scrubbed like any text,
+    /// and withheld entirely when a secret is too short to be masked reliably.
+    pub fn host_text(&self, text: &str) -> String {
+        if self.opaque.get() && !text.trim().is_empty() {
+            HIDDEN.to_owned()
+        } else {
+            self.apply(text)
+        }
     }
 }
 
@@ -336,7 +379,7 @@ fn run_inner(
                 state.warnings.push(text);
             }
         };
-    let none = Scrub(Vec::new());
+    let none = Scrub::default();
     progress("Preparing your Claude setup");
     let roots = match (plan.seams.roots)(Path::new(target.local_project)) {
         Ok(roots) => roots,
@@ -357,7 +400,7 @@ fn run_inner(
     let request = |method: &str, params: Value| -> Result<Value, String> {
         env.host
             .request(target.machine_id, method, params)
-            .map_err(|e| scrub.apply(&e))
+            .map_err(|e| scrub.host_text(&e))
     };
 
     // The Host must know the kit and uploads; an older one is a warning, not a failure.
@@ -403,6 +446,8 @@ fn run_inner(
             return state;
         }
     };
+    // The values actually sent, which may differ from the scanned ones.
+    scrub.learn_packed(&packed);
     for line in &packed.warnings {
         warn(&mut state, &scrub, line, progress);
     }
@@ -422,7 +467,7 @@ fn run_inner(
     ));
     let mut last = 0u64;
     let mut on_progress = |done: u64, total: u64| {
-        let percent = if total == 0 { 100 } else { done * 100 / total };
+        let percent = (done * 100).checked_div(total).unwrap_or(100);
         if percent >= last + 25 {
             last = percent;
             progress(&format!("Uploading the Claude setup: {percent}%"));
@@ -468,7 +513,7 @@ fn run_inner(
                 .flatten()
                 .filter_map(Value::as_str)
             {
-                warn(&mut state, &scrub, line, progress);
+                warn(&mut state, &scrub, &scrub.host_text(line), progress);
             }
         }
         Err(error) => {
@@ -559,37 +604,36 @@ fn cut(text: &str) -> String {
 /// list` text through [`crate::mcp::parse_claude_health`]. Returns the servers and notes.
 pub fn parse_health(reply: &Value, scrub: &Scrub) -> (Vec<ServerHealth>, Vec<String>) {
     let mut notes = Vec::new();
-    let mut servers: Vec<ServerHealth> =
-        reply
-            .get("servers")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| {
-                let name = entry.get("name")?.as_str()?.to_owned();
-                let status = HealthStatus::parse(entry.get("status")?.as_str()?);
-                Some(ServerHealth {
-                    name,
-                    status,
-                    sign_in_needed: entry
-                        .get("signInNeeded")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(status == HealthStatus::SignInNeeded),
-                    transport: entry
-                        .get("transport")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown")
-                        .to_owned(),
-                    detail: cut(
-                        &scrub.apply(entry.get("detail").and_then(Value::as_str).unwrap_or(""))
-                    ),
-                    oauth_style: false,
-                })
+    let mut servers: Vec<ServerHealth> = reply
+        .get("servers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.get("name")?.as_str()?.to_owned();
+            let status = HealthStatus::parse(entry.get("status")?.as_str()?);
+            Some(ServerHealth {
+                name,
+                status,
+                sign_in_needed: entry
+                    .get("signInNeeded")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(status == HealthStatus::SignInNeeded),
+                transport: entry
+                    .get("transport")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                detail: cut(
+                    &scrub.host_text(entry.get("detail").and_then(Value::as_str).unwrap_or(""))
+                ),
+                oauth_style: false,
             })
-            .collect();
+        })
+        .collect();
     if servers.is_empty() {
         if let Some(text) = reply.get("stdout").and_then(Value::as_str) {
-            servers = crate::mcp::parse_claude_health(&scrub.apply(text))
+            servers = crate::mcp::parse_claude_health(&scrub.host_text(text))
                 .into_iter()
                 .map(|(name, status)| {
                     let status = match status.as_str() {
@@ -759,10 +803,11 @@ impl CloudSessions {
     /// start attached to an existing workspace, turned the kit off, the global kit is off or not
     /// accepted, or the step already finished (credentials go once).
     pub(super) fn setup_plan(&self, record: &StartRecord) -> Option<SetupPlan> {
-        if !record.created
-            || record.kit_off
-            || record.step(StepKind::ClaudeSetup).status == StepStatus::Done
-        {
+        let step = record.step(StepKind::ClaudeSetup);
+        // A step that is Skipped without ever starting belongs to a record from before the
+        // step existed: such a start never sends (see `StartRecord::normalize`).
+        let predates_step = step.status == StepStatus::Skipped && step.started_at.is_none();
+        if !record.created || record.kit_off || step.status == StepStatus::Done || predates_step {
             return None;
         }
         let prefs = (self.kit_seams.prefs)();

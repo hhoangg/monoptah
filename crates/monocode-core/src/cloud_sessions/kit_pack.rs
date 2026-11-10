@@ -269,6 +269,10 @@ pub fn pack(
                 continue;
             }
             if !ids.insert(plugin.id.clone()) {
+                warnings.push(format!(
+                    "Plugin \"{}\" was not sent twice: another copy with the same id is.",
+                    plugin.id
+                ));
                 continue;
             }
             let prefix = format!("plugins/{}", plugin.id);

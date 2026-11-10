@@ -448,3 +448,17 @@ fn kit_sources_never_read_the_keychain_or_claude_credentials() {
         }
     }
 }
+
+#[test]
+fn the_kit_is_off_before_the_app_publishes_anything_and_follows_what_it_publishes() {
+    // Safe by default: the defaults send nothing, so a worker that runs before the shell
+    // applied its preferences cannot send a kit.
+    assert!(!CloudKitPrefs::default().applies(ApiKit::Default));
+    let mut prefs = CloudKitPrefs::default();
+    prefs.acknowledge_notice();
+    super::kit_prefs::publish(prefs.clone());
+    assert_eq!(super::kit_prefs::published(), prefs);
+    assert!(super::kit_prefs::published().applies(ApiKit::Default));
+    super::kit_prefs::publish(CloudKitPrefs::default());
+    assert!(!super::kit_prefs::published().applies(ApiKit::Default));
+}

@@ -38,9 +38,13 @@ pub(super) fn begin_cloud_create(
                 .config
                 .as_ref()
                 .ok_or("Set up Docker Sandbox for this project first.")?;
-            let started =
-                cloud.begin_sandbox_start(&request.project, config, &request.branch, HARNESS)?;
-            cloud_picker::keep_kit_choice(cloud, started, request.kit)
+            cloud.begin_sandbox_start_with_kit(
+                &request.project,
+                config,
+                &request.branch,
+                HARNESS,
+                request.kit,
+            )
         }
     }
 }

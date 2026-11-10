@@ -545,6 +545,20 @@ impl CloudSessions {
         branch: &str,
         harness: &str,
     ) -> Result<(Session, StartRecord), String> {
+        self.begin_sandbox_start_with_kit(local_cwd, config, branch, harness, true)
+    }
+
+    /// [`Self::begin_sandbox_start`] with this start's own Claude setup choice. `kit: false`
+    /// is part of the FIRST persisted record (before `sbx create`), so no crash or later
+    /// write failure can turn it back on (rule D11).
+    pub fn begin_sandbox_start_with_kit(
+        &self,
+        local_cwd: &str,
+        config: &DockerProjectConfig,
+        branch: &str,
+        harness: &str,
+        kit: bool,
+    ) -> Result<(Session, StartRecord), String> {
         require_claude(harness)?;
         let deps = self.sandbox_deps()?;
         let config = config.validated()?;
@@ -576,6 +590,7 @@ impl CloudSessions {
         let remote_cwd = format!("/workspaces/{repo_dir}");
         let mut record =
             fresh_sandbox_record(&name, local_cwd, &path, &branch, &remote_cwd, start, began);
+        record.kit_off = !kit;
         let session = {
             let store = self.store()?;
             let project = pending_cloud_project(local_cwd, &CloudRef::sandbox(&name), &remote_cwd);

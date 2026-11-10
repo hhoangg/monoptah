@@ -60,39 +60,16 @@ pub(super) fn target_for(
 /// Takes seconds; the codespace itself comes up in the background (see `cloud_start`). Blocking:
 /// call it on a worker.
 ///
-/// `kit` is this start's own choice for the Claude setup. `false` is recorded before the start
-/// runs, so nothing is sent; `true` leaves the decision to Settings (it can only narrow).
+/// `kit` is this start's own choice for the Claude setup. `false` is part of the first record
+/// the start persists, so nothing is sent; `true` leaves the decision to Settings (it can only
+/// narrow).
 pub(super) fn begin_cloud_start(
     cloud: &CloudSessions,
     local_project: &str,
     target: Target,
     kit: bool,
 ) -> Result<(Session, StartRecord), String> {
-    keep_kit_choice(
-        cloud,
-        cloud.begin_start(local_project, target, HARNESS)?,
-        kit,
-    )
-}
-
-/// Records "no kit for this start" on a start that was just created.
-pub(super) fn keep_kit_choice(
-    cloud: &CloudSessions,
-    (session, mut record): (Session, StartRecord),
-    kit: bool,
-) -> Result<(Session, StartRecord), String> {
-    if !kit {
-        cloud
-            .set_start_kit_off(session.id)
-            .map_err(|error| match record.cloud() {
-                Some(workspace) => {
-                    monocode_core::cloud_sessions::created_note_for(&workspace, &error)
-                }
-                None => error,
-            })?;
-        record.kit_off = true;
-    }
-    Ok((session, record))
+    cloud.begin_start_with_kit(local_project, target, HARNESS, kit)
 }
 
 /// Existing codespaces and machine types of the project's repository.

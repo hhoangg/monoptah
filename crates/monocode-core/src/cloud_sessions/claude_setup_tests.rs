@@ -554,7 +554,9 @@ fn an_old_start_record_without_the_step_still_loads_and_ends_with_it_skipped() {
         .unwrap();
     let loaded = start_record(&f.store.lock().unwrap(), 4).unwrap();
     assert_eq!(loaded.steps.len(), StepKind::ALL.len());
-    assert_eq!(status(&loaded, StepKind::ClaudeSetup), StepStatus::Pending);
+    // It predates the step: it never sends, whatever the preferences say.
+    assert_eq!(status(&loaded, StepKind::ClaudeSetup), StepStatus::Skipped);
+    assert!(f.svc.setup_plan(&loaded).is_none());
     let mut ended = loaded.clone();
     ended.skip_unrun_claude_setup(2000);
     assert_eq!(status(&ended, StepKind::ClaudeSetup), StepStatus::Skipped);
@@ -581,4 +583,120 @@ fn the_panel_view_reports_a_local_change_and_whether_update_is_on_offer() {
     assert!(!view.can_update);
     // A session that never had a setup has no view.
     assert!(off.claude_setup_view(session.id + 100).is_none());
+}
+
+#[test]
+fn the_kit_choice_is_part_of_the_first_persisted_record() {
+    let home = home();
+    let f = kit_fx(&home, on());
+    // No second write: the record read back right after `begin` already says off.
+    let (session, record) = f
+        .svc
+        .begin_start_with_kit("/p", new_target(), "claude", false)
+        .unwrap();
+    assert!(record.kit_off);
+    assert!(f.record(session.id).unwrap().kit_off);
+    f.run(session.id).0.unwrap();
+    assert!(kit(&f, |k| k.methods.is_empty()));
+    // `true` leaves the decision to Settings.
+    let (session, record) = f
+        .svc
+        .begin_start_with_kit("/p", new_target(), "claude", true)
+        .unwrap();
+    assert!(!record.kit_off && !f.record(session.id).unwrap().kit_off);
+}
+
+#[test]
+fn a_halted_setup_is_not_recorded_as_done_so_a_retry_runs_it() {
+    use std::sync::atomic::Ordering;
+    let home = home();
+    let f = kit_fx(&home, on());
+    let halt = Arc::new(AtomicBool::new(false));
+    let flag = halt.clone();
+    script(&f, |k| {
+        k.on_call.push((
+            "kit.probe",
+            Arc::new(move || flag.store(true, Ordering::SeqCst)),
+        ))
+    });
+    f.host.machines.lock().unwrap().push(machine("octo-new1"));
+    let (backend, cloud) = (
+        f.svc.backend(CloudBackendKind::Codespaces).unwrap(),
+        CloudRef::codespace("octo-new1"),
+    );
+    let request = OpenRequest {
+        local_cwd: "/p",
+        cloud: &cloud,
+        sandbox: None,
+        display: "d",
+        repo: "octo/widgets",
+        remote_cwd: "/workspaces/widgets",
+        auth: None,
+        setup: Some(SetupPlan {
+            seams: seams(&home, on()),
+            prefs: on(),
+            workspace: Workspace::Codespace,
+            replace_secrets: false,
+        }),
+    };
+    let mut steps = vec![];
+    let result = super::super::open_project(
+        &*backend,
+        &*f.host,
+        &f.store,
+        &request,
+        &halt,
+        &mut |kind, status| steps.push((kind, status)),
+        &mut |_| {},
+    );
+    assert_eq!(result.unwrap_err(), START_ABORTED);
+    assert!(steps.contains(&(StepKind::ClaudeSetup, StepStatus::Running)));
+    assert!(!steps.contains(&(StepKind::ClaudeSetup, StepStatus::Done)));
+}
+
+#[test]
+fn a_secret_changed_after_the_scan_is_still_scrubbed_from_host_errors() {
+    let home = home();
+    let f = kit_fx(&home, on());
+    const LATE: &str = "late-token-DDDD4444";
+    // Between the scan and the pack the config gets a new secret value.
+    let path = home.roots.home.join(".claude.json");
+    let late_config = std::fs::read_to_string(&path).unwrap().replace(TOKEN, LATE);
+    script(&f, |k| {
+        k.on_call.push((
+            "kit.probe",
+            Arc::new(move || std::fs::write(&path, &late_config).unwrap()),
+        ));
+        k.errors
+            .push(("kit.secrets", format!("cannot write {LATE}")));
+    });
+    let (session, _) = f.svc.begin_start("/p", new_target(), "claude").unwrap();
+    f.run(session.id).0.unwrap();
+    let stored = state(&f);
+    // The late value was the one sent, and it never shows in what we keep.
+    assert_eq!(kit(&f, |k| k.secrets.len()), 0);
+    let text = serde_json::to_string(&stored).unwrap();
+    assert!(!text.contains(LATE), "{text}");
+    assert!(stored.warnings.iter().any(|w| w.contains("secrets")));
+}
+
+#[test]
+fn a_secret_too_short_to_mask_hides_host_text_instead_of_trusting_the_scrub() {
+    let home = home();
+    write(
+        &home.roots.home.join(".claude.json"),
+        &json!({"mcpServers": {"short": {"command": "npx", "env": {"K": "xy1"}}}}).to_string(),
+    );
+    let f = kit_fx(&home, on());
+    script(&f, |k| {
+        k.errors.push(("kit.secrets", "rejected xy1 here".into()));
+        k.apply_warnings = vec!["note xy1".into()];
+    });
+    let (session, _) = f.svc.begin_start("/p", new_target(), "claude").unwrap();
+    let (result, events) = f.run(session.id);
+    result.unwrap();
+    let mut seen = all_text(&events);
+    seen.push_str(&serde_json::to_string(&state(&f)).unwrap());
+    assert!(!seen.contains("xy1"), "{seen}");
+    assert!(seen.contains("too short to mask"));
 }

@@ -281,10 +281,12 @@ fn open_project(
             project_id: project.get("id").and_then(Value::as_str),
         };
         claude_setup::run(&env, &target, plan, progress);
-        step(startup::StepKind::ClaudeSetup, startup::StepStatus::Done);
+        // A halted run may have stopped before anything was sent: leave the step Running so
+        // a retry runs it again, instead of recording a setup that never happened.
         if aborted() {
             return Err(START_ABORTED.into());
         }
+        step(startup::StepKind::ClaudeSetup, startup::StepStatus::Done);
     }
     let remembered = store
         .lock()

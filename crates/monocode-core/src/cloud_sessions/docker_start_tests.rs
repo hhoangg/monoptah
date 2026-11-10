@@ -2432,6 +2432,19 @@ fn a_sandbox_start_runs_the_claude_setup_and_a_reconnect_never_does() {
     assert_eq!(kit_calls(&fx), 0);
 }
 
+#[test]
+fn a_sandbox_start_records_the_kit_choice_in_its_first_record() {
+    let fx = fx();
+    let (session, record) = fx
+        .svc
+        .begin_sandbox_start_with_kit("/Users/me/widgets", &config(), "fix/login", "claude", false)
+        .unwrap();
+    assert!(record.kit_off);
+    assert!(fx.record(session.id).unwrap().kit_off);
+    let (session, record) = fx.begin().unwrap();
+    assert!(!record.kit_off && !fx.record(session.id).unwrap().kit_off);
+}
+
 // ------------------------------------------------------------- call sites
 
 #[test]

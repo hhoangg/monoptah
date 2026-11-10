@@ -35,12 +35,12 @@ impl Shell {
             .active
             .map(|pane| self.workspace.session_for_pane(pane))?;
         let key = cloud.key();
-        let first = {
+        let already_requested = {
             let mut slots = self.claude_setups.borrow_mut();
             let slot = slots.entry(key.clone()).or_default();
             std::mem::replace(&mut slot.requested, true)
         };
-        if !first {
+        if !already_requested {
             self.read_claude_setup(id, key, cx);
             return None;
         }

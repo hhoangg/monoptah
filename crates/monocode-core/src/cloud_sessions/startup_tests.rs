@@ -150,6 +150,8 @@ struct KitHost {
     secrets: Vec<Value>,
     health_params: Vec<Value>,
     methods: Vec<String>,
+    /// Runs when the Host receives `method`, before it answers.
+    on_call: Vec<(&'static str, Arc<dyn Fn() + Send + Sync>)>,
 }
 
 impl KitHost {
@@ -172,6 +174,11 @@ impl KitHost {
             return None;
         }
         self.methods.push(method.to_string());
+        for (when, action) in &self.on_call {
+            if *when == method {
+                action();
+            }
+        }
         if let Some((_, error)) = self.errors.iter().find(|(m, _)| *m == method) {
             return Some(Err(error.clone()));
         }

@@ -374,9 +374,16 @@ impl StartRecord {
     /// Ensures `steps` holds every kind in order (damaged or older storage).
     fn normalize(&mut self) {
         let mut steps: Vec<Step> = StepKind::ALL.iter().map(|k| Step::pending(*k)).collect();
-        for old in std::mem::take(&mut self.steps) {
-            let at = old.kind.index();
-            steps[at] = old;
+        let old = std::mem::take(&mut self.steps);
+        // A record written before the Claude setup step existed never sends the kit: an
+        // upgrade must not start sending credentials in the middle of a start the user began
+        // without that choice.
+        if !old.iter().any(|s| s.kind == StepKind::ClaudeSetup) {
+            steps[StepKind::ClaudeSetup.index()].status = StepStatus::Skipped;
+        }
+        for step in old {
+            let at = step.kind.index();
+            steps[at] = step;
         }
         self.steps = steps;
     }
@@ -813,11 +820,24 @@ impl CloudSessions {
         target: Target,
         harness: &str,
     ) -> Result<(Session, StartRecord), String> {
+        self.begin_start_with_kit(local_cwd, target, harness, true)
+    }
+
+    /// [`Self::begin_start`] with this start's own Claude setup choice. `kit: false` is part of
+    /// the FIRST persisted record, so no crash or later write failure can turn it back on
+    /// (rule D11).
+    pub fn begin_start_with_kit(
+        &self,
+        local_cwd: &str,
+        target: Target,
+        harness: &str,
+        kit: bool,
+    ) -> Result<(Session, StartRecord), String> {
         require_claude(harness)?;
         let began = self.now();
         let resolved = self.resolve_codespace(local_cwd, target, &mut |_| {})?;
         self.invalidate(&resolved.name);
-        self.record_start(local_cwd, harness, &resolved, began)
+        self.record_start(local_cwd, harness, &resolved, began, !kit)
             .map_err(|error| {
                 if resolved.created {
                     created_note(&resolved.name, &error)
@@ -832,6 +852,7 @@ impl CloudSessions {
         harness: &str,
         resolved: &ResolvedCodespace,
         began: u64,
+        kit_off: bool,
     ) -> Result<(Session, StartRecord), String> {
         let now = self.now();
         let store = self.store()?;
@@ -842,6 +863,7 @@ impl CloudSessions {
         );
         let session = store.create_pending_cloud_session(harness, project)?;
         let mut record = StartRecord::fresh(resolved, session.id, local_cwd, began);
+        record.kit_off = kit_off;
         let create = record.step_mut(StepKind::Create);
         if resolved.created {
             create.status = StepStatus::Done;
