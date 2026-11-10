@@ -1,6 +1,7 @@
 //! Settings > Cloud: the one global kit (design 3.2.2). Skills, MCP servers and plugins that
 //! Monoptah copies from this computer to new cloud workspaces. Everything compatible is
-//! checked by default, secrets and sign-ins included; local-only items cannot be checked.
+//! checked by default, secrets included and OAuth-style servers carried config-only;
+//! local-only items cannot be checked.
 //!
 //! Only item ids are stored and shown. A server's secret values never reach this page.
 use crate::{

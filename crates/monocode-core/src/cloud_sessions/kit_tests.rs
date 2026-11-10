@@ -186,21 +186,26 @@ fn url_classification_table() {
         "http://localhost@evil.com/mcp",
     ];
     for url in public {
-        assert_eq!(compat_one(json!({"type": "sse", "url": url})), Ok, "{url}");
+        assert_eq!(
+            compat_one(json!({"type": "sse", "url": url})),
+            OAuthStyle,
+            "{url}"
+        );
     }
 }
 
 #[test]
-fn authorization_header_skips_the_sign_in_probe() {
+fn http_server_without_auth_header_is_oauth_style() {
     let env = env();
     servers_json(
         &env,
         json!({
             "a": {"type": "http", "url": "https://a.example.com", "headers": {"authorization": FAKE_HEADER}},
             "b": {"type": "http", "url": "https://b.example.com"},
+            "c": {"type": "sse", "url": "https://c.example.com", "headers": {"X-Api-Key": FAKE_HEADER}},
         }),
     );
-    let inventory = build_inventory_with(&env.roots, Workspace::Codespace, &|_| Some(true));
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
     let compat: Vec<_> = inventory
         .mcp_servers
         .iter()
@@ -208,13 +213,12 @@ fn authorization_header_skips_the_sign_in_probe() {
         .collect();
     assert_eq!(
         compat,
-        vec![("a", McpCompat::Ok), ("b", McpCompat::SignedIn)]
+        vec![
+            ("a", McpCompat::Ok),
+            ("b", McpCompat::OAuthStyle),
+            ("c", McpCompat::Ok)
+        ]
     );
-    let inventory = build_inventory_with(&env.roots, Workspace::Codespace, &|_| Some(false));
-    assert_eq!(inventory.mcp_servers[1].compat, McpCompat::NotSignedIn);
-    // The shipped seam knows nothing yet, so the server stays Ok.
-    let inventory = build_inventory(&env.roots, Workspace::Codespace);
-    assert_eq!(inventory.mcp_servers[1].compat, McpCompat::Ok);
 }
 
 #[test]
@@ -852,12 +856,8 @@ fn a_timed_out_scan_is_incomplete_and_never_under_the_cap() {
     fixture(&env);
     let complete = build_inventory(&env.roots, Workspace::Codespace);
     assert!(!complete.incomplete);
-    let timed_out = build_inventory_budgeted(
-        &env.roots,
-        Workspace::Codespace,
-        &|_| None,
-        std::time::Duration::ZERO,
-    );
+    let timed_out =
+        build_inventory_budgeted(&env.roots, Workspace::Codespace, std::time::Duration::ZERO);
     assert!(timed_out.incomplete);
     assert!(timed_out.over_total_cap);
     assert!(timed_out
@@ -1313,12 +1313,8 @@ mod key_file {
         assert!(!inventory.over_total_cap);
 
         skill(&env.roots.claude_home.join("skills"), "s", "x");
-        let timed = build_inventory_budgeted(
-            &env.roots,
-            Workspace::Codespace,
-            &|_| None,
-            std::time::Duration::ZERO,
-        );
+        let timed =
+            build_inventory_budgeted(&env.roots, Workspace::Codespace, std::time::Duration::ZERO);
         assert!(timed.scan_timed_out && timed.incomplete);
         assert!(!timed.key_unavailable);
     }
@@ -1839,12 +1835,8 @@ mod roots {
     fn an_exhausted_budget_before_indexing_marks_the_inventory_incomplete() {
         let env = env();
         write(&env.roots.home.join(".ssh/id"), "fake");
-        let inventory = build_inventory_budgeted(
-            &env.roots,
-            Workspace::Codespace,
-            &signed_in,
-            std::time::Duration::ZERO,
-        );
+        let inventory =
+            build_inventory_budgeted(&env.roots, Workspace::Codespace, std::time::Duration::ZERO);
         assert!(inventory.incomplete);
         let normal = build_inventory(&env.roots, Workspace::Codespace);
         assert!(!normal.incomplete);
