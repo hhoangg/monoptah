@@ -1,8 +1,8 @@
 //! Tests for opening files of a cloud workspace from chat links.
 use super::cloud::CloudMark;
 use super::cloud_view::{
-    self, Cached, Outcome, cached_open, cloud_target, read_for_click, read_for_view,
-    takes_cloud_link,
+    self, Cached, MAX_QUEUED_OPENS, OpenQueue, Outcome, cached_open, cloud_target, opens_by_itself,
+    read_for_click, read_for_view, takes_cloud_link,
 };
 use super::*;
 use crate::document_lightbox::{Kind, MAX_BYTES};
@@ -10,7 +10,7 @@ use gpui::TestAppContext;
 use monocode_core::{
     cloud_sessions::{
         CloudBackendKind, CloudSessions, Host,
-        view::{CHUNK_BYTES, FileKind, PlanReason},
+        view::{CHUNK_BYTES, FileKind, HostUpdate, PlanReason},
         view_cache::Downloaded,
     },
     codespaces::{GhOutput, GhRunner},
@@ -59,6 +59,12 @@ struct FileHost {
     may_reconnect: bool,
     reconnected: AtomicBool,
     ensured: Mutex<u32>,
+    /// The Host does not advertise `files.readBytes` (until the test flips it).
+    legacy: AtomicBool,
+    /// What the Host update looks like while `legacy` is set (`None`: nothing recorded).
+    update: Mutex<Option<HostUpdate>>,
+    /// Report this size for every file (a huge file without storing it).
+    fake_size: Option<u64>,
 }
 impl Host for FileHost {
     fn machines(&self) -> Result<Vec<Machine>, String> {
@@ -84,7 +90,12 @@ impl Host for FileHost {
     }
     fn request(&self, _: &str, method: &str, params: Value) -> Result<Value, String> {
         if method == "environment.describe" {
-            return Ok(json!({"capabilities": ["files.read", "files.readBytes"]}));
+            let legacy = self.legacy.load(std::sync::atomic::Ordering::SeqCst);
+            return Ok(json!({"capabilities": if legacy {
+                json!(["files.read"])
+            } else {
+                json!(["files.read", "files.readBytes"])
+            }}));
         }
         assert_eq!(method, "files.readBytes");
         let path = params["path"].as_str().unwrap().to_owned();
@@ -95,14 +106,26 @@ impl Host for FileHost {
         let files = self.files.lock().unwrap();
         let bytes = files.get(&path).ok_or("ENOENT")?;
         let offset = params["offset"].as_u64().unwrap() as usize;
-        let end = (offset + params["length"].as_u64().unwrap().min(CHUNK_BYTES) as usize)
-            .min(bytes.len());
+        let size = self.fake_size.map_or(bytes.len(), |size| size as usize);
+        let end = (offset + params["length"].as_u64().unwrap().min(CHUNK_BYTES) as usize).min(size);
         use base64::Engine;
+        let part = if self.fake_size.is_some() {
+            vec![0u8; end - offset]
+        } else {
+            bytes[offset..end].to_vec()
+        };
         Ok(json!({
-            "data": base64::engine::general_purpose::STANDARD.encode(&bytes[offset..end]),
+            "data": base64::engine::general_purpose::STANDARD.encode(part),
             "offset": end,
-            "size": bytes.len(),
+            "size": size,
         }))
+    }
+    fn host_update(&self, _: &str) -> HostUpdate {
+        self.update
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(HostUpdate::NextConnect)
     }
     fn disconnect(&self, _: &str) -> Result<(), String> {
         panic!("viewing must not disconnect");
@@ -314,6 +337,277 @@ fn clicking_a_link_in_a_stopped_sandbox_uses_the_sandbox_reconnect_path(cx: &mut
     );
     assert!(host.0.lock().unwrap().is_empty());
     assert!(gh.calls.lock().unwrap().is_empty());
+}
+
+/// The tests of the copy-free open: small files in memory, big ones streamed then opened, the
+/// huge ones confirmed, and a Host without `files.readBytes` queued or explained.
+fn sized_service(
+    tag: &str,
+    file: &str,
+    bytes: Vec<u8>,
+    fake_size: Option<u64>,
+) -> (Scratch, CloudSessions, i64) {
+    let dir = Scratch::new(tag);
+    let host = FileHost {
+        fake_size,
+        ..FileHost::default()
+    };
+    host.files.lock().unwrap().insert(file.into(), bytes);
+    let (svc, _host, id) = service(host, dir.path());
+    (dir, svc, id)
+}
+
+#[test]
+fn a_small_image_opens_in_memory_without_touching_the_disk() {
+    let (dir, svc, id) = sized_service("small-image", "shot.png", vec![1, 2, 3], None);
+    let never = AtomicBool::new(false);
+    assert_eq!(
+        read_for_view(&svc, id, "shot.png", &never),
+        Outcome::Image {
+            data: "AQID".into(),
+            mime: "image/png",
+            name: "shot.png".into()
+        }
+    );
+    assert!(!dir.path().join("sessions.db.threads").exists());
+}
+
+#[test]
+fn a_20_mb_pdf_streams_with_progress_then_opens_by_itself() {
+    let size = 20 * 1024 * 1024;
+    let (_dir, svc, id) = sized_service("pdf", "report.pdf", vec![7; size], None);
+    let never = AtomicBool::new(false);
+    let Outcome::Download { file, plan } = read_for_view(&svc, id, "report.pdf", &never) else {
+        panic!("a PDF streams to the cache");
+    };
+    // Under the threshold: no question, the download just starts.
+    assert!(!plan.needs_confirm);
+    assert_eq!(plan.size, size as u64);
+    let mut seen: Vec<(u64, u64)> = Vec::new();
+    let done = svc
+        .download_cloud_file(&file, false, &never, &mut |done, total| {
+            seen.push((done, total))
+        })
+        .unwrap();
+    assert_eq!(done.size, size as u64);
+    assert_eq!(std::fs::metadata(&done.path).unwrap().len(), size as u64);
+    assert!(
+        seen.len() > 10,
+        "progress arrives chunk by chunk: {}",
+        seen.len()
+    );
+    assert!(seen.windows(2).all(|w| w[0].0 <= w[1].0), "never goes back");
+    assert_eq!(seen.last(), Some(&(size as u64, size as u64)));
+    // Nothing to click: a PDF goes straight to the default app.
+    assert!(matches!(cached_open(&done), Cached::External { .. }));
+    assert!(opens_by_itself(&done.path));
+    // Programs and installers are only revealed.
+    assert!(!opens_by_itself(std::path::Path::new("/c/setup.pkg")));
+    assert!(!opens_by_itself(std::path::Path::new("/c/run.sh")));
+}
+
+#[test]
+fn a_600_mb_file_asks_before_anything_is_downloaded() {
+    let size = 600 * 1024 * 1024;
+    let (dir, svc, id) = sized_service("big", "dump.bin", vec![0], Some(size));
+    let never = AtomicBool::new(false);
+    let Outcome::Download { file, plan } = read_for_view(&svc, id, "dump.bin", &never) else {
+        panic!("a big file is a download");
+    };
+    assert!(plan.needs_confirm);
+    assert_eq!(plan.size, size);
+    assert_eq!(
+        svc.download_cloud_file(&file, false, &never, &mut |_, _| {})
+            .unwrap_err(),
+        monocode_core::cloud_sessions::view::ViewError::NeedsConfirm { size }
+    );
+    assert!(
+        !dir.path()
+            .join("sessions.db.threads")
+            .join("1")
+            .join("cloud-cache")
+            .join("dump.bin")
+            .exists(),
+        "nothing was stored before the answer"
+    );
+}
+
+fn legacy_host(update: Option<HostUpdate>) -> FileHost {
+    let host = FileHost {
+        legacy: AtomicBool::new(true),
+        update: Mutex::new(update),
+        ..FileHost::default()
+    };
+    host.files
+        .lock()
+        .unwrap()
+        .insert("shot.png".into(), vec![1, 2, 3]);
+    host
+}
+
+#[test]
+fn a_host_without_read_bytes_says_the_file_opens_after_the_update_and_queues_it() {
+    let never = AtomicBool::new(false);
+    for update in [Some(HostUpdate::Pending), None] {
+        let dir = Scratch::new("legacy-pending");
+        let (svc, _host, id) = service(legacy_host(update), dir.path());
+        match read_for_view(&svc, id, "shot.png", &never) {
+            Outcome::HostUpdate { text, queue } => {
+                assert!(queue);
+                assert!(
+                    text.starts_with("shot.png opens after the Host update"),
+                    "{text}"
+                );
+                assert!(
+                    text.contains("next time this workspace connects")
+                        || text.contains("updated on the next connect"),
+                    "{text}"
+                );
+                assert!(!text.to_lowercase().contains("download"), "{text}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_blocked_host_update_shows_the_policy_hint_and_queues_nothing() {
+    let dir = Scratch::new("legacy-blocked");
+    let warning = monocode_core::remote::host_upgrade::warning(
+        "curl: (6) Could not resolve host: github.com",
+        true,
+    );
+    let (svc, _host, id) = service(legacy_host(Some(HostUpdate::Failed(warning))), dir.path());
+    let never = AtomicBool::new(false);
+    match read_for_view(&svc, id, "shot.png", &never) {
+        Outcome::HostUpdate { text, queue } => {
+            assert!(!queue, "a blocked update does not fix itself");
+            assert!(
+                text.contains("Monoptah Host could not be updated"),
+                "{text}"
+            );
+            assert!(
+                text.contains("blocked by the sandbox network policy"),
+                "{text}"
+            );
+            assert!(
+                text.contains(monocode_core::remote::host_upgrade::POLICY_HINT),
+                "{text}"
+            );
+            assert!(!text.contains("Download"), "{text}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn the_open_queue_is_bounded_deduplicated_and_cleared_on_a_session_switch() {
+    let mut queue = OpenQueue::default();
+    queue.push(1, "a.png".into());
+    queue.push(1, "a.png".into());
+    assert_eq!(queue.len(), 1);
+    for n in 0..MAX_QUEUED_OPENS + 3 {
+        queue.push(1, format!("f{n}.png"));
+    }
+    assert_eq!(queue.len(), MAX_QUEUED_OPENS);
+    queue.push(2, "other.png".into());
+    assert!(queue.has(1) && queue.has(2));
+    queue.keep_only(2);
+    assert!(!queue.has(1));
+    assert_eq!(queue.take(2), ["other.png"]);
+    assert_eq!(queue.len(), 0);
+}
+
+/// The whole path in the shell: the click is queued while the Host is old, a later connect that
+/// finished the update opens the file by itself, and the host is never woken for it.
+#[gpui::test]
+fn a_queued_open_runs_after_the_connect_that_finishes_the_update(cx: &mut TestAppContext) {
+    let (window, _, _) = crate::shell::tests::window(cx);
+    let dir = Scratch::new("queued-shell");
+    let host = legacy_host(Some(HostUpdate::Pending));
+    let (svc, host, id) = service(host, dir.path());
+    window
+        .update(cx, |shell, w, cx| {
+            shell.cloud = Arc::new(svc);
+            shell.workspace.active = Some(id);
+            shell.cloud_marks.insert(
+                id,
+                CloudMark {
+                    local_project: "/Users/me/widgets".into(),
+                    codespace: "octo-abc".into(),
+                    kind: CloudBackendKind::Codespaces,
+                },
+            );
+            assert!(shell.open_cloud_path("shot.png", w, cx));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, w, cx| {
+            let text = shell.cloud_view_text();
+            assert!(text.contains("opens after the Host update"), "{text}");
+            assert!(shell.queued_cloud_opens.has(id));
+            // The Host is still old at the next connect: nothing opens, nothing is shown.
+            shell.dismiss_cloud_view(cx);
+            shell.cloud_resumed(id, cx);
+            assert_eq!(shell.cloud_open_due, Some(id));
+            shell.flush_queued_cloud_opens(id, w, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, _| {
+            assert!(shell.cloud_view.is_none(), "a queued retry stays quiet");
+            assert!(
+                shell.queued_cloud_opens.has(id),
+                "and waits for the next connect"
+            );
+        })
+        .unwrap();
+    // A later connect installed the new Host.
+    host.legacy
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    window
+        .update(cx, |shell, w, cx| {
+            // The background refresh forgot the fake mark (the store has no such codespace).
+            shell.cloud_marks.insert(
+                id,
+                CloudMark {
+                    local_project: "/Users/me/widgets".into(),
+                    codespace: "octo-abc".into(),
+                    kind: CloudBackendKind::Codespaces,
+                },
+            );
+            shell.cloud_resumed(id, cx);
+            shell.flush_queued_cloud_opens(id, w, cx);
+            assert!(shell.cloud_view.is_some(), "the open is reading the file");
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, _| {
+            assert!(
+                shell.cloud_view.is_none(),
+                "the image was handed to its viewer"
+            );
+            assert!(!shell.queued_cloud_opens.has(id));
+        })
+        .unwrap();
+    let reads = host.log.lock().unwrap().clone();
+    assert!(reads.iter().any(|p| p == "shot.png"), "{reads:?}");
+    assert_eq!(*host.ensured.lock().unwrap(), 0, "nothing was woken");
+}
+
+#[gpui::test]
+fn switching_sessions_drops_the_queued_opens_of_the_other_one(cx: &mut TestAppContext) {
+    let (window, a, _) = crate::shell::tests::window(cx);
+    window
+        .update(cx, |shell, w, cx| {
+            shell.queued_cloud_opens.push(a + 1000, "x.png".into());
+            shell.activate_session(a, w, cx);
+            assert!(!shell.queued_cloud_opens.has(a + 1000));
+        })
+        .unwrap();
 }
 
 #[test]

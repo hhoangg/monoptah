@@ -7,9 +7,14 @@
 //!
 //! * cannot be reconnected: the card says why;
 //! * previewable and up to 5 MB: opened in memory in the image or document viewer;
-//! * anything else: downloaded into the session's `cloud-cache/` behind a card with a
-//!   progress bar and Cancel (a confirmation first above 500 MB), then opened from there, or
-//!   offered with "Open with default app" and "Reveal in Finder".
+//! * anything else: streamed through `files.readBytes` into the session's `cloud-cache/` behind
+//!   a card with a progress bar and Cancel (a confirmation first above 500 MB), then opened
+//!   automatically (the viewers, or the default app for what they cannot show; programs and
+//!   installers are only offered with "Reveal in Finder");
+//! * a Host without `files.readBytes`: the card says the file opens after the Host update
+//!   (or that the update was blocked, with the `sbx policy allow` hint). The open is queued
+//!   and runs when a later connect finishes the update. There is no copy fallback and no
+//!   Download button.
 //!
 //! Local sessions and local files never reach this module.
 use super::*;
@@ -28,6 +33,11 @@ pub(super) struct CloudView {
     /// The session whose file this is.
     session: i64,
     name: String,
+    /// The path as clicked, kept for a queued open.
+    target: String,
+    /// A queued open that runs by itself: it never reconnects and stays quiet when the Host
+    /// still cannot send the file.
+    from_queue: bool,
     phase: Phase,
 }
 
@@ -46,11 +56,6 @@ enum Phase {
         cancel: Arc<AtomicBool>,
         progress: Arc<Mutex<(u64, u64)>>,
     },
-    /// The Host is too old to send the file; the user may start a copy (`gh codespace cp` or
-    /// the sandbox transfer), which can resume a workspace that stopped just before.
-    CopyOffer { file: CloudFile },
-    /// The copy runs; it cannot be interrupted, only ignored.
-    Copying { cancel: Arc<AtomicBool> },
     /// Downloaded, but the app cannot show it.
     Saved { path: PathBuf, note: String },
 }
@@ -72,9 +77,10 @@ pub(super) enum Outcome {
         file: CloudFile,
         plan: DownloadPlan,
     },
-    /// The Host cannot send the file: offer the user-started copy.
-    CopyOnly {
-        file: CloudFile,
+    /// The Host lacks `files.readBytes`. `queue`: the open waits for the Host update.
+    HostUpdate {
+        text: String,
+        queue: bool,
     },
     Message(String),
 }
@@ -103,9 +109,66 @@ pub(super) fn read_for_view(
 ) -> Outcome {
     match read_file(cloud, session, raw, cancel) {
         Ok(outcome) => outcome,
-        Err(ViewError::Cancelled) => Outcome::Message(String::new()),
-        Err(error) => Outcome::Message(error.to_string()),
+        Err(error) => failure(error),
     }
+}
+
+/// What a failed read shows.
+fn failure(error: ViewError) -> Outcome {
+    match error {
+        ViewError::Cancelled => Outcome::Message(String::new()),
+        ViewError::HostUpdate { ref state, .. } => Outcome::HostUpdate {
+            queue: state.queues_open(),
+            text: error.to_string(),
+        },
+        error => Outcome::Message(error.to_string()),
+    }
+}
+
+/// The most opens that wait for a Host update.
+pub(super) const MAX_QUEUED_OPENS: usize = 8;
+
+/// File opens waiting for the Host update of their session. Bounded, without duplicates, and
+/// cleared when another session is shown.
+#[derive(Debug, Default)]
+pub(super) struct OpenQueue(Vec<(i64, String)>);
+
+impl OpenQueue {
+    /// Queues `target` of `session`; a repeat keeps one entry, and the oldest goes when full.
+    pub(super) fn push(&mut self, session: i64, target: String) {
+        if self.0.iter().any(|(s, t)| *s == session && *t == target) {
+            return;
+        }
+        if self.0.len() >= MAX_QUEUED_OPENS {
+            self.0.remove(0);
+        }
+        self.0.push((session, target));
+    }
+    pub(super) fn has(&self, session: i64) -> bool {
+        self.0.iter().any(|(s, _)| *s == session)
+    }
+    /// Takes every entry of `session`, oldest first.
+    pub(super) fn take(&mut self, session: i64) -> Vec<String> {
+        let (mine, rest): (Vec<_>, Vec<_>) = self.0.drain(..).partition(|(s, _)| *s == session);
+        self.0 = rest;
+        mine.into_iter().map(|(_, target)| target).collect()
+    }
+    /// Drops what belongs to a session other than `session` (the one now shown).
+    pub(super) fn keep_only(&mut self, session: i64) {
+        self.0.retain(|(s, _)| *s == session);
+    }
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+/// Whether a downloaded file is opened by itself with the default app: programs, scripts and
+/// installers are only revealed.
+pub(super) fn opens_by_itself(path: &std::path::Path) -> bool {
+    !path
+        .file_name()
+        .is_some_and(|n| monocode_core::cloud_sessions::view::runs_code(&n.to_string_lossy()))
 }
 
 /// Brings a workspace back, reporting progress lines; `Ok(false)` means there is nothing to do.
@@ -139,8 +202,7 @@ pub(super) fn read_for_click(
             Err(error) => (Outcome::Message(error), false),
         },
         Ok(outcome) => (outcome, false),
-        Err(ViewError::Cancelled) => (Outcome::Message(String::new()), false),
-        Err(error) => (Outcome::Message(error.to_string()), false),
+        Err(error) => (failure(error), false),
     }
 }
 
@@ -184,7 +246,6 @@ fn read_file(
             name,
         },
         Opened::Download(plan) => Outcome::Download { file, plan },
-        Opened::CopyOnly { .. } => Outcome::CopyOnly { file },
     })
 }
 
@@ -266,7 +327,7 @@ impl Shell {
         if std::path::Path::new(&target).is_absolute() && std::path::Path::new(&target).is_file() {
             return false;
         }
-        self.start_cloud_read(session, target, window, cx);
+        self.start_cloud_read(session, target, false, window, cx);
         true
     }
 
@@ -274,6 +335,7 @@ impl Shell {
         &mut self,
         session: i64,
         target: String,
+        from_queue: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -286,6 +348,8 @@ impl Shell {
             id,
             session,
             name,
+            target: target.clone(),
+            from_queue,
             phase: Phase::Reading {
                 cancel: cancel.clone(),
                 status: status.clone(),
@@ -295,6 +359,10 @@ impl Shell {
         let store = self.store.clone();
         let work = cx.background_executor().spawn(async move {
             let stop = cancel.clone();
+            if from_queue {
+                // The connect that finished the update already happened: read, never wake.
+                return (read_for_view(&cloud, session, &target, &cancel), false);
+            }
             read_for_click(
                 &cloud,
                 session,
@@ -346,6 +414,27 @@ impl Shell {
         cx.notify();
     }
 
+    /// A connect of `session` finished: opens what was waiting for its Host update. Only for the
+    /// session in view and while no other card is up; whatever cannot be opened yet stays
+    /// queued (or is queued again). Several waiting files open as the latest click only, since
+    /// there is one card.
+    pub(super) fn flush_queued_cloud_opens(
+        &mut self,
+        session: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace.active != Some(session)
+            || self.cloud_view.is_some()
+            || !self.is_cloud(session)
+        {
+            return;
+        }
+        if let Some(target) = self.queued_cloud_opens.take(session).pop() {
+            self.start_cloud_read(session, target, true, window, cx);
+        }
+    }
+
     /// A click brought the workspace of `session` back: the session's view clears its error
     /// and reloads its history, and the shell clears the cached Stopped state and banner.
     fn cloud_reconnected_by_click(&mut self, session: i64, cx: &mut Context<Self>) {
@@ -353,6 +442,15 @@ impl Shell {
             // The view emits `CloudResumed`, which the shell hears (`cloud_resumed`).
             Some(view) => view.update(cx, |view, cx| view.cloud_reconnected(cx)),
             None => self.cloud_resumed(session, cx),
+        }
+    }
+
+    /// The text of the card when it shows a plain message.
+    #[cfg(test)]
+    pub(super) fn cloud_view_text(&self) -> String {
+        match self.cloud_view.as_ref().map(|view| &view.phase) {
+            Some(Phase::Message(text)) => text.clone(),
+            _ => String::new(),
         }
     }
 
@@ -397,7 +495,22 @@ impl Shell {
                     cx,
                 );
             }
-            Outcome::CopyOnly { file } => self.set_cloud_phase(Phase::CopyOffer { file }),
+            Outcome::HostUpdate { text, queue } => {
+                let (session, target, quiet) = self
+                    .cloud_view
+                    .as_ref()
+                    .map(|v| (v.session, v.target.clone(), v.from_queue))
+                    .unwrap_or_default();
+                if queue {
+                    self.queued_cloud_opens.push(session, target);
+                }
+                // A queued open that still has to wait says nothing again.
+                if quiet {
+                    self.cloud_view = None;
+                } else {
+                    self.set_cloud_phase(Phase::Message(text));
+                }
+            }
             Outcome::Download { file, plan } => {
                 if plan.needs_confirm {
                     self.set_cloud_phase(Phase::Confirm {
@@ -479,33 +592,6 @@ impl Shell {
         cx.notify();
     }
 
-    /// The user chose "Download" on an old Host's card: copy with the backend's transfer.
-    fn start_cloud_copy(
-        &mut self,
-        id: u64,
-        file: CloudFile,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.set_cloud_phase(Phase::Copying {
-            cancel: cancel.clone(),
-        });
-        let cloud = self.cloud.clone();
-        let work = cx.background_executor().spawn({
-            let file = file.clone();
-            async move { cloud.copy_cloud_file(&file, &cancel) }
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            let result = work.await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.finish_cloud_download(id, file, result, window, cx)
-            });
-        })
-        .detach();
-        cx.notify();
-    }
-
     fn finish_cloud_download(
         &mut self,
         id: u64,
@@ -567,7 +653,12 @@ impl Shell {
                         );
                     }
                     Cached::External { path, note } => {
-                        self.set_cloud_phase(Phase::Saved { path, note })
+                        if opens_by_itself(&path) {
+                            self.cloud_view = None;
+                            self.open_saved(path, false, cx);
+                        } else {
+                            self.set_cloud_phase(Phase::Saved { path, note })
+                        }
                     }
                 }
             }
@@ -578,10 +669,7 @@ impl Shell {
     /// Closes the card and stops whatever it was doing.
     pub(super) fn dismiss_cloud_view(&mut self, cx: &mut Context<Self>) {
         if let Some(view) = self.cloud_view.take() {
-            if let Phase::Reading { cancel, .. }
-            | Phase::Downloading { cancel, .. }
-            | Phase::Copying { cancel } = &view.phase
-            {
+            if let Phase::Reading { cancel, .. } | Phase::Downloading { cancel, .. } = &view.phase {
                 cancel.store(true, Ordering::Relaxed);
             }
             cx.notify();
@@ -707,46 +795,11 @@ impl Shell {
                         ],
                     )
                 }
-                Phase::CopyOffer { file } => {
-                    let file = file.clone();
-                    let id = view.id;
-                    (
-                        format!("{}: {}", view.name, monocode_core::cloud_sessions::view::OUT_OF_DATE),
-                        Some("The copy uses the workspace's own transfer and only works while it is running.".into()),
-                        None,
-                        vec![
-                            button("cloud-view-cancel", "Cancel")
-                                .on_click(cx.listener(|this, _, _, cx| this.dismiss_cloud_view(cx)))
-                                .into_any_element(),
-                            crate::modal::primary_button("cloud-view-copy", "Download")
-                                .debug_selector(|| "cloud-view-copy".into())
-                                .cursor_pointer()
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    if this.live(id) {
-                                        this.start_cloud_copy(id, file.clone(), window, cx);
-                                    }
-                                }))
-                                .into_any_element(),
-                        ],
-                    )
-                }
-                Phase::Copying { .. } => (
-                    format!("Copying {} from the workspace...", view.name),
-                    None,
-                    None,
-                    vec![
-                        button("cloud-view-cancel", "Cancel")
-                            .on_click(cx.listener(|this, _, _, cx| this.dismiss_cloud_view(cx)))
-                            .into_any_element(),
-                    ],
-                ),
                 Phase::Saved { path, note } => {
                     let open = path.clone();
                     let reveal = path.clone();
                     // Apps, scripts and installers are only revealed, never run by a click here.
-                    let runs = path.file_name().is_some_and(|n| {
-                        monocode_core::cloud_sessions::view::runs_code(&n.to_string_lossy())
-                    });
+                    let runs = !opens_by_itself(path);
                     let mut actions: Vec<AnyElement> = Vec::new();
                     if !runs {
                         actions.push(

@@ -722,6 +722,10 @@ pub(crate) struct Shell {
     panel_modes: HashMap<i64, crate::panel_root::PanelMode>,
     /// The card for the cloud file being read or downloaded.
     cloud_view: Option<cloud_view::CloudView>,
+    /// File opens waiting for the Host update of their cloud session.
+    queued_cloud_opens: cloud_view::OpenQueue,
+    /// A connect of this session finished while opens were queued: the next render flushes them.
+    cloud_open_due: Option<i64>,
     cloud_states: HashMap<String, monocode_core::cloud_sessions::CloudState>,
     /// Converted local sessions and the codespace each came from, and which of those no longer
     /// exist.
@@ -1190,6 +1194,8 @@ impl Shell {
             cloud_marks: HashMap::new(),
             panel_modes: HashMap::new(),
             cloud_view: None,
+            queued_cloud_opens: cloud_view::OpenQueue::default(),
+            cloud_open_due: None,
             cloud_states: HashMap::new(),
             cloud_origins: HashMap::new(),
             cloud_located: HashMap::new(),
@@ -4583,6 +4589,7 @@ impl Shell {
         self.leave_app_search(cx);
         self.close_preview(cx);
         self.dismiss_due_reminder(id, cx);
+        self.queued_cloud_opens.keep_only(id);
         let view = self.ensure_session(id, cx);
         let Some(cwd) = view
             .as_ref()
@@ -8969,6 +8976,12 @@ impl Render for Shell {
             let this = cx.entity();
             window.defer(cx, move |window, cx| {
                 this.update(cx, |this, cx| this.open_cloud_archive(ids, window, cx));
+            });
+        }
+        if let Some(id) = self.cloud_open_due.take() {
+            let this = cx.entity();
+            window.defer(cx, move |window, cx| {
+                this.update(cx, |this, cx| this.flush_queued_cloud_opens(id, window, cx));
             });
         }
         if self.mono_panes_unsettled(cx) {
