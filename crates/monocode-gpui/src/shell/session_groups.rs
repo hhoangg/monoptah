@@ -1163,6 +1163,7 @@ impl Shell {
         self.draft_sessions.remove(&id);
         self.history_recency.remove(&id);
         self.session_marks.remove(&id);
+        self.panel_modes.remove(&id);
         self.tab_marks.remove(&id);
         self.order.retain(|s| *s != id);
         if self.busy_sessions.remove(&id) {

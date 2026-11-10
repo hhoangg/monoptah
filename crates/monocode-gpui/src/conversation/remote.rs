@@ -990,6 +990,19 @@ impl Conversation {
     pub(crate) fn cloud_stopped_for_test(&self) -> bool {
         self.cloud_stopped
     }
+    /// Whether the app has a live connection to this session's workspace, for the connection
+    /// strip of the Files and Changes panels. Reads cached view state only; it never wakes or
+    /// reconnects (the strip's Connect action is `reconnect_cloud`, a user action).
+    pub(crate) fn panel_link(&self) -> crate::panel_root::Link {
+        use crate::panel_root::Link;
+        if self.remote_state.waking {
+            Link::Starting
+        } else if self.remote_state.online && !self.cloud_stopped {
+            Link::Connected
+        } else {
+            Link::NotConnected
+        }
+    }
     /// The slim "Codespace stopped" / "Sandbox stopped" banner with a Resume button applies:
     /// the workspace is stopped and nothing else (an error, a pending command) needs the notice.
     fn cloud_stopped_banner(&self) -> bool {

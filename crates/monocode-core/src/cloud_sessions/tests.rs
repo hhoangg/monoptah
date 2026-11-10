@@ -1129,6 +1129,31 @@ fn begin_pending_start(svc: &CloudSessions, cloud: &CloudRef) -> i64 {
 }
 
 #[test]
+fn a_codespace_has_a_web_url_and_a_sandbox_has_none() {
+    let gh = FakeGh::new(vec![(
+        "api user/codespaces/octo-abc",
+        ok("https://octo-abc.github.dev\n"),
+    )]);
+    let host = FakeHost::with_machine("octo-abc");
+    let sandbox = Arc::new(FakeSandboxBackend::default());
+    let svc = service(&gh, &host).with_backend(sandbox.clone());
+
+    let url = svc.workspace_web_url(&CloudRef::codespace("octo-abc"));
+    let none = svc
+        .workspace_web_url(&CloudRef::sandbox("sbx-1"))
+        .unwrap_err();
+
+    assert_eq!(url.as_deref(), Ok("https://octo-abc.github.dev"));
+    assert!(none.contains("sandbox"), "{none}");
+    // Only the read of the URL: nothing woke the workspace.
+    assert_eq!(
+        gh.calls(),
+        vec!["api user/codespaces/octo-abc --jq .web_url"]
+    );
+    assert_eq!(host.log(), Vec::<String>::new());
+}
+
+#[test]
 fn a_sandbox_start_without_sandbox_support_never_reaches_gh() {
     let gh = FakeGh::new(vec![]);
     let host = FakeHost::with_machine("octo-abc");

@@ -1606,6 +1606,40 @@ fn enter_on_an_empty_composer_resumes_nothing_but_the_pill_does(cx: &mut TestApp
     assert!(launched(window, visual).is_empty());
 }
 
+/// The connection strip reads cached view state; only its Connect action (the Reconnect button)
+/// ever reaches the wake service, and it reaches it once.
+#[gpui::test]
+fn the_panel_link_never_wakes_and_connect_wakes_once(cx: &mut TestAppContext) {
+    use crate::panel_root::Link;
+    let (window, host) = stopped_codespace(cx, "");
+    window
+        .update(cx, |view, _, cx| {
+            // Reading the link, over and over, is what a background frame does.
+            for _ in 0..5 {
+                assert_eq!(view.panel_link(), Link::NotConnected);
+            }
+            // Online but stopped is still not connected.
+            view.remote_state.online = true;
+            assert_eq!(view.panel_link(), Link::NotConnected);
+            view.set_cloud_stopped(false, cx);
+            assert_eq!(view.panel_link(), Link::Connected);
+            view.set_cloud_stopped(true, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(ensures(&host), 0, "{:?}", host.0.lock().unwrap());
+    // Connect is `reconnect_cloud`; pressing it twice still wakes once.
+    window
+        .update(cx, |view, _, cx| {
+            assert!(view.reconnect_cloud(cx));
+            assert!(view.reconnect_cloud(cx));
+            assert_eq!(view.panel_link(), Link::Starting);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(ensures(&host), 1, "{:?}", host.0.lock().unwrap());
+}
+
 #[gpui::test]
 fn attachments_only_while_stopped_ask_for_a_prompt(cx: &mut TestAppContext) {
     let (window, host) = stopped_codespace(cx, "");

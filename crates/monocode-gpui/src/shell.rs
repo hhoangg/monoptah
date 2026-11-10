@@ -715,6 +715,9 @@ pub(crate) struct Shell {
     cloud: Arc<monocode_core::cloud_sessions::CloudSessions>,
     /// Sessions that live in a codespace, by id, and the cached state of each codespace.
     cloud_marks: HashMap<i64, cloud::CloudMark>,
+    /// Which side of a cloud session its Files and Changes panels show. In memory only; a
+    /// session without an entry shows the cloud workspace.
+    panel_modes: HashMap<i64, crate::panel_root::PanelMode>,
     /// The card for the cloud file being read or downloaded.
     cloud_view: Option<cloud_view::CloudView>,
     cloud_states: HashMap<String, monocode_core::cloud_sessions::CloudState>,
@@ -1181,6 +1184,7 @@ impl Shell {
             cloud,
             gh,
             cloud_marks: HashMap::new(),
+            panel_modes: HashMap::new(),
             cloud_view: None,
             cloud_states: HashMap::new(),
             cloud_origins: HashMap::new(),
@@ -1936,24 +1940,12 @@ impl Shell {
             .get(&self.workspace.project)
             .map(|id| classic_sidebar::ClassicSidebarTab::from_id(id))
             .unwrap_or_default();
-        let session = self
+        let provider = self
             .workspace
             .active
             .and_then(|id| self.sessions.get(&self.workspace.session_for_pane(id)))
-            .map(|view| {
-                let view = view.read(cx);
-                (
-                    view.settings
-                        .worktree_cwd
-                        .clone()
-                        .unwrap_or_else(|| view.summary.cwd.clone()),
-                    Kind::from_id(&view.summary.provider),
-                )
-            });
-        let (project, provider) = match session {
-            Some((cwd, kind)) => (cwd, Some(kind)),
-            None => (self.working_copy().to_owned(), None),
-        };
+            .map(|view| Kind::from_id(&view.read(cx).summary.provider));
+        let project = self.panel_root(cx).project().to_owned();
         self.git.update(cx, |git, cx| git.set_project(project, cx));
         if let (Some(panel), Some(kind)) = (&self.right_panel, provider) {
             let changes = panel.read(cx).changes.clone();
@@ -2027,20 +2019,12 @@ impl Shell {
         let Some(panel) = &self.right_panel else {
             return div().into_any_element();
         };
-        let panel = panel.read(cx);
-        match self.classic_sidebar_tab {
-            classic_sidebar::ClassicSidebarTab::Files => panel
-                .explorer
-                .clone()
-                .cached(StyleRefinement::default().size_full())
-                .into_any_element(),
-            classic_sidebar::ClassicSidebarTab::Changes => panel
-                .changes
-                .clone()
-                .cached(StyleRefinement::default().size_full())
-                .into_any_element(),
-            classic_sidebar::ClassicSidebarTab::Sessions => div().into_any_element(),
-        }
+        let tab = match self.classic_sidebar_tab {
+            classic_sidebar::ClassicSidebarTab::Files => crate::right_panel::RightTab::Files,
+            classic_sidebar::ClassicSidebarTab::Changes => crate::right_panel::RightTab::Changes,
+            classic_sidebar::ClassicSidebarTab::Sessions => return div().into_any_element(),
+        };
+        panel.update(cx, |panel, cx| panel.classic_tool(tab, cx))
     }
     fn toggle_right_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.set_right_panel_open(!self.workspace.right_panel_open, window, cx);
@@ -2128,6 +2112,10 @@ impl Shell {
                 cx.notify();
             },
         ));
+        self.observations.push(cx.subscribe(
+            &explorer,
+            |this, _, _: &crate::explorer::OpenInBrowser, cx| this.open_panel_in_browser(cx),
+        ));
         self.observations.push(cx.subscribe_in(
             &explorer,
             window,
@@ -2181,6 +2169,16 @@ impl Shell {
                         }
                     }
                     PanelEvent::Reordered(order) => this.workspace.right_panel_tabs = order.clone(),
+                    // Neither changes the saved layout: the mode lives in memory, and Connect
+                    // is the user's explicit wake of the workspace.
+                    PanelEvent::Mode(mode) => {
+                        this.set_panel_mode(*mode, cx);
+                        return;
+                    }
+                    PanelEvent::Connect => {
+                        this.connect_panel_workspace(cx);
+                        return;
+                    }
                 }
                 this.persist(cx);
             }));

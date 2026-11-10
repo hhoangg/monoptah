@@ -653,6 +653,15 @@ impl CloudSessions {
             .ok_or_else(|| format!("No {} backend is available.", kind.noun()))
     }
 
+    /// Browser URL of a workspace (a codespace's VS Code for the web), asked from its backend.
+    /// `Err` when the backend has no web page or could not read it. Reads only: it never wakes
+    /// the workspace.
+    pub fn workspace_web_url(&self, cloud: &CloudRef) -> Result<String, String> {
+        self.backend(cloud.kind)?
+            .web_url(&cloud.name)
+            .unwrap_or_else(|| Err(format!("A {} has no web page.", cloud.noun())))
+    }
+
     /// `owner/repo` of the local project's `origin`.
     pub fn repo_for(&self, local_cwd: &str) -> Result<String, String> {
         codespaces::repo_from_remote(&(self.origin)(local_cwd)?)

@@ -72,6 +72,7 @@ mod notes;
 mod notifications;
 mod pane_layout;
 mod pane_motion;
+mod panel_root;
 mod particle_text;
 mod phase_tile;
 mod pickers;

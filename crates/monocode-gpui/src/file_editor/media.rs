@@ -459,6 +459,8 @@ impl gpui::Render for MediaPreview {
                 )
                 .into_any_element()
         } else if self.failed {
+            // Opening or revealing a file on another machine means nothing here.
+            let remote = monocode_core::files::remote::is_remote(std::path::Path::new(&self.path));
             div()
                 .flex_1()
                 .flex()
@@ -488,46 +490,52 @@ impl gpui::Render for MediaPreview {
                                 .child("Retry")
                                 .on_click(cx.listener(|_, _, _, cx| cx.emit(MediaEvent::Retry))),
                         )
-                        .child(
-                            div()
-                                .id("open-video-externally")
-                                .role(Role::Button)
-                                .aria_label("Open externally")
-                                .px_3()
-                                .py_1()
-                                .rounded_md()
-                                .bg(content(0.1))
-                                .child("Open externally")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    cx.open_url(&format!(
-                                        "file://{}",
-                                        this.path
-                                            .replace('%', "%25")
-                                            .replace(' ', "%20")
-                                            .replace('#', "%23")
-                                            .replace('?', "%3F")
-                                    ))
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id("reveal-video")
-                                .role(Role::Button)
-                                .aria_label("Reveal")
-                                .px_3()
-                                .py_1()
-                                .rounded_md()
-                                .bg(content(0.1))
-                                .child("Reveal")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    let path = PathBuf::from(&this.path);
-                                    cx.background_executor()
-                                        .spawn(async move {
-                                            let _ = monocode_core::files::reveal_path(&path);
-                                        })
-                                        .detach();
-                                })),
-                        )
+                        .when(!remote, |d| {
+                            d.child(
+                                div()
+                                    .id("open-video-externally")
+                                    .debug_selector(|| "open-video-externally".into())
+                                    .role(Role::Button)
+                                    .aria_label("Open externally")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(content(0.1))
+                                    .child("Open externally")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        cx.open_url(&format!(
+                                            "file://{}",
+                                            this.path
+                                                .replace('%', "%25")
+                                                .replace(' ', "%20")
+                                                .replace('#', "%23")
+                                                .replace('?', "%3F")
+                                        ))
+                                    })),
+                            )
+                        })
+                        .when(!remote, |d| {
+                            d.child(
+                                div()
+                                    .id("reveal-video")
+                                    .debug_selector(|| "reveal-video".into())
+                                    .role(Role::Button)
+                                    .aria_label("Reveal")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(content(0.1))
+                                    .child("Reveal")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let path = PathBuf::from(&this.path);
+                                        cx.background_executor()
+                                            .spawn(async move {
+                                                let _ = monocode_core::files::reveal_path(&path);
+                                            })
+                                            .detach();
+                                    })),
+                            )
+                        })
                         .child(
                             div()
                                 .id("copy-video-path")
@@ -701,5 +709,46 @@ mod tests {
             .unwrap();
         assert_eq!(file_size(1024), "1.0 KB");
         assert_eq!(file_size(24 * 1024), "24 KB");
+    }
+
+    /// A failed video on another machine offers neither Open externally nor Reveal: both act on
+    /// this machine's disk.
+    #[gpui::test]
+    fn a_failed_remote_video_hides_open_externally_and_reveal(cx: &mut TestAppContext) {
+        let mut shown = Vec::new();
+        for path in [
+            "/tmp/clip.mp4",
+            "remote://env-octo-abc/workspaces/widgets/clip.mp4",
+        ] {
+            let window = cx.update(|cx| {
+                cx.open_window(Default::default(), |_, cx| {
+                    cx.new(|cx| {
+                        let mut preview = MediaPreview::image(
+                            path.into(),
+                            Arc::new(Image::from_bytes(
+                                ImageFormat::Png,
+                                include_bytes!("../../assets/monocode.png").to_vec(),
+                            )),
+                            8,
+                            8,
+                            64,
+                            "mp4",
+                            cx,
+                        );
+                        preview.image = None;
+                        preview.failed = true;
+                        preview
+                    })
+                })
+                .unwrap()
+            });
+            let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+            visual.refresh().unwrap();
+            shown.push((
+                visual.debug_bounds("open-video-externally").is_some(),
+                visual.debug_bounds("reveal-video").is_some(),
+            ));
+        }
+        assert_eq!(shown, [(true, true), (false, false)]);
     }
 }

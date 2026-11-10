@@ -355,7 +355,7 @@ fn hunk_actions_are_refused_while_a_cloud_session_is_in_view(cx: &mut TestAppCon
         .unwrap()
     });
     cx.run_until_parked();
-    crate::git_gate::set(Some("octo-abc".into()));
+    crate::git_gate::set(crate::git_gate::Gate::local_of("octo-abc"));
     window
         .update(cx, |editor, _, cx| {
             editor.apply_change(true, cx);
@@ -365,6 +365,42 @@ fn hunk_actions_are_refused_while_a_cloud_session_is_in_view(cx: &mut TestAppCon
             assert_eq!(editor.error.as_deref(), Some(crate::git_gate::REFUSED));
         })
         .unwrap();
-    crate::git_gate::set(None);
+    crate::git_gate::set(crate::git_gate::Gate::default());
     let _ = std::fs::remove_file(&path);
+}
+
+/// A file on another machine offers neither Open externally nor Reveal: both act on this
+/// machine's disk. A local file that fails to open still offers them.
+#[gpui::test]
+fn an_unreadable_remote_file_hides_open_externally_and_reveal(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_global(crate::settings::Preferences::default()));
+    let mut shown = Vec::new();
+    for path in [
+        "/nonexistent/monocode-missing.txt",
+        "remote://env-octo-abc/workspaces/widgets/a.rs",
+    ] {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                let git = cx.new(|cx| ProjectGit::new("/nonexistent".into(), cx));
+                cx.new(|cx| FileEditor::new(path.into(), git, cx))
+            })
+            .unwrap()
+        });
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        // Whatever the read did, the error state is what this view draws.
+        window
+            .update(visual, |editor, _, cx| {
+                editor.loading = false;
+                editor.unsupported = None;
+                editor.error = Some("Could not open".into());
+                cx.notify();
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        shown.push((
+            visual.debug_bounds("open-file-externally").is_some(),
+            visual.debug_bounds("reveal-file").is_some(),
+        ));
+    }
+    assert_eq!(shown, [(true, true), (false, false)]);
 }

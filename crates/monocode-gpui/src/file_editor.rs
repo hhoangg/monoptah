@@ -447,6 +447,10 @@ impl FileEditor {
     fn read_total(&self) -> u64 {
         self.read_progress.1.load(Ordering::Relaxed)
     }
+    /// The file lives on another machine (a cloud workspace).
+    fn is_remote_path(&self) -> bool {
+        monocode_core::files::remote::is_remote(std::path::Path::new(&self.path))
+    }
     /// "Opening file…", with the percentage once a chunked remote read has started.
     fn opening_text(&self) -> String {
         let total = self.read_total();
@@ -1319,10 +1323,12 @@ impl gpui::Render for FileEditor {
                             })),
                     )
                 })
-                .when(!self.loading, |d| {
+                // Opening or revealing a file on another machine means nothing here.
+                .when(!self.loading && !self.is_remote_path(), |d| {
                     d.child(
                         div()
                             .id("open-file-externally")
+                            .debug_selector(|| "open-file-externally".into())
                             .role(Role::Button)
                             .aria_label("Open externally")
                             .px_3()
@@ -1360,25 +1366,29 @@ impl gpui::Render for FileEditor {
                                     .child("Retry")
                                     .on_click(cx.listener(|this, _, _, cx| this.load(true, cx))),
                             )
-                            .child(
-                                div()
-                                    .id("reveal-file")
-                                    .role(Role::Button)
-                                    .aria_label("Reveal")
-                                    .px_3()
-                                    .py_1()
-                                    .rounded_md()
-                                    .bg(content(0.1))
-                                    .child("Reveal")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        let path = PathBuf::from(&this.path);
-                                        cx.background_executor()
-                                            .spawn(async move {
-                                                let _ = monocode_core::files::reveal_path(&path);
-                                            })
-                                            .detach();
-                                    })),
-                            )
+                            .when(!self.is_remote_path(), |d| {
+                                d.child(
+                                    div()
+                                        .id("reveal-file")
+                                        .debug_selector(|| "reveal-file".into())
+                                        .role(Role::Button)
+                                        .aria_label("Reveal")
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_md()
+                                        .bg(content(0.1))
+                                        .child("Reveal")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            let path = PathBuf::from(&this.path);
+                                            cx.background_executor()
+                                                .spawn(async move {
+                                                    let _ =
+                                                        monocode_core::files::reveal_path(&path);
+                                                })
+                                                .detach();
+                                        })),
+                                )
+                            })
                             .child(
                                 div()
                                     .id("copy-file-path")
