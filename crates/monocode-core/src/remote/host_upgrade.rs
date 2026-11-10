@@ -103,11 +103,17 @@ fn parse(version: &str) -> Option<([u64; 3], Option<String>)> {
     parts.next().is_none().then_some((out, pre))
 }
 
-/// Why a swap failed.
+/// Why a swap did not happen, or did not finish.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SwapError {
     /// The new Host did not start and the previous one was put back and is running.
     Restored(String),
+    /// A session was running at the last look, on the Host itself: nothing was touched.
+    Busy,
+    /// The staged package was missing or damaged: nothing was touched. Staging again may help.
+    NotStaged(String),
+    /// The swap was refused or failed before it touched anything (no way back, ...).
+    NotTouched(String),
     /// Anything else, including a failed restore: the state of the Host is not known.
     Failed(String),
 }
@@ -123,14 +129,19 @@ pub trait UpgradeEnv {
     fn set_pending(&self, pending: bool);
     /// The start this runs in was cancelled.
     fn cancelled(&self) -> bool;
+    /// A swap that an earlier connect started and never saw finish (the app quit, ssh
+    /// dropped): learn how it ended, finishing or rolling it back on the machine, and make
+    /// the tunnel reach whatever Host is running now.
+    fn recover(&self) {}
     /// Phase A: download and verify the pinned package next to the running Host, which is
     /// not touched. `Ok(false)`: the Host is already current, nothing was staged.
     fn stage(&self) -> Result<bool, String>;
     /// Drops a staged package.
     fn discard(&self);
     /// Holds back (`true`) or releases (`false`) every request that could start a turn on
-    /// this machine, so none starts during the swap.
-    fn hold_sends(&self, held: bool);
+    /// this machine, and on `true` waits until the ones already on their way are done. An
+    /// error (they did not finish in time) means the hold is NOT in place.
+    fn hold_sends(&self, held: bool) -> Result<(), String>;
     /// Phase B: installs the staged package and restarts the Host.
     fn swap(&self) -> Result<(), SwapError>;
     /// Opens a fresh tunnel (the Host restarted under the old one) and describes the Host.
@@ -142,20 +153,21 @@ pub trait UpgradeEnv {
 /// Releases the send hold however the upgrade ends.
 struct Held<'a>(&'a dyn UpgradeEnv);
 impl<'a> Held<'a> {
-    fn new(env: &'a dyn UpgradeEnv) -> Self {
-        env.hold_sends(true);
-        Self(env)
+    fn new(env: &'a dyn UpgradeEnv) -> Result<Self, String> {
+        env.hold_sends(true)?;
+        Ok(Self(env))
     }
 }
 impl Drop for Held<'_> {
     fn drop(&mut self) {
-        self.0.hold_sends(false);
+        let _ = self.0.hold_sends(false);
     }
 }
 
 /// Phase 2. `progress` hears the status lines ("Updating Monoptah Host…", the deferred text,
 /// the warning). Never fails.
 pub fn upgrade_if_needed(env: &dyn UpgradeEnv, progress: &mut dyn FnMut(&str)) -> Outcome {
+    env.recover();
     let Ok(info) = env.host_info() else {
         // Cannot tell what the Host is: leave it alone. The connect already worked.
         return Outcome::Current;
@@ -180,6 +192,11 @@ pub fn upgrade_if_needed(env: &dyn UpgradeEnv, progress: &mut dyn FnMut(&str)) -
             env.set_pending(false);
             return Outcome::Current;
         }
+        // The start was cancelled during the download: not a failure.
+        Err(error) if env.cancelled() || error.contains("Connection cancelled") => {
+            env.discard();
+            return Outcome::Cancelled;
+        }
         // The running Host was not touched.
         Err(error) => return failed(env, progress, &error),
     }
@@ -187,9 +204,13 @@ pub fn upgrade_if_needed(env: &dyn UpgradeEnv, progress: &mut dyn FnMut(&str)) -
         env.discard();
         return Outcome::Cancelled;
     }
-    // The download took a while and a turn may have started since. Hold sends back FIRST, then
-    // look again: anything that started before the hold shows up here, anything after is refused.
-    let _held = Held::new(env);
+    // The download took a while and a turn may have started since. Hold sends back FIRST and
+    // wait for the ones already on their way, then look again: anything that started before
+    // the hold shows up here, anything after is refused.
+    let Ok(_held) = Held::new(env) else {
+        env.discard();
+        return defer(env, progress);
+    };
     if env.busy().unwrap_or(true) {
         env.discard();
         return defer(env, progress);
@@ -198,31 +219,49 @@ pub fn upgrade_if_needed(env: &dyn UpgradeEnv, progress: &mut dyn FnMut(&str)) -
         env.discard();
         return Outcome::Cancelled;
     }
-    // From here on nothing stops the swap: it finishes or rolls back by itself.
-    match env.swap() {
-        Ok(()) => {}
-        Err(SwapError::Restored(error)) => {
-            // The old Host runs again; the tunnel must reach it.
-            return match env.reconnect() {
-                Ok(_) => failed(env, progress, &error),
-                Err(after) => {
-                    let text = format!(
-                        "Monoptah Host could not be updated and the previous Host does not answer: {}",
-                        clip(&after)
-                    );
-                    progress(&text);
-                    Outcome::Failed(text)
+    // From here on nothing stops the swap: it finishes or rolls back by itself, on the machine.
+    let mut restaged = false;
+    loop {
+        match env.swap() {
+            Ok(()) => break,
+            // A session started on the Host itself (another window, another device).
+            Err(SwapError::Busy) => return defer(env, progress),
+            Err(SwapError::NotStaged(error)) if !restaged => {
+                restaged = true;
+                match env.stage() {
+                    Ok(true) => continue,
+                    Ok(false) => return Outcome::Current,
+                    Err(_) if env.cancelled() => return Outcome::Cancelled,
+                    Err(_) => return failed(env, progress, &error),
                 }
-            };
-        }
-        Err(SwapError::Failed(error)) => {
-            let _ = env.reconnect();
-            let text = format!(
-                "Monoptah Host could not be updated and the Host may not be running: {}",
-                clip(&error)
-            );
-            progress(&text);
-            return Outcome::Failed(text);
+            }
+            // Nothing was touched: the old Host runs, and so does the tunnel to it.
+            Err(SwapError::NotStaged(error) | SwapError::NotTouched(error)) => {
+                return failed(env, progress, &error)
+            }
+            Err(SwapError::Restored(error)) => {
+                // The old Host runs again; the tunnel must reach it.
+                return match env.reconnect() {
+                    Ok(_) => failed(env, progress, &error),
+                    Err(after) => {
+                        let text = format!(
+                            "Monoptah Host could not be updated and the previous Host does not answer: {}",
+                            clip(&after)
+                        );
+                        progress(&text);
+                        Outcome::Failed(text)
+                    }
+                };
+            }
+            Err(SwapError::Failed(error)) => {
+                let _ = env.reconnect();
+                let text = format!(
+                    "Monoptah Host could not be updated and the Host may not be running: {}",
+                    clip(&error)
+                );
+                progress(&text);
+                return Outcome::Failed(text);
+            }
         }
     }
     match env.reconnect() {
@@ -352,7 +391,10 @@ mod tests {
         /// The cancel flag flips when the package is staged.
         cancel_after_stage: Cell<bool>,
         stage: Result<bool, String>,
-        swap: Result<(), SwapError>,
+        /// Answers of the successive swaps; the last one repeats.
+        swaps: RefCell<VecDeque<Result<(), SwapError>>>,
+        /// Whether the hold could be put in place (requests in flight may not drain).
+        hold: Result<(), String>,
         /// What the Host reports once it restarted (or came back as the old one).
         after: Result<HostInfo, String>,
         sandbox: bool,
@@ -372,7 +414,8 @@ mod tests {
                 cancel: Cell::new(false),
                 cancel_after_stage: Cell::new(false),
                 stage: Ok(true),
-                swap: Ok(()),
+                swaps: RefCell::new(VecDeque::from([Ok(())])),
+                hold: Ok(()),
                 after: Ok(info_pinned()),
                 sandbox: false,
                 held: Cell::new(false),
@@ -387,6 +430,9 @@ mod tests {
         }
         fn swaps(&self) -> usize {
             self.held_at_swap.borrow().len()
+        }
+        fn swap_answers(&mut self, answers: Vec<Result<(), SwapError>>) {
+            self.swaps = RefCell::new(answers.into());
         }
     }
     fn info_pinned() -> HostInfo {
@@ -425,16 +471,25 @@ mod tests {
             self.discards.set(self.discards.get() + 1);
             self.order.borrow_mut().push("discard");
         }
-        fn hold_sends(&self, held: bool) {
-            self.held.set(held);
+        fn hold_sends(&self, held: bool) -> Result<(), String> {
             self.order
                 .borrow_mut()
                 .push(if held { "hold" } else { "release" });
+            if held {
+                self.hold.clone()?;
+            }
+            self.held.set(held);
+            Ok(())
         }
         fn swap(&self) -> Result<(), SwapError> {
             self.held_at_swap.borrow_mut().push(self.held.get());
             self.order.borrow_mut().push("swap");
-            self.swap.clone()
+            let mut swaps = self.swaps.borrow_mut();
+            if swaps.len() > 1 {
+                swaps.pop_front().unwrap()
+            } else {
+                swaps.front().cloned().unwrap()
+            }
         }
         fn reconnect(&self) -> Result<HostInfo, String> {
             self.reconnects.set(self.reconnects.get() + 1);
@@ -591,9 +646,9 @@ mod tests {
     #[test]
     fn a_new_host_that_fails_to_start_is_rolled_back_and_the_old_one_is_reached_again() {
         let mut fake = Fake::new(info("monoptah", Some("1.0.0")));
-        fake.swap = Err(SwapError::Restored(
-            "SSH setup failed: Monoptah Host update failed; the previous Host was restored.".into(),
-        ));
+        fake.swap_answers(vec![Err(SwapError::Restored(
+            "The new Host did not start, so the previous Host was put back".into(),
+        ))]);
         fake.after = Ok(info("monoptah", Some("1.0.0")));
         let (outcome, lines) = run(&fake);
         let Outcome::Failed(warning) = outcome else {
@@ -613,9 +668,9 @@ mod tests {
     #[test]
     fn when_the_rollback_itself_failed_the_true_state_is_told() {
         let mut fake = Fake::new(info("monoptah", Some("1.0.0")));
-        fake.swap = Err(SwapError::Failed(
-            "Monoptah Host update failed and the previous Host could not be restored.".into(),
-        ));
+        fake.swap_answers(vec![Err(SwapError::Failed(
+            "The new Host did not start and the previous Host could not be put back".into(),
+        ))]);
         fake.after = Err("Machine is unreachable".into());
         let (outcome, _) = run(&fake);
         let Outcome::Failed(warning) = outcome else {
@@ -625,7 +680,7 @@ mod tests {
         assert!(warning.contains("may not be running"), "{warning}");
         // A restored Host that does not answer is not called kept either.
         let mut fake = Fake::new(info("monoptah", Some("1.0.0")));
-        fake.swap = Err(SwapError::Restored("restored".into()));
+        fake.swap_answers(vec![Err(SwapError::Restored("restored".into()))]);
         fake.after = Err("Machine is unreachable".into());
         let Outcome::Failed(warning) = run(&fake).0 else {
             panic!("expected a warning");
@@ -665,6 +720,95 @@ mod tests {
         *fake.info.borrow_mut() = Err("gone".into());
         assert_eq!(run(&fake).0, Outcome::Current);
         assert!(fake.order.borrow().is_empty());
+    }
+
+    #[test]
+    fn requests_that_do_not_drain_in_time_defer_the_upgrade_without_a_swap() {
+        let mut fake = Fake::new(info("upstream", None));
+        fake.hold = Err("Requests to the Host did not finish in time.".into());
+        let (outcome, _) = run(&fake);
+        assert_eq!(outcome, Outcome::Deferred);
+        assert_eq!(fake.swaps(), 0);
+        assert_eq!(fake.discards.get(), 1);
+        assert!(fake.pending.get());
+        assert!(!fake.held.get());
+    }
+
+    #[test]
+    fn a_session_found_by_the_last_look_on_the_host_defers_and_keeps_the_staged_package() {
+        let mut fake = Fake::new(info("monoptah", Some("1.0.0")));
+        fake.swap_answers(vec![Err(SwapError::Busy)]);
+        let (outcome, lines) = run(&fake);
+        assert_eq!(outcome, Outcome::Deferred);
+        assert!(fake.pending.get());
+        assert_eq!(
+            fake.discards.get(),
+            0,
+            "the staged package stays for the next connect"
+        );
+        assert_eq!(fake.reconnects.get(), 0, "the Host was never touched");
+        assert!(lines
+            .last()
+            .unwrap()
+            .ends_with("will be installed the next time this workspace connects"));
+    }
+
+    #[test]
+    fn a_missing_staged_package_is_staged_again_once_and_the_host_is_said_untouched() {
+        let mut fake = Fake::new(info("upstream", None));
+        fake.swap_answers(vec![
+            Err(SwapError::NotStaged(
+                "The downloaded package was not there".into(),
+            )),
+            Ok(()),
+        ]);
+        let (outcome, _) = run(&fake);
+        assert!(matches!(outcome, Outcome::Upgraded(_)), "{outcome:?}");
+        assert_eq!(
+            fake.order
+                .borrow()
+                .iter()
+                .filter(|o| **o == "stage")
+                .count(),
+            2
+        );
+        // Still missing the second time: a warning, the Host is kept, nothing reconnected.
+        let mut fake = Fake::new(info("upstream", None));
+        fake.swap_answers(vec![Err(SwapError::NotStaged(
+            "The downloaded package was not there".into(),
+        ))]);
+        let Outcome::Failed(warning) = run(&fake).0 else {
+            panic!("expected a warning");
+        };
+        assert!(warning.contains("the current Host is kept"), "{warning}");
+        assert!(!warning.contains("may not be running"), "{warning}");
+        assert_eq!(fake.reconnects.get(), 0);
+        assert_eq!(fake.swaps(), 2);
+    }
+
+    #[test]
+    fn a_swap_refused_before_it_changed_anything_keeps_the_host_and_says_so() {
+        let mut fake = Fake::new(info("upstream", None));
+        fake.swap_answers(vec![Err(SwapError::NotTouched(
+            "There is no previous Host to roll back to, so the Host was not replaced".into(),
+        ))]);
+        let Outcome::Failed(warning) = run(&fake).0 else {
+            panic!("expected a warning");
+        };
+        assert!(warning.contains("the current Host is kept"), "{warning}");
+        assert!(warning.contains("no previous Host"), "{warning}");
+        assert_eq!(fake.swaps(), 1, "no retry for this");
+        assert_eq!(fake.reconnects.get(), 0);
+    }
+
+    #[test]
+    fn a_cancelled_download_is_a_cancel_not_a_warning() {
+        let mut fake = Fake::new(info("upstream", None));
+        fake.stage = Err("Connection cancelled".into());
+        let (outcome, lines) = run(&fake);
+        assert_eq!(outcome, Outcome::Cancelled);
+        assert_eq!(fake.discards.get(), 1);
+        assert_eq!(lines, [UPDATING], "no warning line");
     }
 
     #[test]
