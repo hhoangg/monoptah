@@ -165,8 +165,8 @@ These are final. Do not re-open them. If one turns out impossible, stop and ask 
 | D3 | Features gate on **capability strings** from `environment.describe`, never on version numbers. Versions only decide upgrades. An installed Host without `+monoptah` counts as older than any pin. |
 | D4 | Feature 1: clicking a file in a cloud session's chat **opens it directly**. The copy workaround is **deleted** (F1-4); there is no Download-a-copy fallback. Large files stream through `files.readBytes` and open automatically. Only above 500 MB the app asks first. F1-1 (a `read_binary_file` stopgap) is **dropped**. Design §1.2. |
 | D5 | Feature 2: Files and Changes show the **cloud** workspace by default, with a **Cloud / Local** switch. Remote push, pull, sync and PR are allowed as confirmed user actions. Background reads **never** wake a workspace; waking is always a user action. Design §2.2. |
-| D6 | Feature 3: **one global kit** for all cloud workspaces, set in Settings > Cloud. There is no per-project or per-session selection; project-scoped items (local-scope MCP, untracked project skills) follow their own project. The default is everything compatible, **including secrets and MCP OAuth sign-ins**. A one-time notice is acknowledged once. Plugins are **copied from local** and passed with `--plugin-dir`. Design §3.2. |
-| D7 | Feature 3 credentials (env and header secrets, MCP OAuth sign-ins) go **one way, local to cloud, once**: in the "Claude setup" start step of a **new** workspace, before `Ready`. They are stored on the workspace 0600 and loaded into Claude child processes only. A reconnect never re-sends them and nothing ever comes back. The only refresh is the manual "Update Claude setup" action, still one way. There is no `headersHelper` broker. Design §3.2.3, §3.2.5. |
+| D6 | Feature 3: **one global kit** for all cloud workspaces, set in Settings > Cloud. There is no per-project or per-session selection; project-scoped items (local-scope MCP, untracked project skills) follow their own project. The default is everything compatible, **including secrets and MCP OAuth sign-ins** (superseded by D12 for sign-ins). A one-time notice is acknowledged once. Plugins are **copied from local** and passed with `--plugin-dir`. Design §3.2. |
+| D7 | Feature 3 credentials (env and header secrets, MCP OAuth sign-ins; superseded by D12 for sign-ins) go **one way, local to cloud, once**: in the "Claude setup" start step of a **new** workspace, before `Ready`. They are stored on the workspace 0600 and loaded into Claude child processes only. A reconnect never re-sends them and nothing ever comes back. The only refresh is the manual "Update Claude setup" action, still one way. There is no `headersHelper` broker. Design §3.2.3, §3.2.5. |
 | D8 | Feature 4, code: commits travel by **pushing the branch**, never with force and never to origin's default branch. On divergence the target is `<branch>-cloud`. Uncommitted, non-ignored changes travel as a patch over the tunnel and are never pushed. **Ignored files (e.g. `.env.local`) are never carried.** Design §4.2.2. |
 | D9 | Feature 4, identity: **one session, not two.** A local session gains a location (Local / Cloud). The harness (Claude) session id is the same on both sides: a session born in the cloud keeps the **cloud** id when it comes back, and a session born locally takes the **local** id up to the cloud. Design §4.2.1. |
 | D10 | Shared-id safety (design §4.9): **one writer at a time** (by location). Transcripts are compared by the entry `uuid` chain, never by bytes. An extension replaces the old copy, which is kept as `<id>.jsonl.pre-cloud`. **Divergence is never overwritten**: it forks to a new id and tells the user. After a lost workspace, continue on a new id with a summary, never on the stale file. |
@@ -381,7 +381,7 @@ the tracker as `blocked: <reason>`, and ask the user.
   1. Write the `KitInventory` types per design §3.2.1:
      - skills: user, project-untracked, plugin;
      - MCP servers with `compat`: `Ok`, `LocalOnly(reason)`, `NeedsRuntime(..)`,
-       `SignedIn`, `NotSignedIn`, `Project`; plus `secrets: [field]`;
+       `OAuthStyle` (D12), `Project`; plus `secrets: [field]`;
      - plugins: id, version, `installPath`, size, `hasNativeBin`.
   2. **Sources:** the account config dir from `Profile::home`, then `~/.claude`.
      - Verify how Claude Code merges the two for skills and settings: test with a real
@@ -1055,7 +1055,7 @@ same Phase 2 run. It does not depend on a Host release.
 - **Plan:**
   1. Three tabs, checkboxes, size and compat badges as in §3.2.2. Local-only items cannot
      be checked.
-  2. **Defaults:** everything compatible is checked, secrets and sign-ins included.
+  2. **Defaults:** everything compatible is checked, secrets included; OAuth-style servers are checked and carried config-only (D12).
   3. **One-time notice:** the exact text in §3.2.2, stored as acknowledged.
   4. The start panel and picker show the summary and a per-start on/off switch.
   5. The app API may pass `kit: "none"`, but can never add items.

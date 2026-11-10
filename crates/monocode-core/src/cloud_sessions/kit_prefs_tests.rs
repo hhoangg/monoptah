@@ -393,31 +393,56 @@ fn the_key_note_shows_only_when_the_key_is_unavailable() {
 
 #[test]
 fn kit_sources_never_read_the_keychain_or_claude_credentials() {
-    // D12: the app never reads MCP sign-ins. Only production code is checked; the Guard
-    // denylist in kit.rs names `.credentials.json` as a protected path on purpose.
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cloud_sessions");
-    let prefs = std::fs::read_to_string(dir.join("kit_prefs.rs")).unwrap();
-    let kit = std::fs::read_to_string(dir.join("kit.rs")).unwrap();
-    for (name, text) in [("kit_prefs.rs", &prefs), ("kit.rs", &kit)] {
-        for needle in [
-            "find-generic-password",
-            "\"security\"",
-            "Command::new",
-            "SecItem",
-            "keyring",
-        ] {
-            assert!(!text.contains(needle), "{name} references {needle}");
-        }
-    }
-    assert!(
-        !prefs.contains(".credentials.json"),
-        "kit_prefs.rs must not touch credential files"
-    );
-    for (ix, line) in kit.lines().enumerate() {
-        if line.contains(".credentials.json") {
-            let ok = line.trim_start().starts_with("//")
-                || line.contains("\".claude/.credentials.json\",");
-            assert!(ok, "kit.rs line {} reads a credential file: {line}", ix + 1);
+    // D12: the app never reads MCP sign-ins. Every production kit file is scanned (the
+    // `_tests.rs` files are not); the Guard denylist in kit.rs names the credentials file
+    // as a protected path on purpose, and that single exact line is the only allowed hit.
+    let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cloud_sessions");
+    let gpui = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../monocode-gpui/src");
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&core)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            name.starts_with("kit") && name.ends_with(".rs") && !name.ends_with("_tests.rs")
+        })
+        .collect();
+    files.push(gpui.join("cloud_kit_ui.rs"));
+    files.push(gpui.join("settings/pages/cloud.rs"));
+    assert!(files.len() >= 4, "the scan found {files:?}");
+    let allowed = "    \".claude/.credentials.json\",";
+    let forbidden = [
+        "find-generic-password",
+        "\"security\"",
+        "Command::new",
+        "SecItem",
+        "SecKeychain",
+        "security_framework",
+        "get_generic_password",
+        "keyring",
+        "credentials.json",
+        "Library/Keychains",
+    ];
+    for path in files {
+        let text = std::fs::read_to_string(&path).unwrap();
+        let is_guard = path.file_name().unwrap() == "kit.rs";
+        for (ix, line) in text.lines().enumerate() {
+            for needle in forbidden {
+                if !line.contains(needle) {
+                    continue;
+                }
+                let guard_line = is_guard
+                    && ((needle == "credentials.json" && line == allowed)
+                        || (needle == "Library/Keychains"
+                            && line.contains(
+                                "real_root.starts_with(home.join(\"Library/Keychains\"))",
+                            )));
+                assert!(
+                    guard_line,
+                    "{} line {} references {needle}: {line}",
+                    path.display(),
+                    ix + 1
+                );
+            }
         }
     }
 }

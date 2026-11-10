@@ -182,8 +182,6 @@ fn url_classification_table() {
         "${BASE_URL}/mcp",
         "http://100.63.255.255/mcp",
         "http://100.128.0.1/mcp",
-        // The userinfo is "localhost"; the host is evil.com.
-        "http://localhost@evil.com/mcp",
     ];
     for url in public {
         assert_eq!(
@@ -192,33 +190,83 @@ fn url_classification_table() {
             "{url}"
         );
     }
+    // The userinfo is "localhost"; the host is evil.com, so it is public. The userinfo is a
+    // raw credential, so the server is not OAuth-style.
+    assert_eq!(
+        compat_one(json!({"type": "sse", "url": "http://localhost@evil.com/mcp"})),
+        Ok
+    );
 }
 
 #[test]
-fn http_server_without_auth_header_is_oauth_style() {
-    let env = env();
-    servers_json(
-        &env,
-        json!({
-            "a": {"type": "http", "url": "https://a.example.com", "headers": {"authorization": FAKE_HEADER}},
-            "b": {"type": "http", "url": "https://b.example.com"},
-            "c": {"type": "sse", "url": "https://c.example.com", "headers": {"X-Api-Key": FAKE_HEADER}},
-        }),
-    );
-    let inventory = build_inventory(&env.roots, Workspace::Codespace);
-    let compat: Vec<_> = inventory
-        .mcp_servers
-        .iter()
-        .map(|s| (&*s.name, s.compat))
-        .collect();
+fn raw_credentials_make_a_server_not_oauth_style() {
+    use McpCompat::*;
+    let with_headers = |headers: Value| json!({"type": "http", "url": "https://x.example.com", "headers": headers});
+    let credentialed = [
+        with_headers(json!({"Authorization": "${TOKEN}"})),
+        with_headers(json!({"Proxy-Authorization": "${T}"})),
+        with_headers(json!({"X-API-Key": "${T}"})),
+        with_headers(json!({"api-key": "${T}"})),
+        with_headers(json!({"ApiKey": "${T}"})),
+        with_headers(json!({"X-Auth-Token": "${T}"})),
+        with_headers(json!({"X-Access-Token": "${T}"})),
+        with_headers(json!({"Cookie": "${T}"})),
+        // Any literal header value is a secret found by find_secrets.
+        with_headers(json!({"X-Session": FAKE_HEADER})),
+        json!({"type": "sse", "url": "https://x.example.com/mcp?api_key=abcd1234"}),
+        json!({"type": "http", "url": "https://user:pw@x.example.com/mcp"}),
+        json!({"type": "http", "url": "https://x.example.com/mcp#tok"}),
+        json!({"type": "http", "url": "https://x.example.com", "headersHelper": "get-token.sh"}),
+        json!({"type": "http", "url": "https://x.example.com", "env": {"TOKEN": FAKE_HEADER}}),
+    ];
+    for config in credentialed {
+        assert_eq!(compat_one(config.clone()), Ok, "{config}");
+    }
+}
+
+#[test]
+fn harmless_headers_do_not_count_as_credentials() {
+    use McpCompat::*;
+    for name in [
+        "Content-Type",
+        "User-Agent",
+        "X-Author",
+        "X-Keycloak-Realm",
+        "X-Monkey",
+    ] {
+        let config =
+            json!({"type": "http", "url": "https://x.example.com", "headers": {name: "${V}"}});
+        assert_eq!(compat_one(config), OAuthStyle, "{name}");
+    }
     assert_eq!(
-        compat,
-        vec![
-            ("a", McpCompat::Ok),
-            ("b", McpCompat::OAuthStyle),
-            ("c", McpCompat::Ok)
-        ]
+        compat_one(json!({"type": "http", "url": "https://b.example.com"})),
+        OAuthStyle
     );
+}
+
+#[test]
+fn a_local_headers_helper_is_local_only_and_a_relative_one_is_not() {
+    use McpCompat::*;
+    let helper =
+        |cmd: &str| json!({"type": "http", "url": "https://x.example.com", "headersHelper": cmd});
+    assert_eq!(
+        compat_one(helper("/Users/me/bin/get-token")),
+        LocalOnly(LocalOnlyReason::AbsoluteCommand)
+    );
+    assert_eq!(compat_one(helper("get-token")), Ok);
+}
+
+#[test]
+fn only_http_and_sse_can_be_oauth_style() {
+    use McpCompat::*;
+    for transport in ["ws", "sdk", "weird"] {
+        let config = json!({"type": transport, "url": "https://x.example.com"});
+        assert_eq!(compat_one(config), Ok, "{transport}");
+    }
+    for transport in ["http", "SSE"] {
+        let config = json!({"type": transport, "url": "https://x.example.com"});
+        assert_eq!(compat_one(config), OAuthStyle, "{transport}");
+    }
 }
 
 #[test]

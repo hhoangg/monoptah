@@ -1389,21 +1389,51 @@ fn classify(
             return McpCompat::LocalOnly(LocalOnlyReason::PrivateUrl);
         }
     }
-    let has_auth = object
-        .get("headers")
-        .and_then(Value::as_object)
-        .is_some_and(|headers| {
-            headers.keys().any(|k| {
-                let k = k.to_ascii_lowercase();
-                ["authorization", "key", "token", "secret", "auth"]
-                    .iter()
-                    .any(|needle| k.contains(needle))
-            })
-        });
-    if has_auth {
+    if let Some(helper) = object.get("headersHelper").and_then(Value::as_str) {
+        if is_absolute_command(helper.trim_start()) {
+            return McpCompat::LocalOnly(LocalOnlyReason::AbsoluteCommand);
+        }
+    }
+    // Only plain http/sse can be OAuth-style. Any other transport (ws, sdk, unknown) is
+    // carried config-only without the badge.
+    if !matches!(
+        server.transport.to_ascii_lowercase().as_str(),
+        "http" | "sse"
+    ) {
+        return McpCompat::Ok;
+    }
+    if has_raw_credential(server, object) {
         return McpCompat::Ok;
     }
     McpCompat::OAuthStyle
+}
+
+/// Header names that always carry a credential, compared exactly and case-insensitively.
+const CREDENTIAL_HEADERS: [&str; 8] = [
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "api-key",
+    "apikey",
+    "x-auth-token",
+    "x-access-token",
+    "cookie",
+];
+
+/// Does the server carry a raw credential of any kind (D7)? Then it is not OAuth-style:
+/// it works from its config alone. Names are never guessed by substring.
+fn has_raw_credential(server: &KitMcpServer, object: &serde_json::Map<String, Value>) -> bool {
+    if object.contains_key("headersHelper") || !server.secrets.is_empty() {
+        return true;
+    }
+    object
+        .get("headers")
+        .and_then(Value::as_object)
+        .is_some_and(|headers| {
+            headers
+                .keys()
+                .any(|k| CREDENTIAL_HEADERS.contains(&k.to_ascii_lowercase().as_str()))
+        })
 }
 
 fn is_absolute_command(command: &str) -> bool {
