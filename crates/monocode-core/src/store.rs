@@ -2,6 +2,10 @@
 mod app_access;
 pub use app_access::ArchiveTimes;
 mod contributions;
+mod location;
+pub use location::{CloudLocation, SessionLocation};
+mod cloud_rows;
+pub use cloud_rows::AppendOutcome;
 mod managed_sessions;
 mod monocode_import;
 mod monos;
@@ -10,7 +14,7 @@ mod remote;
 mod remote_legacy;
 pub use remote::{
     is_pending_cloud_environment, pending_cloud_project, RemoteProject, RemoteSession,
-    RemoteUpload, CONVERTED, SANDBOX_STOPPED_DELETE,
+    RemoteUpload, CONVERTED, MISSING_HOST, SANDBOX_STOPPED_DELETE,
 };
 pub(crate) use shared::handle as desktop_session_handle;
 mod session_metadata;
@@ -34,6 +38,38 @@ use rusqlite::{params, Connection};
 pub use shared::{HistoryPage, PAGE_TURNS};
 pub use side_threads::DesktopSideThread;
 use std::path::Path;
+
+/// Why a local write to the rows of a session that lives in the cloud is refused.
+pub(crate) const CLOUD_OWNED: &str =
+    "This conversation is in the cloud. Its messages are written from the cloud workspace.";
+
+/// Idempotent row upsert: re-writing the same rows changes nothing, and a different row at
+/// the same index replaces the old one completely.
+fn upsert_rows(
+    tx: &rusqlite::Transaction,
+    session: i64,
+    start: usize,
+    rows: &[Row],
+) -> Result<(), String> {
+    let mut stmt = tx
+        .prepare(
+            "INSERT INTO native_rows(session_id,row_ix,role,body,first,sent_at) VALUES(?1,?2,?3,?4,?5,?6)
+        ON CONFLICT(session_id,row_ix) DO UPDATE SET role=excluded.role,body=excluded.body,first=excluded.first,sent_at=excluded.sent_at",
+        )
+        .map_err(|e| e.to_string())?;
+    for (offset, row) in rows.iter().enumerate() {
+        stmt.execute(params![
+            session,
+            (start + offset) as i64,
+            row.role,
+            row.text,
+            row.first,
+            row.sent_at.and_then(|at| i64::try_from(at).ok())
+        ])
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
 
 /// Upsert of a session's agent settings JSON. The surface is fixed at creation
 /// and `Settings` does not carry it, so a stored one is kept.
@@ -946,30 +982,18 @@ impl Store {
         if self.remote_session(session)?.is_some() {
             return Err("Remote transcripts are owned by the host".into());
         }
+        // Single writer (design 4.9 R2): while the session is in the cloud, only the remote
+        // row append (`append_projected_rows`) writes its rows.
+        // TODO(part B): the local runtime itself must also be refused before it starts a turn.
+        if self.cloud_location(session)?.is_cloud() {
+            return Err(CLOUD_OWNED.into());
+        }
         if self.shared.is_some() {
             return self.shared_write_rows(session, start, rows, message_id);
         }
 
         let tx = self.conn.transaction().map_err(|e| e.to_string())?;
-        {
-            let mut stmt = tx
-                .prepare(
-                    "INSERT INTO native_rows(session_id,row_ix,role,body,first,sent_at) VALUES(?1,?2,?3,?4,?5,?6)
-                ON CONFLICT(session_id,row_ix) DO UPDATE SET body=excluded.body",
-                )
-                .map_err(|e| e.to_string())?;
-            for (offset, row) in rows.iter().enumerate() {
-                stmt.execute(params![
-                    session,
-                    (start + offset) as i64,
-                    row.role,
-                    row.text,
-                    row.first,
-                    row.sent_at.and_then(|at| i64::try_from(at).ok())
-                ])
-                .map_err(|e| e.to_string())?;
-            }
-        }
+        upsert_rows(&tx, session, start, rows)?;
         if !rows.is_empty() {
             tx.execute(
                 "UPDATE native_sessions SET updated_at=?2 WHERE id=?1",
@@ -1232,6 +1256,10 @@ impl Store {
     ) -> Result<(), String> {
         // Resolve the folder first; the persisted id is gone after deletion.
         let dir = self.thread_dir(id).ok().flatten();
+        let cloud_cursor = match self.cloud_location(id) {
+            Ok(SessionLocation::Cloud(l)) => Some((l.environment_id, l.host_session_id)),
+            _ => None,
+        };
         // A converted cloud session's host copy may come back once its local copy is gone.
         let origin = self
             .setting(&format!("codespace-origin:{id}"))
@@ -1239,6 +1267,9 @@ impl Store {
             .flatten()
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
         delete_rows(self)?;
+        if let Some((env, host)) = cloud_cursor {
+            let _ = self.save_setting(&Self::synced_key(&env, &host), "");
+        }
         if let Some(origin) = origin {
             // The refs kept for a restore that never happened; after a restore they hold the
             // other saved branches, which stay.
@@ -1278,7 +1309,7 @@ impl Store {
         tx.execute("DELETE FROM native_reminders WHERE session_id=?1", [id])
             .map_err(|e| e.to_string())?;
         tx.execute(
-            "DELETE FROM native_settings WHERE key IN (?1,?2,?3,?5,?6,?7,?8,?9,?10,?11) OR key LIKE ?4",
+            "DELETE FROM native_settings WHERE key IN (?1,?2,?3,?5,?6,?7,?8,?9,?10,?11,?12,?13) OR key LIKE ?4",
             params![
                 format!("agent:{id}"),
                 format!("context:{id}"),
@@ -1290,7 +1321,9 @@ impl Store {
                 format!("automation:{id}"),
                 format!("mono-retired:{id}"),
                 format!("archive-times:{id}"),
-                format!("codespace-origin:{id}")
+                format!("codespace-origin:{id}"),
+                format!("cloud-location:{id}"),
+                format!("cloud-sync-error:{id}")
             ],
         )
         .map_err(|e| e.to_string())?;

@@ -1465,19 +1465,28 @@ default):
   a codespace or with a different `claude` version. Re-check at F4-3a manual time. A
   file in the right dir with wrong `cwd` fields was not tested.
 - **Account notes:** no rate-limit incident; one profile answered "Not logged in".
-- **Row-append approach for F4-L (code reading):** remote rows are already projected by
-  `Store::project_remote_history` (blocks to rows; one block can yield several rows) and
-  the runtime sends `{start: prefix, rows: rows[prefix..]}`. For the linked LOCAL session
-  use the same index diff: `H` = projected host rows, `L` = local `native_rows` in
-  `row_ix` order, `p` = longest common prefix (compare role and text), then
-  `write_rows(local, p, &H[p..])`, an idempotent `ON CONFLICT(session_id,row_ix)` upsert
-  (today it updates only `body`: extend it to `role`, `first`, `sent_at`). If `H` is
-  shorter than `L`, add a small `truncate_rows(session, from)`. Keep a cursor
+- **Row-append approach for F4-L (offset model):** remote rows are already projected by
+  `Store::project_remote_history` (blocks to rows; one block can yield several rows). For
+  the linked LOCAL session, with `H` = projected host rows and `L` = local `native_rows`
+  in `row_ix` order, the Host session created by a move holds only the turns that ran in
+  the cloud, so Host row `i` is local row `moved_at_row + i`. Compare `L[moved_at_row..]`
+  with `H` (longest common prefix `p` by role and text), upsert `H[p..]` at
+  `moved_at_row + p` (an idempotent `ON CONFLICT(session_id,row_ix)` upsert that sets
+  role, body, first and sent_at), and delete rows from `moved_at_row + H.len()`. Rows
+  before `moved_at_row` are never compared, written or deleted. Keep a cursor
   `cloud-synced:{env}:{host_id}` (revision) in `native_settings` next to
-  `cloud-converted:`, mark delivery with `message_id = "cloud:{host_id}:{revision}"`, and
-  note `write_rows` refuses remote sessions ("Remote transcripts are owned by the host"),
-  so the target must be the local session id. Streaming rows (`streaming:true`) are
-  rewritten as they finalise.
+  `cloud-converted:`. `write_rows` refuses remote sessions ("Remote transcripts are owned
+  by the host"), so the target is the local session id. Streaming rows (`streaming:true`)
+  are rewritten as they finalise.
+  - **Preconditions.** A Host session created by a move starts with ZERO blocks:
+    `sessions.import` must only install the JSONL and bind the id, and must not project
+    the imported JSONL into blocks. Reusing a Host session that already has blocks would
+    duplicate history after the move point. The first sync (no cursor) requires
+    `local row count == moved_at_row`; otherwise it refuses without writing (a local turn
+    was interrupted between the move point and the flip).
+  - The append refuses unless the stored location is Cloud and names the same environment
+    and Host session, so a flip to Local or a deletion during an observation writes
+    nothing.
 
 ### 4.9 Risks of sharing one harness session id across machines
 

@@ -40,6 +40,10 @@ fn update(status: impl Into<String>, finished: bool) -> Update {
         finished,
     }
 }
+/// A terminal update that only carries an error message.
+pub(super) fn failed(error: impl Into<String>) -> Update {
+    update(error, true)
+}
 fn command(kind: &str, session_id: Option<&str>) -> Value {
     let mut value = json!({"type":kind,"commandId":monocode_core::mono::new_id()});
     if let Some(id) = session_id {
@@ -477,9 +481,46 @@ pub(crate) fn run(
     cancel: Arc<AtomicBool>,
     tx: async_channel::Sender<Update>,
 ) {
+    run_with_default_client(summary, None, prompt, settings, controls, store, cancel, tx)
+}
+/// Runs `summary` (a Host session record) for a local session that lives in the cloud:
+/// the Host rows are appended to the local session `mirror`.
+#[allow(clippy::too_many_arguments, reason = "Mirrors the turn worker inputs")]
+pub(crate) fn run_mirrored(
+    summary: Session,
+    mirror: i64,
+    prompt: String,
+    settings: Settings,
+    controls: std::sync::mpsc::Receiver<Control>,
+    store: Database,
+    cancel: Arc<AtomicBool>,
+    tx: async_channel::Sender<Update>,
+) {
+    run_with_default_client(
+        summary,
+        Some(mirror),
+        prompt,
+        settings,
+        controls,
+        store,
+        cancel,
+        tx,
+    )
+}
+#[allow(clippy::too_many_arguments, reason = "Mirrors the turn worker inputs")]
+fn run_with_default_client(
+    summary: Session,
+    mirror: Option<i64>,
+    prompt: String,
+    settings: Settings,
+    controls: std::sync::mpsc::Receiver<Control>,
+    store: Database,
+    cancel: Arc<AtomicBool>,
+    tx: async_channel::Sender<Update>,
+) {
     match monocode_core::remote::default_connections() {
-        Ok(client) => run_with_client(
-            client, summary, prompt, settings, controls, store, cancel, tx,
+        Ok(client) => run_with_client_mirrored(
+            client, summary, mirror, prompt, settings, controls, store, cancel, tx,
         ),
         Err(error) => {
             let _ = tx.send_blocking(update(error, true));
@@ -494,13 +535,57 @@ pub(crate) fn run_with_client(
     client: Arc<monocode_core::remote::Connections>,
     summary: Session,
     prompt: String,
+    settings: Settings,
+    controls: std::sync::mpsc::Receiver<Control>,
+    store: Database,
+    cancel: Arc<AtomicBool>,
+    tx: async_channel::Sender<Update>,
+) {
+    run_with_client_mirrored(
+        client, summary, None, prompt, settings, controls, store, cancel, tx,
+    )
+}
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Mirrors the turn worker inputs while injecting the remote transport for isolation"
+)]
+pub(crate) fn run_with_client_mirrored(
+    client: Arc<monocode_core::remote::Connections>,
+    summary: Session,
+    mirror: Option<i64>,
+    prompt: String,
     mut settings: Settings,
     controls: std::sync::mpsc::Receiver<Control>,
     store: Database,
     cancel: Arc<AtomicBool>,
     tx: async_channel::Sender<Update>,
 ) {
-    let mut latest_rows = Vec::new();
+    // For a mirrored run the open view shows the local rows, so diff against them.
+    let mut latest_rows = match mirror {
+        Some(local) => match locked(&store).and_then(|s| s.load(local)) {
+            Ok(history) => history.rows,
+            Err(error) => {
+                let _ = tx.send_blocking(update(error, true));
+                return;
+            }
+        },
+        None => Vec::new(),
+    };
+    // Local rows before the move point: the Host session holds only the cloud turns, so the
+    // view is those rows followed by the Host rows, and the Host row `i` is view row `base + i`.
+    let pre_move: Vec<Row> = match mirror {
+        Some(local) => {
+            let base = locked(&store)
+                .and_then(|s| s.cloud_location(local))
+                .ok()
+                .and_then(|l| l.cloud().map(|c| c.moved_at_row))
+                .unwrap_or(0);
+            latest_rows[..base.min(latest_rows.len())].to_vec()
+        }
+        None => Vec::new(),
+    };
+    // A failed row append is shown, never allowed to hide the running turn.
+    let mut sync_error: Option<String> = None;
     let mut attaching_run = false;
     let result = (|| -> Result<(), String> {
         if tx.is_closed() {
@@ -513,6 +598,13 @@ pub(crate) fn run_with_client(
         let mut binding = locked(&store)?
             .remote_session(summary.id)?
             .ok_or("Remote session no longer exists")?;
+        if let Some(local) = mirror {
+            // Strictly the Host session the location names; never create or switch one.
+            let (_, record) = locked(&store)?.cloud_host_record(local)?;
+            if record.session_id.is_none() || record.session_id != binding.session_id {
+                return Err(monocode_core::store::MISSING_HOST.into());
+            }
+        }
         let action = settings
             .remote_action
             .take()
@@ -588,6 +680,9 @@ pub(crate) fn run_with_client(
                 }
             }
             if binding.session_id.is_none() {
+                if mirror.is_some() {
+                    return Err(monocode_core::store::MISSING_HOST.into());
+                }
                 let mut create = command("create", None);
                 create["projectId"] = json!(binding.project.project_id);
                 create["harness"] = json!(summary.provider);
@@ -702,14 +797,37 @@ pub(crate) fn run_with_client(
                     &id,
                 );
                 let (history, _) = monocode_core::store::Store::project_remote_history(&projected)?;
+                if let Some(local) = mirror {
+                    // The only writer of this session's rows while it is in the cloud.
+                    // Idempotent: a repeated or half-written sync is repaired, not doubled.
+                    let mut guard = locked(&store)?;
+                    sync_error = guard
+                        .append_projected_rows(
+                            local,
+                            &binding.project.environment_id,
+                            &id,
+                            revision.unwrap_or(0),
+                            &history.rows,
+                        )
+                        .err();
+                    if let Some(message) = &sync_error {
+                        // Durable, so the UI can still say it after a reload.
+                        let _ = guard.record_cloud_sync_error(local, message);
+                    }
+                }
+                let mut view = pre_move.clone();
+                view.extend(history.rows);
                 let prefix = latest_rows
                     .iter()
-                    .zip(&history.rows)
+                    .zip(&view)
                     .take_while(|(known, next)| known == next)
                     .count();
                 next.start = prefix;
-                next.rows = history.rows[prefix..].to_vec();
-                latest_rows = history.rows;
+                next.rows = view[prefix..].to_vec();
+                latest_rows = view;
+            }
+            if let Some(error) = &sync_error {
+                next.status = error.clone();
             }
             next.provider_id = snapshot["session"]["providerSessionId"]
                 .as_str()

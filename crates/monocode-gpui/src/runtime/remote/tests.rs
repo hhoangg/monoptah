@@ -1016,3 +1016,433 @@ fn a_queued_send_that_fails_before_the_journal_is_never_acknowledged() {
     assert!(updates.iter().all(|u| u.delivered.is_none()));
     assert!(updates.last().unwrap().finished);
 }
+
+const PRE_MOVE: usize = 10;
+
+fn cloud_at() -> monocode_core::store::SessionLocation {
+    monocode_core::store::SessionLocation::Cloud(monocode_core::store::CloudLocation {
+        cloud: monocode_core::cloud_sessions::CloudRef::codespace("octo-abc"),
+        environment_id: "env".into(),
+        project_id: "project".into(),
+        host_session_id: "host-session".into(),
+        remote_cwd: "/host/repo".into(),
+        local_cwd: "/Users/me/repo".into(),
+        moved_at_row: PRE_MOVE,
+        pushed_branch: None,
+    })
+}
+
+fn pre_move_rows() -> Vec<Row> {
+    (0..PRE_MOVE)
+        .map(|i| Row {
+            role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+            text: format!("local {i}"),
+            first: true,
+            sent_at: Some(i as u64 + 1),
+        })
+        .collect()
+}
+
+/// A moved session: ten local rows written before the move, and a Host session (made by
+/// the move) that holds only the turns that run in the cloud.
+fn mirrored_pair(store: &Database) -> (i64, RemoteSession) {
+    let remote = {
+        let mut bound = binding(store);
+        bound.session_id = Some("host-session".into());
+        journal(store, &bound).unwrap();
+        bound
+    };
+    let mut store = locked(store).unwrap();
+    let local = store.create("codex", "/Users/me/repo").unwrap();
+    store.write_rows(local.id, 0, &pre_move_rows()).unwrap();
+    store
+        .link_remote_session(remote.summary.id, Some(local.id))
+        .unwrap();
+    store.set_cloud_location(local.id, &cloud_at()).unwrap();
+    let remote = store.remote_session(remote.summary.id).unwrap().unwrap();
+    (local.id, remote)
+}
+
+fn run_mirrored_attach(
+    host: &Host,
+    store: &Database,
+    local: i64,
+    remote: &RemoteSession,
+) -> Vec<Update> {
+    let (tx, rx) = async_channel::unbounded();
+    let (_controls_tx, controls) = std::sync::mpsc::channel();
+    run_with_client_mirrored(
+        host.client.clone(),
+        remote.summary.clone(),
+        Some(local),
+        String::new(),
+        Settings {
+            remote_action: Some(json!({"type":"attach"})),
+            ..Default::default()
+        },
+        controls,
+        store.clone(),
+        Arc::new(AtomicBool::new(false)),
+        tx,
+    );
+    let mut all = vec![receive(&rx)];
+    while !all.last().unwrap().finished {
+        all.push(receive(&rx));
+    }
+    all
+}
+
+fn attach_mirrored(host: &Host, store: &Database, local: i64, remote: &RemoteSession) {
+    let all = run_mirrored_attach(host, store, local, remote);
+    assert_eq!(all.last().unwrap().status, "Ready");
+}
+
+/// The rows the runtime derives from a Host snapshot (attachments qualified first).
+fn host_rows(snapshot: &Value) -> Vec<Row> {
+    let mut qualified = snapshot.clone();
+    monocode_core::remote::attachments::qualify_snapshot(&mut qualified, "env", "host-session");
+    monocode_core::store::Store::project_remote_history(&qualified)
+        .unwrap()
+        .0
+        .rows
+}
+
+fn blocks_snapshot(revision: u64, blocks: Value) -> Value {
+    let mut value = snapshot("idle", revision);
+    value["session"]["blocks"] = blocks;
+    value
+}
+
+fn local_rows(store: &Database, local: i64) -> Vec<Row> {
+    locked(store).unwrap().load(local).unwrap().rows
+}
+
+fn serve(current: &Arc<Mutex<Value>>) -> Host {
+    let served = current.clone();
+    Host::new(move |_| Some(json!({"kind":"snapshot","value":served.lock().unwrap().clone()})))
+}
+
+#[test]
+fn mirrored_run_appends_cloud_rows_after_the_pre_move_rows_once() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let (local, remote) = mirrored_pair(&store);
+    let current = Arc::new(Mutex::new(blocks_snapshot(
+        2,
+        json!([
+            {"id":"u","role":"user","text":"Question"},
+            {"id":"a","role":"assistant","text":"Answer"}
+        ]),
+    )));
+    let host = serve(&current);
+    // The first sync, and a re-sync: the cloud turn lands once, after the ten local rows.
+    let first = run_mirrored_attach(&host, &store, local, &remote);
+    assert_eq!(first.last().unwrap().status, "Ready");
+    attach_mirrored(&host, &store, local, &remote);
+    let rows = local_rows(&store, local);
+    let expected: Vec<Row> = pre_move_rows()
+        .into_iter()
+        .chain(host_rows(&current.lock().unwrap()))
+        .collect();
+    assert_eq!(rows, expected);
+    // The view update starts after the pre-move rows, not at 0.
+    let patch = first.iter().find(|u| !u.rows.is_empty()).unwrap();
+    assert_eq!(patch.start, PRE_MOVE);
+    let guard = locked(&store).unwrap();
+    assert_eq!(
+        guard
+            .remote_session(remote.summary.id)
+            .unwrap()
+            .unwrap()
+            .linked_to,
+        Some(local)
+    );
+    assert!(
+        !guard
+            .sessions()
+            .unwrap()
+            .iter()
+            .any(|s| s.id == local && s.cwd.starts_with("remote://"))
+    );
+}
+
+#[test]
+fn mirrored_run_repairs_a_partial_write_and_follows_a_shorter_host_history() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let (local, remote) = mirrored_pair(&store);
+    let current = Arc::new(Mutex::new(blocks_snapshot(
+        3,
+        json!([
+            {"id":"u","role":"user","text":"One"},
+            {"id":"a","role":"assistant","text":"Two"},
+            {"id":"v","role":"user","text":"Three"}
+        ]),
+    )));
+    let host = serve(&current);
+    attach_mirrored(&host, &store, local, &remote);
+    // Tear the first cloud row after the move, as an interrupted earlier write would.
+    {
+        let mut guard = locked(&store).unwrap();
+        guard.reset_cloud_location_to_local(local).unwrap();
+        guard.truncate_rows(local, PRE_MOVE + 1).unwrap();
+        guard
+            .write_rows(
+                local,
+                PRE_MOVE,
+                &[Row {
+                    role: "user".into(),
+                    text: "torn".into(),
+                    first: true,
+                    sent_at: None,
+                }],
+            )
+            .unwrap();
+        guard
+            .link_remote_session(remote.summary.id, Some(local))
+            .unwrap();
+        guard.set_cloud_location(local, &cloud_at()).unwrap();
+        guard
+            .save_setting("cloud-synced:env:host-session", "3")
+            .unwrap();
+    }
+    attach_mirrored(&host, &store, local, &remote);
+    let all = |c: &Arc<Mutex<Value>>| -> Vec<Row> {
+        pre_move_rows()
+            .into_iter()
+            .chain(host_rows(&c.lock().unwrap()))
+            .collect()
+    };
+    assert_eq!(local_rows(&store, local), all(&current));
+    // The Host history shrinks: only cloud surplus goes, the ten local rows stay.
+    *current.lock().unwrap() = blocks_snapshot(4, json!([{"id":"u","role":"user","text":"One"}]));
+    attach_mirrored(&host, &store, local, &remote);
+    assert_eq!(local_rows(&store, local), all(&current));
+    assert_eq!(&local_rows(&store, local)[..PRE_MOVE], &pre_move_rows()[..]);
+}
+
+#[test]
+fn a_failed_row_append_is_shown_but_the_observation_continues() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let (local, remote) = mirrored_pair(&store);
+    // The local rows before the move point went missing: the Host rows have no place to go.
+    {
+        let mut guard = locked(&store).unwrap();
+        guard.reset_cloud_location_to_local(local).unwrap();
+        guard.truncate_rows(local, 5).unwrap();
+        guard
+            .link_remote_session(remote.summary.id, Some(local))
+            .unwrap();
+        guard.set_cloud_location(local, &cloud_at()).unwrap();
+    }
+    let current = Arc::new(Mutex::new(blocks_snapshot(
+        2,
+        json!([{"id":"u","role":"user","text":"Question"}]),
+    )));
+    let host = serve(&current);
+    let all = run_mirrored_attach(&host, &store, local, &remote);
+    let last = all.last().unwrap();
+    assert!(last.finished);
+    assert!(
+        last.status.contains("Nothing was overwritten"),
+        "{}",
+        last.status
+    );
+    // The turn stayed observable: the view still got the Host rows.
+    assert!(
+        all.iter()
+            .any(|u| u.rows.iter().any(|r| r.text == "Question"))
+    );
+    assert_eq!(local_rows(&store, local).len(), 5);
+    // The failure is durable for the UI, and the next good append clears it.
+    let message = locked(&store).unwrap().cloud_sync_error(local).unwrap();
+    assert!(message.unwrap().contains("Nothing was overwritten"));
+}
+
+#[test]
+fn a_location_flip_during_an_observation_leaves_the_pre_move_rows_alone() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let (local, remote) = mirrored_pair(&store);
+    let flipped = store.clone();
+    let mut polls = 0;
+    let host = Host::new(move |_| {
+        polls += 1;
+        if polls == 3 {
+            locked(&flipped)
+                .unwrap()
+                .reset_cloud_location_to_local(local)
+                .unwrap();
+        }
+        let mut value = snapshot(if polls < 5 { "running" } else { "idle" }, polls);
+        value["session"]["blocks"] = json!([
+            {"id":"u","role":"user","text":format!("Question {polls}")}
+        ]);
+        Some(json!({"kind":"snapshot","value":value}))
+    });
+    let _ = run_mirrored_attach(&host, &store, local, &remote);
+    let rows = local_rows(&store, local);
+    assert_eq!(&rows[..PRE_MOVE], &pre_move_rows()[..]);
+    // Nothing from after the flip (poll 3 on) was written.
+    assert!(rows.len() <= PRE_MOVE + 2);
+    assert!(
+        rows[PRE_MOVE..]
+            .iter()
+            .all(|r| r.text == "[]" || r.text == "Question 1" || r.text == "Question 2")
+    );
+}
+
+#[test]
+fn run_turn_picks_the_remote_runtime_for_a_cloud_location_and_refuses_a_missing_link() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let local = locked(&store)
+        .unwrap()
+        .create("codex", "/Users/me/repo")
+        .unwrap();
+    assert!(cloud_target(&store, local.id).unwrap().is_none());
+    locked(&store)
+        .unwrap()
+        .set_cloud_location(local.id, &cloud_at())
+        .unwrap();
+    assert!(
+        cloud_target(&store, local.id)
+            .unwrap_err()
+            .contains("missing")
+    );
+    let (tx, rx) = async_channel::unbounded();
+    let (_controls_tx, controls) = std::sync::mpsc::channel();
+    run_turn(
+        local.clone(),
+        "hello".into(),
+        Settings::default(),
+        controls,
+        store.clone(),
+        Arc::new(AtomicBool::new(false)),
+        tx,
+    );
+    let result = receive(&rx);
+    assert!(
+        result.finished && result.status.contains("missing"),
+        "{}",
+        result.status
+    );
+    // A linked record without the location's Host session id is refused (never a new session).
+    let remote = {
+        let guard = locked(&store).unwrap();
+        let project = guard
+            .remember_remote_project("env", &json!({"id":"project","cwd":"/host/repo"}))
+            .unwrap();
+        let remote = guard.create("codex", &project.key).unwrap();
+        guard
+            .link_remote_session(remote.id, Some(local.id))
+            .unwrap();
+        remote
+    };
+    assert!(
+        cloud_target(&store, local.id)
+            .unwrap_err()
+            .contains("missing")
+    );
+    // Bound to the location's Host session: it is the target.
+    let mut record = locked(&store)
+        .unwrap()
+        .remote_session(remote.id)
+        .unwrap()
+        .unwrap();
+    record.session_id = Some("host-session".into());
+    journal(&store, &record).unwrap();
+    let (target, mirror) = cloud_target(&store, local.id).unwrap().unwrap();
+    assert_eq!((target.id, mirror), (remote.id, local.id));
+    // A stale link on an older record is ignored once the new record is linked.
+    let stale = {
+        let guard = locked(&store).unwrap();
+        let project = guard
+            .remember_remote_project("env", &json!({"id":"project","cwd":"/host/repo"}))
+            .unwrap();
+        let other = guard.create("codex", &project.key).unwrap();
+        guard.link_remote_session(other.id, Some(local.id)).unwrap();
+        other
+    };
+    assert!(cloud_target(&store, local.id).is_err(), "{}", stale.id);
+}
+
+#[test]
+fn a_mirrored_run_never_creates_a_new_host_session() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let (local, remote) = mirrored_pair(&store);
+    // The Host record lost its session id: sending must error, not create a Host session.
+    let mut record = locked(&store)
+        .unwrap()
+        .remote_session(remote.summary.id)
+        .unwrap()
+        .unwrap();
+    record.session_id = None;
+    journal(&store, &record).unwrap();
+    let host = Host::new(|_| panic!("nothing may be dispatched"));
+    let (tx, rx) = async_channel::unbounded();
+    let (_controls_tx, controls) = std::sync::mpsc::channel();
+    run_with_client_mirrored(
+        host.client.clone(),
+        remote.summary.clone(),
+        Some(local),
+        "hello".into(),
+        Settings {
+            model: Some("codex:fixture".into()),
+            ..Default::default()
+        },
+        controls,
+        store.clone(),
+        Arc::new(AtomicBool::new(false)),
+        tx,
+    );
+    let result = receive(&rx);
+    assert!(
+        result.finished && result.status.contains("missing"),
+        "{}",
+        result.status
+    );
+    assert!(
+        locked(&store)
+            .unwrap()
+            .remote_session(remote.summary.id)
+            .unwrap()
+            .unwrap()
+            .outbox
+            .is_empty()
+    );
+}
+
+#[test]
+fn unlinking_during_an_observation_is_not_undone_by_the_journal() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let (local, remote) = mirrored_pair(&store);
+    let unlinked = store.clone();
+    let remote_id = remote.summary.id;
+    let mut polls = 0;
+    let host = Host::new(move |_| {
+        polls += 1;
+        if polls == 2 {
+            locked(&unlinked)
+                .unwrap()
+                .link_remote_session(remote_id, None)
+                .unwrap();
+        }
+        let mut value = snapshot(if polls < 4 { "running" } else { "idle" }, polls);
+        value["session"]["title"] = json!(format!("Title {polls}"));
+        Some(json!({"kind":"snapshot","value":value}))
+    });
+    let _ = run_mirrored_attach(&host, &store, local, &remote);
+    assert_eq!(
+        locked(&store)
+            .unwrap()
+            .remote_session(remote_id)
+            .unwrap()
+            .unwrap()
+            .linked_to,
+        None
+    );
+}
