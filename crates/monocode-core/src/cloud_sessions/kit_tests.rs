@@ -1397,17 +1397,80 @@ fn a_hard_link_to_a_credentials_file_is_refused_and_other_hard_links_are_a_known
 #[cfg(unix)]
 #[test]
 fn a_folder_named_like_a_credentials_folder_inside_a_skill_excludes_it() {
-    for dir in [".ssh", ".aws", ".gnupg", ".kube", ".docker"] {
+    for (dir, file) in [
+        (".ssh", "f"),
+        (".aws", "f"),
+        (".gnupg", "f"),
+        (".docker", "config.json"),
+        (".kube", "config"),
+    ] {
         let env = env();
         let skills = env.roots.claude_home.join("skills");
         skill(&skills, "s", "x");
-        write(&skills.join("s").join(dir).join("f"), "fake");
+        write(&skills.join("s").join(dir).join(file), "fake");
         let inventory = build_inventory(&env.roots, Workspace::Codespace);
         assert_eq!(
             inventory.skills[0].exclusion,
             Some(Exclusion::SensitiveContent),
             "{dir}"
         );
+    }
+}
+
+#[test]
+fn ordinary_docker_and_kube_folders_do_not_exclude_an_item() {
+    let env = env();
+    let skills = env.roots.claude_home.join("skills");
+    skill(&skills, "d", "x");
+    write(&skills.join("d/.docker/Dockerfile"), "FROM scratch");
+    skill(&skills, "k", "x");
+    write(&skills.join("k/.kube/deploy.yaml"), "kind: Deployment");
+    skill(&skills, "p", "x");
+    write(&skills.join("p/docker/Dockerfile"), "FROM scratch");
+    skill(&skills, "kc", "x");
+    write(
+        &skills.join("kc/.kube/other.yaml"),
+        "apiVersion: v1\nclusters:\n- name: x\n",
+    );
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    let rows: Vec<_> = inventory
+        .skills
+        .iter()
+        .map(|s| (s.name.as_str(), s.exclusion))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("d", None),
+            ("k", None),
+            ("kc", Some(Exclusion::SensitiveContent)),
+            ("p", None),
+        ]
+    );
+}
+
+#[test]
+fn unparsable_and_fragment_urls_hide_their_secrets() {
+    for url in [
+        "https://u:{}@host:99999/",
+        "https://host/p#token={}",
+        "https://host/p?x=1#{}",
+    ] {
+        let env = env();
+        let build = |secret: &str| {
+            servers_json(
+                &env,
+                json!({"b": {"type": "http", "url": url.replace("{}", secret)}}),
+            );
+            let inventory = build_inventory(&env.roots, Workspace::Codespace);
+            (inventory.mcp_servers[0].clone(), inventory.content_hash)
+        };
+        let (one, content_one) = build("s3cr3t-one");
+        let (two, content_two) = build("s3cr3t-two");
+        assert!(!one.secrets.is_empty(), "{url}");
+        assert_eq!(one.config_hash, two.config_hash, "{url}");
+        assert_eq!(content_one, content_two, "{url}");
+        assert_ne!(one.secrets_digest, two.secrets_digest, "{url}");
     }
 }
 
@@ -1691,6 +1754,123 @@ mod roots {
         let inventory = build_inventory(&roots, Workspace::Codespace);
         assert_eq!(inventory.skills.len(), 1);
         assert_eq!(inventory.skills[0].exclusion, Some(Exclusion::UnsafeRoot));
+    }
+
+    fn data_dir(env: &Env) -> PathBuf {
+        env.roots
+            .home
+            .join("Library/Application Support/com.monoptah.desktop")
+    }
+
+    #[test]
+    fn links_into_the_apps_data_and_the_codex_home_are_refused() {
+        let env = env();
+        let data = data_dir(&env);
+        write(&data.join("provider-accounts/codex/work/auth.json"), "fake");
+        write(&data.join("provider-accounts/codex/work/SKILL.md"), "x");
+        write(&env.roots.home.join(".codex/auth.json"), "fake");
+        write(&env.roots.home.join(".codex/SKILL.md"), "x");
+        write(&data.join("SKILL.md"), "x");
+        write(&data.join("provider-accounts/SKILL.md"), "x");
+        let skills = env.roots.claude_home.join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        for (name, target) in [
+            ("work", data.join("provider-accounts/codex/work")),
+            ("accounts", data.join("provider-accounts")),
+            ("data", data.clone()),
+            ("codex", env.roots.home.join(".codex")),
+        ] {
+            symlink(target, skills.join(name)).unwrap();
+        }
+        skill(&skills, "normal", "x");
+        let rows: Vec<_> = build_inventory(&env.roots, Workspace::Codespace)
+            .skills
+            .iter()
+            .map(|s| (s.name.clone(), s.exclusion))
+            .collect();
+        let refused = Some(Exclusion::UnsafeRoot);
+        assert_eq!(
+            rows,
+            vec![
+                ("accounts".to_string(), refused),
+                ("codex".to_string(), refused),
+                ("data".to_string(), refused),
+                ("normal".to_string(), None),
+                ("work".to_string(), refused),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_account_dirs_own_skills_are_still_offered() {
+        let env = env();
+        let account = data_dir(&env).join("provider-accounts/claude/acct");
+        skill(&account.join("skills"), "mine", "x");
+        let roots = KitRoots {
+            account_dir: Some(account),
+            ..env.roots.clone()
+        };
+        let inventory = build_inventory(&roots, Workspace::Codespace);
+        assert_eq!(inventory.skills.len(), 1);
+        assert_eq!(inventory.skills[0].exclusion, None);
+    }
+
+    #[test]
+    fn credentials_are_indexed_before_a_noisy_folder_and_a_cut_short_index_is_incomplete() {
+        let env = env();
+        let skills = env.roots.claude_home.join("skills");
+        skill(&skills, "leak", "x");
+        write(&env.roots.home.join(".ssh/id"), "fake");
+        std::fs::hard_link(env.roots.home.join(".ssh/id"), skills.join("leak/id.txt")).unwrap();
+        let noisy = env.roots.home.join(".docker/logs");
+        std::fs::create_dir_all(&noisy).unwrap();
+        for ix in 0..20_100 {
+            std::fs::write(noisy.join(format!("{ix}.log")), "").unwrap();
+        }
+        let inventory = build_inventory(&env.roots, Workspace::Codespace);
+        assert_eq!(
+            inventory.skills[0].exclusion,
+            Some(Exclusion::HardLinkElsewhere)
+        );
+        assert!(inventory.incomplete);
+    }
+
+    #[test]
+    fn an_exhausted_budget_before_indexing_marks_the_inventory_incomplete() {
+        let env = env();
+        write(&env.roots.home.join(".ssh/id"), "fake");
+        let inventory = build_inventory_budgeted(
+            &env.roots,
+            Workspace::Codespace,
+            &signed_in,
+            std::time::Duration::ZERO,
+        );
+        assert!(inventory.incomplete);
+        let normal = build_inventory(&env.roots, Workspace::Codespace);
+        assert!(!normal.incomplete);
+    }
+
+    #[test]
+    fn a_symlinked_ssh_folder_is_indexed_through_its_target() {
+        let env = env();
+        write(&env.roots.home.join("dotfiles/ssh/id"), "fake");
+        symlink(
+            env.roots.home.join("dotfiles/ssh"),
+            env.roots.home.join(".ssh"),
+        )
+        .unwrap();
+        let skills = env.roots.claude_home.join("skills");
+        skill(&skills, "leak", "x");
+        std::fs::hard_link(
+            env.roots.home.join("dotfiles/ssh/id"),
+            skills.join("leak/id.txt"),
+        )
+        .unwrap();
+        let inventory = build_inventory(&env.roots, Workspace::Codespace);
+        assert_eq!(
+            inventory.skills[0].exclusion,
+            Some(Exclusion::HardLinkElsewhere)
+        );
     }
 
     #[test]

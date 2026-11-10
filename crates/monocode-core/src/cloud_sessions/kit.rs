@@ -190,6 +190,8 @@ pub enum SecretLocation {
     UrlQuery,
     /// The URL carries `user:password@`.
     UrlUserinfo,
+    /// The URL carries a `#fragment`.
+    UrlFragment,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -371,9 +373,10 @@ pub fn build_inventory_budgeted(
     budget: Duration,
 ) -> KitInventory {
     let home = std::fs::canonicalize(&roots.home).unwrap_or_else(|_| roots.home.clone());
-    let guard = Guard::new(roots, &home);
+    let begun = Instant::now();
+    let guard = Guard::new(roots, &home, begun, budget);
     let started = Clock {
-        started: Instant::now(),
+        started: begun,
         budget,
         raw_home: &roots.home,
         project: &roots.project,
@@ -442,7 +445,8 @@ pub fn build_inventory_budgeted(
     }
     inventory.scan_timed_out = timed_out;
     inventory.key_unavailable = key_missing;
-    inventory.incomplete = timed_out || key_missing;
+    // A credential index cut short means a hard link to a credential file could be missed.
+    inventory.incomplete = timed_out || key_missing || !guard.index_complete;
     inventory.total_compressed = total_compressed(&inventory);
     // A timed-out item has no size, so the total is only a lower bound: report over-cap.
     inventory.over_total_cap = timed_out || inventory.total_compressed > MAX_KIT_COMPRESSED_BYTES;
@@ -528,73 +532,141 @@ const SYSTEM_DIRS: [&str; 8] = [
 
 /// Places an item must never reach, and the identity of credential files.
 struct Guard {
-    /// Credentials folders and files, the claude config dirs and the app data dir. An item
-    /// root may not be one of these or contain one. Walking into one is refused too.
+    /// Credentials folders and files and the claude config dirs. An item root may not be
+    /// one of these or contain one. Walking into one is refused too.
     forbidden: Vec<PathBuf>,
+    /// The app's own dirs (data dir, `provider-accounts`, account dirs, the key dir). A
+    /// root may not be one of these, contain one, or live UNDER one (except the
+    /// `skills` and `plugins` folders of the active config dirs, see `exempt`).
+    app: Vec<PathBuf>,
+    /// The `skills` and `plugins` folders of the active claude config dirs, where real
+    /// items live even when that dir sits inside an app dir.
+    exempt: Vec<PathBuf>,
     /// (device, inode) of regular files found under the credentials folders, to spot a
     /// hard link to one of them.
     secret_files: HashSet<(u64, u64)>,
+    /// False when the scan for `secret_files` ran out of time or entries, so a hard link
+    /// to a credential file may go unnoticed.
+    index_complete: bool,
 }
 
 /// Entries read when collecting credential file identities.
 const MAX_GUARD_ENTRIES: usize = 20_000;
 
 /// Folder names that are never part of a skill or plugin, wherever they sit.
-const SENSITIVE_NAMES: [&str; 5] = [".ssh", ".aws", ".gnupg", ".kube", ".docker"];
+const SENSITIVE_NAMES: [&str; 3] = [".ssh", ".aws", ".gnupg"];
+
+/// Credential locations under `$HOME`, in the order they are indexed: the small and
+/// important ones first, the folders that may hold logs and caches last.
+const INDEXED_HOME_PATHS: [&str; 9] = [
+    ".claude/.credentials.json",
+    ".ssh",
+    ".aws",
+    ".config/gh",
+    ".gnupg",
+    ".codex/auth.json",
+    ".kube",
+    ".docker",
+    ".config/gcloud",
+];
+
+/// Folders that hold the app's own data, as the app finds them plus the per-OS layouts
+/// under the given home (the home may differ from the process one).
+fn app_data_dirs(home: &Path) -> Vec<PathBuf> {
+    let id = crate::brand::DESKTOP_APP_ID;
+    let mut out = vec![
+        home.join("Library/Application Support").join(id),
+        home.join(".local/share").join(id),
+    ];
+    if let Some(dir) = crate::store::monocode_database().parent() {
+        out.push(dir.to_path_buf());
+    }
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+        out.push(PathBuf::from(xdg).join(id));
+    }
+    out
+}
 
 impl Guard {
-    fn new(roots: &KitRoots, home: &Path) -> Self {
-        let mut forbidden: Vec<PathBuf> = Vec::new();
-        let mut add = |path: PathBuf| {
+    fn new(roots: &KitRoots, home: &Path, started: Instant, budget: Duration) -> Self {
+        fn with_canonical(list: &mut Vec<PathBuf>, path: PathBuf) {
             if let Ok(real) = std::fs::canonicalize(&path) {
                 if real != path {
-                    forbidden.push(real);
+                    list.push(real);
                 }
             }
-            forbidden.push(path);
-        };
+            list.push(path);
+        }
+        let mut forbidden: Vec<PathBuf> = Vec::new();
         for base in [home, roots.home.as_path()] {
-            for dir in SENSITIVE_HOME_DIRS {
-                add(base.join(dir));
+            for rel in INDEXED_HOME_PATHS {
+                with_canonical(&mut forbidden, base.join(rel));
             }
-            add(base.join(".claude"));
-            add(base.join(".claude/.credentials.json"));
+            with_canonical(&mut forbidden, base.join(".claude"));
+            with_canonical(&mut forbidden, base.join(".codex"));
         }
-        add(roots.claude_home.clone());
-        if let Some(dir) = &roots.account_dir {
-            add(dir.clone());
+        with_canonical(&mut forbidden, roots.claude_home.clone());
+
+        let mut app: Vec<PathBuf> = Vec::new();
+        let mut data_dirs = app_data_dirs(&roots.home);
+        data_dirs.extend(app_data_dirs(home));
+        for dir in data_dirs {
+            with_canonical(&mut app, dir.join("provider-accounts"));
+            with_canonical(&mut app, dir);
         }
-        if let Some(dir) = &roots.key_dir {
-            add(dir.clone());
+        for dir in [&roots.account_dir, &roots.key_dir].into_iter().flatten() {
+            with_canonical(&mut app, dir.clone());
         }
-        forbidden.sort();
-        forbidden.dedup();
+        // Every account dir the app knows lives under `provider-accounts`; those are
+        // covered by their parent, but list the ones present for clarity and for links.
+        let mut exempt: Vec<PathBuf> = Vec::new();
+        for dir in std::iter::once(&roots.claude_home).chain(roots.account_dir.iter()) {
+            for sub in ["skills", "plugins"] {
+                with_canonical(&mut exempt, dir.join(sub));
+            }
+        }
+        for list in [&mut forbidden, &mut app, &mut exempt] {
+            list.sort();
+            list.dedup();
+        }
+
         let mut secret_files = HashSet::new();
-        let mut budget = MAX_GUARD_ENTRIES;
-        for dir in SENSITIVE_HOME_DIRS {
-            collect_file_ids(&home.join(dir), &mut secret_files, &mut budget);
+        let mut budget_left = MAX_GUARD_ENTRIES;
+        let mut index_complete = true;
+        for rel in INDEXED_HOME_PATHS {
+            let path = home.join(rel);
+            // A credentials folder may itself be a link (stow-style dotfiles).
+            let path = std::fs::canonicalize(&path).unwrap_or(path);
+            if !collect_file_ids(&path, &mut secret_files, &mut budget_left, started, budget) {
+                index_complete = false;
+                break;
+            }
         }
-        collect_file_ids(
-            &home.join(".claude/.credentials.json"),
-            &mut secret_files,
-            &mut budget,
-        );
         Self {
             forbidden,
+            app,
+            exempt,
             secret_files,
+            index_complete,
         }
     }
 }
 
 /// Add the (device, inode) of every regular file under `path`, without following links.
-/// Errors are ignored and `budget` caps the entries read.
-fn collect_file_ids(path: &Path, out: &mut HashSet<(u64, u64)>, budget: &mut usize) {
-    if *budget == 0 {
-        return;
+/// Errors are ignored. Returns false when the entry cap or the time budget ran out.
+fn collect_file_ids(
+    path: &Path,
+    out: &mut HashSet<(u64, u64)>,
+    left: &mut usize,
+    started: Instant,
+    budget: Duration,
+) -> bool {
+    if *left == 0 || started.elapsed() >= budget {
+        return false;
     }
-    *budget -= 1;
+    *left -= 1;
     let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return;
+        return true;
     };
     if meta.is_file() {
         if let Some(id) = file_id(&meta) {
@@ -603,10 +675,13 @@ fn collect_file_ids(path: &Path, out: &mut HashSet<(u64, u64)>, budget: &mut usi
     } else if meta.is_dir() {
         if let Ok(reader) = std::fs::read_dir(path) {
             for entry in reader.flatten() {
-                collect_file_ids(&entry.path(), out, budget);
+                if !collect_file_ids(&entry.path(), out, left, started, budget) {
+                    return false;
+                }
             }
         }
     }
+    true
 }
 
 /// Is `real_root` a place that is never a skill or plugin? `root` is the path as named
@@ -633,7 +708,17 @@ fn unsafe_root(
     {
         return true;
     }
-    // A credentials folder or file, the claude config dirs or the app data dir, or a
+    // The app's own dirs: equal, containing, or living under one is refused. The
+    // `skills` and `plugins` folders of the active config dirs are the exception.
+    let exempt = guard.exempt.iter().any(|dir| real_root.starts_with(dir));
+    if guard
+        .app
+        .iter()
+        .any(|dir| dir.starts_with(real_root) || (!exempt && real_root.starts_with(dir)))
+    {
+        return true;
+    }
+    // A credentials folder or file, the claude config dirs, or a
     // folder that contains one of them (`foo -> ~/.config`, `foo -> ~/.claude`). Living
     // UNDER `~/.claude` (`~/.claude/skills/foo`) is fine.
     if guard
@@ -651,9 +736,37 @@ fn unsafe_root(
     })
 }
 
-/// Is a directory met while walking an item a credentials folder?
+/// Is a directory met while walking an item a credentials folder? `.ssh`, `.aws` and
+/// `.gnupg` always are. `.docker` and `.kube` also hold ordinary project files
+/// (a Dockerfile, manifests), so they count only when they hold a client config.
 fn sensitive_dir(path: &Path, name: &str, guard: &Guard) -> bool {
-    SENSITIVE_NAMES.contains(&name) || guard.forbidden.iter().any(|f| f == path)
+    if SENSITIVE_NAMES.contains(&name) || guard.forbidden.iter().any(|f| f == path) {
+        return true;
+    }
+    match name {
+        ".docker" => path.join("config.json").exists(),
+        ".kube" => kube_has_config(path),
+        _ => false,
+    }
+}
+
+/// A `.kube` folder with a `config` file, or a file that looks like a kubeconfig.
+fn kube_has_config(dir: &Path) -> bool {
+    if dir.join("config").exists() {
+        return true;
+    }
+    let Ok(reader) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    reader.flatten().take(64).any(|entry| {
+        let Ok(file) = std::fs::File::open(entry.path()) else {
+            return false;
+        };
+        let mut head = Vec::new();
+        let _ = file.take(64 * 1024).read_to_end(&mut head);
+        let text = String::from_utf8_lossy(&head);
+        text.contains("current-context:") || text.contains("clusters:")
+    })
 }
 
 /// Walk one skill or plugin directory. Files come back sorted, so every later step is
@@ -1420,23 +1533,15 @@ fn find_secrets(object: &serde_json::Map<String, Value>) -> Vec<SecretField> {
         }
     }
     if let Some(raw) = object.get("url").and_then(Value::as_str) {
-        let (has_query, has_userinfo) = match url::Url::parse(raw) {
-            Ok(url) => (
-                url.query().is_some_and(|q| !q.is_empty()),
-                !url.username().is_empty() || url.password().is_some(),
-            ),
-            // A URL we cannot parse still counts if it carries a `?query`.
-            Err(_) => (
-                raw.split_once('?').is_some_and(|(_, q)| !q.is_empty()),
-                false,
-            ),
-        };
-        if has_query || has_userinfo {
+        let parts = url_parts(raw);
+        if parts.userinfo || parts.query || parts.fragment {
             secrets.push(SecretField {
-                location: if has_userinfo {
+                location: if parts.userinfo {
                     SecretLocation::UrlUserinfo
-                } else {
+                } else if parts.query {
                     SecretLocation::UrlQuery
+                } else {
+                    SecretLocation::UrlFragment
                 },
                 value: Secret::new(raw),
             });
@@ -1460,7 +1565,9 @@ fn mask_secrets(config: &Value, secrets: &[SecretField]) -> Value {
         match &secret.location {
             SecretLocation::Env(field) => mask_field(object, "env", field, marker),
             SecretLocation::Header(field) => mask_field(object, "headers", field, marker),
-            SecretLocation::UrlQuery | SecretLocation::UrlUserinfo => {
+            SecretLocation::UrlQuery
+            | SecretLocation::UrlUserinfo
+            | SecretLocation::UrlFragment => {
                 if let Some(raw) = object.get("url").and_then(Value::as_str) {
                     let masked = mask_url(raw);
                     object.insert("url".to_string(), Value::String(masked));
@@ -1471,25 +1578,79 @@ fn mask_secrets(config: &Value, secrets: &[SecretField]) -> Value {
     masked
 }
 
+/// Which secret-bearing parts a URL has.
+struct UrlParts {
+    userinfo: bool,
+    query: bool,
+    fragment: bool,
+}
+
+/// Split a URL that does not parse: `scheme://authority/path?query#fragment`, by hand.
+/// Returns (scheme prefix with `://` or empty, userinfo, rest of authority and path,
+/// query, fragment).
+fn split_unparsed(raw: &str) -> (&str, &str, &str, &str, &str) {
+    let (rest, fragment) = raw.split_once('#').unwrap_or((raw, ""));
+    let (rest, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let (prefix, after) = match rest.find("://") {
+        Some(ix) => rest.split_at(ix + 3),
+        None => ("", rest),
+    };
+    let authority_end = after.find('/').unwrap_or(after.len());
+    match after[..authority_end].rfind('@') {
+        Some(ix) => (prefix, &after[..ix], &after[ix + 1..], query, fragment),
+        None => (prefix, "", after, query, fragment),
+    }
+}
+
+fn url_parts(raw: &str) -> UrlParts {
+    match url::Url::parse(raw) {
+        Ok(url) => UrlParts {
+            userinfo: !url.username().is_empty() || url.password().is_some(),
+            query: url.query().is_some_and(|q| !q.is_empty()),
+            fragment: url.fragment().is_some_and(|f| !f.is_empty()),
+        },
+        Err(_) => {
+            let (_, userinfo, _, query, fragment) = split_unparsed(raw);
+            UrlParts {
+                userinfo: !userinfo.is_empty(),
+                query: !query.is_empty(),
+                fragment: !fragment.is_empty(),
+            }
+        }
+    }
+}
+
 /// The plain form of a secret-bearing URL: scheme, host, port and path only. Userinfo,
 /// query and fragment are replaced by a marker, so none of them reaches a plain hash.
 fn mask_url(raw: &str) -> String {
-    let Ok(url) = url::Url::parse(raw) else {
-        let base = raw.split_once('?').map_or(raw, |(base, _)| base);
-        return format!("{base}?{SECRET_MARKER}");
-    };
-    let mut out = format!("{}://", url.scheme());
-    if !url.username().is_empty() || url.password().is_some() {
-        out.push_str(SECRET_MARKER);
-        out.push('@');
+    let parts = url_parts(raw);
+    let mut out;
+    if let Ok(url) = url::Url::parse(raw) {
+        out = format!("{}://", url.scheme());
+        if parts.userinfo {
+            out.push_str(SECRET_MARKER);
+            out.push('@');
+        }
+        out.push_str(url.host_str().unwrap_or(""));
+        if let Some(port) = url.port() {
+            out.push_str(&format!(":{port}"));
+        }
+        out.push_str(url.path());
+    } else {
+        let (prefix, _, rest, _, _) = split_unparsed(raw);
+        out = prefix.to_string();
+        if parts.userinfo {
+            out.push_str(SECRET_MARKER);
+            out.push('@');
+        }
+        out.push_str(rest);
     }
-    out.push_str(url.host_str().unwrap_or(""));
-    if let Some(port) = url.port() {
-        out.push_str(&format!(":{port}"));
-    }
-    out.push_str(url.path());
-    if url.query().is_some_and(|q| !q.is_empty()) {
+    if parts.query {
         out.push('?');
+        out.push_str(SECRET_MARKER);
+    }
+    if parts.fragment {
+        out.push('#');
         out.push_str(SECRET_MARKER);
     }
     out
@@ -1520,7 +1681,7 @@ const KEY_BYTES: usize = 32;
 /// - A key file readable by group or others is refused (degrade), never replaced.
 /// - A file that cannot be read is left alone. A file that is empty or malformed is
 ///   garbage (for example a crash while writing an older version): it is renamed aside
-///   (see [`retire_garbage`]) and a new key is created. A valid key is never replaced.
+///   (see [`retire_garbage`]) and a new key is created. A valid key is not replaced.
 /// - A new key is written to a temp file (0600) in the same dir and published with a
 ///   hard link, which fails instead of replacing, so a crash never leaves a partial key
 ///   and two processes agree on one key.
@@ -1558,8 +1719,13 @@ fn key_file_too_open(_meta: &std::fs::Metadata) -> bool {
     false
 }
 
-/// Remove a key file that was unreadable as a key, without ever losing a valid one.
+/// Remove a key file that was unreadable as a key, without replacing a valid one.
 /// Returns a key only when a valid one turned up (another process published it).
+///
+/// Limit: with three or more processes racing, a valid key that is moved aside can be
+/// published again by a third process under a new value before it is put back, so the
+/// key may change once. Nothing is exposed by that: the digests simply differ from the
+/// older ones, as after a reinstall.
 ///
 /// The file is renamed aside atomically, and only when it is still the file we read
 /// (same device and inode). Whatever was moved is read again: a valid key is linked

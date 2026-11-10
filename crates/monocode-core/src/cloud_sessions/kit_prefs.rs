@@ -552,6 +552,7 @@ pub fn secret_field_names(server: &KitMcpServer) -> Vec<String> {
             SecretLocation::Header(name) => format!("header {name}"),
             SecretLocation::UrlQuery => "URL query".into(),
             SecretLocation::UrlUserinfo => "URL user and password".into(),
+            SecretLocation::UrlFragment => "URL fragment".into(),
         })
         .collect()
 }
