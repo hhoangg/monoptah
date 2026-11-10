@@ -748,6 +748,22 @@ fn bootstrap_script_from_template(platform: HostPlatform, template: &str) -> Str
 /// `ensure_detached_host` from `remote_bootstrap_detached.sh` is inserted before its
 /// `service install` line. Restarts need nothing extra: the template's `service uninstall` stops a detached Host.
 pub fn sandbox_bootstrap_script(prelude: Option<&str>) -> String {
+    sandbox_script_with(prelude, "")
+}
+
+/// Phase 2 of the cloud Host upgrade in a sandbox: the connect bootstrap, with the SAME
+/// prelude (the restarted Host needs the Claude credential in its environment), replacing
+/// the Host only when it is older or foreign.
+pub(crate) fn sandbox_upgrade_script(prelude: Option<&str>, port: u16) -> String {
+    sandbox_script_with(prelude, &upgrade_flags(port))
+}
+
+fn upgrade_flags(port: u16) -> String {
+    format!("MONOCODE_HOST_UPGRADE_IF_OLDER=1\nMONOCODE_HOST_PORT={port}\n")
+}
+
+/// `extra` lines run right after the prelude, before the bootstrap.
+fn sandbox_script_with(prelude: Option<&str>, extra: &str) -> String {
     let template = include_str!("remote_bootstrap.sh").replace("\r\n", "\n");
     let helpers = include_str!("remote_bootstrap_detached.sh").replace("\r\n", "\n");
     let install = "\"$ENTRY\" service install --port \"$HOST_PORT\" >/dev/null";
@@ -761,8 +777,9 @@ pub fn sandbox_bootstrap_script(prelude: Option<&str>) -> String {
     } else {
         "echo 'The sandbox bootstrap template changed: the service install line is missing.' >&2\nexit 1\n".to_string()
     };
-    let script =
-        format!("MONOCODE_HOST_TRACK_TOKEN=1\nMONOCODE_HOST_INSTALL_CLAUDE=1\n{helpers}{body}");
+    let script = format!(
+        "{extra}MONOCODE_HOST_TRACK_TOKEN=1\nMONOCODE_HOST_INSTALL_CLAUDE=1\n{helpers}{body}"
+    );
     match prelude {
         Some(prelude) => format!("{prelude}\n{script}"),
         None => script,
@@ -779,6 +796,13 @@ pub fn codespace_bootstrap_script() -> String {
         "MONOCODE_HOST_TRACK_TOKEN=1\nMONOCODE_HOST_INSTALL_CLAUDE=1\n{}",
         bootstrap_script(HostPlatform::Unix)
     )
+}
+
+/// Phase 2 of the cloud Host upgrade in a codespace: the connect bootstrap that replaces the
+/// Host only when it is older or foreign. Codespace secrets reach the login shell, so the
+/// restarted Host inherits the Claude token without a prelude.
+pub(crate) fn codespace_upgrade_script(port: u16) -> String {
+    format!("{}{}", upgrade_flags(port), codespace_bootstrap_script())
 }
 
 pub fn upgrade_script(platform: HostPlatform, port: u16) -> String {
@@ -1699,6 +1723,25 @@ mod tests {
         publish: Option<&str>,
         tamper: bool,
     ) -> (bool, String, Vec<String>, tempfile::TempDir) {
+        run_bootstrap_on(
+            pin_hash_of_package,
+            publish,
+            tamper,
+            None,
+            bootstrap_script(HostPlatform::Unix),
+        )
+    }
+    /// [`run_bootstrap_with_fake_package`] for any script, with an already installed Host
+    /// that reports `installed` from `--version`. Every call to a Host is logged in
+    /// `$HOME/calls.log`.
+    #[cfg(unix)]
+    fn run_bootstrap_on(
+        pin_hash_of_package: bool,
+        publish: Option<&str>,
+        tamper: bool,
+        installed: Option<&str>,
+        mut script: String,
+    ) -> (bool, String, Vec<String>, tempfile::TempDir) {
         use sha2::{Digest, Sha256};
         use std::os::unix::fs::PermissionsExt;
         let work = tempfile::tempdir().unwrap();
@@ -1707,7 +1750,7 @@ mod tests {
         let host = pkg.join("monocode-host");
         std::fs::write(
             &host,
-            "#!/bin/sh\ncase \"$1\" in --version) echo '1.1.0+monoptah' ;; connection-info) echo '{\"port\":3774}' ;; esac\nexit 0\n",
+            "#!/bin/sh\necho \"$@\" >> \"$HOME/calls.log\"\ncase \"$1\" in --version) echo '1.1.0+monoptah' ;; connection-info) echo '{\"port\":3774}' ;; esac\nexit 0\n",
         )
         .unwrap();
         std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1749,13 +1792,23 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let mut script = bootstrap_script(HostPlatform::Unix);
         if pin_hash_of_package {
             for (_, hash) in super::super::host_release::HOST_SHA256 {
                 script = script.replace(hash, &package_hash);
             }
         }
         let home = tempfile::tempdir().unwrap();
+        if let Some(version) = installed {
+            let bin = home.path().join(".monocode-host/bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let entry = bin.join("monocode-host");
+            std::fs::write(
+                &entry,
+                format!("#!/bin/sh\necho \"old $@\" >> \"$HOME/calls.log\"\ncase \"$1\" in --version) echo '{version}' ;; connection-info) echo '{{\"port\":3774}}' ;; esac\nexit 0\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let mut child = Command::new("sh")
             .arg("-s")
             .env("HOME", home.path())
@@ -1764,6 +1817,7 @@ mod tests {
                 format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap()),
             )
             .env_remove("MONOCODE_HOST_FORCE_UPGRADE")
+            .env_remove("MONOCODE_HOST_UPGRADE_IF_OLDER")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1829,6 +1883,114 @@ mod tests {
         let (ok, stderr, _, _) = run_bootstrap_with_fake_package(true, Some(&other), false);
         assert!(!ok);
         assert!(stderr.contains("pinned checksum mismatch"), "{stderr}");
+    }
+    /// The cloud upgrade flags in front of the plain bootstrap (no Claude install, which would
+    /// call the stub `curl`).
+    #[cfg(unix)]
+    fn upgrade_only_script() -> String {
+        format!(
+            "{}{}",
+            upgrade_flags(3774),
+            bootstrap_script(HostPlatform::Unix)
+        )
+    }
+    #[cfg(unix)]
+    fn host_calls(home: &tempfile::TempDir) -> String {
+        std::fs::read_to_string(home.path().join("calls.log")).unwrap_or_default()
+    }
+    #[cfg(unix)]
+    #[test]
+    fn the_cloud_upgrade_replaces_an_older_or_foreign_host_and_leaves_a_current_one() {
+        for installed in [
+            "1.0.0+monoptah",
+            "0.9.4",
+            "9.0.0",
+            "1.1.0-rc.1+monoptah",
+            "",
+        ] {
+            let (ok, stderr, urls, home) =
+                run_bootstrap_on(true, None, false, Some(installed), upgrade_only_script());
+            assert!(ok, "{installed}: {stderr}");
+            assert_eq!(urls.len(), 2, "{installed}: {urls:?}");
+            let calls = host_calls(&home);
+            assert!(calls.contains("service uninstall"), "{installed}: {calls}");
+            assert!(calls.contains("service install"), "{installed}: {calls}");
+        }
+        for installed in ["1.1.0+monoptah", "1.2.0+monoptah"] {
+            let (ok, stderr, urls, home) =
+                run_bootstrap_on(true, None, false, Some(installed), upgrade_only_script());
+            assert!(ok, "{installed}: {stderr}");
+            assert!(urls.is_empty(), "{installed}: {urls:?}");
+            let calls = host_calls(&home);
+            assert!(!calls.contains("service uninstall"), "{installed}: {calls}");
+        }
+        // Without the flag an installed Host is never replaced: the plain connect rule.
+        let (ok, _, urls, home) = run_bootstrap_on(
+            true,
+            None,
+            false,
+            Some("0.9.4"),
+            bootstrap_script(HostPlatform::Unix),
+        );
+        assert!(ok);
+        assert!(urls.is_empty());
+        assert!(!host_calls(&home).contains("service uninstall"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_cloud_upgrade_keeps_the_old_host_running() {
+        // The checksum mismatch ends the script before the Host is stopped.
+        for (pin, publish, tamper, message) in [
+            (false, None, false, "checksum mismatch"),
+            (true, None, true, "package checksum mismatch"),
+            (
+                true,
+                Some("0".repeat(64)),
+                false,
+                "pinned checksum mismatch",
+            ),
+        ] {
+            let (ok, stderr, _, home) = run_bootstrap_on(
+                pin,
+                publish.as_deref(),
+                tamper,
+                Some("0.9.4"),
+                upgrade_only_script(),
+            );
+            assert!(!ok);
+            assert!(stderr.contains(message), "{stderr}");
+            let calls = host_calls(&home);
+            assert!(!calls.contains("service uninstall"), "{calls}");
+            assert!(!calls.contains("service install"), "{calls}");
+            // The launcher is still the old one.
+            let launcher =
+                std::fs::read_to_string(home.path().join(".monocode-host/bin/monocode-host"))
+                    .unwrap();
+            assert!(launcher.contains("echo \"old"), "{launcher}");
+        }
+    }
+    #[test]
+    fn cloud_upgrade_scripts_carry_the_flags_and_the_same_prelude_as_connect() {
+        let prelude = "unset ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN\nexport CLAUDE_CODE_OAUTH_TOKEN='sk-test'\n";
+        let sandbox = sandbox_upgrade_script(Some(prelude), 3790);
+        assert!(sandbox.starts_with(prelude), "{sandbox}");
+        let flags = "MONOCODE_HOST_UPGRADE_IF_OLDER=1\nMONOCODE_HOST_PORT=3790\n";
+        assert!(sandbox.contains(flags));
+        // Same body as the connect step, with the same detached start.
+        let connect = sandbox_bootstrap_script(Some(prelude));
+        assert!(
+            sandbox.replace(flags, "") == connect,
+            "only the flags differ"
+        );
+        assert!(sandbox.contains("ensure_detached_host"));
+        assert!(!sandbox_upgrade_script(None, 3774).contains("sk-test"));
+        let codespace = codespace_upgrade_script(3774);
+        assert!(
+            codespace.starts_with("MONOCODE_HOST_UPGRADE_IF_OLDER=1\nMONOCODE_HOST_PORT=3774\n")
+        );
+        assert!(codespace.ends_with(&codespace_bootstrap_script()));
+        // The user's explicit Upgrade is untouched: it forces the install.
+        assert!(upgrade_script(HostPlatform::Unix, 3774).starts_with("MONOCODE_HOST_FORCE_UPGRADE=1\n"));
     }
     #[cfg(unix)]
     #[test]

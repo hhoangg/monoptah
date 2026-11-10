@@ -1,8 +1,10 @@
 //! Remote host connections. The renderer receives machine metadata, never the
 //! saved bearer credential. Workspace requests never fall back to local calls.
 pub mod attachments;
+mod cloud_upgrade;
 pub mod host_info;
 pub mod host_release;
+pub mod host_upgrade;
 pub mod protocol;
 mod ssh;
 pub mod ssh_askpass;
@@ -166,6 +168,10 @@ struct StoredMachine {
     token: String,
     #[serde(default)]
     ssh: Option<SshTarget>,
+    /// A cloud Host is older than the pin but a session was running, so the two-phase
+    /// upgrade was deferred; the next connect that finds the Host idle upgrades it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pending_host_upgrade: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -425,6 +431,7 @@ impl Connections {
             environment_id,
             token,
             ssh: existing.and_then(|m| m.ssh.clone()),
+            pending_host_upgrade: false,
         };
         machines.retain(|m| m.id != id);
         machines.push(machine.clone());
@@ -744,6 +751,7 @@ impl Connections {
                         environment_id,
                         token,
                         ssh: Some(target.clone()),
+                        pending_host_upgrade: false,
                     }
                 };
                 job.message("Opening the secure connection…");
@@ -818,6 +826,7 @@ impl Connections {
             .find(|m| m.environment_id == machine.environment_id)
         {
             machine.id = old.id.clone();
+            machine.pending_host_upgrade |= old.pending_host_upgrade;
         }
         machines.retain(|m| m.id != machine.id);
         machines.push(machine.clone());
@@ -976,7 +985,7 @@ impl Connections {
             let job = self.start_when_free(cancel, JOB_SLOT_WAIT, || {
                 self.codespace_reconnect(machine_id)
             })?;
-            loop {
+            let woke = loop {
                 if cancel.load(Ordering::Relaxed) {
                     let _ = self.ssh_cancel(&job);
                     // The job thread stops within moments; let it finish so an
@@ -991,10 +1000,15 @@ impl Connections {
                 }
                 let view = self.ssh_poll(&job)?;
                 if view.done {
-                    return view.error.map_or(Ok(()), Err);
+                    break view.error.map_or(Ok(()), Err);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
-            }
+            };
+            woke?;
+            // Phase 2 of the Host upgrade. This is a user-initiated connect (a send, a
+            // retry), so it may run; a failure is a warning line, never an error.
+            self.upgrade_host_if_needed(machine_id, None, progress);
+            Ok(())
         })
     }
 
@@ -1231,6 +1245,7 @@ mod tests {
             environment_id: environment.into(),
             token: "t".repeat(43),
             ssh,
+            pending_host_upgrade: false,
         }
     }
     fn codespace_target() -> SshTarget {
@@ -1405,11 +1420,13 @@ mod tests {
             );
             return;
         };
-        let describe =
-            json!({ "result": { "protocolVersion": 1, "environmentId": "env-cs", "name": "Host" }});
+        // A current fork Host, so the connect-time upgrade check leaves it alone.
+        let describe = json!({ "result": { "protocolVersion": 1, "environmentId": "env-cs", "name": "Host", "host": {"flavor": "monoptah", "version": "1.1.0"} }});
         let (url, _requests, server) = host_fixture(vec![
             describe.clone(),
             describe.clone(),
+            describe.clone(),
+            // The upgrade check after the explicit wake reads the Host once more.
             describe.clone(),
             json!({ "result": { "projects": [] } }),
             describe,
@@ -1736,6 +1753,7 @@ else:
             environment_id: "env".into(),
             token: "secret".into(),
             ssh: None,
+            pending_host_upgrade: false,
         };
         let value = serde_json::to_string(&stored.public()).unwrap();
         assert!(!value.contains("secret"));

@@ -13,7 +13,9 @@ HOST_PORT=${MONOCODE_HOST_PORT:-3774}
 # "+monoptah" flavor marker (an upstream Host, whatever its number; "+monoptah.N" counts as
 # the marker) or it is lower than the pin. A pre-release ("1.1.0-rc.1") is lower than its
 # release. Other build metadata is ignored in the comparison. Not used by the install rule
-# below, which stays "missing or FORCE_UPGRADE"; the connect-time upgrade decides with it.
+# below unless MONOCODE_HOST_UPGRADE_IF_OLDER=1 (the two-phase cloud upgrade, which the app
+# only starts after it saw the Host idle); the plain install rule stays "missing or
+# FORCE_UPGRADE".
 is_older_or_foreign() {
   case "$1" in *+monoptah|*+monoptah.*) ;; *) return 0 ;; esac
   _installed=${1%%+*}
@@ -39,6 +41,14 @@ EOF_PIN
   [ "$_a_pre" -eq 1 ] || return 1
   [ "$_b_pre" -eq 0 ] || [ "$_installed" != "$_pin" ]
 }
+
+# The two-phase cloud upgrade replaces an older or foreign Host and leaves a current one
+# alone (another connect may have upgraded it in the meantime). A launcher that cannot print
+# its version counts as foreign.
+if [ "$FORCE_UPGRADE" != 1 ] && [ "$EXISTED" = 1 ] && [ "${MONOCODE_HOST_UPGRADE_IF_OLDER:-0}" = 1 ]; then
+  INSTALLED=$("$ENTRY" --version 2>/dev/null || true)
+  ! is_older_or_foreign "$INSTALLED" "$VERSION" || FORCE_UPGRADE=1
+fi
 
 if [ ! -x "$ENTRY" ] || [ "$FORCE_UPGRADE" = 1 ]; then
   case "$(uname -s)" in Darwin) OS=darwin ;; Linux) OS=linux ;; *) echo 'Monoptah Host supports Linux and macOS.' >&2; exit 1 ;; esac

@@ -191,6 +191,9 @@ struct OpenRequest<'a> {
     display: &'a str,
     repo: &'a str,
     remote_cwd: &'a str,
+    /// The sandbox's Claude prelude, so the Host upgrade restarts the Host with the same
+    /// credential the connect step gave it. `None` for a codespace.
+    auth: Option<remote::host_upgrade::SandboxAuth<'a>>,
 }
 
 /// Step (c) of a start: connect (pair, or wake an already paired machine), open the project,
@@ -233,6 +236,9 @@ fn open_project(
             None => host.connect(&request.cloud.name, request.display, progress)?,
         },
     };
+    // Phase 2 of the Host upgrade, inside this user-initiated connect. Never fatal: a
+    // deferral or a failure is a status line and the session goes on with the Host it has.
+    host.upgrade_host(&machine.id, request.auth, progress);
     step(StepKind::Connect, StepStatus::Done);
     if aborted() {
         return Err(START_ABORTED.into());
@@ -429,6 +435,19 @@ pub trait Host: Send + Sync {
             &described,
         ))
     }
+    /// Phase 2 of the cloud Host upgrade (see [`remote::host_upgrade`]): replaces an older or
+    /// foreign Host when nothing runs on it, else marks the machine for the next connect.
+    /// Only a user-initiated connect or start flow may call it. Never fails: a warning is a
+    /// `progress` line. The default does nothing.
+    fn upgrade_host(
+        &self,
+        machine_id: &str,
+        auth: Option<remote::host_upgrade::SandboxAuth<'_>>,
+        progress: &mut dyn FnMut(&str),
+    ) -> remote::host_upgrade::Outcome {
+        let _ = (machine_id, auth, progress);
+        remote::host_upgrade::Outcome::Current
+    }
     fn disconnect(&self, machine_id: &str) -> Result<(), String>;
 }
 
@@ -470,6 +489,14 @@ impl Host for Arc<Connections> {
             Some(info) => Ok(info),
             None => self.describe_host(machine_id),
         }
+    }
+    fn upgrade_host(
+        &self,
+        machine_id: &str,
+        auth: Option<remote::host_upgrade::SandboxAuth<'_>>,
+        progress: &mut dyn FnMut(&str),
+    ) -> remote::host_upgrade::Outcome {
+        self.upgrade_host_if_needed(machine_id, auth, progress)
     }
     fn disconnect(&self, machine_id: &str) -> Result<(), String> {
         Connections::disconnect(self, machine_id)
@@ -756,6 +783,7 @@ impl CloudSessions {
                 display: &resolved.display,
                 repo: &resolved.repo,
                 remote_cwd: &resolved.remote_cwd,
+                auth: None,
             },
             &AtomicBool::new(false),
             &mut |_, _| {},

@@ -321,6 +321,7 @@ impl CloudSessions {
             let remote_cwd = Self::project_folder(&target, container.as_ref());
             self.progress_line(&mut run, "Reconnecting to the sandbox");
             let display = machine.name.clone();
+            let prelude = auth.as_ref().map(ClaudeAuth::prelude);
             let request = OpenRequest {
                 local_cwd: session.project.local_project.as_deref().unwrap_or(""),
                 cloud: &cloud,
@@ -328,6 +329,13 @@ impl CloudSessions {
                 display: &display,
                 repo: &repo,
                 remote_cwd: &remote_cwd,
+                auth: auth
+                    .as_ref()
+                    .zip(prelude.as_deref())
+                    .map(|(auth, prelude)| SandboxAuth {
+                        prelude: prelude.as_str(),
+                        secret: auth.secret(),
+                    }),
             };
             deps.backend.remember_target(&target);
             let backend = self.backend(CloudBackendKind::DockerSandbox)?;
