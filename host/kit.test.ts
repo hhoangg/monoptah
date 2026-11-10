@@ -7,6 +7,7 @@ import {
   readFileSync,
   readdirSync,
   readlinkSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -401,6 +402,83 @@ describe("kit.apply: unpacking and install", () => {
   });
 });
 
+describe("startup recovery", () => {
+  it("restores a quarantined dir when the crash left no <hash> dir", async () => {
+    const kit = kitFor();
+    await kit.apply({ hash: HASH_A, uploadId: stage(PLUGIN("p")) });
+    // Simulate a crash between "rename to .old" and "rename into place".
+    renameSync(join(kit.root, HASH_A), join(kit.root, `.old-${HASH_A}-abc123`));
+    mkdirSync(join(kit.root, ".unpack-deadbeef"));
+    writeFileSync(join(kit.root, ".unpack-deadbeef", "half"), "x");
+    mkdirSync(join(kit.root, `.old-${HASH_B}-abc123`));
+    const restarted = kitFor();
+    expect(existsSync(join(kit.root, HASH_A, "plugins", "p", "run.sh"))).toBe(true);
+    expect(restarted.current()?.hash).toBe(HASH_A);
+    expect(readdirSync(kit.root).filter((name) => name.startsWith("."))).toEqual([]);
+    expect(existsSync(join(kit.root, HASH_B))).toBe(true);
+  });
+
+  it("drops a quarantined copy when the <hash> dir is already there", async () => {
+    const kit = kitFor();
+    await kit.apply({ hash: HASH_A, uploadId: stage(PLUGIN("p")) });
+    mkdirSync(join(kit.root, `.old-${HASH_A}-abc123`));
+    writeFileSync(join(kit.root, `.old-${HASH_A}-abc123`, "stale"), "x");
+    kitFor();
+    expect(readdirSync(kit.root).filter((name) => name.startsWith("."))).toEqual([]);
+    expect(existsSync(join(kit.root, HASH_A, "plugins", "p", "run.sh"))).toBe(true);
+  });
+});
+
+describe("rollback after the flip", () => {
+  for (const step of ["flip", "unlink", "manifest"] as const) {
+    posix(`restores current, links and manifest when ${step} fails`, async () => {
+      const first = kitFor();
+      await first.apply({ hash: HASH_A, uploadId: stage([...SKILL("keep"), ...SKILL("drop")]) });
+      const managed = readFileSync(join(first.root, "managed.json"), "utf8");
+      const before = first.current();
+      const kit = kitFor({
+        beforeStep: (name) => {
+          if (name === step) throw new Error(`${step} failed`);
+        },
+      });
+      await expect(kit.apply({ hash: HASH_B, uploadId: stage([...SKILL("keep"), ...SKILL("added")]) })).rejects.toThrow(`${step} failed`);
+      expect(readlinkSync(join(kit.root, "current"))).toBe(HASH_A);
+      expect(readdirSync(join(home, ".claude", "skills")).sort()).toEqual(["drop", "keep"]);
+      expect(readlinkSync(join(home, ".claude", "skills", "drop"))).toBe(join(kit.root, "current", "skills", "drop"));
+      expect(readFileSync(join(kit.root, "managed.json"), "utf8")).toBe(managed);
+      expect({ ...kit.current(), lease: undefined }).toEqual({ ...before, lease: undefined });
+      expect(kit.current()?.hash).toBe(HASH_A);
+    });
+  }
+
+  it("rebuilds the cache after a failed apply", async () => {
+    const kit = kitFor({
+      beforeStep: (name) => {
+        if (name === "manifest") throw new Error("boom");
+      },
+    });
+    await expect(kit.apply({ hash: HASH_B, uploadId: stage(SKILL("a")) })).rejects.toThrow("boom");
+    expect(kit.current()).toBeUndefined();
+  });
+});
+
+describe("kit leases", () => {
+  it("keeps the leased kit's files across two applies in the snapshot-to-spawn window", async () => {
+    const kit = kitFor();
+    const H = (c: string) => c.repeat(64);
+    await kit.apply({ hash: H("1"), uploadId: stage(PLUGIN("p")) });
+    const snapshot = kit.current()!;
+    const release = snapshot.lease!();
+    await kit.apply({ hash: H("2"), uploadId: stage(PLUGIN("q")) });
+    await kit.apply({ hash: H("3"), uploadId: stage(PLUGIN("q")) });
+    expect(existsSync(join(snapshot.pluginDirs[0], "run.sh"))).toBe(true);
+    release();
+    release();
+    await kit.apply({ hash: H("4"), uploadId: stage(PLUGIN("q")) });
+    expect(existsSync(join(kit.root, H("1")))).toBe(false);
+  });
+});
+
 describe("kit.secrets", () => {
   const SECRET = "tok-9f8e7d6c5b4a-very-secret";
 
@@ -504,6 +582,26 @@ describe("kit.secrets", () => {
     expect(scrubSecrets("abc is an ordinary word")).toBe("abc is an ordinary word");
   });
 
+  it("scrubs in one pass, caps line forms and leaves ordinary JSON structure alone", async () => {
+    const kit = kitFor();
+    const body = Array.from({ length: 900 }, (_, index) => `${String(index).padStart(5, "0")}AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdefghijklmnopqrst`);
+    const key = ["{", '  "type": "service_account",', '  "client_email": "svc@example.test",', ...body, "}"].join("\n");
+    await kit.secrets({ values: { MONOPTAH_KIT_SA: key } });
+    expect(scrubSecrets('{\n  "type": "service_account",\n}')).toBe('{\n  "type": "service_account",\n}');
+    expect(scrubSecrets("  \"type\": \"service_account\",")).toBe("  \"type\": \"service_account\",");
+    // The first 256 qualifying lines are scrubbed individually.
+    expect(scrubSecrets(body[0])).toBe("[redacted]");
+    expect(scrubSecrets(body[255])).toBe("[redacted]");
+    // A large text is scrubbed in a bounded time.
+    const text = `${"ordinary log line without secrets\n".repeat(60_000)}${body[3]}\n`;
+    const started = performance.now();
+    scrubSecrets(text);
+    expect(performance.now() - started).toBeLessThan(1500);
+    // Overlapping and adjacent hits become one redaction each.
+    await kit.secrets({ values: { MONOPTAH_KIT_A: "abcdefgh", MONOPTAH_KIT_B: "defghijk" } });
+    expect(scrubSecrets("x abcdefghijk y abcdefgh!")).toBe("x [redacted] y [redacted]!");
+  });
+
   it("scrubs health output", async () => {
     const run: KitRun = async () => ({ code: 0, stdout: `clickup: failed ${SECRET}\n`, stderr: `warn ${SECRET}` });
     const kit = kitFor({ resolveClaude: async () => "/fake/claude", run });
@@ -547,7 +645,8 @@ describe("kit.health", () => {
     await kit.apply({ hash: HASH_A, uploadId: stage([...PLUGIN("p"), MCP]) });
     await kit.secrets({ values: { MONOPTAH_KIT_CLICKUP_T: "value-1234" } });
     const out = await kit.health(home);
-    expect(out).toEqual({ exitCode: 0, stdout: "clickup: x - Connected\n", stderr: "", kitServers: true });
+    expect(out).toMatchObject({ exitCode: 0, stdout: "clickup: x - Connected\n", stderr: "", kitServers: true, timedOut: false });
+    expect(out.servers).toEqual([{ name: "clickup", status: "connected", signInNeeded: false, transport: "stdio", detail: "x - Connected" }]);
     expect(calls).toHaveLength(1);
     expect(calls[0].args).toEqual(["mcp", "list"]);
     expect(calls[0].cwd).toBe(home);
@@ -597,6 +696,69 @@ process.exit(3);
     expect(runs[0].argv).toEqual(["mcp", "list"]);
     expect(Object.keys(JSON.parse(runs[0].cfg).mcpServers)).toEqual(["clickup"]);
   });
+
+  it("classifies sign-in outcomes apart from failures and reports each transport", async () => {
+    const mcp = {
+      name: "mcp.json",
+      data: JSON.stringify({
+        mcpServers: {
+          local: { command: "npx", args: ["x"] },
+          linear: { type: "http", url: "https://example.test/mcp" },
+          legacy: { type: "sse", url: "https://example.test/sse" },
+          cu: { url: "https://example.test/mcp", headers: { Authorization: "Bearer ${MONOPTAH_KIT_CU_AUTH}" } },
+          broken: { command: "nope" },
+        },
+      }),
+    };
+    const stdout = [
+      "Checking MCP server health...",
+      "",
+      "local: npx x - \u2713 Connected",
+      "linear: https://example.test/mcp (HTTP) - \u26a0 Needs authentication",
+      "legacy: https://example.test/sse (SSE) - Authentication required",
+      "cu: https://example.test/mcp (HTTP) - Pending approval (run `claude` to approve)",
+      "broken: nope - \u2718 Failed to connect",
+      "not a server line",
+    ].join("\n");
+    const run: KitRun = async () => ({ code: 0, stdout, stderr: "" });
+    const kit = kitFor({ resolveClaude: async () => "/fake/claude", run });
+    await kit.apply({ hash: HASH_A, uploadId: stage([mcp]) });
+    const { servers } = await kit.health(home);
+    const by = Object.fromEntries(servers.map((server) => [server.name, server]));
+    expect(by.local).toMatchObject({ status: "connected", signInNeeded: false, transport: "stdio" });
+    expect(by.linear).toMatchObject({ status: "signInNeeded", signInNeeded: true, transport: "http" });
+    expect(by.legacy).toMatchObject({ status: "signInNeeded", signInNeeded: true, transport: "sse" });
+    expect(by.cu).toMatchObject({ status: "signInNeeded", signInNeeded: true, transport: "http" });
+    expect(by.broken).toMatchObject({ status: "failed", signInNeeded: false, transport: "stdio" });
+    expect(servers).toHaveLength(5);
+  });
+
+  posix("returns within the timeout and leaves no process when a descendant holds the pipes", async () => {
+    const pidFile = join(home, "grandchild.pid");
+    const script = join(home, "claude-hang.cjs");
+    writeFileSync(
+      script,
+      `const { spawn } = require('node:child_process');
+const fs = require('node:fs');
+// The grandchild inherits stdout and stderr and outlives the leader's patience.
+const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 25000)'], { stdio: ['ignore', 'inherit', 'inherit'] });
+fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));
+console.log('local: x - Connected');
+setTimeout(() => {}, 25000);
+`,
+    );
+    const kit = kitFor({ resolveClaude: async () => script, healthTimeoutMs: 400 });
+    await kit.apply({ hash: HASH_A, uploadId: stage([MCP]) });
+    const started = Date.now();
+    const out = await kit.health(home);
+    expect(Date.now() - started).toBeLessThan(8000);
+    expect(out.timedOut).toBe(true);
+    expect(out.stdout).toContain("local: x - Connected");
+    const grandchild = Number(readFileSync(pidFile, "utf8"));
+    await vi.waitFor(() => expect(() => process.kill(grandchild, 0)).toThrow(), { timeout: 5000 });
+    // The throwaway config dir was removed even though the run timed out.
+    expect(readdirSync(tmpdir()).filter((name) => name.startsWith("monoptah-kit-health-") && existsSync(join(tmpdir(), name, ".claude.json")) && readFileSync(join(tmpdir(), name, ".claude.json"), "utf8").includes("clickup"))).toEqual([]);
+  }, 20_000);
 
   it("rejects a bad working directory", async () => {
     const kit = kitFor({ resolveClaude: async () => "/fake/claude" });

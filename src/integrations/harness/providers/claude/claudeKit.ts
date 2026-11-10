@@ -14,6 +14,11 @@ export interface ClaudeKit {
   mcpConfig?: string;
   /** Environment overlay for the interactive Claude child only. */
   env: Record<string, string>;
+  /**
+   * Holds the kit's files on disk until the returned function is called, so a
+   * newer apply cannot remove them between this snapshot and the spawn.
+   */
+  lease?: () => () => void;
 }
 
 let provider: (() => ClaudeKit | undefined) | undefined;

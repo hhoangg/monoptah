@@ -442,6 +442,9 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     existing.runtimeMode = input.runtimeMode;
     return existing;
   }
+  // Hold the snapshot's files until the child is spawned (and pinned there).
+  // (A lease that is never released expires on its own.)
+  const releaseKit = kit?.lease?.();
   if (existing) {
     // Model and launch-setting changes require a fresh Claude process, but
     // they must resume the same provider conversation. Only a cwd change
@@ -545,20 +548,24 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     },
   );
 
-  await spawnChild(
-    input.sessionId,
-    path,
-    buildClaudeSpawnArgs({
-      ...launch,
-      kit: kit && { pluginDirs: kit.pluginDirs, mcpConfig: kit.mcpConfig },
-    }),
-    input.cwd,
-    { provider: "claude", id: input.providerAccountId ?? "default" },
-    "claude",
-    undefined,
-    undefined,
-    kit?.env,
-  );
+  try {
+    await spawnChild(
+      input.sessionId,
+      path,
+      buildClaudeSpawnArgs({
+        ...launch,
+        kit: kit && { pluginDirs: kit.pluginDirs, mcpConfig: kit.mcpConfig },
+      }),
+      input.cwd,
+      { provider: "claude", id: input.providerAccountId ?? "default" },
+      "claude",
+      undefined,
+      undefined,
+      kit?.env,
+    );
+  } finally {
+    releaseKit?.();
+  }
 
   liveByThread.set(input.sessionId, live);
   resumeByThread.set(input.sessionId, {

@@ -2085,6 +2085,15 @@ describe("claude kit", () => {
     expect(spawnedEnv[0]).toEqual({ MONOPTAH_KIT_X_TOKEN: "secret-value" });
   });
 
+  it("leases the kit at snapshot time and releases it once the child is spawned", async () => {
+    const release = vi.fn();
+    const lease = vi.fn(() => release);
+    setClaudeKitProvider(() => kit({ lease }));
+    await startTurn("s1");
+    expect(lease).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
   it("spawns with no kit flags and no env when none is applied", async () => {
     await startTurn("s1");
     expect(spawned[0]).not.toContain("--plugin-dir");
