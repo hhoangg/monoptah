@@ -3,6 +3,7 @@
 use super::move_session::*;
 use super::move_session::{is_older, scrub};
 use super::*;
+use crate::cloud_sessions::docker_config::DockerProjectConfig;
 use crate::codespaces::{GhOutput, GhRunner};
 use crate::remote::Machine;
 use crate::store::SessionLocation;
@@ -243,6 +244,7 @@ impl super::Host for FakeHost {
                         None => return Err("Upload not found".into()),
                     }
                 }
+                let first_apply = self.count("workspace.applySnapshot") == 1;
                 let tree = self
                     .wrong_tree
                     .lock()
@@ -254,8 +256,9 @@ impl super::Host for FakeHost {
                     "branch": params["branch"],
                     "head": params["head"],
                     "tree": tree,
-                    "createdWorktree": params["instance"] == "shared",
-                    "reused": false,
+                    // The Host creates the worktree once; a repeated call finds it in place.
+                    "createdWorktree": params["instance"] == "shared" && first_apply,
+                    "reused": !first_apply,
                     "patchApplied": params["patchUploadId"].is_string(),
                 }))
             }
@@ -1692,6 +1695,10 @@ impl GhRunner for StartGh {
             )
         } else if line.starts_with("api user/codespaces") {
             out("https://asked.github.dev\n")
+        } else if line.starts_with("codespace list") {
+            out(
+                r#"[{"name":"octo-new1","displayName":"x","state":"Available","machineName":"basicLinux32gb","repository":"octo/widgets"}]"#,
+            )
         } else if line.starts_with("codespace view") {
             out(r#"{"state":"Available"}"#)
         } else if line.starts_with("codespace ssh") {
@@ -1853,4 +1860,326 @@ fn the_default_branch_is_used_only_when_head_is_origins_tip_and_nothing_is_pushe
         "main"
     );
     assert_eq!(fx.origin_ref("main-cloud"), None);
+}
+
+// ------------------------------------------------------- review findings
+
+#[test]
+fn a_cancel_after_the_flip_never_deletes_the_live_cloud_session() {
+    let fx = Fx::new();
+    fx.run().0.unwrap();
+    let deletes = fx.host.count("sessions.delete");
+    let scripts = fx.backend.scripts().len();
+    // A crash in the cleanup left the record behind although the location is Cloud.
+    let mut record = fx.begin_unchecked_for_crash_test();
+    record.done = MoveStep::ALL.to_vec();
+    record.created_worktree = true;
+    fx.save_record(&record);
+    let report = fx
+        .svc
+        .cancel_move(fx.session, CancelChoice::default())
+        .unwrap();
+    assert!(report.warnings.iter().any(|w| w.contains("already moved")));
+    assert_eq!(fx.host.count("sessions.delete"), deletes);
+    assert_eq!(fx.backend.scripts().len(), scripts, "no worktree removal");
+    assert!(fx.location().is_cloud());
+    assert!(fx
+        .store
+        .lock()
+        .unwrap()
+        .cloud_host_record(fx.session)
+        .is_ok());
+    assert!(fx.record().is_none());
+    assert!(moved_path_note(&fx.store.lock().unwrap(), fx.session).is_some());
+}
+
+#[test]
+fn the_flip_is_remembered_before_the_cleanup() {
+    let fx = Fx::new();
+    fx.run().0.unwrap();
+    // The record is cleared only at the very end; a re-run of a finished move is a no-op flip.
+    let mut record = fx.begin_unchecked_for_crash_test();
+    record.done = MoveStep::ALL[..6].to_vec();
+    fx.save_record(&record);
+    fx.run().0.unwrap();
+    assert!(fx.record().is_none());
+}
+
+#[test]
+fn the_anchor_is_read_before_the_copy_and_a_change_during_it_is_caught() {
+    let fx = Fx::new();
+    fx.begin();
+    // busy is asked at the run start, at the snapshot start and at the snapshot end.
+    let calls = Arc::new(Mutex::new(0usize));
+    let counter = calls.clone();
+    let store = fx.store.clone();
+    let session = fx.session;
+    let busy = move || {
+        let mut n = counter.lock().unwrap();
+        *n += 1;
+        if *n == 3 {
+            // A turn lands after the copy was started.
+            store
+                .lock()
+                .unwrap()
+                .write_rows(
+                    session,
+                    4,
+                    &[Row {
+                        role: "user".into(),
+                        text: "late".into(),
+                        first: true,
+                        sent_at: None,
+                    }],
+                )
+                .unwrap();
+        }
+        false
+    };
+    let (result, _) = fx.run_with(&busy, &AtomicBool::new(false));
+    assert!(result
+        .unwrap_err()
+        .contains("changed while the move was reading"));
+    assert_eq!(fx.record().unwrap().failed_at, Some(MoveStep::Snapshot));
+    assert_eq!(fx.origin_ref("feat"), None);
+    // Retry reads again and the move completes with the new row inside its move point.
+    fx.run().0.unwrap();
+    let SessionLocation::Cloud(location) = fx.location() else {
+        panic!()
+    };
+    assert_eq!(location.moved_at_row, 5);
+}
+
+#[test]
+fn a_session_that_becomes_busy_during_the_snapshot_is_refused() {
+    let fx = Fx::new();
+    fx.begin();
+    let calls = Arc::new(Mutex::new(0usize));
+    let counter = calls.clone();
+    let (result, _) = fx.run_with(
+        &move || {
+            let mut n = counter.lock().unwrap();
+            *n += 1;
+            *n == 2
+        },
+        &AtomicBool::new(false),
+    );
+    assert_eq!(result.unwrap_err(), BUSY);
+    assert_eq!(fx.record().unwrap().failed_at, Some(MoveStep::Snapshot));
+}
+
+#[test]
+fn a_rerun_of_the_code_step_keeps_the_worktree_the_first_run_created() {
+    let fx = Fx::new();
+    fx.set_flip_hook(|_| Err("crash".into()));
+    assert!(fx.run().0.is_err());
+    // Restore again (as after an expired upload): the Host now answers reused.
+    let mut record = fx.record().unwrap();
+    record.done.retain(|s| {
+        !matches!(
+            s,
+            MoveStep::RestoreCode | MoveStep::RestoreConversation | MoveStep::Flip
+        )
+    });
+    fx.save_record(&record);
+    assert!(fx.run().0.is_err());
+    assert_eq!(fx.host.count("workspace.applySnapshot"), 2);
+    assert!(fx.record().unwrap().created_worktree);
+    fx.svc
+        .cancel_move(fx.session, CancelChoice::default())
+        .unwrap();
+    assert!(fx
+        .backend
+        .scripts()
+        .join("\n")
+        .contains("worktree remove --force"));
+}
+
+#[test]
+fn a_codespace_created_by_a_failed_start_is_reused_not_created_twice() {
+    let (fx, gh, _) = new_codespace_fx();
+    let mut record = fx.svc.begin_move(new_request(&fx), &|| false).unwrap();
+    record.workspace = Some(WorkspaceInfo {
+        backend: CloudBackendKind::Codespaces,
+        name: "octo-new1".into(),
+        created: true,
+        start_session: None,
+        project: None,
+    });
+    fx.save_record(&record);
+    let outcome = fx.run().0.unwrap();
+    assert_eq!(outcome.cloud, CloudRef::codespace("octo-new1"));
+    let creates = gh
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.starts_with("api --method POST"))
+        .count();
+    assert_eq!(creates, 0, "a second codespace was created");
+}
+
+#[test]
+fn a_crash_while_creating_a_workspace_is_noticed_on_retry() {
+    let (fx, gh, _) = new_codespace_fx();
+    let mut record = fx.svc.begin_move(new_request(&fx), &|| false).unwrap();
+    record.workspace = Some(WorkspaceInfo {
+        backend: CloudBackendKind::Codespaces,
+        name: String::new(),
+        created: true,
+        start_session: None,
+        project: None,
+    });
+    fx.save_record(&record);
+    let (result, events) = fx.run();
+    result.unwrap();
+    assert!(notices(&events)
+        .iter()
+        .any(|n| n.contains("may have created a workspace")));
+    assert_eq!(
+        gh.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.starts_with("api --method POST"))
+            .count(),
+        1
+    );
+    // A cancel never tries to delete a workspace that has no name.
+    let (fx, _, _) = new_codespace_fx();
+    let mut record = fx.svc.begin_move(new_request(&fx), &|| false).unwrap();
+    record.workspace = Some(WorkspaceInfo {
+        backend: CloudBackendKind::Codespaces,
+        name: String::new(),
+        created: true,
+        start_session: None,
+        project: None,
+    });
+    fx.save_record(&record);
+    let report = fx
+        .svc
+        .cancel_move(
+            fx.session,
+            CancelChoice {
+                delete_workspace: true,
+            },
+        )
+        .unwrap();
+    assert!(!report.deleted_workspace);
+    assert!(fx.backend.deleted.lock().unwrap().is_empty());
+}
+
+#[test]
+fn from_cwds_also_names_the_folders_the_transcript_itself_uses() {
+    let fx = Fx::new();
+    let jsonl = fx
+        .home
+        .join("projects")
+        .join(encode(&fx.work))
+        .join(format!("{CLAUDE_ID}.jsonl"));
+    let text = std::fs::read_to_string(&jsonl).unwrap();
+    std::fs::write(
+        &jsonl,
+        text.replace(&*fx.work.to_string_lossy(), "/old/worktree"),
+    )
+    .unwrap();
+    fx.run().0.unwrap();
+    let from: Vec<String> = fx.host.calls("sessions.import")[0]["fromCwds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(from.contains(&"/old/worktree".to_string()), "{from:?}");
+    assert!(
+        from.contains(&fx.work.to_string_lossy().into_owned()),
+        "{from:?}"
+    );
+}
+
+#[test]
+fn the_claude_version_check_runs_once_per_move() {
+    let fx = Fx::new();
+    *fx.backend.version.lock().unwrap() = "2.1.300 (Claude Code)".into();
+    fx.set_flip_hook(|_| Err("crash".into()));
+    assert!(fx.run().0.is_err());
+    *fx.svc.flip_hook.lock().unwrap() = None;
+    fx.run().0.unwrap();
+    let updates = fx
+        .backend
+        .scripts()
+        .iter()
+        .filter(|s| s.contains("claude update"))
+        .count();
+    assert_eq!(updates, 1);
+    let reads = fx
+        .backend
+        .scripts()
+        .iter()
+        .filter(|s| s.contains("claude --version"))
+        .count();
+    assert_eq!(
+        reads, 2,
+        "read before and after the one update, never again"
+    );
+}
+
+#[test]
+fn a_push_can_be_cancelled_and_has_a_time_limit() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fx::new();
+    let hook = fx.origin.join("hooks/pre-receive");
+    std::fs::write(&hook, "#!/bin/sh\nsleep 20\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let args = crate::scm::push_commit_args(&fx.work, "origin", &fx.head(), "feat", false).unwrap();
+    // The time limit.
+    let started = std::time::Instant::now();
+    let error = super::move_out::push_timed(
+        &fx.work,
+        &args,
+        Duration::from_millis(400),
+        &AtomicBool::new(false),
+    )
+    .unwrap_err();
+    assert!(error.contains("took longer"), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(10));
+    // The cancel flag.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let flag = cancel.clone();
+    let stopper = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(400));
+        flag.store(true, Ordering::SeqCst);
+    });
+    let started = std::time::Instant::now();
+    let error =
+        super::move_out::push_timed(&fx.work, &args, Duration::from_secs(60), &cancel).unwrap_err();
+    stopper.join().unwrap();
+    assert_eq!(error, super::move_out::PUSH_CANCELLED);
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(fx.origin_ref("feat"), None);
+}
+
+#[test]
+fn a_sandbox_move_starts_on_the_pushed_branch_as_both_base_and_feature() {
+    let config = DockerProjectConfig {
+        repo_url: "https://github.com/octo/widgets".into(),
+        base_ref: "main".into(),
+        ..Default::default()
+    };
+    let used = super::move_session::sandbox_config_for(config.clone(), "feat");
+    assert_eq!(used.base_ref, "feat");
+    assert_eq!(used.repo_url, config.repo_url);
+    // Without sandbox support the move fails at the workspace step and leaves no trace of one.
+    let fx = Fx::new();
+    let request = MoveRequest {
+        target: MoveTarget::NewSandbox { config },
+        ..fx.request()
+    };
+    fx.svc.begin_move(request, &|| false).unwrap();
+    let (result, _) = fx.run();
+    assert!(result.unwrap_err().contains("not available"));
+    let record = fx.record().unwrap();
+    assert_eq!(record.failed_at, Some(MoveStep::Workspace));
+    assert!(record.workspace.is_none());
+    assert!(fx.origin_ref("feat").is_some(), "the push came first");
 }

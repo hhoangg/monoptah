@@ -1045,13 +1045,13 @@ fn push_for(root: &Path) -> Result<(), String> {
 /// checked out branch is `branch` itself and still at `head`: setting the upstream of a
 /// local branch to a differently named `-cloud` branch would change what its plain
 /// `git push` does.
-pub(crate) fn push_commit_to_branch(
+pub(crate) fn push_commit_args(
     root: &Path,
     remote: &str,
     head: &str,
     branch: &str,
     set_upstream: bool,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let hex = |s: &str| matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit());
     if !hex(head) {
         return Err("Invalid commit to push".into());
@@ -1071,11 +1071,30 @@ pub(crate) fn push_commit_to_branch(
             == Some(branch)
         && git_stdout(root, &["rev-parse", "--verify", "HEAD"]).as_deref() == Some(head);
     let dst = format!("refs/heads/{branch}");
-    if on_branch {
-        git_checked(root, &["push", "-u", remote, &format!("HEAD:{dst}")])
+    Ok(if on_branch {
+        vec![
+            "push".into(),
+            "-u".into(),
+            remote.into(),
+            format!("HEAD:{dst}"),
+        ]
     } else {
-        git_checked(root, &["push", remote, &format!("{head}:{dst}")])
-    }
+        vec!["push".into(), remote.into(), format!("{head}:{dst}")]
+    })
+}
+
+/// [`push_commit_args`] run without a time limit.
+#[cfg(test)]
+pub(crate) fn push_commit_to_branch(
+    root: &Path,
+    remote: &str,
+    head: &str,
+    branch: &str,
+    set_upstream: bool,
+) -> Result<(), String> {
+    let args = push_commit_args(root, remote, head, branch, set_upstream)?;
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    git_checked(root, &args)
 }
 
 fn pr_status_for(root: &Path) -> Option<Pr> {

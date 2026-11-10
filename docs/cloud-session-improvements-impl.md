@@ -1438,6 +1438,10 @@ get them after HR2.
 - **Files:** `gpui/shell/session_groups.rs` (menu), `gpui/conversation/cloud_target.rs`
   (the composer menu for sessions with messages), a new dialog module in `gpui/shell/`,
   and `gpui/transcript/cloud_start.rs` (steps).
+- **F4-3a note:** `store_handoff` writes `settings.handoff` AFTER the flip (summary path). An
+  open Conversation keeps its settings in memory and may miss it, or overwrite it on its next
+  `save_settings`, so the UI must reload the session settings when the move finishes. The same
+  goes for the moved-path note (a store setting, read at the first cloud send).
 - **Acceptance:**
   - [ ] Tests: the dialog lists the push target, the counts and the ignored files; it is
     refused while busy; the progress maps `MoveRecord` steps; the divider renders.

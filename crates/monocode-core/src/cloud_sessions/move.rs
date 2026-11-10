@@ -240,6 +240,9 @@ pub struct MoveRecord {
     // Push.
     #[serde(default)]
     pub pushed: bool,
+    /// The Claude version check ran (once per move, whatever happens at the flip).
+    #[serde(default)]
+    pub version_checked: bool,
     // Workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceInfo>,
@@ -563,6 +566,7 @@ impl CloudSessions {
             anchor: RowAnchor::default(),
             local_version: None,
             pushed: false,
+            version_checked: false,
             workspace: None,
             patch_upload: None,
             transcript_upload: None,
@@ -652,6 +656,9 @@ impl CloudSessions {
             }
             break;
         }
+        // The flip is over: remember it before the cleanup, so a crash in the cleanup is not
+        // read as a move that is still to be done (a Cancel would delete the live session).
+        save_record(&*self.store()?, &record)?;
         let outcome = self.finish_move(&record)?;
         events(MoveEvent::Done(outcome.clone()));
         Ok(outcome)
@@ -693,8 +700,8 @@ impl CloudSessions {
         cancel: &AtomicBool,
     ) -> Result<(), Stop> {
         match step {
-            MoveStep::Snapshot => self.step_snapshot(record, events),
-            MoveStep::Push => self.step_push(record, events),
+            MoveStep::Snapshot => self.step_snapshot(record, busy, events),
+            MoveStep::Push => self.step_push(record, events, cancel),
             MoveStep::Workspace => self.step_workspace(record, events, cancel),
             MoveStep::Upload => self.step_upload(record, events, cancel),
             MoveStep::RestoreCode => self.step_restore_code(record, events),
@@ -708,10 +715,17 @@ impl CloudSessions {
     fn step_snapshot(
         &self,
         record: &mut MoveRecord,
+        busy: &dyn Fn() -> bool,
         events: &mut dyn FnMut(MoveEvent),
     ) -> Result<(), Stop> {
         let staging = self.staging_dir(record.session_id)?;
         let work = PathBuf::from(&record.work_cwd);
+        // The anchor is read BEFORE anything is copied, so a turn that lands while the
+        // snapshot is taken is never inside the anchor but missing from the copy.
+        if local_busy(record.session_id, busy) {
+            return Err(Stop::Failed(BUSY.into()));
+        }
+        let anchor = self.store()?.row_anchor(record.session_id)?;
         events(MoveEvent::Log("Reading the local git state".into()));
         move_out::fetch_origin(&work)?;
         let target = move_out::push_target(&work)?;
@@ -792,7 +806,17 @@ impl CloudSessions {
         if let MoveKind::Summary { reason } = &record.kind {
             record.warnings.insert(0, reason.clone());
         }
-        record.anchor = self.store()?.row_anchor(record.session_id)?;
+        // Nothing may have changed while the copy was made: a turn that started and ended in
+        // between is in neither the anchor nor (reliably) the patch and the transcript.
+        if local_busy(record.session_id, busy)
+            || self.store()?.row_anchor(record.session_id)? != anchor
+            || move_out::head_commit(&work).as_deref() != Some(snapshot.head.as_str())
+        {
+            return Err(Stop::Failed(
+                "The conversation or the code changed while the move was reading it. Retry to read it again.".into(),
+            ));
+        }
+        record.anchor = anchor;
         for warning in record.warnings.clone() {
             events(MoveEvent::Notice(warning));
         }
@@ -805,6 +829,7 @@ impl CloudSessions {
         &self,
         record: &mut MoveRecord,
         events: &mut dyn FnMut(MoveEvent),
+        cancel: &AtomicBool,
     ) -> Result<(), Stop> {
         if !record.needs_push {
             events(MoveEvent::Log(format!(
@@ -830,13 +855,18 @@ impl CloudSessions {
             "Pushing to origin/{}",
             record.branch
         )));
-        crate::scm::push_commit_to_branch(
+        let args = crate::scm::push_commit_args(
             &work,
             "origin",
             &record.head,
             &record.branch,
             record.creates_branch,
         )?;
+        match move_out::push_timed(&work, &args, move_out::PUSH_TIMEOUT, cancel) {
+            Ok(()) => {}
+            Err(error) if error == move_out::PUSH_CANCELLED => return Err(Stop::Aborted),
+            Err(error) => return Err(Stop::Failed(error)),
+        }
         if move_out::origin_branch_tip(&work, &record.branch)?.as_deref()
             != Some(record.head.as_str())
         {
@@ -856,10 +886,64 @@ impl CloudSessions {
         events: &mut dyn FnMut(MoveEvent),
         cancel: &AtomicBool,
     ) -> Result<(), Stop> {
+        // A placeholder from a crash while a workspace was being created: it may exist, but
+        // nothing says where. Tell the user and create again.
+        if record
+            .workspace
+            .as_ref()
+            .is_some_and(|w| w.created && w.name.is_empty() && w.start_session.is_none())
+        {
+            record.workspace = None;
+            let note = "An earlier attempt may have created a workspace before the app stopped. Check your codespaces or sandboxes and delete one you do not need.".to_string();
+            record.notices.push(note.clone());
+            events(MoveEvent::Notice(note));
+        }
+        // A start that failed after the codespace was created: reuse that codespace.
+        let reuse = record
+            .workspace
+            .as_ref()
+            .filter(|w| {
+                w.created
+                    && w.backend == CloudBackendKind::Codespaces
+                    && !w.name.is_empty()
+                    && w.start_session.is_none()
+                    && w.project.is_none()
+            })
+            .map(|w| w.name.clone());
+        if let Some(name) = reuse {
+            let (session, _) = self.begin_start(
+                &record.project_cwd,
+                Target {
+                    codespace: CodespaceChoice::Named(name),
+                    branch: None,
+                    machine: None,
+                },
+                super::HARNESS,
+            )?;
+            if let Some(info) = record.workspace.as_mut() {
+                info.start_session = Some(session.id);
+            }
+            save_record(&*self.store()?, record)?;
+        }
         if record.workspace.is_none() {
-            let workspace = match record.target.clone() {
-                MoveTarget::NewCodespace { machine } => {
-                    let (session, start) = self.begin_start(
+            let creating = !matches!(record.target, MoveTarget::Existing { .. });
+            if creating {
+                // Saved before the instance is created, so a crash leaves a trace.
+                record.workspace = Some(WorkspaceInfo {
+                    backend: match &record.target {
+                        MoveTarget::NewSandbox { .. } => CloudBackendKind::DockerSandbox,
+                        _ => CloudBackendKind::Codespaces,
+                    },
+                    name: String::new(),
+                    created: true,
+                    start_session: None,
+                    project: None,
+                });
+                save_record(&*self.store()?, record)?;
+            }
+            let created = match record.target.clone() {
+                MoveTarget::NewCodespace { machine } => self
+                    .begin_start(
                         &record.project_cwd,
                         Target {
                             codespace: CodespaceChoice::New,
@@ -867,40 +951,54 @@ impl CloudSessions {
                             machine,
                         },
                         super::HARNESS,
-                    )?;
-                    WorkspaceInfo {
+                    )
+                    .map(|(session, start)| WorkspaceInfo {
                         backend: CloudBackendKind::Codespaces,
                         name: start.codespace,
                         created: true,
                         start_session: Some(session.id),
                         project: None,
-                    }
-                }
-                MoveTarget::NewSandbox { mut config } => {
-                    config.base_ref = record.branch.clone();
-                    let (session, start) = self.begin_sandbox_start(
+                    }),
+                MoveTarget::NewSandbox { config } => self
+                    .begin_sandbox_start(
                         &record.project_cwd,
-                        &config,
+                        &sandbox_config_for(config, &record.branch),
                         &record.branch,
                         super::HARNESS,
-                    )?;
-                    WorkspaceInfo {
+                    )
+                    .map(|(session, start)| WorkspaceInfo {
                         backend: CloudBackendKind::DockerSandbox,
                         name: start.sandbox.unwrap_or_default(),
                         created: true,
                         start_session: Some(session.id),
                         project: None,
-                    }
-                }
-                MoveTarget::Existing { backend, name } => WorkspaceInfo {
+                    }),
+                MoveTarget::Existing { backend, name } => Ok(WorkspaceInfo {
                     backend,
                     name,
                     created: false,
                     start_session: None,
                     project: None,
-                },
+                }),
             };
-            record.workspace = Some(workspace);
+            match created {
+                Ok(workspace) => record.workspace = Some(workspace),
+                Err(error) => {
+                    // The codespace may exist even though the start failed: keep its name.
+                    record.workspace = match super::split_created_note(&error) {
+                        Some((_, kind, name)) => Some(WorkspaceInfo {
+                            backend: kind,
+                            name: name.to_string(),
+                            created: true,
+                            start_session: None,
+                            project: None,
+                        }),
+                        None => None,
+                    };
+                    save_record(&*self.store()?, record)?;
+                    return Err(Stop::Failed(error));
+                }
+            }
             // Saved before the start runs: a crash must still know what was created.
             save_record(&*self.store()?, record)?;
         }
@@ -922,6 +1020,21 @@ impl CloudSessions {
         save_record(&*self.store()?, record)?;
         // The blank session the start made is plumbing: the moved session is the one row.
         if let Some(start) = workspace.start_session {
+            // The start made no Host session unless something sent to it; if one exists it is
+            // not the moved conversation, so it goes too.
+            let blank = self
+                .store()?
+                .remote_session(start)?
+                .and_then(|s| s.session_id);
+            if let (Some(host_session), Some(info)) = (blank, record.workspace.as_ref()) {
+                if let Some(project) = &info.project {
+                    let _ = self.rpc(
+                        record,
+                        "sessions.delete",
+                        json!({"sessionId": host_session, "projectId": project.project_id}),
+                    );
+                }
+            }
             let store = self.store()?;
             let _ = store.forget_cloud_session(start);
             if let Some(info) = record.workspace.as_mut() {
@@ -1159,7 +1272,8 @@ impl CloudSessions {
             .filter(|cwd| !cwd.is_empty())
             .ok_or("The Host did not say where it restored the code")?;
         record.host_cwd = Some(cwd.to_string());
-        record.created_worktree = result["createdWorktree"].as_bool().unwrap_or(false);
+        // A re-run finds the worktree in place (`reused`): the first creation is what counts.
+        record.created_worktree |= result["createdWorktree"].as_bool().unwrap_or(false);
         Ok(())
     }
 
@@ -1200,7 +1314,13 @@ impl CloudSessions {
                         from.push(real.to_string_lossy().into_owned());
                     }
                 }
-                from.dedup();
+                // The folders the transcript itself names (its first entries), in case the
+                // session's own folders differ from them (a removed worktree, a moved project).
+                if let Ok(staging) = self.staging_dir(record.session_id) {
+                    if let Ok(file) = transcript_file(&staging, &id) {
+                        from.extend(transcript_cwds(&file));
+                    }
+                }
                 let mut seen = std::collections::HashSet::new();
                 from.retain(|p| seen.insert(p.clone()));
                 let result = self.rpc(
@@ -1334,8 +1454,10 @@ impl CloudSessions {
             .clone()
             .ok_or("The move has no cloud session")?;
         let host_cwd = record.host_cwd.clone().unwrap_or_default();
-        if matches!(record.kind, MoveKind::Resume) {
+        if matches!(record.kind, MoveKind::Resume) && !record.version_checked {
             self.check_claude_version(record, &workspace, events);
+            record.version_checked = true;
+            save_record(&*self.store()?, record)?;
         }
         let note = format!(
             "This session moved from {} to {}; paths in earlier messages refer to the old location.",
@@ -1514,12 +1636,35 @@ impl CloudSessions {
         choice: CancelChoice,
     ) -> Result<CancelReport, String> {
         let record = move_record(&*self.store()?, session_id).ok_or(NO_MOVE)?;
+        // A move whose flip already happened is over: its Host session, worktree and uploads
+        // belong to the live cloud session now. Only the leftovers of the move are removed.
+        let located = self.store()?.cloud_location(session_id)?;
+        if let (SessionLocation::Cloud(location), Some(host)) =
+            (located, record.host_session_id.as_deref())
+        {
+            if location.host_session_id == host {
+                if let Ok(dir) = self.staging_dir(session_id) {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+                clear_record(&*self.store()?, session_id)?;
+                return Ok(CancelReport {
+                    warnings: vec![
+                        "The conversation had already moved to the cloud; nothing was rolled back."
+                            .into(),
+                    ],
+                    ..Default::default()
+                });
+            }
+        }
         let mut report = CancelReport {
             created_branch: (record.creates_branch && record.pushed).then(|| record.branch.clone()),
             ..Default::default()
         };
         let mut warnings: Vec<String> = vec![];
-        let created = record.workspace.as_ref().filter(|w| w.created);
+        let created = record
+            .workspace
+            .as_ref()
+            .filter(|w| w.created && !w.name.is_empty());
         let deleting = choice.delete_workspace && created.is_some();
         if record
             .workspace
@@ -1629,6 +1774,44 @@ impl CloudSessions {
             .run_script(&workspace.name, &script, false)
             .map(|_| ())
     }
+}
+
+/// The absolute `cwd` values of the first entries of a transcript (read line by line, capped).
+fn transcript_cwds(file: &Path) -> Vec<String> {
+    use std::io::BufRead;
+    let Ok(file) = std::fs::File::open(file) else {
+        return vec![];
+    };
+    let mut found: Vec<String> = vec![];
+    for line in std::io::BufReader::new(file)
+        .lines()
+        .take(200)
+        .map_while(Result::ok)
+    {
+        if !line.contains("\"cwd\"") {
+            continue;
+        }
+        if let Some(cwd) = serde_json::from_str::<Value>(&line)
+            .ok()
+            .and_then(|entry| entry["cwd"].as_str().map(str::to_owned))
+            .filter(|cwd| cwd.starts_with('/') && cwd.len() > 1 && !cwd.contains('\0'))
+        {
+            if !found.contains(&cwd) && found.len() < 4 {
+                found.push(cwd);
+            }
+        }
+    }
+    found
+}
+
+/// The sandbox config of a move: it starts on the pushed branch, so base and feature are the
+/// same branch (the clone phase then checks out the tracking branch).
+pub(super) fn sandbox_config_for(
+    mut config: DockerProjectConfig,
+    branch: &str,
+) -> DockerProjectConfig {
+    config.base_ref = branch.to_string();
+    config
 }
 
 /// `<staging>/transcript/projects/<dir>/<id>.jsonl`, as [`move_out::collect_transcript`] lays
