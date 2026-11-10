@@ -266,6 +266,9 @@ impl SettingsView {
                         "Reading some items took too long. They are listed but cannot be copied. Press Refresh to try again.",
                     ));
                 }
+                if let Some(text) = kit_prefs::key_unavailable_note(inventory) {
+                    rows.push(note(text));
+                }
                 let (bytes, _) = kit_prefs::selected_compressed(inventory, kit);
                 if bytes > MAX_KIT_COMPRESSED_BYTES {
                     rows.push(note(format!(

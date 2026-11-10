@@ -33,6 +33,15 @@ use super::kit::{
 /// Shown once, the first time the kit is enabled. The wording is fixed by design 3.2.2.
 pub const NOTICE: &str = "Your MCP secrets and sign-ins will be copied to your cloud workspaces. They will be visible to the agent, to every MCP server and to every command the agent runs there.";
 
+/// Shown on the Cloud page when the local key for secret digests could not be used.
+pub const KEY_UNAVAILABLE_NOTE: &str =
+    "Secret change detection is unavailable: the local key could not be used.";
+
+/// The note for this inventory, if any: only when `key_unavailable`.
+pub fn key_unavailable_note(inventory: &KitInventory) -> Option<&'static str> {
+    inventory.key_unavailable.then_some(KEY_UNAVAILABLE_NOTE)
+}
+
 /// The global preferences entry `cloudKit`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -282,7 +291,8 @@ fn exclusion_reason(exclusion: Exclusion) -> &'static str {
         Exclusion::ScanTimedOut => "Reading it took too long",
         Exclusion::LinkLeavesItem => "A link points outside this item",
         Exclusion::UnsafeRoot => "This folder is not a safe place to copy from",
-        Exclusion::HardLinkElsewhere => "A file is a hard link to another disk",
+        Exclusion::HardLinkElsewhere => "A file is a hard link to a credentials file",
+        Exclusion::SensitiveContent => "It contains a credentials folder",
     }
 }
 
@@ -541,6 +551,7 @@ pub fn secret_field_names(server: &KitMcpServer) -> Vec<String> {
             SecretLocation::Env(name) => format!("env {name}"),
             SecretLocation::Header(name) => format!("header {name}"),
             SecretLocation::UrlQuery => "URL query".into(),
+            SecretLocation::UrlUserinfo => "URL user and password".into(),
         })
         .collect()
 }

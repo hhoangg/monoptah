@@ -374,3 +374,14 @@ fn the_cap_counts_checked_items_only() {
     inventory.skills[0].exclusion = Some(Exclusion::ScanTimedOut);
     assert!(!selected_compressed(&inventory, &prefs).1);
 }
+
+#[test]
+fn the_key_note_shows_only_when_the_key_is_unavailable() {
+    let mut inventory = fixture();
+    assert_eq!(key_unavailable_note(&inventory), None);
+    inventory.key_unavailable = true;
+    assert_eq!(
+        key_unavailable_note(&inventory),
+        Some("Secret change detection is unavailable: the local key could not be used.")
+    );
+}
