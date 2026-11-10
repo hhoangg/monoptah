@@ -1510,9 +1510,9 @@ ticket, after review and after merge.
 | F2-4h | 3 | merged | csi-f2-4h | merge 64f9c10e. Opus review x4 fixed: dir watch retry (wanted vs live), recreated ref dirs, replaced client dirs by dev:ino, confinement on re-create, async rate-limited heal with generation tokens, once-per-episode overflow. Host only; reaches users after HR2. |
 | F2-5h | 3 | merged | csi-f2-3h-5h | merge 813f30c3. Idle guard on discard/stash (project lock atomic), 90 s push/pull/sync. Known: 90 s timeout kills git only (not its process group); push now holds the project lock up to 90 s. |
 | HR2 | 3 | merged | - | see HR1: covered by the combined host-v1.1.0 release; pin 1.1.0 (H2a) |
-| F2-3 | 3 | todo | - | |
-| F2-4 | 3 | todo | - | |
-| F2-5 | 3 | in progress | csi-f2-5 | |
+| F2-3 | 3 | in progress | csi-f2-3 | |
+| F2-4 | 3 | in progress | csi-f2-4 | |
+| F2-5 | 3 | merged | csi-f2-5 | merge cdc57294 (remote.rs conflict with H2a resolved: kept host_info helpers and request_timeout wrapper; core tests green). Opus review: sync gets 200 s (Host pull+push can take 2x90 s), push/pull 120 s, MAY_STILL_RUN keeps the panel in a checking state with repeated ahead/behind reads, connect/DNS errors are not MAY_STILL_RUN. |
 | F3-3h | 4 | merged | csi-f3-3h | merge c7113999. Opus review x3 fixed: tar unpacker hardened, fresh unpack per apply, async unpack, secrets scrub (single pass), child env allowlist MONOPTAH_KIT_*, kit.health via temp CLAUDE_CONFIG_DIR in own process group with hard timeout (signInNeeded vs failed; sign-in state not observable, D12), rollback + crash recovery, leases vs prune. Result field kitServers (app side must use it). No claude mcp list --mcp-config (2.1.322 has no such flag). |
 | F3-5h | 4 | skipped: dropped by user decision D12 | - | no OAuth sign-in merge on the Host |
 | F4-2h | 4 | merged | csi-f4-2h | merge be7abcb2 (server.ts and spec conflicts resolved keeping both; host tests 438 passed, check:web green). Opus review x3 fixed: cwd rewrite only named roots (fromCwds REQUIRED), TS/Rust serde parity pinned by shared fixtures, instance:new rollback, force-added files, deterministic fork id, 50 MB cap, default branch refused only when head != origin tip (no ls-remote). Contract for F4-3a: delete/unbind the old Host session before re-import; send fromCwds. |

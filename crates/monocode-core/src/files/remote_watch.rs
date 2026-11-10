@@ -116,7 +116,7 @@ impl LiveWatchHost {
         root: &str,
         command: &str,
         args: Value,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<Value, String> {
         let remote = parse_remote_path(root).ok_or("Invalid remote working copy")?;
         let connections = default_connections()?;
@@ -131,7 +131,7 @@ impl LiveWatchHost {
             .map_err(super::remote::workspace_error)
     }
     fn short(&self, root: &str, command: &str, args: Value) -> Result<Value, String> {
-        self.call(root, command, args, crate::remote::REQUEST_TIMEOUT)
+        self.call(root, command, args, None)
     }
     fn host_path(root: &str) -> Result<String, String> {
         parse_remote_path(root)
@@ -172,7 +172,7 @@ impl WatchHost for LiveWatchHost {
         .map(|_| ())
     }
     fn wait(&self, root: &str, id: &str) -> Result<Changes, String> {
-        let result = self.call(root, "wait_changes", json!({"id": id}), WAIT_TIMEOUT)?;
+        let result = self.call(root, "wait_changes", json!({"id": id}), Some(WAIT_TIMEOUT))?;
         decode_changes(root, result)
     }
     fn unwatch(&self, root: &str, id: &str) {

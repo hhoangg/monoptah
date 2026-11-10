@@ -377,6 +377,23 @@ pub(crate) fn git_action(
     params: &Value,
     chosen: Option<(Kind, Option<String>)>,
 ) -> Result<Value, String> {
+    git_action_inner(root, params, chosen).map_err(phone_error)
+}
+
+/// The phone has no ahead/behind re-check, so the desktop's "Checking..." would be a lie.
+fn phone_error(error: String) -> String {
+    if error == monocode_core::remote::MAY_STILL_RUN {
+        "The operation may still be running on the host".into()
+    } else {
+        error
+    }
+}
+
+fn git_action_inner(
+    root: &Path,
+    params: &Value,
+    chosen: Option<(Kind, Option<String>)>,
+) -> Result<Value, String> {
     // The harness picked in the phone's composer writes the commit message and
     // pull request, as the desktop's panel uses its session's.
     let preferred = params["harness"]
@@ -797,6 +814,14 @@ pub(crate) fn file_highlight(job: &str, from: usize) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_phone_is_not_told_the_host_is_being_checked() {
+        let text = phone_error(monocode_core::remote::MAY_STILL_RUN.into());
+        assert_eq!(text, "The operation may still be running on the host");
+        assert!(!text.contains("Checking"));
+        assert_eq!(phone_error("rejected".into()), "rejected");
+    }
     use std::process::Command;
 
     struct Temp(PathBuf);
