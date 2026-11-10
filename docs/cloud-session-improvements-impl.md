@@ -171,6 +171,9 @@ These are final. Do not re-open them. If one turns out impossible, stop and ask 
 | D9 | Feature 4, identity: **one session, not two.** A local session gains a location (Local / Cloud). The harness (Claude) session id is the same on both sides: a session born in the cloud keeps the **cloud** id when it comes back, and a session born locally takes the **local** id up to the cloud. Design §4.2.1. |
 | D10 | Shared-id safety (design §4.9): **one writer at a time** (by location). Transcripts are compared by the entry `uuid` chain, never by bytes. An extension replaces the old copy, which is kept as `<id>.jsonl.pre-cloud`. **Divergence is never overwritten**: it forks to a new id and tells the user. After a lost workspace, continue on a new id with a summary, never on the stale file. |
 | D11 | The app API can only narrow user choices. It can turn the kit off, but cannot widen it. `sessions.moveToCloud` follows the same push rules (D8). |
+| D12 | (user decision, 2026-11-10) **MCP OAuth sign-ins are not copied.** The app never reads the macOS Keychain or Claude Code's credentials item/file for MCP. F3-5a and F3-5h are dropped. MCP servers whose credentials are raw values in config JSON (`headers`, `env`) are carried one way at setup as in D7. OAuth-signed MCP servers are carried config-only and marked "Sign in in the cloud". The `signed_in` seam of F3-1 stays `None`/unused for copying. |
+| D13 | (user decision, 2026-11-10) F4-0 may run real local `claude` requests: cheapest model, tiny prompts, a first ping per account, and on any rate-limit/usage-limit error the account is abandoned at once (no retry loops). |
+| D14 | (user decision, 2026-11-10) Before F3-4, F3-1 is hardened: (a) links inside a skill/plugin must stay inside that item's own root (no following into `~/.aws` and the like); (b) secret values are never part of `config_hash`/`content_hash` (keyed digest with a local key, never printed). Done in ticket F3-1b, Opus-reviewed. |
 
 ---
 
@@ -389,9 +392,10 @@ the tracker as `blocked: <reason>`, and ask the user.
        sandbox: `LocalOnly`.
      - `npx`/`uvx`/`bunx`/`node`/`python3`/`docker`: `NeedsRuntime`.
      - `${VAR}`-only values are not secrets. Query-string URLs are secret.
-     - `SignedIn` vs `NotSignedIn` needs F3-5a's storage answer. Until then, mark http/sse
-       servers without an `Authorization` header as `SignedIn` when F3-5a's probe
-       function says so. Leave a `fn signed_in(server) -> Option<bool>` seam that returns
+     - (D12) the app cannot know OAuth sign-in state and must not read it; http/sse
+       servers without an `Authorization` header are carried config-only and marked
+       "Sign in in the cloud". Historical note: the original plan used F3-5a's probe
+       function for `SignedIn`/`NotSignedIn`; Leave a `fn signed_in(server) -> Option<bool>` seam that returns
        `None` ("unknown") for now.
   4. **Committed project skills are skipped** (they arrive with the clone): use
      `git ls-files` in the local repo.
@@ -414,7 +418,9 @@ the tracker as `blocked: <reason>`, and ask the user.
 - **Risks:** large home dirs. Cap the scanning time and entries, as `skills.rs` does
   (`MAX_SKILLS`).
 
-#### F3-5a Spike: MCP OAuth sign-in storage (S). **Needs the user at the machine.**
+#### F3-5a Spike: MCP OAuth sign-in storage (S). **DROPPED by user decision D12 (2026-11-10).**
+
+> Do not run. The app never reads the Keychain or Claude Code credential files for MCP.
 
 - **Goal:** learn where Claude Code stores MCP OAuth sign-ins and in what shape, on macOS
   and on Linux, and which of the user's servers rotate refresh tokens. Design §3.2.5.
@@ -1274,14 +1280,16 @@ get them after HR2.
     - a changed kit hash respawns the process.
   - [ ] `npm run check:web` passes (shared TS).
 
-#### F3-5h Host MCP sign-in merge (S-M)
+#### F3-5h Host MCP sign-in merge (S-M). **DROPPED by user decision D12 (2026-11-10).**
+
+> Do not implement. No `mcpSignIns` field, no merge into the remote `.credentials.json`.
 
 - **Goal:** merge the copied MCP sign-ins into the remote Claude `.credentials.json`.
   Only the MCP keys; temp file and rename; 0600; tracked in `signins.json`. Design
   §3.2.5, rule D7.
-- **Depends on:** HR2, F3-5a (the key mapping).
+- **Depends on:** nothing (dropped, D12).
 - **Files:** `host/kit.ts` (`mcpSignIns` in `kit.secrets`) and tests.
-- **If F3-5a found the format unusable:** this ticket only marks those servers "Sign in
+- **(Dropped, D12.)** Originally: if F3-5a found the format unusable, this ticket only marked those servers "Sign in
   in the cloud". Record that in the tracker.
 - **Acceptance:**
   - [ ] Tests: Claude's own login keys are untouched; the merge is idempotent; removal of
@@ -1317,7 +1325,7 @@ get them after HR2.
 #### HR3 Release Host batch 3 and pin it (S). **Release: stop and ask.**
 
 - Same as HR2, with version `1.2.0`.
-- **Depends on:** F3-3h, F3-5h and F4-2h merged.
+- **Depends on:** F3-3h and F4-2h merged (F3-5h was dropped, D12).
 
 #### F3-4 "Claude setup" start step (M)
 
@@ -1347,20 +1355,24 @@ get them after HR2.
   - [ ] **Manual (ask the user):** a new codespace start with the kit, and the agent can
     use a skill and an MCP server on its first turn.
 
-#### F3-5 App side of MCP sign-ins (M). **Needs the user at the machine** for the manual check (Keychain prompt).
+#### F3-5 OAuth MCP servers: config-only, "Sign in in the cloud" (S). Reduced by user decision D12.
 
-- **Goal:** read the selected servers' local sign-ins and send them once in the setup
-  step. Health shows "needs sign-in". Re-copying happens only through "Update Claude
-  setup". Design §3.2.5, rule D7.
-- **Depends on:** F3-4, F3-5h, F3-5a.
-- **Files:** `core/cloud_sessions/kit.rs` (implement the `signed_in` seam from F3-1 and
-  the readers) and a new `core/cloud_sessions/kit_keychain.rs` (macOS `security`
-  invocation for the account's entry, the Linux/Windows file reader).
+- **Goal:** MCP servers that use OAuth sign-in (http/sse servers with no raw `Authorization`
+  header and no secret in config) are carried config-only in the kit and shown in the
+  setup health as "Sign in in the cloud". Nothing is read from the Keychain or from Claude
+  Code's credential files, and no sign-in is copied. Servers whose credentials are raw
+  values in `headers`/`env` keep working through the D7 secrets path. Design §3.2.5, D12.
+- **Depends on:** F3-4.
+- **Files:** `core/cloud_sessions/kit.rs` (classification: OAuth-style server = `NotSignedIn`/
+  `NeedsCloudSignIn`, remove the `signed_in` probe seam or keep it returning `None` with a
+  comment), `gpui/settings/pages/cloud.rs` and `gpui/conversation/cloud_panel.rs` (badge
+  "Sign in in the cloud"), health mapping in the F3-4 step.
 - **Acceptance:**
-  - [ ] Tests with a fake credential source: only the selected servers are sent; values
-    never appear in `Debug` output or logs; no send on reconnect.
-  - [ ] **Manual, with the user:** a server signed in locally works in a new codespace
-    without signing in.
+  - [ ] Tests: an OAuth-style server is listed as carried config-only with the "Sign in in
+    the cloud" badge; no code path in the crate reads the Keychain (`security`) or
+    `.credentials.json` (grep test or review); header/env secret servers still go through
+    the D7 path.
+  - [ ] No manual Keychain step.
 
 #### F4-3a Local to cloud orchestrator (M-L)
 
@@ -1461,8 +1473,9 @@ ticket, after review and after merge.
 | F1-3 | 1 | merged | csi-f1-3 | merge 445cbb37. Opus review x2 fixed: cancel sticks (poll gated), no re-download of big files (1 MB text refusal after first chunk), unmapped paths fall back to read_binary_file (Host enforces roots), cancel on editor close, stale capability retry. Trade-off: remote text 256 KB-1 MB and big files are not polled for external changes (save still conflict-checks). UI progress/Cancel not covered by a GPUI test. |
 | H1 | 1 | merged | csi-h1 | merge 9b6cba91. Opus review: fixed first-release tag path, gh not-found check, dirty tree on commit fail. actionlint unavailable. Note: describe.host.version is bare X.Y.Z; --version prints X.Y.Z+monoptah. |
 | F3-1 | 1 | merged | csi-f3-1 | merge 29deb2f9. Opus review x2 fixed: dead symlinks, roots outside home, total/timeouts flagged incomplete, URL classes, parent-link escape. Design 7 account-config-dirs answered (runtime merge of ~/.claude NOT verified, needs a claude run). Open design questions for the user: (1) links inside a skill that point elsewhere under HOME are followed (could pull ~/.aws); (2) config_hash is an unsalted SHA-256 of configs incl. secrets (shown in Debug); (3) secrets in url userinfo/args are not detected; (4) plugin installPath outside ~/.claude/plugins is offered (F3-3/F3-4 should validate). |
-| F3-5a | 1 | blocked: needs the user at the machine (Keychain prompt) | - | needs the user (Keychain) |
-| F4-0 | 1 | blocked: needs the user's OK to run claude (model requests); F4-L, F4-2h, F4-3a wait on it | - | needs the user's OK (model requests) |
+| F3-1b | 1 | in progress | csi-f3-1b | D14: item-root-confined links, keyed digest for secrets; must finish before F3-4 |
+| F3-5a | 1 | skipped: dropped by user decision D12 | - | never read the Keychain or Claude credential files |
+| F4-0 | 1 | in progress | - | approved by user (D13): haiku, tiny prompts, abandon an account on any rate limit |
 | F4-J | 1 | merged | csi-f4-j | merge 307d3d84. Opus review: no blockers; fixed install race re-decide, fsync, edge fixtures as TS contract (duplicate key line is skipped), rewrite_cwd escaping, orphan fork cleanup. Known: incoming strictly shorter than existing = Diverged (per spec); fork does not copy file-history/<id>; .pre-cloud overwritten on second replace. |
 | F4-1 | 1 | merged | csi-f4-1 | merge a4103dad (conflict markers fixed in 62b35640 and the cfg(test) gate in the next commit). Opus review x2 fixed: default-branch detection fails closed (-cloud when origin default unconfirmed), stale origin/HEAD, tag/branch name clash, -U3, ignore-submodules=none, splitIndex, scratch object dir, fetch process-group kill, ':' in alternates path. Decisions: at origin tip needs_push=false even on default; upstream = default counts as no upstream; behind upstream goes to <branch>-cloud (beyond spec, user to confirm). push_target makes one ls-remote call (10 s cap). |
 | A1 | 1 | merged | csi-a1 | merge 740e6434. Local only. Opus review x2: fixed mention insertion picking another credential (id form when label ambiguous/reserved), icon only for resolved accounts, quote labels use id form. Pending, needs the user: manual verification (real accounts). Known Low: trailing punctuation can resolve to sibling label (x vs x.); steered Mono message uses last account snapshot (pre-existing path). |
@@ -1473,6 +1486,7 @@ ticket, after review and after merge.
 | F2-1 | 2 | merged | csi-f2-1 | merge f0c7d2af. Opus review x3 fixed: Review discard bypassed running-turn policy, per-cwd gate, classic layout chrome, GitPicker branch policy, cwd captured at click time. Pending, needs the user: manual in-app check. docs/docker-sandbox-spec.html sandbox Explorer/Changes stays an OPEN DECISION for the owner. Known: running check is app-side and racy until F2-5h; list_dir client cap not implemented (Host hard-errors above 5000; move to a Host ticket). |
 | F2-2 | 2 | in review | csi-f2-2 | Implemented, Opus review x2 findings fixed (stuck recovery, env liveness, wrong ages, memory budget). Round-3 Opus review was stopped before reporting; not merged yet. Branch csi/f2-2 HEAD has native:check green. |
 | F3-2 | 2 | merged | csi-f3-2 | merge 290dd55f. Opus review x2 fixed: Create re-checks kit pref (D11), project-scoped items follow their project (not frozen), sandbox scan, cache, cap warning, Refresh. Flag cloudKitEnabled off. OPEN DESIGN QUESTION for the user: project-scoped secret-bearing servers (mcp:local:*) are always on and cannot be excluded individually (only by turning the kit off); notice does not say so. Known Low: Settings Refresh does not invalidate KitCache (30 s); target.kit parsed but unused until F3-4; Cloud page not searchable. |
+| F3-2b | 2 | todo | - | D12 follow-up: update the one-time notice constant and UI/default wording that say sign-ins are copied; remove the signed-in/not-signed-in distinction in kit/kit_prefs; after F3-1b |
 | F4-L | 2 | todo | - | L, sub-PRs |
 | H3 | 3 | todo | - | |
 | F2-3h | 3 | todo | - | |
@@ -1483,11 +1497,11 @@ ticket, after review and after merge.
 | F2-4 | 3 | todo | - | |
 | F2-5 | 3 | todo | - | |
 | F3-3h | 4 | todo | - | |
-| F3-5h | 4 | todo | - | |
+| F3-5h | 4 | skipped: dropped by user decision D12 | - | no OAuth sign-in merge on the Host |
 | F4-2h | 4 | todo | - | |
 | HR3 | 4 | todo | - | release: stop and ask |
 | F3-4 | 4 | todo | - | |
-| F3-5 | 4 | todo | - | needs the user for the manual check |
+| F3-5 | 4 | todo | - | reduced (D12): config-only OAuth servers, 'Sign in in the cloud'; depends on F3-4 only |
 | F4-3a | 4 | todo | - | |
 | F4-4 | 4 | todo | - | |
 | F4-5 | 4 | todo | - | |
@@ -1505,7 +1519,7 @@ answer in the design doc.
 | The running app shows the remote tree for cloud sessions (known from code only) | F2-0 | Fix the binding in F2-1 before anything else in feature 2 |
 | `list_dir` entry cap | F2-0 | F2-1 adds the client cap and the optional Host `limit` |
 | Tunnel RPC traffic resets the codespace idle timeout or the sandbox `--ttl` | F2-0 (manual, if the user agrees) | F2-4's 10-minute idle stop becomes mandatory, not just a cost guard |
-| Where and how Claude Code stores MCP OAuth sign-ins; refresh-token rotation | F3-5a | F3-5h and F3-5 fall back to "Sign in in the cloud" for those servers |
+| Where and how Claude Code stores MCP OAuth sign-ins; refresh-token rotation | not investigated (D12: dropped by user decision) | OAuth servers are carried config-only and marked "Sign in in the cloud" |
 | `--resume <id>` keeps the id and appends after a cross-machine install | F4-0 | Stop and ask before F4-J, F4-L, F4-2h and F4-3a |
 | How Claude Code merges `~/.claude` with an account `CLAUDE_CONFIG_DIR` | F3-1 | The inventory labels sources and reads both; adjust the precedence |
 | How headless (stream-json) Claude treats unapproved project `.mcp.json` servers | F3-4 (health output) | Add a follow-up ticket for pre-approval if the user wants it |

@@ -772,10 +772,10 @@ account). It reuses `skills.rs` and `mcp.rs` and classifies each item:
       link-local address;
     - stdio with a `docker` command on a sandbox.
   - `NeedsRuntime(npx|uvx|bunx|node|python|docker)`: checked remotely (§3.2.4).
-  - `SignedIn`: an http/sse server with no auth header, for which Claude holds an OAuth
-    sign-in locally. The sign-in is carried (§3.2.5).
-  - `NotSignedIn`: the same, but with no local sign-in. It is carried without a token,
-    and the panel says "Sign in locally first".
+  - OAuth-style server (D12, 2026-11-10): an http/sse server with no auth header. The app
+    cannot know whether the user signed in locally (it never reads the Keychain or Claude's
+    credential files). It is carried config-only and marked "Sign in in the cloud"
+    (§3.2.5). The older `SignedIn`/`NotSignedIn` split is superseded.
   - `Project`: project-scope `.mcp.json` servers already arrive with the clone. They are
     listed for information only.
 
@@ -801,8 +801,8 @@ Size limits:
 #### 3.2.2 Selection UI and one global kit (F3-2)
 
 Decided: **one kit for all of the cloud**, the same on every codespace and sandbox.
-Secrets and MCP sign-ins go along, so the user never has to sign in to an MCP server again
-in the cloud.
+Secrets (env and header values) go along. MCP OAuth sign-ins do NOT (D12, 2026-11-10):
+those servers are marked "Sign in in the cloud".
 
 - **Where it is set.** Settings > Cloud > "Claude setup", the single global selection.
   There are three tabs (Skills / MCP servers / Plugins), each with checkboxes, size and
@@ -826,8 +826,11 @@ in the cloud.
 - **One-time notice.** The first time the kit is enabled, the app shows the following, and
   the acknowledgement is stored in the global preferences:
 
-  > "Your MCP secrets and sign-ins will be copied to your cloud workspaces. They will be
-  > visible to the agent, to every MCP server and to every command the agent runs there."
+  > "Your MCP secrets will be copied to your cloud workspaces. They will be visible to the
+  > agent, to every MCP server and to every command the agent runs there. MCP servers that
+  > use OAuth sign-in are not copied with a sign-in: sign in to them in the cloud."
+  > (Updated 2026-11-10 for D12; the notice constant in the F3-2 code must follow, ticket
+  > F3-2b.)
 - **The app API** (`sessions.start target`) gets an optional `kit: "none" | "default"`,
   default `"default"` = the global kit **including secrets**. This is the user's own
   standing choice in Settings, not consent claimed by the caller. An API caller can only
@@ -882,8 +885,8 @@ in the cloud.
   - the setup step finishes before the start reports `Ready`, so the first turn already
     sees the kit.
 - **Credentials go one way, once, at the start of a new cloud workspace** (user
-  decision, 2026-11-09). That covers the plain secrets (env and header values) and the MCP
-  sign-ins (§3.2.5). They are not re-sent at reconnect and never come back.
+  decision, 2026-11-09). That covers the plain secrets (env and header values). MCP
+  sign-ins are not copied (D12, §3.2.5). They are not re-sent at reconnect and never come back.
   - `kit.secrets {values: {MONOPTAH_KIT_X_Y: "…"}}` is sent once in the "Claude setup"
     step. The Host writes the values to `~/.monoptah-kit/secrets.env`, mode 0600, written
     to a temp file and renamed. They survive Host restarts and codespace stop/start
@@ -936,6 +939,13 @@ in the cloud.
   (`docker-sandbox-spec.html` ~3312). The app never changes the user's policy.
 
 #### 3.2.5 Carrying MCP sign-ins (OAuth) (F3-5)
+
+> **User decision (2026-11-10, rule D12): sign-ins are NOT copied.** The app never reads
+> the macOS Keychain or Claude Code's credentials item/file for MCP. The spike F3-5a and
+> the Host merge F3-5h are dropped. MCP servers whose credentials are raw values in the
+> config JSON (`headers`, `env`) are carried one way at setup as described in 3.2.3.
+> OAuth-signed servers are carried config-only and marked "Sign in in the cloud". The
+> text below is kept as the record of the option that was considered and is **superseded**.
 
 Goal (user decision): an MCP server the user signed in to locally works in the cloud
 without signing in again.
@@ -998,7 +1008,7 @@ dropped.
 | MCP: `--mcp-config` + one-way secrets file loaded into the Claude child env (chosen) | Survives Host restarts without the app; removable; additive; leaves `~/.claude.json` alone | Needs the fork Host; secrets on the workspace disk (0600) | **Chosen** |
 | Secrets as Codespaces user secrets (`gh secret set --app codespaces`) | Survive restarts | Persist at GitHub; codespaces only; widen the blast radius to every codespace of the repos listed | Rejected for v1 |
 | MCP sign-ins: user signs in again in the cloud (`claude mcp login` on the remote) | Nothing copied; no rotation race | The user explicitly does not want this; a headless remote may not complete the browser flow | Rejected (user decision) |
-| MCP sign-ins: copy into the remote credential store (chosen) | Works offline from the laptop; remote refreshes itself | Undocumented format (spike); refresh-token rotation race | **Chosen**, pending F3-5a |
+| MCP sign-ins: copy into the remote credential store | Works offline from the laptop; remote refreshes itself | Undocumented format; refresh-token rotation race; reads the Keychain | **Rejected by user decision D12 (2026-11-10)**; OAuth servers are carried config-only, "Sign in in the cloud" |
 | MCP sign-ins: `headersHelper` broker fed by the app | Documented mechanism; refresh tokens stay local | Cloud depends on the app running; contradicts the one-way decision | Rejected |
 | Transfer over `run_script` stdin (base64 tar) | Works with the old Host | A new ssh session per transfer (a sandbox wakes and bills); 50 MB base64 on stdin; not resumable | Rejected; uploads go over the tunnel |
 | Docker `sbx mcp` / `sbx skills` | Native to sbx | Experimental; tied to Docker's gateway and local store; sandbox only; cloud support not verified | Rejected |
@@ -1046,15 +1056,14 @@ dropped.
 
 ### 3.7 Security
 
-- Secrets and MCP sign-ins are carried by default (user decision, 2026-11-09). This is
+- Secrets (env and header values) are carried by default (user decision, 2026-11-09; MCP OAuth sign-ins are NOT carried, D12). This is
   covered by the one-time notice, which states that the agent, every MCP server and every
   command it runs can read them.
 - Credentials travel one way, once per new workspace, only over the authenticated tunnel
   RPC.
 - On the remote they are stored 0600:
-  - plain secrets in `~/.monoptah-kit/secrets.env`;
-  - sign-ins in Claude's `.credentials.json`.
-- They reach only the Claude child env and the Claude credential store, and are scrubbed
+  - plain secrets in `~/.monoptah-kit/secrets.env`.
+- They reach only the Claude child env, and are scrubbed
   from logs and start output.
 - An API caller can only turn the kit off, never widen it.
 - Symlink resolution is bounded to the home folder.
@@ -1473,7 +1482,7 @@ each batch ends with an explicit release-and-pin ticket (HR1-HR3).
 | **F1-3** | Editor: chunked `files.readBytes` for remote reads, with progress and cancel; falls back to `read_binary_file` | S-M | - |
 | **H1** | Fork Host release pipeline. Covers: `host/VERSION`; the `+monoptah` marker; `describe.host`; `host-release-monoptah.yml` (all targets incl. Windows `.zip`, `--latest=false`, refuses existing releases, `host-release.json` artifact + attestation); `npm run host:release`; the "Releasing the Host" section and after-merge checklist in CLAUDE.md | M | - |
 | **F3-1** | `kit.rs` inventory and classification (skills/MCP/plugins, compat, secrets, sizes, account config dir) | M | - |
-| **F3-5a** | **Spike, with the user present** (a Keychain prompt appears): where and how Claude Code stores MCP OAuth sign-ins on macOS (key names only) and on Linux; which servers rotate refresh tokens (§3.2.5) | S | - |
+| **F3-5a** | **DROPPED (D12).** ~~Spike, with the user present~~ (a Keychain prompt appears): where and how Claude Code stores MCP OAuth sign-ins on macOS (key names only) and on Linux; which servers rotate refresh tokens (§3.2.5) | S | - |
 | **F4-0** | Spike: `claude --resume <id>` on another machine, after the JSONL is installed with the cwd rewritten, keeps the id and appends to the same file; check the row-append path of the remote runtime | S | - |
 | **F4-J** | `transcript_sync.rs`: uuid-chain compare, extend/replace/fork decision with `.pre-cloud` backup, cwd rewrite both ways, shared JSON fixtures for the Host mirror; fixes R1 in `install_jsonl` (§4.9) | M | - |
 | **F4-1** | `move_out.rs`: branch/push-target rules, the patch of uncommitted non-ignored files, `tree` id, transcript collection; never touches the user's tree, index or stash | M | - |
@@ -1510,11 +1519,11 @@ each batch ends with an explicit release-and-pin ticket (HR1-HR3).
 | ID | Ticket | Size | Depends on |
 |---|---|---|---|
 | **F3-3h** | Host `kit.apply/secrets/probe/health`; `spawnChild` env overlay; `--plugin-dir`/`--mcp-config` in `buildClaudeArgs`; kit hash in `settingsKey`; TS log scrubbing; TS tar extraction | M | HR2 |
-| **F3-5h** | Host side of MCP sign-ins: merge into the remote `.credentials.json` (MCP keys only, temp-rename, 0600, tracked) | S-M | HR2, F3-5a |
+| **F3-5h** | **DROPPED (D12).** ~~Host side of MCP sign-ins: merge into the remote `.credentials.json` (MCP keys only, temp-rename, 0600, tracked)~~ | - | - |
 | **F4-2h** | Host `workspace.applySnapshot` (idle guard, worktree target on shared instances, `tree` verify, validation) and `sessions.import` (JSONL install with the F4-J rule, refuse when a live session binds the id, store record + `provider.bind`, same id) | M | HR2, F4-0, F4-J |
-| **HR3** | Release Host batch 3 and pin it in the app | S | F3-3h, F3-5h, F4-2h |
+| **HR3** | Release Host batch 3 and pin it in the app | S | F3-3h, F4-2h |
 | **F3-4** | "Claude setup" step in new-workspace starts (one-way: kit + secrets file), "Update Claude setup" action, health in the panel, network-policy hints | M | F3-2, HR3 |
-| **F3-5** | App side of MCP sign-ins: read the account's local entries (Keychain or file), send them once in the setup step, "needs sign-in" health, re-copy only through "Update Claude setup" | M | F3-4, F3-5h |
+| **F3-5** | OAuth MCP servers carried config-only and marked "Sign in in the cloud" (D12: no Keychain, no sign-in copy) | S | F3-4 |
 | **F4-3a** | Local → cloud orchestrator: `MoveRecord`, push, both backends, uploads, restore, verify, same-id import, version check (R4), moved-path note (R5), location flip, rollback/cancel | M-L | F4-1, F4-J, F4-L, HR3 |
 | **F4-4** | "Continue in cloud" dialog (one confirmation), progress steps, transcript divider | M | F4-3a |
 | **F4-5** | Cloud → local for moved and cloud-born sessions: in-place apply when unchanged, else a new worktree; the convert no longer archives and replaces the cloud row; same id through F4-J (fork on divergence, new id after a lost workspace) | M | F4-L, F4-3a, F4-J |
@@ -1523,7 +1532,7 @@ each batch ends with an explicit release-and-pin ticket (HR1-HR3).
 ### Recommended order
 
 1. **Wave 1 now, in parallel.** F2-0 first, because it fixes a misleading banner users see
-   today. F3-5a needs the user at the machine.
+   today. F3-5a was dropped (D12).
 2. **Wave 2.**
    - The release chain HR1 → H2a → H2b → F1-4 runs alongside F2-1 → F2-2, F3-2 and F4-L.
    - After this wave, every cloud Host is the fork's, and the remote Explorer/Changes are
@@ -1545,8 +1554,8 @@ each batch ends with an explicit release-and-pin ticket (HR1-HR3).
    confirmed user actions.
 4. **Feature 3 defaults:** take everything compatible, **including secrets**, so the user
    never has to authenticate MCP servers in the cloud.
-5. **Feature 3 MCP auth:** MCP servers go with their credentials, including OAuth
-   sign-ins (§3.2.5). **One way, local → cloud, once, in the setup step of a new
+5. **Feature 3 MCP auth:** MCP servers go with their raw credentials (headers/env); OAuth
+   sign-ins are not copied (D12, §3.2.5). **One way, local → cloud, once, in the setup step of a new
    workspace before it is ready**, plus the manual "Update Claude setup".
 6. **Feature 3 plugins:** copy the local version.
 7. **Feature 3 scope:** one kit for all of the cloud.
@@ -1571,8 +1580,8 @@ each batch ends with an explicit release-and-pin ticket (HR1-HR3).
   it does not truncate and has no `limit` argument (`host/workspace.ts` `listHostFiles`).
 - **Idle timers:** whether tunnel RPC traffic resets the codespace idle timeout or the
   sandbox `--ttl`. F2-0: manual check pending: needs the user.
-- **MCP sign-ins:** where and in what format Claude Code stores MCP OAuth sign-ins
-  (undocumented), and whether those servers rotate refresh tokens. F3-5a.
+- **MCP sign-ins:** dropped (user decision D12, 2026-11-10): the app does not copy
+  sign-ins, so the storage format and rotation behaviour are no longer needed.
 - **Same session id across machines:** whether `--resume <id>` keeps the id and appends to
   the same JSONL after a cross-machine install. The CLI help says yes: `--fork-session` is
   the opt-in for a new id. F4-0.
