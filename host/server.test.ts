@@ -777,4 +777,30 @@ describe("host uploads over the API", () => {
     expect((await s.call("uploads.discard", { uploadId })).value.result).toEqual({ discarded: true });
     expect((await s.call("uploads.begin", { ...params, name: "../x" })).status).not.toBe(200);
   });
+
+  it("runs an unref'd sweeper and clears it when the server closes", async () => {
+    const created: unknown[] = [];
+    const cleared: unknown[] = [];
+    const realSet = globalThis.setInterval;
+    const realClear = globalThis.clearInterval;
+    const set = vi.spyOn(globalThis, "setInterval").mockImplementation(((fn: any, ms?: number) => {
+      const handle = realSet(fn, ms);
+      if (ms === 5 * 60 * 1000) created.push(handle);
+      return handle;
+    }) as any);
+    const clear = vi.spyOn(globalThis, "clearInterval").mockImplementation(((h: any) => {
+      cleared.push(h);
+      realClear(h);
+    }) as any);
+    try {
+      await setup();
+      expect(created).toHaveLength(1);
+      expect((created[0] as NodeJS.Timeout).hasRef()).toBe(false);
+      await cleanups.pop()!();
+      expect(cleared).toContain(created[0]);
+    } finally {
+      set.mockRestore();
+      clear.mockRestore();
+    }
+  });
 });

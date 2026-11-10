@@ -194,9 +194,10 @@ export function createHostServer(
     }
     return catalog;
   };
-  // Sweeps expired staging at startup; begin sweeps again.
+  // Sweeps expired staging at startup, on a timer, and on begin/chunk/commit.
   const uploads = new HostUploads(engine.store.uploadDir);
-  return createServer(
+  uploads.startSweeper();
+  const server = createServer(
     { requestTimeout: 20_000, headersTimeout: 10_000, maxHeaderSize: 8192 },
     async (request, response) => {
       if (request.url === "/lifecycle" && lifecycle) {
@@ -659,4 +660,6 @@ export function createHostServer(
       }
     },
   );
+  server.once("close", () => uploads.stopSweeper());
+  return server;
 }

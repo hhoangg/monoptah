@@ -3,6 +3,7 @@ import {
   chmodSync,
   closeSync,
   fstatSync,
+  ftruncateSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -29,6 +30,11 @@ const ID = /^[0-9a-f]{32}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const PART = "part";
 const META = "meta.json";
+/** Committed payloads live in this subdirectory, so no user-supplied name can
+ * collide with the internal files, even on a case-insensitive filesystem. */
+const FILES = "files";
+export const UPLOAD_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+const RESERVED = new Set([PART, META, FILES]);
 const WINDOWS_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i;
 
 interface Meta {
@@ -53,8 +59,7 @@ export function validateUploadName(value: unknown): string {
     value !== value.trim() ||
     value.startsWith(".") ||
     value.endsWith(".") ||
-    value === PART ||
-    value === META ||
+    RESERVED.has(value.normalize("NFKC").toLowerCase()) ||
     // eslint-disable-next-line no-control-regex
     /[\u0000-\u001f\u007f/\\:*?"<>|]/.test(value) ||
     WINDOWS_RESERVED.test(value)
@@ -83,6 +88,24 @@ export class HostUploads {
     private readonly now: () => number = Date.now,
   ) {
     this.sweep();
+  }
+
+  private timer?: ReturnType<typeof setInterval>;
+
+  /** Sweeps expired uploads on a timer that never keeps the process alive. */
+  startSweeper(intervalMs: number = UPLOAD_SWEEP_INTERVAL_MS): void {
+    if (this.timer) return;
+    this.timer = setInterval(() => this.sweep(), intervalMs);
+    this.timer.unref();
+  }
+
+  stopSweeper(): void {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = undefined;
+  }
+
+  private payload(id: string, meta: Meta): string {
+    return join(this.dir(id), FILES, meta.name);
   }
 
   private dir(id: string): string {
@@ -180,12 +203,13 @@ export class HostUploads {
   }
 
   private offset(id: string, meta: Meta): number {
-    return statSync(join(this.dir(id), meta.committed ? meta.name : PART)).size;
+    return statSync(meta.committed ? this.payload(id, meta) : join(this.dir(id), PART)).size;
   }
 
   /** A repeated chunk at the same offset is accepted when its bytes match; a
    * gap, or an overlap with different bytes, is an error. */
   chunk(input: Record<string, unknown>): { offset: number } {
+    this.sweep();
     const id = validateUploadId(input.uploadId);
     const offset = input.offset;
     const encoded = input.data;
@@ -217,8 +241,17 @@ export class HostUploads {
         if (!existing.equals(bytes.subarray(0, overlap)))
           throw new Error("Upload retry does not match uploaded bytes");
       }
-      if (overlap < bytes.length)
-        writeSync(fd, bytes, overlap, bytes.length - overlap, start + overlap);
+      if (overlap < bytes.length) {
+        const wanted = bytes.length - overlap;
+        let written = -1;
+        try {
+          written = writeSync(fd, bytes, overlap, wanted, start + overlap);
+        } finally {
+          // A short or failed write must not leave a partial chunk behind.
+          if (written !== wanted) ftruncateSync(fd, length);
+        }
+        if (written !== wanted) throw new Error("Upload chunk was not fully written");
+      }
       this.touch(id);
       return { offset: Math.max(length, start + bytes.length) };
     } finally {
@@ -228,10 +261,11 @@ export class HostUploads {
 
   /** Verifies size and sha256, then publishes `<id>/<name>` as a 0600 file. */
   commit(input: Record<string, unknown>): { uploadId: string; name: string; path: string; size: number; sha256: string } {
+    this.sweep();
     const id = validateUploadId(input.uploadId);
     const meta = this.meta(id);
     const dir = this.dir(id);
-    const path = join(dir, meta.name);
+    const path = this.payload(id, meta);
     const done = () => ({ uploadId: id, name: meta.name, path, size: meta.size, sha256: meta.sha256 });
     if (meta.committed) return done();
     const part = join(dir, PART);
@@ -252,6 +286,7 @@ export class HostUploads {
       throw new Error("Upload sha256 does not match");
     }
     chmodSync(part, 0o600);
+    mkdirSync(join(dir, FILES), { mode: 0o700 });
     renameSync(part, path);
     writeFileSync(join(dir, META), JSON.stringify({ ...meta, committed: true }), { mode: 0o600 });
     this.touch(id);
@@ -263,7 +298,7 @@ export class HostUploads {
     const id = validateUploadId(uploadId);
     const meta = this.meta(id);
     if (!meta.committed) throw new Error("Upload is not committed");
-    return join(this.dir(id), meta.name);
+    return this.payload(id, meta);
   }
 
   discard(input: Record<string, unknown>): { discarded: boolean } {
@@ -280,6 +315,7 @@ export class HostUploads {
 
   /** Optional cleanup on Host shutdown. */
   clear(): void {
+    this.stopSweeper();
     rmSync(this.root, { recursive: true, force: true });
   }
 }

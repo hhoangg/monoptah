@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, it } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
 import {
   existsSync,
@@ -18,6 +18,7 @@ import {
   MAX_UPLOAD_BYTES,
   MAX_UPLOAD_QUOTA_BYTES,
   UPLOAD_CHUNK_BYTES,
+  UPLOAD_SWEEP_INTERVAL_MS,
   UPLOAD_TTL_MS,
 } from "./uploads";
 
@@ -47,7 +48,7 @@ it("stages in 512 KB chunks and commits a 0600 regular file in a 0700 dir", () =
     });
   const done = uploads.commit({ uploadId });
   expect(done).toMatchObject({ name: "kit.tar", size: data.length, sha256: sha(data) });
-  expect(done.path).toBe(join(directory, "uploads", uploadId, "kit.tar"));
+  expect(done.path).toBe(join(directory, "uploads", uploadId, "files", "kit.tar"));
   expect(readFileSync(done.path).equals(data)).toBe(true);
   if (process.platform !== "win32") {
     expect(statSync(done.path).mode & 0o777).toBe(0o600);
@@ -157,7 +158,14 @@ it.each([
   "new\nline",
   "x".repeat(256),
   "part",
+  "PART",
   "meta.json",
+  "META.json",
+  "Meta.json",
+  "Files",
+  "ＭＥＴＡ.json",
+  "name.",
+  "name ",
   "CON",
   "a:b",
   "C:\\x",
@@ -232,4 +240,56 @@ it("sweeps stray entries that are not upload directories", () => {
   mkdirSync(stray);
   expect(uploads.sweep()).toBe(1);
   expect(existsSync(stray)).toBe(false);
+});
+
+it.each(["META.json", "Meta.json", "PART", "trailing.", "trailing "])(
+  "never lets the name %j touch internal files",
+  (name) => {
+    const data = Buffer.from("payload");
+    let id: string | undefined;
+    try {
+      id = uploads.begin({ name, size: data.length, sha256: sha(data) }).uploadId;
+    } catch (error) {
+      expect(String(error)).toContain("Invalid upload name");
+      return;
+    }
+    send(id, 0, data);
+    expect(readFileSync(uploads.commit({ uploadId: id }).path)).toEqual(data);
+  },
+);
+
+it("keeps a payload separate from metadata even if the name were hostile", () => {
+  const data = Buffer.from("payload");
+  const { uploadId } = begin(data, "meta-json");
+  send(uploadId, 0, data);
+  const { path } = uploads.commit({ uploadId });
+  expect(path).toContain(join(uploadId, "files"));
+  expect(JSON.parse(readFileSync(join(directory, "uploads", uploadId, "meta.json"), "utf8")).committed).toBe(true);
+  expect(readFileSync(path)).toEqual(data);
+});
+
+it("sweeps expired uploads on a timer and on chunk, and clears the timer", () => {
+  vi.useFakeTimers();
+  try {
+    let now = Date.now();
+    const timed = new HostUploads(join(directory, "timed"), () => now);
+    const a = timed.begin({ name: "a", size: 1, sha256: sha("a") });
+    timed.startSweeper();
+    timed.startSweeper();
+    expect(vi.getTimerCount()).toBe(1);
+    now += UPLOAD_TTL_MS + 1000;
+    vi.advanceTimersByTime(UPLOAD_SWEEP_INTERVAL_MS);
+    expect(existsSync(join(directory, "timed", a.uploadId))).toBe(false);
+    // chunk and commit also sweep other expired uploads
+    const b = timed.begin({ name: "b", size: 1, sha256: sha("b") });
+    now += UPLOAD_TTL_MS - 1000;
+    const c = timed.begin({ name: "c", size: 1, sha256: sha("c") });
+    now += 2000;
+    expect(() => timed.chunk({ uploadId: c.uploadId, offset: 0, data: b64("c") })).not.toThrow();
+    expect(existsSync(join(directory, "timed", b.uploadId))).toBe(false);
+    timed.stopSweeper();
+    expect(vi.getTimerCount()).toBe(0);
+  } finally {
+    vi.useRealTimers();
+  }
 });
