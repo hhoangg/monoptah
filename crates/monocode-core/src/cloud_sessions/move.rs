@@ -425,7 +425,10 @@ pub(super) fn scrub(text: &str) -> String {
 }
 
 fn local_busy(session: i64, busy: &dyn Fn() -> bool) -> bool {
-    busy() || crate::process::agents().iter().any(|a| a.session == session)
+    busy()
+        || crate::process::agents()
+            .iter()
+            .any(|a| a.session == session)
 }
 
 /// The text of a version such as `2.1.321 (Claude Code)` as numbers.
@@ -576,6 +579,8 @@ impl CloudSessions {
         Ok(record)
     }
 
+    /// `busy` is called while the store lock is held at the flip, so it must not take that lock.
+    ///
     /// Runs the move from the first step that is not done. BLOCKS; see the module docs. May
     /// wake a stopped workspace, so call it only for a user action. `Err` is a failure (the
     /// record keeps the step and the text, and `events` ended with `Failed`), a refusal while
@@ -626,10 +631,7 @@ impl CloudSessions {
                         let error = scrub(&error);
                         // A committed upload expires after an hour idle: upload again.
                         if !rewound
-                            && matches!(
-                                step,
-                                MoveStep::RestoreCode | MoveStep::RestoreConversation
-                            )
+                            && matches!(step, MoveStep::RestoreCode | MoveStep::RestoreConversation)
                             && (error.contains("Upload not found")
                                 || error.contains("Upload is not committed"))
                         {
@@ -779,7 +781,9 @@ impl CloudSessions {
                         || error.starts_with("Could not find the Claude conversation") =>
                 {
                     record.kind = MoveKind::Summary {
-                        reason: format!("{error}. The cloud gets a summary and a new Claude session."),
+                        reason: format!(
+                            "{error}. The cloud gets a summary and a new Claude session."
+                        ),
                     };
                 }
                 Err(error) => return Err(error.into()),
@@ -822,7 +826,10 @@ impl CloudSessions {
                 record.branch
             )));
         }
-        events(MoveEvent::Log(format!("Pushing to origin/{}", record.branch)));
+        events(MoveEvent::Log(format!(
+            "Pushing to origin/{}",
+            record.branch
+        )));
         crate::scm::push_commit_to_branch(
             &work,
             "origin",
@@ -897,7 +904,10 @@ impl CloudSessions {
             // Saved before the start runs: a crash must still know what was created.
             save_record(&*self.store()?, record)?;
         }
-        let workspace = record.workspace.clone().ok_or("The move has no workspace")?;
+        let workspace = record
+            .workspace
+            .clone()
+            .ok_or("The move has no workspace")?;
         if workspace.project.is_some() {
             return Ok(());
         }
@@ -1002,7 +1012,10 @@ impl CloudSessions {
     }
 
     fn workspace_of(record: &MoveRecord) -> Result<(WorkspaceInfo, RemoteProject), String> {
-        let workspace = record.workspace.clone().ok_or("The move has no workspace")?;
+        let workspace = record
+            .workspace
+            .clone()
+            .ok_or("The move has no workspace")?;
         let project = workspace
             .project
             .clone()
@@ -1048,11 +1061,19 @@ impl CloudSessions {
         let staging = self.staging_dir(record.session_id)?;
         let mut files: Vec<(&'static str, String, PathBuf)> = vec![];
         if record.has_patch && record.patch_upload.is_none() {
-            files.push(("patch", "snapshot.patch".into(), staging.join("uncommitted.patch")));
+            files.push((
+                "patch",
+                "snapshot.patch".into(),
+                staging.join("uncommitted.patch"),
+            ));
         }
         if matches!(record.kind, MoveKind::Resume) && record.transcript_upload.is_none() {
             let id = record.claude_id.clone().unwrap_or_default();
-            files.push(("transcript", format!("{id}.jsonl"), transcript_file(&staging, &id)?));
+            files.push((
+                "transcript",
+                format!("{id}.jsonl"),
+                transcript_file(&staging, &id)?,
+            ));
         }
         for (what, name, path) in files {
             if !path.is_file() {
@@ -1066,7 +1087,8 @@ impl CloudSessions {
                 .iter()
                 .find(|(n, _)| *n == name)
                 .map(|(_, id)| id.clone());
-            let mut request = |method: &str, params: Value| self.host.request(&machine, method, params);
+            let mut request =
+                |method: &str, params: Value| self.host.request(&machine, method, params);
             let result = uploads::upload_file(
                 &mut request,
                 &path,
@@ -1213,9 +1235,7 @@ impl CloudSessions {
                         let notice = result["notice"]
                             .as_str()
                             .map(str::to_owned)
-                            .unwrap_or_else(|| {
-                                super::transcript_sync::fork_notice(&id, &provider)
-                            });
+                            .unwrap_or_else(|| super::transcript_sync::fork_notice(&id, &provider));
                         record.notices.push(notice.clone());
                         events(MoveEvent::Notice(notice));
                     }
@@ -1412,7 +1432,8 @@ impl CloudSessions {
             return;
         };
         const PATH: &str = "export PATH=\"$HOME/.local/bin:$HOME/.claude/local:$PATH\"\n";
-        let read = || backend.run_script(&workspace.name, &format!("{PATH}claude --version"), false);
+        let read =
+            || backend.run_script(&workspace.name, &format!("{PATH}claude --version"), false);
         fn warn(record: &mut MoveRecord, events: &mut dyn FnMut(MoveEvent), text: String) {
             record.notices.push(text.clone());
             events(MoveEvent::Notice(text));
@@ -1423,7 +1444,10 @@ impl CloudSessions {
                 warn(
                     record,
                     events,
-                    format!("Could not read the Claude version in the cloud ({}).", scrub(&error)),
+                    format!(
+                        "Could not read the Claude version in the cloud ({}).",
+                        scrub(&error)
+                    ),
                 );
                 return;
             }
@@ -1434,7 +1458,8 @@ impl CloudSessions {
         events(MoveEvent::Log(format!(
             "Updating Claude in the cloud ({remote} is older than {local})"
         )));
-        let updated = backend.run_script(&workspace.name, &format!("{PATH}claude update 2>&1"), true);
+        let updated =
+            backend.run_script(&workspace.name, &format!("{PATH}claude update 2>&1"), true);
         let now = read().unwrap_or_default();
         if updated.is_err() || is_older(now.trim(), &local) {
             warn(
@@ -1490,14 +1515,17 @@ impl CloudSessions {
     ) -> Result<CancelReport, String> {
         let record = move_record(&*self.store()?, session_id).ok_or(NO_MOVE)?;
         let mut report = CancelReport {
-            created_branch: (record.creates_branch && record.pushed)
-                .then(|| record.branch.clone()),
+            created_branch: (record.creates_branch && record.pushed).then(|| record.branch.clone()),
             ..Default::default()
         };
         let mut warnings: Vec<String> = vec![];
         let created = record.workspace.as_ref().filter(|w| w.created);
         let deleting = choice.delete_workspace && created.is_some();
-        if record.workspace.as_ref().is_some_and(|w| w.project.is_some()) {
+        if record
+            .workspace
+            .as_ref()
+            .is_some_and(|w| w.project.is_some())
+        {
             for upload in [&record.patch_upload, &record.transcript_upload]
                 .into_iter()
                 .flatten()

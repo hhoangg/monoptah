@@ -11,8 +11,8 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 use std::process::Command;
+use std::sync::atomic::Ordering;
 
 const CLAUDE_ID: &str = "11111111-2222-4333-8444-555555555555";
 const ENV: &str = "env-cs1";
@@ -61,6 +61,8 @@ fn machine() -> Machine {
     }
 }
 
+/// (name, bytes, committed)
+type Upload = (String, Vec<u8>, bool);
 type Hook = Box<dyn Fn(&str) + Send + Sync>;
 
 struct FakeHost {
@@ -69,7 +71,7 @@ struct FakeHost {
     /// `(method, error)`: the next call of `method` fails once with `error`.
     failures: Mutex<Vec<(String, String)>>,
     /// upload id -> (name, bytes, committed)
-    uploads: Mutex<BTreeMap<String, (String, Vec<u8>, bool)>>,
+    uploads: Mutex<BTreeMap<String, Upload>>,
     sessions: Mutex<Vec<Value>>,
     capabilities: Mutex<Vec<String>>,
     /// Makes `applySnapshot` answer with another tree.
@@ -444,7 +446,10 @@ impl Fx {
         std::fs::create_dir_all(&work).unwrap();
         git(&work, &["init", "-q", "-b", "main"]);
         configure(&work);
-        git(&work, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git(
+            &work,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
         std::fs::write(work.join(".gitignore"), ".env.local\n").unwrap();
         git(&work, &["add", ".gitignore"]);
         commit_file(&work, "README.md", "hello\n");
@@ -801,7 +806,10 @@ fn ignored_files_are_never_uploaded_and_only_two_files_travel() {
     for (name, bytes, _) in uploads.values() {
         let text = String::from_utf8_lossy(bytes);
         assert!(!text.contains("hunter2"), "{name} carries the secret");
-        assert!(!text.contains(".env.local"), "{name} names the ignored file");
+        assert!(
+            !text.contains(".env.local"),
+            "{name} names the ignored file"
+        );
     }
     let patch = uploads
         .values()
@@ -935,7 +943,10 @@ fn nothing_is_pushed_when_origin_already_has_the_commit() {
     fx.install_push_counter();
     fx.run().0.unwrap();
     assert_eq!(fx.count_pushes(), 0);
-    assert_eq!(fx.host.calls("workspace.applySnapshot")[0]["branch"], "feat");
+    assert_eq!(
+        fx.host.calls("workspace.applySnapshot")[0]["branch"],
+        "feat"
+    );
 }
 
 // ------------------------------------------------------- idempotence and resume
@@ -1245,7 +1256,10 @@ fn a_busy_session_is_refused_before_and_during_the_move() {
         }
     }));
     let probe = busy.clone();
-    let (result, _) = fx.run_with(&move || probe.load(Ordering::SeqCst), &AtomicBool::new(false));
+    let (result, _) = fx.run_with(
+        &move || probe.load(Ordering::SeqCst),
+        &AtomicBool::new(false),
+    );
     assert_eq!(result.unwrap_err(), BUSY);
     assert_eq!(fx.record().unwrap().failed_at, Some(MoveStep::Flip));
     assert!(
@@ -1673,7 +1687,9 @@ impl GhRunner for StartGh {
             out(AUTH_OK)
         } else if line.starts_with("api --method POST") {
             (self.on_create)();
-            out(r#"{"name":"octo-new1","state":"Provisioning","web_url":"https://octo-new1.github.dev"}"#)
+            out(
+                r#"{"name":"octo-new1","state":"Provisioning","web_url":"https://octo-new1.github.dev"}"#,
+            )
         } else if line.starts_with("api user/codespaces") {
             out("https://asked.github.dev\n")
         } else if line.starts_with("codespace view") {
@@ -1806,12 +1822,7 @@ fn a_start_that_failed_resumes_after_a_restart_without_creating_a_second_codespa
         .with_timing(Duration::from_secs(5), |_| {}, || 1_794_024_100_000)
         .with_backend(fx.backend.clone());
     let outcome = svc
-        .run_move(
-            fx.session,
-            &|| false,
-            &mut |_| {},
-            &AtomicBool::new(false),
-        )
+        .run_move(fx.session, &|| false, &mut |_| {}, &AtomicBool::new(false))
         .unwrap();
     assert_eq!(outcome.cloud, CloudRef::codespace("octo-new1"));
     let creates = gh
