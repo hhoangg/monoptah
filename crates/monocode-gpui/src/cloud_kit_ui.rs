@@ -110,8 +110,9 @@ pub(crate) fn load_summary(
             None => match scan(Path::new(&project), workspace) {
                 Ok(inventory) => {
                     let inventory = Arc::new(inventory);
-                    // A scan that hit its budget is not worth keeping.
-                    if !inventory.incomplete {
+                    // A scan that hit its budget is not worth keeping. A missing hash
+                    // key is not: a rescan would not change it.
+                    if !inventory.scan_timed_out {
                         cache.put(&project, workspace, inventory.clone());
                     }
                     inventory
@@ -231,6 +232,7 @@ pub(crate) mod fixture {
                 Vec::new()
             },
             config_hash: "c".into(),
+            secrets_digest: None,
         }
     }
 

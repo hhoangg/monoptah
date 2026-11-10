@@ -795,8 +795,20 @@ Size limits:
   dependencies for their MCP servers.
   - A plugin with a native `node_modules` (`*.node` files) gets the same "may not run on
     Linux" warning as `bin/`.
-- Symlinks are resolved (the local `~/.claude/skills` has some) but refused when they
-  leave the user's home.
+- Symlinks: an item root may be a link that resolves anywhere under the user's home
+  (dotfiles setups). Links inside an item must resolve inside the item's own canonical
+  root, or the whole item is excluded ("A link points outside this item").
+  A root that resolves to `$HOME`, a folder containing it, a credentials folder (`.ssh`,
+  `.aws`, ...), a folder that CONTAINS one (`~/.config`, `~/.claude`) or a system folder
+  is refused too; a real dir under `~/.claude` is fine. A credentials folder met inside an
+  item excludes the item. A file with several hard links is refused when it is the same
+  file (device and inode) as one under the credentials folders or `~/.claude/.credentials.json`.
+  Known limit: any other hard link is NOT detected (pnpm and Nix store links look the same).
+  When the local key cannot be used, the Cloud page says secret change detection is
+  unavailable.
+- MCP secret values are kept out of the plain config and content hashes. Changes to them
+  are tracked by an HMAC-SHA256 keyed with a per-installation random key
+  (`kit-hash.key`, mode 0600), so digests are not comparable across installs.
 
 #### 3.2.2 Selection UI and one global kit (F3-2)
 

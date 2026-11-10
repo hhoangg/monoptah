@@ -16,6 +16,27 @@
 //! Every MCP `env` and `headers` value is a secret unless it is exactly a `${VAR}`
 //! reference, and so is a URL with a query string. Values live in [`Secret`], which
 //! redacts itself in `Debug` and `Display`, so an inventory is safe to log.
+//!
+//! Secret values never enter a plain hash. `config_hash` and `content_hash` cover the
+//! config with secret values replaced by a marker, so they are equal across installs and
+//! say nothing about the secrets. Changes to the secrets are tracked separately by
+//! [`KitMcpServer::secrets_digest`]: an HMAC-SHA256 keyed with a random per-installation
+//! key (`kit-hash.key` in the app data dir, mode 0600). Two installs produce unrelated
+//! digests, and a low-entropy secret cannot be guessed offline without the key. The
+//! digest type redacts itself in `Debug`. Use [`KitInventory::change_token`] to detect
+//! "the kit changed", secrets included. If the key cannot be read or created, secrets are
+//! left out of the digests and the inventory is flagged `incomplete` (and
+//! `key_unavailable`, which unlike a timeout does not stop caching).
+//!
+//! # For the transfer (F3-3)
+//!
+//! The scan checks links once. A link swapped afterwards could still point out of the
+//! item, so the digest and tar steps must open files without following links: re-
+//! canonicalize each path and check `starts_with(root)`, ideally comparing the dev and
+//! inode recorded at scan time. A file with several hard links is refused when it is the
+//! same file (device and inode) as one found under the credentials folders (`~/.ssh`,
+//! `~/.aws`, ...), see [`Guard`]. Other hard links are NOT detected: a link to some
+//! other private file cannot be told from a pnpm or Nix store link cheaply.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
@@ -85,6 +106,15 @@ pub enum Exclusion {
     LinkOutsideHome,
     TooManyFiles,
     ScanTimedOut,
+    /// A link inside the item resolves to a path outside the item's own root.
+    LinkLeavesItem,
+    /// The item root resolves to a place that is never a skill or plugin: `$HOME` itself,
+    /// a folder that contains it, a credentials folder or a system folder.
+    UnsafeRoot,
+    /// A file with several hard links that is the same file as one in a credentials folder.
+    HardLinkElsewhere,
+    /// The item contains a credentials folder (`.ssh`, `.aws`, `~/.config/gh`, ...).
+    SensitiveContent,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -158,6 +188,10 @@ pub enum SecretLocation {
     Env(String),
     Header(String),
     UrlQuery,
+    /// The URL carries `user:password@`.
+    UrlUserinfo,
+    /// The URL carries a `#fragment`.
+    UrlFragment,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -175,8 +209,12 @@ pub struct KitMcpServer {
     pub transport: String,
     pub compat: McpCompat,
     pub secrets: Vec<SecretField>,
-    /// Hash of the canonical server config, secrets included.
+    /// Hash of the canonical server config with every secret value replaced by a marker,
+    /// so it is the same whatever the secrets are.
     pub config_hash: String,
+    /// Keyed digest of the secret values (see the module docs). `None` when the server
+    /// has no secrets, or when the local key is unavailable.
+    pub secrets_digest: Option<KeyedDigest>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -209,9 +247,50 @@ pub struct KitInventory {
     /// An item hit the scan budget. The totals and the hash are then not comparable
     /// between runs, so callers must not treat them as a stable fingerprint.
     pub incomplete: bool,
+    /// An item hit the scan budget (a subset of `incomplete`). Only this makes a scan not
+    /// worth caching.
+    pub scan_timed_out: bool,
+    /// The local key was unavailable, so secrets are not in the digests (a subset of
+    /// `incomplete`). A rescan would not change that, so it does not block caching.
+    pub key_unavailable: bool,
     /// Same inputs, same hash. Covers names, scopes, sources, file contents and server
-    /// configs including secrets (only a digest of them is kept).
+    /// configs with secret values masked, so it is comparable across installs. For
+    /// change detection that includes the secrets use [`KitInventory::change_token`].
     pub content_hash: String,
+}
+
+impl KitInventory {
+    /// A token that changes when anything in the kit changes, secret values included.
+    /// It mixes in the keyed secret digests, so it is only comparable on this install.
+    /// Do not log it.
+    pub fn change_token(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.content_hash.as_bytes());
+        for server in &self.mcp_servers {
+            hasher.update([0]);
+            if let Some(digest) = &server.secrets_digest {
+                hasher.update(digest.0.as_bytes());
+            }
+        }
+        hex(&hasher.finalize())
+    }
+}
+
+/// An HMAC-SHA256 hex digest. It never appears in `Debug` output.
+#[derive(Clone, PartialEq, Eq)]
+pub struct KeyedDigest(String);
+
+#[cfg(test)]
+impl KeyedDigest {
+    pub(super) fn hex_for_test(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for KeyedDigest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("KeyedDigest(<redacted>)")
+    }
 }
 
 /// Where to look. Build with [`KitRoots::for_profile`], or by hand in tests.
@@ -225,6 +304,9 @@ pub struct KitRoots {
     pub claude_home: PathBuf,
     /// The local project root.
     pub project: PathBuf,
+    /// Where the local `kit-hash.key` lives. `None` means no key: secrets are then left
+    /// out of the digests and the inventory is flagged `incomplete`.
+    pub key_dir: Option<PathBuf>,
 }
 
 impl KitRoots {
@@ -235,13 +317,31 @@ impl KitRoots {
         let claude_home = home.join(".claude");
         let account = profile.home(Kind::Claude)?;
         let account_dir = (account != claude_home).then_some(account);
+        let key_dir = app_data_dir(&home);
         Ok(Self {
             account_dir,
             home,
             claude_home,
             project: project.to_path_buf(),
+            key_dir,
         })
     }
+}
+
+/// The app data dir, as other core modules find it: `MONOCODE_NATIVE_DATA_DIR`, else
+/// `~/.cache/monocode-native`.
+fn app_data_dir(home: &Path) -> Option<PathBuf> {
+    Some(data_dir_from(
+        std::env::var_os("MONOCODE_NATIVE_DATA_DIR"),
+        home,
+    ))
+}
+
+/// An empty or relative value would put the key in the process cwd: ignore it.
+pub(super) fn data_dir_from(var: Option<std::ffi::OsString>, home: &Path) -> PathBuf {
+    var.map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .unwrap_or_else(|| home.join(".cache/monocode-native"))
 }
 
 /// The seam for MCP OAuth sign-in state (F3-5a). `None` means unknown, and an
@@ -272,16 +372,20 @@ pub fn build_inventory_budgeted(
     probe: &dyn Fn(&KitMcpServer) -> Option<bool>,
     budget: Duration,
 ) -> KitInventory {
+    let home = std::fs::canonicalize(&roots.home).unwrap_or_else(|_| roots.home.clone());
+    let begun = Instant::now();
+    let guard = Guard::new(roots, &home, begun, budget);
     let started = Clock {
-        started: Instant::now(),
+        started: begun,
         budget,
         raw_home: &roots.home,
         project: &roots.project,
+        guard: &guard,
     };
-    let home = std::fs::canonicalize(&roots.home).unwrap_or_else(|_| roots.home.clone());
     let sources = sources(roots);
     let mut inventory = KitInventory::default();
     let mut plugin_dirs: Vec<(String, PathBuf, KitSource)> = Vec::new();
+    let key = roots.key_dir.as_deref().and_then(load_or_create_key);
 
     for source in &sources {
         collect_plugins(source, roots, &home, started, &mut inventory.plugins);
@@ -320,16 +424,32 @@ pub fn build_inventory_budgeted(
         ))
     });
 
-    inventory.incomplete = inventory
+    let timed_out = inventory
         .skills
         .iter()
         .map(|s| s.exclusion)
         .chain(inventory.plugins.iter().map(|p| p.exclusion))
         .any(|e| e == Some(Exclusion::ScanTimedOut));
+    // Without a key the secrets cannot be digested, so a change in them would go
+    // unseen: flag the inventory instead of looking complete. This does not make the
+    // size total a lower bound, so `over_total_cap` ignores it.
+    let mut key_missing = false;
+    for server in &mut inventory.mcp_servers {
+        if server.secrets.is_empty() {
+            continue;
+        }
+        match &key {
+            Some(key) => server.secrets_digest = Some(secrets_digest(key, &server.secrets)),
+            None => key_missing = true,
+        }
+    }
+    inventory.scan_timed_out = timed_out;
+    inventory.key_unavailable = key_missing;
+    // A credential index cut short means a hard link to a credential file could be missed.
+    inventory.incomplete = timed_out || key_missing || !guard.index_complete;
     inventory.total_compressed = total_compressed(&inventory);
     // A timed-out item has no size, so the total is only a lower bound: report over-cap.
-    inventory.over_total_cap =
-        inventory.incomplete || inventory.total_compressed > MAX_KIT_COMPRESSED_BYTES;
+    inventory.over_total_cap = timed_out || inventory.total_compressed > MAX_KIT_COMPRESSED_BYTES;
     inventory.content_hash = content_hash(&inventory);
     inventory
 }
@@ -375,8 +495,9 @@ struct Clock<'a> {
     /// `roots.home` as given, before canonicalizing (it may sit behind a link such as
     /// macOS `/var`).
     raw_home: &'a Path,
-    /// The local project; an item inside it may link anywhere inside it.
+    /// The local project, for roots that live outside `$HOME`.
     project: &'a Path,
+    guard: &'a Guard,
 }
 
 struct Scan {
@@ -386,8 +507,283 @@ struct Scan {
     exclusion: Option<Exclusion>,
 }
 
+/// Folders under `$HOME` that hold credentials. An item root never resolves into one.
+const SENSITIVE_HOME_DIRS: [&str; 7] = [
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".kube",
+    ".docker",
+    ".config/gcloud",
+    ".config/gh",
+];
+
+/// System folders an item root never resolves into.
+const SYSTEM_DIRS: [&str; 8] = [
+    "/etc",
+    "/private/etc",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/System",
+    "/Library",
+    "/private/var/root",
+];
+
+/// Places an item must never reach, and the identity of credential files.
+struct Guard {
+    /// Credentials folders and files and the claude config dirs. An item root may not be
+    /// one of these or contain one. Walking into one is refused too.
+    forbidden: Vec<PathBuf>,
+    /// The app's own dirs (data dir, `provider-accounts`, account dirs, the key dir). A
+    /// root may not be one of these, contain one, or live UNDER one (except the
+    /// `skills` and `plugins` folders of the active config dirs, see `exempt`).
+    app: Vec<PathBuf>,
+    /// The `skills` and `plugins` folders of the active claude config dirs, where real
+    /// items live even when that dir sits inside an app dir.
+    exempt: Vec<PathBuf>,
+    /// (device, inode) of regular files found under the credentials folders, to spot a
+    /// hard link to one of them.
+    secret_files: HashSet<(u64, u64)>,
+    /// False when the scan for `secret_files` ran out of time or entries, so a hard link
+    /// to a credential file may go unnoticed.
+    index_complete: bool,
+}
+
+/// Entries read when collecting credential file identities.
+const MAX_GUARD_ENTRIES: usize = 20_000;
+
+/// Folder names that are never part of a skill or plugin, wherever they sit.
+const SENSITIVE_NAMES: [&str; 3] = [".ssh", ".aws", ".gnupg"];
+
+/// Credential locations under `$HOME`, in the order they are indexed: the small and
+/// important ones first, the folders that may hold logs and caches last.
+const INDEXED_HOME_PATHS: [&str; 9] = [
+    ".claude/.credentials.json",
+    ".ssh",
+    ".aws",
+    ".config/gh",
+    ".gnupg",
+    ".codex/auth.json",
+    ".kube",
+    ".docker",
+    ".config/gcloud",
+];
+
+/// Folders that hold the app's own data, as the app finds them plus the per-OS layouts
+/// under the given home (the home may differ from the process one).
+fn app_data_dirs(home: &Path) -> Vec<PathBuf> {
+    let id = crate::brand::DESKTOP_APP_ID;
+    let mut out = vec![
+        home.join("Library/Application Support").join(id),
+        home.join(".local/share").join(id),
+    ];
+    if let Some(dir) = crate::store::monocode_database().parent() {
+        out.push(dir.to_path_buf());
+    }
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+        out.push(PathBuf::from(xdg).join(id));
+    }
+    out
+}
+
+impl Guard {
+    fn new(roots: &KitRoots, home: &Path, started: Instant, budget: Duration) -> Self {
+        fn with_canonical(list: &mut Vec<PathBuf>, path: PathBuf) {
+            if let Ok(real) = std::fs::canonicalize(&path) {
+                if real != path {
+                    list.push(real);
+                }
+            }
+            list.push(path);
+        }
+        let mut forbidden: Vec<PathBuf> = Vec::new();
+        for base in [home, roots.home.as_path()] {
+            for rel in INDEXED_HOME_PATHS {
+                with_canonical(&mut forbidden, base.join(rel));
+            }
+            with_canonical(&mut forbidden, base.join(".claude"));
+            with_canonical(&mut forbidden, base.join(".codex"));
+        }
+        with_canonical(&mut forbidden, roots.claude_home.clone());
+
+        let mut app: Vec<PathBuf> = Vec::new();
+        let mut data_dirs = app_data_dirs(&roots.home);
+        data_dirs.extend(app_data_dirs(home));
+        for dir in data_dirs {
+            with_canonical(&mut app, dir.join("provider-accounts"));
+            with_canonical(&mut app, dir);
+        }
+        for dir in [&roots.account_dir, &roots.key_dir].into_iter().flatten() {
+            with_canonical(&mut app, dir.clone());
+        }
+        // Every account dir the app knows lives under `provider-accounts`; those are
+        // covered by their parent, but list the ones present for clarity and for links.
+        let mut exempt: Vec<PathBuf> = Vec::new();
+        for dir in std::iter::once(&roots.claude_home).chain(roots.account_dir.iter()) {
+            for sub in ["skills", "plugins"] {
+                with_canonical(&mut exempt, dir.join(sub));
+            }
+        }
+        for list in [&mut forbidden, &mut app, &mut exempt] {
+            list.sort();
+            list.dedup();
+        }
+
+        let mut secret_files = HashSet::new();
+        let mut budget_left = MAX_GUARD_ENTRIES;
+        let mut index_complete = true;
+        for rel in INDEXED_HOME_PATHS {
+            let path = home.join(rel);
+            // A credentials folder may itself be a link (stow-style dotfiles).
+            let path = std::fs::canonicalize(&path).unwrap_or(path);
+            if !collect_file_ids(&path, &mut secret_files, &mut budget_left, started, budget) {
+                index_complete = false;
+                break;
+            }
+        }
+        Self {
+            forbidden,
+            app,
+            exempt,
+            secret_files,
+            index_complete,
+        }
+    }
+}
+
+/// Add the (device, inode) of every regular file under `path`, without following links.
+/// Errors are ignored. Returns false when the entry cap or the time budget ran out.
+fn collect_file_ids(
+    path: &Path,
+    out: &mut HashSet<(u64, u64)>,
+    left: &mut usize,
+    started: Instant,
+    budget: Duration,
+) -> bool {
+    if *left == 0 || started.elapsed() >= budget {
+        return false;
+    }
+    *left -= 1;
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return true;
+    };
+    if meta.is_file() {
+        if let Some(id) = file_id(&meta) {
+            out.insert(id);
+        }
+    } else if meta.is_dir() {
+        if let Ok(reader) = std::fs::read_dir(path) {
+            for entry in reader.flatten() {
+                if !collect_file_ids(&entry.path(), out, left, started, budget) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Is `real_root` a place that is never a skill or plugin? `root` is the path as named
+/// and `canonical_named` the same path with its parent canonicalized.
+fn unsafe_root(
+    root: &Path,
+    canonical_named: &Path,
+    real_root: &Path,
+    homes: [&Path; 2],
+    guard: &Guard,
+) -> bool {
+    if real_root.parent().is_none() || SYSTEM_DIRS.iter().any(|d| real_root.starts_with(d)) {
+        return true;
+    }
+    // `$HOME` itself or any folder that contains it.
+    if homes.iter().any(|home| home.starts_with(real_root)) {
+        return true;
+    }
+    // A folder that contains the path that names the root (`foo -> ..`). The named path
+    // is also checked with its parent canonicalized, for a home behind a link.
+    if real_root != root
+        && (root.starts_with(real_root)
+            || (canonical_named != real_root && canonical_named.starts_with(real_root)))
+    {
+        return true;
+    }
+    // The app's own dirs: equal, containing, or living under one is refused. The
+    // `skills` and `plugins` folders of the active config dirs are the exception.
+    let exempt = guard.exempt.iter().any(|dir| real_root.starts_with(dir));
+    if guard
+        .app
+        .iter()
+        .any(|dir| dir.starts_with(real_root) || (!exempt && real_root.starts_with(dir)))
+    {
+        return true;
+    }
+    // A credentials folder or file, the claude config dirs, or a
+    // folder that contains one of them (`foo -> ~/.config`, `foo -> ~/.claude`). Living
+    // UNDER `~/.claude` (`~/.claude/skills/foo`) is fine.
+    if guard
+        .forbidden
+        .iter()
+        .any(|path| path.starts_with(real_root))
+    {
+        return true;
+    }
+    homes.iter().any(|home| {
+        SENSITIVE_HOME_DIRS
+            .iter()
+            .any(|dir| real_root.starts_with(home.join(dir)))
+            || real_root.starts_with(home.join("Library/Keychains"))
+    })
+}
+
+/// Is a directory met while walking an item a credentials folder? `.ssh`, `.aws` and
+/// `.gnupg` always are. `.docker` and `.kube` also hold ordinary project files
+/// (a Dockerfile, manifests), so they count only when they hold a client config.
+fn sensitive_dir(path: &Path, name: &str, guard: &Guard) -> bool {
+    if SENSITIVE_NAMES.contains(&name) || guard.forbidden.iter().any(|f| f == path) {
+        return true;
+    }
+    match name {
+        ".docker" => path.join("config.json").exists(),
+        ".kube" => kube_has_config(path),
+        _ => false,
+    }
+}
+
+/// A `.kube` folder with a `config` file, or a file that looks like a kubeconfig.
+fn kube_has_config(dir: &Path) -> bool {
+    if dir.join("config").exists() {
+        return true;
+    }
+    let Ok(reader) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    reader.flatten().take(64).any(|entry| {
+        let Ok(file) = std::fs::File::open(entry.path()) else {
+            return false;
+        };
+        let mut head = Vec::new();
+        let _ = file.take(64 * 1024).read_to_end(&mut head);
+        let text = String::from_utf8_lossy(&head);
+        text.contains("current-context:") || text.contains("clusters:")
+    })
+}
+
 /// Walk one skill or plugin directory. Files come back sorted, so every later step is
-/// deterministic. Symlinks are resolved, and a link that leaves `home` excludes the item.
+/// deterministic.
+///
+/// Link rules:
+///
+/// - The item ROOT may itself be reached through a link. That is the common dotfiles
+///   setup (`~/.claude/skills/foo -> ~/dotfiles/skills/foo`), so a root named under
+///   `$HOME` may resolve anywhere under `$HOME`. One that resolves out of `$HOME`
+///   (through any component) is refused with [`Exclusion::LinkOutsideHome`]. A root not
+///   named under `$HOME` (a project elsewhere, a plugin installed elsewhere) is taken
+///   as it resolves.
+/// - Links INSIDE the item (its content) must resolve inside the item's own canonical
+///   root. Anything else, even a path under `$HOME` or the project, excludes the whole
+///   item with [`Exclusion::LinkLeavesItem`], so `creds -> ~/.aws` never travels.
+/// - Dead links are skipped, and link loops end through the visited set.
 fn scan_item(root: &Path, kind: ItemKind, home: &Path, started: Clock<'_>) -> Scan {
     let mut scan = Scan {
         files: Vec::new(),
@@ -399,9 +795,6 @@ fn scan_item(root: &Path, kind: ItemKind, home: &Path, started: Clock<'_>) -> Sc
         ItemKind::Skill => MAX_SKILL_BYTES,
         ItemKind::Plugin => MAX_PLUGIN_BYTES,
     };
-    // The item root may live anywhere (a project outside `$HOME`, a plugin installed
-    // elsewhere). But a root whose own path is under `$HOME` must not resolve out of it
-    // through a link in any component (`~/.claude/skills -> /Volumes/x`).
     let Ok(real_root) = std::fs::canonicalize(root) else {
         return scan;
     };
@@ -410,23 +803,43 @@ fn scan_item(root: &Path, kind: ItemKind, home: &Path, started: Clock<'_>) -> Sc
         scan.exclusion = Some(Exclusion::LinkOutsideHome);
         return scan;
     }
+    let canonical_named = match (root.parent(), root.file_name()) {
+        (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+            .map(|p| p.join(name))
+            .unwrap_or_else(|_| root.to_path_buf()),
+        _ => root.to_path_buf(),
+    };
+    if unsafe_root(
+        root,
+        &canonical_named,
+        &real_root,
+        [home, started.raw_home],
+        started.guard,
+    ) {
+        scan.exclusion = Some(Exclusion::UnsafeRoot);
+        return scan;
+    }
+    if !named_inside {
+        // Outside `$HOME` the root must stay in the project or next to where it is named.
+        let project = std::fs::canonicalize(started.project).ok();
+        let parent = root.parent().and_then(|p| std::fs::canonicalize(p).ok());
+        let allowed = project.is_some_and(|p| real_root.starts_with(p))
+            || parent.is_some_and(|p| real_root.starts_with(p));
+        if !allowed {
+            scan.exclusion = Some(Exclusion::UnsafeRoot);
+            return scan;
+        }
+    }
     if kind == ItemKind::Plugin && (root.join("bin").exists() || root.join(".lsp.json").exists()) {
         scan.has_native = true;
     }
     let mut visited: HashSet<PathBuf> = HashSet::new();
     visited.insert(real_root.clone());
     let mut entries = 0usize;
-    // Links may stay inside the item, or inside the project when the item is a project
-    // item living outside `$HOME`.
-    let boundary = std::fs::canonicalize(started.project)
-        .ok()
-        .filter(|project| !named_inside && real_root.starts_with(project))
-        .unwrap_or_else(|| real_root.clone());
     walk(
         &real_root,
-        &boundary,
+        &real_root,
         kind,
-        home,
         started,
         cap,
         &mut visited,
@@ -442,7 +855,6 @@ fn walk(
     dir: &Path,
     item_root: &Path,
     kind: ItemKind,
-    home: &Path,
     started: Clock<'_>,
     cap: u64,
     visited: &mut HashSet<PathBuf>,
@@ -480,10 +892,10 @@ fn walk(
             continue;
         };
         let (path, meta) = if meta.file_type().is_symlink() {
-            let real = match resolve_link(&path, home, item_root) {
+            let real = match resolve_link(&path, item_root) {
                 Link::Inside(real) => real,
                 Link::Outside => {
-                    scan.exclusion = Some(Exclusion::LinkOutsideHome);
+                    scan.exclusion = Some(Exclusion::LinkLeavesItem);
                     return;
                 }
                 Link::Dead => continue,
@@ -496,13 +908,27 @@ fn walk(
             (path, meta)
         };
         if meta.is_dir() {
+            if sensitive_dir(&path, &name, started.guard) {
+                scan.exclusion = Some(Exclusion::SensitiveContent);
+                return;
+            }
             if !visited.insert(path.clone()) {
                 continue;
             }
-            walk(
-                &path, item_root, kind, home, started, cap, visited, entries, scan,
-            );
+            walk(&path, item_root, kind, started, cap, visited, entries, scan);
         } else if meta.is_file() {
+            // A file that is a hard link to a credentials file is refused. Other hard
+            // links are not detected (see the module docs).
+            if started.guard.forbidden.contains(&path) {
+                scan.exclusion = Some(Exclusion::SensitiveContent);
+                return;
+            }
+            if link_count(&meta) > 1
+                && file_id(&meta).is_some_and(|id| started.guard.secret_files.contains(&id))
+            {
+                scan.exclusion = Some(Exclusion::HardLinkElsewhere);
+                return;
+            }
             scan.size += meta.len();
             if scan.size > cap {
                 scan.exclusion = Some(Exclusion::TooLarge);
@@ -516,21 +942,38 @@ fn walk(
     }
 }
 
+#[cfg(unix)]
+fn link_count(meta: &std::fs::Metadata) -> u64 {
+    std::os::unix::fs::MetadataExt::nlink(meta)
+}
+#[cfg(not(unix))]
+fn link_count(_meta: &std::fs::Metadata) -> u64 {
+    1
+}
+#[cfg(unix)]
+fn file_id(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.dev(), meta.ino()))
+}
+#[cfg(not(unix))]
+fn file_id(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
 enum Link {
-    /// Resolves to a path inside `home`.
+    /// Resolves to a path inside the item's own canonical root.
     Inside(PathBuf),
-    /// Resolves to a path outside `home`: refused.
+    /// Resolves anywhere else: refused.
     Outside,
     /// Dead or unreadable: skipped.
     Dead,
 }
 
-/// Resolve a symlink. Only a link that resolves outside `home` is refused; a dead one
-/// is simply skipped.
-fn resolve_link(path: &Path, home: &Path, item_root: &Path) -> Link {
+/// Resolve a symlink found inside an item. Only a target inside `item_root` (already
+/// canonical) is accepted; a dead link is simply skipped.
+fn resolve_link(path: &Path, item_root: &Path) -> Link {
     match std::fs::canonicalize(path) {
-        // Inside `home`, or inside the item itself (a root that lives outside `home`).
-        Ok(real) if real.starts_with(home) || real.starts_with(item_root) => Link::Inside(real),
+        Ok(real) if real.starts_with(item_root) => Link::Inside(real),
         Ok(_) => Link::Outside,
         Err(_) => Link::Dead,
     }
@@ -920,16 +1363,18 @@ fn build_server(
             "stdio"
         })
         .to_string();
+    let secrets = find_secrets(object);
     let mut canonical = String::new();
-    canonical_json(config, &mut canonical);
+    canonical_json(&mask_secrets(config, &secrets), &mut canonical);
     let mut server = KitMcpServer {
         name: name.to_string(),
         scope,
         source,
         config_path: config_path.to_path_buf(),
         compat: McpCompat::Ok,
-        secrets: find_secrets(object),
+        secrets,
         config_hash: digest_str(&[&canonical]),
+        secrets_digest: None,
         transport,
     };
     server.compat = if scope == McpScope::Project {
@@ -1088,18 +1533,324 @@ fn find_secrets(object: &serde_json::Map<String, Value>) -> Vec<SecretField> {
         }
     }
     if let Some(raw) = object.get("url").and_then(Value::as_str) {
-        let has_query = url::Url::parse(raw)
-            .map(|url| url.query().is_some_and(|q| !q.is_empty()))
-            // A URL we cannot parse still counts if it carries a `?query`.
-            .unwrap_or_else(|_| raw.split_once('?').is_some_and(|(_, q)| !q.is_empty()));
-        if has_query {
+        let parts = url_parts(raw);
+        if parts.userinfo || parts.query || parts.fragment {
             secrets.push(SecretField {
-                location: SecretLocation::UrlQuery,
+                location: if parts.userinfo {
+                    SecretLocation::UrlUserinfo
+                } else if parts.query {
+                    SecretLocation::UrlQuery
+                } else {
+                    SecretLocation::UrlFragment
+                },
                 value: Secret::new(raw),
             });
         }
     }
     secrets
+}
+
+const SECRET_MARKER: &str = "<secret>";
+
+/// A copy of the config with every secret value replaced by a marker, so the plain
+/// config hash does not depend on them. Which fields are secret is decided by
+/// [`find_secrets`]; the field names and the shape stay.
+fn mask_secrets(config: &Value, secrets: &[SecretField]) -> Value {
+    let mut masked = config.clone();
+    let Some(object) = masked.as_object_mut() else {
+        return masked;
+    };
+    for secret in secrets {
+        let marker = Value::String(SECRET_MARKER.to_string());
+        match &secret.location {
+            SecretLocation::Env(field) => mask_field(object, "env", field, marker),
+            SecretLocation::Header(field) => mask_field(object, "headers", field, marker),
+            SecretLocation::UrlQuery
+            | SecretLocation::UrlUserinfo
+            | SecretLocation::UrlFragment => {
+                if let Some(raw) = object.get("url").and_then(Value::as_str) {
+                    let masked = mask_url(raw);
+                    object.insert("url".to_string(), Value::String(masked));
+                }
+            }
+        }
+    }
+    masked
+}
+
+/// Which secret-bearing parts a URL has.
+struct UrlParts {
+    userinfo: bool,
+    query: bool,
+    fragment: bool,
+}
+
+/// Split a URL that does not parse: `scheme://authority/path?query#fragment`, by hand.
+/// Returns (scheme prefix with `://` or empty, userinfo, rest of authority and path,
+/// query, fragment).
+fn split_unparsed(raw: &str) -> (&str, &str, &str, &str, &str) {
+    let (rest, fragment) = raw.split_once('#').unwrap_or((raw, ""));
+    let (rest, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let (prefix, after) = match rest.find("://") {
+        Some(ix) => rest.split_at(ix + 3),
+        None => ("", rest),
+    };
+    let authority_end = after.find('/').unwrap_or(after.len());
+    match after[..authority_end].rfind('@') {
+        Some(ix) => (prefix, &after[..ix], &after[ix + 1..], query, fragment),
+        None => (prefix, "", after, query, fragment),
+    }
+}
+
+fn url_parts(raw: &str) -> UrlParts {
+    match url::Url::parse(raw) {
+        Ok(url) => UrlParts {
+            userinfo: !url.username().is_empty() || url.password().is_some(),
+            query: url.query().is_some_and(|q| !q.is_empty()),
+            fragment: url.fragment().is_some_and(|f| !f.is_empty()),
+        },
+        Err(_) => {
+            let (_, userinfo, _, query, fragment) = split_unparsed(raw);
+            UrlParts {
+                userinfo: !userinfo.is_empty(),
+                query: !query.is_empty(),
+                fragment: !fragment.is_empty(),
+            }
+        }
+    }
+}
+
+/// The plain form of a secret-bearing URL: scheme, host, port and path only. Userinfo,
+/// query and fragment are replaced by a marker, so none of them reaches a plain hash.
+fn mask_url(raw: &str) -> String {
+    let parts = url_parts(raw);
+    let mut out;
+    if let Ok(url) = url::Url::parse(raw) {
+        out = format!("{}://", url.scheme());
+        if parts.userinfo {
+            out.push_str(SECRET_MARKER);
+            out.push('@');
+        }
+        out.push_str(url.host_str().unwrap_or(""));
+        if let Some(port) = url.port() {
+            out.push_str(&format!(":{port}"));
+        }
+        out.push_str(url.path());
+    } else {
+        let (prefix, _, rest, _, _) = split_unparsed(raw);
+        out = prefix.to_string();
+        if parts.userinfo {
+            out.push_str(SECRET_MARKER);
+            out.push('@');
+        }
+        out.push_str(rest);
+    }
+    if parts.query {
+        out.push('?');
+        out.push_str(SECRET_MARKER);
+    }
+    if parts.fragment {
+        out.push('#');
+        out.push_str(SECRET_MARKER);
+    }
+    out
+}
+
+fn mask_field(
+    object: &mut serde_json::Map<String, Value>,
+    group: &str,
+    field: &str,
+    marker: Value,
+) {
+    if let Some(map) = object.get_mut(group).and_then(Value::as_object_mut) {
+        map.insert(field.to_string(), marker);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Keyed digest of secrets
+// ---------------------------------------------------------------------------
+
+const KEY_FILE: &str = "kit-hash.key";
+const KEY_BYTES: usize = 32;
+
+/// The per-installation key, created on first use. Any failure gives `None`: the caller
+/// degrades, it never panics.
+///
+/// - A symlink at the key path is never followed or replaced.
+/// - A key file readable by group or others is refused (degrade), never replaced.
+/// - A file that cannot be read is left alone. A file that is empty or malformed is
+///   garbage (for example a crash while writing an older version): it is renamed aside
+///   (see [`retire_garbage`]) and a new key is created. A valid key is not replaced.
+/// - A new key is written to a temp file (0600) in the same dir and published with a
+///   hard link, which fails instead of replacing, so a crash never leaves a partial key
+///   and two processes agree on one key.
+fn load_or_create_key(dir: &Path) -> Option<[u8; KEY_BYTES]> {
+    let path = dir.join(KEY_FILE);
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => return None,
+        Ok(meta) => {
+            if key_file_too_open(&meta) {
+                return None;
+            }
+            let text = std::fs::read_to_string(&path).ok()?;
+            if let Some(key) = parse_key(&text) {
+                return Some(key);
+            }
+            // Garbage: move it aside, never delete blindly.
+            if let Some(key) = retire_garbage(&path, file_id(&meta)) {
+                return Some(key);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return None,
+    }
+    create_key(dir, &path)
+}
+
+#[cfg(unix)]
+fn key_file_too_open(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o077 != 0
+}
+
+#[cfg(not(unix))]
+fn key_file_too_open(_meta: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// Remove a key file that was unreadable as a key, without replacing a valid one.
+/// Returns a key only when a valid one turned up (another process published it).
+///
+/// Limit: with three or more processes racing, a valid key that is moved aside can be
+/// published again by a third process under a new value before it is put back, so the
+/// key may change once. Nothing is exposed by that: the digests simply differ from the
+/// older ones, as after a reinstall.
+///
+/// The file is renamed aside atomically, and only when it is still the file we read
+/// (same device and inode). Whatever was moved is read again: a valid key is linked
+/// back without replacing anything. `None` means the path is clear, so the caller
+/// creates a new key.
+fn retire_garbage(path: &Path, seen: Option<(u64, u64)>) -> Option<[u8; KEY_BYTES]> {
+    let now = std::fs::symlink_metadata(path).ok();
+    if now.as_ref().and_then(file_id) != seen {
+        // Replaced since we read it: use whatever is there now.
+        return parse_key(&std::fs::read_to_string(path).ok()?);
+    }
+    let aside = path.with_file_name(format!(
+        "{KEY_FILE}.garbage-{}-{:08x}",
+        std::process::id(),
+        rand::random::<u32>()
+    ));
+    std::fs::rename(path, &aside).ok()?;
+    let moved = std::fs::read_to_string(&aside)
+        .ok()
+        .and_then(|t| parse_key(&t));
+    let Some(key) = moved else {
+        let _ = std::fs::remove_file(&aside);
+        return None;
+    };
+    // We moved a valid key that was published in the meantime: put it back. If someone
+    // published another one since, theirs stays and wins.
+    match std::fs::hard_link(&aside, path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&aside);
+            Some(key)
+        }
+        Err(_) => {
+            let _ = std::fs::remove_file(&aside);
+            parse_key(&std::fs::read_to_string(path).ok()?)
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn retire_garbage_for_test(
+    path: &Path,
+    seen: Option<(u64, u64)>,
+) -> Option<[u8; KEY_BYTES]> {
+    retire_garbage(path, seen)
+}
+
+fn create_key(dir: &Path, path: &Path) -> Option<[u8; KEY_BYTES]> {
+    std::fs::create_dir_all(dir).ok()?;
+    let key: [u8; KEY_BYTES] = rand::random();
+    let temp = dir.join(format!(
+        "{KEY_FILE}.tmp-{}-{:08x}",
+        std::process::id(),
+        rand::random::<u32>()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let written = options.open(&temp).and_then(|mut file| {
+        file.write_all(hex(&key).as_bytes())?;
+        file.sync_all()
+    });
+    let published = written.is_ok().then(|| std::fs::hard_link(&temp, path));
+    let _ = std::fs::remove_file(&temp);
+    match published? {
+        Ok(()) => Some(key),
+        // Another process published first: use theirs.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            parse_key(&std::fs::read_to_string(path).ok()?)
+        }
+        Err(_) => None,
+    }
+}
+
+fn parse_key(text: &str) -> Option<[u8; KEY_BYTES]> {
+    let text = text.trim();
+    if text.len() != KEY_BYTES * 2 || !text.is_ascii() {
+        return None;
+    }
+    let mut key = [0u8; KEY_BYTES];
+    for (index, byte) in key.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(key)
+}
+
+/// HMAC-SHA256 (RFC 2104), built on `sha2`.
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut block = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Sha256::new();
+    inner.update(block.map(|b| b ^ 0x36));
+    inner.update(data);
+    let mut outer = Sha256::new();
+    outer.update(block.map(|b| b ^ 0x5c));
+    outer.update(inner.finalize());
+    outer.finalize().into()
+}
+
+#[cfg(test)]
+pub(super) fn hmac_for_test(key: &[u8], data: &[u8]) -> String {
+    hex(&hmac_sha256(key, data))
+}
+
+/// Keyed digest of a server's secrets, unambiguous (every part is length-prefixed).
+fn secrets_digest(key: &[u8; KEY_BYTES], secrets: &[SecretField]) -> KeyedDigest {
+    let mut data = b"monoptah-kit-secrets-v1".to_vec();
+    for secret in secrets {
+        for part in [
+            format!("{:?}", secret.location).as_bytes(),
+            secret.value.expose().as_bytes(),
+        ] {
+            data.extend_from_slice(&(part.len() as u64).to_le_bytes());
+            data.extend_from_slice(part);
+        }
+    }
+    KeyedDigest(hex(&hmac_sha256(key, &data)))
 }
 
 /// Compact JSON with object keys sorted, independent of the map implementation.
