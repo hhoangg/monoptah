@@ -207,8 +207,8 @@ fn remote_tip(root: &Path, branch: &str) -> Option<String> {
 // ---------------------------------------------------------------- step 1: fetch
 
 enum Timed {
-    TimedOut,
-    Cancelled,
+    Expired,
+    Stopped,
     Failed(String),
 }
 
@@ -258,11 +258,11 @@ fn run_timed_with(
             Some(status) => break status,
             None if started.elapsed() >= timeout => {
                 crate::process::terminate(&mut child);
-                return Err(Timed::TimedOut);
+                return Err(Timed::Expired);
             }
             None if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) => {
                 crate::process::terminate(&mut child);
-                return Err(Timed::Cancelled);
+                return Err(Timed::Stopped);
             }
             None => std::thread::sleep(Duration::from_millis(25)),
         }
@@ -290,11 +290,11 @@ fn fetch_with_timeout(cwd: &Path, timeout: Duration) -> Result<(), String> {
     let root = toplevel(cwd)?;
     match run_timed(&root, &["fetch", "--no-tags", REMOTE], timeout) {
         Ok(_) => Ok(()),
-        Err(Timed::TimedOut) => Err(format!(
+        Err(Timed::Expired) => Err(format!(
             "Fetching {REMOTE} took longer than {} seconds",
             timeout.as_secs()
         )),
-        Err(Timed::Cancelled) => Err("Cancelled".into()),
+        Err(Timed::Stopped) => Err("Cancelled".into()),
         Err(Timed::Failed(e)) => Err(format!("Could not fetch {REMOTE}: {e}")),
     }
 }
@@ -495,11 +495,11 @@ pub fn push_timed(
     let path = crate::scm::shell::gui_search_path();
     match run_timed_with(&root, &args, timeout, Some(cancel), Some(&path)) {
         Ok(_) => Ok(()),
-        Err(Timed::TimedOut) => Err(format!(
+        Err(Timed::Expired) => Err(format!(
             "Pushing took longer than {} seconds",
             timeout.as_secs()
         )),
-        Err(Timed::Cancelled) => Err(PUSH_CANCELLED.into()),
+        Err(Timed::Stopped) => Err(PUSH_CANCELLED.into()),
         Err(Timed::Failed(e)) => Err(e),
     }
 }
@@ -524,8 +524,8 @@ pub fn origin_branch_tip(cwd: &Path, branch: &str) -> Result<Option<String>, Str
             .filter_map(|line| line.split_once('\t'))
             .find(|(_, name_found)| *name_found == name)
             .map(|(sha, _)| sha.trim().to_owned())),
-        Err(Timed::TimedOut) => Err(format!("Asking {REMOTE} took longer than 10 seconds")),
-        Err(Timed::Cancelled) => Err("Cancelled".into()),
+        Err(Timed::Expired) => Err(format!("Asking {REMOTE} took longer than 10 seconds")),
+        Err(Timed::Stopped) => Err("Cancelled".into()),
         Err(Timed::Failed(e)) => Err(format!("Could not ask {REMOTE}: {e}")),
     }
 }

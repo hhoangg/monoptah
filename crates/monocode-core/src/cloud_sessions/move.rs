@@ -985,16 +985,14 @@ impl CloudSessions {
                 Ok(workspace) => record.workspace = Some(workspace),
                 Err(error) => {
                     // The codespace may exist even though the start failed: keep its name.
-                    record.workspace = match super::split_created_note(&error) {
-                        Some((_, kind, name)) => Some(WorkspaceInfo {
+                    record.workspace =
+                        super::split_created_note(&error).map(|(_, kind, name)| WorkspaceInfo {
                             backend: kind,
                             name: name.to_string(),
                             created: true,
                             start_session: None,
                             project: None,
-                        }),
-                        None => None,
-                    };
+                        });
                     save_record(&*self.store()?, record)?;
                     return Err(Stop::Failed(error));
                 }
