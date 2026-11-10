@@ -9,6 +9,29 @@ EXISTED=0
 FORCE_UPGRADE=${MONOCODE_HOST_FORCE_UPGRADE:-0}
 HOST_PORT=${MONOCODE_HOST_PORT:-3774}
 
+# True (0) when the installed Host must be replaced by the pinned one: it lacks the
+# "+monoptah" flavor marker (an upstream Host, whatever its number) or its X.Y.Z core is
+# lower than the pin's. Build metadata is ignored in the comparison. Not used by the
+# install rule below, which stays "missing or FORCE_UPGRADE"; the connect-time upgrade
+# decides with it.
+is_older_or_foreign() {
+  case "$1" in *+monoptah) ;; *) return 0 ;; esac
+  _installed=${1%%+*}
+  _pin=${2%%+*}
+  IFS=. read -r _a1 _a2 _a3 <<EOF_INSTALLED
+${_installed%%-*}
+EOF_INSTALLED
+  IFS=. read -r _b1 _b2 _b3 <<EOF_PIN
+${_pin%%-*}
+EOF_PIN
+  for _n in "$_a1" "$_a2" "$_a3" "$_b1" "$_b2" "$_b3"; do
+    case "$_n" in *[!0-9]*|'') return 0 ;; esac
+  done
+  [ "$_a1" -eq "$_b1" ] || { [ "$_a1" -lt "$_b1" ]; return; }
+  [ "$_a2" -eq "$_b2" ] || { [ "$_a2" -lt "$_b2" ]; return; }
+  [ "$_a3" -lt "$_b3" ]
+}
+
 if [ ! -x "$ENTRY" ] || [ "$FORCE_UPGRADE" = 1 ]; then
   case "$(uname -s)" in Darwin) OS=darwin ;; Linux) OS=linux ;; *) echo 'Monoptah Host supports Linux and macOS.' >&2; exit 1 ;; esac
   case "$(uname -m)" in arm64|aarch64) ARCH=arm64 ;; x86_64|amd64) ARCH=x64 ;; *) echo 'Unsupported host architecture.' >&2; exit 1 ;; esac
@@ -26,12 +49,19 @@ if [ ! -x "$ENTRY" ] || [ "$FORCE_UPGRADE" = 1 ]; then
       echo 'Install curl or wget on this host and reconnect.' >&2; exit 1
     fi
   }
+  # The expected hash is pinned in the app and substituted here per target, so a changed
+  # release cannot vouch for itself. The published .sha256 is only a cross-check.
+  case "$OS-$ARCH" in
+@@SHA256@@
+    *) echo 'No pinned checksum for this host target.' >&2; exit 1 ;;
+  esac
+  case "$EXPECTED" in *[!0-9a-f]*|'') echo 'Invalid host package checksum.' >&2; exit 1 ;; esac
+  [ "${#EXPECTED}" -eq 64 ] || exit 1
   if ! download "$RELEASE/$FILE" "$TMP/$FILE" || ! download "$RELEASE/$FILE.sha256" "$TMP/checksum"; then
     echo "The Monoptah Host package for version $VERSION is unavailable. Install a Monoptah release that includes host packages." >&2; exit 1
   fi
-  EXPECTED=$(awk 'NR == 1 {print $1}' "$TMP/checksum")
-  case "$EXPECTED" in *[!0-9a-f]*|'') echo 'Invalid host package checksum.' >&2; exit 1 ;; esac
-  [ "${#EXPECTED}" -eq 64 ] || exit 1
+  PUBLISHED=$(awk 'NR == 1 {print $1}' "$TMP/checksum")
+  [ "$PUBLISHED" = "$EXPECTED" ] || { echo 'Monoptah Host pinned checksum mismatch: the published checksum differs.' >&2; exit 1; }
   if command -v shasum >/dev/null 2>&1; then
     ACTUAL=$(shasum -a 256 "$TMP/$FILE" | awk '{print $1}')
   elif command -v sha256sum >/dev/null 2>&1; then

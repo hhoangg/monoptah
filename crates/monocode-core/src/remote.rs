@@ -1,6 +1,8 @@
 //! Remote host connections. The renderer receives machine metadata, never the
 //! saved bearer credential. Workspace requests never fall back to local calls.
 pub mod attachments;
+pub mod host_info;
+pub mod host_release;
 pub mod protocol;
 mod ssh;
 pub mod ssh_askpass;
@@ -28,6 +30,8 @@ pub struct Connections {
     jobs: Mutex<HashMap<String, Arc<Job>>>,
     /// In-flight codespace wakes by machine id, so concurrent callers share one.
     wakes: Mutex<HashMap<String, WakeSlot>>,
+    /// Flavor, version and capabilities of each machine's Host, from `environment.describe`.
+    host_info: host_info::HostInfoCache,
 }
 
 type WakeSlot = Arc<(Mutex<Option<Result<(), String>>>, Condvar)>;
@@ -46,6 +50,7 @@ impl Connections {
             tunnels: Tunnels::default(),
             jobs: Mutex::new(HashMap::new()),
             wakes: Mutex::new(HashMap::new()),
+            host_info: host_info::HostInfoCache::default(),
         }
     }
 
@@ -424,6 +429,7 @@ impl Connections {
         machines.retain(|m| m.id != id);
         machines.push(machine.clone());
         write(&path, &machines)?;
+        self.host_info.record(&id, &descriptor);
         Ok(machine.public())
     }
 
@@ -437,7 +443,21 @@ impl Connections {
         machines.retain(|m| m.id != machine_id);
         write(&path, &machines)?;
         self.tunnels.remove(machine_id);
+        self.host_info.drop_machine(machine_id);
         Ok(())
+    }
+
+    /// What the last `environment.describe` of this machine reported, if any.
+    pub fn host_info(&self, machine_id: &str) -> Option<host_info::HostInfo> {
+        self.host_info.get(machine_id)
+    }
+
+    /// Describes the Host now (refreshing the cache) and returns what it reports.
+    pub fn describe_host(&self, machine_id: &str) -> Result<host_info::HostInfo, String> {
+        self.request(machine_id, "environment.describe", json!({}))?;
+        self.host_info
+            .get(machine_id)
+            .ok_or_else(|| "Machine is no longer connected".into())
     }
 
     pub fn request(
@@ -505,6 +525,8 @@ impl Connections {
             if let Some(lease) = &tunnel_lease {
                 self.tunnels.invalidate(&machine.id, lease);
             }
+            // The Host behind an unreachable tunnel may be replaced; learn it again.
+            self.host_info.drop_machine(&machine.id);
             if cloud {
                 return Err(not_connected.into());
             }
@@ -515,6 +537,9 @@ impl Connections {
                 != Some(machine.environment_id.as_str())
         {
             return Err("Host identity changed. Add this machine again before continuing.".into());
+        }
+        if method == "environment.describe" {
+            self.host_info.record(&machine.id, &result);
         }
         Ok(result)
     }
@@ -735,6 +760,7 @@ impl Connections {
                         return Err("The installed host package still lacks Explorer and Changes. Install a newer Monoptah release with updated host packages.".into());
                     }
                 }
+                state.host_info.record(&machine.id, &descriptor);
                 if machine.name.trim().is_empty() {
                     machine.name = descriptor
                         .get("name")
@@ -1133,6 +1159,37 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn host_info_follows_connect_describe_and_disconnect() {
+        let upstream = json!({ "result": { "protocolVersion": 1, "environmentId": "env", "capabilities": ["files.list"] }});
+        let fork = json!({ "result": {
+            "protocolVersion": 1,
+            "environmentId": "env",
+            "host": { "flavor": "monoptah", "version": "1.1.0" },
+            "capabilities": ["files.list", "files.readBytes"],
+        }});
+        let (url, _requests, server) = host_fixture(vec![upstream, fork]);
+        let dir = tempfile::tempdir().unwrap();
+        let connections = Connections::new(dir.path());
+        assert_eq!(connections.host_info("nobody"), None);
+        let machine = connections.connect("".into(), url, "a".repeat(43)).unwrap();
+        // An upstream describe has no `host` field.
+        let info = connections.host_info(&machine.id).unwrap();
+        assert_eq!(info.flavor, "upstream");
+        assert_eq!(info.version, None);
+        assert!(!info.supports("files.readBytes"));
+        // A fork describe replaces the entry.
+        let info = connections.describe_host(&machine.id).unwrap();
+        assert!(info.is_monoptah());
+        assert_eq!(info.version.as_deref(), Some("1.1.0"));
+        assert!(info.supports("files.readBytes"));
+        assert_eq!(connections.host_info(&machine.id), Some(info));
+        // Disconnecting drops it.
+        connections.disconnect(&machine.id).unwrap();
+        assert_eq!(connections.host_info(&machine.id), None);
+        server.join().unwrap();
     }
 
     #[test]
