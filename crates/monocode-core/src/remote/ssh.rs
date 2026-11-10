@@ -1990,7 +1990,9 @@ mod tests {
         );
         assert!(codespace.ends_with(&codespace_bootstrap_script()));
         // The user's explicit Upgrade is untouched: it forces the install.
-        assert!(upgrade_script(HostPlatform::Unix, 3774).starts_with("MONOCODE_HOST_FORCE_UPGRADE=1\n"));
+        assert!(
+            upgrade_script(HostPlatform::Unix, 3774).starts_with("MONOCODE_HOST_FORCE_UPGRADE=1\n")
+        );
     }
     #[cfg(unix)]
     #[test]

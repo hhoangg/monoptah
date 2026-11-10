@@ -2135,3 +2135,39 @@ fn the_panel_link_is_known_only_after_the_workspace_answered_or_failed(cx: &mut 
         })
     });
 }
+
+/// A user's own machine keeps the manual Upgrade copy; a cloud workspace updates itself at
+/// connect, so it never points at Connections settings.
+#[gpui::test]
+fn the_host_update_copy_differs_for_cloud_and_user_machines(cx: &mut TestAppContext) {
+    use crate::cloud_wake::fakes::{
+        AUTH_OK, github_project, install_with_sandbox, sandbox_session,
+    };
+    let user_machine = conversation(cx);
+    cx.update(|cx| {
+        user_machine.update(cx, |view, _| {
+            assert_eq!(view.cloud_noun(), None);
+            assert_eq!(
+                view.host_update_copy("use Plan mode"),
+                "Update Monoptah Host in Connections settings to use Plan mode."
+            );
+        })
+    });
+    let dir = github_project();
+    let store: Database = Arc::new(Mutex::new(
+        monocode_core::store::Store::open(Path::new(":memory:")).unwrap(),
+    ));
+    let (_gh, _host, _sbx, _) = install_with_sandbox(store.clone(), AUTH_OK, "Shutdown", "stopped");
+    let summary = sandbox_session(&store, dir.0.to_str().unwrap());
+    let view = cx.update(|cx| cx.new(|cx| Conversation::new(summary, store.clone(), cx)));
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            let copy = view.host_update_copy("use Plan mode");
+            assert_eq!(
+                copy,
+                "Monoptah Host will be updated on the next connect. Then you can use Plan mode."
+            );
+            assert!(!copy.contains("Connections settings"));
+        })
+    });
+}

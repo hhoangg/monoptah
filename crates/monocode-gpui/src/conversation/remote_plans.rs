@@ -157,7 +157,7 @@ impl Conversation {
             return;
         }
         if !self.remote_state.host.supports("sessions.plan") {
-            self.status = "Update Monoptah Host in Connections settings to build plans.".into();
+            self.status = self.host_update_copy("build plans");
             cx.notify();
             return;
         }

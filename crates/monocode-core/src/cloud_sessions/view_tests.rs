@@ -338,7 +338,8 @@ fn an_older_host_still_opens_small_text_but_not_binary_files() {
     );
     let text = ViewError::OldHost.to_string();
     assert!(
-        text.contains("Update Monoptah Host in Connections settings"),
+        text.contains("updates itself the next time this workspace connects")
+            && !text.contains("Connections settings"),
         "{text}"
     );
     assert!(text.contains("download a copy"), "{text}");

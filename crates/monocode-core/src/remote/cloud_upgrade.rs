@@ -226,6 +226,28 @@ fn session_is_active(session: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote::SshTarget;
+
+    fn machine(id: &str, ssh: Option<SshTarget>, pending: bool) -> StoredMachine {
+        StoredMachine {
+            id: id.into(),
+            name: id.into(),
+            endpoint: "http://127.0.0.1:9".into(),
+            environment_id: format!("env-{id}"),
+            token: "t".repeat(43),
+            ssh,
+            pending_host_upgrade: pending,
+        }
+    }
+    fn target(codespace: Option<&str>) -> SshTarget {
+        SshTarget {
+            target: "box".into(),
+            port: None,
+            remote_port: 3774,
+            codespace: codespace.map(Into::into),
+            sandbox: None,
+        }
+    }
 
     #[test]
     fn only_idle_or_interrupted_sessions_without_a_question_are_quiet() {
@@ -239,5 +261,68 @@ mod tests {
         ));
         assert!(session_is_active(&json!({"status": "mystery"})));
         assert!(session_is_active(&json!({})));
+    }
+
+    #[test]
+    fn a_users_own_ssh_machine_and_a_plain_host_are_never_upgraded() {
+        let dir = tempfile::tempdir().unwrap();
+        let connections = Connections::new(dir.path());
+        write(
+            &connections.store_path(),
+            &[
+                machine("ssh", Some(target(None)), false),
+                machine("direct", None, false),
+            ],
+        )
+        .unwrap();
+        for id in ["ssh", "direct", "missing"] {
+            let mut lines = vec![];
+            let outcome = connections
+                .upgrade_host_if_needed(id, None, &mut |line| lines.push(line.to_owned()));
+            // Nothing was asked of the machine (its endpoint is a dead port) and nothing said.
+            assert_eq!(outcome, Outcome::Current, "{id}");
+            assert!(lines.is_empty(), "{id}: {lines:?}");
+            assert!(!connections.host_upgrade_pending(id));
+        }
+    }
+
+    #[test]
+    fn the_pending_flag_is_stored_per_machine_and_old_stores_load_without_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let connections = Connections::new(dir.path());
+        write(
+            &connections.store_path(),
+            &[
+                machine("a", Some(target(Some("cs"))), false),
+                machine("b", Some(target(Some("cs2"))), false),
+            ],
+        )
+        .unwrap();
+        let env = CloudUpgrade {
+            connections: &connections,
+            id: "a",
+            sandbox: false,
+            auth: None,
+        };
+        assert!(!env.pending());
+        env.set_pending(true);
+        assert!(env.pending());
+        assert!(connections.host_upgrade_pending("a"));
+        assert!(!connections.host_upgrade_pending("b"));
+        assert!(connections.host_upgrade_pending_for_environment("env-a"));
+        env.set_pending(false);
+        assert!(!connections.host_upgrade_pending("a"));
+        // The flag is only written when set, and a store from before it still loads.
+        let text = std::fs::read_to_string(connections.store_path()).unwrap();
+        assert!(!text.contains("pendingHostUpgrade"), "{text}");
+        std::fs::write(
+            connections.store_path(),
+            r#"[{"id":"o","name":"o","endpoint":"e","environmentId":"x","token":"t"}]"#,
+        )
+        .unwrap();
+        assert!(!connections.host_upgrade_pending("o"));
+        env.set_pending(true);
+        let kept = connections.stored_machine("a").unwrap();
+        assert!(kept.is_none(), "setting a missing machine changes nothing");
     }
 }

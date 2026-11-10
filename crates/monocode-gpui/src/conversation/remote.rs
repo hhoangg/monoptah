@@ -265,15 +265,15 @@ impl Conversation {
         }
         let host = &self.remote_state.host;
         let blocker = if !message.attachments.is_empty() && !host.supports("attachments.upload") {
-            Some("Update Monoptah Host in Connections settings to send attachments.")
+            Some(self.host_update_copy("send attachments"))
         } else if message.mode.as_deref() == Some("plan") && !host.supports("sessions.plan") {
-            Some("Update Monoptah Host in Connections settings to use Plan mode.")
+            Some(self.host_update_copy("use Plan mode"))
         } else {
             None
         };
         if let Some(blocker) = blocker {
             // Pauses the queue and shows the error with a Retry, like any failed message.
-            self.fail_follow_up(&message.id, blocker.into(), cx);
+            self.fail_follow_up(&message.id, blocker, cx);
             cx.notify();
             return;
         }
@@ -348,6 +348,32 @@ impl Conversation {
             .flatten()
             .and_then(|s| s.project.cloud())
             .map(|cloud| cloud.noun())
+    }
+    /// What to tell a user whose Host lacks a feature they used (`action`, e.g. "use Plan mode").
+    /// A user's own SSH machine keeps the manual Upgrade button in Connections settings. A cloud
+    /// workspace upgrades itself at connect, so it says that instead: either the Host is
+    /// updated on the next connect, or it waits for the running turn to end.
+    pub(super) fn host_update_copy(&self, action: &str) -> String {
+        if self.cloud_noun().is_none() {
+            return format!("Update Monoptah Host in Connections settings to {action}.");
+        }
+        let waiting = self.remote_state.client.as_ref().is_some_and(|client| {
+            locked(&self.store)
+                .and_then(|store| store.remote_session(self.summary.id))
+                .ok()
+                .flatten()
+                .is_some_and(|s| {
+                    client.host_upgrade_pending_for_environment(&s.project.environment_id)
+                })
+        });
+        if waiting {
+            format!(
+                "Monoptah Host {} will be installed when the current turn ends. Then you can {action}.",
+                monocode_core::remote::host_upgrade::pinned_version()
+            )
+        } else {
+            format!("Monoptah Host will be updated on the next connect. Then you can {action}.")
+        }
     }
     pub(crate) fn remote_connection_error(&mut self, error: &str, cx: &mut Context<Self>) {
         if self.is_remote() && !self.busy {
@@ -730,18 +756,17 @@ impl Conversation {
             return true;
         }
         if !self.attachments.is_empty() && !self.remote_state.host.supports("attachments.upload") {
-            self.status =
-                "Update Monoptah Host in Connections settings to send attachments.".into();
+            self.status = self.host_update_copy("send attachments");
             cx.notify();
             return true;
         }
         if self.settings.plan && !self.remote_state.host.supports("sessions.plan") {
-            self.status = "Update Monoptah Host in Connections settings to use Plan mode.".into();
+            self.status = self.host_update_copy("use Plan mode");
             cx.notify();
             return true;
         }
         if self.draft_active(cx) && !self.remote_state.host.supports("sessions.draft") {
-            self.status = "Update Monoptah Host in Connections settings to save drafts.".into();
+            self.status = self.host_update_copy("save drafts");
             cx.notify();
             return true;
         }

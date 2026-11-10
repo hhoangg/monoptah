@@ -407,6 +407,9 @@ impl SandboxSecrets for Secrets {
     }
 }
 
+/// (machine id, prelude, secret in it)
+type UpgradeCall = (String, Option<String>, Option<String>);
+
 #[derive(Default)]
 struct FakeHost {
     machines: Mutex<Vec<Machine>>,
@@ -420,6 +423,10 @@ struct FakeHost {
     connected: Mutex<bool>,
     /// `sessions.delete` answers `SANDBOX_NOT_CONNECTED`.
     delete_offline: Mutex<bool>,
+    /// Each Host upgrade asked for: (machine id, prelude, secret in it).
+    upgrades: Mutex<Vec<UpgradeCall>>,
+    /// The upgrade echoes the secret into its progress lines, as a careless script would.
+    upgrade_leaks: Mutex<bool>,
 }
 impl Host for FakeHost {
     fn machines(&self) -> Result<Vec<Machine>, String> {
@@ -479,6 +486,30 @@ impl Host for FakeHost {
             .unwrap()
             .push(format!("request {machine_id} {method} {}", params["cwd"]));
         Ok(json!({"id":"project-1","cwd":params["cwd"]}))
+    }
+    fn upgrade_host(
+        &self,
+        machine_id: &str,
+        auth: Option<crate::remote::host_upgrade::SandboxAuth<'_>>,
+        progress: &mut dyn FnMut(&str),
+    ) -> crate::remote::host_upgrade::Outcome {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("upgrade {machine_id}"));
+        self.upgrades.lock().unwrap().push((
+            machine_id.into(),
+            auth.map(|a| a.prelude.to_string()),
+            auth.map(|a| a.secret.to_string()),
+        ));
+        progress("Updating Monoptah Host…");
+        if *self.upgrade_leaks.lock().unwrap() {
+            if let Some(auth) = auth {
+                progress(&format!("download failed, env {}", auth.prelude));
+                progress(&format!("token {}", auth.secret));
+            }
+        }
+        crate::remote::host_upgrade::Outcome::Current
     }
     fn disconnect(&self, id: &str) -> Result<(), String> {
         self.log.lock().unwrap().push(format!("disconnect {id}"));
@@ -3420,4 +3451,57 @@ fn only_a_deleted_or_recreated_sandbox_is_unrecoverable() {
         "Sandbox is stopping. Try again in a minute."
     ));
     assert!(!is_sandbox_unrecoverable("Could not reach sbx"));
+}
+
+#[test]
+fn a_start_upgrades_the_host_with_the_connect_prelude_and_leaks_no_secret() {
+    let fx = fx();
+    *fx.host.upgrade_leaks.lock().unwrap() = true;
+    let (session, _) = fx.begin().unwrap();
+    let (result, events) = fx.run(session.id);
+    result.unwrap();
+    let upgrades = fx.host.upgrades.lock().unwrap().clone();
+    assert_eq!(upgrades.len(), 1, "{upgrades:?}");
+    // The SAME prelude the bootstrap got on stdin.
+    let prelude = ClaudeAuth::new("CLAUDE_CODE_OAUTH_TOKEN", SECRET.into()).prelude();
+    assert_eq!(upgrades[0].1.as_deref(), Some(prelude.as_str()));
+    assert_eq!(upgrades[0].2.as_deref(), Some(SECRET));
+    assert!(fx
+        .shell
+        .call("bootstrap")
+        .stdin
+        .starts_with(prelude.as_str()));
+    // After the pairing and before the project opens: inside the connect flow.
+    let log = fx.host.log.lock().unwrap().clone();
+    let at = |what: &str| log.iter().position(|l| l.contains(what)).unwrap();
+    assert!(
+        at("connect") < at("upgrade") && at("upgrade") < at("projects.open"),
+        "{log:?}"
+    );
+    // The status line is shown and the secret never reaches what the user can see.
+    let shown = format!("{events:?}");
+    assert!(shown.contains("Updating Monoptah Host"), "{shown}");
+    assert!(
+        !shown.contains(SECRET) && !shown.contains("sk-ant"),
+        "{shown}"
+    );
+    let stored = format!("{:?}", fx.record(session.id));
+    assert!(!stored.contains(SECRET));
+}
+
+#[test]
+fn a_reconnect_upgrades_the_host_with_the_connect_prelude_and_leaks_no_secret() {
+    let (fx, id, _) = started();
+    fx.host.upgrades.lock().unwrap().clear();
+    *fx.host.upgrade_leaks.lock().unwrap() = true;
+    fx.sbx.set_state(&sandbox_id(&fx), "stopped");
+    fx.reset();
+    let (result, lines) = fx.reconnect(id);
+    result.unwrap();
+    let upgrades = fx.host.upgrades.lock().unwrap().clone();
+    assert_eq!(upgrades.len(), 1, "{upgrades:?}");
+    let prelude = ClaudeAuth::new("CLAUDE_CODE_OAUTH_TOKEN", SECRET.into()).prelude();
+    assert_eq!(upgrades[0].1.as_deref(), Some(prelude.as_str()));
+    assert!(lines.iter().any(|l| l.contains("Updating Monoptah Host")));
+    assert!(!lines.iter().any(|l| l.contains(SECRET)), "{lines:?}");
 }
