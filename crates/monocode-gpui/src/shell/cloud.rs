@@ -2009,8 +2009,15 @@ impl Shell {
             self.forget_cloud_row(id, window, cx);
         }
         self.cloud_states.remove(&target.key());
-        // The located sessions read their marker (the store wrote it) on this refresh.
-        self.refresh_cloud(cx);
+        // The located sessions read their marker (the store wrote it) on this refresh. Only
+        // then: a refresh reads codespace states through gh, which nothing else here needs.
+        if self
+            .cloud_marks
+            .iter()
+            .any(|(id, mark)| mark.cloud() == *target && self.cloud_located.contains_key(id))
+        {
+            self.refresh_cloud(cx);
+        }
     }
 
     /// Drops one cloud session from the window; its record is gone from the store already.
