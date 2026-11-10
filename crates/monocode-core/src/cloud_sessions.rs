@@ -1633,6 +1633,7 @@ pub mod backend;
 pub mod docker_config;
 pub mod docker_start;
 pub mod kit;
+pub mod kit_prefs;
 pub mod move_out;
 pub use backend::{CloudBackend, CloudBackendKind, CloudRef, CodespacesBackend};
 
@@ -1655,6 +1656,8 @@ mod convert_tests;
 mod docker_config_tests;
 #[cfg(test)]
 mod docker_start_tests;
+#[cfg(test)]
+mod kit_prefs_tests;
 #[cfg(test)]
 mod kit_tests;
 #[cfg(test)]

@@ -832,6 +832,45 @@ mod tests {
             .unwrap();
     }
     #[gpui::test]
+    fn the_cloud_page_is_in_the_rail_only_behind_its_flag(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            cx.set_global(crate::cloud_kit_ui::KitScanner(
+                crate::cloud_kit_ui::fixture::scan,
+            ));
+        });
+        let (window, _, _) = window(cx);
+        window
+            .update(cx, |shell, w, cx| {
+                shell.open_settings(Section::General, w, cx)
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("settings-nav-mcp").is_some());
+        assert!(visual.debug_bounds("settings-nav-cloud").is_none());
+        window
+            .update(visual, |shell, _, cx| {
+                shell.workspace.preferences.cloud_kit_enabled = true;
+                shell.invalidate_chrome(cx);
+                cx.notify();
+            })
+            .unwrap();
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        let row = visual.debug_bounds("settings-nav-cloud").unwrap();
+        visual.simulate_click(row.center(), Default::default());
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, cx| {
+                assert_eq!(
+                    shell.settings.as_ref().unwrap().read(cx).section,
+                    Section::Cloud
+                )
+            })
+            .unwrap();
+    }
+    #[gpui::test]
     fn settings_nav_search_steps_through_results_with_arrows(cx: &mut TestAppContext) {
         cx.update(|cx| {
             super::super::bind_keys(cx);

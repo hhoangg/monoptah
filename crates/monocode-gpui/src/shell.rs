@@ -1622,6 +1622,17 @@ impl Shell {
         ));
         self.observations.push(cx.subscribe(
             &view,
+            |_, _, _: &crate::conversation::cloud_target::OpenCloudSettings, cx| {
+                cx.spawn(async move |this, cx| {
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.open_settings(crate::settings::Section::Cloud, window, cx)
+                    });
+                })
+                .detach();
+            },
+        ));
+        self.observations.push(cx.subscribe(
+            &view,
             |_, _, event: &crate::conversation::cloud_target::OpenDockerSetup, cx| {
                 let path = event.0.clone();
                 cx.spawn(async move |this, cx| {
@@ -7177,6 +7188,7 @@ impl Shell {
             let back = select.clone();
             return crate::settings::nav(
                 section,
+                self.workspace.preferences.cloud_kit_enabled,
                 search,
                 move |section, _, cx| {
                     let _ = select.update(cx, |this, cx| this.select_settings(section, cx));

@@ -275,6 +275,7 @@ pub(crate) struct SettingsView {
     accent_anchor: AnchorSlot,
     mobile: pages::MobileState,
     ticket_scoring: pages::ScoringState,
+    cloud: pages::CloudState,
     _subscriptions: Vec<Subscription>,
 }
 impl EventEmitter<SettingsEvent> for SettingsView {}
@@ -427,6 +428,7 @@ impl SettingsView {
             accent_anchor: AnchorSlot::default(),
             mobile: pages::MobileState::default(),
             ticket_scoring: pages::ScoringState::default(),
+            cloud: pages::CloudState::default(),
             _subscriptions: subscriptions,
         };
         this.watch_mobile(cx);
@@ -435,6 +437,7 @@ impl SettingsView {
             this.probe_notification_permission(false, cx);
         }
         this.notification_deadline(cx);
+        // `refresh` also reads the Cloud page when it is the open section.
         this.refresh(cx);
         this
     }
@@ -447,6 +450,9 @@ impl SettingsView {
                     center.load_provider(kind, true, cx);
                 }
             });
+        }
+        if self.section == Section::Cloud {
+            self.refresh_cloud(cx);
         }
         let cwd = self.selected_project.clone();
         self.discovery_loading = true;
@@ -487,6 +493,12 @@ impl SettingsView {
     pub(crate) fn set_preferences(&mut self, prefs: &Preferences, cx: &mut Context<Self>) {
         if &self.prefs != prefs {
             self.prefs = prefs.clone();
+            // The Cloud page has no rail entry without its flag, so leave it. (Settings
+            // search lists only `Section::ALL`, so Cloud is not searchable yet.)
+            if self.section == Section::Cloud && !prefs.cloud_kit_enabled {
+                self.select_section(Section::General, cx);
+                cx.emit(SettingsEvent::Section(Section::General));
+            }
             self.notification_deadline(cx);
             cx.notify();
         }
@@ -506,6 +518,9 @@ impl SettingsView {
             self.watch_connections(cx);
             if section == Section::Mcp {
                 self.refresh_mcp_health(cx);
+            }
+            if section == Section::Cloud {
+                self.refresh_cloud(cx);
             }
             self.select_open = None;
             self.recording = None;
@@ -916,6 +931,7 @@ impl SettingsView {
 /// the pages scroll beneath, and Back to app sits at the bottom.
 pub(crate) fn nav(
     section: Section,
+    show_cloud: bool,
     search: AnyElement,
     select: impl Fn(Section, &mut Window, &mut App) + Clone + 'static,
     back: impl Fn(&mut Window, &mut App) + 'static,
@@ -1007,16 +1023,22 @@ pub(crate) fn nav(
                                 .text_color(content(0.35))
                                 .child(*group),
                         )
-                        .children(sections.iter().map(|&item| {
-                            let select = select.clone();
-                            row(
-                                format!("settings-nav-{}", item.id()).into(),
-                                item.label(),
-                                item.icon(),
-                                item == section,
-                            )
-                            .on_click(move |_, window, cx| select(item, window, cx))
-                        }))
+                        .children(
+                            sections
+                                .iter()
+                                .copied()
+                                .chain((show_cloud && *group == "Agents").then_some(Section::Cloud))
+                                .map(|item| {
+                                    let select = select.clone();
+                                    row(
+                                        format!("settings-nav-{}", item.id()).into(),
+                                        item.label(),
+                                        item.icon(),
+                                        item == section,
+                                    )
+                                    .on_click(move |_, window, cx| select(item, window, cx))
+                                }),
+                        )
                 }))
                 .into_any_element(),
         )

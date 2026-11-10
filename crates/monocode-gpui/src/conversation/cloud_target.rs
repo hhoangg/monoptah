@@ -12,6 +12,7 @@ use super::cloud_branches::BranchList;
 use super::*;
 use crate::docker_dialog::model::AccountChoice;
 use monocode_core::cloud_sessions::docker_config::{self, DockerProjectConfig};
+use monocode_core::cloud_sessions::kit::Workspace;
 use monocode_core::codespaces::MachineType;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,6 +103,9 @@ pub(crate) struct CloudCreate {
     pub machine: Option<String>,
     /// The composer text, queued as the first prompt.
     pub prompt: Option<String>,
+    /// Copy the global Claude setup to the new workspace. Read by the "Claude setup" start
+    /// step (F3-4); nothing sends it yet.
+    pub kit: bool,
     /// Which press asked; the answer only applies to the draft that is still waiting for it.
     pub request_id: u64,
 }
@@ -110,6 +114,9 @@ pub(crate) struct CloudCreate {
 pub(crate) struct CreateCloudSession(pub CloudCreate);
 /// Emitted when the Docker Sandbox row is picked and the project has no saved config.
 pub(crate) struct OpenDockerSetup(pub String);
+/// Emitted by the "Claude setup" row to open Settings > Cloud.
+pub(crate) struct OpenCloudSettings;
+impl EventEmitter<OpenCloudSettings> for Conversation {}
 impl EventEmitter<CreateCloudSession> for Conversation {}
 impl EventEmitter<OpenDockerSetup> for Conversation {}
 
@@ -148,6 +155,12 @@ pub(super) struct CloudDraft {
     pub created: Option<String>,
     /// The id of the queue message holding the prompt while the create runs.
     pub queued: Option<String>,
+    /// This start copies the global Claude setup (the per-start switch). Starts on only when
+    /// the user turned the kit on in Settings.
+    pub kit: bool,
+    /// What the global selection takes from this project, read off the UI thread.
+    pub kit_summary: crate::cloud_kit_ui::Summary,
+    pub kit_task: Option<gpui::Task<()>>,
     _events: Vec<Subscription>,
 }
 
@@ -439,6 +452,9 @@ impl Conversation {
         });
         let events = vec![
             cx.subscribe(&branch, |_, _, _: &input::Changed, cx| cx.notify()),
+            // Settings changed while the panel is open: count again with the new selection
+            // (this also picks up the flag being turned on).
+            cx.observe_global::<crate::settings::Preferences>(|this, cx| this.load_kit_summary(cx)),
             cx.subscribe(&base, |this, base, _: &input::Changed, cx| {
                 let text = base.read(cx).content.to_string();
                 if let Some(draft) = &mut this.cloud_draft {
@@ -458,6 +474,7 @@ impl Conversation {
         } else {
             Vec::new()
         };
+        let kit_prefs = crate::cloud_kit_ui::kit_prefs(cx);
         self.cloud_request_seq += 1;
         let machines_request = self.cloud_request_seq;
         self.cloud_request_seq += 1;
@@ -488,13 +505,56 @@ impl Conversation {
             request: 0,
             created: None,
             queued: None,
+            kit: crate::cloud_kit_ui::default_on(&kit_prefs),
+            kit_summary: crate::cloud_kit_ui::Summary::Loading,
+            kit_task: None,
             _events: events,
         });
+        self.load_kit_summary(cx);
         if !docker {
             self.load_cloud_machines(machines_request, cx);
         }
         self.load_cloud_branches(branches_request, cx);
         cx.notify();
+    }
+
+    /// Counts the Claude setup this project would take, on a worker. Does nothing while the
+    /// `cloudKitEnabled` flag is off.
+    fn load_kit_summary(&mut self, cx: &mut Context<Self>) {
+        if self.cloud_draft.is_none() || !crate::cloud_kit_ui::flag_on(cx) {
+            return;
+        }
+        let workspace = match self.cloud_draft.as_ref().map(|draft| draft.target) {
+            Some(CloudTarget::DockerSandbox) => Workspace::Sandbox,
+            _ => Workspace::Codespace,
+        };
+        let task = crate::cloud_kit_ui::load_summary(
+            self.summary.cwd.clone(),
+            workspace,
+            crate::cloud_kit_ui::kit_prefs(cx),
+            cx,
+        );
+        let task = cx.spawn(async move |this, cx| {
+            let summary = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(draft) = this.cloud_draft.as_mut() {
+                    draft.kit_summary = summary;
+                    cx.notify();
+                }
+            });
+        });
+        if let Some(draft) = &mut self.cloud_draft {
+            draft.kit_task = Some(task);
+        }
+    }
+
+    /// The per-start switch of the Claude setup row.
+    pub(super) fn toggle_cloud_kit(&mut self, cx: &mut Context<Self>) {
+        let allowed = crate::cloud_kit_ui::default_on(&crate::cloud_kit_ui::kit_prefs(cx));
+        if let Some(draft) = self.cloud_draft.as_mut().filter(|d| !d.creating && allowed) {
+            draft.kit = !draft.kit;
+            cx.notify();
+        }
     }
 
     /// Lists the machine types on a worker; the answer only applies to the draft that asked.
@@ -682,6 +742,11 @@ impl Conversation {
             config,
             machine,
             prompt: (!prompt.is_empty()).then_some(prompt),
+            // The switch is this start's own choice, but it can only narrow Settings: if the
+            // kit was turned off while the panel was open, nothing is sent.
+            kit: self.cloud_draft.as_ref().is_some_and(|draft| draft.kit)
+                && crate::cloud_kit_ui::flag_on(cx)
+                && crate::cloud_kit_ui::default_on(&crate::cloud_kit_ui::kit_prefs(cx)),
         };
         if let Some(draft) = &mut self.cloud_draft {
             draft.creating = true;

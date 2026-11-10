@@ -266,6 +266,36 @@ impl Conversation {
             }))
     }
 
+    /// "Claude setup: 6 skills, 4 MCP servers, 3 plugins - Settings..." and the switch for this
+    /// start. Shown only behind the `cloudKitEnabled` flag.
+    fn cloud_kit_row(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        use crate::cloud_kit_ui as kit;
+        let prefs = kit::kit_prefs(cx);
+        let globally = kit::default_on(&prefs);
+        let locked = self.cloud_creating();
+        let draft = self.cloud_draft.as_ref();
+        let on = globally && draft.is_some_and(|d| d.kit);
+        let summary = draft.map_or(kit::Summary::Loading, |d| d.kit_summary);
+        let label = format!("Claude setup: {}", kit::summary_text(&summary, globally));
+        row("cloud-row-kit", "sparkles", label)
+            .child(
+                kit::settings_link("cloud-kit-settings")
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(OpenCloudSettings))),
+            )
+            .child(
+                kit::switch(
+                    "cloud-kit-switch",
+                    "cloud-kit-switch",
+                    "Copy my Claude setup to this workspace",
+                    on,
+                    locked || !globally,
+                )
+                .when(!locked && globally, |d| {
+                    d.on_click(cx.listener(|this, _, _, cx| this.toggle_cloud_kit(cx)))
+                }),
+            )
+    }
+
     /// A row with an inline text field for a branch.
     fn cloud_field_row(
         &self,
@@ -414,6 +444,9 @@ impl Conversation {
                     self.cloud_field_row("cloud-row-branch", "Branch", &draft.branch)
                 })
             });
+        let body = body.when(crate::cloud_kit_ui::flag_on(cx), |d| {
+            d.child(self.cloud_kit_row(cx))
+        });
         let tail = div()
             .id("cloud-target-tail")
             .children(draft.error.clone().map(|error| {
