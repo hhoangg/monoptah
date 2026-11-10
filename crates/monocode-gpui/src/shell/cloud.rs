@@ -1176,7 +1176,7 @@ impl Shell {
 
     /// Whether the app has a live connection to the workspace of the session in view. A
     /// session without a live view is Not connected. Never wakes anything.
-    fn panel_link(&self, cx: &App) -> crate::panel_root::Link {
+    pub(super) fn panel_link(&self, cx: &App) -> crate::panel_root::Link {
         let id = self
             .workspace
             .active
@@ -1185,6 +1185,94 @@ impl Shell {
             .map_or(crate::panel_root::Link::NotConnected, |view| {
                 view.read(cx).panel_link()
             })
+    }
+
+    /// Whether the link of the session in view is a fact: a live conversation says the workspace
+    /// is up, waking or down. A session without one (it runs in a terminal) or one that has not
+    /// finished its first refresh knows nothing, and its panels read as they always did.
+    fn panel_link_known(&self, cx: &App) -> bool {
+        self.workspace
+            .active
+            .map(|pane| self.workspace.session_for_pane(pane))
+            .and_then(|id| self.sessions.get(&id))
+            .is_some_and(|view| view.read(cx).panel_link_known())
+    }
+
+    /// The Host environments of the cloud sessions whose link is live. One live session means the
+    /// workspace is up, whatever a stale second session on it says.
+    fn live_environments(&self, cx: &App) -> Vec<String> {
+        self.cloud_environments(cx, true)
+    }
+
+    /// The Host environments where no session is live but some session knows the link is down.
+    pub(super) fn offline_environments(&self, cx: &App) -> Vec<String> {
+        let live = self.live_environments(cx);
+        let mut envs = self.cloud_environments(cx, false);
+        envs.retain(|env| !live.contains(env));
+        envs
+    }
+
+    /// The environments of the sessions with a live conversation whose link is live (`live`) or
+    /// known to be down (`!live`).
+    fn cloud_environments(&self, cx: &App, live: bool) -> Vec<String> {
+        let mut envs = Vec::new();
+        for id in self.cloud_marks.keys() {
+            let Some(view) = self.sessions.get(id).map(|view| view.read(cx)) else {
+                continue;
+            };
+            let connected = view.panel_link() == crate::panel_root::Link::Connected;
+            if !view.panel_link_known() || connected != live {
+                continue;
+            }
+            let cwds = self
+                .session_summaries
+                .get(id)
+                .map(|s| s.cwd.as_str())
+                .into_iter()
+                .chain(view.settings.worktree_cwd.as_deref());
+            for cwd in cwds {
+                if let Some(path) = monocode_core::remote::parse_remote_path(cwd)
+                    && !envs.contains(&path.environment_id)
+                {
+                    envs.push(path.environment_id);
+                }
+            }
+        }
+        envs
+    }
+
+    /// The session in view has a live conversation entry.
+    fn panel_has_conversation(&self) -> bool {
+        self.workspace
+            .active
+            .map(|pane| self.workspace.session_for_pane(pane))
+            .is_some_and(|id| self.sessions.contains_key(&id))
+    }
+
+    /// Whether the link of the panels' workspace is known to be down: the session in view says
+    /// so and no other session on the same environment is live. The panels, the Explorer and the
+    /// git gate all read this one answer.
+    pub(super) fn panel_down(&self, root: &crate::panel_root::PanelRoot, cx: &App) -> bool {
+        let Some(path) = monocode_core::remote::parse_remote_path(root.project()) else {
+            return self.panel_link_known(cx);
+        };
+        // A session without a conversation (it runs in a terminal) knows nothing about its link:
+        // a sibling's down link must not lock its panels, and it has no Connect to unlock them.
+        if !self.panel_has_conversation() {
+            return false;
+        }
+        if self.live_environments(cx).contains(&path.environment_id) {
+            return false;
+        }
+        self.panel_link_known(cx)
+            || self
+                .cloud_environments(cx, false)
+                .contains(&path.environment_id)
+    }
+
+    /// The panels show remembered data of a workspace the app knows is down.
+    pub(super) fn panel_offline(&self, root: &crate::panel_root::PanelRoot, cx: &App) -> bool {
+        crate::panel_root::is_offline(root, self.panel_link(cx)) && self.panel_down(root, cx)
     }
 
     /// Whether the session in view has a live conversation for the Connect action to reconnect.
@@ -1269,17 +1357,45 @@ impl Shell {
     /// Nothing here may wake a workspace: it only reads cached state.
     pub(super) fn sync_cloud_panel(&self, cx: &mut Context<Self>) {
         let root = self.panel_root(cx);
+        let link = self.panel_link(cx);
+        let known = self.panel_down(&root, cx);
+        let offline = self.panel_offline(&root, cx);
         // A cloud session's root can change without the session changing (the Local switch, a
-        // pending workspace that became real).
-        if root.cloud().is_some() && self.git.read(cx).project() != root.project() {
-            let project = root.project().to_owned();
-            self.git.update(cx, |git, cx| git.set_project(project, cx));
+        // pending workspace that became real). Offline: the panels keep the last data and read
+        // nothing; back online: a full reload.
+        let project = root.project().to_owned();
+        if root.cloud().is_some() {
+            self.git
+                .update(cx, |git, cx| git.bind(project, offline, cx));
+        } else {
+            self.git
+                .update(cx, |git, cx| git.set_link_offline(false, cx));
         }
+        self.git.update(cx, |git, cx| {
+            git.set_starting(offline && link == crate::panel_root::Link::Starting, cx)
+        });
         let running = self.running_environments(cx);
-        let chrome =
-            crate::panel_root::Chrome::of(&root, self.panel_link(cx), self.panel_can_connect());
+        let (age, recovering) = {
+            let git = self.git.read(cx);
+            (git.cached_age(), git.stale() && !git.offline())
+        };
+        let chrome = crate::panel_root::Chrome::of(&root, link, self.panel_can_connect())
+            .map(|chrome| chrome.with_state(known, recovering).with_age(age));
         self.sync_codespace_pane(cx);
-        let flipped = crate::git_gate::set(crate::git_gate::Gate::of(&root, running));
+        let mut offline_envs = self.offline_environments(cx);
+        // The panels of a session without a conversation never lock because of a sibling.
+        if !self.panel_has_conversation()
+            && let Some(path) = monocode_core::remote::parse_remote_path(root.project())
+        {
+            offline_envs.retain(|env| *env != path.environment_id);
+        }
+        if chrome.as_ref().is_some_and(|chrome| chrome.offline)
+            && let Some(path) = monocode_core::remote::parse_remote_path(root.project())
+            && !offline_envs.contains(&path.environment_id)
+        {
+            offline_envs.push(path.environment_id);
+        }
+        let flipped = crate::git_gate::set(crate::git_gate::Gate::of(&root, running, offline_envs));
         if let Some(panel) = &self.right_panel {
             panel.update(cx, |panel, cx| {
                 panel.set_cloud_chrome(chrome, cx);

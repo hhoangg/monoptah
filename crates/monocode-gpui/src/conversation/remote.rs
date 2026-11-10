@@ -17,6 +17,9 @@ pub(super) struct State {
     pub(super) refresh_stub: Option<Result<(), String>>,
     pub(super) pending: bool,
     pub(super) online: bool,
+    /// The link was live at least once, so a later `!online` is a known drop and not a refresh
+    /// that has not finished yet.
+    was_online: bool,
     app_prompt_waiting: bool,
     app_draft_launched: bool,
     waking: bool,
@@ -570,6 +573,7 @@ impl Conversation {
                 match result {
                     Ok((remote, settings, snapshot, history, descriptor)) => {
                         this.remote_state.online = true;
+                        this.remote_state.was_online = true;
                         this.remote_state.error = remote
                             .rejected
                             .as_ref()
@@ -990,6 +994,12 @@ impl Conversation {
     pub(crate) fn cloud_stopped_for_test(&self) -> bool {
         self.cloud_stopped
     }
+    /// The live link of the workspace, as a successful refresh would leave it.
+    #[cfg(test)]
+    pub(crate) fn set_online_for_test(&mut self, online: bool) {
+        self.remote_state.online = online;
+        self.remote_state.was_online |= online;
+    }
     /// Whether the app has a live connection to this session's workspace, for the connection
     /// strip of the Files and Changes panels. Reads cached view state only; it never wakes or
     /// reconnects (the strip's Connect action is `reconnect_cloud`, a user action).
@@ -1002,6 +1012,17 @@ impl Conversation {
         } else {
             Link::NotConnected
         }
+    }
+    /// Whether `panel_link` is a fact: the workspace is known to be down, waking or live. A
+    /// conversation that has not finished its first refresh knows nothing yet, and the panels
+    /// then keep reading as they did (no dimming, no read-only) instead of flashing offline.
+    pub(crate) fn panel_link_known(&self) -> bool {
+        let state = &self.remote_state;
+        state.online
+            || state.waking
+            || self.cloud_stopped
+            || state.error.is_some()
+            || state.was_online
     }
     /// The slim "Codespace stopped" / "Sandbox stopped" banner with a Resume button applies:
     /// the workspace is stopped and nothing else (an error, a pending command) needs the notice.

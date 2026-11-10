@@ -187,6 +187,13 @@ impl Link {
     }
 }
 
+/// The panels show a real cloud workspace the app has no live connection to. They then show the
+/// last data dimmed and read-only, read nothing, and never wake the workspace. A local root, the
+/// Local switch and a workspace still being created are never offline.
+pub(crate) fn is_offline(root: &PanelRoot, link: Link) -> bool {
+    matches!(root, PanelRoot::Cloud { .. }) && link != Link::Connected
+}
+
 /// Everything the right panel draws above its tabs for a cloud session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Chrome {
@@ -200,6 +207,10 @@ pub(crate) struct Chrome {
     /// The strip may offer Connect: the Connect action is the session's Reconnect, so it needs
     /// a live conversation (a session that runs in a terminal has none).
     pub can_connect: bool,
+    /// The panels show remembered data: dimmed, read-only, and not polled.
+    pub offline: bool,
+    /// How old the remembered data is, e.g. "last updated 5 min ago".
+    pub cached: Option<String>,
 }
 
 impl Chrome {
@@ -215,7 +226,24 @@ impl Chrome {
             placeholder: root.is_pending(),
             browser: root.offers_browser(),
             can_connect,
+            offline: is_offline(root, link),
+            cached: None,
         })
+    }
+    /// Applies what is known about the link. A link nobody has reported on yet is not offline
+    /// (the panels read as before); a link that came back but whose first reload has not landed
+    /// is still not live data.
+    pub(crate) fn with_state(mut self, known: bool, recovering: bool) -> Self {
+        let cloud = self.link.is_some() && !self.placeholder;
+        self.offline = (self.offline && known) || (recovering && cloud);
+        self
+    }
+    /// Says how old the remembered data is; only shown while it is the data on screen.
+    pub(crate) fn with_age(mut self, age: Option<std::time::Duration>) -> Self {
+        self.cached = age
+            .filter(|_| self.offline)
+            .map(crate::remote_cache::age_hint);
+        self
     }
 }
 
@@ -358,6 +386,33 @@ mod tests {
         );
         assert_eq!(root.banner(), None);
         assert!(!root.refuses_writes());
+    }
+
+    #[test]
+    fn only_a_real_cloud_workspace_without_a_connection_is_offline() {
+        let cloud_root = resolve(session(PROJECT, None), PanelMode::Cloud, false, "/o");
+        assert!(!is_offline(&cloud_root, Link::Connected));
+        assert!(is_offline(&cloud_root, Link::NotConnected));
+        // A workspace that is waking is not live yet either.
+        assert!(is_offline(&cloud_root, Link::Starting));
+        let local_root = resolve(session(PROJECT, None), PanelMode::Local, false, "/o");
+        assert!(!is_offline(&local_root, Link::NotConnected));
+        let pending = "remote://pending-octo-abc/workspaces/widgets";
+        let pending_root = resolve(session(pending, None), PanelMode::Cloud, false, "/o");
+        assert!(!is_offline(&pending_root, Link::NotConnected));
+        let plain = resolve(None, PanelMode::Cloud, false, "/o");
+        assert!(!is_offline(&plain, Link::NotConnected));
+
+        let chrome = Chrome::of(&cloud_root, Link::NotConnected, true)
+            .unwrap()
+            .with_age(Some(std::time::Duration::from_secs(120)));
+        assert!(chrome.offline);
+        assert_eq!(chrome.cached.as_deref(), Some("last updated 2 min ago"));
+        // Live data carries no age.
+        let live = Chrome::of(&cloud_root, Link::Connected, true)
+            .unwrap()
+            .with_age(Some(std::time::Duration::from_secs(120)));
+        assert!(!live.offline && live.cached.is_none());
     }
 
     #[test]

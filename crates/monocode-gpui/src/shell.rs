@@ -1945,8 +1945,11 @@ impl Shell {
             .active
             .and_then(|id| self.sessions.get(&self.workspace.session_for_pane(id)))
             .map(|view| Kind::from_id(&view.read(cx).summary.provider));
-        let project = self.panel_root(cx).project().to_owned();
-        self.git.update(cx, |git, cx| git.set_project(project, cx));
+        let root = self.panel_root(cx);
+        let project = root.project().to_owned();
+        let offline = self.panel_offline(&root, cx);
+        self.git
+            .update(cx, |git, cx| git.bind(project, offline, cx));
         if let (Some(panel), Some(kind)) = (&self.right_panel, provider) {
             let changes = panel.read(cx).changes.clone();
             changes.update(cx, |c, _| c.text_provider = kind);

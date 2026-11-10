@@ -208,6 +208,8 @@ pub(crate) struct Explorer {
     /// The cloud workspace of the session in view is still being created: the tree is bound to
     /// nothing real, so create, rename, delete, paste and duplicate are refused.
     read_only: bool,
+    /// (stale, starting) as of the last rebuild, to redraw the notes when the link changes.
+    link_state: (bool, bool),
     search: Option<Entity<ProjectSearch>>,
     search_events: Option<Subscription>,
     drag_over: Option<String>,
@@ -245,6 +247,12 @@ pub(crate) struct OpenInBrowser;
 impl EventEmitter<OpenInBrowser> for Explorer {}
 const WORKSPACE_STARTING: &str =
     "The cloud workspace is still starting. Files can be changed once it is ready.";
+// Follow-up: opening a file while disconnected should offer Connect, like a chat link does
+// (design 2.2.3). It is not part of F2-2.
+const REFRESHING: &str =
+    "Refreshing the files after reconnecting. They can be changed once that finishes.";
+const NOT_CONNECTED: &str =
+    "Not connected to the workspace. Files can be changed once you choose Connect.";
 
 /// The menu rows that act on this machine (Finder) or in the browser. A remote root has no
 /// local file to reveal: the row stays but is disabled, and a codespace gets "Open in browser".
@@ -278,12 +286,21 @@ impl Explorer {
         let name_focus = name_input.read(cx).focus_handle(cx);
         let subscriptions = vec![
             cx.subscribe(&git, |this, _, _: &GitChanged, cx| this.git_changed(cx)),
-            cx.observe(&git, |this, _, cx| {
+            cx.observe(&git, |this, git, cx| {
                 // Git colours follow every status read.
                 if this.enabled {
                     cx.notify();
+                    // The notes of a tree that is not live follow the link without waiting for
+                    // the next rebuild.
+                    let state = {
+                        let git = git.read(cx);
+                        (git.stale(), git.starting())
+                    };
+                    if state != this.link_state {
+                        this.link_state = state;
+                        this.rebuild(cx);
+                    }
                 }
-                let _ = this;
             }),
             cx.subscribe_in(
                 &name_input,
@@ -320,6 +337,7 @@ impl Explorer {
             menu: None,
             offers_browser: false,
             read_only: false,
+            link_state: (false, false),
             search: None,
             search_events: None,
             drag_over: None,
@@ -413,22 +431,13 @@ impl Explorer {
             return false;
         }
         if !self.cwd.is_empty() {
-            self.saved.insert(
-                self.cwd.clone(),
-                Saved {
-                    expanded: std::mem::take(&mut self.expanded),
-                    selected: self.selected.take(),
-                },
-            );
+            self.leave_root(cx);
         }
         self.cwd = root.clone();
         if let Some(search) = &self.search {
             search.update(cx, |search, cx| search.set_root(root.clone(), cx));
         }
-        let saved = self.saved.get(&root).cloned().unwrap_or_else(|| Saved {
-            expanded: HashSet::from([root.clone()]),
-            selected: None,
-        });
+        let saved = self.enter_root(&root, cx);
         self.expanded = saved.expanded;
         self.selected = saved.selected;
         self.naming = None;
@@ -443,8 +452,58 @@ impl Explorer {
     fn available(&self) -> bool {
         !self.cwd.is_empty() && self.cwd != "~"
     }
+    /// Remembers the tree of the root being left: a cloud root in the shared LRU (listings,
+    /// open folders, selection), a local one in `saved`. A cloud root's listings leave `dirs`
+    /// with it, so they can never be shown under another root.
+    fn leave_root(&mut self, cx: &mut Context<Self>) {
+        let root = self.cwd.clone();
+        let expanded = std::mem::take(&mut self.expanded);
+        let selected = self.selected.take();
+        if !self.is_remote_root() {
+            self.saved.insert(root, Saved { expanded, selected });
+            return;
+        }
+        let mut mine = HashMap::new();
+        self.dirs.retain(|path, listing| {
+            if !crate::remote_cache::within(&root, path) {
+                return true;
+            }
+            if let Ok(entries) = listing {
+                mine.insert(path.clone(), entries.clone());
+            }
+            false
+        });
+        self.git.update(cx, |git, _| {
+            git.remote.put_tree(&root, mine, expanded, selected)
+        });
+    }
+    /// What the root being entered looked like when it was left. A cloud root also brings back
+    /// its remembered listings, to be shown at once and read again when the link is live.
+    fn enter_root(&mut self, root: &str, cx: &mut Context<Self>) -> Saved {
+        if files::remote::is_remote(Path::new(root)) {
+            let cached = self.git.update(cx, |git, _| git.remote.get(root));
+            if let Some(entry) = cached {
+                for (path, entries) in entry.dirs {
+                    self.dirs.entry(path).or_insert(Ok(entries));
+                }
+                if let Some(expanded) = entry.expanded {
+                    return Saved {
+                        expanded,
+                        selected: entry.selected,
+                    };
+                }
+            }
+        } else if let Some(saved) = self.saved.get(root) {
+            return saved.clone();
+        }
+        Saved {
+            expanded: HashSet::from([root.to_owned()]),
+            selected: None,
+        }
+    }
     fn read_dir(&mut self, path: String, cx: &mut Context<Self>) {
-        if !self.reading.insert(path.clone()) {
+        // A workspace without a connection is not read, and never woken: the tree stays as seen.
+        if self.is_offline(cx) || !self.reading.insert(path.clone()) {
             return;
         }
         let dir = PathBuf::from(&path);
@@ -455,16 +514,47 @@ impl Explorer {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
                 this.reading.remove(&path);
-                if this.dirs.get(&path) != Some(&result) {
-                    this.dirs.insert(path, result);
-                    this.rebuild(cx);
-                }
+                this.apply_listing(path, result, cx);
             });
         })
         .detach();
     }
+    /// Takes the result of reading `path`. A failure because the tunnel is down never replaces a
+    /// listing already shown: the tree is kept, and the strip says the link is down.
+    fn apply_listing(
+        &mut self,
+        path: String,
+        result: Result<Vec<DirEntry>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        // A late answer for another root (the panels switched meanwhile) is not this tree's.
+        if !crate::remote_cache::within(&self.cwd, &path) {
+            return;
+        }
+        match &result {
+            Err(error)
+                if monocode_core::cloud_sessions::is_not_connected(error)
+                    && matches!(self.dirs.get(&path), Some(Ok(_))) =>
+            {
+                return;
+            }
+            Ok(_) if self.is_remote_root() => {
+                let root = self.cwd.clone();
+                self.git
+                    .update(cx, |git, _| git.remote.confirm(&root, Instant::now()));
+            }
+            _ => {}
+        }
+        if self.dirs.get(&path) != Some(&result) {
+            self.dirs.insert(path, result);
+            self.rebuild(cx);
+        }
+    }
     /// Rereads every folder shown, keeping the current rows meanwhile.
     fn refresh_loaded(&mut self, cx: &mut Context<Self>) {
+        if self.is_offline(cx) {
+            return;
+        }
         let mut shown: Vec<String> = self
             .expanded
             .iter()
@@ -546,9 +636,17 @@ impl Explorer {
             self.push_name(depth, true, lines, cx);
         }
         if listing.is_none() {
+            // Nothing was read here before the link dropped, and nothing is read until Connect.
+            let text = if self.is_offline(cx) && self.git.read(cx).starting() {
+                "Workspace starting"
+            } else if self.is_offline(cx) {
+                "Not loaded. Choose Connect to load it."
+            } else {
+                "…"
+            };
             lines.push(Line::Note {
                 depth,
-                text: "…".into(),
+                text: text.into(),
             });
         }
         let entries: Vec<&DirEntry> = match listing {
@@ -673,8 +771,7 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only {
-            self.fail(WORKSPACE_STARTING.into(), cx);
+        if self.refuse_write(cx) {
             return;
         }
         let parent = self.create_parent(at.as_deref().or(self.selected.as_deref()));
@@ -692,8 +789,7 @@ impl Explorer {
         );
     }
     fn start_rename(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only {
-            self.fail(WORKSPACE_STARTING.into(), cx);
+        if self.refuse_write(cx) {
             return;
         }
         if path == self.cwd {
@@ -750,6 +846,12 @@ impl Explorer {
         }
         if !commit {
             self.cancel_name(window, cx);
+            return;
+        }
+        if self.write_block(cx).is_some() {
+            // The link dropped while the name was typed.
+            self.cancel_name(window, cx);
+            self.refuse_write(cx);
             return;
         }
         if self
@@ -895,8 +997,7 @@ impl Explorer {
         .detach();
     }
     fn delete(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only {
-            self.fail(WORKSPACE_STARTING.into(), cx);
+        if self.refuse_write(cx) {
             return;
         }
         if path == self.cwd {
@@ -947,8 +1048,7 @@ impl Explorer {
         .detach();
     }
     fn paste(&mut self, at: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only {
-            self.fail(WORKSPACE_STARTING.into(), cx);
+        if self.refuse_write(cx) {
             return;
         }
         let dest = self.create_parent(Some(&at));
@@ -1019,7 +1119,7 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if paths.is_empty() {
+        if paths.is_empty() || self.refuse_write(cx) {
             return;
         }
         let to = dest.clone();
@@ -1038,8 +1138,7 @@ impl Explorer {
         );
     }
     fn duplicate(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only {
-            self.fail(WORKSPACE_STARTING.into(), cx);
+        if self.refuse_write(cx) {
             return;
         }
         if path == self.cwd {
@@ -1062,6 +1161,39 @@ impl Explorer {
     #[cfg(test)]
     pub(crate) fn is_read_only(&self) -> bool {
         self.read_only
+    }
+    /// Why the tree cannot be changed right now: its workspace is still starting, or the app has
+    /// no connection to it and the tree shown is the last one seen.
+    fn write_block(&self, cx: &App) -> Option<&'static str> {
+        let git = self.git.read(cx);
+        if self.read_only || (git.starting() && self.is_offline(cx)) {
+            Some(WORKSPACE_STARTING)
+        } else if self.is_offline(cx) {
+            Some(NOT_CONNECTED)
+        } else if self.is_stale(cx) {
+            Some(REFRESHING)
+        } else {
+            None
+        }
+    }
+    /// The tree shows remembered data from a workspace the app is not connected to. Nothing is
+    /// read meanwhile.
+    pub(crate) fn is_offline(&self, cx: &App) -> bool {
+        self.git.read(cx).offline() && self.is_remote_root()
+    }
+    /// The tree is not live data yet: offline, or the reload after reconnecting has not landed.
+    fn is_stale(&self, cx: &App) -> bool {
+        self.git.read(cx).stale() && self.is_remote_root()
+    }
+    /// Refuses a write when `write_block` says so, and says why. Returns whether it refused.
+    fn refuse_write(&mut self, cx: &mut Context<Self>) -> bool {
+        match self.write_block(cx) {
+            Some(reason) => {
+                self.fail(reason.into(), cx);
+                true
+            }
+            None => false,
+        }
     }
     pub(crate) fn set_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {
         if self.read_only != read_only {
@@ -1953,6 +2085,314 @@ mod tests {
                     }
                     assert_eq!(explorer.op_error.as_deref(), Some(WORKSPACE_STARTING));
                 }
+            })
+            .unwrap();
+    }
+
+    const ROOT: &str = "remote://env-octo-abc/workspaces/widgets";
+
+    fn listing(dir: &str, names: &[&str]) -> Vec<DirEntry> {
+        names
+            .iter()
+            .map(|name| DirEntry {
+                name: (*name).into(),
+                path: format!("{dir}/{name}"),
+                is_dir: name.starts_with("dir"),
+                ignored: false,
+            })
+            .collect()
+    }
+    fn explorer_window(
+        cx: &mut gpui::TestAppContext,
+    ) -> (gpui::WindowHandle<Explorer>, Entity<ProjectGit>) {
+        let git = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = git.clone();
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                let model = cx.new(|cx| ProjectGit::new("~".into(), cx));
+                *slot.borrow_mut() = Some(model.clone());
+                cx.new(|cx| Explorer::new(model, window, cx))
+            })
+            .unwrap()
+        });
+        let git = git.borrow_mut().take().unwrap();
+        (window, git)
+    }
+
+    #[gpui::test]
+    fn a_disconnect_keeps_the_cached_tree_and_disables_writes(cx: &mut gpui::TestAppContext) {
+        let (window, git) = explorer_window(cx);
+        window
+            .update(cx, |explorer, window, cx| {
+                explorer.cwd = ROOT.into();
+                explorer.expanded.insert(ROOT.into());
+                explorer
+                    .dirs
+                    .insert(ROOT.into(), Ok(listing(ROOT, &["dir-src", "a.rs"])));
+                explorer.rebuild(cx);
+                let rows = explorer.lines.len();
+                assert!(rows >= 2);
+                git.update(cx, |git, cx| git.bind(ROOT.into(), true, cx));
+                assert!(explorer.is_offline(cx));
+
+                // Nothing is read, and the tree is still there.
+                explorer.refresh_loaded(cx);
+                explorer.read_dir(ROOT.into(), cx);
+                assert!(explorer.reading.is_empty());
+                assert_eq!(explorer.lines.len(), rows);
+                assert!(matches!(explorer.dirs.get(ROOT), Some(Ok(entries)) if entries.len() == 2));
+
+                // A failure because the tunnel is down never replaces the shown listing.
+                explorer.apply_listing(
+                    ROOT.into(),
+                    Err("Codespace is not connected. Reconnect it first.".into()),
+                    cx,
+                );
+                assert!(matches!(explorer.dirs.get(ROOT), Some(Ok(entries)) if entries.len() == 2));
+                assert_eq!(explorer.lines.len(), rows);
+
+                // Every write is refused with the reason.
+                for attempt in 0..6 {
+                    explorer.op_error = None;
+                    match attempt {
+                        0 => explorer.start_create(false, None, window, cx),
+                        1 => explorer.start_rename(format!("{ROOT}/a.rs"), window, cx),
+                        2 => explorer.delete(format!("{ROOT}/a.rs"), window, cx),
+                        3 => explorer.paste(ROOT.into(), window, cx),
+                        4 => explorer.duplicate(format!("{ROOT}/a.rs"), window, cx),
+                        _ => explorer.copy_external(
+                            vec![PathBuf::from("/tmp/x")],
+                            ROOT.into(),
+                            window,
+                            cx,
+                        ),
+                    }
+                    assert_eq!(
+                        explorer.op_error.as_deref(),
+                        Some(NOT_CONNECTED),
+                        "{attempt}"
+                    );
+                    assert!(explorer.naming.is_none());
+                }
+
+                // Connect brought the link back: the tree is read again, but it stays read-only
+                // (and says why) until the first reload lands.
+                git.update(cx, |git, cx| git.bind(ROOT.into(), false, cx));
+                assert!(!explorer.is_offline(cx) && explorer.is_stale(cx));
+                explorer.op_error = None;
+                explorer.start_create(false, None, window, cx);
+                assert_eq!(explorer.op_error.as_deref(), Some(REFRESHING));
+                assert!(explorer.naming.is_none());
+            })
+            .unwrap();
+        // The reads of this fake workspace fail, so the tree stays read-only until the recovery
+        // limit ends the wait.
+        cx.run_until_parked();
+        window
+            .update(cx, |explorer, _, cx| assert!(explorer.is_stale(cx)))
+            .unwrap();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(31));
+        cx.run_until_parked();
+        window
+            .update(cx, |explorer, window, cx| {
+                assert!(!explorer.is_stale(cx));
+                explorer.op_error = None;
+                explorer.start_create(false, None, window, cx);
+                assert!(explorer.naming.is_some() && explorer.op_error.is_none());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_workspace_that_is_starting_says_so_and_the_note_follows_the_link(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, git) = explorer_window(cx);
+        window
+            .update(cx, |explorer, window, cx| {
+                explorer.cwd = ROOT.into();
+                explorer.enabled = true;
+                explorer.expanded.insert(ROOT.into());
+                git.update(cx, |git, cx| git.bind(ROOT.into(), true, cx));
+                explorer.link_state = (true, false);
+                explorer.rebuild(cx);
+                let note = |explorer: &Explorer| match explorer.lines.first() {
+                    Some(Line::Note { text, .. }) => text.to_string(),
+                    _ => String::new(),
+                };
+                assert!(note(explorer).starts_with("Not loaded"));
+                git.update(cx, |git, cx| git.set_starting(true, cx));
+                explorer.start_create(false, None, window, cx);
+                assert_eq!(explorer.op_error.as_deref(), Some(WORKSPACE_STARTING));
+                explorer.rebuild(cx);
+                assert_eq!(note(explorer), "Workspace starting");
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_late_listing_of_another_root_is_dropped(cx: &mut gpui::TestAppContext) {
+        let (window, git) = explorer_window(cx);
+        let other = "remote://env-octo-xyz/workspaces/widgets";
+        window
+            .update(cx, |explorer, _, cx| {
+                explorer.cwd = ROOT.into();
+                explorer.apply_listing(other.into(), Ok(listing(other, &["secret.rs"])), cx);
+                assert!(explorer.dirs.is_empty());
+                assert!(git.read(cx).remote.peek(other).is_none());
+                assert!(git.read(cx).remote.peek(ROOT).is_none());
+                // A sibling that shares the prefix is another root too.
+                let sibling = format!("{ROOT}-wt");
+                explorer.apply_listing(sibling.clone(), Ok(listing(&sibling, &["x"])), cx);
+                assert!(explorer.dirs.is_empty());
+                // The root's own answer is kept and confirms the root.
+                explorer.apply_listing(ROOT.into(), Ok(listing(ROOT, &["a.rs"])), cx);
+                assert_eq!(explorer.dirs.len(), 1);
+                assert!(git.read(cx).remote.peek(ROOT).unwrap().updated.is_some());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_late_remote_listing_cannot_enter_a_local_tree(cx: &mut gpui::TestAppContext) {
+        let (window, _) = explorer_window(cx);
+        window
+            .update(cx, |explorer, _, cx| {
+                explorer.cwd = "/work/monocode".into();
+                explorer.apply_listing(ROOT.into(), Ok(listing(ROOT, &["a.rs"])), cx);
+                explorer.apply_listing(
+                    "/work/other".into(),
+                    Ok(listing("/work/other", &["b.rs"])),
+                    cx,
+                );
+                assert!(explorer.dirs.is_empty());
+                explorer.apply_listing(
+                    "/work/monocode/src".into(),
+                    Ok(listing("/work/monocode/src", &["lib.rs"])),
+                    cx,
+                );
+                assert_eq!(explorer.dirs.len(), 1);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn leaving_a_root_keeps_the_time_of_its_last_live_read(cx: &mut gpui::TestAppContext) {
+        let (window, git) = explorer_window(cx);
+        window
+            .update(cx, |explorer, _, cx| {
+                explorer.cwd = ROOT.into();
+                explorer.apply_listing(ROOT.into(), Ok(listing(ROOT, &["a.rs"])), cx);
+                let read_at = git.read(cx).remote.peek(ROOT).unwrap().updated.unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                explorer.leave_root(cx);
+                assert_eq!(
+                    git.read(cx).remote.peek(ROOT).unwrap().updated,
+                    Some(read_at)
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_failed_read_of_another_kind_still_replaces_the_listing(cx: &mut gpui::TestAppContext) {
+        let (window, _) = explorer_window(cx);
+        window
+            .update(cx, |explorer, _, cx| {
+                explorer.cwd = ROOT.into();
+                explorer
+                    .dirs
+                    .insert(ROOT.into(), Ok(listing(ROOT, &["a.rs"])));
+                explorer.apply_listing(ROOT.into(), Err("No such directory".into()), cx);
+                assert!(matches!(explorer.dirs.get(ROOT), Some(Err(_))));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_folder_never_read_before_the_disconnect_says_so_instead_of_loading(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, git) = explorer_window(cx);
+        window
+            .update(cx, |explorer, _, cx| {
+                explorer.cwd = ROOT.into();
+                explorer.expanded.insert(ROOT.into());
+                git.update(cx, |git, cx| git.bind(ROOT.into(), true, cx));
+                explorer.rebuild(cx);
+                assert!(matches!(
+                    explorer.lines.first(),
+                    Some(Line::Note { text, .. }) if text.starts_with("Not loaded")
+                ));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn each_remote_root_gets_back_only_its_own_tree(cx: &mut gpui::TestAppContext) {
+        let (window, git) = explorer_window(cx);
+        let sibling = format!("{ROOT}-wt");
+        window
+            .update(cx, |explorer, _, cx| {
+                explorer.cwd = ROOT.into();
+                explorer.expanded = HashSet::from([ROOT.into(), format!("{ROOT}/dir-src")]);
+                explorer.selected = Some(format!("{ROOT}/a.rs"));
+                explorer
+                    .dirs
+                    .insert(ROOT.into(), Ok(listing(ROOT, &["a.rs"])));
+                explorer.dirs.insert(
+                    format!("{ROOT}/dir-src"),
+                    Ok(listing(&format!("{ROOT}/dir-src"), &["lib.rs"])),
+                );
+                // A failed listing is never remembered.
+                explorer
+                    .dirs
+                    .insert(format!("{ROOT}/dir-bad"), Err("boom".into()));
+                // Leaving the root takes its listings with it...
+                explorer.leave_root(cx);
+                assert!(explorer.dirs.is_empty() && explorer.expanded.is_empty());
+                assert_eq!(git.read(cx).remote.len(), 1);
+
+                // ...and another root, even one sharing the prefix, gets nothing of them.
+                explorer.cwd = sibling.clone();
+                let saved = explorer.enter_root(&sibling, cx);
+                assert!(explorer.dirs.is_empty());
+                assert_eq!(saved.expanded, HashSet::from([sibling.clone()]));
+                assert_eq!(saved.selected, None);
+                // The Local checkout of the same session neither.
+                let local = explorer.enter_root("/work/monocode", cx);
+                assert!(explorer.dirs.is_empty() && local.selected.is_none());
+
+                // Coming back restores the tree, the open folders and the selection.
+                let saved = explorer.enter_root(ROOT, cx);
+                assert_eq!(explorer.dirs.len(), 2);
+                assert!(!explorer.dirs.contains_key(&format!("{ROOT}/dir-bad")));
+                assert!(saved.expanded.contains(&format!("{ROOT}/dir-src")));
+                assert_eq!(
+                    saved.selected.as_deref(),
+                    Some(format!("{ROOT}/a.rs").as_str())
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn leaving_a_local_root_uses_the_local_memory_and_not_the_remote_cache(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, git) = explorer_window(cx);
+        window
+            .update(cx, |explorer, _, cx| {
+                explorer.cwd = "/work/monocode".into();
+                explorer.expanded = HashSet::from(["/work/monocode".to_owned()]);
+                explorer.dirs.insert(
+                    "/work/monocode".into(),
+                    Ok(listing("/work/monocode", &["a.rs"])),
+                );
+                explorer.leave_root(cx);
+                assert_eq!(git.read(cx).remote.len(), 0);
+                assert!(explorer.saved.contains_key("/work/monocode"));
             })
             .unwrap();
     }
