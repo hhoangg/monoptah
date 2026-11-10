@@ -8,6 +8,7 @@ mod classic_sidebar;
 #[cfg(test)]
 mod classic_surface_tests;
 mod classic_surfaces;
+mod claude_setup;
 mod cloud;
 mod cloud_app_archive;
 mod cloud_create;
@@ -717,6 +718,8 @@ pub(crate) struct Shell {
     cloud: Arc<monocode_core::cloud_sessions::CloudSessions>,
     /// Sessions that live in a codespace, by id, and the cached state of each codespace.
     cloud_marks: HashMap<i64, cloud::CloudMark>,
+    /// The Claude setup block of each workspace, by `CloudRef::key`; see [`claude_setup`].
+    claude_setups: claude_setup::Setups,
     /// Which side of a cloud session its Files and Changes panels show. In memory only; a
     /// session without an entry shows the cloud workspace.
     panel_modes: HashMap<i64, crate::panel_root::PanelMode>,
@@ -1188,6 +1191,7 @@ impl Shell {
             cloud,
             gh,
             cloud_marks: HashMap::new(),
+            claude_setups: Default::default(),
             panel_modes: HashMap::new(),
             cloud_view: None,
             cloud_states: HashMap::new(),
@@ -2190,6 +2194,10 @@ impl Shell {
                     }
                     PanelEvent::Connect => {
                         this.connect_panel_workspace(cx);
+                        return;
+                    }
+                    PanelEvent::UpdateSetup => {
+                        this.update_claude_setup(cx);
                         return;
                     }
                 }
@@ -7199,7 +7207,6 @@ impl Shell {
             let back = select.clone();
             return crate::settings::nav(
                 section,
-                self.workspace.preferences.cloud_kit_enabled,
                 search,
                 move |section, _, cx| {
                     let _ = select.update(cx, |this, cx| this.select_settings(section, cx));

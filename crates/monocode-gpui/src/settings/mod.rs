@@ -493,12 +493,6 @@ impl SettingsView {
     pub(crate) fn set_preferences(&mut self, prefs: &Preferences, cx: &mut Context<Self>) {
         if &self.prefs != prefs {
             self.prefs = prefs.clone();
-            // The Cloud page has no rail entry without its flag, so leave it. (Settings
-            // search lists only `Section::ALL`, so Cloud is not searchable yet.)
-            if self.section == Section::Cloud && !prefs.cloud_kit_enabled {
-                self.select_section(Section::General, cx);
-                cx.emit(SettingsEvent::Section(Section::General));
-            }
             self.notification_deadline(cx);
             cx.notify();
         }
@@ -931,7 +925,6 @@ impl SettingsView {
 /// the pages scroll beneath, and Back to app sits at the bottom.
 pub(crate) fn nav(
     section: Section,
-    show_cloud: bool,
     search: AnyElement,
     select: impl Fn(Section, &mut Window, &mut App) + Clone + 'static,
     back: impl Fn(&mut Window, &mut App) + 'static,
@@ -1027,7 +1020,7 @@ pub(crate) fn nav(
                             sections
                                 .iter()
                                 .copied()
-                                .chain((show_cloud && *group == "Agents").then_some(Section::Cloud))
+                                .chain((*group == "Agents").then_some(Section::Cloud))
                                 .map(|item| {
                                     let select = select.clone();
                                     row(

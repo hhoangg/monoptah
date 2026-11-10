@@ -675,8 +675,8 @@ impl CloudSessions {
             kit_seams: claude_setup::KitSeams::system(),
         }
     }
-    #[cfg(test)]
-    fn with_kit_seams(mut self, seams: claude_setup::KitSeams) -> Self {
+    /// Replaces where the Claude setup reads the user's preferences and local setup.
+    pub fn with_kit_seams(mut self, seams: claude_setup::KitSeams) -> Self {
         self.kit_seams = seams;
         self
     }

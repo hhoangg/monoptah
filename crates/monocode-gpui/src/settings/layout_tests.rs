@@ -774,17 +774,14 @@ fn the_cloud_notice_shows_once_and_is_stored_as_acknowledged(cx: &mut TestAppCon
 }
 
 #[gpui::test]
-fn the_cloud_page_has_a_refresh_button_and_leaves_when_the_flag_turns_off(cx: &mut TestAppContext) {
+fn the_cloud_page_has_a_refresh_button_and_stays_when_preferences_change(cx: &mut TestAppContext) {
     let window = cloud_window(cx);
     let visual = &mut VisualTestContext::from_window(window.into(), cx);
     visual.run_until_parked();
     visual.refresh().unwrap();
     assert!(visual.debug_bounds("refresh-cloud").is_some());
 
-    let on = Preferences {
-        cloud_kit_enabled: true,
-        ..Default::default()
-    };
+    let on = Preferences::default();
     window
         .update(visual, |view, _, cx| view.set_preferences(&on, cx))
         .unwrap();
@@ -794,8 +791,8 @@ fn the_cloud_page_has_a_refresh_button_and_leaves_when_the_flag_turns_off(cx: &m
             view.set_preferences(&Preferences::default(), cx);
             assert_eq!(
                 view.section,
-                Section::General,
-                "no rail entry without the flag"
+                Section::Cloud,
+                "the page has no flag any more"
             );
         })
         .unwrap();

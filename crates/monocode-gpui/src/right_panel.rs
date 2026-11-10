@@ -6,7 +6,7 @@ use crate::{
     explorer::Explorer,
     git_status::{GitChanged, ProjectGit},
     history::History,
-    panel_root::{Chrome, Link, PanelMode},
+    panel_root::{Chrome, Link, PanelMode, SETUP_CHANGED, SetupStrip, SetupTone},
     project_tabs::{TabLabel, TabReveal, tab_button},
     theme::*,
 };
@@ -100,6 +100,8 @@ pub(crate) enum PanelEvent {
     Reordered(Vec<RightTab>),
     /// The Cloud / Local switch of a cloud session's panels.
     Mode(PanelMode),
+    /// "Update Claude setup": a user action that copies the local setup to the workspace again.
+    UpdateSetup,
     /// The connection strip's Connect action (a user action that may wake the workspace).
     Connect,
 }
@@ -281,6 +283,8 @@ pub(crate) struct RightPanel {
     /// Set while a cloud session is in view: which side the panels show, the switch and the
     /// connection strip.
     cloud: Option<Chrome>,
+    /// The Claude setup block shows its server list.
+    setup_open: bool,
     /// Name of the Codespace tab: `Codespace` or `Sandbox`, by the backend of the start shown.
     codespace_title: &'static str,
     tab_width: f32,
@@ -333,6 +337,7 @@ impl RightPanel {
             terminal_tab: false,
             top_inset: 0.,
             cloud: None,
+            setup_open: false,
             codespace_title: RightTab::Codespace.label(),
             tab_width: tabs_width(3),
             drag: None,
@@ -756,6 +761,144 @@ impl RightPanel {
                     ),
             )
             .children(strip)
+            .children(
+                chrome
+                    .setup
+                    .as_ref()
+                    .map(|setup| self.setup_block(setup, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// "Claude setup": the summary line with the Update action, whether the local setup
+    /// changed, and one line per MCP server.
+    fn setup_block(&self, setup: &SetupStrip, cx: &mut Context<Self>) -> AnyElement {
+        let tone = |tone: SetupTone| match tone {
+            SetupTone::Good => content(0.75),
+            SetupTone::Notice => gpui::rgb(AMBER_400).into(),
+            SetupTone::Bad => gpui::rgb(RED_400).into(),
+            SetupTone::Quiet => content(0.45),
+        };
+        let open = self.setup_open;
+        let head = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .id("cloud-setup-toggle")
+                    .debug_selector(|| "cloud-setup-toggle".into())
+                    .role(Role::Button)
+                    .aria_label("Claude setup")
+                    .aria_expanded(open)
+                    .min_w_0()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.setup_open = !this.setup_open;
+                        cx.notify();
+                    }))
+                    .child(icon(
+                        if open {
+                            "chevron-down"
+                        } else {
+                            "chevron-right"
+                        },
+                        11.,
+                    ))
+                    .child(div().text_color(content(0.8)).child("Claude setup"))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(content(0.45))
+                            .child(setup.summary.clone()),
+                    ),
+            )
+            .when(setup.can_update, |d| {
+                d.child(
+                    div()
+                        .id("cloud-setup-update")
+                        .debug_selector(|| "cloud-setup-update".into())
+                        .role(Role::Button)
+                        .aria_label("Update Claude setup")
+                        .px_2()
+                        .rounded_md()
+                        .bg(content(0.1))
+                        .text_color(content(if setup.updating { 0.5 } else { 1. }))
+                        .when(!setup.updating, |d| {
+                            d.cursor_pointer().hover(|s| s.bg(content(0.16))).on_click(
+                                cx.listener(|_, _, _, cx| cx.emit(PanelEvent::UpdateSetup)),
+                            )
+                        })
+                        .child(if setup.updating {
+                            "Updating..."
+                        } else {
+                            "Update Claude setup"
+                        }),
+                )
+            });
+        div()
+            .id("cloud-setup")
+            .debug_selector(|| "cloud-setup".into())
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .child(head)
+            .when(setup.changed, |d| {
+                d.child(
+                    div()
+                        .id("cloud-setup-changed")
+                        .debug_selector(|| "cloud-setup-changed".into())
+                        .text_color(gpui::rgb(AMBER_400))
+                        .child(SETUP_CHANGED),
+                )
+            })
+            .when_some(setup.error.clone(), |d, error| {
+                d.child(
+                    div()
+                        .id("cloud-setup-error")
+                        .role(Role::Alert)
+                        .text_color(gpui::rgb(RED_400))
+                        .child(error),
+                )
+            })
+            .when(open, |d| {
+                d.children(
+                    setup
+                        .servers
+                        .iter()
+                        .map(|(name, label, kind)| {
+                            let id: SharedString = format!("cloud-setup-server-{name}").into();
+                            div()
+                                .id(id.clone())
+                                .debug_selector(move || id.to_string())
+                                .pl_4()
+                                .flex()
+                                .gap_2()
+                                .child(div().text_color(content(0.7)).child(name.clone()))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .text_color(tone(*kind))
+                                        .child(label.clone()),
+                                )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .children(
+                    setup
+                        .warnings
+                        .iter()
+                        .map(|warning| div().pl_4().text_color(content(0.5)).child(warning.clone()))
+                        .collect::<Vec<_>>(),
+                )
+            })
             .into_any_element()
     }
 }
@@ -988,6 +1131,105 @@ mod tests {
         panel.update(visual, |panel, cx| {
             assert!(!panel.explorer.read(cx).is_read_only())
         });
+    }
+
+    #[gpui::test]
+    fn the_claude_setup_block_lists_health_and_asks_for_an_update(cx: &mut gpui::TestAppContext) {
+        use crate::panel_root::{ActiveSession, SetupStrip, SetupTone, resolve};
+        use monocode_core::cloud_sessions::CloudRef;
+        let mut panel = None;
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                let git = cx.new(|cx| ProjectGit::new("~".into(), cx));
+                let entity = cx.new(|cx| RightPanel::new(git, RightTab::Files, vec![], window, cx));
+                panel = Some(entity.clone());
+                cx.new(|_| ClassicProbe(entity))
+            })
+            .unwrap()
+        });
+        let panel = panel.unwrap();
+        let asked = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = asked.clone();
+        let _keep = cx.update(|cx| {
+            cx.subscribe(&panel, move |_, event: &PanelEvent, _| {
+                if matches!(event, PanelEvent::UpdateSetup) {
+                    count.set(count.get() + 1);
+                }
+            })
+        });
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        let root = resolve(
+            Some(ActiveSession {
+                cwd: "remote://env-octo-abc/workspaces/widgets",
+                worktree_cwd: None,
+                cloud: Some((CloudRef::codespace("octo-abc"), "/work/monocode")),
+            }),
+            crate::panel_root::PanelMode::Cloud,
+            false,
+            "/o",
+        );
+        let strip = |changed, updating| SetupStrip {
+            summary: "1 skill, 2 MCP servers".into(),
+            servers: vec![
+                ("github".into(), "connected".into(), SetupTone::Good),
+                (
+                    "linear".into(),
+                    "Sign in in the cloud".into(),
+                    SetupTone::Notice,
+                ),
+            ],
+            warnings: vec!["Server \"x\" was not sent.".into()],
+            changed,
+            can_update: true,
+            updating,
+            error: None,
+        };
+        let show = |setup: Option<SetupStrip>, visual: &mut gpui::VisualTestContext| {
+            let chrome = Chrome::of(&root, Link::Connected, true).map(|c| c.with_setup(setup));
+            panel.update(visual, |panel, cx| panel.set_cloud_chrome(chrome, cx));
+            visual.refresh().unwrap();
+        };
+        // Nothing was sent: no block.
+        show(None, visual);
+        assert!(visual.debug_bounds("cloud-setup").is_none());
+        // Collapsed: the line and the Update action, no change notice yet.
+        show(Some(strip(false, false)), visual);
+        assert!(visual.debug_bounds("cloud-setup").is_some());
+        assert!(visual.debug_bounds("cloud-setup-changed").is_none());
+        assert!(visual.debug_bounds("cloud-setup-server-github").is_none());
+        // The local setup changed: the indicator shows.
+        show(Some(strip(true, false)), visual);
+        assert!(visual.debug_bounds("cloud-setup-changed").is_some());
+        // Open: one line per server.
+        let toggle = visual.debug_bounds("cloud-setup-toggle").unwrap();
+        visual.simulate_click(toggle.center(), Default::default());
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("cloud-setup-server-github").is_some());
+        assert!(visual.debug_bounds("cloud-setup-server-linear").is_some());
+        // Update is a click; while it runs the button does nothing.
+        let update = visual.debug_bounds("cloud-setup-update").unwrap();
+        visual.simulate_click(update.center(), Default::default());
+        visual.run_until_parked();
+        assert_eq!(asked.get(), 1);
+        show(Some(strip(true, true)), visual);
+        let update = visual.debug_bounds("cloud-setup-update").unwrap();
+        visual.simulate_click(update.center(), Default::default());
+        visual.run_until_parked();
+        assert_eq!(asked.get(), 1);
+        // The Local switch has no block.
+        let local = resolve(
+            Some(ActiveSession {
+                cwd: "remote://env-octo-abc/workspaces/widgets",
+                worktree_cwd: None,
+                cloud: Some((CloudRef::codespace("octo-abc"), "/work/monocode")),
+            }),
+            crate::panel_root::PanelMode::Local,
+            false,
+            "/o",
+        );
+        let chrome = Chrome::of(&local, Link::Connected, true)
+            .map(|c| c.with_setup(Some(strip(false, false))));
+        assert_eq!(chrome.unwrap().setup, None);
     }
 
     #[gpui::test]

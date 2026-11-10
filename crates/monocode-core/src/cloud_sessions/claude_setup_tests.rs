@@ -559,3 +559,26 @@ fn an_old_start_record_without_the_step_still_loads_and_ends_with_it_skipped() {
     ended.skip_unrun_claude_setup(2000);
     assert_eq!(status(&ended, StepKind::ClaudeSetup), StepStatus::Skipped);
 }
+
+#[test]
+fn the_panel_view_reports_a_local_change_and_whether_update_is_on_offer() {
+    let home = home();
+    let f = kit_fx(&home, on());
+    let (session, _) = f.svc.begin_start("/p", new_target(), "claude").unwrap();
+    f.run(session.id).0.unwrap();
+    let view = f.svc.claude_setup_view(session.id).unwrap();
+    assert_eq!(view.cloud, CloudRef::codespace("octo-new1"));
+    assert!(view.can_update && !view.changed);
+    // A skill added locally after the start: "changed since start".
+    write(
+        &home.roots.claude_home.join("skills/deploy/SKILL.md"),
+        "# deploy",
+    );
+    assert!(f.svc.claude_setup_view(session.id).unwrap().changed);
+    // With the kit off in Settings the view stays but Update is not offered.
+    let off = f.svc.with_kit_seams(seams(&home, CloudKitPrefs::default()));
+    let view = off.claude_setup_view(session.id).unwrap();
+    assert!(!view.can_update);
+    // A session that never had a setup has no view.
+    assert!(off.claude_setup_view(session.id + 100).is_none());
+}

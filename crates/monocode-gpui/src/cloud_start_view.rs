@@ -275,6 +275,7 @@ pub(crate) mod fixtures {
             finished_at: None,
             track_ready: true,
             sandbox_start: None,
+            kit_off: false,
         }
     }
 

@@ -128,10 +128,6 @@ pub(crate) struct Preferences {
     // Keybindings: a changed shortcut, or `None` for a disabled one.
     pub keybindings: HashMap<String, Option<String>>,
     // Cloud
-    /// Shows the Cloud page, the start panel summary and the picker switch. Off until the
-    /// kit can be sent to a workspace (F3-4).
-    #[serde(rename = "cloudKitEnabled")]
-    pub cloud_kit_enabled: bool,
     /// The one global kit: item ids only, never values.
     #[serde(rename = "cloudKit")]
     pub cloud_kit: CloudKitPrefs,
@@ -220,7 +216,6 @@ impl Default for Preferences {
             mono_menu_bar_icon: true,
             show_archived: false,
             keybindings: HashMap::new(),
-            cloud_kit_enabled: false,
             cloud_kit: CloudKitPrefs::default(),
         }
     }
@@ -347,19 +342,18 @@ mod tests {
     #[test]
     fn cloud_kit_is_off_by_default_and_round_trips_by_id_only() {
         let prefs = Preferences::default();
-        assert!(!prefs.cloud_kit_enabled);
         assert_eq!(prefs.cloud_kit, CloudKitPrefs::default());
         let old: Preferences = serde_json::from_str(r#"{"sounds":false}"#).unwrap();
-        assert!(!old.cloud_kit_enabled && old.cloud_kit == CloudKitPrefs::default());
+        assert!(old.cloud_kit == CloudKitPrefs::default());
+        // A preference file written while the page was behind a flag still loads.
+        let flagged: Preferences = serde_json::from_str(r#"{"cloudKitEnabled":true}"#).unwrap();
+        assert_eq!(flagged.cloud_kit, CloudKitPrefs::default());
 
-        let mut prefs = Preferences {
-            cloud_kit_enabled: true,
-            ..Default::default()
-        };
+        let mut prefs = Preferences::default();
         prefs.cloud_kit.selection = Some(["mcp:user:github".to_owned()].into());
         prefs.cloud_kit.acknowledge_notice();
         let saved = serde_json::to_value(&prefs).unwrap();
-        assert_eq!(saved["cloudKitEnabled"], true);
+        assert!(saved.get("cloudKitEnabled").is_none());
         assert_eq!(
             saved["cloudKit"],
             serde_json::json!({

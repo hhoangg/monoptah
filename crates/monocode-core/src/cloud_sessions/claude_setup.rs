@@ -739,6 +739,17 @@ pub fn workspace_of(cloud: &CloudRef) -> Workspace {
     }
 }
 
+/// A stored setup result with what the cloud panel adds to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetupView {
+    pub cloud: CloudRef,
+    pub state: SetupState,
+    /// The local setup changed since the workspace's kit was made.
+    pub changed: bool,
+    /// "Update Claude setup" would send something (the kit is on and accepted).
+    pub can_update: bool,
+}
+
 // ---------------------------------------------------------------------------
 // CloudSessions
 // ---------------------------------------------------------------------------
@@ -834,6 +845,34 @@ impl CloudSessions {
             project_id: Some(&session.project.project_id),
         };
         Ok(run(&env, &target, &plan, progress))
+    }
+
+    /// What the cloud panel shows for the workspace of `session_id`: the stored result of its
+    /// Claude setup and whether the local setup changed since. `None` when no setup ever ran
+    /// there. Reads the local setup (many files): call it on a worker, never on the UI thread.
+    pub fn claude_setup_view(&self, session_id: i64) -> Option<SetupView> {
+        let session = self.store().ok()?.remote_session(session_id).ok()??;
+        let cloud = session.project.cloud()?;
+        let state = setup_state(&*self.store().ok()?, &cloud)?;
+        let prefs = (self.kit_seams.prefs)();
+        let can_update = prefs.applies(ApiKit::Default);
+        // A scan that cannot run says nothing, rather than claiming a change.
+        let changed = session
+            .project
+            .local_project
+            .as_deref()
+            .and_then(|project| (self.kit_seams.roots)(Path::new(project)).ok())
+            .map(|roots| {
+                let inventory = kit::build_inventory(&roots, workspace_of(&cloud));
+                local_changed(&state, &inventory, &prefs)
+            })
+            .unwrap_or(false);
+        Some(SetupView {
+            cloud,
+            state,
+            changed,
+            can_update,
+        })
     }
 
     /// The stored result of the last Claude setup of `cloud`.
