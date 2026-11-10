@@ -1489,9 +1489,9 @@ ticket, after review and after merge.
 | F3-2b | 2 | in progress | csi-f3-2b | D12 follow-up: update the one-time notice constant and UI/default wording that say sign-ins are copied; remove the signed-in/not-signed-in distinction in kit/kit_prefs; after F3-1b |
 | F4-L | 2 | in progress | csi-f4-l-a | L, sub-PRs: part A = sub-PR 1+2 (store/location types, runtime selection + row append); part B = sub-PR 3+4 (sidebar/UI, single-writer guards, rewind) |
 | H3 | 3 | in progress | csi-h3 | |
-| F2-3h | 3 | in progress | csi-f2-3h-5h | with F2-5h on one branch |
+| F2-3h | 3 | merged | csi-f2-3h-5h | merge 813f30c3. Opus review fixed: idempotent retry, linked-dir cross-project, per-path mutex, stale temp sweep. Contract for F2-3 client: Host hashes RAW BYTES (BOM not stripped); missing target with expectedSha256 = mismatch. |
 | F2-4h | 3 | merged | csi-f2-4h | merge 64f9c10e. Opus review x4 fixed: dir watch retry (wanted vs live), recreated ref dirs, replaced client dirs by dev:ino, confinement on re-create, async rate-limited heal with generation tokens, once-per-episode overflow. Host only; reaches users after HR2. |
-| F2-5h | 3 | in progress | csi-f2-3h-5h | with F2-3h on one branch |
+| F2-5h | 3 | merged | csi-f2-3h-5h | merge 813f30c3. Idle guard on discard/stash (project lock atomic), 90 s push/pull/sync. Known: 90 s timeout kills git only (not its process group); push now holds the project lock up to 90 s. |
 | HR2 | 3 | todo | - | release: stop and ask |
 | F2-3 | 3 | todo | - | |
 | F2-4 | 3 | todo | - | |
