@@ -26,6 +26,7 @@ import {
   createHostPath,
   existingPath,
   hostFileDiff,
+  GIT_NETWORK_TIMEOUT_MS,
   hostGitAction,
   hostGitIndex,
   indexHostFiles,
@@ -123,7 +124,11 @@ export class WorkspaceCommands {
 
   constructor(
     private readonly store: HostStore,
-    private readonly withIdleProject: <T>(projectId: string, action: () => Promise<T>) => Promise<T>,
+    private readonly withIdleProject: <T>(
+      projectId: string,
+      action: () => Promise<T>,
+      what?: string,
+    ) => Promise<T>,
   ) {}
 
   run(command: unknown, args: unknown): Promise<unknown> {
@@ -176,9 +181,13 @@ export class WorkspaceCommands {
       case "git_unstage_file":
         return this.gitAction(input.cwd, "unstage", input.relative);
       case "git_discard_file":
-        return this.gitAction(input.cwd, "discard", input.relative);
+        return this.gitIdle(input.cwd, "discarding changes", () =>
+          this.gitAction(input.cwd, "discard", input.relative),
+        );
       case "git_discard_all":
-        return this.gitAction(input.cwd, "discardAll");
+        return this.gitIdle(input.cwd, "discarding changes", () =>
+          this.gitAction(input.cwd, "discardAll"),
+        );
       case "git_stage_all":
         return this.gitAction(input.cwd, "stageAll");
       case "git_unstage_all":
@@ -192,7 +201,7 @@ export class WorkspaceCommands {
       case "git_push":
         return this.gitAction(input.cwd, "push");
       case "git_pull":
-        return this.gitCommand(input.cwd, ["pull", "--ff-only"]).then(() => undefined);
+        return this.gitPull(input.cwd);
       case "git_sync":
         return this.gitSync(input.cwd);
       case "git_pr_status":
@@ -218,7 +227,9 @@ export class WorkspaceCommands {
       case "git_create_branch":
         return this.gitCreateBranch(input.cwd, input.name);
       case "git_stash":
-        return this.gitStash(input.cwd, input.message);
+        return this.gitIdle(input.cwd, "stashing changes", () =>
+          this.gitStash(input.cwd, input.message),
+        );
       case "git_worktrees":
         return this.gitWorktrees(input.cwd);
       case "search_project":
@@ -615,11 +626,16 @@ export class WorkspaceCommands {
     return hostGitAction(await this.gitRoot(cwd), action, relative, message, contents);
   }
 
-  private async gitCommand(cwd: unknown, args: string[], env?: NodeJS.ProcessEnv): Promise<string> {
+  private async gitCommand(
+    cwd: unknown,
+    args: string[],
+    env?: NodeJS.ProcessEnv,
+    timeout = 30_000,
+  ): Promise<string> {
     const root = await this.gitRoot(cwd);
     return (await exec("git", ["-c", "core.pager=cat", ...args], {
       cwd: root,
-      timeout: 30_000,
+      timeout,
       maxBuffer: 4 * 1024 * 1024,
       encoding: "utf8",
       env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...env },
@@ -708,8 +724,12 @@ export class WorkspaceCommands {
     return selected;
   }
 
+  private async gitPull(cwd: unknown): Promise<void> {
+    await this.gitCommand(cwd, ["pull", "--ff-only"], undefined, GIT_NETWORK_TIMEOUT_MS);
+  }
+
   private async gitSync(cwd: unknown) {
-    await this.gitCommand(cwd, ["pull", "--ff-only"]);
+    await this.gitPull(cwd);
     await this.gitAction(cwd, "push");
   }
 
@@ -916,12 +936,23 @@ export class WorkspaceCommands {
     return state.current ?? "HEAD";
   }
 
-  private async withIdleGitProject<T>(cwd: string, action: () => Promise<T>): Promise<T> {
+  /** Runs a working-tree-rewriting git command only while no session of the
+   * project is running, so it cannot race an agent turn. */
+  private async gitIdle<T>(cwd: unknown, what: string, action: () => Promise<T>): Promise<T> {
+    const root = await this.gitRoot(cwd);
+    return this.withIdleGitProject(root, action, what);
+  }
+
+  private async withIdleGitProject<T>(
+    cwd: string,
+    action: () => Promise<T>,
+    what?: string,
+  ): Promise<T> {
     const { root } = await this.locate(cwd);
     const project = this.store.projects().find((candidate) =>
       candidate.cwd === root || this.roots.get(candidate.cwd)?.roots.includes(root));
     if (!project) throw new Error("Project is unavailable");
-    return this.withIdleProject(project.id, action);
+    return this.withIdleProject(project.id, action, what);
   }
 
   private async gitStash(cwd: unknown, message: unknown) {

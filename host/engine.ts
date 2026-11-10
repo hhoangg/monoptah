@@ -300,6 +300,7 @@ export class HostEngine {
   async withIdleProject<T>(
     projectId: string,
     action: () => Promise<T>,
+    what = "switching branches",
   ): Promise<T> {
     if (this.switchingProjects.has(projectId))
       throw new Error("A branch switch is already in progress");
@@ -309,7 +310,7 @@ export class HostEngine {
         .some((session) => session.status === "running")
     )
       throw new Error(
-        "Wait for running host sessions before switching branches",
+        `Wait for running host sessions before ${what}`,
       );
     this.switchingProjects.add(projectId);
     try {
