@@ -129,6 +129,10 @@ impl ProjectGit {
     }
     /// The panels show a cloud workspace the app is not connected to. Nothing is read from it
     /// and nothing may wake it; what is shown is the last snapshot, read-only.
+    #[cfg(test)]
+    pub(crate) fn poll_is_off_for_test(&self) -> bool {
+        self.poll.is_none()
+    }
     pub(crate) fn offline(&self) -> bool {
         self.link_offline
     }

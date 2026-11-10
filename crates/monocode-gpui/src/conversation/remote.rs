@@ -990,6 +990,11 @@ impl Conversation {
     pub(crate) fn cloud_stopped_for_test(&self) -> bool {
         self.cloud_stopped
     }
+    /// The live link of the workspace, as a successful refresh would leave it.
+    #[cfg(test)]
+    pub(crate) fn set_online_for_test(&mut self, online: bool) {
+        self.remote_state.online = online;
+    }
     /// Whether the app has a live connection to this session's workspace, for the connection
     /// strip of the Files and Changes panels. Reads cached view state only; it never wakes or
     /// reconnects (the strip's Connect action is `reconnect_cloud`, a user action).
