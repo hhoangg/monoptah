@@ -11,7 +11,7 @@
 //! # Defaults
 //!
 //! `selection: None` means "the defaults": every item that can be sent is checked, secrets
-//! and sign-ins included. The first edit turns the defaults into an explicit list of
+//! included and OAuth-style servers carried config-only. The first edit turns the defaults into an explicit list of
 //! **user-scope** items, so a user-scope item that appears later is left unchecked until the
 //! user ticks it.
 //!
@@ -31,7 +31,7 @@ use super::kit::{
 };
 
 /// Shown once, the first time the kit is enabled. The wording is fixed by design 3.2.2.
-pub const NOTICE: &str = "Your MCP secrets and sign-ins will be copied to your cloud workspaces. They will be visible to the agent, to every MCP server and to every command the agent runs there.";
+pub const NOTICE: &str = "Your MCP secrets will be copied to your cloud workspaces. They will be visible to the agent, to every MCP server and to every command the agent runs there. MCP servers that use OAuth sign-in are not copied with a sign-in: sign in to them in the cloud.";
 
 /// Shown on the Cloud page when the local key for secret digests could not be used.
 pub const KEY_UNAVAILABLE_NOTE: &str =
@@ -187,8 +187,8 @@ pub enum Badge {
     NeedsRuntime(Runtime),
     LocalOnly,
     HasSecrets,
-    SignedIn,
-    NotSignedIn,
+    /// An OAuth-style http/sse server: carried config-only (D12).
+    SignInInCloud,
     /// A project server or skill that arrives with the clone.
     InRepository,
     /// A plugin with `bin/` or native files: it may not run on Linux.
@@ -205,8 +205,7 @@ impl Badge {
             }
             Self::LocalOnly => "Local only - will not work".into(),
             Self::HasSecrets => "Has secrets".into(),
-            Self::SignedIn => "Signed in (OAuth)".into(),
-            Self::NotSignedIn => "Sign in locally first".into(),
+            Self::SignInInCloud => "Sign in in the cloud".into(),
             Self::InRepository => "Already in the repository".into(),
             Self::MayNotRun => "May not run on Linux".into(),
             Self::Excluded => "Cannot be sent".into(),
@@ -340,13 +339,9 @@ fn mcp_item(server: &KitMcpServer) -> Item {
             reason = Some(local_only_reason(why).to_owned());
         }
         McpCompat::NeedsRuntime(runtime) => badges.push(Badge::NeedsRuntime(runtime)),
-        McpCompat::SignedIn => {
+        McpCompat::OAuthStyle => {
             badges.push(Badge::Works);
-            badges.push(Badge::SignedIn);
-        }
-        McpCompat::NotSignedIn => {
-            badges.push(Badge::Works);
-            badges.push(Badge::NotSignedIn);
+            badges.push(Badge::SignInInCloud);
         }
         McpCompat::Project => {
             badges.push(Badge::InRepository);

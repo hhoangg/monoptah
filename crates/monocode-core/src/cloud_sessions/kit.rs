@@ -2,7 +2,7 @@
 //!
 //! [`build_inventory`] lists skills, MCP servers and plugins for one local project and one
 //! provider account, and classifies each item (design 3.2.1, rules D6 and D7). It is pure
-//! reading: no network, no Keychain, no writes. Transfer is a later ticket.
+//! reading: no network, no Keychain, no credential files, no writes. Transfer is a later ticket.
 //!
 //! # Sources
 //!
@@ -171,8 +171,10 @@ pub enum McpCompat {
     Ok,
     LocalOnly(LocalOnlyReason),
     NeedsRuntime(Runtime),
-    SignedIn,
-    NotSignedIn,
+    /// An http/sse server with no raw `Authorization` header (D12). The app never learns
+    /// whether the user signed in locally: it is carried config-only and the user signs in
+    /// in the cloud.
+    OAuthStyle,
     Project,
 }
 
@@ -344,32 +346,15 @@ pub(super) fn data_dir_from(var: Option<std::ffi::OsString>, home: &Path) -> Pat
         .unwrap_or_else(|| home.join(".cache/monocode-native"))
 }
 
-/// The seam for MCP OAuth sign-in state (F3-5a). `None` means unknown, and an
-/// http/sse server without an `Authorization` header then stays `Ok`.
-pub fn signed_in(_server: &KitMcpServer) -> Option<bool> {
-    None
-}
-
-/// Inventory with the real sign-in seam.
+/// Inventory of what the kit could carry. Pure local reading: no Keychain, no network.
 pub fn build_inventory(roots: &KitRoots, workspace: Workspace) -> KitInventory {
-    build_inventory_with(roots, workspace, &signed_in)
+    build_inventory_budgeted(roots, workspace, SCAN_BUDGET)
 }
 
-/// Inventory with an injected sign-in probe. The probe sees the server before its
-/// compat is final (it is `Ok` at that point).
-pub fn build_inventory_with(
-    roots: &KitRoots,
-    workspace: Workspace,
-    probe: &dyn Fn(&KitMcpServer) -> Option<bool>,
-) -> KitInventory {
-    build_inventory_budgeted(roots, workspace, probe, SCAN_BUDGET)
-}
-
-/// [`build_inventory_with`] with an explicit scan budget (tests use a tiny one).
+/// [`build_inventory`] with an explicit scan budget (tests use a tiny one).
 pub fn build_inventory_budgeted(
     roots: &KitRoots,
     workspace: Workspace,
-    probe: &dyn Fn(&KitMcpServer) -> Option<bool>,
     budget: Duration,
 ) -> KitInventory {
     let home = std::fs::canonicalize(&roots.home).unwrap_or_else(|_| roots.home.clone());
@@ -405,7 +390,7 @@ pub fn build_inventory_budgeted(
         collect_plugin_skills(id, dir, *source, &home, started, &mut inventory.skills);
     }
     for source in &sources {
-        collect_mcp(source, roots, workspace, probe, &mut inventory.mcp_servers);
+        collect_mcp(source, roots, workspace, &mut inventory.mcp_servers);
     }
     collect_project_mcp(roots, &mut inventory.mcp_servers);
 
@@ -1266,7 +1251,6 @@ fn collect_mcp(
     source: &Source,
     roots: &KitRoots,
     workspace: Workspace,
-    probe: &dyn Fn(&KitMcpServer) -> Option<bool>,
     out: &mut Vec<KitMcpServer>,
 ) {
     let Some(config) = crate::mcp::read_json(&source.claude_json) else {
@@ -1299,7 +1283,6 @@ fn collect_mcp(
                 &source.claude_json,
                 server,
                 workspace,
-                probe,
             ) {
                 out.push(built);
             }
@@ -1331,7 +1314,6 @@ fn collect_project_mcp(roots: &KitRoots, out: &mut Vec<KitMcpServer>) {
                         &path,
                         server,
                         Workspace::Codespace,
-                        &|_| None,
                     ) {
                         out.push(built);
                     }
@@ -1351,7 +1333,6 @@ fn build_server(
     config_path: &Path,
     config: &Value,
     workspace: Workspace,
-    probe: &dyn Fn(&KitMcpServer) -> Option<bool>,
 ) -> Option<KitMcpServer> {
     let object = config.as_object()?;
     let transport = object
@@ -1380,7 +1361,7 @@ fn build_server(
     server.compat = if scope == McpScope::Project {
         McpCompat::Project
     } else {
-        classify(&server, object, workspace, probe)
+        classify(&server, object, workspace)
     };
     Some(server)
 }
@@ -1389,7 +1370,6 @@ fn classify(
     server: &KitMcpServer,
     object: &serde_json::Map<String, Value>,
     workspace: Workspace,
-    probe: &dyn Fn(&KitMcpServer) -> Option<bool>,
 ) -> McpCompat {
     if server.transport == "stdio" {
         let command = object.get("command").and_then(Value::as_str).unwrap_or("");
@@ -1409,22 +1389,51 @@ fn classify(
             return McpCompat::LocalOnly(LocalOnlyReason::PrivateUrl);
         }
     }
-    let has_auth = object
+    if let Some(helper) = object.get("headersHelper").and_then(Value::as_str) {
+        if is_absolute_command(helper.trim_start()) {
+            return McpCompat::LocalOnly(LocalOnlyReason::AbsoluteCommand);
+        }
+    }
+    // Only plain http/sse can be OAuth-style. Any other transport (ws, sdk, unknown) is
+    // carried config-only without the badge.
+    if !matches!(
+        server.transport.to_ascii_lowercase().as_str(),
+        "http" | "sse"
+    ) {
+        return McpCompat::Ok;
+    }
+    if has_raw_credential(server, object) {
+        return McpCompat::Ok;
+    }
+    McpCompat::OAuthStyle
+}
+
+/// Header names that always carry a credential, compared exactly and case-insensitively.
+const CREDENTIAL_HEADERS: [&str; 8] = [
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "api-key",
+    "apikey",
+    "x-auth-token",
+    "x-access-token",
+    "cookie",
+];
+
+/// Does the server carry a raw credential of any kind (D7)? Then it is not OAuth-style:
+/// it works from its config alone. Names are never guessed by substring.
+fn has_raw_credential(server: &KitMcpServer, object: &serde_json::Map<String, Value>) -> bool {
+    if object.contains_key("headersHelper") || !server.secrets.is_empty() {
+        return true;
+    }
+    object
         .get("headers")
         .and_then(Value::as_object)
         .is_some_and(|headers| {
             headers
                 .keys()
-                .any(|k| k.eq_ignore_ascii_case("authorization"))
-        });
-    if has_auth {
-        return McpCompat::Ok;
-    }
-    match probe(server) {
-        Some(true) => McpCompat::SignedIn,
-        Some(false) => McpCompat::NotSignedIn,
-        None => McpCompat::Ok,
-    }
+                .any(|k| CREDENTIAL_HEADERS.contains(&k.to_ascii_lowercase().as_str()))
+        })
 }
 
 fn is_absolute_command(command: &str) -> bool {

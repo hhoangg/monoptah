@@ -254,7 +254,7 @@ pub(crate) mod fixture {
             mcp_servers: vec![
                 server("fetch", McpCompat::NeedsRuntime(Runtime::Npx), false),
                 server("github", McpCompat::Ok, true),
-                server("linear", McpCompat::SignedIn, false),
+                server("linear", McpCompat::OAuthStyle, false),
                 server(
                     "mine",
                     McpCompat::LocalOnly(LocalOnlyReason::AbsoluteCommand),

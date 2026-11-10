@@ -772,7 +772,7 @@ account). It reuses `skills.rs` and `mcp.rs` and classifies each item:
       link-local address;
     - stdio with a `docker` command on a sandbox.
   - `NeedsRuntime(npx|uvx|bunx|node|python|docker)`: checked remotely (§3.2.4).
-  - OAuth-style server (D12, 2026-11-10): an http/sse server with no auth header. The app
+  - OAuth-style server (D12, 2026-11-10): an http/sse server with no raw credential (no auth header, no secret value, no secret URL, no `headersHelper`). The app
     cannot know whether the user signed in locally (it never reads the Keychain or Claude's
     credential files). It is carried config-only and marked "Sign in in the cloud"
     (§3.2.5). The older `SignedIn`/`NotSignedIn` split is superseded.
@@ -823,10 +823,10 @@ those servers are marked "Sign in in the cloud".
   - "Needs npx on the instance";
   - "Local only - will not work";
   - "Has secrets";
-  - "Signed in (OAuth)".
+  - "Sign in in the cloud" (OAuth-style server, carried config-only, D12).
   - Local-only items cannot be checked. Their reason is shown.
 - **Defaults.** Every compatible item is checked, including servers with secrets and
-  signed-in OAuth servers.
+  OAuth-style servers (carried config-only).
 - **Project-scoped items follow their project automatically when the global switch is
   on:**
   - local-scope MCP servers (`projects.<path>.mcpServers`);
@@ -1557,7 +1557,7 @@ each batch ends with an explicit release-and-pin ticket (HR1-HR3).
 | **F1-4** | Delete the copy workaround; large files stream and open automatically; queued open during a deferred upgrade; "blocked by network policy" card | S-M | H2b (same release or right after) |
 | **F2-1** | `PanelRoot` + **Cloud/Local switch**. Covers: `git_gate` rework (remote writes allowed under §2.2.5, including push/pull/PR as confirmed user actions); the connection strip; local-only actions disabled plus "Open in browser" | M | F2-0 |
 | **F2-2** | Disconnected state: cached read-only tree and index, Connect action, LRU per root | S-M | F2-1 |
-| **F3-2** | Settings > Cloud "Claude setup": the single global kit (everything compatible checked, secrets and sign-ins included), the one-time notice, start-panel summary and on/off switch, app-API rule | M | F3-1 |
+| **F3-2** | Settings > Cloud "Claude setup": the single global kit (everything compatible checked, secrets included, OAuth-style servers config-only), the one-time notice, start-panel summary and on/off switch, app-API rule | M | F3-1 |
 | **F4-L** | **Session location model.** Covers: `cloud-location` on local sessions; `RemoteSession.linked_to` hidden from the sidebar; the remote runtime appending projected rows to the local DB session (no duplicates); closing the local provider process and refusing the local runtime and TUI launch while Cloud (R2); rewind disabled before the move point (R6); cloud badge and panel driven by the location | L | F4-0 |
 
 ### Wave 3: Host batch 2 (files, git, uploads)

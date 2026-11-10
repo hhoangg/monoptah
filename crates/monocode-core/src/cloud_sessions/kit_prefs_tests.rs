@@ -72,7 +72,7 @@ fn fixture() -> KitInventory {
                 McpCompat::LocalOnly(LocalOnlyReason::AbsoluteCommand),
                 true,
             ),
-            server("linear", McpCompat::SignedIn, false),
+            server("linear", McpCompat::OAuthStyle, false),
             server("repo", McpCompat::Project, false),
         ],
         plugins: vec![
@@ -88,7 +88,7 @@ fn row<'a>(rows: &'a [KitRow], name: &str) -> &'a KitRow {
 }
 
 #[test]
-fn defaults_check_everything_that_can_be_sent_secrets_and_sign_ins_included() {
+fn defaults_check_everything_that_can_be_sent_secrets_and_oauth_style_servers() {
     let inventory = fixture();
     let prefs = CloudKitPrefs::default();
     assert_eq!(prefs.selection, None);
@@ -103,11 +103,13 @@ fn defaults_check_everything_that_can_be_sent_secrets_and_sign_ins_included() {
     assert!(row(&servers, "github").checked, "secrets are on by default");
     assert!(
         row(&servers, "linear").checked,
-        "sign-ins are on by default"
+        "OAuth-style servers are on by default"
     );
     assert!(row(&servers, "fetch").checked);
     assert!(row(&servers, "github").badges.contains(&Badge::HasSecrets));
-    assert!(row(&servers, "linear").badges.contains(&Badge::SignedIn));
+    assert!(row(&servers, "linear")
+        .badges
+        .contains(&Badge::SignInInCloud));
 
     let plugins = rows(&inventory, &prefs, KitTab::Plugins);
     assert!(row(&plugins, "fmt@market").checked);
@@ -139,7 +141,10 @@ fn badges_use_the_words_of_the_design() {
     assert_eq!(label("github"), ["Works in the cloud", "Has secrets"]);
     assert_eq!(label("fetch"), ["Needs npx on the instance"]);
     assert_eq!(label("mine"), ["Local only - will not work", "Has secrets"]);
-    assert_eq!(label("linear"), ["Works in the cloud", "Signed in (OAuth)"]);
+    assert_eq!(
+        label("linear"),
+        ["Works in the cloud", "Sign in in the cloud"]
+    );
 }
 
 #[test]
@@ -214,7 +219,7 @@ fn the_notice_is_shown_once() {
 fn the_notice_text_is_the_designed_text() {
     assert_eq!(
         NOTICE,
-        "Your MCP secrets and sign-ins will be copied to your cloud workspaces. They will be visible to the agent, to every MCP server and to every command the agent runs there."
+        "Your MCP secrets will be copied to your cloud workspaces. They will be visible to the agent, to every MCP server and to every command the agent runs there. MCP servers that use OAuth sign-in are not copied with a sign-in: sign in to them in the cloud."
     );
 }
 
@@ -384,4 +389,60 @@ fn the_key_note_shows_only_when_the_key_is_unavailable() {
         key_unavailable_note(&inventory),
         Some("Secret change detection is unavailable: the local key could not be used.")
     );
+}
+
+#[test]
+fn kit_sources_never_read_the_keychain_or_claude_credentials() {
+    // D12: the app never reads MCP sign-ins. Every production kit file is scanned (the
+    // `_tests.rs` files are not); the Guard denylist in kit.rs names the credentials file
+    // as a protected path on purpose, and that single exact line is the only allowed hit.
+    let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cloud_sessions");
+    let gpui = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../monocode-gpui/src");
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&core)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            name.starts_with("kit") && name.ends_with(".rs") && !name.ends_with("_tests.rs")
+        })
+        .collect();
+    files.push(gpui.join("cloud_kit_ui.rs"));
+    files.push(gpui.join("settings/pages/cloud.rs"));
+    assert!(files.len() >= 4, "the scan found {files:?}");
+    let allowed = "    \".claude/.credentials.json\",";
+    let forbidden = [
+        "find-generic-password",
+        "\"security\"",
+        "Command::new",
+        "SecItem",
+        "SecKeychain",
+        "security_framework",
+        "get_generic_password",
+        "keyring",
+        "credentials.json",
+        "Library/Keychains",
+    ];
+    for path in files {
+        let text = std::fs::read_to_string(&path).unwrap();
+        let is_guard = path.file_name().unwrap() == "kit.rs";
+        for (ix, line) in text.lines().enumerate() {
+            for needle in forbidden {
+                if !line.contains(needle) {
+                    continue;
+                }
+                let guard_line = is_guard
+                    && ((needle == "credentials.json" && line == allowed)
+                        || (needle == "Library/Keychains"
+                            && line.contains(
+                                "real_root.starts_with(home.join(\"Library/Keychains\"))",
+                            )));
+                assert!(
+                    guard_line,
+                    "{} line {} references {needle}: {line}",
+                    path.display(),
+                    ix + 1
+                );
+            }
+        }
+    }
 }

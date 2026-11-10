@@ -700,7 +700,7 @@ fn the_cloud_page_checks_everything_compatible_and_refuses_local_only_items(
             );
             assert!(
                 selection.contains("mcp:user:linear"),
-                "sign-ins are on by default"
+                "OAuth-style servers are on by default"
             );
         })
         .unwrap();

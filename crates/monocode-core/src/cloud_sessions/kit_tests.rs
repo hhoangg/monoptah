@@ -182,39 +182,91 @@ fn url_classification_table() {
         "${BASE_URL}/mcp",
         "http://100.63.255.255/mcp",
         "http://100.128.0.1/mcp",
-        // The userinfo is "localhost"; the host is evil.com.
-        "http://localhost@evil.com/mcp",
     ];
     for url in public {
-        assert_eq!(compat_one(json!({"type": "sse", "url": url})), Ok, "{url}");
+        assert_eq!(
+            compat_one(json!({"type": "sse", "url": url})),
+            OAuthStyle,
+            "{url}"
+        );
+    }
+    // The userinfo is "localhost"; the host is evil.com, so it is public. The userinfo is a
+    // raw credential, so the server is not OAuth-style.
+    assert_eq!(
+        compat_one(json!({"type": "sse", "url": "http://localhost@evil.com/mcp"})),
+        Ok
+    );
+}
+
+#[test]
+fn raw_credentials_make_a_server_not_oauth_style() {
+    use McpCompat::*;
+    let with_headers = |headers: Value| json!({"type": "http", "url": "https://x.example.com", "headers": headers});
+    let credentialed = [
+        with_headers(json!({"Authorization": "${TOKEN}"})),
+        with_headers(json!({"Proxy-Authorization": "${T}"})),
+        with_headers(json!({"X-API-Key": "${T}"})),
+        with_headers(json!({"api-key": "${T}"})),
+        with_headers(json!({"ApiKey": "${T}"})),
+        with_headers(json!({"X-Auth-Token": "${T}"})),
+        with_headers(json!({"X-Access-Token": "${T}"})),
+        with_headers(json!({"Cookie": "${T}"})),
+        // Any literal header value is a secret found by find_secrets.
+        with_headers(json!({"X-Session": FAKE_HEADER})),
+        json!({"type": "sse", "url": "https://x.example.com/mcp?api_key=abcd1234"}),
+        json!({"type": "http", "url": "https://user:pw@x.example.com/mcp"}),
+        json!({"type": "http", "url": "https://x.example.com/mcp#tok"}),
+        json!({"type": "http", "url": "https://x.example.com", "headersHelper": "get-token.sh"}),
+        json!({"type": "http", "url": "https://x.example.com", "env": {"TOKEN": FAKE_HEADER}}),
+    ];
+    for config in credentialed {
+        assert_eq!(compat_one(config.clone()), Ok, "{config}");
     }
 }
 
 #[test]
-fn authorization_header_skips_the_sign_in_probe() {
-    let env = env();
-    servers_json(
-        &env,
-        json!({
-            "a": {"type": "http", "url": "https://a.example.com", "headers": {"authorization": FAKE_HEADER}},
-            "b": {"type": "http", "url": "https://b.example.com"},
-        }),
-    );
-    let inventory = build_inventory_with(&env.roots, Workspace::Codespace, &|_| Some(true));
-    let compat: Vec<_> = inventory
-        .mcp_servers
-        .iter()
-        .map(|s| (&*s.name, s.compat))
-        .collect();
+fn harmless_headers_do_not_count_as_credentials() {
+    use McpCompat::*;
+    for name in [
+        "Content-Type",
+        "User-Agent",
+        "X-Author",
+        "X-Keycloak-Realm",
+        "X-Monkey",
+    ] {
+        let config =
+            json!({"type": "http", "url": "https://x.example.com", "headers": {name: "${V}"}});
+        assert_eq!(compat_one(config), OAuthStyle, "{name}");
+    }
     assert_eq!(
-        compat,
-        vec![("a", McpCompat::Ok), ("b", McpCompat::SignedIn)]
+        compat_one(json!({"type": "http", "url": "https://b.example.com"})),
+        OAuthStyle
     );
-    let inventory = build_inventory_with(&env.roots, Workspace::Codespace, &|_| Some(false));
-    assert_eq!(inventory.mcp_servers[1].compat, McpCompat::NotSignedIn);
-    // The shipped seam knows nothing yet, so the server stays Ok.
-    let inventory = build_inventory(&env.roots, Workspace::Codespace);
-    assert_eq!(inventory.mcp_servers[1].compat, McpCompat::Ok);
+}
+
+#[test]
+fn a_local_headers_helper_is_local_only_and_a_relative_one_is_not() {
+    use McpCompat::*;
+    let helper =
+        |cmd: &str| json!({"type": "http", "url": "https://x.example.com", "headersHelper": cmd});
+    assert_eq!(
+        compat_one(helper("/Users/me/bin/get-token")),
+        LocalOnly(LocalOnlyReason::AbsoluteCommand)
+    );
+    assert_eq!(compat_one(helper("get-token")), Ok);
+}
+
+#[test]
+fn only_http_and_sse_can_be_oauth_style() {
+    use McpCompat::*;
+    for transport in ["ws", "sdk", "weird"] {
+        let config = json!({"type": transport, "url": "https://x.example.com"});
+        assert_eq!(compat_one(config), Ok, "{transport}");
+    }
+    for transport in ["http", "SSE"] {
+        let config = json!({"type": transport, "url": "https://x.example.com"});
+        assert_eq!(compat_one(config), OAuthStyle, "{transport}");
+    }
 }
 
 #[test]
@@ -852,12 +904,8 @@ fn a_timed_out_scan_is_incomplete_and_never_under_the_cap() {
     fixture(&env);
     let complete = build_inventory(&env.roots, Workspace::Codespace);
     assert!(!complete.incomplete);
-    let timed_out = build_inventory_budgeted(
-        &env.roots,
-        Workspace::Codespace,
-        &|_| None,
-        std::time::Duration::ZERO,
-    );
+    let timed_out =
+        build_inventory_budgeted(&env.roots, Workspace::Codespace, std::time::Duration::ZERO);
     assert!(timed_out.incomplete);
     assert!(timed_out.over_total_cap);
     assert!(timed_out
@@ -1313,12 +1361,8 @@ mod key_file {
         assert!(!inventory.over_total_cap);
 
         skill(&env.roots.claude_home.join("skills"), "s", "x");
-        let timed = build_inventory_budgeted(
-            &env.roots,
-            Workspace::Codespace,
-            &|_| None,
-            std::time::Duration::ZERO,
-        );
+        let timed =
+            build_inventory_budgeted(&env.roots, Workspace::Codespace, std::time::Duration::ZERO);
         assert!(timed.scan_timed_out && timed.incomplete);
         assert!(!timed.key_unavailable);
     }
@@ -1839,12 +1883,8 @@ mod roots {
     fn an_exhausted_budget_before_indexing_marks_the_inventory_incomplete() {
         let env = env();
         write(&env.roots.home.join(".ssh/id"), "fake");
-        let inventory = build_inventory_budgeted(
-            &env.roots,
-            Workspace::Codespace,
-            &signed_in,
-            std::time::Duration::ZERO,
-        );
+        let inventory =
+            build_inventory_budgeted(&env.roots, Workspace::Codespace, std::time::Duration::ZERO);
         assert!(inventory.incomplete);
         let normal = build_inventory(&env.roots, Workspace::Codespace);
         assert!(!normal.incomplete);
