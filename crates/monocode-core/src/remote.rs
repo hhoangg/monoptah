@@ -266,8 +266,19 @@ fn rpc(
     method: &str,
     params: Value,
 ) -> Result<Value, String> {
-    rpc_with(endpoint, token, environment_id, method, params, false)
+    rpc_with(
+        endpoint,
+        token,
+        environment_id,
+        method,
+        params,
+        false,
+        REQUEST_TIMEOUT,
+    )
 }
+
+/// How long one host request may take in total, unless the caller asks for more.
+pub(crate) const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// `closed_is_dead`: a connection reset or closed without a reply also means
 /// the route is gone. Behind a codespace tunnel that is what a stopped host
@@ -279,11 +290,12 @@ fn rpc_with(
     method: &str,
     params: Value,
     closed_is_dead: bool,
+    timeout: std::time::Duration,
 ) -> Result<Value, String> {
     let agent = ureq::AgentBuilder::new()
         .redirects(0)
         .timeout_connect(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(timeout)
         .build();
     let payload = json!({ "version": 1, "environmentId": environment_id, "method": method, "params": params });
     let response = agent
@@ -480,7 +492,20 @@ impl Connections {
         &self,
         machine_id: &str,
         method: &str,
+        params: Value,
+    ) -> Result<Value, String> {
+        self.request_timeout(machine_id, method, params, REQUEST_TIMEOUT)
+    }
+
+    /// Like [`Self::request`] with its own total timeout, for a request the Host holds open
+    /// on purpose (a long-poll). It takes its own connection, so it blocks nothing else, and
+    /// a cloud machine without a live tunnel is never woken for it.
+    pub fn request_timeout(
+        &self,
+        machine_id: &str,
+        method: &str,
         mut params: Value,
+        timeout: std::time::Duration,
     ) -> Result<Value, String> {
         if method == "environment.describe" {
             let values = params
@@ -537,6 +562,7 @@ impl Connections {
             method,
             params,
             cloud,
+            timeout,
         );
         if response
             .as_ref()
@@ -1559,7 +1585,7 @@ else:
                 let _ = stream.read(&mut buffer);
             }
         });
-        let call = |dead| rpc_with(&endpoint, "t", None, "projects.list", json!({}), dead);
+        let call = |dead| rpc_with(&endpoint, "t", None, "projects.list", json!({}), dead, REQUEST_TIMEOUT);
         assert!(call(true)
             .unwrap_err()
             .starts_with("Machine is unreachable"));
