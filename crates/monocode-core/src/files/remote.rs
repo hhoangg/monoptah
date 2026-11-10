@@ -22,11 +22,15 @@ pub fn run_remote_command(command: &str, args: Value) -> Result<Value, String> {
     })
 }
 
-/// Push, pull and sync get the long limit (the Host stops them at 90 s); every other
-/// command keeps the ordinary one.
+/// Push and pull get a long limit (the Host stops each at 90 s). Sync runs a pull and then
+/// a push on the Host, so it gets about twice that. Every other command keeps the ordinary
+/// limit.
 fn command_timeout(command: &str) -> Option<std::time::Duration> {
-    matches!(command, "git_push" | "git_pull" | "git_sync")
-        .then_some(crate::remote::GIT_REMOTE_TIMEOUT)
+    match command {
+        "git_push" | "git_pull" => Some(crate::remote::GIT_REMOTE_TIMEOUT),
+        "git_sync" => Some(crate::remote::GIT_SYNC_TIMEOUT),
+        _ => None,
+    }
 }
 
 fn run_with(
@@ -272,7 +276,7 @@ mod tests {
         for (command, expected) in [
             ("git_push", Some(crate::remote::GIT_REMOTE_TIMEOUT)),
             ("git_pull", Some(crate::remote::GIT_REMOTE_TIMEOUT)),
-            ("git_sync", Some(crate::remote::GIT_REMOTE_TIMEOUT)),
+            ("git_sync", Some(crate::remote::GIT_SYNC_TIMEOUT)),
             ("git_commit", None),
             ("git_diff_index", None),
             ("list_dir", None),
