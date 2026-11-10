@@ -15,6 +15,7 @@ import {
 } from "../src/features/connections/model/protocol";
 import { HostEngine } from "./engine";
 import { writeAttachmentChunk, readAttachmentChunk } from "./attachments";
+import { HostUploads } from "./uploads";
 import type { LinkedWorkItem } from "../src/features/sessions/model/session";
 import { parseGithubWorkItemUrl } from "../src/features/sessions/model/sessionWorkItem";
 import { SyncTransfers } from "./sync-transfer";
@@ -193,6 +194,9 @@ export function createHostServer(
     }
     return catalog;
   };
+  // Sweeps expired staging at startup, on a timer, and on begin/chunk/commit.
+  const uploads = new HostUploads(engine.store.uploadDir);
+  uploads.startSweeper();
   const server = createServer(
     { requestTimeout: 20_000, headersTimeout: 10_000, maxHeaderSize: 8192 },
     async (request, response) => {
@@ -296,6 +300,7 @@ export function createHostServer(
                 "git.action",
                 "attachments.upload",
                 "attachments.read",
+                "uploads",
                 "sessions.draft",
                 "sessions.plan",
                 "workspace.watch",
@@ -422,6 +427,18 @@ export function createHostServer(
             break;
           case "attachments.read":
             result = readAttachmentChunk(engine.store, params);
+            break;
+          case "uploads.begin":
+            result = uploads.begin(params);
+            break;
+          case "uploads.chunk":
+            result = uploads.chunk(params);
+            break;
+          case "uploads.commit":
+            result = uploads.commit(params);
+            break;
+          case "uploads.discard":
+            result = uploads.discard(params);
             break;
           case "devices.revokeSelf":
             // Only the caller's own credential. Sessions and other devices
@@ -648,5 +665,6 @@ export function createHostServer(
   );
   // Shutdown (and tests) close the server: release every change watcher.
   server.on("close", () => workspace.close());
+  server.once("close", () => uploads.stopSweeper());
   return server;
 }

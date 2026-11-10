@@ -4,6 +4,7 @@ pub mod attachments;
 pub mod protocol;
 mod ssh;
 pub mod ssh_askpass;
+pub mod uploads;
 
 pub(crate) use ssh::{
     sandbox_bootstrap_script, shell_quote, validate_sandbox as validate_sandbox_target,
@@ -545,6 +546,10 @@ fn supported_remote_method(method: &str) -> bool {
             | "commands.dispatch"
             | "attachments.upload"
             | "attachments.read"
+            | "uploads.begin"
+            | "uploads.chunk"
+            | "uploads.commit"
+            | "uploads.discard"
             | "devices.revokeSelf"
             | "git.diff"
             | "git.branches"
@@ -1531,6 +1536,10 @@ else:
             "git.worktreeCreate",
             "attachments.upload",
             "attachments.read",
+            "uploads.begin",
+            "uploads.chunk",
+            "uploads.commit",
+            "uploads.discard",
             "files.readBytes",
         ] {
             assert!(supported_remote_method(method), "{method}");
