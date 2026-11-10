@@ -1655,12 +1655,13 @@
               </li>
               <li>
                 Chat, transcript, approvals, files và Git dùng remote session
-                experience hiện có trong phạm vi host hỗ trợ. Lưu ý: với cloud
-                session Codespaces trên <code>main</code>, Explorer/Changes vẫn
-                hiển thị checkout local (banner "Local files - this session runs
-                in codespace ...") và Git write local bị khoá
-                (<code>crates/monocode-gpui/src/git_gate.rs</code>); muốn
-                Files/Git của sandbox là phần việc mới.
+                experience hiện có trong phạm vi host hỗ trợ. Note: for cloud
+                sessions (Codespaces today), Explorer/Changes show the cloud
+                workspace (banner "Cloud files - codespace ..."), with a
+                Cloud / Local switch; Local shows the local checkout and local
+                git writes are refused there
+                (<code>crates/monocode-gpui/src/git_gate.rs</code>). Remote git
+                writes follow the policy of ticket F2-1.
               </li>
             </ul>
           </article>
@@ -3595,8 +3596,8 @@ ERROR: process "/bin/sh -c npm ci" exited with code 1</span></div>
           session Codespaces bù terminal bằng "Open terminal in codespace"
           (<code>gh codespace ssh</code> local, vào thẳng container); với Docker
           <code>ssh &lt;id&gt;@sbx_cloud</code> vào outer sandbox nên cần exec
-          thêm vào devcontainer. Explorer/Changes của cloud session hiện là
-          checkout local (<code>git_gate.rs</code>). V1 dùng capability
+          thêm vào devcontainer. Explorer/Changes of a cloud session show the
+          cloud workspace by default (<code>git_gate.rs</code>, F2-1). V1 dùng capability
           negotiation, không bật control giả. Browser
           preview/port forwarding là workstream riêng nếu muốn đưa vào scope;
           <code>sbx --cloud ports --publish</code> tạo URL public nên không dùng
@@ -3899,13 +3900,14 @@ ERROR: process "/bin/sh -c npm ci" exited with code 1</span></div>
             còn lại là v1.x.
           </li>
           <li>
-            <strong>Files/Git của sandbox.</strong> Cloud session Codespaces
-            hiện giữ Explorer/Changes ở checkout local và khoá Git write
-            (<code>git_gate.rs</code>). Nếu Docker dùng lại nguyên mô hình này,
-            user không xem/commit được thay đổi của agent trong app trước khi
-            archive. Quyết định: chấp nhận cho v1 (review qua transcript +
-            archive bundle/patch) hay nối Explorer/Changes vào host như remote
-            project thường.
+            <strong>Files/Git của sandbox.</strong> Cloud sessions
+            (Codespaces today) show the cloud workspace in Explorer/Changes by
+            default, with a Cloud / Local switch (<code>git_gate.rs</code>,
+            F2-1); git writes are refused only in Local mode. A sandbox reuses
+            the same model once its Host serves the workspace commands. Open decision:
+            whether v1 relies on the transcript plus the archive bundle/patch,
+            or connects Explorer/Changes to the sandbox Host like a normal
+            remote project.
           </li>
           <li>
             <strong>Claude account picker.</strong> Đã chốt dùng account trong
