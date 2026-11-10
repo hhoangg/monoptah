@@ -197,7 +197,9 @@ impl UsageFooter {
     fn refresh_manual(&mut self, cx: &mut Context<Self>) {
         if let Some(center) = crate::accounts::get(cx) {
             let key = self.key.clone();
-            center.update(cx, |center, _| center.request_manual(key));
+            if !center.update(cx, |center, _| center.request_manual(key)) {
+                return;
+            }
         }
         self.refresh(true, cx);
     }
@@ -846,6 +848,13 @@ impl Render for UsageFooter {
             "···".into()
         } else if state.error.as_ref().is_some_and(|e| e.unavailable) {
             "not connected".into()
+        } else if state
+            .error
+            .as_ref()
+            .is_some_and(|e| e.message == usage::claude_probe::IDLE)
+        {
+            // Not an error: a setup token is checked only on request.
+            "refresh to check usage".into()
         } else {
             "usage unavailable".into()
         };
@@ -1081,5 +1090,21 @@ mod tests {
         assert!(state.start());
         assert!(state.fetching);
         assert!(!state.start(), "one click allows one check");
+    }
+    #[test]
+    fn a_click_during_a_fetch_or_cooldown_does_not_probe_again() {
+        let mut state = CachedUsage::default();
+        assert!(state.request_manual());
+        assert!(state.start());
+        // In flight: the click is dropped, nothing is queued.
+        assert!(!state.request_manual());
+        state.complete(Ok(Snapshot::default()));
+        // Within the cooldown the refresh runs, but without the check.
+        assert!(state.request_manual());
+        assert!(!state.start());
+        state.complete(Ok(Snapshot::default()));
+        state.probed = Some(Instant::now() - Duration::from_secs(61));
+        assert!(state.request_manual());
+        assert!(state.start());
     }
 }

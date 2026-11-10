@@ -14,7 +14,7 @@ const URL: &str = "https://api.anthropic.com/v1/messages";
 pub const MODEL: &str = "claude-haiku-4-5";
 /// Last reading, kept beside the account's Claude config. Never holds a secret.
 const CACHE: &str = ".monoptah-usage-probe.json";
-pub(super) const IDLE: &str =
+pub const IDLE: &str =
     "Usage is unavailable automatically for setup tokens. Refresh to check it with one tiny message.";
 
 #[cfg(test)]
@@ -92,6 +92,7 @@ fn status_error(status: u16) -> FetchError {
             "Claude rejected the setup token. Run claude setup-token and save the new one.".into()
         }
         403 => "This setup token is not allowed to check usage.".into(),
+        404 => format!("Claude no longer offers {MODEL} for the usage check. Update Monoptah."),
         429 => "Claude is rate limiting this account. Try again in a few minutes.".into(),
         status => format!("Claude usage check failed ({status})."),
     })
