@@ -18,7 +18,7 @@ import {
   type RemoteProvider,
 } from "../src/features/connections/model/protocol";
 import { providerLaunch, resolveProvider } from "./process";
-import { scrubSecrets } from "./kit";
+import { pinKitArgs, scrubSecrets } from "./kit";
 
 const exec = promisify(execFile);
 const ALLOWED_EXEC_ARGS: readonly (readonly string[])[] = [
@@ -385,6 +385,10 @@ export class HostChildBackend implements ChildBackend {
       },
     );
     this.children.set(id, child);
+    // A kit dir a running child was launched with must outlive a newer apply.
+    const unpin = pinKitArgs(launch.args);
+    child.once("close", unpin);
+    child.once("error", unpin);
     child.stdin.on("error", () => {
       /* write callbacks report failures */
     });

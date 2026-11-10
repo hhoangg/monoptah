@@ -453,7 +453,7 @@ export function createHostServer(
             result = uploads.discard(params);
             break;
           case "kit.apply":
-            result = kit.apply(params);
+            result = await kit.apply(params);
             break;
           case "kit.secrets":
             result = kit.secrets(params);

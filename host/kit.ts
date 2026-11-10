@@ -6,6 +6,7 @@ import {
   fsyncSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   openSync,
   readFileSync,
   readSync,
@@ -16,10 +17,11 @@ import {
   statSync,
   symlinkSync,
   unlinkSync,
+  writeFileSync,
   writeSync,
 } from "node:fs";
 import { execFile } from "node:child_process";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { delimiter, join, resolve, sep } from "node:path";
 import { inspect } from "node:util";
 import {
@@ -69,8 +71,8 @@ export interface KitLimits {
 
 export const DEFAULT_KIT_LIMITS: KitLimits = {
   maxEntries: 50_000,
-  maxTotalBytes: 512 * 1024 * 1024,
-  maxFileBytes: 256 * 1024 * 1024,
+  maxTotalBytes: 128 * 1024 * 1024,
+  maxFileBytes: 64 * 1024 * 1024,
   maxPathBytes: 512,
   maxSegmentBytes: 255,
   maxDepth: 24,
@@ -81,17 +83,32 @@ export const DEFAULT_KIT_LIMITS: KitLimits = {
 
 let secretValues: string[] = [];
 
+/** Shorter forms would mangle ordinary text, so line and URL forms need more. */
+const MIN_DERIVED_SCRUB_LENGTH = 6;
+
 function setScrubValues(values: Iterable<string>): void {
   const forms = new Set<string>();
+  const add = (form: string, min: number) => {
+    if (form.length >= min) forms.add(form);
+  };
   for (const value of values) {
-    if (value.length < MIN_SCRUB_LENGTH) continue;
-    forms.add(value);
-    // Also the JSON-escaped form, which is how an object dump would show it.
-    forms.add(JSON.stringify(value).slice(1, -1));
+    add(value, MIN_SCRUB_LENGTH);
+    // The JSON-escaped form is how an object dump would show it.
+    add(JSON.stringify(value).slice(1, -1), MIN_SCRUB_LENGTH);
+    add(encodeURIComponent(value), MIN_DERIVED_SCRUB_LENGTH);
+    if (/[\r\n]/.test(value)) {
+      // Output is read line by line, so each line of a multi-line value
+      // (a PEM key, for example) is scrubbed on its own as well.
+      add(value.replace(/\r\n/g, "\n"), MIN_SCRUB_LENGTH);
+      for (const line of value.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        // Armor lines are the same for every key and say nothing secret.
+        if (trimmed.startsWith("-----")) continue;
+        add(trimmed, MIN_DERIVED_SCRUB_LENGTH);
+      }
+    }
   }
-  secretValues = [...forms]
-    .filter((value) => value.length >= MIN_SCRUB_LENGTH)
-    .sort((a, b) => b.length - a.length);
+  secretValues = [...forms].sort((a, b) => b.length - a.length);
 }
 
 /** Replaces every known kit secret value in `text`. */
@@ -140,6 +157,32 @@ export function installLogScrubber(): () => void {
   return () => {
     for (const [method, original] of originals) console[method] = original;
     logScrubberInstalled = false;
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Kit dirs a running child still references are never pruned.
+
+const pinned = new Map<string, number>();
+const KIT_HASH_IN_PATH = /\.monoptah-kit[\\/]([0-9a-f]{64})[\\/]/;
+
+/** Pins the kit dirs named in a child's argv. Call the result when it exits. */
+export function pinKitArgs(args: readonly string[]): () => void {
+  const hashes = new Set<string>();
+  for (const arg of args) {
+    const match = KIT_HASH_IN_PATH.exec(arg);
+    if (match) hashes.add(match[1]);
+  }
+  for (const hash of hashes) pinned.set(hash, (pinned.get(hash) ?? 0) + 1);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    for (const hash of hashes) {
+      const left = (pinned.get(hash) ?? 1) - 1;
+      if (left <= 0) pinned.delete(hash);
+      else pinned.set(hash, left);
+    }
   };
 }
 
@@ -344,12 +387,15 @@ function checkMagic(fd: number): void {
     throw new Error("Compressed archives are not accepted; send a plain tar");
 }
 
+const YIELD_BYTES = 4 * 1024 * 1024;
+const yieldToLoop = () => new Promise<void>((done) => setImmediate(done));
+
 /** Unpacks into `dir`, which must be a fresh directory. */
-export function unpackKitTar(
+export async function unpackKitTar(
   archive: string,
   dir: string,
   limits: KitLimits = DEFAULT_KIT_LIMITS,
-): void {
+): Promise<void> {
   const fd = openSync(archive, "r");
   try {
     checkMagic(fd);
@@ -369,6 +415,8 @@ export function unpackKitTar(
         mkdirSync(target, { recursive: true, mode: 0o700 });
         continue;
       }
+      // Let other Host streams run between files and every few megabytes.
+      await yieldToLoop();
       mkdirSync(join(target, ".."), { recursive: true, mode: 0o700 });
       // "wx" is O_CREAT|O_EXCL: it never follows a link or replaces a file.
       const out = openSync(target, "wx", entry.executable ? 0o700 : 0o600);
@@ -382,6 +430,7 @@ export function unpackKitTar(
           while (written < n)
             written += writeSync(out, buffer, written, n - written);
           done += n;
+          if ((done & (YIELD_BYTES - 1)) < n) await yieldToLoop();
         }
       } finally {
         closeSync(out);
@@ -398,6 +447,8 @@ export function unpackKitTar(
 interface Managed {
   version: 1;
   hash: string;
+  /** The kit applied before this one, kept on disk for racing readers. */
+  previous?: string;
   skills: string[];
   plugins: string[];
 }
@@ -431,6 +482,8 @@ export interface HostKitOptions {
   pathDirs?: string[];
   resolveClaude?: () => Promise<string>;
   run?: KitRun;
+  /** Test seam for failure injection. */
+  symlink?: typeof symlinkSync;
 }
 
 const defaultRun: KitRun = async (command, args, options) => {
@@ -464,6 +517,7 @@ export class HostKit {
   private readonly skillsDir: string;
   private readonly limits: KitLimits;
   private cache: { kit: ClaudeKit | undefined } | undefined;
+  private queue: Promise<unknown> = Promise.resolve();
 
   constructor(
     private readonly uploads: { committedPath(uploadId: unknown): string },
@@ -602,50 +656,85 @@ export class HostKit {
     }
   }
 
-  apply(params: Record<string, unknown>): KitApplyResult {
+  /** Applies run one at a time so two of them never race on `current`. */
+  apply(params: Record<string, unknown>): Promise<KitApplyResult> {
+    const run = this.queue.then(() => this.applyNow(params));
+    this.queue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private async applyNow(
+    params: Record<string, unknown>,
+  ): Promise<KitApplyResult> {
     const hash = validateHash(params.hash);
     const archive = this.uploads.committedPath(params.uploadId);
     this.ensureRoot();
     const dir = join(this.root, hash);
-    let complete = false;
+    // Always unpack the uploaded archive into a fresh dir: an existing
+    // <hash> dir is never trusted, so "Update Claude setup" repairs a
+    // tampered one.
+    const fresh = join(this.root, `.unpack-${randomBytes(8).toString("hex")}`);
+    // mkdir without `recursive` fails if the path exists: O_EXCL semantics.
+    mkdirSync(fresh, { mode: 0o700 });
     try {
-      complete = lstatSync(dir).isDirectory() && existsSync(join(dir, COMPLETE));
-    } catch {
-      /* not there yet */
+      await unpackKitTar(archive, fresh, this.limits);
+      this.checkJson(fresh);
+      closeSync(openSync(join(fresh, COMPLETE), "wx", 0o600));
+    } catch (error) {
+      rmSync(fresh, { recursive: true, force: true });
+      throw error;
     }
-    if (!complete) {
-      // A leftover without the marker is a failed earlier attempt of ours.
-      rmSync(dir, { recursive: true, force: true });
-      // mkdir without `recursive` fails if the path exists: O_EXCL semantics.
-      mkdirSync(dir, { mode: 0o700 });
-      try {
-        unpackKitTar(archive, dir, this.limits);
-        this.checkJson(dir);
-        closeSync(openSync(join(dir, COMPLETE), "wx", 0o600));
-      } catch (error) {
-        rmSync(dir, { recursive: true, force: true });
-        throw error;
+    let quarantined: string | undefined;
+    try {
+      if (existsSync(dir)) {
+        quarantined = join(this.root, `.old-${randomBytes(8).toString("hex")}`);
+        renameSync(dir, quarantined);
       }
+      renameSync(fresh, dir);
+    } catch (error) {
+      if (quarantined && !existsSync(dir)) renameSync(quarantined, dir);
+      rmSync(fresh, { recursive: true, force: true });
+      throw error;
     }
+    if (quarantined) rmSync(quarantined, { recursive: true, force: true });
 
     const skills = this.list(join(dir, "skills"));
     const plugins = this.list(join(dir, "plugins"));
     const mcp = existsSync(join(dir, "mcp.json"));
-    this.flipCurrent(hash);
-    const links = this.reconcileSkills(skills);
-    this.writeAtomic(
-      this.managedPath(),
-      JSON.stringify({
-        version: 1,
-        hash,
-        skills: links.linked,
-        plugins,
-      } satisfies Managed),
-    );
-    // Older unpacked kits are managed dirs this module created earlier.
-    for (const entry of readdirSync(this.root))
-      if (HASH.test(entry) && entry !== hash)
+    const before = this.readManaged();
+    const previous = before && before.hash !== hash ? before.hash : before?.previous;
+    const links = this.linkSkills(skills);
+    let removed: string[];
+    try {
+      this.flipCurrent(hash);
+      removed = this.unlinkDropped(before?.skills ?? [], skills);
+      this.writeAtomic(
+        this.managedPath(),
+        JSON.stringify({
+          version: 1,
+          hash,
+          previous,
+          skills: links.linked,
+          plugins,
+        } satisfies Managed),
+      );
+    } catch (error) {
+      this.rollbackLinks(links.created);
+      throw error;
+    }
+    // Keep this kit and the one before it: a Claude start that read the old
+    // paths just before this apply must still find them. Dirs a running child
+    // references are never removed either.
+    const keep = new Set([hash, previous]);
+    for (const entry of readdirSync(this.root)) {
+      if (HASH.test(entry) && !keep.has(entry) && !pinned.has(entry))
         rmSync(join(this.root, entry), { recursive: true, force: true });
+      else if (/^\.(old|unpack|current)-/.test(entry) && entry !== "current")
+        rmSync(join(this.root, entry), { recursive: true, force: true });
+    }
     this.cache = undefined;
     return {
       hash,
@@ -654,7 +743,7 @@ export class HostKit {
       mcp,
       linked: links.linked,
       skipped: links.skipped,
-      removed: links.removed,
+      removed,
       warnings: links.skipped.map(
         (name) =>
           `Skill "${name}" already exists on this host; the remote copy was kept`,
@@ -689,13 +778,58 @@ export class HostKit {
       throw new Error("kit.json must be an object");
   }
 
-  /** Links new skills, removes managed links the new kit dropped. */
-  private reconcileSkills(skills: string[]): {
+  /**
+   * Links the kit's skills. Only links created here are in `created`, so a
+   * failure can undo exactly those and nothing else.
+   */
+  private linkSkills(skills: string[]): {
     linked: string[];
     skipped: string[];
-    removed: string[];
+    created: string[];
   } {
-    const previous = this.readManaged()?.skills ?? [];
+    mkdirSync(this.skillsDir, { recursive: true });
+    const linked: string[] = [];
+    const skipped: string[] = [];
+    const created: string[] = [];
+    const symlink = this.options.symlink ?? symlinkSync;
+    try {
+      for (const name of skills) {
+        const link = join(this.skillsDir, name);
+        let exists = true;
+        try {
+          lstatSync(link);
+        } catch {
+          exists = false;
+        }
+        if (!exists) {
+          symlink(
+            this.skillTarget(name),
+            link,
+            process.platform === "win32" ? "junction" : undefined,
+          );
+          created.push(link);
+          linked.push(name);
+        } else if (this.isOurLink(link, name)) {
+          linked.push(name);
+        } else {
+          // A real skill, a directory or a foreign link: the remote one wins.
+          skipped.push(name);
+        }
+      }
+    } catch (error) {
+      this.rollbackLinks(created);
+      throw error;
+    }
+    return { linked, skipped, created };
+  }
+
+  private rollbackLinks(created: string[]): void {
+    for (const link of created) rmSync(link, { force: true });
+    created.length = 0;
+  }
+
+  /** Removes managed links the new kit no longer has. */
+  private unlinkDropped(previous: string[], skills: string[]): string[] {
     const removed: string[] = [];
     for (const name of previous) {
       if (skills.includes(name)) continue;
@@ -705,32 +839,7 @@ export class HostKit {
         removed.push(name);
       }
     }
-    mkdirSync(this.skillsDir, { recursive: true });
-    const linked: string[] = [];
-    const skipped: string[] = [];
-    for (const name of skills) {
-      const link = join(this.skillsDir, name);
-      let exists = true;
-      try {
-        lstatSync(link);
-      } catch {
-        exists = false;
-      }
-      if (!exists) {
-        symlinkSync(
-          this.skillTarget(name),
-          link,
-          process.platform === "win32" ? "junction" : undefined,
-        );
-        linked.push(name);
-      } else if (this.isOurLink(link, name)) {
-        linked.push(name);
-      } else {
-        // A real skill, a directory or a foreign link: the remote one wins.
-        skipped.push(name);
-      }
-    }
-    return { linked, skipped, removed };
+    return removed;
   }
 
   private isOurLink(link: string, name: string): boolean {
@@ -803,13 +912,15 @@ export class HostKit {
     } catch {
       /* no secrets */
     }
-    const current = join(this.root, "current");
-    const mcp = join(current, "mcp.json");
+    // Hash paths, not `current`: a started Claude keeps seeing the kit it was
+    // launched with until it respawns.
+    const base = join(this.root, hash);
+    const mcp = join(base, "mcp.json");
     return {
       hash,
       secretsHash: this.hashOf(secretsData),
       pluginDirs: this.list(join(this.root, hash, "plugins")).map((id) =>
-        join(current, "plugins", id),
+        join(base, "plugins", id),
       ),
       mcpConfig: existsSync(join(this.root, hash, "mcp.json"))
         ? mcp
@@ -860,39 +971,59 @@ export class HostKit {
   }
 
   /**
-   * Runs `claude mcp list` in `cwd` with the kit's MCP config and secrets.
+   * Runs `claude mcp list` once in `cwd`. Claude Code has no flag that adds an
+   * MCP config to `mcp list` (`--mcp-config` is rejected there), so the kit's
+   * servers are supplied as the user-scope config of a throwaway
+   * CLAUDE_CONFIG_DIR. That run therefore checks the kit's servers, with the
+   * kit secrets in its env. With no kit MCP config it checks the host's own.
    * Returns the raw output (scrubbed); the app parses it.
    */
   async health(cwd: string): Promise<{
     exitCode: number;
     stdout: string;
     stderr: string;
-    kitFlags: boolean;
+    kitServers: boolean;
   }> {
-    if (typeof cwd !== "string" || cwd.includes("\0") || !statSync(cwd).isDirectory())
+    if (
+      typeof cwd !== "string" ||
+      cwd.includes("\0") ||
+      !statSync(cwd).isDirectory()
+    )
       throw new Error("Invalid working directory");
-    const claude = await (this.options.resolveClaude ?? (async () => {
-      throw new Error("Claude is not available on this host");
-    }))();
+    const claude = await (
+      this.options.resolveClaude ??
+      (async () => {
+        throw new Error("Claude is not available on this host");
+      })
+    )();
     const run = this.options.run ?? defaultRun;
     const kit = this.current();
-    const env = { ...process.env, ...(kit?.env ?? {}) };
-    const withKit = kit?.mcpConfig
-      ? ["mcp", "list", "--mcp-config", kit.mcpConfig]
-      : undefined;
-    let kitFlags = withKit !== undefined;
-    let result = await run(claude, withKit ?? ["mcp", "list"], { cwd, env });
-    if (withKit && result.code !== 0) {
-      // Older Claude builds may not take the flag on `mcp list`.
-      kitFlags = false;
-      result = await run(claude, ["mcp", "list"], { cwd, env });
+    const env: NodeJS.ProcessEnv = { ...process.env, ...(kit?.env ?? {}) };
+    let configDir: string | undefined;
+    try {
+      if (kit?.mcpConfig) {
+        const mcp = JSON.parse(readFileSync(kit.mcpConfig, "utf8")) as {
+          mcpServers: Record<string, unknown>;
+        };
+        configDir = mkdtempSync(join(tmpdir(), "monoptah-kit-health-"));
+        chmodSync(configDir, 0o700);
+        writeFileSync(
+          join(configDir, ".claude.json"),
+          JSON.stringify({ mcpServers: mcp.mcpServers }),
+          { mode: 0o600 },
+        );
+        env.CLAUDE_CONFIG_DIR = configDir;
+      }
+      const result = await run(claude, ["mcp", "list"], { cwd, env });
+      return {
+        exitCode: result.code,
+        stdout: this.scrub(result.stdout),
+        stderr: this.scrub(result.stderr),
+        kitServers: configDir !== undefined,
+      };
+    } finally {
+      if (configDir) rmSync(configDir, { recursive: true, force: true });
     }
-    return {
-      exitCode: result.code,
-      stdout: this.scrub(result.stdout),
-      stderr: this.scrub(result.stderr),
-      kitFlags,
-    };
   }
 
   /** Hash pair used by tests and by callers that need the settings key. */

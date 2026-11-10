@@ -331,3 +331,38 @@ setInterval(() => {}, 1000);
     rmSync(directory, { recursive: true, force: true });
   }
 }, 15_000);
+
+it("scrubs a multi-line secret from child stderr line by line", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "monocode-kit-pem-"));
+  const file = join(directory, "provider.cjs");
+  const pem = "-----BEGIN KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSj\nAbCdEfGhIjKlMnOpQrStUvWxYz0123456789==\n-----END KEY-----";
+  writeFileSync(
+    file,
+    `process.stderr.write(process.env.MONOPTAH_KIT_PEM + '\\n');
+process.stderr.write('enc=' + encodeURIComponent(process.env.MONOPTAH_KIT_PEM) + '\\n');
+process.stderr.write('ordinary line\\n');
+setInterval(() => {}, 1000);
+`,
+  );
+  const backend = new HostChildBackend();
+  const err: string[] = [];
+  const stopErr = await backend.listen<{ line: string }>("harness-stderr", ({ payload }) => err.push(payload.line));
+  const { HostKit } = await import("./kit");
+  try {
+    new HostKit({ committedPath: () => "" }, { home: directory }).secrets({ values: { MONOPTAH_KIT_PEM: pem } });
+    await backend.invoke("harness_spawn", {
+      sessionId: "pem", command: file, args: [], cwd: directory, binaryProvider: "claude", env: { MONOPTAH_KIT_PEM: pem },
+    });
+    await vi.waitFor(() => expect(err).toContain("ordinary line"));
+    const text = err.join("\n");
+    expect(text).not.toContain("MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSj");
+    expect(text).not.toContain("AbCdEfGhIjKlMnOpQrStUvWxYz0123456789==");
+    expect(text).not.toContain(encodeURIComponent(pem));
+    expect(text).toContain("[redacted]");
+    await backend.kill("pem");
+  } finally {
+    stopErr();
+    await backend.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+}, 15_000);
