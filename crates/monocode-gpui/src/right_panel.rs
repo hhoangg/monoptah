@@ -256,7 +256,13 @@ impl Render for ProjectTabs {
     }
 }
 
+/// Whether the Git status or the file tree is on screen.
+fn status_visible(shown: bool, tab: RightTab) -> bool {
+    shown && matches!(tab, RightTab::Files | RightTab::Changes)
+}
+
 pub(crate) struct RightPanel {
+    git: Entity<ProjectGit>,
     pub tabs: Entity<ProjectTabs>,
     pub explorer: Entity<Explorer>,
     pub changes: Entity<Changes>,
@@ -312,7 +318,8 @@ impl RightPanel {
             panel: panel.downgrade(),
             _subscription: cx.observe(&panel, |_, _, cx| cx.notify()),
         });
-        Self {
+        let mut panel = Self {
+            git,
             tabs,
             focus: cx.focus_handle(),
             explorer,
@@ -333,7 +340,9 @@ impl RightPanel {
             skip_click: false,
             tab_bounds: (0..4).map(|_| Default::default()).collect(),
             _subscriptions: subscriptions,
-        }
+        };
+        panel.sync_panes(cx);
+        panel
     }
     pub(crate) fn set_cloud_chrome(&mut self, chrome: Option<Chrome>, cx: &mut Context<Self>) {
         if self.cloud != chrome {
@@ -435,6 +444,11 @@ impl RightPanel {
             Some(tab) => (true, tab),
             None => (self.shown, self.tab),
         };
+        // Cloud workspaces are watched only while Files or Changes is on screen, in the panel or
+        // in the classic layout's sidebar.
+        let visible = status_visible(shown, tab);
+        self.git
+            .update(cx, |git, cx| git.set_panel_visible(visible, cx));
         self.explorer.update(cx, |e, cx| {
             e.set_enabled(shown && tab == RightTab::Files, cx)
         });
@@ -974,5 +988,61 @@ mod tests {
         panel.update(visual, |panel, cx| {
             assert!(!panel.explorer.read(cx).is_read_only())
         });
+    }
+
+    #[gpui::test]
+    fn the_git_status_is_watched_only_while_files_or_changes_is_on_screen(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut parts = None;
+        cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                let git = cx.new(|cx| ProjectGit::new("~".into(), cx));
+                let panel =
+                    cx.new(|cx| RightPanel::new(git.clone(), RightTab::Files, vec![], window, cx));
+                parts = Some((git, panel.clone()));
+                cx.new(|_| ClassicProbe(panel))
+            })
+            .unwrap()
+        });
+        let (git, panel) = parts.unwrap();
+        let visible =
+            |cx: &mut gpui::TestAppContext| git.update(cx, |g, _| g.panel_visible_for_test());
+        // Closed: nothing is on screen.
+        assert!(!visible(cx));
+        // The right panel (modern layout).
+        panel.update(cx, |p, cx| p.set_shown(true, cx));
+        assert!(visible(cx));
+        panel.update(cx, |p, cx| p.select(RightTab::Changes, cx));
+        assert!(visible(cx));
+        // Open on the terminal or the codespace tab: a long-poll would serve nothing.
+        panel.update(cx, |p, cx| p.select(RightTab::Terminal, cx));
+        assert!(!visible(cx));
+        panel.update(cx, |p, cx| p.select(RightTab::Codespace, cx));
+        assert!(!visible(cx));
+        panel.update(cx, |p, cx| p.select(RightTab::Graph, cx));
+        assert!(!visible(cx));
+        // The classic layout: the panel is closed, the left sidebar shows Files or Changes.
+        panel.update(cx, |p, cx| {
+            p.set_shown(false, cx);
+            p.select(RightTab::Files, cx);
+        });
+        assert!(!visible(cx));
+        panel.update(cx, |p, cx| p.set_sidebar_tab(Some(RightTab::Files), cx));
+        assert!(visible(cx));
+        panel.update(cx, |p, cx| p.set_sidebar_tab(Some(RightTab::Changes), cx));
+        assert!(visible(cx));
+        panel.update(cx, |p, cx| p.set_sidebar_tab(None, cx));
+        assert!(!visible(cx));
+    }
+
+    #[test]
+    fn only_files_and_changes_count_as_the_status_being_on_screen() {
+        assert!(status_visible(true, RightTab::Files));
+        assert!(status_visible(true, RightTab::Changes));
+        for tab in [RightTab::Graph, RightTab::Terminal, RightTab::Codespace] {
+            assert!(!status_visible(true, tab));
+        }
+        assert!(!status_visible(false, RightTab::Files));
     }
 }

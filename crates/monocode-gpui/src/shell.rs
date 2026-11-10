@@ -9200,7 +9200,6 @@ impl Render for Shell {
         let window_active = self.window_active;
         self.git.update(cx, |git, cx| {
             git.set_window_active(window_active, cx);
-            git.set_panel_visible(right_shown, cx);
             git.set_polling(poll_git && git.available(), cx)
         });
         self.sync_cloud_panel(cx);
