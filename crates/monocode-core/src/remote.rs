@@ -47,6 +47,9 @@ pub struct Connections {
     drain_override: Mutex<Option<std::time::Duration>>,
     /// Machine id to the tunnel its last Host upgrade pass ran on (once per connect).
     upgrade_passes: Mutex<HashMap<String, u64>>,
+    /// Machine id to the warning of its last Host upgrade that failed (memory only; cleared by
+    /// the next pass that does not fail).
+    upgrade_failures: Mutex<HashMap<String, String>>,
     /// How the Host upgrade reaches a machine (replaced in tests).
     runner: Mutex<Arc<dyn cloud_upgrade::CloudRunner>>,
 }
@@ -75,6 +78,7 @@ impl Connections {
             #[cfg(test)]
             drain_override: Mutex::new(None),
             upgrade_passes: Mutex::new(HashMap::new()),
+            upgrade_failures: Mutex::new(HashMap::new()),
             runner: Mutex::new(Arc::new(cloud_upgrade::SshRunner)),
         }
     }

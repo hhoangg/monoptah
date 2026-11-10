@@ -288,9 +288,11 @@ step.** The fork ships its own Host precisely so that every cloud Host has
      - Only files over 500 MB ask first (`CONFIRM_BYTES`).
    - **The rare Host without `files.readBytes`.** After H2b this only happens in two
      cases, and neither falls back to a copy:
-     - **The upgrade is deferred because a turn is running.** The card says "Monoptah Host
-       is updating after the current turn - the file opens then". The open is **queued**
-       and runs by itself once the deferred upgrade finishes.
+     - **The upgrade is deferred because a turn is running.** The card says "<file> opens
+       after the Host update. Monoptah Host X will be installed the next time this
+       workspace connects". The open is **queued** (the latest click per session) and runs
+       by itself at the next connect that finishes the update. It does not run when the
+       turn ends: the upgrade only runs on a connect.
      - **The upgrade download is blocked** (a sandbox network policy blocking
        `github.com` / `objects.githubusercontent.com`). The card names the blocked host
        and the `sbx policy allow` fix. Nothing else is offered.
@@ -320,8 +322,8 @@ step.** The fork ships its own Host precisely so that every cloud Host has
 ### 1.5 UI changes
 
 - Chat file card: no Download card any more. Large files show streaming progress and then
-  open. A Host that cannot have `files.readBytes` yet gets the "opens after the current
-  turn" or "update blocked by network policy" card (F1-4).
+  open. A Host that cannot have `files.readBytes` yet gets the "opens after the Host
+  update (next connect)" or "update blocked by network policy" card (F1-4).
 - Cloud panel status line: "Updating Monoptah Host…" during an upgrade, or the deferred
   message.
 - Settings > Connections already shows an upgrade action for SSH machines. It now also
