@@ -1328,6 +1328,7 @@ impl gpui::Render for FileEditor {
                     d.child(
                         div()
                             .id("open-file-externally")
+                            .debug_selector(|| "open-file-externally".into())
                             .role(Role::Button)
                             .aria_label("Open externally")
                             .px_3()
@@ -1369,6 +1370,7 @@ impl gpui::Render for FileEditor {
                                 d.child(
                                     div()
                                         .id("reveal-file")
+                                        .debug_selector(|| "reveal-file".into())
                                         .role(Role::Button)
                                         .aria_label("Reveal")
                                         .px_3()

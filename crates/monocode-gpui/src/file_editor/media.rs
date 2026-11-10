@@ -494,6 +494,7 @@ impl gpui::Render for MediaPreview {
                             d.child(
                                 div()
                                     .id("open-video-externally")
+                                    .debug_selector(|| "open-video-externally".into())
                                     .role(Role::Button)
                                     .aria_label("Open externally")
                                     .px_3()
@@ -517,6 +518,7 @@ impl gpui::Render for MediaPreview {
                             d.child(
                                 div()
                                     .id("reveal-video")
+                                    .debug_selector(|| "reveal-video".into())
                                     .role(Role::Button)
                                     .aria_label("Reveal")
                                     .px_3()
@@ -707,5 +709,46 @@ mod tests {
             .unwrap();
         assert_eq!(file_size(1024), "1.0 KB");
         assert_eq!(file_size(24 * 1024), "24 KB");
+    }
+
+    /// A failed video on another machine offers neither Open externally nor Reveal: both act on
+    /// this machine's disk.
+    #[gpui::test]
+    fn a_failed_remote_video_hides_open_externally_and_reveal(cx: &mut TestAppContext) {
+        let mut shown = Vec::new();
+        for path in [
+            "/tmp/clip.mp4",
+            "remote://env-octo-abc/workspaces/widgets/clip.mp4",
+        ] {
+            let window = cx.update(|cx| {
+                cx.open_window(Default::default(), |_, cx| {
+                    cx.new(|cx| {
+                        let mut preview = MediaPreview::image(
+                            path.into(),
+                            Arc::new(Image::from_bytes(
+                                ImageFormat::Png,
+                                include_bytes!("../../assets/monocode.png").to_vec(),
+                            )),
+                            8,
+                            8,
+                            64,
+                            "mp4",
+                            cx,
+                        );
+                        preview.image = None;
+                        preview.failed = true;
+                        preview
+                    })
+                })
+                .unwrap()
+            });
+            let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+            visual.refresh().unwrap();
+            shown.push((
+                visual.debug_bounds("open-video-externally").is_some(),
+                visual.debug_bounds("reveal-video").is_some(),
+            ));
+        }
+        assert_eq!(shown, [(true, true), (false, false)]);
     }
 }
