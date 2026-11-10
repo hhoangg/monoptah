@@ -2,20 +2,21 @@
 use super::*;
 
 impl Shell {
-    pub(super) fn classic_surface_open(&self, cx: &App) -> bool {
+    /// A Classic page that replaces the workspace and has no chat composer:
+    /// settings, an application view or the search page.
+    fn classic_page_open(&self) -> bool {
         self.workspace.classic_layout
-            && (self.settings.is_some()
-                || self.app_view_open()
-                || self.search_page()
-                || self.mono_active(cx))
+            && (self.settings.is_some() || self.app_view_open() || self.search_page())
+    }
+
+    pub(super) fn classic_surface_open(&self, cx: &App) -> bool {
+        self.classic_page_open() || (self.workspace.classic_layout && self.mono_active(cx))
     }
 
     /// The usage/terminal footer sits under every chat composer, so a Mono
-    /// chat keeps it like a session does; settings, app views and search hide it.
+    /// chat keeps it like a session does; Classic pages hide it.
     pub(super) fn classic_footer_shown(&self) -> bool {
-        // Same as classic_surface_open, minus the Mono chat.
-        !self.workspace.classic_layout
-            || (self.settings.is_none() && !self.app_view_open() && !self.search_page())
+        !self.classic_page_open()
     }
 
     pub(super) fn session_sidebar_available(&self, cx: &App) -> bool {
