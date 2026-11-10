@@ -68,6 +68,12 @@ pub const SCAN_BUDGET: Duration = Duration::from_secs(20);
 #[derive(Clone, PartialEq, Eq)]
 pub struct Secret(String);
 
+impl Drop for Secret {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
 impl Secret {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
@@ -124,6 +130,15 @@ pub enum SkillScope {
     Plugin,
 }
 
+/// One regular file of a skill or plugin as the scan saw it: its canonical path and, where
+/// the platform has them, the device and inode. The tar builder opens exactly these, after
+/// checking each is still the same plain file (design 3.7).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct KitFile {
+    pub path: PathBuf,
+    pub id: Option<(u64, u64)>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KitSkill {
     pub name: String,
@@ -137,6 +152,8 @@ pub struct KitSkill {
     /// Gzip size of the files; 0 when excluded.
     pub compressed: u64,
     pub exclusion: Option<Exclusion>,
+    /// The files the scan found, sorted by path. Empty when excluded.
+    pub files: Vec<KitFile>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -233,6 +250,8 @@ pub struct KitPlugin {
     /// Gzip size of the files; 0 when excluded.
     pub compressed: u64,
     pub exclusion: Option<Exclusion>,
+    /// The files the scan found, sorted by path. Empty when excluded.
+    pub files: Vec<KitFile>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -255,6 +274,9 @@ pub struct KitInventory {
     /// The local key was unavailable, so secrets are not in the digests (a subset of
     /// `incomplete`). A rescan would not change that, so it does not block caching.
     pub key_unavailable: bool,
+    /// The credential index was cut short, so a hard link to a credentials file could have
+    /// gone unseen (a subset of `incomplete`). The tar builder then sends no files.
+    pub file_index_incomplete: bool,
     /// Same inputs, same hash. Covers names, scopes, sources, file contents and server
     /// configs with secret values masked, so it is comparable across installs. For
     /// change detection that includes the secrets use [`KitInventory::change_token`].
@@ -281,6 +303,13 @@ impl KitInventory {
 /// An HMAC-SHA256 hex digest. It never appears in `Debug` output.
 #[derive(Clone, PartialEq, Eq)]
 pub struct KeyedDigest(String);
+
+impl KeyedDigest {
+    /// Mixes the digest into `hasher`, for tokens that must change with the secrets.
+    pub(super) fn update(&self, hasher: &mut Sha256) {
+        hasher.update(self.0.as_bytes());
+    }
+}
 
 #[cfg(test)]
 impl KeyedDigest {
@@ -431,6 +460,7 @@ pub fn build_inventory_budgeted(
     inventory.scan_timed_out = timed_out;
     inventory.key_unavailable = key_missing;
     // A credential index cut short means a hard link to a credential file could be missed.
+    inventory.file_index_incomplete = !guard.index_complete;
     inventory.incomplete = timed_out || key_missing || !guard.index_complete;
     inventory.total_compressed = total_compressed(&inventory);
     // A timed-out item has no size, so the total is only a lower bound: report over-cap.
@@ -486,7 +516,7 @@ struct Clock<'a> {
 }
 
 struct Scan {
-    files: Vec<PathBuf>,
+    files: Vec<KitFile>,
     size: u64,
     has_native: bool,
     exclusion: Option<Exclusion>,
@@ -922,7 +952,10 @@ fn walk(
             if path.extension().is_some_and(|ext| ext == "node") {
                 scan.has_native = true;
             }
-            scan.files.push(path);
+            scan.files.push(KitFile {
+                id: file_id(&meta),
+                path,
+            });
         }
     }
 }
@@ -976,12 +1009,13 @@ impl Write for CountingSink {
 }
 
 /// SHA-256 over the files (relative path and bytes) and their gzip size, in one read.
-fn digest_files(root: &Path, files: &[PathBuf]) -> (String, u64) {
+fn digest_files(root: &Path, files: &[KitFile]) -> (String, u64) {
     let real_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let mut hasher = Sha256::new();
     let mut gzip = flate2::write::GzEncoder::new(CountingSink(0), flate2::Compression::fast());
     let mut buffer = vec![0u8; 64 * 1024];
     for file in files {
+        let file = &file.path;
         let relative = file.strip_prefix(&real_root).unwrap_or(file);
         hasher.update(relative.to_string_lossy().as_bytes());
         hasher.update([0]);
@@ -1001,11 +1035,11 @@ fn digest_files(root: &Path, files: &[PathBuf]) -> (String, u64) {
     (hex(&hasher.finalize()), compressed)
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(super) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn digest_str(parts: &[&str]) -> String {
+pub(super) fn digest_str(parts: &[&str]) -> String {
     let mut hasher = Sha256::new();
     for part in parts {
         hasher.update(part.as_bytes());
@@ -1033,7 +1067,13 @@ fn skill_from_dir(
     } else {
         (String::new(), 0)
     };
+    let files = if scan.exclusion.is_none() {
+        scan.files
+    } else {
+        Vec::new()
+    };
     KitSkill {
+        files,
         compressed,
         name: name.to_string(),
         scope,
@@ -1223,6 +1263,11 @@ fn collect_plugins(
             has_native_bin: scan.has_native,
             hash,
             exclusion: scan.exclusion,
+            files: if scan.exclusion.is_none() {
+                scan.files
+            } else {
+                Vec::new()
+            },
         });
     }
 }
@@ -1447,7 +1492,7 @@ fn is_absolute_command(command: &str) -> bool {
             && (bytes[2] == b'\\' || bytes[2] == b'/'))
 }
 
-fn runtime_of(command: &str) -> Option<Runtime> {
+pub(super) fn runtime_of(command: &str) -> Option<Runtime> {
     let base = command.rsplit(['/', '\\']).next().unwrap_or(command);
     match base.to_ascii_lowercase().as_str() {
         "npx" => Some(Runtime::Npx),
@@ -1515,7 +1560,7 @@ fn is_pure_reference(value: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-fn find_secrets(object: &serde_json::Map<String, Value>) -> Vec<SecretField> {
+pub(super) fn find_secrets(object: &serde_json::Map<String, Value>) -> Vec<SecretField> {
     let mut secrets = Vec::new();
     for (key, location) in [("env", true), ("headers", false)] {
         let Some(map) = object.get(key).and_then(Value::as_object) else {
@@ -1564,7 +1609,7 @@ const SECRET_MARKER: &str = "<secret>";
 /// A copy of the config with every secret value replaced by a marker, so the plain
 /// config hash does not depend on them. Which fields are secret is decided by
 /// [`find_secrets`]; the field names and the shape stay.
-fn mask_secrets(config: &Value, secrets: &[SecretField]) -> Value {
+pub(super) fn mask_secrets(config: &Value, secrets: &[SecretField]) -> Value {
     let mut masked = config.clone();
     let Some(object) = masked.as_object_mut() else {
         return masked;
@@ -1863,7 +1908,7 @@ fn secrets_digest(key: &[u8; KEY_BYTES], secrets: &[SecretField]) -> KeyedDigest
 }
 
 /// Compact JSON with object keys sorted, independent of the map implementation.
-fn canonical_json(value: &Value, out: &mut String) {
+pub(super) fn canonical_json(value: &Value, out: &mut String) {
     match value {
         Value::Object(map) => {
             let sorted: BTreeMap<&String, &Value> = map.iter().collect();

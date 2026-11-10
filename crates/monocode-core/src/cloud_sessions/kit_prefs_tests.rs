@@ -17,6 +17,7 @@ fn skill(name: &str, scope: SkillScope, exclusion: Option<Exclusion>) -> KitSkil
         hash: "h".into(),
         compressed: 100,
         exclusion,
+        files: Vec::new(),
     }
 }
 
@@ -52,6 +53,7 @@ fn plugin(id: &str, exclusion: Option<Exclusion>, native: bool) -> KitPlugin {
         hash: "h".into(),
         compressed: 200,
         exclusion,
+        files: Vec::new(),
     }
 }
 

@@ -248,6 +248,7 @@ pub(crate) mod fixture {
             hash: "h".into(),
             compressed: 100,
             exclusion: None,
+            files: Vec::new(),
         };
         KitInventory {
             skills: vec![skill("review"), skill("deploy")],
@@ -271,6 +272,7 @@ pub(crate) mod fixture {
                 hash: "h".into(),
                 compressed: 200,
                 exclusion: None,
+                files: Vec::new(),
             }],
             ..Default::default()
         }
