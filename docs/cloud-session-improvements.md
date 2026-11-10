@@ -1429,6 +1429,44 @@ default):
   - `MoveRecord` resume after a restart.
 
 
+#### F4-0 results (2026-11-10, claude 2.1.321, haiku, 3 requests)
+
+- **Same id kept: YES.** After installing the JSONL under a different cwd's project dir
+  with the `cwd` fields rewritten, `claude -p ... --resume <id>` kept the id (all lines
+  carry the original `sessionId`) and created no new session file.
+- **Same file appended: YES** (29 to 40 lines); the source file was untouched.
+- **uuid prefix preserved: YES** (the old 14 entry uuids are an exact prefix of the new
+  17). The first 29 lines are byte-identical apart from the cwd rewrite. The new tail's
+  `parentUuid` points at an attachment entry added by the resume, not at the old last
+  assistant entry, so a chain check must compare the uuid list, not parent links.
+- **`version` field:** present on `user`, `assistant` and `attachment` entries
+  (`"version":"2.1.321"`); bookkeeping entries (`session-owner`, `last-prompt`) have no
+  `version` and no `cwd`.
+- **Resume finds the session by the ENCODED DIRECTORY NAME of the running cwd**
+  (`projects/<encode(cwd)>/<id>.jsonl`, `/` replaced by `-`): resuming from a cwd with no
+  file there fails with "No conversation found with session ID". The install must put the
+  file in the right project dir. The `cwd` fields are stored in realpath form
+  (`/private/tmp/...` on macOS), not the symlinked form, so the rewrite must use the
+  realpath (and the encoder must match Claude's).
+- **Limits of the evidence:** both sides used the SAME config dir (login is tied to the
+  profile dir), so this is a weaker proxy for a different `CLAUDE_CONFIG_DIR`. Not run on
+  a codespace or with a different `claude` version. Re-check at F4-3a manual time. A
+  file in the right dir with wrong `cwd` fields was not tested.
+- **Account notes:** no rate-limit incident; one profile answered "Not logged in".
+- **Row-append approach for F4-L (code reading):** remote rows are already projected by
+  `Store::project_remote_history` (blocks to rows; one block can yield several rows) and
+  the runtime sends `{start: prefix, rows: rows[prefix..]}`. For the linked LOCAL session
+  use the same index diff: `H` = projected host rows, `L` = local `native_rows` in
+  `row_ix` order, `p` = longest common prefix (compare role and text), then
+  `write_rows(local, p, &H[p..])`, an idempotent `ON CONFLICT(session_id,row_ix)` upsert
+  (today it updates only `body`: extend it to `role`, `first`, `sent_at`). If `H` is
+  shorter than `L`, add a small `truncate_rows(session, from)`. Keep a cursor
+  `cloud-synced:{env}:{host_id}` (revision) in `native_settings` next to
+  `cloud-converted:`, mark delivery with `message_id = "cloud:{host_id}:{revision}"`, and
+  note `write_rows` refuses remote sessions ("Remote transcripts are owned by the host"),
+  so the target must be the local session id. Streaming rows (`streaming:true`) are
+  rewritten as they finalise.
+
 ### 4.9 Risks of sharing one harness session id across machines
 
 The decided rule is:
@@ -1584,7 +1622,7 @@ each batch ends with an explicit release-and-pin ticket (HR1-HR3).
   sign-ins, so the storage format and rotation behaviour are no longer needed.
 - **Same session id across machines:** whether `--resume <id>` keeps the id and appends to
   the same JSONL after a cross-machine install. The CLI help says yes: `--fork-session` is
-  the opt-in for a new id. F4-0.
+  the opt-in for a new id. F4-0: confirmed YES (see "F4-0 results" before section 4.9).
 - **`claude plugin` flags:** the exact `install` / `marketplace add` flags, and
   `claude mcp add-json` flags. `--help` printed "Not logged in" here. Not needed by the
   chosen design.
