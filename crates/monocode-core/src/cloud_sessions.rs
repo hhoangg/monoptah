@@ -623,6 +623,9 @@ pub struct CloudSessions {
     follower_retry: Duration,
     /// Sandboxes with a user-initiated reconnect in flight, by name.
     reconnecting: Mutex<std::collections::HashSet<String>>,
+    /// Test seam of the move flip: runs after the Host link and before the location.
+    #[cfg(test)]
+    flip_hook: Mutex<Option<move_session::FlipHook>>,
 }
 
 impl CloudSessions {
@@ -645,6 +648,8 @@ impl CloudSessions {
             clock: Box::new(crate::time::now_ms),
             follower_retry: Duration::from_secs(2),
             reconnecting: Mutex::new(Default::default()),
+            #[cfg(test)]
+            flip_hook: Mutex::new(None),
         }
     }
     #[cfg(test)]
@@ -1768,6 +1773,8 @@ pub mod docker_start;
 pub mod kit;
 pub mod kit_prefs;
 pub mod move_out;
+#[path = "cloud_sessions/move.rs"]
+pub mod move_session;
 pub use backend::{CloudBackend, CloudBackendKind, CloudRef, CodespacesBackend};
 
 mod convert;
@@ -1795,6 +1802,8 @@ mod kit_prefs_tests;
 mod kit_tests;
 #[cfg(test)]
 mod move_out_tests;
+#[cfg(test)]
+mod move_tests;
 #[cfg(test)]
 mod startup_tests;
 #[cfg(test)]

@@ -455,6 +455,14 @@ pub fn may_be_default_branch(cwd: &Path, branch: &str) -> Result<bool, String> {
     Ok(default_branches(&root).may_be_default(branch))
 }
 
+/// The commit `HEAD` points at, `None` when it cannot be read (no repository, no commits).
+pub fn head_commit(cwd: &Path) -> Option<String> {
+    let root = toplevel(cwd).ok()?;
+    git_text(&root, &["rev-parse", "--verify", "HEAD"], None)
+        .ok()
+        .filter(|head| !head.is_empty())
+}
+
 /// The tip of `refs/heads/<branch>` on origin, asked with a read-only `ls-remote`
 /// (10 s cap). `None` when the branch does not exist there. Used to see that a push already
 /// went through, so a retried push step does not push again.

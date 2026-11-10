@@ -753,6 +753,8 @@ fn supported_remote_method(method: &str) -> bool {
             | "git.index"
             | "git.fileDiff"
             | "git.action"
+            | "workspace.applySnapshot"
+            | "sessions.import"
     )
 }
 
@@ -1941,6 +1943,8 @@ else:
             "uploads.commit",
             "uploads.discard",
             "files.readBytes",
+            "workspace.applySnapshot",
+            "sessions.import",
         ] {
             assert!(supported_remote_method(method), "{method}");
         }
