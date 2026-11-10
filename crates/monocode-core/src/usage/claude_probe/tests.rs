@@ -305,3 +305,8 @@ content-length: 2\r\nconnection: close\r\n\r\n{}",
     let error = crate::usage::fetch_with(Kind::Claude, &profile, None, true).unwrap_err();
     assert!(error.message.contains("Could not reach"));
 }
+
+#[test]
+fn a_retired_model_says_so() {
+    assert!(status_error(404).message.contains(MODEL));
+}
