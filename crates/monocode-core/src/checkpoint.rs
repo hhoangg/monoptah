@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::scm::{expand_home, path_to_js, MAX_TEXT_FILE_BYTES};
 
+pub mod gate;
+
 #[cfg(test)]
 mod tests;
 

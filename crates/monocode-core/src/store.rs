@@ -3,7 +3,7 @@ mod app_access;
 pub use app_access::ArchiveTimes;
 mod contributions;
 mod location;
-pub use location::{CloudLocation, SessionLocation};
+pub use location::{CloudLocation, SessionLocation, LOCAL_RUN_REFUSED, LOCAL_TUI_REFUSED};
 mod cloud_rows;
 pub use cloud_rows::AppendOutcome;
 mod managed_sessions;
@@ -1266,7 +1266,23 @@ impl Store {
             .ok()
             .flatten()
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+        // The Host record that backed a Cloud-located session. Once the location is gone it
+        // would show up as a cloud session of its own, so the local record goes with the
+        // session. The conversation on the workspace itself is not touched (design 4.9 R8).
+        let backing: Vec<i64> = if cloud_cursor.is_some() {
+            self.linked_remote_session(id)
+                .ok()
+                .flatten()
+                .map(|(remote, _)| remote)
+                .into_iter()
+                .collect()
+        } else {
+            Vec::new()
+        };
         delete_rows(self)?;
+        for remote in backing {
+            let _ = self.forget_cloud_session(remote);
+        }
         if let Some((env, host)) = cloud_cursor {
             let _ = self.save_setting(&Self::synced_key(&env, &host), "");
         }

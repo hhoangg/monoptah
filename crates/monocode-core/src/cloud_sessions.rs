@@ -328,6 +328,15 @@ pub struct CloudSession {
     pub needs_input: bool,
 }
 
+/// A local session whose location is Cloud, as the sidebar needs it besides the
+/// [`CloudSession`] row: the move point (rewind gating) and the durable sync error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocatedSession {
+    pub id: i64,
+    pub moved_at_row: usize,
+    pub sync_error: Option<String>,
+}
+
 /// Displayable codespace lifecycle state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CloudState {
@@ -916,11 +925,15 @@ impl CloudSessions {
     }
 
     /// Sessions of `local_cwd` that live in codespaces or Docker sandboxes, newest first.
+    /// Two kinds: sessions born in the cloud (a Host record of their own), and local sessions
+    /// whose location is Cloud (design 4.2.1). The Host record that backs a located session
+    /// is not listed: the local session is the one row, and carries the activity flags.
     pub fn cloud_sessions_for(&self, local_cwd: &str) -> Result<Vec<CloudSession>, String> {
-        Ok(self
-            .store()?
+        let store = self.store()?;
+        let mut found: Vec<CloudSession> = store
             .cloud_sessions(local_cwd)?
             .into_iter()
+            .filter(|s| !store.host_record_is_hidden(s))
             .filter_map(|s| {
                 let cloud = s.project.cloud()?;
                 Some(CloudSession {
@@ -932,6 +945,39 @@ impl CloudSessions {
                     needs_input: s.needs_input,
                     summary: s.summary,
                 })
+            })
+            .collect();
+        for (summary, location) in store.cloud_located_sessions(local_cwd)? {
+            let backing = store.linked_remote_session(summary.id)?.map(|(_, r)| r);
+            found.push(CloudSession {
+                codespace: location.cloud.name.clone(),
+                cloud: location.cloud,
+                environment_id: location.environment_id,
+                session_id: Some(location.host_session_id),
+                running: backing.as_ref().is_some_and(|r| r.running),
+                needs_input: backing.as_ref().is_some_and(|r| r.needs_input),
+                summary,
+            });
+        }
+        found.sort_by_key(|s| {
+            (
+                std::cmp::Reverse(s.summary.updated_at),
+                std::cmp::Reverse(s.summary.id),
+            )
+        });
+        Ok(found)
+    }
+
+    /// The Cloud-located local sessions of `local_cwd` with their move point and sync error.
+    pub fn located_sessions_for(&self, local_cwd: &str) -> Result<Vec<LocatedSession>, String> {
+        let store = self.store()?;
+        Ok(store
+            .cloud_located_sessions(local_cwd)?
+            .into_iter()
+            .map(|(summary, location)| LocatedSession {
+                id: summary.id,
+                moved_at_row: location.moved_at_row,
+                sync_error: store.cloud_sync_error(summary.id).ok().flatten(),
             })
             .collect())
     }

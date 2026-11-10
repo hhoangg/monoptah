@@ -553,9 +553,12 @@ impl Store {
             .filter(|summary| !hidden.contains(&summary.id))
             .map(|summary| (summary.id, summary))
             .collect();
+        // A Host record that backs a Cloud-located local session is plumbing, not a session
+        // of its own: the local session is the one row (design 4.2.1).
         sessions.extend(
             self.remote_sessions()?
                 .into_iter()
+                .filter(|(_, remote)| !self.host_record_is_hidden(remote))
                 .map(|(id, remote)| (id, remote.summary)),
         );
         let mut sessions: Vec<_> = sessions.into_values().collect();

@@ -1248,3 +1248,103 @@ fn split_created_note_reads_what_created_note_for_writes() {
         None
     );
 }
+
+#[test]
+fn a_cloud_located_local_session_is_one_cloud_row_and_its_host_record_is_not_listed() {
+    let gh = FakeGh::new(vec![
+        ("auth status", ok(AUTH_OK)),
+        ("codespace list", ok(LIST)),
+    ]);
+    let host = FakeHost::with_machine("octo-abc");
+    let svc = service(&gh, &host);
+    let binding = svc
+        .prepare_target("/Users/me/widgets", named("octo-abc"), &mut |_| {})
+        .unwrap();
+    // Two Host sessions of the project: one born in the cloud, one that backs a local session.
+    let born = svc.create_session(&binding, "claude").unwrap();
+    let backing = svc.create_session(&binding, "claude").unwrap();
+    let local = {
+        let mut store = svc.store().unwrap();
+        let local = store.create("claude", "/Users/me/widgets").unwrap();
+        let rows: Vec<crate::transcript::Row> = (0..10)
+            .map(|i| crate::transcript::Row {
+                role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+                text: format!("row {i}"),
+                first: i % 2 == 0,
+                sent_at: None,
+            })
+            .collect();
+        store.write_rows(local.id, 0, &rows).unwrap();
+        local
+    };
+    let ids = |svc: &CloudSessions| -> Vec<i64> {
+        let mut ids: Vec<i64> = svc
+            .cloud_sessions_for("/Users/me/widgets")
+            .unwrap()
+            .iter()
+            .map(|s| s.summary.id)
+            .collect();
+        ids.sort();
+        ids
+    };
+    let mut both = vec![born.id, backing.id];
+    both.sort();
+    // Location Local: the local session is not a cloud session; both Host records are.
+    assert_eq!(ids(&svc), both);
+    // The location flips to Cloud and the Host record is linked: the sidebar mark follows.
+    {
+        let store = svc.store().unwrap();
+        store
+            .set_cloud_location(
+                local.id,
+                &crate::store::SessionLocation::Cloud(crate::store::CloudLocation {
+                    cloud: crate::cloud_sessions::CloudRef::codespace("octo-abc"),
+                    environment_id: binding.project_key.clone(),
+                    project_id: String::new(),
+                    host_session_id: "host-1".into(),
+                    remote_cwd: "/workspaces/widgets".into(),
+                    local_cwd: "/Users/me/widgets".into(),
+                    moved_at_row: 10,
+                    pushed_branch: None,
+                }),
+            )
+            .unwrap();
+        store
+            .link_remote_session(backing.id, Some(local.id))
+            .unwrap();
+    }
+    let mut expected = vec![born.id, local.id];
+    expected.sort();
+    assert_eq!(
+        ids(&svc),
+        expected,
+        "the linked record is hidden, the unlinked one is not"
+    );
+    let row = svc
+        .cloud_sessions_for("/Users/me/widgets")
+        .unwrap()
+        .into_iter()
+        .find(|s| s.summary.id == local.id)
+        .unwrap();
+    assert_eq!(row.codespace, "octo-abc");
+    assert_eq!(row.summary.cwd, "/Users/me/widgets");
+    let located = svc.located_sessions_for("/Users/me/widgets").unwrap();
+    assert_eq!(
+        located,
+        vec![LocatedSession {
+            id: local.id,
+            moved_at_row: 10,
+            sync_error: None
+        }]
+    );
+    // Back to Local: both Host records are cloud sessions of their own again.
+    svc.store()
+        .unwrap()
+        .reset_cloud_location_to_local(local.id)
+        .unwrap();
+    assert_eq!(ids(&svc), both);
+    assert!(svc
+        .located_sessions_for("/Users/me/widgets")
+        .unwrap()
+        .is_empty());
+}

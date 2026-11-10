@@ -75,6 +75,14 @@ impl SessionLocation {
     }
 }
 
+/// Why the LOCAL runtime refuses to start a turn for a session that lives in the cloud
+/// (design 4.9 R2: one writer at a time).
+pub const LOCAL_RUN_REFUSED: &str =
+    "This conversation is in the cloud. It cannot run on this computer until it is brought back.";
+
+/// Why the local terminal (TUI) refuses to open a session that lives in the cloud.
+pub const LOCAL_TUI_REFUSED: &str = "This conversation is in the cloud. Its local terminal is closed so two Claude processes never share one session. Bring it back to this computer first.";
+
 /// Why a session with a stored but unparsable location is refused.
 pub const UNREADABLE_LOCATION: &str = "unreadable cloud location";
 
@@ -96,10 +104,66 @@ impl Store {
                 .map_err(|_| UNREADABLE_LOCATION.to_string()),
         }
     }
+    /// Refuses a local turn or a local terminal for a session whose location is Cloud, with
+    /// `message`. Fails closed on an unreadable location, like every other guard.
+    fn require_local(&self, session: i64, message: &str) -> Result<(), String> {
+        if self.cloud_location(session)?.is_cloud() {
+            return Err(message.to_string());
+        }
+        Ok(())
+    }
+    /// Call before the local runtime starts a turn: nothing is written before it refuses.
+    pub fn require_local_run(&self, session: i64) -> Result<(), String> {
+        self.require_local(session, LOCAL_RUN_REFUSED)
+    }
+    /// Call before the local TUI is launched for the session.
+    pub fn require_local_tui(&self, session: i64) -> Result<(), String> {
+        self.require_local(session, LOCAL_TUI_REFUSED)
+    }
+    /// Every local session whose location is Cloud, with that location, by session id.
+    /// Unreadable values are skipped here: they have no workspace to show.
+    pub fn cloud_located(&self) -> Result<Vec<(i64, CloudLocation)>, String> {
+        Ok(self
+            .settings_with_prefix("cloud-location:")?
+            .into_iter()
+            .filter_map(|(id, raw)| Some((id, serde_json::from_str(&raw).ok()?)))
+            .collect())
+    }
+    /// The Cloud-located local sessions of the project folder `project`, newest first. The
+    /// sidebar shows these as cloud sessions (design 4.2.1).
+    pub fn cloud_located_sessions(
+        &self,
+        project: &str,
+    ) -> Result<Vec<(super::Session, CloudLocation)>, String> {
+        let mut located: std::collections::HashMap<i64, CloudLocation> =
+            self.cloud_located()?.into_iter().collect();
+        if located.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .sessions()?
+            .into_iter()
+            .filter(|s| s.cwd == project)
+            .filter_map(|s| located.remove(&s.id).map(|location| (s, location)))
+            .collect())
+    }
+    /// Whether the Host record `record` only backs a local session that has a cloud location,
+    /// and so must not be listed as a session of its own. A link whose local session is back
+    /// to Local (or deleted) hides nothing. An unreadable value or a failed read hides it:
+    /// a second row for the same conversation is the worse outcome.
+    pub fn host_record_is_hidden(&self, record: &super::RemoteSession) -> bool {
+        let Some(local) = record.linked_to else {
+            return false;
+        };
+        match self.setting(&Self::location_key(local)) {
+            Ok(raw) => raw.is_some_and(|raw| !raw.is_empty()),
+            Err(_) => true,
+        }
+    }
     /// Explicit way back to Local when the cloud side is gone (for example the linked Host
-    /// record was deleted). Also clears the link and the sync cursor.
-    // TODO(part B): the UI (and F4-5, the return) calls this; nothing else may flip a
-    // Cloud session back to Local without the transcript reconciliation of F4-5.
+    /// record was deleted). Also clears the link and the sync cursor. It does NOT reconcile
+    /// the transcript (F4-5 does): the UI asks for an explicit confirmation first, and
+    /// nothing else may flip a Cloud session back to Local without that reconciliation.
     pub fn reset_cloud_location_to_local(&self, session: i64) -> Result<(), String> {
         if let Ok(SessionLocation::Cloud(location)) = self.cloud_location(session) {
             self.save_setting(
@@ -119,7 +183,7 @@ impl Store {
         let _ = self.save_setting(&Self::sync_error_key(session), "");
         self.save_setting(&Self::location_key(session), "")
     }
-    // TODO(part B): only the move (F4-3a) and the return (F4-5) may call this.
+    /// Only the move (F4-3a) and the return (F4-5) may call this in production.
     pub fn set_cloud_location(
         &self,
         session: i64,
@@ -260,5 +324,162 @@ pub(crate) mod tests {
             store.cloud_location(session.id).unwrap(),
             SessionLocation::Local
         );
+    }
+
+    // The scenario of the tests below: a local session with 10 rows written before the move,
+    // location Cloud with `moved_at_row` 10, and a Host record linked to it.
+    fn moved_session(store: &mut Store) -> (i64, i64) {
+        let local = store.create("claude", "/Users/me/repo").unwrap();
+        let rows: Vec<crate::transcript::Row> = (0..10)
+            .map(|i| crate::transcript::Row {
+                role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+                text: format!("row {i}"),
+                first: i % 2 == 0,
+                sent_at: None,
+            })
+            .collect();
+        store.write_rows(local.id, 0, &rows).unwrap();
+        let mut location = cloud_location();
+        location.moved_at_row = 10;
+        store
+            .set_cloud_location(local.id, &SessionLocation::Cloud(location))
+            .unwrap();
+        let project = store
+            .remember_remote_project(
+                "env",
+                &serde_json::json!({"id":"project","cwd":"/host/repo"}),
+            )
+            .unwrap();
+        let host = serde_json::json!({"projectId":"project","revision":1,"status":"idle",
+            "updatedAt":5,"session":{"id":"host-1","harness":"claude","title":"T",
+            "model":"claude:opus","runtimeMode":"auto","blocks":[]}});
+        let remote = store.register_remote_summary(&project, &host).unwrap();
+        store
+            .link_remote_session(remote.id, Some(local.id))
+            .unwrap();
+        (local.id, remote.id)
+    }
+
+    fn listed(store: &Store) -> Vec<i64> {
+        store
+            .sessions()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect()
+    }
+
+    #[test]
+    fn the_linked_host_record_is_hidden_while_cloud_and_an_unlinked_one_is_not() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let (local, linked) = moved_session(&mut store);
+        // A session born in the cloud: a Host record with no link.
+        let project = store
+            .remember_remote_project(
+                "env",
+                &serde_json::json!({"id":"project2","cwd":"/host/other"}),
+            )
+            .unwrap();
+        let born = store
+            .register_remote_summary(
+                &project,
+                &serde_json::json!({"projectId":"project2","revision":1,"status":"idle",
+                "updatedAt":6,"session":{"id":"host-2","harness":"claude","title":"B",
+                "model":"claude:opus","runtimeMode":"auto","blocks":[]}}),
+            )
+            .unwrap();
+        let ids = listed(&store);
+        assert!(ids.contains(&local) && ids.contains(&born.id));
+        assert!(!ids.contains(&linked), "the linked Host record is plumbing");
+        // Back to Local: the link is cleared and the Host record is a session of its own.
+        store.reset_cloud_location_to_local(local).unwrap();
+        assert!(listed(&store).contains(&linked));
+        // A link whose local session has no cloud location hides nothing.
+        store.link_remote_session(linked, Some(local)).unwrap();
+        assert!(listed(&store).contains(&linked));
+    }
+
+    #[test]
+    fn located_sessions_are_listed_by_project_with_their_move_point() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let (local, _) = moved_session(&mut store);
+        let found = store.cloud_located_sessions("/Users/me/repo").unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0.id, local);
+        assert_eq!(found[0].1.moved_at_row, 10);
+        assert!(store
+            .cloud_located_sessions("/elsewhere")
+            .unwrap()
+            .is_empty());
+        store.reset_cloud_location_to_local(local).unwrap();
+        assert!(store
+            .cloud_located_sessions("/Users/me/repo")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn the_local_runtime_and_terminal_are_refused_while_cloud() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let plain = store.create("claude", "/Users/me/repo").unwrap();
+        store.require_local_run(plain.id).unwrap();
+        store.require_local_tui(plain.id).unwrap();
+        let (local, _) = moved_session(&mut store);
+        assert_eq!(
+            store.require_local_run(local).unwrap_err(),
+            LOCAL_RUN_REFUSED
+        );
+        assert_eq!(
+            store.require_local_tui(local).unwrap_err(),
+            LOCAL_TUI_REFUSED
+        );
+        assert_eq!(
+            crate::tui_launch::refuse_while_cloud(&store, local).unwrap_err(),
+            LOCAL_TUI_REFUSED
+        );
+        // An unreadable location fails closed too.
+        store
+            .save_setting(&format!("cloud-location:{}", plain.id), "junk")
+            .unwrap();
+        assert_eq!(
+            store.require_local_run(plain.id).unwrap_err(),
+            UNREADABLE_LOCATION
+        );
+        assert!(crate::tui_launch::refuse_while_cloud(&store, plain.id).is_err());
+        // Back to Local, both are allowed again.
+        store.reset_cloud_location_to_local(local).unwrap();
+        store.require_local_run(local).unwrap();
+        crate::tui_launch::refuse_while_cloud(&store, local).unwrap();
+    }
+
+    #[test]
+    fn deleting_a_cloud_session_does_not_resurrect_its_host_record() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let (local, linked) = moved_session(&mut store);
+        store.delete(local).unwrap();
+        assert!(!listed(&store).contains(&linked));
+        assert!(store.remote_session(linked).unwrap().is_none());
+    }
+
+    #[test]
+    fn reset_to_local_clears_the_sync_error_link_and_cursor_of_the_real_scenario() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let (local, linked) = moved_session(&mut store);
+        store.save_setting("cloud-synced:env:host-1", "7").unwrap();
+        store
+            .record_cloud_sync_error(local, "Host unreachable")
+            .unwrap();
+        assert_eq!(
+            store.cloud_sync_error(local).unwrap().as_deref(),
+            Some("Host unreachable")
+        );
+        store.reset_cloud_location_to_local(local).unwrap();
+        assert_eq!(store.cloud_location(local).unwrap(), SessionLocation::Local);
+        assert_eq!(store.cloud_sync_error(local).unwrap(), None);
+        assert_eq!(store.cloud_synced_revision("env", "host-1").unwrap(), None);
+        assert!(store.linked_remote_session(local).unwrap().is_none());
+        // The 10 local rows are untouched.
+        assert_eq!(store.load(local).unwrap().rows.len(), 10);
+        assert!(store.remote_session(linked).unwrap().is_some());
     }
 }
