@@ -145,7 +145,7 @@ export function createHostServer(
   const transfers = new SyncTransfers();
   const workspace = new WorkspaceCommands(
     engine.store,
-    (projectId, action) => engine.withIdleProject(projectId, action),
+    (projectId, action, what) => engine.withIdleProject(projectId, action, what),
   );
   const models = async (projectId?: unknown) => {
     const cwd =
@@ -289,6 +289,8 @@ export function createHostServer(
                 "files.searchContent",
                 "files.create",
                 "files.write",
+                "files.write.hash",
+                "git.idleGuard",
                 "git.index",
                 "git.fileDiff",
                 "git.action",

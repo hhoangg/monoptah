@@ -310,6 +310,13 @@ describe("remote host API", () => {
       version: version.replace("+monoptah", ""),
     });
   });
+  it("advertises the conditional write and git idle guard capabilities", async () => {
+    const s = await setup();
+    const { capabilities } = (await s.call("environment.describe")).value.result;
+    expect(capabilities).toEqual(
+      expect.arrayContaining(["files.write.hash", "git.idleGuard"]),
+    );
+  });
   it("advertises newer providers only to desktops that request them", async () => {
     const s = await setup(["codex", "cursor"]);
     expect((await s.call("environment.describe")).value.result.providers)
