@@ -96,6 +96,7 @@ use super::startup::{
 };
 use super::{require_claude, CloudBinding, CloudSessions, OpenRequest, START_ABORTED};
 use crate::git_credentials::{self, GitCredentials};
+use crate::remote::host_upgrade::SandboxAuth;
 use crate::remote::{
     sandbox_bootstrap_script, shell_quote, validate_sandbox_workspace, SandboxMode, SandboxTarget,
 };
@@ -765,7 +766,7 @@ impl CloudSessions {
         self.sandbox_build_step(&mut run)?;
         self.sandbox_configure_step(&mut run)?;
         let target = self.sandbox_connect_step(&mut run, &name, auth.as_ref())?;
-        let (binding, project) = self.sandbox_open_step(&mut run, &name, &target)?;
+        let (binding, project) = self.sandbox_open_step(&mut run, &name, &target, auth.as_ref())?;
         self.sandbox_lifecycle_step(&mut run);
 
         if self.start_aborted(session_id, cancel) {
@@ -1553,6 +1554,7 @@ impl CloudSessions {
         run: &mut Run,
         name: &str,
         target: &SandboxTarget,
+        auth: Option<&ClaudeAuth>,
     ) -> Result<(CloudBinding, crate::store::RemoteProject), Stop> {
         let (_, container) = self.container_target(run)?;
         let remote_cwd = Self::project_folder(target, container.as_ref());
@@ -1560,6 +1562,8 @@ impl CloudSessions {
         // The evidence setup and the later archive copy exec into this container.
         run.deps.backend.remember_target(target);
         let backend = self.backend(CloudBackendKind::DockerSandbox)?;
+        // The Host upgrade restarts the Host through the SAME prelude as the connect step.
+        let prelude = auth.map(ClaudeAuth::prelude);
         let request = OpenRequest {
             local_cwd: &run.record.local_project.clone(),
             cloud: &cloud,
@@ -1567,6 +1571,12 @@ impl CloudSessions {
             display: &run.record.display.clone(),
             repo: &run.record.repo.clone(),
             remote_cwd: &remote_cwd,
+            auth: auth
+                .zip(prelude.as_deref())
+                .map(|(auth, prelude)| SandboxAuth {
+                    prelude: prelude.as_str(),
+                    secret: auth.secret(),
+                }),
         };
         let cell = std::cell::RefCell::new((&mut *run.record, &mut *run.events));
         let halt = AtomicBool::new(false);

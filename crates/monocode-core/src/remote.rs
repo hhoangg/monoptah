@@ -1,13 +1,18 @@
 //! Remote host connections. The renderer receives machine metadata, never the
 //! saved bearer credential. Workspace requests never fall back to local calls.
 pub mod attachments;
+mod cloud_upgrade;
+#[cfg(test)]
+mod cloud_upgrade_tests;
 pub mod host_info;
 pub mod host_release;
+pub mod host_upgrade;
 pub mod protocol;
 mod ssh;
 pub mod ssh_askpass;
 pub mod uploads;
 
+pub use cloud_upgrade::HOST_UPDATING;
 pub(crate) use ssh::{
     sandbox_bootstrap_script, shell_quote, validate_sandbox as validate_sandbox_target,
     validate_sandbox_workspace,
@@ -32,6 +37,18 @@ pub struct Connections {
     wakes: Mutex<HashMap<String, WakeSlot>>,
     /// Flavor, version and capabilities of each machine's Host, from `environment.describe`.
     host_info: host_info::HostInfoCache,
+    /// Per machine: the turn-starting requests in flight, and the hold during a Host swap.
+    gates: Mutex<HashMap<String, Arc<cloud_upgrade::SendGate>>>,
+    /// Ids of the jobs whose Host swap is past the point of no return (an app quit leaves them).
+    swap_jobs: Mutex<std::collections::HashSet<String>>,
+    #[cfg(test)]
+    slot_wait_override: Mutex<Option<std::time::Duration>>,
+    #[cfg(test)]
+    drain_override: Mutex<Option<std::time::Duration>>,
+    /// Machine id to the tunnel its last Host upgrade pass ran on (once per connect).
+    upgrade_passes: Mutex<HashMap<String, u64>>,
+    /// How the Host upgrade reaches a machine (replaced in tests).
+    runner: Mutex<Arc<dyn cloud_upgrade::CloudRunner>>,
 }
 
 type WakeSlot = Arc<(Mutex<Option<Result<(), String>>>, Condvar)>;
@@ -51,6 +68,14 @@ impl Connections {
             jobs: Mutex::new(HashMap::new()),
             wakes: Mutex::new(HashMap::new()),
             host_info: host_info::HostInfoCache::default(),
+            gates: Mutex::new(HashMap::new()),
+            swap_jobs: Mutex::new(Default::default()),
+            #[cfg(test)]
+            slot_wait_override: Mutex::new(None),
+            #[cfg(test)]
+            drain_override: Mutex::new(None),
+            upgrade_passes: Mutex::new(HashMap::new()),
+            runner: Mutex::new(Arc::new(cloud_upgrade::SshRunner)),
         }
     }
 
@@ -66,10 +91,22 @@ impl Connections {
     }
 
     pub fn shutdown(&self) {
+        // A Host swap that is past the point of no return finishes on the machine by itself;
+        // cancelling its job would only cut the app's view of it. Wait for it (bounded).
+        let protected = self
+            .swap_jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         if let Ok(jobs) = self.jobs.lock() {
-            for job in jobs.values() {
-                job.cancel();
+            for (id, job) in jobs.iter() {
+                if !protected.contains(id) {
+                    job.cancel();
+                }
             }
+        }
+        if !protected.is_empty() {
+            self.wait_for_swaps(&protected);
         }
         self.tunnels.clear();
     }
@@ -166,6 +203,14 @@ struct StoredMachine {
     token: String,
     #[serde(default)]
     ssh: Option<SshTarget>,
+    /// A cloud Host is older than the pin but a session was running, so the two-phase
+    /// upgrade was deferred; the next connect that finds the Host idle upgrades it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pending_host_upgrade: bool,
+    /// The nonce of a Host swap that was started on the machine and that the app never saw
+    /// end (it quit, or the ssh dropped). The next upgrade pass asks the machine how it ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    swap_nonce: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -501,6 +546,8 @@ impl Connections {
             environment_id,
             token,
             ssh: existing.and_then(|m| m.ssh.clone()),
+            pending_host_upgrade: false,
+            swap_nonce: None,
         };
         machines.retain(|m| m.id != id);
         machines.push(machine.clone());
@@ -576,6 +623,13 @@ impl Connections {
         if !supported_remote_method(method) {
             return Err("Unsupported remote operation".into());
         }
+        // A request that starts a turn holds its place for the WHOLE call, so a Host swap that
+        // waits for the places to empty knows that none of them can still reach the Host.
+        let _in_flight = if cloud_upgrade::starts_turn(method) {
+            Some(self.gate(machine_id).enter()?)
+        } else {
+            None
+        };
         let machine = {
             let _guard = self
                 .store
@@ -828,6 +882,8 @@ impl Connections {
                         environment_id,
                         token,
                         ssh: Some(target.clone()),
+                        pending_host_upgrade: false,
+                        swap_nonce: None,
                     }
                 };
                 job.message("Opening the secure connection…");
@@ -902,6 +958,7 @@ impl Connections {
             .find(|m| m.environment_id == machine.environment_id)
         {
             machine.id = old.id.clone();
+            machine.pending_host_upgrade |= old.pending_host_upgrade;
         }
         machines.retain(|m| m.id != machine.id);
         machines.push(machine.clone());
@@ -1060,7 +1117,7 @@ impl Connections {
             let job = self.start_when_free(cancel, JOB_SLOT_WAIT, || {
                 self.codespace_reconnect(machine_id)
             })?;
-            loop {
+            let woke = loop {
                 if cancel.load(Ordering::Relaxed) {
                     let _ = self.ssh_cancel(&job);
                     // The job thread stops within moments; let it finish so an
@@ -1075,10 +1132,15 @@ impl Connections {
                 }
                 let view = self.ssh_poll(&job)?;
                 if view.done {
-                    return view.error.map_or(Ok(()), Err);
+                    break view.error.map_or(Ok(()), Err);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
-            }
+            };
+            woke?;
+            // Phase 2 of the Host upgrade. This is a user-initiated connect (a send, a
+            // retry), so it may run; a failure is a warning line, never an error.
+            self.upgrade_host_if_needed(machine_id, None, cancel, progress);
+            Ok(())
         })
     }
 
@@ -1315,6 +1377,8 @@ mod tests {
             environment_id: environment.into(),
             token: "t".repeat(43),
             ssh,
+            pending_host_upgrade: false,
+            swap_nonce: None,
         }
     }
     fn codespace_target() -> SshTarget {
@@ -1489,11 +1553,13 @@ mod tests {
             );
             return;
         };
-        let describe =
-            json!({ "result": { "protocolVersion": 1, "environmentId": "env-cs", "name": "Host" }});
+        // A current fork Host, so the connect-time upgrade check leaves it alone.
+        let describe = json!({ "result": { "protocolVersion": 1, "environmentId": "env-cs", "name": "Host", "host": {"flavor": "monoptah", "version": "1.1.0"} }});
         let (url, _requests, server) = host_fixture(vec![
             describe.clone(),
             describe.clone(),
+            describe.clone(),
+            // The upgrade check after the explicit wake reads the Host once more.
             describe.clone(),
             json!({ "result": { "projects": [] } }),
             describe,
@@ -1908,6 +1974,8 @@ else:
             environment_id: "env".into(),
             token: "secret".into(),
             ssh: None,
+            pending_host_upgrade: false,
+            swap_nonce: None,
         };
         let value = serde_json::to_string(&stored.public()).unwrap();
         assert!(!value.contains("secret"));

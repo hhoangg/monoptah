@@ -250,7 +250,7 @@ A cloud session's cwd is already such a path: `remote://<env>/workspaces/<repo>`
        its environment.
   4. If a session is running, the upgrade is deferred: `pendingHostUpgrade` is set on the
      machine and retried at the next connect that finds the Host idle. The status line
-     says "Monoptah Host X.Y.Z will be installed when the current turn ends".
+     says "Monoptah Host X.Y.Z will be installed the next time this workspace connects".
   - User-owned SSH machines keep today's explicit "Upgrade" button: we do not silently
     upgrade a machine the user administers.
   - The copy "Update Monoptah Host in Connections settings"

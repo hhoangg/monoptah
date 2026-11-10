@@ -505,7 +505,7 @@ impl<'a> Fetcher<'a> {
 }
 
 /// Shown when the Host predates `files.readBytes`.
-pub const OUT_OF_DATE: &str = "The Monoptah Host in this workspace is too old to send this file. Update Monoptah Host in Connections settings, or download a copy with the button below.";
+pub const OUT_OF_DATE: &str = "The Monoptah Host in this workspace is too old to send this file. It updates itself the next time this workspace connects, or you can download a copy with the button below.";
 
 impl CloudSessions {
     /// Resolves a path mentioned in session `session_id` into a [`CloudFile`]. Reads the

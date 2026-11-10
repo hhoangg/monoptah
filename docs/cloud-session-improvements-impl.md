@@ -916,7 +916,7 @@ same Phase 2 run. It does not depend on a Host release.
        prelude), then reconnect the tunnel;
      - if something is running, set `pending_host_upgrade` and retry on the next connect.
   2. The status line shows "Updating Monoptah Host…" or "Monoptah Host X will be
-     installed when the current turn ends".
+     installed the next time this workspace connects".
   3. Replace the "Update Monoptah Host in Connections settings" copy for cloud sessions.
   4. User SSH machines: unchanged.
 - **Acceptance:**
@@ -936,6 +936,10 @@ same Phase 2 run. It does not depend on a Host release.
 - **Risks:**
   - A tunnel race during the restart: reuse the tunnel-invalidation path (`remote.rs`
     ~498-511).
+  - Known limit: a turn dispatched from another device or window in the few milliseconds
+    between the swap worker's last look at the Host and `service uninstall` is not held back
+    and is cut off by the restart. Closing it needs a Host-side drain (the Host refusing new
+    turns until told otherwise), which is out of scope for this ticket.
 
 #### F1-4 Delete the copy workaround; files open directly (S-M)
 

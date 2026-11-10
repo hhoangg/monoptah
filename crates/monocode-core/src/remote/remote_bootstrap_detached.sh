@@ -39,3 +39,7 @@ ensure_detached_host() {
   tail -n 20 "$BASE/host.log" >&2 2>/dev/null || true
   exit 1
 }
+# Runs before every `service install` of a restored Host too (the upgrade rollback calls it).
+before_service_install() {
+  ensure_detached_host
+}

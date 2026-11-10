@@ -1002,6 +1002,7 @@ impl CloudSessions {
                     display: &record.display,
                     repo: &record.repo,
                     remote_cwd: &record.remote_cwd,
+                    auth: None,
                 };
                 let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     super::open_project(
