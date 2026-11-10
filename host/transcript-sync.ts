@@ -12,7 +12,7 @@
 
 export type Decision = "install" | "replace" | "already_current" | "diverged";
 
-/** serde_json refuses to nest deeper than this many arrays/objects. */
+/** serde_json refuses to nest deeper than this many arrays/objects in a parsed `Value`. */
 const MAX_DEPTH = 127;
 
 class Reject extends Error {}
@@ -28,12 +28,21 @@ export interface Probe {
   sessionIdSpan?: Span;
 }
 
+const FATAL = new TextDecoder("utf-8", { fatal: true });
+
 /**
- * Parses one line like serde_json does for the Rust `Probe` struct: the whole line must be
- * one valid JSON object, a repeated top-level `uuid` or `sessionId` key rejects the line,
- * and nothing else is interpreted. Returns null for a line that contributes nothing.
+ * Parses one line like serde_json does for the Rust `Probe` struct. The whole line must be
+ * one syntactically valid JSON object, and a repeated top-level `uuid` or `sessionId` key
+ * rejects the line. Strictness is limited to what serde interprets: top-level KEY strings
+ * and the VALUES of `uuid` / `sessionId` (valid escapes, paired surrogates, valid UTF-8,
+ * finite numbers, depth). Every other value only needs correct JSON syntax, so a lone
+ * surrogate, invalid UTF-8, `1e400` or deep nesting there does not drop the line. Returns
+ * null for a line that contributes nothing.
+ *
+ * `binary` means the line holds one char per byte (latin1), which is how the file reader
+ * keeps invalid UTF-8 visible; strict strings are then UTF-8 checked and decoded.
  */
-export function probeLine(line: string): Probe | null {
+export function probeLine(line: string, binary = false): Probe | null {
   let i = 0;
   const fail = (): never => {
     throw new Reject();
@@ -50,8 +59,8 @@ export function probeLine(line: string): Probe | null {
     if (!/^[0-9a-fA-F]{4}$/.test(part)) return fail();
     return parseInt(part, 16);
   };
-  /** Scans a string token and returns its span, validating escapes like serde_json. */
-  const string = (): Span => {
+  /** Scans a string token; `strict` also checks surrogate pairing and UTF-8. */
+  const string = (strict: boolean): Span => {
     const start = i;
     if (line[i] !== '"') return fail();
     i++;
@@ -60,6 +69,13 @@ export function probeLine(line: string): Probe | null {
       const c = line.charCodeAt(i);
       if (c === 0x22) {
         i++;
+        if (strict && binary) {
+          try {
+            FATAL.decode(Buffer.from(line.slice(start, i), "latin1"));
+          } catch {
+            return fail();
+          }
+        }
         return { start, end: i };
       }
       if (c < 0x20) return fail();
@@ -71,12 +87,12 @@ export function probeLine(line: string): Probe | null {
         } else if (e === "u") {
           const unit = hex4(i + 2);
           i += 6;
-          if (unit >= 0xd800 && unit <= 0xdbff) {
+          if (strict && unit >= 0xd800 && unit <= 0xdbff) {
             if (line[i] !== "\\" || line[i + 1] !== "u") return fail();
             const low = hex4(i + 2);
             if (low < 0xdc00 || low > 0xdfff) return fail();
             i += 6;
-          } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+          } else if (strict && unit >= 0xdc00 && unit <= 0xdfff) {
             return fail();
           }
         } else {
@@ -87,26 +103,49 @@ export function probeLine(line: string): Probe | null {
       }
     }
   };
-  const number = () => {
+  /** The decoded text of a string token that `string(true)` accepted. */
+  const decoded = (span: Span): string => {
+    const token = line.slice(span.start, span.end);
+    return JSON.parse(binary ? FATAL.decode(Buffer.from(token, "latin1")) : token) as string;
+  };
+  const number = (strict: boolean) => {
     const pattern = /-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/y;
     pattern.lastIndex = i;
     const match = pattern.exec(line);
     if (!match) return fail();
-    if (!Number.isFinite(Number(match[0]))) return fail();
+    if (strict && !Number.isFinite(Number(match[0]))) return fail();
     i += match[0].length;
   };
   const literal = (word: string) => {
     if (!line.startsWith(word, i)) return fail();
     i += word.length;
   };
-  const value = (depth: number): Span => {
+  /** A fully checked value, as serde_json parses `Option<Value>`. */
+  const strictValue = (depth: number): Span => {
     ws();
     const start = i;
     const c = line[i];
-    if (c === '"') string();
+    if (c === '"') string(true);
     else if (c === "{") {
       if (depth + 1 > MAX_DEPTH) return fail();
-      object(depth + 1, false);
+      i++;
+      ws();
+      if (line[i] === "}") i++;
+      else
+        for (;;) {
+          ws();
+          string(true);
+          ws();
+          if (line[i] !== ":") return fail();
+          i++;
+          strictValue(depth + 1);
+          ws();
+          if (line[i] === ",") i++;
+          else if (line[i] === "}") {
+            i++;
+            break;
+          } else return fail();
+        }
     } else if (c === "[") {
       if (depth + 1 > MAX_DEPTH) return fail();
       i++;
@@ -114,7 +153,7 @@ export function probeLine(line: string): Probe | null {
       if (line[i] === "]") i++;
       else
         for (;;) {
-          value(depth + 1);
+          strictValue(depth + 1);
           ws();
           if (line[i] === ",") i++;
           else if (line[i] === "]") {
@@ -125,12 +164,68 @@ export function probeLine(line: string): Probe | null {
     } else if (c === "t") literal("true");
     else if (c === "f") literal("false");
     else if (c === "n") literal("null");
-    else number();
+    else number(true);
     return { start, end: i };
+  };
+  /** An ignored value: correct JSON syntax only, no depth limit (iterative on purpose). */
+  const skipValue = () => {
+    const stack: string[] = [];
+    for (;;) {
+      ws();
+      const c = line[i];
+      if (c === "{") {
+        i++;
+        ws();
+        if (line[i] === "}") i++;
+        else {
+          stack.push("{");
+          string(false);
+          ws();
+          if (line[i] !== ":") return fail();
+          i++;
+          continue;
+        }
+      } else if (c === "[") {
+        i++;
+        ws();
+        if (line[i] === "]") i++;
+        else {
+          stack.push("[");
+          continue;
+        }
+      } else if (c === '"') string(false);
+      else if (c === "t") literal("true");
+      else if (c === "f") literal("false");
+      else if (c === "n") literal("null");
+      else number(false);
+      // A value is complete: close containers or move to the next member.
+      for (;;) {
+        const top = stack[stack.length - 1];
+        if (top === undefined) return;
+        ws();
+        if (line[i] === ",") {
+          i++;
+          if (top === "{") {
+            ws();
+            string(false);
+            ws();
+            if (line[i] !== ":") return fail();
+            i++;
+          }
+          break;
+        }
+        if ((top === "{" && line[i] === "}") || (top === "[" && line[i] === "]")) {
+          i++;
+          stack.pop();
+          continue;
+        }
+        return fail();
+      }
+    }
   };
   const probe: Probe = {};
   const seen = new Set<string>();
-  const object = (depth: number, top: boolean) => {
+  const topObject = () => {
     i++; // {
     ws();
     if (line[i] === "}") {
@@ -139,23 +234,24 @@ export function probeLine(line: string): Probe | null {
     }
     for (;;) {
       ws();
-      const key = string();
+      const name = decoded(string(true));
       ws();
       if (line[i] !== ":") return fail();
       i++;
-      const name = top ? (JSON.parse(line.slice(key.start, key.end)) as string) : "";
-      const span = value(depth);
-      if (top && (name === "uuid" || name === "sessionId")) {
+      if (name === "uuid" || name === "sessionId") {
+        const span = strictValue(1);
         if (seen.has(name)) return fail();
         seen.add(name);
         if (line[span.start] === '"') {
-          const text = JSON.parse(line.slice(span.start, span.end)) as string;
+          const text = decoded(span);
           if (name === "uuid") probe.uuid = text;
           else {
             probe.sessionId = text;
             probe.sessionIdSpan = span;
           }
         }
+      } else {
+        skipValue();
       }
       ws();
       if (line[i] === ",") i++;
@@ -165,10 +261,31 @@ export function probeLine(line: string): Probe | null {
       } else return fail();
     }
   };
+  /** serde reads a struct from a two-element array too: uuid first, sessionId second. */
+  const topArray = () => {
+    i++; // [
+    const values: Span[] = [];
+    ws();
+    if (line[i] === "]") i++;
+    else
+      for (;;) {
+        values.push(strictValue(1));
+        ws();
+        if (line[i] === ",") i++;
+        else if (line[i] === "]") {
+          i++;
+          break;
+        } else return fail();
+      }
+    if (values.length !== 2) return fail();
+    if (line[values[0].start] === '"') probe.uuid = decoded(values[0]);
+    if (line[values[1].start] === '"') probe.sessionId = decoded(values[1]);
+  };
   try {
     ws();
-    if (line[i] !== "{") return null;
-    object(1, true);
+    if (line[i] === "[") topArray();
+    else if (line[i] === "{") topObject();
+    else return null;
     ws();
     if (i !== line.length) return null;
     return probe;
@@ -178,9 +295,8 @@ export function probeLine(line: string): Probe | null {
   }
 }
 
-const FATAL = new TextDecoder("utf-8", { fatal: true });
-
-/** Lines split on LF, a trailing CR stripped, ASCII-whitespace-only lines dropped. */
+/** Lines split on LF, a trailing CR stripped, ASCII-whitespace-only lines dropped. Each
+ * line is returned one char per byte (latin1), so invalid UTF-8 stays visible. */
 function* lines(jsonl: Uint8Array): Generator<string> {
   let from = 0;
   for (let at = 0; at <= jsonl.length; at++) {
@@ -190,11 +306,7 @@ function* lines(jsonl: Uint8Array): Generator<string> {
     const bytes = jsonl.subarray(from, end);
     from = at + 1;
     if (bytes.every((b) => b === 0x20 || (b >= 0x09 && b <= 0x0d))) continue;
-    try {
-      yield FATAL.decode(bytes);
-    } catch {
-      // serde_json::from_slice rejects invalid UTF-8: the line is not an entry.
-    }
+    yield Buffer.from(bytes).toString("latin1");
   }
 }
 
@@ -203,7 +315,7 @@ export function parseChain(jsonl: Uint8Array | string): string[] {
   const bytes = typeof jsonl === "string" ? Buffer.from(jsonl) : jsonl;
   const chain: string[] = [];
   for (const line of lines(bytes)) {
-    const probe = probeLine(line);
+    const probe = probeLine(line, true);
     if (probe?.uuid !== undefined) chain.push(probe.uuid);
   }
   return chain;
@@ -245,11 +357,12 @@ export function forkTranscript(jsonl: string, newId: string): string {
 function forkLine(line: string, newId: string): string {
   if (!line.includes('"sessionId"')) return line;
   const probe = probeLine(line);
-  if (probe?.sessionId === undefined || !probe.sessionIdSpan) return line;
+  if (probe?.sessionId === undefined) return line;
   if (probe.sessionId === newId) return line;
   const from = `"sessionId":${JSON.stringify(probe.sessionId)}`;
   if (line.includes(from))
     return line.split(from).join(`"sessionId":${JSON.stringify(newId)}`);
+  if (!probe.sessionIdSpan) return line;
   // Spaced JSON: replace just the value, keeping every other byte.
   const { start, end } = probe.sessionIdSpan;
   return line.slice(0, start) + JSON.stringify(newId) + line.slice(end);

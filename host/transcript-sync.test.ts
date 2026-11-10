@@ -13,6 +13,7 @@ import {
 // The SAME fixture files as crates/monocode-core/src/cloud_sessions/transcript_sync.rs.
 const DIR = join(__dirname, "..", "crates/monocode-core/tests/fixtures/transcript_sync");
 const fixture = (name: string) => readFileSync(join(DIR, name), "utf8");
+const bytes = (name: string) => readFileSync(join(DIR, name));
 const manifest = JSON.parse(fixture("cases.json")) as {
   cases: { name: string; existing: string | null; incoming: string; decision: string }[];
   chains: { file: string; uuids: string[] }[];
@@ -21,12 +22,12 @@ const manifest = JSON.parse(fixture("cases.json")) as {
 
 describe("shared transcript_sync fixtures", () => {
   it.each(manifest.chains.map((c) => [c.file, c] as const))("chain of %s", (_file, chain) => {
-    expect(parseChain(Buffer.from(fixture(chain.file)))).toEqual(chain.uuids);
+    expect(parseChain(bytes(chain.file))).toEqual(chain.uuids);
   });
 
   it.each(manifest.cases.map((c) => [c.name, c] as const))("decision: %s", (_name, c) => {
-    const existing = c.existing === null ? null : Buffer.from(fixture(c.existing));
-    expect(decide(existing, Buffer.from(fixture(c.incoming)))).toBe(c.decision);
+    const existing = c.existing === null ? null : bytes(c.existing);
+    expect(decide(existing, bytes(c.incoming))).toBe(c.decision);
   });
 
   it("covers the edge rules the manifest documents", () => {
@@ -35,19 +36,32 @@ describe("shared transcript_sync fixtures", () => {
     expect(probeLine('{"uuid":"a","uuid":"b"}')).toBeNull();
     expect(probeLine('{"sessionId":"a","sessionId":"b"}')).toBeNull();
     expect(probeLine('{"x":{"uuid":"a","uuid":"b"},"uuid":"c"}')?.uuid).toBe("c");
-    // Non-object values and invalid JSON contribute nothing.
-    for (const bad of ["[]", '"s"', "42", "null", '{"uuid":"a"', '{"uuid":"a"} x', '{"uuid":"a",}'])
+    // Non-object, non-array values and invalid JSON contribute nothing.
+    for (const bad of ['"s"', "42", "null", '{"uuid":"a"', '{"uuid":"a"} x', '{"uuid":"a",}', "[1,]"])
       expect(probeLine(bad), bad).toBeNull();
     // Only a string uuid joins the chain.
     expect(probeLine('{"uuid":1}')?.uuid).toBeUndefined();
     expect(probeLine('{"uuid":null}')?.uuid).toBeUndefined();
-    // Escapes in keys and values are decoded; lone surrogates are rejected like serde.
+    // Escapes in keys and values are decoded.
     expect(probeLine('{"u\\u0075id":"a"}')?.uuid).toBe("a");
+    // Strict only on top-level keys and on uuid / sessionId values.
+    expect(probeLine('{"\\ud800":1,"uuid":"a"}')).toBeNull();
     expect(probeLine('{"uuid":"\\ud800"}')).toBeNull();
-    expect(probeLine('{"n":1e999}')).toBeNull();
-    // Invalid UTF-8 and over-deep nesting are not entries.
-    expect(parseChain(Buffer.from([0x7b, 0x22, 0x75, 0x75, 0x69, 0x64, 0x22, 0x3a, 0x22, 0xff, 0x22, 0x7d]))).toEqual([]);
-    expect(probeLine(`{"a":${"[".repeat(130)}${"]".repeat(130)},"uuid":"x"}`)).toBeNull();
+    expect(probeLine('{"uuid":1e400}')).toBeNull();
+    // Everything else needs correct JSON syntax only.
+    expect(probeLine('{"uuid":"a","x":"\\ud800","n":1e400,"o":{"\\udc00":[]}}')?.uuid).toBe("a");
+    expect(probeLine(`{"uuid":"a","x":${"[".repeat(5000)}${"]".repeat(5000)}}`)?.uuid).toBe("a");
+    expect(probeLine('{"uuid":"a","x":"bad\u0001"}'.replace("\\u0001", "\u0001"))).toBeNull();
+    expect(probeLine('{"uuid":"a","x":"\\q"}')).toBeNull();
+    // A two-value array is read positionally like serde reads a struct.
+    expect(probeLine('["u","s"]')).toMatchObject({ uuid: "u", sessionId: "s" });
+    for (const arr of ["[]", '["a"]', '["a","b","c"]']) expect(probeLine(arr), arr).toBeNull();
+    // Invalid UTF-8: kept in ignored fields, dropped in uuid.
+    const withByte = (head: string, bad: number, tail: string) =>
+      Buffer.concat([Buffer.from(head), Buffer.from([bad]), Buffer.from(tail)]);
+    expect(parseChain(withByte('{"uuid":"a","x":"', 0xff, '"}'))).toEqual(["a"]);
+    expect(parseChain(withByte('{"uuid":"', 0xff, '"}'))).toEqual([]);
+    expect(decide('{"uuid":"a"}\n', '{"uuid":"a"}\n{"uuid":"b","x":"\\udc00"}\n')).toBe("replace");
   });
 
   it("ignores the cwd rewrite when comparing", () => {
