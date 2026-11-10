@@ -1,6 +1,6 @@
 // Fork-local (Monoptah). Tests scripts/pin-host-release.mjs with `gh` mocked: no network.
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,7 +8,9 @@ import { test } from "node:test";
 import {
   TARGETS,
   crossCheck,
+  compareCore,
   parseTag,
+  pinnedVersion,
   pinHostRelease,
   renderHostRelease,
   validateManifest,
@@ -136,4 +138,55 @@ test("refuses and writes nothing on attestation failure or a hash mismatch", asy
       await rm(dir, { recursive: true, force: true });
     }
   }
+});
+
+test("verifies the attestation against the signer workflow, tag and runner kind", async () => {
+  const dir = await root();
+  const gh = fakeGh();
+  try {
+    await pinHostRelease("host-v2.3.4", { root: dir, gh });
+    const verify = gh.calls.find((c) => c.startsWith("attestation verify"));
+    assert.match(verify, / -R hhoangg\/monoptah /);
+    assert.ok(
+      verify.includes(
+        "--signer-workflow hhoangg/monoptah/.github/workflows/host-release-monoptah.yml",
+      ),
+    );
+    assert.ok(verify.includes("--source-ref refs/tags/host-v2.3.4"));
+    assert.ok(verify.endsWith("--deny-self-hosted-runners"));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("refuses a downgrade, allows a re-pin and leaves no temporary file", async () => {
+  const dir = await root();
+  try {
+    await pinHostRelease("host-v2.3.4", { root: dir, gh: fakeGh() });
+    assert.deepEqual(pinnedVersion(await readFile(target(dir), "utf8")), [2, 3, 4]);
+    const before = await readFile(target(dir), "utf8");
+    // A lower version is refused before any network call.
+    const gh = fakeGh({ manifestJson: { version: "2.3.3+monoptah", assets } });
+    await assert.rejects(pinHostRelease("host-v2.3.3", { root: dir, gh }), /downgrade/);
+    assert.deepEqual(gh.calls, []);
+    assert.equal(await readFile(target(dir), "utf8"), before);
+    // The same version is a re-pin.
+    const again = await pinHostRelease("host-v2.3.4", { root: dir, gh: fakeGh() });
+    assert.equal(again.repinned, true);
+    // A higher one moves the pin.
+    const higher = { version: "2.4.0+monoptah", assets };
+    const up = await pinHostRelease("host-v2.4.0", { root: dir, gh: fakeGh({ manifestJson: higher }) });
+    assert.equal(up.repinned, false);
+    assert.deepEqual(pinnedVersion(await readFile(target(dir), "utf8")), [2, 4, 0]);
+    assert.deepEqual(readdirSync(join(dir, "crates/monocode-core/src/remote")), ["host_release.rs"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("compares the pinned core with a plain version", () => {
+  assert.equal(compareCore([1, 1, 0], "1.1.0"), 0);
+  assert.equal(compareCore([1, 10, 0], "1.9.0"), 1);
+  assert.equal(compareCore([1, 1, 0], "1.1.1"), -1);
+  assert.equal(pinnedVersion("nothing"), null);
 });

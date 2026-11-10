@@ -7,7 +7,7 @@
 // trust-on-first-use; the attestation ties the hashes to the workflow that built them.
 // It needs an authenticated `gh` and only reads from GitHub.
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -67,6 +67,19 @@ export function crossCheck(assets, checksumFiles) {
         `Hash mismatch for ${target}: host-release.json has ${assets[target]}, the release has ${published}`,
       );
   }
+}
+
+// The X.Y.Z of the version pinned in a host_release.rs text, or null.
+export function pinnedVersion(text) {
+  const match = /HOST_VERSION: &str = "(\d+)\.(\d+)\.(\d+)\+/.exec(text);
+  return match ? match.slice(1).map(Number) : null;
+}
+
+// -1, 0 or 1 comparing the X.Y.Z of `a` (an array) with the plain version string `b`.
+export function compareCore(a, b) {
+  const other = b.split("+")[0].split(".").map(Number);
+  for (let i = 0; i < 3; i++) if (a[i] !== other[i]) return a[i] < other[i] ? -1 : 1;
+  return 0;
 }
 
 export function renderHostRelease(tag, manifest) {
@@ -144,11 +157,30 @@ async function fetchManifest(gh, tag, dir, runId) {
 
 // Pins `tag` into `root`. `gh` is injectable so tests never touch the network.
 export async function pinHostRelease(tag, { root = process.cwd(), gh = defaultGh, runId } = {}) {
-  parseTag(tag);
+  const plain = parseTag(tag);
+  // Never move the pin back: installed apps and Hosts only ever upgrade.
+  let current = null;
+  try {
+    current = pinnedVersion(await readFile(join(root, OUTPUT), "utf8"));
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  const same = current !== null && compareCore(current, plain) === 0;
+  if (current !== null && compareCore(current, plain) > 0)
+    throw new Error(
+      `Refusing to downgrade the pinned Host from ${current.join(".")} to ${plain}`,
+    );
   const dir = await mkdtemp(join(tmpdir(), "pin-host-release-"));
   try {
     const { file, source } = await fetchManifest(gh, tag, dir, runId);
-    ghOk(gh, ["attestation", "verify", file, "-R", REPO]);
+    // The attestation must come from this repository's Host release workflow, run on
+    // this tag by a GitHub-hosted runner; any other signer is refused.
+    ghOk(gh, [
+      "attestation", "verify", file, "-R", REPO,
+      "--signer-workflow", `${REPO}/.github/workflows/${WORKFLOW}`,
+      "--source-ref", `refs/tags/${tag}`,
+      "--deny-self-hosted-runners",
+    ]);
     const manifest = JSON.parse(await readFile(file, "utf8"));
     const { assets } = validateManifest(manifest, tag);
     const sums = join(dir, "sums");
@@ -158,8 +190,16 @@ export async function pinHostRelease(tag, { root = process.cwd(), gh = defaultGh
     for (const name of await readdir(sums))
       checksumFiles[name] = await readFile(join(sums, name), "utf8");
     crossCheck(assets, checksumFiles);
-    await writeFile(join(root, OUTPUT), renderHostRelease(tag, manifest));
-    return { source, version: manifest.version, output: OUTPUT };
+    // Write beside the target and rename, so a crash never leaves a half-written file.
+    const target = join(root, OUTPUT);
+    const temporary = `${target}.tmp-${process.pid}`;
+    try {
+      await writeFile(temporary, renderHostRelease(tag, manifest));
+      await rename(temporary, target);
+    } finally {
+      await rm(temporary, { force: true });
+    }
+    return { source, version: manifest.version, output: OUTPUT, repinned: same };
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -171,7 +211,9 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     const runAt = args.indexOf("--run");
     const runId = runAt >= 0 ? args.splice(runAt, 2)[1] : undefined;
     const result = await pinHostRelease(args[0], { runId });
-    console.log(`Pinned ${result.version} from ${result.source} into ${result.output}`);
+    console.log(
+      `${result.repinned ? "Re-pinned (same version)" : "Pinned"} ${result.version} from ${result.source} into ${result.output}`,
+    );
   } catch (error) {
     console.error(error.message);
     process.exit(1);

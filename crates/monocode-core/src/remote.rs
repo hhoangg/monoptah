@@ -448,8 +448,24 @@ impl Connections {
     }
 
     /// What the last `environment.describe` of this machine reported, if any.
+    /// A machine reached through a tunnel with no live tunnel has no answer: the cached
+    /// entry may describe a Host that is gone, so it is dropped.
     pub fn host_info(&self, machine_id: &str) -> Option<host_info::HostInfo> {
+        let through_tunnel = self
+            .list()
+            .ok()?
+            .into_iter()
+            .any(|m| m.id == machine_id && m.ssh.is_some());
+        if through_tunnel && self.tunnels.existing(machine_id).is_none() {
+            self.host_info.drop_machine(machine_id);
+            return None;
+        }
         self.host_info.get(machine_id)
+    }
+
+    /// Forgets what is cached about this machine's Host.
+    pub(crate) fn forget_host(&self, machine_id: &str) {
+        self.host_info.drop_machine(machine_id);
     }
 
     /// Describes the Host now (refreshing the cache) and returns what it reports.
@@ -505,6 +521,11 @@ impl Connections {
         } else {
             None
         };
+        // A tunnel that was just (re)started may reach a different Host than the one that
+        // was described; learn it again.
+        if tunnel_lease.as_ref().is_some_and(|lease| lease.fresh) {
+            self.host_info.drop_machine(&machine.id);
+        }
         let endpoint = tunnel_lease
             .as_ref()
             .map(|lease| lease.endpoint.as_str())
@@ -631,7 +652,7 @@ impl Connections {
         }
         let state = self.clone();
         std::thread::spawn(move || {
-            let prepared = (|| -> Result<(StoredMachine, Tunnel), String> {
+            let prepared = (|| -> Result<(StoredMachine, Tunnel, Value), String> {
                 let askpass = job.askpass()?;
                 let mut target = target;
                 let cloud = target.is_cloud();
@@ -746,12 +767,8 @@ impl Connections {
                     );
                 }
                 if upgrade {
-                    let capabilities = descriptor.get("capabilities").and_then(Value::as_array);
-                    let supports = |name: &str| {
-                        capabilities.is_some_and(|entries| {
-                            entries.iter().any(|entry| entry.as_str() == Some(name))
-                        })
-                    };
+                    let info = host_info::HostInfo::from_descriptor(&descriptor);
+                    let supports = |name: &str| info.supports(name);
                     if !supports("git.index")
                         || !supports("files.list")
                         || !supports("files.create")
@@ -760,7 +777,6 @@ impl Connections {
                         return Err("The installed host package still lacks Explorer and Changes. Install a newer Monoptah release with updated host packages.".into());
                     }
                 }
-                state.host_info.record(&machine.id, &descriptor);
                 if machine.name.trim().is_empty() {
                     machine.name = descriptor
                         .get("name")
@@ -770,30 +786,45 @@ impl Connections {
                         .take(100)
                         .collect();
                 }
-                Ok((machine, tunnel))
+                Ok((machine, tunnel, descriptor))
             })();
             job.complete(|| {
-                let (mut machine, tunnel) = prepared?;
-                let _guard = state
-                    .store
-                    .lock()
-                    .map_err(|_| "Connection store is locked")?;
-                let path = state.store_path();
-                let mut machines = read(&path)?;
-                if let Some(old) = machines
-                    .iter()
-                    .find(|m| m.environment_id == machine.environment_id)
-                {
-                    machine.id = old.id.clone();
-                }
-                machines.retain(|m| m.id != machine.id);
-                machines.push(machine.clone());
-                write(&path, &machines)?;
+                let (machine, tunnel, descriptor) = prepared?;
+                let machine = state.commit_machine(machine, &descriptor)?;
                 state.tunnels.insert(machine.id.clone(), tunnel);
                 Ok(machine.public())
             });
         });
         Ok(id)
+    }
+
+    /// Saves a machine set up over SSH. An already saved machine with the same environment
+    /// keeps its id, and the Host info is recorded under that final id only: the id the job
+    /// started with is provisional and must leave nothing behind.
+    fn commit_machine(
+        &self,
+        mut machine: StoredMachine,
+        descriptor: &Value,
+    ) -> Result<StoredMachine, String> {
+        let _guard = self
+            .store
+            .lock()
+            .map_err(|_| "Connection store is locked")?;
+        let path = self.store_path();
+        let mut machines = read(&path)?;
+        let provisional = machine.id.clone();
+        if let Some(old) = machines
+            .iter()
+            .find(|m| m.environment_id == machine.environment_id)
+        {
+            machine.id = old.id.clone();
+        }
+        machines.retain(|m| m.id != machine.id);
+        machines.push(machine.clone());
+        write(&path, &machines)?;
+        self.host_info.drop_machine(&provisional);
+        self.host_info.record(&machine.id, descriptor);
+        Ok(machine)
     }
 
     pub fn ssh_begin(
@@ -1190,6 +1221,80 @@ mod tests {
         connections.disconnect(&machine.id).unwrap();
         assert_eq!(connections.host_info(&machine.id), None);
         server.join().unwrap();
+    }
+
+    fn stored(id: &str, environment: &str, ssh: Option<SshTarget>) -> StoredMachine {
+        StoredMachine {
+            id: id.into(),
+            name: id.into(),
+            endpoint: "https://host.example".into(),
+            environment_id: environment.into(),
+            token: "t".repeat(43),
+            ssh,
+        }
+    }
+    fn codespace_target() -> SshTarget {
+        SshTarget {
+            target: "cs".into(),
+            port: None,
+            remote_port: 3774,
+            codespace: Some("cs".into()),
+            sandbox: None,
+        }
+    }
+
+    #[test]
+    fn a_re_added_machine_keeps_only_the_host_info_under_its_final_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let connections = Connections::new(dir.path());
+        write(
+            &connections.store_path(),
+            &[stored("old", "env", Some(codespace_target()))],
+        )
+        .unwrap();
+        connections
+            .host_info
+            .record("old", &json!({"capabilities": ["stale"]}));
+        // The job started under a provisional id and recorded nothing yet.
+        let fork = json!({"host": {"flavor": "monoptah", "version": "1.1.0"}, "capabilities": ["uploads"]});
+        connections.host_info.record("provisional", &fork);
+        let machine = connections
+            .commit_machine(
+                stored("provisional", "env", Some(codespace_target())),
+                &fork,
+            )
+            .unwrap();
+        assert_eq!(machine.id, "old");
+        assert_eq!(connections.host_info.get("provisional"), None);
+        let info = connections.host_info.get("old").unwrap();
+        assert!(info.is_monoptah());
+        assert!(info.supports("uploads") && !info.supports("stale"));
+        assert_eq!(connections.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn host_info_of_a_tunnelled_machine_without_a_live_tunnel_is_not_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let connections = Arc::new(Connections::new(dir.path()));
+        write(
+            &connections.store_path(),
+            &[
+                stored("cloud", "env-1", Some(codespace_target())),
+                stored("direct", "env-2", None),
+            ],
+        )
+        .unwrap();
+        let info = json!({"capabilities": ["files.readBytes"]});
+        connections.host_info.record("cloud", &info);
+        connections.host_info.record("direct", &info);
+        // A direct machine has no tunnel to lose.
+        assert!(connections.host_info("direct").is_some());
+        // No live tunnel: no answer, and the stale entry is gone.
+        assert_eq!(connections.host_info("cloud"), None);
+        assert_eq!(connections.host_info.get("cloud"), None);
+        // The seam used by file viewing then reports the not-connected answer.
+        let error = crate::cloud_sessions::Host::host_info(&connections, "cloud").unwrap_err();
+        assert_eq!(error, CODESPACE_NOT_CONNECTED);
     }
 
     #[test]

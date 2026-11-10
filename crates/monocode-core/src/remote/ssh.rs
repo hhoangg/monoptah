@@ -942,6 +942,8 @@ pub struct TunnelLease {
     pub endpoint: String,
     slot: Arc<Mutex<Slot>>,
     generation: u64,
+    /// The tunnel was started for this lease (not reused).
+    pub fresh: bool,
 }
 
 /// Each machine has its own lock: restarting one machine's tunnel (up to
@@ -988,6 +990,7 @@ impl Tunnels {
             endpoint: format!("http://127.0.0.1:{port}"),
             slot: slot.clone(),
             generation: current.generation,
+            fresh: false,
         })
     }
     pub fn endpoint(&self, id: &str, target: &SshTarget) -> Result<TunnelLease, String> {
@@ -999,6 +1002,7 @@ impl Tunnels {
                     endpoint: format!("http://127.0.0.1:{}", tunnel.port),
                     slot: slot.clone(),
                     generation: current.generation,
+                    fresh: false,
                 });
             }
         }
@@ -1018,6 +1022,7 @@ impl Tunnels {
                     endpoint,
                     slot: slot.clone(),
                     generation: current.generation,
+                    fresh: true,
                 })
             }
             Err(error) => {
@@ -1109,6 +1114,7 @@ mod tests {
             endpoint: String::new(),
             slot: old,
             generation: 1,
+            fresh: false,
         };
         let newer = slot(2);
         tunnels.slots().insert("host".into(), newer.clone());
@@ -1118,6 +1124,7 @@ mod tests {
             endpoint: String::new(),
             slot: newer.clone(),
             generation: 1,
+            fresh: false,
         };
         tunnels.invalidate("host", &stale_lease);
         assert!(newer.lock().unwrap().failure.is_some());
@@ -1852,6 +1859,21 @@ mod tests {
         assert!(!check("1.1.1+monoptah", pin));
         assert!(!check("1.2.0+monoptah", pin));
         assert!(!check("10.0.0+monoptah", pin));
+        // Pre-releases are older than their release, build metadata is ignored.
+        assert!(check("1.1.0-rc.1+monoptah", pin));
+        assert!(check("1.1.0-rc.1+monoptah.3", pin));
+        assert!(!check("1.1.0+monoptah.3", pin));
+        assert!(!check("1.1.0+monoptah.3", "1.1.0+monoptah"));
+        assert!(check("1.1.0+monoptah.3", "1.1.1+monoptah"));
+        assert!(
+            !check("1.1.1-rc.1+monoptah", pin),
+            "a pre-release of a higher core"
+        );
+        assert!(!check("1.1.0+monoptah", "1.1.0-rc.1+monoptah"));
+        assert!(!check("1.1.0-rc.1+monoptah", "1.1.0-rc.1+monoptah"));
+        assert!(check("1.1.0-rc.1+monoptah", "1.1.0-rc.2+monoptah"));
+        assert!(check("1.1.0+monoptahx", pin), "not the flavor marker");
+        assert!(check("1.1.0+other", pin));
     }
     #[test]
     fn remote_platform_probe_handles_cmd_powershell_and_unix() {
