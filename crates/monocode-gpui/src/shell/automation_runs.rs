@@ -376,9 +376,6 @@ impl Shell {
         if let Some(id) = reuse {
             self.ensure_session(id, cx);
         }
-        let account = crate::accounts::get(cx)
-            .map(|accounts| accounts.read(cx).selected(kind, &automation.cwd))
-            .unwrap_or_default();
         if let Some(id) = reuse {
             self.automation_state.reserved.insert(id);
         }
@@ -389,7 +386,19 @@ impl Shell {
                     .map(|view| view.read(cx).settings.clone())
             })
             .unwrap_or_default();
-        settings.account = account;
+        // A continued session keeps its account: its transcript lives in that
+        // account's config dir, so moving it to the project's or provider's
+        // default account (say, a new setup token) would break the resume.
+        // A new session, or one whose account was removed, takes the selection.
+        let keep = reuse.is_some()
+            && crate::accounts::get(cx).is_some_and(|accounts| {
+                accounts.read(cx).book.exists(kind, &settings.account.id)
+            });
+        if !keep {
+            settings.account = crate::accounts::get(cx)
+                .map(|accounts| accounts.read(cx).selected(kind, &automation.cwd))
+                .unwrap_or_default();
+        }
         settings.model = monocode_core::store::native_model(&automation.model, kind.id());
         settings.model_settings = automation.model_settings.clone();
         settings.effort = [

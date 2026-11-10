@@ -408,6 +408,75 @@ mod tests {
             .unwrap();
     }
 
+    /// A continued chat keeps its own account even after another account
+    /// became the provider's default: its transcript lives in that account.
+    #[gpui::test]
+    fn a_continued_chat_keeps_its_account_when_another_is_the_default(
+        cx: &mut TestAppContext,
+    ) {
+        let project = Project::new(false);
+        let (window, _clis) = shell(cx, &[("claude", Surface::Chat)]);
+        let (sibling, preferred) = window
+            .update(cx, |shell, _, cx| {
+                let center = crate::accounts::get(cx).unwrap();
+                let preferred = center.update(cx, |center, _| {
+                    let account = center.book.add(Kind::Claude, "Token").unwrap();
+                    center
+                        .book
+                        .set_preferred(Kind::Claude, &account.id)
+                        .unwrap();
+                    account.id
+                });
+                let mut summary = locked(&shell.store)
+                    .unwrap()
+                    .create("claude", &project.cwd())
+                    .unwrap();
+                summary.has_messages = true;
+                let id = summary.id;
+                shell.add(summary, cx);
+                (id, preferred)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        // The earlier session ran on the CLI login.
+        window
+            .update(cx, |shell, _, cx| {
+                shell.sessions[&sibling].update(cx, |v, _| {
+                    v.settings.account = monocode_core::accounts::Profile::default()
+                })
+            })
+            .unwrap();
+        let due = window
+            .update(cx, |shell, _, _| {
+                due(shell, &project, "claude", |upsert| {
+                    upsert.reuse_session = true;
+                })
+            })
+            .unwrap();
+        let due = DueAutomationRun {
+            automation: Automation {
+                last_session_id: Some(sibling.to_string()),
+                ..due.automation
+            },
+            run: due.run,
+        };
+        launch(&window, cx, &due);
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(
+                    shell
+                        .automation_state
+                        .session_automations
+                        .contains_key(&sibling),
+                    "the run continues the earlier chat"
+                );
+                let account = shell.sessions[&sibling].read(cx).settings.account.id.clone();
+                assert_ne!(account, preferred);
+                assert_eq!(account, monocode_core::accounts::DEFAULT);
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     fn the_run_is_recorded_as_running_with_its_session(cx: &mut TestAppContext) {
         let project = Project::new(false);
