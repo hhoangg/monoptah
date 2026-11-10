@@ -18,6 +18,7 @@ import { writeAttachmentChunk, readAttachmentChunk } from "./attachments";
 import { HostUploads } from "./uploads";
 import { HostKit, installLogScrubber, scrubSecrets } from "./kit";
 import { setClaudeKitProvider } from "../src/integrations/harness/providers/claude/claudeKit";
+import { HostMoves } from "./move";
 import type { LinkedWorkItem } from "../src/features/sessions/model/session";
 import { parseGithubWorkItemUrl } from "../src/features/sessions/model/sessionWorkItem";
 import { SyncTransfers } from "./sync-transfer";
@@ -207,6 +208,9 @@ export function createHostServer(
     resolveClaude: async () => (await resolveBinary.claude()).path,
   });
   setClaudeKitProvider(() => kit.current());
+  const moves = new HostMoves(engine, uploads, {
+    onWorktreeCreated: () => workspace.invalidateRoots(),
+  });
   const server = createServer(
     { requestTimeout: 20_000, headersTimeout: 10_000, maxHeaderSize: 8192 },
     async (request, response) => {
@@ -316,6 +320,8 @@ export function createHostServer(
                 "sessions.draft",
                 "sessions.plan",
                 "workspace.watch",
+                "workspace.applySnapshot",
+                "sessions.import",
               ],
             };
             break;
@@ -469,6 +475,12 @@ export function createHostServer(
             result = await kit.health(cwd);
             break;
           }
+          case "workspace.applySnapshot":
+            result = await moves.applySnapshot(params);
+            break;
+          case "sessions.import":
+            result = await moves.importSession(params);
+            break;
           case "devices.revokeSelf":
             // Only the caller's own credential. Sessions and other devices
             // are unaffected; the host keeps running.

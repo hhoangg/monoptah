@@ -79,6 +79,18 @@
       "existing": "edge_no_final_newline.jsonl",
       "incoming": "edge_no_final_newline.jsonl",
       "decision": "already_current"
+    },
+    {
+      "name": "a lone surrogate in an ignored field does not drop the line, so the file extends",
+      "existing": "edge_prefix.jsonl",
+      "incoming": "edge_lone_surrogate_ignored.jsonl",
+      "decision": "replace"
+    },
+    {
+      "name": "a file with invalid UTF-8 in an ignored field equals itself",
+      "existing": "edge_invalid_utf8_ignored.jsonl",
+      "incoming": "edge_invalid_utf8_ignored.jsonl",
+      "decision": "already_current"
     }
   ],
   "chains": [
@@ -159,6 +171,53 @@
         "r2",
         "r1"
       ]
+    },
+    {
+      "file": "edge_prefix.jsonl",
+      "uuids": [
+        "s1"
+      ]
+    },
+    {
+      "file": "edge_lone_surrogate_ignored.jsonl",
+      "uuids": [
+        "s1",
+        "s2"
+      ]
+    },
+    {
+      "file": "edge_invalid_utf8_ignored.jsonl",
+      "uuids": [
+        "u1",
+        "u2"
+      ]
+    },
+    {
+      "file": "edge_number_range_ignored.jsonl",
+      "uuids": [
+        "n1",
+        "n2"
+      ]
+    },
+    {
+      "file": "edge_deep_nesting_ignored.jsonl",
+      "uuids": [
+        "p1",
+        "p2"
+      ]
+    },
+    {
+      "file": "edge_array_line.jsonl",
+      "uuids": [
+        "u1",
+        "r1"
+      ]
+    },
+    {
+      "file": "edge_strict_ids.jsonl",
+      "uuids": [
+        "k1"
+      ]
     }
   ],
   "edgeRules": [
@@ -167,6 +226,7 @@
     "Only a top-level string `uuid` joins the chain, in file order. A uuid that is not a string (number, null, array, object) is ignored. Duplicate uuid values in the file stay in the chain, in order.",
     "A line that repeats a key (`uuid` or `sessionId` twice in the same object) is skipped as a whole, like serde's duplicate-field error. Mirrors must reject such a line too.",
     "Only `uuid` and `sessionId` are interpreted. Every other field and unknown line shape is ignored.",
-    "Chains are compared as exact string sequences: equal means AlreadyCurrent, a strict prefix of the incoming chain means Replace, anything else means Diverged."
+    "Chains are compared as exact string sequences: equal means AlreadyCurrent, a strict prefix of the incoming chain means Replace, anything else means Diverged.",
+    "Only top-level KEY strings and the values of `uuid` and `sessionId` are checked beyond JSON syntax (escapes, paired surrogates, valid UTF-8, finite numbers, nesting depth 127). A lone surrogate escape, invalid UTF-8 bytes, an out-of-range number such as 1e400 or deep nesting inside any other field does NOT drop the line. A line that is a JSON array of exactly two values is read positionally like serde reads a struct (the first value is `uuid`, the second `sessionId`); any other array contributes nothing."
   ]
 }

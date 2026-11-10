@@ -1399,6 +1399,19 @@ get them after HR2.
   - refuse while the session is busy, or when HEAD or the last row changed before the
     flip. Step 7 precondition for F4-L: the last row id still matches, so the local row
     count at the flip equals `moved_at_row` (the first row append refuses otherwise).
+  - **F4-2h contract:** `sessions.import` refuses a Claude session id that an earlier Host
+    session with turns (or a running one) still binds, and return-to-local only tombstones
+    the session in the app. So before importing the same conversation to a Host again,
+    F4-3a must `sessions.delete` (or unbind) the old Host session there. An untouched
+    session from an earlier import is reused, so a retry of the same step is safe.
+  - **F4-2h `fromCwds`:** `sessions.import` requires `fromCwds`, a non-empty array of
+    absolute paths: the client sends the project cwd plus the session cwd as written in the
+    transcript. Only those roots are rewritten (a trailing separator is ignored, subpaths are
+    kept); there is no fallback guess from the transcript.
+  - **F4-2h default branch:** `workspace.applySnapshot` accepts origin's default branch only
+    when `head` equals the tip of `origin/<branch>` (uncommitted changes only). A shared
+    instance then gets a detached worktree at `head`. Otherwise the client must send the
+    `<branch>-cloud` branch.
 - **Acceptance:**
   - [ ] Tests with fakes for git, the Host and backends:
     - every step is idempotent;

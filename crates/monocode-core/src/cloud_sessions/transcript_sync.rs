@@ -146,6 +146,13 @@ mod tests {
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
     }
 
+    fn fixture_bytes(name: &str) -> Vec<u8> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/transcript_sync")
+            .join(name);
+        std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
     fn manifest() -> Value {
         serde_json::from_str(&fixture("cases.json")).unwrap()
     }
@@ -153,14 +160,14 @@ mod tests {
     #[test]
     fn chains_match_the_shared_fixtures() {
         for chain in manifest()["chains"].as_array().unwrap() {
-            let file = fixture(chain["file"].as_str().unwrap());
+            let file = fixture_bytes(chain["file"].as_str().unwrap());
             let want: Vec<String> = chain["uuids"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .map(|u| u.as_str().unwrap().to_string())
                 .collect();
-            assert_eq!(parse_chain(file.as_bytes()), want, "{}", chain["file"]);
+            assert_eq!(parse_chain(&file), want, "{}", chain["file"]);
         }
     }
 
@@ -168,8 +175,8 @@ mod tests {
     fn decisions_match_the_shared_fixtures() {
         let m = manifest();
         for case in m["cases"].as_array().unwrap() {
-            let existing = case["existing"].as_str().map(fixture);
-            let incoming = fixture(case["incoming"].as_str().unwrap());
+            let existing = case["existing"].as_str().map(fixture_bytes);
+            let incoming = fixture_bytes(case["incoming"].as_str().unwrap());
             let want = match case["decision"].as_str().unwrap() {
                 "install" => Decision::Install,
                 "replace" => Decision::Replace,
@@ -178,12 +185,36 @@ mod tests {
                 other => panic!("unknown decision {other}"),
             };
             assert_eq!(
-                decide(existing.as_deref().map(str::as_bytes), incoming.as_bytes()),
+                decide(existing.as_deref(), &incoming),
                 want,
                 "{}",
                 case["name"]
             );
         }
+    }
+
+    #[test]
+    fn only_keys_and_ids_are_checked_beyond_json_syntax() {
+        // The contract the TypeScript mirror is pinned to (see edgeRules in cases.json):
+        // oddities inside other fields keep the line in the chain, oddities in a
+        // top-level key or in `uuid` / `sessionId` drop it.
+        for (file, want) in [
+            ("edge_lone_surrogate_ignored.jsonl", vec!["s1", "s2"]),
+            ("edge_invalid_utf8_ignored.jsonl", vec!["u1", "u2"]),
+            ("edge_number_range_ignored.jsonl", vec!["n1", "n2"]),
+            ("edge_deep_nesting_ignored.jsonl", vec!["p1", "p2"]),
+            ("edge_array_line.jsonl", vec!["u1", "r1"]),
+            ("edge_strict_ids.jsonl", vec!["k1"]),
+        ] {
+            assert_eq!(parse_chain(&fixture_bytes(file)), want, "{file}");
+        }
+        assert_eq!(
+            decide(
+                Some(&fixture_bytes("edge_prefix.jsonl")),
+                &fixture_bytes("edge_lone_surrogate_ignored.jsonl")
+            ),
+            Decision::Replace
+        );
     }
 
     #[test]
