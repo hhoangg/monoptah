@@ -69,29 +69,81 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// True when the Host no longer holds a usable upload for this id (expired,
+/// or discarded after a hash mismatch), or the resumed upload does not match.
+fn host_dropped(message: &str) -> bool {
+    message.contains("Upload not found")
+        || message.contains("sha256 does not match")
+        || message.contains("does not match the one being resumed")
+}
+
+fn stamp(path: &Path) -> Option<(u64, Option<std::time::SystemTime>)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()))
+}
+
 /// Uploads `path` as `name` through `request(method, params)`, which sends
-/// one Host RPC. Returns the committed file on the Host.
+/// one Host RPC. Returns the committed file on the Host. When the Host has
+/// dropped the upload (expired, or discarded after a hash mismatch) or the
+/// source changed while sending, the transfer restarts once from `begin`
+/// with a fresh upload id and a fresh hash.
 pub fn upload_file(
     request: &mut dyn FnMut(&str, Value) -> Result<Value, String>,
     path: &Path,
     name: &str,
     mut options: UploadOptions<'_>,
 ) -> Result<UploadedFile, UploadError> {
-    let fail = |message: String, id: Option<&str>| UploadError {
-        message,
-        upload_id: id.map(str::to_string),
-        cancelled: false,
+    let resume = options.resume_id.take();
+    match attempt(request, path, name, &mut options, resume) {
+        Err((_, true)) => attempt(request, path, name, &mut options, None).map_err(|(e, _)| e),
+        other => other.map_err(|(e, _)| e),
+    }
+}
+
+/// One transfer. The bool on failure says a restart from `begin` may help.
+fn attempt(
+    request: &mut dyn FnMut(&str, Value) -> Result<Value, String>,
+    path: &Path,
+    name: &str,
+    options: &mut UploadOptions<'_>,
+    resume_id: Option<String>,
+) -> Result<UploadedFile, (UploadError, bool)> {
+    // A dropped upload advertises no resumable id.
+    let fail = |message: String, id: Option<&str>| {
+        let dropped = host_dropped(&message);
+        (
+            UploadError {
+                message,
+                upload_id: if dropped {
+                    None
+                } else {
+                    id.map(str::to_string)
+                },
+                cancelled: false,
+            },
+            dropped,
+        )
     };
+    let changed = || {
+        (
+            UploadError {
+                message: "The file changed while it was being uploaded".into(),
+                upload_id: None,
+                cancelled: false,
+            },
+            true,
+        )
+    };
+    let before = stamp(path);
     let (sha256, size) = sha256_file(path).map_err(|m| fail(m, None))?;
     if size > MAX_UPLOAD_BYTES {
         return Err(fail("File is larger than 500 MB.".into(), None));
     }
     let mut begin = json!({"name": name, "size": size, "sha256": sha256});
-    if let Some(id) = &options.resume_id {
+    if let Some(id) = &resume_id {
         begin["uploadId"] = json!(id);
     }
-    let started =
-        request("uploads.begin", begin).map_err(|m| fail(m, options.resume_id.as_deref()))?;
+    let started = request("uploads.begin", begin).map_err(|m| fail(m, resume_id.as_deref()))?;
     let id = started["uploadId"]
         .as_str()
         .filter(|id| !id.is_empty())
@@ -109,13 +161,20 @@ pub fn upload_file(
     let mut file = File::open(path).map_err(|e| fail(e.to_string(), Some(&id)))?;
     let mut buffer = vec![0u8; chunk];
     while offset < size {
+        if stamp(path) != before {
+            let _ = request("uploads.discard", json!({"uploadId": id}));
+            return Err(changed());
+        }
         if options.cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             let _ = request("uploads.discard", json!({"uploadId": id}));
-            return Err(UploadError {
-                message: "Upload cancelled".into(),
-                upload_id: None,
-                cancelled: true,
-            });
+            return Err((
+                UploadError {
+                    message: "Upload cancelled".into(),
+                    upload_id: None,
+                    cancelled: true,
+                },
+                false,
+            ));
         }
         let want = chunk.min((size - offset) as usize);
         file.seek(SeekFrom::Start(offset))
@@ -146,6 +205,10 @@ pub fn upload_file(
         if let Some(progress) = options.progress.as_mut() {
             progress(offset, size);
         }
+    }
+    if stamp(path) != before {
+        let _ = request("uploads.discard", json!({"uploadId": id}));
+        return Err(changed());
     }
     let done =
         request("uploads.commit", json!({"uploadId": id})).map_err(|m| fail(m, Some(&id)))?;
@@ -442,5 +505,104 @@ mod tests {
         )
         .unwrap_err();
         assert!(missing.upload_id.is_none());
+    }
+
+    #[test]
+    fn restarts_once_when_the_host_dropped_the_resumed_upload() {
+        let bytes = data(CHUNK_BYTES + 3);
+        let (_dir, path) = file(&bytes);
+        let mut host = FakeHost::default();
+        let done = upload_file(
+            &mut |m, p| host.call(m, p),
+            &path,
+            "kit.tar",
+            UploadOptions {
+                resume_id: Some("0".repeat(32)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_ne!(done.upload_id, "0".repeat(32));
+        assert_eq!(host.uploads[&done.upload_id].3, bytes);
+        let begins = host.calls.iter().filter(|c| *c == "uploads.begin").count();
+        assert_eq!(begins, 2);
+    }
+
+    #[test]
+    fn restarts_once_after_a_hash_mismatch_and_advertises_no_id_when_it_fails_again() {
+        let bytes = data(10);
+        let (_dir, path) = file(&bytes);
+        let mut host = FakeHost::default();
+        let mut corrupt_first = true;
+        let done = upload_file(
+            &mut |m, p| {
+                let mut p = p;
+                if m == "uploads.chunk" && corrupt_first {
+                    corrupt_first = false;
+                    p["data"] = json!(STANDARD.encode(b"corrupted!"));
+                }
+                let r = host.call(m, p.clone());
+                if m == "uploads.commit" && r.is_err() {
+                    // The real Host deletes the upload after a mismatch.
+                    host.uploads.remove(p["uploadId"].as_str().unwrap());
+                }
+                r
+            },
+            &path,
+            "kit.tar",
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(done.size, 10);
+
+        let mut host = FakeHost::default();
+        let err = upload_file(
+            &mut |m, p| {
+                let mut p = p;
+                if m == "uploads.chunk" {
+                    p["data"] = json!(STANDARD.encode(b"corrupted!"));
+                }
+                let r = host.call(m, p.clone());
+                if m == "uploads.commit" && r.is_err() {
+                    host.uploads.remove(p["uploadId"].as_str().unwrap());
+                }
+                r
+            },
+            &path,
+            "kit.tar",
+            Default::default(),
+        )
+        .unwrap_err();
+        assert!(err.message.contains("sha256"), "{err}");
+        assert!(err.upload_id.is_none());
+        assert_eq!(
+            host.calls.iter().filter(|c| *c == "uploads.begin").count(),
+            2
+        );
+    }
+
+    #[test]
+    fn restarts_when_the_source_changes_while_sending() {
+        let bytes = data(CHUNK_BYTES * 2);
+        let (_dir, path) = file(&bytes);
+        let mut host = FakeHost::default();
+        let mut changed = false;
+        let replacement = data(CHUNK_BYTES * 2 + 9);
+        let done = upload_file(
+            &mut |m, p| {
+                if m == "uploads.chunk" && !changed {
+                    changed = true;
+                    std::fs::write(&path, &replacement).unwrap();
+                }
+                host.call(m, p)
+            },
+            &path,
+            "kit.tar",
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(done.size, replacement.len() as u64);
+        assert_eq!(done.sha256, hex(&Sha256::digest(&replacement)));
+        assert!(host.uploads.len() == 1, "the stale upload is discarded");
     }
 }
