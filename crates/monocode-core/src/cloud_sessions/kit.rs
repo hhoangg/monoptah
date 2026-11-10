@@ -33,9 +33,10 @@
 //! The scan checks links once. A link swapped afterwards could still point out of the
 //! item, so the digest and tar steps must open files without following links: re-
 //! canonicalize each path and check `starts_with(root)`, ideally comparing the dev and
-//! inode recorded at scan time. Hard links inside an item are accepted when the file is
-//! on the item's device (see `scan_item`); pnpm and Nix store hard links are a known
-//! limit that cannot be told apart cheaply.
+//! inode recorded at scan time. A file with several hard links is refused when it is the
+//! same file (device and inode) as one found under the credentials folders (`~/.ssh`,
+//! `~/.aws`, ...), see [`Guard`]. Other hard links are NOT detected: a link to some
+//! other private file cannot be told from a pnpm or Nix store link cheaply.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
@@ -110,8 +111,10 @@ pub enum Exclusion {
     /// The item root resolves to a place that is never a skill or plugin: `$HOME` itself,
     /// a folder that contains it, a credentials folder or a system folder.
     UnsafeRoot,
-    /// A file with several hard links that lives on another device than the item root.
+    /// A file with several hard links that is the same file as one in a credentials folder.
     HardLinkElsewhere,
+    /// The item contains a credentials folder (`.ssh`, `.aws`, `~/.config/gh`, ...).
+    SensitiveContent,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -185,6 +188,8 @@ pub enum SecretLocation {
     Env(String),
     Header(String),
     UrlQuery,
+    /// The URL carries `user:password@`.
+    UrlUserinfo,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -365,13 +370,15 @@ pub fn build_inventory_budgeted(
     probe: &dyn Fn(&KitMcpServer) -> Option<bool>,
     budget: Duration,
 ) -> KitInventory {
+    let home = std::fs::canonicalize(&roots.home).unwrap_or_else(|_| roots.home.clone());
+    let guard = Guard::new(roots, &home);
     let started = Clock {
         started: Instant::now(),
         budget,
         raw_home: &roots.home,
         project: &roots.project,
+        guard: &guard,
     };
-    let home = std::fs::canonicalize(&roots.home).unwrap_or_else(|_| roots.home.clone());
     let sources = sources(roots);
     let mut inventory = KitInventory::default();
     let mut plugin_dirs: Vec<(String, PathBuf, KitSource)> = Vec::new();
@@ -486,6 +493,7 @@ struct Clock<'a> {
     raw_home: &'a Path,
     /// The local project, for roots that live outside `$HOME`.
     project: &'a Path,
+    guard: &'a Guard,
 }
 
 struct Scan {
@@ -493,8 +501,6 @@ struct Scan {
     size: u64,
     has_native: bool,
     exclusion: Option<Exclusion>,
-    /// Device of the item root, to spot hard links to another device.
-    root_dev: Option<u64>,
 }
 
 /// Folders under `$HOME` that hold credentials. An item root never resolves into one.
@@ -520,8 +526,98 @@ const SYSTEM_DIRS: [&str; 8] = [
     "/private/var/root",
 ];
 
-/// Is `real_root` a place that is never a skill or plugin? `root` is the path as named.
-fn unsafe_root(root: &Path, real_root: &Path, homes: [&Path; 2]) -> bool {
+/// Places an item must never reach, and the identity of credential files.
+struct Guard {
+    /// Credentials folders and files, the claude config dirs and the app data dir. An item
+    /// root may not be one of these or contain one. Walking into one is refused too.
+    forbidden: Vec<PathBuf>,
+    /// (device, inode) of regular files found under the credentials folders, to spot a
+    /// hard link to one of them.
+    secret_files: HashSet<(u64, u64)>,
+}
+
+/// Entries read when collecting credential file identities.
+const MAX_GUARD_ENTRIES: usize = 20_000;
+
+/// Folder names that are never part of a skill or plugin, wherever they sit.
+const SENSITIVE_NAMES: [&str; 5] = [".ssh", ".aws", ".gnupg", ".kube", ".docker"];
+
+impl Guard {
+    fn new(roots: &KitRoots, home: &Path) -> Self {
+        let mut forbidden: Vec<PathBuf> = Vec::new();
+        let mut add = |path: PathBuf| {
+            if let Ok(real) = std::fs::canonicalize(&path) {
+                if real != path {
+                    forbidden.push(real);
+                }
+            }
+            forbidden.push(path);
+        };
+        for base in [home, roots.home.as_path()] {
+            for dir in SENSITIVE_HOME_DIRS {
+                add(base.join(dir));
+            }
+            add(base.join(".claude"));
+            add(base.join(".claude/.credentials.json"));
+        }
+        add(roots.claude_home.clone());
+        if let Some(dir) = &roots.account_dir {
+            add(dir.clone());
+        }
+        if let Some(dir) = &roots.key_dir {
+            add(dir.clone());
+        }
+        forbidden.sort();
+        forbidden.dedup();
+        let mut secret_files = HashSet::new();
+        let mut budget = MAX_GUARD_ENTRIES;
+        for dir in SENSITIVE_HOME_DIRS {
+            collect_file_ids(&home.join(dir), &mut secret_files, &mut budget);
+        }
+        collect_file_ids(
+            &home.join(".claude/.credentials.json"),
+            &mut secret_files,
+            &mut budget,
+        );
+        Self {
+            forbidden,
+            secret_files,
+        }
+    }
+}
+
+/// Add the (device, inode) of every regular file under `path`, without following links.
+/// Errors are ignored and `budget` caps the entries read.
+fn collect_file_ids(path: &Path, out: &mut HashSet<(u64, u64)>, budget: &mut usize) {
+    if *budget == 0 {
+        return;
+    }
+    *budget -= 1;
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if meta.is_file() {
+        if let Some(id) = file_id(&meta) {
+            out.insert(id);
+        }
+    } else if meta.is_dir() {
+        if let Ok(reader) = std::fs::read_dir(path) {
+            for entry in reader.flatten() {
+                collect_file_ids(&entry.path(), out, budget);
+            }
+        }
+    }
+}
+
+/// Is `real_root` a place that is never a skill or plugin? `root` is the path as named
+/// and `canonical_named` the same path with its parent canonicalized.
+fn unsafe_root(
+    root: &Path,
+    canonical_named: &Path,
+    real_root: &Path,
+    homes: [&Path; 2],
+    guard: &Guard,
+) -> bool {
     if real_root.parent().is_none() || SYSTEM_DIRS.iter().any(|d| real_root.starts_with(d)) {
         return true;
     }
@@ -529,8 +625,22 @@ fn unsafe_root(root: &Path, real_root: &Path, homes: [&Path; 2]) -> bool {
     if homes.iter().any(|home| home.starts_with(real_root)) {
         return true;
     }
-    // A folder that contains the path that names the root (`foo -> ..`).
-    if real_root != root && root.starts_with(real_root) {
+    // A folder that contains the path that names the root (`foo -> ..`). The named path
+    // is also checked with its parent canonicalized, for a home behind a link.
+    if real_root != root
+        && (root.starts_with(real_root)
+            || (canonical_named != real_root && canonical_named.starts_with(real_root)))
+    {
+        return true;
+    }
+    // A credentials folder or file, the claude config dirs or the app data dir, or a
+    // folder that contains one of them (`foo -> ~/.config`, `foo -> ~/.claude`). Living
+    // UNDER `~/.claude` (`~/.claude/skills/foo`) is fine.
+    if guard
+        .forbidden
+        .iter()
+        .any(|path| path.starts_with(real_root))
+    {
         return true;
     }
     homes.iter().any(|home| {
@@ -539,6 +649,11 @@ fn unsafe_root(root: &Path, real_root: &Path, homes: [&Path; 2]) -> bool {
             .any(|dir| real_root.starts_with(home.join(dir)))
             || real_root.starts_with(home.join("Library/Keychains"))
     })
+}
+
+/// Is a directory met while walking an item a credentials folder?
+fn sensitive_dir(path: &Path, name: &str, guard: &Guard) -> bool {
+    SENSITIVE_NAMES.contains(&name) || guard.forbidden.iter().any(|f| f == path)
 }
 
 /// Walk one skill or plugin directory. Files come back sorted, so every later step is
@@ -562,7 +677,6 @@ fn scan_item(root: &Path, kind: ItemKind, home: &Path, started: Clock<'_>) -> Sc
         size: 0,
         has_native: false,
         exclusion: None,
-        root_dev: None,
     };
     let cap = match kind {
         ItemKind::Skill => MAX_SKILL_BYTES,
@@ -576,7 +690,19 @@ fn scan_item(root: &Path, kind: ItemKind, home: &Path, started: Clock<'_>) -> Sc
         scan.exclusion = Some(Exclusion::LinkOutsideHome);
         return scan;
     }
-    if unsafe_root(root, &real_root, [home, started.raw_home]) {
+    let canonical_named = match (root.parent(), root.file_name()) {
+        (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+            .map(|p| p.join(name))
+            .unwrap_or_else(|_| root.to_path_buf()),
+        _ => root.to_path_buf(),
+    };
+    if unsafe_root(
+        root,
+        &canonical_named,
+        &real_root,
+        [home, started.raw_home],
+        started.guard,
+    ) {
         scan.exclusion = Some(Exclusion::UnsafeRoot);
         return scan;
     }
@@ -591,7 +717,6 @@ fn scan_item(root: &Path, kind: ItemKind, home: &Path, started: Clock<'_>) -> Sc
             return scan;
         }
     }
-    scan.root_dev = device_of(&real_root);
     if kind == ItemKind::Plugin && (root.join("bin").exists() || root.join(".lsp.json").exists()) {
         scan.has_native = true;
     }
@@ -670,15 +795,24 @@ fn walk(
             (path, meta)
         };
         if meta.is_dir() {
+            if sensitive_dir(&path, &name, started.guard) {
+                scan.exclusion = Some(Exclusion::SensitiveContent);
+                return;
+            }
             if !visited.insert(path.clone()) {
                 continue;
             }
             walk(&path, item_root, kind, started, cap, visited, entries, scan);
         } else if meta.is_file() {
-            // Hard links cannot be traced cheaply. A multi-link file on another device
-            // than the item root is refused; one on the same device is accepted, which
-            // is a known limit (pnpm and Nix store hard links look the same).
-            if hard_link_elsewhere(link_count(&meta), device_of_meta(&meta), scan.root_dev) {
+            // A file that is a hard link to a credentials file is refused. Other hard
+            // links are not detected (see the module docs).
+            if started.guard.forbidden.contains(&path) {
+                scan.exclusion = Some(Exclusion::SensitiveContent);
+                return;
+            }
+            if link_count(&meta) > 1
+                && file_id(&meta).is_some_and(|id| started.guard.secret_files.contains(&id))
+            {
                 scan.exclusion = Some(Exclusion::HardLinkElsewhere);
                 return;
             }
@@ -695,10 +829,6 @@ fn walk(
     }
 }
 
-fn hard_link_elsewhere(links: u64, dev: Option<u64>, root_dev: Option<u64>) -> bool {
-    links > 1 && dev.is_some() && root_dev.is_some() && dev != root_dev
-}
-
 #[cfg(unix)]
 fn link_count(meta: &std::fs::Metadata) -> u64 {
     std::os::unix::fs::MetadataExt::nlink(meta)
@@ -708,22 +838,13 @@ fn link_count(_meta: &std::fs::Metadata) -> u64 {
     1
 }
 #[cfg(unix)]
-fn device_of_meta(meta: &std::fs::Metadata) -> Option<u64> {
-    Some(std::os::unix::fs::MetadataExt::dev(meta))
+fn file_id(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.dev(), meta.ino()))
 }
 #[cfg(not(unix))]
-fn device_of_meta(_meta: &std::fs::Metadata) -> Option<u64> {
+fn file_id(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
     None
-}
-fn device_of(path: &Path) -> Option<u64> {
-    std::fs::metadata(path)
-        .ok()
-        .and_then(|m| device_of_meta(&m))
-}
-
-#[cfg(test)]
-pub(super) fn hard_link_elsewhere_for_test(links: u64, dev: u64, root_dev: u64) -> bool {
-    hard_link_elsewhere(links, Some(dev), Some(root_dev))
 }
 
 enum Link {
@@ -1299,13 +1420,24 @@ fn find_secrets(object: &serde_json::Map<String, Value>) -> Vec<SecretField> {
         }
     }
     if let Some(raw) = object.get("url").and_then(Value::as_str) {
-        let has_query = url::Url::parse(raw)
-            .map(|url| url.query().is_some_and(|q| !q.is_empty()))
+        let (has_query, has_userinfo) = match url::Url::parse(raw) {
+            Ok(url) => (
+                url.query().is_some_and(|q| !q.is_empty()),
+                !url.username().is_empty() || url.password().is_some(),
+            ),
             // A URL we cannot parse still counts if it carries a `?query`.
-            .unwrap_or_else(|_| raw.split_once('?').is_some_and(|(_, q)| !q.is_empty()));
-        if has_query {
+            Err(_) => (
+                raw.split_once('?').is_some_and(|(_, q)| !q.is_empty()),
+                false,
+            ),
+        };
+        if has_query || has_userinfo {
             secrets.push(SecretField {
-                location: SecretLocation::UrlQuery,
+                location: if has_userinfo {
+                    SecretLocation::UrlUserinfo
+                } else {
+                    SecretLocation::UrlQuery
+                },
                 value: Secret::new(raw),
             });
         }
@@ -1328,17 +1460,39 @@ fn mask_secrets(config: &Value, secrets: &[SecretField]) -> Value {
         match &secret.location {
             SecretLocation::Env(field) => mask_field(object, "env", field, marker),
             SecretLocation::Header(field) => mask_field(object, "headers", field, marker),
-            SecretLocation::UrlQuery => {
-                // Keep scheme, host and path in the plain hash; mask only the query.
+            SecretLocation::UrlQuery | SecretLocation::UrlUserinfo => {
                 if let Some(raw) = object.get("url").and_then(Value::as_str) {
-                    let base = raw.split_once('?').map_or(raw, |(base, _)| base);
-                    let masked = format!("{base}?{SECRET_MARKER}");
+                    let masked = mask_url(raw);
                     object.insert("url".to_string(), Value::String(masked));
                 }
             }
         }
     }
     masked
+}
+
+/// The plain form of a secret-bearing URL: scheme, host, port and path only. Userinfo,
+/// query and fragment are replaced by a marker, so none of them reaches a plain hash.
+fn mask_url(raw: &str) -> String {
+    let Ok(url) = url::Url::parse(raw) else {
+        let base = raw.split_once('?').map_or(raw, |(base, _)| base);
+        return format!("{base}?{SECRET_MARKER}");
+    };
+    let mut out = format!("{}://", url.scheme());
+    if !url.username().is_empty() || url.password().is_some() {
+        out.push_str(SECRET_MARKER);
+        out.push('@');
+    }
+    out.push_str(url.host_str().unwrap_or(""));
+    if let Some(port) = url.port() {
+        out.push_str(&format!(":{port}"));
+    }
+    out.push_str(url.path());
+    if url.query().is_some_and(|q| !q.is_empty()) {
+        out.push('?');
+        out.push_str(SECRET_MARKER);
+    }
+    out
 }
 
 fn mask_field(
@@ -1365,8 +1519,8 @@ const KEY_BYTES: usize = 32;
 /// - A symlink at the key path is never followed or replaced.
 /// - A key file readable by group or others is refused (degrade), never replaced.
 /// - A file that cannot be read is left alone. A file that is empty or malformed is
-///   garbage (for example a crash while writing an older version) and is recreated.
-///   A valid key is never replaced.
+///   garbage (for example a crash while writing an older version): it is renamed aside
+///   (see [`retire_garbage`]) and a new key is created. A valid key is never replaced.
 /// - A new key is written to a temp file (0600) in the same dir and published with a
 ///   hard link, which fails instead of replacing, so a crash never leaves a partial key
 ///   and two processes agree on one key.
@@ -1382,13 +1536,10 @@ fn load_or_create_key(dir: &Path) -> Option<[u8; KEY_BYTES]> {
             if let Some(key) = parse_key(&text) {
                 return Some(key);
             }
-            // Garbage: recheck right before removing so a key another process just
-            // published is not lost.
-            let again = std::fs::read_to_string(&path).ok()?;
-            if let Some(key) = parse_key(&again) {
+            // Garbage: move it aside, never delete blindly.
+            if let Some(key) = retire_garbage(&path, file_id(&meta)) {
                 return Some(key);
             }
-            std::fs::remove_file(&path).ok()?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => return None,
@@ -1405,6 +1556,54 @@ fn key_file_too_open(meta: &std::fs::Metadata) -> bool {
 #[cfg(not(unix))]
 fn key_file_too_open(_meta: &std::fs::Metadata) -> bool {
     false
+}
+
+/// Remove a key file that was unreadable as a key, without ever losing a valid one.
+/// Returns a key only when a valid one turned up (another process published it).
+///
+/// The file is renamed aside atomically, and only when it is still the file we read
+/// (same device and inode). Whatever was moved is read again: a valid key is linked
+/// back without replacing anything. `None` means the path is clear, so the caller
+/// creates a new key.
+fn retire_garbage(path: &Path, seen: Option<(u64, u64)>) -> Option<[u8; KEY_BYTES]> {
+    let now = std::fs::symlink_metadata(path).ok();
+    if now.as_ref().and_then(file_id) != seen {
+        // Replaced since we read it: use whatever is there now.
+        return parse_key(&std::fs::read_to_string(path).ok()?);
+    }
+    let aside = path.with_file_name(format!(
+        "{KEY_FILE}.garbage-{}-{:08x}",
+        std::process::id(),
+        rand::random::<u32>()
+    ));
+    std::fs::rename(path, &aside).ok()?;
+    let moved = std::fs::read_to_string(&aside)
+        .ok()
+        .and_then(|t| parse_key(&t));
+    let Some(key) = moved else {
+        let _ = std::fs::remove_file(&aside);
+        return None;
+    };
+    // We moved a valid key that was published in the meantime: put it back. If someone
+    // published another one since, theirs stays and wins.
+    match std::fs::hard_link(&aside, path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&aside);
+            Some(key)
+        }
+        Err(_) => {
+            let _ = std::fs::remove_file(&aside);
+            parse_key(&std::fs::read_to_string(path).ok()?)
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn retire_garbage_for_test(
+    path: &Path,
+    seen: Option<(u64, u64)>,
+) -> Option<[u8; KEY_BYTES]> {
+    retire_garbage(path, seen)
 }
 
 fn create_key(dir: &Path, path: &Path) -> Option<[u8; KEY_BYTES]> {

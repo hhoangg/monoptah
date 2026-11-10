@@ -1352,28 +1352,143 @@ fn a_url_query_secret_masks_only_the_query_in_the_plain_hash() {
     assert_ne!(base.secrets_digest, other_secret.secrets_digest);
 }
 
+#[cfg(unix)]
 #[test]
-fn hard_links_are_refused_only_across_devices() {
-    use super::kit::hard_link_elsewhere_for_test as elsewhere;
-    assert!(elsewhere(2, 7, 8));
-    assert!(!elsewhere(1, 7, 8));
-    assert!(!elsewhere(2, 8, 8));
+fn a_hard_link_to_a_credentials_file_is_refused_and_other_hard_links_are_a_known_limit() {
+    let env = env();
+    let skills = env.roots.claude_home.join("skills");
+    skill(&skills, "secret", "x");
+    skill(&skills, "plain", "x");
+    write(&env.roots.home.join(".aws/credentials"), "fake");
+    write(&env.roots.home.join(".claude/.credentials.json"), "fake");
+    write(&env.roots.home.join("other/file.txt"), "abc");
+    std::fs::hard_link(
+        env.roots.home.join(".aws/credentials"),
+        skills.join("secret/c.txt"),
+    )
+    .unwrap();
+    skill(&skills, "oauth", "x");
+    std::fs::hard_link(
+        env.roots.home.join(".claude/.credentials.json"),
+        skills.join("oauth/c.json"),
+    )
+    .unwrap();
+    std::fs::hard_link(
+        env.roots.home.join("other/file.txt"),
+        skills.join("plain/file.txt"),
+    )
+    .unwrap();
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    let rows: Vec<_> = inventory
+        .skills
+        .iter()
+        .map(|s| (s.name.as_str(), s.exclusion))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("oauth", Some(Exclusion::HardLinkElsewhere)),
+            ("plain", None),
+            ("secret", Some(Exclusion::HardLinkElsewhere)),
+        ]
+    );
 }
 
 #[cfg(unix)]
 #[test]
-fn a_hard_link_on_the_same_device_is_accepted_as_a_known_limit() {
-    let env = env();
-    let skills = env.roots.claude_home.join("skills");
-    skill(&skills, "hl", "x");
-    write(&env.roots.home.join("other/file.txt"), "abc");
-    std::fs::hard_link(
-        env.roots.home.join("other/file.txt"),
-        skills.join("hl/file.txt"),
-    )
-    .unwrap();
-    let inventory = build_inventory(&env.roots, Workspace::Codespace);
-    assert_eq!(inventory.skills[0].exclusion, None);
+fn a_folder_named_like_a_credentials_folder_inside_a_skill_excludes_it() {
+    for dir in [".ssh", ".aws", ".gnupg", ".kube", ".docker"] {
+        let env = env();
+        let skills = env.roots.claude_home.join("skills");
+        skill(&skills, "s", "x");
+        write(&skills.join("s").join(dir).join("f"), "fake");
+        let inventory = build_inventory(&env.roots, Workspace::Codespace);
+        assert_eq!(
+            inventory.skills[0].exclusion,
+            Some(Exclusion::SensitiveContent),
+            "{dir}"
+        );
+    }
+}
+
+#[test]
+fn a_url_password_is_a_secret_with_or_without_a_query() {
+    for url in [
+        "https://bot:{}@mcp.example.com/mcp?x=1",
+        "https://bot:{}@mcp.example.com/mcp",
+        "https://{}@mcp.example.com:8443/mcp",
+    ] {
+        let env = env();
+        let build = |secret: &str| {
+            servers_json(
+                &env,
+                json!({"b": {"type": "http", "url": url.replace("{}", secret)}}),
+            );
+            let inventory = build_inventory(&env.roots, Workspace::Codespace);
+            (inventory.mcp_servers[0].clone(), inventory.content_hash)
+        };
+        let (one, content_one) = build("s3cr3t-one");
+        let (two, content_two) = build("s3cr3t-two");
+        assert!(!one.secrets.is_empty(), "{url}");
+        assert_eq!(one.config_hash, two.config_hash, "{url}");
+        assert_eq!(content_one, content_two, "{url}");
+        assert_ne!(one.secrets_digest, two.secrets_digest, "{url}");
+        assert!(!format!("{one:?}").contains("s3cr3t"), "{url}");
+    }
+}
+
+#[cfg(unix)]
+mod key_race {
+    use super::super::kit::retire_garbage_for_test as retire;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    const VALID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn write_key(path: &std::path::Path, text: &str) {
+        std::fs::write(path, text).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn id(path: &std::path::Path) -> Option<(u64, u64)> {
+        let meta = std::fs::symlink_metadata(path).unwrap();
+        Some((meta.dev(), meta.ino()))
+    }
+
+    #[test]
+    fn garbage_replaced_by_a_valid_key_before_removal_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kit-hash.key");
+        write_key(&path, "garbage");
+        let seen = id(&path);
+        // Another writer replaces the garbage with a valid key (new inode).
+        let other = dir.path().join("other");
+        write_key(&other, VALID);
+        std::fs::rename(&other, &path).unwrap();
+        assert!(retire(&path, seen).is_some());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), VALID);
+    }
+
+    #[test]
+    fn a_valid_key_moved_aside_by_mistake_is_put_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kit-hash.key");
+        write_key(&path, VALID);
+        // Identity matches (as if the valid key landed in place after we read garbage).
+        assert!(retire(&path, id(&path)).is_some());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), VALID);
+        let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().flatten().collect();
+        assert_eq!(names.len(), 1);
+    }
+
+    #[test]
+    fn real_garbage_is_cleared_and_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kit-hash.key");
+        write_key(&path, "garbage");
+        assert!(retire(&path, id(&path)).is_none());
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
 }
 
 #[cfg(unix)]
@@ -1486,6 +1601,96 @@ mod roots {
                 ("stray".to_string(), Some(Exclusion::UnsafeRoot))
             ]
         );
+    }
+
+    #[test]
+    fn a_root_that_contains_a_credentials_folder_or_claude_home_is_excluded() {
+        for target in [".config", ".claude", "."] {
+            let env = env();
+            write(&env.roots.home.join(".config/gh/hosts.yml"), "fake");
+            write(&env.roots.home.join(".claude/.credentials.json"), "fake");
+            write(&env.roots.home.join(".config/SKILL.md"), "x");
+            write(&env.roots.home.join(".claude/SKILL.md"), "x");
+            write(&env.roots.home.join("SKILL.md"), "x");
+            let skills = env.roots.claude_home.join("skills");
+            std::fs::create_dir_all(&skills).unwrap();
+            symlink(env.roots.home.join(target), skills.join("foo")).unwrap();
+            let project_skills = env.roots.project.join(".claude/skills");
+            std::fs::create_dir_all(&project_skills).unwrap();
+            symlink(env.roots.home.join(target), project_skills.join("bar")).unwrap();
+            let inventory = build_inventory(&env.roots, Workspace::Codespace);
+            assert!(!inventory.skills.is_empty());
+            for skill in &inventory.skills {
+                assert_eq!(skill.exclusion, Some(Exclusion::UnsafeRoot), "{target}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_plugin_install_path_that_contains_credentials_is_excluded() {
+        for rel in [".config", ".claude"] {
+            let env = env();
+            write(&env.roots.home.join(".config/gh/hosts.yml"), "fake");
+            write(&env.roots.home.join(".claude/.credentials.json"), "fake");
+            let raw = env.roots.home.join(rel).display().to_string();
+            write_json(
+                &env.roots.claude_home.join("plugins/installed_plugins.json"),
+                json!({"version": 2, "plugins": {"p@mk": [{"scope": "user", "version": "1", "installPath": raw}]}}),
+            );
+            write_json(
+                &env.roots.claude_home.join("settings.json"),
+                json!({"enabledPlugins": {"p@mk": true}}),
+            );
+            let inventory = build_inventory(&env.roots, Workspace::Codespace);
+            assert_eq!(
+                inventory.plugins[0].exclusion,
+                Some(Exclusion::UnsafeRoot),
+                "{rel}"
+            );
+        }
+    }
+
+    #[test]
+    fn real_skill_and_plugin_dirs_under_claude_home_are_still_accepted() {
+        let env = env();
+        let skills = env.roots.claude_home.join("skills");
+        skill(&skills, "real", "x");
+        let inventory = build_inventory(&env.roots, Workspace::Codespace);
+        assert_eq!(inventory.skills[0].exclusion, None);
+        let install = env.roots.claude_home.join("plugins/cache/mk/p/1");
+        write(&install.join("README.md"), "x");
+        write_json(
+            &env.roots.claude_home.join("plugins/installed_plugins.json"),
+            json!({"version": 2, "plugins": {"p@mk": [{"scope": "user", "version": "1", "installPath": install.display().to_string()}]}}),
+        );
+        write_json(
+            &env.roots.claude_home.join("settings.json"),
+            json!({"enabledPlugins": {"p@mk": true}}),
+        );
+        let inventory = build_inventory(&env.roots, Workspace::Codespace);
+        assert_eq!(inventory.plugins[0].exclusion, None);
+    }
+
+    #[test]
+    fn a_parent_link_is_refused_when_home_itself_is_behind_a_link() {
+        let env = env();
+        let alias = env.dir.path().join("alias-home");
+        symlink(&env.roots.home, &alias).unwrap();
+        let project = alias.join("work/app");
+        let skills = project.join(".claude/skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        write(&project.join(".claude/SKILL.md"), "x");
+        symlink("..", skills.join("up")).unwrap();
+        let roots = KitRoots {
+            account_dir: None,
+            claude_home: alias.join(".claude"),
+            project,
+            key_dir: Some(alias.join("app-data")),
+            home: alias,
+        };
+        let inventory = build_inventory(&roots, Workspace::Codespace);
+        assert_eq!(inventory.skills.len(), 1);
+        assert_eq!(inventory.skills[0].exclusion, Some(Exclusion::UnsafeRoot));
     }
 
     #[test]
