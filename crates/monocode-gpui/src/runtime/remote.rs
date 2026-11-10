@@ -571,6 +571,21 @@ pub(crate) fn run_with_client_mirrored(
         },
         None => Vec::new(),
     };
+    // Local rows before the move point: the Host session holds only the cloud turns, so the
+    // view is those rows followed by the Host rows, and the Host row `i` is view row `base + i`.
+    let pre_move: Vec<Row> = match mirror {
+        Some(local) => {
+            let base = locked(&store)
+                .and_then(|s| s.cloud_location(local))
+                .ok()
+                .and_then(|l| l.cloud().map(|c| c.moved_at_row))
+                .unwrap_or(0);
+            latest_rows[..base.min(latest_rows.len())].to_vec()
+        }
+        None => Vec::new(),
+    };
+    // A failed row append is shown, never allowed to hide the running turn.
+    let mut sync_error: Option<String> = None;
     let mut attaching_run = false;
     let result = (|| -> Result<(), String> {
         if tx.is_closed() {
@@ -583,6 +598,13 @@ pub(crate) fn run_with_client_mirrored(
         let mut binding = locked(&store)?
             .remote_session(summary.id)?
             .ok_or("Remote session no longer exists")?;
+        if let Some(local) = mirror {
+            // Strictly the Host session the location names; never create or switch one.
+            let (_, record) = locked(&store)?.cloud_host_record(local)?;
+            if record.session_id.is_none() || record.session_id != binding.session_id {
+                return Err(monocode_core::store::MISSING_HOST.into());
+            }
+        }
         let action = settings
             .remote_action
             .take()
@@ -658,6 +680,9 @@ pub(crate) fn run_with_client_mirrored(
                 }
             }
             if binding.session_id.is_none() {
+                if mirror.is_some() {
+                    return Err(monocode_core::store::MISSING_HOST.into());
+                }
                 let mut create = command("create", None);
                 create["projectId"] = json!(binding.project.project_id);
                 create["harness"] = json!(summary.provider);
@@ -775,22 +800,29 @@ pub(crate) fn run_with_client_mirrored(
                 if let Some(local) = mirror {
                     // The only writer of this session's rows while it is in the cloud.
                     // Idempotent: a repeated or half-written sync is repaired, not doubled.
-                    locked(&store)?.append_projected_rows(
-                        local,
-                        &binding.project.environment_id,
-                        &id,
-                        revision.unwrap_or(0),
-                        &history.rows,
-                    )?;
+                    sync_error = locked(&store)?
+                        .append_projected_rows(
+                            local,
+                            &binding.project.environment_id,
+                            &id,
+                            revision.unwrap_or(0),
+                            &history.rows,
+                        )
+                        .err();
                 }
+                let mut view = pre_move.clone();
+                view.extend(history.rows);
                 let prefix = latest_rows
                     .iter()
-                    .zip(&history.rows)
+                    .zip(&view)
                     .take_while(|(known, next)| known == next)
                     .count();
                 next.start = prefix;
-                next.rows = history.rows[prefix..].to_vec();
-                latest_rows = history.rows;
+                next.rows = view[prefix..].to_vec();
+                latest_rows = view;
+            }
+            if let Some(error) = &sync_error {
+                next.status = error.clone();
             }
             next.provider_id = snapshot["session"]["providerSessionId"]
                 .as_str()

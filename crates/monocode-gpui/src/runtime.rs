@@ -87,9 +87,7 @@ fn cloud_target(store: &Database, local: i64) -> Result<Option<(Session, i64)>, 
     if !store.cloud_location(local)?.is_cloud() {
         return Ok(None);
     }
-    let (_, remote) = store.linked_remote_session(local)?.ok_or(
-        "This conversation is in the cloud, but its cloud session is missing. Reconnect it first.",
-    )?;
+    let (_, remote) = store.cloud_host_record(local)?;
     Ok(Some((remote.summary, local)))
 }
 
