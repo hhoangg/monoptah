@@ -210,6 +210,15 @@ pub fn target_from_input(input: &Value) -> Result<Option<CloudTarget>, String> {
 /// True when session `id` is a cloud session bound to the local `project`.
 pub fn is_cloud_session_of(store: &Store, id: i64, project: &str) -> bool {
     let key = crate::files::path_key(project);
+    // A local session whose location is Cloud is a cloud session of its own project, served by
+    // its linked Host record (design 4.2.1).
+    if let Ok((_, host)) = store.cloud_host_record(id) {
+        return host.project.cloud().is_some()
+            && store.sessions().ok().is_some_and(|all| {
+                all.iter()
+                    .any(|s| s.id == id && crate::files::path_key(&s.cwd) == key)
+            });
+    }
     store.remote_session(id).ok().flatten().is_some_and(|s| {
         s.project.cloud().is_some()
             && s.project
@@ -217,6 +226,15 @@ pub fn is_cloud_session_of(store: &Store, id: i64, project: &str) -> bool {
                 .as_deref()
                 .is_some_and(|p| crate::files::path_key(p) == key)
     })
+}
+
+/// The Host record that serves session `id`: the linked record of a Cloud-located local
+/// session, or the session's own record for one born in the cloud.
+fn serving_record(store: &Store, id: i64) -> Option<(i64, crate::store::RemoteSession)> {
+    store
+        .cloud_host_record(id)
+        .ok()
+        .or_else(|| store.remote_session(id).ok().flatten().map(|s| (id, s)))
 }
 
 pub use crate::cloud_sessions::created_note;
@@ -606,9 +624,8 @@ impl CloudApi {
         if !is_cloud_session_of(&store, id, project) {
             return Err("Session is not a cloud session of this project.".into());
         }
-        store
-            .remote_session(id)?
-            .and_then(|s| s.project.cloud())
+        serving_record(&store, id)
+            .and_then(|(_, s)| s.project.cloud())
             .ok_or_else(|| "Session is not a cloud session of this project.".into())
     }
     fn outcome(&self, cloud: &CloudRef, flag: &str, sessions: &[InstanceSession]) -> Value {
@@ -874,7 +891,9 @@ impl CloudApi {
             Some(_) => return Err("taskId must be a Today task id or key".into()),
         };
         let path = input.get("path").and_then(Value::as_str);
-        let pull = self.cloud.pull_evidence(session_id, path)?;
+        let serving =
+            serving_record(&*lock()?, session_id).map_or(session_id, |(host_id, _)| host_id);
+        let pull = self.cloud.pull_evidence(serving, path)?;
         let files: Vec<String> = pull
             .files
             .iter()

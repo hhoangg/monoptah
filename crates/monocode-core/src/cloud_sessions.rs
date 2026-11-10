@@ -334,7 +334,15 @@ pub struct CloudSession {
 pub struct LocatedSession {
     pub id: i64,
     pub moved_at_row: usize,
+    /// Why the session needs attention, which makes the shell offer "Reset to local": the
+    /// stored row-append error, an unreadable location, or a missing Host record. A session
+    /// that runs fine has none.
     pub sync_error: Option<String>,
+    /// The stored location cannot be read (the session fails closed).
+    pub unreadable: bool,
+    /// The Host side is running a turn (or waits for input): resetting now would leave two
+    /// writers.
+    pub host_active: bool,
 }
 
 /// Displayable codespace lifecycle state.
@@ -968,18 +976,37 @@ impl CloudSessions {
         Ok(found)
     }
 
-    /// The Cloud-located local sessions of `local_cwd` with their move point and sync error.
+    /// The local sessions of `local_cwd` that have a cloud location (readable or not), with
+    /// their move point and whatever needs the user's attention.
     pub fn located_sessions_for(&self, local_cwd: &str) -> Result<Vec<LocatedSession>, String> {
         let store = self.store()?;
-        Ok(store
-            .cloud_located_sessions(local_cwd)?
-            .into_iter()
-            .map(|(summary, location)| LocatedSession {
+        let located = store.cloud_located_raw()?;
+        if located.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut found = Vec::new();
+        for summary in store.sessions()?.into_iter().filter(|s| s.cwd == local_cwd) {
+            let Some((_, location)) = located.iter().find(|(id, _)| *id == summary.id) else {
+                continue;
+            };
+            let backing = store.linked_remote_session(summary.id)?.map(|(_, r)| r);
+            let stored = store.cloud_sync_error(summary.id).ok().flatten();
+            let derived = match location {
+                None => Some(crate::store::UNREADABLE_NOTICE.to_string()),
+                Some(_) if store.cloud_host_record(summary.id).is_err() => {
+                    Some(crate::store::MISSING_HOST.to_string())
+                }
+                Some(_) => None,
+            };
+            found.push(LocatedSession {
                 id: summary.id,
-                moved_at_row: location.moved_at_row,
-                sync_error: store.cloud_sync_error(summary.id).ok().flatten(),
-            })
-            .collect())
+                moved_at_row: location.as_ref().map_or(0, |l| l.moved_at_row),
+                sync_error: stored.or(derived),
+                unreadable: location.is_none(),
+                host_active: backing.as_ref().is_some_and(|r| r.running || r.needs_input),
+            });
+        }
+        Ok(found)
     }
 
     /// Raw gh state of a codespace, cached for the TTL. Never wakes it.

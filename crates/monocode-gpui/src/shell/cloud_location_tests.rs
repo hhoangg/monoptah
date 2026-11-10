@@ -293,3 +293,116 @@ fn deleting_a_cloud_session_says_the_workspace_copy_stays(cx: &mut TestAppContex
         })
         .unwrap();
 }
+
+#[gpui::test]
+fn deleting_the_workspace_keeps_the_located_session_in_the_window_with_the_notice(
+    cx: &mut TestAppContext,
+) {
+    let (window, _, local) = crate::shell::tests::window(cx);
+    let host = window
+        .update(cx, |shell, _, _| {
+            shell.cloud = Arc::new(service(shell.store.clone()));
+            host_record(&shell.store, "host-1")
+        })
+        .unwrap();
+    window
+        .update(cx, |shell, _, cx| {
+            move_to_cloud(&shell.store, local, host);
+            shell.refresh_cloud(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, w, cx| {
+            assert!(shell.cloud_located.contains_key(&local));
+            // The workspace is deleted: the store drops the Host records and marks the session.
+            locked(&shell.store)
+                .unwrap()
+                .forget_cloud(&CloudRef::codespace("octo-abc"))
+                .unwrap();
+            shell.forget_codespace_sessions(&CloudRef::codespace("octo-abc"), w, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            assert!(shell.session_summaries.contains_key(&local), "not dropped");
+            assert!(shell.sessions.contains_key(&local), "the view stays");
+            let located = &shell.cloud_located[&local];
+            assert_eq!(
+                located.sync_error.as_deref(),
+                Some(monocode_core::store::WORKSPACE_LOST)
+            );
+            assert!(shell.sessions[&local].read(cx).cloud_sync_notice_visible());
+            // The rows are untouched.
+            assert!(
+                locked(&shell.store)
+                    .unwrap()
+                    .cloud_location(local)
+                    .unwrap()
+                    .is_cloud()
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn an_unreadable_location_gets_the_notice_and_a_delete_warning(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_prompt_builder(crate::modal::prompt_builder));
+    let (window, _, local) = crate::shell::tests::window(cx);
+    window
+        .update(cx, |shell, _, cx| {
+            shell.cloud = Arc::new(service(shell.store.clone()));
+            locked(&shell.store)
+                .unwrap()
+                .save_setting(&format!("cloud-location:{local}"), "junk")
+                .unwrap();
+            shell.refresh_cloud(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, w, cx| {
+            let located = &shell.cloud_located[&local];
+            assert!(located.unreadable);
+            assert_eq!(
+                located.sync_error.as_deref(),
+                Some(monocode_core::store::UNREADABLE_NOTICE)
+            );
+            assert!(shell.sessions[&local].read(cx).cloud_sync_notice_visible());
+            shell.request_delete_sessions(vec![local], w, cx);
+            let notice = shell
+                .delete_dialog
+                .as_ref()
+                .and_then(|d| d.cloud_notice.clone())
+                .expect("the dialog warns");
+            assert!(notice.contains("cannot be read"), "{notice}");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_missing_host_record_offers_reset_without_any_stored_error(cx: &mut TestAppContext) {
+    let (window, _, local) = crate::shell::tests::window(cx);
+    window
+        .update(cx, |shell, _, cx| {
+            shell.cloud = Arc::new(service(shell.store.clone()));
+            // Cloud location with no Host record at all.
+            locked(&shell.store)
+                .unwrap()
+                .set_cloud_location(local, &location())
+                .unwrap();
+            shell.refresh_cloud(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            assert_eq!(
+                shell.cloud_located[&local].sync_error.as_deref(),
+                Some(monocode_core::store::MISSING_HOST)
+            );
+            assert!(shell.sessions[&local].read(cx).cloud_sync_notice_visible());
+        })
+        .unwrap();
+}

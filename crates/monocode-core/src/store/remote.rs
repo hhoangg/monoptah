@@ -315,6 +315,14 @@ impl Store {
     /// Drop every project and session bound to `cloud` (local records
     /// only; the host is gone or about to be).
     pub fn forget_cloud(&self, cloud: &CloudRef) -> Result<(), String> {
+        // Local sessions that live in this workspace keep their rows and stay in the window; the
+        // Host record they ran on goes with the workspace, so they carry a durable marker
+        // (and the Reset to local action) instead of a Cloud location that points nowhere.
+        for (local, location) in self.cloud_located()? {
+            if location.cloud == *cloud {
+                self.record_cloud_sync_error(local, super::location::WORKSPACE_LOST)?;
+            }
+        }
         let mut sessions = self.remote_sessions()?;
         let gone: Vec<i64> = sessions
             .iter()

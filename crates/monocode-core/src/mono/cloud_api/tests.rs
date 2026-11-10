@@ -2198,3 +2198,42 @@ fn pull_evidence_works_for_a_sandbox_session() {
         )
         .is_err());
 }
+
+#[test]
+fn a_cloud_located_local_session_is_a_cloud_session_of_its_project() {
+    let gh = FakeGh::new(vec![
+        ("auth status", ok(AUTH_OK)),
+        ("codespace list", ok(LIST)),
+    ]);
+    let fx = fixture(&gh);
+    let host_id = fx.bind("octo-abc");
+    let store = fx.store.lock().unwrap();
+    let record = store.remote_session(host_id).unwrap().unwrap();
+    let local = store.create("claude", &fx.path()).unwrap().id;
+    assert!(!is_cloud_session_of(&store, local, &fx.path()));
+    store
+        .set_cloud_location(
+            local,
+            &crate::store::SessionLocation::Cloud(crate::store::CloudLocation {
+                cloud: record.project.cloud().unwrap(),
+                environment_id: record.project.environment_id.clone(),
+                project_id: String::new(),
+                host_session_id: "host-1".into(),
+                remote_cwd: "/workspaces/widgets".into(),
+                local_cwd: fx.path(),
+                moved_at_row: 10,
+                pushed_branch: None,
+            }),
+        )
+        .unwrap();
+    // Without a resolvable Host record it is not served.
+    assert!(!is_cloud_session_of(&store, local, &fx.path()));
+    let mut saved = record.clone();
+    saved.session_id = Some("host-1".into());
+    store.save_remote_session(&saved).unwrap();
+    store.link_remote_session(host_id, Some(local)).unwrap();
+    assert!(is_cloud_session_of(&store, local, &fx.path()));
+    assert!(!is_cloud_session_of(&store, local, "/somewhere/else"));
+    let serving = serving_record(&store, local).unwrap();
+    assert_eq!(serving.0, host_id);
+}

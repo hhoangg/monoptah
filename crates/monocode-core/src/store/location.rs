@@ -83,6 +83,16 @@ pub const LOCAL_RUN_REFUSED: &str =
 /// Why the local terminal (TUI) refuses to open a session that lives in the cloud.
 pub const LOCAL_TUI_REFUSED: &str = "This conversation is in the cloud. Its local terminal is closed so two Claude processes never share one session. Bring it back to this computer first.";
 
+/// Why Reset to local is refused while the cloud is working on the conversation.
+pub const HOST_TURN_RUNNING: &str =
+    "A turn is running in the cloud for this conversation. Wait for it to finish, then reset.";
+
+/// Shown on a Cloud session whose workspace was deleted: its Host record went with it.
+pub const WORKSPACE_LOST: &str = "The cloud workspace of this conversation was deleted. Messages written there after the last sync are lost. Reset to local to continue on this computer.";
+
+/// Shown on a session whose stored location cannot be read.
+pub const UNREADABLE_NOTICE: &str = "The cloud location of this conversation cannot be read, so it is closed for writing. Reset to local to continue on this computer.";
+
 /// Why a session with a stored but unparsable location is refused.
 pub const UNREADABLE_LOCATION: &str = "unreadable cloud location";
 
@@ -119,6 +129,16 @@ impl Store {
     /// Call before the local TUI is launched for the session.
     pub fn require_local_tui(&self, session: i64) -> Result<(), String> {
         self.require_local(session, LOCAL_TUI_REFUSED)
+    }
+    /// Every local session with a stored location value, by session id: `Some` when it reads as
+    /// Cloud, `None` when the value is unreadable (such a session fails closed everywhere).
+    pub fn cloud_located_raw(&self) -> Result<Vec<(i64, Option<CloudLocation>)>, String> {
+        Ok(self
+            .settings_with_prefix("cloud-location:")?
+            .into_iter()
+            .filter(|(_, raw)| !raw.is_empty())
+            .map(|(id, raw)| (id, serde_json::from_str(&raw).ok()))
+            .collect())
     }
     /// Every local session whose location is Cloud, with that location, by session id.
     /// Unreadable values are skipped here: they have no workspace to show.
@@ -159,6 +179,28 @@ impl Store {
             Ok(raw) => raw.is_some_and(|raw| !raw.is_empty()),
             Err(_) => true,
         }
+    }
+    /// The user's way back to Local ("Reset to local"), after the confirmation. Refuses while a
+    /// Host-side turn runs (it would be a second writer). Unlike the bare reset it also
+    /// retires the Host record: it is unlinked, remembered as converted so a poll never
+    /// imports it again, and dropped locally, so nothing can send to it while the local
+    /// runtime is allowed on the same Claude id. The copy in the workspace itself stays.
+    /// It does not reconcile the transcript (F4-5).
+    pub fn leave_cloud(&self, session: i64) -> Result<(), String> {
+        let backing = self.linked_remote_session(session)?;
+        if let Some((_, record)) = &backing {
+            if record.running || record.needs_input {
+                return Err(HOST_TURN_RUNNING.to_string());
+            }
+        }
+        self.reset_cloud_location_to_local(session)?;
+        if let Some((id, record)) = backing {
+            if let Some(host) = record.session_id.as_deref() {
+                self.set_cloud_converted(&record.project.environment_id, host, true)?;
+            }
+            self.forget_cloud_session(id)?;
+        }
+        Ok(())
     }
     /// Explicit way back to Local when the cloud side is gone (for example the linked Host
     /// record was deleted). Also clears the link and the sync cursor. It does NOT reconcile
@@ -481,5 +523,65 @@ pub(crate) mod tests {
         // The 10 local rows are untouched.
         assert_eq!(store.load(local).unwrap().rows.len(), 10);
         assert!(store.remote_session(linked).unwrap().is_some());
+    }
+
+    #[test]
+    fn leave_cloud_retires_the_host_record_and_refuses_while_the_cloud_runs() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let (local, linked) = moved_session(&mut store);
+        store.save_setting("cloud-synced:env:host-1", "3").unwrap();
+        // The linked record needs a Host session id to be tombstoned.
+        let mut record = store.remote_session(linked).unwrap().unwrap();
+        record.running = true;
+        store.save_remote_session(&record).unwrap();
+        assert_eq!(store.leave_cloud(local).unwrap_err(), HOST_TURN_RUNNING);
+        assert!(
+            store.cloud_location(local).unwrap().is_cloud(),
+            "nothing changed"
+        );
+        record.running = false;
+        store.save_remote_session(&record).unwrap();
+        store.leave_cloud(local).unwrap();
+        assert_eq!(store.cloud_location(local).unwrap(), SessionLocation::Local);
+        assert_eq!(store.cloud_synced_revision("env", "host-1").unwrap(), None);
+        // The Host record is not a session that can be sent to, and a poll cannot bring it back.
+        assert!(store.remote_session(linked).unwrap().is_none());
+        assert!(!listed(&store).contains(&linked));
+        assert!(store.is_cloud_converted("env", "host-1").unwrap());
+        assert_eq!(store.load(local).unwrap().rows.len(), 10);
+    }
+
+    #[test]
+    fn a_late_sync_error_is_a_no_op_once_local_and_a_reset_clears_a_stale_one() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let (local, _) = moved_session(&mut store);
+        store
+            .record_cloud_sync_error(local, "Host unreachable")
+            .unwrap();
+        store.leave_cloud(local).unwrap();
+        assert_eq!(store.cloud_sync_error(local).unwrap(), None);
+        store.record_cloud_sync_error(local, "late").unwrap();
+        assert_eq!(store.cloud_sync_error(local).unwrap(), None);
+    }
+
+    #[test]
+    fn an_unreadable_location_can_carry_a_notice_and_deleting_forgets_its_host_record() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let (local, linked) = moved_session(&mut store);
+        store
+            .save_setting(&format!("cloud-location:{local}"), "junk")
+            .unwrap();
+        assert!(store.cloud_located().unwrap().is_empty());
+        assert_eq!(store.cloud_located_raw().unwrap(), vec![(local, None)]);
+        store
+            .record_cloud_sync_error(local, UNREADABLE_NOTICE)
+            .unwrap();
+        assert_eq!(
+            store.cloud_sync_error(local).unwrap().as_deref(),
+            Some(UNREADABLE_NOTICE)
+        );
+        store.delete(local).unwrap();
+        assert!(store.remote_session(linked).unwrap().is_none());
+        assert!(!listed(&store).contains(&linked));
     }
 }

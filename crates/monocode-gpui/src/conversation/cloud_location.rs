@@ -10,7 +10,7 @@ use monocode_core::checkpoint::gate::{self, Gate, Operation};
 use monocode_core::cloud_sessions::LocatedSession;
 
 /// The confirmation text of "Reset to local". It must say what the reset does not do.
-pub(crate) const RESET_CONFIRM: &str = "This stops syncing with the cloud workspace and runs the conversation on this computer again. The messages are not reconciled: anything written in the cloud after the last sync is not copied here, and the local provider session does not know about those cloud turns. The copy in the cloud workspace stays there.";
+pub(crate) const RESET_CONFIRM: &str = "This stops syncing with the cloud workspace and runs the conversation on this computer again. The messages are not reconciled: anything written in the cloud after the last sync is not copied here, and the local provider session does not know about those cloud turns. The copy in the cloud workspace stays there, but it is no longer a session here, and cloud turns that were not synced are not copied.";
 
 /// The status line after a confirmed reset.
 pub(crate) const RESET_DONE: &str =
@@ -73,9 +73,29 @@ impl Conversation {
     }
     /// The Reset to local button: opens the confirmation. Never resets by itself.
     pub(crate) fn request_reset_to_local(&mut self, cx: &mut Context<Self>) {
-        if self.cloud_location.located.is_some() && !self.busy && !self.cloud_location.resetting {
-            self.cloud_location.confirming = true;
+        if self.cloud_location.located.is_some() && !self.cloud_location.resetting {
+            if let Some(why) = self.reset_blocker() {
+                self.status = why.into();
+            } else {
+                self.cloud_location.confirming = true;
+            }
             cx.notify();
+        }
+    }
+    /// Why a reset cannot start now: a turn of this view, or a turn the Host side runs that
+    /// this view did not start, would be a second writer next to the local runtime.
+    fn reset_blocker(&self) -> Option<&'static str> {
+        if self.busy || self.stopping {
+            Some("A turn is running. Wait for it to finish, then reset.")
+        } else if self
+            .cloud_location
+            .located
+            .as_ref()
+            .is_some_and(|l| l.host_active)
+        {
+            Some(monocode_core::store::HOST_TURN_RUNNING)
+        } else {
+            None
         }
     }
     pub(crate) fn cancel_reset_to_local(&mut self, cx: &mut Context<Self>) {
@@ -93,12 +113,18 @@ impl Conversation {
             return false;
         }
         self.cloud_location.confirming = false;
+        // Re-checked at confirm time: a turn may have started since the confirmation opened.
+        if let Some(why) = self.reset_blocker() {
+            self.status = why.into();
+            cx.notify();
+            return false;
+        }
         self.cloud_location.resetting = true;
         let store = self.store.clone();
         let id = self.summary.id;
         let work = cx
             .background_executor()
-            .spawn(async move { locked(&store)?.reset_cloud_location_to_local(id) });
+            .spawn(async move { locked(&store)?.leave_cloud(id) });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
@@ -227,6 +253,8 @@ mod tests {
             id: 1,
             moved_at_row: 10,
             sync_error: sync_error.map(str::to_owned),
+            unreadable: false,
+            host_active: false,
         }
     }
     #[test]
@@ -338,5 +366,34 @@ mod tests {
             chat.set_cloud_location(None, cx);
             assert!(chat.rewind_gate(Operation::EditLastTurn, 0).is_allowed());
         });
+    }
+    #[gpui::test]
+    fn a_reset_is_refused_while_a_turn_runs_here_or_in_the_cloud(cx: &mut TestAppContext) {
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let session = store.create("claude", "/Users/me/repo").unwrap();
+        let chat = cx.new(|cx| Conversation::new(session, Arc::new(Mutex::new(store)), cx));
+        chat.update(cx, |chat, cx| {
+            chat.set_cloud_location(Some(located(Some("Host unreachable"))), cx);
+            // A Host-side turn this view did not start blocks even the confirmation.
+            let mut active = located(Some("Host unreachable"));
+            active.host_active = true;
+            chat.set_cloud_location(Some(active), cx);
+            chat.request_reset_to_local(cx);
+            assert!(!chat.cloud_location.confirming);
+            assert_eq!(chat.status, monocode_core::store::HOST_TURN_RUNNING);
+            // A turn that started after the confirmation opened blocks the confirm.
+            chat.set_cloud_location(Some(located(Some("Host unreachable"))), cx);
+            chat.request_reset_to_local(cx);
+            assert!(chat.cloud_location.confirming);
+            chat.busy = true;
+            assert!(!chat.confirm_reset_to_local(cx));
+            assert!(chat.cloud_location.located.is_some(), "still cloud");
+            assert!(chat.status.contains("turn is running"), "{}", chat.status);
+        });
+    }
+    #[test]
+    fn the_confirmation_says_what_happens_to_the_cloud_copy() {
+        assert!(RESET_CONFIRM.contains("no longer a session here"));
+        assert!(RESET_CONFIRM.contains("not copied"));
     }
 }

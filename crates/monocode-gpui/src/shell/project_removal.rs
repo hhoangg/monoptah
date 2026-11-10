@@ -482,18 +482,24 @@ impl Shell {
         let provider_files =
             ProviderFiles::of(ids.iter().filter_map(|id| self.local_files_kind(*id, cx)));
         // The location, not the Host record, says whether a session lives in the cloud.
-        let clouds: Vec<monocode_core::cloud_sessions::CloudRef> = locked(&self.store)
-            .map(|store| {
-                ids.iter()
-                    .filter_map(|id| match store.cloud_location(*id) {
-                        Ok(location) => location.cloud().map(|c| c.cloud.clone()),
-                        Err(_) => None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let (clouds, unreadable): (Vec<monocode_core::cloud_sessions::CloudRef>, usize) =
+            locked(&self.store)
+                .map(|store| {
+                    let mut clouds = Vec::new();
+                    let mut unreadable = 0;
+                    for id in &ids {
+                        match store.cloud_location(*id) {
+                            Ok(location) => {
+                                clouds.extend(location.cloud().map(|c| c.cloud.clone()))
+                            }
+                            Err(_) => unreadable += 1,
+                        }
+                    }
+                    (clouds, unreadable)
+                })
+                .unwrap_or_default();
         let dialog = DeleteDialog {
-            cloud_notice: provider_cleanup::cloud_delete_notice(&clouds),
+            cloud_notice: provider_cleanup::cloud_delete_notice(&clouds, unreadable),
             ids,
             title,
             provider_files,

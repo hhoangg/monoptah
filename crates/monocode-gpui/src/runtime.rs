@@ -124,6 +124,15 @@ pub(crate) fn run_turn(
         }
         Ok(None) => {}
         Err(error) => {
+            // Durable, so the notice with Reset to local shows without a successful append.
+            if let Ok(store) = locked(&store) {
+                let message = if error == monocode_core::store::UNREADABLE_LOCATION_TEXT {
+                    monocode_core::store::UNREADABLE_NOTICE
+                } else {
+                    error.as_str()
+                };
+                let _ = store.record_cloud_sync_error(summary.id, message);
+            }
             let _ = tx.send_blocking(remote::failed(error));
             return;
         }

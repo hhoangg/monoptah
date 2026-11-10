@@ -70,3 +70,55 @@ fn the_local_runtime_still_starts_once_the_session_is_local_again() {
     store.reset_cloud_location_to_local(summary.id).unwrap();
     assert!(store.require_local_run(summary.id).is_ok());
 }
+
+fn run_cloud_turn(store: &Database, summary: &Session) -> Update {
+    let (tx, rx) = async_channel::unbounded();
+    let (_controls_tx, controls) = std::sync::mpsc::channel();
+    run_turn(
+        summary.clone(),
+        "hello".into(),
+        Settings::default(),
+        controls,
+        store.clone(),
+        Arc::new(AtomicBool::new(false)),
+        tx,
+    );
+    rx.try_recv().expect("one refusal")
+}
+
+#[test]
+fn a_missing_host_record_at_turn_start_leaves_a_durable_marker() {
+    let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
+    let summary = moved_session(&mut store);
+    let store: Database = Arc::new(Mutex::new(store));
+    let update = run_cloud_turn(&store, &summary);
+    assert!(update.finished && update.status == monocode_core::store::MISSING_HOST);
+    assert_eq!(
+        locked(&store)
+            .unwrap()
+            .cloud_sync_error(summary.id)
+            .unwrap()
+            .as_deref(),
+        Some(monocode_core::store::MISSING_HOST)
+    );
+}
+
+#[test]
+fn an_unreadable_location_at_turn_start_leaves_a_durable_marker() {
+    let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
+    let summary = moved_session(&mut store);
+    store
+        .save_setting(&format!("cloud-location:{}", summary.id), "junk")
+        .unwrap();
+    let store: Database = Arc::new(Mutex::new(store));
+    let update = run_cloud_turn(&store, &summary);
+    assert!(update.finished);
+    assert_eq!(
+        locked(&store)
+            .unwrap()
+            .cloud_sync_error(summary.id)
+            .unwrap()
+            .as_deref(),
+        Some(monocode_core::store::UNREADABLE_NOTICE)
+    );
+}

@@ -64,7 +64,9 @@ impl Store {
     /// Remembers why the row append failed, so the UI can say so after a reload. Does
     /// nothing when the session is not in the cloud (for example it was just deleted).
     pub fn record_cloud_sync_error(&self, session: i64, message: &str) -> Result<(), String> {
-        if !matches!(self.cloud_location(session), Ok(SessionLocation::Cloud(_))) {
+        // A Local session (or a deleted one) has nothing to report. An unreadable location is
+        // still a location: the session fails closed and the notice must say so.
+        if matches!(self.cloud_location(session), Ok(SessionLocation::Local)) {
             return Ok(());
         }
         self.save_setting(&Self::sync_error_key(session), message)

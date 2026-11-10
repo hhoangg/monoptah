@@ -1997,16 +1997,20 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A local session that lives in the workspace is never dropped: it keeps its rows and
+        // shows the "cloud side lost" notice with Reset to local (read from the store).
         let gone: Vec<i64> = self
             .cloud_marks
             .iter()
-            .filter(|(_, mark)| mark.cloud() == *target)
+            .filter(|(id, mark)| mark.cloud() == *target && !self.cloud_located.contains_key(id))
             .map(|(id, _)| *id)
             .collect();
         for id in gone {
             self.forget_cloud_row(id, window, cx);
         }
         self.cloud_states.remove(&target.key());
+        // The located sessions read their marker (the store wrote it) on this refresh.
+        self.refresh_cloud(cx);
     }
 
     /// Drops one cloud session from the window; its record is gone from the store already.
@@ -2016,6 +2020,10 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The store never forgets a located local session with its workspace; neither does the window.
+        if self.cloud_located.contains_key(&id) {
+            return;
+        }
         if self.workspace.tab_of(id).is_some() {
             self.close_pane(id, window, cx);
         }
@@ -2034,6 +2042,9 @@ impl Shell {
         let Some(mark) = self.cloud_marks.get(&id).cloned() else {
             return;
         };
+        if self.cloud_located.contains_key(&id) {
+            return;
+        }
         if self.cloud_archive.is_some() || self.cloud_busy.contains(&id) {
             return;
         }
@@ -2076,7 +2087,10 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.is_cloud(id) || self.cloud_busy.contains(&id) {
+        if !self.is_cloud(id)
+            || self.cloud_located.contains_key(&id)
+            || self.cloud_busy.contains(&id)
+        {
             return;
         }
         self.cloud_busy.insert(id);
