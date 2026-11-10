@@ -310,6 +310,11 @@ describe("remote host API", () => {
       version: version.replace("+monoptah", ""),
     });
   });
+  it("advertises the conditional write capability", async () => {
+    const s = await setup();
+    const { capabilities } = (await s.call("environment.describe")).value.result;
+    expect(capabilities).toContain("files.write.hash");
+  });
   it("advertises newer providers only to desktops that request them", async () => {
     const s = await setup(["codex", "cursor"]);
     expect((await s.call("environment.describe")).value.result.providers)

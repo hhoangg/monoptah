@@ -289,6 +289,7 @@ export function createHostServer(
                 "files.searchContent",
                 "files.create",
                 "files.write",
+                "files.write.hash",
                 "git.index",
                 "git.fileDiff",
                 "git.action",

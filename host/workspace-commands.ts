@@ -1,6 +1,8 @@
+import { createHash, randomBytes } from "node:crypto";
 import {
   cp,
   lstat,
+  open,
   mkdir,
   mkdtemp,
   readFile,
@@ -143,7 +145,7 @@ export class WorkspaceCommands {
       case "read_file_preview":
         return this.preview(input.path, input.maxLines, input.startLine);
       case "write_text_file":
-        return this.writeText(input.path, input.content);
+        return this.writeText(input.path, input.content, input.expectedSha256);
       case "stat_files":
         return this.statFiles(input.paths);
       case "create_path":
@@ -393,13 +395,19 @@ export class WorkspaceCommands {
       .map((line) => (line.length > 200 ? `${line.slice(0, 199)}…` : line));
   }
 
-  private async writeText(input: unknown, content: unknown): Promise<void> {
+  private async writeText(
+    input: unknown,
+    content: unknown,
+    expectedSha256?: unknown,
+  ): Promise<void> {
     if (typeof content !== "string")
       throw new Error("Invalid file content");
     if (Buffer.byteLength(content, "utf8") > MAX_TEXT_FILE)
       throw new Error(
         `File is too large to save (maximum ${MAX_TEXT_FILE / 1024 / 1024} MB).`,
       );
+    if (expectedSha256 !== undefined && expectedSha256 !== null)
+      return this.writeIfUnchanged(input, content, expectedSha256);
     const { root, relative: rel } = await this.locate(input);
     const path = workspacePath(root, rel);
     if (await stat(path).then((info) => info.isDirectory(), () => false))
@@ -411,6 +419,71 @@ export class WorkspaceCommands {
       await rm(temporary, { force: true });
       throw reason;
     });
+  }
+
+  /** Conditional write (`files.write.hash`). Fails with "File changed on the
+   * host" unless the file still hashes to `expectedSha256`. The content goes to
+   * a temp file in the same directory (fsynced, mode copied), the hash is
+   * checked again, and the temp file is renamed over the target, so a reader
+   * never sees a partial file.
+   *
+   * Unavoidable: another process can still modify the file between the second
+   * hash check and the rename (a few microseconds; POSIX has no compare-and-
+   * swap rename). The window is far smaller than the one around the check alone.
+   *
+   * Symlinks: `locate` resolves the link, so the target is replaced and the
+   * link itself is kept. A link whose target is outside the workspace root
+   * that contains the link is refused. */
+  private async writeIfUnchanged(
+    input: unknown,
+    content: string,
+    expected: unknown,
+  ): Promise<void> {
+    if (typeof expected !== "string" || !/^[0-9a-f]{64}$/i.test(expected))
+      throw new Error("Invalid expected file hash");
+    const wanted = expected.toLowerCase();
+    const { root, relative: rel } = await this.locate(input);
+    const path = workspacePath(root, rel);
+    const link = await lstat(resolve(input as string)).catch(() => undefined);
+    if (link?.isSymbolicLink()) {
+      // The link must stay inside the root that holds the link itself.
+      const holder = await this.locate(dirname(resolve(input as string)));
+      if (holder.root !== root) throw new Error("Path is outside the workspace");
+    }
+    const info = await stat(path).catch(() => undefined);
+    if (!info) throw new Error("File changed on the host");
+    if (info.isDirectory()) throw new Error("Cannot save text to a directory.");
+    if (!info.isFile()) throw new Error("Not a file");
+    const unchanged = async () => {
+      const size = (await stat(path)).size;
+      if (size > MAX_TEXT_FILE)
+        throw new Error(
+          `File is too large to save (maximum ${MAX_TEXT_FILE / 1024 / 1024} MB).`,
+        );
+      return createHash("sha256").update(await readFile(path)).digest("hex") === wanted;
+    };
+    if (!(await unchanged())) throw new Error("File changed on the host");
+    const temporary = join(
+      dirname(path),
+      `.${basename(path)}.monoptah-${process.pid}-${randomBytes(6).toString("hex")}.tmp`,
+    );
+    const mode = info.mode & 0o7777;
+    try {
+      const handle = await open(temporary, "wx", mode);
+      try {
+        await handle.writeFile(content, "utf8");
+        // open() applies the umask; restore the exact original mode.
+        await handle.chmod(mode);
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      if (!(await unchanged())) throw new Error("File changed on the host");
+      await rename(temporary, path);
+    } catch (reason) {
+      await rm(temporary, { force: true });
+      throw reason;
+    }
   }
 
   private async statFiles(input: unknown): Promise<FileMtime[]> {
