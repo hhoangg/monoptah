@@ -40,6 +40,10 @@ fn update(status: impl Into<String>, finished: bool) -> Update {
         finished,
     }
 }
+/// A terminal update that only carries an error message.
+pub(super) fn failed(error: impl Into<String>) -> Update {
+    update(error, true)
+}
 fn command(kind: &str, session_id: Option<&str>) -> Value {
     let mut value = json!({"type":kind,"commandId":monocode_core::mono::new_id()});
     if let Some(id) = session_id {
@@ -477,9 +481,46 @@ pub(crate) fn run(
     cancel: Arc<AtomicBool>,
     tx: async_channel::Sender<Update>,
 ) {
+    run_with_default_client(summary, None, prompt, settings, controls, store, cancel, tx)
+}
+/// Runs `summary` (a Host session record) for a local session that lives in the cloud:
+/// the Host rows are appended to the local session `mirror`.
+#[allow(clippy::too_many_arguments, reason = "Mirrors the turn worker inputs")]
+pub(crate) fn run_mirrored(
+    summary: Session,
+    mirror: i64,
+    prompt: String,
+    settings: Settings,
+    controls: std::sync::mpsc::Receiver<Control>,
+    store: Database,
+    cancel: Arc<AtomicBool>,
+    tx: async_channel::Sender<Update>,
+) {
+    run_with_default_client(
+        summary,
+        Some(mirror),
+        prompt,
+        settings,
+        controls,
+        store,
+        cancel,
+        tx,
+    )
+}
+#[allow(clippy::too_many_arguments, reason = "Mirrors the turn worker inputs")]
+fn run_with_default_client(
+    summary: Session,
+    mirror: Option<i64>,
+    prompt: String,
+    settings: Settings,
+    controls: std::sync::mpsc::Receiver<Control>,
+    store: Database,
+    cancel: Arc<AtomicBool>,
+    tx: async_channel::Sender<Update>,
+) {
     match monocode_core::remote::default_connections() {
-        Ok(client) => run_with_client(
-            client, summary, prompt, settings, controls, store, cancel, tx,
+        Ok(client) => run_with_client_mirrored(
+            client, summary, mirror, prompt, settings, controls, store, cancel, tx,
         ),
         Err(error) => {
             let _ = tx.send_blocking(update(error, true));
@@ -494,13 +535,42 @@ pub(crate) fn run_with_client(
     client: Arc<monocode_core::remote::Connections>,
     summary: Session,
     prompt: String,
+    settings: Settings,
+    controls: std::sync::mpsc::Receiver<Control>,
+    store: Database,
+    cancel: Arc<AtomicBool>,
+    tx: async_channel::Sender<Update>,
+) {
+    run_with_client_mirrored(
+        client, summary, None, prompt, settings, controls, store, cancel, tx,
+    )
+}
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Mirrors the turn worker inputs while injecting the remote transport for isolation"
+)]
+pub(crate) fn run_with_client_mirrored(
+    client: Arc<monocode_core::remote::Connections>,
+    summary: Session,
+    mirror: Option<i64>,
+    prompt: String,
     mut settings: Settings,
     controls: std::sync::mpsc::Receiver<Control>,
     store: Database,
     cancel: Arc<AtomicBool>,
     tx: async_channel::Sender<Update>,
 ) {
-    let mut latest_rows = Vec::new();
+    // For a mirrored run the open view shows the local rows, so diff against them.
+    let mut latest_rows = match mirror {
+        Some(local) => match locked(&store).and_then(|s| s.load(local)) {
+            Ok(history) => history.rows,
+            Err(error) => {
+                let _ = tx.send_blocking(update(error, true));
+                return;
+            }
+        },
+        None => Vec::new(),
+    };
     let mut attaching_run = false;
     let result = (|| -> Result<(), String> {
         if tx.is_closed() {
@@ -702,6 +772,17 @@ pub(crate) fn run_with_client(
                     &id,
                 );
                 let (history, _) = monocode_core::store::Store::project_remote_history(&projected)?;
+                if let Some(local) = mirror {
+                    // The only writer of this session's rows while it is in the cloud.
+                    // Idempotent: a repeated or half-written sync is repaired, not doubled.
+                    locked(&store)?.append_projected_rows(
+                        local,
+                        &binding.project.environment_id,
+                        &id,
+                        revision.unwrap_or(0),
+                        &history.rows,
+                    )?;
+                }
                 let prefix = latest_rows
                     .iter()
                     .zip(&history.rows)

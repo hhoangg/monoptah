@@ -79,6 +79,20 @@ pub(crate) fn locked(store: &Database) -> Result<std::sync::MutexGuard<'_, Store
         .map_err(|_| "Native session store unavailable".into())
 }
 
+/// For a local session whose location is Cloud: the summary of its linked Host session (the
+/// one the remote runtime binds to) and the local session id that receives the rows.
+/// `None` for a session that lives locally.
+fn cloud_target(store: &Database, local: i64) -> Result<Option<(Session, i64)>, String> {
+    let store = locked(store)?;
+    if !store.cloud_location(local)?.is_cloud() {
+        return Ok(None);
+    }
+    let (_, remote) = store.linked_remote_session(local)?.ok_or(
+        "This conversation is in the cloud, but its cloud session is missing. Reconnect it first.",
+    )?;
+    Ok(Some((remote.summary, local)))
+}
+
 pub(crate) fn run_turn(
     summary: Session,
     prompt: String,
@@ -91,6 +105,28 @@ pub(crate) fn run_turn(
     if summary.cwd.starts_with("remote://") {
         remote::run(summary, prompt, settings, controls, store, cancel, tx);
         return;
+    }
+    // A local session that lives in the cloud runs on its linked Host session, and the Host
+    // rows are appended to this local session (design 4.2.1). Never the local provider.
+    match cloud_target(&store, summary.id) {
+        Ok(Some((remote_summary, mirror))) => {
+            remote::run_mirrored(
+                remote_summary,
+                mirror,
+                prompt,
+                settings,
+                controls,
+                store,
+                cancel,
+                tx,
+            );
+            return;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let _ = tx.send_blocking(remote::failed(error));
+            return;
+        }
     }
     run_turn_using(
         TurnInput {

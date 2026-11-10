@@ -1016,3 +1016,227 @@ fn a_queued_send_that_fails_before_the_journal_is_never_acknowledged() {
     assert!(updates.iter().all(|u| u.delivered.is_none()));
     assert!(updates.last().unwrap().finished);
 }
+
+fn cloud_at() -> monocode_core::store::SessionLocation {
+    monocode_core::store::SessionLocation::Cloud(monocode_core::store::CloudLocation {
+        cloud: monocode_core::cloud_sessions::CloudRef::codespace("octo-abc"),
+        environment_id: "env".into(),
+        project_id: "project".into(),
+        host_session_id: "host-session".into(),
+        remote_cwd: "/host/repo".into(),
+        local_cwd: "/Users/me/repo".into(),
+        moved_at_row: 0,
+        pushed_branch: None,
+    })
+}
+
+fn mirrored_pair(store: &Database) -> (i64, RemoteSession) {
+    let remote = {
+        let mut bound = binding(store);
+        bound.session_id = Some("host-session".into());
+        journal(store, &bound).unwrap();
+        bound
+    };
+    let store = locked(store).unwrap();
+    let local = store.create("codex", "/Users/me/repo").unwrap();
+    store
+        .link_remote_session(remote.summary.id, Some(local.id))
+        .unwrap();
+    store.set_cloud_location(local.id, &cloud_at()).unwrap();
+    let remote = store.remote_session(remote.summary.id).unwrap().unwrap();
+    (local.id, remote)
+}
+
+fn attach_mirrored(host: &Host, store: &Database, local: i64, remote: &RemoteSession) {
+    let (tx, rx) = async_channel::unbounded();
+    let (_controls_tx, controls) = std::sync::mpsc::channel();
+    run_with_client_mirrored(
+        host.client.clone(),
+        remote.summary.clone(),
+        Some(local),
+        String::new(),
+        Settings {
+            remote_action: Some(json!({"type":"attach"})),
+            ..Default::default()
+        },
+        controls,
+        store.clone(),
+        Arc::new(AtomicBool::new(false)),
+        tx,
+    );
+    let mut last = receive(&rx);
+    while !last.finished {
+        last = receive(&rx);
+    }
+    assert_eq!(last.status, "Ready");
+}
+
+/// The rows the runtime derives from a Host snapshot (attachments qualified first).
+fn host_rows(snapshot: &Value) -> Vec<Row> {
+    let mut qualified = snapshot.clone();
+    monocode_core::remote::attachments::qualify_snapshot(&mut qualified, "env", "host-session");
+    monocode_core::store::Store::project_remote_history(&qualified)
+        .unwrap()
+        .0
+        .rows
+}
+
+fn blocks_snapshot(revision: u64, blocks: Value) -> Value {
+    let mut value = snapshot("idle", revision);
+    value["session"]["blocks"] = blocks;
+    value
+}
+
+#[test]
+fn mirrored_run_appends_host_rows_to_the_local_session_once() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let (local, remote) = mirrored_pair(&store);
+    let host_blocks = json!([
+        {"id":"u","role":"user","text":"Question"},
+        {"id":"a","role":"assistant","text":"Answer"}
+    ]);
+    let value = blocks_snapshot(2, host_blocks.clone());
+    let host = Host::new(move |_| Some(json!({"kind":"snapshot","value":value.clone()})));
+    // Re-syncing the same snapshot twice must not duplicate anything.
+    attach_mirrored(&host, &store, local, &remote);
+    attach_mirrored(&host, &store, local, &remote);
+    let rows = locked(&store).unwrap().load(local).unwrap().rows;
+    let projected = host_rows(&blocks_snapshot(2, host_blocks.clone()));
+    assert_eq!(rows, projected);
+    assert!(rows.iter().any(|r| r.text == "Question") && rows.iter().any(|r| r.text == "Answer"));
+    // The Host record is untouched plumbing and the local session never got a remote cwd.
+    let guard = locked(&store).unwrap();
+    assert_eq!(
+        guard
+            .remote_session(remote.summary.id)
+            .unwrap()
+            .unwrap()
+            .linked_to,
+        Some(local)
+    );
+    assert!(
+        !guard
+            .sessions()
+            .unwrap()
+            .iter()
+            .any(|s| s.id == local && s.cwd.starts_with("remote://"))
+    );
+}
+
+#[test]
+fn mirrored_run_repairs_a_partial_write_and_follows_a_shorter_host_history() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let (local, remote) = mirrored_pair(&store);
+    let full = json!([
+        {"id":"u","role":"user","text":"One"},
+        {"id":"a","role":"assistant","text":"Two"},
+        {"id":"v","role":"user","text":"Three"}
+    ]);
+    let current = Arc::new(Mutex::new(blocks_snapshot(3, full)));
+    let served = current.clone();
+    let host =
+        Host::new(move |_| Some(json!({"kind":"snapshot","value":served.lock().unwrap().clone()})));
+    attach_mirrored(&host, &store, local, &remote);
+    // Tear the middle row as an interrupted earlier write would.
+    {
+        let mut guard = locked(&store).unwrap();
+        guard
+            .set_cloud_location(local, &monocode_core::store::SessionLocation::Local)
+            .unwrap();
+        guard.truncate_rows(local, 1).unwrap();
+        guard
+            .write_rows(
+                local,
+                1,
+                &[Row {
+                    role: "assistant".into(),
+                    text: "torn".into(),
+                    first: true,
+                    sent_at: None,
+                }],
+            )
+            .unwrap();
+    }
+    locked(&store)
+        .unwrap()
+        .set_cloud_location(local, &cloud_at())
+        .unwrap();
+    attach_mirrored(&host, &store, local, &remote);
+    let texts = |store: &Database| -> Vec<String> {
+        locked(store)
+            .unwrap()
+            .load(local)
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|r| r.text)
+            .collect()
+    };
+    let expected =
+        |snap: &Value| -> Vec<String> { host_rows(snap).into_iter().map(|r| r.text).collect() };
+    assert_eq!(texts(&store), expected(&current.lock().unwrap()));
+    assert!(texts(&store).len() >= 3);
+    // The Host history shrinks (for example after a rewind there): the surplus goes.
+    *current.lock().unwrap() = blocks_snapshot(
+        4,
+        json!([{"id":"u","role":"user","text":"One"},{"id":"a","role":"assistant","text":"Two"}]),
+    );
+    attach_mirrored(&host, &store, local, &remote);
+    assert_eq!(texts(&store), expected(&current.lock().unwrap()));
+    assert!(!texts(&store).iter().any(|t| t == "Three"));
+}
+
+#[test]
+fn run_turn_picks_the_remote_runtime_for_a_cloud_location_and_refuses_a_missing_link() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let local = locked(&store)
+        .unwrap()
+        .create("codex", "/Users/me/repo")
+        .unwrap();
+    // Local location: no cloud target, the local runtime stays in charge.
+    assert!(cloud_target(&store, local.id).unwrap().is_none());
+    // Cloud location without a linked Host session: a clear error, never the local provider.
+    locked(&store)
+        .unwrap()
+        .set_cloud_location(local.id, &cloud_at())
+        .unwrap();
+    assert!(
+        cloud_target(&store, local.id)
+            .unwrap_err()
+            .contains("missing")
+    );
+    let (tx, rx) = async_channel::unbounded();
+    let (_controls_tx, controls) = std::sync::mpsc::channel();
+    run_turn(
+        local.clone(),
+        "hello".into(),
+        Settings::default(),
+        controls,
+        store.clone(),
+        Arc::new(AtomicBool::new(false)),
+        tx,
+    );
+    let result = receive(&rx);
+    assert!(
+        result.finished && result.status.contains("missing"),
+        "{}",
+        result.status
+    );
+    // Linked: the target is the Host record's summary, receiving rows for the local id.
+    let remote = {
+        let guard = locked(&store).unwrap();
+        let project = guard
+            .remember_remote_project("env", &json!({"id":"project","cwd":"/host/repo"}))
+            .unwrap();
+        let remote = guard.create("codex", &project.key).unwrap();
+        guard
+            .link_remote_session(remote.id, Some(local.id))
+            .unwrap();
+        remote
+    };
+    let (target, mirror) = cloud_target(&store, local.id).unwrap().unwrap();
+    assert_eq!((target.id, mirror), (remote.id, local.id));
+}
