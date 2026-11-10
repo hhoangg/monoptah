@@ -16,6 +16,7 @@ import {
 import { HostEngine } from "./engine";
 import { writeAttachmentChunk, readAttachmentChunk } from "./attachments";
 import { HostUploads } from "./uploads";
+import { HostMoves } from "./move";
 import type { LinkedWorkItem } from "../src/features/sessions/model/session";
 import { parseGithubWorkItemUrl } from "../src/features/sessions/model/sessionWorkItem";
 import { SyncTransfers } from "./sync-transfer";
@@ -197,6 +198,9 @@ export function createHostServer(
   // Sweeps expired staging at startup, on a timer, and on begin/chunk/commit.
   const uploads = new HostUploads(engine.store.uploadDir);
   uploads.startSweeper();
+  const moves = new HostMoves(engine, uploads, {
+    onWorktreeCreated: () => workspace.invalidateRoots(),
+  });
   const server = createServer(
     { requestTimeout: 20_000, headersTimeout: 10_000, maxHeaderSize: 8192 },
     async (request, response) => {
@@ -304,6 +308,8 @@ export function createHostServer(
                 "sessions.draft",
                 "sessions.plan",
                 "workspace.watch",
+                "workspace.applySnapshot",
+                "sessions.import",
               ],
             };
             break;
@@ -439,6 +445,12 @@ export function createHostServer(
             break;
           case "uploads.discard":
             result = uploads.discard(params);
+            break;
+          case "workspace.applySnapshot":
+            result = await moves.applySnapshot(params);
+            break;
+          case "sessions.import":
+            result = await moves.importSession(params);
             break;
           case "devices.revokeSelf":
             // Only the caller's own credential. Sessions and other devices

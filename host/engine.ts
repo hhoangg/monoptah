@@ -55,7 +55,7 @@ const text = (value: unknown, label: string, max = 128): string => {
   return value;
 };
 
-function modelSettings(value: unknown): Record<string, string> {
+export function modelSettings(value: unknown): Record<string, string> {
   if (value == null) return {};
   if (!value || typeof value !== "object" || Array.isArray(value))
     throw new Error("Invalid model settings");
@@ -246,6 +246,7 @@ export function parseCommand(input: unknown): HostCommand {
 const ACTION_LABELS: Record<string, string> = {
   "discarding changes": "discard",
   "stashing changes": "stash",
+  "restoring a moved workspace": "workspace restore",
 };
 
 export class HostEngine {
@@ -324,6 +325,65 @@ export class HostEngine {
     } finally {
       this.switchingProjects.delete(projectId);
     }
+  }
+
+  /** Claude Host sessions that bind this provider conversation id, in any project. */
+  sessionsBoundTo(providerSessionId: string) {
+    return this.store
+      .projects()
+      .flatMap((project) => this.store.summaries(project.id))
+      .filter(
+        (entry) =>
+          entry.harness === "claude" &&
+          entry.providerSessionId === providerSessionId,
+      );
+  }
+
+  /**
+   * Creates a Claude Host session for a conversation whose transcript was installed by
+   * `sessions.import`. It has NO blocks and is bound to `providerSessionId`, so its first
+   * turn passes `--resume <id>` (never `--fork-session`) and appends to the same JSONL.
+   */
+  importClaudeSession(input: {
+    projectId: string;
+    cwd: string;
+    providerSessionId: string;
+    title: string;
+    model: string;
+    modelSettings: Record<string, string>;
+    runtimeMode: Session["runtimeMode"];
+  }): HostSession {
+    if (this.closing) throw new Error("Host is stopping");
+    const project = this.store.project(input.projectId);
+    const busy = this.switchingProjects.get(project.id);
+    if (busy) throw new Error(`Wait for the ${busy} to finish`);
+    const provider = this.provider("claude");
+    const now = Date.now();
+    const saved = this.store.transaction(() =>
+      this.store.save(
+        {
+          projectId: project.id,
+          revision: 1,
+          status: "idle",
+          createdAt: now,
+          updatedAt: now,
+          session: {
+            id: randomUUID(),
+            cwd: input.cwd,
+            harness: "claude",
+            model: input.model,
+            runtimeMode: input.runtimeMode,
+            modelSettings: input.modelSettings,
+            title: input.title,
+            providerSessionId: input.providerSessionId,
+            blocks: [],
+          },
+        },
+        { type: "imported" },
+      ),
+    );
+    provider.bind(saved.session.id, input.providerSessionId, input.cwd);
+    return saved;
   }
 
   private provider(id: string): HostProvider {

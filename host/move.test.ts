@@ -1,0 +1,568 @@
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { HostProvider } from "./providers";
+import { HostEngine } from "./engine";
+import { HostStore } from "./store";
+import { HostUploads } from "./uploads";
+import {
+  HostMoves,
+  installTranscript,
+  patchPathProblem,
+  validateBranch,
+  worktreeTree,
+} from "./move";
+import { claudeProjectDirName, decide, parseChain } from "./transcript-sync";
+
+const FIXTURES = join(__dirname, "..", "crates/monocode-core/tests/fixtures/transcript_sync");
+const fixture = (name: string) => readFileSync(join(FIXTURES, name), "utf8");
+
+const cleanups: Array<() => Promise<void> | void> = [];
+afterEach(async () => {
+  for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+});
+
+const IDENTITY = {
+  GIT_AUTHOR_NAME: "Test",
+  GIT_AUTHOR_EMAIL: "test@example.com",
+  GIT_COMMITTER_NAME: "Test",
+  GIT_COMMITTER_EMAIL: "test@example.com",
+};
+const git = (cwd: string, ...args: string[]) =>
+  execFileSync("git", ["-c", "commit.gpgsign=false", ...args], {
+    cwd,
+    encoding: "utf8",
+    env: { ...process.env, ...IDENTITY },
+  }).trim();
+
+/** What a sender computes: the tree and patch of every non-ignored change over HEAD. */
+function snapshotOf(repo: string) {
+  const scratch = mkdtempSync(join(tmpdir(), "move-test-index-"));
+  const env = { ...process.env, GIT_INDEX_FILE: join(scratch, "index") };
+  const run = (...args: string[]) =>
+    execFileSync("git", args, { cwd: repo, env, maxBuffer: 1 << 26 });
+  run("read-tree", "HEAD");
+  run("add", "-A");
+  const tree = run("write-tree").toString().trim();
+  const patch = run("diff", "--cached", "--binary", "HEAD");
+  rmSync(scratch, { recursive: true, force: true });
+  return { head: git(repo, "rev-parse", "HEAD"), tree, patch };
+}
+
+function upload(uploads: HostUploads, name: string, data: Buffer | string) {
+  const bytes = Buffer.from(data);
+  const { uploadId } = uploads.begin({
+    name,
+    size: bytes.length,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  });
+  uploads.chunk({ uploadId, offset: 0, data: bytes.toString("base64") });
+  uploads.commit({ uploadId });
+  return uploadId;
+}
+
+interface World {
+  dir: string;
+  origin: string;
+  local: string;
+  root: string;
+  claudeDir: string;
+  store: HostStore;
+  engine: HostEngine;
+  provider: HostProvider;
+  uploads: HostUploads;
+  moves: HostMoves;
+  projectId: string;
+  turns: Array<{ finish: () => void }>;
+}
+
+/**
+ * origin (bare, default branch main) <- local (the sender, on `feat` with dirty changes)
+ * and root (the Host project, a clone of origin on main).
+ */
+function world(options: { cloneRootAfterPush?: boolean; rootBranch?: string } = {}): World {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "move-test-")));
+  const origin = join(dir, "origin.git");
+  const local = join(dir, "local");
+  const root = join(dir, "root");
+  mkdirSync(origin);
+  git(origin, "init", "-q", "--bare", "-b", "main");
+  git(dir, "clone", "-q", origin, local);
+  git(local, "checkout", "-q", "-b", "main");
+  writeFileSync(join(local, "a.txt"), "one\n");
+  writeFileSync(join(local, ".gitignore"), "secret.env\n");
+  git(local, "add", ".");
+  git(local, "commit", "-q", "-m", "initial");
+  git(local, "push", "-q", "origin", "main");
+  git(origin, "symbolic-ref", "HEAD", "refs/heads/main");
+  git(local, "remote", "set-head", "origin", "main");
+  const rootAfterPush = options.cloneRootAfterPush || !!options.rootBranch;
+  if (!rootAfterPush) git(dir, "clone", "-q", origin, root);
+  git(local, "checkout", "-q", "-b", "feat");
+  writeFileSync(join(local, "a.txt"), "one\ntwo\n");
+  git(local, "commit", "-q", "-am", "second");
+  git(local, "push", "-q", "origin", "feat");
+  if (rootAfterPush) git(dir, "clone", "-q", origin, root);
+  if (options.rootBranch) git(root, "checkout", "-q", options.rootBranch);
+  // Uncommitted work: a change, a new file, a binary file, and an ignored file.
+  writeFileSync(join(local, "a.txt"), "one\ntwo\nthree\n");
+  writeFileSync(join(local, "b.txt"), "new file\n");
+  writeFileSync(join(local, "bin.dat"), Buffer.from([0, 1, 2, 255, 254, 0, 9]));
+  writeFileSync(join(local, "secret.env"), "TOKEN=1\n");
+
+  const directory = join(dir, "host");
+  mkdirSync(directory);
+  const store = new HostStore(join(directory, "host.db"));
+  const project = store.addProject(realpathSync(root), "root");
+  const turns: World["turns"] = [];
+  const provider: HostProvider = {
+    send: vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          turns.push({ finish: resolve });
+        }),
+    ),
+    cancel: vi.fn(async () => turns.at(-1)?.finish()),
+    stop: vi.fn(async () => turns.at(-1)?.finish()),
+    bind: vi.fn(),
+    approve: vi.fn(),
+    answer: vi.fn(),
+  };
+  const engine = new HostEngine(store, { claude: provider, codex: provider });
+  const uploads = new HostUploads(join(directory, "uploads"));
+  const claudeDir = join(dir, "claude-config");
+  const moves = new HostMoves(engine, uploads, { claudeConfigDir: () => claudeDir });
+  cleanups.push(async () => {
+    await engine.close();
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  return {
+    dir, origin, local, root: realpathSync(root), claudeDir, store, engine, provider, uploads, moves,
+    projectId: project.id, turns,
+  };
+}
+
+const listing = (repo: string) => git(repo, "worktree", "list", "--porcelain");
+
+describe("workspace.applySnapshot", () => {
+  it("restores code on a new Host worktree and the tree verification passes", async () => {
+    const w = world();
+    const snap = snapshotOf(w.local);
+    const patchUploadId = upload(w.uploads, "changes.patch", snap.patch);
+    const result = await w.moves.applySnapshot({
+      projectId: w.projectId, instance: "shared", branch: "feat", ...snap, patchUploadId,
+    });
+    expect(result).toMatchObject({ branch: "feat", head: snap.head, tree: snap.tree, createdWorktree: true, reused: false });
+    // A shared instance: a new worktree, never the project root.
+    expect(result.cwd).not.toBe(w.root);
+    expect(realpathSync(result.cwd).startsWith(`${w.root}-worktrees`)).toBe(true);
+    expect(listing(w.root)).toContain(`branch refs/heads/feat`);
+    expect(readFileSync(join(result.cwd, "a.txt"), "utf8")).toBe("one\ntwo\nthree\n");
+    expect(readFileSync(join(result.cwd, "b.txt"), "utf8")).toBe("new file\n");
+    expect([...readFileSync(join(result.cwd, "bin.dat"))]).toEqual([0, 1, 2, 255, 254, 0, 9]);
+    // Ignored files never travel; the changes are unstaged; the root is untouched.
+    expect(existsSync(join(result.cwd, "secret.env"))).toBe(false);
+    expect(git(result.cwd, "diff", "--cached", "--name-only")).toBe("");
+    expect(git(w.root, "status", "--porcelain")).toBe("");
+    expect(git(w.root, "symbolic-ref", "--short", "HEAD")).toBe("main");
+    expect(await worktreeTree(result.cwd)).toBe(snap.tree);
+  });
+
+  it("fails the tree verification, rolls back what it created and reports", async () => {
+    const w = world();
+    const snap = snapshotOf(w.local);
+    const patchUploadId = upload(w.uploads, "changes.patch", snap.patch);
+    const wrong = snap.tree.replace(/^./, (c) => (c === "0" ? "1" : "0"));
+    await expect(
+      w.moves.applySnapshot({ projectId: w.projectId, branch: "feat", head: snap.head, tree: wrong, patchUploadId }),
+    ).rejects.toThrow(/do not match the snapshot \(expected tree .* got /);
+    expect(listing(w.root)).not.toContain("feat");
+    expect(git(w.root, "branch", "--list", "feat")).toBe("");
+    expect(existsSync(`${w.root}-worktrees/wt-feat`)).toBe(false);
+    expect(git(w.root, "status", "--porcelain")).toBe("");
+  });
+
+  it("fails when the patch does not produce the snapshot tree", async () => {
+    const w = world();
+    const snap = snapshotOf(w.local);
+    // A patch for only part of the changes leaves the tree different.
+    writeFileSync(join(w.local, "b.txt"), "different\n");
+    const partial = snapshotOf(w.local).patch;
+    const patchUploadId = upload(w.uploads, "changes.patch", partial);
+    await expect(
+      w.moves.applySnapshot({ projectId: w.projectId, branch: "feat", head: snap.head, tree: snap.tree, patchUploadId }),
+    ).rejects.toThrow(/do not match/);
+    expect(existsSync(`${w.root}-worktrees/wt-feat`)).toBe(false);
+  });
+
+  it("restores a clean snapshot without a patch", async () => {
+    const w = world();
+    git(w.local, "checkout", "-q", "--", ".");
+    rmSync(join(w.local, "b.txt"));
+    rmSync(join(w.local, "bin.dat"));
+    const snap = snapshotOf(w.local);
+    const result = await w.moves.applySnapshot({ projectId: w.projectId, branch: "feat", ...snap });
+    expect(result.patchApplied).toBe(false);
+    expect(await worktreeTree(result.cwd)).toBe(snap.tree);
+  });
+
+  it("targets the project root on a new instance and rolls back a mismatch there", async () => {
+    const w = world({ rootBranch: "feat" });
+    const snap = snapshotOf(w.local);
+    const patchUploadId = upload(w.uploads, "changes.patch", snap.patch);
+    const wrong = snap.tree.replace(/^./, (c) => (c === "0" ? "1" : "0"));
+    await expect(
+      w.moves.applySnapshot({ projectId: w.projectId, instance: "new", branch: "feat", head: snap.head, tree: wrong, patchUploadId }),
+    ).rejects.toThrow(/do not match/);
+    expect(git(w.root, "status", "--porcelain")).toBe("");
+    const ok = await w.moves.applySnapshot({
+      projectId: w.projectId, instance: "new", branch: "feat", ...snap, patchUploadId,
+    });
+    expect(ok).toMatchObject({ cwd: w.root, createdWorktree: false, reused: false });
+    expect(readFileSync(join(w.root, "a.txt"), "utf8")).toBe("one\ntwo\nthree\n");
+    expect(existsSync(`${w.root}-worktrees`)).toBe(false);
+  });
+
+  it("is idempotent: a repeated call finds the snapshot already in place", async () => {
+    for (const instance of ["shared", "new"] as const) {
+      const w = world({ rootBranch: instance === "new" ? "feat" : undefined });
+      const snap = snapshotOf(w.local);
+      const patchUploadId = upload(w.uploads, "changes.patch", snap.patch);
+      const args = { projectId: w.projectId, instance, branch: "feat", ...snap, patchUploadId };
+      const first = await w.moves.applySnapshot(args);
+      const second = await w.moves.applySnapshot(args);
+      expect(second).toMatchObject({ cwd: first.cwd, reused: true, createdWorktree: false, patchApplied: false });
+    }
+  });
+
+  it("fetches the pushed branch when the commit is missing, and not when it is there", async () => {
+    const missing = world();
+    const snap = snapshotOf(missing.local);
+    expect(() => git(missing.root, "cat-file", "-e", `${snap.head}^{commit}`)).toThrow();
+    const patchUploadId = upload(missing.uploads, "changes.patch", snap.patch);
+    const result = await missing.moves.applySnapshot({ projectId: missing.projectId, branch: "feat", ...snap, patchUploadId });
+    expect(git(missing.root, "rev-parse", "refs/remotes/origin/feat")).toBe(snap.head);
+    expect(git(result.cwd, "rev-parse", "HEAD")).toBe(snap.head);
+    // Never forced and never the default branch: origin/main is where it was.
+    expect(git(missing.root, "rev-parse", "main")).toBe(git(missing.origin, "rev-parse", "main"));
+
+    const present = world({ cloneRootAfterPush: true });
+    const second = snapshotOf(present.local);
+    expect(git(present.root, "cat-file", "-t", second.head)).toBe("commit");
+    const secondPatch = upload(present.uploads, "changes.patch", second.patch);
+    await expect(
+      present.moves.applySnapshot({ projectId: present.projectId, branch: "feat", ...second, patchUploadId: secondPatch }),
+    ).resolves.toMatchObject({ createdWorktree: true });
+  });
+
+  it("reports when the snapshot head is not on the pushed branch", async () => {
+    const w = world();
+    const snap = snapshotOf(w.local);
+    const unpushed = "0".repeat(39) + "1";
+    await expect(
+      w.moves.applySnapshot({ projectId: w.projectId, branch: "feat", ...snap, head: unpushed }),
+    ).rejects.toThrow(/not on the pushed branch/);
+    expect(existsSync(`${w.root}-worktrees`)).toBe(false);
+  });
+
+  it("refuses the default branch of origin", async () => {
+    const w = world();
+    const snap = snapshotOf(w.local);
+    await expect(
+      w.moves.applySnapshot({ projectId: w.projectId, branch: "main", ...snap }),
+    ).rejects.toThrow(/default branch/);
+  });
+
+  it("refuses an existing branch at a different commit and never moves it", async () => {
+    const w = world();
+    const snap = snapshotOf(w.local);
+    git(w.root, "fetch", "-q", "origin");
+    git(w.root, "branch", "feat", "origin/main");
+    await expect(
+      w.moves.applySnapshot({ projectId: w.projectId, branch: "feat", ...snap }),
+    ).rejects.toThrow(/different commit/);
+    expect(git(w.root, "rev-parse", "feat")).toBe(git(w.root, "rev-parse", "origin/main"));
+  });
+
+  it.each([
+    ["head", { head: "xyz" }],
+    ["head", { head: "ABC" }],
+    ["tree", { tree: "1234" }],
+    ["tree", { tree: 5 }],
+    ["branch", { branch: "bad..name" }],
+    ["branch", { branch: "-x" }],
+    ["branch", { branch: "a b" }],
+    ["branch", { branch: "@{-1}" }],
+    ["branch", { branch: "refs/heads/x.lock" }],
+    ["instance", { instance: "elsewhere" }],
+    ["patch upload", { patchUploadId: "../../etc/passwd" }],
+  ])("rejects an invalid %s", async (_label, bad) => {
+    const w = world();
+    const snap = snapshotOf(w.local);
+    await expect(
+      w.moves.applySnapshot({ projectId: w.projectId, branch: "feat", ...snap, ...bad }),
+    ).rejects.toThrow();
+    expect(existsSync(`${w.root}-worktrees`)).toBe(false);
+  });
+
+  it("refuses to run while a Host session is running", async () => {
+    const w = world();
+    const snap = snapshotOf(w.local);
+    const created = w.engine.command({
+      type: "create", commandId: "c", projectId: w.projectId, harness: "claude",
+      model: "claude:test", runtimeMode: "supervised",
+    });
+    w.engine.command({ type: "send", commandId: "s", sessionId: created.sessionId, text: "work" });
+    await expect(
+      w.moves.applySnapshot({ projectId: w.projectId, branch: "feat", ...snap }),
+    ).rejects.toThrow(/Wait for running host sessions/);
+    w.turns[0]?.finish();
+  });
+
+  describe("the patch cannot touch .git/ or leave the target", () => {
+    const patchFor = (path: string, from = path) =>
+      `diff --git a/${from} b/${path}\nnew file mode 100644\n--- /dev/null\n+++ b/${path}\n@@ -0,0 +1 @@\n+x\n`;
+    it.each([
+      [".git/hooks/pre-commit", patchFor(".git/hooks/pre-commit")],
+      ["sub/.git/config", patchFor("sub/.git/config")],
+      ["a nested .GIT", patchFor("x/.GIT/config")],
+      ["../escape.txt", patchFor("../escape.txt")],
+      ["a/../../escape.txt", patchFor("a/../../escape.txt")],
+      ["an absolute path", "diff --git a//tmp/abs.txt b//tmp/abs.txt\nnew file mode 100644\n--- /dev/null\n+++ b//tmp/abs.txt\n@@ -0,0 +1 @@\n+x\n"],
+      ["a rename into .git", "diff --git a/a.txt b/.git/a.txt\nsimilarity index 100%\nrename from a.txt\nrename to .git/a.txt\n"],
+    ])("refuses %s and creates nothing", async (_label, patch) => {
+      const w = world();
+      const snap = snapshotOf(w.local);
+      const patchUploadId = upload(w.uploads, "evil.patch", patch);
+      await expect(
+        w.moves.applySnapshot({ projectId: w.projectId, branch: "feat", ...snap, patchUploadId }),
+      ).rejects.toThrow();
+      expect(existsSync(`${w.root}-worktrees`)).toBe(false);
+      expect(git(w.root, "branch", "--list", "feat")).toBe("");
+      expect(existsSync(join(w.dir, "escape.txt"))).toBe(false);
+      expect(existsSync(join(w.root, ".git", "hooks", "pre-commit"))).toBe(false);
+    });
+
+    it("explains a .git path with our own message", async () => {
+      const w = world();
+      const snap = snapshotOf(w.local);
+      const patchUploadId = upload(w.uploads, "evil.patch", patchFor("sub/.git/config"));
+      await expect(
+        w.moves.applySnapshot({ projectId: w.projectId, branch: "feat", ...snap, patchUploadId }),
+      ).rejects.toThrow(/inside \.git/);
+    });
+
+    it("classifies paths", () => {
+      for (const bad of ["", ".git", "a/.git/b", "A/.GIT/b", ".git./x", "git~1/x", "../x", "a/../x", "/etc/x", "\\x", "C:/x", "a\\..\\x"])
+        expect(patchPathProblem(bad), bad).toBeTruthy();
+      for (const good of ["a.txt", "dir/file", ".gitignore", ".github/workflows/a.yml", "my.git/x", "a..b/c"])
+        expect(patchPathProblem(good), good).toBeUndefined();
+    });
+  });
+
+  it("validates branch names with check-ref-format", async () => {
+    const w = world();
+    await expect(validateBranch(w.root, "feature/ok-1")).resolves.toBe("feature/ok-1");
+    for (const bad of ["", "a..b", "x.lock", "a b", "-x", "@", "a~b", "a\0b", 7])
+      await expect(validateBranch(w.root, bad), String(bad)).rejects.toThrow("Invalid branch name");
+  });
+});
+
+describe("transcript install (shared Rust fixtures)", () => {
+  const cases = (JSON.parse(fixture("cases.json")) as {
+    cases: { name: string; existing: string | null; incoming: string; decision: string }[];
+  }).cases;
+  const dirOf = () => {
+    const dir = mkdtempSync(join(tmpdir(), "move-install-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    return dir;
+  };
+
+  it.each(cases.map((c) => [c.name, c] as const))("%s", (_name, c) => {
+    const dir = dirOf();
+    const id = "11111111-1111-4111-8111-111111111111";
+    if (c.existing) writeFileSync(join(dir, `${id}.jsonl`), fixture(c.existing));
+    const incoming = fixture(c.incoming);
+    const out = installTranscript({ dir, id, text: incoming, newId: () => "22222222-2222-4222-8222-222222222222" });
+    expect(out.decision).toBe(c.decision);
+    const dest = join(dir, `${id}.jsonl`);
+    if (c.decision === "install" || c.decision === "replace") {
+      expect(readFileSync(dest, "utf8")).toBe(incoming);
+      if (c.decision === "replace") {
+        expect(readFileSync(join(dir, `${id}.jsonl.pre-cloud`), "utf8")).toBe(fixture(c.existing!));
+      } else expect(existsSync(join(dir, `${id}.jsonl.pre-cloud`))).toBe(false);
+    } else if (c.decision === "already_current") {
+      expect(readFileSync(dest, "utf8")).toBe(fixture(c.existing!));
+      expect(readdirSync(dir)).toEqual([`${id}.jsonl`]);
+    } else {
+      // Divergence is never overwritten: the existing file is byte for byte as before and
+      // the incoming copy lives under the new id with its sessionId fields rewritten.
+      expect(readFileSync(dest, "utf8")).toBe(fixture(c.existing!));
+      expect(out.id).toBe("22222222-2222-4222-8222-222222222222");
+      const forked = readFileSync(out.file, "utf8");
+      expect(forked).not.toContain(id);
+      expect(parseChain(forked)).toEqual(parseChain(incoming));
+      expect(decide(readFileSync(dest), forked)).toBe("diverged");
+    }
+    // No temporary files are left behind.
+    expect(readdirSync(dir).filter((name) => name.startsWith("."))).toEqual([]);
+  });
+});
+
+describe("sessions.import", () => {
+  const ID = "11111111-1111-4111-8111-111111111111";
+  const imported = (w: World, uploadId: string, extra: Record<string, unknown> = {}) =>
+    w.moves.importSession({
+      projectId: w.projectId, providerSessionId: ID, uploadId, cwd: w.root,
+      title: "Moved", model: "claude:test", fromCwds: ["/workspaces/app"], ...extra,
+    });
+  const fileOf = (w: World, id = ID, cwd = w.root) =>
+    join(w.claudeDir, "projects", claudeProjectDirName(cwd), `${id}.jsonl`);
+
+  it("installs under the encoded cwd dir, rewrites cwd, and creates a block-free bound session", async () => {
+    const w = world();
+    const uploadId = upload(w.uploads, "t.jsonl", fixture("base.jsonl"));
+    const result = await imported(w, uploadId);
+    expect(result).toMatchObject({ decision: "installed", providerSessionId: ID, reused: false });
+    const file = fileOf(w);
+    const text = readFileSync(file, "utf8");
+    expect(text).not.toContain("/workspaces/app");
+    expect(text).toContain(JSON.stringify(w.root).slice(1, -1));
+    expect(parseChain(text)).toEqual(parseChain(fixture("base.jsonl")));
+    const stored = w.store.session(result.sessionId);
+    expect(stored.session.blocks).toHaveLength(0);
+    expect(stored.session).toMatchObject({ harness: "claude", providerSessionId: ID, cwd: w.root, title: "Moved" });
+    expect(w.provider.bind).toHaveBeenCalledWith(result.sessionId, ID, w.root);
+  });
+
+  it("detects the source cwd from the entries when none is given", async () => {
+    const w = world();
+    const uploadId = upload(w.uploads, "t.jsonl", fixture("base.jsonl"));
+    await imported(w, uploadId, { fromCwds: undefined });
+    expect(readFileSync(fileOf(w), "utf8")).not.toContain("/workspaces/app");
+  });
+
+  it("extends: replaces an older copy, keeps it as .pre-cloud and reuses the untouched session", async () => {
+    const w = world();
+    const first = await imported(w, upload(w.uploads, "a.jsonl", fixture("base.jsonl")));
+    const before = readFileSync(fileOf(w), "utf8");
+    const second = await imported(w, upload(w.uploads, "b.jsonl", fixture("extended.jsonl")));
+    expect(second).toMatchObject({ decision: "replaced", reused: true, sessionId: first.sessionId });
+    expect(readFileSync(`${fileOf(w)}.pre-cloud`, "utf8")).toBe(before);
+    expect(parseChain(readFileSync(fileOf(w)))).toEqual(parseChain(fixture("extended.jsonl")));
+    expect(w.store.summaries(w.projectId)).toHaveLength(1);
+  });
+
+  it("is idempotent: a re-import changes nothing and creates no second session", async () => {
+    const w = world();
+    const uploadId = upload(w.uploads, "t.jsonl", fixture("base.jsonl"));
+    const first = await imported(w, uploadId);
+    const bytes = readFileSync(fileOf(w));
+    const again = await imported(w, uploadId);
+    expect(again).toMatchObject({ decision: "already_current", reused: true, sessionId: first.sessionId });
+    expect(readFileSync(fileOf(w)).equals(bytes)).toBe(true);
+    expect(readdirSync(join(w.claudeDir, "projects", claudeProjectDirName(w.root)))).toEqual([`${ID}.jsonl`]);
+    expect(w.store.summaries(w.projectId)).toHaveLength(1);
+  });
+
+  it("forks a diverged copy to a new id and leaves the existing file alone", async () => {
+    const w = world();
+    mkdirSync(join(w.claudeDir, "projects", claudeProjectDirName(w.root)), { recursive: true });
+    const local = rewrite(fixture("diverged.jsonl"), w.root);
+    writeFileSync(fileOf(w), local);
+    const result = await imported(w, upload(w.uploads, "t.jsonl", fixture("extended.jsonl")));
+    expect(result.decision).toBe("forked");
+    expect(result.forkedFrom).toBe(ID);
+    expect(result.providerSessionId).not.toBe(ID);
+    expect(result.notice).toContain(result.providerSessionId);
+    expect(readFileSync(fileOf(w), "utf8")).toBe(local);
+    const forked = readFileSync(fileOf(w, result.providerSessionId), "utf8");
+    expect(forked).not.toContain(ID);
+    expect(forked).toContain(result.providerSessionId);
+    const stored = w.store.session(result.sessionId);
+    expect(stored.session.providerSessionId).toBe(result.providerSessionId);
+    expect(stored.session.blocks).toHaveLength(0);
+    expect(w.provider.bind).toHaveBeenCalledWith(result.sessionId, result.providerSessionId, w.root);
+  });
+
+  it("refuses when a running session binds the conversation, and writes nothing", async () => {
+    const w = world();
+    const first = await imported(w, upload(w.uploads, "a.jsonl", fixture("base.jsonl")));
+    w.engine.command({ type: "send", commandId: "go", sessionId: first.sessionId, text: "hi" });
+    const before = readFileSync(fileOf(w));
+    await expect(
+      imported(w, upload(w.uploads, "b.jsonl", fixture("extended.jsonl"))),
+    ).rejects.toThrow(/already uses this Claude conversation/);
+    expect(readFileSync(fileOf(w)).equals(before)).toBe(true);
+    w.turns[0]?.finish();
+  });
+
+  it("refuses when an idle session that already has turns binds the conversation", async () => {
+    const w = world();
+    const first = await imported(w, upload(w.uploads, "a.jsonl", fixture("base.jsonl")));
+    w.engine.command({ type: "send", commandId: "go", sessionId: first.sessionId, text: "hi" });
+    await vi.waitFor(() => expect(w.turns).toHaveLength(1));
+    w.turns[0].finish();
+    await vi.waitFor(() => expect(w.store.session(first.sessionId).status).toBe("idle"));
+    expect(w.store.session(first.sessionId).session.blocks.length).toBeGreaterThan(0);
+    await expect(
+      imported(w, upload(w.uploads, "b.jsonl", fixture("base.jsonl"))),
+    ).rejects.toThrow(/already uses this Claude conversation/);
+  });
+
+  it.each([
+    ["an id with a slash", { providerSessionId: "a/b" }],
+    ["a dotted id", { providerSessionId: "../x" }],
+    ["an empty id", { providerSessionId: "" }],
+    ["a bad upload id", { uploadId: "nope" }],
+    ["a cwd outside the project", { cwd: tmpdir() }],
+    ["a relative cwd", { cwd: "relative/dir" }],
+    ["a missing model", { model: "" }],
+    ["a bad mode", { runtimeMode: "chaos" }],
+    ["bad source paths", { fromCwds: "not-a-list" }],
+  ])("refuses %s", async (_label, bad) => {
+    const w = world();
+    const uploadId = upload(w.uploads, "t.jsonl", fixture("base.jsonl"));
+    await expect(imported(w, uploadId, bad)).rejects.toThrow();
+    expect(existsSync(join(w.claudeDir, "projects"))).toBe(false);
+    expect(w.store.summaries(w.projectId)).toHaveLength(0);
+  });
+
+  it("refuses an empty transcript, a non-UTF-8 one and an uncommitted upload", async () => {
+    const w = world();
+    await expect(imported(w, upload(w.uploads, "e.jsonl", fixture("empty.jsonl")))).rejects.toThrow(/no entries/);
+    await expect(imported(w, upload(w.uploads, "b.jsonl", Buffer.from([0x7b, 0xff, 0x7d])))).rejects.toThrow(/UTF-8/);
+    const bytes = Buffer.from("x");
+    const { uploadId } = w.uploads.begin({ name: "p.jsonl", size: 1, sha256: createHash("sha256").update(bytes).digest("hex") });
+    await expect(imported(w, uploadId)).rejects.toThrow(/not committed/);
+    expect(existsSync(join(w.claudeDir, "projects"))).toBe(false);
+  });
+
+  it("uses a registered worktree as the cwd", async () => {
+    const w = world();
+    const snap = snapshotOf(w.local);
+    const patchUploadId = upload(w.uploads, "changes.patch", snap.patch);
+    const tree = await w.moves.applySnapshot({ projectId: w.projectId, branch: "feat", ...snap, patchUploadId });
+    const result = await imported(w, upload(w.uploads, "t.jsonl", fixture("base.jsonl")), { cwd: tree.cwd });
+    expect(existsSync(fileOf(w, ID, tree.cwd))).toBe(true);
+    expect(w.store.session(result.sessionId).session.cwd).toBe(tree.cwd);
+  });
+});
+
+/** The local copy of a cloud fixture, as the Host would have stored it. */
+function rewrite(text: string, cwd: string): string {
+  return text.split("/workspaces/app").join(cwd);
+}
