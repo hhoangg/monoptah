@@ -1942,16 +1942,15 @@ mod tests {
             .update(cx, |explorer, window, cx| {
                 explorer.cwd = "/work/monocode".into();
                 explorer.set_read_only(true, cx);
-                let attempts: [&dyn Fn(&mut Explorer, &mut Window, &mut Context<Explorer>); 5] = [
-                    &|e, w, cx| e.start_create(false, None, w, cx),
-                    &|e, w, cx| e.start_rename("/work/monocode/a.rs".into(), w, cx),
-                    &|e, w, cx| e.delete("/work/monocode/a.rs".into(), w, cx),
-                    &|e, w, cx| e.paste("/work/monocode".into(), w, cx),
-                    &|e, w, cx| e.duplicate("/work/monocode/a.rs".into(), w, cx),
-                ];
-                for attempt in attempts {
+                for attempt in 0..5 {
                     explorer.op_error = None;
-                    attempt(explorer, window, cx);
+                    match attempt {
+                        0 => explorer.start_create(false, None, window, cx),
+                        1 => explorer.start_rename("/work/monocode/a.rs".into(), window, cx),
+                        2 => explorer.delete("/work/monocode/a.rs".into(), window, cx),
+                        3 => explorer.paste("/work/monocode".into(), window, cx),
+                        _ => explorer.duplicate("/work/monocode/a.rs".into(), window, cx),
+                    }
                     assert_eq!(explorer.op_error.as_deref(), Some(WORKSPACE_STARTING));
                 }
             })
