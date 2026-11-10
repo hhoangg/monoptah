@@ -457,6 +457,25 @@ pub(crate) fn mono_spoke(source: &[Row], from: usize, to: usize) -> bool {
     false
 }
 /// The first row of the prompt block that opens `turn`.
+/// Each user message's text (its rows joined), oldest first, with any
+/// legacy attachment links removed.
+pub(crate) fn sent_prompts(source: &[Row]) -> Vec<String> {
+    let mut prompts = Vec::new();
+    let mut at = 0;
+    while at < source.len() {
+        let mut end = at + 1;
+        while end < source.len() && !source[end].first {
+            end += 1;
+        }
+        if source[at].role == "user" {
+            let text: String = source[at..end].iter().map(|r| r.text.as_str()).collect();
+            let body = monocode_core::transcript::attachments::legacy_tail(&text).0;
+            prompts.push(body.to_owned());
+        }
+        at = end;
+    }
+    prompts
+}
 pub(crate) fn prompt_start(source: &[Row], turn: usize) -> usize {
     let mut at = turn.min(source.len());
     while at > 0 && source[at - 1].is_prompt() {
@@ -928,6 +947,10 @@ impl TranscriptView {
     /// and response actions are.
     pub(crate) fn history_rows(&self) -> &[Row] {
         &self.source
+    }
+    /// The user's sent prompts, oldest first, without attachment links.
+    pub(crate) fn sent_prompts(&self) -> Vec<String> {
+        sent_prompts(&self.source)
     }
     /// Whether `history_rows` holds every turn, not only the newest pages.
     pub(crate) fn history_complete(&self) -> bool {

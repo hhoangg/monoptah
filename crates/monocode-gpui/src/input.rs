@@ -14,11 +14,14 @@ use unicode_segmentation::UnicodeSegmentation;
 mod code;
 mod command;
 mod context_menu;
+mod edit_history;
 mod links;
 mod mention;
+mod prompt_history;
 mod spelling;
 pub(crate) use command::{Command, CommandRemoved};
 use mention::{DisplayLayout, MentionIcon};
+pub(crate) use prompt_history::recall_order;
 
 const MAX_BYTES: usize = 64 * 1024;
 const LINE_HEIGHT: f32 = 22.;
@@ -128,8 +131,8 @@ pub fn bind(cx: &mut App) {
         "ctrl"
     };
     cx.bind_keys([
-        KeyBinding::new(&format!("{modifier}-z"), Undo, Some("CodeEditor")),
-        KeyBinding::new(&format!("{modifier}-shift-z"), Redo, Some("CodeEditor")),
+        KeyBinding::new(&format!("{modifier}-z"), Undo, Some("Composer")),
+        KeyBinding::new(&format!("{modifier}-shift-z"), Redo, Some("Composer")),
         KeyBinding::new("ctrl-space", Complete, Some("CodeEditor")),
         KeyBinding::new("cmd-alt-[", FoldCode, Some("CodeEditor")),
         KeyBinding::new("cmd-alt-]", UnfoldCode, Some("CodeEditor")),
@@ -141,6 +144,9 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("tab", Indent, Some("CodeEditor")),
         KeyBinding::new("shift-tab", Outdent, Some("CodeEditor")),
     ]);
+    if !cfg!(target_os = "macos") {
+        cx.bind_keys([KeyBinding::new("ctrl-y", Redo, Some("Composer"))]);
+    }
     cx.bind_keys([
         KeyBinding::new(&format!("{modifier}-a"), SelectAll, Some("Composer")),
         KeyBinding::new(&format!("{modifier}-c"), Copy, Some("Composer")),
@@ -251,6 +257,13 @@ pub struct Input {
     selecting: bool,
     drag_position: Option<Point<Pixels>>,
     autoscroll: Option<gpui::Task<()>>,
+    /// Undo for plain fields; the code editor keeps its own in `code`.
+    edits: edit_history::EditHistory,
+    /// The next edit is its own undo step (paste, cut, completion).
+    edit_step: bool,
+    /// The next edit is Backspace/Delete removing one grapheme.
+    char_delete: bool,
+    prompt_history: Option<prompt_history::PromptHistory>,
 }
 impl EventEmitter<Submitted> for Input {}
 impl EventEmitter<AlternateSubmitted> for Input {}
@@ -319,6 +332,10 @@ impl Input {
             selecting: false,
             drag_position: None,
             autoscroll: None,
+            edits: Default::default(),
+            edit_step: false,
+            char_delete: false,
+            prompt_history: None,
         }
     }
     pub fn search(cx: &mut Context<Self>) -> Self {
@@ -574,6 +591,8 @@ impl Input {
             return None;
         }
         let text = self.content.to_string();
+        self.edits.clear();
+        self.reset_prompt_history();
         self.content = "".into();
         self.lines.clear();
         self.selection = 0..0;
@@ -597,6 +616,17 @@ impl Input {
         yields
     }
     pub(crate) fn set_text(&mut self, text: String, cx: &mut Context<Self>) {
+        if self.code.is_none() && self.marked.is_none() && *self.content != *text {
+            let before = self.snapshot();
+            self.edits.record(
+                before,
+                &(0..self.content.len()),
+                edit_history::EditKind::Other,
+                text.len(),
+                std::time::Instant::now(),
+            );
+        }
+        self.reset_prompt_history();
         self.manual_scroll = false;
         self.reveal_pending = self.reveal_in_parent;
         self.clear_folds();
@@ -611,6 +641,46 @@ impl Input {
         self.scroll_y = px(0.);
         cx.emit(Changed);
         cx.notify();
+    }
+    fn snapshot(&self) -> edit_history::Snapshot {
+        edit_history::Snapshot {
+            content: self.content.clone(),
+            selection: self.selection.clone(),
+            reversed: self.reversed,
+        }
+    }
+    /// Put back text and selection from undo, redo or prompt recall.
+    fn restore_snapshot(&mut self, snapshot: edit_history::Snapshot, cx: &mut Context<Self>) {
+        self.manual_scroll = false;
+        self.reveal_pending = self.reveal_in_parent;
+        let previous_command = self
+            .inline_commands
+            .then(|| Command::leading(&self.content))
+            .flatten();
+        self.content = snapshot.content;
+        self.lines.clear();
+        self.selection = self.clip_range(snapshot.selection);
+        self.reversed = snapshot.reversed && !self.selection.is_empty();
+        self.marked = None;
+        self.hovered_link = None;
+        self.command_removed(previous_command, cx);
+        cx.emit(Changed);
+        cx.notify();
+    }
+    /// Replace the whole text as one undo step of its own.
+    fn apply_programmatic(&mut self, snapshot: edit_history::Snapshot, cx: &mut Context<Self>) {
+        if self.content != snapshot.content {
+            let before = self.snapshot();
+            let all = 0..self.content.len();
+            self.edits.record(
+                before,
+                &all,
+                edit_history::EditKind::Other,
+                snapshot.selection.end,
+                std::time::Instant::now(),
+            );
+        }
+        self.restore_snapshot(snapshot, cx);
     }
     pub fn is_composing(&self) -> bool {
         self.marked.is_some()
@@ -659,7 +729,9 @@ impl Input {
         cx: &mut Context<Self>,
     ) {
         self.selection = self.clip_range(range);
+        self.edit_step = true;
         self.replace_text_in_range(None, text, window, cx);
+        self.edit_step = false;
     }
     /// Layouts and native text callbacks can still refer to the previous value.
     /// Every cursor and edit range must index the current UTF-8 buffer.
@@ -1010,12 +1082,12 @@ impl Input {
         self.select_to(self.next_word(), cx);
     }
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.completion_step(true, cx) {
+        if !self.completion_step(true, cx) && !self.step_prompt_history(true, cx) {
             self.move_to(self.vertical(false), cx);
         }
     }
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.completion_step(false, cx) {
+        if !self.completion_step(false, cx) && !self.step_prompt_history(false, cx) {
             self.move_to(self.vertical(true), cx);
         }
     }
@@ -1060,14 +1132,18 @@ impl Input {
         }
         if self.selection.is_empty() {
             self.select_to(self.prev(self.cursor()), cx);
+            self.char_delete = true;
         }
         self.replace_text_in_range(None, "", w, cx);
+        self.char_delete = false;
     }
     fn delete(&mut self, _: &Delete, w: &mut Window, cx: &mut Context<Self>) {
         if self.selection.is_empty() {
             self.select_to(self.next(self.cursor()), cx);
+            self.char_delete = true;
         }
         self.replace_text_in_range(None, "", w, cx);
+        self.char_delete = false;
     }
     fn newline(&mut self, _: &Newline, w: &mut Window, cx: &mut Context<Self>) {
         if !self.single_line {
@@ -1109,7 +1185,9 @@ impl Input {
     }
     fn paste(&mut self, _: &Paste, w: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+            self.edit_step = true;
             self.replace_text_in_range(None, &text.replace("\r\n", "\n"), w, cx);
+            self.edit_step = false;
         }
     }
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
@@ -1121,7 +1199,9 @@ impl Input {
     }
     fn cut(&mut self, _: &Cut, w: &mut Window, cx: &mut Context<Self>) {
         self.copy(&Copy, w, cx);
+        self.edit_step = true;
         self.replace_text_in_range(None, "", w, cx);
+        self.edit_step = false;
     }
     fn mouse_down(&mut self, e: &MouseDownEvent, w: &mut Window, cx: &mut Context<Self>) {
         if cfg!(target_os = "macos") && e.modifiers.control {
@@ -1403,6 +1483,23 @@ impl EntityInputHandler for Input {
             })
             .saturating_sub(self.content.len() - (r.end - r.start)),
         );
+        // Committing IME text was recorded when composition began.
+        if self.code.is_none() && self.marked.is_none() && (!r.is_empty() || !text.is_empty()) {
+            let kind = edit_history::EditHistory::kind(
+                &r,
+                text,
+                self.edit_step || corrected.is_some(),
+                self.char_delete,
+            );
+            let before = self.snapshot();
+            self.edits.record(
+                before,
+                &r,
+                kind,
+                r.start + text.len(),
+                std::time::Instant::now(),
+            );
+        }
         self.map_code_folds(&r, text.len());
         self.content = format!(
             "{}{}{}",
@@ -1456,6 +1553,17 @@ impl EntityInputHandler for Input {
             })
             .saturating_sub(self.content.len() - (r.end - r.start)),
         );
+        // A composition is one undo step, taken as it begins.
+        if self.code.is_none() && self.marked.is_none() {
+            let before = self.snapshot();
+            self.edits.record(
+                before,
+                &r,
+                edit_history::EditKind::Other,
+                r.start + text.len(),
+                std::time::Instant::now(),
+            );
+        }
         self.map_code_folds(&r, text.len());
         self.content = format!(
             "{}{}{}",
@@ -2160,8 +2268,8 @@ mod native_input_tests {
                 assert!(!input.selecting);
             })
             .unwrap();
-        // Cut is first, Copy second. Exercise the real menu's keyboard path.
-        cx.simulate_keystrokes(window.into(), "down enter");
+        // Undo, Redo, Cut, Copy, Paste. Exercise the real menu's keyboard path.
+        cx.simulate_keystrokes(window.into(), "down down down enter");
         cx.run_until_parked();
         window
             .update(cx, |input, w, cx| {
@@ -2185,7 +2293,7 @@ mod native_input_tests {
             })
             .unwrap();
         cx.refresh().unwrap();
-        cx.simulate_keystrokes(window.into(), "down down enter");
+        cx.simulate_keystrokes(window.into(), "down down down down enter");
         cx.run_until_parked();
         window
             .update(cx, |input, w, _| {
@@ -2461,6 +2569,149 @@ mod native_input_tests {
             cx.simulate_input(window.into(), "X");
             assert_eq!(input.read_with(cx, |i, _| i.content.to_string()), "café X");
         }
+    }
+
+    fn text(input: &Entity<Input>, cx: &TestAppContext) -> String {
+        input.read_with(cx, |i, _| i.content.to_string())
+    }
+    fn caret(input: &Entity<Input>, cx: &TestAppContext) -> Range<usize> {
+        input.read_with(cx, |i, _| i.selection.clone())
+    }
+    fn undo_keys() -> (&'static str, &'static str) {
+        if cfg!(target_os = "macos") {
+            ("cmd-z", "cmd-shift-z")
+        } else {
+            ("ctrl-z", "ctrl-y")
+        }
+    }
+
+    #[gpui::test]
+    fn undo_after_select_all_and_delete_restores_text_and_selection(cx: &mut TestAppContext) {
+        let (undo, redo) = undo_keys();
+        let select_all = if cfg!(target_os = "macos") {
+            "cmd-a"
+        } else {
+            "ctrl-a"
+        };
+        let window = field(cx, false);
+        let input = window.root(cx).unwrap();
+        cx.simulate_keystrokes(window.into(), "h a l f space t y p e d");
+        assert_eq!(text(&input, cx), "half typed");
+        cx.simulate_keystrokes(window.into(), &format!("{select_all} backspace"));
+        assert_eq!(text(&input, cx), "");
+        cx.simulate_keystrokes(window.into(), undo);
+        assert_eq!(text(&input, cx), "half typed");
+        assert_eq!(
+            caret(&input, cx),
+            0..10,
+            "the selection comes back with the text"
+        );
+        cx.simulate_keystrokes(window.into(), redo);
+        assert_eq!(text(&input, cx), "");
+        if !cfg!(target_os = "macos") {
+            cx.simulate_keystrokes(window.into(), "ctrl-z ctrl-shift-z");
+            assert_eq!(text(&input, cx), "", "Ctrl+Shift+Z also redoes");
+        }
+    }
+
+    #[gpui::test]
+    fn typing_coalesces_into_word_steps_and_new_edits_clear_redo(cx: &mut TestAppContext) {
+        let (undo, redo) = undo_keys();
+        let window = field(cx, false);
+        let input = window.root(cx).unwrap();
+        cx.simulate_keystrokes(window.into(), "h i space t h e r e");
+        cx.simulate_keystrokes(window.into(), undo);
+        assert_eq!(text(&input, cx), "hi ", "one step undoes the last word");
+        assert_eq!(caret(&input, cx), 3..3);
+        cx.simulate_keystrokes(window.into(), undo);
+        assert_eq!(text(&input, cx), "");
+        cx.simulate_keystrokes(window.into(), undo);
+        assert_eq!(text(&input, cx), "", "nothing older to undo");
+        cx.simulate_keystrokes(window.into(), redo);
+        assert_eq!(text(&input, cx), "hi ");
+        cx.simulate_keystrokes(window.into(), "x");
+        assert_eq!(text(&input, cx), "hi x");
+        cx.simulate_keystrokes(window.into(), redo);
+        assert_eq!(text(&input, cx), "hi x", "a new edit cleared redo");
+        // A paste is a step of its own even right after typing.
+        cx.write_to_clipboard(ClipboardItem::new_string("PASTE".into()));
+        let paste = if cfg!(target_os = "macos") {
+            "cmd-v"
+        } else {
+            "ctrl-v"
+        };
+        cx.simulate_keystrokes(window.into(), paste);
+        assert_eq!(text(&input, cx), "hi xPASTE");
+        cx.simulate_keystrokes(window.into(), undo);
+        assert_eq!(text(&input, cx), "hi x");
+    }
+
+    fn with_history(cx: &mut TestAppContext, prompts: &[&str]) -> WindowHandle<Input> {
+        let window = field(cx, false);
+        let prompts: Vec<String> = prompts.iter().map(|p| p.to_string()).collect();
+        window
+            .update(cx, |input, _, _| {
+                input.set_prompt_history(Box::new(move |_| recall_order(prompts.clone())))
+            })
+            .unwrap();
+        window
+    }
+
+    #[gpui::test]
+    fn up_and_down_walk_prompt_history_and_restore_the_draft(cx: &mut TestAppContext) {
+        let window = with_history(cx, &["first", "second", "second", "third"]);
+        let input = window.root(cx).unwrap();
+        cx.simulate_keystrokes(window.into(), "d r a f t left");
+        cx.simulate_keystrokes(window.into(), "up");
+        assert_eq!(text(&input, cx), "third");
+        cx.simulate_keystrokes(window.into(), "up");
+        assert_eq!(text(&input, cx), "second");
+        cx.simulate_keystrokes(window.into(), "up");
+        assert_eq!(
+            text(&input, cx),
+            "first",
+            "consecutive duplicates are one entry"
+        );
+        cx.simulate_keystrokes(window.into(), "up");
+        assert_eq!(text(&input, cx), "first", "the oldest prompt stays");
+        // Editing a recalled entry leaves the history as it was.
+        cx.simulate_keystrokes(window.into(), "!");
+        assert_eq!(text(&input, cx), "first!");
+        cx.simulate_keystrokes(window.into(), "down");
+        assert_eq!(text(&input, cx), "second");
+        cx.simulate_keystrokes(window.into(), "down down");
+        assert_eq!(text(&input, cx), "draft", "the unsent draft comes back");
+        assert_eq!(caret(&input, cx), 4..4, "with its caret");
+        assert!(!input.read_with(cx, |i, _| i.browsing_prompt_history()));
+        cx.simulate_keystrokes(window.into(), "down");
+        assert_eq!(text(&input, cx), "draft");
+        cx.simulate_keystrokes(window.into(), "up up");
+        assert_eq!(text(&input, cx), "second", "history was not edited");
+        // A recall is its own undo step.
+        let (undo, _) = undo_keys();
+        cx.simulate_keystrokes(window.into(), undo);
+        assert_eq!(text(&input, cx), "third");
+    }
+
+    #[gpui::test]
+    fn arrows_move_the_caret_off_the_edge_lines_of_a_multiline_prompt(cx: &mut TestAppContext) {
+        let window = with_history(cx, &["sent"]);
+        let input = window.root(cx).unwrap();
+        replace(window, "one\ntwo\nthree", cx);
+        cx.simulate_keystrokes(window.into(), "up");
+        assert_eq!(text(&input, cx), "one\ntwo\nthree");
+        assert!(caret(&input, cx).start < 8, "Up moved to the second line");
+        cx.simulate_keystrokes(window.into(), "up");
+        assert_eq!(text(&input, cx), "one\ntwo\nthree");
+        assert!(caret(&input, cx).start <= 3, "and then to the first");
+        cx.simulate_keystrokes(window.into(), "up");
+        assert_eq!(text(&input, cx), "sent", "Up on the first line recalls");
+        cx.simulate_keystrokes(window.into(), "down");
+        assert_eq!(text(&input, cx), "one\ntwo\nthree");
+        assert!(
+            caret(&input, cx).end <= 3,
+            "the draft keeps the caret it had"
+        );
     }
 
     #[gpui::test]
