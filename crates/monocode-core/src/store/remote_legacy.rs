@@ -82,6 +82,7 @@ impl Store {
             needs_input: false,
             configuration: None,
             linked_to: None,
+            flags_at: 0,
         };
         if let Some(cached) = cached {
             apply_cached(&mut remote, &cached);

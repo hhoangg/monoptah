@@ -126,9 +126,25 @@ pub struct RemoteSession {
     /// session. Absent for sessions born in the cloud.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linked_to: Option<i64>,
+    /// When `running` and `needs_input` were last read from the Host (ms). Only a successful
+    /// poll refreshes them, so an old value says nothing about the Host now.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub flags_at: u64,
 }
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+/// How long `running` stays believable after the last successful poll.
+pub const FLAGS_FRESH_MS: u64 = 120_000;
 impl RemoteSession {
     /// True when this record backs a local session instead of being a session of its own.
+    /// Whether the Host was running a turn at its last poll AND that poll is recent. A stale
+    /// flag must not block anything: it is exactly what an unreachable Host leaves behind.
+    pub fn running_now(&self) -> bool {
+        self.running && crate::time::now_ms().saturating_sub(self.flags_at) <= FLAGS_FRESH_MS
+    }
     pub fn is_linked(&self) -> bool {
         self.linked_to.is_some()
     }
@@ -531,6 +547,20 @@ impl Store {
                 return Err(CONVERTED.into());
             }
         }
+        // A worker journals a record it loaded long ago. If the workspace was deleted meanwhile
+        // (`forget_cloud` marked the located session), the record must not come back: unlinked,
+        // it would be a live cloud session next to the local one.
+        if let Some(host) = &session.session_id {
+            for (local, location) in self.cloud_located()? {
+                if location.environment_id == session.project.environment_id
+                    && location.host_session_id == *host
+                    && self.cloud_sync_error(local)?.as_deref()
+                        == Some(super::location::WORKSPACE_LOST)
+                {
+                    return Err(super::location::WORKSPACE_LOST.into());
+                }
+            }
+        }
         self.claim_legacy_remote_commands(session)?;
         let mut sessions = self.stored_remote_sessions()?;
         // The link is owned by `link_remote_session`. A worker holds a record loaded long ago
@@ -646,6 +676,7 @@ impl Store {
             running: false,
             needs_input: false,
             linked_to: None,
+            flags_at: 0,
         })?;
         Ok(summary)
     }
@@ -781,6 +812,7 @@ impl Store {
                     })
                 }),
             linked_to: prior.as_ref().and_then(|remote| remote.linked_to),
+            flags_at: crate::time::now_ms(),
         };
         sessions.insert(id, remote);
         self.save_setting(

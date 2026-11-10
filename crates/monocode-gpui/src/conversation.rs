@@ -1228,6 +1228,11 @@ impl Conversation {
                 .is_some_and(|center| !center.read(cx).book.exists(kind, &self.settings.account.id))
     }
     fn launch_prompt(&mut self, prompt: String, cx: &mut Context<Self>) {
+        if self.reset_in_progress() {
+            self.status = "Resetting to local. Send again in a moment.".into();
+            cx.notify();
+            return;
+        }
         #[cfg(test)]
         self.launched.push(prompt.clone());
         if self.stopping && self.is_remote() {

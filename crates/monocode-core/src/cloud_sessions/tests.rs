@@ -1338,6 +1338,7 @@ fn a_cloud_located_local_session_is_one_cloud_row_and_its_host_record_is_not_lis
             sync_error: Some(crate::store::MISSING_HOST.into()),
             unreadable: false,
             host_active: false,
+            unsynced: true,
         }]
     );
     // Back to Local: both Host records are cloud sessions of their own again.

@@ -69,6 +69,11 @@ impl Store {
         if matches!(self.cloud_location(session), Ok(SessionLocation::Local)) {
             return Ok(());
         }
+        // The deleted-workspace marker is the most specific one: a later, vaguer failure (for
+        // example a missing Host record) must not replace it.
+        if self.cloud_sync_error(session)?.as_deref() == Some(super::location::WORKSPACE_LOST) {
+            return Ok(());
+        }
         self.save_setting(&Self::sync_error_key(session), message)
     }
     /// Deletes the rows of a local session from index `from` on.
@@ -134,6 +139,12 @@ impl Store {
         };
         if location.environment_id != environment || location.host_session_id != host_session {
             return Err(NOT_CLOUD.into());
+        }
+        // The workspace is gone: there is nothing to append, and the marker and the cursor
+        // must stay as `forget_cloud` left them.
+        if self.cloud_sync_error(local_session)?.as_deref() == Some(super::location::WORKSPACE_LOST)
+        {
+            return Err(super::location::WORKSPACE_LOST.into());
         }
         let base = location.moved_at_row;
         let local = self.native_rows(local_session)?;

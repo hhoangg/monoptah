@@ -343,6 +343,9 @@ pub struct LocatedSession {
     /// The Host side is running a turn (or waits for input): resetting now would leave two
     /// writers.
     pub host_active: bool,
+    /// The cloud copy may hold turns that were not copied here (see
+    /// `Store::cloud_may_hold_unsynced`): Reset asks with the stronger text.
+    pub unsynced: bool,
 }
 
 /// Displayable codespace lifecycle state.
@@ -998,12 +1001,16 @@ impl CloudSessions {
                 }
                 Some(_) => None,
             };
+            let sync_error = stored.or(derived);
             found.push(LocatedSession {
                 id: summary.id,
                 moved_at_row: location.as_ref().map_or(0, |l| l.moved_at_row),
-                sync_error: stored.or(derived),
                 unreadable: location.is_none(),
-                host_active: backing.as_ref().is_some_and(|r| r.running || r.needs_input),
+                // Fresh `running` only, and never next to a problem: see `leave_cloud`.
+                host_active: backing.as_ref().is_some_and(|r| r.running_now())
+                    && sync_error.is_none(),
+                unsynced: store.cloud_may_hold_unsynced(summary.id),
+                sync_error,
             });
         }
         Ok(found)

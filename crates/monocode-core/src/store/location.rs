@@ -180,16 +180,51 @@ impl Store {
             Err(_) => true,
         }
     }
+    /// Whether the cloud copy may hold turns that were not copied here: the Host's last known
+    /// revision differs from the synced cursor, or either is unknown (an unreachable Host, a
+    /// recorded problem, a missing record). The Reset confirmation is stronger then.
+    pub fn cloud_may_hold_unsynced(&self, session: i64) -> bool {
+        if self.cloud_sync_error(session).ok().flatten().is_some() {
+            return true;
+        }
+        let Ok((_, record)) = self.cloud_host_record(session) else {
+            return true;
+        };
+        let known = record
+            .configuration
+            .as_ref()
+            .and_then(|c| c["revision"].as_u64());
+        let synced = self
+            .cloud_synced_revision(
+                &record.project.environment_id,
+                record.session_id.as_deref().unwrap_or(""),
+            )
+            .ok()
+            .flatten();
+        match (known, synced) {
+            (Some(a), Some(b)) => a != b,
+            _ => true,
+        }
+    }
     /// The user's way back to Local ("Reset to local"), after the confirmation. Refuses while a
     /// Host-side turn runs (it would be a second writer). Unlike the bare reset it also
     /// retires the Host record: it is unlinked, remembered as converted so a poll never
     /// imports it again, and dropped locally, so nothing can send to it while the local
     /// runtime is allowed on the same Claude id. The copy in the workspace itself stays.
     /// It does not reconcile the transcript (F4-5).
+    ///
+    /// Choice: the local Host record is tombstoned and dropped, not kept as a read-only
+    /// converted view. The converted mechanism only marks a Host session as already saved as a
+    /// local copy; showing one would need the Host to be reachable and a new view, so it is not
+    /// cheap. The data stays in the workspace, and the confirmation says so (stronger when
+    /// `cloud_may_hold_unsynced`).
     pub fn leave_cloud(&self, session: i64) -> Result<(), String> {
         let backing = self.linked_remote_session(session)?;
+        // Only a fresh `running` blocks. A Host waiting for input is not writing, and a flag
+        // that is stale or sits next to a recorded problem (unreachable Host, lost workspace)
+        // would block Reset exactly when it is the only way out.
         if let Some((_, record)) = &backing {
-            if record.running || record.needs_input {
+            if record.running_now() && self.cloud_sync_error(session)?.is_none() {
                 return Err(HOST_TURN_RUNNING.to_string());
             }
         }
@@ -533,6 +568,7 @@ pub(crate) mod tests {
         // The linked record needs a Host session id to be tombstoned.
         let mut record = store.remote_session(linked).unwrap().unwrap();
         record.running = true;
+        record.flags_at = crate::time::now_ms();
         store.save_remote_session(&record).unwrap();
         assert_eq!(store.leave_cloud(local).unwrap_err(), HOST_TURN_RUNNING);
         assert!(
@@ -581,6 +617,106 @@ pub(crate) mod tests {
             Some(UNREADABLE_NOTICE)
         );
         store.delete(local).unwrap();
+        assert!(store.remote_session(linked).unwrap().is_none());
+        assert!(!listed(&store).contains(&linked));
+    }
+
+    #[test]
+    fn only_a_fresh_running_flag_without_a_problem_blocks_reset() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let (local, linked) = moved_session(&mut store);
+        let mut record = store.remote_session(linked).unwrap().unwrap();
+        // A Host waiting for input is not a second writer.
+        record.needs_input = true;
+        record.flags_at = crate::time::now_ms();
+        store.save_remote_session(&record).unwrap();
+        assert!(!store.remote_session(linked).unwrap().unwrap().running_now());
+        // Stale running (the Host went unreachable mid-turn) does not block.
+        record.needs_input = false;
+        record.running = true;
+        record.flags_at = crate::time::now_ms() - 10 * 60_000;
+        store.save_remote_session(&record).unwrap();
+        assert!(!store.remote_session(linked).unwrap().unwrap().running_now());
+        // Fresh running blocks...
+        record.flags_at = crate::time::now_ms();
+        store.save_remote_session(&record).unwrap();
+        assert_eq!(store.leave_cloud(local).unwrap_err(), HOST_TURN_RUNNING);
+        // ...unless a problem is recorded: the flag cannot be trusted then.
+        store
+            .record_cloud_sync_error(local, "Host unreachable")
+            .unwrap();
+        store.leave_cloud(local).unwrap();
+        assert_eq!(store.cloud_location(local).unwrap(), SessionLocation::Local);
+    }
+
+    #[test]
+    fn the_warning_variant_follows_what_may_be_unsynced() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let (local, linked) = moved_session(&mut store);
+        // The Host is at revision 1 (its last snapshot); nothing synced yet: unknown, so strong.
+        assert!(store.cloud_may_hold_unsynced(local));
+        store.save_setting("cloud-synced:env:host-1", "1").unwrap();
+        let mut record = store.remote_session(linked).unwrap().unwrap();
+        record.configuration = Some(serde_json::json!({"revision": 1}));
+        store.save_remote_session(&record).unwrap();
+        assert!(!store.cloud_may_hold_unsynced(local), "in step: plain text");
+        store.save_setting("cloud-synced:env:host-1", "0").unwrap();
+        assert!(
+            store.cloud_may_hold_unsynced(local),
+            "cursor behind the Host"
+        );
+        store.save_setting("cloud-synced:env:host-1", "1").unwrap();
+        store
+            .record_cloud_sync_error(local, "Host unreachable")
+            .unwrap();
+        assert!(
+            store.cloud_may_hold_unsynced(local),
+            "unreachable: cannot know"
+        );
+    }
+
+    #[test]
+    fn a_deleted_workspace_marker_survives_and_blocks_appends_and_journals() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let (local, linked) = moved_session(&mut store);
+        let stale = store.remote_session(linked).unwrap().unwrap();
+        store.save_setting("cloud-synced:env:host-1", "4").unwrap();
+        store.forget_cloud(&cloud_location().cloud).unwrap();
+        // The fixture's Host record is not bound to the workspace, so drop it as the delete would.
+        store.forget_cloud_session(linked).unwrap();
+        assert_eq!(
+            store.cloud_sync_error(local).unwrap().as_deref(),
+            Some(WORKSPACE_LOST)
+        );
+        // A vaguer later failure does not replace it.
+        store
+            .record_cloud_sync_error(local, crate::store::MISSING_HOST)
+            .unwrap();
+        assert_eq!(
+            store.cloud_sync_error(local).unwrap().as_deref(),
+            Some(WORKSPACE_LOST)
+        );
+        // An append writes nothing and leaves the marker and the cursor alone.
+        let snapshot = serde_json::json!({"revision": 9, "status": "idle",
+            "session": {"id": "host-1", "blocks": [{"id": "b0", "role": "user", "text": "x"}]}});
+        assert_eq!(
+            store.append_remote_rows(local, &snapshot).unwrap_err(),
+            WORKSPACE_LOST
+        );
+        assert_eq!(
+            store.cloud_sync_error(local).unwrap().as_deref(),
+            Some(WORKSPACE_LOST)
+        );
+        assert_eq!(
+            store.cloud_synced_revision("env", "host-1").unwrap(),
+            Some(4)
+        );
+        assert_eq!(store.load(local).unwrap().rows.len(), 10);
+        // A worker that journals its old record after the delete cannot bring the record back.
+        assert_eq!(
+            store.save_remote_session(&stale).unwrap_err(),
+            WORKSPACE_LOST
+        );
         assert!(store.remote_session(linked).unwrap().is_none());
         assert!(!listed(&store).contains(&linked));
     }

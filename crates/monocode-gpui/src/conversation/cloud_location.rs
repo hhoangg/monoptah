@@ -12,6 +12,10 @@ use monocode_core::cloud_sessions::LocatedSession;
 /// The confirmation text of "Reset to local". It must say what the reset does not do.
 pub(crate) const RESET_CONFIRM: &str = "This stops syncing with the cloud workspace and runs the conversation on this computer again. The messages are not reconciled: anything written in the cloud after the last sync is not copied here, and the local provider session does not know about those cloud turns. The copy in the cloud workspace stays there, but it is no longer a session here, and cloud turns that were not synced are not copied.";
 
+/// Added to the confirmation when the cloud copy may hold turns that were not copied here, or
+/// that cannot be known (the Host is unreachable).
+pub(crate) const RESET_CONFIRM_UNSYNCED: &str = "The cloud copy may contain turns that were not copied here. After you continue locally they cannot be opened in Monoptah. They remain in the cloud workspace.";
+
 /// The status line after a confirmed reset.
 pub(crate) const RESET_DONE: &str =
     "Back on this computer. Messages written in the cloud after the last sync are not included.";
@@ -27,6 +31,15 @@ pub(super) struct State {
     /// it is confirmed.
     pub(super) confirming: bool,
     resetting: bool,
+}
+
+/// The confirmation text for a session: stronger when the cloud copy may hold unsynced turns.
+pub(crate) fn confirm_text(located: &LocatedSession) -> String {
+    if located.unsynced {
+        format!("{RESET_CONFIRM_UNSYNCED} {RESET_CONFIRM}")
+    } else {
+        RESET_CONFIRM.to_owned()
+    }
 }
 
 impl Conversation {
@@ -145,6 +158,10 @@ impl Conversation {
         cx.notify();
         true
     }
+    /// A reset is running: nothing may be sent meanwhile (the location is about to change).
+    pub(super) fn reset_in_progress(&self) -> bool {
+        self.cloud_location.resetting
+    }
     /// Whether the sync notice (or its confirmation) is showing.
     pub(crate) fn cloud_sync_notice_visible(&self) -> bool {
         self.cloud_location
@@ -165,7 +182,7 @@ impl Conversation {
             "Cloud sync problem"
         };
         let message = if confirming {
-            RESET_CONFIRM.to_owned()
+            confirm_text(located)
         } else {
             located.sync_error.clone().unwrap_or_default()
         };
@@ -255,6 +272,7 @@ mod tests {
             sync_error: sync_error.map(str::to_owned),
             unreadable: false,
             host_active: false,
+            unsynced: false,
         }
     }
     #[test]
@@ -395,5 +413,34 @@ mod tests {
     fn the_confirmation_says_what_happens_to_the_cloud_copy() {
         assert!(RESET_CONFIRM.contains("no longer a session here"));
         assert!(RESET_CONFIRM.contains("not copied"));
+    }
+    #[test]
+    fn the_confirmation_is_stronger_when_the_cloud_copy_may_be_ahead() {
+        let plain = confirm_text(&located(None));
+        assert_eq!(plain, RESET_CONFIRM);
+        let mut ahead = located(None);
+        ahead.unsynced = true;
+        let strong = confirm_text(&ahead);
+        assert!(strong.starts_with(RESET_CONFIRM_UNSYNCED));
+        assert!(strong.contains("cannot be opened in Monoptah"));
+        assert!(strong.ends_with(RESET_CONFIRM));
+        assert!(!strong.contains('\u{2014}') && !strong.contains('\u{2013}'));
+    }
+    #[gpui::test]
+    fn nothing_is_sent_while_a_reset_runs(cx: &mut TestAppContext) {
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let session = store.create("claude", "/Users/me/repo").unwrap();
+        let chat = cx.new(|cx| Conversation::new(session, Arc::new(Mutex::new(store)), cx));
+        chat.update(cx, |chat, cx| {
+            chat.set_cloud_location(Some(located(Some("Host unreachable"))), cx);
+            chat.cloud_location.resetting = true;
+            chat.launch_prompt("hello".into(), cx);
+            assert!(chat.launched.is_empty(), "the send never starts");
+            assert!(
+                chat.status.contains("Resetting to local"),
+                "{}",
+                chat.status
+            );
+        });
     }
 }

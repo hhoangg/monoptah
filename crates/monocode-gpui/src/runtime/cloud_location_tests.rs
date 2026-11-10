@@ -122,3 +122,23 @@ fn an_unreadable_location_at_turn_start_leaves_a_durable_marker() {
         Some(monocode_core::store::UNREADABLE_NOTICE)
     );
 }
+
+#[test]
+fn a_turn_start_does_not_overwrite_the_deleted_workspace_marker() {
+    let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
+    let summary = moved_session(&mut store);
+    store
+        .record_cloud_sync_error(summary.id, monocode_core::store::WORKSPACE_LOST)
+        .unwrap();
+    let store: Database = Arc::new(Mutex::new(store));
+    let update = run_cloud_turn(&store, &summary);
+    assert!(update.finished);
+    assert_eq!(
+        locked(&store)
+            .unwrap()
+            .cloud_sync_error(summary.id)
+            .unwrap()
+            .as_deref(),
+        Some(monocode_core::store::WORKSPACE_LOST)
+    );
+}
