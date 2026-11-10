@@ -118,8 +118,17 @@ pub struct RemoteSession {
     pub running: bool,
     #[serde(default)]
     pub needs_input: bool,
+    /// The LOCAL session this Host session backs while that session's location is Cloud
+    /// (design 4.2.1). Such a record is plumbing: the sidebar must not list it as its own
+    /// session. Absent for sessions born in the cloud.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_to: Option<i64>,
 }
 impl RemoteSession {
+    /// True when this record backs a local session instead of being a session of its own.
+    pub fn is_linked(&self) -> bool {
+        self.linked_to.is_some()
+    }
     pub fn machine(&self, client: &Connections) -> Result<Machine, String> {
         client
             .list()?
@@ -324,6 +333,29 @@ impl Store {
             SESSIONS,
             &serde_json::to_string(&sessions).map_err(|e| e.to_string())?,
         )
+    }
+    /// Links the Host session record `remote` to the local session `local` (or unlinks it with
+    /// `None`).
+    pub fn link_remote_session(&self, remote: i64, local: Option<i64>) -> Result<(), String> {
+        let mut sessions = self.stored_remote_sessions()?;
+        sessions
+            .get_mut(&remote)
+            .ok_or("Remote session no longer exists")?
+            .linked_to = local;
+        self.save_setting(
+            SESSIONS,
+            &serde_json::to_string(&sessions).map_err(|e| e.to_string())?,
+        )
+    }
+    /// The Host session record linked to the local session `local`, with its id.
+    pub fn linked_remote_session(
+        &self,
+        local: i64,
+    ) -> Result<Option<(i64, RemoteSession)>, String> {
+        Ok(self
+            .remote_sessions()?
+            .into_iter()
+            .find(|(_, session)| session.linked_to == Some(local)))
     }
     /// Ids of every cloud session bound to `cloud`, archived or not.
     pub fn cloud_session_ids(&self, cloud: &CloudRef) -> Result<Vec<i64>, String> {
@@ -569,6 +601,7 @@ impl Store {
             configuration: None,
             running: false,
             needs_input: false,
+            linked_to: None,
         })?;
         Ok(summary)
     }
@@ -703,6 +736,7 @@ impl Store {
                             && b["approval"].get("decided").is_none_or(Value::is_null)
                     })
                 }),
+            linked_to: prior.as_ref().and_then(|remote| remote.linked_to),
         };
         sessions.insert(id, remote);
         self.save_setting(
