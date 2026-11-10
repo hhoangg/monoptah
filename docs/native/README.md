@@ -51,7 +51,7 @@ four hours. Recent suggestions and the last check time are saved in the Mono's
 `heartbeat.json` file to avoid repeating
 the same follow-ups after a restart. Scheduled habits take priority over
 heartbeats. Live scheduler and provider behavior still need broader testing;
-see [verification](verification.md).
+see [verification](verification.md). Linux cloud sessions: [cloud development environment](cloud-dev-environment.md).
 
 ## Develop
 
