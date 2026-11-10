@@ -37,17 +37,56 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// What a save checks against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
-    /// The file must still be what the document loaded.
+    /// The file must still be what `document.disk` says it was.
     Guarded,
-    /// The user chose to replace what is there now: take its hash first.
-    Overwrite,
+    /// The file did not exist when the user chose to keep their text: create it, with no
+    /// hash. (Keep mine over an existing version always uses [`Mode::Guarded`] with the
+    /// bytes the user was shown.)
+    Create,
 }
 
-fn missing(error: &str) -> bool {
+/// True when a read failed because the file does not exist.
+pub fn is_missing(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     ["enoent", "no such file", "not found"]
         .iter()
         .any(|needle| error.contains(needle))
+}
+
+/// The oldest Host that checks `expectedSha256`. An older Host ignores the argument and
+/// would write unconditionally, so a stale capability list must not be trusted below it.
+const MIN_HASH_HOST: (u64, u64, u64) = (1, 1, 0);
+
+fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
+    let core = text.split(['+', '-']).next()?;
+    let mut parts = core.split('.').map(|part| part.parse::<u64>().ok());
+    Some((parts.next()??, parts.next()??, parts.next()??))
+}
+
+/// The Host verifiably checks the hash: it says so and it is a fork Host new enough.
+fn checks_hash(info: &crate::remote::host_info::HostInfo) -> bool {
+    info.supports(HASH_CAPABILITY)
+        && info.is_monoptah()
+        && info
+            .version
+            .as_deref()
+            .and_then(parse_version)
+            .is_some_and(|version| version >= MIN_HASH_HOST)
+}
+
+/// The Host does not know the command or argument (it was replaced by an older one).
+fn is_unsupported(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "unsupported host method",
+        "unsupported workspace command",
+        "unsupported remote operation",
+        "unknown argument",
+        "unknown parameter",
+        "unrecognized",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
 }
 
 fn read_current(transport: &dyn Transport, cache: &Cache, path: &Path) -> Result<Fetched, String> {
@@ -81,32 +120,71 @@ pub(crate) fn save_remote(
     let remote = crate::remote::parse_remote_path(&path.to_string_lossy())
         .ok_or("Invalid remote file path")?;
     let machine = transport.machine_for_environment(&remote.environment_id)?;
-    let hashed = transport.host_info(&machine)?.supports(HASH_CAPABILITY);
-    let mut args = json!({"path": remote.host_path, "content": content});
-    match (hashed, mode) {
-        (true, Mode::Guarded) => args["expectedSha256"] = json!(document.disk_sha256()),
-        (true, Mode::Overwrite) => match read_current(transport, cache, path) {
-            Ok(Fetched::Bytes(current)) => args["expectedSha256"] = json!(sha256_hex(&current)),
-            Ok(Fetched::Refused(reason)) => return Err(reason),
-            // The file was deleted meanwhile: Keep mine creates it, without a hash.
-            Err(error) if missing(&error) => {}
-            Err(error) => return Err(error),
-        },
-        (false, Mode::Guarded) => {
-            if read_current(transport, cache, path)? != Fetched::Bytes(document.disk.clone()) {
-                return Err(STALE_COPY.into());
-            }
-        }
-        (false, Mode::Overwrite) => {}
-    }
-    transport
-        .request(
+    let write = |args: serde_json::Value| {
+        transport.request(
             &machine,
             "workspace.run",
             json!({"command": "write_text_file", "args": args}),
         )
-        .map_err(super::remote::workspace_error)?;
+    };
+    let mut args = json!({"path": remote.host_path, "content": content});
+    if mode == Mode::Guarded && checks_hash(&transport.host_info(&machine)?) {
+        args["expectedSha256"] = json!(document.disk_sha256());
+        match write(args.clone()) {
+            Ok(_) => return Ok(bytes),
+            Err(error) if is_unsupported(&error) => {
+                // The Host is not the one described: forget it and compare here instead.
+                transport.forget_host_info(&machine);
+            }
+            Err(error) => return Err(super::remote::workspace_error(error)),
+        }
+        args.as_object_mut()
+            .map(|args| args.remove("expectedSha256"));
+    }
+    if mode == Mode::Guarded
+        && read_current(transport, cache, path)? != Fetched::Bytes(document.disk.clone())
+    {
+        return Err(STALE_COPY.into());
+    }
+    write(args).map_err(super::remote::workspace_error)?;
     Ok(bytes)
+}
+
+/// Keep mine: saves over the version the user was shown (`shown` bytes, `None` when the
+/// file did not exist), never over a newer one.
+pub(crate) fn overwrite_remote(
+    transport: &dyn Transport,
+    cache: &Cache,
+    path: &Path,
+    document: &TextDocument,
+    text: &str,
+    shown: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
+    match shown {
+        Some(shown) => {
+            let mut baseline = document.clone();
+            baseline.disk = shown.to_vec();
+            save_remote(transport, cache, path, &baseline, text, Mode::Guarded)
+        }
+        None => save_remote(transport, cache, path, document, text, Mode::Create),
+    }
+}
+
+pub(crate) fn overwrite_default(
+    path: &Path,
+    document: &TextDocument,
+    text: &str,
+    shown: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
+    let connections = crate::remote::default_connections()?;
+    overwrite_remote(
+        &*connections,
+        &super::remote_read::CACHE,
+        path,
+        document,
+        text,
+        shown,
+    )
 }
 
 /// [`save_remote`] over the app's shared connections.
@@ -145,6 +223,11 @@ mod tests {
         reads: RefCell<usize>,
         /// The next write is applied, then its reply is lost (a timeout).
         lose_next_reply: RefCell<bool>,
+        /// Version the Host reports; `None` reports no `host` field.
+        version: Option<&'static str>,
+        /// A write that carries `expectedSha256` fails with this error.
+        reject_hash: Option<&'static str>,
+        forgotten: RefCell<usize>,
         info: crate::remote::host_info::HostInfoCache,
     }
     impl Fake {
@@ -155,6 +238,9 @@ mod tests {
                 writes: RefCell::new(Vec::new()),
                 reads: RefCell::new(0),
                 lose_next_reply: RefCell::new(false),
+                version: Some("1.1.0"),
+                reject_hash: None,
+                forgotten: RefCell::new(0),
                 info: Default::default(),
             }
         }
@@ -164,16 +250,26 @@ mod tests {
             let described = self.request(machine, "environment.describe", json!({}))?;
             Ok(self.info.record(machine, &described))
         }
+        fn forget_host_info(&self, machine: &str) {
+            *self.forgotten.borrow_mut() += 1;
+            self.info.drop_machine(machine);
+        }
         fn machine_for_environment(&self, _: &str) -> Result<String, String> {
             Ok("machine".into())
         }
         fn request(&self, _: &str, method: &str, params: Value) -> Result<Value, String> {
             match method {
-                "environment.describe" => Ok(json!({"capabilities": if self.hash_capable {
-                    json!(["files.readBytes", HASH_CAPABILITY])
-                } else {
-                    json!(["files.readBytes"])
-                }})),
+                "environment.describe" => {
+                    let mut described = json!({"capabilities": if self.hash_capable {
+                        json!(["files.readBytes", HASH_CAPABILITY])
+                    } else {
+                        json!(["files.readBytes"])
+                    }});
+                    if let Some(version) = self.version {
+                        described["host"] = json!({"flavor": "monoptah", "version": version});
+                    }
+                    Ok(described)
+                }
                 "projects.list" => Ok(json!([{"id": "p1", "cwd": "/work/repo"}])),
                 "git.worktrees" => Ok(json!({"worktrees": []})),
                 "files.readBytes" => {
@@ -189,6 +285,11 @@ mod tests {
                 "workspace.run" => {
                     assert_eq!(params["command"], "write_text_file");
                     let args = &params["args"];
+                    if let (Some(error), Some(_)) =
+                        (self.reject_hash, args["expectedSha256"].as_str())
+                    {
+                        return Err(error.into());
+                    }
                     self.writes.borrow_mut().push(args.clone());
                     let content = args["content"].as_str().unwrap().as_bytes().to_vec();
                     let mut file = self.file.borrow_mut();
@@ -246,29 +347,81 @@ mod tests {
         assert_eq!(host.file.borrow().as_deref(), Some(&b"agent edit\n"[..]));
     }
 
+    fn keep_mine(
+        host: &Fake,
+        doc: &TextDocument,
+        text: &str,
+        shown: Option<&[u8]>,
+    ) -> Result<Vec<u8>, String> {
+        overwrite_remote(host, &Cache::default(), Path::new(PATH), doc, text, shown)
+    }
+
     #[test]
-    fn keep_mine_overwrites_with_the_new_hash() {
+    fn keep_mine_overwrites_the_version_that_was_shown_using_its_hash() {
         let host = Fake::new(true, Some(b"one\n"));
         let doc = document(b"one\n");
         *host.file.borrow_mut() = Some(b"agent edit\n".to_vec());
         assert!(save(&host, &doc, "mine\n", Mode::Guarded).is_err());
-        save(&host, &doc, "mine\n", Mode::Overwrite).unwrap();
+        keep_mine(&host, &doc, "mine\n", Some(b"agent edit\n")).unwrap();
         assert_eq!(host.file.borrow().as_deref(), Some(&b"mine\n"[..]));
         let writes = host.writes.borrow();
         assert_eq!(writes[1]["expectedSha256"], sha256_hex(b"agent edit\n"));
-        assert_ne!(writes[1]["expectedSha256"], writes[0]["expectedSha256"]);
+        // No read-back: the hash is the one of the shown version, not of "now".
+        assert_eq!(*host.reads.borrow(), 0);
     }
 
     #[test]
-    fn keep_mine_recreates_a_deleted_file_without_a_hash() {
+    fn keep_mine_does_not_overwrite_a_version_the_user_never_saw() {
+        let host = Fake::new(true, Some(b"one\n"));
+        let doc = document(b"one\n");
+        // The dialog showed A; the agent wrote B before the click.
+        *host.file.borrow_mut() = Some(b"B\n".to_vec());
+        let error = keep_mine(&host, &doc, "mine\n", Some(b"A\n")).unwrap_err();
+        assert!(is_host_conflict(&error), "{error}");
+        assert_eq!(host.file.borrow().as_deref(), Some(&b"B\n"[..]));
+    }
+
+    #[test]
+    fn keep_mine_recreates_a_file_that_was_missing_when_shown_without_a_hash() {
         let host = Fake::new(true, Some(b"one\n"));
         let doc = document(b"one\n");
         *host.file.borrow_mut() = None;
         let error = save(&host, &doc, "mine\n", Mode::Guarded).unwrap_err();
         assert!(is_host_conflict(&error), "{error}");
-        save(&host, &doc, "mine\n", Mode::Overwrite).unwrap();
+        keep_mine(&host, &doc, "mine\n", None).unwrap();
         assert_eq!(host.file.borrow().as_deref(), Some(&b"mine\n"[..]));
         assert!(host.writes.borrow()[1].get("expectedSha256").is_none());
+    }
+
+    #[test]
+    fn a_host_older_than_the_pin_is_compared_by_a_read_even_if_it_lists_the_capability() {
+        for version in [Some("1.0.0"), None] {
+            let mut host = Fake::new(true, Some(b"one\n"));
+            host.version = version;
+            let doc = document(b"one\n");
+            save(&host, &doc, "two\n", Mode::Guarded).unwrap();
+            assert_eq!(*host.reads.borrow(), 1, "{version:?}");
+            assert!(host.writes.borrow()[0].get("expectedSha256").is_none());
+            *host.file.borrow_mut() = Some(b"agent edit\n".to_vec());
+            assert!(save(&host, &doc, "mine\n", Mode::Guarded).is_err());
+            assert_eq!(host.writes.borrow().len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_host_that_rejects_the_hash_is_forgotten_and_compared_by_a_read() {
+        let mut host = Fake::new(true, Some(b"one\n"));
+        host.reject_hash = Some("Unsupported host method: write_text_file");
+        let doc = document(b"one\n");
+        save(&host, &doc, "two\n", Mode::Guarded).unwrap();
+        assert_eq!(*host.forgotten.borrow(), 1);
+        assert_eq!(*host.reads.borrow(), 1);
+        assert_eq!(host.file.borrow().as_deref(), Some(&b"two\n"[..]));
+        // The fallback still refuses a changed file.
+        *host.file.borrow_mut() = Some(b"agent edit\n".to_vec());
+        let error = save(&host, &doc, "mine\n", Mode::Guarded).unwrap_err();
+        assert!(error.contains("changed on disk"), "{error}");
+        assert_eq!(host.file.borrow().as_deref(), Some(&b"agent edit\n"[..]));
     }
 
     #[test]

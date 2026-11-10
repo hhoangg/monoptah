@@ -408,13 +408,15 @@ pub fn save_document(path: &Path, document: &TextDocument, text: &str) -> Result
     result
 }
 
-/// Saves over whatever is on disk now ("Keep mine" after a conflict): the current bytes
-/// become the baseline first, so a remote save carries the new hash and not the stale one.
-/// A file that no longer exists is created.
+/// Saves over the cloud version the user was shown ("Keep mine" after a conflict).
+/// `shown` is that version's raw bytes, or `None` when the file did not exist. The save is
+/// conditional on exactly those bytes, so a version the user never saw (the agent wrote
+/// again meanwhile) is refused with "File changed on the host" and not overwritten.
 pub fn overwrite_document(
     path: &Path,
     document: &TextDocument,
     text: &str,
+    shown: Option<&[u8]>,
 ) -> Result<Vec<u8>, String> {
     if let Some(reason) = &document.read_only {
         return Err(reason.clone());
@@ -423,16 +425,12 @@ pub fn overwrite_document(
         return Err("Text exceeds the editor size limit.".into());
     }
     if super::remote::is_remote(path) {
-        return super::remote_write::save_default(
-            path,
-            document,
-            text,
-            super::remote_write::Mode::Overwrite,
-        );
+        return super::remote_write::overwrite_default(path, document, text, shown);
     }
-    let mut current = document.clone();
-    current.disk = std::fs::read(expand_home(path)).map_err(|e| e.to_string())?;
-    save_document(path, &current, text)
+    let shown = shown.ok_or("The file no longer exists.")?;
+    let mut baseline = document.clone();
+    baseline.disk = shown.to_vec();
+    save_document(path, &baseline, text)
 }
 
 fn matches_disk(path: &Path, expected: &[u8]) -> Result<bool, String> {

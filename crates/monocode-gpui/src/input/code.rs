@@ -825,7 +825,7 @@ impl Input {
             cx.propagate();
             return;
         };
-        if self.marked.is_some() {
+        if self.marked.is_some() || self.read_only {
             return;
         }
         let source = if redo { &mut code.redo } else { &mut code.undo };
