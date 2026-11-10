@@ -19,6 +19,7 @@ use gpui::{
 use monocode_core::{
     agent::{AccessMode, Settings},
     provider::{self, Event, Kind, Request},
+    remote::MAY_STILL_RUN,
     scm::{self, ChangedFile, DiffIndex, Pr},
 };
 use serde::{Deserialize, Serialize};
@@ -527,10 +528,12 @@ impl Changes {
             let result = task.await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.busy = None;
+                // Refreshes ahead/behind, which also settles a timed-out push, pull or sync.
                 this.mutated(cx);
-                match result {
-                    Ok(()) => then(this, window, cx),
-                    Err(error) => Self::fail(error, window, cx),
+                match settle(result) {
+                    Settled::Done => then(this, window, cx),
+                    Settled::MayStillRun => this.set_status(MAY_STILL_RUN, cx),
+                    Settled::Failed(error) => Self::fail(error, window, cx),
                 }
                 cx.notify();
             });
@@ -2080,9 +2083,91 @@ impl Render for Changes {
     }
 }
 
+/// How a git action ended. A client timeout on a remote push, pull or sync is not a
+/// failure: the host may still be running it.
+#[derive(Debug, PartialEq)]
+enum Settled {
+    Done,
+    MayStillRun,
+    Failed(String),
+}
+
+fn settle(result: Result<(), String>) -> Settled {
+    match result {
+        Ok(()) => Settled::Done,
+        Err(error) if error == MAY_STILL_RUN => Settled::MayStillRun,
+        Err(error) => Settled::Failed(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_the_exact_timeout_text_is_not_a_failure() {
+        assert_eq!(settle(Ok(())), Settled::Done);
+        assert_eq!(settle(Err(MAY_STILL_RUN.into())), Settled::MayStillRun);
+        assert_eq!(
+            settle(Err("rejected".into())),
+            Settled::Failed("rejected".into())
+        );
+    }
+    /// A timed-out push shows "may still be running", not an alert, and re-reads ahead/behind
+    /// once. A real failure still alerts.
+    #[gpui::test]
+    fn a_timed_out_push_checks_the_host_instead_of_failing(cx: &mut gpui::TestAppContext) {
+        let (git_handle, window) = cx.update(|cx| {
+            let git = cx.new(|cx| ProjectGit::new("~".into(), cx));
+            let handle = git.clone();
+            let window = cx
+                .open_window(Default::default(), |window, cx| {
+                    cx.new(|cx| Changes::new(git, window, cx))
+                })
+                .unwrap();
+            (handle, window)
+        });
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        let epoch = |cx: &mut gpui::VisualTestContext| git_handle.read_with(cx, |g, _| g.epoch);
+        let before = epoch(visual);
+        window
+            .update(visual, |changes, window, cx| {
+                let cwd = changes.cwd.clone();
+                changes.run_git_at(
+                    cwd,
+                    "push".into(),
+                    |_| Err(MAY_STILL_RUN.into()),
+                    |_, _, _| panic!("a timeout is not a success"),
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(!visual.has_pending_prompt(), "a timeout is not an alert");
+        assert_eq!(epoch(visual), before + 1, "ahead/behind is re-read once");
+        window
+            .update(visual, |changes, _, _| {
+                assert_eq!(changes.status.as_deref(), Some(MAY_STILL_RUN));
+                assert!(changes.busy.is_none());
+            })
+            .unwrap();
+        window
+            .update(visual, |changes, window, cx| {
+                let cwd = changes.cwd.clone();
+                changes.run_git_at(
+                    cwd,
+                    "push".into(),
+                    |_| Err("rejected".into()),
+                    |_, _, _| {},
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let (message, _) = visual.pending_prompt().expect("a failure alerts");
+        assert_eq!(message, "rejected");
+    }
     #[gpui::test]
     fn enabling_an_enabled_changes_panel_does_not_reload(cx: &mut gpui::TestAppContext) {
         let window = cx.update(|cx| {
