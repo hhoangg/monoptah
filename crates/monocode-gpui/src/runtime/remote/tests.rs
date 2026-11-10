@@ -1202,6 +1202,9 @@ fn mirrored_run_repairs_a_partial_write_and_follows_a_shorter_host_history() {
             .link_remote_session(remote.summary.id, Some(local))
             .unwrap();
         guard.set_cloud_location(local, &cloud_at()).unwrap();
+        guard
+            .save_setting("cloud-synced:env:host-session", "3")
+            .unwrap();
     }
     attach_mirrored(&host, &store, local, &remote);
     let all = |c: &Arc<Mutex<Value>>| -> Vec<Row> {
@@ -1252,6 +1255,42 @@ fn a_failed_row_append_is_shown_but_the_observation_continues() {
             .any(|u| u.rows.iter().any(|r| r.text == "Question"))
     );
     assert_eq!(local_rows(&store, local).len(), 5);
+    // The failure is durable for the UI, and the next good append clears it.
+    let message = locked(&store).unwrap().cloud_sync_error(local).unwrap();
+    assert!(message.unwrap().contains("Nothing was overwritten"));
+}
+
+#[test]
+fn a_location_flip_during_an_observation_leaves_the_pre_move_rows_alone() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let (local, remote) = mirrored_pair(&store);
+    let flipped = store.clone();
+    let mut polls = 0;
+    let host = Host::new(move |_| {
+        polls += 1;
+        if polls == 3 {
+            locked(&flipped)
+                .unwrap()
+                .reset_cloud_location_to_local(local)
+                .unwrap();
+        }
+        let mut value = snapshot(if polls < 5 { "running" } else { "idle" }, polls);
+        value["session"]["blocks"] = json!([
+            {"id":"u","role":"user","text":format!("Question {polls}")}
+        ]);
+        Some(json!({"kind":"snapshot","value":value}))
+    });
+    let _ = run_mirrored_attach(&host, &store, local, &remote);
+    let rows = local_rows(&store, local);
+    assert_eq!(&rows[..PRE_MOVE], &pre_move_rows()[..]);
+    // Nothing from after the flip (poll 3 on) was written.
+    assert!(rows.len() <= PRE_MOVE + 2);
+    assert!(
+        rows[PRE_MOVE..]
+            .iter()
+            .all(|r| r.text == "[]" || r.text == "Question 1" || r.text == "Question 2")
+    );
 }
 
 #[test]

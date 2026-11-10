@@ -1321,6 +1321,9 @@ get them after HR2.
     leave the target; a shared instance uses a worktree; import extend / replace / fork
     gives the same decisions as the Rust fixtures; a live-binding refusal; the first
     turn passes `--resume <same id>` and no `--fork-session`.
+  - [ ] Import creates no blocks (the new Host session has `blocks: []`), and a move
+    always gets a fresh Host session. F4-L's row append maps Host row `i` to local row
+    `moved_at_row + i` and would duplicate history after the move point otherwise.
 
 #### HR3 Release Host batch 3 and pin it (S). **Release: stop and ask.**
 
@@ -1394,7 +1397,8 @@ get them after HR2.
     `claude --version`, and runs `claude update` on the remote when it is older;
   - the first cloud turn gets the moved-path note;
   - refuse while the session is busy, or when HEAD or the last row changed before the
-    flip.
+    flip. Step 7 precondition for F4-L: the last row id still matches, so the local row
+    count at the flip equals `moved_at_row` (the first row append refuses otherwise).
 - **Acceptance:**
   - [ ] Tests with fakes for git, the Host and backends:
     - every step is idempotent;

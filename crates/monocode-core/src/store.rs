@@ -1309,7 +1309,7 @@ impl Store {
         tx.execute("DELETE FROM native_reminders WHERE session_id=?1", [id])
             .map_err(|e| e.to_string())?;
         tx.execute(
-            "DELETE FROM native_settings WHERE key IN (?1,?2,?3,?5,?6,?7,?8,?9,?10,?11,?12) OR key LIKE ?4",
+            "DELETE FROM native_settings WHERE key IN (?1,?2,?3,?5,?6,?7,?8,?9,?10,?11,?12,?13) OR key LIKE ?4",
             params![
                 format!("agent:{id}"),
                 format!("context:{id}"),
@@ -1322,7 +1322,8 @@ impl Store {
                 format!("mono-retired:{id}"),
                 format!("archive-times:{id}"),
                 format!("codespace-origin:{id}"),
-                format!("cloud-location:{id}")
+                format!("cloud-location:{id}"),
+                format!("cloud-sync-error:{id}")
             ],
         )
         .map_err(|e| e.to_string())?;

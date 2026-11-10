@@ -40,11 +40,17 @@ pub struct CloudLocation {
     #[serde(with = "cloud_ref")]
     pub cloud: CloudRef,
     pub environment_id: String,
+    // Every field added later needs `#[serde(default)]`: an older stored value must keep
+    // parsing after an upgrade, or its session would read as "unreadable cloud location".
+    #[serde(default)]
     pub project_id: String,
     pub host_session_id: String,
+    #[serde(default)]
     pub remote_cwd: String,
+    #[serde(default)]
     pub local_cwd: String,
     /// Rows before this index were written locally; the row append never rewrites them.
+    #[serde(default)]
     pub moved_at_row: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pushed_branch: Option<String>,
@@ -110,6 +116,7 @@ impl Store {
         for id in linked {
             self.link_remote_session(id, None)?;
         }
+        let _ = self.save_setting(&Self::sync_error_key(session), "");
         self.save_setting(&Self::location_key(session), "")
     }
     // TODO(part B): only the move (F4-3a) and the return (F4-5) may call this.
@@ -164,6 +171,25 @@ pub(crate) mod tests {
         assert_eq!(
             store.cloud_location(session.id).unwrap(),
             SessionLocation::Local
+        );
+    }
+
+    #[test]
+    fn an_older_stored_location_still_parses() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let session = store.create("claude", "/Users/me/repo").unwrap();
+        // Only the identifying fields, plus a field a newer app might have written.
+        store
+            .save_setting(
+                &format!("cloud-location:{}", session.id),
+                r#"{"cloud":{"backend":"codespaces","name":"octo"},"environmentId":"env","hostSessionId":"h","futureField":1}"#,
+            )
+            .unwrap();
+        let location = store.cloud_location(session.id).unwrap();
+        let cloud = location.cloud().unwrap();
+        assert_eq!(
+            (cloud.host_session_id.as_str(), cloud.moved_at_row),
+            ("h", 0)
         );
     }
 

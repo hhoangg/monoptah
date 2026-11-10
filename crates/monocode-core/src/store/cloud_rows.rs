@@ -1,10 +1,18 @@
 //! Appends the rows of a cloud (Host) session to the LOCAL session it is linked to
 //! (design 4.2.1 and the "F4-0 results" row-append approach).
 //!
-//! The Host snapshot is projected to rows `H`; the local `native_rows` are `L`. The longest
-//! common prefix `p` (role and text) is kept, `H[p..]` is upserted at index `p`, and rows
-//! at or after `H.len()` are deleted. Every step is idempotent, so a second sync of the same
-//! snapshot changes nothing and a half-written earlier sync is repaired by the next one.
+//! The Host snapshot is projected to rows `H`; the local `native_rows` are `L`. A Host
+//! session created by a move holds only the turns that ran in the cloud, so Host row `i`
+//! is local row `moved_at_row + i`. The longest common prefix `p` (role and text) of
+//! `L[moved_at_row..]` and `H` is kept, `H[p..]` is upserted at `moved_at_row + p`, and rows
+//! from `moved_at_row + H.len()` are deleted. Rows before `moved_at_row` are never read,
+//! written or deleted. Every step is idempotent, so a second sync of the same snapshot
+//! changes nothing and a half-written earlier sync is repaired by the next one.
+//!
+//! Preconditions: the Host session starts with zero blocks (`sessions.import` must not
+//! project the imported JSONL), and the first sync (no cursor) finds exactly `moved_at_row`
+//! local rows. The append writes only while the stored location is Cloud for the same
+//! environment and Host session.
 use super::{upsert_rows, SessionLocation, Store, CLOUD_OWNED};
 use crate::transcript::Row;
 use rusqlite::params;
@@ -23,6 +31,11 @@ pub struct AppendOutcome {
 
 /// Why the append refuses: the local rows written before the move are missing, so the Host
 /// rows have no place to go. Nothing is written.
+pub const NOT_CLOUD: &str =
+    "This conversation is no longer in that cloud session. Nothing was written.";
+
+/// Why the append refuses: the local rows do not match the move point (too few rows, or at
+/// the first sync a different count), so the Host rows have no safe place. Nothing is written.
 pub const DIVERGED: &str = "The local conversation is shorter than its move point, so the cloud messages cannot be placed. Nothing was overwritten.";
 
 impl Store {
@@ -38,6 +51,23 @@ impl Store {
         Ok(self
             .setting(&Self::synced_key(environment, host_session))?
             .and_then(|raw| raw.parse().ok()))
+    }
+    pub(super) fn sync_error_key(session: i64) -> String {
+        format!("cloud-sync-error:{session}")
+    }
+    /// The last row-append failure of a Cloud session, until the next successful append.
+    pub fn cloud_sync_error(&self, session: i64) -> Result<Option<String>, String> {
+        Ok(self
+            .setting(&Self::sync_error_key(session))?
+            .filter(|message| !message.is_empty()))
+    }
+    /// Remembers why the row append failed, so the UI can say so after a reload. Does
+    /// nothing when the session is not in the cloud (for example it was just deleted).
+    pub fn record_cloud_sync_error(&self, session: i64, message: &str) -> Result<(), String> {
+        if !matches!(self.cloud_location(session), Ok(SessionLocation::Cloud(_))) {
+            return Ok(());
+        }
+        self.save_setting(&Self::sync_error_key(session), message)
     }
     /// Deletes the rows of a local session from index `from` on.
     pub fn truncate_rows(&mut self, session: i64, from: usize) -> Result<(), String> {
@@ -97,12 +127,18 @@ impl Store {
         // A Host session created by a move holds only the turns that ran in the cloud, so
         // Host row `i` is local row `moved_at_row + i`. Rows before `moved_at_row` are never
         // compared, written or deleted.
-        let base = match self.cloud_location(local_session)? {
-            SessionLocation::Cloud(location) => location.moved_at_row,
-            SessionLocation::Local => 0,
+        let SessionLocation::Cloud(location) = self.cloud_location(local_session)? else {
+            return Err(NOT_CLOUD.into());
         };
+        if location.environment_id != environment || location.host_session_id != host_session {
+            return Err(NOT_CLOUD.into());
+        }
+        let base = location.moved_at_row;
         let local = self.native_rows(local_session)?;
-        if local.len() < base {
+        let first_sync = self
+            .cloud_synced_revision(environment, host_session)?
+            .is_none();
+        if local.len() < base || (first_sync && local.len() != base) {
             return Err(DIVERGED.into());
         }
         let tail = &local[base..];
@@ -137,6 +173,11 @@ impl Store {
                 Self::synced_key(environment, host_session),
                 revision.to_string()
             ],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM native_settings WHERE key=?1",
+            [Self::sync_error_key(local_session)],
         )
         .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
@@ -270,6 +311,8 @@ mod tests {
             .unwrap();
             tx.commit().unwrap();
         }
+        // An earlier sync got as far as its cursor (the first sync checks the row count).
+        store.save_setting("cloud-synced:env:host-1", "4").unwrap();
         let repaired = store.append_remote_rows(id, &snap).unwrap();
         assert_eq!(repaired.start, 1);
         assert_eq!(
@@ -447,6 +490,113 @@ mod tests {
             CLOUD_OWNED
         );
         assert_eq!(store.native_rows(id).unwrap(), rows);
+    }
+
+    #[test]
+    fn a_location_flip_or_delete_mid_observation_writes_nothing() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let (id, before) = local_history(&mut store, 10);
+        let rows = [Row {
+            role: "user".into(),
+            text: "cloud".into(),
+            first: true,
+            sent_at: None,
+        }];
+        store
+            .append_projected_rows(id, "env", "host-1", 1, &rows)
+            .unwrap();
+        // The location flips to Local: the next poll must not touch the ten local rows.
+        store.reset_cloud_location_to_local(id).unwrap();
+        let err = store
+            .append_projected_rows(id, "env", "host-1", 2, &[])
+            .unwrap_err();
+        assert_eq!(err, NOT_CLOUD);
+        assert_eq!(&store.native_rows(id).unwrap()[..10], &before[..]);
+        assert_eq!(store.native_rows(id).unwrap().len(), 11);
+        // A different Host session than the location names is refused too.
+        let mut other = cloud_location();
+        other.moved_at_row = 10;
+        store
+            .set_cloud_location(id, &SessionLocation::Cloud(other))
+            .unwrap();
+        assert!(store
+            .append_projected_rows(id, "env", "another-host", 3, &[])
+            .is_err());
+        assert!(store
+            .append_projected_rows(id, "other-env", "host-1", 3, &[])
+            .is_err());
+        assert_eq!(store.native_rows(id).unwrap().len(), 11);
+        // A deleted session gets neither rows nor a cursor back.
+        store.delete(id).unwrap();
+        assert!(store
+            .append_projected_rows(id, "env", "host-1", 4, &rows)
+            .is_err());
+        assert!(store.native_rows(id).unwrap().is_empty());
+        assert_eq!(store.cloud_synced_revision("env", "host-1").unwrap(), None);
+    }
+
+    #[test]
+    fn the_first_sync_needs_exactly_the_move_point_row_count() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let (id, before) = local_history(&mut store, 4);
+        // A local turn left an extra row between the move point and the flip.
+        store
+            .write_rows(
+                id,
+                4,
+                &[Row {
+                    role: "assistant".into(),
+                    text: "interrupted".into(),
+                    first: true,
+                    sent_at: None,
+                }],
+            )
+            .unwrap_err(); // refused: already Cloud
+        store.reset_cloud_location_to_local(id).unwrap();
+        store
+            .write_rows(
+                id,
+                4,
+                &[Row {
+                    role: "assistant".into(),
+                    text: "interrupted".into(),
+                    first: true,
+                    sent_at: None,
+                }],
+            )
+            .unwrap();
+        let mut location = cloud_location();
+        location.moved_at_row = 4;
+        store
+            .set_cloud_location(id, &SessionLocation::Cloud(location))
+            .unwrap();
+        assert_eq!(
+            store
+                .append_remote_rows(id, &snapshot(1, &[("user", "q")]))
+                .unwrap_err(),
+            DIVERGED
+        );
+        assert_eq!(store.native_rows(id).unwrap().len(), 5);
+        assert_eq!(&store.native_rows(id).unwrap()[..4], &before[..]);
+        assert_eq!(store.cloud_synced_revision("env", "host-1").unwrap(), None);
+    }
+
+    #[test]
+    fn a_sync_failure_is_remembered_until_the_next_successful_append() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let (id, _) = local_history(&mut store, 4);
+        assert_eq!(store.cloud_sync_error(id).unwrap(), None);
+        store.record_cloud_sync_error(id, "boom").unwrap();
+        assert_eq!(store.cloud_sync_error(id).unwrap().as_deref(), Some("boom"));
+        store
+            .append_remote_rows(id, &snapshot(1, &[("user", "q")]))
+            .unwrap();
+        assert_eq!(store.cloud_sync_error(id).unwrap(), None);
+        // A session that is not in the cloud (or was deleted) keeps no marker.
+        store.record_cloud_sync_error(id, "again").unwrap();
+        store.delete(id).unwrap();
+        store.record_cloud_sync_error(id, "late").unwrap();
+        assert_eq!(store.cloud_sync_error(id).unwrap(), None);
     }
 
     #[test]

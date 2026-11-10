@@ -800,7 +800,8 @@ pub(crate) fn run_with_client_mirrored(
                 if let Some(local) = mirror {
                     // The only writer of this session's rows while it is in the cloud.
                     // Idempotent: a repeated or half-written sync is repaired, not doubled.
-                    sync_error = locked(&store)?
+                    let mut guard = locked(&store)?;
+                    sync_error = guard
                         .append_projected_rows(
                             local,
                             &binding.project.environment_id,
@@ -809,6 +810,10 @@ pub(crate) fn run_with_client_mirrored(
                             &history.rows,
                         )
                         .err();
+                    if let Some(message) = &sync_error {
+                        // Durable, so the UI can still say it after a reload.
+                        let _ = guard.record_cloud_sync_error(local, message);
+                    }
                 }
                 let mut view = pre_move.clone();
                 view.extend(history.rows);
