@@ -6,9 +6,11 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   statSync,
   utimesSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -242,30 +244,71 @@ it("sweeps stray entries that are not upload directories", () => {
   expect(existsSync(stray)).toBe(false);
 });
 
-it.each(["META.json", "Meta.json", "PART", "trailing.", "trailing "])(
-  "never lets the name %j touch internal files",
+it.each(["META.json", "Meta.json", "PART", "Files", "trailing.", "trailing "])(
+  "keeps rejecting the collision candidate %j",
   (name) => {
-    const data = Buffer.from("payload");
-    let id: string | undefined;
-    try {
-      id = uploads.begin({ name, size: data.length, sha256: sha(data) }).uploadId;
-    } catch (error) {
-      expect(String(error)).toContain("Invalid upload name");
-      return;
-    }
-    send(id, 0, data);
-    expect(readFileSync(uploads.commit({ uploadId: id }).path)).toEqual(data);
+    expect(() => uploads.begin({ name, size: 1, sha256: sha("a") })).toThrow("Invalid upload name");
   },
 );
 
-it("keeps a payload separate from metadata even if the name were hostile", () => {
-  const data = Buffer.from("payload");
-  const { uploadId } = begin(data, "meta-json");
+it.each(["meta-json", "part.txt", "files.bak", "metadata.json", "parts"])(
+  "commits a legitimate file named %j under files/ and leaves internal files intact",
+  (name) => {
+    const data = Buffer.from("payload for " + name);
+    const { uploadId } = begin(data, name);
+    send(uploadId, 0, data);
+    const done = uploads.commit({ uploadId });
+    const dir = join(directory, "uploads", uploadId);
+    expect(done.path).toBe(join(dir, "files", name));
+    expect(readFileSync(done.path)).toEqual(data);
+    const meta = JSON.parse(readFileSync(join(dir, "meta.json"), "utf8"));
+    expect(meta).toMatchObject({ name, size: data.length, sha256: sha(data), committed: true });
+    expect(readdirSync(dir).sort()).toEqual(["files", "meta.json"]);
+    expect(uploads.commit({ uploadId })).toEqual(done);
+  },
+);
+
+const staged = (text = "crash test") => {
+  const data = Buffer.from(text);
+  const { uploadId } = begin(data, "kit.tar");
   send(uploadId, 0, data);
-  const { path } = uploads.commit({ uploadId });
-  expect(path).toContain(join(uploadId, "files"));
-  expect(JSON.parse(readFileSync(join(directory, "uploads", uploadId, "meta.json"), "utf8")).committed).toBe(true);
-  expect(readFileSync(path)).toEqual(data);
+  return { data, uploadId, dir: join(directory, "uploads", uploadId) };
+};
+
+it("recovers a commit killed after files/ was created", () => {
+  const { data, uploadId, dir } = staged();
+  mkdirSync(join(dir, "files"), { mode: 0o700 });
+  const done = uploads.commit({ uploadId });
+  expect(readFileSync(done.path)).toEqual(data);
+});
+
+it("recovers a commit killed between the rename and the metadata write", () => {
+  const { data, uploadId, dir } = staged();
+  mkdirSync(join(dir, "files"), { mode: 0o700 });
+  renameSync(join(dir, "part"), join(dir, "files", "kit.tar"));
+  const done = uploads.commit({ uploadId });
+  expect(readFileSync(done.path)).toEqual(data);
+  expect(JSON.parse(readFileSync(join(dir, "meta.json"), "utf8")).committed).toBe(true);
+  expect(uploads.committedPath(uploadId)).toBe(done.path);
+});
+
+it("reports an unrecoverable commit as not found and drops the directory", () => {
+  const { uploadId, dir } = staged();
+  rmSync(join(dir, "part"));
+  expect(() => uploads.commit({ uploadId })).toThrow("Upload not found");
+  expect(existsSync(dir)).toBe(false);
+  const again = staged("again");
+  rmSync(join(again.dir, "part"));
+  expect(() => send(again.uploadId, 0, "x")).toThrow("Upload not found");
+});
+
+it("fails a recovered payload whose bytes are wrong with a hash mismatch", () => {
+  const { uploadId, dir } = staged();
+  mkdirSync(join(dir, "files"), { mode: 0o700 });
+  writeFileSync(join(dir, "files", "kit.tar"), "tampered!!");
+  rmSync(join(dir, "part"));
+  expect(() => uploads.commit({ uploadId })).toThrow("sha256 does not match");
+  expect(existsSync(dir)).toBe(false);
 });
 
 it("sweeps expired uploads on a timer and on chunk, and clears the timer", () => {

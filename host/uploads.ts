@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
   closeSync,
+  existsSync,
   fstatSync,
   ftruncateSync,
   mkdirSync,
@@ -230,7 +231,12 @@ export class HostUploads {
     // (which begin already bounded to 500 MB).
     if (bytes.length > UPLOAD_CHUNK_BYTES || start + bytes.length > meta.size)
       throw new Error("Upload chunk exceeds the declared size");
-    const fd = openSync(join(this.dir(id), PART), "r+");
+    let fd: number;
+    try {
+      fd = openSync(join(this.dir(id), PART), "r+");
+    } catch {
+      throw new Error("Upload not found");
+    }
     try {
       const length = fstatSync(fd).size;
       if (start > length) throw new Error("Upload chunks are out of order");
@@ -268,10 +274,17 @@ export class HostUploads {
     const path = this.payload(id, meta);
     const done = () => ({ uploadId: id, name: meta.name, path, size: meta.size, sha256: meta.sha256 });
     if (meta.committed) return done();
+    // A crash between the rename and the metadata write leaves the bytes in
+    // files/ with committed:false, so a retry finishes from whichever exists.
     const part = join(dir, PART);
-    if (statSync(part).size !== meta.size) throw new Error("Upload is incomplete");
+    const source = existsSync(part) ? part : existsSync(path) ? path : undefined;
+    if (!source) {
+      rmSync(dir, { recursive: true, force: true });
+      throw new Error("Upload not found");
+    }
+    if (statSync(source).size !== meta.size) throw new Error("Upload is incomplete");
     const hash = createHash("sha256");
-    const fd = openSync(part, "r");
+    const fd = openSync(source, "r");
     try {
       const buffer = Buffer.alloc(UPLOAD_CHUNK_BYTES);
       for (let read = readSync(fd, buffer, 0, buffer.length, null); read > 0;
@@ -285,10 +298,15 @@ export class HostUploads {
       rmSync(dir, { recursive: true, force: true });
       throw new Error("Upload sha256 does not match");
     }
-    chmodSync(part, 0o600);
-    mkdirSync(join(dir, FILES), { mode: 0o700 });
-    renameSync(part, path);
-    writeFileSync(join(dir, META), JSON.stringify({ ...meta, committed: true }), { mode: 0o600 });
+    if (source === part) {
+      chmodSync(part, 0o600);
+      mkdirSync(join(dir, FILES), { recursive: true, mode: 0o700 });
+      renameSync(part, path);
+    }
+    chmodSync(path, 0o600);
+    const next = join(dir, `${META}.tmp`);
+    writeFileSync(next, JSON.stringify({ ...meta, committed: true }), { mode: 0o600 });
+    renameSync(next, join(dir, META));
     this.touch(id);
     return done();
   }
