@@ -3,6 +3,7 @@
 //! `files.readBytes` is keyed by `projectId` (plus an optional worktree `cwd`), not by path,
 //! so a `remote://<env>/<path>` path is first mapped onto the registered project that owns
 //! it. A Host without the capability is read with the single `read_binary_file` reply instead.
+use crate::remote::host_info::HostInfo;
 use base64::Engine;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -20,13 +21,20 @@ pub(crate) const MAX_LEGACY_BYTES: usize = 10 * 1024 * 1024;
 pub const READ_CANCELLED: &str = "Read cancelled";
 const TOO_LARGE: &str = "File is too large to preview (maximum 32 MB).";
 const PROJECT_TTL: Duration = Duration::from_secs(5);
-const CAPABILITY_TTL: Duration = Duration::from_secs(60);
 
 /// What the chunked read needs from a connection, so tests can stand in a fake Host.
 pub(crate) trait Transport {
     /// The connection machine id of a remote environment.
     fn machine_for_environment(&self, environment: &str) -> Result<String, String>;
     fn request(&self, machine: &str, method: &str, params: Value) -> Result<Value, String>;
+    /// Flavor, version and capabilities of the machine's Host. The default asks the Host
+    /// every time; [`crate::remote::Connections`] answers from its single `HostInfo` cache.
+    fn host_info(&self, machine: &str) -> Result<HostInfo, String> {
+        let described = self.request(machine, "environment.describe", json!({}))?;
+        Ok(HostInfo::from_descriptor(&described))
+    }
+    /// Drops what is cached about the machine's Host (it was found to be different).
+    fn forget_host_info(&self, _machine: &str) {}
 }
 
 impl Transport for crate::remote::Connections {
@@ -35,6 +43,15 @@ impl Transport for crate::remote::Connections {
     }
     fn request(&self, machine: &str, method: &str, params: Value) -> Result<Value, String> {
         Self::request(self, machine, method, params)
+    }
+    fn host_info(&self, machine: &str) -> Result<HostInfo, String> {
+        match Self::host_info(self, machine) {
+            Some(info) => Ok(info),
+            None => self.describe_host(machine),
+        }
+    }
+    fn forget_host_info(&self, machine: &str) {
+        self.forget_host(machine);
     }
 }
 
@@ -66,11 +83,6 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> Ttl<K, V> {
             ttl,
         }
     }
-    fn forget(&self, key: &K) {
-        if let Ok(mut entries) = self.entries.lock() {
-            entries.remove(key);
-        }
-    }
     fn get_or(&self, key: &K, load: impl FnOnce() -> Result<V, String>) -> Result<V, String> {
         if let Ok(entries) = self.entries.lock() {
             if let Some((at, value)) = entries.get(key) {
@@ -92,14 +104,12 @@ pub(crate) struct Cache {
     projects: Ttl<String, Vec<Project>>,
     /// `None` caches a failed listing, so a read does not ask again for every project.
     worktrees: Ttl<(String, String), Option<Vec<Worktree>>>,
-    capable: Ttl<String, bool>,
 }
 impl Default for Cache {
     fn default() -> Self {
         Self {
             projects: Ttl::new(PROJECT_TTL),
             worktrees: Ttl::new(PROJECT_TTL),
-            capable: Ttl::new(CAPABILITY_TTL),
         }
     }
 }
@@ -212,13 +222,8 @@ fn locate(
     })
 }
 
-fn has_capability(transport: &dyn Transport, cache: &Cache, machine: &str) -> Result<bool, String> {
-    cache.capable.get_or(&machine.to_owned(), || {
-        let described = transport.request(machine, "environment.describe", json!({}))?;
-        Ok(described["capabilities"]
-            .as_array()
-            .is_some_and(|all| all.iter().any(|c| c == "files.readBytes")))
-    })
+fn has_capability(transport: &dyn Transport, machine: &str) -> Result<bool, String> {
+    Ok(transport.host_info(machine)?.supports("files.readBytes"))
 }
 
 fn invalid(what: &str) -> String {
@@ -253,7 +258,7 @@ pub(crate) fn read_bytes(
     let remote = crate::remote::parse_remote_path(&path.to_string_lossy())
         .ok_or("Invalid remote file path")?;
     let machine = transport.machine_for_environment(&remote.environment_id)?;
-    if !has_capability(transport, cache, &machine)? {
+    if !has_capability(transport, &machine)? {
         return legacy(transport, &machine, &remote.host_path);
     }
     let Ok(found) = locate(transport, cache, &machine, &remote.host_path) else {
@@ -284,7 +289,7 @@ pub(crate) fn read_bytes(
                         .contains("unsupported host method") =>
             {
                 // The capability cache was stale (the Host was replaced by an older one).
-                cache.capable.forget(&machine);
+                transport.forget_host_info(&machine);
                 return legacy(transport, &machine, &remote.host_path);
             }
             Err(error) => return Err(error),
@@ -363,6 +368,8 @@ mod tests {
         worktrees_fail: bool,
         /// Advertises `files.readBytes` but refuses it, like a Host replaced by an old one.
         stale_capability: bool,
+        /// Stands in for the `Connections` Host info cache.
+        info: crate::remote::host_info::HostInfoCache,
     }
     impl Fake {
         fn new(capable: bool, data: Vec<u8>) -> Self {
@@ -374,6 +381,7 @@ mod tests {
                 projects_fail: false,
                 worktrees_fail: false,
                 stale_capability: false,
+                info: Default::default(),
             }
         }
         fn methods(&self, method: &str) -> Vec<Value> {
@@ -386,6 +394,16 @@ mod tests {
         }
     }
     impl Transport for Fake {
+        fn host_info(&self, machine: &str) -> Result<HostInfo, String> {
+            if let Some(info) = self.info.get(machine) {
+                return Ok(info);
+            }
+            let described = self.request(machine, "environment.describe", json!({}))?;
+            Ok(self.info.record(machine, &described))
+        }
+        fn forget_host_info(&self, machine: &str) {
+            self.info.drop_machine(machine);
+        }
         fn machine_for_environment(&self, environment: &str) -> Result<String, String> {
             (environment == "env")
                 .then(|| "machine".to_owned())

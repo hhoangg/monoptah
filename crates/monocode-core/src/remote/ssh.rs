@@ -704,18 +704,35 @@ pub fn bootstrap_script(platform: HostPlatform) -> String {
     bootstrap_script_from_template(platform, template)
 }
 
+/// Host targets the bootstrap can detect, in the order of `host_release::HOST_SHA256`.
+fn pinned_sha256_lines(platform: HostPlatform) -> String {
+    use super::host_release::HOST_SHA256;
+    HOST_SHA256
+        .iter()
+        .filter(|(target, _)| target.starts_with("win32") == (platform == HostPlatform::Windows))
+        .map(|(target, hash)| match platform {
+            // One `case` arm per target, filled in at the template's `@@SHA256@@` line.
+            HostPlatform::Unix => format!("    {target}) EXPECTED={hash} ;;"),
+            HostPlatform::Windows => format!("    '{target}' = '{hash}'"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn bootstrap_script_from_template(platform: HostPlatform, template: &str) -> String {
-    let version = env!("CARGO_PKG_VERSION");
-    let url = format!("https://github.com/hardbeat920/monocode/releases/download/v{version}");
+    use super::host_release::{HOST_RELEASE_BASE, HOST_VERSION};
+    let sha256 = pinned_sha256_lines(platform);
     match platform {
         // include_str! preserves checkout line endings, including Windows CRLF.
         HostPlatform::Unix => template
             .replace("\r\n", "\n")
-            .replace("@@VERSION@@", &shell_quote(version))
-            .replace("@@RELEASE@@", &shell_quote(&url)),
+            .replace("@@VERSION@@", &shell_quote(HOST_VERSION))
+            .replace("@@RELEASE@@", &shell_quote(HOST_RELEASE_BASE))
+            .replace("@@SHA256@@", &sha256),
         HostPlatform::Windows => template
-            .replace("@@VERSION@@", &powershell_quote(version))
-            .replace("@@RELEASE@@", &powershell_quote(&url))
+            .replace("@@VERSION@@", &powershell_quote(HOST_VERSION))
+            .replace("@@RELEASE@@", &powershell_quote(HOST_RELEASE_BASE))
+            .replace("@@SHA256@@", &sha256)
             .replace("@@ACL@@", include_str!("windows-acl.ps1")),
     }
 }
@@ -925,6 +942,8 @@ pub struct TunnelLease {
     pub endpoint: String,
     slot: Arc<Mutex<Slot>>,
     generation: u64,
+    /// The tunnel was started for this lease (not reused).
+    pub fresh: bool,
 }
 
 /// Each machine has its own lock: restarting one machine's tunnel (up to
@@ -971,6 +990,7 @@ impl Tunnels {
             endpoint: format!("http://127.0.0.1:{port}"),
             slot: slot.clone(),
             generation: current.generation,
+            fresh: false,
         })
     }
     pub fn endpoint(&self, id: &str, target: &SshTarget) -> Result<TunnelLease, String> {
@@ -982,6 +1002,7 @@ impl Tunnels {
                     endpoint: format!("http://127.0.0.1:{}", tunnel.port),
                     slot: slot.clone(),
                     generation: current.generation,
+                    fresh: false,
                 });
             }
         }
@@ -1001,6 +1022,7 @@ impl Tunnels {
                     endpoint,
                     slot: slot.clone(),
                     generation: current.generation,
+                    fresh: true,
                 })
             }
             Err(error) => {
@@ -1092,6 +1114,7 @@ mod tests {
             endpoint: String::new(),
             slot: old,
             generation: 1,
+            fresh: false,
         };
         let newer = slot(2);
         tunnels.slots().insert("host".into(), newer.clone());
@@ -1101,6 +1124,7 @@ mod tests {
             endpoint: String::new(),
             slot: newer.clone(),
             generation: 1,
+            fresh: false,
         };
         tunnels.invalidate("host", &stale_lease);
         assert!(newer.lock().unwrap().failure.is_some());
@@ -1633,6 +1657,223 @@ mod tests {
         assert!(!upgrade_script(HostPlatform::Unix, 3774).contains('\r'));
         assert!(upgrade_script(HostPlatform::Windows, 3774)
             .starts_with("$env:MONOCODE_HOST_FORCE_UPGRADE = '1'"));
+    }
+    #[test]
+    fn bootstrap_pins_the_fork_release_version_and_hashes() {
+        use super::super::host_release::{HOST_RELEASE_BASE, HOST_SHA256, HOST_VERSION};
+        let unix = bootstrap_script(HostPlatform::Unix);
+        assert!(unix.contains(&format!("RELEASE={}\n", shell_quote(HOST_RELEASE_BASE))));
+        assert!(unix.contains(&format!("VERSION={}\n", shell_quote(HOST_VERSION))));
+        assert!(HOST_RELEASE_BASE
+            .starts_with("https://github.com/hhoangg/monoptah/releases/download/host-v"));
+        assert!(HOST_VERSION.ends_with("+monoptah"));
+        assert!(!unix.contains("hardbeat920"));
+        for (target, hash) in HOST_SHA256 {
+            assert_eq!(
+                unix.contains(&format!("    {target}) EXPECTED={hash} ;;")),
+                !target.starts_with("win32"),
+                "{target}"
+            );
+        }
+        let windows = bootstrap_script(HostPlatform::Windows);
+        assert!(windows.contains(&format!(
+            "$release = {}",
+            powershell_quote(HOST_RELEASE_BASE)
+        )));
+        assert!(windows.contains(&format!("$version = {}", powershell_quote(HOST_VERSION))));
+        for (target, hash) in HOST_SHA256 {
+            assert_eq!(
+                windows.contains(&format!("'{target}' = '{hash}'")),
+                target.starts_with("win32"),
+                "{target}"
+            );
+        }
+        // The reinstall rule is unchanged: missing or FORCE_UPGRADE.
+        assert!(unix.contains("[ ! -x \"$ENTRY\" ] || [ \"$FORCE_UPGRADE\" = 1 ]"));
+    }
+    /// Runs the real Unix bootstrap with a stub `curl` that serves one fake package, and
+    /// returns (exit success, stderr, urls requested, HOME).
+    #[cfg(unix)]
+    fn run_bootstrap_with_fake_package(
+        pin_hash_of_package: bool,
+        publish: Option<&str>,
+        tamper: bool,
+    ) -> (bool, String, Vec<String>, tempfile::TempDir) {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+        let work = tempfile::tempdir().unwrap();
+        let pkg = work.path().join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        let host = pkg.join("monocode-host");
+        std::fs::write(
+            &host,
+            "#!/bin/sh\ncase \"$1\" in --version) echo '1.1.0+monoptah' ;; connection-info) echo '{\"port\":3774}' ;; esac\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let tarball = work.path().join("pkg.tar.gz");
+        let status = Command::new("tar")
+            .arg("-czf")
+            .arg(&tarball)
+            .arg("-C")
+            .arg(&pkg)
+            .arg("monocode-host")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let package_hash = format!("{:x}", Sha256::digest(std::fs::read(&tarball).unwrap()));
+        // The checksum the "release" publishes next to the package.
+        let published = publish
+            .map(String::from)
+            .unwrap_or_else(|| package_hash.clone());
+        std::fs::write(
+            work.path().join("pkg.sha256"),
+            format!("{published}  pkg\n"),
+        )
+        .unwrap();
+        if tamper {
+            // Serve other bytes than the ones that were hashed.
+            std::fs::write(&tarball, b"not the package").unwrap();
+        }
+        let stubs = work.path().join("stubs");
+        std::fs::create_dir_all(&stubs).unwrap();
+        let curl = stubs.join("curl");
+        std::fs::write(
+            &curl,
+            format!(
+                "#!/bin/sh\nurl=; out=\nwhile [ $# -gt 0 ]; do case \"$1\" in -o) out=$2; shift ;; https://*) url=$1 ;; esac; shift; done\necho \"$url\" >> {log}\ncase \"$url\" in *.sha256) cp {sha} \"$out\" ;; *) cp {tar} \"$out\" ;; esac\n",
+                log = work.path().join("urls.log").display(),
+                sha = work.path().join("pkg.sha256").display(),
+                tar = tarball.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut script = bootstrap_script(HostPlatform::Unix);
+        if pin_hash_of_package {
+            for (_, hash) in super::super::host_release::HOST_SHA256 {
+                script = script.replace(hash, &package_hash);
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let mut child = Command::new("sh")
+            .arg("-s")
+            .env("HOME", home.path())
+            .env(
+                "PATH",
+                format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap()),
+            )
+            .env_remove("MONOCODE_HOST_FORCE_UPGRADE")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let urls = std::fs::read_to_string(work.path().join("urls.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(String::from)
+            .collect();
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            urls,
+            home,
+        )
+    }
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_installs_a_package_that_matches_the_pinned_hash() {
+        let (ok, stderr, urls, home) = run_bootstrap_with_fake_package(true, None, false);
+        assert!(ok, "{stderr}");
+        assert_eq!(urls.len(), 2, "{urls:?}");
+        for url in &urls {
+            assert!(
+                url.starts_with("https://github.com/hhoangg/monoptah/releases/download/host-v"),
+                "{url}"
+            );
+        }
+        assert!(home
+            .path()
+            .join(".monocode-host/bin/monocode-host")
+            .is_file());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_rejects_a_wrong_pinned_hash_and_a_tampered_package() {
+        // The pin is the real release hash: the fake package can not match it.
+        let (ok, stderr, _, home) = run_bootstrap_with_fake_package(false, None, false);
+        assert!(!ok);
+        assert!(stderr.contains("checksum mismatch"), "{stderr}");
+        assert!(!home
+            .path()
+            .join(".monocode-host/bin/monocode-host")
+            .exists());
+        // Pin and published checksum agree, but the served bytes differ.
+        let (ok, stderr, _, home) = run_bootstrap_with_fake_package(true, None, true);
+        assert!(!ok);
+        assert!(stderr.contains("package checksum mismatch"), "{stderr}");
+        assert!(!home
+            .path()
+            .join(".monocode-host/bin/monocode-host")
+            .exists());
+        // The pin matches the package, but the release publishes another checksum.
+        let other = "0".repeat(64);
+        let (ok, stderr, _, _) = run_bootstrap_with_fake_package(true, Some(&other), false);
+        assert!(!ok);
+        assert!(stderr.contains("pinned checksum mismatch"), "{stderr}");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn is_older_or_foreign_compares_the_semver_core_and_the_flavor() {
+        let template = include_str!("remote_bootstrap.sh");
+        let start = template.find("is_older_or_foreign() {").unwrap();
+        let end = start + template[start..].find("\n}\n").unwrap() + 3;
+        let function = &template[start..end];
+        let check = |installed: &str, pin: &str| {
+            Command::new("sh")
+                .arg("-c")
+                .arg(format!("{function}\nis_older_or_foreign \"$1\" \"$2\""))
+                .arg("sh")
+                .arg(installed)
+                .arg(pin)
+                .status()
+                .unwrap()
+                .success()
+        };
+        let pin = "1.1.0+monoptah";
+        assert!(check("1.1.0", pin), "upstream, same number");
+        assert!(check("2.0.0", pin), "upstream, higher number");
+        assert!(check("1.0.9+monoptah", pin));
+        assert!(check("0.33.0+monoptah", pin));
+        assert!(check("1.0.10+monoptah", "1.1.0+monoptah"));
+        assert!(check("garbage+monoptah", pin));
+        assert!(!check("1.1.0+monoptah", pin));
+        assert!(!check("1.1.1+monoptah", pin));
+        assert!(!check("1.2.0+monoptah", pin));
+        assert!(!check("10.0.0+monoptah", pin));
+        // Pre-releases are older than their release, build metadata is ignored.
+        assert!(check("1.1.0-rc.1+monoptah", pin));
+        assert!(check("1.1.0-rc.1+monoptah.3", pin));
+        assert!(!check("1.1.0+monoptah.3", pin));
+        assert!(!check("1.1.0+monoptah.3", "1.1.0+monoptah"));
+        assert!(check("1.1.0+monoptah.3", "1.1.1+monoptah"));
+        assert!(
+            !check("1.1.1-rc.1+monoptah", pin),
+            "a pre-release of a higher core"
+        );
+        assert!(!check("1.1.0+monoptah", "1.1.0-rc.1+monoptah"));
+        assert!(!check("1.1.0-rc.1+monoptah", "1.1.0-rc.1+monoptah"));
+        assert!(check("1.1.0-rc.1+monoptah", "1.1.0-rc.2+monoptah"));
+        assert!(check("1.1.0+monoptahx", pin), "not the flavor marker");
+        assert!(check("1.1.0+other", pin));
     }
     #[test]
     fn remote_platform_probe_handles_cmd_powershell_and_unix() {

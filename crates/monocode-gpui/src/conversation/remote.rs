@@ -28,7 +28,8 @@ pub(super) struct State {
     error: Option<String>,
     rejected: Option<Value>,
     snapshot: Option<Value>,
-    pub(super) capabilities: std::collections::HashSet<String>,
+    /// Flavor, version and capabilities of the Host, from its last `environment.describe`.
+    pub(super) host: monocode_core::remote::host_info::HostInfo,
 }
 impl State {
     fn legacy_recovery_error(&self) -> Option<&str> {
@@ -262,13 +263,10 @@ impl Conversation {
         {
             return;
         }
-        let capabilities = &self.remote_state.capabilities;
-        let blocker = if !message.attachments.is_empty()
-            && !capabilities.contains("attachments.upload")
-        {
+        let host = &self.remote_state.host;
+        let blocker = if !message.attachments.is_empty() && !host.supports("attachments.upload") {
             Some("Update Monoptah Host in Connections settings to send attachments.")
-        } else if message.mode.as_deref() == Some("plan") && !capabilities.contains("sessions.plan")
-        {
+        } else if message.mode.as_deref() == Some("plan") && !host.supports("sessions.plan") {
             Some("Update Monoptah Host in Connections settings to use Plan mode.")
         } else {
             None
@@ -507,8 +505,8 @@ impl Conversation {
             }
             let client = client.ok_or("Remote connections are unavailable")?;
             let machine = remote.machine(&client)?;
-            let descriptor = if initial {
-                Some(client.request(&machine.id, "environment.describe", json!({}))?)
+            let host = if initial {
+                Some(client.describe_host(&machine.id)?)
             } else {
                 None
             };
@@ -552,7 +550,7 @@ impl Conversation {
             } else {
                 None
             };
-            Ok::<_, String>((remote, settings, snapshot, history, descriptor))
+            Ok::<_, String>((remote, settings, snapshot, history, host))
         });
         cx.spawn(async move |this, cx| {
             let result = work.await;
@@ -571,7 +569,7 @@ impl Conversation {
                 this.remote_state.refreshing = false;
                 this.loading = false;
                 match result {
-                    Ok((remote, settings, snapshot, history, descriptor)) => {
+                    Ok((remote, settings, snapshot, history, host)) => {
                         this.remote_state.online = true;
                         this.remote_state.was_online = true;
                         this.remote_state.error = remote
@@ -586,13 +584,8 @@ impl Conversation {
                         let launching = this.summary.has_messages && snapshot.is_none();
                         this.summary = remote.summary;
                         this.summary.has_messages |= launching;
-                        if let Some(descriptor) = descriptor {
-                            this.remote_state.capabilities = descriptor["capabilities"]
-                                .as_array()
-                                .into_iter()
-                                .flatten()
-                                .filter_map(|v| v.as_str().map(str::to_owned))
-                                .collect();
+                        if let Some(host) = host {
+                            this.remote_state.host = host;
                         }
                         if settings.revision > this.settings.revision
                             || (initial && settings.revision >= this.settings.revision)
@@ -736,23 +729,18 @@ impl Conversation {
             }
             return true;
         }
-        if !self.attachments.is_empty()
-            && !self
-                .remote_state
-                .capabilities
-                .contains("attachments.upload")
-        {
+        if !self.attachments.is_empty() && !self.remote_state.host.supports("attachments.upload") {
             self.status =
                 "Update Monoptah Host in Connections settings to send attachments.".into();
             cx.notify();
             return true;
         }
-        if self.settings.plan && !self.remote_state.capabilities.contains("sessions.plan") {
+        if self.settings.plan && !self.remote_state.host.supports("sessions.plan") {
             self.status = "Update Monoptah Host in Connections settings to use Plan mode.".into();
             cx.notify();
             return true;
         }
-        if self.draft_active(cx) && !self.remote_state.capabilities.contains("sessions.draft") {
+        if self.draft_active(cx) && !self.remote_state.host.supports("sessions.draft") {
             self.status = "Update Monoptah Host in Connections settings to save drafts.".into();
             cx.notify();
             return true;

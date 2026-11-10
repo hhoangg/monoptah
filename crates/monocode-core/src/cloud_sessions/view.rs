@@ -368,19 +368,18 @@ impl<'a> Fetcher<'a> {
         }
     }
 
-    /// Whether the Host advertises `files.readBytes` in its capabilities. A read-only
-    /// `environment.describe`; with no live tunnel it is the not-connected answer.
+    /// Whether the Host advertises `files.readBytes` in its capabilities (from the cached
+    /// [`HostInfo`](crate::remote::host_info::HostInfo); with no live tunnel it is the
+    /// not-connected answer).
     pub(crate) fn has_bytes(&self) -> Result<bool, ViewError> {
         if let Some(known) = self.bytes.get() {
             return Ok(known);
         }
-        let described = self
+        let known = self
             .host
-            .request(&self.file.machine_id, "environment.describe", json!({}))
-            .map_err(|e| self.map_error(e))?;
-        let known = described["capabilities"]
-            .as_array()
-            .is_some_and(|all| all.iter().any(|c| c == "files.readBytes"));
+            .host_info(&self.file.machine_id)
+            .map_err(|e| self.map_error(e))?
+            .supports("files.readBytes");
         self.bytes.set(Some(known));
         Ok(known)
     }

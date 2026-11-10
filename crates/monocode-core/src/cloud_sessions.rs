@@ -421,6 +421,14 @@ pub trait Host: Send + Sync {
         progress: &mut dyn FnMut(&str),
     ) -> Result<(), String>;
     fn request(&self, machine_id: &str, method: &str, params: Value) -> Result<Value, String>;
+    /// Flavor, version and capabilities of the machine's Host. The default asks the Host
+    /// (`environment.describe`); [`Connections`] answers from its cache once it has one.
+    fn host_info(&self, machine_id: &str) -> Result<crate::remote::host_info::HostInfo, String> {
+        let described = self.request(machine_id, "environment.describe", serde_json::json!({}))?;
+        Ok(crate::remote::host_info::HostInfo::from_descriptor(
+            &described,
+        ))
+    }
     fn disconnect(&self, machine_id: &str) -> Result<(), String>;
 }
 
@@ -456,6 +464,12 @@ impl Host for Arc<Connections> {
     }
     fn request(&self, machine_id: &str, method: &str, params: Value) -> Result<Value, String> {
         Connections::request(self, machine_id, method, params)
+    }
+    fn host_info(&self, machine_id: &str) -> Result<crate::remote::host_info::HostInfo, String> {
+        match Connections::host_info(self, machine_id) {
+            Some(info) => Ok(info),
+            None => self.describe_host(machine_id),
+        }
     }
     fn disconnect(&self, machine_id: &str) -> Result<(), String> {
         Connections::disconnect(self, machine_id)
