@@ -14,11 +14,13 @@ fn conversation(cx: &mut TestAppContext) -> Entity<Conversation> {
             let mut view = Conversation::new(summary, Arc::new(Mutex::new(store)), cx);
             view.loaded = true;
             view.remote_state.online = true;
-            view.remote_state.capabilities =
-                ["sessions.draft", "sessions.plan", "attachments.upload"]
+            view.remote_state.host = monocode_core::remote::host_info::HostInfo {
+                capabilities: ["sessions.draft", "sessions.plan", "attachments.upload"]
                     .into_iter()
                     .map(str::to_owned)
-                    .collect();
+                    .collect(),
+                ..Default::default()
+            };
             view.input.update(cx, |input, cx| {
                 input.set_text("Keep this next message".into(), cx)
             });
@@ -64,7 +66,7 @@ fn remote_capability_and_command_guards_keep_composer_and_attachments(cx: &mut T
     let view = conversation(cx);
     cx.update(|cx| {
         view.update(cx, |view, cx| {
-            view.remote_state.capabilities.clear();
+            view.remote_state.host = Default::default();
             view.attachments = vec![PathBuf::from("/home/me/design.png")];
             assert!(view.remote_send_guard(cx));
             assert!(view.status.contains("attachments"));
@@ -2058,7 +2060,7 @@ fn a_blocked_head_message_pauses_the_queue_with_a_retry(cx: &mut TestAppContext)
         .update(cx, |view, _, cx| {
             view.cloud_stopped = false;
             view.remote_state.online = true;
-            view.remote_state.capabilities.clear();
+            view.remote_state.host = Default::default();
             view.attachments = vec![PathBuf::from("/tmp/a.png")];
             view.input
                 .update(cx, |input, cx| input.set_text("see this".into(), cx));
