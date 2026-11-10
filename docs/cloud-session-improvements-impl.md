@@ -1500,7 +1500,7 @@ ticket, after review and after merge.
 | F2-3 | 3 | todo | - | |
 | F2-4 | 3 | todo | - | |
 | F2-5 | 3 | todo | - | |
-| F3-3h | 4 | in progress | csi-f3-3h | |
+| F3-3h | 4 | merged | csi-f3-3h | merge c7113999. Opus review x3 fixed: tar unpacker hardened, fresh unpack per apply, async unpack, secrets scrub (single pass), child env allowlist MONOPTAH_KIT_*, kit.health via temp CLAUDE_CONFIG_DIR in own process group with hard timeout (signInNeeded vs failed; sign-in state not observable, D12), rollback + crash recovery, leases vs prune. Result field kitServers (app side must use it). No claude mcp list --mcp-config (2.1.322 has no such flag). |
 | F3-5h | 4 | skipped: dropped by user decision D12 | - | no OAuth sign-in merge on the Host |
 | F4-2h | 4 | in progress | csi-f4-2h | |
 | HR3 | 4 | todo | - | release: stop and ask |
