@@ -103,8 +103,8 @@ pub(crate) struct CloudCreate {
     pub machine: Option<String>,
     /// The composer text, queued as the first prompt.
     pub prompt: Option<String>,
-    /// Copy the global Claude setup to the new workspace. Read by the "Claude setup" start
-    /// step (F3-4); nothing sends it yet.
+    /// Copy the global Claude setup to the new workspace. `false` is recorded on the start
+    /// (`StartRecord::kit_off`) before it runs, so the "Claude setup" step sends nothing.
     pub kit: bool,
     /// Which press asked; the answer only applies to the draft that is still waiting for it.
     pub request_id: u64,

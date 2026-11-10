@@ -21,8 +21,8 @@ enum Picked {
     Started {
         summary: Session,
         record: StartRecord,
-        /// Copy the global Claude setup to the workspace. Read by the "Claude setup" start
-        /// step (F3-4); nothing sends it yet.
+        /// Copy the global Claude setup to the workspace. `false` was already recorded on the
+        /// start (`StartRecord::kit_off`) when the session was created.
         #[allow(dead_code)]
         kit: bool,
     },
