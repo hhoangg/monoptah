@@ -1488,9 +1488,9 @@ ticket, after review and after merge.
 | F3-2 | 2 | merged | csi-f3-2 | merge 290dd55f. Opus review x2 fixed: Create re-checks kit pref (D11), project-scoped items follow their project (not frozen), sandbox scan, cache, cap warning, Refresh. Flag cloudKitEnabled off. OPEN DESIGN QUESTION for the user: project-scoped secret-bearing servers (mcp:local:*) are always on and cannot be excluded individually (only by turning the kit off); notice does not say so. Known Low: Settings Refresh does not invalidate KitCache (30 s); target.kit parsed but unused until F3-4; Cloud page not searchable. |
 | F3-2b | 2 | todo | - | D12 follow-up: update the one-time notice constant and UI/default wording that say sign-ins are copied; remove the signed-in/not-signed-in distinction in kit/kit_prefs; after F3-1b |
 | F4-L | 2 | in progress | csi-f4-l-a | L, sub-PRs: part A = sub-PR 1+2 (store/location types, runtime selection + row append); part B = sub-PR 3+4 (sidebar/UI, single-writer guards, rewind) |
-| H3 | 3 | todo | - | |
+| H3 | 3 | in progress | csi-h3 | |
 | F2-3h | 3 | todo | - | |
-| F2-4h | 3 | todo | - | |
+| F2-4h | 3 | in progress | csi-f2-4h | |
 | F2-5h | 3 | todo | - | |
 | HR2 | 3 | todo | - | release: stop and ask |
 | F2-3 | 3 | todo | - | |
