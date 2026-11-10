@@ -1146,7 +1146,10 @@ fn a_codespace_has_a_web_url_and_a_sandbox_has_none() {
     assert_eq!(url.as_deref(), Ok("https://octo-abc.github.dev"));
     assert!(none.contains("sandbox"), "{none}");
     // Only the read of the URL: nothing woke the workspace.
-    assert_eq!(gh.calls(), vec!["api user/codespaces/octo-abc --jq .web_url"]);
+    assert_eq!(
+        gh.calls(),
+        vec!["api user/codespaces/octo-abc --jq .web_url"]
+    );
     assert_eq!(host.log(), Vec::<String>::new());
 }
 

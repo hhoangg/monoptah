@@ -616,11 +616,6 @@ pub(super) fn delete_note(groups: &[CodespaceGroup]) -> String {
     )
 }
 
-/// What the File and Git panels say while a cloud session is active.
-pub(super) fn banner_text(cloud: &CloudRef) -> String {
-    format!("Cloud files - {} {}", cloud.noun(), cloud.name)
-}
-
 /// `ssh -t <id>@sbx_cloud <devcontainer exec ... bash -l>`: an interactive shell in a
 /// sandbox's container (a sandbox without a devcontainer: `cd <workspace> && bash -l`). The
 /// remote command is one word, as the start flow sends it.
@@ -1125,19 +1120,142 @@ impl Shell {
         cx.notify();
     }
 
-    /// While a cloud session is in view the File and Git panels still show the
-    /// local project: say so, and keep git writes off it.
-    pub(super) fn sync_cloud_panel(&self, cx: &mut Context<Self>) {
-        let cloud = if self.mono_active(cx) {
-            None
-        } else {
-            self.active_cloud()
+    /// What the File and Git panels are bound to: the workspace of the cloud session in view
+    /// (default), its local checkout when the user switched the panels to Local, or the local
+    /// project. Pure reads: it never touches a workspace.
+    pub(super) fn panel_root(&self, cx: &App) -> crate::panel_root::PanelRoot {
+        use crate::panel_root::{ActiveSession, PanelMode, resolve};
+        let id = self
+            .workspace
+            .active
+            .map(|pane| self.workspace.session_for_pane(pane));
+        let mode = id
+            .and_then(|id| self.panel_modes.get(&id).copied())
+            .unwrap_or(PanelMode::Cloud);
+        let mark = id.and_then(|id| self.cloud_marks.get(&id));
+        let live = id.and_then(|id| self.sessions.get(&id)).map(|v| v.read(cx));
+        // A cloud session without a live view still gets its cloud root, from its summary.
+        let facts = match (id, live) {
+            (_, Some(view)) => Some((
+                view.summary.cwd.as_str(),
+                view.settings.worktree_cwd.as_deref(),
+            )),
+            (Some(id), None) if mark.is_some() => self
+                .session_summaries
+                .get(&id)
+                .map(|summary| (summary.cwd.as_str(), None)),
+            _ => None,
         };
+        let active = facts.map(|(cwd, worktree_cwd)| ActiveSession {
+            cwd,
+            worktree_cwd,
+            cloud: mark.map(|mark| (mark.cloud(), mark.local_project.as_str())),
+        });
+        resolve(active, mode, self.mono_active(cx), self.working_copy())
+    }
+
+    /// Switches the panels of the session in view between its cloud workspace and its local
+    /// checkout. The choice is per session and lives in memory.
+    pub(super) fn set_panel_mode(
+        &mut self,
+        mode: crate::panel_root::PanelMode,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self
+            .workspace
+            .active
+            .map(|pane| self.workspace.session_for_pane(pane))
+        else {
+            return;
+        };
+        if self.panel_modes.insert(id, mode).unwrap_or_default() != mode {
+            self.sync_git(cx);
+            cx.notify();
+        }
+    }
+
+    /// Whether the app has a live connection to the workspace of the session in view. A
+    /// session without a live view is Not connected. Never wakes anything.
+    fn panel_link(&self, cx: &App) -> crate::panel_root::Link {
+        let id = self
+            .workspace
+            .active
+            .map(|pane| self.workspace.session_for_pane(pane));
+        id.and_then(|id| self.sessions.get(&id))
+            .map_or(crate::panel_root::Link::NotConnected, |view| {
+                view.read(cx).panel_link()
+            })
+    }
+
+    /// The Connect action of the connection strip. It is the Reconnect button of the session in
+    /// view, a user action: the only way the panels ever wake a workspace.
+    pub(super) fn connect_panel_workspace(&self, cx: &mut Context<Self>) {
+        let id = self
+            .workspace
+            .active
+            .map(|pane| self.workspace.session_for_pane(pane));
+        if let Some(view) = id.and_then(|id| self.sessions.get(&id)).cloned() {
+            view.update(cx, |view, cx| {
+                view.reconnect_cloud(cx);
+            });
+        }
+    }
+
+    /// Whether any session in the workspace of the panels has a turn running. The app-side half
+    /// of the "not while the agent works" rule, see `git_gate::turn_running`.
+    fn workspace_turn_running(&self, cloud: &CloudRef, cx: &App) -> bool {
+        self.cloud_marks.iter().any(|(id, mark)| {
+            mark.cloud() == *cloud
+                && self.session_summaries.contains_key(id)
+                && self.session_metadata(*id, cx).busy
+        })
+    }
+
+    /// Opens the codespace of the panels in the browser (VS Code for the web). The URL is read
+    /// on a worker; a failure lands in the file-error notice.
+    pub(super) fn open_panel_in_browser(&mut self, cx: &mut Context<Self>) {
+        let Some(cloud) = self.panel_root(cx).cloud().cloned() else {
+            return;
+        };
+        let service = self.cloud.clone();
+        let work = cx
+            .background_executor()
+            .spawn(async move { service.workspace_web_url(&cloud) });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(url) => cx.open_url(&url),
+                Err(error) => {
+                    this.notification_state
+                        .file_error
+                        .update(cx, |notice, cx| notice.set_message(Some(error), cx));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Runs every frame, from the shell's render: binds the panels to the resolved root, draws the
+    /// cloud banner, switch and connection strip, and tells the git gate what the panels show.
+    /// Nothing here may wake a workspace: it only reads cached state.
+    pub(super) fn sync_cloud_panel(&self, cx: &mut Context<Self>) {
+        let root = self.panel_root(cx);
+        // A cloud session's root can change without the session changing (the Local switch, a
+        // pending workspace that became real).
+        if root.cloud().is_some() && self.git.read(cx).project() != root.project() {
+            let project = root.project().to_owned();
+            self.git.update(cx, |git, cx| git.set_project(project, cx));
+        }
+        let running = root
+            .cloud()
+            .is_some_and(|cloud| self.workspace_turn_running(cloud, cx));
+        let chrome = crate::panel_root::Chrome::of(&root, self.panel_link(cx));
         self.sync_codespace_pane(cx);
-        let flipped = crate::git_gate::set(cloud.as_ref().map(CloudRef::key));
+        let flipped = crate::git_gate::set(crate::git_gate::Gate::of(&root, running));
         if let Some(panel) = &self.right_panel {
             panel.update(cx, |panel, cx| {
-                panel.set_cloud_banner(cloud.as_ref().map(banner_text), cx);
+                panel.set_cloud_chrome(chrome, cx);
                 if flipped {
                     panel
                         .changes
@@ -1153,6 +1271,7 @@ impl Shell {
     }
 
     /// The workspace of the active cloud session, when one is in view.
+    #[cfg(test)]
     pub(super) fn active_cloud(&self) -> Option<CloudRef> {
         let id = self.workspace.active?;
         self.cloud_marks.get(&id).map(CloudMark::cloud)

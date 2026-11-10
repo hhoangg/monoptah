@@ -2123,7 +2123,7 @@ mod tests {
             pane.update(cx, |pane, cx| pane.diff_event(0, &event, cx));
             cx.run_until_parked();
         };
-        crate::git_gate::set(Some("octo-abc".into()));
+        crate::git_gate::set(crate::git_gate::Gate::local_of("octo-abc"));
         discard("a.txt", cx);
         assert_eq!(
             std::fs::read_to_string(repo.0.join("a.txt")).unwrap(),
@@ -2131,7 +2131,7 @@ mod tests {
             "the local file must survive"
         );
         // Control: with the gate open the same event does discard.
-        crate::git_gate::set(None);
+        crate::git_gate::set(crate::git_gate::Gate::default());
         discard("b.txt", cx);
         assert_eq!(
             std::fs::read_to_string(repo.0.join("b.txt")).unwrap(),

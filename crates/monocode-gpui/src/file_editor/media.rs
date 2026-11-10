@@ -459,6 +459,8 @@ impl gpui::Render for MediaPreview {
                 )
                 .into_any_element()
         } else if self.failed {
+            // Opening or revealing a file on another machine means nothing here.
+            let remote = monocode_core::files::remote::is_remote(std::path::Path::new(&self.path));
             div()
                 .flex_1()
                 .flex()
@@ -488,46 +490,50 @@ impl gpui::Render for MediaPreview {
                                 .child("Retry")
                                 .on_click(cx.listener(|_, _, _, cx| cx.emit(MediaEvent::Retry))),
                         )
-                        .child(
-                            div()
-                                .id("open-video-externally")
-                                .role(Role::Button)
-                                .aria_label("Open externally")
-                                .px_3()
-                                .py_1()
-                                .rounded_md()
-                                .bg(content(0.1))
-                                .child("Open externally")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    cx.open_url(&format!(
-                                        "file://{}",
-                                        this.path
-                                            .replace('%', "%25")
-                                            .replace(' ', "%20")
-                                            .replace('#', "%23")
-                                            .replace('?', "%3F")
-                                    ))
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id("reveal-video")
-                                .role(Role::Button)
-                                .aria_label("Reveal")
-                                .px_3()
-                                .py_1()
-                                .rounded_md()
-                                .bg(content(0.1))
-                                .child("Reveal")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    let path = PathBuf::from(&this.path);
-                                    cx.background_executor()
-                                        .spawn(async move {
-                                            let _ = monocode_core::files::reveal_path(&path);
-                                        })
-                                        .detach();
-                                })),
-                        )
+                        .when(!remote, |d| {
+                            d.child(
+                                div()
+                                    .id("open-video-externally")
+                                    .role(Role::Button)
+                                    .aria_label("Open externally")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(content(0.1))
+                                    .child("Open externally")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        cx.open_url(&format!(
+                                            "file://{}",
+                                            this.path
+                                                .replace('%', "%25")
+                                                .replace(' ', "%20")
+                                                .replace('#', "%23")
+                                                .replace('?', "%3F")
+                                        ))
+                                    })),
+                            )
+                        })
+                        .when(!remote, |d| {
+                            d.child(
+                                div()
+                                    .id("reveal-video")
+                                    .role(Role::Button)
+                                    .aria_label("Reveal")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(content(0.1))
+                                    .child("Reveal")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let path = PathBuf::from(&this.path);
+                                        cx.background_executor()
+                                            .spawn(async move {
+                                                let _ = monocode_core::files::reveal_path(&path);
+                                            })
+                                            .detach();
+                                    })),
+                            )
+                        })
                         .child(
                             div()
                                 .id("copy-video-path")

@@ -6,6 +6,7 @@ use crate::{
     explorer::Explorer,
     git_status::{GitChanged, ProjectGit},
     history::History,
+    panel_root::{Chrome, Link, PanelMode},
     project_tabs::{TabLabel, TabReveal, tab_button},
     theme::*,
 };
@@ -97,6 +98,10 @@ impl RightTab {
 pub(crate) enum PanelEvent {
     Tab(RightTab),
     Reordered(Vec<RightTab>),
+    /// The Cloud / Local switch of a cloud session's panels.
+    Mode(PanelMode),
+    /// The connection strip's Connect action (a user action that may wake the workspace).
+    Connect,
 }
 
 /// Tool headers share the open-file tab bar's height and bottom rule.
@@ -267,8 +272,9 @@ pub(crate) struct RightPanel {
     /// Classic reserves the title bar's height; rounded content starts at
     /// the card's top edge, below the window-wide title bar.
     top_inset: f32,
-    /// Set while a cloud session is in view: what the panel shows is local.
-    cloud_banner: Option<String>,
+    /// Set while a cloud session is in view: which side the panels show, the switch and the
+    /// connection strip.
+    cloud: Option<Chrome>,
     /// Name of the Codespace tab: `Codespace` or `Sandbox`, by the backend of the start shown.
     codespace_title: &'static str,
     tab_width: f32,
@@ -319,7 +325,7 @@ impl RightPanel {
             sidebar_tab: None,
             terminal_tab: false,
             top_inset: 0.,
-            cloud_banner: None,
+            cloud: None,
             codespace_title: RightTab::Codespace.label(),
             tab_width: tabs_width(3),
             drag: None,
@@ -329,9 +335,12 @@ impl RightPanel {
             _subscriptions: subscriptions,
         }
     }
-    pub(crate) fn set_cloud_banner(&mut self, banner: Option<String>, cx: &mut Context<Self>) {
-        if self.cloud_banner != banner {
-            self.cloud_banner = banner;
+    pub(crate) fn set_cloud_chrome(&mut self, chrome: Option<Chrome>, cx: &mut Context<Self>) {
+        if self.cloud != chrome {
+            let browser = chrome.as_ref().is_some_and(|chrome| chrome.browser);
+            self.cloud = chrome;
+            self.explorer
+                .update(cx, |explorer, cx| explorer.set_offers_browser(browser, cx));
             cx.notify();
         }
     }
@@ -347,7 +356,11 @@ impl RightPanel {
     }
     #[cfg(test)]
     pub(crate) fn cloud_banner(&self) -> Option<&str> {
-        self.cloud_banner.as_deref()
+        self.cloud.as_ref().map(|chrome| chrome.banner.as_str())
+    }
+    #[cfg(test)]
+    pub(crate) fn cloud_chrome(&self) -> Option<&Chrome> {
+        self.cloud.as_ref()
     }
     pub(crate) fn tab(&self) -> RightTab {
         self.tab
@@ -629,9 +642,119 @@ impl RightPanel {
     }
 }
 
+impl RightPanel {
+    /// The banner with the Cloud | Local switch, and under it the connection strip.
+    fn cloud_header(&self, chrome: &Chrome, cx: &mut Context<Self>) -> AnyElement {
+        let choice = |id: &'static str, label: &'static str, mode: PanelMode| {
+            let on = chrome.mode == mode;
+            div()
+                .id(id)
+                .role(Role::Button)
+                .aria_label(format!("Show {label} files"))
+                .px_2()
+                .rounded_md()
+                .text_size(px(11.))
+                .line_height(px(18.))
+                .cursor_pointer()
+                .when(on, |d| d.bg(selection()).text_color(content(1.)))
+                .when(!on, |d| {
+                    d.text_color(content(0.6))
+                        .hover(|s| s.bg(content(0.1)))
+                        .on_click(cx.listener(move |_, _, _, cx| cx.emit(PanelEvent::Mode(mode))))
+                })
+                .child(label)
+        };
+        let strip = chrome.link.map(|link| {
+            let dot = match link {
+                Link::Connected => 0x6ee7b7,
+                Link::NotConnected => RED_400,
+                Link::Starting => AMBER_400,
+            };
+            div()
+                .id("cloud-connection-strip")
+                .role(Role::Status)
+                .aria_label(link.label())
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(div().size(px(6.)).rounded_full().bg(gpui::rgb(dot)))
+                .child(link.label())
+                .when(link == Link::NotConnected, |d| {
+                    d.child(
+                        div()
+                            .id("cloud-connect")
+                            .role(Role::Button)
+                            .aria_label("Connect")
+                            .px_2()
+                            .rounded_md()
+                            .bg(content(0.1))
+                            .text_color(content(1.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(content(0.16)))
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(PanelEvent::Connect)))
+                            .child("Connect"),
+                    )
+                })
+        });
+        div()
+            .id("cloud-files-banner")
+            .role(Role::Status)
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .px_3()
+            .py(px(6.))
+            .border_b_1()
+            .border_color(stroke())
+            .text_size(px(11.))
+            .line_height(px(15.))
+            .text_color(content(0.6))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(div().min_w_0().child(chrome.banner.clone()))
+                    .child(
+                        div()
+                            .id("cloud-panel-mode")
+                            .role(Role::Group)
+                            .aria_label("Panel mode")
+                            .flex()
+                            .flex_shrink_0()
+                            .gap(px(2.))
+                            .child(choice("panel-mode-cloud", "Cloud", PanelMode::Cloud))
+                            .child(choice("panel-mode-local", "Local", PanelMode::Local)),
+                    ),
+            )
+            .children(strip)
+            .into_any_element()
+    }
+}
+
 impl Render for RightPanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let placeholder = self.cloud.as_ref().is_some_and(|chrome| chrome.placeholder)
+            && matches!(
+                self.tab,
+                RightTab::Files | RightTab::Changes | RightTab::Graph
+            );
         let pane: AnyElement = match self.tab {
+            _ if placeholder => div()
+                .id("cloud-files-placeholder")
+                .role(Role::Status)
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(12.))
+                .text_color(content(0.5))
+                .child("Workspace is starting")
+                .into_any_element(),
             RightTab::Files => self
                 .explorer
                 .clone()
@@ -674,20 +797,11 @@ impl Render for RightPanel {
                 )
             })
             .when(self.tab != RightTab::Terminal, |d| {
-                d.children(self.cloud_banner.clone().map(|text| {
-                    div()
-                        .id("cloud-files-banner")
-                        .role(Role::Status)
-                        .flex_shrink_0()
-                        .px_3()
-                        .py(px(6.))
-                        .border_b_1()
-                        .border_color(stroke())
-                        .text_size(px(11.))
-                        .line_height(px(15.))
-                        .text_color(content(0.6))
-                        .child(text)
-                }))
+                d.children(
+                    self.cloud
+                        .clone()
+                        .map(|chrome| self.cloud_header(&chrome, cx)),
+                )
             })
             .child(pane)
     }

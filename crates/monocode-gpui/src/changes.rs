@@ -466,6 +466,17 @@ impl Changes {
         cx.background_executor()
             .spawn(async move { matches!(answer.await, Ok(0)) })
     }
+    /// Whether a discard may start. A cloud workspace refuses while a turn runs there (the
+    /// agent may be editing these files); the reason is shown as an alert.
+    fn discard_allowed(window: &mut Window, cx: &mut App) -> bool {
+        match crate::git_gate::decide(crate::git_gate::Op::Discard) {
+            crate::git_gate::Decision::Refuse(reason) => {
+                Self::fail(reason.into(), window, cx);
+                false
+            }
+            _ => true,
+        }
+    }
     /// Runs `work` against the checkout with `busy` held, then rereads.
     fn run_git(
         &mut self,
@@ -525,6 +536,9 @@ impl Changes {
             start(self, window, cx);
             return;
         }
+        if !Self::discard_allowed(window, cx) {
+            return;
+        }
         let name = basename(&file.relative).to_owned();
         let untracked = file.status == "untracked";
         let ask = Self::confirm(
@@ -568,6 +582,9 @@ impl Changes {
         };
         if action != FileAction::Discard {
             start(self, window, cx);
+            return;
+        }
+        if !Self::discard_allowed(window, cx) {
             return;
         }
         let index = self.index(cx);
@@ -757,6 +774,12 @@ impl Changes {
                 "Amend a commit that is already pushed? Monoptah cannot push the result. You will need a force push from the terminal.".into(),
                 "Amend",
             ));
+        }
+        // On a cloud workspace the agent may be committing too: ask first.
+        if let crate::git_gate::Decision::Confirm { message, ok } =
+            crate::git_gate::decide(crate::git_gate::Op::Commit)
+        {
+            questions.push((message.to_owned(), ok));
         }
         self.menu = None;
         cx.spawn_in(window, async move |this, cx| {
@@ -2022,6 +2045,59 @@ mod tests {
                 assert_eq!(request, changes.pr_request);
             })
             .unwrap();
+    }
+    /// A discard in a cloud workspace is refused with an alert while a turn runs there, and
+    /// asks the usual question otherwise.
+    #[gpui::test]
+    fn discard_is_refused_while_a_turn_runs_in_the_cloud_workspace(cx: &mut gpui::TestAppContext) {
+        use crate::git_gate::{Gate, set};
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                let git = cx.new(|cx| ProjectGit::new("~".into(), cx));
+                cx.new(|cx| Changes::new(git, window, cx))
+            })
+            .unwrap()
+        });
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        set(Gate::remote_of("octo-abc", true));
+        window
+            .update(visual, |changes, window, cx| {
+                changes.run_file(f("a.rs", "modified"), FileAction::Discard, window, cx);
+            })
+            .unwrap();
+        let (message, _) = visual.pending_prompt().expect("an alert");
+        assert!(message.contains("agent is working"), "{message}");
+        visual.simulate_prompt_answer("OK");
+        visual.run_until_parked();
+        assert!(!visual.has_pending_prompt());
+        // Discard all is refused the same way.
+        window
+            .update(visual, |changes, window, cx| {
+                changes.run_all(FileAction::Discard, window, cx)
+            })
+            .unwrap();
+        let (message, _) = visual.pending_prompt().expect("an alert");
+        assert!(message.contains("agent is working"), "{message}");
+        visual.simulate_prompt_answer("OK");
+        visual.run_until_parked();
+        window
+            .update(visual, |changes, _, _| assert!(changes.busy.is_none()))
+            .unwrap();
+
+        set(Gate::remote_of("octo-abc", false));
+        window
+            .update(visual, |changes, window, cx| {
+                changes.run_file(f("a.rs", "modified"), FileAction::Discard, window, cx)
+            })
+            .unwrap();
+        let (message, _) = visual.pending_prompt().expect("the confirmation");
+        assert!(message.starts_with("Discard changes in a.rs?"), "{message}");
+        visual.simulate_prompt_answer("Cancel");
+        visual.run_until_parked();
+        window
+            .update(visual, |changes, _, _| assert!(changes.busy.is_none()))
+            .unwrap();
+        set(Gate::default());
     }
     fn f(relative: &str, status: &str) -> ChangedFile {
         ChangedFile {

@@ -355,7 +355,7 @@ fn hunk_actions_are_refused_while_a_cloud_session_is_in_view(cx: &mut TestAppCon
         .unwrap()
     });
     cx.run_until_parked();
-    crate::git_gate::set(Some("octo-abc".into()));
+    crate::git_gate::set(crate::git_gate::Gate::local_of("octo-abc"));
     window
         .update(cx, |editor, _, cx| {
             editor.apply_change(true, cx);
@@ -365,6 +365,6 @@ fn hunk_actions_are_refused_while_a_cloud_session_is_in_view(cx: &mut TestAppCon
             assert_eq!(editor.error.as_deref(), Some(crate::git_gate::REFUSED));
         })
         .unwrap();
-    crate::git_gate::set(None);
+    crate::git_gate::set(crate::git_gate::Gate::default());
     let _ = std::fs::remove_file(&path);
 }
