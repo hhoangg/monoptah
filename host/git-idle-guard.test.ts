@@ -77,7 +77,7 @@ function setup() {
     await vi.waitFor(() => expect(turns).toHaveLength(1));
     return () => turns.forEach((finish) => finish());
   };
-  return { home, run, commands, startSession };
+  return { home, run, commands, startSession, engine, project };
 }
 
 const dirty = (home: string) => writeFileSync(join(home, "f.txt"), "two\n");
@@ -119,4 +119,39 @@ it("leaves other git commands on their old timeout", async () => {
   const { home, commands } = setup();
   await commands.run("git_head_message", { cwd: home });
   expect(calls.find((call) => call.args.includes("log"))?.timeout).toBe(30_000);
+});
+
+it("names the action in progress in busy errors", async () => {
+  const { home, commands, engine, project } = setup();
+  let release = () => {};
+  const holding = engine.withIdleProject(
+    project.id,
+    () => new Promise<void>((resolve) => (release = resolve)),
+    "stashing changes",
+  );
+  await expect(commands.run("git_discard_all", { cwd: home })).rejects.toThrow(
+    "A stash is already in progress",
+  );
+  expect(() =>
+    engine.command({
+      type: "create",
+      commandId: "busy",
+      projectId: project.id,
+      harness: "codex",
+      model: "codex:test",
+      runtimeMode: "supervised",
+    }),
+  ).toThrow("Wait for the stash to finish");
+  release();
+  await holding;
+  const discarding = engine.withIdleProject(
+    project.id,
+    () => new Promise<void>((resolve) => (release = resolve)),
+    "discarding changes",
+  );
+  await expect(engine.withIdleProject(project.id, async () => {})).rejects.toThrow(
+    "A discard is already in progress",
+  );
+  release();
+  await discarding;
 });

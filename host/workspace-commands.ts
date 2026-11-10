@@ -5,6 +5,7 @@ import {
   open,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   realpath,
   rename,
@@ -111,6 +112,7 @@ export class WorkspaceCommands {
   private roots = new Map<string, { at: number; roots: string[] }>();
   private rootsGeneration = 0;
   private readonly watches = new WorkspaceWatchHost();
+  private readonly writeLocks = new Map<string, Promise<void>>();
 
   /** Releases every change watcher (host shutdown). */
   close(): void {
@@ -438,13 +440,23 @@ export class WorkspaceCommands {
    * checked again, and the temp file is renamed over the target, so a reader
    * never sees a partial file.
    *
-   * Unavoidable: another process can still modify the file between the second
-   * hash check and the rename (a few microseconds; POSIX has no compare-and-
-   * swap rename). The window is far smaller than the one around the check alone.
+   * Idempotent: if the file already holds exactly the new content (a retry
+   * after a write whose reply was lost), the call succeeds without writing.
+   *
+   * Writes through this host to the same path are serialized by an in-process
+   * mutex. Unavoidable: an external process can still modify the file between
+   * the second hash check and the rename (a few microseconds; POSIX has no
+   * compare-and-swap rename). The window is far smaller than the one around
+   * the check alone.
    *
    * Symlinks: `locate` resolves the link, so the target is replaced and the
-   * link itself is kept. A link whose target is outside the workspace root
-   * that contains the link is refused. */
+   * link itself is kept. The resolved target must belong to the same
+   * registered project root as the requested path as written, so neither a
+   * link nor a linked directory can carry a write into another project or out
+   * of the workspace.
+   *
+   * Temp files left by a crash (`.<name>.monoptah-*.tmp`, older than 1 h) in
+   * the target directory are removed on each conditional write. */
   private async writeIfUnchanged(
     input: unknown,
     content: string,
@@ -455,25 +467,46 @@ export class WorkspaceCommands {
     const wanted = expected.toLowerCase();
     const { root, relative: rel } = await this.locate(input);
     const path = workspacePath(root, rel);
-    const link = await lstat(resolve(input as string)).catch(() => undefined);
-    if (link?.isSymbolicLink()) {
-      // The link must stay inside the root that holds the link itself.
-      const holder = await this.locate(dirname(resolve(input as string)));
-      if (holder.root !== root) throw new Error("Path is outside the workspace");
+    const requested = resolve(input as string);
+    for (const candidate of await this.allowedRoots()) {
+      const within = relative(candidate, requested);
+      if (within === "" || (!within.startsWith("..") && !isAbsolute(within))) {
+        if (candidate !== root) throw new Error("Path is outside the workspace");
+        break;
+      }
     }
+    const previous = this.writeLocks.get(path) ?? Promise.resolve();
+    const run = previous.then(() => this.writeLocked(path, content, wanted));
+    const tail = run.then(() => undefined, () => undefined);
+    this.writeLocks.set(path, tail);
+    try {
+      await run;
+    } finally {
+      if (this.writeLocks.get(path) === tail) this.writeLocks.delete(path);
+    }
+  }
+
+  private async writeLocked(path: string, content: string, wanted: string) {
     const info = await stat(path).catch(() => undefined);
     if (!info) throw new Error("File changed on the host");
     if (info.isDirectory()) throw new Error("Cannot save text to a directory.");
     if (!info.isFile()) throw new Error("Not a file");
-    const unchanged = async () => {
+    const next = createHash("sha256").update(content, "utf8").digest("hex");
+    // "match": still the expected content; "done": already the new content.
+    const state = async () => {
       const size = (await stat(path)).size;
       if (size > MAX_TEXT_FILE)
         throw new Error(
           `File is too large to save (maximum ${MAX_TEXT_FILE / 1024 / 1024} MB).`,
         );
-      return createHash("sha256").update(await readFile(path)).digest("hex") === wanted;
+      const current = createHash("sha256").update(await readFile(path)).digest("hex");
+      if (current === next) return "done";
+      return current === wanted ? "match" : "changed";
     };
-    if (!(await unchanged())) throw new Error("File changed on the host");
+    const first = await state();
+    if (first === "done") return;
+    if (first !== "match") throw new Error("File changed on the host");
+    await this.sweepTemporaries(path);
     const temporary = join(
       dirname(path),
       `.${basename(path)}.monoptah-${process.pid}-${randomBytes(6).toString("hex")}.tmp`,
@@ -489,11 +522,29 @@ export class WorkspaceCommands {
       } finally {
         await handle.close();
       }
-      if (!(await unchanged())) throw new Error("File changed on the host");
+      const second = await state();
+      if (second === "changed" || second === "done") {
+        await rm(temporary, { force: true });
+        if (second === "changed") throw new Error("File changed on the host");
+        return;
+      }
       await rename(temporary, path);
     } catch (reason) {
       await rm(temporary, { force: true });
       throw reason;
+    }
+  }
+
+  /** Removes `.<name>.monoptah-*.tmp` files older than 1 h left by a crash. */
+  private async sweepTemporaries(path: string): Promise<void> {
+    const prefix = `.${basename(path)}.monoptah-`;
+    const names = await readdir(dirname(path)).catch(() => [] as string[]);
+    for (const name of names) {
+      if (!name.startsWith(prefix) || !name.endsWith(".tmp")) continue;
+      const full = join(dirname(path), name);
+      const info = await lstat(full).catch(() => undefined);
+      if (info?.isFile() && Date.now() - info.mtimeMs > 60 * 60 * 1000)
+        await rm(full, { force: true });
     }
   }
 

@@ -243,8 +243,14 @@ export function parseCommand(input: unknown): HostCommand {
   throw new Error("Unsupported command");
 }
 
+const ACTION_LABELS: Record<string, string> = {
+  "discarding changes": "discard",
+  "stashing changes": "stash",
+};
+
 export class HostEngine {
-  private switchingProjects = new Set<string>();
+  /** Project id -> the action holding the checkout ("branch switch", "discard", ...). */
+  private switchingProjects = new Map<string, string>();
   private running = new Map<
     string,
     { runId: string; done: Promise<void>; cancelled: boolean; persistenceFailed: boolean }
@@ -302,8 +308,8 @@ export class HostEngine {
     action: () => Promise<T>,
     what = "switching branches",
   ): Promise<T> {
-    if (this.switchingProjects.has(projectId))
-      throw new Error("A branch switch is already in progress");
+    const busy = this.switchingProjects.get(projectId);
+    if (busy) throw new Error(`A ${busy} is already in progress`);
     if (
       this.store
         .summaries(projectId)
@@ -312,7 +318,7 @@ export class HostEngine {
       throw new Error(
         `Wait for running host sessions before ${what}`,
       );
-    this.switchingProjects.add(projectId);
+    this.switchingProjects.set(projectId, ACTION_LABELS[what] ?? "branch switch");
     try {
       return await action();
     } finally {
@@ -427,8 +433,8 @@ export class HostEngine {
       let value: HostSession;
       if (command.type === "create") {
         const project = this.store.project(command.projectId);
-        if (this.switchingProjects.has(project.id))
-          throw new Error("Wait for the branch switch to finish");
+        const busy = this.switchingProjects.get(project.id);
+        if (busy) throw new Error(`Wait for the ${busy} to finish`);
         this.provider(command.harness);
         const cwd = resolveHostWorktree(project.cwd, command.worktreeCwd);
         const now = Date.now();
@@ -455,11 +461,9 @@ export class HostEngine {
         };
       } else {
         value = this.store.session(command.sessionId);
-        if (
-          (command.type === "send" || command.type === "compact") &&
-          this.switchingProjects.has(value.projectId)
-        )
-          throw new Error("Wait for the branch switch to finish");
+        const busy = this.switchingProjects.get(value.projectId);
+        if ((command.type === "send" || command.type === "compact") && busy)
+          throw new Error(`Wait for the ${busy} to finish`);
         const provider = this.provider(value.session.harness);
         if (command.type === "configure") {
           if (value.status === "running")

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   chmodSync,
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -10,6 +11,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -99,14 +101,71 @@ it("rejects a malformed expected hash", async () => {
   await expect(write(file, "y", "nope")).rejects.toThrow("Invalid expected file hash");
 });
 
-it.runIf(posix)("preserves the file mode", async () => {
+it.runIf(posix)("preserves the file mode even when the umask would strip it", async () => {
   const { project, write } = fixture();
   const file = join(project, "run.sh");
   writeFileSync(file, "#!/bin/sh\n");
-  chmodSync(file, 0o750);
-  await write(file, "#!/bin/sh\necho hi\n", sha("#!/bin/sh\n"));
-  expect(statSync(file).mode & 0o7777).toBe(0o750);
+  chmodSync(file, 0o666);
+  const before = process.umask(0o077);
+  try {
+    await write(file, "#!/bin/sh\necho hi\n", sha("#!/bin/sh\n"));
+  } finally {
+    process.umask(before);
+  }
+  expect(statSync(file).mode & 0o7777).toBe(0o666);
   expect(readFileSync(file, "utf8")).toBe("#!/bin/sh\necho hi\n");
+});
+
+it("treats a retry of a write that already landed as success", async () => {
+  const { project, write } = fixture();
+  const file = join(project, "a.txt");
+  writeFileSync(file, "before\n");
+  await write(file, "after\n", sha("before\n"));
+  await write(file, "after\n", sha("before\n"));
+  expect(readFileSync(file, "utf8")).toBe("after\n");
+  expect(readdirSync(project)).toEqual(["a.txt"]);
+});
+
+it("treats the new content appearing during the write as success", async () => {
+  const { project, write } = fixture();
+  const file = join(project, "a.txt");
+  writeFileSync(file, "before\n");
+  hooks.afterOpen = () => writeFileSync(file, "after\n");
+  await write(file, "after\n", sha("before\n"));
+  expect(readFileSync(file, "utf8")).toBe("after\n");
+  expect(readdirSync(project)).toEqual(["a.txt"]);
+});
+
+it("lets only one of two interleaved writes with the same hash succeed", async () => {
+  const { project, write } = fixture();
+  const file = join(project, "a.txt");
+  writeFileSync(file, "base\n");
+  const results = await Promise.allSettled([
+    write(file, "one\n", sha("base\n")),
+    write(file, "two\n", sha("base\n")),
+  ]);
+  expect(results.map((r) => r.status).sort()).toEqual(["fulfilled", "rejected"]);
+  const rejected = results.find((r) => r.status === "rejected") as PromiseRejectedResult;
+  expect(String(rejected.reason)).toContain("File changed on the host");
+  expect(["one\n", "two\n"]).toContain(readFileSync(file, "utf8"));
+  expect(readdirSync(project)).toEqual(["a.txt"]);
+});
+
+it("sweeps stale temp files of the same name and keeps fresh and unrelated ones", async () => {
+  const { project, write } = fixture();
+  const file = join(project, "a.txt");
+  writeFileSync(file, "x");
+  const stale = join(project, ".a.txt.monoptah-1-aa.tmp");
+  const fresh = join(project, ".a.txt.monoptah-2-bb.tmp");
+  const other = join(project, ".b.txt.monoptah-1-cc.tmp");
+  for (const f of [stale, fresh, other]) writeFileSync(f, "t");
+  const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+  utimesSync(stale, old, old);
+  utimesSync(other, old, old);
+  await write(file, "y", sha("x"));
+  expect(existsSync(stale)).toBe(false);
+  expect(existsSync(fresh)).toBe(true);
+  expect(existsSync(other)).toBe(true);
 });
 
 it.runIf(posix)("writes through a symlink whose target is inside the workspace", async () => {
@@ -145,6 +204,19 @@ it.runIf(posix)("refuses a symlink into another project", async () => {
     "Path is outside the workspace",
   );
   expect(readFileSync(join(other, "f.txt"), "utf8")).toBe("o\n");
+});
+
+it.runIf(posix)("refuses a linked directory that leads into another project", async () => {
+  const { home, project, write, store } = fixture();
+  const other = join(home, "other");
+  mkdirSync(join(other, "dir"), { recursive: true });
+  store.addProject(other, "other");
+  writeFileSync(join(other, "dir", "f.txt"), "o\n");
+  symlinkSync(join(other, "dir"), join(project, "shared"));
+  await expect(
+    write(join(project, "shared", "f.txt"), "x", sha("o\n")),
+  ).rejects.toThrow("Path is outside the workspace");
+  expect(readFileSync(join(other, "dir", "f.txt"), "utf8")).toBe("o\n");
 });
 
 it("refuses content over 1 MB", async () => {
