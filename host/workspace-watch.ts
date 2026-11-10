@@ -66,23 +66,33 @@ const identity = (path: string): string | undefined => {
   }
 };
 
-const identityAsync = async (path: string): Promise<string | undefined> => {
+/** File system calls used off the event loop; injectable so tests can hang them. */
+export type FsOps = {
+  realpath: (path: string) => Promise<string>;
+  stat: (path: string) => Promise<{ dev: number | bigint; ino: number | bigint }>;
+  readdir: (path: string) => Promise<Array<{ name: string; isDirectory(): boolean }>>;
+};
+const defaultOps: FsOps = {
+  realpath: (path) => realpath(path),
+  stat: (path) => stat(path),
+  readdir: (path) => readdir(path, { withFileTypes: true }),
+};
+
+const identityAsync = async (path: string, ops: FsOps): Promise<string | undefined> => {
   try {
-    const { dev, ino } = await stat(path);
+    const { dev, ino } = await ops.stat(path);
     return `${dev}:${ino}`;
   } catch {
     return undefined;
   }
 };
 
-type Wanted = WatchDir & { real?: string };
-
 class Watch {
   private handles = new Map<string, WatchHandle>();
   /** Live client-dir watches with the inode they were created on. */
   private dirKeys = new Map<string, WatchDir & { id?: string }>();
   /** What the client last asked for, kept even when a handle is lost. */
-  private wanted = new Map<string, Wanted>();
+  private wanted = new Map<string, WatchDir>();
   private gitWanted: string[] = [];
   private healing = false;
   private cooling = false;
@@ -92,8 +102,11 @@ class Watch {
   private refDirs = new Map<string, string | undefined>();
   private refRoots: string[] = [];
   private degraded = new Set<string>();
-  private refChain: Promise<void> = Promise.resolve();
-  private refQueued = false;
+  private refRunning?: Promise<void>;
+  private refAgain = false;
+  /** Bumped when a hung pass is abandoned; late passes check it before mutating. */
+  private gen = 0;
+  private refGen = 0;
   private pendingGit = false;
   private pendingDirs = new Set<string>();
   private overflow = false;
@@ -109,6 +122,7 @@ class Watch {
     readonly cwd: string,
     private readonly watchFn: WatchFn,
     private readonly expire: () => void,
+    private readonly ops: FsOps = defaultOps,
   ) {}
 
   async start(dirs: WatchDir[]) {
@@ -181,40 +195,57 @@ class Watch {
   }
 
   private syncAllRefs(): Promise<void> {
-    if (this.refQueued) return this.refChain;
-    this.refQueued = true;
-    this.refChain = this.refChain
-      .then(async () => {
-        this.refQueued = false;
-        if (this.closed) return;
-        const hits = new Set<string>();
-        const found: string[] = [];
-        for (const root of this.refRoots) await this.walkRefs(root, 0, hits, found);
-        if (this.closed) return;
-        // Phase 1: release watches on directories that are gone or were
-        // replaced, so stale entries never count toward the cap.
-        for (const [known, id] of [...this.refDirs]) {
-          if (!found.includes(known) || id !== (await identityAsync(known)))
-            this.drop(`ref:${known}`, false);
+    if (this.refRunning) {
+      this.refAgain = true;
+      return this.refRunning;
+    }
+    const gen = this.refGen;
+    const run: Promise<void> = this.refPass(gen)
+      .catch(() => undefined)
+      .finally(() => {
+        if (gen !== this.refGen) return;
+        this.refRunning = undefined;
+        if (this.refAgain && !this.closed) {
+          this.refAgain = false;
+          void this.syncAllRefs();
         }
-        // Phase 2: watch what is missing, up to the cap.
-        for (const dir of found) {
-          if (this.closed || this.refDirs.has(dir)) continue;
-          if (this.refDirs.size >= MAX_REF_DIRS) {
-            hits.add("cap");
-            break;
-          }
-          const id = await identityAsync(dir);
-          if (this.add(`ref:${dir}`, dir, () => this.gitChanged())) this.refDirs.set(dir, id);
-        }
-        // Report each degraded state once per episode, not on every sync.
-        let fresh = false;
-        for (const hit of hits) if (!this.degraded.has(hit)) fresh = true;
-        this.degraded = hits;
-        if (fresh && !this.closed) this.degrade();
-      })
-      .catch(() => undefined);
-    return this.refChain;
+      });
+    this.refRunning = run;
+    return run;
+  }
+
+  private async refPass(gen: number): Promise<void> {
+    const stale = () => this.closed || gen !== this.refGen;
+    const hits = new Set<string>();
+    const found: string[] = [];
+    for (const root of this.refRoots) await this.walkRefs(root, 0, hits, found, stale);
+    if (stale()) return;
+    // Phase 1: release watches on directories that are gone or were replaced,
+    // so stale entries never count toward the cap.
+    for (const [known, id] of [...this.refDirs]) {
+      const now = await identityAsync(known, this.ops);
+      if (stale()) return;
+      if (!found.includes(known) || id !== now) this.drop(`ref:${known}`, false);
+    }
+    // Phase 2: watch what is missing, up to the cap. Failures are quiet and
+    // recorded as degraded states, reported once per episode.
+    for (const dir of found) {
+      if (stale()) return;
+      if (this.refDirs.has(dir)) continue;
+      if (this.refDirs.size >= MAX_REF_DIRS) {
+        hits.add("cap");
+        break;
+      }
+      const id = await identityAsync(dir, this.ops);
+      if (stale()) return;
+      if (this.add(`ref:${dir}`, dir, () => this.gitChanged(), true)) this.refDirs.set(dir, id);
+      else hits.add(`add:${dir}`);
+    }
+    if (stale()) return;
+    let fresh = false;
+    for (const hit of hits) if (!this.degraded.has(hit)) fresh = true;
+    this.degraded = hits;
+    if (fresh) this.degrade();
   }
 
   /** Lists `dir` and its ref sub-directories (depth first, bounded depth). */
@@ -223,34 +254,40 @@ class Watch {
     depth: number,
     hits: Set<string>,
     found: string[],
+    stale: () => boolean,
   ): Promise<void> {
-    if (this.closed) return;
+    if (stale()) return;
     if (depth > MAX_REF_DEPTH) {
       hits.add("depth");
       return;
     }
-    const entries = await readdir(dir, { withFileTypes: true }).catch(() => undefined);
-    if (!entries) return;
+    const entries = await this.ops.readdir(dir).catch(() => undefined);
+    if (!entries || stale()) return;
     found.push(dir);
     for (const entry of entries)
-      if (entry.isDirectory()) await this.walkRefs(join(dir, entry.name), depth + 1, hits, found);
+      if (entry.isDirectory())
+        await this.walkRefs(join(dir, entry.name), depth + 1, hits, found, stale);
   }
 
   /** Replaces the watched client directories. A directory whose inode changed
    * since it was watched (removed and recreated) is watched again. */
   setDirs(dirs: WatchDir[]) {
     this.renew();
-    this.wanted = new Map(
-      dirs.map((dir) => {
-        let real: string | undefined;
-        try {
-          real = realpathSync.native(dir.path);
-        } catch {
-          // Healing keeps retrying while it does not resolve.
-        }
-        return [dir.rel, { ...dir, real }] as const;
-      }),
-    );
+    const wanted = new Map<string, WatchDir>();
+    for (const dir of dirs) {
+      // The caller passes canonical, confined paths. One that no longer
+      // resolves to itself was swapped (for example for a link): refuse it.
+      let canonical = false;
+      try {
+        canonical = realpathSync.native(dir.path) === dir.path;
+      } catch {
+        // Missing: kept as wanted, healing retries it.
+        canonical = true;
+      }
+      if (canonical) wanted.set(dir.rel, dir);
+      else this.degrade();
+    }
+    this.wanted = wanted;
     for (const [rel] of [...this.dirKeys])
       if (!this.wanted.has(rel)) this.drop(`dir:${rel}`, false);
     for (const [rel, dir] of this.wanted) this.watchDir(rel, dir, false);
@@ -302,6 +339,7 @@ class Watch {
 
   private async heal() {
     if (this.closed) return;
+    const gen = ++this.gen;
     this.healing = true;
     this.cooling = true;
     this.cooldown = setTimeout(() => {
@@ -310,47 +348,64 @@ class Watch {
       this.healIfAsked();
     }, HEAL_INTERVAL_MS);
     this.cooldown.unref?.();
-    const run = this.healPass()
+    const run = this.healPass(gen)
       .catch(() => undefined)
       .finally(() => {
+        if (gen !== this.gen) return;
         this.healing = false;
         this.healIfAsked();
       });
+    let timedOut = false;
     try {
       await Promise.race([
         run,
         new Promise<void>((resolve) => {
-          this.healTimer = setTimeout(resolve, HEAL_TIMEOUT_MS);
+          this.healTimer = setTimeout(() => {
+            timedOut = true;
+            resolve();
+          }, HEAL_TIMEOUT_MS);
           this.healTimer.unref?.();
         }),
       ]);
     } finally {
       clearTimeout(this.healTimer);
     }
+    if (timedOut && gen === this.gen && !this.closed) {
+      // A hung file system call: abandon this pass. When it finally settles it
+      // sees a newer generation and changes nothing.
+      this.gen++;
+      this.refGen++;
+      this.refRunning = undefined;
+      this.refAgain = false;
+      this.healing = false;
+      this.healIfAsked();
+    }
   }
 
   /** Restores watches that were lost and re-checks the live ones, without
-   * blocking the event loop. Every re-created watch is confined again. */
-  private async healPass() {
+   * blocking the event loop. Every re-created watch is confined again: it must
+   * still resolve to the canonical path the caller validated. */
+  private async healPass(gen: number) {
+    const stale = () => this.closed || gen !== this.gen;
     for (const [rel, dir] of [...this.wanted]) {
-      if (this.closed) return;
+      if (stale()) return;
       const live = this.dirKeys.get(rel);
-      const real = await realpath(dir.path).catch(() => undefined);
-      if (this.closed || this.wanted.get(rel) !== dir) continue;
-      if (real === undefined || real !== (dir.real ?? dir.path)) {
+      const real = await this.ops.realpath(dir.path).catch(() => undefined);
+      if (stale() || this.wanted.get(rel) !== dir) continue;
+      if (real === undefined || real !== dir.path) {
         // Gone, or swapped for a link that leads elsewhere: never watch it.
         if (live) this.drop(`dir:${rel}`, true);
         continue;
       }
-      const id = await identityAsync(real);
-      if (this.closed || this.wanted.get(rel) !== dir) continue;
+      const id = await identityAsync(real, this.ops);
+      if (stale() || this.wanted.get(rel) !== dir) continue;
       if (id === undefined) {
         if (live) this.drop(`dir:${rel}`, true);
       } else if (!live || live.id !== id || !this.handles.has(`dir:${rel}`)) {
         this.watchDir(rel, dir, true);
       }
     }
-    if (this.closed) return;
+    if (stale()) return;
     for (const dir of this.gitWanted)
       if (!this.handles.has(`git:${dir}`) && this.addGit(dir, true)) this.gitChanged();
     await this.syncAllRefs();
@@ -456,7 +511,10 @@ class Watch {
 export class WorkspaceWatchHost {
   private watches = new Map<string, Watch>();
 
-  constructor(private readonly watchFn: WatchFn = fsWatch as unknown as WatchFn) {}
+  constructor(
+    private readonly watchFn: WatchFn = fsWatch as unknown as WatchFn,
+    private readonly ops: FsOps = defaultOps,
+  ) {}
 
   get size() {
     return this.watches.size;
@@ -473,7 +531,7 @@ export class WorkspaceWatchHost {
     if (dirs.length > MAX_DIRS) throw new Error(`Too many watched directories (maximum ${MAX_DIRS})`);
     if (this.watches.size >= MAX_WATCHERS) throw new Error("Too many watchers");
     const id = randomUUID();
-    const watch = new Watch(cwd, this.watchFn, () => this.stop(id));
+    const watch = new Watch(cwd, this.watchFn, () => this.stop(id), this.ops);
     // Reserve the slot first so concurrent starts respect the cap.
     this.watches.set(id, watch);
     try {

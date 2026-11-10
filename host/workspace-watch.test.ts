@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { realpath, readdir, stat } from "node:fs/promises";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import {
   BATCH_MS,
@@ -19,7 +20,9 @@ import {
   MAX_WATCHERS,
   WAIT_MS,
   WATCH_UNKNOWN,
+  HEAL_TIMEOUT_MS,
   WorkspaceWatchHost,
+  type FsOps,
   type WatchFn,
 } from "./workspace-watch";
 
@@ -48,7 +51,9 @@ const repo = () => {
 function fakes() {
   const all: Fake[] = [];
   let failNext: Error | undefined;
+  const failing = new Set<string>();
   const watchFn: WatchFn = (path, options, listener) => {
+    if (failing.has(path)) throw Object.assign(new Error("ENOSPC"), { code: "ENOSPC" });
     if (failNext) {
       const error = failNext;
       failNext = undefined;
@@ -79,6 +84,10 @@ function fakes() {
     watchFn,
     open: () => all.filter((fake) => !fake.closed),
     at: (path: string) => all.find((fake) => fake.path === path && !fake.closed)!,
+    failPath: (path: string, fail = true) => {
+      if (fail) failing.add(path);
+      else failing.delete(path);
+    },
     failNext: (error: Error) => {
       failNext = error;
     },
@@ -511,6 +520,127 @@ it("rate limits healing passes", async () => {
   await vi.advanceTimersByTimeAsync(HEAL_INTERVAL_MS);
   void host.wait(id);
   await until(() => count() === 3);
+  host.close();
+});
+
+it("reports a persistent ref watch failure once, not on every heal cycle", async () => {
+  const cwd = repo();
+  const feature = join(cwd, ".git", "refs", "heads", "feature");
+  mkdirSync(feature);
+  const f = fakes();
+  f.failPath(feature);
+  const host = new WorkspaceWatchHost(f.watchFn);
+  const id = await host.start(cwd, []);
+  await settle();
+  let overflows = 0;
+  for (let i = 0; i < 6; i++) {
+    const pending = host.wait(id);
+    await real(80);
+    await vi.advanceTimersByTimeAsync(WAIT_MS);
+    if ((await pending).overflow) overflows++;
+  }
+  expect(overflows).toBe(1);
+  // Once the failure clears, the dir is watched and a later failure is a new episode.
+  f.failPath(feature, false);
+  const pending = host.wait(id);
+  await real(80);
+  await vi.advanceTimersByTimeAsync(WAIT_MS);
+  await pending;
+  await until(() => f.open().some((fake) => fake.path === feature));
+  host.close();
+});
+
+function hangingOps() {
+  const calls = { realpath: 0 };
+  let hung: ((value: string) => void) | undefined;
+  let hang: ((error: Error) => void) | undefined;
+  let hangNext = false;
+  const ops: FsOps = {
+    realpath: (path) => {
+      calls.realpath++;
+      if (hangNext) {
+        hangNext = false;
+        return new Promise<string>((resolve, reject) => {
+          hung = resolve;
+          hang = reject;
+        });
+      }
+      return realpath(path);
+    },
+    stat: (path) => stat(path),
+    readdir: (path) => readdir(path, { withFileTypes: true }),
+  };
+  return {
+    ops,
+    calls,
+    hangNext: () => {
+      hangNext = true;
+    },
+    settleHung: (value?: string) =>
+      value === undefined ? hang?.(Object.assign(new Error("ENOENT"), { code: "ENOENT" })) : hung?.(value),
+  };
+}
+
+it("abandons a hung file system call and lets a stale pass change nothing", async () => {
+  const cwd = repo();
+  const f = fakes();
+  const h = hangingOps();
+  const host = new WorkspaceWatchHost(f.watchFn, h.ops);
+  const id = await host.start(cwd, [dir(cwd, "src")]);
+  const src = f.at(join(cwd, "src"));
+  h.hangNext();
+  src.emit("rename", null); // pass 1 hangs in realpath
+  await until(() => h.calls.realpath === 1);
+  await vi.advanceTimersByTimeAsync(HEAL_TIMEOUT_MS);
+  // The next request runs a new pass instead of being wedged behind the hung one.
+  void host.wait(id);
+  await until(() => h.calls.realpath === 2);
+  // The hung call finally fails: it must not drop the live watch.
+  h.settleHung();
+  await real(80);
+  expect(src.closed).toBe(false);
+  expect(await Promise.race([host.wait(id), Promise.resolve("pending")])).toBe("pending");
+  host.close();
+});
+
+it("does not add watches from a pass that is still running when the watcher closes", async () => {
+  const cwd = repo();
+  const f = fakes();
+  const h = hangingOps();
+  const host = new WorkspaceWatchHost(f.watchFn, h.ops);
+  const id = await host.start(cwd, [dir(cwd, "src")]);
+  f.at(join(cwd, "src")).fail(new Error("EMFILE"));
+  h.hangNext();
+  void host.wait(id);
+  await until(() => h.calls.realpath === 1);
+  const before = f.all.length;
+  host.close();
+  h.settleHung(join(cwd, "src"));
+  await real(80);
+  expect(f.all.length).toBe(before);
+  expect(f.open()).toHaveLength(0);
+});
+
+it("refuses a watched directory that is a link by the time it is adopted", async () => {
+  const cwd = repo();
+  const secret = tmp();
+  const f = fakes();
+  const host = new WorkspaceWatchHost(f.watchFn);
+  const id = await host.start(cwd, []);
+  rmSync(join(cwd, "src"), { recursive: true });
+  symlinkSync(secret, join(cwd, "src"));
+  // The caller validated "<cwd>/src" as a real directory before the swap.
+  host.update(id, [dir(cwd, "src"), dir(cwd, "other")]);
+  expect(f.all.some((fake) => fake.path === join(cwd, "src"))).toBe(false);
+  expect(f.all.some((fake) => fake.path === secret)).toBe(false);
+  expect(f.at(join(cwd, "other"))).toBeDefined();
+  await settle();
+  expect(await host.wait(id)).toMatchObject({ overflow: true });
+  // Healing never adopts it either.
+  await vi.advanceTimersByTimeAsync(HEAL_INTERVAL_MS);
+  void host.wait(id);
+  await real(100);
+  expect(f.all.some((fake) => fake.path === join(cwd, "src"))).toBe(false);
   host.close();
 });
 
