@@ -85,6 +85,8 @@ pub enum Exclusion {
     LinkOutsideHome,
     TooManyFiles,
     ScanTimedOut,
+    /// A link inside the item resolves to a path outside the item's own root.
+    LinkLeavesItem,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -276,7 +278,6 @@ pub fn build_inventory_budgeted(
         started: Instant::now(),
         budget,
         raw_home: &roots.home,
-        project: &roots.project,
     };
     let home = std::fs::canonicalize(&roots.home).unwrap_or_else(|_| roots.home.clone());
     let sources = sources(roots);
@@ -375,8 +376,6 @@ struct Clock<'a> {
     /// `roots.home` as given, before canonicalizing (it may sit behind a link such as
     /// macOS `/var`).
     raw_home: &'a Path,
-    /// The local project; an item inside it may link anywhere inside it.
-    project: &'a Path,
 }
 
 struct Scan {
@@ -387,7 +386,20 @@ struct Scan {
 }
 
 /// Walk one skill or plugin directory. Files come back sorted, so every later step is
-/// deterministic. Symlinks are resolved, and a link that leaves `home` excludes the item.
+/// deterministic.
+///
+/// Link rules:
+///
+/// - The item ROOT may itself be reached through a link. That is the common dotfiles
+///   setup (`~/.claude/skills/foo -> ~/dotfiles/skills/foo`), so a root named under
+///   `$HOME` may resolve anywhere under `$HOME`. One that resolves out of `$HOME`
+///   (through any component) is refused with [`Exclusion::LinkOutsideHome`]. A root not
+///   named under `$HOME` (a project elsewhere, a plugin installed elsewhere) is taken
+///   as it resolves.
+/// - Links INSIDE the item (its content) must resolve inside the item's own canonical
+///   root. Anything else, even a path under `$HOME` or the project, excludes the whole
+///   item with [`Exclusion::LinkLeavesItem`], so `creds -> ~/.aws` never travels.
+/// - Dead links are skipped, and link loops end through the visited set.
 fn scan_item(root: &Path, kind: ItemKind, home: &Path, started: Clock<'_>) -> Scan {
     let mut scan = Scan {
         files: Vec::new(),
@@ -399,9 +411,6 @@ fn scan_item(root: &Path, kind: ItemKind, home: &Path, started: Clock<'_>) -> Sc
         ItemKind::Skill => MAX_SKILL_BYTES,
         ItemKind::Plugin => MAX_PLUGIN_BYTES,
     };
-    // The item root may live anywhere (a project outside `$HOME`, a plugin installed
-    // elsewhere). But a root whose own path is under `$HOME` must not resolve out of it
-    // through a link in any component (`~/.claude/skills -> /Volumes/x`).
     let Ok(real_root) = std::fs::canonicalize(root) else {
         return scan;
     };
@@ -416,17 +425,10 @@ fn scan_item(root: &Path, kind: ItemKind, home: &Path, started: Clock<'_>) -> Sc
     let mut visited: HashSet<PathBuf> = HashSet::new();
     visited.insert(real_root.clone());
     let mut entries = 0usize;
-    // Links may stay inside the item, or inside the project when the item is a project
-    // item living outside `$HOME`.
-    let boundary = std::fs::canonicalize(started.project)
-        .ok()
-        .filter(|project| !named_inside && real_root.starts_with(project))
-        .unwrap_or_else(|| real_root.clone());
     walk(
         &real_root,
-        &boundary,
+        &real_root,
         kind,
-        home,
         started,
         cap,
         &mut visited,
@@ -442,7 +444,6 @@ fn walk(
     dir: &Path,
     item_root: &Path,
     kind: ItemKind,
-    home: &Path,
     started: Clock<'_>,
     cap: u64,
     visited: &mut HashSet<PathBuf>,
@@ -480,10 +481,10 @@ fn walk(
             continue;
         };
         let (path, meta) = if meta.file_type().is_symlink() {
-            let real = match resolve_link(&path, home, item_root) {
+            let real = match resolve_link(&path, item_root) {
                 Link::Inside(real) => real,
                 Link::Outside => {
-                    scan.exclusion = Some(Exclusion::LinkOutsideHome);
+                    scan.exclusion = Some(Exclusion::LinkLeavesItem);
                     return;
                 }
                 Link::Dead => continue,
@@ -499,9 +500,7 @@ fn walk(
             if !visited.insert(path.clone()) {
                 continue;
             }
-            walk(
-                &path, item_root, kind, home, started, cap, visited, entries, scan,
-            );
+            walk(&path, item_root, kind, started, cap, visited, entries, scan);
         } else if meta.is_file() {
             scan.size += meta.len();
             if scan.size > cap {
@@ -517,20 +516,19 @@ fn walk(
 }
 
 enum Link {
-    /// Resolves to a path inside `home`.
+    /// Resolves to a path inside the item's own canonical root.
     Inside(PathBuf),
-    /// Resolves to a path outside `home`: refused.
+    /// Resolves anywhere else: refused.
     Outside,
     /// Dead or unreadable: skipped.
     Dead,
 }
 
-/// Resolve a symlink. Only a link that resolves outside `home` is refused; a dead one
-/// is simply skipped.
-fn resolve_link(path: &Path, home: &Path, item_root: &Path) -> Link {
+/// Resolve a symlink found inside an item. Only a target inside `item_root` (already
+/// canonical) is accepted; a dead link is simply skipped.
+fn resolve_link(path: &Path, item_root: &Path) -> Link {
     match std::fs::canonicalize(path) {
-        // Inside `home`, or inside the item itself (a root that lives outside `home`).
-        Ok(real) if real.starts_with(home) || real.starts_with(item_root) => Link::Inside(real),
+        Ok(real) if real.starts_with(item_root) => Link::Inside(real),
         Ok(_) => Link::Outside,
         Err(_) => Link::Dead,
     }

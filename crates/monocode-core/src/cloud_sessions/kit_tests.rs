@@ -625,7 +625,7 @@ fn total_cap_is_measured_after_compression() {
 
 #[cfg(unix)]
 #[test]
-fn symlinks_inside_home_are_followed_and_outside_are_refused() {
+fn item_roots_may_be_links_under_home_but_content_links_must_stay_in_the_item() {
     use std::os::unix::fs::symlink;
     let env = env();
     let outside = tempfile::tempdir().unwrap();
@@ -664,7 +664,7 @@ fn symlinks_inside_home_are_followed_and_outside_are_refused() {
         rows,
         vec![
             ("far", Some(Exclusion::LinkOutsideHome)),
-            ("leaky", Some(Exclusion::LinkOutsideHome)),
+            ("leaky", Some(Exclusion::LinkLeavesItem)),
             ("linked-skill", None),
             ("loop", None),
         ]
@@ -953,7 +953,7 @@ mod links {
         target.push(outside.path().strip_prefix("/").unwrap());
         target.push("f.txt");
         symlink(&target, skills.join("esc/rel.txt")).unwrap();
-        assert_eq!(only_skill(&env).exclusion, Some(Exclusion::LinkOutsideHome));
+        assert_eq!(only_skill(&env).exclusion, Some(Exclusion::LinkLeavesItem));
     }
 
     #[test]
@@ -967,11 +967,14 @@ mod links {
         symlink(outside.path().join("f.txt"), env.roots.home.join("hop2")).unwrap();
         symlink(env.roots.home.join("hop2"), env.roots.home.join("hop1")).unwrap();
         symlink(env.roots.home.join("hop1"), skills.join("chain/c.txt")).unwrap();
-        assert_eq!(only_skill(&env).exclusion, Some(Exclusion::LinkOutsideHome));
+        assert_eq!(only_skill(&env).exclusion, Some(Exclusion::LinkLeavesItem));
     }
 
+    // Replaces `project_outside_home_may_link_inside_itself_but_not_out`: a link from a
+    // project skill to a sibling path inside the project used to be followed. It now
+    // excludes the skill, because it leaves the skill's own root.
     #[test]
-    fn project_outside_home_may_link_inside_itself_but_not_out() {
+    fn project_skill_linking_to_elsewhere_in_the_project_is_excluded() {
         let env = env();
         let elsewhere = tempfile::tempdir().unwrap();
         let project = elsewhere.path().to_path_buf();
@@ -988,22 +991,74 @@ mod links {
         };
         let inventory = build_inventory(&roots, Workspace::Codespace);
         assert_eq!(inventory.skills.len(), 1);
-        assert_eq!(inventory.skills[0].exclusion, None);
-        // SKILL.md (1) + util.txt (3)
-        assert_eq!(inventory.skills[0].size, 4);
-
-        // A link leaving both home and the project is still refused.
-        let other = tempfile::tempdir().unwrap();
-        write(&other.path().join("o.txt"), "o");
-        symlink(
-            other.path().join("o.txt"),
-            project.join(".claude/skills/foo/out.txt"),
-        )
-        .unwrap();
-        let inventory = build_inventory(&roots, Workspace::Codespace);
         assert_eq!(
             inventory.skills[0].exclusion,
-            Some(Exclusion::LinkOutsideHome)
+            Some(Exclusion::LinkLeavesItem)
+        );
+    }
+
+    #[test]
+    fn links_to_other_places_under_home_exclude_the_item() {
+        let env = env();
+        let skills = env.roots.claude_home.join("skills");
+        skill(&skills, "creds", "x");
+        write(&env.roots.home.join(".aws/credentials"), "fake");
+        symlink(env.roots.home.join(".aws"), skills.join("creds/aws")).unwrap();
+        assert_eq!(only_skill(&env).exclusion, Some(Exclusion::LinkLeavesItem));
+    }
+
+    #[test]
+    fn links_inside_the_item_are_followed() {
+        let env = env();
+        let skills = env.roots.claude_home.join("skills");
+        skill(&skills, "tidy", "x");
+        write(&skills.join("tidy/real/data.txt"), "abcd");
+        symlink("real", skills.join("tidy/alias")).unwrap();
+        symlink("real/data.txt", skills.join("tidy/data-link.txt")).unwrap();
+        let found = only_skill(&env);
+        assert_eq!(found.exclusion, None);
+        assert!(found.size >= 9);
+    }
+
+    // The documented dotfiles rule: the ROOT may be a link to anywhere under home, but
+    // the content links are judged against the canonical root it resolves to.
+    #[test]
+    fn a_dotfiles_skill_root_may_be_a_link_but_its_content_links_stay_in_its_target() {
+        let env = env();
+        let skills = env.roots.claude_home.join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        let target = env.roots.home.join("dotfiles/skills/foo");
+        write(&target.join("SKILL.md"), "x");
+        write(&target.join("lib/a.txt"), "abc");
+        symlink("lib/a.txt", target.join("a-link.txt")).unwrap();
+        symlink(&target, skills.join("foo")).unwrap();
+        assert_eq!(only_skill(&env).exclusion, None);
+
+        // A sibling in dotfiles is inside home but outside the item: excluded.
+        write(&env.roots.home.join("dotfiles/other/o.txt"), "o");
+        symlink(env.roots.home.join("dotfiles/other"), target.join("other")).unwrap();
+        assert_eq!(only_skill(&env).exclusion, Some(Exclusion::LinkLeavesItem));
+    }
+
+    #[test]
+    fn a_plugin_with_a_link_out_of_its_install_path_is_excluded() {
+        let env = env();
+        let install = env.roots.home.join("plugins-store/p");
+        write(&install.join(".claude-plugin/plugin.json"), "{}");
+        write(&env.roots.home.join(".ssh/id"), "fake");
+        symlink(env.roots.home.join(".ssh"), install.join("x")).unwrap();
+        write_json(
+            &env.roots.claude_home.join("plugins/installed_plugins.json"),
+            json!({"version": 2, "plugins": {"p@mk": [{"scope": "user", "version": "1", "installPath": install}]}}),
+        );
+        write_json(
+            &env.roots.claude_home.join("settings.json"),
+            json!({"enabledPlugins": {"p@mk": true}}),
+        );
+        let inventory = build_inventory(&env.roots, Workspace::Codespace);
+        assert_eq!(
+            inventory.plugins[0].exclusion,
+            Some(Exclusion::LinkLeavesItem)
         );
     }
 }

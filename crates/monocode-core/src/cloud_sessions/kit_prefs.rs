@@ -280,6 +280,7 @@ fn exclusion_reason(exclusion: Exclusion) -> &'static str {
         Exclusion::LinkOutsideHome => "Links to a file outside your home folder",
         Exclusion::TooManyFiles => "Too many files to send",
         Exclusion::ScanTimedOut => "Reading it took too long",
+        Exclusion::LinkLeavesItem => "A link points outside this item",
     }
 }
 
