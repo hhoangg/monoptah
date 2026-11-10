@@ -682,6 +682,14 @@ impl RightPanel {
                 .gap_2()
                 .child(div().size(px(6.)).rounded_full().bg(gpui::rgb(dot)))
                 .child(link.label())
+                .children(chrome.cached.clone().map(|age| {
+                    div()
+                        .id("cloud-cached-age")
+                        .min_w_0()
+                        .truncate()
+                        .text_color(content(0.45))
+                        .child(age)
+                }))
                 .when(link == Link::NotConnected && chrome.can_connect, |d| {
                     d.child(
                         div()
@@ -757,6 +765,21 @@ fn workspace_placeholder() -> AnyElement {
 }
 
 impl RightPanel {
+    /// While the app has no connection to the workspace, the panes show what was seen last, dimmed
+    /// so it never reads as live.
+    fn remembered(&self, pane: AnyElement) -> AnyElement {
+        if !self.cloud.as_ref().is_some_and(|chrome| chrome.offline) {
+            return pane;
+        }
+        div()
+            .id("cloud-remembered")
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .opacity(0.55)
+            .child(pane)
+            .into_any_element()
+    }
     /// The Files or Changes tool of the classic sidebar, with the same cloud chrome as the right
     /// panel: banner, Cloud | Local switch, connection strip, and the placeholder while the
     /// workspace is being created (never a writable local tree for a pending root).
@@ -776,6 +799,7 @@ impl RightPanel {
                 .cached(StyleRefinement::default().size_full())
                 .into_any_element(),
         };
+        let pane = self.remembered(pane);
         let Some(chrome) = chrome else {
             return pane;
         };
@@ -820,6 +844,11 @@ impl Render for RightPanel {
                 .into_any_element(),
             // The shell paints the terminal over this pane.
             RightTab::Terminal => div().into_any_element(),
+        };
+        let pane = if self.tab == RightTab::Terminal {
+            pane
+        } else {
+            self.remembered(pane)
         };
         div()
             .id("right-panel")

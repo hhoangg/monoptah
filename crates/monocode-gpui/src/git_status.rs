@@ -3,6 +3,7 @@
 //! useProjectDiffStats over one off-thread reader. Reads never overlap; a
 //! read requested meanwhile runs once the current one returns, and only a
 //! changed snapshot notifies.
+use crate::remote_cache::RemoteCache;
 use gpui::{Context, EventEmitter, Task};
 use monocode_core::scm::{self, DiffIndex, DiffStats};
 use std::{
@@ -74,6 +75,17 @@ pub(crate) struct ProjectGit {
     pub review_cache: crate::review::ReviewCache,
     versions: Option<HashMap<String, scm::FileDiffVersion>>,
     remembered: HashMap<String, (u64, DiffIndex)>,
+    /// The listing and snapshot of the last 16 cloud workspaces, shown dimmed while the tunnel
+    /// to one is down. Local checkouts use `remembered`.
+    pub(crate) remote: RemoteCache,
+    /// The panels show a cloud workspace that has no live connection: nothing is read, the last
+    /// snapshot stays, and the panels are read-only until the link is back.
+    link_offline: bool,
+    /// Status should be read while visible, whether or not a read can run right now.
+    polling_wanted: bool,
+    /// Reads started, for tests that prove a disconnected workspace is left alone.
+    #[cfg(test)]
+    pub(crate) reads: usize,
     clock: u64,
     in_flight: bool,
     pending: bool,
@@ -95,6 +107,11 @@ impl ProjectGit {
             review_cache: Default::default(),
             versions: None,
             remembered: HashMap::new(),
+            remote: RemoteCache::default(),
+            link_offline: false,
+            polling_wanted: false,
+            #[cfg(test)]
+            reads: 0,
             clock: 0,
             in_flight: false,
             pending: false,
@@ -110,6 +127,55 @@ impl ProjectGit {
     pub(crate) fn available(&self) -> bool {
         !self.project.is_empty() && self.project != "~"
     }
+    /// The panels show a cloud workspace the app is not connected to. Nothing is read from it
+    /// and nothing may wake it; what is shown is the last snapshot, read-only.
+    pub(crate) fn offline(&self) -> bool {
+        self.link_offline
+    }
+    /// How long ago the live workspace of the project was last read, for a remote project.
+    pub(crate) fn cached_age(&self) -> Option<std::time::Duration> {
+        self.remote.age(&self.project, Instant::now())
+    }
+    /// Binds to `project` and records whether its workspace is connected. A switch to a
+    /// workspace without a connection reads nothing; the link coming back reads everything
+    /// again (a full reload, and polling resumes).
+    pub(crate) fn bind(&mut self, project: String, offline: bool, cx: &mut Context<Self>) {
+        let was = self.link_offline;
+        self.link_offline = offline;
+        if project != self.project {
+            self.set_project(project, cx);
+            return;
+        }
+        if was == offline {
+            return;
+        }
+        if offline {
+            // Stop the timers and the watcher; the wish to poll is remembered.
+            self.poll = None;
+            cx.notify();
+            return;
+        }
+        // Back online: a user action (Connect) brought the workspace back. Start over.
+        self.epoch += 1;
+        cx.emit(GitChanged);
+        cx.notify();
+        if self.polling_wanted {
+            self.set_polling(true, cx);
+        } else {
+            self.warm_choices(cx);
+            self.reload(cx);
+        }
+    }
+    pub(crate) fn set_link_offline(&mut self, offline: bool, cx: &mut Context<Self>) {
+        self.bind(self.project.clone(), offline, cx);
+    }
+    /// The remembered snapshot of `project`.
+    fn remembered_index(&mut self, project: &str) -> Option<DiffIndex> {
+        if project.starts_with("remote://") {
+            return self.remote.get(project).and_then(|entry| entry.index);
+        }
+        self.remembered.get(project).map(|(_, i)| i.clone())
+    }
     /// The first frame of a switch already shows the new checkout's last
     /// snapshot, never the previous one's files and actions.
     pub(crate) fn set_project(&mut self, project: String, cx: &mut Context<Self>) {
@@ -118,7 +184,7 @@ impl ProjectGit {
         }
         self.project = project.clone();
         self.root = project.clone();
-        self.index = self.remembered.get(&project).map(|(_, i)| i.clone());
+        self.index = self.remembered_index(&project);
         self.stats = self.index.as_ref().map(stats_of);
         self.statuses = self
             .index
@@ -131,7 +197,8 @@ impl ProjectGit {
         cx.emit(GitChanged);
         cx.notify();
         self.warm_choices(cx);
-        if self.poll.take().is_some() {
+        self.poll = None;
+        if self.polling_wanted {
             // Watch the new checkout instead; this reads it straight away.
             self.set_polling(true, cx);
         } else {
@@ -142,11 +209,16 @@ impl ProjectGit {
     /// checkout or its Git directory changes on disk, and every 30s besides.
     /// Without a file watcher, poll every 2s instead.
     pub(crate) fn set_polling(&mut self, polling: bool, cx: &mut Context<Self>) {
+        self.polling_wanted = polling;
         if polling == self.poll.is_some() {
             return;
         }
         if !polling {
             self.poll = None;
+            return;
+        }
+        if self.link_offline {
+            // Polled again once the link is back (see `bind`).
             return;
         }
         self.reload(cx);
@@ -192,6 +264,9 @@ impl ProjectGit {
     }
     /// useProjectDiffStats reads again on focus once its snapshot is 30s old.
     pub(crate) fn resume(&mut self, cx: &mut Context<Self>) {
+        if self.link_offline {
+            return;
+        }
         if self
             .stats_loaded
             .is_none_or(|at| at.elapsed() >= RESUME_TTL)
@@ -210,7 +285,7 @@ impl ProjectGit {
     }
     /// Project selection warms both menus before the user opens either one.
     fn warm_choices(&self, cx: &Context<Self>) {
-        if !self.available() {
+        if !self.available() || self.link_offline {
             return;
         }
         let project = self.project.clone();
@@ -221,8 +296,12 @@ impl ProjectGit {
             .detach();
     }
     pub(crate) fn reload(&mut self, cx: &mut Context<Self>) {
-        if !self.available() {
+        if !self.available() || self.link_offline {
             return;
+        }
+        #[cfg(test)]
+        {
+            self.reads += 1;
         }
         if self.in_flight {
             self.pending = true;
@@ -270,6 +349,10 @@ impl ProjectGit {
     /// rememberIndex: recent checkouts open on their last snapshot, within 24
     /// checkouts and 20,000 files.
     fn remember(&mut self, project: &str, index: &DiffIndex) {
+        if project.starts_with("remote://") {
+            self.remote.put_index(project, index, Instant::now());
+            return;
+        }
         self.clock += 1;
         self.remembered
             .insert(project.to_owned(), (self.clock, index.clone()));
@@ -303,7 +386,26 @@ fn stats_of(index: &DiffIndex) -> DiffStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{AppContext as _, TestAppContext};
     use monocode_core::scm::ChangedFile;
+
+    const A: &str = "remote://env-octo-abc/workspaces/widgets";
+    const B: &str = "remote://env-octo-xyz/workspaces/widgets";
+
+    fn snapshot(path: &str) -> DiffIndex {
+        DiffIndex {
+            files: vec![ChangedFile {
+                path: format!("{path}/a.rs"),
+                relative: "a.rs".into(),
+                status: "modified".into(),
+                additions: 1,
+                deletions: 0,
+                staged: false,
+                unstaged: true,
+            }],
+            ..Default::default()
+        }
+    }
     fn file(path: &str, status: &str) -> ChangedFile {
         ChangedFile {
             path: path.into(),
@@ -330,5 +432,109 @@ mod tests {
         assert_eq!(map.dirs["/r/a"], "modified");
         assert!(!map.dirs.contains_key("/r"));
         assert_eq!(map.files["/r/a/gone.rs"], "deleted");
+    }
+
+    #[gpui::test]
+    fn a_disconnected_workspace_is_not_read_or_polled_and_resumes_with_a_full_reload(
+        cx: &mut TestAppContext,
+    ) {
+        let git = cx.new(|cx| ProjectGit::new("~".into(), cx));
+        git.update(cx, |git, cx| {
+            git.bind(A.into(), false, cx);
+            git.set_polling(true, cx);
+            assert!(git.poll.is_some() && git.reads >= 1);
+        });
+        // The tunnel drops: the timers stop, and no read of any kind starts.
+        git.update(cx, |git, cx| {
+            let (reads, epoch) = (git.reads, git.epoch);
+            git.bind(A.into(), true, cx);
+            assert!(git.offline() && git.poll.is_none());
+            git.set_polling(true, cx);
+            git.resume(cx);
+            git.reload(cx);
+            git.changed(cx);
+            git.set_polling(true, cx);
+            assert!(git.poll.is_none(), "polling waits for the link");
+            assert_eq!(git.reads, reads, "a disconnected workspace is never read");
+            assert_eq!(git.epoch, epoch + 1, "only `changed` bumps the epoch");
+        });
+        // Connect succeeded: one full reload, and polling is back.
+        git.update(cx, |git, cx| {
+            let (reads, epoch) = (git.reads, git.epoch);
+            git.bind(A.into(), false, cx);
+            assert!(!git.offline() && git.poll.is_some());
+            assert_eq!(git.reads, reads + 1);
+            assert!(git.epoch > epoch, "the views reread");
+            // Binding again with the same link changes nothing.
+            git.bind(A.into(), false, cx);
+            assert_eq!(git.reads, reads + 1);
+        });
+        // Not polled before: back online only reads once, and does not start polling.
+        git.update(cx, |git, cx| {
+            git.set_polling(false, cx);
+            git.bind(A.into(), true, cx);
+            let reads = git.reads;
+            git.bind(A.into(), false, cx);
+            assert!(git.poll.is_none());
+            assert_eq!(git.reads, reads + 1);
+        });
+    }
+
+    #[gpui::test]
+    fn a_disconnect_keeps_the_snapshot_of_its_root_and_never_shows_it_for_another(
+        cx: &mut TestAppContext,
+    ) {
+        let git = cx.new(|cx| ProjectGit::new("~".into(), cx));
+        git.update(cx, |git, cx| {
+            git.bind(A.into(), false, cx);
+            let seen = snapshot(A);
+            git.remember(A, &seen);
+            // A reload that failed because the tunnel is down kept this snapshot; the switch
+            // away and back brings it back.
+            git.bind(B.into(), false, cx);
+            assert_eq!(git.index, None, "root A's snapshot is never root B's");
+            assert!(git.statuses.files.is_empty());
+            git.bind(A.into(), true, cx);
+            assert_eq!(git.index.as_ref(), Some(&seen));
+            assert_eq!(git.stats.as_ref().map(|s| s.files), Some(1));
+            assert!(git.statuses.files.contains_key(&format!("{A}/a.rs")));
+            assert!(git.cached_age().is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn a_disconnected_switch_reads_nothing_and_a_local_root_is_never_offline(
+        cx: &mut TestAppContext,
+    ) {
+        let git = cx.new(|cx| ProjectGit::new("~".into(), cx));
+        git.update(cx, |git, cx| {
+            git.bind(A.into(), true, cx);
+            assert_eq!(
+                git.reads, 0,
+                "binding an unreachable workspace reads nothing"
+            );
+            git.bind("/work/local".into(), false, cx);
+            assert!(!git.offline());
+            assert_eq!(git.reads, 1);
+        });
+    }
+
+    #[gpui::test]
+    fn only_sixteen_remote_snapshots_are_remembered_and_local_ones_stay_apart(
+        cx: &mut TestAppContext,
+    ) {
+        let git = cx.new(|cx| ProjectGit::new("~".into(), cx));
+        git.update(cx, |git, _| {
+            for n in 0..20 {
+                let root = format!("remote://env-{n}/w");
+                git.remember(&root, &snapshot(&root));
+            }
+            assert_eq!(git.remote.len(), crate::remote_cache::CAPACITY);
+            assert!(git.remote.peek("remote://env-0/w").is_none());
+            assert!(git.remote.peek("remote://env-19/w").is_some());
+            git.remember("/work/local", &snapshot("/work/local"));
+            assert_eq!(git.remote.len(), crate::remote_cache::CAPACITY);
+            assert!(git.remembered.contains_key("/work/local"));
+        });
     }
 }

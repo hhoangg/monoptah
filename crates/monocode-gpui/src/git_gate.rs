@@ -22,11 +22,15 @@ pub(crate) struct Gate {
     local_refused: bool,
     /// Host environments where some session has a turn running (see [`turn_running`]).
     running: Vec<String>,
+    /// The Host environment of the workspace the panels show while the app has no connection to
+    /// it: its files are only remembered, so writes to it are refused.
+    offline: Option<String>,
 }
 
 impl Gate {
-    pub(crate) fn of(root: &PanelRoot, running: Vec<String>) -> Self {
+    pub(crate) fn of(root: &PanelRoot, running: Vec<String>, offline: bool) -> Self {
         Self {
+            offline: offline.then(|| environment(root.project())).flatten(),
             cloud: root
                 .cloud()
                 .map(monocode_core::cloud_sessions::CloudRef::key),
@@ -40,6 +44,14 @@ impl Gate {
         Self {
             cloud: Some(cloud_key.into()),
             local_refused: true,
+            ..Self::default()
+        }
+    }
+    /// The workspace of environment `env` has no connection (tests).
+    #[cfg(test)]
+    pub(crate) fn offline_in(env: &str) -> Self {
+        Self {
+            offline: Some(env.to_owned()),
             ..Self::default()
         }
     }
@@ -61,6 +73,9 @@ thread_local! {
 fn environment(cwd: &str) -> Option<String> {
     parse_remote_path(cwd).map(|path| path.environment_id)
 }
+
+/// Why a write to a workspace without a connection was refused.
+pub(crate) const REFUSED_OFFLINE: &str = "Not connected to the workspace: the files shown are the last ones seen and cannot be changed. Choose Connect to change them.";
 
 /// Why a write was refused.
 pub(crate) const REFUSED: &str = "Git changes are off while the panels show the local checkout of a cloud session: those files are not the session's. Switch the panels to Cloud to change its workspace.";
@@ -88,8 +103,20 @@ pub(crate) fn codespace() -> Option<String> {
 /// the panels switch.
 pub(crate) fn writes_allowed(cwd: &str) -> bool {
     match environment(cwd) {
-        Some(env) => !is_pending_cloud_environment(&env),
+        Some(env) => !is_pending_cloud_environment(&env) && !offline(&env),
         None => STATE.with(|state| !state.borrow().local_refused),
+    }
+}
+
+fn offline(env: &str) -> bool {
+    STATE.with(|state| state.borrow().offline.as_deref() == Some(env))
+}
+
+/// The reason `writes_allowed(cwd)` is false.
+pub(crate) fn refusal(cwd: &str) -> &'static str {
+    match environment(cwd) {
+        Some(env) if offline(&env) => REFUSED_OFFLINE,
+        _ => REFUSED,
     }
 }
 
@@ -261,6 +288,19 @@ mod tests {
             Decision::Refuse(_)
         ));
         set(Gate::default());
+    }
+
+    #[test]
+    fn a_workspace_without_a_connection_refuses_writes_and_says_why() {
+        set(Gate::offline_in("env-octo-abc"));
+        assert!(!writes_allowed(REMOTE));
+        assert_eq!(refusal(REMOTE), REFUSED_OFFLINE);
+        // Another workspace and a local checkout are not affected by that disconnect.
+        assert!(writes_allowed("remote://env-other/workspaces/w"));
+        assert!(writes_allowed("/work/local"));
+        assert_eq!(refusal("/work/local"), REFUSED);
+        set(Gate::default());
+        assert!(writes_allowed(REMOTE));
     }
 
     #[test]

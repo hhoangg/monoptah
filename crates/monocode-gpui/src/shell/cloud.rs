@@ -1176,7 +1176,7 @@ impl Shell {
 
     /// Whether the app has a live connection to the workspace of the session in view. A
     /// session without a live view is Not connected. Never wakes anything.
-    fn panel_link(&self, cx: &App) -> crate::panel_root::Link {
+    pub(super) fn panel_link(&self, cx: &App) -> crate::panel_root::Link {
         let id = self
             .workspace
             .active
@@ -1269,17 +1269,25 @@ impl Shell {
     /// Nothing here may wake a workspace: it only reads cached state.
     pub(super) fn sync_cloud_panel(&self, cx: &mut Context<Self>) {
         let root = self.panel_root(cx);
+        let link = self.panel_link(cx);
+        let offline = crate::panel_root::is_offline(&root, link);
         // A cloud session's root can change without the session changing (the Local switch, a
-        // pending workspace that became real).
-        if root.cloud().is_some() && self.git.read(cx).project() != root.project() {
-            let project = root.project().to_owned();
-            self.git.update(cx, |git, cx| git.set_project(project, cx));
+        // pending workspace that became real). Offline: the panels keep the last data and read
+        // nothing; back online: a full reload.
+        let project = root.project().to_owned();
+        if root.cloud().is_some() {
+            self.git
+                .update(cx, |git, cx| git.bind(project, offline, cx));
+        } else {
+            self.git
+                .update(cx, |git, cx| git.set_link_offline(false, cx));
         }
         let running = self.running_environments(cx);
-        let chrome =
-            crate::panel_root::Chrome::of(&root, self.panel_link(cx), self.panel_can_connect());
+        let age = self.git.read(cx).cached_age();
+        let chrome = crate::panel_root::Chrome::of(&root, link, self.panel_can_connect())
+            .map(|chrome| chrome.with_age(age));
         self.sync_codespace_pane(cx);
-        let flipped = crate::git_gate::set(crate::git_gate::Gate::of(&root, running));
+        let flipped = crate::git_gate::set(crate::git_gate::Gate::of(&root, running, offline));
         if let Some(panel) = &self.right_panel {
             panel.update(cx, |panel, cx| {
                 panel.set_cloud_chrome(chrome, cx);
