@@ -936,6 +936,10 @@ same Phase 2 run. It does not depend on a Host release.
 - **Risks:**
   - A tunnel race during the restart: reuse the tunnel-invalidation path (`remote.rs`
     ~498-511).
+  - Known limit: a turn dispatched from another device or window in the few milliseconds
+    between the swap worker's last look at the Host and `service uninstall` is not held back
+    and is cut off by the restart. Closing it needs a Host-side drain (the Host refusing new
+    turns until told otherwise), which is out of scope for this ticket.
 
 #### F1-4 Delete the copy workaround; files open directly (S-M)
 

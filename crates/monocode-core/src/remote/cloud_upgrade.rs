@@ -452,6 +452,8 @@ enum Finished {
     Failed,
     /// No worker was ever started.
     NotStarted,
+    /// The status on the machine belongs to some other swap.
+    Stale,
 }
 
 impl CloudUpgrade<'_> {
@@ -473,13 +475,14 @@ impl CloudUpgrade<'_> {
 
     /// Runs one step of the upgrade script on the machine and returns its last stdout line.
     fn run(&self, phase: UpgradePhase) -> Result<String, String> {
-        self.run_with(self.job, self.askpass, phase)
+        self.run_with(self.job, self.askpass, phase, "")
     }
     fn run_with(
         &self,
         job: &Arc<Job>,
         askpass: &Askpass,
         phase: UpgradePhase,
+        nonce: &str,
     ) -> Result<String, String> {
         let target = self
             .machine()?
@@ -488,6 +491,7 @@ impl CloudUpgrade<'_> {
         let check = SwapCheck {
             device_token: &self.device_token,
             environment_id: &self.environment_id,
+            nonce,
         };
         // A sandbox uses the SAME prelude as its connect step, so a restarted Host has the
         // Claude credential in its environment. It travels on stdin only.
@@ -527,21 +531,21 @@ impl CloudUpgrade<'_> {
         })
     }
 
-    fn set_unconfirmed(&self, on: bool) {
+    fn set_swap_nonce(&self, nonce: Option<&str>) {
         let _ = self.connections.update_machine(self.id, |machine| {
-            let changed = machine.swap_unconfirmed != on;
-            machine.swap_unconfirmed = on;
+            let changed = machine.swap_nonce.as_deref() != nonce;
+            machine.swap_nonce = nonce.map(str::to_owned);
             changed
         });
     }
 
     /// Asks the machine how the swap worker is doing until it is done. `Err`: contact was lost
     /// or the swap takes too long; the machine keeps going on its own.
-    fn wait_for_worker(&self) -> Result<Finished, String> {
+    fn wait_for_worker(&self, nonce: &str) -> Result<Finished, String> {
         let deadline = Instant::now() + SWAP_WAIT;
         let mut failures = 0;
         loop {
-            match self.run(UpgradePhase::Status) {
+            match self.run_with(self.job, self.askpass, UpgradePhase::Status, nonce) {
                 Ok(line) => {
                     failures = 0;
                     let status: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
@@ -563,6 +567,7 @@ impl CloudUpgrade<'_> {
                         }
                         Some("failed") => return Ok(Finished::Failed),
                         Some("none") => return Ok(Finished::NotStarted),
+                        Some("stale") => return Ok(Finished::Stale),
                         Some("checking" | "swapping") => {}
                         _ => return Err("Host update returned an invalid response".into()),
                     }
@@ -627,15 +632,15 @@ impl UpgradeEnv for CloudUpgrade<'_> {
     }
 
     fn recover(&self) {
-        if !self.machine().is_ok_and(|m| m.swap_unconfirmed) {
+        let Some(nonce) = self.machine().ok().and_then(|m| m.swap_nonce) else {
             return;
-        }
+        };
         // An earlier connect started a swap and never saw it end. The machine finishes it or
         // puts the old Host back; the tunnel then has to reach whichever runs now.
-        match self.wait_for_worker() {
+        match self.wait_for_worker(&nonce) {
             Err(_) => {}
             Ok(_) => {
-                self.set_unconfirmed(false);
+                self.set_swap_nonce(None);
                 let _ = self.reconnect();
             }
         }
@@ -653,7 +658,7 @@ impl UpgradeEnv for CloudUpgrade<'_> {
         // The job of this start may be cancelled, which is why we are here: use a fresh one.
         let job = Job::new();
         if let Ok(askpass) = job.askpass() {
-            let _ = self.run_with(&job, &askpass, UpgradePhase::Discard);
+            let _ = self.run_with(&job, &askpass, UpgradePhase::Discard, "");
         }
     }
 
@@ -670,10 +675,11 @@ impl UpgradeEnv for CloudUpgrade<'_> {
     fn swap(&self) -> Result<(), SwapError> {
         // From the moment the worker starts, an app quit leaves it alone.
         let _mark = SwapMark::new(self.connections, self.job);
-        self.set_unconfirmed(true);
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        self.set_swap_nonce(Some(&nonce));
         // If this fails the worker may still have started (ssh can drop after it): ask anyway.
-        let started = self.run(UpgradePhase::Swap);
-        let finished = self.wait_for_worker();
+        let started = self.run_with(self.job, self.askpass, UpgradePhase::Swap, &nonce);
+        let finished = self.wait_for_worker(&nonce);
         let ended = finished.is_ok();
         let result = match finished {
             Ok(Finished::Done(port)) => {
@@ -711,6 +717,9 @@ impl UpgradeEnv for CloudUpgrade<'_> {
             Ok(Finished::Refused(_) | Finished::Failed) => Err(SwapError::NotTouched(
                 "The update was refused before it changed anything".into(),
             )),
+            Ok(Finished::Stale) => Err(SwapError::NotTouched(started.err().unwrap_or_else(|| {
+                "Another update of this Host is running on the machine".into()
+            }))),
             Ok(Finished::NotStarted) => Err(SwapError::NotTouched(
                 started
                     .err()
@@ -720,7 +729,7 @@ impl UpgradeEnv for CloudUpgrade<'_> {
         };
         // Only a swap that is still running somewhere stays unconfirmed.
         if ended {
-            self.set_unconfirmed(false);
+            self.set_swap_nonce(None);
         }
         result
     }
@@ -783,7 +792,7 @@ mod tests {
             token: "t".repeat(43),
             ssh,
             pending_host_upgrade: pending,
-            swap_unconfirmed: false,
+            swap_nonce: None,
         }
     }
     fn target(codespace: Option<&str>) -> SshTarget {

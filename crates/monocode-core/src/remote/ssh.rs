@@ -728,7 +728,8 @@ fn bootstrap_script_from_template(platform: HostPlatform, template: &str) -> Str
             .replace("\r\n", "\n")
             .replace("@@VERSION@@", &shell_quote(HOST_VERSION))
             .replace("@@RELEASE@@", &shell_quote(HOST_RELEASE_BASE))
-            .replace("@@SHA256@@", &sha256),
+            .replace("@@SHA256@@", &sha256)
+            .replace("@@WORKER_ALIVE@@", include_str!("worker_alive.sh")),
         HostPlatform::Windows => template
             .replace("@@VERSION@@", &powershell_quote(HOST_VERSION))
             .replace("@@RELEASE@@", &powershell_quote(HOST_RELEASE_BASE))
@@ -782,6 +783,8 @@ impl UpgradePhase {
 pub(crate) struct SwapCheck<'a> {
     pub device_token: &'a str,
     pub environment_id: &'a str,
+    /// Names this swap; the status the app reads must carry it.
+    pub nonce: &'a str,
 }
 
 /// Wraps the worker in a script that stores it, starts it detached (it survives a closed ssh
@@ -795,12 +798,19 @@ fn swap_launcher(worker: &str, check: Option<SwapCheck<'_>>) -> String {
         ),
         None => String::new(),
     };
+    let alive = include_str!("worker_alive.sh");
     format!(
         r#"{exports}[ -z "${{MONOCODE_HOST_TOKEN_VAR:-}}" ] || export MONOCODE_HOST_TOKEN_VAR
 set -eu
 umask 077
 BASE="$HOME/.monocode-host"
 mkdir -p "$BASE"
+{alive}
+# One worker at a time: a live one owns the lock.
+if [ -f "$BASE/swap.lock" ] && worker_alive "$(cat "$BASE/swap.lock" 2>/dev/null)"; then
+  echo 'Another Monoptah Host update is still running on this machine.' >&2
+  exit 1
+fi
 rm -f "$BASE/swap-status"
 cat > "$BASE/swap-worker.sh" <<'MONOCODE_SWAP_WORKER_END'
 {worker}
@@ -816,6 +826,8 @@ until [ -f "$BASE/swap-status" ]; do
   [ "$_wait" -lt 15 ] || {{ echo 'The Host update did not start.' >&2; exit 1; }}
   sleep 1
 done
+# Nothing started from here on needs the credential.
+unset MONOCODE_CHECK_TOKEN MONOCODE_CHECK_ENV
 echo '{{"swap":"started"}}'
 "#
     )
@@ -832,19 +844,25 @@ pub(crate) fn sandbox_upgrade_script(
 ) -> String {
     if phase == UpgradePhase::Swap {
         // The worker inherits the prelude's exports; it carries none itself.
-        let worker = sandbox_script_with(None, &upgrade_flags(port, phase));
+        let worker = sandbox_script_with(None, &upgrade_flags(port, phase, check));
         let launcher = swap_launcher(&worker, check);
         return match prelude {
             Some(prelude) => format!("{prelude}\n{launcher}"),
             None => launcher,
         };
     }
-    sandbox_script_with(prelude, &upgrade_flags(port, phase))
+    sandbox_script_with(prelude, &upgrade_flags(port, phase, check))
 }
 
-fn upgrade_flags(port: u16, phase: UpgradePhase) -> String {
+fn upgrade_flags(port: u16, phase: UpgradePhase, check: Option<SwapCheck<'_>>) -> String {
+    let nonce = match (phase, check) {
+        (UpgradePhase::Swap | UpgradePhase::Status, Some(check)) => {
+            format!("MONOCODE_SWAP_NONCE={}\n", shell_quote(check.nonce))
+        }
+        _ => String::new(),
+    };
     format!(
-        "MONOCODE_HOST_UPGRADE_IF_OLDER=1\nMONOCODE_HOST_UPGRADE_PHASE={}\nMONOCODE_HOST_PORT={port}\n",
+        "MONOCODE_HOST_UPGRADE_IF_OLDER=1\nMONOCODE_HOST_UPGRADE_PHASE={}\nMONOCODE_HOST_PORT={port}\n{nonce}",
         phase.word()
     )
 }
@@ -894,7 +912,7 @@ pub(crate) fn codespace_upgrade_script(
 ) -> String {
     let script = format!(
         "{}{}",
-        upgrade_flags(port, phase),
+        upgrade_flags(port, phase, check),
         codespace_bootstrap_script()
     );
     if phase == UpgradePhase::Swap {
@@ -1881,7 +1899,7 @@ mod tests {
         let host = pkg.join("monocode-host");
         std::fs::write(
             &host,
-            "#!/bin/sh\necho \"new $@\" >> \"$HOME/calls.log\"\ncase \"$1\" in --version) echo '1.1.0+monoptah' ;; connection-info) [ ! -f \"$HOME/fail-new\" ] || exit 1; echo '{\"port\":3774}' ;; service) [ \"$2\" != install ] || [ ! -f \"$HOME/fail-new\" ] || exit 1 ;; esac\nexit 0\n",
+            "#!/bin/sh\necho \"new $@\" >> \"$HOME/calls.log\"\nenv >> \"$HOME/env.log\"\ncase \"$1\" in --version) echo '1.1.0+monoptah' ;; connection-info) if [ -f \"$HOME/flaky\" ]; then n=$(cat \"$HOME/flaky\"); if [ \"$n\" -gt 0 ]; then echo $((n - 1)) > \"$HOME/flaky\"; exit 1; fi; fi; [ ! -f \"$HOME/fail-new\" ] || exit 1; echo '{\"port\":3774}' ;; service) [ \"$2\" != install ] || [ ! -f \"$HOME/fail-new\" ] || exit 1 ;; esac\nexit 0\n",
         )
         .unwrap();
         std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2019,7 +2037,7 @@ mod tests {
         let host = runtime.join("monocode-host");
         std::fs::write(
             &host,
-            format!("#!/bin/sh\necho \"old $@\" >> \"$HOME/calls.log\"\ncase \"$1\" in --version) echo '{version}' ;; connection-info) echo '{{\"port\":3774}}' ;; service) [ \"$2\" != install ] || [ ! -f \"$HOME/fail-old\" ] || exit 1 ;; esac\nexit 0\n"),
+            format!("#!/bin/sh\necho \"old $@\" >> \"$HOME/calls.log\"\nenv >> \"$HOME/env.log\"\ncase \"$1\" in --version) echo '{version}' ;; connection-info) if [ -f \"$HOME/flaky\" ]; then n=$(cat \"$HOME/flaky\"); if [ \"$n\" -gt 0 ]; then echo $((n - 1)) > \"$HOME/flaky\"; exit 1; fi; fi; echo '{{\"port\":3774}}' ;; service) [ \"$2\" != install ] || [ ! -f \"$HOME/fail-old\" ] || exit 1 ;; esac\nexit 0\n"),
         )
         .unwrap();
         std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2083,7 +2101,7 @@ mod tests {
     fn upgrade_step_on(port: u16, phase: UpgradePhase) -> String {
         format!(
             "{}{}",
-            upgrade_flags(port, phase),
+            upgrade_flags(port, phase, None),
             bootstrap_script(HostPlatform::Unix)
         )
     }
@@ -2106,8 +2124,50 @@ mod tests {
     fn swap_status(home: &std::path::Path) -> String {
         std::fs::read_to_string(home.join(".monocode-host/swap-status"))
             .unwrap_or_default()
+            .lines()
+            .next()
+            .unwrap_or("")
             .trim()
             .to_string()
+    }
+    /// The second line of the status file: the nonce of the swap that wrote it.
+    #[cfg(unix)]
+    fn status_nonce(home: &std::path::Path) -> String {
+        std::fs::read_to_string(home.join(".monocode-host/swap-status"))
+            .unwrap_or_default()
+            .lines()
+            .nth(1)
+            .unwrap_or("")
+            .to_string()
+    }
+    /// The status script, asking for the swap named `nonce`.
+    #[cfg(unix)]
+    fn status_script(nonce: &str) -> String {
+        let check = SwapCheck {
+            device_token: "unused",
+            environment_id: "unused",
+            nonce,
+        };
+        format!(
+            "{}{}",
+            upgrade_flags(3774, UpgradePhase::Status, Some(check)),
+            bootstrap_script(HostPlatform::Unix)
+        )
+    }
+    /// A process whose command line is a swap worker's, alive for a few seconds.
+    #[cfg(unix)]
+    fn fake_worker() -> std::process::Child {
+        Command::new("sh")
+            .args(["-c", "sleep 4", "swap-worker.sh"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+    #[cfg(unix)]
+    fn env_log(home: &tempfile::TempDir) -> String {
+        std::fs::read_to_string(home.path().join("env.log")).unwrap_or_default()
     }
     /// The Host's own API as the swap worker's last look sees it: `projects.list` has one
     /// project, `sessions.list` answers `sessions` (a JSON array body).
@@ -2495,47 +2555,208 @@ mod tests {
         assert_eq!(swap_status(home.path()), "done");
         assert!(!home.path().join("claude-install.log").exists());
     }
+    /// A swap whose worker died: a package staged, the previous Host's files saved, and
+    /// `runtime-path` pointing at `current` (`"staged"` for the new Host, `"old"` for the
+    /// untouched one).
     #[cfg(unix)]
-    #[test]
-    fn status_reports_the_worker_and_finishes_or_rolls_back_one_that_died() {
-        let state = |home: &std::path::Path| {
-            run_in_home(home, &upgrade_step(UpgradePhase::Status))
-                .1
-                .trim()
-                .to_string()
-        };
+    fn died_mid_swap(current: &str) -> tempfile::TempDir {
         let (home, _api) = staged_host(IDLE);
         let base = home.path().join(".monocode-host");
-        assert_eq!(state(home.path()), "{\"swap\":\"none\"}");
-        // A live worker is left alone.
-        std::fs::write(
-            base.join("swap-status"),
-            format!("swapping {}\n", std::process::id()),
-        )
-        .unwrap();
-        assert_eq!(state(home.path()), "{\"swap\":\"swapping\"}");
-        // A worker that died before it touched anything.
-        std::fs::write(base.join("swap-status"), "checking 999999\n").unwrap();
-        assert_eq!(state(home.path()), "{\"swap\":\"failed\"}");
-        // Died in the middle of the swap, the new Host runs: the update stands.
-        let staged = std::fs::read_to_string(base.join("staged-runtime")).unwrap();
         std::fs::copy(base.join("runtime-path"), base.join("runtime-path.prev")).unwrap();
         std::fs::copy(
             base.join("bin/monocode-host"),
             base.join("bin/monocode-host.prev"),
         )
         .unwrap();
-        std::fs::write(base.join("runtime-path"), staged.clone()).unwrap();
-        std::fs::write(base.join("swap-status"), "swapping 999999\n").unwrap();
-        assert_eq!(state(home.path()), "{\"swap\":\"done\",\"port\":3774}");
-        assert_eq!(swap_status(home.path()), "done");
-        // Died in the middle and the new Host does not run: the old one is put back.
-        std::fs::write(base.join("runtime-path"), staged).unwrap();
-        std::fs::write(home.path().join("fail-new"), "").unwrap();
-        std::fs::write(base.join("swap-status"), "swapping 999999\n").unwrap();
-        assert_eq!(state(home.path()), "{\"swap\":\"restored\"}");
+        if current == "staged" {
+            let staged = std::fs::read_to_string(base.join("staged-runtime")).unwrap();
+            std::fs::write(base.join("runtime-path"), staged).unwrap();
+        }
+        std::fs::write(base.join("swap-status"), "swapping 999999\nnonce-1\n").unwrap();
+        home
+    }
+    #[cfg(unix)]
+    fn status_of(home: &std::path::Path, nonce: &str) -> String {
+        run_in_home_env(
+            home,
+            &status_script(nonce),
+            &[("MONOCODE_PROBE_WAIT", "0")],
+            false,
+        )
+        .1
+        .trim()
+        .to_string()
+    }
+    #[cfg(unix)]
+    #[test]
+    fn status_reports_a_live_worker_and_one_that_never_got_to_touch_anything() {
+        let (home, _api) = staged_host(IDLE);
+        let base = home.path().join(".monocode-host");
+        assert_eq!(status_of(home.path(), "nonce-1"), "{\"swap\":\"none\"}");
+        // A live worker is left alone: its command line is the worker's (Linux), or its
+        // heartbeat is fresh (elsewhere).
+        let mut worker = fake_worker();
+        std::fs::write(base.join("swap-heartbeat"), "").unwrap();
+        std::fs::write(
+            base.join("swap-status"),
+            format!("swapping {}\nnonce-1\n", worker.id()),
+        )
+        .unwrap();
+        assert_eq!(status_of(home.path(), "nonce-1"), "{\"swap\":\"swapping\"}");
+        let _ = worker.wait();
+        // A worker that died before it touched anything.
+        std::fs::write(base.join("swap-status"), "checking 999999\nnonce-1\n").unwrap();
+        assert_eq!(status_of(home.path(), "nonce-1"), "{\"swap\":\"failed\"}");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_reused_pid_is_not_taken_for_the_worker() {
+        let home = died_mid_swap("old");
+        let base = home.path().join(".monocode-host");
+        // The pid belongs to a live process now, but it is not the worker: not its command
+        // line, and no heartbeat.
+        let _ = std::fs::remove_file(base.join("swap-heartbeat"));
+        std::fs::write(
+            base.join("swap-status"),
+            format!("swapping {}\nnonce-1\n", std::process::id()),
+        )
+        .unwrap();
+        assert_eq!(status_of(home.path(), "nonce-1"), "{\"swap\":\"restored\"}");
+        // A stale heartbeat is no proof either (no /proc: macOS), and an old file does not
+        // keep a dead worker alive forever.
+        let mut other = Command::new("sleep").arg("3").spawn().unwrap();
+        std::fs::write(
+            base.join("swap-status"),
+            format!("swapping {}\nnonce-1\n", other.id()),
+        )
+        .unwrap();
+        assert_eq!(status_of(home.path(), "nonce-1"), "{\"swap\":\"restored\"}");
+        let _ = other.wait();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn recovery_never_restarts_a_host_that_answers() {
+        // (a) The worker died with the old files in place: the old Host is fine, nothing to undo.
+        let home = died_mid_swap("old");
+        assert_eq!(status_of(home.path(), "nonce-1"), "{\"swap\":\"restored\"}");
+        assert_eq!(swap_status(home.path()), "restored");
+        let calls = host_calls(&home);
+        assert!(
+            !calls.contains("service"),
+            "the healthy Host was restarted: {calls}"
+        );
+        assert!(runtime_path(home.path()).ends_with("runtime/old"));
+        // (b) The worker died after the swap and one health probe fails by chance: the new
+        // Host is kept, not rolled back over.
+        let home = died_mid_swap("staged");
+        std::fs::write(home.path().join("flaky"), "2").unwrap();
+        assert_eq!(
+            status_of(home.path(), "nonce-1"),
+            "{\"swap\":\"done\",\"port\":3774}"
+        );
+        let calls = host_calls(&home);
+        assert!(
+            !calls.contains("service"),
+            "the healthy Host was restarted: {calls}"
+        );
+        assert!(!runtime_path(home.path()).ends_with("runtime/old"));
+        // Only when nothing answers (more failures than the probe tries) is the old Host put back.
+        let home = died_mid_swap("staged");
+        std::fs::write(home.path().join("flaky"), "7").unwrap();
+        assert_eq!(status_of(home.path(), "nonce-1"), "{\"swap\":\"restored\"}");
         assert!(runtime_path(home.path()).ends_with("runtime/old"));
         assert!(host_calls(&home).contains("old service install"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_status_from_another_swap_is_not_this_ones() {
+        let home = died_mid_swap("old");
+        assert_eq!(status_of(home.path(), "other"), "{\"swap\":\"stale\"}");
+        // Nothing was settled on the strength of it.
+        assert_eq!(swap_status(home.path()), "swapping 999999");
+        assert!(!host_calls(&home).contains("service"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn the_credential_never_reaches_a_process_the_worker_starts() {
+        let present = |home: &tempfile::TempDir| {
+            let log = env_log(home);
+            assert!(!log.is_empty(), "the stub Host ran");
+            log.contains("MONOCODE_CHECK") || log.contains(API_TOKEN)
+        };
+        // A good update: the new Host is started.
+        let (home, api) = staged_host(IDLE);
+        assert_eq!(run_worker(home.path(), &api, false), Some(0));
+        assert!(host_calls(&home).contains("new service install"));
+        assert!(!present(&home), "{}", env_log(&home));
+        // A rollback: the new Host fails, the old one is started again.
+        let (home, api) = staged_host(IDLE);
+        std::fs::write(home.path().join("fail-new"), "").unwrap();
+        assert_eq!(run_worker(home.path(), &api, false), Some(75));
+        assert!(host_calls(&home).contains("old service install"));
+        assert!(!present(&home), "{}", env_log(&home));
+        // A busy Host: exit 77, and the staged check that ran before it saw nothing either.
+        let (home, api) = staged_host(RUNNING);
+        assert_eq!(run_worker(home.path(), &api, false), Some(77));
+        assert!(!present(&home), "{}", env_log(&home));
+        // A refusal before the look.
+        let (home, api) = staged_host(IDLE);
+        std::fs::remove_file(home.path().join(".monocode-host/runtime-path")).unwrap();
+        assert_eq!(run_worker(home.path(), &api, false), Some(78));
+        assert!(!present(&home), "{}", env_log(&home));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_running_session_without_a_project_key_is_not_invisible() {
+        // Schema drift: the running session has no `projectId`, the idle one does.
+        let adversarial = "[{\"revision\":1,\"status\":\"running\",\"id\":\"a\",\"title\":\"t\",\"needsInput\":false},{\"projectId\":\"p1\",\"status\":\"idle\",\"id\":\"b\",\"needsInput\":false}]";
+        let (home, api) = staged_host(adversarial);
+        assert_eq!(run_worker(home.path(), &api, false), Some(77));
+        assert!(runtime_path(home.path()).ends_with("runtime/old"));
+        // A session with no status at all, and one with an unknown status, fail closed too.
+        for sessions in [
+            "[{\"projectId\":\"p1\",\"id\":\"a\"},{\"projectId\":\"p1\",\"status\":\"idle\"}]",
+            "[{\"projectId\":\"p1\",\"status\":\"mystery\"}]",
+        ] {
+            let (home, api) = staged_host(sessions);
+            assert_eq!(run_worker(home.path(), &api, false), Some(77), "{sessions}");
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_second_launcher_cannot_start_while_a_worker_is_alive() {
+        let (home, api) = staged_host(IDLE);
+        let base = home.path().join(".monocode-host");
+        let check = SwapCheck {
+            device_token: API_TOKEN,
+            environment_id: "env-1",
+            nonce: "nonce-2",
+        };
+        let launcher = codespace_upgrade_script(api.port, UpgradePhase::Swap, Some(check));
+        // A live worker owns the lock.
+        let mut worker = fake_worker();
+        std::fs::write(base.join("swap.lock"), format!("{}\n", worker.id())).unwrap();
+        std::fs::write(base.join("swap-heartbeat"), "").unwrap();
+        std::fs::write(base.join("swap-status"), "swapping 1\nnonce-1\n").unwrap();
+        let (code, _, stderr) = run_in_home(home.path(), &launcher);
+        assert_eq!(code, Some(1));
+        assert!(stderr.contains("still running"), "{stderr}");
+        // Nothing of the first swap was disturbed.
+        assert_eq!(status_nonce(home.path()), "nonce-1");
+        assert!(!base.join("swap-worker.sh").exists());
+        let _ = worker.wait();
+        // A lock left by a dead worker does not block.
+        std::fs::write(base.join("swap.lock"), "999999\n").unwrap();
+        let (code, stdout, stderr) = run_in_home(home.path(), &launcher);
+        assert_eq!(code, Some(0), "{stderr}");
+        assert!(stdout.contains("started"));
+        for _ in 0..150 {
+            if swap_status(home.path()) == "done" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert_eq!(swap_status(home.path()), "done");
     }
     #[cfg(unix)]
     #[test]
@@ -2545,11 +2766,13 @@ mod tests {
         let check = SwapCheck {
             device_token: API_TOKEN,
             environment_id: "env-1",
+            nonce: "nonce-1",
         };
         let launcher = codespace_upgrade_script(api.port, UpgradePhase::Swap, Some(check));
         let (code, stdout, stderr) = run_in_home(home.path(), &launcher);
         assert_eq!(code, Some(0), "{stderr}");
         assert!(stdout.contains("{\"swap\":\"started\"}"), "{stdout}");
+        // The launcher's own shell no longer holds the credential once the worker runs.
         // The launcher is gone; the worker finishes on its own.
         let mut done = false;
         for _ in 0..150 {
@@ -2560,6 +2783,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(200));
         }
         assert!(done, "status: {}", swap_status(home.path()));
+        assert_eq!(status_nonce(home.path()), "nonce-1");
+        assert!(!env_log(&home).contains(API_TOKEN) && !env_log(&home).contains("MONOCODE_CHECK"));
         assert!(!runtime_path(home.path()).ends_with("runtime/old"));
         let worker = std::fs::read_to_string(base.join("swap-worker.sh")).unwrap();
         let log = std::fs::read_to_string(base.join("swap.log")).unwrap_or_default();
@@ -2594,6 +2819,7 @@ mod tests {
         let check = SwapCheck {
             device_token: "device-token-xyz",
             environment_id: "env-9",
+            nonce: "nonce-9",
         };
         for phase in [
             UpgradePhase::Stage,
@@ -2604,7 +2830,7 @@ mod tests {
                 "MONOCODE_HOST_UPGRADE_IF_OLDER=1\nMONOCODE_HOST_UPGRADE_PHASE={}\nMONOCODE_HOST_PORT=3790\n",
                 phase.word()
             );
-            let sandbox = sandbox_upgrade_script(Some(prelude), 3790, phase, Some(check));
+            let sandbox = sandbox_upgrade_script(Some(prelude), 3790, phase, None);
             assert!(sandbox.starts_with(prelude), "{sandbox}");
             // Same body as the connect step, with the same detached start.
             let connect = sandbox_bootstrap_script(Some(prelude));
@@ -2615,7 +2841,7 @@ mod tests {
             assert!(sandbox.contains("ensure_detached_host"));
             assert!(!sandbox_upgrade_script(None, 3774, phase, None).contains("sk-test"));
             assert!(!sandbox.contains("device-token-xyz"));
-            let codespace = codespace_upgrade_script(3774, phase, Some(check));
+            let codespace = codespace_upgrade_script(3774, phase, None);
             assert!(codespace.starts_with(&format!(
                 "MONOCODE_HOST_UPGRADE_IF_OLDER=1\nMONOCODE_HOST_UPGRADE_PHASE={}\nMONOCODE_HOST_PORT=3774\n",
                 phase.word()
@@ -2628,7 +2854,19 @@ mod tests {
         assert!(swap.starts_with(prelude), "{swap}");
         assert!(swap.contains("export MONOCODE_CHECK_TOKEN='device-token-xyz'\n"));
         assert!(swap.contains("export MONOCODE_CHECK_ENV='env-9'\n"));
-        assert!(swap.contains("MONOCODE_HOST_UPGRADE_PHASE=swapnow\nMONOCODE_HOST_PORT=3790\n"));
+        assert!(swap.contains(
+            "MONOCODE_HOST_UPGRADE_PHASE=swapnow\nMONOCODE_HOST_PORT=3790\nMONOCODE_SWAP_NONCE='nonce-9'\n"
+        ));
+        // The status script asks for the same swap.
+        assert!(
+            codespace_upgrade_script(3774, UpgradePhase::Status, Some(check))
+                .contains("MONOCODE_SWAP_NONCE='nonce-9'\n")
+        );
+        // The launcher refuses a second worker and drops the credential before it returns.
+        assert!(
+            swap.contains("swap.lock")
+                && swap.contains("unset MONOCODE_CHECK_TOKEN MONOCODE_CHECK_ENV")
+        );
         assert!(swap.contains("ensure_detached_host"));
         assert!(swap.contains("setsid nohup sh \"$BASE/swap-worker.sh\""));
         // The prelude's secret is in the launcher only, not in the file the worker is saved to.

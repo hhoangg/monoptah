@@ -241,7 +241,7 @@ fn setup(
             token: "t".repeat(43),
             ssh: Some(target(sandbox)),
             pending_host_upgrade: false,
-            swap_unconfirmed: false,
+            swap_nonce: None,
         }],
     )
     .unwrap();
@@ -817,7 +817,7 @@ fn a_swap_the_app_never_saw_end_is_settled_at_the_next_connect() {
     let fx = setup_happy(vec!["idle"]);
     fx.connections
         .update_machine(MACHINE, |m| {
-            m.swap_unconfirmed = true;
+            m.swap_nonce = Some("n1".into());
             true
         })
         .unwrap();
@@ -836,14 +836,22 @@ fn a_swap_the_app_never_saw_end_is_settled_at_the_next_connect() {
     assert!(matches!(outcome, Outcome::Upgraded(_)), "{outcome:?}");
     // It asked first, reopened the tunnel to whatever runs now, and then upgraded normally.
     assert_eq!(fx.runner.phases(), ["status", "stage", "swapnow", "status"]);
+    // The first status asked for the nonce of the swap that was left behind.
+    assert!(fx.runner.scripts.lock().unwrap()[0]
+        .1
+        .contains("MONOCODE_SWAP_NONCE='n1'\n"));
+    // The swap that follows has a nonce of its own.
+    let scripts = fx.runner.scripts.lock().unwrap().clone();
+    assert!(scripts[2].1.contains("MONOCODE_SWAP_NONCE='"));
+    assert!(!scripts[2].1.contains("'n1'"));
     assert_eq!(fx.runner.tunnels.load(Ordering::SeqCst), 2);
-    assert!(
-        !fx.connections
-            .stored_machine(MACHINE)
-            .unwrap()
-            .unwrap()
-            .swap_unconfirmed
-    );
+    assert!(fx
+        .connections
+        .stored_machine(MACHINE)
+        .unwrap()
+        .unwrap()
+        .swap_nonce
+        .is_none());
 }
 
 #[test]
@@ -856,7 +864,7 @@ fn a_swap_is_marked_unconfirmed_while_it_runs_and_cleared_when_it_ends() {
         *fx.runner.on_script.lock().unwrap() = Box::new(move |phase, script| {
             if phase == "swapnow" {
                 let machine = connections.stored_machine(MACHINE).unwrap().unwrap();
-                seen.lock().unwrap().push(machine.swap_unconfirmed);
+                seen.lock().unwrap().push(machine.swap_nonce.is_some());
                 // Past the point of no return an app quit must not cancel it.
                 seen.lock()
                     .unwrap()
@@ -868,13 +876,13 @@ fn a_swap_is_marked_unconfirmed_while_it_runs_and_cleared_when_it_ends() {
     let (outcome, _) = upgrade(&fx, None);
     assert!(matches!(outcome, Outcome::Upgraded(_)));
     assert_eq!(*seen.lock().unwrap(), [true, true]);
-    assert!(
-        !fx.connections
-            .stored_machine(MACHINE)
-            .unwrap()
-            .unwrap()
-            .swap_unconfirmed
-    );
+    assert!(fx
+        .connections
+        .stored_machine(MACHINE)
+        .unwrap()
+        .unwrap()
+        .swap_nonce
+        .is_none());
     assert!(fx.connections.swap_jobs.lock().unwrap().is_empty());
     // The launcher carries the device credential for the worker's last look, on stdin only.
     let scripts = fx.runner.scripts.lock().unwrap().clone();

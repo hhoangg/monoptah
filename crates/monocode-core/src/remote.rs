@@ -207,10 +207,10 @@ struct StoredMachine {
     /// upgrade was deferred; the next connect that finds the Host idle upgrades it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pending_host_upgrade: bool,
-    /// A Host swap was started on the machine and the app never saw it end (it quit, or the
-    /// ssh dropped). The next upgrade pass asks the machine how it ended.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    swap_unconfirmed: bool,
+    /// The nonce of a Host swap that was started on the machine and that the app never saw
+    /// end (it quit, or the ssh dropped). The next upgrade pass asks the machine how it ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    swap_nonce: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -547,7 +547,7 @@ impl Connections {
             token,
             ssh: existing.and_then(|m| m.ssh.clone()),
             pending_host_upgrade: false,
-            swap_unconfirmed: false,
+            swap_nonce: None,
         };
         machines.retain(|m| m.id != id);
         machines.push(machine.clone());
@@ -883,7 +883,7 @@ impl Connections {
                         token,
                         ssh: Some(target.clone()),
                         pending_host_upgrade: false,
-                        swap_unconfirmed: false,
+                        swap_nonce: None,
                     }
                 };
                 job.message("Opening the secure connection…");
@@ -1378,7 +1378,7 @@ mod tests {
             token: "t".repeat(43),
             ssh,
             pending_host_upgrade: false,
-            swap_unconfirmed: false,
+            swap_nonce: None,
         }
     }
     fn codespace_target() -> SshTarget {
@@ -1975,7 +1975,7 @@ else:
             token: "secret".into(),
             ssh: None,
             pending_host_upgrade: false,
-            swap_unconfirmed: false,
+            swap_nonce: None,
         };
         let value = serde_json::to_string(&stored.public()).unwrap();
         assert!(!value.contains("secret"));
