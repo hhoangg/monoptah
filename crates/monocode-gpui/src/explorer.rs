@@ -438,20 +438,44 @@ impl Explorer {
             }
         }
     }
+    /// The open folders that are on screen and present in the listings: the root, and each
+    /// open folder whose parent is shown and lists it. A folder the loaded parent listing no
+    /// longer has is gone: it leaves `expanded` (and its listings) for good.
+    fn shown_dirs(&mut self) -> Vec<String> {
+        let gone: Vec<String> = self
+            .expanded
+            .iter()
+            .filter(|path| **path != self.cwd)
+            .filter(|path| match self.dirs.get(&parent_of(path)) {
+                Some(Ok(entries)) => !entries.iter().any(|e| e.is_dir && e.path == **path),
+                _ => false,
+            })
+            .cloned()
+            .collect();
+        for path in &gone {
+            self.expanded.remove(path);
+            self.forget(path);
+        }
+        let mut open: Vec<&String> = self.expanded.iter().collect();
+        open.sort_by_key(|path| path.matches('/').count());
+        let mut shown = HashSet::from([self.cwd.clone()]);
+        for path in open {
+            let listed = match self.dirs.get(&parent_of(path)) {
+                Some(Ok(entries)) => entries.iter().any(|e| e.is_dir && e.path == *path),
+                _ => false,
+            };
+            if listed && shown.contains(&parent_of(path)) {
+                shown.insert(path.clone());
+            }
+        }
+        shown.into_iter().collect()
+    }
     /// Tells the Host which folders are open, so it watches those and no others.
     fn publish_watch_dirs(&mut self, cx: &mut Context<Self>) {
         if !self.enabled || !self.available() || !self.is_remote_root() {
             return;
         }
-        let mut dirs: Vec<String> = self
-            .expanded
-            .iter()
-            .filter(|path| crate::remote_cache::within(&self.cwd, path))
-            .cloned()
-            .collect();
-        if !dirs.contains(&self.cwd) {
-            dirs.push(self.cwd.clone());
-        }
+        let dirs = self.shown_dirs();
         self.git.update(cx, |git, cx| {
             if git.root == self.cwd {
                 git.set_watch_dirs(dirs, cx)
@@ -2521,7 +2545,8 @@ mod tests {
                 git.update(cx, |git, cx| git.bind(ROOT.into(), false, cx));
                 explorer.cwd = ROOT.into();
                 explorer.enabled = true;
-                explorer.expanded = HashSet::from([ROOT.into(), src.clone()]);
+                let build = format!("{ROOT}/dir-build");
+                explorer.expanded = HashSet::from([ROOT.into(), src.clone(), build.clone()]);
                 explorer.dirs.insert(
                     ROOT.into(),
                     Ok(listing(ROOT, &["dir-src", "dir-lib", "a.rs"])),
@@ -2530,13 +2555,16 @@ mod tests {
                     .dirs
                     .insert(src.clone(), Ok(listing(&src, &["b.rs"])));
                 explorer.rebuild(cx);
-                // The open folders (and the root) are what the Host is asked to watch.
+                // The open folders that exist (and the root) are what the Host is asked to
+                // watch; `dir-build` is open but the listing no longer has it, so it is dropped
+                // for good.
                 git.update(cx, |git, _| {
                     assert_eq!(
                         git.watch_dirs_for_test(),
                         vec![ROOT.to_owned(), src.clone()]
                     );
                 });
+                assert!(!explorer.expanded.contains(&build));
                 // A named folder that is open is listed again; one that is not open is not;
                 // another root's event is ignored.
                 let event = |root: &str, dirs: Option<Vec<String>>| ReloadDirs {

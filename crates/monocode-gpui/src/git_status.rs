@@ -8,9 +8,9 @@ use gpui::{AsyncApp, Context, EventEmitter, Task, WeakEntity};
 use monocode_core::files::remote_watch::{self, Changes, LiveWatchHost, WatchHost};
 use monocode_core::scm::{self, DiffIndex, DiffStats};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -34,8 +34,11 @@ const SLOW_POLL: Duration = Duration::from_secs(15);
 const RELIST: Duration = Duration::from_secs(5);
 /// Folders the Explorer opens or closes are sent to the Host after this quiet time.
 const DIRS_DEBOUNCE: Duration = Duration::from_millis(500);
-/// After a failed watch call the next try comes this much later.
-const WATCH_RETRY: Duration = Duration::from_secs(5);
+/// After a failed watch call the next try comes after 5 s, then 10 s, 20 s ... up to 2 min; a
+/// watch the Host forgot is subscribed again after 1 s, then 2 s ... up to 30 s. A wait that
+/// succeeds starts both over.
+const FAIL_BACKOFF: (Duration, Duration) = (Duration::from_secs(5), Duration::from_secs(120));
+const UNKNOWN_BACKOFF: (Duration, Duration) = (Duration::from_secs(1), Duration::from_secs(30));
 /// A Host that cannot be asked about its capabilities is asked again this often.
 const CAPABILITY_RETRY: Duration = Duration::from_secs(30);
 /// A cloud workspace stops being watched or polled after this long without user input in the
@@ -51,6 +54,67 @@ pub(crate) struct GitChanged;
 pub(crate) struct ReloadDirs {
     pub root: String,
     pub dirs: Option<Vec<String>>,
+}
+
+/// A delay that doubles on every use up to a cap.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Backoff {
+    base: Duration,
+    cap: Duration,
+    next: Duration,
+}
+impl Backoff {
+    pub(crate) fn new((base, cap): (Duration, Duration)) -> Self {
+        Self {
+            base,
+            cap,
+            next: base,
+        }
+    }
+    /// The delay to use now; the next one is twice as long.
+    pub(crate) fn wait(&mut self) -> Duration {
+        let now = self.next;
+        self.next = (self.next * 2).min(self.cap);
+        now
+    }
+    pub(crate) fn reset(&mut self) {
+        self.next = self.base;
+    }
+}
+
+/// The Host watch of one run of the live mode. It is shared with the thread that creates the
+/// watch, so a watch created just as the run is stopped is ended at once instead of lasting
+/// until its lease runs out.
+#[derive(Default)]
+pub(crate) struct WatchSlot(Mutex<SlotState>);
+#[derive(Default)]
+struct SlotState {
+    cancelled: bool,
+    id: Option<(String, String)>,
+}
+impl WatchSlot {
+    /// Records a new watch; false when the run was stopped meanwhile (the caller ends it).
+    fn register(&self, root: &str, id: &str) -> bool {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if state.cancelled {
+            return false;
+        }
+        state.id = Some((root.to_owned(), id.to_owned()));
+        true
+    }
+    /// The Host dropped the watch.
+    fn clear(&self) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).id = None;
+    }
+    pub(crate) fn current(&self) -> Option<(String, String)> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).id.clone()
+    }
+    /// Stops the run; returns the watch to end, if one exists.
+    fn cancel(&self) -> Option<(String, String)> {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.cancelled = true;
+        state.id.take()
+    }
 }
 
 /// What a cloud workspace is doing to learn about changes.
@@ -158,11 +222,21 @@ pub(crate) struct ProjectGit {
     mode: Option<Mode>,
     live: Live,
     host: Arc<dyn WatchHost>,
-    /// (root, id) of the Host watch in use.
-    watch_id: Option<(String, String)>,
-    /// The folders the Explorer has open, as full remote paths.
+    /// The Host watch of the current live run.
+    slot: Arc<WatchSlot>,
+    /// The folders the Explorer shows open, as full remote paths.
     watch_dirs: Vec<String>,
+    /// Folders the Host refused (gone, or not folders); they are left out of what is sent until
+    /// the Explorer's list drops them.
+    rejected: HashSet<String>,
+    /// A folder update is on its way; the next one waits for it, so they arrive in order.
+    update_in_flight: bool,
+    /// The folders changed (or an update failed) since the last one sent.
+    update_dirty: bool,
+    update_backoff: Backoff,
     dirs_task: Option<Task<()>>,
+    /// The next live start lists every loaded folder again (the window was idle).
+    resumed: bool,
     window_active: bool,
     panel_visible: bool,
     /// No user input for `IDLE_TICKS` ticks: a cloud workspace is left alone until the next one.
@@ -204,9 +278,14 @@ impl ProjectGit {
             mode: None,
             live: Live::Unknown,
             host: Arc::new(LiveWatchHost),
-            watch_id: None,
+            slot: Arc::default(),
             watch_dirs: Vec::new(),
+            rejected: HashSet::new(),
+            update_in_flight: false,
+            update_dirty: false,
+            update_backoff: Backoff::new(FAIL_BACKOFF),
             dirs_task: None,
+            resumed: false,
             window_active: true,
             panel_visible: true,
             idle: false,
@@ -226,6 +305,10 @@ impl ProjectGit {
     #[cfg(test)]
     pub(crate) fn poll_is_off_for_test(&self) -> bool {
         self.poll.is_none()
+    }
+    #[cfg(test)]
+    pub(crate) fn panel_visible_for_test(&self) -> bool {
+        self.panel_visible
     }
     #[cfg(test)]
     pub(crate) fn watch_dirs_for_test(&self) -> Vec<String> {
@@ -405,6 +488,7 @@ impl ProjectGit {
         self.input_epoch += 1;
         if self.idle {
             self.idle = false;
+            self.resumed = true;
             self.apply_polling(true, cx);
         }
     }
@@ -435,13 +519,21 @@ impl ProjectGit {
         if wanted == self.mode {
             return;
         }
+        let was = self.mode;
         self.stop_poll(cx);
         self.mode = wanted;
         match wanted {
             None => {}
             Some(Mode::Local) => self.start_local(read, cx),
             Some(Mode::Slow) => self.start_remote(read, false, cx),
-            Some(Mode::Live) => self.start_remote(read, true, cx),
+            Some(Mode::Live) => {
+                self.start_remote(read, true, cx);
+                // Changes in folders nobody watched meanwhile (build output, say) were missed.
+                if was == Some(Mode::Slow) || std::mem::take(&mut self.resumed) {
+                    let root = self.project.clone();
+                    cx.emit(ReloadDirs { root, dirs: None });
+                }
+            }
         }
     }
     /// Stops every timer and the watch, and ends the Host watch (best effort: the Host also
@@ -451,7 +543,13 @@ impl ProjectGit {
         self.mode = None;
         self.live = Live::Unknown;
         self.dirs_task = None;
-        if let Some((root, id)) = self.watch_id.take() {
+        self.update_in_flight = false;
+        self.update_dirty = false;
+        self.update_backoff.reset();
+        self.rejected.clear();
+        // A watch being created right now ends itself when it finds the run stopped.
+        let ended = std::mem::take(&mut self.slot).cancel();
+        if let Some((root, id)) = ended {
             let host = self.host.clone();
             cx.background_executor()
                 .spawn(async move { host.unwatch(&root, &id) })
@@ -574,13 +672,16 @@ impl ProjectGit {
         }
         self.poll = Some(tasks);
     }
-    /// Asks the Host once whether it can watch, then keeps one watch alive: waits for changes,
-    /// and subscribes again when the Host forgot the watch.
+    /// Asks the Host whether it can watch, then keeps one watch alive: waits for changes, and
+    /// subscribes again when the Host forgot the watch.
     async fn watch_loop(this: &WeakEntity<Self>, cx: &mut AsyncApp) {
-        let Ok((host, root)) = this.update(cx, |this, _| (this.host.clone(), this.project.clone()))
-        else {
+        let Ok((host, root, slot)) = this.update(cx, |this, _| {
+            (this.host.clone(), this.project.clone(), this.slot.clone())
+        }) else {
             return;
         };
+        let mut backoffs = (Backoff::new(FAIL_BACKOFF), Backoff::new(UNKNOWN_BACKOFF));
+        let mut established = false;
         loop {
             let (asked, root_asked) = (host.clone(), root.clone());
             let capable = cx
@@ -599,42 +700,66 @@ impl ProjectGit {
                     continue;
                 }
             }
-            Self::subscription(this, cx, &host, &root).await;
+            let kept =
+                Self::subscription(this, cx, (&host, &root, &slot), &mut backoffs, established)
+                    .await;
+            match kept {
+                Some(was_established) => established |= was_established,
+                None => return,
+            }
         }
     }
-    /// One watch, from its creation to the Host forgetting it or a failure. Returns after the
-    /// pause that follows a failure.
+    /// One watch, from its creation to the Host forgetting it or a failure, then the pause that
+    /// follows. Returns whether the watch was created, or `None` when the run is over.
     async fn subscription(
         this: &WeakEntity<Self>,
         cx: &mut AsyncApp,
-        host: &Arc<dyn WatchHost>,
-        root: &str,
-    ) {
-        let Ok(dirs) = this.update(cx, |this, _| this.watch_dirs.clone()) else {
-            return;
-        };
-        let (h, r, d) = (host.clone(), root.to_owned(), dirs.clone());
+        (host, root, slot): (&Arc<dyn WatchHost>, &str, &Arc<WatchSlot>),
+        (fail, unknown): &mut (Backoff, Backoff),
+        resubscribing: bool,
+    ) -> Option<bool> {
+        let dirs = this
+            .update(cx, |this, _| {
+                this.rejected.clear();
+                this.watch_dirs.clone()
+            })
+            .ok()?;
+        let (h, r, d, s) = (host.clone(), root.to_owned(), dirs.clone(), slot.clone());
         let created = cx
             .background_executor()
-            .spawn(async move { h.watch(&r, &d) })
+            .spawn(async move {
+                let (id, left_out) = remote_watch::start_filtered(&*h, &r, &d)?;
+                // The run may have been stopped while the Host made the watch.
+                if s.register(&r, &id) {
+                    Ok((id, left_out))
+                } else {
+                    h.unwatch(&r, &id);
+                    Err("Watch stopped".to_owned())
+                }
+            })
             .await;
-        let id = match created {
-            Ok(id) => id,
+        let (id, left_out) = match created {
+            Ok(created) => created,
             Err(_) => {
                 let _ = this.update(cx, |this, _| this.live = Live::Fallback);
-                cx.background_executor().timer(WATCH_RETRY).await;
-                return;
+                cx.background_executor().timer(fail.wait()).await;
+                return Some(false);
             }
         };
         let kept = this.update(cx, |this, cx| {
             this.live = Live::Watch;
-            this.watch_id = Some((root.to_owned(), id.clone()));
+            this.rejected = left_out.into_iter().collect();
+            if resubscribing {
+                // Events between the two watches were lost.
+                let root = root.to_owned();
+                cx.emit(ReloadDirs { root, dirs: None });
+            }
             if this.watch_dirs != dirs {
                 this.send_dirs(cx);
             }
         });
         if kept.is_err() {
-            return;
+            return None;
         }
         loop {
             let (h, r, i) = (host.clone(), root.to_owned(), id.clone());
@@ -645,12 +770,14 @@ impl ProjectGit {
                 .await;
             match waited {
                 Ok(changes) => {
+                    fail.reset();
+                    unknown.reset();
                     let empty = changes == Changes::default();
                     if this
                         .update(cx, |this, cx| this.on_changes(root, changes, cx))
                         .is_err()
                     {
-                        return;
+                        return None;
                     }
                     if empty && started.elapsed() < Duration::from_millis(500) {
                         // The Host answers at once only when something is wrong.
@@ -658,10 +785,10 @@ impl ProjectGit {
                     }
                 }
                 Err(error) => {
-                    let unknown = remote_watch::is_watch_unknown(&error);
+                    let forgot = remote_watch::is_watch_unknown(&error);
+                    slot.clear();
                     let _ = this.update(cx, |this, cx| {
-                        this.watch_id = None;
-                        if !unknown {
+                        if !forgot {
                             this.live = Live::Fallback;
                             let (h, r, i) = (this.host.clone(), root.to_owned(), id.clone());
                             cx.background_executor()
@@ -669,10 +796,9 @@ impl ProjectGit {
                                 .detach();
                         }
                     });
-                    if !unknown {
-                        cx.background_executor().timer(WATCH_RETRY).await;
-                    }
-                    return;
+                    let pause = if forgot { unknown.wait() } else { fail.wait() };
+                    cx.background_executor().timer(pause).await;
+                    return Some(true);
                 }
             }
         }
@@ -697,7 +823,7 @@ impl ProjectGit {
             });
         }
     }
-    /// The folders the Explorer has open (full remote paths). The Host is told after a quiet
+    /// The folders the Explorer shows open (full remote paths). The Host is told after a quiet
     /// moment, so opening several folders in a row is one call.
     pub(crate) fn set_watch_dirs(&mut self, mut dirs: Vec<String>, cx: &mut Context<Self>) {
         dirs.sort();
@@ -705,30 +831,83 @@ impl ProjectGit {
         if dirs == self.watch_dirs {
             return;
         }
+        self.rejected.retain(|dir| dirs.contains(dir));
         self.watch_dirs = dirs;
-        if self.watch_id.is_none() {
+        if self.slot.current().is_none() {
             // The watch picks the folders up when it is created.
             return;
         }
+        self.update_dirty = true;
         self.dirs_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(DIRS_DEBOUNCE).await;
             let _ = this.update(cx, |this, cx| this.send_dirs(cx));
         }));
     }
+    /// The folders to send: the Explorer's, less those the Host refused.
+    fn effective_dirs(&self) -> Vec<String> {
+        self.watch_dirs
+            .iter()
+            .filter(|dir| !self.rejected.contains(*dir))
+            .cloned()
+            .collect()
+    }
+    /// Sends the folders to the Host. One update is on its way at a time, so two can never
+    /// arrive out of order; one that fails is sent again later.
     fn send_dirs(&mut self, cx: &mut Context<Self>) {
-        let Some((root, id)) = self.watch_id.clone() else {
+        if self.update_in_flight {
+            self.update_dirty = true;
+            return;
+        }
+        let Some((root, id)) = self.slot.current() else {
             return;
         };
         if root != self.project || self.stale() {
             return;
         }
-        let (host, dirs) = (self.host.clone(), self.watch_dirs.clone());
-        cx.background_executor()
-            .spawn(async move {
-                // A watch the Host forgot is found by the next wait, which subscribes again.
-                let _ = host.update(&root, &id, &dirs);
-            })
-            .detach();
+        self.update_in_flight = true;
+        self.update_dirty = false;
+        let (host, dirs) = (self.host.clone(), self.effective_dirs());
+        let (r, i) = (root.clone(), id.clone());
+        let work = cx
+            .background_executor()
+            .spawn(async move { remote_watch::update_filtered(&*host, &r, &i, &dirs) });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |this, cx| this.update_done(root, id, result, cx));
+        })
+        .detach();
+    }
+    fn update_done(
+        &mut self,
+        root: String,
+        id: String,
+        result: Result<Vec<String>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.slot.current() != Some((root, id)) {
+            // That watch is over; its successor starts with the current folders.
+            return;
+        }
+        self.update_in_flight = false;
+        match result {
+            Ok(left_out) => {
+                self.update_backoff.reset();
+                self.rejected.extend(left_out);
+                if self.update_dirty {
+                    self.send_dirs(cx);
+                }
+            }
+            // The next wait finds the watch gone and subscribes again.
+            Err(error) if remote_watch::is_watch_unknown(&error) => self.update_dirty = false,
+            Err(_) => {
+                self.update_dirty = true;
+                let pause = self.update_backoff.wait();
+                self.dirs_task = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(pause).await;
+                    let _ = this.update(cx, |this, cx| this.send_dirs(cx));
+                }));
+            }
+        }
     }
     /// useProjectDiffStats reads again on focus once its snapshot is 30s old.
     pub(crate) fn resume(&mut self, cx: &mut Context<Self>) {
@@ -1108,7 +1287,7 @@ mod tests {
 
     // --- the Host watch ---
 
-    use std::{cell::RefCell, collections::VecDeque, rc::Rc, sync::Mutex};
+    use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
     /// A Host that records every call and answers `wait` from a script. It has no way to wake
     /// anything: any call it sees came through the no-wake request path.
@@ -1118,6 +1297,12 @@ mod tests {
         watch_error: Mutex<Option<String>>,
         calls: Mutex<Vec<String>>,
         ids: Mutex<u32>,
+        /// Folders that are gone: any list holding one is refused, as the Host does.
+        bad: Mutex<HashSet<String>>,
+        /// The next this many `update` calls fail as if the link dropped.
+        update_failures: Mutex<u32>,
+        /// Runs inside `watch`, before it answers.
+        on_watch: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     }
     impl FakeHost {
         fn new(supports: Result<bool, String>) -> Arc<Self> {
@@ -1127,6 +1312,9 @@ mod tests {
                 watch_error: Mutex::new(None),
                 calls: Mutex::new(Vec::new()),
                 ids: Mutex::new(0),
+                bad: Mutex::new(HashSet::new()),
+                update_failures: Mutex::new(0),
+                on_watch: Mutex::new(None),
             })
         }
         fn script(&self, wait: Result<Changes, String>) {
@@ -1134,6 +1322,13 @@ mod tests {
         }
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
+        }
+        fn last_update(&self) -> String {
+            self.calls()
+                .into_iter()
+                .rev()
+                .find(|c| c.starts_with("update"))
+                .unwrap_or_default()
         }
         fn count(&self, prefix: &str) -> usize {
             self.calls()
@@ -1152,8 +1347,18 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("watch {root} {}", dirs.join(",")));
+            let hook = self.on_watch.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
             if let Some(error) = self.watch_error.lock().unwrap().clone() {
                 return Err(error);
+            }
+            if dirs
+                .iter()
+                .any(|dir| self.bad.lock().unwrap().contains(dir))
+            {
+                return Err("ENOENT: no such file or directory, realpath".into());
             }
             let mut ids = self.ids.lock().unwrap();
             *ids += 1;
@@ -1164,6 +1369,17 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("update {id} {}", dirs.join(",")));
+            let mut failures = self.update_failures.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                return Err("Machine is unreachable.".into());
+            }
+            if dirs
+                .iter()
+                .any(|dir| self.bad.lock().unwrap().contains(dir))
+            {
+                return Err("Path is outside the workspace".into());
+            }
             Ok(())
         }
         fn wait(&self, _: &str, id: &str) -> Result<Changes, String> {
@@ -1262,8 +1478,15 @@ mod tests {
             git: true,
             ..Default::default()
         }));
-        let (git, _) = watched(&host, cx);
+        let (git, events) = watched(&host, cx);
+        assert_eq!(host.count("watch "), 1, "it waits a second first");
+        advance(cx, Duration::from_millis(1100));
         assert_eq!(host.count("watch "), 2, "{:?}", host.calls());
+        assert_eq!(
+            *events.borrow(),
+            vec![None],
+            "the folders are listed again after a new watch"
+        );
         assert!(host.count("wait w2") >= 1);
         assert_eq!(
             host.count("unwatch"),
@@ -1271,7 +1494,7 @@ mod tests {
             "the Host already forgot the old watch"
         );
         git.update(cx, |git, _| {
-            assert_eq!(git.watch_id.as_ref().map(|w| w.1.as_str()), Some("w2"))
+            assert_eq!(git.slot.current().map(|w| w.1), Some("w2".to_owned()))
         });
     }
 
@@ -1434,7 +1657,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let host = FakeHost::new(Ok(true));
-        let (git, _) = watched(&host, cx);
+        let (git, events) = watched(&host, cx);
         git.update(cx, |git, cx| {
             git.set_watch_dirs(vec![format!("{A}/src")], cx)
         });
@@ -1451,13 +1674,22 @@ mod tests {
             "the new root starts with no folders of the old one: {calls:?}"
         );
         git.update(cx, |git, _| {
-            assert_eq!(git.watch_id, Some((B.into(), "w2".into())));
+            assert_eq!(git.slot.current(), Some((B.into(), "w2".into())));
             assert!(git.watch_dirs.is_empty());
         });
-        // An event of the old root that was already on its way is dropped.
+        // An event of the old root that was already on its way is dropped: it reads nothing
+        // and lists nothing.
+        let (reads_before, events_before) = (reads(&git, cx), events.borrow().len());
         git.update(cx, |git, cx| {
-            git.on_changes(A, dirs_changed(&[A]), cx);
+            let changes = Changes {
+                git: true,
+                dirs: vec![A.into()],
+                overflow: true,
+            };
+            git.on_changes(A, changes, cx);
         });
+        assert_eq!(reads(&git, cx), reads_before);
+        assert_eq!(events.borrow().len(), events_before);
     }
 
     #[gpui::test]
@@ -1526,5 +1758,214 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(host.calls().is_empty());
+    }
+
+    #[gpui::test]
+    fn a_vanished_folder_is_left_out_and_the_watch_keeps_working(cx: &mut TestAppContext) {
+        let host = FakeHost::new(Ok(true));
+        host.bad.lock().unwrap().insert(format!("{A}/build"));
+        let git = cx.new(|cx| ProjectGit::new("~".into(), cx));
+        git.update(cx, |git, cx| {
+            git.host = host.clone();
+            git.bind(A.into(), false, cx);
+            git.set_watch_dirs(vec![A.into(), format!("{A}/src"), format!("{A}/build")], cx);
+            git.set_polling(true, cx);
+        });
+        cx.run_until_parked();
+        let calls = host.calls();
+        // The whole list is refused, the root alone is watched, and the good folders are found.
+        assert_eq!(host.count("watch "), 2, "{calls:?}");
+        assert_eq!(host.last_update(), format!("update w1 {A},{A}/src"));
+        git.update(cx, |git, _| {
+            assert_eq!(git.live, Live::Watch, "no fall back to polling");
+            assert_eq!(git.rejected, HashSet::from([format!("{A}/build")]));
+        });
+        advance(cx, Duration::from_secs(60));
+        assert_eq!(host.count("watch "), 2, "no failing call repeats");
+        // A folder that goes bad later is dropped from the update; the rest is still watched.
+        host.bad.lock().unwrap().insert(format!("{A}/src"));
+        git.update(cx, |git, cx| {
+            git.set_watch_dirs(vec![A.into(), format!("{A}/src"), format!("{A}/lib")], cx)
+        });
+        advance(cx, Duration::from_millis(600));
+        assert_eq!(host.last_update(), format!("update w1 {A},{A}/lib"));
+        git.update(cx, |git, _| {
+            assert_eq!(git.live, Live::Watch);
+            assert!(git.rejected.contains(&format!("{A}/src")));
+        });
+        // The Explorer drops it from its list: it is forgotten and later sent again.
+        git.update(cx, |git, cx| {
+            git.set_watch_dirs(vec![A.into(), format!("{A}/lib")], cx)
+        });
+        advance(cx, Duration::from_millis(600));
+        git.update(cx, |git, _| assert!(git.rejected.is_empty()));
+    }
+
+    #[gpui::test]
+    fn a_watch_that_keeps_failing_is_retried_after_5_10_20_seconds(cx: &mut TestAppContext) {
+        let host = FakeHost::new(Ok(true));
+        *host.watch_error.lock().unwrap() = Some("Machine is unreachable.".into());
+        let (git, _) = watched(&host, cx);
+        assert_eq!(host.count("watch "), 1);
+        advance(cx, Duration::from_millis(4900));
+        assert_eq!(host.count("watch "), 1);
+        advance(cx, Duration::from_millis(200));
+        assert_eq!(host.count("watch "), 2, "after 5 s");
+        advance(cx, Duration::from_millis(9800));
+        assert_eq!(host.count("watch "), 2);
+        advance(cx, Duration::from_millis(200));
+        assert_eq!(host.count("watch "), 3, "10 s later");
+        advance(cx, Duration::from_millis(19800));
+        assert_eq!(host.count("watch "), 3);
+        advance(cx, Duration::from_millis(200));
+        assert_eq!(host.count("watch "), 4, "20 s later");
+        git.update(cx, |git, _| assert_eq!(git.live, Live::Fallback));
+    }
+
+    #[test]
+    fn backoff_doubles_up_to_its_cap_and_starts_over() {
+        let mut backoff = Backoff::new(FAIL_BACKOFF);
+        let seen: Vec<u64> = (0..7).map(|_| backoff.wait().as_secs()).collect();
+        assert_eq!(seen, [5, 10, 20, 40, 80, 120, 120]);
+        backoff.reset();
+        assert_eq!(backoff.wait().as_secs(), 5);
+        let mut unknown = Backoff::new(UNKNOWN_BACKOFF);
+        let seen: Vec<u64> = (0..7).map(|_| unknown.wait().as_secs()).collect();
+        assert_eq!(seen, [1, 2, 4, 8, 16, 30, 30]);
+    }
+
+    #[gpui::test]
+    fn a_forgotten_watch_is_subscribed_again_after_one_two_four_seconds(cx: &mut TestAppContext) {
+        let host = FakeHost::new(Ok(true));
+        for _ in 0..3 {
+            host.script(Err("watch_unknown: watcher is unknown or expired".into()));
+        }
+        let (_git, _) = watched(&host, cx);
+        assert_eq!(host.count("watch "), 1);
+        advance(cx, Duration::from_millis(900));
+        assert_eq!(host.count("watch "), 1);
+        advance(cx, Duration::from_millis(200));
+        assert_eq!(host.count("watch "), 2, "after 1 s");
+        advance(cx, Duration::from_millis(1800));
+        assert_eq!(host.count("watch "), 2);
+        advance(cx, Duration::from_millis(300));
+        assert_eq!(host.count("watch "), 3, "2 s later");
+        advance(cx, Duration::from_millis(3600));
+        assert_eq!(host.count("watch "), 3);
+        advance(cx, Duration::from_millis(300));
+        assert_eq!(host.count("watch "), 4, "4 s later");
+    }
+
+    #[gpui::test]
+    fn a_folder_update_that_fails_is_sent_again_with_the_latest_list(cx: &mut TestAppContext) {
+        let host = FakeHost::new(Ok(true));
+        let (git, _) = watched(&host, cx);
+        *host.update_failures.lock().unwrap() = 1;
+        git.update(cx, |git, cx| {
+            git.set_watch_dirs(vec![A.into(), format!("{A}/b")], cx)
+        });
+        advance(cx, Duration::from_millis(600));
+        assert_eq!(host.count("update"), 1, "the first try fails");
+        git.update(cx, |git, cx| {
+            git.set_watch_dirs(vec![A.into(), format!("{A}/b"), format!("{A}/c")], cx)
+        });
+        advance(cx, Duration::from_millis(600));
+        // The new list went out at its debounce, and succeeded.
+        assert_eq!(host.last_update(), format!("update w1 {A},{A}/b,{A}/c"));
+        // A failure with nothing newer is retried after 5 s.
+        *host.update_failures.lock().unwrap() = 1;
+        git.update(cx, |git, cx| {
+            git.set_watch_dirs(vec![A.into(), format!("{A}/d")], cx)
+        });
+        advance(cx, Duration::from_millis(600));
+        let tries = host.count("update");
+        advance(cx, Duration::from_millis(4000));
+        assert_eq!(host.count("update"), tries);
+        advance(cx, Duration::from_millis(1500));
+        assert_eq!(host.count("update"), tries + 1);
+        assert_eq!(host.last_update(), format!("update w1 {A},{A}/d"));
+        advance(cx, Duration::from_secs(60));
+        assert_eq!(
+            host.count("update"),
+            tries + 1,
+            "it stops once it went through"
+        );
+    }
+
+    #[gpui::test]
+    fn folder_updates_go_one_at_a_time_and_in_order(cx: &mut TestAppContext) {
+        let host = FakeHost::new(Ok(true));
+        let (git, _) = watched(&host, cx);
+        git.update(cx, |git, cx| {
+            git.watch_dirs = vec![A.into(), format!("{A}/one")];
+            git.send_dirs(cx);
+            assert!(git.update_in_flight);
+            // Asked again while the first is on its way: it waits.
+            git.watch_dirs = vec![A.into(), format!("{A}/two")];
+            git.send_dirs(cx);
+            assert!(git.update_dirty);
+        });
+        cx.run_until_parked();
+        let updates: Vec<String> = host
+            .calls()
+            .into_iter()
+            .filter(|c| c.starts_with("update"))
+            .collect();
+        assert_eq!(
+            updates,
+            vec![
+                format!("update w1 {A},{A}/one"),
+                format!("update w1 {A},{A}/two")
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn a_watch_created_as_its_run_is_stopped_is_ended_at_once(cx: &mut TestAppContext) {
+        let host = FakeHost::new(Ok(true));
+        let git = cx.new(|cx| ProjectGit::new("~".into(), cx));
+        git.update(cx, |git, cx| {
+            git.host = host.clone();
+            git.bind(A.into(), false, cx);
+            git.set_polling(true, cx);
+            // The run is stopped while the Host is still making the watch.
+            let slot = git.slot.clone();
+            *host.on_watch.lock().unwrap() = Some(Arc::new(move || {
+                slot.cancel();
+            }));
+        });
+        cx.run_until_parked();
+        assert_eq!(host.count("watch "), 1);
+        assert_eq!(
+            host.count(&format!("unwatch {A} w1")),
+            1,
+            "{:?}",
+            host.calls()
+        );
+        assert_eq!(host.count("wait"), 0, "and it is never waited on");
+        git.update(cx, |git, _| assert!(git.slot.current().is_none()));
+    }
+
+    #[gpui::test]
+    fn the_loaded_folders_are_listed_again_after_idle_and_after_an_unfocused_spell(
+        cx: &mut TestAppContext,
+    ) {
+        let host = FakeHost::new(Ok(true));
+        let (git, events) = watched(&host, cx);
+        assert!(events.borrow().is_empty(), "the first watch lists nothing");
+        git.update(cx, |git, cx| git.set_window_active(false, cx));
+        cx.run_until_parked();
+        assert!(events.borrow().is_empty());
+        git.update(cx, |git, cx| git.set_window_active(true, cx));
+        cx.run_until_parked();
+        assert_eq!(*events.borrow(), vec![None], "after being unfocused");
+        for _ in 0..21 {
+            advance(cx, IDLE_TICK);
+        }
+        git.update(cx, |git, _| assert!(git.idle));
+        events.borrow_mut().clear();
+        git.update(cx, |git, cx| git.note_input(cx));
+        cx.run_until_parked();
+        assert_eq!(*events.borrow(), vec![None], "after being idle");
     }
 }
