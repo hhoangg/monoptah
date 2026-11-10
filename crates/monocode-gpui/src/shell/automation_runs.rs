@@ -391,9 +391,8 @@ impl Shell {
         // default account (say, a new setup token) would break the resume.
         // A new session, or one whose account was removed, takes the selection.
         let keep = reuse.is_some()
-            && crate::accounts::get(cx).is_some_and(|accounts| {
-                accounts.read(cx).book.exists(kind, &settings.account.id)
-            });
+            && crate::accounts::get(cx)
+                .is_some_and(|accounts| accounts.read(cx).book.exists(kind, &settings.account.id));
         if !keep {
             settings.account = crate::accounts::get(cx)
                 .map(|accounts| accounts.read(cx).selected(kind, &automation.cwd))

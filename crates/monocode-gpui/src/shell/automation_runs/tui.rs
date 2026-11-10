@@ -411,9 +411,7 @@ mod tests {
     /// A continued chat keeps its own account even after another account
     /// became the provider's default: its transcript lives in that account.
     #[gpui::test]
-    fn a_continued_chat_keeps_its_account_when_another_is_the_default(
-        cx: &mut TestAppContext,
-    ) {
+    fn a_continued_chat_keeps_its_account_when_another_is_the_default(cx: &mut TestAppContext) {
         let project = Project::new(false);
         let (window, _clis) = shell(cx, &[("claude", Surface::Chat)]);
         let (sibling, preferred) = window
@@ -470,7 +468,12 @@ mod tests {
                         .contains_key(&sibling),
                     "the run continues the earlier chat"
                 );
-                let account = shell.sessions[&sibling].read(cx).settings.account.id.clone();
+                let account = shell.sessions[&sibling]
+                    .read(cx)
+                    .settings
+                    .account
+                    .id
+                    .clone();
                 assert_ne!(account, preferred);
                 assert_eq!(account, monocode_core::accounts::DEFAULT);
             })
