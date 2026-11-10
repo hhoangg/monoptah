@@ -1395,6 +1395,11 @@ get them after HR2.
   - the first cloud turn gets the moved-path note;
   - refuse while the session is busy, or when HEAD or the last row changed before the
     flip.
+  - **F4-2h contract:** `sessions.import` refuses a Claude session id that an earlier Host
+    session with turns (or a running one) still binds, and return-to-local only tombstones
+    the session in the app. So before importing the same conversation to a Host again,
+    F4-3a must `sessions.delete` (or unbind) the old Host session there. An untouched
+    session from an earlier import is reused, so a retry of the same step is safe.
 - **Acceptance:**
   - [ ] Tests with fakes for git, the Host and backends:
     - every step is idempotent;

@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import {
   closeSync,
   copyFileSync,
@@ -62,15 +62,18 @@ async function git(
   args: string[],
   env: NodeJS.ProcessEnv = {},
   timeout = GIT_TIMEOUT_MS,
+  input?: string,
 ): Promise<string> {
   try {
-    const { stdout } = await exec("git", args, {
+    const child = exec("git", args, {
       cwd,
       timeout,
       maxBuffer: MAX_BUFFER,
       encoding: "utf8",
       env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...env },
     });
+    if (input !== undefined) child.child.stdin?.end(input);
+    const { stdout } = await child;
     return stdout;
   } catch (error) {
     throw failure(error);
@@ -158,7 +161,7 @@ export async function validatePatch(target: string, patch: string): Promise<stri
  * directory (the real objects are read through an alternate), so the repository is not
  * polluted and the real index is never touched.
  */
-export async function worktreeTree(cwd: string): Promise<string> {
+export async function worktreeTree(cwd: string, extra: string[] = []): Promise<string> {
   const scratch = mkdtempSync(join(tmpdir(), "monoptah-snapshot-"));
   try {
     const common = (await git(cwd, ["rev-parse", "--git-common-dir"])).trim();
@@ -175,10 +178,43 @@ export async function worktreeTree(cwd: string): Promise<string> {
     };
     await git(cwd, ["read-tree", "HEAD"], env);
     await git(cwd, ["add", "-A"], env);
+    // The sender starts from a copy of its REAL index, so a staged file that .gitignore
+    // matches (a force-added one) is in its tree and its patch, but `add -A` skips it
+    // here. The files the patch touches are put in explicitly (present: added, gone:
+    // removed), which does not consult .gitignore.
+    if (extra.length)
+      await git(cwd, ["update-index", "--add", "--remove", "-z", "--stdin"], env, GIT_TIMEOUT_MS, extra.join("\0") + "\0");
     return (await git(cwd, ["write-tree"], env)).trim();
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
+}
+
+/**
+ * Branches that may be origin's default (the Rust `default_branches`, without failing
+ * closed when origin cannot be asked: the pushed branch must be fetchable anyway):
+ * the target of `origin/HEAD`, `main` / `master` when they exist on origin, and what a
+ * read-only `ls-remote --symref` reports.
+ */
+export async function defaultBranches(root: string): Promise<string[]> {
+  const names = new Set<string>();
+  const head = (await git(root, ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]).catch(() => "")).trim();
+  const prefix = "refs/remotes/origin/";
+  if (head.startsWith(prefix)) names.add(head.slice(prefix.length));
+  for (const name of ["main", "master"])
+    if (await gitOk(root, ["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${name}`]))
+      names.add(name);
+  const remote = await git(root, ["ls-remote", "--symref", "origin", "HEAD"], {}, 15_000).catch(() => "");
+  for (const line of remote.split("\n")) {
+    const match = /^ref: refs\/heads\/(\S+)/.exec(line);
+    if (match) names.add(match[1]);
+  }
+  const heads = await git(root, ["ls-remote", "--heads", "origin", "refs/heads/main", "refs/heads/master"], {}, 15_000).catch(() => "");
+  for (const line of heads.split("\n")) {
+    const match = /\trefs\/heads\/(main|master)$/.exec(line);
+    if (match) names.add(match[1]);
+  }
+  return [...names];
 }
 
 export interface SnapshotResult {
@@ -206,6 +242,22 @@ export interface ImportResult {
   reused: boolean;
 }
 
+/** Fixed limit for a transcript upload read by `sessions.import`. */
+export const MAX_JSONL_BYTES = 50 * 1024 * 1024;
+
+/**
+ * The id a diverged copy is forked to, derived from the source id and the incoming chain
+ * so that a retry after a lost response lands on the same file and the same Host session.
+ */
+export function forkSessionId(sourceId: string, text: string): string {
+  const h = createHash("sha256")
+    .update(sourceId)
+    .update("\0")
+    .update(parseChain(text).join("\n"))
+    .digest("hex");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-${"89ab"[parseInt(h[16], 16) % 4]}${h.slice(17, 20)}-${h.slice(20, 32)}`;
+}
+
 export interface InstalledTranscript {
   decision: Decision;
   /** The session id the transcript lives under (new when it forked). */
@@ -213,6 +265,8 @@ export interface InstalledTranscript {
   file: string;
   /** Set when an existing file was replaced and kept. */
   backup?: string;
+  /** False when a fork from an earlier attempt was already there and is reused. */
+  created?: boolean;
 }
 
 const nanos = () => `${process.hrtime.bigint()}`;
@@ -284,11 +338,20 @@ export function installTranscript(input: {
         renameSync(tmp, dest);
         return { decision, id, file: dest, backup };
       }
-      const forkId = (input.newId ?? randomUUID)();
+      const forkId = input.newId ? input.newId() : forkSessionId(id, text);
       const forked = join(dir, `${forkId}.jsonl`);
-      writeSynced(tmp, forkTranscript(text, forkId));
-      linkSync(tmp, forked);
-      return { decision, id: forkId, file: forked };
+      const forkText = forkTranscript(text, forkId);
+      writeSynced(tmp, forkText);
+      try {
+        linkSync(tmp, forked);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        // A retry: the fork of this very transcript is already there.
+        if (decide(readFileSync(forked), forkText) !== "already_current")
+          throw new Error("A fork with this id already exists and differs");
+        return { decision, id: forkId, file: forked, created: false };
+      }
+      return { decision, id: forkId, file: forked, created: true };
     } finally {
       rmSync(tmp, { force: true });
     }
@@ -296,19 +359,25 @@ export function installTranscript(input: {
   throw new Error("The transcript on this machine keeps changing");
 }
 
-/** Distinct top-level `cwd` strings of the entries. */
-function transcriptCwds(text: string): string[] {
-  const found = new Set<string>();
+/**
+ * The session's own cwd: the top-level `cwd` of the first entry that has one. Other cwds in
+ * the file (a subdirectory the session moved into, a path outside the project) are NOT
+ * sources: the Rust side rewrites only the project cwd and the session cwd, and
+ * `rewriteCwd` keeps the rest of a path (`/src/app/pkg` becomes `/dst/app/pkg`).
+ */
+function firstSessionCwd(text: string): string | undefined {
   for (const line of text.split("\n")) {
-    if (!line.includes('"cwd"') || !probeLine(line.replace(/\r$/, ""))) continue;
+    if (!line.includes('"cwd"')) continue;
+    const body = line.replace(/\r$/, "");
+    if (!probeLine(body)) continue;
     try {
-      const cwd = (JSON.parse(line) as { cwd?: unknown }).cwd;
-      if (typeof cwd === "string" && cwd) found.add(cwd);
+      const cwd = (JSON.parse(body) as { cwd?: unknown }).cwd;
+      if (typeof cwd === "string" && cwd) return cwd;
     } catch {
       // Not an entry: nothing to rewrite.
     }
   }
-  return [...found];
+  return undefined;
 }
 
 function str(value: unknown, label: string, max: number): string {
@@ -355,7 +424,7 @@ export class HostMoves {
     return this.engine.withIdleProject(
       project.id,
       async () => {
-        const result = await this.restore({ root, instance, branch, head, tree, patch });
+        const result = await this.restore({ root, projectId: project.id, instance, branch, head, tree, patch });
         if (result.createdWorktree) this.options.onWorktreeCreated?.();
         return result;
       },
@@ -365,6 +434,7 @@ export class HostMoves {
 
   private async restore(input: {
     root: string;
+    projectId: string;
     instance: "new" | "shared";
     branch: string;
     head: string;
@@ -373,15 +443,10 @@ export class HostMoves {
   }): Promise<SnapshotResult> {
     const { root, branch, head, tree, patch } = input;
     // The default branch of origin is never the target of a move.
-    const upstream = (
-      await git(root, ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]).catch(
-        () => "",
-      )
-    ).trim();
-    if (upstream && upstream === `origin/${branch}`)
+    if ((await defaultBranches(root)).includes(branch))
       throw new Error("A moved session never uses the default branch of origin");
     // Refuse a bad patch before anything is created.
-    if (patch) await validatePatch(root, patch);
+    const paths = patch ? await validatePatch(root, patch) : [];
     await this.ensureCommit(root, head, branch);
     const result = (cwd: string, created: boolean, reused: boolean): SnapshotResult => ({
       cwd,
@@ -398,21 +463,34 @@ export class HostMoves {
       const current = (await git(root, ["symbolic-ref", "--quiet", "--short", "HEAD"]).catch(() => "")).trim();
       if (current !== branch) throw new Error(`The workspace is on "${current || "a detached HEAD"}", not on "${branch}"`);
       const at = (await git(root, ["rev-parse", "HEAD"])).trim();
-      if (at === head && (await worktreeTree(root)) === tree) return result(root, false, true);
+      if (at === head && (await worktreeTree(root, paths)) === tree) return result(root, false, true);
+      // "new" is only the client's claim: a checkout that sessions already use is not new.
+      for (const entry of this.engine.store.summaries(input.projectId)) {
+        if (entry.cwd !== root) continue;
+        if (entry.status !== "idle" || this.engine.store.session(entry.id).session.blocks.length > 0)
+          throw new Error("The workspace is already in use by a session; it is not a new instance");
+      }
       if ((await git(root, ["status", "--porcelain", "--untracked-files=all"])).trim())
         throw new Error("The workspace has changes; it cannot take a snapshot");
+      let moved = false;
       if (at !== head) {
         if (!(await gitOk(root, ["merge-base", "--is-ancestor", at, head])))
           throw new Error("HEAD of the workspace is not an ancestor of the snapshot head");
         await git(root, ["merge", "--ff-only", head]);
+        moved = true;
       }
-      return this.finish(root, root, patch, tree, head, async () => {}, result(root, false, false));
+      // The tree was clean at the start (checked above), so putting the branch back to its
+      // old tip with reset --hard loses nothing.
+      const restoreTip = async () => {
+        if (moved) await git(root, ["reset", "--hard", "--quiet", at]);
+      };
+      return this.finish(root, root, patch, paths, tree, head, restoreTip, result(root, false, false));
     }
 
     const listed = await hostWorktrees(root);
     const existing = listed.worktrees.find((entry) => entry.branch === branch && !entry.missing);
     if (existing) {
-      if (existing.head === head && (await worktreeTree(existing.path)) === tree)
+      if (existing.head === head && (await worktreeTree(existing.path, paths)) === tree)
         return result(existing.path, false, true);
       throw new Error("This branch already has a working copy. Select it from the picker.");
     }
@@ -438,7 +516,7 @@ export class HostMoves {
         if (now === head) await git(root, ["branch", "-D", "--", branch]).catch(() => undefined);
       }
     };
-    return this.finish(root, target, patch, tree, head, rollback, result(target, true, false));
+    return this.finish(root, target, patch, paths, tree, head, rollback, result(target, true, false));
   }
 
   /** Checks HEAD, applies the patch, verifies the tree; rolls back on any failure. */
@@ -446,6 +524,7 @@ export class HostMoves {
     root: string,
     target: string,
     patch: string | undefined,
+    paths: string[],
     tree: string,
     head: string,
     rollback: () => Promise<void>,
@@ -461,7 +540,7 @@ export class HostMoves {
         await git(target, ["apply", "--binary", "--whitespace=nowarn", "--", patch]);
         applied = true;
       }
-      const actual = await worktreeTree(target);
+      const actual = await worktreeTree(target, paths);
       if (actual !== tree)
         throw new Error(`The restored files do not match the snapshot (expected tree ${tree}, got ${actual})`);
       return ok;
@@ -490,6 +569,12 @@ export class HostMoves {
   }
 
   /**
+   * Contract for the caller (F4-3a): a second move of the same conversation to this Host is
+   * refused while an earlier Host session that has turns (or is running) still binds the
+   * Claude session id. Returning to local only tombstones the session in the app, so
+   * F4-3a must delete (`sessions.delete`) or unbind the old Host session BEFORE it imports
+   * again. An untouched session from an earlier import is reused, which makes retries safe.
+   *
    * `sessions.import {projectId, providerSessionId, uploadId, cwd, title?, model,
    * modelSettings?, runtimeMode?, fromCwds?}`. The session has NO blocks and is bound to the
    * installed Claude session id, so the first turn passes `--resume <id>`.
@@ -519,9 +604,11 @@ export class HostMoves {
 
     let incoming: string;
     try {
-      incoming = new TextDecoder("utf-8", { fatal: true }).decode(
-        readFileSync(this.uploads.committedPath(validateUploadId(params.uploadId))),
-      );
+      const file = this.uploads.committedPath(validateUploadId(params.uploadId));
+      // Checked before the file is read into memory.
+      if (statSync(file).size > MAX_JSONL_BYTES)
+        throw new Error("The transcript is larger than 50 MB");
+      incoming = new TextDecoder("utf-8", { fatal: true }).decode(readFileSync(file));
     } catch (error) {
       throw error instanceof TypeError ? new Error("The transcript is not valid UTF-8") : error;
     }
@@ -538,18 +625,34 @@ export class HostMoves {
       reusable ??= bound.id;
     }
 
+    // Only the roots the client names (project cwd and session cwd) are rewritten; with
+    // none named, only the session's own cwd. Anything outside them stays as it was.
+    const named = (given as string[]).length ? (given as string[]) : [firstSessionCwd(incoming)];
     const sources = [
-      ...new Set([
-        ...(given as string[]),
-        params.cwd,
-        ...transcriptCwds(incoming),
-      ]),
+      ...new Set([...named, params.cwd].filter((entry): entry is string => !!entry)),
     ].filter((entry) => entry !== cwd);
     const text = rewriteCwd(incoming, sources, cwd);
     const dir = join(this.claudeDir(), "projects", name);
     const installed = installTranscript({ dir, id: wanted, text });
 
     const forked = installed.decision === "diverged";
+    if (forked) {
+      // A retry finds the fork of an earlier attempt: its untouched session is returned.
+      for (const bound of this.engine.sessionsBoundTo(installed.id)) {
+        const untouched =
+          bound.status === "idle" && this.engine.store.session(bound.id).session.blocks.length === 0;
+        if (!untouched)
+          throw new Error("A session on this machine already uses this Claude conversation");
+        return {
+          sessionId: bound.id,
+          providerSessionId: installed.id,
+          decision: "forked",
+          forkedFrom: wanted,
+          notice: forkNotice(wanted, installed.id),
+          reused: true,
+        };
+      }
+    }
     if (reusable && !forked) {
       return {
         sessionId: reusable,
@@ -579,7 +682,7 @@ export class HostMoves {
       };
     } catch (error) {
       // Nothing uses the file we just created: take it back so a retry starts clean.
-      if (installed.decision === "install" || forked) {
+      if (installed.decision === "install" || (forked && installed.created)) {
         try {
           unlinkSync(installed.file);
         } catch {

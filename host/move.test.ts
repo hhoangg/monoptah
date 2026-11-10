@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -8,6 +9,7 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  truncateSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -19,8 +21,11 @@ import { HostStore } from "./store";
 import { HostUploads } from "./uploads";
 import {
   HostMoves,
+  MAX_JSONL_BYTES,
+  forkSessionId,
   installTranscript,
   patchPathProblem,
+  defaultBranches,
   validateBranch,
   worktreeTree,
 } from "./move";
@@ -48,12 +53,14 @@ const git = (cwd: string, ...args: string[]) =>
   }).trim();
 
 /** What a sender computes: the tree and patch of every non-ignored change over HEAD. */
-function snapshotOf(repo: string) {
+function snapshotOf(repo: string, copyIndex = false) {
   const scratch = mkdtempSync(join(tmpdir(), "move-test-index-"));
   const env = { ...process.env, GIT_INDEX_FILE: join(scratch, "index") };
   const run = (...args: string[]) =>
     execFileSync("git", args, { cwd: repo, env, maxBuffer: 1 << 26 });
-  run("read-tree", "HEAD");
+  // The real sender starts from a copy of its REAL index (staged work included).
+  if (copyIndex) copyFileSync(join(repo, ".git", "index"), join(scratch, "index"));
+  else run("read-tree", "HEAD");
   run("add", "-A");
   const tree = run("write-tree").toString().trim();
   const patch = run("diff", "--cached", "--binary", "HEAD");
@@ -286,6 +293,108 @@ describe("workspace.applySnapshot", () => {
     ).rejects.toThrow(/default branch/);
   });
 
+  it("restores a force-added ignored file that is staged but uncommitted", async () => {
+    const w = world();
+    git(w.local, "add", "-f", "secret.env");
+    const snap = snapshotOf(w.local, true);
+    // The plain `add -A` tree (what the Host starts from) misses it, so the trees differ.
+    expect(snap.tree).not.toBe(snapshotOf(w.local).tree);
+    const patchUploadId = upload(w.uploads, "changes.patch", snap.patch);
+    const result = await w.moves.applySnapshot({ projectId: w.projectId, branch: "feat", ...snap, patchUploadId });
+    expect(readFileSync(join(result.cwd, "secret.env"), "utf8")).toBe("TOKEN=1\n");
+    expect(await worktreeTree(result.cwd, ["secret.env"])).toBe(snap.tree);
+  });
+
+  describe("on a new instance", () => {
+    const behind = (w: World) => {
+      const tip = git(w.root, "rev-parse", "HEAD");
+      git(w.root, "reset", "-q", "--hard", "HEAD~1");
+      return { tip, old: git(w.root, "rev-parse", "HEAD") };
+    };
+
+    it("fast-forwards to the snapshot head and then applies the patch", async () => {
+      const w = world({ rootBranch: "feat" });
+      const { tip, old } = behind(w);
+      expect(old).not.toBe(tip);
+      const snap = snapshotOf(w.local);
+      const patchUploadId = upload(w.uploads, "changes.patch", snap.patch);
+      await w.moves.applySnapshot({ projectId: w.projectId, instance: "new", branch: "feat", ...snap, patchUploadId });
+      expect(git(w.root, "rev-parse", "HEAD")).toBe(snap.head);
+      expect(await worktreeTree(w.root)).toBe(snap.tree);
+    });
+
+    it("puts the branch back to its old tip when the tree check fails after the fast-forward", async () => {
+      const w = world({ rootBranch: "feat" });
+      const { old } = behind(w);
+      const snap = snapshotOf(w.local);
+      const patchUploadId = upload(w.uploads, "changes.patch", snap.patch);
+      const wrong = snap.tree.replace(/^./, (c) => (c === "0" ? "1" : "0"));
+      await expect(
+        w.moves.applySnapshot({ projectId: w.projectId, instance: "new", branch: "feat", ...snap, tree: wrong, patchUploadId }),
+      ).rejects.toThrow(/do not match/);
+      expect(git(w.root, "rev-parse", "HEAD")).toBe(old);
+      expect(git(w.root, "rev-parse", "feat")).toBe(old);
+      expect(git(w.root, "status", "--porcelain")).toBe("");
+      expect(existsSync(join(w.root, "b.txt"))).toBe(false);
+    });
+
+    it("puts the branch back when the patch itself fails to apply", async () => {
+      const w = world({ rootBranch: "feat" });
+      const { old } = behind(w);
+      const snap = snapshotOf(w.local);
+      const patchUploadId = upload(w.uploads, "bad.patch", snap.patch.toString().replace("two", "TWO"));
+      await expect(
+        w.moves.applySnapshot({ projectId: w.projectId, instance: "new", branch: "feat", ...snap, patchUploadId }),
+      ).rejects.toThrow();
+      expect(git(w.root, "rev-parse", "HEAD")).toBe(old);
+      expect(git(w.root, "status", "--porcelain")).toBe("");
+    });
+
+    it("refuses a checkout that a session already uses", async () => {
+      const w = world({ rootBranch: "feat" });
+      behind(w);
+      const snap = snapshotOf(w.local);
+      const patchUploadId = upload(w.uploads, "changes.patch", snap.patch);
+      const created = w.engine.command({
+        type: "create", commandId: "c", projectId: w.projectId, harness: "claude",
+        model: "claude:test", runtimeMode: "supervised",
+      });
+      w.engine.command({ type: "send", commandId: "s", sessionId: created.sessionId, text: "work" });
+      await vi.waitFor(() => expect(w.turns).toHaveLength(1));
+      w.turns[0].finish();
+      await vi.waitFor(() => expect(w.store.session(created.sessionId).status).toBe("idle"));
+      await expect(
+        w.moves.applySnapshot({ projectId: w.projectId, instance: "new", branch: "feat", ...snap, patchUploadId }),
+      ).rejects.toThrow(/already in use/);
+      expect(git(w.root, "status", "--porcelain")).toBe("");
+    });
+  });
+
+  describe("default branch protection", () => {
+    it("still refuses main and master when origin/HEAD is unset", async () => {
+      const w = world();
+      git(w.root, "remote", "set-head", "origin", "-d");
+      expect(() => git(w.root, "symbolic-ref", "refs/remotes/origin/HEAD")).toThrow();
+      git(w.local, "push", "-q", "origin", "feat:master");
+      const snap = snapshotOf(w.local);
+      for (const branch of ["main", "master"])
+        await expect(w.moves.applySnapshot({ projectId: w.projectId, branch, ...snap })).rejects.toThrow(/default branch/);
+      expect(await defaultBranches(w.root)).toContain("main");
+    });
+
+    it("refuses a default that only origin names, such as develop", async () => {
+      const w = world();
+      git(w.local, "push", "-q", "origin", "feat:develop");
+      git(w.origin, "symbolic-ref", "HEAD", "refs/heads/develop");
+      git(w.root, "remote", "set-head", "origin", "-d");
+      const snap = snapshotOf(w.local);
+      expect(await defaultBranches(w.root)).toEqual(expect.arrayContaining(["develop"]));
+      await expect(
+        w.moves.applySnapshot({ projectId: w.projectId, branch: "develop", ...snap }),
+      ).rejects.toThrow(/default branch/);
+    });
+  });
+
   it("refuses an existing branch at a different commit and never moves it", async () => {
     const w = world();
     const snap = snapshotOf(w.local);
@@ -496,6 +605,54 @@ describe("sessions.import", () => {
     expect(stored.session.providerSessionId).toBe(result.providerSessionId);
     expect(stored.session.blocks).toHaveLength(0);
     expect(w.provider.bind).toHaveBeenCalledWith(result.sessionId, result.providerSessionId, w.root);
+  });
+
+  it("rewrites only the named roots and keeps nested subpaths and outside paths", async () => {
+    const entries = [
+      { type: "user", uuid: "a1", sessionId: ID, cwd: "/workspaces/app", message: "x" },
+      { type: "user", uuid: "a2", sessionId: ID, cwd: "/workspaces/app/pkg/src", file: "/workspaces/app/pkg/src/a.ts" },
+      { type: "user", uuid: "a3", sessionId: ID, cwd: "/home/someone", other: "/tmp/x /workspaces/app-two" },
+    ];
+    const text = entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n";
+    for (const fromCwds of [["/workspaces/app"], undefined]) {
+      const w = world();
+      await imported(w, upload(w.uploads, "t.jsonl", text), { fromCwds });
+      const out = readFileSync(fileOf(w), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      expect(out[0].cwd).toBe(w.root);
+      expect(out[1].cwd).toBe(`${w.root}/pkg/src`);
+      expect(out[1].file).toBe(`${w.root}/pkg/src/a.ts`);
+      expect(out[2].cwd).toBe("/home/someone");
+      expect(out[2].other).toBe("/tmp/x /workspaces/app-two");
+    }
+  });
+
+  it("forks to the same id and the same session on a retry", async () => {
+    const w = world();
+    mkdirSync(join(w.claudeDir, "projects", claudeProjectDirName(w.root)), { recursive: true });
+    const local = rewrite(fixture("diverged.jsonl"), w.root);
+    writeFileSync(fileOf(w), local);
+    const uploadId = upload(w.uploads, "t.jsonl", fixture("extended.jsonl"));
+    const first = await imported(w, uploadId);
+    const again = await imported(w, uploadId);
+    expect(first.decision).toBe("forked");
+    expect(again).toMatchObject({ decision: "forked", reused: true, sessionId: first.sessionId, providerSessionId: first.providerSessionId });
+    expect(readdirSync(join(w.claudeDir, "projects", claudeProjectDirName(w.root))).sort()).toEqual(
+      [`${ID}.jsonl`, `${first.providerSessionId}.jsonl`].sort(),
+    );
+    expect(w.store.summaries(w.projectId)).toHaveLength(1);
+    expect(forkSessionId(ID, fixture("extended.jsonl"))).toBe(first.providerSessionId);
+    expect(first.providerSessionId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  });
+
+  it("rejects a transcript over 50 MB before reading it", async () => {
+    const w = world();
+    const uploadId = upload(w.uploads, "t.jsonl", fixture("base.jsonl"));
+    truncateSync(w.uploads.committedPath(uploadId), MAX_JSONL_BYTES + 1);
+    await expect(imported(w, uploadId)).rejects.toThrow(/larger than 50 MB/);
+    expect(existsSync(join(w.claudeDir, "projects"))).toBe(false);
+    const ok = upload(w.uploads, "u.jsonl", fixture("base.jsonl"));
+    truncateSync(w.uploads.committedPath(ok), MAX_JSONL_BYTES);
+    await expect(imported(w, ok)).resolves.toMatchObject({ decision: "installed" });
   });
 
   it("refuses when a running session binds the conversation, and writes nothing", async () => {
