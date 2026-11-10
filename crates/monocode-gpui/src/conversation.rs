@@ -637,6 +637,17 @@ impl Conversation {
             view.file_link_base = Some(summary.cwd.clone());
             view
         });
+        // Up/Down in the composer recall this chat's sent prompts, read from
+        // the transcript so they survive restarts.
+        let prompts = transcript.downgrade();
+        input.update(cx, |input, _| {
+            input.set_prompt_history(Box::new(move |cx| {
+                prompts
+                    .upgrade()
+                    .map(|t| input::recall_order(t.read(cx).sent_prompts()))
+                    .unwrap_or_default()
+            }))
+        });
         let cloud_events = cx.subscribe(
             &transcript,
             |this, _, event: &crate::cloud_start_view::CloudStartAction, cx| {

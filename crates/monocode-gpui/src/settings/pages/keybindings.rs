@@ -324,6 +324,30 @@ pub(crate) const BINDINGS: &[Binding] = &[
         when: "editorFocus",
         fixed: false,
     },
+    Binding {
+        command: "Text: Undo",
+        keys: "⌘Z",
+        when: "inputFocus",
+        fixed: false,
+    },
+    Binding {
+        command: "Text: Redo",
+        keys: "⌘⇧Z",
+        when: "inputFocus",
+        fixed: false,
+    },
+    Binding {
+        command: "Composer: Previous Prompt",
+        keys: "↑",
+        when: "composerFocus && caretOnFirstLine",
+        fixed: true,
+    },
+    Binding {
+        command: "Composer: Next Prompt",
+        keys: "↓",
+        when: "composerFocus && caretOnLastLine",
+        fixed: true,
+    },
 ];
 pub(super) fn quick_composer_label(p: &Preferences) -> String {
     p.keybindings
@@ -699,5 +723,19 @@ mod tests {
             .collect();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].keys, "⌘⌥J");
+    }
+
+    #[test]
+    fn text_undo_and_redo_are_customizable_with_platform_defaults() {
+        for (command, key) in [("Text: Undo", "z"), ("Text: Redo", "shift-z")] {
+            let row = BINDINGS.iter().find(|b| b.command == command).unwrap();
+            assert!(!row.fixed);
+            let modifier = if cfg!(target_os = "macos") {
+                "cmd"
+            } else {
+                "ctrl"
+            };
+            assert_eq!(default_shortcuts(row), [format!("{modifier}-{key}")]);
+        }
     }
 }

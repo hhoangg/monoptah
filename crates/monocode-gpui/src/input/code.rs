@@ -812,17 +812,37 @@ impl Input {
     pub(super) fn history_available(&self, redo: bool) -> bool {
         !self.read_only
             && self.marked.is_none()
-            && self
-                .code
-                .as_ref()
-                .is_some_and(|code| !(if redo { &code.redo } else { &code.undo }).is_empty())
+            && match &self.code {
+                Some(code) => !(if redo { &code.redo } else { &code.undo }).is_empty(),
+                None => {
+                    if redo {
+                        self.edits.can_redo()
+                    } else {
+                        self.edits.can_undo()
+                    }
+                }
+            }
     }
     pub(super) fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
         self.history(true, cx);
     }
     fn history(&mut self, redo: bool, cx: &mut Context<Self>) {
+        if self.code.is_none() {
+            if self.read_only || self.marked.is_some() {
+                return;
+            }
+            let current = self.snapshot();
+            let restored = if redo {
+                self.edits.redo(current)
+            } else {
+                self.edits.undo(current)
+            };
+            if let Some(snapshot) = restored {
+                self.restore_snapshot(snapshot, cx);
+            }
+            return;
+        }
         let Some(code) = &mut self.code else {
-            cx.propagate();
             return;
         };
         if self.marked.is_some() {
