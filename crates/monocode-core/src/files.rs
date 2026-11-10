@@ -9,6 +9,7 @@ mod paths;
 pub mod remote;
 pub mod remote_read;
 pub mod remote_watch;
+pub mod remote_write;
 pub use remote::run_remote_command;
 
 use std::collections::HashSet;

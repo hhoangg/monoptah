@@ -141,6 +141,14 @@ fn host_arguments(command: &str, args: Value) -> Result<(String, Value), String>
     Ok((environment.ok_or(UNAVAILABLE)?, Value::Object(args)))
 }
 
+#[cfg(test)]
+pub(super) fn host_arguments_for_tests(
+    command: &str,
+    args: Value,
+) -> Result<(String, Value), String> {
+    host_arguments(command, args)
+}
+
 fn to_host(value: &mut Value, environment: &mut Option<String>) -> Result<(), String> {
     if let Value::Array(values) = value {
         for value in values {

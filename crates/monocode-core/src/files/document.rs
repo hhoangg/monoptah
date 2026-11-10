@@ -4,8 +4,11 @@ use std::io::Read;
 use std::sync::atomic::AtomicBool;
 
 pub const MAX_TEXT_BYTES: usize = 2 * 1024 * 1024;
-/// Remote writes cap at 1 MB, so a remote text file over it is not opened for editing.
-const REMOTE_TEXT_BYTES: usize = 1024 * 1024;
+/// Remote writes cap at 1 MB, so a remote text file over it is opened read-only.
+pub const REMOTE_TEXT_BYTES: usize = 1024 * 1024;
+/// Shown above a remote text file between 1 and 2 MB: it can be read but not saved.
+pub const REMOTE_READ_ONLY: &str =
+    "Read-only: the cloud workspace accepts saves up to 1 MB, and this file is larger.";
 pub const MAX_LINE_BYTES: usize = 16 * 1024;
 pub(super) const MAX_PREVIEW_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -17,6 +20,8 @@ pub struct TextDocument {
     pub bom: bool,
     /// Original bytes are retained to detect an external edit before saving.
     pub disk: Vec<u8>,
+    /// Why the file can be read but not saved, when it cannot.
+    pub read_only: Option<String>,
 }
 #[derive(Debug)]
 pub enum Document {
@@ -99,14 +104,14 @@ pub fn read_document_with(
 ) -> Result<Document, String> {
     if super::remote::is_remote(path) {
         let video = is_video_path(path);
-        // The size is known after the first chunk: a text file over the remote limit is
+        // The size is known after the first chunk: a text file over the reading limit is
         // refused there, so it is never downloaded (the editor polls open files).
         let accept = |first: &[u8], size: u64| {
             (!video
-                && size > REMOTE_TEXT_BYTES as u64
+                && size > MAX_TEXT_BYTES as u64
                 && sniff_image(first).is_none()
                 && !has_image_extension(path))
-            .then(|| too_large_to_edit(REMOTE_TEXT_BYTES))
+            .then(|| too_large_to_edit(MAX_TEXT_BYTES))
         };
         let bytes = match super::remote_read::read_default(path, progress, cancel, &accept)? {
             super::remote_read::Fetched::Bytes(bytes) => bytes,
@@ -158,7 +163,7 @@ pub fn read_document_with(
                 source: Some(source),
             });
         }
-        return document_from_bytes(path, bytes, REMOTE_TEXT_BYTES);
+        return document_from_bytes(path, bytes, MAX_TEXT_BYTES);
     }
     let path = expand_home(path);
     let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
@@ -230,7 +235,7 @@ fn too_large_to_edit(max: usize) -> String {
     )
 }
 
-fn document_from_bytes(
+pub(super) fn document_from_bytes(
     path: &Path,
     bytes: Vec<u8>,
     max_text_bytes: usize,
@@ -284,12 +289,15 @@ fn document_from_bytes(
         ));
     }
     let crlf = raw.contains("\r\n");
+    let read_only = (super::remote::is_remote(path) && bytes.len() > REMOTE_TEXT_BYTES)
+        .then(|| REMOTE_READ_ONLY.to_owned());
     Ok(Document::Text(TextDocument {
         text,
         crlf,
         cr: !crlf && raw.contains('\r'),
         bom,
         disk: bytes,
+        read_only,
     }))
 }
 
@@ -315,6 +323,11 @@ pub fn is_video_path(path: &Path) -> bool {
 }
 
 impl TextDocument {
+    /// SHA-256 (lowercase hex) of the raw bytes that were read, BOM included. The Host
+    /// hashes raw bytes too, so this is what a conditional remote save sends.
+    pub fn disk_sha256(&self) -> String {
+        super::remote_write::sha256_hex(&self.disk)
+    }
     pub fn encode(&self, text: &str) -> Vec<u8> {
         let mut out = if self.bom {
             vec![0xef, 0xbb, 0xbf]
@@ -337,23 +350,16 @@ pub fn save_document(path: &Path, document: &TextDocument, text: &str) -> Result
     if text.len() > MAX_TEXT_BYTES || text.split('\n').any(|line| line.len() > MAX_LINE_BYTES) {
         return Err("Text exceeds the editor size limit.".into());
     }
+    if let Some(reason) = &document.read_only {
+        return Err(reason.clone());
+    }
     if super::remote::is_remote(path) {
-        let current = super::remote_read::read_default(
+        return super::remote_write::save_default(
             path,
-            &mut |_, _| {},
-            &AtomicBool::new(false),
-            &|_, _| None,
-        )?;
-        if current != super::remote_read::Fetched::Bytes(document.disk.clone()) {
-            return Err("The file changed on disk. Reload it before saving your edits.".into());
-        }
-        let bytes = document.encode(text);
-        let content = std::str::from_utf8(&bytes).map_err(|_| "File is not valid UTF-8.")?;
-        super::remote::command::<()>(
-            "write_text_file",
-            serde_json::json!({"path":path,"content":content}),
-        )?;
-        return Ok(bytes);
+            document,
+            text,
+            super::remote_write::Mode::Guarded,
+        );
     }
     let destination = std::fs::canonicalize(expand_home(path)).map_err(|e| e.to_string())?;
     if !matches_disk(&destination, &document.disk)? {
@@ -400,6 +406,31 @@ pub fn save_document(path: &Path, document: &TextDocument, text: &str) -> Result
         let _ = std::fs::remove_file(&temporary);
     }
     result
+}
+
+/// Saves over the cloud version the user was shown ("Keep mine" after a conflict).
+/// `shown` is that version's raw bytes, or `None` when the file did not exist. The save is
+/// conditional on exactly those bytes, so a version the user never saw (the agent wrote
+/// again meanwhile) is refused with "File changed on the host" and not overwritten.
+pub fn overwrite_document(
+    path: &Path,
+    document: &TextDocument,
+    text: &str,
+    shown: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
+    if let Some(reason) = &document.read_only {
+        return Err(reason.clone());
+    }
+    if text.len() > MAX_TEXT_BYTES || text.split('\n').any(|line| line.len() > MAX_LINE_BYTES) {
+        return Err("Text exceeds the editor size limit.".into());
+    }
+    if super::remote::is_remote(path) {
+        return super::remote_write::overwrite_default(path, document, text, shown);
+    }
+    let shown = shown.ok_or("The file no longer exists.")?;
+    let mut baseline = document.clone();
+    baseline.disk = shown.to_vec();
+    save_document(path, &baseline, text)
 }
 
 fn matches_disk(path: &Path, expected: &[u8]) -> Result<bool, String> {
