@@ -19,6 +19,7 @@ import { hostGitBlame } from "./git-blame";
 import { hostWorktrees } from "./git-worktrees";
 import { createHostBranch, hostBranches, switchHostBranch } from "./git-branches";
 import type { HostStore } from "./store";
+import { WorkspaceWatchHost, MAX_DIRS, type WatchDir } from "./workspace-watch";
 import {
   createHostPath,
   existingPath,
@@ -81,6 +82,10 @@ export const WORKSPACE_COMMANDS = [
   "git_stash",
   "git_worktrees",
   "search_project",
+  "watch_changes",
+  "update_watch",
+  "wait_changes",
+  "unwatch_changes",
 ] as const;
 export type WorkspaceCommand = (typeof WORKSPACE_COMMANDS)[number];
 
@@ -102,6 +107,12 @@ type Located = { root: string; relative: string };
 export class WorkspaceCommands {
   private roots = new Map<string, { at: number; roots: string[] }>();
   private rootsGeneration = 0;
+  private readonly watches = new WorkspaceWatchHost();
+
+  /** Releases every change watcher (host shutdown). */
+  close(): void {
+    this.watches.close();
+  }
 
   invalidateRoots(): void {
     this.rootsGeneration++;
@@ -210,7 +221,50 @@ export class WorkspaceCommands {
         return this.gitWorktrees(input.cwd);
       case "search_project":
         return this.searchProject(input.options);
+      case "watch_changes":
+        return this.watchChanges(input.cwd, input.dirs);
+      case "update_watch":
+        return this.updateWatch(input.id, input.dirs);
+      case "wait_changes":
+        return (async () => this.watches.wait(input.id))();
+      case "unwatch_changes":
+        return (async () => this.watches.stop(input.id))();
     }
+  }
+
+  /** Resolves client directories (relative to `cwd`, slash-separated, "" is the
+   * root) to real paths that stay inside the workspace. Refuses `..`, absolute
+   * paths, `.git` and symlinks that lead out. */
+  private async watchDirs(root: string, dirs: unknown): Promise<WatchDir[]> {
+    if (dirs === undefined) return [];
+    if (!Array.isArray(dirs)) throw new Error("Invalid watch directories");
+    if (dirs.length > MAX_DIRS)
+      throw new Error(`Too many watched directories (maximum ${MAX_DIRS})`);
+    const out = new Map<string, WatchDir>();
+    for (const input of dirs) {
+      if (typeof input !== "string") throw new Error("Invalid watch directory");
+      const raw = slashed(input);
+      if (raw.startsWith("/") || /^[a-zA-Z]:/.test(raw))
+        throw new Error("Watch directories must be relative");
+      const rel = raw.replace(/^\.\/|\/+$/g, "").replace(/^\.$/, "");
+      if (rel.split("/").some((part) => part === ".." || part.toLowerCase() === ".git"))
+        throw new Error("Path is outside the workspace");
+      const path = await existingPath(root, rel, true);
+      if (!(await stat(path)).isDirectory()) throw new Error("Not a directory");
+      out.set(rel, { rel, path });
+    }
+    return [...out.values()];
+  }
+
+  private async watchChanges(cwd: unknown, dirs: unknown): Promise<{ id: string }> {
+    const { path } = await this.existing(cwd, true);
+    const list = await this.watchDirs(path, dirs);
+    return { id: await this.watches.start(path, list) };
+  }
+
+  private async updateWatch(id: unknown, dirs: unknown): Promise<void> {
+    const root = this.watches.root(id);
+    this.watches.update(id, await this.watchDirs(root, dirs));
   }
 
   /** The project folders and worktrees files may be read and written in. */

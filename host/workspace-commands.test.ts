@@ -300,3 +300,42 @@ it.skipIf(process.platform === "win32")(
     ).rejects.toThrow();
   },
 );
+
+it("confines watched directories to the workspace and releases watchers", async () => {
+  const { commands, repo, home } = fixture();
+  const { cwd, write } = repo();
+  mkdirSync(join(cwd, "src"));
+  mkdirSync(join(home, "outside"));
+  symlinkSync(join(home, "outside"), join(cwd, "escape"));
+  write("file.txt", "x");
+  const watch = (dirs: unknown) => commands.run("watch_changes", { cwd, dirs });
+
+  for (const dirs of [
+    ["../outside"],
+    ["src/../../outside"],
+    [join(home, "outside")],
+    ["/"],
+    ["escape"],
+    [".git"],
+    [".git/refs"],
+    ["src/.GIT/x"],
+    ["file.txt"],
+    ["missing"],
+    [1],
+    "src",
+  ])
+    await expect(watch(dirs)).rejects.toThrow();
+  await expect(
+    commands.run("watch_changes", { cwd: join(home, "outside"), dirs: [] }),
+  ).rejects.toThrow();
+
+  const { id } = (await watch(["src", "", "./src/"])) as { id: string };
+  await expect(
+    commands.run("update_watch", { id, dirs: ["../outside"] }),
+  ).rejects.toThrow();
+  await commands.run("update_watch", { id, dirs: ["src"] });
+  write("file.txt", "y");
+  await commands.run("unwatch_changes", { id });
+  await expect(commands.run("wait_changes", { id })).rejects.toThrow("watch_unknown");
+  commands.close();
+});
