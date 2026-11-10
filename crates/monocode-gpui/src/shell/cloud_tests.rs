@@ -1387,7 +1387,9 @@ fn files_and_git_show_the_cloud_workspace_by_default_and_the_local_switch_refuse
             shell.workspace.active = Some(id);
             shell.sync_cloud_panel(cx);
             let remote = shell.session_summaries[&id].cwd.clone();
-            // Default: the cloud workspace, and its git writes go to the remote under the policy.
+            // Default: the cloud workspace, and its git writes go to the remote under the policy
+            // once the app is connected to it. This session has no live conversation, so it is
+            // not connected and its remembered files are read-only (see the disconnected test).
             assert_eq!(
                 panel.read(cx).cloud_banner(),
                 Some("Cloud files - codespace octo-abc")
@@ -1396,7 +1398,7 @@ fn files_and_git_show_the_cloud_workspace_by_default_and_the_local_switch_refuse
                 panel.read(cx).cloud_chrome().unwrap().mode,
                 PanelMode::Cloud
             );
-            assert!(crate::git_gate::writes_allowed(&remote));
+            assert!(!crate::git_gate::writes_allowed(&remote));
             assert!(!crate::git_gate::writes_allowed(LOCAL));
             assert_eq!(crate::git_gate::codespace().as_deref(), Some("octo-abc"));
             assert_eq!(shell.git.read(cx).project(), remote);
@@ -1416,7 +1418,7 @@ fn files_and_git_show_the_cloud_workspace_by_default_and_the_local_switch_refuse
             // refused after the switch: the answer follows the path, not the visible panel.
             shell.set_panel_mode(PanelMode::Cloud, cx);
             shell.sync_cloud_panel(cx);
-            assert!(crate::git_gate::writes_allowed(&remote));
+            assert!(!crate::git_gate::writes_allowed(&remote));
             assert!(!crate::git_gate::writes_allowed(LOCAL));
             assert_eq!(shell.git.read(cx).project(), remote);
             assert_eq!(shell.panel_modes.get(&id), Some(&PanelMode::Cloud));

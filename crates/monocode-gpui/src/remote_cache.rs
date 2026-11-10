@@ -222,18 +222,20 @@ mod tests {
     fn a_snapshot_over_the_file_limit_is_not_kept() {
         let now = Instant::now();
         let mut cache = RemoteCache::default();
-        let mut index = DiffIndex::default();
-        index.files = (0..=MAX_INDEX_FILES)
-            .map(|n| monocode_core::scm::ChangedFile {
-                path: format!("/r/{n}"),
-                relative: n.to_string(),
-                status: "modified".into(),
-                additions: 0,
-                deletions: 0,
-                staged: false,
-                unstaged: true,
-            })
-            .collect();
+        let mut index = DiffIndex {
+            files: (0..=MAX_INDEX_FILES)
+                .map(|n| monocode_core::scm::ChangedFile {
+                    path: format!("/r/{n}"),
+                    relative: n.to_string(),
+                    status: "modified".into(),
+                    additions: 0,
+                    deletions: 0,
+                    staged: false,
+                    unstaged: true,
+                })
+                .collect(),
+            ..Default::default()
+        };
         cache.put_index(&root(1), &index, now);
         assert_eq!(cache.len(), 0);
         index.files.truncate(2);
