@@ -1515,7 +1515,7 @@ ticket, after review and after merge.
 | F2-5 | 3 | todo | - | |
 | F3-3h | 4 | merged | csi-f3-3h | merge c7113999. Opus review x3 fixed: tar unpacker hardened, fresh unpack per apply, async unpack, secrets scrub (single pass), child env allowlist MONOPTAH_KIT_*, kit.health via temp CLAUDE_CONFIG_DIR in own process group with hard timeout (signInNeeded vs failed; sign-in state not observable, D12), rollback + crash recovery, leases vs prune. Result field kitServers (app side must use it). No claude mcp list --mcp-config (2.1.322 has no such flag). |
 | F3-5h | 4 | skipped: dropped by user decision D12 | - | no OAuth sign-in merge on the Host |
-| F4-2h | 4 | in progress | csi-f4-2h | |
+| F4-2h | 4 | merged | csi-f4-2h | merge be7abcb2 (server.ts and spec conflicts resolved keeping both; host tests 438 passed, check:web green). Opus review x3 fixed: cwd rewrite only named roots (fromCwds REQUIRED), TS/Rust serde parity pinned by shared fixtures, instance:new rollback, force-added files, deterministic fork id, 50 MB cap, default branch refused only when head != origin tip (no ls-remote). Contract for F4-3a: delete/unbind the old Host session before re-import; send fromCwds. |
 | HR3 | 4 | todo | - | release: stop and ask |
 | F3-4 | 4 | todo | - | |
 | F3-5 | 4 | todo | - | reduced (D12): config-only OAuth servers, 'Sign in in the cloud'; depends on F3-4 only |
