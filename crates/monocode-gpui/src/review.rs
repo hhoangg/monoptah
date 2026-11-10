@@ -738,7 +738,11 @@ impl ReviewPane {
                 this.run_write(
                     pending.view,
                     pending.id,
-                    Box::new(move || scm::discard_file(&cwd, &relative)),
+                    Box::new(move || {
+                        #[cfg(test)]
+                        tests::DISCARDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        scm::discard_file(&cwd, &relative)
+                    }),
                     cx,
                 );
             });
@@ -1459,6 +1463,11 @@ impl ReviewPane {
             }
             return;
         };
+        // A comment is not a write: it goes to the chat whatever the gate says.
+        if let DiffEvent::Comment(text) = event {
+            cx.emit(ReviewEvent::Comment(text.clone()));
+            return;
+        }
         if !crate::git_gate::writes_allowed(cwd) {
             return;
         }
@@ -2188,6 +2197,9 @@ mod tests {
         );
     }
 
+    /// Counts the discards that reached scm (a fake seam for the policy tests).
+    pub(super) static DISCARDS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
     fn review_window(cx: &mut gpui::TestAppContext, cwd: &str) -> gpui::WindowHandle<ReviewPane> {
         let window = cx.update(|cx| {
             cx.open_window(Default::default(), |_, cx| {
@@ -2273,14 +2285,37 @@ mod tests {
         let cwd = repo.cwd();
         let window = review_window(cx, &cwd);
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        // The Local switch, then back to Cloud: a cloud session is in view both times.
-        for _ in 0..2 {
-            crate::git_gate::set(crate::git_gate::Gate::local_of("octo-abc"));
+        use crate::panel_root::PanelRoot;
+        let cloud = monocode_core::cloud_sessions::CloudRef::codespace("octo-abc");
+        let remote = "remote://env-octo-abc/workspaces/widgets";
+        let roots = [
+            // The Local switch...
+            PanelRoot::Local {
+                path: "/work/monocode".into(),
+                cloud: Some(cloud.clone()),
+            },
+            // ...then back to Cloud.
+            PanelRoot::Cloud {
+                root: remote.into(),
+                cloud,
+                local_project: "/work/monocode".into(),
+            },
+        ];
+        for root in roots {
+            crate::git_gate::set(crate::git_gate::Gate::of(&root, Vec::new()));
             discard_event(window, "a.txt", visual);
-            assert!(!visual.has_pending_prompt());
+            assert!(!visual.has_pending_prompt(), "{root:?}");
             assert_eq!(
                 std::fs::read_to_string(repo.0.join("a.txt")).unwrap(),
-                "edit1\n"
+                "edit1\n",
+                "{root:?}"
+            );
+            // The local cwd stays refused, a remote one is writable under the policy.
+            assert!(!crate::git_gate::writes_allowed(&cwd), "{root:?}");
+            assert!(crate::git_gate::writes_allowed(remote), "{root:?}");
+            assert_eq!(
+                crate::git_gate::decide(crate::git_gate::Op::Discard, remote),
+                crate::git_gate::Decision::Allow
             );
         }
         crate::git_gate::set(crate::git_gate::Gate::default());
@@ -2293,6 +2328,7 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         let remote = "remote://env-octo-abc/workspaces/widgets";
+        let before = DISCARDS.load(std::sync::atomic::Ordering::SeqCst);
         let repo = Repo::new();
         let window = review_window(cx, &repo.cwd());
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
@@ -2329,9 +2365,45 @@ mod tests {
         visual.simulate_prompt_answer("OK");
         visual.run_until_parked();
         assert_eq!(
-            std::fs::read_to_string(repo.0.join("a.txt")).unwrap(),
-            "edit1\n"
+            DISCARDS.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "the discard must not reach scm"
         );
+        // Control: once idle and confirmed, the discard does reach scm.
+        crate::git_gate::set(crate::git_gate::Gate::running_in(&[]));
+        discard_event(window, "a.txt", visual);
+        visual.simulate_prompt_answer("Discard");
+        visual.run_until_parked();
+        assert_eq!(
+            DISCARDS.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1
+        );
+        crate::git_gate::set(crate::git_gate::Gate::default());
+    }
+
+    /// "Comment to chat" is not a write: it is delivered even where writes are refused.
+    #[gpui::test]
+    fn comments_reach_the_chat_where_writes_are_refused(cx: &mut gpui::TestAppContext) {
+        let repo = Repo::new();
+        let window = review_window(cx, &repo.cwd());
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sink = seen.clone();
+        let pane = window.root(visual).unwrap();
+        let _subscription = visual.update(|_, cx| {
+            cx.subscribe(&pane, move |_, event: &ReviewEvent, _| {
+                if let ReviewEvent::Comment(text) = event {
+                    sink.borrow_mut().push(text.clone());
+                }
+            })
+        });
+        crate::git_gate::set(crate::git_gate::Gate::local_of("octo-abc"));
+        assert!(!crate::git_gate::writes_allowed(&repo.cwd()));
+        let event = DiffEvent::Comment("note".into());
+        window
+            .update(visual, |pane, _, cx| pane.diff_event(0, &event, cx))
+            .unwrap();
+        assert_eq!(seen.borrow().len(), 1);
         crate::git_gate::set(crate::git_gate::Gate::default());
     }
 

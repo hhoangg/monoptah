@@ -3910,11 +3910,12 @@ ERROR: process "/bin/sh -c npm ci" exited with code 1</span></div>
             are refused while a cloud session is in view; writes to the cloud
             workspace follow the remote git policy. While a sandbox is still
             being created (a pending workspace) the panels show a placeholder
-            and writes are refused. Decided: the code treats sandboxes like
-            codespaces, so Explorer/Changes connect to the sandbox Host like a
-            normal remote project (the only difference is that a sandbox has no
-            "Open in browser"). The transcript plus the archive bundle/patch
-            remain the fallback when the Host is not reachable.
+            and writes are refused. Open decision, awaiting the owner: whether v1 relies on the transcript
+            plus the archive bundle/patch, or connects Explorer/Changes to the
+            sandbox Host like a normal remote project. The code currently
+            treats sandboxes like codespaces (the panels show the sandbox
+            workspace, without "Open in browser"); that is not a product
+            decision.
           </li>
           <li>
             <strong>Claude account picker.</strong> Đã chốt dùng account trong
