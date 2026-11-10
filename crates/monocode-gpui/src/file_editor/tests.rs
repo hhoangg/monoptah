@@ -404,3 +404,254 @@ fn an_unreadable_remote_file_hides_open_externally_and_reveal(cx: &mut TestAppCo
     }
     assert_eq!(shown, [(true, true), (false, false)]);
 }
+
+mod cloud_conflicts {
+    use super::*;
+    use monocode_core::files::remote_write::HOST_CHANGED;
+    use std::sync::Mutex;
+
+    const PATH: &str = "remote://env/work/repo/a.txt";
+
+    fn doc(text: &str, read_only: bool) -> TextDocument {
+        TextDocument {
+            text: text.into(),
+            crlf: false,
+            cr: false,
+            bom: false,
+            disk: text.as_bytes().to_vec(),
+            read_only: read_only.then(|| document::REMOTE_READ_ONLY.to_owned()),
+        }
+    }
+
+    /// What the fake Host saw: ("save" | "overwrite", text).
+    type Log = Arc<Mutex<Vec<(&'static str, String)>>>;
+
+    /// A Host whose file was changed by the agent: `save` is refused, `overwrite` lands.
+    fn io(log: &Log, cloud: &str) -> conflict::FileIo {
+        let (save_log, overwrite_log) = (log.clone(), log.clone());
+        let cloud = cloud.to_owned();
+        conflict::FileIo {
+            save: Arc::new(move |_, _, text| {
+                save_log.lock().unwrap().push(("save", text.into()));
+                Err(format!("Command failed: {HOST_CHANGED}"))
+            }),
+            overwrite: Arc::new(move |_, _, text| {
+                overwrite_log
+                    .lock()
+                    .unwrap()
+                    .push(("overwrite", text.into()));
+                Ok(text.as_bytes().to_vec())
+            }),
+            read: Arc::new(move |_| Ok(Document::Text(doc(&cloud, false)))),
+        }
+    }
+
+    fn editor(
+        cx: &mut TestAppContext,
+        document: TextDocument,
+        io: conflict::FileIo,
+    ) -> gpui::WindowHandle<FileEditor> {
+        cx.update(|cx| cx.set_global(crate::settings::Preferences::default()));
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                let git = cx.new(|cx| {
+                    ProjectGit::new(std::env::temp_dir().to_string_lossy().into_owned(), cx)
+                });
+                cx.new(|cx| {
+                    let mut e = FileEditor::new_deferred(PATH.into(), git, cx);
+                    let text = document.text.clone();
+                    e.input.update(cx, |i, cx| i.reload_file(text, false, cx));
+                    e.document = Some(document);
+                    e.io = io;
+                    e.sync_read_only(cx);
+                    e
+                })
+            })
+            .unwrap()
+        });
+        cx.run_until_parked();
+        window
+    }
+
+    fn type_draft(cx: &mut TestAppContext, window: &gpui::WindowHandle<FileEditor>) {
+        window
+            .update(cx, |e, w, cx| {
+                e.input
+                    .update(cx, |i, cx| i.replace_text_in_range(None, "draft ", w, cx))
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn a_refused_save_opens_the_dialog_and_keeps_the_text(cx: &mut TestAppContext) {
+        let log = Log::default();
+        let window = editor(cx, doc("one\n", false), io(&log, "agent\n"));
+        type_draft(cx, &window);
+        window.update(cx, |e, _, cx| e.save(cx)).unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |e, _, cx| {
+                let conflict = e.conflict.as_ref().expect("the dialog is open");
+                assert_eq!(conflict.mine, "draft one\n");
+                assert!(matches!(&conflict.cloud, conflict::Cloud::Text(d) if d.text == "agent\n"));
+                // Nothing was replaced: the draft is still there and still unsaved.
+                assert!(e.dirty && !e.saving);
+                assert_eq!(e.input.read(cx).content.as_ref(), "draft one\n");
+                assert!(e.input.read(cx).is_read_only());
+                // A second save does not run while the dialog is open.
+                e.save(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(*log.lock().unwrap(), [("save", "draft one\n".to_owned())]);
+    }
+
+    #[gpui::test]
+    fn cancel_keeps_the_draft_and_unlocks_the_editor(cx: &mut TestAppContext) {
+        let log = Log::default();
+        let window = editor(cx, doc("one\n", false), io(&log, "agent\n"));
+        type_draft(cx, &window);
+        window.update(cx, |e, _, cx| e.save(cx)).unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |e, _, cx| {
+                e.cancel_conflict(cx);
+                assert!(e.conflict.is_none() && e.dirty);
+                assert_eq!(e.input.read(cx).content.as_ref(), "draft one\n");
+                assert!(!e.input.read(cx).is_read_only());
+            })
+            .unwrap();
+        assert_eq!(log.lock().unwrap().len(), 1);
+    }
+
+    #[gpui::test]
+    fn keep_mine_overwrites_and_adopts_what_was_written(cx: &mut TestAppContext) {
+        let log = Log::default();
+        let window = editor(cx, doc("one\n", false), io(&log, "agent\n"));
+        type_draft(cx, &window);
+        window.update(cx, |e, _, cx| e.save(cx)).unwrap();
+        cx.run_until_parked();
+        window.update(cx, |e, _, cx| e.keep_mine(cx)).unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |e, _, cx| {
+                assert!(e.conflict.is_none() && !e.dirty && !e.saving);
+                assert!(e.error.is_none());
+                assert_eq!(e.input.read(cx).content.as_ref(), "draft one\n");
+                let doc = e.document.as_ref().unwrap();
+                assert_eq!(doc.disk, b"draft one\n");
+                assert!(!e.input.read(cx).is_read_only());
+            })
+            .unwrap();
+        assert_eq!(
+            *log.lock().unwrap(),
+            [
+                ("save", "draft one\n".to_owned()),
+                ("overwrite", "draft one\n".to_owned())
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn take_cloud_reloads_the_editor_with_the_cloud_text(cx: &mut TestAppContext) {
+        let log = Log::default();
+        let window = editor(cx, doc("one\n", false), io(&log, "agent\n"));
+        type_draft(cx, &window);
+        window.update(cx, |e, _, cx| e.save(cx)).unwrap();
+        cx.run_until_parked();
+        // Until the user chooses, the draft is intact.
+        window
+            .update(cx, |e, _, cx| {
+                assert_eq!(e.input.read(cx).content.as_ref(), "draft one\n");
+                e.take_cloud(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |e, _, cx| {
+                assert!(e.conflict.is_none() && !e.dirty);
+                assert_eq!(e.input.read(cx).content.as_ref(), "agent\n");
+                assert_eq!(e.document.as_ref().unwrap().disk, b"agent\n");
+            })
+            .unwrap();
+        // Take cloud never writes.
+        assert_eq!(log.lock().unwrap().len(), 1);
+    }
+
+    #[gpui::test]
+    fn a_deleted_cloud_file_offers_only_keep_mine(cx: &mut TestAppContext) {
+        let log = Log::default();
+        let mut gone = io(&log, "");
+        gone.read = Arc::new(|_| Err("ENOENT: no such file".into()));
+        let window = editor(cx, doc("one\n", false), gone);
+        type_draft(cx, &window);
+        window.update(cx, |e, _, cx| e.save(cx)).unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |e, _, cx| {
+                assert!(matches!(
+                    e.conflict.as_ref().unwrap().cloud,
+                    conflict::Cloud::Unavailable(_)
+                ));
+                e.take_cloud(cx);
+                assert!(e.conflict.is_some() && e.dirty);
+                assert_eq!(e.input.read(cx).content.as_ref(), "draft one\n");
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_file_over_one_megabyte_is_read_only_and_cannot_be_saved(cx: &mut TestAppContext) {
+        let log = Log::default();
+        let window = editor(cx, doc("big\n", true), io(&log, "x"));
+        window
+            .update(cx, |e, w, cx| {
+                assert!(e.input.read(cx).is_read_only());
+                e.input
+                    .update(cx, |i, cx| i.replace_text_in_range(None, "typed", w, cx));
+                assert_eq!(e.input.read(cx).content.as_ref(), "big\n");
+                e.save(cx);
+                assert!(!e.saving);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(log.lock().unwrap().is_empty());
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("read-only-banner").is_some());
+        window
+            .update(visual, |e, _, _| {
+                assert_eq!(
+                    e.document.as_ref().unwrap().read_only.as_deref(),
+                    Some(document::REMOTE_READ_ONLY)
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn the_agent_working_notice_follows_the_running_signal(cx: &mut TestAppContext) {
+        let log = Log::default();
+        let window = editor(cx, doc("one\n", false), io(&log, "agent\n"));
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("agent-working-banner").is_none());
+        crate::git_gate::set(crate::git_gate::Gate::running_in(&["env"]));
+        window.update(visual, |_, _, cx| cx.notify()).unwrap();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("agent-working-banner").is_some());
+        // The compare dialog carries the same notice.
+        window
+            .update(visual, |e, w, cx| {
+                e.input
+                    .update(cx, |i, cx| i.replace_text_in_range(None, "d", w, cx));
+                e.show_conflict("d".into(), conflict::Cloud::Unavailable("gone".into()), cx);
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("conflict-agent-working").is_some());
+        assert!(visual.debug_bounds("conflict-keep-mine").is_some());
+        crate::git_gate::set(crate::git_gate::Gate::default());
+    }
+}

@@ -24,6 +24,7 @@ use std::{
 
 pub(crate) mod blame;
 mod chrome;
+mod conflict;
 mod diff;
 pub(crate) mod media;
 #[cfg(test)]
@@ -202,6 +203,9 @@ pub(crate) struct FileEditor {
     svg_render: Option<Task<()>>,
     unsupported: Option<String>,
     error: Option<String>,
+    /// A remote save the Host refused because the file changed there; the dialog is open.
+    conflict: Option<conflict::Conflict>,
+    io: conflict::FileIo,
     disk_changed: bool,
     loading: bool,
     /// Progress of a remote read in bytes (done, total; total 0 until the first chunk), and
@@ -368,6 +372,8 @@ impl FileEditor {
             svg_render: None,
             unsupported: None,
             error: None,
+            conflict: None,
+            io: Default::default(),
             disk_changed: false,
             loading: false,
             read_progress: Arc::default(),
@@ -538,6 +544,7 @@ impl FileEditor {
                             input.reload_file(text, !first && !force, cx);
                         });
                         this.dirty = false;
+                        this.sync_read_only(cx);
                         this.sync_blame_options(cx);
                         this.request_blame(cx);
                         if first && !this.show_diff && (this.is_markdown() || this.is_svg()) {
@@ -888,6 +895,7 @@ impl FileEditor {
         self.autosave = None;
         if !self.dirty
             || self.disk_changed
+            || self.conflict.is_some()
             || !cx
                 .try_global::<crate::settings::Preferences>()
                 .is_some_and(|p| p.autosave)
@@ -899,6 +907,7 @@ impl FileEditor {
             let _ = this.update(cx, |this, cx| {
                 if this.dirty
                     && !this.disk_changed
+                    && this.conflict.is_none()
                     && cx
                         .try_global::<crate::settings::Preferences>()
                         .is_some_and(|p| p.autosave)
@@ -939,7 +948,14 @@ impl FileEditor {
         }));
     }
     pub(crate) fn save(&mut self, cx: &mut Context<Self>) {
-        if self.saving || self.input.read(cx).is_composing() || self.document.is_none() {
+        if self.saving
+            || self.conflict.is_some()
+            || self.input.read(cx).is_composing()
+            || self
+                .document
+                .as_ref()
+                .is_none_or(|doc| doc.read_only.is_some())
+        {
             return;
         }
         let source = self.input.read(cx).content.clone();
@@ -974,7 +990,7 @@ impl FileEditor {
                     }
                 });
             }
-            let Ok(Some((path, doc, saved))) = this.update(cx, |this, cx| {
+            let Ok(Some((path, doc, saved, save))) = this.update(cx, |this, cx| {
                 if this.input.read(cx).is_composing() {
                     this.saving = false;
                     this.schedule_autosave(cx);
@@ -985,6 +1001,7 @@ impl FileEditor {
                     PathBuf::from(&this.path),
                     this.document.clone()?,
                     this.input.read(cx).content.to_string(),
+                    this.io.save.clone(),
                 ))
             }) else {
                 return;
@@ -992,31 +1009,56 @@ impl FileEditor {
             let text = saved.clone();
             let result = cx
                 .background_executor()
-                .spawn(async move { document::save_document(&path, &doc, &text) })
+                .spawn(async move { save(&path, &doc, &text) })
                 .await;
-            let _ = this.update(cx, |this, cx| {
-                this.saving = false;
-                match result {
-                    Ok(disk) => {
-                        if let Some(doc) = &mut this.document {
-                            doc.disk = disk;
-                            doc.text = saved;
-                        }
-                        this.disk_changed = false;
-                        this.edited(cx);
-                        this.git.update(cx, |git, cx| git.changed(cx));
-                        cx.emit(FileEvent::Saved);
-                    }
-                    Err(error) => {
-                        this.error = Some(error);
-                        cx.emit(FileEvent::SaveFailed);
-                    }
-                }
-                cx.notify();
-            });
+            let _ = this.update(cx, |this, cx| this.finish_save(result, saved, cx));
         })
         .detach();
         cx.notify();
+    }
+    /// Applies the outcome of a save. A refusal because the file changed on the host opens
+    /// the compare dialog; any other failure leaves the text in the editor with the error.
+    fn finish_save(
+        &mut self,
+        result: Result<Vec<u8>, String>,
+        saved: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.saving = false;
+        match result {
+            Ok(disk) => {
+                if let Some(doc) = &mut self.document {
+                    doc.disk = disk;
+                    doc.text = saved;
+                }
+                self.disk_changed = false;
+                self.edited(cx);
+                self.git.update(cx, |git, cx| git.changed(cx));
+                cx.emit(FileEvent::Saved);
+            }
+            Err(error) if monocode_core::files::remote_write::is_host_conflict(&error) => {
+                self.open_conflict(saved, cx);
+            }
+            Err(error) => {
+                self.error = Some(error);
+                cx.emit(FileEvent::SaveFailed);
+            }
+        }
+        cx.notify();
+    }
+    /// The input follows the document: a file that cannot be saved is not editable.
+    fn sync_read_only(&mut self, cx: &mut Context<Self>) {
+        let read_only = self.conflict.is_some()
+            || self
+                .document
+                .as_ref()
+                .is_some_and(|d| d.read_only.is_some());
+        self.input
+            .update(cx, |input, _| input.set_read_only(read_only));
+    }
+    /// A turn is running in this file's cloud workspace.
+    fn agent_working(&self) -> bool {
+        crate::git_gate::turn_running(&self.path)
     }
     fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.dirty {
@@ -1235,6 +1277,7 @@ impl gpui::Render for FileEditor {
                 .into_any_element()
         });
         let selection_menu = self.code_selection_menu(window, cx);
+        let conflict_dialog = self.conflict_dialog(cx);
         self.input.update(cx, |i, _| {
             i.set_editor_diff(self.show_diff, !self.git_staged)
         });
@@ -1424,6 +1467,11 @@ impl gpui::Render for FileEditor {
             )
             .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape" {
+                    if this.conflict.is_some() {
+                        this.cancel_conflict(cx);
+                        cx.stop_propagation();
+                        return;
+                    }
                     this.selection.dismiss();
                     cx.notify();
                 }
@@ -1487,6 +1535,33 @@ impl gpui::Render for FileEditor {
             })
             .when(self.search_open, |d| d.child(self.search_panel(cx)))
             .when_some(
+                self.document.as_ref().and_then(|doc| doc.read_only.clone()),
+                |d, reason| {
+                    d.child(
+                        div()
+                            .id("read-only-banner")
+                            .debug_selector(|| "read-only-banner".into())
+                            .px_3()
+                            .py_2()
+                            .text_size(px(12.))
+                            .text_color(rgb(0xfbbf24))
+                            .child(reason),
+                    )
+                },
+            )
+            .when(ready && self.agent_working(), |d| {
+                d.child(
+                    div()
+                        .id("agent-working-banner")
+                        .debug_selector(|| "agent-working-banner".into())
+                        .px_3()
+                        .py_2()
+                        .text_size(px(12.))
+                        .text_color(content(0.6))
+                        .child("The agent is working in this workspace and may change this file."),
+                )
+            })
+            .when_some(
                 self.error.clone().filter(|_| ready).or_else(|| {
                     self.disk_changed
                         .then(|| "File changed on disk. Reload to use the new version.".into())
@@ -1506,6 +1581,7 @@ impl gpui::Render for FileEditor {
             .when(ready && !self.preview, |d| d.child(self.status_footer(cx)))
             .child(self.selection_surface(cx))
             .children(selection_menu)
+            .children(conflict_dialog)
     }
 }
 
