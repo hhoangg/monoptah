@@ -1241,6 +1241,14 @@ impl Shell {
         envs
     }
 
+    /// The session in view has a live conversation entry.
+    fn panel_has_conversation(&self) -> bool {
+        self.workspace
+            .active
+            .map(|pane| self.workspace.session_for_pane(pane))
+            .is_some_and(|id| self.sessions.contains_key(&id))
+    }
+
     /// Whether the link of the panels' workspace is known to be down: the session in view says
     /// so and no other session on the same environment is live. The panels, the Explorer and the
     /// git gate all read this one answer.
@@ -1248,6 +1256,11 @@ impl Shell {
         let Some(path) = monocode_core::remote::parse_remote_path(root.project()) else {
             return self.panel_link_known(cx);
         };
+        // A session without a conversation (it runs in a terminal) knows nothing about its link:
+        // a sibling's down link must not lock its panels, and it has no Connect to unlock them.
+        if !self.panel_has_conversation() {
+            return false;
+        }
         if self.live_environments(cx).contains(&path.environment_id) {
             return false;
         }
@@ -1370,6 +1383,12 @@ impl Shell {
             .map(|chrome| chrome.with_state(known, recovering).with_age(age));
         self.sync_codespace_pane(cx);
         let mut offline_envs = self.offline_environments(cx);
+        // The panels of a session without a conversation never lock because of a sibling.
+        if !self.panel_has_conversation()
+            && let Some(path) = monocode_core::remote::parse_remote_path(root.project())
+        {
+            offline_envs.retain(|env| *env != path.environment_id);
+        }
         if chrome.as_ref().is_some_and(|chrome| chrome.offline)
             && let Some(path) = monocode_core::remote::parse_remote_path(root.project())
             && !offline_envs.contains(&path.environment_id)

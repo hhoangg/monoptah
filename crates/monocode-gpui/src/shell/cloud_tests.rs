@@ -1703,6 +1703,44 @@ fn a_disconnected_workspace_keeps_its_cached_panels_read_only_and_connect_reload
         .unwrap();
 }
 
+/// A terminal-run cloud session (no conversation) in view is not locked by a sibling whose link
+/// is down: it has no Connect action, so its panels keep reading as in F2-1.
+#[gpui::test]
+fn a_terminal_session_is_not_locked_by_a_sibling_that_is_down(cx: &mut TestAppContext) {
+    use crate::cloud_wake::fakes::{AUTH_OK, install, serial};
+    let _serial = serial();
+    let (window, _, _) = crate::shell::tests::window(cx);
+    let _fakes = window
+        .update(cx, |shell, _, _| {
+            install(shell.store.clone(), AUTH_OK, "Shutdown")
+        })
+        .unwrap();
+    window
+        .update(cx, |shell, window, cx| {
+            let (x, t) = (cloud_row(shell, "octo-run"), cloud_row(shell, "octo-run"));
+            shell
+                .cloud_states
+                .insert("octo-run".into(), CloudState::Available);
+            shell.ensure_session(x, cx).expect("conversation");
+            shell.sessions[&x].update(cx, |v, _| {
+                v.set_online_for_test(true);
+                v.set_online_for_test(false);
+            });
+            shell.ensure_right_panel(window, cx);
+            shell.workspace.active = Some(t);
+            shell.sync_cloud_panel(cx);
+            let remote = shell.session_summaries[&t].cwd.clone();
+            let root = shell.panel_root(cx);
+            assert!(!shell.sessions.contains_key(&t));
+            assert!(!shell.panel_offline(&root, cx));
+            assert!(!shell.git.read(cx).offline());
+            assert!(crate::git_gate::writes_allowed(&remote));
+            let panel = shell.right_panel.clone().unwrap();
+            assert!(!panel.read(cx).cloud_chrome().unwrap().offline);
+        })
+        .unwrap();
+}
+
 /// One live session means the workspace is up: a stale second session on the same environment
 /// never makes the panels, the Explorer or the git gate treat it as down.
 #[gpui::test]
