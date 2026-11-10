@@ -1685,6 +1685,11 @@ fn a_disconnected_workspace_keeps_its_cached_panels_read_only_and_connect_reload
             assert!(panel.read(cx).cloud_chrome().unwrap().offline);
         })
         .unwrap();
+    // The reads of the fake workspace fail, so the panels stay read-only until the recovery
+    // limit ends the wait.
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(31));
     cx.run_until_parked();
     window
         .update(cx, |shell, _, cx| {
@@ -1694,6 +1699,57 @@ fn a_disconnected_workspace_keeps_its_cached_panels_read_only_and_connect_reload
             let panel = shell.right_panel.clone().unwrap();
             let chrome = panel.read(cx).cloud_chrome().unwrap().clone();
             assert!(!chrome.offline && chrome.cached.is_none());
+        })
+        .unwrap();
+}
+
+/// One live session means the workspace is up: a stale second session on the same environment
+/// never makes the panels, the Explorer or the git gate treat it as down.
+#[gpui::test]
+fn one_live_session_keeps_the_environment_writable_whatever_another_one_says(
+    cx: &mut TestAppContext,
+) {
+    use crate::cloud_wake::fakes::{AUTH_OK, install, serial};
+    let _serial = serial();
+    let (window, _, _) = crate::shell::tests::window(cx);
+    let _fakes = window
+        .update(cx, |shell, _, _| {
+            install(shell.store.clone(), AUTH_OK, "Shutdown")
+        })
+        .unwrap();
+    window
+        .update(cx, |shell, window, cx| {
+            let (live, stale) = (cloud_row(shell, "octo-run"), cloud_row(shell, "octo-run"));
+            for id in [live, stale] {
+                shell
+                    .cloud_states
+                    .insert("octo-run".into(), CloudState::Available);
+                shell.ensure_session(id, cx).expect("conversation");
+            }
+            shell.ensure_right_panel(window, cx);
+            let remote = shell.session_summaries[&stale].cwd.clone();
+            shell.workspace.active = Some(stale);
+            // The session in view lost its link; the other one is live.
+            shell.sessions[&live].update(cx, |v, _| v.set_online_for_test(true));
+            shell.sessions[&stale].update(cx, |v, _| {
+                v.set_online_for_test(true);
+                v.set_online_for_test(false);
+            });
+            shell.sync_cloud_panel(cx);
+            let root = shell.panel_root(cx);
+            assert!(!shell.panel_offline(&root, cx));
+            assert!(shell.offline_environments(cx).is_empty());
+            assert!(!shell.git.read(cx).offline());
+            assert!(crate::git_gate::writes_allowed(&remote));
+            let panel = shell.right_panel.clone().unwrap();
+            assert!(!panel.read(cx).cloud_chrome().unwrap().offline);
+
+            // Both down: the environment is down for the panels, the Explorer and the gate alike.
+            shell.sessions[&live].update(cx, |v, _| v.set_online_for_test(false));
+            shell.sync_cloud_panel(cx);
+            assert!(shell.panel_offline(&root, cx));
+            assert!(shell.git.read(cx).offline());
+            assert!(!crate::git_gate::writes_allowed(&remote));
         })
         .unwrap();
 }

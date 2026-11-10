@@ -19,6 +19,10 @@ const RESUME_TTL: Duration = Duration::from_secs(30);
 const SETTLE: Duration = Duration::from_millis(300);
 /// Watched status still reads this often, in case an event went missing.
 const REPAIR: Duration = Duration::from_secs(30);
+/// After a reconnect the old snapshot stays read-only for at most this long, so a read that hangs
+/// or keeps failing can never lock the panels while the link is reported live. A link that is
+/// really down is separate (`link_offline`) and keeps the panels read-only regardless.
+const RECOVERY_LIMIT: Duration = Duration::from_secs(30);
 
 /// A disk or Git change: Changes, History and the Explorer reread.
 pub(crate) struct GitChanged;
@@ -84,6 +88,15 @@ pub(crate) struct ProjectGit {
     /// The link is back but the first full reload since has not finished: what is shown is still
     /// the old snapshot, so it stays dimmed and read-only until the reload lands.
     recovering: bool,
+    /// Reads started so far, and how many had started when the link came back: only a read that
+    /// started after the reconnect can end the recovery, whatever else is queued meanwhile.
+    read_seq: u64,
+    recovery_floor: u64,
+    recovery_tries: u32,
+    /// Ends the recovery after `RECOVERY_LIMIT` whatever happens to the reads.
+    recovery_limit: Option<Task<()>>,
+    /// Reads again after a failed first read, with a growing delay.
+    recovery_retry: Option<Task<()>>,
     /// The workspace is being woken (the strip says "Workspace starting").
     starting: bool,
     /// Status should be read while visible, whether or not a read can run right now.
@@ -115,6 +128,11 @@ impl ProjectGit {
             remote: RemoteCache::default(),
             link_offline: false,
             recovering: false,
+            read_seq: 0,
+            recovery_floor: 0,
+            recovery_tries: 0,
+            recovery_limit: None,
+            recovery_retry: None,
             starting: false,
             polling_wanted: false,
             #[cfg(test)]
@@ -178,12 +196,13 @@ impl ProjectGit {
         if offline {
             // Stop the timers and the watcher; the wish to poll is remembered.
             self.poll = None;
+            self.end_recovery();
             cx.notify();
             return;
         }
         // Back online: a user action (Connect) brought the workspace back. Start over; the old
         // snapshot stays read-only until the first reload lands.
-        self.recovering = self.available();
+        self.begin_recovery(cx);
         self.epoch += 1;
         cx.emit(GitChanged);
         cx.notify();
@@ -193,6 +212,49 @@ impl ProjectGit {
             self.warm_choices(cx);
             self.reload(cx);
         }
+    }
+    fn end_recovery(&mut self) {
+        self.recovering = false;
+        self.recovery_tries = 0;
+        self.recovery_limit = None;
+        self.recovery_retry = None;
+    }
+    /// The link is back: the snapshot is old until a read that starts now lands, and in any case
+    /// for no longer than `RECOVERY_LIMIT`.
+    fn begin_recovery(&mut self, cx: &mut Context<Self>) {
+        self.end_recovery();
+        if !self.available() {
+            return;
+        }
+        self.recovering = true;
+        self.recovery_floor = self.read_seq;
+        self.recovery_limit = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(RECOVERY_LIMIT).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.recovering {
+                    this.end_recovery();
+                    cx.notify();
+                }
+            });
+        }));
+    }
+    /// Read `seq` of `project` ended. Only a read that started after the reconnect counts: a
+    /// good one ends the recovery, a failed one keeps the panels read-only and reads again soon.
+    fn finish_read(&mut self, seq: u64, project: &str, ok: bool, cx: &mut Context<Self>) {
+        if !self.recovering || self.project != project || seq <= self.recovery_floor {
+            return;
+        }
+        if ok {
+            self.end_recovery();
+            cx.notify();
+            return;
+        }
+        self.recovery_tries += 1;
+        let delay = Duration::from_millis(1000 << self.recovery_tries.min(3));
+        self.recovery_retry = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = this.update(cx, |this, cx| this.reload(cx));
+        }));
     }
     pub(crate) fn set_link_offline(&mut self, offline: bool, cx: &mut Context<Self>) {
         self.bind(self.project.clone(), offline, cx);
@@ -212,7 +274,7 @@ impl ProjectGit {
         }
         self.project = project.clone();
         self.root = project.clone();
-        self.recovering = false;
+        self.end_recovery();
         self.index = self.remembered_index(&project);
         self.stats = self.index.as_ref().map(stats_of);
         self.statuses = self
@@ -337,6 +399,8 @@ impl ProjectGit {
             return;
         }
         self.in_flight = true;
+        self.read_seq += 1;
+        let seq = self.read_seq;
         let project = self.project.clone();
         let path = PathBuf::from(&project);
         let work = cx.background_executor().spawn(async move {
@@ -348,10 +412,7 @@ impl ProjectGit {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
                 this.in_flight = false;
-                if this.project == project && !this.pending && std::mem::take(&mut this.recovering)
-                {
-                    cx.notify();
-                }
+                this.finish_read(seq, &project, result.is_ok(), cx);
                 // A slow or unavailable checkout keeps its last snapshot, and
                 // never takes another checkout's.
                 if this.project == project
@@ -419,7 +480,7 @@ fn stats_of(index: &DiffIndex) -> DiffStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{AppContext as _, TestAppContext};
+    use gpui::{AppContext as _, Entity, TestAppContext};
     use monocode_core::scm::ChangedFile;
 
     const A: &str = "remote://env-octo-abc/workspaces/widgets";
@@ -575,17 +636,92 @@ mod tests {
         });
     }
 
-    #[gpui::test]
-    fn the_snapshot_stays_stale_after_reconnecting_until_the_first_reload_lands(
-        cx: &mut TestAppContext,
-    ) {
-        let git = cx.new(|cx| ProjectGit::new("~".into(), cx));
+    fn reconnected(git: &Entity<ProjectGit>, cx: &mut TestAppContext) {
         git.update(cx, |git, cx| {
             git.bind(A.into(), true, cx);
-            assert!(git.stale());
             git.bind(A.into(), false, cx);
             assert!(!git.offline() && git.stale());
         });
+    }
+
+    #[gpui::test]
+    fn a_good_read_that_started_after_the_reconnect_ends_the_recovery_even_with_one_queued(
+        cx: &mut TestAppContext,
+    ) {
+        let git = cx.new(|cx| ProjectGit::new("~".into(), cx));
+        reconnected(&git, cx);
+        git.update(cx, |git, cx| {
+            // A slow read (longer than the 2 s poll) finishes while the next one is queued.
+            git.pending = true;
+            let seq = git.read_seq;
+            assert!(seq > git.recovery_floor);
+            git.finish_read(seq, A, true, cx);
+            assert!(!git.stale(), "`pending` must not keep the panels read-only");
+        });
+    }
+
+    #[gpui::test]
+    fn a_read_that_started_before_the_reconnect_does_not_end_the_recovery(cx: &mut TestAppContext) {
+        let git = cx.new(|cx| ProjectGit::new("~".into(), cx));
+        git.update(cx, |git, cx| {
+            git.bind(A.into(), false, cx);
+        });
+        let old = git.update(cx, |git, _| git.read_seq);
+        // The old read lands (and fails here) before the link drops and comes back.
+        cx.run_until_parked();
+        reconnected(&git, cx);
+        git.update(cx, |git, cx| {
+            git.finish_read(old, A, true, cx);
+            assert!(
+                git.stale(),
+                "an old read says nothing about the reconnected workspace"
+            );
+            // Nor does a read of another project.
+            let seq = git.read_seq;
+            git.finish_read(seq, B, true, cx);
+            assert!(git.stale());
+            git.finish_read(seq, A, true, cx);
+            assert!(!git.stale());
+        });
+    }
+
+    #[gpui::test]
+    fn a_failed_first_read_keeps_the_panels_read_only_and_reads_again(cx: &mut TestAppContext) {
+        let git = cx.new(|cx| ProjectGit::new("~".into(), cx));
+        reconnected(&git, cx);
+        // The remote read fails here (no connection): still read-only, and a retry is queued.
+        cx.run_until_parked();
+        git.update(cx, |git, _| {
+            assert!(git.stale() && git.recovery_retry.is_some());
+            assert_eq!(git.recovery_tries, 1);
+        });
+        let reads = git.update(cx, |git, _| git.reads);
+        cx.executor().advance_clock(Duration::from_secs(3));
+        cx.run_until_parked();
+        git.update(cx, |git, _| {
+            assert!(git.reads > reads, "the retry read again");
+            assert!(git.stale());
+        });
+        // The escape ends it for a read that keeps failing, but a link that is down again stays
+        // read-only.
+        cx.executor()
+            .advance_clock(RECOVERY_LIMIT + Duration::from_secs(1));
+        cx.run_until_parked();
+        git.update(cx, |git, cx| {
+            assert!(!git.stale());
+            git.bind(A.into(), true, cx);
+            assert!(git.stale());
+        });
+    }
+
+    #[gpui::test]
+    fn a_hung_read_cannot_lock_the_panels_for_ever(cx: &mut TestAppContext) {
+        let git = cx.new(|cx| ProjectGit::new("~".into(), cx));
+        git.update(cx, |git, _| git.in_flight = true);
+        reconnected(&git, cx);
+        git.update(cx, |git, _| assert!(git.stale() && git.pending));
+        cx.executor()
+            .advance_clock(RECOVERY_LIMIT + Duration::from_secs(1));
         cx.run_until_parked();
         git.update(cx, |git, _| assert!(!git.stale()));
     }

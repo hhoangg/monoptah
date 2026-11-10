@@ -1198,20 +1198,30 @@ impl Shell {
             .is_some_and(|view| view.read(cx).panel_link_known())
     }
 
-    /// The panels show remembered data of a workspace the app knows is down.
-    pub(super) fn panel_offline(&self, root: &crate::panel_root::PanelRoot, cx: &App) -> bool {
-        crate::panel_root::is_offline(root, self.panel_link(cx)) && self.panel_link_known(cx)
+    /// The Host environments of the cloud sessions whose link is live. One live session means the
+    /// workspace is up, whatever a stale second session on it says.
+    fn live_environments(&self, cx: &App) -> Vec<String> {
+        self.cloud_environments(cx, true)
     }
 
-    /// Every Host environment of a cloud session whose link is known to be down, for the git
-    /// gate: a Review tab of workspace B must be refused while the panels show A or Local.
-    fn offline_environments(&self, cx: &App) -> Vec<String> {
+    /// The Host environments where no session is live but some session knows the link is down.
+    pub(super) fn offline_environments(&self, cx: &App) -> Vec<String> {
+        let live = self.live_environments(cx);
+        let mut envs = self.cloud_environments(cx, false);
+        envs.retain(|env| !live.contains(env));
+        envs
+    }
+
+    /// The environments of the sessions with a live conversation whose link is live (`live`) or
+    /// known to be down (`!live`).
+    fn cloud_environments(&self, cx: &App, live: bool) -> Vec<String> {
         let mut envs = Vec::new();
         for id in self.cloud_marks.keys() {
             let Some(view) = self.sessions.get(id).map(|view| view.read(cx)) else {
                 continue;
             };
-            if !view.panel_link_known() || view.panel_link() == crate::panel_root::Link::Connected {
+            let connected = view.panel_link() == crate::panel_root::Link::Connected;
+            if !view.panel_link_known() || connected != live {
                 continue;
             }
             let cwds = self
@@ -1229,6 +1239,27 @@ impl Shell {
             }
         }
         envs
+    }
+
+    /// Whether the link of the panels' workspace is known to be down: the session in view says
+    /// so and no other session on the same environment is live. The panels, the Explorer and the
+    /// git gate all read this one answer.
+    pub(super) fn panel_down(&self, root: &crate::panel_root::PanelRoot, cx: &App) -> bool {
+        let Some(path) = monocode_core::remote::parse_remote_path(root.project()) else {
+            return self.panel_link_known(cx);
+        };
+        if self.live_environments(cx).contains(&path.environment_id) {
+            return false;
+        }
+        self.panel_link_known(cx)
+            || self
+                .cloud_environments(cx, false)
+                .contains(&path.environment_id)
+    }
+
+    /// The panels show remembered data of a workspace the app knows is down.
+    pub(super) fn panel_offline(&self, root: &crate::panel_root::PanelRoot, cx: &App) -> bool {
+        crate::panel_root::is_offline(root, self.panel_link(cx)) && self.panel_down(root, cx)
     }
 
     /// Whether the session in view has a live conversation for the Connect action to reconnect.
@@ -1314,7 +1345,7 @@ impl Shell {
     pub(super) fn sync_cloud_panel(&self, cx: &mut Context<Self>) {
         let root = self.panel_root(cx);
         let link = self.panel_link(cx);
-        let known = self.panel_link_known(cx);
+        let known = self.panel_down(&root, cx);
         let offline = self.panel_offline(&root, cx);
         // A cloud session's root can change without the session changing (the Local switch, a
         // pending workspace that became real). Offline: the panels keep the last data and read

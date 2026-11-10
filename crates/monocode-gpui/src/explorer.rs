@@ -528,7 +528,7 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) {
         // A late answer for another root (the panels switched meanwhile) is not this tree's.
-        if self.is_remote_root() && !crate::remote_cache::within(&self.cwd, &path) {
+        if !crate::remote_cache::within(&self.cwd, &path) {
             return;
         }
         match &result {
@@ -2185,6 +2185,14 @@ mod tests {
                 assert!(explorer.naming.is_none());
             })
             .unwrap();
+        // The reads of this fake workspace fail, so the tree stays read-only until the recovery
+        // limit ends the wait.
+        cx.run_until_parked();
+        window
+            .update(cx, |explorer, _, cx| assert!(explorer.is_stale(cx)))
+            .unwrap();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(31));
         cx.run_until_parked();
         window
             .update(cx, |explorer, window, cx| {
@@ -2242,6 +2250,29 @@ mod tests {
                 explorer.apply_listing(ROOT.into(), Ok(listing(ROOT, &["a.rs"])), cx);
                 assert_eq!(explorer.dirs.len(), 1);
                 assert!(git.read(cx).remote.peek(ROOT).unwrap().updated.is_some());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_late_remote_listing_cannot_enter_a_local_tree(cx: &mut gpui::TestAppContext) {
+        let (window, _) = explorer_window(cx);
+        window
+            .update(cx, |explorer, _, cx| {
+                explorer.cwd = "/work/monocode".into();
+                explorer.apply_listing(ROOT.into(), Ok(listing(ROOT, &["a.rs"])), cx);
+                explorer.apply_listing(
+                    "/work/other".into(),
+                    Ok(listing("/work/other", &["b.rs"])),
+                    cx,
+                );
+                assert!(explorer.dirs.is_empty());
+                explorer.apply_listing(
+                    "/work/monocode/src".into(),
+                    Ok(listing("/work/monocode/src", &["lib.rs"])),
+                    cx,
+                );
+                assert_eq!(explorer.dirs.len(), 1);
             })
             .unwrap();
     }
