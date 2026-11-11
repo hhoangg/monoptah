@@ -18,6 +18,16 @@ use crate::transcript::Row;
 use rusqlite::params;
 use serde_json::Value;
 
+/// Where a local session's rows stand: how many there are and a digest of the last one. A
+/// move records it at the snapshot and compares it at the flip, so a turn that was written in
+/// between is noticed (design 4.2.2 step 7).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RowAnchor {
+    pub count: usize,
+    /// Digest of the last row (role, text, first, send time); `None` when there are no rows.
+    pub last: Option<String>,
+}
+
 /// What one append changed, in local row indexes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AppendOutcome {
@@ -75,6 +85,53 @@ impl Store {
             return Ok(());
         }
         self.save_setting(&Self::sync_error_key(session), message)
+    }
+    /// The row count of a local session and a digest of its last row. Reads only.
+    pub fn row_anchor(&self, session: i64) -> Result<RowAnchor, String> {
+        use rusqlite::OptionalExtension;
+        use sha2::{Digest, Sha256};
+        self.require_native_rows()?;
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM native_rows WHERE session_id=?1",
+                [session],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let last = self
+            .conn
+            .query_row(
+                "SELECT role,body,first,sent_at FROM native_rows WHERE session_id=?1 ORDER BY row_ix DESC LIMIT 1",
+                [session],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, bool>(2)?,
+                        r.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .map(|(role, body, first, sent_at)| {
+                let mut hash = Sha256::new();
+                hash.update(role.as_bytes());
+                hash.update([0]);
+                hash.update(body.as_bytes());
+                hash.update([0, u8::from(first)]);
+                hash.update(sent_at.unwrap_or(-1).to_le_bytes());
+                hash.finalize()
+                    .iter()
+                    .take(16)
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            });
+        Ok(RowAnchor {
+            count: usize::try_from(count).unwrap_or(0),
+            last,
+        })
     }
     /// Deletes the rows of a local session from index `from` on.
     pub fn truncate_rows(&mut self, session: i64, from: usize) -> Result<(), String> {

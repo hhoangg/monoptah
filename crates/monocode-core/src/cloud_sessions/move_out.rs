@@ -207,13 +207,26 @@ fn remote_tip(root: &Path, branch: &str) -> Option<String> {
 // ---------------------------------------------------------------- step 1: fetch
 
 enum Timed {
-    TimedOut,
+    Expired,
+    Stopped,
     Failed(String),
 }
 
 /// Runs git with a deadline. On timeout the whole process group is killed, so helpers such
 /// as `ssh` or a credential program do not outlive the call.
 fn run_timed(root: &Path, args: &[&str], timeout: Duration) -> Result<String, Timed> {
+    run_timed_with(root, args, timeout, None, None)
+}
+
+/// [`run_timed`] that also stops when `cancel` is set, and may run with another `PATH` (a
+/// push needs the hooks and credential helpers of the login shell).
+fn run_timed_with(
+    root: &Path,
+    args: &[&str],
+    timeout: Duration,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    path: Option<&str>,
+) -> Result<String, Timed> {
     let failed = |e: String| Timed::Failed(e);
     let mut out = tempfile::tempfile().map_err(|e| failed(e.to_string()))?;
     let mut err = tempfile::tempfile().map_err(|e| failed(e.to_string()))?;
@@ -233,6 +246,9 @@ fn run_timed(root: &Path, args: &[&str], timeout: Duration) -> Result<String, Ti
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
+    if let Some(path) = path {
+        cmd.env("PATH", path);
+    }
     let mut child = cmd
         .spawn()
         .map_err(|e| failed(format!("Could not run Git: {e}")))?;
@@ -242,7 +258,11 @@ fn run_timed(root: &Path, args: &[&str], timeout: Duration) -> Result<String, Ti
             Some(status) => break status,
             None if started.elapsed() >= timeout => {
                 crate::process::terminate(&mut child);
-                return Err(Timed::TimedOut);
+                return Err(Timed::Expired);
+            }
+            None if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) => {
+                crate::process::terminate(&mut child);
+                return Err(Timed::Stopped);
             }
             None => std::thread::sleep(Duration::from_millis(25)),
         }
@@ -270,10 +290,11 @@ fn fetch_with_timeout(cwd: &Path, timeout: Duration) -> Result<(), String> {
     let root = toplevel(cwd)?;
     match run_timed(&root, &["fetch", "--no-tags", REMOTE], timeout) {
         Ok(_) => Ok(()),
-        Err(Timed::TimedOut) => Err(format!(
+        Err(Timed::Expired) => Err(format!(
             "Fetching {REMOTE} took longer than {} seconds",
             timeout.as_secs()
         )),
+        Err(Timed::Stopped) => Err("Cancelled".into()),
         Err(Timed::Failed(e)) => Err(format!("Could not fetch {REMOTE}: {e}")),
     }
 }
@@ -446,6 +467,67 @@ fn default_branches(root: &Path) -> Defaults {
     names.sort();
     names.dedup();
     Defaults { names, confirmed }
+}
+
+/// Whether pushing to `branch` might change origin's default branch. Fails closed when
+/// origin cannot be asked (see [`Defaults::may_be_default`]). The move refuses such a push.
+pub fn may_be_default_branch(cwd: &Path, branch: &str) -> Result<bool, String> {
+    let root = toplevel(cwd)?;
+    Ok(default_branches(&root).may_be_default(branch))
+}
+
+/// Why [`push_timed`] stopped because of `cancel`.
+pub const PUSH_CANCELLED: &str = "The push was cancelled.";
+/// A push may take this long (large repositories over a slow link), like the Host's push.
+pub const PUSH_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Runs `git push` with `args` (built and validated by `scm::push_commit_args`), ended after
+/// `timeout` or when `cancel` is set; the whole process group is stopped then. Never prompts.
+pub fn push_timed(
+    cwd: &Path,
+    args: &[String],
+    timeout: Duration,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(), String> {
+    let root = toplevel(cwd)?;
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    // Hooks (LFS) and credential helpers may only be on the login-shell PATH.
+    let path = crate::scm::shell::gui_search_path();
+    match run_timed_with(&root, &args, timeout, Some(cancel), Some(&path)) {
+        Ok(_) => Ok(()),
+        Err(Timed::Expired) => Err(format!(
+            "Pushing took longer than {} seconds",
+            timeout.as_secs()
+        )),
+        Err(Timed::Stopped) => Err(PUSH_CANCELLED.into()),
+        Err(Timed::Failed(e)) => Err(e),
+    }
+}
+
+/// The commit `HEAD` points at, `None` when it cannot be read (no repository, no commits).
+pub fn head_commit(cwd: &Path) -> Option<String> {
+    let root = toplevel(cwd).ok()?;
+    git_text(&root, &["rev-parse", "--verify", "HEAD"], None)
+        .ok()
+        .filter(|head| !head.is_empty())
+}
+
+/// The tip of `refs/heads/<branch>` on origin, asked with a read-only `ls-remote`
+/// (10 s cap). `None` when the branch does not exist there. Used to see that a push already
+/// went through, so a retried push step does not push again.
+pub fn origin_branch_tip(cwd: &Path, branch: &str) -> Result<Option<String>, String> {
+    let root = toplevel(cwd)?;
+    let name = format!("refs/heads/{branch}");
+    match run_timed(&root, &["ls-remote", REMOTE, &name], LS_REMOTE_TIMEOUT) {
+        Ok(text) => Ok(text
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .find(|(_, name_found)| *name_found == name)
+            .map(|(sha, _)| sha.trim().to_owned())),
+        Err(Timed::Expired) => Err(format!("Asking {REMOTE} took longer than 10 seconds")),
+        Err(Timed::Stopped) => Err("Cancelled".into()),
+        Err(Timed::Failed(e)) => Err(format!("Could not ask {REMOTE}: {e}")),
+    }
 }
 
 // ---------------------------------------------------------------- step 2: snapshot

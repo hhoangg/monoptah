@@ -688,6 +688,11 @@ pub struct CloudSessions {
     reconnecting: Mutex<std::collections::HashSet<String>>,
     /// Where the Claude setup step reads the user's kit preferences and local setup.
     kit_seams: claude_setup::KitSeams,
+    /// Moves (and rollbacks) running in this process, by local session id.
+    moves: Mutex<HashMap<i64, Arc<move_session::RunState>>>,
+    /// Test seam of the move flip: runs after the Host link and before the location.
+    #[cfg(test)]
+    flip_hook: Mutex<Option<move_session::FlipHook>>,
 }
 
 impl CloudSessions {
@@ -711,6 +716,9 @@ impl CloudSessions {
             follower_retry: Duration::from_secs(2),
             reconnecting: Mutex::new(Default::default()),
             kit_seams: claude_setup::KitSeams::system(),
+            moves: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            flip_hook: Mutex::new(None),
         }
     }
     /// Replaces where the Claude setup reads the user's preferences and local setup.
@@ -1842,6 +1850,8 @@ pub mod kit;
 pub mod kit_pack;
 pub mod kit_prefs;
 pub mod move_out;
+#[path = "cloud_sessions/move.rs"]
+pub mod move_session;
 pub use backend::{CloudBackend, CloudBackendKind, CloudRef, CodespacesBackend};
 
 mod convert;
@@ -1871,6 +1881,8 @@ mod kit_prefs_tests;
 mod kit_tests;
 #[cfg(test)]
 mod move_out_tests;
+#[cfg(test)]
+mod move_tests;
 #[cfg(test)]
 mod startup_tests;
 #[cfg(test)]

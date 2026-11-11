@@ -406,6 +406,20 @@ describe("workspace.applySnapshot", () => {
       expect(readFileSync(join(out.cwd, "c.txt"), "utf8")).toBe("new\n");
     });
 
+    it("is idempotent for the detached worktree of a default-branch move (shared instance)", async () => {
+      const w = world();
+      onMain(w);
+      const snap = snapshotOf(w.local);
+      const patchUploadId = upload(w.uploads, "changes.patch", snap.patch);
+      const args = { projectId: w.projectId, branch: "main", ...snap, patchUploadId };
+      const first = await w.moves.applySnapshot(args);
+      const second = await w.moves.applySnapshot(args);
+      expect(second).toMatchObject({ cwd: first.cwd, createdWorktree: false, reused: true });
+      // A worktree at that name that holds something else is still refused.
+      writeFileSync(join(first.cwd, "c.txt"), "changed\n");
+      await expect(w.moves.applySnapshot(args)).rejects.toThrow(/already exists/);
+    });
+
     it("refuses main when it is ahead of origin/main", async () => {
       const w = world();
       onMain(w);

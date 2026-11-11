@@ -44,6 +44,26 @@ fn update(status: impl Into<String>, finished: bool) -> Update {
 pub(super) fn failed(error: impl Into<String>) -> Update {
     update(error, true)
 }
+use monocode_core::cloud_sessions::move_session::moved_path_note;
+/// The text of the first turn of a session that moved to the cloud: a summary hand-off (a
+/// session that moved as a summary) goes around the prompt, and the note about the old
+/// machine's paths goes in front of everything.
+pub(super) fn moved_turn_text(
+    prompt: &str,
+    handoff: Option<&monocode_core::agent::Handoff>,
+    note: Option<&str>,
+) -> String {
+    let text = match handoff {
+        Some(handoff) => {
+            monocode_core::response::wrap_handoff_prompt(&handoff.from, &handoff.brief, prompt)
+        }
+        None => prompt.to_string(),
+    };
+    match note {
+        Some(note) => format!("{note}\n\n{text}"),
+        None => text,
+    }
+}
 fn command(kind: &str, session_id: Option<&str>) -> Value {
     let mut value = json!({"type":kind,"commandId":monocode_core::mono::new_id()});
     if let Some(id) = session_id {
@@ -713,8 +733,19 @@ pub(crate) fn run_with_client_mirrored(
                 operation
             };
             let mut send = command(operation, binding.session_id.as_deref());
+            // The first turn after a move to the cloud (design 4.2.2, 4.9 R5): a session that
+            // moved as a summary carries its handoff, and the paths of the old machine in the
+            // earlier messages are explained once. Both are part of the durable command, so a
+            // retry sends the same text, and the note is consumed only after the journal write.
+            let mut moved_note = None;
             if matches!(operation, "send" | "draft") {
-                send["text"] = json!(prompt);
+                let mut text = prompt.clone();
+                if let (true, Some(local)) = (operation == "send", mirror) {
+                    let note = moved_path_note(&*locked(&store)?, local);
+                    moved_note = note.as_ref().map(|_| local);
+                    text = moved_turn_text(&prompt, settings.handoff.as_ref(), note.as_deref());
+                }
+                send["text"] = json!(text);
                 let (references, uploads) = prepare_for_session(
                     &client,
                     &machine.id,
@@ -742,6 +773,12 @@ pub(crate) fn run_with_client_mirrored(
             binding.summary.has_messages = true;
             binding.summary.updated_at = monocode_core::time::now_ms();
             journal(&store, &binding)?;
+            if let Some(local) = moved_note {
+                let _ = monocode_core::cloud_sessions::move_session::clear_moved_path_note(
+                    &*locked(&store)?,
+                    local,
+                );
+            }
             // The command is durable now: a queued message that started this turn may leave
             // the send queue (same receipt as the local runtime).
             if let Some(id) = settings.mono_message_id.clone() {

@@ -142,3 +142,36 @@ fn a_turn_start_does_not_overwrite_the_deleted_workspace_marker() {
         Some(monocode_core::store::WORKSPACE_LOST)
     );
 }
+
+#[test]
+fn the_first_cloud_turn_carries_the_moved_path_note_and_the_summary() {
+    use monocode_core::agent::Handoff;
+    // Nothing to add: the prompt is sent as typed.
+    assert_eq!(remote::moved_turn_text("go on", None, None), "go on");
+    // The note comes first, once.
+    let note = "This session moved from /Users/me/repo to /workspaces/repo; paths in earlier messages refer to the old location.";
+    let text = remote::moved_turn_text("go on", None, Some(note));
+    assert_eq!(text, format!("{note}\n\ngo on"));
+    // A session that moved as a summary also wraps the prompt in the hand-off.
+    let handoff = Handoff {
+        from: "codex".into(),
+        brief: "We fixed the login bug.".into(),
+    };
+    let text = remote::moved_turn_text("go on", Some(&handoff), Some(note));
+    assert!(text.starts_with(note));
+    assert!(text.contains("We fixed the login bug."));
+    assert!(text.contains("go on"));
+}
+
+#[test]
+fn the_moved_path_note_is_consumed_once() {
+    use monocode_core::cloud_sessions::move_session::{clear_moved_path_note, moved_path_note};
+    let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
+    let summary = moved_session(&mut store);
+    store
+        .save_setting(&format!("cloud-move-note:{}", summary.id), "note")
+        .unwrap();
+    assert_eq!(moved_path_note(&store, summary.id).as_deref(), Some("note"));
+    clear_moved_path_note(&store, summary.id).unwrap();
+    assert_eq!(moved_path_note(&store, summary.id), None);
+}
