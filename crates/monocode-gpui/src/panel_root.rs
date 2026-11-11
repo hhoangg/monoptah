@@ -291,6 +291,14 @@ impl SetupStrip {
     }
 }
 
+/// True when some server line asks the user to sign in in the cloud (D12).
+pub(crate) fn needs_cloud_sign_in(setup: &SetupStrip) -> bool {
+    setup
+        .servers
+        .iter()
+        .any(|(_, label, _)| label == SIGN_IN_LABEL)
+}
+
 /// Said when the local setup differs from what the workspace got.
 pub(crate) const SETUP_CHANGED: &str = "Your local setup changed since this workspace started";
 

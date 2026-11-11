@@ -6,7 +6,9 @@ use crate::{
     explorer::Explorer,
     git_status::{GitChanged, ProjectGit},
     history::History,
-    panel_root::{Chrome, Link, PanelMode, SETUP_CHANGED, SetupStrip, SetupTone},
+    panel_root::{
+        Chrome, Link, PanelMode, SETUP_CHANGED, SetupStrip, SetupTone, needs_cloud_sign_in,
+    },
     project_tabs::{TabLabel, TabReveal, tab_button},
     theme::*,
 };
@@ -15,6 +17,7 @@ use gpui::{
     FontWeight, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Role, SharedString,
     Stateful, StyleRefinement, Subscription, WeakEntity, Window, div, prelude::*, px,
 };
+use monocode_core::cloud_sessions::claude_setup::SIGN_IN_HINT;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -891,6 +894,16 @@ impl RightPanel {
                         })
                         .collect::<Vec<_>>(),
                 )
+                .when(needs_cloud_sign_in(setup), |d| {
+                    d.child(
+                        div()
+                            .id("cloud-setup-sign-in-hint")
+                            .debug_selector(|| "cloud-setup-sign-in-hint".into())
+                            .pl_4()
+                            .text_color(content(0.5))
+                            .child(SIGN_IN_HINT),
+                    )
+                })
                 .children(
                     setup
                         .warnings
@@ -1206,6 +1219,8 @@ mod tests {
         visual.run_until_parked();
         assert!(visual.debug_bounds("cloud-setup-server-github").is_some());
         assert!(visual.debug_bounds("cloud-setup-server-linear").is_some());
+        // A "Sign in in the cloud" server brings the hint: the app copies no sign-in (D12).
+        assert!(visual.debug_bounds("cloud-setup-sign-in-hint").is_some());
         // Update is a click; while it runs the button does nothing.
         let update = visual.debug_bounds("cloud-setup-update").unwrap();
         visual.simulate_click(update.center(), Default::default());
