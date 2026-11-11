@@ -44,7 +44,17 @@ impl Shell {
             .workspace
             .tab_of(id)
             .and_then(|tab| self.workspace.tab_workspaces.get(&tab))
-            .map_or_else(|| self.session_working_copy(id, cx), String::as_str);
+            .map_or_else(
+                // A cloud session runs in its remote workspace but is scoped to the
+                // local project it twins.
+                || {
+                    self.project_of(
+                        self.workspace.session_for_pane(id),
+                        self.session_working_copy(id, cx),
+                    )
+                },
+                String::as_str,
+            );
         path_key(scope) == path_key(self.working_copy())
     }
     pub(super) fn in_sidebar_worktree_scope(&self, id: i64, cx: &App) -> bool {
