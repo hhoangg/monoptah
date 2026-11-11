@@ -7,7 +7,9 @@
 //! to view ..."). A click on a link is a user action, so the app then reconnects the
 //! workspace through its own user-initiated door (the same one as the Reconnect button, see
 //! `docker_start::reconnect` for a sandbox) and reads again; this module never does.
-//! The ssh based `CloudBackend::copy_from` is deliberately not used.
+//! The ssh based `CloudBackend::copy_from` is deliberately not used, and there is no copy
+//! fallback: a Host without `files.readBytes` answers [`ViewError::HostUpdate`] and the file
+//! opens once the Host is updated.
 //!
 //! # Host calls
 //!
@@ -17,8 +19,8 @@
 //!   `.git` segment, symlinks must not leave the workspace).
 //! * `files.read` is the older text only call (UTF-8, at most 1 MB, binary refused). A Host
 //!   that predates `files.readBytes` answers "Unsupported host method"; small text files and
-//!   Markdown/HTML still open through `files.read`, anything else says the Host is out of
-//!   date.
+//!   Markdown/HTML still open through `files.read`, anything else is
+//!   [`ViewError::HostUpdate`] (see [`HostUpdate`]).
 //!
 //! # Flow (all BLOCKING; call from a worker thread)
 //!
@@ -128,38 +130,60 @@ pub(crate) fn name_for_message(name: &str) -> String {
     super::view_cache::sanitize_name(name)
 }
 
-/// Files a double click would run or install (apps, scripts, installers, shortcuts).
-/// They are only revealed, never opened with the default app.
-pub fn runs_code(name: &str) -> bool {
+/// Whether a downloaded file may be opened by itself with the default app: only known inert
+/// document and media types, judged by the LAST extension (`report.pdf.app` is an app),
+/// case-insensitively. Everything else (unknown or no extension, scripts, bundles, installers,
+/// disk images, location and shortcut files, macro-enabled office files, archives) is only
+/// revealed. This is the one barrier between a chat link and a launch.
+pub fn opens_with_default_app(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    let ext = lower.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+    let Some((stem, ext)) = lower.rsplit_once('.') else {
+        return false;
+    };
+    // A dotfile such as `.pdf` has no extension of its own.
+    if stem.is_empty() {
+        return false;
+    }
     matches!(
         ext,
-        "app"
-            | "command"
-            | "terminal"
-            | "webloc"
-            | "tool"
-            | "sh"
-            | "bash"
-            | "zsh"
-            | "pkg"
-            | "dmg"
-            | "exe"
-            | "msi"
-            | "bat"
-            | "cmd"
-            | "ps1"
-            | "jar"
-            | "scpt"
-            | "workflow"
-            | "action"
-            | "service"
-            | "desktop"
-            | "appimage"
-            | "run"
-            | "inetloc"
-            | "url"
+        "pdf"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "bmp"
+            | "tiff"
+            | "tif"
+            | "heic"
+            | "ico"
+            | "mp3"
+            | "wav"
+            | "m4a"
+            | "flac"
+            | "ogg"
+            | "mp4"
+            | "mov"
+            | "m4v"
+            | "webm"
+            | "mkv"
+            | "doc"
+            | "docx"
+            | "xls"
+            | "xlsx"
+            | "ppt"
+            | "pptx"
+            | "odt"
+            | "ods"
+            | "odp"
+            | "rtf"
+            | "csv"
+            | "tsv"
+            | "txt"
+            | "md"
+            | "markdown"
+            | "json"
+            | "log"
     )
 }
 
@@ -182,8 +206,12 @@ pub enum ViewError {
     /// The path is not something to fetch (outside the workspace, not a cloud session).
     Refused(String),
     Cancelled,
-    /// The Host lacks `files.readBytes`: only the user-started copy can fetch this file.
-    OldHost,
+    /// The Host lacks `files.readBytes`: the file opens once the Host is updated. Nothing is
+    /// offered in the meantime (there is no copy fallback).
+    HostUpdate {
+        name: String,
+        state: HostUpdate,
+    },
     /// The file is over the confirm threshold; ask, then retry with `confirmed`.
     NeedsConfirm {
         size: u64,
@@ -198,11 +226,42 @@ impl std::fmt::Display for ViewError {
                 f.write_str(text)
             }
             ViewError::Cancelled => f.write_str("Cancelled."),
-            ViewError::OldHost => f.write_str(OUT_OF_DATE),
+            ViewError::HostUpdate { name, state } => match state {
+                HostUpdate::Pending => write!(
+                    f,
+                    "{name} opens after the Host update. {}.",
+                    crate::remote::host_upgrade::deferred_message()
+                ),
+                HostUpdate::NextConnect => write!(
+                    f,
+                    "{name} opens after the Host update. Monoptah Host will be updated on the next connect."
+                ),
+                HostUpdate::Failed(warning) => write!(f, "{name} cannot be opened yet. {warning}"),
+            },
             ViewError::NeedsConfirm { size } => {
                 write!(f, "This file is {} MB.", size / (1024 * 1024))
             }
         }
+    }
+}
+
+/// Where the update of a Host that lacks `files.readBytes` stands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostUpdate {
+    /// Deferred because a turn was running: the next connect that finds the Host idle installs it.
+    Pending,
+    /// Nothing is recorded: a cloud Host updates itself at its next connect.
+    NextConnect,
+    /// The last update failed and the old Host was kept. Carries the warning (with the
+    /// `sbx policy allow` hint when the sandbox network policy looks like the cause).
+    Failed(String),
+}
+
+impl HostUpdate {
+    /// Whether opening the file can be queued for after the update (a failed update will not
+    /// fix itself, so nothing waits for it).
+    pub fn queues_open(&self) -> bool {
+        !matches!(self, HostUpdate::Failed(_))
     }
 }
 
@@ -274,11 +333,6 @@ pub enum Opened {
         html: String,
     },
     Download(DownloadPlan),
-    /// The Host cannot send this file (it lacks `files.readBytes`); the user may start a copy
-    /// with [`CloudSessions::copy_cloud_file`].
-    CopyOnly {
-        kind: FileKind,
-    },
 }
 
 /// Resolves `raw` (absolute, or relative to `root`) to a validated path below `root`.
@@ -409,7 +463,7 @@ impl<'a> Fetcher<'a> {
                 FileKind::Markdown | FileKind::Html | FileKind::Text
             )
         {
-            return Err(ViewError::OldHost);
+            return Err(self.host_update(name));
         }
         let mut params = json!({"projectId": self.file.project_id, "path": rel});
         self.add_cwd(&mut params);
@@ -424,8 +478,18 @@ impl<'a> Fetcher<'a> {
             Ok(_) => Err(ViewError::Failed(
                 "The host sent an unexpected reply.".into(),
             )),
-            Err(error) if super::is_not_connected(&error) => Err(self.map_error(error)),
-            Err(_) => Err(ViewError::OldHost),
+            // Only "this Host does not have the call" means the file needs the update; a missing
+            // file, a binary or a file over 1 MB keep their own message.
+            Err(error) if error.contains("Unsupported host method") => Err(self.host_update(name)),
+            Err(error) => Err(self.map_error(error)),
+        }
+    }
+
+    /// The answer for a file only a newer Host can send.
+    fn host_update(&self, name: &str) -> ViewError {
+        ViewError::HostUpdate {
+            name: name_for_message(name),
+            state: self.host.host_update(&self.file.machine_id),
         }
     }
 
@@ -504,9 +568,6 @@ impl<'a> Fetcher<'a> {
     }
 }
 
-/// Shown when the Host predates `files.readBytes`.
-pub const OUT_OF_DATE: &str = "The Monoptah Host in this workspace is too old to send this file. It updates itself the next time this workspace connects, or you can download a copy with the button below.";
-
 impl CloudSessions {
     /// Resolves a path mentioned in session `session_id` into a [`CloudFile`]. Reads the
     /// store and the machine list; sends nothing to the workspace.
@@ -584,11 +645,7 @@ impl CloudSessions {
     ) -> Result<Opened, ViewError> {
         let fetcher = Fetcher::new(&*self.host, file);
         let kind = file.kind();
-        let first = match fetcher.first(&file.rel) {
-            Ok(first) => first,
-            Err(ViewError::OldHost) => return Ok(Opened::CopyOnly { kind }),
-            Err(error) => return Err(error),
-        };
+        let first = fetcher.first(&file.rel)?;
         let size = first.size;
         let plan = |reason| {
             Opened::Download(DownloadPlan {
@@ -767,7 +824,9 @@ impl Inliner<'_> {
                 let fetched = match self.fetcher.read_all(&rel, self.budget, self.cancel) {
                     Ok(Ok(bytes)) => Some(Rc::new(bytes)),
                     Ok(Err(_)) => return Err(Stop::TooLarge),
-                    Err(ViewError::Failed(_) | ViewError::Refused(_) | ViewError::OldHost) => None,
+                    Err(
+                        ViewError::Failed(_) | ViewError::Refused(_) | ViewError::HostUpdate { .. },
+                    ) => None,
                     Err(error) => return Err(Stop::Fatal(error)),
                 };
                 self.files.borrow_mut().insert(rel.clone(), fetched.clone());

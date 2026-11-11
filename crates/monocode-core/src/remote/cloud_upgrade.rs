@@ -243,8 +243,9 @@ impl Connections {
         let askpass = match job.askpass() {
             Ok(askpass) => askpass,
             Err(error) => {
-                let text = host_upgrade::warning(&error, false);
+                let text = scrub(&host_upgrade::warning(&error, false), &machine.token);
                 progress(&text);
+                self.record_upgrade_failure(machine_id, Some(&text));
                 return Outcome::Failed(text);
             }
         };
@@ -264,6 +265,17 @@ impl Connections {
         let outcome = host_upgrade::upgrade_if_needed(&env, &mut |line| {
             progress(&env.clean_error(line.to_owned()))
         });
+        // Safe by construction: whatever warning is shown or stored has been through the same
+        // redaction as the progress lines (credentials, the device token, the prelude).
+        let outcome = match outcome {
+            Outcome::Failed(text) => Outcome::Failed(env.clean_error(text)),
+            other => other,
+        };
+        match &outcome {
+            Outcome::Cancelled => {}
+            Outcome::Failed(text) => self.record_upgrade_failure(machine_id, Some(text)),
+            _ => self.record_upgrade_failure(machine_id, None),
+        }
         if outcome != Outcome::Cancelled {
             // The tunnel after the pass (a swap reopens it) is the connect's tunnel.
             if let Some(lease) = self.tunnels.existing(machine_id) {
@@ -271,6 +283,27 @@ impl Connections {
             }
         }
         outcome
+    }
+
+    fn record_upgrade_failure(&self, machine_id: &str, warning: Option<&str>) {
+        let mut failures = self
+            .upgrade_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match warning {
+            Some(text) => failures.insert(machine_id.to_owned(), text.to_owned()),
+            None => failures.remove(machine_id),
+        };
+    }
+
+    /// The warning of the last Host upgrade of this machine when it failed and the current Host
+    /// was kept (cleared by the next pass that does not fail; not kept across restarts).
+    pub fn host_upgrade_failure(&self, machine_id: &str) -> Option<String> {
+        self.upgrade_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(machine_id)
+            .cloned()
     }
 
     /// Whether the Host of this machine waits for the next connect to be upgraded (it was
@@ -575,7 +608,7 @@ impl CloudUpgrade<'_> {
                 Err(error) => {
                     failures += 1;
                     if failures >= POLL_FAILURES {
-                        return Err(error);
+                        return Err(self.clean_error(error));
                     }
                 }
             }
@@ -589,7 +622,9 @@ impl CloudUpgrade<'_> {
 
 impl UpgradeEnv for CloudUpgrade<'_> {
     fn host_info(&self) -> Result<super::host_info::HostInfo, String> {
-        self.connections.describe_host(self.id)
+        self.connections
+            .describe_host(self.id)
+            .map_err(|error| self.clean_error(error))
     }
 
     fn busy(&self) -> Result<bool, String> {
