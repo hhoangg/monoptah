@@ -979,7 +979,8 @@ there once. The app copies no sign-in and cannot tell whether the user signed in
 3. The Host health check reports such a server as `signInNeeded`. The cloud panel shows it
    as "Sign in in the cloud" (never "failed") with a short hint: sign-ins are not copied
    from this computer; the user signs in once in the cloud workspace, by running
-   `claude mcp` in its terminal or session.
+   `claude mcp login --no-browser <name>` in its terminal (it prints the authorization URL;
+   the user pastes the redirect URL back), or `/mcp` in a Claude session.
 4. Servers whose credentials are raw values in `headers` or `env` keep working through the
    one-way secrets path (3.2.3).
 
@@ -993,7 +994,7 @@ there once. The app copies no sign-in and cannot tell whether the user signed in
 | MCP: `claude mcp add-json -s user` on the remote | Works with any Host | Persists secrets in the remote `~/.claude.json` on disk; harder to remove cleanly | Rejected (secrets) |
 | MCP: `--mcp-config` + one-way secrets file loaded into the Claude child env (chosen) | Survives Host restarts without the app; removable; additive; leaves `~/.claude.json` alone | Needs the fork Host; secrets on the workspace disk (0600) | **Chosen** |
 | Secrets as Codespaces user secrets (`gh secret set --app codespaces`) | Survive restarts | Persist at GitHub; codespaces only; widen the blast radius to every codespace of the repos listed | Rejected for v1 |
-| MCP sign-ins: user signs in again in the cloud (`claude mcp` on the remote) | Nothing copied; no rotation race; no Keychain read | A headless remote may not complete the browser flow | **Chosen (user decision D12, 2026-11-10)**: servers are carried config-only, "Sign in in the cloud" |
+| MCP sign-ins: user signs in again in the cloud (`claude mcp login --no-browser <name>` or `/mcp` on the remote) | Nothing copied; no rotation race; no Keychain read | A headless remote has no browser; `--no-browser` prints the URL and the user pastes the redirect URL back | **Chosen (user decision D12, 2026-11-10)**: servers are carried config-only, "Sign in in the cloud" |
 | MCP sign-ins: copy into the remote credential store | Works offline from the laptop; remote refreshes itself | Undocumented format; refresh-token rotation race; reads the Keychain | **Rejected by user decision D12 (2026-11-10)**; OAuth servers are carried config-only, "Sign in in the cloud" |
 | MCP sign-ins: `headersHelper` broker fed by the app | Documented mechanism; refresh tokens stay local | Cloud depends on the app running; contradicts the one-way decision | Rejected |
 | Transfer over `run_script` stdin (base64 tar) | Works with the old Host | A new ssh session per transfer (a sandbox wakes and bills); 50 MB base64 on stdin; not resumable | Rejected; uploads go over the tunnel |

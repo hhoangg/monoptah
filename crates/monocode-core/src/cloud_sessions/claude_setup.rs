@@ -73,7 +73,7 @@ const MAX_WARNINGS: usize = 40;
 pub const SIGN_IN_LABEL: &str = "Sign in in the cloud";
 /// The hint under the server list when some server wears [`SIGN_IN_LABEL`]. The app copies no
 /// sign-in (D12): the user signs in once in the cloud workspace.
-pub const SIGN_IN_HINT: &str = "Sign-ins are not copied from this computer. Sign in to these servers once in the cloud workspace, by running claude mcp in its terminal or session.";
+pub const SIGN_IN_HINT: &str = "Sign-ins are not copied from this computer. Sign in to these servers once in the cloud workspace: run `claude mcp login --no-browser <name>` in its terminal, or `/mcp` in a Claude session.";
 /// Text for a project server that waits for approval (design 7).
 pub const APPROVAL_LABEL: &str = "Needs approval";
 

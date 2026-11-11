@@ -1221,6 +1221,13 @@ mod tests {
         assert!(visual.debug_bounds("cloud-setup-server-linear").is_some());
         // A "Sign in in the cloud" server brings the hint: the app copies no sign-in (D12).
         assert!(visual.debug_bounds("cloud-setup-sign-in-hint").is_some());
+        // No server needs a sign-in: no hint.
+        let mut quiet = strip(false, false);
+        quiet.servers.truncate(1);
+        show(Some(quiet), visual);
+        assert!(visual.debug_bounds("cloud-setup-server-github").is_some());
+        assert!(visual.debug_bounds("cloud-setup-sign-in-hint").is_none());
+        show(Some(strip(true, false)), visual);
         // Update is a click; while it runs the button does nothing.
         let update = visual.debug_bounds("cloud-setup-update").unwrap();
         visual.simulate_click(update.center(), Default::default());

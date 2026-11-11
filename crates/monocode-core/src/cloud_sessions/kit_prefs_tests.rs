@@ -423,9 +423,14 @@ fn cloud_sources_never_read_the_keychain_or_claude_credentials() {
         gpui.join("cloud_kit_ui.rs"),
         gpui.join("settings/pages/cloud.rs"),
         gpui.join("shell/claude_setup.rs"),
+        gpui.join("shell.rs"),
+        gpui.join("panel_root.rs"),
+        gpui.join("shell/cloud_picker.rs"),
+        gpui.join("conversation/cloud_target.rs"),
+        gpui.join("settings/preferences.rs"),
     ];
     files.extend(kit_ui.iter().cloned());
-    assert!(files.len() >= 15, "the scan found {files:?}");
+    assert!(files.len() >= 20, "the scan found {files:?}");
     for must in [
         "kit.rs",
         "kit_pack.rs",
@@ -475,6 +480,14 @@ fn cloud_sources_never_read_the_keychain_or_claude_credentials() {
             }
         }
     }
+}
+
+#[test]
+fn the_sign_in_hint_names_real_commands_and_says_nothing_is_copied() {
+    use crate::cloud_sessions::claude_setup::SIGN_IN_HINT;
+    assert!(SIGN_IN_HINT.contains("not copied"));
+    assert!(SIGN_IN_HINT.contains("`claude mcp login --no-browser <name>`"));
+    assert!(SIGN_IN_HINT.contains("`/mcp`"));
 }
 
 #[test]
