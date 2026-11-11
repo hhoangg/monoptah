@@ -689,8 +689,15 @@ impl Shell {
         match action {
             "codespace-restore" => self.restore_codespace_code(id, cx),
             "continue-locally" => self.open_continue_locally(id, window, cx),
-            "restore-continue-backup" => self.open_backup_action(id, true, window, cx),
-            "discard-continue-backup" => self.open_backup_action(id, false, window, cx),
+            "restore-continue-backup" => {
+                self.open_backup_action(id, cloud_continue::Op::Restore, window, cx)
+            }
+            "discard-continue-backup" => {
+                self.open_backup_action(id, cloud_continue::Op::Discard, window, cx)
+            }
+            "keep-continue-backup" => {
+                self.open_backup_action(id, cloud_continue::Op::Keep, window, cx)
+            }
             "codespace-stop" => {
                 self.run_origin_codespace_action(id, cloud::ArchiveChoice::Stop, window, cx)
             }

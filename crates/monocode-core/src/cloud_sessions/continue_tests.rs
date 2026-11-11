@@ -609,11 +609,12 @@ fn a_crash_after_the_apply_is_detected_on_retry_instead_of_forking_a_worktree() 
         &w.project,
         &["fetch", "-q", w.ws.to_str().unwrap(), "feat/x"],
     );
-    git(&w.project, &["merge", "-q", "--ff-only", "FETCH_HEAD"]);
+    crash_after_update_ref(&w);
     std::fs::write(w.project.join("a.txt"), "one\ntwo\n").unwrap();
     std::fs::write(w.project.join("bin.dat"), [9u8, 8, 7, 0]).unwrap();
     std::fs::write(w.project.join("untracked.txt"), "new file\n").unwrap();
     let done = run(&w, local).unwrap();
+    assert_index_follows_head(&w);
     assert!(
         done.warnings.iter().any(|n| n.contains("already applied")),
         "{:?}",
@@ -760,6 +761,34 @@ fn deleting_a_session_forgets_its_return_state() {
     }
 }
 
+/// The state a crash between `update-ref` and the index update leaves: the branch is at the
+/// cloud commit, the files are the cloud's, the real index is still the OLD one.
+fn crash_after_update_ref(w: &World) {
+    git(
+        &w.project,
+        &["fetch", "-q", w.ws.to_str().unwrap(), "feat/x"],
+    );
+    let old = hash_of(&w.project, "HEAD");
+    git(
+        &w.project,
+        &["update-ref", "refs/heads/main", "FETCH_HEAD", &old],
+    );
+    // `read-tree -u` already wrote the cloud's committed file before the crash.
+    std::fs::write(w.project.join("made.txt"), "created by claude\n").unwrap();
+    assert!(
+        !git(&w.project, &["diff", "--cached", "--name-only"]).is_empty(),
+        "the index is stale, as after the real crash"
+    );
+}
+
+fn assert_index_follows_head(w: &World) {
+    assert_eq!(
+        git(&w.project, &["diff", "--cached", "--name-only"]),
+        "",
+        "a plain commit must not revert the cloud commit"
+    );
+}
+
 fn hash_of(dir: &Path, rev: &str) -> String {
     git(dir, &["rev-parse", rev])
 }
@@ -860,11 +889,12 @@ fn a_crash_after_the_branch_moved_is_recognised_as_applied() {
         &w.project,
         &["fetch", "-q", w.ws.to_str().unwrap(), "feat/x"],
     );
-    git(&w.project, &["merge", "-q", "--ff-only", "FETCH_HEAD"]);
+    crash_after_update_ref(&w);
     std::fs::write(w.project.join("a.txt"), "one\ntwo\n").unwrap();
     std::fs::write(w.project.join("bin.dat"), [9u8, 8, 7, 0]).unwrap();
     std::fs::write(w.project.join("untracked.txt"), "new file\n").unwrap();
     let done = run(&w, local).unwrap();
+    assert_index_follows_head(&w);
     assert!(
         done.warnings.iter().any(|n| n.contains("already applied")),
         "{:?}",
@@ -1121,4 +1151,331 @@ fn a_submodule_edit_with_recurse_on_is_never_carried_away() {
         .unwrap()
         .worktree_cwd
         .is_some());
+}
+
+/// Runs `inject` at `stage` of the apply, on this thread.
+fn at_stage(stage: &'static str, inject: impl Fn(&Path) + 'static) {
+    super::continue_local::WINDOW.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |name, root| {
+            if name == stage {
+                inject(root);
+            }
+        }));
+    });
+}
+
+fn clear_stage() {
+    super::continue_local::WINDOW.with(|hook| *hook.borrow_mut() = None);
+}
+
+fn worktree_of(w: &World, local: i64) -> Option<String> {
+    w.svc
+        .store()
+        .unwrap()
+        .agent_settings(local)
+        .unwrap()
+        .unwrap_or_default()
+        .worktree_cwd
+}
+
+/// The local project also has `keep.txt`, a tracked file the cloud never touches.
+fn with_keep_file(w: &World) {
+    std::fs::write(w.project.join("keep.txt"), "keep\n").unwrap();
+    git(&w.project, &["add", "."]);
+    git(&w.project, &["commit", "-q", "-m", "keep"]);
+    git(&w.project, &["push", "-q", "origin", "main"]);
+    git(&w.ws, &["fetch", "-q", "origin"]);
+    git(&w.ws, &["merge", "-q", "--no-edit", "origin/main"]);
+}
+
+fn nothing_was_written_note(done: &Converted) {
+    assert!(
+        done.warnings
+            .iter()
+            .any(|n| n.contains("nothing was written")),
+        "{:?}",
+        done.warnings
+    );
+    assert!(
+        !done.warnings.iter().any(|n| n.contains("applied to")),
+        "{:?}",
+        done.warnings
+    );
+}
+
+#[test]
+fn a_refused_apply_never_reverts_what_the_user_changed_in_the_window() {
+    // (1) an edit of a file the cloud touches.
+    let w = world(true);
+    let local = moved(&w);
+    at_stage("before-read-tree", |root| {
+        std::fs::write(root.join("a.txt"), "my edit\n").unwrap()
+    });
+    let done = run(&w, local).unwrap();
+    clear_stage();
+    nothing_was_written_note(&done);
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("a.txt")).unwrap(),
+        "my edit\n"
+    );
+    assert_eq!(git(&w.project, &["log", "-1", "--format=%s"]), "base");
+    assert!(w
+        .svc
+        .store()
+        .unwrap()
+        .cloud_continue_broken(local)
+        .is_none());
+    assert!(worktree_of(&w, local).is_some());
+
+    // (2) an untracked file at a path the cloud adds.
+    let w = world(true);
+    let local = moved(&w);
+    at_stage("before-read-tree", |root| {
+        std::fs::write(root.join("made.txt"), "mine\n").unwrap()
+    });
+    let done = run(&w, local).unwrap();
+    clear_stage();
+    nothing_was_written_note(&done);
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("made.txt")).unwrap(),
+        "mine\n"
+    );
+
+    // (3) a folder where the cloud adds a file, with a user file inside.
+    let w = world(true);
+    let local = moved(&w);
+    at_stage("before-read-tree", |root| {
+        std::fs::create_dir_all(root.join("made.txt")).unwrap();
+        std::fs::write(root.join("made.txt/inner.txt"), "inner\n").unwrap();
+    });
+    let done = run(&w, local).unwrap();
+    clear_stage();
+    nothing_was_written_note(&done);
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("made.txt/inner.txt")).unwrap(),
+        "inner\n"
+    );
+    assert!(worktree_of(&w, local).is_some());
+}
+
+#[test]
+fn files_the_cloud_does_not_touch_survive_an_applied_return() {
+    // (4) a new untracked file elsewhere, (5) an edit of a tracked file the cloud leaves alone.
+    let w = world(true);
+    with_keep_file(&w);
+    let local = moved(&w);
+    at_stage("before-read-tree", |root| {
+        std::fs::write(root.join("notes.md"), "notes\n").unwrap();
+        std::fs::write(root.join("keep.txt"), "keep, edited\n").unwrap();
+    });
+    let done = run(&w, local).unwrap();
+    clear_stage();
+    assert!(
+        done.warnings.iter().any(|n| n.contains("applied to")),
+        "{:?}",
+        done.warnings
+    );
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("notes.md")).unwrap(),
+        "notes\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("keep.txt")).unwrap(),
+        "keep, edited\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("a.txt")).unwrap(),
+        "one\ntwo\n"
+    );
+    assert_eq!(
+        git(&w.project, &["log", "-1", "--format=%s"]),
+        "Merge remote-tracking branch 'origin/main' into feat/x"
+    );
+    assert_index_follows_head(&w);
+    assert!(w
+        .svc
+        .store()
+        .unwrap()
+        .cloud_continue_broken(local)
+        .is_none());
+}
+
+fn refuse_the_branch_move(w: &World) {
+    let hook = w.project.join(".git/hooks/reference-transaction");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    let flag = w.project.join(".git/fail-once");
+    std::fs::write(&flag, "1").unwrap();
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = prepared ] && [ -f '{f}' ] && grep -q refs/heads/main; then rm -f '{f}'; exit 1; fi\nexit 0\n",
+            f = flag.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn an_undo_after_a_refused_branch_move_refuses_to_revert_a_file_changed_meanwhile() {
+    let w = world(true);
+    let local = moved(&w);
+    refuse_the_branch_move(&w);
+    // After the files became the cloud's, the user edits one of them.
+    at_stage("after-read-tree", |root| {
+        std::fs::write(root.join("a.txt"), "typed just now\n").unwrap()
+    });
+    let error = run(&w, local).unwrap_err().to_string();
+    clear_stage();
+    assert!(error.contains("pre-continue"), "{error}");
+    assert!(error.contains("changed meanwhile"), "{error}");
+    assert!(!error.contains("left alone"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("a.txt")).unwrap(),
+        "typed just now\n"
+    );
+    let store = w.svc.store().unwrap();
+    assert!(
+        store.cloud_continue_broken(local).is_some(),
+        "the marker stays"
+    );
+    assert!(store.cloud_location(local).unwrap().is_cloud());
+}
+
+#[test]
+fn an_undo_after_a_refused_branch_move_keeps_unrelated_new_files() {
+    let w = world(true);
+    let local = moved(&w);
+    refuse_the_branch_move(&w);
+    at_stage("after-read-tree", |root| {
+        std::fs::write(root.join("notes.md"), "notes\n").unwrap()
+    });
+    run(&w, local).unwrap();
+    clear_stage();
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("notes.md")).unwrap(),
+        "notes\n"
+    );
+    // The cloud's files were taken back out, and the work went to a worktree.
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("a.txt")).unwrap(),
+        "one\n"
+    );
+    assert!(!w.project.join("made.txt").exists());
+    assert!(worktree_of(&w, local).is_some());
+}
+
+#[test]
+fn an_ignored_file_created_in_the_window_is_never_overwritten() {
+    let w = world(true);
+    std::fs::write(w.project.join(".git/info/exclude"), "made.txt\n").unwrap();
+    let local = moved(&w);
+    at_stage("before-recheck", |root| {
+        std::fs::write(root.join("made.txt"), "my secret\n").unwrap()
+    });
+    run(&w, local).unwrap();
+    clear_stage();
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("made.txt")).unwrap(),
+        "my secret\n"
+    );
+    assert_eq!(git(&w.project, &["log", "-1", "--format=%s"]), "base");
+    assert!(worktree_of(&w, local).is_some());
+}
+
+#[test]
+fn a_tracked_file_that_matches_gitignore_still_applies_in_place() {
+    let w = world(true);
+    std::fs::write(w.project.join(".gitignore"), "build.out\n").unwrap();
+    std::fs::write(w.project.join("build.out"), "tracked anyway\n").unwrap();
+    git(&w.project, &["add", "-f", ".gitignore", "build.out"]);
+    git(&w.project, &["commit", "-q", "-m", "ignored but tracked"]);
+    git(&w.project, &["push", "-q", "origin", "main"]);
+    git(&w.ws, &["fetch", "-q", "origin"]);
+    git(&w.ws, &["merge", "-q", "--no-edit", "origin/main"]);
+    let local = moved(&w);
+    let done = run(&w, local).unwrap();
+    assert!(
+        done.warnings.iter().any(|n| n.contains("applied to")),
+        "{:?}",
+        done.warnings
+    );
+    assert!(worktree_of(&w, local).is_none());
+}
+
+#[test]
+fn keep_the_cloud_state_finishes_a_crash_that_also_has_new_edits() {
+    let w = world(true);
+    let local = moved(&w);
+    write_marker(&w, local, &hash_of(&w.ws, "HEAD"), &tree_of(&w.ws));
+    crash_after_update_ref(&w);
+    std::fs::write(w.project.join("a.txt"), "one\ntwo\nplus my edit\n").unwrap();
+    // Not the expected tree any more: Continue reports, Restore would refuse.
+    assert!(run(&w, local).is_err());
+    w.svc.keep_cloud_state(local).unwrap();
+    assert_index_follows_head(&w);
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("a.txt")).unwrap(),
+        "one\ntwo\nplus my edit\n"
+    );
+    assert!(w
+        .svc
+        .store()
+        .unwrap()
+        .cloud_continue_broken(local)
+        .is_none());
+    assert!(w.root.join("marker-backup").is_dir(), "the backup stays");
+    // Elsewhere than at the cloud commit there is nothing to keep.
+    let w = world(true);
+    let local = moved(&w);
+    write_marker(&w, local, &hash_of(&w.ws, "HEAD"), &tree_of(&w.ws));
+    assert!(w.svc.keep_cloud_state(local).is_err());
+}
+
+#[test]
+fn discard_deletes_only_a_real_backup_folder_inside_the_session_folder() {
+    let w = world(true);
+    let local = moved(&w);
+    let thread = w.svc.store().unwrap().thread_dir(local).unwrap().unwrap();
+    std::fs::create_dir_all(&thread).unwrap();
+    let marker = |path: &Path| {
+        w.svc
+            .store()
+            .unwrap()
+            .set_cloud_continue_broken(local, &serde_json::json!({"backup": path}).to_string())
+            .unwrap();
+    };
+    // Outside the session folder, or named otherwise: kept.
+    let outside = w.root.join("pre-continue-outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    marker(&outside);
+    w.svc.discard_continue_marker(local).unwrap();
+    assert!(outside.is_dir());
+    let other = thread.join("precious");
+    std::fs::create_dir_all(&other).unwrap();
+    marker(&other);
+    w.svc.discard_continue_marker(local).unwrap();
+    assert!(other.is_dir());
+    // A link named like a backup: the link target survives.
+    let target = w.root.join("link-target");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("f"), "x").unwrap();
+    let link = thread.join("pre-continue-link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    marker(&link);
+    w.svc.discard_continue_marker(local).unwrap();
+    assert!(target.join("f").is_file());
+    // The real thing goes.
+    let real = thread.join("pre-continue-123");
+    std::fs::create_dir_all(&real).unwrap();
+    marker(&real);
+    w.svc.discard_continue_marker(local).unwrap();
+    assert!(!real.exists());
+    assert!(w
+        .svc
+        .store()
+        .unwrap()
+        .cloud_continue_broken(local)
+        .is_none());
 }

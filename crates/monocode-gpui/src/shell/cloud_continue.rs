@@ -18,25 +18,37 @@ pub(super) type ContinueFn = Arc<
         + Sync,
 >;
 
-/// Restores (`true`) or discards (`false`) the backup of an interrupted return and says what
-/// happened. A seam for tests.
+/// What the user can do with the backup of an interrupted return.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Op {
+    /// Put the files back as they were before the attempt.
+    Restore,
+    /// Delete the backup and forget the attempt.
+    Discard,
+    /// The cloud state is in place: only make the index follow it.
+    Keep,
+}
+
+/// Does `Op` on the backup of an interrupted return and says what happened. A seam for tests.
 pub(super) type BackupFn =
-    Arc<dyn Fn(&CloudSessions, i64, bool) -> Result<String, String> + Send + Sync>;
+    Arc<dyn Fn(&CloudSessions, i64, Op) -> Result<String, String> + Send + Sync>;
 
 pub(super) fn default_backup() -> BackupFn {
-    Arc::new(|cloud, id, restore| {
-        if restore {
-            cloud.restore_continue_backup(id).map(|fresh| {
-                format!(
-                    "Your files are back as they were before the interrupted return. The state they were in before is saved in {}.",
-                    fresh.display()
-                )
-            })
-        } else {
-            cloud
-                .discard_continue_marker(id)
-                .map(|()| "The backup was deleted.".to_string())
-        }
+    Arc::new(|cloud, id, op| {
+        match op {
+        Op::Restore => cloud.restore_continue_backup(id).map(|fresh| {
+            format!(
+                "Your files are back as they were before the interrupted return. The state they were in before is saved in {}.",
+                fresh.display()
+            )
+        }),
+        Op::Discard => cloud
+            .discard_continue_marker(id)
+            .map(|()| "The backup was deleted.".to_string()),
+        Op::Keep => cloud
+            .keep_cloud_state(id)
+            .map(|()| "The cloud state is kept. Your earlier files stay in the backup.".to_string()),
+    }
     })
 }
 
@@ -53,7 +65,7 @@ pub(super) enum Phase {
     Failed(String),
     /// Asking before the backup of an interrupted return is restored or deleted.
     ConfirmBackup {
-        restore: bool,
+        op: Op,
     },
 }
 
@@ -61,7 +73,7 @@ pub(super) enum Phase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Action {
     Continue,
-    Backup { restore: bool },
+    Backup { op: Op },
 }
 
 pub(super) struct ContinueDialog {
@@ -118,8 +130,13 @@ impl Default for State {
 }
 
 /// What Restore and Discard tell the user before anything happens.
-pub(super) fn backup_text(restore: bool, path: &str) -> String {
-    if restore {
+pub(super) fn backup_text(op: Op, path: &str) -> String {
+    if op == Op::Keep {
+        return format!(
+            "The cloud work is already in your folder; an interrupted return only left the index behind. Keep makes the index follow it and forgets the attempt. Your earlier uncommitted work stays in {path}."
+        );
+    }
+    if op == Op::Restore {
         format!(
             "An earlier return from the cloud was interrupted. Your uncommitted work from before it is saved in {path}. Restore takes a fresh backup of your files as they are now (kept next to it), then puts your files back as they were before that attempt. It refuses, and changes nothing, if the branch or commit changed or a file is in the way."
         )
@@ -362,6 +379,7 @@ impl Shell {
         }
         vec![
             MenuAction::new("restore-continue-backup", "Restore my backup…").into(),
+            MenuAction::new("keep-continue-backup", "Keep the cloud state…").into(),
             MenuAction::new("discard-continue-backup", "Discard backup…")
                 .danger()
                 .into(),
@@ -372,7 +390,7 @@ impl Shell {
     pub(super) fn open_backup_action(
         &mut self,
         id: i64,
-        restore: bool,
+        op: Op,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -387,9 +405,9 @@ impl Shell {
             title: self.session_metadata(id, cx).display_title(),
             kind: Kind::Born,
             noun: "workspace",
-            action: Action::Backup { restore },
+            action: Action::Backup { op },
             backup: Some(backup),
-            phase: Phase::ConfirmBackup { restore },
+            phase: Phase::ConfirmBackup { op },
             focus: cx.focus_handle(),
         };
         window.focus(&dialog.focus, cx);
@@ -398,13 +416,13 @@ impl Shell {
     }
 
     /// From the failed dialog: switch to the confirmation of Restore or Discard.
-    pub(super) fn ask_backup_action(&mut self, restore: bool, cx: &mut Context<Self>) {
+    pub(super) fn ask_backup_action(&mut self, op: Op, cx: &mut Context<Self>) {
         if let Some(dialog) = self.cloud_continue.dialog.as_mut()
             && matches!(dialog.phase, Phase::Failed(_))
             && dialog.backup.is_some()
         {
-            dialog.action = Action::Backup { restore };
-            dialog.phase = Phase::ConfirmBackup { restore };
+            dialog.action = Action::Backup { op };
+            dialog.phase = Phase::ConfirmBackup { op };
             cx.notify();
         }
     }
@@ -414,16 +432,16 @@ impl Shell {
         let Some(dialog) = self.cloud_continue.dialog.as_mut() else {
             return;
         };
-        let restore = match (&dialog.phase, dialog.action) {
-            (Phase::ConfirmBackup { restore }, _) => *restore,
-            (Phase::Failed(_), Action::Backup { restore }) => restore,
+        let op = match (&dialog.phase, dialog.action) {
+            (Phase::ConfirmBackup { op }, _) => *op,
+            (Phase::Failed(_), Action::Backup { op }) => op,
             _ => return,
         };
         let id = dialog.id;
-        let progress = Arc::new(std::sync::Mutex::new(String::from(if restore {
-            "Restoring your files"
-        } else {
-            "Deleting the backup"
+        let progress = Arc::new(std::sync::Mutex::new(String::from(match op {
+            Op::Restore => "Restoring your files",
+            Op::Discard => "Deleting the backup",
+            Op::Keep => "Updating the index",
         })));
         dialog.phase = Phase::Working { progress };
         window.focus(&dialog.focus, cx);
@@ -432,7 +450,7 @@ impl Shell {
         let run = self.cloud_continue.backup.clone();
         let work = cx
             .background_executor()
-            .spawn(async move { run(&cloud, id, restore) });
+            .spawn(async move { run(&cloud, id, op) });
         cx.spawn_in(window, async move |this, cx| {
             let result = work.await;
             let _ = this.update_in(cx, |this, _window, cx| {
@@ -499,106 +517,124 @@ impl Shell {
             .items_center()
             .justify_end()
             .gap_2();
-        let (heading, body, footer) =
-            match &dialog.phase {
-                Phase::Confirm => (
-                    "Continue locally?",
-                    div().child(text(
-                        "cloud-continue-body",
-                        confirm_text(dialog.kind, &dialog.title, dialog.noun),
-                        false,
+        let (heading, body, footer) = match &dialog.phase {
+            Phase::Confirm => (
+                "Continue locally?",
+                div().child(text(
+                    "cloud-continue-body",
+                    confirm_text(dialog.kind, &dialog.title, dialog.noun),
+                    false,
+                )),
+                footer.child(cancel).child(go("Continue locally", cx)),
+            ),
+            Phase::Working { progress } => (
+                "Continuing locally",
+                div().child(text(
+                    "cloud-continue-progress",
+                    format!(
+                        "{}...",
+                        progress
+                            .lock()
+                            .map(|line| line.clone())
+                            .unwrap_or_default()
+                            .trim_end_matches(['.', '\u{2026}'])
+                    ),
+                    false,
+                )),
+                footer,
+            ),
+            Phase::Failed(error) => (
+                "Could not continue locally",
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(text("cloud-continue-error", error.clone(), false))
+                    .child(text(
+                        "cloud-continue-still",
+                        "The conversation is still where it was; nothing was lost.".into(),
+                        true,
                     )),
-                    footer.child(cancel).child(go("Continue locally", cx)),
-                ),
-                Phase::Working { progress } => (
-                    "Continuing locally",
-                    div().child(text(
-                        "cloud-continue-progress",
-                        format!(
-                            "{}...",
-                            progress
-                                .lock()
-                                .map(|line| line.clone())
-                                .unwrap_or_default()
-                                .trim_end_matches(['.', '\u{2026}'])
-                        ),
-                        false,
-                    )),
-                    footer,
-                ),
-                Phase::Failed(error) => (
-                    "Could not continue locally",
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(text("cloud-continue-error", error.clone(), false))
-                        .child(text(
-                            "cloud-continue-still",
-                            "The conversation is still where it was; nothing was lost.".into(),
-                            true,
-                        )),
-                    {
-                        let mut footer = footer.child(cancel);
-                        // An interrupted return blocks Continue and Delete until its backup is
-                        // restored or discarded; each is its own confirmation.
-                        if dialog.backup.is_some() && dialog.action == Action::Continue {
-                            footer = footer
-                                .child(
-                                    crate::modal::ghost_button(
-                                        "cloud-continue-restore",
-                                        "Restore my backup…",
-                                    )
-                                    .debug_selector(|| "cloud-continue-restore".into())
-                                    .cursor_pointer()
-                                    .on_click(cx.listener(
-                                        |this, _, _, cx| this.ask_backup_action(true, cx),
-                                    )),
+                {
+                    let mut footer = footer.child(cancel);
+                    // An interrupted return blocks Continue and Delete until its backup is
+                    // restored or discarded; each is its own confirmation.
+                    if dialog.backup.is_some() && dialog.action == Action::Continue {
+                        footer = footer
+                            .child(
+                                crate::modal::ghost_button(
+                                    "cloud-continue-restore",
+                                    "Restore my backup…",
                                 )
-                                .child(
-                                    crate::modal::danger_button(
-                                        "cloud-continue-discard",
-                                        "Discard backup…",
-                                    )
-                                    .debug_selector(|| "cloud-continue-discard".into())
-                                    .cursor_pointer()
-                                    .on_click(cx.listener(
-                                        |this, _, _, cx| this.ask_backup_action(false, cx),
-                                    )),
-                                );
-                        }
-                        footer.child(retry)
+                                .debug_selector(|| "cloud-continue-restore".into())
+                                .cursor_pointer()
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| this.ask_backup_action(Op::Restore, cx),
+                                )),
+                            )
+                            .child(
+                                crate::modal::ghost_button(
+                                    "cloud-continue-keep",
+                                    "Keep the cloud state…",
+                                )
+                                .debug_selector(|| "cloud-continue-keep".into())
+                                .cursor_pointer()
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| this.ask_backup_action(Op::Keep, cx),
+                                )),
+                            )
+                            .child(
+                                crate::modal::danger_button(
+                                    "cloud-continue-discard",
+                                    "Discard backup…",
+                                )
+                                .debug_selector(|| "cloud-continue-discard".into())
+                                .cursor_pointer()
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| this.ask_backup_action(Op::Discard, cx),
+                                )),
+                            );
+                    }
+                    footer.child(retry)
+                },
+            ),
+            Phase::ConfirmBackup { op } => {
+                let op = *op;
+                let path = dialog.backup.clone().unwrap_or_default();
+                (
+                    match op {
+                        Op::Restore => "Restore my backup?",
+                        Op::Discard => "Discard the backup?",
+                        Op::Keep => "Keep the cloud state?",
                     },
-                ),
-                Phase::ConfirmBackup { restore } => {
-                    let restore = *restore;
-                    let path = dialog.backup.clone().unwrap_or_default();
-                    (
-                        if restore {
-                            "Restore my backup?"
-                        } else {
-                            "Discard the backup?"
-                        },
-                        div().child(text(
-                            "cloud-continue-backup-body",
-                            backup_text(restore, &path),
-                            false,
-                        )),
-                        footer.child(cancel).child(
-                            if restore {
+                    div().child(text(
+                        "cloud-continue-backup-body",
+                        backup_text(op, &path),
+                        false,
+                    )),
+                    footer.child(cancel).child(
+                        match op {
+                            Op::Restore => {
                                 crate::modal::primary_button("cloud-continue-backup-go", "Restore")
-                            } else {
+                            }
+                            Op::Keep => {
+                                crate::modal::primary_button("cloud-continue-backup-go", "Keep")
+                            }
+                            Op::Discard => {
                                 crate::modal::danger_button("cloud-continue-backup-go", "Discard")
                             }
-                            .debug_selector(|| "cloud-continue-backup-go".into())
-                            .cursor_pointer()
-                            .on_click(cx.listener(
-                                |this, _, window, cx| this.confirm_backup_action(window, cx),
-                            )),
+                        }
+                        .debug_selector(|| "cloud-continue-backup-go".into())
+                        .cursor_pointer()
+                        .on_click(
+                            cx.listener(|this, _, window, cx| {
+                                this.confirm_backup_action(window, cx)
+                            }),
                         ),
-                    )
-                }
-            };
+                    ),
+                )
+            }
+        };
         Some(
             div()
                 .absolute()
