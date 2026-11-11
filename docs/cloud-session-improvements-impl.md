@@ -1529,9 +1529,9 @@ ticket, after review and after merge.
 | HR3 | 4 | merged | - | see HR1: covered by the combined host-v1.1.0 release; pin 1.1.0 (H2a) |
 | F3-4 | 4 | merged | csi-f3-4 | merge c252c7c0. Two independent Opus reviews (c3's + mine), 6+14 findings fixed incl. a BLOCKER (kit.* methods were missing from the app allowlist so the setup never ran). Pipeline: kit tar builder (deterministic, O_NOFOLLOW, dev/ino recheck, names as in the item), mcp.json with ${MONOPTAH_KIT_*} refs, kit.secrets, health shown as status + generic reason (no raw Host lines), ClaudeSetup runs only for NEW workspaces, never fails the start, halt honoured, Update Claude setup never wakes a workspace and keeps the last good state on failure; servers with headersHelper are not sent. cloudKitEnabled flag removed. Pending, needs the user (creates a codespace/sandbox): new start with the kit, first-turn skill/MCP use, headless unapproved project .mcp.json behaviour (design 7). Needs a FUTURE Host release (>1.1.0, NOT done, needs the user): host/kit.ts parseHealth now returns only the status part (app already defends); F4-2h snapshot-worktree idempotence fix (if F4-3a lands it). |
 | F3-5 | 4 | in progress | csi-f3-5 | reduced (D12): config-only OAuth servers, 'Sign in in the cloud'; depends on F3-4 only |
-| F4-3a | 4 | in progress | csi-f4-3a | |
-| F4-4 | 4 | todo | - | |
-| F4-5 | 4 | todo | - | |
+| F4-3a | 4 | merged | csi-f4-3a | merge 2fbbce9a (cloud_sessions.rs struct/ctor conflict with F3-4 resolved keeping both fields; native:check, branding, host tests, check:web green on the merged tree). Three Opus reviews, all findings fixed: cancel after flip, anchor at snapshot start, Codex model reset atomic with the location (set_cloud_location_with_settings), owner stamp (session ids are reused), per-session run guard, cancel report event, worktree ownership, removed-worktree refusal, push <sha>:refs/heads/<b>. API: begin_move/run_move/cancel_move/move_record/pending_moves; NO UI yet (F4-4); nothing calls run_move from a background path. Pending, needs the user (creates a codespace): real move. Needs a FUTURE Host release (>1.1.0, NOT done, needs the user): host/move.ts idempotent snapshot worktree reuse (app tolerates the older Host). |
+| F4-4 | 4 | in progress | csi-f4-4 | |
+| F4-5 | 4 | in progress | csi-f4-5 | |
 | F4-3b | 4 | todo | - | |
 
 ---
