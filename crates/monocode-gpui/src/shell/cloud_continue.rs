@@ -127,6 +127,22 @@ impl State {
     }
 }
 
+impl State {
+    /// For `sessions.moveStatus`: how a return of session `id` stands, `None` when no return of
+    /// it is running or failed (a dialog still waiting for the user's confirmation is none).
+    pub(super) fn api_status(&self, id: i64) -> Option<(&'static str, Option<String>)> {
+        let dialog = self.dialog.as_ref().filter(|d| d.id == id)?;
+        if dialog.action != Action::Continue {
+            return None;
+        }
+        match &dialog.phase {
+            Phase::Working { .. } => Some(("running", None)),
+            Phase::Failed(error) => Some(("failed", Some(error.clone()))),
+            _ => None,
+        }
+    }
+}
+
 impl Default for State {
     fn default() -> Self {
         Self {

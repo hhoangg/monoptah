@@ -18,6 +18,7 @@ mod cloud_create;
 #[cfg(test)]
 mod cloud_location_tests;
 mod cloud_move;
+mod cloud_move_api;
 mod cloud_picker;
 mod cloud_start;
 #[cfg(test)]
@@ -724,6 +725,8 @@ pub(crate) struct Shell {
     cloud_move_engine: Arc<dyn cloud_move::MoveEngine>,
     /// Moves to the cloud in progress, one per session (see `cloud_move`).
     cloud_moves: HashMap<i64, cloud_move::MoveRun>,
+    /// Why the last move an agent started for a session was refused before it began.
+    api_move_errors: HashMap<i64, String>,
     move_dialog: Option<cloud_move::OpenMove>,
     /// The working-copy inspections of the move dialog in flight, by session (cancel flags).
     move_previews: HashMap<i64, Arc<std::sync::atomic::AtomicBool>>,
@@ -1220,6 +1223,7 @@ impl Shell {
             _remote_clock: remote_clock,
             cloud_move_engine: cloud.clone(),
             cloud_moves: HashMap::new(),
+            api_move_errors: HashMap::new(),
             move_dialog: None,
             move_previews: HashMap::new(),
             move_labels: HashMap::new(),

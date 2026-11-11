@@ -503,6 +503,31 @@ impl Monos {
         })
         .detach();
     }
+    /// `sessions.moveToCloud|moveToLocal|moveStatus|cancelMove`: quick answers on the UI thread;
+    /// the moves themselves run on workers owned by the shell.
+    fn move_call(
+        &mut self,
+        action: &str,
+        input: &Value,
+        project: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Value, String> {
+        use monocode_core::mono::move_api as api;
+        let shell = self
+            .owner
+            .upgrade()
+            .ok_or("The app is not available right now")?;
+        let session = api::session_of(input)?;
+        shell.update(cx, |shell, cx| match action {
+            api::MOVE_TO_CLOUD => {
+                shell.api_move_to_cloud(project, api::parse_move_to_cloud(input)?, cx)
+            }
+            api::MOVE_TO_LOCAL => shell.api_move_to_local(project, session, window, cx),
+            api::MOVE_STATUS => shell.api_move_status(project, session),
+            _ => shell.api_cancel_move(project, session, cx),
+        })
+    }
     fn call_work(
         &mut self,
         call: Call,
@@ -1001,6 +1026,13 @@ impl Monos {
                     }
                     Ok(json!({"accepted":true}))
                 }
+            }
+            action if monocode_core::mono::move_api::is_move_action(action) => {
+                // Moves are Mono-only (an Operator is refused at validation). The session is
+                // checked against the project inside the shell, which owns the moves.
+                let result = self.move_call(action, &input, &project, window, cx);
+                self.finish_call(call, result, cx);
+                return;
             }
             "sessions.pullEvidence" => {
                 let session = match id(&input, "sessionId") {

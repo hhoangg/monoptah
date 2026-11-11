@@ -489,3 +489,169 @@ fn keep_the_cloud_state_is_offered_only_at_the_cloud_commit_and_runs_after_the_c
     cx.run_until_parked();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
+
+// ------------------------------------------------------------ app API (F4-3b)
+
+fn project_of(window: gpui::WindowHandle<Shell>, id: i64, cx: &mut TestAppContext) -> String {
+    window
+        .update(cx, |shell, _, _| {
+            shell.cloud_marks[&id].local_project.clone()
+        })
+        .unwrap()
+}
+
+#[gpui::test]
+fn an_agent_return_runs_the_same_continue_locally_and_reports_through_the_status(
+    cx: &mut TestAppContext,
+) {
+    let (window, local) = moved_window(cx);
+    let project = project_of(window, local, cx);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let started = window
+        .update(cx, |shell, window, cx| {
+            shell.cloud_continue.run = fake(calls.clone(), None, shell.store.clone());
+            shell.api_move_to_local(&project, local, window, cx)
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(started["state"], "running");
+    cx.run_until_parked();
+    // The seam of the dialog ran once, and the session is local again.
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let status = window
+        .update(cx, |shell, _, _| shell.api_move_status(&project, local))
+        .unwrap()
+        .unwrap();
+    assert_eq!(status["state"], "none");
+    assert_eq!(status["location"], "local");
+    assert!(
+        !locked(&window.update(cx, |s, _, _| s.store.clone()).unwrap())
+            .unwrap()
+            .cloud_location(local)
+            .unwrap()
+            .is_cloud()
+    );
+}
+
+#[gpui::test]
+fn a_refusal_of_continue_locally_reaches_the_agent_and_the_session_stays_in_the_cloud(
+    cx: &mut TestAppContext,
+) {
+    let (window, local) = moved_window(cx);
+    let project = project_of(window, local, cx);
+    let calls = Arc::new(AtomicUsize::new(0));
+    window
+        .update(cx, |shell, window, cx| {
+            shell.cloud_continue.run = fake(
+                calls.clone(),
+                Some("A turn is running in the cloud. Wait for it to finish."),
+                shell.store.clone(),
+            );
+            shell
+                .api_move_to_local(&project, local, window, cx)
+                .unwrap();
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let status = window
+        .update(cx, |shell, _, _| shell.api_move_status(&project, local))
+        .unwrap()
+        .unwrap();
+    assert_eq!(status["state"], "failed");
+    assert_eq!(status["direction"], "toLocal");
+    assert!(
+        status["error"]
+            .as_str()
+            .unwrap()
+            .contains("turn is running"),
+        "{status}"
+    );
+    window
+        .update(cx, |shell, _, _| {
+            assert!(
+                locked(&shell.store)
+                    .unwrap()
+                    .cloud_location(local)
+                    .unwrap()
+                    .is_cloud()
+            );
+            assert_eq!(shell.cloud_continue.phase_name(), "failed");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_real_continue_locally_is_the_default_and_its_failure_leaves_the_cloud_in_place(
+    cx: &mut TestAppContext,
+) {
+    // No seam replaced: this is `CloudSessions::continue_locally` against a Host that is
+    // offline, so it refuses and nothing changes.
+    let (window, local) = moved_window(cx);
+    let project = project_of(window, local, cx);
+    window
+        .update(cx, |shell, window, cx| {
+            shell
+                .api_move_to_local(&project, local, window, cx)
+                .unwrap();
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, _| {
+            let status = shell.api_move_status(&project, local).unwrap();
+            assert_eq!(status["state"], "failed", "{status}");
+            assert!(
+                locked(&shell.store)
+                    .unwrap()
+                    .cloud_location(local)
+                    .unwrap()
+                    .is_cloud()
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn an_agent_return_is_refused_for_the_wrong_session_a_running_turn_or_another_dialog(
+    cx: &mut TestAppContext,
+) {
+    let (window, local) = moved_window(cx);
+    let project = project_of(window, local, cx);
+    let calls = Arc::new(AtomicUsize::new(0));
+    window
+        .update(cx, |shell, window, cx| {
+            shell.cloud_continue.run = fake(calls.clone(), None, shell.store.clone());
+            // Another project, an unknown session, a session that is not in the cloud.
+            let error = shell
+                .api_move_to_local("/somewhere/else", local, window, cx)
+                .unwrap_err();
+            assert!(error.contains("outside the assigned project"), "{error}");
+            assert!(shell.api_move_to_local(&project, 9999, window, cx).is_err());
+            let plain = shell
+                .session_summaries
+                .keys()
+                .copied()
+                .find(|id| !shell.cloud_marks.contains_key(id))
+                .expect("a plain local session");
+            let error = shell
+                .api_move_to_local(&project, plain, window, cx)
+                .unwrap_err();
+            assert!(error.contains("does not live in the cloud"), "{error}");
+            // A turn running here.
+            shell.sessions[&local].update(cx, |c, _| c.busy = true);
+            let error = shell
+                .api_move_to_local(&project, local, window, cx)
+                .unwrap_err();
+            assert!(error.contains("turn is running"), "{error}");
+            shell.sessions[&local].update(cx, |c, _| c.busy = false);
+            // The user's own dialog is open.
+            shell.run_session_menu(local, "continue-locally", window, cx);
+            let error = shell
+                .api_move_to_local(&project, local, window, cx)
+                .unwrap_err();
+            assert!(error.contains("Another return"), "{error}");
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing ran");
+}

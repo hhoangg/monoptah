@@ -18,9 +18,13 @@ use gpui::{
 };
 use monocode_core::cloud_sessions::{
     StepStatus,
-    move_session::{CancelReport, MoveRecord, MoveStep, MoveTarget},
+    move_session::{CancelReport, MoveRecord, MoveStep, MoveTarget, StartedBy},
     move_ui::MovePreview,
 };
+
+/// Shown on a move that an agent started through the app API.
+pub(crate) const STARTED_BY_AGENT: &str =
+    "Started by an agent. You can cancel it here at any time.";
 
 /// What the dialog asks the shell to do.
 #[derive(Clone, Debug, PartialEq)]
@@ -512,7 +516,15 @@ impl MoveDialog {
     }
 
     fn progress(&self) -> Div {
-        let mut column = div().flex().flex_col().gap_3().child(self.steps());
+        let mut column = div().flex().flex_col().gap_3();
+        if self
+            .record
+            .as_ref()
+            .is_some_and(|r| r.started_by == StartedBy::Api)
+        {
+            column = column.child(muted(STARTED_BY_AGENT));
+        }
+        column = column.child(self.steps());
         if let Some(error) = &self.error {
             column = column.child(alert("move-error", error.clone()));
         }

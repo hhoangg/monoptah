@@ -954,3 +954,62 @@ fn live_cloud_start(cx: &mut TestAppContext) {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
 }
+
+#[gpui::test]
+fn a_mono_move_call_is_validated_before_anything_is_created(cx: &mut TestAppContext) {
+    let (s, gh, host, _guard) = cloud_setup(cx, "Available");
+    let before = gh.calls.lock().unwrap().len();
+    let target = json!({"kind":"codespace","instance":"new"});
+    for (n, (action, input, needle)) in [
+        (
+            "sessions.moveToCloud",
+            json!({"session":1,"target":target,"force":true}),
+            "does not take force",
+        ),
+        (
+            "sessions.moveToCloud",
+            json!({"session":1,"target":{"kind":"codespace","instance":"new","branch":"main"}}),
+            "does not take branch",
+        ),
+        (
+            "sessions.moveToCloud",
+            json!({"session":1,"target":target,"kit":{"skills":["x"]}}),
+            "must be text",
+        ),
+        (
+            "sessions.moveToCloud",
+            json!({"target":target}),
+            "Provide session",
+        ),
+        (
+            "sessions.moveToLocal",
+            json!({"session":1,"deleteWorkspace":true}),
+            "does not take deleteWorkspace",
+        ),
+        (
+            "sessions.cancelMove",
+            json!({"session":1,"deleteWorkspace":true}),
+            "does not take deleteWorkspace",
+        ),
+        // A session of no project of this Mono.
+        (
+            "sessions.moveStatus",
+            json!({"session":424242}),
+            "outside the assigned project",
+        ),
+        (
+            "sessions.moveToCloud",
+            json!({"session":424242,"target":target}),
+            "outside the assigned project",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let error = run(&s, &format!("mv-{n}"), action, input, cx).unwrap_err();
+        assert!(error.contains(needle), "{action}: {error}");
+    }
+    // No codespace was created and no workspace was woken.
+    assert_eq!(gh.calls.lock().unwrap().len(), before);
+    assert!(host.0.lock().unwrap().is_empty());
+}
