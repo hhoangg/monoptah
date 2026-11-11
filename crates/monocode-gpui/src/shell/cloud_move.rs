@@ -92,7 +92,7 @@ pub(super) struct OpenMove {
 
 /// How a worker reports back to the UI thread.
 enum Report {
-    Event(MoveEvent),
+    Event(Box<MoveEvent>),
     Finished(Result<MoveOutcome, String>),
 }
 
@@ -324,7 +324,7 @@ impl Shell {
                 engine.preview(Path::new(&cwd))
             });
             let preview = work.await;
-            let _ = view.update(cx, |dialog, cx| dialog.show_preview(preview, cx));
+            view.update(cx, |dialog, cx| dialog.show_preview(preview, cx));
         })
         .detach();
     }
@@ -428,7 +428,8 @@ impl Shell {
                 };
                 match engine.begin(request, &busy_check) {
                     Ok(record) => {
-                        let _ = reports.try_send(Report::Event(MoveEvent::Updated(record)));
+                        let _ =
+                            reports.try_send(Report::Event(Box::new(MoveEvent::Updated(record))));
                     }
                     Err(error) => {
                         let _ = reports.try_send(Report::Finished(Err(error)));
@@ -437,7 +438,7 @@ impl Shell {
                 }
             }
             let mut send = |event: MoveEvent| {
-                let _ = reports.try_send(Report::Event(event));
+                let _ = reports.try_send(Report::Event(Box::new(event)));
             };
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 engine.run(id, &busy_check, &mut send, &cancel)
@@ -478,9 +479,16 @@ impl Shell {
             run.busy.store(busy_now, Ordering::Relaxed);
         }
         let dialog = self.dialog_for(id);
-        match report {
-            Report::Event(MoveEvent::Updated(record))
-            | Report::Event(MoveEvent::Failed(record)) => {
+        let event = match report {
+            Report::Event(event) => *event,
+            Report::Finished(result) => {
+                self.finish_move_worker(id, result, window, cx);
+                self.invalidate_chrome(cx);
+                return;
+            }
+        };
+        match event {
+            MoveEvent::Updated(record) | MoveEvent::Failed(record) => {
                 if let Some(run) = self.cloud_moves.get_mut(&id) {
                     run.record = Some(record.clone());
                 }
@@ -488,21 +496,20 @@ impl Shell {
                     dialog.update(cx, |dialog, cx| dialog.update_record(record, cx));
                 }
             }
-            Report::Event(MoveEvent::Log(_)) => {}
-            Report::Event(MoveEvent::Notice(notice)) => {
+            MoveEvent::Log(_) => {}
+            MoveEvent::Notice(notice) => {
                 if let Some(dialog) = dialog {
                     dialog.update(cx, |dialog, cx| dialog.push_notice(notice, cx));
                 }
             }
-            Report::Event(MoveEvent::Done(outcome)) => self.finish_cloud_move(id, outcome, cx),
-            Report::Event(MoveEvent::Cancelled(report)) => {
+            MoveEvent::Done(outcome) => self.finish_cloud_move(id, outcome, cx),
+            MoveEvent::Cancelled(report) => {
                 self.cloud_moves.remove(&id);
                 if let Some(dialog) = dialog {
                     dialog.update(cx, |dialog, cx| dialog.cancelled(report, cx));
                 }
                 self.sync_cloud_moves(cx);
             }
-            Report::Finished(result) => self.finish_move_worker(id, result, window, cx),
         }
         self.invalidate_chrome(cx);
     }
