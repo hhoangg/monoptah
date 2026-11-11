@@ -1,0 +1,19 @@
+{
+  "name": "Monoptah Native",
+  "build": { "dockerfile": "Dockerfile", "context": "." },
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": { "version": "22" }
+  },
+  "remoteUser": "vscode",
+  "hostRequirements": { "cpus": 4, "memory": "8gb" },
+  "containerEnv": {
+    "CARGO_BUILD_JOBS": "1",
+    "CARGO_TERM_COLOR": "never",
+    "CARGO_INCREMENTAL": "0"
+  },
+  "onCreateCommand": "bash .devcontainer/setup.sh",
+  "postCreateCommand": "bash .devcontainer/prefetch.sh",
+  "customizations": {
+    "vscode": { "extensions": ["rust-lang.rust-analyzer"] }
+  }
+}
