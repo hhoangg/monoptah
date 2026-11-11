@@ -959,57 +959,30 @@ those servers are marked "Sign in in the cloud".
 > the Host merge F3-5h are dropped. MCP servers whose credentials are raw values in the
 > config JSON (`headers`, `env`) are carried one way at setup as described in 3.2.3.
 > OAuth-signed servers are carried config-only and marked "Sign in in the cloud". The
-> text below is kept as the record of the option that was considered and is **superseded**.
+> text below describes what the app does instead.
 
-Goal (user decision): an MCP server the user signed in to locally works in the cloud
-without signing in again.
+Goal: an MCP server that signs in with OAuth works in the cloud after the user signs in
+there once. The app copies no sign-in and cannot tell whether the user signed in locally.
 
 **What is known** (code.claude.com docs, `iam` and `mcp` pages):
 
 - Claude Code keeps credentials in the macOS Keychain, in an entry keyed to
   `CLAUDE_CONFIG_DIR`. On Linux it keeps them in `~/.claude/.credentials.json` (mode 0600).
 - MCP OAuth tokens are "stored securely and refreshed automatically". Their exact place and
-  format are **not documented**: not sure they share the Keychain entry or the
-  `.credentials.json` file.
-- A documented bypass exists: `headersHelper`. When the helper prints an `Authorization`
-  header, Claude Code uses it and does not fall back to OAuth. It re-runs the helper on a
-  401/403 and retries once.
+  format are **not documented**. The app does not look: it never reads either place for MCP.
 
-**Chosen approach: copy the sign-in to the remote credential store** ("full copy"):
+**What the app does (D12):**
 
-1. A spike (F3-5a) runs with the user present, because reading the Keychain shows a macOS
-   prompt. It reads the local credential entry for the session's account and prints
-   **key names only**, to find where MCP OAuth entries live (expected: an `mcpOAuth`-like
-   map keyed by server name and URL). It also checks the Linux layout with
-   `claude mcp login` on a codespace.
-2. Copying:
-   - The app reads the local entries for the selected servers: Keychain through
-     `security find-generic-password` with the account's `CLAUDE_CONFIG_DIR`, or the file.
-   - It sends them once, in the "Claude setup" step of a new workspace, in `kit.secrets`
-     under a separate `mcpSignIns` field.
-   - The Host merges them into the remote `${CLAUDE_CONFIG_DIR:-~/.claude}/.credentials.json`:
-     - only the MCP keys; Claude's own login there is never touched;
-     - write to a temp file, then rename;
-     - mode 0600;
-     - the merged keys are recorded in `~/.monoptah-kit/signins.json`.
-   - Remote Claude then refreshes the tokens on its own.
-3. The kit removes the copied entries when the workspace is archived with Keep, and
-   whenever a server leaves the kit. A deleted workspace takes them with it.
-
-**Risk: refresh-token rotation.** Many OAuth servers rotate the refresh token on each
-refresh. After the copy, local and cloud hold the same refresh token. The first side to
-refresh invalidates it for the other, and that side has to sign in again.
-
-- The one-way, start-only copy keeps this rare. It happens once per new workspace,
-  usually within the token's lifetime.
-- When it bites, the cloud health check reports "needs sign-in", and "Update Claude
-  setup" copies the local sign-in again. The fix is still one way.
-- **Not sure** which of the user's servers rotate. F3-5a lists them.
-
-**If the spike finds the storage format unusable:** those servers are carried without a
-sign-in and marked "Sign in in the cloud". The `headersHelper` broker considered earlier
-needs the app to keep feeding tokens, which contradicts the one-way decision, so it is
-dropped.
+1. Classification (3.2.2): an http/sse server with no raw credential is OAuth-style.
+2. It is carried config-only, like any other server, in the "Claude setup" step of a new
+   workspace. No sign-in is read, copied, re-sent at reconnect or refreshed by the app.
+3. The Host health check reports such a server as `signInNeeded`. The cloud panel shows it
+   as "Sign in in the cloud" (never "failed") with a short hint: sign-ins are not copied
+   from this computer; the user signs in once in the cloud workspace, by running
+   `claude mcp login --no-browser <name>` in its terminal (it prints the authorization URL;
+   the user pastes the redirect URL back), or `/mcp` in a Claude session.
+4. Servers whose credentials are raw values in `headers` or `env` keep working through the
+   one-way secrets path (3.2.3).
 
 ### 3.3 Alternatives considered
 
@@ -1021,7 +994,7 @@ dropped.
 | MCP: `claude mcp add-json -s user` on the remote | Works with any Host | Persists secrets in the remote `~/.claude.json` on disk; harder to remove cleanly | Rejected (secrets) |
 | MCP: `--mcp-config` + one-way secrets file loaded into the Claude child env (chosen) | Survives Host restarts without the app; removable; additive; leaves `~/.claude.json` alone | Needs the fork Host; secrets on the workspace disk (0600) | **Chosen** |
 | Secrets as Codespaces user secrets (`gh secret set --app codespaces`) | Survive restarts | Persist at GitHub; codespaces only; widen the blast radius to every codespace of the repos listed | Rejected for v1 |
-| MCP sign-ins: user signs in again in the cloud (`claude mcp login` on the remote) | Nothing copied; no rotation race | The user explicitly does not want this; a headless remote may not complete the browser flow | Rejected (user decision) |
+| MCP sign-ins: user signs in again in the cloud (`claude mcp login --no-browser <name>` or `/mcp` on the remote) | Nothing copied; no rotation race; no Keychain read | A headless remote has no browser; `--no-browser` prints the URL and the user pastes the redirect URL back | **Chosen (user decision D12, 2026-11-10)**: servers are carried config-only, "Sign in in the cloud" |
 | MCP sign-ins: copy into the remote credential store | Works offline from the laptop; remote refreshes itself | Undocumented format; refresh-token rotation race; reads the Keychain | **Rejected by user decision D12 (2026-11-10)**; OAuth servers are carried config-only, "Sign in in the cloud" |
 | MCP sign-ins: `headersHelper` broker fed by the app | Documented mechanism; refresh tokens stay local | Cloud depends on the app running; contradicts the one-way decision | Rejected |
 | Transfer over `run_script` stdin (base64 tar) | Works with the old Host | A new ssh session per transfer (a sandbox wakes and bills); 50 MB base64 on stdin; not resumable | Rejected; uploads go over the tunnel |

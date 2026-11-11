@@ -393,29 +393,59 @@ fn the_key_note_shows_only_when_the_key_is_unavailable() {
     );
 }
 
+/// Every non-test `.rs` file under `dir`, recursively (`tests.rs` and `*_tests.rs` are tests).
+fn production_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            production_sources(&path, out);
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if name.ends_with(".rs") && name != "tests.rs" && !name.ends_with("_tests.rs") {
+            out.push(path);
+        }
+    }
+}
+
 #[test]
-fn kit_sources_never_read_the_keychain_or_claude_credentials() {
-    // D12: the app never reads MCP sign-ins. Every production kit file is scanned (the
-    // `_tests.rs` files are not); the Guard denylist in kit.rs names the credentials file
-    // as a protected path on purpose, and that single exact line is the only allowed hit.
+fn cloud_sources_never_read_the_keychain_or_claude_credentials() {
+    // D12: the app never reads MCP sign-ins. Every production file of the cloud sessions
+    // module, and the kit UI files, are scanned (test files are not); the Guard denylist in
+    // kit.rs names the credentials file as a protected path on purpose, and those exact
+    // lines are the only allowed hits. Spawning a process is also banned in the kit files
+    // (the other cloud files run `gh`, `ssh` and `sbx` legitimately).
     let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cloud_sessions");
     let gpui = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../monocode-gpui/src");
-    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&core)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| {
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            name.starts_with("kit") && name.ends_with(".rs") && !name.ends_with("_tests.rs")
-        })
-        .collect();
-    files.push(gpui.join("cloud_kit_ui.rs"));
-    files.push(gpui.join("settings/pages/cloud.rs"));
-    assert!(files.len() >= 4, "the scan found {files:?}");
+    let mut files = Vec::new();
+    production_sources(&core, &mut files);
+    let kit_ui = [
+        gpui.join("cloud_kit_ui.rs"),
+        gpui.join("settings/pages/cloud.rs"),
+        gpui.join("shell/claude_setup.rs"),
+        gpui.join("shell.rs"),
+        gpui.join("panel_root.rs"),
+        gpui.join("shell/cloud_picker.rs"),
+        gpui.join("conversation/cloud_target.rs"),
+        gpui.join("settings/preferences.rs"),
+    ];
+    files.extend(kit_ui.iter().cloned());
+    assert!(files.len() >= 20, "the scan found {files:?}");
+    for must in [
+        "kit.rs",
+        "kit_pack.rs",
+        "claude_setup.rs",
+        "docker_start.rs",
+    ] {
+        assert!(
+            files.iter().any(|f| f.file_name().unwrap() == must),
+            "{must} is not scanned"
+        );
+    }
     let allowed = "    \".claude/.credentials.json\",";
-    let forbidden = [
+    let keychain = [
         "find-generic-password",
         "\"security\"",
-        "Command::new",
         "SecItem",
         "SecKeychain",
         "security_framework",
@@ -426,9 +456,12 @@ fn kit_sources_never_read_the_keychain_or_claude_credentials() {
     ];
     for path in files {
         let text = std::fs::read_to_string(&path).unwrap();
-        let is_guard = path.file_name().unwrap() == "kit.rs";
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let is_guard = name == "kit.rs";
+        let is_kit = name.starts_with("kit") || kit_ui.contains(&path);
         for (ix, line) in text.lines().enumerate() {
-            for needle in forbidden {
+            let spawns = is_kit && line.contains("Command::new");
+            for needle in keychain.into_iter().chain(spawns.then_some("Command::new")) {
                 if !line.contains(needle) {
                     continue;
                 }
@@ -447,6 +480,32 @@ fn kit_sources_never_read_the_keychain_or_claude_credentials() {
             }
         }
     }
+}
+
+#[test]
+fn the_sign_in_hint_names_real_commands_and_says_nothing_is_copied() {
+    use crate::cloud_sessions::claude_setup::SIGN_IN_HINT;
+    assert!(SIGN_IN_HINT.contains("not copied"));
+    assert!(SIGN_IN_HINT.contains("`claude mcp login --no-browser <name>`"));
+    assert!(SIGN_IN_HINT.contains("`/mcp`"));
+}
+
+#[test]
+fn an_oauth_style_server_is_carried_config_only_and_wears_the_sign_in_badge() {
+    use crate::cloud_sessions::claude_setup::SIGN_IN_LABEL;
+    let inventory = KitInventory {
+        mcp_servers: vec![server("linear", McpCompat::OAuthStyle, false)],
+        ..Default::default()
+    };
+    let prefs = CloudKitPrefs::default();
+    let servers = rows(&inventory, &prefs, KitTab::McpServers);
+    let linear = row(&servers, "linear");
+    // Sent (checked, no secret, nothing local-only or excluded), badge in the D12 words.
+    assert!(linear.checked);
+    assert_eq!(linear.badges, vec![Badge::Works, Badge::SignInInCloud]);
+    assert_eq!(Badge::SignInInCloud.label(), SIGN_IN_LABEL);
+    // The start panel's count includes it, and nothing flags it as a secret.
+    assert_eq!(KitSummary::of(&inventory, &prefs).mcp_servers, 1);
 }
 
 #[test]
