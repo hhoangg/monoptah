@@ -603,6 +603,9 @@ impl Shell {
                     }
                 }
             }
+            if self.can_continue_locally(id) {
+                items.push(MenuAction::new("continue-locally", "Continue locally…").into());
+            }
             if self.codespace_restore_pending(id) {
                 items.push(
                     MenuAction::new("codespace-restore", "Restore code from codespace").into(),
@@ -684,6 +687,7 @@ impl Shell {
         let ids = self.session_menu_ids(id, cx);
         match action {
             "codespace-restore" => self.restore_codespace_code(id, cx),
+            "continue-locally" => self.open_continue_locally(id, window, cx),
             "codespace-stop" => {
                 self.run_origin_codespace_action(id, cloud::ArchiveChoice::Stop, window, cx)
             }

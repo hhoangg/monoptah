@@ -14,7 +14,7 @@ use monocode_core::{
 use serde_json::{Value, json};
 use std::sync::atomic::AtomicBool;
 
-const LOCAL: &str = "/work/monocode";
+pub(super) const LOCAL: &str = "/work/monocode";
 
 struct Gh;
 impl GhRunner for Gh {
@@ -45,7 +45,7 @@ impl Host for NoHost {
     }
 }
 
-fn service(store: Database) -> CloudSessions {
+pub(super) fn service(store: Database) -> CloudSessions {
     CloudSessions::new(Arc::new(Gh), Arc::new(NoHost), store)
 }
 
@@ -63,7 +63,7 @@ fn location() -> SessionLocation {
 }
 
 /// A Host record of the codespace `octo-abc`, bound to the local project, with a host id.
-fn host_record(store: &Database, host_session: &str) -> i64 {
+pub(super) fn host_record(store: &Database, host_session: &str) -> i64 {
     let store = store.lock().unwrap();
     let project = store
         .remember_cloud_project(
@@ -85,13 +85,13 @@ fn host_record(store: &Database, host_session: &str) -> i64 {
 }
 
 /// Moves local session `local` to the cloud as F4-3a will: location, plus the linked record.
-fn move_to_cloud(store: &Database, local: i64, host: i64) {
+pub(super) fn move_to_cloud(store: &Database, local: i64, host: i64) {
     let store = store.lock().unwrap();
     store.set_cloud_location(local, &location()).unwrap();
     store.link_remote_session(host, Some(local)).unwrap();
 }
 
-fn ten_row_session(store: &Database) -> i64 {
+pub(super) fn ten_row_session(store: &Database) -> i64 {
     let mut store = store.lock().unwrap();
     let session = store.create("claude", LOCAL).unwrap();
     let rows: Vec<monocode_core::transcript::Row> = (0..10)
@@ -106,7 +106,7 @@ fn ten_row_session(store: &Database) -> i64 {
     session.id
 }
 
-fn memory_store() -> Database {
+pub(super) fn memory_store() -> Database {
     Arc::new(Mutex::new(
         Store::open(std::path::Path::new(":memory:")).unwrap(),
     ))

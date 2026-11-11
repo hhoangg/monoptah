@@ -11,6 +11,9 @@ mod classic_surfaces;
 mod claude_setup;
 mod cloud;
 mod cloud_app_archive;
+mod cloud_continue;
+#[cfg(test)]
+mod cloud_continue_tests;
 mod cloud_create;
 #[cfg(test)]
 mod cloud_location_tests;
@@ -742,6 +745,7 @@ pub(crate) struct Shell {
     /// A resume happened while a refresh was in flight: its answer is stale, read again.
     cloud_refresh_again: bool,
     cloud_archive: Option<cloud::ArchiveDialog>,
+    cloud_continue: cloud_continue::State,
     /// Saves the local copy of a cloud session before its codespace is stopped or deleted.
     cloud_convert: cloud::ConvertFn,
     cloud_busy: HashSet<i64>,
@@ -1210,6 +1214,7 @@ impl Shell {
             cloud_refreshing: false,
             cloud_refresh_again: false,
             cloud_archive: None,
+            cloud_continue: cloud_continue::State::default(),
             cloud_convert: cloud::default_convert(),
             cloud_busy: HashSet::new(),
             cloud_workspaces_busy: HashSet::new(),
@@ -9832,6 +9837,7 @@ impl Render for Shell {
             .children(self.git_credential_modal(window, cx))
             .children(self.delete_modal(window, cx))
             .children(self.cloud_archive_modal(window, cx))
+            .children(self.cloud_continue_modal(window, cx))
             .children(self.cloud_view_card(cx))
             .children(self.codespace_picker_modal(window, cx))
             .children(self.action_modal(window, cx))
