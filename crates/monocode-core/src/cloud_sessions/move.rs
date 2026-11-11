@@ -155,6 +155,18 @@ pub enum MoveTarget {
     },
 }
 
+/// Who asked for the move. The UI shows "started by an agent" for an API move.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StartedBy {
+    /// The user pressed Continue in the dialog.
+    #[default]
+    User,
+    /// An agent called `sessions.moveToCloud` (rule D11: it can only narrow the user's
+    /// choices, so it has no way to widen the kit or the push rules).
+    Api,
+}
+
 /// How the conversation travels.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -288,6 +300,13 @@ pub struct MoveRecord {
     /// call that answers `reused` is the worktree this move made.
     #[serde(default)]
     pub restore_attempted: bool,
+    /// Who asked for the move.
+    #[serde(default)]
+    pub started_by: StartedBy,
+    /// The new workspace gets no Claude kit: the app API asked for `kit: "none"`. It can only
+    /// narrow the user's global setting (rule D11), never widen it.
+    #[serde(default)]
+    pub kit_off: bool,
 }
 
 impl MoveRecord {
@@ -405,6 +424,9 @@ pub struct MoveRequest {
     pub target: MoveTarget,
     /// Claude config home of the session's account; defaults to the session's profile home.
     pub account_home: Option<PathBuf>,
+    pub started_by: StartedBy,
+    /// No Claude kit for a workspace this move creates (the API's `kit: "none"`).
+    pub kit_off: bool,
 }
 
 // ------------------------------------------------------------- store accessors
@@ -657,6 +679,8 @@ impl CloudSessions {
             create_command: format!("move-{id}-{}", uuid::Uuid::new_v4()),
             owner: uuid::Uuid::new_v4().to_string(),
             restore_attempted: false,
+            started_by: request.started_by,
+            kit_off: request.kit_off,
         };
         store.save_setting(&owner_key(id), &record.owner)?;
         save_record(&store, &record)?;
@@ -1096,7 +1120,7 @@ impl CloudSessions {
             })
             .map(|w| w.name.clone());
         if let Some(name) = reuse {
-            let (session, _) = self.begin_start(
+            let (session, _) = self.begin_start_with_kit(
                 &record.project_cwd,
                 Target {
                     codespace: CodespaceChoice::Named(name),
@@ -1104,6 +1128,7 @@ impl CloudSessions {
                     machine: None,
                 },
                 super::HARNESS,
+                !record.kit_off,
             )?;
             if let Some(info) = record.workspace.as_mut() {
                 info.start_session = Some(session.id);
@@ -1128,7 +1153,7 @@ impl CloudSessions {
             }
             let created = match record.target.clone() {
                 MoveTarget::NewCodespace { machine } => self
-                    .begin_start(
+                    .begin_start_with_kit(
                         &record.project_cwd,
                         Target {
                             codespace: CodespaceChoice::New,
@@ -1136,6 +1161,7 @@ impl CloudSessions {
                             machine,
                         },
                         super::HARNESS,
+                        !record.kit_off,
                     )
                     .map(|(session, start)| WorkspaceInfo {
                         backend: CloudBackendKind::Codespaces,
@@ -1145,11 +1171,12 @@ impl CloudSessions {
                         project: None,
                     }),
                 MoveTarget::NewSandbox { config } => self
-                    .begin_sandbox_start(
+                    .begin_sandbox_start_with_kit(
                         &record.project_cwd,
                         &sandbox_config_for(config, &record.branch),
                         &record.branch,
                         super::HARNESS,
+                        !record.kit_off,
                     )
                     .map(|(session, start)| WorkspaceInfo {
                         backend: CloudBackendKind::DockerSandbox,

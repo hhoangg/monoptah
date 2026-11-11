@@ -16,7 +16,7 @@ use monocode_core::cloud_sessions::{
     CloudSessions, CloudState, HARNESS, docker_config,
     move_session::{
         CancelChoice, CancelReport, MOVE_ABORTED, MOVE_STOPPING, MoveEvent, MoveOutcome,
-        MoveRecord, MoveRequest, MoveStep, MoveTarget, NO_MOVE, pending_moves,
+        MoveRecord, MoveRequest, MoveStep, MoveTarget, NO_MOVE, StartedBy, pending_moves,
     },
     move_ui::{self, MovePreview},
 };
@@ -501,6 +501,8 @@ impl Shell {
                     session_id: id,
                     target,
                     account_home: None,
+                    started_by: StartedBy::User,
+                    kit_off: false,
                 };
                 match engine.begin(request, &busy_check) {
                     Ok(record) => {

@@ -561,6 +561,8 @@ impl Fx {
                 name: "cs1".into(),
             },
             account_home: Some(self.home.clone()),
+            started_by: StartedBy::User,
+            kit_off: false,
         }
     }
 
@@ -2933,4 +2935,131 @@ fn a_push_that_reached_origin_but_was_not_recorded_is_reported_on_cancel() {
         .cancel_move(fx.session, CancelChoice::default())
         .unwrap();
     assert_eq!(report.created_branch.as_deref(), Some("feat"));
+}
+
+// ------------------------------------------------------------ app API (F4-3b)
+
+fn api_request(fx: &Fx, kit_off: bool) -> MoveRequest {
+    MoveRequest {
+        started_by: StartedBy::Api,
+        kit_off,
+        ..new_request(fx)
+    }
+}
+
+#[test]
+fn an_api_move_is_marked_and_a_user_move_is_not() {
+    let (fx, _, _) = new_codespace_fx();
+    let record = fx
+        .svc
+        .begin_move(api_request(&fx, false), &|| false)
+        .unwrap();
+    assert_eq!(record.started_by, StartedBy::Api);
+    assert_eq!(fx.record().unwrap().started_by, StartedBy::Api);
+    let fx = Fx::new();
+    assert_eq!(fx.begin().started_by, StartedBy::User);
+    // A record written before the field existed reads as a user move with the kit on.
+    let mut json = serde_json::to_value(fx.record().unwrap()).unwrap();
+    json.as_object_mut().unwrap().remove("startedBy");
+    json.as_object_mut().unwrap().remove("kitOff");
+    let old: MoveRecord = serde_json::from_value(json).unwrap();
+    assert_eq!(old.started_by, StartedBy::User);
+    assert!(!old.kit_off);
+}
+
+#[test]
+fn the_kit_off_choice_of_an_api_move_reaches_the_workspace_start_record() {
+    for kit_off in [true, false] {
+        let (fx, _, _) = new_codespace_fx();
+        fx.svc
+            .begin_move(api_request(&fx, kit_off), &|| false)
+            .unwrap();
+        // Stop after the workspace exists so its start record is still there to read.
+        *fx.host.connect_error.lock().unwrap() = Some("pairing failed".into());
+        let (result, _) = fx.run();
+        assert!(result.is_err());
+        assert_eq!(fx.record().unwrap().kit_off, kit_off);
+        let store = fx.store.lock().unwrap();
+        let starts = crate::cloud_sessions::pending_starts(&store);
+        assert_eq!(starts.len(), 1, "{starts:?}");
+        assert_eq!(starts[0].kit_off, kit_off);
+    }
+}
+
+#[test]
+fn an_api_move_follows_the_same_push_rules_as_the_dialog() {
+    // Diverged branch: pushed to `<branch>-cloud`, their branch untouched, never forced.
+    let fx = Fx::new();
+    let other = fx.tmp.path().join("other");
+    git(
+        fx.tmp.path(),
+        &["clone", "-q", fx.origin.to_str().unwrap(), "other"],
+    );
+    configure(&other);
+    git(&other, &["checkout", "-q", "-b", "feat", "origin/main"]);
+    commit_file(&other, "theirs.txt", "theirs\n");
+    git(&other, &["push", "-q", "origin", "feat"]);
+    let theirs = fx.origin_ref("feat").unwrap();
+    let request = MoveRequest {
+        started_by: StartedBy::Api,
+        kit_off: true,
+        ..fx.request()
+    };
+    fx.svc.begin_move(request, &|| false).unwrap();
+    fx.run().0.unwrap();
+    assert_eq!(fx.origin_ref("feat").as_deref(), Some(theirs.as_str()));
+    assert_eq!(
+        fx.origin_ref("feat-cloud").as_deref(),
+        Some(fx.head().as_str())
+    );
+    // Default branch ahead of origin: `main` is never the target.
+    let fx = Fx::with(|work| {
+        git(work, &["stash", "-q", "-u"]);
+        git(work, &["checkout", "-q", "main"]);
+        git(work, &["merge", "-q", "--ff-only", "feat"]);
+        git(work, &["branch", "-q", "-D", "feat"]);
+        git(work, &["stash", "pop", "-q"]);
+    });
+    let main_before = fx.origin_ref("main").unwrap();
+    let request = MoveRequest {
+        started_by: StartedBy::Api,
+        ..fx.request()
+    };
+    fx.svc.begin_move(request, &|| false).unwrap();
+    fx.run().0.unwrap();
+    assert_eq!(fx.origin_ref("main").as_deref(), Some(main_before.as_str()));
+    assert_eq!(
+        fx.origin_ref("main-cloud").as_deref(),
+        Some(fx.head().as_str())
+    );
+}
+
+#[test]
+fn an_api_move_never_uploads_ignored_files() {
+    let fx = Fx::new();
+    let request = MoveRequest {
+        started_by: StartedBy::Api,
+        ..fx.request()
+    };
+    fx.svc.begin_move(request, &|| false).unwrap();
+    fx.run().0.unwrap();
+    let names = fx.host.uploaded_names();
+    assert!(names.len() <= 2, "{names:?}");
+    assert!(names.iter().all(|n| !n.contains(".env")), "{names:?}");
+}
+
+#[test]
+fn an_api_move_is_refused_while_busy_or_already_moving() {
+    let fx = Fx::new();
+    let request = MoveRequest {
+        started_by: StartedBy::Api,
+        ..fx.request()
+    };
+    assert_eq!(
+        fx.svc.begin_move(request.clone(), &|| true).unwrap_err(),
+        BUSY
+    );
+    assert!(fx.record().is_none(), "a refused move leaves no record");
+    fx.svc.begin_move(request.clone(), &|| false).unwrap();
+    assert!(fx.svc.begin_move(request, &|| false).is_err());
 }
