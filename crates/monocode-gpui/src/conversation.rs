@@ -25,6 +25,8 @@ pub(crate) use question_api::{QuestionAsked, QuestionSettled};
 mod cloud_branches;
 mod cloud_location;
 pub(crate) use cloud_location::CloudLocationReset;
+mod cloud_move;
+pub(crate) use cloud_move::{ContinueInCloud, MoveOffer};
 mod cloud_panel;
 mod remote;
 pub(crate) use remote::CloudResumed;
@@ -174,6 +176,8 @@ pub(crate) struct Conversation {
     cloud_stopped: bool,
     /// The shell says this local session lives in the cloud (design 4.2.1).
     cloud_location: cloud_location::State,
+    /// The shell says whether the Workspace menu offers "Continue in cloud".
+    move_offer: MoveOffer,
     /// Lists the machine types of a project's repository for the codespace panel.
     machine_loader: Option<cloud_target::MachineLoader>,
     cloud_anchors: [AnchorSlot; 4],
@@ -795,6 +799,7 @@ impl Conversation {
             cloud_offers_codespace: false,
             cloud_stopped: false,
             cloud_location: Default::default(),
+            move_offer: MoveOffer::Hidden,
             machine_loader: None,
             cloud_anchors: Default::default(),
             cloud_ref_anchors: Default::default(),
@@ -2706,6 +2711,7 @@ impl Conversation {
                         .into(),
                 ];
                 items.extend(self.cloud_menu_items());
+                items.extend(self.move_menu_items());
                 ("Workspace", items, 240., MenuStyle::Settings)
             }
             // Composer.tsx's plus menu with native mode and attachment actions.

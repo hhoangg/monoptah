@@ -151,7 +151,7 @@ impl Shell {
         }
     }
 
-    fn cloud_modal(
+    pub(super) fn cloud_modal(
         &self,
         id: &'static str,
         view: impl Into<AnyView>,

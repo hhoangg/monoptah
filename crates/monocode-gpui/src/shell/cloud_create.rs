@@ -84,6 +84,7 @@ impl Shell {
             let located = self.cloud_located.get(id).cloned();
             view.update(cx, |view, cx| view.set_cloud_location(located, cx));
         }
+        self.sync_cloud_moves(cx);
     }
 
     /// How a conversation lists the machine types of its repository: `gh api` on the worker.

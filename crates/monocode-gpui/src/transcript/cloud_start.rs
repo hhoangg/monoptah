@@ -122,6 +122,7 @@ impl TranscriptView {
                 .max(display_start);
             self.rows.insert(at, row(CLOUD_START_ROW, Body::CloudStart));
         }
+        self.push_moved_row();
     }
 
     /// The index just after the rows of the first user message.
@@ -398,6 +399,78 @@ impl TranscriptView {
             )
             .into_any_element()
     }
+}
+
+/// One line of a step list in the style of the Codespace panel: a mark for the status, the
+/// label and an optional note on the right. The "Continue in cloud" dialog draws the steps of
+/// a move with it.
+pub(crate) fn step_row(
+    id: SharedString,
+    label: impl Into<SharedString>,
+    status: monocode_core::cloud_sessions::StepStatus,
+    note: Option<String>,
+) -> gpui::AnyElement {
+    use monocode_core::cloud_sessions::StepStatus;
+    let ring = |alpha: f32| {
+        div()
+            .size(px(8.))
+            .m(px(2.))
+            .rounded_full()
+            .border_1()
+            .border_color(content(alpha))
+            .into_any_element()
+    };
+    let (mark, color, label_alpha): (gpui::AnyElement, _, f32) = match status {
+        StepStatus::Done => (
+            icon("check", 12.).text_color(rgb(GREEN)).into_any_element(),
+            content(0.8),
+            0.8,
+        ),
+        StepStatus::Running => (
+            spinner(SharedString::from(format!("{id}-spin")), "loader", 12.),
+            content(0.45),
+            1.,
+        ),
+        StepStatus::Failed => (
+            icon("alert-circle", 12.)
+                .text_color(danger_color())
+                .into_any_element(),
+            danger_color(),
+            1.,
+        ),
+        StepStatus::Pending => (ring(0.3), content(0.45), 0.45),
+        StepStatus::Skipped => (ring(0.15), content(0.3), 0.3),
+    };
+    let selector = id.clone();
+    div()
+        .id(id)
+        .debug_selector(move || selector.to_string())
+        .px_3()
+        .py(px(3.))
+        .flex()
+        .items_center()
+        .gap_2()
+        .text_size(px(12.))
+        .child(div().size(px(12.)).flex_shrink_0().child(mark))
+        .child(
+            div()
+                .min_w_0()
+                .flex_1()
+                .truncate()
+                .text_color(content(label_alpha))
+                .child(label.into()),
+        )
+        .when_some(note, |d, note| {
+            d.child(
+                div()
+                    .flex_shrink_0()
+                    .font_features(tabular())
+                    .text_size(px(11.))
+                    .text_color(color)
+                    .child(note),
+            )
+        })
+        .into_any_element()
 }
 
 /// The 7px dot of the queued note and the composer chip: amber and pulsing while the codespace

@@ -322,6 +322,10 @@ impl Conversation {
             return true;
         }
         match id {
+            "workspace:cloud-move" => {
+                cx.emit(ContinueInCloud);
+                true
+            }
             "workspace:cloud-codespace" => {
                 if self.cloud_menu_applies()
                     && !self.cloud_creating()
