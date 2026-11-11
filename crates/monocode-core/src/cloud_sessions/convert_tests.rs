@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
-const SESSION: &str = "5b0a3c1e-1111-4222-8333-444455556666";
+pub(super) const SESSION: &str = "5b0a3c1e-1111-4222-8333-444455556666";
 
-fn git(dir: &Path, args: &[&str]) -> String {
+pub(super) fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .current_dir(dir)
         .args([
@@ -33,13 +33,13 @@ fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 /// Runs scripts and copies against the local disk instead of a codespace.
-struct LocalGh {
-    home: PathBuf,
-    calls: Mutex<Vec<String>>,
-    fail_snapshot: Mutex<Option<String>>,
+pub(super) struct LocalGh {
+    pub(super) home: PathBuf,
+    pub(super) calls: Mutex<Vec<String>>,
+    pub(super) fail_snapshot: Mutex<Option<String>>,
 }
 impl LocalGh {
-    fn new(home: &Path) -> Arc<Self> {
+    pub(super) fn new(home: &Path) -> Arc<Self> {
         Arc::new(Self {
             home: home.into(),
             calls: Mutex::new(vec![]),
@@ -112,10 +112,10 @@ impl GhRunner for LocalGh {
     }
 }
 
-struct SyncHost {
-    machines: Vec<Machine>,
-    snapshot: Value,
-    log: Mutex<Vec<String>>,
+pub(super) struct SyncHost {
+    pub(super) machines: Vec<Machine>,
+    pub(super) snapshot: Value,
+    pub(super) log: Mutex<Vec<String>>,
 }
 impl Host for SyncHost {
     fn machines(&self) -> Result<Vec<Machine>, String> {
@@ -142,30 +142,30 @@ impl Host for SyncHost {
     }
 }
 
-struct World {
-    _dir: tempfile::TempDir,
-    root: PathBuf,
+pub(super) struct World {
+    pub(super) _dir: tempfile::TempDir,
+    pub(super) root: PathBuf,
     /// The "codespace" workspace.
-    ws: PathBuf,
+    pub(super) ws: PathBuf,
     /// The shared bare remote.
-    origin: PathBuf,
+    pub(super) origin: PathBuf,
     /// Claude config dir on this machine.
-    claude: PathBuf,
+    pub(super) claude: PathBuf,
     /// The local project folder (a clone of the origin).
-    project: PathBuf,
-    gh: Arc<LocalGh>,
-    host: Arc<SyncHost>,
-    svc: CloudSessions,
-    cloud_id: i64,
+    pub(super) project: PathBuf,
+    pub(super) gh: Arc<LocalGh>,
+    pub(super) host: Arc<SyncHost>,
+    pub(super) svc: CloudSessions,
+    pub(super) cloud_id: i64,
 }
 
-fn world(ran_claude: bool) -> World {
+pub(super) fn world(ran_claude: bool) -> World {
     world_with(ran_claude, false, true)
 }
 
 /// `worktree`: the host session runs in its own git worktree. `extras`: a second branch with
 /// work, a stash and ignored files.
-fn world_with(ran_claude: bool, worktree: bool, extras: bool) -> World {
+pub(super) fn world_with(ran_claude: bool, worktree: bool, extras: bool) -> World {
     let dir = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(dir.path()).unwrap();
     let origin = root.join("origin.git");
