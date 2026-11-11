@@ -1496,6 +1496,7 @@ impl Shell {
             this.order.push(summary.id);
             this.session_summaries.insert(summary.id, summary);
         }
+        this.publish_kit_prefs();
         this.resume_cloud_starts(cx);
         this.init_mobile_host(cx);
         if let Some(id) = this.workspace.active {

@@ -361,6 +361,46 @@ mod links {
     }
 
     #[test]
+    fn links_inside_a_skill_keep_their_own_names_in_the_tar() {
+        let env = env();
+        let dir = skill(&env, "review", "# review");
+        write(&dir.join("shared/docs/a.md"), "doc a");
+        symlink("SKILL.md", dir.join("README.md")).unwrap();
+        symlink("shared/docs", dir.join("docs")).unwrap();
+        let packed = pack_env(&env, &all_present());
+        assert_eq!(packed.skills, ["review"], "{:?}", packed.warnings);
+        let tar = read_tar(&packed);
+        let paths: Vec<&str> = tar.keys().map(String::as_str).collect();
+        // The file link and the folder link exist under their own names, with the bytes of
+        // their targets, and the targets are there as well.
+        for want in [
+            "skills/review/SKILL.md",
+            "skills/review/README.md",
+            "skills/review/shared/docs/a.md",
+            "skills/review/docs/a.md",
+        ] {
+            assert!(paths.contains(&want), "{want} missing in {paths:?}");
+        }
+        assert_eq!(tar["skills/review/README.md"].4, b"# review");
+        assert_eq!(tar["skills/review/docs/a.md"].4, b"doc a");
+    }
+
+    #[test]
+    fn a_link_to_a_folder_that_contains_it_ends_the_walk() {
+        let env = env();
+        let dir = skill(&env, "review", "# review");
+        symlink(".", dir.join("again")).unwrap();
+        let packed = pack_env(&env, &all_present());
+        assert_eq!(packed.skills, ["review"]);
+        let tar = read_tar(&packed);
+        assert!(
+            !tar.keys().any(|p| p.contains("again/again")),
+            "{:?}",
+            tar.keys()
+        );
+    }
+
+    #[test]
     fn a_file_swapped_for_a_link_after_the_scan_is_refused() {
         let env = env();
         let dir = skill(&env, "review", "# review");
@@ -433,6 +473,7 @@ mod links {
         inventory.skills[0].files.push(KitFile {
             path: private.clone(),
             id: None,
+            name: "stolen.txt".into(),
         });
         let packed = pack(&inventory, &env.roots, &on(), &all_present()).unwrap();
         assert!(packed.skills.is_empty());
@@ -454,6 +495,7 @@ mod links {
         inventory.skills[0].files.push(KitFile {
             path: big,
             id: None,
+            name: "big.bin".into(),
         });
         let packed = pack(&inventory, &env.roots, &on(), &all_present()).unwrap();
         assert!(packed.skills.is_empty());
@@ -503,4 +545,119 @@ fn an_empty_selection_packs_nothing() {
     let env = env();
     let packed = pack_env(&env, &all_present());
     assert!(packed.is_empty());
+}
+
+#[test]
+fn a_server_with_a_headers_helper_is_not_sent() {
+    let env = env();
+    servers(
+        &env,
+        json!({
+            "helper": {"type": "http", "url": "https://h.example/mcp", "headersHelper": "my-helper"},
+            "fine": {"command": "npx"},
+        }),
+    );
+    let packed = pack_env(&env, &all_present());
+    let names: Vec<_> = packed.servers.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["fine"]);
+    assert!(packed
+        .warnings
+        .iter()
+        .any(|w| w.contains("helper") && w.contains("headers helper")));
+}
+
+#[test]
+fn a_reference_mixed_into_text_is_sent_literally_with_a_warning() {
+    let env = env();
+    servers(
+        &env,
+        json!({"mixed": {"command": "npx", "env": {"HOME_DIR": "${HOME}/x", "DEF": "${X:-d}", "OK": "${PURE}"}}}),
+    );
+    let packed = pack_env(&env, &all_present());
+    let names: Vec<_> = packed.secrets.iter().map(|s| s.0.as_str()).collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+    let warned = packed
+        .warnings
+        .iter()
+        .filter(|w| w.contains("variable reference"))
+        .count();
+    assert_eq!(warned, 2, "{:?}", packed.warnings);
+    // A lone reference is still left alone.
+    assert_eq!(
+        mcp_json(&packed)["mcpServers"]["mixed"]["env"]["OK"],
+        "${PURE}"
+    );
+}
+
+#[test]
+fn url_secrets_are_tracked_by_name_even_when_the_name_was_made_unique() {
+    let env = env();
+    servers(
+        &env,
+        json!({
+            "a-b": {"type": "http", "url": format!("https://q.example/a?key={FAKE_QUERY}")},
+            "a_b": {"type": "http", "url": "https://q.example/b?key=other-query-9999"},
+        }),
+    );
+    let packed = pack_env(&env, &all_present());
+    assert_eq!(packed.secrets.len(), 2);
+    assert_eq!(packed.url_secrets.len(), 2);
+    for (name, _) in &packed.secrets {
+        assert!(packed.url_secrets.contains(name), "{name}");
+    }
+}
+
+#[test]
+fn token_looking_parts_of_args_and_urls_are_collected_for_the_scrub() {
+    let env = env();
+    servers(
+        &env,
+        json!({
+            "tool": {"command": "npx", "args": ["-y", "@scope/pkg", "--key=argvalue-EEEE5555", "tokenmix1234567890ABCD", "${REF}"]},
+            "path": {"type": "http", "url": "https://p.example/mcp/pathtoken1234567890XYZ"},
+        }),
+    );
+    let packed = pack_env(&env, &all_present());
+    let extra: Vec<&str> = packed.scrub_extra.iter().map(|s| s.as_str()).collect();
+    for want in [
+        "argvalue-EEEE5555",
+        "tokenmix1234567890ABCD",
+        "pathtoken1234567890XYZ",
+    ] {
+        assert!(extra.contains(&want), "{want} not in {extra:?}");
+    }
+    // Plain words stay out, so the log stays readable.
+    for plain in ["-y", "@scope/pkg", "${REF}", "npx"] {
+        assert!(!extra.contains(&plain), "{plain}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn files_that_differ_only_in_case_are_refused() {
+    let env = env();
+    let dir = skill(&env, "review", "# review");
+    write(&dir.join("one.txt"), "one");
+    write(&dir.join("two.txt"), "two");
+    let mut inventory = build_inventory(&env.roots, Workspace::Codespace);
+    let real = std::fs::canonicalize(&dir).unwrap();
+    let files = &mut inventory.skills[0].files;
+    files.clear();
+    files.push(KitFile {
+        path: real.join("one.txt"),
+        id: None,
+        name: "Notes.md".into(),
+    });
+    files.push(KitFile {
+        path: real.join("two.txt"),
+        id: None,
+        name: "notes.md".into(),
+    });
+    let packed = pack(&inventory, &env.roots, &on(), &all_present()).unwrap();
+    assert!(packed.skills.is_empty());
+    assert!(
+        packed.warnings.iter().any(|w| w.contains("letter case")),
+        "{:?}",
+        packed.warnings
+    );
 }

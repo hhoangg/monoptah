@@ -63,7 +63,7 @@ fn seams(home: &Home, prefs: CloudKitPrefs) -> KitSeams {
     let roots = home.roots.clone();
     KitSeams {
         prefs: Arc::new(move || prefs.clone()),
-        roots: Arc::new(move |_| Ok(roots.clone())),
+        roots: Arc::new(move |_, _| Ok(roots.clone())),
     }
 }
 
@@ -423,6 +423,7 @@ fn run_step(f: &Fx, home: &Home, workspace: Workspace) -> claude_setup::SetupSta
         prefs: on(),
         workspace,
         replace_secrets: false,
+        account: None,
     };
     let cloud = CloudRef::codespace("octo-new1");
     claude_setup::run(
@@ -517,7 +518,7 @@ fn health_comes_from_the_host_list_or_the_raw_output() {
             "connected".to_string(),
             SIGN_IN_LABEL.to_string(),
             APPROVAL_LABEL.to_string(),
-            "failed - npx: not found".to_string(),
+            "failed - command not found".to_string(),
         ]
     );
     assert!(servers[3].is_problem() && !servers[1].is_problem());
@@ -637,6 +638,7 @@ fn a_halted_setup_is_not_recorded_as_done_so_a_retry_runs_it() {
             prefs: on(),
             workspace: Workspace::Codespace,
             replace_secrets: false,
+            account: None,
         }),
     };
     let mut steps = vec![];
@@ -699,4 +701,345 @@ fn a_secret_too_short_to_mask_hides_host_text_instead_of_trusting_the_scrub() {
     seen.push_str(&serde_json::to_string(&state(&f)).unwrap());
     assert!(!seen.contains("xy1"), "{seen}");
     assert!(seen.contains("too short to mask"));
+}
+
+// ---- review round 2
+
+use std::collections::BTreeSet;
+use std::sync::atomic::Ordering;
+
+fn run_step_with(
+    f: &Fx,
+    home: &Home,
+    workspace: Workspace,
+    halt: &AtomicBool,
+    replace_secrets: bool,
+    prefs: CloudKitPrefs,
+) -> claude_setup::SetupState {
+    if f.host.machines.lock().unwrap().is_empty() {
+        f.host.machines.lock().unwrap().push(machine("octo-new1"));
+    }
+    let plan = SetupPlan {
+        seams: seams(home, prefs.clone()),
+        prefs,
+        workspace,
+        replace_secrets,
+        account: None,
+    };
+    let cloud = CloudRef::codespace("octo-new1");
+    claude_setup::run(
+        &claude_setup::Env {
+            host: &*f.host,
+            store: &f.store,
+            halt,
+            now: 1,
+        },
+        &claude_setup::Target {
+            local_project: "/p",
+            cloud: &cloud,
+            machine_id: "m-octo-new1",
+            project_id: Some("project-1"),
+        },
+        &plan,
+        &mut |_| {},
+    )
+}
+
+#[test]
+fn every_host_method_the_step_uses_passes_the_real_remote_allowlist() {
+    let home = home();
+    let f = kit_fx(&home, on());
+    let (session, _) = f.svc.begin_start("/p", new_target(), "claude").unwrap();
+    f.run(session.id).0.unwrap();
+    let methods: BTreeSet<String> = kit(&f, |k| k.methods.iter().cloned().collect());
+    for needed in [
+        "kit.probe",
+        "kit.apply",
+        "kit.secrets",
+        "kit.health",
+        "uploads.begin",
+        "uploads.chunk",
+        "uploads.commit",
+        "uploads.discard",
+    ] {
+        assert!(methods.contains(needed), "the step never called {needed}");
+    }
+    // `Connections::request_timeout` refuses everything outside this list, so a fake Host that
+    // skips it must not be the only thing that proves the step runs.
+    for method in methods {
+        assert!(
+            crate::remote::supported_remote_method(&method),
+            "{method} would be refused as an unsupported remote operation"
+        );
+    }
+}
+
+#[test]
+fn long_host_calls_get_their_own_limits() {
+    let home = home();
+    let f = kit_fx(&home, on());
+    let (session, _) = f.svc.begin_start("/p", new_target(), "claude").unwrap();
+    f.run(session.id).0.unwrap();
+    let limit = |method: &str| {
+        kit(&f, |k| {
+            k.timeouts
+                .iter()
+                .find(|(m, _)| m == method)
+                .map(|(_, t)| *t)
+                .unwrap_or_else(|| panic!("{method} was not sent through request_timeout"))
+        })
+    };
+    assert_eq!(limit("kit.health"), Some(Duration::from_secs(75)));
+    assert_eq!(limit("kit.apply"), Some(Duration::from_secs(120)));
+    assert_eq!(limit("kit.secrets"), Some(Duration::from_secs(30)));
+    assert_eq!(limit("kit.probe"), None);
+}
+
+#[test]
+fn a_halt_after_the_upload_sends_no_secrets_and_stores_nothing() {
+    let home = home();
+    for halt_on in ["uploads.commit", "kit.apply"] {
+        let f = kit_fx(&home, on());
+        let halt = Arc::new(AtomicBool::new(false));
+        let flag = halt.clone();
+        script(&f, |k| {
+            k.on_call.push((
+                halt_on,
+                Arc::new(move || flag.store(true, Ordering::SeqCst)),
+            ))
+        });
+        run_step_with(&f, &home, Workspace::Codespace, &halt, false, on());
+        let methods = kit(&f, |k| k.methods.clone());
+        assert!(
+            !methods.iter().any(|m| m == "kit.secrets"),
+            "{halt_on}: {methods:?}"
+        );
+        assert!(
+            !methods.iter().any(|m| m == "kit.health"),
+            "{halt_on}: {methods:?}"
+        );
+        // Halted before the apply: it is not installed either.
+        if halt_on == "uploads.commit" {
+            assert!(!methods.iter().any(|m| m == "kit.apply"), "{methods:?}");
+        }
+        // Nothing is stored: a deleted workspace's state is not brought back.
+        assert!(f
+            .svc
+            .claude_setup_state(&CloudRef::codespace("octo-new1"))
+            .is_none());
+    }
+}
+
+#[test]
+fn a_failed_update_keeps_the_last_good_result_and_says_why() {
+    let home = home();
+    let f = kit_fx(&home, on());
+    let (session, _) = f.svc.begin_start("/p", new_target(), "claude").unwrap();
+    f.run(session.id).0.unwrap();
+    let good = state(&f);
+    assert!(good.applied && good.failure.is_none());
+    script(&f, |k| k.errors.push(("kit.apply", "disk full".into())));
+    let kept = f
+        .svc
+        .update_claude_setup(session.id, &AtomicBool::new(false), &mut |_| {})
+        .unwrap();
+    assert!(kept.applied);
+    assert_eq!(kept.health, good.health);
+    assert_eq!(kept.summary, good.summary);
+    let why = kept.failure.clone().expect("the failure is recorded");
+    assert!(why.contains("install"), "{why}");
+    assert_eq!(state(&f), kept);
+    // A later good update clears it.
+    script(&f, |k| k.errors.clear());
+    let again = f
+        .svc
+        .update_claude_setup(session.id, &AtomicBool::new(false), &mut |_| {})
+        .unwrap();
+    assert!(again.failure.is_none());
+}
+
+#[test]
+fn an_update_never_wakes_a_codespace() {
+    let home = home();
+    let f = kit_fx(&home, on());
+    let (session, _) = f.svc.begin_start("/p", new_target(), "claude").unwrap();
+    f.run(session.id).0.unwrap();
+    let ensures = |f: &Fx| {
+        f.host
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.starts_with("ensure"))
+            .count()
+    };
+    f.svc
+        .update_claude_setup(session.id, &AtomicBool::new(false), &mut |_| {})
+        .unwrap();
+    assert_eq!(ensures(&f), 0);
+}
+
+#[test]
+fn an_update_with_nothing_selected_removes_what_was_sent() {
+    let home = home();
+    let f = kit_fx(&home, on());
+    let (session, _) = f.svc.begin_start("/p", new_target(), "claude").unwrap();
+    f.run(session.id).0.unwrap();
+    assert_eq!(kit(&f, |k| k.secrets.len()), 1);
+    let nothing = CloudKitPrefs {
+        enabled: true,
+        notice_acknowledged: true,
+        selection: Some(BTreeSet::new()),
+    };
+    let off = f.svc.with_kit_seams(seams(&home, nothing));
+    let updated = off
+        .update_claude_setup(session.id, &AtomicBool::new(false), &mut |_| {})
+        .unwrap();
+    assert!(updated.applied);
+    assert!(updated.summary.contains("removed"), "{}", updated.summary);
+    // An empty kit was installed and the secrets file was replaced by an empty set.
+    let (applied, secrets) = {
+        let guard = f.host.kit.lock().unwrap();
+        let k = guard.as_ref().unwrap();
+        (k.applied.clone(), k.secrets.clone())
+    };
+    assert_eq!(applied.len(), 2);
+    assert!(tar_paths(applied.last().unwrap()).is_empty());
+    assert_eq!(secrets.last().unwrap(), &json!({}));
+}
+
+#[test]
+fn health_text_is_reduced_to_a_status_and_a_generic_reason() {
+    let home = home();
+    let f = kit_fx(&home, on());
+    script(&f, |k| {
+        k.health = json!({"kitServers": true, "timedOut": false, "exitCode": 0, "servers": [
+            // A Host from before the fix returns the whole line after the name.
+            {"name": "github", "status": "failed", "signInNeeded": false, "transport": "stdio",
+             "detail": "npx server --token=ghp_leakedtoken1234 - \u{2718} Failed to connect"},
+            {"name": "site", "status": "failed", "signInNeeded": false, "transport": "http",
+             "detail": "https://site.example/mcp/abcdef0123456789abcdef (HTTP) - connection refused"},
+        ]});
+    });
+    let (session, _) = f.svc.begin_start("/p", new_target(), "claude").unwrap();
+    let (result, events) = f.run(session.id);
+    result.unwrap();
+    let stored = state(&f);
+    let health = |name: &str| {
+        stored
+            .health
+            .iter()
+            .find(|h| h.name == name)
+            .unwrap()
+            .label()
+    };
+    assert_eq!(health("github"), "failed - could not connect");
+    assert_eq!(health("site"), "failed - could not connect");
+    let mut seen = all_text(&events);
+    seen.push_str(&serde_json::to_string(&stored).unwrap());
+    let store = f.store.lock().unwrap();
+    for key in ["cloud-claude-setup.v1", "cloud-starts.v1"] {
+        seen.push_str(&store.setting(key).unwrap().unwrap_or_default());
+    }
+    for leaked in [
+        "ghp_leakedtoken1234",
+        "abcdef0123456789abcdef",
+        "npx server",
+    ] {
+        assert!(!seen.contains(leaked), "{leaked} leaked");
+    }
+}
+
+#[test]
+fn token_looking_arguments_and_url_paths_are_scrubbed_from_host_errors() {
+    let home = home();
+    write(
+        &home.roots.home.join(".claude.json"),
+        &json!({"mcpServers": {
+            "tool": {"command": "npx", "args": ["-y", "pkg", "--api-key=argvalue-EEEE5555", "tokenmix1234567890ABCD"]},
+            "path": {"type": "http", "url": "https://p.example/mcp/pathtoken1234567890XYZ"},
+        }})
+        .to_string(),
+    );
+    let f = kit_fx(&home, on());
+    script(&f, |k| {
+        k.apply_warnings = vec![
+            "ran --api-key=argvalue-EEEE5555".into(),
+            "saw tokenmix1234567890ABCD".into(),
+            "at /mcp/pathtoken1234567890XYZ".into(),
+        ];
+    });
+    let (session, _) = f.svc.begin_start("/p", new_target(), "claude").unwrap();
+    f.run(session.id).0.unwrap();
+    let text = serde_json::to_string(&state(&f)).unwrap();
+    for leaked in [
+        "argvalue-EEEE5555",
+        "tokenmix1234567890ABCD",
+        "pathtoken1234567890XYZ",
+    ] {
+        assert!(!text.contains(leaked), "{leaked} leaked: {text}");
+    }
+    // Ordinary words stay readable.
+    assert!(text.contains("[redacted]"));
+}
+
+#[test]
+fn a_predating_record_stays_skipped_across_a_rebuild() {
+    let f = fx(Gh::new(&["Available"], &[]));
+    f.store
+        .lock()
+        .unwrap()
+        .save_setting("cloud-starts.v1", &format!("{{\"4\":{OLD_START_RECORD}}}"))
+        .unwrap();
+    let rebuilt = f.svc.rebuild_start(4).unwrap();
+    assert!(rebuilt.step(StepKind::ClaudeSetup).predates());
+    assert!(f.svc.setup_plan(&rebuilt).is_none());
+    // A record of the new format legitimately sends again after a rebuild.
+    let (_, fresh) = f.svc.begin_start("/p", new_target(), "claude").unwrap();
+    let rebuilt = f.svc.rebuild_start(fresh.session_id).unwrap();
+    assert!(!rebuilt.step(StepKind::ClaudeSetup).predates());
+}
+
+#[test]
+fn the_setup_chip_wins_while_the_project_is_still_being_opened() {
+    let mut record = fresh_record();
+    record.step_mut(StepKind::OpenProject).status = StepStatus::Running;
+    assert_eq!(record.current(), Some(StepKind::OpenProject));
+    record.step_mut(StepKind::ClaudeSetup).status = StepStatus::Running;
+    assert_eq!(record.current(), Some(StepKind::ClaudeSetup));
+    assert_eq!(StepKind::ClaudeSetup.running_label(), "Setting up Claude");
+}
+
+#[test]
+fn the_setup_reads_the_claude_account_the_project_uses() {
+    use crate::provider::Kind;
+    let home = home();
+    let mut f = kit_fx(&home, on());
+    let profiles: Arc<Mutex<Vec<String>>> = Default::default();
+    let seen = profiles.clone();
+    let roots = home.roots.clone();
+    let prefs = on();
+    f.svc = f.svc.with_kit_seams(KitSeams {
+        prefs: Arc::new(move || prefs.clone()),
+        roots: Arc::new(move |_, profile| {
+            seen.lock().unwrap().push(profile.id.clone());
+            Ok(roots.clone())
+        }),
+    });
+    let work = {
+        let store = f.store.lock().unwrap();
+        let mut book = store.provider_accounts().unwrap();
+        let work = book.add(Kind::Claude, "Work").unwrap();
+        book.select(Kind::Claude, "/p", &work.id).unwrap();
+        store.save_provider_accounts(&book).unwrap();
+        work
+    };
+    let (session, _) = f.svc.begin_start("/p", new_target(), "claude").unwrap();
+    f.run(session.id).0.unwrap();
+    assert_eq!(profiles.lock().unwrap().first(), Some(&work.id));
+    // The panel's change check reads the same account.
+    profiles.lock().unwrap().clear();
+    let default = f.svc.claude_setup_view(session.id);
+    assert!(default.is_some());
+    assert_eq!(profiles.lock().unwrap().first(), Some(&work.id));
 }

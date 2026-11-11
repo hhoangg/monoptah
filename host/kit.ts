@@ -688,7 +688,7 @@ export interface KitServerHealth {
   signInNeeded: boolean;
   /** From the kit's mcp.json; "unknown" when the server is not in the kit. */
   transport: "stdio" | "http" | "sse" | "unknown";
-  /** The status line after the name, scrubbed. */
+  /** The status after the last " - " of the line (never the command or URL), scrubbed. */
   detail: string;
 }
 
@@ -733,7 +733,11 @@ export function parseHealth(
     if (at <= 0) continue;
     const name = line.slice(0, at).trim();
     if (!SERVER_LINE_NAME.test(name)) continue;
-    const detail = line.slice(at + 2).trim();
+    // Only the STATUS after the last " - ": what precedes it is the server's command,
+    // arguments or URL, which can hold a credential and must not leave the Host.
+    const rest = line.slice(at + 2).trim();
+    const cut = rest.lastIndexOf(" - ");
+    const detail = cut < 0 ? "" : rest.slice(cut + 3).trim();
     const status = classifyHealth(detail);
     out.push({
       name,

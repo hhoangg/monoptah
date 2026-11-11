@@ -42,23 +42,46 @@ pub fn key_unavailable_note(inventory: &KitInventory) -> Option<&'static str> {
     inventory.key_unavailable.then_some(KEY_UNAVAILABLE_NOTE)
 }
 
-static PUBLISHED: std::sync::Mutex<Option<CloudKitPrefs>> = std::sync::Mutex::new(None);
+/// Where the app publishes the preferences. The process has one ([`publish`] and
+/// [`published`]); a test makes its own so it never touches the shared one.
+pub struct PrefsSlot(std::sync::Mutex<Option<CloudKitPrefs>>);
+
+impl PrefsSlot {
+    pub const fn new() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+    pub fn publish(&self, prefs: CloudKitPrefs) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(prefs);
+        }
+    }
+    /// The last published preferences; the defaults (kit off) before any were published.
+    pub fn get(&self) -> CloudKitPrefs {
+        self.0
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_default()
+    }
+}
+
+impl Default for PrefsSlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+static PUBLISHED: PrefsSlot = PrefsSlot::new();
 
 /// The app publishes the preferences here whenever they change, so code that runs without
 /// the UI (a start on a worker, the app API) reads the same choice the user made.
 pub fn publish(prefs: CloudKitPrefs) {
-    if let Ok(mut slot) = PUBLISHED.lock() {
-        *slot = Some(prefs);
-    }
+    PUBLISHED.publish(prefs);
 }
 
 /// The last published preferences; the defaults (kit off) before the app published any.
 pub fn published() -> CloudKitPrefs {
-    PUBLISHED
-        .lock()
-        .ok()
-        .and_then(|slot| slot.clone())
-        .unwrap_or_default()
+    PUBLISHED.get()
 }
 
 /// The global preferences entry `cloudKit`.

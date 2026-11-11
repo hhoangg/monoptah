@@ -46,9 +46,10 @@ impl Shell {
         }
         let slots = self.claude_setups.borrow();
         let slot = slots.get(&key)?;
+        let connected = self.panel_link(cx) == crate::panel_root::Link::Connected;
         slot.view
             .as_ref()
-            .map(|view| SetupStrip::of(view, slot.updating, slot.error.clone()))
+            .map(|view| SetupStrip::of(view, slot.updating, slot.error.clone(), connected))
     }
 
     /// Reads the stored result on a worker and shows it.

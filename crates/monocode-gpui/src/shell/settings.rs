@@ -433,6 +433,17 @@ impl Shell {
             monos.update(cx, |monos, cx| monos.sweep_auto_resume(cx));
         }
     }
+    /// Starts that run on a worker, and the app API, read the Claude setup choice from the
+    /// published copy. It must be there BEFORE a resumed start runs, or that start would read
+    /// the default (off) and skip the step for good. Tests do not publish: the slot is
+    /// process-wide, and one test's choice must not reach another's service.
+    pub(super) fn publish_kit_prefs(&self) {
+        #[cfg(not(test))]
+        monocode_core::cloud_sessions::kit_prefs::publish(
+            self.workspace.preferences.cloud_kit.clone(),
+        );
+    }
+
     pub(super) fn apply_preferences(&mut self, cx: &mut Context<Self>) {
         self.refresh_notification_permission();
         self.configure_quick_composer(cx);
@@ -462,10 +473,7 @@ impl Shell {
         // After the keymap, so the menu shows rebound shortcuts.
         crate::app_menu::install(&self.workspace.preferences, cx);
         cx.set_global(self.workspace.preferences.clone());
-        // Starts that run on a worker, and the app API, read the Claude setup choice here.
-        monocode_core::cloud_sessions::kit_prefs::publish(
-            self.workspace.preferences.cloud_kit.clone(),
-        );
+        self.publish_kit_prefs();
         self.sweep_auto_resume(cx);
         self.sync_right_panel(cx);
         if let Some(center) = crate::accounts::get(cx) {

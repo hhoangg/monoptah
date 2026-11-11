@@ -248,9 +248,18 @@ pub(crate) struct SetupStrip {
 
 impl SetupStrip {
     /// The block for a stored setup result. `updating` and `error` belong to the Update action.
-    pub(crate) fn of(view: &SetupView, updating: bool, error: Option<String>) -> Self {
+    /// `connected` is whether the workspace has a live connection: Update never wakes it, so
+    /// it is on offer only then. A failed earlier update shows as the error.
+    pub(crate) fn of(
+        view: &SetupView,
+        updating: bool,
+        error: Option<String>,
+        connected: bool,
+    ) -> Self {
         Self {
-            summary: if view.state.summary.is_empty() {
+            summary: if !view.state.applied {
+                "not installed, see the warnings".into()
+            } else if view.state.summary.is_empty() {
                 "nothing was sent".into()
             } else {
                 view.state.summary.clone()
@@ -275,9 +284,9 @@ impl SetupStrip {
                 .collect(),
             warnings: view.state.warnings.iter().take(4).cloned().collect(),
             changed: view.changed,
-            can_update: view.can_update,
+            can_update: view.can_update && connected,
             updating,
-            error,
+            error: error.or_else(|| view.state.failure.clone()),
         }
     }
 }
@@ -529,5 +538,44 @@ mod tests {
 
         let plain = resolve(None, PanelMode::Cloud, false, "/o");
         assert_eq!(Chrome::of(&plain, Link::Connected, true), None);
+    }
+
+    #[test]
+    fn the_setup_strip_offers_update_only_when_connected_and_shows_a_failed_update() {
+        use monocode_core::cloud_sessions::claude_setup::{SetupState, SetupView};
+        let mut state: SetupState = serde_json::from_value(serde_json::json!({
+            "atMs": 1, "applied": true, "summary": "1 skill", "health": [], "warnings": []
+        }))
+        .unwrap();
+        let view = |state: SetupState, can_update| SetupView {
+            cloud: cloud(),
+            state,
+            changed: false,
+            can_update,
+        };
+        let on = SetupStrip::of(&view(state.clone(), true), false, None, true);
+        assert!(on.can_update && on.error.is_none());
+        // Update never wakes a workspace: not connected, not on offer.
+        let off = SetupStrip::of(&view(state.clone(), true), false, None, false);
+        assert!(!off.can_update);
+        // The kit being off in Settings also removes it.
+        assert!(!SetupStrip::of(&view(state.clone(), false), false, None, true).can_update);
+        // A failed update shows next to the last good result.
+        state.failure = Some("The workspace could not install the Claude setup.".into());
+        let failed = SetupStrip::of(&view(state.clone(), true), false, None, true);
+        assert_eq!(failed.summary, "1 skill");
+        assert!(
+            failed
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("install"))
+        );
+        // A setup that never installed says so instead of listing what was meant to go.
+        state.applied = false;
+        assert!(
+            SetupStrip::of(&view(state, true), false, None, true)
+                .summary
+                .contains("not installed")
+        );
     }
 }

@@ -55,6 +55,14 @@ const MAX_DEPTH: usize = 24;
 /// Prefix of every secret name; the Host accepts `MONOPTAH_KIT_[A-Z0-9_]{1,128}`.
 pub const SECRET_PREFIX: &str = "MONOPTAH_KIT_";
 const MAX_SECRET_TAIL: usize = 128;
+/// Entries added after the items: `kit.json`, `mcp.json`, `skills/` and `plugins/`.
+const EXTRA_ENTRIES: usize = 4;
+
+/// The key the Host compares paths by: NFC and lower case.
+fn fold(path: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    path.nfc().collect::<String>().to_lowercase()
+}
 
 /// Commands asked of `kit.probe`, in the order of the design.
 pub const PROBE_COMMANDS: [&str; 6] = ["npx", "uvx", "bunx", "node", "python3", "docker"];
@@ -129,6 +137,11 @@ pub struct Packed {
     pub size: u64,
     /// `(name, value)` for `kit.secrets`. Values are wiped on drop.
     pub secrets: Vec<(String, Zeroizing<String>)>,
+    /// Names in `secrets` whose value is a whole URL (userinfo, query or fragment).
+    pub url_secrets: BTreeSet<String>,
+    /// More text to keep out of logs: token-looking parts of `args`, `command` and URL paths
+    /// of the servers that are sent. Wiped on drop.
+    pub scrub_extra: Vec<Zeroizing<String>>,
     /// Things the user should know: dropped items and doubts. Never a secret value.
     pub warnings: Vec<String>,
     pub skills: Vec<String>,
@@ -157,6 +170,7 @@ impl fmt::Debug for Packed {
             .field("sha256", &self.sha256)
             .field("size", &self.size)
             .field("secrets", &self.secrets.len())
+            .field("scrub_extra", &self.scrub_extra.len())
             .field("skills", &self.skills)
             .field("plugins", &self.plugins)
             .field("servers", &self.servers)
@@ -268,9 +282,9 @@ pub fn pack(
                 ));
                 continue;
             }
-            if !ids.insert(plugin.id.clone()) {
+            if !ids.insert(fold(&plugin.id)) {
                 warnings.push(format!(
-                    "Plugin \"{}\" was not sent twice: another copy with the same id is.",
+                    "Plugin \"{}\" was not sent: another plugin whose id differs only in letter case is.",
                     plugin.id
                 ));
                 continue;
@@ -352,6 +366,8 @@ pub fn pack(
         sha256,
         size,
         secrets: mcp.secrets,
+        url_secrets: mcp.url_secrets,
+        scrub_extra: mcp.scrub_extra,
         warnings,
         skills,
         plugins,
@@ -491,13 +507,11 @@ fn item_entries(
     let mut out = BTreeMap::new();
     out.insert(prefix.to_owned(), dir_entry());
     let mut bytes = 0u64;
+    let mut folded: BTreeSet<String> = BTreeSet::new();
     for file in files {
-        let relative = file
-            .path
-            .strip_prefix(&real_root)
-            .map_err(|_| "a file is outside the folder".to_string())?;
+        // The name inside the item, as the item itself names it (a link keeps its own name).
         let mut segments = Vec::new();
-        for component in relative.components() {
+        for component in file.name.components() {
             match component {
                 Component::Normal(part) => segments.push(
                     part.to_str()
@@ -525,6 +539,10 @@ fn item_entries(
             dir = format!("{dir}/{segment}");
             out.entry(dir.clone()).or_insert_with(dir_entry);
         }
+        // The Host folds case and normalizes Unicode when it checks for duplicates.
+        if !folded.insert(fold(&path)) {
+            return Err("two files differ only in letter case or Unicode form".into());
+        }
         if out
             .insert(
                 path,
@@ -538,7 +556,8 @@ fn item_entries(
         {
             return Err("two files have the same path".into());
         }
-        if used_entries + out.len() > MAX_TAR_ENTRIES {
+        // Room for kit.json, mcp.json, skills/ and plugins/, which are added later.
+        if used_entries + out.len() + EXTRA_ENTRIES > MAX_TAR_ENTRIES {
             return Err("it has too many files".into());
         }
     }
@@ -601,6 +620,74 @@ struct McpPart {
     config: Map<String, Value>,
     servers: Vec<PackedServer>,
     secrets: Vec<(String, Zeroizing<String>)>,
+    url_secrets: BTreeSet<String>,
+    scrub_extra: Vec<Zeroizing<String>>,
+}
+
+/// A config read for packing. Its strings are wiped when it goes out of scope, because it
+/// still holds the secret values.
+struct Wiped(Value);
+impl Drop for Wiped {
+    fn drop(&mut self) {
+        fn wipe(value: &mut Value) {
+            match value {
+                Value::String(text) => zeroize::Zeroize::zeroize(text),
+                Value::Array(items) => items.iter_mut().for_each(wipe),
+                Value::Object(map) => map.values_mut().for_each(wipe),
+                _ => {}
+            }
+        }
+        wipe(&mut self.0);
+    }
+}
+
+/// Parts of a server config that a tool may print back and that look like a credential:
+/// `KEY=value` values, long mixed tokens in `args` and `command`, and long mixed path
+/// segments of the URL. Short plain words ("-y", package names) are left alone.
+fn token_like_parts(object: &Map<String, Value>) -> Vec<String> {
+    fn tokenish(text: &str) -> bool {
+        text.len() >= 16
+            && !text.contains(['/', ' ', '$'])
+            && text.bytes().any(|b| b.is_ascii_digit())
+            && text.bytes().any(|b| b.is_ascii_alphabetic())
+    }
+    let mut out = Vec::new();
+    let mut consider = |text: &str| {
+        if text.contains("${") {
+            return;
+        }
+        if let Some((_, value)) = text.split_once('=') {
+            if value.len() >= 4 {
+                out.push(value.to_owned());
+            }
+        } else if tokenish(text) {
+            out.push(text.to_owned());
+        }
+    };
+    if let Some(command) = object.get("command").and_then(Value::as_str) {
+        consider(command);
+    }
+    for arg in object
+        .get("args")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        consider(arg);
+    }
+    if let Some(url) = object
+        .get("url")
+        .and_then(Value::as_str)
+        .and_then(|raw| url::Url::parse(raw).ok())
+    {
+        for segment in url.path_segments().into_iter().flatten() {
+            if tokenish(segment) {
+                out.push(segment.to_owned());
+            }
+        }
+    }
+    out
 }
 
 /// `API-key` -> `API_KEY`: upper case letters and digits, everything else one `_`.
@@ -635,7 +722,7 @@ fn secret_name(server: &str, field: &str, used: &mut BTreeSet<String>) -> String
 }
 
 /// The server's own entry in the config file it was found in, read again now.
-fn read_config(server: &super::kit::KitMcpServer, roots: &KitRoots) -> Option<Value> {
+fn read_config(server: &super::kit::KitMcpServer, roots: &KitRoots) -> Option<Wiped> {
     let json = crate::mcp::read_json(&server.config_path)?;
     let servers = match server.scope {
         McpScope::User => json.get("mcpServers"),
@@ -645,7 +732,7 @@ fn read_config(server: &super::kit::KitMcpServer, roots: &KitRoots) -> Option<Va
             .get("mcpServers"),
         McpScope::Project => None,
     }?;
-    servers.get(&server.name).cloned()
+    servers.get(&server.name).cloned().map(Wiped)
 }
 
 fn build_mcp(
@@ -673,6 +760,8 @@ fn build_mcp(
         config: Map::new(),
         servers: Vec::new(),
         secrets: Vec::new(),
+        url_secrets: BTreeSet::new(),
+        scrub_extra: Vec::new(),
     };
     let mut used = BTreeSet::new();
     for (name, server) in by_name {
@@ -697,12 +786,21 @@ fn build_mcp(
             ));
             continue;
         };
-        let Some(object) = config.as_object() else {
+        let config = config;
+        let Some(object) = config.0.as_object() else {
             continue;
         };
+        // A header helper is a local program that prints headers: it cannot run on the
+        // workspace and there is no broker for it (D7).
+        if object.contains_key("headersHelper") {
+            warnings.push(format!(
+                "MCP server \"{name}\" was not sent: it uses a headers helper program, which cannot run in the workspace."
+            ));
+            continue;
+        }
         let fresh = find_secrets(object);
         let mut canonical = String::new();
-        canonical_json(&mask_secrets(&config, &fresh), &mut canonical);
+        canonical_json(&mask_secrets(&config.0, &fresh), &mut canonical);
         if digest_str(&[&canonical]) != server.config_hash {
             warnings.push(format!(
                 "MCP server \"{name}\" was not sent: its configuration changed after it was scanned."
@@ -721,6 +819,16 @@ fn build_mcp(
                 | SecretLocation::UrlFragment => (None, "url", "URL".to_owned()),
             };
             let secret = secret_name(name, &label, &mut used);
+            // `${HOME}/x` or `${X:-d}` mixed into text is not expanded as a whole value the
+            // way a lone reference is: it travels literally.
+            if field.value.expose().contains("${") {
+                warnings.push(format!(
+                    "MCP server \"{name}\": a value contains a variable reference inside other text, so it is sent as written and not expanded in the workspace."
+                ));
+            }
+            if group.is_none() {
+                part.url_secrets.insert(secret.clone());
+            }
             let reference = Value::String(format!("${{{secret}}}"));
             match group {
                 Some(group) => {
@@ -735,6 +843,8 @@ fn build_mcp(
             part.secrets
                 .push((secret, Zeroizing::new(field.value.expose().to_owned())));
         }
+        part.scrub_extra
+            .extend(token_like_parts(object).into_iter().map(Zeroizing::new));
         part.config.insert(name.to_owned(), Value::Object(out));
         let mut hosts: Vec<String> = object
             .get("url")

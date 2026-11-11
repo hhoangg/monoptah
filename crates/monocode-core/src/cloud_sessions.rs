@@ -454,6 +454,18 @@ pub trait Host: Send + Sync {
         progress: &mut dyn FnMut(&str),
     ) -> Result<(), String>;
     fn request(&self, machine_id: &str, method: &str, params: Value) -> Result<Value, String>;
+    /// [`Self::request`] with a limit for a long operation (`None` = the default). Never wakes
+    /// anything. The default ignores the limit.
+    fn request_timeout(
+        &self,
+        machine_id: &str,
+        method: &str,
+        params: Value,
+        timeout: Option<Duration>,
+    ) -> Result<Value, String> {
+        let _ = timeout;
+        self.request(machine_id, method, params)
+    }
     /// Flavor, version and capabilities of the machine's Host. The default asks the Host
     /// (`environment.describe`); [`Connections`] answers from its cache once it has one.
     fn host_info(&self, machine_id: &str) -> Result<crate::remote::host_info::HostInfo, String> {
@@ -517,6 +529,15 @@ impl Host for Arc<Connections> {
     }
     fn request(&self, machine_id: &str, method: &str, params: Value) -> Result<Value, String> {
         Connections::request(self, machine_id, method, params)
+    }
+    fn request_timeout(
+        &self,
+        machine_id: &str,
+        method: &str,
+        params: Value,
+        timeout: Option<Duration>,
+    ) -> Result<Value, String> {
+        Connections::request_timeout(self, machine_id, method, params, timeout)
     }
     fn host_info(&self, machine_id: &str) -> Result<crate::remote::host_info::HostInfo, String> {
         match Connections::host_info(self, machine_id) {

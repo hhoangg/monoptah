@@ -135,8 +135,12 @@ pub enum SkillScope {
 /// checking each is still the same plain file (design 3.7).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct KitFile {
+    /// The canonical path the bytes are read from (inside the item root).
     pub path: PathBuf,
     pub id: Option<(u64, u64)>,
+    /// Where the file sits in the item AS NAMED, relative to the item root: a file reached
+    /// through a link inside the item keeps the link's own name, not its target's.
+    pub name: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -798,7 +802,8 @@ fn kube_has_config(dir: &Path) -> bool {
 /// - Links INSIDE the item (its content) must resolve inside the item's own canonical
 ///   root. Anything else, even a path under `$HOME` or the project, excludes the whole
 ///   item with [`Exclusion::LinkLeavesItem`], so `creds -> ~/.aws` never travels.
-/// - Dead links are skipped, and link loops end through the visited set.
+/// - Dead links are skipped. A link loop is cut where a folder would contain itself; a folder
+///   reachable under two names (a link inside the item) is listed under both.
 fn scan_item(root: &Path, kind: ItemKind, home: &Path, started: Clock<'_>) -> Scan {
     let mut scan = Scan {
         files: Vec::new(),
@@ -848,11 +853,14 @@ fn scan_item(root: &Path, kind: ItemKind, home: &Path, started: Clock<'_>) -> Sc
     if kind == ItemKind::Plugin && (root.join("bin").exists() || root.join(".lsp.json").exists()) {
         scan.has_native = true;
     }
+    // The folders on the way down, so a link to an ancestor ends the walk but a folder
+    // that is merely reachable twice is listed under both names.
     let mut visited: HashSet<PathBuf> = HashSet::new();
     visited.insert(real_root.clone());
     let mut entries = 0usize;
     walk(
         &real_root,
+        Path::new(""),
         &real_root,
         kind,
         started,
@@ -861,13 +869,14 @@ fn scan_item(root: &Path, kind: ItemKind, home: &Path, started: Clock<'_>) -> Sc
         &mut entries,
         &mut scan,
     );
-    scan.files.sort();
+    scan.files.sort_by(|a, b| a.name.cmp(&b.name));
     scan
 }
 
 #[allow(clippy::too_many_arguments)]
 fn walk(
     dir: &Path,
+    rel: &Path,
     item_root: &Path,
     kind: ItemKind,
     started: Clock<'_>,
@@ -930,7 +939,18 @@ fn walk(
             if !visited.insert(path.clone()) {
                 continue;
             }
-            walk(&path, item_root, kind, started, cap, visited, entries, scan);
+            walk(
+                &path,
+                &rel.join(&*name),
+                item_root,
+                kind,
+                started,
+                cap,
+                visited,
+                entries,
+                scan,
+            );
+            visited.remove(&path);
         } else if meta.is_file() {
             // A file that is a hard link to a credentials file is refused. Other hard
             // links are not detected (see the module docs).
@@ -955,6 +975,7 @@ fn walk(
             scan.files.push(KitFile {
                 id: file_id(&meta),
                 path,
+                name: rel.join(&*name),
             });
         }
     }
@@ -1010,13 +1031,13 @@ impl Write for CountingSink {
 
 /// SHA-256 over the files (relative path and bytes) and their gzip size, in one read.
 fn digest_files(root: &Path, files: &[KitFile]) -> (String, u64) {
-    let real_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let _ = root;
     let mut hasher = Sha256::new();
     let mut gzip = flate2::write::GzEncoder::new(CountingSink(0), flate2::Compression::fast());
     let mut buffer = vec![0u8; 64 * 1024];
     for file in files {
+        let relative = &file.name;
         let file = &file.path;
-        let relative = file.strip_prefix(&real_root).unwrap_or(file);
         hasher.update(relative.to_string_lossy().as_bytes());
         hasher.update([0]);
         let Ok(mut handle) = std::fs::File::open(file) else {

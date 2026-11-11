@@ -154,6 +154,8 @@ struct KitHost {
     methods: Vec<String>,
     /// Runs when the Host receives `method`, before it answers.
     on_call: Vec<(&'static str, Hook)>,
+    /// The limit each request was given.
+    timeouts: Vec<(String, Option<Duration>)>,
 }
 
 impl KitHost {
@@ -276,6 +278,18 @@ impl super::Host for Host {
     }
     fn ensure(&self, _: &str, _: &AtomicBool, _: &mut dyn FnMut(&str)) -> Result<(), String> {
         Ok(())
+    }
+    fn request_timeout(
+        &self,
+        machine_id: &str,
+        method: &str,
+        params: Value,
+        timeout: Option<Duration>,
+    ) -> Result<Value, String> {
+        if let Some(kit) = self.kit.lock().unwrap().as_mut() {
+            kit.timeouts.push((method.to_string(), timeout));
+        }
+        self.request(machine_id, method, params)
     }
     fn request(&self, machine_id: &str, method: &str, params: Value) -> Result<Value, String> {
         self.log

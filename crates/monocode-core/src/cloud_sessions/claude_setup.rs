@@ -42,8 +42,9 @@
 use std::collections::BTreeSet;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -54,6 +55,8 @@ use super::kit::{self, KitInventory, KitRoots, SecretLocation, Workspace};
 use super::kit_pack::{self, Packed, Present};
 use super::kit_prefs::{self, ApiKit, CloudKitPrefs};
 use super::{CloudSessions, Host, StartRecord, StepKind, StepStatus};
+use crate::accounts::Profile;
+use crate::provider::Kind;
 use crate::remote::uploads::{upload_file, UploadOptions};
 use crate::store::Store;
 
@@ -64,7 +67,6 @@ pub const UPLOADS_CAPABILITY: &str = "uploads";
 /// Store setting holding the JSON map `CloudRef::key() -> SetupState`.
 const SETTING: &str = "cloud-claude-setup.v1";
 const UPLOAD_NAME: &str = "kit.tar";
-const MAX_DETAIL_CHARS: usize = 200;
 const MAX_WARNINGS: usize = 40;
 
 /// Text of the row that carries a server the user has to sign in to in the cloud (D12).
@@ -73,25 +75,23 @@ pub const SIGN_IN_LABEL: &str = "Sign in in the cloud";
 pub const APPROVAL_LABEL: &str = "Needs approval";
 
 /// Finds the local setup of a project.
-pub type RootsFn = Arc<dyn Fn(&Path) -> Result<KitRoots, String> + Send + Sync>;
+pub type RootsFn = Arc<dyn Fn(&Path, &Profile) -> Result<KitRoots, String> + Send + Sync>;
 
 /// The seams the step reads the user's setup through. Tests install fixtures.
 #[derive(Clone)]
 pub struct KitSeams {
     /// The global kit preferences as set in Settings.
     pub prefs: Arc<dyn Fn() -> CloudKitPrefs + Send + Sync>,
-    /// Where the local setup lives, for a local project.
+    /// Where the local setup lives, for a local project and the Claude account it uses.
     pub roots: RootsFn,
 }
 
 impl KitSeams {
-    /// The real preferences ([`kit_prefs::published`]) and this computer's default account.
+    /// The real preferences ([`kit_prefs::published`]) and the Claude account's own config.
     pub fn system() -> Self {
         Self {
             prefs: Arc::new(kit_prefs::published),
-            roots: Arc::new(|project| {
-                KitRoots::for_profile(&crate::accounts::Profile::default(), project)
-            }),
+            roots: Arc::new(|project, profile| KitRoots::for_profile(profile, project)),
         }
     }
 }
@@ -136,8 +136,13 @@ pub struct ServerHealth {
     pub status: HealthStatus,
     pub sign_in_needed: bool,
     pub transport: String,
-    /// The status line, scrubbed and cut short.
-    pub detail: String,
+    /// A short generic reason from a fixed list ("command not found", "could not connect"),
+    /// never the Host's text: a status line can carry a command, a URL or an argument.
+    #[serde(default)]
+    pub reason: String,
+    /// A project server that waits for approval (design 7).
+    #[serde(default)]
+    pub needs_approval: bool,
     /// The kit sent this server config-only (D12).
     #[serde(default)]
     pub oauth_style: bool,
@@ -146,15 +151,12 @@ pub struct ServerHealth {
 impl ServerHealth {
     /// The word the cloud panel shows: `connected`, `failed - <why>`, `Sign in in the cloud`...
     pub fn label(&self) -> String {
-        let lower = self.detail.to_lowercase();
         match self.status {
             HealthStatus::Connected => "connected".into(),
-            HealthStatus::SignInNeeded if lower.contains("pending approval") => {
-                APPROVAL_LABEL.into()
-            }
+            HealthStatus::SignInNeeded if self.needs_approval => APPROVAL_LABEL.into(),
             HealthStatus::SignInNeeded => SIGN_IN_LABEL.into(),
-            HealthStatus::Failed if self.detail.is_empty() => "failed".into(),
-            HealthStatus::Failed => format!("failed - {}", self.detail),
+            HealthStatus::Failed if self.reason.is_empty() => "failed".into(),
+            HealthStatus::Failed => format!("failed - {}", self.reason),
             HealthStatus::Disabled => "disabled".into(),
             HealthStatus::Configured => "not checked".into(),
         }
@@ -180,6 +182,10 @@ pub struct SetupState {
     pub token: Option<Token>,
     pub health: Vec<ServerHealth>,
     pub warnings: Vec<String>,
+    /// The last "Update Claude setup" failed: the rest of this state is the last GOOD result,
+    /// kept as it was, and this says why the update did not go through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
 }
 
 impl SetupState {
@@ -191,6 +197,7 @@ impl SetupState {
             token: None,
             health: Vec::new(),
             warnings: Vec::new(),
+            failure: None,
         }
     }
 }
@@ -237,7 +244,10 @@ impl Scrub {
     /// Learns the values that are actually about to be sent.
     fn learn_packed(&self, packed: &Packed) {
         for (name, value) in &packed.secrets {
-            self.add_value(value.as_str(), name.ends_with("_URL"));
+            self.add_value(value.as_str(), packed.url_secrets.contains(name));
+        }
+        for value in &packed.scrub_extra {
+            self.add_value(value.as_str(), false);
         }
     }
 
@@ -320,8 +330,12 @@ pub struct SetupPlan {
     /// The preferences as read when the plan was made.
     pub prefs: CloudKitPrefs,
     pub workspace: Workspace,
-    /// "Update Claude setup" replaces the secrets file even when there are none now.
+    /// "Update Claude setup" replaces the secrets file even when there are none now, and
+    /// sends an empty kit when nothing is selected, so a revoked item is removed.
     pub replace_secrets: bool,
+    /// The Claude account whose setup is read (a sandbox start names one); else the account
+    /// the project uses.
+    pub account: Option<String>,
 }
 
 pub(super) struct Env<'a> {
@@ -338,7 +352,40 @@ pub(super) struct Target<'a> {
     pub project_id: Option<&'a str>,
 }
 
+/// How long each Host call may take. The Host allows `kit.health` 60 s plus a grace of 2 s,
+/// and a large kit takes a while to unpack. Everything else keeps the default limit.
+pub(super) fn timeout_for(method: &str) -> Option<Duration> {
+    match method {
+        "kit.health" => Some(Duration::from_secs(75)),
+        "kit.apply" => Some(Duration::from_secs(120)),
+        "kit.secrets" => Some(Duration::from_secs(30)),
+        _ => None,
+    }
+}
+
+/// The Claude account whose setup is read: `account` when it is a known account, else the one
+/// the project uses.
+fn profile_for(store: &Arc<Mutex<Store>>, project: &str, account: Option<&str>) -> Profile {
+    let Ok(store) = store.lock() else {
+        return Profile::default();
+    };
+    let book = store.provider_accounts().unwrap_or_default();
+    let id = match account {
+        Some(account) if book.exists(Kind::Claude, account) => account.to_owned(),
+        _ => book.selected(Kind::Claude, project),
+    };
+    let root = store
+        .data_dir()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    Profile::new(&id, &root)
+}
+
 /// Runs the step and stores its result. Never fails and never panics out.
+///
+/// A halted run (cancelled, or the start or workspace was deleted) stores nothing, so a state
+/// that `forget_cloud_starts` removed is not brought back. A failed "Update Claude setup" keeps
+/// the last good result and records the failure next to it.
 pub(super) fn run(
     env: &Env<'_>,
     target: &Target<'_>,
@@ -354,7 +401,22 @@ pub(super) fn run(
             .push("The Claude setup stopped unexpectedly. Your workspace works without it.".into());
         state
     });
+    if env.halt.load(Ordering::Relaxed) {
+        return state;
+    }
     if let Ok(store) = env.store.lock() {
+        if plan.replace_secrets && !state.applied {
+            if let Some(mut good) = setup_state(&store, target.cloud).filter(|p| p.applied) {
+                let why: Vec<&str> = state.warnings.iter().take(3).map(String::as_str).collect();
+                good.failure = Some(if why.is_empty() {
+                    "The update did not go through.".to_owned()
+                } else {
+                    why.join(" ")
+                });
+                let _ = save_state(&store, target.cloud, &good);
+                return good;
+            }
+        }
         let _ = save_state(&store, target.cloud, &state);
     }
     state
@@ -379,9 +441,16 @@ fn run_inner(
                 state.warnings.push(text);
             }
         };
+    // A progress line first (it is also where a cancelled or deleted start is noticed), then
+    // the check.
+    let halted = || env.halt.load(Ordering::Relaxed);
     let none = Scrub::default();
     progress("Preparing your Claude setup");
-    let roots = match (plan.seams.roots)(Path::new(target.local_project)) {
+    if halted() {
+        return state;
+    }
+    let profile = profile_for(env.store, target.local_project, plan.account.as_deref());
+    let roots = match (plan.seams.roots)(Path::new(target.local_project), &profile) {
         Ok(roots) => roots,
         Err(error) => {
             warn(
@@ -399,7 +468,7 @@ fn run_inner(
     state.token = Some(Token(kit_pack::selection_token(&inventory, &plan.prefs)));
     let request = |method: &str, params: Value| -> Result<Value, String> {
         env.host
-            .request(target.machine_id, method, params)
+            .request_timeout(target.machine_id, method, params, timeout_for(method))
             .map_err(|e| scrub.host_text(&e))
     };
 
@@ -417,6 +486,9 @@ fn run_inner(
     }
 
     progress("Checking which tools the workspace has");
+    if halted() {
+        return state;
+    }
     let present = match request("kit.probe", json!({ "commands": kit_pack::PROBE_COMMANDS })) {
         Ok(reply) => reply
             .get("present")
@@ -451,20 +523,26 @@ fn run_inner(
     for line in &packed.warnings {
         warn(&mut state, &scrub, line, progress);
     }
-    if packed.is_empty() {
+    if packed.is_empty() && !plan.replace_secrets {
         progress("Nothing to send for the Claude setup");
         state.summary = "nothing selected".into();
         return state;
     }
-    state.summary = summary_of(&packed);
-    if env.halt.load(std::sync::atomic::Ordering::Relaxed) {
-        return state;
-    }
+    state.summary = if packed.is_empty() {
+        // An update with nothing selected still goes through: an empty kit and an empty
+        // secrets file replace the old ones, so what the user took out is removed.
+        "nothing selected: the earlier setup was removed".into()
+    } else {
+        summary_of(&packed)
+    };
 
     progress(&format!(
         "Uploading the Claude setup ({})",
         kit_prefs::size_label(packed.size)
     ));
+    if halted() {
+        return state;
+    }
     let mut last = 0u64;
     let mut on_progress = |done: u64, total: u64| {
         let percent = (done * 100).checked_div(total).unwrap_or(100);
@@ -497,6 +575,10 @@ fn run_inner(
     };
 
     progress("Installing the Claude setup");
+    if halted() {
+        let _ = request("uploads.discard", json!({ "uploadId": uploaded.upload_id }));
+        return state;
+    }
     let applied = request(
         "kit.apply",
         json!({ "uploadId": uploaded.upload_id, "hash": packed.sha256 }),
@@ -529,6 +611,9 @@ fn run_inner(
 
     if !packed.secrets.is_empty() || plan.replace_secrets {
         progress("Storing MCP secrets on the workspace");
+        if halted() {
+            return state;
+        }
         if let Err(error) = request("kit.secrets", json!({ "values": packed.secrets_value() })) {
             warn(
                 &mut state,
@@ -540,6 +625,9 @@ fn run_inner(
     }
 
     progress("Checking MCP servers");
+    if halted() {
+        return state;
+    }
     let mut params = json!({});
     if let Some(project) = target.project_id {
         params["projectId"] = json!(project);
@@ -589,15 +677,42 @@ fn summary_of(packed: &Packed) -> String {
 // Health
 // ---------------------------------------------------------------------------
 
-fn cut(text: &str) -> String {
-    let text = text.trim();
-    if text.chars().count() <= MAX_DETAIL_CHARS {
-        text.to_owned()
+/// The part of a `claude mcp list` line that is the STATUS: what follows the last " - " (the
+/// whole text when there is none, as a fixed Host returns it). Only keywords are read from it.
+/// The text before the separator is the server's command, arguments or URL, which can hold a credential. A
+/// Host from before the fix returns the whole line, so the app cuts it here as well.
+fn status_part(line: &str) -> &str {
+    line.rsplit_once(" - ").map_or(line, |(_, status)| status)
+}
+
+/// Whether the status says the server waits for approval.
+fn is_approval(status: &str) -> bool {
+    status.to_lowercase().contains("pending approval")
+}
+
+/// A generic reason for a failure, chosen from a fixed list by keywords of the status. The
+/// status text itself is never kept.
+fn reason_of(status: &str) -> String {
+    let lower = status.to_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| lower.contains(w));
+    if has(&["not found", "enoent"]) {
+        "command not found"
+    } else if has(&["timed out", "timeout"]) {
+        "timed out"
+    } else if has(&["401", "403", "unauthorized", "forbidden"]) {
+        "not authorized"
+    } else if has(&[
+        "refused",
+        "enotfound",
+        "dns",
+        "could not connect",
+        "failed to connect",
+    ]) {
+        "could not connect"
     } else {
-        let mut out: String = text.chars().take(MAX_DETAIL_CHARS).collect();
-        out.push_str("...");
-        out
+        ""
     }
+    .into()
 }
 
 /// Reads a `kit.health` reply: the Host's own per-server list, else the raw `claude mcp
@@ -612,6 +727,8 @@ pub fn parse_health(reply: &Value, scrub: &Scrub) -> (Vec<ServerHealth>, Vec<Str
         .filter_map(|entry| {
             let name = entry.get("name")?.as_str()?.to_owned();
             let status = HealthStatus::parse(entry.get("status")?.as_str()?);
+            // Only keywords are read from it, through `scrub` first; it is never stored.
+            let detail = scrub.host_text(entry.get("detail").and_then(Value::as_str).unwrap_or(""));
             Some(ServerHealth {
                 name,
                 status,
@@ -624,9 +741,12 @@ pub fn parse_health(reply: &Value, scrub: &Scrub) -> (Vec<ServerHealth>, Vec<Str
                     .and_then(Value::as_str)
                     .unwrap_or("unknown")
                     .to_owned(),
-                detail: cut(
-                    &scrub.host_text(entry.get("detail").and_then(Value::as_str).unwrap_or(""))
-                ),
+                reason: if status == HealthStatus::Failed {
+                    reason_of(status_part(&detail))
+                } else {
+                    String::new()
+                },
+                needs_approval: is_approval(status_part(&detail)),
                 oauth_style: false,
             })
         })
@@ -648,7 +768,8 @@ pub fn parse_health(reply: &Value, scrub: &Scrub) -> (Vec<ServerHealth>, Vec<Str
                         status,
                         sign_in_needed: status == HealthStatus::SignInNeeded,
                         transport: "unknown".into(),
-                        detail: String::new(),
+                        reason: String::new(),
+                        needs_approval: false,
                         oauth_style: false,
                     }
                 })
@@ -687,7 +808,8 @@ fn merge_health(mut health: Vec<ServerHealth>, packed: &Packed) -> Vec<ServerHea
                 },
                 sign_in_needed: sent.oauth_style,
                 transport: "unknown".into(),
-                detail: String::new(),
+                reason: String::new(),
+                needs_approval: false,
                 oauth_style: sent.oauth_style,
             }),
         }
@@ -701,7 +823,7 @@ fn merge_health(mut health: Vec<ServerHealth>, packed: &Packed) -> Vec<ServerHea
 fn health_warnings(health: &[ServerHealth], packed: &Packed, workspace: Workspace) -> Vec<String> {
     let mut out = Vec::new();
     for entry in health {
-        if entry.label() == APPROVAL_LABEL {
+        if entry.needs_approval && entry.status == HealthStatus::SignInNeeded {
             out.push(format!(
                 "Project MCP server \"{}\" waits for approval. Whether an agent session loads it before it is approved is not confirmed.",
                 entry.name
@@ -806,7 +928,7 @@ impl CloudSessions {
         let step = record.step(StepKind::ClaudeSetup);
         // A step that is Skipped without ever starting belongs to a record from before the
         // step existed: such a start never sends (see `StartRecord::normalize`).
-        let predates_step = step.status == StepStatus::Skipped && step.started_at.is_none();
+        let predates_step = step.predates();
         if !record.created || record.kit_off || step.status == StepStatus::Done || predates_step {
             return None;
         }
@@ -819,6 +941,10 @@ impl CloudSessions {
             prefs,
             workspace: workspace_of(&record.cloud()?),
             replace_secrets: false,
+            account: record
+                .sandbox_start
+                .as_ref()
+                .and_then(|start| start.config.claude_account.clone()),
         })
     }
 
@@ -867,15 +993,14 @@ impl CloudSessions {
             .into_iter()
             .find(|m| m.environment_id == session.project.environment_id)
             .ok_or("The workspace is not connected. Reconnect the session first.")?;
-        if cloud.kind == CloudBackendKind::Codespaces {
-            // A user action: waking a stopped codespace is expected.
-            self.host.ensure(&machine.id, cancel, progress)?;
-        }
+        // Never wakes the workspace: the requests below need a live tunnel and fail with the
+        // usual "not connected" text otherwise. The panel offers the action only when connected.
         let plan = SetupPlan {
             seams: self.kit_seams.clone(),
             prefs,
             workspace: workspace_of(&cloud),
             replace_secrets: true,
+            account: None,
         };
         let env = Env {
             host: &*self.host,
@@ -906,7 +1031,10 @@ impl CloudSessions {
             .project
             .local_project
             .as_deref()
-            .and_then(|project| (self.kit_seams.roots)(Path::new(project)).ok())
+            .and_then(|project| {
+                let profile = profile_for(&self.store, project, None);
+                (self.kit_seams.roots)(Path::new(project), &profile).ok()
+            })
             .map(|roots| {
                 let inventory = kit::build_inventory(&roots, workspace_of(&cloud));
                 local_changed(&state, &inventory, &prefs)

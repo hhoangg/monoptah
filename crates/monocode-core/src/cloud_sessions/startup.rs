@@ -221,6 +221,14 @@ pub struct Step {
 }
 
 impl Step {
+    /// A Claude setup step that was never started and never ended: the record was written
+    /// before the step existed ([`StartRecord::normalize`]). Such a start never sends.
+    pub(super) fn predates(&self) -> bool {
+        self.kind == StepKind::ClaudeSetup
+            && self.status == StepStatus::Skipped
+            && self.started_at.is_none()
+            && self.finished_at.is_none()
+    }
     pub(super) fn pending(kind: StepKind) -> Self {
         Self {
             kind,
@@ -392,10 +400,11 @@ impl StartRecord {
     /// waits. `None` when nothing is running.
     pub fn current(&self) -> Option<StepKind> {
         let running = |kind: StepKind| self.step(kind).status == StepStatus::Running;
+        // The Claude setup runs while OpenProject is still open: it comes first.
         [
+            StepKind::ClaudeSetup,
             StepKind::Connect,
             StepKind::OpenProject,
-            StepKind::ClaudeSetup,
         ]
         .into_iter()
         .find(|k| running(*k))
@@ -1173,7 +1182,8 @@ impl CloudSessions {
         self.invalidate_ref(&cloud);
         let now = self.now();
         for step in &mut record.steps {
-            if step.kind != StepKind::Create {
+            // A record from before the Claude setup step keeps never sending.
+            if step.kind != StepKind::Create && !step.predates() {
                 *step = Step::pending(step.kind);
             }
         }

@@ -718,7 +718,7 @@ pub const CODESPACE_NOT_CONNECTED: &str =
 pub const SANDBOX_NOT_CONNECTED: &str =
     "Sandbox is not connected. Reconnect to start it and restore the connection.";
 
-fn supported_remote_method(method: &str) -> bool {
+pub(crate) fn supported_remote_method(method: &str) -> bool {
     matches!(
         method,
         "environment.describe"
@@ -738,6 +738,10 @@ fn supported_remote_method(method: &str) -> bool {
             | "uploads.chunk"
             | "uploads.commit"
             | "uploads.discard"
+            | "kit.probe"
+            | "kit.apply"
+            | "kit.secrets"
+            | "kit.health"
             | "devices.revokeSelf"
             | "git.diff"
             | "git.branches"

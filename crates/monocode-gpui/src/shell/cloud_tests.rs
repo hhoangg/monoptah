@@ -1449,7 +1449,12 @@ fn the_cloud_panel_shows_the_claude_setup_and_update_reports_a_refusal(cx: &mut 
         status,
         sign_in_needed: sign_in,
         transport: "http".into(),
-        detail: detail.into(),
+        reason: if detail.contains("refused") {
+            "could not connect".into()
+        } else {
+            String::new()
+        },
+        needs_approval: detail.contains("approval"),
         oauth_style: oauth,
     };
     let view = SetupView {
@@ -1489,7 +1494,7 @@ fn the_cloud_panel_shows_the_claude_setup_and_update_reports_a_refusal(cx: &mut 
                 CloudSessions::new(gh, Arc::new(FakeHost::default()), shell.store.clone())
                     .with_kit_seams(KitSeams {
                         prefs: Arc::new(CloudKitPrefs::default),
-                        roots: Arc::new(|_| Err("not used".into())),
+                        roots: Arc::new(|_, _| Err("not used".into())),
                     }),
             );
             shell.ensure_right_panel(window, cx);
@@ -1522,7 +1527,8 @@ fn the_cloud_panel_shows_the_claude_setup_and_update_reports_a_refusal(cx: &mut 
                 .clone()
                 .unwrap();
             assert_eq!(setup.summary, "1 skill, 3 MCP servers");
-            assert!(setup.changed && setup.can_update && !setup.updating);
+            // The panel's link is down in this fixture: Update is not on offer (it never wakes).
+            assert!(setup.changed && !setup.can_update && !setup.updating);
             let lines: Vec<_> = setup
                 .servers
                 .iter()
@@ -1533,7 +1539,7 @@ fn the_cloud_panel_shows_the_claude_setup_and_update_reports_a_refusal(cx: &mut 
                 [
                     ("github", "connected"),
                     ("linear", "Sign in in the cloud"),
-                    ("site", "failed - connection refused"),
+                    ("site", "failed - could not connect"),
                 ]
             );
             shell.update_claude_setup(cx);

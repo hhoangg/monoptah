@@ -1622,6 +1622,11 @@ impl CloudSessions {
                 self.publish(record, &mut **events);
             },
             &mut |line| {
+                // The Claude setup reports a line before each phase: this is where a
+                // cancelled or deleted start stops it (`open_project` polls `halt`).
+                if self.start_aborted(session_id, cancel) {
+                    halt.store(true, Ordering::Relaxed);
+                }
                 let mut guard = cell.borrow_mut();
                 let (record, events) = &mut *guard;
                 let text = format!("{PROGRESS_PREFIX}{}", run.scrub.apply(line));
@@ -1704,7 +1709,7 @@ impl CloudSessions {
             return Err("This sandbox has no devcontainer to rebuild.".into());
         }
         for step in &mut record.steps {
-            if !matches!(step.kind, StepKind::Create | StepKind::Provision) {
+            if !matches!(step.kind, StepKind::Create | StepKind::Provision) && !step.predates() {
                 *step = Step::pending(step.kind);
             }
         }

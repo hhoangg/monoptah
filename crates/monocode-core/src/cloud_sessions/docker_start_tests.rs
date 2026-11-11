@@ -2402,7 +2402,7 @@ fn a_sandbox_start_runs_the_claude_setup_and_a_reconnect_never_does() {
     let mut fx = fx();
     fx.svc = fx.svc.with_kit_seams(KitSeams {
         prefs: Arc::new(move || prefs.clone()),
-        roots: Arc::new(move |_| Ok(roots.clone())),
+        roots: Arc::new(move |_, _| Ok(roots.clone())),
     });
     let (session, record) = fx.begin().unwrap();
     assert!(record.created);
