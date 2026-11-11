@@ -157,10 +157,18 @@ impl Shell {
         for id in ids {
             let offer = self.move_offer(id);
             let locked = self.cloud_moves.contains_key(&id);
+            let by_agent = self.cloud_moves.get(&id).is_some_and(|run| {
+                run.by_api
+                    || run
+                        .record
+                        .as_ref()
+                        .is_some_and(|r| r.started_by == StartedBy::Api)
+            });
             let label = self.move_label(id);
             if let Some(view) = self.sessions.get(&id) {
                 view.update(cx, |view, cx| {
                     view.set_move_locked(locked, cx);
+                    view.set_move_by_agent(by_agent, cx);
                     view.set_move_offer(offer, cx);
                     view.set_cloud_moved(label, cx);
                 });
@@ -2279,5 +2287,56 @@ mod tests {
         let text = status(window, session, cx).to_string();
         assert!(!text.contains("/work/monocode"), "{text}");
         assert!(!text.contains(&project), "{text}");
+    }
+
+    #[gpui::test]
+    fn an_agent_move_is_announced_and_the_banner_says_who_started_it(cx: &mut TestAppContext) {
+        let (window, session, _) = setup(cx, Script::FailAtPush);
+        let project = project_of(window, session, cx);
+        let title = window
+            .update(cx, |shell, _, _| {
+                shell.session_summaries[&session].title.clone()
+            })
+            .unwrap();
+        call(window, cx, |shell, cx| {
+            shell.error = None;
+            shell.api_move_to_cloud(&project, new_codespace(session, false), cx)
+        })
+        .unwrap();
+        window
+            .update(cx, |shell, _, cx| {
+                assert_eq!(
+                    shell.error.as_deref(),
+                    Some(format!("An agent started moving {title} to the cloud.").as_str())
+                );
+                let view = shell.sessions[&session].read(cx);
+                assert!(view.move_locked());
+                assert!(view.move_by_agent());
+            })
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        assert!(cx.debug_bounds("cloud-move-by-agent").is_some());
+    }
+
+    #[gpui::test]
+    fn a_users_own_move_is_not_marked_and_an_agent_cannot_cancel_it(cx: &mut TestAppContext) {
+        let (window, session, fake) = setup(cx, Script::FailAtPush);
+        let project = project_of(window, session, cx);
+        open(window, session, cx);
+        confirm(window, cx);
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(!shell.sessions[&session].read(cx).move_by_agent());
+                let error = shell.api_cancel_move(&project, session, cx).unwrap_err();
+                assert!(error.contains("started by the user"), "{error}");
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(fake.calls.count("cancel"), 0);
+        window
+            .update(cx, |shell, _, _| {
+                assert!(shell.cloud_moves.contains_key(&session))
+            })
+            .unwrap();
     }
 }

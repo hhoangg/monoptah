@@ -138,7 +138,8 @@ impl State {
         match &dialog.phase {
             Phase::Working { .. } => Some(("running", None)),
             Phase::Failed(error) => Some(("failed", Some(error.clone()))),
-            _ => None,
+            Phase::Confirm => Some(("awaitingConfirmation", None)),
+            Phase::ConfirmBackup { .. } => None,
         }
     }
 }
@@ -375,6 +376,9 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let message = done.warnings.join(" ");
+        if done.local_id != id {
+            self.remember_returned(id, done.local_id);
+        }
         if done.local_id == id {
             self.session_summaries.insert(id, done.summary);
             self.cloud_located.remove(&id);

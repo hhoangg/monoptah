@@ -166,6 +166,19 @@ pub fn resolve_target(request: &MoveToCloud, offered: &[MoveTarget]) -> Result<M
     })
 }
 
+/// Replaces filesystem paths in `text` with `<path>`: absolute and `~/` paths (including a
+/// macOS `Application Support` folder with its space) and Windows drive paths. URLs and
+/// branch names such as `origin/feat` stay.
+pub fn scrub_paths(text: &str) -> String {
+    static PATH: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r#"(^|[\s"'(=\[<])((?:/|~/)(?:Application Support|[^\s"')\]>,;])+|[A-Za-z]:\\(?:Application Support|[^\s"')\]>,;])*)"#,
+        )
+        .expect("a valid path pattern")
+    });
+    PATH.replace_all(text, "${1}<path>").into_owned()
+}
+
 fn step_id(step: MoveStep) -> String {
     serde_json::to_value(step)
         .ok()
@@ -216,7 +229,7 @@ pub fn status_json(session: i64, record: &MoveRecord, running: bool) -> Value {
         value["step"] = json!(step_id(step));
     }
     if let Some(error) = &record.error {
-        value["error"] = json!(error);
+        value["error"] = json!(scrub_paths(error));
     }
     if let Some(cloud) = record.cloud() {
         value["target"] = json!({"kind": cloud.kind.api_name(), "instance": cloud.name});
@@ -225,20 +238,43 @@ pub fn status_json(session: i64, record: &MoveRecord, running: bool) -> Value {
         value["branch"] = json!(record.branch);
     }
     if !record.notices.is_empty() || !record.warnings.is_empty() {
-        let mut notes: Vec<&String> = record.warnings.iter().collect();
-        notes.extend(record.notices.iter());
+        let notes: Vec<String> = record
+            .warnings
+            .iter()
+            .chain(record.notices.iter())
+            .map(|note| scrub_paths(note))
+            .collect();
         value["notices"] = json!(notes);
     }
     value
 }
 
-/// The status of a session that has no move record.
-pub fn idle_json(session: i64, in_cloud: bool) -> Value {
-    json!({
+/// The status of a session that has no move record. `error` says why the last move an agent
+/// started was refused, if it was.
+pub fn idle_json(session: i64, in_cloud: bool, error: Option<&str>) -> Value {
+    let mut value = json!({
         "session": session,
         "state": "none",
         "location": if in_cloud { "cloud" } else { "local" },
-    })
+    });
+    if let Some(error) = error {
+        value["error"] = json!(scrub_paths(error));
+    }
+    value
+}
+
+/// A return that is still waiting for the user, running, failed, or finished.
+pub fn return_json(session: i64, state: &str, error: Option<&str>) -> Value {
+    let mut value = json!({"session": session, "direction": "toLocal", "state": state});
+    if let Some(error) = error {
+        value["error"] = json!(scrub_paths(error));
+    }
+    value
+}
+
+/// A session born in the cloud came back as a new local session.
+pub fn returned_json(old: i64, new: i64) -> Value {
+    json!({"session": old, "direction": "toLocal", "state": "done", "newSession": new})
 }
 
 #[cfg(test)]

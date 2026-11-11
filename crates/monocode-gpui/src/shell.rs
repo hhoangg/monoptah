@@ -727,6 +727,9 @@ pub(crate) struct Shell {
     cloud_moves: HashMap<i64, cloud_move::MoveRun>,
     /// Why the last move an agent started for a session was refused before it began.
     api_move_errors: HashMap<i64, String>,
+    /// Sessions born in the cloud that came back as a new local session: (old id, new id,
+    /// project). Bounded; lets `sessions.moveStatus` answer for the old id.
+    api_returned: std::collections::VecDeque<(i64, i64, String)>,
     move_dialog: Option<cloud_move::OpenMove>,
     /// The working-copy inspections of the move dialog in flight, by session (cancel flags).
     move_previews: HashMap<i64, Arc<std::sync::atomic::AtomicBool>>,
@@ -1224,6 +1227,7 @@ impl Shell {
             cloud_move_engine: cloud.clone(),
             cloud_moves: HashMap::new(),
             api_move_errors: HashMap::new(),
+            api_returned: std::collections::VecDeque::new(),
             move_dialog: None,
             move_previews: HashMap::new(),
             move_labels: HashMap::new(),

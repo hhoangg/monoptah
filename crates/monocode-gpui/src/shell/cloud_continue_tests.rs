@@ -514,7 +514,22 @@ fn an_agent_return_runs_the_same_continue_locally_and_reports_through_the_status
         })
         .unwrap()
         .unwrap();
-    assert_eq!(started["state"], "running");
+    // The call only opens the confirmation: nothing runs before the user presses Continue.
+    assert_eq!(started["state"], "awaitingConfirmation");
+    cx.run_until_parked();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let waiting = window
+        .update(cx, |shell, _, _| shell.api_move_status(&project, local))
+        .unwrap()
+        .unwrap();
+    assert_eq!(waiting["state"], "awaitingConfirmation");
+    assert_eq!(waiting["direction"], "toLocal");
+    window
+        .update(cx, |shell, window, cx| {
+            assert_eq!(shell.cloud_continue.phase_name(), "confirm");
+            shell.confirm_continue_locally(window, cx)
+        })
+        .unwrap();
     cx.run_until_parked();
     // The seam of the dialog ran once, and the session is local again.
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -550,6 +565,7 @@ fn a_refusal_of_continue_locally_reaches_the_agent_and_the_session_stays_in_the_
             shell
                 .api_move_to_local(&project, local, window, cx)
                 .unwrap();
+            shell.confirm_continue_locally(window, cx);
         })
         .unwrap();
     cx.run_until_parked();
@@ -593,6 +609,7 @@ fn the_real_continue_locally_is_the_default_and_its_failure_leaves_the_cloud_in_
             shell
                 .api_move_to_local(&project, local, window, cx)
                 .unwrap();
+            shell.confirm_continue_locally(window, cx);
         })
         .unwrap();
     cx.run_until_parked();
@@ -633,8 +650,9 @@ fn an_agent_return_is_refused_for_the_wrong_session_a_running_turn_or_another_di
                 .copied()
                 .find(|id| !shell.cloud_marks.contains_key(id))
                 .expect("a plain local session");
+            let own = shell.session_summaries[&plain].cwd.clone();
             let error = shell
-                .api_move_to_local(&project, plain, window, cx)
+                .api_move_to_local(&own, plain, window, cx)
                 .unwrap_err();
             assert!(error.contains("does not live in the cloud"), "{error}");
             // A turn running here.
@@ -654,4 +672,52 @@ fn an_agent_return_is_refused_for_the_wrong_session_a_running_turn_or_another_di
         .unwrap();
     cx.run_until_parked();
     assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing ran");
+}
+
+#[gpui::test]
+fn another_projects_session_gets_the_same_refusal_whether_local_or_in_the_cloud(
+    cx: &mut TestAppContext,
+) {
+    let (window, local) = moved_window(cx);
+    window
+        .update(cx, |shell, window, cx| {
+            let plain = shell
+                .session_summaries
+                .keys()
+                .copied()
+                .find(|id| !shell.cloud_marks.contains_key(id))
+                .expect("a plain local session");
+            let one = shell
+                .api_move_to_local("/somewhere/else", local, window, cx)
+                .unwrap_err();
+            let two = shell
+                .api_move_to_local("/somewhere/else", plain, window, cx)
+                .unwrap_err();
+            assert_eq!(one, two);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_session_born_in_the_cloud_still_answers_under_its_old_id_once_it_is_local(
+    cx: &mut TestAppContext,
+) {
+    let (window, local) = moved_window(cx);
+    let project = project_of(window, local, cx);
+    window
+        .update(cx, |shell, _, _| {
+            // The old (negative) id was forgotten by the adoption; its new local id is kept.
+            shell.remember_returned(local, 4242);
+            let done = shell.api_move_status(&project, local).unwrap();
+            assert_eq!(done["state"], "done");
+            assert_eq!(done["newSession"], 4242);
+            // Only for the project that owned it.
+            assert!(shell.api_move_status("/somewhere/else", local).is_err());
+            // The memory is bounded.
+            for n in 0..100 {
+                shell.remember_returned(local, 5000 + n);
+            }
+            assert!(shell.api_returned.len() <= 32);
+        })
+        .unwrap();
 }

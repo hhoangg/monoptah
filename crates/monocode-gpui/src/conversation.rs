@@ -180,6 +180,8 @@ pub(crate) struct Conversation {
     move_offer: MoveOffer,
     /// A move to the cloud of this session is unfinished: nothing may be sent or saved.
     move_locked: bool,
+    /// The unfinished move was started by an agent through the app API.
+    move_by_agent: bool,
     /// The flip happened but the settings in memory were not reloaded from the store yet.
     move_settings_stale: bool,
     /// Lists the machine types of a project's repository for the codespace panel.
@@ -805,6 +807,7 @@ impl Conversation {
             cloud_location: Default::default(),
             move_offer: MoveOffer::Hidden,
             move_locked: false,
+            move_by_agent: false,
             move_settings_stale: false,
             machine_loader: None,
             cloud_anchors: Default::default(),

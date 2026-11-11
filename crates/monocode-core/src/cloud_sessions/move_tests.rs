@@ -3035,17 +3035,32 @@ fn an_api_move_follows_the_same_push_rules_as_the_dialog() {
 }
 
 #[test]
-fn an_api_move_never_uploads_ignored_files() {
+fn an_api_move_uploads_exactly_two_files_and_never_an_ignored_one() {
     let fx = Fx::new();
     let request = MoveRequest {
         started_by: StartedBy::Api,
+        kit_off: true,
         ..fx.request()
     };
     fx.svc.begin_move(request, &|| false).unwrap();
-    fx.run().0.unwrap();
-    let names = fx.host.uploaded_names();
-    assert!(names.len() <= 2, "{names:?}");
-    assert!(names.iter().all(|n| !n.contains(".env")), "{names:?}");
+    // Stop at the code step so the uploads are still on the fake Host.
+    fx.host.fail_once("workspace.applySnapshot", "stop here");
+    let _ = fx.run();
+    let mut names = fx.host.uploaded_names();
+    names.sort();
+    let mut expected = vec!["snapshot.patch".to_string(), format!("{CLAUDE_ID}.jsonl")];
+    expected.sort();
+    assert_eq!(names, expected);
+    let uploads = fx.host.uploads.lock().unwrap().clone();
+    assert_eq!(uploads.len(), 2);
+    for (name, bytes, _) in uploads.values() {
+        let text = String::from_utf8_lossy(bytes);
+        assert!(!text.contains("hunter2"), "{name} carries the secret");
+        assert!(
+            !text.contains(".env.local"),
+            "{name} names the ignored file"
+        );
+    }
 }
 
 #[test]

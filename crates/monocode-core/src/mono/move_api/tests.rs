@@ -333,7 +333,53 @@ fn the_status_names_a_failure_and_a_paused_move() {
         json!({"kind": "codespace", "instance": "octo-new1"})
     );
     assert_eq!(
-        idle_json(7, false),
+        idle_json(7, false, None),
         json!({"session": 7, "state": "none", "location": "local"})
     );
+}
+
+#[test]
+fn paths_are_scrubbed_from_every_error_the_status_can_carry() {
+    for (raw, expected) in [
+        (
+            "Could not read /Users/me/secret-project/.git/index: permission denied",
+            "Could not read <path> permission denied",
+        ),
+        (
+            "failed: '/Users/me/Library/Application Support/com.monoptah.desktop/x.json' is bad",
+            "failed: '<path>' is bad",
+        ),
+        ("cannot open ~/work/repo", "cannot open <path>"),
+        ("bad (C:\\Users\\me\\repo\\file)", "bad (<path>)"),
+        ("path=/tmp/x/y", "path=<path>"),
+        // Not paths: a URL, a branch and a remote ref stay.
+        (
+            "Push to https://github.com/octo/widgets.git of origin/feat-cloud failed",
+            "Push to https://github.com/octo/widgets.git of origin/feat-cloud failed",
+        ),
+    ] {
+        assert_eq!(scrub_paths(raw), expected, "{raw}");
+    }
+    let failed = status_json(
+        7,
+        &record(json!({
+            "failedAt": "push",
+            "current": null,
+            "error": "cannot write /Users/me/Library/Application Support/com.monoptah.desktop/cloud-move/x",
+            "notices": ["kept /Users/me/secret-project-wt"],
+        })),
+        false,
+    );
+    let text = failed.to_string();
+    assert!(!text.contains("/Users"), "{text}");
+    assert!(!text.contains("Application Support"), "{text}");
+    assert!(
+        !return_json(5, "failed", Some("no /Users/me/x"))
+            .to_string()
+            .contains("/Users"),
+        "return errors are scrubbed"
+    );
+    assert!(!idle_json(5, true, Some("see /Users/me/x"))
+        .to_string()
+        .contains("/Users"));
 }
