@@ -90,13 +90,14 @@ impl Shell {
                 TitleTab::Session(tab) => {
                     self.workspace.tabs.contains(tab) && {
                         let id = self.workspace.scope_pane(*tab);
-                        self.session_summaries
-                            .contains_key(&self.workspace.session_for_pane(id))
-                            && self
-                                .session_metadata(self.workspace.session_for_pane(id), cx)
-                                .summary
-                                .cwd
-                                == self.workspace.project
+                        let session = self.workspace.session_for_pane(id);
+                        // A cloud session's cwd is its remote path; it belongs to the
+                        // local project it twins.
+                        self.session_summaries.contains_key(&session)
+                            && self.project_of(
+                                session,
+                                &self.session_metadata(session, cx).summary.cwd,
+                            ) == self.workspace.project
                             && self.in_worktree_scope(id, cx)
                     }
                 }
@@ -943,6 +944,67 @@ mod interaction_tests {
                 assert_eq!(shell.visible_tabs(cx), [mono, TitleTab::Session(first)]);
                 assert_eq!(shell.workspace.active, Some(first));
                 assert!(!shell.mono_active(cx));
+            })
+            .unwrap();
+    }
+
+    /// Stores a cloud session twinning the project in view and lists it, as a refresh
+    /// does. No conversation entity: a remote one polls its host forever.
+    fn add_cloud(shell: &mut Shell) -> i64 {
+        let local = shell.workspace.project.clone();
+        let summary = {
+            let store = locked(&shell.store).unwrap();
+            let remote = store
+                .remember_cloud_project(
+                    "env-octo-abc",
+                    &serde_json::json!({"id":"p","cwd":"/workspaces/widgets"}),
+                    &local,
+                    "octo-abc",
+                )
+                .unwrap();
+            store.create("claude", &remote.key).unwrap()
+        };
+        let id = summary.id;
+        assert!(summary.cwd.starts_with("remote://"));
+        shell.session_summaries.insert(id, summary);
+        shell.order.push(id);
+        shell.mark_cloud_session(id);
+        id
+    }
+
+    #[gpui::test]
+    fn cloud_sessions_are_tabs_of_their_local_project_alone_and_in_a_grid(cx: &mut TestAppContext) {
+        let (window, _, local) = window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                assert_eq!(shell.workspace.project, "/work/monocode");
+                let cloud = add_cloud(shell);
+                assert!(shell.is_cloud(cloud));
+                // Opened in its own tab, as `open` does, without loading the remote chat.
+                shell.workspace.open(cloud);
+                shell.record_worktree_session(cloud, cx);
+                assert!(shell.visible_tabs(cx).contains(&TitleTab::Session(cloud)));
+                // Dropped into the local session's grid and focused there.
+                shell
+                    .workspace
+                    .place(cloud, local, crate::pane_layout::Edge::Right);
+                let tab = shell.workspace.tab_of(cloud).unwrap();
+                assert_eq!(shell.workspace.tab_of(local), Some(tab));
+                assert_eq!(shell.workspace.tab_focus(tab), cloud);
+                assert!(shell.visible_tabs(cx).contains(&TitleTab::Session(tab)));
+                // A relaunch restores tabs without their per-run scopes and without the
+                // remote chat, so only the cloud mark ties them to the local project.
+                shell.workspace.open(local);
+                shell.workspace.detach(cloud, shell.workspace.tabs.len());
+                shell.workspace.tab_workspaces.clear();
+                assert!(shell.visible_tabs(cx).contains(&TitleTab::Session(cloud)));
+                shell
+                    .workspace
+                    .place(cloud, local, crate::pane_layout::Edge::Right);
+                shell.workspace.tab_workspaces.clear();
+                let tab = shell.workspace.tab_of(cloud).unwrap();
+                assert_eq!(shell.workspace.tab_focus(tab), cloud);
+                assert!(shell.visible_tabs(cx).contains(&TitleTab::Session(tab)));
             })
             .unwrap();
     }
