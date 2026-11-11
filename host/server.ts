@@ -317,6 +317,7 @@ export function createHostServer(
                 "uploads",
                 "kit",
                 "claude.kit",
+                "claude.kit.instructions",
                 "sessions.draft",
                 "sessions.plan",
                 "workspace.watch",

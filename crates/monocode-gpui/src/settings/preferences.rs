@@ -359,7 +359,8 @@ mod tests {
             serde_json::json!({
                 "selection": ["mcp:user:github"],
                 "enabled": true,
-                "notice_acknowledged": true
+                "notice_acknowledged": true,
+                "instructions": true
             })
         );
         let back: Preferences = serde_json::from_value(saved).unwrap();

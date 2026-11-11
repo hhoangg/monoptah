@@ -124,7 +124,8 @@ fn defaults_check_everything_that_can_be_sent_secrets_and_oauth_style_servers() 
         KitSummary {
             skills: 2,
             mcp_servers: 3,
-            plugins: 1
+            plugins: 1,
+            ..Default::default()
         }
     );
 }
@@ -279,12 +280,14 @@ fn summary_text_counts_and_pluralizes() {
         skills: 6,
         mcp_servers: 4,
         plugins: 3,
+        ..Default::default()
     };
     assert_eq!(summary.text(), "6 skills, 4 MCP servers, 3 plugins");
     let one = KitSummary {
         skills: 1,
         mcp_servers: 1,
         plugins: 1,
+        ..Default::default()
     };
     assert_eq!(one.text(), "1 skill, 1 MCP server, 1 plugin");
     assert_eq!(KitSummary::default().text(), "nothing selected");
@@ -298,11 +301,12 @@ fn preferences_round_trip_and_old_files_get_the_defaults() {
         selection: Some(["skill:user:review".to_owned()].into()),
         enabled: true,
         notice_acknowledged: true,
+        ..Default::default()
     };
     let saved = serde_json::to_value(&prefs).unwrap();
     assert_eq!(
         saved,
-        json!({"selection":["skill:user:review"],"enabled":true,"notice_acknowledged":true})
+        json!({"selection":["skill:user:review"],"enabled":true,"notice_acknowledged":true,"instructions":true})
     );
     assert_eq!(
         serde_json::from_value::<CloudKitPrefs>(saved).unwrap(),
@@ -522,4 +526,54 @@ fn the_kit_is_off_before_the_app_publishes_anything_and_follows_what_it_publishe
     assert!(slot.get().applies(ApiKit::Default));
     slot.publish(CloudKitPrefs::default());
     assert!(!slot.get().applies(ApiKit::Default));
+}
+
+#[test]
+fn instructions_are_on_for_old_and_new_preferences_and_round_trip_off() {
+    assert!(CloudKitPrefs::default().instructions);
+    let old: CloudKitPrefs =
+        serde_json::from_str(r#"{"enabled":true,"notice_acknowledged":true}"#).unwrap();
+    assert!(old.instructions);
+    let empty: CloudKitPrefs = serde_json::from_str("{}").unwrap();
+    assert!(empty.instructions);
+    let off = CloudKitPrefs {
+        instructions: false,
+        ..Default::default()
+    };
+    let back: CloudKitPrefs = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+    assert!(!back.instructions);
+    assert_eq!(back, off);
+}
+
+#[test]
+fn the_summary_counts_instructions_only_when_they_are_on_and_carried() {
+    let ins = |exclusion| KitInstructions {
+        source: KitSource::User,
+        root: PathBuf::from("/x"),
+        files: vec![KitFile {
+            path: PathBuf::from("/x/CLAUDE.md"),
+            id: None,
+            name: PathBuf::from("CLAUDE.md"),
+        }],
+        size: 3,
+        hash: "h".into(),
+        exclusion,
+        not_carried: Vec::new(),
+        notes: Vec::new(),
+    };
+    let mut inventory = KitInventory {
+        instructions: Some(ins(None)),
+        ..Default::default()
+    };
+    let on = CloudKitPrefs::default();
+    let summary = KitSummary::of(&inventory, &on);
+    assert!(summary.instructions && !summary.is_empty());
+    assert_eq!(summary.text(), "your instructions");
+    let off = CloudKitPrefs {
+        instructions: false,
+        ..Default::default()
+    };
+    assert!(KitSummary::of(&inventory, &off).is_empty());
+    inventory.instructions = Some(ins(Some(Exclusion::TooLarge)));
+    assert!(!KitSummary::of(&inventory, &on).instructions);
 }

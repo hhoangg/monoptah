@@ -984,6 +984,41 @@ there once. The app copies no sign-in and cannot tell whether the user signed in
 4. Servers whose credentials are raw values in `headers` or `env` keep working through the
    one-way secrets path (3.2.3).
 
+#### 3.2.6 Personal instructions (F3-6, D15)
+
+Found while verifying PR #73: a cloud session had no user-scope `CLAUDE.md`. Locally the
+file is loaded even under an account `CLAUDE_CONFIG_DIR` (the account dirs have none),
+apparently because the project sits under `$HOME`, so Claude Code reads
+`~/.claude/CLAUDE.md` while walking up the parent directories (the session shows it as a
+project file). On the instance the project is under `/workspaces`, outside `$HOME`, and the
+kit did not carry the file, so nothing was loaded.
+
+- **Source:** the account dir's `CLAUDE.md` if it exists, else `~/.claude/CLAUDE.md`
+  (labelled `Account` or `User`), plus every file it imports with `@path` (recursively, up
+  to depth 5, not inside code) and `rules/**/*.md`.
+- **Only from inside that config root.** An import outside it (`@~/...`, absolute paths),
+  a missing one, or one the Guard refuses is listed as "not carried" and never sent. Same
+  link and credential rules as skills (§3.2.1).
+- **Markdown only, never Claude's own files.** Only `.md` files are carried, and never a
+  path whose first folder is one Claude owns (`skills`, `plugins`, `projects`, `agents`,
+  `commands`, `output-styles`, `hooks`, `todos`, `shell-snapshots`, `session-env`,
+  `file-history`, `ide`, `statsig`, `plans`, `backups`, `downloads`, `sessions`, `state`).
+  An import of `settings.json` or a skill's `SKILL.md` would otherwise land in `~/.claude`
+  on the instance as live config. The Host applies the same rule and skips such a file.
+- **Caps:** 64 files, 256 KiB each, 1 MiB in total; over a cap nothing is carried.
+- **Toggle:** Settings > Cloud > Claude setup, "Your instructions (CLAUDE.md)", default
+  ON (also for saved preferences written before the toggle existed).
+- **Transfer:** tar dir `instructions/` and a `kit.json` `instructions` list, sent only to
+  a Host with capability `claude.kit.instructions` (D3). Otherwise the setup step warns
+  that a newer Monoptah Host is needed, and the kit stays marked as changed until the
+  instructions are actually delivered. If the Host cannot be asked at all, the step stops
+  without applying, so existing instruction links are not removed.
+- **Install:** the Host links each file to `~/.claude/<rel>` from the kit's hash dir and
+  records it in `managed.json`. It never overwrites a file it did not create; that file
+  is reported as skipped. Turning the toggle off removes only the managed links.
+- **Proof that Claude sees it** needs a manual check (a canary line in a test import, or
+  `/memory`), because a unit test can only show the file is in place.
+
 ### 3.3 Alternatives considered
 
 | Option | Pros | Cons | Verdict |
@@ -1558,6 +1593,7 @@ each batch ends with an explicit release-and-pin ticket (HR1-HR3).
 | **HR3** | Release Host batch 3 and pin it in the app | S | F3-3h, F4-2h |
 | **F3-4** | "Claude setup" step in new-workspace starts (one-way: kit + secrets file), "Update Claude setup" action, health in the panel, network-policy hints | M | F3-2, HR3 |
 | **F3-5** | OAuth MCP servers carried config-only and marked "Sign in in the cloud" (D12: no Keychain, no sign-in copy) | S | F3-4 |
+| **F3-6** | Personal instructions (`CLAUDE.md`, its imports, `rules/`) in the kit, toggle default ON (D15) | S-M | F3-4 |
 | **F4-3a** | Local → cloud orchestrator: `MoveRecord`, push, both backends, uploads, restore, verify, same-id import, version check (R4), moved-path note (R5), location flip, rollback/cancel | M-L | F4-1, F4-J, F4-L, HR3 |
 | **F4-4** | "Continue in cloud" dialog (one confirmation), progress steps, transcript divider | M | F4-3a |
 | **F4-5** | Cloud → local for moved and cloud-born sessions: in-place apply when unchanged, else a new worktree; the convert no longer archives and replaces the cloud row; same id through F4-J (fork on divergence, new id after a lost workspace) | M | F4-L, F4-3a, F4-J |

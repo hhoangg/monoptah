@@ -174,6 +174,7 @@ These are final. Do not re-open them. If one turns out impossible, stop and ask 
 | D12 | (user decision, 2026-11-10) **MCP OAuth sign-ins are not copied.** The app never reads the macOS Keychain or Claude Code's credentials item/file for MCP. F3-5a and F3-5h are dropped. MCP servers whose credentials are raw values in config JSON (`headers`, `env`) are carried one way at setup as in D7. OAuth-signed MCP servers are carried config-only and marked "Sign in in the cloud". The `signed_in` seam of F3-1 stays `None`/unused for copying. |
 | D13 | (user decision, 2026-11-10) F4-0 may run real local `claude` requests: cheapest model, tiny prompts, a first ping per account, and on any rate-limit/usage-limit error the account is abandoned at once (no retry loops). |
 | D14 | (user decision, 2026-11-10) Before F3-4, F3-1 is hardened: (a) links inside a skill/plugin must stay inside that item's own root (no following into `~/.aws` and the like); (b) secret values are never part of `config_hash`/`content_hash` (keyed digest with a local key, never printed). Done in ticket F3-1b, Opus-reviewed. |
+| D15 | (user decision, 2026-11-11) Feature 3 also carries the user's **personal instructions**: the account's `CLAUDE.md` if it has one, else `~/.claude/CLAUDE.md`, plus the files it imports with `@path` and `rules/**/*.md`, all only from inside that config root. A Settings > Cloud > Claude setup toggle controls it, **default ON** (saved prefs without the field come out ON). Gated on the Host capability `claude.kit.instructions`; the Host links the files into `~/.claude` and never overwrites a file it did not create. Ticket F3-6, design §3.2.6. |
 
 ---
 
@@ -1383,6 +1384,37 @@ get them after HR2.
     the D7 path.
   - [ ] No manual Keychain step.
 
+#### F3-6 User instructions in the kit (S-M). User decision D15 (2026-11-11).
+
+- **Goal:** Claude in the cloud sees the user's personal instructions, as it does locally.
+  Found in manual verification of PR #73: the kit carried skills, MCP and plugins only, so
+  a cloud session had no user-scope `CLAUDE.md`. Design §3.2.6.
+- **Depends on:** F3-4. Needs a Host release and a new pin before it does anything on a
+  real workspace (D3: capability gate).
+- **Files:** `core/cloud_sessions/kit.rs`, `kit_pack.rs`, `kit_prefs.rs`,
+  `claude_setup.rs`; GPUI `cloud_kit_ui.rs`, `settings/pages/cloud.rs`; `host/kit.ts`,
+  `host/server.ts`; their tests.
+- **Contract:**
+  - tar dir `instructions/` (regular files, paths relative to the source config root,
+    `CLAUDE.md` required, depth <= 8, <= 64 files, <= 256 KiB each, <= 1 MiB total);
+  - only `.md` files, never under a folder Claude owns (list in design §3.2.6); the Host
+    skips such a file instead of refusing the kit;
+  - `kit.json` field `instructions: [sorted rel paths]`, equal to the files in the tar;
+  - capability `claude.kit.instructions`;
+  - Host links `~/.claude/<rel>` to the hash dir, tracks them in `managed.json`
+    `instructions`, skips and reports a file it did not create;
+  - apply result `instructions: {installed, skipped: [{path, reason}]}`.
+- **Acceptance:**
+  - [ ] Imports that resolve outside the source root, are missing, or are refused by the
+    Guard are listed as not carried, never sent.
+  - [ ] The toggle defaults ON, also for saved prefs without the field; OFF removes the
+    managed links on the next apply.
+  - [ ] An old Host (no capability) gets no `instructions/` and the user sees why.
+  - [ ] A user-owned remote `~/.claude/CLAUDE.md` is never overwritten.
+  - [ ] Manual, needs the user: after the Host release and pin, "Update Claude setup",
+    then a NEW cloud session answers a canary line from a test import (or `/memory`
+    lists `~/.claude/CLAUDE.md`).
+
 #### F4-3a Local to cloud orchestrator (M-L)
 
 - **Goal:** `MoveRecord`-driven moves with: push, workspace start or attach, uploads,
@@ -1533,6 +1565,7 @@ ticket, after review and after merge.
 | F4-4 | 4 | merged | csi-f4-4 | merge 803cf74a. Opus review x1, 9 findings fixed (not re-reviewed). One-confirmation dialog (target, push line, counts, ignored files NOT carried, LFS/submodule warnings), progress rows, Retry/Resume/Cancel (+ two-step 'Cancel and delete workspace'), divider, settings reload on Flip-done, composer/queued sends/API sends locked for the whole move, run only from Confirm/Retry/Resume, preview on its own thread (cancellable, serialized with the move's snapshot). Known gap: a stale record (rows appended during the move) has no re-anchor: dialog says Cancel move and start again (a pushed branch stays on origin). Pending, needs the user: real end-to-end move. |
 | F4-5 | 4 | merged | csi-f4-5 | merge c43d3662 (store.rs delete key list and session_groups.rs menu/match conflicts with F4-4 resolved keeping both; native:check, branding, host tests, check:web green on the merged tree). FIVE Opus review rounds (the most dangerous ticket: it changes the user's local working tree). Final design: temp index (seeded from the real index) -> write-tree == move tree -> read-tree -m -u (refuses on any change) -> update-ref CAS -> mixed reset -q; write-ahead marker + verified backup before any change, undo from the expected tree (refuses on user edits), recovery only looks, Restore/Discard/Keep actions with confirmations, partial-write detection keeps marker+backup, ignored/assume-unchanged/submodule/branch/in-progress states refuse, gate monotonic. Mutation-verified test for the partial-write path. Known: staged/unstaged split is not preserved on success; Reset-to-local without cloud turns resumes the local file (summary path only when cloud turns exist). Pending, needs the user (creates a codespace): real round trip. |
 | F4-3b | 4 | merged | csi-f4-3b | merge 42674620. Opus review x1 + 9 fixes (not re-reviewed). Mono-only actions sessions.moveToCloud (starts immediately like sessions.start with a cloud target; visible record 'Started by an agent', notice + banner), sessions.moveToLocal (only OPENS the Continue locally dialog, returns awaitingConfirmation; the USER confirms), sessions.moveStatus (paths scrubbed), sessions.cancelMove (only agent-started moves, never deletes workspaces). Refused for unattended runs (habit/heartbeat/workflow question) and for the delete exclusion set. kit may only narrow (kit_off in the first start record). OPEN PRODUCT QUESTION for the user: may a Mono move ANY eligible session, or only sessions it started / the user mentioned? (currently any eligible session of the project). |
+| F3-6 | 4 | merged | csi-f3-6 | PR #79. D15. Host + app halves in parallel; Opus review x3, all findings fixed; native:check, test:host, host:build, branding green on the tree merged with origin/feat/cloud-session-impl (d2940ed6). Needs a Host release (host-v1.2.0) and a new pin before it works on real workspaces. Pending, needs the user: canary check on a real workspace. Known: on an old Host the kit stays marked changed until instructions are delivered. |
 
 ---
 

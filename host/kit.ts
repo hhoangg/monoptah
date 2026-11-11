@@ -12,6 +12,7 @@ import {
   readSync,
   readdirSync,
   readlinkSync,
+  rmdirSync,
   renameSync,
   rmSync,
   statSync,
@@ -22,7 +23,7 @@ import {
 } from "node:fs";
 import { execFile, spawn } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
-import { delimiter, join, resolve, sep } from "node:path";
+import { delimiter, join, relative, resolve, sep } from "node:path";
 import { inspect } from "node:util";
 import {
   claudeKitKey,
@@ -37,7 +38,8 @@ import { providerLaunch } from "./process";
  * Everything lives under `~/.monoptah-kit`:
  *   <hash>/        one unpacked kit, created fresh with mkdir (O_EXCL semantics)
  *   current        symlink to the active <hash>, flipped atomically
- *   managed.json   skill links this module created in ~/.claude/skills
+ *   managed.json   skill links this module created in ~/.claude/skills, and
+ *                  instruction links it created under ~/.claude
  *   secrets.env    kit secrets, mode 0600, loaded into the Claude child env only
  */
 
@@ -49,7 +51,42 @@ const SECRET_NAME = /^MONOPTAH_KIT_[A-Z0-9_]{1,128}$/;
 const COMMAND_NAME = /^[A-Za-z0-9._+-]{1,64}$/;
 const BLOCK = 512;
 const COMPLETE = ".complete";
-const TOP_LEVEL = new Set(["skills", "plugins", "mcp.json", "kit.json"]);
+const TOP_LEVEL = new Set([
+  "skills",
+  "plugins",
+  "instructions",
+  "mcp.json",
+  "kit.json",
+]);
+/** Caps for the user's instruction files (CLAUDE.md and what it imports). */
+const MAX_INSTRUCTION_FILES = 64;
+const MAX_INSTRUCTION_FILE_BYTES = 256 * 1024;
+const MAX_INSTRUCTION_TOTAL_BYTES = 1024 * 1024;
+const MAX_INSTRUCTION_DEPTH = 8;
+/** Claude's own folders under ~/.claude: nothing from a kit goes there. */
+const BLOCKED_INSTRUCTION_ROOTS = new Set([
+  "skills",
+  "plugins",
+  "projects",
+  "agents",
+  "commands",
+  "output-styles",
+  "hooks",
+  "todos",
+  "shell-snapshots",
+  "session-env",
+  "file-history",
+  "ide",
+  "statsig",
+  "plans",
+  "backups",
+  "downloads",
+  "sessions",
+  "state",
+]);
+/** Marks the temp link used to swap an instruction link atomically. */
+const TEMP_LINK_MARK = ".monoptah-";
+const TEMP_LINK = /\.monoptah-[0-9a-f]{12}$/;
 /** Values shorter than this are not scrubbed: they would mangle ordinary text. */
 const MIN_SCRUB_LENGTH = 4;
 const MAX_SECRET_VALUE_BYTES = 64 * 1024;
@@ -294,6 +331,26 @@ function validateHash(value: unknown): string {
   return value;
 }
 
+/** A path relative to `instructions/`: plain segments, bounded depth, no `.git`. */
+function validInstructionPath(rel: string): boolean {
+  if (rel === "" || hasControl(rel) || rel.includes("\\") || rel.startsWith("/"))
+    return false;
+  const segments = rel.split("/");
+  if (segments.length > MAX_INSTRUCTION_DEPTH) return false;
+  return segments.every(
+    (segment) =>
+      segment !== "" && segment !== "." && segment !== ".." && segment !== ".git",
+  );
+}
+
+/** Why a kit file is never linked into ~/.claude, or undefined if it may be. */
+function instructionSkipReason(rel: string): string | undefined {
+  if (BLOCKED_INSTRUCTION_ROOTS.has(rel.split("/")[0]))
+    return "Claude's own folder";
+  if (!rel.toLowerCase().endsWith(".md")) return "Only Markdown files are copied";
+  return undefined;
+}
+
 export function validateSkillName(value: string): boolean {
   return value.length > 0 && value.length <= 64 && SKILL_NAME.test(value);
 }
@@ -373,6 +430,14 @@ function checkLayout(segments: string[], directory: boolean): void {
     if (!directory) throw new Error("Refused tar entry: invalid path");
     return;
   }
+  if (top === "instructions") {
+    // Depth is counted below `instructions/`.
+    if (segments.length - 1 > MAX_INSTRUCTION_DEPTH)
+      throw new Error("Refused tar entry: instructions path too deep");
+    if (segments.some((segment) => segment === ".git"))
+      throw new Error("Refused tar entry: invalid path");
+    return;
+  }
   const valid =
     top === "skills" ? validateSkillName(second) : PLUGIN_ID.test(second);
   if (!valid) throw new Error("Refused tar entry: invalid item name");
@@ -400,6 +465,8 @@ function* readTar(
   let total = 0;
   let longName: string | undefined;
   let paxPath: string | undefined;
+  let instructionFiles = 0;
+  let instructionBytes = 0;
   for (;;) {
     // A valid archive ends with a zero block; running out of bytes is a cut.
     if (position + BLOCK > archiveSize) throw new Error("Truncated tar archive");
@@ -458,6 +525,16 @@ function* readTar(
     checkLayout(segments, directory);
     if (++count > limits.maxEntries)
       throw new Error("Kit has too many entries");
+    if (segments[0] === "instructions" && !directory) {
+      instructionFiles += 1;
+      instructionBytes += size;
+      if (instructionFiles > MAX_INSTRUCTION_FILES)
+        throw new Error("Kit has too many instruction files");
+      if (size > MAX_INSTRUCTION_FILE_BYTES)
+        throw new Error("An instruction file is too large");
+      if (instructionBytes > MAX_INSTRUCTION_TOTAL_BYTES)
+        throw new Error("Kit instructions are too large");
+    }
     if (!directory) total += size;
     if (total > limits.maxTotalBytes)
       throw new Error("Kit is larger than the unpacked size cap");
@@ -518,7 +595,10 @@ export async function unpackKitTar(
       await yieldToLoop();
       mkdirSync(join(target, ".."), { recursive: true, mode: 0o700 });
       // "wx" is O_CREAT|O_EXCL: it never follows a link or replaces a file.
-      const out = openSync(target, "wx", entry.executable ? 0o700 : 0o600);
+      // Instruction files are read-only: an in-place edit must fail loudly.
+      const fileMode =
+        entry.segments[0] === "instructions" ? 0o400 : entry.executable ? 0o700 : 0o600;
+      const out = openSync(target, "wx", fileMode);
       try {
         let done = 0;
         while (done < entry.size) {
@@ -550,6 +630,15 @@ interface Managed {
   previous?: string;
   skills: string[];
   plugins: string[];
+  /** Relative paths (under ~/.claude) of instruction links created here. */
+  instructions: string[];
+  /** Folders (relative to ~/.claude) this module created for those links. */
+  instructionDirs: string[];
+}
+
+export interface KitInstructionsResult {
+  installed: string[];
+  skipped: { path: string; reason: string }[];
 }
 
 export interface KitApplyResult {
@@ -563,6 +652,7 @@ export interface KitApplyResult {
   skipped: string[];
   /** Managed links removed because the new kit no longer has them. */
   removed: string[];
+  instructions: KitInstructionsResult;
   warnings: string[];
 }
 
@@ -750,9 +840,21 @@ export function parseHealth(
   return out;
 }
 
+interface InstructionLinks {
+  installed: string[];
+  skipped: { path: string; reason: string }[];
+  /** Links created here (removed on rollback). */
+  created: string[];
+  /** Managed links re-pointed at the new kit, with their old targets. */
+  replaced: { link: string; target: string }[];
+  /** Folders (relative to ~/.claude) made here, removed on rollback if empty. */
+  createdDirs: string[];
+}
+
 export class HostKit {
   readonly root: string;
   private readonly skillsDir: string;
+  private readonly claudeDir: string;
   private readonly limits: KitLimits;
   private cache: { kit: ClaudeKit | undefined } | undefined;
   private queue: Promise<unknown> = Promise.resolve();
@@ -763,7 +865,8 @@ export class HostKit {
   ) {
     const home = options.home ?? homedir();
     this.root = join(home, ".monoptah-kit");
-    this.skillsDir = join(home, ".claude", "skills");
+    this.claudeDir = join(home, ".claude");
+    this.skillsDir = join(this.claudeDir, "skills");
     this.limits = { ...DEFAULT_KIT_LIMITS, ...options.limits };
     // Host restarts must keep scrubbing secrets stored earlier.
     this.refreshScrub();
@@ -776,6 +879,7 @@ export class HostKit {
    * drop the rest.
    */
   private recover(): void {
+    this.removeTempInstructionLinks();
     let entries: string[];
     try {
       entries = readdirSync(this.root);
@@ -793,6 +897,45 @@ export class HostKit {
         }
       } catch {
         /* best effort; the next apply cleans up */
+      }
+    }
+  }
+
+  /**
+   * A crash between creating a temp link and renaming it leaves
+   * `<name>.monoptah-<12 hex>`. Only symlinks pointing into the kit root, in
+   * ~/.claude or a folder this module made, are removed.
+   */
+  private removeTempInstructionLinks(): void {
+    const managed = this.readManaged();
+    const rels = [
+      ...(managed?.instructionDirs ?? []),
+      // The parent of every managed link, including a folder the user made.
+      ...(managed?.instructions ?? []).map((rel) =>
+        rel.split("/").slice(0, -1).join("/"),
+      ),
+    ];
+    const dirs = [
+      this.claudeDir,
+      ...rels.map((rel) => join(this.claudeDir, ...rel.split("/"))),
+    ];
+    for (const dir of dirs) {
+      let names: string[];
+      try {
+        names = readdirSync(dir);
+      } catch {
+        continue;
+      }
+      for (const name of names) {
+        if (!TEMP_LINK.test(name)) continue;
+        const path = join(dir, name);
+        try {
+          if (!lstatSync(path).isSymbolicLink()) continue;
+          if (!(readlinkSync(path) + sep).startsWith(this.root + sep)) continue;
+          unlinkSync(path);
+        } catch {
+          /* best effort */
+        }
       }
     }
   }
@@ -856,8 +999,23 @@ export class HostKit {
         value.skills.every(
           (name: unknown) => typeof name === "string" && validateSkillName(name),
         )
-      )
-        return value as Managed;
+      ) {
+        // Older files have no `instructions`; a damaged entry is dropped so a
+        // tampered file can never point removal outside ~/.claude.
+        const instructions = Array.isArray(value.instructions)
+          ? value.instructions.filter(
+              (rel: unknown): rel is string =>
+                typeof rel === "string" && validInstructionPath(rel),
+            )
+          : [];
+        const instructionDirs = Array.isArray(value.instructionDirs)
+          ? value.instructionDirs.filter(
+              (rel: unknown): rel is string =>
+                typeof rel === "string" && validInstructionPath(rel),
+            )
+          : [];
+        return { ...value, instructions, instructionDirs } as Managed;
+      }
     } catch {
       /* none yet */
     }
@@ -987,7 +1145,54 @@ export class HostKit {
     const before = this.readManaged();
     const previous = before && before.hash !== hash ? before.hash : before?.previous;
     const links = this.linkSkills(skills);
+    const instructionFiles = this.listInstructions(dir);
+    // Only files that will really be linked go in the write-ahead record.
+    const linkable = instructionFiles.filter(
+      (rel) => instructionSkipReason(rel) === undefined,
+    );
+    // Write ahead: record the links and folders about to be made, so a crash
+    // before the final manifest still leaves them known to the next apply.
+    const originalManifest = this.readManagedText();
+    const restoreManifest = () => {
+      try {
+        if (originalManifest === undefined) rmSync(this.managedPath(), { force: true });
+        else this.writeAtomic(this.managedPath(), originalManifest);
+      } catch {
+        /* best effort */
+      }
+    };
+    let instructionLinks: InstructionLinks;
+    try {
+      if (linkable.length > 0)
+        this.writeAtomic(
+          this.managedPath(),
+          JSON.stringify({
+            version: 1,
+            hash: before?.hash ?? hash,
+            previous: before?.previous,
+            skills: before?.skills ?? [],
+            plugins: before?.plugins ?? [],
+            instructions: [
+              ...new Set([...(before?.instructions ?? []), ...linkable]),
+            ].sort(),
+            instructionDirs: [
+              ...new Set([
+                ...(before?.instructionDirs ?? []),
+                ...this.pendingFolders(linkable),
+              ]),
+            ].sort(),
+          } satisfies Managed),
+        );
+      instructionLinks = this.linkInstructions(hash, instructionFiles);
+    } catch (error) {
+      this.rollbackLinks(links.created);
+      restoreManifest();
+      throw error;
+    }
     const removed: string[] = [];
+    const removedInstructions: { link: string; target: string }[] = [];
+    const removedDirs: string[] = [];
+    let instructionDirs: string[] = [];
     const previousTarget = this.currentTarget();
     const step = this.options.beforeStep ?? (() => {});
     try {
@@ -995,6 +1200,15 @@ export class HostKit {
       this.flipCurrent(hash);
       step("unlink");
       this.unlinkDropped(before?.skills ?? [], skills, removed);
+      this.unlinkDroppedInstructions(
+        before?.instructions ?? [],
+        instructionLinks.installed,
+        removedInstructions,
+      );
+      instructionDirs = this.pruneFolders(
+        [...(before?.instructionDirs ?? []), ...instructionLinks.createdDirs],
+        removedDirs,
+      );
       step("manifest");
       this.writeAtomic(
         this.managedPath(),
@@ -1004,6 +1218,8 @@ export class HostKit {
           previous,
           skills: links.linked,
           plugins,
+          instructions: instructionLinks.installed,
+          instructionDirs,
         } satisfies Managed),
       );
     } catch (error) {
@@ -1027,6 +1243,12 @@ export class HostKit {
         }
       }
       this.rollbackLinks(links.created);
+      restoreManifest();
+      this.rollbackInstructions(
+        instructionLinks,
+        removedInstructions,
+        removedDirs,
+      );
       this.cache = undefined;
       throw error;
     }
@@ -1049,6 +1271,10 @@ export class HostKit {
       linked: links.linked,
       skipped: links.skipped,
       removed,
+      instructions: {
+        installed: instructionLinks.installed,
+        skipped: instructionLinks.skipped,
+      },
       warnings: links.skipped.map(
         (name) =>
           `Skill "${name}" already exists on this host; the remote copy was kept`,
@@ -1081,6 +1307,284 @@ export class HostKit {
     const manifest = read("kit.json");
     if (manifest !== undefined && !isObject(manifest))
       throw new Error("kit.json must be an object");
+    this.checkInstructions(dir, manifest as Record<string, unknown> | undefined);
+  }
+
+  /** Files under `<dir>/instructions`, as sorted relative paths. */
+  private listInstructions(dir: string): string[] {
+    const base = join(dir, "instructions");
+    const out: string[] = [];
+    const walk = (current: string, prefix: string): void => {
+      let entries;
+      try {
+        entries = readdirSync(current, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) walk(join(current, entry.name), rel);
+        else if (entry.isFile()) out.push(rel);
+      }
+    };
+    walk(base, "");
+    return out.sort();
+  }
+
+  /** The instructions dir needs CLAUDE.md, and kit.json must list exactly its files. */
+  private checkInstructions(
+    dir: string,
+    manifest: Record<string, unknown> | undefined,
+  ): void {
+    const files = this.listInstructions(dir);
+    const present = existsSync(join(dir, "instructions"));
+    if (present && !files.includes("CLAUDE.md"))
+      throw new Error("Kit instructions have no CLAUDE.md");
+    const listed = manifest?.instructions;
+    if (listed === undefined) {
+      if (present) throw new Error("kit.json must list the instructions");
+      return;
+    }
+    if (
+      !Array.isArray(listed) ||
+      !listed.every((rel) => typeof rel === "string" && validInstructionPath(rel))
+    )
+      throw new Error("kit.json has an invalid instructions list");
+    const sorted = [...(listed as string[])].sort();
+    if (
+      sorted.length !== files.length ||
+      sorted.some((rel, index) => rel !== files[index])
+    )
+      throw new Error("kit.json instructions do not match the kit files");
+  }
+
+  private instructionTarget(hash: string, rel: string): string {
+    return join(this.root, hash, "instructions", ...rel.split("/"));
+  }
+
+  /** True for a link that points into some kit's `instructions/<rel>`. */
+  private isManagedInstructionLink(link: string, rel: string): string | undefined {
+    try {
+      if (!lstatSync(link).isSymbolicLink()) return undefined;
+      const target = readlinkSync(link);
+      const parts = relative(this.root, target).split(sep);
+      if (
+        parts.length >= 3 &&
+        HASH.test(parts[0]) &&
+        parts[1] === "instructions" &&
+        parts.slice(2).join("/") === rel &&
+        target === this.instructionTarget(parts[0], rel)
+      )
+        return target;
+    } catch {
+      /* not a link */
+    }
+    return undefined;
+  }
+
+  /**
+   * Links the kit's instruction files into ~/.claude. A path that holds
+   * anything this module did not create is skipped and reported, and so is
+   * a file whose link cannot be made: one bad file never fails the apply.
+   */
+  private linkInstructions(
+    hash: string,
+    files: string[],
+  ): InstructionLinks {
+    const result: InstructionLinks = {
+      installed: [],
+      skipped: [],
+      created: [],
+      replaced: [],
+      createdDirs: [],
+    };
+    const symlink = this.options.symlink ?? symlinkSync;
+    const skip = (path: string, reason: string) =>
+      result.skipped.push({ path, reason });
+    try {
+      mkdirSync(this.claudeDir, { recursive: true });
+      for (const rel of files) {
+        const segments = rel.split("/");
+        const refusal = instructionSkipReason(rel);
+        if (refusal !== undefined) {
+          skip(rel, refusal);
+          continue;
+        }
+        const link = join(this.claudeDir, ...segments);
+        const target = this.instructionTarget(hash, rel);
+        let exists = true;
+        try {
+          lstatSync(link);
+        } catch {
+          exists = false;
+        }
+        if (exists) {
+          const old = this.isManagedInstructionLink(link, rel);
+          if (old === undefined) {
+            skip(rel, "A file of your own is already there");
+            continue;
+          }
+          if (old !== target) {
+            const temp = `${link}${TEMP_LINK_MARK}${randomBytes(6).toString("hex")}`;
+            try {
+              symlink(target, temp, "file");
+              // Narrow the race: something of the user's may have replaced
+              // the link since the check above.
+              if (this.isManagedInstructionLink(link, rel) === undefined) {
+                rmSync(temp, { force: true });
+                skip(rel, "A file of your own is already there");
+                continue;
+              }
+              renameSync(temp, link);
+            } catch {
+              rmSync(temp, { force: true });
+              skip(rel, "The link could not be created");
+              continue;
+            }
+            result.replaced.push({ link, target: old });
+          }
+          result.installed.push(rel);
+          continue;
+        }
+        const folder = this.ensureFolders(segments.slice(0, -1), result.createdDirs);
+        if (folder !== undefined) {
+          skip(rel, folder);
+          continue;
+        }
+        try {
+          symlink(target, link, "file");
+        } catch {
+          skip(rel, "The link could not be created");
+          continue;
+        }
+        result.created.push(link);
+        result.installed.push(rel);
+      }
+    } catch (error) {
+      this.rollbackInstructions(result, [], []);
+      throw error;
+    }
+    return result;
+  }
+
+  /**
+   * Makes the folders below ~/.claude one at a time, never going through a
+   * link. Returns a skip reason, or undefined when the folder is ready.
+   */
+  private ensureFolders(
+    segments: string[],
+    createdDirs: string[],
+  ): string | undefined {
+    let current = this.claudeDir;
+    for (let index = 0; index < segments.length; index++) {
+      current = join(current, segments[index]);
+      let info;
+      try {
+        info = lstatSync(current);
+      } catch {
+        try {
+          mkdirSync(current);
+        } catch {
+          return "The folder could not be created";
+        }
+        createdDirs.push(segments.slice(0, index + 1).join("/"));
+        continue;
+      }
+      if (info.isSymbolicLink()) return "The folder is a link";
+      if (!info.isDirectory()) return "The folder could not be created";
+    }
+    return undefined;
+  }
+
+  /** Removes managed instruction links the new kit does not install. */
+  private unlinkDroppedInstructions(
+    previous: string[],
+    installed: string[],
+    removed: { link: string; target: string }[],
+  ): void {
+    for (const rel of previous) {
+      if (installed.includes(rel)) continue;
+      const link = join(this.claudeDir, ...rel.split("/"));
+      const target = this.isManagedInstructionLink(link, rel);
+      if (target === undefined) continue;
+      unlinkSync(link);
+      removed.push({ link, target });
+    }
+  }
+
+  private readManagedText(): string | undefined {
+    try {
+      return readFileSync(this.managedPath(), "utf8");
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Folders (relative to ~/.claude) that do not exist yet and linking would make. */
+  private pendingFolders(files: string[]): string[] {
+    const out = new Set<string>();
+    for (const rel of files) {
+      const segments = rel.split("/").slice(0, -1);
+      for (let index = 1; index <= segments.length; index++) {
+        const folder = segments.slice(0, index).join("/");
+        try {
+          lstatSync(join(this.claudeDir, ...folder.split("/")));
+        } catch {
+          out.add(folder);
+        }
+      }
+    }
+    return [...out];
+  }
+
+  /** Removes folders this module made, deepest first, only while empty. */
+  private pruneFolders(dirs: string[], removed: string[]): string[] {
+    const kept: string[] = [];
+    const ordered = [...new Set(dirs)].sort(
+      (a, b) => b.split("/").length - a.split("/").length,
+    );
+    for (const rel of ordered) {
+      const path = join(this.claudeDir, ...rel.split("/"));
+      try {
+        if (!lstatSync(path).isDirectory()) continue;
+        rmdirSync(path);
+        removed.push(rel);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") kept.push(rel);
+      }
+    }
+    return kept.sort();
+  }
+
+  /** Undoes new links, restores replaced ones and re-creates removed ones. */
+  private rollbackInstructions(
+    links: InstructionLinks,
+    removed: { link: string; target: string }[],
+    removedDirs: string[],
+  ): void {
+    // Folders pruned in this apply come back first, shallowest first.
+    for (const rel of [...removedDirs].sort(
+      (a, b) => a.split("/").length - b.split("/").length,
+    )) {
+      try {
+        mkdirSync(join(this.claudeDir, ...rel.split("/")));
+      } catch {
+        /* best effort */
+      }
+    }
+    for (const link of links.created) rmSync(link, { force: true });
+    links.created.length = 0;
+    for (const { link, target } of [...links.replaced, ...removed]) {
+      try {
+        rmSync(link, { force: true });
+        symlinkSync(target, link, "file");
+      } catch {
+        /* best effort */
+      }
+    }
+    links.replaced.length = 0;
+    this.pruneFolders(links.createdDirs, []);
+    links.createdDirs.length = 0;
   }
 
   /**

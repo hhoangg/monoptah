@@ -3,7 +3,9 @@
 //!
 //! # What goes in
 //!
-//! Only `skills/<name>/...`, `plugins/<id>/...`, `mcp.json` (`{"mcpServers": {...}}`) and
+//! Only `skills/<name>/...`, `plugins/<id>/...`, `instructions/...` (the user's `CLAUDE.md`,
+//! its imports and rules, at paths relative to their config root; only when the Host
+//! advertises `claude.kit.instructions`), `mcp.json` (`{"mcpServers": {...}}`) and
 //! `kit.json`, as a plain, uncompressed tar with regular files and directories only. The
 //! Host refuses anything else, so the same limits are checked here first: 128 MiB in total,
 //! 64 MiB per file, 50 000 entries, paths of at most 512 bytes and 24 segments.
@@ -57,6 +59,8 @@ pub const SECRET_PREFIX: &str = "MONOPTAH_KIT_";
 const MAX_SECRET_TAIL: usize = 128;
 /// Entries added after the items: `kit.json`, `mcp.json`, `skills/` and `plugins/`.
 const EXTRA_ENTRIES: usize = 4;
+/// The Host's caps for `instructions/`, checked again on what is read now.
+const MAX_INSTRUCTION_FILES: usize = super::kit::MAX_INSTRUCTION_FILES;
 
 /// The key the Host compares paths by: NFC and lower case.
 fn fold(path: &str) -> String {
@@ -88,22 +92,34 @@ fn runtime_word(runtime: Runtime) -> &'static str {
 
 /// What `kit.probe` found on the workspace.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Present(Option<BTreeSet<String>>);
+pub struct Present {
+    commands: Option<BTreeSet<String>>,
+    instructions: bool,
+}
 
 impl Present {
     /// The probe answered with these commands.
     pub fn known(commands: impl IntoIterator<Item = String>) -> Self {
-        Self(Some(commands.into_iter().collect()))
+        Self {
+            commands: Some(commands.into_iter().collect()),
+            instructions: false,
+        }
     }
     /// The probe failed: nothing is dropped for a missing runtime, the health check will say.
     pub fn unknown() -> Self {
-        Self(None)
+        Self::default()
+    }
+    /// Whether the Host advertises `claude.kit.instructions`. Without it the user's
+    /// instructions are not sent.
+    pub fn with_instructions(mut self, supported: bool) -> Self {
+        self.instructions = supported;
+        self
     }
     pub fn is_known(&self) -> bool {
-        self.0.is_some()
+        self.commands.is_some()
     }
     fn has(&self, runtime: Runtime) -> bool {
-        self.0
+        self.commands
             .as_ref()
             .is_none_or(|set| set.contains(probe_command(runtime)))
     }
@@ -147,12 +163,20 @@ pub struct Packed {
     pub skills: Vec<String>,
     pub plugins: Vec<String>,
     pub servers: Vec<PackedServer>,
+    /// Paths of the instructions files, relative to `instructions/`, sorted.
+    pub instructions: Vec<String>,
+    /// How many imports and rules of the instructions stayed behind (see
+    /// [`super::kit::KitInstructions::not_carried`]); 0 unless instructions were sent.
+    pub instructions_not_carried: usize,
 }
 
 impl Packed {
     /// Nothing was selected or everything was refused: there is nothing to send.
     pub fn is_empty(&self) -> bool {
-        self.skills.is_empty() && self.plugins.is_empty() && self.servers.is_empty()
+        self.skills.is_empty()
+            && self.plugins.is_empty()
+            && self.servers.is_empty()
+            && self.instructions.is_empty()
     }
     /// The secrets as the `values` object of `kit.secrets`.
     pub fn secrets_value(&self) -> Value {
@@ -174,6 +198,7 @@ impl fmt::Debug for Packed {
             .field("skills", &self.skills)
             .field("plugins", &self.plugins)
             .field("servers", &self.servers)
+            .field("instructions", &self.instructions)
             .field("warnings", &self.warnings)
             .finish()
     }
@@ -182,6 +207,17 @@ impl fmt::Debug for Packed {
 /// A token that changes when anything the selection takes changes, secret values included.
 /// It mixes the keyed secret digests, so it only compares on this install. Do not log it.
 pub fn selection_token(inventory: &KitInventory, prefs: &CloudKitPrefs) -> String {
+    selection_token_for(inventory, prefs, true)
+}
+
+/// Like [`selection_token`], but the user's instructions only count when `instructions_sent`:
+/// a start that did not send them (an older Host, a doubt about the scan) must differ from
+/// one that does, so the panel notices the change after the Host is updated.
+pub fn selection_token_for(
+    inventory: &KitInventory,
+    prefs: &CloudKitPrefs,
+    instructions_sent: bool,
+) -> String {
     let selected = kit_prefs::selected(inventory, prefs);
     let mut hasher = Sha256::new();
     for skill in &selected.skills {
@@ -199,6 +235,9 @@ pub fn selection_token(inventory: &KitInventory, prefs: &CloudKitPrefs) -> Strin
         if let Some(digest) = &server.secrets_digest {
             digest.update(&mut hasher);
         }
+    }
+    if let Some(instructions) = selected.instructions.filter(|_| instructions_sent) {
+        hasher.update(digest_str(&["instructions", &instructions.hash]).as_bytes());
     }
     hex(&hasher.finalize())
 }
@@ -227,13 +266,19 @@ pub fn pack(
     let mut total: u64 = 0;
     let mut skills = Vec::new();
     let mut plugins = Vec::new();
+    let mut instructions: Vec<String> = Vec::new();
+    let mut instructions_not_carried = 0;
 
     // Files are sent only when the scan could vouch for every one of them.
     let mut files_ok = true;
+    // The doubt about links to credentials files covers every file; the size cap is only about
+    // skills and plugins.
+    let mut instructions_ok = true;
     if inventory.file_index_incomplete {
         files_ok = false;
+        instructions_ok = false;
         warnings.push(
-            "Skills and plugins were not sent: the scan could not prove that no file is a link to a credentials file."
+            "Skills, plugins and your instructions were not sent: the scan could not prove that no file is a link to a credentials file."
                 .into(),
         );
     } else if kit_prefs::selected_compressed(inventory, prefs).0
@@ -313,6 +358,34 @@ pub fn pack(
         }
     }
 
+    if let (true, Some(found)) = (
+        instructions_ok && present.instructions,
+        selected.instructions,
+    ) {
+        match item_entries(
+            "instructions",
+            &found.root,
+            &found.files,
+            entries.len(),
+            total,
+        ) {
+            Ok((items, bytes)) => match check_instruction_caps(&items, bytes) {
+                Ok(()) => {
+                    instructions = items
+                        .iter()
+                        .filter(|(_, entry)| !entry.dir)
+                        .filter_map(|(path, _)| path.strip_prefix("instructions/"))
+                        .map(str::to_owned)
+                        .collect();
+                    entries.extend(items);
+                    instructions_not_carried = found.not_carried.len();
+                }
+                Err(why) => warnings.push(format!("Your instructions were not sent: {why}.")),
+            },
+            Err(why) => warnings.push(format!("Your instructions were not sent: {why}.")),
+        }
+    }
+
     let mcp = build_mcp(&selected.servers, roots, present, &mut warnings);
     if !mcp.servers.is_empty() {
         let mut text = String::new();
@@ -330,20 +403,25 @@ pub fn pack(
         );
     }
 
-    let packed_nothing = skills.is_empty() && plugins.is_empty() && mcp.servers.is_empty();
+    let packed_nothing = skills.is_empty()
+        && plugins.is_empty()
+        && mcp.servers.is_empty()
+        && instructions.is_empty();
     if !packed_nothing {
         let mut manifest = String::new();
-        canonical_json(
-            &json!({
-                "version": 1,
-                "contentHash": inventory.content_hash,
-                "skills": skills,
-                "plugins": plugins,
-                "mcpServers": mcp.servers.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
-                "signInInCloud": mcp.servers.iter().filter(|s| s.oauth_style).map(|s| s.name.clone()).collect::<Vec<_>>(),
-            }),
-            &mut manifest,
-        );
+        let mut kit_json = json!({
+            "version": 1,
+            "contentHash": inventory.content_hash,
+            "skills": skills,
+            "plugins": plugins,
+            "mcpServers": mcp.servers.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
+            "signInInCloud": mcp.servers.iter().filter(|s| s.oauth_style).map(|s| s.name.clone()).collect::<Vec<_>>(),
+        });
+        // Only when `instructions/` is in the tar, and then exactly its files.
+        if !instructions.is_empty() {
+            kit_json["instructions"] = json!(instructions);
+        }
+        canonical_json(&kit_json, &mut manifest);
         entries.insert(
             "kit.json".into(),
             Entry {
@@ -372,7 +450,28 @@ pub fn pack(
         skills,
         plugins,
         servers: mcp.servers,
+        instructions,
+        instructions_not_carried,
     })
+}
+
+/// The Host's caps for `instructions/`, applied to the bytes read now.
+fn check_instruction_caps(items: &BTreeMap<String, Entry>, bytes: u64) -> Result<(), String> {
+    let files: Vec<&Entry> = items.values().filter(|entry| !entry.dir).collect();
+    if files.len() > MAX_INSTRUCTION_FILES {
+        return Err("there are more than 64 files".into());
+    }
+    if files
+        .iter()
+        .any(|entry| entry.data.len() as u64 > super::kit::MAX_INSTRUCTION_FILE_BYTES)
+        || bytes > super::kit::MAX_INSTRUCTION_TOTAL_BYTES
+    {
+        return Err("they are larger than the limit".into());
+    }
+    if !items.contains_key("instructions/CLAUDE.md") {
+        return Err("CLAUDE.md is missing".into());
+    }
+    Ok(())
 }
 
 fn dir_entry() -> Entry {
