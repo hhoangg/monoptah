@@ -5,6 +5,7 @@ use crate::cloud_sessions::claude_setup::{
     self, local_changed, parse_health, HealthStatus, KitSeams, Scrub, ServerHealth, SetupPlan,
     APPROVAL_LABEL, SIGN_IN_LABEL,
 };
+use crate::cloud_sessions::claude_setup::{parse_instructions_result, InstructionsResult};
 use crate::cloud_sessions::kit::{build_inventory, KitRoots, Workspace};
 use crate::cloud_sessions::kit_prefs::{ApiKit, CloudKitPrefs};
 
@@ -56,6 +57,7 @@ fn on() -> CloudKitPrefs {
         enabled: true,
         notice_acknowledged: true,
         selection: None,
+        ..Default::default()
     }
 }
 
@@ -198,11 +200,13 @@ fn the_kit_is_off_unless_the_user_turned_it_on_and_accepted_the_notice() {
             enabled: true,
             notice_acknowledged: false,
             selection: None,
+            ..Default::default()
         },
         CloudKitPrefs {
             enabled: false,
             notice_acknowledged: true,
             selection: None,
+            ..Default::default()
         },
     ] {
         let f = kit_fx(&home, prefs.clone());
@@ -890,6 +894,7 @@ fn an_update_with_nothing_selected_removes_what_was_sent() {
         enabled: true,
         notice_acknowledged: true,
         selection: Some(BTreeSet::new()),
+        ..Default::default()
     };
     let off = f.svc.with_kit_seams(seams(&home, nothing));
     let updated = off
@@ -1042,4 +1047,133 @@ fn the_setup_reads_the_claude_account_the_project_uses() {
     let default = f.svc.claude_setup_view(session.id);
     assert!(default.is_some());
     assert_eq!(profiles.lock().unwrap().first(), Some(&work.id));
+}
+
+#[test]
+fn the_apply_result_lists_installed_and_skipped_instruction_files() {
+    let full = parse_instructions_result(&json!({
+        "warnings": [],
+        "instructions": {
+            "installed": ["CLAUDE.md", "RTK.md"],
+            "skipped": [{"path": "notes.txt", "reason": "not Markdown"}, {"path": "x.md"}, 7]
+        }
+    }));
+    assert_eq!(full.installed, ["CLAUDE.md", "RTK.md"]);
+    assert_eq!(
+        full.skipped,
+        [
+            ("notes.txt".to_string(), "not Markdown".to_string()),
+            ("x.md".to_string(), String::new())
+        ]
+    );
+    assert_eq!(
+        parse_instructions_result(&json!({"warnings": []})),
+        InstructionsResult::default()
+    );
+    assert_eq!(
+        parse_instructions_result(&json!({"instructions": "bad"})),
+        InstructionsResult::default()
+    );
+}
+
+fn with_instructions(home: &Home, text: &str) {
+    write(&home.roots.claude_home.join("CLAUDE.md"), text);
+}
+
+#[test]
+fn an_old_host_gets_no_instructions_and_the_user_sees_the_note() {
+    let home = home();
+    with_instructions(&home, "@missing.md\nBe brief.");
+    let f = kit_fx(&home, on());
+    let (session, _) = f.svc.begin_start("/p", new_target(), "claude").unwrap();
+    f.run(session.id).0.unwrap();
+    let tar = kit(&f, |k| k.applied[0].clone());
+    assert!(tar_paths(&tar)
+        .iter()
+        .all(|p| !p.starts_with("instructions")));
+    let stored = state(&f);
+    assert!(stored.applied);
+    assert!(stored
+        .warnings
+        .contains(&claude_setup::INSTRUCTIONS_HOST_NOTE.to_string()));
+    // Nothing was said about imports: the instructions were not sent.
+    assert!(stored
+        .warnings
+        .iter()
+        .all(|w| !w.contains("instruction files")));
+    // Once the Host can take them, the panel sees a change.
+    let inventory = build_inventory(&home.roots, Workspace::Codespace);
+    assert!(claude_setup::local_changed(&stored, &inventory, &on()));
+}
+
+#[test]
+fn a_capable_host_gets_instructions_and_one_line_for_what_stayed_behind() {
+    let home = home();
+    with_instructions(&home, "@one.md @two.md\nBe brief.");
+    let f = kit_fx(&home, on());
+    script(&f, |k| {
+        k.capabilities = vec!["claude.kit", "uploads", "claude.kit.instructions"];
+        k.apply_warnings = vec!["host note".into()];
+    });
+    let (session, _) = f.svc.begin_start("/p", new_target(), "claude").unwrap();
+    f.run(session.id).0.unwrap();
+    let tar = kit(&f, |k| k.applied[0].clone());
+    assert!(tar_paths(&tar).contains(&"instructions/CLAUDE.md".to_string()));
+    let stored = state(&f);
+    assert!(stored.summary.contains("your instructions"));
+    assert!(!stored
+        .warnings
+        .contains(&claude_setup::INSTRUCTIONS_HOST_NOTE.to_string()));
+    let line = "2 of your instruction files were not copied; see Settings > Cloud.";
+    assert_eq!(stored.warnings.last().unwrap(), line);
+    assert_eq!(
+        stored
+            .warnings
+            .iter()
+            .filter(|w| w.contains("instruction files"))
+            .count(),
+        1
+    );
+    let inventory = build_inventory(&home.roots, Workspace::Codespace);
+    assert!(!claude_setup::local_changed(&stored, &inventory, &on()));
+}
+
+#[test]
+fn a_host_that_cannot_be_asked_does_not_get_a_kit_that_would_drop_instructions() {
+    let home = home();
+    with_instructions(&home, "Be brief.");
+    let f = kit_fx(&home, on());
+    script(&f, |k| {
+        k.errors
+            .push(("environment.describe", "tunnel closed".into()));
+    });
+    let (session, _) = f.svc.begin_start("/p", new_target(), "claude").unwrap();
+    f.run(session.id).0.unwrap();
+    assert_eq!(kit(&f, |k| k.methods.clone()), ["environment.describe"]);
+    let stored = state(&f);
+    assert!(!stored.applied);
+    assert!(stored.warnings[0].contains("Try again"));
+    assert!(!stored
+        .warnings
+        .iter()
+        .any(|w| w == claude_setup::INSTRUCTIONS_HOST_NOTE));
+}
+
+#[test]
+fn a_host_that_cannot_be_asked_still_gets_a_kit_when_instructions_are_off() {
+    let home = home();
+    with_instructions(&home, "Be brief.");
+    let off = CloudKitPrefs {
+        instructions: false,
+        ..on()
+    };
+    let f = kit_fx(&home, off);
+    script(&f, |k| {
+        k.errors
+            .push(("environment.describe", "tunnel closed".into()));
+    });
+    let (session, _) = f.svc.begin_start("/p", new_target(), "claude").unwrap();
+    f.run(session.id).0.unwrap();
+    assert!(kit(&f, |k| k.methods.contains(&"kit.apply".to_string())));
+    assert!(state(&f).applied);
 }

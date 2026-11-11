@@ -1924,3 +1924,556 @@ mod roots {
         assert_eq!(first_skill(&env).exclusion, None);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Instructions (CLAUDE.md, its imports and rules)
+// ---------------------------------------------------------------------------
+
+fn names(inventory: &KitInventory) -> Vec<String> {
+    inventory
+        .instructions
+        .as_ref()
+        .map(|i| {
+            i.files
+                .iter()
+                .map(|f| f.name.to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn not_carried(inventory: &KitInventory) -> Vec<(String, String)> {
+    inventory.instructions.as_ref().unwrap().not_carried.clone()
+}
+
+fn account_env() -> Env {
+    let mut env = env();
+    let account = env.roots.home.join("app-data/provider-accounts/claude/acc");
+    std::fs::create_dir_all(&account).unwrap();
+    env.roots.account_dir = Some(account);
+    env
+}
+
+#[test]
+fn instructions_come_from_the_account_then_the_user_then_nothing() {
+    let env = account_env();
+    assert!(build_inventory(&env.roots, Workspace::Codespace)
+        .instructions
+        .is_none());
+
+    write(&env.roots.claude_home.join("CLAUDE.md"), "user rules");
+    let found = build_inventory(&env.roots, Workspace::Codespace);
+    let user = found.instructions.unwrap();
+    assert_eq!(user.source, KitSource::User);
+    assert_eq!(user.size, "user rules".len() as u64);
+    assert!(user.is_carried());
+
+    write(
+        &env.roots.account_dir.clone().unwrap().join("CLAUDE.md"),
+        "account rules",
+    );
+    let found = build_inventory(&env.roots, Workspace::Codespace);
+    let account = found.instructions.unwrap();
+    assert_eq!(account.source, KitSource::Account);
+    assert_eq!(account.size, "account rules".len() as u64);
+}
+
+#[test]
+fn a_relative_import_is_carried_with_the_file() {
+    let env = env();
+    let root = &env.roots.claude_home;
+    write(&root.join("CLAUDE.md"), "@RTK.md\n\nBe brief.\n");
+    write(&root.join("RTK.md"), "use rtk");
+    write(&root.join("unrelated.md"), "not imported");
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    assert_eq!(names(&inventory), ["CLAUDE.md", "RTK.md"]);
+    assert!(not_carried(&inventory).is_empty());
+}
+
+#[test]
+fn imports_follow_five_levels_and_no_further() {
+    let env = env();
+    let root = &env.roots.claude_home;
+    write(&root.join("CLAUDE.md"), "@a1.md");
+    for n in 1..=6 {
+        write(&root.join(format!("a{n}.md")), &format!("@a{}.md", n + 1));
+    }
+    write(&root.join("a7.md"), "end");
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    assert_eq!(
+        names(&inventory),
+        ["CLAUDE.md", "a1.md", "a2.md", "a3.md", "a4.md", "a5.md"]
+    );
+    assert_eq!(
+        not_carried(&inventory),
+        [("a6.md".to_string(), "Nested too deeply".to_string())]
+    );
+}
+
+#[test]
+fn an_import_cycle_ends() {
+    let env = env();
+    let root = &env.roots.claude_home;
+    write(&root.join("CLAUDE.md"), "@a.md");
+    write(&root.join("a.md"), "@b.md");
+    write(&root.join("b.md"), "@a.md and @CLAUDE.md");
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    assert_eq!(names(&inventory), ["CLAUDE.md", "a.md", "b.md"]);
+    assert!(not_carried(&inventory).is_empty());
+}
+
+#[test]
+fn imports_outside_the_config_folder_or_missing_are_listed_not_carried() {
+    let env = env();
+    let root = &env.roots.claude_home;
+    write(&env.roots.home.join("notes/x.md"), "private");
+    write(
+        &root.join("CLAUDE.md"),
+        &format!(
+            "@~/notes/x.md\n@{}\n@../outside.md\n@gone.md\n@~/notes/missing.md\n",
+            env.roots.home.join("notes/x.md").display()
+        ),
+    );
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    assert_eq!(names(&inventory), ["CLAUDE.md"]);
+    let outside = "Outside the Claude config folder".to_string();
+    assert_eq!(
+        not_carried(&inventory),
+        [
+            ("~/notes/x.md".to_string(), outside.clone()),
+            (
+                env.roots.home.join("notes/x.md").display().to_string(),
+                outside.clone()
+            ),
+            ("../outside.md".to_string(), outside.clone()),
+            ("gone.md".to_string(), "Not found".to_string()),
+            ("~/notes/missing.md".to_string(), outside),
+        ]
+    );
+}
+
+#[test]
+fn a_home_import_into_the_config_folder_is_carried() {
+    let env = env();
+    let root = &env.roots.claude_home;
+    write(&root.join("CLAUDE.md"), "@~/.claude/extra.md");
+    write(&root.join("extra.md"), "x");
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    assert_eq!(names(&inventory), ["CLAUDE.md", "extra.md"]);
+}
+
+#[test]
+fn code_blocks_inline_code_and_email_addresses_are_not_imports() {
+    let env = env();
+    let root = &env.roots.claude_home;
+    write(
+        &root.join("CLAUDE.md"),
+        "```\n@fenced.md\n```\n~~~sh\n@tilde.md\n~~~\nuse `@inline.md` here\nmail me@host.com\n@real.md\n",
+    );
+    for name in ["fenced", "tilde", "inline", "host.com", "real"] {
+        write(&root.join(format!("{name}.md")), "x");
+    }
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    assert_eq!(names(&inventory), ["CLAUDE.md", "real.md"]);
+    assert!(not_carried(&inventory).is_empty());
+}
+
+#[test]
+fn rules_are_carried_recursively() {
+    let env = env();
+    let root = &env.roots.claude_home;
+    write(&root.join("CLAUDE.md"), "hi");
+    write(&root.join("rules/style.md"), "s");
+    write(&root.join("rules/lang/rust.md"), "r");
+    write(&root.join("rules/lang/notes.txt"), "not markdown");
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    assert_eq!(
+        names(&inventory),
+        ["CLAUDE.md", "rules/lang/rust.md", "rules/style.md"]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_that_leaves_the_config_folder_is_refused() {
+    let env = env();
+    let root = &env.roots.claude_home;
+    write(&env.roots.home.join("secret.md"), "outside");
+    write(&root.join("CLAUDE.md"), "@ext.md");
+    std::os::unix::fs::symlink(env.roots.home.join("secret.md"), root.join("ext.md")).unwrap();
+    write(&root.join("rules/a.md"), "ok");
+    std::os::unix::fs::symlink(env.roots.home.join("secret.md"), root.join("rules/b.md")).unwrap();
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    assert_eq!(names(&inventory), ["CLAUDE.md", "rules/a.md"]);
+    let outside = "Outside the Claude config folder".to_string();
+    assert_eq!(
+        not_carried(&inventory),
+        [
+            ("ext.md".to_string(), outside.clone()),
+            ("rules/b.md".to_string(), outside)
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_inside_the_folder_keeps_its_own_name() {
+    let env = env();
+    let root = &env.roots.claude_home;
+    write(&root.join("CLAUDE.md"), "@alias.md");
+    write(&root.join("real.md"), "x");
+    std::os::unix::fs::symlink(root.join("real.md"), root.join("alias.md")).unwrap();
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    assert_eq!(names(&inventory), ["CLAUDE.md", "alias.md"]);
+    assert!(not_carried(&inventory).is_empty());
+    // The bytes come from the target.
+    let found = inventory.instructions.unwrap();
+    assert_eq!(found.files[1].path, root.join("real.md"));
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_md_may_be_a_link_inside_the_folder() {
+    let env = env();
+    let root = &env.roots.claude_home;
+    write(&root.join("AGENTS.md"), "shared");
+    std::os::unix::fs::symlink(root.join("AGENTS.md"), root.join("CLAUDE.md")).unwrap();
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    assert_eq!(names(&inventory), ["CLAUDE.md"]);
+    let found = inventory.instructions.unwrap();
+    assert!(found.is_carried());
+    assert_eq!(found.size, 6);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_linked_rules_folder_keeps_the_rules_name() {
+    let env = env();
+    let root = &env.roots.claude_home;
+    write(&root.join("CLAUDE.md"), "hi");
+    write(&root.join("shared/rules/style.md"), "s");
+    write(&root.join("shared/rules/deep/more.md"), "m");
+    std::os::unix::fs::symlink(root.join("shared/rules"), root.join("rules")).unwrap();
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    assert_eq!(
+        names(&inventory),
+        ["CLAUDE.md", "rules/deep/more.md", "rules/style.md"]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_rules_folder_linked_outside_is_reported() {
+    let env = env();
+    let root = &env.roots.claude_home;
+    write(&root.join("CLAUDE.md"), "hi");
+    write(&env.roots.home.join("elsewhere/a.md"), "a");
+    std::os::unix::fs::symlink(env.roots.home.join("elsewhere"), root.join("rules")).unwrap();
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    assert_eq!(names(&inventory), ["CLAUDE.md"]);
+    assert_eq!(
+        not_carried(&inventory),
+        [(
+            "rules".to_string(),
+            "Outside the Claude config folder".to_string()
+        )]
+    );
+}
+
+#[test]
+fn mentions_are_ignored_but_missing_paths_are_reported() {
+    let env = env();
+    let root = &env.roots.claude_home;
+    write(
+        &root.join("CLAUDE.md"),
+        "ask @alice and @team about @docs/gone.md",
+    );
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    assert_eq!(
+        not_carried(&inventory),
+        [("docs/gone.md".to_string(), "Not found".to_string())]
+    );
+}
+
+#[test]
+fn dot_folders_are_not_walked_or_imported() {
+    let env = env();
+    let root = &env.roots.claude_home;
+    write(&root.join("CLAUDE.md"), "@.git/notes.md\n@.hidden/x.md");
+    write(&root.join(".git/notes.md"), "g");
+    write(&root.join(".hidden/x.md"), "h");
+    write(&root.join("rules/ok.md"), "ok");
+    write(&root.join("rules/.git/config.md"), "g");
+    write(&root.join("rules/.cache/a.md"), "c");
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    assert_eq!(names(&inventory), ["CLAUDE.md", "rules/ok.md"]);
+    let refused = "Not allowed to copy".to_string();
+    assert_eq!(
+        not_carried(&inventory),
+        [
+            (".git/notes.md".to_string(), refused.clone()),
+            (".hidden/x.md".to_string(), refused)
+        ]
+    );
+}
+
+#[test]
+fn an_exhausted_rules_walk_is_reported() {
+    let env = env();
+    let root = &env.roots.claude_home;
+    write(&root.join("CLAUDE.md"), "hi");
+    std::fs::create_dir_all(root.join("rules")).unwrap();
+    for n in 0..2_100 {
+        std::fs::write(root.join(format!("rules/f{n:04}.txt")), "").unwrap();
+    }
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    assert_eq!(names(&inventory), ["CLAUDE.md"]);
+    assert_eq!(
+        not_carried(&inventory),
+        [("rules".to_string(), "Too many files in rules".to_string())]
+    );
+}
+
+#[test]
+fn indented_code_is_not_scanned_but_list_continuations_are() {
+    let env = env();
+    let root = &env.roots.claude_home;
+    write(
+        &root.join("CLAUDE.md"),
+        "Example:\n\n    @code.md\n    @code2.md\n\n\t@tab.md\n\n- item\n\n    @listed.md\n\nplain\n    @lazy.md\n",
+    );
+    for name in ["code", "code2", "tab", "listed", "lazy"] {
+        write(&root.join(format!("{name}.md")), "x");
+    }
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    assert_eq!(names(&inventory), ["CLAUDE.md", "lazy.md", "listed.md"]);
+}
+
+#[test]
+fn an_absolute_import_inside_the_folder_is_carried_with_a_note() {
+    let env = env();
+    let root = &env.roots.claude_home;
+    write(
+        &root.join("CLAUDE.md"),
+        &format!("@{}", root.join("abs.md").display()),
+    );
+    write(&root.join("abs.md"), "x");
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    assert_eq!(names(&inventory), ["CLAUDE.md", "abs.md"]);
+    // Carried with a caveat: a note, not a "not copied" entry.
+    assert!(not_carried(&inventory).is_empty());
+    let notes = inventory.instructions.unwrap().notes;
+    assert_eq!(notes.len(), 1);
+    assert_eq!(
+        notes[0].1,
+        "Written as an absolute path; it will not resolve in the cloud"
+    );
+}
+
+#[test]
+fn credential_files_are_refused() {
+    let env = env();
+    let root = &env.roots.claude_home;
+    write(&root.join(".credentials.json"), "{\"fake\":true}");
+    write(&root.join("CLAUDE.md"), "@.credentials.json\n@.ssh/id.md");
+    write(&root.join(".ssh/id.md"), "fake key");
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    assert_eq!(names(&inventory), ["CLAUDE.md"]);
+    assert_eq!(
+        not_carried(&inventory),
+        [
+            (
+                ".credentials.json".to_string(),
+                "Only Markdown files are copied".to_string()
+            ),
+            (".ssh/id.md".to_string(), "Not allowed to copy".to_string())
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hard_link_to_a_credentials_file_is_refused() {
+    let env = env();
+    let root = &env.roots.claude_home;
+    write(&env.roots.home.join(".ssh/id_fake"), "fake key");
+    std::fs::hard_link(env.roots.home.join(".ssh/id_fake"), root.join("linked.md")).unwrap();
+    write(&root.join("CLAUDE.md"), "@linked.md");
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    assert_eq!(names(&inventory), ["CLAUDE.md"]);
+    assert_eq!(not_carried(&inventory).len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_claude_md_that_cannot_be_carried_carries_nothing() {
+    let env = env();
+    let root = &env.roots.claude_home;
+    write(&root.join("CLAUDE.md"), "x");
+    write(&root.join("rules/a.md"), "ok");
+    {
+        std::fs::remove_file(root.join("CLAUDE.md")).unwrap();
+        write(&env.roots.home.join("elsewhere.md"), "x");
+        std::os::unix::fs::symlink(env.roots.home.join("elsewhere.md"), root.join("CLAUDE.md"))
+            .unwrap();
+        let inventory = build_inventory(&env.roots, Workspace::Codespace);
+        let found = inventory.instructions.unwrap();
+        assert!(!found.is_carried());
+        assert!(found.files.is_empty());
+        assert_eq!(found.not_carried[0].0, "CLAUDE.md");
+    }
+}
+
+#[test]
+fn caps_exclude_the_instructions_entirely() {
+    // More than 64 files.
+    let env_files = env();
+    let root = &env_files.roots.claude_home;
+    write(&root.join("CLAUDE.md"), "hi");
+    for n in 0..64 {
+        write(&root.join(format!("rules/r{n:02}.md")), "r");
+    }
+    let found = build_inventory(&env_files.roots, Workspace::Codespace)
+        .instructions
+        .unwrap();
+    assert_eq!(found.exclusion, Some(Exclusion::TooManyFiles));
+    assert!(found.files.is_empty());
+    assert!(!found.is_carried());
+
+    // One file over 256 KiB.
+    let env_big = env();
+    write(
+        &env_big.roots.claude_home.join("CLAUDE.md"),
+        &"x".repeat(256 * 1024 + 1),
+    );
+    let found = build_inventory(&env_big.roots, Workspace::Codespace)
+        .instructions
+        .unwrap();
+    assert_eq!(found.exclusion, Some(Exclusion::TooLarge));
+
+    // Each file fine, 1 MiB in total.
+    let env_total = env();
+    let root = &env_total.roots.claude_home;
+    write(&root.join("CLAUDE.md"), &"x".repeat(200 * 1024));
+    for n in 0..5 {
+        write(
+            &root.join(format!("rules/r{n}.md")),
+            &"y".repeat(200 * 1024),
+        );
+    }
+    let found = build_inventory(&env_total.roots, Workspace::Codespace)
+        .instructions
+        .unwrap();
+    assert_eq!(found.exclusion, Some(Exclusion::TooLarge));
+    assert_eq!(found.size, 0);
+}
+
+#[test]
+fn the_content_hash_follows_the_instructions() {
+    let env = env();
+    let root = &env.roots.claude_home;
+    write(&root.join("CLAUDE.md"), "@RTK.md");
+    write(&root.join("RTK.md"), "one");
+    let first = build_inventory(&env.roots, Workspace::Codespace);
+    let again = build_inventory(&env.roots, Workspace::Codespace);
+    assert_eq!(first.content_hash, again.content_hash);
+    write(&root.join("RTK.md"), "two");
+    let changed = build_inventory(&env.roots, Workspace::Codespace);
+    assert_ne!(first.content_hash, changed.content_hash);
+    assert_ne!(first.change_token(), changed.change_token());
+}
+
+#[test]
+fn only_markdown_imports_are_carried() {
+    let env = env();
+    let root = &env.roots.claude_home;
+    write(
+        &root.join("CLAUDE.md"),
+        "@notes.txt\n@data.json\n@UPPER.MD\n@plain",
+    );
+    write(&root.join("notes.txt"), "t");
+    write(&root.join("data.json"), "{}");
+    write(&root.join("UPPER.MD"), "u");
+    write(&root.join("plain"), "p");
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    assert_eq!(names(&inventory), ["CLAUDE.md", "UPPER.MD"]);
+    let why = "Only Markdown files are copied".to_string();
+    assert_eq!(
+        not_carried(&inventory),
+        [
+            ("notes.txt".to_string(), why.clone()),
+            ("data.json".to_string(), why.clone()),
+            ("plain".to_string(), why)
+        ]
+    );
+}
+
+#[test]
+fn claudes_own_folders_are_never_carried() {
+    let env = env();
+    let root = &env.roots.claude_home;
+    let mut text = String::new();
+    for dir in [
+        "skills",
+        "plugins",
+        "projects",
+        "agents",
+        "commands",
+        "output-styles",
+        "hooks",
+        "todos",
+        "shell-snapshots",
+        "session-env",
+        "file-history",
+        "ide",
+        "statsig",
+        "plans",
+        "backups",
+        "downloads",
+        "sessions",
+        "state",
+    ] {
+        text.push_str(&format!("@{dir}/x.md\n"));
+        write(&root.join(dir).join("x.md"), "x");
+    }
+    write(&root.join("CLAUDE.md"), &text);
+    write(&root.join("mine/x.md"), "ok");
+    write(&root.join("CLAUDE.md.extra"), "");
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    assert_eq!(names(&inventory), ["CLAUDE.md"]);
+    let listed = not_carried(&inventory);
+    assert_eq!(listed.len(), 18);
+    assert!(listed.iter().all(|(_, why)| why == "Claude's own folder"));
+}
+
+#[test]
+fn only_new_path_like_imports_are_reported_as_nested_too_deeply() {
+    let env = env();
+    let root = &env.roots.claude_home;
+    write(&root.join("CLAUDE.md"), "@a1.md");
+    for n in 1..=4 {
+        write(&root.join(format!("a{n}.md")), &format!("@a{}.md", n + 1));
+    }
+    // a5 sits at depth 5: a mention, a file already carried and a new file.
+    write(&root.join("a5.md"), "@alice @a2.md @a6.md");
+    write(&root.join("a6.md"), "x");
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    assert_eq!(
+        not_carried(&inventory),
+        [("a6.md".to_string(), "Nested too deeply".to_string())]
+    );
+}
+
+#[test]
+fn an_indented_fence_inside_indented_code_does_not_open_a_fence() {
+    let env = env();
+    let root = &env.roots.claude_home;
+    write(
+        &root.join("CLAUDE.md"),
+        "Example:\n\n    ```\n    @code.md\n\n@real.md\n",
+    );
+    write(&root.join("code.md"), "x");
+    write(&root.join("real.md"), "x");
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    assert_eq!(names(&inventory), ["CLAUDE.md", "real.md"]);
+}

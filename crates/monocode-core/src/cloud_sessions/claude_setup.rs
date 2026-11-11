@@ -62,6 +62,11 @@ use crate::store::Store;
 
 /// The Host capability for `kit.*`.
 pub const CAPABILITY: &str = "claude.kit";
+/// The Host capability for `instructions/` in the kit tar (the user's `CLAUDE.md`).
+pub const INSTRUCTIONS_CAPABILITY: &str = "claude.kit.instructions";
+/// Shown when instructions are on but the Host cannot take them yet.
+pub const INSTRUCTIONS_HOST_NOTE: &str =
+    "Your instructions need a newer Monoptah Host; they will be copied after it is updated.";
 /// The Host capability for `uploads.*`.
 pub const UPLOADS_CAPABILITY: &str = "uploads";
 /// Store setting holding the JSON map `CloudRef::key() -> SetupState`.
@@ -468,7 +473,15 @@ fn run_inner(
     let inventory = kit::build_inventory(&roots, plan.workspace);
     // Secrets are in the inventory from here on: nothing leaves without the scrub.
     let scrub = Scrub::from_inventory(&inventory, &plan.prefs);
-    state.token = Some(Token(kit_pack::selection_token(&inventory, &plan.prefs)));
+    // Instructions count in the token only once they were really sent (set again below).
+    state.token = Some(Token(kit_pack::selection_token_for(
+        &inventory,
+        &plan.prefs,
+        false,
+    )));
+    let wants_instructions = kit_prefs::selected(&inventory, &plan.prefs)
+        .instructions
+        .is_some();
     let request = |method: &str, params: Value| -> Result<Value, String> {
         env.host
             .request_timeout(target.machine_id, method, params, timeout_for(method))
@@ -476,7 +489,26 @@ fn run_inner(
     };
 
     // The Host must know the kit and uploads; an older one is a warning, not a failure.
-    if let Ok(info) = env.host.host_info(target.machine_id) {
+    let mut instructions_supported = false;
+    let described = env.host.host_info(target.machine_id);
+    if let Err(error) = &described {
+        // An apply without `instructions/` makes the Host remove the instructions it has, so
+        // while the Host cannot be asked, a kit that carries instructions is not applied.
+        if wants_instructions {
+            warn(
+                &mut state,
+                &scrub,
+                &format!(
+                    "Could not check the workspace's Host ({}), so the Claude setup was not sent and your instructions were left as they are. Try again.",
+                    scrub.host_text(error)
+                ),
+                progress,
+            );
+            return state;
+        }
+    }
+    if let Ok(info) = described {
+        instructions_supported = info.supports(INSTRUCTIONS_CAPABILITY);
         if !info.supports(CAPABILITY) || !info.supports(UPLOADS_CAPABILITY) {
             warn(
                 &mut state,
@@ -509,6 +541,10 @@ fn run_inner(
         }
     };
 
+    if !instructions_supported && wants_instructions {
+        warn(&mut state, &scrub, INSTRUCTIONS_HOST_NOTE, progress);
+    }
+    let present = present.with_instructions(instructions_supported);
     let packed = match kit_pack::pack(&inventory, &roots, &plan.prefs, &present) {
         Ok(packed) => packed,
         Err(error) => {
@@ -521,6 +557,11 @@ fn run_inner(
             return state;
         }
     };
+    state.token = Some(Token(kit_pack::selection_token_for(
+        &inventory,
+        &plan.prefs,
+        !packed.instructions.is_empty(),
+    )));
     // The values actually sent, which may differ from the scanned ones.
     scrub.learn_packed(&packed);
     for line in &packed.warnings {
@@ -600,6 +641,14 @@ fn run_inner(
             {
                 warn(&mut state, &scrub, &scrub.host_text(line), progress);
             }
+            for (path, reason) in parse_instructions_result(&reply).skipped {
+                let line = if reason.is_empty() {
+                    format!("Instruction file \"{path}\" was not installed.")
+                } else {
+                    format!("Instruction file \"{path}\" was not installed: {reason}.")
+                };
+                warn(&mut state, &scrub, &scrub.host_text(&line), progress);
+            }
         }
         Err(error) => {
             warn(
@@ -659,7 +708,54 @@ fn run_inner(
     for entry in &state.health {
         progress(&format!("{}: {}", entry.name, entry.label()));
     }
+    // One line for every instructions file that stayed behind, after all other warnings and outside
+    // their cap so it is never the one dropped.
+    if packed.instructions_not_carried > 0 {
+        let n = packed.instructions_not_carried;
+        let line = if n == 1 {
+            "1 instruction file was not copied; see Settings > Cloud.".to_string()
+        } else {
+            format!("{n} of your instruction files were not copied; see Settings > Cloud.")
+        };
+        progress(&line);
+        state.warnings.push(line);
+    }
     state
+}
+
+/// What `kit.apply` says about `instructions/`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InstructionsResult {
+    pub installed: Vec<String>,
+    /// `(path, reason)` of files the Host did not install.
+    pub skipped: Vec<(String, String)>,
+}
+
+/// Reads `instructions` of a `kit.apply` reply. Lenient: absent or malformed parts count as none.
+pub fn parse_instructions_result(reply: &Value) -> InstructionsResult {
+    let Some(found) = reply.get("instructions") else {
+        return InstructionsResult::default();
+    };
+    let text = |value: &Value, key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
+    InstructionsResult {
+        installed: found
+            .get("installed")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect(),
+        skipped: found
+            .get("skipped")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|v| {
+                let path = text(v, "path")?;
+                Some((path, text(v, "reason").unwrap_or_default()))
+            })
+            .collect(),
+    }
 }
 
 fn summary_of(packed: &Packed) -> String {
@@ -672,6 +768,9 @@ fn summary_of(packed: &Packed) -> String {
     }
     if !packed.plugins.is_empty() {
         parts.push(plural(packed.plugins.len(), "plugin", "plugins"));
+    }
+    if !packed.instructions.is_empty() {
+        parts.push("your instructions".to_owned());
     }
     parts.join(", ")
 }
