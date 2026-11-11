@@ -811,6 +811,9 @@ impl ArchiveDialog {
     pub(super) fn others(&self) -> usize {
         self.groups.iter().map(|g| g.others).sum()
     }
+    pub(super) fn focus_handle(&self) -> FocusHandle {
+        self.focus.clone()
+    }
 }
 
 pub(super) fn default_gh() -> Arc<dyn GhRunner> {
@@ -1615,6 +1618,18 @@ impl Shell {
                     .get(id)
                     .is_some_and(|(running, _)| *running)
             })
+    }
+
+    /// Backdrop and Escape: closes the dialog, but never cancels a running save. Only the
+    /// Cancel button does that.
+    pub(super) fn dismiss_cloud_archive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(
+            self.cloud_archive.as_ref().map(|d| &d.phase),
+            Some(Phase::Working { .. })
+        ) {
+            return;
+        }
+        self.close_cloud_archive(window, cx);
     }
 
     pub(super) fn close_cloud_archive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2471,21 +2486,25 @@ impl Shell {
                 )
             }
         };
-        let choosing = matches!(dialog.phase, Phase::Choose);
+        let priority = crate::modal::BLOCKING_PRIORITY;
         Some(
             div()
                 .absolute()
                 .size_full()
-                .child(crate::modal::scrim("cloud-archive-scrim"))
+                .child(crate::modal::barrier(
+                    "cloud-archive-scrim",
+                    priority,
+                    window,
+                ))
                 .child(
                     popover("cloud-archive-modal", Anchor::Center)
                         .modal_surface(self.workspace.boxy_layout())
                         .width(width)
                         .gap(0.)
-                        .priority(60)
+                        .priority(priority)
                         .on_dismiss(move |window, cx| {
                             let _ =
-                                weak.update(cx, |this, cx| this.close_cloud_archive(window, cx));
+                                weak.update(cx, |this, cx| this.dismiss_cloud_archive(window, cx));
                         })
                         .child(
                             div()
@@ -2494,14 +2513,7 @@ impl Shell {
                                 .aria_label("Archive cloud session")
                                 .track_focus(&dialog.focus)
                                 .key_context("CloudArchive")
-                                .on_key_down(cx.listener(
-                                    move |this, event: &gpui::KeyDownEvent, window, cx| {
-                                        if choosing && event.keystroke.key == "enter" {
-                                            this.confirm_cloud_archive(default, window, cx);
-                                            cx.stop_propagation();
-                                        }
-                                    },
-                                ))
+                                .debug_selector(|| "cloud-archive-dialog".into())
                                 .p_4()
                                 .flex()
                                 .flex_col()

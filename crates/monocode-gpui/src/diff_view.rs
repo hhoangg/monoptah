@@ -1484,6 +1484,8 @@ impl Render for DiffView {
         self.request_highlights(&visible, cx);
         let entity = cx.entity();
         let viewport = self.viewport.clone();
+        let wheel_hitbox = std::rc::Rc::new(std::cell::RefCell::new(None::<gpui::Hitbox>));
+        let marker = wheel_hitbox.clone();
         let view_id = cx.entity_id();
         let weak = cx.weak_entity();
         let sticky = self.sticky_header(cx);
@@ -1678,10 +1680,17 @@ impl Render for DiffView {
                             },
                             move |bounds, _, window, _| {
                                 let weak = weak.clone();
+                                let hitbox = wheel_hitbox.clone();
                                 window.on_mouse_event(
-                                    move |event: &ScrollWheelEvent, phase, _, cx| {
+                                    move |event: &ScrollWheelEvent, phase, window, cx| {
+                                        // Hit-tested through the hitbox below, so a dialog
+                                        // barrier drawn above the window blocks the wheel.
                                         if phase != gpui::DispatchPhase::Capture
                                             || !bounds.contains(&event.position)
+                                            || !hitbox
+                                                .borrow()
+                                                .as_ref()
+                                                .is_some_and(|h| h.should_handle_scroll(window))
                                         {
                                             return;
                                         }
@@ -1705,7 +1714,22 @@ impl Render for DiffView {
                         .size_full(),
                     )
                     .children(sticky)
-                    .child(self.overview(cx)),
+                    .child(self.overview(cx))
+                    // Last, so its hitbox sits above the pinned header and the overview.
+                    .child(
+                        canvas(
+                            move |bounds, window, _| {
+                                *marker.borrow_mut() = Some(
+                                    window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal),
+                                );
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                    ),
             )
             .child(self.horizontal_bar(cx))
             .children(comment)
