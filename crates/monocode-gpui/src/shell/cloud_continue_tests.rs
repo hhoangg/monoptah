@@ -721,3 +721,298 @@ fn a_session_born_in_the_cloud_still_answers_under_its_old_id_once_it_is_local(
         })
         .unwrap();
 }
+
+/// Helpers shared by the tests of the blocking progress dialogs.
+pub(super) mod blocking {
+    use super::*;
+    use gpui::{Bounds, Pixels, Point, VisualTestContext};
+
+    /// The sidebar row the tests hover and click, and the button its hover reveals.
+    pub(in crate::shell) const ROW: &str = "sidebar-session-2";
+    pub(in crate::shell) const ARCHIVE: &str = "archive-session-2";
+    pub(in crate::shell) const PROBED: i64 = 2;
+    pub(in crate::shell) const OTHER: i64 = 1;
+    pub(in crate::shell) const MOD: &str = if cfg!(target_os = "macos") {
+        "cmd"
+    } else {
+        "ctrl"
+    };
+
+    /// Binds the keymap the Workspace shortcuts come from, before the window opens.
+    pub(in crate::shell) fn bind(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::input::bind(cx);
+            super::super::bind_keys(cx);
+            cx.set_reduce_motion(true);
+        });
+    }
+
+    /// Makes `PROBED` a visible, inactive sidebar row and returns its centre.
+    pub(in crate::shell) fn arm(
+        window: gpui::WindowHandle<Shell>,
+        cx: &mut TestAppContext,
+    ) -> Point<Pixels> {
+        window
+            .update(cx, |shell, _, cx| {
+                shell.sessions[&PROBED]
+                    .update(cx, |session, _| session.summary.has_messages = true);
+                shell.workspace.active = Some(OTHER);
+                shell.invalidate_chrome(cx);
+            })
+            .unwrap();
+        cx.refresh().unwrap();
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        visual.debug_bounds(ROW).expect("the probed row").center()
+    }
+
+    /// Whether hovering the row at `at` reveals its Archive button.
+    pub(in crate::shell) fn hover_reveals(
+        visual: &mut VisualTestContext,
+        at: Point<Pixels>,
+    ) -> bool {
+        visual.simulate_mouse_move(
+            gpui::point(gpui::px(900.), gpui::px(700.)),
+            None,
+            Default::default(),
+        );
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        visual.simulate_mouse_move(at, None, Default::default());
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        visual.debug_bounds(ARCHIVE).is_some()
+    }
+
+    pub(in crate::shell) fn sidebar_visible(
+        window: gpui::WindowHandle<Shell>,
+        visual: &mut VisualTestContext,
+    ) -> bool {
+        window
+            .update(visual, |shell, _, _| shell.workspace.sidebar_visible)
+            .unwrap()
+    }
+
+    /// Dispatches the View > Toggle Sidebar menu action to the focused node, as AppKit does.
+    pub(in crate::shell) fn menu_toggle_sidebar(
+        window: gpui::WindowHandle<Shell>,
+        visual: &mut VisualTestContext,
+    ) {
+        use gpui::Action;
+        window
+            .update(visual, |_, window, cx| {
+                window.dispatch_action(super::super::ToggleSidebar.boxed_clone(), cx)
+            })
+            .unwrap();
+        visual.run_until_parked();
+    }
+
+    pub(in crate::shell) fn active(
+        window: gpui::WindowHandle<Shell>,
+        visual: &mut VisualTestContext,
+    ) -> Option<i64> {
+        window
+            .update(visual, |shell, _, _| shell.workspace.active)
+            .unwrap()
+    }
+
+    /// The window behind a dialog gets no hover, workspace shortcut or Tab.
+    pub(in crate::shell) fn assert_blocked(
+        window: gpui::WindowHandle<Shell>,
+        visual: &mut VisualTestContext,
+        at: Point<Pixels>,
+        card: Bounds<Pixels>,
+        dialog_focus: impl Fn(&Shell, &Window, &App) -> bool,
+    ) {
+        assert!(
+            !card.contains(&at),
+            "the probed row must be outside the card"
+        );
+        assert!(!hover_reveals(visual, at), "hover must not reach the row");
+        let visible = sidebar_visible(window, visual);
+        visual.simulate_keystrokes(&format!("{MOD}-b"));
+        assert_eq!(
+            sidebar_visible(window, visual),
+            visible,
+            "no workspace shortcut"
+        );
+        menu_toggle_sidebar(window, visual);
+        assert_eq!(
+            sidebar_visible(window, visual),
+            visible,
+            "no menu action reaches the workspace"
+        );
+        visual.simulate_keystrokes("tab");
+        assert!(
+            window
+                .update(visual, |shell, window, cx| dialog_focus(shell, window, cx))
+                .unwrap(),
+            "Tab must keep focus inside the dialog"
+        );
+    }
+
+    /// The window works again: hover, the sidebar shortcut and focus inside the Shell.
+    pub(in crate::shell) fn assert_restored(
+        window: gpui::WindowHandle<Shell>,
+        visual: &mut VisualTestContext,
+        at: Point<Pixels>,
+    ) {
+        assert!(hover_reveals(visual, at), "hover works again");
+        let visible = sidebar_visible(window, visual);
+        visual.simulate_keystrokes(&format!("{MOD}-b"));
+        assert_eq!(
+            sidebar_visible(window, visual),
+            !visible,
+            "shortcut works again"
+        );
+        visual.simulate_keystrokes(&format!("{MOD}-b"));
+        assert_eq!(sidebar_visible(window, visual), visible);
+        menu_toggle_sidebar(window, visual);
+        assert_eq!(
+            sidebar_visible(window, visual),
+            !visible,
+            "menu works again"
+        );
+        menu_toggle_sidebar(window, visual);
+        assert_eq!(sidebar_visible(window, visual), visible);
+        assert!(
+            window
+                .update(visual, |shell, window, cx| shell
+                    .focus
+                    .contains_focused(window, cx))
+                .unwrap(),
+            "focus is back inside the Shell"
+        );
+    }
+}
+
+fn continue_focused(shell: &Shell, window: &Window, cx: &App) -> bool {
+    shell
+        .cloud_continue
+        .dialog
+        .as_ref()
+        .is_some_and(|d| d.focus_handle().contains_focused(window, cx))
+}
+
+#[gpui::test]
+fn a_running_continue_blocks_the_window_behind_it_and_ignores_escape(cx: &mut TestAppContext) {
+    use blocking::*;
+    bind(cx);
+    let (window, local) = moved_window(cx);
+    let at = arm(window, cx);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    assert!(
+        hover_reveals(visual, at),
+        "the hover probe works without a dialog"
+    );
+    window
+        .update(visual, |shell, window, cx| {
+            shell.open_continue_locally(local, window, cx);
+            shell.cloud_continue.hold_working("Saving the code state");
+        })
+        .unwrap();
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    let card = visual
+        .debug_bounds("cloud-continue-dialog")
+        .expect("the dialog");
+    assert_blocked(window, visual, at, card, continue_focused);
+    visual.simulate_keystrokes("escape");
+    window
+        .update(visual, |shell, _, _| {
+            assert_eq!(shell.cloud_continue.phase_name(), "working");
+        })
+        .unwrap();
+    // A press on the backdrop does not close it either.
+    visual.simulate_click(
+        gpui::point(gpui::px(900.), gpui::px(700.)),
+        Default::default(),
+    );
+    window
+        .update(visual, |shell, _, _| {
+            assert_eq!(shell.cloud_continue.phase_name(), "working");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_continue_confirmation_closes_with_escape_or_cancel_and_frees_the_window(
+    cx: &mut TestAppContext,
+) {
+    use blocking::*;
+    bind(cx);
+    let (window, local) = moved_window(cx);
+    let at = arm(window, cx);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    window
+        .update(visual, |shell, window, cx| {
+            shell.open_continue_locally(local, window, cx)
+        })
+        .unwrap();
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    let card = visual
+        .debug_bounds("cloud-continue-dialog")
+        .expect("the dialog");
+    assert_blocked(window, visual, at, card, continue_focused);
+    window
+        .update(visual, |shell, _, _| {
+            assert_eq!(shell.cloud_continue.phase_name(), "confirm");
+        })
+        .unwrap();
+    visual.simulate_keystrokes("escape");
+    window
+        .update(visual, |shell, _, _| {
+            assert_eq!(shell.cloud_continue.phase_name(), "closed");
+        })
+        .unwrap();
+    visual.refresh().unwrap();
+    assert_restored(window, visual, at);
+
+    // The Cancel button still works through the barrier.
+    window
+        .update(visual, |shell, window, cx| {
+            shell.open_continue_locally(local, window, cx)
+        })
+        .unwrap();
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    let cancel = visual
+        .debug_bounds("cloud-continue-cancel")
+        .expect("Cancel");
+    visual.simulate_click(cancel.center(), Default::default());
+    window
+        .update(visual, |shell, _, _| {
+            assert_eq!(shell.cloud_continue.phase_name(), "closed");
+        })
+        .unwrap();
+    visual.refresh().unwrap();
+    assert_restored(window, visual, at);
+}
+
+#[gpui::test]
+fn a_finished_continue_returns_focus_and_the_window_to_the_shell(cx: &mut TestAppContext) {
+    use blocking::*;
+    bind(cx);
+    let (window, local) = moved_window(cx);
+    let at = arm(window, cx);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    let calls = Arc::new(AtomicUsize::new(0));
+    window
+        .update(visual, |shell, window, cx| {
+            shell.cloud_continue.run = fake(calls.clone(), None, shell.store.clone());
+            shell.open_continue_locally(local, window, cx);
+            shell.confirm_continue_locally(window, cx);
+        })
+        .unwrap();
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    window
+        .update(visual, |shell, _, _| {
+            assert_eq!(shell.cloud_continue.phase_name(), "closed");
+        })
+        .unwrap();
+    assert_restored(window, visual, at);
+}
