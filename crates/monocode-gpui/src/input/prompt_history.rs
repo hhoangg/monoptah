@@ -87,6 +87,7 @@ impl Input {
         if self.prompt_history.is_none()
             || self.code.is_some()
             || self.single_line
+            || self.secret
             || self.read_only
             || self.is_composing()
             || !self.selection.is_empty()
