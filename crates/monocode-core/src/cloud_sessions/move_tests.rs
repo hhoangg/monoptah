@@ -457,11 +457,26 @@ impl Fx {
         Self::build_with(provider, version, prepare, Arc::new(NoGh))
     }
 
+    /// The desktop schema (`Store::open_monocode`), which every real launch of the app uses.
+    fn new_shared() -> Self {
+        Self::build_full("claude", "2.1.321", |_| {}, Arc::new(NoGh), true)
+    }
+
     fn build_with(
         provider: &str,
         version: &str,
         prepare: impl FnOnce(&Path),
         gh: Arc<dyn GhRunner>,
+    ) -> Self {
+        Self::build_full(provider, version, prepare, gh, false)
+    }
+
+    fn build_full(
+        provider: &str,
+        version: &str,
+        prepare: impl FnOnce(&Path),
+        gh: Arc<dyn GhRunner>,
+        shared: bool,
     ) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
@@ -490,7 +505,11 @@ impl Fx {
         std::fs::write(work.join(".env.local"), "SECRET=hunter2\n").unwrap();
         prepare(&work);
 
-        let store = Arc::new(Mutex::new(Store::open(&root.join("native.db")).unwrap()));
+        let store = Arc::new(Mutex::new(if shared {
+            Store::open_monocode(&root.join("monocode.db")).unwrap()
+        } else {
+            Store::open(&root.join("native.db")).unwrap()
+        }));
         let work_text = work.to_string_lossy().into_owned();
         let session = {
             let mut guard = store.lock().unwrap();
@@ -499,7 +518,12 @@ impl Fx {
             if provider == "claude" {
                 guard.provider_id(session.id, CLAUDE_ID).unwrap();
             }
-            guard.write_rows(session.id, 0, &rows()).unwrap();
+            let mut local = rows();
+            if shared {
+                // Blocks hold one message each: a continuation row would merge into its prompt.
+                local.iter_mut().for_each(|row| row.first = true);
+            }
+            guard.write_rows(session.id, 0, &local).unwrap();
             session.id
         };
         // The Claude transcript the session resumes.
@@ -818,6 +842,39 @@ fn a_move_runs_every_step_in_order_and_flips_the_location_last() {
         .unwrap()
         .require_local_run(fx.session)
         .is_err());
+}
+
+#[test]
+fn a_move_on_the_desktop_schema_store_gets_past_the_snapshot_and_keeps_the_local_rows() {
+    let fx = Fx::new_shared();
+    assert_eq!(fx.row_count(), 4);
+    let before = fx.store.lock().unwrap().load(fx.session).unwrap().rows;
+    let (result, events) = fx.run();
+    let outcome = result.unwrap();
+    assert!(matches!(events.last(), Some(MoveEvent::Done(_))));
+    let SessionLocation::Cloud(location) = fx.location() else {
+        panic!("not in the cloud")
+    };
+    assert_eq!(location.moved_at_row, 4);
+    assert_eq!(outcome.moved_at_row, 4);
+    assert_eq!(fx.row_count(), 4);
+    assert_eq!(
+        fx.store.lock().unwrap().load(fx.session).unwrap().rows,
+        before
+    );
+    // The live sync of cloud turns works on the same store.
+    let mut store = fx.store.lock().unwrap();
+    let mut snapshot = json!({"revision": 1, "status": "idle", "session": {"id": "host-1", "blocks": [
+        {"id": "c1", "role": "user", "text": "cloud q"},
+        {"id": "c2", "role": "assistant", "text": "cloud a"}]}});
+    crate::remote::attachments::qualify_snapshot(&mut snapshot, ENV, "host-1");
+    let out = store.append_remote_rows(fx.session, &snapshot).unwrap();
+    assert_eq!((out.start, out.written), (4, 3));
+    let again = store.append_remote_rows(fx.session, &snapshot).unwrap();
+    assert_eq!((again.written, again.truncated), (0, 0));
+    let rows = store.load(fx.session).unwrap().rows;
+    assert_eq!(&rows[..4], &before[..]);
+    assert_eq!(rows.len(), 7);
 }
 
 #[test]
