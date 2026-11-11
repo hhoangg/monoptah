@@ -864,8 +864,10 @@ fn undo_files(root: &Path, expected: &str, old_tree: &str, scratch: &Path) -> Re
 
 // Test seam: runs between the steps of the apply to inject what a user could do there.
 #[cfg(test)]
+pub(super) type WindowHook = Box<dyn Fn(&str, &Path)>;
+#[cfg(test)]
 thread_local! {
-    pub(super) static WINDOW: std::cell::RefCell<Option<Box<dyn Fn(&str, &Path)>>> =
+    pub(super) static WINDOW: std::cell::RefCell<Option<WindowHook>> =
         const { std::cell::RefCell::new(None) };
 }
 
