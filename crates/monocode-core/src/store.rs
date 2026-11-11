@@ -5,8 +5,8 @@ mod contributions;
 mod location;
 pub use location::UNREADABLE_LOCATION as UNREADABLE_LOCATION_TEXT;
 pub use location::{
-    CloudLocation, SessionLocation, HOST_TURN_RUNNING, LOCAL_RUN_REFUSED, LOCAL_TUI_REFUSED,
-    UNREADABLE_NOTICE, WORKSPACE_LOST,
+    CloudLocation, MovePoint, SessionLocation, HOST_TURN_RUNNING, LOCAL_RUN_REFUSED,
+    LOCAL_TUI_REFUSED, UNREADABLE_NOTICE, WORKSPACE_LOST,
 };
 mod cloud_rows;
 pub use cloud_rows::{AppendOutcome, RowAnchor};

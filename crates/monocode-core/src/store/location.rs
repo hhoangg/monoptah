@@ -96,7 +96,54 @@ pub const UNREADABLE_NOTICE: &str = "The cloud location of this conversation can
 /// Why a session with a stored but unparsable location is refused.
 pub const UNREADABLE_LOCATION: &str = "unreadable cloud location";
 
+/// The local tree a move left behind. Kept after the move (the move record is cleared at the
+/// flip) until the session returns, so "Continue locally" can tell whether the working copy
+/// changed since (design 4.2.3).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MovePoint {
+    /// The Host session of the move this point belongs to (a reused session id never matches).
+    pub host_session_id: String,
+    pub head: String,
+    pub tree: String,
+    /// The folder the session worked in: a session worktree, else the project folder.
+    pub work_cwd: String,
+}
+
 impl Store {
+    fn move_point_key(session: i64) -> String {
+        format!("cloud-move-point:{session}")
+    }
+    pub fn set_cloud_move_point(&self, session: i64, point: &MovePoint) -> Result<(), String> {
+        self.save_setting(
+            &Self::move_point_key(session),
+            &serde_json::to_string(point).map_err(|e| e.to_string())?,
+        )
+    }
+    /// The recorded move point, only when it belongs to the session's current Cloud location.
+    pub fn cloud_move_point(&self, session: i64) -> Option<MovePoint> {
+        let SessionLocation::Cloud(location) = self.cloud_location(session).ok()? else {
+            return None;
+        };
+        let raw = self.setting(&Self::move_point_key(session)).ok()??;
+        let point: MovePoint = serde_json::from_str(&raw).ok()?;
+        (point.host_session_id == location.host_session_id).then_some(point)
+    }
+    pub fn clear_cloud_move_point(&self, session: i64) -> Result<(), String> {
+        self.save_setting(&Self::move_point_key(session), "")
+    }
+    fn continue_key(session: i64) -> String {
+        format!("cloud-continue:{session}")
+    }
+    /// Progress of a "Continue locally" that stopped half way (see `continue_local`).
+    pub fn cloud_continue_progress(&self, session: i64) -> Option<String> {
+        self.setting(&Self::continue_key(session))
+            .ok()?
+            .filter(|raw| !raw.is_empty())
+    }
+    pub fn set_cloud_continue_progress(&self, session: i64, raw: &str) -> Result<(), String> {
+        self.save_setting(&Self::continue_key(session), raw)
+    }
     fn location_key(session: i64) -> String {
         format!("cloud-location:{session}")
     }
@@ -258,6 +305,7 @@ impl Store {
             self.link_remote_session(id, None)?;
         }
         let _ = self.save_setting(&Self::sync_error_key(session), "");
+        let _ = self.save_setting(&Self::move_point_key(session), "");
         self.save_setting(&Self::location_key(session), "")
     }
     /// Writes the Cloud location together with the settings the move needs in ONE transaction:

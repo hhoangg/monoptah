@@ -1745,6 +1745,17 @@ impl CloudSessions {
             ));
         }
         store.save_setting(&format!("{NOTE_PREFIX}{session}"), &note)?;
+        // The tree this move left behind: the way back applies the cloud work in place only
+        // while the local tree is still exactly this (design 4.2.3).
+        store.set_cloud_move_point(
+            session,
+            &crate::store::MovePoint {
+                host_session_id: host_session.clone(),
+                head: record.head.clone(),
+                tree: record.tree.clone(),
+                work_cwd: record.work_cwd.clone(),
+            },
+        )?;
         // Everything below runs under the store lock, so no local write lands in between.
         if local_busy(session, busy) {
             return Err(Stop::Failed(BUSY.into()));

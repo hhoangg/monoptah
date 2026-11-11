@@ -1854,6 +1854,7 @@ pub mod move_out;
 pub mod move_session;
 pub use backend::{CloudBackend, CloudBackendKind, CloudRef, CodespacesBackend};
 
+mod continue_local;
 mod convert;
 pub use convert::*;
 pub mod transcript_sync;
