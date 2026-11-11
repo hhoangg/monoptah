@@ -1,4 +1,5 @@
 //! "Continue locally" against the same real-git fixtures the archive tests use.
+use super::convert::nanos;
 use super::convert_tests::{git, world, World, SESSION};
 use super::*;
 use crate::store::{CloudLocation, MovePoint, SessionLocation};
@@ -1512,45 +1513,93 @@ fn a_write_that_fails_partway_keeps_the_marker_and_the_backup() {
         local
     };
     // A read-only folder: git cannot unlink d/x.txt after it wrote other files.
+    let stages = record_stages();
     std::fs::set_permissions(w.project.join("d"), std::fs::Permissions::from_mode(0o555)).unwrap();
     let result = run(&w, local);
     std::fs::set_permissions(w.project.join("d"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    clear_stage();
+    // The exact path: the partial write was detected, then the undo ran (and could not
+    // finish because the folder is read-only), so the result is Broken.
+    let seen = stages.borrow().clone();
+    let partial = seen.iter().position(|s| s == "partial-write-detected");
+    let undo = seen.iter().position(|s| s == "undo-ran");
+    assert!(partial.is_some() && undo > partial, "{seen:?}");
+    let error = result.unwrap_err().to_string();
+    assert!(
+        error.contains("stopped partway") && error.contains("pre-continue"),
+        "{error}"
+    );
+    assert!(
+        !error.contains("left alone") && !error.contains("nothing was written"),
+        "{error}"
+    );
     let store = w.svc.store().unwrap();
-    match result {
-        Err(error) => {
-            let error = error.to_string();
-            assert!(error.contains("pre-continue"), "{error}");
-            assert!(
-                !error.contains("left alone") && !error.contains("nothing was written"),
-                "{error}"
-            );
-            let marker = store
-                .cloud_continue_broken(local)
-                .expect("the marker stays");
-            let backup = serde_json::from_str::<serde_json::Value>(&marker).unwrap()["backup"]
-                .as_str()
-                .unwrap()
-                .to_string();
-            // The only copy of the user's uncommitted bytes is still there.
-            let patch: String = std::fs::read_dir(&backup)
-                .unwrap()
-                .flatten()
-                .filter_map(|e| std::fs::read_to_string(e.path()).ok())
-                .collect();
-            assert!(patch.contains("uncommitted bytes"), "{patch}");
-        }
-        // Everything was put back and verified: then the folder is exactly as it was.
-        Ok(_) => {
-            assert_eq!(
-                std::fs::read_to_string(w.project.join("mod.txt")).unwrap(),
-                "mod\n"
-            );
-            assert_eq!(
-                std::fs::read_to_string(w.project.join("keep-me.txt")).unwrap(),
-                "uncommitted bytes\n"
-            );
-        }
-    }
+    let marker = store
+        .cloud_continue_broken(local)
+        .expect("the marker stays");
+    let backup = serde_json::from_str::<serde_json::Value>(&marker).unwrap()["backup"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // The backup is the copy of the user's uncommitted bytes, and it was not deleted.
+    let patch: String = std::fs::read_dir(&backup)
+        .unwrap()
+        .flatten()
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .collect();
+    assert!(patch.contains("uncommitted bytes"), "{patch}");
+    assert!(store.cloud_location(local).unwrap().is_cloud());
+}
+
+fn record_stages() -> std::rc::Rc<std::cell::RefCell<Vec<String>>> {
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = seen.clone();
+    super::continue_local::WINDOW.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |name, _| sink.borrow_mut().push(name.into())));
+    });
+    seen
+}
+
+#[test]
+fn the_undo_refuses_to_rewrite_ignored_files_of_the_user() {
+    use super::continue_local::{g, undo_files};
+    let w = world(true);
+    let _ = moved(&w);
+    let tmp = tempfile::tempdir().unwrap();
+    let tree = |extra: &dyn Fn(&dyn Fn(&[&str]))| {
+        let idx = tmp.path().join(format!("{}.idx", nanos()));
+        let text = idx.to_string_lossy().into_owned();
+        let run = |args: &[&str]| {
+            g(&w.project, args, &[("GIT_INDEX_FILE", text.as_str())]).unwrap();
+        };
+        run(&["add", "-A"]);
+        extra(&run);
+        g(
+            &w.project,
+            &["write-tree"],
+            &[("GIT_INDEX_FILE", text.as_str())],
+        )
+        .unwrap()
+        .trim()
+        .to_string()
+    };
+    // (1) a tracked file that matches the ignore rules, changed between the two trees.
+    let old = tree(&|_| {});
+    std::fs::write(w.project.join("a.txt"), "regenerated\n").unwrap();
+    let new = tree(&|_| {});
+    git(&w.project, &["checkout", "-q", "--", "a.txt"]);
+    std::fs::write(w.project.join(".git/info/exclude"), "a.txt\nsecret.log\n").unwrap();
+    let error = undo_files(&w.project, &new, &old, tmp.path()).unwrap_err();
+    assert!(error.contains("ignored file of yours"), "{error}");
+    // (2) an untracked ignored file at a path the undo would rewrite.
+    std::fs::write(w.project.join("secret.log"), "mine\n").unwrap();
+    let with_secret = tree(&|run| run(&["add", "-f", "secret.log"]));
+    let error = undo_files(&w.project, &with_secret, &old, tmp.path()).unwrap_err();
+    assert!(error.contains("ignored file of yours"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("secret.log")).unwrap(),
+        "mine\n"
+    );
 }
 
 #[test]

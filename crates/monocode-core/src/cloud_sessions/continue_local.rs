@@ -637,7 +637,10 @@ impl CloudSessions {
                     "a file changed or appeared while it was applied, so nothing was written ({error})"
                 ));
             }
-            return match undo_files_now() {
+            window_hook("partial-write-detected", &root);
+            let undone = undo_files_now();
+            window_hook("undo-ran", &root);
+            return match undone {
                 Ok(()) => {
                     clear(self);
                     drop_backup();
@@ -1011,7 +1014,12 @@ fn verify_paths(
 /// Undoes a completed `read-tree -u` and nothing else. The undo index is built from the tree
 /// the apply produced (`expected`) and refreshed against the working tree, so any file the
 /// user changed since makes the two-way read-tree REFUSE instead of reverting it.
-fn undo_files(root: &Path, expected: &str, old_tree: &str, scratch: &Path) -> Result<(), String> {
+pub(super) fn undo_files(
+    root: &Path,
+    expected: &str,
+    old_tree: &str,
+    scratch: &Path,
+) -> Result<(), String> {
     let index = scratch.join(format!("undo-{}.idx", nanos()));
     let text = index.to_string_lossy().into_owned();
     let envs = [("GIT_INDEX_FILE", text.as_str())];
