@@ -2,7 +2,7 @@
 use super::*;
 use gpui::{
     AnyElement, App, Element, ElementId, GlobalElementId, InspectorElementId, LayoutId,
-    MouseButton, Point, TextLayout, WeakEntity,
+    MouseButton, Point, TextLayout,
 };
 use std::{cell::RefCell, ops::Range, rc::Rc};
 use unicode_segmentation::UnicodeSegmentation;
@@ -42,12 +42,17 @@ struct Fragment {
     row_text: SharedString,
     layout: TextLayout,
 }
+/// The selection state of one selectable surface: the transcript, or any
+/// other view that renders Markdown rows (the notes preview).
 #[derive(Clone, Default)]
-pub(super) struct Selection(Rc<RefCell<State>>);
+pub(crate) struct Selection(Rc<RefCell<State>>);
+/// Runs after a press on a text run: focuses the owning view so Copy and
+/// Escape reach it, and asks it to redraw.
+type Pressed = Rc<dyn Fn(&mut Window, &mut App)>;
 #[derive(Clone)]
 pub(crate) struct TextSelection {
     state: Selection,
-    view: WeakEntity<TranscriptView>,
+    pressed: Pressed,
     row: (usize, usize),
     response: usize,
     offset: usize,
@@ -83,7 +88,7 @@ impl Selection {
             byte: 3,
         });
     }
-    pub(super) fn clear(&self) {
+    pub(crate) fn clear(&self) {
         let mut state = self.0.borrow_mut();
         state.anchor = None;
         state.head = None;
@@ -91,8 +96,132 @@ impl Selection {
         state.menu = None;
         state.layouts.clear();
     }
-    pub(super) fn begin_frame(&self) {
+    pub(crate) fn begin_frame(&self) {
         self.0.borrow_mut().layouts.clear();
+    }
+    pub(crate) fn dragging(&self) -> bool {
+        self.0.borrow().drag.is_some()
+    }
+    /// Select from the start of `first` to `end` bytes into `last`, within
+    /// one response (a document has a single one).
+    pub(crate) fn select_rows(
+        &self,
+        response: usize,
+        first: (usize, usize),
+        last: (usize, usize),
+        end: usize,
+    ) {
+        let mut state = self.0.borrow_mut();
+        state.response = response;
+        state.anchor = Some(Position {
+            row: first,
+            byte: 0,
+        });
+        state.head = Some(Position {
+            row: last,
+            byte: end,
+        });
+        state.drag = None;
+        state.menu = None;
+    }
+    /// The selected text of `rows` (key, response, selectable text), in order.
+    pub(crate) fn text_of(
+        &self,
+        rows: impl IntoIterator<Item = ((usize, usize), usize, String)>,
+    ) -> Option<String> {
+        let state = self.0.borrow();
+        let (a, b) = (state.anchor?, state.head?);
+        if a == b {
+            return None;
+        }
+        let (a, b) = if a < b { (a, b) } else { (b, a) };
+        let mut parts = Vec::new();
+        for (key, response, text) in rows {
+            if key < a.row || key > b.row || response != state.response {
+                continue;
+            }
+            let start = if key == a.row { snap(&text, a.byte) } else { 0 };
+            let end = if key == b.row {
+                snap(&text, b.byte)
+            } else {
+                text.len()
+            };
+            if start <= end {
+                parts.push(text[start..end].to_owned())
+            }
+        }
+        let text = parts.join("\n").trim().to_owned();
+        (!text.is_empty()).then_some(text)
+    }
+    /// Extend a drag to `point`, as the transcript's `move_selection` does.
+    /// True when the selection changed and the view should redraw.
+    pub(crate) fn drag_to(&self, point: Point<Pixels>, pressed: bool) -> bool {
+        let mut state = self.0.borrow_mut();
+        let Some(drag) = state.drag.as_mut() else {
+            return false;
+        };
+        if !pressed {
+            state.drag = None;
+            return false;
+        }
+        if !drag.moved {
+            let delta = point - drag.origin;
+            if delta.x.abs().max(delta.y.abs()) < px(3.) {
+                return false;
+            }
+            drag.moved = true;
+        }
+        let (anchor, granularity, response) =
+            (drag.anchor.clone(), drag.granularity, state.response);
+        let distance = |f: &Fragment| {
+            let bounds = f.layout.bounds();
+            let dx = (bounds.left() - point.x)
+                .max(px(0.))
+                .max(point.x - bounds.right());
+            let dy = (bounds.top() - point.y)
+                .max(px(0.))
+                .max(point.y - bounds.bottom());
+            f32::from(dy) * 10000. + f32::from(dx)
+        };
+        let Some(fragment) = state
+            .layouts
+            .values()
+            .filter(|f| f.response == response)
+            .min_by(|a, b| distance(a).total_cmp(&distance(b)))
+        else {
+            return false;
+        };
+        let byte = fragment
+            .layout
+            .index_for_position(point)
+            .unwrap_or_else(|ix| ix);
+        let range = unit(&fragment.row_text, fragment.offset + byte, granularity);
+        let row = fragment.row;
+        let (start, end) = (
+            Position {
+                row,
+                byte: range.start,
+            },
+            Position {
+                row,
+                byte: range.end,
+            },
+        );
+        let (anchor, head) = if start < anchor.start {
+            (anchor.end, start)
+        } else {
+            (anchor.start, end)
+        };
+        if state.anchor == Some(anchor) && state.head == Some(head) {
+            return false;
+        }
+        state.anchor = Some(anchor);
+        state.head = Some(head);
+        true
+    }
+    /// End a drag. True when one was in progress.
+    pub(crate) fn finish_drag(&self) -> bool {
+        self.0.borrow_mut().drag.take().is_some()
     }
     fn range(
         &self,
@@ -189,6 +318,24 @@ fn unit(text: &str, byte: usize, granularity: Granularity) -> Range<usize> {
     }
 }
 impl TextSelection {
+    /// A run of row `row` in a single-response surface outside the
+    /// transcript. `pressed` focuses and redraws the owning view.
+    pub(crate) fn new(
+        state: &Selection,
+        row: (usize, usize),
+        pressed: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            state: state.clone(),
+            pressed: Rc::new(pressed),
+            row,
+            response: 0,
+            offset: 0,
+            quote: false,
+            row_text: None,
+            cursor: gpui::CursorStyle::IBeam,
+        }
+    }
     pub(crate) fn with_text(mut self, text: SharedString) -> Self {
         self.row_text = Some(text);
         self
@@ -232,7 +379,7 @@ impl TextSelection {
                     Granularity::Character
                 };
                 let range = unit(&row_text, selection.offset + byte, granularity);
-                let _ = selection.view.update(cx, |view, cx| {
+                {
                     let mut state = selection.state.0.borrow_mut();
                     let start = Position {
                         row: selection.row,
@@ -263,11 +410,8 @@ impl TextSelection {
                     });
                     state.menu = None;
                     drop(state);
-                    if let Some(focus) = &view.selection_focus {
-                        window.focus(focus, cx)
-                    }
-                    cx.notify();
-                });
+                    (selection.pressed)(window, cx);
+                }
             })
             .child(SelectedText {
                 context: self.clone(),
@@ -390,13 +534,23 @@ impl TranscriptView {
         quote: bool,
         cx: &Context<Self>,
     ) -> Option<TextSelection> {
-        (!self.document).then(|| TextSelection {
+        let view = cx.weak_entity();
+        Some(TextSelection {
             state: self.selection.clone(),
-            view: cx.weak_entity(),
+            pressed: Rc::new(move |window, cx| {
+                let _ = view.update(cx, |view, cx| {
+                    if let Some(focus) = &view.selection_focus {
+                        window.focus(focus, cx)
+                    }
+                    cx.notify();
+                });
+            }),
             row,
             response,
             offset: 0,
-            quote,
+            // A document has no chat or note to add the selection to; its
+            // menu offers Copy only.
+            quote: quote && !self.document,
             row_text: None,
             cursor: gpui::CursorStyle::IBeam,
         })
@@ -503,41 +657,40 @@ impl TranscriptView {
         })
         .detach();
     }
-    pub(super) fn selected_text(&self) -> Option<String> {
-        let state = self.selection.0.borrow();
-        let (a, b) = (state.anchor?, state.head?);
-        if a == b {
-            return None;
-        }
-        let (a, b) = if a < b { (a, b) } else { (b, a) };
-        let mut parts = Vec::new();
-        for row in self.rows.iter().filter(|row| {
-            row.key >= a.row
-                && row.key <= b.row
-                && self.messages[row.message].start == state.response
-        }) {
+    fn selectable_rows(&self) -> impl Iterator<Item = ((usize, usize), usize, String)> + '_ {
+        self.rows.iter().filter_map(|row| {
             let text = match &row.body {
                 Body::Markdown(md) => crate::markdown::selection_text(md),
                 Body::Plain(text) => text.to_string(),
                 Body::Interjection(note) => note.text.clone(),
-                _ => continue,
+                _ => return None,
             };
-            let start = if row.key == a.row {
-                snap(&text, a.byte)
-            } else {
-                0
-            };
-            let end = if row.key == b.row {
-                snap(&text, b.byte)
-            } else {
-                text.len()
-            };
-            if start <= end {
-                parts.push(text[start..end].to_owned())
-            }
+            Some((row.key, self.messages[row.message].start, text))
+        })
+    }
+    pub(super) fn selected_text(&self) -> Option<String> {
+        self.selection.text_of(self.selectable_rows())
+    }
+    /// Select All in a document view selects the whole document. A chat
+    /// keeps it unhandled: its selection never crosses responses.
+    pub(super) fn select_all(
+        &mut self,
+        _: &crate::input::SelectAll,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let rows: Vec<_> = self.selectable_rows().collect();
+        let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
+            cx.propagate();
+            return;
+        };
+        if !self.document {
+            cx.propagate();
+            return;
         }
-        let text = parts.join("\n").trim().to_owned();
-        (!text.is_empty()).then_some(text)
+        let (first, response, last, end) = (first.0, first.1, last.0, last.2.len());
+        self.selection.select_rows(response, first, last, end);
+        cx.notify();
     }
     pub(super) fn copy_selection(
         &mut self,
@@ -664,6 +817,31 @@ impl TranscriptView {
                 })
                 .into_any_element(),
         )
+    }
+}
+
+#[cfg(test)]
+impl Selection {
+    /// Whether the selection menu is open, and whether it offers quoting.
+    pub(crate) fn menu_for_test(&self) -> (bool, bool) {
+        let state = self.0.borrow();
+        (state.menu.is_some(), state.quote)
+    }
+    /// The window point of `byte` in the drawn run of `row`, nudged into the
+    /// line so a press there resolves to that byte.
+    pub(crate) fn point_for_test(&self, row: (usize, usize), byte: usize) -> Point<Pixels> {
+        let state = self.0.borrow();
+        let fragment = state
+            .layouts
+            .values()
+            .filter(|f| f.row == row && f.offset <= byte && byte <= f.offset + f.text.len())
+            .min_by_key(|f| f.offset)
+            .unwrap_or_else(|| panic!("row {row:?} byte {byte} is not drawn"));
+        let at = fragment
+            .layout
+            .position_for_index(byte - fragment.offset)
+            .unwrap();
+        gpui::point(at.x + px(1.), at.y + fragment.layout.line_height() / 2.)
     }
 }
 

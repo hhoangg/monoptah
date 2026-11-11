@@ -2,6 +2,8 @@ pub(crate) mod attachments;
 pub(crate) mod burst;
 pub(crate) mod cloud_start;
 pub(crate) mod dates;
+#[cfg(test)]
+mod document_selection_tests;
 mod drafts;
 #[cfg(test)]
 mod follow_tests;
@@ -6014,6 +6016,7 @@ impl Render for TranscriptView {
             .key_context("TranscriptSelection")
             .track_focus(self.selection_focus.as_ref().unwrap())
             .on_action(cx.listener(Self::copy_selection))
+            .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::open_link_menu))
             .capture_any_mouse_down(cx.listener(
                 |this, event: &gpui::MouseDownEvent, window, cx| {
