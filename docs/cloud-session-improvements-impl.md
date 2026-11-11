@@ -1523,8 +1523,8 @@ ticket, after review and after merge.
 | F3-5h | 4 | skipped: dropped by user decision D12 | - | no OAuth sign-in merge on the Host |
 | F4-2h | 4 | merged | csi-f4-2h | merge be7abcb2 (server.ts and spec conflicts resolved keeping both; host tests 438 passed, check:web green). Opus review x3 fixed: cwd rewrite only named roots (fromCwds REQUIRED), TS/Rust serde parity pinned by shared fixtures, instance:new rollback, force-added files, deterministic fork id, 50 MB cap, default branch refused only when head != origin tip (no ls-remote). Contract for F4-3a: delete/unbind the old Host session before re-import; send fromCwds. |
 | HR3 | 4 | merged | - | see HR1: covered by the combined host-v1.1.0 release; pin 1.1.0 (H2a) |
-| F3-4 | 4 | in progress | csi-f3-4 | |
-| F3-5 | 4 | todo | - | reduced (D12): config-only OAuth servers, 'Sign in in the cloud'; depends on F3-4 only |
+| F3-4 | 4 | merged | csi-f3-4 | merge c252c7c0. Two independent Opus reviews (c3's + mine), 6+14 findings fixed incl. a BLOCKER (kit.* methods were missing from the app allowlist so the setup never ran). Pipeline: kit tar builder (deterministic, O_NOFOLLOW, dev/ino recheck, names as in the item), mcp.json with ${MONOPTAH_KIT_*} refs, kit.secrets, health shown as status + generic reason (no raw Host lines), ClaudeSetup runs only for NEW workspaces, never fails the start, halt honoured, Update Claude setup never wakes a workspace and keeps the last good state on failure; servers with headersHelper are not sent. cloudKitEnabled flag removed. Pending, needs the user (creates a codespace/sandbox): new start with the kit, first-turn skill/MCP use, headless unapproved project .mcp.json behaviour (design 7). Needs a FUTURE Host release (>1.1.0, NOT done, needs the user): host/kit.ts parseHealth now returns only the status part (app already defends); F4-2h snapshot-worktree idempotence fix (if F4-3a lands it). |
+| F3-5 | 4 | in progress | csi-f3-5 | reduced (D12): config-only OAuth servers, 'Sign in in the cloud'; depends on F3-4 only |
 | F4-3a | 4 | in progress | csi-f4-3a | |
 | F4-4 | 4 | todo | - | |
 | F4-5 | 4 | todo | - | |
