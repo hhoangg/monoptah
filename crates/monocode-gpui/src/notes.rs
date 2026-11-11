@@ -366,11 +366,12 @@ impl Notes {
 
     fn update_preview(&mut self, cx: &mut Context<Self>) {
         self.document = self.draft(cx).map(|note| {
-            cx.new(|_| {
+            cx.new(|cx| {
                 preview::Preview::new(
                     &note.body,
                     note.source_cwd.as_deref().unwrap_or(&self.cwd),
                     &self.store,
+                    cx,
                 )
             })
         });

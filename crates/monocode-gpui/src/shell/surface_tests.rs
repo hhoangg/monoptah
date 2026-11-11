@@ -475,3 +475,71 @@ fn settings_lists_models_discovered_for_the_default_account(cx: &mut TestAppCont
         })
         .unwrap();
 }
+
+/// Opening Settings discovers the catalog of every provider without one,
+/// including providers that have no accounts, so an installed CLI with no
+/// open session is listed with models. Account events only reach providers
+/// with accounts, and a rename starts no discovery at all.
+#[gpui::test]
+fn settings_discovers_every_missing_catalog_but_not_on_a_rename(cx: &mut TestAppContext) {
+    let (window, _, _) = window(cx);
+    window
+        .update(cx, |shell, window, cx| {
+            if crate::accounts::get(cx).is_none() {
+                crate::accounts::install(shell.store.clone(), cx);
+            }
+            shell.workspace.project = PROJECT.into();
+            shell.open_settings(crate::settings::Section::Providers, window, cx);
+            let opened = shell.settings_opened_catalogs(cx);
+            assert!(opened.contains(&Kind::Cursor), "{opened:?}");
+            assert!(opened.contains(&Kind::Claude), "{opened:?}");
+
+            // A discovered catalog of a provider without accounts is listed.
+            let profile = monocode_core::accounts::Profile::default();
+            let model = monocode_core::catalog::Model {
+                id: "settings-cursor-test".into(),
+                name: "Cursor test".into(),
+                alias_target: None,
+                efforts: Vec::new(),
+                default_effort: None,
+                fast: false,
+                thinking: false,
+                default: true,
+                tiers: Vec::new(),
+                controls: Vec::new(),
+            };
+            monocode_core::catalog::seed_cached(Kind::Cursor, &profile, vec![model]);
+            let rows = shell.settings_context(cx).catalogs.remove("cursor");
+            monocode_core::catalog::invalidate(Kind::Cursor, &profile);
+            assert_eq!(rows.unwrap()[0].0, "settings-cursor-test");
+
+            let center = crate::accounts::get(cx).unwrap();
+            let account = center.update(cx, |center, _| {
+                center.book.add(Kind::Claude, "Work").unwrap().id
+            });
+            // Adding an account changes no account new sessions use.
+            assert!(shell.settings_accounts_changed(false, cx).is_empty());
+            center.update(cx, |center, _| {
+                center
+                    .book
+                    .rename(Kind::Claude, &account, "Renamed")
+                    .unwrap()
+            });
+            assert!(
+                shell.settings_accounts_changed(false, cx).is_empty(),
+                "a rename starts no discovery"
+            );
+            center.update(cx, |center, _| {
+                center.book.set_preferred(Kind::Claude, &account).unwrap()
+            });
+            let changed = shell.settings_accounts_changed(false, cx);
+            assert!(changed.contains(&Kind::Claude), "{changed:?}");
+            assert!(
+                changed
+                    .iter()
+                    .all(|kind| monocode_core::accounts::supports_accounts(*kind)),
+                "{changed:?}"
+            );
+        })
+        .unwrap();
+}

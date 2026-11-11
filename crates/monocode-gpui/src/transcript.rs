@@ -3,6 +3,8 @@ pub(crate) mod burst;
 pub(crate) mod cloud_moved;
 pub(crate) mod cloud_start;
 pub(crate) mod dates;
+#[cfg(test)]
+mod document_selection_tests;
 mod drafts;
 #[cfg(test)]
 mod follow_tests;
@@ -459,7 +461,6 @@ pub(crate) fn mono_spoke(source: &[Row], from: usize, to: usize) -> bool {
     }
     false
 }
-/// The first row of the prompt block that opens `turn`.
 /// Each user message's text (its rows joined), oldest first, with any
 /// legacy attachment links removed.
 pub(crate) fn sent_prompts(source: &[Row]) -> Vec<String> {
@@ -479,6 +480,7 @@ pub(crate) fn sent_prompts(source: &[Row]) -> Vec<String> {
     }
     prompts
 }
+/// The first row of the prompt block that opens `turn`.
 pub(crate) fn prompt_start(source: &[Row], turn: usize) -> usize {
     let mut at = turn.min(source.len());
     while at > 0 && source[at - 1].is_prompt() {
@@ -6105,6 +6107,7 @@ impl Render for TranscriptView {
             .key_context("TranscriptSelection")
             .track_focus(self.selection_focus.as_ref().unwrap())
             .on_action(cx.listener(Self::copy_selection))
+            .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::open_link_menu))
             .capture_any_mouse_down(cx.listener(
                 |this, event: &gpui::MouseDownEvent, window, cx| {
@@ -6115,8 +6118,8 @@ impl Render for TranscriptView {
             ))
             .on_mouse_down(
                 gpui::MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.selection.clear_if_not_dragging();
+                cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                    this.selection.press_outside(event);
                     cx.notify();
                 }),
             )

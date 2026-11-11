@@ -397,7 +397,7 @@ fn resolve_matches_default_id_and_exact_label_only() {
     assert_eq!(ok(Kind::Claude, "  WORK    Account ").unwrap(), work.id);
     assert_eq!(ok(Kind::Codex, "hoang").unwrap(), codex.id);
     // The default account is reachable by its label too.
-    assert_eq!(ok(Kind::Claude, "Default account").unwrap(), DEFAULT);
+    assert_eq!(ok(Kind::Claude, "CLI login").unwrap(), DEFAULT);
     // Ids are case-sensitive.
     assert!(ok(Kind::Claude, &work.id.to_uppercase()).is_err());
     // No prefix or fuzzy matching.
@@ -421,7 +421,7 @@ fn resolve_errors_list_valid_choices_and_name_the_owner() {
         .unwrap_err()
         .to_string();
     assert!(text.contains("claude") && text.contains("Work") && text.contains(&work.id));
-    assert!(text.contains("Default account"));
+    assert!(text.contains("CLI login"));
     for selector in ["Hoang", codex.id.as_str()] {
         let error = resolve(&book, Kind::Claude, selector).unwrap_err();
         assert!(matches!(error, ResolveError::OtherProvider { .. }));

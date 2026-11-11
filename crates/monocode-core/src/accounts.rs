@@ -269,7 +269,7 @@ impl Book {
             .find(|a| a.provider == kind.id() && a.is_default())
             .map(|a| clean_label(&a.label))
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "Default account".into());
+            .unwrap_or_else(|| "CLI login".into());
         let mut rows = vec![Account {
             id: DEFAULT.into(),
             provider: kind.id().into(),
@@ -363,6 +363,12 @@ impl Book {
             .cloned()
     }
     /// The account marked as default for `kind`, or the provider CLI profile.
+    ///
+    /// Only existence is checked, not whether the account can still sign in:
+    /// an expired or revoked setup token stays the default, so new sessions
+    /// fail authentication until the user saves a new token or picks another
+    /// default. That is deliberate; silently moving sessions to a different
+    /// account (and its config dir and billing) would be worse.
     pub fn preferred(&self, kind: Kind) -> String {
         self.defaults
             .get(kind.id())

@@ -23,7 +23,7 @@ fn mention_text_quotes_labels_outside_the_plain_set() {
     assert_eq!(text(&accent), "@\"claude/Café\"");
     // The default account answers to its own label.
     let default = book.list(Kind::Claude).remove(0);
-    assert_eq!(text(&default), "@\"claude/Default account\"");
+    assert_eq!(text(&default), "@\"claude/CLI login\"");
 }
 
 #[test]
@@ -32,7 +32,7 @@ fn a_label_that_would_pick_another_credential_inserts_the_id() {
     let first = book.add(Kind::Claude, "Team").unwrap();
     let second = book.add(Kind::Claude, "team").unwrap();
     let literal = book.add(Kind::Claude, "default").unwrap();
-    let named = book.add(Kind::Claude, "Default account").unwrap();
+    let named = book.add(Kind::Claude, "CLI login").unwrap();
     let quoted = book.add(Kind::Claude, "say \"hi\"").unwrap();
     for account in [&first, &second, &literal, &named, &quoted] {
         let text = mention_text(&book, Kind::Claude, account);

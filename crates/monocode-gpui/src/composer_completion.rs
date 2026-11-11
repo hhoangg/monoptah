@@ -2311,8 +2311,8 @@ mod tests {
                     accounts,
                     [
                         (
-                            "Default account",
-                            "@\"claude/Default account\"",
+                            "CLI login",
+                            "@\"claude/CLI login\"",
                             "claude account · CLI login"
                         ),
                         (
@@ -2362,12 +2362,7 @@ mod tests {
             crate::accounts::get(cx).unwrap().update(cx, |center, _| {
                 use monocode_core::provider::Kind;
                 let mut add = |label: &str| center.book.add(Kind::Codex, label).unwrap().id;
-                (
-                    add("Team"),
-                    add("team"),
-                    add("default"),
-                    add("Default account"),
-                )
+                (add("Team"), add("team"), add("default"), add("CLI login"))
             })
         });
         let window = window(cx);
@@ -2476,10 +2471,7 @@ mod tests {
                     .filter(|c| c.account)
                     .map(|c| c.insertion.as_str())
                     .collect();
-                assert_eq!(
-                    insertions,
-                    ["@\"codex/Default account\"", "@codex/hoangxuan2402"]
-                );
+                assert_eq!(insertions, ["@\"codex/CLI login\"", "@codex/hoangxuan2402"]);
             })
             .unwrap();
     }

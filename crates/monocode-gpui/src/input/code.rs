@@ -838,6 +838,8 @@ impl Input {
                 self.edits.undo(current)
             };
             if let Some(snapshot) = restored {
+                // The text no longer matches a recalled prompt or the draft.
+                self.reset_prompt_history();
                 self.restore_snapshot(snapshot, cx);
             }
             return;

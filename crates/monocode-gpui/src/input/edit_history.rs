@@ -119,6 +119,15 @@ impl EditHistory {
         self.group = None;
     }
 
+    /// A composition that ended leaving `current` as the text it started
+    /// from (cancelled IME) drops the step recorded when it began.
+    pub(crate) fn discard_noop(&mut self, current: &SharedString) {
+        if self.undo.last().is_some_and(|top| top.content == *current) {
+            self.undo.pop();
+            self.group = None;
+        }
+    }
+
     pub(crate) fn can_undo(&self) -> bool {
         !self.undo.is_empty()
     }
@@ -253,6 +262,20 @@ mod tests {
         let kind = EditHistory::kind(&(2..2), "x", false, false);
         history.record(back, &(2..2), kind, 3, now);
         assert!(!history.can_redo(), "a new edit clears redo");
+    }
+
+    #[test]
+    fn discard_noop_drops_only_an_unchanged_step() {
+        let mut history = EditHistory::default();
+        let now = Instant::now();
+        history.record(snap("ab", 2..2), &(2..2), EditKind::Other, 3, now);
+        history.discard_noop(&"abc".into());
+        assert_eq!(history.undo.len(), 1, "a changed text keeps its step");
+        history.discard_noop(&"ab".into());
+        assert!(
+            !history.can_undo(),
+            "a cancelled composition leaves no step"
+        );
     }
 
     #[test]
