@@ -6027,8 +6027,8 @@ impl Render for TranscriptView {
             ))
             .on_mouse_down(
                 gpui::MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.selection.clear_if_not_dragging();
+                cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                    this.selection.press_outside(event);
                     cx.notify();
                 }),
             )

@@ -23,6 +23,10 @@ struct Drag {
     anchor: Range<Position>,
     granularity: Granularity,
     moved: bool,
+    /// Pressed outside any text run: the anchor is resolved to the nearest
+    /// text position once the pointer starts dragging, so a plain click on
+    /// a margin, gap or control selects nothing.
+    pending: bool,
 }
 #[derive(Default)]
 struct State {
@@ -38,9 +42,49 @@ struct Fragment {
     row: (usize, usize),
     response: usize,
     offset: usize,
+    quote: bool,
     text: SharedString,
     row_text: SharedString,
     layout: TextLayout,
+}
+/// The text position closest to `point`, as a browser resolves a press
+/// beside the text: the nearest run vertically, then the line and character
+/// under the point (a line's start or end when the point lies left or right
+/// of it, the run's start or end when the point lies above or below it).
+fn nearest(
+    layouts: &HashMap<((usize, usize), usize, usize), Fragment>,
+    response: Option<usize>,
+    point: Point<Pixels>,
+) -> Option<(&Fragment, usize)> {
+    let fragment = layouts
+        .values()
+        .filter(|f| response.is_none_or(|r| f.response == r))
+        .min_by(|a, b| {
+            let distance = |f: &Fragment| {
+                let bounds = f.layout.bounds();
+                let dx = (bounds.left() - point.x)
+                    .max(px(0.))
+                    .max(point.x - bounds.right());
+                let dy = (bounds.top() - point.y)
+                    .max(px(0.))
+                    .max(point.y - bounds.bottom());
+                f32::from(dy) * 10000. + f32::from(dx)
+            };
+            distance(a)
+                .total_cmp(&distance(b))
+                // Deterministic among equals: the earlier text wins.
+                .then((a.row, a.offset).cmp(&(b.row, b.offset)))
+        })?;
+    // Inside the run's vertical span this resolves the line under the
+    // point; above or below it, the run's start or end. So a drag that
+    // leaves the text vertically keeps boundary semantics (through the end
+    // of the last line, or back to the start of the first), and a point in
+    // the gap between two runs falls to the nearer run's edge.
+    let byte = fragment
+        .layout
+        .index_for_position(point)
+        .unwrap_or_else(|ix| ix);
+    Some((fragment, byte))
 }
 /// The selection state of one selectable surface: the transcript, or any
 /// other view that renders Markdown rows (the notes preview).
@@ -66,11 +110,37 @@ impl Selection {
         state.menu = None;
         state.drag = None;
     }
-    pub(super) fn clear_if_not_dragging(&self) {
-        let dragging = self.0.borrow().drag.is_some();
-        if !dragging {
-            self.clear();
+    /// A left press that no text run claimed (a margin, the gap between
+    /// lines or blocks, beside a short line). Arms a pending drag; the
+    /// selection starts at the nearest text once the pointer moves.
+    pub(super) fn press_outside(&self, event: &gpui::MouseDownEvent) {
+        if self.dragging() {
+            // A text run already started a selection for this press.
+            return;
         }
+        self.clear();
+        if event.click_count != 1 || event.modifiers.shift {
+            return;
+        }
+        let origin = Position {
+            row: (0, 0),
+            byte: 0,
+        };
+        self.0.borrow_mut().drag = Some(Drag {
+            origin: event.position,
+            anchor: origin..origin,
+            granularity: Granularity::Character,
+            moved: false,
+            pending: true,
+        });
+    }
+    /// A margin press is waiting for the pointer to move.
+    pub(super) fn pending(&self) -> bool {
+        self.0
+            .borrow()
+            .drag
+            .as_ref()
+            .is_some_and(|drag| drag.pending)
     }
     pub(super) fn active(&self) -> bool {
         let state = self.0.borrow();
@@ -171,30 +241,32 @@ impl Selection {
             }
             drag.moved = true;
         }
+        let started = drag.pending;
+        if started {
+            let origin = drag.origin;
+            let Some((fragment, byte)) = nearest(&state.layouts, None, origin) else {
+                return false;
+            };
+            let at = Position {
+                row: fragment.row,
+                byte: snap(&fragment.row_text, fragment.offset + byte),
+            };
+            let (response, quote) = (fragment.response, fragment.quote);
+            let drag = state.drag.as_mut().unwrap();
+            drag.pending = false;
+            drag.anchor = at..at;
+            state.response = response;
+            state.quote = quote;
+            state.anchor = Some(at);
+            state.head = Some(at);
+            state.menu = None;
+        }
+        let drag = state.drag.as_ref().unwrap();
         let (anchor, granularity, response) =
             (drag.anchor.clone(), drag.granularity, state.response);
-        let distance = |f: &Fragment| {
-            let bounds = f.layout.bounds();
-            let dx = (bounds.left() - point.x)
-                .max(px(0.))
-                .max(point.x - bounds.right());
-            let dy = (bounds.top() - point.y)
-                .max(px(0.))
-                .max(point.y - bounds.bottom());
-            f32::from(dy) * 10000. + f32::from(dx)
-        };
-        let Some(fragment) = state
-            .layouts
-            .values()
-            .filter(|f| f.response == response)
-            .min_by(|a, b| distance(a).total_cmp(&distance(b)))
-        else {
+        let Some((fragment, byte)) = nearest(&state.layouts, Some(response), point) else {
             return false;
         };
-        let byte = fragment
-            .layout
-            .index_for_position(point)
-            .unwrap_or_else(|ix| ix);
         let range = unit(&fragment.row_text, fragment.offset + byte, granularity);
         let row = fragment.row;
         let (start, end) = (
@@ -213,7 +285,7 @@ impl Selection {
             (anchor.start, end)
         };
         if state.anchor == Some(anchor) && state.head == Some(head) {
-            return false;
+            return started;
         }
         state.anchor = Some(anchor);
         state.head = Some(head);
@@ -407,6 +479,7 @@ impl TextSelection {
                         anchor,
                         granularity,
                         moved: false,
+                        pending: false,
                     });
                     state.menu = None;
                     drop(state);
@@ -468,6 +541,7 @@ impl Element for SelectedText {
                 row: self.context.row,
                 response: self.context.response,
                 offset: self.context.offset,
+                quote: self.context.quote,
                 text: self.text.clone(),
                 row_text: self
                     .context
@@ -558,69 +632,23 @@ impl TranscriptView {
     pub(super) fn move_selection(
         &mut self,
         event: &gpui::MouseMoveEvent,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut state = self.selection.0.borrow_mut();
-        let Some(drag) = state.drag.as_mut() else {
-            return;
-        };
-        if event.pressed_button != Some(MouseButton::Left) {
-            state.drag = None;
-            return;
+        let pending = self.selection.pending();
+        let pressed = event.pressed_button == Some(MouseButton::Left);
+        let changed = self.selection.drag_to(event.position, pressed);
+        // A margin press became a selection: take focus so Copy and Escape
+        // reach this view, as a press on a text run does.
+        if pending
+            && !self.selection.pending()
+            && self.selection.dragging()
+            && let Some(focus) = &self.selection_focus
+        {
+            window.focus(focus, cx)
         }
-        if !drag.moved {
-            let delta = event.position - drag.origin;
-            if delta.x.abs().max(delta.y.abs()) < px(3.) {
-                return;
-            }
-            drag.moved = true;
-        }
-        let anchor = drag.anchor.clone();
-        let granularity = drag.granularity;
-        let response = state.response;
-        let hit = state
-            .layouts
-            .values()
-            .filter(|f| f.response == response)
-            .min_by(|a, b| {
-                let distance = |f: &Fragment| {
-                    let bounds = f.layout.bounds();
-                    let dx = (bounds.left() - event.position.x)
-                        .max(px(0.))
-                        .max(event.position.x - bounds.right());
-                    let dy = (bounds.top() - event.position.y)
-                        .max(px(0.))
-                        .max(event.position.y - bounds.bottom());
-                    f32::from(dy) * 10000. + f32::from(dx)
-                };
-                distance(a).total_cmp(&distance(b))
-            });
-        if let Some(fragment) = hit {
-            let byte = fragment
-                .layout
-                .index_for_position(event.position)
-                .unwrap_or_else(|ix| ix);
-            let range = unit(&fragment.row_text, fragment.offset + byte, granularity);
-            let start = Position {
-                row: fragment.row,
-                byte: range.start,
-            };
-            let end = Position {
-                row: fragment.row,
-                byte: range.end,
-            };
-            let (anchor, head) = if start < anchor.start {
-                (anchor.end, start)
-            } else {
-                (anchor.start, end)
-            };
-            if state.anchor != Some(anchor) || state.head != Some(head) {
-                state.anchor = Some(anchor);
-                state.head = Some(head);
-                drop(state);
-                cx.notify()
-            }
+        if changed {
+            cx.notify()
         }
     }
     pub(super) fn finish_selection(
@@ -849,6 +877,7 @@ impl Selection {
 mod tests {
     use super::*;
     use gpui::TestAppContext;
+    use monocode_core::tool::{ToolCall, ToolState};
     #[gpui::test]
     fn rendered_selection_crosses_markdown_and_code_without_chrome_or_other_responses(
         cx: &mut TestAppContext,
@@ -890,5 +919,218 @@ mod tests {
         assert_eq!(snap("e\u{301}🙂", 2), 0);
         assert_eq!(snap("e\u{301}🙂", 4), 3);
         assert_eq!(word("hello café", 7), 6..11);
+    }
+    fn open(cx: &mut TestAppContext, rows: Vec<Row>) -> gpui::WindowHandle<TranscriptView> {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|_| TranscriptView::new())
+            })
+            .unwrap()
+        });
+        window
+            .update(cx, |view, _, cx| view.patch(0, rows, cx))
+            .unwrap();
+        window
+    }
+    /// Bounds of the rendered text runs, in reading order.
+    fn runs(view: &TranscriptView) -> Vec<(String, Bounds<Pixels>)> {
+        let state = view.selection.0.borrow();
+        let mut runs: Vec<_> = state
+            .layouts
+            .values()
+            .map(|f| ((f.row, f.offset), f.text.to_string(), f.layout.bounds()))
+            .collect();
+        runs.sort_by_key(|(key, ..)| *key);
+        runs.into_iter().map(|(_, t, b)| (t, b)).collect()
+    }
+    fn drag(visual: &mut gpui::VisualTestContext, from: Point<Pixels>, to: Point<Pixels>) {
+        let mid = gpui::point((from.x + to.x) / 2., (from.y + to.y) / 2.);
+        visual.simulate_mouse_down(from, MouseButton::Left, Default::default());
+        visual.simulate_mouse_move(mid, MouseButton::Left, Default::default());
+        visual.simulate_mouse_move(to, MouseButton::Left, Default::default());
+        visual.simulate_mouse_up(to, MouseButton::Left, Default::default());
+        visual.run_until_parked();
+    }
+    fn paragraphs() -> Vec<Row> {
+        vec![Row {
+            role: "assistant".into(),
+            text: "First paragraph here.\n\nSecond one.".into(),
+            first: true,
+            sent_at: None,
+        }]
+    }
+
+    #[gpui::test]
+    fn dragging_from_the_left_margin_selects_from_the_nearest_line_start(cx: &mut TestAppContext) {
+        let window = open(cx, paragraphs());
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let runs = window.update(visual, |view, _, _| runs(view)).unwrap();
+        let first = runs
+            .iter()
+            .find(|(t, _)| t == "First paragraph here.")
+            .unwrap()
+            .1;
+        let second = runs.iter().find(|(t, _)| t == "Second one.").unwrap().1;
+        assert!(first.left() > px(4.), "the message has a left margin");
+        // From the margin beside the first line to past the end of the second.
+        let from = gpui::point(px(2.), first.center().y);
+        let to = gpui::point(second.right() + px(40.), second.center().y);
+        drag(visual, from, to);
+        window
+            .update(visual, |view, _, _| {
+                assert_eq!(
+                    view.selected_text().as_deref(),
+                    Some("First paragraph here.\nSecond one.")
+                );
+            })
+            .unwrap();
+        // From the gap between the paragraphs, just above the second one,
+        // back up into the first: the selection starts at the second line's
+        // start, not mid-way through either paragraph.
+        let gap = gpui::point(px(2.), second.top() - px(1.));
+        let start = window
+            .update(visual, |view, _, _| {
+                view.selection
+                    .0
+                    .borrow()
+                    .layouts
+                    .values()
+                    .find(|f| f.text.as_ref() == "First paragraph here.")
+                    .unwrap()
+                    .layout
+                    .position_for_index(6)
+                    .unwrap()
+            })
+            .unwrap();
+        drag(visual, gap, start + gpui::point(px(1.), px(2.)));
+        window
+            .update(visual, |view, _, _| {
+                assert_eq!(view.selected_text().as_deref(), Some("paragraph here."));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_plain_click_beside_the_text_selects_nothing_and_controls_still_click(
+        cx: &mut TestAppContext,
+    ) {
+        let mut call = ToolCall::new("chain", "Bash");
+        call.input = serde_json::json!({
+            "command": "cd /repo && git status --short && cat package.json && sed -n '1,260p' scripts/build-native.mjs && sed -n '1,260p' scripts/dev-native.mjs",
+        })
+        .to_string();
+        call.state = ToolState::Completed;
+        let window = open(
+            cx,
+            vec![
+                Row {
+                    role: "user".into(),
+                    text: "Find model settings".into(),
+                    first: true,
+                    sent_at: None,
+                },
+                Row {
+                    role: "tool".into(),
+                    text: serde_json::to_string(&call).unwrap(),
+                    first: true,
+                    sent_at: None,
+                },
+            ],
+        );
+        window
+            .update(cx, |view, _, cx| {
+                view.work_folds.insert(1, true);
+                view.phases.insert(1, true);
+                view.rebuild(0, cx);
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(gpui::size(px(900.), px(600.)));
+        visual.run_until_parked();
+        // A click in the margin neither selects nor arms a lasting drag.
+        visual.simulate_click(gpui::point(px(2.), px(2.)), Default::default());
+        visual.run_until_parked();
+        window
+            .update(visual, |view, _, _| assert!(!view.has_selection()))
+            .unwrap();
+        assert!(visual.debug_bounds("tool-steps-1").is_none());
+        let row = visual.debug_bounds("tool-1").unwrap();
+        visual.simulate_click(
+            gpui::point(row.right() - px(8.), row.center().y),
+            Default::default(),
+        );
+        visual.run_until_parked();
+        assert!(
+            visual.debug_bounds("tool-steps-1").is_some(),
+            "the tool row still expands"
+        );
+        window
+            .update(visual, |view, _, _| assert!(!view.has_selection()))
+            .unwrap();
+    }
+
+    /// Bounds of the two paragraphs.
+    fn paragraph_bounds(
+        visual: &mut gpui::VisualTestContext,
+        window: gpui::WindowHandle<TranscriptView>,
+    ) -> (Bounds<Pixels>, Bounds<Pixels>) {
+        let runs = window.update(visual, |view, _, _| runs(view)).unwrap();
+        let first = runs
+            .iter()
+            .find(|(t, _)| t == "First paragraph here.")
+            .unwrap()
+            .1;
+        let second = runs.iter().find(|(t, _)| t == "Second one.").unwrap().1;
+        (first, second)
+    }
+    fn selected(
+        visual: &mut gpui::VisualTestContext,
+        window: gpui::WindowHandle<TranscriptView>,
+    ) -> Option<String> {
+        window
+            .update(visual, |view, _, _| view.selected_text())
+            .unwrap()
+    }
+
+    #[gpui::test]
+    fn dragging_past_the_text_vertically_selects_through_its_boundary(cx: &mut TestAppContext) {
+        let window = open(cx, paragraphs());
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let (first, second) = paragraph_bounds(visual, window);
+        // Down from the first character to below the last line, near the
+        // left text edge: through the end of the response, not that column.
+        let start = gpui::point(first.left() + px(1.), first.center().y);
+        drag(
+            visual,
+            start,
+            gpui::point(second.left() + px(2.), second.bottom() + px(30.)),
+        );
+        assert_eq!(
+            selected(visual, window).as_deref(),
+            Some("First paragraph here.\nSecond one.")
+        );
+        // Up from past the last character to above the first line: back to
+        // the start of the response.
+        let end = gpui::point(second.right() - px(1.), second.center().y);
+        let above = gpui::point(first.right() - px(40.), first.top() - px(1.));
+        drag(visual, end, above);
+        assert_eq!(
+            selected(visual, window).as_deref(),
+            Some("First paragraph here.\nSecond one.")
+        );
+        // Into the gap just under the first paragraph, near the left edge:
+        // the whole first paragraph, not its first character.
+        drag(
+            visual,
+            start,
+            gpui::point(first.left() + px(2.), first.bottom() + px(1.)),
+        );
+        assert_eq!(
+            selected(visual, window).as_deref(),
+            Some("First paragraph here.")
+        );
     }
 }

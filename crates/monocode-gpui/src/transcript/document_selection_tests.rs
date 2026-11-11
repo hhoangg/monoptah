@@ -168,3 +168,38 @@ fn a_document_selection_menu_offers_copy_only(cx: &mut TestAppContext) {
         "a document must not offer Add to chat or Add to notes"
     );
 }
+
+#[gpui::test]
+fn dragging_from_a_document_margin_selects_from_the_nearest_line_and_offers_copy_only(
+    cx: &mut TestAppContext,
+) {
+    let window = document(cx);
+    let rows = paragraphs(window, cx);
+    let first = at(window, rows[0], 0, cx);
+    assert!(first.x > px(4.), "the document has a left margin");
+    // From the margin beside the first line to the end of the first word
+    // of the second paragraph.
+    let from = point(px(2.), first.y);
+    let to = at(window, rows[1], 6, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_mouse_down(from, MouseButton::Left, Modifiers::default());
+    visual.simulate_mouse_move(to, MouseButton::Left, Modifiers::default());
+    visual.simulate_mouse_up(to, MouseButton::Left, Modifiers::default());
+    assert_eq!(
+        selected(window, cx).as_deref(),
+        Some("Alpha beta gamma.\nSecond")
+    );
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(1));
+    cx.run_until_parked();
+    let (menu, quote) = window
+        .read_with(cx, |view, _| view.selection.menu_for_test())
+        .unwrap();
+    assert!(
+        menu && !quote,
+        "a margin-started document selection offers Copy only"
+    );
+    // A plain click in the margin selects nothing.
+    press(window, from, 1, cx);
+    assert_eq!(selected(window, cx), None);
+}
