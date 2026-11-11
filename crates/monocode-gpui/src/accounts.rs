@@ -82,6 +82,7 @@ impl Key {
         (!self.billing.is_empty()).then(|| format!("{}/", self.billing))
     }
 }
+const PROBE_COOLDOWN: Duration = Duration::from_secs(60);
 #[derive(Clone, Default)]
 pub(crate) struct Cached {
     pub snapshot: Option<Snapshot>,
@@ -93,10 +94,25 @@ pub(crate) struct Cached {
     /// The user clicked refresh: the next fetch may spend a message on the
     /// setup-token quota check. Background refreshes never set it.
     pub manual: bool,
+    /// When the user last asked for a setup-token check, for the cooldown.
+    pub probed: Option<Instant>,
 }
 impl Cached {
     /// Begin a fetch. Returns whether it is the user-requested one; the flag
     /// is consumed, so one click allows exactly one setup-token check.
+    /// A refresh click. Returns false while a fetch is in flight, so a click
+    /// never queues a second check. Within a minute of the last check the
+    /// refresh still runs but without the check, to spare the user's quota.
+    pub(crate) fn request_manual(&mut self) -> bool {
+        if self.fetching {
+            return false;
+        }
+        if self.probed.is_none_or(|at| at.elapsed() >= PROBE_COOLDOWN) {
+            self.manual = true;
+            self.probed = Some(Instant::now());
+        }
+        true
+    }
     pub(crate) fn start(&mut self) -> bool {
         self.fetching = true;
         self.attempted = Some(Instant::now());
@@ -384,7 +400,10 @@ impl Accounts {
             self.usage
                 .get(&Key::new(kind, self.profile(id), None))?
                 .snapshot
-                .as_ref()?
+                .as_ref()
+                // A setup-token reading is as old as the last click; too stale
+                // to steer a switch.
+                .filter(|s| !s.manual)?
                 .headroom(now)
         };
         if room(selected)? > 20. {
@@ -487,8 +506,8 @@ impl Accounts {
     }
     /// Mark the next refresh of `key` as user-requested, which alone may run
     /// the setup-token check. Call `refresh(key, true, ..)` after it.
-    pub(crate) fn request_manual(&mut self, key: Key) {
-        self.usage.entry(key).or_default().manual = true;
+    pub(crate) fn request_manual(&mut self, key: Key) -> bool {
+        self.usage.entry(key).or_default().request_manual()
     }
     pub(crate) fn refresh(&mut self, key: Key, force: bool, cx: &mut Context<Self>) {
         if cfg!(test) {

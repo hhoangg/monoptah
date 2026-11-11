@@ -1826,6 +1826,37 @@ mod tests {
         assert_eq!(submitted.get(), 0);
     }
     #[gpui::test]
+    fn an_open_popup_keeps_up_and_down_from_prompt_history(cx: &mut TestAppContext) {
+        let window = window(cx);
+        window
+            .update(cx, |v, _, cx| {
+                v.input.update(cx, |i, cx| {
+                    i.set_prompt_history(Box::new(|_| vec!["earlier prompt".into()]));
+                    i.set_text("/".into(), cx)
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(window.update(cx, |v, _, _| v.choices.len() > 1).unwrap());
+        cx.simulate_keystrokes(window.into(), "down");
+        cx.run_until_parked();
+        window
+            .update(cx, |v, _, cx| {
+                assert_eq!(v.active, 1, "Down moves the popup's selection");
+                assert_eq!(v.input.read(cx).content, "/");
+            })
+            .unwrap();
+        cx.simulate_keystrokes(window.into(), "up");
+        cx.run_until_parked();
+        window
+            .update(cx, |v, _, cx| {
+                assert_eq!(v.active, 0, "Up moves the popup's selection");
+                assert_eq!(v.input.read(cx).content, "/", "no prompt was recalled");
+                assert!(!v.input.read(cx).browsing_prompt_history());
+            })
+            .unwrap();
+    }
+    #[gpui::test]
     fn visualize_completion_inserts_a_command_without_selecting_a_mode(cx: &mut TestAppContext) {
         let window = window(cx);
         window

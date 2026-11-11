@@ -261,6 +261,11 @@ fn assert_original_surface(surface: Surface, cx: &mut TestAppContext) {
     assert_eq!(header.size.height, px(40.));
     assert!(header.left() >= rail.right());
     assert_eq!(surface.icon_left(visual), rail.right() + px(12.));
+    assert_eq!(
+        visual.debug_bounds("usage-footer").is_some(),
+        matches!(surface, Surface::Mono),
+        "{surface:?}: only a Mono chat keeps the usage footer"
+    );
     if matches!(surface, Surface::Search) {
         assert!(visual.debug_bounds("classic-app-surface-header").is_none());
     }
@@ -454,7 +459,7 @@ fn original_app_surfaces_mono_uses_identity_header_and_restores_sessions(cx: &mu
 }
 
 #[gpui::test]
-fn original_mono_chat_keeps_the_usage_footer_under_its_composer(cx: &mut TestAppContext) {
+fn original_mono_keeps_the_usage_footer_with_and_without_overview(cx: &mut TestAppContext) {
     let (window, _) = setup(cx, true, false);
     let visual = &mut VisualTestContext::from_window(window.into(), cx);
     visual.refresh().unwrap();
@@ -470,6 +475,19 @@ fn original_mono_chat_keeps_the_usage_footer_under_its_composer(cx: &mut TestApp
     assert!(
         visual.debug_bounds("usage-footer").is_some(),
         "a classic Mono chat shows the quota row like Focus does"
+    );
+    let overview = visual.debug_bounds("classic-mono-overview").unwrap();
+    visual.simulate_click(overview.center(), Default::default());
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    assert!(
+        visual
+            .debug_bounds("original-mono-overview-header")
+            .is_some()
+    );
+    assert!(
+        visual.debug_bounds("usage-footer").is_some(),
+        "the overview panel keeps the quota row"
     );
 }
 

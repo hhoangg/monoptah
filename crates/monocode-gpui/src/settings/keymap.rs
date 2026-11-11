@@ -96,6 +96,8 @@ fn command(binding: &KeyBinding) -> Option<&'static str> {
         "workspace::ZoomOut" | "image_lightbox::ZoomOut" => "View: Zoom Out",
         "workspace::ResetZoom" | "image_lightbox::ResetZoom" => "View: Reset Zoom",
         "workspace::Reload" => "View: Reload",
+        "composer::Undo" => "Text: Undo",
+        "composer::Redo" => "Text: Redo",
         _ => return None,
     })
 }
@@ -108,5 +110,13 @@ mod tests {
     fn terminal_new_in_home_has_a_keybinding_label() {
         let binding = KeyBinding::new("cmd-alt-j", crate::shell::NewTerminalHome, None);
         assert_eq!(command(&binding), Some("Terminal: New in Home"));
+    }
+
+    #[test]
+    fn text_undo_and_redo_have_keybinding_labels() {
+        let undo = KeyBinding::new("cmd-z", crate::input::Undo, Some("Composer"));
+        let redo = KeyBinding::new("ctrl-y", crate::input::Redo, Some("Composer"));
+        assert_eq!(command(&undo), Some("Text: Undo"));
+        assert_eq!(command(&redo), Some("Text: Redo"));
     }
 }
