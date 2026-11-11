@@ -567,7 +567,7 @@ fn snapshot_with_limit(cwd: &Path, staging: &Path, max_patch: u64) -> Result<Sna
         .map_err(|_| "This branch has no commits yet".to_string())?;
     std::fs::create_dir_all(staging).map_err(|e| e.to_string())?;
     // The scratch paths go into environment variables of git runs in another directory.
-    let staging = staging.canonicalize().map_err(|e| e.to_string())?;
+    let staging = super::plain_path(staging.canonicalize().map_err(|e| e.to_string())?);
     let objects = git_text(&root, &["rev-parse", "--git-path", "objects"], None)?;
     let scratch = Scratch {
         index: staging.join("index.tmp"),

@@ -17,9 +17,10 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use super::{
-    credential_file, digest_files, file_id, file_stamp, Exclusion, Guard, KitFile, KitInstructions,
-    KitRoots, KitSource, MAX_IMPORT_DEPTH, MAX_INSTRUCTION_DEPTH, MAX_INSTRUCTION_FILES,
-    MAX_INSTRUCTION_FILE_BYTES, MAX_INSTRUCTION_TOTAL_BYTES, SENSITIVE_NAMES,
+    credential_file, digest_files, file_id, file_stamp, slash_name, Exclusion, Guard, KitFile,
+    KitInstructions, KitRoots, KitSource, MAX_IMPORT_DEPTH, MAX_INSTRUCTION_DEPTH,
+    MAX_INSTRUCTION_FILES, MAX_INSTRUCTION_FILE_BYTES, MAX_INSTRUCTION_TOTAL_BYTES,
+    SENSITIVE_NAMES,
 };
 
 pub(super) const OUTSIDE: &str = "Outside the Claude config folder";
@@ -347,7 +348,7 @@ impl Scan<'_> {
             let path = entry.path();
             let label = path
                 .strip_prefix(&self.root)
-                .map(|rel| rel.to_string_lossy().into_owned())
+                .map(slash_name)
                 .unwrap_or_else(|_| "rules".into());
             // Follows links: a linked folder or file is checked against the root below.
             let Ok(meta) = std::fs::metadata(&path) else {
@@ -553,7 +554,10 @@ fn import_tokens(text: &str) -> Vec<(String, bool)> {
             let path =
                 path.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '}', '"', '\'']);
             if !path.is_empty() {
-                out.push((path.to_owned(), path.starts_with('/')));
+                out.push((
+                    path.to_owned(),
+                    path.starts_with('/') || Path::new(path).is_absolute(),
+                ));
             }
         }
     }

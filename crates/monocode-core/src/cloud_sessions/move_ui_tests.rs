@@ -26,7 +26,7 @@ fn commit_file(dir: &Path, name: &str, text: &str) {
 /// A bare origin with `main` and a clone tracking it.
 fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().canonicalize().unwrap();
+    let root = super::plain_path(tmp.path().canonicalize().unwrap());
     let origin = root.join("origin.git");
     let work = root.join("work");
     std::fs::create_dir_all(&origin).unwrap();

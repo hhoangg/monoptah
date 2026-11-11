@@ -1043,6 +1043,15 @@ fn link_count(meta: &std::fs::Metadata) -> u64 {
 fn link_count(_meta: &std::fs::Metadata) -> u64 {
     1
 }
+/// A relative path as the cloud names it: components joined with `/` on every platform (the
+/// Linux container and the tar never see a backslash).
+pub(super) fn slash_name(path: &Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// The size and modification time of a file, when the platform reports the time.
 pub(super) fn file_stamp(meta: &std::fs::Metadata) -> Option<(u64, std::time::SystemTime)> {
     Some((meta.len(), meta.modified().ok()?))
@@ -1096,7 +1105,7 @@ fn digest_files(root: &Path, files: &[KitFile]) -> (String, u64) {
     for file in files {
         let relative = &file.name;
         let file = &file.path;
-        hasher.update(relative.to_string_lossy().as_bytes());
+        hasher.update(slash_name(relative).as_bytes());
         hasher.update([0]);
         let Ok(mut handle) = std::fs::File::open(file) else {
             continue;

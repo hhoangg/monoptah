@@ -1495,7 +1495,7 @@ impl CloudSessions {
     fn transcript_dir(&self, local_cwd: &str) -> Result<(PathBuf, String), String> {
         let local = std::fs::canonicalize(local_cwd).map_or_else(
             |_| local_cwd.to_string(),
-            |p| p.to_string_lossy().into_owned(),
+            |p| super::plain_path(p).to_string_lossy().into_owned(),
         );
         let name = claude_project_dir_name(&local);
         if name.len() > CLAUDE_NAME_LIMIT {

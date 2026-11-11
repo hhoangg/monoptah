@@ -479,7 +479,7 @@ impl Fx {
         shared: bool,
     ) -> Self {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
+        let root = super::plain_path(tmp.path().canonicalize().unwrap());
         let origin = root.join("origin.git");
         let work = root.join("work");
         std::fs::create_dir_all(&origin).unwrap();
@@ -532,7 +532,8 @@ impl Fx {
         std::fs::create_dir_all(&project).unwrap();
         let line = |uuid: &str, kind: &str, v: &str| {
             format!(
-                "{{\"type\":\"{kind}\",\"uuid\":\"{uuid}\",\"sessionId\":\"{CLAUDE_ID}\",\"cwd\":\"{work_text}\",\"version\":\"{v}\"}}\n"
+                "{}\n",
+                json!({"type": kind, "uuid": uuid, "sessionId": CLAUDE_ID, "cwd": work_text, "version": v})
             )
         };
         std::fs::write(
@@ -681,7 +682,7 @@ impl Fx {
     #[cfg(unix)]
     fn install_push_counter(&self) {
         use std::os::unix::fs::PermissionsExt;
-        let log = self.tmp.path().canonicalize().unwrap().join("pushes.log");
+        let log = super::plain_path(self.tmp.path().canonicalize().unwrap()).join("pushes.log");
         let hook = self.origin.join("hooks/pre-receive");
         std::fs::write(
             &hook,
@@ -2552,15 +2553,19 @@ fn transcript_folders_inside_other_roots_are_not_sent_to_the_host() {
         .join(encode(&fx.work))
         .join(format!("{CLAUDE_ID}.jsonl"));
     let work = fx.work.to_string_lossy().into_owned();
+    let sub = fx.work.join("sub").to_string_lossy().into_owned();
     let line = |uuid: &str, cwd: &str| {
-        format!("{{\"type\":\"user\",\"uuid\":\"{uuid}\",\"sessionId\":\"{CLAUDE_ID}\",\"cwd\":\"{cwd}\",\"version\":\"2.1.321\"}}\n")
+        format!(
+            "{}\n",
+            json!({"type": "user", "uuid": uuid, "sessionId": CLAUDE_ID, "cwd": cwd, "version": "2.1.321"})
+        )
     };
     std::fs::write(
         &jsonl,
         format!(
             "{}{}{}{}",
             line("e1", &work),
-            line("e2", &format!("{work}/sub")),
+            line("e2", &sub),
             line("e3", "/old/wt"),
             line("e4", "/old/wt/pkg")
         ),
@@ -2575,7 +2580,7 @@ fn transcript_folders_inside_other_roots_are_not_sent_to_the_host() {
         .collect();
     assert!(from.contains(&"/old/wt".to_string()), "{from:?}");
     assert!(!from.contains(&"/old/wt/pkg".to_string()), "{from:?}");
-    assert!(!from.contains(&format!("{work}/sub")), "{from:?}");
+    assert!(!from.contains(&sub), "{from:?}");
     assert!(from.contains(&work));
 }
 

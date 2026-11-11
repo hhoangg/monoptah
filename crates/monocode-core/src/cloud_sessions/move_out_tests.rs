@@ -50,7 +50,7 @@ impl Fixture {
     }
 
     fn in_dir(tmp: tempfile::TempDir) -> Self {
-        let root = tmp.path().canonicalize().unwrap();
+        let root = super::plain_path(tmp.path().canonicalize().unwrap());
         let origin = root.join("origin.git");
         let work = root.join("work");
         std::fs::create_dir_all(&origin).unwrap();
@@ -79,7 +79,7 @@ impl Fixture {
 
     /// Another clone that pushes `file` to `branch` on origin.
     fn push_from_elsewhere(&self, branch: &str, file: &str) {
-        let other = self._tmp.path().canonicalize().unwrap().join("other");
+        let other = super::plain_path(self._tmp.path().canonicalize().unwrap()).join("other");
         if !other.exists() {
             git(
                 self._tmp.path(),
@@ -1076,6 +1076,7 @@ fn symlinked_roots_of_the_transcript_are_not_followed() {
     assert!(err.contains("Could not find"), "{err}");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_repository_path_with_a_colon_works() {
     let tmp = tempfile::Builder::new().prefix("a:b;c-").tempdir().unwrap();

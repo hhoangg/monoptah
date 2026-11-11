@@ -916,6 +916,7 @@ fn a_timed_out_scan_is_incomplete_and_never_under_the_cap() {
     assert!(!timed_out.content_hash.is_empty());
 }
 
+#[cfg(unix)]
 #[test]
 fn committed_symlink_skills_count_as_committed() {
     let env = env();
@@ -924,16 +925,12 @@ fn committed_symlink_skills_count_as_committed() {
     let skills = project.join(".claude/skills");
     skill(&project.join("shared"), "linked", "x");
     std::fs::create_dir_all(&skills).unwrap();
-    #[cfg(unix)]
     std::os::unix::fs::symlink(project.join("shared/linked"), skills.join("linked")).unwrap();
     skill(&skills, "plain", "x");
     git(project, &["add", ".claude/skills/linked"]);
     let inventory = build_inventory(&env.roots, Workspace::Codespace);
     let names: Vec<_> = inventory.skills.iter().map(|s| s.name.as_str()).collect();
-    #[cfg(unix)]
     assert_eq!(names, vec!["plain"]);
-    #[cfg(not(unix))]
-    let _ = names;
 }
 
 #[cfg(unix)]
@@ -1221,6 +1218,8 @@ mod keyed_secrets {
         assert!(!first.incomplete);
     }
 
+    // The corrupt file is refused (not replaced) because the default file mode is too open.
+    #[cfg(unix)]
     #[test]
     fn an_unusable_key_degrades_without_panicking() {
         let env = env();
@@ -1374,7 +1373,8 @@ mod key_file {
         let dir = |v: &str| data_dir_from(Some(v.into()), home);
         assert_eq!(dir(""), default);
         assert_eq!(dir("relative/dir"), default);
-        assert_eq!(dir("/abs/data"), PathBuf::from("/abs/data"));
+        let absolute = std::env::temp_dir().join("abs-data");
+        assert_eq!(dir(absolute.to_str().unwrap()), absolute);
         assert_eq!(data_dir_from(None, home), default);
     }
 }
@@ -1933,12 +1933,7 @@ fn names(inventory: &KitInventory) -> Vec<String> {
     inventory
         .instructions
         .as_ref()
-        .map(|i| {
-            i.files
-                .iter()
-                .map(|f| f.name.to_string_lossy().into_owned())
-                .collect()
-        })
+        .map(|i| i.files.iter().map(|f| slash_name(&f.name)).collect())
         .unwrap_or_default()
 }
 

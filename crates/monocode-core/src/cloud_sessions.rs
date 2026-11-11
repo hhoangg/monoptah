@@ -95,6 +95,21 @@ pub const HARNESS: &str = "claude";
 pub const STATE_TTL: Duration = Duration::from_secs(30);
 const UNSUPPORTED_HARNESS: &str = "Cloud sessions support Claude only for now.";
 
+/// Drops the `\\?\` prefix of a Windows drive path (`\\?\D:\x` becomes `D:\x`).
+/// `fs::canonicalize` returns that verbatim form there, and Git reads it as a remote host
+/// when it is used as a URL. Every other path is returned unchanged.
+pub(crate) fn plain_path(path: std::path::PathBuf) -> std::path::PathBuf {
+    let plain = {
+        let text = path.as_os_str().to_str().unwrap_or_default();
+        text.strip_prefix(r"\\?\")
+            .filter(|rest| {
+                matches!(rest.as_bytes(), [drive, b':', b'\\', ..] if drive.is_ascii_alphabetic())
+            })
+            .map(std::path::PathBuf::from)
+    };
+    plain.unwrap_or(path)
+}
+
 /// True when `error` is `Connections::request`'s "codespace is not connected"
 /// or "sandbox is not connected".
 pub fn is_not_connected(error: &str) -> bool {

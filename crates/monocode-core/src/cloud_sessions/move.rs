@@ -1621,7 +1621,7 @@ impl CloudSessions {
                 for path in [&record.project_cwd, &record.work_cwd] {
                     from.push(path.clone());
                     if let Ok(real) = std::fs::canonicalize(path) {
-                        from.push(real.to_string_lossy().into_owned());
+                        from.push(super::plain_path(real).to_string_lossy().into_owned());
                     }
                 }
                 // The folders the transcript itself names (its first entries), in case the
