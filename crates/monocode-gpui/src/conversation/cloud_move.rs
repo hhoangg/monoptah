@@ -18,6 +18,14 @@ pub(crate) enum MoveOffer {
     InProgress,
 }
 
+/// Shown above the composer and as the refusal while a move of this session is unfinished.
+pub(crate) const MOVE_PAUSED: &str =
+    "This conversation is being moved to the cloud; sending is paused.";
+
+/// Emitted by the banner's Cancel move button; the shell opens the dialog and cancels.
+pub(crate) struct CancelCloudMove;
+impl EventEmitter<CancelCloudMove> for Conversation {}
+
 /// Emitted by the Workspace menu entry; the shell opens the move dialog.
 pub(crate) struct ContinueInCloud;
 impl EventEmitter<ContinueInCloud> for Conversation {}
@@ -26,6 +34,76 @@ impl Conversation {
     /// A stop was requested and the turn has not wound down yet.
     pub(crate) fn is_stopping(&self) -> bool {
         self.stopping
+    }
+
+    /// The shell says a move of this session is unfinished (from `begin_move` until the flip is
+    /// reloaded or the move is cancelled): sends, queued follow-ups and settings writes wait.
+    pub(crate) fn set_move_locked(&mut self, locked: bool, cx: &mut Context<Self>) {
+        if self.move_locked != locked {
+            self.move_locked = locked;
+            cx.notify();
+        }
+    }
+    pub(crate) fn move_locked(&self) -> bool {
+        self.move_locked
+    }
+    /// The flip happened: the stored settings changed under this copy.
+    pub(crate) fn mark_move_flipped(&mut self) {
+        self.move_settings_stale = true;
+    }
+
+    /// The banner above the composer while a move is unfinished.
+    pub(super) fn move_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.move_locked {
+            return None;
+        }
+        let button = |id: &'static str, label: &'static str| {
+            crate::settings::widgets::secondary_button(id, label, false, false)
+                .debug_selector(move || id.into())
+                .child(label)
+        };
+        let card = composer_shelf::card("cloud-move-notice", self.classic_layout)
+            .debug_selector(|| "cloud-move-notice".into())
+            .role(Role::Group)
+            .aria_label("Move to the cloud in progress")
+            .py(px(6.))
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(icon("cloud-upload", 14.).text_color(warning_color()))
+                    .child(
+                        div()
+                            .debug_selector(|| "cloud-move-notice-text".into())
+                            .text_color(warning_color())
+                            .child(MOVE_PAUSED),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(
+                        button("cloud-move-show", "Show move")
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(ContinueInCloud))),
+                    )
+                    .child(
+                        button("cloud-move-cancel", "Cancel move")
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(CancelCloudMove))),
+                    ),
+            );
+        Some(
+            composer_shelf::shelf("cloud-move-notice-shelf")
+                .px(px(8.))
+                .child(card)
+                .into_any_element(),
+        )
     }
 
     /// The shell tells whether this session can move to the cloud.
@@ -82,6 +160,7 @@ impl Conversation {
         mut saved: monocode_core::agent::Settings,
         cx: &mut Context<Self>,
     ) {
+        self.move_settings_stale = false;
         self.model = saved.model.clone();
         saved.mono = self.settings.mono.take();
         saved.environment = std::mem::take(&mut self.settings.environment);
@@ -93,6 +172,12 @@ impl Conversation {
 
 #[cfg(test)]
 impl Conversation {
+    pub(crate) fn settings_for_test(&self) -> &monocode_core::agent::Settings {
+        &self.settings
+    }
+    pub(crate) fn save_settings_for_test(&mut self, cx: &mut Context<Self>) {
+        self.save_settings(cx)
+    }
     /// The labels of the move entries of the Workspace menu.
     pub(crate) fn move_menu_items_for_test(&self) -> Vec<String> {
         self.move_menu_items()

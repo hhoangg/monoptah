@@ -43,11 +43,60 @@ pub struct MovePreview {
     pub dirty_submodules: Vec<String>,
 }
 
+/// The message `begin_move` gives for a session whose worktree is gone: the preview refuses
+/// with the same words.
+pub const NO_WORKTREE: &str = "Select a branch or worktree to continue this conversation.";
+
+use std::sync::{Condvar, LazyLock, Mutex};
+
+/// The project folders being inspected right now, with a condvar to wait for one to free up.
+static INSPECTING: LazyLock<(Mutex<std::collections::HashSet<String>>, Condvar)> =
+    LazyLock::new(Default::default);
+
+/// Holds the per-project lock until dropped.
+pub(super) struct ProjectGuard(String);
+
+impl Drop for ProjectGuard {
+    fn drop(&mut self) {
+        let (set, freed) = &*INSPECTING;
+        set.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+        freed.notify_all();
+    }
+}
+
+/// One git inspection of a project folder at a time (the preview and the move's own snapshot
+/// both fetch origin and write staging). Blocks until the folder is free.
+pub(super) fn project_guard(cwd: &Path) -> ProjectGuard {
+    let key = std::fs::canonicalize(cwd)
+        .unwrap_or_else(|_| cwd.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    let (set, freed) = &*INSPECTING;
+    let mut held = set.lock().unwrap_or_else(|e| e.into_inner());
+    while held.contains(&key) {
+        held = freed.wait(held).unwrap_or_else(|e| e.into_inner());
+    }
+    held.insert(key.clone());
+    ProjectGuard(key)
+}
+
 /// Inspects the working copy at `cwd`. Blocking (a `git fetch`, up to 60 s): run it on a
-/// worker. Nothing in the repository is written and nothing is pushed.
-pub fn preview(cwd: &Path) -> Result<MovePreview, String> {
-    move_out::fetch_origin(cwd)?;
+/// dedicated thread. Nothing in the repository is written and nothing is pushed. Setting
+/// `cancel` stops the fetch (killing git and its children) and returns `Err("Cancelled")`.
+pub fn preview(cwd: &Path, cancel: &std::sync::atomic::AtomicBool) -> Result<MovePreview, String> {
+    use std::sync::atomic::Ordering;
+    let stopped = || cancel.load(Ordering::Relaxed);
+    let _inspect = project_guard(cwd);
+    if stopped() {
+        return Err("Cancelled".into());
+    }
+    move_out::fetch_origin_cancellable(cwd, cancel)?;
     let target = move_out::push_target(cwd)?;
+    if stopped() {
+        return Err("Cancelled".into());
+    }
     let staging = tempfile::tempdir().map_err(|e| e.to_string())?;
     let snapshot = move_out::snapshot(cwd, staging.path())?;
     let commits = if target.needs_push {
@@ -146,4 +195,9 @@ pub(super) fn save_mark(store: &Store, session: i64, mark: &MoveMark) -> Result<
 /// session that never moved).
 pub fn move_mark(store: &Store, session: i64) -> Option<MoveMark> {
     serde_json::from_str(&store.setting(&format!("{MARK_PREFIX}{session}")).ok()??).ok()
+}
+
+#[cfg(test)]
+pub(super) fn save_mark_for_test(store: &Store, session: i64, mark: &MoveMark) {
+    save_mark(store, session, mark).unwrap();
 }

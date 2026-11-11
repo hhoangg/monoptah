@@ -665,6 +665,16 @@ impl Shell {
                     Err(e) => Err(e),
                     Ok((id, view)) => {
                         if matches!(action.as_str(), "sessions.send" | "sessions.draft")
+                            && view.read(cx).move_locked()
+                        {
+                            self.finish_app_call(
+                                call,
+                                Err(crate::conversation::MOVE_PAUSED.into()),
+                                cx,
+                            );
+                            return;
+                        }
+                        if matches!(action.as_str(), "sessions.send" | "sessions.draft")
                             && (self.cloud_busy.contains(&id) || view.read(cx).cloud_locked)
                         {
                             self.finish_app_call(call, Err(CLOUD_ARCHIVING.into()), cx);

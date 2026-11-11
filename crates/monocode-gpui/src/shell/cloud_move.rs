@@ -15,8 +15,8 @@ use crate::conversation::MoveOffer;
 use monocode_core::cloud_sessions::{
     CloudSessions, CloudState, HARNESS, docker_config,
     move_session::{
-        CancelChoice, CancelReport, MOVE_ABORTED, MoveEvent, MoveOutcome, MoveRecord, MoveRequest,
-        MoveTarget, pending_moves,
+        CancelChoice, CancelReport, MOVE_ABORTED, MOVE_STOPPING, MoveEvent, MoveOutcome,
+        MoveRecord, MoveRequest, MoveStep, MoveTarget, NO_MOVE, pending_moves,
     },
     move_ui::{self, MovePreview},
 };
@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// with a fake that counts calls (the UI must never call `run` without a confirmation).
 pub(crate) trait MoveEngine: Send + Sync {
     /// The read-only "what will move" inspection of the working copy at `cwd`.
-    fn preview(&self, cwd: &Path) -> Result<MovePreview, String>;
+    fn preview(&self, cwd: &Path, cancel: &AtomicBool) -> Result<MovePreview, String>;
     /// Checks the session and saves the record. Changes nothing else.
     fn begin(&self, request: MoveRequest, busy: &dyn Fn() -> bool) -> Result<MoveRecord, String>;
     /// Runs the steps. BLOCKS and may wake a workspace: user actions only.
@@ -42,8 +42,8 @@ pub(crate) trait MoveEngine: Send + Sync {
 }
 
 impl MoveEngine for CloudSessions {
-    fn preview(&self, cwd: &Path) -> Result<MovePreview, String> {
-        move_ui::preview(cwd)
+    fn preview(&self, cwd: &Path, cancel: &AtomicBool) -> Result<MovePreview, String> {
+        move_ui::preview(cwd, cancel)
     }
     fn begin(&self, request: MoveRequest, busy: &dyn Fn() -> bool) -> Result<MoveRecord, String> {
         self.begin_move(request, busy)
@@ -71,15 +71,26 @@ pub(super) struct MoveRun {
     cancel: Arc<AtomicBool>,
     /// Mirrors whether the conversation runs a turn; the engine asks it at the flip.
     busy: Arc<AtomicBool>,
+    /// A cancel that arrived before the engine had a record to cancel (`begin_move` still
+    /// running): carried out when the worker ends.
+    pending_cancel: Option<CancelChoice>,
+    /// Set by the worker thread when it ends; the quit handler waits on it.
+    ended: Arc<AtomicBool>,
 }
 
 impl MoveRun {
+    pub(super) fn set_busy(&self, busy: bool) {
+        self.busy.store(busy, Ordering::Relaxed);
+    }
+
     fn new(record: Option<MoveRecord>) -> Self {
         Self {
             record,
             running: false,
             cancel: Arc::new(AtomicBool::new(false)),
             busy: Arc::new(AtomicBool::new(false)),
+            pending_cancel: None,
+            ended: Arc::new(AtomicBool::new(true)),
         }
     }
 }
@@ -133,9 +144,11 @@ impl Shell {
         let ids: Vec<i64> = self.sessions.keys().copied().collect();
         for id in ids {
             let offer = self.move_offer(id);
+            let locked = self.cloud_moves.contains_key(&id);
             let label = self.move_label(id);
             if let Some(view) = self.sessions.get(&id) {
                 view.update(cx, |view, cx| {
+                    view.set_move_locked(locked, cx);
                     view.set_move_offer(offer, cx);
                     view.set_cloud_moved(label, cx);
                 });
@@ -252,6 +265,13 @@ impl Shell {
             return;
         }
         self.close_menu(cx);
+        // The same session's dialog is still reading the working copy: keep that one (and its
+        // inspection) instead of starting another.
+        if let Some(open) = self.move_dialog.as_ref().filter(|o| o.session == id)
+            && open.view.read(cx).is_loading()
+        {
+            return;
+        }
         self.close_cloud_move_dialog(window, cx);
         let in_progress = self.cloud_moves.get(&id);
         let unfinished = in_progress.and_then(|run| run.record.clone());
@@ -275,7 +295,9 @@ impl Shell {
         });
         if let Some(record) = unfinished {
             // A move that exists already: show where it stands, start nothing.
+            let allowed = self.may_delete_workspace(&record);
             view.update(cx, |dialog, cx| {
+                dialog.set_delete_allowed(allowed, cx);
                 if running {
                     dialog.update_record(record, cx);
                 } else {
@@ -301,9 +323,10 @@ impl Shell {
         })
     }
 
-    /// Reads the working copy off the UI thread and shows the answer. Read-only.
+    /// Reads the working copy on a dedicated thread and shows the answer. Read-only. Closing the
+    /// dialog cancels it (the fetch is killed).
     fn load_move_preview(
-        &self,
+        &mut self,
         id: i64,
         project: String,
         view: Entity<MoveDialog>,
@@ -311,27 +334,67 @@ impl Shell {
     ) {
         let engine = self.cloud_move_engine.clone();
         let store = self.store.clone();
-        cx.spawn(async move |_, cx| {
-            let work = cx.background_executor().spawn(async move {
-                // A session in a worktree moves that worktree.
-                let cwd = locked(&store)
-                    .and_then(|s| s.agent_settings(id))
-                    .ok()
-                    .flatten()
-                    .and_then(|s| s.worktree_cwd)
-                    .filter(|cwd| !cwd.is_empty() && Path::new(cwd).is_dir())
-                    .unwrap_or(project);
-                engine.preview(Path::new(&cwd))
+        let cancel = Arc::new(AtomicBool::new(false));
+        if let Some(old) = self.move_previews.insert(id, cancel.clone()) {
+            old.store(true, Ordering::Relaxed);
+        }
+        let (tx, rx) = async_channel::bounded(1);
+        let worker_cancel = cancel.clone();
+        let work = move || {
+            let settings = locked(&store)
+                .and_then(|s| s.agent_settings(id))
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            // The same rule as `begin_move`: a session in a worktree moves that worktree, and
+            // a missing one is not replaced by the project folder.
+            let recorded = settings.worktree_cwd.clone().filter(|cwd| !cwd.is_empty());
+            let result = if settings.worktree_removed
+                || recorded
+                    .as_deref()
+                    .is_some_and(|cwd| !Path::new(cwd).is_dir())
+            {
+                Err(move_ui::NO_WORKTREE.to_owned())
+            } else {
+                let cwd = recorded.unwrap_or(project);
+                engine.preview(Path::new(&cwd), &worker_cancel)
+            };
+            let _ = tx.try_send(result);
+        };
+        // A fetch can take a minute: not on GPUI's shared worker pool.
+        #[cfg(not(test))]
+        std::thread::spawn(work);
+        #[cfg(test)]
+        cx.background_executor()
+            .spawn(async move { work() })
+            .detach();
+        cx.spawn(async move |this, cx| {
+            let Ok(preview) = rx.recv().await else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                if this
+                    .move_previews
+                    .get(&id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &cancel))
+                {
+                    this.move_previews.remove(&id);
+                }
+                if !cancel.load(Ordering::Relaxed) {
+                    view.update(cx, |dialog, cx| dialog.show_preview(preview, cx));
+                }
             });
-            let preview = work.await;
-            view.update(cx, |dialog, cx| dialog.show_preview(preview, cx));
         })
         .detach();
     }
 
     pub(super) fn close_cloud_move_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Closing never stops the move: the worker and the record stay in `cloud_moves`.
-        if self.move_dialog.take().is_some() {
+        // Closing never stops the move: the worker and the record stay in `cloud_moves`. It does
+        // stop a working-copy inspection nobody waits for.
+        if let Some(open) = self.move_dialog.take() {
+            if let Some(cancel) = self.move_previews.remove(&open.session) {
+                cancel.store(true, Ordering::Relaxed);
+            }
             self.focus_workspace(window, cx);
             cx.notify();
         }
@@ -368,6 +431,10 @@ impl Shell {
                 self.cancel_cloud_move(id, *delete_workspace, cx)
             }
         }
+    }
+
+    pub(super) fn cloud_move_dialog_for(&self, id: i64) -> Option<Entity<MoveDialog>> {
+        self.dialog_for(id)
     }
 
     fn dialog_for(&self, id: i64) -> Option<Entity<MoveDialog>> {
@@ -415,10 +482,19 @@ impl Shell {
         run.running = true;
         run.cancel = Arc::new(AtomicBool::new(false));
         run.busy.store(busy_now, Ordering::Relaxed);
+        run.ended = Arc::new(AtomicBool::new(false));
+        let ended = run.ended.clone();
         let (cancel, busy) = (run.cancel.clone(), run.busy.clone());
         let engine = self.cloud_move_engine.clone();
         let (reports, incoming) = async_channel::unbounded::<Report>();
         let work = move || {
+            struct Ended(Arc<AtomicBool>);
+            impl Drop for Ended {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+            let _ended = Ended(ended);
             let busy_check = || busy.load(Ordering::Relaxed);
             if let Some(target) = target {
                 let request = MoveRequest {
@@ -489,11 +565,19 @@ impl Shell {
         };
         match event {
             MoveEvent::Updated(record) | MoveEvent::Failed(record) => {
+                let flipped = record.done.contains(&MoveStep::Flip);
+                let allowed = self.may_delete_workspace(&record);
                 if let Some(run) = self.cloud_moves.get_mut(&id) {
                     run.record = Some(record.clone());
                 }
                 if let Some(dialog) = dialog {
-                    dialog.update(cx, |dialog, cx| dialog.update_record(record, cx));
+                    dialog.update(cx, |dialog, cx| {
+                        dialog.set_delete_allowed(allowed, cx);
+                        dialog.update_record(record, cx)
+                    });
+                }
+                if flipped {
+                    self.flip_happened(id, cx);
                 }
             }
             MoveEvent::Log(_) => {}
@@ -514,6 +598,31 @@ impl Shell {
         self.invalidate_chrome(cx);
     }
 
+    /// Whether "Cancel and delete" may be offered: the move created the workspace and no other
+    /// session of this window lives in it.
+    fn may_delete_workspace(&self, record: &MoveRecord) -> bool {
+        record.workspace.as_ref().is_some_and(|w| {
+            w.created
+                && !w.name.is_empty()
+                && !self
+                    .cloud_marks
+                    .values()
+                    .any(|mark| mark.kind == w.backend && mark.codespace == w.name)
+        })
+    }
+
+    /// The location is Cloud and the settings changed in the store: the open conversation
+    /// reloads them now, not seconds later when the cleanup ends.
+    fn flip_happened(&mut self, id: i64, cx: &mut Context<Self>) {
+        if let Some(view) = self.sessions.get(&id) {
+            view.update(cx, |view, cx| {
+                view.mark_move_flipped();
+                view.reload_settings(cx);
+            });
+        }
+        self.refresh_cloud(cx);
+    }
+
     /// The worker ended. A success was handled by its `Done` event; here an error that no
     /// `Failed` event described (a refusal before the first step, an abort) is shown.
     fn finish_move_worker(
@@ -527,18 +636,38 @@ impl Shell {
             return;
         };
         run.running = false;
+        let cancelling = run.cancel.load(Ordering::Relaxed);
+        let never_began = run.record.is_none();
+        // A cancel that came before the engine had a record: carry it out now.
+        if let Some(choice) = run.pending_cancel.take() {
+            if never_began {
+                // `begin_move` did not record anything: there is nothing to roll back.
+                self.cloud_moves.remove(&id);
+                if let Some(dialog) = self.dialog_for(id) {
+                    dialog.update(cx, |dialog, cx| {
+                        dialog.cancelled(CancelReport::default(), cx)
+                    });
+                }
+                self.sync_cloud_moves(cx);
+            } else {
+                self.run_engine_cancel(id, choice, cx);
+            }
+            return;
+        }
         let Err(error) = result else {
             return;
         };
-        let never_began = run.record.is_none();
         let dialog = self.dialog_for(id);
-        if never_began {
-            // `begin_move` refused (busy, already moving, ...): nothing was recorded.
+        if never_began || error == NO_MOVE {
+            // `begin_move` refused (busy, already moving, ...) or the record is gone: no dead
+            // entry stays behind.
             self.cloud_moves.remove(&id);
             if let Some(dialog) = dialog {
                 dialog.update(cx, |dialog, cx| dialog.refuse(error, cx));
             }
             self.sync_cloud_moves(cx);
+        } else if cancelling && error == MOVE_ABORTED {
+            // The user's cancel stopped the run; the rollback reports for itself.
         } else if let Some(dialog) = dialog {
             // The record is kept: the move can be resumed.
             let error = if error == MOVE_ABORTED {
@@ -555,52 +684,120 @@ impl Shell {
         self.cloud_moves.remove(&id);
         self.move_labels.remove(&id);
         // The conversation keeps its settings in memory; the flip wrote new ones.
-        if let Some(view) = self.sessions.get(&id) {
-            view.update(cx, |view, cx| view.reload_settings(cx));
-        }
+        self.flip_happened(id, cx);
         if let Some(dialog) = self.dialog_for(id) {
             dialog.update(cx, |dialog, cx| dialog.done(cx));
         }
-        // The cloud refresh reads the location, so the sidebar mark and the divider follow.
-        self.refresh_cloud(cx);
         self.sync_cloud_moves(cx);
         cx.notify();
     }
 
+    /// The user pressed a Cancel button of the dialog (or the banner).
     fn cancel_cloud_move(&mut self, id: i64, delete_workspace: bool, cx: &mut Context<Self>) {
-        let Some(run) = self.cloud_moves.get(&id) else {
+        let Some(run) = self.cloud_moves.get_mut(&id) else {
             return;
         };
-        let running = run.running;
-        let engine = self.cloud_move_engine.clone();
         let choice = CancelChoice { delete_workspace };
-        // A running move rolls itself back and reports `Cancelled`. Otherwise the rollback is
-        // done here, off the UI thread (it may talk to the workspace).
+        if run.running {
+            // The engine watches this flag; the run stops at its next check.
+            run.cancel.store(true, Ordering::Relaxed);
+            if run.record.is_none() {
+                // `begin_move` has not saved anything yet: cancel when it has.
+                run.pending_cancel = Some(choice);
+                return;
+            }
+        }
+        self.run_engine_cancel(id, choice, cx);
+    }
+
+    /// Asks the engine to cancel, off the UI thread (a rollback may talk to the workspace),
+    /// and applies the answer. The entry stays until the answer is known.
+    fn run_engine_cancel(&mut self, id: i64, choice: CancelChoice, cx: &mut Context<Self>) {
+        let engine = self.cloud_move_engine.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move { engine.cancel(id, choice) })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                if running {
-                    if let Err(error) = result
-                        && let Some(dialog) = this.dialog_for(id)
-                    {
-                        dialog.update(cx, |dialog, cx| dialog.fail(error, cx));
-                    }
-                    return;
-                }
-                this.cloud_moves.remove(&id);
-                if let Some(dialog) = this.dialog_for(id) {
-                    dialog.update(cx, |dialog, cx| match result {
-                        Ok(report) => dialog.cancelled(report, cx),
-                        Err(error) => dialog.fail(error, cx),
-                    });
-                }
-                this.sync_cloud_moves(cx);
+                this.apply_cancel_result(id, choice, result, cx)
             });
         })
         .detach();
+    }
+
+    fn apply_cancel_result(
+        &mut self,
+        id: i64,
+        choice: CancelChoice,
+        result: Result<CancelReport, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let dialog = self.dialog_for(id);
+        match result {
+            // A run is still going: it rolls back by itself and sends `Cancelled`.
+            Ok(report) if report.warnings.iter().any(|w| w == MOVE_STOPPING) => {}
+            Ok(report) => {
+                self.cloud_moves.remove(&id);
+                if let Some(dialog) = dialog {
+                    dialog.update(cx, |dialog, cx| dialog.cancelled(report, cx));
+                }
+                self.sync_cloud_moves(cx);
+            }
+            Err(error) if error == NO_MOVE => {
+                if let Some(run) = self.cloud_moves.get_mut(&id)
+                    && run.running
+                {
+                    // The worker has no record yet: try again when it ends.
+                    run.pending_cancel = Some(choice);
+                    return;
+                }
+                // No record and no worker: there is nothing to cancel.
+                self.cloud_moves.remove(&id);
+                if let Some(dialog) = dialog {
+                    dialog.update(cx, |dialog, cx| {
+                        dialog.cancelled(CancelReport::default(), cx)
+                    });
+                }
+                self.sync_cloud_moves(cx);
+            }
+            Err(error) => {
+                // The move is still there: show why and leave Rolling.
+                if let Some(dialog) = dialog {
+                    dialog.update(cx, |dialog, cx| dialog.fail(error, cx));
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// A session was deleted: its move (and any inspection) goes with it.
+    pub(super) fn drop_cloud_move(&mut self, id: i64) {
+        if let Some(cancel) = self.move_previews.remove(&id) {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        if let Some(run) = self.cloud_moves.remove(&id) {
+            run.cancel.store(true, Ordering::Relaxed);
+        }
+        self.move_labels.remove(&id);
+        if self.move_dialog.as_ref().is_some_and(|o| o.session == id) {
+            self.move_dialog = None;
+        }
+    }
+
+    /// The app is quitting: stop every worker (its push is killed with its process group; the
+    /// record stays, so the move can be resumed) and return what to wait for.
+    pub(super) fn cancel_moves_on_quit(&self) -> Vec<Arc<AtomicBool>> {
+        for cancel in self.move_previews.values() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.cloud_moves
+            .values()
+            .map(|run| {
+                run.cancel.store(true, Ordering::Relaxed);
+                run.ended.clone()
+            })
+            .collect()
     }
 }
 
@@ -672,6 +869,8 @@ mod tests {
         Succeed,
         /// Fails at the Push step.
         FailAtPush,
+        /// `run` finds no record (it was cleared meanwhile).
+        NoMove,
     }
 
     struct Fake {
@@ -679,6 +878,8 @@ mod tests {
         store: Database,
         script: Mutex<Script>,
         preview: MovePreview,
+        /// The answers of the next `cancel` calls; the default answer is a report.
+        cancels: Mutex<Vec<Result<CancelReport, String>>>,
     }
 
     fn preview() -> MovePreview {
@@ -719,7 +920,7 @@ mod tests {
     }
 
     impl MoveEngine for Fake {
-        fn preview(&self, _: &Path) -> Result<MovePreview, String> {
+        fn preview(&self, _: &Path, _: &AtomicBool) -> Result<MovePreview, String> {
             self.calls.push("preview");
             Ok(self.preview.clone())
         }
@@ -742,6 +943,9 @@ mod tests {
             _: &AtomicBool,
         ) -> Result<MoveOutcome, String> {
             self.calls.push("run");
+            if *self.script.lock().unwrap() == Script::NoMove {
+                return Err(NO_MOVE.into());
+            }
             let mut rec = record(session);
             rec.done = vec![MoveStep::Snapshot];
             rec.current = Some(MoveStep::Push);
@@ -798,6 +1002,9 @@ mod tests {
         }
         fn cancel(&self, _: i64, _: CancelChoice) -> Result<CancelReport, String> {
             self.calls.push("cancel");
+            if let Some(answer) = self.cancels.lock().unwrap().pop() {
+                return answer;
+            }
             Ok(CancelReport {
                 created_branch: Some("feature-cloud".into()),
                 kept_workspace: Some(CloudRef::codespace("octo-new")),
@@ -815,6 +1022,7 @@ mod tests {
                     store: shell.store.clone(),
                     script: Mutex::new(script),
                     preview: preview(),
+                    cancels: Mutex::new(Vec::new()),
                 });
                 // No real `gh` and no workspace: the cloud refresh reads the store only.
                 shell.cloud = Arc::new(CloudSessions::new(
@@ -1215,6 +1423,548 @@ mod tests {
                     shell.cloud_move_menu_item(session).is_none(),
                     "remote project"
                 );
+            })
+            .unwrap();
+    }
+
+    // ---------------------------------------------------------------- review fixes
+
+    fn paused(cx: &mut TestAppContext) -> (WindowHandle<Shell>, i64, Arc<Fake>) {
+        let (window, session, fake) = setup(cx, Script::FailAtPush);
+        window
+            .update(cx, |shell, _, cx| shell.ensure_session(session, cx))
+            .unwrap();
+        cx.run_until_parked();
+        open(window, session, cx);
+        confirm(window, cx);
+        assert_eq!(stage(window, cx), Stage::Paused);
+        (window, session, fake)
+    }
+
+    #[gpui::test]
+    fn sending_is_locked_while_a_move_is_unfinished_and_a_banner_says_so(cx: &mut TestAppContext) {
+        let (window, session, _) = paused(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                let view = shell.sessions[&session].clone();
+                assert!(view.read(cx).move_locked());
+                // The composer, a queued follow-up, a Mono send and the app API all refuse.
+                assert!(view.update(cx, |v, cx| v.refuse_while_saving_copy(cx)));
+                let sent = view.update(cx, |v, cx| v.mono_external_send("hi".into(), false, cx));
+                assert_eq!(sent, Err(crate::conversation::MOVE_PAUSED.to_owned()));
+            })
+            .unwrap();
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        assert!(
+            visual.debug_bounds("cloud-move-notice").is_some(),
+            "the banner"
+        );
+        assert!(
+            visual.debug_bounds("cloud-move-cancel").is_some(),
+            "its Cancel move"
+        );
+        // Cancelling releases the lock.
+        window
+            .update(cx, |shell, w, cx| {
+                shell.cancel_cloud_move(session, false, cx);
+                let _ = w;
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(!shell.sessions[&session].read(cx).move_locked());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn the_banner_cancel_opens_the_move_and_cancels_it(cx: &mut TestAppContext) {
+        let (window, session, fake) = paused(cx);
+        window
+            .update(cx, |shell, w, cx| {
+                shell.close_cloud_move_dialog(w, cx);
+                shell.sessions[&session]
+                    .update(cx, |_, cx| cx.emit(crate::conversation::CancelCloudMove));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(fake.calls.count("cancel"), 1);
+        assert!(matches!(stage(window, cx), Stage::Cancelled(_)));
+    }
+
+    #[gpui::test]
+    fn a_failed_cancel_shows_the_error_and_keeps_the_move(cx: &mut TestAppContext) {
+        let (window, session, fake) = paused(cx);
+        fake.cancels
+            .lock()
+            .unwrap()
+            .push(Err("the host is unreachable".into()));
+        let view = dialog(window, cx);
+        window
+            .update(cx, |_, _, cx| {
+                view.update(cx, |d, cx| d.cancel_move(false, cx))
+            })
+            .unwrap();
+        cx.run_until_parked();
+        // Not stuck on Rolling: the error is shown and Retry / Cancel are back.
+        assert_eq!(stage(window, cx), Stage::Paused);
+        window
+            .update(cx, |shell, _, cx| {
+                assert_eq!(view.read(cx).error(), Some("the host is unreachable"));
+                assert!(shell.cloud_moves.contains_key(&session), "the entry stays");
+                assert_eq!(shell.move_offer(session), MoveOffer::InProgress);
+            })
+            .unwrap();
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        assert!(visual.debug_bounds("move-error").is_some());
+        assert!(visual.debug_bounds("move-cancel").is_some());
+        // A second Continue is not offered; another cancel then works.
+        window
+            .update(cx, |_, _, cx| {
+                view.update(cx, |d, cx| d.cancel_move(false, cx))
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(matches!(stage(window, cx), Stage::Cancelled(_)));
+        window
+            .update(cx, |shell, _, _| {
+                assert_eq!(shell.move_offer(session), MoveOffer::Offer)
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_cancel_before_begin_finished_is_carried_out_when_it_has(cx: &mut TestAppContext) {
+        let (window, session, fake) = setup(cx, Script::Succeed);
+        open(window, session, cx);
+        // A worker is in `begin_move`: no record yet.
+        window
+            .update(cx, |shell, _, _| {
+                let mut run = MoveRun::new(None);
+                run.running = true;
+                shell.cloud_moves.insert(session, run);
+            })
+            .unwrap();
+        let view = dialog(window, cx);
+        window
+            .update(cx, |shell, _, cx| {
+                shell.cancel_cloud_move(session, false, cx);
+                let run = &shell.cloud_moves[&session];
+                assert!(
+                    run.cancel.load(Ordering::Relaxed),
+                    "the engine's flag is set"
+                );
+                assert!(run.pending_cancel.is_some());
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(fake.calls.count("cancel"), 0, "nothing to cancel yet");
+        // The worker ends after recording the move: now the cancel runs.
+        window
+            .update(cx, |shell, w, cx| {
+                let rec = record(session);
+                shell.apply_move_report(
+                    session,
+                    Report::Event(Box::new(MoveEvent::Updated(rec))),
+                    w,
+                    cx,
+                );
+                shell.apply_move_report(session, Report::Finished(Err(MOVE_ABORTED.into())), w, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(fake.calls.count("cancel"), 1);
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(matches!(view.read(cx).stage(), Stage::Cancelled(_)));
+                assert!(shell.cloud_moves.is_empty());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_cancel_that_finds_no_record_yet_retries_and_a_begin_that_failed_leaves_nothing(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, session, fake) = setup(cx, Script::Succeed);
+        open(window, session, cx);
+        // The record exists in the shell but the engine answers NO_MOVE while its worker runs.
+        window
+            .update(cx, |shell, _, _| {
+                let mut run = MoveRun::new(Some(record(session)));
+                run.running = true;
+                shell.cloud_moves.insert(session, run);
+            })
+            .unwrap();
+        fake.cancels.lock().unwrap().push(Err(NO_MOVE.into()));
+        window
+            .update(cx, |shell, _, cx| {
+                shell.cancel_cloud_move(session, false, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                assert!(shell.cloud_moves[&session].pending_cancel.is_some());
+            })
+            .unwrap();
+        // Begin failed instead: the entry is gone and the cancel reports nothing to undo.
+        window
+            .update(cx, |shell, w, cx| {
+                shell.cloud_moves.get_mut(&session).unwrap().record = None;
+                shell.apply_move_report(session, Report::Finished(Err("refused".into())), w, cx);
+            })
+            .unwrap();
+        window
+            .update(cx, |shell, _, _| assert!(shell.cloud_moves.is_empty()))
+            .unwrap();
+        assert!(matches!(stage(window, cx), Stage::Cancelled(_)));
+    }
+
+    #[gpui::test]
+    fn a_run_that_finds_no_record_leaves_no_dead_entry(cx: &mut TestAppContext) {
+        let (window, session, fake) = setup(cx, Script::NoMove);
+        open(window, session, cx);
+        confirm(window, cx);
+        assert_eq!(fake.calls.count("run"), 1);
+        window
+            .update(cx, |shell, _, _| {
+                assert!(shell.cloud_moves.is_empty(), "no dead entry");
+                assert_eq!(shell.move_offer(session), MoveOffer::Offer);
+            })
+            .unwrap();
+        assert!(matches!(stage(window, cx), Stage::Refused(_)));
+    }
+
+    #[gpui::test]
+    fn a_cancel_while_the_run_is_going_waits_for_its_own_report(cx: &mut TestAppContext) {
+        let (window, session, fake) = setup(cx, Script::Succeed);
+        open(window, session, cx);
+        window
+            .update(cx, |shell, _, _| {
+                let mut run = MoveRun::new(Some(record(session)));
+                run.running = true;
+                shell.cloud_moves.insert(session, run);
+            })
+            .unwrap();
+        fake.cancels.lock().unwrap().push(Ok(CancelReport {
+            warnings: vec![MOVE_STOPPING.into()],
+            ..Default::default()
+        }));
+        window
+            .update(cx, |shell, _, cx| {
+                shell.cancel_cloud_move(session, false, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        // The "stopping" answer is not a final report: the entry stays until `Cancelled`.
+        window
+            .update(cx, |shell, _, _| {
+                assert!(shell.cloud_moves.contains_key(&session))
+            })
+            .unwrap();
+        assert!(!matches!(stage(window, cx), Stage::Cancelled(_)));
+        window
+            .update(cx, |shell, w, cx| {
+                shell.apply_move_report(
+                    session,
+                    Report::Event(Box::new(MoveEvent::Cancelled(CancelReport::default()))),
+                    w,
+                    cx,
+                );
+            })
+            .unwrap();
+        assert!(matches!(stage(window, cx), Stage::Cancelled(_)));
+        window
+            .update(cx, |shell, _, _| assert!(shell.cloud_moves.is_empty()))
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn the_flip_reloads_the_settings_at_once_and_a_save_in_the_gap_keeps_the_handoff(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, session, _) = setup(cx, Script::Succeed);
+        window
+            .update(cx, |shell, _, cx| shell.ensure_session(session, cx))
+            .unwrap();
+        cx.run_until_parked();
+        // The flip stored a handoff (the in-memory copy has none).
+        window
+            .update(cx, |shell, _, cx| {
+                let store = locked(&shell.store).unwrap();
+                let mut stored = store.agent_settings(session).unwrap().unwrap_or_default();
+                stored.handoff = Some(monocode_core::agent::Handoff {
+                    from: "claude".into(),
+                    brief: "BRIEF".into(),
+                });
+                stored.revision += 1;
+                store.save_agent_settings(session, &stored).unwrap();
+                drop(store);
+                let mut run = MoveRun::new(Some(record(session)));
+                run.running = true;
+                shell.cloud_moves.insert(session, run);
+                shell.sync_cloud_moves(cx);
+                assert!(
+                    shell.sessions[&session]
+                        .read(cx)
+                        .settings_for_test()
+                        .handoff
+                        .is_none()
+                );
+                // The record says Flip is done: the reload starts now, before `Done`.
+            })
+            .unwrap();
+        window
+            .update(cx, |shell, w, cx| {
+                let mut rec = record(session);
+                rec.done = vec![MoveStep::Flip];
+                shell.apply_move_report(
+                    session,
+                    Report::Event(Box::new(MoveEvent::Updated(rec))),
+                    w,
+                    cx,
+                );
+                // The user changes the model in the gap: refused while the move owns the settings.
+                shell.sessions[&session].update(cx, |v, cx| v.save_settings_for_test(cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                let view = shell.sessions[&session].read(cx);
+                assert_eq!(
+                    view.settings_for_test()
+                        .handoff
+                        .as_ref()
+                        .map(|h| h.brief.as_str()),
+                    Some("BRIEF"),
+                    "reloaded before Done"
+                );
+                assert!(view.move_locked(), "still locked until Done");
+                let stored = locked(&shell.store)
+                    .unwrap()
+                    .agent_settings(session)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    stored.handoff.as_ref().map(|h| h.brief.as_str()),
+                    Some("BRIEF")
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_stale_copy_never_erases_the_stored_handoff_when_it_saves(cx: &mut TestAppContext) {
+        let (window, session, _) = setup(cx, Script::Succeed);
+        window
+            .update(cx, |shell, _, cx| shell.ensure_session(session, cx))
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                let store = locked(&shell.store).unwrap();
+                let mut stored = store.agent_settings(session).unwrap().unwrap_or_default();
+                stored.handoff = Some(monocode_core::agent::Handoff {
+                    from: "codex".into(),
+                    brief: "KEEP".into(),
+                });
+                store.save_agent_settings(session, &stored).unwrap();
+                drop(store);
+                // Flipped, not yet reloaded, no longer locked: the worst moment to save.
+                shell.sessions[&session].update(cx, |v, cx| {
+                    v.mark_move_flipped();
+                    v.save_settings_for_test(cx);
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                let stored = locked(&shell.store)
+                    .unwrap()
+                    .agent_settings(session)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    stored.handoff.as_ref().map(|h| h.brief.as_str()),
+                    Some("KEEP")
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn deleting_the_workspace_needs_its_own_confirmation_and_is_not_offered_when_shared(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, session, fake) = paused(cx);
+        // Make the record's workspace one this move created.
+        let created = {
+            let mut r = record(session);
+            r.workspace = Some(monocode_core::cloud_sessions::move_session::WorkspaceInfo {
+                backend: monocode_core::cloud_sessions::CloudBackendKind::Codespaces,
+                name: "octo-new".into(),
+                created: true,
+                start_session: None,
+                project: None,
+            });
+            r.failed_at = Some(MoveStep::Push);
+            r.error = Some("x".into());
+            r
+        };
+        let view = dialog(window, cx);
+        window
+            .update(cx, |shell, w, cx| {
+                assert!(shell.may_delete_workspace(&created));
+                shell.apply_move_report(
+                    session,
+                    Report::Event(Box::new(MoveEvent::Failed(created.clone()))),
+                    w,
+                    cx,
+                );
+                // One click on the destructive action only asks.
+                view.update(cx, |d, cx| d.cancel_move(true, cx));
+                assert_eq!(
+                    *view.read(cx).stage(),
+                    Stage::Paused,
+                    "not without the second step"
+                );
+                view.update(cx, |d, cx| d.ask_delete(cx));
+                assert!(view.read(cx).confirming_delete());
+            })
+            .unwrap();
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("move-delete-confirm").is_some());
+        assert!(visual.debug_bounds("move-delete-warning").is_some());
+        assert_eq!(fake.calls.count("cancel"), 0);
+        window
+            .update(cx, |_, _, cx| view.update(cx, |d, cx| d.keep_workspace(cx)))
+            .unwrap();
+        window
+            .update(cx, |_, _, cx| assert!(!view.read(cx).confirming_delete()))
+            .unwrap();
+        // Another session lives in that workspace: no delete.
+        window
+            .update(cx, |shell, _, _| {
+                shell.cloud_marks.insert(
+                    9999,
+                    cloud::CloudMark {
+                        local_project: "/work/monocode".into(),
+                        codespace: "octo-new".into(),
+                        kind: monocode_core::cloud_sessions::CloudBackendKind::Codespaces,
+                    },
+                );
+                assert!(!shell.may_delete_workspace(&created));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn the_preview_is_shared_cancelled_on_close_and_refuses_a_missing_worktree(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, session, fake) = setup(cx, Script::Succeed);
+        // Opening twice before the first answer reuses the inspection.
+        window
+            .update(cx, |shell, w, cx| {
+                shell.open_cloud_move(session, w, cx);
+                shell.open_cloud_move(session, w, cx);
+                assert_eq!(shell.move_previews.len(), 1);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(fake.calls.count("preview"), 1);
+        assert!(matches!(stage(window, cx), Stage::Review(_)));
+        // Closing while one runs cancels it and shows nothing.
+        let flag = window
+            .update(cx, |shell, w, cx| {
+                shell.close_cloud_move_dialog(w, cx);
+                shell.open_cloud_move(session, w, cx);
+                let flag = shell.move_previews[&session].clone();
+                shell.close_cloud_move_dialog(w, cx);
+                flag
+            })
+            .unwrap();
+        assert!(flag.load(Ordering::Relaxed));
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                assert!(shell.move_dialog.is_none());
+                assert!(shell.move_previews.is_empty());
+            })
+            .unwrap();
+        // The worktree is gone: the same refusal as `begin_move`, and no inspection.
+        let before = fake.calls.count("preview");
+        window
+            .update(cx, |shell, w, cx| {
+                let store = locked(&shell.store).unwrap();
+                let mut settings = store.agent_settings(session).unwrap().unwrap_or_default();
+                settings.worktree_removed = true;
+                store.save_agent_settings(session, &settings).unwrap();
+                drop(store);
+                shell.open_cloud_move(session, w, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            stage(window, cx),
+            Stage::Refused(move_ui::NO_WORKTREE.into())
+        );
+        assert_eq!(fake.calls.count("preview"), before);
+    }
+
+    #[gpui::test]
+    fn the_busy_mirror_follows_the_conversation_between_move_events(cx: &mut TestAppContext) {
+        let (window, session, _) = setup(cx, Script::Succeed);
+        window
+            .update(cx, |shell, _, cx| shell.ensure_session(session, cx))
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                shell
+                    .cloud_moves
+                    .insert(session, MoveRun::new(Some(record(session))));
+                shell.sessions[&session].update(cx, |v, cx| {
+                    v.busy = true;
+                    cx.notify();
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                assert!(shell.cloud_moves[&session].busy.load(Ordering::Relaxed));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_deleted_session_drops_its_move_and_quit_stops_the_workers(cx: &mut TestAppContext) {
+        let (window, session, _) = setup(cx, Script::Succeed);
+        window
+            .update(cx, |shell, _, _| {
+                let mut run = MoveRun::new(Some(record(session)));
+                run.running = true;
+                run.ended = Arc::new(AtomicBool::new(false));
+                let cancel = run.cancel.clone();
+                let ended = run.ended.clone();
+                shell.cloud_moves.insert(session, run);
+                // Quit: the flag is set (the engine's watcher kills the push) and the caller
+                // gets the flags to wait on; the record stays.
+                let waits = shell.cancel_moves_on_quit();
+                assert!(cancel.load(Ordering::Relaxed));
+                assert_eq!(waits.len(), 1);
+                assert!(!waits[0].load(Ordering::SeqCst));
+                assert!(Arc::ptr_eq(&waits[0], &ended));
+                assert!(shell.cloud_moves.contains_key(&session));
+                shell.drop_cloud_move(session);
+                assert!(shell.cloud_moves.is_empty());
             })
             .unwrap();
     }

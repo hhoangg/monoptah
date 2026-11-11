@@ -71,6 +71,10 @@ pub(crate) struct MoveDialog {
     record: Option<MoveRecord>,
     notices: Vec<String>,
     error: Option<String>,
+    /// The shell says the workspace the move created may be deleted (no other session uses it).
+    delete_allowed: bool,
+    /// "Cancel and delete" was pressed and waits for its own confirmation.
+    confirming_delete: bool,
     focus: FocusHandle,
 }
 
@@ -245,10 +249,15 @@ impl MoveDialog {
             record: None,
             notices: Vec::new(),
             error: None,
+            delete_allowed: false,
+            confirming_delete: false,
             focus: cx.focus_handle(),
         }
     }
 
+    pub(crate) fn is_loading(&self) -> bool {
+        self.stage == Stage::Loading
+    }
     #[cfg(test)]
     pub(crate) fn stage(&self) -> &Stage {
         &self.stage
@@ -332,13 +341,39 @@ impl MoveDialog {
 
     pub(crate) fn fail(&mut self, error: String, cx: &mut Context<Self>) {
         self.error = Some(error);
-        if !matches!(
-            self.stage,
-            Stage::Rolling | Stage::Cancelled(_) | Stage::Done
-        ) {
+        // A rollback that failed leaves Rolling: the move is still there to retry or cancel.
+        if !matches!(self.stage, Stage::Cancelled(_) | Stage::Done) {
             self.stage = Stage::Paused;
         }
+        self.confirming_delete = false;
         cx.notify();
+    }
+
+    /// The shell says whether deleting the move's workspace may be offered.
+    pub(crate) fn set_delete_allowed(&mut self, allowed: bool, cx: &mut Context<Self>) {
+        if self.delete_allowed != allowed {
+            self.delete_allowed = allowed;
+            cx.notify();
+        }
+    }
+
+    /// "Cancel and delete <workspace>": asks for its own confirmation first.
+    pub(crate) fn ask_delete(&mut self, cx: &mut Context<Self>) {
+        if self.delete_allowed && matches!(self.stage, Stage::Paused | Stage::Running) {
+            self.confirming_delete = true;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn keep_workspace(&mut self, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.confirming_delete) {
+            cx.notify();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn confirming_delete(&self) -> bool {
+        self.confirming_delete
     }
 
     pub(crate) fn cancelled(&mut self, report: CancelReport, cx: &mut Context<Self>) {
@@ -388,6 +423,11 @@ impl MoveDialog {
         if !matches!(self.stage, Stage::Paused | Stage::Running) {
             return;
         }
+        // Deleting a workspace needs its own confirmation step.
+        if delete_workspace && !(self.confirming_delete && self.delete_allowed) {
+            return;
+        }
+        self.confirming_delete = false;
         self.stage = Stage::Rolling;
         cx.notify();
         cx.emit(Event::CancelMove { delete_workspace });
@@ -479,6 +519,24 @@ impl MoveDialog {
         if !self.notices.is_empty() {
             column = column.child(Self::lines("move-notice", "Notes", self.notices.clone()));
         }
+        if self.record.as_ref().is_some_and(|r| r.stale) {
+            column = column.child(alert(
+                "move-stale",
+                "This conversation changed after the move started, so it cannot continue. Press Cancel move, then start again from the menu. A branch that was pushed stays on origin.",
+            ));
+        }
+        if self.confirming_delete
+            && let Some(w) = self.record.as_ref().and_then(|r| r.workspace.as_ref())
+        {
+            column = column.child(alert(
+                "move-delete-warning",
+                format!(
+                    "Delete the {} {}? It was created by this move and nothing else uses it. This cannot be undone.",
+                    w.backend.noun(),
+                    w.name
+                ),
+            ));
+        }
         if self.stage == Stage::Running {
             column = column.child(muted(
                 "You can close this window. The move goes on and can be resumed from the conversation's menu.",
@@ -510,12 +568,27 @@ impl MoveDialog {
                 );
             }
             Stage::Rolling => row = row.child(close("Close")),
+            Stage::Running | Stage::Paused if self.confirming_delete => {
+                row = row
+                    .child(
+                        modal::ghost_button("move-delete-back", "Keep it")
+                            .debug_selector(|| "move-delete-back".into())
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| this.keep_workspace(cx))),
+                    )
+                    .child(
+                        modal::danger_button("move-delete-confirm", "Delete and cancel move")
+                            .debug_selector(|| "move-delete-confirm".into())
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel_move(true, cx))),
+                    );
+            }
             Stage::Running | Stage::Paused => {
                 let created = self
                     .record
                     .as_ref()
                     .and_then(|r| r.workspace.as_ref())
-                    .filter(|w| w.created && !w.name.is_empty())
+                    .filter(|w| w.created && !w.name.is_empty() && self.delete_allowed)
                     .map(|w| w.backend.noun());
                 row = row.child(close("Close"));
                 if let Some(noun) = created {
@@ -526,7 +599,7 @@ impl MoveDialog {
                         )
                         .debug_selector(|| "move-cancel-delete".into())
                         .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _, cx| this.cancel_move(true, cx))),
+                        .on_click(cx.listener(|this, _, _, cx| this.ask_delete(cx))),
                     );
                 }
                 row = row.child(
@@ -574,7 +647,7 @@ impl Render for MoveDialog {
                 .flex()
                 .flex_col()
                 .gap_3()
-                .child(self.steps())
+                .child(self.progress())
                 .child(muted("Rolling back what the move created..."))
                 .into_any_element(),
             Stage::Cancelled(report) => {

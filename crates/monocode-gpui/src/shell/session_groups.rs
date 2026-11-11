@@ -1159,6 +1159,7 @@ impl Shell {
             self.preview_close = None;
         }
         self.drop_cloud_start(id);
+        self.drop_cloud_move(id);
         self.sessions.remove(&id);
         self.stop_tui(id, cx);
         self.session_summaries.remove(&id);

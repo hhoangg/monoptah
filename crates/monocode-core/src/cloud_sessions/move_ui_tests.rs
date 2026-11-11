@@ -62,7 +62,7 @@ fn the_preview_lists_the_push_target_the_counts_and_the_ignored_files() {
     std::fs::write(work.join("new.txt"), "new\n").unwrap();
     std::fs::write(work.join(".env.local"), "SECRET=1\n").unwrap();
 
-    let p = preview(&work).unwrap();
+    let p = preview(&work, &std::sync::atomic::AtomicBool::new(false)).unwrap();
     assert_eq!(p.branch, "feature");
     assert_eq!(p.local_branch, "feature");
     assert!(p.needs_push && p.creates_branch);
@@ -87,7 +87,7 @@ fn the_preview_lists_the_push_target_the_counts_and_the_ignored_files() {
 #[test]
 fn a_branch_that_origin_already_has_means_nothing_to_push() {
     let (_tmp, work) = fixture();
-    let p = preview(&work).unwrap();
+    let p = preview(&work, &std::sync::atomic::AtomicBool::new(false)).unwrap();
     assert!(!p.needs_push);
     assert_eq!(p.commits, 0);
     assert_eq!(p.branch, "main");
@@ -97,7 +97,7 @@ fn a_branch_that_origin_already_has_means_nothing_to_push() {
 fn the_default_branch_is_never_the_target() {
     let (_tmp, work) = fixture();
     commit_file(&work, "a.txt", "a\n");
-    let p = preview(&work).unwrap();
+    let p = preview(&work, &std::sync::atomic::AtomicBool::new(false)).unwrap();
     assert_eq!(p.branch, "main-cloud");
     assert!(p.creates_branch && p.needs_push);
     assert_eq!(p.commits, 1);
@@ -113,4 +113,43 @@ fn the_mark_names_the_target_and_reads_back() {
     assert_eq!(mark.target_label(), "codespace fluffy-guacamole");
     let json = serde_json::to_string(&mark).unwrap();
     assert_eq!(serde_json::from_str::<MoveMark>(&json).unwrap(), mark);
+}
+
+#[test]
+fn a_cancelled_preview_stops_and_the_project_is_inspected_one_at_a_time() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (_tmp, work) = fixture();
+    // Already cancelled: it returns at once without running git.
+    let cancel = AtomicBool::new(true);
+    assert_eq!(preview(&work, &cancel).unwrap_err(), "Cancelled");
+    // Two inspections of one folder never overlap.
+    let running = std::sync::atomic::AtomicUsize::new(0);
+    let max = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..4 {
+            s.spawn(|| {
+                let _g = super::move_ui::project_guard(&work);
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                max.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                running.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+    });
+    assert_eq!(max.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn deleting_a_session_removes_its_move_mark() {
+    let mut store = crate::store::Store::open(Path::new(":memory:")).unwrap();
+    let session = store.create("claude", "/work/x").unwrap();
+    let mark = MoveMark {
+        at_ms: 1,
+        backend: super::backend::CloudBackendKind::Codespaces,
+        target: "cs".into(),
+    };
+    super::move_ui::save_mark_for_test(&store, session.id, &mark);
+    assert!(move_mark(&store, session.id).is_some());
+    store.delete(session.id).unwrap();
+    assert!(move_mark(&store, session.id).is_none());
 }
