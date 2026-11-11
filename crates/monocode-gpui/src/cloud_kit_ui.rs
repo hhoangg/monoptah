@@ -272,6 +272,33 @@ pub(crate) mod fixture {
         }
     }
 
+    /// The fixture plus the user's instructions: two files and one import left behind.
+    pub(crate) fn scan_with_instructions(
+        project: &Path,
+        workspace: Workspace,
+    ) -> Result<KitInventory, String> {
+        let mut inventory = scan(project, workspace)?;
+        let file = |name: &str| KitFile {
+            path: PathBuf::from("/x").join(name),
+            id: None,
+            name: PathBuf::from(name),
+        };
+        inventory.instructions = Some(KitInstructions {
+            source: KitSource::User,
+            root: PathBuf::from("/x"),
+            files: vec![file("CLAUDE.md"), file("RTK.md")],
+            size: 2048,
+            hash: "h".into(),
+            exclusion: None,
+            not_carried: vec![(
+                "~/notes.md".into(),
+                "Outside the Claude config folder".into(),
+            )],
+            notes: Vec::new(),
+        });
+        Ok(inventory)
+    }
+
     /// Like the real scan, a stdio `docker` server is local-only on a sandbox.
     pub(crate) fn scan(_: &Path, workspace: Workspace) -> Result<KitInventory, String> {
         let mut inventory = inventory();

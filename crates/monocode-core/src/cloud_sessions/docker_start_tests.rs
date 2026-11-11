@@ -2457,6 +2457,7 @@ fn a_sandbox_start_runs_the_claude_setup_and_a_reconnect_never_does() {
         enabled: true,
         notice_acknowledged: true,
         selection: None,
+        ..Default::default()
     };
     let mut fx = fx();
     fx.svc = fx.svc.with_kit_seams(KitSeams {

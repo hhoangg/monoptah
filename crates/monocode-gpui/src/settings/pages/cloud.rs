@@ -13,7 +13,7 @@ use crate::{
 };
 use gpui::{AnyElement, Context, Role, SharedString, Task, div, prelude::*, px};
 use monocode_core::cloud_sessions::{
-    kit::{KitInventory, MAX_KIT_COMPRESSED_BYTES, Workspace},
+    kit::{KitInventory, KitSource, MAX_KIT_COMPRESSED_BYTES, Workspace},
     kit_prefs::{self, Badge, Enable, KitRow, KitSummary, KitTab, NOTICE},
 };
 use std::{path::Path, sync::Arc};
@@ -122,7 +122,7 @@ impl SettingsView {
             true,
             "Claude setup",
             Some(
-                "Copy your skills, MCP servers and plugins to new cloud workspaces, so Claude works there the way it does here."
+                "Copy your skills, MCP servers, plugins and instructions to new cloud workspaces, so Claude works there the way it does here."
                     .into(),
             ),
             None,
@@ -144,8 +144,111 @@ impl SettingsView {
         if self.cloud.notice_open {
             page.push(self.kit_notice(cx));
         }
+        page.push(self.kit_instructions(&kit, cx));
         page.push(self.kit_items(&kit, cx));
         page
+    }
+
+    /// The "Your instructions (CLAUDE.md)" switch with what it would copy: the source, the
+    /// file count and size, and the imports that stay behind.
+    fn kit_instructions(
+        &mut self,
+        kit: &kit_prefs::CloudKitPrefs,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let found = match &self.cloud.load {
+            Load::Ready(inventory) => inventory.instructions.clone(),
+            _ => None,
+        };
+        let (description, disabled) = match (&self.cloud.load, &found) {
+            (Load::Idle, _) => (
+                "Open a project to see what can be copied.".to_owned(),
+                false,
+            ),
+            (Load::Loading, _) => ("Reading your Claude setup...".to_owned(), false),
+            (Load::Failed(error), _) => (error.clone(), false),
+            (Load::Ready(_), None) => (
+                "No CLAUDE.md found on this computer, so there is nothing to copy.".to_owned(),
+                true,
+            ),
+            (Load::Ready(_), Some(found)) => match found.exclusion {
+                Some(exclusion) => (
+                    format!(
+                        "Cannot be copied: {}.",
+                        kit_prefs::exclusion_reason(exclusion)
+                    ),
+                    true,
+                ),
+                None if found.files.is_empty() => (
+                    "Your CLAUDE.md cannot be copied: see below.".to_owned(),
+                    true,
+                ),
+                None => (
+                    format!(
+                        "From {}: {} - {}. Copied with your CLAUDE.md imports and rules.",
+                        match found.source {
+                            KitSource::Account => "this account's Claude folder",
+                            _ => "~/.claude",
+                        },
+                        match found.files.len() {
+                            1 => "1 file".to_owned(),
+                            n => format!("{n} files"),
+                        },
+                        kit_prefs::size_label(found.size),
+                    ),
+                    false,
+                ),
+            },
+        };
+        let mut children = vec![self.row(
+            Some("cloud-kit-instructions"),
+            true,
+            "Your instructions (CLAUDE.md)",
+            Some(description.into()),
+            vec![self.toggle(
+                "cloud-kit-instructions",
+                "Your instructions (CLAUDE.md)",
+                kit.instructions && !disabled,
+                disabled,
+                cx,
+                |this, on, cx| this.update(cx, |p| p.cloud_kit.instructions = on),
+            )],
+        )];
+        if let Some(found) = &found {
+            let lines = found
+                .not_carried
+                .iter()
+                .map(|(path, reason)| (format!("Not copied: {path} ({reason})"), true))
+                .chain(
+                    found
+                        .notes
+                        .iter()
+                        .map(|(path, note)| (format!("Copied, but: {path} ({note})"), false)),
+                );
+            for (ix, (text, bad)) in lines.enumerate() {
+                children.push(
+                    div()
+                        .id(("cloud-kit-instructions-warning", ix))
+                        .debug_selector(move || format!("cloud-kit-instructions-warning-{ix}"))
+                        .px_4()
+                        .py(px(8.))
+                        .border_t_1()
+                        .border_color(content(0.05))
+                        .text_size(px(12.))
+                        .text_color(if bad { red(0.9) } else { content(0.55) })
+                        .child(text)
+                        .into_any_element(),
+                );
+            }
+        }
+        self.group(
+            Some("cloud-kit-instructions-group"),
+            false,
+            "Instructions",
+            Some("Your personal CLAUDE.md, the Markdown files it imports and your rules, so Claude follows them in the cloud too.".into()),
+            None,
+            children,
+        )
     }
 
     fn kit_notice(&self, cx: &mut Context<Self>) -> AnyElement {

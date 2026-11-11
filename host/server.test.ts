@@ -811,7 +811,7 @@ describe("host uploads over the API", () => {
   it("applies a kit over RPC, advertises it and scrubs secrets from errors", async () => {
     const s = await setup();
     const described = await s.call("environment.describe");
-    expect(described.value.result.capabilities).toEqual(expect.arrayContaining(["kit", "claude.kit"]));
+    expect(described.value.result.capabilities).toEqual(expect.arrayContaining(["kit", "claude.kit", "claude.kit.instructions"]));
     const block = (name: string, data: Buffer, type = "0") => {
       const h = Buffer.alloc(512);
       h.write(name, 0);

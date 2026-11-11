@@ -716,7 +716,8 @@ mod kit_tests {
                 Summary::Ready(KitSummary {
                     skills: 2,
                     mcp_servers: 4,
-                    plugins: 1
+                    plugins: 1,
+                    ..Default::default()
                 })
             );
         });

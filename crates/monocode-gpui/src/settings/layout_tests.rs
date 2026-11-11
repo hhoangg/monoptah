@@ -727,6 +727,84 @@ fn the_cloud_page_checks_everything_compatible_and_refuses_local_only_items(
 }
 
 #[gpui::test]
+fn the_instructions_switch_shows_the_source_and_what_stays_behind(cx: &mut TestAppContext) {
+    let window = cloud_window(cx);
+    cx.update(|cx| {
+        cx.set_global(crate::cloud_kit_ui::KitScanner(
+            crate::cloud_kit_ui::fixture::scan_with_instructions,
+        ))
+    });
+    window
+        .update(cx, |view, _, cx| view.refresh_cloud(cx))
+        .unwrap();
+    cx.run_until_parked();
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+
+    // On by default, and the import that stays behind is listed.
+    window
+        .update(visual, |view, _, _| {
+            assert!(view.prefs.cloud_kit.instructions)
+        })
+        .unwrap();
+    assert!(
+        visual
+            .debug_bounds("cloud-kit-instructions-warning-0")
+            .is_some()
+    );
+    click(visual, "settings-toggle-cloud-kit-instructions");
+    window
+        .update(visual, |view, _, _| {
+            assert!(!view.prefs.cloud_kit.instructions)
+        })
+        .unwrap();
+    click(visual, "settings-toggle-cloud-kit-instructions");
+    window
+        .update(visual, |view, _, _| {
+            assert!(view.prefs.cloud_kit.instructions)
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_instructions_switch_is_disabled_without_a_claude_md(cx: &mut TestAppContext) {
+    let window = cloud_window(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    click(visual, "settings-toggle-cloud-kit-instructions");
+    window
+        .update(visual, |view, _, _| {
+            assert!(view.prefs.cloud_kit.instructions)
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_instructions_switch_follows_the_preference_while_the_scan_has_not_answered(
+    cx: &mut TestAppContext,
+) {
+    let window = cloud_window(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    window
+        .update(visual, |view, _, cx| {
+            view.cloud.load = pages::CloudLoad::Loading;
+            cx.notify();
+        })
+        .unwrap();
+    visual.refresh().unwrap();
+    // Not disabled: a click turns the preference off, and nothing claims there is no CLAUDE.md.
+    click(visual, "settings-toggle-cloud-kit-instructions");
+    window
+        .update(visual, |view, _, _| {
+            assert!(!view.prefs.cloud_kit.instructions)
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn the_cloud_notice_shows_once_and_is_stored_as_acknowledged(cx: &mut TestAppContext) {
     let window = cloud_window(cx);
     let visual = &mut VisualTestContext::from_window(window.into(), cx);

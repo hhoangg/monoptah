@@ -815,3 +815,324 @@ describe("kit in the Claude spawn", () => {
     expect(kit.key()).not.toBe(withSecrets);
   });
 });
+
+// ---------------------------------------------------------------------------
+// User instructions (CLAUDE.md and what it imports).
+
+const INSTR = (files: Record<string, string>, list = true): TarEntry[] => [
+  ...Object.entries(files).map(([rel, data]) => ({ name: `instructions/${rel}`, data })),
+  ...(list ? [{ name: "kit.json", data: JSON.stringify({ instructions: Object.keys(files).sort() }) }] : []),
+];
+const BASIC = { "CLAUDE.md": "@RTK.md\nme", "RTK.md": "rtk", "rules/a.md": "rule a" };
+const claudeDir = () => join(home, ".claude");
+
+describe("kit instructions: unpack", () => {
+  it("accepts instructions with a matching kit.json list", async () => {
+    const kit = kitFor();
+    const result = await kit.apply({ hash: HASH_A, uploadId: stage(INSTR(BASIC)) });
+    expect(result.instructions).toEqual({ installed: ["CLAUDE.md", "RTK.md", "rules/a.md"], skipped: [] });
+    expect(readFileSync(join(kit.root, HASH_A, "instructions", "rules", "a.md"), "utf8")).toBe("rule a");
+  });
+
+  const many = Object.fromEntries(Array.from({ length: 65 }, (_, i) => [`n${i}.md`, "x"]));
+  const refusals: Array<[string, TarEntry[], RegExp]> = [
+    ["a parent traversal", [{ name: "instructions/../x", data: "x" }], /invalid path/],
+    ["an absolute path", [{ name: "/instructions/CLAUDE.md", data: "x" }], /invalid path/],
+    ["a path deeper than 8", INSTR({ "CLAUDE.md": "x", "a/b/c/d/e/f/g/h/i.md": "x" }), /too deep/],
+    ["a .git segment", INSTR({ "CLAUDE.md": "x", ".git/config": "x" }), /invalid path/],
+    ["too many files", INSTR({ "CLAUDE.md": "x", ...many }), /too many instruction files/],
+    ["a file that is too big", INSTR({ "CLAUDE.md": "x".repeat(256 * 1024 + 1) }), /too large/],
+    ["a total that is too big", INSTR(Object.fromEntries(Array.from({ length: 5 }, (_, i) => [i ? `f${i}.md` : "CLAUDE.md", "x".repeat(250 * 1024)]))), /too large/],
+    ["a list that does not match", [...INSTR({ "CLAUDE.md": "x" }, false), { name: "kit.json", data: JSON.stringify({ instructions: ["CLAUDE.md", "RTK.md"] }) }], /do not match/],
+    ["a list entry with no file", [{ name: "kit.json", data: JSON.stringify({ instructions: ["CLAUDE.md"] }) }], /do not match/],
+    ["instructions without CLAUDE.md", INSTR({ "RTK.md": "x" }), /no CLAUDE.md/],
+    ["instructions as a file", [{ name: "instructions", data: "x" }], /invalid path/],
+  ];
+  for (const [label, entries, message] of refusals) {
+    it(`refuses ${label} and leaves nothing behind`, async () => {
+      const kit = kitFor();
+      await expect(kit.apply({ hash: HASH_A, uploadId: stage(entries) })).rejects.toThrow(message);
+      expect(existsSync(join(kit.root, HASH_A))).toBe(false);
+      expect(existsSync(claudeDir())).toBe(false);
+    });
+  }
+});
+
+describe("kit instructions: install", () => {
+  posix("links each file at the hash dir and reads through the link", async () => {
+    const kit = kitFor();
+    await kit.apply({ hash: HASH_A, uploadId: stage(INSTR(BASIC)) });
+    for (const [rel, data] of Object.entries(BASIC)) {
+      const link = join(claudeDir(), ...rel.split("/"));
+      expect(lstatSync(link).isSymbolicLink()).toBe(true);
+      expect(readlinkSync(link)).toBe(join(kit.root, HASH_A, "instructions", ...rel.split("/")));
+      expect(readFileSync(link, "utf8")).toBe(data);
+    }
+    expect(JSON.parse(readFileSync(join(kit.root, "managed.json"), "utf8")).instructions).toEqual(["CLAUDE.md", "RTK.md", "rules/a.md"]);
+  });
+
+  posix("never overwrites a file of the user's own and reports it", async () => {
+    mkdirSync(claudeDir(), { recursive: true });
+    writeFileSync(join(claudeDir(), "CLAUDE.md"), "mine");
+    const kit = kitFor();
+    const result = await kit.apply({ hash: HASH_A, uploadId: stage(INSTR(BASIC)) });
+    expect(readFileSync(join(claudeDir(), "CLAUDE.md"), "utf8")).toBe("mine");
+    expect(lstatSync(join(claudeDir(), "CLAUDE.md")).isSymbolicLink()).toBe(false);
+    expect(result.instructions.installed).toEqual(["RTK.md", "rules/a.md"]);
+    expect(result.instructions.skipped).toEqual([{ path: "CLAUDE.md", reason: "A file of your own is already there" }]);
+    expect(JSON.parse(readFileSync(join(kit.root, "managed.json"), "utf8")).instructions).toEqual(["RTK.md", "rules/a.md"]);
+  });
+
+  posix("re-points managed links at the new hash and drops only files the kit lost", async () => {
+    const kit = kitFor();
+    await kit.apply({ hash: HASH_A, uploadId: stage(INSTR(BASIC)) });
+    const result = await kit.apply({ hash: HASH_B, uploadId: stage(INSTR({ "CLAUDE.md": "v2", "rules/a.md": "rule a2" })) });
+    expect(result.instructions.installed).toEqual(["CLAUDE.md", "rules/a.md"]);
+    expect(readlinkSync(join(claudeDir(), "CLAUDE.md"))).toBe(join(kit.root, HASH_B, "instructions", "CLAUDE.md"));
+    expect(readFileSync(join(claudeDir(), "CLAUDE.md"), "utf8")).toBe("v2");
+    expect(existsSync(join(claudeDir(), "RTK.md"))).toBe(false);
+    expect(lstatSync(join(claudeDir(), "rules", "a.md")).isSymbolicLink()).toBe(true);
+  });
+
+  posix("removes every managed link when the kit has no instructions, keeping the user's file", async () => {
+    mkdirSync(join(claudeDir(), "rules"), { recursive: true });
+    writeFileSync(join(claudeDir(), "rules", "a.md"), "mine");
+    const kit = kitFor();
+    await kit.apply({ hash: HASH_A, uploadId: stage(INSTR(BASIC)) });
+    const result = await kit.apply({ hash: HASH_B, uploadId: stage(SKILL("s")) });
+    expect(result.instructions).toEqual({ installed: [], skipped: [] });
+    expect(existsSync(join(claudeDir(), "CLAUDE.md"))).toBe(false);
+    expect(existsSync(join(claudeDir(), "RTK.md"))).toBe(false);
+    expect(readFileSync(join(claudeDir(), "rules", "a.md"), "utf8")).toBe("mine");
+    expect(JSON.parse(readFileSync(join(kit.root, "managed.json"), "utf8")).instructions).toEqual([]);
+  });
+
+  posix("does not remove a link the user replaced after we made it", async () => {
+    const kit = kitFor();
+    await kit.apply({ hash: HASH_A, uploadId: stage(INSTR(BASIC)) });
+    rmSync(join(claudeDir(), "RTK.md"));
+    writeFileSync(join(claudeDir(), "RTK.md"), "mine now");
+    await kit.apply({ hash: HASH_B, uploadId: stage(INSTR({ "CLAUDE.md": "v2" })) });
+    expect(readFileSync(join(claudeDir(), "RTK.md"), "utf8")).toBe("mine now");
+  });
+
+  posix("loads an old managed.json that has no instructions field", async () => {
+    const kit = kitFor();
+    await kit.apply({ hash: HASH_A, uploadId: stage(SKILL("s")) });
+    const path = join(kit.root, "managed.json");
+    const old = JSON.parse(readFileSync(path, "utf8"));
+    delete old.instructions;
+    writeFileSync(path, JSON.stringify(old));
+    const result = await kitFor().apply({ hash: HASH_B, uploadId: stage([...SKILL("s"), ...INSTR(BASIC)]) });
+    expect(result.instructions.installed).toEqual(["CLAUDE.md", "RTK.md", "rules/a.md"]);
+  });
+
+  posix("still applies an old kit without instructions", async () => {
+    const result = await kitFor().apply({ hash: HASH_A, uploadId: stage([...SKILL("s"), { name: "kit.json", data: "{}" }]) });
+    expect(result).toMatchObject({ skills: ["s"], instructions: { installed: [], skipped: [] } });
+    expect(existsSync(join(claudeDir(), "CLAUDE.md"))).toBe(false);
+  });
+
+  for (const step of ["flip", "unlink", "manifest"] as const) {
+    posix(`restores previous instruction links when ${step} fails`, async () => {
+      const first = kitFor();
+      await first.apply({ hash: HASH_A, uploadId: stage(INSTR(BASIC)) });
+      const managed = readFileSync(join(first.root, "managed.json"), "utf8");
+      const kit = kitFor({
+        beforeStep: (name) => {
+          if (name === step) throw new Error(`${step} failed`);
+        },
+      });
+      await expect(kit.apply({ hash: HASH_B, uploadId: stage(INSTR({ "CLAUDE.md": "v2", "notes/new.md": "n" })) })).rejects.toThrow(`${step} failed`);
+      for (const rel of Object.keys(BASIC))
+        expect(readlinkSync(join(claudeDir(), ...rel.split("/")))).toBe(join(first.root, HASH_A, "instructions", ...rel.split("/")));
+      expect(existsSync(join(claudeDir(), "notes", "new.md"))).toBe(false);
+      expect(readFileSync(join(first.root, "managed.json"), "utf8")).toBe(managed);
+    });
+  }
+});
+
+describe("kit instructions: hardening", () => {
+  it("accepts a path exactly 8 deep and refuses an instructions dir with no kit.json", async () => {
+    const deep = "a/b/c/d/e/f/g/h.md";
+    const result = await kitFor().apply({ hash: HASH_A, uploadId: stage(INSTR({ "CLAUDE.md": "x", [deep]: "x" })) });
+    expect(result.instructions.installed).toContain(deep);
+    await expect(
+      kitFor().apply({ hash: HASH_B, uploadId: stage(INSTR({ "CLAUDE.md": "x" }, false)) }),
+    ).rejects.toThrow(/must list the instructions/);
+  });
+
+  posix("unpacks instruction files read-only", async () => {
+    const kit = kitFor();
+    await kit.apply({ hash: HASH_A, uploadId: stage(INSTR(BASIC)) });
+    expect(mode(join(kit.root, HASH_A, "instructions", "CLAUDE.md"))).toBe(0o400);
+    // Root ignores file modes, so only the mode bits are checked there.
+    if (process.getuid?.() !== 0)
+      expect(() => writeFileSync(join(claudeDir(), "CLAUDE.md"), "edit")).toThrow();
+  });
+
+  posix("skips Claude's own folders and non-Markdown files", async () => {
+    const result = await kitFor().apply({
+      hash: HASH_A,
+      uploadId: stage(INSTR({ "CLAUDE.md": "x", "skills/foo/SKILL.md": "x", "settings.json": "{}", "NOTES.MD": "n" })),
+    });
+    expect(result.instructions.installed).toEqual(["CLAUDE.md", "NOTES.MD"]);
+    expect(result.instructions.skipped).toEqual([
+      { path: "settings.json", reason: "Only Markdown files are copied" },
+      { path: "skills/foo/SKILL.md", reason: "Claude's own folder" },
+    ]);
+    expect(existsSync(join(claudeDir(), "skills", "foo"))).toBe(false);
+    expect(existsSync(join(claudeDir(), "settings.json"))).toBe(false);
+  });
+
+  posix("skips files under a linked folder and under a regular file", async () => {
+    mkdirSync(claudeDir(), { recursive: true });
+    const elsewhere = mkdtempSync(join(tmpdir(), "host-kit-else-"));
+    symlinkSync(elsewhere, join(claudeDir(), "rules"));
+    writeFileSync(join(claudeDir(), "notes"), "i am a file");
+    const result = await kitFor().apply({
+      hash: HASH_A,
+      uploadId: stage(INSTR({ "CLAUDE.md": "x", "rules/a.md": "x", "notes/x.md": "x" })),
+    });
+    expect(result.instructions.installed).toEqual(["CLAUDE.md"]);
+    expect(result.instructions.skipped).toEqual([
+      { path: "notes/x.md", reason: "The folder could not be created" },
+      { path: "rules/a.md", reason: "The folder is a link" },
+    ]);
+    expect(readdirSync(elsewhere)).toEqual([]);
+    rmSync(elsewhere, { recursive: true, force: true });
+  });
+
+  posix("a link that cannot be made is skipped and the apply goes on", async () => {
+    const kit = kitFor({
+      symlink: ((target: string, path: string, type?: string) => {
+        if (path.endsWith("RTK.md")) throw Object.assign(new Error("denied"), { code: "EPERM" });
+        symlinkSync(target, path, type as "junction" | undefined);
+      }) as typeof symlinkSync,
+    });
+    const result = await kit.apply({ hash: HASH_A, uploadId: stage(INSTR(BASIC)) });
+    expect(result.instructions.installed).toEqual(["CLAUDE.md", "rules/a.md"]);
+    expect(result.instructions.skipped).toEqual([{ path: "RTK.md", reason: "The link could not be created" }]);
+    expect(readlinkSync(join(kit.root, "current"))).toBe(HASH_A);
+  });
+
+  posix("heals an orphan link left by a crash before the manifest was written", async () => {
+    const kit = kitFor();
+    await kit.apply({ hash: HASH_A, uploadId: stage(INSTR(BASIC)) });
+    rmSync(join(kit.root, "managed.json"));
+    const result = await kitFor().apply({ hash: HASH_B, uploadId: stage(INSTR(BASIC)) });
+    expect(result.instructions).toEqual({ installed: ["CLAUDE.md", "RTK.md", "rules/a.md"], skipped: [] });
+    expect(readlinkSync(join(claudeDir(), "CLAUDE.md"))).toBe(join(kit.root, HASH_B, "instructions", "CLAUDE.md"));
+  });
+
+  posix("removes only folders it created, and only when empty", async () => {
+    const kit = kitFor();
+    mkdirSync(join(claudeDir(), "mine"), { recursive: true });
+    await kit.apply({ hash: HASH_A, uploadId: stage(INSTR({ "CLAUDE.md": "x", "rules/a.md": "x", "mine/b.md": "x" })) });
+    expect(JSON.parse(readFileSync(join(kit.root, "managed.json"), "utf8")).instructionDirs).toEqual(["rules"]);
+    writeFileSync(join(claudeDir(), "rules", "own.md"), "mine");
+    await kit.apply({ hash: HASH_B, uploadId: stage(INSTR({ "CLAUDE.md": "x" })) });
+    expect(existsSync(join(claudeDir(), "rules", "own.md"))).toBe(true);
+    expect(existsSync(join(claudeDir(), "mine"))).toBe(true);
+    rmSync(join(claudeDir(), "rules", "own.md"));
+    await kit.apply({ hash: "c".repeat(64), uploadId: stage(INSTR({ "CLAUDE.md": "x" })) });
+    expect(existsSync(join(claudeDir(), "rules"))).toBe(false);
+    expect(existsSync(join(claudeDir(), "mine"))).toBe(true);
+    expect(JSON.parse(readFileSync(join(kit.root, "managed.json"), "utf8")).instructionDirs).toEqual([]);
+  });
+
+  posix("rollback removes folders made by the failed apply and restores pruned ones", async () => {
+    const first = kitFor();
+    await first.apply({ hash: HASH_A, uploadId: stage(INSTR({ "CLAUDE.md": "x", "rules/a.md": "x" })) });
+    const kit = kitFor({
+      beforeStep: (name) => {
+        if (name === "manifest") throw new Error("manifest failed");
+      },
+    });
+    await expect(kit.apply({ hash: HASH_B, uploadId: stage(INSTR({ "CLAUDE.md": "x", "notes/n.md": "x" })) })).rejects.toThrow("manifest failed");
+    expect(existsSync(join(claudeDir(), "notes"))).toBe(false);
+    expect(readlinkSync(join(claudeDir(), "rules", "a.md"))).toBe(join(first.root, HASH_A, "instructions", "rules", "a.md"));
+  });
+
+  posix("re-applying the same hash is a no-op for the links", async () => {
+    const kit = kitFor();
+    await kit.apply({ hash: HASH_A, uploadId: stage(INSTR(BASIC)) });
+    const managed = JSON.parse(readFileSync(join(kit.root, "managed.json"), "utf8"));
+    const again = await kit.apply({ hash: HASH_A, uploadId: stage(INSTR(BASIC)) });
+    expect(again.instructions).toEqual({ installed: ["CLAUDE.md", "RTK.md", "rules/a.md"], skipped: [] });
+    expect(JSON.parse(readFileSync(join(kit.root, "managed.json"), "utf8")).instructions).toEqual(managed.instructions);
+    expect(readFileSync(join(claudeDir(), "rules", "a.md"), "utf8")).toBe("rule a");
+  });
+
+  posix("startup removes a leftover temp link but not a file of the user's", async () => {
+    const kit = kitFor();
+    await kit.apply({ hash: HASH_A, uploadId: stage(INSTR(BASIC)) });
+    const temp = join(claudeDir(), "CLAUDE.md.monoptah-0123456789ab");
+    symlinkSync(join(kit.root, HASH_A, "instructions", "CLAUDE.md"), temp);
+    const own = join(claudeDir(), "x.md.monoptah-0123456789ab");
+    writeFileSync(own, "mine");
+    kitFor();
+    expect(existsSync(temp) || lstatSync(temp, { throwIfNoEntry: false }) !== undefined).toBe(false);
+    expect(readFileSync(own, "utf8")).toBe("mine");
+  });
+});
+
+describe("kit instructions: crash safety", () => {
+  posix("a crash after linking leaves a record, and a kit without instructions cleans it up", async () => {
+    const kit = kitFor();
+    let recorded = "";
+    const crashing = kitFor({
+      beforeStep: (name) => {
+        if (name === "flip") {
+          recorded = readFileSync(join(kit.root, "managed.json"), "utf8");
+          throw new Error("crash");
+        }
+      },
+    });
+    await expect(crashing.apply({ hash: HASH_A, uploadId: stage(INSTR({ "CLAUDE.md": "x", "notes/n.md": "x" })) })).rejects.toThrow("crash");
+    // The write-ahead record named the links and the folder before they existed.
+    expect(JSON.parse(recorded)).toMatchObject({ instructions: ["CLAUDE.md", "notes/n.md"], instructionDirs: ["notes"] });
+    // A failed apply restores the manifest it found (none here) and the links.
+    expect(existsSync(join(kit.root, "managed.json"))).toBe(false);
+    expect(existsSync(join(claudeDir(), "notes"))).toBe(false);
+    // Rebuild the state a real crash would leave: links, folder and record.
+    mkdirSync(join(claudeDir(), "notes"), { recursive: true });
+    for (const rel of ["CLAUDE.md", "notes/n.md"])
+      symlinkSync(join(kit.root, HASH_A, "instructions", ...rel.split("/")), join(claudeDir(), ...rel.split("/")));
+    writeFileSync(join(kit.root, "managed.json"), recorded);
+    const result = await kitFor().apply({ hash: HASH_B, uploadId: stage(SKILL("s")) });
+    expect(result.instructions).toEqual({ installed: [], skipped: [] });
+    expect(existsSync(join(claudeDir(), "CLAUDE.md"))).toBe(false);
+    expect(existsSync(join(claudeDir(), "notes"))).toBe(false);
+  });
+
+  posix("startup also removes a temp link in a folder the user made", async () => {
+    const kit = kitFor();
+    mkdirSync(join(claudeDir(), "rules"), { recursive: true });
+    await kit.apply({ hash: HASH_A, uploadId: stage(INSTR(BASIC)) });
+    const temp = join(claudeDir(), "rules", "a.md.monoptah-0123456789ab");
+    symlinkSync(join(kit.root, HASH_A, "instructions", "rules", "a.md"), temp);
+    kitFor();
+    expect(lstatSync(temp, { throwIfNoEntry: false })).toBeUndefined();
+    expect(lstatSync(join(claudeDir(), "rules", "a.md")).isSymbolicLink()).toBe(true);
+  });
+});
+
+describe("kit instructions: write-ahead filter", () => {
+  posix("does not record files or folders that linking would skip", async () => {
+    const kit = kitFor();
+    let recorded = "";
+    const crashing = kitFor({
+      beforeStep: (name) => {
+        if (name === "flip") {
+          recorded = readFileSync(join(kit.root, "managed.json"), "utf8");
+          throw new Error("crash");
+        }
+      },
+    });
+    await expect(
+      crashing.apply({ hash: HASH_A, uploadId: stage(INSTR({ "CLAUDE.md": "x", "agents/a.md": "x", "notes/s.json": "{}" })) }),
+    ).rejects.toThrow("crash");
+    expect(JSON.parse(recorded)).toMatchObject({ instructions: ["CLAUDE.md"], instructionDirs: [] });
+  });
+});

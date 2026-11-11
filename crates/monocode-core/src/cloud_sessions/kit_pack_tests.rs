@@ -55,6 +55,7 @@ fn on() -> CloudKitPrefs {
         enabled: true,
         notice_acknowledged: true,
         selection: None,
+        ..Default::default()
     }
 }
 
@@ -660,4 +661,213 @@ fn files_that_differ_only_in_case_are_refused() {
         "{:?}",
         packed.warnings
     );
+}
+
+// ---------------------------------------------------------------------------
+// Instructions
+// ---------------------------------------------------------------------------
+
+fn instructions_env() -> Env {
+    let env = env();
+    let root = &env.roots.claude_home;
+    write(&root.join("CLAUDE.md"), "@RTK.md\nBe brief.\n");
+    write(&root.join("RTK.md"), "use rtk");
+    write(&root.join("rules/style.md"), "style");
+    env
+}
+
+fn pack_with(env: &Env, prefs: &CloudKitPrefs, present: &Present) -> Packed {
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    pack(&inventory, &env.roots, prefs, present).unwrap()
+}
+
+fn kit_json(packed: &Packed) -> Value {
+    serde_json::from_slice(&read_tar(packed)["kit.json"].4).unwrap()
+}
+
+#[test]
+fn instructions_travel_when_enabled_and_the_host_can_take_them() {
+    let env = instructions_env();
+    let packed = pack_with(&env, &on(), &all_present().with_instructions(true));
+    let tar = read_tar(&packed);
+    let paths: Vec<&str> = tar.keys().map(String::as_str).collect();
+    assert_eq!(
+        paths,
+        [
+            "instructions",
+            "instructions/CLAUDE.md",
+            "instructions/RTK.md",
+            "instructions/rules",
+            "instructions/rules/style.md",
+            "kit.json",
+        ]
+    );
+    assert_eq!(tar["instructions/RTK.md"].4, b"use rtk");
+    assert_eq!(
+        kit_json(&packed)["instructions"],
+        json!(["CLAUDE.md", "RTK.md", "rules/style.md"])
+    );
+    assert_eq!(
+        packed.instructions,
+        ["CLAUDE.md", "RTK.md", "rules/style.md"]
+    );
+    assert!(!packed.is_empty());
+}
+
+#[test]
+fn instructions_are_omitted_when_off_or_when_the_host_lacks_the_capability() {
+    let env = instructions_env();
+    let off = CloudKitPrefs {
+        instructions: false,
+        ..on()
+    };
+    let packed = pack_with(&env, &off, &all_present().with_instructions(true));
+    assert!(packed.is_empty());
+    assert!(read_tar(&packed).is_empty());
+
+    let skills_too = {
+        skill(&env, "review", "# review");
+        pack_with(&env, &off, &all_present().with_instructions(true))
+    };
+    assert!(kit_json(&skills_too).get("instructions").is_none());
+
+    let packed = pack_with(&env, &on(), &all_present());
+    assert!(packed.instructions.is_empty());
+    assert!(kit_json(&packed).get("instructions").is_none());
+    assert!(!read_tar(&packed)
+        .keys()
+        .any(|p| p.starts_with("instructions")));
+}
+
+#[test]
+fn an_instructions_only_kit_is_packed_and_is_deterministic() {
+    let env = instructions_env();
+    let first = pack_with(&env, &on(), &Present::unknown().with_instructions(true));
+    assert!(read_tar(&first).contains_key("kit.json"));
+    assert!(first.skills.is_empty() && first.plugins.is_empty() && first.servers.is_empty());
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    for name in ["CLAUDE.md", "RTK.md"] {
+        let file = env.roots.claude_home.join(name);
+        let text = std::fs::read_to_string(&file).unwrap();
+        std::fs::write(&file, text).unwrap();
+    }
+    let second = pack_with(&env, &on(), &Present::unknown().with_instructions(true));
+    assert_eq!(first.sha256, second.sha256);
+    assert_eq!(
+        std::fs::read(first.file.path()).unwrap(),
+        std::fs::read(second.file.path()).unwrap()
+    );
+}
+
+#[test]
+fn the_selection_token_follows_the_instructions_and_the_preference() {
+    let env = instructions_env();
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    let before = selection_token(&inventory, &on());
+    write(&env.roots.claude_home.join("RTK.md"), "changed");
+    let changed = build_inventory(&env.roots, Workspace::Codespace);
+    assert_ne!(before, selection_token(&changed, &on()));
+    let off = CloudKitPrefs {
+        instructions: false,
+        ..on()
+    };
+    assert_ne!(
+        selection_token(&changed, &on()),
+        selection_token(&changed, &off)
+    );
+}
+
+#[test]
+fn a_file_that_grew_past_the_cap_after_the_scan_is_not_sent() {
+    let env = instructions_env();
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    // Same file (device and inode), but it grew after the scan: only the cap check can refuse it.
+    write(
+        &env.roots.claude_home.join("RTK.md"),
+        &"x".repeat(300 * 1024),
+    );
+    let packed = pack(
+        &inventory,
+        &env.roots,
+        &on(),
+        &all_present().with_instructions(true),
+    )
+    .unwrap();
+    assert!(packed.instructions.is_empty());
+    assert!(packed
+        .warnings
+        .iter()
+        .any(|w| w == "Your instructions were not sent: they are larger than the limit."));
+}
+
+#[test]
+fn imports_that_were_not_carried_are_counted_not_listed() {
+    let env = env();
+    write(
+        &env.roots.claude_home.join("CLAUDE.md"),
+        "@missing.md @other.md",
+    );
+    let packed = pack_with(&env, &on(), &all_present().with_instructions(true));
+    assert_eq!(packed.instructions, ["CLAUDE.md"]);
+    assert_eq!(packed.instructions_not_carried, 2);
+    assert!(packed.warnings.iter().all(|w| !w.contains("missing.md")));
+}
+
+#[test]
+fn the_token_leaves_instructions_out_when_they_were_not_sent() {
+    let env = instructions_env();
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    let sent = selection_token_for(&inventory, &on(), true);
+    let held_back = selection_token_for(&inventory, &on(), false);
+    assert_ne!(sent, held_back);
+    assert_eq!(sent, selection_token(&inventory, &on()));
+    // With no instructions at all both are the same.
+    let bare = super::kit::KitInventory::default();
+    assert_eq!(
+        selection_token_for(&bare, &on(), true),
+        selection_token_for(&bare, &on(), false)
+    );
+}
+
+#[test]
+fn a_kit_over_the_size_cap_still_sends_the_instructions() {
+    let env = instructions_env();
+    skill(&env, "review", "# review");
+    let mut inventory = build_inventory(&env.roots, Workspace::Codespace);
+    inventory.skills[0].compressed = super::kit::MAX_KIT_COMPRESSED_BYTES + 1;
+    let packed = pack(
+        &inventory,
+        &env.roots,
+        &on(),
+        &all_present().with_instructions(true),
+    )
+    .unwrap();
+    assert!(packed.skills.is_empty());
+    assert_eq!(
+        packed.instructions,
+        ["CLAUDE.md", "RTK.md", "rules/style.md"]
+    );
+    assert!(packed
+        .warnings
+        .iter()
+        .any(|w| w.contains("larger than 50 MB")));
+}
+
+#[test]
+fn an_incomplete_credential_index_drops_the_instructions_and_says_so() {
+    let env = instructions_env();
+    let mut inventory = build_inventory(&env.roots, Workspace::Codespace);
+    inventory.file_index_incomplete = true;
+    let packed = pack(
+        &inventory,
+        &env.roots,
+        &on(),
+        &all_present().with_instructions(true),
+    )
+    .unwrap();
+    assert!(packed.instructions.is_empty());
+    assert!(packed
+        .warnings
+        .iter()
+        .any(|w| w.contains("your instructions were not sent")));
 }

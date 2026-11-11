@@ -63,6 +63,18 @@ pub const MAX_ENTRIES_PER_ITEM: usize = 20_000;
 pub const MAX_SKILLS_PER_ROOT: usize = 5_000;
 /// Wall-clock budget for one inventory; later items are reported as timed out.
 pub const SCAN_BUDGET: Duration = Duration::from_secs(20);
+/// Most files of the user's instructions (`CLAUDE.md`, its imports and rules).
+pub const MAX_INSTRUCTION_FILES: usize = 64;
+/// Largest single instructions file.
+pub const MAX_INSTRUCTION_FILE_BYTES: u64 = 256 * 1024;
+/// Largest instructions set, before compression.
+pub const MAX_INSTRUCTION_TOTAL_BYTES: u64 = 1024 * 1024;
+/// Deepest path below the instructions folder, in segments.
+pub const MAX_INSTRUCTION_DEPTH: usize = 8;
+/// How many levels of `@import` Claude Code follows.
+pub const MAX_IMPORT_DEPTH: usize = 5;
+
+mod instructions;
 
 /// A value that must never be printed. `Debug` and `Display` both redact.
 #[derive(Clone, PartialEq, Eq)]
@@ -258,9 +270,41 @@ pub struct KitPlugin {
     pub files: Vec<KitFile>,
 }
 
+/// The user's instructions: `CLAUDE.md` of one config root, the files it imports and
+/// `rules/**/*.md`. Files are named by their path below that root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KitInstructions {
+    /// `Account` when the account's config dir has a `CLAUDE.md`, else `User` (`~/.claude`).
+    pub source: KitSource,
+    /// The canonical config root the file names are relative to.
+    pub root: PathBuf,
+    /// The files that travel, sorted by name. Empty when `exclusion` is set or when the
+    /// source `CLAUDE.md` itself cannot be carried.
+    pub files: Vec<KitFile>,
+    /// Total bytes of `files`.
+    pub size: u64,
+    /// Digest of the names and bytes of `files`; empty when there are none.
+    pub hash: String,
+    /// A cap was exceeded: nothing is carried.
+    pub exclusion: Option<Exclusion>,
+    /// Imports and rules that are not carried: `(path as written, reason)`.
+    pub not_carried: Vec<(String, String)>,
+    /// Carried files that come with a caveat: `(path as written, note)`. Not counted in
+    /// `not_carried`.
+    pub notes: Vec<(String, String)>,
+}
+
+impl KitInstructions {
+    /// Whether anything travels.
+    pub fn is_carried(&self) -> bool {
+        self.exclusion.is_none() && !self.files.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct KitInventory {
     pub skills: Vec<KitSkill>,
+    pub instructions: Option<KitInstructions>,
     pub mcp_servers: Vec<KitMcpServer>,
     pub plugins: Vec<KitPlugin>,
     /// Compressed size of every item that is not excluded (plugin skills count with
@@ -426,6 +470,7 @@ pub fn build_inventory_budgeted(
         collect_mcp(source, roots, workspace, &mut inventory.mcp_servers);
     }
     collect_project_mcp(roots, &mut inventory.mcp_servers);
+    inventory.instructions = instructions::collect(roots, &home, &guard);
 
     inventory.skills.sort_by(|a, b| {
         (&a.name, a.scope, a.source, &a.path).cmp(&(&b.name, b.scope, b.source, &b.path))
@@ -952,16 +997,8 @@ fn walk(
             );
             visited.remove(&path);
         } else if meta.is_file() {
-            // A file that is a hard link to a credentials file is refused. Other hard
-            // links are not detected (see the module docs).
-            if started.guard.forbidden.contains(&path) {
-                scan.exclusion = Some(Exclusion::SensitiveContent);
-                return;
-            }
-            if link_count(&meta) > 1
-                && file_id(&meta).is_some_and(|id| started.guard.secret_files.contains(&id))
-            {
-                scan.exclusion = Some(Exclusion::HardLinkElsewhere);
+            if let Some(exclusion) = credential_file(&path, &meta, started.guard) {
+                scan.exclusion = Some(exclusion);
                 return;
             }
             scan.size += meta.len();
@@ -979,6 +1016,19 @@ fn walk(
             });
         }
     }
+}
+
+/// Why a regular file is refused as a credentials file: it is one of the guarded paths, or a
+/// hard link to a file in a credentials folder. Other hard links are not detected (see the
+/// module docs).
+fn credential_file(path: &Path, meta: &std::fs::Metadata, guard: &Guard) -> Option<Exclusion> {
+    if guard.forbidden.iter().any(|f| f == path) {
+        return Some(Exclusion::SensitiveContent);
+    }
+    if link_count(meta) > 1 && file_id(meta).is_some_and(|id| guard.secret_files.contains(&id)) {
+        return Some(Exclusion::HardLinkElsewhere);
+    }
+    None
 }
 
 #[cfg(unix)]
@@ -2000,6 +2050,14 @@ fn content_hash(inventory: &KitInventory) -> String {
             &plugin.version,
             &format!("{:?}", plugin.source),
             &plugin.hash,
+        ]);
+    }
+    if let Some(instructions) = &inventory.instructions {
+        line(&[
+            "instructions",
+            &format!("{:?}", instructions.source),
+            &format!("{:?}", instructions.exclusion),
+            &instructions.hash,
         ]);
     }
     for server in &inventory.mcp_servers {

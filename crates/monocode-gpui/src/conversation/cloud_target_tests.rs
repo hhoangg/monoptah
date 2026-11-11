@@ -1973,7 +1973,8 @@ fn the_panel_shows_the_kit_summary_and_a_switch_for_this_start(cx: &mut TestAppC
                 Summary::Ready(KitSummary {
                     skills: 2,
                     mcp_servers: 3,
-                    plugins: 1
+                    plugins: 1,
+                    ..Default::default()
                 })
             );
         })

@@ -26,8 +26,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::kit::{
-    build_inventory, Exclusion, KitInventory, KitMcpServer, KitPlugin, KitRoots, KitSkill,
-    LocalOnlyReason, McpCompat, McpScope, Runtime, SecretLocation, SkillScope, Workspace,
+    build_inventory, Exclusion, KitInstructions, KitInventory, KitMcpServer, KitPlugin, KitRoots,
+    KitSkill, LocalOnlyReason, McpCompat, McpScope, Runtime, SecretLocation, SkillScope, Workspace,
 };
 
 /// Shown once, the first time the kit is enabled. The wording is fixed by design 3.2.2.
@@ -85,7 +85,7 @@ pub fn published() -> CloudKitPrefs {
 }
 
 /// The global preferences entry `cloudKit`.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CloudKitPrefs {
     /// Checked item ids. `None` = the defaults (everything that can be sent).
@@ -94,6 +94,20 @@ pub struct CloudKitPrefs {
     pub enabled: bool,
     /// The user has seen [`NOTICE`] and accepted it.
     pub notice_acknowledged: bool,
+    /// Carry the user's instructions (`CLAUDE.md`, its imports and rules). On by default,
+    /// also for preferences saved before this field existed.
+    pub instructions: bool,
+}
+
+impl Default for CloudKitPrefs {
+    fn default() -> Self {
+        Self {
+            selection: None,
+            enabled: false,
+            notice_acknowledged: false,
+            instructions: true,
+        }
+    }
 }
 
 /// What asking to turn the kit on led to.
@@ -324,7 +338,7 @@ pub fn plugin_id(plugin: &KitPlugin) -> String {
     format!("plugin:{}", plugin.id)
 }
 
-fn exclusion_reason(exclusion: Exclusion) -> &'static str {
+pub fn exclusion_reason(exclusion: Exclusion) -> &'static str {
     match exclusion {
         Exclusion::TooLarge => "Too large to send",
         Exclusion::LinkOutsideHome => "Links to a file outside your home folder",
@@ -509,6 +523,8 @@ pub struct Selected<'a> {
     pub skills: Vec<&'a KitSkill>,
     pub plugins: Vec<&'a KitPlugin>,
     pub servers: Vec<&'a KitMcpServer>,
+    /// The user's instructions, when they are on and something can travel.
+    pub instructions: Option<&'a KitInstructions>,
 }
 
 /// Whether a server can be ticked at all (mirrors the badges of [`mcp_item`]).
@@ -535,6 +551,10 @@ pub fn selected<'a>(inventory: &'a KitInventory, prefs: &CloudKitPrefs) -> Selec
             .iter()
             .filter(|server| prefs.is_selected(&mcp_id(server), mcp_selectable(server)))
             .collect(),
+        instructions: inventory
+            .instructions
+            .as_ref()
+            .filter(|instructions| prefs.instructions && instructions.is_carried()),
     }
 }
 
@@ -563,11 +583,16 @@ pub struct KitSummary {
     pub skills: usize,
     pub mcp_servers: usize,
     pub plugins: usize,
+    /// The user's instructions go along.
+    pub instructions: bool,
 }
 
 impl KitSummary {
     pub fn of(inventory: &KitInventory, prefs: &CloudKitPrefs) -> Self {
-        let mut summary = Self::default();
+        let mut summary = Self {
+            instructions: selected(inventory, prefs).instructions.is_some(),
+            ..Self::default()
+        };
         for item in items(inventory) {
             if !prefs.is_selected(&item.id, item.selectable) {
                 continue;
@@ -582,22 +607,26 @@ impl KitSummary {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.skills + self.mcp_servers + self.plugins == 0
+        self.skills + self.mcp_servers + self.plugins == 0 && !self.instructions
     }
 
-    /// `6 skills, 4 MCP servers, 3 plugins`.
+    /// `6 skills, 4 MCP servers, 3 plugins, your instructions`.
     pub fn text(&self) -> String {
         if self.is_empty() {
             return "nothing selected".into();
         }
         let part =
             |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
-        [
-            part(self.skills, "skill", "skills"),
-            part(self.mcp_servers, "MCP server", "MCP servers"),
-            part(self.plugins, "plugin", "plugins"),
-        ]
-        .join(", ")
+        let mut parts = Vec::new();
+        if self.skills + self.mcp_servers + self.plugins > 0 {
+            parts.push(part(self.skills, "skill", "skills"));
+            parts.push(part(self.mcp_servers, "MCP server", "MCP servers"));
+            parts.push(part(self.plugins, "plugin", "plugins"));
+        }
+        if self.instructions {
+            parts.push("your instructions".to_owned());
+        }
+        parts.join(", ")
     }
 }
 
