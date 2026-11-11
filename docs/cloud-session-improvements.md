@@ -1308,6 +1308,134 @@ default):
 - The rows are already in the local DB (§4.2.1). The location flips back to Local, and
   the Host session is tombstoned as `convert.rs` does today.
 
+##### After a successful return: deleting the instance
+
+Once a return succeeded, the codespace or Docker sandbox has nothing the user still needs,
+unless something else uses it. It is then deleted, but only when that is safe. Every check
+fails closed: when a question cannot be answered, the instance is kept. The code is in
+`cloud_sessions/return_cleanup.rs` (core) and `shell/cloud_return_cleanup.rs` (GUI).
+
+- **Order of operations.**
+  1. `continue_locally` converts: the code is placed, the transcript installed, then the last
+     step flips the location to Local (a moved session) or adopts the born session, and
+     tombstones the Host copy.
+  2. Only after a full conversion, the core ARMS a durable record `cloud-return-cleanup:<cloud
+     key>` (one per instance). Arming reads the unsaved-file lines of the result and the
+     transcript result, and asks the Host (still connected from the conversion) for other
+     sessions, then saves the record. It never turns the successful return into an error: if
+     it cannot be saved, the return still succeeded and a warning says the instance was kept.
+  3. The GUI starts `run_return_cleanup` on a worker once the session is adopted. It
+     re-checks everything fresh, stores that an attempt started, then calls
+     `delete_cloud_outcome`, which deletes the instance, disconnects its machine and forgets
+     all its bindings. A later "Continue in cloud" creates a fresh instance.
+  4. A failed or cancelled return arms nothing, and neither does a return that lost the
+     workspace (the lost workspace and sandbox recreated paths): the cloud code was not
+     brought back, so the instance stays.
+  5. `run_return_cleanup` first asks the backend (read-only `exists`) whether the instance is
+     still there. If it is gone, no question goes to the Host: the bindings are forgotten and
+     the result is "already deleted" (if sessions still refer to it, the record is dropped
+     and the message says it no longer exists).
+- **Sole versus shared instance.** The instance is deleted only when it hosts no other
+  session or pending work. If another session uses it (another cloud session record,
+  another local session located there or with an unreadable location, a start in progress,
+  an unfinished move whose workspace OR target is this instance, or another live Host
+  session that was not saved as a local copy), it is KEPT, the other sessions are untouched,
+  and the status line names them. A second return from the same instance that finds it
+  being decided on saves a Retry record instead of dropping its decision.
+- **Fail-closed cases.**
+  - Files that were not brought back (ignored, non-regenerable files; a conversation or
+    evidence that was not fully saved): not armed, the lines are recorded for the instance
+    (so a manual delete asks as before) and a warning names the files.
+  - Claude transcript: the conversion reports `Converted::transcript_lost`, true when the
+    cloud session had a Claude id and its raw transcript was not copied here (not found on
+    the instance, or not saved). The instance is then not armed and a warning says so. When
+    the raw file was copied, arming is fine even if installing it failed (the raw file is
+    kept in the session folder). A session that never ran Claude may still arm.
+  - The Host cannot be asked and nothing is known (the check at the return failed too): the
+    run stops with "could not check whether other sessions use it", keeps the record and
+    waits for Retry.
+  - Trust window: a recorded "no other session" answer (`HostCheck::Clear`) is trusted for
+    `CLEAR_TRUST_MS` (15 minutes) after the return when the Host cannot be asked later (the
+    instance went to sleep). Older, it counts as unknown: the run stops with "the <noun>
+    must be running so Monoptah can check that no other session uses it", and the user starts
+    it and chooses Retry. Monoptah never wakes it for this check. A recorded "others" answer
+    keeps the instance.
+  - Race: the app-known blockers are read again right before the delete (after the Host
+    listing and the existence check). While the instance is being deleted, new work on it is
+    refused with a clear message. The refusal is checked again WHILE HOLDING THE STORE LOCK,
+    right before the record is persisted, in `begin_move` (Existing target), `attach_session`
+    and the start record of `begin_start` (`record_start`). `prepare_target` (the blocking
+    path) only has the early check, because it persists inside `open_project` after a
+    connect and has no single point under the lock. Work that began before the last blocker
+    read is visible to it.
+  - A run only touches the record it loaded: before it saves, removes or marks a record it
+    compares the stored one (session id and creation time), so a newer return of the same
+    instance is never overwritten or removed by an older run.
+  - A record already marked gone whose existence cannot be confirmed (offline) is not sent
+    down the live path: it stays a Retry with "could not confirm that ... is gone; choose
+    Finish cleanup again". Dismissing a gone record says the instance is already deleted and
+    that only the cleanup notice was dismissed.
+  - Any error on the way (no backend, the record cannot be saved) is saved as the record's
+    message so Retry appears; a failure to remove the record when the instance is kept does
+    not turn the answer into an error.
+- **Retry and Keep.** A delete error keeps the record with the message. The session menu of
+  the returned session then offers "Retry deleting <noun> <name>" and "Keep <noun> <name>"
+  (when a session has records for several instances, the newest one that needs a Retry is
+  shown, and the label names the instance). Nothing retries by itself. Keep removes the
+  record and deletes nothing. A blocked run (instance in use) removes the record too: there
+  is no retry loop. If the delete cannot start because another action works on the same
+  workspace, the record becomes a Retry with that reason and the status says so; it does not
+  run silently at the next start. When the backend delete worked but Monoptah could not
+  finish forgetting it, and the instance is confirmed gone, the result is "deleted, but
+  Monoptah could not finish forgetting it", a record stays, and the Retry finds it already
+  gone; such a record is labelled "Finish cleanup of <noun> <name>" (not "Retry deleting")
+  and its Keep item reads "Dismiss cleanup of ...".
+- **Persistence failures.** The status always matches what is stored. If the Retry state
+  cannot be saved, the message says the cleanup will be offered again at the next start. If
+  Keep cannot remove the record, the message says so and does not claim it was kept. When the
+  instance is kept and the record cannot be removed, it is marked with a "kept" message so it
+  never runs by itself.
+- **Status line.** The result of the delete is appended to the text of the return (including
+  its warnings), not shown instead of it.
+- **Deleting a kept instance.** A returned session no longer belongs to the instance, so the
+  session menu offers no Delete for it, except for a cloud-born codespace whose local copy
+  has an origin: that session's menu offers "Delete codespace <name>", which also warns
+  about files that are not on this computer, and the message points there. When other
+  sessions still use the instance, the message points to their menu or archive dialog. When
+  nothing in the app refers to it, the message says plainly that it stays until the user
+  deletes it: for a codespace with `gh codespace delete -c <name>`, for a sandbox with
+  Docker's sandbox tools (the app itself calls `sbx --cloud rm --force <id>`, which takes the
+  sandbox id, so no command is suggested). Messages say "was kept", not "keeps running": the
+  instance may be stopped.
+- **Known limitation.** A record is tied to a local session id, and a session has no creation
+  time to tell a reused id from the original. A record that outlived a deleted session could
+  therefore be shown on a new session with the same id. The GUI matches the instance as
+  well, which keeps a return from picking up another instance's record.
+- **Crash behavior.** The attempt is recorded before the delete is called. If the app closes
+  during the delete, the next start turns the record into a retry ("The app closed while
+  deleting ...; choose Retry") and does NOT run it again by itself; deleting may have
+  half-happened. A record that was armed but never attempted runs at the next start. A
+  crash between the final flip and arming leaves the instance running, exactly as before
+  this change.
+- **Unchanged.** Archive Keep, Stop and Delete, and "Reset to local" (which calls
+  `Store::leave_cloud_inner` directly, not `continue_locally`) keep their semantics. Reset
+  never deletes an instance.
+- **Manual verification.** Use a throwaway instance you create yourself for the test, never
+  an existing one.
+  1. Move a small throwaway session to a NEW codespace or sandbox ("Continue in cloud"),
+     let it make a change, then "Continue locally". Expect "Back on this computer. The
+     codespace <name> is being deleted." and then "... The codespace <name> was deleted.";
+     the instance disappears from `gh codespace list` or `sbx ls`.
+  2. Repeat, but first start a second session on the same new instance. Expect the first
+     to return and the instance to be kept, with a message naming the second session.
+  3. Repeat, but create an ignored file such as `secrets.env` on the instance first.
+     Expect the instance kept with a warning naming the file and the manual delete command.
+  4. Disconnect the network just before the delete step (or make `gh` fail): expect "Could
+     not delete ...", then Retry and Keep in the session menu; Retry succeeds after
+     the network is back.
+  5. Quit the app while the delete runs: on the next start expect Retry, not an automatic
+     delete.
+
 ### 4.3 Alternatives considered
 
 | Option | Pros | Cons | Verdict |

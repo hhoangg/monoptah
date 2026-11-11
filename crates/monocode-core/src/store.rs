@@ -596,6 +596,30 @@ impl Store {
         let value = serde_json::to_string(summary).map_err(|e| e.to_string())?;
         self.save_setting(&format!("orchestration:{lead}"), &value)
     }
+    /// Every non-empty setting whose key starts with `prefix`, as `(rest of the key, value)`.
+    pub fn settings_with_key_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>, String> {
+        if self.shared.is_some() {
+            return self.shared_settings_with_key_prefix(prefix);
+        }
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key, value FROM native_settings WHERE substr(key, 1, length(?1)) = ?1")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([prefix], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (key, value) = row.map_err(|e| e.to_string())?;
+            if let Some(rest) = key.strip_prefix(prefix).filter(|_| !value.is_empty()) {
+                out.push((rest.to_string(), value));
+            }
+        }
+        Ok(out)
+    }
     /// `prefix<session id>` settings, by session id.
     fn settings_with_prefix(&self, prefix: &str) -> Result<Vec<(i64, String)>, String> {
         if self.shared.is_some() {

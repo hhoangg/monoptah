@@ -20,6 +20,7 @@ use super::convert::{
     fetch_origin, git_run, git_run_stdin, has_commit, nanos, pending_restore, restore_code,
     save_refs, Mode, OriginRefs, GIT_LIMIT,
 };
+use super::return_cleanup::ReturnSource;
 use super::*;
 use crate::store::{CloudLocation, MovePoint, SessionLocation, WORKSPACE_LOST};
 use move_out::head_commit;
@@ -74,6 +75,11 @@ impl CloudSessions {
                     return Err(crate::store::HOST_TURN_RUNNING.into());
                 }
                 drop(store);
+                let source = ReturnSource {
+                    cloud: location.cloud.clone(),
+                    environment_id: location.environment_id.clone(),
+                    host_session_id: Some(location.host_session_id.clone()),
+                };
                 match self.convert_with(
                     record_id,
                     false,
@@ -81,7 +87,12 @@ impl CloudSessions {
                     progress,
                 ) {
                     Err(ConvertError::Failed(why)) if why == super::convert::SANDBOX_RECREATED => {
+                        // The cloud code was not brought back: the instance stays.
                         self.continue_without_workspace(id, &location, progress)
+                    }
+                    Ok(mut converted) => {
+                        self.arm_return_cleanup(source, &mut converted);
+                        Ok(converted)
                     }
                     other => other,
                 }
@@ -93,8 +104,18 @@ impl CloudSessions {
                 if store.host_record_is_hidden(&record) {
                     return Err("This cloud copy belongs to a conversation on this computer; continue that one.".into());
                 }
+                let source = record.project.cloud().map(|cloud| ReturnSource {
+                    cloud,
+                    environment_id: record.project.environment_id.clone(),
+                    host_session_id: record.session_id.clone(),
+                });
                 drop(store);
-                self.convert_with(id, false, Mode::Continue { moved: None }, progress)
+                let mut converted =
+                    self.convert_with(id, false, Mode::Continue { moved: None }, progress)?;
+                if let Some(source) = source {
+                    self.arm_return_cleanup(source, &mut converted);
+                }
+                Ok(converted)
             }
         }
     }
@@ -148,6 +169,7 @@ impl CloudSessions {
             ignored_truncated: false,
             evidence_partial: false,
             warnings,
+            transcript_lost: false,
             history_saved: true,
         })
     }

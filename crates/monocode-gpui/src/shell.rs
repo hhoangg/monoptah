@@ -20,6 +20,7 @@ mod cloud_location_tests;
 mod cloud_move;
 mod cloud_move_api;
 mod cloud_picker;
+mod cloud_return_cleanup;
 mod cloud_start;
 #[cfg(test)]
 mod cloud_tests;
@@ -762,6 +763,8 @@ pub(crate) struct Shell {
     cloud_refresh_again: bool,
     cloud_archive: Option<cloud::ArchiveDialog>,
     cloud_continue: cloud_continue::State,
+    /// Deleting the instance after a successful Continue locally.
+    cloud_return_cleanup: cloud_return_cleanup::State,
     /// Saves the local copy of a cloud session before its codespace is stopped or deleted.
     cloud_convert: cloud::ConvertFn,
     cloud_busy: HashSet<i64>,
@@ -1248,6 +1251,7 @@ impl Shell {
             cloud_refresh_again: false,
             cloud_archive: None,
             cloud_continue: cloud_continue::State::default(),
+            cloud_return_cleanup: cloud_return_cleanup::State::default(),
             cloud_convert: cloud::default_convert(),
             cloud_busy: HashSet::new(),
             cloud_workspaces_busy: HashSet::new(),
@@ -1537,6 +1541,7 @@ impl Shell {
         this.publish_kit_prefs();
         this.resume_cloud_starts(cx);
         this.resume_cloud_moves(cx);
+        this.resume_return_cleanups(cx);
         this.init_mobile_host(cx);
         if let Some(id) = this.workspace.active {
             this.ensure_session(this.workspace.session_for_pane(id), cx);

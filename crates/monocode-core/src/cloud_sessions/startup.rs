@@ -843,6 +843,9 @@ impl CloudSessions {
         kit: bool,
     ) -> Result<(Session, StartRecord), String> {
         require_claude(harness)?;
+        if let crate::cloud_sessions::CodespaceChoice::Named(name) = &target.codespace {
+            self.refuse_while_cleaning(&CloudRef::codespace(name))?;
+        }
         let began = self.now();
         let resolved = self.resolve_codespace(local_cwd, target, &mut |_| {})?;
         self.invalidate(&resolved.name);
@@ -855,7 +858,7 @@ impl CloudSessions {
                 }
             })
     }
-    fn record_start(
+    pub(super) fn record_start(
         &self,
         local_cwd: &str,
         harness: &str,
@@ -865,6 +868,8 @@ impl CloudSessions {
     ) -> Result<(Session, StartRecord), String> {
         let now = self.now();
         let store = self.store()?;
+        // Again with the store held, see `refuse_while_cleaning`.
+        self.refuse_while_cleaning(&CloudRef::codespace(&resolved.name))?;
         let project = pending_cloud_project(
             local_cwd,
             &CloudRef::codespace(&resolved.name),

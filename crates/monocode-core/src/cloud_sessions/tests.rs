@@ -1087,7 +1087,7 @@ fn an_unregistered_backend_is_an_error_not_a_panic() {
     assert!(error.contains("sandbox"), "{error}");
 }
 
-fn resolved(name: &str) -> ResolvedCodespace {
+pub(super) fn resolved(name: &str) -> ResolvedCodespace {
     ResolvedCodespace {
         name: name.into(),
         display: "monoptah-main".into(),

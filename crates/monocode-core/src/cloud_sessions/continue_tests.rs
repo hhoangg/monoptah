@@ -6,7 +6,7 @@ use crate::store::{CloudLocation, MovePoint, SessionLocation};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn encoded(claude: &Path, cwd: &Path) -> PathBuf {
+pub(super) fn encoded(claude: &Path, cwd: &Path) -> PathBuf {
     let real = std::fs::canonicalize(cwd).unwrap();
     claude
         .join("projects")
@@ -42,7 +42,7 @@ fn tree_of(dir: &Path) -> String {
 /// A local session that moved to the cloud: two local rows before the move, the Host record
 /// linked, the location Cloud, the move point recorded, and the pre-move Claude file on disk.
 /// The cloud's turns are NOT mirrored yet (the Host holds them).
-fn moved(w: &World) -> i64 {
+pub(super) fn moved(w: &World) -> i64 {
     moved_in(w, &w.project)
 }
 
@@ -204,7 +204,7 @@ fn a_round_trip_keeps_one_session_one_id_and_the_cloud_turns_in_the_local_file()
     assert!(w.svc.store().unwrap().cloud_move_point(local).is_none());
 }
 
-fn summary_provider(store: &Store, id: i64) -> Option<String> {
+pub(super) fn summary_provider(store: &Store, id: i64) -> Option<String> {
     store
         .sessions()
         .unwrap()
