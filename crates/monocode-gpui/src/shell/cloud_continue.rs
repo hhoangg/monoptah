@@ -36,10 +36,11 @@ pub(super) type BackupFn =
 pub(super) fn default_backup() -> BackupFn {
     Arc::new(|cloud, id, op| {
         match op {
-        Op::Restore => cloud.restore_continue_backup(id).map(|fresh| {
+        Op::Restore => cloud.restore_continue_backup(id).map(|(fresh, original)| {
             format!(
-                "Your files are back as they were before the interrupted return. The state they were in before is saved in {}.",
-                fresh.display()
+                "Your files are back as they were before the interrupted return. The state they were in just before is saved in {} and the earlier backup is still in {}. Delete them when you no longer need them.",
+                fresh.display(),
+                original.display()
             )
         }),
         Op::Discard => cloud
@@ -47,7 +48,12 @@ pub(super) fn default_backup() -> BackupFn {
             .map(|()| "The backup was deleted.".to_string()),
         Op::Keep => cloud
             .keep_cloud_state(id)
-            .map(|()| "The cloud state is kept. Your earlier files stay in the backup.".to_string()),
+            .map(|backup| {
+                format!(
+                    "The cloud state is kept. Your earlier uncommitted work is still saved in {}; delete that folder when you no longer need it.",
+                    backup.display()
+                )
+            }),
     }
     })
 }
@@ -84,6 +90,8 @@ pub(super) struct ContinueDialog {
     action: Action,
     /// The backup of an interrupted return of this session, when there is one.
     backup: Option<String>,
+    /// "Keep the cloud state" applies: the branch is at the cloud commit.
+    keepable: bool,
     phase: Phase,
     focus: FocusHandle,
 }
@@ -133,7 +141,7 @@ impl Default for State {
 pub(super) fn backup_text(op: Op, path: &str) -> String {
     if op == Op::Keep {
         return format!(
-            "The cloud work is already in your folder; an interrupted return only left the index behind. Keep makes the index follow it and forgets the attempt. Your earlier uncommitted work stays in {path}."
+            "The branch is at the cloud commit, left there by an interrupted return. Keep makes the index follow that commit and forgets the attempt. Your files are not touched. Your earlier uncommitted work stays in {path}; delete that folder when you no longer need it."
         );
     }
     if op == Op::Restore {
@@ -220,6 +228,7 @@ impl Shell {
             noun,
             action: Action::Continue,
             backup: self.continue_backup_of(id),
+            keepable: false,
             phase: Phase::Confirm,
             focus: cx.focus_handle(),
         };
@@ -329,9 +338,11 @@ impl Shell {
             Err(error) => {
                 // The session is still where it was: the dialog stays for a retry.
                 let backup = self.continue_backup_of(id);
+                let keepable = backup.is_some() && self.continue_keepable(id);
                 if let Some(dialog) = self.cloud_continue.dialog.as_mut() {
                     dialog.phase = Phase::Failed(error.to_string());
                     dialog.backup = backup;
+                    dialog.keepable = keepable;
                 }
             }
         }
@@ -371,19 +382,45 @@ impl Shell {
             .and_then(|s| s.continue_backup_path(id))
     }
 
+    /// Whether the branch of the interrupted return is at the cloud commit, the only state
+    /// "Keep the cloud state" is for.
+    fn continue_keepable(&self, id: i64) -> bool {
+        let Some(raw) = locked(&self.store)
+            .ok()
+            .and_then(|s| s.cloud_continue_broken(id))
+        else {
+            return false;
+        };
+        let Ok(marker) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            return false;
+        };
+        let (root, cloud) = (
+            marker["root"].as_str().unwrap_or_default(),
+            marker["cloudHead"].as_str().unwrap_or_default(),
+        );
+        !cloud.is_empty()
+            && monocode_core::cloud_sessions::move_out::head_commit(std::path::Path::new(root))
+                .as_deref()
+                == Some(cloud)
+    }
+
     /// The session menu entries for an interrupted return (Delete is blocked until one of
     /// them is done).
     pub(super) fn continue_backup_items(&self, id: i64) -> Vec<MenuItem> {
         if self.continue_backup_of(id).is_none() {
             return vec![];
         }
-        vec![
-            MenuAction::new("restore-continue-backup", "Restore my backup…").into(),
-            MenuAction::new("keep-continue-backup", "Keep the cloud state…").into(),
+        let mut items: Vec<MenuItem> =
+            vec![MenuAction::new("restore-continue-backup", "Restore my backup…").into()];
+        if self.continue_keepable(id) {
+            items.push(MenuAction::new("keep-continue-backup", "Keep the cloud state…").into());
+        }
+        items.push(
             MenuAction::new("discard-continue-backup", "Discard backup…")
                 .danger()
                 .into(),
-        ]
+        );
+        items
     }
 
     /// Opens the confirmation for Restore (`true`) or Discard. Nothing runs before it.
@@ -397,6 +434,9 @@ impl Shell {
         let Some(backup) = self.continue_backup_of(id) else {
             return;
         };
+        if op == Op::Keep && !self.continue_keepable(id) {
+            return;
+        }
         if self.cloud_continue.dialog.is_some() || self.cloud_busy.contains(&id) {
             return;
         }
@@ -407,6 +447,7 @@ impl Shell {
             noun: "workspace",
             action: Action::Backup { op },
             backup: Some(backup),
+            keepable: false,
             phase: Phase::ConfirmBackup { op },
             focus: cx.focus_handle(),
         };
@@ -572,7 +613,7 @@ impl Shell {
                                     |this, _, _, cx| this.ask_backup_action(Op::Restore, cx),
                                 )),
                             )
-                            .child(
+                            .children(dialog.keepable.then(|| {
                                 crate::modal::ghost_button(
                                     "cloud-continue-keep",
                                     "Keep the cloud state…",
@@ -581,8 +622,8 @@ impl Shell {
                                 .cursor_pointer()
                                 .on_click(cx.listener(
                                     |this, _, _, cx| this.ask_backup_action(Op::Keep, cx),
-                                )),
-                            )
+                                ))
+                            }))
                             .child(
                                 crate::modal::danger_button(
                                     "cloud-continue-discard",

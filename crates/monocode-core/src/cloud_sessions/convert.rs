@@ -1628,7 +1628,7 @@ pub(super) fn git_run(
     git_run_stdin(cwd, args, envs, limit, None)
 }
 
-fn git_run_stdin(
+pub(super) fn git_run_stdin(
     cwd: &Path,
     args: &[&str],
     envs: &[(&str, &str)],

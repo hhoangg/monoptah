@@ -1479,3 +1479,218 @@ fn discard_deletes_only_a_real_backup_folder_inside_the_session_folder() {
         .cloud_continue_broken(local)
         .is_none());
 }
+
+/// The project has `d/x.txt` and `mod.txt`; the cloud edits both and adds `zz.txt`.
+fn with_cloud_edits_in_a_folder(w: &World) {
+    std::fs::create_dir_all(w.project.join("d")).unwrap();
+    std::fs::write(w.project.join("d/x.txt"), "x\n").unwrap();
+    std::fs::write(w.project.join("mod.txt"), "mod\n").unwrap();
+    git(&w.project, &["add", "."]);
+    git(&w.project, &["commit", "-q", "-m", "d and mod"]);
+    git(&w.project, &["push", "-q", "origin", "main"]);
+    git(&w.ws, &["fetch", "-q", "origin"]);
+    git(&w.ws, &["merge", "-q", "--no-edit", "origin/main"]);
+    std::fs::write(w.ws.join("d/x.txt"), "x from the cloud\n").unwrap();
+    std::fs::write(w.ws.join("mod.txt"), "mod from the cloud\n").unwrap();
+    std::fs::write(w.ws.join("zz.txt"), "zz\n").unwrap();
+}
+
+#[test]
+fn a_write_that_fails_partway_keeps_the_marker_and_the_backup() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = world(true);
+    with_cloud_edits_in_a_folder(&w);
+    let local = moved(&w);
+    // The user also has an uncommitted edit that only the backup holds a copy of.
+    std::fs::write(w.project.join("keep-me.txt"), "uncommitted bytes\n").unwrap();
+    let local = {
+        // Re-record the move point so the new file is part of the moved state.
+        let store = w.svc.store().unwrap();
+        let mut point = store.cloud_move_point(local).unwrap();
+        point.tree = tree_of(&w.project);
+        store.set_cloud_move_point(local, &point).unwrap();
+        local
+    };
+    // A read-only folder: git cannot unlink d/x.txt after it wrote other files.
+    std::fs::set_permissions(w.project.join("d"), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let result = run(&w, local);
+    std::fs::set_permissions(w.project.join("d"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let store = w.svc.store().unwrap();
+    match result {
+        Err(error) => {
+            let error = error.to_string();
+            assert!(error.contains("pre-continue"), "{error}");
+            assert!(
+                !error.contains("left alone") && !error.contains("nothing was written"),
+                "{error}"
+            );
+            let marker = store
+                .cloud_continue_broken(local)
+                .expect("the marker stays");
+            let backup = serde_json::from_str::<serde_json::Value>(&marker).unwrap()["backup"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            // The only copy of the user's uncommitted bytes is still there.
+            let patch: String = std::fs::read_dir(&backup)
+                .unwrap()
+                .flatten()
+                .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+                .collect();
+            assert!(patch.contains("uncommitted bytes"), "{patch}");
+        }
+        // Everything was put back and verified: then the folder is exactly as it was.
+        Ok(_) => {
+            assert_eq!(
+                std::fs::read_to_string(w.project.join("mod.txt")).unwrap(),
+                "mod\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(w.project.join("keep-me.txt")).unwrap(),
+                "uncommitted bytes\n"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_failed_index_update_with_a_refused_branch_move_keeps_the_new_index_and_the_marker() {
+    let w = world(true);
+    let local = moved(&w);
+    let hook = w.project.join(".git/hooks/reference-transaction");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    let counter = w.project.join(".git/ref-counter");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = prepared ] && grep -q refs/heads/main; then n=$(cat '{c}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{c}'; [ $n -ge 2 ] && exit 1; fi\nexit 0\n",
+            c = counter.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // `reset -q` cannot take the index lock.
+    at_stage("after-read-tree", |root| {
+        std::fs::write(root.join(".git/index.lock"), "").unwrap();
+    });
+    let error = run(&w, local).unwrap_err().to_string();
+    clear_stage();
+    std::fs::remove_file(w.project.join(".git/index.lock")).unwrap();
+    assert!(error.contains("could not be moved back"), "{error}");
+    assert!(error.contains("pre-continue"), "{error}");
+    // The branch is at the cloud commit and the old index was NOT copied over the new state.
+    assert_eq!(
+        git(&w.project, &["log", "-1", "--format=%s"]),
+        "claude commit"
+    );
+    let store = w.svc.store().unwrap();
+    assert!(store.cloud_continue_broken(local).is_some());
+}
+
+#[test]
+fn files_the_new_ignore_rules_skip_do_not_make_a_good_apply_look_broken() {
+    let w = world(true);
+    // The cloud commits a rule that ignores *.gen, and force-adds a *.gen file uncommitted.
+    std::fs::write(w.ws.join(".gitignore"), "*.gen\n").unwrap();
+    git(&w.ws, &["add", ".gitignore"]);
+    git(&w.ws, &["commit", "-q", "-m", "ignore gen"]);
+    std::fs::write(w.ws.join("x.gen"), "generated\n").unwrap();
+    git(&w.ws, &["add", "-f", "x.gen"]);
+    let local = moved(&w);
+    let done = run(&w, local).unwrap();
+    assert!(
+        done.warnings.iter().any(|n| n.contains("applied to")),
+        "{:?}",
+        done.warnings
+    );
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("x.gen")).unwrap(),
+        "generated\n"
+    );
+    assert!(w
+        .svc
+        .store()
+        .unwrap()
+        .cloud_continue_broken(local)
+        .is_none());
+}
+
+#[test]
+fn a_cloud_deleted_file_that_is_back_and_ignored_is_not_a_clean_result() {
+    let w = world(true);
+    std::fs::write(w.project.join("old.txt"), "old\n").unwrap();
+    git(&w.project, &["add", "."]);
+    git(&w.project, &["commit", "-q", "-m", "old"]);
+    git(&w.project, &["push", "-q", "origin", "main"]);
+    git(&w.ws, &["fetch", "-q", "origin"]);
+    git(&w.ws, &["merge", "-q", "--no-edit", "origin/main"]);
+    std::fs::write(w.ws.join(".gitignore"), "old.txt\n").unwrap();
+    git(&w.ws, &["add", ".gitignore"]);
+    git(&w.ws, &["commit", "-q", "-m", "ignore old"]);
+    git(&w.ws, &["rm", "-q", "--cached", "old.txt"]);
+    std::fs::remove_file(w.ws.join("old.txt")).unwrap();
+    let local = moved(&w);
+    // A build regenerates the file right after the cloud's deletion was written.
+    at_stage("after-read-tree", |root| {
+        std::fs::write(root.join("old.txt"), "regenerated\n").unwrap()
+    });
+    let error = run(&w, local).unwrap_err().to_string();
+    clear_stage();
+    assert!(
+        error.contains("could not be verified") && error.contains("deleted"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("old.txt")).unwrap(),
+        "regenerated\n"
+    );
+    assert!(w
+        .svc
+        .store()
+        .unwrap()
+        .cloud_continue_broken(local)
+        .is_some());
+}
+
+#[test]
+fn restore_refuses_to_rewrite_a_tracked_file_that_matches_the_ignore_rules() {
+    let w = world(true);
+    let local = moved(&w);
+    write_marker(&w, local, &hash_of(&w.ws, "HEAD"), &tree_of(&w.ws));
+    // a.txt is tracked and changed since the marker, and the rules ignore it.
+    std::fs::write(w.project.join(".git/info/exclude"), "a.txt\n").unwrap();
+    std::fs::write(w.project.join("a.txt"), "regenerated by a build\n").unwrap();
+    let error = w.svc.restore_continue_backup(local).unwrap_err();
+    assert!(error.contains("ignored file of yours"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("a.txt")).unwrap(),
+        "regenerated by a build\n"
+    );
+    assert!(w
+        .svc
+        .store()
+        .unwrap()
+        .cloud_continue_broken(local)
+        .is_some());
+}
+
+#[test]
+fn recovery_and_restore_keep_their_scratch_files_in_the_session_folder() {
+    let w = world(true);
+    let local = moved(&w);
+    let backup = write_marker(&w, local, &hash_of(&w.ws, "HEAD"), &tree_of(&w.ws));
+    std::fs::write(w.project.join("a.txt"), "edited\n").unwrap();
+    let _ = run(&w, local);
+    let (fresh, original) = w.svc.restore_continue_backup(local).unwrap();
+    let thread = w.svc.store().unwrap().thread_dir(local).unwrap().unwrap();
+    assert!(fresh.starts_with(&thread), "{fresh:?}");
+    assert_eq!(original, backup);
+    // Nothing was written inside a backup folder named by a marker.
+    let inside: Vec<_> = std::fs::read_dir(&backup)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(inside, vec![std::ffi::OsString::from("changes.patch")]);
+}

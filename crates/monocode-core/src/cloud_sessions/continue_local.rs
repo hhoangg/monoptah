@@ -17,8 +17,8 @@
 //! Every step before the final flip can fail or be cancelled and leaves the session Cloud and
 //! consistent; a retry reuses the recorded code placement.
 use super::convert::{
-    fetch_origin, git_run, has_commit, nanos, pending_restore, restore_code, save_refs, Mode,
-    OriginRefs, GIT_LIMIT,
+    fetch_origin, git_run, git_run_stdin, has_commit, nanos, pending_restore, restore_code,
+    save_refs, Mode, OriginRefs, GIT_LIMIT,
 };
 use super::*;
 use crate::store::{CloudLocation, MovePoint, SessionLocation, WORKSPACE_LOST};
@@ -272,7 +272,7 @@ impl CloudSessions {
         let marker: Marker =
             serde_json::from_str(&raw).map_err(|_| BROKEN_UNREADABLE.to_string())?;
         let root = Path::new(&marker.root);
-        let scratch = Path::new(&marker.backup).join("look");
+        let scratch = session_scratch(store, session, "look");
         let _cleanup = RemoveOnDrop(scratch.clone());
         let head = head_commit(root);
         let tree = tree_now(root, &scratch);
@@ -307,7 +307,7 @@ impl CloudSessions {
     /// backed up state. A fresh backup of the CURRENT state is taken first, the branch and
     /// commit must be the ones the marker recorded, and the change goes through the same
     /// refuse-on-conflict path as the return itself. Returns the path of the fresh backup.
-    pub fn restore_continue_backup(&self, session: i64) -> Result<PathBuf, String> {
+    pub fn restore_continue_backup(&self, session: i64) -> Result<(PathBuf, PathBuf), String> {
         let store = self.store()?;
         let raw = store
             .cloud_continue_broken(session)
@@ -315,7 +315,7 @@ impl CloudSessions {
         let marker: Marker =
             serde_json::from_str(&raw).map_err(|_| BROKEN_UNREADABLE.to_string())?;
         let root = Path::new(&marker.root);
-        let fresh = Path::new(&marker.backup).join(format!("current-{}", nanos()));
+        let fresh = session_scratch(&store, session, "pre-continue-current");
         move_out::snapshot(root, &fresh)
             .map_err(|e| format!("Could not back up the current state first: {e}"))?;
         let branch = g(root, &["symbolic-ref", "-q", "HEAD"], &[])?;
@@ -332,8 +332,16 @@ impl CloudSessions {
         let idx = scratch.join("restore.idx");
         let text = idx.to_string_lossy().into_owned();
         let envs = [("GIT_INDEX_FILE", text.as_str())];
+        // Seeded like the snapshot, so tracked files that match .gitignore are part of it.
+        seed_index(root, &idx)?;
         g(root, &["add", "-A"], &envs)?;
         let current = g(root, &["write-tree"], &envs)?.trim().to_string();
+        guard_ignored(root, &current, &marker.tree).map_err(|e| {
+            format!(
+                "Refused, nothing was changed ({e}). The current state is saved in {}.",
+                fresh.display()
+            )
+        })?;
         g(
             root,
             &["read-tree", "-m", "-u", &current, &marker.tree],
@@ -346,7 +354,7 @@ impl CloudSessions {
             )
         })?;
         store.set_cloud_continue_broken(session, "")?;
-        Ok(fresh)
+        Ok((fresh, PathBuf::from(&marker.backup)))
     }
 
     /// The explicit user action: forget the interrupted return and delete its backup. It
@@ -365,7 +373,7 @@ impl CloudSessions {
 
     /// The explicit user action for a crash between the branch move and the index update:
     /// keep the cloud state, make the index follow HEAD, forget the marker. The backup stays.
-    pub fn keep_cloud_state(&self, session: i64) -> Result<(), String> {
+    pub fn keep_cloud_state(&self, session: i64) -> Result<PathBuf, String> {
         let store = self.store()?;
         let raw = store
             .cloud_continue_broken(session)
@@ -379,7 +387,8 @@ impl CloudSessions {
             return Err("The branch is not at the cloud commit, so there is no cloud state to keep. Restore the backup or discard it.".into());
         }
         finalise_index(root)?;
-        store.set_cloud_continue_broken(session, "")
+        store.set_cloud_continue_broken(session, "")?;
+        Ok(PathBuf::from(&marker.backup))
     }
 
     /// The in-place path. Only while the folder is exactly what the move left, with the same
@@ -609,23 +618,41 @@ impl CloudSessions {
             return unsuitable("an ignored file of yours is in the way");
         }
         window_hook("before-read-tree", &root);
+        // Undoes a completed (or partly completed) `read-tree -u`: it refuses rather than
+        // revert anything the user changed since.
+        let undo_files_now = || undo_files(&root, &expected, &point.tree, &scratch);
         // Step 2 refuses (exit 128) on a tracked file changed after the index was built and
-        // on an untracked file in the way, BEFORE writing anything. A refusal therefore
-        // changed nothing and must not be "rolled back": that would revert the user's edits.
+        // on an untracked file in the way, before writing. But git can also fail PARTWAY
+        // (a read-only folder, a full disk) after some files were written. So an error is a
+        // clean refusal only when the folder still has the tree it had before.
         if let Err(error) = g(
             &root,
             &["read-tree", "-m", "-u", &point.tree, &expected],
             &envs,
         ) {
-            clear(self);
-            drop_backup();
-            return InPlace::Unsuitable(format!(
-                "a file changed or appeared while it was applied, so nothing was written ({error})"
-            ));
+            if !wrote_something(&root, &point.tree, &expected, &changed, &scratch) {
+                clear(self);
+                drop_backup();
+                return InPlace::Unsuitable(format!(
+                    "a file changed or appeared while it was applied, so nothing was written ({error})"
+                ));
+            }
+            return match undo_files_now() {
+                Ok(()) => {
+                    clear(self);
+                    drop_backup();
+                    InPlace::Unsuitable(format!(
+                        "writing the cloud files stopped partway ({error}); they were put back"
+                    ))
+                }
+                Err(e) => InPlace::Broken(format!(
+                    "Writing the cloud files stopped partway ({error}) and they could not be put back ({e}). Some of your files may already hold the cloud's content. Your uncommitted work from before is saved in {} (commit {}). Nothing was deleted or overwritten.",
+                    backup.display(),
+                    point.head
+                )),
+            };
         }
         window_hook("after-read-tree", &root);
-        // From here the files are the cloud's. Undo only what completed.
-        let undo_files_now = || undo_files(&root, &expected, &point.tree, &scratch);
         // Step 3: compare-and-swap on the checked out branch.
         if let Err(error) = g(
             &root,
@@ -656,7 +683,9 @@ impl CloudSessions {
         }
         // Step 4: the real index follows HEAD; the working tree is already the expected one.
         if let Err(error) = g(&root, &["reset", "-q"], &[]) {
-            let undone = g(
+            // Only when the branch is back at the old commit may the old index come back; with
+            // HEAD at the cloud commit the new index is the right one and stays.
+            let moved_back = g(
                 &root,
                 &[
                     "update-ref",
@@ -667,11 +696,18 @@ impl CloudSessions {
                     head,
                 ],
                 &[],
-            )
-            .and_then(|_| undo_files_now());
+            );
+            if let Err(e) = moved_back {
+                return InPlace::Broken(format!(
+                    "The index could not be updated ({error}) and the branch could not be moved back ({e}). The branch is at the cloud commit and your files hold the cloud state. Your uncommitted work from before is saved in {} (commit {}). Nothing was deleted or overwritten.",
+                    backup.display(),
+                    point.head
+                ));
+            }
             if let Some(index) = &original_index {
                 let _ = std::fs::copy(backup.join("index.orig"), index);
             }
+            let undone = undo_files_now();
             return match undone {
                 Ok(()) => {
                     clear(self);
@@ -750,6 +786,87 @@ fn tree_now(root: &Path, scratch: &Path) -> Result<String, String> {
     result
 }
 
+/// Refuses when a read-tree from tree `from` to tree `to` would rewrite a path that is an
+/// ignored file of the user's: untracked and ignored, or tracked and matching the ignore
+/// rules (a build may have regenerated it). Nothing is written.
+fn guard_ignored(root: &Path, from: &str, to: &str) -> Result<(), String> {
+    let rewritten = split_paths(&g(
+        root,
+        &[
+            "diff-tree",
+            "-r",
+            "-z",
+            "--name-only",
+            "--no-renames",
+            from,
+            to,
+        ],
+        &[],
+    )?);
+    for kind in ["--others", "--cached"] {
+        let ignored = g(
+            root,
+            &["ls-files", "-z", kind, "--ignored", "--exclude-standard"],
+            &[],
+        )?;
+        if paths_overlap(&split_paths(&ignored), &rewritten) {
+            return Err("an ignored file of yours is in the way".into());
+        }
+    }
+    Ok(())
+}
+
+/// The tree of the folder as it is now, written into the repository (index seeded like the
+/// move's snapshot, then everything added).
+fn tree_in_repo(root: &Path, scratch: &Path) -> Result<String, String> {
+    std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
+    let index = scratch.join(format!("now-{}.idx", nanos()));
+    let text = index.to_string_lossy().into_owned();
+    let envs = [("GIT_INDEX_FILE", text.as_str())];
+    let result = seed_index(root, &index)
+        .and_then(|()| g(root, &["add", "-A"], &envs))
+        .and_then(|_| g(root, &["write-tree"], &envs))
+        .map(|t| t.trim().to_string());
+    let _ = std::fs::remove_file(&index);
+    result
+}
+
+/// After a failed `read-tree -m -u`: did it write anything? Not when the folder still has the
+/// tree it had. A different tree is a refusal caused by the user's own change unless a path
+/// the cloud changes already holds the cloud's content: that is a partial write. Any doubt
+/// counts as written.
+fn wrote_something(
+    root: &Path,
+    point_tree: &str,
+    expected: &str,
+    changed: &[String],
+    scratch: &Path,
+) -> bool {
+    let Ok(now) = tree_in_repo(root, scratch) else {
+        return true;
+    };
+    if now == point_tree {
+        return false;
+    }
+    let Ok(differing) = g(
+        root,
+        &[
+            "diff-tree",
+            "-r",
+            "-z",
+            "--name-only",
+            "--no-renames",
+            &now,
+            expected,
+        ],
+        &[],
+    ) else {
+        return true;
+    };
+    let differing = split_paths(&differing);
+    changed.iter().any(|path| !differing.contains(path))
+}
+
 /// Makes the real index follow HEAD (a crash between the branch move and the index update
 /// leaves it stale, and a plain `git commit` would then revert the cloud commit). It only
 /// touches the index; afterwards the index must equal HEAD.
@@ -758,6 +875,17 @@ fn finalise_index(root: &Path) -> Result<(), String> {
     g(root, &["diff", "--cached", "--quiet"], &[])
         .map(|_| ())
         .map_err(|_| "the index still differs from HEAD".to_string())
+}
+
+/// A folder for temporary or fresh-backup files of this session, inside its own folder when
+/// the store has one.
+fn session_scratch(store: &Store, session: i64, prefix: &str) -> PathBuf {
+    let base = store
+        .thread_dir(session)
+        .ok()
+        .flatten()
+        .unwrap_or_else(std::env::temp_dir);
+    base.join(format!("{prefix}-{}", nanos()))
 }
 
 /// The backup folder of a marker, only when it is a real folder (not a link) directly inside
@@ -825,8 +953,42 @@ fn verify_paths(
     let envs = [("GIT_INDEX_FILE", text.as_str())];
     seed_index(root, &index)?;
     g(root, &["add", "-A"], &envs)?;
+    // The cloud's own files count even when the new ignore rules would skip them.
+    let present: String = changed
+        .iter()
+        .filter(|p| root.join(p).is_file())
+        .map(|p| format!("{p}\0"))
+        .collect();
+    if !present.is_empty() {
+        git_run_stdin(
+            root,
+            &[
+                "-c",
+                "submodule.recurse=false",
+                "add",
+                "-f",
+                "--pathspec-from-file=-",
+                "--pathspec-file-nul",
+            ],
+            &envs,
+            GIT_LIMIT,
+            Some(&present),
+        )?;
+    }
     let now = g(root, &["write-tree"], &envs)?.trim().to_string();
     let _ = std::fs::remove_file(&index);
+    // A file the cloud deleted must be gone, even if the new rules ignore it.
+    let kept = split_paths(&g(
+        root,
+        &["ls-tree", "-r", "-z", "--name-only", expected],
+        &[],
+    )?);
+    for path in changed {
+        let meta = std::fs::symlink_metadata(root.join(path));
+        if !kept.contains(path) && meta.is_ok_and(|m| !m.is_dir()) {
+            return Err("a file the cloud deleted is still there".into());
+        }
+    }
     let differing = g(
         root,
         &[
@@ -854,6 +1016,7 @@ fn undo_files(root: &Path, expected: &str, old_tree: &str, scratch: &Path) -> Re
     let text = index.to_string_lossy().into_owned();
     let envs = [("GIT_INDEX_FILE", text.as_str())];
     let result = (|| {
+        guard_ignored(root, expected, old_tree)?;
         g(root, &["read-tree", expected], &envs)?;
         let _ = g(root, &["update-index", "-q", "--refresh"], &envs);
         g(root, &["read-tree", "-m", "-u", expected, old_tree], &envs).map(|_| ())

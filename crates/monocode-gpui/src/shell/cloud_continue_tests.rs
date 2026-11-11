@@ -441,14 +441,44 @@ fn the_backup_confirmations_name_the_path_and_the_consequence() {
 }
 
 #[gpui::test]
-fn keep_the_cloud_state_is_offered_and_runs_only_after_the_confirmation(cx: &mut TestAppContext) {
+fn keep_the_cloud_state_is_offered_only_at_the_cloud_commit_and_runs_after_the_confirmation(
+    cx: &mut TestAppContext,
+) {
     let (window, local) = moved_window(cx);
     let tmp = scratch_dir();
-    broken_marker(&window, cx, local, tmp.as_path());
+    let repo = tmp.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    git(&["init", "-q"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "one"]);
+    let cloud_head = git(&["rev-parse", "HEAD"]);
+    let marker = |head: &str| {
+        json!({"backup": tmp.join("pre-continue-1"), "root": repo, "cloudHead": head}).to_string()
+    };
     let calls = Arc::new(AtomicUsize::new(0));
     window
         .update(cx, |shell, window, cx| {
-            shell.cloud_continue.backup = fake_backup(calls.clone(), None, shell.store.clone());
+            let store = shell.store.clone();
+            locked(&store)
+                .unwrap()
+                .set_cloud_continue_broken(local, &marker("0".repeat(40).as_str()))
+                .unwrap();
+            // Not at the cloud commit: no Keep.
+            assert!(!labels(shell, local, cx).contains(&"Keep the cloud state…".to_string()));
+            locked(&store)
+                .unwrap()
+                .set_cloud_continue_broken(local, &marker(&cloud_head))
+                .unwrap();
+            shell.cloud_continue.backup = fake_backup(calls.clone(), None, store);
             assert!(labels(shell, local, cx).contains(&"Keep the cloud state…".to_string()));
             shell.run_session_menu(local, "keep-continue-backup", window, cx);
             assert_eq!(shell.cloud_continue.phase_name(), "confirm-backup");
