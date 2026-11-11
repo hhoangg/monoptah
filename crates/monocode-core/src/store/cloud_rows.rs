@@ -48,6 +48,27 @@ pub const NOT_CLOUD: &str =
 /// the first sync a different count), so the Host rows have no safe place. Nothing is written.
 pub const DIVERGED: &str = "The local conversation is shorter than its move point, so the cloud messages cannot be placed. Nothing was overwritten.";
 
+/// Why the append refuses a conversation whose history is kept in the paged desktop tables: its
+/// row indexes are relative to a per-store window, so a move point is not stable. Nothing is
+/// written.
+pub const INDEXED_UNSUPPORTED: &str = "Continue in cloud does not support this conversation's paged history yet. Nothing was changed.";
+
+/// The digest of a row, shared by both stores so an anchor is the same for the same rows.
+pub(super) fn row_digest(role: &str, body: &str, first: bool, sent_at: Option<i64>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(role.as_bytes());
+    hash.update([0]);
+    hash.update(body.as_bytes());
+    hash.update([0, u8::from(first)]);
+    hash.update(sent_at.unwrap_or(-1).to_le_bytes());
+    hash.finalize()
+        .iter()
+        .take(16)
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
+}
+
 impl Store {
     pub(super) fn synced_key(environment: &str, host_session: &str) -> String {
         format!("cloud-synced:{environment}:{host_session}")
@@ -89,7 +110,9 @@ impl Store {
     /// The row count of a local session and a digest of its last row. Reads only.
     pub fn row_anchor(&self, session: i64) -> Result<RowAnchor, String> {
         use rusqlite::OptionalExtension;
-        use sha2::{Digest, Sha256};
+        if self.shared.is_some() {
+            return self.shared_row_anchor(session);
+        }
         self.require_native_rows()?;
         let count: i64 = self
             .conn
@@ -115,19 +138,7 @@ impl Store {
             )
             .optional()
             .map_err(|e| e.to_string())?
-            .map(|(role, body, first, sent_at)| {
-                let mut hash = Sha256::new();
-                hash.update(role.as_bytes());
-                hash.update([0]);
-                hash.update(body.as_bytes());
-                hash.update([0, u8::from(first)]);
-                hash.update(sent_at.unwrap_or(-1).to_le_bytes());
-                hash.finalize()
-                    .iter()
-                    .take(16)
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>()
-            });
+            .map(|(role, body, first, sent_at)| row_digest(&role, &body, first, sent_at));
         Ok(RowAnchor {
             count: usize::try_from(count).unwrap_or(0),
             last,
@@ -187,7 +198,6 @@ impl Store {
         if self.remote_session(local_session)?.is_some() {
             return Err("Remote transcripts are owned by the host".into());
         }
-        self.require_native_rows()?;
         // A Host session created by a move holds only the turns that ran in the cloud, so
         // Host row `i` is local row `moved_at_row + i`. Rows before `moved_at_row` are never
         // compared, written or deleted.
@@ -204,6 +214,17 @@ impl Store {
             return Err(super::location::WORKSPACE_LOST.into());
         }
         let base = location.moved_at_row;
+        if self.shared.is_some() {
+            return self.shared_append_projected_rows(
+                local_session,
+                environment,
+                host_session,
+                revision,
+                host,
+                base,
+            );
+        }
+        self.require_native_rows()?;
         let local = self.native_rows(local_session)?;
         let first_sync = self
             .cloud_synced_revision(environment, host_session)?

@@ -71,7 +71,7 @@ impl QuitGate {
 }
 
 /// Ctrl+Q off macOS (Cmd+Q on a Mac), however the keyboard cased the key.
-fn is_quit_keystroke(keystroke: &Keystroke, mac: bool) -> bool {
+pub(super) fn is_quit_keystroke(keystroke: &Keystroke, mac: bool) -> bool {
     let m = keystroke.modifiers;
     keystroke.key.eq_ignore_ascii_case("q")
         && !m.alt

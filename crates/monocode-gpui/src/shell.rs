@@ -9099,7 +9099,8 @@ impl Render for Shell {
         }
         if let Some(m) = &self.monos {
             m.read(cx).hide_html(cx);
-            let covered = self.document_lightbox.is_some();
+            // A native web view paints above the barrier, so a blocking dialog hides it too.
+            let covered = self.document_lightbox.is_some() || self.blocking_modal().is_some();
             m.update(cx, |m, cx| {
                 m.set_suppress_html(covered);
                 m.bind_window(window, cx)
@@ -9355,6 +9356,9 @@ impl Render for Shell {
             .aria_label("Monoptah Native")
             .key_context("Workspace")
             .track_focus(&self.focus)
+            .when(self.blocking_modal().is_some(), |el| {
+                shortcuts::block_menu_actions(el)
+            })
             .capture_key_up(cx.listener(|this, _, _, _| this.archive_shortcut_held = false))
             .on_action(cx.listener(|this, _: &ArchiveSession, window, cx| {
                 this.archive_active_session(window, cx)

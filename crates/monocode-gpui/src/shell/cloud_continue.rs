@@ -113,8 +113,23 @@ pub(super) struct State {
     pub backup: BackupFn,
 }
 
+impl ContinueDialog {
+    /// The dialog's focus handle, kept focused while it is open.
+    pub(super) fn focus_handle(&self) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
 #[cfg(test)]
 impl State {
+    /// For tests: shows the Working step with a progress line, without spawning work.
+    pub fn hold_working(&mut self, line: &str) {
+        if let Some(dialog) = self.dialog.as_mut() {
+            dialog.phase = Phase::Working {
+                progress: Arc::new(std::sync::Mutex::new(line.to_string())),
+            };
+        }
+    }
     /// For tests: which step the dialog is on.
     pub fn phase_name(&self) -> &'static str {
         match self.dialog.as_ref().map(|d| &d.phase) {
@@ -360,6 +375,7 @@ impl Shell {
             Ok(done) => {
                 self.cloud_continue.dialog = None;
                 self.adopt_continued(id, done, window, cx);
+                self.focus_active(window, cx);
             }
             Err(error) => {
                 // The session is still where it was: the dialog stays for a retry.
@@ -564,11 +580,12 @@ impl Shell {
             .spawn(async move { run(&cloud, id, op) });
         cx.spawn_in(window, async move |this, cx| {
             let result = work.await;
-            let _ = this.update_in(cx, |this, _window, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
                 this.cloud_busy.remove(&id);
                 match result {
                     Ok(message) => {
                         this.cloud_continue.dialog = None;
+                        this.focus_active(window, cx);
                         this.error = Some(message);
                     }
                     // The marker stays: the dialog keeps the choice for a retry.
@@ -594,6 +611,7 @@ impl Shell {
         let width = 520f32.min(window.viewport_size().width.as_f32() - 24.);
         let weak = cx.weak_entity();
         let working = matches!(dialog.phase, Phase::Working { .. });
+        let priority = crate::modal::BLOCKING_PRIORITY;
         let text = |id: &'static str, text: String, dim: bool| {
             div()
                 .id(id)
@@ -750,13 +768,17 @@ impl Shell {
             div()
                 .absolute()
                 .size_full()
-                .child(crate::modal::scrim("cloud-continue-scrim"))
+                .child(crate::modal::barrier(
+                    "cloud-continue-scrim",
+                    priority,
+                    window,
+                ))
                 .child(
                     popover("cloud-continue-modal", Anchor::Center)
                         .modal_surface(self.workspace.boxy_layout())
                         .width(width)
                         .gap(0.)
-                        .priority(60)
+                        .priority(priority)
                         .on_dismiss(move |window, cx| {
                             let _ =
                                 weak.update(cx, |this, cx| this.close_continue_locally(window, cx));
@@ -764,6 +786,7 @@ impl Shell {
                         .child(
                             div()
                                 .id("cloud-continue-dialog")
+                                .debug_selector(|| "cloud-continue-dialog".into())
                                 .role(Role::Dialog)
                                 .aria_label("Continue locally")
                                 .track_focus(&dialog.focus)
