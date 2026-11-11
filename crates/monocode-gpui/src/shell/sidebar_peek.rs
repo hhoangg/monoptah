@@ -151,6 +151,10 @@ impl Shell {
     }
 
     fn peek_pointer(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        // A blocking dialog owns the pointer: the hidden sidebar must not open behind it.
+        if self.blocking_modal().is_some() {
+            return;
+        }
         let edge =
             event.position.x.as_f32() <= PEEK_EDGE && event.position.y.as_f32() > TITLE_BAR_HEIGHT;
         if edge && event.pressed_button.is_none() {

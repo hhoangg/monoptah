@@ -4782,3 +4782,147 @@ fn app_archive_delete_review_error_tells_the_user_to_review_in_the_app(cx: &mut 
     assert!(failure.archived);
     assert!(gh.archive_calls().is_empty());
 }
+
+fn archive_focused(shell: &Shell, window: &Window, cx: &App) -> bool {
+    shell
+        .cloud_archive
+        .as_ref()
+        .is_some_and(|d| d.focus_handle().contains_focused(window, cx))
+}
+
+/// Puts the open archive dialog in its Working phase without spawning work, and returns the
+/// flag Cancel sets.
+fn hold_archive_working(shell: &mut Shell) -> Arc<AtomicBool> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    shell.cloud_archive.as_mut().expect("the dialog").phase = cloud::Phase::Working {
+        progress: Arc::new(std::sync::Mutex::new("Saving a local copy".into())),
+        cancel: cancel.clone(),
+    };
+    cancel
+}
+
+#[gpui::test]
+fn a_running_archive_blocks_the_window_and_only_the_cancel_button_cancels(cx: &mut TestAppContext) {
+    use super::cloud_continue_tests::blocking::*;
+    use std::sync::atomic::Ordering;
+    bind(cx);
+    let (window, id, _) = shell_with_cloud(cx);
+    let at = arm(window, cx);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    assert!(
+        hover_reveals(visual, at),
+        "the hover probe works without a dialog"
+    );
+    let cancel = window
+        .update(visual, |shell, window, cx| {
+            shell.open_cloud_archive(vec![id], window, cx);
+            hold_archive_working(shell)
+        })
+        .unwrap();
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    let card = visual
+        .debug_bounds("cloud-archive-dialog")
+        .expect("the dialog");
+    assert_blocked(window, visual, at, card, archive_focused);
+    // The backdrop and Escape never cancel the running save.
+    assert!(
+        !card.contains(&gpui::point(gpui::px(900.), gpui::px(700.))),
+        "the backdrop press is outside the card"
+    );
+    visual.simulate_click(
+        gpui::point(gpui::px(900.), gpui::px(700.)),
+        Default::default(),
+    );
+    visual.simulate_click(at, Default::default());
+    assert_eq!(
+        active(window, visual),
+        Some(OTHER),
+        "click must not select the row"
+    );
+    visual.simulate_keystrokes("escape");
+    assert!(
+        !cancel.load(Ordering::Relaxed),
+        "a stray press must not cancel"
+    );
+    window
+        .update(visual, |shell, _, _| assert!(shell.cloud_archive.is_some()))
+        .unwrap();
+    // The Cancel button does.
+    let button = visual.debug_bounds("cloud-archive-cancel").expect("Cancel");
+    visual.simulate_click(button.center(), Default::default());
+    assert!(
+        cancel.load(Ordering::Relaxed),
+        "the button asks the worker to stop"
+    );
+}
+
+#[gpui::test]
+fn the_archive_choice_takes_enter_and_escape_through_the_gate_and_frees_the_window(
+    cx: &mut TestAppContext,
+) {
+    use super::cloud_continue_tests::blocking::*;
+    bind(cx);
+    let (window, id, gh) = shell_with_cloud(cx);
+    let at = arm(window, cx);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    // Escape closes the choice and the window works again.
+    window
+        .update(visual, |shell, window, cx| {
+            shell.open_cloud_archive(vec![id], window, cx)
+        })
+        .unwrap();
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    let card = visual
+        .debug_bounds("cloud-archive-dialog")
+        .expect("the dialog");
+    assert_blocked(window, visual, at, card, archive_focused);
+    visual.simulate_keystrokes("escape");
+    window
+        .update(visual, |shell, _, _| assert!(shell.cloud_archive.is_none()))
+        .unwrap();
+    visual.refresh().unwrap();
+    assert_restored(window, visual, at);
+
+    // With another session on the codespace the default is Keep running: Enter archives the
+    // row locally and never touches gh.
+    window
+        .update(visual, |shell, window, cx| {
+            let other = add_cloud_session(&shell.store, "/work/monocode", "octo-abc");
+            let summary = locked(&shell.store)
+                .unwrap()
+                .sessions()
+                .unwrap()
+                .into_iter()
+                .find(|s| s.id == other)
+                .unwrap();
+            shell.session_summaries.insert(other, summary);
+            shell.order.push(other);
+            shell.cloud_marks.insert(
+                other,
+                CloudMark {
+                    local_project: "/work/monocode".into(),
+                    codespace: "octo-abc".into(),
+                    kind: CloudBackendKind::Codespaces,
+                },
+            );
+            shell.open_cloud_archive(vec![id], window, cx);
+            assert_eq!(shell.cloud_archive.as_ref().unwrap().others(), 1);
+        })
+        .unwrap();
+    visual.run_until_parked();
+    visual.simulate_keystrokes("enter");
+    visual.run_until_parked();
+    window
+        .update(visual, |shell, _, cx| {
+            assert!(shell.cloud_archive.is_none());
+            assert!(shell.session_metadata(id, cx).summary.archived);
+        })
+        .unwrap();
+    assert!(gh.calls().is_empty());
+    visual.refresh().unwrap();
+    // The archived row left the list, so the probed row may have moved.
+    let at = visual.debug_bounds(ROW).expect("the probed row").center();
+    assert_restored(window, visual, at);
+}
