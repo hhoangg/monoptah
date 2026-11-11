@@ -292,7 +292,15 @@ impl TranscriptView {
                             delete_label,
                             StartAction::DeleteCodespace,
                             true,
-                        )),
+                        ))
+                        .when_some(start.help_url(), |d, url| {
+                            d.child(
+                                secondary_button("cloud-start-help", "How to fix", false, false)
+                                    .debug_selector(|| "cloud-start-help".into())
+                                    .child("How to fix")
+                                    .on_click(move |_, _, cx| cx.open_url(url)),
+                            )
+                        }),
                 )
         });
         div()
@@ -683,6 +691,10 @@ mod tests {
             assert_eq!(seen.borrow().last(), Some(&action), "{id}");
         }
         assert!(visual.debug_bounds("cloud-queued-note").is_some());
+        assert!(
+            visual.debug_bounds("cloud-start-help").is_none(),
+            "an unrecognised failure has no fix guide"
+        );
         window
             .update(visual, |view, _, _| {
                 let start = view.cloud_start.clone().unwrap();
@@ -692,6 +704,39 @@ mod tests {
                     "devcontainer up failed The sandbox is kept, so a retry reuses it."
                 );
                 assert_eq!(start.delete_label(), "Delete sandbox");
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_codespace_without_ssh_server_says_to_add_the_feature_and_keeps_retry(
+        cx: &mut TestAppContext,
+    ) {
+        let window = window(cx);
+        let error = "SSH setup failed: error getting ssh server details: failed to start SSH server: Please check if an SSH server is installed in the container.";
+        window
+            .update(cx, |view, _, cx| {
+                view.set_cloud_start(Some(failed(5, error)), None, cx)
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        for id in [
+            "cloud-start-help",
+            "cloud-start-retry",
+            "cloud-start-rebuild",
+            "cloud-start-delete",
+        ] {
+            assert!(visual.debug_bounds(id).is_some(), "{id}");
+        }
+        window
+            .update(visual, |view, _, _| {
+                let message = view.cloud_start.clone().unwrap().failure_message();
+                assert!(
+                    message.contains("ghcr.io/devcontainers/features/sshd:1"),
+                    "{message}"
+                );
             })
             .unwrap();
     }

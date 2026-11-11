@@ -157,6 +157,30 @@ pub fn split_created_note(error: &str) -> Option<(&str, CloudBackendKind, &str)>
     })
 }
 
+/// The dev container feature that installs an SSH server, which a codespace needs so the app
+/// can connect to it.
+pub const SSHD_FEATURE: &str = "ghcr.io/devcontainers/features/sshd:1";
+/// GitHub's page on connecting to a codespace over SSH, which explains the requirement.
+pub const SSHD_DOCS_URL: &str = "https://docs.github.com/en/codespaces/developing-in-a-codespace/using-github-codespaces-with-github-cli#ssh-into-a-codespace";
+
+/// Whether a start error says the codespace has no SSH server: `gh codespace ssh` fails with
+/// "failed to start SSH server" when the dev container does not install one.
+pub fn is_missing_ssh_server(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("failed to start ssh server")
+        || (error.contains("ssh server") && error.contains("is installed in the container"))
+}
+
+/// What to do about a start error, when the app recognises it. Only the missing SSH server
+/// is recognised, the usual cause of a codespace failing at "connect".
+pub fn start_error_hint(error: &str) -> Option<String> {
+    is_missing_ssh_server(error).then(|| {
+        format!(
+            "This codespace has no SSH server, which the app needs to connect. Add the \"{SSHD_FEATURE}\": {{}} feature to the repository's devcontainer.json, then use Rebuild container."
+        )
+    })
+}
+
 /// Error text of a start that was cancelled or whose session disappeared. Not a failure: no
 /// `Failed` event accompanies it.
 pub const START_ABORTED: &str = "The cloud session start was cancelled.";
@@ -1299,6 +1323,14 @@ impl CloudSessions {
     pub fn converted_origins(&self) -> Vec<(i64, String)> {
         self.store()
             .and_then(|s| s.codespace_origins())
+            .unwrap_or_default()
+    }
+
+    /// Ids of the sessions bound to `cloud`, read before a delete forgets them so the app can
+    /// drop them from its window.
+    pub fn session_ids_on(&self, cloud: &CloudRef) -> Vec<i64> {
+        self.store()
+            .and_then(|store| store.cloud_session_ids(cloud))
             .unwrap_or_default()
     }
 

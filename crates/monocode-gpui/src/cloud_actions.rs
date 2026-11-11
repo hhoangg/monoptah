@@ -48,6 +48,22 @@ pub(crate) fn run(
     }
 }
 
+/// The instance a successful `cloud.delete` removed and the ids of the sessions it forgot,
+/// read from its result. `None` for any other action or result.
+pub(crate) fn deleted(action: &str, result: &Value) -> Option<(CloudRef, Vec<i64>)> {
+    if action != "cloud.delete" || result["deleted"] != true {
+        return None;
+    }
+    let kind =
+        monocode_core::cloud_sessions::CloudBackendKind::from_api_name(result["kind"].as_str()?)?;
+    let name = result["instance"].as_str()?.to_owned();
+    let ids = result["removedSessionIds"]
+        .as_array()
+        .map(|ids| ids.iter().filter_map(Value::as_i64).collect())
+        .unwrap_or_default();
+    Some((CloudRef { kind, name }, ids))
+}
+
 /// Adds `target`, `cloudState` and (while provisioning) `startup` to a `sessions.start` result.
 pub(crate) fn describe_start(result: &mut Value, start: &CloudStart) {
     let state = cloud_api::state_id(start.initial_state());
@@ -157,5 +173,32 @@ mod tests {
         assert!(busy.working_on(&CloudRef::sandbox("box-1")));
         assert!(!busy.working_on(&CloudRef::codespace("box-1")));
         assert!(busy.session_busy(-7) && !busy.session_busy(-8));
+    }
+
+    #[test]
+    fn a_delete_result_names_the_instance_and_the_sessions_it_removed() {
+        let result = json!({"kind":"codespace","instance":"cs-a","deleted":true,"sessions":[],"removedSessionIds":[7,9]});
+        let (cloud, ids) = deleted("cloud.delete", &result).unwrap();
+        assert_eq!(
+            cloud,
+            CloudRef {
+                kind: monocode_core::cloud_sessions::CloudBackendKind::Codespaces,
+                name: "cs-a".into()
+            }
+        );
+        assert_eq!(ids, vec![7, 9]);
+        let sandbox = json!({"kind":"sandbox","instance":"box","deleted":true});
+        assert_eq!(
+            deleted("cloud.delete", &sandbox).unwrap().1,
+            Vec::<i64>::new()
+        );
+        assert!(deleted("cloud.stop", &result).is_none());
+        assert!(
+            deleted(
+                "cloud.delete",
+                &json!({"kind":"codespace","instance":"cs-a"})
+            )
+            .is_none()
+        );
     }
 }

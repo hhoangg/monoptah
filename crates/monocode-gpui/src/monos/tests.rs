@@ -2780,7 +2780,7 @@ fn start_rejects_a_malformed_parent_id(cx: &mut TestAppContext) {
     assert_eq!(session_count(&s), before);
 }
 
-fn launch_of(session: i64, cwd: &str) -> mono::Launch {
+pub(super) fn launch_of(session: i64, cwd: &str) -> mono::Launch {
     mono::Launch {
         session_id: session,
         cwd: cwd.into(),

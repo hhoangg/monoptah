@@ -45,6 +45,22 @@ at 1 job; running the GPUI tests needs a 4 CPU / 8g sandbox. 8g with 1 job is th
 verified GPUI-test setup.
 `scripts/native-dev-doctor.sh` reads the cgroup limit and warns about all of this.
 
+## Codespaces need an SSH server
+
+The app reaches a codespace through `gh codespace ssh`, so the dev container must run an SSH
+server. Without one the start fails at "connect" with `SSH setup failed: ... failed to start
+SSH server ...`; the app then says to add the feature below and keeps the codespace for
+Retry or Rebuild container. Add it to `devcontainer.json` (then rebuild the container):
+
+```json
+"features": {
+  "ghcr.io/devcontainers/features/sshd:1": {}
+}
+```
+
+See GitHub's [SSH into a codespace](https://docs.github.com/en/codespaces/developing-in-a-codespace/using-github-codespaces-with-github-cli#ssh-into-a-codespace).
+Docker Sandboxes do not need it.
+
 ## What is provisioned
 
 - `Dockerfile`: Debian trixie dev image, the system libraries from `native.yml`

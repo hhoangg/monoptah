@@ -74,6 +74,12 @@ impl Conversation {
     pub(crate) fn cloud_queued(&self) -> Option<&str> {
         self.cloud_queued.as_deref()
     }
+    /// The codespace (or sandbox) start of this session failed and waits for the user.
+    pub(crate) fn cloud_start_failed(&self) -> bool {
+        self.cloud_start
+            .as_ref()
+            .is_some_and(|s| s.phase == crate::cloud_start_view::StartPhase::Failed)
+    }
     /// `codespace` or `sandbox`, by the backend of the start shown.
     pub(super) fn cloud_start_noun(&self) -> &'static str {
         self.cloud_start.as_ref().map_or("codespace", |s| s.noun())

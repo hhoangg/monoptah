@@ -1,5 +1,5 @@
 //! Mono dispatch of the `cloud.*` actions and of cloud sessions, for codespaces and sandboxes.
-use super::tests::{Setup, call, call_from, fake_run, launches_of, setup, setup_with};
+use super::tests::{Setup, call, call_from, fake_run, launch_of, launches_of, setup, setup_with};
 use crate::cloud_wake::fakes::{
     AUTH_OK, FakeHost, Gh, SANDBOX, Sbx, install, install_with_sandbox, sandbox_session, serial,
 };
@@ -1203,4 +1203,84 @@ fn a_cloud_sub_agent_row_shows_the_cloud_badge_and_a_local_one_does_not(cx: &mut
     let cloud_badge = row_of(badge(cloud)).expect("the cloud row carries the cloud badge");
     assert!(cloud_row.contains(&cloud_badge.center()));
     assert!(row_of(badge(local)).is_none());
+}
+
+#[gpui::test]
+fn deleting_a_codespace_drops_its_sessions_from_the_window_and_the_sub_agents_panel(
+    cx: &mut TestAppContext,
+) {
+    let (s, _gh, _host, _guard) = cloud_setup(cx, "Available");
+    let id = cloud_session(&s, cx);
+    cx.update(|cx| {
+        s.manager.update(cx, |m, _| {
+            let mono = m.roster.get_mut(&s.id).unwrap();
+            let cwd = mono.projects[0].clone();
+            mono.launches.push(launch_of(id, &cwd));
+        })
+    });
+    let views = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            s.manager
+                .read(cx)
+                .owner
+                .upgrade()
+                .unwrap()
+                .read(cx)
+                .mono_session_views(cx)
+                .iter()
+                .map(|v| v.id)
+                .collect::<Vec<_>>()
+        })
+    };
+    assert!(views(cx).contains(&id), "shown before the delete");
+    let deleted = run(
+        &s,
+        "d1",
+        "cloud.delete",
+        json!({"kind":"codespace","instance":"octo-run"}),
+        cx,
+    )
+    .unwrap();
+    assert_eq!(deleted["deleted"], true, "{deleted}");
+    assert_eq!(deleted["removedSessionIds"], json!([id]), "{deleted}");
+    cx.run_until_parked();
+    assert!(
+        !views(cx).contains(&id),
+        "the panel reads these views: the deleted session is gone"
+    );
+    let launch = launches_of(&s, cx)
+        .into_iter()
+        .find(|l| l.session_id == id)
+        .unwrap();
+    assert!(
+        launch.dismissed,
+        "its launch is dismissed like a deleted session's"
+    );
+}
+
+#[gpui::test]
+fn a_session_whose_codespace_failed_to_start_is_not_working(cx: &mut TestAppContext) {
+    use crate::cloud_start_view::fixtures::{failed, starting};
+    let (s, _gh, _host, _guard) = cloud_setup(cx, "Available");
+    let id = cloud_session(&s, cx);
+    let owner = cx.update(|cx| s.manager.read(cx).owner.upgrade().unwrap());
+    let view = cx
+        .update(|cx| owner.update(cx, |o, cx| o.mono_ensure_session(id, cx)))
+        .unwrap();
+    let state = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            let views = owner.read(cx).mono_session_views(cx);
+            let v = views.iter().find(|v| v.id == id).unwrap();
+            (v.busy, v.start_failed)
+        })
+    };
+    cx.update(|cx| view.update(cx, |v, cx| v.set_cloud_start(Some(starting(2)), cx)));
+    assert_eq!(state(cx), (true, false), "a running start is working");
+    let error = "SSH setup failed: failed to start SSH server";
+    cx.update(|cx| view.update(cx, |v, cx| v.set_cloud_start(Some(failed(5, error)), cx)));
+    assert_eq!(
+        state(cx),
+        (false, true),
+        "a failed start waits for Retry: not working, shown as failed"
+    );
 }
