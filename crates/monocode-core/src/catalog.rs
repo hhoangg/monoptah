@@ -258,7 +258,7 @@ pub fn cached_models_for(kind: Kind, account: &crate::accounts::Profile) -> Opti
         .map(|(_, _, models, _)| models.clone())
 }
 /// Stores a catalog as if it had been discovered, for the app's tests.
-#[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn seed_cached(kind: Kind, account: &crate::accounts::Profile, models: Vec<Model>) {
     let mut cache = cache().lock().unwrap_or_else(|e| e.into_inner());
     cache

@@ -362,8 +362,10 @@ impl Accounts {
                     .justify_end()
                     .gap_1();
                 if preferred == id {
+                    let selector = format!("account-default-badge-{}-{id}", kind.id());
                     controls = controls.child(
                         div()
+                            .debug_selector(move || selector.clone())
                             .mr_1()
                             .text_size(px(10.))
                             .text_color(content(0.3))
@@ -378,6 +380,10 @@ impl Accounts {
                             "pin",
                         )
                         .size_7()
+                        .debug_selector({
+                            let selector = format!("account-set-default-{}-{id}", kind.id());
+                            move || selector.clone()
+                        })
                         .when(self.working, |d| d.opacity(0.5))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.set_default(kind, &default_id, cx)

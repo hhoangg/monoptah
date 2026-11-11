@@ -824,6 +824,9 @@ pub(crate) struct Shell {
     settings: Option<Entity<crate::settings::SettingsView>>,
     settings_events: Option<Subscription>,
     settings_overlay_watch: Option<Subscription>,
+    /// The accounts Settings last discovered model catalogs for, so an account
+    /// update that does not change them (a rename) starts no provider CLI.
+    settings_catalog_accounts: Vec<(Kind, String)>,
     app_search: Option<search::Open>,
     saved_search: Option<(String, monocode_core::search::Scope)>,
     order: Vec<i64>,
@@ -1264,6 +1267,7 @@ impl Shell {
             settings: None,
             settings_events: None,
             settings_overlay_watch: None,
+            settings_catalog_accounts: Vec::new(),
             app_search: None,
             saved_search: None,
             order: Vec::new(),
