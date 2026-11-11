@@ -1802,6 +1802,17 @@ impl CloudSessions {
             &SessionLocation::Cloud(location),
             settings.as_ref(),
         )?;
+        // The transcript divider's date and target. Not needed for correctness: a failure
+        // only leaves the divider without them.
+        let _ = super::move_ui::save_mark(
+            &store,
+            session,
+            &super::move_ui::MoveMark {
+                at_ms: self.now(),
+                backend: workspace.backend,
+                target: workspace.name.clone(),
+            },
+        );
         Ok(())
     }
 

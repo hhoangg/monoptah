@@ -793,6 +793,9 @@ fn a_move_runs_every_step_in_order_and_flips_the_location_last() {
         assert!(note.contains("/workspaces/widgets-wt"));
         // The move is over: no record.
         assert!(move_record(&store, fx.session).is_none());
+        // The transcript divider's date and target are kept.
+        let mark = super::move_ui::move_mark(&store, fx.session).unwrap();
+        assert_eq!(mark.target, "cs1");
     }
     assert!(!fx.staging().exists());
     assert_eq!(fx.host.count("uploads.discard"), 2);

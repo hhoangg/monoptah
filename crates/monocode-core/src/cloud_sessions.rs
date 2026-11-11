@@ -1852,6 +1852,7 @@ pub mod kit_prefs;
 pub mod move_out;
 #[path = "cloud_sessions/move.rs"]
 pub mod move_session;
+pub mod move_ui;
 pub use backend::{CloudBackend, CloudBackendKind, CloudRef, CodespacesBackend};
 
 mod convert;
@@ -1883,6 +1884,8 @@ mod kit_tests;
 mod move_out_tests;
 #[cfg(test)]
 mod move_tests;
+#[cfg(test)]
+mod move_ui_tests;
 #[cfg(test)]
 mod startup_tests;
 #[cfg(test)]
