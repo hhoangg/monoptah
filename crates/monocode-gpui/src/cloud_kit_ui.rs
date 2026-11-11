@@ -281,6 +281,7 @@ pub(crate) mod fixture {
         let file = |name: &str| KitFile {
             path: PathBuf::from("/x").join(name),
             id: None,
+            stamp: None,
             name: PathBuf::from(name),
         };
         inventory.instructions = Some(KitInstructions {

@@ -1,5 +1,7 @@
+#[cfg(unix)]
+use super::move_out::fetch_with_timeout_for_test;
+use super::move_out::snapshot_with_limit_for_test;
 use super::move_out::*;
-use super::move_out::{fetch_with_timeout_for_test, snapshot_with_limit_for_test};
 use std::{
     path::{Path, PathBuf},
     process::Command,
@@ -782,6 +784,41 @@ fn files_over_the_limit_are_refused_before_anything_is_written() {
     assert!(!f._tmp.path().join("s/uncommitted.patch").exists());
     // Under the limit it works.
     assert!(snapshot_with_limit_for_test(&f.work, &f._tmp.path().join("s"), 1 << 20).is_ok());
+}
+
+/// Git re-reads an index entry as new as the index file itself. The scratch copy of the index
+/// must keep the real index's time, or a file rewritten in place with the same size in the
+/// same tick as the last index refresh would be taken as unchanged and its old blob kept.
+#[test]
+fn the_snapshot_sees_a_same_size_rewrite_made_in_the_tick_of_the_last_index_refresh() {
+    use std::time::{Duration, SystemTime};
+    let f = Fixture::new();
+    // Compare size and mtime only, as a filesystem with coarse ctime would.
+    git(&f.work, &["config", "core.trustctime", "false"]);
+    commit_file(&f.work, "same.txt", "aaaa\n");
+    let tick = SystemTime::now() - Duration::from_secs(30);
+    let set_time = |path: &Path| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(tick)
+            .unwrap();
+    };
+    let file = f.work.join("same.txt");
+    set_time(&file);
+    git(&f.work, &["update-index", "--really-refresh"]);
+    // The index was refreshed in the same tick that the file was last written.
+    set_time(&f.work.join(".git/index"));
+    // Same length, same inode, same mtime: only the content differs.
+    std::fs::write(&file, "bbbb\n").unwrap();
+    set_time(&file);
+    let snap = snapshot_with_limit_for_test(&f.work, &f._tmp.path().join("s"), 1 << 20).unwrap();
+    assert_ne!(
+        snap.tree,
+        tree_of_head(&f.work),
+        "the snapshot kept the old content"
+    );
 }
 
 #[test]

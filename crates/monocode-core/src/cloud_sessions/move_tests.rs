@@ -671,12 +671,14 @@ impl Fx {
     }
 
     /// Counts the pushes origin received (a hook appends a line per push).
+    #[cfg(unix)]
     fn count_pushes(&self) -> usize {
         std::fs::read_to_string(self.tmp.path().join("pushes.log"))
             .map(|t| t.lines().count())
             .unwrap_or(0)
     }
 
+    #[cfg(unix)]
     fn install_push_counter(&self) {
         use std::os::unix::fs::PermissionsExt;
         let log = self.tmp.path().canonicalize().unwrap().join("pushes.log");
@@ -715,6 +717,7 @@ impl Fx {
     }
 
     /// A second service over the same store and Host: the app after a restart.
+    #[cfg(unix)]
     fn restarted(&self) -> CloudSessions {
         CloudSessions::new(Arc::new(NoGh), self.host.clone(), self.store.clone())
             .with_backend(self.backend.clone())
@@ -1048,6 +1051,7 @@ fn push_commit_to_branch_cannot_overwrite_a_branch_that_moved() {
 }
 
 #[test]
+#[cfg(unix)]
 fn nothing_is_pushed_when_origin_already_has_the_commit() {
     let fx = Fx::new();
     git(&fx.work, &["push", "-q", "-u", "origin", "feat"]);
@@ -1064,6 +1068,7 @@ fn nothing_is_pushed_when_origin_already_has_the_commit() {
 // ------------------------------------------------------- idempotence and resume
 
 #[test]
+#[cfg(unix)]
 fn a_finished_push_step_is_not_pushed_again_even_if_it_runs_again() {
     let fx = Fx::new();
     fx.install_push_counter();
@@ -1080,6 +1085,7 @@ fn a_finished_push_step_is_not_pushed_again_even_if_it_runs_again() {
 }
 
 #[test]
+#[cfg(unix)]
 fn every_host_step_resumes_where_it_failed_and_earlier_steps_do_not_repeat() {
     // (method that fails once, step that must be marked failed)
     let cases = [
@@ -1963,6 +1969,7 @@ fn a_start_that_failed_resumes_after_a_restart_without_creating_a_second_codespa
 }
 
 #[test]
+#[cfg(unix)]
 fn the_default_branch_is_used_only_when_head_is_origins_tip_and_nothing_is_pushed() {
     let fx = Fx::with(|work| {
         // On `main` exactly at origin's tip, with only uncommitted changes.
@@ -2245,6 +2252,7 @@ fn the_claude_version_check_runs_once_per_move() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_push_can_be_cancelled_and_has_a_time_limit() {
     use std::os::unix::fs::PermissionsExt;
     let fx = Fx::new();

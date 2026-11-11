@@ -625,7 +625,7 @@ impl CloudSessions {
             .map(|p| root.join(p.trim()))
             .ok();
         if let Some(index) = &original_index {
-            let _ = std::fs::copy(index, backup.join("index.orig"));
+            let _ = move_out::copy_index(index, &backup.join("index.orig"));
         }
         let clear = |this: &Self| {
             if let Ok(store) = this.store() {
@@ -730,7 +730,7 @@ impl CloudSessions {
                 ));
             }
             if let Some(index) = &original_index {
-                let _ = std::fs::copy(backup.join("index.orig"), index);
+                let _ = move_out::copy_index(&backup.join("index.orig"), index);
             }
             let undone = undo_files_now();
             return match undone {
@@ -935,7 +935,7 @@ fn seed_index(root: &Path, index: &Path) -> Result<(), String> {
     let _ = std::fs::remove_file(index);
     let text = index.to_string_lossy().into_owned();
     let real = g(root, &["rev-parse", "--git-path", "index"], &[])?;
-    if std::fs::copy(root.join(real.trim()), index).is_ok() {
+    if move_out::copy_index(&root.join(real.trim()), index).is_ok() {
         return Ok(());
     }
     g(

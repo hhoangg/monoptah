@@ -150,6 +150,9 @@ pub struct KitFile {
     /// The canonical path the bytes are read from (inside the item root).
     pub path: PathBuf,
     pub id: Option<(u64, u64)>,
+    /// The size and modification time the scan saw. A replacement file can reuse the freed
+    /// inode (so `id` alone misses it); a different size or time exposes it.
+    pub stamp: Option<(u64, std::time::SystemTime)>,
     /// Where the file sits in the item AS NAMED, relative to the item root: a file reached
     /// through a link inside the item keeps the link's own name, not its target's.
     pub name: PathBuf,
@@ -1011,6 +1014,7 @@ fn walk(
             }
             scan.files.push(KitFile {
                 id: file_id(&meta),
+                stamp: file_stamp(&meta),
                 path,
                 name: rel.join(&*name),
             });
@@ -1038,6 +1042,10 @@ fn link_count(meta: &std::fs::Metadata) -> u64 {
 #[cfg(not(unix))]
 fn link_count(_meta: &std::fs::Metadata) -> u64 {
     1
+}
+/// The size and modification time of a file, when the platform reports the time.
+pub(super) fn file_stamp(meta: &std::fs::Metadata) -> Option<(u64, std::time::SystemTime)> {
+    Some((meta.len(), meta.modified().ok()?))
 }
 #[cfg(unix)]
 fn file_id(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
@@ -1889,7 +1897,7 @@ fn retire_garbage(path: &Path, seen: Option<(u64, u64)>) -> Option<[u8; KEY_BYTE
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn retire_garbage_for_test(
     path: &Path,
     seen: Option<(u64, u64)>,

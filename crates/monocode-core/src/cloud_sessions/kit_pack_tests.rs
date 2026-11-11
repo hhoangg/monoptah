@@ -350,6 +350,22 @@ fn unsendable_names_are_refused_with_a_warning() {
     assert!(valid_server_name("a.b_c@d-e") && !valid_server_name("a b"));
 }
 
+#[test]
+fn a_file_rewritten_to_the_same_size_with_another_time_is_refused() {
+    let env = env();
+    let dir = skill(&env, "review", "# review");
+    let inventory = build_inventory(&env.roots, Workspace::Codespace);
+    // Same inode and same length: only the modification time tells it apart.
+    let path = dir.join("SKILL.md");
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    file.set_modified(later).unwrap();
+    drop(file);
+    let packed = pack(&inventory, &env.roots, &on(), &all_present()).unwrap();
+    assert!(packed.skills.is_empty());
+    assert!(packed.warnings.iter().any(|w| w.contains("changed")));
+}
+
 #[cfg(unix)]
 mod links {
     use super::*;
@@ -474,6 +490,7 @@ mod links {
         inventory.skills[0].files.push(KitFile {
             path: private.clone(),
             id: None,
+            stamp: None,
             name: "stolen.txt".into(),
         });
         let packed = pack(&inventory, &env.roots, &on(), &all_present()).unwrap();
@@ -496,6 +513,7 @@ mod links {
         inventory.skills[0].files.push(KitFile {
             path: big,
             id: None,
+            stamp: None,
             name: "big.bin".into(),
         });
         let packed = pack(&inventory, &env.roots, &on(), &all_present()).unwrap();
@@ -647,11 +665,13 @@ fn files_that_differ_only_in_case_are_refused() {
     files.push(KitFile {
         path: real.join("one.txt"),
         id: None,
+        stamp: None,
         name: "Notes.md".into(),
     });
     files.push(KitFile {
         path: real.join("two.txt"),
         id: None,
+        stamp: None,
         name: "notes.md".into(),
     });
     let packed = pack(&inventory, &env.roots, &on(), &all_present()).unwrap();
@@ -780,8 +800,12 @@ fn the_selection_token_follows_the_instructions_and_the_preference() {
 #[test]
 fn a_file_that_grew_past_the_cap_after_the_scan_is_not_sent() {
     let env = instructions_env();
-    let inventory = build_inventory(&env.roots, Workspace::Codespace);
-    // Same file (device and inode), but it grew after the scan: only the cap check can refuse it.
+    let mut inventory = build_inventory(&env.roots, Workspace::Codespace);
+    // Same file (device and inode), but it grew after the scan. The scan's size and time are
+    // dropped so that only the cap check can refuse it (the stamp would refuse it first).
+    for file in &mut inventory.instructions.as_mut().unwrap().files {
+        file.stamp = None;
+    }
     write(
         &env.roots.claude_home.join("RTK.md"),
         &"x".repeat(300 * 1024),

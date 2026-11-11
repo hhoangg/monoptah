@@ -708,13 +708,29 @@ fn snapshot_in(
     })
 }
 
+/// Copies a git index file and gives the copy the source's modification time. Git trusts an
+/// entry as clean when its file's stat data matches, except an entry as new as the index file
+/// itself, which is re-read ("racily clean"). A copy with a fresh time would make every entry
+/// look old and so trust a file rewritten in place with the same size in the same tick. When
+/// the time cannot be carried over an error is returned, so a caller that only seeds a scratch
+/// index falls back to `read-tree`, which records no stat data at all.
+pub(super) fn copy_index(from: &Path, to: &Path) -> std::io::Result<()> {
+    let modified = std::fs::metadata(from)?.modified()?;
+    // Not `fs::copy`: some platforms keep the source time with it and others do not.
+    std::fs::write(to, std::fs::read(from)?)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(to)?
+        .set_modified(modified)
+}
+
 /// Fills the scratch index: a copy of the real one, or `HEAD`'s tree.
 fn seed_index(root: &Path, scratch: &Scratch, copy: bool) -> Result<(), String> {
     let _ = std::fs::remove_file(&scratch.index);
     if copy {
         let real = git_text(root, &["rev-parse", "--git-path", "index"], None)?;
         let real = root.join(real);
-        if std::fs::copy(&real, &scratch.index).is_ok() {
+        if copy_index(&real, &scratch.index).is_ok() {
             return Ok(());
         }
     }
@@ -946,7 +962,7 @@ fn copy_tree(source: &Path, dest: &Path) -> Result<u64, String> {
     Ok(total)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn fetch_with_timeout_for_test(cwd: &Path, millis: u64) -> Result<(), String> {
     fetch_with_timeout(cwd, Duration::from_millis(millis))
 }

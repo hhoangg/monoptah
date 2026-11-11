@@ -17,8 +17,8 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use super::{
-    credential_file, digest_files, file_id, Exclusion, Guard, KitFile, KitInstructions, KitRoots,
-    KitSource, MAX_IMPORT_DEPTH, MAX_INSTRUCTION_DEPTH, MAX_INSTRUCTION_FILES,
+    credential_file, digest_files, file_id, file_stamp, Exclusion, Guard, KitFile, KitInstructions,
+    KitRoots, KitSource, MAX_IMPORT_DEPTH, MAX_INSTRUCTION_DEPTH, MAX_INSTRUCTION_FILES,
     MAX_INSTRUCTION_FILE_BYTES, MAX_INSTRUCTION_TOTAL_BYTES, SENSITIVE_NAMES,
 };
 
@@ -219,6 +219,7 @@ impl Scan<'_> {
             KitFile {
                 path: real.clone(),
                 id: file_id(&meta),
+                stamp: file_stamp(&meta),
                 name: rel,
             },
         );

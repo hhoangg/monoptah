@@ -43,8 +43,8 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use super::kit::{
-    canonical_json, digest_str, find_secrets, hex, mask_secrets, KitFile, KitInventory, KitRoots,
-    McpCompat, McpScope, Runtime, SecretLocation,
+    canonical_json, digest_str, file_stamp, find_secrets, hex, mask_secrets, KitFile, KitInventory,
+    KitRoots, McpCompat, McpScope, Runtime, SecretLocation,
 };
 use super::kit_prefs::{self, CloudKitPrefs};
 
@@ -563,6 +563,12 @@ fn read_file(file: &KitFile, root: &Path) -> Result<(Vec<u8>, bool), Refusal> {
     }
     let (id, exec) = id_and_mode(&meta);
     if file.id.is_some() && id != file.id {
+        return Err(changed());
+    }
+    if file
+        .stamp
+        .is_some_and(|stamp| Some(stamp) != file_stamp(&meta))
+    {
         return Err(changed());
     }
     if meta.len() > MAX_FILE_BYTES {

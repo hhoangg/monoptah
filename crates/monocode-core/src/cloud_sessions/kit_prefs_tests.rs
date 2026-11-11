@@ -553,6 +553,7 @@ fn the_summary_counts_instructions_only_when_they_are_on_and_carried() {
         files: vec![KitFile {
             path: PathBuf::from("/x/CLAUDE.md"),
             id: None,
+            stamp: None,
             name: PathBuf::from("CLAUDE.md"),
         }],
         size: 3,
