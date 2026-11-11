@@ -175,6 +175,11 @@ impl Shell {
         };
         window.focus(&dialog.focus, cx);
         self.cloud_busy.insert(id);
+        // Stop or Delete of the same workspace from another session must not interleave.
+        let workspace = self.cloud_marks.get(&id).map(|mark| mark.key());
+        if let Some(key) = &workspace {
+            self.cloud_workspaces_busy.insert(key.clone());
+        }
         self.lock_cloud_composer(&[id], true, cx);
         let cloud = self.cloud.clone();
         let run = self.cloud_continue.run.clone();
@@ -214,6 +219,9 @@ impl Shell {
             let result = work.await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.cloud_busy.remove(&id);
+                if let Some(key) = &workspace {
+                    this.cloud_workspaces_busy.remove(key);
+                }
                 this.lock_cloud_composer(&[id], false, cx);
                 this.finish_continue_locally(id, result, window, cx)
             });

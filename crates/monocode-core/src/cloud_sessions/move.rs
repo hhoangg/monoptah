@@ -1747,6 +1747,7 @@ impl CloudSessions {
         store.save_setting(&format!("{NOTE_PREFIX}{session}"), &note)?;
         // The tree this move left behind: the way back applies the cloud work in place only
         // while the local tree is still exactly this (design 4.2.3).
+        store.set_returned_gate(session, None)?;
         store.set_cloud_move_point(
             session,
             &crate::store::MovePoint {

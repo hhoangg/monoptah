@@ -10,7 +10,7 @@ use monocode_core::checkpoint::gate::{self, Gate, Operation};
 use monocode_core::cloud_sessions::LocatedSession;
 
 /// The confirmation text of "Reset to local". It must say what the reset does not do.
-pub(crate) const RESET_CONFIRM: &str = "This stops syncing with the cloud workspace and runs the conversation on this computer again. The messages are not reconciled: anything written in the cloud after the last sync is not copied here, and the local provider session does not know about those cloud turns. The copy in the cloud workspace stays there, but it is no longer a session here, and cloud turns that were not synced are not copied.";
+pub(crate) const RESET_CONFIRM: &str = "This stops syncing with the cloud workspace and runs the conversation on this computer again. The messages are not reconciled: anything written in the cloud after the last sync is not copied here, so the next message starts a new Claude session from a summary of the messages kept here. The copy in the cloud workspace stays there, but it is no longer a session here, and cloud turns that were not synced are not copied.";
 
 /// Added to the confirmation when the cloud copy may hold turns that were not copied here, or
 /// that cannot be known (the Host is unreachable).
@@ -27,6 +27,8 @@ impl EventEmitter<CloudLocationReset> for Conversation {}
 #[derive(Default)]
 pub(super) struct State {
     pub(super) located: Option<LocatedSession>,
+    /// Turns before this row came back through a new worktree or Claude id (rewind gate).
+    pub(super) returned_gate: Option<usize>,
     /// "Reset to local" was clicked and the confirmation is showing. Nothing is reset until
     /// it is confirmed.
     pub(super) confirming: bool,
@@ -71,6 +73,13 @@ impl Conversation {
             .update(cx, |transcript, cx| transcript.set_cloud_move(moved, cx));
         cx.notify();
     }
+    /// The shell tells where the session came back through a new place (or `None`).
+    pub(crate) fn set_returned_gate(&mut self, before: Option<usize>, cx: &mut Context<Self>) {
+        if self.cloud_location.returned_gate != before {
+            self.cloud_location.returned_gate = before;
+            cx.notify();
+        }
+    }
     /// The move point the shell last pushed in, for tests.
     #[cfg(test)]
     pub(crate) fn cloud_move_for_test(&self) -> Option<usize> {
@@ -78,6 +87,9 @@ impl Conversation {
     }
     /// Whether `operation` may start at store row `row` of this session.
     pub(super) fn rewind_gate(&self, operation: Operation, row: usize) -> Gate {
+        if self.cloud_location.located.is_none() {
+            return gate::gate_returned(self.cloud_location.returned_gate, row);
+        }
         gate::gate_at(
             self.cloud_location.located.as_ref().map(|l| l.moved_at_row),
             operation,
@@ -407,6 +419,21 @@ mod tests {
             assert!(!chat.confirm_reset_to_local(cx));
             assert!(chat.cloud_location.located.is_some(), "still cloud");
             assert!(chat.status.contains("turn is running"), "{}", chat.status);
+        });
+    }
+    #[gpui::test]
+    fn turns_before_a_return_through_a_new_place_cannot_be_rewound(cx: &mut TestAppContext) {
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let session = store.create("claude", "/Users/me/repo").unwrap();
+        let chat = cx.new(|cx| Conversation::new(session, Arc::new(Mutex::new(store)), cx));
+        chat.update(cx, |chat, cx| {
+            assert!(chat.rewind_gate(Operation::EditLastTurn, 0).is_allowed());
+            chat.set_returned_gate(Some(4), cx);
+            assert_eq!(
+                chat.rewind_gate(Operation::EditLastTurn, 3).reason(),
+                Some(gate::BEFORE_RETURN)
+            );
+            assert!(chat.rewind_gate(Operation::EditLastTurn, 4).is_allowed());
         });
     }
     #[test]

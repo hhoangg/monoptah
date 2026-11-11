@@ -12,8 +12,8 @@
 //!   rows and of the JSONL (R2). An operation that would rewrite local rows or the local
 //!   JSONL (edit the last turn, fork) is disabled there too. An operation that only acts on
 //!   files (restore) rewrites neither, so it stays allowed after the move point.
-//! * A Local session is never gated here. Once the session is back from the cloud the move
-//!   point is gone with the location, so older turns are gated again by F4-5, not here.
+//! * A Local session is gated here only by [`gate_returned`]: when it came back through a new
+//!   worktree or a new Claude id, the turns up to that return are disabled.
 use crate::store::SessionLocation;
 
 /// A rewind-like operation of the app.
@@ -39,6 +39,21 @@ pub const BEFORE_MOVE: &str = "This turn ran on this computer before the convers
 
 /// Why an operation that rewrites the history is disabled while the session is in the cloud.
 pub const CLOUD_OWNED: &str = "This conversation is in the cloud. Its messages are written from the cloud workspace, so they cannot be edited or forked from this computer.";
+
+/// Why an operation on a turn from before a return through a new worktree or a new Claude id
+/// is disabled.
+pub const BEFORE_RETURN: &str = "This turn ran in another folder or under another Claude session than this conversation uses now. Its file history describes that other place, so it cannot be rewound here.";
+
+/// [`gate_at`] for a session that came back from the cloud through a new worktree or a new
+/// Claude id (`Store::returned_gate`): turns before `before` are disabled for every
+/// operation, later ones are ordinary local turns. `None` (including an in-place return,
+/// where the folder is the same) gates nothing.
+pub fn gate_returned(before: Option<usize>, row: usize) -> Gate {
+    match before {
+        Some(before) if row < before => Gate::Disabled(BEFORE_RETURN),
+        _ => Gate::Allowed,
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Gate {
@@ -96,6 +111,13 @@ mod tests {
             moved_at_row,
             pushed_branch: None,
         })
+    }
+
+    #[test]
+    fn turns_before_a_return_through_a_new_place_are_disabled() {
+        assert!(gate_returned(None, 0).is_allowed());
+        assert_eq!(gate_returned(Some(5), 4).reason(), Some(BEFORE_RETURN));
+        assert!(gate_returned(Some(5), 5).is_allowed());
     }
 
     #[test]

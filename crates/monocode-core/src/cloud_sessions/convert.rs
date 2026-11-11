@@ -354,6 +354,9 @@ pub enum Resume {
     Missing(String),
 }
 
+/// Internal marker: the sandbox of a moved session was recreated (see `continue_locally`).
+pub(super) const SANDBOX_RECREATED: &str = "sandbox recreated";
+
 /// What a conversion is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Mode {
@@ -755,9 +758,14 @@ impl CloudSessions {
                             "The sandbox cannot be reached ({error}). Start it again and retry."
                         )));
                     }
+                    // The conversation that ran in the old container is gone: for a moved
+                    // session that is the lost-workspace case (new Claude id, summary).
+                    Err(docker_start::ReconnectError::Recreated) if mode.moved().is_some() => {
+                        return Err(ConvertError::Failed(SANDBOX_RECREATED.into()));
+                    }
                     Err(docker_start::ReconnectError::Recreated) if mode.continuing() => {
                         return Err(ConvertError::Failed(
-                            "The sandbox was recreated, so the conversation that ran there is gone. Reset to local to continue from this computer."
+                            "The sandbox was recreated, so the conversation that ran there is gone. Archive its files only from the archive dialog."
                                 .into(),
                         ));
                     }
@@ -810,6 +818,10 @@ impl CloudSessions {
             } else {
                 progress("Reading the conversation");
                 let value = read(machine.as_ref().ok_or_else(no_machine)?)?;
+                // Whatever the flags said, a turn the Host is running now is a second writer.
+                if mode.continuing() && value["status"] == "running" {
+                    return Err(ConvertError::Failed(crate::store::HOST_TURN_RUNNING.into()));
+                }
                 // Turns the cloud wrote since the last sync are copied first, so the local
                 // rows hold everything before the transcript and the code are touched.
                 if let Some(local) = mode.moved() {
@@ -1165,6 +1177,11 @@ impl CloudSessions {
                 .thread_dir(local_id)?
                 .ok_or("This store keeps no session folders.")?;
             let dir = local_thread.join(CODESPACE_DIR);
+            if mode.continuing() {
+                // Every return works in a fresh folder: the files of an earlier return
+                // (patches, restored.json) must never be applied or consulted again.
+                let _ = std::fs::remove_dir_all(&dir);
+            }
             std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
             // Claude's raw transcript is always kept, whatever happens to the install below.
             if snap.jsonl {
@@ -1290,7 +1307,7 @@ impl CloudSessions {
                 // The code lands (in place or in a new worktree) before the transcript, because
                 // Claude finds a session by the folder it runs in; and both land before the
                 // cloud record is retired: a failure leaves the session in the cloud.
-                let (notes, cwd) = self.place_code(
+                let (notes, cwd, in_place) = self.place_code(
                     mode,
                     local_id,
                     local_project,
@@ -1298,7 +1315,17 @@ impl CloudSessions {
                     tombstone.as_ref().map_or("", |(_, host)| host.as_str()),
                 )?;
                 warnings.extend(notes);
-                install(&cwd, warnings)?
+                let resume = install(&cwd, warnings)?;
+                // Turns that ran in another folder or under another Claude id cannot be
+                // rewound from here (their checkpoints describe other directories).
+                if let Some(local) = mode.moved() {
+                    let started_over = matches!(resume, Resume::Forked(_) | Resume::Missing(_));
+                    if !in_place || started_over {
+                        let count = self.store()?.load(local)?.rows.len();
+                        self.store()?.set_returned_gate(local, Some(count))?;
+                    }
+                }
+                resume
             } else {
                 self.store()?.set_archived(local_id, true)?;
                 early.ok_or("internal: no transcript result")?
@@ -1315,7 +1342,7 @@ impl CloudSessions {
             if let Some(local) = mode.moved() {
                 // One-way, like Reset to local: the Host copy is tombstoned and the location
                 // goes back to Local in the same call.
-                store.leave_cloud(local)?;
+                store.leave_cloud_inner(local, false)?;
                 // Past the point of no return: bookkeeping failures cannot undo the return.
                 let _ = store.clear_cloud_move_point(local);
                 let _ = store.set_cloud_continue_progress(local, "");
@@ -1371,6 +1398,8 @@ impl CloudSessions {
                     }
                     if created {
                         let _ = store.delete(local_id);
+                        // Ids are reused: nothing of this attempt may be inherited.
+                        let _ = store.set_cloud_continue_progress(local_id, "");
                     }
                 }
                 undo_install(self);

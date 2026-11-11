@@ -41,6 +41,11 @@ fn tree_of(dir: &Path) -> String {
 /// linked, the location Cloud, the move point recorded, and the pre-move Claude file on disk.
 /// The cloud's turns are NOT mirrored yet (the Host holds them).
 fn moved(w: &World) -> i64 {
+    moved_in(w, &w.project)
+}
+
+/// [`moved`] for a session that works in `work` (maybe a subfolder of the repository).
+fn moved_in(w: &World, work: &Path) -> i64 {
     let local = {
         let mut store = w.svc.store().unwrap();
         let session = store.create("claude", w.project.to_str().unwrap()).unwrap();
@@ -61,8 +66,8 @@ fn moved(w: &World) -> i64 {
     let point = MovePoint {
         host_session_id: "host-1".into(),
         head,
-        tree: tree_of(&w.project),
-        work_cwd: w.project.to_str().unwrap().into(),
+        tree: tree_of(work),
+        work_cwd: work.to_str().unwrap().into(),
     };
     let store = w.svc.store().unwrap();
     store
@@ -488,4 +493,243 @@ fn the_archive_flow_still_archives() {
             .archived
     );
     assert!(store.remote_session(w.cloud_id).unwrap().is_none());
+}
+
+#[test]
+fn a_session_in_a_subfolder_gets_the_whole_cloud_state_and_loses_nothing() {
+    let w = world(true);
+    // The local project gets a subfolder commit that the cloud also has.
+    std::fs::create_dir_all(w.project.join("sub")).unwrap();
+    std::fs::write(w.project.join("sub/x.txt"), "x\n").unwrap();
+    git(&w.project, &["add", "."]);
+    git(&w.project, &["commit", "-q", "-m", "sub"]);
+    git(&w.project, &["push", "-q", "origin", "main"]);
+    git(&w.ws, &["fetch", "-q", "origin"]);
+    git(&w.ws, &["merge", "-q", "--no-edit", "origin/main"]);
+    let local = moved_in(&w, &w.project.join("sub"));
+    let done = run(&w, local).unwrap();
+    assert!(
+        done.warnings.iter().any(|n| n.contains("applied to")),
+        "{:?}",
+        done.warnings
+    );
+    // Files OUTSIDE the subfolder carry the cloud state too (the bug applied from sub/ only).
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("a.txt")).unwrap(),
+        "one\ntwo\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("untracked.txt")).unwrap(),
+        "new file\n"
+    );
+    assert!(w.project.join("made.txt").is_file());
+    assert_eq!(
+        git(
+            &w.project,
+            &["status", "--porcelain", "--untracked-files=no"]
+        )
+        .lines()
+        .count(),
+        2
+    );
+}
+
+#[test]
+fn an_ignored_local_file_in_the_way_falls_back_to_a_worktree_and_is_kept() {
+    let w = world(true);
+    let local = moved(&w);
+    // Ignored, so the tree check passes; the cloud patch adds a file of the same name.
+    std::fs::write(w.project.join(".git/info/exclude"), "untracked.txt\n").unwrap();
+    std::fs::write(w.project.join("untracked.txt"), "mine\n").unwrap();
+    run(&w, local).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("untracked.txt")).unwrap(),
+        "mine\n"
+    );
+    assert_eq!(
+        git(&w.project, &["log", "-1", "--format=%s"]),
+        "base",
+        "rolled back and verified"
+    );
+    let settings = w
+        .svc
+        .store()
+        .unwrap()
+        .agent_settings(local)
+        .unwrap()
+        .unwrap();
+    assert!(settings.worktree_cwd.is_some());
+    // No backup is left behind after a verified rollback.
+    let thread = w.svc.store().unwrap().thread_dir(local).unwrap().unwrap();
+    let leftovers = std::fs::read_dir(&thread)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("pre-continue"))
+        .count();
+    assert_eq!(leftovers, 0);
+}
+
+#[test]
+fn files_of_an_earlier_return_are_never_reused_and_the_restore_offer_is_consumed() {
+    let w = world(true);
+    let local = moved(&w);
+    let thread = w.svc.store().unwrap().thread_dir(local).unwrap().unwrap();
+    let stale = thread.join(CODESPACE_DIR);
+    std::fs::create_dir_all(stale.join(PATCHES)).unwrap();
+    std::fs::write(stale.join(RESTORED), r#"{"status":"done"}"#).unwrap();
+    std::fs::write(stale.join(PATCH), "garbage that must never be applied").unwrap();
+    std::fs::write(stale.join(PATCHES).join("0001.patch"), "garbage").unwrap();
+    run(&w, local).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("a.txt")).unwrap(),
+        "one\ntwo\n"
+    );
+    let store = w.svc.store().unwrap();
+    assert!(
+        pending_restore_for(&store, local).is_none(),
+        "no second restore is offered"
+    );
+}
+
+#[test]
+fn a_crash_after_the_apply_is_detected_on_retry_instead_of_forking_a_worktree() {
+    let w = world(true);
+    let local = moved(&w);
+    // The cloud state is already here (the previous attempt applied it, then died).
+    git(
+        &w.project,
+        &["fetch", "-q", w.ws.to_str().unwrap(), "feat/x"],
+    );
+    git(&w.project, &["merge", "-q", "--ff-only", "FETCH_HEAD"]);
+    std::fs::write(w.project.join("a.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(w.project.join("bin.dat"), [9u8, 8, 7, 0]).unwrap();
+    std::fs::write(w.project.join("untracked.txt"), "new file\n").unwrap();
+    let done = run(&w, local).unwrap();
+    assert!(
+        done.warnings.iter().any(|n| n.contains("already applied")),
+        "{:?}",
+        done.warnings
+    );
+    let settings = w
+        .svc
+        .store()
+        .unwrap()
+        .agent_settings(local)
+        .unwrap()
+        .unwrap_or_default();
+    assert!(settings.worktree_cwd.is_none());
+}
+
+#[test]
+fn a_broken_earlier_attempt_blocks_a_retry_and_keeps_the_backup() {
+    let w = world(true);
+    let local = moved(&w);
+    let backup = w.root.join("kept-backup");
+    std::fs::create_dir_all(&backup).unwrap();
+    std::fs::write(backup.join("changes.patch"), "x").unwrap();
+    let marker = serde_json::json!({
+        "root": w.project, "backup": backup, "head": git(&w.project, &["rev-parse", "HEAD"]),
+        "tree": "0000000000000000000000000000000000000000", "patch": null
+    });
+    w.svc
+        .store()
+        .unwrap()
+        .set_cloud_continue_broken(local, &marker.to_string())
+        .unwrap();
+    let error = run(&w, local).unwrap_err().to_string();
+    assert!(error.contains("kept-backup"), "{error}");
+    assert!(
+        backup.join("changes.patch").is_file(),
+        "the backup is never deleted"
+    );
+    let store = w.svc.store().unwrap();
+    assert!(store.cloud_location(local).unwrap().is_cloud());
+    assert!(store.cloud_continue_broken(local).is_some());
+}
+
+#[test]
+fn a_sync_error_does_not_hide_a_running_cloud_turn() {
+    let w = world(true);
+    let local = moved(&w);
+    {
+        let store = w.svc.store().unwrap();
+        store
+            .record_cloud_sync_error(local, "Host unreachable")
+            .unwrap();
+        let (_, mut record) = store.linked_remote_session(local).unwrap().unwrap();
+        record.running = true;
+        record.flags_at = crate::time::now_ms();
+        store.save_remote_session(&record).unwrap();
+    }
+    assert_eq!(
+        run(&w, local).unwrap_err().to_string(),
+        crate::store::HOST_TURN_RUNNING
+    );
+    assert!(w.host.log.lock().unwrap().is_empty());
+}
+
+#[test]
+fn reset_with_cloud_turns_starts_a_new_claude_session_instead_of_resuming_the_stale_file() {
+    let w = world(true);
+    let local = moved(&w);
+    let snapshot = {
+        let mut s = w.host.snapshot.clone();
+        crate::remote::attachments::qualify_snapshot(&mut s, "env-1", "host-1");
+        s
+    };
+    w.svc
+        .store()
+        .unwrap()
+        .append_remote_rows(local, &snapshot)
+        .unwrap();
+    w.svc.store().unwrap().leave_cloud(local).unwrap();
+    let store = w.svc.store().unwrap();
+    assert_eq!(
+        summary_provider(&store, local),
+        None,
+        "no stale id to resume"
+    );
+    assert!(store
+        .agent_settings(local)
+        .unwrap()
+        .unwrap()
+        .handoff
+        .is_some());
+    assert_eq!(
+        store.returned_gate(local),
+        Some(store.load(local).unwrap().rows.len())
+    );
+}
+
+#[test]
+fn a_return_through_a_worktree_gates_older_turns_and_an_in_place_one_does_not() {
+    let w = world(true);
+    let local = moved(&w);
+    std::fs::write(w.project.join("a.txt"), "my own edit\n").unwrap();
+    run(&w, local).unwrap();
+    let store = w.svc.store().unwrap();
+    let rows = store.load(local).unwrap().rows.len();
+    assert_eq!(store.returned_gate(local), Some(rows));
+    drop(store);
+    let w = world(true);
+    let local = moved(&w);
+    run(&w, local).unwrap();
+    assert_eq!(w.svc.store().unwrap().returned_gate(local), None);
+}
+
+#[test]
+fn deleting_a_session_forgets_its_return_state() {
+    let w = world(true);
+    let local = moved(&w);
+    {
+        let mut store = w.svc.store().unwrap();
+        store.set_cloud_continue_progress(local, "{}").unwrap();
+        store.set_returned_gate(local, Some(3)).unwrap();
+        store.set_cloud_continue_broken(local, "{}").unwrap();
+        store.delete(local).unwrap();
+        assert!(store.cloud_continue_progress(local).is_none());
+        assert!(store.cloud_move_point(local).is_none());
+        assert_eq!(store.returned_gate(local), None);
+        assert!(store.cloud_continue_broken(local).is_none());
+    }
 }
