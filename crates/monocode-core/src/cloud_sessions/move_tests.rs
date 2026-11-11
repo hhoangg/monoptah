@@ -900,7 +900,9 @@ fn the_same_claude_id_reaches_sessions_import_with_from_cwds() {
         from.contains(&fx.work.to_string_lossy().into_owned()),
         "{from:?}"
     );
-    assert!(from.iter().all(|p| p.starts_with('/')));
+    assert!(from
+        .iter()
+        .all(|p| p.starts_with('/') || Path::new(p).is_absolute()));
     assert!(import["uploadId"].as_str().is_some());
     assert_eq!(import["model"], "claude:default");
 }
@@ -956,7 +958,14 @@ fn a_push_is_never_forced_and_a_diverged_branch_goes_to_the_cloud_branch() {
     let other = fx.tmp.path().join("other");
     git(
         fx.tmp.path(),
-        &["clone", "-q", fx.origin.to_str().unwrap(), "other"],
+        &[
+            "clone",
+            "-q",
+            "-c",
+            "core.autocrlf=false",
+            fx.origin.to_str().unwrap(),
+            "other",
+        ],
     );
     configure(&other);
     git(&other, &["checkout", "-q", "-b", "feat", "origin/main"]);
@@ -2206,9 +2215,11 @@ fn from_cwds_also_names_the_folders_the_transcript_itself_uses() {
         .join(encode(&fx.work))
         .join(format!("{CLAUDE_ID}.jsonl"));
     let text = std::fs::read_to_string(&jsonl).unwrap();
+    // The path as it is written inside the JSON lines (backslashes escaped on Windows).
+    let in_json = serde_json::to_string(&*fx.work.to_string_lossy()).unwrap();
     std::fs::write(
         &jsonl,
-        text.replace(&*fx.work.to_string_lossy(), "/old/worktree"),
+        text.replace(in_json.trim_matches('"'), "/old/worktree"),
     )
     .unwrap();
     fx.run().0.unwrap();
@@ -2582,6 +2593,48 @@ fn transcript_folders_inside_other_roots_are_not_sent_to_the_host() {
     assert!(!from.contains(&"/old/wt/pkg".to_string()), "{from:?}");
     assert!(!from.contains(&sub), "{from:?}");
     assert!(from.contains(&work));
+}
+
+#[test]
+fn only_folder_forms_the_host_accepts_are_sent_as_from_cwds() {
+    let fx = Fx::new();
+    let jsonl = fx
+        .home
+        .join("projects")
+        .join(encode(&fx.work))
+        .join(format!("{CLAUDE_ID}.jsonl"));
+    let line = |uuid: &str, cwd: &str| {
+        format!(
+            "{}\n",
+            json!({"type": "user", "uuid": uuid, "sessionId": CLAUDE_ID, "cwd": cwd, "version": "2.1.321"})
+        )
+    };
+    std::fs::write(
+        &jsonl,
+        format!(
+            "{}{}{}{}",
+            line("e1", r"\\server\share\p"),
+            line("e2", r"\\?\C:\verbatim"),
+            line("e3", "C:/drive/slash"),
+            line("e4", "/old/wt")
+        ),
+    )
+    .unwrap();
+    fx.run().0.unwrap();
+    let from: Vec<String> = fx.host.calls("sessions.import")[0]["fromCwds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(from.contains(&"/old/wt".to_string()), "{from:?}");
+    assert!(!from.iter().any(|p| p.starts_with(r"\\")), "{from:?}");
+    // A drive path is a folder only where drive paths exist.
+    assert_eq!(
+        from.contains(&"C:/drive/slash".to_string()),
+        cfg!(windows),
+        "{from:?}"
+    );
 }
 
 #[test]
@@ -3063,7 +3116,14 @@ fn an_api_move_follows_the_same_push_rules_as_the_dialog() {
     let other = fx.tmp.path().join("other");
     git(
         fx.tmp.path(),
-        &["clone", "-q", fx.origin.to_str().unwrap(), "other"],
+        &[
+            "clone",
+            "-q",
+            "-c",
+            "core.autocrlf=false",
+            fx.origin.to_str().unwrap(),
+            "other",
+        ],
     );
     configure(&other);
     git(&other, &["checkout", "-q", "-b", "feat", "origin/main"]);

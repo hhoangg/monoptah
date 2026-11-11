@@ -83,7 +83,14 @@ impl Fixture {
         if !other.exists() {
             git(
                 self._tmp.path(),
-                &["clone", "-q", self.origin.to_str().unwrap(), "other"],
+                &[
+                    "clone",
+                    "-q",
+                    "-c",
+                    "core.autocrlf=false",
+                    self.origin.to_str().unwrap(),
+                    "other",
+                ],
             );
             configure(&other);
         }
@@ -559,7 +566,14 @@ fn the_patch_rebuilds_the_tree_on_a_fresh_clone() {
     let remote = f._tmp.path().join("remote");
     git(
         f._tmp.path(),
-        &["clone", "-q", f.origin.to_str().unwrap(), "remote"],
+        &[
+            "clone",
+            "-q",
+            "-c",
+            "core.autocrlf=false",
+            f.origin.to_str().unwrap(),
+            "remote",
+        ],
     );
     configure(&remote);
     assert_eq!(git(&remote, &["rev-parse", "HEAD"]), snap.head);
@@ -621,7 +635,14 @@ fn rebuilt_tree(f: &Fixture, patch: &Path, name: &str) -> String {
     let clone = f._tmp.path().join(name);
     git(
         f._tmp.path(),
-        &["clone", "-q", f.origin.to_str().unwrap(), name],
+        &[
+            "clone",
+            "-q",
+            "-c",
+            "core.autocrlf=false",
+            f.origin.to_str().unwrap(),
+            name,
+        ],
     );
     configure(&clone);
     git(&clone, &["apply", "--binary", patch.to_str().unwrap()]);
@@ -821,6 +842,7 @@ fn the_snapshot_sees_a_same_size_rewrite_made_in_the_tick_of_the_last_index_refr
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_relative_staging_path_works() {
     let f = Fixture::new();

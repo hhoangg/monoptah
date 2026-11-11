@@ -2250,7 +2250,7 @@ fn transcript_cwds(file: &Path) -> Vec<String> {
         if let Some(cwd) = serde_json::from_str::<Value>(&line)
             .ok()
             .and_then(|entry| entry["cwd"].as_str().map(str::to_owned))
-            .filter(|cwd| cwd.starts_with('/') && cwd.len() > 1 && !cwd.contains('\0'))
+            .filter(|cwd| host_absolute(cwd) && cwd.len() > 1 && !cwd.contains('\0'))
         {
             if !found.contains(&cwd) && found.len() < 4 {
                 found.push(cwd);
@@ -2260,7 +2260,25 @@ fn transcript_cwds(file: &Path) -> Vec<String> {
     found
 }
 
+/// The absolute forms the Host accepts for a folder: a posix path, or (from a Windows
+/// transcript) a drive path such as `C:\x` or `C:/x`. UNC and verbatim paths are not accepted.
+fn host_absolute(cwd: &str) -> bool {
+    let drive =
+        matches!(cwd.as_bytes(), [letter, b':', b'\\' | b'/', ..] if letter.is_ascii_alphabetic());
+    cwd.starts_with('/') || (cfg!(windows) && drive)
+}
+
+#[cfg(not(windows))]
 fn is_inside(path: &str, root: &str) -> bool {
+    let root = root.trim_end_matches('/');
+    path == root || path.starts_with(&format!("{root}/"))
+}
+
+/// Windows: `/` and `\` are the same separator and letters compare without case.
+#[cfg(windows)]
+fn is_inside(path: &str, root: &str) -> bool {
+    let plain = |text: &str| text.replace('\\', "/").to_ascii_lowercase();
+    let (path, root) = (plain(path), plain(root));
     let root = root.trim_end_matches('/');
     path == root || path.starts_with(&format!("{root}/"))
 }
