@@ -725,6 +725,12 @@ pub(crate) struct Shell {
     panel_modes: HashMap<i64, crate::panel_root::PanelMode>,
     /// The card for the cloud file being read or downloaded.
     cloud_view: Option<cloud_view::CloudView>,
+    /// File opens waiting for the Host update of their cloud session.
+    queued_cloud_opens: cloud_view::OpenQueue,
+    /// A connect of this session finished while opens were queued: the next render flushes them.
+    cloud_open_due: Option<i64>,
+    /// The pane last seen by the render, to notice a switch.
+    cloud_open_watch: Option<i64>,
     cloud_states: HashMap<String, monocode_core::cloud_sessions::CloudState>,
     /// Converted local sessions and the codespace each came from, and which of those no longer
     /// exist.
@@ -1194,6 +1200,9 @@ impl Shell {
             claude_setups: Default::default(),
             panel_modes: HashMap::new(),
             cloud_view: None,
+            queued_cloud_opens: cloud_view::OpenQueue::default(),
+            cloud_open_due: None,
+            cloud_open_watch: None,
             cloud_states: HashMap::new(),
             cloud_origins: HashMap::new(),
             cloud_located: HashMap::new(),
@@ -4572,6 +4581,9 @@ impl Shell {
         }
     }
     fn activate_session(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        // Any pane or session switch, a Mono or terminal pane included, drops the queued opens
+        // of the others and stops a queued stream.
+        self.leave_queued_cloud_opens(Some(id), cx);
         if self.workspace.review_owners.contains_key(&id) {
             self.open_file_pane(id, window, cx);
             return;
@@ -8976,6 +8988,16 @@ impl Render for Shell {
             let this = cx.entity();
             window.defer(cx, move |window, cx| {
                 this.update(cx, |this, cx| this.open_cloud_archive(ids, window, cx));
+            });
+        }
+        if self.cloud_open_watch != self.workspace.active {
+            self.cloud_open_watch = self.workspace.active;
+            self.note_active_session(cx);
+        }
+        if let Some(id) = self.cloud_open_due {
+            let this = cx.entity();
+            window.defer(cx, move |window, cx| {
+                this.update(cx, |this, cx| this.flush_queued_cloud_opens(id, window, cx));
             });
         }
         if self.mono_panes_unsettled(cx) {

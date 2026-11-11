@@ -906,6 +906,9 @@ impl Shell {
         }
         self.sync_cloud_stopped(cx);
         self.invalidate_chrome(cx);
+        if self.queued_cloud_opens.has(id) {
+            self.cloud_open_due = Some(id);
+        }
         if self.cloud_refreshing {
             self.cloud_refresh_again = true;
         } else {

@@ -462,6 +462,12 @@ pub trait Host: Send + Sync {
             &described,
         ))
     }
+    /// Where the Host update of this machine stands, for a file only a newer Host can send.
+    /// The default knows nothing, so a cloud Host is said to update at its next connect.
+    fn host_update(&self, machine_id: &str) -> view::HostUpdate {
+        let _ = machine_id;
+        view::HostUpdate::NextConnect
+    }
     /// Phase 2 of the cloud Host upgrade (see [`remote::host_upgrade`]): replaces an older or
     /// foreign Host when nothing runs on it, else marks the machine for the next connect.
     /// Only a user-initiated connect or start flow may call it. Never fails: a warning is a
@@ -516,6 +522,15 @@ impl Host for Arc<Connections> {
         match Connections::host_info(self, machine_id) {
             Some(info) => Ok(info),
             None => self.describe_host(machine_id),
+        }
+    }
+    fn host_update(&self, machine_id: &str) -> view::HostUpdate {
+        if let Some(warning) = self.host_upgrade_failure(machine_id) {
+            view::HostUpdate::Failed(warning)
+        } else if self.host_upgrade_pending(machine_id) {
+            view::HostUpdate::Pending
+        } else {
+            view::HostUpdate::NextConnect
         }
     }
     fn upgrade_host(
