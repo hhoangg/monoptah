@@ -619,6 +619,7 @@ impl Shell {
                 );
             }
             items.extend(self.telegram_topic_item(id, cx));
+            items.extend(self.cloud_move_menu_item(id));
         }
         items.extend([
             MenuAction::new("reminder", "Remind me")
@@ -684,6 +685,7 @@ impl Shell {
         let ids = self.session_menu_ids(id, cx);
         match action {
             "codespace-restore" => self.restore_codespace_code(id, cx),
+            "continue-in-cloud" => self.open_cloud_move(id, window, cx),
             "codespace-stop" => {
                 self.run_origin_codespace_action(id, cloud::ArchiveChoice::Stop, window, cx)
             }
@@ -1157,6 +1159,7 @@ impl Shell {
             self.preview_close = None;
         }
         self.drop_cloud_start(id);
+        self.drop_cloud_move(id);
         self.sessions.remove(&id);
         self.stop_tui(id, cx);
         self.session_summaries.remove(&id);

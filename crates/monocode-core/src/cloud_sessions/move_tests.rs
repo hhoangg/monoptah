@@ -793,6 +793,9 @@ fn a_move_runs_every_step_in_order_and_flips_the_location_last() {
         assert!(note.contains("/workspaces/widgets-wt"));
         // The move is over: no record.
         assert!(move_record(&store, fx.session).is_none());
+        // The transcript divider's date and target are kept.
+        let mark = super::move_ui::move_mark(&store, fx.session).unwrap();
+        assert_eq!(mark.target, "cs1");
     }
     assert!(!fx.staging().exists());
     assert_eq!(fx.host.count("uploads.discard"), 2);
@@ -800,6 +803,12 @@ fn a_move_runs_every_step_in_order_and_flips_the_location_last() {
     assert_eq!(outcome.provider_session_id.as_deref(), Some(CLAUDE_ID));
     assert!(!outcome.forked);
     assert!(matches!(events.last(), Some(MoveEvent::Done(_))));
+    // The flip is announced before the cleanup, so the UI can reload the settings at once.
+    let before_done = &events[events.len() - 2];
+    assert!(
+        matches!(before_done, MoveEvent::Updated(r) if r.done.contains(&MoveStep::Flip)),
+        "{before_done:?}"
+    );
     // Local runs are refused from now on (single writer).
     assert!(fx
         .store

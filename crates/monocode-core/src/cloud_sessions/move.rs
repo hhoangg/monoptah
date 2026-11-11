@@ -87,13 +87,17 @@ pub const NOTE_PREFIX: &str = "cloud-move-note:";
 pub const MOVE_ABORTED: &str = "The move to the cloud was cancelled.";
 /// Why a move is refused while a turn runs.
 pub const MOVE_RUNNING: &str = "This conversation is already being moved: a move is running.";
+/// The warning of the report `cancel_move` returns while a run is still going: the run itself
+/// rolls back and then sends [`MoveEvent::Cancelled`].
+pub const MOVE_STOPPING: &str =
+    "The move is stopping. It is rolled back when the current step ends.";
 pub const BUSY: &str =
     "A turn is running in this conversation. Wait for it to finish, then continue in the cloud.";
 /// Why a flip is refused when the local session moved on after the snapshot.
 pub const CHANGED_AFTER_START: &str =
     "Your local session changed after the move started. Cancel this move and move again.";
 const ALREADY_MOVING: &str = "This conversation is already being moved to the cloud.";
-const NO_MOVE: &str = "No move to the cloud is in progress for this conversation.";
+pub const NO_MOVE: &str = "No move to the cloud is in progress for this conversation.";
 const STAGING: &str = "cloud-move";
 /// Capabilities the Host must announce (`environment.describe`) before a move uploads anything.
 const CAPABILITIES: [&str; 3] = ["workspace.applySnapshot", "sessions.import", "uploads"];
@@ -831,6 +835,8 @@ impl CloudSessions {
         // The flip is over: remember it before the cleanup, so a crash in the cleanup is not
         // read as a move that is still to be done (a Cancel would delete the live session).
         save_record(&*self.store()?, &record)?;
+        // Tells the UI the location is Cloud now (before the slow cleanup in `finish_move`).
+        events(MoveEvent::Updated(record.clone()));
         let outcome = self.finish_move(&record)?;
         events(MoveEvent::Done(outcome.clone()));
         Ok(outcome)
@@ -906,9 +912,12 @@ impl CloudSessions {
         }
         let anchor = self.store()?.row_anchor(record.session_id)?;
         events(MoveEvent::Log("Reading the local git state".into()));
+        // One git inspection of a project at a time: the dialog's preview takes the same lock.
+        let _inspect = super::move_ui::project_guard(&work);
         move_out::fetch_origin(&work)?;
         let target = move_out::push_target(&work)?;
         let snapshot = move_out::snapshot(&work, &staging)?;
+        drop(_inspect);
         record.head = snapshot.head.clone();
         record.tree = snapshot.tree.clone();
         record.branch = target.branch;
@@ -1802,6 +1811,17 @@ impl CloudSessions {
             &SessionLocation::Cloud(location),
             settings.as_ref(),
         )?;
+        // The transcript divider's date and target. Not needed for correctness: a failure
+        // only leaves the divider without them.
+        let _ = super::move_ui::save_mark(
+            &store,
+            session,
+            &super::move_ui::MoveMark {
+                at_ms: self.now(),
+                backend: workspace.backend,
+                target: workspace.name.clone(),
+            },
+        );
         Ok(())
     }
 
@@ -1949,9 +1969,7 @@ impl CloudSessions {
             }
             state.stop.store(true, Ordering::Relaxed);
             return Ok(CancelReport {
-                warnings: vec![
-                    "The move is stopping. It is rolled back when the current step ends.".into(),
-                ],
+                warnings: vec![MOVE_STOPPING.into()],
                 ..Default::default()
             });
         }

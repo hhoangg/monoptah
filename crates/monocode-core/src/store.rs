@@ -1326,7 +1326,7 @@ impl Store {
         tx.execute("DELETE FROM native_reminders WHERE session_id=?1", [id])
             .map_err(|e| e.to_string())?;
         tx.execute(
-            "DELETE FROM native_settings WHERE key IN (?1,?2,?3,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16) OR key LIKE ?4",
+            "DELETE FROM native_settings WHERE key IN (?1,?2,?3,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17) OR key LIKE ?4",
             params![
                 format!("agent:{id}"),
                 format!("context:{id}"),
@@ -1343,7 +1343,8 @@ impl Store {
                 format!("cloud-sync-error:{id}"),
                 format!("cloud-move:{id}"),
                 format!("cloud-move-note:{id}"),
-                format!("cloud-move-owner:{id}")
+                format!("cloud-move-owner:{id}"),
+                format!("cloud-move-mark:{id}")
             ],
         )
         .map_err(|e| e.to_string())?;

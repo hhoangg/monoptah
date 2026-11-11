@@ -286,6 +286,29 @@ pub fn fetch_origin(cwd: &Path) -> Result<(), String> {
     fetch_with_timeout(cwd, FETCH_TIMEOUT)
 }
 
+/// [`fetch_origin`] that stops (killing git and its children) when `cancel` is set.
+pub fn fetch_origin_cancellable(
+    cwd: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(), String> {
+    let root = toplevel(cwd)?;
+    match run_timed_with(
+        &root,
+        &["fetch", "--no-tags", REMOTE],
+        FETCH_TIMEOUT,
+        Some(cancel),
+        None,
+    ) {
+        Ok(_) => Ok(()),
+        Err(Timed::Expired) => Err(format!(
+            "Fetching {REMOTE} took longer than {} seconds",
+            FETCH_TIMEOUT.as_secs()
+        )),
+        Err(Timed::Stopped) => Err("Cancelled".into()),
+        Err(Timed::Failed(e)) => Err(format!("Could not fetch {REMOTE}: {e}")),
+    }
+}
+
 fn fetch_with_timeout(cwd: &Path, timeout: Duration) -> Result<(), String> {
     let root = toplevel(cwd)?;
     match run_timed(&root, &["fetch", "--no-tags", REMOTE], timeout) {

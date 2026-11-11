@@ -1,5 +1,6 @@
 pub(crate) mod attachments;
 pub(crate) mod burst;
+pub(crate) mod cloud_moved;
 pub(crate) mod cloud_start;
 pub(crate) mod dates;
 mod drafts;
@@ -149,6 +150,8 @@ enum Body {
     CloudStart,
     /// The message queued while the codespace starts.
     CloudQueued,
+    /// The divider where the session continued in the cloud.
+    CloudMoved,
     Markdown(Arc<MarkdownRow>),
     /// A dithered break between text replies in one Mono turn.
     MonoDivider,
@@ -718,6 +721,8 @@ pub(crate) struct TranscriptView {
     /// The codespace start of a cloud session and the message queued behind it.
     cloud_start: Option<Arc<crate::cloud_start_view::CloudStartSnapshot>>,
     cloud_queued: Option<String>,
+    /// The text of the "continued in the cloud" divider, once the session moved.
+    cloud_moved: Option<String>,
     cloud_clock: Option<gpui::Task<()>>,
     /// Pending messages just taken, including any entrance still in flight.
     taken: Vec<TakenMessage>,
@@ -926,6 +931,9 @@ impl TranscriptView {
     pub(crate) fn set_cloud_move(&mut self, moved_at_row: Option<usize>, cx: &mut Context<Self>) {
         if self.cloud_move != moved_at_row {
             self.cloud_move = moved_at_row;
+            if self.cloud_moved.is_some() {
+                self.rebuild_rows(0, cx);
+            }
             cx.notify();
         }
     }
@@ -2601,6 +2609,7 @@ impl TranscriptView {
             saved_draft: None,
             cloud_start: None,
             cloud_queued: None,
+            cloud_moved: None,
             cloud_clock: None,
             taken: Vec::new(),
             pending_entrances: HashMap::new(),
@@ -4339,6 +4348,7 @@ impl TranscriptView {
                     | Body::SavedDraft
                     | Body::CloudStart
                     | Body::CloudQueued
+                    | Body::CloudMoved
             ) {
                 return false;
             }
@@ -4799,6 +4809,7 @@ impl TranscriptView {
             Body::SavedDraft => return self.saved_draft_row(cx),
             Body::CloudStart => return self.cloud_start_row(cx),
             Body::CloudQueued => return self.cloud_queued_row(cx),
+            Body::CloudMoved => return self.cloud_moved_row(),
             Body::Pending(i) => return self.pending_row(i, cx),
             Body::Launch(id) => return self.launch_row(ix, id, cx),
             _ => {}
@@ -5046,7 +5057,8 @@ impl TranscriptView {
             | Body::Launch(_)
             | Body::SavedDraft
             | Body::CloudStart
-            | Body::CloudQueued => div().into_any_element(),
+            | Body::CloudQueued
+            | Body::CloudMoved => div().into_any_element(),
             Body::Actions { turn, complete } => {
                 // Tighten only a visible Mono reply followed by a user bubble;
                 // stacked user messages keep their existing spacing.

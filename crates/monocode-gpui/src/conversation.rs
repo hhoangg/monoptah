@@ -25,6 +25,8 @@ pub(crate) use question_api::{QuestionAsked, QuestionSettled};
 mod cloud_branches;
 mod cloud_location;
 pub(crate) use cloud_location::CloudLocationReset;
+mod cloud_move;
+pub(crate) use cloud_move::{CancelCloudMove, ContinueInCloud, MOVE_PAUSED, MoveOffer};
 mod cloud_panel;
 mod remote;
 pub(crate) use remote::CloudResumed;
@@ -174,6 +176,12 @@ pub(crate) struct Conversation {
     cloud_stopped: bool,
     /// The shell says this local session lives in the cloud (design 4.2.1).
     cloud_location: cloud_location::State,
+    /// The shell says whether the Workspace menu offers "Continue in cloud".
+    move_offer: MoveOffer,
+    /// A move to the cloud of this session is unfinished: nothing may be sent or saved.
+    move_locked: bool,
+    /// The flip happened but the settings in memory were not reloaded from the store yet.
+    move_settings_stale: bool,
     /// Lists the machine types of a project's repository for the codespace panel.
     machine_loader: Option<cloud_target::MachineLoader>,
     cloud_anchors: [AnchorSlot; 4],
@@ -795,6 +803,9 @@ impl Conversation {
             cloud_offers_codespace: false,
             cloud_stopped: false,
             cloud_location: Default::default(),
+            move_offer: MoveOffer::Hidden,
+            move_locked: false,
+            move_settings_stale: false,
             machine_loader: None,
             cloud_anchors: Default::default(),
             cloud_ref_anchors: Default::default(),
@@ -1025,6 +1036,11 @@ impl Conversation {
     }
     /// A cloud session whose local copy is being saved takes no new message.
     pub(crate) fn refuse_while_saving_copy(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.move_locked {
+            self.status = MOVE_PAUSED.into();
+            cx.notify();
+            return true;
+        }
         if self.cloud_locked {
             self.status =
                 "This session is being saved as a local copy. Wait for it to finish.".into();
@@ -2141,6 +2157,13 @@ impl Conversation {
         cx.notify();
     }
     fn save_settings(&mut self, cx: &mut Context<Self>) {
+        if self.move_locked {
+            // The move owns the stored settings until it ends (its flip writes them).
+            self.status = MOVE_PAUSED.into();
+            cx.notify();
+            return;
+        }
+        let keep_handoff = self.move_settings_stale && self.settings.handoff.is_none();
         self.settings.revision = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -2155,6 +2178,11 @@ impl Conversation {
         cx.background_executor()
             .spawn(async move {
                 let saved = locked(&store).and_then(|s| {
+                    let mut settings = settings;
+                    // The flip stored a handoff this copy never saw: do not erase it.
+                    if keep_handoff && let Some(stored) = s.agent_settings(id)? {
+                        settings.handoff = stored.handoff;
+                    }
                     s.configure_agent(id, &provider, &settings)?;
                     if let Some(title) = title
                         && s.agent_settings(id)?
@@ -2706,6 +2734,7 @@ impl Conversation {
                         .into(),
                 ];
                 items.extend(self.cloud_menu_items());
+                items.extend(self.move_menu_items());
                 ("Workspace", items, 240., MenuStyle::Settings)
             }
             // Composer.tsx's plus menu with native mode and attachment actions.
@@ -3064,6 +3093,7 @@ impl Conversation {
             .child(self.cloud_target_panel(window, cx))
             .children(self.remote_notice(cx))
             .children(self.cloud_sync_notice(cx))
+            .children(self.move_notice(cx))
             .child(self.cloud_start_panel(cx))
             .child(self.message_queue(window, cx))
             .children(if self.is_remote() { None } else { self.auth_notice(cx) })

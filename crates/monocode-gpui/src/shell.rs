@@ -14,6 +14,7 @@ mod cloud_app_archive;
 mod cloud_create;
 #[cfg(test)]
 mod cloud_location_tests;
+mod cloud_move;
 mod cloud_picker;
 mod cloud_start;
 #[cfg(test)]
@@ -716,6 +717,15 @@ pub(crate) struct Shell {
     /// `gh` runner shared by the cloud session service and the codespace picker.
     gh: Arc<dyn monocode_core::codespaces::GhRunner>,
     cloud: Arc<monocode_core::cloud_sessions::CloudSessions>,
+    /// The move engine "Continue in cloud" uses; the real one is `cloud`.
+    cloud_move_engine: Arc<dyn cloud_move::MoveEngine>,
+    /// Moves to the cloud in progress, one per session (see `cloud_move`).
+    cloud_moves: HashMap<i64, cloud_move::MoveRun>,
+    move_dialog: Option<cloud_move::OpenMove>,
+    /// The working-copy inspections of the move dialog in flight, by session (cancel flags).
+    move_previews: HashMap<i64, Arc<std::sync::atomic::AtomicBool>>,
+    /// The divider text of each moved session, read from the store once.
+    move_labels: HashMap<i64, Option<String>>,
     /// Sessions that live in a codespace, by id, and the cached state of each codespace.
     cloud_marks: HashMap<i64, cloud::CloudMark>,
     /// The Claude setup block of each workspace, by `CloudRef::key`; see [`claude_setup`].
@@ -1013,8 +1023,18 @@ impl Shell {
             for view in this.cloud_starts.values() {
                 view.cancel_on_quit();
             }
+            // A move's worker stops (its push is killed) and the record stays resumable.
+            let moves = this.cancel_moves_on_quit();
             let remote = quit_remote.clone();
             cx.background_executor().spawn(async move {
+                let waited = std::time::Instant::now();
+                while waited.elapsed() < std::time::Duration::from_secs(2)
+                    && moves
+                        .iter()
+                        .any(|ended| !ended.load(std::sync::atomic::Ordering::SeqCst))
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
                 remote.shutdown();
             })
         })
@@ -1194,6 +1214,11 @@ impl Shell {
             remote_refreshing: false,
             remote_marks: HashMap::new(),
             _remote_clock: remote_clock,
+            cloud_move_engine: cloud.clone(),
+            cloud_moves: HashMap::new(),
+            move_dialog: None,
+            move_previews: HashMap::new(),
+            move_labels: HashMap::new(),
             cloud,
             gh,
             cloud_marks: HashMap::new(),
@@ -1498,6 +1523,7 @@ impl Shell {
         }
         this.publish_kit_prefs();
         this.resume_cloud_starts(cx);
+        this.resume_cloud_moves(cx);
         this.init_mobile_host(cx);
         if let Some(id) = this.workspace.active {
             this.ensure_session(this.workspace.session_for_pane(id), cx);
@@ -1626,6 +1652,8 @@ impl Shell {
                 cx,
             );
             view.set_cloud_location(self.cloud_located.get(&id).cloned(), cx);
+            view.set_move_locked(self.cloud_moves.contains_key(&id), cx);
+            view.set_move_offer(self.move_offer(id), cx);
             view.set_project_appearance(appearance, cx);
             view.transcript.update(cx, |transcript, cx| {
                 transcript.apply_preferences(&self.workspace.preferences, cx)
@@ -1648,6 +1676,39 @@ impl Shell {
                 this.create_cloud_session(id, event.0.clone(), cx)
             },
         ));
+        self.observations.push(cx.subscribe(
+            &view,
+            move |_, _, _: &crate::conversation::ContinueInCloud, cx| {
+                cx.spawn(async move |this, cx| {
+                    let _ =
+                        this.update_in(cx, |this, window, cx| this.open_cloud_move(id, window, cx));
+                })
+                .detach();
+            },
+        ));
+        self.observations.push(cx.subscribe(
+            &view,
+            move |_, _, _: &crate::conversation::CancelCloudMove, cx| {
+                cx.spawn(async move |this, cx| {
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.open_cloud_move(id, window, cx);
+                        if let Some(dialog) = this.cloud_move_dialog_for(id) {
+                            dialog.update(cx, |dialog, cx| dialog.cancel_move(false, cx));
+                        }
+                    });
+                })
+                .detach();
+            },
+        ));
+        // The move engine reads whether this conversation is busy: keep it current whenever it
+        // changes, not only when a move event happens to arrive.
+        self.observations
+            .push(cx.observe(&view, move |this, view, cx| {
+                if let Some(run) = this.cloud_moves.get(&id) {
+                    let view = view.read(cx);
+                    run.set_busy(view.busy || view.is_stopping());
+                }
+            }));
         self.observations.push(cx.subscribe(
             &view,
             |_, _, _: &crate::conversation::cloud_target::OpenCloudSettings, cx| {
@@ -9830,6 +9891,7 @@ impl Render for Shell {
             .children(self.codespaces_modal(window, cx))
             .children(self.docker_modal(window, cx))
             .children(self.git_credential_modal(window, cx))
+            .children(self.cloud_move_modal(window, cx))
             .children(self.delete_modal(window, cx))
             .children(self.cloud_archive_modal(window, cx))
             .children(self.cloud_view_card(cx))
