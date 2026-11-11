@@ -480,6 +480,79 @@ mod tests {
             .unwrap();
     }
 
+    /// The same for a session that was never opened since launch: only its
+    /// summary and saved settings exist, and a view made for the run starts on
+    /// the current default account until the saved settings load.
+    #[gpui::test]
+    fn a_continued_unopened_chat_keeps_its_saved_account(cx: &mut TestAppContext) {
+        let project = Project::new(false);
+        let (window, _clis) = shell(cx, &[("claude", Surface::Chat)]);
+        let (sibling, saved, preferred) = window
+            .update(cx, |shell, _, cx| {
+                let center = crate::accounts::get(cx).unwrap();
+                let (saved, preferred) = center.update(cx, |center, _| {
+                    let saved = center.book.add(Kind::Claude, "Saved").unwrap();
+                    let preferred = center.book.add(Kind::Claude, "Token").unwrap();
+                    center
+                        .book
+                        .set_preferred(Kind::Claude, &preferred.id)
+                        .unwrap();
+                    (saved.id, preferred.id)
+                });
+                let store = locked(&shell.store).unwrap();
+                let mut summary = store.create("claude", &project.cwd()).unwrap();
+                let settings = monocode_core::agent::Settings {
+                    account: center.read(cx).profile(&saved),
+                    ..Default::default()
+                };
+                store
+                    .configure_agent(summary.id, "claude", &settings)
+                    .unwrap();
+                drop(store);
+                summary.has_messages = true;
+                let id = summary.id;
+                // History only: no view until the run needs one.
+                shell.session_summaries.insert(id, summary);
+                assert!(!shell.sessions.contains_key(&id));
+                (id, saved, preferred)
+            })
+            .unwrap();
+        let due = window
+            .update(cx, |shell, _, _| {
+                due(shell, &project, "claude", |upsert| {
+                    upsert.reuse_session = true;
+                })
+            })
+            .unwrap();
+        let due = DueAutomationRun {
+            automation: Automation {
+                last_session_id: Some(sibling.to_string()),
+                ..due.automation
+            },
+            run: due.run,
+        };
+        launch(&window, cx, &due);
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(
+                    shell
+                        .automation_state
+                        .session_automations
+                        .contains_key(&sibling),
+                    "the run continues the earlier chat"
+                );
+                let account = shell.sessions[&sibling]
+                    .read(cx)
+                    .settings
+                    .account
+                    .id
+                    .clone();
+                assert_ne!(account, preferred);
+                assert_eq!(account, saved);
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     fn the_run_is_recorded_as_running_with_its_session(cx: &mut TestAppContext) {
         let project = Project::new(false);

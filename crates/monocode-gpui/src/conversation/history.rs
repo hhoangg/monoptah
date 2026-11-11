@@ -7,6 +7,12 @@ impl Conversation {
     pub(super) fn history_ready(&self) -> bool {
         self.loaded && !self.history_unloaded && !self.loading
     }
+    /// Whether `settings` came from the store or the user. Before the first
+    /// load they are only `Conversation::new`'s defaults (the current account
+    /// selection, not the account the session ran on).
+    pub(crate) fn settings_loaded(&self) -> bool {
+        self.loaded
+    }
     pub(crate) fn needs_history_restore(&self) -> bool {
         self.history_unloaded || self.loading || (!self.loaded && self.summary.has_messages)
     }

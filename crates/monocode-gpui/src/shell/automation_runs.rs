@@ -386,10 +386,28 @@ impl Shell {
                     .map(|view| view.read(cx).settings.clone())
             })
             .unwrap_or_default();
+        // A session that was never opened since launch only has
+        // Conversation::new's defaults, whose account is the current selection.
+        // Its own account is the one saved with it.
+        if let Some(id) = reuse
+            && self
+                .sessions
+                .get(&id)
+                .is_some_and(|view| !view.read(cx).settings_loaded())
+            && let Some(saved) = locked(&self.store)
+                .ok()
+                .and_then(|store| store.agent_settings(id).ok().flatten())
+            && let Some(accounts) = crate::accounts::get(cx)
+        {
+            // The saved profile carries only its id; the store root is local.
+            settings.account = accounts.read(cx).profile(&saved.account.id);
+        }
         // A continued session keeps its account: its transcript lives in that
         // account's config dir, so moving it to the project's or provider's
         // default account (say, a new setup token) would break the resume.
         // A new session, or one whose account was removed, takes the selection.
+        // The deferred send installs these settings over the loaded ones, so
+        // the account chosen here is the one the run uses.
         let keep = reuse.is_some()
             && crate::accounts::get(cx)
                 .is_some_and(|accounts| accounts.read(cx).book.exists(kind, &settings.account.id));
