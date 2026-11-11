@@ -1320,9 +1320,16 @@ impl CloudSessions {
                 // rewound from here (their checkpoints describe other directories).
                 if let Some(local) = mode.moved() {
                     let started_over = matches!(resume, Resume::Forked(_) | Resume::Missing(_));
-                    if !in_place || started_over {
-                        let count = self.store()?.load(local)?.rows.len();
-                        self.store()?.set_returned_gate(local, Some(count))?;
+                    let store = self.store()?;
+                    let count = store.load(local)?.rows.len();
+                    let moved_at = store
+                        .cloud_location(local)?
+                        .cloud()
+                        .map_or(count, |l| l.moved_at_row);
+                    // Even in place, the turns the cloud wrote ran elsewhere: their file
+                    // history belongs to the other machine.
+                    if !in_place || started_over || count > moved_at {
+                        store.set_returned_gate(local, Some(count))?;
                     }
                 }
                 resume

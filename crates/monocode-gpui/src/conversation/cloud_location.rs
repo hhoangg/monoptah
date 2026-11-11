@@ -77,6 +77,9 @@ impl Conversation {
     pub(crate) fn set_returned_gate(&mut self, before: Option<usize>, cx: &mut Context<Self>) {
         if self.cloud_location.returned_gate != before {
             self.cloud_location.returned_gate = before;
+            self.transcript.update(cx, |transcript, cx| {
+                transcript.set_returned_gate(before, cx)
+            });
             cx.notify();
         }
     }

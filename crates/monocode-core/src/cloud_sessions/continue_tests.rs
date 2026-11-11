@@ -3,6 +3,7 @@ use super::convert_tests::{git, world, World, SESSION};
 use super::*;
 use crate::store::{CloudLocation, MovePoint, SessionLocation};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 fn encoded(claude: &Path, cwd: &Path) -> PathBuf {
     let real = std::fs::canonicalize(cwd).unwrap();
@@ -68,6 +69,14 @@ fn moved_in(w: &World, work: &Path) -> i64 {
         head,
         tree: tree_of(work),
         work_cwd: work.to_str().unwrap().into(),
+        branch: {
+            let name = git(work, &["rev-parse", "--symbolic-full-name", "HEAD"]);
+            if name == "HEAD" {
+                String::new()
+            } else {
+                name
+            }
+        },
     };
     let store = w.svc.store().unwrap();
     store
@@ -702,7 +711,7 @@ fn reset_with_cloud_turns_starts_a_new_claude_session_instead_of_resuming_the_st
 }
 
 #[test]
-fn a_return_through_a_worktree_gates_older_turns_and_an_in_place_one_does_not() {
+fn a_return_gates_the_turns_up_to_it() {
     let w = world(true);
     let local = moved(&w);
     std::fs::write(w.project.join("a.txt"), "my own edit\n").unwrap();
@@ -711,10 +720,22 @@ fn a_return_through_a_worktree_gates_older_turns_and_an_in_place_one_does_not() 
     let rows = store.load(local).unwrap().rows.len();
     assert_eq!(store.returned_gate(local), Some(rows));
     drop(store);
+    // In place too: the turns the cloud wrote ran on the other machine.
     let w = world(true);
     let local = moved(&w);
     run(&w, local).unwrap();
-    assert_eq!(w.svc.store().unwrap().returned_gate(local), None);
+    let store = w.svc.store().unwrap();
+    assert_eq!(
+        store.returned_gate(local),
+        Some(store.load(local).unwrap().rows.len())
+    );
+    // The gate only ever goes up.
+    store.set_returned_gate(local, Some(1)).unwrap();
+    store.set_returned_gate(local, None).unwrap();
+    assert_eq!(
+        store.returned_gate(local),
+        Some(store.load(local).unwrap().rows.len())
+    );
 }
 
 #[test]
@@ -725,11 +746,379 @@ fn deleting_a_session_forgets_its_return_state() {
         let mut store = w.svc.store().unwrap();
         store.set_cloud_continue_progress(local, "{}").unwrap();
         store.set_returned_gate(local, Some(3)).unwrap();
-        store.set_cloud_continue_broken(local, "{}").unwrap();
+        store
+            .set_cloud_continue_broken(local, r#"{"backup":"/tmp/keep"}"#)
+            .unwrap();
+        // The only backup of someone's work is never deleted silently.
+        assert!(store.delete(local).unwrap_err().contains("/tmp/keep"));
+        store.set_cloud_continue_broken(local, "").unwrap();
         store.delete(local).unwrap();
         assert!(store.cloud_continue_progress(local).is_none());
         assert!(store.cloud_move_point(local).is_none());
         assert_eq!(store.returned_gate(local), None);
         assert!(store.cloud_continue_broken(local).is_none());
     }
+}
+
+fn hash_of(dir: &Path, rev: &str) -> String {
+    git(dir, &["rev-parse", rev])
+}
+
+/// The state a marker records for the project as it is at the move.
+fn write_marker(w: &World, local: i64, applied_head: &str, expected: &str) -> PathBuf {
+    let backup = w.root.join("marker-backup");
+    std::fs::create_dir_all(&backup).unwrap();
+    std::fs::write(backup.join("changes.patch"), "x").unwrap();
+    // As in a real attempt, the tree of the folder was written into the repository.
+    let idx = w.root.join("marker.idx");
+    let text = idx.to_string_lossy().into_owned();
+    let run_in = |args: &[&str]| {
+        let out = Command::new("git")
+            .current_dir(&w.project)
+            .env("GIT_INDEX_FILE", &text)
+            .args(args)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    run_in(&["add", "-A"]);
+    let tree = run_in(&["write-tree"]);
+    let marker = serde_json::json!({
+        "root": w.project, "backup": backup, "head": hash_of(&w.project, "HEAD"),
+        "tree": tree, "branch": git(&w.project, &["symbolic-ref", "HEAD"]),
+        "cloudHead": applied_head, "expected": expected, "at": 1
+    });
+    w.svc
+        .store()
+        .unwrap()
+        .set_cloud_continue_broken(local, &marker.to_string())
+        .unwrap();
+    backup
+}
+
+#[test]
+fn after_a_broken_return_new_edits_and_new_files_are_never_touched() {
+    let w = world(true);
+    let local = moved(&w);
+    let backup = write_marker(&w, local, &hash_of(&w.ws, "HEAD"), &tree_of(&w.ws));
+    // The user keeps working: edits a tracked file and creates a new one.
+    std::fs::write(w.project.join("a.txt"), "edited after the failure\n").unwrap();
+    std::fs::create_dir_all(w.project.join("src")).unwrap();
+    std::fs::write(w.project.join("src/new.rs"), "fn main() {}\n").unwrap();
+    let error = run(&w, local).unwrap_err().to_string();
+    assert!(
+        error.contains("marker-backup") && error.contains("Nothing was changed now"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("a.txt")).unwrap(),
+        "edited after the failure\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("src/new.rs")).unwrap(),
+        "fn main() {}\n"
+    );
+    assert!(backup.join("changes.patch").is_file());
+    assert!(w
+        .svc
+        .store()
+        .unwrap()
+        .cloud_location(local)
+        .unwrap()
+        .is_cloud());
+    // Only an explicit action restores, after a fresh backup of the current state.
+    let fresh = w.svc.restore_continue_backup(local);
+    assert!(fresh.is_ok(), "{fresh:?}");
+    assert!(backup.join("changes.patch").is_file());
+}
+
+#[test]
+fn a_crash_after_the_working_tree_changed_reports_the_backup_instead_of_claiming_nothing_happened()
+{
+    let w = world(true);
+    let local = moved(&w);
+    let backup = write_marker(&w, local, &hash_of(&w.ws, "HEAD"), &tree_of(&w.ws));
+    // Crash between the file update and the branch move: new files, old HEAD.
+    std::fs::write(w.project.join("a.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(w.project.join("made.txt"), "created by claude\n").unwrap();
+    let error = run(&w, local).unwrap_err().to_string();
+    assert!(error.contains("marker-backup"), "{error}");
+    assert!(!error.contains("left alone"), "{error}");
+    assert!(backup.is_dir());
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("a.txt")).unwrap(),
+        "one\ntwo\n"
+    );
+}
+
+#[test]
+fn a_crash_after_the_branch_moved_is_recognised_as_applied() {
+    let w = world(true);
+    let local = moved(&w);
+    write_marker(&w, local, &hash_of(&w.ws, "HEAD"), &tree_of(&w.ws));
+    git(
+        &w.project,
+        &["fetch", "-q", w.ws.to_str().unwrap(), "feat/x"],
+    );
+    git(&w.project, &["merge", "-q", "--ff-only", "FETCH_HEAD"]);
+    std::fs::write(w.project.join("a.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(w.project.join("bin.dat"), [9u8, 8, 7, 0]).unwrap();
+    std::fs::write(w.project.join("untracked.txt"), "new file\n").unwrap();
+    let done = run(&w, local).unwrap();
+    assert!(
+        done.warnings.iter().any(|n| n.contains("already applied")),
+        "{:?}",
+        done.warnings
+    );
+    assert!(w
+        .svc
+        .store()
+        .unwrap()
+        .cloud_continue_broken(local)
+        .is_none());
+}
+
+#[test]
+fn read_tree_refuses_a_file_changed_or_created_after_the_snapshot() {
+    use super::continue_local::g;
+    let w = world(true);
+    let _ = moved(&w);
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = tmp.path().join("i.idx");
+    let text = idx.to_string_lossy().into_owned();
+    let envs = [("GIT_INDEX_FILE", text.as_str())];
+    g(&w.project, &["add", "-A"], &envs).unwrap();
+    let old = g(&w.project, &["write-tree"], &envs)
+        .unwrap()
+        .trim()
+        .to_string();
+    // The target tree changes a.txt and adds made.txt.
+    let new_idx = tmp.path().join("n.idx");
+    let ntext = new_idx.to_string_lossy().into_owned();
+    let nenvs = [("GIT_INDEX_FILE", ntext.as_str())];
+    std::fs::write(w.project.join("a.txt"), "cloud\n").unwrap();
+    std::fs::write(w.project.join("made.txt"), "cloud\n").unwrap();
+    g(&w.project, &["add", "-A"], &nenvs).unwrap();
+    let target = g(&w.project, &["write-tree"], &nenvs)
+        .unwrap()
+        .trim()
+        .to_string();
+    git(&w.project, &["checkout", "-q", "--", "a.txt"]);
+    std::fs::remove_file(w.project.join("made.txt")).unwrap();
+    // (a) a tracked file edited after the snapshot
+    std::fs::write(w.project.join("a.txt"), "typed after the snapshot\n").unwrap();
+    assert!(g(&w.project, &["read-tree", "-m", "-u", &old, &target], &envs).is_err());
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("a.txt")).unwrap(),
+        "typed after the snapshot\n"
+    );
+    git(&w.project, &["checkout", "-q", "--", "a.txt"]);
+    // (b) an untracked file created in the way
+    std::fs::write(w.project.join("made.txt"), "mine\n").unwrap();
+    assert!(g(&w.project, &["read-tree", "-m", "-u", &old, &target], &envs).is_err());
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("made.txt")).unwrap(),
+        "mine\n"
+    );
+}
+
+#[test]
+fn an_ignored_file_the_cloud_adds_as_tracked_is_never_overwritten() {
+    let w = world(true);
+    git(&w.ws, &["add", "-f", "-N", "."]);
+    std::fs::write(w.ws.join("secret.cfg"), "from the cloud\n").unwrap();
+    git(&w.ws, &["add", "secret.cfg"]);
+    git(
+        &w.ws,
+        &["commit", "-q", "-m", "add secret.cfg", "secret.cfg"],
+    );
+    let local = moved(&w);
+    std::fs::write(w.project.join(".git/info/exclude"), "secret.cfg\n").unwrap();
+    std::fs::write(w.project.join("secret.cfg"), "my secret\n").unwrap();
+    run(&w, local).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("secret.cfg")).unwrap(),
+        "my secret\n"
+    );
+    assert_eq!(git(&w.project, &["log", "-1", "--format=%s"]), "base");
+    assert!(w
+        .svc
+        .store()
+        .unwrap()
+        .agent_settings(local)
+        .unwrap()
+        .unwrap()
+        .worktree_cwd
+        .is_some());
+}
+
+#[test]
+fn hidden_edits_of_assume_unchanged_files_force_the_worktree() {
+    let w = world(true);
+    git(&w.project, &["update-index", "--assume-unchanged", "a.txt"]);
+    std::fs::write(w.project.join("a.txt"), "hidden edit\n").unwrap();
+    let local = moved(&w);
+    run(&w, local).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("a.txt")).unwrap(),
+        "hidden edit\n"
+    );
+    assert_eq!(git(&w.project, &["log", "-1", "--format=%s"]), "base");
+    assert!(w
+        .svc
+        .store()
+        .unwrap()
+        .agent_settings(local)
+        .unwrap()
+        .unwrap()
+        .worktree_cwd
+        .is_some());
+}
+
+#[test]
+fn a_detached_head_another_branch_or_a_merge_in_progress_refuse_in_place() {
+    // Detached HEAD at the move.
+    let w = world(true);
+    git(&w.project, &["checkout", "-q", "--detach"]);
+    let local = moved(&w);
+    run(&w, local).unwrap();
+    assert!(w
+        .svc
+        .store()
+        .unwrap()
+        .agent_settings(local)
+        .unwrap()
+        .unwrap()
+        .worktree_cwd
+        .is_some());
+    // Another branch checked out since the move.
+    let w = world(true);
+    let local = moved(&w);
+    git(&w.project, &["checkout", "-q", "-b", "other"]);
+    run(&w, local).unwrap();
+    assert!(w
+        .svc
+        .store()
+        .unwrap()
+        .agent_settings(local)
+        .unwrap()
+        .unwrap()
+        .worktree_cwd
+        .is_some());
+    assert_eq!(
+        git(&w.project, &["symbolic-ref", "--short", "HEAD"]),
+        "other"
+    );
+    // A merge in progress.
+    let w = world(true);
+    let local = moved(&w);
+    let head = hash_of(&w.project, "HEAD");
+    std::fs::write(w.project.join(".git/MERGE_HEAD"), format!("{head}\n")).unwrap();
+    run(&w, local).unwrap();
+    assert!(w
+        .svc
+        .store()
+        .unwrap()
+        .agent_settings(local)
+        .unwrap()
+        .unwrap()
+        .worktree_cwd
+        .is_some());
+    assert_eq!(git(&w.project, &["log", "-1", "--format=%s"]), "base");
+}
+
+#[test]
+fn a_refused_branch_move_rolls_back_files_and_keeps_the_staged_state() {
+    let w = world(true);
+    // A staged edit and an unstaged one at the move.
+    std::fs::write(w.project.join("a.txt"), "staged edit\n").unwrap();
+    git(&w.project, &["add", "a.txt"]);
+    std::fs::write(w.project.join("bin.dat"), [1u8, 1, 1]).unwrap();
+    let local = moved(&w);
+    // A hook that refuses the first update of the checked out branch.
+    let hook = w.project.join(".git/hooks/reference-transaction");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    let flag = w.project.join(".git/fail-once");
+    std::fs::write(&flag, "1").unwrap();
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = prepared ] && [ -f '{f}' ] && grep -q refs/heads/main; then rm -f '{f}'; exit 1; fi\nexit 0\n",
+            f = flag.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let done = run(&w, local).unwrap();
+    assert!(
+        done.warnings.iter().any(|n| n.contains("worktree")),
+        "{:?}",
+        done.warnings
+    );
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("a.txt")).unwrap(),
+        "staged edit\n"
+    );
+    assert_eq!(
+        std::fs::read(w.project.join("bin.dat")).unwrap(),
+        [1u8, 1, 1]
+    );
+    assert_eq!(git(&w.project, &["log", "-1", "--format=%s"]), "base");
+    // The staged part is still staged, the unstaged part still unstaged.
+    assert_eq!(
+        git(&w.project, &["diff", "--cached", "--name-only"]),
+        "a.txt"
+    );
+    assert_eq!(git(&w.project, &["diff", "--name-only"]), "bin.dat");
+    assert!(w
+        .svc
+        .store()
+        .unwrap()
+        .cloud_continue_broken(local)
+        .is_none());
+}
+
+#[test]
+fn a_submodule_edit_with_recurse_on_is_never_carried_away() {
+    let w = world(true);
+    let sub = w.root.join("subrepo");
+    std::fs::create_dir_all(&sub).unwrap();
+    git(&sub, &["init", "-q", "-b", "main"]);
+    std::fs::write(sub.join("f.txt"), "f\n").unwrap();
+    git(&sub, &["add", "."]);
+    git(&sub, &["commit", "-q", "-m", "sub base"]);
+    git(
+        &w.project,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            sub.to_str().unwrap(),
+            "lib",
+        ],
+    );
+    git(&w.project, &["commit", "-q", "-m", "add lib"]);
+    git(&w.project, &["push", "-q", "origin", "main"]);
+    git(&w.ws, &["fetch", "-q", "origin"]);
+    git(&w.ws, &["merge", "-q", "--no-edit", "origin/main"]);
+    git(&w.project, &["config", "submodule.recurse", "true"]);
+    std::fs::write(w.project.join("lib/f.txt"), "edited inside the submodule\n").unwrap();
+    let local = moved(&w);
+    run(&w, local).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("lib/f.txt")).unwrap(),
+        "edited inside the submodule\n"
+    );
+    assert!(w
+        .svc
+        .store()
+        .unwrap()
+        .agent_settings(local)
+        .unwrap()
+        .unwrap()
+        .worktree_cwd
+        .is_some());
 }

@@ -108,6 +108,10 @@ pub struct MovePoint {
     pub tree: String,
     /// The folder the session worked in: a session worktree, else the project folder.
     pub work_cwd: String,
+    /// The checked out branch ref at the move (`refs/heads/...`); empty when it was detached
+    /// or unknown, which makes the in-place return refuse.
+    #[serde(default)]
+    pub branch: String,
 }
 
 impl Store {
@@ -155,11 +159,12 @@ impl Store {
             .ok()?
             .and_then(|raw| raw.parse().ok())
     }
+    /// Raises the gate; it never goes down (a later return must not re-enable turns an
+    /// earlier one disabled). `None` is a no-op.
     pub fn set_returned_gate(&self, session: i64, row: Option<usize>) -> Result<(), String> {
-        self.save_setting(
-            &Self::returned_gate_key(session),
-            &row.map(|r| r.to_string()).unwrap_or_default(),
-        )
+        let Some(row) = row else { return Ok(()) };
+        let row = row.max(self.returned_gate(session).unwrap_or(0));
+        self.save_setting(&Self::returned_gate_key(session), &row.to_string())
     }
     /// The next turn starts a new Claude conversation with a summary of the rows: the Claude
     /// id is cleared (so a stale local file is never resumed), the summary is queued like a

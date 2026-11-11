@@ -1258,6 +1258,16 @@ impl Store {
         id: i64,
         delete_rows: impl FnOnce(&mut Self) -> Result<(), String>,
     ) -> Result<(), String> {
+        // The only copy of someone's uncommitted work may sit in this session's folder.
+        if let Some(raw) = self.cloud_continue_broken(id) {
+            let backup = serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()
+                .and_then(|v| v["backup"].as_str().map(str::to_owned))
+                .unwrap_or_default();
+            return Err(format!(
+                "An interrupted return from the cloud left a backup of uncommitted work in {backup}. Restore or discard it before deleting this conversation."
+            ));
+        }
         // Resolve the folder first; the persisted id is gone after deletion.
         let dir = self.thread_dir(id).ok().flatten();
         let cloud_cursor = match self.cloud_location(id) {
