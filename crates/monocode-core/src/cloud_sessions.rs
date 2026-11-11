@@ -1855,6 +1855,7 @@ pub mod move_session;
 pub mod move_ui;
 pub use backend::{CloudBackend, CloudBackendKind, CloudRef, CodespacesBackend};
 
+mod continue_local;
 mod convert;
 pub use convert::*;
 pub mod transcript_sync;
@@ -1868,6 +1869,8 @@ pub use startup::{
 };
 
 // These fixtures execute the Linux host scripts against local Unix paths.
+#[cfg(all(test, unix))]
+mod continue_tests;
 #[cfg(all(test, unix))]
 mod convert_tests;
 #[cfg(test)]

@@ -5,8 +5,8 @@ mod contributions;
 mod location;
 pub use location::UNREADABLE_LOCATION as UNREADABLE_LOCATION_TEXT;
 pub use location::{
-    CloudLocation, SessionLocation, HOST_TURN_RUNNING, LOCAL_RUN_REFUSED, LOCAL_TUI_REFUSED,
-    UNREADABLE_NOTICE, WORKSPACE_LOST,
+    CloudLocation, MovePoint, SessionLocation, HOST_TURN_RUNNING, LOCAL_RUN_REFUSED,
+    LOCAL_TUI_REFUSED, UNREADABLE_NOTICE, WORKSPACE_LOST,
 };
 mod cloud_rows;
 pub use cloud_rows::{AppendOutcome, RowAnchor};
@@ -1258,6 +1258,16 @@ impl Store {
         id: i64,
         delete_rows: impl FnOnce(&mut Self) -> Result<(), String>,
     ) -> Result<(), String> {
+        // The only copy of someone's uncommitted work may sit in this session's folder.
+        if let Some(raw) = self.cloud_continue_broken(id) {
+            let backup = serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()
+                .and_then(|v| v["backup"].as_str().map(str::to_owned))
+                .unwrap_or_default();
+            return Err(format!(
+                "An interrupted return from the cloud left a backup of uncommitted work in {backup}. Restore or discard it before deleting this conversation."
+            ));
+        }
         // Resolve the folder first; the persisted id is gone after deletion.
         let dir = self.thread_dir(id).ok().flatten();
         let cloud_cursor = match self.cloud_location(id) {
@@ -1326,7 +1336,7 @@ impl Store {
         tx.execute("DELETE FROM native_reminders WHERE session_id=?1", [id])
             .map_err(|e| e.to_string())?;
         tx.execute(
-            "DELETE FROM native_settings WHERE key IN (?1,?2,?3,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17) OR key LIKE ?4",
+            "DELETE FROM native_settings WHERE key IN (?1,?2,?3,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21) OR key LIKE ?4",
             params![
                 format!("agent:{id}"),
                 format!("context:{id}"),
@@ -1344,7 +1354,11 @@ impl Store {
                 format!("cloud-move:{id}"),
                 format!("cloud-move-note:{id}"),
                 format!("cloud-move-owner:{id}"),
-                format!("cloud-move-mark:{id}")
+                format!("cloud-move-mark:{id}"),
+                format!("cloud-continue:{id}"),
+                format!("cloud-move-point:{id}"),
+                format!("cloud-continue-broken:{id}"),
+                format!("gate-before-row:{id}")
             ],
         )
         .map_err(|e| e.to_string())?;

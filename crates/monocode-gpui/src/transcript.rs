@@ -683,6 +683,8 @@ pub(crate) struct TranscriptView {
     base: usize,
     /// The move point (`moved_at_row`) while the session lives in the cloud (design 4.5).
     cloud_move: Option<usize>,
+    /// Turns before this row came back through a new place (the click's gate).
+    returned_gate: Option<usize>,
     /// The store cursor for the turns above the loaded rows, if any.
     history_before: Option<i64>,
     /// The store cursor for the turns just above the window, which older
@@ -928,6 +930,12 @@ impl TranscriptView {
     }
     /// The session lives in the cloud from row `moved_at_row` on (or is local again): the
     /// edit button of a turn the move point gates is shown disabled, with the reason.
+    pub(crate) fn set_returned_gate(&mut self, before: Option<usize>, cx: &mut Context<Self>) {
+        if self.returned_gate != before {
+            self.returned_gate = before;
+            cx.notify();
+        }
+    }
     pub(crate) fn set_cloud_move(&mut self, moved_at_row: Option<usize>, cx: &mut Context<Self>) {
         if self.cloud_move != moved_at_row {
             self.cloud_move = moved_at_row;
@@ -1449,7 +1457,14 @@ impl TranscriptView {
                         monocode_core::checkpoint::gate::Operation::EditLastTurn,
                         start - base,
                     )
-                    .reason();
+                    .reason()
+                    .or_else(|| {
+                        monocode_core::checkpoint::gate::gate_returned(
+                            self.returned_gate,
+                            start - base,
+                        )
+                        .reason()
+                    });
                     match blocked {
                         None => d.child(
                             response_actions::button(
@@ -2588,6 +2603,7 @@ impl TranscriptView {
             history_requested: false,
             base: 0,
             cloud_move: None,
+            returned_gate: None,
             history_before: None,
             window_before: None,
             history_pager: None,

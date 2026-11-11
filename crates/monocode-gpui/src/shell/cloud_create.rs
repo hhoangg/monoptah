@@ -82,7 +82,11 @@ impl Shell {
     pub(super) fn sync_cloud_location(&mut self, cx: &mut Context<Self>) {
         for (id, view) in &self.sessions {
             let located = self.cloud_located.get(id).cloned();
-            view.update(cx, |view, cx| view.set_cloud_location(located, cx));
+            let returned = locked(&self.store).ok().and_then(|s| s.returned_gate(*id));
+            view.update(cx, |view, cx| {
+                view.set_cloud_location(located, cx);
+                view.set_returned_gate(returned, cx);
+            });
         }
         self.sync_cloud_moves(cx);
     }

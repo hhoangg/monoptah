@@ -1289,6 +1289,16 @@ fn moved_at_row_is_the_row_count_at_the_flip() {
 }
 
 #[test]
+fn the_flip_keeps_the_local_tree_the_move_left_for_the_way_back() {
+    let fx = Fx::new();
+    fx.run().0.unwrap();
+    let store = fx.store.lock().unwrap();
+    let point = store.cloud_move_point(fx.session).expect("a move point");
+    assert_eq!(point.head.len(), 40);
+    assert!(!point.tree.is_empty() && !point.work_cwd.is_empty());
+}
+
+#[test]
 fn a_busy_session_is_refused_before_and_during_the_move() {
     let fx = Fx::new();
     // Refused at the start.

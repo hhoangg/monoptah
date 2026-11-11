@@ -1979,7 +1979,12 @@ impl Shell {
     }
 
     /// Replaces a converted cloud session in the window by its archived local copy.
-    fn adopt_converted(&mut self, saved: Converted, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn adopt_converted(
+        &mut self,
+        saved: Converted,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let cloud_id = saved.cloud_id;
         if self.workspace.tab_of(cloud_id).is_some() {
             self.close_pane(cloud_id, window, cx);

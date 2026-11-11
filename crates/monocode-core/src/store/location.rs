@@ -96,7 +96,116 @@ pub const UNREADABLE_NOTICE: &str = "The cloud location of this conversation can
 /// Why a session with a stored but unparsable location is refused.
 pub const UNREADABLE_LOCATION: &str = "unreadable cloud location";
 
+/// The local tree a move left behind. Kept after the move (the move record is cleared at the
+/// flip) until the session returns, so "Continue locally" can tell whether the working copy
+/// changed since (design 4.2.3).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MovePoint {
+    /// The Host session of the move this point belongs to (a reused session id never matches).
+    pub host_session_id: String,
+    pub head: String,
+    pub tree: String,
+    /// The folder the session worked in: a session worktree, else the project folder.
+    pub work_cwd: String,
+    /// The checked out branch ref at the move (`refs/heads/...`); empty when it was detached
+    /// or unknown, which makes the in-place return refuse.
+    #[serde(default)]
+    pub branch: String,
+}
+
 impl Store {
+    fn move_point_key(session: i64) -> String {
+        format!("cloud-move-point:{session}")
+    }
+    pub fn set_cloud_move_point(&self, session: i64, point: &MovePoint) -> Result<(), String> {
+        self.save_setting(
+            &Self::move_point_key(session),
+            &serde_json::to_string(point).map_err(|e| e.to_string())?,
+        )
+    }
+    /// The recorded move point, only when it belongs to the session's current Cloud location.
+    pub fn cloud_move_point(&self, session: i64) -> Option<MovePoint> {
+        let SessionLocation::Cloud(location) = self.cloud_location(session).ok()? else {
+            return None;
+        };
+        let raw = self.setting(&Self::move_point_key(session)).ok()??;
+        let point: MovePoint = serde_json::from_str(&raw).ok()?;
+        (point.host_session_id == location.host_session_id).then_some(point)
+    }
+    pub fn clear_cloud_move_point(&self, session: i64) -> Result<(), String> {
+        self.save_setting(&Self::move_point_key(session), "")
+    }
+    fn broken_key(session: i64) -> String {
+        format!("cloud-continue-broken:{session}")
+    }
+    /// A return that could not put the local folder back: where the backup of the
+    /// uncommitted work is. Kept until the folder is verified or the user dealt with it.
+    pub fn cloud_continue_broken(&self, session: i64) -> Option<String> {
+        self.setting(&Self::broken_key(session))
+            .ok()?
+            .filter(|raw| !raw.is_empty())
+    }
+    /// Where the backup of an interrupted return is, when there is one.
+    pub fn continue_backup_path(&self, session: i64) -> Option<String> {
+        let raw = self.cloud_continue_broken(session)?;
+        serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .and_then(|v| v["backup"].as_str().map(str::to_owned))
+            .or(Some(String::new()))
+    }
+    pub fn set_cloud_continue_broken(&self, session: i64, raw: &str) -> Result<(), String> {
+        self.save_setting(&Self::broken_key(session), raw)
+    }
+    fn returned_gate_key(session: i64) -> String {
+        format!("gate-before-row:{session}")
+    }
+    /// Rows before this index ran somewhere else than where the session runs now (it came
+    /// back through a new worktree or a new Claude id): rewinding to them is disabled.
+    pub fn returned_gate(&self, session: i64) -> Option<usize> {
+        self.setting(&Self::returned_gate_key(session))
+            .ok()?
+            .and_then(|raw| raw.parse().ok())
+    }
+    /// Raises the gate; it never goes down (a later return must not re-enable turns an
+    /// earlier one disabled). `None` is a no-op.
+    pub fn set_returned_gate(&self, session: i64, row: Option<usize>) -> Result<(), String> {
+        let Some(row) = row else { return Ok(()) };
+        let row = row.max(self.returned_gate(session).unwrap_or(0));
+        self.save_setting(&Self::returned_gate_key(session), &row.to_string())
+    }
+    /// The next turn starts a new Claude conversation with a summary of the rows: the Claude
+    /// id is cleared (so a stale local file is never resumed), the summary is queued like a
+    /// provider switch does, and older turns are gated (their files belong to another id).
+    pub fn start_fresh_with_summary(&self, local: i64) -> Result<(), String> {
+        let session = self
+            .sessions()?
+            .into_iter()
+            .find(|s| s.id == local)
+            .ok_or("The conversation no longer exists")?;
+        let rows = self.load(local)?.rows;
+        let mut settings = self.agent_settings(local)?.unwrap_or_default();
+        settings.handoff = Some(crate::agent::Handoff {
+            from: session.provider.clone(),
+            brief: crate::response::handoff(&rows),
+        });
+        settings.revision += 1;
+        self.save_agent_settings(local, &settings)?;
+        self.reset_provider_id_if(local, session.provider_id.as_deref())?;
+        self.set_returned_gate(local, Some(rows.len()))
+    }
+    fn continue_key(session: i64) -> String {
+        format!("cloud-continue:{session}")
+    }
+    /// Progress of a "Continue locally" that stopped half way (see `continue_local`).
+    pub fn cloud_continue_progress(&self, session: i64) -> Option<String> {
+        self.setting(&Self::continue_key(session))
+            .ok()?
+            .filter(|raw| !raw.is_empty())
+    }
+    pub fn set_cloud_continue_progress(&self, session: i64, raw: &str) -> Result<(), String> {
+        self.save_setting(&Self::continue_key(session), raw)
+    }
     fn location_key(session: i64) -> String {
         format!("cloud-location:{session}")
     }
@@ -219,6 +328,13 @@ impl Store {
     /// cheap. The data stays in the workspace, and the confirmation says so (stronger when
     /// `cloud_may_hold_unsynced`).
     pub fn leave_cloud(&self, session: i64) -> Result<(), String> {
+        self.leave_cloud_inner(session, true)
+    }
+    /// [`Self::leave_cloud`] for the return that already brought the transcript back
+    /// ("Continue locally"): the Claude id stays. Plain Reset does not reconcile the
+    /// transcript, so it starts a new Claude conversation with a summary when the cloud may
+    /// hold turns the local file lacks (design 4.9 R7, rule D10).
+    pub(crate) fn leave_cloud_inner(&self, session: i64, fresh: bool) -> Result<(), String> {
         let backing = self.linked_remote_session(session)?;
         // Only a fresh `running` blocks. A Host waiting for input is not writing, and a flag
         // that is stale or sits next to a recorded problem (unreachable Host, lost workspace)
@@ -226,6 +342,17 @@ impl Store {
         if let Some((_, record)) = &backing {
             if record.running_now() && self.cloud_sync_error(session)?.is_none() {
                 return Err(HOST_TURN_RUNNING.to_string());
+            }
+        }
+        if fresh {
+            let cloud_rows = match self.cloud_location(session)? {
+                SessionLocation::Cloud(location) => {
+                    self.load(session)?.rows.len() > location.moved_at_row
+                }
+                SessionLocation::Local => false,
+            };
+            if cloud_rows || self.cloud_may_hold_unsynced(session) {
+                self.start_fresh_with_summary(session)?;
             }
         }
         self.reset_cloud_location_to_local(session)?;
@@ -258,6 +385,8 @@ impl Store {
             self.link_remote_session(id, None)?;
         }
         let _ = self.save_setting(&Self::sync_error_key(session), "");
+        let _ = self.save_setting(&Self::move_point_key(session), "");
+        let _ = self.save_setting(&Self::continue_key(session), "");
         self.save_setting(&Self::location_key(session), "")
     }
     /// Writes the Cloud location together with the settings the move needs in ONE transaction:
