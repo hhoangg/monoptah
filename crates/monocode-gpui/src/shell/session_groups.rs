@@ -624,6 +624,7 @@ impl Shell {
             items.extend(self.telegram_topic_item(id, cx));
             items.extend(self.cloud_move_menu_item(id));
             items.extend(self.continue_backup_items(id));
+            items.extend(self.return_cleanup_items(id));
         }
         items.extend([
             MenuAction::new("reminder", "Remind me")
@@ -697,6 +698,8 @@ impl Shell {
             "discard-continue-backup" => {
                 self.open_backup_action(id, cloud_continue::Op::Discard, window, cx)
             }
+            "retry-return-cleanup" => self.retry_return_cleanup(id, cx),
+            "keep-return-cleanup" => self.keep_return_cleanup(id, cx),
             "keep-continue-backup" => {
                 self.open_backup_action(id, cloud_continue::Op::Keep, window, cx)
             }

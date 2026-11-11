@@ -196,7 +196,7 @@ pub(super) fn confirm_text(kind: Kind, title: &str, noun: &str) -> String {
             "The {noun} of {who} was deleted, so the turns written there after the last sync are lost. The conversation continues on this computer. Its next message starts a new Claude session from a summary of the messages kept here; the old local Claude file is not resumed."
         ),
         Kind::Moved { unsynced } => format!(
-            "{who} comes back to this computer as the same conversation. Monoptah will wake the {noun} if it is stopped, {sync}apply the cloud code here (in place if your files are unchanged since the move, otherwise in a new worktree; your uncommitted changes are never overwritten), bring the Claude transcript back and then close the cloud copy. Nothing changes until all of that succeeded; if it fails, the conversation stays in the cloud.",
+            "{who} comes back to this computer as the same conversation. Monoptah will wake the {noun} if it is stopped, {sync}apply the cloud code here (in place if your files are unchanged since the move, otherwise in a new worktree; your uncommitted changes are never overwritten), bring the Claude transcript back and then close the cloud copy. Nothing changes until all of that succeeded; if it fails, the conversation stays in the cloud. After it succeeded, the {noun} is deleted when no other session uses it and nothing on it is missing here; otherwise it is kept and you are told why.",
             sync = if unsynced {
                 "copy the cloud turns that are not here yet, "
             } else {
@@ -204,8 +204,17 @@ pub(super) fn confirm_text(kind: Kind, title: &str, noun: &str) -> String {
             }
         ),
         Kind::Born => format!(
-            "{who} gets a copy on this computer that replaces it in the list (it is not archived). Monoptah will wake the {noun} if it is stopped, copy the conversation, put the cloud code in a new worktree and bring the Claude transcript back. The {noun} itself keeps running."
+            "{who} gets a copy on this computer that replaces it in the list (it is not archived). Monoptah will wake the {noun} if it is stopped, copy the conversation, put the cloud code in a new worktree and bring the Claude transcript back. After that, the {noun} is deleted when no other session uses it and nothing on it is missing here; otherwise it is kept and you are told why."
         ),
+    }
+}
+
+/// The status line after a return: the warnings follow the lead.
+fn back_text(message: &str) -> String {
+    if message.is_empty() {
+        "Back on this computer.".to_string()
+    } else {
+        format!("Back on this computer. {message}")
     }
 }
 
@@ -391,7 +400,19 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let message = done.warnings.join(" ");
+        let mut message = done.warnings.join(" ");
+        let done_local = done.local_id;
+        // The record of THIS return: the same session and the instance it came back from. An
+        // older record of the session for another instance is none of this return's business.
+        let came_from = self.cloud_marks.get(&id).map(|mark| mark.kind);
+        let armed = self
+            .cloud
+            .return_cleanups_for_session(done.local_id)
+            .into_iter()
+            .find(|r| {
+                r.cloud.name == done.codespace && came_from.is_none_or(|kind| r.cloud.kind == kind)
+            })
+            .filter(|record| record.auto_run());
         if done.local_id != id {
             self.remember_returned(id, done.local_id);
         }
@@ -403,11 +424,40 @@ impl Shell {
         } else {
             self.adopt_converted(done, window, cx);
         }
-        self.error = Some(if message.is_empty() {
-            "Back on this computer.".to_string()
-        } else {
-            format!("Back on this computer. {message}")
-        });
+        // Only after the adoption above: the instance is deleted once the return is complete
+        // and nothing else uses it (the core checks again; it may keep it and say why).
+        if let Some(record) = armed {
+            let started = self.start_return_cleanup(&record.key(), Some(back_text(&message)), cx);
+            let tail = if started {
+                Some(format!(
+                    "The {} {} is being deleted.",
+                    record.cloud.noun(),
+                    record.cloud.name
+                ))
+            } else {
+                // Could not start: the record is now a Retry and says why, or (when even
+                // that could not be saved) is offered again at the next start.
+                let what = format!("{} {}", record.cloud.noun(), record.cloud.name);
+                match self
+                    .cloud
+                    .return_cleanup_for(done_local, &record.cloud)
+                    .map(|r| r.last_error)
+                {
+                    Some(Some(why)) => Some(format!("The {what} was kept: {why}.")),
+                    Some(None) => Some(format!(
+                        "The {what} was not deleted; the cleanup will be offered again at the next start."
+                    )),
+                    None => None,
+                }
+            };
+            if let Some(tail) = tail {
+                if !message.is_empty() {
+                    message.push(' ');
+                }
+                message.push_str(&tail);
+            }
+        }
+        self.error = Some(back_text(&message));
         cx.notify();
     }
 

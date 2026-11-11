@@ -55,6 +55,7 @@ fn fake(
             ignored_truncated: false,
             evidence_partial: false,
             warnings: vec!["Applied.".into()],
+            transcript_lost: false,
             history_saved: true,
         })
     })
@@ -209,6 +210,8 @@ fn the_confirmation_says_what_will_happen_and_never_uses_dashes() {
         "uncommitted changes are never overwritten",
         "stays in the cloud",
         "same conversation",
+        "the codespace is deleted when no other session uses it",
+        "otherwise it is kept and you are told why",
     ] {
         assert!(moved.contains(needle), "{needle}: {moved}");
     }
@@ -222,6 +225,12 @@ fn the_confirmation_says_what_will_happen_and_never_uses_dashes() {
     let born = confirm_text(Kind::Born, "Fix login", "codespace");
     assert!(
         born.contains("not archived") && born.contains("new worktree"),
+        "{born}"
+    );
+    assert!(
+        born.contains("the codespace is deleted when no other session uses it")
+            && born.contains("nothing on it is missing here")
+            && !born.contains("keeps running"),
         "{born}"
     );
     for text in [moved, unsynced, lost, born] {
@@ -718,6 +727,421 @@ fn a_session_born_in_the_cloud_still_answers_under_its_old_id_once_it_is_local(
                 shell.remember_returned(local, 5000 + n);
             }
             assert!(shell.api_returned.len() <= 32);
+        })
+        .unwrap();
+}
+
+// ---------------------------------------------------------------- deleting the instance
+
+use monocode_core::cloud_sessions::{CleanupOutcome, CloudRef, HostCheck, ReturnCleanup};
+use std::sync::Mutex as StdMutex;
+
+const KEY: &str = "octo-abc";
+
+fn cleanup_record(last_error: Option<&str>, attempt: Option<u64>, local: i64) -> ReturnCleanup {
+    ReturnCleanup {
+        local_id: local,
+        cloud: CloudRef::codespace(KEY),
+        environment_id: "env-octo-abc".into(),
+        host_session_id: Some("host-1".into()),
+        title: "T".into(),
+        created_at: 1,
+        host_check: HostCheck::Clear,
+        attempt_started_at: attempt,
+        last_error: last_error.map(str::to_owned),
+        gone: false,
+    }
+}
+
+fn write_cleanup(store: &Database, record: &ReturnCleanup) {
+    locked(store)
+        .unwrap()
+        .save_setting(
+            &format!("cloud-return-cleanup:{}", record.key()),
+            &serde_json::to_string(record).unwrap(),
+        )
+        .unwrap();
+}
+
+fn cleanup_record_of(store: &Database, local: i64) -> Option<ReturnCleanup> {
+    let store = locked(store).unwrap();
+    store
+        .settings_with_key_prefix("cloud-return-cleanup:")
+        .unwrap()
+        .into_iter()
+        .filter_map(|(_, raw)| serde_json::from_str::<ReturnCleanup>(&raw).ok())
+        .find(|r| r.local_id == local)
+}
+
+/// A continue that, like the core after a full return, also arms the delete.
+fn arming(inner: cloud_continue::ContinueFn, store: Database) -> cloud_continue::ContinueFn {
+    Arc::new(move |cloud, id, progress| {
+        let result = inner(cloud, id, progress);
+        if let Ok(done) = &result {
+            write_cleanup(&store, &cleanup_record(None, None, done.local_id));
+        }
+        result
+    })
+}
+
+/// A fake delete: records the location of the session at call time, and answers like the
+/// core would (removes the record on success, keeps it with the error on failure).
+fn fake_cleanup(
+    calls: Arc<StdMutex<Vec<(String, bool)>>>,
+    answers: Arc<StdMutex<Vec<Result<CleanupOutcome, String>>>>,
+    store: Database,
+    local: i64,
+) -> cloud_return_cleanup::CleanupFn {
+    Arc::new(move |_, key| {
+        let is_local = !locked(&store)
+            .unwrap()
+            .cloud_location(local)
+            .unwrap()
+            .is_cloud();
+        calls.lock().unwrap().push((key.to_string(), is_local));
+        let answer = answers.lock().unwrap().remove(0);
+        let setting = format!("cloud-return-cleanup:{key}");
+        match &answer {
+            Ok(_) => locked(&store).unwrap().save_setting(&setting, "").unwrap(),
+            Err(e) => write_cleanup(&store, &cleanup_record(Some(e), None, local)),
+        }
+        answer
+    })
+}
+
+fn deleted() -> Result<CleanupOutcome, String> {
+    Ok(CleanupOutcome::Deleted { warning: None })
+}
+
+#[gpui::test]
+fn a_successful_return_runs_the_delete_once_after_the_adoption(cx: &mut TestAppContext) {
+    let (window, local) = moved_window(cx);
+    let continues = Arc::new(AtomicUsize::new(0));
+    let deletes = Arc::new(StdMutex::new(vec![]));
+    window
+        .update(cx, |shell, window, cx| {
+            shell.cloud_continue.run = arming(
+                fake(continues.clone(), None, shell.store.clone()),
+                shell.store.clone(),
+            );
+            shell.cloud_return_cleanup.run = fake_cleanup(
+                deletes.clone(),
+                Arc::new(StdMutex::new(vec![deleted()])),
+                shell.store.clone(),
+                local,
+            );
+            shell.open_continue_locally(local, window, cx);
+            assert!(deletes.lock().unwrap().is_empty(), "not before confirming");
+            shell.confirm_continue_locally(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, _| {
+            assert_eq!(continues.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                *deletes.lock().unwrap(),
+                vec![(KEY.to_string(), true)],
+                "once, with the session already back"
+            );
+            assert!(shell.cloud_return_cleanup.running.is_empty());
+            assert!(!shell.cloud_workspaces_busy.contains(KEY));
+            assert!(
+                shell
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("Back on this computer. Applied.")
+                        && e.contains("The codespace octo-abc was deleted.")),
+                "{:?}",
+                shell.error
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_failed_return_never_runs_the_delete(cx: &mut TestAppContext) {
+    let (window, local) = moved_window(cx);
+    let deletes = Arc::new(StdMutex::new(vec![]));
+    window
+        .update(cx, |shell, window, cx| {
+            // Even a record left over from before must not be started by a failure.
+            write_cleanup(&shell.store, &cleanup_record(None, None, local));
+            shell.cloud_continue.run = arming(
+                fake(
+                    Arc::new(AtomicUsize::new(0)),
+                    Some("ssh dropped"),
+                    shell.store.clone(),
+                ),
+                shell.store.clone(),
+            );
+            shell.cloud_return_cleanup.run = fake_cleanup(
+                deletes.clone(),
+                Arc::new(StdMutex::new(vec![deleted()])),
+                shell.store.clone(),
+                local,
+            );
+            shell.open_continue_locally(local, window, cx);
+            shell.confirm_continue_locally(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, window, cx| {
+            assert_eq!(shell.cloud_continue.phase_name(), "failed");
+            shell.close_continue_locally(window, cx);
+            assert!(deletes.lock().unwrap().is_empty());
+            assert!(shell.cloud_return_cleanup.running.is_empty());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_failed_delete_offers_retry_and_keep_and_retry_runs_it_again(cx: &mut TestAppContext) {
+    let (window, local) = moved_window(cx);
+    let deletes = Arc::new(StdMutex::new(vec![]));
+    window
+        .update(cx, |shell, window, cx| {
+            shell.cloud_continue.run = arming(
+                fake(Arc::new(AtomicUsize::new(0)), None, shell.store.clone()),
+                shell.store.clone(),
+            );
+            shell.cloud_return_cleanup.run = fake_cleanup(
+                deletes.clone(),
+                Arc::new(StdMutex::new(vec![Err("gh is offline".into()), deleted()])),
+                shell.store.clone(),
+                local,
+            );
+            shell.open_continue_locally(local, window, cx);
+            shell.confirm_continue_locally(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, window, cx| {
+            assert_eq!(deletes.lock().unwrap().len(), 1);
+            let error = shell.error.clone().unwrap_or_default();
+            assert!(
+                error.contains("Could not delete the codespace octo-abc: gh is offline"),
+                "{error}"
+            );
+            assert!(error.contains("Retry from the session menu"), "{error}");
+            assert!(
+                error.contains("Back on this computer. Applied."),
+                "the return warnings stay: {error}"
+            );
+            let items = labels(shell, local, cx);
+            assert!(
+                items.contains(&"Retry deleting codespace octo-abc".to_string()),
+                "{items:?}"
+            );
+            assert!(items.contains(&"Keep codespace octo-abc".to_string()));
+            shell.run_session_menu(local, "retry-return-cleanup", window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            assert_eq!(deletes.lock().unwrap().len(), 2, "retry calls it again");
+            assert!(cleanup_record_of(&shell.store, local).is_none());
+            let items = labels(shell, local, cx);
+            assert!(items.iter().all(|l| !l.contains("deleting codespace")));
+            assert!(
+                shell
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("was deleted."))
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn keep_dismisses_the_pending_delete_and_deletes_nothing(cx: &mut TestAppContext) {
+    let (window, local) = moved_window(cx);
+    let deletes = Arc::new(StdMutex::new(vec![]));
+    window
+        .update(cx, |shell, window, cx| {
+            shell.cloud_continue.run = arming(
+                fake(Arc::new(AtomicUsize::new(0)), None, shell.store.clone()),
+                shell.store.clone(),
+            );
+            shell.cloud_return_cleanup.run = fake_cleanup(
+                deletes.clone(),
+                Arc::new(StdMutex::new(vec![Err("gh is offline".into())])),
+                shell.store.clone(),
+                local,
+            );
+            shell.open_continue_locally(local, window, cx);
+            shell.confirm_continue_locally(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, window, cx| {
+            shell.run_session_menu(local, "keep-return-cleanup", window, cx);
+            assert!(cleanup_record_of(&shell.store, local).is_none());
+            assert!(
+                shell
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("The codespace octo-abc was kept"))
+            );
+            let items = labels(shell, local, cx);
+            assert!(items.iter().all(|l| !l.contains("deleting codespace")));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(deletes.lock().unwrap().len(), 1, "no second delete");
+}
+
+#[gpui::test]
+fn at_start_an_interrupted_delete_waits_for_retry_and_an_untried_one_runs(cx: &mut TestAppContext) {
+    let (window, local) = moved_window(cx);
+    let deletes = Arc::new(StdMutex::new(vec![]));
+    window
+        .update(cx, |shell, _, cx| {
+            // The app closed while this delete was running.
+            write_cleanup(&shell.store, &cleanup_record(None, Some(5), local));
+            shell.cloud_return_cleanup.run = fake_cleanup(
+                deletes.clone(),
+                Arc::new(StdMutex::new(vec![deleted()])),
+                shell.store.clone(),
+                local,
+            );
+            shell.resume_return_cleanups(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            assert!(deletes.lock().unwrap().is_empty(), "not run by itself");
+            let record = cleanup_record_of(&shell.store, local).unwrap();
+            assert!(record.needs_retry() && record.attempt_started_at.is_none());
+            assert!(
+                labels(shell, local, cx).contains(&"Retry deleting codespace octo-abc".to_string())
+            );
+            // Armed but never tried: runs at start.
+            write_cleanup(&shell.store, &cleanup_record(None, None, local));
+            shell.resume_return_cleanups(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(deletes.lock().unwrap().len(), 1);
+}
+
+#[gpui::test]
+fn an_older_record_for_another_instance_does_not_hide_the_one_just_armed(cx: &mut TestAppContext) {
+    let (window, local) = moved_window(cx);
+    let deletes = Arc::new(StdMutex::new(vec![]));
+    window
+        .update(cx, |shell, window, cx| {
+            let mut old = cleanup_record(Some("gh is offline"), None, local);
+            old.cloud = CloudRef::codespace("old-cs");
+            old.created_at = 0;
+            write_cleanup(&shell.store, &old);
+            shell.cloud_continue.run = arming(
+                fake(Arc::new(AtomicUsize::new(0)), None, shell.store.clone()),
+                shell.store.clone(),
+            );
+            shell.cloud_return_cleanup.run = fake_cleanup(
+                deletes.clone(),
+                Arc::new(StdMutex::new(vec![deleted()])),
+                shell.store.clone(),
+                local,
+            );
+            shell.open_continue_locally(local, window, cx);
+            shell.confirm_continue_locally(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            assert_eq!(
+                *deletes.lock().unwrap(),
+                vec![(KEY.to_string(), true)],
+                "the instance just returned from is deleted"
+            );
+            // The older one still waits for the user and is named in the menu.
+            assert!(
+                labels(shell, local, cx).contains(&"Retry deleting codespace old-cs".to_string())
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_delete_that_cannot_start_becomes_a_retry_and_is_not_run_silently_later(
+    cx: &mut TestAppContext,
+) {
+    let (window, local) = moved_window(cx);
+    let deletes = Arc::new(StdMutex::new(vec![]));
+    window
+        .update(cx, |shell, _, cx| {
+            write_cleanup(&shell.store, &cleanup_record(None, None, local));
+            shell.cloud_return_cleanup.run = fake_cleanup(
+                deletes.clone(),
+                Arc::new(StdMutex::new(vec![deleted()])),
+                shell.store.clone(),
+                local,
+            );
+            // Another action works on the same workspace.
+            shell.cloud_workspaces_busy.insert(KEY.to_string());
+            assert!(!shell.start_return_cleanup(KEY, Some("Back on this computer.".into()), cx));
+            let record = cleanup_record_of(&shell.store, local).unwrap();
+            assert!(
+                record.last_error.as_deref().is_some_and(
+                    |e| e.contains("another action was working on the codespace octo-abc")
+                ),
+                "{record:?}"
+            );
+            let status = shell.error.clone().unwrap_or_default();
+            assert!(
+                status.starts_with("Back on this computer.") && status.contains("choose Retry"),
+                "{status}"
+            );
+            shell.cloud_workspaces_busy.clear();
+            shell.resume_return_cleanups(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(
+        deletes.lock().unwrap().is_empty(),
+        "not run silently at start"
+    );
+}
+
+#[gpui::test]
+fn a_cleanup_of_an_instance_already_gone_is_not_offered_as_a_delete(cx: &mut TestAppContext) {
+    let (window, local) = moved_window(cx);
+    window
+        .update(cx, |shell, _, cx| {
+            let mut record = cleanup_record(Some("could not save"), None, local);
+            record.gone = true;
+            write_cleanup(&shell.store, &record);
+            let items = labels(shell, local, cx);
+            assert!(items.contains(&"Finish cleanup of codespace octo-abc".to_string()));
+            assert!(items.iter().all(|l| !l.contains("Retry deleting")));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn dismissing_a_cleanup_of_a_gone_instance_does_not_claim_it_was_kept(cx: &mut TestAppContext) {
+    let (window, local) = moved_window(cx);
+    window
+        .update(cx, |shell, window, cx| {
+            let mut record = cleanup_record(Some("could not save"), None, local);
+            record.gone = true;
+            write_cleanup(&shell.store, &record);
+            shell.run_session_menu(local, "keep-return-cleanup", window, cx);
+            let status = shell.error.clone().unwrap_or_default();
+            assert!(
+                status.contains("is already deleted") && status.contains("only the cleanup notice"),
+                "{status}"
+            );
+            assert!(!status.contains("was kept") && !status.contains("gh codespace"));
+            assert!(cleanup_record_of(&shell.store, local).is_none());
         })
         .unwrap();
 }

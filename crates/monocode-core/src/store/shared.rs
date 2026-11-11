@@ -1421,6 +1421,21 @@ impl Store {
             })
             .collect())
     }
+    pub(super) fn shared_settings_with_key_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, String)>, String> {
+        Ok(self
+            .shared
+            .as_ref()
+            .unwrap()
+            .extras
+            .borrow()
+            .iter()
+            .filter(|(_, value)| !value.is_empty())
+            .filter_map(|(key, value)| Some((key.strip_prefix(prefix)?.to_string(), value.clone())))
+            .collect())
+    }
     pub(super) fn shared_drafts(&self) -> Result<HashSet<i64>, String> {
         let mut query = sql(self.conn.prepare(&format!(
             "SELECT id FROM sessions WHERE {}!=0",

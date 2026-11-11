@@ -404,6 +404,9 @@ pub struct Converted {
     pub evidence_partial: bool,
     /// Problems that did not stop the conversion.
     pub warnings: Vec<String>,
+    /// The cloud session had a Claude conversation but its raw transcript was not copied
+    /// here (not found, or not saved), so the cloud copy may be the only one left.
+    pub transcript_lost: bool,
     /// Whether the conversation itself was saved. `false` for a files-only archive that
     /// could not read the history: only the code state is in the local copy.
     pub history_saved: bool,
@@ -1367,6 +1370,7 @@ impl CloudSessions {
                     ignored_truncated: snap.ignored_truncated,
                     evidence_partial: false,
                     warnings: vec![],
+                    transcript_lost: provider_id.is_some() && !snap.jsonl,
                     history_saved,
                 });
             }
@@ -1393,6 +1397,7 @@ impl CloudSessions {
                 ignored_truncated: snap.ignored_truncated,
                 evidence_partial: false,
                 warnings: vec![],
+                transcript_lost: provider_id.is_some() && !snap.jsonl,
                 history_saved,
             })
         };

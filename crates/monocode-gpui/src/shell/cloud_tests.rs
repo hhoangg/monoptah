@@ -197,6 +197,7 @@ fn fake_convert(store: Database, fail: Option<&'static str>) -> cloud::ConvertFn
             ignored_truncated: false,
             evidence_partial: false,
             warnings: vec![],
+            transcript_lost: false,
             history_saved: true,
         })
     })

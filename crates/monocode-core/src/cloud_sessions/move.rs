@@ -580,6 +580,12 @@ impl CloudSessions {
         busy: &dyn Fn() -> bool,
     ) -> Result<MoveRecord, String> {
         let id = request.session_id;
+        if let MoveTarget::Existing { backend, name } = &request.target {
+            self.refuse_while_cleaning(&CloudRef {
+                kind: *backend,
+                name: name.clone(),
+            })?;
+        }
         if self
             .moves
             .lock()
@@ -682,6 +688,14 @@ impl CloudSessions {
             started_by: request.started_by,
             kit_off: request.kit_off,
         };
+        // Again with the store held: a delete that began since the first look must see this
+        // record, or this move must see the delete.
+        if let MoveTarget::Existing { backend, name } = &record.target {
+            self.refuse_while_cleaning(&CloudRef {
+                kind: *backend,
+                name: name.clone(),
+            })?;
+        }
         store.save_setting(&owner_key(id), &record.owner)?;
         save_record(&store, &record)?;
         Ok(record)

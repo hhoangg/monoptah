@@ -690,6 +690,8 @@ pub struct CloudSessions {
     kit_seams: claude_setup::KitSeams,
     /// Moves (and rollbacks) running in this process, by local session id.
     moves: Mutex<HashMap<i64, Arc<move_session::RunState>>>,
+    /// Instances (by cloud key) whose return cleanup runs in this process.
+    cleaning: Mutex<std::collections::HashSet<String>>,
     /// Test seam of the move flip: runs after the Host link and before the location.
     #[cfg(test)]
     flip_hook: Mutex<Option<move_session::FlipHook>>,
@@ -717,6 +719,7 @@ impl CloudSessions {
             reconnecting: Mutex::new(Default::default()),
             kit_seams: claude_setup::KitSeams::system(),
             moves: Mutex::new(HashMap::new()),
+            cleaning: Mutex::new(Default::default()),
             #[cfg(test)]
             flip_hook: Mutex::new(None),
         }
@@ -838,6 +841,9 @@ impl CloudSessions {
         progress: &mut dyn FnMut(&str),
         created: &mut Option<String>,
     ) -> Result<CloudBinding, String> {
+        if let CodespaceChoice::Named(name) = &target.codespace {
+            self.refuse_while_cleaning(&CloudRef::codespace(name))?;
+        }
         let resolved = self.resolve_codespace(local_cwd, target, progress)?;
         if resolved.created {
             *created = Some(resolved.name.clone());
@@ -1528,6 +1534,7 @@ impl CloudSessions {
         harness: &str,
     ) -> Result<crate::store::Session, String> {
         require_claude(harness)?;
+        self.refuse_while_cleaning(cloud)?;
         let store = self.store()?;
         let on_instance: Vec<RemoteSession> = store
             .cloud_sessions(local_cwd)?
@@ -1553,6 +1560,7 @@ impl CloudSessions {
                     cloud.name
                 )
             })?;
+        self.refuse_while_cleaning(cloud)?;
         store.create(harness, &ready.project.key)
     }
 
@@ -1858,6 +1866,8 @@ pub use backend::{CloudBackend, CloudBackendKind, CloudRef, CodespacesBackend};
 mod continue_local;
 mod convert;
 pub use convert::*;
+pub mod return_cleanup;
+pub use return_cleanup::{CleanupOutcome, HostCheck, ReturnCleanup};
 pub mod transcript_sync;
 
 pub mod startup;
@@ -1889,6 +1899,8 @@ mod move_out_tests;
 mod move_tests;
 #[cfg(test)]
 mod move_ui_tests;
+#[cfg(all(test, unix))]
+mod return_cleanup_tests;
 #[cfg(test)]
 mod startup_tests;
 #[cfg(test)]
