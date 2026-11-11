@@ -279,6 +279,11 @@ impl Input {
     /// Keep authentication text out of drawing, accessibility and clipboard.
     pub(crate) fn set_secret(&mut self, secret: bool) {
         self.secret = secret;
+        if secret {
+            // Nothing typed into a secret field is kept beyond the field.
+            self.edits.clear();
+            self.reset_prompt_history();
+        }
     }
     #[cfg(test)]
     pub(crate) fn is_secret(&self) -> bool {
@@ -618,7 +623,7 @@ impl Input {
     pub(crate) fn set_text(&mut self, text: String, cx: &mut Context<Self>) {
         if self.code.is_none() && self.marked.is_none() && *self.content != *text {
             let before = self.snapshot();
-            self.edits.record(
+            self.record_edit(
                 before,
                 &(0..self.content.len()),
                 edit_history::EditKind::Other,
@@ -641,6 +646,26 @@ impl Input {
         self.scroll_y = px(0.);
         cx.emit(Changed);
         cx.notify();
+    }
+    /// Record an undo step, unless the field is secret: its text must not
+    /// outlive the field in history snapshots.
+    fn record_edit(
+        &mut self,
+        before: edit_history::Snapshot,
+        range: &Range<usize>,
+        kind: edit_history::EditKind,
+        caret_after: usize,
+        now: std::time::Instant,
+    ) {
+        if !self.secret {
+            self.edits.record(before, range, kind, caret_after, now);
+        }
+    }
+    /// A composition just ended; if it changed nothing, forget its step.
+    fn composition_ended(&mut self, was_composing: bool) {
+        if was_composing && self.marked.is_none() && self.code.is_none() {
+            self.edits.discard_noop(&self.content);
+        }
     }
     fn snapshot(&self) -> edit_history::Snapshot {
         edit_history::Snapshot {
@@ -672,7 +697,7 @@ impl Input {
         if self.content != snapshot.content {
             let before = self.snapshot();
             let all = 0..self.content.len();
-            self.edits.record(
+            self.record_edit(
                 before,
                 &all,
                 edit_history::EditKind::Other,
@@ -1409,7 +1434,8 @@ impl EntityInputHandler for Input {
         self.marked.clone().map(|r| self.range16(r))
     }
     fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
-        self.marked = None;
+        let was_composing = self.marked.take().is_some();
+        self.composition_ended(was_composing);
         cx.emit(Changed);
         cx.notify();
     }
@@ -1492,7 +1518,7 @@ impl EntityInputHandler for Input {
                 self.char_delete,
             );
             let before = self.snapshot();
-            self.edits.record(
+            self.record_edit(
                 before,
                 &r,
                 kind,
@@ -1512,7 +1538,8 @@ impl EntityInputHandler for Input {
         self.code_changed(Some((r.clone(), text.len())));
         self.selection = end..end;
         self.reversed = false;
-        self.marked = None;
+        let was_composing = self.marked.take().is_some();
+        self.composition_ended(was_composing);
         self.command_removed(previous_command, cx);
         cx.emit(Changed);
         cx.notify();
@@ -1556,7 +1583,7 @@ impl EntityInputHandler for Input {
         // A composition is one undo step, taken as it begins.
         if self.code.is_none() && self.marked.is_none() {
             let before = self.snapshot();
-            self.edits.record(
+            self.record_edit(
                 before,
                 &r,
                 edit_history::EditKind::Other,
@@ -1574,7 +1601,9 @@ impl EntityInputHandler for Input {
         .into();
         let text = text.to_owned();
         self.code_changed(Some((r.clone(), text.len())));
+        let was_composing = self.marked.is_some();
         self.marked = (!text.is_empty()).then_some(r.start..r.start + text.len());
+        self.composition_ended(was_composing);
         let selection = selection
             .map(|s| r.start + from16(&text, s.start)..r.start + from16(&text, s.end))
             .unwrap_or(r.start + text.len()..r.start + text.len());
@@ -2691,6 +2720,81 @@ mod native_input_tests {
         let (undo, _) = undo_keys();
         cx.simulate_keystrokes(window.into(), undo);
         assert_eq!(text(&input, cx), "third");
+    }
+
+    #[gpui::test]
+    fn undo_and_redo_end_prompt_history_browsing(cx: &mut TestAppContext) {
+        let (undo, redo) = undo_keys();
+        let window = with_history(cx, &["older", "newer"]);
+        let input = window.root(cx).unwrap();
+        cx.simulate_keystrokes(window.into(), "d r a f t");
+        cx.simulate_keystrokes(window.into(), "up");
+        assert_eq!(text(&input, cx), "newer");
+        cx.simulate_keystrokes(window.into(), undo);
+        assert_eq!(text(&input, cx), "draft");
+        assert!(!input.read_with(cx, |i, _| i.browsing_prompt_history()));
+        // Down does not jump back to a stale draft.
+        cx.simulate_keystrokes(window.into(), "down");
+        assert_eq!(text(&input, cx), "draft");
+        cx.simulate_keystrokes(window.into(), redo);
+        assert_eq!(text(&input, cx), "newer");
+        assert!(!input.read_with(cx, |i, _| i.browsing_prompt_history()));
+        // Up starts a fresh walk from the most recent prompt.
+        cx.simulate_keystrokes(window.into(), "up");
+        assert_eq!(text(&input, cx), "newer");
+        cx.simulate_keystrokes(window.into(), "up");
+        assert_eq!(text(&input, cx), "older");
+    }
+
+    #[gpui::test]
+    fn a_cancelled_composition_leaves_no_undo_step(cx: &mut TestAppContext) {
+        let window = field(cx, false);
+        let input = window.root(cx).unwrap();
+        cx.simulate_keystrokes(window.into(), "a b");
+        let steps = input.read_with(cx, |i, _| i.edits.can_undo());
+        assert!(steps);
+        window
+            .update(cx, |i, w, cx| {
+                i.replace_and_mark_text_in_range(None, "に", Some(1..1), w, cx);
+                i.replace_and_mark_text_in_range(None, "", None, w, cx);
+                i.unmark_text(w, cx);
+            })
+            .unwrap();
+        assert_eq!(text(&input, cx), "ab");
+        let (undo, _) = undo_keys();
+        cx.simulate_keystrokes(window.into(), undo);
+        assert_eq!(text(&input, cx), "", "undo skips the empty composition");
+        // A committed composition is still one step.
+        window
+            .update(cx, |i, w, cx| {
+                i.replace_and_mark_text_in_range(None, "に", Some(1..1), w, cx);
+                i.replace_text_in_range(None, "日", w, cx);
+            })
+            .unwrap();
+        assert_eq!(text(&input, cx), "日");
+        cx.simulate_keystrokes(window.into(), undo);
+        assert_eq!(text(&input, cx), "");
+    }
+
+    #[gpui::test]
+    fn secret_fields_keep_no_undo_or_prompt_history(cx: &mut TestAppContext) {
+        let (undo, _) = undo_keys();
+        let window = with_history(cx, &["sent"]);
+        let input = window.root(cx).unwrap();
+        cx.simulate_keystrokes(window.into(), "x");
+        window.update(cx, |i, _, _| i.set_secret(true)).unwrap();
+        assert!(
+            !input.read_with(cx, |i, _| i.edits.can_undo()),
+            "turning secret drops earlier steps"
+        );
+        cx.simulate_keystrokes(window.into(), "p w");
+        replace(window, "hunter2", cx);
+        assert!(!input.read_with(cx, |i, _| i.edits.can_undo()));
+        cx.simulate_keystrokes(window.into(), undo);
+        assert_eq!(text(&input, cx), "hunter2");
+        cx.simulate_keystrokes(window.into(), "up");
+        assert_eq!(text(&input, cx), "hunter2", "no recall in a secret field");
+        assert!(!input.read_with(cx, |i, _| i.browsing_prompt_history()));
     }
 
     #[gpui::test]

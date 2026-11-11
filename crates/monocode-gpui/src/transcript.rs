@@ -456,7 +456,6 @@ pub(crate) fn mono_spoke(source: &[Row], from: usize, to: usize) -> bool {
     }
     false
 }
-/// The first row of the prompt block that opens `turn`.
 /// Each user message's text (its rows joined), oldest first, with any
 /// legacy attachment links removed.
 pub(crate) fn sent_prompts(source: &[Row]) -> Vec<String> {
@@ -476,6 +475,7 @@ pub(crate) fn sent_prompts(source: &[Row]) -> Vec<String> {
     }
     prompts
 }
+/// The first row of the prompt block that opens `turn`.
 pub(crate) fn prompt_start(source: &[Row], turn: usize) -> usize {
     let mut at = turn.min(source.len());
     while at > 0 && source[at - 1].is_prompt() {
