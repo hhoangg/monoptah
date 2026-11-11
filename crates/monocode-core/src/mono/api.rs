@@ -15,6 +15,9 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             cloud_fields = cloud::fields(action).ok_or("Unknown app action. Run app help")?;
             cloud_fields.as_str()
         }
+        action if super::move_api::is_move_action(action) => {
+            super::move_api::fields(action).ok_or("Unknown app action. Run app help")?
+        }
         "sessions.send"=>"sessionId prompt project notifyOnComplete completionDelivery",
         "sessions.draft"=>"sessionId prompt project",
         "sessions.pullEvidence"=>"sessionId project path taskId",
@@ -91,9 +94,11 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             return Err("before must be a turn ID".into());
         }
         // A cloud session lives in the remote store, whose IDs are negative numbers.
-        let session = matches!(key.as_str(), "sessionId" | "besideSessionId");
-        if matches!(key.as_str(), "id" | "sessionId" | "besideSessionId")
-            && !value.is_string()
+        let session = matches!(key.as_str(), "sessionId" | "besideSessionId" | "session");
+        if matches!(
+            key.as_str(),
+            "id" | "sessionId" | "besideSessionId" | "session"
+        ) && !value.is_string()
             && value.as_u64().is_none()
             && !(session && value.as_i64().is_some_and(|n| n < 0))
         {
@@ -114,6 +119,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             "number",
             "id",
             "sessionId",
+            "session",
             "besideSessionId",
             "modelSettings",
             "schedule",
@@ -155,7 +161,14 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             crate::accounts::parse_provider(provider.as_str().unwrap_or_default())?;
         }
     }
-    if let Some(target) = input.get("target") {
+    if super::move_api::is_move_action(action) {
+        super::move_api::validate(action, input)?;
+    }
+    // A move's target has its own, narrower check (move_api::validate).
+    let start_target = input
+        .get("target")
+        .filter(|_| action != super::move_api::MOVE_TO_CLOUD);
+    if let Some(target) = start_target {
         cloud::validate_target(target, input)?;
         if input.get("account").is_some() {
             return Err(ACCOUNT_LOCAL_ONLY.into());

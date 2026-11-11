@@ -13,6 +13,7 @@ mod habit_yaml_tests;
 pub mod habits;
 pub mod heartbeat;
 pub mod memory;
+pub mod move_api;
 pub mod provider_files;
 pub mod work;
 pub mod workflows;
