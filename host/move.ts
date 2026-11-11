@@ -490,7 +490,15 @@ export class HostMoves {
       throw new Error("This branch already has a working copy. Select it from the picker.");
     }
     const path = join(listed.defaultRoot, `wt-${branch.replace(/[^a-zA-Z0-9_-]/g, "-")}${detached ? "-snapshot" : ""}`);
-    if (existsSync(path)) throw new Error(`${path} already exists. Choose another branch name.`);
+    if (existsSync(path)) {
+      // A repeated call finds the snapshot worktree of an earlier call (a detached worktree
+      // of a default-branch move has a fixed name): it is the result when it is a registered
+      // worktree that holds this very snapshot.
+      const known = listed.worktrees.find((entry) => entry.path === path && !entry.missing);
+      if (known && known.head === head && (await worktreeTree(path, paths)) === tree)
+        return result(path, false, true);
+      throw new Error(`${path} already exists. Choose another branch name.`);
+    }
     const local = (
       await git(root, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]).catch(() => "")
     ).trim();
