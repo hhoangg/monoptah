@@ -2,6 +2,7 @@
 //! persistent native_* tables, or history conversion on open.
 mod accounts;
 pub(super) mod blocks;
+mod cloud_rows;
 mod edit;
 mod index_search;
 mod settings;
