@@ -16,7 +16,7 @@ use monocode_core::cloud_sessions::{
     CloudSessions, CloudState, HARNESS, docker_config,
     move_session::{
         CancelChoice, CancelReport, MOVE_ABORTED, MOVE_STOPPING, MoveEvent, MoveOutcome,
-        MoveRecord, MoveRequest, MoveStep, MoveTarget, NO_MOVE, pending_moves,
+        MoveRecord, MoveRequest, MoveStep, MoveTarget, NO_MOVE, StartedBy, pending_moves,
     },
     move_ui::{self, MovePreview},
 };
@@ -65,9 +65,9 @@ impl MoveEngine for CloudSessions {
 /// A move of one session as the shell knows it.
 pub(super) struct MoveRun {
     /// The latest record. `None` until `begin_move` answered.
-    record: Option<MoveRecord>,
+    pub(super) record: Option<MoveRecord>,
     /// A worker runs `begin_move` / `run_move`.
-    running: bool,
+    pub(super) running: bool,
     cancel: Arc<AtomicBool>,
     /// Mirrors whether the conversation runs a turn; the engine asks it at the flip.
     busy: Arc<AtomicBool>,
@@ -76,6 +76,17 @@ pub(super) struct MoveRun {
     pending_cancel: Option<CancelChoice>,
     /// Set by the worker thread when it ends; the quit handler waits on it.
     ended: Arc<AtomicBool>,
+    /// An agent started it through the app API (`sessions.moveToCloud`); a refusal of
+    /// `begin_move` is then kept for `sessions.moveStatus`, because no dialog shows it.
+    pub(super) by_api: bool,
+}
+
+/// What a new move is made of: where it goes, who asked and whether the kit is off. The API
+/// can only narrow these (rule D11).
+pub(super) struct NewMove {
+    pub target: MoveTarget,
+    pub started_by: StartedBy,
+    pub kit_off: bool,
 }
 
 impl MoveRun {
@@ -83,7 +94,7 @@ impl MoveRun {
         self.busy.store(busy, Ordering::Relaxed);
     }
 
-    fn new(record: Option<MoveRecord>) -> Self {
+    pub(super) fn new(record: Option<MoveRecord>) -> Self {
         Self {
             record,
             running: false,
@@ -91,6 +102,7 @@ impl MoveRun {
             busy: Arc::new(AtomicBool::new(false)),
             pending_cancel: None,
             ended: Arc::new(AtomicBool::new(true)),
+            by_api: false,
         }
     }
 }
@@ -145,10 +157,18 @@ impl Shell {
         for id in ids {
             let offer = self.move_offer(id);
             let locked = self.cloud_moves.contains_key(&id);
+            let by_agent = self.cloud_moves.get(&id).is_some_and(|run| {
+                run.by_api
+                    || run
+                        .record
+                        .as_ref()
+                        .is_some_and(|r| r.started_by == StartedBy::Api)
+            });
             let label = self.move_label(id);
             if let Some(view) = self.sessions.get(&id) {
                 view.update(cx, |view, cx| {
                     view.set_move_locked(locked, cx);
+                    view.set_move_by_agent(by_agent, cx);
                     view.set_move_offer(offer, cx);
                     view.set_cloud_moved(label, cx);
                 });
@@ -195,7 +215,7 @@ impl Shell {
     // ------------------------------------------------------------------ dialog
 
     /// The targets the dialog offers for the project of session `id`.
-    fn move_targets(&self, id: i64) -> Vec<TargetChoice> {
+    pub(super) fn move_targets(&self, id: i64) -> Vec<TargetChoice> {
         let Some(summary) = self.session_summaries.get(&id) else {
             return Vec::new();
         };
@@ -316,7 +336,7 @@ impl Shell {
         cx.notify();
     }
 
-    fn session_is_busy(&self, id: i64, cx: &App) -> bool {
+    pub(super) fn session_is_busy(&self, id: i64, cx: &App) -> bool {
         self.sessions.get(&id).is_some_and(|c| {
             let c = c.read(cx);
             c.busy || c.is_stopping()
@@ -454,7 +474,12 @@ impl Shell {
         }
         let run = MoveRun::new(None);
         self.cloud_moves.insert(id, run);
-        self.start_move_worker(id, Some(target), cx);
+        let new = NewMove {
+            target,
+            started_by: StartedBy::User,
+            kit_off: false,
+        };
+        self.start_move_worker(id, Some(new), cx);
         self.sync_cloud_moves(cx);
     }
 
@@ -471,7 +496,12 @@ impl Shell {
 
     /// Runs `begin_move` (when `target` is given) and then `run_move` on a worker. Called ONLY
     /// from the confirm and retry actions.
-    fn start_move_worker(&mut self, id: i64, target: Option<MoveTarget>, cx: &mut Context<Self>) {
+    pub(super) fn start_move_worker(
+        &mut self,
+        id: i64,
+        new: Option<NewMove>,
+        cx: &mut Context<Self>,
+    ) {
         let busy_now = self.session_is_busy(id, cx);
         let Some(run) = self.cloud_moves.get_mut(&id) else {
             return;
@@ -496,11 +526,13 @@ impl Shell {
             }
             let _ended = Ended(ended);
             let busy_check = || busy.load(Ordering::Relaxed);
-            if let Some(target) = target {
+            if let Some(new) = new {
                 let request = MoveRequest {
                     session_id: id,
-                    target,
+                    target: new.target,
                     account_home: None,
+                    started_by: new.started_by,
+                    kit_off: new.kit_off,
                 };
                 match engine.begin(request, &busy_check) {
                     Ok(record) => {
@@ -661,6 +693,9 @@ impl Shell {
         if never_began || error == NO_MOVE {
             // `begin_move` refused (busy, already moving, ...) or the record is gone: no dead
             // entry stays behind.
+            if self.cloud_moves.get(&id).is_some_and(|run| run.by_api) {
+                self.api_move_errors.insert(id, error.clone());
+            }
             self.cloud_moves.remove(&id);
             if let Some(dialog) = dialog {
                 dialog.update(cx, |dialog, cx| dialog.refuse(error, cx));
@@ -693,7 +728,12 @@ impl Shell {
     }
 
     /// The user pressed a Cancel button of the dialog (or the banner).
-    fn cancel_cloud_move(&mut self, id: i64, delete_workspace: bool, cx: &mut Context<Self>) {
+    pub(super) fn cancel_cloud_move(
+        &mut self,
+        id: i64,
+        delete_workspace: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(run) = self.cloud_moves.get_mut(&id) else {
             return;
         };
@@ -780,6 +820,7 @@ impl Shell {
             run.cancel.store(true, Ordering::Relaxed);
         }
         self.move_labels.remove(&id);
+        self.api_move_errors.remove(&id);
         if self.move_dialog.as_ref().is_some_and(|o| o.session == id) {
             self.move_dialog = None;
         }
@@ -871,6 +912,8 @@ mod tests {
         FailAtPush,
         /// `run` finds no record (it was cleared meanwhile).
         NoMove,
+        /// `begin` refuses (for example a removed worktree).
+        RefuseBegin,
     }
 
     struct Fake {
@@ -880,6 +923,9 @@ mod tests {
         preview: MovePreview,
         /// The answers of the next `cancel` calls; the default answer is a report.
         cancels: Mutex<Vec<Result<CancelReport, String>>>,
+        /// Every request `begin` got, and every choice `cancel` got.
+        requests: Mutex<Vec<MoveRequest>>,
+        choices: Mutex<Vec<CancelChoice>>,
     }
 
     fn preview() -> MovePreview {
@@ -933,7 +979,14 @@ mod tests {
             if busy() {
                 return Err(BUSY.into());
             }
-            Ok(record(request.session_id))
+            if *self.script.lock().unwrap() == Script::RefuseBegin {
+                return Err("Select a branch or worktree to continue this conversation.".into());
+            }
+            let mut record = record(request.session_id);
+            record.started_by = request.started_by;
+            record.kit_off = request.kit_off;
+            self.requests.lock().unwrap().push(request);
+            Ok(record)
         }
         fn run(
             &self,
@@ -947,6 +1000,10 @@ mod tests {
                 return Err(NO_MOVE.into());
             }
             let mut rec = record(session);
+            if let Some(request) = self.requests.lock().unwrap().last() {
+                rec.started_by = request.started_by;
+                rec.kit_off = request.kit_off;
+            }
             rec.done = vec![MoveStep::Snapshot];
             rec.current = Some(MoveStep::Push);
             events(MoveEvent::Updated(rec.clone()));
@@ -1000,8 +1057,9 @@ mod tests {
             events(MoveEvent::Done(outcome.clone()));
             Ok(outcome)
         }
-        fn cancel(&self, _: i64, _: CancelChoice) -> Result<CancelReport, String> {
+        fn cancel(&self, _: i64, choice: CancelChoice) -> Result<CancelReport, String> {
             self.calls.push("cancel");
+            self.choices.lock().unwrap().push(choice);
             if let Some(answer) = self.cancels.lock().unwrap().pop() {
                 return answer;
             }
@@ -1023,6 +1081,8 @@ mod tests {
                     script: Mutex::new(script),
                     preview: preview(),
                     cancels: Mutex::new(Vec::new()),
+                    requests: Mutex::new(Vec::new()),
+                    choices: Mutex::new(Vec::new()),
                 });
                 // No real `gh` and no workspace: the cloud refresh reads the store only.
                 shell.cloud = Arc::new(CloudSessions::new(
@@ -1965,6 +2025,317 @@ mod tests {
                 assert!(shell.cloud_moves.contains_key(&session));
                 shell.drop_cloud_move(session);
                 assert!(shell.cloud_moves.is_empty());
+            })
+            .unwrap();
+    }
+
+    // ------------------------------------------------------------ app API (F4-3b)
+
+    use monocode_core::cloud_sessions::CloudBackendKind;
+    use monocode_core::mono::move_api::{Instance, MoveToCloud};
+
+    fn api(session: i64, kind: CloudBackendKind, instance: Instance, kit_off: bool) -> MoveToCloud {
+        MoveToCloud {
+            session,
+            kind,
+            instance,
+            kit_off,
+        }
+    }
+
+    fn new_codespace(session: i64, kit_off: bool) -> MoveToCloud {
+        api(
+            session,
+            CloudBackendKind::Codespaces,
+            Instance::New,
+            kit_off,
+        )
+    }
+
+    fn project_of(window: WindowHandle<Shell>, session: i64, cx: &mut TestAppContext) -> String {
+        window
+            .update(cx, |shell, _, _| {
+                shell.session_summaries[&session].cwd.clone()
+            })
+            .unwrap()
+    }
+
+    fn call<T: 'static>(
+        window: WindowHandle<Shell>,
+        cx: &mut TestAppContext,
+        f: impl FnOnce(&mut Shell, &mut Context<Shell>) -> T,
+    ) -> T {
+        let out = window.update(cx, |shell, _, cx| f(shell, cx)).unwrap();
+        cx.run_until_parked();
+        out
+    }
+
+    fn status(window: WindowHandle<Shell>, session: i64, cx: &mut TestAppContext) -> Value {
+        let project = project_of(window, session, cx);
+        window
+            .update(cx, |shell, _, _| shell.api_move_status(&project, session))
+            .unwrap()
+            .unwrap()
+    }
+
+    #[gpui::test]
+    fn an_agent_move_is_a_normal_marked_record_with_the_kit_choice(cx: &mut TestAppContext) {
+        let (window, session, fake) = setup(cx, Script::FailAtPush);
+        let project = project_of(window, session, cx);
+        let started = call(window, cx, |shell, cx| {
+            shell.api_move_to_cloud(&project, new_codespace(session, true), cx)
+        })
+        .unwrap();
+        assert_eq!(started["state"], "running");
+        assert_eq!(started["startedBy"], "api");
+        // The same worker as Confirm: one begin, one run, with the agent's marks.
+        assert_eq!(fake.calls.count("begin"), 1);
+        assert_eq!(fake.calls.count("run"), 1);
+        let requests = fake.requests.lock().unwrap();
+        assert_eq!(requests[0].started_by, StartedBy::Api);
+        assert!(requests[0].kit_off);
+        assert_eq!(
+            requests[0].target,
+            MoveTarget::NewCodespace { machine: None }
+        );
+        drop(requests);
+        // It shows in the UI like any move: a record the dialog can follow, Retry and Cancel.
+        let reported = status(window, session, cx);
+        assert_eq!(reported["state"], "failed");
+        assert_eq!(reported["startedBy"], "api");
+        assert_eq!(reported["error"], "push rejected");
+        window
+            .update(cx, |shell, w, cx| {
+                assert_eq!(shell.move_offer(session), MoveOffer::InProgress);
+                shell.open_cloud_move(session, w, cx);
+                let record = shell.cloud_moves[&session].record.as_ref().unwrap();
+                assert_eq!(record.started_by, StartedBy::Api);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(stage(window, cx), Stage::Paused);
+    }
+
+    #[gpui::test]
+    fn kit_default_does_not_turn_the_kit_off_and_a_finished_move_reports_cloud(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, session, fake) = setup(cx, Script::Succeed);
+        let project = project_of(window, session, cx);
+        call(window, cx, |shell, cx| {
+            shell.api_move_to_cloud(&project, new_codespace(session, false), cx)
+        })
+        .unwrap();
+        assert!(!fake.requests.lock().unwrap()[0].kit_off);
+        let reported = status(window, session, cx);
+        assert_eq!(reported["state"], "none");
+        assert_eq!(reported["location"], "cloud");
+    }
+
+    #[gpui::test]
+    fn a_refused_call_creates_nothing(cx: &mut TestAppContext) {
+        let (window, session, fake) = setup(cx, Script::Succeed);
+        let project = project_of(window, session, cx);
+        let refusals = [
+            // Another project's session, an unknown session.
+            (
+                "/somewhere/else".to_owned(),
+                new_codespace(session, false),
+                "outside the assigned project",
+            ),
+            (
+                project.clone(),
+                new_codespace(9999, false),
+                "outside the assigned project",
+            ),
+            // A sandbox the project has no setup for, an instance that runs no session of it.
+            (
+                project.clone(),
+                api(
+                    session,
+                    CloudBackendKind::DockerSandbox,
+                    Instance::New,
+                    false,
+                ),
+                "set up its Docker sandbox",
+            ),
+            (
+                project.clone(),
+                api(
+                    session,
+                    CloudBackendKind::Codespaces,
+                    Instance::Named("nope".into()),
+                    false,
+                ),
+                "does not run a session of this project",
+            ),
+        ];
+        for (project, request, needle) in refusals {
+            let error = call(window, cx, |shell, cx| {
+                shell.api_move_to_cloud(&project, request, cx)
+            })
+            .unwrap_err();
+            assert!(error.contains(needle), "{error}");
+        }
+        // Not a GitHub repository: no new codespace.
+        window
+            .update(cx, |shell, _, _| {
+                shell.github_projects.insert(project.clone(), false);
+            })
+            .unwrap();
+        let error = call(window, cx, |shell, cx| {
+            shell.api_move_to_cloud(&project, new_codespace(session, false), cx)
+        })
+        .unwrap_err();
+        assert!(error.contains("GitHub"), "{error}");
+        assert_eq!(fake.calls.count("begin"), 0);
+        assert_eq!(fake.calls.count("run"), 0);
+        window
+            .update(cx, |shell, _, _| assert!(shell.cloud_moves.is_empty()))
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_busy_session_and_a_second_move_are_refused(cx: &mut TestAppContext) {
+        let (window, session, fake) = setup(cx, Script::FailAtPush);
+        let project = project_of(window, session, cx);
+        window
+            .update(cx, |shell, _, cx| {
+                shell.sessions[&session].update(cx, |c, _| c.busy = true);
+            })
+            .unwrap();
+        let error = call(window, cx, |shell, cx| {
+            shell.api_move_to_cloud(&project, new_codespace(session, false), cx)
+        })
+        .unwrap_err();
+        assert_eq!(error, BUSY);
+        assert_eq!(fake.calls.count("begin"), 0);
+        window
+            .update(cx, |shell, _, cx| {
+                shell.sessions[&session].update(cx, |c, _| c.busy = false);
+            })
+            .unwrap();
+        call(window, cx, |shell, cx| {
+            shell.api_move_to_cloud(&project, new_codespace(session, false), cx)
+        })
+        .unwrap();
+        let error = call(window, cx, |shell, cx| {
+            shell.api_move_to_cloud(&project, new_codespace(session, false), cx)
+        })
+        .unwrap_err();
+        assert!(error.contains("already being moved"), "{error}");
+        assert_eq!(fake.calls.count("begin"), 1);
+    }
+
+    #[gpui::test]
+    fn a_refusal_by_the_engine_is_kept_for_the_status(cx: &mut TestAppContext) {
+        let (window, session, fake) = setup(cx, Script::RefuseBegin);
+        let project = project_of(window, session, cx);
+        call(window, cx, |shell, cx| {
+            shell.api_move_to_cloud(&project, new_codespace(session, false), cx)
+        })
+        .unwrap();
+        assert_eq!(fake.calls.count("run"), 0);
+        let reported = status(window, session, cx);
+        assert_eq!(reported["state"], "none");
+        assert_eq!(
+            reported["error"],
+            "Select a branch or worktree to continue this conversation."
+        );
+        window
+            .update(cx, |shell, _, _| assert!(shell.cloud_moves.is_empty()))
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn cancel_uses_the_dialogs_cancel_and_never_deletes_a_workspace(cx: &mut TestAppContext) {
+        let (window, session, fake) = setup(cx, Script::FailAtPush);
+        let project = project_of(window, session, cx);
+        // Nothing to cancel yet.
+        let error = call(window, cx, |shell, cx| {
+            shell.api_cancel_move(&project, session, cx)
+        })
+        .unwrap_err();
+        assert_eq!(error, NO_MOVE);
+        call(window, cx, |shell, cx| {
+            shell.api_move_to_cloud(&project, new_codespace(session, false), cx)
+        })
+        .unwrap();
+        let cancelled = call(window, cx, |shell, cx| {
+            shell.api_cancel_move(&project, session, cx)
+        })
+        .unwrap();
+        assert_eq!(cancelled["state"], "cancelling");
+        assert_eq!(fake.calls.count("cancel"), 1);
+        assert_eq!(
+            *fake.choices.lock().unwrap(),
+            vec![CancelChoice {
+                delete_workspace: false
+            }]
+        );
+        assert_eq!(status(window, session, cx)["state"], "none");
+    }
+
+    #[gpui::test]
+    fn the_status_of_a_move_holds_no_path_or_secret(cx: &mut TestAppContext) {
+        let (window, session, _) = setup(cx, Script::FailAtPush);
+        let project = project_of(window, session, cx);
+        call(window, cx, |shell, cx| {
+            shell.api_move_to_cloud(&project, new_codespace(session, false), cx)
+        })
+        .unwrap();
+        let text = status(window, session, cx).to_string();
+        assert!(!text.contains("/work/monocode"), "{text}");
+        assert!(!text.contains(&project), "{text}");
+    }
+
+    #[gpui::test]
+    fn an_agent_move_is_announced_and_the_banner_says_who_started_it(cx: &mut TestAppContext) {
+        let (window, session, _) = setup(cx, Script::FailAtPush);
+        let project = project_of(window, session, cx);
+        let title = window
+            .update(cx, |shell, _, _| {
+                shell.session_summaries[&session].title.clone()
+            })
+            .unwrap();
+        call(window, cx, |shell, cx| {
+            shell.error = None;
+            shell.api_move_to_cloud(&project, new_codespace(session, false), cx)
+        })
+        .unwrap();
+        window
+            .update(cx, |shell, _, cx| {
+                assert_eq!(
+                    shell.error.as_deref(),
+                    Some(format!("An agent started moving {title} to the cloud.").as_str())
+                );
+                let view = shell.sessions[&session].read(cx);
+                assert!(view.move_locked());
+                assert!(view.move_by_agent());
+            })
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        assert!(cx.debug_bounds("cloud-move-by-agent").is_some());
+    }
+
+    #[gpui::test]
+    fn a_users_own_move_is_not_marked_and_an_agent_cannot_cancel_it(cx: &mut TestAppContext) {
+        let (window, session, fake) = setup(cx, Script::FailAtPush);
+        let project = project_of(window, session, cx);
+        open(window, session, cx);
+        confirm(window, cx);
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(!shell.sessions[&session].read(cx).move_by_agent());
+                let error = shell.api_cancel_move(&project, session, cx).unwrap_err();
+                assert!(error.contains("started by the user"), "{error}");
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(fake.calls.count("cancel"), 0);
+        window
+            .update(cx, |shell, _, _| {
+                assert!(shell.cloud_moves.contains_key(&session))
             })
             .unwrap();
     }

@@ -44,6 +44,17 @@ impl Conversation {
             cx.notify();
         }
     }
+    /// The shell says an agent started the unfinished move (the banner says so).
+    pub(crate) fn set_move_by_agent(&mut self, by_agent: bool, cx: &mut Context<Self>) {
+        if self.move_by_agent != by_agent {
+            self.move_by_agent = by_agent;
+            cx.notify();
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn move_by_agent(&self) -> bool {
+        self.move_by_agent
+    }
     pub(crate) fn move_locked(&self) -> bool {
         self.move_locked
     }
@@ -83,6 +94,12 @@ impl Conversation {
                             .child(MOVE_PAUSED),
                     ),
             )
+            .children(self.move_by_agent.then(|| {
+                div()
+                    .debug_selector(|| "cloud-move-by-agent".into())
+                    .text_color(warning_color())
+                    .child(crate::cloud_move_dialog::STARTED_BY_AGENT)
+            }))
             .child(
                 div()
                     .flex()

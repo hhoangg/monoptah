@@ -310,7 +310,35 @@ impl Monos {
         {
             return Err("A habit run can only read and run workflows".into());
         }
+        // Moving a session between this computer and the cloud pushes a branch and creates or
+        // wakes a workspace: never from an unattended or injected context. Reading the state of
+        // a move stays allowed.
+        if matches!(
+            call.action.as_str(),
+            monocode_core::mono::move_api::MOVE_TO_CLOUD
+                | monocode_core::mono::move_api::MOVE_TO_LOCAL
+                | monocode_core::mono::move_api::CANCEL_MOVE
+        ) && (habit_run || question || heartbeat)
+        {
+            return Err(
+                "A habit run, heartbeat or workflow question cannot move sessions to or from the cloud"
+                    .into(),
+            );
+        }
         Ok(mono)
+    }
+    /// A session that a Mono must not manage through the app: its own, another Mono's chat, a
+    /// habit run, a workflow's question and a worker. The one rule of `sessions.delete`,
+    /// `sessions.archive` with a cloud stop or delete, and the move actions.
+    fn unmanaged_session(&self, session: i64, caller: i64, cx: &App) -> bool {
+        session == caller
+            || self.is_mono_session(session)
+            || self.running.contains_key(&session)
+            || self.workflow_live.asked_by(session).is_some()
+            || self
+                .owner
+                .upgrade()
+                .is_some_and(|o| o.read(cx).mono_is_worker(session))
     }
     fn finish_call(&mut self, call: Call, result: Result<Value, String>, cx: &mut Context<Self>) {
         let key = (call.session, call.request_id.clone());
@@ -502,6 +530,35 @@ impl Monos {
             });
         })
         .detach();
+    }
+    /// `sessions.moveToCloud|moveToLocal|moveStatus|cancelMove`: quick answers on the UI thread;
+    /// the moves themselves run on workers owned by the shell.
+    fn move_call(
+        &mut self,
+        action: &str,
+        input: &Value,
+        project: &str,
+        caller: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Value, String> {
+        use monocode_core::mono::move_api as api;
+        let shell = self
+            .owner
+            .upgrade()
+            .ok_or("The app is not available right now")?;
+        let session = api::session_of(input)?;
+        if action != api::MOVE_STATUS && self.unmanaged_session(session, caller, cx) {
+            return Err("Only other regular project sessions can be managed here".into());
+        }
+        shell.update(cx, |shell, cx| match action {
+            api::MOVE_TO_CLOUD => {
+                shell.api_move_to_cloud(project, api::parse_move_to_cloud(input)?, cx)
+            }
+            api::MOVE_TO_LOCAL => shell.api_move_to_local(project, session, window, cx),
+            api::MOVE_STATUS => shell.api_move_status(project, session),
+            _ => shell.api_cancel_move(project, session, cx),
+        })
     }
     fn call_work(
         &mut self,
@@ -821,14 +878,7 @@ impl Monos {
                 if (action == "sessions.delete"
                     || (action == "sessions.archive"
                         && matches!(input["cloud"].as_str(), Some("stop" | "delete"))))
-                    && (session == call.session
-                        || self.is_mono_session(session)
-                        || self.running.contains_key(&session)
-                        || self.workflow_live.asked_by(session).is_some()
-                        || self
-                            .owner
-                            .upgrade()
-                            .is_some_and(|o| o.read(cx).mono_is_worker(session)))
+                    && self.unmanaged_session(session, call.session, cx)
                 {
                     self.finish_call(
                         call,
@@ -1001,6 +1051,13 @@ impl Monos {
                     }
                     Ok(json!({"accepted":true}))
                 }
+            }
+            action if monocode_core::mono::move_api::is_move_action(action) => {
+                // Moves are Mono-only (an Operator is refused at validation). The session is
+                // checked against the project inside the shell, which owns the moves.
+                let result = self.move_call(action, &input, &project, call.session, window, cx);
+                self.finish_call(call, result, cx);
+                return;
             }
             "sessions.pullEvidence" => {
                 let session = match id(&input, "sessionId") {

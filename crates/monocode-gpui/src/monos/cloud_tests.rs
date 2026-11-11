@@ -1,5 +1,5 @@
 //! Mono dispatch of the `cloud.*` actions and of cloud sessions, for codespaces and sandboxes.
-use super::tests::{Setup, call, launches_of, setup, setup_with};
+use super::tests::{Setup, call, call_from, fake_run, launches_of, setup, setup_with};
 use crate::cloud_wake::fakes::{
     AUTH_OK, FakeHost, Gh, SANDBOX, Sbx, install, install_with_sandbox, sandbox_session, serial,
 };
@@ -953,4 +953,206 @@ fn live_cloud_start(cx: &mut TestAppContext) {
         }
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
+}
+
+#[gpui::test]
+fn a_mono_move_call_is_validated_before_anything_is_created(cx: &mut TestAppContext) {
+    let (s, gh, host, _guard) = cloud_setup(cx, "Available");
+    let before = gh.calls.lock().unwrap().len();
+    let target = json!({"kind":"codespace","instance":"new"});
+    for (n, (action, input, needle)) in [
+        (
+            "sessions.moveToCloud",
+            json!({"session":1,"target":target,"force":true}),
+            "does not take force",
+        ),
+        (
+            "sessions.moveToCloud",
+            json!({"session":1,"target":{"kind":"codespace","instance":"new","branch":"main"}}),
+            "does not take branch",
+        ),
+        (
+            "sessions.moveToCloud",
+            json!({"session":1,"target":target,"kit":{"skills":["x"]}}),
+            "must be text",
+        ),
+        (
+            "sessions.moveToCloud",
+            json!({"target":target}),
+            "Provide session",
+        ),
+        (
+            "sessions.moveToLocal",
+            json!({"session":1,"deleteWorkspace":true}),
+            "does not take deleteWorkspace",
+        ),
+        (
+            "sessions.cancelMove",
+            json!({"session":1,"deleteWorkspace":true}),
+            "does not take deleteWorkspace",
+        ),
+        // A session of no project of this Mono.
+        (
+            "sessions.moveStatus",
+            json!({"session":424242}),
+            "outside the assigned project",
+        ),
+        (
+            "sessions.moveToCloud",
+            json!({"session":424242,"target":target}),
+            "outside the assigned project",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let error = run(&s, &format!("mv-{n}"), action, input, cx).unwrap_err();
+        assert!(error.contains(needle), "{action}: {error}");
+    }
+    // No codespace was created and no workspace was woken.
+    assert_eq!(gh.calls.lock().unwrap().len(), before);
+    assert!(host.0.lock().unwrap().is_empty());
+}
+
+const MOVE_ACTIONS: [&str; 3] = [
+    "sessions.moveToCloud",
+    "sessions.moveToLocal",
+    "sessions.cancelMove",
+];
+
+fn move_input(action: &str, session: i64) -> Value {
+    match action {
+        "sessions.moveToCloud" => {
+            json!({"session":session,"target":{"kind":"codespace","instance":"new"}})
+        }
+        _ => json!({"session":session}),
+    }
+}
+
+fn plain_session(s: &Setup, cx: &mut TestAppContext) -> i64 {
+    let summary = locked(&s.store)
+        .unwrap()
+        .create("claude", &s.project)
+        .unwrap();
+    show(s, summary, cx)
+}
+
+#[gpui::test]
+fn a_habit_run_or_heartbeat_cannot_start_or_cancel_a_move_but_can_read_one(
+    cx: &mut TestAppContext,
+) {
+    let (s, gh, host, _guard) = cloud_setup(cx, "Available");
+    let target = plain_session(&s, cx);
+    let habit = fake_run(&s, cx);
+    let beat = fake_run(&s, cx);
+    cx.update(|cx| {
+        s.manager.update(cx, |m, _| {
+            m.running.get_mut(&beat).unwrap().habit = monocode_core::mono::heartbeat::RUN_ID.into();
+        })
+    });
+    let before = gh.calls.lock().unwrap().len();
+    for (caller, label) in [(habit, "habit"), (beat, "heartbeat")] {
+        for action in MOVE_ACTIONS {
+            let error = call_from(
+                &s,
+                caller,
+                &format!("{label}-{action}"),
+                action,
+                move_input(action, target),
+                cx,
+            )
+            .try_recv()
+            .unwrap()
+            .unwrap_err();
+            assert!(
+                error.contains("cannot move sessions"),
+                "{label} {action}: {error}"
+            );
+        }
+        // Reading a move is fine.
+        let status = call_from(
+            &s,
+            caller,
+            &format!("{label}-status"),
+            "sessions.moveStatus",
+            json!({"session":target}),
+            cx,
+        )
+        .try_recv()
+        .unwrap()
+        .unwrap();
+        assert_eq!(status["state"], "none");
+    }
+    assert_eq!(gh.calls.lock().unwrap().len(), before);
+    assert!(host.0.lock().unwrap().is_empty());
+}
+
+#[gpui::test]
+fn the_move_actions_skip_the_sessions_a_mono_must_not_manage(cx: &mut TestAppContext) {
+    let (s, _gh, _host, _guard) = cloud_setup(cx, "Available");
+    let hidden = plain_session(&s, cx);
+    cx.update(|cx| {
+        s.manager
+            .update(cx, |m, _| m.roster.hidden_sessions.push(hidden))
+    });
+    let running = fake_run(&s, cx);
+    let managed: Vec<(&str, i64)> = vec![
+        // The caller's own chat.
+        ("own", s.session),
+        // A habit run session and a hidden (Mono-owned) session.
+        ("run", running),
+        ("hidden", hidden),
+    ];
+    for (label, session) in managed {
+        for action in MOVE_ACTIONS {
+            let error = call(
+                &s,
+                &format!("{label}-{action}"),
+                action,
+                move_input(action, session),
+                cx,
+            )
+            .try_recv()
+            .unwrap()
+            .unwrap_err();
+            assert!(
+                error.contains("Only other regular project sessions"),
+                "{label} {action}: {error}"
+            );
+        }
+    }
+}
+
+#[gpui::test]
+fn a_move_call_for_a_regular_session_reaches_the_shell(cx: &mut TestAppContext) {
+    let (s, gh, host, _guard) = cloud_setup(cx, "Available");
+    let session = plain_session(&s, cx);
+    let before = gh.calls.lock().unwrap().len();
+    // The shell's own refusal (a conversation with no messages), so the call got through the
+    // dispatcher and validation to `Shell::api_move_to_cloud`, which created nothing.
+    let error = call(
+        &s,
+        "reach-1",
+        "sessions.moveToCloud",
+        move_input("sessions.moveToCloud", session),
+        cx,
+    )
+    .try_recv()
+    .unwrap()
+    .unwrap_err();
+    assert!(error.contains("no messages yet"), "{error}");
+    let status = call(
+        &s,
+        "reach-2",
+        "sessions.moveStatus",
+        json!({"session":session}),
+        cx,
+    )
+    .try_recv()
+    .unwrap()
+    .unwrap();
+    assert_eq!(status["state"], "none");
+    assert_eq!(status["location"], "local");
+    assert_eq!(gh.calls.lock().unwrap().len(), before);
+    assert!(host.0.lock().unwrap().is_empty());
 }
