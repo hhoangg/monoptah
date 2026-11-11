@@ -1566,14 +1566,16 @@ fn the_undo_refuses_to_rewrite_ignored_files_of_the_user() {
     let w = world(true);
     let _ = moved(&w);
     let tmp = tempfile::tempdir().unwrap();
-    let tree = |extra: &dyn Fn(&dyn Fn(&[&str]))| {
+    let tree = |forced: Option<&str>| {
         let idx = tmp.path().join(format!("{}.idx", nanos()));
         let text = idx.to_string_lossy().into_owned();
         let run = |args: &[&str]| {
             g(&w.project, args, &[("GIT_INDEX_FILE", text.as_str())]).unwrap();
         };
         run(&["add", "-A"]);
-        extra(&run);
+        if let Some(path) = forced {
+            run(&["add", "-f", path]);
+        }
         g(
             &w.project,
             &["write-tree"],
@@ -1584,16 +1586,16 @@ fn the_undo_refuses_to_rewrite_ignored_files_of_the_user() {
         .to_string()
     };
     // (1) a tracked file that matches the ignore rules, changed between the two trees.
-    let old = tree(&|_| {});
+    let old = tree(None);
     std::fs::write(w.project.join("a.txt"), "regenerated\n").unwrap();
-    let new = tree(&|_| {});
+    let new = tree(None);
     git(&w.project, &["checkout", "-q", "--", "a.txt"]);
     std::fs::write(w.project.join(".git/info/exclude"), "a.txt\nsecret.log\n").unwrap();
     let error = undo_files(&w.project, &new, &old, tmp.path()).unwrap_err();
     assert!(error.contains("ignored file of yours"), "{error}");
     // (2) an untracked ignored file at a path the undo would rewrite.
     std::fs::write(w.project.join("secret.log"), "mine\n").unwrap();
-    let with_secret = tree(&|run| run(&["add", "-f", "secret.log"]));
+    let with_secret = tree(Some("secret.log"));
     let error = undo_files(&w.project, &with_secret, &old, tmp.path()).unwrap_err();
     assert!(error.contains("ignored file of yours"), "{error}");
     assert_eq!(
