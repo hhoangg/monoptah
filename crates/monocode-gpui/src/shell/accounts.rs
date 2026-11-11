@@ -39,12 +39,12 @@ impl Shell {
                     }
                     this.update_usage_provider(cx);
                     // A sign-in can make a failed discovery succeed.
-                    this.settings_accounts_changed(true, cx);
+                    let _ = this.settings_accounts_changed(true, cx);
                 }
                 AccountEvent::Updated => {
                     this.update_usage_provider(cx);
                     // A new default account has its own model catalog.
-                    this.settings_accounts_changed(false, cx);
+                    let _ = this.settings_accounts_changed(false, cx);
                     this.sync_settings(cx);
                 }
                 AccountEvent::PickerDismiss | AccountEvent::AuthStarted => {}

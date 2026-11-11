@@ -295,7 +295,7 @@ impl Shell {
             }
         }));
         self.settings = Some(view.clone());
-        self.settings_accounts_changed(true, cx);
+        self.settings_opened_catalogs(cx);
         // Settings has its own complete rail, even when the project rail was hidden.
         self.settings_nav_visible = true;
         self.sidebar_slide = None;
@@ -319,22 +319,35 @@ impl Shell {
     /// catalog. Discover the rest for the account new sessions use (which may
     /// be a setup-token account), so a provider without a session is not
     /// shown with no models and cannot be made the default.
-    pub(super) fn prefetch_settings_catalogs(&mut self, cx: &mut Context<Self>) {
-        // Tests must never start an installed provider CLI.
-        if cfg!(test) {
-            return;
-        }
+    /// The catalogs Settings lacks: providers without an open session whose
+    /// catalog for the account new sessions use is not cached yet.
+    /// `accounts_only` keeps the providers whose catalog depends on an account.
+    fn missing_settings_catalogs(
+        &self,
+        accounts_only: bool,
+        cx: &App,
+    ) -> Vec<(Kind, monocode_core::accounts::Profile)> {
         let shown = self.settings_context(cx).catalogs;
-        let missing: Vec<_> = self
-            .settings_profiles(cx)
+        self.settings_profiles(cx)
             .into_iter()
-            // Only providers with accounts: the rest have one catalog that a
-            // session already carries, and other CLIs cache it for only 5 minutes.
-            .filter(|(kind, _)| monocode_core::accounts::supports_accounts(*kind))
+            .filter(|(kind, _)| !accounts_only || monocode_core::accounts::supports_accounts(*kind))
             .filter(|(kind, _)| !shown.contains_key(kind.id()))
-            .collect();
-        if missing.is_empty() {
-            return;
+            .collect()
+    }
+    /// Settings lists models per Agent CLI, but only open sessions carried a
+    /// catalog. Discover the rest for the account new sessions use (which may
+    /// be a setup-token account), so a provider without a session is not
+    /// shown with no models and cannot be made the default. Returns the
+    /// providers it looks up; installed CLIs are checked on the worker.
+    fn prefetch_settings_catalogs(
+        &mut self,
+        missing: Vec<(Kind, monocode_core::accounts::Profile)>,
+        cx: &mut Context<Self>,
+    ) -> Vec<Kind> {
+        let kinds = missing.iter().map(|(kind, _)| *kind).collect();
+        // Tests must never start an installed provider CLI.
+        if missing.is_empty() || cfg!(test) {
+            return kinds;
         }
         let work = cx.background_executor().spawn(async move {
             for (kind, profile) in missing {
@@ -350,21 +363,38 @@ impl Shell {
             let _ = this.update(cx, |this, cx| this.sync_settings(cx));
         })
         .detach();
+        kinds
     }
-    /// After an account update: discover catalogs only when the accounts new
-    /// sessions use changed (a new default, sign-in), not on a rename.
-    pub(super) fn settings_accounts_changed(&mut self, force: bool, cx: &mut Context<Self>) {
-        let accounts: Vec<_> = self
-            .settings_profiles(cx)
+    /// When Settings opens: discover every missing catalog, whatever the provider.
+    pub(super) fn settings_opened_catalogs(&mut self, cx: &mut Context<Self>) -> Vec<Kind> {
+        self.settings_catalog_accounts = self.settings_account_ids(cx);
+        let missing = self.missing_settings_catalogs(false, cx);
+        self.prefetch_settings_catalogs(missing, cx)
+    }
+    fn settings_account_ids(&self, cx: &App) -> Vec<(Kind, String)> {
+        self.settings_profiles(cx)
             .into_iter()
             .filter(|(kind, _)| monocode_core::accounts::supports_accounts(*kind))
             .map(|(kind, profile)| (kind, profile.id))
-            .collect();
+            .collect()
+    }
+    /// After an account event, while Settings is open: only providers with
+    /// accounts can be affected. `force` (a sign-in, which can make a failed
+    /// discovery succeed) looks them up again; any other update does only when
+    /// the accounts new sessions use changed (a new default), not on a rename.
+    pub(super) fn settings_accounts_changed(
+        &mut self,
+        force: bool,
+        cx: &mut Context<Self>,
+    ) -> Vec<Kind> {
+        let accounts = self.settings_account_ids(cx);
         let changed = accounts != self.settings_catalog_accounts;
         self.settings_catalog_accounts = accounts;
-        if self.settings.is_some() && (force || changed) {
-            self.prefetch_settings_catalogs(cx);
+        if self.settings.is_none() || !(force || changed) {
+            return Vec::new();
         }
+        let missing = self.missing_settings_catalogs(true, cx);
+        self.prefetch_settings_catalogs(missing, cx)
     }
     pub(super) fn select_settings(&mut self, section: Section, cx: &mut Context<Self>) {
         if let Some(view) = &self.settings {
