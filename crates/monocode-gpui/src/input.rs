@@ -149,6 +149,14 @@ pub fn bind(cx: &mut App) {
     }
     cx.bind_keys([
         KeyBinding::new(&format!("{modifier}-a"), SelectAll, Some("Composer")),
+        // Rendered text (transcript, documents, the notes preview). On macOS
+        // the Edit menu also sends these; elsewhere only the binding does.
+        KeyBinding::new(
+            &format!("{modifier}-a"),
+            SelectAll,
+            Some("TranscriptSelection"),
+        ),
+        KeyBinding::new(&format!("{modifier}-c"), Copy, Some("TranscriptSelection")),
         KeyBinding::new(&format!("{modifier}-c"), Copy, Some("Composer")),
         KeyBinding::new(&format!("{modifier}-v"), Paste, Some("Composer")),
         KeyBinding::new(&format!("{modifier}-x"), Cut, Some("Composer")),
