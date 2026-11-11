@@ -77,6 +77,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// Store setting prefix of a move in progress: `cloud-move:<session id>`.
 pub const SETTING_PREFIX: &str = "cloud-move:";
@@ -85,6 +86,7 @@ pub const NOTE_PREFIX: &str = "cloud-move-note:";
 /// Returned when `cancel` stopped a run. The record is kept so the move can be resumed.
 pub const MOVE_ABORTED: &str = "The move to the cloud was cancelled.";
 /// Why a move is refused while a turn runs.
+pub const MOVE_RUNNING: &str = "This conversation is already being moved: a move is running.";
 pub const BUSY: &str =
     "A turn is running in this conversation. Wait for it to finish, then continue in the cloud.";
 /// Why a flip is refused when the local session moved on after the snapshot.
@@ -274,6 +276,14 @@ pub struct MoveRecord {
     /// Id of the Host `create` command of the summary path, so a retry lands on one session.
     #[serde(default)]
     pub create_command: String,
+    /// Stamp of the session this record was made for. Session ids are reused after a delete,
+    /// so a record only belongs to the session whose `cloud-move-owner` setting matches.
+    #[serde(default)]
+    pub owner: String,
+    /// `applySnapshot` was asked to restore into a worktree of a shared instance. A later
+    /// call that answers `reused` is the worktree this move made.
+    #[serde(default)]
+    pub restore_attempted: bool,
 }
 
 impl MoveRecord {
@@ -337,6 +347,27 @@ pub struct CancelReport {
     pub warnings: Vec<String>,
 }
 
+/// The state of one running move (or rollback), shared with a `cancel_move` that arrives.
+#[derive(Default)]
+pub(super) struct RunState {
+    stop: AtomicBool,
+    /// Set by `cancel_move` while the move runs: the run rolls back when it has stopped.
+    choice: Mutex<Option<CancelChoice>>,
+}
+
+/// Removes the per-session guard when the move or the rollback ends.
+struct MoveGuard<'a> {
+    service: &'a CloudSessions,
+    session: i64,
+}
+impl Drop for MoveGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut running) = self.service.moves.lock() {
+            running.remove(&self.session);
+        }
+    }
+}
+
 enum Stop {
     Aborted,
     Failed(String),
@@ -370,7 +401,13 @@ fn key(session: i64) -> String {
 
 /// The unfinished move of a session, `None` when there is none (or it cannot be read).
 pub fn move_record(store: &Store, session: i64) -> Option<MoveRecord> {
-    serde_json::from_str(&store.setting(&key(session)).ok()??).ok()
+    let record: MoveRecord = serde_json::from_str(&store.setting(&key(session)).ok()??).ok()?;
+    let owner = store.setting(&owner_key(session)).ok()??;
+    (!owner.is_empty() && owner == record.owner).then_some(record)
+}
+
+fn owner_key(session: i64) -> String {
+    format!("cloud-move-owner:{session}")
 }
 
 /// Every unfinished move. A listing only: it never resumes anything.
@@ -379,7 +416,7 @@ pub fn pending_moves(store: &Store) -> Vec<MoveRecord> {
         .cloud_move_settings()
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|(_, raw)| serde_json::from_str(&raw).ok())
+        .filter_map(|(id, _)| move_record(store, id))
         .collect()
 }
 
@@ -391,7 +428,8 @@ fn save_record(store: &Store, record: &MoveRecord) -> Result<(), String> {
 }
 
 fn clear_record(store: &Store, session: i64) -> Result<(), String> {
-    store.save_setting(&key(session), "")
+    store.save_setting(&key(session), "")?;
+    store.save_setting(&owner_key(session), "")
 }
 
 /// The one-line note the first cloud turn of a moved session carries (design 4.9 R5), once.
@@ -477,7 +515,7 @@ fn shell_quote(text: &str) -> String {
 
 /// Test seam: runs between writing the Host link and writing the location.
 #[cfg(test)]
-pub(super) type FlipHook = Box<dyn Fn(&Store) -> Result<(), String> + Send + Sync>;
+pub(super) type FlipHook = Box<dyn Fn(&Store, &str) -> Result<(), String> + Send + Sync>;
 
 impl CloudSessions {
     fn staging_dir(&self, session: i64) -> Result<PathBuf, String> {
@@ -515,13 +553,20 @@ impl CloudSessions {
             .find(|s| s.id == id)
             .ok_or("Session not found")?;
         let settings = store.agent_settings(id)?.unwrap_or_default();
-        let work_cwd = settings
+        // A session that works in a worktree moves that worktree. If it is gone, falling back
+        // to the project folder would snapshot and push another checkout.
+        let recorded = settings
             .worktree_cwd
             .clone()
-            .filter(|cwd| !cwd.is_empty() && !settings.worktree_removed)
-            .filter(|cwd| !crate::files::remote::is_remote(Path::new(cwd)))
-            .filter(|cwd| Path::new(cwd).is_dir())
-            .unwrap_or_else(|| session.cwd.clone());
+            .filter(|cwd| !cwd.is_empty() && !crate::files::remote::is_remote(Path::new(cwd)));
+        if settings.worktree_removed
+            || recorded
+                .as_deref()
+                .is_some_and(|cwd| !Path::new(cwd).is_dir())
+        {
+            return Err("Select a branch or worktree to continue this conversation.".into());
+        }
+        let work_cwd = recorded.unwrap_or_else(|| session.cwd.clone());
         if crate::files::remote::is_remote(Path::new(&session.cwd)) {
             return Err("A conversation on another machine cannot be moved from here.".into());
         }
@@ -578,7 +623,10 @@ impl CloudSessions {
             forked_from: None,
             notices: vec![],
             create_command: format!("move-{id}-{}", uuid::Uuid::new_v4()),
+            owner: uuid::Uuid::new_v4().to_string(),
+            restore_attempted: false,
         };
+        store.save_setting(&owner_key(id), &record.owner)?;
         save_record(&store, &record)?;
         Ok(record)
     }
@@ -590,6 +638,66 @@ impl CloudSessions {
     /// record keeps the step and the text, and `events` ended with `Failed`), a refusal while
     /// busy, or [`MOVE_ABORTED`] (neither event; the record is kept).
     pub fn run_move(
+        &self,
+        session_id: i64,
+        busy: &dyn Fn() -> bool,
+        events: &mut dyn FnMut(MoveEvent),
+        cancel: &AtomicBool,
+    ) -> Result<MoveOutcome, String> {
+        let (state, _release) = self.enter_move(session_id)?;
+        if cancel.load(Ordering::Relaxed) {
+            state.stop.store(true, Ordering::Relaxed);
+        }
+        let finished = AtomicBool::new(false);
+        // One flag stops everything below: the caller's `cancel` and a `cancel_move` that
+        // arrives while the move runs.
+        let result = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !finished.load(Ordering::Relaxed) {
+                    if cancel.load(Ordering::Relaxed) {
+                        state.stop.store(true, Ordering::Relaxed);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(40));
+                }
+            });
+            let result = self.run_move_inner(session_id, busy, events, &state.stop);
+            finished.store(true, Ordering::Relaxed);
+            result
+        });
+        // A cancel that arrived during the run: the run does the rollback itself, once it
+        // has stopped, so nothing writes the record again afterwards.
+        if result.is_err() {
+            let choice = state.choice.lock().ok().and_then(|mut c| c.take());
+            if let Some(choice) = choice {
+                if let Err(error) = self.cancel_move_inner(session_id, choice) {
+                    events(MoveEvent::Notice(format!(
+                        "The rollback failed: {}",
+                        scrub(&error)
+                    )));
+                }
+            }
+        }
+        result
+    }
+
+    /// Takes the per-session guard: one run, one cancel at a time.
+    fn enter_move(&self, session: i64) -> Result<(Arc<RunState>, MoveGuard<'_>), String> {
+        let mut running = self.moves.lock().map_err(|_| "Moves are unavailable")?;
+        if running.contains_key(&session) {
+            return Err(MOVE_RUNNING.into());
+        }
+        let state = Arc::new(RunState::default());
+        running.insert(session, state.clone());
+        Ok((
+            state,
+            MoveGuard {
+                service: self,
+                session,
+            },
+        ))
+    }
+
+    fn run_move_inner(
         &self,
         session_id: i64,
         busy: &dyn Fn() -> bool,
@@ -628,7 +736,11 @@ impl CloudSessions {
                     }
                     Err(Stop::Aborted) => {
                         record.current = None;
-                        let _ = save_record(&*self.store()?, &record);
+                        // Never bring back a record that was cleared meanwhile.
+                        let store = self.store()?;
+                        if move_record(&store, session_id).is_some() {
+                            let _ = save_record(&store, &record);
+                        }
                         return Err(MOVE_ABORTED.into());
                     }
                     Err(Stop::Failed(error)) => {
@@ -704,8 +816,8 @@ impl CloudSessions {
             MoveStep::Push => self.step_push(record, events, cancel),
             MoveStep::Workspace => self.step_workspace(record, events, cancel),
             MoveStep::Upload => self.step_upload(record, events, cancel),
-            MoveStep::RestoreCode => self.step_restore_code(record, events),
-            MoveStep::RestoreConversation => self.step_restore_conversation(record, events),
+            MoveStep::RestoreCode => self.step_restore_code(record, events, cancel),
+            MoveStep::RestoreConversation => self.step_restore_conversation(record, events, cancel),
             MoveStep::Flip => self.step_flip(record, busy, events),
         }
     }
@@ -855,13 +967,7 @@ impl CloudSessions {
             "Pushing to origin/{}",
             record.branch
         )));
-        let args = crate::scm::push_commit_args(
-            &work,
-            "origin",
-            &record.head,
-            &record.branch,
-            record.creates_branch,
-        )?;
+        let args = crate::scm::push_commit_args(&work, "origin", &record.head, &record.branch)?;
         match move_out::push_timed(&work, &args, move_out::PUSH_TIMEOUT, cancel) {
             Ok(()) => {}
             Err(error) if error == move_out::PUSH_CANCELLED => return Err(Stop::Aborted),
@@ -873,6 +979,9 @@ impl CloudSessions {
             return Err(Stop::Failed(
                 "The push finished but origin does not have the commit.".into(),
             ));
+        }
+        if record.creates_branch {
+            crate::scm::set_upstream_after_push(&work, "origin", &record.head, &record.branch);
         }
         record.pushed = true;
         Ok(())
@@ -1145,6 +1254,33 @@ impl CloudSessions {
             })
     }
 
+    /// A Retry is a user action: a stopped codespace is woken before the Host is used.
+    /// (Never called from a background path; the sandbox is reconnected by its own flow.)
+    fn ensure_connected(
+        &self,
+        record: &MoveRecord,
+        cancel: &AtomicBool,
+        events: &mut dyn FnMut(MoveEvent),
+    ) -> Result<(), Stop> {
+        let (workspace, project) = Self::workspace_of(record)?;
+        if workspace.backend != CloudBackendKind::Codespaces {
+            return Ok(());
+        }
+        if let Some(machine) = self
+            .host
+            .machines()?
+            .into_iter()
+            .find(|m| m.environment_id == project.environment_id)
+        {
+            self.host
+                .ensure(&machine.id, cancel, &mut |line| {
+                    events(MoveEvent::Log(scrub(line)))
+                })
+                .map_err(Stop::Failed)?;
+        }
+        Ok(())
+    }
+
     fn rpc(&self, record: &MoveRecord, method: &str, params: Value) -> Result<Value, String> {
         let (_, project) = Self::workspace_of(record)?;
         let machine = self.machine_of(&project)?;
@@ -1159,6 +1295,7 @@ impl CloudSessions {
         events: &mut dyn FnMut(MoveEvent),
         cancel: &AtomicBool,
     ) -> Result<(), Stop> {
+        self.ensure_connected(record, cancel, events)?;
         let (_, project) = Self::workspace_of(record)?;
         let machine = self.machine_of(&project)?;
         let info = self.host.host_info(&machine)?;
@@ -1240,7 +1377,9 @@ impl CloudSessions {
         &self,
         record: &mut MoveRecord,
         events: &mut dyn FnMut(MoveEvent),
+        cancel: &AtomicBool,
     ) -> Result<(), Stop> {
+        self.ensure_connected(record, cancel, events)?;
         let (workspace, project) = Self::workspace_of(record)?;
         events(MoveEvent::Log("Restoring the code in the workspace".into()));
         let mut params = json!({
@@ -1253,7 +1392,46 @@ impl CloudSessions {
         if let Some(upload) = &record.patch_upload {
             params["patchUploadId"] = json!(upload);
         }
-        let result = self.rpc(record, "workspace.applySnapshot", params)?;
+        // Written before the call: a worktree the Host made whose answer was lost is the
+        // move's, and a later call that answers `reused` must not make Cancel forget it.
+        let rerun = record.restore_attempted;
+        if workspace.created {
+            // A new instance restores into its own checkout; nothing is created.
+        } else if !rerun {
+            record.restore_attempted = true;
+            save_record(&*self.store()?, record)?;
+        }
+        let result = match self.rpc(record, "workspace.applySnapshot", params) {
+            Ok(result) => result,
+            // An older Host cannot repeat a default-branch restore (its detached worktree
+            // exists already). The earlier call's worktree is the result when the Host still
+            // lists it; the snapshot itself was verified by that earlier call.
+            Err(error)
+                if error.contains("already exists") && rerun && record.host_cwd.is_some() =>
+            {
+                let cwd = record.host_cwd.clone().unwrap_or_default();
+                let listed = self.rpc(
+                    record,
+                    "git.worktrees",
+                    json!({"projectId": project.project_id}),
+                )?;
+                let present = listed["worktrees"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|w| {
+                        w["path"].as_str() == Some(cwd.as_str()) && w["missing"] != json!(true)
+                    });
+                if !present {
+                    return Err(Stop::Failed(format!(
+                        "The Host could not restore the code again ({error}). Cancel this move and start a new one."
+                    )));
+                }
+                json!({"cwd": cwd, "branch": record.branch, "head": record.head,
+                    "tree": record.tree, "createdWorktree": false, "reused": true})
+            }
+            Err(error) => return Err(Stop::Failed(error)),
+        };
         let text = |field: &str| result[field].as_str().unwrap_or_default().to_lowercase();
         if text("tree") != record.tree || text("head") != record.head {
             return Err(Stop::Failed(
@@ -1271,7 +1449,8 @@ impl CloudSessions {
             .ok_or("The Host did not say where it restored the code")?;
         record.host_cwd = Some(cwd.to_string());
         // A re-run finds the worktree in place (`reused`): the first creation is what counts.
-        record.created_worktree |= result["createdWorktree"].as_bool().unwrap_or(false);
+        record.created_worktree |= result["createdWorktree"].as_bool().unwrap_or(false)
+            || (rerun && result["reused"].as_bool().unwrap_or(false));
         Ok(())
     }
 
@@ -1281,7 +1460,9 @@ impl CloudSessions {
         &self,
         record: &mut MoveRecord,
         events: &mut dyn FnMut(MoveEvent),
+        cancel: &AtomicBool,
     ) -> Result<(), Stop> {
+        self.ensure_connected(record, cancel, events)?;
         let (_, project) = Self::workspace_of(record)?;
         let host_cwd = record
             .host_cwd
@@ -1291,7 +1472,14 @@ impl CloudSessions {
             .store()?
             .agent_settings(record.session_id)?
             .unwrap_or_default();
-        let configuration = crate::remote::protocol::settings_configuration("claude", &settings);
+        let mut configuration =
+            crate::remote::protocol::settings_configuration("claude", &settings);
+        if record.provider != super::HARNESS {
+            // The model of another provider means nothing to Claude (it would be started with
+            // an unknown --model): the cloud session starts on Claude's default.
+            configuration["model"] = json!("claude:default");
+            configuration["modelSettings"] = json!({});
+        }
         let model = configuration["model"]
             .as_str()
             .unwrap_or("claude:default")
@@ -1300,6 +1488,10 @@ impl CloudSessions {
             MoveKind::Resume => {
                 let id = record.claude_id.clone().unwrap_or_default();
                 self.retire_old_host_sessions(record, &id, events)?;
+                if let Some(earlier) = record.provider_session_id.clone().filter(|p| *p != id) {
+                    // A fork id from an earlier attempt can be bound by an older Host session.
+                    self.retire_old_host_sessions(record, &earlier, events)?;
+                }
                 let upload = record
                     .transcript_upload
                     .clone()
@@ -1316,7 +1508,8 @@ impl CloudSessions {
                 // session's own folders differ from them (a removed worktree, a moved project).
                 if let Ok(staging) = self.staging_dir(record.session_id) {
                     if let Ok(file) = transcript_file(&staging, &id) {
-                        from.extend(transcript_cwds(&file));
+                        let own = from.clone();
+                        from.extend(top_level_roots(transcript_cwds(&file), &own));
                     }
                 }
                 let mut seen = std::collections::HashSet::new();
@@ -1329,7 +1522,7 @@ impl CloudSessions {
                         "providerSessionId": id,
                         "uploadId": upload,
                         "cwd": host_cwd,
-                        "title": if record.title.trim().is_empty() { "Moved session".to_string() } else { record.title.chars().take(200).collect::<String>() },
+                        "title": host_title(&record.title),
                         "model": model,
                         "modelSettings": configuration["modelSettings"],
                         "runtimeMode": configuration["runtimeMode"],
@@ -1472,6 +1665,15 @@ impl CloudSessions {
                 "This conversation is already in the cloud.".into(),
             ));
         }
+        // The session may have been deleted while the move ran (its id is then free for the
+        // next session): nothing is flipped for a session that is not the one that began it.
+        if !store.sessions()?.iter().any(|s| s.id == session)
+            || move_record(&store, session).is_none_or(|stored| stored.owner != record.owner)
+        {
+            return Err(Stop::Failed(
+                "The conversation was deleted while it was moving. Cancel the move.".into(),
+            ));
+        }
         store.save_setting(&format!("{NOTE_PREFIX}{session}"), &note)?;
         // Everything below runs under the store lock, so no local write lands in between.
         if local_busy(session, busy) {
@@ -1485,6 +1687,9 @@ impl CloudSessions {
         if store.row_anchor(session)? != record.anchor {
             return Err(Stop::Stale(CHANGED_AFTER_START.into()));
         }
+        // This move owns the Host session now. An earlier return to local may have marked a
+        // session with the same id (a fork id is derived, so it repeats) as saved locally.
+        store.set_cloud_converted(&project.environment_id, &host_session, false)?;
         let provider = record.provider_session_id.clone();
         let flat = json!({
             "id": host_session,
@@ -1495,11 +1700,17 @@ impl CloudSessions {
             "updatedAt": self.now(),
         });
         let remote = store.register_remote_summary(&project, &flat)?;
+        #[cfg(test)]
+        self.run_flip_hook(&store, "registered")?;
         // The link first: a Cloud location without a Host record reads as a lost workspace.
         store.link_remote_session(remote.id, Some(session))?;
         #[cfg(test)]
-        if let Some(hook) = self.flip_hook.lock().map_err(|e| e.to_string())?.as_ref() {
-            hook(&store)?;
+        self.run_flip_hook(&store, "linked")?;
+        // The summary and the Claude-only settings are written BEFORE the location, so the
+        // location never exists without them. The revision is raised so that a turn that
+        // began just before the flip cannot write its older settings over them.
+        if matches!(record.kind, MoveKind::Summary { .. }) {
+            self.store_handoff(&store, record)?;
         }
         let moved_at_row = store.row_anchor(session)?.count;
         let location = CloudLocation {
@@ -1513,28 +1724,41 @@ impl CloudSessions {
             pushed_branch: Some(record.branch.clone()),
         };
         store.set_cloud_location(session, &SessionLocation::Cloud(location))?;
-        if matches!(record.kind, MoveKind::Summary { .. }) {
-            self.store_handoff(&store, record, events);
-        }
         Ok(())
     }
 
-    /// The summary for the first cloud turn: the same brief a provider switch writes.
-    fn store_handoff(&self, store: &Store, record: &MoveRecord, events: &mut dyn FnMut(MoveEvent)) {
-        let result = (|| -> Result<(), String> {
-            let rows = store.load(record.session_id)?.rows;
-            let mut settings = store.agent_settings(record.session_id)?.unwrap_or_default();
-            settings.handoff = Some(crate::agent::Handoff {
-                from: record.provider.clone(),
-                brief: crate::response::handoff(&rows),
-            });
-            store.save_agent_settings(record.session_id, &settings)
-        })();
-        if let Err(error) = result {
-            events(MoveEvent::Notice(format!(
-                "The summary of this conversation could not be saved ({error}); the cloud session starts without it."
-            )));
+    #[cfg(test)]
+    fn run_flip_hook(&self, store: &Store, stage: &str) -> Result<(), String> {
+        match self.flip_hook.lock().map_err(|e| e.to_string())?.as_ref() {
+            Some(hook) => hook(store, stage),
+            None => Ok(()),
         }
+    }
+
+    /// The summary for the first cloud turn: the same brief a provider switch writes. A
+    /// session that is not Claude also leaves its own provider's model behind: the cloud runs
+    /// Claude, and every send configures the Host session from these settings.
+    fn store_handoff(&self, store: &Store, record: &MoveRecord) -> Result<(), String> {
+        let rows = store.load(record.session_id)?.rows;
+        let mut settings = store.agent_settings(record.session_id)?.unwrap_or_default();
+        settings.handoff = Some(crate::agent::Handoff {
+            from: record.provider.clone(),
+            brief: crate::response::handoff(&rows),
+        });
+        if record.provider != super::HARNESS {
+            settings.model = None;
+            settings.effort = None;
+            settings.fast = false;
+            settings.service_tier = None;
+            settings.thinking = None;
+            settings.model_settings.clear();
+        }
+        settings.revision += 1;
+        store
+            .save_agent_settings(record.session_id, &settings)
+            .map_err(|error| {
+                format!("The summary of this conversation could not be saved ({error})")
+            })
     }
 
     /// R4: the cloud must run a Claude at least as new as the one that wrote the transcript.
@@ -1629,6 +1853,34 @@ impl CloudSessions {
     /// Rolls the move back and removes its record, see the module docs. The local session is
     /// not touched. Never deletes a pushed branch. Call it when no `run_move` is running.
     pub fn cancel_move(
+        &self,
+        session_id: i64,
+        choice: CancelChoice,
+    ) -> Result<CancelReport, String> {
+        let running = self
+            .moves
+            .lock()
+            .map_err(|_| "Moves are unavailable")?
+            .get(&session_id)
+            .cloned();
+        if let Some(state) = running {
+            // The run stops at its next check and then rolls back by itself.
+            if let Ok(mut slot) = state.choice.lock() {
+                *slot = Some(choice);
+            }
+            state.stop.store(true, Ordering::Relaxed);
+            return Ok(CancelReport {
+                warnings: vec![
+                    "The move is stopping. It is rolled back when the current step ends.".into(),
+                ],
+                ..Default::default()
+            });
+        }
+        let (_state, _release) = self.enter_move(session_id)?;
+        self.cancel_move_inner(session_id, choice)
+    }
+
+    fn cancel_move_inner(
         &self,
         session_id: i64,
         choice: CancelChoice,
@@ -1800,6 +2052,48 @@ fn transcript_cwds(file: &Path) -> Vec<String> {
         }
     }
     found
+}
+
+fn is_inside(path: &str, root: &str) -> bool {
+    let root = root.trim_end_matches('/');
+    path == root || path.starts_with(&format!("{root}/"))
+}
+
+/// The folders of `found` that are not inside `own` or inside each other. The Host rewrites
+/// the longest named root first, so a subfolder named next to its parent would map to the
+/// new root without its own subpath.
+fn top_level_roots(found: Vec<String>, own: &[String]) -> Vec<String> {
+    let outside: Vec<String> = found
+        .into_iter()
+        .filter(|cwd| !own.iter().any(|root| is_inside(cwd, root)))
+        .collect();
+    outside
+        .iter()
+        .filter(|cwd| {
+            !outside
+                .iter()
+                .any(|other| other != *cwd && is_inside(cwd, other))
+        })
+        .cloned()
+        .collect()
+}
+
+/// A session title the Host accepts: it counts UTF-16 units and allows 200.
+fn host_title(title: &str) -> String {
+    let mut out = String::new();
+    let mut units = 0;
+    for c in title.chars() {
+        units += c.len_utf16();
+        if units > 200 {
+            break;
+        }
+        out.push(c);
+    }
+    if out.trim().is_empty() {
+        "Moved session".to_string()
+    } else {
+        out
+    }
 }
 
 /// The sandbox config of a move: it starts on the pushed branch, so base and feature are the
