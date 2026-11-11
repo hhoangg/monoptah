@@ -85,6 +85,8 @@ struct FakeHost {
     apply_exists_on_rerun: Mutex<bool>,
     /// Whether `git.worktrees` lists the restored working copy.
     lists_worktree: Mutex<bool>,
+    /// `applySnapshot` always finds the working copy in place (another move's worktree).
+    always_reused: Mutex<bool>,
 }
 impl FakeHost {
     fn new() -> Arc<Self> {
@@ -105,6 +107,7 @@ impl FakeHost {
             connect_error: Mutex::new(None),
             apply_exists_on_rerun: Mutex::new(false),
             lists_worktree: Mutex::new(true),
+            always_reused: Mutex::new(false),
         })
     }
     fn methods(&self) -> Vec<String> {
@@ -264,6 +267,7 @@ impl super::Host for FakeHost {
                     }
                 }
                 let first_apply = self.count("workspace.applySnapshot") == 1;
+                let always = *self.always_reused.lock().unwrap();
                 let tree = self
                     .wrong_tree
                     .lock()
@@ -276,8 +280,8 @@ impl super::Host for FakeHost {
                     "head": params["head"],
                     "tree": tree,
                     // The Host creates the worktree once; a repeated call finds it in place.
-                    "createdWorktree": params["instance"] == "shared" && first_apply,
-                    "reused": !first_apply,
+                    "createdWorktree": params["instance"] == "shared" && first_apply && !always,
+                    "reused": !first_apply || always,
                     "patchApplied": params["patchUploadId"].is_string(),
                 }))
             }
@@ -2349,7 +2353,7 @@ fn deleting_the_session_during_a_move_leaves_no_cloud_location_for_the_next_one(
         }
     }));
     let (result, _) = fx.run();
-    assert!(result.unwrap_err().contains("deleted while it was moving"));
+    assert!(result.unwrap_err().contains("no longer belongs"));
     let reused = fx
         .store
         .lock()
@@ -2672,4 +2676,242 @@ fn a_fork_id_from_an_earlier_attempt_is_retired_like_the_original_id() {
         .map(|c| c["sessionId"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(deleted, vec!["old-fork".to_string()]);
+}
+
+// ------------------------------------------------------------ third review
+
+#[test]
+fn a_worktree_that_was_already_there_is_never_removed_by_a_cancel() {
+    let fx = Fx::new();
+    *fx.host.always_reused.lock().unwrap() = true;
+    fx.set_flip_hook(|_| Err("crash".into()));
+    assert!(fx.run().0.is_err());
+    let mut record = fx.record().unwrap();
+    record.done.retain(|s| {
+        !matches!(
+            s,
+            MoveStep::RestoreCode | MoveStep::RestoreConversation | MoveStep::Flip
+        )
+    });
+    fx.save_record(&record);
+    assert!(fx.run().0.is_err());
+    assert_eq!(fx.host.count("workspace.applySnapshot"), 2);
+    assert!(
+        !fx.record().unwrap().created_worktree,
+        "reused twice is still not ours"
+    );
+    fx.svc
+        .cancel_move(fx.session, CancelChoice::default())
+        .unwrap();
+    assert!(!fx.backend.scripts().join("\n").contains("worktree remove"));
+}
+
+#[test]
+fn a_cancel_keeps_a_worktree_that_another_host_session_works_in() {
+    let fx = Fx::new();
+    fx.set_flip_hook(|_| Err("crash".into()));
+    assert!(fx.run().0.is_err());
+    assert!(fx.record().unwrap().created_worktree);
+    fx.host.sessions.lock().unwrap().push(json!({
+        "id": "someone-else", "harness": "claude", "providerSessionId": "other",
+        "status": "idle", "cwd": "/workspaces/widgets-wt"
+    }));
+    let report = fx
+        .svc
+        .cancel_move(fx.session, CancelChoice::default())
+        .unwrap();
+    assert!(report
+        .warnings
+        .iter()
+        .any(|w| w.contains("used by another session")));
+    assert!(!fx.backend.scripts().join("\n").contains("worktree remove"));
+}
+
+#[test]
+fn the_location_and_the_settings_are_written_together_or_not_at_all() {
+    let fx = Fx::build("codex", "2.1.321", |_| {});
+    set_settings(&fx, |s| s.model = Some("gpt-5.1-codex".into()));
+    // A database that refuses the location write (disk full).
+    let path = fx.store.lock().unwrap().database_path().to_path_buf();
+    let other = rusqlite::Connection::open(&path).unwrap();
+    other
+        .execute_batch(
+            "CREATE TRIGGER refuse_location BEFORE INSERT ON native_settings
+             WHEN NEW.key LIKE 'cloud-location:%'
+             BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+        )
+        .unwrap();
+    let (result, _) = fx.run();
+    assert!(result.unwrap_err().contains("disk full"));
+    assert_eq!(fx.location(), SessionLocation::Local);
+    {
+        let store = fx.store.lock().unwrap();
+        let settings = store.agent_settings(fx.session).unwrap().unwrap();
+        assert_eq!(
+            settings.model.as_deref(),
+            Some("gpt-5.1-codex"),
+            "model kept"
+        );
+        assert!(
+            settings.handoff.is_none(),
+            "no handoff without the location"
+        );
+    }
+    other.execute_batch("DROP TRIGGER refuse_location").unwrap();
+    fx.run().0.unwrap();
+    let settings = fx
+        .store
+        .lock()
+        .unwrap()
+        .agent_settings(fx.session)
+        .unwrap()
+        .unwrap();
+    assert!(settings.handoff.is_some() && settings.model.is_none());
+    assert!(fx.location().is_cloud());
+}
+
+#[test]
+fn a_cancel_that_arrives_during_the_flip_does_not_abort_it() {
+    use std::sync::mpsc;
+    let fx = Fx::new();
+    fx.begin();
+    let (reached_tx, reached_rx) = mpsc::channel::<()>();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let reached_tx = Mutex::new(reached_tx);
+    let go_rx = Mutex::new(go_rx);
+    fx.set_flip_hook(move |_| {
+        reached_tx.lock().unwrap().send(()).unwrap();
+        go_rx.lock().unwrap().recv().unwrap();
+        Ok(())
+    });
+    std::thread::scope(|scope| {
+        let run = scope.spawn(|| fx.run());
+        reached_rx.recv().unwrap();
+        fx.svc
+            .cancel_move(fx.session, CancelChoice::default())
+            .unwrap();
+        go_tx.send(()).unwrap();
+        let (result, events) = run.join().unwrap();
+        result.unwrap();
+        assert!(notices(&events).iter().any(|n| n.contains("came too late")));
+    });
+    assert!(fx.location().is_cloud());
+    assert!(
+        fx.host.count("sessions.delete") == 0,
+        "nothing was rolled back"
+    );
+}
+
+#[test]
+fn a_run_for_a_deleted_session_never_writes_the_next_sessions_move() {
+    let fx = Fx::new();
+    let store = fx.store.clone();
+    let session = fx.session;
+    let work = fx.work.to_string_lossy().into_owned();
+    *fx.host.on_request.lock().unwrap() = Some(Box::new(move |method| {
+        if method == "workspace.applySnapshot" {
+            let mut guard = store.lock().unwrap();
+            guard.delete(session).unwrap();
+            let next = guard.create("claude", &work).unwrap();
+            assert_eq!(next.id, session);
+            guard
+                .save_setting(&format!("cloud-move:{session}"), "FOREIGN")
+                .unwrap();
+            guard
+                .save_setting(&format!("cloud-move-owner:{session}"), "other-owner")
+                .unwrap();
+        }
+    }));
+    let (result, events) = fx.run();
+    assert!(result.unwrap_err().contains("no longer belongs"));
+    let store = fx.store.lock().unwrap();
+    assert_eq!(
+        store
+            .setting(&format!("cloud-move:{session}"))
+            .unwrap()
+            .as_deref(),
+        Some("FOREIGN")
+    );
+    assert_eq!(
+        store
+            .setting(&format!("cloud-move-owner:{session}"))
+            .unwrap()
+            .as_deref(),
+        Some("other-owner")
+    );
+    assert!(store.cloud_location(session).unwrap() == SessionLocation::Local);
+    drop(store);
+    // What the run made on the Host is undone.
+    assert!(fx.host.uploaded_names().is_empty());
+    let _ = events;
+}
+
+#[test]
+fn a_move_cannot_begin_while_one_runs_for_the_same_id() {
+    use std::sync::mpsc;
+    let fx = Fx::new();
+    fx.begin();
+    let (reached_tx, reached_rx) = mpsc::channel::<()>();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let reached_tx = Mutex::new(reached_tx);
+    let go_rx = Mutex::new(go_rx);
+    let first = AtomicBool::new(true);
+    *fx.host.on_request.lock().unwrap() = Some(Box::new(move |method| {
+        if method == "workspace.applySnapshot" && first.swap(false, Ordering::SeqCst) {
+            reached_tx.lock().unwrap().send(()).unwrap();
+            go_rx.lock().unwrap().recv().unwrap();
+        }
+    }));
+    std::thread::scope(|scope| {
+        let run = scope.spawn(|| fx.run().0);
+        reached_rx.recv().unwrap();
+        assert_eq!(
+            fx.svc.begin_move(fx.request(), &|| false).unwrap_err(),
+            MOVE_RUNNING
+        );
+        go_tx.send(()).unwrap();
+        run.join().unwrap().unwrap();
+    });
+}
+
+#[test]
+fn a_panic_in_a_run_releases_the_guard_and_does_not_hang() {
+    let fx = Fx::new();
+    fx.begin();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fx.svc.run_move(
+            fx.session,
+            &|| false,
+            &mut |event| {
+                if matches!(event, MoveEvent::Log(_)) {
+                    panic!("boom");
+                }
+            },
+            &AtomicBool::new(false),
+        )
+    }));
+    assert!(outcome.is_err());
+    assert!(
+        fx.svc.moves.lock().unwrap().is_empty(),
+        "the guard is released"
+    );
+    // The move can be run again.
+    fx.run().0.unwrap();
+}
+
+#[test]
+fn a_push_that_reached_origin_but_was_not_recorded_is_reported_on_cancel() {
+    let fx = Fx::new();
+    let mut record = fx.begin();
+    record.branch = "feat".into();
+    record.creates_branch = true;
+    record.pushed = false;
+    record.head = fx.head();
+    fx.save_record(&record);
+    git(&fx.work, &["push", "-q", "origin", "feat"]);
+    let report = fx
+        .svc
+        .cancel_move(fx.session, CancelChoice::default())
+        .unwrap();
+    assert_eq!(report.created_branch.as_deref(), Some("feat"));
 }

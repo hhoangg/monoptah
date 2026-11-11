@@ -311,6 +311,9 @@ pub enum MoveEvent {
     Notice(String),
     /// The move finished; the location is Cloud.
     Done(MoveOutcome),
+    /// A cancel that arrived during the run was carried out by the run: what is left for the
+    /// user to decide (a pushed branch, a kept workspace).
+    Cancelled(CancelReport),
     /// The move failed; the record (with `failed_at` and `error`) is persisted.
     Failed(MoveRecord),
 }
@@ -359,11 +362,18 @@ pub(super) struct RunState {
 struct MoveGuard<'a> {
     service: &'a CloudSessions,
     session: i64,
+    state: Arc<RunState>,
 }
 impl Drop for MoveGuard<'_> {
     fn drop(&mut self) {
+        // Only its own entry: a later run of the same id must keep its guard.
         if let Ok(mut running) = self.service.moves.lock() {
-            running.remove(&self.session);
+            if running
+                .get(&self.session)
+                .is_some_and(|state| Arc::ptr_eq(state, &self.state))
+            {
+                running.remove(&self.session);
+            }
         }
     }
 }
@@ -420,7 +430,17 @@ pub fn pending_moves(store: &Store) -> Vec<MoveRecord> {
         .collect()
 }
 
+/// Returned when a run tries to write the record of a session that is gone or whose id now
+/// belongs to another session.
+pub const MOVE_OWNER_GONE: &str =
+    "This move no longer belongs to this conversation (it was deleted). Nothing more was done.";
+
 fn save_record(store: &Store, record: &MoveRecord) -> Result<(), String> {
+    if store.setting(&owner_key(record.session_id))?.as_deref() != Some(record.owner.as_str())
+        || record.owner.is_empty()
+    {
+        return Err(MOVE_OWNER_GONE.into());
+    }
     store.save_setting(
         &key(record.session_id),
         &serde_json::to_string(record).map_err(|e| e.to_string())?,
@@ -533,8 +553,16 @@ impl CloudSessions {
         request: MoveRequest,
         busy: &dyn Fn() -> bool,
     ) -> Result<MoveRecord, String> {
-        let store = self.store()?;
         let id = request.session_id;
+        if self
+            .moves
+            .lock()
+            .map_err(|_| "Moves are unavailable")?
+            .contains_key(&id)
+        {
+            return Err(MOVE_RUNNING.into());
+        }
+        let store = self.store()?;
         if move_record(&store, id).is_some() {
             return Err(ALREADY_MOVING.into());
         }
@@ -652,6 +680,13 @@ impl CloudSessions {
         // One flag stops everything below: the caller's `cancel` and a `cancel_move` that
         // arrives while the move runs.
         let result = std::thread::scope(|scope| {
+            // Set even if the run panics, or the scope would wait for the watcher forever.
+            struct Finish<'a>(&'a AtomicBool);
+            impl Drop for Finish<'_> {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Relaxed);
+                }
+            }
             scope.spawn(|| {
                 while !finished.load(Ordering::Relaxed) {
                     if cancel.load(Ordering::Relaxed) {
@@ -660,21 +695,36 @@ impl CloudSessions {
                     std::thread::sleep(std::time::Duration::from_millis(40));
                 }
             });
-            let result = self.run_move_inner(session_id, busy, events, &state.stop);
-            finished.store(true, Ordering::Relaxed);
-            result
+            let _finish = Finish(&finished);
+            self.run_move_inner(session_id, busy, events, &state.stop)
         });
-        // A cancel that arrived during the run: the run does the rollback itself, once it
-        // has stopped, so nothing writes the record again afterwards.
-        if result.is_err() {
-            let choice = state.choice.lock().ok().and_then(|mut c| c.take());
-            if let Some(choice) = choice {
-                if let Err(error) = self.cancel_move_inner(session_id, choice) {
-                    events(MoveEvent::Notice(format!(
-                        "The rollback failed: {}",
-                        scrub(&error)
-                    )));
+        // A cancel that arrived during the run: the run does the rollback itself, once it has
+        // stopped, and tells the caller what is left to decide. The guard is only released
+        // when no cancel is waiting, so a late one is never lost.
+        loop {
+            let choice = {
+                let mut running = self.moves.lock().map_err(|_| "Moves are unavailable")?;
+                let choice = state.choice.lock().ok().and_then(|mut c| c.take());
+                if choice.is_none() {
+                    running.remove(&session_id);
                 }
+                choice
+            };
+            let Some(choice) = choice else { break };
+            if result.is_ok() {
+                // The move had finished its flip: there is nothing to roll back.
+                events(MoveEvent::Notice(
+                    "The cancel came too late: the conversation had already moved to the cloud."
+                        .into(),
+                ));
+                continue;
+            }
+            match self.cancel_move_inner(session_id, choice) {
+                Ok(report) => events(MoveEvent::Cancelled(report)),
+                Err(error) => events(MoveEvent::Notice(format!(
+                    "The rollback failed: {}",
+                    scrub(&error)
+                ))),
             }
         }
         result
@@ -689,10 +739,11 @@ impl CloudSessions {
         let state = Arc::new(RunState::default());
         running.insert(session, state.clone());
         Ok((
-            state,
+            state.clone(),
             MoveGuard {
                 service: self,
                 session,
+                state,
             },
         ))
     }
@@ -743,6 +794,15 @@ impl CloudSessions {
                         }
                         return Err(MOVE_ABORTED.into());
                     }
+                    Err(Stop::Failed(error)) if error == MOVE_OWNER_GONE => {
+                        // The conversation was deleted (its id may belong to another one
+                        // now): undo what this run made on the Host, touch nothing locally.
+                        let warnings = self.rollback_host(&record, false);
+                        for warning in warnings {
+                            events(MoveEvent::Notice(warning));
+                        }
+                        return Err(error);
+                    }
                     Err(Stop::Failed(error)) => {
                         let error = scrub(&error);
                         // A committed upload expires after an hour idle: upload again.
@@ -781,7 +841,14 @@ impl CloudSessions {
         record: &MoveRecord,
         events: &mut dyn FnMut(MoveEvent),
     ) -> Result<(), String> {
-        save_record(&*self.store()?, record)?;
+        if let Err(error) = save_record(&*self.store()?, record) {
+            if error == MOVE_OWNER_GONE {
+                for warning in self.rollback_host(record, false) {
+                    events(MoveEvent::Notice(warning));
+                }
+            }
+            return Err(error);
+        }
         events(MoveEvent::Updated(record.clone()));
         Ok(())
     }
@@ -1395,6 +1462,9 @@ impl CloudSessions {
         // Written before the call: a worktree the Host made whose answer was lost is the
         // move's, and a later call that answers `reused` must not make Cancel forget it.
         let rerun = record.restore_attempted;
+        // The first answer decides whether the working copy is ours: a worktree that was
+        // already there (another move's) stays someone else's however often it is answered.
+        let no_prior_answer = record.host_cwd.is_none();
         if workspace.created {
             // A new instance restores into its own checkout; nothing is created.
         } else if !rerun {
@@ -1450,7 +1520,7 @@ impl CloudSessions {
         record.host_cwd = Some(cwd.to_string());
         // A re-run finds the worktree in place (`reused`): the first creation is what counts.
         record.created_worktree |= result["createdWorktree"].as_bool().unwrap_or(false)
-            || (rerun && result["reused"].as_bool().unwrap_or(false));
+            || (rerun && no_prior_answer && result["reused"].as_bool().unwrap_or(false));
         Ok(())
     }
 
@@ -1709,9 +1779,11 @@ impl CloudSessions {
         // The summary and the Claude-only settings are written BEFORE the location, so the
         // location never exists without them. The revision is raised so that a turn that
         // began just before the flip cannot write its older settings over them.
-        if matches!(record.kind, MoveKind::Summary { .. }) {
-            self.store_handoff(&store, record)?;
-        }
+        let settings = if matches!(record.kind, MoveKind::Summary { .. }) {
+            Some(self.handoff_settings(&store, record)?)
+        } else {
+            None
+        };
         let moved_at_row = store.row_anchor(session)?.count;
         let location = CloudLocation {
             cloud: workspace.cloud(),
@@ -1723,7 +1795,13 @@ impl CloudSessions {
             moved_at_row,
             pushed_branch: Some(record.branch.clone()),
         };
-        store.set_cloud_location(session, &SessionLocation::Cloud(location))?;
+        // One transaction: the location never exists without its settings, and a failed write
+        // leaves the Local session exactly as it was.
+        store.set_cloud_location_with_settings(
+            session,
+            &SessionLocation::Cloud(location),
+            settings.as_ref(),
+        )?;
         Ok(())
     }
 
@@ -1735,10 +1813,15 @@ impl CloudSessions {
         }
     }
 
-    /// The summary for the first cloud turn: the same brief a provider switch writes. A
+    /// The settings of a session that moves as a summary: the same brief a provider switch
+    /// writes. A
     /// session that is not Claude also leaves its own provider's model behind: the cloud runs
     /// Claude, and every send configures the Host session from these settings.
-    fn store_handoff(&self, store: &Store, record: &MoveRecord) -> Result<(), String> {
+    fn handoff_settings(
+        &self,
+        store: &Store,
+        record: &MoveRecord,
+    ) -> Result<crate::agent::Settings, String> {
         let rows = store.load(record.session_id)?.rows;
         let mut settings = store.agent_settings(record.session_id)?.unwrap_or_default();
         settings.handoff = Some(crate::agent::Handoff {
@@ -1754,11 +1837,7 @@ impl CloudSessions {
             settings.model_settings.clear();
         }
         settings.revision += 1;
-        store
-            .save_agent_settings(record.session_id, &settings)
-            .map_err(|error| {
-                format!("The summary of this conversation could not be saved ({error})")
-            })
+        Ok(settings)
     }
 
     /// R4: the cloud must run a Claude at least as new as the one that wrote the transcript.
@@ -1906,51 +1985,24 @@ impl CloudSessions {
                 });
             }
         }
+        // A push that was cancelled or lost its answer may still have reached origin: ask it.
+        let on_origin = record.creates_branch
+            && !record.branch.is_empty()
+            && (record.pushed
+                || move_out::origin_branch_tip(Path::new(&record.work_cwd), &record.branch)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|tip| !record.head.is_empty() && tip == record.head));
         let mut report = CancelReport {
-            created_branch: (record.creates_branch && record.pushed).then(|| record.branch.clone()),
+            created_branch: on_origin.then(|| record.branch.clone()),
             ..Default::default()
         };
-        let mut warnings: Vec<String> = vec![];
         let created = record
             .workspace
             .as_ref()
             .filter(|w| w.created && !w.name.is_empty());
         let deleting = choice.delete_workspace && created.is_some();
-        if record
-            .workspace
-            .as_ref()
-            .is_some_and(|w| w.project.is_some())
-        {
-            for upload in [&record.patch_upload, &record.transcript_upload]
-                .into_iter()
-                .flatten()
-            {
-                if let Err(e) = self.rpc(&record, "uploads.discard", json!({"uploadId": upload})) {
-                    warnings.push(format!("Could not discard an upload: {}", scrub(&e)));
-                }
-            }
-            if let (Some(host_session), Some(project)) = (
-                &record.host_session_id,
-                record.workspace.as_ref().and_then(|w| w.project.as_ref()),
-            ) {
-                if let Err(e) = self.rpc(
-                    &record,
-                    "sessions.delete",
-                    json!({"sessionId": host_session, "projectId": project.project_id}),
-                ) {
-                    warnings.push(format!("Could not delete the cloud session: {}", scrub(&e)));
-                }
-            }
-            // A deleted workspace takes its working copy with it.
-            if record.created_worktree && !deleting {
-                if let Err(e) = self.remove_host_worktree(&record) {
-                    warnings.push(format!(
-                        "Could not remove the cloud working copy: {}",
-                        scrub(&e)
-                    ));
-                }
-            }
-        }
+        let mut warnings = self.rollback_host(&record, deleting);
         {
             let store = self.store()?;
             // A flip that failed after the Host record was linked leaves it behind. While the
@@ -2005,6 +2057,82 @@ impl CloudSessions {
         clear_record(&*self.store()?, session_id)?;
         report.warnings = warnings;
         Ok(report)
+    }
+
+    /// What a move made on the Host, undone best effort: uploads, the Host session and a
+    /// worktree the move itself created (never one that another session may use). Returns
+    /// the warnings. Writes nothing in the local store.
+    fn rollback_host(&self, record: &MoveRecord, deleting: bool) -> Vec<String> {
+        let mut warnings: Vec<String> = vec![];
+        if !record
+            .workspace
+            .as_ref()
+            .is_some_and(|w| w.project.is_some())
+        {
+            return warnings;
+        }
+        for upload in [&record.patch_upload, &record.transcript_upload]
+            .into_iter()
+            .flatten()
+        {
+            if let Err(e) = self.rpc(record, "uploads.discard", json!({"uploadId": upload})) {
+                warnings.push(format!("Could not discard an upload: {}", scrub(&e)));
+            }
+        }
+        if let (Some(host_session), Some(project)) = (
+            &record.host_session_id,
+            record.workspace.as_ref().and_then(|w| w.project.as_ref()),
+        ) {
+            if let Err(e) = self.rpc(
+                record,
+                "sessions.delete",
+                json!({"sessionId": host_session, "projectId": project.project_id}),
+            ) {
+                warnings.push(format!("Could not delete the cloud session: {}", scrub(&e)));
+            }
+        }
+        // A deleted workspace takes its working copy with it.
+        if record.created_worktree && !deleting {
+            match self.worktree_used_by_another(record) {
+                Ok(true) => warnings
+                    .push("The cloud working copy is used by another session and was kept.".into()),
+                Ok(false) => {
+                    if let Err(e) = self.remove_host_worktree(record) {
+                        warnings.push(format!(
+                            "Could not remove the cloud working copy: {}",
+                            scrub(&e)
+                        ));
+                    }
+                }
+                Err(e) => warnings.push(format!(
+                    "The cloud working copy was kept because its use could not be checked: {}",
+                    scrub(&e)
+                )),
+            }
+        }
+        warnings
+    }
+
+    /// Whether a Host session other than this move's own works in the move's working copy.
+    fn worktree_used_by_another(&self, record: &MoveRecord) -> Result<bool, String> {
+        let Some(cwd) = record.host_cwd.as_deref() else {
+            return Ok(false);
+        };
+        let projects = self.rpc(record, "projects.list", json!({}))?;
+        for project in projects.as_array().into_iter().flatten() {
+            let Some(id) = project["id"].as_str() else {
+                continue;
+            };
+            let sessions = self.rpc(record, "sessions.list", json!({"projectId": id}))?;
+            for session in sessions.as_array().into_iter().flatten() {
+                if session["cwd"].as_str() == Some(cwd)
+                    && session["id"].as_str() != record.host_session_id.as_deref()
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Removes the worktree `applySnapshot` created. The Host has no RPC for it, so a plain

@@ -260,6 +260,47 @@ impl Store {
         let _ = self.save_setting(&Self::sync_error_key(session), "");
         self.save_setting(&Self::location_key(session), "")
     }
+    /// Writes the Cloud location together with the settings the move needs in ONE transaction:
+    /// either both are stored or neither (the settings carry the summary and the Claude-only
+    /// model). Only the move may call this.
+    pub fn set_cloud_location_with_settings(
+        &self,
+        session: i64,
+        location: &SessionLocation,
+        settings: Option<&crate::agent::Settings>,
+    ) -> Result<(), String> {
+        let Some(settings) = settings else {
+            return self.set_cloud_location(session, location);
+        };
+        if self.shared.is_some() || session < 0 || self.remote_session(session)?.is_some() {
+            self.save_agent_settings(session, settings)?;
+            return self.set_cloud_location(session, location);
+        }
+        let raw = match location {
+            SessionLocation::Local => String::new(),
+            SessionLocation::Cloud(cloud) => {
+                serde_json::to_string(cloud).map_err(|e| e.to_string())?
+            }
+        };
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        tx.execute(
+            super::SAVE_AGENT_SETTINGS,
+            rusqlite::params![
+                format!("agent:{session}"),
+                serde_json::to_string(settings).map_err(|e| e.to_string())?
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO native_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            rusqlite::params![Self::location_key(session), raw],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
     /// Every stored `cloud-move:<session id>` record (the move in progress), by session id.
     pub fn cloud_move_settings(&self) -> Result<Vec<(i64, String)>, String> {
         Ok(self
