@@ -1,7 +1,7 @@
 //! The Continue locally dialog: nothing runs before the confirmation, success adopts the
 //! result, and a failure leaves the session in the cloud with a retry.
 use super::cloud_continue::{Kind, confirm_text};
-use super::cloud_location_tests::{LOCAL, host_record, move_to_cloud, service, ten_row_session};
+use super::cloud_location_tests::{LOCAL, host_record, move_to_cloud, service};
 use super::*;
 use gpui::TestAppContext;
 use monocode_core::cloud_sessions::{ConvertError, Converted, Resume};

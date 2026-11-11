@@ -101,17 +101,6 @@ fn run(w: &World, id: i64) -> Result<Converted, ConvertError> {
     w.svc.continue_locally(id, &mut |_| {})
 }
 
-fn summary(w: &World, id: i64) -> crate::store::Session {
-    w.svc
-        .store()
-        .unwrap()
-        .sessions()
-        .unwrap()
-        .into_iter()
-        .find(|s| s.id == id)
-        .unwrap()
-}
-
 #[test]
 fn a_round_trip_keeps_one_session_one_id_and_the_cloud_turns_in_the_local_file() {
     let w = world(true);
