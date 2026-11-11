@@ -2378,6 +2378,73 @@ fn a_cancelled_reconnect_stops_without_touching_the_host() {
     assert!(fx.host.log.lock().unwrap().is_empty());
 }
 
+#[test]
+fn a_sandbox_start_runs_the_claude_setup_and_a_reconnect_never_does() {
+    use super::claude_setup::KitSeams;
+    use super::kit::KitRoots;
+    use super::kit_prefs::CloudKitPrefs;
+    let kit_home = tempfile::tempdir().unwrap();
+    let home = std::fs::canonicalize(kit_home.path()).unwrap();
+    std::fs::create_dir_all(home.join(".claude/skills/review")).unwrap();
+    std::fs::write(home.join(".claude/skills/review/SKILL.md"), "# review").unwrap();
+    let roots = KitRoots {
+        account_dir: None,
+        claude_home: home.join(".claude"),
+        project: home.join("work"),
+        key_dir: Some(home.join("app-data")),
+        home,
+    };
+    let prefs = CloudKitPrefs {
+        enabled: true,
+        notice_acknowledged: true,
+        selection: None,
+    };
+    let mut fx = fx();
+    fx.svc = fx.svc.with_kit_seams(KitSeams {
+        prefs: Arc::new(move || prefs.clone()),
+        roots: Arc::new(move |_, _| Ok(roots.clone())),
+    });
+    let (session, record) = fx.begin().unwrap();
+    assert!(record.created);
+    let (result, events) = fx.run(session.id);
+    // The scripted Host answers every kit call with a project reply, so the step only
+    // warns; it still ran, once, and the start is Ready.
+    result.unwrap();
+    let Some(StartEvent::Updated(last)) = events.iter().rev().nth(1) else {
+        panic!("{events:?}");
+    };
+    assert_eq!(status(last, StepKind::ClaudeSetup), StepStatus::Done);
+    let kit_calls = |fx: &Fx| {
+        fx.host
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.contains(" kit.") || l.contains(" uploads."))
+            .count()
+    };
+    assert!(kit_calls(&fx) > 0);
+    // A user reconnect restores the sandbox; it never sends the kit or credentials again.
+    super::docker_config::save(&fx.store.lock().unwrap(), "/Users/me/widgets", &config()).unwrap();
+    fx.sbx.set_state(&sandbox_id(&fx), "stopped");
+    fx.reset();
+    fx.reconnect(session.id).0.unwrap();
+    assert_eq!(kit_calls(&fx), 0);
+}
+
+#[test]
+fn a_sandbox_start_records_the_kit_choice_in_its_first_record() {
+    let fx = fx();
+    let (session, record) = fx
+        .svc
+        .begin_sandbox_start_with_kit("/Users/me/widgets", &config(), "fix/login", "claude", false)
+        .unwrap();
+    assert!(record.kit_off);
+    assert!(fx.record(session.id).unwrap().kit_off);
+    let (session, record) = fx.begin().unwrap();
+    assert!(!record.kit_off && !fx.record(session.id).unwrap().kit_off);
+}
+
 // ------------------------------------------------------------- call sites
 
 #[test]

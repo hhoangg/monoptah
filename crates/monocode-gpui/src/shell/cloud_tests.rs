@@ -373,7 +373,7 @@ fn the_new_session_flow_begins_a_start_and_lists_a_pending_claude_session() {
         cloud_picker::target_for(CodespaceChoice::New, " feature ", Some("basicLinux32gb"))
             .unwrap();
     assert_eq!(target.branch.as_deref(), Some("feature"));
-    let (summary, record) = cloud_picker::begin_cloud_start(&svc, &local, target).unwrap();
+    let (summary, record) = cloud_picker::begin_cloud_start(&svc, &local, target, true).unwrap();
     assert_eq!(summary.provider, "claude");
     // The session exists at once, on a provisional project, with its start recorded.
     assert!(
@@ -403,7 +403,7 @@ fn an_existing_codespace_is_used_without_creating_and_a_new_one_needs_a_branch()
     let svc = service(&gh, &host, memory_store());
     let target =
         cloud_picker::target_for(CodespaceChoice::Named("octo-abc".into()), "", None).unwrap();
-    cloud_picker::begin_cloud_start(&svc, &local, target).unwrap();
+    cloud_picker::begin_cloud_start(&svc, &local, target, true).unwrap();
     assert!(!gh.calls().iter().any(|c| c.contains("--method POST")));
     assert_eq!(
         cloud_picker::target_for(CodespaceChoice::New, "  ", None).unwrap_err(),
@@ -1434,6 +1434,146 @@ fn files_and_git_show_the_cloud_workspace_by_default_and_the_local_switch_refuse
         .unwrap();
 }
 
+/// The Claude setup block of the cloud panel (design 3.2.4): the stored health, the "changed
+/// since start" indicator and the manual Update, which refuses while the kit is off.
+#[gpui::test]
+fn the_cloud_panel_shows_the_claude_setup_and_update_reports_a_refusal(cx: &mut TestAppContext) {
+    use crate::shell::claude_setup::SetupSlot;
+    use monocode_core::cloud_sessions::claude_setup::{
+        HealthStatus, KitSeams, ServerHealth, SetupState, SetupView,
+    };
+    use monocode_core::cloud_sessions::kit_prefs::CloudKitPrefs;
+    let (window, id, gh) = shell_with_cloud(cx);
+    let health = |name: &str, status, sign_in, detail: &str, oauth| ServerHealth {
+        name: name.into(),
+        status,
+        sign_in_needed: sign_in,
+        transport: "http".into(),
+        reason: if detail.contains("refused") {
+            "could not connect".into()
+        } else {
+            String::new()
+        },
+        needs_approval: detail.contains("approval"),
+        oauth_style: oauth,
+    };
+    let view = SetupView {
+        cloud: CloudRef::codespace("octo-abc"),
+        state: serde_json::from_value::<SetupState>(json!({
+            "atMs": 1, "applied": true, "summary": "1 skill, 3 MCP servers",
+            "health": [], "warnings": ["Server \"x\" was not sent."]
+        }))
+        .map(|mut state| {
+            state.health = vec![
+                health("github", HealthStatus::Connected, false, "Connected", false),
+                health(
+                    "linear",
+                    HealthStatus::SignInNeeded,
+                    true,
+                    "Needs authentication",
+                    true,
+                ),
+                health(
+                    "site",
+                    HealthStatus::Failed,
+                    false,
+                    "connection refused",
+                    false,
+                ),
+            ];
+            state
+        })
+        .unwrap(),
+        changed: true,
+        can_update: true,
+    };
+    window
+        .update(cx, |shell, window, cx| {
+            // The kit is off in Settings: Update must refuse, not send.
+            shell.cloud = Arc::new(
+                CloudSessions::new(gh, Arc::new(FakeHost::default()), shell.store.clone())
+                    .with_kit_seams(KitSeams {
+                        prefs: Arc::new(CloudKitPrefs::default),
+                        roots: Arc::new(|_, _| Err("not used".into())),
+                    }),
+            );
+            shell.ensure_right_panel(window, cx);
+            shell.workspace.active = Some(id);
+            // Without a stored result the block is absent.
+            shell.sync_cloud_panel(cx);
+            let panel = shell.right_panel.clone().expect("panel");
+            assert_eq!(panel.read(cx).cloud_chrome().unwrap().setup, None);
+        })
+        .unwrap();
+    // The read of the (absent) stored result lands before the stored one is put in place.
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            let panel = shell.right_panel.clone().expect("panel");
+            shell.claude_setups.borrow_mut().insert(
+                "octo-abc".into(),
+                SetupSlot {
+                    view: Some(view),
+                    requested: true,
+                    ..Default::default()
+                },
+            );
+            shell.sync_cloud_panel(cx);
+            let setup = panel
+                .read(cx)
+                .cloud_chrome()
+                .unwrap()
+                .setup
+                .clone()
+                .unwrap();
+            assert_eq!(setup.summary, "1 skill, 3 MCP servers");
+            // The panel's link is down in this fixture: Update is not on offer (it never wakes).
+            assert!(setup.changed && !setup.can_update && !setup.updating);
+            let lines: Vec<_> = setup
+                .servers
+                .iter()
+                .map(|(name, label, _)| (name.as_str(), label.as_str()))
+                .collect();
+            assert_eq!(
+                lines,
+                [
+                    ("github", "connected"),
+                    ("linear", "Sign in in the cloud"),
+                    ("site", "failed - could not connect"),
+                ]
+            );
+            shell.update_claude_setup(cx);
+            assert!(shell.claude_setups.borrow()["octo-abc"].updating);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            let slots = shell.claude_setups.borrow();
+            let slot = &slots["octo-abc"];
+            assert!(!slot.updating);
+            assert!(
+                slot.error.as_deref().is_some_and(|e| e.contains("off")),
+                "{:?}",
+                slot.error
+            );
+            drop(slots);
+            // The refusal is shown with the block.
+            shell.workspace.active = Some(id);
+            shell.sync_cloud_panel(cx);
+            let panel = shell.right_panel.clone().unwrap();
+            let setup = panel
+                .read(cx)
+                .cloud_chrome()
+                .unwrap()
+                .setup
+                .clone()
+                .unwrap();
+            assert!(setup.error.is_some());
+        })
+        .unwrap();
+}
+
 const LOCAL: &str = "/work/monocode";
 
 /// The panels (binding, the Local switch, the connection strip, the policy) only read cached
@@ -2142,7 +2282,7 @@ fn begin(
 ) -> (Session, monocode_core::cloud_sessions::StartRecord) {
     let local = checkout.path().to_string_lossy().into_owned();
     let target = cloud_picker::target_for(CodespaceChoice::New, "feature", None).unwrap();
-    cloud_picker::begin_cloud_start(svc, &local, target).unwrap()
+    cloud_picker::begin_cloud_start(svc, &local, target, true).unwrap()
 }
 
 #[gpui::test]

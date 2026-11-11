@@ -42,6 +42,48 @@ pub fn key_unavailable_note(inventory: &KitInventory) -> Option<&'static str> {
     inventory.key_unavailable.then_some(KEY_UNAVAILABLE_NOTE)
 }
 
+/// Where the app publishes the preferences. The process has one ([`publish`] and
+/// [`published`]); a test makes its own so it never touches the shared one.
+pub struct PrefsSlot(std::sync::Mutex<Option<CloudKitPrefs>>);
+
+impl PrefsSlot {
+    pub const fn new() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+    pub fn publish(&self, prefs: CloudKitPrefs) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(prefs);
+        }
+    }
+    /// The last published preferences; the defaults (kit off) before any were published.
+    pub fn get(&self) -> CloudKitPrefs {
+        self.0
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_default()
+    }
+}
+
+impl Default for PrefsSlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+static PUBLISHED: PrefsSlot = PrefsSlot::new();
+
+/// The app publishes the preferences here whenever they change, so code that runs without
+/// the UI (a start on a worker, the app API) reads the same choice the user made.
+pub fn publish(prefs: CloudKitPrefs) {
+    PUBLISHED.publish(prefs);
+}
+
+/// The last published preferences; the defaults (kit off) before the app published any.
+pub fn published() -> CloudKitPrefs {
+    PUBLISHED.get()
+}
+
 /// The global preferences entry `cloudKit`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -458,6 +500,42 @@ pub fn selected_compressed(inventory: &KitInventory, prefs: &CloudKitPrefs) -> (
         exact = false;
     }
     (total, exact)
+}
+
+/// The items a start sends: the checked ones that can be sent. A skill that ships inside a
+/// plugin travels with the plugin, so it is not listed on its own.
+#[derive(Debug, Default)]
+pub struct Selected<'a> {
+    pub skills: Vec<&'a KitSkill>,
+    pub plugins: Vec<&'a KitPlugin>,
+    pub servers: Vec<&'a KitMcpServer>,
+}
+
+/// Whether a server can be ticked at all (mirrors the badges of [`mcp_item`]).
+fn mcp_selectable(server: &KitMcpServer) -> bool {
+    !matches!(server.compat, McpCompat::LocalOnly(_) | McpCompat::Project)
+}
+
+/// Applies `prefs` to `inventory`, in inventory order.
+pub fn selected<'a>(inventory: &'a KitInventory, prefs: &CloudKitPrefs) -> Selected<'a> {
+    Selected {
+        skills: inventory
+            .skills
+            .iter()
+            .filter(|skill| skill.scope != SkillScope::Plugin)
+            .filter(|skill| prefs.is_selected(&skill_id(skill), skill.exclusion.is_none()))
+            .collect(),
+        plugins: inventory
+            .plugins
+            .iter()
+            .filter(|plugin| prefs.is_selected(&plugin_id(plugin), plugin.exclusion.is_none()))
+            .collect(),
+        servers: inventory
+            .mcp_servers
+            .iter()
+            .filter(|server| prefs.is_selected(&mcp_id(server), mcp_selectable(server)))
+            .collect(),
+    }
 }
 
 /// The rows of one tab, with the preferences applied.

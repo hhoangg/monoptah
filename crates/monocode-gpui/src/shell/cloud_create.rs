@@ -25,9 +25,12 @@ pub(super) fn begin_cloud_create(
     request: &CloudCreate,
 ) -> Result<(Session, StartRecord), String> {
     match request.target {
-        CloudTarget::Codespace => {
-            cloud_picker::begin_cloud_start(cloud, &request.project, codespace_target(request)?)
-        }
+        CloudTarget::Codespace => cloud_picker::begin_cloud_start(
+            cloud,
+            &request.project,
+            codespace_target(request)?,
+            request.kit,
+        ),
         CloudTarget::DockerSandbox => {
             // The config already carries this session's overrides; `begin_sandbox_start`
             // validates it again.
@@ -35,7 +38,13 @@ pub(super) fn begin_cloud_create(
                 .config
                 .as_ref()
                 .ok_or("Set up Docker Sandbox for this project first.")?;
-            cloud.begin_sandbox_start(&request.project, config, &request.branch, HARNESS)
+            cloud.begin_sandbox_start_with_kit(
+                &request.project,
+                config,
+                &request.branch,
+                HARNESS,
+                request.kit,
+            )
         }
     }
 }

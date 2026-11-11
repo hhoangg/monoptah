@@ -267,7 +267,7 @@ impl Conversation {
     }
 
     /// "Claude setup: 6 skills, 4 MCP servers, 3 plugins - Settings..." and the switch for this
-    /// start. Shown only behind the `cloudKitEnabled` flag.
+    /// start.
     fn cloud_kit_row(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         use crate::cloud_kit_ui as kit;
         let prefs = kit::kit_prefs(cx);
@@ -444,9 +444,7 @@ impl Conversation {
                     self.cloud_field_row("cloud-row-branch", "Branch", &draft.branch)
                 })
             });
-        let body = body.when(crate::cloud_kit_ui::flag_on(cx), |d| {
-            d.child(self.cloud_kit_row(cx))
-        });
+        let body = body.child(self.cloud_kit_row(cx));
         let tail = div()
             .id("cloud-target-tail")
             .children(draft.error.clone().map(|error| {

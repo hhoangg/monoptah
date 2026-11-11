@@ -336,6 +336,8 @@ impl CloudSessions {
                         prelude: prelude.as_str(),
                         secret: auth.secret(),
                     }),
+                // A reconnect never sends the kit or its credentials again (rule D7).
+                setup: None,
             };
             deps.backend.remember_target(&target);
             let backend = self.backend(CloudBackendKind::DockerSandbox)?;

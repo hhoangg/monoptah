@@ -1394,8 +1394,14 @@ impl Shell {
             let git = self.git.read(cx);
             (git.cached_age(), git.stale() && !git.offline())
         };
-        let chrome = crate::panel_root::Chrome::of(&root, link, self.panel_can_connect())
-            .map(|chrome| chrome.with_state(known, recovering).with_age(age));
+        let setup = self.claude_setup_strip(&root, cx);
+        let chrome =
+            crate::panel_root::Chrome::of(&root, link, self.panel_can_connect()).map(|chrome| {
+                chrome
+                    .with_state(known, recovering)
+                    .with_age(age)
+                    .with_setup(setup)
+            });
         self.sync_codespace_pane(cx);
         let mut offline_envs = self.offline_environments(cx);
         // The panels of a session without a conversation never lock because of a sibling.

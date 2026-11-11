@@ -1930,15 +1930,12 @@ fn a_save_that_returns_after_the_create_finished_does_not_requeue_the_prompt(
         .unwrap();
 }
 
-fn kit_globals(cx: &mut TestAppContext, flag: bool, enabled: bool) {
+fn kit_globals(cx: &mut TestAppContext, enabled: bool) {
     cx.update(|cx| {
         cx.set_global(crate::cloud_kit_ui::KitScanner(
             crate::cloud_kit_ui::fixture::scan,
         ));
-        let mut prefs = crate::settings::Preferences {
-            cloud_kit_enabled: flag,
-            ..Default::default()
-        };
+        let mut prefs = crate::settings::Preferences::default();
         if enabled {
             prefs.cloud_kit.acknowledge_notice();
         }
@@ -1961,7 +1958,7 @@ fn choose_docker(window: WindowHandle<Conversation>, visual: &mut gpui::VisualTe
 fn the_panel_shows_the_kit_summary_and_a_switch_for_this_start(cx: &mut TestAppContext) {
     use crate::cloud_kit_ui::Summary;
     use monocode_core::cloud_sessions::kit_prefs::KitSummary;
-    kit_globals(cx, true, true);
+    kit_globals(cx, true);
     let window = conversation(cx, PROJECT, false);
     let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
     choose_docker(window, visual);
@@ -2000,7 +1997,7 @@ fn the_panel_shows_the_kit_summary_and_a_switch_for_this_start(cx: &mut TestAppC
 #[gpui::test]
 fn the_settings_link_asks_the_shell_to_open_cloud_settings(cx: &mut TestAppContext) {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    kit_globals(cx, true, true);
+    kit_globals(cx, true);
     let window = conversation(cx, PROJECT, false);
     let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
     let opened = Arc::new(AtomicUsize::new(0));
@@ -2021,17 +2018,9 @@ fn the_settings_link_asks_the_shell_to_open_cloud_settings(cx: &mut TestAppConte
 }
 
 #[gpui::test]
-fn the_kit_row_is_off_without_the_flag_and_locked_while_the_kit_is_off(cx: &mut TestAppContext) {
-    // Flag off: no row, whatever was saved.
-    kit_globals(cx, false, true);
-    let window = conversation(cx, PROJECT, false);
-    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-    choose_docker(window, visual);
-    assert!(visual.debug_bounds("cloud-target-panel").is_some());
-    assert!(visual.debug_bounds("cloud-row-kit").is_none());
-
-    // Flag on but the kit is off in Settings: the row says so and the switch does nothing.
-    kit_globals(cx, true, false);
+fn the_kit_row_is_locked_while_the_kit_is_off(cx: &mut TestAppContext) {
+    // The kit is off in Settings: the row says so and the switch does nothing.
+    kit_globals(cx, false);
     let window = conversation(cx, PROJECT, false);
     let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
     choose_docker(window, visual);
@@ -2056,7 +2045,7 @@ fn set_kit_prefs(cx: &mut TestAppContext, change: impl FnOnce(&mut crate::settin
 
 #[gpui::test]
 fn create_never_sends_the_kit_after_settings_turned_it_off(cx: &mut TestAppContext) {
-    kit_globals(cx, true, true);
+    kit_globals(cx, true);
     let window = conversation(cx, PROJECT, false);
     let requests = watch(window, cx);
     window
@@ -2078,7 +2067,7 @@ fn create_never_sends_the_kit_after_settings_turned_it_off(cx: &mut TestAppConte
     );
 
     // Control: with the kit still on the request carries it.
-    kit_globals(cx, true, true);
+    kit_globals(cx, true);
     let window = conversation(cx, PROJECT, false);
     let requests = watch(window, cx);
     window
@@ -2097,7 +2086,7 @@ fn a_sandbox_panel_counts_docker_servers_as_unavailable_and_a_codespace_panel_do
     cx: &mut TestAppContext,
 ) {
     use crate::cloud_kit_ui::Summary;
-    kit_globals(cx, true, true);
+    kit_globals(cx, true);
     let window = conversation(cx, PROJECT, false);
     let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
     choose_docker(window, visual);
@@ -2123,23 +2112,11 @@ fn a_sandbox_panel_counts_docker_servers_as_unavailable_and_a_codespace_panel_do
 #[gpui::test]
 fn the_summary_follows_settings_changes_while_the_panel_is_open(cx: &mut TestAppContext) {
     use crate::cloud_kit_ui::Summary;
-    // The flag is off when the panel opens: no row, nothing counted.
-    kit_globals(cx, false, true);
+    // The row counts as soon as the panel opens.
+    kit_globals(cx, true);
     let window = conversation(cx, PROJECT, false);
     let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
     choose_docker(window, visual);
-    assert!(visual.debug_bounds("cloud-row-kit").is_none());
-    window
-        .update(visual, |view, _, _| {
-            assert_eq!(
-                view.cloud_draft.as_ref().unwrap().kit_summary,
-                Summary::Loading
-            );
-        })
-        .unwrap();
-
-    // Turning the flag on counts without reopening the panel.
-    set_kit_prefs(cx, |prefs| prefs.cloud_kit_enabled = true);
     visual.run_until_parked();
     visual.refresh().unwrap();
     assert!(visual.debug_bounds("cloud-row-kit").is_some());

@@ -24,12 +24,6 @@ pub(crate) enum Summary {
     Unavailable,
 }
 
-/// The `cloudKitEnabled` flag. Off until the kit can be sent (F3-4).
-pub(crate) fn flag_on(cx: &App) -> bool {
-    cx.try_global::<Preferences>()
-        .is_some_and(|prefs| prefs.cloud_kit_enabled)
-}
-
 /// The global kit as saved in Settings.
 pub(crate) fn kit_prefs(cx: &App) -> CloudKitPrefs {
     cx.try_global::<Preferences>()
@@ -248,6 +242,7 @@ pub(crate) mod fixture {
             hash: "h".into(),
             compressed: 100,
             exclusion: None,
+            files: Vec::new(),
         };
         KitInventory {
             skills: vec![skill("review"), skill("deploy")],
@@ -271,6 +266,7 @@ pub(crate) mod fixture {
                 hash: "h".into(),
                 compressed: 200,
                 exclusion: None,
+                files: Vec::new(),
             }],
             ..Default::default()
         }

@@ -646,7 +646,7 @@ describe("kit.health", () => {
     await kit.secrets({ values: { MONOPTAH_KIT_CLICKUP_T: "value-1234" } });
     const out = await kit.health(home);
     expect(out).toMatchObject({ exitCode: 0, stdout: "clickup: x - Connected\n", stderr: "", kitServers: true, timedOut: false });
-    expect(out.servers).toEqual([{ name: "clickup", status: "connected", signInNeeded: false, transport: "stdio", detail: "x - Connected" }]);
+    expect(out.servers).toEqual([{ name: "clickup", status: "connected", signInNeeded: false, transport: "stdio", detail: "Connected" }]);
     expect(calls).toHaveLength(1);
     expect(calls[0].args).toEqual(["mcp", "list"]);
     expect(calls[0].cwd).toBe(home);
@@ -731,6 +731,25 @@ process.exit(3);
     expect(by.cu).toMatchObject({ status: "signInNeeded", signInNeeded: true, transport: "http" });
     expect(by.broken).toMatchObject({ status: "failed", signInNeeded: false, transport: "stdio" });
     expect(servers).toHaveLength(5);
+  });
+
+  it("returns only the status of a line, never its command, arguments or URL", async () => {
+    const stdout = [
+      "tok: npx server --api-key=sk-live-123456 - \u2718 Failed to connect",
+      "url: https://example.test/mcp/abcdef0123456789abcdef (HTTP) - \u2713 Connected",
+      "bare: npx sk-live-123456",
+    ].join("\n");
+    const run: KitRun = async () => ({ code: 0, stdout, stderr: "" });
+    const kit = kitFor({ resolveClaude: async () => "/fake/claude", run });
+    await kit.apply({ hash: HASH_A, uploadId: stage([MCP]) });
+    const { servers } = await kit.health(home);
+    const text = JSON.stringify(servers);
+    expect(text).not.toContain("sk-live-123456");
+    expect(text).not.toContain("abcdef0123456789abcdef");
+    const by = Object.fromEntries(servers.map((server) => [server.name, server]));
+    expect(by.tok).toMatchObject({ status: "failed", detail: "\u2718 Failed to connect" });
+    expect(by.url).toMatchObject({ status: "connected", detail: "\u2713 Connected" });
+    expect(by.bare).toMatchObject({ status: "configured", detail: "" });
   });
 
   posix("returns within the timeout and leaves no process when a descendant holds the pipes", async () => {

@@ -17,6 +17,7 @@ fn skill(name: &str, scope: SkillScope, exclusion: Option<Exclusion>) -> KitSkil
         hash: "h".into(),
         compressed: 100,
         exclusion,
+        files: Vec::new(),
     }
 }
 
@@ -52,6 +53,7 @@ fn plugin(id: &str, exclusion: Option<Exclusion>, native: bool) -> KitPlugin {
         hash: "h".into(),
         compressed: 200,
         exclusion,
+        files: Vec::new(),
     }
 }
 
@@ -445,4 +447,20 @@ fn kit_sources_never_read_the_keychain_or_claude_credentials() {
             }
         }
     }
+}
+
+#[test]
+fn the_kit_is_off_before_the_app_publishes_anything_and_follows_what_it_publishes() {
+    // Safe by default: the defaults send nothing, so a worker that runs before the shell
+    // applied its preferences cannot send a kit. A private slot keeps the shared one out of
+    // the test, so no other test sees these values.
+    let slot = PrefsSlot::new();
+    assert!(!slot.get().applies(ApiKit::Default));
+    let mut prefs = CloudKitPrefs::default();
+    prefs.acknowledge_notice();
+    slot.publish(prefs.clone());
+    assert_eq!(slot.get(), prefs);
+    assert!(slot.get().applies(ApiKit::Default));
+    slot.publish(CloudKitPrefs::default());
+    assert!(!slot.get().applies(ApiKit::Default));
 }

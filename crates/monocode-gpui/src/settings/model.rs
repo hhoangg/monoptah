@@ -18,7 +18,7 @@ pub(crate) enum Section {
     Inbox,
     Archive,
     Worktrees,
-    /// Behind `cloudKitEnabled`: not in [`Section::ALL`], the rail adds it when the flag is on.
+    /// Not in [`Section::ALL`] (so Settings search does not list it yet); the rail adds it.
     Cloud,
 }
 
@@ -49,7 +49,7 @@ pub(crate) const GROUPS: [(&str, &[Section]); 3] = [
 ];
 
 impl Section {
-    /// The pages that always show. [`Section::Cloud`] is added by the rail when its flag is on.
+    /// The searchable pages. [`Section::Cloud`] is added by the rail.
     pub(crate) const ALL: [Section; 12] = [
         Section::General,
         Section::Connections,

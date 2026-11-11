@@ -103,8 +103,8 @@ pub(crate) struct CloudCreate {
     pub machine: Option<String>,
     /// The composer text, queued as the first prompt.
     pub prompt: Option<String>,
-    /// Copy the global Claude setup to the new workspace. Read by the "Claude setup" start
-    /// step (F3-4); nothing sends it yet.
+    /// Copy the global Claude setup to the new workspace. `false` is recorded on the start
+    /// (`StartRecord::kit_off`) before it runs, so the "Claude setup" step sends nothing.
     pub kit: bool,
     /// Which press asked; the answer only applies to the draft that is still waiting for it.
     pub request_id: u64,
@@ -518,10 +518,9 @@ impl Conversation {
         cx.notify();
     }
 
-    /// Counts the Claude setup this project would take, on a worker. Does nothing while the
-    /// `cloudKitEnabled` flag is off.
+    /// Counts the Claude setup this project would take, on a worker.
     fn load_kit_summary(&mut self, cx: &mut Context<Self>) {
-        if self.cloud_draft.is_none() || !crate::cloud_kit_ui::flag_on(cx) {
+        if self.cloud_draft.is_none() {
             return;
         }
         let workspace = match self.cloud_draft.as_ref().map(|draft| draft.target) {
@@ -745,7 +744,6 @@ impl Conversation {
             // The switch is this start's own choice, but it can only narrow Settings: if the
             // kit was turned off while the panel was open, nothing is sent.
             kit: self.cloud_draft.as_ref().is_some_and(|draft| draft.kit)
-                && crate::cloud_kit_ui::flag_on(cx)
                 && crate::cloud_kit_ui::default_on(&crate::cloud_kit_ui::kit_prefs(cx)),
         };
         if let Some(draft) = &mut self.cloud_draft {

@@ -6,7 +6,10 @@
 //! is useful before converting a session back. The resolution is pure, so it is tested without a
 //! window.
 use monocode_core::{
-    cloud_sessions::{CloudBackendKind, CloudRef},
+    cloud_sessions::{
+        CloudBackendKind, CloudRef,
+        claude_setup::{APPROVAL_LABEL, HealthStatus, SIGN_IN_LABEL, SetupView},
+    },
     remote::parse_remote_path,
     store::is_pending_cloud_environment,
 };
@@ -211,7 +214,85 @@ pub(crate) struct Chrome {
     pub offline: bool,
     /// How old the remembered data is, e.g. "last updated 5 min ago".
     pub cached: Option<String>,
+    /// The Claude setup of this workspace, when one was sent. Cloud mode only.
+    pub setup: Option<SetupStrip>,
 }
+
+/// How serious one server line of the Claude setup is, for its colour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SetupTone {
+    Good,
+    /// Needs the user (sign in, approval): not a failure.
+    Notice,
+    Bad,
+    Quiet,
+}
+
+/// The Claude setup block under the connection strip (design 3.2.4): what was sent, one line
+/// per MCP server, warnings, whether the local setup changed, and the Update action. It holds
+/// text only, never a value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SetupStrip {
+    /// `4 skills, 2 MCP servers`.
+    pub summary: String,
+    /// `(server, status text, tone)`.
+    pub servers: Vec<(String, String, SetupTone)>,
+    pub warnings: Vec<String>,
+    /// "Your local setup changed since this workspace started".
+    pub changed: bool,
+    /// The Update action is on offer (the kit is on).
+    pub can_update: bool,
+    pub updating: bool,
+    pub error: Option<String>,
+}
+
+impl SetupStrip {
+    /// The block for a stored setup result. `updating` and `error` belong to the Update action.
+    /// `connected` is whether the workspace has a live connection: Update never wakes it, so
+    /// it is on offer only then. A failed earlier update shows as the error.
+    pub(crate) fn of(
+        view: &SetupView,
+        updating: bool,
+        error: Option<String>,
+        connected: bool,
+    ) -> Self {
+        Self {
+            summary: if !view.state.applied {
+                "not installed, see the warnings".into()
+            } else if view.state.summary.is_empty() {
+                "nothing was sent".into()
+            } else {
+                view.state.summary.clone()
+            },
+            servers: view
+                .state
+                .health
+                .iter()
+                .map(|entry| {
+                    let label = entry.label();
+                    let tone = if label == SIGN_IN_LABEL || label == APPROVAL_LABEL {
+                        SetupTone::Notice
+                    } else {
+                        match entry.status {
+                            HealthStatus::Connected => SetupTone::Good,
+                            HealthStatus::Failed => SetupTone::Bad,
+                            _ => SetupTone::Quiet,
+                        }
+                    };
+                    (entry.name.clone(), label, tone)
+                })
+                .collect(),
+            warnings: view.state.warnings.iter().take(4).cloned().collect(),
+            changed: view.changed,
+            can_update: view.can_update && connected,
+            updating,
+            error: error.or_else(|| view.state.failure.clone()),
+        }
+    }
+}
+
+/// Said when the local setup differs from what the workspace got.
+pub(crate) const SETUP_CHANGED: &str = "Your local setup changed since this workspace started";
 
 impl Chrome {
     pub(crate) fn of(root: &PanelRoot, link: Link, can_connect: bool) -> Option<Self> {
@@ -228,6 +309,7 @@ impl Chrome {
             can_connect,
             offline: is_offline(root, link),
             cached: None,
+            setup: None,
         })
     }
     /// Applies what is known about the link. A link nobody has reported on yet is not offline
@@ -236,6 +318,11 @@ impl Chrome {
     pub(crate) fn with_state(mut self, known: bool, recovering: bool) -> Self {
         let cloud = self.link.is_some() && !self.placeholder;
         self.offline = (self.offline && known) || (recovering && cloud);
+        self
+    }
+    /// Adds the Claude setup block; it shows in Cloud mode only.
+    pub(crate) fn with_setup(mut self, setup: Option<SetupStrip>) -> Self {
+        self.setup = setup.filter(|_| self.link.is_some());
         self
     }
     /// Says how old the remembered data is; only shown while it is the data on screen.
@@ -451,5 +538,44 @@ mod tests {
 
         let plain = resolve(None, PanelMode::Cloud, false, "/o");
         assert_eq!(Chrome::of(&plain, Link::Connected, true), None);
+    }
+
+    #[test]
+    fn the_setup_strip_offers_update_only_when_connected_and_shows_a_failed_update() {
+        use monocode_core::cloud_sessions::claude_setup::{SetupState, SetupView};
+        let mut state: SetupState = serde_json::from_value(serde_json::json!({
+            "atMs": 1, "applied": true, "summary": "1 skill", "health": [], "warnings": []
+        }))
+        .unwrap();
+        let view = |state: SetupState, can_update| SetupView {
+            cloud: cloud(),
+            state,
+            changed: false,
+            can_update,
+        };
+        let on = SetupStrip::of(&view(state.clone(), true), false, None, true);
+        assert!(on.can_update && on.error.is_none());
+        // Update never wakes a workspace: not connected, not on offer.
+        let off = SetupStrip::of(&view(state.clone(), true), false, None, false);
+        assert!(!off.can_update);
+        // The kit being off in Settings also removes it.
+        assert!(!SetupStrip::of(&view(state.clone(), false), false, None, true).can_update);
+        // A failed update shows next to the last good result.
+        state.failure = Some("The workspace could not install the Claude setup.".into());
+        let failed = SetupStrip::of(&view(state.clone(), true), false, None, true);
+        assert_eq!(failed.summary, "1 skill");
+        assert!(
+            failed
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("install"))
+        );
+        // A setup that never installed says so instead of listing what was meant to go.
+        state.applied = false;
+        assert!(
+            SetupStrip::of(&view(state, true), false, None, true)
+                .summary
+                .contains("not installed")
+        );
     }
 }

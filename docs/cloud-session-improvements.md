@@ -1682,6 +1682,14 @@ each batch ends with an explicit release-and-pin ticket (HR1-HR3).
     small change.
 - **Unapproved project MCP servers:** how a headless (stream-json) Claude treats
   unapproved project `.mcp.json` servers.
+  - **Answered from the health output (F3-4), as far as the code can:** `claude mcp list`
+    reports such a server as "pending approval". The Host (`classifyHealth`) maps that to
+    `signInNeeded`, which is not a failure, and the cloud panel lists it as "Needs approval"
+    with a warning. The app never approves anything for the user.
+  - **Not answerable from that output, must be confirmed by hand on a real workspace:** whether
+    a HEADLESS (stream-json) session loads a server that is still pending approval, or skips
+    it. `mcp list` runs a different code path from a session. A follow-up ticket for
+    pre-approval is only worth opening if the manual check shows the server is skipped.
 - **Docker features on cloud sandboxes:** whether `sbx mcp`, `sbx skills` and
   `--static-mcp` work on cloud sandboxes (not used by this design).
 - **LFS:** whether `git push` uploads LFS content in every setup.

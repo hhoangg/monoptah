@@ -21,8 +21,8 @@ enum Picked {
     Started {
         summary: Session,
         record: StartRecord,
-        /// Copy the global Claude setup to the workspace. Read by the "Claude setup" start
-        /// step (F3-4); nothing sends it yet.
+        /// Copy the global Claude setup to the workspace. `false` was already recorded on the
+        /// start (`StartRecord::kit_off`) when the session was created.
         #[allow(dead_code)]
         kit: bool,
     },
@@ -59,12 +59,17 @@ pub(super) fn target_for(
 /// Requests the codespace (creating it if asked) and creates the session that will run in it.
 /// Takes seconds; the codespace itself comes up in the background (see `cloud_start`). Blocking:
 /// call it on a worker.
+///
+/// `kit` is this start's own choice for the Claude setup. `false` is part of the first record
+/// the start persists, so nothing is sent; `true` leaves the decision to Settings (it can only
+/// narrow).
 pub(super) fn begin_cloud_start(
     cloud: &CloudSessions,
     local_project: &str,
     target: Target,
+    kit: bool,
 ) -> Result<(Session, StartRecord), String> {
-    cloud.begin_start(local_project, target, HARNESS)
+    cloud.begin_start_with_kit(local_project, target, HARNESS, kit)
 }
 
 /// Existing codespaces and machine types of the project's repository.
@@ -186,12 +191,8 @@ impl CodespacePicker {
         .detach();
     }
 
-    /// Counts the Claude setup this project would take, off the UI thread. Does nothing while
-    /// the `cloudKitEnabled` flag is off.
+    /// Counts the Claude setup this project would take, off the UI thread.
     fn load_kit_summary(&mut self, cx: &mut Context<Self>) {
-        if !crate::cloud_kit_ui::flag_on(cx) {
-            return;
-        }
         let task = crate::cloud_kit_ui::load_summary(
             self.local_project.clone(),
             monocode_core::cloud_sessions::kit::Workspace::Codespace,
@@ -207,12 +208,9 @@ impl CodespacePicker {
         }));
     }
 
-    /// The "Claude setup" row, behind the `cloudKitEnabled` flag.
+    /// The "Claude setup" row.
     fn kit_row(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         use crate::cloud_kit_ui as kit;
-        if !kit::flag_on(cx) {
-            return None;
-        }
         let globally = kit::default_on(&kit::kit_prefs(cx));
         let on = globally && self.kit;
         let locked = self.busy || !globally;
@@ -275,14 +273,13 @@ impl CodespacePicker {
         self.busy = true;
         self.error.clear();
         self.progress = "Creating codespace...".into();
-        let use_kit = self.kit
-            && crate::cloud_kit_ui::flag_on(cx)
-            && crate::cloud_kit_ui::default_on(&crate::cloud_kit_ui::kit_prefs(cx));
+        let use_kit =
+            self.kit && crate::cloud_kit_ui::default_on(&crate::cloud_kit_ui::kit_prefs(cx));
         let cloud = self.cloud.clone();
         let project = self.local_project.clone();
         let work = cx
             .background_executor()
-            .spawn(async move { begin_cloud_start(&cloud, &project, target) });
+            .spawn(async move { begin_cloud_start(&cloud, &project, target, use_kit) });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
@@ -673,13 +670,10 @@ mod kit_tests {
     use gpui::{TestAppContext, VisualTestContext};
     use monocode_core::cloud_sessions::kit_prefs::KitSummary;
 
-    fn globals(cx: &mut TestAppContext, flag: bool, enabled: bool) {
+    fn globals(cx: &mut TestAppContext, enabled: bool) {
         cx.update(|cx| {
             cx.set_global(KitScanner(fixture::scan));
-            let mut prefs = crate::settings::Preferences {
-                cloud_kit_enabled: flag,
-                ..Default::default()
-            };
+            let mut prefs = crate::settings::Preferences::default();
             if enabled {
                 prefs.cloud_kit.acknowledge_notice();
             }
@@ -689,12 +683,11 @@ mod kit_tests {
 
     fn open(
         cx: &mut TestAppContext,
-        flag: bool,
         enabled: bool,
     ) -> (gpui::WindowHandle<Shell>, Entity<CodespacePicker>) {
         let (window, _, _) = crate::shell::tests::window(cx);
         // After the shell window, which installs its own preferences.
-        globals(cx, flag, enabled);
+        globals(cx, enabled);
         window
             .update(cx, |shell, window, cx| {
                 shell.open_codespace_picker(window, cx)
@@ -712,7 +705,7 @@ mod kit_tests {
 
     #[gpui::test]
     fn the_picker_shows_the_kit_summary_and_a_switch_for_this_start(cx: &mut TestAppContext) {
-        let (window, picker) = open(cx, true, true);
+        let (window, picker) = open(cx, true);
         let visual = &mut VisualTestContext::from_window(window.into(), cx);
         assert!(visual.debug_bounds("codespace-kit-row").is_some());
         assert!(visual.debug_bounds("codespace-kit-settings").is_some());
@@ -734,11 +727,16 @@ mod kit_tests {
     }
 
     #[gpui::test]
-    fn the_picker_has_no_kit_row_without_the_flag(cx: &mut TestAppContext) {
-        let (window, _picker) = open(cx, false, true);
+    fn the_picker_switch_is_locked_while_the_kit_is_off(cx: &mut TestAppContext) {
+        let (window, picker) = open(cx, false);
         let visual = &mut VisualTestContext::from_window(window.into(), cx);
         assert!(visual.debug_bounds("codespace-picker").is_some());
-        assert!(visual.debug_bounds("codespace-kit-row").is_none());
+        assert!(visual.debug_bounds("codespace-kit-row").is_some());
+        visual.read_entity(&picker, |picker, _| assert!(!picker.kit));
+        let switch = visual.debug_bounds("codespace-kit-switch").unwrap();
+        visual.simulate_click(switch.center(), Default::default());
+        visual.run_until_parked();
+        visual.read_entity(&picker, |picker, _| assert!(!picker.kit));
     }
 
     static SCANS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -753,7 +751,7 @@ mod kit_tests {
     #[gpui::test]
     fn a_fresh_scan_is_reused_and_settings_changes_update_the_summary(cx: &mut TestAppContext) {
         SCANS.store(0, std::sync::atomic::Ordering::SeqCst);
-        let (window, picker) = open(cx, true, true);
+        let (window, picker) = open(cx, true);
         cx.update(|cx| cx.set_global(KitScanner(counting_scan)));
         let visual = &mut VisualTestContext::from_window(window.into(), cx);
         // A change in Settings counts again with the new selection, without a second scan

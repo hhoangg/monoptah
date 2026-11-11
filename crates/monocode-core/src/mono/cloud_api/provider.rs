@@ -189,6 +189,7 @@ pub trait CloudProvider: Send + Sync {
         harness: &str,
         instance: Option<&str>,
         options: &Map<String, Value>,
+        kit: bool,
     ) -> Result<CloudStart, String>;
     /// Blocking variant of a start that returns the ready binding.
     fn prepare(

@@ -433,6 +433,17 @@ impl Shell {
             monos.update(cx, |monos, cx| monos.sweep_auto_resume(cx));
         }
     }
+    /// Starts that run on a worker, and the app API, read the Claude setup choice from the
+    /// published copy. It must be there BEFORE a resumed start runs, or that start would read
+    /// the default (off) and skip the step for good. Tests do not publish: the slot is
+    /// process-wide, and one test's choice must not reach another's service.
+    pub(super) fn publish_kit_prefs(&self) {
+        #[cfg(not(test))]
+        monocode_core::cloud_sessions::kit_prefs::publish(
+            self.workspace.preferences.cloud_kit.clone(),
+        );
+    }
+
     pub(super) fn apply_preferences(&mut self, cx: &mut Context<Self>) {
         self.refresh_notification_permission();
         self.configure_quick_composer(cx);
@@ -462,6 +473,7 @@ impl Shell {
         // After the keymap, so the menu shows rebound shortcuts.
         crate::app_menu::install(&self.workspace.preferences, cx);
         cx.set_global(self.workspace.preferences.clone());
+        self.publish_kit_prefs();
         self.sweep_auto_resume(cx);
         self.sync_right_panel(cx);
         if let Some(center) = crate::accounts::get(cx) {
@@ -832,7 +844,7 @@ mod tests {
             .unwrap();
     }
     #[gpui::test]
-    fn the_cloud_page_is_in_the_rail_only_behind_its_flag(cx: &mut TestAppContext) {
+    fn the_cloud_page_is_always_in_the_rail(cx: &mut TestAppContext) {
         cx.update(|cx| {
             cx.set_reduce_motion(true);
             cx.set_global(crate::cloud_kit_ui::KitScanner(
@@ -848,15 +860,6 @@ mod tests {
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         visual.run_until_parked();
         assert!(visual.debug_bounds("settings-nav-mcp").is_some());
-        assert!(visual.debug_bounds("settings-nav-cloud").is_none());
-        window
-            .update(visual, |shell, _, cx| {
-                shell.workspace.preferences.cloud_kit_enabled = true;
-                shell.invalidate_chrome(cx);
-                cx.notify();
-            })
-            .unwrap();
-        visual.run_until_parked();
         visual.refresh().unwrap();
         let row = visual.debug_bounds("settings-nav-cloud").unwrap();
         visual.simulate_click(row.center(), Default::default());

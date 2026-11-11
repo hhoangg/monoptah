@@ -211,6 +211,7 @@ impl CloudProvider for SandboxProvider {
         harness: &str,
         instance: Option<&str>,
         options: &Map<String, Value>,
+        kit: bool,
     ) -> Result<CloudStart, String> {
         if let Some(instance) = instance {
             if !options.is_empty() {
@@ -240,7 +241,7 @@ impl CloudProvider for SandboxProvider {
         };
         let (session, record) = self
             .cloud
-            .begin_sandbox_start(project, &config, &branch, harness)?;
+            .begin_sandbox_start_with_kit(project, &config, &branch, harness, kit)?;
         Ok(CloudStart::Pending(session, record))
     }
 

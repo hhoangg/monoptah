@@ -545,6 +545,20 @@ impl CloudSessions {
         branch: &str,
         harness: &str,
     ) -> Result<(Session, StartRecord), String> {
+        self.begin_sandbox_start_with_kit(local_cwd, config, branch, harness, true)
+    }
+
+    /// [`Self::begin_sandbox_start`] with this start's own Claude setup choice. `kit: false`
+    /// is part of the FIRST persisted record (before `sbx create`), so no crash or later
+    /// write failure can turn it back on (rule D11).
+    pub fn begin_sandbox_start_with_kit(
+        &self,
+        local_cwd: &str,
+        config: &DockerProjectConfig,
+        branch: &str,
+        harness: &str,
+        kit: bool,
+    ) -> Result<(Session, StartRecord), String> {
         require_claude(harness)?;
         let deps = self.sandbox_deps()?;
         let config = config.validated()?;
@@ -576,6 +590,7 @@ impl CloudSessions {
         let remote_cwd = format!("/workspaces/{repo_dir}");
         let mut record =
             fresh_sandbox_record(&name, local_cwd, &path, &branch, &remote_cwd, start, began);
+        record.kit_off = !kit;
         let session = {
             let store = self.store()?;
             let project = pending_cloud_project(local_cwd, &CloudRef::sandbox(&name), &remote_cwd);
@@ -783,6 +798,7 @@ impl CloudSessions {
         let at = self.now();
         let record = run.record;
         record.finish_step(StepKind::OpenProject, at);
+        record.skip_unrun_claude_setup(at);
         if record.step(StepKind::BlockingCommands).status == StepStatus::Pending {
             record.step_mut(StepKind::BlockingCommands).status = StepStatus::Skipped;
         }
@@ -1564,6 +1580,7 @@ impl CloudSessions {
         let backend = self.backend(CloudBackendKind::DockerSandbox)?;
         // The Host upgrade restarts the Host through the SAME prelude as the connect step.
         let prelude = auth.map(ClaudeAuth::prelude);
+        let setup = self.setup_plan(run.record);
         let request = OpenRequest {
             local_cwd: &run.record.local_project.clone(),
             cloud: &cloud,
@@ -1577,6 +1594,7 @@ impl CloudSessions {
                     prelude: prelude.as_str(),
                     secret: auth.secret(),
                 }),
+            setup,
         };
         let cell = std::cell::RefCell::new((&mut *run.record, &mut *run.events));
         let halt = AtomicBool::new(false);
@@ -1604,6 +1622,11 @@ impl CloudSessions {
                 self.publish(record, &mut **events);
             },
             &mut |line| {
+                // The Claude setup reports a line before each phase: this is where a
+                // cancelled or deleted start stops it (`open_project` polls `halt`).
+                if self.start_aborted(session_id, cancel) {
+                    halt.store(true, Ordering::Relaxed);
+                }
                 let mut guard = cell.borrow_mut();
                 let (record, events) = &mut *guard;
                 let text = format!("{PROGRESS_PREFIX}{}", run.scrub.apply(line));
@@ -1686,7 +1709,7 @@ impl CloudSessions {
             return Err("This sandbox has no devcontainer to rebuild.".into());
         }
         for step in &mut record.steps {
-            if !matches!(step.kind, StepKind::Create | StepKind::Provision) {
+            if !matches!(step.kind, StepKind::Create | StepKind::Provision) && !step.predates() {
                 *step = Step::pending(step.kind);
             }
         }
@@ -1797,5 +1820,6 @@ fn fresh_sandbox_record(
         finished_at: None,
         track_ready: false,
         sandbox_start: Some(start),
+        kit_off: false,
     }
 }
