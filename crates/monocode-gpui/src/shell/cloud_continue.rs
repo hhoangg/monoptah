@@ -18,6 +18,28 @@ pub(super) type ContinueFn = Arc<
         + Sync,
 >;
 
+/// Restores (`true`) or discards (`false`) the backup of an interrupted return and says what
+/// happened. A seam for tests.
+pub(super) type BackupFn =
+    Arc<dyn Fn(&CloudSessions, i64, bool) -> Result<String, String> + Send + Sync>;
+
+pub(super) fn default_backup() -> BackupFn {
+    Arc::new(|cloud, id, restore| {
+        if restore {
+            cloud.restore_continue_backup(id).map(|fresh| {
+                format!(
+                    "Your files are back as they were before the interrupted return. The state they were in before is saved in {}.",
+                    fresh.display()
+                )
+            })
+        } else {
+            cloud
+                .discard_continue_marker(id)
+                .map(|()| "The backup was deleted.".to_string())
+        }
+    })
+}
+
 pub(super) fn default_continue() -> ContinueFn {
     Arc::new(|cloud, id, progress| cloud.continue_locally(id, progress))
 }
@@ -29,6 +51,17 @@ pub(super) enum Phase {
         progress: Arc<std::sync::Mutex<String>>,
     },
     Failed(String),
+    /// Asking before the backup of an interrupted return is restored or deleted.
+    ConfirmBackup {
+        restore: bool,
+    },
+}
+
+/// What the dialog is for, so Retry runs the right thing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Action {
+    Continue,
+    Backup { restore: bool },
 }
 
 pub(super) struct ContinueDialog {
@@ -36,6 +69,9 @@ pub(super) struct ContinueDialog {
     title: String,
     kind: Kind,
     noun: &'static str,
+    action: Action,
+    /// The backup of an interrupted return of this session, when there is one.
+    backup: Option<String>,
     phase: Phase,
     focus: FocusHandle,
 }
@@ -54,6 +90,21 @@ pub(super) enum Kind {
 pub(super) struct State {
     pub dialog: Option<ContinueDialog>,
     pub run: ContinueFn,
+    pub backup: BackupFn,
+}
+
+#[cfg(test)]
+impl State {
+    /// For tests: which step the dialog is on.
+    pub fn phase_name(&self) -> &'static str {
+        match self.dialog.as_ref().map(|d| &d.phase) {
+            None => "closed",
+            Some(Phase::Confirm) => "confirm",
+            Some(Phase::Working { .. }) => "working",
+            Some(Phase::Failed(_)) => "failed",
+            Some(Phase::ConfirmBackup { .. }) => "confirm-backup",
+        }
+    }
 }
 
 impl Default for State {
@@ -61,7 +112,21 @@ impl Default for State {
         Self {
             dialog: None,
             run: default_continue(),
+            backup: default_backup(),
         }
+    }
+}
+
+/// What Restore and Discard tell the user before anything happens.
+pub(super) fn backup_text(restore: bool, path: &str) -> String {
+    if restore {
+        format!(
+            "An earlier return from the cloud was interrupted. Your uncommitted work from before it is saved in {path}. Restore takes a fresh backup of your files as they are now (kept next to it), then puts your files back as they were before that attempt. It refuses, and changes nothing, if the branch or commit changed or a file is in the way."
+        )
+    } else {
+        format!(
+            "This deletes the backup of your uncommitted work in {path} and forgets the interrupted return. It cannot be undone. Only do this when your files are as you want them."
+        )
     }
 }
 
@@ -136,6 +201,8 @@ impl Shell {
             title: self.session_metadata(id, cx).display_title(),
             kind: self.continue_kind(id),
             noun,
+            action: Action::Continue,
+            backup: self.continue_backup_of(id),
             phase: Phase::Confirm,
             focus: cx.focus_handle(),
         };
@@ -244,8 +311,10 @@ impl Shell {
             }
             Err(error) => {
                 // The session is still where it was: the dialog stays for a retry.
+                let backup = self.continue_backup_of(id);
                 if let Some(dialog) = self.cloud_continue.dialog.as_mut() {
                     dialog.phase = Phase::Failed(error.to_string());
+                    dialog.backup = backup;
                 }
             }
         }
@@ -278,6 +347,115 @@ impl Shell {
         cx.notify();
     }
 
+    /// The backup path of an interrupted return of session `id`, when there is one.
+    fn continue_backup_of(&self, id: i64) -> Option<String> {
+        locked(&self.store)
+            .ok()
+            .and_then(|s| s.continue_backup_path(id))
+    }
+
+    /// The session menu entries for an interrupted return (Delete is blocked until one of
+    /// them is done).
+    pub(super) fn continue_backup_items(&self, id: i64) -> Vec<MenuItem> {
+        if self.continue_backup_of(id).is_none() {
+            return vec![];
+        }
+        vec![
+            MenuAction::new("restore-continue-backup", "Restore my backup…").into(),
+            MenuAction::new("discard-continue-backup", "Discard backup…")
+                .danger()
+                .into(),
+        ]
+    }
+
+    /// Opens the confirmation for Restore (`true`) or Discard. Nothing runs before it.
+    pub(super) fn open_backup_action(
+        &mut self,
+        id: i64,
+        restore: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backup) = self.continue_backup_of(id) else {
+            return;
+        };
+        if self.cloud_continue.dialog.is_some() || self.cloud_busy.contains(&id) {
+            return;
+        }
+        let dialog = ContinueDialog {
+            id,
+            title: self.session_metadata(id, cx).display_title(),
+            kind: Kind::Born,
+            noun: "workspace",
+            action: Action::Backup { restore },
+            backup: Some(backup),
+            phase: Phase::ConfirmBackup { restore },
+            focus: cx.focus_handle(),
+        };
+        window.focus(&dialog.focus, cx);
+        self.cloud_continue.dialog = Some(dialog);
+        cx.notify();
+    }
+
+    /// From the failed dialog: switch to the confirmation of Restore or Discard.
+    pub(super) fn ask_backup_action(&mut self, restore: bool, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.cloud_continue.dialog.as_mut()
+            && matches!(dialog.phase, Phase::Failed(_))
+            && dialog.backup.is_some()
+        {
+            dialog.action = Action::Backup { restore };
+            dialog.phase = Phase::ConfirmBackup { restore };
+            cx.notify();
+        }
+    }
+
+    /// Runs Restore or Discard on a worker, after the confirmation.
+    pub(super) fn confirm_backup_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dialog) = self.cloud_continue.dialog.as_mut() else {
+            return;
+        };
+        let restore = match (&dialog.phase, dialog.action) {
+            (Phase::ConfirmBackup { restore }, _) => *restore,
+            (Phase::Failed(_), Action::Backup { restore }) => restore,
+            _ => return,
+        };
+        let id = dialog.id;
+        let progress = Arc::new(std::sync::Mutex::new(String::from(if restore {
+            "Restoring your files"
+        } else {
+            "Deleting the backup"
+        })));
+        dialog.phase = Phase::Working { progress };
+        window.focus(&dialog.focus, cx);
+        self.cloud_busy.insert(id);
+        let cloud = self.cloud.clone();
+        let run = self.cloud_continue.backup.clone();
+        let work = cx
+            .background_executor()
+            .spawn(async move { run(&cloud, id, restore) });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = work.await;
+            let _ = this.update_in(cx, |this, _window, cx| {
+                this.cloud_busy.remove(&id);
+                match result {
+                    Ok(message) => {
+                        this.cloud_continue.dialog = None;
+                        this.error = Some(message);
+                    }
+                    // The marker stays: the dialog keeps the choice for a retry.
+                    Err(error) => {
+                        if let Some(dialog) = this.cloud_continue.dialog.as_mut() {
+                            dialog.phase = Phase::Failed(error);
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     pub(super) fn cloud_continue_modal(
         &self,
         window: &Window,
@@ -299,6 +477,14 @@ impl Shell {
             .debug_selector(|| "cloud-continue-cancel".into())
             .cursor_pointer()
             .on_click(cx.listener(|this, _, window, cx| this.close_continue_locally(window, cx)));
+        let action = dialog.action;
+        let retry = crate::modal::primary_button("cloud-continue-go", "Retry")
+            .debug_selector(|| "cloud-continue-go".into())
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, window, cx| match action {
+                Action::Continue => this.confirm_continue_locally(window, cx),
+                Action::Backup { .. } => this.confirm_backup_action(window, cx),
+            }));
         let go = |label: &'static str, cx: &mut Context<Self>| {
             crate::modal::primary_button("cloud-continue-go", label)
                 .debug_selector(|| "cloud-continue-go".into())
@@ -313,47 +499,106 @@ impl Shell {
             .items_center()
             .justify_end()
             .gap_2();
-        let (heading, body, footer) = match &dialog.phase {
-            Phase::Confirm => (
-                "Continue locally?",
-                div().child(text(
-                    "cloud-continue-body",
-                    confirm_text(dialog.kind, &dialog.title, dialog.noun),
-                    false,
-                )),
-                footer.child(cancel).child(go("Continue locally", cx)),
-            ),
-            Phase::Working { progress } => (
-                "Continuing locally",
-                div().child(text(
-                    "cloud-continue-progress",
-                    format!(
-                        "{}...",
-                        progress
-                            .lock()
-                            .map(|line| line.clone())
-                            .unwrap_or_default()
-                            .trim_end_matches(['.', '\u{2026}'])
-                    ),
-                    false,
-                )),
-                footer,
-            ),
-            Phase::Failed(error) => (
-                "Could not continue locally",
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(text("cloud-continue-error", error.clone(), false))
-                    .child(text(
-                        "cloud-continue-still",
-                        "The conversation is still where it was; nothing was lost.".into(),
-                        true,
+        let (heading, body, footer) =
+            match &dialog.phase {
+                Phase::Confirm => (
+                    "Continue locally?",
+                    div().child(text(
+                        "cloud-continue-body",
+                        confirm_text(dialog.kind, &dialog.title, dialog.noun),
+                        false,
                     )),
-                footer.child(cancel).child(go("Retry", cx)),
-            ),
-        };
+                    footer.child(cancel).child(go("Continue locally", cx)),
+                ),
+                Phase::Working { progress } => (
+                    "Continuing locally",
+                    div().child(text(
+                        "cloud-continue-progress",
+                        format!(
+                            "{}...",
+                            progress
+                                .lock()
+                                .map(|line| line.clone())
+                                .unwrap_or_default()
+                                .trim_end_matches(['.', '\u{2026}'])
+                        ),
+                        false,
+                    )),
+                    footer,
+                ),
+                Phase::Failed(error) => (
+                    "Could not continue locally",
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(text("cloud-continue-error", error.clone(), false))
+                        .child(text(
+                            "cloud-continue-still",
+                            "The conversation is still where it was; nothing was lost.".into(),
+                            true,
+                        )),
+                    {
+                        let mut footer = footer.child(cancel);
+                        // An interrupted return blocks Continue and Delete until its backup is
+                        // restored or discarded; each is its own confirmation.
+                        if dialog.backup.is_some() && dialog.action == Action::Continue {
+                            footer = footer
+                                .child(
+                                    crate::modal::ghost_button(
+                                        "cloud-continue-restore",
+                                        "Restore my backup…",
+                                    )
+                                    .debug_selector(|| "cloud-continue-restore".into())
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(
+                                        |this, _, _, cx| this.ask_backup_action(true, cx),
+                                    )),
+                                )
+                                .child(
+                                    crate::modal::danger_button(
+                                        "cloud-continue-discard",
+                                        "Discard backup…",
+                                    )
+                                    .debug_selector(|| "cloud-continue-discard".into())
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(
+                                        |this, _, _, cx| this.ask_backup_action(false, cx),
+                                    )),
+                                );
+                        }
+                        footer.child(retry)
+                    },
+                ),
+                Phase::ConfirmBackup { restore } => {
+                    let restore = *restore;
+                    let path = dialog.backup.clone().unwrap_or_default();
+                    (
+                        if restore {
+                            "Restore my backup?"
+                        } else {
+                            "Discard the backup?"
+                        },
+                        div().child(text(
+                            "cloud-continue-backup-body",
+                            backup_text(restore, &path),
+                            false,
+                        )),
+                        footer.child(cancel).child(
+                            if restore {
+                                crate::modal::primary_button("cloud-continue-backup-go", "Restore")
+                            } else {
+                                crate::modal::danger_button("cloud-continue-backup-go", "Discard")
+                            }
+                            .debug_selector(|| "cloud-continue-backup-go".into())
+                            .cursor_pointer()
+                            .on_click(cx.listener(
+                                |this, _, window, cx| this.confirm_backup_action(window, cx),
+                            )),
+                        ),
+                    )
+                }
+            };
         Some(
             div()
                 .absolute()

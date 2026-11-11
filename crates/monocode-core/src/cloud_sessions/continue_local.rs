@@ -341,9 +341,16 @@ impl CloudSessions {
         Ok(fresh)
     }
 
-    /// The explicit user action: forget the interrupted return. The backup stays on disk.
+    /// The explicit user action: forget the interrupted return and delete its backup. It
+    /// cannot be undone. The marker goes first, so a half-deleted backup never blocks.
     pub fn discard_continue_marker(&self, session: i64) -> Result<(), String> {
-        self.store()?.set_cloud_continue_broken(session, "")
+        let store = self.store()?;
+        let backup = store.continue_backup_path(session);
+        store.set_cloud_continue_broken(session, "")?;
+        if let Some(backup) = backup {
+            let _ = std::fs::remove_dir_all(backup);
+        }
+        Ok(())
     }
 
     /// The in-place path. Only while the folder is exactly what the move left, with the same

@@ -146,6 +146,14 @@ impl Store {
             .ok()?
             .filter(|raw| !raw.is_empty())
     }
+    /// Where the backup of an interrupted return is, when there is one.
+    pub fn continue_backup_path(&self, session: i64) -> Option<String> {
+        let raw = self.cloud_continue_broken(session)?;
+        serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .and_then(|v| v["backup"].as_str().map(str::to_owned))
+            .or(Some(String::new()))
+    }
     pub fn set_cloud_continue_broken(&self, session: i64, raw: &str) -> Result<(), String> {
         self.save_setting(&Self::broken_key(session), raw)
     }

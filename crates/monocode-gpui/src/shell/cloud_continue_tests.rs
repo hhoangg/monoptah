@@ -229,3 +229,209 @@ fn the_confirmation_says_what_will_happen_and_never_uses_dashes() {
     }
     let _ = LOCAL;
 }
+
+use serde_json::json;
+
+fn scratch_dir() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "f45-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn broken_marker(
+    window: &gpui::WindowHandle<Shell>,
+    cx: &mut TestAppContext,
+    local: i64,
+    backup: &std::path::Path,
+) {
+    window
+        .update(cx, |shell, _, _| {
+            locked(&shell.store)
+                .unwrap()
+                .set_cloud_continue_broken(local, &json!({"backup": backup}).to_string())
+                .unwrap();
+        })
+        .unwrap();
+}
+
+fn fake_backup(
+    calls: Arc<AtomicUsize>,
+    fail: Option<&'static str>,
+    store: Database,
+) -> cloud_continue::BackupFn {
+    Arc::new(move |_, id, _restore| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(error) = fail {
+            return Err(error.into());
+        }
+        locked(&store)
+            .unwrap()
+            .set_cloud_continue_broken(id, "")
+            .unwrap();
+        Ok("Done.".into())
+    })
+}
+
+#[gpui::test]
+fn restore_and_discard_are_offered_and_nothing_runs_before_the_confirmation(
+    cx: &mut TestAppContext,
+) {
+    let (window, local) = moved_window(cx);
+    let tmp = scratch_dir();
+    broken_marker(&window, cx, local, tmp.as_path());
+    let calls = Arc::new(AtomicUsize::new(0));
+    window
+        .update(cx, |shell, window, cx| {
+            shell.cloud_continue.backup = fake_backup(calls.clone(), None, shell.store.clone());
+            let items = labels(shell, local, cx);
+            assert!(
+                items.contains(&"Restore my backup…".to_string()),
+                "{items:?}"
+            );
+            assert!(items.contains(&"Discard backup…".to_string()));
+            shell.run_session_menu(local, "restore-continue-backup", window, cx);
+            assert_eq!(shell.cloud_continue.phase_name(), "confirm-backup");
+            // Cancel runs nothing and keeps the marker.
+            shell.close_continue_locally(window, cx);
+            assert_eq!(shell.cloud_continue.phase_name(), "closed");
+            assert!(
+                locked(&shell.store)
+                    .unwrap()
+                    .cloud_continue_broken(local)
+                    .is_some()
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    window
+        .update(cx, |shell, window, cx| {
+            shell.run_session_menu(local, "restore-continue-backup", window, cx);
+            shell.confirm_backup_action(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, _| {
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(shell.cloud_continue.phase_name(), "closed");
+            assert!(
+                locked(&shell.store)
+                    .unwrap()
+                    .cloud_continue_broken(local)
+                    .is_none()
+            );
+            assert_eq!(shell.error.as_deref(), Some("Done."));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_failed_restore_keeps_the_marker_and_can_be_retried(cx: &mut TestAppContext) {
+    let (window, local) = moved_window(cx);
+    let tmp = scratch_dir();
+    broken_marker(&window, cx, local, tmp.as_path());
+    let calls = Arc::new(AtomicUsize::new(0));
+    window
+        .update(cx, |shell, window, cx| {
+            shell.cloud_continue.backup = fake_backup(
+                calls.clone(),
+                Some("a file is in the way"),
+                shell.store.clone(),
+            );
+            shell.open_backup_action(local, true, window, cx);
+            shell.confirm_backup_action(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, window, cx| {
+            assert_eq!(shell.cloud_continue.phase_name(), "failed");
+            assert!(
+                locked(&shell.store)
+                    .unwrap()
+                    .cloud_continue_broken(local)
+                    .is_some()
+            );
+            shell.cloud_continue.backup = fake_backup(calls.clone(), None, shell.store.clone());
+            shell.confirm_backup_action(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, _| {
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert!(
+                locked(&shell.store)
+                    .unwrap()
+                    .cloud_continue_broken(local)
+                    .is_none()
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_blocked_continue_offers_the_backup_actions_and_discard_unblocks_delete(
+    cx: &mut TestAppContext,
+) {
+    let (window, local) = moved_window(cx);
+    let tmp = scratch_dir();
+    let backup = tmp.as_path().join("pre-continue-1");
+    std::fs::create_dir_all(&backup).unwrap();
+    std::fs::write(backup.join("changes.patch"), "x").unwrap();
+    broken_marker(&window, cx, local, &backup);
+    let calls = Arc::new(AtomicUsize::new(0));
+    window
+        .update(cx, |shell, window, cx| {
+            shell.cloud_continue.run = fake(
+                calls.clone(),
+                Some("An earlier return was interrupted"),
+                shell.store.clone(),
+            );
+            shell.open_continue_locally(local, window, cx);
+            shell.confirm_continue_locally(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, window, cx| {
+            assert_eq!(shell.cloud_continue.phase_name(), "failed");
+            // From the failed dialog, Discard asks first.
+            shell.ask_backup_action(false, cx);
+            assert_eq!(shell.cloud_continue.phase_name(), "confirm-backup");
+            assert!(
+                locked(&shell.store).unwrap().delete(local).is_err(),
+                "delete is blocked"
+            );
+            shell.confirm_backup_action(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, _| {
+            let mut store = locked(&shell.store).unwrap();
+            assert!(store.cloud_continue_broken(local).is_none());
+            assert!(!backup.exists(), "the backup is deleted");
+            store.delete(local).unwrap();
+        })
+        .unwrap();
+}
+
+#[test]
+fn the_backup_confirmations_name_the_path_and_the_consequence() {
+    let restore = cloud_continue::backup_text(true, "/tmp/b");
+    assert!(restore.contains("/tmp/b") && restore.contains("fresh backup"));
+    let discard = cloud_continue::backup_text(false, "/tmp/b");
+    assert!(discard.contains("/tmp/b") && discard.contains("cannot be undone"));
+    for text in [restore, discard] {
+        assert!(!text.contains('\u{2014}') && !text.contains('\u{2013}'));
+    }
+}
