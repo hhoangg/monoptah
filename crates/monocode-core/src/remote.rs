@@ -1681,7 +1681,7 @@ mod tests {
             return;
         };
         // A current fork Host, so the connect-time upgrade check leaves it alone.
-        let describe = json!({ "result": { "protocolVersion": 1, "environmentId": "env-cs", "name": "Host", "host": {"flavor": "monoptah", "version": "1.1.0"} }});
+        let describe = json!({ "result": { "protocolVersion": 1, "environmentId": "env-cs", "name": "Host", "host": {"flavor": "monoptah", "version": host_upgrade::pinned_version()} }});
         let (url, _requests, server) = host_fixture(vec![
             describe.clone(),
             describe.clone(),
