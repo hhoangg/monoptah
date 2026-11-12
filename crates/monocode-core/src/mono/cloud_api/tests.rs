@@ -751,6 +751,53 @@ fn create_defaults_to_the_current_branch_and_waits_until_available() {
 }
 
 #[test]
+fn create_uses_the_project_cloud_settings_for_branch_and_options() {
+    use crate::cloud_sessions::project_cloud::{self, CodespaceProjectConfig, ProjectCloud};
+    let create_call = |input: Value| {
+        let gh = FakeGh::new(vec![
+            ("auth status", ok(AUTH_OK)),
+            ("codespace create", ok("octo-new1\n")),
+            ("codespace view", ok(r#"{"state":"Available"}"#)),
+        ]);
+        let fx = fixture(&gh);
+        project_cloud::save(
+            &fx.store.lock().unwrap(),
+            &fx.path(),
+            &ProjectCloud {
+                codespace: CodespaceProjectConfig {
+                    base_ref: "release".into(),
+                    machine: Some("premiumLinux".into()),
+                    idle_timeout_minutes: 90,
+                    devcontainer_path: ".devcontainer/web/devcontainer.json".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fx.api.create(&fx.path(), &input, &mut |_| {}).unwrap();
+        gh.calls()
+            .into_iter()
+            .find(|c| c.contains("codespace create"))
+            .unwrap()
+    };
+    let create = create_call(json!({"kind":"codespace"}));
+    assert!(create.contains("--branch release"), "{create}");
+    assert!(create.contains("--machine premiumLinux"), "{create}");
+    assert!(create.contains("--idle-timeout 90m"), "{create}");
+    assert!(
+        create.contains("--devcontainer-path .devcontainer/web/devcontainer.json"),
+        "{create}"
+    );
+    // The request's own branch and machine win; the other settings still apply.
+    let create =
+        create_call(json!({"kind":"codespace","branch":"feat","machine":"standardLinux32gb"}));
+    assert!(create.contains("--branch feat"), "{create}");
+    assert!(create.contains("--machine standardLinux32gb"), "{create}");
+    assert!(create.contains("--idle-timeout 90m"), "{create}");
+}
+
+#[test]
 fn a_sandbox_cannot_be_created_alone_and_the_error_says_what_to_do() {
     let gh = FakeGh::new(vec![]);
     let fx = fixture(&gh);

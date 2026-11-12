@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 pub const OAUTH_SECRET_KEY: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 pub const DEFAULT_MACHINE: &str = "basicLinux32gb";
 pub const IDLE_TIMEOUT: &str = "30m";
+/// [`IDLE_TIMEOUT`] in minutes, for the REST API.
+pub const DEFAULT_IDLE_TIMEOUT_MINUTES: u32 = 30;
 pub const RETENTION_PERIOD: &str = "72h";
 pub const READY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 pub const READY_POLL: Duration = Duration::from_secs(5);
@@ -588,6 +590,8 @@ pub struct CreateOptions<'a> {
 
 /// Lowest and highest idle timeout `gh` accepts, in minutes.
 pub const IDLE_TIMEOUT_MINUTES: std::ops::RangeInclusive<u32> = 5..=240;
+/// The message for an idle timeout outside [`IDLE_TIMEOUT_MINUTES`].
+pub const IDLE_TIMEOUT_ERROR: &str = "Stop when idle must be between 5 and 240 minutes.";
 
 impl<'a> CreateOptions<'a> {
     /// The machine type to request.
@@ -602,7 +606,7 @@ impl<'a> CreateOptions<'a> {
         match self.idle_timeout_minutes {
             None => Ok(None),
             Some(m) if IDLE_TIMEOUT_MINUTES.contains(&m) => Ok(Some(m)),
-            Some(_) => Err("The idle timeout must be between 5 and 240 minutes".into()),
+            Some(_) => Err(IDLE_TIMEOUT_ERROR.into()),
         }
     }
     /// The devcontainer path to request, when set; rejects anything but a relative path.
@@ -707,7 +711,7 @@ pub fn create_started(
         return Err("A branch is required to create a codespace".into());
     }
     let machine = options.machine();
-    let idle = options.idle()?.unwrap_or(30);
+    let idle = options.idle()?.unwrap_or(DEFAULT_IDLE_TIMEOUT_MINUTES);
     let devcontainer = options.devcontainer()?;
     let display: String = match display.filter(|d| !d.trim().is_empty()) {
         Some(d) => d.chars().take(DISPLAY_NAME_MAX).collect(),
@@ -1203,6 +1207,17 @@ pub struct MachineType {
     pub storage_in_bytes: u64,
     pub memory_in_bytes: u64,
     pub cpus: u32,
+}
+
+/// The machine a new codespace starts on when the user does not choose: `preferred` (the
+/// project's machine) when the repository offers it, else [`DEFAULT_MACHINE`], else the first.
+pub fn default_machine(machines: &[MachineType], preferred: Option<&str>) -> Option<String> {
+    machines
+        .iter()
+        .find(|m| Some(m.name.as_str()) == preferred)
+        .or_else(|| machines.iter().find(|m| m.name == DEFAULT_MACHINE))
+        .or_else(|| machines.first())
+        .map(|m| m.name.clone())
 }
 
 /// The REST API uses snake_case; accept both so tests and gh versions agree.

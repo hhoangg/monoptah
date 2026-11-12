@@ -913,11 +913,7 @@ impl CloudSessions {
         &self,
         local_cwd: &str,
     ) -> project_cloud::CodespaceProjectConfig {
-        self.store()
-            .ok()
-            .and_then(|store| project_cloud::load(&store, local_cwd).ok())
-            .map(|p| p.codespace)
-            .unwrap_or_default()
+        project_cloud::codespace_config_or_default(&self.store, local_cwd)
     }
     /// The registered backend for `kind`.
     pub(crate) fn backend(&self, kind: CloudBackendKind) -> Result<Arc<dyn CloudBackend>, String> {
@@ -1035,17 +1031,17 @@ impl CloudSessions {
                 progress("Creating codespace");
                 // Whatever the caller left unset comes from the project's cloud settings.
                 let project = self.codespace_project_config(local_cwd);
-                let machine = target
-                    .machine
-                    .clone()
-                    .or(project.machine)
-                    .map(|m| m.trim().to_owned())
-                    .filter(|m| !m.is_empty());
-                let devcontainer = target
-                    .devcontainer_path
-                    .clone()
-                    .or(Some(project.devcontainer_path))
-                    .filter(|p| !p.trim().is_empty());
+                // A blank target value counts as unset, so it falls back to the project's.
+                let set = |value: &Option<String>| {
+                    value
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_owned)
+                };
+                let machine = set(&target.machine).or_else(|| set(&project.machine));
+                let devcontainer = set(&target.devcontainer_path)
+                    .or_else(|| set(&Some(project.devcontainer_path.clone())));
                 let options = codespaces::CreateOptions {
                     machine: machine.as_deref(),
                     idle_timeout_minutes: Some(

@@ -180,10 +180,18 @@ impl Conversation {
                                 .into(),
                         ]
                     }
+                    // The listing failed: offer the machine the row shows (the project's, else
+                    // the default), so it stays selectable.
                     Machines::Failed => vec![
-                        MenuAction::new("cloud-set:machine:", codespaces::DEFAULT_MACHINE)
-                            .checked(true)
-                            .into(),
+                        MenuAction::new(
+                            format!(
+                                "cloud-set:machine:{}",
+                                draft.machine.as_deref().unwrap_or("")
+                            ),
+                            selected,
+                        )
+                        .checked(true)
+                        .into(),
                     ],
                 };
                 ("Machine type", items)

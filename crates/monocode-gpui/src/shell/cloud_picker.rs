@@ -30,21 +30,6 @@ enum Picked {
     Cancel,
 }
 
-/// Machine selected for a new codespace when the user does not choose.
-/// The project's own machine wins when the repository offers it.
-fn default_machine(machines: &[MachineType], preferred: Option<&str>) -> Option<String> {
-    machines
-        .iter()
-        .find(|m| Some(m.name.as_str()) == preferred)
-        .or_else(|| {
-            machines
-                .iter()
-                .find(|m| m.name == codespaces::DEFAULT_MACHINE)
-        })
-        .or_else(|| machines.first())
-        .map(|m| m.name.clone())
-}
-
 /// The target a picker choice turns into. A new codespace needs a branch.
 pub(super) fn target_for(
     choice: CodespaceChoice,
@@ -197,7 +182,8 @@ impl CodespacePicker {
                             .cloud
                             .codespace_project_config(&this.local_project)
                             .machine;
-                        this.machine = default_machine(&listing.machines, preferred.as_deref());
+                        this.machine =
+                            codespaces::default_machine(&listing.machines, preferred.as_deref());
                         this.listing = Some(listing);
                     }
                     Err(error) => this.error = error,

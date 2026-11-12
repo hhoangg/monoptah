@@ -30,12 +30,12 @@ fn defaults_are_todays_behavior() {
 #[test]
 fn kind_serializes_as_codespace_and_sandbox() {
     assert_eq!(
-        serde_json::to_string(&CloudBackendKind::Codespace).unwrap(),
+        serde_json::to_string(&DefaultBackend::Codespace).unwrap(),
         r#""codespace""#
     );
     assert_eq!(
-        serde_json::from_str::<CloudBackendKind>(r#""sandbox""#).unwrap(),
-        CloudBackendKind::Sandbox
+        serde_json::from_str::<DefaultBackend>(r#""sandbox""#).unwrap(),
+        DefaultBackend::Sandbox
     );
 }
 
@@ -46,7 +46,7 @@ fn missing_project_loads_defaults() {
     assert_eq!(loaded, ProjectCloud::default());
     assert_eq!(
         loaded.effective_default_backend(),
-        CloudBackendKind::Codespace
+        DefaultBackend::Codespace
     );
 }
 
@@ -54,7 +54,7 @@ fn missing_project_loads_defaults() {
 fn round_trip_keeps_both_parts() {
     let (_dir, store) = store();
     let project = ProjectCloud {
-        default_backend: Some(CloudBackendKind::Sandbox),
+        default_backend: Some(DefaultBackend::Sandbox),
         codespace: CodespaceProjectConfig {
             base_ref: " main ".into(),
             devcontainer_path: ".devcontainer/web/devcontainer.json".into(),
@@ -174,14 +174,14 @@ fn codespace_validation_rules() {
 #[test]
 fn effective_default_backend_cases() {
     let mut p = ProjectCloud::default();
-    assert_eq!(p.effective_default_backend(), CloudBackendKind::Codespace);
+    assert_eq!(p.effective_default_backend(), DefaultBackend::Codespace);
     p.sandbox = Some(sandbox());
-    assert_eq!(p.effective_default_backend(), CloudBackendKind::Sandbox);
-    p.default_backend = Some(CloudBackendKind::Codespace);
-    assert_eq!(p.effective_default_backend(), CloudBackendKind::Codespace);
+    assert_eq!(p.effective_default_backend(), DefaultBackend::Sandbox);
+    p.default_backend = Some(DefaultBackend::Codespace);
+    assert_eq!(p.effective_default_backend(), DefaultBackend::Codespace);
     p.sandbox = None;
-    p.default_backend = Some(CloudBackendKind::Sandbox);
-    assert_eq!(p.effective_default_backend(), CloudBackendKind::Sandbox);
+    p.default_backend = Some(DefaultBackend::Sandbox);
+    assert_eq!(p.effective_default_backend(), DefaultBackend::Sandbox);
 }
 
 #[test]
@@ -320,6 +320,13 @@ fn devcontainer_sshd_variants() {
     assert!(case(r#"{"ghcr.io/devcontainers/features/sshd:1":{}}"#));
     assert!(case(r#"{"ghcr.io/devcontainers/features/sshd":{}}"#));
     assert!(case(r#"{"sshd:1":{}}"#));
+    assert!(case(
+        r#"{"ghcr.io/devcontainers/features/sshd@sha256:abc":{}}"#
+    ));
+    assert!(!case(r#"{"ghcr.io/devcontainers/features/not-sshd:1":{}}"#));
+    assert!(!case(
+        r#"{"ghcr.io/devcontainers/features/sshd-extras":{}}"#
+    ));
     assert!(!case(r#"{"ghcr.io/devcontainers/features/node:1":{}}"#));
     assert!(!case("{}"));
 }
@@ -341,4 +348,90 @@ fn devcontainer_explicit_path_and_unparsable_file() {
         (info.host_cpus, info.host_memory_mib, info.has_sshd),
         (None, None, false)
     );
+}
+
+#[test]
+fn default_backend_converts_to_and_from_the_session_backend_kind() {
+    use crate::cloud_sessions::backend::CloudBackendKind;
+    for (default, kind) in [
+        (DefaultBackend::Codespace, CloudBackendKind::Codespaces),
+        (DefaultBackend::Sandbox, CloudBackendKind::DockerSandbox),
+    ] {
+        assert_eq!(CloudBackendKind::from(default), kind);
+        assert_eq!(DefaultBackend::from(kind), default);
+    }
+}
+
+#[test]
+fn codespace_settings_load_even_when_the_sandbox_setting_is_invalid() {
+    let (_dir, store) = store();
+    save(
+        &store,
+        "/p",
+        &ProjectCloud {
+            default_backend: Some(DefaultBackend::Codespace),
+            codespace: CodespaceProjectConfig {
+                machine: Some("standardLinux32gb".into()),
+                idle_timeout_minutes: 90,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    store
+        .save_setting(docker_config::SETTING, r#"{"/p":{"repoUrl":"ftp://nope"}}"#)
+        .unwrap();
+    assert!(load(&store, "/p").is_err());
+    let loaded = load_codespace(&store, "/p").unwrap();
+    assert_eq!(loaded.default_backend, Some(DefaultBackend::Codespace));
+    assert_eq!(
+        loaded.codespace.machine.as_deref(),
+        Some("standardLinux32gb")
+    );
+    assert_eq!(loaded.codespace.idle_timeout_minutes, 90);
+    let shared = std::sync::Mutex::new(store);
+    let cfg = codespace_config_or_default(&shared, "/p");
+    assert_eq!(cfg.idle_timeout_minutes, 90);
+    // An unreadable cloud-projects.v1 still falls back to the defaults.
+    shared
+        .lock()
+        .unwrap()
+        .save_setting(SETTING, "{nope")
+        .unwrap();
+    assert_eq!(
+        codespace_config_or_default(&shared, "/p"),
+        CodespaceProjectConfig::default()
+    );
+}
+
+#[test]
+fn a_failed_cloud_projects_write_leaves_the_sandbox_setting_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("monocode.db");
+    let store = Store::open(&path).unwrap();
+    let old = DockerProjectConfig {
+        cpus: 2,
+        ..sandbox()
+    };
+    docker_config::save(&store, "/p", &old).unwrap();
+    let before = store.setting(docker_config::SETTING).unwrap();
+    // Make writes of cloud-projects.v1 fail from a second connection.
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_cloud_projects BEFORE INSERT ON native_settings \
+             WHEN NEW.key = '{SETTING}' BEGIN SELECT RAISE(ABORT, 'injected'); END;"
+        ))
+        .unwrap();
+    let next = ProjectCloud {
+        sandbox: Some(DockerProjectConfig {
+            cpus: 4,
+            ..sandbox()
+        }),
+        ..Default::default()
+    };
+    assert!(save(&store, "/p", &next).is_err());
+    assert_eq!(store.setting(docker_config::SETTING).unwrap(), before);
+    assert_eq!(docker_config::load(&store, "/p").unwrap().unwrap().cpus, 2);
 }

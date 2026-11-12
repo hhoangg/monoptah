@@ -179,6 +179,21 @@ fn a_saved_config_comes_back_into_the_form() {
 }
 
 #[test]
+fn the_dialog_keeps_the_saved_docker_account() {
+    let saved = DockerProjectConfig {
+        repo_url: "https://github.com/acme/alpha".into(),
+        docker_account: Some("docker-acct-1".into()),
+        ..Default::default()
+    };
+    let form = Form::initial(Some(&saved), None);
+    assert_eq!(
+        form.to_config(Some(&saved)).docker_account.as_deref(),
+        Some("docker-acct-1")
+    );
+    assert_eq!(form.to_config(None).docker_account, None);
+}
+
+#[test]
 fn validation_errors_land_under_the_right_field() {
     let accounts = [];
     let check = |edit: fn(&mut Form), creds: &[GitCredentialSummary]| {

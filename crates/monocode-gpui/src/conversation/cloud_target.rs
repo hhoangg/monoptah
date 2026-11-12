@@ -14,7 +14,7 @@ use crate::docker_dialog::model::AccountChoice;
 use monocode_core::cloud_sessions::docker_config::{self, DockerProjectConfig};
 use monocode_core::cloud_sessions::kit::Workspace;
 use monocode_core::cloud_sessions::project_cloud::{self, CodespaceProjectConfig};
-use monocode_core::codespaces::MachineType;
+use monocode_core::codespaces::{self, MachineType};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CloudTarget {
@@ -313,12 +313,9 @@ impl Conversation {
     }
 
     /// The codespace part of the project's cloud settings (the defaults when none is saved).
+    /// Read once per action and passed around.
     fn codespace_project_config(&self) -> CodespaceProjectConfig {
-        locked(&self.store)
-            .ok()
-            .and_then(|store| project_cloud::load(&store, &self.summary.cwd).ok())
-            .map(|p| p.codespace)
-            .unwrap_or_default()
+        project_cloud::codespace_config_or_default(&self.store, &self.summary.cwd)
     }
 
     /// The branch a new codespace starts on: the project's base branch when set, else HEAD of
@@ -413,8 +410,8 @@ impl Conversation {
             let field = draft.base.clone();
             field.update(cx, |field, cx| field.set_text(base, cx));
             if target == CloudTarget::Codespace {
-                // The same reset for a codespace: no machine pick, the branch from HEAD again
-                // and a fresh listing.
+                // The same reset for a codespace: the project's machine, its base branch (else
+                // HEAD) again and a fresh listing.
                 let project = self.codespace_project_config();
                 let head = self.codespace_default_branch(&project);
                 let Some(draft) = &mut self.cloud_draft else {
@@ -452,7 +449,8 @@ impl Conversation {
         let docker = target == CloudTarget::DockerSandbox;
         let (cpus, memory, ttl, account, base_text) = config_defaults(config.as_ref());
         // Docker names a new feature branch; a codespace starts on the current branch of the
-        // project folder (HEAD, as the header picker does), empty while HEAD is detached.
+        // project folder (HEAD, as the header picker does), empty while HEAD is detached, unless
+        // the project sets a base branch.
         let codespace_config = self.codespace_project_config();
         let default = if docker {
             format!("monoptah/{}", short_id())
@@ -606,7 +604,17 @@ impl Conversation {
                     .filter(|draft| draft.machines_request == request)
                 {
                     draft.machines = match result {
-                        Ok(machines) if !machines.is_empty() => Machines::Loaded(machines),
+                        Ok(machines) if !machines.is_empty() => {
+                            // A machine the repository does not offer (from the project's
+                            // settings) falls back like the header picker does.
+                            if let Some(wanted) = &draft.machine
+                                && !machines.iter().any(|m| &m.name == wanted)
+                            {
+                                draft.machine =
+                                    codespaces::default_machine(&machines, Some(wanted));
+                            }
+                            Machines::Loaded(machines)
+                        }
                         _ => Machines::Failed,
                     };
                     cx.notify();
@@ -696,13 +704,13 @@ impl Conversation {
             return;
         }
         let typed = draft.branch.read(cx).content.trim().to_owned();
+        let codespace_base = self.codespace_project_config().base_ref;
         let (branch, config) = match target {
-            // Same source as the header picker unless the user typed another branch: HEAD of
-            // the project folder (a worktree's branch would not exist on the remote).
+            // The typed branch wins. Else the project's base branch, else HEAD of the project
+            // folder (as the header picker does; a worktree's branch would not exist on the
+            // remote).
             CloudTarget::Codespace if !typed.is_empty() => (typed, None),
-            CloudTarget::Codespace if !self.codespace_project_config().base_ref.is_empty() => {
-                (self.codespace_project_config().base_ref, None)
-            }
+            CloudTarget::Codespace if !codespace_base.is_empty() => (codespace_base, None),
             CloudTarget::Codespace => match git_head(Path::new(&self.summary.cwd)) {
                 Some((_, true)) => {
                     fail(

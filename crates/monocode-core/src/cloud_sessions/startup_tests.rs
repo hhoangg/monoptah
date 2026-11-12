@@ -697,6 +697,70 @@ fn a_start_takes_machine_idle_timeout_and_devcontainer_from_the_project_settings
 }
 
 #[test]
+fn an_invalid_sandbox_setting_does_not_hide_the_codespace_settings() {
+    use super::project_cloud::{self, CodespaceProjectConfig, ProjectCloud};
+    let f = fx(Gh::new(&["Provisioning"], &[]));
+    {
+        let store = f.store.lock().unwrap();
+        project_cloud::save(
+            &store,
+            "/p",
+            &ProjectCloud {
+                codespace: CodespaceProjectConfig {
+                    machine: Some("standardLinux32gb".into()),
+                    idle_timeout_minutes: 90,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        store
+            .save_setting(
+                super::docker_config::SETTING,
+                r#"{"/p":{"repoUrl":"ftp://nope"}}"#,
+            )
+            .unwrap();
+    }
+    f.svc.begin_start("/p", new_target(), "claude").unwrap();
+    let call = create_call(&f);
+    assert!(call.contains("machine=standardLinux32gb"), "{call}");
+    assert!(call.contains("idle_timeout_minutes=90"), "{call}");
+}
+
+#[test]
+fn blank_target_values_fall_back_to_the_project_settings() {
+    use super::project_cloud::{self, CodespaceProjectConfig, ProjectCloud};
+    let f = fx(Gh::new(&["Provisioning"], &[]));
+    project_cloud::save(
+        &f.store.lock().unwrap(),
+        "/p",
+        &ProjectCloud {
+            codespace: CodespaceProjectConfig {
+                machine: Some("standardLinux32gb".into()),
+                devcontainer_path: ".devcontainer.json".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let target = Target {
+        machine: Some("  ".into()),
+        devcontainer_path: Some("".into()),
+        ..new_target()
+    };
+    let (_, record) = f.svc.begin_start("/p", target, "claude").unwrap();
+    let call = create_call(&f);
+    assert!(call.contains("machine=standardLinux32gb"), "{call}");
+    assert!(
+        call.contains("devcontainer_path=.devcontainer.json"),
+        "{call}"
+    );
+    assert_eq!(record.machine.as_deref(), Some("standardLinux32gb"));
+}
+
+#[test]
 fn begin_start_for_a_named_codespace_skips_create() {
     let f = fx(Gh::new(&["Shutdown"], &[]));
     let (_, record) = f.svc.begin_start("/p", named_target(), "claude").unwrap();

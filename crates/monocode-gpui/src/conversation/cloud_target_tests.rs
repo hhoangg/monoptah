@@ -2200,3 +2200,154 @@ fn a_cloud_session_shows_its_backend_and_workspace_state_in_the_workspace_bar(
     draw(visual);
     assert!(visual.debug_bounds("cloud-session-status").is_none());
 }
+
+/// Saves a project cloud config (codespace part only) for the conversation's project.
+fn save_codespace_config(view: &Conversation, base_ref: &str, machine: Option<&str>) {
+    use monocode_core::cloud_sessions::project_cloud::{
+        self, CodespaceProjectConfig, ProjectCloud,
+    };
+    project_cloud::save(
+        &locked(&view.store).unwrap(),
+        &view.summary.cwd,
+        &ProjectCloud {
+            codespace: CodespaceProjectConfig {
+                base_ref: base_ref.into(),
+                machine: machine.map(str::to_owned),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+}
+
+#[gpui::test]
+fn the_composer_starts_and_resets_from_the_saved_project_machine_and_branch(
+    cx: &mut TestAppContext,
+) {
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    window
+        .update(cx, |view, _, cx| {
+            save_codespace_config(view, "release", Some("standardLinux32gb"));
+            view.set_machine_loader(Arc::new(|_| {
+                Ok(vec![
+                    machine("basicLinux32gb", "Basic"),
+                    machine("standardLinux32gb", "Standard"),
+                ])
+            }));
+            view.set_offers_codespace(true, cx);
+            view.cloud_menu_choice("workspace:cloud-codespace", cx);
+            let draft = view.cloud_draft.as_ref().unwrap();
+            assert_eq!(draft.machine.as_deref(), Some("standardLinux32gb"));
+            assert_eq!(draft.branch.read(cx).content.as_ref(), "release");
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            // Offered by the repository: it stays and the row shows it.
+            assert_eq!(
+                view.cloud_draft.as_ref().unwrap().machine.as_deref(),
+                Some("standardLinux32gb")
+            );
+            assert_eq!(view.cloud_field_value(CloudField::Machine), "Standard");
+            view.cloud_menu_choice("cloud-set:machine:basicLinux32gb", cx);
+            set_text(view, |d| d.branch.clone(), "other", cx);
+            view.cloud_menu_choice("workspace:cloud-codespace", cx);
+            let draft = view.cloud_draft.as_ref().unwrap();
+            assert_eq!(draft.machine.as_deref(), Some("standardLinux32gb"));
+            assert_eq!(draft.branch.read(cx).content.as_ref(), "release");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn an_empty_branch_field_starts_on_the_project_base_branch(cx: &mut TestAppContext) {
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    let requests = watch(window, cx);
+    window
+        .update(cx, |view, _, cx| {
+            save_codespace_config(view, "release", None);
+            view.set_offers_codespace(true, cx);
+            view.cloud_menu_choice("workspace:cloud-codespace", cx);
+            set_text(view, |d| d.branch.clone(), "", cx);
+            view.create_cloud(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(requests.lock().unwrap()[0].branch, "release");
+}
+
+#[gpui::test]
+fn a_project_machine_the_repository_does_not_offer_falls_back_like_the_picker(
+    cx: &mut TestAppContext,
+) {
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    let requests = watch(window, cx);
+    window
+        .update(cx, |view, _, cx| {
+            save_codespace_config(view, "", Some("gone32gb"));
+            view.set_machine_loader(Arc::new(|_| {
+                Ok(vec![
+                    machine("standardLinux32gb", "Standard"),
+                    machine("basicLinux32gb", "Basic"),
+                ])
+            }));
+            view.set_offers_codespace(true, cx);
+            view.cloud_menu_choice("workspace:cloud-codespace", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            let draft = view.cloud_draft.as_ref().unwrap();
+            assert_eq!(draft.machine.as_deref(), Some(codespaces::DEFAULT_MACHINE));
+            assert_eq!(view.cloud_field_value(CloudField::Machine), "Basic");
+            view.create_cloud(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        requests.lock().unwrap()[0].machine.as_deref(),
+        Some(codespaces::DEFAULT_MACHINE)
+    );
+}
+
+#[gpui::test]
+fn a_failed_listing_still_offers_the_project_machine_the_row_shows(cx: &mut TestAppContext) {
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    let requests = watch(window, cx);
+    window
+        .update(cx, |view, _, cx| {
+            save_codespace_config(view, "", Some("premiumLinux"));
+            view.set_machine_loader(Arc::new(|_| Err("gh is not installed".into())));
+            view.set_offers_codespace(true, cx);
+            view.cloud_menu_choice("workspace:cloud-codespace", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            assert_eq!(view.cloud_field_value(CloudField::Machine), "premiumLinux");
+            let (_, items) = view.cloud_field_menu(CloudField::Machine);
+            assert_eq!(items.len(), 1);
+            assert!(matches!(
+                &items[0],
+                MenuItem::Action(a)
+                    if a.id.as_ref() == "cloud-set:machine:premiumLinux" && a.checked
+            ));
+            // Choosing it keeps the project machine.
+            assert!(view.cloud_menu_choice("cloud-set:machine:premiumLinux", cx));
+            view.create_cloud(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        requests.lock().unwrap()[0].machine.as_deref(),
+        Some("premiumLinux")
+    );
+}

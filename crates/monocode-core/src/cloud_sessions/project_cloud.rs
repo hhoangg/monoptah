@@ -13,14 +13,32 @@ use std::path::Path;
 /// Native store setting holding the cwd -> [`StoredProject`] map.
 pub const SETTING: &str = "cloud-projects.v1";
 /// Minutes a codespace may sit idle before it stops, when the project sets nothing.
-pub const DEFAULT_IDLE_TIMEOUT_MINUTES: u32 = 30;
+pub const DEFAULT_IDLE_TIMEOUT_MINUTES: u32 = crate::codespaces::DEFAULT_IDLE_TIMEOUT_MINUTES;
 
 /// Which backend new cloud sessions of a project use by default.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum CloudBackendKind {
+pub enum DefaultBackend {
     Codespace,
     Sandbox,
+}
+
+impl From<DefaultBackend> for super::backend::CloudBackendKind {
+    fn from(kind: DefaultBackend) -> Self {
+        match kind {
+            DefaultBackend::Codespace => Self::Codespaces,
+            DefaultBackend::Sandbox => Self::DockerSandbox,
+        }
+    }
+}
+
+impl From<super::backend::CloudBackendKind> for DefaultBackend {
+    fn from(kind: super::backend::CloudBackendKind) -> Self {
+        match kind {
+            super::backend::CloudBackendKind::Codespaces => Self::Codespace,
+            super::backend::CloudBackendKind::DockerSandbox => Self::Sandbox,
+        }
+    }
 }
 
 /// How a project's new codespaces are created.
@@ -82,7 +100,7 @@ impl CodespaceProjectConfig {
             }
         }
         if !crate::codespaces::IDLE_TIMEOUT_MINUTES.contains(&cfg.idle_timeout_minutes) {
-            return Err("Stop when idle must be between 5 and 240 minutes.".into());
+            return Err(crate::codespaces::IDLE_TIMEOUT_ERROR.into());
         }
         if let Some(id) = &cfg.claude_account {
             if !docker_config::valid_account_id(id) {
@@ -98,7 +116,7 @@ impl CodespaceProjectConfig {
 #[serde(rename_all = "camelCase", default)]
 struct StoredProject {
     #[serde(skip_serializing_if = "Option::is_none")]
-    default_backend: Option<CloudBackendKind>,
+    default_backend: Option<DefaultBackend>,
     codespace: CodespaceProjectConfig,
 }
 
@@ -106,7 +124,7 @@ struct StoredProject {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProjectCloud {
     /// The user's choice; `None` while never chosen (see [`Self::effective_default_backend`]).
-    pub default_backend: Option<CloudBackendKind>,
+    pub default_backend: Option<DefaultBackend>,
     pub codespace: CodespaceProjectConfig,
     /// `None` means no sandbox config is saved.
     pub sandbox: Option<DockerProjectConfig>,
@@ -114,11 +132,11 @@ pub struct ProjectCloud {
 
 impl ProjectCloud {
     /// The stored choice, else Sandbox when a sandbox config exists, else Codespace.
-    pub fn effective_default_backend(&self) -> CloudBackendKind {
+    pub fn effective_default_backend(&self) -> DefaultBackend {
         self.default_backend.unwrap_or(if self.sandbox.is_some() {
-            CloudBackendKind::Sandbox
+            DefaultBackend::Sandbox
         } else {
-            CloudBackendKind::Codespace
+            DefaultBackend::Codespace
         })
     }
 }
@@ -135,12 +153,47 @@ fn load_map(store: &Store) -> Result<BTreeMap<String, StoredProject>, String> {
 
 /// Both parts of the project at `cwd`. A stored part that no longer validates is an error.
 pub fn load(store: &Store, cwd: &str) -> Result<ProjectCloud, String> {
-    let stored = load_map(store)?.remove(cwd).unwrap_or_default();
+    let CodespaceCloud {
+        default_backend,
+        codespace,
+    } = load_codespace(store, cwd)?;
     Ok(ProjectCloud {
-        default_backend: stored.default_backend,
-        codespace: stored.codespace.validated()?,
+        default_backend,
+        codespace,
         sandbox: docker_config::load(store, cwd)?,
     })
+}
+
+/// What `cloud-projects.v1` holds for one project: no sandbox part.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CodespaceCloud {
+    pub default_backend: Option<DefaultBackend>,
+    pub codespace: CodespaceProjectConfig,
+}
+
+/// The default backend and codespace part of the project at `cwd`. Reads only
+/// `cloud-projects.v1`, so an invalid sandbox config never affects a codespace.
+pub fn load_codespace(store: &Store, cwd: &str) -> Result<CodespaceCloud, String> {
+    let stored = load_map(store)?.remove(cwd).unwrap_or_default();
+    Ok(CodespaceCloud {
+        default_backend: stored.default_backend,
+        codespace: stored.codespace.validated()?,
+    })
+}
+
+/// The codespace settings of the project at `cwd`, or the defaults when none are saved, the
+/// saved ones cannot be read, or the store is unavailable (a start then behaves as before the
+/// settings existed). The one function every codespace entry point reads settings through.
+pub fn codespace_config_or_default(
+    store: &std::sync::Mutex<Store>,
+    cwd: &str,
+) -> CodespaceProjectConfig {
+    store
+        .lock()
+        .ok()
+        .and_then(|store| load_codespace(&store, cwd).ok())
+        .map(|p| p.codespace)
+        .unwrap_or_default()
 }
 
 /// Validate both parts first, then write. Nothing is written when either is invalid, and an
@@ -167,14 +220,14 @@ pub fn save(store: &Store, cwd: &str, project: &ProjectCloud) -> Result<ProjectC
         },
     );
     let json = serde_json::to_string(&map).map_err(|e| e.to_string())?;
+    // `cloud-projects.v1` goes first: when the second write fails, only the new, additive
+    // setting changed and the caller is told Err; the existing sandbox config (the critical
+    // one) is still the old, working value. The store has no multi-setting transaction.
+    store.save_setting(SETTING, &json)?;
     let sandbox = match sandbox {
-        Some(config) => {
-            docker_config::save(store, cwd, &config)?;
-            Some(config)
-        }
+        Some(config) => Some(docker_config::save(store, cwd, &config)?),
         None => docker_config::load(store, cwd).ok().flatten(),
     };
-    store.save_setting(SETTING, &json)?;
     Ok(ProjectCloud {
         default_backend: project.default_backend,
         codespace,
@@ -242,6 +295,14 @@ fn memory_mib(text: &str) -> Option<u64> {
     (mib.is_finite() && mib >= 0.0).then_some(mib as u64)
 }
 
+/// Whether the feature id `id` names the sshd feature: its last path segment, without a
+/// `:version` or `@digest` tag, is exactly `sshd`.
+fn is_sshd_feature(id: &str) -> bool {
+    let last = id.rsplit('/').next().unwrap_or(id);
+    let name = last.split([':', '@']).next().unwrap_or(last);
+    name == "sshd"
+}
+
 /// Reads the devcontainer config of `project_root`. `path` is relative to the root; empty
 /// looks for `.devcontainer/devcontainer.json`, then `.devcontainer.json`. A file that cannot
 /// be parsed is reported as found, with nothing declared. Reads files only.
@@ -282,6 +343,6 @@ pub fn devcontainer_info(project_root: &Path, path: &str) -> DevcontainerInfo {
     info.has_sshd = value
         .get("features")
         .and_then(|f| f.as_object())
-        .is_some_and(|f| f.keys().any(|k| k.contains("/sshd") || k.contains("sshd:")));
+        .is_some_and(|f| f.keys().any(|k| is_sshd_feature(k)));
     info
 }

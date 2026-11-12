@@ -1483,3 +1483,54 @@ fn create_rejects_out_of_range_idle_timeout_and_unsafe_devcontainer_path() {
         );
     }
 }
+
+#[test]
+fn idle_timeout_error_copy_is_identical_in_create_options_and_project_settings() {
+    use crate::cloud_sessions::project_cloud::CodespaceProjectConfig;
+    let fake = Fake::new(vec![]);
+    let from_create =
+        create(&fake, "a/b", "x", &opts(Some(4), None), None, &mut |_| {}).unwrap_err();
+    let from_started = create_started(&fake, "a/b", "x", &opts(Some(4), None), None).unwrap_err();
+    let from_settings = CodespaceProjectConfig {
+        idle_timeout_minutes: 4,
+        ..Default::default()
+    }
+    .validated()
+    .unwrap_err();
+    let expected = "Stop when idle must be between 5 and 240 minutes.";
+    assert_eq!(from_create, expected);
+    assert_eq!(from_started, expected);
+    assert_eq!(from_settings, expected);
+}
+
+fn machine(name: &str) -> MachineType {
+    MachineType {
+        name: name.into(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn default_machine_prefers_the_project_machine_and_falls_back() {
+    let offered = [
+        machine("premiumLinux"),
+        machine(DEFAULT_MACHINE),
+        machine("standardLinux32gb"),
+    ];
+    let pick = |m: &[MachineType], preferred| default_machine(m, preferred);
+    assert_eq!(
+        pick(&offered, Some("standardLinux32gb")).as_deref(),
+        Some("standardLinux32gb")
+    );
+    // Not offered: the default machine, else the first one.
+    assert_eq!(
+        pick(&offered, Some("gone")).as_deref(),
+        Some(DEFAULT_MACHINE)
+    );
+    assert_eq!(pick(&offered, None).as_deref(), Some(DEFAULT_MACHINE));
+    assert_eq!(
+        pick(&offered[..1], Some("gone")).as_deref(),
+        Some("premiumLinux")
+    );
+    assert_eq!(pick(&[], Some("x")), None);
+}
