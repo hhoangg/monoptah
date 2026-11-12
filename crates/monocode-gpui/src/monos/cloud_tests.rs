@@ -1156,3 +1156,51 @@ fn a_move_call_for_a_regular_session_reaches_the_shell(cx: &mut TestAppContext) 
     assert_eq!(gh.calls.lock().unwrap().len(), before);
     assert!(host.0.lock().unwrap().is_empty());
 }
+
+#[gpui::test]
+fn a_cloud_sub_agent_row_shows_the_cloud_badge_and_a_local_one_does_not(cx: &mut TestAppContext) {
+    let (s, _, _, _guard) = cloud_setup(cx, "Available");
+    let cloud = cloud_session(&s, cx);
+    let local = plain_session(&s, cx);
+    cx.update(|cx| {
+        let owner = s.manager.read(cx).owner.upgrade().unwrap();
+        owner.update(cx, |owner, cx| owner.mono_refresh_cloud(cx));
+    });
+    cx.run_until_parked();
+    crate::monos::tests::edit_mono(&s, cx, |m| {
+        for (id, harness) in [(cloud, "claude"), (local, "claude")] {
+            m.launches.push(monocode_core::mono::Launch {
+                session_id: id,
+                cwd: s.project.clone(),
+                title: format!("launch {id}"),
+                harness: harness.into(),
+                model: None,
+                origin_turn: 0,
+                notify_on_complete: false,
+                completed: false,
+                dismissed: false,
+                each: false,
+                visible: false,
+            });
+        }
+    });
+    s.window
+        .update(cx, |_, _, cx| {
+            s.manager.update(cx, |m, cx| {
+                m.settings = None;
+                m.overview_tab = crate::monos::panels::OverviewTab::Sessions;
+                cx.notify();
+            });
+        })
+        .unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(s.window.into(), cx);
+    visual.run_until_parked();
+    let row = |id: i64| format!("mono-launch-{id}");
+    let badge = |id: i64| format!("mono-launch-cloud-{id}");
+    let mut row_of = |name: String| visual.debug_bounds(Box::leak(name.into_boxed_str()));
+    let cloud_row = row_of(row(cloud)).expect("the cloud launch row is rendered");
+    row_of(row(local)).expect("the local launch row is rendered");
+    let cloud_badge = row_of(badge(cloud)).expect("the cloud row carries the cloud badge");
+    assert!(cloud_row.contains(&cloud_badge.center()));
+    assert!(row_of(badge(local)).is_none());
+}
