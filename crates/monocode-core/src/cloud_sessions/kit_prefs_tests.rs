@@ -434,6 +434,7 @@ fn cloud_sources_never_read_the_keychain_or_claude_credentials() {
         gpui.join("settings/preferences.rs"),
     ];
     files.extend(kit_ui.iter().cloned());
+    files.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/docker_accounts.rs"));
     assert!(files.len() >= 20, "the scan found {files:?}");
     for must in [
         "kit.rs",

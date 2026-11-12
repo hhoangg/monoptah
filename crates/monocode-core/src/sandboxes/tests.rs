@@ -629,3 +629,28 @@ fn run_survives_large_stdin_and_stdout_without_deadlock() {
     assert!(out.success);
     assert_eq!(out.stdout.len(), text.len());
 }
+
+#[test]
+fn redaction_masks_jwts_and_oat_tokens() {
+    let jwt = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.c2ln-nature_1";
+    for (input, secret) in [
+        (format!("token {jwt} rejected"), jwt),
+        (format!("DOCKER_ACCESS_TOKEN was {jwt}."), jwt),
+        (format!("(\"{jwt}\")"), jwt),
+        (
+            "bad dckr_oat_abc123XYZ here".to_string(),
+            "dckr_oat_abc123XYZ",
+        ),
+    ] {
+        let out = redact(&input);
+        assert!(!out.contains(secret), "{input} -> {out}");
+        assert!(out.contains("[redacted]"), "{input} -> {out}");
+    }
+    assert_eq!(
+        redact(&format!("sentence ends {jwt}.")),
+        "sentence ends [redacted]."
+    );
+    // Not JWT-shaped: untouched.
+    assert_eq!(redact("eyJhbGci.only-two"), "eyJhbGci.only-two");
+    assert_eq!(redact("version 1.2.3 ready"), "version 1.2.3 ready");
+}

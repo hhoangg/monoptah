@@ -178,6 +178,8 @@ impl Store {
             .map_err(|e| e.to_string())?;
         conn.execute_batch(crate::git_credentials::GIT_CREDENTIALS_TABLE)
             .map_err(|e| e.to_string())?;
+        conn.execute_batch(crate::docker_accounts::DOCKER_ACCOUNTS_TABLE)
+            .map_err(|e| e.to_string())?;
         conn.execute_batch(crate::mobile::identity_store::MOBILE_IDENTITY_TABLE)
             .map_err(|e| e.to_string())?;
         if let Some(dir) = path.parent() {

@@ -182,7 +182,7 @@ fn args(parts: &[&str]) -> Vec<String> {
 /// tokens, JSON `token`/`password` values, `KEY=value` secrets and known token prefixes
 /// anywhere inside a word.
 pub fn redact(text: &str) -> String {
-    const PREFIXES: [&str; 9] = [
+    const PREFIXES: [&str; 10] = [
         "github_pat_",
         "ghp_",
         "gho_",
@@ -191,6 +191,7 @@ pub fn redact(text: &str) -> String {
         "glpat-",
         "sk-ant-",
         "dckr_pat_",
+        "dckr_oat_",
         "xoxb-",
     ];
     const SECRET_KEYS: [&str; 5] = ["TOKEN", "SECRET", "PASSWORD", "API_KEY", "PASSWD"];
@@ -279,8 +280,30 @@ pub fn redact(text: &str) -> String {
                 w.replace_range(i..end, MASK);
             }
         }
+        mask_jwts(&mut w);
         w
     })
+}
+
+/// Mask JWT-shaped runs inside `word`: three dot-separated base64url parts, the first
+/// starting with `eyJ` (a JSON header).
+fn mask_jwts(word: &mut String) {
+    let is_part = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-');
+    let mut from = 0;
+    while let Some(found) = word[from..].find("eyJ") {
+        let start = from + found;
+        let end = word[start..]
+            .find(|c: char| !is_part(c) && c != '.')
+            .map_or(word.len(), |e| start + e);
+        let run = word[start..end].trim_end_matches('.');
+        let parts: Vec<&str> = run.split('.').collect();
+        if parts.len() == 3 && parts.iter().all(|p| !p.is_empty()) {
+            word.replace_range(start..start + run.len(), "[redacted]");
+            from = start + "[redacted]".len();
+        } else {
+            from = start + 3;
+        }
+    }
 }
 
 /// Start/length of the first `"<key containing a secret word>"` in `lower`.
