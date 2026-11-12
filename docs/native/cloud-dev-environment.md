@@ -52,6 +52,10 @@ verified GPUI-test setup.
   dbus, ...), `gh`, and Rust `RUST_VERSION` (pinned, `rustfmt` + `clippy`; rustup-init is
   checked against its published sha256). CI uses `stable`; bump the pin when you bump CI.
 - Node 22 through the devcontainer node feature (for `npm run native:test:dev`).
+- An SSH server through the devcontainer sshd feature (`ghcr.io/devcontainers/features/sshd:1`,
+  pinned in `devcontainer-lock.json`). Required: the app reaches a codespace only through
+  `gh codespace ssh`, and without it a Codespaces start fails at "connect". Do not remove it.
+  Docker Sandboxes do not use it. No password is set and no port is forwarded.
 - `onCreateCommand` runs `scripts/native-dev-doctor.sh --quiet`: blocking, installs nothing,
   fails the build if anything is missing. `postCreateCommand` runs `cargo fetch --locked`
   in the background-safe slot; it never fails the session. Both are idempotent.
