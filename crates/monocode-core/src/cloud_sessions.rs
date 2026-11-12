@@ -157,6 +157,32 @@ pub fn split_created_note(error: &str) -> Option<(&str, CloudBackendKind, &str)>
     })
 }
 
+/// The dev container feature that installs an SSH server, which a codespace needs so the app
+/// can connect to it.
+pub const SSHD_FEATURE: &str = "ghcr.io/devcontainers/features/sshd:1";
+/// GitHub's page on connecting to a codespace over SSH, which explains the requirement.
+pub const SSHD_DOCS_URL: &str = "https://docs.github.com/en/codespaces/developing-in-a-codespace/using-github-codespaces-with-github-cli#ssh-into-a-codespace";
+
+/// Whether a start error says the codespace has no SSH server: `gh codespace ssh` fails with
+/// "failed to start SSH server: Please check if an SSH server is installed in the container."
+/// when the dev container does not install one. The bare "failed to start SSH server" prefix
+/// is not enough: an installed sshd that fails for another reason gives it too, and a rebuild
+/// with the feature would not help.
+pub fn is_missing_ssh_server(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("ssh server") && error.contains("is installed in the container")
+}
+
+/// What to do about a start error, when the app recognises it. Only the missing SSH server
+/// is recognised, the usual cause of a codespace failing at "connect".
+pub fn start_error_hint(error: &str) -> Option<String> {
+    is_missing_ssh_server(error).then(|| {
+        format!(
+            "This codespace has no SSH server, which the app needs to connect. Add the \"{SSHD_FEATURE}\": {{}} feature to the repository's devcontainer.json, then use Rebuild container."
+        )
+    })
+}
+
 /// Error text of a start that was cancelled or whose session disappeared. Not a failure: no
 /// `Failed` event accompanies it.
 pub const START_ABORTED: &str = "The cloud session start was cancelled.";
@@ -1300,6 +1326,27 @@ impl CloudSessions {
         self.store()
             .and_then(|s| s.codespace_origins())
             .unwrap_or_default()
+    }
+
+    /// Ids of the sessions bound to `cloud`, read before a delete forgets them so the app can
+    /// drop them from its window. The Host record behind a local session moved to `cloud` is
+    /// left out: it is never listed as a session of its own, and the local session stays.
+    pub fn session_ids_on(&self, cloud: &CloudRef) -> Vec<i64> {
+        let Ok(store) = self.store() else {
+            return vec![];
+        };
+        store
+            .cloud_session_ids(cloud)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|&id| {
+                store
+                    .remote_session(id)
+                    .ok()
+                    .flatten()
+                    .is_none_or(|record| !store.host_record_is_hidden(&record))
+            })
+            .collect()
     }
 
     /// What deleting `codespace` would lose, as recorded when its sessions were saved.

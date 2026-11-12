@@ -2049,6 +2049,25 @@ impl Shell {
         }
     }
 
+    /// After an app `cloud.delete`: drops the sessions the store forgot, by id (a session the
+    /// window holds without a cloud mark, like a Mono's hidden launch, too) and by mark.
+    pub(crate) fn forget_deleted_cloud(
+        &mut self,
+        target: &CloudRef,
+        ids: &[i64],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // As the app's own delete does: the instance no longer exists.
+        self.cloud_gone.insert(target.key());
+        for &id in ids {
+            self.forget_cloud_row(id, window, cx);
+        }
+        self.forget_codespace_sessions(target, window, cx);
+        self.invalidate_chrome(cx);
+        cx.notify();
+    }
+
     /// Drops one cloud session from the window; its record is gone from the store already.
     pub(super) fn forget_cloud_row(
         &mut self,

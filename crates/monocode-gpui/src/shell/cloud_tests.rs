@@ -2409,6 +2409,20 @@ fn restart_resumes_a_running_start_and_only_shows_a_failed_one(cx: &mut TestAppC
             assert!(fresh.read(cx).session_summaries[&running.id].has_messages);
             assert!(fresh.read(cx).session_summaries[&failed.id].has_messages);
             assert!(fresh.read(cx).cloud_start_snapshot(failed.id).is_some());
+            // A Mono's Sub-agents panel reads the failed start from the restarted shell's
+            // tracked starts: the session has no live view there.
+            assert!(!fresh.read(cx).sessions.contains_key(&failed.id));
+            let failed_of = |id: i64| {
+                fresh
+                    .read(cx)
+                    .mono_session_views(cx)
+                    .into_iter()
+                    .find(|v| v.id == id)
+                    .unwrap()
+                    .start_failed
+            };
+            assert!(failed_of(failed.id), "a failed start survives the restart");
+            assert!(!failed_of(running.id));
             let before = gh.calls().len();
             shell.resume_cloud_starts(cx);
             let resumed = shell.cloud_start_snapshot(running.id).unwrap();

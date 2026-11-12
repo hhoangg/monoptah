@@ -144,6 +144,14 @@ impl Shell {
         }
     }
 
+    /// The tracked start of session `id` failed and waits for Retry. Read from the shell's
+    /// starts, so it holds after a restart and for a launch that has no view.
+    pub(super) fn cloud_start_failed(&self, id: i64) -> bool {
+        self.cloud_starts
+            .get(&id)
+            .is_some_and(|start| start.phase() == StartPhase::Failed)
+    }
+
     /// Forgets a session's startup and stops its worker (the session was deleted).
     pub(super) fn drop_cloud_start(&mut self, id: i64) {
         if let Some(view) = self.cloud_starts.remove(&id) {

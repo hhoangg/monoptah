@@ -190,6 +190,8 @@ pub(super) fn outlined<E: Styled + InteractiveElement>(element: E) -> E {
 enum AgentState {
     Working,
     NeedsInput,
+    /// The cloud workspace failed to start.
+    StartFailed,
     Idle(u64),
     Unavailable,
 }
@@ -223,6 +225,7 @@ fn sub_agent_card(agent: SubAgent) -> Stateful<Div> {
     let (label, color, live): (String, gpui::Hsla, bool) = match agent.state {
         AgentState::Working => ("Working".into(), accent_color(), true),
         AgentState::NeedsInput => ("Needs approval".into(), amber, true),
+        AgentState::StartFailed => ("Failed to start".into(), danger_color(), false),
         AgentState::Idle(at) => (
             monocode_core::time::relative(at, monocode_core::time::now_ms()),
             content(0.45),
@@ -1281,6 +1284,7 @@ impl Monos {
                         branch: branch.is_some(),
                         state: match state {
                             Some(s) if s.needs_input => AgentState::NeedsInput,
+                            Some(s) if s.start_failed => AgentState::StartFailed,
                             Some(s) if s.busy => AgentState::Working,
                             Some(s) => AgentState::Idle(s.updated_at),
                             None => AgentState::Unavailable,

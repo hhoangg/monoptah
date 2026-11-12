@@ -180,6 +180,7 @@ mod tests {
             archived: false,
             updated_at: monocode_core::time::now_ms(),
             needs_input: false,
+            start_failed: false,
             branch: None,
             model: Default::default(),
             cloud,

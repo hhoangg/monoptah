@@ -1,5 +1,5 @@
 //! Mono dispatch of the `cloud.*` actions and of cloud sessions, for codespaces and sandboxes.
-use super::tests::{Setup, call, call_from, fake_run, launches_of, setup, setup_with};
+use super::tests::{Setup, call, call_from, fake_run, launch_of, launches_of, setup, setup_with};
 use crate::cloud_wake::fakes::{
     AUTH_OK, FakeHost, Gh, SANDBOX, Sbx, install, install_with_sandbox, sandbox_session, serial,
 };
@@ -1203,4 +1203,200 @@ fn a_cloud_sub_agent_row_shows_the_cloud_badge_and_a_local_one_does_not(cx: &mut
     let cloud_badge = row_of(badge(cloud)).expect("the cloud row carries the cloud badge");
     assert!(cloud_row.contains(&cloud_badge.center()));
     assert!(row_of(badge(local)).is_none());
+}
+
+#[gpui::test]
+fn deleting_a_codespace_drops_its_sessions_from_the_window_and_the_sub_agents_panel(
+    cx: &mut TestAppContext,
+) {
+    let (s, _gh, _host, _guard) = cloud_setup(cx, "Available");
+    let id = cloud_session(&s, cx);
+    cx.update(|cx| {
+        s.manager.update(cx, |m, _| {
+            let mono = m.roster.get_mut(&s.id).unwrap();
+            let cwd = mono.projects[0].clone();
+            mono.launches.push(launch_of(id, &cwd));
+        })
+    });
+    let views = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            s.manager
+                .read(cx)
+                .owner
+                .upgrade()
+                .unwrap()
+                .read(cx)
+                .mono_session_views(cx)
+                .iter()
+                .map(|v| v.id)
+                .collect::<Vec<_>>()
+        })
+    };
+    assert!(views(cx).contains(&id), "shown before the delete");
+    let deleted = run(
+        &s,
+        "d1",
+        "cloud.delete",
+        json!({"kind":"codespace","instance":"octo-run"}),
+        cx,
+    )
+    .unwrap();
+    assert_eq!(deleted["deleted"], true, "{deleted}");
+    assert_eq!(deleted["removedSessionIds"], json!([id]), "{deleted}");
+    cx.run_until_parked();
+    assert!(
+        !views(cx).contains(&id),
+        "the panel reads these views: the deleted session is gone"
+    );
+    let launch = launches_of(&s, cx)
+        .into_iter()
+        .find(|l| l.session_id == id)
+        .unwrap();
+    assert!(
+        launch.dismissed,
+        "its launch is dismissed like a deleted session's"
+    );
+}
+
+#[gpui::test]
+fn deleting_a_codespace_keeps_a_session_moved_there_from_local_and_its_launch(
+    cx: &mut TestAppContext,
+) {
+    use monocode_core::cloud_sessions::{CloudBackendKind, CloudRef};
+    use monocode_core::mono::cloud_api::{CloudTarget, InstanceChoice};
+    use monocode_core::store::{CloudLocation, SessionLocation};
+    let (s, _gh, _host, _guard) = cloud_setup(cx, "Available");
+    let api = monocode_core::mono::cloud_api::CloudApi::shared(&s.store).unwrap();
+    let binding = api
+        .prepare(
+            &s.project,
+            CloudTarget::new(
+                CloudBackendKind::Codespaces,
+                InstanceChoice::Named("octo-run".into()),
+            ),
+            &mut |_| {},
+        )
+        .unwrap();
+    // A session born in the codespace, and the Host record behind a local session moved there.
+    let born = api.create_session(&binding, "claude").unwrap();
+    let backing = api.create_session(&binding, "claude").unwrap();
+    let local = {
+        let mut store = locked(&s.store).unwrap();
+        let local = store.create("claude", &s.project).unwrap();
+        let rows: Vec<monocode_core::transcript::Row> = (0..4)
+            .map(|i| monocode_core::transcript::Row {
+                role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+                text: format!("row {i}"),
+                first: true,
+                sent_at: None,
+            })
+            .collect();
+        store.write_rows(local.id, 0, &rows).unwrap();
+        store
+            .set_cloud_location(
+                local.id,
+                &SessionLocation::Cloud(CloudLocation {
+                    cloud: CloudRef::codespace("octo-run"),
+                    environment_id: binding.project_key.clone(),
+                    project_id: String::new(),
+                    host_session_id: "host-1".into(),
+                    remote_cwd: binding.remote_cwd.clone(),
+                    local_cwd: s.project.clone(),
+                    moved_at_row: 4,
+                    pushed_branch: None,
+                }),
+            )
+            .unwrap();
+        store
+            .link_remote_session(backing.id, Some(local.id))
+            .unwrap();
+        local
+    };
+    let (born, local) = (show(&s, born, cx), show(&s, local, cx));
+    let owner = cx.update(|cx| s.manager.read(cx).owner.upgrade().unwrap());
+    cx.update(|cx| owner.update(cx, |o, cx| o.mono_refresh_cloud(cx)));
+    cx.run_until_parked();
+    cx.update(|cx| {
+        s.manager.update(cx, |m, _| {
+            let mono = m.roster.get_mut(&s.id).unwrap();
+            let cwd = mono.projects[0].clone();
+            mono.launches.push(launch_of(born, &cwd));
+            mono.launches.push(launch_of(local, &cwd));
+        })
+    });
+    let views = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            owner
+                .read(cx)
+                .mono_session_views(cx)
+                .iter()
+                .map(|v| (v.id, v.cloud))
+                .collect::<Vec<_>>()
+        })
+    };
+    let before = views(cx);
+    assert!(before.contains(&(born, true)), "{before:?}");
+    assert!(
+        before.contains(&(local, true)),
+        "the moved session is a cloud row before the delete: {before:?}"
+    );
+    let deleted = run(
+        &s,
+        "d1",
+        "cloud.delete",
+        json!({"kind":"codespace","instance":"octo-run"}),
+        cx,
+    )
+    .unwrap();
+    assert_eq!(deleted["deleted"], true, "{deleted}");
+    // Only the born session: not the hidden Host record (never listed) nor the local session.
+    assert_eq!(deleted["removedSessionIds"], json!([born]), "{deleted}");
+    cx.run_until_parked();
+    let after: Vec<i64> = views(cx).into_iter().map(|(id, _)| id).collect();
+    assert!(!after.contains(&born), "{after:?}");
+    assert!(after.contains(&local), "the moved session stays: {after:?}");
+    let launches = launches_of(&s, cx);
+    let dismissed = |id: i64| {
+        launches
+            .iter()
+            .find(|l| l.session_id == id)
+            .unwrap()
+            .dismissed
+    };
+    assert!(dismissed(born));
+    assert!(
+        !dismissed(local),
+        "the moved session's launch is kept in the Sub-agents panel"
+    );
+    // The store kept it too, with its rows.
+    let store = locked(&s.store).unwrap();
+    assert!(store.sessions().unwrap().iter().any(|x| x.id == local));
+    assert_eq!(store.load(local).unwrap().rows.len(), 4);
+}
+
+#[gpui::test]
+fn a_session_whose_codespace_failed_to_start_is_not_working(cx: &mut TestAppContext) {
+    use crate::cloud_start_view::fixtures::{failed, starting};
+    let (s, _gh, _host, _guard) = cloud_setup(cx, "Available");
+    let id = cloud_session(&s, cx);
+    let owner = cx.update(|cx| s.manager.read(cx).owner.upgrade().unwrap());
+    let view = cx
+        .update(|cx| owner.update(cx, |o, cx| o.mono_ensure_session(id, cx)))
+        .unwrap();
+    let state = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            let views = owner.read(cx).mono_session_views(cx);
+            let v = views.iter().find(|v| v.id == id).unwrap();
+            (v.busy, v.start_failed)
+        })
+    };
+    cx.update(|cx| view.update(cx, |v, cx| v.set_cloud_start(Some(starting(2)), cx)));
+    assert_eq!(state(cx), (true, false), "a running start is working");
+    let error = "SSH setup failed: failed to start SSH server";
+    cx.update(|cx| view.update(cx, |v, cx| v.set_cloud_start(Some(failed(5, error)), cx)));
+    assert_eq!(
+        state(cx),
+        (false, true),
+        "a failed start waits for Retry: not working, shown as failed"
+    );
 }

@@ -371,6 +371,19 @@ impl Render for CodespacePane {
                     .flex_col()
                     .pb_3()
                     .child(meta)
+                    .when_some(start.fix_hint(), |d, hint| {
+                        d.child(
+                            div()
+                                .id("codespace-fix-hint")
+                                .debug_selector(|| "codespace-fix-hint".into())
+                                .px_3()
+                                .pt_2()
+                                .text_size(px(12.))
+                                .line_height(px(17.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(hint),
+                        )
+                    })
                     .when_some(start.error().map(str::to_owned), |d, error| {
                         d.child(
                             div()
@@ -415,7 +428,20 @@ impl Render for CodespacePane {
                                     StartAction::DeleteCodespace,
                                     true,
                                     cx,
-                                )),
+                                ))
+                                .when_some(start.help_url(), |d, url| {
+                                    d.child(
+                                        secondary_button(
+                                            "codespace-help",
+                                            "How to fix",
+                                            false,
+                                            false,
+                                        )
+                                        .debug_selector(|| "codespace-help".into())
+                                        .child("How to fix")
+                                        .on_click(move |_, _, cx| cx.open_url(url)),
+                                    )
+                                }),
                         )
                     })
                     .child(Self::section("Phases"))

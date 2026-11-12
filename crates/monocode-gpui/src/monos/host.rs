@@ -18,6 +18,8 @@ pub(super) enum Effect {
     Card(Value),
     None,
     Start(Box<Started>),
+    /// `cloud.delete` removed an instance and these sessions with it.
+    CloudDeleted(monocode_core::cloud_sessions::CloudRef, Vec<i64>),
 }
 pub(super) struct Started {
     pub(super) summary: Session,
@@ -264,6 +266,37 @@ pub(super) fn delete_reply(
     }
 }
 impl Monos {
+    /// After `cloud.delete`: the sessions on the deleted instance are gone from the store, so
+    /// their launches are dismissed and the window forgets them, or the Sub-agents panel keeps
+    /// showing them (as working, when their start never finished).
+    pub(super) fn forget_deleted_cloud(
+        &mut self,
+        cloud: monocode_core::cloud_sessions::CloudRef,
+        ids: Vec<i64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for m in &mut self.roster.monos {
+            for launch in &mut m.launches {
+                if ids.contains(&launch.session_id) {
+                    launch.dismissed = true;
+                }
+            }
+        }
+        self.save(cx);
+        let owner = self.owner.clone();
+        let handle = window.window_handle();
+        let app: &mut App = cx;
+        // Deferred like the other removals, to stay clear of the entities being updated now.
+        app.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, cx| {
+                let _ = owner.update(cx, |owner, cx| {
+                    owner.forget_deleted_cloud(&cloud, &ids, window, cx)
+                });
+            });
+        });
+        cx.notify();
+    }
     fn app_caller(&self, call: &Call) -> Result<Mono, String> {
         let mono = self
             .roster
@@ -578,6 +611,9 @@ impl Monos {
                         Effect::Card(value) => {
                             this.hold_card(call.session, &mono_id, value);
                             this.save(cx);
+                        }
+                        Effect::CloudDeleted(cloud, ids) => {
+                            this.forget_deleted_cloud(cloud, ids, window, cx);
                         }
                         Effect::Start(started) => {
                             this.apply_started(
@@ -1104,7 +1140,11 @@ impl Monos {
                     move |store| {
                         let value =
                             crate::cloud_actions::run(&store, &action, &project, &input, &busy)?;
-                        Ok((value, Effect::None))
+                        let effect = crate::cloud_actions::deleted(&action, &value)
+                            .map_or(Effect::None, |(cloud, ids)| {
+                                Effect::CloudDeleted(cloud, ids)
+                            });
+                        Ok((value, effect))
                     },
                     cx,
                 );

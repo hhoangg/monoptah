@@ -1435,3 +1435,23 @@ fn deleting_the_workspace_keeps_a_located_session_and_does_not_convert_its_host_
         .unwrap()
         .is_empty());
 }
+
+#[test]
+fn a_missing_ssh_server_is_recognised_with_its_fix() {
+    let gh = "SSH setup failed: error getting ssh server details: failed to start SSH server: Please check if an SSH server is installed in the container.";
+    assert!(is_missing_ssh_server(gh));
+    assert!(is_missing_ssh_server(&created_note("cs-1", gh)));
+    let hint = start_error_hint(gh).unwrap();
+    assert!(hint.contains(SSHD_FEATURE), "{hint}");
+    assert!(hint.contains("devcontainer.json"), "{hint}");
+    for other in [
+        "SSH setup timed out. Check the host's network connection and try again.",
+        "cargo fetch exited with code 101",
+        // sshd is installed but fails for another reason: adding the feature would not help.
+        "SSH setup failed: error getting ssh server details: failed to start SSH server: exit status 255",
+        "",
+    ] {
+        assert!(!is_missing_ssh_server(other), "{other}");
+        assert_eq!(start_error_hint(other), None, "{other}");
+    }
+}

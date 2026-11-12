@@ -727,8 +727,11 @@ impl CloudApi {
                 unsaved.join(" ")
             ));
         }
+        let removed = self.cloud.session_ids_on(cloud);
         let outcome = self.cloud.delete_cloud_outcome(cloud)?;
         let mut result = self.outcome(cloud, "deleted", &sessions);
+        // The sessions the delete removed, so the app drops them from its window and panels.
+        result["removedSessionIds"] = json!(removed);
         if let DeleteOutcome::DeletedWithWarning(error) = outcome {
             result["warning"] = json!(format!(
                 "Deleted, but disconnecting its machine failed: {error}"

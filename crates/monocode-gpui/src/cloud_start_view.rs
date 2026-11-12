@@ -163,16 +163,34 @@ impl CloudStartSnapshot {
         }
     }
 
-    /// The text of the failure box: the reason, then why a retry is safe.
+    /// The text of the failure box: the reason, then why a retry is safe. A failure the app
+    /// recognises (a codespace without an SSH server) is told as what to change instead of the
+    /// raw `gh` output, which stays in the log.
     pub(crate) fn failure_message(&self) -> String {
         let reason = self
-            .short_error()
-            .filter(|reason| !reason.is_empty())
+            .fix_hint()
+            .or_else(|| self.short_error().filter(|reason| !reason.is_empty()))
             .unwrap_or_else(|| format!("The {} failed to start.", self.noun()));
         format!(
             "{reason} The {} is kept, so a retry reuses it.",
             self.noun()
         )
+    }
+
+    /// What to change for a failure the app recognises, see
+    /// [`monocode_core::cloud_sessions::start_error_hint`].
+    pub(crate) fn fix_hint(&self) -> Option<String> {
+        if self.phase != StartPhase::Failed {
+            return None;
+        }
+        self.error()
+            .and_then(monocode_core::cloud_sessions::start_error_hint)
+    }
+
+    /// The page that explains [`Self::fix_hint`], offered as a button next to Retry.
+    pub(crate) fn help_url(&self) -> Option<&'static str> {
+        self.fix_hint()
+            .map(|_| monocode_core::cloud_sessions::SSHD_DOCS_URL)
     }
 
     /// The label of the button that deletes the workspace.
@@ -551,5 +569,27 @@ mod tests {
         step.started_at = Some(1000);
         assert_eq!(step_ms(&step, 90_000_000), None);
         assert_eq!(step_ms(&step, 31_000), Some(30_000));
+    }
+
+    #[test]
+    fn a_codespace_without_ssh_server_says_how_to_fix_it() {
+        let error = "SSH setup failed: error getting ssh server details: failed to start SSH server: Please check if an SSH server is installed in the container.";
+        let start = failed(5, error);
+        let message = start.failure_message();
+        assert!(
+            message.contains("ghcr.io/devcontainers/features/sshd:1"),
+            "{message}"
+        );
+        assert!(message.ends_with("The codespace is kept, so a retry reuses it."));
+        assert!(
+            !message.contains("error getting ssh server details"),
+            "{message}"
+        );
+        assert_eq!(
+            start.help_url(),
+            Some(monocode_core::cloud_sessions::SSHD_DOCS_URL)
+        );
+        assert!(start.offers_rebuild(), "Rebuild stays offered");
+        assert_eq!(failed(2, "cargo fetch failed").help_url(), None);
     }
 }
