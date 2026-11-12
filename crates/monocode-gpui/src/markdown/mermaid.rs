@@ -637,10 +637,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        not(target_os = "macos"),
-        ignore = "mermaid-rs-renderer 0.3.1 fails its own debug-only flowchart stage_validation assert (final_layout_errors: 5) on the 8x8x8 grouped chain (24 nodes, 128 edges) on Linux x86_64 and aarch64; its layout differs from macOS, and release builds skip the assert"
-    )]
     fn grouped_endpoint_expansion_is_rejected_before_parsing() {
         let group = |prefix: &str, count: usize| {
             (0..count)
@@ -703,16 +699,31 @@ mod tests {
         // Small Cartesian groups, chains, and linear fanout remain usable.
         for source in [
             "graph TD; A & B --> C & D".to_owned(),
-            format!(
-                "graph TD; {} --> {} --> {}",
-                group("A", 8),
-                group("B", 8),
-                group("C", 8)
-            ),
             format!("graph TD; {} --> Z", group("A", 16)),
         ] {
             assert!(diagram_svg(&source, false).is_ok(), "{source}");
         }
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "mermaid-rs-renderer 0.3.1 fails its own debug-only flowchart stage_validation assert (final_layout_errors: 5) on the 8x8x8 grouped chain (24 nodes, 128 edges) on Linux x86_64 and aarch64; its layout differs from macOS, and release builds skip the assert"
+    )]
+    fn a_small_grouped_chain_remains_usable() {
+        let group = |prefix: &str, count: usize| {
+            (0..count)
+                .map(|ix| format!("{prefix}{ix}"))
+                .collect::<Vec<_>>()
+                .join(" & ")
+        };
+        let source = format!(
+            "graph TD; {} --> {} --> {}",
+            group("A", 8),
+            group("B", 8),
+            group("C", 8)
+        );
+        assert!(diagram_svg(&source, false).is_ok(), "{source}");
     }
 
     #[test]

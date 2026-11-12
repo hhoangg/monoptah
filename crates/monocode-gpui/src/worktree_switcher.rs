@@ -790,7 +790,7 @@ mod tests {
                 branch: None
             })]
         );
-        visual.simulate_keystrokes("cmd-a");
+        visual.simulate_keystrokes("secondary-a");
         visual.simulate_input("new-copy");
         visual.run_until_parked();
         assert!(visual.debug_bounds("create-sidebar-worktree").is_some());

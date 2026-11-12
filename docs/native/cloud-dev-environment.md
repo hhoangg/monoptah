@@ -64,27 +64,18 @@ From the repository root, inside the container:
 scripts/native-dev-doctor.sh      # toolchain and library diagnostics
 M=crates/monocode-gpui/Cargo.toml
 cargo fmt --manifest-path $M --all --check
-cargo clippy --locked --manifest-path $M -p monocode-core --all-targets --profile native-dev -- -D warnings
+cargo clippy --locked --manifest-path $M -p monocode-core -p monocode-gpui --all-targets --profile native-dev -- -D warnings
 cargo test   --locked --manifest-path $M -p monocode-core --profile native-dev
-cargo check  --locked --manifest-path $M -p monocode-core -p monocode-gpui --all-targets --profile native-dev
+cargo test   --locked --manifest-path $M -p monocode-gpui --profile native-dev -- --test-threads=1
 ```
 
-These are what `native.yml` runs for Linux. GPUI is supported on Linux by the source (X11 and
-Wayland features, `vendor/gpui-pre-linux`), so it builds here, but it is not fully green:
-
-| Check (Linux aarch64, 4 CPUs / 8g) | Result |
-| --- | --- |
-| core fmt, clippy `-D warnings`, `cargo check` GPUI `--all-targets` | pass |
-| core tests | pass (4199 tests; 3 `docker_start_tests::scripts` need a real clone, see worktrees) |
-| `npm run native:test:dev` (after `npm ci`) | 80 pass, 2 skipped |
-| GPUI `clippy -D warnings` | **fails**: unused/dead code that is only used on macOS (`native.yml` says the same) |
-| GPUI tests | 3339 pass, 23 fail deterministically (terminal dock, panes, settings, quit gate, ...), at least some because tests press macOS `cmd-` shortcuts. Not triaged one by one |
-
-This was measured before the macOS-only code was gated, so those results are historical:
-GPUI clippy `-D warnings` now passes on Linux and runs in `native.yml` on CI, together with the
-GPUI tests. Only clippy of the macOS-only code (`npm run native:check:mac`) and tests gated to
-macOS stay Mac-only, and `npm run native:check` still runs in full before every release. Do not
-report macOS-only checks as passing from a Linux session. The GPUI test binary needs an 8g sandbox even at 1 job (see Resources). Anything needing a Metal device, a display or the real macOS app (`native:dev`,
+Core fmt/clippy/tests are what the `native.yml` core job runs on Linux. For GPUI, `native.yml`
+runs fmt, clippy `-D warnings` (`-p monocode-core -p monocode-gpui --all-targets`) and the GPUI
+tests (`-p monocode-gpui -- --test-threads=1`) on Linux; Windows keeps a `cargo check`. GPUI is
+supported on Linux by the source (X11 and Wayland features, `vendor/gpui-pre-linux`). Tests gated
+to macOS and clippy of the macOS-only code (`npm run native:check:mac`) stay Mac-only, and
+`npm run native:check` still runs in full before every release. Do not report macOS-only checks
+as passing from a Linux session. The GPUI test binary needs an 8g sandbox even at 1 job (see Resources). Anything needing a Metal device, a display or the real macOS app (`native:dev`,
 `native:build`, packaging, `native:release:mac`) is Mac-only.
 
 ## Linked git worktrees
