@@ -186,6 +186,14 @@ pub(crate) fn launch(
         })
         .unwrap_or_default();
     let harness = view.map(|v| v.harness.clone()).unwrap_or_default();
+    let cloud = view.and_then(|v| v.cloud.as_ref()).map(|badge| {
+        crate::cloud_mark::badge(
+            ("mono-launch-card-cloud", id as usize),
+            format!("mono-launch-card-cloud-{id}"),
+            badge,
+            true,
+        )
+    });
     div()
         .flex()
         .child(
@@ -200,6 +208,7 @@ pub(crate) fn launch(
                 .pl_3()
                 .pr(px(6.))
                 .child(mark)
+                .children(cloud)
                 .child(
                     div()
                         .min_w_0()
@@ -261,6 +270,7 @@ pub(crate) fn render(
                     },
                     harness: value["harness"].as_str().unwrap_or_default().into(),
                     cwd: value["cwd"].as_str().unwrap_or_default().into(),
+                    cloud: None,
                 });
             return launch(id, view.as_ref(), cx);
         }
@@ -396,6 +406,7 @@ pub(crate) fn launch_views(
                         state: launched_state(session, cx),
                         harness: session.summary.provider.clone(),
                         cwd: session.summary.cwd.clone(),
+                        cloud: owner.cloud_badge_of(launch.session_id),
                     }
                 }
                 None => {
@@ -419,6 +430,7 @@ pub(crate) fn launch_views(
                         cwd: summary
                             .map(|s| s.cwd.clone())
                             .unwrap_or_else(|| launch.cwd.clone()),
+                        cloud: owner.cloud_badge_of(launch.session_id),
                     }
                 }
             };

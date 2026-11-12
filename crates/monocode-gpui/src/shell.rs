@@ -1680,6 +1680,7 @@ impl Shell {
             view.transcript.update(cx, |transcript, cx| {
                 transcript.apply_preferences(&self.workspace.preferences, cx)
             });
+            view.set_cloud_badge(self.cloud_badge_of(id), cx);
             if let Some(start) = self.cloud_start_snapshot(id) {
                 view.set_cloud_start(Some(start), cx);
             }
@@ -2781,6 +2782,14 @@ impl Shell {
                     .rounded_full()
                     .when(focused, |d| d.bg(accent_color())),
             )
+            .children(self.cloud_badge_of(id).map(|badge| {
+                crate::cloud_mark::badge(
+                    ("split-cloud-mark", id as usize),
+                    format!("split-cloud-mark-{id}"),
+                    &badge,
+                    true,
+                )
+            }))
             .child(
                 div()
                     .min_w_0()
@@ -6639,9 +6648,7 @@ impl Shell {
             mark.update(cx, |mark, cx| mark.set_size(side, cx));
         }
         let work_item = self.work_item_badge(id, compact, cx);
-        let cloud_badge = self.cloud_badge(id, compact);
         let has_badges = work_item.is_some()
-            || cloud_badge.is_some()
             || mode.is_some()
             || self.automation_state.session_automations.contains_key(&id);
         let session = self.session_metadata(id, cx);
@@ -6802,7 +6809,6 @@ impl Shell {
             .items_center()
             .gap_1()
             .flex_shrink_0()
-            .children(cloud_badge)
             .children(work_item)
             .when(
                 self.automation_state.session_automations.contains_key(&id),
@@ -6824,6 +6830,8 @@ impl Shell {
                 )
             });
         let suffix = self.session_suffix(id, &session, compact, cx);
+        // The cloud mark sits beside the title, never with the badges on the right.
+        let cloud_mark = self.cloud_badge(id, true);
         let body = if compact {
             div()
                 .w_full()
@@ -6831,6 +6839,7 @@ impl Shell {
                 .items_center()
                 .gap(px(if nested { 6. } else { 8. }))
                 .child(mark)
+                .children(cloud_mark)
                 .child(title)
                 .when(has_badges, |d| d.child(badges))
                 .child(suffix)
@@ -6851,6 +6860,7 @@ impl Shell {
                         .when(pinned, |d| {
                             d.child(icon("pin", 12.).text_color(content(0.45)))
                         })
+                        .children(cloud_mark)
                         .child(title)
                         .child(suffix),
                 )
@@ -7904,7 +7914,25 @@ impl Shell {
         hovered: bool,
     ) -> AnyElement {
         const LINE: f32 = 20.;
-        let line = |pane: &TabPane, top: f32, opacity: f32| {
+        let line = |pane: &TabPane, top: f32, opacity: f32, leaving: bool| {
+            // A chat that runs in the cloud says so before its title; its file side does not.
+            let (pane_id, file_side) = pane.key;
+            let cloud = matches!(pane.mark, PaneMark::Session(..))
+                .then(|| self.cloud_badge_of(pane_id))
+                .flatten()
+                .filter(|_| !file_side)
+                .map(|badge| {
+                    crate::cloud_mark::badge(
+                        SharedString::from(format!("tab-cloud-mark-{pane_id}-{leaving}")),
+                        if leaving {
+                            format!("title-tab-cloud-mark-leaving-{pane_id}")
+                        } else {
+                            format!("title-tab-cloud-mark-{pane_id}")
+                        },
+                        &badge,
+                        true,
+                    )
+                });
             div()
                 .absolute()
                 .left_0()
@@ -7915,6 +7943,7 @@ impl Shell {
                 .flex()
                 .items_center()
                 .gap(px(6.))
+                .children(cloud)
                 .child(
                     div()
                         .flex_1()
@@ -7933,10 +7962,15 @@ impl Shell {
             .text_color(content(if active || hovered { 1. } else { 0.5 }))
             .group_hover("title-tab", |s| s.text_color(content(1.)))
             .when_some(copy.panes.get(copy.focus), |d, pane| {
-                d.child(line(pane, dir * (1. - progress) * LINE, progress.max(0.2)))
+                d.child(line(
+                    pane,
+                    dir * (1. - progress) * LINE,
+                    progress.max(0.2),
+                    false,
+                ))
             })
             .when_some(leaving.and_then(|ix| copy.panes.get(ix)), |d, pane| {
-                d.child(line(pane, -dir * progress * LINE, 1. - progress))
+                d.child(line(pane, -dir * progress * LINE, 1. - progress, true))
             })
             .into_any_element()
     }

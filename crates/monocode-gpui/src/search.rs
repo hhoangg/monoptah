@@ -37,6 +37,8 @@ pub(crate) struct Sources {
     pub logos: HashMap<String, String>,
     pub classic: bool,
     pub panel: bool,
+    /// Sessions that run in a codespace or a Docker sandbox, marked in the results.
+    pub cloud: HashMap<i64, crate::cloud_mark::CloudBadge>,
 }
 pub(crate) struct SearchView {
     pub(crate) input: Entity<Input>,
@@ -47,6 +49,7 @@ pub(crate) struct SearchView {
     projects: Vec<String>,
     recent: Vec<String>,
     logos: HashMap<String, String>,
+    cloud: HashMap<i64, crate::cloud_mark::CloudBadge>,
     classic: bool,
     original_header: Option<f32>,
     /// Floating command panel; otherwise the original full page.
@@ -128,6 +131,7 @@ impl SearchView {
             projects: sources.projects,
             recent: sources.recent,
             logos: sources.logos,
+            cloud: sources.cloud,
             classic: sources.classic,
             original_header: None,
             panel: sources.panel,
@@ -643,6 +647,23 @@ impl SearchView {
         let next = (ix + delta).rem_euclid(Scope::ALL.len() as isize) as usize;
         self.select_scope(Scope::ALL[next].0, cx);
     }
+    /// The cloud glyph of a result in a session that runs in a codespace or a Docker sandbox.
+    fn cloud_mark(&self, ix: usize, hit: &Hit) -> Option<AnyElement> {
+        let session = match hit.target {
+            Target::Conversation(id) | Target::Message { session: id, .. } => id,
+            Target::File { .. } | Target::Project(_) => return None,
+        };
+        let badge = self.cloud.get(&session)?;
+        Some(
+            crate::cloud_mark::badge(
+                ("app-search-cloud", ix),
+                format!("app-search-cloud-{ix}"),
+                badge,
+                true,
+            )
+            .into_any_element(),
+        )
+    }
     fn row(&self, ix: usize, hit: &Hit, cx: &mut Context<Self>) -> AnyElement {
         let active = self.active == ix;
         let mark = match &hit.target {
@@ -723,6 +744,7 @@ impl SearchView {
                     .justify_center()
                     .child(mark),
             )
+            .children(self.cloud_mark(ix, hit))
             .child(
                 div()
                     .min_w_0()
@@ -831,6 +853,7 @@ impl SearchView {
                             .justify_center()
                             .child(mark),
                     )
+                    .children(self.cloud_mark(ix, hit))
                     .child(div().min_w_0().flex_1().truncate().child(text))
                     .child(
                         div()

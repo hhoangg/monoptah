@@ -1013,6 +1013,21 @@ impl Conversation {
             cx.notify();
         }
     }
+    /// The shell's badge of this session's cloud workspace (`None` for a local session).
+    pub(crate) fn set_cloud_badge(
+        &mut self,
+        badge: Option<crate::cloud_mark::CloudBadge>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.cloud_badge != badge {
+            self.cloud_badge = badge;
+            cx.notify();
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn cloud_badge_for_test(&self) -> Option<&crate::cloud_mark::CloudBadge> {
+        self.cloud_badge.as_ref()
+    }
     #[cfg(test)]
     pub(crate) fn cloud_stopped_for_test(&self) -> bool {
         self.cloud_stopped

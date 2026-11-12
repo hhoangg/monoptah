@@ -73,7 +73,11 @@ impl Shell {
                     && self.cloud_states.get(&mark.key())
                         == Some(&monocode_core::cloud_sessions::CloudState::Stopped)
             });
-            view.update(cx, |view, cx| view.set_cloud_stopped(stopped, cx));
+            let badge = self.cloud_badge_of(*id);
+            view.update(cx, |view, cx| {
+                view.set_cloud_stopped(stopped, cx);
+                view.set_cloud_badge(badge, cx);
+            });
         }
     }
 

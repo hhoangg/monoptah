@@ -431,9 +431,11 @@ impl Shell {
         let Some(snapshot) = self.cloud_start_snapshot(id) else {
             return;
         };
+        let badge = self.cloud_badge_of(id);
         if let Some(conversation) = self.sessions.get(&id).cloned() {
             conversation.update(cx, |conversation, cx| {
-                conversation.set_cloud_start(Some(snapshot), cx)
+                conversation.set_cloud_start(Some(snapshot), cx);
+                conversation.set_cloud_badge(badge, cx);
             });
         }
         self.sync_codespace_pane(cx);
