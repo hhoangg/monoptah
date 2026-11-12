@@ -1,0 +1,1830 @@
+//! The project's "Cloud settings" dialog: one frame for both cloud backends (Codespaces and
+//! Docker Sandbox). A segment picks the backend shown, a Ready checklist says what is missing
+//! (with a Fix where the app can help), the Workspace rows set the repository, branch,
+//! devcontainer, size and lifetime, and the Credentials rows pick the Docker account, the
+//! Claude account and the Git credential. Both backends' unsaved edits are kept while the
+//! segment switches. Save writes both parts through `project_cloud::save`; Cancel writes
+//! nothing.
+//!
+//! Every `gh`, `sbx`, `git` and Docker Hub call runs on the background executor, and an
+//! answer is dropped when the state it was asked for has changed (a generation counter per
+//! kind of check). `model` holds what the dialog decides, `secrets` the Codespaces secrets
+//! block with the `claude setup-token` flow.
+pub(crate) mod model;
+pub(crate) mod secrets;
+#[cfg(test)]
+pub(crate) mod tests;
+
+use crate::{
+    cloud_dialog_ui::{alert, field_box, heading, labelled, muted},
+    cloud_kit_ui,
+    fix_terminal::FixCommand,
+    input::{self, Input},
+    modal,
+    runtime::{Database, locked},
+    settings::{cloud_env::CloudServices, cloud_env::Resolver, widgets::secondary_button},
+    theme::*,
+};
+use gpui::{
+    AnyElement, App, Context, Div, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
+    FontWeight, IntoElement, KeyDownEvent, Render, Role, SharedString, Stateful, Subscription,
+    Window, div, prelude::*, px, rgb,
+};
+use model::{AccountChoice, Field, FieldError, Form};
+use monocode_core::{
+    cloud_sessions::{
+        project_cloud::{self, DefaultBackend, DevcontainerInfo, ProjectCloud},
+        readiness::{self, Fix, Item, State},
+    },
+    codespaces::{self, GhRunner, MachineType},
+    docker_accounts::{DockerAccountSummary, DockerAccounts, DockerAuthError, Secret},
+    git_credentials::{GitCredentialSummary, GitCredentials, GitRunner, SystemGit},
+    sandboxes::{SbxRunner, SystemSbx},
+    store::Store,
+};
+use secrets::SecretsView;
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
+
+/// The Claude accounts that hold a setup-token or an API key: the ones a cloud session can
+/// use.
+pub(crate) fn claude_accounts(cx: &App) -> Vec<AccountChoice> {
+    use monocode_core::{accounts::ClaudeCredential, provider::Kind};
+    let Some(center) = crate::accounts::get(cx) else {
+        return Vec::new();
+    };
+    let center = center.read(cx);
+    center
+        .book
+        .list(Kind::Claude)
+        .into_iter()
+        .filter(|account| center.uses_claude_token(&account.id))
+        .map(|account| AccountChoice {
+            kind: match center.claude_credential(&account.id) {
+                Some(ClaudeCredential::ApiKey) => "API key",
+                _ => "setup-token",
+            },
+            id: account.id,
+            label: account.label,
+        })
+        .collect()
+}
+
+pub(crate) enum Event {
+    Close,
+    /// The settings were stored: conversations of the project forget their cached copy.
+    Saved,
+    /// Open the Git credential dialog for this repository, with this profile selected.
+    ManageCredentials {
+        repo_url: String,
+        selected: Option<String>,
+    },
+    /// Run a fix in a terminal; call [`CloudSettings::fix_finished`] when it ends.
+    Fix(FixSlot),
+    /// The Docker account's token must be replaced: open Settings > Cloud.
+    ReplaceDockerToken,
+}
+
+/// A fix command on its way to the host. An event is only borrowed and a command holds
+/// secrets that are not `Clone`, so the host takes it out of the slot once.
+pub(crate) struct FixSlot(Mutex<Option<FixCommand>>);
+
+impl FixSlot {
+    pub(crate) fn new(command: FixCommand) -> Self {
+        Self(Mutex::new(Some(command)))
+    }
+
+    pub(crate) fn take(&self) -> Option<FixCommand> {
+        self.0.lock().ok()?.take()
+    }
+}
+
+type DockerAccountsFn = fn(&Store) -> Result<Vec<DockerAccountSummary>, String>;
+type DockerEnvFn = fn(Option<&str>) -> Result<Option<(&'static str, Secret)>, DockerAuthError>;
+
+fn list_docker_accounts(store: &Store) -> Result<Vec<DockerAccountSummary>, String> {
+    DockerAccounts::for_store(store)?.list()
+}
+
+/// The outside world the dialog reaches.
+#[derive(Clone)]
+pub(crate) struct Env {
+    pub gh: Arc<dyn GhRunner>,
+    pub sbx: Arc<dyn SbxRunner>,
+    pub git: Arc<dyn GitRunner>,
+    pub store: Database,
+    pub home: Option<PathBuf>,
+    pub origin: fn(&Path) -> Option<String>,
+    pub claude: fn() -> Option<PathBuf>,
+    /// The saved Docker accounts (no token).
+    pub docker_accounts: DockerAccountsFn,
+    /// The environment that makes a command act as a Docker account (the JWT exchange: a
+    /// network call, so only ever called off the UI thread).
+    pub docker_env: DockerEnvFn,
+    /// Finds a program the way a GUI app must.
+    pub resolve: Resolver,
+    pub claude_accounts: Vec<AccountChoice>,
+}
+
+impl Env {
+    /// The real world, with the shell's `gh` runner. Tests install an [`EnvOverride`] so a
+    /// dialog opened through the shell reaches nothing.
+    pub(crate) fn for_shell(
+        store: Database,
+        gh: Arc<dyn GhRunner>,
+        claude_accounts: Vec<AccountChoice>,
+        cx: &App,
+    ) -> Self {
+        if let Some(over) = cx.try_global::<EnvOverride>() {
+            return over.0.clone();
+        }
+        let services = CloudServices::get(cx);
+        Self {
+            gh,
+            sbx: Arc::new(SystemSbx),
+            git: Arc::new(SystemGit),
+            store,
+            home: services.home,
+            origin: secrets::model::git_origin,
+            claude: || monocode_core::scm::resolve_gui_binary("claude"),
+            docker_accounts: list_docker_accounts,
+            docker_env: monocode_core::docker_accounts::env_for,
+            resolve: services.resolve,
+            claude_accounts,
+        }
+    }
+}
+
+/// Replaces the environment of dialogs opened through the shell (tests only install it).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct EnvOverride(pub Env);
+impl gpui::Global for EnvOverride {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Select {
+    Default,
+    Machine,
+    Size,
+    Idle,
+    Runtime,
+    DockerAccount,
+    Claude,
+    Git,
+}
+
+impl Select {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Machine => "machine",
+            Self::Size => "size",
+            Self::Idle => "idle",
+            Self::Runtime => "runtime",
+            Self::DockerAccount => "docker",
+            Self::Claude => "claude",
+            Self::Git => "git",
+        }
+    }
+}
+
+/// What picking an option does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Pick {
+    Default(DefaultBackend),
+    Machine(Option<String>),
+    Size(u32, String),
+    Idle(u32),
+    Runtime(String),
+    DockerAccount(Option<String>),
+    Claude(Option<String>),
+    Git(Option<String>),
+}
+
+struct Opt {
+    label: String,
+    selected: bool,
+    pick: Pick,
+}
+
+enum Machines {
+    NotLoaded,
+    Loading,
+    Loaded(Vec<MachineType>),
+    /// The list could not be read: the machine is typed instead.
+    Failed(String),
+}
+
+enum Ready {
+    NotStarted,
+    Checking,
+    Done(Vec<Item>),
+}
+
+fn ix(backend: DefaultBackend) -> usize {
+    match backend {
+        DefaultBackend::Codespace => 0,
+        DefaultBackend::Sandbox => 1,
+    }
+}
+
+pub(crate) struct CloudSettings {
+    project: String,
+    name: String,
+    env: Env,
+    tab: DefaultBackend,
+    form: Form,
+    /// The sandbox form as it was offered (with the origin prefill), to tell an untouched
+    /// section from an edited one.
+    sandbox_baseline: model::SandboxForm,
+    sandbox_saved: bool,
+    sandbox_wanted: bool,
+    /// The project's origin, once read.
+    origin: Option<String>,
+    load_error: Option<String>,
+    cs_base: Entity<Input>,
+    cs_devcontainer: Entity<Input>,
+    cs_machine: Entity<Input>,
+    repo: Entity<Input>,
+    sb_base: Entity<Input>,
+    sb_devcontainer: Entity<Input>,
+    credentials: Vec<GitCredentialSummary>,
+    credentials_loaded: bool,
+    credentials_error: Option<String>,
+    docker_accounts: Vec<DockerAccountSummary>,
+    docker_accounts_loaded: bool,
+    docker_accounts_error: Option<String>,
+    machines: Machines,
+    machines_gen: u64,
+    ready: [Ready; 2],
+    ready_gen: [u64; 2],
+    infos: [DevcontainerInfo; 2],
+    open_select: Option<Select>,
+    error: Option<FieldError>,
+    /// A fix waits for the Docker account's token (off the UI thread).
+    fix_pending: bool,
+    fix_gen: u64,
+    /// The backend whose fix is running in the terminal.
+    fix_backend: Option<DefaultBackend>,
+    secrets: Option<Entity<SecretsView>>,
+    focus: FocusHandle,
+    _events: Vec<Subscription>,
+}
+
+impl EventEmitter<Event> for CloudSettings {}
+
+impl Focusable for CloudSettings {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+fn text_input(
+    label: &'static str,
+    placeholder: &str,
+    value: &str,
+    cx: &mut Context<CloudSettings>,
+) -> Entity<Input> {
+    let (placeholder, value) = (placeholder.to_owned(), value.to_owned());
+    let input = cx.new(|cx| {
+        let mut field = Input::field(label, placeholder, content(0.35), cx);
+        field.set_font_size(13.);
+        field
+    });
+    input.update(cx, |input, cx| input.set_text(value, cx));
+    input
+}
+
+impl CloudSettings {
+    /// Opens on `backend`, else on the project's default backend.
+    pub(crate) fn new(
+        project: String,
+        name: String,
+        backend: Option<DefaultBackend>,
+        env: Env,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (saved, load_error) = match locked(&env.store)
+            .and_then(|store| project_cloud::load(&store, &project).map_err(|e| e.to_string()))
+        {
+            Ok(saved) => (saved, None),
+            Err(message) => {
+                // An unreadable part must not hide the other one.
+                let codespace = locked(&env.store)
+                    .and_then(|store| project_cloud::load_codespace(&store, &project))
+                    .unwrap_or_default();
+                (
+                    ProjectCloud {
+                        default_backend: codespace.default_backend,
+                        codespace: codespace.codespace,
+                        sandbox: None,
+                    },
+                    Some(message),
+                )
+            }
+        };
+        let form = Form::initial(&saved, None);
+        let tab = backend.unwrap_or_else(|| saved.effective_default_backend());
+        let sandbox_saved = saved.sandbox.is_some();
+        let cs_base = text_input(
+            "Base branch",
+            "The current branch of the project folder",
+            &form.codespace.base_ref,
+            cx,
+        );
+        let cs_devcontainer = text_input(
+            "Devcontainer configuration path",
+            "Repository default",
+            &form.codespace.devcontainer,
+            cx,
+        );
+        let cs_machine = text_input(
+            "Machine type",
+            codespaces::DEFAULT_MACHINE,
+            form.codespace.machine.as_deref().unwrap_or(""),
+            cx,
+        );
+        let repo = text_input(
+            "Repository URL",
+            "https://github.com/owner/repo",
+            &form.sandbox.repo_url,
+            cx,
+        );
+        let sb_base = text_input(
+            "Base branch",
+            "Default branch of the repository",
+            &form.sandbox.base_ref,
+            cx,
+        );
+        let sb_devcontainer = text_input(
+            "Devcontainer configuration path",
+            monocode_core::cloud_sessions::docker_config::DEFAULT_DEVCONTAINER,
+            &form.sandbox.devcontainer,
+            cx,
+        );
+        let mut events = Vec::new();
+        events.push(cx.subscribe(&repo, |this, _, _: &input::Changed, cx| {
+            this.repo_changed(cx)
+        }));
+        for input in [
+            &cs_base,
+            &cs_devcontainer,
+            &cs_machine,
+            &sb_base,
+            &sb_devcontainer,
+        ] {
+            events.push(cx.subscribe(input, |this, _, _: &input::Changed, cx| {
+                this.refresh_infos(cx);
+                cx.notify();
+            }));
+        }
+        for input in [
+            &repo,
+            &cs_base,
+            &cs_devcontainer,
+            &cs_machine,
+            &sb_base,
+            &sb_devcontainer,
+        ] {
+            events.push(cx.subscribe(input, |this, _, _: &input::Submitted, cx| this.save(cx)));
+        }
+        let sandbox_baseline = form.sandbox.clone();
+        let mut this = Self {
+            project,
+            name,
+            env,
+            tab,
+            form,
+            sandbox_baseline,
+            sandbox_saved,
+            sandbox_wanted: backend == Some(DefaultBackend::Sandbox) && !sandbox_saved,
+            origin: None,
+            load_error,
+            cs_base,
+            cs_devcontainer,
+            cs_machine,
+            repo,
+            sb_base,
+            sb_devcontainer,
+            credentials: Vec::new(),
+            credentials_loaded: false,
+            credentials_error: None,
+            docker_accounts: Vec::new(),
+            docker_accounts_loaded: false,
+            docker_accounts_error: None,
+            machines: Machines::NotLoaded,
+            machines_gen: 0,
+            ready: [Ready::NotStarted, Ready::NotStarted],
+            ready_gen: [0, 0],
+            infos: [DevcontainerInfo::default(), DevcontainerInfo::default()],
+            open_select: None,
+            error: None,
+            fix_pending: false,
+            fix_gen: 0,
+            fix_backend: None,
+            secrets: None,
+            focus: cx.focus_handle(),
+            _events: events,
+        };
+        this.refresh_infos(cx);
+        this.reload_credentials(None, cx);
+        this.load_docker_accounts(cx);
+        this.read_origin(cx);
+        this.tab_shown(cx);
+        this
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tab(&self) -> DefaultBackend {
+        self.tab
+    }
+
+    pub(crate) fn project_name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn repo_url(&self, cx: &App) -> String {
+        self.repo.read(cx).content.trim().to_owned()
+    }
+
+    // -------------------------------------------------------------- background loads
+
+    /// Reads the project's `origin` off the UI thread; prefills the repository field when
+    /// no sandbox is configured and the user typed nothing.
+    fn read_origin(&mut self, cx: &mut Context<Self>) {
+        let (origin, project) = (self.env.origin, self.project.clone());
+        cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(async move { origin(Path::new(&project)) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.origin = found.clone();
+                if !this.sandbox_saved && this.repo.read(cx).content.trim().is_empty() {
+                    let url = model::prefill_repo(found.as_deref());
+                    if !url.is_empty() {
+                        this.repo
+                            .update(cx, |input, cx| input.set_text(url.clone(), cx));
+                        // The prefill is not an edit of the user's.
+                        this.sandbox_baseline.repo_url = url;
+                    }
+                }
+                this.refresh_infos(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Reads the saved Git credentials again, off the UI thread, and selects `select` if given.
+    pub(crate) fn reload_credentials(&mut self, select: Option<String>, cx: &mut Context<Self>) {
+        let store = self.env.store.clone();
+        cx.spawn(async move |this, cx| {
+            let listed = cx
+                .background_executor()
+                .spawn(async move {
+                    let credentials =
+                        locked(&store).and_then(|store| GitCredentials::for_store(&store))?;
+                    credentials.list()
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match listed {
+                    Ok(list) => {
+                        this.credentials = list;
+                        this.credentials_error = None;
+                    }
+                    Err(message) => {
+                        this.credentials.clear();
+                        this.credentials_error = Some(message);
+                    }
+                }
+                this.credentials_loaded = true;
+                if let Some(id) = select {
+                    this.form.sandbox.credential_id = Some(id);
+                    this.check_ready(DefaultBackend::Sandbox, cx);
+                } else if let Some(id) = &this.form.sandbox.credential_id
+                    && this.credentials_error.is_none()
+                    && !this.credentials.iter().any(|c| c.id == *id)
+                {
+                    this.form.sandbox.credential_id = None;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn load_docker_accounts(&mut self, cx: &mut Context<Self>) {
+        let (store, list) = (self.env.store.clone(), self.env.docker_accounts);
+        cx.spawn(async move |this, cx| {
+            let listed = cx
+                .background_executor()
+                .spawn(async move { locked(&store).and_then(|store| list(&store)) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match listed {
+                    Ok(list) => {
+                        this.docker_accounts = list;
+                        this.docker_accounts_error = None;
+                    }
+                    Err(message) => {
+                        this.docker_accounts.clear();
+                        this.docker_accounts_error = Some(message);
+                    }
+                }
+                this.docker_accounts_loaded = true;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Lists the machine types of the project's repository, off the UI thread.
+    fn load_machines(&mut self, cx: &mut Context<Self>) {
+        self.machines_gen += 1;
+        let generation = self.machines_gen;
+        self.machines = Machines::Loading;
+        cx.notify();
+        let (gh, origin, project) = (self.env.gh.clone(), self.env.origin, self.project.clone());
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let origin = origin(Path::new(&project));
+                    let repo = origin
+                        .as_deref()
+                        .and_then(codespaces::repo_from_remote)
+                        .ok_or_else(|| "The project has no GitHub origin.".to_owned())?;
+                    codespaces::list_machines(gh.as_ref(), &repo)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.machines_gen != generation {
+                    return;
+                }
+                this.machines = match result {
+                    Ok(list) if !list.is_empty() => Machines::Loaded(list),
+                    Ok(_) => Machines::Failed("GitHub returned no machine types.".into()),
+                    Err(message) => Machines::Failed(message),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Computes the Ready checklist of `backend` off the UI thread. An answer for a state
+    /// that has changed since (another check started) is dropped.
+    pub(crate) fn check_ready(&mut self, backend: DefaultBackend, cx: &mut Context<Self>) {
+        let slot = ix(backend);
+        self.ready_gen[slot] += 1;
+        let generation = self.ready_gen[slot];
+        self.ready[slot] = Ready::Checking;
+        cx.notify();
+        let typed = self.typed(cx);
+        let (env, project) = (self.env.clone(), self.project.clone());
+        cx.spawn(async move |this, cx| {
+            let items = cx
+                .background_executor()
+                .spawn(async move {
+                    let root = Path::new(&project);
+                    let origin = (env.origin)(root);
+                    match backend {
+                        DefaultBackend::Codespace => readiness::codespace(
+                            env.gh.as_ref(),
+                            root,
+                            origin.as_deref(),
+                            &typed.codespace.devcontainer,
+                        ),
+                        DefaultBackend::Sandbox => {
+                            let credentials = locked(&env.store)
+                                .ok()
+                                .and_then(|store| GitCredentials::for_store(&store).ok());
+                            readiness::sandbox(
+                                env.sbx.as_ref(),
+                                env.git.as_ref(),
+                                credentials.as_ref(),
+                                &readiness::SandboxQuery {
+                                    project_root: root,
+                                    origin: origin.as_deref(),
+                                    home: env.home.as_deref(),
+                                    docker_account: typed.sandbox.docker_account.as_deref(),
+                                    repo_url: &typed.sandbox.repo_url,
+                                    credential_id: typed.sandbox.credential_id.as_deref(),
+                                    devcontainer_path: &typed.sandbox.devcontainer,
+                                },
+                            )
+                        }
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.ready_gen[slot] != generation {
+                    return;
+                }
+                this.ready[slot] = Ready::Done(items);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// A tab became visible: run its first checks.
+    fn tab_shown(&mut self, cx: &mut Context<Self>) {
+        let tab = self.tab;
+        if matches!(self.ready[ix(tab)], Ready::NotStarted) {
+            self.check_ready(tab, cx);
+            if tab == DefaultBackend::Codespace && matches!(self.machines, Machines::NotLoaded) {
+                self.load_machines(cx);
+            }
+        }
+        self.ensure_secrets(cx);
+        cx.notify();
+    }
+
+    /// Builds the Codespaces secrets block the first time it is needed.
+    fn ensure_secrets(&mut self, cx: &mut Context<Self>) {
+        if self.secrets.is_some()
+            || self.tab != DefaultBackend::Codespace
+            || self.form.codespace.claude.is_some()
+        {
+            return;
+        }
+        let env = secrets::Env {
+            runner: self.env.gh.clone(),
+            origin: self.env.origin,
+            claude: self.env.claude,
+        };
+        let project = self.project.clone();
+        self.secrets = Some(cx.new(|cx| SecretsView::new(project, env, cx)));
+    }
+
+    /// Re-checks what a fix was fixing. Called by the host when the fix terminal's command
+    /// ends.
+    pub(crate) fn fix_finished(&mut self, cx: &mut Context<Self>) {
+        if let Some(backend) = self.fix_backend.take() {
+            self.check_ready(backend, cx);
+            if backend == DefaultBackend::Codespace {
+                self.load_machines(cx);
+                if let Some(secrets) = self.secrets.clone() {
+                    secrets.update(cx, |view, cx| view.refresh(cx));
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------- form
+
+    /// The form with what the text fields hold now.
+    fn typed(&self, cx: &App) -> Form {
+        let mut form = self.form.clone();
+        let text = |input: &Entity<Input>| input.read(cx).content.to_string();
+        form.codespace.base_ref = text(&self.cs_base);
+        form.codespace.devcontainer = text(&self.cs_devcontainer);
+        if let Machines::Failed(_) | Machines::NotLoaded = self.machines {
+            let typed = text(&self.cs_machine);
+            let typed = typed.trim();
+            form.codespace.machine = (!typed.is_empty()).then(|| typed.to_owned());
+        }
+        form.sandbox.repo_url = text(&self.repo);
+        form.sandbox.base_ref = text(&self.sb_base);
+        form.sandbox.devcontainer = text(&self.sb_devcontainer);
+        form
+    }
+
+    fn refresh_infos(&mut self, cx: &App) {
+        let root = Path::new(&self.project);
+        let typed = self.typed(cx);
+        self.infos[0] = project_cloud::devcontainer_info(root, &typed.codespace.devcontainer);
+        let local = self
+            .origin
+            .as_deref()
+            .is_some_and(|origin| readiness::same_repository(origin, &typed.sandbox.repo_url));
+        self.infos[1] = if local {
+            project_cloud::devcontainer_info(root, &typed.sandbox.devcontainer)
+        } else {
+            DevcontainerInfo::default()
+        };
+    }
+
+    /// A different host than the picked credential's drops the pick.
+    fn repo_changed(&mut self, cx: &mut Context<Self>) {
+        let url = self.repo.read(cx).content.to_string();
+        if let Some(id) = &self.form.sandbox.credential_id
+            && let Ok((platform, _, _)) = monocode_core::git_credentials::normalize_origin(&url)
+            && self
+                .credentials
+                .iter()
+                .any(|c| &c.id == id && c.platform != platform)
+        {
+            self.form.sandbox.credential_id = None;
+        }
+        self.refresh_infos(cx);
+        cx.notify();
+    }
+
+    fn effective_default(&self) -> DefaultBackend {
+        self.form.default_backend.unwrap_or(if self.sandbox_saved {
+            DefaultBackend::Sandbox
+        } else {
+            DefaultBackend::Codespace
+        })
+    }
+
+    fn switch_tab(&mut self, backend: DefaultBackend, cx: &mut Context<Self>) {
+        if self.tab == backend {
+            return;
+        }
+        self.tab = backend;
+        self.open_select = None;
+        self.tab_shown(cx);
+    }
+
+    /// Validates both backends and stores them. Field errors stay in the dialog; success
+    /// closes it.
+    pub(crate) fn save(&mut self, cx: &mut Context<Self>) {
+        let form = self.typed(cx);
+        let sandbox_baseline = self.sandbox_baseline.clone();
+        let ctx = model::Context {
+            credentials: &self.credentials,
+            credentials_loaded: self.credentials_loaded,
+            claude_accounts: &self.env.claude_accounts,
+            docker_accounts: self
+                .docker_accounts_loaded
+                .then_some(self.docker_accounts.as_slice())
+                .filter(|_| self.docker_accounts_error.is_none()),
+            sandbox_saved: self.sandbox_saved,
+            sandbox_baseline: &sandbox_baseline,
+            sandbox_wanted: self.sandbox_wanted,
+        };
+        // The settings are small and live in the native store like the app's other
+        // settings, so they are written on the UI thread.
+        let result = locked(&self.env.store)
+            .map_err(|message| FieldError {
+                backend: self.tab,
+                field: Field::General,
+                message,
+            })
+            .and_then(|store| model::save(&store, &self.project, &form, &ctx));
+        match result {
+            Ok(saved) => {
+                self.sandbox_saved = saved.sandbox.is_some();
+                self.form = form;
+                self.error = None;
+                cx.emit(Event::Saved);
+                cx.emit(Event::Close);
+            }
+            Err(error) => {
+                self.tab = error.backend;
+                self.form = form;
+                self.error = Some(error);
+                self.tab_shown(cx);
+                cx.notify();
+            }
+        }
+    }
+
+    // -------------------------------------------------------------- selects
+
+    fn claude_options(&self, backend: DefaultBackend) -> Vec<Opt> {
+        let (current, none_label) = match backend {
+            DefaultBackend::Codespace => {
+                (&self.form.codespace.claude, model::CODESPACE_SECRET_LABEL)
+            }
+            DefaultBackend::Sandbox => (&self.form.sandbox.claude, "None"),
+        };
+        let mut options = vec![Opt {
+            label: none_label.into(),
+            selected: current.is_none(),
+            pick: Pick::Claude(None),
+        }];
+        for account in &self.env.claude_accounts {
+            options.push(Opt {
+                label: account.label.clone(),
+                selected: current.as_deref() == Some(account.id.as_str()),
+                pick: Pick::Claude(Some(account.id.clone())),
+            });
+        }
+        if let Some(id) = current
+            && !self.env.claude_accounts.iter().any(|a| &a.id == id)
+        {
+            options.push(Opt {
+                label: format!("{id} (unavailable)"),
+                selected: true,
+                pick: Pick::Claude(Some(id.clone())),
+            });
+        }
+        options
+    }
+
+    fn options(&self, which: Select, cx: &App) -> Vec<Opt> {
+        let typed = self.typed(cx);
+        match which {
+            Select::Default => {
+                let current = self.effective_default();
+                [
+                    (DefaultBackend::Codespace, "Codespaces"),
+                    (DefaultBackend::Sandbox, "Docker Sandbox"),
+                ]
+                .into_iter()
+                .map(|(backend, label)| Opt {
+                    label: label.into(),
+                    selected: backend == current,
+                    pick: Pick::Default(backend),
+                })
+                .collect()
+            }
+            Select::Machine => {
+                let Machines::Loaded(machines) = &self.machines else {
+                    return Vec::new();
+                };
+                let current = typed.codespace.machine.as_deref();
+                let selected = model::selected_machine(machines, current);
+                model::machine_options(machines, current, &self.infos[0])
+                    .into_iter()
+                    .map(|option| Opt {
+                        selected: selected.as_deref() == Some(option.name.as_str()),
+                        pick: Pick::Machine(Some(option.name)),
+                        label: option.label,
+                    })
+                    .collect()
+            }
+            Select::Size => model::size_options(typed.sandbox.cpus, &typed.sandbox.memory)
+                .into_iter()
+                .map(|(cpus, memory)| Opt {
+                    label: model::size_label(cpus, &memory),
+                    selected: cpus == typed.sandbox.cpus && memory == typed.sandbox.memory,
+                    pick: Pick::Size(cpus, memory),
+                })
+                .collect(),
+            Select::Idle => model::idle_options(typed.codespace.idle)
+                .into_iter()
+                .map(|minutes| Opt {
+                    label: model::idle_label(minutes),
+                    selected: minutes == typed.codespace.idle,
+                    pick: Pick::Idle(minutes),
+                })
+                .collect(),
+            Select::Runtime => model::runtime_options(&typed.sandbox.ttl)
+                .into_iter()
+                .map(|ttl| Opt {
+                    label: model::runtime_label(&ttl),
+                    selected: ttl == typed.sandbox.ttl,
+                    pick: Pick::Runtime(ttl),
+                })
+                .collect(),
+            Select::DockerAccount => {
+                let current = &typed.sandbox.docker_account;
+                let mut options = vec![Opt {
+                    label: "Machine sign-in (sbx login)".into(),
+                    selected: current.is_none(),
+                    pick: Pick::DockerAccount(None),
+                }];
+                for account in &self.docker_accounts {
+                    options.push(Opt {
+                        label: model::docker_account_label(account),
+                        selected: current.as_deref() == Some(account.id.as_str()),
+                        pick: Pick::DockerAccount(Some(account.id.clone())),
+                    });
+                }
+                if let Some(id) = current
+                    && self.docker_accounts_loaded
+                    && !self.docker_accounts.iter().any(|a| &a.id == id)
+                {
+                    options.push(Opt {
+                        label: format!("{id} (no longer exists)"),
+                        selected: true,
+                        pick: Pick::DockerAccount(Some(id.clone())),
+                    });
+                }
+                options
+            }
+            Select::Claude => self.claude_options(self.tab),
+            Select::Git => {
+                let current = &typed.sandbox.credential_id;
+                let mut options: Vec<Opt> =
+                    model::matching_credentials(&self.credentials, &typed.sandbox.repo_url)
+                        .into_iter()
+                        .map(|credential| Opt {
+                            label: format!(
+                                "{} ({}, saved credential)",
+                                credential.label,
+                                credential.platform.host()
+                            ),
+                            selected: current.as_deref() == Some(credential.id.as_str()),
+                            pick: Pick::Git(Some(credential.id)),
+                        })
+                        .collect();
+                options.push(Opt {
+                    label: "None (read-only clone)".into(),
+                    selected: current.is_none(),
+                    pick: Pick::Git(None),
+                });
+                options
+            }
+        }
+    }
+
+    fn pick(&mut self, pick: Pick, cx: &mut Context<Self>) {
+        self.open_select = None;
+        self.error = None;
+        match pick {
+            Pick::Default(backend) => self.form.default_backend = Some(backend),
+            Pick::Machine(machine) => self.form.codespace.machine = machine,
+            Pick::Size(cpus, memory) => {
+                self.form.sandbox.cpus = cpus;
+                self.form.sandbox.memory = memory;
+            }
+            Pick::Idle(minutes) => self.form.codespace.idle = minutes,
+            Pick::Runtime(ttl) => self.form.sandbox.ttl = ttl,
+            Pick::DockerAccount(account) => {
+                if self.form.sandbox.docker_account != account {
+                    self.form.sandbox.docker_account = account;
+                    self.check_ready(DefaultBackend::Sandbox, cx);
+                }
+            }
+            Pick::Claude(account) => {
+                match self.tab {
+                    DefaultBackend::Codespace => self.form.codespace.claude = account,
+                    DefaultBackend::Sandbox => self.form.sandbox.claude = account,
+                }
+                self.ensure_secrets(cx);
+            }
+            Pick::Git(credential) => {
+                if self.form.sandbox.credential_id != credential {
+                    self.form.sandbox.credential_id = credential;
+                    self.check_ready(DefaultBackend::Sandbox, cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    // -------------------------------------------------------------- fixes
+
+    fn fix_title(line: &str) -> &'static str {
+        if line.starts_with("gh auth") {
+            "Sign in to GitHub"
+        } else if line.starts_with("sbx --cloud setup ssh") {
+            "Set up ssh for Docker Sandbox"
+        } else if line.starts_with("sbx login") {
+            "Sign in to Docker"
+        } else {
+            "Install the GitHub CLI"
+        }
+    }
+
+    /// Runs the fix of a checklist line. The Docker account's token (a Hub exchange, a
+    /// network call) is fetched off the UI thread and goes only into the terminal's
+    /// environment.
+    pub(crate) fn run_fix(&mut self, backend: DefaultBackend, fix: Fix, cx: &mut Context<Self>) {
+        let checking = matches!(self.ready[ix(backend)], Ready::Checking);
+        if self.fix_pending || checking || self.fix_backend.is_some() {
+            return;
+        }
+        let line = match fix {
+            Fix::ReplaceToken => {
+                cx.emit(Event::ReplaceDockerToken);
+                return;
+            }
+            Fix::Command(line) => line,
+        };
+        let resolve = self.env.resolve.clone();
+        let Some(command) =
+            FixCommand::from_line(Self::fix_title(line), line, |name| resolve(name))
+        else {
+            return;
+        };
+        let account = (backend == DefaultBackend::Sandbox && line == readiness::SBX_SSH_COMMAND)
+            .then(|| self.form.sandbox.docker_account.clone())
+            .flatten();
+        let Some(account) = account else {
+            self.fix_backend = Some(backend);
+            cx.emit(Event::Fix(FixSlot::new(command)));
+            return;
+        };
+        self.fix_pending = true;
+        self.fix_gen += 1;
+        let generation = self.fix_gen;
+        self.error = None;
+        cx.notify();
+        let docker_env = self.env.docker_env;
+        cx.spawn(async move |this, cx| {
+            let env = cx
+                .background_executor()
+                .spawn(async move { docker_env(Some(&account)) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.fix_gen != generation || !this.fix_pending {
+                    return;
+                }
+                this.fix_pending = false;
+                match env {
+                    Ok(pair) => {
+                        let command = match pair {
+                            Some((name, token)) => command.with_env(name, token),
+                            None => command,
+                        };
+                        this.fix_backend = Some(backend);
+                        cx.emit(Event::Fix(FixSlot::new(command)));
+                    }
+                    Err(error) => {
+                        this.error = Some(FieldError {
+                            backend,
+                            field: Field::DockerAccount,
+                            message: error.to_string(),
+                        });
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The embedded `claude setup-token` terminal has the keyboard: Escape belongs to it.
+    pub(crate) fn terminal_focused(&self, window: &Window, cx: &App) -> bool {
+        self.secrets
+            .as_ref()
+            .is_some_and(|secrets| secrets.read(cx).terminal_focused(window, cx))
+    }
+
+    /// Ends the secrets terminal and drops anything typed; called when the dialog closes.
+    pub(crate) fn shutdown(&mut self, cx: &mut Context<Self>) {
+        // Answers still in flight are dropped.
+        self.ready_gen = [self.ready_gen[0] + 1, self.ready_gen[1] + 1];
+        self.machines_gen += 1;
+        self.fix_gen += 1;
+        self.fix_pending = false;
+        if let Some(secrets) = self.secrets.take() {
+            secrets.update(cx, |view, cx| view.shutdown(cx));
+        }
+    }
+
+    // -------------------------------------------------------------- tests
+
+    #[cfg(test)]
+    fn set_text(&mut self, which: &str, text: &str, cx: &mut Context<Self>) {
+        let input = match which {
+            "repo" => &self.repo,
+            "sb_base" => &self.sb_base,
+            "sb_dev" => &self.sb_devcontainer,
+            "cs_base" => &self.cs_base,
+            "cs_dev" => &self.cs_devcontainer,
+            _ => &self.cs_machine,
+        };
+        input.update(cx, |input, cx| input.set_text(text.to_owned(), cx));
+    }
+
+    #[cfg(test)]
+    fn text(&self, which: &str, cx: &App) -> String {
+        let input = match which {
+            "repo" => &self.repo,
+            "sb_base" => &self.sb_base,
+            "sb_dev" => &self.sb_devcontainer,
+            "cs_base" => &self.cs_base,
+            "cs_dev" => &self.cs_devcontainer,
+            _ => &self.cs_machine,
+        };
+        input.read(cx).content.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------- render
+
+const GREEN: u32 = 0x34d399;
+const AMBER: u32 = 0xfbbf24;
+
+fn section_title(text: &'static str, note: Option<&'static str>) -> Div {
+    div()
+        .flex()
+        .items_baseline()
+        .gap_2()
+        .child(
+            div()
+                .text_size(px(13.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(text),
+        )
+        .children(note.map(muted))
+}
+
+fn rule() -> Div {
+    div().h(px(1.)).bg(content(0.08))
+}
+
+impl CloudSettings {
+    fn error_for(&self, backend: DefaultBackend, field: Field) -> Option<AnyElement> {
+        let error = self
+            .error
+            .as_ref()
+            .filter(|e| e.backend == backend && e.field == field)?;
+        let id = format!("cloud-error-{field:?}").to_lowercase();
+        Some(alert(id, error.message.clone()).into_any_element())
+    }
+
+    fn segment(
+        &self,
+        backend: DefaultBackend,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let on = self.tab == backend;
+        let id: &'static str = match backend {
+            DefaultBackend::Codespace => "cloud-seg-codespace",
+            DefaultBackend::Sandbox => "cloud-seg-sandbox",
+        };
+        div()
+            .id(id)
+            .debug_selector(move || id.into())
+            .role(Role::Tab)
+            .aria_label(label)
+            .aria_selected(on)
+            .flex_1()
+            .h(px(30.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .cursor_pointer()
+            .text_size(px(12.))
+            .font_weight(FontWeight::MEDIUM)
+            .when(on, |d| d.bg(content(0.12)).text_color(content(1.)))
+            .when(!on, |d| {
+                d.text_color(content(0.6)).hover(|s| s.bg(content(0.06)))
+            })
+            .on_click(cx.listener(move |this, _, _, cx| this.switch_tab(backend, cx)))
+            .child(label)
+    }
+
+    /// A select: the current value in a box; clicking opens the options below it.
+    fn select(&mut self, which: Select, current: String, cx: &mut Context<Self>) -> Div {
+        let open = self.open_select == Some(which);
+        let id = which.id();
+        let trigger_id: SharedString = format!("cloud-select-{id}").into();
+        let mut column = div().flex().flex_col().gap(px(4.)).child(
+            div()
+                .id(ElementId::from(trigger_id.clone()))
+                .debug_selector({
+                    let selector = trigger_id.to_string();
+                    move || selector.clone()
+                })
+                .role(Role::ComboBox)
+                .aria_label(current.clone())
+                .h(px(34.))
+                .min_w_0()
+                .px_3()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .rounded_lg()
+                .border_1()
+                .border_color(content(if open { 0.3 } else { 0.15 }))
+                .bg(content(0.03))
+                .cursor_pointer()
+                .text_size(px(12.5))
+                .hover(|s| s.bg(content(0.06)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.open_select = (this.open_select != Some(which)).then_some(which);
+                    cx.notify();
+                }))
+                .child(div().min_w_0().truncate().child(current))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(content(0.5))
+                        .child(if open { "\u{25b4}" } else { "\u{25be}" }),
+                ),
+        );
+        if open {
+            let mut list = div()
+                .id(ElementId::from(SharedString::from(format!(
+                    "cloud-options-{id}"
+                ))))
+                .flex()
+                .flex_col()
+                .p(px(2.))
+                .rounded_lg()
+                .border_1()
+                .border_color(content(0.1))
+                .bg(content(0.03));
+            for (n, option) in self.options(which, cx).into_iter().enumerate() {
+                let pick = option.pick.clone();
+                list = list.child(
+                    crate::cloud_dialog_ui::choice(
+                        format!("cloud-option-{id}-{n}"),
+                        option.label,
+                        option.selected,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| this.pick(pick.clone(), cx))),
+                );
+            }
+            column = column.child(list);
+        }
+        column
+    }
+
+    fn current_label(&self, which: Select, cx: &App) -> String {
+        self.options(which, cx)
+            .into_iter()
+            .find(|o| o.selected)
+            .map(|o| o.label)
+            .unwrap_or_default()
+    }
+
+    fn select_row(&mut self, label: &'static str, which: Select, cx: &mut Context<Self>) -> Div {
+        let current = self.current_label(which, cx);
+        labelled(label).child(self.select(which, current, cx))
+    }
+
+    fn ready_section(&self, cx: &mut Context<Self>) -> Div {
+        let backend = self.tab;
+        let state = &self.ready[ix(backend)];
+        let checking = matches!(state, Ready::Checking | Ready::NotStarted);
+        let busy = checking || self.fix_pending || self.fix_backend.is_some();
+        let mut column = div().flex().flex_col().gap(px(6.));
+        column = column.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(section_title("Ready", None))
+                .child(
+                    div()
+                        .id("cloud-recheck")
+                        .debug_selector(|| "cloud-recheck".into())
+                        .role(Role::Button)
+                        .aria_label("Check again")
+                        .text_size(px(12.))
+                        .text_color(content(0.55))
+                        .when(!checking, |d| {
+                            d.cursor_pointer()
+                                .hover(|s| s.text_color(content(1.)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.check_ready(backend, cx);
+                                    if backend == DefaultBackend::Codespace {
+                                        this.load_machines(cx);
+                                    }
+                                }))
+                        })
+                        .when(checking, |d| d.opacity(0.4))
+                        .child("Check again"),
+                ),
+        );
+        column = column.child(muted("Checked when this tab opens and before every start"));
+        match state {
+            Ready::NotStarted | Ready::Checking => {
+                column = column.child(
+                    div()
+                        .id("cloud-ready-checking")
+                        .debug_selector(|| "cloud-ready-checking".into())
+                        .text_size(px(12.))
+                        .text_color(content(0.55))
+                        .child("Checking..."),
+                );
+            }
+            Ready::Done(items) => {
+                for item in items {
+                    column = column.child(self.ready_item(item, busy, cx));
+                }
+            }
+        }
+        column
+    }
+
+    fn ready_item(&self, item: &Item, busy: bool, cx: &mut Context<Self>) -> Div {
+        let backend = self.tab;
+        let (mark, colour) = match item.state {
+            State::Ok => ("\u{2713}", rgb(GREEN)),
+            State::Problem => ("!", rgb(AMBER)),
+            State::Unknown => ("\u{2026}", rgb(0x9ca3af)),
+        };
+        let key = item.id.key();
+        let row_id: SharedString = format!("cloud-ready-{key}").into();
+        let mut row = div()
+            .flex()
+            .items_start()
+            .gap_2()
+            .child(
+                div()
+                    .w(px(14.))
+                    .flex_shrink_0()
+                    .text_size(px(12.))
+                    .text_color(colour)
+                    .child(mark),
+            )
+            .child(
+                div()
+                    .id(ElementId::from(row_id.clone()))
+                    .debug_selector({
+                        let selector = row_id.to_string();
+                        move || selector.clone()
+                    })
+                    .min_w_0()
+                    .flex_1()
+                    .text_size(px(12.))
+                    .line_height(px(18.))
+                    .text_color(if item.state == State::Ok {
+                        content(0.8)
+                    } else {
+                        content(0.95)
+                    })
+                    .child(item.text.clone()),
+            );
+        if let Some(fix) = item.fix {
+            let label = match fix {
+                Fix::ReplaceToken => "Replace token",
+                Fix::Command(_) => "Fix",
+            };
+            let id: SharedString = format!("cloud-fix-{key}").into();
+            row = row.child(
+                secondary_button(ElementId::from(id.clone()), label, false, busy)
+                    .child(label)
+                    .debug_selector({
+                        let selector = id.to_string();
+                        move || selector.clone()
+                    })
+                    .when(!busy, |b| {
+                        b.on_click(
+                            cx.listener(move |this, _, _, cx| this.run_fix(backend, fix, cx)),
+                        )
+                    }),
+            );
+        }
+        row
+    }
+
+    fn input_row(
+        &self,
+        label: &'static str,
+        id: &'static str,
+        input: &Entity<Input>,
+        hint: Option<String>,
+        backend: DefaultBackend,
+        field: Field,
+    ) -> Div {
+        labelled(label)
+            .child(field_box(id, input))
+            .children(hint.map(muted))
+            .children(self.error_for(backend, field))
+    }
+
+    fn codespace_workspace(&mut self, cx: &mut Context<Self>) -> Div {
+        let cs = DefaultBackend::Codespace;
+        let repo_text = match &self.origin {
+            Some(origin) => codespaces::repo_from_remote(origin)
+                .unwrap_or_else(|| "The origin is not a GitHub repository".into()),
+            None => "Reading the project's origin...".into(),
+        };
+        let mut column = div().flex().flex_col().gap_3().child(
+            labelled("Repository").child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("cloud-repo-readonly")
+                            .debug_selector(|| "cloud-repo-readonly".into())
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(12.5))
+                            .child(repo_text),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .px(px(6.))
+                            .rounded_md()
+                            .bg(content(0.08))
+                            .text_size(px(10.))
+                            .text_color(content(0.6))
+                            .child("from origin"),
+                    ),
+            ),
+        );
+        column = column.child(self.input_row(
+            "Base branch",
+            "cloud-field-cs-base",
+            &self.cs_base.clone(),
+            Some(model::CODESPACE_BASE_HINT.into()),
+            cs,
+            Field::Base,
+        ));
+        column = column.child(self.input_row(
+            "Devcontainer",
+            "cloud-field-cs-devcontainer",
+            &self.cs_devcontainer.clone(),
+            model::requirement_hint(&self.infos[0]),
+            cs,
+            Field::Devcontainer,
+        ));
+        // Machine
+        let machine = match &self.machines {
+            Machines::Loaded(_) => {
+                let current = self.current_label(Select::Machine, cx);
+                labelled("Machine").child(self.select(Select::Machine, current, cx))
+            }
+            Machines::NotLoaded | Machines::Loading => labelled("Machine").child(
+                div()
+                    .id("cloud-machines-loading")
+                    .debug_selector(|| "cloud-machines-loading".into())
+                    .text_size(px(12.))
+                    .text_color(content(0.55))
+                    .child("Reading the machine types..."),
+            ),
+            Machines::Failed(message) => labelled("Machine")
+                .child(field_box("cloud-field-cs-machine", &self.cs_machine))
+                .child(muted(format!(
+                    "Could not list the machine types ({}). Type one, or leave empty for {}.",
+                    message.trim_end_matches('.'),
+                    codespaces::DEFAULT_MACHINE
+                ))),
+        };
+        column = column.child(machine.children(self.machine_warning(cx)));
+        column = column.children(self.error_for(cs, Field::Machine));
+        column
+            .child(self.select_row("Stop when idle", Select::Idle, cx))
+            .children(self.error_for(cs, Field::Idle))
+    }
+
+    fn machine_warning(&self, cx: &App) -> Option<Stateful<Div>> {
+        let Machines::Loaded(machines) = &self.machines else {
+            return None;
+        };
+        let typed = self.typed(cx);
+        let name = model::selected_machine(machines, typed.codespace.machine.as_deref())?;
+        let machine = machines.iter().find(|m| m.name == name)?;
+        let warning = model::size_warning(
+            machine.cpus,
+            Some(machine.memory_in_bytes / (1024 * 1024)),
+            &self.infos[0],
+        )?;
+        Some(
+            div()
+                .id("cloud-machine-warning")
+                .debug_selector(|| "cloud-machine-warning".into())
+                .text_size(px(11.))
+                .line_height(px(17.))
+                .text_color(rgb(AMBER))
+                .child(warning),
+        )
+    }
+
+    fn size_warning(&self) -> Option<Stateful<Div>> {
+        let form = &self.form.sandbox;
+        let warning =
+            model::size_warning(form.cpus, model::memory_mib(&form.memory), &self.infos[1])?;
+        Some(
+            div()
+                .id("cloud-size-warning")
+                .debug_selector(|| "cloud-size-warning".into())
+                .text_size(px(11.))
+                .line_height(px(17.))
+                .text_color(rgb(AMBER))
+                .child(warning),
+        )
+    }
+
+    fn sandbox_workspace(&mut self, cx: &mut Context<Self>) -> Div {
+        let sb = DefaultBackend::Sandbox;
+        let mut column = div().flex().flex_col().gap_3();
+        column = column.child(self.input_row(
+            "Repository",
+            "cloud-field-repo",
+            &self.repo.clone(),
+            Some(model::REPO_HINT.into()),
+            sb,
+            Field::Repo,
+        ));
+        column = column.child(self.input_row(
+            "Base branch",
+            "cloud-field-sb-base",
+            &self.sb_base.clone(),
+            Some(model::SANDBOX_BASE_HINT.into()),
+            sb,
+            Field::Base,
+        ));
+        let dev_hint = model::requirement_hint(&self.infos[1]).unwrap_or_else(|| {
+            "Relative to the repository root. If the repository has none, the session runs directly in the sandbox.".into()
+        });
+        column = column.child(self.input_row(
+            "Devcontainer",
+            "cloud-field-sb-devcontainer",
+            &self.sb_devcontainer.clone(),
+            Some(dev_hint),
+            sb,
+            Field::Devcontainer,
+        ));
+        column = column.child(
+            self.select_row("Size", Select::Size, cx)
+                .children(self.size_warning()),
+        );
+        column = column.children(self.error_for(sb, Field::Size));
+        column
+            .child(self.select_row("Runtime limit", Select::Runtime, cx))
+            .children(self.error_for(sb, Field::Runtime))
+    }
+
+    fn credentials_section(&mut self, cx: &mut Context<Self>) -> Div {
+        let backend = self.tab;
+        let mut column = div().flex().flex_col().gap_3();
+        if backend == DefaultBackend::Sandbox {
+            column = column.child(
+                self.select_row("Docker account", Select::DockerAccount, cx)
+                    .child(muted(model::DOCKER_ACCOUNT_NOTE))
+                    .children(
+                        self.docker_accounts_error
+                            .clone()
+                            .map(|message| alert("cloud-docker-accounts-error", message)),
+                    )
+                    .children(self.error_for(backend, Field::DockerAccount)),
+            );
+        }
+        let claude = if self.env.claude_accounts.is_empty() {
+            labelled("Claude")
+                .child(self.select(Select::Claude, self.current_label(Select::Claude, cx), cx))
+                .child(muted(model::NO_ACCOUNT_LINE))
+        } else {
+            self.select_row("Claude", Select::Claude, cx)
+        };
+        column = column.child(
+            claude
+                .child(muted(model::CLAUDE_NOTE))
+                .children(self.error_for(backend, Field::Claude)),
+        );
+        if backend == DefaultBackend::Codespace && self.form.codespace.claude.is_none() {
+            column = column.children(self.secrets.clone());
+        }
+        column.child(self.git_row(cx))
+    }
+
+    fn git_row(&mut self, cx: &mut Context<Self>) -> Div {
+        match self.tab {
+            DefaultBackend::Codespace => labelled("Git").child(
+                div()
+                    .id("cloud-git-codespace")
+                    .debug_selector(|| "cloud-git-codespace".into())
+                    .text_size(px(12.5))
+                    .child(model::GIT_CODESPACE_LINE),
+            ),
+            DefaultBackend::Sandbox => {
+                let current = self.current_label(Select::Git, cx);
+                let select = self.select(Select::Git, current, cx);
+                labelled("Git")
+                    .child(
+                        div()
+                            .flex()
+                            .items_start()
+                            .gap_2()
+                            .child(div().min_w_0().flex_1().child(select))
+                            .child(
+                                secondary_button("cloud-git-manage", "Manage", false, false)
+                                    .child("Manage")
+                                    .debug_selector(|| "cloud-git-manage".into())
+                                    .h(px(34.))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let event = Event::ManageCredentials {
+                                            repo_url: this.repo_url(cx),
+                                            selected: this.form.sandbox.credential_id.clone(),
+                                        };
+                                        cx.emit(event);
+                                    })),
+                            ),
+                    )
+                    .child(muted(model::GIT_SANDBOX_NOTE))
+                    .children(
+                        self.credentials_error
+                            .clone()
+                            .map(|message| alert("cloud-credentials-error", message)),
+                    )
+                    .children(self.error_for(DefaultBackend::Sandbox, Field::Credential))
+            }
+        }
+    }
+
+    /// `New cloud sessions use ...` for the backend shown.
+    pub(crate) fn summary(&self, cx: &App) -> String {
+        let typed = self.typed(cx);
+        let kit_on = cloud_kit_ui::default_on(&cloud_kit_ui::kit_prefs(cx));
+        let account_label = |id: &Option<String>, none: &str| match id {
+            None => none.to_owned(),
+            Some(id) => self
+                .env
+                .claude_accounts
+                .iter()
+                .find(|a| &a.id == id)
+                .map_or_else(|| format!("{id} (unavailable)"), |a| a.label.clone()),
+        };
+        match self.tab {
+            DefaultBackend::Codespace => {
+                let machine = match &self.machines {
+                    Machines::Loaded(list) => {
+                        model::selected_machine(list, typed.codespace.machine.as_deref()).and_then(
+                            |name| {
+                                list.iter()
+                                    .find(|m| m.name == name)
+                                    .map(model::machine_label)
+                                    .or(Some(name))
+                            },
+                        )
+                    }
+                    _ => Some(
+                        typed
+                            .codespace
+                            .machine
+                            .clone()
+                            .unwrap_or_else(|| codespaces::DEFAULT_MACHINE.to_owned()),
+                    ),
+                }
+                .unwrap_or_else(|| codespaces::DEFAULT_MACHINE.to_owned());
+                model::summary_line(
+                    self.tab,
+                    &machine,
+                    &account_label(&typed.codespace.claude, "Codespaces secret"),
+                    None,
+                    kit_on,
+                )
+            }
+            DefaultBackend::Sandbox => {
+                let docker = typed.sandbox.docker_account.as_ref().map(|id| {
+                    self.docker_accounts
+                        .iter()
+                        .find(|a| &a.id == id)
+                        .map_or_else(|| id.clone(), |a| a.docker_id.clone())
+                });
+                model::summary_line(
+                    self.tab,
+                    &model::size_label(typed.sandbox.cpus, &typed.sandbox.memory),
+                    &account_label(&typed.sandbox.claude, "None"),
+                    docker.as_deref(),
+                    kit_on,
+                )
+            }
+        }
+    }
+}
+
+impl Render for CloudSettings {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let height = window.viewport_size().height.as_f32() - 34.;
+        let backend = self.tab;
+        let default_select = {
+            let current = self.current_label(Select::Default, cx);
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .child("Default for new cloud sessions"),
+                )
+                .child(self.select(Select::Default, current, cx))
+        };
+        let subtitle = format!(
+            "{} \u{b7} {}",
+            self.name,
+            model::display_path(&self.project, self.env.home.as_deref())
+        );
+        let workspace = match backend {
+            DefaultBackend::Codespace => self.codespace_workspace(cx),
+            DefaultBackend::Sandbox => self.sandbox_workspace(cx),
+        };
+        let body = div()
+            .id("cloud-settings-body")
+            .min_h_0()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .p_4()
+            .child(
+                div()
+                    .flex()
+                    .p(px(2.))
+                    .gap(px(2.))
+                    .rounded_lg()
+                    .bg(content(0.05))
+                    .child(self.segment(DefaultBackend::Codespace, "Codespaces", cx))
+                    .child(self.segment(DefaultBackend::Sandbox, "Docker Sandbox", cx)),
+            )
+            .child(default_select)
+            .child(rule())
+            .child(self.ready_section(cx))
+            .child(rule())
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(section_title(
+                        "Workspace",
+                        Some("Same fields, same order for both backends"),
+                    ))
+                    .child(workspace),
+            )
+            .child(rule())
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(section_title(
+                        "Credentials",
+                        Some("One Claude picker for both backends"),
+                    ))
+                    .child(self.credentials_section(cx)),
+            )
+            .children(
+                self.load_error
+                    .clone()
+                    .map(|message| alert("cloud-load-error", message)),
+            )
+            .children(
+                self.error
+                    .as_ref()
+                    .filter(|e| e.field == Field::General)
+                    .map(|e| alert("cloud-error-general", e.message.clone())),
+            );
+        let summary = self.summary(cx);
+        let footer = div()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px_4()
+            .pb_4()
+            .pt_3()
+            .border_t_1()
+            .border_color(content(0.08))
+            .child(
+                div()
+                    .id("cloud-summary")
+                    .debug_selector(|| "cloud-summary".into())
+                    .role(Role::Status)
+                    .aria_label(summary.clone())
+                    .text_size(px(11.5))
+                    .line_height(px(17.))
+                    .text_color(content(0.65))
+                    .child(summary),
+            )
+            .child(
+                modal::actions()
+                    .mt(px(0.))
+                    .child(
+                        modal::ghost_button("cloud-cancel", "Cancel")
+                            .debug_selector(|| "cloud-cancel".into())
+                            .cursor_pointer()
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::Close))),
+                    )
+                    .child(
+                        modal::primary_button("cloud-save", "Save")
+                            .debug_selector(|| "cloud-save".into())
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                    ),
+            );
+        div()
+            .id("cloud-settings")
+            .debug_selector(|| "cloud-settings".into())
+            .role(Role::Dialog)
+            .aria_label("Cloud settings")
+            .track_focus(&self.focus)
+            .relative()
+            .min_h_0()
+            .max_h(px(height))
+            .flex()
+            .flex_col()
+            .text_color(content(1.))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" && !this.terminal_focused(window, cx) {
+                    cx.emit(Event::Close);
+                    window.prevent_default();
+                    cx.stop_propagation();
+                }
+            }))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .px_4()
+                    .pt_3()
+                    .child(heading("Cloud settings", subtitle))
+                    .child(
+                        icon_button("cloud-close", "Close Cloud settings", "close")
+                            .size(px(28.))
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::Close))),
+                    ),
+            )
+            .child(body)
+            .child(footer)
+    }
+}

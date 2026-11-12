@@ -1,5 +1,5 @@
 //! Sign-in and tool checks for the cloud backends, shared by Settings > Cloud and the
-//! Codespaces setup dialog: how far the GitHub CLI is set up, whether `sbx` is installed and
+//! project Cloud settings dialog: how far the GitHub CLI is set up, whether `sbx` is installed and
 //! whether its `sbx_cloud` ssh alias exists. Pure functions of their inputs; callers run
 //! them on the background executor.
 use monocode_core::{codespaces::AuthStatus, sandboxes};

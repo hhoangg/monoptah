@@ -709,7 +709,7 @@ fn the_docker_config_is_read_once_per_menu_opening(cx: &mut TestAppContext) {
     window
         .update(cx, |view, _, _| {
             assert!(rows(view)[0].3.is_some(), "no config yet");
-            // Saved behind the cache's back (the setup dialog): not seen until reopened.
+            // Saved behind the cache's back (Cloud settings): not seen until reopened.
             let config = DockerProjectConfig {
                 repo_url: "https://github.com/octo/widgets.git".into(),
                 ..Default::default()

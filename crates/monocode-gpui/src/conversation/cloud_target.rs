@@ -10,7 +10,7 @@
 //! applied to a copy of the config when the prompt is sent and nothing is saved back.
 use super::cloud_branches::BranchList;
 use super::*;
-use crate::docker_dialog::model::AccountChoice;
+use crate::cloud_settings::model::AccountChoice;
 use monocode_core::cloud_sessions::docker_config::{self, DockerProjectConfig};
 use monocode_core::cloud_sessions::kit::Workspace;
 use monocode_core::cloud_sessions::project_cloud::{self, CodespaceProjectConfig};
@@ -120,6 +120,14 @@ pub(crate) struct CloudCreate {
 pub(crate) struct CreateCloudSession(pub CloudCreate);
 /// Emitted when the Docker Sandbox row is picked and the project has no saved config.
 pub(crate) struct OpenDockerSetup(pub String);
+/// Asks the shell to open the project's Cloud settings, on `backend` or else the project's
+/// default backend. (The Workspace menu's item comes with the panel redesign.)
+#[allow(dead_code)]
+pub(crate) struct OpenProjectCloudSettings {
+    pub cwd: String,
+    pub backend: Option<monocode_core::cloud_sessions::project_cloud::DefaultBackend>,
+}
+impl EventEmitter<OpenProjectCloudSettings> for Conversation {}
 /// Emitted by the "Claude setup" row to open Settings > Cloud.
 pub(crate) struct OpenCloudSettings;
 impl EventEmitter<OpenCloudSettings> for Conversation {}
@@ -334,7 +342,7 @@ impl Conversation {
             .unwrap_or_default()
     }
 
-    pub(super) fn forget_docker_config(&self) {
+    pub(crate) fn forget_docker_config(&self) {
         self.docker_config_cache.take();
     }
 
@@ -403,7 +411,7 @@ impl Conversation {
             && draft.target == target
             && !draft.creating
         {
-            // Picked again (after the setup dialog, say): the project's config is the default
+            // Picked again (after Cloud settings, say): the project's config is the default
             // again, so this session's overrides start over from it.
             let (cpus, memory, ttl, account, base) = config_defaults(config.as_ref());
             draft.config = config;
@@ -499,7 +507,7 @@ impl Conversation {
         self.save_settings(cx);
         self.refresh_git(cx);
         let accounts = if docker {
-            crate::docker_dialog::claude_accounts(cx)
+            crate::cloud_settings::claude_accounts(cx)
         } else {
             Vec::new()
         };
@@ -757,7 +765,11 @@ impl Conversation {
                         }
                     }
                     None => {
-                        fail(self, "Set up Docker Sandbox for this project first.", cx);
+                        fail(
+                            self,
+                            "Set up Docker Sandbox in the project's Cloud settings first.",
+                            cx,
+                        );
                         return;
                     }
                 }

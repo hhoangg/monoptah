@@ -1,4 +1,4 @@
-//! What the Codespaces setup dialog knows and decides. Every `gh` call here takes the runner
+//! What the Codespaces secrets block knows and decides. Every `gh` call here takes the runner
 //! as an argument, so the dialog runs them on the background executor and tests use a fake.
 //! Secret values only ever pass through `save`, which hands them to `set_secret` (stdin).
 use monocode_core::codespaces::{

@@ -62,8 +62,6 @@ impl FixCommand {
         Some(Self::run(title, program, words))
     }
 
-    // Used by the project Cloud settings dialog; Settings > Cloud passes no token.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn with_env(mut self, name: impl Into<String>, value: Secret) -> Self {
         self.env.push((name.into(), value));
         self

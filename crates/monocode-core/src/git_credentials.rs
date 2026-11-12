@@ -647,6 +647,68 @@ fn check_with(
     })
 }
 
+/// Check that `repo_url` can be read without any credential (a public repository), with
+/// `git ls-remote --heads`. Git is isolated like in [`GitCredentials::check_access`] and
+/// never prompts. Nothing is stored and no secret is involved.
+pub fn check_public(runner: &dyn GitRunner, repo_url: &str) -> Result<AccessCheck, String> {
+    let (platform, _, _) = normalize_origin(repo_url)?;
+    let url = clone_url(repo_url)?;
+    let args: Vec<String> = [
+        "-c",
+        "credential.helper=",
+        "-c",
+        "http.followRedirects=false",
+        "-c",
+        "http.lowSpeedLimit=1000",
+        "-c",
+        "http.lowSpeedTime=30",
+        "ls-remote",
+        "--heads",
+        "--",
+        &url,
+    ]
+    .map(String::from)
+    .into();
+    let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+    let env = vec![
+        pair("GIT_TERMINAL_PROMPT", "0"),
+        pair("GCM_INTERACTIVE", "never"),
+        pair("GIT_CONFIG_GLOBAL", "/dev/null"),
+        pair("GIT_CONFIG_NOSYSTEM", "1"),
+        pair("GIT_ALLOW_PROTOCOL", "https"),
+        pair("GIT_ASKPASS", "/bin/false"),
+    ];
+    let output = runner.run(&args, &env, &Secret::new(String::new()))?;
+    Ok(if output.success {
+        AccessCheck {
+            status: AccessStatus::ReadOk,
+            message: "The repository can be read without a credential.".into(),
+        }
+    } else {
+        let detail = output.stderr.trim();
+        match classify(detail) {
+            AccessStatus::AuthFailed => AccessCheck {
+                status: AccessStatus::AuthFailed,
+                message: "The repository needs a credential. Choose a Git credential.".into(),
+            },
+            AccessStatus::NotFound => AccessCheck {
+                status: AccessStatus::NotFound,
+                message: "Repository not found. Check the URL, or choose a Git credential if it is private.".into(),
+            },
+            _ => AccessCheck {
+                status: AccessStatus::Network,
+                message: format!(
+                    "Could not reach {}. {}",
+                    platform.host(),
+                    detail.lines().last().unwrap_or("")
+                )
+                .trim()
+                .to_owned(),
+            },
+        }
+    })
+}
+
 /// Check read access to `repo_url` with a token that is not saved. Validates the username
 /// and token like [`GitCredentials::save`] and stores nothing.
 pub fn check_token(

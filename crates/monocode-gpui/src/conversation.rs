@@ -2698,7 +2698,7 @@ impl Conversation {
                 ("Switch account", items, 250., MenuStyle::Explorer)
             }
             ComposerMenu::Workspace => {
-                // The setup dialog may have saved a config since the last open.
+                // Cloud settings may have saved a config since the last open.
                 self.forget_docker_config();
                 let picker = cx.new(|cx| {
                     GitPicker::new(

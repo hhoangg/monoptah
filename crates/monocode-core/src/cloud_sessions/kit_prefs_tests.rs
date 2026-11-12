@@ -431,6 +431,12 @@ fn cloud_sources_never_read_the_keychain_or_claude_credentials() {
         gpui.join("settings/cloud_env.rs"),
         gpui.join("cloud_checks.rs"),
         gpui.join("fix_terminal.rs"),
+        // The project's Cloud settings dialog. secrets/model.rs is not scanned: it runs
+        // `git remote get-url origin`, which the kit files must not do.
+        gpui.join("cloud_settings/mod.rs"),
+        gpui.join("cloud_settings/model.rs"),
+        gpui.join("cloud_settings/secrets.rs"),
+        gpui.join("shell/project_cloud.rs"),
         gpui.join("shell/claude_setup.rs"),
         gpui.join("shell.rs"),
         gpui.join("panel_root.rs"),

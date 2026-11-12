@@ -1,4 +1,5 @@
-//! The project menu's Codespaces setup dialog: whether `gh` can drive codespaces, which
+//! The Codespaces secrets block of the project's Cloud settings dialog, shown while the
+//! Claude picker is on "Codespaces secret": whether `gh` can drive codespaces, which
 //! repository the project belongs to, and the user secrets a codespace for it needs
 //! (devcontainer secrets plus CLAUDE_CODE_OAUTH_TOKEN). `model` holds what it says and
 //! decides. Every `gh` call runs on the background executor. Secret values live only in
@@ -8,26 +9,21 @@ pub(crate) mod model;
 mod tests;
 
 use crate::{
+    cloud_dialog_ui::{alert, button, code_box, muted},
     input::{self, Input},
-    settings::widgets::secondary_button,
     terminal::{Terminal, TerminalEvent},
     theme::*,
 };
 use gpui::{
-    AnyElement, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    IntoElement, KeyDownEvent, Render, Role, SharedString, Stateful, StyleRefinement, Subscription,
-    Window, div, prelude::*, px, rgb,
+    AnyElement, Context, Div, Entity, FocusHandle, Focusable, FontWeight, IntoElement, Render,
+    SharedString, StyleRefinement, Subscription, Window, div, prelude::*, px, rgb,
 };
 use model::{Row, Snapshot};
-use monocode_core::codespaces::{GhRunner, OAUTH_SECRET_KEY, SecretState, SystemGh};
+use monocode_core::codespaces::{GhRunner, OAUTH_SECRET_KEY, SecretState};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-
-pub(crate) enum Event {
-    Close,
-}
 
 /// The outside world the dialog reaches: `gh`, the project's git origin and the `claude` CLI.
 #[derive(Clone)]
@@ -37,60 +33,11 @@ pub(crate) struct Env {
     pub claude: fn() -> Option<PathBuf>,
 }
 
-impl Env {
-    pub(crate) fn system() -> Self {
-        Self {
-            runner: Arc::new(SystemGh),
-            origin: model::git_origin,
-            claude: || monocode_core::scm::resolve_gui_binary("claude"),
-        }
-    }
-}
-
 fn join_lines(first: Option<String>, second: Option<String>) -> Option<String> {
     match (first, second) {
         (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
         (a, b) => a.or(b),
     }
-}
-
-fn muted(text: impl Into<SharedString>) -> Div {
-    div()
-        .text_size(px(11.))
-        .line_height(px(17.))
-        .text_color(content(0.45))
-        .child(text.into())
-}
-
-fn alert(id: &'static str, text: impl Into<SharedString>) -> Stateful<Div> {
-    div()
-        .id(id)
-        .role(Role::Alert)
-        .text_size(px(12.))
-        .line_height(px(18.))
-        .text_color(rgb(0xf87171))
-        .child(text.into())
-}
-
-fn code_box(text: &str) -> Div {
-    div()
-        .min_w_0()
-        .rounded_md()
-        .border_1()
-        .border_color(content(0.1))
-        .px(px(8.))
-        .py(px(4.))
-        .text_size(px(12.))
-        .line_height(px(18.))
-        .child(text.to_owned())
-}
-
-fn button(id: &'static str, label: impl Into<SharedString>, disabled: bool) -> Stateful<Div> {
-    // `secondary_button` only sets the accessible label; the visible text is a child.
-    let label = label.into();
-    secondary_button(id, label.clone(), false, disabled)
-        .child(label)
-        .debug_selector(move || id.into())
 }
 
 fn section() -> Div {
@@ -103,9 +50,8 @@ fn section() -> Div {
         .pt_4()
 }
 
-pub(crate) struct CodespacesDialog {
+pub(crate) struct SecretsView {
     project: String,
-    name: String,
     env: Env,
     snapshot: Option<Snapshot>,
     /// One masked input per secret, in `snapshot.rows` order.
@@ -121,19 +67,16 @@ pub(crate) struct CodespacesDialog {
     _events: Vec<Subscription>,
 }
 
-impl EventEmitter<Event> for CodespacesDialog {}
-
-impl Focusable for CodespacesDialog {
+impl Focusable for SecretsView {
     fn focus_handle(&self, _: &gpui::App) -> FocusHandle {
         self.focus.clone()
     }
 }
 
-impl CodespacesDialog {
-    pub(crate) fn new(project: String, name: String, env: Env, cx: &mut Context<Self>) -> Self {
+impl SecretsView {
+    pub(crate) fn new(project: String, env: Env, cx: &mut Context<Self>) -> Self {
         let mut this = Self {
             project,
-            name,
             env,
             snapshot: None,
             fields: Vec::new(),
@@ -280,7 +223,6 @@ impl CodespacesDialog {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.busy = false;
-                let clean = !outcome.saved.is_empty() && outcome.failed.is_empty();
                 for key in &outcome.saved {
                     if let Some((_, value)) = entries.iter().find(|(k, _)| k == key) {
                         this.clear_if_unchanged(key, value, cx);
@@ -299,23 +241,11 @@ impl CodespacesDialog {
                 if this.pending_auto_save {
                     // That save decides whether the dialog is done.
                     this.run_pending_auto_save(cx);
-                } else if clean && this.error.is_none() && this.all_set() && !this.has_input(cx) {
-                    // Closing empties the fields, so a value still typed keeps it open.
-                    cx.emit(Event::Close);
                 }
                 cx.notify();
             });
         })
         .detach();
-    }
-
-    /// Every secret is set and the last check had no error: nothing is left to do here.
-    fn all_set(&self) -> bool {
-        self.snapshot.as_ref().is_some_and(|s| {
-            s.error.is_none()
-                && !s.rows.is_empty()
-                && s.rows.iter().all(|row| row.state == Some(SecretState::Set))
-        })
     }
 
     /// Empties a saved field, unless it was changed while the save ran.
@@ -687,8 +617,8 @@ impl CodespacesDialog {
     }
 }
 
-impl Render for CodespacesDialog {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl Render for SecretsView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut body = self.body(cx);
         if let Some(error) = self.error.clone() {
             body.push(alert("codespaces-error", error).into_any_element());
@@ -703,78 +633,13 @@ impl Render for CodespacesDialog {
                     .into_any_element(),
             );
         }
-        let height = window.viewport_size().height.as_f32() - 34.;
         div()
-            .id("codespaces-dialog")
-            .debug_selector(|| "codespaces-dialog".into())
-            .role(Role::Dialog)
-            .aria_label("Codespaces setup")
+            .id("codespaces-secrets")
+            .debug_selector(|| "codespaces-secrets".into())
             .track_focus(&self.focus)
-            .relative()
-            .min_h_0()
-            .max_h(px(height))
             .flex()
             .flex_col()
-            .text_color(content(1.))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                if event.keystroke.key == "escape" && !this.terminal_focused(window, cx) {
-                    cx.emit(Event::Close);
-                    window.prevent_default();
-                    cx.stop_propagation();
-                }
-            }))
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .flex()
-                    .items_start()
-                    .gap_2()
-                    .px_4()
-                    .pt_3()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .pt(px(2.))
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .text_size(px(16.))
-                                    .line_height(px(20.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Codespaces setup"),
-                            )
-                            .child(
-                                div()
-                                    .mt(px(2.))
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(px(12.))
-                                    .line_height(px(16.5))
-                                    .text_color(content(0.5))
-                                    .child(format!(
-                                        "Secrets for running {} in a GitHub codespace",
-                                        self.name
-                                    )),
-                            ),
-                    )
-                    .child(
-                        icon_button("codespaces-close", "Close Codespaces setup", "close")
-                            .size(px(28.))
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::Close))),
-                    ),
-            )
-            .child(
-                div()
-                    .id("codespaces-dialog-body")
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .gap_4()
-                    .p_4()
-                    .children(body),
-            )
+            .gap_3()
+            .children(body)
     }
 }

@@ -39,7 +39,7 @@ pub(super) fn begin_cloud_create(
             let config = request
                 .config
                 .as_ref()
-                .ok_or("Set up Docker Sandbox for this project first.")?;
+                .ok_or("Set up Docker Sandbox in the project's Cloud settings first.")?;
             cloud.begin_sandbox_start_pinned(
                 &request.project,
                 config,

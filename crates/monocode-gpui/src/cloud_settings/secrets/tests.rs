@@ -143,16 +143,16 @@ fn env(gh: &Arc<FakeGh>, origin: fn(&Path) -> Option<String>) -> Env {
     }
 }
 
-fn open(cx: &mut TestAppContext, env: Env) -> WindowHandle<CodespacesDialog> {
+fn open(cx: &mut TestAppContext, env: Env) -> WindowHandle<SecretsView> {
     open_at(cx, env, PROJECT)
 }
 
-fn open_at(cx: &mut TestAppContext, env: Env, project: &str) -> WindowHandle<CodespacesDialog> {
+fn open_at(cx: &mut TestAppContext, env: Env, project: &str) -> WindowHandle<SecretsView> {
     let project = project.to_owned();
     let window = cx.update(|cx| {
         input::bind(cx);
         cx.open_window(Default::default(), |_, cx| {
-            cx.new(|cx| CodespacesDialog::new(project, "Alpha".into(), env, cx))
+            cx.new(|cx| SecretsView::new(project, env, cx))
         })
         .unwrap()
     });
@@ -161,28 +161,23 @@ fn open_at(cx: &mut TestAppContext, env: Env, project: &str) -> WindowHandle<Cod
 }
 
 fn read<T>(
-    window: &WindowHandle<CodespacesDialog>,
+    window: &WindowHandle<SecretsView>,
     cx: &mut TestAppContext,
-    f: impl FnOnce(&CodespacesDialog, &gpui::App) -> T,
+    f: impl FnOnce(&SecretsView, &gpui::App) -> T,
 ) -> T {
     window.read_with(cx, |dialog, cx| f(dialog, cx)).unwrap()
 }
 
 fn act(
-    window: &WindowHandle<CodespacesDialog>,
+    window: &WindowHandle<SecretsView>,
     cx: &mut TestAppContext,
-    f: impl FnOnce(&mut CodespacesDialog, &mut Context<CodespacesDialog>),
+    f: impl FnOnce(&mut SecretsView, &mut Context<SecretsView>),
 ) {
     window.update(cx, |dialog, _, cx| f(dialog, cx)).unwrap();
     cx.run_until_parked();
 }
 
-fn type_in(
-    window: &WindowHandle<CodespacesDialog>,
-    cx: &mut TestAppContext,
-    key: &str,
-    text: &str,
-) {
+fn type_in(window: &WindowHandle<SecretsView>, cx: &mut TestAppContext, key: &str, text: &str) {
     window
         .update(cx, |dialog, _, cx| {
             let (_, input) = dialog.fields.iter().find(|(k, _)| k == key).unwrap();
@@ -192,7 +187,7 @@ fn type_in(
 }
 
 fn state_of(
-    window: &WindowHandle<CodespacesDialog>,
+    window: &WindowHandle<SecretsView>,
     cx: &mut TestAppContext,
     key: &str,
 ) -> Option<SecretState> {
@@ -466,27 +461,17 @@ fn closing_the_dialog_drops_typed_values(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn escape_in_the_terminal_never_closes_the_dialog(cx: &mut TestAppContext) {
+fn the_view_knows_when_its_terminal_has_the_keyboard(cx: &mut TestAppContext) {
+    // The Cloud settings dialog leaves Escape to the terminal while this is true.
     let gh = FakeGh::new(Ok(AUTH_OK));
     let window = open(cx, env(&gh, origin));
-    let closed: std::rc::Rc<std::cell::Cell<u32>> = Default::default();
-    let seen = closed.clone();
-    window
-        .update(cx, |_, _, cx| {
-            cx.subscribe(&cx.entity(), move |_, _, _: &Event, _| {
-                seen.set(seen.get() + 1)
-            })
-            .detach()
-        })
-        .unwrap();
     act(&window, cx, |dialog, cx| dialog.generate_token(cx));
     cx.refresh().unwrap();
     let visual = &mut VisualTestContext::from_window(window.into(), cx);
     visual.update(|window, cx| {
-        let handle = window
-            .root::<CodespacesDialog>()
-            .flatten()
-            .unwrap()
+        let dialog = window.root::<SecretsView>().flatten().unwrap();
+        assert!(!dialog.read(cx).terminal_focused(window, cx));
+        let handle = dialog
             .read(cx)
             .terminal
             .as_ref()
@@ -497,24 +482,13 @@ fn escape_in_the_terminal_never_closes_the_dialog(cx: &mut TestAppContext) {
     });
     visual.run_until_parked();
     visual.update(|window, cx| {
-        let dialog = window.root::<CodespacesDialog>().flatten().unwrap();
+        let dialog = window.root::<SecretsView>().flatten().unwrap();
         assert!(dialog.read(cx).terminal_focused(window, cx));
     });
-    visual.simulate_keystrokes("escape");
-    assert_eq!(closed.get(), 0);
-    visual.update(|window, cx| {
-        let dialog = window.root::<CodespacesDialog>().flatten().unwrap();
-        assert!(dialog.read(cx).terminal.is_some());
-        // With the dialog itself focused, Escape still closes it.
-        let focus = dialog.read(cx).focus.clone();
-        window.focus(&focus, cx);
-    });
-    visual.simulate_keystrokes("escape");
-    assert_eq!(closed.get(), 1);
 }
 
 fn field_center(
-    window: &WindowHandle<CodespacesDialog>,
+    window: &WindowHandle<SecretsView>,
     cx: &mut TestAppContext,
 ) -> gpui::Point<gpui::Pixels> {
     cx.refresh().unwrap();
@@ -525,7 +499,7 @@ fn field_center(
         .center()
 }
 
-fn typed_token(window: &WindowHandle<CodespacesDialog>, cx: &mut TestAppContext) -> String {
+fn typed_token(window: &WindowHandle<SecretsView>, cx: &mut TestAppContext) -> String {
     read(window, cx, |dialog, cx| {
         dialog.fields[0].1.read(cx).content.to_string()
     })
@@ -796,10 +770,7 @@ fn exited(tail: &str) -> TerminalEvent {
     }
 }
 
-fn terminal_of(
-    window: &WindowHandle<CodespacesDialog>,
-    cx: &mut TestAppContext,
-) -> Entity<Terminal> {
+fn terminal_of(window: &WindowHandle<SecretsView>, cx: &mut TestAppContext) -> Entity<Terminal> {
     read(window, cx, |dialog, _| dialog.terminal.clone().unwrap())
 }
 
@@ -888,7 +859,6 @@ fn an_exit_after_the_dialog_shut_down_saves_nothing(cx: &mut TestAppContext) {
 fn a_token_captured_while_busy_is_saved_when_the_work_ends(cx: &mut TestAppContext) {
     let gh = FakeGh::new(Ok(AUTH_OK));
     let window = open(cx, env(&gh, origin));
-    let closed = count_closes(&window, cx);
     act(&window, cx, |dialog, cx| dialog.generate_token(cx));
     let terminal = terminal_of(&window, cx);
     act(&window, cx, |dialog, cx| {
@@ -903,14 +873,12 @@ fn a_token_captured_while_busy_is_saved_when_the_work_ends(cx: &mut TestAppConte
         assert!(!dialog.pending_auto_save && !dialog.busy);
         assert!(!dialog.has_input(cx));
     });
-    assert_eq!(closed.get(), 1);
 }
 
 #[gpui::test]
 fn auto_save_leaves_other_typed_fields_alone(cx: &mut TestAppContext) {
     let gh = FakeGh::new(Ok(AUTH_OK));
     let window = open(cx, env(&gh, origin));
-    let closed = count_closes(&window, cx);
     act(&window, cx, |dialog, cx| {
         let input = cx.new(|cx| Input::field("OTHER".to_owned(), "x", content(0.35), cx));
         input.update(cx, |input, cx| input.set_text("half-typed".into(), cx));
@@ -927,8 +895,6 @@ fn auto_save_leaves_other_typed_fields_alone(cx: &mut TestAppContext) {
         let other = dialog.fields.iter().find(|(k, _)| k == "OTHER").unwrap();
         assert_eq!(other.1.read(cx).content, "half-typed");
     });
-    // Closing would throw the typed value away.
-    assert_eq!(closed.get(), 0);
 }
 
 #[gpui::test]
@@ -951,7 +917,6 @@ fn a_save_does_not_clear_a_token_filled_after_it_started(cx: &mut TestAppContext
 fn a_deferred_auto_save_keeps_the_error_of_the_save_it_waited_for(cx: &mut TestAppContext) {
     let gh = FakeGh::new(Ok(AUTH_OK)).failing("OTHER");
     let window = open(cx, env(&gh, origin));
-    let closed = count_closes(&window, cx);
     act(&window, cx, |dialog, cx| dialog.generate_token(cx));
     let terminal = terminal_of(&window, cx);
     act(&window, cx, |dialog, cx| {
@@ -971,51 +936,43 @@ fn a_deferred_auto_save_keeps_the_error_of_the_save_it_waited_for(cx: &mut TestA
         let other = dialog.fields.iter().find(|(k, _)| k == "OTHER").unwrap();
         assert_eq!(other.1.read(cx).content, "value");
     });
-    // The kept error means the work is not finished: the dialog stays open.
-    assert_eq!(closed.get(), 0);
-}
-
-fn count_closes(
-    window: &WindowHandle<CodespacesDialog>,
-    cx: &mut TestAppContext,
-) -> std::rc::Rc<std::cell::Cell<u32>> {
-    let closed: std::rc::Rc<std::cell::Cell<u32>> = Default::default();
-    let seen = closed.clone();
-    window
-        .update(cx, |_, _, cx| {
-            cx.subscribe(&cx.entity(), move |_, _, _: &Event, _| {
-                seen.set(seen.get() + 1)
-            })
-            .detach()
-        })
-        .unwrap();
-    closed
 }
 
 #[gpui::test]
-fn a_successful_auto_save_with_everything_set_closes_the_dialog(cx: &mut TestAppContext) {
+fn a_successful_auto_save_with_everything_set_reports_it_and_stays(cx: &mut TestAppContext) {
     let gh = FakeGh::new(Ok(AUTH_OK));
     let window = open(cx, env(&gh, origin));
-    let closed = count_closes(&window, cx);
     act(&window, cx, |dialog, cx| dialog.generate_token(cx));
     let terminal = terminal_of(&window, cx);
     act(&window, cx, |_, cx| emit(&terminal, exited(TOKEN), cx));
     assert_eq!(gh.sets().len(), 1);
-    assert_eq!(closed.get(), 1);
+    read(&window, cx, |dialog, _| {
+        assert_eq!(
+            dialog.notice.as_deref(),
+            Some("Saved CLAUDE_CODE_OAUTH_TOKEN.")
+        );
+        assert!(dialog.error.is_none());
+    });
 }
 
 #[gpui::test]
-fn a_manual_save_with_everything_set_closes_the_dialog(cx: &mut TestAppContext) {
+fn a_manual_save_with_everything_set_reports_it_and_empties_the_field(cx: &mut TestAppContext) {
     let gh = FakeGh::new(Ok(AUTH_OK));
     let window = open(cx, env(&gh, origin));
-    let closed = count_closes(&window, cx);
     type_in(&window, cx, "CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-manual");
     act(&window, cx, |dialog, cx| dialog.save(cx));
-    assert_eq!(closed.get(), 1);
+    assert_eq!(gh.sets().len(), 1);
+    read(&window, cx, |dialog, cx| {
+        assert_eq!(
+            dialog.notice.as_deref(),
+            Some("Saved CLAUDE_CODE_OAUTH_TOKEN.")
+        );
+        assert_eq!(dialog.first_field_text(cx), "");
+    });
 }
 
 #[gpui::test]
-fn a_save_leaves_the_dialog_open_while_another_secret_is_missing(cx: &mut TestAppContext) {
+fn a_save_leaves_another_secret_missing(cx: &mut TestAppContext) {
     let dir = std::env::temp_dir().join(format!(
         "monoptah-cs-close-{}",
         monocode_core::mono::new_id()
@@ -1028,7 +985,6 @@ fn a_save_leaves_the_dialog_open_while_another_secret_is_missing(cx: &mut TestAp
     .unwrap();
     let gh = FakeGh::new(Ok(AUTH_OK));
     let window = open_at(cx, env(&gh, origin), dir.to_str().unwrap());
-    let closed = count_closes(&window, cx);
     type_in(&window, cx, "CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-manual");
     act(&window, cx, |dialog, cx| dialog.save(cx));
     std::fs::remove_dir_all(dir).ok();
@@ -1037,15 +993,16 @@ fn a_save_leaves_the_dialog_open_while_another_secret_is_missing(cx: &mut TestAp
         state_of(&window, cx, "NPM_TOKEN"),
         Some(SecretState::Missing)
     );
-    assert_eq!(closed.get(), 0);
 }
 
 #[gpui::test]
-fn a_failed_save_leaves_the_dialog_open(cx: &mut TestAppContext) {
+fn a_failed_save_keeps_the_value_and_reports_the_key(cx: &mut TestAppContext) {
     let gh = FakeGh::new(Ok(AUTH_OK)).failing("CLAUDE_CODE_OAUTH_TOKEN");
     let window = open(cx, env(&gh, origin));
-    let closed = count_closes(&window, cx);
     type_in(&window, cx, "CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-manual");
     act(&window, cx, |dialog, cx| dialog.save(cx));
-    assert_eq!(closed.get(), 0);
+    read(&window, cx, |dialog, cx| {
+        assert!(dialog.error.is_some());
+        assert_eq!(dialog.first_field_text(cx), "sk-ant-oat-manual");
+    });
 }

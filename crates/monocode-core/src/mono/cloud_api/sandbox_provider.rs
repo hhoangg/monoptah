@@ -344,7 +344,7 @@ impl CloudProvider for SandboxProvider {
             return Ok(CloudStart::Attached(session, cloud, state));
         }
         let mut config = self.config(project)?.ok_or(
-            "Docker Sandbox is not set up for this project. Set it up in the project's Docker Sandbox settings first.",
+            "Docker Sandbox is not set up for this project. Set it up in the project's Cloud settings first.",
         )?;
         if let Some(cpus) = options.get("cpus").and_then(Value::as_u64) {
             config.cpus = u32::try_from(cpus).map_err(|_| "cpus is too large")?;

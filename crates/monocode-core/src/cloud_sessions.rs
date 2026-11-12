@@ -2119,6 +2119,7 @@ pub mod move_out;
 pub mod move_session;
 pub mod move_ui;
 pub mod project_cloud;
+pub mod readiness;
 pub use backend::{CloudBackend, CloudBackendKind, CloudRef, CodespacesBackend};
 
 mod continue_local;

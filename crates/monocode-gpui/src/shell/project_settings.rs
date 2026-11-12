@@ -98,7 +98,7 @@ impl Shell {
                 }
                 if this.background_dialog.is_none()
                     && !this.telegram.dialog_open()
-                    && this.codespaces.is_none()
+                    && this.cloud_settings.is_none()
                 {
                     this.focus_workspace(window, cx);
                 }
