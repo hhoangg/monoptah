@@ -210,6 +210,7 @@ fn sandbox_machine() -> Machine {
             relay_port: 1,
             config: None,
             mode: Default::default(),
+            docker_account: None,
         }),
     }
 }

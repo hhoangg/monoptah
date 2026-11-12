@@ -2769,6 +2769,7 @@ fn sandbox_machine() -> Machine {
             relay_port: 47200,
             config: None,
             mode: Default::default(),
+            docker_account: None,
         }),
     }
 }
@@ -3247,6 +3248,12 @@ fn a_sandbox_terminal_runs_ssh_into_the_container_and_a_missing_connection_says_
             assert!(remote.contains("/home/agent/widgets"), "{remote}");
             assert!(remote.ends_with("-- bash -l"), "{remote}");
             assert!(spec.env_set.iter().any(|(key, _)| key == "PATH"));
+            // No Docker account on this sandbox: nothing is added to the machine's sign-in.
+            assert!(
+                spec.env_set
+                    .iter()
+                    .all(|(key, _)| key != "DOCKER_ACCESS_TOKEN")
+            );
             assert_eq!(terminal.cwd, crate::terminal::home_cwd());
         })
         .unwrap();
@@ -3365,6 +3372,7 @@ fn the_sandbox_terminal_args_carry_the_connection_options_and_the_delete_note_is
     let args = cloud::sandbox_ssh_args(&monocode_core::cloud_sessions::SandboxTerminal {
         destination: "sbx_1abc@sbx_cloud".into(),
         remote: "devcontainer exec -- bash -l".into(),
+        docker_account: None,
     });
     let args: Vec<String> = args
         .iter()
@@ -3394,7 +3402,7 @@ fn the_sandbox_terminal_args_carry_the_connection_options_and_the_delete_note_is
     }]);
     assert_eq!(cloud::delete_start_note(&cs, true), None);
     assert_eq!(
-        cloud::remove_confirm_body("Fix  login", "box-1"),
+        cloud::remove_confirm_body("Fix  login", "box-1", None),
         "Remove \u{2018}Fix login\u{2019} from Monoptah? The sandbox box-1 keeps existing and keeps \
          costing money until you delete it (`sbx --cloud rm box-1`). Its conversation is not saved \
          on this computer."
@@ -5066,4 +5074,34 @@ fn a_cloud_session_is_marked_beside_its_title_and_a_local_one_is_not(cx: &mut Te
             );
         })
         .unwrap();
+}
+
+#[test]
+fn a_sandbox_terminal_environment_adds_a_token_only_for_a_docker_account() {
+    let terminal = |docker_account: Option<&str>| monocode_core::cloud_sessions::SandboxTerminal {
+        destination: "sbx_1abc@sbx_cloud".into(),
+        remote: "devcontainer exec -- bash -l".into(),
+        docker_account: docker_account.map(str::to_owned),
+    };
+    let plain = cloud::sandbox_terminal_env(&terminal(None)).unwrap();
+    assert_eq!(plain.len(), 1);
+    assert_eq!(plain[0].0, "PATH");
+    // An account that cannot produce a token (none is installed in this test) is an error
+    // that opens no terminal, not a terminal on the machine's sign-in.
+    let error = cloud::sandbox_terminal_env(&terminal(Some("acct-1"))).unwrap_err();
+    assert!(
+        error.contains("Docker accounts are not available"),
+        "{error}"
+    );
+    assert!(!error.contains("sbx login"), "{error}");
+}
+
+#[test]
+fn removing_a_sandbox_session_locally_names_the_account_its_delete_command_needs() {
+    assert_eq!(
+        cloud::remove_confirm_body("Fix login", "box-1", Some("Docker account alice")),
+        "Remove \u{2018}Fix login\u{2019} from Monoptah? The sandbox box-1 keeps existing and keeps \
+         costing money until you delete it (`sbx --cloud rm box-1`, which must run with the token of \
+         Docker account alice). Its conversation is not saved on this computer."
+    );
 }

@@ -880,6 +880,10 @@ impl CloudSessions {
     /// Registers the Docker sandbox backend over the real `sbx`, `ssh` and the app's own
     /// secret store. Nothing runs until a sandbox session is used.
     pub fn with_system_sandboxes(self, store: Database) -> Self {
+        // Docker accounts: `sbx` and ssh get the JWT of a project's account from here.
+        if let Ok(guard) = store.lock() {
+            crate::docker_accounts::install_system(&guard);
+        }
         let secrets = Arc::new(docker_start::StoreSecrets::new(store));
         self.with_sandboxes(
             Arc::new(crate::sandboxes::SystemSbx),
@@ -906,6 +910,27 @@ impl CloudSessions {
             .lock()
             .map_err(|_| "Native session store unavailable".into())
     }
+    /// The Docker account sandbox `name` lives in: the one that created it (pinned per
+    /// sandbox name), not the project's current choice. `None` is the machine's `sbx login`,
+    /// also for a sandbox created before accounts existed.
+    pub fn sandbox_account(&self, name: &str) -> Option<String> {
+        match &self.sandbox {
+            Some(deps) => deps.backend.account_of(name),
+            None => self
+                .store()
+                .ok()
+                .and_then(|store| crate::sandboxes::account::pinned(&store, name)),
+        }
+    }
+
+    /// How to name the Docker account of sandbox `name` to the user (its Docker ID), or
+    /// `None` when the sandbox uses the machine login.
+    pub fn sandbox_account_label(&self, name: &str) -> Option<String> {
+        let account = self.sandbox_account(name)?;
+        let store = self.store().ok()?;
+        Some(crate::sandboxes::account::describe(&store, &account))
+    }
+
     /// The codespace part of the project's cloud settings; the defaults when none is saved
     /// or the saved settings cannot be read (a start then behaves as before the settings
     /// existed).
@@ -1750,6 +1775,23 @@ pub struct SandboxTerminal {
     /// The single remote word: `devcontainer exec ... -- bash -l`, or `cd <workspace> && bash
     /// -l` for a sandbox without a devcontainer.
     pub remote: String,
+    /// The Docker account the sandbox lives in; `None` is the machine's `sbx login`. The
+    /// ssh needs its token in the environment: [`Self::env`].
+    pub docker_account: Option<String>,
+}
+
+impl SandboxTerminal {
+    /// The environment pairs the terminal's ssh must run with, resolved now (the JWT is
+    /// short-lived, so call this when the terminal is spawned, not when the menu opens).
+    /// Empty without an account. The token is in the environment only, never argv.
+    pub fn env(&self) -> Result<Vec<(String, std::ffi::OsString)>, String> {
+        let pair = crate::docker_accounts::env_for(self.docker_account.as_deref())
+            .map_err(|e| e.to_string())?;
+        Ok(pair
+            .into_iter()
+            .map(|(name, token)| (name.to_owned(), std::ffi::OsString::from(token.as_str())))
+            .collect())
+    }
 }
 
 /// The Host worktree a session runs in, as the store recorded it, unless that worktree was
@@ -1831,6 +1873,10 @@ impl CloudSessions {
         Ok(SandboxTerminal {
             destination: crate::sandboxes::ssh_destination(&target.id),
             remote: target.exec_in_container(&["bash", "-l"]),
+            docker_account: target
+                .docker_account
+                .clone()
+                .or_else(|| self.sandbox_account(&cloud.name)),
         })
     }
 }

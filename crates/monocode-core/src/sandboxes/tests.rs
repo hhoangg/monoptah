@@ -654,3 +654,411 @@ fn redaction_masks_jwts_and_oat_tokens() {
     assert_eq!(redact("eyJhbGci.only-two"), "eyJhbGci.only-two");
     assert_eq!(redact("version 1.2.3 ready"), "version 1.2.3 ready");
 }
+
+// --------------------------------------------------------------- Docker accounts
+
+mod accounts {
+    use super::super::test_support::AccountSbx;
+    use super::*;
+    use crate::docker_accounts::test_support::{Installed, Uninstalled};
+    use crate::docker_accounts::{ACCESS_TOKEN_VAR, REJECTED_MARKER};
+
+    fn rejected() -> Result<SbxOutput, String> {
+        fail(&format!("error: {REJECTED_MARKER}: invalid token"))
+    }
+    fn env_of(command: &Command, key: &str) -> Option<String> {
+        command
+            .get_envs()
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_string_lossy().into_owned())
+    }
+    fn argv_of(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+    const SBX: &str = "/nonexistent/sbx";
+
+    #[test]
+    fn every_verb_helper_runs_as_the_account_it_is_bound_to() {
+        let sbx = AccountSbx::new();
+        sbx.add("sbx_001a", "box-1", "running", Some("A"));
+        let a = as_account(&sbx, Some("A"));
+        assert_eq!(list(&a).unwrap().len(), 1);
+        assert!(find_by_name(&a, "box-1").unwrap().is_some());
+        assert_eq!(inspect(&a, "sbx_001a").unwrap().name, "box-1");
+        assert_eq!(state(&a, "sbx_001a").unwrap(), "running");
+        let created = create(&a, "box-2", &Compute::default()).unwrap();
+        stop(&a, "sbx_001a").unwrap();
+        delete(&a, &created).unwrap();
+        let calls = sbx.calls();
+        assert_eq!(calls.len(), 7, "{calls:?}");
+        assert!(
+            calls
+                .iter()
+                .all(|(_, account)| account.as_deref() == Some("A")),
+            "{calls:?}"
+        );
+        for verb in ["ls", "inspect", "create", "stop", "rm"] {
+            assert!(
+                calls.iter().any(|(v, _)| v == verb),
+                "no {verb} call in {calls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_account_means_the_machine_login_and_never_sees_an_accounts_sandbox() {
+        let sbx = AccountSbx::new();
+        sbx.add("sbx_001a", "box-1", "running", Some("A"));
+        sbx.add("sbx_002b", "box-2", "running", None);
+        let machine = as_account(&sbx, None);
+        assert_eq!(list(&machine).unwrap().len(), 1);
+        assert!(find_by_name(&machine, "box-1").unwrap().is_none());
+        assert!(is_deleted(
+            &inspect(&machine, "sbx_001a").unwrap_err(),
+            "sbx_001a"
+        ));
+        assert!(sbx.calls().iter().all(|(_, account)| account.is_none()));
+        // Another account sees neither.
+        let other = as_account(&sbx, Some("B"));
+        assert!(list(&other).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_unbound_runner_call_is_the_machine_login() {
+        let sbx = AccountSbx::new();
+        list(&sbx).unwrap();
+        assert_eq!(sbx.calls(), [("ls".to_string(), None)]);
+    }
+
+    // ---- the environment of the real runner
+
+    #[test]
+    fn the_account_token_goes_in_the_environment_never_in_argv() {
+        let installed = Installed::new();
+        let id = installed.add("alice");
+        let argv = args(&["ls", "--format", "json"]);
+        let command = SystemSbx::command(Path::new(SBX), &argv, Some(&id)).unwrap();
+        let token = installed.hub.last();
+        assert_eq!(env_of(&command, ACCESS_TOKEN_VAR).as_deref(), Some(&*token));
+        assert!(
+            argv_of(&command).iter().all(|a| !a.contains(&token)),
+            "{:?}",
+            argv_of(&command)
+        );
+        // The argv is today's argv.
+        assert_eq!(
+            argv_of(&command),
+            ["--cloud", "--no-input", "ls", "--format", "json"]
+        );
+    }
+
+    #[test]
+    fn without_an_account_no_variable_is_added_and_the_argv_is_unchanged() {
+        let _installed = Installed::new();
+        let argv = args(&["ls", "--format", "json"]);
+        let command = SystemSbx::command(Path::new(SBX), &argv, None).unwrap();
+        assert!(
+            command.get_envs().all(|(k, _)| k != ACCESS_TOKEN_VAR),
+            "no account must add no token"
+        );
+        assert_eq!(
+            argv_of(&command),
+            ["--cloud", "--no-input", "ls", "--format", "json"]
+        );
+    }
+
+    #[test]
+    fn an_account_that_cannot_produce_a_token_is_an_error_not_the_machine_login() {
+        {
+            let _none = Uninstalled::new();
+            let error =
+                SystemSbx::command(Path::new(SBX), &args(&["ls"]), Some("acct")).unwrap_err();
+            assert!(error.contains("not available"), "{error}");
+        }
+        let installed = Installed::new();
+        let error = SystemSbx::command(Path::new(SBX), &args(&["ls"]), Some("no-such-account"))
+            .unwrap_err();
+        assert!(error.contains("no longer exists"), "{error}");
+        assert_eq!(installed.hub.calls(), 0);
+    }
+
+    #[test]
+    fn a_fresh_token_is_read_for_every_new_process() {
+        let installed = Installed::new();
+        let id = installed.add("alice");
+        let a = SystemSbx::command(Path::new(SBX), &args(&["ls"]), Some(&id)).unwrap();
+        let b = SystemSbx::command(Path::new(SBX), &args(&["ls"]), Some(&id)).unwrap();
+        // Two exchanges only when the first JWT is no longer usable; here it is cached.
+        assert_eq!(
+            env_of(&a, ACCESS_TOKEN_VAR),
+            env_of(&b, ACCESS_TOKEN_VAR),
+            "a cached JWT is reused while it has time left"
+        );
+        assert_eq!(
+            installed.hub.calls(),
+            2,
+            "one for add, one for the first command"
+        );
+    }
+
+    // ---- rejected: invalidate, retry once
+
+    #[test]
+    fn a_rejected_token_is_dropped_and_the_call_is_retried_once_with_a_fresh_one() {
+        let installed = Installed::new();
+        let id = installed.add("alice");
+        let before = installed.hub.calls();
+        let mut tokens = Vec::new();
+        let mut replies = VecDeque::from([rejected(), ok("[]")]);
+        let result = run_as_account(Some(&id), &mut || {
+            let command = SystemSbx::command(Path::new(SBX), &args(&["ls"]), Some(&id)).unwrap();
+            tokens.push(env_of(&command, ACCESS_TOKEN_VAR).unwrap());
+            replies.pop_front().unwrap()
+        })
+        .unwrap();
+        assert!(result.success);
+        assert_eq!(tokens.len(), 2, "exactly one retry");
+        assert_ne!(tokens[0], tokens[1], "the retry carries a fresh JWT");
+        assert_eq!(tokens[1], installed.hub.last());
+        assert_eq!(installed.hub.calls() - before, 2, "two exchanges in all");
+    }
+
+    #[test]
+    fn a_second_rejection_reports_the_account_as_revoked_and_stops() {
+        let installed = Installed::new();
+        let id = installed.add("alice");
+        let mut attempts = 0;
+        let error = run_as_account(Some(&id), &mut || {
+            attempts += 1;
+            rejected()
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 2, "no third attempt");
+        assert_eq!(
+            error,
+            "Docker account alice: token revoked or expired. Replace it in Settings > Cloud."
+        );
+        for jwt in installed.hub.issued() {
+            assert!(!error.contains(&jwt));
+        }
+    }
+
+    #[test]
+    fn a_rejection_without_an_account_is_not_retried() {
+        let _installed = Installed::new();
+        let mut attempts = 0;
+        let out = run_as_account(None, &mut || {
+            attempts += 1;
+            rejected()
+        })
+        .unwrap();
+        assert_eq!(attempts, 1);
+        assert!(!out.success);
+    }
+
+    #[test]
+    fn another_failure_with_an_account_is_not_retried() {
+        let installed = Installed::new();
+        let id = installed.add("alice");
+        let mut attempts = 0;
+        let out = run_as_account(Some(&id), &mut || {
+            attempts += 1;
+            fail("error: connection refused")
+        })
+        .unwrap();
+        assert_eq!(attempts, 1);
+        assert!(!out.success);
+    }
+
+    #[test]
+    fn a_spawn_failure_is_passed_through_untouched() {
+        let installed = Installed::new();
+        let id = installed.add("alice");
+        let mut attempts = 0;
+        let error = run_as_account(Some(&id), &mut || {
+            attempts += 1;
+            Err(SBX_MISSING.to_string())
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert_eq!(error, SBX_MISSING);
+    }
+
+    // ---- a real process (a shell script named like sbx)
+
+    #[cfg(unix)]
+    fn script(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("sbx");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_real_process_sees_the_token_only_for_an_account() {
+        let installed = Installed::new();
+        let id = installed.add("alice");
+        let dir = tempfile::tempdir().unwrap();
+        // Prints whether the variable is set, and whether the JWT is in argv. Never the value.
+        let program = script(
+            dir.path(),
+            r#"if [ -n "$DOCKER_ACCESS_TOKEN" ]; then echo set; else echo unset; fi
+case "$*" in *eyJ*) echo argv-leak;; esac"#,
+        );
+        let with = run_piped(
+            SystemSbx::command(&program, &args(&["ls"]), Some(&id)).unwrap(),
+            None,
+            Duration::from_secs(20),
+            "ls",
+        )
+        .unwrap();
+        assert_eq!(with.stdout.trim(), "set");
+        assert!(!with.stdout.contains("argv-leak"));
+
+        let mut plain = SystemSbx::command(&program, &args(&["ls"]), None).unwrap();
+        // Whatever the test runner inherited, the account-less call adds nothing of its own.
+        plain.env_remove(ACCESS_TOKEN_VAR);
+        let without = run_piped(plain, None, Duration::from_secs(20), "ls").unwrap();
+        assert_eq!(without.stdout.trim(), "unset");
+        for jwt in installed.hub.issued() {
+            assert!(!with.stdout.contains(&jwt) && !with.stderr.contains(&jwt));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_real_process_that_keeps_rejecting_is_run_exactly_twice() {
+        let installed = Installed::new();
+        let id = installed.add("alice");
+        let dir = tempfile::tempdir().unwrap();
+        let count = dir.path().join("count");
+        let program = script(
+            dir.path(),
+            &format!(
+                "echo run >> '{}'\necho '{REJECTED_MARKER}' >&2\nexit 1",
+                count.display()
+            ),
+        );
+        let error = run_as_account(Some(&id), &mut || {
+            run_piped(
+                SystemSbx::command(&program, &args(&["ls"]), Some(&id)).unwrap(),
+                None,
+                Duration::from_secs(20),
+                "ls",
+            )
+        })
+        .unwrap_err();
+        assert!(error.contains("token revoked or expired"), "{error}");
+        assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 2);
+    }
+
+    // ---- diagnose
+
+    #[test]
+    fn diagnose_without_an_account_is_unchanged() {
+        let home = tempfile::tempdir().unwrap();
+        let logged_out = Fake::new(vec![fail("error: not logged in\n  try: sbx login")]);
+        let status = diagnose_as(&logged_out, home.path(), None);
+        assert!(matches!(status, Prerequisites::NotLoggedIn(_)));
+        assert_eq!(status.fix_command(), Some("sbx login"));
+    }
+
+    #[test]
+    fn an_account_problem_never_advises_sbx_login() {
+        let installed = Installed::new();
+        let id = installed.add("alice");
+        let home = tempfile::tempdir().unwrap();
+        write(&home.path().join(".ssh/config"), "Host sbx_cloud\n");
+        for stderr in [
+            "error: not logged in\n  try: sbx login".to_string(),
+            "error: unauthorized".to_string(),
+            format!("error: {REJECTED_MARKER}"),
+        ] {
+            let fake = Fake::new(vec![fail(&stderr)]);
+            let status = diagnose_as(&fake, home.path(), Some(&id));
+            assert!(
+                matches!(&status, Prerequisites::DockerAccount(_)),
+                "{stderr} -> {status:?}"
+            );
+            assert_eq!(status.fix_command(), None);
+            assert!(
+                !status.message().contains("sbx login"),
+                "{}",
+                status.message()
+            );
+            assert!(
+                status.message().contains("Settings > Cloud"),
+                "{}",
+                status.message()
+            );
+        }
+        // The second rejection of the real runner arrives as an error text.
+        let revoked = Fake::new(vec![Err(
+            "Docker account alice: token revoked or expired. Replace it in Settings > Cloud."
+                .into(),
+        )]);
+        let status = diagnose_as(&revoked, home.path(), Some(&id));
+        assert_eq!(
+            status,
+            Prerequisites::DockerAccount(
+                "Docker account alice: token revoked or expired. Replace it in Settings > Cloud."
+                    .into()
+            )
+        );
+        for jwt in installed.hub.issued() {
+            assert!(!status.message().contains(&jwt));
+        }
+    }
+
+    #[test]
+    fn an_unknown_account_is_reported_before_sbx_is_asked() {
+        let _installed = Installed::new();
+        let home = tempfile::tempdir().unwrap();
+        let fake = Fake::new(vec![ok("[]")]);
+        let status = diagnose_as(&fake, home.path(), Some("gone"));
+        assert!(
+            matches!(&status, Prerequisites::DockerAccount(m) if m.contains("no longer exists"))
+        );
+        assert_eq!(fake.count(), 0);
+    }
+
+    #[test]
+    fn an_account_without_the_installed_accounts_is_reported_as_such() {
+        let _none = Uninstalled::new();
+        let home = tempfile::tempdir().unwrap();
+        let fake = Fake::new(vec![ok("[]")]);
+        let status = diagnose_as(&fake, home.path(), Some("acct"));
+        assert!(matches!(&status, Prerequisites::DockerAccount(m) if m.contains("not available")));
+        assert_eq!(fake.count(), 0);
+    }
+
+    #[test]
+    fn a_ready_account_probes_as_that_account() {
+        let installed = Installed::new();
+        let id = installed.add("alice");
+        let home = tempfile::tempdir().unwrap();
+        write(&home.path().join(".ssh/config"), "Host sbx_cloud\n");
+        let sbx = AccountSbx::new();
+        let status = diagnose_as(&sbx, home.path(), Some(&id));
+        assert!(status.is_ready(), "{status:?}");
+        assert_eq!(sbx.accounts_of("ls"), [Some(id)]);
+        drop(installed);
+    }
+
+    #[test]
+    fn sbx_output_that_echoes_a_token_is_redacted_in_the_error() {
+        let installed = Installed::new();
+        let id = installed.add("alice");
+        let jwt = installed.hub.last();
+        let fake = Fake::new(vec![fail(&format!("error: bad credential {jwt}"))]);
+        let error = list(&as_account(&fake, Some(&id))).unwrap_err();
+        assert!(!error.contains(&jwt), "{error}");
+        assert!(error.contains("[redacted]"));
+    }
+}

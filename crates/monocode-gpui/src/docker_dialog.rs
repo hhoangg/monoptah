@@ -194,10 +194,15 @@ impl DockerDialog {
         self.access = Access::Checking;
         cx.notify();
         let (sbx, home) = (self.env.sbx.clone(), self.env.home.clone());
+        // The saved config's account: this dialog does not edit it, and the check must ask
+        // as the account the project will use.
+        let account = self.saved.as_ref().and_then(|c| c.docker_account.clone());
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { model::check_access(sbx.as_ref(), home.as_deref()) })
+                .spawn(async move {
+                    model::check_access(sbx.as_ref(), home.as_deref(), account.as_deref())
+                })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.access = Access::Done(result);

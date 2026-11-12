@@ -50,10 +50,15 @@ impl Access {
     }
 }
 
-/// Runs the read-only prerequisite check (`sbx ls` plus a look at the SSH config).
-pub(super) fn check_access(runner: &dyn SbxRunner, home: Option<&Path>) -> Prerequisites {
+/// Runs the read-only prerequisite check (`sbx ls` plus a look at the SSH config), as the
+/// project's Docker account when it names one (`None`: the machine's `sbx login`).
+pub(super) fn check_access(
+    runner: &dyn SbxRunner,
+    home: Option<&Path>,
+    account: Option<&str>,
+) -> Prerequisites {
     match home {
-        Some(home) => sandboxes::diagnose(runner, home),
+        Some(home) => sandboxes::diagnose_as(runner, home, account),
         None => Prerequisites::Unreachable("The home directory is unknown.".into()),
     }
 }

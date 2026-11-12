@@ -168,6 +168,7 @@ pub(crate) mod fakes {
                 relay_port: 47200,
                 config: None,
                 mode: Default::default(),
+                docker_account: None,
             }),
         }
     }

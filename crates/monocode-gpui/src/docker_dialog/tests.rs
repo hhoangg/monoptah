@@ -267,7 +267,7 @@ fn only_credentials_for_the_repository_host_are_offered() {
 #[test]
 fn access_shows_the_exact_command_to_run() {
     let fixture = fixture(true);
-    let out = model::check_access(fixture.sbx.as_ref(), Some(&fixture.home.0));
+    let out = model::check_access(fixture.sbx.as_ref(), Some(&fixture.home.0), None);
     assert!(matches!(out, Prerequisites::NotLoggedIn(_)));
     let access = Access::Done(out);
     assert_eq!(access.fix(), Some("sbx login"));
@@ -286,6 +286,7 @@ fn fixture_ready() -> Access {
     Access::Done(model::check_access(
         fixture.sbx.as_ref(),
         Some(&fixture.home.0),
+        None,
     ))
 }
 
@@ -409,6 +410,38 @@ fn a_saved_config_is_not_replaced_by_the_origin(cx: &mut TestAppContext) {
     dialog.read_with(cx, |d, cx| {
         assert_eq!(d.field_text(Field::Repo, cx), "https://gitlab.com/g/r");
     });
+}
+
+#[gpui::test]
+fn the_access_check_asks_as_the_saved_docker_account_and_never_advises_sbx_login(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture(true);
+    let saved = DockerProjectConfig {
+        repo_url: "https://github.com/acme/alpha.git".into(),
+        docker_account: Some("acct-1".into()),
+        ..Default::default()
+    };
+    docker_config::save(&fixture.store.lock().unwrap(), "/p", &saved).unwrap();
+    let dialog =
+        cx.new(|cx| DockerDialog::new("/p".into(), "alpha".into(), fixture.env(https_origin), cx));
+    cx.run_until_parked();
+    dialog.read_with(cx, |dialog, _| {
+        // No Docker accounts are installed in this test, so the account cannot give a token:
+        // that is the answer, not the machine login's "run sbx login".
+        assert!(!dialog.access.is_ready());
+        assert_eq!(dialog.access.fix(), None);
+        assert!(
+            dialog.access.line().contains("not available"),
+            "{}",
+            dialog.access.line()
+        );
+        assert!(!dialog.access.line().contains("sbx login"));
+    });
+    assert!(
+        fixture.sbx.calls.lock().unwrap().is_empty(),
+        "sbx was not run as the machine login instead"
+    );
 }
 
 #[gpui::test]

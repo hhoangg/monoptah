@@ -3,6 +3,12 @@
 //! Every `sbx` call goes through the injectable [`SbxRunner`] so tests never touch the
 //! network or the real cloud. Secret values only ever travel over stdin, never in argv.
 //!
+//! Every call also names the Docker account it runs as ([`SbxRunner::run_as`]; the verb
+//! helpers take a runner, and [`as_account`] binds one to an account). `None` is the
+//! machine's `sbx login`, today's behavior; an account runs `sbx` with a fresh
+//! `DOCKER_ACCESS_TOKEN` in its environment ([`crate::docker_accounts::env_for`]).
+//! [`SystemSbx`] is the only place an `sbx` process is spawned.
+//!
 //! Two rules shape this module:
 //!
 //! * Every call is `sbx --cloud --no-input ...`: the app only ever talks to cloud
@@ -19,6 +25,10 @@ use std::time::Duration;
 use serde::{Deserialize, Deserializer};
 
 use crate::cloud_sessions::CloudState;
+
+pub mod account;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 /// Default sandbox lifetime before `--on-timeout stop` stops it.
 pub const DEFAULT_TTL: &str = "2h";
@@ -48,7 +58,51 @@ pub struct SbxOutput {
 
 /// Runs `sbx` with the given arguments. `Err` means sbx could not be started.
 pub trait SbxRunner: Send + Sync {
+    /// Runs as the machine's `sbx login`.
     fn run(&self, args: &[String], stdin: Option<&str>) -> Result<SbxOutput, String>;
+    /// Runs as Docker account `account` (an id from [`crate::docker_accounts`]); `None` is
+    /// [`Self::run`]. The default ignores the account, so a runner that never talks to the
+    /// real `sbx` (every fake) needs no change; [`SystemSbx`] honors it. `Err` is also what
+    /// an account that cannot produce a token reports (never a fallback to the machine
+    /// login).
+    fn run_as(
+        &self,
+        account: Option<&str>,
+        args: &[String],
+        stdin: Option<&str>,
+    ) -> Result<SbxOutput, String> {
+        let _ = account;
+        self.run(args, stdin)
+    }
+}
+
+/// A runner bound to one Docker account: every call of the verb helpers made through it
+/// runs as that account. Build it with [`as_account`].
+pub struct AsAccount<'a> {
+    runner: &'a dyn SbxRunner,
+    account: Option<String>,
+}
+
+/// `runner` bound to `account` (`None` keeps the machine login).
+pub fn as_account<'a>(runner: &'a dyn SbxRunner, account: Option<&str>) -> AsAccount<'a> {
+    AsAccount {
+        runner,
+        account: account.map(str::to_owned),
+    }
+}
+
+impl SbxRunner for AsAccount<'_> {
+    fn run(&self, args: &[String], stdin: Option<&str>) -> Result<SbxOutput, String> {
+        self.runner.run_as(self.account.as_deref(), args, stdin)
+    }
+    fn run_as(
+        &self,
+        account: Option<&str>,
+        args: &[String],
+        stdin: Option<&str>,
+    ) -> Result<SbxOutput, String> {
+        self.runner.run_as(account, args, stdin)
+    }
 }
 
 /// Real runner: resolves `sbx` on the login-shell PATH like the other CLIs.
@@ -56,17 +110,51 @@ pub trait SbxRunner: Send + Sync {
 pub struct SystemSbx;
 
 impl SystemSbx {
-    fn command(args: &[String]) -> Result<Command, String> {
-        let program =
-            crate::scm::resolve_gui_binary("sbx").ok_or_else(|| SBX_MISSING.to_string())?;
+    /// The `sbx` process for `args`. With an account, `DOCKER_ACCESS_TOKEN` is set on the
+    /// child's environment (never argv); without one nothing is added.
+    fn command(program: &Path, args: &[String], account: Option<&str>) -> Result<Command, String> {
         let mut cmd = Command::new(program);
         cmd.args(with_base_flags(args))
             .env("NO_COLOR", "1")
             .env("GIT_TERMINAL_PROMPT", "0");
         crate::scm::shell::apply_gui_env(&mut cmd);
         crate::process::configure_child(&mut cmd);
+        // After the GUI env so an inherited DOCKER_ACCESS_TOKEN can not win over the account.
+        crate::docker_accounts::apply_env(&mut cmd, account)?;
         Ok(cmd)
     }
+}
+
+/// Runs one `sbx` call as `account`. `attempt` spawns the process (it builds the command,
+/// so every attempt reads a fresh token from the account cache). When `sbx` says the JWT was
+/// rejected, the account's cached JWT is dropped and the call is made once more; a second
+/// rejection is the account's token being revoked or expired.
+fn run_as_account(
+    account: Option<&str>,
+    attempt: &mut dyn FnMut() -> Result<SbxOutput, String>,
+) -> Result<SbxOutput, String> {
+    let rejected = |out: &SbxOutput| {
+        !out.success
+            && (crate::docker_accounts::is_rejection(&out.stderr)
+                || crate::docker_accounts::is_rejection(&out.stdout))
+    };
+    let out = attempt()?;
+    let Some(account) = account.filter(|_| rejected(&out)) else {
+        return Ok(out);
+    };
+    let access = crate::docker_accounts::shared();
+    if let Some(access) = &access {
+        access.invalidate(account);
+    }
+    let out = attempt()?;
+    if !rejected(&out) {
+        return Ok(out);
+    }
+    Err(match access {
+        Some(access) => access.rejected(account),
+        None => crate::docker_accounts::DockerAuthError::NotAvailable,
+    }
+    .to_string())
 }
 
 /// `args` with `--cloud --no-input` in front unless the caller already put them there.
@@ -104,12 +192,29 @@ fn call_timeout(args: &[String]) -> Duration {
 
 impl SbxRunner for SystemSbx {
     fn run(&self, args: &[String], stdin: Option<&str>) -> Result<SbxOutput, String> {
+        self.run_as(None, args, stdin)
+    }
+    fn run_as(
+        &self,
+        account: Option<&str>,
+        args: &[String],
+        stdin: Option<&str>,
+    ) -> Result<SbxOutput, String> {
         let verb = args
             .iter()
             .map(String::as_str)
             .find(|a| !a.starts_with('-'))
             .unwrap_or("");
-        run_piped(Self::command(args)?, stdin, call_timeout(args), verb)
+        let program =
+            crate::scm::resolve_gui_binary("sbx").ok_or_else(|| SBX_MISSING.to_string())?;
+        run_as_account(account, &mut || {
+            run_piped(
+                Self::command(&program, args, account)?,
+                stdin,
+                call_timeout(args),
+                verb,
+            )
+        })
     }
 }
 
@@ -868,6 +973,9 @@ pub enum Prerequisites {
     SshAliasMissing,
     /// sbx answered with something other than a login problem (network, service).
     Unreachable(String),
+    /// The project's Docker account could not be used: the text says why and where to fix
+    /// it (Settings > Cloud). There is no command to run and `sbx login` is not the advice.
+    DockerAccount(String),
     Ready,
 }
 
@@ -894,6 +1002,7 @@ impl Prerequisites {
                 "SSH is not set up for cloud sandboxes: run `sbx --cloud setup ssh`.".into()
             }
             Self::Unreachable(why) => format!("Docker Sandboxes is not reachable: {why}"),
+            Self::DockerAccount(why) => why.clone(),
             Self::Ready => "Ready".into(),
         }
     }
@@ -906,12 +1015,36 @@ impl Prerequisites {
 /// where cloud calls work with the daemon down). A cheap authenticated read, `ls`, proves
 /// both the install and the login.
 pub fn diagnose(runner: &dyn SbxRunner, home: &Path) -> Prerequisites {
-    match runner.run(&args(&["ls", "--format", "json"]), None) {
+    diagnose_as(runner, home, None)
+}
+
+/// [`diagnose`] for a project that names Docker account `account`: the probe runs as that
+/// account, and a problem with the account (unknown, revoked, no Cloud Sandboxes access,
+/// rejected by sbx) is [`Prerequisites::DockerAccount`] with the account's own advice
+/// instead of `sbx login`. `None` is [`diagnose`].
+pub fn diagnose_as(runner: &dyn SbxRunner, home: &Path, account: Option<&str>) -> Prerequisites {
+    if account.is_some() {
+        // A token problem is reported as such before sbx is even asked.
+        if let Err(error) = crate::docker_accounts::env_for(account) {
+            return Prerequisites::DockerAccount(error.to_string());
+        }
+    }
+    match runner.run_as(account, &args(&["ls", "--format", "json"]), None) {
         Err(error) if error.contains("not installed") => return Prerequisites::SbxMissing,
+        Err(error) if account.is_some() && is_account_text(&error) => {
+            return Prerequisites::DockerAccount(error)
+        }
         Err(error) => return Prerequisites::Unreachable(redact(&error)),
         Ok(out) if !out.success => {
             let error = failure(&out, "ls");
-            return if looks_logged_out(&error) {
+            return if account.is_some() && (is_account_rejection(&out) || looks_logged_out(&error))
+            {
+                // The CLI's own text may advise `sbx login`, which is the wrong fix here.
+                Prerequisites::DockerAccount(
+                    "Docker Sandboxes did not accept this Docker account's token. Replace it in Settings > Cloud."
+                        .into(),
+                )
+            } else if looks_logged_out(&error) {
                 Prerequisites::NotLoggedIn(error)
             } else {
                 Prerequisites::Unreachable(error)
@@ -924,6 +1057,18 @@ pub fn diagnose(runner: &dyn SbxRunner, home: &Path) -> Prerequisites {
     } else {
         Prerequisites::SshAliasMissing
     }
+}
+
+/// True when `sbx` reported the account's JWT as not accepted.
+fn is_account_rejection(out: &SbxOutput) -> bool {
+    crate::docker_accounts::is_rejection(&out.stderr)
+        || crate::docker_accounts::is_rejection(&out.stdout)
+}
+
+/// True when `text` is the user-facing text of a Docker account failure (an error of
+/// [`crate::docker_accounts::DockerAuthError`] that tells where to fix it).
+pub fn is_account_text(text: &str) -> bool {
+    text.contains("in Settings > Cloud.") || text.contains("Choose another in Cloud settings.")
 }
 
 fn looks_logged_out(error: &str) -> bool {

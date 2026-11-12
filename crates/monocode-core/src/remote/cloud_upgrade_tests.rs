@@ -208,6 +208,7 @@ fn target(sandbox: bool) -> SshTarget {
                 relay_port: 3900,
                 config: None,
                 mode: SandboxMode::Container,
+                docker_account: None,
             }),
         }
     } else {

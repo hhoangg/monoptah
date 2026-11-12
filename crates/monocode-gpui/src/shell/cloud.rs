@@ -192,10 +192,20 @@ pub(super) fn delete_start_note(words: &Words, stopped: bool) -> Option<String> 
 }
 
 /// The body of the "Remove from Monoptah" confirmation.
-pub(super) fn remove_confirm_body(title: &str, name: &str) -> String {
+///
+/// A sandbox in a Docker account other than the machine's sign-in is not visible to a plain
+/// `sbx`: `account` (the account named for the user, never a token) adds that the command
+/// must run with that account's token.
+pub(super) fn remove_confirm_body(title: &str, name: &str, account: Option<&str>) -> String {
+    let command = match account {
+        Some(account) => {
+            format!("`sbx --cloud rm {name}`, which must run with the token of {account}")
+        }
+        None => format!("`sbx --cloud rm {name}`"),
+    };
     format!(
         "Remove {} from Monoptah? The sandbox {name} keeps existing and keeps costing money \
-         until you delete it (`sbx --cloud rm {name}`). Its conversation is not saved on this \
+         until you delete it ({command}). Its conversation is not saved on this \
          computer.",
         quoted_title_single(title),
     )
@@ -631,6 +641,22 @@ pub(super) fn sandbox_ssh_args(terminal: &SandboxTerminal) -> Vec<OsString> {
     .collect()
 }
 
+/// The environment of a sandbox terminal's ssh. The ssh alias runs `sbx` as its
+/// ProxyCommand, which a Finder-launched app cannot find on launchd's bare PATH. A sandbox in
+/// a Docker account also needs that account's token for the same ProxyCommand, resolved now
+/// because the JWT is short-lived; an account that cannot give one is an error, never the
+/// machine's sign-in.
+pub(super) fn sandbox_terminal_env(
+    terminal: &SandboxTerminal,
+) -> Result<Vec<(String, OsString)>, String> {
+    let mut env = vec![(
+        "PATH".to_string(),
+        OsString::from(monocode_core::scm::terminal_search_path()),
+    )];
+    env.extend(terminal.env()?);
+    Ok(env)
+}
+
 /// `ssh` on the login-shell PATH.
 fn ssh_program() -> OsString {
     monocode_core::scm::resolve_gui_binary("ssh")
@@ -725,6 +751,9 @@ pub(super) enum Phase {
         id: i64,
         title: String,
         name: String,
+        /// The Docker account the sandbox lives in, named for the user, when it is not the
+        /// machine's sign-in.
+        account: Option<String>,
     },
     /// The conversation of session `id` could not be reached: retry, or archive only the code.
     FilesOnly {
@@ -1029,12 +1058,14 @@ impl Shell {
             }
         };
         let cwd = crate::terminal::home_cwd();
-        // The ssh alias runs `sbx` as its ProxyCommand, which a Finder-launched app cannot
-        // find on launchd's bare PATH.
-        let env = vec![(
-            "PATH".to_string(),
-            OsString::from(monocode_core::scm::terminal_search_path()),
-        )];
+        let env = match sandbox_terminal_env(&command) {
+            Ok(env) => env,
+            Err(error) => {
+                self.error = Some(format!("Could not open a terminal in the sandbox: {error}"));
+                cx.notify();
+                return None;
+            }
+        };
         let terminal = cx.new(|cx| {
             Terminal::launch(
                 std::path::Path::new(&cwd),
@@ -2095,6 +2126,9 @@ impl Shell {
             phase: Phase::ConfirmRemove {
                 id,
                 title,
+                account: (mark.kind == CloudBackendKind::DockerSandbox)
+                    .then(|| self.cloud.sandbox_account_label(&mark.codespace))
+                    .flatten(),
                 name: mark.codespace,
             },
             files_only: Vec::new(),
@@ -2321,13 +2355,18 @@ impl Shell {
                     ),
                 )
             }
-            Phase::ConfirmRemove { id, title, name } => {
+            Phase::ConfirmRemove {
+                id,
+                title,
+                name,
+                account,
+            } => {
                 let id = *id;
                 (
                     "Remove from Monoptah?".to_string(),
                     div().child(text(
                         "cloud-archive-remove",
-                        remove_confirm_body(title, name),
+                        remove_confirm_body(title, name, account.as_deref()),
                         false,
                     )),
                     footer.child(cancel).child(

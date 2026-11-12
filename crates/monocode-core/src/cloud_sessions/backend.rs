@@ -150,6 +150,8 @@ pub trait CloudBackend: Send + Sync {
 }
 
 #[cfg(test)]
+mod docker_account_tests;
+#[cfg(test)]
 mod docker_tests;
 #[cfg(test)]
 mod tests;

@@ -601,7 +601,7 @@ fn missing_database_or_table_is_empty_and_never_created() {
 }
 
 /// Serializes tests that touch the process-wide slot and restores it afterwards.
-static SHARED_LOCK: Mutex<()> = Mutex::new(());
+use super::test_support::GLOBAL as SHARED_LOCK;
 struct SharedGuard {
     previous: Option<Arc<DockerAccess>>,
     _lock: MutexGuard<'static, ()>,
@@ -908,4 +908,96 @@ fn the_token_reply_is_parsed_without_keeping_a_plain_copy() {
     );
     let none: TokenReply = serde_json::from_str("{}").unwrap();
     assert!(none.access_token.is_none());
+}
+
+#[test]
+fn install_system_needs_a_data_directory_and_never_replaces_an_installed_instance() {
+    let _lock = lock(&SHARED_LOCK);
+    let previous = replace_shared_for_test(None);
+    // An in-memory store has no data directory: nothing is installed.
+    let memory = crate::store::Store::open(std::path::Path::new(":memory:")).unwrap();
+    install_system(&memory);
+    assert!(shared().is_none());
+    // A store on disk installs the instance...
+    let f = fixture();
+    install_system(&f._store);
+    let first = shared().expect("installed");
+    // ...and a second call keeps it (a test double, or an earlier start, stays in place).
+    install_system(&f._store);
+    assert!(Arc::ptr_eq(&shared().unwrap(), &first));
+    // It reads the store's credentials database: a saved account is known to it.
+    let hub = ok_hub();
+    let added = f.accounts.add("alice", PAT, hub.as_ref()).unwrap();
+    assert_eq!(first.docker_id(&added.id).as_deref(), Some("alice"));
+    assert_eq!(first.docker_id("nope"), None);
+    replace_shared_for_test(previous);
+}
+
+#[test]
+fn env_for_names_an_unusable_account_instead_of_falling_back() {
+    let f = fixture();
+    let hub = ok_hub();
+    let a = f.accounts.add("alice", PAT, hub.as_ref()).unwrap();
+    let now = now_at(1);
+    let access = Arc::new(access(&f, hub.clone(), &now));
+    let guard = SharedGuard::install(access.clone());
+    // No account: nothing, and no exchange.
+    let calls = hub.calls();
+    assert!(env_for(None).unwrap().is_none());
+    assert_eq!(hub.calls(), calls);
+    // An account: the variable and a JWT.
+    let (name, token) = env_for(Some(&a.id)).unwrap().unwrap();
+    assert_eq!(name, "DOCKER_ACCESS_TOKEN");
+    assert!(parse_claims(token.as_str()).is_some());
+    // The same account twice reuses the cached JWT.
+    let calls = hub.calls();
+    env_for(Some(&a.id)).unwrap();
+    assert_eq!(hub.calls(), calls);
+    // A removed one is an error with its own text.
+    assert_eq!(
+        env_for(Some("gone")).unwrap_err(),
+        DockerAuthError::UnknownAccount
+    );
+    // The revoked-after-retry error names the Docker ID and carries no token.
+    let rejected = access.rejected(&a.id);
+    assert_eq!(
+        rejected.to_string(),
+        "Docker account alice: token revoked or expired. Replace it in Settings > Cloud."
+    );
+    assert_eq!(access.rejected("gone"), DockerAuthError::UnknownAccount);
+    drop(guard);
+    // Without an installed instance the account is not silently dropped.
+    let _lock = lock(&SHARED_LOCK);
+    let previous = replace_shared_for_test(None);
+    let error = env_for(Some(&a.id)).unwrap_err();
+    assert_eq!(error, DockerAuthError::NotAvailable);
+    assert!(error.to_string().contains("not available"));
+    replace_shared_for_test(previous);
+    assert!(is_rejection("error: DOCKER_ACCESS_TOKEN was rejected"));
+    assert!(!is_rejection("error: not logged in"));
+}
+
+#[test]
+fn apply_env_sets_the_variable_on_the_command_and_never_adds_an_argument() {
+    let f = fixture();
+    let hub = ok_hub();
+    let a = f.accounts.add("alice", PAT, hub.as_ref()).unwrap();
+    let now = now_at(1);
+    let _guard = SharedGuard::install(Arc::new(access(&f, hub.clone(), &now)));
+    let mut with = std::process::Command::new("sbx");
+    apply_env(&mut with, Some(&a.id)).unwrap();
+    let value = with
+        .get_envs()
+        .find(|(k, _)| *k == "DOCKER_ACCESS_TOKEN")
+        .and_then(|(_, v)| v)
+        .map(|v| v.to_string_lossy().into_owned())
+        .unwrap();
+    assert!(parse_claims(&value).is_some());
+    assert_eq!(with.get_args().count(), 0);
+    let mut without = std::process::Command::new("sbx");
+    apply_env(&mut without, None).unwrap();
+    assert_eq!(without.get_envs().count(), 0);
+    assert_eq!(without.get_args().count(), 0);
+    let error = apply_env(&mut std::process::Command::new("sbx"), Some("gone")).unwrap_err();
+    assert!(error.contains("no longer exists"));
 }

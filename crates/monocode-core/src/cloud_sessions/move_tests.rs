@@ -3429,6 +3429,7 @@ fn lifecycle_fx() -> (Fx, Arc<LifecycleShell>) {
         config: None,
         mount: true,
         started: false,
+        docker_account: None,
     });
     fx.save_record(&record);
     (fx, shell)
@@ -3596,6 +3597,7 @@ fn a_move_record_from_before_the_deferral_loads_and_behaves_as_before() {
             config: Some(".devcontainer/x/devcontainer.json".into()),
             mount: false,
             started: true,
+            docker_account: None,
         }),
         ..record
     };

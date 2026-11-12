@@ -1751,6 +1751,7 @@ fn a_sandbox_session_converts_through_the_container_exec_and_a_tar_stream() {
         relay_port: 47200,
         config: None,
         mode: Default::default(),
+        docker_account: None,
     };
     // The same session, now bound to a sandbox.
     {

@@ -356,6 +356,10 @@ impl Store {
             &serde_json::to_string(&projects).map_err(|e| e.to_string())?,
         )?;
         crate::cloud_sessions::startup::forget_cloud_starts(self, cloud)?;
+        // The sandbox is gone: so is the record of the Docker account it lived in.
+        if cloud.kind == CloudBackendKind::DockerSandbox {
+            crate::sandboxes::account::clear_pin(self, &cloud.name);
+        }
         self.save_setting(
             SESSIONS,
             &serde_json::to_string(&sessions).map_err(|e| e.to_string())?,
@@ -923,7 +927,14 @@ impl Store {
             let exists = match cloud.kind {
                 CloudBackendKind::Codespaces => crate::codespaces::exists(gh, &cloud.name)?,
                 CloudBackendKind::DockerSandbox => {
-                    crate::sandboxes::find_by_name(sbx, &cloud.name)?.is_some()
+                    // Under the account the sandbox lives in. `ls` under another one would
+                    // report "not found" and forget a sandbox that is still billing.
+                    let account = crate::sandboxes::account::pinned(self, &cloud.name);
+                    crate::sandboxes::find_by_name(
+                        &crate::sandboxes::as_account(sbx, account.as_deref()),
+                        &cloud.name,
+                    )?
+                    .is_some()
                 }
             };
             if !exists {
@@ -977,13 +988,25 @@ impl Store {
             .project
             .cloud()
             .ok_or("This is not a cloud session.")?;
+        let account = (cloud.kind == CloudBackendKind::DockerSandbox)
+            .then(|| crate::sandboxes::account::pinned(self, &cloud.name))
+            .flatten()
+            .map(|account| crate::sandboxes::account::describe(self, &account));
         self.forget_cloud_session(id)?;
-        Ok(format!(
-            "Removed from Monoptah. The {} {} still exists and keeps costing money until you delete it with `sbx --cloud rm {}`.",
-            cloud.noun(),
-            cloud.name,
-            cloud.name
-        ))
+        Ok(match account {
+            Some(account) => format!(
+                "Removed from Monoptah. The {} {} still exists and keeps costing money until you delete it with `sbx --cloud rm {}`. That command must run with the token of {account}: a sandbox is not visible to any other Docker account.",
+                cloud.noun(),
+                cloud.name,
+                cloud.name
+            ),
+            None => format!(
+                "Removed from Monoptah. The {} {} still exists and keeps costing money until you delete it with `sbx --cloud rm {}`.",
+                cloud.noun(),
+                cloud.name,
+                cloud.name
+            ),
+        })
     }
 }
 

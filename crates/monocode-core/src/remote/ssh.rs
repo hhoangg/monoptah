@@ -69,6 +69,11 @@ pub struct SandboxTarget {
     /// Container or plain outer sandbox. Absent in older records: Container.
     #[serde(default, skip_serializing_if = "SandboxMode::is_container")]
     pub mode: SandboxMode,
+    /// The Docker account the sandbox lives in (an id from `docker_accounts`). Every ssh to
+    /// the sandbox runs with that account's `DOCKER_ACCESS_TOKEN`, because the alias's
+    /// ProxyCommand is `sbx --cloud ssh-connect`. Absent: the machine's `sbx login`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docker_account: Option<String>,
 }
 
 /// Host alias written by `sbx setup ssh` into the user's ssh config.
@@ -489,7 +494,7 @@ fn gh_program() -> std::ffi::OsString {
         .unwrap_or_else(|| "gh".into())
 }
 
-fn command(target: &SshTarget, interactive: bool) -> Command {
+fn command(target: &SshTarget, interactive: bool) -> Result<Command, String> {
     let program = match target.transport() {
         Transport::Codespace(_) => gh_program(),
         Transport::Ssh | Transport::Sandbox(_) => "ssh".into(),
@@ -503,11 +508,17 @@ fn command(target: &SshTarget, interactive: bool) -> Command {
 /// left out and BatchMode stays on. A sandbox is plain `ssh` to its
 /// `<id>@sbx_cloud` alias: the alias carries the ProxyCommand and host trust,
 /// so there is no host-key prompting, no password prompt and no `-p`.
+///
+/// A sandbox that lives in a Docker account gets that account's `DOCKER_ACCESS_TOKEN` in
+/// the environment (the ProxyCommand's `sbx` reads it; never argv). An account that cannot
+/// produce a token is an error, not a silent fallback to the machine login. A long-lived
+/// tunnel keeps the environment it was spawned with; a reconnect spawns a new ssh and gets
+/// a fresh token.
 fn command_with_program(
     target: &SshTarget,
     interactive: bool,
     program: &std::ffi::OsStr,
-) -> Command {
+) -> Result<Command, String> {
     let mut command = Command::new(program);
     let transport = target.transport();
     if let Transport::Codespace(name) = transport {
@@ -573,12 +584,15 @@ fn command_with_program(
         // the sandbox alias's ProxyCommand runs `sbx`.
         command.env("PATH", crate::scm::terminal_search_path());
     }
+    if let Transport::Sandbox(sandbox) = transport {
+        crate::docker_accounts::apply_env(&mut command, sandbox.docker_account.as_deref())?;
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
-    command
+    Ok(command)
 }
 
 /// Names and paths read back from the store are re-checked before they reach argv.
@@ -659,7 +673,7 @@ pub fn detect_platform(
         String::new(),
         job,
         askpass,
-        command(target, true),
+        command(target, true)?,
         PLATFORM_PROBE,
     )?;
     parse_platform(&output)
@@ -692,7 +706,7 @@ pub fn run_script(
             script,
             job,
             askpass,
-            command(target, true),
+            command(target, true)?,
             &[
                 "powershell.exe",
                 "-NoLogo",
@@ -703,7 +717,7 @@ pub fn run_script(
             ],
         )
     } else {
-        run_script_with_command(target, script, job, askpass, command(target, true))
+        run_script_with_command(target, script, job, askpass, command(target, true)?)
     }
 }
 
@@ -1079,7 +1093,7 @@ impl Tunnel {
         job: Option<&Arc<Job>>,
         askpass: Option<&Askpass>,
     ) -> Result<Self, String> {
-        Self::start_with_command(target, job, askpass, command(target, askpass.is_some()))
+        Self::start_with_command(target, job, askpass, command(target, askpass.is_some())?)
     }
 
     fn start_with_command(
@@ -1421,7 +1435,7 @@ mod tests {
             sandbox: None,
         };
         let make_command = || {
-            let mut command = command(&target, false);
+            let mut command = command(&target, false).unwrap();
             command.args([
                 "-F",
                 "/dev/null",
@@ -1498,7 +1512,8 @@ mod tests {
     }
     #[test]
     fn codespace_commands_use_gh_without_a_destination_or_host_key_prompts() {
-        let command = command_with_program(&codespace_target("octo-abc123"), true, "gh".as_ref());
+        let command =
+            command_with_program(&codespace_target("octo-abc123"), true, "gh".as_ref()).unwrap();
         assert_eq!(command.get_program(), "gh");
         let expected: Vec<&str> = vec![
             "codespace",
@@ -1543,7 +1558,7 @@ mod tests {
             codespace: None,
             sandbox: None,
         };
-        let command = command_with_program(&target, true, "ssh".as_ref());
+        let command = command_with_program(&target, true, "ssh".as_ref()).unwrap();
         let args = argv(&command);
         assert_eq!(command.get_program(), "ssh");
         assert!(args.contains(&"StrictHostKeyChecking=ask".to_string()));
@@ -3128,12 +3143,13 @@ mod tests {
                 relay_port: 47200,
                 config: None,
                 mode: SandboxMode::Container,
+                docker_account: None,
             }),
         }
     }
     #[test]
     fn sandbox_commands_are_plain_ssh_to_the_alias_without_prompts() {
-        let command = command_with_program(&sandbox_target(), true, "ssh".as_ref());
+        let command = command_with_program(&sandbox_target(), true, "ssh".as_ref()).unwrap();
         assert_eq!(command.get_program(), "ssh");
         let args = argv(&command);
         assert_eq!(args[0], "-T");
@@ -3151,6 +3167,129 @@ mod tests {
         // The destination is added by the caller after `--`.
         assert!(!args.contains(&"--".to_string()));
     }
+    fn env_var(command: &Command, key: &str) -> Option<String> {
+        command
+            .get_envs()
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_string_lossy().into_owned())
+    }
+    fn account_target(account: Option<&str>) -> SshTarget {
+        let mut target = sandbox_target();
+        target.sandbox.as_mut().unwrap().docker_account = account.map(str::to_owned);
+        target
+    }
+    #[test]
+    fn a_sandbox_in_a_docker_account_gets_its_token_in_the_environment_only() {
+        use crate::docker_accounts::test_support::Installed;
+        let installed = Installed::new();
+        let id = installed.add("alice");
+        let target = account_target(Some(&id));
+        for command in [
+            command_with_program(&target, true, "ssh".as_ref()).unwrap(),
+            command_with_program(&target, false, "ssh".as_ref()).unwrap(),
+            // The funnel that run_script, detect_platform and Tunnel::start use.
+            command(&target, true).unwrap(),
+            command(&target, false).unwrap(),
+        ] {
+            let token = env_var(&command, "DOCKER_ACCESS_TOKEN").expect("token missing");
+            assert!(installed.hub.issued().contains(&token));
+            assert!(
+                argv(&command).iter().all(|a| !a.contains(&token)),
+                "{:?}",
+                argv(&command)
+            );
+            // The rest of the command is the same as without an account.
+            assert_eq!(
+                argv(&command),
+                argv(&command_with_program(&sandbox_target(), true, "ssh".as_ref()).unwrap())
+            );
+        }
+    }
+    #[test]
+    fn a_sandbox_without_an_account_and_other_transports_get_no_token() {
+        use crate::docker_accounts::test_support::Installed;
+        let installed = Installed::new();
+        installed.add("alice");
+        let before = installed.hub.calls();
+        for target in [
+            account_target(None),
+            codespace_target("octo-abc123"),
+            SshTarget {
+                target: "me@host".into(),
+                port: Some(22),
+                remote_port: 3774,
+                codespace: None,
+                sandbox: None,
+            },
+        ] {
+            let program = if target.codespace.is_some() {
+                "gh"
+            } else {
+                "ssh"
+            };
+            let command = command_with_program(&target, true, program.as_ref()).unwrap();
+            assert!(
+                command.get_envs().all(|(k, _)| k != "DOCKER_ACCESS_TOKEN"),
+                "{target:?}"
+            );
+        }
+        assert_eq!(installed.hub.calls(), before, "no account, no exchange");
+    }
+    #[test]
+    fn a_sandbox_whose_account_has_no_token_fails_instead_of_using_the_machine_login() {
+        use crate::docker_accounts::test_support::{Installed, Uninstalled};
+        {
+            let _none = Uninstalled::new();
+            let error = command(&account_target(Some("acct")), true).unwrap_err();
+            assert!(error.contains("not available"), "{error}");
+        }
+        let _installed = Installed::new();
+        let error = command(&account_target(Some("removed")), true).unwrap_err();
+        assert!(error.contains("no longer exists"), "{error}");
+        // The tunnel is not started either.
+        let error = Tunnel::start(&account_target(Some("removed")), None, None)
+            .err()
+            .unwrap();
+        assert!(error.contains("no longer exists"), "{error}");
+    }
+    #[test]
+    fn a_new_ssh_after_a_rejection_gets_a_fresh_token() {
+        use crate::docker_accounts::test_support::Installed;
+        let installed = Installed::new();
+        let id = installed.add("alice");
+        let target = account_target(Some(&id));
+        let first = env_var(&command(&target, false).unwrap(), "DOCKER_ACCESS_TOKEN").unwrap();
+        // A live tunnel keeps its environment; a reconnect spawns a new ssh, which reads the
+        // cache again. While the JWT is valid that is the same one, after a rejection a new one.
+        let again = env_var(&command(&target, false).unwrap(), "DOCKER_ACCESS_TOKEN").unwrap();
+        assert_eq!(first, again);
+        crate::docker_accounts::shared().unwrap().invalidate(&id);
+        let fresh = env_var(&command(&target, false).unwrap(), "DOCKER_ACCESS_TOKEN").unwrap();
+        assert_ne!(first, fresh);
+    }
+    #[test]
+    fn the_account_of_a_sandbox_target_round_trips_and_is_absent_when_unset() {
+        let with: SandboxTarget = serde_json::from_value(serde_json::json!({
+            "id":"sbx_1","name":"b","workspace":"/w","relayPort":1,"dockerAccount":"acct"
+        }))
+        .unwrap();
+        assert_eq!(with.docker_account.as_deref(), Some("acct"));
+        assert_eq!(
+            serde_json::to_value(&with).unwrap()["dockerAccount"],
+            "acct"
+        );
+        // A record written before the field existed.
+        let old: SandboxTarget = serde_json::from_value(serde_json::json!({
+            "id":"sbx_1","name":"b","workspace":"/w","relayPort":1
+        }))
+        .unwrap();
+        assert_eq!(old.docker_account, None);
+        assert!(serde_json::to_value(&old)
+            .unwrap()
+            .get("dockerAccount")
+            .is_none());
+    }
     #[test]
     fn a_target_cannot_be_a_codespace_and_a_sandbox() {
         let mut target = sandbox_target();
@@ -3166,7 +3305,7 @@ mod tests {
             codespace: None,
             sandbox: None,
         };
-        let command = command_with_program(&target, true, "ssh".as_ref());
+        let command = command_with_program(&target, true, "ssh".as_ref()).unwrap();
         let expected: Vec<&str> = vec![
             "-T",
             "-o",
@@ -3206,7 +3345,8 @@ mod tests {
     }
     #[test]
     fn golden_codespace_env_sets_the_terminal_path() {
-        let command = command_with_program(&codespace_target("octo-abc123"), false, "gh".as_ref());
+        let command =
+            command_with_program(&codespace_target("octo-abc123"), false, "gh".as_ref()).unwrap();
         assert_eq!(env_of(&command, "LC_ALL").as_deref(), Some("C"));
         assert_eq!(
             env_of(&command, "PATH").map(std::path::PathBuf::from),
@@ -3264,7 +3404,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let command = command_with_program(&sandbox_target(), false, script.as_os_str());
+        let command = command_with_program(&sandbox_target(), false, script.as_os_str()).unwrap();
         // The fake exits at once, so the tunnel reports a failed connection.
         let error = match Tunnel::start_with_command(&sandbox_target(), None, None, command) {
             Ok(_) => panic!("fake ssh exits, tunnel must fail"),
@@ -3300,7 +3440,7 @@ mod tests {
         let mut target = sandbox_target();
         target.remote_port = 4111;
         target.sandbox.as_mut().unwrap().mode = SandboxMode::Plain;
-        let command = command_with_program(&target, false, script.as_os_str());
+        let command = command_with_program(&target, false, script.as_os_str()).unwrap();
         assert!(Tunnel::start_with_command(&target, None, None, command).is_err());
         let args = std::fs::read_to_string(&log).unwrap();
         assert!(

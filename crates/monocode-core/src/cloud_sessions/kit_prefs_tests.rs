@@ -435,6 +435,9 @@ fn cloud_sources_never_read_the_keychain_or_claude_credentials() {
     ];
     files.extend(kit_ui.iter().cloned());
     files.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/docker_accounts.rs"));
+    // The sbx seam and the per-sandbox account pin act as Docker accounts: no Keychain.
+    files.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sandboxes.rs"));
+    files.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sandboxes/account.rs"));
     assert!(files.len() >= 20, "the scan found {files:?}");
     for must in [
         "kit.rs",

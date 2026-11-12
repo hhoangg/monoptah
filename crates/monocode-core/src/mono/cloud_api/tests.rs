@@ -116,6 +116,8 @@ impl Host for FakeHost {
 struct Sbx {
     sandboxes: Mutex<Vec<(String, String, String)>>,
     calls: Mutex<Vec<String>>,
+    /// The Docker account of every call, parallel to `calls`.
+    accounts: Mutex<Vec<Option<String>>>,
     broken: Mutex<Option<String>>,
 }
 impl Sbx {
@@ -123,8 +125,18 @@ impl Sbx {
         Arc::new(Self {
             sandboxes: Mutex::new(vec![]),
             calls: Mutex::new(vec![]),
+            accounts: Mutex::new(vec![]),
             broken: Mutex::new(None),
         })
+    }
+    /// The accounts the `ls` calls ran as, in order.
+    fn ls_accounts(&self) -> Vec<Option<String>> {
+        self.calls()
+            .iter()
+            .zip(self.accounts.lock().unwrap().iter())
+            .filter(|(line, _)| line.split_whitespace().nth(2) == Some("ls"))
+            .map(|(_, account)| account.clone())
+            .collect()
     }
     fn add(&self, id: &str, name: &str, state: &str) {
         self.sandboxes
@@ -150,8 +162,20 @@ fn sbx_out(success: bool, stdout: &str, stderr: &str) -> Result<SbxOutput, Strin
     })
 }
 impl SbxRunner for Sbx {
-    fn run(&self, args: &[String], _stdin: Option<&str>) -> Result<SbxOutput, String> {
+    fn run(&self, args: &[String], stdin: Option<&str>) -> Result<SbxOutput, String> {
+        self.run_as(None, args, stdin)
+    }
+    fn run_as(
+        &self,
+        account: Option<&str>,
+        args: &[String],
+        _stdin: Option<&str>,
+    ) -> Result<SbxOutput, String> {
         self.calls.lock().unwrap().push(args.join(" "));
+        self.accounts
+            .lock()
+            .unwrap()
+            .push(account.map(str::to_owned));
         if let Some(error) = self.broken.lock().unwrap().clone() {
             return Err(error);
         }
@@ -250,6 +274,7 @@ fn sandbox_machine(name: &str) -> Machine {
             relay_port: 47200,
             config: None,
             mode: Default::default(),
+            docker_account: None,
         }),
     }
 }
@@ -2320,4 +2345,97 @@ fn a_cloud_located_local_session_is_a_cloud_session_of_its_project() {
     assert!(!is_cloud_session_of(&store, local, "/somewhere/else"));
     let serving = serving_record(&store, local).unwrap();
     assert_eq!(serving.0, host_id);
+}
+
+// ---------------------------------------------------------------- Docker accounts
+
+mod docker_accounts {
+    use super::*;
+    use crate::docker_accounts::test_support::Installed;
+    use crate::sandboxes::account;
+
+    fn save_account_config(fx: &Fixture, docker_account: Option<&str>) {
+        let config = crate::cloud_sessions::docker_config::DockerProjectConfig {
+            repo_url: REPO_URL.into(),
+            docker_account: docker_account.map(str::to_owned),
+            ..Default::default()
+        };
+        crate::cloud_sessions::docker_config::save(&fx.store.lock().unwrap(), &fx.path(), &config)
+            .unwrap();
+    }
+    fn pin(fx: &Fixture, name: &str, docker_account: &str) {
+        account::pin(&fx.store.lock().unwrap(), name, Some(docker_account));
+    }
+
+    #[test]
+    fn listing_without_any_account_is_one_ls_as_the_machine_login() {
+        let gh = FakeGh::new(vec![]);
+        let fx = fixture(&gh);
+        fx.bind_sandbox("box-1");
+        fx.api.list(&fx.path(), &json!({"kind":"sandbox"})).unwrap();
+        assert_eq!(fx.sbx.ls_accounts(), [None]);
+    }
+
+    #[test]
+    fn listing_asks_each_bound_sandbox_in_the_account_that_created_it() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        let b = installed.add("bob");
+        let gh = FakeGh::new(vec![]);
+        let fx = fixture(&gh);
+        // The project names B today; its two sandboxes were made under A and under no account.
+        save_account_config(&fx, Some(&b));
+        fx.bind_sandbox("box-1");
+        fx.bind_sandbox("box-2");
+        pin(&fx, "box-1", &a);
+        let listed = fx.api.list(&fx.path(), &json!({"kind":"sandbox"})).unwrap();
+        assert_eq!(listed["instances"].as_array().unwrap().len(), 2);
+        let mut asked = fx.sbx.ls_accounts();
+        asked.sort();
+        assert_eq!(asked, [None, Some(a.clone())], "never the project's new B");
+        assert_eq!(listed["backends"], json!({"sandbox":{"ok":true}}));
+    }
+
+    #[test]
+    fn with_nothing_bound_the_projects_own_account_is_asked() {
+        let installed = Installed::new();
+        let b = installed.add("bob");
+        let gh = FakeGh::new(vec![]);
+        let fx = fixture(&gh);
+        save_account_config(&fx, Some(&b));
+        fx.api.list(&fx.path(), &json!({"kind":"sandbox"})).unwrap();
+        assert_eq!(fx.sbx.ls_accounts(), [Some(b)]);
+    }
+
+    #[test]
+    fn status_checks_as_the_projects_account_and_reports_a_revoked_one_in_its_own_words() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        let gh = FakeGh::new(vec![]);
+        let fx = fixture(&gh);
+        save_account_config(&fx, Some(&a));
+        let status = fx
+            .api
+            .status(&fx.path(), &json!({"kind":"sandbox"}))
+            .unwrap();
+        assert_eq!(status["backends"]["sandbox"]["ready"], true);
+        assert_eq!(fx.sbx.ls_accounts(), [Some(a.clone())]);
+        // The token is revoked: the answer names the account and where to fix it.
+        installed.hub.reject_from_now_on();
+        crate::docker_accounts::shared().unwrap().invalidate(&a);
+        let status = fx
+            .api
+            .status(&fx.path(), &json!({"kind":"sandbox"}))
+            .unwrap();
+        let sandbox = &status["backends"]["sandbox"];
+        assert_eq!(sandbox["ready"], false);
+        assert_eq!(sandbox["loggedIn"], false);
+        assert_eq!(
+            sandbox["message"],
+            "Docker account alice: token revoked or expired. Replace it in Settings > Cloud."
+        );
+        assert!(sandbox.get("fixCommand").is_none(), "{sandbox}");
+        assert!(!status.to_string().contains("sbx login"));
+        assert_eq!(fx.sbx.ls_accounts().len(), 1, "sbx was not asked again");
+    }
 }

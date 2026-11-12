@@ -54,6 +54,8 @@ struct Sbx {
     sandboxes: Mutex<Vec<(String, String, String)>>,
     mode: Mutex<CreateMode>,
     calls: Mutex<Vec<String>>,
+    /// The Docker account of every call, parallel to `calls`.
+    accounts: Mutex<Vec<Option<String>>>,
 }
 impl Sbx {
     fn new(mode: CreateMode) -> Arc<Self> {
@@ -61,10 +63,28 @@ impl Sbx {
             sandboxes: Mutex::new(vec![]),
             mode: Mutex::new(mode),
             calls: Mutex::new(vec![]),
+            accounts: Mutex::new(vec![]),
         })
     }
     fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
+    }
+    /// `(verb, account)` of every call.
+    fn verbs_with_accounts(&self) -> Vec<(String, Option<String>)> {
+        self.calls()
+            .iter()
+            .zip(self.accounts.lock().unwrap().iter())
+            .map(|(line, account)| {
+                (
+                    line.split_whitespace().nth(2).unwrap_or("").to_string(),
+                    account.clone(),
+                )
+            })
+            .collect()
+    }
+    fn forget_calls(&self) {
+        self.calls.lock().unwrap().clear();
+        self.accounts.lock().unwrap().clear();
     }
     fn count(&self, verb: &str) -> usize {
         self.calls()
@@ -101,9 +121,21 @@ fn out(success: bool, stdout: &str, stderr: &str) -> Result<SbxOutput, String> {
 }
 impl SbxRunner for Sbx {
     fn run(&self, args: &[String], stdin: Option<&str>) -> Result<SbxOutput, String> {
+        self.run_as(None, args, stdin)
+    }
+    fn run_as(
+        &self,
+        account: Option<&str>,
+        args: &[String],
+        stdin: Option<&str>,
+    ) -> Result<SbxOutput, String> {
         assert!(stdin.is_none(), "no stdin for sbx");
         let line = args.join(" ");
         self.calls.lock().unwrap().push(line.clone());
+        self.accounts
+            .lock()
+            .unwrap()
+            .push(account.map(str::to_owned));
         let verb = args.get(2).map(String::as_str).unwrap_or("");
         let list = || {
             let items: Vec<Value> = self
@@ -169,6 +201,8 @@ struct ShellCall {
     id: String,
     remote: String,
     stdin: String,
+    /// The Docker account the call ran as.
+    account: Option<String>,
 }
 impl ShellCall {
     /// The `PHASE`, `MODE` or other tag of the embedded script this call carries.
@@ -259,6 +293,18 @@ impl SandboxShell for Shell {
         remote: &str,
         stdin: &str,
         on_line: &mut dyn FnMut(&str),
+        abort: &dyn Fn() -> bool,
+        timeout: Duration,
+    ) -> Result<ShellOutput, String> {
+        self.run_as(None, id, remote, stdin, on_line, abort, timeout)
+    }
+    fn run_as(
+        &self,
+        account: Option<&str>,
+        id: &str,
+        remote: &str,
+        stdin: &str,
+        on_line: &mut dyn FnMut(&str),
         _abort: &dyn Fn() -> bool,
         _timeout: Duration,
     ) -> Result<ShellOutput, String> {
@@ -266,6 +312,7 @@ impl SandboxShell for Shell {
             id: id.into(),
             remote: remote.into(),
             stdin: stdin.into(),
+            account: account.map(str::to_owned),
         };
         let tag = call.tag();
         self.calls.lock().unwrap().push(call);
@@ -2548,6 +2595,7 @@ fn rebuild_forgets_the_paired_machine_because_the_container_is_new() {
         relay_port: 47200,
         config: None,
         mode: Default::default(),
+        docker_account: None,
     };
     fx.host.machines.lock().unwrap().push(Machine {
         id: "m-old".into(),
@@ -2590,6 +2638,7 @@ fn a_new_container_id_forgets_the_paired_machine() {
             relay_port: 47200,
             config: None,
             mode: Default::default(),
+            docker_account: None,
         }),
     });
     *fx.shell.fail_tag.lock().unwrap() = None;
@@ -2691,7 +2740,7 @@ impl Fx {
     /// Forgets what the start did, so only the reconnect shows.
     fn reset(&self) {
         self.shell.calls.lock().unwrap().clear();
-        self.sbx.calls.lock().unwrap().clear();
+        self.sbx.forget_calls();
         self.host.log.lock().unwrap().clear();
     }
 }
@@ -4119,4 +4168,460 @@ fn a_start_record_without_the_deferral_field_loads_as_an_ordinary_start() {
     value.as_object_mut().unwrap().remove("deferLifecycle");
     let start: super::docker_start::SandboxStart = serde_json::from_value(value).unwrap();
     assert!(!start.defer_lifecycle);
+}
+
+// ---------------------------------------------------------------- Docker accounts
+
+/// A sandbox flow whose project names a Docker account: every `sbx` and every ssh of the
+/// flow runs as the account that CREATED the sandbox.
+mod docker_accounts {
+    use super::*;
+    use crate::cloud_sessions::CloudRef;
+    use crate::docker_accounts::test_support::Installed;
+    use crate::sandboxes::account;
+
+    fn account_config(account: Option<&str>) -> DockerProjectConfig {
+        DockerProjectConfig {
+            docker_account: account.map(str::to_owned),
+            ..config()
+        }
+    }
+    fn begin_as(fx: &Fx, account: Option<&str>) -> Result<(Session, StartRecord), String> {
+        fx.svc.begin_sandbox_start(
+            "/Users/me/widgets",
+            &account_config(account),
+            "fix/login",
+            "claude",
+        )
+    }
+    fn save_project_account(fx: &Fx, account: Option<&str>) {
+        super::super::docker_config::save(
+            &fx.store.lock().unwrap(),
+            "/Users/me/widgets",
+            &account_config(account),
+        )
+        .unwrap();
+    }
+    fn pin_of(fx: &Fx, name: &str) -> Option<String> {
+        account::pinned(&fx.store.lock().unwrap(), name)
+    }
+    fn only(accounts: Vec<Option<String>>, want: Option<&str>) -> bool {
+        !accounts.is_empty() && accounts.iter().all(|a| a.as_deref() == want)
+    }
+    fn sbx_accounts(fx: &Fx) -> Vec<Option<String>> {
+        fx.sbx
+            .verbs_with_accounts()
+            .into_iter()
+            .map(|(_, account)| account)
+            .collect()
+    }
+    fn shell_accounts(fx: &Fx) -> Vec<Option<String>> {
+        fx.shell.calls().into_iter().map(|c| c.account).collect()
+    }
+
+    #[test]
+    fn a_start_runs_every_sbx_and_ssh_process_as_the_projects_account_and_pins_it() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        let fx = fx();
+        let (session, began) = begin_as(&fx, Some(&a)).unwrap();
+        let name = began.sandbox.clone().unwrap();
+        // diagnose and create already ran as the account.
+        assert!(
+            only(sbx_accounts(&fx), Some(&a)),
+            "{:?}",
+            fx.sbx.verbs_with_accounts()
+        );
+        assert!(fx.sbx.count("create") == 1);
+        assert_eq!(pin_of(&fx, &name).as_deref(), Some(a.as_str()));
+        let (result, events) = fx.run(session.id);
+        result.unwrap();
+        let sbx = fx.sbx.verbs_with_accounts();
+        for verb in ["ls", "create", "inspect"] {
+            assert!(sbx.iter().any(|(v, _)| v == verb), "no {verb} in {sbx:?}");
+        }
+        assert!(only(sbx_accounts(&fx), Some(&a)), "{sbx:?}");
+        let shell = fx.shell.calls();
+        assert!(shell.len() >= 6, "{:?}", fx.shell.tags());
+        assert!(only(shell_accounts(&fx), Some(&a)), "{:?}", fx.shell.tags());
+        // The paired machine carries the account, so its tunnel and Host upgrade use it.
+        let machines = fx.host.machines.lock().unwrap().clone();
+        assert_eq!(
+            machines[0]
+                .sandbox
+                .as_ref()
+                .unwrap()
+                .docker_account
+                .as_deref(),
+            Some(a.as_str())
+        );
+        // Nothing the user can see or the store keeps holds a JWT.
+        let shown = format!(
+            "{events:?} {:?} {:?}",
+            fx.record(session.id),
+            fx.shell.calls()
+        );
+        for jwt in installed.hub.issued() {
+            assert!(!shown.contains(&jwt));
+        }
+        assert!(installed.hub.calls() >= 2);
+    }
+
+    #[test]
+    fn a_start_without_an_account_is_exactly_as_before() {
+        let installed = Installed::new();
+        let fx = fx();
+        let (session, began) = begin_as(&fx, None).unwrap();
+        let name = began.sandbox.clone().unwrap();
+        fx.run(session.id).0.unwrap();
+        assert!(
+            only(sbx_accounts(&fx), None),
+            "{:?}",
+            fx.sbx.verbs_with_accounts()
+        );
+        assert!(only(shell_accounts(&fx), None));
+        assert_eq!(pin_of(&fx, &name), None);
+        assert_eq!(
+            fx.store
+                .lock()
+                .unwrap()
+                .setting(&account::pin_key(&name))
+                .unwrap(),
+            None
+        );
+        let machines = fx.host.machines.lock().unwrap().clone();
+        assert_eq!(machines[0].sandbox.as_ref().unwrap().docker_account, None);
+        assert_eq!(
+            installed.hub.calls(),
+            0,
+            "no account, no Docker Hub exchange"
+        );
+    }
+
+    #[test]
+    fn changing_the_projects_account_does_not_move_an_existing_sandbox() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        let b = installed.add("bob");
+        let fx = fx();
+        let (session, began) = begin_as(&fx, Some(&a)).unwrap();
+        let name = began.sandbox.clone().unwrap();
+        fx.run(session.id).0.unwrap();
+        // The user now picks account B for the project.
+        save_project_account(&fx, Some(&b));
+        fx.sbx.set_state(&sandbox_id(&fx), "stopped");
+        fx.reset();
+        // Reconnect, stop and delete all keep using A.
+        let (result, _) = fx.reconnect(session.id);
+        result.unwrap();
+        assert!(!fx.sbx.calls().is_empty() && !fx.shell.calls().is_empty());
+        assert!(
+            only(sbx_accounts(&fx), Some(&a)),
+            "{:?}",
+            fx.sbx.verbs_with_accounts()
+        );
+        assert!(only(shell_accounts(&fx), Some(&a)), "{:?}", fx.shell.tags());
+        let machines = fx.host.machines.lock().unwrap().clone();
+        assert_eq!(
+            machines
+                .last()
+                .unwrap()
+                .sandbox
+                .as_ref()
+                .unwrap()
+                .docker_account
+                .as_deref(),
+            Some(a.as_str()),
+            "the re-paired machine keeps the sandbox's own account"
+        );
+        let cloud = CloudRef::sandbox(&name);
+        fx.reset();
+        fx.svc.stop_cloud(&cloud).unwrap();
+        fx.svc.delete_cloud_outcome(&cloud).unwrap();
+        assert_eq!(fx.sbx.count("stop"), 1);
+        assert_eq!(fx.sbx.count("rm"), 1);
+        assert!(
+            only(sbx_accounts(&fx), Some(&a)),
+            "{:?}",
+            fx.sbx.verbs_with_accounts()
+        );
+        // Gone: the pin is gone with it.
+        assert_eq!(pin_of(&fx, &name), None);
+        for jwt in installed.hub.issued() {
+            assert!(!format!("{:?}", fx.sbx.calls()).contains(&jwt));
+        }
+    }
+
+    #[test]
+    fn a_sandbox_without_a_pin_keeps_the_machine_login_whatever_the_project_names_now() {
+        let installed = Installed::new();
+        let b = installed.add("bob");
+        let fx = fx();
+        let (session, _) = begin_as(&fx, None).unwrap();
+        fx.run(session.id).0.unwrap();
+        save_project_account(&fx, Some(&b));
+        fx.sbx.set_state(&sandbox_id(&fx), "stopped");
+        fx.reset();
+        fx.reconnect(session.id).0.unwrap();
+        assert!(!fx.sbx.calls().is_empty() && !fx.shell.calls().is_empty());
+        assert!(
+            only(sbx_accounts(&fx), None),
+            "{:?}",
+            fx.sbx.verbs_with_accounts()
+        );
+        assert!(only(shell_accounts(&fx), None));
+        assert_eq!(installed.hub.calls(), 1, "only the add: B was never used");
+    }
+
+    #[test]
+    fn an_adopted_sandbox_is_pinned_to_the_account_that_found_it() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        let fx = fx_with(
+            CreateMode::TimeoutKept,
+            Some(("CLAUDE_CODE_OAUTH_TOKEN", SECRET.into())),
+        );
+        let (_, began) = begin_as(&fx, Some(&a)).unwrap();
+        let name = began.sandbox.clone().unwrap();
+        // The create timed out, the lookup by name found the sandbox: adopted and pinned.
+        assert_eq!(
+            began.sandbox_start.as_ref().unwrap().sandbox_id.as_deref(),
+            Some(NEW_ID)
+        );
+        assert_eq!(pin_of(&fx, &name).as_deref(), Some(a.as_str()));
+        let lookups: Vec<_> = fx
+            .sbx
+            .verbs_with_accounts()
+            .into_iter()
+            .filter(|(v, _)| v == "ls")
+            .collect();
+        assert!(lookups.len() >= 2, "{lookups:?}");
+        assert!(lookups
+            .iter()
+            .all(|(_, acc)| acc.as_deref() == Some(a.as_str())));
+        drop(installed);
+    }
+
+    #[test]
+    fn a_revoked_account_stops_the_start_with_its_own_advice_and_creates_nothing() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        installed.hub.reject_from_now_on();
+        let fx = fx();
+        let error = begin_as(&fx, Some(&a)).unwrap_err();
+        assert_eq!(
+            error,
+            "Docker account alice: token revoked or expired. Replace it in Settings > Cloud."
+        );
+        assert!(!error.contains("sbx login"));
+        assert_eq!(fx.sbx.count("create"), 0);
+        assert!(fx.sbx.calls().is_empty(), "sbx was not even asked");
+        // A pending session was not left behind.
+        assert!(pending_starts(&fx.store.lock().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn an_account_that_was_removed_stops_the_start_with_a_clear_text() {
+        let _installed = Installed::new();
+        let fx = fx();
+        let error = begin_as(&fx, Some("removed-account")).unwrap_err();
+        assert!(error.contains("no longer exists"), "{error}");
+        assert!(!error.contains("sbx login"));
+        assert!(fx.sbx.calls().is_empty());
+    }
+
+    /// A started sandbox session with a Host conversation, and a fake `sbx` in which the
+    /// sandbox lives in `lives_in`.
+    fn deletable(
+        pinned_to: Option<&str>,
+        lives_in: Option<&str>,
+        exists: bool,
+    ) -> (Fx, i64, crate::sandboxes::test_support::AccountSbx) {
+        let fx = fx();
+        let (session, began) = begin_as(&fx, pinned_to).unwrap();
+        let name = began.sandbox.clone().unwrap();
+        fx.run(session.id).0.unwrap();
+        let sbx = crate::sandboxes::test_support::AccountSbx::new();
+        if exists {
+            sbx.add(NEW_ID, &name, "running", lives_in);
+        }
+        let store = fx.store.lock().unwrap();
+        let mut remote = store.remote_session(session.id).unwrap().unwrap();
+        remote.session_id = Some("host-session".into());
+        store.save_remote_session(&remote).unwrap();
+        drop(store);
+        fx.host.log.lock().unwrap().clear();
+        (fx, session.id, sbx)
+    }
+    fn host_was_asked_to_delete(fx: &Fx) -> bool {
+        fx.host
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("sessions.delete"))
+    }
+
+    #[test]
+    fn the_store_delete_path_looks_the_sandbox_up_under_its_pinned_account() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        let (fx, id, sbx) = deletable(Some(&a), Some(&a), true);
+        fx.store
+            .lock()
+            .unwrap()
+            .delete_remote_session_with_sbx(id, &NoGh, &sbx, &*fx.host)
+            .unwrap();
+        assert_eq!(sbx.accounts_of("ls"), [Some(a)]);
+        // Found, so the Host conversation was deleted before the record was forgotten: the
+        // app did not conclude "gone" for a sandbox that still bills.
+        assert!(
+            host_was_asked_to_delete(&fx),
+            "{:?}",
+            fx.host.log.lock().unwrap()
+        );
+        assert!(fx
+            .store
+            .lock()
+            .unwrap()
+            .remote_session(id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn the_store_delete_path_keeps_the_machine_login_for_a_sandbox_without_a_pin() {
+        let _installed = Installed::new();
+        let (fx, id, sbx) = deletable(None, None, true);
+        fx.store
+            .lock()
+            .unwrap()
+            .delete_remote_session_with_sbx(id, &NoGh, &sbx, &*fx.host)
+            .unwrap();
+        assert_eq!(sbx.accounts_of("ls"), [None]);
+        assert!(host_was_asked_to_delete(&fx));
+    }
+
+    #[test]
+    fn a_sandbox_that_is_really_gone_under_its_account_is_forgotten_without_the_host() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        let (fx, id, sbx) = deletable(Some(&a), Some(&a), false);
+        fx.store
+            .lock()
+            .unwrap()
+            .delete_remote_session_with_sbx(id, &NoGh, &sbx, &*fx.host)
+            .unwrap();
+        assert_eq!(sbx.accounts_of("ls"), [Some(a)]);
+        assert!(!host_was_asked_to_delete(&fx));
+        assert!(fx
+            .store
+            .lock()
+            .unwrap()
+            .remote_session(id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn removing_a_session_locally_says_which_account_the_delete_command_needs() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        let fx = fx();
+        let (session, began) = begin_as(&fx, Some(&a)).unwrap();
+        let name = began.sandbox.clone().unwrap();
+        fx.run(session.id).0.unwrap();
+        // The memory store has no credentials database, so the account is named generically;
+        // the hint still never holds a token.
+        let warning = fx
+            .store
+            .lock()
+            .unwrap()
+            .remove_cloud_session_locally(session.id)
+            .unwrap();
+        assert!(
+            warning.contains(&format!("sbx --cloud rm {name}")),
+            "{warning}"
+        );
+        assert!(warning.contains("must run with the token of"), "{warning}");
+        for jwt in installed.hub.issued() {
+            assert!(!warning.contains(&jwt));
+        }
+        // Without an account the hint is the old one.
+        let (fx, id, _) = started();
+        let warning = fx
+            .store
+            .lock()
+            .unwrap()
+            .remove_cloud_session_locally(id)
+            .unwrap();
+        assert!(!warning.contains("must run with the token"), "{warning}");
+    }
+
+    #[test]
+    fn the_sandbox_terminal_names_the_sandboxs_account_and_resolves_its_token_at_spawn() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        let b = installed.add("bob");
+        let fx = fx();
+        let (session, _) = begin_as(&fx, Some(&a)).unwrap();
+        fx.run(session.id).0.unwrap();
+        save_project_account(&fx, Some(&b));
+        let terminal = fx.svc.sandbox_terminal(session.id).unwrap();
+        assert_eq!(terminal.docker_account.as_deref(), Some(a.as_str()));
+        let before = installed.hub.calls();
+        let env = terminal.env().unwrap();
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].0, "DOCKER_ACCESS_TOKEN");
+        assert!(installed.hub.issued().iter().any(|j| env[0].1 == **j));
+        assert!(installed.hub.calls() >= before);
+        // The command line the terminal runs never holds the token.
+        let shown = format!("{terminal:?}");
+        for jwt in installed.hub.issued() {
+            assert!(!shown.contains(&jwt));
+        }
+    }
+
+    #[test]
+    fn a_sandbox_terminal_without_an_account_sets_no_variable() {
+        let installed = Installed::new();
+        let fx = fx();
+        let (session, _) = begin_as(&fx, None).unwrap();
+        fx.run(session.id).0.unwrap();
+        let terminal = fx.svc.sandbox_terminal(session.id).unwrap();
+        assert_eq!(terminal.docker_account, None);
+        assert!(terminal.env().unwrap().is_empty());
+        assert_eq!(installed.hub.calls(), 0);
+    }
+
+    #[test]
+    fn a_moves_deferred_lifecycle_and_credential_delivery_run_as_the_sandboxs_account() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        let fx = fx();
+        let (session, began) = fx
+            .svc
+            .begin_sandbox_start_for_move(
+                "/Users/me/widgets",
+                &account_config(Some(&a)),
+                "fix/login",
+                "claude",
+                true,
+            )
+            .unwrap();
+        let name = began.sandbox.clone().unwrap();
+        fx.run(session.id).0.unwrap();
+        let deferred = fx.svc.peek_deferred_lifecycle(&name).unwrap();
+        assert_eq!(deferred.docker_account.as_deref(), Some(a.as_str()));
+        fx.reset();
+        fx.svc
+            .start_deferred_lifecycle(&deferred, &|| false)
+            .unwrap();
+        fx.svc
+            .deliver_git_credential(NEW_ID, &account_config(Some(&a)), &|| false)
+            .unwrap();
+        assert_eq!(fx.shell.calls().len(), 2);
+        assert!(only(shell_accounts(&fx), Some(&a)));
+        drop(installed);
+    }
 }

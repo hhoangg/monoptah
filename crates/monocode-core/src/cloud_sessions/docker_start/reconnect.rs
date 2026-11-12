@@ -201,6 +201,13 @@ impl CloudSessions {
         if let Some(path) = &target.config {
             config.devcontainer_path = path.clone();
         }
+        // The sandbox lives in the Docker account that created it, whatever the project
+        // names now: a change of the project's account applies to new sandboxes only. The
+        // config is used from here on only to run things in THIS sandbox.
+        config.docker_account = target
+            .docker_account
+            .clone()
+            .or_else(|| deps.backend.account_of(&name));
         // A live tunnel needs the container and the Host left alone (this uses the tunnel
         // only, never ssh). The Git credential cache is the one thing that expires on its
         // own, so a delivery older than [`CREDENTIAL_REFRESH_MS`] is repeated: it is cheap,

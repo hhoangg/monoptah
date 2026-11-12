@@ -687,6 +687,8 @@ pub enum DockerAuthError {
         docker_id: String,
     },
     Storage(String),
+    /// An account is named but this process has no [`DockerAccess`] (never installed).
+    NotAvailable,
 }
 impl std::fmt::Display for DockerAuthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -715,6 +717,9 @@ impl std::fmt::Display for DockerAuthError {
                 "Docker account {docker_id}: Docker Hub sent an unexpected answer. Try again later."
             ),
             Self::Storage(text) => f.write_str(text),
+            Self::NotAvailable => f.write_str(
+                "Docker accounts are not available in this session. Restart Monoptah and try again.",
+            ),
         }
     }
 }
@@ -856,6 +861,32 @@ impl DockerAccess {
         }
     }
 
+    /// The Docker ID of a saved account, `None` when it does not exist or cannot be read.
+    pub fn docker_id(&self, account_id: &str) -> Option<String> {
+        self.accounts.get(account_id).ok().map(|a| a.docker_id)
+    }
+
+    /// The error to report when `sbx` rejected even a fresh JWT of this account: the
+    /// account's token is revoked or expired (or the account is gone).
+    pub fn rejected(&self, account_id: &str) -> DockerAuthError {
+        match self.docker_id(account_id) {
+            Some(docker_id) => DockerAuthError::Revoked { docker_id },
+            None => DockerAuthError::UnknownAccount,
+        }
+    }
+
+    /// The accounts of the store's data directory with the Docker Hub exchange and clock
+    /// injected by the caller (the app passes [`SystemDockerHub`] and [`system_clock`]).
+    pub fn for_store(
+        store: &crate::store::Store,
+        hub: Arc<dyn DockerHub>,
+        clock: Clock,
+    ) -> Result<Self, String> {
+        let dir = store.data_dir().ok_or(UNAVAILABLE)?;
+        let database = crate::accounts::database_for(dir).ok_or(UNAVAILABLE)?;
+        Ok(Self::new(database, hub, clock))
+    }
+
     /// Drop the cached JWT and the remembered outcome of an account (after a rejection,
     /// token replacement or removal), so the next call exchanges again.
     pub fn invalidate(&self, account_id: &str) {
@@ -882,10 +913,60 @@ pub(crate) fn replace_shared_for_test(
         access,
     )
 }
+/// Installs the real instance (Docker Hub, the system clock) over the credentials database
+/// of `store`, unless one is installed already. A store without a data directory (in
+/// memory) installs nothing: an account then fails with [`DockerAuthError::NotAvailable`].
+pub fn install_system(store: &crate::store::Store) {
+    if shared().is_some() {
+        return;
+    }
+    if let Ok(access) = DockerAccess::for_store(store, Arc::new(SystemDockerHub), system_clock()) {
+        install(Arc::new(access));
+    }
+}
+
 /// The process-wide instance, if one was installed.
 pub fn shared() -> Option<Arc<DockerAccess>> {
     SHARED.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
+
+/// The environment variable `sbx` reads a Docker JWT from. It takes precedence over the
+/// machine's `sbx login`.
+pub const ACCESS_TOKEN_VAR: &str = "DOCKER_ACCESS_TOKEN";
+/// What `sbx` prints when the JWT in [`ACCESS_TOKEN_VAR`] is not accepted.
+pub const REJECTED_MARKER: &str = "DOCKER_ACCESS_TOKEN was rejected";
+
+/// The environment pair that makes a process (`sbx`, or `ssh` whose ProxyCommand runs
+/// `sbx`) act as Docker account `account`: a JWT with more than the refresh margin left.
+///
+/// `None` (no account) is `Ok(None)`: nothing is added and the machine's `sbx login` stays
+/// in charge, exactly as before accounts existed. An account that is named but cannot
+/// produce a JWT is an error, never a silent fallback to the machine login.
+pub fn env_for(account: Option<&str>) -> Result<Option<(&'static str, Secret)>, DockerAuthError> {
+    let Some(account) = account else {
+        return Ok(None);
+    };
+    let access = shared().ok_or(DockerAuthError::NotAvailable)?;
+    Ok(Some((ACCESS_TOKEN_VAR, access.access_token(account)?)))
+}
+
+/// True when `text` (the stderr of an `sbx` run, or of an ssh through its ProxyCommand)
+/// says the JWT was not accepted.
+pub fn is_rejection(text: &str) -> bool {
+    text.contains(REJECTED_MARKER)
+}
+
+/// [`env_for`] applied to a command: sets [`ACCESS_TOKEN_VAR`] on the child's environment
+/// only (never argv). A no-op without an account. The error is the user-facing text.
+pub fn apply_env(command: &mut std::process::Command, account: Option<&str>) -> Result<(), String> {
+    if let Some((name, token)) = env_for(account).map_err(|e| e.to_string())? {
+        command.env(name, token.as_str());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod test_support;
 
 #[cfg(test)]
 mod tests;

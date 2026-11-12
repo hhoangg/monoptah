@@ -86,6 +86,47 @@ impl SandboxProvider {
             .map(|s| s.cloud.name)
             .collect()
     }
+    /// The Docker accounts to ask when listing the project's sandboxes. A sandbox lives in
+    /// the account that created it, so each bound sandbox adds ITS account (which may differ
+    /// from the project's current choice, or from each other). With nothing bound it is the
+    /// project's own account. Without any account this is `[None]`: one `sbx ls` as the
+    /// machine login, as before.
+    fn accounts_to_ask(&self, project: &str, bound: &HashSet<String>) -> Vec<Option<String>> {
+        let mut accounts: Vec<Option<String>> = Vec::new();
+        for name in bound {
+            let account = self.cloud.sandbox_account(name);
+            if !accounts.contains(&account) {
+                accounts.push(account);
+            }
+        }
+        if accounts.is_empty() {
+            accounts.push(
+                self.config(project)
+                    .ok()
+                    .flatten()
+                    .and_then(|config| config.docker_account),
+            );
+        }
+        accounts.sort();
+        accounts
+    }
+    /// `sbx ls` once per account in `accounts`, results joined.
+    fn list_as(&self, accounts: &[Option<String>]) -> Result<Vec<sandboxes::SandboxInfo>, String> {
+        let (runner, _) = self.cloud.sandbox_tools()?;
+        let mut all: Vec<sandboxes::SandboxInfo> = Vec::new();
+        for account in accounts {
+            for info in sandboxes::list(&sandboxes::as_account(&*runner, account.as_deref()))? {
+                // A sandbox is listed by the one account it lives in; never twice.
+                if !all
+                    .iter()
+                    .any(|seen| seen.id == info.id && seen.name == info.name)
+                {
+                    all.push(info);
+                }
+            }
+        }
+        Ok(all)
+    }
     fn config(&self, project: &str) -> Result<Option<docker_config::DockerProjectConfig>, String> {
         let store = self
             .store
@@ -118,9 +159,9 @@ impl CloudProvider for SandboxProvider {
     }
 
     fn list(&self, project: &str) -> Result<Vec<CloudInstance>, String> {
-        let (runner, _) = self.cloud.sandbox_tools()?;
         let bound = self.bound_names(project);
-        Ok(sandboxes::list(&*runner)?
+        Ok(self
+            .list_as(&self.accounts_to_ask(project, &bound))?
             .into_iter()
             .filter(|info| bound.contains(&info.name))
             .map(|info| {
@@ -150,14 +191,19 @@ impl CloudProvider for SandboxProvider {
     /// repoUrl?}`. `loggedIn` is null when sbx could not be asked.
     fn status(&self, project: &str) -> Result<Value, String> {
         let (runner, home) = self.cloud.sandbox_tools()?;
-        let prerequisites = sandboxes::diagnose(&*runner, &home);
+        let config = self.config(project);
+        // As the project's Docker account when it names one.
+        let account = match &config {
+            Ok(Some(config)) => config.docker_account.as_deref(),
+            _ => None,
+        };
+        let prerequisites = sandboxes::diagnose_as(&*runner, &home, account);
         let (installed, logged_in) = match &prerequisites {
             Prerequisites::SbxMissing => (false, json!(false)),
-            Prerequisites::NotLoggedIn(_) => (true, json!(false)),
+            Prerequisites::NotLoggedIn(_) | Prerequisites::DockerAccount(_) => (true, json!(false)),
             Prerequisites::Unreachable(_) => (true, Value::Null),
             Prerequisites::SshAliasMissing | Prerequisites::Ready => (true, json!(true)),
         };
-        let config = self.config(project);
         let mut result = json!({
             "ready":prerequisites.is_ready(),
             "installed":installed,
@@ -184,8 +230,7 @@ impl CloudProvider for SandboxProvider {
     fn resolve_instance(&self, project: &str, instance: &str) -> Result<String, String> {
         let bound = self.bound_names(project);
         let name = if sandboxes::validate_sandbox_id(instance).is_ok() {
-            let (runner, _) = self.cloud.sandbox_tools()?;
-            sandboxes::list(&*runner)?
+            self.list_as(&self.accounts_to_ask(project, &bound))?
                 .into_iter()
                 .find(|info| info.id == instance)
                 .map(|info| info.name)

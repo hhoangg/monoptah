@@ -104,7 +104,9 @@
 //! Background code never runs ssh into a sandbox (that resumes and bills it): only
 //! `run_start` and `rebuild_start` (user actions) do. `inspect` is the only read they use
 //! before ssh.
-use super::backend::docker::{DockerBackend, SandboxShell, ShellOutput, SHELL_ABORTED};
+use super::backend::docker::{
+    AccountResolver, DockerBackend, SandboxShell, ShellOutput, SHELL_ABORTED,
+};
 use super::backend::{CloudBackendKind, CloudRef};
 use super::docker_config::{valid_ref, DockerProjectConfig};
 use super::startup::{
@@ -220,6 +222,9 @@ pub struct DeferredLifecycle {
     /// The commands were started (or were tried once): never again.
     #[serde(default)]
     pub started: bool,
+    /// The Docker account the sandbox lives in; the ssh that starts the commands runs as it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docker_account: Option<String>,
 }
 
 /// Why the LifecycleCommands step of a move's sandbox did not run in the start.
@@ -263,6 +268,7 @@ impl DeferredLifecycle {
             config: config_arg(&start.config),
             mount: start.config.credential_id.is_some(),
             started: false,
+            docker_account: start.config.docker_account.clone(),
         })
     }
 }
@@ -592,7 +598,17 @@ impl CloudSessions {
         shell: Arc<dyn SandboxShell>,
         secrets: Arc<dyn SandboxSecrets>,
     ) -> Self {
-        let backend = Arc::new(DockerBackend::new(runner.clone()).with_shell(shell.clone()));
+        // A sandbox this process has not been told about is looked up in the pin settings.
+        let pins = self.store.clone();
+        let resolver: AccountResolver = Arc::new(move |name| {
+            let store = pins.lock().ok()?;
+            sandboxes::account::pinned(&store, name)
+        });
+        let backend = Arc::new(
+            DockerBackend::new(runner.clone())
+                .with_shell(shell.clone())
+                .with_account_resolver(resolver),
+        );
         self.backends
             .insert(CloudBackendKind::DockerSandbox, backend.clone());
         self.sandbox = Some(SandboxDeps {
@@ -683,7 +699,10 @@ impl CloudSessions {
         }
         compute_of(&config)?;
         let (_, _, path) = git_credentials::normalize_origin(&config.repo_url)?;
-        let prerequisites = sandboxes::diagnose(&*deps.runner, &deps.home);
+        // Under the project's Docker account when it names one: an account problem then
+        // reads as such (with where to fix it), never as "run `sbx login`".
+        let prerequisites =
+            sandboxes::diagnose_as(&*deps.runner, &deps.home, config.docker_account.as_deref());
         if !prerequisites.is_ready() {
             return Err(prerequisites.message());
         }
@@ -762,9 +781,13 @@ impl CloudSessions {
             .as_ref()
             .ok_or_else(|| CreateFailure::definite("This start has no sandbox data.".into()))?;
         let compute = compute_of(&start.config).map_err(CreateFailure::definite)?;
+        // A sandbox lives in the account that creates it: the start's own snapshot of the
+        // project config, so a later change of the project's account does not move a retry.
+        let account = start.config.docker_account.clone();
+        let runner = sandboxes::as_account(&*deps.runner, account.as_deref());
         let mut found = None;
         if lookup_first {
-            found = sandboxes::find_by_name(&*deps.runner, &name)
+            found = sandboxes::find_by_name(&runner, &name)
                 .map_err(|e| CreateFailure {
                     message: e,
                     ambiguous: true,
@@ -773,11 +796,11 @@ impl CloudSessions {
         }
         let id = match found {
             Some(id) => id,
-            None => match sandboxes::create(&*deps.runner, &name, &compute) {
+            None => match sandboxes::create(&runner, &name, &compute) {
                 Ok(id) => id,
                 Err(error) => match error.id {
                     Some(id) => id,
-                    None => match sandboxes::find_by_name(&*deps.runner, &name) {
+                    None => match sandboxes::find_by_name(&runner, &name) {
                         Ok(Some(found)) => found.id,
                         Ok(None) => {
                             return Err(CreateFailure {
@@ -795,6 +818,11 @@ impl CloudSessions {
                 },
             },
         };
+        // Created or adopted: from here on every call for this name runs as `account`.
+        if let Ok(store) = self.store() {
+            sandboxes::account::pin(&store, &name, account.as_deref());
+        }
+        deps.backend.remember_account(&name, account.as_deref());
         deps.backend.remember(&name, &id);
         if let Some(start) = record.sandbox_start.as_mut() {
             start.sandbox_id = Some(id);
@@ -975,6 +1003,7 @@ impl CloudSessions {
         what: &str,
     ) -> Result<ShellOutput, Stop> {
         let shell = run.deps.shell.clone();
+        let account = Self::run_account(run);
         let cancel = run.cancel;
         let session_id = run.record.session_id;
         let detached = run.detached;
@@ -985,7 +1014,15 @@ impl CloudSessions {
                     self.log_line(run, line);
                 }
             };
-            shell.run(id, remote, stdin, &mut on_line, &abort, timeout)
+            shell.run_as(
+                account.as_deref(),
+                id,
+                remote,
+                stdin,
+                &mut on_line,
+                &abort,
+                timeout,
+            )
         };
         let out = result.map_err(|e| Stop::from(run.scrub.apply(&e)))?;
         if !out.success {
@@ -1017,7 +1054,8 @@ impl CloudSessions {
         }
         let out = deps
             .shell
-            .run(
+            .run_as(
+                config.docker_account.as_deref(),
                 sandbox_id,
                 &approve_remote(),
                 &payload,
@@ -1031,6 +1069,15 @@ impl CloudSessions {
         } else {
             Err(failure_text(&out, &scrub, "Delivering the Git credential"))
         }
+    }
+
+    /// The Docker account this run's sandbox lives in: the start's own snapshot of the
+    /// project config (a reconnect overwrites it with the sandbox's pinned account).
+    fn run_account(run: &Run) -> Option<String> {
+        run.record
+            .sandbox_start
+            .as_ref()
+            .and_then(|s| s.config.docker_account.clone())
     }
 
     fn sandbox_id(run: &Run) -> Result<String, Stop> {
@@ -1061,7 +1108,11 @@ impl CloudSessions {
         let id = Self::sandbox_id(run)?;
         run.deps.backend.remember(name, &id);
         // Reconcile: the sandbox may be stopped, or gone. Never recreated.
-        match sandboxes::inspect(&*run.deps.runner, &id) {
+        let account = Self::run_account(run);
+        match sandboxes::inspect(
+            &sandboxes::as_account(&*run.deps.runner, account.as_deref()),
+            &id,
+        ) {
             Ok(info) => {
                 let state = info.state.trim().to_ascii_lowercase();
                 match state.as_str() {
@@ -1371,6 +1422,7 @@ impl CloudSessions {
         self.sandbox_exec(run, &id, SH_S, &vars, SHORT, "Starting the container build")?;
         let follow_vars = Self::up_vars(run, "follow")?;
         let shell = run.deps.shell.clone();
+        let account = Self::run_account(run);
         let mut delivered = 0usize;
         let mut exit: Option<String> = None;
         let mut outcome: Option<UpLine> = None;
@@ -1395,7 +1447,15 @@ impl CloudSessions {
                         exit = Some(code.trim().to_string());
                     }
                 };
-                shell.run(&id, SH_S, &follow, &mut on_line, &abort, LONG)
+                shell.run_as(
+                    account.as_deref(),
+                    &id,
+                    SH_S,
+                    &follow,
+                    &mut on_line,
+                    &abort,
+                    LONG,
+                )
             };
             match result {
                 Err(error) => {
@@ -1539,6 +1599,7 @@ impl CloudSessions {
             relay_port: start.relay_port,
             config: config_arg(&start.config),
             mode,
+            docker_account: start.config.docker_account.clone(),
         };
         crate::remote::validate_sandbox_target(&target)?;
         Ok((target, container))
@@ -1837,7 +1898,15 @@ impl CloudSessions {
         );
         let out = deps
             .shell
-            .run(&deferred.sandbox_id, SH_S, &vars, &mut |_| {}, abort, SHORT)
+            .run_as(
+                deferred.docker_account.as_deref(),
+                &deferred.sandbox_id,
+                SH_S,
+                &vars,
+                &mut |_| {},
+                abort,
+                SHORT,
+            )
             .map_err(|e| Scrub(vec![]).apply(&e))?;
         if !out.success {
             return Err(failure_text(
