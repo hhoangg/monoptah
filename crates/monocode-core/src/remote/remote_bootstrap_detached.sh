@@ -16,7 +16,7 @@ start_detached_host() {
     exit 1
   fi
   (
-    PATH="$PATH:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    PATH="$HOME/.local/bin:$PATH:/usr/local/bin:/usr/bin:/bin"
     export PATH
     if command -v setsid >/dev/null 2>&1; then
       setsid "$ENTRY" serve --data-dir "$BASE" --port "$HOST_PORT" </dev/null >>"$BASE/host.log" 2>&1 &
@@ -38,4 +38,8 @@ ensure_detached_host() {
   echo "The Monoptah Host did not start. Check $BASE/host.log." >&2
   tail -n 20 "$BASE/host.log" >&2 2>/dev/null || true
   exit 1
+}
+# Runs before every `service install` of a restored Host too (the upgrade rollback calls it).
+before_service_install() {
+  ensure_detached_host
 }

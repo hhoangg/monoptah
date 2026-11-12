@@ -20,10 +20,10 @@
 //! | Create | id known: `inspect` it (gone -> failure, never recreated); id unknown: create or adopt by name |
 //! | Provision | `docker_provision.sh` phases `setup` (xz, Dev Container CLI), `approve` (Git credential into an in-memory `git-credential-cache`, payload on stdin) and `clone` (checkout + feature branch) |
 //! | BuildContainer, BlockingCommands | `docker_up.sh` runs `devcontainer up --skip-non-blocking-commands --log-format json` detached into a log file; the log is followed over ssh and mapped to steps by [`parse_up_line`] |
-//! | ConfigureCodespace ("Configure environment") | inside the container: git credential helper pointing at the mounted socket, for the exact repo URL |
+//! | ConfigureCodespace ("Configure environment") | inside the container: git credential helper pointing at the mounted socket, for the exact repo URL; for GitHub a `gh` wrapper in `~/.local/bin` that reads the cached token per call; an agent note in `~/.claude/rules/monoptah-cloud-git.md` |
 //! | Connect | bootstrap the Host in the container (Claude prelude on stdin), start the relay, pair and tunnel through [`Host::connect_sandbox`](super::Host::connect_sandbox) |
 //! | OpenProject | [`super::open_project`] with the container's `remoteWorkspaceFolder` |
-//! | LifecycleCommands | `devcontainer run-user-commands` detached; never blocks `Ready` |
+//! | LifecycleCommands | `devcontainer run-user-commands` detached; never blocks `Ready`. A sandbox a MOVE starts ([`CloudSessions::begin_sandbox_start_for_move`]) skips it ("Starts after the move restores the code"): the move would restore the code while `postCreateCommand` (a big fetch, say) hogs the sandbox, so the move starts it itself afterwards ([`DeferredLifecycle`]) |
 //!
 //! # Container and Plain mode
 //!
@@ -56,6 +56,20 @@
 //!   `$HOME/.monoptah/git/sock` in the outer sandbox, bind-mounted into the container at
 //!   [`CONTAINER_GIT_DIR`]. The container's global git config names that socket for the exact
 //!   repo URL only. The daemon keeps the token in memory (24 h), nothing is written to disk.
+//! * `gh` (GitHub only): the configure step installs `~/.local/bin/gh`, a marked POSIX sh
+//!   wrapper that the Host bootstrap puts first on `PATH`. On every call it asks the cache
+//!   (`git credential-cache get`, bound to this repo's host and path) for the token and sets
+//!   `GH_TOKEN` for that one exec of the real `gh`. Through `gh` the token works for any
+//!   GitHub request its own PAT permissions allow, not only this repository. The Host
+//!   bootstrap puts `$HOME/.local/bin` first on `PATH` (both the foreground and the detached
+//!   start), which is what makes the wrapper win over `/usr/bin/gh`; the note also names the
+//!   absolute path. It holds no secret, refuses `gh auth
+//!   token`, `gh auth status -t`, `gh auth git-credential`, `gh auth login` and `gh auth
+//!   setup-git`, and respects a
+//!   `GH_TOKEN`/`GITHUB_TOKEN` already in the environment. The agent note
+//!   `~/.claude/rules/monoptah-cloud-git.md` (GitHub and GitLab, marked, no secret) tells the
+//!   agent what is preconfigured. Both files are removed (only if marked) when the session
+//!   has no credential. A foreign `~/.local/bin/gh` or note is never overwritten.
 //! * Relay: the outer sandbox listens on `127.0.0.1:`[`DEFAULT_RELAY_PORT`] (the only place
 //!   `ssh -L` may point to). Each connection runs `docker exec -i -u <remoteUser> <container>`
 //!   with the Host's own packaged Node (`$(cat ~/.monocode-host/runtime-path)/bin/node -e`)
@@ -78,6 +92,9 @@
 //! * Every process in the container, repository lifecycle commands included, can use the
 //!   Git token through the mounted socket (scoped to the one repo URL) and the Claude token
 //!   through the Host's environment.
+//! * Likewise any process in the container that can run `gh` gets the token through the
+//!   wrapper (same trade-off as the socket, except that through `gh` the token is limited only
+//!   by its own PAT permissions).
 //! * The Claude installer runs with the token exported.
 //! * The socket is reachable only by the outer sandbox user's uid: with
 //!   `updateRemoteUserUID` off and a different container uid, the container can not use it.
@@ -96,6 +113,7 @@ use super::startup::{
 };
 use super::{require_claude, CloudBinding, CloudSessions, OpenRequest, START_ABORTED};
 use crate::git_credentials::{self, GitCredentials};
+use crate::remote::host_upgrade::SandboxAuth;
 use crate::remote::{
     sandbox_bootstrap_script, shell_quote, validate_sandbox_workspace, SandboxMode, SandboxTarget,
 };
@@ -175,6 +193,78 @@ pub struct SandboxStart {
     /// The next `devcontainer up` removes the existing container (rebuild).
     #[serde(default)]
     pub rebuild: bool,
+    /// A move started this sandbox ([`CloudSessions::begin_sandbox_start_for_move`]): the
+    /// LifecycleCommands step does not run the repository's background commands (the
+    /// devcontainer `postCreateCommand` and friends), because the move restores the code
+    /// first and would compete with them. The move starts them itself afterwards, see
+    /// [`DeferredLifecycle`].
+    #[serde(default)]
+    pub defer_lifecycle: bool,
+}
+
+/// What the move needs to start the lifecycle commands of a sandbox it started, after the
+/// code is restored: exactly the inputs of the `lifecycle` mode of `docker_up.sh`. Holds no
+/// secret.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeferredLifecycle {
+    pub sandbox_id: String,
+    /// Checkout path in the OUTER sandbox (`--workspace-folder`).
+    pub workspace: String,
+    /// Non-default devcontainer config path, when one is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<String>,
+    /// The Git credential socket is mounted into the container.
+    #[serde(default)]
+    pub mount: bool,
+    /// The commands were started (or were tried once): never again.
+    #[serde(default)]
+    pub started: bool,
+}
+
+/// Why the LifecycleCommands step of a move's sandbox did not run in the start.
+const LIFECYCLE_DEFERRED: &str = "Starts after the move restores the code";
+
+/// Store setting that holds a sandbox's [`DeferredLifecycle`] between the end of its start
+/// and the move that takes it. The name is unique per sandbox, so a stale value never
+/// reaches another one.
+fn deferred_key(sandbox: &str) -> String {
+    format!("cloud-sandbox-lifecycle:{sandbox}")
+}
+
+impl CloudSessions {
+    /// Reads (without clearing) what the start of the sandbox `name` deferred. The caller
+    /// clears it with [`Self::clear_deferred_lifecycle`] once it has saved it elsewhere.
+    pub(super) fn peek_deferred_lifecycle(&self, name: &str) -> Option<DeferredLifecycle> {
+        let store = self.store().ok()?;
+        let text = store.setting(&deferred_key(name)).ok().flatten()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    /// Clears what [`Self::peek_deferred_lifecycle`] read.
+    pub(super) fn clear_deferred_lifecycle(&self, name: &str) {
+        if let Ok(store) = self.store() {
+            let _ = store.save_setting(&deferred_key(name), "");
+        }
+    }
+}
+
+impl DeferredLifecycle {
+    /// What a finished start of a move's sandbox leaves for the move to run later. `None`
+    /// when the start did not defer, has no container, or lacks what the script needs.
+    pub(super) fn of(record: &StartRecord) -> Option<Self> {
+        let start = record.sandbox_start.as_ref()?;
+        if !start.defer_lifecycle || start.mode.unwrap_or_default() == SandboxMode::Plain {
+            return None;
+        }
+        Some(Self {
+            sandbox_id: start.sandbox_id.clone()?,
+            workspace: start.workspace.clone()?,
+            config: config_arg(&start.config),
+            mount: start.config.credential_id.is_some(),
+            started: false,
+        })
+    }
 }
 
 /// The ssh/exec seam, the secret source and the `sbx` runner of the sandbox flow.
@@ -544,6 +634,46 @@ impl CloudSessions {
         branch: &str,
         harness: &str,
     ) -> Result<(Session, StartRecord), String> {
+        self.begin_sandbox_start_with_kit(local_cwd, config, branch, harness, true)
+    }
+
+    /// [`Self::begin_sandbox_start`] with this start's own Claude setup choice. `kit: false`
+    /// is part of the FIRST persisted record (before `sbx create`), so no crash or later
+    /// write failure can turn it back on (rule D11).
+    pub fn begin_sandbox_start_with_kit(
+        &self,
+        local_cwd: &str,
+        config: &DockerProjectConfig,
+        branch: &str,
+        harness: &str,
+        kit: bool,
+    ) -> Result<(Session, StartRecord), String> {
+        self.begin_sandbox_start_inner(local_cwd, config, branch, harness, kit, false)
+    }
+
+    /// [`Self::begin_sandbox_start_with_kit`] for a sandbox a move creates: the start leaves
+    /// the repository's background lifecycle commands to the move ([`DeferredLifecycle`]), so
+    /// they do not compete with the code restore. An ordinary start never uses this.
+    pub(super) fn begin_sandbox_start_for_move(
+        &self,
+        local_cwd: &str,
+        config: &DockerProjectConfig,
+        branch: &str,
+        harness: &str,
+        kit: bool,
+    ) -> Result<(Session, StartRecord), String> {
+        self.begin_sandbox_start_inner(local_cwd, config, branch, harness, kit, true)
+    }
+
+    fn begin_sandbox_start_inner(
+        &self,
+        local_cwd: &str,
+        config: &DockerProjectConfig,
+        branch: &str,
+        harness: &str,
+        kit: bool,
+        defer_lifecycle: bool,
+    ) -> Result<(Session, StartRecord), String> {
         require_claude(harness)?;
         let deps = self.sandbox_deps()?;
         let config = config.validated()?;
@@ -571,10 +701,12 @@ impl CloudSessions {
             mode: None,
             relay_port: DEFAULT_RELAY_PORT,
             rebuild: false,
+            defer_lifecycle,
         };
         let remote_cwd = format!("/workspaces/{repo_dir}");
         let mut record =
             fresh_sandbox_record(&name, local_cwd, &path, &branch, &remote_cwd, start, began);
+        record.kit_off = !kit;
         let session = {
             let store = self.store()?;
             let project = pending_cloud_project(local_cwd, &CloudRef::sandbox(&name), &remote_cwd);
@@ -765,7 +897,7 @@ impl CloudSessions {
         self.sandbox_build_step(&mut run)?;
         self.sandbox_configure_step(&mut run)?;
         let target = self.sandbox_connect_step(&mut run, &name, auth.as_ref())?;
-        let (binding, project) = self.sandbox_open_step(&mut run, &name, &target)?;
+        let (binding, project) = self.sandbox_open_step(&mut run, &name, &target, auth.as_ref())?;
         self.sandbox_lifecycle_step(&mut run);
 
         if self.start_aborted(session_id, cancel) {
@@ -782,6 +914,7 @@ impl CloudSessions {
         let at = self.now();
         let record = run.record;
         record.finish_step(StepKind::OpenProject, at);
+        record.skip_unrun_claude_setup(at);
         if record.step(StepKind::BlockingCommands).status == StepStatus::Pending {
             record.step_mut(StepKind::BlockingCommands).status = StepStatus::Skipped;
         }
@@ -1208,23 +1341,11 @@ impl CloudSessions {
             .workspace
             .as_deref()
             .ok_or("The workspace is not known yet.")?;
-        let config = config_arg(&start.config);
-        Ok(with_vars(
-            &[
-                ("MODE", mode),
-                ("WS", workspace),
-                ("CONFIG", config.as_deref().unwrap_or("")),
-                (
-                    "MOUNT",
-                    if start.config.credential_id.is_some() {
-                        "1"
-                    } else {
-                        "0"
-                    },
-                ),
-                ("MOUNT_DST", CONTAINER_GIT_DIR),
-            ],
-            UP_SCRIPT,
+        Ok(up_vars_with(
+            mode,
+            workspace,
+            config_arg(&start.config).as_deref(),
+            start.config.credential_id.is_some(),
         ))
     }
 
@@ -1442,6 +1563,9 @@ impl CloudSessions {
             .clone()
             .ok_or("Missing sandbox data.")?;
         let clone_url = git_credentials::clone_url(&start.config.repo_url)?;
+        // The host and the `path=` of the credential payload (see `GitCredentials::summary_for`),
+        // so the gh wrapper asks the cache for exactly the entry that was approved.
+        let (platform, repo_path) = git_credentials::payload_path(&start.config.repo_url)?;
         // Without a container the script runs in the outer sandbox and finds the cache
         // socket itself (empty SOCKET).
         let socket = match target.mode {
@@ -1459,6 +1583,8 @@ impl CloudSessions {
                     },
                 ),
                 ("CLONE_URL", &clone_url),
+                ("GIT_HOST", platform.host()),
+                ("REPO_PATH", &repo_path),
                 ("SOCKET", &socket),
             ],
             GIT_CONFIG_SCRIPT,
@@ -1553,6 +1679,7 @@ impl CloudSessions {
         run: &mut Run,
         name: &str,
         target: &SandboxTarget,
+        auth: Option<&ClaudeAuth>,
     ) -> Result<(CloudBinding, crate::store::RemoteProject), Stop> {
         let (_, container) = self.container_target(run)?;
         let remote_cwd = Self::project_folder(target, container.as_ref());
@@ -1560,6 +1687,9 @@ impl CloudSessions {
         // The evidence setup and the later archive copy exec into this container.
         run.deps.backend.remember_target(target);
         let backend = self.backend(CloudBackendKind::DockerSandbox)?;
+        // The Host upgrade restarts the Host through the SAME prelude as the connect step.
+        let prelude = auth.map(ClaudeAuth::prelude);
+        let setup = self.setup_plan(run.record);
         let request = OpenRequest {
             local_cwd: &run.record.local_project.clone(),
             cloud: &cloud,
@@ -1567,6 +1697,13 @@ impl CloudSessions {
             display: &run.record.display.clone(),
             repo: &run.record.repo.clone(),
             remote_cwd: &remote_cwd,
+            auth: auth
+                .zip(prelude.as_deref())
+                .map(|(auth, prelude)| SandboxAuth {
+                    prelude: prelude.as_str(),
+                    secret: auth.secret(),
+                }),
+            setup,
         };
         let cell = std::cell::RefCell::new((&mut *run.record, &mut *run.events));
         let halt = AtomicBool::new(false);
@@ -1594,6 +1731,11 @@ impl CloudSessions {
                 self.publish(record, &mut **events);
             },
             &mut |line| {
+                // The Claude setup reports a line before each phase: this is where a
+                // cancelled or deleted start stops it (`open_project` polls `halt`).
+                if self.start_aborted(session_id, cancel) {
+                    halt.store(true, Ordering::Relaxed);
+                }
                 let mut guard = cell.borrow_mut();
                 let (record, events) = &mut *guard;
                 let text = format!("{PROGRESS_PREFIX}{}", run.scrub.apply(line));
@@ -1617,6 +1759,32 @@ impl CloudSessions {
     fn sandbox_lifecycle_step(&self, run: &mut Run) {
         if Self::run_mode(run) == SandboxMode::Plain {
             Self::skip_without_devcontainer(run, &[StepKind::LifecycleCommands]);
+            self.publish(run.record, run.events);
+            return;
+        }
+        if run
+            .record
+            .sandbox_start
+            .as_ref()
+            .is_some_and(|s| s.defer_lifecycle)
+        {
+            // A move starts them after it restored the code (see `DeferredLifecycle`). The
+            // start record is gone once the start is ready, so what the move needs is kept
+            // under the sandbox name until the move takes it.
+            if let (Some(deferred), Some(name), Ok(store)) = (
+                DeferredLifecycle::of(run.record),
+                run.record.sandbox.clone(),
+                self.store(),
+            ) {
+                if let Ok(text) = serde_json::to_string(&deferred) {
+                    let _ = store.save_setting(&deferred_key(&name), &text);
+                }
+            }
+            let step = run.record.step_mut(StepKind::LifecycleCommands);
+            step.status = StepStatus::Skipped;
+            step.started_at = None;
+            step.finished_at = None;
+            step.detail = Some(LIFECYCLE_DEFERRED.into());
             self.publish(run.record, run.events);
             return;
         }
@@ -1651,6 +1819,36 @@ impl CloudSessions {
         self.publish(run.record, run.events);
     }
 
+    /// Starts the lifecycle commands a move deferred ([`DeferredLifecycle`]): the same
+    /// `docker_up.sh` `lifecycle` run the start would have made, detached in the outer
+    /// sandbox. Only for a move that just restored the code or kept its sandbox on cancel.
+    pub(super) fn start_deferred_lifecycle(
+        &self,
+        deferred: &DeferredLifecycle,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<(), String> {
+        let deps = self.sandbox_deps()?;
+        sandboxes::validate_sandbox_id(&deferred.sandbox_id)?;
+        let vars = up_vars_with(
+            "lifecycle",
+            &deferred.workspace,
+            deferred.config.as_deref(),
+            deferred.mount,
+        );
+        let out = deps
+            .shell
+            .run(&deferred.sandbox_id, SH_S, &vars, &mut |_| {}, abort, SHORT)
+            .map_err(|e| Scrub(vec![]).apply(&e))?;
+        if !out.success {
+            return Err(failure_text(
+                &out,
+                &Scrub(vec![]),
+                "Starting the background commands",
+            ));
+        }
+        Ok(())
+    }
+
     // ---- Rebuild
 
     /// `rebuild_start` for a sandbox: the next `run_start` runs `devcontainer up
@@ -1676,7 +1874,7 @@ impl CloudSessions {
             return Err("This sandbox has no devcontainer to rebuild.".into());
         }
         for step in &mut record.steps {
-            if !matches!(step.kind, StepKind::Create | StepKind::Provision) {
+            if !matches!(step.kind, StepKind::Create | StepKind::Provision) && !step.predates() {
                 *step = Step::pending(step.kind);
             }
         }
@@ -1747,6 +1945,20 @@ pub(super) fn container_key(name: &str) -> String {
     format!("sandbox-container:{name}")
 }
 
+/// The `docker_up.sh` script with its variables for `mode`.
+fn up_vars_with(mode: &str, workspace: &str, config: Option<&str>, mount: bool) -> String {
+    with_vars(
+        &[
+            ("MODE", mode),
+            ("WS", workspace),
+            ("CONFIG", config.unwrap_or("")),
+            ("MOUNT", if mount { "1" } else { "0" }),
+            ("MOUNT_DST", CONTAINER_GIT_DIR),
+        ],
+        UP_SCRIPT,
+    )
+}
+
 /// `--config` argument: the devcontainer path, unless it is the default one.
 fn config_arg(config: &DockerProjectConfig) -> Option<String> {
     (config.devcontainer_path != super::docker_config::DEFAULT_DEVCONTAINER)
@@ -1787,5 +1999,6 @@ fn fresh_sandbox_record(
         finished_at: None,
         track_ready: false,
         sandbox_start: Some(start),
+        kit_off: false,
     }
 }

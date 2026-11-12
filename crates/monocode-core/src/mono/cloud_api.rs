@@ -30,6 +30,7 @@
 //! Listings only read cached or read-only state.
 //!
 //! Secret values never pass through this module.
+use crate::cloud_sessions::kit_prefs::ApiKit;
 use crate::cloud_sessions::{
     CloudBackendKind, CloudBinding, CloudRef, CloudSessions, CloudState, DeleteOutcome,
     InstanceSession, SessionTarget, StartupSummary,
@@ -146,6 +147,8 @@ pub struct CloudTarget {
     pub instance: InstanceChoice,
     /// Backend options (`branch`, `machine`, `cpus`, ...), only with [`InstanceChoice::New`].
     pub options: Map<String, Value>,
+    /// `target.kit`. The API can only turn the user's kit off, never widen it.
+    pub kit: ApiKit,
 }
 
 impl CloudTarget {
@@ -154,6 +157,7 @@ impl CloudTarget {
             kind,
             instance,
             options: Map::new(),
+            kit: ApiKit::Default,
         }
     }
     /// Text option `key`, e.g. `branch`.
@@ -185,21 +189,36 @@ pub fn target_from_input(input: &Value) -> Result<Option<CloudTarget>, String> {
         ),
         Some(_) => return Err("target.instance is not valid".into()),
     };
+    let kit = map
+        .get(validate::KIT_OPTION)
+        .map(ApiKit::parse)
+        .transpose()?
+        .unwrap_or(ApiKit::Default);
     let options = map
         .iter()
-        .filter(|(key, _)| !matches!(key.as_str(), "kind" | "instance"))
+        .filter(|(key, _)| !matches!(key.as_str(), "kind" | "instance" | validate::KIT_OPTION))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
     Ok(Some(CloudTarget {
         kind,
         instance,
         options,
+        kit,
     }))
 }
 
 /// True when session `id` is a cloud session bound to the local `project`.
 pub fn is_cloud_session_of(store: &Store, id: i64, project: &str) -> bool {
     let key = crate::files::path_key(project);
+    // A local session whose location is Cloud is a cloud session of its own project, served by
+    // its linked Host record (design 4.2.1).
+    if let Ok((_, host)) = store.cloud_host_record(id) {
+        return host.project.cloud().is_some()
+            && store.sessions().ok().is_some_and(|all| {
+                all.iter()
+                    .any(|s| s.id == id && crate::files::path_key(&s.cwd) == key)
+            });
+    }
     store.remote_session(id).ok().flatten().is_some_and(|s| {
         s.project.cloud().is_some()
             && s.project
@@ -207,6 +226,15 @@ pub fn is_cloud_session_of(store: &Store, id: i64, project: &str) -> bool {
                 .as_deref()
                 .is_some_and(|p| crate::files::path_key(p) == key)
     })
+}
+
+/// The Host record that serves session `id`: the linked record of a Cloud-located local
+/// session, or the session's own record for one born in the cloud.
+fn serving_record(store: &Store, id: i64) -> Option<(i64, crate::store::RemoteSession)> {
+    store
+        .cloud_host_record(id)
+        .ok()
+        .or_else(|| store.remote_session(id).ok().flatten().map(|s| (id, s)))
 }
 
 pub use crate::cloud_sessions::created_note;
@@ -596,9 +624,8 @@ impl CloudApi {
         if !is_cloud_session_of(&store, id, project) {
             return Err("Session is not a cloud session of this project.".into());
         }
-        store
-            .remote_session(id)?
-            .and_then(|s| s.project.cloud())
+        serving_record(&store, id)
+            .and_then(|(_, s)| s.project.cloud())
             .ok_or_else(|| "Session is not a cloud session of this project.".into())
     }
     fn outcome(&self, cloud: &CloudRef, flag: &str, sessions: &[InstanceSession]) -> Value {
@@ -755,8 +782,15 @@ impl CloudApi {
         harness: &str,
     ) -> Result<CloudStart, String> {
         let instance = self.instance_name(project, &target)?;
-        self.provider(target.kind)?
-            .start(project, harness, instance.as_deref(), &target.options)
+        // `kit: "none"` can only narrow the user's choice (rule D11). It goes into the first
+        // record the start persists, so no later write can turn the kit back on.
+        self.provider(target.kind)?.start(
+            project,
+            harness,
+            instance.as_deref(),
+            &target.options,
+            target.kit != ApiKit::None,
+        )
     }
     /// A blank session on the binding (Claude only).
     pub fn create_session(&self, binding: &CloudBinding, harness: &str) -> Result<Session, String> {
@@ -864,7 +898,9 @@ impl CloudApi {
             Some(_) => return Err("taskId must be a Today task id or key".into()),
         };
         let path = input.get("path").and_then(Value::as_str);
-        let pull = self.cloud.pull_evidence(session_id, path)?;
+        let serving =
+            serving_record(&*lock()?, session_id).map_or(session_id, |(host_id, _)| host_id);
+        let pull = self.cloud.pull_evidence(serving, path)?;
         let files: Vec<String> = pull
             .files
             .iter()

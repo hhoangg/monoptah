@@ -82,6 +82,7 @@ impl Host for FakeHost {
         &self,
         codespace: &str,
         display: &str,
+        _: &AtomicBool,
         _progress: &mut dyn FnMut(&str),
     ) -> Result<Machine, String> {
         self.log
@@ -404,6 +405,21 @@ fn parses_the_target_of_sessions_start() {
     assert_eq!(omitted.kind, CloudBackendKind::DockerSandbox);
     assert_eq!(omitted.instance, InstanceChoice::New);
     assert_eq!(omitted.options["cpus"], 4);
+    // The kit option is not a backend option; it defaults to the user's kit.
+    assert_eq!(new.kit, ApiKit::Default);
+    assert!(!new.options.contains_key("kit"));
+    let none = target_from_input(&json!({"target":{"kind":"sandbox","kit":"none","cpus":4}}))
+        .unwrap()
+        .unwrap();
+    assert_eq!(none.kit, ApiKit::None);
+    assert_eq!(none.options.len(), 1, "only cpus stays an option");
+    let default = target_from_input(&json!({"target":{"kind":"sandbox","kit":"default"}}))
+        .unwrap()
+        .unwrap();
+    assert_eq!(default.kit, ApiKit::Default);
+    assert!(
+        target_from_input(&json!({"target":{"kind":"sandbox","kit":{"skills":["a"]}}})).is_err()
+    );
     let named = target_from_input(&json!({"target":{"kind":"codespace","instance":"octo-abc"}}))
         .unwrap()
         .unwrap();
@@ -1612,6 +1628,42 @@ fn a_named_start_error_is_not_decorated() {
 }
 
 #[test]
+fn kit_none_marks_the_pending_start_so_no_kit_is_sent() {
+    let gh = FakeGh::new(vec![
+        ("auth status", ok(AUTH_OK)),
+        ("codespace list", ok(LIST)),
+        (
+            "--method POST",
+            ok(r#"{"name":"octo-new1","state":"Provisioning"}"#),
+        ),
+    ]);
+    let fx = fixture(&gh);
+    let new = || start_target(CloudBackendKind::Codespaces, InstanceChoice::New);
+    // The default leaves the user's choice alone.
+    let CloudStart::Pending(session, record) =
+        fx.api.begin_start(&fx.path(), new(), "claude").unwrap()
+    else {
+        panic!("not pending");
+    };
+    assert!(!record.kit_off);
+    let stored = |id| {
+        let store = fx.store.lock().unwrap();
+        crate::cloud_sessions::start_record(&store, id).unwrap()
+    };
+    assert!(!stored(session.id).kit_off);
+    // `kit: "none"` turns it off for this start, in the answer and in the stored record.
+    let mut target = new();
+    target.kit = ApiKit::None;
+    let CloudStart::Pending(session, record) =
+        fx.api.begin_start(&fx.path(), target, "claude").unwrap()
+    else {
+        panic!("not pending");
+    };
+    assert!(record.kit_off);
+    assert!(stored(session.id).kit_off);
+}
+
+#[test]
 fn starting_a_codespace_session_resolves_every_instance_form() {
     let gh = FakeGh::new(vec![
         ("auth status", ok(AUTH_OK)),
@@ -2182,4 +2234,43 @@ fn pull_evidence_works_for_a_sandbox_session() {
             1
         )
         .is_err());
+}
+
+#[test]
+fn a_cloud_located_local_session_is_a_cloud_session_of_its_project() {
+    let gh = FakeGh::new(vec![
+        ("auth status", ok(AUTH_OK)),
+        ("codespace list", ok(LIST)),
+    ]);
+    let fx = fixture(&gh);
+    let host_id = fx.bind("octo-abc");
+    let store = fx.store.lock().unwrap();
+    let record = store.remote_session(host_id).unwrap().unwrap();
+    let local = store.create("claude", &fx.path()).unwrap().id;
+    assert!(!is_cloud_session_of(&store, local, &fx.path()));
+    store
+        .set_cloud_location(
+            local,
+            &crate::store::SessionLocation::Cloud(crate::store::CloudLocation {
+                cloud: record.project.cloud().unwrap(),
+                environment_id: record.project.environment_id.clone(),
+                project_id: String::new(),
+                host_session_id: "host-1".into(),
+                remote_cwd: "/workspaces/widgets".into(),
+                local_cwd: fx.path(),
+                moved_at_row: 10,
+                pushed_branch: None,
+            }),
+        )
+        .unwrap();
+    // Without a resolvable Host record it is not served.
+    assert!(!is_cloud_session_of(&store, local, &fx.path()));
+    let mut saved = record.clone();
+    saved.session_id = Some("host-1".into());
+    store.save_remote_session(&saved).unwrap();
+    store.link_remote_session(host_id, Some(local)).unwrap();
+    assert!(is_cloud_session_of(&store, local, &fx.path()));
+    assert!(!is_cloud_session_of(&store, local, "/somewhere/else"));
+    let serving = serving_record(&store, local).unwrap();
+    assert_eq!(serving.0, host_id);
 }

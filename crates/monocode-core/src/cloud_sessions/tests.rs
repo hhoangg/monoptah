@@ -89,6 +89,7 @@ impl Host for FakeHost {
         &self,
         codespace: &str,
         display: &str,
+        _: &AtomicBool,
         progress: &mut dyn FnMut(&str),
     ) -> Result<Machine, String> {
         progress("pairing");
@@ -455,8 +456,14 @@ fn delete_forgets_bindings_even_when_disconnect_fails() {
         fn machines(&self) -> Result<Vec<Machine>, String> {
             self.0.machines()
         }
-        fn connect(&self, c: &str, d: &str, p: &mut dyn FnMut(&str)) -> Result<Machine, String> {
-            self.0.connect(c, d, p)
+        fn connect(
+            &self,
+            c: &str,
+            d: &str,
+            h: &AtomicBool,
+            p: &mut dyn FnMut(&str),
+        ) -> Result<Machine, String> {
+            self.0.connect(c, d, h, p)
         }
         fn ensure(&self, m: &str, c: &AtomicBool, p: &mut dyn FnMut(&str)) -> Result<(), String> {
             self.0.ensure(m, c, p)
@@ -1087,7 +1094,7 @@ fn an_unregistered_backend_is_an_error_not_a_panic() {
     assert!(error.contains("sandbox"), "{error}");
 }
 
-fn resolved(name: &str) -> ResolvedCodespace {
+pub(super) fn resolved(name: &str) -> ResolvedCodespace {
     ResolvedCodespace {
         name: name.into(),
         display: "monoptah-main".into(),
@@ -1126,6 +1133,31 @@ fn begin_pending_start(svc: &CloudSessions, cloud: &CloudRef) -> i64 {
     }
     startup::save_start_record(&store, &record).unwrap();
     session.id
+}
+
+#[test]
+fn a_codespace_has_a_web_url_and_a_sandbox_has_none() {
+    let gh = FakeGh::new(vec![(
+        "api user/codespaces/octo-abc",
+        ok("https://octo-abc.github.dev\n"),
+    )]);
+    let host = FakeHost::with_machine("octo-abc");
+    let sandbox = Arc::new(FakeSandboxBackend::default());
+    let svc = service(&gh, &host).with_backend(sandbox.clone());
+
+    let url = svc.workspace_web_url(&CloudRef::codespace("octo-abc"));
+    let none = svc
+        .workspace_web_url(&CloudRef::sandbox("sbx-1"))
+        .unwrap_err();
+
+    assert_eq!(url.as_deref(), Ok("https://octo-abc.github.dev"));
+    assert!(none.contains("sandbox"), "{none}");
+    // Only the read of the URL: nothing woke the workspace.
+    assert_eq!(
+        gh.calls(),
+        vec!["api user/codespaces/octo-abc --jq .web_url"]
+    );
+    assert_eq!(host.log(), Vec::<String>::new());
 }
 
 #[test]
@@ -1222,4 +1254,184 @@ fn split_created_note_reads_what_created_note_for_writes() {
         split_created_note("x (sandbox  was created and kept; y)"),
         None
     );
+}
+
+#[test]
+fn a_cloud_located_local_session_is_one_cloud_row_and_its_host_record_is_not_listed() {
+    let gh = FakeGh::new(vec![
+        ("auth status", ok(AUTH_OK)),
+        ("codespace list", ok(LIST)),
+    ]);
+    let host = FakeHost::with_machine("octo-abc");
+    let svc = service(&gh, &host);
+    let binding = svc
+        .prepare_target("/Users/me/widgets", named("octo-abc"), &mut |_| {})
+        .unwrap();
+    // Two Host sessions of the project: one born in the cloud, one that backs a local session.
+    let born = svc.create_session(&binding, "claude").unwrap();
+    let backing = svc.create_session(&binding, "claude").unwrap();
+    let local = {
+        let mut store = svc.store().unwrap();
+        let local = store.create("claude", "/Users/me/widgets").unwrap();
+        let rows: Vec<crate::transcript::Row> = (0..10)
+            .map(|i| crate::transcript::Row {
+                role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+                text: format!("row {i}"),
+                first: i % 2 == 0,
+                sent_at: None,
+            })
+            .collect();
+        store.write_rows(local.id, 0, &rows).unwrap();
+        local
+    };
+    let ids = |svc: &CloudSessions| -> Vec<i64> {
+        let mut ids: Vec<i64> = svc
+            .cloud_sessions_for("/Users/me/widgets")
+            .unwrap()
+            .iter()
+            .map(|s| s.summary.id)
+            .collect();
+        ids.sort();
+        ids
+    };
+    let mut both = vec![born.id, backing.id];
+    both.sort();
+    // Location Local: the local session is not a cloud session; both Host records are.
+    assert_eq!(ids(&svc), both);
+    // The location flips to Cloud and the Host record is linked: the sidebar mark follows.
+    {
+        let store = svc.store().unwrap();
+        store
+            .set_cloud_location(
+                local.id,
+                &crate::store::SessionLocation::Cloud(crate::store::CloudLocation {
+                    cloud: crate::cloud_sessions::CloudRef::codespace("octo-abc"),
+                    environment_id: binding.project_key.clone(),
+                    project_id: String::new(),
+                    host_session_id: "host-1".into(),
+                    remote_cwd: "/workspaces/widgets".into(),
+                    local_cwd: "/Users/me/widgets".into(),
+                    moved_at_row: 10,
+                    pushed_branch: None,
+                }),
+            )
+            .unwrap();
+        store
+            .link_remote_session(backing.id, Some(local.id))
+            .unwrap();
+    }
+    let mut expected = vec![born.id, local.id];
+    expected.sort();
+    assert_eq!(
+        ids(&svc),
+        expected,
+        "the linked record is hidden, the unlinked one is not"
+    );
+    let row = svc
+        .cloud_sessions_for("/Users/me/widgets")
+        .unwrap()
+        .into_iter()
+        .find(|s| s.summary.id == local.id)
+        .unwrap();
+    assert_eq!(row.codespace, "octo-abc");
+    assert_eq!(row.summary.cwd, "/Users/me/widgets");
+    let located = svc.located_sessions_for("/Users/me/widgets").unwrap();
+    assert_eq!(
+        located,
+        vec![LocatedSession {
+            id: local.id,
+            moved_at_row: 10,
+            // The fake Host record has no Host session id: the link cannot be resolved.
+            sync_error: Some(crate::store::MISSING_HOST.into()),
+            unreadable: false,
+            host_active: false,
+            unsynced: true,
+        }]
+    );
+    // Back to Local: both Host records are cloud sessions of their own again.
+    svc.store()
+        .unwrap()
+        .reset_cloud_location_to_local(local.id)
+        .unwrap();
+    assert_eq!(ids(&svc), both);
+    assert!(svc
+        .located_sessions_for("/Users/me/widgets")
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn deleting_the_workspace_keeps_a_located_session_and_does_not_convert_its_host_record() {
+    let gh = FakeGh::new(vec![
+        ("auth status", ok(AUTH_OK)),
+        ("codespace list", ok(LIST)),
+        ("codespace delete", ok("")),
+    ]);
+    let host = FakeHost::with_machine("octo-abc");
+    let svc = service(&gh, &host);
+    let binding = svc
+        .prepare_target("/Users/me/widgets", named("octo-abc"), &mut |_| {})
+        .unwrap();
+    let born = svc.create_session(&binding, "claude").unwrap();
+    let backing = svc.create_session(&binding, "claude").unwrap();
+    let local = {
+        let mut store = svc.store().unwrap();
+        let local = store.create("claude", "/Users/me/widgets").unwrap();
+        let rows: Vec<crate::transcript::Row> = (0..10)
+            .map(|i| crate::transcript::Row {
+                role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+                text: format!("row {i}"),
+                first: true,
+                sent_at: None,
+            })
+            .collect();
+        store.write_rows(local.id, 0, &rows).unwrap();
+        store
+            .set_cloud_location(
+                local.id,
+                &crate::store::SessionLocation::Cloud(crate::store::CloudLocation {
+                    cloud: crate::cloud_sessions::CloudRef::codespace("octo-abc"),
+                    environment_id: binding.project_key.clone(),
+                    project_id: String::new(),
+                    host_session_id: "host-1".into(),
+                    remote_cwd: "/workspaces/widgets".into(),
+                    local_cwd: "/Users/me/widgets".into(),
+                    moved_at_row: 10,
+                    pushed_branch: None,
+                }),
+            )
+            .unwrap();
+        store
+            .link_remote_session(backing.id, Some(local.id))
+            .unwrap();
+        local
+    };
+    let cloud = crate::cloud_sessions::CloudRef::codespace("octo-abc");
+    // The linked Host record is not offered for conversion or archiving.
+    let offered = svc.sessions_in_cloud(&cloud);
+    assert!(offered.contains(&born.id));
+    assert!(!offered.contains(&backing.id), "{offered:?}");
+    // The workspace is deleted: the Host records go, the local session stays with a marker.
+    svc.delete_cloud_outcome(&cloud).unwrap();
+    let store = svc.store().unwrap();
+    assert!(store.remote_session(backing.id).unwrap().is_none());
+    assert!(store.sessions().unwrap().iter().any(|s| s.id == local.id));
+    assert_eq!(store.load(local.id).unwrap().rows.len(), 10);
+    assert_eq!(
+        store.cloud_sync_error(local.id).unwrap().as_deref(),
+        Some(crate::store::WORKSPACE_LOST)
+    );
+    drop(store);
+    let located = svc.located_sessions_for("/Users/me/widgets").unwrap();
+    assert_eq!(located.len(), 1);
+    assert_eq!(
+        located[0].sync_error.as_deref(),
+        Some(crate::store::WORKSPACE_LOST)
+    );
+    // Reset to local is the way out, and it does not need a Host record.
+    svc.store().unwrap().leave_cloud(local.id).unwrap();
+    assert!(svc
+        .located_sessions_for("/Users/me/widgets")
+        .unwrap()
+        .is_empty());
 }

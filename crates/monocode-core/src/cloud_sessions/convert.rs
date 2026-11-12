@@ -254,7 +254,7 @@ pub(super) fn parse_snapshot(out: &str) -> Result<Snapshot, String> {
     Ok(snap)
 }
 
-fn valid_hex(text: &str) -> bool {
+pub(super) fn valid_hex(text: &str) -> bool {
     (40..=64).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
@@ -283,17 +283,25 @@ pub(super) fn default_claude_dir() -> PathBuf {
 }
 
 /// Replaces every path in `from` (matched on boundaries) by `to` in a JSONL text. `to` is
-/// escaped for use inside a JSON string. Longer paths are tried first. A match must not be
+/// and every `from` are escaped for use inside a JSON string. Longer paths are tried first. A match must not be
 /// the tail of a longer path (`/tmp/workspaces/app`) or the head of a longer name
 /// (`/workspaces/app-two`, `/workspaces/app.git`).
 pub(super) fn rewrite_cwd(text: &str, from: &[&str], to: &str) -> String {
     let escaped = serde_json::to_string(to).unwrap_or_default();
     let to = &escaped[1..escaped.len().saturating_sub(1).max(1)];
-    let mut froms: Vec<&str> = from.iter().copied().filter(|f| !f.is_empty()).collect();
+    // The text is JSONL, so a path with a quote or backslash is stored escaped.
+    let mut froms: Vec<String> = from
+        .iter()
+        .filter(|f| !f.is_empty())
+        .map(|f| {
+            let escaped = serde_json::to_string(f).unwrap_or_default();
+            escaped[1..escaped.len().saturating_sub(1).max(1)].to_string()
+        })
+        .collect();
     froms.sort_by_key(|f| std::cmp::Reverse(f.len()));
     froms.dedup();
     let mut text = text.to_string();
-    for from in froms {
+    for from in froms.iter().map(String::as_str) {
         let mut out = String::with_capacity(text.len());
         let mut rest = text.as_str();
         let mut before: Option<char> = None;
@@ -334,10 +342,42 @@ pub(super) fn rewrite_cwd(text: &str, from: &[&str], to: &str) -> String {
 pub enum Resume {
     /// Written to the local Claude folder: `claude --resume <id>` works from the project.
     Installed(PathBuf),
-    /// A file with that id already existed locally and was left alone.
+    /// A file with that id already existed locally with the same entries and was left alone.
     AlreadyThere(PathBuf),
+    /// The incoming transcript extends the local file with that id: it replaced it, and the
+    /// old file is kept next to it as `<id>.jsonl.pre-cloud`.
+    Replaced(PathBuf),
+    /// The local file with that id diverged from the incoming one and was left untouched.
+    /// The incoming transcript is installed under this new session id.
+    Forked(String),
     /// Not available; the local copy starts a fresh Claude conversation.
     Missing(String),
+}
+
+/// Internal marker: the sandbox of a moved session was recreated (see `continue_locally`).
+pub(super) const SANDBOX_RECREATED: &str = "sandbox recreated";
+
+/// What a conversion is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Mode {
+    /// Save an archived local copy of a cloud session (Keep, Stop and Delete).
+    Archive,
+    /// "Continue locally": the session carries on as ONE local session. Nothing is archived.
+    /// `moved` is the local session that already lives in the cloud (it keeps its rows and
+    /// its id); `None` is a session born in the cloud, which gets a new local session.
+    Continue { moved: Option<i64> },
+}
+
+impl Mode {
+    pub(super) fn continuing(self) -> bool {
+        matches!(self, Self::Continue { .. })
+    }
+    pub(super) fn moved(self) -> Option<i64> {
+        match self {
+            Self::Continue { moved } => moved,
+            Self::Archive => None,
+        }
+    }
 }
 
 /// What a conversion produced.
@@ -364,6 +404,9 @@ pub struct Converted {
     pub evidence_partial: bool,
     /// Problems that did not stop the conversion.
     pub warnings: Vec<String>,
+    /// The cloud session had a Claude conversation but its raw transcript was not copied
+    /// here (not found, or not saved), so the cloud copy may be the only one left.
+    pub transcript_lost: bool,
     /// Whether the conversation itself was saved. `false` for a files-only archive that
     /// could not read the history: only the code state is in the local copy.
     pub history_saved: bool,
@@ -549,7 +592,7 @@ pub(super) fn ignored_warning(ignored: &[(u64, String)], truncated: bool) -> Opt
     ))
 }
 
-fn nanos() -> u128 {
+pub(super) fn nanos() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos())
@@ -609,7 +652,22 @@ impl CloudSessions {
     pub fn sessions_in_cloud(&self, cloud: &CloudRef) -> Vec<i64> {
         self.store()
             .ok()
-            .and_then(|store| store.cloud_session_ids(cloud).ok())
+            .and_then(|store| {
+                // A Host record that backs a Cloud-located local session is not a session of
+                // its own: converting it would save a second copy of the same conversation.
+                let ids = store.cloud_session_ids(cloud).ok()?;
+                Some(
+                    ids.into_iter()
+                        .filter(|id| {
+                            !store
+                                .remote_session(*id)
+                                .ok()
+                                .flatten()
+                                .is_some_and(|r| store.host_record_is_hidden(&r))
+                        })
+                        .collect(),
+                )
+            })
             .unwrap_or_default()
     }
 
@@ -636,6 +694,16 @@ impl CloudSessions {
         &self,
         cloud_id: i64,
         files_only_confirmed: bool,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<Converted, ConvertError> {
+        self.convert_with(cloud_id, files_only_confirmed, Mode::Archive, progress)
+    }
+
+    pub(super) fn convert_with(
+        &self,
+        cloud_id: i64,
+        files_only_confirmed: bool,
+        mode: Mode,
         progress: &mut dyn FnMut(&str),
     ) -> Result<Converted, ConvertError> {
         let remote = self
@@ -683,6 +751,26 @@ impl CloudSessions {
                         if machine.is_none() {
                             return Err(no_machine().into());
                         }
+                    }
+                    // Continuing needs the conversation itself: a files-only copy would
+                    // forget the cloud record and lose the turns that are only there.
+                    Err(error @ docker_start::ReconnectError::HostUnreachable(_))
+                        if mode.continuing() =>
+                    {
+                        return Err(ConvertError::Failed(format!(
+                            "The sandbox cannot be reached ({error}). Start it again and retry."
+                        )));
+                    }
+                    // The conversation that ran in the old container is gone: for a moved
+                    // session that is the lost-workspace case (new Claude id, summary).
+                    Err(docker_start::ReconnectError::Recreated) if mode.moved().is_some() => {
+                        return Err(ConvertError::Failed(SANDBOX_RECREATED.into()));
+                    }
+                    Err(docker_start::ReconnectError::Recreated) if mode.continuing() => {
+                        return Err(ConvertError::Failed(
+                            "The sandbox was recreated, so the conversation that ran there is gone. Archive its files only from the archive dialog."
+                                .into(),
+                        ));
                     }
                     Err(docker_start::ReconnectError::HostUnreachable(reason))
                         if !files_only_confirmed =>
@@ -732,7 +820,17 @@ impl CloudSessions {
                 snapshot = machine.as_ref().and_then(|m| read(m).ok());
             } else {
                 progress("Reading the conversation");
-                snapshot = Some(read(machine.as_ref().ok_or_else(no_machine)?)?);
+                let value = read(machine.as_ref().ok_or_else(no_machine)?)?;
+                // Whatever the flags said, a turn the Host is running now is a second writer.
+                if mode.continuing() && value["status"] == "running" {
+                    return Err(ConvertError::Failed(crate::store::HOST_TURN_RUNNING.into()));
+                }
+                // Turns the cloud wrote since the last sync are copied first, so the local
+                // rows hold everything before the transcript and the code are touched.
+                if let Some(local) = mode.moved() {
+                    self.store()?.append_remote_rows(local, &value)?;
+                }
+                snapshot = Some(value);
             }
         }
         if let Some(target) = &files_only {
@@ -749,7 +847,8 @@ impl CloudSessions {
             });
         }
         // The session may run in its own host worktree: that is the tree to save.
-        let host_cwd = snapshot
+        let workspace_root = self.workspace_root_of(&cloud);
+        let session_cwd = snapshot
             .as_ref()
             .and_then(|v| v["session"]["cwd"].as_str())
             .map(str::to_string)
@@ -757,17 +856,9 @@ impl CloudSessions {
                 // Without a Host the session's own folder is what the store last saw.
                 files_only.as_ref()?;
                 let settings = self.store().ok()?.agent_settings(cloud_id).ok().flatten()?;
-                // A removed worktree is not a place to look any more.
-                (!settings.worktree_removed)
-                    .then_some(settings.worktree_cwd)
-                    .flatten()
-            });
-        let workspace_root = self.workspace_root_of(&cloud);
-        let session_cwd = host_cwd
-            .map(|c| c.trim_end_matches('/').to_string())
-            .filter(|c| {
-                c.starts_with(&format!("{}/", workspace_root)) && valid_remote_path(c).is_ok()
-            });
+                stored_worktree_cwd(&settings)
+            })
+            .and_then(|cwd| confine_host_cwd(&cwd, &workspace_root));
         let workspace = session_cwd.clone().unwrap_or_else(|| project_cwd.clone());
         // Where the snapshot script looks: the same tree, at its path in the outer sandbox
         // for a files-only archive.
@@ -834,6 +925,7 @@ impl CloudSessions {
                 local_project: &local_project,
                 workspace: &workspace,
                 scan_dir: &scan_dir,
+                mode,
                 files_only: files_only.is_some(),
                 history_saved: files_only.is_none()
                     || snapshot.is_some()
@@ -880,6 +972,7 @@ impl CloudSessions {
             local_project,
             workspace,
             scan_dir,
+            mode,
             files_only,
             history_saved,
             cwds,
@@ -989,7 +1082,22 @@ impl CloudSessions {
 
         // Everything fetched: from here on a failure rolls the local session back.
         progress("Creating the local copy");
-        let local_id = {
+        // A session that already lives here is not created again, and not deleted on failure.
+        let created = mode.moved().is_none();
+        let previous_provider = match mode.moved() {
+            Some(id) => {
+                self.store()?
+                    .sessions()?
+                    .into_iter()
+                    .find(|s| s.id == id)
+                    .ok_or("The conversation no longer exists")?
+                    .provider_id
+            }
+            None => None,
+        };
+        let local_id = if let Some(id) = mode.moved() {
+            id
+        } else {
             let mut store = self.store()?;
             let session = store.create(&remote.summary.provider, local_project)?;
             let local_id = session.id;
@@ -1034,16 +1142,49 @@ impl CloudSessions {
             }
             local_id
         };
+        // Undoes what a failed attempt did to a session that stays (and stays in the cloud).
+        let undo_install = |this: &Self| {
+            if created {
+                return;
+            }
+            let Ok(store) = this.store() else { return };
+            match &previous_provider {
+                Some(id) => {
+                    let _ = store.provider_id(local_id, id);
+                }
+                None => {
+                    let current = store
+                        .sessions()
+                        .ok()
+                        .and_then(|all| all.into_iter().find(|s| s.id == local_id))
+                        .and_then(|s| s.provider_id);
+                    let _ = store.reset_provider_id_if(local_id, current.as_deref());
+                }
+            }
+        };
+        let local_is_claude = mode.moved().is_none() || {
+            self.store()?
+                .sessions()?
+                .into_iter()
+                .find(|s| s.id == local_id)
+                .is_some_and(|s| s.provider == HARNESS)
+        };
         let tombstone = remote
             .session_id
             .as_deref()
             .map(|host| (remote.project.environment_id.clone(), host.to_string()));
+        let mut forked_file: Option<PathBuf> = None;
         let mut finish = || -> Result<Converted, String> {
             let local_thread = self
                 .store()?
                 .thread_dir(local_id)?
                 .ok_or("This store keeps no session folders.")?;
             let dir = local_thread.join(CODESPACE_DIR);
+            if mode.continuing() {
+                // Every return works in a fresh folder: the files of an earlier return
+                // (patches, restored.json) must never be applied or consulted again.
+                let _ = std::fs::remove_dir_all(&dir);
+            }
             std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
             // Claude's raw transcript is always kept, whatever happens to the install below.
             if snap.jsonl {
@@ -1051,9 +1192,15 @@ impl CloudSessions {
                     .map_err(|e| format!("Cannot keep Claude's transcript: {e}"))?;
             }
             let from: Vec<&str> = cwds.iter().map(String::as_str).collect();
-            let resume = match (provider_id, snap.jsonl) {
+            let mut install = |cwd: &str, warnings: &mut Vec<String>| -> Result<Resume, String> {
+                let claude_session = mode.moved().is_none() || local_is_claude;
+                let resume = match (provider_id, snap.jsonl) {
+                (Some(_), true) if !claude_session => Resume::Missing(
+                    "this conversation does not run on Claude, so the cloud transcript is not used"
+                        .into(),
+                ),
                 (Some(id), true) => {
-                    match self.install_jsonl(&staged.join("claude.jsonl"), &from, local_project, id)
+                    match self.install_jsonl(&staged.join("claude.jsonl"), &from, cwd, id)
                     {
                         Ok(resume) => resume,
                         Err(e) => Resume::Missing(e),
@@ -1067,10 +1214,22 @@ impl CloudSessions {
                 }
                 (None, _) => Resume::Missing("The session never ran Claude".into()),
             };
-            match &resume {
-                Resume::Installed(_) | Resume::AlreadyThere(_) => {
+                if let Resume::Forked(new_id) = &resume {
+                    forked_file = self
+                        .transcript_dir(cwd)
+                        .ok()
+                        .map(|(dir, _)| dir.join(format!("{new_id}.jsonl")));
+                }
+                match &resume {
+                Resume::Installed(_) | Resume::AlreadyThere(_) | Resume::Replaced(_) => {
                     if let Some(id) = provider_id {
                         self.store()?.provider_id(local_id, id)?;
+                    }
+                }
+                Resume::Forked(new_id) => {
+                    self.store()?.provider_id(local_id, new_id)?;
+                    if let Some(id) = provider_id {
+                        warnings.push(super::transcript_sync::fork_notice(id, new_id));
                     }
                 }
                 Resume::Missing(why) if files_only => warnings.push(format!(
@@ -1080,6 +1239,21 @@ impl CloudSessions {
                     "Claude cannot resume this conversation locally ({why}); the next message starts a fresh one. The raw transcript is kept in the session folder."
                 )),
             }
+                if mode.moved().is_some() && matches!(resume, Resume::Missing(_)) {
+                    // Never resume the stale local file: it lacks the turns that ran in the cloud.
+                    self.start_fresh_with_summary(local_id)?;
+                    warnings.push(
+                    "The cloud transcript could not be brought back, so the next message starts a new Claude conversation with a summary of this one."
+                        .into(),
+                );
+                }
+                Ok(resume)
+            };
+            let early = if mode.continuing() {
+                None
+            } else {
+                Some(install(local_project, warnings)?)
+            };
             let head = snap
                 .head
                 .as_deref()
@@ -1132,7 +1306,40 @@ impl CloudSessions {
                 copy_tree(evidence_dir, &local_thread.join(super::EVIDENCE_DIR))
                     .map_err(|e| format!("Cannot keep the evidence: {e}"))?;
             }
-            self.store()?.set_archived(local_id, true)?;
+            let resume = if mode.continuing() {
+                // The code lands (in place or in a new worktree) before the transcript, because
+                // Claude finds a session by the folder it runs in; and both land before the
+                // cloud record is retired: a failure leaves the session in the cloud.
+                let (notes, cwd, in_place) = self.place_code(
+                    mode,
+                    local_id,
+                    local_project,
+                    &local_thread,
+                    tombstone.as_ref().map_or("", |(_, host)| host.as_str()),
+                )?;
+                warnings.extend(notes);
+                let resume = install(&cwd, warnings)?;
+                // Turns that ran in another folder or under another Claude id cannot be
+                // rewound from here (their checkpoints describe other directories).
+                if let Some(local) = mode.moved() {
+                    let started_over = matches!(resume, Resume::Forked(_) | Resume::Missing(_));
+                    let store = self.store()?;
+                    let count = store.load(local)?.rows.len();
+                    let moved_at = store
+                        .cloud_location(local)?
+                        .cloud()
+                        .map_or(count, |l| l.moved_at_row);
+                    // Even in place, the turns the cloud wrote ran elsewhere: their file
+                    // history belongs to the other machine.
+                    if !in_place || started_over || count > moved_at {
+                        store.set_returned_gate(local, Some(count))?;
+                    }
+                }
+                resume
+            } else {
+                self.store()?.set_archived(local_id, true)?;
+                early.ok_or("internal: no transcript result")?
+            };
             let summary = self
                 .store()?
                 .sessions()?
@@ -1142,6 +1349,31 @@ impl CloudSessions {
             // Last, so a failure above leaves the cloud record in place. The tombstone keeps
             // the host session from being imported again by a poll or a refresh.
             let store = self.store()?;
+            if let Some(local) = mode.moved() {
+                // One-way, like Reset to local: the Host copy is tombstoned and the location
+                // goes back to Local in the same call.
+                store.leave_cloud_inner(local, false)?;
+                // Past the point of no return: bookkeeping failures cannot undo the return.
+                let _ = store.clear_cloud_move_point(local);
+                let _ = store.set_cloud_continue_progress(local, "");
+                return Ok(Converted {
+                    cloud_id: remote.summary.id,
+                    local_id,
+                    summary,
+                    codespace: codespace.into(),
+                    title: title.into(),
+                    rows: rows.len(),
+                    resume,
+                    evidence: vec![],
+                    code_dir: Some(dir),
+                    ignored: snap.ignored.clone(),
+                    ignored_truncated: snap.ignored_truncated,
+                    evidence_partial: false,
+                    warnings: vec![],
+                    transcript_lost: provider_id.is_some() && !snap.jsonl,
+                    history_saved,
+                });
+            }
             if let Some((env, host)) = &tombstone {
                 store.set_cloud_converted(env, host, true)?;
             }
@@ -1165,6 +1397,7 @@ impl CloudSessions {
                 ignored_truncated: snap.ignored_truncated,
                 evidence_partial: false,
                 warnings: vec![],
+                transcript_lost: provider_id.is_some() && !snap.jsonl,
                 history_saved,
             })
         };
@@ -1175,7 +1408,16 @@ impl CloudSessions {
                     if let Some((env, host)) = &tombstone {
                         let _ = store.set_cloud_converted(env, host, false);
                     }
-                    let _ = store.delete(local_id);
+                    if created {
+                        let _ = store.delete(local_id);
+                        // Ids are reused: nothing of this attempt may be inherited.
+                        let _ = store.set_cloud_continue_progress(local_id, "");
+                    }
+                }
+                undo_install(self);
+                // A retry forks again, so the fork made by this attempt would be an orphan.
+                if let Some(file) = &forked_file {
+                    let _ = std::fs::remove_file(file);
                 }
                 return Err(error);
             }
@@ -1186,7 +1428,10 @@ impl CloudSessions {
         Ok(converted)
     }
 
-    /// Writes the rewritten JSONL into the local Claude folder, never replacing a file.
+    /// Writes the rewritten JSONL into the local Claude folder (transcript_sync, rule D10):
+    /// a fresh id is installed, an extension of the existing file replaces it (the old file
+    /// is kept as `<id>.jsonl.pre-cloud`), an equal file is left alone, and a divergent one is
+    /// never overwritten: the incoming copy is installed under a new id instead.
     fn install_jsonl(
         &self,
         source: &Path,
@@ -1194,36 +1439,100 @@ impl CloudSessions {
         local_cwd: &str,
         provider_id: &str,
     ) -> Result<Resume, String> {
+        use super::transcript_sync::{decide, fork, Decision};
+        let (dir, local) = self.transcript_dir(local_cwd)?;
+        let dest = dir.join(format!("{provider_id}.jsonl"));
+        let text = std::fs::read_to_string(source)
+            .map_err(|e| format!("cannot read Claude's transcript: {e}"))?;
+        let text = rewrite_cwd(&text, remote_cwds, &local);
+        // A writer that races in after the check is decided again, never trusted blindly.
+        for _ in 0..3 {
+            let existing = match std::fs::read(&dest) {
+                Ok(bytes) => Some(bytes),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(format!("cannot read the local transcript: {e}")),
+            };
+            let decision = decide(existing.as_deref(), text.as_bytes());
+            if decision == Decision::AlreadyCurrent {
+                return Ok(Resume::AlreadyThere(dest));
+            }
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let tmp = dir.join(format!(".{provider_id}.{}.tmp", nanos()));
+            match decision {
+                Decision::AlreadyCurrent => unreachable!("returned above"),
+                Decision::Install => {
+                    std::fs::write(&tmp, &text).map_err(|e| e.to_string())?;
+                    // A hard link fails when the name exists, so a concurrent writer is never replaced.
+                    let linked = std::fs::hard_link(&tmp, &dest);
+                    let _ = std::fs::remove_file(&tmp);
+                    match linked {
+                        Ok(()) => return Ok(Resume::Installed(dest)),
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                        Err(e) => return Err(e.to_string()),
+                    }
+                }
+                Decision::Replace => {
+                    write_synced(&tmp, &text).map_err(|e| e.to_string())?;
+                    let result = replace_keeping_backup(&dir, &tmp, &dest, provider_id);
+                    let _ = std::fs::remove_file(&tmp);
+                    return result.map(|()| Resume::Replaced(dest));
+                }
+                Decision::Diverged => {
+                    let new_id = uuid::Uuid::new_v4().to_string();
+                    let forked = dir.join(format!("{new_id}.jsonl"));
+                    std::fs::write(&tmp, fork(&text, &new_id)).map_err(|e| e.to_string())?;
+                    let linked = std::fs::hard_link(&tmp, &forked);
+                    let _ = std::fs::remove_file(&tmp);
+                    linked.map_err(|e| e.to_string())?;
+                    return Ok(Resume::Forked(new_id));
+                }
+            }
+        }
+        Err("the local transcript keeps changing".into())
+    }
+
+    /// The Claude project folder for a local cwd, and the canonical cwd text.
+    fn transcript_dir(&self, local_cwd: &str) -> Result<(PathBuf, String), String> {
         let local = std::fs::canonicalize(local_cwd).map_or_else(
             |_| local_cwd.to_string(),
-            |p| p.to_string_lossy().into_owned(),
+            |p| super::plain_path(p).to_string_lossy().into_owned(),
         );
         let name = claude_project_dir_name(&local);
         if name.len() > CLAUDE_NAME_LIMIT {
             return Err("the local project path is too long for Claude's session folder".into());
         }
-        let dir = self.claude_dir.join("projects").join(name);
-        let dest = dir.join(format!("{provider_id}.jsonl"));
-        if dest.exists() {
-            return Ok(Resume::AlreadyThere(dest));
-        }
-        let text = std::fs::read_to_string(source)
-            .map_err(|e| format!("cannot read Claude's transcript: {e}"))?;
-        let text = rewrite_cwd(&text, remote_cwds, &local);
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let tmp = dir.join(format!(".{provider_id}.{}.tmp", nanos()));
-        std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
-        // A hard link fails when the name exists, so a concurrent writer is never replaced.
-        let linked = std::fs::hard_link(&tmp, &dest);
-        let _ = std::fs::remove_file(&tmp);
-        match linked {
-            Ok(()) => Ok(Resume::Installed(dest)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                Ok(Resume::AlreadyThere(dest))
-            }
-            Err(e) => Err(e.to_string()),
-        }
+        Ok((self.claude_dir.join("projects").join(name), local))
     }
+}
+
+/// Writes a file and flushes it to disk, so a rename that follows never exposes a hollow file.
+fn write_synced(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()
+}
+
+/// Puts `tmp` in place of `dest` without a moment where `dest` is missing, keeping the
+/// previous file as `<id>.jsonl.pre-cloud` (a newer backup replaces an older one: both are
+/// prefixes of the new transcript).
+fn replace_keeping_backup(
+    dir: &Path,
+    tmp: &Path,
+    dest: &Path,
+    provider_id: &str,
+) -> Result<(), String> {
+    let backup = dir.join(format!("{provider_id}.jsonl.pre-cloud"));
+    let staged = dir.join(format!(".{provider_id}.{}.bak", nanos()));
+    if std::fs::hard_link(dest, &staged).is_err() {
+        std::fs::copy(dest, &staged).map_err(|e| format!("cannot back up the transcript: {e}"))?;
+    }
+    let renamed = std::fs::rename(&staged, &backup);
+    if let Err(e) = renamed {
+        let _ = std::fs::remove_file(&staged);
+        return Err(format!("cannot back up the transcript: {e}"));
+    }
+    std::fs::rename(tmp, dest).map_err(|e| e.to_string())
 }
 
 /// Where the snapshot script and the copy of its stage run.
@@ -1303,6 +1612,7 @@ struct Plan<'a> {
     workspace: &'a str,
     /// Where `workspace` is read: the same path, or its outer-sandbox path when `files_only`.
     scan_dir: &'a str,
+    mode: Mode,
     /// A sandbox archived without its container, see the module docs.
     files_only: bool,
     /// Whether the conversation was read (see [`Converted::history_saved`]).
@@ -1314,7 +1624,7 @@ struct Plan<'a> {
 }
 
 /// Runs git with a time limit, no prompts, and git's own message as the error.
-fn git_run(
+pub(super) fn git_run(
     cwd: &Path,
     args: &[&str],
     envs: &[(&str, &str)],
@@ -1323,7 +1633,7 @@ fn git_run(
     git_run_stdin(cwd, args, envs, limit, None)
 }
 
-fn git_run_stdin(
+pub(super) fn git_run_stdin(
     cwd: &Path,
     args: &[&str],
     envs: &[(&str, &str)],
@@ -1391,9 +1701,9 @@ fn git_run_stdin(
     }
 }
 
-const GIT_LIMIT: Duration = Duration::from_secs(120);
+pub(super) const GIT_LIMIT: Duration = Duration::from_secs(120);
 
-fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
+pub(super) fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
     git_run(cwd, args, &[], GIT_LIMIT)
 }
 
@@ -1543,9 +1853,9 @@ fn pin_commits(project: &Path, id8: &str, pins: &[(String, &str)]) {
 }
 
 /// Removes the `refs/codespace/<id8>/origin/*` copy of origin's branches when dropped.
-struct OriginRefs<'a> {
-    project: &'a Path,
-    id8: &'a str,
+pub(super) struct OriginRefs<'a> {
+    pub(super) project: &'a Path,
+    pub(super) id8: &'a str,
 }
 impl Drop for OriginRefs<'_> {
     fn drop(&mut self) {
@@ -1670,13 +1980,13 @@ fn branch_taken(project: &Path, name: &str) -> bool {
     .is_ok()
 }
 
-fn has_commit(project: &Path, sha: &str) -> bool {
+pub(super) fn has_commit(project: &Path, sha: &str) -> bool {
     run_git(project, &["cat-file", "-e", &format!("{sha}^{{commit}}")]).is_ok()
 }
 
 /// Fetches origin's branches into a namespace this feature owns, so no existing branch or
 /// remote-tracking ref moves. Best effort, bounded.
-fn fetch_origin(project: &Path, id8: &str) {
+pub(super) fn fetch_origin(project: &Path, id8: &str) {
     let spec = format!("+refs/heads/*:refs/codespace/{id8}/origin/*");
     // Fetching by URL, not by remote name: a named remote also refreshes its tracking refs.
     let Ok(url) = run_git(project, &["remote", "get-url", "origin"]) else {
@@ -1920,8 +2230,13 @@ fn finish_restore(
             worktree.display()
         )
     })?;
-    // Every saved branch and the stash get their own ref first, so dropping the pins loses
-    // nothing; then the worktree's branch holds the restored commits.
+    save_refs(project, manifest, id8);
+    Ok(restored.clone())
+}
+
+/// Every saved branch and the stash get their own ref first, so dropping the pins loses
+/// nothing; then the pins are released.
+pub(super) fn save_refs(project: &Path, manifest: &CodeManifest, id8: &str) {
     let batch: String = manifest
         .refs
         .iter()
@@ -1948,7 +2263,6 @@ fn finish_restore(
         );
     }
     drop_refs(project, &format!("refs/codespace/{id8}/keep/"));
-    Ok(restored.clone())
 }
 
 /// The pending code restore of local session `id`, if it came from a codespace.

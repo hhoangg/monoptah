@@ -1038,6 +1038,71 @@ fn push_for(root: &Path) -> Result<(), String> {
     git_checked(root, &["push", "-u", &remote, "HEAD"])
 }
 
+/// Pushes the commit `head` to `refs/heads/<branch>` on `remote` for "Continue in cloud"
+/// (design 4.2.2 step 2). Never a force push: the refspec has no `+` and no force flag is
+/// ever passed, so git refuses a non-fast-forward update. The caller must have chosen a branch
+/// that is not origin's default.
+pub(crate) fn push_commit_args(
+    root: &Path,
+    remote: &str,
+    head: &str,
+    branch: &str,
+) -> Result<Vec<String>, String> {
+    let hex = |s: &str| matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit());
+    if !hex(head) {
+        return Err("Invalid commit to push".into());
+    }
+    if branch.is_empty()
+        || branch.starts_with(['-', '+', '/'])
+        || branch.contains([':', ' ', '\0', '\n'])
+        || git_checked(root, &["check-ref-format", &format!("refs/heads/{branch}")]).is_err()
+    {
+        return Err("Invalid branch name to push".into());
+    }
+    if remote.is_empty() || remote.starts_with('-') {
+        return Err("Invalid remote to push to".into());
+    }
+    // The commit that was snapshotted, never `HEAD`: a commit made while the move runs must
+    // not travel under the branch name.
+    Ok(vec![
+        "push".into(),
+        remote.into(),
+        format!("{head}:refs/heads/{branch}"),
+    ])
+}
+
+/// After a push that created `branch`: makes it the upstream of the local branch of the same
+/// name, only while that branch is still at `head` (a `<branch>-cloud` push never changes the
+/// upstream of the local branch). Best effort: a failure changes nothing that matters.
+pub(crate) fn set_upstream_after_push(root: &Path, remote: &str, head: &str, branch: &str) {
+    let on_branch = git_stdout(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]).as_deref()
+        == Some(branch)
+        && git_stdout(root, &["rev-parse", "--verify", "HEAD"]).as_deref() == Some(head);
+    if on_branch {
+        let _ = git_checked(
+            root,
+            &[
+                "branch",
+                &format!("--set-upstream-to={remote}/{branch}"),
+                branch,
+            ],
+        );
+    }
+}
+
+/// [`push_commit_args`] run without a time limit.
+#[cfg(test)]
+pub(crate) fn push_commit_to_branch(
+    root: &Path,
+    remote: &str,
+    head: &str,
+    branch: &str,
+) -> Result<(), String> {
+    let args = push_commit_args(root, remote, head, branch)?;
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    git_checked(root, &args)
+}
+
 fn pr_status_for(root: &Path) -> Option<Pr> {
     let branch = git_branch(root)?;
     let repo = github_repo_for(root).ok()?;

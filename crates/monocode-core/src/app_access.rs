@@ -16,6 +16,7 @@ pub fn validate_operator(action: &str, input: &Value) -> Result<(), String> {
     if !matches!(
         action,
         "models.list"
+            | "accounts.list"
             | "sessions.list"
             | "sessions.read"
             | "sessions.start"
@@ -38,6 +39,9 @@ pub fn validate_operator(action: &str, input: &Value) -> Result<(), String> {
             | "cloud.stop"
             | "cloud.resume"
     ) {
+        if crate::mono::move_api::is_move_action(action) {
+            return Err(crate::mono::move_api::MONO_ONLY.into());
+        }
         if action == "cloud.delete" {
             return Err("Deleting a cloud instance is only available to a Mono".into());
         }
@@ -52,6 +56,9 @@ pub fn validate_operator(action: &str, input: &Value) -> Result<(), String> {
     }
     if input["providerFiles"] == true {
         return Err("Removing provider session files is only available to a Mono".into());
+    }
+    if input.get("account").is_some() {
+        return Err("account is available to Monos only".into());
     }
     Ok(())
 }

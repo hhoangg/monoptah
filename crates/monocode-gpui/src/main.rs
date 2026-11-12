@@ -15,6 +15,8 @@ mod automations;
 mod changes;
 mod cloud_actions;
 mod cloud_dialog_ui;
+mod cloud_kit_ui;
+mod cloud_move_dialog;
 mod cloud_start_view;
 mod cloud_wake;
 mod codespace_pane;
@@ -71,6 +73,7 @@ mod notes;
 mod notifications;
 mod pane_layout;
 mod pane_motion;
+mod panel_root;
 mod particle_text;
 mod phase_tile;
 mod pickers;
@@ -85,6 +88,7 @@ mod questions;
 mod quick_composer;
 mod quick_open;
 mod reflow_motion;
+mod remote_cache;
 mod resource_pressure;
 mod response_actions;
 mod reveal;
@@ -118,7 +122,9 @@ mod window_state;
 mod workspace;
 mod worktree_switcher;
 
-use gpui::{App, KeyBinding, TitlebarOptions, WindowOptions, actions, point, prelude::*, px, size};
+#[cfg(target_os = "macos")]
+use gpui::KeyBinding;
+use gpui::{App, TitlebarOptions, WindowOptions, actions, point, prelude::*, px, size};
 use monocode_core::{store::Store, transcript::Transcript};
 use std::{
     path::PathBuf,

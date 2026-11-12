@@ -78,6 +78,22 @@ clone)
   cd "$WS"
   if git rev-parse --verify --quiet "refs/heads/$BRANCH" >/dev/null; then
     git checkout --quiet "$BRANCH"
+  elif [ -n "$BASE_REF" ] && [ "$BASE_REF" = "$BRANCH" ]; then
+    # feature == base (a session moved to the cloud): the branch was pushed to origin, so
+    # check out a local branch that tracks it instead of branching from it under a new name.
+    # The workspace may be an older clone that never saw the push: fetch the branch first.
+    echo "[monoptah] checking out $BRANCH"
+    if [ -S "$SOCK" ]; then
+      git -c credential.helper= -c "credential.helper=cache --socket=$SOCK" \
+        -c credential.useHttpPath=true fetch --quiet origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" || true
+    else
+      git fetch --quiet origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" || true
+    fi
+    if ! git rev-parse --verify --quiet "refs/remotes/origin/$BRANCH^{commit}" >/dev/null; then
+      echo "The branch $BRANCH does not exist in the repository." >&2
+      exit 1
+    fi
+    git checkout --quiet --track -b "$BRANCH" "origin/$BRANCH"
   else
     START=HEAD
     if [ -n "$BASE_REF" ]; then

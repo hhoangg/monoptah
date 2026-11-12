@@ -1,5 +1,6 @@
 pub(crate) mod attachments;
 pub(crate) mod burst;
+pub(crate) mod cloud_moved;
 pub(crate) mod cloud_start;
 pub(crate) mod dates;
 #[cfg(test)]
@@ -151,6 +152,8 @@ enum Body {
     CloudStart,
     /// The message queued while the codespace starts.
     CloudQueued,
+    /// The divider where the session continued in the cloud.
+    CloudMoved,
     Markdown(Arc<MarkdownRow>),
     /// A dithered break between text replies in one Mono turn.
     MonoDivider,
@@ -699,6 +702,10 @@ pub(crate) struct TranscriptView {
     history_requested: bool,
     /// Rows of older pages above the store's window. Store row `i` is `base + i`.
     base: usize,
+    /// The move point (`moved_at_row`) while the session lives in the cloud (design 4.5).
+    cloud_move: Option<usize>,
+    /// Turns before this row came back through a new place (the click's gate).
+    returned_gate: Option<usize>,
     /// The store cursor for the turns above the loaded rows, if any.
     history_before: Option<i64>,
     /// The store cursor for the turns just above the window, which older
@@ -737,6 +744,8 @@ pub(crate) struct TranscriptView {
     /// The codespace start of a cloud session and the message queued behind it.
     cloud_start: Option<Arc<crate::cloud_start_view::CloudStartSnapshot>>,
     cloud_queued: Option<String>,
+    /// The text of the "continued in the cloud" divider, once the session moved.
+    cloud_moved: Option<String>,
     cloud_clock: Option<gpui::Task<()>>,
     /// Pending messages just taken, including any entrance still in flight.
     taken: Vec<TakenMessage>,
@@ -939,6 +948,23 @@ impl TranscriptView {
             });
         }
         cx.notify();
+    }
+    /// The session lives in the cloud from row `moved_at_row` on (or is local again): the
+    /// edit button of a turn the move point gates is shown disabled, with the reason.
+    pub(crate) fn set_returned_gate(&mut self, before: Option<usize>, cx: &mut Context<Self>) {
+        if self.returned_gate != before {
+            self.returned_gate = before;
+            cx.notify();
+        }
+    }
+    pub(crate) fn set_cloud_move(&mut self, moved_at_row: Option<usize>, cx: &mut Context<Self>) {
+        if self.cloud_move != moved_at_row {
+            self.cloud_move = moved_at_row;
+            if self.cloud_moved.is_some() {
+                self.rebuild_rows(0, cx);
+            }
+            cx.notify();
+        }
     }
     /// The rows of the store's window, numbered as the store numbers them.
     /// Older pages above it are read-only and never part of a save.
@@ -1449,18 +1475,77 @@ impl TranscriptView {
                         .rposition(|row| row.first && row.role == "user")
                         == Some(start),
                 |d| {
-                    d.child(
-                        response_actions::button(
-                            start,
-                            "edit-last-message",
-                            "Edit last message",
-                            "pencil",
-                            false,
-                        )
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            cx.emit(ResponseRequest::EditLastTurn { turn: start - base })
-                        })),
+                    // A turn the cloud gates (before the move point, or owned by the cloud
+                    // workspace) keeps its button, disabled, and says why on hover.
+                    let blocked = monocode_core::checkpoint::gate::gate_at(
+                        self.cloud_move,
+                        monocode_core::checkpoint::gate::Operation::EditLastTurn,
+                        start - base,
                     )
+                    .reason()
+                    .or_else(|| {
+                        monocode_core::checkpoint::gate::gate_returned(
+                            self.returned_gate,
+                            start - base,
+                        )
+                        .reason()
+                    });
+                    match blocked {
+                        None => d.child(
+                            response_actions::button(
+                                start,
+                                "edit-last-message",
+                                "Edit last message",
+                                "pencil",
+                                false,
+                            )
+                            .debug_selector(|| "edit-last-message".into())
+                            .on_click(cx.listener(
+                                move |_, _, _, cx| {
+                                    cx.emit(ResponseRequest::EditLastTurn { turn: start - base })
+                                },
+                            )),
+                        ),
+                        Some(reason) => {
+                            let anchor = self
+                                .action_anchors
+                                .entry((start, "edit-blocked"))
+                                .or_default()
+                                .clone();
+                            d.child(
+                                response_actions::button(
+                                    start,
+                                    "edit-last-message-disabled",
+                                    format!("Edit last message (unavailable): {reason}"),
+                                    "pencil",
+                                    false,
+                                )
+                                .debug_selector(|| "edit-last-message-disabled".into())
+                                .opacity(0.35)
+                                .child(anchor.probe())
+                                .on_hover(cx.listener(
+                                    move |this, hovered: &bool, _, cx| {
+                                        this.action_hover(start, "edit-blocked", *hovered, cx)
+                                    },
+                                )),
+                            )
+                            .when(
+                                self.hovered_action == Some((start, "edit-blocked")),
+                                |d| {
+                                    d.child(
+                                        popover(
+                                            ("edit-blocked-tooltip", start),
+                                            Anchor::Slot(anchor.clone()),
+                                        )
+                                        .side(Side::Top)
+                                        .padding(8.)
+                                        .width(280.)
+                                        .child(div().text_size(px(12.)).child(reason)),
+                                    )
+                                },
+                            )
+                        }
+                    }
                 },
             )
             .when_some(sent_at, |d, at| {
@@ -2542,6 +2627,8 @@ impl TranscriptView {
             history_loading: false,
             history_requested: false,
             base: 0,
+            cloud_move: None,
+            returned_gate: None,
             history_before: None,
             window_before: None,
             history_pager: None,
@@ -2563,6 +2650,7 @@ impl TranscriptView {
             saved_draft: None,
             cloud_start: None,
             cloud_queued: None,
+            cloud_moved: None,
             cloud_clock: None,
             taken: Vec::new(),
             pending_entrances: HashMap::new(),
@@ -4301,6 +4389,7 @@ impl TranscriptView {
                     | Body::SavedDraft
                     | Body::CloudStart
                     | Body::CloudQueued
+                    | Body::CloudMoved
             ) {
                 return false;
             }
@@ -4761,6 +4850,7 @@ impl TranscriptView {
             Body::SavedDraft => return self.saved_draft_row(cx),
             Body::CloudStart => return self.cloud_start_row(cx),
             Body::CloudQueued => return self.cloud_queued_row(cx),
+            Body::CloudMoved => return self.cloud_moved_row(),
             Body::Pending(i) => return self.pending_row(i, cx),
             Body::Launch(id) => return self.launch_row(ix, id, cx),
             _ => {}
@@ -5008,7 +5098,8 @@ impl TranscriptView {
             | Body::Launch(_)
             | Body::SavedDraft
             | Body::CloudStart
-            | Body::CloudQueued => div().into_any_element(),
+            | Body::CloudQueued
+            | Body::CloudMoved => div().into_any_element(),
             Body::Actions { turn, complete } => {
                 // Tighten only a visible Mono reply followed by a user bubble;
                 // stacked user messages keep their existing spacing.
@@ -7941,5 +8032,89 @@ mod scroll_tests {
                 assert!(!view.show_jump && view.list.is_following_tail());
             })
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod cloud_rewind_tests {
+    use super::*;
+    use gpui::{TestAppContext, WindowBounds, WindowOptions, point};
+
+    fn row(role: &str, text: &str) -> Row {
+        Row {
+            role: role.into(),
+            text: text.into(),
+            first: true,
+            sent_at: None,
+        }
+    }
+    fn open(
+        cx: &mut TestAppContext,
+        cloud_move: Option<usize>,
+    ) -> gpui::WindowHandle<TranscriptView> {
+        let window = cx.update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(0.), px(0.)),
+                        size(px(900.), px(600.)),
+                    ))),
+                    ..Default::default()
+                },
+                |_, cx| {
+                    cx.new(|cx| {
+                        let mut view = TranscriptView::new();
+                        view.patch(
+                            0,
+                            vec![row("user", "Do the thing"), row("assistant", "Done.")],
+                            cx,
+                        );
+                        view.hovered_prompt_actions = Some(0);
+                        view.cloud_move = cloud_move;
+                        view
+                    })
+                },
+            )
+            .unwrap()
+        });
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        window
+    }
+
+    #[gpui::test]
+    fn the_edit_button_is_enabled_for_a_local_session(cx: &mut TestAppContext) {
+        let window = open(cx, None);
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        assert!(visual.debug_bounds("edit-last-message").is_some());
+        assert!(visual.debug_bounds("edit-last-message-disabled").is_none());
+    }
+
+    #[gpui::test]
+    fn the_edit_button_before_the_move_point_is_disabled_and_explains_why(cx: &mut TestAppContext) {
+        // Local row 0 ran before the move at row 10.
+        let window = open(cx, Some(10));
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        assert!(
+            visual.debug_bounds("edit-last-message-disabled").is_some(),
+            "the disabled button is shown"
+        );
+        assert!(visual.debug_bounds("edit-last-message").is_none());
+        window
+            .update(visual, |view, _, cx| {
+                view.action_hover(0, "edit-blocked", true, cx)
+            })
+            .unwrap();
+        visual.run_until_parked();
+        // The reason is the one the gate gives for this row.
+        assert_eq!(
+            monocode_core::checkpoint::gate::gate_at(
+                Some(10),
+                monocode_core::checkpoint::gate::Operation::EditLastTurn,
+                0
+            )
+            .reason(),
+            Some(monocode_core::checkpoint::gate::BEFORE_MOVE)
+        );
     }
 }

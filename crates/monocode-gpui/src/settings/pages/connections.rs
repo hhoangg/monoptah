@@ -12,7 +12,7 @@ use gpui::{
     AnyElement, Context, Div, Focusable, FontWeight, Role, SharedString, Task, Window, div,
     prelude::*, px, rgb,
 };
-use monocode_core::remote::{Connections, JobView, Machine};
+use monocode_core::remote::{Connections, JobView, Machine, host_info::HostInfo};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
@@ -36,6 +36,8 @@ pub(in crate::settings) struct ConnectionsState {
     loaded: bool,
     machines: Vec<Machine>,
     status: HashMap<String, String>,
+    /// Host flavor and version by machine id, from the last `environment.describe`.
+    hosts: HashMap<String, String>,
     needs_update: HashSet<String>,
     busy: bool,
     error: String,
@@ -74,6 +76,8 @@ impl Drop for JobLease {
 struct Health {
     label: String,
     needs_update: bool,
+    /// Host flavor and version, e.g. `Monoptah 1.1.0`.
+    host: String,
 }
 
 fn describe_health(environment: &str, host: &Value) -> Result<Health, String> {
@@ -84,12 +88,8 @@ fn describe_health(environment: &str, host: &Value) -> Result<Health, String> {
         .get("providers")
         .and_then(Value::as_array)
         .ok_or_else(|| "Host returned an invalid provider list".to_owned())?;
-    let supports = |capability| {
-        host.get("capabilities")
-            .and_then(Value::as_array)
-            .is_some_and(|values| values.iter().any(|v| v.as_str() == Some(capability)))
-    };
-    let needs_update = !supports("workspace.run") || !supports("git.worktreeCreate");
+    let info = HostInfo::from_descriptor(host);
+    let needs_update = !info.supports("workspace.run") || !info.supports("git.worktreeCreate");
     Ok(Health {
         label: if needs_update {
             "Connected · host update needed for Explorer and Changes"
@@ -100,6 +100,7 @@ fn describe_health(environment: &str, host: &Value) -> Result<Health, String> {
         }
         .into(),
         needs_update,
+        host: info.summary(),
     })
 }
 
@@ -358,6 +359,7 @@ impl SettingsView {
                             match health {
                                 Ok(health) => {
                                     this.connections.status.insert(id.clone(), health.label);
+                                    this.connections.hosts.insert(id.clone(), health.host);
                                     if health.needs_update {
                                         this.connections.needs_update.insert(id);
                                     } else {
@@ -365,6 +367,7 @@ impl SettingsView {
                                     }
                                 }
                                 Err(_) => {
+                                    this.connections.hosts.remove(&id);
                                     this.connections
                                         .status
                                         .insert(id, "Offline · reconnect to check access".into());
@@ -732,6 +735,7 @@ impl SettingsView {
                             .child(div().truncate().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child(machine.name.clone()))
                             .child(paragraph(endpoint).mt_1())
                             .child(paragraph(self.connections.status.get(&id).cloned().unwrap_or_else(|| "Checking connection…".into())).mt_1().text_color(content(0.5)))
+                            .when_some(self.connections.hosts.get(&id).cloned(), |d, host| d.child(paragraph(format!("Host: {host}")).mt_1().text_size(px(11.)).text_color(content(0.5))))
                             .when(machine.ssh.is_some() && update, |d| d.child(paragraph("Updating restarts the host and interrupts active agent turns.").mt_1().text_size(px(11.)))))
                         .when(machine.ssh.is_some(), |d| d.child(div().flex().items_center().gap_2()
                             .when(update, |d| d.child(secondary_button(SharedString::from(format!("update-host-{id}")), "Update Host", false, disabled)
@@ -1038,12 +1042,17 @@ mod tests {
             describe_health("host", &json!({"environmentId": "host", "providers": []})).unwrap(),
             Health {
                 label: "Connected · host update needed for Explorer and Changes".into(),
-                needs_update: true
+                needs_update: true,
+                host: "Upstream (version unknown)".into()
             }
         );
         assert_eq!(describe_health("host", &json!({"environmentId": "host", "providers": [], "capabilities": ["workspace.run", "git.worktreeCreate"]})).unwrap(), Health {
-            label: "Connected · install a supported provider on the host".into(), needs_update: false
+            label: "Connected · install a supported provider on the host".into(), needs_update: false,
+            host: "Upstream (version unknown)".into()
         });
+        let fork = describe_health("host", &json!({"environmentId": "host", "providers": ["codex"], "host": {"flavor": "monoptah", "version": "1.1.0"}, "capabilities": ["workspace.run", "git.worktreeCreate"]})).unwrap();
+        assert_eq!(fork.host, "Monoptah 1.1.0");
+        assert_eq!(fork.label, "Connected");
     }
 
     #[test]

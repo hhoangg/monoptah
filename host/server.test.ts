@@ -2,10 +2,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,6 +16,9 @@ import { request } from "node:http";
 import { HostEngine } from "./engine";
 import { HostStore } from "./store";
 import { createHostServer } from "./server";
+import { WorkspaceCommands } from "./workspace-commands";
+import { WorkspaceWatchHost } from "./workspace-watch";
+import { HOST_VERSION } from "./host-version";
 import { HostChildBackend } from "./child-backend";
 import { configureChildBackend } from "../src/integrations/harness/core/child";
 import type { SendTurnInput } from "../src/integrations/harness/core/types";
@@ -56,7 +61,9 @@ async function setup(providers: RemoteProvider[] = ["codex"]) {
   // Follow production's canonicalization, including Windows 8.3 paths such
   // as RUNNER~1 in the CI runner's temporary directory.
   const project = await engine.openProject(directory);
-  const server = createHostServer(engine, providers);
+  const server = createHostServer(engine, providers, undefined, {
+    kitHome: join(directory, "kit-home"),
+  });
   try {
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
@@ -102,6 +109,7 @@ async function setup(providers: RemoteProvider[] = ["codex"]) {
   });
   return {
     url,
+    server,
     directory,
     engine,
     store,
@@ -296,6 +304,22 @@ describe("remote host API", () => {
       { id: "codex:test", name: "Test" },
     ]);
     expect(modelProbe).toHaveBeenCalledTimes(2);
+  });
+  it("identifies itself as the Monoptah flavor in describe.host", async () => {
+    const s = await setup();
+    const version = HOST_VERSION;
+    expect(version).toMatch(/^\d+\.\d+\.\d+\+monoptah$/);
+    expect((await s.call("environment.describe")).value.result.host).toEqual({
+      flavor: "monoptah",
+      version: version.replace("+monoptah", ""),
+    });
+  });
+  it("advertises the conditional write and git idle guard capabilities", async () => {
+    const s = await setup();
+    const { capabilities } = (await s.call("environment.describe")).value.result;
+    expect(capabilities).toEqual(
+      expect.arrayContaining(["files.write.hash", "git.idleGuard"]),
+    );
   });
   it("advertises newer providers only to desktops that request them", async () => {
     const s = await setup(["codex", "cursor"]);
@@ -495,6 +519,24 @@ describe("remote host API", () => {
       (await s.call("files.read", { projectId: s.project.id, path: ".." }))
         .value.error,
     ).toContain("outside");
+  });
+
+  it("advertises workspace.watch and releases watchers when the server closes", async () => {
+    const s = await setup();
+    const run = async (command: string, args: Record<string, unknown>) =>
+      (await s.call("workspace.run", { command, args })).value;
+    const closeAll = vi.spyOn(WorkspaceWatchHost.prototype, "close");
+    const closeCommands = vi.spyOn(WorkspaceCommands.prototype, "close");
+    const { result } = await run("watch_changes", { cwd: s.project.cwd, dirs: [""] });
+    expect(typeof result.id).toBe("string");
+    const pending = run("wait_changes", { id: result.id });
+    s.server.closeAllConnections();
+    await new Promise<void>((resolve) => s.server.close(() => resolve()));
+    expect(closeCommands).toHaveBeenCalled();
+    expect(closeAll).toHaveBeenCalled();
+    await pending.catch(() => undefined);
+    closeAll.mockRestore();
+    closeCommands.mockRestore();
   });
 
   it("answers this app's file commands inside host projects only", async () => {
@@ -744,5 +786,91 @@ describe("remote host API", () => {
     expect(
       (await s.call("git.index", { projectId: project.id })).value.result.files,
     ).toEqual([]);
+  });
+});
+
+describe("host uploads over the API", () => {
+  it("advertises the capability and round-trips an authenticated upload", async () => {
+    const s = await setup();
+    const described = await s.call("environment.describe");
+    expect(described.value.result.capabilities).toContain("uploads");
+    const data = Buffer.from("kit bytes");
+    const sha256 = createHash("sha256").update(data).digest("hex");
+    const params = { name: "kit.tar", size: data.length, sha256 };
+    expect((await s.call("uploads.begin", params, "invalid")).status).toBe(401);
+    const { uploadId } = (await s.call("uploads.begin", params)).value.result;
+    const chunk = await s.call("uploads.chunk", { uploadId, offset: 0, data: data.toString("base64") });
+    expect(chunk.value.result).toEqual({ offset: data.length });
+    const done = await s.call("uploads.commit", { uploadId });
+    expect(done.value.result).toMatchObject({ name: "kit.tar", size: data.length, sha256 });
+    expect(readFileSync(done.value.result.path).equals(data)).toBe(true);
+    expect((await s.call("uploads.discard", { uploadId })).value.result).toEqual({ discarded: true });
+    expect((await s.call("uploads.begin", { ...params, name: "../x" })).status).not.toBe(200);
+  });
+
+  it("applies a kit over RPC, advertises it and scrubs secrets from errors", async () => {
+    const s = await setup();
+    const described = await s.call("environment.describe");
+    expect(described.value.result.capabilities).toEqual(expect.arrayContaining(["kit", "claude.kit", "claude.kit.instructions"]));
+    const block = (name: string, data: Buffer, type = "0") => {
+      const h = Buffer.alloc(512);
+      h.write(name, 0);
+      h.write("0000644\0", 100);
+      h.write(data.length.toString(8).padStart(11, "0") + "\0", 124);
+      h.write("        ", 148);
+      h.write(type, 156);
+      let sum = 0;
+      for (const b of h) sum += b;
+      h.write(sum.toString(8).padStart(6, "0") + "\0 ", 148);
+      return Buffer.concat([h, data, Buffer.alloc((512 - (data.length % 512)) % 512)]);
+    };
+    const archive = Buffer.concat([block("skills/demo/", Buffer.alloc(0), "5"), block("skills/demo/SKILL.md", Buffer.from("# demo")), Buffer.alloc(1024)]);
+    const sha256 = createHash("sha256").update(archive).digest("hex");
+    const { uploadId } = (await s.call("uploads.begin", { name: "kit.tar", size: archive.length, sha256 })).value.result;
+    await s.call("uploads.chunk", { uploadId, offset: 0, data: archive.toString("base64") });
+    await s.call("uploads.commit", { uploadId });
+    const hash = "c".repeat(64);
+    expect((await s.call("kit.apply", { uploadId, hash }, "invalid")).status).toBe(401);
+    expect((await s.call("kit.apply", { uploadId, hash: "xyz" })).status).toBe(400);
+    const applied = await s.call("kit.apply", { uploadId, hash });
+    expect(applied.value.result).toMatchObject({ hash, skills: ["demo"], skipped: [] });
+    expect(readFileSync(join(s.directory, "kit-home", ".monoptah-kit", hash, "skills", "demo", "SKILL.md"), "utf8")).toBe("# demo");
+    expect((await s.call("kit.probe", { commands: ["node"] })).value.result.present).toContain("node");
+    const secret = "rpc-secret-value-4242";
+    expect((await s.call("kit.secrets", { values: { MONOPTAH_KIT_A: secret } })).value.result.count).toBe(1);
+    // An error that happens to contain the secret must not echo it.
+    vi.spyOn(s.store, "project").mockImplementation(() => {
+      throw new Error(`lookup failed for ${secret}`);
+    });
+    const failed = await s.call("kit.health", { projectId: "p" });
+    expect(failed.status).toBe(400);
+    expect(failed.value.error).toBe("lookup failed for [redacted]");
+    expect(JSON.stringify(failed.value)).not.toContain(secret);
+  });
+
+  it("runs an unref'd sweeper and clears it when the server closes", async () => {
+    const created: unknown[] = [];
+    const cleared: unknown[] = [];
+    const realSet = globalThis.setInterval;
+    const realClear = globalThis.clearInterval;
+    const set = vi.spyOn(globalThis, "setInterval").mockImplementation(((fn: any, ms?: number) => {
+      const handle = realSet(fn, ms);
+      if (ms === 5 * 60 * 1000) created.push(handle);
+      return handle;
+    }) as any);
+    const clear = vi.spyOn(globalThis, "clearInterval").mockImplementation(((h: any) => {
+      cleared.push(h);
+      realClear(h);
+    }) as any);
+    try {
+      await setup();
+      expect(created).toHaveLength(1);
+      expect((created[0] as NodeJS.Timeout).hasRef()).toBe(false);
+      await cleanups.pop()!();
+      expect(cleared).toContain(created[0]);
+    } finally {
+      set.mockRestore();
+      clear.mockRestore();
+    }
   });
 });

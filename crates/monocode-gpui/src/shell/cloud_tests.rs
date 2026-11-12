@@ -93,6 +93,7 @@ impl Host for FakeHost {
         &self,
         codespace: &str,
         _: &str,
+        _: &AtomicBool,
         progress: &mut dyn FnMut(&str),
     ) -> Result<Machine, String> {
         progress("Pairing with the codespace");
@@ -197,6 +198,7 @@ fn fake_convert(store: Database, fail: Option<&'static str>) -> cloud::ConvertFn
             ignored_truncated: false,
             evidence_partial: false,
             warnings: vec![],
+            transcript_lost: false,
             history_saved: true,
         })
     })
@@ -373,7 +375,7 @@ fn the_new_session_flow_begins_a_start_and_lists_a_pending_claude_session() {
         cloud_picker::target_for(CodespaceChoice::New, " feature ", Some("basicLinux32gb"))
             .unwrap();
     assert_eq!(target.branch.as_deref(), Some("feature"));
-    let (summary, record) = cloud_picker::begin_cloud_start(&svc, &local, target).unwrap();
+    let (summary, record) = cloud_picker::begin_cloud_start(&svc, &local, target, true).unwrap();
     assert_eq!(summary.provider, "claude");
     // The session exists at once, on a provisional project, with its start recorded.
     assert!(
@@ -403,7 +405,7 @@ fn an_existing_codespace_is_used_without_creating_and_a_new_one_needs_a_branch()
     let svc = service(&gh, &host, memory_store());
     let target =
         cloud_picker::target_for(CodespaceChoice::Named("octo-abc".into()), "", None).unwrap();
-    cloud_picker::begin_cloud_start(&svc, &local, target).unwrap();
+    cloud_picker::begin_cloud_start(&svc, &local, target, true).unwrap();
     assert!(!gh.calls().iter().any(|c| c.contains("--method POST")));
     assert_eq!(
         cloud_picker::target_for(CodespaceChoice::New, "  ", None).unwrap_err(),
@@ -1340,8 +1342,14 @@ fn a_partial_delete_still_drops_the_sessions_and_keeps_the_warning(cx: &mut Test
         fn machines(&self) -> Result<Vec<Machine>, String> {
             self.0.machines()
         }
-        fn connect(&self, c: &str, d: &str, p: &mut dyn FnMut(&str)) -> Result<Machine, String> {
-            self.0.connect(c, d, p)
+        fn connect(
+            &self,
+            c: &str,
+            d: &str,
+            h: &AtomicBool,
+            p: &mut dyn FnMut(&str),
+        ) -> Result<Machine, String> {
+            self.0.connect(c, d, h, p)
         }
         fn ensure(&self, m: &str, c: &AtomicBool, p: &mut dyn FnMut(&str)) -> Result<(), String> {
             self.0.ensure(m, c, p)
@@ -1372,9 +1380,10 @@ fn a_partial_delete_still_drops_the_sessions_and_keeps_the_warning(cx: &mut Test
 }
 
 #[gpui::test]
-fn files_and_git_say_they_are_local_and_refuse_writes_while_a_cloud_session_is_active(
+fn files_and_git_show_the_cloud_workspace_by_default_and_the_local_switch_refuses_writes(
     cx: &mut TestAppContext,
 ) {
+    use crate::panel_root::PanelMode;
     let (window, id, _) = shell_with_cloud(cx);
     window
         .update(cx, |shell, window, cx| {
@@ -1382,15 +1391,717 @@ fn files_and_git_say_they_are_local_and_refuse_writes_while_a_cloud_session_is_a
             let panel = shell.right_panel.clone().expect("panel");
             shell.sync_cloud_panel(cx);
             assert_eq!(panel.read(cx).cloud_banner(), None);
-            assert!(crate::git_gate::writes_allowed());
+            assert!(crate::git_gate::writes_allowed(LOCAL));
             shell.workspace.active = Some(id);
+            shell.sync_cloud_panel(cx);
+            let remote = shell.session_summaries[&id].cwd.clone();
+            // Default: the cloud workspace, and its git writes go to the remote under the policy.
+            // This session has no live conversation (it runs in a terminal): its link is
+            // unknown, not down, so the panels read it as before, neither dimmed nor read-only.
+            assert_eq!(
+                panel.read(cx).cloud_banner(),
+                Some("Cloud files - codespace octo-abc")
+            );
+            assert_eq!(
+                panel.read(cx).cloud_chrome().unwrap().mode,
+                PanelMode::Cloud
+            );
+            assert!(crate::git_gate::writes_allowed(&remote));
+            assert!(!crate::git_gate::writes_allowed(LOCAL));
+            assert_eq!(crate::git_gate::codespace().as_deref(), Some("octo-abc"));
+            assert!(!panel.read(cx).cloud_chrome().unwrap().offline);
+            assert!(!shell.git.read(cx).stale());
+            assert_eq!(shell.git.read(cx).project(), remote);
+
+            // Local: the local checkout, where writes are refused.
+            shell.set_panel_mode(PanelMode::Local, cx);
             shell.sync_cloud_panel(cx);
             assert_eq!(
                 panel.read(cx).cloud_banner(),
-                Some("Local files - this session runs in codespace octo-abc")
+                Some("Local files - this session runs in the codespace octo-abc")
             );
-            assert!(!crate::git_gate::writes_allowed());
-            assert_eq!(crate::git_gate::codespace().as_deref(), Some("octo-abc"));
+            assert_eq!(panel.read(cx).cloud_chrome().unwrap().link, None);
+            assert!(!crate::git_gate::writes_allowed(LOCAL));
+            assert_eq!(shell.git.read(cx).project(), "/work/monocode");
+
+            // And back; the choice is remembered per session. A view opened on a local cwd stays
+            // refused after the switch: the answer follows the path, not the visible panel.
+            shell.set_panel_mode(PanelMode::Cloud, cx);
+            shell.sync_cloud_panel(cx);
+            assert!(crate::git_gate::writes_allowed(&remote));
+            assert!(!crate::git_gate::writes_allowed(LOCAL));
+            assert_eq!(shell.git.read(cx).project(), remote);
+            assert_eq!(shell.panel_modes.get(&id), Some(&PanelMode::Cloud));
+
+            // Leaving the cloud session lifts the gate and the banner.
+            shell.workspace.active = None;
+            shell.sync_cloud_panel(cx);
+            assert_eq!(panel.read(cx).cloud_banner(), None);
+            assert!(crate::git_gate::writes_allowed(LOCAL));
+        })
+        .unwrap();
+}
+
+/// The Claude setup block of the cloud panel (design 3.2.4): the stored health, the "changed
+/// since start" indicator and the manual Update, which refuses while the kit is off.
+#[gpui::test]
+fn the_cloud_panel_shows_the_claude_setup_and_update_reports_a_refusal(cx: &mut TestAppContext) {
+    use crate::shell::claude_setup::SetupSlot;
+    use monocode_core::cloud_sessions::claude_setup::{
+        HealthStatus, KitSeams, ServerHealth, SetupState, SetupView,
+    };
+    use monocode_core::cloud_sessions::kit_prefs::CloudKitPrefs;
+    let (window, id, gh) = shell_with_cloud(cx);
+    let health = |name: &str, status, sign_in, detail: &str, oauth| ServerHealth {
+        name: name.into(),
+        status,
+        sign_in_needed: sign_in,
+        transport: "http".into(),
+        reason: if detail.contains("refused") {
+            "could not connect".into()
+        } else {
+            String::new()
+        },
+        needs_approval: detail.contains("approval"),
+        oauth_style: oauth,
+    };
+    let view = SetupView {
+        cloud: CloudRef::codespace("octo-abc"),
+        state: serde_json::from_value::<SetupState>(json!({
+            "atMs": 1, "applied": true, "summary": "1 skill, 3 MCP servers",
+            "health": [], "warnings": ["Server \"x\" was not sent."]
+        }))
+        .map(|mut state| {
+            state.health = vec![
+                health("github", HealthStatus::Connected, false, "Connected", false),
+                health(
+                    "linear",
+                    HealthStatus::SignInNeeded,
+                    true,
+                    "Needs authentication",
+                    true,
+                ),
+                health(
+                    "site",
+                    HealthStatus::Failed,
+                    false,
+                    "connection refused",
+                    false,
+                ),
+            ];
+            state
+        })
+        .unwrap(),
+        changed: true,
+        can_update: true,
+    };
+    window
+        .update(cx, |shell, window, cx| {
+            // The kit is off in Settings: Update must refuse, not send.
+            shell.cloud = Arc::new(
+                CloudSessions::new(gh, Arc::new(FakeHost::default()), shell.store.clone())
+                    .with_kit_seams(KitSeams {
+                        prefs: Arc::new(CloudKitPrefs::default),
+                        roots: Arc::new(|_, _| Err("not used".into())),
+                    }),
+            );
+            shell.ensure_right_panel(window, cx);
+            shell.workspace.active = Some(id);
+            // Without a stored result the block is absent.
+            shell.sync_cloud_panel(cx);
+            let panel = shell.right_panel.clone().expect("panel");
+            assert_eq!(panel.read(cx).cloud_chrome().unwrap().setup, None);
+        })
+        .unwrap();
+    // The read of the (absent) stored result lands before the stored one is put in place.
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            let panel = shell.right_panel.clone().expect("panel");
+            shell.claude_setups.borrow_mut().insert(
+                "octo-abc".into(),
+                SetupSlot {
+                    view: Some(view),
+                    requested: true,
+                    ..Default::default()
+                },
+            );
+            shell.sync_cloud_panel(cx);
+            let setup = panel
+                .read(cx)
+                .cloud_chrome()
+                .unwrap()
+                .setup
+                .clone()
+                .unwrap();
+            assert_eq!(setup.summary, "1 skill, 3 MCP servers");
+            // The panel's link is down in this fixture: Update is not on offer (it never wakes).
+            assert!(setup.changed && !setup.can_update && !setup.updating);
+            let lines: Vec<_> = setup
+                .servers
+                .iter()
+                .map(|(name, label, _)| (name.as_str(), label.as_str()))
+                .collect();
+            assert_eq!(
+                lines,
+                [
+                    ("github", "connected"),
+                    ("linear", "Sign in in the cloud"),
+                    ("site", "failed - could not connect"),
+                ]
+            );
+            shell.update_claude_setup(cx);
+            assert!(shell.claude_setups.borrow()["octo-abc"].updating);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            let slots = shell.claude_setups.borrow();
+            let slot = &slots["octo-abc"];
+            assert!(!slot.updating);
+            assert!(
+                slot.error.as_deref().is_some_and(|e| e.contains("off")),
+                "{:?}",
+                slot.error
+            );
+            drop(slots);
+            // The refusal is shown with the block.
+            shell.workspace.active = Some(id);
+            shell.sync_cloud_panel(cx);
+            let panel = shell.right_panel.clone().unwrap();
+            let setup = panel
+                .read(cx)
+                .cloud_chrome()
+                .unwrap()
+                .setup
+                .clone()
+                .unwrap();
+            assert!(setup.error.is_some());
+        })
+        .unwrap();
+}
+
+const LOCAL: &str = "/work/monocode";
+
+/// The panels (binding, the Local switch, the connection strip, the policy) only read cached
+/// state. A counting fake host and `gh` prove that no background path wakes a stopped workspace,
+/// and that the strip's Connect action, a user action, does.
+#[gpui::test]
+fn the_panels_never_wake_a_workspace_on_their_own_and_connect_does(cx: &mut TestAppContext) {
+    use crate::cloud_wake::fakes::{AUTH_OK, install, serial};
+    use crate::panel_root::{Link, PanelMode};
+    let _serial = serial();
+    let (window, _, _) = crate::shell::tests::window(cx);
+    let (gh, host) = window
+        .update(cx, |shell, _, _| {
+            install(shell.store.clone(), AUTH_OK, "Shutdown")
+        })
+        .unwrap();
+    let id = window
+        .update(cx, |shell, _, cx| {
+            // The fake machine is the codespace `octo-run`.
+            let id = add_cloud_session(&shell.store, "/work/monocode", "octo-run");
+            let summary = locked(&shell.store)
+                .unwrap()
+                .sessions()
+                .unwrap()
+                .into_iter()
+                .find(|s| s.id == id)
+                .unwrap();
+            shell.session_summaries.insert(id, summary);
+            shell.order.push(id);
+            let mark = CloudMark {
+                local_project: "/work/monocode".into(),
+                codespace: "octo-run".into(),
+                kind: CloudBackendKind::Codespaces,
+            };
+            shell.cloud_states.insert(mark.key(), CloudState::Stopped);
+            shell.cloud_marks.insert(id, mark);
+            shell.ensure_session(id, cx).expect("conversation");
+            id
+        })
+        .unwrap();
+    host.0.lock().unwrap().clear();
+    let wakes = |gh: &crate::cloud_wake::fakes::Gh| {
+        gh.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| {
+                call.contains("codespace ssh")
+                    || call.contains("codespace start")
+                    || call.contains("api --method POST")
+            })
+            .count()
+    };
+    let ensures = || {
+        host.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.starts_with("ensure"))
+            .count()
+    };
+    let before = wakes(&gh);
+    window
+        .update(cx, |shell, window, cx| {
+            shell.ensure_right_panel(window, cx);
+            shell.workspace.active = Some(id);
+            // Everything a frame or a click on the panels does, except Connect.
+            for mode in [PanelMode::Cloud, PanelMode::Local, PanelMode::Cloud] {
+                shell.set_panel_mode(mode, cx);
+                shell.sync_git(cx);
+                shell.sync_cloud_panel(cx);
+            }
+            let panel = shell.right_panel.clone().unwrap();
+            assert_eq!(
+                panel.read(cx).cloud_chrome().unwrap().link,
+                Some(Link::NotConnected)
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(ensures(), 0, "{:?}", host.0.lock().unwrap());
+    assert_eq!(wakes(&gh), before, "{:?}", gh.calls.lock().unwrap());
+
+    // The Connect action is the user's explicit wake.
+    window
+        .update(cx, |shell, _, cx| shell.connect_panel_workspace(cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(ensures(), 1, "{:?}", host.0.lock().unwrap());
+}
+
+/// The panels of a workspace the app is not connected to keep the last tree and git snapshot,
+/// dimmed and read-only, and read nothing. Connect (a user action) reconnects exactly once; the
+/// panels read everything again and polling resumes only after the link is live. A counting fake
+/// host and `gh` prove that nothing in between wakes the workspace.
+#[gpui::test]
+fn a_disconnected_workspace_keeps_its_cached_panels_read_only_and_connect_reloads(
+    cx: &mut TestAppContext,
+) {
+    use crate::cloud_wake::fakes::{AUTH_OK, install, serial};
+    use crate::panel_root::{Link, PanelMode};
+    let _serial = serial();
+    let (window, _, _) = crate::shell::tests::window(cx);
+    let (gh, host) = window
+        .update(cx, |shell, _, _| {
+            install(shell.store.clone(), AUTH_OK, "Shutdown")
+        })
+        .unwrap();
+    let id = window
+        .update(cx, |shell, _, cx| {
+            let id = add_cloud_session(&shell.store, "/work/monocode", "octo-run");
+            let summary = locked(&shell.store)
+                .unwrap()
+                .sessions()
+                .unwrap()
+                .into_iter()
+                .find(|s| s.id == id)
+                .unwrap();
+            shell.session_summaries.insert(id, summary);
+            shell.order.push(id);
+            let mark = CloudMark {
+                local_project: "/work/monocode".into(),
+                codespace: "octo-run".into(),
+                kind: CloudBackendKind::Codespaces,
+            };
+            shell.cloud_states.insert(mark.key(), CloudState::Stopped);
+            shell.cloud_marks.insert(id, mark);
+            shell.ensure_session(id, cx).expect("conversation");
+            id
+        })
+        .unwrap();
+    host.0.lock().unwrap().clear();
+    let wakes = |gh: &crate::cloud_wake::fakes::Gh| {
+        gh.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| {
+                call.contains("codespace ssh")
+                    || call.contains("codespace start")
+                    || call.contains("api --method POST")
+            })
+            .count()
+    };
+    let ensures = || {
+        host.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.starts_with("ensure"))
+            .count()
+    };
+    let before = wakes(&gh);
+    let (remote, reads_before) = window
+        .update(cx, |shell, window, cx| {
+            shell.ensure_right_panel(window, cx);
+            let reads_before = shell.git.read(cx).reads;
+            let remote = shell.session_summaries[&id].cwd.clone();
+            // The last tree and snapshot of this workspace, seen while it was connected.
+            let seen = monocode_core::scm::DiffIndex {
+                files: vec![monocode_core::scm::ChangedFile {
+                    path: format!("{remote}/a.rs"),
+                    relative: "a.rs".into(),
+                    status: "modified".into(),
+                    additions: 1,
+                    deletions: 0,
+                    staged: false,
+                    unstaged: true,
+                }],
+                ..Default::default()
+            };
+            shell.git.update(cx, |git, _| {
+                git.remote
+                    .put_index(&remote, &seen, std::time::Instant::now())
+            });
+            shell.workspace.active = Some(id);
+            for _ in 0..3 {
+                shell.sync_git(cx);
+                shell.sync_cloud_panel(cx);
+            }
+            let panel = shell.right_panel.clone().unwrap();
+            let chrome = panel.read(cx).cloud_chrome().unwrap().clone();
+            assert_eq!(chrome.link, Some(Link::NotConnected));
+            assert!(chrome.offline && chrome.can_connect, "{chrome:?}");
+            assert!(
+                chrome
+                    .cached
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("last updated")
+            );
+            let git = shell.git.read(cx);
+            assert!(git.offline() && git.index.as_ref() == Some(&seen));
+            assert_eq!(
+                git.reads, reads_before,
+                "a disconnected workspace is never read"
+            );
+            // Writes to it are refused, and the Local switch is not offline.
+            assert!(!crate::git_gate::writes_allowed(&remote));
+            assert_eq!(
+                crate::git_gate::refusal(&remote),
+                crate::git_gate::REFUSED_OFFLINE
+            );
+            shell.set_panel_mode(PanelMode::Local, cx);
+            shell.sync_cloud_panel(cx);
+            assert!(!shell.git.read(cx).offline());
+            shell.set_panel_mode(PanelMode::Cloud, cx);
+            shell.sync_cloud_panel(cx);
+            assert!(shell.git.read(cx).offline());
+            // A Review tab of this workspace is refused even when the panels show something
+            // else: the gate knows every environment that is down, not only the panels' root.
+            shell.workspace.active = None;
+            shell.sync_cloud_panel(cx);
+            assert!(!crate::git_gate::writes_allowed(&remote));
+            shell.workspace.active = Some(id);
+            shell.sync_cloud_panel(cx);
+            (remote, reads_before)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(ensures(), 0, "{:?}", host.0.lock().unwrap());
+    assert_eq!(wakes(&gh), before, "{:?}", gh.calls.lock().unwrap());
+
+    // Connect twice in a row (a double click): the workspace is reconnected exactly once.
+    window
+        .update(cx, |shell, _, cx| {
+            shell.connect_panel_workspace(cx);
+            shell.connect_panel_workspace(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(ensures(), 1, "{:?}", host.0.lock().unwrap());
+
+    // The link is live again: the panels read everything again and polling resumes.
+    window
+        .update(cx, |shell, _, cx| {
+            shell.git.update(cx, |git, cx| git.set_polling(true, cx));
+            assert!(shell.git.read(cx).poll_is_off_for_test());
+            let view = shell.sessions[&id].clone();
+            view.update(cx, |view, _| view.set_online_for_test(true));
+            shell.sync_cloud_panel(cx);
+            let git = shell.git.read(cx);
+            // Only the recovery's own read runs; the watch and the timers wait for it to land.
+            assert!(!git.offline() && git.reads > reads_before && git.poll_is_off_for_test());
+            // Between the reconnect and the end of the first reload the old snapshot is not
+            // live data: still dimmed, and still no writes.
+            assert!(git.stale());
+            assert!(!crate::git_gate::writes_allowed(&remote));
+            let panel = shell.right_panel.clone().unwrap();
+            assert!(panel.read(cx).cloud_chrome().unwrap().offline);
+        })
+        .unwrap();
+    // The reads of the fake workspace fail, so the panels stay read-only until the recovery
+    // limit ends the wait.
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(31));
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            shell.sync_cloud_panel(cx);
+            assert!(!shell.git.read(cx).stale());
+            assert!(
+                !shell.git.read(cx).poll_is_off_for_test(),
+                "polling resumes when the recovery ends"
+            );
+            assert!(crate::git_gate::writes_allowed(&remote));
+            let panel = shell.right_panel.clone().unwrap();
+            let chrome = panel.read(cx).cloud_chrome().unwrap().clone();
+            assert!(!chrome.offline && chrome.cached.is_none());
+        })
+        .unwrap();
+}
+
+/// A terminal-run cloud session (no conversation) in view is not locked by a sibling whose link
+/// is down: it has no Connect action, so its panels keep reading as in F2-1.
+#[gpui::test]
+fn a_terminal_session_is_not_locked_by_a_sibling_that_is_down(cx: &mut TestAppContext) {
+    use crate::cloud_wake::fakes::{AUTH_OK, install, serial};
+    let _serial = serial();
+    let (window, _, _) = crate::shell::tests::window(cx);
+    let _fakes = window
+        .update(cx, |shell, _, _| {
+            install(shell.store.clone(), AUTH_OK, "Shutdown")
+        })
+        .unwrap();
+    window
+        .update(cx, |shell, window, cx| {
+            let (x, t) = (cloud_row(shell, "octo-run"), cloud_row(shell, "octo-run"));
+            shell
+                .cloud_states
+                .insert("octo-run".into(), CloudState::Available);
+            shell.ensure_session(x, cx).expect("conversation");
+            shell.sessions[&x].update(cx, |v, _| {
+                v.set_online_for_test(true);
+                v.set_online_for_test(false);
+            });
+            shell.ensure_right_panel(window, cx);
+            shell.workspace.active = Some(t);
+            shell.sync_cloud_panel(cx);
+            let remote = shell.session_summaries[&t].cwd.clone();
+            let root = shell.panel_root(cx);
+            assert!(!shell.sessions.contains_key(&t));
+            assert!(!shell.panel_offline(&root, cx));
+            assert!(!shell.git.read(cx).offline());
+            assert!(crate::git_gate::writes_allowed(&remote));
+            let panel = shell.right_panel.clone().unwrap();
+            assert!(!panel.read(cx).cloud_chrome().unwrap().offline);
+        })
+        .unwrap();
+}
+
+/// One live session means the workspace is up: a stale second session on the same environment
+/// never makes the panels, the Explorer or the git gate treat it as down.
+#[gpui::test]
+fn one_live_session_keeps_the_environment_writable_whatever_another_one_says(
+    cx: &mut TestAppContext,
+) {
+    use crate::cloud_wake::fakes::{AUTH_OK, install, serial};
+    let _serial = serial();
+    let (window, _, _) = crate::shell::tests::window(cx);
+    let _fakes = window
+        .update(cx, |shell, _, _| {
+            install(shell.store.clone(), AUTH_OK, "Shutdown")
+        })
+        .unwrap();
+    window
+        .update(cx, |shell, window, cx| {
+            let (live, stale) = (cloud_row(shell, "octo-run"), cloud_row(shell, "octo-run"));
+            for id in [live, stale] {
+                shell
+                    .cloud_states
+                    .insert("octo-run".into(), CloudState::Available);
+                shell.ensure_session(id, cx).expect("conversation");
+            }
+            shell.ensure_right_panel(window, cx);
+            let remote = shell.session_summaries[&stale].cwd.clone();
+            shell.workspace.active = Some(stale);
+            // The session in view lost its link; the other one is live.
+            shell.sessions[&live].update(cx, |v, _| v.set_online_for_test(true));
+            shell.sessions[&stale].update(cx, |v, _| {
+                v.set_online_for_test(true);
+                v.set_online_for_test(false);
+            });
+            shell.sync_cloud_panel(cx);
+            let root = shell.panel_root(cx);
+            assert!(!shell.panel_offline(&root, cx));
+            assert!(shell.offline_environments(cx).is_empty());
+            assert!(!shell.git.read(cx).offline());
+            assert!(crate::git_gate::writes_allowed(&remote));
+            let panel = shell.right_panel.clone().unwrap();
+            assert!(!panel.read(cx).cloud_chrome().unwrap().offline);
+
+            // Both down: the environment is down for the panels, the Explorer and the gate alike.
+            shell.sessions[&live].update(cx, |v, _| v.set_online_for_test(false));
+            shell.sync_cloud_panel(cx);
+            assert!(shell.panel_offline(&root, cx));
+            assert!(shell.git.read(cx).offline());
+            assert!(!crate::git_gate::writes_allowed(&remote));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_pending_workspace_shows_a_placeholder_instead_of_reading_the_workspace(
+    cx: &mut TestAppContext,
+) {
+    use crate::panel_root::Link;
+    let (window, id, _) = shell_with_cloud(cx);
+    window
+        .update(cx, |shell, window, cx| {
+            shell.ensure_right_panel(window, cx);
+            let panel = shell.right_panel.clone().expect("panel");
+            shell.session_summaries.get_mut(&id).unwrap().cwd =
+                "remote://pending-octo-abc/workspaces/widgets".into();
+            shell.workspace.active = Some(id);
+            shell.sync_cloud_panel(cx);
+            let chrome = panel.read(cx).cloud_chrome().unwrap().clone();
+            assert!(chrome.placeholder);
+            assert_eq!(chrome.link, Some(Link::Starting));
+            // Nothing is read from a workspace that does not exist yet.
+            assert_eq!(shell.git.read(cx).project(), "/work/monocode");
+            assert!(!crate::git_gate::writes_allowed(LOCAL));
+            assert!(!crate::git_gate::writes_allowed(
+                "remote://pending-octo-abc/workspaces/widgets"
+            ));
+        })
+        .unwrap();
+}
+
+/// Session ids can be reused: a deleted or archived session must not leave its Local choice
+/// behind for the next session with that id.
+#[gpui::test]
+fn a_deleted_or_archived_session_forgets_its_panel_mode(cx: &mut TestAppContext) {
+    use crate::panel_root::PanelMode;
+    let (window, id, _) = shell_with_cloud(cx);
+    window
+        .update(cx, |shell, window, cx| {
+            shell.workspace.active = Some(id);
+            shell.set_panel_mode(PanelMode::Local, cx);
+            assert_eq!(shell.panel_modes.get(&id), Some(&PanelMode::Local));
+            shell.apply_archived(id, true, window, cx);
+            assert!(!shell.panel_modes.contains_key(&id));
+            shell.panel_modes.insert(id, PanelMode::Local);
+            shell.forget_session(id, cx);
+            assert!(!shell.panel_modes.contains_key(&id));
+        })
+        .unwrap();
+}
+
+/// Connect is the session's Reconnect, so a cloud session without a live conversation (for
+/// example one that runs in a terminal) gets no Connect action instead of a dead button.
+#[gpui::test]
+fn the_connect_action_needs_a_live_conversation(cx: &mut TestAppContext) {
+    let (window, id, _) = shell_with_cloud(cx);
+    window
+        .update(cx, |shell, window, cx| {
+            shell.ensure_right_panel(window, cx);
+            let panel = shell.right_panel.clone().expect("panel");
+            shell.workspace.active = Some(id);
+            shell.sync_cloud_panel(cx);
+            let chrome = panel.read(cx).cloud_chrome().unwrap().clone();
+            assert_eq!(chrome.link, Some(crate::panel_root::Link::NotConnected));
+            assert!(!chrome.can_connect);
+            shell.ensure_session(id, cx).expect("conversation");
+            shell.sync_cloud_panel(cx);
+            assert!(panel.read(cx).cloud_chrome().unwrap().can_connect);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_remote_policy_sees_a_turn_running_in_the_workspace_of_the_panels(cx: &mut TestAppContext) {
+    use crate::git_gate::{Decision, Op, decide};
+    let (window, id, _) = shell_with_cloud(cx);
+    window
+        .update(cx, |shell, _, cx| {
+            let remote = shell.session_summaries[&id].cwd.clone();
+            shell.workspace.active = Some(id);
+            shell.sync_cloud_panel(cx);
+            assert_eq!(decide(Op::Discard, &remote), Decision::Allow);
+            // The session is working: discard is refused, commit asks first, push goes on.
+            shell.remote_marks.insert(id, (true, false));
+            shell.sync_cloud_panel(cx);
+            assert!(crate::git_gate::turn_running(&remote));
+            assert!(matches!(decide(Op::Discard, &remote), Decision::Refuse(_)));
+            assert!(matches!(
+                decide(Op::Commit, &remote),
+                Decision::Confirm { .. }
+            ));
+            assert!(matches!(
+                decide(Op::ChangeBranch, &remote),
+                Decision::Refuse(_)
+            ));
+            assert_eq!(decide(Op::Push, &remote), Decision::Allow);
+            // The Local switch shows another checkout: the remote policy does not apply to it,
+            // but a remote Review of the same workspace still gets it.
+            shell.set_panel_mode(crate::panel_root::PanelMode::Local, cx);
+            shell.sync_cloud_panel(cx);
+            assert_eq!(decide(Op::Discard, LOCAL), Decision::Allow);
+            assert!(matches!(decide(Op::Discard, &remote), Decision::Refuse(_)));
+            // A local session in view: the remote Review still sees the running turn.
+            shell.workspace.active = None;
+            shell.sync_cloud_panel(cx);
+            assert!(matches!(decide(Op::Discard, &remote), Decision::Refuse(_)));
+            assert!(crate::git_gate::writes_allowed(LOCAL));
+            // The session is done again.
+            shell.remote_marks.insert(id, (false, false));
+            shell.sync_cloud_panel(cx);
+            assert_eq!(decide(Op::Discard, &remote), Decision::Allow);
+        })
+        .unwrap();
+}
+
+/// The panels follow the session in view: for a cloud session that is its `remote://`
+/// project key, so Files and Changes list the cloud workspace, not the local checkout.
+#[gpui::test]
+fn files_and_git_are_bound_to_the_remote_project_of_the_active_cloud_session(
+    cx: &mut TestAppContext,
+) {
+    let (window, id, _) = shell_with_cloud(cx);
+    window
+        .update(cx, |shell, _, cx| {
+            let cwd = shell.session_summaries[&id].cwd.clone();
+            assert!(cwd.starts_with("remote://"), "{cwd}");
+            shell.ensure_session(id, cx).expect("conversation");
+            shell.workspace.active = Some(id);
+            shell.sync_git(cx);
+            let root = shell.git.read(cx).project().to_owned();
+            assert_eq!(root, cwd);
+            assert_ne!(root, "/work/monocode");
+        })
+        .unwrap();
+}
+
+/// A session that runs in a Host worktree binds the panels to that worktree, which is
+/// also a `remote://` path.
+#[gpui::test]
+fn files_and_git_are_bound_to_the_host_worktree_of_the_active_cloud_session(
+    cx: &mut TestAppContext,
+) {
+    let (window, id, _) = shell_with_cloud(cx);
+    window
+        .update(cx, |shell, _, cx| {
+            let worktree =
+                monocode_core::remote::remote_path("env-octo-abc", "/workspaces/widgets-wt");
+            assert!(worktree.starts_with("remote://"), "{worktree}");
+            shell.session_worktrees.insert(id, Some(worktree.clone()));
+            let view = shell.ensure_session(id, cx).expect("conversation");
+            assert_eq!(
+                view.read(cx).settings.worktree_cwd.as_deref(),
+                Some(worktree.as_str())
+            );
+            shell.workspace.active = Some(id);
+            shell.sync_git(cx);
+            assert_eq!(shell.git.read(cx).project(), worktree);
+            assert_ne!(
+                shell.git.read(cx).project(),
+                shell.session_summaries[&id].cwd
+            );
         })
         .unwrap();
 }
@@ -1579,7 +2290,7 @@ fn begin(
 ) -> (Session, monocode_core::cloud_sessions::StartRecord) {
     let local = checkout.path().to_string_lossy().into_owned();
     let target = cloud_picker::target_for(CodespaceChoice::New, "feature", None).unwrap();
-    cloud_picker::begin_cloud_start(svc, &local, target).unwrap()
+    cloud_picker::begin_cloud_start(svc, &local, target, true).unwrap()
 }
 
 #[gpui::test]
@@ -2279,12 +2990,12 @@ fn the_archive_copy_names_the_sandbox_and_keeps_the_codespace_text_byte_identica
     // Stop is the default when nothing else uses the workspace.
     assert_eq!(cloud::default_choice(0), ArchiveChoice::Stop);
     assert_eq!(
-        cloud::banner_text(&CloudRef::sandbox("box")),
-        "Local files - this session runs in sandbox box"
+        crate::panel_root::cloud_banner(&CloudRef::sandbox("box")),
+        "Cloud files - sandbox box"
     );
     assert_eq!(
-        cloud::banner_text(&CloudRef::codespace("octo-abc")),
-        "Local files - this session runs in codespace octo-abc"
+        crate::panel_root::cloud_banner(&CloudRef::codespace("octo-abc")),
+        "Cloud files - codespace octo-abc"
     );
 }
 
@@ -3639,6 +4350,7 @@ fn the_create_request_turns_the_panel_picks_into_begin_start_arguments() {
         config: None,
         machine: machine.map(str::to_owned),
         prompt: None,
+        kit: false,
         request_id: 1,
     };
     let picked =
@@ -4077,4 +4789,148 @@ fn app_archive_delete_review_error_tells_the_user_to_review_in_the_app(cx: &mut 
     );
     assert!(failure.archived);
     assert!(gh.archive_calls().is_empty());
+}
+
+fn archive_focused(shell: &Shell, window: &Window, cx: &App) -> bool {
+    shell
+        .cloud_archive
+        .as_ref()
+        .is_some_and(|d| d.focus_handle().contains_focused(window, cx))
+}
+
+/// Puts the open archive dialog in its Working phase without spawning work, and returns the
+/// flag Cancel sets.
+fn hold_archive_working(shell: &mut Shell) -> Arc<AtomicBool> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    shell.cloud_archive.as_mut().expect("the dialog").phase = cloud::Phase::Working {
+        progress: Arc::new(std::sync::Mutex::new("Saving a local copy".into())),
+        cancel: cancel.clone(),
+    };
+    cancel
+}
+
+#[gpui::test]
+fn a_running_archive_blocks_the_window_and_only_the_cancel_button_cancels(cx: &mut TestAppContext) {
+    use super::cloud_continue_tests::blocking::*;
+    use std::sync::atomic::Ordering;
+    bind(cx);
+    let (window, id, _) = shell_with_cloud(cx);
+    let at = arm(window, cx);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    assert!(
+        hover_reveals(visual, at),
+        "the hover probe works without a dialog"
+    );
+    let cancel = window
+        .update(visual, |shell, window, cx| {
+            shell.open_cloud_archive(vec![id], window, cx);
+            hold_archive_working(shell)
+        })
+        .unwrap();
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    let card = visual
+        .debug_bounds("cloud-archive-dialog")
+        .expect("the dialog");
+    assert_blocked(window, visual, at, card, archive_focused);
+    // The backdrop and Escape never cancel the running save.
+    assert!(
+        !card.contains(&gpui::point(gpui::px(900.), gpui::px(700.))),
+        "the backdrop press is outside the card"
+    );
+    visual.simulate_click(
+        gpui::point(gpui::px(900.), gpui::px(700.)),
+        Default::default(),
+    );
+    visual.simulate_click(at, Default::default());
+    assert_eq!(
+        active(window, visual),
+        Some(OTHER),
+        "click must not select the row"
+    );
+    visual.simulate_keystrokes("escape");
+    assert!(
+        !cancel.load(Ordering::Relaxed),
+        "a stray press must not cancel"
+    );
+    window
+        .update(visual, |shell, _, _| assert!(shell.cloud_archive.is_some()))
+        .unwrap();
+    // The Cancel button does.
+    let button = visual.debug_bounds("cloud-archive-cancel").expect("Cancel");
+    visual.simulate_click(button.center(), Default::default());
+    assert!(
+        cancel.load(Ordering::Relaxed),
+        "the button asks the worker to stop"
+    );
+}
+
+#[gpui::test]
+fn the_archive_choice_takes_enter_and_escape_through_the_gate_and_frees_the_window(
+    cx: &mut TestAppContext,
+) {
+    use super::cloud_continue_tests::blocking::*;
+    bind(cx);
+    let (window, id, gh) = shell_with_cloud(cx);
+    let at = arm(window, cx);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    // Escape closes the choice and the window works again.
+    window
+        .update(visual, |shell, window, cx| {
+            shell.open_cloud_archive(vec![id], window, cx)
+        })
+        .unwrap();
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    let card = visual
+        .debug_bounds("cloud-archive-dialog")
+        .expect("the dialog");
+    assert_blocked(window, visual, at, card, archive_focused);
+    visual.simulate_keystrokes("escape");
+    window
+        .update(visual, |shell, _, _| assert!(shell.cloud_archive.is_none()))
+        .unwrap();
+    visual.refresh().unwrap();
+    assert_restored(window, visual, at);
+
+    // With another session on the codespace the default is Keep running: Enter archives the
+    // row locally and never touches gh.
+    window
+        .update(visual, |shell, window, cx| {
+            let other = add_cloud_session(&shell.store, "/work/monocode", "octo-abc");
+            let summary = locked(&shell.store)
+                .unwrap()
+                .sessions()
+                .unwrap()
+                .into_iter()
+                .find(|s| s.id == other)
+                .unwrap();
+            shell.session_summaries.insert(other, summary);
+            shell.order.push(other);
+            shell.cloud_marks.insert(
+                other,
+                CloudMark {
+                    local_project: "/work/monocode".into(),
+                    codespace: "octo-abc".into(),
+                    kind: CloudBackendKind::Codespaces,
+                },
+            );
+            shell.open_cloud_archive(vec![id], window, cx);
+            assert_eq!(shell.cloud_archive.as_ref().unwrap().others(), 1);
+        })
+        .unwrap();
+    visual.run_until_parked();
+    visual.simulate_keystrokes("enter");
+    visual.run_until_parked();
+    window
+        .update(visual, |shell, _, cx| {
+            assert!(shell.cloud_archive.is_none());
+            assert!(shell.session_metadata(id, cx).summary.archived);
+        })
+        .unwrap();
+    assert!(gh.calls().is_empty());
+    visual.refresh().unwrap();
+    // The archived row left the list, so the probed row may have moved.
+    let at = visual.debug_bounds(ROW).expect("the probed row").center();
+    assert_restored(window, visual, at);
 }

@@ -420,6 +420,16 @@ impl Accounts {
             .max_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(a, _)| a)
     }
+    /// The `accounts.list` app action, from the same book and credential cache the GUI uses.
+    pub(crate) fn app_list(&self, input: &serde_json::Value) -> Result<serde_json::Value, String> {
+        let provider = input
+            .get("provider")
+            .map(|value| accounts::parse_provider(value.as_str().unwrap_or_default()))
+            .transpose()?;
+        Ok(accounts::list_value(&self.book, provider, &|id| {
+            self.claude_credential(id)
+        }))
+    }
     pub(crate) fn selected(&self, kind: Kind, project: &str) -> Profile {
         self.profile(&self.book.selected(kind, project))
     }

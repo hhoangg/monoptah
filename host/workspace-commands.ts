@@ -1,8 +1,11 @@
+import { createHash, randomBytes } from "node:crypto";
 import {
   cp,
   lstat,
+  open,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   realpath,
   rename,
@@ -19,10 +22,12 @@ import { hostGitBlame } from "./git-blame";
 import { hostWorktrees } from "./git-worktrees";
 import { createHostBranch, hostBranches, switchHostBranch } from "./git-branches";
 import type { HostStore } from "./store";
+import { WorkspaceWatchHost, MAX_DIRS, type WatchDir } from "./workspace-watch";
 import {
   createHostPath,
   existingPath,
   hostFileDiff,
+  GIT_NETWORK_TIMEOUT_MS,
   hostGitAction,
   hostGitIndex,
   indexHostFiles,
@@ -81,6 +86,10 @@ export const WORKSPACE_COMMANDS = [
   "git_stash",
   "git_worktrees",
   "search_project",
+  "watch_changes",
+  "update_watch",
+  "wait_changes",
+  "unwatch_changes",
 ] as const;
 export type WorkspaceCommand = (typeof WORKSPACE_COMMANDS)[number];
 
@@ -102,6 +111,13 @@ type Located = { root: string; relative: string };
 export class WorkspaceCommands {
   private roots = new Map<string, { at: number; roots: string[] }>();
   private rootsGeneration = 0;
+  private readonly watches = new WorkspaceWatchHost();
+  private readonly writeLocks = new Map<string, Promise<void>>();
+
+  /** Releases every change watcher (host shutdown). */
+  close(): void {
+    this.watches.close();
+  }
 
   invalidateRoots(): void {
     this.rootsGeneration++;
@@ -110,7 +126,11 @@ export class WorkspaceCommands {
 
   constructor(
     private readonly store: HostStore,
-    private readonly withIdleProject: <T>(projectId: string, action: () => Promise<T>) => Promise<T>,
+    private readonly withIdleProject: <T>(
+      projectId: string,
+      action: () => Promise<T>,
+      what?: string,
+    ) => Promise<T>,
   ) {}
 
   run(command: unknown, args: unknown): Promise<unknown> {
@@ -132,7 +152,7 @@ export class WorkspaceCommands {
       case "read_file_preview":
         return this.preview(input.path, input.maxLines, input.startLine);
       case "write_text_file":
-        return this.writeText(input.path, input.content);
+        return this.writeText(input.path, input.content, input.expectedSha256);
       case "stat_files":
         return this.statFiles(input.paths);
       case "create_path":
@@ -163,9 +183,13 @@ export class WorkspaceCommands {
       case "git_unstage_file":
         return this.gitAction(input.cwd, "unstage", input.relative);
       case "git_discard_file":
-        return this.gitAction(input.cwd, "discard", input.relative);
+        return this.gitIdle(input.cwd, "discarding changes", () =>
+          this.gitAction(input.cwd, "discard", input.relative),
+        );
       case "git_discard_all":
-        return this.gitAction(input.cwd, "discardAll");
+        return this.gitIdle(input.cwd, "discarding changes", () =>
+          this.gitAction(input.cwd, "discardAll"),
+        );
       case "git_stage_all":
         return this.gitAction(input.cwd, "stageAll");
       case "git_unstage_all":
@@ -179,7 +203,7 @@ export class WorkspaceCommands {
       case "git_push":
         return this.gitAction(input.cwd, "push");
       case "git_pull":
-        return this.gitCommand(input.cwd, ["pull", "--ff-only"]).then(() => undefined);
+        return this.gitPull(input.cwd);
       case "git_sync":
         return this.gitSync(input.cwd);
       case "git_pr_status":
@@ -205,12 +229,57 @@ export class WorkspaceCommands {
       case "git_create_branch":
         return this.gitCreateBranch(input.cwd, input.name);
       case "git_stash":
-        return this.gitStash(input.cwd, input.message);
+        return this.gitIdle(input.cwd, "stashing changes", () =>
+          this.gitStash(input.cwd, input.message),
+        );
       case "git_worktrees":
         return this.gitWorktrees(input.cwd);
       case "search_project":
         return this.searchProject(input.options);
+      case "watch_changes":
+        return this.watchChanges(input.cwd, input.dirs);
+      case "update_watch":
+        return this.updateWatch(input.id, input.dirs);
+      case "wait_changes":
+        return (async () => this.watches.wait(input.id))();
+      case "unwatch_changes":
+        return (async () => this.watches.stop(input.id))();
     }
+  }
+
+  /** Resolves client directories (relative to `cwd`, slash-separated, "" is the
+   * root) to real paths that stay inside the workspace. Refuses `..`, absolute
+   * paths, `.git` and symlinks that lead out. */
+  private async watchDirs(root: string, dirs: unknown): Promise<WatchDir[]> {
+    if (dirs === undefined) return [];
+    if (!Array.isArray(dirs)) throw new Error("Invalid watch directories");
+    if (dirs.length > MAX_DIRS)
+      throw new Error(`Too many watched directories (maximum ${MAX_DIRS})`);
+    const out = new Map<string, WatchDir>();
+    for (const input of dirs) {
+      if (typeof input !== "string") throw new Error("Invalid watch directory");
+      const raw = slashed(input);
+      if (raw.startsWith("/") || /^[a-zA-Z]:/.test(raw))
+        throw new Error("Watch directories must be relative");
+      const rel = raw.replace(/^\.\/|\/+$/g, "").replace(/^\.$/, "");
+      if (rel.split("/").some((part) => part === ".." || part.toLowerCase() === ".git"))
+        throw new Error("Path is outside the workspace");
+      const path = await existingPath(root, rel, true);
+      if (!(await stat(path)).isDirectory()) throw new Error("Not a directory");
+      out.set(rel, { rel, path });
+    }
+    return [...out.values()];
+  }
+
+  private async watchChanges(cwd: unknown, dirs: unknown): Promise<{ id: string }> {
+    const { path } = await this.existing(cwd, true);
+    const list = await this.watchDirs(path, dirs);
+    return { id: await this.watches.start(path, list) };
+  }
+
+  private async updateWatch(id: unknown, dirs: unknown): Promise<void> {
+    const root = this.watches.root(id);
+    this.watches.update(id, await this.watchDirs(root, dirs));
   }
 
   /** The project folders and worktrees files may be read and written in. */
@@ -339,13 +408,19 @@ export class WorkspaceCommands {
       .map((line) => (line.length > 200 ? `${line.slice(0, 199)}…` : line));
   }
 
-  private async writeText(input: unknown, content: unknown): Promise<void> {
+  private async writeText(
+    input: unknown,
+    content: unknown,
+    expectedSha256?: unknown,
+  ): Promise<void> {
     if (typeof content !== "string")
       throw new Error("Invalid file content");
     if (Buffer.byteLength(content, "utf8") > MAX_TEXT_FILE)
       throw new Error(
         `File is too large to save (maximum ${MAX_TEXT_FILE / 1024 / 1024} MB).`,
       );
+    if (expectedSha256 !== undefined && expectedSha256 !== null)
+      return this.writeIfUnchanged(input, content, expectedSha256);
     const { root, relative: rel } = await this.locate(input);
     const path = workspacePath(root, rel);
     if (await stat(path).then((info) => info.isDirectory(), () => false))
@@ -357,6 +432,120 @@ export class WorkspaceCommands {
       await rm(temporary, { force: true });
       throw reason;
     });
+  }
+
+  /** Conditional write (`files.write.hash`). Fails with "File changed on the
+   * host" unless the file still hashes to `expectedSha256`. The content goes to
+   * a temp file in the same directory (fsynced, mode copied), the hash is
+   * checked again, and the temp file is renamed over the target, so a reader
+   * never sees a partial file.
+   *
+   * Idempotent: if the file already holds exactly the new content (a retry
+   * after a write whose reply was lost), the call succeeds without writing.
+   *
+   * Writes through this host to the same path are serialized by an in-process
+   * mutex. Unavoidable: an external process can still modify the file between
+   * the second hash check and the rename (a few microseconds; POSIX has no
+   * compare-and-swap rename). The window is far smaller than the one around
+   * the check alone.
+   *
+   * Symlinks: `locate` resolves the link, so the target is replaced and the
+   * link itself is kept. The resolved target must belong to the same
+   * registered project root as the requested path as written, so neither a
+   * link nor a linked directory can carry a write into another project or out
+   * of the workspace.
+   *
+   * Temp files left by a crash (`.<name>.monoptah-*.tmp`, older than 1 h) in
+   * the target directory are removed on each conditional write. */
+  private async writeIfUnchanged(
+    input: unknown,
+    content: string,
+    expected: unknown,
+  ): Promise<void> {
+    if (typeof expected !== "string" || !/^[0-9a-f]{64}$/i.test(expected))
+      throw new Error("Invalid expected file hash");
+    const wanted = expected.toLowerCase();
+    const { root, relative: rel } = await this.locate(input);
+    const path = workspacePath(root, rel);
+    const requested = resolve(input as string);
+    for (const candidate of await this.allowedRoots()) {
+      const within = relative(candidate, requested);
+      if (within === "" || (!within.startsWith("..") && !isAbsolute(within))) {
+        if (candidate !== root) throw new Error("Path is outside the workspace");
+        break;
+      }
+    }
+    const previous = this.writeLocks.get(path) ?? Promise.resolve();
+    const run = previous.then(() => this.writeLocked(path, content, wanted));
+    const tail = run.then(() => undefined, () => undefined);
+    this.writeLocks.set(path, tail);
+    try {
+      await run;
+    } finally {
+      if (this.writeLocks.get(path) === tail) this.writeLocks.delete(path);
+    }
+  }
+
+  private async writeLocked(path: string, content: string, wanted: string) {
+    const info = await stat(path).catch(() => undefined);
+    if (!info) throw new Error("File changed on the host");
+    if (info.isDirectory()) throw new Error("Cannot save text to a directory.");
+    if (!info.isFile()) throw new Error("Not a file");
+    const next = createHash("sha256").update(content, "utf8").digest("hex");
+    // "match": still the expected content; "done": already the new content.
+    const state = async () => {
+      const size = (await stat(path)).size;
+      if (size > MAX_TEXT_FILE)
+        throw new Error(
+          `File is too large to save (maximum ${MAX_TEXT_FILE / 1024 / 1024} MB).`,
+        );
+      const current = createHash("sha256").update(await readFile(path)).digest("hex");
+      if (current === next) return "done";
+      return current === wanted ? "match" : "changed";
+    };
+    const first = await state();
+    if (first === "done") return;
+    if (first !== "match") throw new Error("File changed on the host");
+    await this.sweepTemporaries(path);
+    const temporary = join(
+      dirname(path),
+      `.${basename(path)}.monoptah-${process.pid}-${randomBytes(6).toString("hex")}.tmp`,
+    );
+    const mode = info.mode & 0o7777;
+    try {
+      const handle = await open(temporary, "wx", mode);
+      try {
+        await handle.writeFile(content, "utf8");
+        // open() applies the umask; restore the exact original mode.
+        await handle.chmod(mode);
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      const second = await state();
+      if (second === "changed" || second === "done") {
+        await rm(temporary, { force: true });
+        if (second === "changed") throw new Error("File changed on the host");
+        return;
+      }
+      await rename(temporary, path);
+    } catch (reason) {
+      await rm(temporary, { force: true });
+      throw reason;
+    }
+  }
+
+  /** Removes `.<name>.monoptah-*.tmp` files older than 1 h left by a crash. */
+  private async sweepTemporaries(path: string): Promise<void> {
+    const prefix = `.${basename(path)}.monoptah-`;
+    const names = await readdir(dirname(path)).catch(() => [] as string[]);
+    for (const name of names) {
+      if (!name.startsWith(prefix) || !name.endsWith(".tmp")) continue;
+      const full = join(dirname(path), name);
+      const info = await lstat(full).catch(() => undefined);
+      if (info?.isFile() && Date.now() - info.mtimeMs > 60 * 60 * 1000)
+        await rm(full, { force: true });
+    }
   }
 
   private async statFiles(input: unknown): Promise<FileMtime[]> {
@@ -488,11 +677,16 @@ export class WorkspaceCommands {
     return hostGitAction(await this.gitRoot(cwd), action, relative, message, contents);
   }
 
-  private async gitCommand(cwd: unknown, args: string[], env?: NodeJS.ProcessEnv): Promise<string> {
+  private async gitCommand(
+    cwd: unknown,
+    args: string[],
+    env?: NodeJS.ProcessEnv,
+    timeout = 30_000,
+  ): Promise<string> {
     const root = await this.gitRoot(cwd);
     return (await exec("git", ["-c", "core.pager=cat", ...args], {
       cwd: root,
-      timeout: 30_000,
+      timeout,
       maxBuffer: 4 * 1024 * 1024,
       encoding: "utf8",
       env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...env },
@@ -581,8 +775,12 @@ export class WorkspaceCommands {
     return selected;
   }
 
+  private async gitPull(cwd: unknown): Promise<void> {
+    await this.gitCommand(cwd, ["pull", "--ff-only"], undefined, GIT_NETWORK_TIMEOUT_MS);
+  }
+
   private async gitSync(cwd: unknown) {
-    await this.gitCommand(cwd, ["pull", "--ff-only"]);
+    await this.gitPull(cwd);
     await this.gitAction(cwd, "push");
   }
 
@@ -789,12 +987,23 @@ export class WorkspaceCommands {
     return state.current ?? "HEAD";
   }
 
-  private async withIdleGitProject<T>(cwd: string, action: () => Promise<T>): Promise<T> {
+  /** Runs a working-tree-rewriting git command only while no session of the
+   * project is running, so it cannot race an agent turn. */
+  private async gitIdle<T>(cwd: unknown, what: string, action: () => Promise<T>): Promise<T> {
+    const root = await this.gitRoot(cwd);
+    return this.withIdleGitProject(root, action, what);
+  }
+
+  private async withIdleGitProject<T>(
+    cwd: string,
+    action: () => Promise<T>,
+    what?: string,
+  ): Promise<T> {
     const { root } = await this.locate(cwd);
     const project = this.store.projects().find((candidate) =>
       candidate.cwd === root || this.roots.get(candidate.cwd)?.roots.includes(root));
     if (!project) throw new Error("Project is unavailable");
-    return this.withIdleProject(project.id, action);
+    return this.withIdleProject(project.id, action, what);
   }
 
   private async gitStash(cwd: unknown, message: unknown) {

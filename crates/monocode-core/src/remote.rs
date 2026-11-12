@@ -1,10 +1,20 @@
 //! Remote host connections. The renderer receives machine metadata, never the
 //! saved bearer credential. Workspace requests never fall back to local calls.
 pub mod attachments;
+mod cloud_upgrade;
+#[cfg(test)]
+mod cloud_upgrade_tests;
+pub mod host_info;
+pub mod host_release;
+pub mod host_upgrade;
+#[cfg(test)]
+mod job_slot_tests;
 pub mod protocol;
 mod ssh;
 pub mod ssh_askpass;
+pub mod uploads;
 
+pub use cloud_upgrade::HOST_UPDATING;
 pub(crate) use ssh::{
     sandbox_bootstrap_script, shell_quote, validate_sandbox as validate_sandbox_target,
     validate_sandbox_workspace,
@@ -27,12 +37,38 @@ pub struct Connections {
     jobs: Mutex<HashMap<String, Arc<Job>>>,
     /// In-flight codespace wakes by machine id, so concurrent callers share one.
     wakes: Mutex<HashMap<String, WakeSlot>>,
+    /// Flavor, version and capabilities of each machine's Host, from `environment.describe`.
+    host_info: host_info::HostInfoCache,
+    /// Per machine: the turn-starting requests in flight, and the hold during a Host swap.
+    gates: Mutex<HashMap<String, Arc<cloud_upgrade::SendGate>>>,
+    /// Ids of the jobs whose Host swap is past the point of no return (an app quit leaves them).
+    swap_jobs: Mutex<std::collections::HashSet<String>>,
+    #[cfg(test)]
+    slot_wait_override: Mutex<Option<std::time::Duration>>,
+    #[cfg(test)]
+    drain_override: Mutex<Option<std::time::Duration>>,
+    /// Machine id to the tunnel its last Host upgrade pass ran on (once per connect).
+    upgrade_passes: Mutex<HashMap<String, u64>>,
+    /// Machine id to the warning of its last Host upgrade that failed (memory only; cleared by
+    /// the next pass that does not fail).
+    upgrade_failures: Mutex<HashMap<String, String>>,
+    /// How the Host upgrade reaches a machine (replaced in tests).
+    runner: Mutex<Arc<dyn cloud_upgrade::CloudRunner>>,
 }
 
 type WakeSlot = Arc<(Mutex<Option<Result<(), String>>>, Condvar)>;
+/// Returned when a setup job for the same target (or one that needs the SSH prompts to
+/// itself) is already running.
 const SSH_BUSY: &str = "Another SSH connection is being set up. Finish or cancel it first.";
-/// How long a wake waits for the single SSH job slot before giving up.
-const JOB_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// How long a wake or a start waits for a free SSH job slot before giving up.
+pub(crate) const JOB_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// How long a finished setup job stays readable. Its owner polls every 100 ms, but with
+/// several starts at once the owner may not read the result right when the job ends.
+const FINISHED_JOB_KEEP: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// How long after a job paired a target a cloud start for that target still waits (see
+/// `start_ssh_job_guarded`). Short: it only has to cover the moment between the machine being
+/// committed and the start's next look at the store.
+const JUST_PAIRED_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
 /// Error returned when a wake was cancelled by its caller.
 pub const WAKE_CANCELLED: &str = "Wake cancelled";
 
@@ -45,6 +81,16 @@ impl Connections {
             tunnels: Tunnels::default(),
             jobs: Mutex::new(HashMap::new()),
             wakes: Mutex::new(HashMap::new()),
+            host_info: host_info::HostInfoCache::default(),
+            gates: Mutex::new(HashMap::new()),
+            swap_jobs: Mutex::new(Default::default()),
+            #[cfg(test)]
+            slot_wait_override: Mutex::new(None),
+            #[cfg(test)]
+            drain_override: Mutex::new(None),
+            upgrade_passes: Mutex::new(HashMap::new()),
+            upgrade_failures: Mutex::new(HashMap::new()),
+            runner: Mutex::new(Arc::new(cloud_upgrade::SshRunner)),
         }
     }
 
@@ -60,10 +106,22 @@ impl Connections {
     }
 
     pub fn shutdown(&self) {
+        // A Host swap that is past the point of no return finishes on the machine by itself;
+        // cancelling its job would only cut the app's view of it. Wait for it (bounded).
+        let protected = self
+            .swap_jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         if let Ok(jobs) = self.jobs.lock() {
-            for job in jobs.values() {
-                job.cancel();
+            for (id, job) in jobs.iter() {
+                if !protected.contains(id) {
+                    job.cancel();
+                }
             }
+        }
+        if !protected.is_empty() {
+            self.wait_for_swaps(&protected);
         }
         self.tunnels.clear();
     }
@@ -160,6 +218,14 @@ struct StoredMachine {
     token: String,
     #[serde(default)]
     ssh: Option<SshTarget>,
+    /// A cloud Host is older than the pin but a session was running, so the two-phase
+    /// upgrade was deferred; the next connect that finds the Host idle upgrades it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pending_host_upgrade: bool,
+    /// The nonce of a Host swap that was started on the machine and that the app never saw
+    /// end (it quit, or the ssh dropped). The next upgrade pass asks the machine how it ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    swap_nonce: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -260,24 +326,68 @@ fn rpc(
     method: &str,
     params: Value,
 ) -> Result<Value, String> {
-    rpc_with(endpoint, token, environment_id, method, params, false)
+    rpc_with(endpoint, token, environment_id, method, params, None, false)
 }
+
+/// Total time any ordinary RPC may take.
+const DEFAULT_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Total time a push or pull may take. The Host stops git after 90 s, so this leaves
+/// room for its own error reply to arrive first.
+pub const GIT_REMOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Total time a sync may take. The Host runs a pull and then a push, each stopped at
+/// 90 s, so it can legitimately take about 180 s; this adds a margin.
+pub const GIT_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(200);
+
+/// The result of a long operation that timed out on our side. The host may still be
+/// running it, so callers must re-read state instead of reporting a failure.
+pub const MAY_STILL_RUN: &str = "The operation may still be running on the host. Checking...";
 
 /// `closed_is_dead`: a connection reset or closed without a reply also means
 /// the route is gone. Behind a codespace tunnel that is what a stopped host
 /// looks like: the local forward accepts, then the remote side hangs up.
+///
+/// `timeout`: `None` is the ordinary 30 s limit. `Some(limit)` is for operations that may
+/// outlive the client (push, pull, sync): hitting it returns `MAY_STILL_RUN`, and the
+/// connection is dropped, so a reply that arrives later is never read.
 fn rpc_with(
     endpoint: &str,
     token: &str,
     environment_id: Option<&str>,
     method: &str,
     params: Value,
+    timeout: Option<std::time::Duration>,
     closed_is_dead: bool,
+) -> Result<Value, String> {
+    rpc_with_default(
+        endpoint,
+        token,
+        environment_id,
+        method,
+        params,
+        timeout,
+        closed_is_dead,
+        DEFAULT_RPC_TIMEOUT,
+    )
+}
+
+/// `rpc_with` with the ordinary limit as a parameter, so tests need not wait 30 s.
+#[allow(clippy::too_many_arguments)]
+fn rpc_with_default(
+    endpoint: &str,
+    token: &str,
+    environment_id: Option<&str>,
+    method: &str,
+    params: Value,
+    timeout: Option<std::time::Duration>,
+    closed_is_dead: bool,
+    default_timeout: std::time::Duration,
 ) -> Result<Value, String> {
     let agent = ureq::AgentBuilder::new()
         .redirects(0)
         .timeout_connect(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(timeout.unwrap_or(default_timeout))
         .build();
     let payload = json!({ "version": 1, "environmentId": environment_id, "method": method, "params": params });
     let response = agent
@@ -295,8 +405,20 @@ fn rpc_with(
                 "Machine is unreachable. Check the host and SSH tunnel, then reconnect.".into(),
             )
         }
-        Err(_) => {
-            return Err("The host request did not complete. Retry to confirm its result.".into())
+        Err(ureq::Error::Transport(error)) if timeout.is_some() && timed_out(&error) => {
+            return Err(MAY_STILL_RUN.into())
+        }
+        Err(ureq::Error::Transport(error)) if timed_out(&error) => {
+            return Err(format!(
+                "The host request did not complete: no answer within {} s (the host may still be working). Retry to confirm its result.",
+                timeout.unwrap_or(default_timeout).as_secs_f64().ceil() as u64
+            ))
+        }
+        Err(error) => {
+            return Err(format!(
+                "The host request did not complete ({}). Retry to confirm its result.",
+                transport_detail(&error)
+            ))
         }
     };
     let status = response.status();
@@ -305,7 +427,13 @@ fn rpc_with(
         .into_reader()
         .take(MAX_RESPONSE_BYTES + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            if timeout.is_some() && e.kind() == std::io::ErrorKind::TimedOut {
+                MAY_STILL_RUN.to_string()
+            } else {
+                e.to_string()
+            }
+        })?;
     if bytes.len() as u64 > MAX_RESPONSE_BYTES {
         return Err("Host response is too large".into());
     }
@@ -322,6 +450,45 @@ fn rpc_with(
         .ok_or_else(|| "Invalid host response".into())
 }
 
+/// A single-line description of a transport failure for the user: the error kind and its
+/// message, with any URL userinfo removed and the length capped. The bearer token travels
+/// only in a header, so it never appears here.
+fn transport_detail(error: &ureq::Error) -> String {
+    let kind = match error {
+        ureq::Error::Transport(transport) => format!("{:?}", transport.kind()),
+        ureq::Error::Status(..) => "Status".to_string(),
+    };
+    let full = format!("{kind}: {error}");
+    let one_line = strip_userinfo(&full.split_whitespace().collect::<Vec<_>>().join(" "));
+    if one_line.chars().count() > 200 {
+        let cut: String = one_line.chars().take(200).collect();
+        format!("{cut}...")
+    } else {
+        one_line
+    }
+}
+
+/// Removes `user:password@` from any `scheme://` URL inside `text`.
+fn strip_userinfo(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(index) = rest.find("://") {
+        let (head, tail) = rest.split_at(index + 3);
+        out.push_str(head);
+        let end = tail
+            .find(|c: char| c.is_whitespace() || c == '/')
+            .unwrap_or(tail.len());
+        let authority = &tail[..end];
+        match authority.rfind('@') {
+            Some(at) => out.push_str(&authority[at + 1..]),
+            None => out.push_str(authority),
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 // Only a refused connection proves the local forwarding listener is gone.
 // A slow request or an interrupted response says nothing about SSH health.
 fn connection_closed(error: &ureq::Transport) -> bool {
@@ -334,6 +501,29 @@ fn connection_closed(error: &ureq::Transport) -> bool {
                 ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof
             )
         }) {
+            return true;
+        }
+        source = error.source();
+    }
+    false
+}
+
+/// Whether the request may have reached the host. A connect failure (including a connect
+/// timeout, whose source is also an `io::ErrorKind::TimedOut`) means nothing was sent.
+fn may_have_been_sent(kind: ureq::ErrorKind) -> bool {
+    kind == ureq::ErrorKind::Io
+}
+
+fn timed_out(error: &ureq::Transport) -> bool {
+    if !may_have_been_sent(error.kind()) {
+        return false;
+    }
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = source {
+        if error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::TimedOut)
+        {
             return true;
         }
         source = error.source();
@@ -419,10 +609,13 @@ impl Connections {
             environment_id,
             token,
             ssh: existing.and_then(|m| m.ssh.clone()),
+            pending_host_upgrade: false,
+            swap_nonce: None,
         };
         machines.retain(|m| m.id != id);
         machines.push(machine.clone());
         write(&path, &machines)?;
+        self.host_info.record(&id, &descriptor);
         Ok(machine.public())
     }
 
@@ -436,14 +629,51 @@ impl Connections {
         machines.retain(|m| m.id != machine_id);
         write(&path, &machines)?;
         self.tunnels.remove(machine_id);
+        self.host_info.drop_machine(machine_id);
         Ok(())
     }
 
-    pub fn request(
+    /// What the last `environment.describe` of this machine reported, if any.
+    /// A machine reached through a tunnel with no live tunnel has no answer: the cached
+    /// entry may describe a Host that is gone, so it is dropped.
+    pub fn host_info(&self, machine_id: &str) -> Option<host_info::HostInfo> {
+        let through_tunnel = self
+            .list()
+            .ok()?
+            .into_iter()
+            .any(|m| m.id == machine_id && m.ssh.is_some());
+        if through_tunnel && self.tunnels.existing(machine_id).is_none() {
+            self.host_info.drop_machine(machine_id);
+            return None;
+        }
+        self.host_info.get(machine_id)
+    }
+
+    /// Forgets what is cached about this machine's Host.
+    pub(crate) fn forget_host(&self, machine_id: &str) {
+        self.host_info.drop_machine(machine_id);
+    }
+
+    /// Describes the Host now (refreshing the cache) and returns what it reports.
+    pub fn describe_host(&self, machine_id: &str) -> Result<host_info::HostInfo, String> {
+        self.request(machine_id, "environment.describe", json!({}))?;
+        self.host_info
+            .get(machine_id)
+            .ok_or_else(|| "Machine is no longer connected".into())
+    }
+
+    pub fn request(&self, machine_id: &str, method: &str, params: Value) -> Result<Value, String> {
+        self.request_timeout(machine_id, method, params, None)
+    }
+
+    /// Like `request` with a per-request limit for long operations; see `rpc_with`.
+    /// Never wakes a workspace: cloud machines still need a live tunnel.
+    pub fn request_timeout(
         &self,
         machine_id: &str,
         method: &str,
         mut params: Value,
+        timeout: Option<std::time::Duration>,
     ) -> Result<Value, String> {
         if method == "environment.describe" {
             let values = params
@@ -456,6 +686,13 @@ impl Connections {
         if !supported_remote_method(method) {
             return Err("Unsupported remote operation".into());
         }
+        // A request that starts a turn holds its place for the WHOLE call, so a Host swap that
+        // waits for the places to empty knows that none of them can still reach the Host.
+        let _in_flight = if cloud_upgrade::starts_turn(method) {
+            Some(self.gate(machine_id).enter()?)
+        } else {
+            None
+        };
         let machine = {
             let _guard = self
                 .store
@@ -484,6 +721,11 @@ impl Connections {
         } else {
             None
         };
+        // A tunnel that was just (re)started may reach a different Host than the one that
+        // was described; learn it again.
+        if tunnel_lease.as_ref().is_some_and(|lease| lease.fresh) {
+            self.host_info.drop_machine(&machine.id);
+        }
         let endpoint = tunnel_lease
             .as_ref()
             .map(|lease| lease.endpoint.as_str())
@@ -494,6 +736,7 @@ impl Connections {
             Some(&machine.environment_id),
             method,
             params,
+            timeout,
             cloud,
         );
         if response
@@ -504,6 +747,8 @@ impl Connections {
             if let Some(lease) = &tunnel_lease {
                 self.tunnels.invalidate(&machine.id, lease);
             }
+            // The Host behind an unreachable tunnel may be replaced; learn it again.
+            self.host_info.drop_machine(&machine.id);
             if cloud {
                 return Err(not_connected.into());
             }
@@ -514,6 +759,9 @@ impl Connections {
                 != Some(machine.environment_id.as_str())
         {
             return Err("Host identity changed. Add this machine again before continuing.".into());
+        }
+        if method == "environment.describe" {
+            self.host_info.record(&machine.id, &result);
         }
         Ok(result)
     }
@@ -529,7 +777,7 @@ pub const CODESPACE_NOT_CONNECTED: &str =
 pub const SANDBOX_NOT_CONNECTED: &str =
     "Sandbox is not connected. Reconnect to start it and restore the connection.";
 
-fn supported_remote_method(method: &str) -> bool {
+pub(crate) fn supported_remote_method(method: &str) -> bool {
     matches!(
         method,
         "environment.describe"
@@ -545,6 +793,14 @@ fn supported_remote_method(method: &str) -> bool {
             | "commands.dispatch"
             | "attachments.upload"
             | "attachments.read"
+            | "uploads.begin"
+            | "uploads.chunk"
+            | "uploads.commit"
+            | "uploads.discard"
+            | "kit.probe"
+            | "kit.apply"
+            | "kit.secrets"
+            | "kit.health"
             | "devices.revokeSelf"
             | "git.diff"
             | "git.branches"
@@ -564,6 +820,8 @@ fn supported_remote_method(method: &str) -> bool {
             | "git.index"
             | "git.fileDiff"
             | "git.action"
+            | "workspace.applySnapshot"
+            | "sessions.import"
     )
 }
 
@@ -577,6 +835,14 @@ fn cloud_or_plain_bootstrap(target: &SshTarget, platform: ssh::HostPlatform) -> 
     }
 }
 
+/// Drops the finished jobs that have been kept longer than [`FINISHED_JOB_KEEP`] as of `now`.
+fn prune_finished_jobs_at(jobs: &mut HashMap<String, Arc<Job>>, now: std::time::Instant) {
+    jobs.retain(|_, job| {
+        job.finished_at()
+            .is_none_or(|at| now.saturating_duration_since(at) < FINISHED_JOB_KEEP)
+    });
+}
+
 impl Connections {
     fn start_ssh_job(
         self: &Arc<Self>,
@@ -585,23 +851,53 @@ impl Connections {
         existing: Option<StoredMachine>,
         upgrade: bool,
     ) -> Result<String, String> {
+        self.start_ssh_job_guarded(target, name, existing, upgrade, false)
+    }
+
+    /// [`Self::start_ssh_job`]. With `after_pairing_guard` (the cloud start path), a job for
+    /// the same target that finished with a machine within [`JUST_PAIRED_WINDOW`] makes the
+    /// start wait (SSH_BUSY): that job committed its machine before it was marked done, so the
+    /// start's next look at the store finds it and wakes it instead of pairing a second time.
+    fn start_ssh_job_guarded(
+        self: &Arc<Self>,
+        target: SshTarget,
+        name: String,
+        existing: Option<StoredMachine>,
+        upgrade: bool,
+        after_pairing_guard: bool,
+    ) -> Result<String, String> {
         ssh::check_target(&target)?;
-        let job = Job::new();
+        let job = Job::for_target(target.job_target());
         let id = job.view().id;
         {
             let mut jobs = self
                 .jobs
                 .lock()
                 .map_err(|_| "Connection setup is unavailable")?;
-            if jobs.values().any(|job| !job.view().done) {
+            prune_finished_jobs_at(&mut jobs, std::time::Instant::now());
+            // Check and insert under one lock, so two starts cannot both pass.
+            let key_ready = ssh::codespace_key_exists();
+            if jobs.values().any(|active| {
+                !active.view().done && ssh::jobs_conflict(job.target(), active.target(), key_ready)
+            }) {
                 return Err(SSH_BUSY.into());
             }
-            jobs.retain(|_, job| !job.view().done);
+            if after_pairing_guard
+                && jobs.values().any(|done| {
+                    done.target() == job.target()
+                        && done.view().machine.is_some()
+                        && done
+                            .finished_at()
+                            .is_some_and(|at| at.elapsed() < JUST_PAIRED_WINDOW)
+                })
+            {
+                return Err(SSH_BUSY.into());
+            }
             jobs.insert(id.clone(), job.clone());
         }
         let state = self.clone();
         std::thread::spawn(move || {
-            let prepared = (|| -> Result<(StoredMachine, Tunnel), String> {
+            let prepared = (|| -> Result<(StoredMachine, Tunnel, Value), String> {
                 let askpass = job.askpass()?;
                 let mut target = target;
                 let cloud = target.is_cloud();
@@ -693,6 +989,8 @@ impl Connections {
                         environment_id,
                         token,
                         ssh: Some(target.clone()),
+                        pending_host_upgrade: false,
+                        swap_nonce: None,
                     }
                 };
                 job.message("Opening the secure connection…");
@@ -716,12 +1014,8 @@ impl Connections {
                     );
                 }
                 if upgrade {
-                    let capabilities = descriptor.get("capabilities").and_then(Value::as_array);
-                    let supports = |name: &str| {
-                        capabilities.is_some_and(|entries| {
-                            entries.iter().any(|entry| entry.as_str() == Some(name))
-                        })
-                    };
+                    let info = host_info::HostInfo::from_descriptor(&descriptor);
+                    let supports = |name: &str| info.supports(name);
                     if !supports("git.index")
                         || !supports("files.list")
                         || !supports("files.create")
@@ -739,30 +1033,46 @@ impl Connections {
                         .take(100)
                         .collect();
                 }
-                Ok((machine, tunnel))
+                Ok((machine, tunnel, descriptor))
             })();
             job.complete(|| {
-                let (mut machine, tunnel) = prepared?;
-                let _guard = state
-                    .store
-                    .lock()
-                    .map_err(|_| "Connection store is locked")?;
-                let path = state.store_path();
-                let mut machines = read(&path)?;
-                if let Some(old) = machines
-                    .iter()
-                    .find(|m| m.environment_id == machine.environment_id)
-                {
-                    machine.id = old.id.clone();
-                }
-                machines.retain(|m| m.id != machine.id);
-                machines.push(machine.clone());
-                write(&path, &machines)?;
+                let (machine, tunnel, descriptor) = prepared?;
+                let machine = state.commit_machine(machine, &descriptor)?;
                 state.tunnels.insert(machine.id.clone(), tunnel);
                 Ok(machine.public())
             });
         });
         Ok(id)
+    }
+
+    /// Saves a machine set up over SSH. An already saved machine with the same environment
+    /// keeps its id, and the Host info is recorded under that final id only: the id the job
+    /// started with is provisional and must leave nothing behind.
+    fn commit_machine(
+        &self,
+        mut machine: StoredMachine,
+        descriptor: &Value,
+    ) -> Result<StoredMachine, String> {
+        let _guard = self
+            .store
+            .lock()
+            .map_err(|_| "Connection store is locked")?;
+        let path = self.store_path();
+        let mut machines = read(&path)?;
+        let provisional = machine.id.clone();
+        if let Some(old) = machines
+            .iter()
+            .find(|m| m.environment_id == machine.environment_id)
+        {
+            machine.id = old.id.clone();
+            machine.pending_host_upgrade |= old.pending_host_upgrade;
+        }
+        machines.retain(|m| m.id != machine.id);
+        machines.push(machine.clone());
+        write(&path, &machines)?;
+        self.host_info.drop_machine(&provisional);
+        self.host_info.record(&machine.id, descriptor);
+        Ok(machine)
     }
 
     pub fn ssh_begin(
@@ -793,12 +1103,31 @@ impl Connections {
         name: &str,
         display_name: Option<&str>,
     ) -> Result<String, String> {
+        self.codespace_begin_with(name, display_name, false)
+    }
+
+    /// [`Self::codespace_begin`] for the cloud start path, which must not pair a codespace
+    /// that a job it waited for has just paired.
+    pub(crate) fn codespace_begin_for_start(
+        self: &Arc<Self>,
+        name: &str,
+        display_name: Option<&str>,
+    ) -> Result<String, String> {
+        self.codespace_begin_with(name, display_name, true)
+    }
+
+    fn codespace_begin_with(
+        self: &Arc<Self>,
+        name: &str,
+        display_name: Option<&str>,
+        after_pairing_guard: bool,
+    ) -> Result<String, String> {
         let name = ssh::validate_codespace(name)?;
         let display = display_name
             .map(|d| d.trim().chars().take(100).collect::<String>())
             .filter(|d| !d.is_empty())
             .unwrap_or_else(|| name.clone());
-        self.start_ssh_job(
+        self.start_ssh_job_guarded(
             SshTarget {
                 target: name.clone(),
                 port: None,
@@ -809,6 +1138,7 @@ impl Connections {
             display,
             None,
             false,
+            after_pairing_guard,
         )
     }
 
@@ -914,7 +1244,7 @@ impl Connections {
             let job = self.start_when_free(cancel, JOB_SLOT_WAIT, || {
                 self.codespace_reconnect(machine_id)
             })?;
-            loop {
+            let woke = loop {
                 if cancel.load(Ordering::Relaxed) {
                     let _ = self.ssh_cancel(&job);
                     // The job thread stops within moments; let it finish so an
@@ -929,17 +1259,22 @@ impl Connections {
                 }
                 let view = self.ssh_poll(&job)?;
                 if view.done {
-                    return view.error.map_or(Ok(()), Err);
+                    break view.error.map_or(Ok(()), Err);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
-            }
+            };
+            woke?;
+            // Phase 2 of the Host upgrade. This is a user-initiated connect (a send, a
+            // retry), so it may run; a failure is a warning line, never an error.
+            self.upgrade_host_if_needed(machine_id, None, cancel, progress);
+            Ok(())
         })
     }
 
     /// SSH setup runs one job at a time. Instead of failing while another
     /// job (a pairing, a wake of another machine, a just-cancelled wake) holds
     /// the slot, wait for it, bounded and cancellable.
-    fn start_when_free(
+    pub(crate) fn start_when_free(
         &self,
         cancel: &AtomicBool,
         limit: std::time::Duration,
@@ -1131,6 +1466,113 @@ mod tests {
     }
 
     #[test]
+    fn host_info_follows_connect_describe_and_disconnect() {
+        let upstream = json!({ "result": { "protocolVersion": 1, "environmentId": "env", "capabilities": ["files.list"] }});
+        let fork = json!({ "result": {
+            "protocolVersion": 1,
+            "environmentId": "env",
+            "host": { "flavor": "monoptah", "version": "1.1.0" },
+            "capabilities": ["files.list", "files.readBytes"],
+        }});
+        let (url, _requests, server) = host_fixture(vec![upstream, fork]);
+        let dir = tempfile::tempdir().unwrap();
+        let connections = Connections::new(dir.path());
+        assert_eq!(connections.host_info("nobody"), None);
+        let machine = connections.connect("".into(), url, "a".repeat(43)).unwrap();
+        // An upstream describe has no `host` field.
+        let info = connections.host_info(&machine.id).unwrap();
+        assert_eq!(info.flavor, "upstream");
+        assert_eq!(info.version, None);
+        assert!(!info.supports("files.readBytes"));
+        // A fork describe replaces the entry.
+        let info = connections.describe_host(&machine.id).unwrap();
+        assert!(info.is_monoptah());
+        assert_eq!(info.version.as_deref(), Some("1.1.0"));
+        assert!(info.supports("files.readBytes"));
+        assert_eq!(connections.host_info(&machine.id), Some(info));
+        // Disconnecting drops it.
+        connections.disconnect(&machine.id).unwrap();
+        assert_eq!(connections.host_info(&machine.id), None);
+        server.join().unwrap();
+    }
+
+    fn stored(id: &str, environment: &str, ssh: Option<SshTarget>) -> StoredMachine {
+        StoredMachine {
+            id: id.into(),
+            name: id.into(),
+            endpoint: "https://host.example".into(),
+            environment_id: environment.into(),
+            token: "t".repeat(43),
+            ssh,
+            pending_host_upgrade: false,
+            swap_nonce: None,
+        }
+    }
+    fn codespace_target() -> SshTarget {
+        SshTarget {
+            target: "cs".into(),
+            port: None,
+            remote_port: 3774,
+            codespace: Some("cs".into()),
+            sandbox: None,
+        }
+    }
+
+    #[test]
+    fn a_re_added_machine_keeps_only_the_host_info_under_its_final_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let connections = Connections::new(dir.path());
+        write(
+            &connections.store_path(),
+            &[stored("old", "env", Some(codespace_target()))],
+        )
+        .unwrap();
+        connections
+            .host_info
+            .record("old", &json!({"capabilities": ["stale"]}));
+        // The job started under a provisional id and recorded nothing yet.
+        let fork = json!({"host": {"flavor": "monoptah", "version": "1.1.0"}, "capabilities": ["uploads"]});
+        connections.host_info.record("provisional", &fork);
+        let machine = connections
+            .commit_machine(
+                stored("provisional", "env", Some(codespace_target())),
+                &fork,
+            )
+            .unwrap();
+        assert_eq!(machine.id, "old");
+        assert_eq!(connections.host_info.get("provisional"), None);
+        let info = connections.host_info.get("old").unwrap();
+        assert!(info.is_monoptah());
+        assert!(info.supports("uploads") && !info.supports("stale"));
+        assert_eq!(connections.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn host_info_of_a_tunnelled_machine_without_a_live_tunnel_is_not_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let connections = Arc::new(Connections::new(dir.path()));
+        write(
+            &connections.store_path(),
+            &[
+                stored("cloud", "env-1", Some(codespace_target())),
+                stored("direct", "env-2", None),
+            ],
+        )
+        .unwrap();
+        let info = json!({"capabilities": ["files.readBytes"]});
+        connections.host_info.record("cloud", &info);
+        connections.host_info.record("direct", &info);
+        // A direct machine has no tunnel to lose.
+        assert!(connections.host_info("direct").is_some());
+        // No live tunnel: no answer, and the stale entry is gone.
+        assert_eq!(connections.host_info("cloud"), None);
+        assert_eq!(connections.host_info.get("cloud"), None);
+        // The seam used by file viewing then reports the not-connected answer.
+        let error = crate::cloud_sessions::Host::host_info(&connections, "cloud").unwrap_err();
+        assert_eq!(error, CODESPACE_NOT_CONNECTED);
+    }
+
+    #[test]
     fn connecting_same_host_keeps_identity_and_scopes_authenticated_requests() {
         let descriptor =
             json!({ "result": { "protocolVersion": 1, "environmentId": "env", "name": "Server" }});
@@ -1238,11 +1680,13 @@ mod tests {
             );
             return;
         };
-        let describe =
-            json!({ "result": { "protocolVersion": 1, "environmentId": "env-cs", "name": "Host" }});
+        // A current fork Host, so the connect-time upgrade check leaves it alone.
+        let describe = json!({ "result": { "protocolVersion": 1, "environmentId": "env-cs", "name": "Host", "host": {"flavor": "monoptah", "version": "1.1.0"} }});
         let (url, _requests, server) = host_fixture(vec![
             describe.clone(),
             describe.clone(),
+            describe.clone(),
+            // The upgrade check after the explicit wake reads the Host once more.
             describe.clone(),
             json!({ "result": { "projects": [] } }),
             describe,
@@ -1392,14 +1836,123 @@ else:
                 let _ = stream.read(&mut buffer);
             }
         });
-        let call = |dead| rpc_with(&endpoint, "t", None, "projects.list", json!({}), dead);
+        let call = |dead| rpc_with(&endpoint, "t", None, "projects.list", json!({}), None, dead);
         assert!(call(true)
             .unwrap_err()
             .starts_with("Machine is unreachable"));
-        assert!(call(false)
-            .unwrap_err()
-            .starts_with("The host request did not complete"));
+        let error = call(false).unwrap_err();
+        assert!(
+            error.starts_with("The host request did not complete ("),
+            "{error}"
+        );
+        assert!(!error.contains("no answer within"), "{error}");
+        assert!(!error.contains('\n'));
         server.join().unwrap();
+    }
+
+    /// A server that accepts, reads the request, and answers only after `delay`. It returns
+    /// whether the client had already hung up when it woke (so a late reply goes nowhere).
+    fn slow_server(delay: std::time::Duration) -> (String, std::thread::JoinHandle<bool>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0; 4096];
+            let _ = stream.read(&mut buffer);
+            std::thread::sleep(delay);
+            // The request body may arrive in a second segment: drain it, then expect EOF.
+            let hung_up = loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => break true,
+                    Ok(_) => {}
+                }
+            };
+            let body = r#"{"result":{"late":true}}"#;
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            hung_up
+        });
+        (endpoint, server)
+    }
+
+    #[test]
+    fn a_timeout_on_a_long_operation_says_it_may_still_be_running() {
+        let (endpoint, server) = slow_server(std::time::Duration::from_millis(600));
+        let started = std::time::Instant::now();
+        let error = rpc_with(
+            &endpoint,
+            "t",
+            None,
+            "workspace.run",
+            json!({}),
+            Some(std::time::Duration::from_millis(150)),
+            false,
+        )
+        .unwrap_err();
+        // The passed limit applied (not the 30 s default).
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(error, MAY_STILL_RUN);
+        // The client dropped the connection, so the late reply is never read.
+        assert!(server.join().unwrap(), "the client should have hung up");
+    }
+
+    #[test]
+    fn the_limits_are_120_for_push_and_pull_200_for_sync_and_30_otherwise() {
+        assert_eq!(GIT_REMOTE_TIMEOUT, std::time::Duration::from_secs(120));
+        assert_eq!(GIT_SYNC_TIMEOUT, std::time::Duration::from_secs(200));
+        assert_eq!(DEFAULT_RPC_TIMEOUT, std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn an_ordinary_request_that_times_out_is_a_plain_incomplete_request() {
+        let (endpoint, server) = slow_server(std::time::Duration::from_millis(600));
+        let error = rpc_with_default(
+            &endpoint,
+            "t",
+            None,
+            "projects.list",
+            json!({}),
+            None,
+            false,
+            std::time::Duration::from_millis(150),
+        )
+        .unwrap_err();
+        assert!(
+            error.starts_with("The host request did not complete"),
+            "{error}"
+        );
+        assert_ne!(error, MAY_STILL_RUN);
+        assert!(error.contains("no answer within 1 s"), "{error}");
+        assert!(error.contains("may still be working"), "{error}");
+        assert!(server.join().unwrap());
+    }
+
+    #[test]
+    fn transport_detail_is_one_short_line_without_userinfo() {
+        assert_eq!(
+            strip_userinfo("x http://user:pw@127.0.0.1:1/rpc y"),
+            "x http://127.0.0.1:1/rpc y"
+        );
+        let error = ureq::get("http://user:secret@127.0.0.1:1/rpc")
+            .call()
+            .unwrap_err();
+        let detail = transport_detail(&error);
+        assert!(!detail.contains("secret"), "{detail}");
+        assert!(!detail.contains('\n'));
+        assert!(detail.chars().count() <= 203);
+    }
+
+    #[test]
+    fn only_errors_after_connecting_can_mean_the_request_was_sent() {
+        assert!(may_have_been_sent(ureq::ErrorKind::Io));
+        assert!(!may_have_been_sent(ureq::ErrorKind::ConnectionFailed));
+        assert!(!may_have_been_sent(ureq::ErrorKind::Dns));
+        assert!(!may_have_been_sent(ureq::ErrorKind::InvalidUrl));
     }
 
     #[test]
@@ -1531,7 +2084,13 @@ else:
             "git.worktreeCreate",
             "attachments.upload",
             "attachments.read",
+            "uploads.begin",
+            "uploads.chunk",
+            "uploads.commit",
+            "uploads.discard",
             "files.readBytes",
+            "workspace.applySnapshot",
+            "sessions.import",
         ] {
             assert!(supported_remote_method(method), "{method}");
         }
@@ -1565,6 +2124,8 @@ else:
             environment_id: "env".into(),
             token: "secret".into(),
             ssh: None,
+            pending_host_upgrade: false,
+            swap_nonce: None,
         };
         let value = serde_json::to_string(&stored.public()).unwrap();
         assert!(!value.contains("secret"));

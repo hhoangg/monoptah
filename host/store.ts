@@ -18,6 +18,7 @@ export class HostStore {
   readonly db: DatabaseSync;
   readonly environmentId: string;
   readonly attachmentDir: string;
+  readonly uploadDir: string;
   // This process is the only session writer, so recently used snapshots are
   // served from memory instead of re-parsing whole transcripts. Callers must
   // treat returned values as immutable.
@@ -25,6 +26,7 @@ export class HostStore {
 
   constructor(path: string) {
     this.attachmentDir = join(dirname(path), "attachments");
+    this.uploadDir = join(dirname(path), "uploads");
     this.db = new DatabaseSync(path);
     this.db
       .exec(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;

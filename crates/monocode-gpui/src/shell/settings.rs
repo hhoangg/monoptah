@@ -481,6 +481,17 @@ impl Shell {
             monos.update(cx, |monos, cx| monos.sweep_auto_resume(cx));
         }
     }
+    /// Starts that run on a worker, and the app API, read the Claude setup choice from the
+    /// published copy. It must be there BEFORE a resumed start runs, or that start would read
+    /// the default (off) and skip the step for good. Tests do not publish: the slot is
+    /// process-wide, and one test's choice must not reach another's service.
+    pub(super) fn publish_kit_prefs(&self) {
+        #[cfg(not(test))]
+        monocode_core::cloud_sessions::kit_prefs::publish(
+            self.workspace.preferences.cloud_kit.clone(),
+        );
+    }
+
     pub(super) fn apply_preferences(&mut self, cx: &mut Context<Self>) {
         self.refresh_notification_permission();
         self.configure_quick_composer(cx);
@@ -510,6 +521,7 @@ impl Shell {
         // After the keymap, so the menu shows rebound shortcuts.
         crate::app_menu::install(&self.workspace.preferences, cx);
         cx.set_global(self.workspace.preferences.clone());
+        self.publish_kit_prefs();
         self.sweep_auto_resume(cx);
         self.sync_right_panel(cx);
         if let Some(center) = crate::accounts::get(cx) {
@@ -880,6 +892,36 @@ mod tests {
             .unwrap();
     }
     #[gpui::test]
+    fn the_cloud_page_is_always_in_the_rail(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            cx.set_global(crate::cloud_kit_ui::KitScanner(
+                crate::cloud_kit_ui::fixture::scan,
+            ));
+        });
+        let (window, _, _) = window(cx);
+        window
+            .update(cx, |shell, w, cx| {
+                shell.open_settings(Section::General, w, cx)
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("settings-nav-mcp").is_some());
+        visual.refresh().unwrap();
+        let row = visual.debug_bounds("settings-nav-cloud").unwrap();
+        visual.simulate_click(row.center(), Default::default());
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, cx| {
+                assert_eq!(
+                    shell.settings.as_ref().unwrap().read(cx).section,
+                    Section::Cloud
+                )
+            })
+            .unwrap();
+    }
+    #[gpui::test]
     fn settings_nav_search_steps_through_results_with_arrows(cx: &mut TestAppContext) {
         cx.update(|cx| {
             super::super::bind_keys(cx);
@@ -924,7 +966,7 @@ mod tests {
             .update(cx, |shell, w, cx| shell.focus_active(w, cx))
             .unwrap();
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        visual.simulate_keystrokes("cmd-,");
+        visual.simulate_keystrokes("secondary-,");
         visual.run_until_parked();
         let card = visual.debug_bounds("main-pane-frame").unwrap();
         let header = visual.debug_bounds("settings-header").unwrap();
@@ -994,7 +1036,7 @@ mod tests {
             .update(cx, |shell, w, cx| shell.focus_active(w, cx))
             .unwrap();
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        visual.simulate_keystrokes("cmd-,");
+        visual.simulate_keystrokes("secondary-,");
         visual.run_until_parked();
         let back = visual.debug_bounds("settings-nav-back").unwrap();
         let search = visual.debug_bounds("settings-search").unwrap();
@@ -1083,7 +1125,7 @@ mod tests {
         visual.run_until_parked();
         let recorder = visual.debug_bounds("shortcut-App: Settings").unwrap();
         visual.simulate_click(recorder.center(), Default::default());
-        visual.simulate_keystrokes("cmd-k");
+        visual.simulate_keystrokes("secondary-k");
         visual.run_until_parked();
         window
             .update(visual, |shell, _, _| {
@@ -1097,7 +1139,7 @@ mod tests {
                 )
             })
             .unwrap();
-        visual.simulate_keystrokes("cmd-alt-y");
+        visual.simulate_keystrokes("secondary-alt-y");
         visual.run_until_parked();
         window
             .update(visual, |shell, _, _| {
@@ -1114,14 +1156,14 @@ mod tests {
         window
             .update(visual, |shell, _, _| assert!(shell.settings.is_none()))
             .unwrap();
-        visual.simulate_keystrokes("cmd-,");
+        visual.simulate_keystrokes("secondary-,");
         visual.run_until_parked();
         window
             .update(visual, |shell, _, _| {
                 assert!(shell.settings.is_none(), "old chord is removed")
             })
             .unwrap();
-        visual.simulate_keystrokes("cmd-alt-y");
+        visual.simulate_keystrokes("secondary-alt-y");
         visual.run_until_parked();
         window
             .update(visual, |shell, _, _| {
@@ -1142,7 +1184,7 @@ mod tests {
         visual.run_until_parked();
         visual.simulate_keystrokes("escape");
         visual.run_until_parked();
-        visual.simulate_keystrokes("cmd-,");
+        visual.simulate_keystrokes("secondary-,");
         visual.run_until_parked();
         window
             .update(visual, |shell, _, _| {

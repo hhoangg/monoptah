@@ -223,6 +223,7 @@ impl Shell {
             && !matches!(
                 call.action.as_str(),
                 "models.list"
+                    | "accounts.list"
                     | "sessions.list"
                     | "sessions.read"
                     | "folders.list"
@@ -497,6 +498,9 @@ impl Shell {
                 );
                 return;
             }
+            "accounts.list" => crate::accounts::get(cx)
+                .ok_or_else(|| "Provider accounts are unavailable".to_owned())
+                .and_then(|center| center.read(cx).app_list(&input)),
             "models.list" => {
                 let profiles: Vec<_> = Kind::ALL
                     .into_iter()
@@ -660,6 +664,16 @@ impl Shell {
                     }) {
                     Err(e) => Err(e),
                     Ok((id, view)) => {
+                        if matches!(action.as_str(), "sessions.send" | "sessions.draft")
+                            && view.read(cx).move_locked()
+                        {
+                            self.finish_app_call(
+                                call,
+                                Err(crate::conversation::MOVE_PAUSED.into()),
+                                cx,
+                            );
+                            return;
+                        }
                         if matches!(action.as_str(), "sessions.send" | "sessions.draft")
                             && (self.cloud_busy.contains(&id) || view.read(cx).cloud_locked)
                         {
@@ -991,6 +1005,7 @@ fn mutating(action: &str) -> bool {
     !matches!(
         action,
         "models.list"
+            | "accounts.list"
             | "today.current"
             | "sessions.list"
             | "sessions.read"

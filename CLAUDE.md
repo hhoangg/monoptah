@@ -37,6 +37,10 @@ Also confirm `src-tauri/tauri.conf.json` still has `productName: "Monoptah"`,
 `identifier: "com.monoptah.desktop"`, and the updater `pubkey` and fork `endpoints` —
 an upstream change to that file is the one most likely to hand the app back to MonoCode.
 
+If upstream changed `host/`, bump `host/VERSION` and cut a Host release (see "Releasing the
+Host"). Give any new upstream Host workflow job the
+`if: github.repository == 'hardbeat920/monocode'` gate.
+
 ## Never rename these
 
 They are identifiers, not branding. Changing them breaks working installs:
@@ -100,6 +104,34 @@ The updater private key lives at `~/.config/monoptah/updater.key` and is **not**
 repo. Losing it means no further updates can be published to installed apps — they only
 trust that one key, so a replacement key would strand them.
 
+### Releasing the Host
+
+The fork publishes its own remote Host (`host/`), separately from both apps. Its version lives
+in `host/VERSION` as `X.Y.Z+monoptah` (semver build metadata marks the fork flavor); the root
+`package.json` version is not used. `monocode-host --version` prints it and
+`environment.describe` reports `host: {flavor: "monoptah", version: "X.Y.Z"}`.
+
+1. `npm run host:release -- X.Y.Z` (plain `X.Y.Z`): needs a clean tree, writes `host/VERSION`,
+   commits "Release Monoptah Host X.Y.Z" and creates the tag `host-vX.Y.Z`. It never pushes; it
+   prints the push commands for you to review and run.
+2. Pushing the tag starts `.github/workflows/host-release-monoptah.yml`. It checks the tag
+   against `host/VERSION`, refuses when the release already exists, builds every target of
+   `npm run host:package -- --all` (Linux and macOS `.tar.gz`, Windows `.zip`, asset names keep
+   `monocode-host`), and publishes release `host-vX.Y.Z` with `--latest=false` (never "latest":
+   Tauri's updater reads `releases/latest`). It uploads each package with its `.sha256` and
+   `host-release.json` (`{version, assets: {target: sha256}}`, also a workflow artifact with a
+   build-provenance attestation).
+3. Never re-upload a version: the app pins the sha256 of every asset. To redo a failed release,
+   bump the version.
+4. The app pins the Host version, URL base and hashes (H2a, `host_release.rs`, written by
+   `scripts/pin-host-release.mjs` from the run's `host-release.json`). Release the Host before
+   the app that pins it.
+
+Note: the paused Tauri `release.yml` still packages the Host, but those packages now report
+`X.Y.Z+monoptah` while the Tauri app's bootstrap expects its own version. A Tauri release cut
+after H1 would fail to install the Host until the Tauri bootstrap is handled (H2a covers the
+native app only).
+
 ### Releasing the native app
 
 Monoptah Native (GPUI) ships for macOS arm64 (ad-hoc signed, not notarized), Linux x86_64 and
@@ -107,10 +139,13 @@ Windows x86_64 (unsigned installer). It releases separately from the Tauri app. 
 runs on GitHub Actions (hosted macOS runners are not being acquired): the macOS app is checked,
 built and packaged on the maintainer's Mac, everything else is on CI.
 
-What CI checks (`native.yml`): `monocode-core` clippy and tests on Linux and Windows, and GPUI
-with `fmt` (Linux) and `cargo check --all-targets` (Linux and Windows). GPUI clippy
-`-D warnings`, the GPUI tests and everything macOS run locally in `npm run native:check`,
-which `native:release:mac` runs.
+What CI checks (`native.yml`): `monocode-core` clippy and tests plus `native:test:dev` on Linux
+and Windows, GPUI `fmt`, clippy `-D warnings` and tests on Linux, and GPUI `cargo check
+--all-targets` on Windows. During development the local remainder is `npm run native:check:mac`
+(clippy of the macOS-only code that Linux and Windows never compile); when you change macOS-only
+code or tests gated to macOS, also run the tests you touched on macOS. `npm run native:check`
+(the full gate, including the GPUI tests on macOS) still runs locally in `native:release:mac`
+before every release.
 
 1. Edit `docs/native/monoptah-release-notes.md` (its first line must be
    `# Monoptah Native X.Y.Z`) and merge it into main through a PR.

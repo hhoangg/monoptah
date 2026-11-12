@@ -95,6 +95,21 @@ pub const HARNESS: &str = "claude";
 pub const STATE_TTL: Duration = Duration::from_secs(30);
 const UNSUPPORTED_HARNESS: &str = "Cloud sessions support Claude only for now.";
 
+/// Drops the `\\?\` prefix of a Windows drive path (`\\?\D:\x` becomes `D:\x`).
+/// `fs::canonicalize` returns that verbatim form there, and Git reads it as a remote host
+/// when it is used as a URL. Every other path is returned unchanged.
+pub(crate) fn plain_path(path: std::path::PathBuf) -> std::path::PathBuf {
+    let plain = {
+        let text = path.as_os_str().to_str().unwrap_or_default();
+        text.strip_prefix(r"\\?\")
+            .filter(|rest| {
+                matches!(rest.as_bytes(), [drive, b':', b'\\', ..] if drive.is_ascii_alphabetic())
+            })
+            .map(std::path::PathBuf::from)
+    };
+    plain.unwrap_or(path)
+}
+
 /// True when `error` is `Connections::request`'s "codespace is not connected"
 /// or "sandbox is not connected".
 pub fn is_not_connected(error: &str) -> bool {
@@ -191,6 +206,12 @@ struct OpenRequest<'a> {
     display: &'a str,
     repo: &'a str,
     remote_cwd: &'a str,
+    /// The sandbox's Claude prelude, so the Host upgrade restarts the Host with the same
+    /// credential the connect step gave it. `None` for a codespace.
+    auth: Option<remote::host_upgrade::SandboxAuth<'a>>,
+    /// The Claude setup to run before the project is handed over, for a start that created
+    /// its workspace. `None` for everything else (an attach, a reconnect, the kit off).
+    setup: Option<claude_setup::SetupPlan>,
 }
 
 /// Step (c) of a start: connect (pair, or wake an already paired machine), open the project,
@@ -221,7 +242,12 @@ fn open_project(
         Some(machine) if request.sandbox.is_some() => {
             progress("Reconnecting to the sandbox");
             host.disconnect(&machine.id)?;
-            host.connect_sandbox(request.sandbox.cloned().unwrap(), request.display, progress)?
+            host.connect_sandbox(
+                request.sandbox.cloned().unwrap(),
+                request.display,
+                halt,
+                progress,
+            )?
         }
         Some(machine) => {
             progress(&format!("Connecting to the {}", request.cloud.noun()));
@@ -229,10 +255,15 @@ fn open_project(
             machine
         }
         None => match request.sandbox {
-            Some(sandbox) => host.connect_sandbox(sandbox.clone(), request.display, progress)?,
-            None => host.connect(&request.cloud.name, request.display, progress)?,
+            Some(sandbox) => {
+                host.connect_sandbox(sandbox.clone(), request.display, halt, progress)?
+            }
+            None => host.connect(&request.cloud.name, request.display, halt, progress)?,
         },
     };
+    // Phase 2 of the Host upgrade, inside this user-initiated connect. Never fatal: a
+    // deferral or a failure is a status line and the session goes on with the Host it has.
+    host.upgrade_host(&machine.id, request.auth, halt, progress);
     step(StepKind::Connect, StepStatus::Done);
     if aborted() {
         return Err(START_ABORTED.into());
@@ -254,6 +285,30 @@ fn open_project(
     }
     if aborted() {
         return Err(START_ABORTED.into());
+    }
+    // One way, once, and only for a workspace this start created. It never fails the start:
+    // `run` turns every problem into a warning.
+    if let Some(plan) = &request.setup {
+        step(startup::StepKind::ClaudeSetup, startup::StepStatus::Running);
+        let env = claude_setup::Env {
+            host,
+            store,
+            halt,
+            now: crate::time::now_ms(),
+        };
+        let target = claude_setup::Target {
+            local_project: request.local_cwd,
+            cloud: request.cloud,
+            machine_id: &machine.id,
+            project_id: project.get("id").and_then(Value::as_str),
+        };
+        claude_setup::run(&env, &target, plan, progress);
+        // A halted run may have stopped before anything was sent: leave the step Running so
+        // a retry runs it again, instead of recording a setup that never happened.
+        if aborted() {
+            return Err(START_ABORTED.into());
+        }
+        step(startup::StepKind::ClaudeSetup, startup::StepStatus::Done);
     }
     let remembered = store
         .lock()
@@ -328,6 +383,26 @@ pub struct CloudSession {
     pub needs_input: bool,
 }
 
+/// A local session whose location is Cloud, as the sidebar needs it besides the
+/// [`CloudSession`] row: the move point (rewind gating) and the durable sync error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocatedSession {
+    pub id: i64,
+    pub moved_at_row: usize,
+    /// Why the session needs attention, which makes the shell offer "Reset to local": the
+    /// stored row-append error, an unreadable location, or a missing Host record. A session
+    /// that runs fine has none.
+    pub sync_error: Option<String>,
+    /// The stored location cannot be read (the session fails closed).
+    pub unreadable: bool,
+    /// The Host side is running a turn (or waits for input): resetting now would leave two
+    /// writers.
+    pub host_active: bool,
+    /// The cloud copy may hold turns that were not copied here (see
+    /// `Store::cloud_may_hold_unsynced`): Reset asks with the stronger text.
+    pub unsynced: bool,
+}
+
 /// Displayable codespace lifecycle state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CloudState {
@@ -366,11 +441,14 @@ impl CloudState {
 /// Machine/transport seam over [`Connections`] so the service is testable.
 pub trait Host: Send + Sync {
     fn machines(&self) -> Result<Vec<Machine>, String>;
-    /// Pair with a codespace (starting it via gh if needed); blocks until done.
+    /// Pair with a codespace (starting it via gh if needed); blocks until done. Waits for a
+    /// free SSH setup slot instead of failing; setting `halt` stops the wait or the setup with
+    /// [`START_ABORTED`].
     fn connect(
         &self,
         codespace: &str,
         display: &str,
+        halt: &AtomicBool,
         progress: &mut dyn FnMut(&str),
     ) -> Result<Machine, String>;
     /// Pair with the Host in a Docker Sandbox's devcontainer; blocks until done. The relay
@@ -379,9 +457,10 @@ pub trait Host: Send + Sync {
         &self,
         sandbox: SandboxTarget,
         display: &str,
+        halt: &AtomicBool,
         progress: &mut dyn FnMut(&str),
     ) -> Result<Machine, String> {
-        let _ = (sandbox, display, progress);
+        let _ = (sandbox, display, halt, progress);
         Err("This host cannot connect to a Docker sandbox.".into())
     }
     /// Wake the codespace and reconnect if needed (blocking, no-op when
@@ -401,7 +480,56 @@ pub trait Host: Send + Sync {
         progress: &mut dyn FnMut(&str),
     ) -> Result<(), String>;
     fn request(&self, machine_id: &str, method: &str, params: Value) -> Result<Value, String>;
+    /// [`Self::request`] with a limit for a long operation (`None` = the default). Never wakes
+    /// anything. The default ignores the limit.
+    fn request_timeout(
+        &self,
+        machine_id: &str,
+        method: &str,
+        params: Value,
+        timeout: Option<Duration>,
+    ) -> Result<Value, String> {
+        let _ = timeout;
+        self.request(machine_id, method, params)
+    }
+    /// Flavor, version and capabilities of the machine's Host. The default asks the Host
+    /// (`environment.describe`); [`Connections`] answers from its cache once it has one.
+    fn host_info(&self, machine_id: &str) -> Result<crate::remote::host_info::HostInfo, String> {
+        let described = self.request(machine_id, "environment.describe", serde_json::json!({}))?;
+        Ok(crate::remote::host_info::HostInfo::from_descriptor(
+            &described,
+        ))
+    }
+    /// Where the Host update of this machine stands, for a file only a newer Host can send.
+    /// The default knows nothing, so a cloud Host is said to update at its next connect.
+    fn host_update(&self, machine_id: &str) -> view::HostUpdate {
+        let _ = machine_id;
+        view::HostUpdate::NextConnect
+    }
+    /// Phase 2 of the cloud Host upgrade (see [`remote::host_upgrade`]): replaces an older or
+    /// foreign Host when nothing runs on it, else marks the machine for the next connect.
+    /// Only a user-initiated connect or start flow may call it. Never fails: a warning is a
+    /// `progress` line. The default does nothing.
+    fn upgrade_host(
+        &self,
+        machine_id: &str,
+        auth: Option<remote::host_upgrade::SandboxAuth<'_>>,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(&str),
+    ) -> remote::host_upgrade::Outcome {
+        let _ = (machine_id, auth, cancel, progress);
+        remote::host_upgrade::Outcome::Current
+    }
     fn disconnect(&self, machine_id: &str) -> Result<(), String>;
+}
+
+/// A halted wait for the SSH slot ends the start the way every other halted step does.
+fn start_error(error: String) -> String {
+    if error == remote::WAKE_CANCELLED {
+        START_ABORTED.into()
+    } else {
+        error
+    }
 }
 
 impl Host for Arc<Connections> {
@@ -412,19 +540,48 @@ impl Host for Arc<Connections> {
         &self,
         codespace: &str,
         display: &str,
+        halt: &AtomicBool,
         progress: &mut dyn FnMut(&str),
     ) -> Result<Machine, String> {
-        let job = self.codespace_begin(codespace, Some(display))?;
-        self.await_pairing(&job, "codespace", progress)
+        // A start that waited for the slot may find the codespace already paired by the job
+        // it waited for. Pairing again would replace its device token and tunnel under
+        // requests in flight, so that machine is woken (a no-op when connected) instead.
+        let mut paired: Option<Machine> = None;
+        let job = self
+            .start_when_free(halt, remote::JOB_SLOT_WAIT, || {
+                paired = self
+                    .list()?
+                    .into_iter()
+                    .find(|m| m.codespace.as_deref() == Some(codespace));
+                if paired.is_some() {
+                    return Ok(String::new());
+                }
+                self.codespace_begin_for_start(codespace, Some(display))
+            })
+            .map_err(start_error)?;
+        if let Some(machine) = paired {
+            self.ensure_codespace_with(&machine.id, halt, progress)
+                .map_err(start_error)?;
+            return Ok(machine);
+        }
+        self.await_pairing(&job, "codespace", halt, progress)
     }
+    // A sandbox always pairs afresh: `open_project` drops an existing machine first on
+    // purpose (a start has just restored the relay and the Host), so a machine found here
+    // would be the one that call meant to replace.
     fn connect_sandbox(
         &self,
         sandbox: SandboxTarget,
         display: &str,
+        halt: &AtomicBool,
         progress: &mut dyn FnMut(&str),
     ) -> Result<Machine, String> {
-        let job = self.sandbox_begin(sandbox, Some(display))?;
-        self.await_pairing(&job, "sandbox", progress)
+        let job = self
+            .start_when_free(halt, remote::JOB_SLOT_WAIT, || {
+                self.sandbox_begin(sandbox.clone(), Some(display))
+            })
+            .map_err(start_error)?;
+        self.await_pairing(&job, "sandbox", halt, progress)
     }
     fn ensure(
         &self,
@@ -437,21 +594,66 @@ impl Host for Arc<Connections> {
     fn request(&self, machine_id: &str, method: &str, params: Value) -> Result<Value, String> {
         Connections::request(self, machine_id, method, params)
     }
+    fn request_timeout(
+        &self,
+        machine_id: &str,
+        method: &str,
+        params: Value,
+        timeout: Option<Duration>,
+    ) -> Result<Value, String> {
+        Connections::request_timeout(self, machine_id, method, params, timeout)
+    }
+    fn host_info(&self, machine_id: &str) -> Result<crate::remote::host_info::HostInfo, String> {
+        match Connections::host_info(self, machine_id) {
+            Some(info) => Ok(info),
+            None => self.describe_host(machine_id),
+        }
+    }
+    fn host_update(&self, machine_id: &str) -> view::HostUpdate {
+        if let Some(warning) = self.host_upgrade_failure(machine_id) {
+            view::HostUpdate::Failed(warning)
+        } else if self.host_upgrade_pending(machine_id) {
+            view::HostUpdate::Pending
+        } else {
+            view::HostUpdate::NextConnect
+        }
+    }
+    fn upgrade_host(
+        &self,
+        machine_id: &str,
+        auth: Option<remote::host_upgrade::SandboxAuth<'_>>,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(&str),
+    ) -> remote::host_upgrade::Outcome {
+        self.upgrade_host_if_needed(machine_id, auth, cancel, progress)
+    }
     fn disconnect(&self, machine_id: &str) -> Result<(), String> {
         Connections::disconnect(self, machine_id)
     }
 }
 
 impl Connections {
-    /// Follows the pairing job `job` to its end and returns the machine it paired.
+    /// Follows the pairing job `job` to its end and returns the machine it paired. Setting
+    /// `halt` cancels the job, waits for it to stop (bounded) and fails with [`START_ABORTED`].
     fn await_pairing(
         self: &Arc<Self>,
         job: &str,
         noun: &str,
+        halt: &AtomicBool,
         progress: &mut dyn FnMut(&str),
     ) -> Result<Machine, String> {
         let mut last = String::new();
         loop {
+            if halt.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = self.ssh_cancel(job);
+                for _ in 0..20 {
+                    if self.ssh_poll(job).map_or(true, |view| view.done) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                return Err(START_ABORTED.into());
+            }
             let view = self.ssh_poll(job)?;
             if view.message != last {
                 progress(&view.message);
@@ -560,6 +762,17 @@ pub struct CloudSessions {
     follower_retry: Duration,
     /// Sandboxes with a user-initiated reconnect in flight, by name.
     reconnecting: Mutex<std::collections::HashSet<String>>,
+    /// Where the Claude setup step reads the user's kit preferences and local setup.
+    kit_seams: claude_setup::KitSeams,
+    /// Moves (and rollbacks) running in this process, by local session id.
+    moves: Mutex<HashMap<i64, Arc<move_session::RunState>>>,
+    /// Instances (by cloud key) whose return cleanup runs in this process.
+    cleaning: Mutex<std::collections::HashSet<String>>,
+    /// Limits and pauses of the move's RestoreCode wait; tests shorten them.
+    restore_timing: move_session::RestoreTiming,
+    /// Test seam of the move flip: runs after the Host link and before the location.
+    #[cfg(test)]
+    flip_hook: Mutex<Option<move_session::FlipHook>>,
 }
 
 impl CloudSessions {
@@ -582,7 +795,18 @@ impl CloudSessions {
             clock: Box::new(crate::time::now_ms),
             follower_retry: Duration::from_secs(2),
             reconnecting: Mutex::new(Default::default()),
+            kit_seams: claude_setup::KitSeams::system(),
+            moves: Mutex::new(HashMap::new()),
+            cleaning: Mutex::new(Default::default()),
+            restore_timing: Default::default(),
+            #[cfg(test)]
+            flip_hook: Mutex::new(None),
         }
+    }
+    /// Replaces where the Claude setup reads the user's preferences and local setup.
+    pub fn with_kit_seams(mut self, seams: claude_setup::KitSeams) -> Self {
+        self.kit_seams = seams;
+        self
     }
     #[cfg(test)]
     fn with_timing(
@@ -595,6 +819,11 @@ impl CloudSessions {
         self.sleep = Box::new(sleep);
         self.clock = Box::new(clock);
         self.follower_retry = Duration::ZERO;
+        self
+    }
+    #[cfg(test)]
+    fn with_restore_timing(mut self, timing: move_session::RestoreTiming) -> Self {
+        self.restore_timing = timing;
         self
     }
     #[cfg(all(test, unix))]
@@ -653,6 +882,15 @@ impl CloudSessions {
             .ok_or_else(|| format!("No {} backend is available.", kind.noun()))
     }
 
+    /// Browser URL of a workspace (a codespace's VS Code for the web), asked from its backend.
+    /// `Err` when the backend has no web page or could not read it. Reads only: it never wakes
+    /// the workspace.
+    pub fn workspace_web_url(&self, cloud: &CloudRef) -> Result<String, String> {
+        self.backend(cloud.kind)?
+            .web_url(&cloud.name)
+            .unwrap_or_else(|| Err(format!("A {} has no web page.", cloud.noun())))
+    }
+
     /// `owner/repo` of the local project's `origin`.
     pub fn repo_for(&self, local_cwd: &str) -> Result<String, String> {
         codespaces::repo_from_remote(&(self.origin)(local_cwd)?)
@@ -687,6 +925,9 @@ impl CloudSessions {
         progress: &mut dyn FnMut(&str),
         created: &mut Option<String>,
     ) -> Result<CloudBinding, String> {
+        if let CodespaceChoice::Named(name) = &target.codespace {
+            self.refuse_while_cleaning(&CloudRef::codespace(name))?;
+        }
         let resolved = self.resolve_codespace(local_cwd, target, progress)?;
         if resolved.created {
             *created = Some(resolved.name.clone());
@@ -713,6 +954,8 @@ impl CloudSessions {
                 display: &resolved.display,
                 repo: &resolved.repo,
                 remote_cwd: &resolved.remote_cwd,
+                auth: None,
+                setup: None,
             },
             &AtomicBool::new(false),
             &mut |_, _| {},
@@ -907,11 +1150,15 @@ impl CloudSessions {
     }
 
     /// Sessions of `local_cwd` that live in codespaces or Docker sandboxes, newest first.
+    /// Two kinds: sessions born in the cloud (a Host record of their own), and local sessions
+    /// whose location is Cloud (design 4.2.1). The Host record that backs a located session
+    /// is not listed: the local session is the one row, and carries the activity flags.
     pub fn cloud_sessions_for(&self, local_cwd: &str) -> Result<Vec<CloudSession>, String> {
-        Ok(self
-            .store()?
+        let store = self.store()?;
+        let mut found: Vec<CloudSession> = store
             .cloud_sessions(local_cwd)?
             .into_iter()
+            .filter(|s| !store.host_record_is_hidden(s))
             .filter_map(|s| {
                 let cloud = s.project.cloud()?;
                 Some(CloudSession {
@@ -924,7 +1171,63 @@ impl CloudSessions {
                     summary: s.summary,
                 })
             })
-            .collect())
+            .collect();
+        for (summary, location) in store.cloud_located_sessions(local_cwd)? {
+            let backing = store.linked_remote_session(summary.id)?.map(|(_, r)| r);
+            found.push(CloudSession {
+                codespace: location.cloud.name.clone(),
+                cloud: location.cloud,
+                environment_id: location.environment_id,
+                session_id: Some(location.host_session_id),
+                running: backing.as_ref().is_some_and(|r| r.running),
+                needs_input: backing.as_ref().is_some_and(|r| r.needs_input),
+                summary,
+            });
+        }
+        found.sort_by_key(|s| {
+            (
+                std::cmp::Reverse(s.summary.updated_at),
+                std::cmp::Reverse(s.summary.id),
+            )
+        });
+        Ok(found)
+    }
+
+    /// The local sessions of `local_cwd` that have a cloud location (readable or not), with
+    /// their move point and whatever needs the user's attention.
+    pub fn located_sessions_for(&self, local_cwd: &str) -> Result<Vec<LocatedSession>, String> {
+        let store = self.store()?;
+        let located = store.cloud_located_raw()?;
+        if located.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut found = Vec::new();
+        for summary in store.sessions()?.into_iter().filter(|s| s.cwd == local_cwd) {
+            let Some((_, location)) = located.iter().find(|(id, _)| *id == summary.id) else {
+                continue;
+            };
+            let backing = store.linked_remote_session(summary.id)?.map(|(_, r)| r);
+            let stored = store.cloud_sync_error(summary.id).ok().flatten();
+            let derived = match location {
+                None => Some(crate::store::UNREADABLE_NOTICE.to_string()),
+                Some(_) if store.cloud_host_record(summary.id).is_err() => {
+                    Some(crate::store::MISSING_HOST.to_string())
+                }
+                Some(_) => None,
+            };
+            let sync_error = stored.or(derived);
+            found.push(LocatedSession {
+                id: summary.id,
+                moved_at_row: location.as_ref().map_or(0, |l| l.moved_at_row),
+                unreadable: location.is_none(),
+                // Fresh `running` only, and never next to a problem: see `leave_cloud`.
+                host_active: backing.as_ref().is_some_and(|r| r.running_now())
+                    && sync_error.is_none(),
+                unsynced: store.cloud_may_hold_unsynced(summary.id),
+                sync_error,
+            });
+        }
+        Ok(found)
     }
 
     /// Raw gh state of a codespace, cached for the TTL. Never wakes it.
@@ -1315,6 +1618,7 @@ impl CloudSessions {
         harness: &str,
     ) -> Result<crate::store::Session, String> {
         require_claude(harness)?;
+        self.refuse_while_cleaning(cloud)?;
         let store = self.store()?;
         let on_instance: Vec<RemoteSession> = store
             .cloud_sessions(local_cwd)?
@@ -1340,6 +1644,7 @@ impl CloudSessions {
                     cloud.name
                 )
             })?;
+        self.refuse_while_cleaning(cloud)?;
         store.create(harness, &ready.project.key)
     }
 
@@ -1372,6 +1677,30 @@ pub struct SandboxTerminal {
     /// The single remote word: `devcontainer exec ... -- bash -l`, or `cd <workspace> && bash
     /// -l` for a sandbox without a devcontainer.
     pub remote: String,
+}
+
+/// The Host worktree a session runs in, as the store recorded it, unless that worktree was
+/// removed (then the session is back in the project folder). May still be a `remote://`
+/// path: see [`confine_host_cwd`].
+pub(crate) fn stored_worktree_cwd(settings: &crate::agent::Settings) -> Option<String> {
+    if settings.worktree_removed {
+        return None;
+    }
+    settings.worktree_cwd.clone().filter(|cwd| !cwd.is_empty())
+}
+
+/// A session's Host cwd: `cwd` (a Host path, or the `remote://<env>/<path>` form the store
+/// keeps) when it lies strictly inside the workspace folder `workspace_root` and is a valid
+/// remote path. Anything else is `None`, and the caller uses the project cwd.
+pub(crate) fn confine_host_cwd(cwd: &str, workspace_root: &str) -> Option<String> {
+    let cwd = match crate::remote::parse_remote_path(cwd.trim()) {
+        Some(remote) => remote.host_path,
+        None => cwd.to_owned(),
+    };
+    let cwd = cwd.trim_end_matches('/').to_owned();
+    (cwd.starts_with(&format!("{}/", workspace_root.trim_end_matches('/')))
+        && crate::codespaces::valid_remote_path(&cwd).is_ok())
+    .then_some(cwd)
 }
 
 impl CloudSessions {
@@ -1606,12 +1935,24 @@ impl StartupSummary {
 }
 
 pub mod backend;
+pub mod claude_setup;
 pub mod docker_config;
 pub mod docker_start;
+pub mod kit;
+pub mod kit_pack;
+pub mod kit_prefs;
+pub mod move_out;
+#[path = "cloud_sessions/move.rs"]
+pub mod move_session;
+pub mod move_ui;
 pub use backend::{CloudBackend, CloudBackendKind, CloudRef, CodespacesBackend};
 
+mod continue_local;
 mod convert;
 pub use convert::*;
+pub mod return_cleanup;
+pub use return_cleanup::{CleanupOutcome, HostCheck, ReturnCleanup};
+pub mod transcript_sync;
 
 pub mod startup;
 pub mod view;
@@ -1623,11 +1964,27 @@ pub use startup::{
 
 // These fixtures execute the Linux host scripts against local Unix paths.
 #[cfg(all(test, unix))]
+mod continue_tests;
+#[cfg(all(test, unix))]
 mod convert_tests;
 #[cfg(test)]
 mod docker_config_tests;
 #[cfg(test)]
 mod docker_start_tests;
+#[cfg(test)]
+mod kit_pack_tests;
+#[cfg(test)]
+mod kit_prefs_tests;
+#[cfg(test)]
+mod kit_tests;
+#[cfg(test)]
+mod move_out_tests;
+#[cfg(test)]
+mod move_tests;
+#[cfg(test)]
+mod move_ui_tests;
+#[cfg(all(test, unix))]
+mod return_cleanup_tests;
 #[cfg(test)]
 mod startup_tests;
 #[cfg(test)]

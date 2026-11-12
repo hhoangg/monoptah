@@ -1,10 +1,16 @@
 //! Bounded file reads and atomic editor saves, extracted from Tauri's fs service.
 use super::*;
 use std::io::Read;
+use std::sync::atomic::AtomicBool;
 
 pub const MAX_TEXT_BYTES: usize = 2 * 1024 * 1024;
+/// Remote writes cap at 1 MB, so a remote text file over it is opened read-only.
+pub const REMOTE_TEXT_BYTES: usize = 1024 * 1024;
+/// Shown above a remote text file between 1 and 2 MB: it can be read but not saved.
+pub const REMOTE_READ_ONLY: &str =
+    "Read-only: the cloud workspace accepts saves up to 1 MB, and this file is larger.";
 pub const MAX_LINE_BYTES: usize = 16 * 1024;
-const MAX_PREVIEW_BYTES: u64 = 32 * 1024 * 1024;
+pub(super) const MAX_PREVIEW_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct TextDocument {
@@ -14,6 +20,8 @@ pub struct TextDocument {
     pub bom: bool,
     /// Original bytes are retained to detect an external edit before saving.
     pub disk: Vec<u8>,
+    /// Why the file can be read but not saved, when it cannot.
+    pub read_only: Option<String>,
 }
 #[derive(Debug)]
 pub enum Document {
@@ -84,9 +92,34 @@ pub fn resolve_path(path: &Path, cwd: &Path) -> PathBuf {
 }
 
 pub fn read_document(path: &Path) -> Result<Document, String> {
+    read_document_with(path, &mut |_, _| {}, &AtomicBool::new(false))
+}
+
+/// [`read_document`] that reports `(done, total)` bytes of a remote read after every
+/// chunk and stops with [`super::remote_read::READ_CANCELLED`] once `cancel` is set.
+pub fn read_document_with(
+    path: &Path,
+    progress: &mut dyn FnMut(u64, u64),
+    cancel: &AtomicBool,
+) -> Result<Document, String> {
     if super::remote::is_remote(path) {
-        let bytes = read_remote_bytes(path)?;
-        if is_video_path(path) {
+        let video = is_video_path(path);
+        // The size is known after the first chunk: a text file over the reading limit is
+        // refused there, so it is never downloaded (the editor polls open files).
+        let accept = |first: &[u8], size: u64| {
+            (!video
+                && size > MAX_TEXT_BYTES as u64
+                && sniff_image(first).is_none()
+                && !has_image_extension(path))
+            .then(|| too_large_to_edit(MAX_TEXT_BYTES))
+        };
+        let bytes = match super::remote_read::read_default(path, progress, cancel, &accept)? {
+            super::remote_read::Fetched::Bytes(bytes) => bytes,
+            super::remote_read::Fetched::Refused(reason) => {
+                return Ok(Document::Unsupported(reason))
+            }
+        };
+        if video {
             #[derive(Deserialize)]
             #[serde(rename_all = "camelCase")]
             struct Modified {
@@ -130,7 +163,7 @@ pub fn read_document(path: &Path) -> Result<Document, String> {
                 source: Some(source),
             });
         }
-        return document_from_bytes(path, bytes, 1024 * 1024);
+        return document_from_bytes(path, bytes, MAX_TEXT_BYTES);
     }
     let path = expand_home(path);
     let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
@@ -162,25 +195,8 @@ pub fn read_document(path: &Path) -> Result<Document, String> {
     document_from_bytes(&path, bytes, MAX_TEXT_BYTES)
 }
 
-fn read_remote_bytes(path: &Path) -> Result<Vec<u8>, String> {
-    use base64::Engine;
-    let encoded: String =
-        super::remote::command("read_binary_file", serde_json::json!({"path":path}))?;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .map_err(|error| format!("Invalid remote file content: {error}"))?;
-    if bytes.len() > 10 * 1024 * 1024 {
-        return Err("File is too large to preview (maximum 10 MB).".into());
-    }
-    Ok(bytes)
-}
-
-fn document_from_bytes(
-    path: &Path,
-    bytes: Vec<u8>,
-    max_text_bytes: usize,
-) -> Result<Document, String> {
-    let format = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+fn sniff_image(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some("png")
     } else if bytes.starts_with(b"\xff\xd8\xff") {
         Some("jpeg")
@@ -198,7 +214,33 @@ fn document_from_bytes(
         Some("bmp")
     } else {
         None
-    };
+    }
+}
+
+fn has_image_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "bmp" | "ico"
+            )
+        })
+}
+
+fn too_large_to_edit(max: usize) -> String {
+    format!(
+        "File is too large to edit (maximum {} MB).",
+        max / 1024 / 1024
+    )
+}
+
+pub(super) fn document_from_bytes(
+    path: &Path,
+    bytes: Vec<u8>,
+    max_text_bytes: usize,
+) -> Result<Document, String> {
+    let format = sniff_image(&bytes);
     if let Some(format) = format {
         let (width, height) = image::ImageReader::new(std::io::Cursor::new(&bytes))
             .with_guessed_format()
@@ -229,10 +271,7 @@ fn document_from_bytes(
         return Ok(Document::Unsupported("Not a readable image.".into()));
     }
     if bytes.len() > max_text_bytes {
-        return Ok(Document::Unsupported(format!(
-            "File is too large to edit (maximum {} MB).",
-            max_text_bytes / 1024 / 1024
-        )));
+        return Ok(Document::Unsupported(too_large_to_edit(max_text_bytes)));
     }
     if bytes.contains(&0) {
         return Ok(Document::Unsupported(
@@ -250,12 +289,15 @@ fn document_from_bytes(
         ));
     }
     let crlf = raw.contains("\r\n");
+    let read_only = (super::remote::is_remote(path) && bytes.len() > REMOTE_TEXT_BYTES)
+        .then(|| REMOTE_READ_ONLY.to_owned());
     Ok(Document::Text(TextDocument {
         text,
         crlf,
         cr: !crlf && raw.contains('\r'),
         bom,
         disk: bytes,
+        read_only,
     }))
 }
 
@@ -281,6 +323,11 @@ pub fn is_video_path(path: &Path) -> bool {
 }
 
 impl TextDocument {
+    /// SHA-256 (lowercase hex) of the raw bytes that were read, BOM included. The Host
+    /// hashes raw bytes too, so this is what a conditional remote save sends.
+    pub fn disk_sha256(&self) -> String {
+        super::remote_write::sha256_hex(&self.disk)
+    }
     pub fn encode(&self, text: &str) -> Vec<u8> {
         let mut out = if self.bom {
             vec![0xef, 0xbb, 0xbf]
@@ -303,17 +350,16 @@ pub fn save_document(path: &Path, document: &TextDocument, text: &str) -> Result
     if text.len() > MAX_TEXT_BYTES || text.split('\n').any(|line| line.len() > MAX_LINE_BYTES) {
         return Err("Text exceeds the editor size limit.".into());
     }
+    if let Some(reason) = &document.read_only {
+        return Err(reason.clone());
+    }
     if super::remote::is_remote(path) {
-        if read_remote_bytes(path)? != document.disk {
-            return Err("The file changed on disk. Reload it before saving your edits.".into());
-        }
-        let bytes = document.encode(text);
-        let content = std::str::from_utf8(&bytes).map_err(|_| "File is not valid UTF-8.")?;
-        super::remote::command::<()>(
-            "write_text_file",
-            serde_json::json!({"path":path,"content":content}),
-        )?;
-        return Ok(bytes);
+        return super::remote_write::save_default(
+            path,
+            document,
+            text,
+            super::remote_write::Mode::Guarded,
+        );
     }
     let destination = std::fs::canonicalize(expand_home(path)).map_err(|e| e.to_string())?;
     if !matches_disk(&destination, &document.disk)? {
@@ -360,6 +406,31 @@ pub fn save_document(path: &Path, document: &TextDocument, text: &str) -> Result
         let _ = std::fs::remove_file(&temporary);
     }
     result
+}
+
+/// Saves over the cloud version the user was shown ("Keep mine" after a conflict).
+/// `shown` is that version's raw bytes, or `None` when the file did not exist. The save is
+/// conditional on exactly those bytes, so a version the user never saw (the agent wrote
+/// again meanwhile) is refused with "File changed on the host" and not overwritten.
+pub fn overwrite_document(
+    path: &Path,
+    document: &TextDocument,
+    text: &str,
+    shown: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
+    if let Some(reason) = &document.read_only {
+        return Err(reason.clone());
+    }
+    if text.len() > MAX_TEXT_BYTES || text.split('\n').any(|line| line.len() > MAX_LINE_BYTES) {
+        return Err("Text exceeds the editor size limit.".into());
+    }
+    if super::remote::is_remote(path) {
+        return super::remote_write::overwrite_default(path, document, text, shown);
+    }
+    let shown = shown.ok_or("The file no longer exists.")?;
+    let mut baseline = document.clone();
+    baseline.disk = shown.to_vec();
+    save_document(path, &baseline, text)
 }
 
 fn matches_disk(path: &Path, expected: &[u8]) -> Result<bool, String> {

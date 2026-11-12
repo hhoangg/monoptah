@@ -56,6 +56,30 @@ fn the_placeholder_follows_the_start_and_is_restored_exactly(cx: &mut TestAppCon
         .unwrap();
 }
 
+#[gpui::test]
+fn a_failed_start_is_not_a_pending_launch_but_a_running_one_is(cx: &mut TestAppContext) {
+    let window = conversation(cx);
+    window
+        .update(cx, |view, _, cx| {
+            assert!(!view.cloud_launch_pending());
+            view.set_cloud_start(Some(starting(2)), cx);
+            assert!(view.cloud_launch_pending());
+            view.set_cloud_start(Some(failed(2, "boom")), cx);
+            assert!(!view.cloud_launch_pending(), "a failed start is not busy");
+            // A prompt that waits for a retry does not make a failed start busy either.
+            view.remote_state.app_prompt_waiting = true;
+            assert!(!view.cloud_launch_pending());
+            view.set_cloud_start(Some(starting(3)), cx);
+            assert!(view.cloud_launch_pending());
+            view.set_cloud_start(Some(ready(1000)), cx);
+            assert!(
+                view.cloud_launch_pending(),
+                "the waiting prompt is still to go out"
+            );
+        })
+        .unwrap();
+}
+
 fn draw(visual: &mut gpui::VisualTestContext) {
     visual.run_until_parked();
     visual.refresh().unwrap();

@@ -847,7 +847,7 @@ impl Input {
         let Some(code) = &mut self.code else {
             return;
         };
-        if self.marked.is_some() {
+        if self.marked.is_some() || self.read_only {
             return;
         }
         let source = if redo { &mut code.redo } else { &mut code.undo };
@@ -2440,6 +2440,34 @@ mod tests {
                 assert!(i.autoscroll.is_none());
                 assert_eq!(i.selection.start, anchor);
                 assert_eq!(i.scroll_y, scrolled);
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn undo_and_redo_leave_a_read_only_editor_alone(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            bind(cx);
+            cx.open_window(Default::default(), |_, cx| cx.new(Input::editor))
+                .unwrap()
+        });
+        window
+            .update(cx, |i, w, cx| {
+                i.set_text("one".into(), cx);
+                i.reset_editor_history();
+                i.replace_text_in_range(None, "x", w, cx);
+                assert_eq!(i.content.as_ref(), "onex");
+                i.set_read_only(true);
+                i.undo(&Undo, w, cx);
+                assert_eq!(i.content.as_ref(), "onex");
+                i.set_read_only(false);
+                i.undo(&Undo, w, cx);
+                assert_eq!(i.content.as_ref(), "one");
+                i.set_read_only(true);
+                i.redo(&Redo, w, cx);
+                assert_eq!(i.content.as_ref(), "one");
+                i.set_read_only(false);
+                i.redo(&Redo, w, cx);
+                assert_eq!(i.content.as_ref(), "onex");
             })
             .unwrap();
     }

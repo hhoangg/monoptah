@@ -71,7 +71,7 @@ impl QuitGate {
 }
 
 /// Ctrl+Q off macOS (Cmd+Q on a Mac), however the keyboard cased the key.
-fn is_quit_keystroke(keystroke: &Keystroke, mac: bool) -> bool {
+pub(super) fn is_quit_keystroke(keystroke: &Keystroke, mac: bool) -> bool {
     let m = keystroke.modifiers;
     keystroke.key.eq_ignore_ascii_case("q")
         && !m.alt
@@ -456,7 +456,7 @@ mod tests {
             .unwrap();
         let cx = &mut VisualTestContext::from_window(window.into(), cx);
         cx.run_until_parked();
-        cx.simulate_keystrokes("cmd-j");
+        cx.simulate_keystrokes("secondary-j");
         cx.run_until_parked();
         let focused = window
             .update(cx, |shell, w, cx| shell.dock_focused(w, cx).is_some())

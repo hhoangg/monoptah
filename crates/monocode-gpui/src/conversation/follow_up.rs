@@ -318,7 +318,7 @@ impl Conversation {
         }
     }
     pub(super) fn pump_follow_ups(&mut self, cx: &mut Context<Self>) {
-        if self.editing_last_turn.pending() || self.stopping {
+        if self.editing_last_turn.pending() || self.stopping || self.move_locked {
             return;
         }
         if !self.history_ready() {

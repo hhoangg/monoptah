@@ -8,7 +8,8 @@ use super::*;
 use monocode_core::{
     cloud_sessions::{
         CloudBackendKind, CloudRef, CloudSessions, CloudState, ConvertError, Converted,
-        DeleteOutcome, Restored, SandboxTerminal, pending_restore_for, restore_code,
+        DeleteOutcome, LocatedSession, Restored, SandboxTerminal, pending_restore_for,
+        restore_code,
     },
     codespaces::GhRunner,
 };
@@ -81,6 +82,9 @@ pub(super) struct Snapshot {
     pub origins: HashMap<i64, String>,
     /// Codespaces among `origins` that gh says no longer exist.
     pub gone: std::collections::HashSet<String>,
+    /// The marked sessions that are LOCAL sessions whose location is Cloud, by session id:
+    /// their move point and durable sync error. Sessions born in the cloud are not here.
+    pub located: HashMap<i64, LocatedSession>,
 }
 
 /// Reads every cloud session of `projects` from the store and the cached state of
@@ -128,6 +132,11 @@ pub(super) fn collect(
             {
                 slot.insert(cloud.cloud_state_of(&session.cloud));
             }
+        }
+        // A local session whose location is Cloud is already among the marked sessions above
+        // (the listing is driven by the location); this adds what its panels need.
+        for located in cloud.located_sessions_for(project).unwrap_or_default() {
+            snapshot.located.insert(located.id, located);
         }
     }
     snapshot
@@ -616,15 +625,6 @@ pub(super) fn delete_note(groups: &[CodespaceGroup]) -> String {
     )
 }
 
-/// What the File and Git panels say while a cloud session is active.
-pub(super) fn banner_text(cloud: &CloudRef) -> String {
-    format!(
-        "Local files - this session runs in {} {}",
-        cloud.noun(),
-        cloud.name
-    )
-}
-
 /// `ssh -t <id>@sbx_cloud <devcontainer exec ... bash -l>`: an interactive shell in a
 /// sandbox's container (a sandbox without a devcontainer: `cd <workspace> && bash -l`). The
 /// remote command is one word, as the start flow sends it.
@@ -811,6 +811,9 @@ impl ArchiveDialog {
     pub(super) fn others(&self) -> usize {
         self.groups.iter().map(|g| g.others).sum()
     }
+    pub(super) fn focus_handle(&self) -> FocusHandle {
+        self.focus.clone()
+    }
 }
 
 pub(super) fn default_gh() -> Arc<dyn GhRunner> {
@@ -906,6 +909,9 @@ impl Shell {
         }
         self.sync_cloud_stopped(cx);
         self.invalidate_chrome(cx);
+        if self.queued_cloud_opens.has(id) {
+            self.cloud_open_due = Some(id);
+        }
         if self.cloud_refreshing {
             self.cloud_refresh_again = true;
         } else {
@@ -952,8 +958,10 @@ impl Shell {
         let changed = snapshot.marks != self.cloud_marks
             || snapshot.states != self.cloud_states
             || snapshot.origins != self.cloud_origins
-            || snapshot.gone != self.cloud_gone;
+            || snapshot.gone != self.cloud_gone
+            || snapshot.located != self.cloud_located;
         self.cloud_origins = snapshot.origins;
+        self.cloud_located = snapshot.located;
         self.cloud_gone = snapshot.gone;
         for (id, activity) in &snapshot.activity {
             // Host activity of the project is only polled for remote projects.
@@ -964,6 +972,7 @@ impl Shell {
         self.cloud_marks = snapshot.marks;
         self.cloud_states = snapshot.states;
         self.sync_cloud_stopped(cx);
+        self.sync_cloud_location(cx);
         if changed {
             self.invalidate_chrome(cx);
             cx.notify();
@@ -1129,19 +1138,291 @@ impl Shell {
         cx.notify();
     }
 
-    /// While a cloud session is in view the File and Git panels still show the
-    /// local project: say so, and keep git writes off it.
-    pub(super) fn sync_cloud_panel(&self, cx: &mut Context<Self>) {
-        let cloud = if self.mono_active(cx) {
-            None
-        } else {
-            self.active_cloud()
+    /// What the File and Git panels are bound to: the workspace of the cloud session in view
+    /// (default), its local checkout when the user switched the panels to Local, or the local
+    /// project. Pure reads: it never touches a workspace.
+    pub(super) fn panel_root(&self, cx: &App) -> crate::panel_root::PanelRoot {
+        use crate::panel_root::{ActiveSession, PanelMode, resolve};
+        let id = self
+            .workspace
+            .active
+            .map(|pane| self.workspace.session_for_pane(pane));
+        let mode = id
+            .and_then(|id| self.panel_modes.get(&id).copied())
+            .unwrap_or(PanelMode::Cloud);
+        let mark = id.and_then(|id| self.cloud_marks.get(&id));
+        let live = id.and_then(|id| self.sessions.get(&id)).map(|v| v.read(cx));
+        // A cloud session without a live view still gets its cloud root, from its summary.
+        let facts = match (id, live) {
+            (_, Some(view)) => Some((
+                view.summary.cwd.as_str(),
+                view.settings.worktree_cwd.as_deref(),
+            )),
+            (Some(id), None) if mark.is_some() => self
+                .session_summaries
+                .get(&id)
+                .map(|summary| (summary.cwd.as_str(), None)),
+            _ => None,
         };
+        let active = facts.map(|(cwd, worktree_cwd)| ActiveSession {
+            cwd,
+            worktree_cwd,
+            cloud: mark.map(|mark| (mark.cloud(), mark.local_project.as_str())),
+        });
+        resolve(active, mode, self.mono_active(cx), self.working_copy())
+    }
+
+    /// Switches the panels of the session in view between its cloud workspace and its local
+    /// checkout. The choice is per session and lives in memory.
+    pub(super) fn set_panel_mode(
+        &mut self,
+        mode: crate::panel_root::PanelMode,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self
+            .workspace
+            .active
+            .map(|pane| self.workspace.session_for_pane(pane))
+        else {
+            return;
+        };
+        if self.panel_modes.insert(id, mode).unwrap_or_default() != mode {
+            self.sync_git(cx);
+            cx.notify();
+        }
+    }
+
+    /// Whether the app has a live connection to the workspace of the session in view. A
+    /// session without a live view is Not connected. Never wakes anything.
+    pub(super) fn panel_link(&self, cx: &App) -> crate::panel_root::Link {
+        let id = self
+            .workspace
+            .active
+            .map(|pane| self.workspace.session_for_pane(pane));
+        id.and_then(|id| self.sessions.get(&id))
+            .map_or(crate::panel_root::Link::NotConnected, |view| {
+                view.read(cx).panel_link()
+            })
+    }
+
+    /// Whether the link of the session in view is a fact: a live conversation says the workspace
+    /// is up, waking or down. A session without one (it runs in a terminal) or one that has not
+    /// finished its first refresh knows nothing, and its panels read as they always did.
+    fn panel_link_known(&self, cx: &App) -> bool {
+        self.workspace
+            .active
+            .map(|pane| self.workspace.session_for_pane(pane))
+            .and_then(|id| self.sessions.get(&id))
+            .is_some_and(|view| view.read(cx).panel_link_known())
+    }
+
+    /// The Host environments of the cloud sessions whose link is live. One live session means the
+    /// workspace is up, whatever a stale second session on it says.
+    fn live_environments(&self, cx: &App) -> Vec<String> {
+        self.cloud_environments(cx, true)
+    }
+
+    /// The Host environments where no session is live but some session knows the link is down.
+    pub(super) fn offline_environments(&self, cx: &App) -> Vec<String> {
+        let live = self.live_environments(cx);
+        let mut envs = self.cloud_environments(cx, false);
+        envs.retain(|env| !live.contains(env));
+        envs
+    }
+
+    /// The environments of the sessions with a live conversation whose link is live (`live`) or
+    /// known to be down (`!live`).
+    fn cloud_environments(&self, cx: &App, live: bool) -> Vec<String> {
+        let mut envs = Vec::new();
+        for id in self.cloud_marks.keys() {
+            let Some(view) = self.sessions.get(id).map(|view| view.read(cx)) else {
+                continue;
+            };
+            let connected = view.panel_link() == crate::panel_root::Link::Connected;
+            if !view.panel_link_known() || connected != live {
+                continue;
+            }
+            let cwds = self
+                .session_summaries
+                .get(id)
+                .map(|s| s.cwd.as_str())
+                .into_iter()
+                .chain(view.settings.worktree_cwd.as_deref());
+            for cwd in cwds {
+                if let Some(path) = monocode_core::remote::parse_remote_path(cwd)
+                    && !envs.contains(&path.environment_id)
+                {
+                    envs.push(path.environment_id);
+                }
+            }
+        }
+        envs
+    }
+
+    /// The session in view has a live conversation entry.
+    fn panel_has_conversation(&self) -> bool {
+        self.workspace
+            .active
+            .map(|pane| self.workspace.session_for_pane(pane))
+            .is_some_and(|id| self.sessions.contains_key(&id))
+    }
+
+    /// Whether the link of the panels' workspace is known to be down: the session in view says
+    /// so and no other session on the same environment is live. The panels, the Explorer and the
+    /// git gate all read this one answer.
+    pub(super) fn panel_down(&self, root: &crate::panel_root::PanelRoot, cx: &App) -> bool {
+        let Some(path) = monocode_core::remote::parse_remote_path(root.project()) else {
+            return self.panel_link_known(cx);
+        };
+        // A session without a conversation (it runs in a terminal) knows nothing about its link:
+        // a sibling's down link must not lock its panels, and it has no Connect to unlock them.
+        if !self.panel_has_conversation() {
+            return false;
+        }
+        if self.live_environments(cx).contains(&path.environment_id) {
+            return false;
+        }
+        self.panel_link_known(cx)
+            || self
+                .cloud_environments(cx, false)
+                .contains(&path.environment_id)
+    }
+
+    /// The panels show remembered data of a workspace the app knows is down.
+    pub(super) fn panel_offline(&self, root: &crate::panel_root::PanelRoot, cx: &App) -> bool {
+        crate::panel_root::is_offline(root, self.panel_link(cx)) && self.panel_down(root, cx)
+    }
+
+    /// Whether the session in view has a live conversation for the Connect action to reconnect.
+    fn panel_can_connect(&self) -> bool {
+        self.workspace
+            .active
+            .map(|pane| self.workspace.session_for_pane(pane))
+            .is_some_and(|id| self.sessions.contains_key(&id))
+    }
+
+    /// The Connect action of the connection strip. It is the Reconnect button of the session in
+    /// view, a user action: the only way the panels ever wake a workspace.
+    pub(super) fn connect_panel_workspace(&self, cx: &mut Context<Self>) {
+        let id = self
+            .workspace
+            .active
+            .map(|pane| self.workspace.session_for_pane(pane));
+        if let Some(view) = id.and_then(|id| self.sessions.get(&id)).cloned() {
+            view.update(cx, |view, cx| {
+                view.reconnect_cloud(cx);
+            });
+        }
+    }
+
+    /// The Host environments where a cloud session has a turn running. The app-side half of the
+    /// "not while the agent works" rule, see `git_gate::turn_running`. Every cloud session counts,
+    /// not just the one in view: a Review of another workspace asks the same gate.
+    fn running_environments(&self, cx: &App) -> Vec<String> {
+        let mut envs = Vec::new();
+        for id in self.cloud_marks.keys() {
+            if !self.session_summaries.contains_key(id) || !self.session_metadata(*id, cx).busy {
+                continue;
+            }
+            let cwds = self
+                .session_summaries
+                .get(id)
+                .map(|s| s.cwd.as_str())
+                .into_iter()
+                .chain(
+                    self.sessions
+                        .get(id)
+                        .and_then(|v| v.read(cx).settings.worktree_cwd.as_deref()),
+                );
+            for cwd in cwds {
+                if let Some(path) = monocode_core::remote::parse_remote_path(cwd)
+                    && !envs.contains(&path.environment_id)
+                {
+                    envs.push(path.environment_id);
+                }
+            }
+        }
+        envs
+    }
+
+    /// Opens the codespace of the panels in the browser (VS Code for the web). The URL is read
+    /// on a worker; a failure lands in the file-error notice.
+    pub(super) fn open_panel_in_browser(&mut self, cx: &mut Context<Self>) {
+        let Some(cloud) = self.panel_root(cx).cloud().cloned() else {
+            return;
+        };
+        let service = self.cloud.clone();
+        let work = cx
+            .background_executor()
+            .spawn(async move { service.workspace_web_url(&cloud) });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(url) => cx.open_url(&url),
+                Err(error) => {
+                    this.notification_state
+                        .file_error
+                        .update(cx, |notice, cx| notice.set_message(Some(error), cx));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Runs every frame, from the shell's render: binds the panels to the resolved root, draws the
+    /// cloud banner, switch and connection strip, and tells the git gate what the panels show.
+    /// Nothing here may wake a workspace: it only reads cached state.
+    pub(super) fn sync_cloud_panel(&self, cx: &mut Context<Self>) {
+        let root = self.panel_root(cx);
+        let link = self.panel_link(cx);
+        let known = self.panel_down(&root, cx);
+        let offline = self.panel_offline(&root, cx);
+        // A cloud session's root can change without the session changing (the Local switch, a
+        // pending workspace that became real). Offline: the panels keep the last data and read
+        // nothing; back online: a full reload.
+        let project = root.project().to_owned();
+        if root.cloud().is_some() {
+            self.git
+                .update(cx, |git, cx| git.bind(project, offline, cx));
+        } else {
+            self.git
+                .update(cx, |git, cx| git.set_link_offline(false, cx));
+        }
+        self.git.update(cx, |git, cx| {
+            git.set_starting(offline && link == crate::panel_root::Link::Starting, cx)
+        });
+        let running = self.running_environments(cx);
+        let (age, recovering) = {
+            let git = self.git.read(cx);
+            (git.cached_age(), git.stale() && !git.offline())
+        };
+        let setup = self.claude_setup_strip(&root, cx);
+        let chrome =
+            crate::panel_root::Chrome::of(&root, link, self.panel_can_connect()).map(|chrome| {
+                chrome
+                    .with_state(known, recovering)
+                    .with_age(age)
+                    .with_setup(setup)
+            });
         self.sync_codespace_pane(cx);
-        let flipped = crate::git_gate::set(cloud.as_ref().map(CloudRef::key));
+        let mut offline_envs = self.offline_environments(cx);
+        // The panels of a session without a conversation never lock because of a sibling.
+        if !self.panel_has_conversation()
+            && let Some(path) = monocode_core::remote::parse_remote_path(root.project())
+        {
+            offline_envs.retain(|env| *env != path.environment_id);
+        }
+        if chrome.as_ref().is_some_and(|chrome| chrome.offline)
+            && let Some(path) = monocode_core::remote::parse_remote_path(root.project())
+            && !offline_envs.contains(&path.environment_id)
+        {
+            offline_envs.push(path.environment_id);
+        }
+        let flipped = crate::git_gate::set(crate::git_gate::Gate::of(&root, running, offline_envs));
         if let Some(panel) = &self.right_panel {
             panel.update(cx, |panel, cx| {
-                panel.set_cloud_banner(cloud.as_ref().map(banner_text), cx);
+                panel.set_cloud_chrome(chrome, cx);
                 if flipped {
                     panel
                         .changes
@@ -1157,6 +1438,7 @@ impl Shell {
     }
 
     /// The workspace of the active cloud session, when one is in view.
+    #[cfg(test)]
     pub(super) fn active_cloud(&self) -> Option<CloudRef> {
         let id = self.workspace.active?;
         self.cloud_marks.get(&id).map(CloudMark::cloud)
@@ -1336,6 +1618,18 @@ impl Shell {
                     .get(id)
                     .is_some_and(|(running, _)| *running)
             })
+    }
+
+    /// Backdrop and Escape: closes the dialog, but never cancels a running save. Only the
+    /// Cancel button does that.
+    pub(super) fn dismiss_cloud_archive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(
+            self.cloud_archive.as_ref().map(|d| &d.phase),
+            Some(Phase::Working { .. })
+        ) {
+            return;
+        }
+        self.close_cloud_archive(window, cx);
     }
 
     pub(super) fn close_cloud_archive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1700,7 +1994,12 @@ impl Shell {
     }
 
     /// Replaces a converted cloud session in the window by its archived local copy.
-    fn adopt_converted(&mut self, saved: Converted, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn adopt_converted(
+        &mut self,
+        saved: Converted,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let cloud_id = saved.cloud_id;
         if self.workspace.tab_of(cloud_id).is_some() {
             self.close_pane(cloud_id, window, cx);
@@ -1727,16 +2026,27 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A local session that lives in the workspace is never dropped: it keeps its rows and
+        // shows the "cloud side lost" notice with Reset to local (read from the store).
         let gone: Vec<i64> = self
             .cloud_marks
             .iter()
-            .filter(|(_, mark)| mark.cloud() == *target)
+            .filter(|(id, mark)| mark.cloud() == *target && !self.cloud_located.contains_key(id))
             .map(|(id, _)| *id)
             .collect();
         for id in gone {
             self.forget_cloud_row(id, window, cx);
         }
         self.cloud_states.remove(&target.key());
+        // The located sessions read their marker (the store wrote it) on this refresh. Only
+        // then: a refresh reads codespace states through gh, which nothing else here needs.
+        if self
+            .cloud_marks
+            .iter()
+            .any(|(id, mark)| mark.cloud() == *target && self.cloud_located.contains_key(id))
+        {
+            self.refresh_cloud(cx);
+        }
     }
 
     /// Drops one cloud session from the window; its record is gone from the store already.
@@ -1746,6 +2056,10 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The store never forgets a located local session with its workspace; neither does the window.
+        if self.cloud_located.contains_key(&id) {
+            return;
+        }
         if self.workspace.tab_of(id).is_some() {
             self.close_pane(id, window, cx);
         }
@@ -1764,6 +2078,9 @@ impl Shell {
         let Some(mark) = self.cloud_marks.get(&id).cloned() else {
             return;
         };
+        if self.cloud_located.contains_key(&id) {
+            return;
+        }
         if self.cloud_archive.is_some() || self.cloud_busy.contains(&id) {
             return;
         }
@@ -1806,7 +2123,10 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.is_cloud(id) || self.cloud_busy.contains(&id) {
+        if !self.is_cloud(id)
+            || self.cloud_located.contains_key(&id)
+            || self.cloud_busy.contains(&id)
+        {
             return;
         }
         self.cloud_busy.insert(id);
@@ -2166,21 +2486,25 @@ impl Shell {
                 )
             }
         };
-        let choosing = matches!(dialog.phase, Phase::Choose);
+        let priority = crate::modal::BLOCKING_PRIORITY;
         Some(
             div()
                 .absolute()
                 .size_full()
-                .child(crate::modal::scrim("cloud-archive-scrim"))
+                .child(crate::modal::barrier(
+                    "cloud-archive-scrim",
+                    priority,
+                    window,
+                ))
                 .child(
                     popover("cloud-archive-modal", Anchor::Center)
                         .modal_surface(self.workspace.boxy_layout())
                         .width(width)
                         .gap(0.)
-                        .priority(60)
+                        .priority(priority)
                         .on_dismiss(move |window, cx| {
                             let _ =
-                                weak.update(cx, |this, cx| this.close_cloud_archive(window, cx));
+                                weak.update(cx, |this, cx| this.dismiss_cloud_archive(window, cx));
                         })
                         .child(
                             div()
@@ -2189,14 +2513,7 @@ impl Shell {
                                 .aria_label("Archive cloud session")
                                 .track_focus(&dialog.focus)
                                 .key_context("CloudArchive")
-                                .on_key_down(cx.listener(
-                                    move |this, event: &gpui::KeyDownEvent, window, cx| {
-                                        if choosing && event.keystroke.key == "enter" {
-                                            this.confirm_cloud_archive(default, window, cx);
-                                            cx.stop_propagation();
-                                        }
-                                    },
-                                ))
+                                .debug_selector(|| "cloud-archive-dialog".into())
                                 .p_4()
                                 .flex()
                                 .flex_col()

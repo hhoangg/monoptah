@@ -13,6 +13,7 @@ use std::time::Duration;
 
 pub(crate) const RADIUS: f32 = 16.;
 /// Backdrop blur behind the card, in points.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const BLUR: f32 = 24.;
 const ENTER: Duration = Duration::from_millis(200);
 const RISE: f32 = 6.;
@@ -46,6 +47,31 @@ pub(crate) fn backdrop<E: Styled + IntoElement + 'static>(
 /// `absolute().inset_0()`. Add it before the card so the card paints above.
 pub(crate) fn scrim(id: impl Into<ElementId>) -> AnimationElement<Div> {
     backdrop(id, div().absolute().inset_0())
+}
+
+/// Where the blocking progress dialogs (continue locally, archive a cloud session) draw:
+/// above quick open, search, prompts and the lightboxes (80 to 100), below toasts (110) and
+/// the quit notice (120).
+pub(crate) const BLOCKING_PRIORITY: usize = 105;
+
+/// A full-window scrim that blocks the window behind a dialog drawn at
+/// `priority`. It occludes every hitbox behind it, so the window gets no
+/// hover, tooltip, cursor, click, scroll, drag/drop or context menu. Presses on
+/// it are left to the dialog's own dismissal (a popover's `on_dismiss` is a
+/// window-level capture listener, so it still sees them). It is deferred just
+/// below `priority`, so the dialog card paints and hit-tests above it.
+pub(crate) fn barrier(
+    id: impl Into<ElementId>,
+    priority: usize,
+    window: &Window,
+) -> impl IntoElement {
+    let size = window.viewport_size();
+    gpui::deferred(
+        gpui::anchored()
+            .position(gpui::point(px(0.), px(0.)))
+            .child(backdrop(id, div().w(size.width).h(size.height).occlude())),
+    )
+    .with_priority(priority.saturating_sub(1))
 }
 
 /// Lifts a modal overlay out of the pane that renders it, so its scrim covers
@@ -397,5 +423,131 @@ mod tests {
         visual.simulate_keystrokes("enter");
         visual.run_until_parked();
         assert_eq!(answer.try_recv(), Ok(Some(0)));
+    }
+
+    /// A background that records every pointer event it receives, a barrier over it, and a
+    /// card button above the barrier.
+    #[derive(Default)]
+    struct Probe {
+        barrier: bool,
+        hovered: bool,
+        downs: usize,
+        right_downs: usize,
+        scrolls: usize,
+        card_clicks: usize,
+    }
+
+    impl Render for Probe {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let view = cx.entity();
+            let background = div()
+                .id("probe-background")
+                .absolute()
+                .inset_0()
+                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                    this.hovered = *hovered;
+                    cx.notify();
+                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, _| this.downs += 1),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, _, _, _| this.right_downs += 1),
+                )
+                .on_scroll_wheel(cx.listener(|this, _, _, _| this.scrolls += 1));
+            let overlay = self.barrier.then(|| {
+                let card = div()
+                    .id("probe-card")
+                    .debug_selector(|| "probe-card".into())
+                    .w(px(120.))
+                    .h(px(40.))
+                    .on_click(move |_, _, cx| view.update(cx, |this, _| this.card_clicks += 1));
+                div().child(barrier("probe-barrier", 60, window)).child(
+                    gpui::deferred(
+                        gpui::anchored()
+                            .position(gpui::point(px(400.), px(300.)))
+                            .child(card),
+                    )
+                    .with_priority(60),
+                )
+            });
+            div().size_full().child(background).children(overlay)
+        }
+    }
+
+    fn scroll(position: gpui::Point<gpui::Pixels>) -> gpui::ScrollWheelEvent {
+        gpui::ScrollWheelEvent {
+            position,
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-20.))),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        }
+    }
+
+    /// Moves, left-clicks, right-clicks and scrolls over the background at `at`.
+    fn poke(visual: &mut gpui::VisualTestContext, at: gpui::Point<gpui::Pixels>) {
+        visual.simulate_mouse_move(at, None, Default::default());
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        visual.simulate_click(at, Default::default());
+        visual.simulate_mouse_down(at, MouseButton::Right, Default::default());
+        visual.simulate_mouse_up(at, MouseButton::Right, Default::default());
+        visual.simulate_event(scroll(at));
+        visual.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn the_barrier_blocks_the_window_behind_it_and_leaves_the_card_working(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let window = cx.add_window(|_, _| Probe::default());
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let at = gpui::point(px(100.), px(100.));
+        let counts = |visual: &mut gpui::VisualTestContext| {
+            window
+                .update(visual, |p, _, _| {
+                    (p.hovered, p.downs, p.right_downs, p.scrolls, p.card_clicks)
+                })
+                .unwrap()
+        };
+
+        // The probe sees every kind of event before the barrier exists.
+        poke(visual, at);
+        assert_eq!(counts(visual), (true, 1, 1, 1, 0), "the probe must work");
+        visual.simulate_mouse_move(gpui::point(px(900.), px(700.)), None, Default::default());
+        visual.run_until_parked();
+        window
+            .update(visual, |p, _, _| {
+                *p = Probe {
+                    barrier: true,
+                    ..Default::default()
+                }
+            })
+            .unwrap();
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+
+        // With the barrier up the background gets nothing.
+        poke(visual, at);
+        assert_eq!(counts(visual), (false, 0, 0, 0, 0), "the barrier occludes");
+
+        // The card above the barrier still takes clicks.
+        let card = visual.debug_bounds("probe-card").expect("the card");
+        visual.simulate_click(card.center(), Default::default());
+        visual.run_until_parked();
+        assert_eq!(counts(visual), (false, 0, 0, 0, 1));
+
+        // Hiding the barrier gives the background its events back.
+        window.update(visual, |p, _, _| p.barrier = false).unwrap();
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        visual.simulate_mouse_move(gpui::point(px(900.), px(700.)), None, Default::default());
+        visual.run_until_parked();
+        poke(visual, at);
+        assert_eq!(counts(visual), (true, 1, 1, 1, 1), "no stuck barrier");
     }
 }

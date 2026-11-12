@@ -17,7 +17,10 @@ pub(super) struct State {
     pub(super) refresh_stub: Option<Result<(), String>>,
     pub(super) pending: bool,
     pub(super) online: bool,
-    app_prompt_waiting: bool,
+    /// The link was live at least once, so a later `!online` is a known drop and not a refresh
+    /// that has not finished yet.
+    was_online: bool,
+    pub(super) app_prompt_waiting: bool,
     app_draft_launched: bool,
     waking: bool,
     /// Stops the reconnect that is running (set by the Cancel button).
@@ -25,7 +28,8 @@ pub(super) struct State {
     error: Option<String>,
     rejected: Option<Value>,
     snapshot: Option<Value>,
-    pub(super) capabilities: std::collections::HashSet<String>,
+    /// Flavor, version and capabilities of the Host, from its last `environment.describe`.
+    pub(super) host: monocode_core::remote::host_info::HostInfo,
 }
 impl State {
     fn legacy_recovery_error(&self) -> Option<&str> {
@@ -80,8 +84,12 @@ impl Conversation {
             .as_ref()
             .is_some_and(|s| s.blocks_session())
     }
+    /// A cloud launch is under way: the start runs, or its first prompt has still to go out.
+    /// A start that failed is not under way (it waits for a retry), so it is not busy.
     pub(crate) fn cloud_launch_pending(&self) -> bool {
-        self.cloud_start.is_some()
+        self.cloud_start
+            .as_ref()
+            .is_some_and(|s| s.phase != crate::cloud_start_view::StartPhase::Failed)
             && (self.cloud_start_blocks()
                 || self.remote_state.app_prompt_waiting
                 || self.remote_state.app_draft_launched)
@@ -259,20 +267,17 @@ impl Conversation {
         {
             return;
         }
-        let capabilities = &self.remote_state.capabilities;
-        let blocker = if !message.attachments.is_empty()
-            && !capabilities.contains("attachments.upload")
-        {
-            Some("Update Monoptah Host in Connections settings to send attachments.")
-        } else if message.mode.as_deref() == Some("plan") && !capabilities.contains("sessions.plan")
-        {
-            Some("Update Monoptah Host in Connections settings to use Plan mode.")
+        let host = &self.remote_state.host;
+        let blocker = if !message.attachments.is_empty() && !host.supports("attachments.upload") {
+            Some(self.host_update_copy("send attachments"))
+        } else if message.mode.as_deref() == Some("plan") && !host.supports("sessions.plan") {
+            Some(self.host_update_copy("use Plan mode"))
         } else {
             None
         };
         if let Some(blocker) = blocker {
             // Pauses the queue and shows the error with a Retry, like any failed message.
-            self.fail_follow_up(&message.id, blocker.into(), cx);
+            self.fail_follow_up(&message.id, blocker, cx);
             cx.notify();
             return;
         }
@@ -347,6 +352,32 @@ impl Conversation {
             .flatten()
             .and_then(|s| s.project.cloud())
             .map(|cloud| cloud.noun())
+    }
+    /// What to tell a user whose Host lacks a feature they used (`action`, e.g. "use Plan mode").
+    /// A user's own SSH machine keeps the manual Upgrade button in Connections settings. A cloud
+    /// workspace upgrades itself at connect, so it says that instead: either the Host is
+    /// updated on the next connect, or it waits for the running turn to end.
+    pub(super) fn host_update_copy(&self, action: &str) -> String {
+        if self.cloud_noun().is_none() {
+            return format!("Update Monoptah Host in Connections settings to {action}.");
+        }
+        let waiting = self.remote_state.client.as_ref().is_some_and(|client| {
+            locked(&self.store)
+                .and_then(|store| store.remote_session(self.summary.id))
+                .ok()
+                .flatten()
+                .is_some_and(|s| {
+                    client.host_upgrade_pending_for_environment(&s.project.environment_id)
+                })
+        });
+        if waiting {
+            format!(
+                "Monoptah Host {} will be installed the next time this workspace connects. Then you can {action}.",
+                monocode_core::remote::host_upgrade::pinned_version()
+            )
+        } else {
+            format!("Monoptah Host will be updated on the next connect. Then you can {action}.")
+        }
     }
     pub(crate) fn remote_connection_error(&mut self, error: &str, cx: &mut Context<Self>) {
         if self.is_remote() && !self.busy {
@@ -504,8 +535,8 @@ impl Conversation {
             }
             let client = client.ok_or("Remote connections are unavailable")?;
             let machine = remote.machine(&client)?;
-            let descriptor = if initial {
-                Some(client.request(&machine.id, "environment.describe", json!({}))?)
+            let host = if initial {
+                Some(client.describe_host(&machine.id)?)
             } else {
                 None
             };
@@ -549,7 +580,7 @@ impl Conversation {
             } else {
                 None
             };
-            Ok::<_, String>((remote, settings, snapshot, history, descriptor))
+            Ok::<_, String>((remote, settings, snapshot, history, host))
         });
         cx.spawn(async move |this, cx| {
             let result = work.await;
@@ -568,8 +599,9 @@ impl Conversation {
                 this.remote_state.refreshing = false;
                 this.loading = false;
                 match result {
-                    Ok((remote, settings, snapshot, history, descriptor)) => {
+                    Ok((remote, settings, snapshot, history, host)) => {
                         this.remote_state.online = true;
+                        this.remote_state.was_online = true;
                         this.remote_state.error = remote
                             .rejected
                             .as_ref()
@@ -582,13 +614,8 @@ impl Conversation {
                         let launching = this.summary.has_messages && snapshot.is_none();
                         this.summary = remote.summary;
                         this.summary.has_messages |= launching;
-                        if let Some(descriptor) = descriptor {
-                            this.remote_state.capabilities = descriptor["capabilities"]
-                                .as_array()
-                                .into_iter()
-                                .flatten()
-                                .filter_map(|v| v.as_str().map(str::to_owned))
-                                .collect();
+                        if let Some(host) = host {
+                            this.remote_state.host = host;
                         }
                         if settings.revision > this.settings.revision
                             || (initial && settings.revision >= this.settings.revision)
@@ -732,24 +759,18 @@ impl Conversation {
             }
             return true;
         }
-        if !self.attachments.is_empty()
-            && !self
-                .remote_state
-                .capabilities
-                .contains("attachments.upload")
-        {
-            self.status =
-                "Update Monoptah Host in Connections settings to send attachments.".into();
+        if !self.attachments.is_empty() && !self.remote_state.host.supports("attachments.upload") {
+            self.status = self.host_update_copy("send attachments");
             cx.notify();
             return true;
         }
-        if self.settings.plan && !self.remote_state.capabilities.contains("sessions.plan") {
-            self.status = "Update Monoptah Host in Connections settings to use Plan mode.".into();
+        if self.settings.plan && !self.remote_state.host.supports("sessions.plan") {
+            self.status = self.host_update_copy("use Plan mode");
             cx.notify();
             return true;
         }
-        if self.draft_active(cx) && !self.remote_state.capabilities.contains("sessions.draft") {
-            self.status = "Update Monoptah Host in Connections settings to save drafts.".into();
+        if self.draft_active(cx) && !self.remote_state.host.supports("sessions.draft") {
+            self.status = self.host_update_copy("save drafts");
             cx.notify();
             return true;
         }
@@ -989,6 +1010,36 @@ impl Conversation {
     #[cfg(test)]
     pub(crate) fn cloud_stopped_for_test(&self) -> bool {
         self.cloud_stopped
+    }
+    /// The live link of the workspace, as a successful refresh would leave it.
+    #[cfg(test)]
+    pub(crate) fn set_online_for_test(&mut self, online: bool) {
+        self.remote_state.online = online;
+        self.remote_state.was_online |= online;
+    }
+    /// Whether the app has a live connection to this session's workspace, for the connection
+    /// strip of the Files and Changes panels. Reads cached view state only; it never wakes or
+    /// reconnects (the strip's Connect action is `reconnect_cloud`, a user action).
+    pub(crate) fn panel_link(&self) -> crate::panel_root::Link {
+        use crate::panel_root::Link;
+        if self.remote_state.waking {
+            Link::Starting
+        } else if self.remote_state.online && !self.cloud_stopped {
+            Link::Connected
+        } else {
+            Link::NotConnected
+        }
+    }
+    /// Whether `panel_link` is a fact: the workspace is known to be down, waking or live. A
+    /// conversation that has not finished its first refresh knows nothing yet, and the panels
+    /// then keep reading as they did (no dimming, no read-only) instead of flashing offline.
+    pub(crate) fn panel_link_known(&self) -> bool {
+        let state = &self.remote_state;
+        state.online
+            || state.waking
+            || self.cloud_stopped
+            || state.error.is_some()
+            || state.was_online
     }
     /// The slim "Codespace stopped" / "Sandbox stopped" banner with a Resume button applies:
     /// the workspace is stopped and nothing else (an error, a pending command) needs the notice.

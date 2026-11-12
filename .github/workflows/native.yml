@@ -27,10 +27,12 @@ concurrency:
   cancel-in-progress: true
 
 # macOS is not built or checked on CI at all: GitHub-hosted macOS runners are not
-# reliably available. The macOS app is checked (npm run native:check), built and
-# packaged on the maintainer's Mac by npm run native:release:mac. CI covers the
-# core crate on Linux and Windows, GPUI (fmt on Linux, cargo check on Linux and
-# Windows), and seeds the release caches.
+# reliably available. CI covers the core crate (clippy, tests) and the native node
+# tests on Linux and Windows, GPUI fmt, clippy -D warnings and tests on Linux, a
+# GPUI cargo check on Windows, and seeds the release caches. Only what needs a Mac
+# stays local: clippy of the macOS-only code (npm run native:check:mac), macOS-only
+# tests, and building and packaging (npm run native:release:mac, which also runs
+# the full npm run native:check before every release).
 jobs:
   core:
     name: Core (${{ matrix.os }})
@@ -66,38 +68,71 @@ jobs:
       - run: cargo clippy --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-core --all-targets --profile native-dev -- -D warnings
       - run: cargo test --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-core --profile native-dev
 
-  # GPUI itself: fmt (Linux) and a compile check of every target (Linux and
-  # Windows), so a change that breaks the Linux or Windows build fails here and
-  # not halfway through a release. It is `cargo check`, not clippy -D warnings:
-  # much of the crate is macOS-only, so it has dead-code warnings elsewhere.
-  # The gpui tests and clippy -D warnings run locally in npm run native:check
-  # before every release. No release flags, so it does not share the release
-  # cache.
-  desktop:
-    name: GPUI (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+  # GPUI itself, split into parallel jobs on purpose: clippy only produces
+  # metadata while the test build needs full codegen, so they share little and
+  # running them side by side is faster wall-clock than one job. No release
+  # flags, so none of these share the release cache.
+  #
+  # Lint (Linux): fmt, then clippy -D warnings. Clippy already type-checks every
+  # target, so a separate cargo check on Linux would only waste time.
+  desktop-lint:
+    name: GPUI lint (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates/monocode-gpui
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install native Linux build dependencies
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y clang cmake ninja-build pkg-config libfontconfig1-dev libfreetype6-dev libxcb1-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libasound2-dev libx11-xcb-dev libegl1-mesa-dev libvulkan-dev libdbus-1-dev squashfs-tools desktop-file-utils
-      - if: runner.os == 'Linux'
-        run: cargo fmt --manifest-path crates/monocode-gpui/Cargo.toml --all --check
+      - run: cargo fmt --manifest-path crates/monocode-gpui/Cargo.toml --all --check
+      - run: cargo clippy --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-core -p monocode-gpui --all-targets --profile native-dev -- -D warnings
+
+  # Windows keeps a compile check of every target (not clippy), so a change that
+  # breaks the Windows build fails here and not halfway through a release.
+  desktop:
+    name: GPUI check (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/monocode-gpui
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-core -p monocode-gpui --all-targets --profile native-dev
+
+  # The GPUI tests. macOS-only tests and the macOS build still run locally.
+  desktop-test:
+    name: GPUI tests (ubuntu-latest)
+    # Linux only. Windows GPUI tests are not run: a probe took 23 minutes to
+    # build and its tests were still running (with failures) when it hit the
+    # 60 minute limit. Windows keeps the compile check above.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/monocode-gpui
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install native Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y clang cmake ninja-build pkg-config libfontconfig1-dev libfreetype6-dev libxcb1-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libasound2-dev libx11-xcb-dev libegl1-mesa-dev libvulkan-dev libdbus-1-dev squashfs-tools desktop-file-utils
+      - run: cargo test --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-gpui --profile native-dev -- --test-threads=1
 
   # Release runs restore these, which is what makes a native release faster (a miss is
   # only slower). Keep the toolchain, per-OS setup and build command in step with

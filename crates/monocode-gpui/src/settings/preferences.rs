@@ -1,6 +1,6 @@
 //! App-wide preferences the Settings pages edit. Defaults are the React
 //! app's (`settings.ts`, `appearance.ts`, `displayPrefs.ts`, `sounds.ts`).
-use monocode_core::{provider::Kind, surface::Surface};
+use monocode_core::{cloud_sessions::kit_prefs::CloudKitPrefs, provider::Kind, surface::Surface};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
@@ -127,6 +127,10 @@ pub(crate) struct Preferences {
     pub show_archived: bool,
     // Keybindings: a changed shortcut, or `None` for a disabled one.
     pub keybindings: HashMap<String, Option<String>>,
+    // Cloud
+    /// The one global kit: item ids only, never values.
+    #[serde(rename = "cloudKit")]
+    pub cloud_kit: CloudKitPrefs,
 }
 
 pub(crate) const UI_SCALE_PERCENTS: [u32; 16] = [
@@ -212,6 +216,7 @@ impl Default for Preferences {
             mono_menu_bar_icon: true,
             show_archived: false,
             keybindings: HashMap::new(),
+            cloud_kit: CloudKitPrefs::default(),
         }
     }
 }
@@ -332,6 +337,34 @@ mod tests {
         let saved = serde_json::to_string(&prefs).unwrap();
         let loaded: Preferences = serde_json::from_str(&saved).unwrap();
         assert!(loaded.auto_resume_usage_limit);
+    }
+
+    #[test]
+    fn cloud_kit_is_off_by_default_and_round_trips_by_id_only() {
+        let prefs = Preferences::default();
+        assert_eq!(prefs.cloud_kit, CloudKitPrefs::default());
+        let old: Preferences = serde_json::from_str(r#"{"sounds":false}"#).unwrap();
+        assert!(old.cloud_kit == CloudKitPrefs::default());
+        // A preference file written while the page was behind a flag still loads.
+        let flagged: Preferences = serde_json::from_str(r#"{"cloudKitEnabled":true}"#).unwrap();
+        assert_eq!(flagged.cloud_kit, CloudKitPrefs::default());
+
+        let mut prefs = Preferences::default();
+        prefs.cloud_kit.selection = Some(["mcp:user:github".to_owned()].into());
+        prefs.cloud_kit.acknowledge_notice();
+        let saved = serde_json::to_value(&prefs).unwrap();
+        assert!(saved.get("cloudKitEnabled").is_none());
+        assert_eq!(
+            saved["cloudKit"],
+            serde_json::json!({
+                "selection": ["mcp:user:github"],
+                "enabled": true,
+                "notice_acknowledged": true,
+                "instructions": true
+            })
+        );
+        let back: Preferences = serde_json::from_value(saved).unwrap();
+        assert_eq!(back, prefs);
     }
 
     #[test]

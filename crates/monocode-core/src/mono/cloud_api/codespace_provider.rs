@@ -259,9 +259,12 @@ impl CloudProvider for CodespaceProvider {
         harness: &str,
         instance: Option<&str>,
         options: &Map<String, Value>,
+        kit: bool,
     ) -> Result<CloudStart, String> {
         let target = self.target(project, instance, options)?;
-        let (session, record) = self.cloud.begin_start(project, target, harness)?;
+        let (session, record) = self
+            .cloud
+            .begin_start_with_kit(project, target, harness, kit)?;
         Ok(CloudStart::Pending(session, record))
     }
 

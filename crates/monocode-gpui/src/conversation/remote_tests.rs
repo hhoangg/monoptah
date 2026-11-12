@@ -14,11 +14,13 @@ fn conversation(cx: &mut TestAppContext) -> Entity<Conversation> {
             let mut view = Conversation::new(summary, Arc::new(Mutex::new(store)), cx);
             view.loaded = true;
             view.remote_state.online = true;
-            view.remote_state.capabilities =
-                ["sessions.draft", "sessions.plan", "attachments.upload"]
+            view.remote_state.host = monocode_core::remote::host_info::HostInfo {
+                capabilities: ["sessions.draft", "sessions.plan", "attachments.upload"]
                     .into_iter()
                     .map(str::to_owned)
-                    .collect();
+                    .collect(),
+                ..Default::default()
+            };
             view.input.update(cx, |input, cx| {
                 input.set_text("Keep this next message".into(), cx)
             });
@@ -64,7 +66,7 @@ fn remote_capability_and_command_guards_keep_composer_and_attachments(cx: &mut T
     let view = conversation(cx);
     cx.update(|cx| {
         view.update(cx, |view, cx| {
-            view.remote_state.capabilities.clear();
+            view.remote_state.host = Default::default();
             view.attachments = vec![PathBuf::from("/home/me/design.png")];
             assert!(view.remote_send_guard(cx));
             assert!(view.status.contains("attachments"));
@@ -1606,6 +1608,40 @@ fn enter_on_an_empty_composer_resumes_nothing_but_the_pill_does(cx: &mut TestApp
     assert!(launched(window, visual).is_empty());
 }
 
+/// The connection strip reads cached view state; only its Connect action (the Reconnect button)
+/// ever reaches the wake service, and it reaches it once.
+#[gpui::test]
+fn the_panel_link_never_wakes_and_connect_wakes_once(cx: &mut TestAppContext) {
+    use crate::panel_root::Link;
+    let (window, host) = stopped_codespace(cx, "");
+    window
+        .update(cx, |view, _, cx| {
+            // Reading the link, over and over, is what a background frame does.
+            for _ in 0..5 {
+                assert_eq!(view.panel_link(), Link::NotConnected);
+            }
+            // Online but stopped is still not connected.
+            view.remote_state.online = true;
+            assert_eq!(view.panel_link(), Link::NotConnected);
+            view.set_cloud_stopped(false, cx);
+            assert_eq!(view.panel_link(), Link::Connected);
+            view.set_cloud_stopped(true, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(ensures(&host), 0, "{:?}", host.0.lock().unwrap());
+    // Connect is `reconnect_cloud`; pressing it twice still wakes once.
+    window
+        .update(cx, |view, _, cx| {
+            assert!(view.reconnect_cloud(cx));
+            assert!(view.reconnect_cloud(cx));
+            assert_eq!(view.panel_link(), Link::Starting);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(ensures(&host), 1, "{:?}", host.0.lock().unwrap());
+}
+
 #[gpui::test]
 fn attachments_only_while_stopped_ask_for_a_prompt(cx: &mut TestAppContext) {
     let (window, host) = stopped_codespace(cx, "");
@@ -2024,7 +2060,7 @@ fn a_blocked_head_message_pauses_the_queue_with_a_retry(cx: &mut TestAppContext)
         .update(cx, |view, _, cx| {
             view.cloud_stopped = false;
             view.remote_state.online = true;
-            view.remote_state.capabilities.clear();
+            view.remote_state.host = Default::default();
             view.attachments = vec![PathBuf::from("/tmp/a.png")];
             view.input
                 .update(cx, |input, cx| input.set_text("see this".into(), cx));
@@ -2064,4 +2100,74 @@ fn queued_messages_of_a_remote_session_offer_no_steer(cx: &mut TestAppContext) {
         })
         .unwrap();
     assert!(visual.debug_bounds("queue-steer").is_none());
+}
+
+/// The panels dim and refuse writes only for a link that is known to be down. A conversation that
+/// has not finished its first refresh knows nothing, and neither does a session without one.
+#[gpui::test]
+fn the_panel_link_is_known_only_after_the_workspace_answered_or_failed(cx: &mut TestAppContext) {
+    let view = conversation(cx);
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            // First refresh not finished: not online yet, but nothing says it is down.
+            view.remote_state.online = false;
+            assert!(!view.panel_link_known());
+            // Live.
+            view.set_online_for_test(true);
+            assert!(view.panel_link_known());
+            // It was live and then dropped: a known drop.
+            view.set_online_for_test(false);
+            assert!(view.panel_link_known());
+        });
+    });
+    let view = conversation(cx);
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            view.remote_state.online = false;
+            view.remote_state.error = Some("Could not reach the codespace.".into());
+            assert!(view.panel_link_known());
+            view.remote_state.error = None;
+            view.remote_state.waking = true;
+            assert!(view.panel_link_known());
+            view.remote_state.waking = false;
+            view.cloud_stopped = true;
+            assert!(view.panel_link_known());
+        })
+    });
+}
+
+/// A user's own machine keeps the manual Upgrade copy; a cloud workspace updates itself at
+/// connect, so it never points at Connections settings.
+#[gpui::test]
+fn the_host_update_copy_differs_for_cloud_and_user_machines(cx: &mut TestAppContext) {
+    use crate::cloud_wake::fakes::{
+        AUTH_OK, github_project, install_with_sandbox, sandbox_session,
+    };
+    let user_machine = conversation(cx);
+    cx.update(|cx| {
+        user_machine.update(cx, |view, _| {
+            assert_eq!(view.cloud_noun(), None);
+            assert_eq!(
+                view.host_update_copy("use Plan mode"),
+                "Update Monoptah Host in Connections settings to use Plan mode."
+            );
+        })
+    });
+    let dir = github_project();
+    let store: Database = Arc::new(Mutex::new(
+        monocode_core::store::Store::open(Path::new(":memory:")).unwrap(),
+    ));
+    let (_gh, _host, _sbx, _) = install_with_sandbox(store.clone(), AUTH_OK, "Shutdown", "stopped");
+    let summary = sandbox_session(&store, dir.0.to_str().unwrap());
+    let view = cx.update(|cx| cx.new(|cx| Conversation::new(summary, store.clone(), cx)));
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            let copy = view.host_update_copy("use Plan mode");
+            assert_eq!(
+                copy,
+                "Monoptah Host will be updated on the next connect. Then you can use Plan mode."
+            );
+            assert!(!copy.contains("Connections settings"));
+        })
+    });
 }

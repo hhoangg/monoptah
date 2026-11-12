@@ -2,6 +2,14 @@
 mod app_access;
 pub use app_access::ArchiveTimes;
 mod contributions;
+mod location;
+pub use location::UNREADABLE_LOCATION as UNREADABLE_LOCATION_TEXT;
+pub use location::{
+    CloudLocation, MovePoint, SessionLocation, HOST_TURN_RUNNING, LOCAL_RUN_REFUSED,
+    LOCAL_TUI_REFUSED, UNREADABLE_NOTICE, WORKSPACE_LOST,
+};
+mod cloud_rows;
+pub use cloud_rows::{AppendOutcome, RowAnchor};
 mod managed_sessions;
 mod monocode_import;
 mod monos;
@@ -10,7 +18,7 @@ mod remote;
 mod remote_legacy;
 pub use remote::{
     is_pending_cloud_environment, pending_cloud_project, RemoteProject, RemoteSession,
-    RemoteUpload, CONVERTED, SANDBOX_STOPPED_DELETE,
+    RemoteUpload, CONVERTED, MISSING_HOST, SANDBOX_STOPPED_DELETE,
 };
 pub(crate) use shared::handle as desktop_session_handle;
 mod session_metadata;
@@ -34,6 +42,38 @@ use rusqlite::{params, Connection};
 pub use shared::{HistoryPage, PAGE_TURNS};
 pub use side_threads::DesktopSideThread;
 use std::path::Path;
+
+/// Why a local write to the rows of a session that lives in the cloud is refused.
+pub(crate) const CLOUD_OWNED: &str =
+    "This conversation is in the cloud. Its messages are written from the cloud workspace.";
+
+/// Idempotent row upsert: re-writing the same rows changes nothing, and a different row at
+/// the same index replaces the old one completely.
+fn upsert_rows(
+    tx: &rusqlite::Transaction,
+    session: i64,
+    start: usize,
+    rows: &[Row],
+) -> Result<(), String> {
+    let mut stmt = tx
+        .prepare(
+            "INSERT INTO native_rows(session_id,row_ix,role,body,first,sent_at) VALUES(?1,?2,?3,?4,?5,?6)
+        ON CONFLICT(session_id,row_ix) DO UPDATE SET role=excluded.role,body=excluded.body,first=excluded.first,sent_at=excluded.sent_at",
+        )
+        .map_err(|e| e.to_string())?;
+    for (offset, row) in rows.iter().enumerate() {
+        stmt.execute(params![
+            session,
+            (start + offset) as i64,
+            row.role,
+            row.text,
+            row.first,
+            row.sent_at.and_then(|at| i64::try_from(at).ok())
+        ])
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
 
 /// Upsert of a session's agent settings JSON. The surface is fixed at creation
 /// and `Settings` does not carry it, so a stored one is kept.
@@ -556,6 +596,30 @@ impl Store {
         let value = serde_json::to_string(summary).map_err(|e| e.to_string())?;
         self.save_setting(&format!("orchestration:{lead}"), &value)
     }
+    /// Every non-empty setting whose key starts with `prefix`, as `(rest of the key, value)`.
+    pub fn settings_with_key_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>, String> {
+        if self.shared.is_some() {
+            return self.shared_settings_with_key_prefix(prefix);
+        }
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key, value FROM native_settings WHERE substr(key, 1, length(?1)) = ?1")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([prefix], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (key, value) = row.map_err(|e| e.to_string())?;
+            if let Some(rest) = key.strip_prefix(prefix).filter(|_| !value.is_empty()) {
+                out.push((rest.to_string(), value));
+            }
+        }
+        Ok(out)
+    }
     /// `prefix<session id>` settings, by session id.
     fn settings_with_prefix(&self, prefix: &str) -> Result<Vec<(i64, String)>, String> {
         if self.shared.is_some() {
@@ -946,30 +1010,18 @@ impl Store {
         if self.remote_session(session)?.is_some() {
             return Err("Remote transcripts are owned by the host".into());
         }
+        // Single writer (design 4.9 R2): while the session is in the cloud, only the remote
+        // row append (`append_projected_rows`) writes its rows. The local runtime is refused
+        // earlier, before it starts a turn (`require_local_run`); this stays as the backstop.
+        if self.cloud_location(session)?.is_cloud() {
+            return Err(CLOUD_OWNED.into());
+        }
         if self.shared.is_some() {
             return self.shared_write_rows(session, start, rows, message_id);
         }
 
         let tx = self.conn.transaction().map_err(|e| e.to_string())?;
-        {
-            let mut stmt = tx
-                .prepare(
-                    "INSERT INTO native_rows(session_id,row_ix,role,body,first,sent_at) VALUES(?1,?2,?3,?4,?5,?6)
-                ON CONFLICT(session_id,row_ix) DO UPDATE SET body=excluded.body",
-                )
-                .map_err(|e| e.to_string())?;
-            for (offset, row) in rows.iter().enumerate() {
-                stmt.execute(params![
-                    session,
-                    (start + offset) as i64,
-                    row.role,
-                    row.text,
-                    row.first,
-                    row.sent_at.and_then(|at| i64::try_from(at).ok())
-                ])
-                .map_err(|e| e.to_string())?;
-            }
-        }
+        upsert_rows(&tx, session, start, rows)?;
         if !rows.is_empty() {
             tx.execute(
                 "UPDATE native_sessions SET updated_at=?2 WHERE id=?1",
@@ -1230,15 +1282,45 @@ impl Store {
         id: i64,
         delete_rows: impl FnOnce(&mut Self) -> Result<(), String>,
     ) -> Result<(), String> {
+        // The only copy of someone's uncommitted work may sit in this session's folder.
+        if let Some(raw) = self.cloud_continue_broken(id) {
+            let backup = serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()
+                .and_then(|v| v["backup"].as_str().map(str::to_owned))
+                .unwrap_or_default();
+            return Err(format!(
+                "An interrupted return from the cloud left a backup of uncommitted work in {backup}. Restore or discard it before deleting this conversation."
+            ));
+        }
         // Resolve the folder first; the persisted id is gone after deletion.
         let dir = self.thread_dir(id).ok().flatten();
+        let cloud_cursor = match self.cloud_location(id) {
+            Ok(SessionLocation::Cloud(l)) => Some((l.environment_id, l.host_session_id)),
+            _ => None,
+        };
         // A converted cloud session's host copy may come back once its local copy is gone.
         let origin = self
             .setting(&format!("codespace-origin:{id}"))
             .ok()
             .flatten()
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+        // The Host record that backed a Cloud-located session. Once the location is gone it
+        // would show up as a cloud session of its own, so the local record goes with the
+        // session. The conversation on the workspace itself is not touched (design 4.9 R8).
+        let backing: Vec<i64> = self
+            .linked_remote_session(id)
+            .ok()
+            .flatten()
+            .map(|(remote, _)| remote)
+            .into_iter()
+            .collect();
         delete_rows(self)?;
+        for remote in backing {
+            let _ = self.forget_cloud_session(remote);
+        }
+        if let Some((env, host)) = cloud_cursor {
+            let _ = self.save_setting(&Self::synced_key(&env, &host), "");
+        }
         if let Some(origin) = origin {
             // The refs kept for a restore that never happened; after a restore they hold the
             // other saved branches, which stay.
@@ -1278,7 +1360,7 @@ impl Store {
         tx.execute("DELETE FROM native_reminders WHERE session_id=?1", [id])
             .map_err(|e| e.to_string())?;
         tx.execute(
-            "DELETE FROM native_settings WHERE key IN (?1,?2,?3,?5,?6,?7,?8,?9,?10,?11) OR key LIKE ?4",
+            "DELETE FROM native_settings WHERE key IN (?1,?2,?3,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21) OR key LIKE ?4",
             params![
                 format!("agent:{id}"),
                 format!("context:{id}"),
@@ -1290,7 +1372,17 @@ impl Store {
                 format!("automation:{id}"),
                 format!("mono-retired:{id}"),
                 format!("archive-times:{id}"),
-                format!("codespace-origin:{id}")
+                format!("codespace-origin:{id}"),
+                format!("cloud-location:{id}"),
+                format!("cloud-sync-error:{id}"),
+                format!("cloud-move:{id}"),
+                format!("cloud-move-note:{id}"),
+                format!("cloud-move-owner:{id}"),
+                format!("cloud-move-mark:{id}"),
+                format!("cloud-continue:{id}"),
+                format!("cloud-move-point:{id}"),
+                format!("cloud-continue-broken:{id}"),
+                format!("gate-before-row:{id}")
             ],
         )
         .map_err(|e| e.to_string())?;

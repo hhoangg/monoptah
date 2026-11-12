@@ -25,9 +25,12 @@ pub(super) fn begin_cloud_create(
     request: &CloudCreate,
 ) -> Result<(Session, StartRecord), String> {
     match request.target {
-        CloudTarget::Codespace => {
-            cloud_picker::begin_cloud_start(cloud, &request.project, codespace_target(request)?)
-        }
+        CloudTarget::Codespace => cloud_picker::begin_cloud_start(
+            cloud,
+            &request.project,
+            codespace_target(request)?,
+            request.kit,
+        ),
         CloudTarget::DockerSandbox => {
             // The config already carries this session's overrides; `begin_sandbox_start`
             // validates it again.
@@ -35,7 +38,13 @@ pub(super) fn begin_cloud_create(
                 .config
                 .as_ref()
                 .ok_or("Set up Docker Sandbox for this project first.")?;
-            cloud.begin_sandbox_start(&request.project, config, &request.branch, HARNESS)
+            cloud.begin_sandbox_start_with_kit(
+                &request.project,
+                config,
+                &request.branch,
+                HARNESS,
+                request.kit,
+            )
         }
     }
 }
@@ -66,6 +75,20 @@ impl Shell {
             });
             view.update(cx, |view, cx| view.set_cloud_stopped(stopped, cx));
         }
+    }
+
+    /// Tells every open conversation whether its session lives in the cloud (the location,
+    /// not the Host record, decides), so it can gate rewinds and show a sync error.
+    pub(super) fn sync_cloud_location(&mut self, cx: &mut Context<Self>) {
+        for (id, view) in &self.sessions {
+            let located = self.cloud_located.get(id).cloned();
+            let returned = locked(&self.store).ok().and_then(|s| s.returned_gate(*id));
+            view.update(cx, |view, cx| {
+                view.set_cloud_location(located, cx);
+                view.set_returned_gate(returned, cx);
+            });
+        }
+        self.sync_cloud_moves(cx);
     }
 
     /// How a conversation lists the machine types of its repository: `gh api` on the worker.

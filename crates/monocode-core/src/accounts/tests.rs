@@ -381,3 +381,76 @@ fn the_preferred_account_drives_new_sessions_and_falls_back_when_removed() {
     book.set_preferred(Kind::Claude, DEFAULT).unwrap();
     assert!(book.defaults.is_empty());
 }
+
+#[test]
+fn resolve_matches_default_id_and_exact_label_only() {
+    let mut book = Book::default();
+    let work = book.add(Kind::Claude, "Work account").unwrap();
+    let codex = book.add(Kind::Codex, "Hoang").unwrap();
+    let removed = book.add(Kind::Claude, "Old").unwrap();
+    book.remove(Kind::Claude, &removed.id).unwrap();
+    let ok = |kind, text: &str| resolve(&book, kind, text);
+    assert_eq!(ok(Kind::Claude, "default").unwrap(), DEFAULT);
+    assert_eq!(ok(Kind::Claude, "  default ").unwrap(), DEFAULT);
+    assert_eq!(ok(Kind::Claude, &work.id).unwrap(), work.id);
+    assert_eq!(ok(Kind::Claude, "work account").unwrap(), work.id);
+    assert_eq!(ok(Kind::Claude, "  WORK    Account ").unwrap(), work.id);
+    assert_eq!(ok(Kind::Codex, "hoang").unwrap(), codex.id);
+    // The default account is reachable by its label too.
+    assert_eq!(ok(Kind::Claude, "CLI login").unwrap(), DEFAULT);
+    // Ids are case-sensitive.
+    assert!(ok(Kind::Claude, &work.id.to_uppercase()).is_err());
+    // No prefix or fuzzy matching.
+    for bad in ["wor", "work", "work account x", "", "   "] {
+        assert!(
+            matches!(ok(Kind::Claude, bad), Err(ResolveError::NotFound { .. })),
+            "{bad:?}"
+        );
+    }
+    // Removed accounts never match, by label or id.
+    assert!(ok(Kind::Claude, "Old").is_err());
+    assert!(ok(Kind::Claude, &removed.id).is_err());
+}
+
+#[test]
+fn resolve_errors_list_valid_choices_and_name_the_owner() {
+    let mut book = Book::default();
+    let work = book.add(Kind::Claude, "Work").unwrap();
+    let codex = book.add(Kind::Codex, "Hoang").unwrap();
+    let text = resolve(&book, Kind::Claude, "nobody")
+        .unwrap_err()
+        .to_string();
+    assert!(text.contains("claude") && text.contains("Work") && text.contains(&work.id));
+    assert!(text.contains("CLI login"));
+    for selector in ["Hoang", codex.id.as_str()] {
+        let error = resolve(&book, Kind::Claude, selector).unwrap_err();
+        assert!(matches!(error, ResolveError::OtherProvider { .. }));
+        let text = error.to_string();
+        assert!(text.contains("belongs to codex"), "{text}");
+        assert!(text.contains(&work.id), "lists the requested provider");
+    }
+    // Devin has only its default account.
+    assert_eq!(resolve(&book, Kind::Devin, "default").unwrap(), DEFAULT);
+    assert!(resolve(&book, Kind::Devin, "Work").is_err());
+    // A harness without account support.
+    assert!(matches!(
+        resolve(&book, Kind::OpenCode, "default"),
+        Err(ResolveError::Unsupported(_))
+    ));
+}
+
+#[test]
+fn resolve_reports_ambiguous_labels_with_their_ids() {
+    let mut book = Book::default();
+    let first = book.add(Kind::Claude, "Team").unwrap();
+    let second = book.add(Kind::Claude, "team").unwrap();
+    let error = resolve(&book, Kind::Claude, "TEAM").unwrap_err();
+    let text = error.to_string();
+    assert!(matches!(error, ResolveError::Ambiguous { .. }));
+    assert!(
+        text.contains(&first.id) && text.contains(&second.id),
+        "{text}"
+    );
+    // An exact id still resolves.
+    assert_eq!(resolve(&book, Kind::Claude, &first.id).unwrap(), first.id);
+}

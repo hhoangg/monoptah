@@ -2,6 +2,7 @@
 //! persistent native_* tables, or history conversion on open.
 mod accounts;
 pub(super) mod blocks;
+mod cloud_rows;
 mod edit;
 mod index_search;
 mod settings;
@@ -1418,6 +1419,21 @@ impl Store {
             .filter_map(|(key, value)| {
                 Some((key.strip_prefix(prefix)?.parse().ok()?, value.clone()))
             })
+            .collect())
+    }
+    pub(super) fn shared_settings_with_key_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, String)>, String> {
+        Ok(self
+            .shared
+            .as_ref()
+            .unwrap()
+            .extras
+            .borrow()
+            .iter()
+            .filter(|(_, value)| !value.is_empty())
+            .filter_map(|(key, value)| Some((key.strip_prefix(prefix)?.to_string(), value.clone())))
             .collect())
     }
     pub(super) fn shared_drafts(&self) -> Result<HashSet<i64>, String> {

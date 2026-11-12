@@ -398,6 +398,177 @@ impl Book {
         Ok(())
     }
 }
+/// Why a textual account selector did not name exactly one account.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResolveError {
+    /// The provider has no account support at all.
+    Unsupported(String),
+    /// Two accounts of the provider share the label; the ids are listed.
+    Ambiguous {
+        provider: String,
+        label: String,
+        ids: Vec<String>,
+    },
+    /// The name exists only for another provider.
+    OtherProvider {
+        provider: String,
+        owner: String,
+        valid: String,
+    },
+    /// Nothing matches; `valid` lists this provider's labels and ids.
+    NotFound {
+        provider: String,
+        selector: String,
+        valid: String,
+    },
+}
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported(provider) => {
+                write!(f, "{provider} does not support provider accounts")
+            }
+            Self::Ambiguous {
+                provider,
+                label,
+                ids,
+            } => write!(
+                f,
+                "Several {provider} accounts are named \"{label}\"; use one of these ids: {}",
+                ids.join(", ")
+            ),
+            Self::OtherProvider {
+                provider,
+                owner,
+                valid,
+            } => write!(
+                f,
+                "That account belongs to {owner}, not {provider}. Valid {provider} accounts: {valid}"
+            ),
+            Self::NotFound {
+                provider,
+                selector,
+                valid,
+            } => write!(
+                f,
+                "No {provider} account matches \"{selector}\". Valid {provider} accounts: {valid}"
+            ),
+        }
+    }
+}
+fn fold_label(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+fn describe_accounts(rows: &[Account]) -> String {
+    rows.iter()
+        .map(|a| format!("{} ({})", a.label, a.id))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+/// Resolve a user-written selector to an account id of `kind`. Accepts, in
+/// order: the literal `default`, an exact id, then a case-insensitive exact
+/// label (inner whitespace collapsed). Never a prefix or fuzzy match.
+pub fn resolve(book: &Book, kind: Kind, selector: &str) -> Result<String, ResolveError> {
+    if !supports_accounts(kind) {
+        return Err(ResolveError::Unsupported(kind.id().into()));
+    }
+    let selector = selector.trim();
+    let rows = book.list(kind);
+    if selector == DEFAULT {
+        return Ok(DEFAULT.into());
+    }
+    if let Some(row) = rows.iter().find(|a| a.id == selector) {
+        return Ok(row.id.clone());
+    }
+    let wanted = fold_label(selector);
+    if !wanted.is_empty() {
+        let hits: Vec<&Account> = rows
+            .iter()
+            .filter(|a| fold_label(&a.label) == wanted)
+            .collect();
+        match hits.as_slice() {
+            [one] => return Ok(one.id.clone()),
+            [] => (),
+            many => {
+                return Err(ResolveError::Ambiguous {
+                    provider: kind.id().into(),
+                    label: selector.into(),
+                    ids: many.iter().map(|a| a.id.clone()).collect(),
+                })
+            }
+        }
+    }
+    let valid = describe_accounts(&rows);
+    for other in PROVIDERS.into_iter().filter(|other| *other != kind) {
+        let theirs = book.list(other);
+        if theirs
+            .iter()
+            .any(|a| a.id == selector || (!wanted.is_empty() && fold_label(&a.label) == wanted))
+        {
+            return Err(ResolveError::OtherProvider {
+                provider: kind.id().into(),
+                owner: other.id().into(),
+                valid,
+            });
+        }
+    }
+    Err(ResolveError::NotFound {
+        provider: kind.id().into(),
+        selector: selector.into(),
+        valid,
+    })
+}
+/// Parse the `provider` filter of `accounts.list`.
+pub fn parse_provider(text: &str) -> Result<Kind, String> {
+    Kind::parse(text.trim())
+        .filter(|kind| supports_accounts(*kind))
+        .ok_or_else(|| {
+            let ids: Vec<&str> = PROVIDERS.iter().map(|kind| kind.id()).collect();
+            format!(
+                "provider must be one of: {} (the providers with accounts)",
+                ids.join(", ")
+            )
+        })
+}
+/// How an account signs in: "cli" (the provider CLI's own login), "setupToken" or "apiKey".
+pub fn auth_kind(kind: Kind, credential: Option<ClaudeCredential>) -> &'static str {
+    match (kind, credential) {
+        (Kind::Claude, Some(ClaudeCredential::SetupToken)) => "setupToken",
+        (Kind::Claude, Some(ClaudeCredential::ApiKey)) => "apiKey",
+        _ => "cli",
+    }
+}
+/// The `accounts.list` result: ids, labels and credential kinds only, never a
+/// token, an email or a path. `claude_credential` reports the kind of a named
+/// Claude account; anything without one (and every other provider) is "cli".
+pub fn list_value(
+    book: &Book,
+    provider: Option<Kind>,
+    claude_credential: &dyn Fn(&str) -> Option<ClaudeCredential>,
+) -> serde_json::Value {
+    let kinds: Vec<Kind> = match provider {
+        Some(kind) => vec![kind],
+        None => PROVIDERS.to_vec(),
+    };
+    let mut rows = Vec::new();
+    for kind in kinds {
+        let preferred = book.preferred(kind);
+        for account in book.list(kind) {
+            let auth = auth_kind(kind, claude_credential(&account.id));
+            rows.push(serde_json::json!({
+                "provider": kind.id(),
+                "id": account.id,
+                "label": account.label,
+                "isDefault": account.id == preferred,
+                "authKind": auth,
+            }));
+        }
+    }
+    serde_json::json!({ "accounts": rows })
+}
 fn project_key(project: &str) -> String {
     let key = project.trim().replace('\\', "/");
     let key = key.trim_end_matches('/');

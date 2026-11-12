@@ -15,21 +15,36 @@ pub fn is_remote(path: &Path) -> bool {
 /// Run one of the same bounded workspace commands supported by the Tauri app.
 /// This is synchronous, like the filesystem APIs; call from a background task.
 pub fn run_remote_command(command: &str, args: Value) -> Result<Value, String> {
-    run_with(command, args, |environment, params| {
+    run_with(command, args, |environment, params, timeout| {
         let connections = crate::remote::default_connections()?;
         let machine = connections.machine_for_environment(environment)?;
-        connections.request(&machine.id, "workspace.run", params)
+        connections.request_timeout(&machine.id, "workspace.run", params, timeout)
     })
+}
+
+/// Push and pull get a long limit (the Host stops each at 90 s). Sync runs a pull and then
+/// a push on the Host, so it gets about twice that. Every other command keeps the ordinary
+/// limit.
+fn command_timeout(command: &str) -> Option<std::time::Duration> {
+    match command {
+        "git_push" | "git_pull" => Some(crate::remote::GIT_REMOTE_TIMEOUT),
+        "git_sync" => Some(crate::remote::GIT_SYNC_TIMEOUT),
+        _ => None,
+    }
 }
 
 fn run_with(
     command: &str,
     args: Value,
-    request: impl FnOnce(&str, Value) -> Result<Value, String>,
+    request: impl FnOnce(&str, Value, Option<std::time::Duration>) -> Result<Value, String>,
 ) -> Result<Value, String> {
     let (environment, args) = host_arguments(command, args)?;
-    let result =
-        request(&environment, json!({"command":command,"args":args})).map_err(workspace_error)?;
+    let result = request(
+        &environment,
+        json!({"command":command,"args":args}),
+        command_timeout(command),
+    )
+    .map_err(workspace_error)?;
     Ok(client_result(command, &environment, &args, result))
 }
 
@@ -38,7 +53,7 @@ pub(crate) fn command<T: DeserializeOwned>(command: &str, args: Value) -> Result
         .map_err(|error| format!("Invalid remote workspace response: {error}"))
 }
 
-fn workspace_error(error: String) -> String {
+pub(super) fn workspace_error(error: String) -> String {
     let lower = error.to_ascii_lowercase();
     if [
         "unsupported host method",
@@ -124,6 +139,14 @@ fn host_arguments(command: &str, args: Value) -> Result<(String, Value), String>
         }
     }
     Ok((environment.ok_or(UNAVAILABLE)?, Value::Object(args)))
+}
+
+#[cfg(test)]
+pub(super) fn host_arguments_for_tests(
+    command: &str,
+    args: Value,
+) -> Result<(String, Value), String> {
+    host_arguments(command, args)
 }
 
 fn to_host(value: &mut Value, environment: &mut Option<String>) -> Result<(), String> {
@@ -234,7 +257,7 @@ mod tests {
 
     #[test]
     fn rpc_routes_paths_and_preserves_remote_failure_without_local_fallback() {
-        let result = run_with("list_dir", json!({"path":"remote://env/home/code"}), |environment, params| {
+        let result = run_with("list_dir", json!({"path":"remote://env/home/code"}), |environment, params, _| {
             assert_eq!(environment, "env");
             assert_eq!(params, json!({"command":"list_dir","args":{"path":"/home/code"}}));
             Ok(json!([{"name":"a.txt","path":"/home/code/a.txt","isDir":false,"ignored":false}]))
@@ -243,17 +266,55 @@ mod tests {
         let error = run_with(
             "read_text_file",
             json!({"path":"remote://env/home/code/a.txt"}),
-            |_, _| Err("Host disconnected".into()),
+            |_, _, _| Err("Host disconnected".into()),
         )
         .unwrap_err();
         assert_eq!(error, "Host disconnected");
         let error = run_with(
             "read_text_file",
             json!({"path":"remote://env/home/code/a.txt"}),
-            |_, _| Err("Unsupported host method".into()),
+            |_, _, _| Err("Unsupported host method".into()),
         )
         .unwrap_err();
         assert_eq!(error, OUTDATED);
+    }
+
+    #[test]
+    fn push_pull_and_sync_get_the_long_timeout_and_other_commands_do_not() {
+        for (command, expected) in [
+            ("git_push", Some(crate::remote::GIT_REMOTE_TIMEOUT)),
+            ("git_pull", Some(crate::remote::GIT_REMOTE_TIMEOUT)),
+            ("git_sync", Some(crate::remote::GIT_SYNC_TIMEOUT)),
+            ("git_commit", None),
+            ("git_diff_index", None),
+            ("list_dir", None),
+        ] {
+            let seen = std::cell::Cell::new(None);
+            let _ = run_with(
+                command,
+                json!({"cwd":"remote://env/home/code","path":"remote://env/home/code"}),
+                |_, _, timeout| {
+                    seen.set(Some(timeout));
+                    Ok(json!(null))
+                },
+            );
+            assert_eq!(seen.get(), Some(expected), "{command}");
+        }
+        assert_eq!(
+            crate::remote::GIT_REMOTE_TIMEOUT,
+            std::time::Duration::from_secs(120)
+        );
+    }
+
+    #[test]
+    fn a_timeout_reaches_the_caller_unchanged() {
+        let error = run_with(
+            "git_push",
+            json!({"cwd":"remote://env/home/code"}),
+            |_, _, _| Err(crate::remote::MAY_STILL_RUN.into()),
+        )
+        .unwrap_err();
+        assert_eq!(error, crate::remote::MAY_STILL_RUN);
     }
 
     #[test]

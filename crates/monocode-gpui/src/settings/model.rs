@@ -18,6 +18,8 @@ pub(crate) enum Section {
     Inbox,
     Archive,
     Worktrees,
+    /// Not in [`Section::ALL`] (so Settings search does not list it yet); the rail adds it.
+    Cloud,
 }
 
 pub(crate) const GROUPS: [(&str, &[Section]); 3] = [
@@ -47,6 +49,7 @@ pub(crate) const GROUPS: [(&str, &[Section]); 3] = [
 ];
 
 impl Section {
+    /// The searchable pages. [`Section::Cloud`] is added by the rail.
     pub(crate) const ALL: [Section; 12] = [
         Section::General,
         Section::Connections,
@@ -75,6 +78,7 @@ impl Section {
             Section::Inbox => "inbox",
             Section::Archive => "archive",
             Section::Worktrees => "worktrees",
+            Section::Cloud => "cloud",
         }
     }
     pub(crate) fn label(self) -> &'static str {
@@ -91,6 +95,7 @@ impl Section {
             Section::Inbox => "Inbox",
             Section::Archive => "Archive",
             Section::Worktrees => "Worktrees",
+            Section::Cloud => "Cloud",
         }
     }
     pub(crate) fn description(self) -> &'static str {
@@ -121,6 +126,9 @@ impl Section {
             }
             Section::Archive => "Projects and conversations you have archived.",
             Section::Worktrees => "Manage additional worktrees for each project.",
+            Section::Cloud => {
+                "What Monoptah copies from this computer to your cloud workspaces: skills, MCP servers and plugins."
+            }
         }
     }
     fn keywords(self) -> &'static str {
@@ -147,6 +155,7 @@ impl Section {
             }
             Section::Archive => "archived restore delete hidden",
             Section::Worktrees => "git branch worktree working copy project create delete",
+            Section::Cloud => "codespace sandbox docker kit claude setup secrets sign in copy",
         }
     }
     /// SettingsRail.tsx's SECTION_ICONS.
@@ -164,6 +173,7 @@ impl Section {
             Section::Inbox => "inbox-hi",
             Section::Archive => "archive",
             Section::Worktrees => "folder-tree",
+            Section::Cloud => "cloud-upload",
         }
     }
 }

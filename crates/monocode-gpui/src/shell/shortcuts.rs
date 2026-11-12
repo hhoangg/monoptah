@@ -25,6 +25,56 @@ pub(super) struct Shortcuts {
     _native: Option<macos::NativeKeys>,
 }
 
+/// Actions of the app and the window itself, which keep working behind a blocking dialog:
+/// from the menu bar and from their key bindings (Hide, Minimize, Quit...).
+fn app_level_action(action: &dyn Action) -> bool {
+    matches!(
+        action.name(),
+        "application::Hide"
+            | "application::HideOthers"
+            | "application::ShowAll"
+            | "application::Quit"
+            | "application::OpenUrl"
+            | "workspace::MinimizeWindow"
+            | "workspace::ZoomWindow"
+            | "workspace::About"
+    )
+}
+
+/// Pure modifier presses are observations, not strokes of a shortcut.
+fn is_modifier_key(keystroke: &Keystroke) -> bool {
+    matches!(
+        keystroke.key.as_str(),
+        "control" | "platform" | "alt" | "shift" | "function"
+    )
+}
+
+/// While a blocking dialog is open the menu bar must not reach the workspace behind it: a
+/// menu action dispatches to the focused node, which sits inside the Shell. Registers a
+/// capture listener that swallows each workspace-level menu action; the app and window level
+/// ones (see [`app_level_action`]) are left out on purpose.
+pub(super) fn block_menu_actions<E: InteractiveElement>(element: E) -> E {
+    macro_rules! swallow {
+        ($el:expr; $($action:ty),+ $(,)?) => {{
+            let mut el = $el;
+            $(el = el.capture_action(|_: &$action, _, cx| cx.stop_propagation());)+
+            el
+        }};
+    }
+    swallow!(
+        element;
+        NewCodex, NewClaude, OpenProject, CloseTab, CloseAllTabs, CloseOtherTabs, VisitBack,
+        VisitForward, NextTab, PreviousTab, ToggleSidebar, FocusSearch, SearchFiles,
+        PreviousSession, NextSession, PreviousProject, NextProject, SwitchModel,
+        ToggleRightPanel, SplitRight, SplitDown, FocusPaneLeft, FocusPaneRight, FocusPaneUp,
+        FocusPaneDown, ToggleTerminal, NewTerminal, NewTerminalHome, SplitTerminal,
+        ToggleLayout, ToggleWorkspaceStyle, OpenSettings, GoToFile, OpenCommandPalette,
+        OpenInbox, OpenNotes, CheckForUpdates, ZoomIn, ZoomOut, ResetZoom, Reload,
+        SidebarAppearance, crate::file_editor::ToggleAutosave,
+        crate::file_editor::ToggleGitBlame,
+    )
+}
+
 fn workspace_action(action: &dyn Action) -> bool {
     let name = action.name();
     (name.starts_with("workspace::")
@@ -80,6 +130,41 @@ fn quit_press(
     })
 }
 
+impl Shell {
+    /// The focus handle of the open blocking dialog (continue locally, or archive a cloud
+    /// session), which must own the keyboard and pointer until it closes.
+    pub(super) fn blocking_modal(&self) -> Option<FocusHandle> {
+        self.cloud_continue
+            .dialog
+            .as_ref()
+            .map(|d| d.focus_handle())
+            .or_else(|| self.cloud_archive.as_ref().map(|d| d.focus_handle()))
+    }
+
+    /// Escape and Enter for the open blocking dialog. Every other key is ignored.
+    fn blocking_modal_key(
+        &mut self,
+        keystroke: &Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let escape = keystroke.key == "escape";
+        let enter = keystroke.key == "enter";
+        if self.cloud_continue.dialog.is_some() {
+            if escape {
+                self.close_continue_locally(window, cx);
+            }
+        } else if let Some(dialog) = self.cloud_archive.as_ref() {
+            if escape {
+                self.dismiss_cloud_archive(window, cx);
+            } else if enter && matches!(dialog.phase, cloud::Phase::Choose) {
+                let default = cloud::default_choice(dialog.others());
+                self.confirm_cloud_archive(default, window, cx);
+            }
+        }
+    }
+}
+
 pub(super) fn install(owner: WeakEntity<Shell>, window: &Window, cx: &mut App) -> Shortcuts {
     let window_id = window.window_handle().window_id();
     let forwarding = Rc::new(Forwarding::default());
@@ -93,6 +178,42 @@ pub(super) fn install(owner: WeakEntity<Shell>, window: &Window, cx: &mut App) -
         let Some(owner) = owner.upgrade() else {
             return;
         };
+        // A blocking dialog's focus sits inside the Workspace key context, so without this
+        // every workspace binding (and Tab focus moves) would act behind the dialog.
+        if let Some(focus) = owner.read(cx).blocking_modal() {
+            pending.borrow_mut().clear();
+            forwarding.chord_deadline.set(None);
+            if super::quit_gate::is_quit_keystroke(&event.keystroke, cfg!(target_os = "macos")) {
+                return;
+            }
+            if is_modifier_key(&event.keystroke) {
+                return;
+            }
+            // Hide, Minimize and the like are app-level, not workspace behind the dialog.
+            let bound = {
+                let keymap = cx.key_bindings();
+                let keymap = keymap.borrow();
+                let (bindings, _) = keymap.bindings_for_input(
+                    std::slice::from_ref(&event.keystroke),
+                    &event.context_stack,
+                );
+                bindings
+                    .first()
+                    .is_some_and(|binding| app_level_action(binding.action()))
+            };
+            if bound {
+                return;
+            }
+            if !focus.contains_focused(window, cx) {
+                window.focus(&focus, cx);
+            }
+            owner.update(cx, |shell, cx| {
+                shell.blocking_modal_key(&event.keystroke, window, cx)
+            });
+            forwarding.handled.set(true);
+            cx.stop_propagation();
+            return;
+        }
         let root = owner.read(cx).focus.clone();
         let native = forwarding.native.get();
         let now = Instant::now();
@@ -108,10 +229,7 @@ pub(super) fn install(owner: WeakEntity<Shell>, window: &Window, cx: &mut App) -
             return;
         }
         // Modifier release observations are not strokes in a shortcut chord.
-        if matches!(
-            event.keystroke.key.as_str(),
-            "control" | "platform" | "alt" | "shift" | "function"
-        ) {
+        if is_modifier_key(&event.keystroke) {
             return;
         }
         let mut sequence = pending.borrow_mut();

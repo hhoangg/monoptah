@@ -8,10 +8,19 @@ mod classic_sidebar;
 #[cfg(test)]
 mod classic_surface_tests;
 mod classic_surfaces;
+mod claude_setup;
 mod cloud;
 mod cloud_app_archive;
+mod cloud_continue;
+#[cfg(test)]
+mod cloud_continue_tests;
 mod cloud_create;
+#[cfg(test)]
+mod cloud_location_tests;
+mod cloud_move;
+mod cloud_move_api;
 mod cloud_picker;
+mod cloud_return_cleanup;
 mod cloud_start;
 #[cfg(test)]
 mod cloud_tests;
@@ -713,19 +722,49 @@ pub(crate) struct Shell {
     /// `gh` runner shared by the cloud session service and the codespace picker.
     gh: Arc<dyn monocode_core::codespaces::GhRunner>,
     cloud: Arc<monocode_core::cloud_sessions::CloudSessions>,
+    /// The move engine "Continue in cloud" uses; the real one is `cloud`.
+    cloud_move_engine: Arc<dyn cloud_move::MoveEngine>,
+    /// Moves to the cloud in progress, one per session (see `cloud_move`).
+    cloud_moves: HashMap<i64, cloud_move::MoveRun>,
+    /// Why the last move an agent started for a session was refused before it began.
+    api_move_errors: HashMap<i64, String>,
+    /// Sessions born in the cloud that came back as a new local session: (old id, new id,
+    /// project). Bounded; lets `sessions.moveStatus` answer for the old id.
+    api_returned: std::collections::VecDeque<(i64, i64, String)>,
+    move_dialog: Option<cloud_move::OpenMove>,
+    /// The working-copy inspections of the move dialog in flight, by session (cancel flags).
+    move_previews: HashMap<i64, Arc<std::sync::atomic::AtomicBool>>,
+    /// The divider text of each moved session, read from the store once.
+    move_labels: HashMap<i64, Option<String>>,
     /// Sessions that live in a codespace, by id, and the cached state of each codespace.
     cloud_marks: HashMap<i64, cloud::CloudMark>,
+    /// The Claude setup block of each workspace, by `CloudRef::key`; see [`claude_setup`].
+    claude_setups: claude_setup::Setups,
+    /// Which side of a cloud session its Files and Changes panels show. In memory only; a
+    /// session without an entry shows the cloud workspace.
+    panel_modes: HashMap<i64, crate::panel_root::PanelMode>,
     /// The card for the cloud file being read or downloaded.
     cloud_view: Option<cloud_view::CloudView>,
+    /// File opens waiting for the Host update of their cloud session.
+    queued_cloud_opens: cloud_view::OpenQueue,
+    /// A connect of this session finished while opens were queued: the next render flushes them.
+    cloud_open_due: Option<i64>,
+    /// The pane last seen by the render, to notice a switch.
+    cloud_open_watch: Option<i64>,
     cloud_states: HashMap<String, monocode_core::cloud_sessions::CloudState>,
     /// Converted local sessions and the codespace each came from, and which of those no longer
     /// exist.
     cloud_origins: HashMap<i64, String>,
+    /// Local sessions whose location is Cloud (design 4.2.1): move point and sync error.
+    cloud_located: HashMap<i64, monocode_core::cloud_sessions::LocatedSession>,
     cloud_gone: std::collections::HashSet<String>,
     cloud_refreshing: bool,
     /// A resume happened while a refresh was in flight: its answer is stale, read again.
     cloud_refresh_again: bool,
     cloud_archive: Option<cloud::ArchiveDialog>,
+    cloud_continue: cloud_continue::State,
+    /// Deleting the instance after a successful Continue locally.
+    cloud_return_cleanup: cloud_return_cleanup::State,
     /// Saves the local copy of a cloud session before its codespace is stopped or deleted.
     cloud_convert: cloud::ConvertFn,
     cloud_busy: HashSet<i64>,
@@ -1000,8 +1039,18 @@ impl Shell {
             for view in this.cloud_starts.values() {
                 view.cancel_on_quit();
             }
+            // A move's worker stops (its push is killed) and the record stays resumable.
+            let moves = this.cancel_moves_on_quit();
             let remote = quit_remote.clone();
             cx.background_executor().spawn(async move {
+                let waited = std::time::Instant::now();
+                while waited.elapsed() < std::time::Duration::from_secs(2)
+                    && moves
+                        .iter()
+                        .any(|ended| !ended.load(std::sync::atomic::Ordering::SeqCst))
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
                 remote.shutdown();
             })
         })
@@ -1181,16 +1230,31 @@ impl Shell {
             remote_refreshing: false,
             remote_marks: HashMap::new(),
             _remote_clock: remote_clock,
+            cloud_move_engine: cloud.clone(),
+            cloud_moves: HashMap::new(),
+            api_move_errors: HashMap::new(),
+            api_returned: std::collections::VecDeque::new(),
+            move_dialog: None,
+            move_previews: HashMap::new(),
+            move_labels: HashMap::new(),
             cloud,
             gh,
             cloud_marks: HashMap::new(),
+            claude_setups: Default::default(),
+            panel_modes: HashMap::new(),
             cloud_view: None,
+            queued_cloud_opens: cloud_view::OpenQueue::default(),
+            cloud_open_due: None,
+            cloud_open_watch: None,
             cloud_states: HashMap::new(),
             cloud_origins: HashMap::new(),
+            cloud_located: HashMap::new(),
             cloud_gone: Default::default(),
             cloud_refreshing: false,
             cloud_refresh_again: false,
             cloud_archive: None,
+            cloud_continue: cloud_continue::State::default(),
+            cloud_return_cleanup: cloud_return_cleanup::State::default(),
             cloud_convert: cloud::default_convert(),
             cloud_busy: HashSet::new(),
             cloud_workspaces_busy: HashSet::new(),
@@ -1478,7 +1542,10 @@ impl Shell {
             this.order.push(summary.id);
             this.session_summaries.insert(summary.id, summary);
         }
+        this.publish_kit_prefs();
         this.resume_cloud_starts(cx);
+        this.resume_cloud_moves(cx);
+        this.resume_return_cleanups(cx);
         this.init_mobile_host(cx);
         if let Some(id) = this.workspace.active {
             this.ensure_session(this.workspace.session_for_pane(id), cx);
@@ -1606,6 +1673,9 @@ impl Shell {
                 }),
                 cx,
             );
+            view.set_cloud_location(self.cloud_located.get(&id).cloned(), cx);
+            view.set_move_locked(self.cloud_moves.contains_key(&id), cx);
+            view.set_move_offer(self.move_offer(id), cx);
             view.set_project_appearance(appearance, cx);
             view.transcript.update(cx, |transcript, cx| {
                 transcript.apply_preferences(&self.workspace.preferences, cx)
@@ -1620,8 +1690,56 @@ impl Shell {
         ));
         self.observations.push(cx.subscribe(
             &view,
+            |this, _, _: &crate::conversation::CloudLocationReset, cx| this.refresh_cloud(cx),
+        ));
+        self.observations.push(cx.subscribe(
+            &view,
             move |this, _, event: &crate::conversation::cloud_target::CreateCloudSession, cx| {
                 this.create_cloud_session(id, event.0.clone(), cx)
+            },
+        ));
+        self.observations.push(cx.subscribe(
+            &view,
+            move |_, _, _: &crate::conversation::ContinueInCloud, cx| {
+                cx.spawn(async move |this, cx| {
+                    let _ =
+                        this.update_in(cx, |this, window, cx| this.open_cloud_move(id, window, cx));
+                })
+                .detach();
+            },
+        ));
+        self.observations.push(cx.subscribe(
+            &view,
+            move |_, _, _: &crate::conversation::CancelCloudMove, cx| {
+                cx.spawn(async move |this, cx| {
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.open_cloud_move(id, window, cx);
+                        if let Some(dialog) = this.cloud_move_dialog_for(id) {
+                            dialog.update(cx, |dialog, cx| dialog.cancel_move(false, cx));
+                        }
+                    });
+                })
+                .detach();
+            },
+        ));
+        // The move engine reads whether this conversation is busy: keep it current whenever it
+        // changes, not only when a move event happens to arrive.
+        self.observations
+            .push(cx.observe(&view, move |this, view, cx| {
+                if let Some(run) = this.cloud_moves.get(&id) {
+                    let view = view.read(cx);
+                    run.set_busy(view.busy || view.is_stopping());
+                }
+            }));
+        self.observations.push(cx.subscribe(
+            &view,
+            |_, _, _: &crate::conversation::cloud_target::OpenCloudSettings, cx| {
+                cx.spawn(async move |this, cx| {
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.open_settings(crate::settings::Section::Cloud, window, cx)
+                    });
+                })
+                .detach();
             },
         ));
         self.observations.push(cx.subscribe(
@@ -1929,25 +2047,16 @@ impl Shell {
             .get(&self.workspace.project)
             .map(|id| classic_sidebar::ClassicSidebarTab::from_id(id))
             .unwrap_or_default();
-        let session = self
+        let provider = self
             .workspace
             .active
             .and_then(|id| self.sessions.get(&self.workspace.session_for_pane(id)))
-            .map(|view| {
-                let view = view.read(cx);
-                (
-                    view.settings
-                        .worktree_cwd
-                        .clone()
-                        .unwrap_or_else(|| view.summary.cwd.clone()),
-                    Kind::from_id(&view.summary.provider),
-                )
-            });
-        let (project, provider) = match session {
-            Some((cwd, kind)) => (cwd, Some(kind)),
-            None => (self.working_copy().to_owned(), None),
-        };
-        self.git.update(cx, |git, cx| git.set_project(project, cx));
+            .map(|view| Kind::from_id(&view.read(cx).summary.provider));
+        let root = self.panel_root(cx);
+        let project = root.project().to_owned();
+        let offline = self.panel_offline(&root, cx);
+        self.git
+            .update(cx, |git, cx| git.bind(project, offline, cx));
         if let (Some(panel), Some(kind)) = (&self.right_panel, provider) {
             let changes = panel.read(cx).changes.clone();
             changes.update(cx, |c, _| c.text_provider = kind);
@@ -2020,20 +2129,12 @@ impl Shell {
         let Some(panel) = &self.right_panel else {
             return div().into_any_element();
         };
-        let panel = panel.read(cx);
-        match self.classic_sidebar_tab {
-            classic_sidebar::ClassicSidebarTab::Files => panel
-                .explorer
-                .clone()
-                .cached(StyleRefinement::default().size_full())
-                .into_any_element(),
-            classic_sidebar::ClassicSidebarTab::Changes => panel
-                .changes
-                .clone()
-                .cached(StyleRefinement::default().size_full())
-                .into_any_element(),
-            classic_sidebar::ClassicSidebarTab::Sessions => div().into_any_element(),
-        }
+        let tab = match self.classic_sidebar_tab {
+            classic_sidebar::ClassicSidebarTab::Files => crate::right_panel::RightTab::Files,
+            classic_sidebar::ClassicSidebarTab::Changes => crate::right_panel::RightTab::Changes,
+            classic_sidebar::ClassicSidebarTab::Sessions => return div().into_any_element(),
+        };
+        panel.update(cx, |panel, cx| panel.classic_tool(tab, cx))
     }
     fn toggle_right_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.set_right_panel_open(!self.workspace.right_panel_open, window, cx);
@@ -2121,6 +2222,10 @@ impl Shell {
                 cx.notify();
             },
         ));
+        self.observations.push(cx.subscribe(
+            &explorer,
+            |this, _, _: &crate::explorer::OpenInBrowser, cx| this.open_panel_in_browser(cx),
+        ));
         self.observations.push(cx.subscribe_in(
             &explorer,
             window,
@@ -2174,6 +2279,20 @@ impl Shell {
                         }
                     }
                     PanelEvent::Reordered(order) => this.workspace.right_panel_tabs = order.clone(),
+                    // Neither changes the saved layout: the mode lives in memory, and Connect
+                    // is the user's explicit wake of the workspace.
+                    PanelEvent::Mode(mode) => {
+                        this.set_panel_mode(*mode, cx);
+                        return;
+                    }
+                    PanelEvent::Connect => {
+                        this.connect_panel_workspace(cx);
+                        return;
+                    }
+                    PanelEvent::UpdateSetup => {
+                        this.update_claude_setup(cx);
+                        return;
+                    }
                 }
                 this.persist(cx);
             }));
@@ -4546,6 +4665,9 @@ impl Shell {
         }
     }
     fn activate_session(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        // Any pane or session switch, a Mono or terminal pane included, drops the queued opens
+        // of the others and stops a queued stream.
+        self.leave_queued_cloud_opens(Some(id), cx);
         if self.workspace.review_owners.contains_key(&id) {
             self.open_file_pane(id, window, cx);
             return;
@@ -8952,6 +9074,16 @@ impl Render for Shell {
                 this.update(cx, |this, cx| this.open_cloud_archive(ids, window, cx));
             });
         }
+        if self.cloud_open_watch != self.workspace.active {
+            self.cloud_open_watch = self.workspace.active;
+            self.note_active_session(cx);
+        }
+        if let Some(id) = self.cloud_open_due {
+            let this = cx.entity();
+            window.defer(cx, move |window, cx| {
+                this.update(cx, |this, cx| this.flush_queued_cloud_opens(id, window, cx));
+            });
+        }
         if self.mono_panes_unsettled(cx) {
             let this = cx.entity();
             window.defer(cx, move |window, cx| {
@@ -8971,7 +9103,8 @@ impl Render for Shell {
         }
         if let Some(m) = &self.monos {
             m.read(cx).hide_html(cx);
-            let covered = self.document_lightbox.is_some();
+            // A native web view paints above the barrier, so a blocking dialog hides it too.
+            let covered = self.document_lightbox.is_some() || self.blocking_modal().is_some();
             m.update(cx, |m, cx| {
                 m.set_suppress_html(covered);
                 m.bind_window(window, cx)
@@ -9177,8 +9310,10 @@ impl Render for Shell {
         };
         let right_shown = self.right_panel_shown(cx);
         self.right_drawn = if right_shown { right_width } else { 0. };
-        let poll_git = self.window_active && !self.mono_active(cx);
+        let poll_git = !self.mono_active(cx);
+        let window_active = self.window_active;
         self.git.update(cx, |git, cx| {
+            git.set_window_active(window_active, cx);
             git.set_polling(poll_git && git.available(), cx)
         });
         self.sync_cloud_panel(cx);
@@ -9225,6 +9360,9 @@ impl Render for Shell {
             .aria_label("Monoptah Native")
             .key_context("Workspace")
             .track_focus(&self.focus)
+            .when(self.blocking_modal().is_some(), |el| {
+                shortcuts::block_menu_actions(el)
+            })
             .capture_key_up(cx.listener(|this, _, _, _| this.archive_shortcut_held = false))
             .on_action(cx.listener(|this, _: &ArchiveSession, window, cx| {
                 this.archive_active_session(window, cx)
@@ -9266,9 +9404,14 @@ impl Render for Shell {
             .text_color(content(1.))
             .font_family(crate::fonts::UI)
             .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                this.git.update(cx, |git, cx| git.note_input(cx));
                 this.quit_hotkey_down(event, cfg!(target_os = "macos"), window, cx)
             }))
+            .on_scroll_wheel(cx.listener(|this, _: &gpui::ScrollWheelEvent, _, cx| {
+                this.git.update(cx, |git, cx| git.note_input(cx));
+            }))
             .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                this.git.update(cx, |git, cx| git.note_input(cx));
                 if this.session_preview.as_ref().is_some_and(|preview| {
                     !preview
                         .surface
@@ -9774,8 +9917,10 @@ impl Render for Shell {
             .children(self.codespaces_modal(window, cx))
             .children(self.docker_modal(window, cx))
             .children(self.git_credential_modal(window, cx))
+            .children(self.cloud_move_modal(window, cx))
             .children(self.delete_modal(window, cx))
             .children(self.cloud_archive_modal(window, cx))
+            .children(self.cloud_continue_modal(window, cx))
             .children(self.cloud_view_card(cx))
             .children(self.codespace_picker_modal(window, cx))
             .children(self.action_modal(window, cx))
@@ -13030,7 +13175,7 @@ mod tests {
             cx.debug_bounds(count_selector).is_none(),
             "a single pane has no count badge"
         );
-        cx.simulate_keystrokes("cmd-d");
+        cx.simulate_keystrokes("secondary-d");
         cx.run_until_parked();
         let new = window
             .update(cx, |shell, _, _| {
@@ -13230,7 +13375,7 @@ mod tests {
             .unwrap();
 
         // ⌘W closes the focused pane only; its neighbour takes focus.
-        cx.simulate_keystrokes("cmd-w");
+        cx.simulate_keystrokes("secondary-w");
         cx.run_until_parked();
         window
             .update(cx, |shell, _, _| {
@@ -13329,7 +13474,7 @@ mod tests {
             .unwrap();
         let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         cx.run_until_parked();
-        cx.simulate_keystrokes("cmd-d");
+        cx.simulate_keystrokes("secondary-d");
         cx.run_until_parked();
         cx.update(|_, cx| cx.set_reduce_motion(false));
         let new = window
@@ -13501,7 +13646,7 @@ mod tests {
                 assert_eq!(shell.viewport_width, 1000.);
             })
             .unwrap();
-        cx.simulate_keystrokes("cmd-d");
+        cx.simulate_keystrokes("secondary-d");
         cx.run_until_parked();
         let new = window
             .update(cx, |shell, _, cx| {
@@ -13519,10 +13664,10 @@ mod tests {
             .update(cx, |shell, _, _| assert!(shell.workspace.sidebar_visible))
             .unwrap();
         // A sidebar the user hid stays hidden when room comes back.
-        cx.simulate_keystrokes("cmd-d");
+        cx.simulate_keystrokes("secondary-d");
         cx.run_until_parked();
         // Collapsed for the split; shown, then hidden again by hand.
-        cx.simulate_keystrokes("cmd-b cmd-b");
+        cx.simulate_keystrokes("secondary-b secondary-b");
         cx.run_until_parked();
         window
             .update(cx, |shell, w, cx| {
@@ -13556,7 +13701,7 @@ mod tests {
             .unwrap();
         let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         cx.run_until_parked();
-        for keys in ["cmd-d", "cmd-shift-d"] {
+        for keys in ["secondary-d", "secondary-shift-d"] {
             cx.simulate_keystrokes(keys);
             cx.run_until_parked();
             window
@@ -13592,7 +13737,7 @@ mod tests {
         let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         cx.run_until_parked();
         // Wide enough for two panes beside the sidebar.
-        cx.simulate_keystrokes("cmd-d");
+        cx.simulate_keystrokes("secondary-d");
         cx.run_until_parked();
         window
             .update(cx, |shell, _, _| assert!(shell.workspace.sidebar_visible))
@@ -13612,13 +13757,13 @@ mod tests {
         // Shown by hand while crowded, it stays until the room changes again.
         cx.simulate_resize(gpui::size(px(1000.), px(800.)));
         cx.run_until_parked();
-        cx.simulate_keystrokes("cmd-b");
+        cx.simulate_keystrokes("secondary-b");
         cx.run_until_parked();
         window
             .update(cx, |shell, _, _| assert!(shell.workspace.sidebar_visible))
             .unwrap();
         // Hidden by hand, it stays hidden however wide the window grows.
-        cx.simulate_keystrokes("cmd-b");
+        cx.simulate_keystrokes("secondary-b");
         cx.simulate_resize(gpui::size(px(1600.), px(800.)));
         cx.run_until_parked();
         window
@@ -13691,7 +13836,7 @@ mod tests {
         let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         cx.run_until_parked();
         assert!(cx.debug_bounds("terminal-dock").is_none());
-        cx.simulate_keystrokes("cmd-j");
+        cx.simulate_keystrokes("secondary-j");
         cx.run_until_parked();
         let project = window
             .update(cx, |shell, w, cx| {
@@ -13709,7 +13854,7 @@ mod tests {
         assert!((dock.size.height - px(220.)).abs() < px(2.));
         // ⌘T in the dock opens another terminal, not a session tab.
         let tabs = window.update(cx, |s, _, _| s.workspace.tabs.len()).unwrap();
-        cx.simulate_keystrokes("cmd-t");
+        cx.simulate_keystrokes("secondary-t");
         cx.run_until_parked();
         window
             .update(cx, |shell, w, cx| {
@@ -13721,7 +13866,7 @@ mod tests {
             .unwrap();
         assert!(cx.debug_bounds("terminal-tab-1").is_some());
         // ⌘W closes the focused terminal; the session tab stays.
-        cx.simulate_keystrokes("cmd-w");
+        cx.simulate_keystrokes("secondary-w");
         cx.run_until_parked();
         window
             .update(cx, |shell, _, _| {
@@ -13747,7 +13892,7 @@ mod tests {
         window
             .update(cx, |shell, w, cx| shell.focus_terminal(w, cx))
             .unwrap();
-        cx.simulate_keystrokes("cmd-j");
+        cx.simulate_keystrokes("secondary-j");
         cx.run_until_parked();
         window
             .update(cx, |shell, w, cx| {

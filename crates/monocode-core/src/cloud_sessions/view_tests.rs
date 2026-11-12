@@ -21,8 +21,12 @@ impl GhRunner for NoGh {
 struct FileHost {
     files: Mutex<HashMap<String, Vec<u8>>>,
     log: Mutex<Vec<String>>,
+    /// The `cwd` param of every file read (`None`: the request carried none).
+    cwds: Mutex<Vec<Option<String>>>,
     disconnected: AtomicBool,
     legacy: bool,
+    /// `files.read` is unsupported too (a Host older than both calls).
+    no_read: bool,
     /// Every call answers like a machine the connection store no longer knows.
     gone: bool,
     describes: std::sync::atomic::AtomicUsize,
@@ -37,6 +41,9 @@ impl FileHost {
             .lock()
             .unwrap()
             .insert(rel.into(), bytes.to_vec());
+    }
+    fn cwds(&self) -> Vec<Option<String>> {
+        self.cwds.lock().unwrap().clone()
     }
     fn log(&self) -> Vec<String> {
         self.log.lock().unwrap().clone()
@@ -54,7 +61,13 @@ impl Host for FileHost {
             sandbox: None,
         }])
     }
-    fn connect(&self, _: &str, _: &str, _: &mut dyn FnMut(&str)) -> Result<Machine, String> {
+    fn connect(
+        &self,
+        _: &str,
+        _: &str,
+        _: &AtomicBool,
+        _: &mut dyn FnMut(&str),
+    ) -> Result<Machine, String> {
         panic!("viewing a file must not connect");
     }
     fn ensure(&self, _: &str, _: &AtomicBool, _: &mut dyn FnMut(&str)) -> Result<(), String> {
@@ -79,6 +92,10 @@ impl Host for FileHost {
         assert_eq!(params["projectId"], "project-1");
         let path = params["path"].as_str().unwrap().to_string();
         self.log.lock().unwrap().push(format!("{method} {path}"));
+        self.cwds
+            .lock()
+            .unwrap()
+            .push(params["cwd"].as_str().map(str::to_owned));
         if self.disconnected.load(Ordering::SeqCst) {
             return Err(remote::CODESPACE_NOT_CONNECTED.into());
         }
@@ -111,6 +128,7 @@ impl Host for FileHost {
                     "size": size,
                 }))
             }
+            "files.read" if self.no_read => Err("Unsupported host method".into()),
             "files.read" => {
                 if bytes.len() > 1024 * 1024 || bytes.contains(&0) {
                     return Err("File is too large to preview".into());
@@ -320,19 +338,93 @@ fn an_older_host_still_opens_small_text_but_not_binary_files() {
         }
     );
     assert_eq!(host.log(), vec!["files.read notes.md"]);
-    // Capabilities, not error text, decide: images need the copy fallback.
+    // Capabilities, not error text, decide: an image needs the update, and nothing else is
+    // offered (no copy).
+    let error = open(&svc, id, "shot.png").unwrap_err();
     assert_eq!(
-        open(&svc, id, "shot.png").unwrap(),
-        Opened::CopyOnly {
-            kind: FileKind::Image
+        error,
+        ViewError::HostUpdate {
+            name: "shot.png".into(),
+            state: HostUpdate::NextConnect
         }
     );
-    let text = ViewError::OldHost.to_string();
+    let text = error.to_string();
     assert!(
-        text.contains("Update Monoptah Host in Connections settings"),
+        text.contains("opens after the Host update")
+            && text.contains("updated on the next connect")
+            && !text.contains("Connections settings")
+            && !text.to_lowercase().contains("download")
+            && !text.to_lowercase().contains("copy"),
         "{text}"
     );
-    assert!(text.contains("download a copy"), "{text}");
+}
+
+#[test]
+fn only_an_unsupported_call_is_a_host_update_other_old_host_errors_keep_their_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = FileHost {
+        legacy: true,
+        ..Default::default()
+    };
+    host.put("big.md", &vec![b'a'; 1024 * 1024 + 1]);
+    host.put("bin.txt", b"a\0b");
+    let (svc, _host, id) = setup(host, dir.path());
+    for (name, wanted) in [
+        ("missing.md", "ENOENT"),
+        ("big.md", "too large"),
+        ("bin.txt", "too large"),
+    ] {
+        match open(&svc, id, name).unwrap_err() {
+            ViewError::Failed(text) => assert!(text.contains(wanted), "{name}: {text}"),
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+    let host = FileHost {
+        legacy: true,
+        no_read: true,
+        ..Default::default()
+    };
+    host.put("a.md", b"x");
+    let (svc, _host, id) = setup(host, dir.path());
+    assert!(matches!(
+        open(&svc, id, "a.md").unwrap_err(),
+        ViewError::HostUpdate { .. }
+    ));
+}
+
+#[test]
+fn the_host_update_text_tells_a_deferred_update_and_a_blocked_one() {
+    let pending = ViewError::HostUpdate {
+        name: "a.pdf".into(),
+        state: HostUpdate::Pending,
+    }
+    .to_string();
+    assert!(
+        pending.starts_with("a.pdf opens after the Host update."),
+        "{pending}"
+    );
+    assert!(
+        pending.contains("will be installed the next time this workspace connects"),
+        "{pending}"
+    );
+    let warning = crate::remote::host_upgrade::warning("curl: (7) connection refused", true);
+    let blocked = ViewError::HostUpdate {
+        name: "a.pdf".into(),
+        state: HostUpdate::Failed(warning),
+    }
+    .to_string();
+    assert!(
+        blocked.contains("Monoptah Host could not be updated"),
+        "{blocked}"
+    );
+    assert!(
+        blocked.contains("blocked by the sandbox network policy")
+            && blocked.contains(crate::remote::host_upgrade::POLICY_HINT),
+        "{blocked}"
+    );
+    assert!(HostUpdate::Pending.queues_open());
+    assert!(HostUpdate::NextConnect.queues_open());
+    assert!(!HostUpdate::Failed(String::new()).queues_open());
 }
 
 #[test]
@@ -366,224 +458,71 @@ fn remote_links_must_name_this_sessions_machine() {
 }
 
 #[test]
-fn only_files_that_cannot_run_are_opened_by_the_default_app() {
+fn only_known_inert_types_are_opened_by_the_default_app() {
+    for name in [
+        "a.pdf",
+        "A.PDF",
+        "shot.png",
+        "x.JPEG",
+        "clip.mp4",
+        "song.mp3",
+        "r.docx",
+        "t.xlsx",
+        "s.pptx",
+        "n.rtf",
+        "d.csv",
+        "n.txt",
+        "n.md",
+        "d.json",
+        "x.log",
+        "v1.2.final.pdf",
+    ] {
+        assert!(opens_with_default_app(name), "{name}");
+    }
     for name in [
         "x.app",
         "run.COMMAND",
         "a.sh",
         "i.pkg",
+        "i.mpkg",
         "d.dmg",
         "w.webloc",
         "t.terminal",
+        "l.fileloc",
+        "l.afploc",
+        "l.ftploc",
+        "l.inetloc",
+        "s.py",
+        "s.pyw",
+        "s.pl",
+        "s.rb",
+        "a.jnlp",
+        "a.jar",
+        "a.exe",
+        "a.bat",
+        "a.ps1",
+        "a.scpt",
+        "a.workflow",
+        "a.url",
+        "m.docm",
+        "m.xlsm",
+        "m.pptm",
+        "bundle.zip",
+        "bundle.tar.gz",
+        "image.iso",
+        "report.pdf.app",
+        "report.pdf.sh",
+        "REPORT.PDF.COMMAND",
+        "script",
+        "Makefile",
+        ".pdf",
+        ".hidden",
+        "trailingdot.",
+        "a.pdf ",
+        "",
     ] {
-        assert!(runs_code(name), "{name}");
+        assert!(!opens_with_default_app(name), "{name:?}");
     }
-    for name in ["a.png", "r.html", "notes.md", "data.bin", "script"] {
-        assert!(!runs_code(name), "{name}");
-    }
-}
-
-/// A backend that only knows its state and `copy_from`.
-struct FakeBackend {
-    raw: &'static str,
-    copy: CopyFn,
-    calls: Mutex<Vec<String>>,
-}
-type CopyFn = Box<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
-impl backend::CloudBackend for FakeBackend {
-    fn kind(&self) -> CloudBackendKind {
-        CloudBackendKind::Codespaces
-    }
-    fn display_state(&self, raw: &str) -> CloudState {
-        CloudState::from_gh(raw)
-    }
-    fn is_stopped(&self, raw: &str) -> bool {
-        raw == "Shutdown" || raw == "ShuttingDown"
-    }
-    fn is_deleted_state(&self, _: &str) -> bool {
-        false
-    }
-    fn is_missing_error(&self, _: &str) -> bool {
-        false
-    }
-    fn state(&self, _: &str) -> Result<String, String> {
-        self.calls.lock().unwrap().push("state".into());
-        Ok(self.raw.into())
-    }
-    fn exists(&self, _: &str) -> Result<bool, String> {
-        Ok(true)
-    }
-    fn stop(&self, _: &str) -> Result<(), String> {
-        panic!("not used")
-    }
-    fn delete(&self, _: &str) -> Result<(), String> {
-        panic!("not used")
-    }
-    fn rebuild(&self, _: &str) -> Result<(), String> {
-        panic!("not used")
-    }
-    fn web_url(&self, _: &str) -> Option<Result<String, String>> {
-        None
-    }
-    fn run_script(&self, _: &str, _: &str, _: bool) -> Result<String, String> {
-        panic!("not used")
-    }
-    fn copy_from(&self, _: &str, remote: &str, local: &Path) -> Result<(), String> {
-        self.calls.lock().unwrap().push(format!("copy {remote}"));
-        (self.copy)(local)
-    }
-    fn prepare_evidence(&self, _: &str, _: &str) -> Result<(), String> {
-        panic!("not used")
-    }
-}
-
-fn with_backend(
-    svc: CloudSessions,
-    raw: &'static str,
-    copy: CopyFn,
-) -> (CloudSessions, Arc<FakeBackend>) {
-    let backend = Arc::new(FakeBackend {
-        raw,
-        copy,
-        calls: Mutex::new(vec![]),
-    });
-    (svc.with_backend(backend.clone()), backend)
-}
-
-fn old_host_setup(dir: &Path) -> (CloudSessions, Arc<FileHost>, i64) {
-    let host = FileHost {
-        legacy: true,
-        ..Default::default()
-    };
-    host.put("out/shot.png", &[1u8; 10]);
-    setup(host, dir)
-}
-
-fn copy_file(local: &Path) -> Result<(), String> {
-    std::fs::write(local.join("shot.png"), b"PNGDATA").map_err(|e| e.to_string())
-}
-
-#[test]
-fn the_copy_fallback_runs_only_on_request_into_the_cache_and_cleans_up() {
-    let dir = tempfile::tempdir().unwrap();
-    let (svc, _host, id) = old_host_setup(dir.path());
-    let (svc, backend) = with_backend(svc, "Available", Box::new(copy_file));
-    let file = svc.resolve_cloud_file(id, "out/shot.png").unwrap();
-    // Opening never copies; it only reports that the copy is the way.
-    assert_eq!(
-        svc.open_cloud_file(&file, &AtomicBool::new(false)).unwrap(),
-        Opened::CopyOnly {
-            kind: FileKind::Image
-        }
-    );
-    assert!(backend.calls.lock().unwrap().is_empty());
-    let got = svc.copy_cloud_file(&file, &AtomicBool::new(false)).unwrap();
-    assert_eq!(
-        *backend.calls.lock().unwrap(),
-        vec![
-            "state".to_string(),
-            "copy /workspaces/widgets/out/shot.png".to_string()
-        ]
-    );
-    let cache = file.cache_dir.clone().unwrap();
-    assert_eq!(got.path, cache.join("out").join("shot.png"));
-    assert_eq!(std::fs::read(&got.path).unwrap(), b"PNGDATA");
-    assert_eq!(got.size, 7);
-    // The temporary folder is gone.
-    let names: Vec<String> = std::fs::read_dir(&cache)
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    assert_eq!(names, vec!["out".to_string()]);
-}
-
-#[test]
-fn the_copy_fallback_refuses_a_workspace_that_is_not_running_or_not_reachable() {
-    let dir = tempfile::tempdir().unwrap();
-    for raw in ["Shutdown", "ShuttingDown", "Starting"] {
-        let (svc, _host, id) = old_host_setup(dir.path());
-        let (svc, backend) = with_backend(svc, raw, Box::new(copy_file));
-        let file = svc.resolve_cloud_file(id, "out/shot.png").unwrap();
-        let error = svc
-            .copy_cloud_file(&file, &AtomicBool::new(false))
-            .unwrap_err();
-        assert!(
-            matches!(error, ViewError::NotConnected(_)),
-            "{raw}: {error:?}"
-        );
-        assert_eq!(
-            *backend.calls.lock().unwrap(),
-            vec!["state".to_string()],
-            "{raw}"
-        );
-    }
-    // Tunnel down: not even the state is read.
-    let host = FileHost {
-        legacy: true,
-        ..Default::default()
-    };
-    host.disconnected.store(true, Ordering::SeqCst);
-    let (svc, _host, id) = setup(host, dir.path());
-    let (svc, backend) = with_backend(svc, "Available", Box::new(copy_file));
-    let file = svc.resolve_cloud_file(id, "out/shot.png").unwrap();
-    assert!(matches!(
-        svc.copy_cloud_file(&file, &AtomicBool::new(false)),
-        Err(ViewError::NotConnected(_))
-    ));
-    assert!(backend.calls.lock().unwrap().is_empty());
-}
-
-#[test]
-fn the_copy_fallback_refuses_folders_and_links() {
-    let dir = tempfile::tempdir().unwrap();
-    let (svc, _host, id) = old_host_setup(dir.path());
-    let (svc, _backend) = with_backend(
-        svc,
-        "Available",
-        Box::new(|local| std::fs::create_dir(local.join("shot.png")).map_err(|e| e.to_string())),
-    );
-    let file = svc.resolve_cloud_file(id, "out/shot.png").unwrap();
-    let error = svc
-        .copy_cloud_file(&file, &AtomicBool::new(false))
-        .unwrap_err();
-    assert!(matches!(error, ViewError::Refused(_)), "{error:?}");
-    #[cfg(unix)]
-    {
-        let (svc, _host, id) = old_host_setup(dir.path());
-        let secret = dir.path().join("secret.txt");
-        std::fs::write(&secret, "secret").unwrap();
-        let target = secret.clone();
-        let (svc, _backend) = with_backend(
-            svc,
-            "Available",
-            Box::new(move |local| {
-                std::os::unix::fs::symlink(&target, local.join("shot.png"))
-                    .map_err(|e| e.to_string())
-            }),
-        );
-        let file = svc.resolve_cloud_file(id, "out/shot.png").unwrap();
-        let error = svc
-            .copy_cloud_file(&file, &AtomicBool::new(false))
-            .unwrap_err();
-        assert!(matches!(error, ViewError::Refused(_)), "{error:?}");
-        assert!(!file.cache_dir.unwrap().join("out/shot.png").exists());
-    }
-}
-
-#[test]
-fn a_cancelled_copy_keeps_nothing() {
-    let dir = tempfile::tempdir().unwrap();
-    let (svc, _host, id) = old_host_setup(dir.path());
-    let (svc, _backend) = with_backend(svc, "Available", Box::new(copy_file));
-    let file = svc.resolve_cloud_file(id, "out/shot.png").unwrap();
-    let error = svc
-        .copy_cloud_file(&file, &AtomicBool::new(true))
-        .unwrap_err();
-    assert_eq!(error, ViewError::Cancelled);
-    assert_eq!(
-        std::fs::read_dir(file.cache_dir.unwrap()).map_or(0, |d| d.count()),
-        0
-    );
 }
 
 #[test]
@@ -980,4 +919,81 @@ fn downloaded_files_are_quarantined_on_macos() {
         .unwrap();
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).starts_with("0083;"));
+}
+
+const WORKTREE: &str = "/workspaces/widgets-feature";
+
+/// Records `worktree` (as the store keeps it: `remote://<env>/<path>`) for session `id`.
+fn set_worktree(svc: &CloudSessions, id: i64, worktree: Option<&str>, removed: bool) {
+    let settings = crate::agent::Settings {
+        worktree_cwd: worktree.map(|path| format!("remote://env-octo-abc{path}")),
+        worktree_removed: removed,
+        ..Default::default()
+    };
+    svc.store()
+        .unwrap()
+        .save_agent_settings(id, &settings)
+        .unwrap();
+}
+
+#[test]
+fn reads_carry_the_worktree_cwd_and_stay_inside_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = FileHost::default();
+    host.put("src/main.rs", b"fn main() {}\n");
+    let (svc, host, id) = setup(host, dir.path());
+    set_worktree(&svc, id, Some(WORKTREE), false);
+    let file = svc
+        .resolve_cloud_file(id, &format!("{WORKTREE}/src/main.rs"))
+        .unwrap();
+    assert_eq!(file.cwd.as_deref(), Some(WORKTREE));
+    assert_eq!(file.rel, "src/main.rs");
+    svc.open_cloud_file(&file, &AtomicBool::new(false)).unwrap();
+    assert_eq!(host.log(), vec!["files.readBytes src/main.rs"]);
+    assert_eq!(host.cwds(), vec![Some(WORKTREE.to_owned())]);
+    // The project root is outside this session's worktree: refused, nothing sent.
+    let outside = svc
+        .resolve_cloud_file(id, &format!("{ROOT}/src/main.rs"))
+        .unwrap_err();
+    assert!(matches!(outside, ViewError::Refused(_)), "{outside:?}");
+    assert_eq!(host.log().len(), 1);
+}
+
+#[test]
+fn the_older_text_read_also_carries_the_worktree_cwd() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = FileHost {
+        legacy: true,
+        ..Default::default()
+    };
+    host.put("notes.md", b"# Notes\n");
+    let (svc, host, id) = setup(host, dir.path());
+    set_worktree(&svc, id, Some(WORKTREE), false);
+    open(&svc, id, "notes.md").unwrap();
+    assert_eq!(host.log(), vec!["files.read notes.md"]);
+    assert_eq!(host.cwds(), vec![Some(WORKTREE.to_owned())]);
+}
+
+#[test]
+fn no_cwd_is_sent_without_a_usable_worktree() {
+    let cases = [
+        (None, false),
+        // A removed worktree falls back to the project folder.
+        (Some(WORKTREE), true),
+        // A recorded folder outside the workspace is never trusted.
+        (Some("/etc"), false),
+        (Some("/workspaces"), false),
+    ];
+    for (worktree, removed) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let host = FileHost::default();
+        host.put("a.txt", b"hello");
+        let (svc, host, id) = setup(host, dir.path());
+        set_worktree(&svc, id, worktree, removed);
+        let file = svc.resolve_cloud_file(id, "a.txt").unwrap();
+        assert_eq!(file.cwd, None, "{worktree:?} {removed}");
+        assert_eq!(file.root, ROOT);
+        svc.open_cloud_file(&file, &AtomicBool::new(false)).unwrap();
+        assert_eq!(host.cwds(), vec![None], "{worktree:?} {removed}");
+    }
 }

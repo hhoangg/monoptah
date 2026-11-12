@@ -55,7 +55,7 @@ const text = (value: unknown, label: string, max = 128): string => {
   return value;
 };
 
-function modelSettings(value: unknown): Record<string, string> {
+export function modelSettings(value: unknown): Record<string, string> {
   if (value == null) return {};
   if (!value || typeof value !== "object" || Array.isArray(value))
     throw new Error("Invalid model settings");
@@ -243,8 +243,15 @@ export function parseCommand(input: unknown): HostCommand {
   throw new Error("Unsupported command");
 }
 
+const ACTION_LABELS: Record<string, string> = {
+  "discarding changes": "discard",
+  "stashing changes": "stash",
+  "restoring a moved workspace": "workspace restore",
+};
+
 export class HostEngine {
-  private switchingProjects = new Set<string>();
+  /** Project id -> the action holding the checkout ("branch switch", "discard", ...). */
+  private switchingProjects = new Map<string, string>();
   private running = new Map<
     string,
     { runId: string; done: Promise<void>; cancelled: boolean; persistenceFailed: boolean }
@@ -300,23 +307,83 @@ export class HostEngine {
   async withIdleProject<T>(
     projectId: string,
     action: () => Promise<T>,
+    what = "switching branches",
   ): Promise<T> {
-    if (this.switchingProjects.has(projectId))
-      throw new Error("A branch switch is already in progress");
+    const busy = this.switchingProjects.get(projectId);
+    if (busy) throw new Error(`A ${busy} is already in progress`);
     if (
       this.store
         .summaries(projectId)
         .some((session) => session.status === "running")
     )
       throw new Error(
-        "Wait for running host sessions before switching branches",
+        `Wait for running host sessions before ${what}`,
       );
-    this.switchingProjects.add(projectId);
+    this.switchingProjects.set(projectId, ACTION_LABELS[what] ?? "branch switch");
     try {
       return await action();
     } finally {
       this.switchingProjects.delete(projectId);
     }
+  }
+
+  /** Claude Host sessions that bind this provider conversation id, in any project. */
+  sessionsBoundTo(providerSessionId: string) {
+    return this.store
+      .projects()
+      .flatMap((project) => this.store.summaries(project.id))
+      .filter(
+        (entry) =>
+          entry.harness === "claude" &&
+          entry.providerSessionId === providerSessionId,
+      );
+  }
+
+  /**
+   * Creates a Claude Host session for a conversation whose transcript was installed by
+   * `sessions.import`. It has NO blocks and is bound to `providerSessionId`, so its first
+   * turn passes `--resume <id>` (never `--fork-session`) and appends to the same JSONL.
+   */
+  importClaudeSession(input: {
+    projectId: string;
+    cwd: string;
+    providerSessionId: string;
+    title: string;
+    model: string;
+    modelSettings: Record<string, string>;
+    runtimeMode: Session["runtimeMode"];
+  }): HostSession {
+    if (this.closing) throw new Error("Host is stopping");
+    const project = this.store.project(input.projectId);
+    const busy = this.switchingProjects.get(project.id);
+    if (busy) throw new Error(`Wait for the ${busy} to finish`);
+    const provider = this.provider("claude");
+    const now = Date.now();
+    const saved = this.store.transaction(() =>
+      this.store.save(
+        {
+          projectId: project.id,
+          revision: 1,
+          status: "idle",
+          createdAt: now,
+          updatedAt: now,
+          session: {
+            id: randomUUID(),
+            cwd: input.cwd,
+            harness: "claude",
+            model: input.model,
+            runtimeMode: input.runtimeMode,
+            modelSettings: input.modelSettings,
+            title: input.title,
+            providerSessionId: input.providerSessionId,
+            blocks: [],
+          },
+        },
+        { type: "imported" },
+      ),
+    );
+    provider.bind(saved.session.id, input.providerSessionId, input.cwd);
+    return saved;
   }
 
   private provider(id: string): HostProvider {
@@ -426,8 +493,8 @@ export class HostEngine {
       let value: HostSession;
       if (command.type === "create") {
         const project = this.store.project(command.projectId);
-        if (this.switchingProjects.has(project.id))
-          throw new Error("Wait for the branch switch to finish");
+        const busy = this.switchingProjects.get(project.id);
+        if (busy) throw new Error(`Wait for the ${busy} to finish`);
         this.provider(command.harness);
         const cwd = resolveHostWorktree(project.cwd, command.worktreeCwd);
         const now = Date.now();
@@ -454,11 +521,9 @@ export class HostEngine {
         };
       } else {
         value = this.store.session(command.sessionId);
-        if (
-          (command.type === "send" || command.type === "compact") &&
-          this.switchingProjects.has(value.projectId)
-        )
-          throw new Error("Wait for the branch switch to finish");
+        const busy = this.switchingProjects.get(value.projectId);
+        if ((command.type === "send" || command.type === "compact") && busy)
+          throw new Error(`Wait for the ${busy} to finish`);
         const provider = this.provider(value.session.harness);
         if (command.type === "configure") {
           if (value.status === "running")

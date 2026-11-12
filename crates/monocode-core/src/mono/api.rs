@@ -1,16 +1,22 @@
 use super::cloud_api::validate as cloud;
 use serde_json::Value;
+/// Refusal for `sessions.start` with both `account` and a cloud `target`.
+pub const ACCOUNT_LOCAL_ONLY: &str = "account applies to local sessions only; a cloud session uses the cloud setup (the API key or setup token configured for Codespaces or Docker Sandbox)";
 /// Reject misspelled fields and ambiguous types before any app mutation.
 pub fn validate(action: &str, input: &Value) -> Result<(), String> {
     let cloud_fields;
     let fields=match action{
         "models.list"|"soul.read"|"habits.list"=>"",
+        "accounts.list"=>"provider",
         "sessions.list"|"folders.list"|"worktrees.list"=>"project",
         "sessions.read"=>"sessionId project before limit maxChars",
-        "sessions.start"=>"prompt project harness model modelSettings effort runtimeMode title draft reveal workspaceMode worktreeBase worktreeCwd placement besideSessionId notifyOnComplete completionDelivery parentSessionId folderName folderId target",
+        "sessions.start"=>"prompt project harness model modelSettings effort runtimeMode title draft reveal workspaceMode worktreeBase worktreeCwd placement besideSessionId notifyOnComplete completionDelivery parentSessionId folderName folderId target account",
         action if action.starts_with("cloud.") => {
             cloud_fields = cloud::fields(action).ok_or("Unknown app action. Run app help")?;
             cloud_fields.as_str()
+        }
+        action if super::move_api::is_move_action(action) => {
+            super::move_api::fields(action).ok_or("Unknown app action. Run app help")?
         }
         "sessions.send"=>"sessionId prompt project notifyOnComplete completionDelivery",
         "sessions.draft"=>"sessionId prompt project",
@@ -88,9 +94,11 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             return Err("before must be a turn ID".into());
         }
         // A cloud session lives in the remote store, whose IDs are negative numbers.
-        let session = matches!(key.as_str(), "sessionId" | "besideSessionId");
-        if matches!(key.as_str(), "id" | "sessionId" | "besideSessionId")
-            && !value.is_string()
+        let session = matches!(key.as_str(), "sessionId" | "besideSessionId" | "session");
+        if matches!(
+            key.as_str(),
+            "id" | "sessionId" | "besideSessionId" | "session"
+        ) && !value.is_string()
             && value.as_u64().is_none()
             && !(session && value.as_i64().is_some_and(|n| n < 0))
         {
@@ -111,6 +119,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             "number",
             "id",
             "sessionId",
+            "session",
             "besideSessionId",
             "modelSettings",
             "schedule",
@@ -141,8 +150,29 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             "removeWorktree and providerFiles cannot be combined; choose one per call".into(),
         );
     }
-    if let Some(target) = input.get("target") {
+    if let Some(account) = input.get("account") {
+        let account = account.as_str().unwrap_or_default();
+        if account.trim().is_empty() || account.chars().count() > 128 {
+            return Err("account must be a non-empty string of at most 128 characters".into());
+        }
+    }
+    if action == "accounts.list" {
+        if let Some(provider) = input.get("provider") {
+            crate::accounts::parse_provider(provider.as_str().unwrap_or_default())?;
+        }
+    }
+    if super::move_api::is_move_action(action) {
+        super::move_api::validate(action, input)?;
+    }
+    // A move's target has its own, narrower check (move_api::validate).
+    let start_target = input
+        .get("target")
+        .filter(|_| action != super::move_api::MOVE_TO_CLOUD);
+    if let Some(target) = start_target {
         cloud::validate_target(target, input)?;
+        if input.get("account").is_some() {
+            return Err(ACCOUNT_LOCAL_ONLY.into());
+        }
     }
     if action.starts_with("cloud.") {
         cloud::validate_action(action, input)?;
@@ -226,6 +256,54 @@ mod tests {
             &json!({"prompt":"x","project":"/code","draft":true})
         )
         .is_ok());
+    }
+    #[test]
+    fn account_is_bounded_text_for_local_starts_only() {
+        let start = |input| validate("sessions.start", &input);
+        assert!(start(json!({"prompt":"x","account":"Work"})).is_ok());
+        assert!(start(json!({"prompt":"x","account":"a".repeat(128)})).is_ok());
+        for bad in [json!(""), json!("  "), json!("a".repeat(129))] {
+            assert_eq!(
+                start(json!({"prompt":"x","account":bad})).unwrap_err(),
+                "account must be a non-empty string of at most 128 characters"
+            );
+        }
+        for bad in [json!(1), json!(null), json!(true)] {
+            assert_eq!(
+                start(json!({"prompt":"x","account":bad})).unwrap_err(),
+                "account must be text"
+            );
+        }
+        for target in [
+            json!({"kind":"codespace","instance":"new"}),
+            json!({"kind":"codespace","instance":"my-box"}),
+            json!({"kind":"sandbox","instance":{"session":5}}),
+            json!({"kind":"sandbox"}),
+        ] {
+            assert_eq!(
+                start(json!({"prompt":"x","account":"Work","target":target})).unwrap_err(),
+                ACCOUNT_LOCAL_ONLY
+            );
+        }
+        assert_eq!(
+            validate("sessions.send", &json!({"sessionId":1,"account":"Work"})).unwrap_err(),
+            "sessions.send does not take account"
+        );
+    }
+    #[test]
+    fn accounts_list_takes_an_optional_account_capable_provider() {
+        let list = |input| validate("accounts.list", &input);
+        assert!(list(json!({})).is_ok());
+        assert!(list(json!({"provider":"claude"})).is_ok());
+        assert!(list(json!({"provider":"codex"})).is_ok());
+        assert!(list(json!({"provider":"devin"})).is_ok());
+        for bad in [json!("cursor"), json!("nope"), json!(1), json!("")] {
+            assert!(list(json!({"provider":bad})).is_err());
+        }
+        assert_eq!(
+            list(json!({"bogus":1})).unwrap_err(),
+            "accounts.list does not take bogus"
+        );
     }
     #[test]
     fn provider_files_is_a_boolean_on_delete_only() {
@@ -612,6 +690,46 @@ mod tests {
             let error = ok(json!({"prompt":"x","target":bad.clone()})).unwrap_err();
             assert!(error.contains(why), "{bad}: {error}");
         }
+    }
+    #[test]
+    fn cloud_target_kit_may_only_narrow_the_users_kit() {
+        let ok = |input| validate("sessions.start", &input);
+        for kind in ["codespace", "sandbox"] {
+            for kit in ["none", "default"] {
+                assert!(
+                    ok(json!({"prompt":"x","target":{"kind":kind,"instance":"new","kit":kit}}))
+                        .is_ok(),
+                    "{kind} {kit}"
+                );
+            }
+        }
+        // No way to name items, add servers or switch secrets on.
+        for kit in [
+            json!({"skills":["review"]}),
+            json!({"mcpServers":{"x":{"command":"npx"}}}),
+            json!(["mcp:user:github"]),
+            json!("all"),
+            json!("secrets"),
+            json!(true),
+            json!(null),
+        ] {
+            let error =
+                ok(json!({"prompt":"x","target":{"kind":"codespace","instance":"new","kit":kit.clone()}}))
+                    .unwrap_err();
+            assert!(error.contains("target.kit must be"), "{kit}: {error}");
+        }
+        for key in ["skills", "mcpServers", "plugins", "kitItems", "secrets"] {
+            let error =
+                ok(json!({"prompt":"x","target":{"kind":"codespace","instance":"new",key:["a"]}}))
+                    .unwrap_err();
+            assert!(error.contains("target does not take"), "{key}: {error}");
+        }
+        // A reconnect never sends the kit again.
+        let error = ok(
+            json!({"prompt":"x","target":{"kind":"codespace","instance":"octo-abc","kit":"none"}}),
+        )
+        .unwrap_err();
+        assert!(error.contains("only applies when creating"), "{error}");
     }
     #[test]
     fn cloud_target_rejects_options_that_need_a_local_checkout() {

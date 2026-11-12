@@ -19,6 +19,7 @@ use gpui::{
 use monocode_core::{
     agent::{AccessMode, Settings},
     provider::{self, Event, Kind, Request},
+    remote::MAY_STILL_RUN,
     scm::{self, ChangedFile, DiffIndex, Pr},
 };
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,10 @@ use std::{
     },
     time::Duration,
 };
+
+/// Seconds after a timeout at which ahead/behind is re-read. The Host stops a git step at
+/// 90 s, and a sync runs two, so the last look is at 90 s.
+const CHECK_AT: [u64; 4] = [5, 15, 45, 90];
 
 const MOD: &str = if cfg!(target_os = "macos") {
     "⌘"
@@ -221,6 +226,11 @@ pub(crate) struct Changes {
     busy: Option<String>,
     status: Option<String>,
     status_clear: Option<Task<()>>,
+    /// The follow-up re-reads after a push, pull or sync timed out; `busy` is "checking"
+    /// while it runs, which blocks every other git action.
+    checking: Option<Task<()>>,
+    /// Offsets from the timeout at which ahead/behind is re-read (tests shorten them).
+    check_at: Vec<Duration>,
     pr: Option<Pr>,
     pr_branch: Option<String>,
     pr_request: u64,
@@ -259,6 +269,8 @@ impl Changes {
             busy: None,
             status: None,
             status_clear: None,
+            checking: None,
+            check_at: CHECK_AT.iter().map(|s| Duration::from_secs(*s)).collect(),
             pr: None,
             pr_branch: None,
             pr_request: 0,
@@ -443,11 +455,11 @@ impl Changes {
         self.git.update(cx, |git, cx| git.changed(cx));
     }
     /// `window.alert`.
-    fn fail(error: String, window: &mut Window, cx: &mut App) {
+    pub(crate) fn fail(error: String, window: &mut Window, cx: &mut App) {
         drop(window.prompt(PromptLevel::Critical, &error, None, &["OK"], cx));
     }
     /// confirmNative: Tauri's `ask` with the OK label it was given.
-    fn confirm(
+    pub(crate) fn confirm(
         message: String,
         ok: &'static str,
         window: &mut Window,
@@ -466,6 +478,29 @@ impl Changes {
         cx.background_executor()
             .spawn(async move { matches!(answer.await, Ok(0)) })
     }
+    /// Whether the panel still shows `cwd`; otherwise says so and the caller must stop.
+    fn still_at(&self, cwd: &str, window: &mut Window, cx: &mut App) -> bool {
+        if self.cwd == cwd {
+            return true;
+        }
+        Self::fail(
+            "The project changed while the dialog was open. Nothing was changed.".into(),
+            window,
+            cx,
+        );
+        false
+    }
+    /// Whether a discard may start. A cloud workspace refuses while a turn runs there (the
+    /// agent may be editing these files); the reason is shown as an alert.
+    fn discard_allowed(cwd: &str, window: &mut Window, cx: &mut App) -> bool {
+        match crate::git_gate::decide(crate::git_gate::Op::Discard, cwd) {
+            crate::git_gate::Decision::Refuse(reason) => {
+                Self::fail(reason.into(), window, cx);
+                false
+            }
+            _ => true,
+        }
+    }
     /// Runs `work` against the checkout with `busy` held, then rereads.
     fn run_git(
         &mut self,
@@ -475,26 +510,89 @@ impl Changes {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.busy.is_some() || !crate::git_gate::writes_allowed() {
+        let cwd = self.cwd.clone();
+        self.run_git_at(cwd, busy, work, then, window, cx);
+    }
+    /// [`Self::run_git`] against `cwd`, the checkout the user acted on. A path that awaited a
+    /// dialog passes the cwd it captured at click time: if the panel moved to another checkout
+    /// meanwhile, nothing runs.
+    fn run_git_at(
+        &mut self,
+        cwd: String,
+        busy: String,
+        work: impl FnOnce(PathBuf) -> Result<(), String> + Send + 'static,
+        then: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.still_at(&cwd, window, cx) {
+            return;
+        }
+        if self.busy.is_some() || !crate::git_gate::writes_allowed(&cwd) {
             return;
         }
         self.busy = Some(busy);
         cx.notify();
-        let path = PathBuf::from(&self.cwd);
+        let path = PathBuf::from(&cwd);
         let task = cx.background_executor().spawn(async move { work(path) });
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.busy = None;
+                // Refreshes ahead/behind, which also settles a timed-out push, pull or sync.
                 this.mutated(cx);
-                match result {
-                    Ok(()) => then(this, window, cx),
-                    Err(error) => Self::fail(error, window, cx),
+                match settle(result) {
+                    Settled::Done => then(this, window, cx),
+                    Settled::MayStillRun => this.start_checking(cwd, cx),
+                    Settled::Failed(error) => Self::fail(error, window, cx),
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// A remote push, pull or sync timed out and may still be running on the host. Keep the
+    /// panel busy (so a second one cannot start in parallel) and re-read ahead/behind a few
+    /// times until it changes or the last look is done.
+    fn start_checking(&mut self, cwd: String, cx: &mut Context<Self>) {
+        self.busy = Some("checking".into());
+        self.status_clear = None;
+        self.status = Some(MAY_STILL_RUN.into());
+        let before = self.counts(cx);
+        let schedule = self.check_at.clone();
+        self.checking = Some(cx.spawn(async move |this, cx| {
+            let mut elapsed = Duration::ZERO;
+            for (n, at) in schedule.iter().enumerate() {
+                cx.background_executor().timer(*at - elapsed).await;
+                elapsed = *at;
+                let last = n + 1 == schedule.len();
+                let finished = this.update(cx, |this, cx| {
+                    let moved = this.cwd != cwd;
+                    // The previous re-read already landed: if it differs, the host is done.
+                    let settled = this.counts(cx) != before;
+                    if moved || settled || last {
+                        if !moved {
+                            this.mutated(cx);
+                        }
+                        this.busy = None;
+                        this.status = None;
+                        this.checking = None;
+                    } else {
+                        this.mutated(cx);
+                    }
+                    cx.notify();
+                    moved || settled || last
+                });
+                if finished.unwrap_or(true) {
+                    return;
+                }
+            }
+        }));
+        cx.notify();
+    }
+    fn counts(&self, cx: &App) -> Option<(i64, i64)> {
+        self.index(cx).map(|i| (i.ahead, i.behind))
     }
 
     fn run_file(
@@ -508,8 +606,18 @@ impl Changes {
             return;
         }
         let relative = file.relative.clone();
+        let cwd = self.cwd.clone();
         let start = move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
-            this.run_git(
+            // The dialog may have been open for a while: the panel may show another checkout
+            // and a turn can have started meanwhile.
+            if !this.still_at(&cwd, window, cx) {
+                return;
+            }
+            if action == FileAction::Discard && !Self::discard_allowed(&cwd, window, cx) {
+                return;
+            }
+            this.run_git_at(
+                cwd.clone(),
                 relative.clone(),
                 move |path| match action {
                     FileAction::Stage => scm::stage_file(&path, &relative),
@@ -523,6 +631,9 @@ impl Changes {
         };
         if action != FileAction::Discard {
             start(self, window, cx);
+            return;
+        }
+        if !Self::discard_allowed(&self.cwd, window, cx) {
             return;
         }
         let name = basename(&file.relative).to_owned();
@@ -553,8 +664,16 @@ impl Changes {
             FileAction::Unstage => "unstage",
             FileAction::Discard => "discard",
         };
+        let cwd = self.cwd.clone();
         let start = move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
-            this.run_git(
+            if !this.still_at(&cwd, window, cx) {
+                return;
+            }
+            if action == FileAction::Discard && !Self::discard_allowed(&cwd, window, cx) {
+                return;
+            }
+            this.run_git_at(
+                cwd.clone(),
                 key.into(),
                 move |path| match action {
                     FileAction::Stage => scm::stage_all(&path),
@@ -568,6 +687,9 @@ impl Changes {
         };
         if action != FileAction::Discard {
             start(self, window, cx);
+            return;
+        }
+        if !Self::discard_allowed(&self.cwd, window, cx) {
             return;
         }
         let index = self.index(cx);
@@ -725,7 +847,7 @@ impl Changes {
     fn can_commit(&self, cx: &App) -> bool {
         let index = self.git.read(cx).index.as_ref();
         let staged = index.is_some_and(|i| i.files.iter().any(|f| f.staged));
-        crate::git_gate::writes_allowed()
+        crate::git_gate::writes_allowed(&self.cwd)
             && (staged || self.amend.is_some())
             && !self.message.read(cx).content.trim().is_empty()
             && self.busy.is_none()
@@ -758,7 +880,14 @@ impl Changes {
                 "Amend",
             ));
         }
+        // On a cloud workspace the agent may be committing too: ask first.
+        if let crate::git_gate::Decision::Confirm { message, ok } =
+            crate::git_gate::decide(crate::git_gate::Op::Commit, &self.cwd)
+        {
+            questions.push((message.to_owned(), ok));
+        }
         self.menu = None;
+        let cwd = self.cwd.clone();
         cx.spawn_in(window, async move |this, cx| {
             for (question, ok) in questions {
                 let Ok(ask) =
@@ -771,13 +900,16 @@ impl Changes {
                 }
             }
             let _ = this.update_in(cx, |this, window, cx| {
-                this.commit_now(push, create_pr, window, cx)
+                if this.still_at(&cwd, window, cx) {
+                    this.commit_now(cwd, push, create_pr, window, cx)
+                }
             });
         })
         .detach();
     }
     fn commit_now(
         &mut self,
+        cwd: String,
         push: bool,
         create_pr: bool,
         window: &mut Window,
@@ -786,7 +918,9 @@ impl Changes {
         let message = self.message.read(cx).content.to_string();
         let amend = self.amend.is_some();
         let pr = create_pr.then(|| self.text_harness(cx));
-        self.run_git(
+        let pr_cwd = cwd.clone();
+        self.run_git_at(
+            cwd,
             if create_pr { "pr" } else { "commit" }.into(),
             move |path| {
                 scm::commit(&path, &message, amend)?;
@@ -800,7 +934,7 @@ impl Changes {
                 this.message
                     .update(cx, |m, cx| m.set_text(String::new(), cx));
                 if let Some(harness) = pr {
-                    this.open_created_pr(harness, window, cx);
+                    this.open_created_pr(pr_cwd, harness, window, cx);
                 }
             },
             window,
@@ -810,16 +944,17 @@ impl Changes {
     /// generatePrContent, `gh pr create`, then the browser.
     fn open_created_pr(
         &mut self,
+        cwd: String,
         harness: Option<TextHarness>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !crate::git_gate::writes_allowed() {
+        if !self.still_at(&cwd, window, cx) || !crate::git_gate::writes_allowed(&cwd) {
             return;
         }
         self.busy = Some("pr".into());
         cx.notify();
-        let cwd = PathBuf::from(&self.cwd);
+        let cwd = PathBuf::from(&cwd);
         let work = cx
             .background_executor()
             .spawn(async move { create_pr_blocking(harness, &cwd) });
@@ -860,6 +995,7 @@ impl Changes {
             )
         });
         let harness = self.text_harness(cx);
+        let cwd = self.cwd.clone();
         cx.spawn_in(window, async move |this, cx| {
             if let Some(question) = question {
                 let Ok(ask) = this.update_in(cx, |_, window, cx| {
@@ -873,15 +1009,17 @@ impl Changes {
             }
             let _ = this.update_in(cx, |this, window, cx| {
                 if ahead {
-                    this.run_git(
+                    let pr_cwd = cwd.clone();
+                    this.run_git_at(
+                        cwd,
                         "pr".into(),
                         |path| scm::push(&path),
-                        move |this, window, cx| this.open_created_pr(harness, window, cx),
+                        move |this, window, cx| this.open_created_pr(pr_cwd, harness, window, cx),
                         window,
                         cx,
                     );
                 } else {
-                    this.open_created_pr(harness, window, cx);
+                    this.open_created_pr(cwd, harness, window, cx);
                 }
             });
         })
@@ -1999,9 +2137,156 @@ impl Render for Changes {
     }
 }
 
+/// How a git action ended. A client timeout on a remote push, pull or sync is not a
+/// failure: the host may still be running it.
+#[derive(Debug, PartialEq)]
+enum Settled {
+    Done,
+    MayStillRun,
+    Failed(String),
+}
+
+fn settle(result: Result<(), String>) -> Settled {
+    match result {
+        Ok(()) => Settled::Done,
+        Err(error) if error == MAY_STILL_RUN => Settled::MayStillRun,
+        Err(error) => Settled::Failed(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_the_exact_timeout_text_is_not_a_failure() {
+        assert_eq!(settle(Ok(())), Settled::Done);
+        assert_eq!(settle(Err(MAY_STILL_RUN.into())), Settled::MayStillRun);
+        assert_eq!(
+            settle(Err("rejected".into())),
+            Settled::Failed("rejected".into())
+        );
+    }
+    fn changes_window(
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<ProjectGit>, gpui::WindowHandle<Changes>) {
+        cx.update(|cx| {
+            let git = cx.new(|cx| ProjectGit::new("~".into(), cx));
+            let handle = git.clone();
+            let window = cx
+                .open_window(Default::default(), |window, cx| {
+                    cx.new(|cx| Changes::new(git, window, cx))
+                })
+                .unwrap();
+            (handle, window)
+        })
+    }
+    /// A timed-out push is not an alert: the panel stays busy "checking" (so nothing else
+    /// starts), re-reads ahead/behind at each look, and frees itself after the last one. A real
+    /// failure still alerts.
+    #[gpui::test]
+    fn a_timed_out_push_keeps_checking_the_host_instead_of_failing(cx: &mut gpui::TestAppContext) {
+        let (git_handle, window) = changes_window(cx);
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        let epoch = |cx: &mut gpui::VisualTestContext| git_handle.read_with(cx, |g, _| g.epoch);
+        window
+            .update(visual, |changes, _, _| {
+                changes.check_at = [1u64, 2, 3, 4].map(Duration::from_millis).to_vec();
+                // The checkout the git model reports; otherwise the first re-read looks like
+                // the panel moving to another checkout.
+                changes.cwd = "~".into();
+            })
+            .unwrap();
+        let before = epoch(visual);
+        window
+            .update(visual, |changes, window, cx| {
+                let cwd = changes.cwd.clone();
+                changes.run_git_at(
+                    cwd,
+                    "push".into(),
+                    |_| Err(MAY_STILL_RUN.into()),
+                    |_, _, _| panic!("a timeout is not a success"),
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(!visual.has_pending_prompt(), "a timeout is not an alert");
+        assert_eq!(epoch(visual), before + 1, "the first re-read is immediate");
+        window
+            .update(visual, |changes, _, _| {
+                assert_eq!(changes.busy.as_deref(), Some("checking"));
+                assert_eq!(changes.status.as_deref(), Some(MAY_STILL_RUN));
+            })
+            .unwrap();
+        // A second push while checking is refused and never runs.
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        window
+            .update(visual, |changes, window, cx| {
+                let cwd = changes.cwd.clone();
+                changes.run_git_at(
+                    cwd,
+                    "push".into(),
+                    move |_| {
+                        flag.store(true, Ordering::SeqCst);
+                        Ok(())
+                    },
+                    |_, _, _| {},
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(!ran.load(Ordering::SeqCst), "a second push must not start");
+        // Each look re-reads once; the last one frees the panel.
+        for (n, millis) in [1u64, 1, 1].into_iter().enumerate() {
+            visual
+                .executor()
+                .advance_clock(Duration::from_millis(millis));
+            visual.run_until_parked();
+            assert_eq!(
+                epoch(visual),
+                before + 2 + n as u64,
+                "look {n}, before {before}"
+            );
+            window
+                .update(visual, |changes, _, _| {
+                    assert_eq!(changes.busy.as_deref(), Some("checking"))
+                })
+                .unwrap();
+        }
+        visual.executor().advance_clock(Duration::from_millis(1));
+        visual.run_until_parked();
+        assert_eq!(
+            epoch(visual),
+            before + 5,
+            "one immediate read and four looks"
+        );
+        window
+            .update(visual, |changes, _, _| {
+                assert!(changes.busy.is_none());
+                assert!(changes.status.is_none());
+            })
+            .unwrap();
+        window
+            .update(visual, |changes, window, cx| {
+                let cwd = changes.cwd.clone();
+                changes.run_git_at(
+                    cwd,
+                    "push".into(),
+                    |_| Err("rejected".into()),
+                    |_, _, _| {},
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let (message, _) = visual.pending_prompt().expect("a failure alerts");
+        assert_eq!(message, "rejected");
+    }
     #[gpui::test]
     fn enabling_an_enabled_changes_panel_does_not_reload(cx: &mut gpui::TestAppContext) {
         let window = cx.update(|cx| {
@@ -2022,6 +2307,146 @@ mod tests {
                 assert_eq!(request, changes.pr_request);
             })
             .unwrap();
+    }
+    /// A discard in a cloud workspace is refused with an alert while a turn runs there, and
+    /// asks the usual question otherwise.
+    #[gpui::test]
+    fn discard_is_refused_while_a_turn_runs_in_the_cloud_workspace(cx: &mut gpui::TestAppContext) {
+        use crate::git_gate::{Gate, set};
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                let git = cx.new(|cx| ProjectGit::new("~".into(), cx));
+                cx.new(|cx| Changes::new(git, window, cx))
+            })
+            .unwrap()
+        });
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        window
+            .update(visual, |changes, _, _| {
+                changes.cwd = "remote://octo-abc/workspaces/widgets".into()
+            })
+            .unwrap();
+        set(Gate::running_in(&["octo-abc"]));
+        window
+            .update(visual, |changes, window, cx| {
+                changes.run_file(f("a.rs", "modified"), FileAction::Discard, window, cx);
+            })
+            .unwrap();
+        let (message, _) = visual.pending_prompt().expect("an alert");
+        assert!(message.contains("agent is working"), "{message}");
+        visual.simulate_prompt_answer("OK");
+        visual.run_until_parked();
+        assert!(!visual.has_pending_prompt());
+        // Discard all is refused the same way.
+        window
+            .update(visual, |changes, window, cx| {
+                changes.run_all(FileAction::Discard, window, cx)
+            })
+            .unwrap();
+        let (message, _) = visual.pending_prompt().expect("an alert");
+        assert!(message.contains("agent is working"), "{message}");
+        visual.simulate_prompt_answer("OK");
+        visual.run_until_parked();
+        window
+            .update(visual, |changes, _, _| assert!(changes.busy.is_none()))
+            .unwrap();
+
+        set(Gate::running_in(&[]));
+        window
+            .update(visual, |changes, window, cx| {
+                changes.run_file(f("a.rs", "modified"), FileAction::Discard, window, cx)
+            })
+            .unwrap();
+        let (message, _) = visual.pending_prompt().expect("the confirmation");
+        assert!(message.starts_with("Discard changes in a.rs?"), "{message}");
+        visual.simulate_prompt_answer("Cancel");
+        visual.run_until_parked();
+        window
+            .update(visual, |changes, _, _| assert!(changes.busy.is_none()))
+            .unwrap();
+        set(Gate::default());
+    }
+    /// A turn can start while the confirmation is open: the answer re-runs the policy.
+    #[gpui::test]
+    fn discard_is_checked_again_after_the_confirmation(cx: &mut gpui::TestAppContext) {
+        use crate::git_gate::{Gate, set};
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                let git = cx.new(|cx| ProjectGit::new("~".into(), cx));
+                cx.new(|cx| Changes::new(git, window, cx))
+            })
+            .unwrap()
+        });
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        window
+            .update(visual, |changes, _, _| {
+                changes.cwd = "remote://octo-abc/workspaces/widgets".into()
+            })
+            .unwrap();
+        set(Gate::running_in(&[]));
+        window
+            .update(visual, |changes, window, cx| {
+                changes.run_file(f("a.rs", "modified"), FileAction::Discard, window, cx);
+            })
+            .unwrap();
+        let (message, _) = visual.pending_prompt().expect("the confirmation");
+        assert!(message.starts_with("Discard changes in a.rs?"), "{message}");
+        // The agent starts working while the dialog is open.
+        set(Gate::running_in(&["octo-abc"]));
+        visual.simulate_prompt_answer("Discard");
+        visual.run_until_parked();
+        let (message, _) = visual.pending_prompt().expect("a refusal");
+        assert!(message.contains("agent is working"), "{message}");
+        visual.simulate_prompt_answer("OK");
+        visual.run_until_parked();
+        window
+            .update(visual, |changes, _, _| assert!(changes.busy.is_none()))
+            .unwrap();
+        set(Gate::default());
+    }
+    /// The panel can move to another checkout while a dialog is open: the discard must not run
+    /// there, and the new checkout is left alone.
+    #[gpui::test]
+    fn a_discard_does_not_run_on_another_checkout_after_the_panel_moved(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::git_gate::{Gate, set};
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                let git = cx.new(|cx| ProjectGit::new("~".into(), cx));
+                cx.new(|cx| Changes::new(git, window, cx))
+            })
+            .unwrap()
+        });
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        window
+            .update(visual, |changes, _, _| {
+                changes.cwd = "remote://octo-abc/workspaces/one".into()
+            })
+            .unwrap();
+        set(Gate::running_in(&[]));
+        window
+            .update(visual, |changes, window, cx| {
+                changes.run_file(f("a.rs", "modified"), FileAction::Discard, window, cx);
+            })
+            .unwrap();
+        assert!(visual.pending_prompt().is_some(), "the confirmation");
+        // The panel moves to another repo while the dialog is open.
+        window
+            .update(visual, |changes, _, _| {
+                changes.cwd = "remote://octo-abc/workspaces/two".into()
+            })
+            .unwrap();
+        visual.simulate_prompt_answer("Discard");
+        visual.run_until_parked();
+        let (message, _) = visual.pending_prompt().expect("a notice");
+        assert!(message.contains("project changed"), "{message}");
+        visual.simulate_prompt_answer("OK");
+        visual.run_until_parked();
+        window
+            .update(visual, |changes, _, _| assert!(changes.busy.is_none()))
+            .unwrap();
+        set(Gate::default());
     }
     fn f(relative: &str, status: &str) -> ChangedFile {
         ChangedFile {

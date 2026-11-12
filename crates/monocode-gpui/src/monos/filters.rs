@@ -8,6 +8,8 @@ pub(super) struct Filters {
     pub show_unavailable: bool,
     pub hidden_harnesses: Vec<String>,
     pub time: String,
+    /// "" or "all" shows every launch; "local" or "cloud" keeps one location.
+    pub location: String,
     pub working: bool,
     pub needs_approval: bool,
     pub done: bool,
@@ -39,6 +41,11 @@ impl Filters {
         (!self.show_archived || view.archived)
             && !self.hidden_harnesses.contains(&launch.harness)
             && view.updated_at >= since
+            && match self.location.as_str() {
+                "local" => !view.cloud,
+                "cloud" => view.cloud,
+                _ => true,
+            }
             && (!(self.working || self.needs_approval || self.done)
                 || self.working && view.busy
                 || self.needs_approval && view.needs_input
@@ -69,6 +76,22 @@ impl Monos {
                         f.time.is_empty() || f.time == "all"
                     } else {
                         f.time == id
+                    })
+                    .into(),
+            );
+        }
+        items.push(MenuItem::Separator);
+        for (id, label) in [
+            ("all", "All locations"),
+            ("local", "Local"),
+            ("cloud", "Cloud"),
+        ] {
+            items.push(
+                MenuAction::new(format!("location:{id}"), label)
+                    .checked(if id == "all" {
+                        f.location.is_empty() || f.location == "all"
+                    } else {
+                        f.location == id
                     })
                     .into(),
             );
@@ -108,6 +131,7 @@ impl Monos {
                     "done" => f.done = !f.done,
                     "reset" => *f = Filters::default(),
                     id if id.starts_with("time:") => f.time = id[5..].into(),
+                    id if id.starts_with("location:") => f.location = id[9..].into(),
                     id if id.starts_with("provider:") => {
                         let id = id[9..].to_string();
                         if f.hidden_harnesses.contains(&id) {
@@ -138,5 +162,75 @@ impl Monos {
             _events: vec![events],
         });
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shell::monos::MonoSession;
+
+    fn view(cloud: bool) -> MonoSession {
+        MonoSession {
+            id: 1,
+            title: String::new(),
+            cwd: String::new(),
+            busy: false,
+            has_messages: true,
+            archived: false,
+            updated_at: monocode_core::time::now_ms(),
+            needs_input: false,
+            branch: None,
+            model: Default::default(),
+            cloud,
+        }
+    }
+    fn launch() -> mono::Launch {
+        mono::Launch {
+            session_id: 1,
+            cwd: "/p".into(),
+            title: "x".into(),
+            harness: "claude".into(),
+            model: None,
+            origin_turn: 0,
+            notify_on_complete: false,
+            completed: false,
+            dismissed: false,
+            each: false,
+            visible: false,
+        }
+    }
+
+    #[test]
+    fn the_location_filter_keeps_only_local_or_only_cloud_launches() {
+        let (local, cloud) = (view(false), view(true));
+        let launch = launch();
+        for (location, shows_local, shows_cloud) in [
+            ("", true, true),
+            ("all", true, true),
+            ("local", true, false),
+            ("cloud", false, true),
+        ] {
+            let filters = Filters {
+                location: location.into(),
+                ..Default::default()
+            };
+            assert_eq!(
+                filters.matches(&launch, Some(&local)),
+                shows_local,
+                "{location}"
+            );
+            assert_eq!(
+                filters.matches(&launch, Some(&cloud)),
+                shows_cloud,
+                "{location}"
+            );
+        }
+    }
+
+    #[test]
+    fn saved_filters_without_a_location_still_load() {
+        let filters: Filters = serde_json::from_str(r#"{"time":"7d","working":true}"#).unwrap();
+        assert!(filters.location.is_empty());
     }
 }

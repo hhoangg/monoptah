@@ -27,8 +27,11 @@
 //!
 //! # Steps
 //!
-//! [`StepKind::ALL`] is the display order. `Create`, `Provision`, `Connect` and `OpenProject`
-//! are timed with the wall clock. `BuildContainer`, `BlockingCommands`, `ConfigureCodespace`
+//! [`StepKind::ALL`] is the display order. `Create`, `Provision`, `Connect`, `OpenProject` and
+//! `ClaudeSetup` are timed with the wall clock. `ClaudeSetup` (see [`super::claude_setup`])
+//! sends the user's Claude kit to a workspace this start CREATED, once, before `Ready`; it never
+//! fails the start and is `Skipped` when the kit is off, for a start that attached to an
+//! existing workspace and in a record written before the step existed. `BuildContainer`, `BlockingCommands`, `ConfigureCodespace`
 //! and `LifecycleCommands` come from the codespace's creation log (`log_step`): the log is
 //! replayed from the top once the codespace is Available, so their durations are real even
 //! though they arrive late. `LifecycleCommands` runs in the background after Available and
@@ -97,13 +100,17 @@ pub enum StepKind {
     ConfigureCodespace,
     Connect,
     OpenProject,
+    /// Sends the Claude kit (skills, MCP servers, plugins) to a new workspace. Records written
+    /// before this step existed have no such step; [`StartRecord::normalize`] adds it pending
+    /// and the start ends it `Skipped`.
+    ClaudeSetup,
     LifecycleCommands,
 }
 
 impl StepKind {
     /// Every step in display order. `LifecycleCommands` is last: it runs in the background
     /// after Available and never blocks `Ready`.
-    pub const ALL: [StepKind; 8] = [
+    pub const ALL: [StepKind; 9] = [
         StepKind::Create,
         StepKind::Provision,
         StepKind::BuildContainer,
@@ -111,6 +118,7 @@ impl StepKind {
         StepKind::ConfigureCodespace,
         StepKind::Connect,
         StepKind::OpenProject,
+        StepKind::ClaudeSetup,
         StepKind::LifecycleCommands,
     ];
     /// Name in the step list.
@@ -123,6 +131,7 @@ impl StepKind {
             Self::ConfigureCodespace => "Configure codespace",
             Self::Connect => "Connect over SSH",
             Self::OpenProject => "Open project",
+            Self::ClaudeSetup => "Claude setup",
             Self::LifecycleCommands => "Background lifecycle commands",
         }
     }
@@ -136,6 +145,7 @@ impl StepKind {
             Self::ConfigureCodespace => "Configuring codespace",
             Self::Connect => "Connecting",
             Self::OpenProject => "Opening project",
+            Self::ClaudeSetup => "Setting up Claude",
             Self::LifecycleCommands => "Running background commands",
         }
     }
@@ -167,6 +177,7 @@ impl StepKind {
             Self::ConfigureCodespace => "configureCodespace",
             Self::Connect => "connect",
             Self::OpenProject => "openProject",
+            Self::ClaudeSetup => "claudeSetup",
             Self::LifecycleCommands => "lifecycleCommands",
         }
     }
@@ -210,6 +221,14 @@ pub struct Step {
 }
 
 impl Step {
+    /// A Claude setup step that was never started and never ended: the record was written
+    /// before the step existed ([`StartRecord::normalize`]). Such a start never sends.
+    pub(super) fn predates(&self) -> bool {
+        self.kind == StepKind::ClaudeSetup
+            && self.status == StepStatus::Skipped
+            && self.started_at.is_none()
+            && self.finished_at.is_none()
+    }
     pub(super) fn pending(kind: StepKind) -> Self {
         Self {
             kind,
@@ -296,6 +315,14 @@ pub struct StartRecord {
     /// What only a sandbox start has. Set exactly when [`Self::sandbox`] is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_start: Option<SandboxStart>,
+    /// This start sends no Claude kit: the per-start switch was off, or the app API asked
+    /// for `kit: "none"`. It can only narrow the global setting (rule D11), never widen it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub kit_off: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl StartRecord {
@@ -326,6 +353,7 @@ impl StartRecord {
             finished_at: None,
             track_ready: resolved.created,
             sandbox_start: None,
+            kit_off: false,
         }
     }
     /// The backend this start runs on.
@@ -354,9 +382,16 @@ impl StartRecord {
     /// Ensures `steps` holds every kind in order (damaged or older storage).
     fn normalize(&mut self) {
         let mut steps: Vec<Step> = StepKind::ALL.iter().map(|k| Step::pending(*k)).collect();
-        for old in std::mem::take(&mut self.steps) {
-            let at = old.kind.index();
-            steps[at] = old;
+        let old = std::mem::take(&mut self.steps);
+        // A record written before the Claude setup step existed never sends the kit: an
+        // upgrade must not start sending credentials in the middle of a start the user began
+        // without that choice.
+        if !old.iter().any(|s| s.kind == StepKind::ClaudeSetup) {
+            steps[StepKind::ClaudeSetup.index()].status = StepStatus::Skipped;
+        }
+        for step in old {
+            let at = step.kind.index();
+            steps[at] = step;
         }
         self.steps = steps;
     }
@@ -365,18 +400,23 @@ impl StartRecord {
     /// waits. `None` when nothing is running.
     pub fn current(&self) -> Option<StepKind> {
         let running = |kind: StepKind| self.step(kind).status == StepStatus::Running;
-        [StepKind::Connect, StepKind::OpenProject]
-            .into_iter()
-            .find(|k| running(*k))
-            .or_else(|| {
-                StepKind::ALL
-                    .iter()
-                    .rev()
-                    .copied()
-                    .find(|k| k.is_log_derived() && running(*k))
-            })
-            .or_else(|| running(StepKind::Provision).then_some(StepKind::Provision))
-            .or_else(|| running(StepKind::Create).then_some(StepKind::Create))
+        // The Claude setup runs while OpenProject is still open: it comes first.
+        [
+            StepKind::ClaudeSetup,
+            StepKind::Connect,
+            StepKind::OpenProject,
+        ]
+        .into_iter()
+        .find(|k| running(*k))
+        .or_else(|| {
+            StepKind::ALL
+                .iter()
+                .rev()
+                .copied()
+                .find(|k| k.is_log_derived() && running(*k))
+        })
+        .or_else(|| running(StepKind::Provision).then_some(StepKind::Provision))
+        .or_else(|| running(StepKind::Create).then_some(StepKind::Create))
     }
     pub fn is_failed(&self) -> bool {
         self.error.is_some()
@@ -386,6 +426,15 @@ impl StartRecord {
         self.finished_at
             .unwrap_or(now)
             .saturating_sub(self.started_at)
+    }
+    /// At the end of a start: a Claude setup that never ran (kit off, an attached workspace,
+    /// an old record) is shown as skipped.
+    pub(super) fn skip_unrun_claude_setup(&mut self, at: u64) {
+        let step = self.step_mut(StepKind::ClaudeSetup);
+        if matches!(step.status, StepStatus::Pending | StepStatus::Running) {
+            step.status = StepStatus::Skipped;
+            step.finished_at = Some(at);
+        }
     }
     pub(super) fn start_step(&mut self, kind: StepKind, at: u64) {
         let step = self.step_mut(kind);
@@ -484,6 +533,7 @@ impl StartRecord {
         let main = [
             StepKind::Connect,
             StepKind::OpenProject,
+            StepKind::ClaudeSetup,
             StepKind::Provision,
             StepKind::Create,
         ];
@@ -608,6 +658,7 @@ pub fn pause_start(store: &Store, id: i64, reason: &str) -> Result<(), String> {
 
 /// Drops the records of a workspace that no longer exists (called by `forget_cloud`).
 pub(crate) fn forget_cloud_starts(store: &Store, cloud: &CloudRef) -> Result<(), String> {
+    super::claude_setup::forget_state(store, cloud)?;
     for key in [SETTING, SETTING_SANDBOX] {
         let mut all = load_key(store, key);
         let before = all.len();
@@ -778,11 +829,27 @@ impl CloudSessions {
         target: Target,
         harness: &str,
     ) -> Result<(Session, StartRecord), String> {
+        self.begin_start_with_kit(local_cwd, target, harness, true)
+    }
+
+    /// [`Self::begin_start`] with this start's own Claude setup choice. `kit: false` is part of
+    /// the FIRST persisted record, so no crash or later write failure can turn it back on
+    /// (rule D11).
+    pub fn begin_start_with_kit(
+        &self,
+        local_cwd: &str,
+        target: Target,
+        harness: &str,
+        kit: bool,
+    ) -> Result<(Session, StartRecord), String> {
         require_claude(harness)?;
+        if let crate::cloud_sessions::CodespaceChoice::Named(name) = &target.codespace {
+            self.refuse_while_cleaning(&CloudRef::codespace(name))?;
+        }
         let began = self.now();
         let resolved = self.resolve_codespace(local_cwd, target, &mut |_| {})?;
         self.invalidate(&resolved.name);
-        self.record_start(local_cwd, harness, &resolved, began)
+        self.record_start(local_cwd, harness, &resolved, began, !kit)
             .map_err(|error| {
                 if resolved.created {
                     created_note(&resolved.name, &error)
@@ -791,15 +858,18 @@ impl CloudSessions {
                 }
             })
     }
-    fn record_start(
+    pub(super) fn record_start(
         &self,
         local_cwd: &str,
         harness: &str,
         resolved: &ResolvedCodespace,
         began: u64,
+        kit_off: bool,
     ) -> Result<(Session, StartRecord), String> {
         let now = self.now();
         let store = self.store()?;
+        // Again with the store held, see `refuse_while_cleaning`.
+        self.refuse_while_cleaning(&CloudRef::codespace(&resolved.name))?;
         let project = pending_cloud_project(
             local_cwd,
             &CloudRef::codespace(&resolved.name),
@@ -807,6 +877,7 @@ impl CloudSessions {
         );
         let session = store.create_pending_cloud_session(harness, project)?;
         let mut record = StartRecord::fresh(resolved, session.id, local_cwd, began);
+        record.kit_off = kit_off;
         let create = record.step_mut(StepKind::Create);
         if resolved.created {
             create.status = StepStatus::Done;
@@ -985,6 +1056,7 @@ impl CloudSessions {
             record.started_at,
         );
         let halt = Arc::new(AtomicBool::new(false));
+        let setup = self.setup_plan(record);
         {
             let (backend, host, store, halt, tx) = (
                 self.backend(record.backend())?,
@@ -1002,6 +1074,8 @@ impl CloudSessions {
                     display: &record.display,
                     repo: &record.repo,
                     remote_cwd: &record.remote_cwd,
+                    auth: None,
+                    setup,
                 };
                 let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     super::open_project(
@@ -1077,6 +1151,7 @@ impl CloudSessions {
         };
         let at = self.now();
         record.finish_step(StepKind::OpenProject, at);
+        record.skip_unrun_claude_setup(at);
         for kind in StepKind::ALL {
             if kind.is_log_derived()
                 && kind != StepKind::LifecycleCommands
@@ -1112,7 +1187,8 @@ impl CloudSessions {
         self.invalidate_ref(&cloud);
         let now = self.now();
         for step in &mut record.steps {
-            if step.kind != StepKind::Create {
+            // A record from before the Claude setup step keeps never sending.
+            if step.kind != StepKind::Create && !step.predates() {
                 *step = Step::pending(step.kind);
             }
         }

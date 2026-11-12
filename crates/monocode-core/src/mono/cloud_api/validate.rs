@@ -3,8 +3,13 @@
 //! Nothing here names a backend: instance names, option keys and option values come from the
 //! [`CloudKindSpec`] registry.
 use super::provider::{spec_of, specs, CloudKindSpec};
+use crate::cloud_sessions::kit_prefs::ApiKit;
 use crate::cloud_sessions::CloudBackendKind;
 use serde_json::{Map, Value};
+
+/// `target.kit`: `"none"` or `"default"`. Every backend takes it, so it is not in the
+/// backend's own option list. It can only narrow what the user set in Settings (rule D11).
+pub const KIT_OPTION: &str = "kit";
 
 /// Accepted values of `kind`, for error text: `codespace or sandbox`.
 fn kind_choices() -> String {
@@ -127,7 +132,7 @@ pub fn validate_target(target: &Value, input: &Value) -> Result<(), String> {
         .and_then(|value| kind_of(value, "target.kind"))?;
     let spec = spec_of(kind);
     for key in target.keys() {
-        if !["kind", "instance"].contains(&key.as_str())
+        if !["kind", "instance", KIT_OPTION].contains(&key.as_str())
             && !spec.start_options().contains(&key.as_str())
         {
             return Err(format!("target does not take {key} for a {}", kind.noun()));
@@ -144,7 +149,11 @@ pub fn validate_target(target: &Value, input: &Value) -> Result<(), String> {
                 kind.noun()
             ));
         }
-        spec.check_start_option(key, value)?;
+        if key == KIT_OPTION {
+            ApiKit::parse(value)?;
+        } else {
+            spec.check_start_option(key, value)?;
+        }
     }
     validate_session_options(input)
 }

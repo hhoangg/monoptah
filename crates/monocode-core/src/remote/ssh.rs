@@ -252,14 +252,90 @@ pub struct JobView {
 struct JobData {
     view: JobView,
     answer: Option<String>,
+    /// When the job completed; finished jobs are kept a while for their owner to read.
+    finished: Option<Instant>,
 }
+
+/// What a setup job connects to. Two jobs for different cloud targets can run side by side;
+/// jobs for the same target, or any job on a plain SSH machine, cannot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JobTarget {
+    Codespace(String),
+    Sandbox(String),
+    /// Destination and port of a plain SSH machine.
+    Ssh(String, Option<u16>),
+}
+
+impl SshTarget {
+    pub fn job_target(&self) -> JobTarget {
+        match self.transport() {
+            Transport::Codespace(name) => JobTarget::Codespace(name.into()),
+            Transport::Sandbox(sandbox) => JobTarget::Sandbox(sandbox.name.clone()),
+            Transport::Ssh => JobTarget::Ssh(self.target.clone(), self.port),
+        }
+    }
+}
+
+/// True when an active job for `active` must finish before a job for `new` may start.
+/// `None` (a job tied to no single target) conflicts with everything.
+///
+/// * The same target twice would race on one machine.
+/// * A plain SSH job can ask for a password or a host key and writes `~/.ssh/known_hosts`,
+///   so it runs alone.
+/// * Codespace jobs for different codespaces run together, but only once `gh` has created
+///   its automatic key pair (`key_ready`): the first `gh codespace ssh` generates it, and
+///   two first runs could race on the files.
+pub fn jobs_conflict(new: Option<&JobTarget>, active: Option<&JobTarget>, key_ready: bool) -> bool {
+    let (Some(new), Some(active)) = (new, active) else {
+        return true;
+    };
+    match (new, active) {
+        (JobTarget::Ssh(..), _) | (_, JobTarget::Ssh(..)) => true,
+        (new, active) if new == active => true,
+        (JobTarget::Codespace(_), JobTarget::Codespace(_)) => !key_ready,
+        _ => false,
+    }
+}
+
+/// Whether `gh` has already created its automatic key pair for `gh codespace ssh`
+/// (`~/.ssh/codespaces.auto` and `.pub`). Without a known home it counts as missing, which
+/// only makes codespace setups run one at a time.
+pub fn codespace_key_exists() -> bool {
+    #[cfg(all(test, unix))]
+    let override_home = HOME_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    #[cfg(not(all(test, unix)))]
+    let override_home: Option<std::path::PathBuf> = None;
+    let Some(home) = override_home.or_else(|| {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(std::path::PathBuf::from)
+    }) else {
+        return false;
+    };
+    let ssh = home.join(".ssh");
+    ssh.join("codespaces.auto").is_file() && ssh.join("codespaces.auto.pub").is_file()
+}
+
 pub struct Job {
     inner: Mutex<JobData>,
     pub cancelled: AtomicBool,
+    /// `None` for a job that is not tied to one target (a Host upgrade slot): it conflicts
+    /// with every other job.
+    target: Option<JobTarget>,
 }
 impl Job {
     pub fn new() -> Arc<Self> {
+        Self::with_target(None)
+    }
+    pub fn for_target(target: JobTarget) -> Arc<Self> {
+        Self::with_target(Some(target))
+    }
+    fn with_target(target: Option<JobTarget>) -> Arc<Self> {
         Arc::new(Self {
+            target,
             inner: Mutex::new(JobData {
                 view: JobView {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -270,9 +346,17 @@ impl Job {
                     machine: None,
                 },
                 answer: None,
+                finished: None,
             }),
             cancelled: AtomicBool::new(false),
         })
+    }
+    pub fn target(&self) -> Option<&JobTarget> {
+        self.target.as_ref()
+    }
+    /// When the job completed, `None` while it runs.
+    pub fn finished_at(&self) -> Option<Instant> {
+        self.inner.lock().unwrap().finished
     }
     pub fn view(&self) -> JobView {
         self.inner.lock().unwrap().view.clone()
@@ -288,6 +372,7 @@ impl Job {
             action()
         };
         inner.view.done = true;
+        inner.finished = Some(Instant::now());
         inner.view.prompt = None;
         inner.answer = None;
         match result {
@@ -360,6 +445,8 @@ impl Job {
 static GH_OVERRIDE: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 #[cfg(all(test, unix))]
 static GH_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(all(test, unix))]
+static HOME_OVERRIDE: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 
 /// Points codespace commands at a fake `gh` for the life of the guard. The
 /// guard also serializes tests, because the override is process-global.
@@ -374,9 +461,17 @@ impl GhOverride {
     }
 }
 #[cfg(all(test, unix))]
+impl GhOverride {
+    /// Makes the codespace key lookup read this directory instead of the real home.
+    pub(super) fn set_home(&self, home: std::path::PathBuf) {
+        *HOME_OVERRIDE.lock().unwrap_or_else(PoisonError::into_inner) = Some(home);
+    }
+}
+#[cfg(all(test, unix))]
 impl Drop for GhOverride {
     fn drop(&mut self) {
         *GH_OVERRIDE.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        *HOME_OVERRIDE.lock().unwrap_or_else(PoisonError::into_inner) = None;
     }
 }
 
@@ -704,18 +799,36 @@ pub fn bootstrap_script(platform: HostPlatform) -> String {
     bootstrap_script_from_template(platform, template)
 }
 
+/// Host targets the bootstrap can detect, in the order of `host_release::HOST_SHA256`.
+fn pinned_sha256_lines(platform: HostPlatform) -> String {
+    use super::host_release::HOST_SHA256;
+    HOST_SHA256
+        .iter()
+        .filter(|(target, _)| target.starts_with("win32") == (platform == HostPlatform::Windows))
+        .map(|(target, hash)| match platform {
+            // One `case` arm per target, filled in at the template's `@@SHA256@@` line.
+            HostPlatform::Unix => format!("    {target}) EXPECTED={hash} ;;"),
+            HostPlatform::Windows => format!("    '{target}' = '{hash}'"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn bootstrap_script_from_template(platform: HostPlatform, template: &str) -> String {
-    let version = env!("CARGO_PKG_VERSION");
-    let url = format!("https://github.com/hardbeat920/monocode/releases/download/v{version}");
+    use super::host_release::{HOST_RELEASE_BASE, HOST_VERSION};
+    let sha256 = pinned_sha256_lines(platform);
     match platform {
         // include_str! preserves checkout line endings, including Windows CRLF.
         HostPlatform::Unix => template
             .replace("\r\n", "\n")
-            .replace("@@VERSION@@", &shell_quote(version))
-            .replace("@@RELEASE@@", &shell_quote(&url)),
+            .replace("@@VERSION@@", &shell_quote(HOST_VERSION))
+            .replace("@@RELEASE@@", &shell_quote(HOST_RELEASE_BASE))
+            .replace("@@SHA256@@", &sha256)
+            .replace("@@WORKER_ALIVE@@", include_str!("worker_alive.sh")),
         HostPlatform::Windows => template
-            .replace("@@VERSION@@", &powershell_quote(version))
-            .replace("@@RELEASE@@", &powershell_quote(&url))
+            .replace("@@VERSION@@", &powershell_quote(HOST_VERSION))
+            .replace("@@RELEASE@@", &powershell_quote(HOST_RELEASE_BASE))
+            .replace("@@SHA256@@", &sha256)
             .replace("@@ACL@@", include_str!("windows-acl.ps1")),
     }
 }
@@ -731,6 +844,126 @@ fn bootstrap_script_from_template(platform: HostPlatform, template: &str) -> Str
 /// `ensure_detached_host` from `remote_bootstrap_detached.sh` is inserted before its
 /// `service install` line. Restarts need nothing extra: the template's `service uninstall` stops a detached Host.
 pub fn sandbox_bootstrap_script(prelude: Option<&str>) -> String {
+    sandbox_script_with(prelude, "")
+}
+
+/// One step of the cloud Host upgrade (see `remote_bootstrap.sh`): `Stage` downloads and
+/// verifies the package without touching the running Host; `Swap` starts the detached worker
+/// that installs it (and puts the previous Host back if the new one does not start); `Status`
+/// reads how the worker is doing (and finishes or rolls back one that died); `Discard` drops
+/// a staged package.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UpgradePhase {
+    Stage,
+    Swap,
+    Discard,
+    Status,
+}
+impl UpgradePhase {
+    /// The value of `MONOCODE_HOST_UPGRADE_PHASE`. The detached worker of a `Swap` runs as
+    /// `swapnow`.
+    fn word(self) -> &'static str {
+        match self {
+            Self::Stage => "stage",
+            Self::Swap => "swapnow",
+            Self::Discard => "discard",
+            Self::Status => "status",
+        }
+    }
+}
+
+/// What the swap worker needs to look at the running Host once more, right before it stops it.
+/// Travels on stdin only, and is exported for the worker, never written to a file.
+#[derive(Clone, Copy)]
+pub(crate) struct SwapCheck<'a> {
+    pub device_token: &'a str,
+    pub environment_id: &'a str,
+    /// Names this swap; the status the app reads must carry it.
+    pub nonce: &'a str,
+}
+
+/// Wraps the worker in a script that stores it, starts it detached (it survives a closed ssh
+/// and an app quit) and waits until it reports its first state.
+fn swap_launcher(worker: &str, check: Option<SwapCheck<'_>>) -> String {
+    let exports = match check {
+        Some(check) => format!(
+            "export MONOCODE_CHECK_TOKEN={}\nexport MONOCODE_CHECK_ENV={}\n",
+            shell_quote(check.device_token),
+            shell_quote(check.environment_id)
+        ),
+        None => String::new(),
+    };
+    let alive = include_str!("worker_alive.sh");
+    format!(
+        r#"{exports}[ -z "${{MONOCODE_HOST_TOKEN_VAR:-}}" ] || export MONOCODE_HOST_TOKEN_VAR
+set -eu
+umask 077
+BASE="$HOME/.monocode-host"
+mkdir -p "$BASE"
+{alive}
+# One worker at a time: a live one owns the lock.
+if [ -f "$BASE/swap.lock" ] && worker_alive "$(cat "$BASE/swap.lock" 2>/dev/null)"; then
+  echo 'Another Monoptah Host update is still running on this machine.' >&2
+  exit 1
+fi
+rm -f "$BASE/swap-status"
+cat > "$BASE/swap-worker.sh" <<'MONOCODE_SWAP_WORKER_END'
+{worker}
+MONOCODE_SWAP_WORKER_END
+if command -v setsid >/dev/null 2>&1; then
+  setsid nohup sh "$BASE/swap-worker.sh" >/dev/null 2>&1 </dev/null &
+else
+  nohup sh "$BASE/swap-worker.sh" >/dev/null 2>&1 </dev/null &
+fi
+_wait=0
+until [ -f "$BASE/swap-status" ]; do
+  _wait=$((_wait + 1))
+  [ "$_wait" -lt 15 ] || {{ echo 'The Host update did not start.' >&2; exit 1; }}
+  sleep 1
+done
+# Nothing started from here on needs the credential.
+unset MONOCODE_CHECK_TOKEN MONOCODE_CHECK_ENV
+echo '{{"swap":"started"}}'
+"#
+    )
+}
+
+/// A step of the cloud Host upgrade in a sandbox: the connect bootstrap, with the SAME prelude
+/// (a restarted Host needs the Claude credential in its environment), replacing the Host only
+/// when it is older or foreign.
+pub(crate) fn sandbox_upgrade_script(
+    prelude: Option<&str>,
+    port: u16,
+    phase: UpgradePhase,
+    check: Option<SwapCheck<'_>>,
+) -> String {
+    if phase == UpgradePhase::Swap {
+        // The worker inherits the prelude's exports; it carries none itself.
+        let worker = sandbox_script_with(None, &upgrade_flags(port, phase, check));
+        let launcher = swap_launcher(&worker, check);
+        return match prelude {
+            Some(prelude) => format!("{prelude}\n{launcher}"),
+            None => launcher,
+        };
+    }
+    sandbox_script_with(prelude, &upgrade_flags(port, phase, check))
+}
+
+fn upgrade_flags(port: u16, phase: UpgradePhase, check: Option<SwapCheck<'_>>) -> String {
+    let nonce = match (phase, check) {
+        (UpgradePhase::Swap | UpgradePhase::Status, Some(check)) => {
+            format!("MONOCODE_SWAP_NONCE={}\n", shell_quote(check.nonce))
+        }
+        _ => String::new(),
+    };
+    format!(
+        "MONOCODE_HOST_UPGRADE_IF_OLDER=1\nMONOCODE_HOST_UPGRADE_PHASE={}\nMONOCODE_HOST_PORT={port}\n{nonce}",
+        phase.word()
+    )
+}
+
+/// `extra` lines run right after the prelude, before the bootstrap.
+fn sandbox_script_with(prelude: Option<&str>, extra: &str) -> String {
     let template = include_str!("remote_bootstrap.sh").replace("\r\n", "\n");
     let helpers = include_str!("remote_bootstrap_detached.sh").replace("\r\n", "\n");
     let install = "\"$ENTRY\" service install --port \"$HOST_PORT\" >/dev/null";
@@ -744,8 +977,9 @@ pub fn sandbox_bootstrap_script(prelude: Option<&str>) -> String {
     } else {
         "echo 'The sandbox bootstrap template changed: the service install line is missing.' >&2\nexit 1\n".to_string()
     };
-    let script =
-        format!("MONOCODE_HOST_TRACK_TOKEN=1\nMONOCODE_HOST_INSTALL_CLAUDE=1\n{helpers}{body}");
+    let script = format!(
+        "{extra}MONOCODE_HOST_TRACK_TOKEN=1\nMONOCODE_HOST_INSTALL_CLAUDE=1\n{helpers}{body}"
+    );
     match prelude {
         Some(prelude) => format!("{prelude}\n{script}"),
         None => script,
@@ -762,6 +996,25 @@ pub fn codespace_bootstrap_script() -> String {
         "MONOCODE_HOST_TRACK_TOKEN=1\nMONOCODE_HOST_INSTALL_CLAUDE=1\n{}",
         bootstrap_script(HostPlatform::Unix)
     )
+}
+
+/// A step of the cloud Host upgrade in a codespace. Codespace secrets reach the login shell,
+/// so the restarted Host inherits the Claude token without a prelude.
+pub(crate) fn codespace_upgrade_script(
+    port: u16,
+    phase: UpgradePhase,
+    check: Option<SwapCheck<'_>>,
+) -> String {
+    let script = format!(
+        "{}{}",
+        upgrade_flags(port, phase, check),
+        codespace_bootstrap_script()
+    );
+    if phase == UpgradePhase::Swap {
+        swap_launcher(&script, check)
+    } else {
+        script
+    }
 }
 
 pub fn upgrade_script(platform: HostPlatform, port: u16) -> String {
@@ -787,6 +1040,12 @@ pub struct Tunnel {
     child: Child,
     pub port: u16,
     stderr: Arc<Mutex<String>>,
+    /// Distinguishes this tunnel from every other one ever started, even on a reused port.
+    id: u64,
+}
+static NEXT_TUNNEL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+fn next_tunnel_id() -> u64 {
+    NEXT_TUNNEL_ID.fetch_add(1, Ordering::Relaxed)
 }
 impl Drop for Tunnel {
     fn drop(&mut self) {
@@ -795,6 +1054,23 @@ impl Drop for Tunnel {
     }
 }
 impl Tunnel {
+    /// A tunnel that forwards nothing itself: `port` is wherever a test serves the Host.
+    #[cfg(test)]
+    pub(super) fn for_test(port: u16) -> Self {
+        let child = Command::new("sleep")
+            .arg("600")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        Self {
+            child,
+            port,
+            stderr: Arc::default(),
+            id: next_tunnel_id(),
+        }
+    }
     fn alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
     }
@@ -862,6 +1138,7 @@ impl Tunnel {
             child,
             port,
             stderr,
+            id: next_tunnel_id(),
         };
         // gh starts a stopped codespace before it can forward, and a sandbox
         // resumes on connect, which takes a while.
@@ -923,8 +1200,12 @@ struct Slot {
 
 pub struct TunnelLease {
     pub endpoint: String,
+    /// The tunnel this lease is on (see `Tunnel::id`).
+    pub tunnel_id: u64,
     slot: Arc<Mutex<Slot>>,
     generation: u64,
+    /// The tunnel was started for this lease (not reused).
+    pub fresh: bool,
 }
 
 /// Each machine has its own lock: restarting one machine's tunnel (up to
@@ -959,18 +1240,20 @@ impl Tunnels {
     pub fn existing(&self, id: &str) -> Option<TunnelLease> {
         let slot = self.slots().get(id).cloned()?;
         let mut current = slot.lock().unwrap_or_else(PoisonError::into_inner);
-        let port = {
+        let (port, tunnel_id) = {
             let tunnel = current.tunnel.as_mut()?;
             if !tunnel.alive() {
                 current.tunnel = None;
                 return None;
             }
-            tunnel.port
+            (tunnel.port, tunnel.id)
         };
         Some(TunnelLease {
             endpoint: format!("http://127.0.0.1:{port}"),
+            tunnel_id,
             slot: slot.clone(),
             generation: current.generation,
+            fresh: false,
         })
     }
     pub fn endpoint(&self, id: &str, target: &SshTarget) -> Result<TunnelLease, String> {
@@ -980,8 +1263,10 @@ impl Tunnels {
             if tunnel.alive() {
                 return Ok(TunnelLease {
                     endpoint: format!("http://127.0.0.1:{}", tunnel.port),
+                    tunnel_id: tunnel.id,
                     slot: slot.clone(),
                     generation: current.generation,
+                    fresh: false,
                 });
             }
         }
@@ -994,13 +1279,16 @@ impl Tunnels {
         match Tunnel::start(target, None, None) {
             Ok(tunnel) => {
                 let endpoint = format!("http://127.0.0.1:{}", tunnel.port);
+                let tunnel_id = tunnel.id;
                 current.failure = None;
                 current.generation = current.generation.wrapping_add(1);
                 current.tunnel = Some(tunnel);
                 Ok(TunnelLease {
                     endpoint,
+                    tunnel_id,
                     slot: slot.clone(),
                     generation: current.generation,
+                    fresh: true,
                 })
             }
             Err(error) => {
@@ -1064,6 +1352,8 @@ pub fn device_name() -> String {
 }
 
 #[cfg(test)]
+mod bootstrap_libc_tests;
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1090,8 +1380,10 @@ mod tests {
         tunnels.slots().insert("host".into(), old.clone());
         let old_lease = TunnelLease {
             endpoint: String::new(),
+            tunnel_id: 0,
             slot: old,
             generation: 1,
+            fresh: false,
         };
         let newer = slot(2);
         tunnels.slots().insert("host".into(), newer.clone());
@@ -1099,8 +1391,10 @@ mod tests {
         assert!(newer.lock().unwrap().failure.is_some());
         let stale_lease = TunnelLease {
             endpoint: String::new(),
+            tunnel_id: 0,
             slot: newer.clone(),
             generation: 1,
+            fresh: false,
         };
         tunnels.invalidate("host", &stale_lease);
         assert!(newer.lock().unwrap().failure.is_some());
@@ -1633,6 +1927,1100 @@ mod tests {
         assert!(!upgrade_script(HostPlatform::Unix, 3774).contains('\r'));
         assert!(upgrade_script(HostPlatform::Windows, 3774)
             .starts_with("$env:MONOCODE_HOST_FORCE_UPGRADE = '1'"));
+    }
+    #[test]
+    fn bootstrap_pins_the_fork_release_version_and_hashes() {
+        use super::super::host_release::{HOST_RELEASE_BASE, HOST_SHA256, HOST_VERSION};
+        let unix = bootstrap_script(HostPlatform::Unix);
+        assert!(unix.contains(&format!("RELEASE={}\n", shell_quote(HOST_RELEASE_BASE))));
+        assert!(unix.contains(&format!("VERSION={}\n", shell_quote(HOST_VERSION))));
+        assert!(HOST_RELEASE_BASE
+            .starts_with("https://github.com/hhoangg/monoptah/releases/download/host-v"));
+        assert!(HOST_VERSION.ends_with("+monoptah"));
+        assert!(!unix.contains("hardbeat920"));
+        for (target, hash) in HOST_SHA256 {
+            assert_eq!(
+                unix.contains(&format!("    {target}) EXPECTED={hash} ;;")),
+                !target.starts_with("win32"),
+                "{target}"
+            );
+        }
+        let windows = bootstrap_script(HostPlatform::Windows);
+        assert!(windows.contains(&format!(
+            "$release = {}",
+            powershell_quote(HOST_RELEASE_BASE)
+        )));
+        assert!(windows.contains(&format!("$version = {}", powershell_quote(HOST_VERSION))));
+        for (target, hash) in HOST_SHA256 {
+            assert_eq!(
+                windows.contains(&format!("'{target}' = '{hash}'")),
+                target.starts_with("win32"),
+                "{target}"
+            );
+        }
+        // The reinstall rule is unchanged: missing or FORCE_UPGRADE.
+        assert!(unix.contains("[ ! -x \"$ENTRY\" ] || [ \"$FORCE_UPGRADE\" = 1 ]"));
+    }
+    /// Runs the real Unix bootstrap with a stub `curl` that serves one fake package, and
+    /// returns (exit success, stderr, urls requested, HOME).
+    #[cfg(unix)]
+    fn run_bootstrap_with_fake_package(
+        pin_hash_of_package: bool,
+        publish: Option<&str>,
+        tamper: bool,
+    ) -> (bool, String, Vec<String>, tempfile::TempDir) {
+        run_bootstrap_on(
+            pin_hash_of_package,
+            publish,
+            tamper,
+            None,
+            bootstrap_script(HostPlatform::Unix),
+        )
+    }
+    /// [`run_bootstrap_with_fake_package`] for any script, with an already installed Host
+    /// that reports `installed` from `--version`. Every call to a Host is logged in
+    /// `$HOME/calls.log`.
+    #[cfg(unix)]
+    fn run_bootstrap_on(
+        pin_hash_of_package: bool,
+        publish: Option<&str>,
+        tamper: bool,
+        installed: Option<&str>,
+        mut script: String,
+    ) -> (bool, String, Vec<String>, tempfile::TempDir) {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+        let work = tempfile::tempdir().unwrap();
+        let pkg = work.path().join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        let host = pkg.join("monocode-host");
+        std::fs::write(
+            &host,
+            "#!/bin/sh\necho \"new $@\" >> \"$HOME/calls.log\"\nenv >> \"$HOME/env.log\"\ncase \"$1\" in --version) echo '1.1.0+monoptah' ;; connection-info) if [ -f \"$HOME/flaky\" ]; then n=$(cat \"$HOME/flaky\"); if [ \"$n\" -gt 0 ]; then echo $((n - 1)) > \"$HOME/flaky\"; exit 1; fi; fi; [ ! -f \"$HOME/fail-new\" ] || exit 1; echo '{\"port\":3774}' ;; service) [ \"$2\" != install ] || [ ! -f \"$HOME/fail-new\" ] || exit 1 ;; esac\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let tarball = work.path().join("pkg.tar.gz");
+        let status = Command::new("tar")
+            .arg("-czf")
+            .arg(&tarball)
+            .arg("-C")
+            .arg(&pkg)
+            .arg("monocode-host")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let package_hash = format!("{:x}", Sha256::digest(std::fs::read(&tarball).unwrap()));
+        // The checksum the "release" publishes next to the package.
+        let published = publish
+            .map(String::from)
+            .unwrap_or_else(|| package_hash.clone());
+        std::fs::write(
+            work.path().join("pkg.sha256"),
+            format!("{published}  pkg\n"),
+        )
+        .unwrap();
+        if tamper {
+            // Serve other bytes than the ones that were hashed.
+            std::fs::write(&tarball, b"not the package").unwrap();
+        }
+        let stubs = work.path().join("stubs");
+        std::fs::create_dir_all(&stubs).unwrap();
+        let curl = stubs.join("curl");
+        std::fs::write(
+            &curl,
+            format!(
+                "#!/bin/sh\nurl=; out=\nwhile [ $# -gt 0 ]; do case \"$1\" in -o) out=$2; shift ;; https://*) url=$1 ;; esac; shift; done\necho \"$url\" >> {log}\ncase \"$url\" in *.sha256) cp {sha} \"$out\" ;; *) cp {tar} \"$out\" ;; esac\n",
+                log = work.path().join("urls.log").display(),
+                sha = work.path().join("pkg.sha256").display(),
+                tar = tarball.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if pin_hash_of_package {
+            for (_, hash) in super::super::host_release::HOST_SHA256 {
+                script = script.replace(hash, &package_hash);
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        if let Some(version) = installed {
+            install_old_host(home.path(), version);
+        }
+        let mut child = Command::new("sh")
+            .arg("-s")
+            .env("HOME", home.path())
+            .env(
+                "PATH",
+                format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap()),
+            )
+            .env_remove("MONOCODE_HOST_FORCE_UPGRADE")
+            .env_remove("MONOCODE_HOST_UPGRADE_IF_OLDER")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let urls = std::fs::read_to_string(work.path().join("urls.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(String::from)
+            .collect();
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            urls,
+            home,
+        )
+    }
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_installs_a_package_that_matches_the_pinned_hash() {
+        let (ok, stderr, urls, home) = run_bootstrap_with_fake_package(true, None, false);
+        assert!(ok, "{stderr}");
+        assert_eq!(urls.len(), 2, "{urls:?}");
+        for url in &urls {
+            assert!(
+                url.starts_with("https://github.com/hhoangg/monoptah/releases/download/host-v"),
+                "{url}"
+            );
+        }
+        assert!(home
+            .path()
+            .join(".monocode-host/bin/monocode-host")
+            .is_file());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_rejects_a_wrong_pinned_hash_and_a_tampered_package() {
+        // The pin is the real release hash: the fake package can not match it.
+        let (ok, stderr, _, home) = run_bootstrap_with_fake_package(false, None, false);
+        assert!(!ok);
+        assert!(stderr.contains("checksum mismatch"), "{stderr}");
+        assert!(!home
+            .path()
+            .join(".monocode-host/bin/monocode-host")
+            .exists());
+        // Pin and published checksum agree, but the served bytes differ.
+        let (ok, stderr, _, home) = run_bootstrap_with_fake_package(true, None, true);
+        assert!(!ok);
+        assert!(stderr.contains("package checksum mismatch"), "{stderr}");
+        assert!(!home
+            .path()
+            .join(".monocode-host/bin/monocode-host")
+            .exists());
+        // The pin matches the package, but the release publishes another checksum.
+        let other = "0".repeat(64);
+        let (ok, stderr, _, _) = run_bootstrap_with_fake_package(true, Some(&other), false);
+        assert!(!ok);
+        assert!(stderr.contains("pinned checksum mismatch"), "{stderr}");
+    }
+    /// An installed Host as the bootstrap leaves it: a versioned runtime that reports `version`,
+    /// `runtime-path` and the generic launcher. Every call it gets is logged as `old ...`.
+    #[cfg(unix)]
+    fn install_old_host(home: &std::path::Path, version: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let base = home.join(".monocode-host");
+        let runtime = base.join("runtime/old");
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::create_dir_all(base.join("bin")).unwrap();
+        let host = runtime.join("monocode-host");
+        std::fs::write(
+            &host,
+            format!("#!/bin/sh\necho \"old $@\" >> \"$HOME/calls.log\"\nenv >> \"$HOME/env.log\"\ncase \"$1\" in --version) echo '{version}' ;; connection-info) if [ -f \"$HOME/flaky\" ]; then n=$(cat \"$HOME/flaky\"); if [ \"$n\" -gt 0 ]; then echo $((n - 1)) > \"$HOME/flaky\"; exit 1; fi; fi; echo '{{\"port\":3774}}' ;; service) [ \"$2\" != install ] || [ ! -f \"$HOME/fail-old\" ] || exit 1 ;; esac\nexit 0\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            base.join("runtime-path"),
+            format!("{}\n", runtime.display()),
+        )
+        .unwrap();
+        let launcher = base.join("bin/monocode-host");
+        std::fs::write(
+            &launcher,
+            "#!/bin/sh\nset -eu\nBASE=$(CDPATH= cd -- \"$(dirname -- \"$0\")/..\" && pwd)\nRUNTIME=$(cat \"$BASE/runtime-path\")\nexec \"$RUNTIME/monocode-host\" \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    /// Runs a script in an existing HOME with extra environment. `PATH` can be replaced.
+    #[cfg(unix)]
+    fn run_in_home_env(
+        home: &std::path::Path,
+        script: &str,
+        envs: &[(&str, &str)],
+        close_output: bool,
+    ) -> (Option<i32>, String, String) {
+        let mut command = Command::new("sh");
+        command
+            .arg("-s")
+            .env("HOME", home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        let mut child = command.spawn().unwrap();
+        if close_output {
+            // The ssh the worker was started over is gone: writing to it would break the pipe.
+            drop(child.stdout.take());
+            drop(child.stderr.take());
+        }
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+    #[cfg(unix)]
+    fn run_in_home(home: &std::path::Path, script: &str) -> (Option<i32>, String, String) {
+        run_in_home_env(home, script, &[], false)
+    }
+    /// The cloud upgrade step in front of the plain bootstrap (no Claude install, which would
+    /// call the stub `curl`), for a Host that listens on `port`.
+    #[cfg(unix)]
+    fn upgrade_step_on(port: u16, phase: UpgradePhase) -> String {
+        format!(
+            "{}{}",
+            upgrade_flags(port, phase, None),
+            bootstrap_script(HostPlatform::Unix)
+        )
+    }
+    #[cfg(unix)]
+    fn upgrade_step(phase: UpgradePhase) -> String {
+        upgrade_step_on(3774, phase)
+    }
+    #[cfg(unix)]
+    fn host_calls(home: &tempfile::TempDir) -> String {
+        std::fs::read_to_string(home.path().join("calls.log")).unwrap_or_default()
+    }
+    #[cfg(unix)]
+    fn runtime_path(home: &std::path::Path) -> String {
+        std::fs::read_to_string(home.join(".monocode-host/runtime-path"))
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+    #[cfg(unix)]
+    fn swap_status(home: &std::path::Path) -> String {
+        std::fs::read_to_string(home.join(".monocode-host/swap-status"))
+            .unwrap_or_default()
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    }
+    /// The second line of the status file: the nonce of the swap that wrote it.
+    #[cfg(unix)]
+    fn status_nonce(home: &std::path::Path) -> String {
+        std::fs::read_to_string(home.join(".monocode-host/swap-status"))
+            .unwrap_or_default()
+            .lines()
+            .nth(1)
+            .unwrap_or("")
+            .to_string()
+    }
+    /// The status script, asking for the swap named `nonce`.
+    #[cfg(unix)]
+    fn status_script(nonce: &str) -> String {
+        let check = SwapCheck {
+            device_token: "unused",
+            environment_id: "unused",
+            nonce,
+        };
+        format!(
+            "{}{}",
+            upgrade_flags(3774, UpgradePhase::Status, Some(check)),
+            bootstrap_script(HostPlatform::Unix)
+        )
+    }
+    /// A process whose command line is a swap worker's, alive for a few seconds.
+    #[cfg(unix)]
+    fn fake_worker() -> std::process::Child {
+        Command::new("sh")
+            .args(["-c", "sleep 4", "swap-worker.sh"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+    #[cfg(unix)]
+    fn env_log(home: &tempfile::TempDir) -> String {
+        std::fs::read_to_string(home.path().join("env.log")).unwrap_or_default()
+    }
+    /// The Host's own API as the swap worker's last look sees it: `projects.list` has one
+    /// project, `sessions.list` answers `sessions` (a JSON array body).
+    #[cfg(unix)]
+    struct FakeApi {
+        port: u16,
+        sessions: Arc<Mutex<String>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    }
+    #[cfg(unix)]
+    const API_TOKEN: &str = "device-token-0123456789-abcdefghijklmnopq";
+    #[cfg(unix)]
+    impl FakeApi {
+        fn start(sessions: &str) -> Self {
+            use std::io::BufRead;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let sessions = Arc::new(Mutex::new(sessions.to_string()));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (state, halt) = (sessions.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !halt.load(Ordering::Relaxed) {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                    let (mut length, mut authorized) = (0, false);
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        let lower = line.to_ascii_lowercase();
+                        if let Some(value) = lower.strip_prefix("content-length:") {
+                            length = value.trim().parse().unwrap();
+                        }
+                        authorized |= line.trim() == format!("Authorization: Bearer {API_TOKEN}")
+                            || line.trim() == format!("authorization: Bearer {API_TOKEN}");
+                    }
+                    let mut body = vec![0; length];
+                    let _ = reader.read_exact(&mut body);
+                    let body = String::from_utf8_lossy(&body).into_owned();
+                    let reply = if !authorized {
+                        "{\"error\":\"unauthorized\"}".to_string()
+                    } else if body.contains("projects.list") {
+                        "{\"result\":[{\"id\":\"p1\",\"cwd\":\"/x\",\"name\":\"x\"}]}".to_string()
+                    } else {
+                        format!("{{\"result\":{}}}", state.lock().unwrap())
+                    };
+                    let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}", reply.len(), reply);
+                }
+            });
+            Self {
+                port,
+                sessions,
+                stop,
+            }
+        }
+        fn set(&self, sessions: &str) {
+            *self.sessions.lock().unwrap() = sessions.to_string();
+        }
+        fn envs(&self) -> Vec<(&'static str, &'static str)> {
+            vec![
+                ("MONOCODE_CHECK_TOKEN", API_TOKEN),
+                ("MONOCODE_CHECK_ENV", "env-1"),
+            ]
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for FakeApi {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+        }
+    }
+    #[cfg(unix)]
+    const IDLE: &str = "[{\"id\":\"s1\",\"projectId\":\"p1\",\"status\":\"idle\",\"needsInput\":false},{\"id\":\"s2\",\"projectId\":\"p1\",\"status\":\"interrupted\",\"needsInput\":false}]";
+    #[cfg(unix)]
+    const RUNNING: &str =
+        "[{\"id\":\"s1\",\"projectId\":\"p1\",\"status\":\"running\",\"needsInput\":false}]";
+    /// An old Host installed, a package staged for it, and the Host's own API up.
+    #[cfg(unix)]
+    fn staged_host(sessions: &str) -> (tempfile::TempDir, FakeApi) {
+        let api = FakeApi::start(sessions);
+        let (ok, stderr, _, home) = run_bootstrap_on(
+            true,
+            None,
+            false,
+            Some("0.9.4"),
+            upgrade_step_on(api.port, UpgradePhase::Stage),
+        );
+        assert!(ok, "{stderr}");
+        (home, api)
+    }
+    /// Runs the swap worker the way the launcher would (detached: the output is its own log).
+    #[cfg(unix)]
+    fn run_worker(home: &std::path::Path, api: &FakeApi, close_output: bool) -> Option<i32> {
+        run_in_home_env(
+            home,
+            &upgrade_step_on(api.port, UpgradePhase::Swap),
+            &api.envs(),
+            close_output,
+        )
+        .0
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_downloads_and_verifies_without_touching_the_running_host() {
+        for installed in [
+            "1.0.0+monoptah",
+            "0.9.4",
+            "9.0.0",
+            "1.1.0-rc.1+monoptah",
+            "",
+        ] {
+            let (ok, stderr, urls, home) = run_bootstrap_on(
+                true,
+                None,
+                false,
+                Some(installed),
+                upgrade_step(UpgradePhase::Stage),
+            );
+            assert!(ok, "{installed}: {stderr}");
+            assert_eq!(urls.len(), 2, "{installed}: {urls:?}");
+            let base = home.path().join(".monocode-host");
+            // The old runtime and launcher are exactly as they were, and the Host was not stopped.
+            assert!(
+                runtime_path(home.path()).ends_with("runtime/old"),
+                "{installed}"
+            );
+            assert!(!base.join("runtime-path.prev").exists());
+            let calls = host_calls(&home);
+            assert!(!calls.contains("service"), "{installed}: {calls}");
+            // A verified package waits in a staging directory.
+            let staged = std::fs::read_to_string(base.join("staged-runtime")).unwrap();
+            assert!(std::path::Path::new(staged.trim())
+                .join("monocode-host")
+                .is_file());
+        }
+        for installed in ["1.1.0+monoptah", "1.2.0+monoptah"] {
+            let (ok, stderr, urls, home) = run_bootstrap_on(
+                true,
+                None,
+                false,
+                Some(installed),
+                upgrade_step(UpgradePhase::Stage),
+            );
+            assert!(ok, "{installed}: {stderr}");
+            assert!(urls.is_empty(), "{installed}: {urls:?}");
+            assert!(!home.path().join(".monocode-host/staged-runtime").exists());
+        }
+        // Without the flag an installed Host is never replaced: the plain connect rule.
+        let (ok, _, urls, home) = run_bootstrap_on(
+            true,
+            None,
+            false,
+            Some("0.9.4"),
+            bootstrap_script(HostPlatform::Unix),
+        );
+        assert!(ok);
+        assert!(urls.is_empty());
+        assert!(!host_calls(&home).contains("service uninstall"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_stage_leaves_the_old_host_and_launcher_alone() {
+        for (pin, publish, tamper, message) in [
+            (false, None, false, "checksum mismatch"),
+            (true, None, true, "package checksum mismatch"),
+            (
+                true,
+                Some("0".repeat(64)),
+                false,
+                "pinned checksum mismatch",
+            ),
+        ] {
+            let (ok, stderr, _, home) = run_bootstrap_on(
+                pin,
+                publish.as_deref(),
+                tamper,
+                Some("0.9.4"),
+                upgrade_step(UpgradePhase::Stage),
+            );
+            assert!(!ok);
+            assert!(stderr.contains(message), "{stderr}");
+            assert!(!host_calls(&home).contains("service"));
+            assert!(runtime_path(home.path()).ends_with("runtime/old"));
+            assert!(!home.path().join(".monocode-host/staged-runtime").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_swap_installs_the_staged_package_and_keeps_the_previous_host_as_prev() {
+        let (home, api) = staged_host(IDLE);
+        assert_eq!(run_worker(home.path(), &api, false), Some(0));
+        let base = home.path().join(".monocode-host");
+        assert_eq!(swap_status(home.path()), "done");
+        assert!(std::fs::read_to_string(base.join("swap-info"))
+            .unwrap()
+            .contains("3774"));
+        assert!(!runtime_path(home.path()).ends_with("runtime/old"));
+        assert!(std::fs::read_to_string(base.join("runtime-path.prev"))
+            .unwrap()
+            .trim()
+            .ends_with("runtime/old"));
+        assert!(base.join("bin/monocode-host.prev").is_file());
+        assert!(!base.join("staged-runtime").exists());
+        assert!(host_calls(&home).contains("new service install"));
+        // A swap with nothing staged is refused and changes nothing.
+        assert_eq!(run_worker(home.path(), &api, false), Some(3));
+        assert_eq!(swap_status(home.path()), "refused 3");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn the_last_look_on_the_host_itself_stops_the_swap_before_anything_is_touched() {
+        for sessions in [
+            RUNNING,
+            "[{\"id\":\"s1\",\"projectId\":\"p1\",\"status\":\"idle\",\"needsInput\":true}]",
+            // A session without a readable status counts as busy.
+            "[{\"id\":\"s1\",\"projectId\":\"p1\"}]",
+        ] {
+            let (home, api) = staged_host(sessions);
+            let before = host_calls(&home);
+            assert_eq!(run_worker(home.path(), &api, false), Some(77), "{sessions}");
+            assert_eq!(swap_status(home.path()), "busy");
+            // The Host is untouched: same runtime, never stopped, and the package stays.
+            assert!(runtime_path(home.path()).ends_with("runtime/old"));
+            let calls = host_calls(&home);
+            assert!(!calls.contains("service uninstall"), "{calls}");
+            assert_eq!(
+                calls.matches("service").count(),
+                before.matches("service").count()
+            );
+            assert!(home.path().join(".monocode-host/staged-runtime").exists());
+        }
+        // The same staged package goes in once the Host is idle.
+        let (home, api) = staged_host(RUNNING);
+        assert_eq!(run_worker(home.path(), &api, false), Some(77));
+        api.set(IDLE);
+        assert_eq!(run_worker(home.path(), &api, false), Some(0));
+        assert_eq!(swap_status(home.path()), "done");
+        // A Host that cannot be asked (wrong credential, nothing listening) is busy too.
+        let (home, api) = staged_host(IDLE);
+        let wrong = [
+            ("MONOCODE_CHECK_TOKEN", "wrong"),
+            ("MONOCODE_CHECK_ENV", "env-1"),
+        ];
+        let code = run_in_home_env(
+            home.path(),
+            &upgrade_step_on(api.port, UpgradePhase::Swap),
+            &wrong,
+            false,
+        )
+        .0;
+        assert_eq!(code, Some(77));
+        let code = run_in_home_env(
+            home.path(),
+            &upgrade_step_on(api.port, UpgradePhase::Swap),
+            &[],
+            false,
+        )
+        .0;
+        assert_eq!(
+            code,
+            Some(77),
+            "no credential: cannot look, so it does not swap"
+        );
+        assert!(runtime_path(home.path()).ends_with("runtime/old"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_swap_without_a_way_back_is_refused_and_the_host_is_left_alone() {
+        let (home, api) = staged_host(IDLE);
+        // The launcher is there but nothing says which runtime it runs: no rollback possible.
+        let base = home.path().join(".monocode-host");
+        std::fs::remove_file(base.join("runtime-path")).unwrap();
+        assert_eq!(run_worker(home.path(), &api, false), Some(78));
+        assert_eq!(swap_status(home.path()), "refused 78");
+        assert!(base.join("bin/monocode-host").is_file());
+        assert!(!host_calls(&home).contains("service uninstall"));
+        assert!(base.join("staged-runtime").exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_new_host_that_fails_to_start_is_rolled_back_to_the_old_one() {
+        let (home, api) = staged_host(IDLE);
+        // The new Host's `service install` fails.
+        std::fs::write(home.path().join("fail-new"), "").unwrap();
+        assert_eq!(run_worker(home.path(), &api, false), Some(75));
+        assert_eq!(swap_status(home.path()), "restored");
+        // The old runtime and launcher are back and the old Host was started again.
+        assert!(runtime_path(home.path()).ends_with("runtime/old"));
+        assert!(host_calls(&home).contains("old service install"));
+        let launcher = home.path().join(".monocode-host/bin/monocode-host");
+        let output = Command::new(launcher)
+            .arg("connection-info")
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("3774"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_rollback_that_cannot_restart_the_old_host_ends_unrestored() {
+        let (home, api) = staged_host(IDLE);
+        std::fs::write(home.path().join("fail-new"), "").unwrap();
+        // The old Host does not start again either.
+        std::fs::write(home.path().join("fail-old"), "").unwrap();
+        assert_eq!(run_worker(home.path(), &api, false), Some(76));
+        assert_eq!(swap_status(home.path()), "unrestored");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_closed_ssh_neither_stops_the_swap_nor_turns_a_good_update_into_a_rollback() {
+        // stdout and stderr go nowhere (a broken pipe), including the final connection-info.
+        let (home, api) = staged_host(IDLE);
+        assert_eq!(run_worker(home.path(), &api, true), Some(0));
+        assert_eq!(swap_status(home.path()), "done");
+        assert!(
+            !runtime_path(home.path()).ends_with("runtime/old"),
+            "not rolled back"
+        );
+        // And a failing update with the ssh gone still rolls back.
+        let (home, api) = staged_host(IDLE);
+        std::fs::write(home.path().join("fail-new"), "").unwrap();
+        assert_eq!(run_worker(home.path(), &api, true), Some(75));
+        assert_eq!(swap_status(home.path()), "restored");
+        assert!(runtime_path(home.path()).ends_with("runtime/old"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn the_swap_installs_nothing_slow_after_the_host_is_stopped() {
+        use std::os::unix::fs::PermissionsExt;
+        // A `curl` that records a Claude install and forwards everything else.
+        let stubs = tempfile::tempdir().unwrap();
+        let curl = stubs.path().join("curl");
+        std::fs::write(
+            &curl,
+            "#!/bin/sh\ncase \"$*\" in *claude.ai*) echo called >> \"$HOME/claude-install.log\"; exit 0 ;; esac\nfor c in /usr/bin/curl /opt/homebrew/bin/curl /usr/local/bin/curl; do [ -x \"$c\" ] && exec \"$c\" \"$@\"; done\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:/usr/bin:/bin", stubs.path().display());
+        let claude_flags = "MONOCODE_HOST_TRACK_TOKEN=1\nMONOCODE_HOST_INSTALL_CLAUDE=1\n";
+        // Control: a plain connect bootstrap does install Claude when it is missing.
+        let (ok, stderr, _, home) = run_bootstrap_on(
+            true,
+            None,
+            false,
+            Some("1.1.0+monoptah"),
+            format!("{claude_flags}{}", bootstrap_script(HostPlatform::Unix)),
+        );
+        let _ = (ok, stderr, home);
+        let control = tempfile::tempdir().unwrap();
+        install_old_host(control.path(), "1.1.0+monoptah");
+        let (code, _, stderr) = run_in_home_env(
+            control.path(),
+            &format!("{claude_flags}{}", bootstrap_script(HostPlatform::Unix)),
+            &[("PATH", path.as_str())],
+            false,
+        );
+        assert_eq!(code, Some(0), "{stderr}");
+        assert!(
+            control.path().join("claude-install.log").exists(),
+            "the stub sees installs"
+        );
+        // The swap worker skips it, however the script asked.
+        let (home, api) = staged_host(IDLE);
+        let mut envs = api.envs();
+        envs.push(("PATH", path.as_str()));
+        let script = format!(
+            "{claude_flags}{}",
+            upgrade_step_on(api.port, UpgradePhase::Swap)
+        );
+        let (code, _, _) = run_in_home_env(home.path(), &script, &envs, false);
+        assert_eq!(code, Some(0));
+        assert_eq!(swap_status(home.path()), "done");
+        assert!(!home.path().join("claude-install.log").exists());
+    }
+    /// A swap whose worker died: a package staged, the previous Host's files saved, and
+    /// `runtime-path` pointing at `current` (`"staged"` for the new Host, `"old"` for the
+    /// untouched one).
+    #[cfg(unix)]
+    fn died_mid_swap(current: &str) -> tempfile::TempDir {
+        let (home, _api) = staged_host(IDLE);
+        let base = home.path().join(".monocode-host");
+        std::fs::copy(base.join("runtime-path"), base.join("runtime-path.prev")).unwrap();
+        std::fs::copy(
+            base.join("bin/monocode-host"),
+            base.join("bin/monocode-host.prev"),
+        )
+        .unwrap();
+        if current == "staged" {
+            let staged = std::fs::read_to_string(base.join("staged-runtime")).unwrap();
+            std::fs::write(base.join("runtime-path"), staged).unwrap();
+        }
+        std::fs::write(base.join("swap-status"), "swapping 999999\nnonce-1\n").unwrap();
+        home
+    }
+    #[cfg(unix)]
+    fn status_of(home: &std::path::Path, nonce: &str) -> String {
+        run_in_home_env(
+            home,
+            &status_script(nonce),
+            &[("MONOCODE_PROBE_WAIT", "0")],
+            false,
+        )
+        .1
+        .trim()
+        .to_string()
+    }
+    #[cfg(unix)]
+    #[test]
+    fn status_reports_a_live_worker_and_one_that_never_got_to_touch_anything() {
+        let (home, _api) = staged_host(IDLE);
+        let base = home.path().join(".monocode-host");
+        assert_eq!(status_of(home.path(), "nonce-1"), "{\"swap\":\"none\"}");
+        // A live worker is left alone: its command line is the worker's (Linux), or its
+        // heartbeat is fresh (elsewhere).
+        let mut worker = fake_worker();
+        std::fs::write(base.join("swap-heartbeat"), "").unwrap();
+        std::fs::write(
+            base.join("swap-status"),
+            format!("swapping {}\nnonce-1\n", worker.id()),
+        )
+        .unwrap();
+        assert_eq!(status_of(home.path(), "nonce-1"), "{\"swap\":\"swapping\"}");
+        let _ = worker.wait();
+        // A worker that died before it touched anything.
+        std::fs::write(base.join("swap-status"), "checking 999999\nnonce-1\n").unwrap();
+        assert_eq!(status_of(home.path(), "nonce-1"), "{\"swap\":\"failed\"}");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_reused_pid_is_not_taken_for_the_worker() {
+        let home = died_mid_swap("old");
+        let base = home.path().join(".monocode-host");
+        // The pid belongs to a live process now, but it is not the worker: not its command
+        // line, and no heartbeat.
+        let _ = std::fs::remove_file(base.join("swap-heartbeat"));
+        std::fs::write(
+            base.join("swap-status"),
+            format!("swapping {}\nnonce-1\n", std::process::id()),
+        )
+        .unwrap();
+        assert_eq!(status_of(home.path(), "nonce-1"), "{\"swap\":\"restored\"}");
+        // A stale heartbeat is no proof either (no /proc: macOS), and an old file does not
+        // keep a dead worker alive forever.
+        let mut other = Command::new("sleep").arg("3").spawn().unwrap();
+        std::fs::write(
+            base.join("swap-status"),
+            format!("swapping {}\nnonce-1\n", other.id()),
+        )
+        .unwrap();
+        assert_eq!(status_of(home.path(), "nonce-1"), "{\"swap\":\"restored\"}");
+        let _ = other.wait();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn recovery_never_restarts_a_host_that_answers() {
+        // (a) The worker died with the old files in place: the old Host is fine, nothing to undo.
+        let home = died_mid_swap("old");
+        assert_eq!(status_of(home.path(), "nonce-1"), "{\"swap\":\"restored\"}");
+        assert_eq!(swap_status(home.path()), "restored");
+        let calls = host_calls(&home);
+        assert!(
+            !calls.contains("service"),
+            "the healthy Host was restarted: {calls}"
+        );
+        assert!(runtime_path(home.path()).ends_with("runtime/old"));
+        // (b) The worker died after the swap and one health probe fails by chance: the new
+        // Host is kept, not rolled back over.
+        let home = died_mid_swap("staged");
+        std::fs::write(home.path().join("flaky"), "2").unwrap();
+        assert_eq!(
+            status_of(home.path(), "nonce-1"),
+            "{\"swap\":\"done\",\"port\":3774}"
+        );
+        let calls = host_calls(&home);
+        assert!(
+            !calls.contains("service"),
+            "the healthy Host was restarted: {calls}"
+        );
+        assert!(!runtime_path(home.path()).ends_with("runtime/old"));
+        // Only when nothing answers (more failures than the probe tries) is the old Host put back.
+        let home = died_mid_swap("staged");
+        std::fs::write(home.path().join("flaky"), "7").unwrap();
+        assert_eq!(status_of(home.path(), "nonce-1"), "{\"swap\":\"restored\"}");
+        assert!(runtime_path(home.path()).ends_with("runtime/old"));
+        assert!(host_calls(&home).contains("old service install"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_status_from_another_swap_is_not_this_ones() {
+        let home = died_mid_swap("old");
+        assert_eq!(status_of(home.path(), "other"), "{\"swap\":\"stale\"}");
+        // Nothing was settled on the strength of it.
+        assert_eq!(swap_status(home.path()), "swapping 999999");
+        assert!(!host_calls(&home).contains("service"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn the_credential_never_reaches_a_process_the_worker_starts() {
+        let present = |home: &tempfile::TempDir| {
+            let log = env_log(home);
+            assert!(!log.is_empty(), "the stub Host ran");
+            log.contains("MONOCODE_CHECK") || log.contains(API_TOKEN)
+        };
+        // A good update: the new Host is started.
+        let (home, api) = staged_host(IDLE);
+        assert_eq!(run_worker(home.path(), &api, false), Some(0));
+        assert!(host_calls(&home).contains("new service install"));
+        assert!(!present(&home), "{}", env_log(&home));
+        // A rollback: the new Host fails, the old one is started again.
+        let (home, api) = staged_host(IDLE);
+        std::fs::write(home.path().join("fail-new"), "").unwrap();
+        assert_eq!(run_worker(home.path(), &api, false), Some(75));
+        assert!(host_calls(&home).contains("old service install"));
+        assert!(!present(&home), "{}", env_log(&home));
+        // A busy Host: exit 77, and the staged check that ran before it saw nothing either.
+        let (home, api) = staged_host(RUNNING);
+        assert_eq!(run_worker(home.path(), &api, false), Some(77));
+        assert!(!present(&home), "{}", env_log(&home));
+        // A refusal before the look.
+        let (home, api) = staged_host(IDLE);
+        std::fs::remove_file(home.path().join(".monocode-host/runtime-path")).unwrap();
+        assert_eq!(run_worker(home.path(), &api, false), Some(78));
+        assert!(!present(&home), "{}", env_log(&home));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_running_session_without_a_project_key_is_not_invisible() {
+        // Schema drift: the running session has no `projectId`, the idle one does.
+        let adversarial = "[{\"revision\":1,\"status\":\"running\",\"id\":\"a\",\"title\":\"t\",\"needsInput\":false},{\"projectId\":\"p1\",\"status\":\"idle\",\"id\":\"b\",\"needsInput\":false}]";
+        let (home, api) = staged_host(adversarial);
+        assert_eq!(run_worker(home.path(), &api, false), Some(77));
+        assert!(runtime_path(home.path()).ends_with("runtime/old"));
+        // A session with no status at all, and one with an unknown status, fail closed too.
+        for sessions in [
+            "[{\"projectId\":\"p1\",\"id\":\"a\"},{\"projectId\":\"p1\",\"status\":\"idle\"}]",
+            "[{\"projectId\":\"p1\",\"status\":\"mystery\"}]",
+        ] {
+            let (home, api) = staged_host(sessions);
+            assert_eq!(run_worker(home.path(), &api, false), Some(77), "{sessions}");
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_second_launcher_cannot_start_while_a_worker_is_alive() {
+        let (home, api) = staged_host(IDLE);
+        let base = home.path().join(".monocode-host");
+        let check = SwapCheck {
+            device_token: API_TOKEN,
+            environment_id: "env-1",
+            nonce: "nonce-2",
+        };
+        let launcher = codespace_upgrade_script(api.port, UpgradePhase::Swap, Some(check));
+        // A live worker owns the lock.
+        let mut worker = fake_worker();
+        std::fs::write(base.join("swap.lock"), format!("{}\n", worker.id())).unwrap();
+        std::fs::write(base.join("swap-heartbeat"), "").unwrap();
+        std::fs::write(base.join("swap-status"), "swapping 1\nnonce-1\n").unwrap();
+        let (code, _, stderr) = run_in_home(home.path(), &launcher);
+        assert_eq!(code, Some(1));
+        assert!(stderr.contains("still running"), "{stderr}");
+        // Nothing of the first swap was disturbed.
+        assert_eq!(status_nonce(home.path()), "nonce-1");
+        assert!(!base.join("swap-worker.sh").exists());
+        let _ = worker.wait();
+        // A lock left by a dead worker does not block.
+        std::fs::write(base.join("swap.lock"), "999999\n").unwrap();
+        let (code, stdout, stderr) = run_in_home(home.path(), &launcher);
+        assert_eq!(code, Some(0), "{stderr}");
+        assert!(stdout.contains("started"));
+        for _ in 0..150 {
+            if swap_status(home.path()) == "done" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert_eq!(swap_status(home.path()), "done");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn the_launcher_runs_the_worker_detached_and_keeps_every_credential_off_the_disk() {
+        let (home, api) = staged_host(IDLE);
+        let base = home.path().join(".monocode-host");
+        let check = SwapCheck {
+            device_token: API_TOKEN,
+            environment_id: "env-1",
+            nonce: "nonce-1",
+        };
+        let launcher = codespace_upgrade_script(api.port, UpgradePhase::Swap, Some(check));
+        let (code, stdout, stderr) = run_in_home(home.path(), &launcher);
+        assert_eq!(code, Some(0), "{stderr}");
+        assert!(stdout.contains("{\"swap\":\"started\"}"), "{stdout}");
+        // The launcher's own shell no longer holds the credential once the worker runs.
+        // The launcher is gone; the worker finishes on its own.
+        let mut done = false;
+        for _ in 0..150 {
+            if swap_status(home.path()) == "done" {
+                done = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert!(done, "status: {}", swap_status(home.path()));
+        assert_eq!(status_nonce(home.path()), "nonce-1");
+        assert!(!env_log(&home).contains(API_TOKEN) && !env_log(&home).contains("MONOCODE_CHECK"));
+        assert!(!runtime_path(home.path()).ends_with("runtime/old"));
+        let worker = std::fs::read_to_string(base.join("swap-worker.sh")).unwrap();
+        let log = std::fs::read_to_string(base.join("swap.log")).unwrap_or_default();
+        for text in [&worker, &log] {
+            assert!(!text.contains(API_TOKEN), "a credential reached the disk");
+        }
+        assert!(worker.contains("MONOCODE_HOST_UPGRADE_PHASE=swapnow"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discard_drops_a_staged_package() {
+        let (ok, stderr, _, home) = run_bootstrap_on(
+            true,
+            None,
+            false,
+            Some("0.9.4"),
+            upgrade_step(UpgradePhase::Stage),
+        );
+        assert!(ok, "{stderr}");
+        let base = home.path().join(".monocode-host");
+        let staged = std::fs::read_to_string(base.join("staged-runtime")).unwrap();
+        let (code, stderr, _) = run_in_home(home.path(), &upgrade_step(UpgradePhase::Discard));
+        assert_eq!(code, Some(0), "{stderr}");
+        assert!(!std::path::Path::new(staged.trim()).exists());
+        assert!(!base.join("staged-runtime").exists());
+        assert!(runtime_path(home.path()).ends_with("runtime/old"));
+    }
+    #[test]
+    fn cloud_upgrade_scripts_carry_the_flags_and_the_same_prelude_as_connect() {
+        let prelude = "unset ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN\nexport CLAUDE_CODE_OAUTH_TOKEN='sk-test'\n";
+        let check = SwapCheck {
+            device_token: "device-token-xyz",
+            environment_id: "env-9",
+            nonce: "nonce-9",
+        };
+        for phase in [
+            UpgradePhase::Stage,
+            UpgradePhase::Discard,
+            UpgradePhase::Status,
+        ] {
+            let flags = format!(
+                "MONOCODE_HOST_UPGRADE_IF_OLDER=1\nMONOCODE_HOST_UPGRADE_PHASE={}\nMONOCODE_HOST_PORT=3790\n",
+                phase.word()
+            );
+            let sandbox = sandbox_upgrade_script(Some(prelude), 3790, phase, None);
+            assert!(sandbox.starts_with(prelude), "{sandbox}");
+            // Same body as the connect step, with the same detached start.
+            let connect = sandbox_bootstrap_script(Some(prelude));
+            assert!(
+                sandbox.replace(&flags, "") == connect,
+                "only the flags differ"
+            );
+            assert!(sandbox.contains("ensure_detached_host"));
+            assert!(!sandbox_upgrade_script(None, 3774, phase, None).contains("sk-test"));
+            assert!(!sandbox.contains("device-token-xyz"));
+            let codespace = codespace_upgrade_script(3774, phase, None);
+            assert!(codespace.starts_with(&format!(
+                "MONOCODE_HOST_UPGRADE_IF_OLDER=1\nMONOCODE_HOST_UPGRADE_PHASE={}\nMONOCODE_HOST_PORT=3774\n",
+                phase.word()
+            )));
+            assert!(codespace.ends_with(&codespace_bootstrap_script()));
+        }
+        // The swap is a launcher: the prelude and the credential exports come first, then the
+        // worker (with the same body) goes into a file and runs detached.
+        let swap = sandbox_upgrade_script(Some(prelude), 3790, UpgradePhase::Swap, Some(check));
+        assert!(swap.starts_with(prelude), "{swap}");
+        assert!(swap.contains("export MONOCODE_CHECK_TOKEN='device-token-xyz'\n"));
+        assert!(swap.contains("export MONOCODE_CHECK_ENV='env-9'\n"));
+        assert!(swap.contains(
+            "MONOCODE_HOST_UPGRADE_PHASE=swapnow\nMONOCODE_HOST_PORT=3790\nMONOCODE_SWAP_NONCE='nonce-9'\n"
+        ));
+        // The status script asks for the same swap.
+        assert!(
+            codespace_upgrade_script(3774, UpgradePhase::Status, Some(check))
+                .contains("MONOCODE_SWAP_NONCE='nonce-9'\n")
+        );
+        // The launcher refuses a second worker and drops the credential before it returns.
+        assert!(
+            swap.contains("swap.lock")
+                && swap.contains("unset MONOCODE_CHECK_TOKEN MONOCODE_CHECK_ENV")
+        );
+        assert!(swap.contains("ensure_detached_host"));
+        assert!(swap.contains("setsid nohup sh \"$BASE/swap-worker.sh\""));
+        // The prelude's secret is in the launcher only, not in the file the worker is saved to.
+        let worker = swap.split("<<'MONOCODE_SWAP_WORKER_END'\n").nth(1).unwrap();
+        let worker = worker.split("\nMONOCODE_SWAP_WORKER_END\n").next().unwrap();
+        assert!(!worker.contains("sk-test") && !worker.contains("device-token-xyz"));
+        let codespace = codespace_upgrade_script(3774, UpgradePhase::Swap, Some(check));
+        assert!(codespace.contains("export MONOCODE_CHECK_TOKEN='device-token-xyz'\n"));
+        // The user's explicit Upgrade is untouched: it forces the install.
+        assert!(
+            upgrade_script(HostPlatform::Unix, 3774).starts_with("MONOCODE_HOST_FORCE_UPGRADE=1\n")
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn is_older_or_foreign_compares_the_semver_core_and_the_flavor() {
+        let template = include_str!("remote_bootstrap.sh");
+        let start = template.find("is_older_or_foreign() {").unwrap();
+        let end = start + template[start..].find("\n}\n").unwrap() + 3;
+        let function = &template[start..end];
+        let check = |installed: &str, pin: &str| {
+            Command::new("sh")
+                .arg("-c")
+                .arg(format!("{function}\nis_older_or_foreign \"$1\" \"$2\""))
+                .arg("sh")
+                .arg(installed)
+                .arg(pin)
+                .status()
+                .unwrap()
+                .success()
+        };
+        let pin = "1.1.0+monoptah";
+        assert!(check("1.1.0", pin), "upstream, same number");
+        assert!(check("2.0.0", pin), "upstream, higher number");
+        assert!(check("1.0.9+monoptah", pin));
+        assert!(check("0.33.0+monoptah", pin));
+        assert!(check("1.0.10+monoptah", "1.1.0+monoptah"));
+        assert!(check("garbage+monoptah", pin));
+        assert!(!check("1.1.0+monoptah", pin));
+        assert!(!check("1.1.1+monoptah", pin));
+        assert!(!check("1.2.0+monoptah", pin));
+        assert!(!check("10.0.0+monoptah", pin));
+        // Pre-releases are older than their release, build metadata is ignored.
+        assert!(check("1.1.0-rc.1+monoptah", pin));
+        assert!(check("1.1.0-rc.1+monoptah.3", pin));
+        assert!(!check("1.1.0+monoptah.3", pin));
+        assert!(!check("1.1.0+monoptah.3", "1.1.0+monoptah"));
+        assert!(check("1.1.0+monoptah.3", "1.1.1+monoptah"));
+        assert!(
+            !check("1.1.1-rc.1+monoptah", pin),
+            "a pre-release of a higher core"
+        );
+        assert!(!check("1.1.0+monoptah", "1.1.0-rc.1+monoptah"));
+        assert!(!check("1.1.0-rc.1+monoptah", "1.1.0-rc.1+monoptah"));
+        assert!(check("1.1.0-rc.1+monoptah", "1.1.0-rc.2+monoptah"));
+        assert!(check("1.1.0+monoptahx", pin), "not the flavor marker");
+        assert!(check("1.1.0+other", pin));
     }
     #[test]
     fn remote_platform_probe_handles_cmd_powershell_and_unix() {

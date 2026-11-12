@@ -64,13 +64,21 @@ try {
     New-Item -ItemType Directory -Path $temporary | Out-Null
     $archive = Join-Path $temporary $filename
     $checksum = Join-Path $temporary 'checksum'
+    # The expected hash is pinned in the app and substituted per target, so a changed
+    # release cannot vouch for itself. The published .sha256 is only a cross-check.
+    $pinned = @{
+@@SHA256@@
+    }
+    $expected = $pinned[$target]
+    if (-not $expected -or $expected -notmatch '^[a-f0-9]{64}$') { throw 'No pinned checksum for this host target.' }
     try {
       Download-MonoCode "$release/$filename" $archive
       Download-MonoCode "$release/$filename.sha256" $checksum
     } catch { throw "The Windows host package for version $version could not be downloaded. Install a release with host packages. $($_.Exception.Message)" }
-    $expected = ((Get-Content -LiteralPath $checksum -Raw).Trim() -split '\s+')[0]
-    if ($expected -notmatch '^[a-fA-F0-9]{64}$') { throw 'Invalid host package checksum.' }
-    if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $expected) { throw 'Monoptah Host package checksum mismatch.' }
+    $published = ((Get-Content -LiteralPath $checksum -Raw).Trim() -split '\s+')[0]
+    if ($published -notmatch '^[a-fA-F0-9]{64}$') { throw 'Invalid host package checksum.' }
+    if ($published.ToLowerInvariant() -ne $expected) { throw 'Monoptah Host pinned checksum mismatch: the published checksum differs.' }
+    if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'Monoptah Host package checksum mismatch.' }
     $unpacked = Join-Path $temporary 'unpacked'
     Expand-Archive -LiteralPath $archive -DestinationPath $unpacked
     $actual = & (Join-Path $unpacked 'node.exe') (Join-Path $unpacked 'host.mjs') --version

@@ -143,6 +143,18 @@ pub fn normalize_origin(url: &str) -> Result<(GitPlatform, String, String), Stri
     Ok((platform, platform.origin(), segments.join("/")))
 }
 
+/// The `path=` of a credential payload: the clone URL without its origin and leading slash.
+fn repo_path_of(clone_url: &str, origin: &str) -> String {
+    clone_url[origin.len() + 1..].to_owned()
+}
+
+/// The platform and the `path=` the credential payload uses for `repo_url`, without needing
+/// a stored credential (the sandbox's `gh` wrapper asks the cache for this exact entry).
+pub fn payload_path(repo_url: &str) -> Result<(GitPlatform, String), String> {
+    let (platform, origin, _) = normalize_origin(repo_url)?;
+    Ok((platform, repo_path_of(&clone_url(repo_url)?, &origin)))
+}
+
 /// The URL to hand to git: the normalised form of `url`, keeping a trailing
 /// `.git` when the input had one. Never the raw input.
 pub fn clone_url(url: &str) -> Result<String, String> {
@@ -489,7 +501,7 @@ impl GitCredentials {
                 platform.host()
             ));
         }
-        let path = url[origin.len() + 1..].to_owned();
+        let path = repo_path_of(&url, &origin);
         Ok((summary, path, url))
     }
 

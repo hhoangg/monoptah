@@ -21,7 +21,12 @@ enum Picked {
     Started {
         summary: Session,
         record: StartRecord,
+        /// Copy the global Claude setup to the workspace. `false` was already recorded on the
+        /// start (`StartRecord::kit_off`) when the session was created.
+        #[allow(dead_code)]
+        kit: bool,
     },
+    OpenSettings,
     Cancel,
 }
 
@@ -54,12 +59,17 @@ pub(super) fn target_for(
 /// Requests the codespace (creating it if asked) and creates the session that will run in it.
 /// Takes seconds; the codespace itself comes up in the background (see `cloud_start`). Blocking:
 /// call it on a worker.
+///
+/// `kit` is this start's own choice for the Claude setup. `false` is part of the first record
+/// the start persists, so nothing is sent; `true` leaves the decision to Settings (it can only
+/// narrow).
 pub(super) fn begin_cloud_start(
     cloud: &CloudSessions,
     local_project: &str,
     target: Target,
+    kit: bool,
 ) -> Result<(Session, StartRecord), String> {
-    cloud.begin_start(local_project, target, HARNESS)
+    cloud.begin_start_with_kit(local_project, target, HARNESS, kit)
 }
 
 /// Existing codespaces and machine types of the project's repository.
@@ -100,6 +110,10 @@ struct CodespacePicker {
     progress: String,
     busy: bool,
     error: String,
+    /// The per-start switch of the Claude setup row.
+    kit: bool,
+    kit_summary: crate::cloud_kit_ui::Summary,
+    kit_task: Option<gpui::Task<()>>,
     focus: FocusHandle,
     _events: Vec<Subscription>,
 }
@@ -130,6 +144,8 @@ impl CodespacePicker {
             cx.subscribe(&branch, |this, _, _: &input::Submitted, cx| {
                 this.start(CodespaceChoice::New, cx)
             }),
+            // Settings changed while the picker is open: count again.
+            cx.observe_global::<crate::settings::Preferences>(|this, cx| this.load_kit_summary(cx)),
         ];
         let mut this = Self {
             cloud,
@@ -141,10 +157,14 @@ impl CodespacePicker {
             progress: String::new(),
             busy: false,
             error: String::new(),
+            kit: crate::cloud_kit_ui::default_on(&crate::cloud_kit_ui::kit_prefs(cx)),
+            kit_summary: crate::cloud_kit_ui::Summary::Loading,
+            kit_task: None,
             focus: cx.focus_handle(),
             _events: events,
         };
         this.load(cx);
+        this.load_kit_summary(cx);
         this
     }
 
@@ -171,6 +191,72 @@ impl CodespacePicker {
         .detach();
     }
 
+    /// Counts the Claude setup this project would take, off the UI thread.
+    fn load_kit_summary(&mut self, cx: &mut Context<Self>) {
+        let task = crate::cloud_kit_ui::load_summary(
+            self.local_project.clone(),
+            monocode_core::cloud_sessions::kit::Workspace::Codespace,
+            crate::cloud_kit_ui::kit_prefs(cx),
+            cx,
+        );
+        self.kit_task = Some(cx.spawn(async move |this, cx| {
+            let summary = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.kit_summary = summary;
+                cx.notify();
+            });
+        }));
+    }
+
+    /// The "Claude setup" row.
+    fn kit_row(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use crate::cloud_kit_ui as kit;
+        let globally = kit::default_on(&kit::kit_prefs(cx));
+        let on = globally && self.kit;
+        let locked = self.busy || !globally;
+        Some(
+            div()
+                .id("codespace-kit-row")
+                .debug_selector(|| "codespace-kit-row".into())
+                .role(Role::Group)
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_size(px(12.))
+                .text_color(content(if globally { 0.8 } else { 0.5 }))
+                .child(kit::summary_line(
+                    "codespace-kit-summary",
+                    &self.kit_summary,
+                    globally,
+                ))
+                .child(
+                    kit::settings_link("codespace-kit-settings").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            if !this.busy {
+                                cx.emit(Picked::OpenSettings)
+                            }
+                        },
+                    )),
+                )
+                .child(
+                    kit::switch(
+                        "codespace-kit-switch",
+                        "codespace-kit-switch",
+                        "Copy my Claude setup to this workspace",
+                        on,
+                        locked,
+                    )
+                    .when(!locked, |d| {
+                        d.on_click(cx.listener(|this, _, _, cx| {
+                            this.kit = !this.kit;
+                            cx.notify();
+                        }))
+                    }),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn start(&mut self, choice: CodespaceChoice, cx: &mut Context<Self>) {
         if self.busy {
             return;
@@ -187,17 +273,23 @@ impl CodespacePicker {
         self.busy = true;
         self.error.clear();
         self.progress = "Creating codespace...".into();
+        let use_kit =
+            self.kit && crate::cloud_kit_ui::default_on(&crate::cloud_kit_ui::kit_prefs(cx));
         let cloud = self.cloud.clone();
         let project = self.local_project.clone();
         let work = cx
             .background_executor()
-            .spawn(async move { begin_cloud_start(&cloud, &project, target) });
+            .spawn(async move { begin_cloud_start(&cloud, &project, target, use_kit) });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
                 this.busy = false;
                 match result {
-                    Ok((summary, record)) => cx.emit(Picked::Started { summary, record }),
+                    Ok((summary, record)) => cx.emit(Picked::Started {
+                        summary,
+                        record,
+                        kit: use_kit,
+                    }),
                     Err(error) => this.error = error,
                 }
                 cx.notify();
@@ -419,6 +511,11 @@ impl Render for CodespacePicker {
                     .child("Loading codespaces…"),
             );
         }
+        if !self.busy
+            && let Some(row) = self.kit_row(cx)
+        {
+            view = view.child(row);
+        }
         if !self.error.is_empty() {
             view = view.child(
                 div()
@@ -491,8 +588,11 @@ impl Shell {
             move |this, _, event: &Picked, window, cx| {
                 this.close_codespace_picker(window, cx);
                 match event {
-                    Picked::Started { summary, record } => {
-                        this.open_cloud_start(summary.clone(), record.clone(), window, cx)
+                    Picked::Started {
+                        summary, record, ..
+                    } => this.open_cloud_start(summary.clone(), record.clone(), window, cx),
+                    Picked::OpenSettings => {
+                        this.open_settings(crate::settings::Section::Cloud, window, cx)
                     }
                     Picked::Cancel => {}
                 }
@@ -560,5 +660,118 @@ impl Shell {
                 )
                 .into_any_element(),
         )
+    }
+}
+
+#[cfg(test)]
+mod kit_tests {
+    use super::*;
+    use crate::cloud_kit_ui::{KitScanner, Summary, fixture};
+    use gpui::{TestAppContext, VisualTestContext};
+    use monocode_core::cloud_sessions::kit_prefs::KitSummary;
+
+    fn globals(cx: &mut TestAppContext, enabled: bool) {
+        cx.update(|cx| {
+            cx.set_global(KitScanner(fixture::scan));
+            let mut prefs = crate::settings::Preferences::default();
+            if enabled {
+                prefs.cloud_kit.acknowledge_notice();
+            }
+            cx.set_global(prefs);
+        });
+    }
+
+    fn open(
+        cx: &mut TestAppContext,
+        enabled: bool,
+    ) -> (gpui::WindowHandle<Shell>, Entity<CodespacePicker>) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        // After the shell window, which installs its own preferences.
+        globals(cx, enabled);
+        window
+            .update(cx, |shell, window, cx| {
+                shell.open_codespace_picker(window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        let picker = window
+            .update(cx, |shell, _, _| {
+                shell.codespace_picker.as_ref().unwrap().picker.clone()
+            })
+            .unwrap();
+        (window, picker)
+    }
+
+    #[gpui::test]
+    fn the_picker_shows_the_kit_summary_and_a_switch_for_this_start(cx: &mut TestAppContext) {
+        let (window, picker) = open(cx, true);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        assert!(visual.debug_bounds("codespace-kit-row").is_some());
+        assert!(visual.debug_bounds("codespace-kit-settings").is_some());
+        visual.read_entity(&picker, |picker, _| {
+            assert!(picker.kit);
+            assert_eq!(
+                picker.kit_summary,
+                Summary::Ready(KitSummary {
+                    skills: 2,
+                    mcp_servers: 4,
+                    plugins: 1,
+                    ..Default::default()
+                })
+            );
+        });
+        let switch = visual.debug_bounds("codespace-kit-switch").unwrap();
+        visual.simulate_click(switch.center(), Default::default());
+        visual.run_until_parked();
+        visual.read_entity(&picker, |picker, _| assert!(!picker.kit));
+    }
+
+    #[gpui::test]
+    fn the_picker_switch_is_locked_while_the_kit_is_off(cx: &mut TestAppContext) {
+        let (window, picker) = open(cx, false);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        assert!(visual.debug_bounds("codespace-picker").is_some());
+        assert!(visual.debug_bounds("codespace-kit-row").is_some());
+        visual.read_entity(&picker, |picker, _| assert!(!picker.kit));
+        let switch = visual.debug_bounds("codespace-kit-switch").unwrap();
+        visual.simulate_click(switch.center(), Default::default());
+        visual.run_until_parked();
+        visual.read_entity(&picker, |picker, _| assert!(!picker.kit));
+    }
+
+    static SCANS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    fn counting_scan(
+        path: &std::path::Path,
+        workspace: monocode_core::cloud_sessions::kit::Workspace,
+    ) -> Result<monocode_core::cloud_sessions::kit::KitInventory, String> {
+        SCANS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        fixture::scan(path, workspace)
+    }
+
+    #[gpui::test]
+    fn a_fresh_scan_is_reused_and_settings_changes_update_the_summary(cx: &mut TestAppContext) {
+        SCANS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let (window, picker) = open(cx, true);
+        cx.update(|cx| cx.set_global(KitScanner(counting_scan)));
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        // A change in Settings counts again with the new selection, without a second scan
+        // of the disk (the first picker scan is still fresh and cached).
+        let first = SCANS.load(std::sync::atomic::Ordering::SeqCst);
+        cx.update(|cx| {
+            let mut prefs = cx.global::<crate::settings::Preferences>().clone();
+            prefs
+                .cloud_kit
+                .set_selected(&fixture::inventory(), "skill:user:review", false);
+            cx.set_global(prefs);
+        });
+        visual.run_until_parked();
+        visual.read_entity(&picker, |picker, _| {
+            assert!(matches!(
+                picker.kit_summary,
+                Summary::Ready(counts) if counts.skills == 1
+            ));
+        });
+        assert_eq!(SCANS.load(std::sync::atomic::Ordering::SeqCst), first);
     }
 }

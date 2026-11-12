@@ -3,6 +3,7 @@ import {
   type IncomingMessage,
   type ServerResponse,
 } from "node:http";
+import { HOST_FLAVOR, HOST_VERSION_BASE } from "./host-version";
 import { hostname, homedir } from "node:os";
 import { execFile } from "node:child_process";
 import { realpath, stat } from "node:fs/promises";
@@ -14,6 +15,10 @@ import {
 } from "../src/features/connections/model/protocol";
 import { HostEngine } from "./engine";
 import { writeAttachmentChunk, readAttachmentChunk } from "./attachments";
+import { HostUploads } from "./uploads";
+import { HostKit, installLogScrubber, scrubSecrets } from "./kit";
+import { setClaudeKitProvider } from "../src/integrations/harness/providers/claude/claudeKit";
+import { HostMoves } from "./move";
 import type { LinkedWorkItem } from "../src/features/sessions/model/session";
 import { parseGithubWorkItemUrl } from "../src/features/sessions/model/sessionWorkItem";
 import { SyncTransfers } from "./sync-transfer";
@@ -136,6 +141,7 @@ export function createHostServer(
   engine: HostEngine,
   providers: RemoteProvider[],
   lifecycle?: (request: IncomingMessage, response: ServerResponse) => void,
+  options: { kitHome?: string } = {},
 ) {
   const catalogs = new Map<
     string,
@@ -144,7 +150,7 @@ export function createHostServer(
   const transfers = new SyncTransfers();
   const workspace = new WorkspaceCommands(
     engine.store,
-    (projectId, action) => engine.withIdleProject(projectId, action),
+    (projectId, action, what) => engine.withIdleProject(projectId, action, what),
   );
   const models = async (projectId?: unknown) => {
     const cwd =
@@ -192,7 +198,20 @@ export function createHostServer(
     }
     return catalog;
   };
-  return createServer(
+  // Sweeps expired staging at startup, on a timer, and on begin/chunk/commit.
+  const uploads = new HostUploads(engine.store.uploadDir);
+  uploads.startSweeper();
+  // The kit's secrets must never reach Host logs or error text.
+  const restoreConsole = installLogScrubber();
+  const kit = new HostKit(uploads, {
+    home: options.kitHome,
+    resolveClaude: async () => (await resolveBinary.claude()).path,
+  });
+  setClaudeKitProvider(() => kit.current());
+  const moves = new HostMoves(engine, uploads, {
+    onWorktreeCreated: () => workspace.invalidateRoots(),
+  });
+  const server = createServer(
     { requestTimeout: 20_000, headersTimeout: 10_000, maxHeaderSize: 8192 },
     async (request, response) => {
       if (request.url === "/lifecycle" && lifecycle) {
@@ -260,6 +279,7 @@ export function createHostServer(
               environmentId: engine.store.environmentId,
               name: hostname(),
               platform: process.platform,
+              host: { flavor: HOST_FLAVOR, version: HOST_VERSION_BASE },
               // Older clients validate this list against Codex and Claude only.
               providers: providers.filter((provider) =>
                 Array.isArray(params.supportedProviders)
@@ -287,13 +307,22 @@ export function createHostServer(
                 "files.searchContent",
                 "files.create",
                 "files.write",
+                "files.write.hash",
+                "git.idleGuard",
                 "git.index",
                 "git.fileDiff",
                 "git.action",
                 "attachments.upload",
                 "attachments.read",
+                "uploads",
+                "kit",
+                "claude.kit",
+                "claude.kit.instructions",
                 "sessions.draft",
                 "sessions.plan",
+                "workspace.watch",
+                "workspace.applySnapshot",
+                "sessions.import",
               ],
             };
             break;
@@ -417,6 +446,41 @@ export function createHostServer(
             break;
           case "attachments.read":
             result = readAttachmentChunk(engine.store, params);
+            break;
+          case "uploads.begin":
+            result = uploads.begin(params);
+            break;
+          case "uploads.chunk":
+            result = uploads.chunk(params);
+            break;
+          case "uploads.commit":
+            result = uploads.commit(params);
+            break;
+          case "uploads.discard":
+            result = uploads.discard(params);
+            break;
+          case "kit.apply":
+            result = await kit.apply(params);
+            break;
+          case "kit.secrets":
+            result = kit.secrets(params);
+            break;
+          case "kit.probe":
+            result = kit.probe(params);
+            break;
+          case "kit.health": {
+            const cwd =
+              typeof params.projectId === "string"
+                ? engine.store.project(params.projectId).cwd
+                : homedir();
+            result = await kit.health(cwd);
+            break;
+          }
+          case "workspace.applySnapshot":
+            result = await moves.applySnapshot(params);
+            break;
+          case "sessions.import":
+            result = await moves.importSession(params);
             break;
           case "devices.revokeSelf":
             // Only the caller's own credential. Sessions and other devices
@@ -635,10 +699,20 @@ export function createHostServer(
           response.writeHead(400).end(
             JSON.stringify({
               error:
-                error instanceof Error ? error.message : "Host request failed",
+                error instanceof Error
+                  ? scrubSecrets(error.message)
+                  : "Host request failed",
             }),
           );
       }
     },
   );
+  // Shutdown (and tests) close the server: release every change watcher.
+  server.on("close", () => workspace.close());
+  server.once("close", () => {
+    uploads.stopSweeper();
+    setClaudeKitProvider(undefined);
+    restoreConsole();
+  });
+  return server;
 }

@@ -278,3 +278,91 @@ setInterval(() => {}, 1000);
     });
   }
 }, 10_000);
+
+it("loads kit secrets into a Claude child only, never into process.env", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "monocode-kit-env-"));
+  const file = join(directory, "provider.cjs");
+  writeFileSync(
+    file,
+    `console.log(JSON.stringify({ t: process.env.MONOPTAH_KIT_X_T || null }));
+console.error('stderr echo ' + process.env.MONOPTAH_KIT_X_T);
+setInterval(() => {}, 1000);
+`,
+  );
+  const secret = "kit-secret-value-123";
+  const backend = new HostChildBackend();
+  const out: string[] = [];
+  const err: string[] = [];
+  const stopOut = await backend.listen<{ line: string }>("harness-stdout", ({ payload }) => out.push(payload.line));
+  const stopErr = await backend.listen<{ line: string }>("harness-stderr", ({ payload }) => err.push(payload.line));
+  const { HostKit } = await import("./kit");
+  try {
+    // Registers the value with the scrubber, as the Host does on startup.
+    new HostKit({ committedPath: () => "" }, { home: directory }).secrets({
+      values: { MONOPTAH_KIT_X_T: secret },
+    });
+    await backend.invoke("harness_spawn", {
+      sessionId: "kit",
+      command: file,
+      args: [],
+      cwd: directory,
+      binaryProvider: "claude",
+      env: { MONOPTAH_KIT_X_T: secret },
+    });
+    await vi.waitFor(() => expect(out.length).toBeGreaterThan(0));
+    expect(JSON.parse(out[0])).toEqual({ t: secret });
+    await vi.waitFor(() => expect(err.length).toBeGreaterThan(0));
+    expect(err.join("\n")).not.toContain(secret);
+    expect(process.env.MONOPTAH_KIT_X_T).toBeUndefined();
+    await backend.kill("kit");
+    // Not for other providers, and only MONOPTAH_KIT_ names.
+    for (const [binaryProvider, env] of [
+      ["codex", { MONOPTAH_KIT_X_T: secret }],
+      ["claude", { LD_PRELOAD: "/x.so" }],
+      ["claude", { MONOPTAH_KIT_X_T: 5 }],
+    ] as const)
+      await expect(
+        backend.invoke("harness_spawn", { sessionId: "kit2", command: file, args: [], cwd: directory, binaryProvider, env }),
+      ).rejects.toThrow("Unsupported child environment");
+  } finally {
+    stopOut();
+    stopErr();
+    await backend.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+}, 15_000);
+
+it("scrubs a multi-line secret from child stderr line by line", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "monocode-kit-pem-"));
+  const file = join(directory, "provider.cjs");
+  const pem = "-----BEGIN KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSj\nAbCdEfGhIjKlMnOpQrStUvWxYz0123456789==\n-----END KEY-----";
+  writeFileSync(
+    file,
+    `process.stderr.write(process.env.MONOPTAH_KIT_PEM + '\\n');
+process.stderr.write('enc=' + encodeURIComponent(process.env.MONOPTAH_KIT_PEM) + '\\n');
+process.stderr.write('ordinary line\\n');
+setInterval(() => {}, 1000);
+`,
+  );
+  const backend = new HostChildBackend();
+  const err: string[] = [];
+  const stopErr = await backend.listen<{ line: string }>("harness-stderr", ({ payload }) => err.push(payload.line));
+  const { HostKit } = await import("./kit");
+  try {
+    new HostKit({ committedPath: () => "" }, { home: directory }).secrets({ values: { MONOPTAH_KIT_PEM: pem } });
+    await backend.invoke("harness_spawn", {
+      sessionId: "pem", command: file, args: [], cwd: directory, binaryProvider: "claude", env: { MONOPTAH_KIT_PEM: pem },
+    });
+    await vi.waitFor(() => expect(err).toContain("ordinary line"));
+    const text = err.join("\n");
+    expect(text).not.toContain("MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSj");
+    expect(text).not.toContain("AbCdEfGhIjKlMnOpQrStUvWxYz0123456789==");
+    expect(text).not.toContain(encodeURIComponent(pem));
+    expect(text).toContain("[redacted]");
+    await backend.kill("pem");
+  } finally {
+    stopErr();
+    await backend.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+}, 15_000);

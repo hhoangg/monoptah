@@ -275,6 +275,7 @@ pub(crate) mod fixtures {
             finished_at: None,
             track_ready: true,
             sandbox_start: None,
+            kit_off: false,
         }
     }
 
@@ -303,6 +304,7 @@ pub(crate) mod fixtures {
                 mode,
                 relay_port: 0,
                 rebuild: false,
+                defer_lifecycle: false,
             });
         Arc::new(snapshot)
     }

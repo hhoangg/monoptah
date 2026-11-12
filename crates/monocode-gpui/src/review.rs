@@ -282,8 +282,18 @@ pub(crate) struct ReviewPane {
     skip_tab_click: bool,
     pending_close: Option<(usize, bool)>,
     close_prompted: bool,
+    /// A discard waiting for its confirmation; the dialog needs a window, so render asks it.
+    pending_discard: Option<PendingDiscard>,
+    /// A write the git policy refused, shown as an alert by the next render.
+    pending_refusal: Option<String>,
     menu: Option<(usize, Point<gpui::Pixels>, Entity<Menu>, Subscription)>,
     _subscriptions: Vec<Subscription>,
+}
+struct PendingDiscard {
+    view: Entity<DiffView>,
+    id: SharedString,
+    relative: String,
+    cwd: String,
 }
 struct FileTabDrag {
     from: usize,
@@ -400,6 +410,8 @@ impl ReviewPane {
             skip_tab_click: false,
             pending_close: None,
             close_prompted: false,
+            pending_discard: None,
+            pending_refusal: None,
             menu: None,
             _subscriptions: subscriptions,
         };
@@ -685,6 +697,57 @@ impl ReviewPane {
                 self.remove_tab(ix, cx);
             }
         }
+    }
+    /// Shows what the render left for a window: a refused write, or the discard confirmation.
+    fn prompt_git_policy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(reason) = self.pending_refusal.take() {
+            crate::changes::Changes::fail(reason, window, cx);
+        }
+        let Some(pending) = self.pending_discard.take() else {
+            return;
+        };
+        let name = std::path::Path::new(&pending.relative)
+            .file_name()
+            .map_or_else(
+                || pending.relative.clone(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+        let ask = crate::changes::Changes::confirm(
+            format!("Discard changes in {name}? This cannot be undone."),
+            "Discard",
+            window,
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if !ask.await {
+                return;
+            }
+            let _ = this.update_in(cx, |this, window, cx| {
+                // The dialog may have been open for a while: a turn can have started meanwhile.
+                if let crate::git_gate::Decision::Refuse(reason) =
+                    crate::git_gate::decide(crate::git_gate::Op::Discard, &pending.cwd)
+                {
+                    crate::changes::Changes::fail(reason.into(), window, cx);
+                    return;
+                }
+                if !crate::git_gate::writes_allowed(&pending.cwd) {
+                    return;
+                }
+                let cwd = PathBuf::from(&pending.cwd);
+                let relative = pending.relative;
+                this.run_write(
+                    pending.view,
+                    pending.id,
+                    Box::new(move || {
+                        #[cfg(test)]
+                        tests::DISCARDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        scm::discard_file(&cwd, &relative)
+                    }),
+                    cx,
+                );
+            });
+        })
+        .detach();
     }
     fn prompt_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.pending_close.is_none() || self.close_prompted {
@@ -1231,80 +1294,83 @@ impl ReviewPane {
         };
         let models: Vec<DiffFile> = match &source.tab {
             ReviewTab::File { .. } => return,
-            ReviewTab::Changes { staged, .. } => entries(files, *staged)
-                .into_iter()
-                .map(|(id, kind, file)| {
-                    let loaded = source.loaded.get(&id);
-                    let unchanged = loaded.is_some_and(|l| {
-                        l.unified.is_some()
-                            && l.additions == 0
-                            && l.deletions == 0
-                            && !l.diff.binary
-                    });
-                    let index_counts = loaded.is_some_and(|l| l.error.is_none())
-                        && !(file.staged && file.unstaged);
-                    let label = if file.staged && file.unstaged {
-                        format!(
-                            "{} ({})",
-                            file.relative,
-                            if kind { "Staged" } else { "Unstaged" }
-                        )
-                    } else {
-                        file.relative.clone()
-                    };
-                    DiffFile {
-                        id: id.into(),
-                        path: file.path.clone(),
-                        label,
-                        binary: loaded.is_some_and(|l| l.diff.binary),
-                        too_large: loaded.is_some_and(|l| l.diff.too_large),
-                        empty_message: match loaded {
-                            None => Some("Loading…".into()),
-                            Some(l) if l.error.is_some() => Some(format!(
-                                "Couldn’t load diff: {}",
-                                l.error.clone().unwrap_or_default()
-                            )),
-                            _ if unchanged => Some(
-                                if kind {
-                                    "No staged changes"
-                                } else {
-                                    "No unstaged changes"
-                                }
-                                .into(),
-                            ),
-                            _ => None,
-                        },
-                        additions: loaded
-                            .filter(|l| l.unified.is_some())
-                            .map(|l| l.additions)
-                            .unwrap_or(if index_counts {
-                                file.additions as u32
-                            } else {
-                                0
-                            }),
-                        deletions: loaded
-                            .filter(|l| l.unified.is_some())
-                            .map(|l| l.deletions)
-                            .unwrap_or(if index_counts {
-                                file.deletions as u32
-                            } else {
-                                0
-                            }),
-                        blocks: if unchanged {
-                            Arc::new(Vec::new())
+            ReviewTab::Changes { staged, cwd, .. } => {
+                let writable = crate::git_gate::writes_allowed(cwd);
+                entries(files, *staged)
+                    .into_iter()
+                    .map(|(id, kind, file)| {
+                        let loaded = source.loaded.get(&id);
+                        let unchanged = loaded.is_some_and(|l| {
+                            l.unified.is_some()
+                                && l.additions == 0
+                                && l.deletions == 0
+                                && !l.diff.binary
+                        });
+                        let index_counts = loaded.is_some_and(|l| l.error.is_none())
+                            && !(file.staged && file.unstaged);
+                        let label = if file.staged && file.unstaged {
+                            format!(
+                                "{} ({})",
+                                file.relative,
+                                if kind { "Staged" } else { "Unstaged" }
+                            )
                         } else {
-                            loaded
-                                .and_then(|l| l.unified.clone())
-                                .unwrap_or_else(|| Arc::new(Vec::new()))
-                        },
-                        can_stage: !kind && crate::git_gate::writes_allowed(),
-                        can_discard: !kind && crate::git_gate::writes_allowed(),
-                        can_stage_hunk: !kind
-                            && crate::git_gate::writes_allowed()
-                            && !loaded.is_some_and(|l| l.diff.binary || l.diff.too_large),
-                    }
-                })
-                .collect(),
+                            file.relative.clone()
+                        };
+                        DiffFile {
+                            id: id.into(),
+                            path: file.path.clone(),
+                            label,
+                            binary: loaded.is_some_and(|l| l.diff.binary),
+                            too_large: loaded.is_some_and(|l| l.diff.too_large),
+                            empty_message: match loaded {
+                                None => Some("Loading…".into()),
+                                Some(l) if l.error.is_some() => Some(format!(
+                                    "Couldn’t load diff: {}",
+                                    l.error.clone().unwrap_or_default()
+                                )),
+                                _ if unchanged => Some(
+                                    if kind {
+                                        "No staged changes"
+                                    } else {
+                                        "No unstaged changes"
+                                    }
+                                    .into(),
+                                ),
+                                _ => None,
+                            },
+                            additions: loaded
+                                .filter(|l| l.unified.is_some())
+                                .map(|l| l.additions)
+                                .unwrap_or(if index_counts {
+                                    file.additions as u32
+                                } else {
+                                    0
+                                }),
+                            deletions: loaded
+                                .filter(|l| l.unified.is_some())
+                                .map(|l| l.deletions)
+                                .unwrap_or(if index_counts {
+                                    file.deletions as u32
+                                } else {
+                                    0
+                                }),
+                            blocks: if unchanged {
+                                Arc::new(Vec::new())
+                            } else {
+                                loaded
+                                    .and_then(|l| l.unified.clone())
+                                    .unwrap_or_else(|| Arc::new(Vec::new()))
+                            },
+                            can_stage: !kind && writable,
+                            can_discard: !kind && writable,
+                            can_stage_hunk: !kind
+                                && writable
+                                && !loaded.is_some_and(|l| l.diff.binary || l.diff.too_large),
+                        }
+                    })
+                    .collect()
+            }
             ReviewTab::Commit { .. } | ReviewTab::Session { .. } => files
                 .iter()
                 .map(|file| {
@@ -1397,7 +1463,35 @@ impl ReviewPane {
             }
             return;
         };
-        if !crate::git_gate::writes_allowed() {
+        // A comment is not a write: it goes to the chat whatever the gate says.
+        if let DiffEvent::Comment(text) = event {
+            cx.emit(ReviewEvent::Comment(text.clone()));
+            return;
+        }
+        if !crate::git_gate::writes_allowed(cwd) {
+            return;
+        }
+        // The same policy as the Changes panel, whatever the visible panel or session is.
+        let op = match event {
+            DiffEvent::DiscardFile(_) => crate::git_gate::Op::Discard,
+            _ => crate::git_gate::Op::Stage,
+        };
+        if let crate::git_gate::Decision::Refuse(reason) = crate::git_gate::decide(op, cwd) {
+            self.pending_refusal = Some(reason.into());
+            cx.notify();
+            return;
+        }
+        if let DiffEvent::DiscardFile(id) = event {
+            let Some(relative) = id.strip_prefix("unstaged:").map(str::to_owned) else {
+                return;
+            };
+            self.pending_discard = Some(PendingDiscard {
+                view: source.view.clone(),
+                id: id.clone(),
+                relative,
+                cwd: cwd.clone(),
+            });
+            cx.notify();
             return;
         }
         let cwd = PathBuf::from(cwd);
@@ -1407,20 +1501,14 @@ impl ReviewPane {
                 cx.emit(ReviewEvent::Comment(text.clone()));
                 return;
             }
-            DiffEvent::StageFile(id) | DiffEvent::DiscardFile(id) => {
+            DiffEvent::DiscardFile(_) => return,
+            DiffEvent::StageFile(id) => {
                 let Some(relative) = id.strip_prefix("unstaged:").map(str::to_owned) else {
                     return;
                 };
-                let stage = matches!(event, DiffEvent::StageFile(_));
                 (
                     id.clone(),
-                    Box::new(move || {
-                        if stage {
-                            scm::stage_file(&cwd, &relative)
-                        } else {
-                            scm::discard_file(&cwd, &relative)
-                        }
-                    }),
+                    Box::new(move || scm::stage_file(&cwd, &relative)),
                 )
             }
             DiffEvent::StageHunk(id, chunk) => {
@@ -1443,6 +1531,17 @@ impl ReviewPane {
             }
         };
         let view = source.view.clone();
+        self.run_write(view, id, work, cx);
+    }
+
+    /// Runs one git write with the file's row busy, then rereads.
+    fn run_write(
+        &mut self,
+        view: Entity<DiffView>,
+        id: SharedString,
+        work: Box<dyn FnOnce() -> Result<(), String> + Send>,
+        cx: &mut Context<Self>,
+    ) {
         view.update(cx, |v, cx| {
             v.busy_id = Some(id.clone());
             cx.notify();
@@ -1793,6 +1892,7 @@ impl Render for ReviewPane {
             window.focus(&self.focus, cx);
         }
         self.prompt_close(window, cx);
+        self.prompt_git_policy(window, cx);
         // PaneTree's reveal: the files fade in once the pane has arrived.
         if cx.reduce_motion() {
             self.revealed = None;
@@ -2097,46 +2197,214 @@ mod tests {
         );
     }
 
+    /// Counts the discards that reached scm (a fake seam for the policy tests).
+    pub(super) static DISCARDS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    fn review_window(cx: &mut gpui::TestAppContext, cwd: &str) -> gpui::WindowHandle<ReviewPane> {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                let git = cx.new(|cx| ProjectGit::new(cwd.to_owned(), cx));
+                cx.new(|cx| {
+                    let mut pane = ReviewPane::new(git, Default::default(), cx);
+                    pane.open(
+                        ReviewTab::Changes {
+                            cwd: cwd.to_owned(),
+                            path: None,
+                            staged: None,
+                        },
+                        cx,
+                    );
+                    pane.set_visible(true, cx);
+                    pane
+                })
+            })
+            .unwrap()
+        });
+        cx.run_until_parked();
+        window
+    }
+    fn discard_event(
+        window: gpui::WindowHandle<ReviewPane>,
+        file: &str,
+        visual: &mut gpui::VisualTestContext,
+    ) {
+        let event = DiffEvent::DiscardFile(format!("unstaged:{file}").into());
+        window
+            .update(visual, |pane, _, cx| pane.diff_event(0, &event, cx))
+            .unwrap();
+        visual.run_until_parked();
+    }
+
     #[gpui::test]
     fn discarding_a_file_is_refused_in_the_review_view_while_a_cloud_session_is_in_view(
         cx: &mut gpui::TestAppContext,
     ) {
         let repo = Repo::new();
         let cwd = repo.cwd();
-        let git = cx.new(|cx| ProjectGit::new(cwd.clone(), cx));
-        cx.run_until_parked();
-        let pane = cx.new(|cx| ReviewPane::new(git, Default::default(), cx));
-        pane.update(cx, |pane, cx| {
-            pane.open(
-                ReviewTab::Changes {
-                    cwd: cwd.clone(),
-                    path: None,
-                    staged: None,
-                },
-                cx,
-            );
-            pane.set_visible(true, cx);
-        });
-        cx.run_until_parked();
-        let discard = |file: &str, cx: &mut gpui::TestAppContext| {
-            let event = DiffEvent::DiscardFile(format!("unstaged:{file}").into());
-            pane.update(cx, |pane, cx| pane.diff_event(0, &event, cx));
-            cx.run_until_parked();
-        };
-        crate::git_gate::set(Some("octo-abc".into()));
-        discard("a.txt", cx);
+        let window = review_window(cx, &cwd);
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        crate::git_gate::set(crate::git_gate::Gate::local_of("octo-abc"));
+        discard_event(window, "a.txt", visual);
+        assert!(
+            !visual.has_pending_prompt(),
+            "a local cwd is refused silently"
+        );
         assert_eq!(
             std::fs::read_to_string(repo.0.join("a.txt")).unwrap(),
             "edit1\n",
             "the local file must survive"
         );
-        // Control: with the gate open the same event does discard.
-        crate::git_gate::set(None);
-        discard("b.txt", cx);
+        // Control: with the gate open the event asks first, and the answer discards.
+        crate::git_gate::set(crate::git_gate::Gate::default());
+        discard_event(window, "b.txt", visual);
+        let (message, _) = visual.pending_prompt().expect("the confirmation");
+        assert!(
+            message.starts_with("Discard changes in b.txt?"),
+            "{message}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.0.join("b.txt")).unwrap(),
+            "edit1\n",
+            "nothing is discarded before the answer"
+        );
+        visual.simulate_prompt_answer("Discard");
+        visual.run_until_parked();
         assert_eq!(
             std::fs::read_to_string(repo.0.join("b.txt")).unwrap(),
             "base\n"
         );
+    }
+
+    /// Scenario A: a Review opened on a local checkout stays refused after the panels switch
+    /// back to Cloud, because the answer follows the cwd, not the visible panel.
+    #[gpui::test]
+    fn a_local_review_stays_refused_when_the_panels_switch_back_to_cloud(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let repo = Repo::new();
+        let cwd = repo.cwd();
+        let window = review_window(cx, &cwd);
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        use crate::panel_root::PanelRoot;
+        let cloud = monocode_core::cloud_sessions::CloudRef::codespace("octo-abc");
+        let remote = "remote://env-octo-abc/workspaces/widgets";
+        let roots = [
+            // The Local switch...
+            PanelRoot::Local {
+                path: "/work/monocode".into(),
+                cloud: Some(cloud.clone()),
+            },
+            // ...then back to Cloud.
+            PanelRoot::Cloud {
+                root: remote.into(),
+                cloud,
+                local_project: "/work/monocode".into(),
+            },
+        ];
+        for root in roots {
+            crate::git_gate::set(crate::git_gate::Gate::of(&root, Vec::new(), Vec::new()));
+            discard_event(window, "a.txt", visual);
+            assert!(!visual.has_pending_prompt(), "{root:?}");
+            assert_eq!(
+                std::fs::read_to_string(repo.0.join("a.txt")).unwrap(),
+                "edit1\n",
+                "{root:?}"
+            );
+            // The local cwd stays refused, a remote one is writable under the policy.
+            assert!(!crate::git_gate::writes_allowed(&cwd), "{root:?}");
+            assert!(crate::git_gate::writes_allowed(remote), "{root:?}");
+            assert_eq!(
+                crate::git_gate::decide(crate::git_gate::Op::Discard, remote),
+                crate::git_gate::Decision::Allow
+            );
+        }
+        crate::git_gate::set(crate::git_gate::Gate::default());
+    }
+
+    /// The running-turn refusal and the confirmation apply to a Review of a remote workspace,
+    /// also when it is shown while a local session is active (scenario B).
+    #[gpui::test]
+    fn a_remote_review_refuses_discard_while_a_turn_runs_and_asks_when_idle(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let remote = "remote://env-octo-abc/workspaces/widgets";
+        let before = DISCARDS.load(std::sync::atomic::Ordering::SeqCst);
+        let repo = Repo::new();
+        let window = review_window(cx, &repo.cwd());
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        window
+            .update(visual, |pane, _, _| {
+                if let ReviewTab::Changes { cwd, .. } = &mut pane.sources[0].tab {
+                    *cwd = remote.into();
+                }
+            })
+            .unwrap();
+        // A local session is active: no cloud session in view, but a turn runs in the workspace.
+        crate::git_gate::set(crate::git_gate::Gate::running_in(&["env-octo-abc"]));
+        discard_event(window, "a.txt", visual);
+        let (message, _) = visual.pending_prompt().expect("an alert");
+        assert!(message.contains("agent is working"), "{message}");
+        visual.simulate_prompt_answer("OK");
+        visual.run_until_parked();
+        window
+            .update(visual, |pane, _, _| assert!(pane.pending_discard.is_none()))
+            .unwrap();
+        // Idle: the user is asked. A turn that starts while the dialog is open refuses it.
+        crate::git_gate::set(crate::git_gate::Gate::running_in(&[]));
+        discard_event(window, "a.txt", visual);
+        let (message, _) = visual.pending_prompt().expect("the confirmation");
+        assert!(
+            message.starts_with("Discard changes in a.txt?"),
+            "{message}"
+        );
+        crate::git_gate::set(crate::git_gate::Gate::running_in(&["env-octo-abc"]));
+        visual.simulate_prompt_answer("Discard");
+        visual.run_until_parked();
+        let (message, _) = visual.pending_prompt().expect("a refusal after the dialog");
+        assert!(message.contains("agent is working"), "{message}");
+        visual.simulate_prompt_answer("OK");
+        visual.run_until_parked();
+        assert_eq!(
+            DISCARDS.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "the discard must not reach scm"
+        );
+        // Control: once idle and confirmed, the discard does reach scm.
+        crate::git_gate::set(crate::git_gate::Gate::running_in(&[]));
+        discard_event(window, "a.txt", visual);
+        visual.simulate_prompt_answer("Discard");
+        visual.run_until_parked();
+        assert_eq!(
+            DISCARDS.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1
+        );
+        crate::git_gate::set(crate::git_gate::Gate::default());
+    }
+
+    /// "Comment to chat" is not a write: it is delivered even where writes are refused.
+    #[gpui::test]
+    fn comments_reach_the_chat_where_writes_are_refused(cx: &mut gpui::TestAppContext) {
+        let repo = Repo::new();
+        let window = review_window(cx, &repo.cwd());
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sink = seen.clone();
+        let pane = window.root(visual).unwrap();
+        let _subscription = visual.update(|_, cx| {
+            cx.subscribe(&pane, move |_, event: &ReviewEvent, _| {
+                if let ReviewEvent::Comment(text) = event {
+                    sink.borrow_mut().push(text.clone());
+                }
+            })
+        });
+        crate::git_gate::set(crate::git_gate::Gate::local_of("octo-abc"));
+        assert!(!crate::git_gate::writes_allowed(&repo.cwd()));
+        let event = DiffEvent::Comment("note".into());
+        window
+            .update(visual, |pane, _, cx| pane.diff_event(0, &event, cx))
+            .unwrap();
+        assert_eq!(seen.borrow().len(), 1);
+        crate::git_gate::set(crate::git_gate::Gate::default());
     }
 
     #[gpui::test]
@@ -2348,6 +2616,64 @@ mod tests {
                     cx,
                 );
                 assert_eq!(pane.sources.len(), 2);
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn a_pending_close_is_cancelled_when_the_save_cannot_complete(cx: &mut gpui::TestAppContext) {
+        use gpui::EntityInputHandler;
+        let repo = Repo::new();
+        cx.update(|cx| cx.set_global(crate::settings::Preferences::default()));
+        let cwd = repo.cwd();
+        let path = repo.0.join("a.txt").to_string_lossy().into_owned();
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                let git = cx.new(|cx| ProjectGit::new(cwd.clone(), cx));
+                cx.new(|cx| {
+                    let mut pane = ReviewPane::new(git, Default::default(), cx);
+                    pane.open(
+                        ReviewTab::File {
+                            cwd: cwd.clone(),
+                            path: path.clone(),
+                        },
+                        cx,
+                    );
+                    pane.set_visible(true, cx);
+                    pane
+                })
+            })
+            .unwrap()
+        });
+        cx.run_until_parked();
+        let editor = window
+            .update(cx, |pane, w, cx| {
+                let editor = pane.active_editor().unwrap();
+                editor
+                    .read(cx)
+                    .input
+                    .clone()
+                    .update(cx, |i, cx| i.replace_text_in_range(None, "draft ", w, cx));
+                editor
+            })
+            .unwrap();
+        cx.run_until_parked();
+        // A cloud save was refused and the compare dialog is open on the dirty file.
+        window
+            .update(cx, |pane, _, cx| {
+                editor.update(cx, |e, cx| e.open_conflict_for_test(cx));
+                pane.close_tab(0, cx);
+                assert!(pane.pending_close.is_some());
+                // The close prompt's "Save" asks the editor to save; it cannot start.
+                editor.update(cx, |e, cx| e.save(cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |pane, _, cx| {
+                assert!(pane.pending_close.is_none(), "the close was cancelled");
+                assert!(!pane.close_prompted);
+                assert_eq!(pane.sources.len(), 1);
+                assert!(editor.read(cx).dirty);
             })
             .unwrap();
     }

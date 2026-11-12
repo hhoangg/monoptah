@@ -203,6 +203,10 @@ struct SubAgent<'a> {
     place: String,
     branch: bool,
     state: AgentState,
+    /// The cloud badge of a session on a codespace or sandbox.
+    cloud: Option<AnyElement>,
+    /// Names the backend and instance, for the row's accessible label.
+    cloud_label: Option<String>,
 }
 /// A sub-agent the Mono started: who it is (model and provider) first, then
 /// what it was asked to do and where.
@@ -233,7 +237,10 @@ fn sub_agent_card(agent: SubAgent) -> Stateful<Div> {
             .id(("mono-launch", id as usize))
             .debug_selector(move || format!("mono-launch-{id}"))
             .role(Role::Button)
-            .aria_label(format!("{}, {model}", agent.title)),
+            .aria_label(match &agent.cloud_label {
+                Some(cloud) => format!("{}, {model}, {cloud}", agent.title),
+                None => format!("{}, {model}", agent.title),
+            }),
     )
     .when(needs_input, |d| {
         let mut c = amber;
@@ -313,23 +320,38 @@ fn sub_agent_card(agent: SubAgent) -> Stateful<Div> {
                         div()
                             .ml_auto()
                             .min_w_0()
-                            .max_w(px(160.))
                             .flex()
                             .items_center()
-                            .gap_1()
-                            .text_color(content(0.4))
-                            .child(
-                                icon(
-                                    if agent.branch {
-                                        "git-branch"
-                                    } else {
-                                        "folder-01"
-                                    },
-                                    11.,
+                            .gap_1p5()
+                            .when_some(agent.cloud, |d, badge| {
+                                d.child(
+                                    div()
+                                        .debug_selector(move || format!("mono-launch-cloud-{id}"))
+                                        .flex_shrink_0()
+                                        .child(badge),
                                 )
-                                .text_color(content(0.4)),
-                            )
-                            .child(div().min_w_0().truncate().child(agent.place)),
+                            })
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .max_w(px(160.))
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .text_color(content(0.4))
+                                    .child(
+                                        icon(
+                                            if agent.branch {
+                                                "git-branch"
+                                            } else {
+                                                "folder-01"
+                                            },
+                                            11.,
+                                        )
+                                        .text_color(content(0.4)),
+                                    )
+                                    .child(div().min_w_0().truncate().child(agent.place)),
+                            ),
                     ),
             ),
     )
@@ -1185,9 +1207,9 @@ impl Monos {
             cx,
         );
         let query = filter.read(cx).content.to_lowercase();
-        let views = self
-            .owner
-            .upgrade()
+        let owner = self.owner.upgrade();
+        let views = owner
+            .as_ref()
             .map(|owner| owner.read(cx).mono_session_views(cx))
             .unwrap_or_default();
         let mut launches: Vec<_> = mono
@@ -1246,6 +1268,9 @@ impl Monos {
                     let project = mono.projects.iter().find(|p| monocode_core::files::path_key(p) == monocode_core::files::path_key(cwd)).unwrap_or(cwd);
                     let project = std::path::Path::new(project).file_name().map_or(project.clone(), |n| n.to_string_lossy().to_string());
                     let branch = state.and_then(|s| s.branch.clone());
+                    let is_cloud = state.is_some_and(|s| s.cloud);
+                    let cloud = if is_cloud { owner.as_ref().and_then(|o| o.read(cx).mono_cloud_badge(id)) } else { None };
+                    let cloud_label = if is_cloud { owner.as_ref().and_then(|o| o.read(cx).mono_cloud_label(id)) } else { None };
                     sub_agent_card(SubAgent {
                         id,
                         title,
@@ -1260,6 +1285,8 @@ impl Monos {
                             Some(s) => AgentState::Idle(s.updated_at),
                             None => AgentState::Unavailable,
                         },
+                        cloud,
+                        cloud_label,
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.route = Some(Route::Session(id));

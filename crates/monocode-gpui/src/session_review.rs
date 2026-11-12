@@ -37,6 +37,9 @@ pub(crate) struct SessionReview {
     busy: bool,
     /// Another session is running in this project.
     undo_locked: bool,
+    /// Why Undo is disabled for a session that lives in the cloud (design 4.9 R6): its
+    /// recorded changes are from turns before the move point.
+    undo_blocked: Option<&'static str>,
     generation: u64,
     _load: Option<Task<()>>,
 }
@@ -53,6 +56,7 @@ impl SessionReview {
             acting: None,
             busy: false,
             undo_locked: false,
+            undo_blocked: None,
             generation: 0,
             _load: None,
         }
@@ -84,6 +88,17 @@ impl SessionReview {
             self.publish(Ok(CheckpointStatus::default()), cx);
         }
         cx.notify();
+    }
+    /// The cloud gate of Undo: `Some(reason)` disables it and shows the reason.
+    pub(crate) fn set_undo_blocked(
+        &mut self,
+        reason: Option<&'static str>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.undo_blocked != reason {
+            self.undo_blocked = reason;
+            cx.notify();
+        }
     }
     pub(crate) fn set_undo_locked(&mut self, locked: bool, cx: &mut Context<Self>) {
         if self.undo_locked != locked {
@@ -134,6 +149,9 @@ impl SessionReview {
     }
     fn run(&mut self, action: Action, cx: &mut Context<Self>) {
         if self.acting.is_some() {
+            return;
+        }
+        if action == Action::Undo && self.undo_blocked.is_some() {
             return;
         }
         let Some(store) = monocode_core::checkpoint::store() else {
@@ -272,7 +290,9 @@ impl SessionReview {
             return div().into_any_element();
         }
         let disabled = self.acting.is_some();
-        let can_undo = !self.undo_locked && self.files.iter().all(|f| f.undoable);
+        let can_undo = !self.undo_locked
+            && self.undo_blocked.is_none()
+            && self.files.iter().all(|f| f.undoable);
         let visible = if self.expanded {
             self.files.len()
         } else {
@@ -322,7 +342,18 @@ impl SessionReview {
                         counts(additions, deletions, 6.)
                             .line_height(px(16.5))
                             .mt(px(-2.)),
-                    ),
+                    )
+                    .when_some(self.undo_blocked, |d, reason| {
+                        d.child(
+                            div()
+                                .id("session-review-undo-reason")
+                                .debug_selector(|| "session-review-undo-reason".into())
+                                .text_size(px(11.))
+                                .line_height(px(15.))
+                                .text_color(content(0.45))
+                                .child(format!("Undo is unavailable. {reason}")),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -334,6 +365,8 @@ impl SessionReview {
                         text_button("session-review-undo", "Undo", !disabled && can_undo)
                             .aria_label(if can_undo {
                                 "Undo the recorded changes"
+                            } else if let Some(reason) = self.undo_blocked {
+                                reason
                             } else if self.undo_locked {
                                 "Undo is unavailable while another session is running in this project"
                             } else {

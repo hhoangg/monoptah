@@ -253,6 +253,8 @@ pub struct Input {
     reversed: bool,
     marked: Option<Range<usize>>,
     composer_tokens: Vec<Range<usize>>,
+    /// The subset of `composer_tokens` that resolved to a provider account (Mono composers).
+    account_tokens: Vec<Range<usize>>,
     inline_commands: bool,
     selected_command: Option<Command>,
     lines: Vec<WrappedLine>,
@@ -333,6 +335,7 @@ impl Input {
             reversed: false,
             marked: None,
             composer_tokens: Vec::new(),
+            account_tokens: Vec::new(),
             inline_commands: false,
             selected_command: None,
             lines: Vec::new(),
@@ -747,10 +750,12 @@ impl Input {
     pub(crate) fn highlight_composer_tokens(
         &mut self,
         ranges: Vec<Range<usize>>,
+        accounts: Vec<Range<usize>>,
         cx: &mut Context<Self>,
     ) {
-        if self.composer_tokens != ranges {
+        if self.composer_tokens != ranges || self.account_tokens != accounts {
             self.composer_tokens = ranges;
+            self.account_tokens = accounts;
             cx.notify();
         }
     }
@@ -2026,12 +2031,16 @@ impl Element for InputElement {
                                     );
                                 }
                             }
-                            MentionIcon::Note | MentionIcon::Workflow | MentionIcon::Today => {
+                            MentionIcon::Note
+                            | MentionIcon::Workflow
+                            | MentionIcon::Today
+                            | MentionIcon::Account => {
                                 let _ = w.paint_svg(
                                     icon_bounds,
                                     match icon {
                                         MentionIcon::Note => "note",
                                         MentionIcon::Today => "check-circle",
+                                        MentionIcon::Account => "account-user",
                                         _ => "git-branch",
                                     }
                                     .into(),
@@ -2203,12 +2212,15 @@ mod tests {
             Some(MentionIcon::Note) => "note".into(),
             Some(MentionIcon::Workflow) => "git-branch".into(),
             Some(MentionIcon::Today) => "check-circle".into(),
+            Some(MentionIcon::Account) => "account-user".into(),
             None => String::new(),
         };
         assert_eq!(asset("@src/main.rs"), "mi/rust.svg");
         assert_eq!(asset("@\"docs/My Notes.md\""), "mi/markdown.svg");
         assert_eq!(asset("@note/todo"), "note");
         assert_eq!(asset("@workflow/nightly"), "git-branch");
+        // Never inferred from the text: a real file under codex/ keeps its file icon.
+        assert_eq!(asset("@codex/main.rs"), "mi/rust.svg");
         assert_eq!(asset("@today/clickup:42"), "check-circle");
         assert_eq!(asset("/plan"), "");
     }

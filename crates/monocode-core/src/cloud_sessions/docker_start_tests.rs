@@ -407,6 +407,9 @@ impl SandboxSecrets for Secrets {
     }
 }
 
+/// (machine id, prelude, secret in it)
+type UpgradeCall = (String, Option<String>, Option<String>);
+
 #[derive(Default)]
 struct FakeHost {
     machines: Mutex<Vec<Machine>>,
@@ -420,18 +423,29 @@ struct FakeHost {
     connected: Mutex<bool>,
     /// `sessions.delete` answers `SANDBOX_NOT_CONNECTED`.
     delete_offline: Mutex<bool>,
+    /// Each Host upgrade asked for: (machine id, prelude, secret in it).
+    upgrades: Mutex<Vec<UpgradeCall>>,
+    /// The upgrade echoes the secret into its progress lines, as a careless script would.
+    upgrade_leaks: Mutex<bool>,
 }
 impl Host for FakeHost {
     fn machines(&self) -> Result<Vec<Machine>, String> {
         Ok(self.machines.lock().unwrap().clone())
     }
-    fn connect(&self, _: &str, _: &str, _: &mut dyn FnMut(&str)) -> Result<Machine, String> {
+    fn connect(
+        &self,
+        _: &str,
+        _: &str,
+        _: &AtomicBool,
+        _: &mut dyn FnMut(&str),
+    ) -> Result<Machine, String> {
         panic!("a sandbox must not connect as a codespace")
     }
     fn connect_sandbox(
         &self,
         sandbox: crate::remote::SandboxTarget,
         display: &str,
+        _: &AtomicBool,
         progress: &mut dyn FnMut(&str),
     ) -> Result<Machine, String> {
         if let Some(shell) = self.shell.lock().unwrap().as_ref() {
@@ -479,6 +493,31 @@ impl Host for FakeHost {
             .unwrap()
             .push(format!("request {machine_id} {method} {}", params["cwd"]));
         Ok(json!({"id":"project-1","cwd":params["cwd"]}))
+    }
+    fn upgrade_host(
+        &self,
+        machine_id: &str,
+        auth: Option<crate::remote::host_upgrade::SandboxAuth<'_>>,
+        _: &AtomicBool,
+        progress: &mut dyn FnMut(&str),
+    ) -> crate::remote::host_upgrade::Outcome {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("upgrade {machine_id}"));
+        self.upgrades.lock().unwrap().push((
+            machine_id.into(),
+            auth.map(|a| a.prelude.to_string()),
+            auth.map(|a| a.secret.to_string()),
+        ));
+        progress("Updating Monoptah Host…");
+        if *self.upgrade_leaks.lock().unwrap() {
+            if let Some(auth) = auth {
+                progress(&format!("download failed, env {}", auth.prelude));
+                progress(&format!("token {}", auth.secret));
+            }
+        }
+        crate::remote::host_upgrade::Outcome::Current
     }
     fn disconnect(&self, id: &str) -> Result<(), String> {
         self.log.lock().unwrap().push(format!("disconnect {id}"));
@@ -1116,6 +1155,8 @@ fn the_clone_and_up_scripts_carry_the_validated_settings() {
     let git = fx.shell.call("gitconfig");
     assert!(git.stdin.contains("WANT_CRED='1'\n"));
     assert!(git.stdin.contains(&format!("CLONE_URL='{REPO}'\n")));
+    assert!(git.stdin.contains("GIT_HOST='github.com'\n"));
+    assert!(git.stdin.contains("REPO_PATH='octo/widgets.git'\n"));
     assert!(git.stdin.contains("SOCKET='/run/monoptah-git/sock'\n"));
 }
 
@@ -1617,6 +1658,65 @@ mod scripts {
     }
 
     #[test]
+    fn feature_equal_to_base_checks_out_the_tracking_branch_even_in_an_older_clone() {
+        let outer = Outer::new();
+        let repo = upstream();
+        let url = repo.path().display().to_string();
+        let script = |base: &str, branch: &str| {
+            with_vars(
+                &[
+                    ("PHASE", "clone"),
+                    ("REPO_URL", &url),
+                    ("REPO_DIR", "w"),
+                    ("BASE_REF", base),
+                    ("BRANCH", branch),
+                ],
+                PROVISION_SCRIPT,
+            )
+        };
+        // An older clone that has never seen the branch that is pushed next.
+        let (ok, _, stderr) = outer.run(&script("main", "feat/x"), "");
+        assert!(ok, "{stderr}");
+        git(repo.path(), &["checkout", "-q", "-b", "moved", "dev"]);
+        std::fs::write(repo.path().join("a.txt"), "moved\n").unwrap();
+        git(repo.path(), &["commit", "-qam", "moved"]);
+        git(repo.path(), &["checkout", "-q", "main"]);
+        let (ok, _, stderr) = outer.run(&script("moved", "moved"), "");
+        assert!(ok, "{stderr}");
+        let ws = outer.home.path().join("workspaces/w");
+        let config = |key: &str| {
+            String::from_utf8(
+                Command::new("git")
+                    .args(["-C", &ws.display().to_string(), "config", key])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+            .trim()
+            .to_string()
+        };
+        assert_eq!(config("branch.moved.remote"), "origin");
+        assert_eq!(config("branch.moved.merge"), "refs/heads/moved");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("a.txt")).unwrap(),
+            "moved\n"
+        );
+        // A second run keeps the branch and any work on it.
+        std::fs::write(ws.join("a.txt"), "my work\n").unwrap();
+        let (ok, _, stderr) = outer.run(&script("moved", "moved"), "");
+        assert!(ok, "{stderr}");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("a.txt")).unwrap(),
+            "my work\n"
+        );
+        // A branch origin does not have is an error, not a silent new branch.
+        let (ok, _, stderr) = outer.run(&script("ghost", "ghost"), "");
+        assert!(!ok);
+        assert!(stderr.contains("does not exist"), "{stderr}");
+    }
+
+    #[test]
     fn up_runs_detached_with_the_documented_flags_and_follow_replays_the_log() {
         let outer = Outer::new();
         let dc = outer.home.path().join(".devcontainers/bin");
@@ -1760,6 +1860,8 @@ mod scripts {
             &[
                 ("WANT_CRED", "1"),
                 ("CLONE_URL", "https://github.com/octo/widgets.git"),
+                ("GIT_HOST", "github.com"),
+                ("REPO_PATH", "octo/widgets.git"),
                 ("SOCKET", "/run/monoptah-git/sock"),
             ],
             GIT_CONFIG_SCRIPT,
@@ -1864,6 +1966,8 @@ mod scripts {
             &[
                 ("WANT_CRED", "1"),
                 ("CLONE_URL", "https://github.com/octo/widgets.git"),
+                ("GIT_HOST", "github.com"),
+                ("REPO_PATH", "octo/widgets.git"),
                 ("SOCKET", ""),
             ],
             GIT_CONFIG_SCRIPT,
@@ -1891,6 +1995,393 @@ mod scripts {
             config.contains(&format!("helper = cache --socket={}", socket.display())),
             "{config}"
         );
+    }
+
+    const FAKE_TOKEN: &str = "ghp_FAKEWRAPPERTOKEN123456";
+
+    /// Runs the configure script in `outer`'s HOME; returns (ok, stdout, stderr).
+    fn configure(outer: &Outer, host: &str, want: &str) -> (bool, String, String) {
+        let url = format!("https://{host}/octo/widgets.git");
+        let script = with_vars(
+            &[
+                ("WANT_CRED", want),
+                ("CLONE_URL", &url),
+                ("GIT_HOST", host),
+                ("REPO_PATH", "octo/widgets.git"),
+                ("SOCKET", ""),
+            ],
+            GIT_CONFIG_SCRIPT,
+        );
+        assert!(!script.contains(FAKE_TOKEN));
+        let mut child = Command::new("sh")
+            .arg("-s")
+            .env("HOME", outer.home.path())
+            .env("GIT_CONFIG_GLOBAL", outer.home.path().join("gitconfig"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    /// Puts [`FAKE_TOKEN`] for `octo/widgets.git` into a real cache daemon in `outer`.
+    fn cache_fake_token(outer: &Outer) -> String {
+        let script = with_vars(
+            &[("PHASE", "approve"), ("CACHE_TIMEOUT", "600")],
+            PROVISION_SCRIPT,
+        );
+        let payload = format!(
+            "protocol=https\nhost=github.com\npath=octo/widgets.git\nusername=me\npassword={FAKE_TOKEN}\n\n"
+        );
+        let (ok, _, stderr) = outer.run_c(&script, &payload);
+        assert!(ok, "{stderr}");
+        outer
+            .home
+            .path()
+            .join(".monoptah/git/sock")
+            .display()
+            .to_string()
+    }
+
+    fn stop_cache(sock: &str) {
+        let _ = Command::new("git")
+            .args(["credential-cache", "--socket", sock, "exit"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status();
+    }
+
+    /// Stops the cache daemon when dropped, so a failing test does not leave it running.
+    struct CacheGuard(String);
+    impl Drop for CacheGuard {
+        fn drop(&mut self) {
+            stop_cache(&self.0);
+        }
+    }
+
+    /// Runs `$HOME/.local/bin/gh args` with a fake real `gh` behind it; the fake reports
+    /// whether `GH_TOKEN` equals `FAKE_EXPECT` and never prints the token.
+    fn run_wrapper(outer: &Outer, args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
+        let real = outer.home.path().join("realbin");
+        std::fs::create_dir_all(&real).unwrap();
+        executable(
+            &real.join("gh"),
+            "if [ -z \"${GH_TOKEN:-}\" ]; then echo token=none; \
+             elif [ \"$GH_TOKEN\" = \"$FAKE_EXPECT\" ]; then echo token=match; \
+             else echo token=other; fi\necho \"args=$*\"",
+        );
+        let path = format!(
+            "{}:{}:{}",
+            outer.home.path().join(".local/bin").display(),
+            real.display(),
+            std::env::var("PATH").unwrap()
+        );
+        let mut cmd = Command::new(outer.home.path().join(".local/bin/gh"));
+        cmd.args(args)
+            .env("HOME", outer.home.path())
+            .env("PATH", path)
+            .env("FAKE_EXPECT", FAKE_TOKEN)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .stdin(Stdio::null());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        (
+            out.status.code().unwrap(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    #[test]
+    fn github_configure_installs_the_gh_wrapper_and_the_note() {
+        let outer = Outer::new();
+        let sock = cache_fake_token(&outer);
+        let _guard = CacheGuard(sock.clone());
+        let (ok, stdout, stderr) = configure(&outer, "github.com", "1");
+        assert!(ok, "{stderr}");
+        assert!(stdout.contains("MONOPTAH_GIT=configured"));
+        assert!(stdout.contains("MONOPTAH_GH=wrapped"));
+        assert!(stdout.contains("MONOPTAH_NOTE=written"));
+        let gh = outer.home.path().join(".local/bin/gh");
+        let text = std::fs::read_to_string(&gh).unwrap();
+        assert!(text.starts_with("#!/bin/sh\n# monoptah-gh-wrapper v1\n"));
+        assert!(!text.contains(FAKE_TOKEN));
+        assert!(text.contains(&format!("SOCK='{sock}'")));
+        assert!(text.contains("REPO_PATH='octo/widgets.git'"));
+        assert_eq!(
+            std::fs::metadata(&gh).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        let note = std::fs::read_to_string(
+            outer
+                .home
+                .path()
+                .join(".claude/rules/monoptah-cloud-git.md"),
+        )
+        .unwrap();
+        assert!(note.starts_with("<!-- monoptah-cloud-git v1 -->\n"));
+        assert!(note.contains("https://github.com/octo/widgets.git"));
+        assert!(note.contains("gh pr create") && !note.contains(FAKE_TOKEN));
+        // The wrapper reaches the fake gh with the cached token, and is not found again
+        // as the "real" gh although its directory is first on PATH.
+        let (code, stdout, stderr) = run_wrapper(&outer, &["pr", "create"], &[]);
+        assert_eq!(code, 0, "{stderr}");
+        assert!(stdout.contains("token=match"), "{stdout}");
+        assert!(stdout.contains("args=pr create"));
+        assert!(!stdout.contains(FAKE_TOKEN) && !stderr.contains(FAKE_TOKEN));
+        // Installing again replaces our own wrapper.
+        let (ok, stdout, _) = configure(&outer, "github.com", "1");
+        assert!(ok && stdout.contains("MONOPTAH_GH=wrapped"));
+        stop_cache(&sock);
+    }
+
+    #[test]
+    fn the_gh_wrapper_serves_only_its_own_repo_and_survives_a_missing_credential() {
+        let outer = Outer::new();
+        let sock = cache_fake_token(&outer);
+        let _guard = CacheGuard(sock.clone());
+        let (ok, _, stderr) = configure(&outer, "github.com", "1");
+        assert!(ok, "{stderr}");
+        // Same cache, but a wrapper baked for another repo gets no token.
+        let gh = outer.home.path().join(".local/bin/gh");
+        let text = std::fs::read_to_string(&gh).unwrap();
+        std::fs::write(&gh, text.replace("octo/widgets.git", "octo/other.git")).unwrap();
+        let (code, stdout, stderr) = run_wrapper(&outer, &["api", "user"], &[]);
+        assert_eq!(code, 0);
+        assert!(stdout.contains("token=none"), "{stdout}");
+        assert!(stderr.contains("no Git credential for github.com/octo/other.git"));
+        assert!(!stdout.contains(FAKE_TOKEN) && !stderr.contains(FAKE_TOKEN));
+        // Cache gone: the real gh still runs, without a token.
+        std::fs::write(&gh, text).unwrap();
+        stop_cache(&sock);
+        let (code, stdout, stderr) = run_wrapper(&outer, &["api", "user"], &[]);
+        assert_eq!(code, 0);
+        assert!(stdout.contains("token=none"), "{stdout}");
+        assert!(stderr.contains("no Git credential for github.com/octo/widgets.git"));
+    }
+
+    #[test]
+    fn the_gh_wrapper_refuses_commands_that_print_or_store_the_token() {
+        let outer = Outer::new();
+        let sock = cache_fake_token(&outer);
+        let _guard = CacheGuard(sock.clone());
+        let (ok, _, stderr) = configure(&outer, "github.com", "1");
+        assert!(ok, "{stderr}");
+        for args in [
+            &["auth", "token"][..],
+            &["auth", "status", "-t"],
+            &["auth", "status", "--show-token"],
+            &["auth", "status", "-at"],
+            &["auth", "status", "-ta"],
+            &["auth", "git-credential", "get"],
+            &["auth", "login"],
+            &["auth", "setup-git"],
+        ] {
+            let (code, stdout, stderr) = run_wrapper(&outer, args, &[]);
+            assert_eq!(code, 2, "{args:?}");
+            assert!(stdout.is_empty(), "{args:?}: {stdout}");
+            assert!(!stderr.contains(FAKE_TOKEN));
+        }
+        // Other auth commands pass through, also a short flag that carries a value.
+        let (code, stdout, _) = run_wrapper(&outer, &["auth", "status"], &[]);
+        assert_eq!(code, 0);
+        assert!(stdout.contains("token=match"));
+        let (code, stdout, _) = run_wrapper(&outer, &["auth", "status", "-hgithub.com"], &[]);
+        assert_eq!(code, 0, "{stdout}");
+        assert!(stdout.contains("token=match"));
+        stop_cache(&sock);
+    }
+
+    #[test]
+    fn the_gh_wrapper_respects_an_explicit_token_and_reports_a_missing_gh() {
+        let outer = Outer::new();
+        let sock = cache_fake_token(&outer);
+        let _guard = CacheGuard(sock.clone());
+        let (ok, _, stderr) = configure(&outer, "github.com", "1");
+        assert!(ok, "{stderr}");
+        let (code, stdout, _) = run_wrapper(&outer, &["api", "user"], &[("GH_TOKEN", "mine")]);
+        assert_eq!(code, 0);
+        assert!(stdout.contains("token=other"), "{stdout}");
+        let (code, stdout, _) = run_wrapper(&outer, &["api", "user"], &[("GITHUB_TOKEN", "mine")]);
+        assert_eq!(code, 0);
+        assert!(
+            stdout.contains("token=none"),
+            "GH_TOKEN stays unset: {stdout}"
+        );
+        // No real gh on PATH: exit 127 with a clear error.
+        let out = Command::new(outer.home.path().join(".local/bin/gh"))
+            .env("HOME", outer.home.path())
+            .env("PATH", outer.home.path().join(".local/bin"))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(127));
+        assert!(String::from_utf8_lossy(&out.stderr)
+            .contains("The GitHub CLI (gh) is not installed in this sandbox."));
+        stop_cache(&sock);
+    }
+
+    #[test]
+    fn a_foreign_gh_and_a_foreign_note_are_left_alone() {
+        let outer = Outer::new();
+        let bin = outer.home.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("gh"), "#!/bin/sh\necho mine\n").unwrap();
+        let rules = outer.home.path().join(".claude/rules");
+        std::fs::create_dir_all(&rules).unwrap();
+        std::fs::write(rules.join("monoptah-cloud-git.md"), "my own rule\n").unwrap();
+        let (ok, stdout, stderr) = configure(&outer, "github.com", "1");
+        assert!(ok, "{stderr}");
+        assert!(stdout.contains("[monoptah] ~/.local/bin/gh is not ours; leaving it"));
+        assert!(!stdout.contains("MONOPTAH_GH=wrapped") && !stdout.contains("MONOPTAH_NOTE"));
+        assert_eq!(
+            std::fs::read_to_string(bin.join("gh")).unwrap(),
+            "#!/bin/sh\necho mine\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(rules.join("monoptah-cloud-git.md")).unwrap(),
+            "my own rule\n"
+        );
+        // Unbinding leaves unmarked files too.
+        let (ok, _, _) = configure(&outer, "github.com", "0");
+        assert!(ok);
+        assert!(bin.join("gh").exists() && rules.join("monoptah-cloud-git.md").exists());
+    }
+
+    #[test]
+    fn the_gh_wrapper_skips_another_copy_of_itself_on_path() {
+        let outer = Outer::new();
+        let _guard = CacheGuard(cache_fake_token(&outer));
+        let (ok, _, stderr) = configure(&outer, "github.com", "1");
+        assert!(ok, "{stderr}");
+        let copy = outer.home.path().join("copy");
+        std::fs::create_dir_all(&copy).unwrap();
+        std::fs::copy(outer.home.path().join(".local/bin/gh"), copy.join("gh")).unwrap();
+        // The copy comes before the fake real gh on PATH: it must be skipped, not exec'd.
+        let real = outer.home.path().join("realbin");
+        std::fs::create_dir_all(&real).unwrap();
+        executable(&real.join("gh"), "echo token=${GH_TOKEN:+set}");
+        let out = Command::new(outer.home.path().join(".local/bin/gh"))
+            .env("HOME", outer.home.path())
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}:{}",
+                    copy.display(),
+                    real.display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "token=set");
+    }
+
+    #[test]
+    fn a_failing_wrapper_or_note_never_fails_the_configure_step() {
+        // A dangling ~/.claude/rules symlink: the note can not be written.
+        let outer = Outer::new();
+        std::fs::create_dir_all(outer.home.path().join(".claude")).unwrap();
+        std::os::unix::fs::symlink(
+            "/nonexistent-monoptah-dir/x",
+            outer.home.path().join(".claude/rules"),
+        )
+        .unwrap();
+        let (ok, stdout, stderr) = configure(&outer, "github.com", "1");
+        assert!(ok, "{stderr}");
+        assert!(stdout.contains("MONOPTAH_GIT=configured"));
+        assert!(
+            stdout.contains("could not write the agent note"),
+            "{stdout}"
+        );
+        // A read-only ~/.local/bin: the wrapper can not be written (skipped as root, which
+        // ignores permissions).
+        let outer = Outer::new();
+        let bin = outer.home.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let (ok, stdout, stderr) = configure(&outer, "github.com", "1");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(ok, "{stderr}");
+        assert!(stdout.contains("MONOPTAH_GIT=configured"));
+        if !bin.join("gh").exists() {
+            assert!(
+                stdout.contains("could not install the gh wrapper"),
+                "{stdout}"
+            );
+            assert!(
+                std::fs::read_dir(&bin).unwrap().next().is_none(),
+                "no temp file left"
+            );
+        }
+    }
+
+    #[test]
+    fn gitlab_removes_a_wrapper_left_by_another_repo() {
+        let outer = Outer::new();
+        let (ok, _, stderr) = configure(&outer, "github.com", "1");
+        assert!(ok, "{stderr}");
+        assert!(outer.home.path().join(".local/bin/gh").exists());
+        let (ok, stdout, stderr) = configure(&outer, "gitlab.com", "1");
+        assert!(ok, "{stderr}");
+        assert!(stdout.contains("MONOPTAH_GH=removed"));
+        assert!(!outer.home.path().join(".local/bin/gh").exists());
+    }
+
+    #[test]
+    fn gitlab_gets_the_note_but_no_wrapper() {
+        let outer = Outer::new();
+        let (ok, stdout, stderr) = configure(&outer, "gitlab.com", "1");
+        assert!(ok, "{stderr}");
+        assert!(stdout.contains("MONOPTAH_NOTE=written") && !stdout.contains("MONOPTAH_GH"));
+        assert!(!outer.home.path().join(".local/bin/gh").exists());
+        let note = std::fs::read_to_string(
+            outer
+                .home
+                .path()
+                .join(".claude/rules/monoptah-cloud-git.md"),
+        )
+        .unwrap();
+        assert!(note.contains("https://gitlab.com/octo/widgets.git"));
+        assert!(note.contains("not `glab`") && !note.contains("gh pr"));
+    }
+
+    #[test]
+    fn unbinding_the_credential_removes_only_our_files() {
+        let outer = Outer::new();
+        let (ok, _, stderr) = configure(&outer, "github.com", "1");
+        assert!(ok, "{stderr}");
+        let gh = outer.home.path().join(".local/bin/gh");
+        let note = outer
+            .home
+            .path()
+            .join(".claude/rules/monoptah-cloud-git.md");
+        assert!(gh.exists() && note.exists());
+        let (ok, stdout, stderr) = configure(&outer, "github.com", "0");
+        assert!(ok, "{stderr}");
+        assert!(stdout.contains("MONOPTAH_GH=removed") && stdout.contains("MONOPTAH_NOTE=removed"));
+        assert!(!gh.exists() && !note.exists());
+        // Nothing to remove is fine.
+        let (ok, _, _) = configure(&outer, "github.com", "0");
+        assert!(ok);
     }
 
     #[test]
@@ -2344,6 +2835,74 @@ fn a_cancelled_reconnect_stops_without_touching_the_host() {
         .unwrap_err();
     assert_eq!(error, START_ABORTED);
     assert!(fx.host.log.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_sandbox_start_runs_the_claude_setup_and_a_reconnect_never_does() {
+    use super::claude_setup::KitSeams;
+    use super::kit::KitRoots;
+    use super::kit_prefs::CloudKitPrefs;
+    let kit_home = tempfile::tempdir().unwrap();
+    let home = std::fs::canonicalize(kit_home.path()).unwrap();
+    std::fs::create_dir_all(home.join(".claude/skills/review")).unwrap();
+    std::fs::write(home.join(".claude/skills/review/SKILL.md"), "# review").unwrap();
+    let roots = KitRoots {
+        account_dir: None,
+        claude_home: home.join(".claude"),
+        project: home.join("work"),
+        key_dir: Some(home.join("app-data")),
+        home,
+    };
+    let prefs = CloudKitPrefs {
+        enabled: true,
+        notice_acknowledged: true,
+        selection: None,
+        ..Default::default()
+    };
+    let mut fx = fx();
+    fx.svc = fx.svc.with_kit_seams(KitSeams {
+        prefs: Arc::new(move || prefs.clone()),
+        roots: Arc::new(move |_, _| Ok(roots.clone())),
+    });
+    let (session, record) = fx.begin().unwrap();
+    assert!(record.created);
+    let (result, events) = fx.run(session.id);
+    // The scripted Host answers every kit call with a project reply, so the step only
+    // warns; it still ran, once, and the start is Ready.
+    result.unwrap();
+    let Some(StartEvent::Updated(last)) = events.iter().rev().nth(1) else {
+        panic!("{events:?}");
+    };
+    assert_eq!(status(last, StepKind::ClaudeSetup), StepStatus::Done);
+    let kit_calls = |fx: &Fx| {
+        fx.host
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.contains(" kit.") || l.contains(" uploads."))
+            .count()
+    };
+    assert!(kit_calls(&fx) > 0);
+    // A user reconnect restores the sandbox; it never sends the kit or credentials again.
+    super::docker_config::save(&fx.store.lock().unwrap(), "/Users/me/widgets", &config()).unwrap();
+    fx.sbx.set_state(&sandbox_id(&fx), "stopped");
+    fx.reset();
+    fx.reconnect(session.id).0.unwrap();
+    assert_eq!(kit_calls(&fx), 0);
+}
+
+#[test]
+fn a_sandbox_start_records_the_kit_choice_in_its_first_record() {
+    let fx = fx();
+    let (session, record) = fx
+        .svc
+        .begin_sandbox_start_with_kit("/Users/me/widgets", &config(), "fix/login", "claude", false)
+        .unwrap();
+    assert!(record.kit_off);
+    assert!(fx.record(session.id).unwrap().kit_off);
+    let (session, record) = fx.begin().unwrap();
+    assert!(!record.kit_off && !fx.record(session.id).unwrap().kit_off);
 }
 
 // ------------------------------------------------------------- call sites
@@ -3256,6 +3815,27 @@ mod files_only {
     }
 
     #[test]
+    fn a_stored_remote_form_worktree_is_refused_like_a_plain_path() {
+        let a = archivable();
+        a.recreate();
+        {
+            let store = a.fx.store.lock().unwrap();
+            let mut settings = store.agent_settings(a.id).unwrap().unwrap_or_default();
+            // The form the store keeps in production: remote://<env>/<path>.
+            settings.worktree_cwd =
+                Some("remote://env-1/workspaces/widgets-worktrees/fix-login".into());
+            settings.worktree_removed = false;
+            store.save_agent_settings(a.id, &settings).unwrap();
+        }
+        let error = a.convert().0.unwrap_err();
+        assert!(
+            error.contains("worktree lived only in the container"),
+            "{error}"
+        );
+        assert!(a.archive_calls().is_empty());
+    }
+
+    #[test]
     fn a_deleted_sandbox_is_not_archived_as_files_only() {
         let a = archivable();
         a.fx.sbx.remove(&sandbox_id(&a.fx));
@@ -3399,4 +3979,144 @@ fn only_a_deleted_or_recreated_sandbox_is_unrecoverable() {
         "Sandbox is stopping. Try again in a minute."
     ));
     assert!(!is_sandbox_unrecoverable("Could not reach sbx"));
+}
+
+#[test]
+fn a_start_upgrades_the_host_with_the_connect_prelude_and_leaks_no_secret() {
+    let fx = fx();
+    *fx.host.upgrade_leaks.lock().unwrap() = true;
+    let (session, _) = fx.begin().unwrap();
+    let (result, events) = fx.run(session.id);
+    result.unwrap();
+    let upgrades = fx.host.upgrades.lock().unwrap().clone();
+    assert_eq!(upgrades.len(), 1, "{upgrades:?}");
+    // The SAME prelude the bootstrap got on stdin.
+    let prelude = ClaudeAuth::new("CLAUDE_CODE_OAUTH_TOKEN", SECRET.into()).prelude();
+    assert_eq!(upgrades[0].1.as_deref(), Some(prelude.as_str()));
+    assert_eq!(upgrades[0].2.as_deref(), Some(SECRET));
+    assert!(fx
+        .shell
+        .call("bootstrap")
+        .stdin
+        .starts_with(prelude.as_str()));
+    // After the pairing and before the project opens: inside the connect flow.
+    let log = fx.host.log.lock().unwrap().clone();
+    let at = |what: &str| log.iter().position(|l| l.contains(what)).unwrap();
+    assert!(
+        at("connect") < at("upgrade") && at("upgrade") < at("projects.open"),
+        "{log:?}"
+    );
+    // The status line is shown and the secret never reaches what the user can see.
+    let shown = format!("{events:?}");
+    assert!(shown.contains("Updating Monoptah Host"), "{shown}");
+    assert!(
+        !shown.contains(SECRET) && !shown.contains("sk-ant"),
+        "{shown}"
+    );
+    let stored = format!("{:?}", fx.record(session.id));
+    assert!(!stored.contains(SECRET));
+}
+
+#[test]
+fn a_reconnect_upgrades_the_host_with_the_connect_prelude_and_leaks_no_secret() {
+    let (fx, id, _) = started();
+    fx.host.upgrades.lock().unwrap().clear();
+    *fx.host.upgrade_leaks.lock().unwrap() = true;
+    fx.sbx.set_state(&sandbox_id(&fx), "stopped");
+    fx.reset();
+    let (result, lines) = fx.reconnect(id);
+    result.unwrap();
+    let upgrades = fx.host.upgrades.lock().unwrap().clone();
+    assert_eq!(upgrades.len(), 1, "{upgrades:?}");
+    let prelude = ClaudeAuth::new("CLAUDE_CODE_OAUTH_TOKEN", SECRET.into()).prelude();
+    assert_eq!(upgrades[0].1.as_deref(), Some(prelude.as_str()));
+    assert!(lines.iter().any(|l| l.contains("Updating Monoptah Host")));
+    assert!(!lines.iter().any(|l| l.contains(SECRET)), "{lines:?}");
+}
+
+// ------------------------------------------- lifecycle deferred by a move
+
+/// The last record a start published (the persisted one is removed when the start is ready).
+fn last_record(events: &[StartEvent]) -> StartRecord {
+    events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            StartEvent::Updated(record) => Some(record.clone()),
+            _ => None,
+        })
+        .unwrap()
+}
+
+#[test]
+fn a_move_started_sandbox_defers_its_lifecycle_commands() {
+    let fx = fx();
+    let (session, began) = fx
+        .svc
+        .begin_sandbox_start_for_move("/Users/me/widgets", &config(), "fix/login", "claude", true)
+        .unwrap();
+    let name = began.sandbox.clone().unwrap();
+    let (result, events) = fx.run(session.id);
+    result.unwrap();
+    assert!(
+        !fx.shell.tags().contains(&"mode:lifecycle".to_string()),
+        "{:?}",
+        fx.shell.tags()
+    );
+    let record = last_record(&events);
+    let step = record.step(StepKind::LifecycleCommands);
+    assert_eq!(step.status, StepStatus::Skipped);
+    assert_eq!(
+        step.detail.as_deref(),
+        Some("Starts after the move restores the code")
+    );
+    // What the move needs to run them later: the start record is gone once the start is
+    // ready, so it is read by the sandbox name until the move clears it.
+    let deferred = fx.svc.peek_deferred_lifecycle(&name).unwrap();
+    assert!(
+        fx.svc.peek_deferred_lifecycle(&name).is_some(),
+        "peek keeps it"
+    );
+    fx.svc.clear_deferred_lifecycle(&name);
+    assert!(fx.svc.peek_deferred_lifecycle(&name).is_none());
+    assert_eq!(deferred.sandbox_id, NEW_ID);
+    assert_eq!(deferred.workspace, WORKSPACE);
+    assert!(deferred.mount && !deferred.started);
+    // Running them later is the same script in lifecycle mode.
+    fx.svc
+        .start_deferred_lifecycle(&deferred, &|| false)
+        .unwrap();
+    let call = fx.shell.call("mode:lifecycle");
+    assert_eq!(call.id, NEW_ID);
+    assert!(call.stdin.contains(WORKSPACE), "{}", call.stdin);
+    assert!(call.stdin.contains("MOUNT='1'"), "{}", call.stdin);
+}
+
+#[test]
+fn an_ordinary_sandbox_start_still_runs_its_lifecycle_commands() {
+    let fx = fx();
+    let (session, began) = fx.begin().unwrap();
+    let name = began.sandbox.clone().unwrap();
+    let (result, events) = fx.run(session.id);
+    result.unwrap();
+    assert!(fx.shell.tags().contains(&"mode:lifecycle".to_string()));
+    assert_eq!(
+        last_record(&events)
+            .step(StepKind::LifecycleCommands)
+            .detail
+            .as_deref(),
+        Some("Running in the background")
+    );
+    assert!(fx.svc.peek_deferred_lifecycle(&name).is_none());
+}
+
+#[test]
+fn a_start_record_without_the_deferral_field_loads_as_an_ordinary_start() {
+    let fx = fx();
+    let (session, _) = fx.begin().unwrap();
+    let mut value =
+        serde_json::to_value(fx.record(session.id).unwrap().sandbox_start.unwrap()).unwrap();
+    value.as_object_mut().unwrap().remove("deferLifecycle");
+    let start: super::docker_start::SandboxStart = serde_json::from_value(value).unwrap();
+    assert!(!start.defer_lifecycle);
 }

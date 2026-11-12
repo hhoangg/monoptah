@@ -621,6 +621,261 @@ fn switching_project_in_the_picker_clears_the_selection(cx: &mut TestAppContext)
         .unwrap();
 }
 
+fn cloud_window(cx: &mut TestAppContext) -> WindowHandle<SettingsView> {
+    let window = window(Section::General, cx);
+    cx.update(|cx| {
+        cx.set_global(crate::cloud_kit_ui::KitScanner(
+            crate::cloud_kit_ui::fixture::scan,
+        ))
+    });
+    window
+        .update(cx, |view, _, cx| {
+            view.selected_project = "/work/app".into();
+            view.select_section(Section::Cloud, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.refresh().unwrap();
+    window
+}
+
+fn click(visual: &mut VisualTestContext, selector: &'static str) {
+    let bounds = visual
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("{selector} is not drawn"));
+    visual.simulate_click(bounds.center(), Default::default());
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+}
+
+#[gpui::test]
+fn the_cloud_page_checks_everything_compatible_and_refuses_local_only_items(
+    cx: &mut TestAppContext,
+) {
+    let window = cloud_window(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+
+    // Defaults: nothing stored, the compatible skill is checked.
+    window
+        .update(visual, |view, _, _| {
+            assert_eq!(view.prefs.cloud_kit.selection, None);
+            assert!(matches!(view.cloud.load, pages::CloudLoad::Ready(_)));
+        })
+        .unwrap();
+    assert!(
+        visual
+            .debug_bounds("cloud-kit-check-skill:user:review")
+            .is_some()
+    );
+
+    // Unchecking turns the defaults into an explicit list of ids.
+    click(visual, "cloud-kit-row-skill:user:review");
+    window
+        .update(visual, |view, _, _| {
+            let selection = view.prefs.cloud_kit.selection.clone().unwrap();
+            assert!(!selection.contains("skill:user:review"));
+            assert!(selection.contains("skill:user:deploy"));
+            assert!(selection.contains("plugin:fmt@market"));
+        })
+        .unwrap();
+
+    // MCP tab: a local-only server is drawn, with a reason, and clicking it changes nothing.
+    click(visual, "settings-cloud-kit-tab-mcp");
+    let before = window
+        .update(visual, |view, _, _| view.prefs.cloud_kit.clone())
+        .unwrap();
+    assert!(visual.debug_bounds("cloud-kit-row-mcp:user:mine").is_some());
+    click(visual, "cloud-kit-row-mcp:user:mine");
+    click(visual, "cloud-kit-check-mcp:user:mine");
+    window
+        .update(visual, |view, _, _| {
+            assert_eq!(view.prefs.cloud_kit, before);
+            let selection = view.prefs.cloud_kit.selection.as_ref().unwrap();
+            assert!(!selection.contains("mcp:user:mine"));
+            assert!(
+                selection.contains("mcp:user:github"),
+                "secrets are on by default"
+            );
+            assert!(
+                selection.contains("mcp:user:linear"),
+                "OAuth-style servers are on by default"
+            );
+        })
+        .unwrap();
+
+    // A selectable server toggles.
+    click(visual, "cloud-kit-row-mcp:user:github");
+    window
+        .update(visual, |view, _, _| {
+            let selection = view.prefs.cloud_kit.selection.as_ref().unwrap();
+            assert!(!selection.contains("mcp:user:github"));
+            // What is stored is ids only.
+            let saved = serde_json::to_string(&view.prefs).unwrap();
+            assert!(!saved.contains(crate::cloud_kit_ui::fixture::FAKE_SECRET));
+        })
+        .unwrap();
+
+    // Back to the defaults.
+    click(visual, "cloud-kit-reset");
+    window
+        .update(visual, |view, _, _| {
+            assert_eq!(view.prefs.cloud_kit.selection, None);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_instructions_switch_shows_the_source_and_what_stays_behind(cx: &mut TestAppContext) {
+    let window = cloud_window(cx);
+    cx.update(|cx| {
+        cx.set_global(crate::cloud_kit_ui::KitScanner(
+            crate::cloud_kit_ui::fixture::scan_with_instructions,
+        ))
+    });
+    window
+        .update(cx, |view, _, cx| view.refresh_cloud(cx))
+        .unwrap();
+    cx.run_until_parked();
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+
+    // On by default, and the import that stays behind is listed.
+    window
+        .update(visual, |view, _, _| {
+            assert!(view.prefs.cloud_kit.instructions)
+        })
+        .unwrap();
+    assert!(
+        visual
+            .debug_bounds("cloud-kit-instructions-warning-0")
+            .is_some()
+    );
+    click(visual, "settings-toggle-cloud-kit-instructions");
+    window
+        .update(visual, |view, _, _| {
+            assert!(!view.prefs.cloud_kit.instructions)
+        })
+        .unwrap();
+    click(visual, "settings-toggle-cloud-kit-instructions");
+    window
+        .update(visual, |view, _, _| {
+            assert!(view.prefs.cloud_kit.instructions)
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_instructions_switch_is_disabled_without_a_claude_md(cx: &mut TestAppContext) {
+    let window = cloud_window(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    click(visual, "settings-toggle-cloud-kit-instructions");
+    window
+        .update(visual, |view, _, _| {
+            assert!(view.prefs.cloud_kit.instructions)
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_instructions_switch_follows_the_preference_while_the_scan_has_not_answered(
+    cx: &mut TestAppContext,
+) {
+    let window = cloud_window(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    window
+        .update(visual, |view, _, cx| {
+            view.cloud.load = pages::CloudLoad::Loading;
+            cx.notify();
+        })
+        .unwrap();
+    visual.refresh().unwrap();
+    // Not disabled: a click turns the preference off, and nothing claims there is no CLAUDE.md.
+    click(visual, "settings-toggle-cloud-kit-instructions");
+    window
+        .update(visual, |view, _, _| {
+            assert!(!view.prefs.cloud_kit.instructions)
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_cloud_notice_shows_once_and_is_stored_as_acknowledged(cx: &mut TestAppContext) {
+    let window = cloud_window(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    assert!(visual.debug_bounds("cloud-kit-notice").is_none());
+
+    // First time on: the notice opens, and the kit stays off until it is accepted.
+    click(visual, "settings-toggle-cloud-kit-enabled");
+    assert!(visual.debug_bounds("cloud-kit-notice").is_some());
+    window
+        .update(visual, |view, _, _| {
+            assert!(!view.prefs.cloud_kit.enabled);
+            assert!(!view.prefs.cloud_kit.notice_acknowledged);
+        })
+        .unwrap();
+
+    // Cancel leaves everything as it was.
+    click(visual, "cloud-kit-notice-cancel");
+    assert!(visual.debug_bounds("cloud-kit-notice").is_none());
+    window
+        .update(visual, |view, _, _| assert!(!view.prefs.cloud_kit.enabled))
+        .unwrap();
+
+    click(visual, "settings-toggle-cloud-kit-enabled");
+    click(visual, "cloud-kit-notice-accept");
+    assert!(visual.debug_bounds("cloud-kit-notice").is_none());
+    window
+        .update(visual, |view, _, _| {
+            assert!(view.prefs.cloud_kit.enabled);
+            assert!(view.prefs.cloud_kit.notice_acknowledged);
+        })
+        .unwrap();
+
+    // Off and on again: no second notice.
+    click(visual, "settings-toggle-cloud-kit-enabled");
+    window
+        .update(visual, |view, _, _| assert!(!view.prefs.cloud_kit.enabled))
+        .unwrap();
+    click(visual, "settings-toggle-cloud-kit-enabled");
+    assert!(visual.debug_bounds("cloud-kit-notice").is_none());
+    window
+        .update(visual, |view, _, _| assert!(view.prefs.cloud_kit.enabled))
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_cloud_page_has_a_refresh_button_and_stays_when_preferences_change(cx: &mut TestAppContext) {
+    let window = cloud_window(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    assert!(visual.debug_bounds("refresh-cloud").is_some());
+
+    let on = Preferences::default();
+    window
+        .update(visual, |view, _, cx| view.set_preferences(&on, cx))
+        .unwrap();
+    window
+        .update(visual, |view, _, cx| {
+            assert_eq!(view.section, Section::Cloud);
+            view.set_preferences(&Preferences::default(), cx);
+            assert_eq!(
+                view.section,
+                Section::Cloud,
+                "the page has no flag any more"
+            );
+        })
+        .unwrap();
+}
+
 /// The DEFAULT badge marks the account new sessions use, and the pin button on
 /// another account makes that one the default and moves the badge to it.
 #[gpui::test]

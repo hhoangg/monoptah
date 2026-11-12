@@ -150,7 +150,7 @@ mod tests {
         visual.simulate_click(center, Default::default());
         visual.simulate_input("sk-ant");
         visual.write_to_clipboard(gpui::ClipboardItem::new_string("-pasted".into()));
-        visual.simulate_keystrokes("cmd-v");
+        visual.simulate_keystrokes("secondary-v");
         visual.run_until_parked();
         assert_eq!(token(&window, cx), "sk-ant-pasted");
     }

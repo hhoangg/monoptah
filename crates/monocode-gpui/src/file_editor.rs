@@ -12,11 +12,22 @@ use gpui::{
     ImageFormat, ImageSource, KeyBinding, ObjectFit, PromptLevel, RenderImage, Role, SharedString,
     Subscription, Task, Window, actions, div, img, prelude::*, px, rgb,
 };
-use monocode_core::files::document::{self, Document, TextDocument};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use monocode_core::files::{
+    document::{self, Document, TextDocument},
+    remote_write::sha256_hex,
+};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 pub(crate) mod blame;
 mod chrome;
+mod conflict;
 mod diff;
 pub(crate) mod media;
 #[cfg(test)]
@@ -143,6 +154,13 @@ pub(crate) enum FileEvent {
     },
 }
 
+/// Largest remote text file that the poll keeps refreshing.
+const REMOTE_POLL_BYTES: usize = 256 * 1024;
+
+fn poll_reloads(remote: bool, open_text_bytes: Option<usize>) -> bool {
+    !remote || open_text_bytes.is_some_and(|len| len <= REMOTE_POLL_BYTES)
+}
+
 pub(crate) struct FileEditor {
     pub path: String,
     git: Entity<ProjectGit>,
@@ -188,8 +206,25 @@ pub(crate) struct FileEditor {
     svg_render: Option<Task<()>>,
     unsupported: Option<String>,
     error: Option<String>,
+    /// A remote save the Host refused because the file changed there; the dialog is open.
+    conflict: Option<conflict::Conflict>,
+    io: conflict::FileIo,
+    /// SHA-256 of the bytes of the last remote save that was sent and not confirmed: its
+    /// write may have landed (a timeout), which a later conflict must not mistake for
+    /// someone else's edit.
+    last_attempt: Option<String>,
+    /// The attempt before the one in flight: what a conflict is compared with.
+    prior_attempt: Option<String>,
+    /// The save that follows adopting our own earlier write is under way.
+    own_retry: bool,
+    /// A reload was asked for while the compare dialog was open; it is asked again after.
+    pending_reload: bool,
     disk_changed: bool,
     loading: bool,
+    /// Progress of a remote read in bytes (done, total; total 0 until the first chunk), and
+    /// the flag that stops it after the chunk in flight.
+    read_progress: Arc<(AtomicU64, AtomicU64)>,
+    read_cancel: Arc<AtomicBool>,
     pub saving: bool,
     pub dirty: bool,
     visible: bool,
@@ -289,7 +324,9 @@ impl FileEditor {
                 if this
                     .update(cx, |this, cx| {
                         if this.visible && !this.saving {
-                            this.load(false, cx);
+                            if this.poll_reloads() {
+                                this.load(false, cx);
+                            }
                             this.refresh_git(cx);
                         }
                     })
@@ -303,6 +340,8 @@ impl FileEditor {
             if let Some(image) = this.svg_preview.take() {
                 cx.drop_image(image, None);
             }
+            // A closed editor stops a remote read after the chunk in flight.
+            this.read_cancel.store(true, Ordering::Relaxed);
         })
         .detach();
         Self {
@@ -346,8 +385,16 @@ impl FileEditor {
             svg_render: None,
             unsupported: None,
             error: None,
+            conflict: None,
+            io: Default::default(),
+            last_attempt: None,
+            prior_attempt: None,
+            own_retry: false,
+            pending_reload: false,
             disk_changed: false,
             loading: false,
+            read_progress: Arc::default(),
+            read_cancel: Arc::new(AtomicBool::new(false)),
             saving: false,
             dirty: false,
             visible: false,
@@ -408,6 +455,34 @@ impl FileEditor {
             self.catch_up_blame(cx);
         }
     }
+    /// Whether the 2 s poll may read the file again.
+    ///
+    /// A local file is cheap to re-read. A remote one costs a round trip per 384 KB chunk, so
+    /// the poll only re-reads a small text file that is already open; a cancelled read, a
+    /// read error, an image, a video, or a file the editor refused stays as it is until the
+    /// user presses Retry, shows the tab again, or saves (a save re-checks the disk).
+    fn poll_reloads(&self) -> bool {
+        poll_reloads(
+            monocode_core::files::remote::is_remote(std::path::Path::new(&self.path)),
+            self.document.as_ref().map(|doc| doc.disk.len()),
+        )
+    }
+    fn read_total(&self) -> u64 {
+        self.read_progress.1.load(Ordering::Relaxed)
+    }
+    /// The file lives on another machine (a cloud workspace).
+    fn is_remote_path(&self) -> bool {
+        monocode_core::files::remote::is_remote(std::path::Path::new(&self.path))
+    }
+    /// "Opening file…", with the percentage once a chunked remote read has started.
+    fn opening_text(&self) -> String {
+        let total = self.read_total();
+        if !self.loading || total == 0 {
+            return "Opening file…".into();
+        }
+        let done = self.read_progress.0.load(Ordering::Relaxed).min(total);
+        format!("Opening file… {}%", done * 100 / total)
+    }
     fn is_markdown(&self) -> bool {
         matches!(
             PathBuf::from(&self.path)
@@ -417,14 +492,45 @@ impl FileEditor {
         )
     }
     fn load(&mut self, force: bool, cx: &mut Context<Self>) {
-        if self.loading || self.saving {
+        // The dialog compares two versions: neither may change under it.
+        if self.loading || self.saving || self.conflict.is_some() {
             return;
         }
         self.loading = true;
         let path = PathBuf::from(&self.path);
-        let work = cx
-            .background_executor()
-            .spawn(async move { document::read_document(&path).and_then(media::prepare_document) });
+        let remote = monocode_core::files::remote::is_remote(&path);
+        let progress = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.read_progress = progress.clone();
+        self.read_cancel = cancel.clone();
+        let work = cx.background_executor().spawn(async move {
+            document::read_document_with(
+                &path,
+                &mut |done, total| {
+                    progress.0.store(done, Ordering::Relaxed);
+                    progress.1.store(total, Ordering::Relaxed);
+                },
+                &cancel,
+            )
+            .and_then(media::prepare_document)
+        });
+        if remote {
+            // The read runs on a worker, so poll its progress for the "Opening" line.
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(200))
+                        .await;
+                    let Ok(true) = this.update(cx, |this, cx| {
+                        cx.notify();
+                        this.loading
+                    }) else {
+                        break;
+                    };
+                }
+            })
+            .detach();
+        }
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
@@ -456,6 +562,7 @@ impl FileEditor {
                             input.reload_file(text, !first && !force, cx);
                         });
                         this.dirty = false;
+                        this.sync_read_only(cx);
                         this.sync_blame_options(cx);
                         this.request_blame(cx);
                         if first && !this.show_diff && (this.is_markdown() || this.is_svg()) {
@@ -806,6 +913,7 @@ impl FileEditor {
         self.autosave = None;
         if !self.dirty
             || self.disk_changed
+            || self.conflict.is_some()
             || !cx
                 .try_global::<crate::settings::Preferences>()
                 .is_some_and(|p| p.autosave)
@@ -817,6 +925,7 @@ impl FileEditor {
             let _ = this.update(cx, |this, cx| {
                 if this.dirty
                     && !this.disk_changed
+                    && this.conflict.is_none()
                     && cx
                         .try_global::<crate::settings::Preferences>()
                         .is_some_and(|p| p.autosave)
@@ -857,7 +966,18 @@ impl FileEditor {
         }));
     }
     pub(crate) fn save(&mut self, cx: &mut Context<Self>) {
-        if self.saving || self.input.read(cx).is_composing() || self.document.is_none() {
+        if self.saving {
+            return;
+        }
+        // A save that cannot start must not leave a pending close waiting for it.
+        if self.conflict.is_some()
+            || self.input.read(cx).is_composing()
+            || self
+                .document
+                .as_ref()
+                .is_none_or(|doc| doc.read_only.is_some())
+        {
+            cx.emit(FileEvent::SaveFailed);
             return;
         }
         let source = self.input.read(cx).content.clone();
@@ -892,51 +1012,98 @@ impl FileEditor {
                     }
                 });
             }
-            let Ok(Some((path, doc, saved))) = this.update(cx, |this, cx| {
+            let Ok(Some((path, doc, saved, save))) = this.update(cx, |this, cx| {
                 if this.input.read(cx).is_composing() {
                     this.saving = false;
                     this.schedule_autosave(cx);
                     cx.emit(FileEvent::SaveFailed);
                     return None;
                 }
-                Some((
-                    PathBuf::from(&this.path),
-                    this.document.clone()?,
-                    this.input.read(cx).content.to_string(),
-                ))
+                let doc = this.document.clone()?;
+                let text = this.input.read(cx).content.to_string();
+                if this.is_remote_path() {
+                    if text == doc.text {
+                        // Nothing to save: no conditional write for an unchanged buffer.
+                        this.saving = false;
+                        cx.emit(FileEvent::Saved);
+                        cx.notify();
+                        return None;
+                    }
+                    this.prior_attempt = this.last_attempt.replace(sha256_hex(&doc.encode(&text)));
+                }
+                Some((PathBuf::from(&this.path), doc, text, this.io.save.clone()))
             }) else {
                 return;
             };
             let text = saved.clone();
             let result = cx
                 .background_executor()
-                .spawn(async move { document::save_document(&path, &doc, &text) })
+                .spawn(async move { save(&path, &doc, &text) })
                 .await;
-            let _ = this.update(cx, |this, cx| {
-                this.saving = false;
-                match result {
-                    Ok(disk) => {
-                        if let Some(doc) = &mut this.document {
-                            doc.disk = disk;
-                            doc.text = saved;
-                        }
-                        this.disk_changed = false;
-                        this.edited(cx);
-                        this.git.update(cx, |git, cx| git.changed(cx));
-                        cx.emit(FileEvent::Saved);
-                    }
-                    Err(error) => {
-                        this.error = Some(error);
-                        cx.emit(FileEvent::SaveFailed);
-                    }
-                }
-                cx.notify();
-            });
+            let _ = this.update(cx, |this, cx| this.finish_save(result, saved, cx));
         })
         .detach();
         cx.notify();
     }
+    /// Applies the outcome of a save. A refusal because the file changed on the host opens
+    /// the compare dialog; any other failure leaves the text in the editor with the error.
+    fn finish_save(
+        &mut self,
+        result: Result<Vec<u8>, String>,
+        saved: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.saving = false;
+        match result {
+            Ok(disk) => {
+                self.last_attempt = None;
+                self.prior_attempt = None;
+                self.own_retry = false;
+                if let Some(doc) = &mut self.document {
+                    doc.disk = disk;
+                    doc.text = saved;
+                }
+                self.disk_changed = false;
+                self.edited(cx);
+                self.git.update(cx, |git, cx| git.changed(cx));
+                cx.emit(FileEvent::Saved);
+            }
+            Err(error) if monocode_core::files::remote_write::is_host_conflict(&error) => {
+                self.open_conflict(saved, cx);
+            }
+            Err(error) => {
+                self.own_retry = false;
+                self.error = Some(error);
+                cx.emit(FileEvent::SaveFailed);
+            }
+        }
+        cx.notify();
+    }
+    /// The input follows the document: a file that cannot be saved is not editable.
+    fn sync_read_only(&mut self, cx: &mut Context<Self>) {
+        let read_only = self.conflict.is_some()
+            || self
+                .document
+                .as_ref()
+                .is_some_and(|d| d.read_only.is_some());
+        self.input
+            .update(cx, |input, _| input.set_read_only(read_only));
+    }
+    /// Opens the compare dialog without a Host (tests of the panes around the editor).
+    #[cfg(test)]
+    pub(crate) fn open_conflict_for_test(&mut self, cx: &mut Context<Self>) {
+        let mine = self.input.read(cx).content.to_string();
+        self.show_conflict(mine, conflict::Cloud::Missing, cx);
+    }
+    /// A turn is running in this file's cloud workspace.
+    fn agent_working(&self) -> bool {
+        crate::git_gate::turn_running(&self.path)
+    }
     fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.conflict.is_some() {
+            self.pending_reload = true;
+            return;
+        }
         if !self.dirty {
             self.load(true, cx);
             return;
@@ -1153,6 +1320,11 @@ impl gpui::Render for FileEditor {
                 .into_any_element()
         });
         let selection_menu = self.code_selection_menu(window, cx);
+        let conflict_dialog = self.conflict_dialog(cx);
+        if self.pending_reload && self.conflict.is_none() {
+            self.pending_reload = false;
+            cx.defer_in(window, |this, window, cx| this.reload(window, cx));
+        }
         self.input.update(cx, |i, _| {
             i.set_editor_diff(self.show_diff, !self.git_staged)
         });
@@ -1222,12 +1394,31 @@ impl gpui::Render for FileEditor {
                     self.unsupported
                         .clone()
                         .or(self.error.clone())
-                        .unwrap_or_else(|| "Opening file…".into()),
+                        .unwrap_or_else(|| self.opening_text()),
                 )
-                .when(!self.loading, |d| {
+                .when(self.loading && self.read_total() > 0, |d| {
+                    d.child(
+                        div()
+                            .id("cancel-read")
+                            .role(Role::Button)
+                            .aria_label("Cancel")
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .bg(content(0.1))
+                            .child("Cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.read_cancel.store(true, Ordering::Relaxed);
+                                cx.notify();
+                            })),
+                    )
+                })
+                // Opening or revealing a file on another machine means nothing here.
+                .when(!self.loading && !self.is_remote_path(), |d| {
                     d.child(
                         div()
                             .id("open-file-externally")
+                            .debug_selector(|| "open-file-externally".into())
                             .role(Role::Button)
                             .aria_label("Open externally")
                             .px_3()
@@ -1265,25 +1456,29 @@ impl gpui::Render for FileEditor {
                                     .child("Retry")
                                     .on_click(cx.listener(|this, _, _, cx| this.load(true, cx))),
                             )
-                            .child(
-                                div()
-                                    .id("reveal-file")
-                                    .role(Role::Button)
-                                    .aria_label("Reveal")
-                                    .px_3()
-                                    .py_1()
-                                    .rounded_md()
-                                    .bg(content(0.1))
-                                    .child("Reveal")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        let path = PathBuf::from(&this.path);
-                                        cx.background_executor()
-                                            .spawn(async move {
-                                                let _ = monocode_core::files::reveal_path(&path);
-                                            })
-                                            .detach();
-                                    })),
-                            )
+                            .when(!self.is_remote_path(), |d| {
+                                d.child(
+                                    div()
+                                        .id("reveal-file")
+                                        .debug_selector(|| "reveal-file".into())
+                                        .role(Role::Button)
+                                        .aria_label("Reveal")
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_md()
+                                        .bg(content(0.1))
+                                        .child("Reveal")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            let path = PathBuf::from(&this.path);
+                                            cx.background_executor()
+                                                .spawn(async move {
+                                                    let _ =
+                                                        monocode_core::files::reveal_path(&path);
+                                                })
+                                                .detach();
+                                        })),
+                                )
+                            })
                             .child(
                                 div()
                                     .id("copy-file-path")
@@ -1319,6 +1514,11 @@ impl gpui::Render for FileEditor {
             )
             .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape" {
+                    if this.conflict.is_some() {
+                        this.cancel_conflict(cx);
+                        cx.stop_propagation();
+                        return;
+                    }
                     this.selection.dismiss();
                     cx.notify();
                 }
@@ -1382,6 +1582,33 @@ impl gpui::Render for FileEditor {
             })
             .when(self.search_open, |d| d.child(self.search_panel(cx)))
             .when_some(
+                self.document.as_ref().and_then(|doc| doc.read_only.clone()),
+                |d, reason| {
+                    d.child(
+                        div()
+                            .id("read-only-banner")
+                            .debug_selector(|| "read-only-banner".into())
+                            .px_3()
+                            .py_2()
+                            .text_size(px(12.))
+                            .text_color(rgb(0xfbbf24))
+                            .child(reason),
+                    )
+                },
+            )
+            .when(ready && self.agent_working(), |d| {
+                d.child(
+                    div()
+                        .id("agent-working-banner")
+                        .debug_selector(|| "agent-working-banner".into())
+                        .px_3()
+                        .py_2()
+                        .text_size(px(12.))
+                        .text_color(content(0.6))
+                        .child("The agent is working in this workspace and may change this file."),
+                )
+            })
+            .when_some(
                 self.error.clone().filter(|_| ready).or_else(|| {
                     self.disk_changed
                         .then(|| "File changed on disk. Reload to use the new version.".into())
@@ -1401,6 +1628,7 @@ impl gpui::Render for FileEditor {
             .when(ready && !self.preview, |d| d.child(self.status_footer(cx)))
             .child(self.selection_surface(cx))
             .children(selection_menu)
+            .children(conflict_dialog)
     }
 }
 
@@ -1411,6 +1639,18 @@ mod tests {
         Bounds, EntityInputHandler, TestAppContext, VisualTestContext, WindowBounds, WindowOptions,
         point, size,
     };
+    #[test]
+    fn the_poll_never_re_downloads_a_remote_file_it_cannot_refresh_cheaply() {
+        // Local files are always re-read.
+        assert!(poll_reloads(false, None));
+        assert!(poll_reloads(false, Some(50_000_000)));
+        // A small open remote text file is refreshed.
+        assert!(poll_reloads(true, Some(REMOTE_POLL_BYTES)));
+        // A big one, an image, a refused or cancelled file, or a read error (no document)
+        // is left alone until the user retries.
+        assert!(!poll_reloads(true, Some(REMOTE_POLL_BYTES + 1)));
+        assert!(!poll_reloads(true, None));
+    }
     #[gpui::test]
     fn file_overview_tracks_unsaved_syntax_and_staged_or_unstaged_git_baselines(
         cx: &mut TestAppContext,

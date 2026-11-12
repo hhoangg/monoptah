@@ -11,6 +11,8 @@ pub(crate) struct MonoSession {
     pub needs_input: bool,
     pub branch: Option<String>,
     pub model: SharedString,
+    /// Runs on a codespace or a sandbox rather than on this machine.
+    pub cloud: bool,
 }
 impl Shell {
     pub(crate) fn mono_install_app(
@@ -41,6 +43,11 @@ impl Shell {
         self.session_summaries.remove(&id);
         self.sessions.remove(&id);
     }
+    /// Reads the cloud marks from the store, as the shell's periodic refresh does.
+    #[cfg(test)]
+    pub(crate) fn mono_refresh_cloud(&mut self, cx: &mut Context<Self>) {
+        self.refresh_cloud(cx);
+    }
     #[cfg(test)]
     pub(crate) fn mono_manager(&self) -> Entity<crate::monos::Monos> {
         self.monos.as_ref().unwrap().clone()
@@ -53,6 +60,15 @@ impl Shell {
         self.monos
             .as_ref()
             .is_some_and(|m| m.read(cx).active.is_some())
+    }
+    /// The compact cloud mark of a Mono launch row, from the cached state (never wakes the instance).
+    pub(crate) fn mono_cloud_badge(&self, id: i64) -> Option<AnyElement> {
+        self.cloud_badge(id, true)
+    }
+    /// "Docker Sandbox box-1": the backend and instance of a cloud launch, from the cached marks.
+    pub(crate) fn mono_cloud_label(&self, id: i64) -> Option<String> {
+        let mark = self.cloud_marks.get(&id)?;
+        Some(format!("{} {}", mark.kind.title(), mark.codespace))
     }
     pub(crate) fn mono_session_views(&self, cx: &App) -> Vec<MonoSession> {
         // A Mono's launches are usually hidden from the sidebar, so they are
@@ -81,6 +97,7 @@ impl Shell {
                     needs_input: metadata.needs_approval(),
                     branch: live.and_then(|v| v.branch_name()).map(str::to_owned),
                     model: live.map(|v| v.mono_model_label()).unwrap_or_default(),
+                    cloud: self.is_cloud(id),
                 }
             })
             .collect()

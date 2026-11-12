@@ -603,6 +603,9 @@ impl Shell {
                     }
                 }
             }
+            if self.can_continue_locally(id) {
+                items.push(MenuAction::new("continue-locally", "Continue locally…").into());
+            }
             if self.codespace_restore_pending(id) {
                 items.push(
                     MenuAction::new("codespace-restore", "Restore code from codespace").into(),
@@ -619,6 +622,9 @@ impl Shell {
                 );
             }
             items.extend(self.telegram_topic_item(id, cx));
+            items.extend(self.cloud_move_menu_item(id));
+            items.extend(self.continue_backup_items(id));
+            items.extend(self.return_cleanup_items(id));
         }
         items.extend([
             MenuAction::new("reminder", "Remind me")
@@ -684,6 +690,19 @@ impl Shell {
         let ids = self.session_menu_ids(id, cx);
         match action {
             "codespace-restore" => self.restore_codespace_code(id, cx),
+            "continue-in-cloud" => self.open_cloud_move(id, window, cx),
+            "continue-locally" => self.open_continue_locally(id, window, cx),
+            "restore-continue-backup" => {
+                self.open_backup_action(id, cloud_continue::Op::Restore, window, cx)
+            }
+            "discard-continue-backup" => {
+                self.open_backup_action(id, cloud_continue::Op::Discard, window, cx)
+            }
+            "retry-return-cleanup" => self.retry_return_cleanup(id, cx),
+            "keep-return-cleanup" => self.keep_return_cleanup(id, cx),
+            "keep-continue-backup" => {
+                self.open_backup_action(id, cloud_continue::Op::Keep, window, cx)
+            }
             "codespace-stop" => {
                 self.run_origin_codespace_action(id, cloud::ArchiveChoice::Stop, window, cx)
             }
@@ -1157,12 +1176,14 @@ impl Shell {
             self.preview_close = None;
         }
         self.drop_cloud_start(id);
+        self.drop_cloud_move(id);
         self.sessions.remove(&id);
         self.stop_tui(id, cx);
         self.session_summaries.remove(&id);
         self.draft_sessions.remove(&id);
         self.history_recency.remove(&id);
         self.session_marks.remove(&id);
+        self.panel_modes.remove(&id);
         self.tab_marks.remove(&id);
         self.order.retain(|s| *s != id);
         if self.busy_sessions.remove(&id) {

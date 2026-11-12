@@ -393,6 +393,8 @@ impl Shell {
         let mut session = session;
         session.has_messages = true;
         self.session_summaries.insert(id, session.clone());
+        // The Claude setup step stored its result before Ready: show it.
+        self.forget_claude_setup(&state_key);
         self.cloud_states.insert(state_key, CloudState::Available);
         // A queued message needs the conversation to send it.
         let queued = locked(&self.store).is_ok_and(|store| {
