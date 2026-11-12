@@ -2058,6 +2058,8 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // As the app's own delete does: the instance no longer exists.
+        self.cloud_gone.insert(target.key());
         for &id in ids {
             self.forget_cloud_row(id, window, cx);
         }

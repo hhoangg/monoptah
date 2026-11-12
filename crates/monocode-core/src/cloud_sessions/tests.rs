@@ -1447,6 +1447,8 @@ fn a_missing_ssh_server_is_recognised_with_its_fix() {
     for other in [
         "SSH setup timed out. Check the host's network connection and try again.",
         "cargo fetch exited with code 101",
+        // sshd is installed but fails for another reason: adding the feature would not help.
+        "SSH setup failed: error getting ssh server details: failed to start SSH server: exit status 255",
         "",
     ] {
         assert!(!is_missing_ssh_server(other), "{other}");

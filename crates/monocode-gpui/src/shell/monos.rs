@@ -97,7 +97,8 @@ impl Shell {
                     archived: metadata.summary.archived,
                     updated_at: metadata.summary.updated_at,
                     needs_input: metadata.needs_approval(),
-                    start_failed: live.is_some_and(|v| v.cloud_start_failed()),
+                    start_failed: self.cloud_start_failed(id)
+                        || live.is_some_and(|v| v.cloud_start_failed()),
                     branch: live.and_then(|v| v.branch_name()).map(str::to_owned),
                     model: live.map(|v| v.mono_model_label()).unwrap_or_default(),
                     cloud: self.is_cloud(id),
