@@ -184,6 +184,9 @@ pub(crate) struct Conversation {
     move_by_agent: bool,
     /// The flip happened but the settings in memory were not reloaded from the store yet.
     move_settings_stale: bool,
+    /// The backend, workspace and state of a session that runs in the cloud, from the shell's
+    /// cache; `None` for a local session. The workspace bar shows it in place of the checkout.
+    cloud_badge: Option<crate::cloud_mark::CloudBadge>,
     /// Lists the machine types of a project's repository for the codespace panel.
     machine_loader: Option<cloud_target::MachineLoader>,
     cloud_anchors: [AnchorSlot; 4],
@@ -820,6 +823,7 @@ impl Conversation {
             move_locked: false,
             move_by_agent: false,
             move_settings_stale: false,
+            cloud_badge: None,
             machine_loader: None,
             cloud_anchors: Default::default(),
             cloud_ref_anchors: Default::default(),
@@ -3366,7 +3370,10 @@ impl Conversation {
             !self.busy && !self.preparing_worktree && !self.cloud_creating() && self.git.is_some();
         // Still reading git is not unavailable: don't dim, then brighten.
         let dimmed = !enabled && (self.loaded || self.busy || self.preparing_worktree);
-        let workspace = if draft {
+        let workspace = if let Some(badge) = &self.cloud_badge {
+            // A session in a codespace or sandbox: no local checkout to choose or show.
+            crate::cloud_mark::status("composer-workspace", badge, self.branch.as_deref())
+        } else if draft {
             bar_trigger(
                 "composer-workspace",
                 if cloud_label.is_some() {

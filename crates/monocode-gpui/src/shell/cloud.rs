@@ -40,34 +40,8 @@ impl CloudMark {
     }
 }
 
-/// What the sidebar shows for a codespace state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Tone {
-    Good,
-    Busy,
-    Idle,
-    Bad,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Indicator {
-    pub label: &'static str,
-    pub tone: Tone,
-}
-
-/// Row indicator for a codespace state. A state that could not be read (offline,
-/// gh missing, not signed in) is "Not connected": a state, never an error toast.
-pub(super) fn indicator(state: Option<CloudState>) -> Indicator {
-    let (label, tone) = match state {
-        Some(CloudState::Available) => ("Available", Tone::Good),
-        Some(CloudState::Starting) => ("Starting", Tone::Busy),
-        Some(CloudState::Stopping) => ("Stopping", Tone::Busy),
-        Some(CloudState::Stopped) => ("Stopped", Tone::Idle),
-        Some(CloudState::Unavailable) => ("Unavailable", Tone::Bad),
-        Some(CloudState::Unknown) | None => ("Not connected", Tone::Idle),
-    };
-    Indicator { label, tone }
-}
+// The state words and tones are shared with every view that marks a cloud session.
+pub(super) use crate::cloud_mark::{Indicator, Tone, indicator};
 
 /// What a refresh found: bindings, cached states and the host's activity marks.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -979,42 +953,41 @@ impl Shell {
         }
     }
 
-    /// The cloud mark for a session row: a cloud glyph, the codespace state's dot
-    /// and, in roomy rows, its name.
-    pub(super) fn cloud_badge(&self, id: i64, compact: bool) -> Option<AnyElement> {
+    /// What every view marks a cloud session with: its backend, its workspace and how that
+    /// stands. A startup in progress or failed replaces the workspace state. `None` for a local
+    /// session.
+    pub(crate) fn cloud_badge_of(&self, id: i64) -> Option<crate::cloud_mark::CloudBadge> {
         let mark = self.cloud_marks.get(&id)?;
-        let mut indicator = indicator(self.cloud_states.get(&mark.key()).copied());
-        // A startup in progress or failed replaces the codespace state: the dot is amber or red.
-        if let Some(label) = self.cloud_start_label(id) {
-            indicator = label;
-        }
-        let color = match indicator.tone {
-            Tone::Good => rgb(0x4ade80).into(),
-            Tone::Busy => rgb(0xfbbf24).into(),
-            Tone::Bad => rgb(0xf87171).into(),
-            Tone::Idle => content(0.35),
-        };
+        Some(crate::cloud_mark::CloudBadge {
+            kind: mark.kind,
+            instance: mark.codespace.clone(),
+            indicator: self
+                .cloud_start_label(id)
+                .unwrap_or_else(|| indicator(self.cloud_states.get(&mark.key()).copied())),
+        })
+    }
+
+    /// Every cloud session's badge, for views that list sessions outside the shell.
+    pub(crate) fn cloud_badges(&self) -> HashMap<i64, crate::cloud_mark::CloudBadge> {
+        self.cloud_marks
+            .keys()
+            .filter_map(|&id| Some((id, self.cloud_badge_of(id)?)))
+            .collect()
+    }
+
+    /// The cloud mark of a session (`cloud-badge-<id>`): the cloud glyph, the workspace state's
+    /// dot and, unless `compact`, its label. Every surface that lists sessions shows this one
+    /// mark, see [`crate::cloud_mark::badge`]. `None` for a local session.
+    pub(super) fn cloud_badge(&self, id: i64, compact: bool) -> Option<AnyElement> {
+        let badge = self.cloud_badge_of(id)?;
         Some(
-            div()
-                .id(("cloud-badge", id as usize))
-                .debug_selector(move || format!("cloud-badge-{id}"))
-                .role(Role::Image)
-                .aria_label(format!(
-                    "{} {}: {}",
-                    mark.kind.title(),
-                    mark.codespace,
-                    indicator.label
-                ))
-                .flex_shrink_0()
-                .flex()
-                .items_center()
-                .gap(px(4.))
-                .text_size(px(11.))
-                .text_color(content(0.5))
-                .child(icon("cloud-upload", 12.).text_color(content(0.55)))
-                .child(div().size(px(6.)).rounded_full().bg(color))
-                .when(!compact, |d| d.child(indicator.label))
-                .into_any_element(),
+            crate::cloud_mark::badge(
+                ("cloud-badge", id as usize),
+                format!("cloud-badge-{id}"),
+                &badge,
+                compact,
+            )
+            .into_any_element(),
         )
     }
 

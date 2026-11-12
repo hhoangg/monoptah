@@ -139,6 +139,8 @@ impl AssetSource for Assets {
    "minus-sign"=>include_bytes!("../assets/hugeicons/minus-sign.svg"),
    "undo"=>include_bytes!("../assets/hugeicons/undo.svg"),
    "cloud-upload"=>include_bytes!("../assets/hugeicons/cloud-upload.svg"),
+   // A session that runs in a codespace or a Docker sandbox (see `cloud_mark.rs`).
+   "cloud"=>include_bytes!("../assets/hugeicons/cloud.svg"),
    "git-merge"=>include_bytes!("../assets/hugeicons/git-merge.svg"),
    "git-commit"=>include_bytes!("../assets/hugeicons/git-commit.svg"),
    "git-pull-request-draft"=>include_bytes!("../assets/hugeicons/git-pull-request-draft.svg"),

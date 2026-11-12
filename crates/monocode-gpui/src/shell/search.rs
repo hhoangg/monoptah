@@ -255,6 +255,7 @@ impl Shell {
                     recent,
                     classic: self.workspace.boxy_layout(),
                     panel,
+                    cloud: self.cloud_badges(),
                     logos: self
                         .workspace
                         .project_appearance

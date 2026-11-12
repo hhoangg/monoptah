@@ -1593,6 +1593,7 @@ fn a_notification_continuing_a_turn_does_not_move_the_chat(cx: &mut TestAppConte
                         state: "done",
                         harness: "codex".into(),
                         cwd: "/repo".into(),
+                        cloud: None,
                     },
                 )]),
                 cx,
@@ -2853,4 +2854,68 @@ fn a_reinstalled_history_keeps_following_the_tail(cx: &mut TestAppContext) {
         assert!(same, "the list stopped following the tail at {after:?}");
         assert!(consumed, "the suspended position is still pending");
     }
+}
+
+#[gpui::test]
+fn a_launch_card_marks_a_session_that_runs_in_the_cloud(cx: &mut TestAppContext) {
+    use monocode_core::cloud_sessions::{CloudBackendKind, CloudState};
+    let window = chat(cx);
+    let receipt = |id: i64| {
+        let mut tool = ToolCall::new(&format!("launch-{id}"), "exec_command");
+        tool.input = serde_json::json!({
+            "cmd": "'/Applications/Monoptah Native.app/Contents/MacOS/monocode-gpui' app sessions.start --json '{}'"
+        })
+        .to_string();
+        tool.output =
+            serde_json::json!({"ok": true, "result": {"sessionId": id, "accepted": true}})
+                .to_string();
+        tool.state = ToolState::Completed;
+        row("tool", &serde_json::to_string(&tool).unwrap())
+    };
+    let view = |title: &str, cloud| LaunchView {
+        title: title.into(),
+        state: "done",
+        harness: "claude".into(),
+        cwd: "/repo".into(),
+        cloud,
+    };
+    window
+        .update(cx, |transcript, _, cx| {
+            transcript.set_launches(
+                HashMap::from([
+                    (
+                        776,
+                        view(
+                            "In the cloud",
+                            Some(crate::cloud_mark::CloudBadge {
+                                kind: CloudBackendKind::Codespaces,
+                                instance: "octo-abc".into(),
+                                indicator: crate::cloud_mark::indicator(Some(
+                                    CloudState::Available,
+                                )),
+                            }),
+                        ),
+                    ),
+                    (777, view("On this Mac", None)),
+                ]),
+                cx,
+            );
+            transcript.patch(
+                0,
+                vec![
+                    row("user", "Start two"),
+                    receipt(776),
+                    receipt(777),
+                    row("assistant", "Started both."),
+                ],
+                cx,
+            );
+        })
+        .unwrap();
+    render(window, cx);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    assert!(visual.debug_bounds("mono-launch-card-776").is_some());
+    assert!(visual.debug_bounds("mono-launch-card-777").is_some());
+    assert!(visual.debug_bounds("mono-launch-card-cloud-776").is_some());
+    assert!(visual.debug_bounds("mono-launch-card-cloud-777").is_none());
 }

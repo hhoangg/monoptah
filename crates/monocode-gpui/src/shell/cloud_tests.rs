@@ -4934,3 +4934,122 @@ fn the_archive_choice_takes_enter_and_escape_through_the_gate_and_frees_the_wind
     let at = visual.debug_bounds(ROW).expect("the probed row").center();
     assert_restored(window, visual, at);
 }
+
+/// A cloud session's row, tab and open conversation carry the cloud mark; a local session in the
+/// same project has none of it.
+#[gpui::test]
+fn a_cloud_session_is_marked_beside_its_title_and_a_local_one_is_not(cx: &mut TestAppContext) {
+    let (window, cloud_id, _) = shell_with_cloud(cx);
+    let local_id = window
+        .update(cx, |shell, window, cx| {
+            let mut summary = locked(&shell.store)
+                .unwrap()
+                .create("codex", &shell.workspace.project)
+                .unwrap();
+            // A blank draft is not listed; a started one is.
+            summary.has_messages = true;
+            let id = summary.id;
+            shell.add(summary, cx);
+            shell.open(id, window, cx);
+            // The cloud session's tab sits in its local project's strip beside the local one;
+            // it needs no conversation to draw.
+            shell.workspace.tabs.push(cloud_id);
+            shell.remember_title_tab(TitleTab::Session(cloud_id));
+            shell.notify_sidebar(cx);
+            shell.invalidate_chrome(cx);
+            id
+        })
+        .unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+    for classic in [false, true] {
+        window
+            .update(visual, |shell, _, cx| {
+                shell.workspace.classic_layout = classic;
+                shell.layout_changed(cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        for id in [cloud_id, local_id] {
+            assert!(
+                visual
+                    .debug_bounds(leak(format!("session-title-{id}")))
+                    .is_some(),
+                "row {id} drawn (classic {classic})"
+            );
+        }
+        let mark = visual
+            .debug_bounds(leak(format!("cloud-badge-{cloud_id}")))
+            .unwrap_or_else(|| panic!("cloud row marked (classic {classic})"));
+        let title = visual
+            .debug_bounds(leak(format!("session-title-{cloud_id}")))
+            .unwrap();
+        // Beside the title, on its line, before it.
+        assert!(mark.origin.x < title.origin.x, "classic {classic}");
+        assert!(
+            mark.origin.y >= title.origin.y - px(4.)
+                && mark.origin.y <= title.origin.y + title.size.height,
+            "classic {classic}"
+        );
+        assert!(
+            visual
+                .debug_bounds(leak(format!("cloud-badge-{local_id}")))
+                .is_none(),
+            "local row unmarked (classic {classic})"
+        );
+        for id in [cloud_id, local_id] {
+            assert!(
+                visual
+                    .debug_bounds(leak(format!("title-tab-{id}")))
+                    .is_some(),
+                "tab {id} drawn (classic {classic})"
+            );
+        }
+        assert!(
+            visual
+                .debug_bounds(leak(format!("title-tab-cloud-mark-{cloud_id}")))
+                .is_some(),
+            "cloud tab marked (classic {classic})"
+        );
+        assert!(
+            visual
+                .debug_bounds(leak(format!("title-tab-cloud-mark-{local_id}")))
+                .is_none(),
+            "local tab unmarked (classic {classic})"
+        );
+    }
+    window
+        .update(visual, |shell, _, cx| {
+            let badge = shell.cloud_badge_of(cloud_id).unwrap();
+            assert_eq!(badge.status(), "Codespace \u{b7} Stopped");
+            assert_eq!(badge.tooltip(None), "Codespace \u{b7} octo-abc");
+            assert!(shell.cloud_badge_of(local_id).is_none());
+            assert_eq!(
+                shell.cloud_badges().keys().copied().collect::<Vec<_>>(),
+                [cloud_id]
+            );
+            // The open local conversation gets no badge; one bound to a workspace gets the
+            // shell's backend and state.
+            shell.sync_cloud_stopped(cx);
+            let view = shell.sessions[&local_id].clone();
+            assert!(view.read(cx).cloud_badge_for_test().is_none());
+            shell.cloud_marks.insert(
+                local_id,
+                CloudMark {
+                    local_project: "/work/monocode".into(),
+                    codespace: "box-1".into(),
+                    kind: CloudBackendKind::DockerSandbox,
+                },
+            );
+            shell
+                .cloud_states
+                .insert(CloudRef::sandbox("box-1").key(), CloudState::Available);
+            shell.sync_cloud_stopped(cx);
+            assert_eq!(
+                view.read(cx).cloud_badge_for_test().map(|b| b.status()),
+                Some("Docker Sandbox \u{b7} Available".to_string())
+            );
+        })
+        .unwrap();
+}

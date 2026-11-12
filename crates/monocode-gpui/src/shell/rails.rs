@@ -358,7 +358,6 @@ impl Shell {
             return row;
         }
         let work_item = self.work_item_badge(id, false, cx);
-        let cloud_badge = self.cloud_badge(id, false);
         let agents = match rail {
             Some((Rail::Agents(summary), true)) => Some(self.agents(id, summary, cx)),
             _ => None,
@@ -482,6 +481,8 @@ impl Shell {
                     .when(session.summary.pinned, |d| {
                         d.child(icon("pin", 12.).text_color(content(0.45)))
                     })
+                    // The cloud mark sits beside the title, not in the footer.
+                    .children(self.cloud_badge(id, true))
                     .child(title)
                     .when(!header, |d| {
                         d.child(
@@ -532,7 +533,6 @@ impl Shell {
                                         d.child(self.session_archive_button(id, &session, cx))
                                     }),
                             )
-                            .children(cloud_badge)
                             .children(work_item)
                             .when(
                                 self.automation_state.session_automations.contains_key(&id),

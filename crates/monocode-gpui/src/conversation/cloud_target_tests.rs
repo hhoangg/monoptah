@@ -2147,3 +2147,56 @@ fn the_summary_follows_settings_changes_while_the_panel_is_open(cx: &mut TestApp
         })
         .unwrap();
 }
+
+#[gpui::test]
+fn a_cloud_session_shows_its_backend_and_workspace_state_in_the_workspace_bar(
+    cx: &mut TestAppContext,
+) {
+    use crate::cloud_mark::{CloudBadge, indicator};
+    use monocode_core::cloud_sessions::{CloudBackendKind, CloudState};
+    let window = conversation(cx, PROJECT, true);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    let draw = |visual: &mut gpui::VisualTestContext| {
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+    };
+    draw(visual);
+    // A local session keeps its checkout and has no cloud status.
+    assert!(visual.debug_bounds("cloud-session-status").is_none());
+    let badge = |kind, state| CloudBadge {
+        kind,
+        instance: "octo-abc".into(),
+        indicator: indicator(Some(state)),
+    };
+    window
+        .update(visual, |view, _, cx| {
+            view.set_cloud_badge(
+                Some(badge(CloudBackendKind::Codespaces, CloudState::Stopped)),
+                cx,
+            );
+            let shown = view.cloud_badge_for_test().unwrap();
+            assert_eq!(shown.status(), "Codespace \u{b7} Stopped");
+            assert_eq!(shown.tooltip(None), "Codespace \u{b7} octo-abc");
+        })
+        .unwrap();
+    draw(visual);
+    assert!(visual.debug_bounds("cloud-session-status").is_some());
+    window
+        .update(visual, |view, _, cx| {
+            view.set_cloud_badge(
+                Some(badge(
+                    CloudBackendKind::DockerSandbox,
+                    CloudState::Available,
+                )),
+                cx,
+            );
+            assert_eq!(
+                view.cloud_badge_for_test().unwrap().status(),
+                "Docker Sandbox \u{b7} Available"
+            );
+            view.set_cloud_badge(None, cx);
+        })
+        .unwrap();
+    draw(visual);
+    assert!(visual.debug_bounds("cloud-session-status").is_none());
+}

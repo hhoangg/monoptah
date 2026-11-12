@@ -70,6 +70,8 @@ pub(crate) struct LaunchView {
     pub state: &'static str,
     pub harness: String,
     pub cwd: String,
+    /// Its codespace or Docker sandbox, when it runs in one.
+    pub cloud: Option<crate::cloud_mark::CloudBadge>,
 }
 /// A message the Mono has not taken yet, shown where it will land.
 #[derive(Clone, PartialEq)]
@@ -7544,6 +7546,7 @@ mod scroll_tests {
                                     state: "working",
                                     harness: "codex".into(),
                                     cwd: "/tmp/project".into(),
+                                    cloud: None,
                                 },
                             )]),
                             cx,
