@@ -4033,3 +4033,90 @@ fn a_reconnect_upgrades_the_host_with_the_connect_prelude_and_leaks_no_secret() 
     assert!(lines.iter().any(|l| l.contains("Updating Monoptah Host")));
     assert!(!lines.iter().any(|l| l.contains(SECRET)), "{lines:?}");
 }
+
+// ------------------------------------------- lifecycle deferred by a move
+
+/// The last record a start published (the persisted one is removed when the start is ready).
+fn last_record(events: &[StartEvent]) -> StartRecord {
+    events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            StartEvent::Updated(record) => Some(record.clone()),
+            _ => None,
+        })
+        .unwrap()
+}
+
+#[test]
+fn a_move_started_sandbox_defers_its_lifecycle_commands() {
+    let fx = fx();
+    let (session, began) = fx
+        .svc
+        .begin_sandbox_start_for_move("/Users/me/widgets", &config(), "fix/login", "claude", true)
+        .unwrap();
+    let name = began.sandbox.clone().unwrap();
+    let (result, events) = fx.run(session.id);
+    result.unwrap();
+    assert!(
+        !fx.shell.tags().contains(&"mode:lifecycle".to_string()),
+        "{:?}",
+        fx.shell.tags()
+    );
+    let record = last_record(&events);
+    let step = record.step(StepKind::LifecycleCommands);
+    assert_eq!(step.status, StepStatus::Skipped);
+    assert_eq!(
+        step.detail.as_deref(),
+        Some("Starts after the move restores the code")
+    );
+    // What the move needs to run them later: the start record is gone once the start is
+    // ready, so it is read by the sandbox name until the move clears it.
+    let deferred = fx.svc.peek_deferred_lifecycle(&name).unwrap();
+    assert!(
+        fx.svc.peek_deferred_lifecycle(&name).is_some(),
+        "peek keeps it"
+    );
+    fx.svc.clear_deferred_lifecycle(&name);
+    assert!(fx.svc.peek_deferred_lifecycle(&name).is_none());
+    assert_eq!(deferred.sandbox_id, NEW_ID);
+    assert_eq!(deferred.workspace, WORKSPACE);
+    assert!(deferred.mount && !deferred.started);
+    // Running them later is the same script in lifecycle mode.
+    fx.svc
+        .start_deferred_lifecycle(&deferred, &|| false)
+        .unwrap();
+    let call = fx.shell.call("mode:lifecycle");
+    assert_eq!(call.id, NEW_ID);
+    assert!(call.stdin.contains(WORKSPACE), "{}", call.stdin);
+    assert!(call.stdin.contains("MOUNT='1'"), "{}", call.stdin);
+}
+
+#[test]
+fn an_ordinary_sandbox_start_still_runs_its_lifecycle_commands() {
+    let fx = fx();
+    let (session, began) = fx.begin().unwrap();
+    let name = began.sandbox.clone().unwrap();
+    let (result, events) = fx.run(session.id);
+    result.unwrap();
+    assert!(fx.shell.tags().contains(&"mode:lifecycle".to_string()));
+    assert_eq!(
+        last_record(&events)
+            .step(StepKind::LifecycleCommands)
+            .detail
+            .as_deref(),
+        Some("Running in the background")
+    );
+    assert!(fx.svc.peek_deferred_lifecycle(&name).is_none());
+}
+
+#[test]
+fn a_start_record_without_the_deferral_field_loads_as_an_ordinary_start() {
+    let fx = fx();
+    let (session, _) = fx.begin().unwrap();
+    let mut value =
+        serde_json::to_value(fx.record(session.id).unwrap().sandbox_start.unwrap()).unwrap();
+    value.as_object_mut().unwrap().remove("deferLifecycle");
+    let start: super::docker_start::SandboxStart = serde_json::from_value(value).unwrap();
+    assert!(!start.defer_lifecycle);
+}

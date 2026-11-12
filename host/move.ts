@@ -10,10 +10,12 @@ import {
   mkdtempSync,
   openSync,
   readFileSync,
+  readdirSync,
   renameSync,
   rmSync,
   statSync,
   unlinkSync,
+  utimesSync,
   writeSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -155,10 +157,49 @@ export async function validatePatch(target: string, patch: string): Promise<stri
 }
 
 /**
+ * Copies the real index of `cwd` to `target` and resets it to HEAD with `read-tree -m`,
+ * keeping stat data of entries that match HEAD. Returns false (caller falls back to a plain
+ * `read-tree HEAD`) when there is no usable index: missing, split or sparse index, a copy
+ * error, or a failing `read-tree -m`. The real index is only read.
+ */
+async function seedScratchIndex(cwd: string, target: string, env: NodeJS.ProcessEnv): Promise<boolean> {
+  try {
+    const path = resolve(cwd, (await git(cwd, ["rev-parse", "--git-path", "index"])).trim());
+    const info = statSync(path);
+    if (!info.isFile()) return false;
+    // A split index needs shared-index files next to the repository, and a sparse index needs
+    // sparse handling (and `core.splitIndex` would make git write a shared index into the real
+    // repository). Any hint of either means the safe fallback.
+    for (const key of ["core.splitIndex", "index.sparse", "core.sparseCheckout"])
+      if ((await git(cwd, ["config", "--type=bool", "--get", key]).catch(() => "")).trim() === "true") return false;
+    for (const dir of new Set(
+      await Promise.all(["--git-dir", "--git-common-dir"].map(async (flag) => resolve(cwd, (await git(cwd, ["rev-parse", flag])).trim()))),
+    ))
+      if (readdirSync(dir).some((name) => name.startsWith("sharedindex."))) return false;
+    copyFileSync(path, target);
+    utimesSync(target, info.atime, info.mtime);
+    await git(cwd, ["-c", "core.fsmonitor=false", "read-tree", "-m", "HEAD"], env);
+    // `read-tree -m` keeps the per-entry flags of the real index. An assume-unchanged (lowercase
+    // tag) or skip-worktree (`S`) entry would make `add -A` skip the file, giving a wrong tree.
+    const listing = await git(cwd, ["-c", "core.fsmonitor=false", "ls-files", "-v", "-z"], env);
+    for (const entry of listing.split("\0")) if (entry && (entry[0] === "S" || /[a-z]/.test(entry[0]))) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * The tree id of everything in `cwd` that is not ignored: a temporary index starts from
  * HEAD, takes `add -A`, and is written with `write-tree`. Objects it creates go to a scratch
  * directory (the real objects are read through an alternate), so the repository is not
  * polluted and the real index is never touched.
+ *
+ * The temporary index is seeded from a copy of the real index (mtime preserved, so git's
+ * racy-entry check still re-hashes what it must) and then reset to HEAD with
+ * `read-tree -m HEAD`: the content is exactly HEAD, as with a plain `read-tree HEAD`, but
+ * entries that match HEAD keep their stat data, so `add -A` re-hashes only files that
+ * changed instead of every tracked file. Any problem seeding falls back to the plain path.
  */
 export async function worktreeTree(cwd: string, extra: string[] = []): Promise<string> {
   const scratch = mkdtempSync(join(tmpdir(), "monoptah-snapshot-"));
@@ -175,14 +216,18 @@ export async function worktreeTree(cwd: string, extra: string[] = []): Promise<s
       GIT_ALTERNATE_OBJECT_DIRECTORIES: alternates,
       GIT_OPTIONAL_LOCKS: "0",
     };
-    await git(cwd, ["read-tree", "HEAD"], env);
-    await git(cwd, ["add", "-A"], env);
+    if (!(await seedScratchIndex(cwd, env.GIT_INDEX_FILE, env))) {
+      rmSync(env.GIT_INDEX_FILE, { force: true });
+      await git(cwd, ["read-tree", "HEAD"], env);
+    }
+    // fsmonitor is off so an inherited fsmonitor-valid bit or daemon cannot hide a change.
+    await git(cwd, ["-c", "core.fsmonitor=false", "add", "-A"], env);
     // The sender starts from a copy of its REAL index, so a staged file that .gitignore
     // matches (a force-added one) is in its tree and its patch, but `add -A` skips it
     // here. The files the patch touches are put in explicitly (present: added, gone:
     // removed), which does not consult .gitignore.
     if (extra.length)
-      await git(cwd, ["update-index", "--add", "--remove", "-z", "--stdin"], env, GIT_TIMEOUT_MS, extra.join("\0") + "\0");
+      await git(cwd, ["-c", "core.fsmonitor=false", "update-index", "--add", "--remove", "-z", "--stdin"], env, GIT_TIMEOUT_MS, extra.join("\0") + "\0");
     return (await git(cwd, ["write-tree"], env)).trim();
   } finally {
     rmSync(scratch, { recursive: true, force: true });

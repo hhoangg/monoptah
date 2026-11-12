@@ -23,7 +23,7 @@
 //! | ConfigureCodespace ("Configure environment") | inside the container: git credential helper pointing at the mounted socket, for the exact repo URL; for GitHub a `gh` wrapper in `~/.local/bin` that reads the cached token per call; an agent note in `~/.claude/rules/monoptah-cloud-git.md` |
 //! | Connect | bootstrap the Host in the container (Claude prelude on stdin), start the relay, pair and tunnel through [`Host::connect_sandbox`](super::Host::connect_sandbox) |
 //! | OpenProject | [`super::open_project`] with the container's `remoteWorkspaceFolder` |
-//! | LifecycleCommands | `devcontainer run-user-commands` detached; never blocks `Ready` |
+//! | LifecycleCommands | `devcontainer run-user-commands` detached; never blocks `Ready`. A sandbox a MOVE starts ([`CloudSessions::begin_sandbox_start_for_move`]) skips it ("Starts after the move restores the code"): the move would restore the code while `postCreateCommand` (a big fetch, say) hogs the sandbox, so the move starts it itself afterwards ([`DeferredLifecycle`]) |
 //!
 //! # Container and Plain mode
 //!
@@ -193,6 +193,78 @@ pub struct SandboxStart {
     /// The next `devcontainer up` removes the existing container (rebuild).
     #[serde(default)]
     pub rebuild: bool,
+    /// A move started this sandbox ([`CloudSessions::begin_sandbox_start_for_move`]): the
+    /// LifecycleCommands step does not run the repository's background commands (the
+    /// devcontainer `postCreateCommand` and friends), because the move restores the code
+    /// first and would compete with them. The move starts them itself afterwards, see
+    /// [`DeferredLifecycle`].
+    #[serde(default)]
+    pub defer_lifecycle: bool,
+}
+
+/// What the move needs to start the lifecycle commands of a sandbox it started, after the
+/// code is restored: exactly the inputs of the `lifecycle` mode of `docker_up.sh`. Holds no
+/// secret.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeferredLifecycle {
+    pub sandbox_id: String,
+    /// Checkout path in the OUTER sandbox (`--workspace-folder`).
+    pub workspace: String,
+    /// Non-default devcontainer config path, when one is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<String>,
+    /// The Git credential socket is mounted into the container.
+    #[serde(default)]
+    pub mount: bool,
+    /// The commands were started (or were tried once): never again.
+    #[serde(default)]
+    pub started: bool,
+}
+
+/// Why the LifecycleCommands step of a move's sandbox did not run in the start.
+const LIFECYCLE_DEFERRED: &str = "Starts after the move restores the code";
+
+/// Store setting that holds a sandbox's [`DeferredLifecycle`] between the end of its start
+/// and the move that takes it. The name is unique per sandbox, so a stale value never
+/// reaches another one.
+fn deferred_key(sandbox: &str) -> String {
+    format!("cloud-sandbox-lifecycle:{sandbox}")
+}
+
+impl CloudSessions {
+    /// Reads (without clearing) what the start of the sandbox `name` deferred. The caller
+    /// clears it with [`Self::clear_deferred_lifecycle`] once it has saved it elsewhere.
+    pub(super) fn peek_deferred_lifecycle(&self, name: &str) -> Option<DeferredLifecycle> {
+        let store = self.store().ok()?;
+        let text = store.setting(&deferred_key(name)).ok().flatten()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    /// Clears what [`Self::peek_deferred_lifecycle`] read.
+    pub(super) fn clear_deferred_lifecycle(&self, name: &str) {
+        if let Ok(store) = self.store() {
+            let _ = store.save_setting(&deferred_key(name), "");
+        }
+    }
+}
+
+impl DeferredLifecycle {
+    /// What a finished start of a move's sandbox leaves for the move to run later. `None`
+    /// when the start did not defer, has no container, or lacks what the script needs.
+    pub(super) fn of(record: &StartRecord) -> Option<Self> {
+        let start = record.sandbox_start.as_ref()?;
+        if !start.defer_lifecycle || start.mode.unwrap_or_default() == SandboxMode::Plain {
+            return None;
+        }
+        Some(Self {
+            sandbox_id: start.sandbox_id.clone()?,
+            workspace: start.workspace.clone()?,
+            config: config_arg(&start.config),
+            mount: start.config.credential_id.is_some(),
+            started: false,
+        })
+    }
 }
 
 /// The ssh/exec seam, the secret source and the `sbx` runner of the sandbox flow.
@@ -576,6 +648,32 @@ impl CloudSessions {
         harness: &str,
         kit: bool,
     ) -> Result<(Session, StartRecord), String> {
+        self.begin_sandbox_start_inner(local_cwd, config, branch, harness, kit, false)
+    }
+
+    /// [`Self::begin_sandbox_start_with_kit`] for a sandbox a move creates: the start leaves
+    /// the repository's background lifecycle commands to the move ([`DeferredLifecycle`]), so
+    /// they do not compete with the code restore. An ordinary start never uses this.
+    pub(super) fn begin_sandbox_start_for_move(
+        &self,
+        local_cwd: &str,
+        config: &DockerProjectConfig,
+        branch: &str,
+        harness: &str,
+        kit: bool,
+    ) -> Result<(Session, StartRecord), String> {
+        self.begin_sandbox_start_inner(local_cwd, config, branch, harness, kit, true)
+    }
+
+    fn begin_sandbox_start_inner(
+        &self,
+        local_cwd: &str,
+        config: &DockerProjectConfig,
+        branch: &str,
+        harness: &str,
+        kit: bool,
+        defer_lifecycle: bool,
+    ) -> Result<(Session, StartRecord), String> {
         require_claude(harness)?;
         let deps = self.sandbox_deps()?;
         let config = config.validated()?;
@@ -603,6 +701,7 @@ impl CloudSessions {
             mode: None,
             relay_port: DEFAULT_RELAY_PORT,
             rebuild: false,
+            defer_lifecycle,
         };
         let remote_cwd = format!("/workspaces/{repo_dir}");
         let mut record =
@@ -1242,23 +1341,11 @@ impl CloudSessions {
             .workspace
             .as_deref()
             .ok_or("The workspace is not known yet.")?;
-        let config = config_arg(&start.config);
-        Ok(with_vars(
-            &[
-                ("MODE", mode),
-                ("WS", workspace),
-                ("CONFIG", config.as_deref().unwrap_or("")),
-                (
-                    "MOUNT",
-                    if start.config.credential_id.is_some() {
-                        "1"
-                    } else {
-                        "0"
-                    },
-                ),
-                ("MOUNT_DST", CONTAINER_GIT_DIR),
-            ],
-            UP_SCRIPT,
+        Ok(up_vars_with(
+            mode,
+            workspace,
+            config_arg(&start.config).as_deref(),
+            start.config.credential_id.is_some(),
         ))
     }
 
@@ -1675,6 +1762,32 @@ impl CloudSessions {
             self.publish(run.record, run.events);
             return;
         }
+        if run
+            .record
+            .sandbox_start
+            .as_ref()
+            .is_some_and(|s| s.defer_lifecycle)
+        {
+            // A move starts them after it restored the code (see `DeferredLifecycle`). The
+            // start record is gone once the start is ready, so what the move needs is kept
+            // under the sandbox name until the move takes it.
+            if let (Some(deferred), Some(name), Ok(store)) = (
+                DeferredLifecycle::of(run.record),
+                run.record.sandbox.clone(),
+                self.store(),
+            ) {
+                if let Ok(text) = serde_json::to_string(&deferred) {
+                    let _ = store.save_setting(&deferred_key(&name), &text);
+                }
+            }
+            let step = run.record.step_mut(StepKind::LifecycleCommands);
+            step.status = StepStatus::Skipped;
+            step.started_at = None;
+            step.finished_at = None;
+            step.detail = Some(LIFECYCLE_DEFERRED.into());
+            self.publish(run.record, run.events);
+            return;
+        }
         let Ok(id) = Self::sandbox_id(run) else {
             return;
         };
@@ -1704,6 +1817,36 @@ impl CloudSessions {
             Err(Stop::Aborted) => {}
         }
         self.publish(run.record, run.events);
+    }
+
+    /// Starts the lifecycle commands a move deferred ([`DeferredLifecycle`]): the same
+    /// `docker_up.sh` `lifecycle` run the start would have made, detached in the outer
+    /// sandbox. Only for a move that just restored the code or kept its sandbox on cancel.
+    pub(super) fn start_deferred_lifecycle(
+        &self,
+        deferred: &DeferredLifecycle,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<(), String> {
+        let deps = self.sandbox_deps()?;
+        sandboxes::validate_sandbox_id(&deferred.sandbox_id)?;
+        let vars = up_vars_with(
+            "lifecycle",
+            &deferred.workspace,
+            deferred.config.as_deref(),
+            deferred.mount,
+        );
+        let out = deps
+            .shell
+            .run(&deferred.sandbox_id, SH_S, &vars, &mut |_| {}, abort, SHORT)
+            .map_err(|e| Scrub(vec![]).apply(&e))?;
+        if !out.success {
+            return Err(failure_text(
+                &out,
+                &Scrub(vec![]),
+                "Starting the background commands",
+            ));
+        }
+        Ok(())
     }
 
     // ---- Rebuild
@@ -1800,6 +1943,20 @@ impl CreateFailure {
 /// Setting that remembers the id of the container a sandbox's Host lives in.
 pub(super) fn container_key(name: &str) -> String {
     format!("sandbox-container:{name}")
+}
+
+/// The `docker_up.sh` script with its variables for `mode`.
+fn up_vars_with(mode: &str, workspace: &str, config: Option<&str>, mount: bool) -> String {
+    with_vars(
+        &[
+            ("MODE", mode),
+            ("WS", workspace),
+            ("CONFIG", config.unwrap_or("")),
+            ("MOUNT", if mount { "1" } else { "0" }),
+            ("MOUNT_DST", CONTAINER_GIT_DIR),
+        ],
+        UP_SCRIPT,
+    )
 }
 
 /// `--config` argument: the devcontainer path, unless it is the default one.

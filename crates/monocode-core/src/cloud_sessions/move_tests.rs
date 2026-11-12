@@ -4,6 +4,7 @@ use super::move_session::*;
 use super::move_session::{is_older, scrub};
 use super::*;
 use crate::cloud_sessions::docker_config::DockerProjectConfig;
+use crate::cloud_sessions::docker_start::DeferredLifecycle;
 use crate::codespaces::{GhOutput, GhRunner};
 use crate::remote::Machine;
 use crate::store::SessionLocation;
@@ -87,6 +88,8 @@ struct FakeHost {
     lists_worktree: Mutex<bool>,
     /// `applySnapshot` always finds the working copy in place (another move's worktree).
     always_reused: Mutex<bool>,
+    /// `(method, limit)` of every call that went through `request_timeout`.
+    timeouts: Mutex<Vec<(String, Option<Duration>)>>,
 }
 impl FakeHost {
     fn new() -> Arc<Self> {
@@ -108,6 +111,7 @@ impl FakeHost {
             apply_exists_on_rerun: Mutex::new(false),
             lists_worktree: Mutex::new(true),
             always_reused: Mutex::new(false),
+            timeouts: Mutex::new(vec![]),
         })
     }
     fn methods(&self) -> Vec<String> {
@@ -173,6 +177,19 @@ impl super::Host for FakeHost {
     fn disconnect(&self, id: &str) -> Result<(), String> {
         self.machines.lock().unwrap().retain(|m| m.id != id);
         Ok(())
+    }
+    fn request_timeout(
+        &self,
+        machine: &str,
+        method: &str,
+        params: Value,
+        timeout: Option<Duration>,
+    ) -> Result<Value, String> {
+        self.timeouts
+            .lock()
+            .unwrap()
+            .push((method.to_string(), timeout));
+        self.request(machine, method, params)
     }
     fn request(&self, _machine: &str, method: &str, params: Value) -> Result<Value, String> {
         self.log
@@ -3208,4 +3225,380 @@ fn an_api_move_is_refused_while_busy_or_already_moving() {
     assert!(fx.record().is_none(), "a refused move leaves no record");
     fx.svc.begin_move(request.clone(), &|| false).unwrap();
     assert!(fx.svc.begin_move(request, &|| false).is_err());
+}
+
+// ------------------------------------------------ waiting for a long restore
+
+const IN_PROGRESS: &str = "Host rejected request: A workspace restore is already in progress";
+
+fn fast_restore(fx: Fx, deadline_secs: u64) -> Fx {
+    Fx {
+        svc: fx.svc.with_restore_timing(RestoreTiming {
+            limit: RESTORE_RPC_TIMEOUT,
+            deadline: Duration::from_secs(deadline_secs),
+            poll: Duration::from_secs(5),
+            tick: Duration::from_millis(500),
+        }),
+        ..fx
+    }
+}
+
+#[test]
+fn a_restore_that_outlives_the_limit_is_waited_for_and_the_move_continues() {
+    let fx = fast_restore(Fx::new(), 900);
+    fx.host
+        .fail_once("workspace.applySnapshot", crate::remote::MAY_STILL_RUN);
+    fx.host.fail_once("workspace.applySnapshot", IN_PROGRESS);
+    let (result, events) = fx.run();
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(fx.host.count("workspace.applySnapshot"), 3);
+    assert!(fx.location().is_cloud());
+    let waiting = events
+        .iter()
+        .filter(|e| matches!(e, MoveEvent::Log(text) if text.contains("still restoring")))
+        .count();
+    assert_eq!(waiting, 1, "announced once, not once per poll");
+}
+
+#[test]
+fn a_shared_restore_answered_reused_after_our_lost_call_is_ours_to_remove() {
+    let fx = fast_restore(Fx::new(), 900);
+    fx.host
+        .fail_once("workspace.applySnapshot", crate::remote::MAY_STILL_RUN);
+    // Keep the record so the bookkeeping can be read.
+    fx.host.fail_once("sessions.import", "stop here");
+    assert!(fx.run().0.is_err());
+    assert_eq!(fx.host.count("workspace.applySnapshot"), 2);
+    let record = fx.record().unwrap();
+    assert!(record.created_worktree);
+    assert_eq!(record.host_cwd.as_deref(), Some("/workspaces/widgets-wt"));
+}
+
+#[test]
+fn an_in_progress_rejection_does_not_make_a_later_reused_answer_ours() {
+    let fx = fast_restore(Fx::new(), 900);
+    // The rejection comes before the action runs: our call did not run, so the worktree the
+    // Host reports as `reused` is another move's.
+    fx.host.fail_once("workspace.applySnapshot", IN_PROGRESS);
+    fx.host.fail_once("sessions.import", "stop here");
+    assert!(fx.run().0.is_err());
+    assert_eq!(fx.host.count("workspace.applySnapshot"), 2);
+    let record = fx.record().unwrap();
+    assert!(!record.created_worktree);
+    assert_eq!(record.host_cwd.as_deref(), Some("/workspaces/widgets-wt"));
+}
+
+#[test]
+fn a_cancel_during_the_restore_wait_aborts_and_keeps_the_record() {
+    let fx = fast_restore(Fx::new(), 900);
+    fx.host
+        .fail_once("workspace.applySnapshot", crate::remote::MAY_STILL_RUN);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let flag = cancel.clone();
+    *fx.host.on_request.lock().unwrap() = Some(Box::new(move |method| {
+        if method == "workspace.applySnapshot" {
+            flag.store(true, Ordering::SeqCst);
+            // `run_move` forwards the flag through a watcher that polls every 40 ms.
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }));
+    let (result, events) = fx.run_with(&|| false, &cancel);
+    assert_eq!(result.unwrap_err(), MOVE_ABORTED);
+    assert_eq!(fx.host.count("workspace.applySnapshot"), 1, "no re-send");
+    assert!(fx.record().is_some());
+    assert!(!events.iter().any(|e| matches!(e, MoveEvent::Failed(_))));
+    fx.assert_still_local_and_usable();
+}
+
+#[test]
+fn a_restore_that_never_finishes_fails_at_the_deadline_with_a_retry_message() {
+    let fx = fast_restore(Fx::new(), 20);
+    for _ in 0..50 {
+        fx.host.fail_once("workspace.applySnapshot", IN_PROGRESS);
+    }
+    let (result, events) = fx.run();
+    let error = result.unwrap_err();
+    assert!(error.contains("still restoring the code after"), "{error}");
+    assert!(error.contains("Retry later"), "{error}");
+    let count = fx.host.count("workspace.applySnapshot");
+    assert!((2..=6).contains(&count), "{count} sends");
+    assert!(matches!(events.last(), Some(MoveEvent::Failed(_))));
+    let record = fx.record().unwrap();
+    assert_eq!(record.failed_at, Some(MoveStep::RestoreCode));
+}
+
+#[test]
+fn another_busy_action_is_not_waited_for() {
+    let fx = fast_restore(Fx::new(), 900);
+    fx.host.fail_once(
+        "workspace.applySnapshot",
+        "Host rejected request: A turn is running in this project",
+    );
+    let (result, _) = fx.run();
+    assert!(result.unwrap_err().contains("A turn is running"));
+    assert_eq!(fx.host.count("workspace.applySnapshot"), 1);
+}
+
+#[test]
+fn the_long_limit_is_passed_for_apply_snapshot() {
+    let fx = Fx::new();
+    assert!(fx.run().0.is_ok());
+    let limits: Vec<_> = fx
+        .host
+        .timeouts
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(method, _)| method == "workspace.applySnapshot")
+        .map(|(_, limit)| *limit)
+        .collect();
+    assert_eq!(limits, vec![Some(RESTORE_RPC_TIMEOUT)]);
+}
+
+// ------------------------------------- a new sandbox's deferred lifecycle commands
+
+struct LifecycleShell {
+    calls: Mutex<Vec<(String, String)>>,
+    fail: Mutex<bool>,
+    /// Whether any call was given an abort that was already set.
+    aborted: Mutex<bool>,
+}
+impl super::backend::docker::SandboxShell for LifecycleShell {
+    fn run(
+        &self,
+        id: &str,
+        _remote: &str,
+        stdin: &str,
+        _on_line: &mut dyn FnMut(&str),
+        abort: &dyn Fn() -> bool,
+        _timeout: Duration,
+    ) -> Result<super::backend::docker::ShellOutput, String> {
+        *self.aborted.lock().unwrap() |= abort();
+        self.calls.lock().unwrap().push((id.into(), stdin.into()));
+        let failed = *self.fail.lock().unwrap();
+        Ok(super::backend::docker::ShellOutput {
+            success: !failed,
+            stdout: String::new(),
+            stderr: if failed {
+                "devcontainer exploded".into()
+            } else {
+                String::new()
+            },
+        })
+    }
+}
+struct NoSbx;
+impl crate::sandboxes::SbxRunner for NoSbx {
+    fn run(&self, _: &[String], _: Option<&str>) -> Result<crate::sandboxes::SbxOutput, String> {
+        Err("sbx is not used here".into())
+    }
+}
+struct NoSecrets;
+impl super::docker_start::SandboxSecrets for NoSecrets {
+    fn claude_auth(
+        &self,
+        _: Option<&str>,
+    ) -> Result<Option<super::docker_start::ClaudeAuth>, String> {
+        Ok(None)
+    }
+    fn git_payload(&self, _: &str, _: &str) -> Result<zeroize::Zeroizing<String>, String> {
+        Err("no credential".into())
+    }
+}
+
+/// A fixture whose move holds deferred lifecycle commands, as if a new sandbox's start had left
+/// them (the real sandbox start is tested in `docker_start_tests`).
+fn lifecycle_fx() -> (Fx, Arc<LifecycleShell>) {
+    let fx = Fx::new();
+    let shell = Arc::new(LifecycleShell {
+        calls: Mutex::new(vec![]),
+        fail: Mutex::new(false),
+        aborted: Mutex::new(false),
+    });
+    // `with_sandboxes` also registers the Docker backend; the move's workspace is a codespace.
+    let fx = Fx {
+        svc: fx
+            .svc
+            .with_sandboxes(Arc::new(NoSbx), shell.clone(), Arc::new(NoSecrets)),
+        ..fx
+    };
+    let mut record = fx.begin();
+    record.lifecycle = Some(DeferredLifecycle {
+        sandbox_id: "sbx_001newbox".into(),
+        workspace: "/home/agent/workspaces/widgets".into(),
+        config: None,
+        mount: true,
+        started: false,
+    });
+    fx.save_record(&record);
+    (fx, shell)
+}
+
+#[test]
+fn deferred_lifecycle_commands_start_once_after_the_code_is_restored() {
+    let (fx, shell) = lifecycle_fx();
+    // Not yet when the Host restores the code, already when the conversation is restored.
+    let seen = Arc::new(Mutex::new(vec![]));
+    {
+        let shell = shell.clone();
+        let seen = seen.clone();
+        *fx.host.on_request.lock().unwrap() = Some(Box::new(move |method| {
+            if matches!(method, "workspace.applySnapshot" | "sessions.import") {
+                seen.lock()
+                    .unwrap()
+                    .push((method.to_string(), shell.calls.lock().unwrap().len()));
+            }
+        }));
+    }
+    // A later failure and a Retry must not start them again.
+    fx.host.fail_once("sessions.import", "stop here");
+    assert!(fx.run().0.is_err());
+    assert!(fx.record().unwrap().lifecycle.unwrap().started);
+    assert!(fx.run().0.is_ok());
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            ("workspace.applySnapshot".to_string(), 0),
+            ("sessions.import".to_string(), 1),
+            ("sessions.import".to_string(), 1),
+        ]
+    );
+    let calls = shell.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "sbx_001newbox");
+    assert!(calls[0].1.contains("MODE='lifecycle'"), "{}", calls[0].1);
+    assert!(calls[0].1.contains("/home/agent/workspaces/widgets"));
+}
+
+#[test]
+fn a_cancel_does_not_abort_the_lifecycle_call_nor_start_it_again_when_kept() {
+    let (fx, shell) = lifecycle_fx();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let flag = cancel.clone();
+    *fx.host.on_request.lock().unwrap() = Some(Box::new(move |method| {
+        if method == "workspace.applySnapshot" {
+            flag.store(true, Ordering::SeqCst);
+            // `run_move` forwards the flag through a watcher that polls every 40 ms.
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }));
+    let _ = fx.run_with(&|| false, &cancel);
+    let record = fx.record().unwrap();
+    // Whether or not the cancel was seen before the call, it was made at most once, with
+    // no abort, and stays marked started so a cancel-keep never starts it a second time.
+    assert!(!*shell.aborted.lock().unwrap());
+    if shell.calls.lock().unwrap().len() == 1 {
+        assert!(record.lifecycle.unwrap().started);
+    }
+    assert!(shell.calls.lock().unwrap().len() <= 1);
+}
+
+#[test]
+fn a_target_without_deferred_lifecycle_commands_starts_nothing() {
+    let fx = Fx::new();
+    let shell = Arc::new(LifecycleShell {
+        calls: Mutex::new(vec![]),
+        fail: Mutex::new(false),
+        aborted: Mutex::new(false),
+    });
+    let fx = Fx {
+        svc: fx
+            .svc
+            .with_sandboxes(Arc::new(NoSbx), shell.clone(), Arc::new(NoSecrets)),
+        ..fx
+    };
+    assert!(fx.run().0.is_ok());
+    assert!(shell.calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn failing_to_start_the_lifecycle_commands_is_only_a_notice() {
+    let (fx, shell) = lifecycle_fx();
+    *shell.fail.lock().unwrap() = true;
+    fx.host.fail_once("sessions.import", "stop here");
+    let (result, events) = fx.run();
+    assert!(result.is_err(), "the later failure is the move's");
+    let record = fx.record().unwrap();
+    assert!(record.is_failed());
+    assert_eq!(record.failed_at, Some(MoveStep::RestoreConversation));
+    assert!(record
+        .notices
+        .iter()
+        .any(|n| n.contains("background commands") && n.contains("devcontainer exploded")));
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, MoveEvent::Notice(n) if n.contains("not started"))));
+    // Not tried again on Retry, and the move completes.
+    assert!(fx.run().0.is_ok());
+    assert_eq!(shell.calls.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn cancelling_keeps_a_new_sandbox_complete_but_a_deleted_one_gets_nothing() {
+    for delete in [false, true] {
+        let (fx, shell) = lifecycle_fx();
+        fx.host.fail_once("workspace.applySnapshot", "stop here");
+        assert!(fx.run().0.is_err());
+        let mut record = fx.record().unwrap();
+        assert!(!record.lifecycle.as_ref().unwrap().started);
+        // The move created this workspace.
+        record.workspace.as_mut().unwrap().created = true;
+        fx.save_record(&record);
+        let report = fx
+            .svc
+            .cancel_move(
+                fx.session,
+                CancelChoice {
+                    delete_workspace: delete,
+                },
+            )
+            .unwrap();
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert_eq!(report.deleted_workspace, delete);
+        assert_eq!(shell.calls.lock().unwrap().len(), usize::from(!delete));
+    }
+}
+
+#[test]
+fn a_failed_start_of_the_kept_sandbox_is_a_warning() {
+    let (fx, shell) = lifecycle_fx();
+    fx.host.fail_once("workspace.applySnapshot", "stop here");
+    assert!(fx.run().0.is_err());
+    let mut record = fx.record().unwrap();
+    record.workspace.as_mut().unwrap().created = true;
+    fx.save_record(&record);
+    *shell.fail.lock().unwrap() = true;
+    let report = fx
+        .svc
+        .cancel_move(fx.session, CancelChoice::default())
+        .unwrap();
+    assert!(report
+        .warnings
+        .iter()
+        .any(|w| w.contains("background commands")));
+    assert!(fx.record().is_none());
+}
+
+#[test]
+fn a_move_record_from_before_the_deferral_loads_and_behaves_as_before() {
+    let fx = Fx::new();
+    let record = fx.begin();
+    let mut value = serde_json::to_value(&record).unwrap();
+    assert!(value.get("lifecycle").is_none(), "None is not written");
+    value.as_object_mut().unwrap().remove("lifecycle");
+    let loaded: MoveRecord = serde_json::from_value(value).unwrap();
+    assert!(loaded.lifecycle.is_none());
+    // An old record with a deferred value round-trips too.
+    let with = MoveRecord {
+        lifecycle: Some(DeferredLifecycle {
+            sandbox_id: "sbx_1".into(),
+            workspace: "/w".into(),
+            config: Some(".devcontainer/x/devcontainer.json".into()),
+            mount: false,
+            started: true,
+        }),
+        ..record
+    };
+    let again: MoveRecord = serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+    assert_eq!(again.lifecycle, with.lifecycle);
 }

@@ -259,6 +259,7 @@ impl CloudSessions {
             mode: Some(target.mode),
             relay_port: target.relay_port,
             rebuild: false,
+            defer_lifecycle: false,
         };
         let mut record = fresh_sandbox_record(
             &name,

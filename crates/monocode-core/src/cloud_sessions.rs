@@ -768,6 +768,8 @@ pub struct CloudSessions {
     moves: Mutex<HashMap<i64, Arc<move_session::RunState>>>,
     /// Instances (by cloud key) whose return cleanup runs in this process.
     cleaning: Mutex<std::collections::HashSet<String>>,
+    /// Limits and pauses of the move's RestoreCode wait; tests shorten them.
+    restore_timing: move_session::RestoreTiming,
     /// Test seam of the move flip: runs after the Host link and before the location.
     #[cfg(test)]
     flip_hook: Mutex<Option<move_session::FlipHook>>,
@@ -796,6 +798,7 @@ impl CloudSessions {
             kit_seams: claude_setup::KitSeams::system(),
             moves: Mutex::new(HashMap::new()),
             cleaning: Mutex::new(Default::default()),
+            restore_timing: Default::default(),
             #[cfg(test)]
             flip_hook: Mutex::new(None),
         }
@@ -816,6 +819,11 @@ impl CloudSessions {
         self.sleep = Box::new(sleep);
         self.clock = Box::new(clock);
         self.follower_retry = Duration::ZERO;
+        self
+    }
+    #[cfg(test)]
+    fn with_restore_timing(mut self, timing: move_session::RestoreTiming) -> Self {
+        self.restore_timing = timing;
         self
     }
     #[cfg(all(test, unix))]

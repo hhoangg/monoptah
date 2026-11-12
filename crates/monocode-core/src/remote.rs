@@ -408,8 +408,17 @@ fn rpc_with_default(
         Err(ureq::Error::Transport(error)) if timeout.is_some() && timed_out(&error) => {
             return Err(MAY_STILL_RUN.into())
         }
-        Err(_) => {
-            return Err("The host request did not complete. Retry to confirm its result.".into())
+        Err(ureq::Error::Transport(error)) if timed_out(&error) => {
+            return Err(format!(
+                "The host request did not complete: no answer within {} s (the host may still be working). Retry to confirm its result.",
+                timeout.unwrap_or(default_timeout).as_secs_f64().ceil() as u64
+            ))
+        }
+        Err(error) => {
+            return Err(format!(
+                "The host request did not complete ({}). Retry to confirm its result.",
+                transport_detail(&error)
+            ))
         }
     };
     let status = response.status();
@@ -439,6 +448,45 @@ fn rpc_with_default(
         .get("result")
         .cloned()
         .ok_or_else(|| "Invalid host response".into())
+}
+
+/// A single-line description of a transport failure for the user: the error kind and its
+/// message, with any URL userinfo removed and the length capped. The bearer token travels
+/// only in a header, so it never appears here.
+fn transport_detail(error: &ureq::Error) -> String {
+    let kind = match error {
+        ureq::Error::Transport(transport) => format!("{:?}", transport.kind()),
+        ureq::Error::Status(..) => "Status".to_string(),
+    };
+    let full = format!("{kind}: {error}");
+    let one_line = strip_userinfo(&full.split_whitespace().collect::<Vec<_>>().join(" "));
+    if one_line.chars().count() > 200 {
+        let cut: String = one_line.chars().take(200).collect();
+        format!("{cut}...")
+    } else {
+        one_line
+    }
+}
+
+/// Removes `user:password@` from any `scheme://` URL inside `text`.
+fn strip_userinfo(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(index) = rest.find("://") {
+        let (head, tail) = rest.split_at(index + 3);
+        out.push_str(head);
+        let end = tail
+            .find(|c: char| c.is_whitespace() || c == '/')
+            .unwrap_or(tail.len());
+        let authority = &tail[..end];
+        match authority.rfind('@') {
+            Some(at) => out.push_str(&authority[at + 1..]),
+            None => out.push_str(authority),
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 // Only a refused connection proves the local forwarding listener is gone.
@@ -1792,9 +1840,13 @@ else:
         assert!(call(true)
             .unwrap_err()
             .starts_with("Machine is unreachable"));
-        assert!(call(false)
-            .unwrap_err()
-            .starts_with("The host request did not complete"));
+        let error = call(false).unwrap_err();
+        assert!(
+            error.starts_with("The host request did not complete ("),
+            "{error}"
+        );
+        assert!(!error.contains("no answer within"), "{error}");
+        assert!(!error.contains('\n'));
         server.join().unwrap();
     }
 
@@ -1875,7 +1927,24 @@ else:
             "{error}"
         );
         assert_ne!(error, MAY_STILL_RUN);
+        assert!(error.contains("no answer within 1 s"), "{error}");
+        assert!(error.contains("may still be working"), "{error}");
         assert!(server.join().unwrap());
+    }
+
+    #[test]
+    fn transport_detail_is_one_short_line_without_userinfo() {
+        assert_eq!(
+            strip_userinfo("x http://user:pw@127.0.0.1:1/rpc y"),
+            "x http://127.0.0.1:1/rpc y"
+        );
+        let error = ureq::get("http://user:secret@127.0.0.1:1/rpc")
+            .call()
+            .unwrap_err();
+        let detail = transport_detail(&error);
+        assert!(!detail.contains("secret"), "{detail}");
+        assert!(!detail.contains('\n'));
+        assert!(detail.chars().count() <= 203);
     }
 
     #[test]

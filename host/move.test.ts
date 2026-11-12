@@ -9,7 +9,9 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  statSync,
   truncateSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -826,3 +828,137 @@ describe("sessions.import", () => {
 function rewrite(text: string, cwd: string): string {
   return text.split("/workspaces/app").join(cwd);
 }
+
+describe("worktreeTree stat reuse", () => {
+  /** The old algorithm: a scratch index from a plain `read-tree HEAD`, then add -A and extras. */
+  function reference(repo: string, extra: string[] = []) {
+    const scratch = mkdtempSync(join(tmpdir(), "move-ref-index-"));
+    const env = { ...process.env, GIT_INDEX_FILE: join(scratch, "index") };
+    const run = (args: string[], input?: string) =>
+      execFileSync("git", args, { cwd: repo, env, input, encoding: "utf8" }).trim();
+    run(["read-tree", "HEAD"]);
+    run(["add", "-A"]);
+    if (extra.length) run(["update-index", "--add", "--remove", "-z", "--stdin"], extra.join("\0") + "\0");
+    const tree = run(["write-tree"]);
+    rmSync(scratch, { recursive: true, force: true });
+    return tree;
+  }
+
+  function repo(setup: (dir: string) => void = () => {}) {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "move-stat-")));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    git(dir, "init", "-q", "-b", "main");
+    setup(dir);
+    writeFileSync(join(dir, ".gitignore"), "ignored.txt\n");
+    writeFileSync(join(dir, "a.txt"), "one\n");
+    writeFileSync(join(dir, "b.txt"), "two\n");
+    git(dir, "add", ".");
+    git(dir, "commit", "-q", "-m", "init");
+    return dir;
+  }
+
+  const same = async (dir: string, extra: string[] = []) => {
+    const expected = reference(dir, extra);
+    expect(await worktreeTree(dir, extra)).toBe(expected);
+    return expected;
+  };
+
+  it("matches the old tree for a clean checkout", async () => {
+    const dir = repo();
+    expect(await same(dir)).toBe(git(dir, "rev-parse", "HEAD^{tree}"));
+  });
+
+  it("matches for a modified, a deleted, an untracked and an ignored file", async () => {
+    const dir = repo();
+    writeFileSync(join(dir, "a.txt"), "changed\n");
+    rmSync(join(dir, "b.txt"));
+    writeFileSync(join(dir, "new.txt"), "new\n");
+    writeFileSync(join(dir, "ignored.txt"), "x\n");
+    const tree = await same(dir);
+    const files = git(dir, "ls-tree", "-r", "--name-only", tree).split("\n");
+    expect(files).toContain("new.txt");
+    expect(files).not.toContain("b.txt");
+    expect(files).not.toContain("ignored.txt");
+  });
+
+  it("handles a file staged in the real index but not in HEAD like the old algorithm", async () => {
+    const dir = repo();
+    writeFileSync(join(dir, "staged.txt"), "s\n");
+    git(dir, "add", "staged.txt");
+    writeFileSync(join(dir, "ignored.txt"), "x\n");
+    git(dir, "add", "-f", "ignored.txt");
+    await same(dir);
+    await same(dir, ["ignored.txt"]);
+  });
+
+  it("includes an ignored file passed in extra", async () => {
+    const dir = repo();
+    writeFileSync(join(dir, "ignored.txt"), "x\n");
+    const tree = await worktreeTree(dir, ["ignored.txt"]);
+    expect(tree).toBe(reference(dir, ["ignored.txt"]));
+    expect(git(dir, "ls-tree", "-r", "--name-only", tree)).toContain("ignored.txt");
+  });
+
+  it("works in a linked worktree", async () => {
+    const dir = repo();
+    const linked = join(dir, "..", `${dir.split("/").pop()}-linked`);
+    git(dir, "worktree", "add", "-q", "-b", "other", linked);
+    cleanups.push(() => rmSync(linked, { recursive: true, force: true }));
+    writeFileSync(join(linked, "a.txt"), "linked change\n");
+    writeFileSync(join(linked, "n.txt"), "n\n");
+    await same(linked);
+  });
+
+  it("falls back correctly with core.splitIndex", async () => {
+    const dir = repo();
+    git(dir, "config", "core.splitIndex", "true");
+    git(dir, "update-index", "--split-index");
+    writeFileSync(join(dir, "a.txt"), "changed\n");
+    writeFileSync(join(dir, "n.txt"), "n\n");
+    await same(dir);
+  });
+
+  it("re-hashes a racily clean file changed without a size change", async () => {
+    const dir = repo();
+    // ctime always moves on a write, so ignore it: only size and mtime can reveal the change.
+    git(dir, "config", "core.trustctime", "false");
+    const file = join(dir, "a.txt");
+    const when = new Date(Math.floor(Date.now() / 1000) * 1000 - 5000);
+    utimesSync(file, when, when);
+    git(dir, "update-index", "--refresh");
+    // The index is as new as the entry, so the entry is racily clean: git must re-hash it.
+    const index = join(dir, ".git", "index");
+    utimesSync(index, when, when);
+    writeFileSync(file, "ONE\n");
+    utimesSync(file, when, when);
+    const tree = await same(dir);
+    expect(git(dir, "show", `${tree}:a.txt`)).toBe("ONE");
+  });
+
+  for (const [flag, label] of [
+    ["--assume-unchanged", "assume-unchanged"],
+    ["--skip-worktree", "skip-worktree"],
+  ] as const)
+    for (const withExtra of [false, true])
+      it(`matches the old tree for a modified ${label} file${withExtra ? " listed in extra" : ""}`, async () => {
+        const dir = repo();
+        git(dir, "update-index", flag, "a.txt");
+        writeFileSync(join(dir, "a.txt"), "changed\n");
+        writeFileSync(join(dir, "n.txt"), "n\n");
+        const tree = await same(dir, withExtra ? ["a.txt"] : []);
+        expect(git(dir, "ls-tree", "-r", "--name-only", tree)).toContain("n.txt");
+        expect(git(dir, "show", `${tree}:a.txt`)).toBe("changed");
+      });
+
+  it("never changes the real index", async () => {
+    const dir = repo();
+    writeFileSync(join(dir, "a.txt"), "changed\n");
+    const index = join(dir, ".git", "index");
+    const bytes = readFileSync(index);
+    const mtime = statSync(index).mtimeMs;
+    await worktreeTree(dir, ["a.txt"]);
+    expect(readFileSync(index).equals(bytes)).toBe(true);
+    expect(statSync(index).mtimeMs).toBe(mtime);
+    expect(existsSync(join(dir, ".git", "index.lock"))).toBe(false);
+  });
+});

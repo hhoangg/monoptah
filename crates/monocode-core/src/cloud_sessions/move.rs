@@ -37,7 +37,10 @@
 //!   transcript (`<id>/`, `file-history/<id>/`) are collected for a later return but
 //!   `sessions.import` carries only the JSONL.
 //! * **RestoreCode**: `workspace.applySnapshot`, whose result must repeat `head`, `branch` and
-//!   `tree`.
+//!   `tree`. The call has a 60 s limit of its own (a longer restore is waited for by
+//!   re-sending, so a cancel is seen within about a minute). When it outlives that, or the Host says a restore of the project is still
+//!   running, the move waits a few seconds and sends it again (a finished restore answers
+//!   `reused`), announcing it once, until a 15 minute deadline; a cancel ends the wait.
 //! * **RestoreConversation**: first any older Host session that still binds the same Claude
 //!   id is deleted (the Host refuses a second binding), then `sessions.import` with the same
 //!   id and `fromCwds` = project cwd, session cwd and their real paths. A `forked` decision
@@ -59,6 +62,18 @@
 //! way; Retry continues at the failed step; a flip that finds HEAD or the last row changed
 //! marks the move stale (Retry would fail again) and the user cancels and starts over.
 //!
+//! # A new sandbox and its background commands
+//!
+//! A sandbox the move creates ([`MoveTarget::NewSandbox`]) is started with
+//! [`CloudSessions::begin_sandbox_start_for_move`]: its start does NOT run the devcontainer
+//! lifecycle commands (`postCreateCommand` and friends), which can fetch gigabytes and starve
+//! the restore on a small sandbox. `step_workspace` copies what is needed to run them into
+//! [`MoveRecord::lifecycle`] before it forgets the start; RestoreCode starts them (best
+//! effort, a failure is only a notice) as soon as the code is in place, and saves that
+//! BEFORE the call so Retry never starts them twice. A cancel that keeps the sandbox starts
+//! them too, so it is a complete devcontainer; a deleted sandbox gets nothing. Records
+//! without the field behave as before.
+//!
 //! # Cancel
 //!
 //! [`CloudSessions::cancel_move`] deletes what the move created, best effort: the Host session
@@ -69,6 +84,7 @@
 //! ([`CancelReport::created_branch`]). Failures are listed in [`CancelReport::warnings`].
 use super::backend::{CloudBackendKind, CloudRef};
 use super::docker_config::DockerProjectConfig;
+use super::docker_start::DeferredLifecycle;
 use super::move_out;
 use super::{CloudSessions, CodespaceChoice, Target};
 use crate::remote::uploads::{self, UploadOptions};
@@ -78,6 +94,7 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Store setting prefix of a move in progress: `cloud-move:<session id>`.
 pub const SETTING_PREFIX: &str = "cloud-move:";
@@ -99,6 +116,43 @@ pub const CHANGED_AFTER_START: &str =
 const ALREADY_MOVING: &str = "This conversation is already being moved to the cloud.";
 pub const NO_MOVE: &str = "No move to the cloud is in progress for this conversation.";
 const STAGING: &str = "cloud-move";
+/// How long one `workspace.applySnapshot` call may take. A longer restore is then waited for
+/// by re-sending, which the Host answers at once with "already in progress" while it is busy,
+/// so a cancel is seen within about a minute. The ordinary 30 s limit of a request would
+/// abandon a restore that is still going too early.
+pub const RESTORE_RPC_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long the move waits in total for a restore that is still running on the Host.
+pub const RESTORE_DEADLINE: Duration = Duration::from_secs(15 * 60);
+/// Pause between two sends of `applySnapshot` while the Host is still restoring.
+pub const RESTORE_POLL: Duration = Duration::from_secs(5);
+/// How often the wait looks at `cancel`.
+pub const RESTORE_TICK: Duration = Duration::from_millis(200);
+/// What the Host says (inside `Host rejected request: ...`) while another restore of the
+/// project is still running. Only this busy action is waited for, never other ones.
+const RESTORE_IN_PROGRESS: &str = "workspace restore is already in progress";
+
+/// The timing of the RestoreCode wait. Tests shorten it.
+#[derive(Clone, Copy, Debug)]
+pub struct RestoreTiming {
+    /// Limit of one `applySnapshot` call.
+    pub limit: Duration,
+    /// Total time to wait for a restore that is still running.
+    pub deadline: Duration,
+    /// Pause between two sends.
+    pub poll: Duration,
+    /// Granularity of the cancel check inside a pause.
+    pub tick: Duration,
+}
+impl Default for RestoreTiming {
+    fn default() -> Self {
+        Self {
+            limit: RESTORE_RPC_TIMEOUT,
+            deadline: RESTORE_DEADLINE,
+            poll: RESTORE_POLL,
+            tick: RESTORE_TICK,
+        }
+    }
+}
 /// Capabilities the Host must announce (`environment.describe`) before a move uploads anything.
 const CAPABILITIES: [&str; 3] = ["workspace.applySnapshot", "sessions.import", "uploads"];
 
@@ -307,6 +361,11 @@ pub struct MoveRecord {
     /// narrow the user's global setting (rule D11), never widen it.
     #[serde(default)]
     pub kit_off: bool,
+    /// The lifecycle commands of a sandbox this move started, deferred until the code is
+    /// restored (see [`docker_start::DeferredLifecycle`]). `None` for every other target and
+    /// in records from before the deferral, which behave as they always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<DeferredLifecycle>,
 }
 
 impl MoveRecord {
@@ -685,6 +744,7 @@ impl CloudSessions {
             create_command: format!("move-{id}-{}", uuid::Uuid::new_v4()),
             owner: uuid::Uuid::new_v4().to_string(),
             restore_attempted: false,
+            lifecycle: None,
             started_by: request.started_by,
             kit_off: request.kit_off,
         };
@@ -1185,7 +1245,7 @@ impl CloudSessions {
                         project: None,
                     }),
                 MoveTarget::NewSandbox { config } => self
-                    .begin_sandbox_start_with_kit(
+                    .begin_sandbox_start_for_move(
                         &record.project_cwd,
                         &sandbox_config_for(config, &record.branch),
                         &record.branch,
@@ -1241,7 +1301,19 @@ impl CloudSessions {
         if let Some(info) = record.workspace.as_mut() {
             info.project = Some(project);
         }
+        // What the start left for the move to run once the code is restored. Saved with the
+        // project, before the start is forgotten below.
+        if workspace.start_session.is_some()
+            && workspace.backend == CloudBackendKind::DockerSandbox
+            && record.lifecycle.is_none()
+        {
+            record.lifecycle = self.peek_deferred_lifecycle(&workspace.name);
+        }
         save_record(&*self.store()?, record)?;
+        // Cleared only once the record holds it: a failed save above keeps the setting.
+        if record.lifecycle.is_some() && workspace.start_session.is_some() {
+            self.clear_deferred_lifecycle(&workspace.name);
+        }
         // The blank session the start made is plumbing: the moved session is the one row.
         if let Some(start) = workspace.start_session {
             // The start made no Host session unless something sent to it; if one exists it is
@@ -1404,6 +1476,48 @@ impl CloudSessions {
         self.host.request(&machine, method, params)
     }
 
+    /// [`Self::rpc`] with a limit for a long operation: at the limit the answer is
+    /// [`crate::remote::MAY_STILL_RUN`].
+    fn rpc_timeout(
+        &self,
+        record: &MoveRecord,
+        method: &str,
+        params: Value,
+        timeout: Option<Duration>,
+    ) -> Result<Value, String> {
+        let (_, project) = Self::workspace_of(record)?;
+        let machine = self.machine_of(&project)?;
+        self.host.request_timeout(&machine, method, params, timeout)
+    }
+
+    /// Pauses between two sends of `applySnapshot`, looking at `cancel` every tick. Fails
+    /// when the total wait of this step passed its deadline.
+    fn wait_for_restore(
+        &self,
+        timing: &RestoreTiming,
+        spent: &mut Duration,
+        cancel: &AtomicBool,
+    ) -> Result<(), Stop> {
+        if *spent >= timing.deadline {
+            return Err(Stop::Failed(format!(
+                "The Host is still restoring the code after {} minutes. Retry later to check its result.",
+                timing.deadline.as_secs() / 60
+            )));
+        }
+        let mut waited = Duration::ZERO;
+        loop {
+            if cancel.load(Ordering::SeqCst) {
+                return Err(Stop::Aborted);
+            }
+            if waited >= timing.poll {
+                return Ok(());
+            }
+            (self.sleep)(timing.tick);
+            waited += timing.tick;
+            *spent += timing.tick;
+        }
+    }
+
     // --------------------------------------------------------------- 4 upload
 
     fn step_upload(
@@ -1521,36 +1635,75 @@ impl CloudSessions {
             record.restore_attempted = true;
             save_record(&*self.store()?, record)?;
         }
-        let result = match self.rpc(record, "workspace.applySnapshot", params) {
-            Ok(result) => result,
-            // An older Host cannot repeat a default-branch restore (its detached worktree
-            // exists already). The earlier call's worktree is the result when the Host still
-            // lists it; the snapshot itself was verified by that earlier call.
-            Err(error)
-                if error.contains("already exists") && rerun && record.host_cwd.is_some() =>
-            {
-                let cwd = record.host_cwd.clone().unwrap_or_default();
-                let listed = self.rpc(
-                    record,
-                    "git.worktrees",
-                    json!({"projectId": project.project_id}),
-                )?;
-                let present = listed["worktrees"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .any(|w| {
-                        w["path"].as_str() == Some(cwd.as_str()) && w["missing"] != json!(true)
-                    });
-                if !present {
-                    return Err(Stop::Failed(format!(
+        let timing = self.restore_timing;
+        // Time spent in calls and pauses of this step, counted by hand so a test that skips
+        // the real pauses still reaches the deadline.
+        let mut spent = Duration::ZERO;
+        let mut rerun = rerun;
+        let mut announced = false;
+        let result = loop {
+            let started = Instant::now();
+            let answer = self.rpc_timeout(
+                record,
+                "workspace.applySnapshot",
+                params.clone(),
+                Some(timing.limit),
+            );
+            spent += started.elapsed();
+            match answer {
+                Ok(result) => break result,
+                // The call outlived our limit, or the Host is still running a restore of
+                // this project: wait, then ask again. Asking again is safe, a finished restore
+                // answers `reused`.
+                Err(error)
+                    if error == crate::remote::MAY_STILL_RUN
+                        || error.contains(RESTORE_IN_PROGRESS) =>
+                {
+                    if !announced {
+                        announced = true;
+                        events(MoveEvent::Log(
+                            "The Host is still restoring the code. Waiting for it to finish..."
+                                .into(),
+                        ));
+                    }
+                    // Only our own call that may still run can have created the worktree. The
+                    // "already in progress" rejection comes before the action runs, so it proves
+                    // our call did not run (another move's restore may be the one running).
+                    if !workspace.created && error == crate::remote::MAY_STILL_RUN {
+                        rerun = true;
+                    }
+                    self.wait_for_restore(&timing, &mut spent, cancel)?;
+                    continue;
+                }
+                // An older Host cannot repeat a default-branch restore (its detached worktree
+                // exists already). The earlier call's worktree is the result when the Host still
+                // lists it; the snapshot itself was verified by that earlier call.
+                Err(error)
+                    if error.contains("already exists") && rerun && record.host_cwd.is_some() =>
+                {
+                    let cwd = record.host_cwd.clone().unwrap_or_default();
+                    let listed = self.rpc(
+                        record,
+                        "git.worktrees",
+                        json!({"projectId": project.project_id}),
+                    )?;
+                    let present = listed["worktrees"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|w| {
+                            w["path"].as_str() == Some(cwd.as_str()) && w["missing"] != json!(true)
+                        });
+                    if !present {
+                        return Err(Stop::Failed(format!(
                         "The Host could not restore the code again ({error}). Cancel this move and start a new one."
                     )));
+                    }
+                    break json!({"cwd": cwd, "branch": record.branch, "head": record.head,
+                    "tree": record.tree, "createdWorktree": false, "reused": true});
                 }
-                json!({"cwd": cwd, "branch": record.branch, "head": record.head,
-                    "tree": record.tree, "createdWorktree": false, "reused": true})
+                Err(error) => return Err(Stop::Failed(error)),
             }
-            Err(error) => return Err(Stop::Failed(error)),
         };
         let text = |field: &str| result[field].as_str().unwrap_or_default().to_lowercase();
         if text("tree") != record.tree || text("head") != record.head {
@@ -1571,6 +1724,37 @@ impl CloudSessions {
         // A re-run finds the worktree in place (`reused`): the first creation is what counts.
         record.created_worktree |= result["createdWorktree"].as_bool().unwrap_or(false)
             || (rerun && no_prior_answer && result["reused"].as_bool().unwrap_or(false));
+        self.start_move_lifecycle(record, events)
+    }
+
+    /// Starts the lifecycle commands the new sandbox deferred, now that the code is in place.
+    /// Best effort: a failure is only a notice. `started` is saved BEFORE the call, so Retry
+    /// or a resume never starts them twice (a cancel does not abort the call).
+    fn start_move_lifecycle(
+        &self,
+        record: &mut MoveRecord,
+        events: &mut dyn FnMut(MoveEvent),
+    ) -> Result<(), Stop> {
+        let Some(mut deferred) = record.lifecycle.clone().filter(|d| !d.started) else {
+            return Ok(());
+        };
+        deferred.started = true;
+        record.lifecycle = Some(deferred.clone());
+        save_record(&*self.store()?, record)?;
+        events(MoveEvent::Log(
+            "Starting the repository's background commands".into(),
+        ));
+        // Never aborted by a cancel: the script is short and detaches the commands, and an
+        // abort could land after they were spawned, so a cancel-keep would start them twice.
+        if let Err(error) = self.start_deferred_lifecycle(&deferred, &|| false) {
+            let notice = format!(
+                "The repository's background commands (devcontainer postCreateCommand and similar) were not started: {}",
+                scrub(&error)
+            );
+            record.notices.push(notice.clone());
+            events(MoveEvent::Notice(notice));
+            save_record(&*self.store()?, record)?;
+        }
         Ok(())
     }
 
@@ -2080,6 +2264,13 @@ impl CloudSessions {
             .as_ref()
             .filter(|w| w.created && !w.name.is_empty());
         let deleting = choice.delete_workspace && created.is_some();
+        // What a sandbox start deferred, taken here too when the move had not taken it yet, so
+        // nothing stays behind.
+        let lifecycle = record.lifecycle.clone().or_else(|| {
+            created
+                .filter(|w| w.backend == CloudBackendKind::DockerSandbox)
+                .and_then(|w| self.peek_deferred_lifecycle(&w.name))
+        });
         let mut warnings = self.rollback_host(&record, deleting);
         {
             let store = self.store()?;
@@ -2129,7 +2320,20 @@ impl CloudSessions {
                     }
                 }
             } else {
+                // A kept sandbox should be a complete devcontainer: start what the move
+                // deferred, when the start got that far and it never ran.
+                if let Some(deferred) = lifecycle.as_ref().filter(|d| !d.started) {
+                    if let Err(e) = self.start_deferred_lifecycle(deferred, &|| false) {
+                        warnings.push(format!(
+                            "Could not start the background commands of the kept sandbox: {}",
+                            scrub(&e)
+                        ));
+                    }
+                }
                 report.kept_workspace = Some(workspace.cloud());
+            }
+            if workspace.backend == CloudBackendKind::DockerSandbox {
+                self.clear_deferred_lifecycle(&workspace.name);
             }
         }
         clear_record(&*self.store()?, session_id)?;
