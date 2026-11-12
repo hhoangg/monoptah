@@ -1034,6 +1034,7 @@ fn new_work_on_the_instance_is_refused_while_it_is_being_deleted() {
                 devcontainer_path: None,
                 claude_account: None,
                 claude_account_pinned: false,
+                work_branch: None,
             },
             HARNESS,
         );
@@ -1047,6 +1048,7 @@ fn new_work_on_the_instance_is_refused_while_it_is_being_deleted() {
                 devcontainer_path: None,
                 claude_account: None,
                 claude_account_pinned: false,
+                work_branch: None,
             },
             &mut |_| {},
         );

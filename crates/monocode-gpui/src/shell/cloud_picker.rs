@@ -49,6 +49,7 @@ pub(super) fn target_for(
         devcontainer_path: None,
         claude_account: account.map(str::to_owned),
         claude_account_pinned: account_pinned,
+        work_branch: None,
         codespace: choice,
     })
 }

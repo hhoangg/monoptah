@@ -2230,5 +2230,6 @@ fn fresh_sandbox_record(
         track_ready: false,
         sandbox_start: Some(start),
         kit_off: false,
+        work_branch: None,
     }
 }

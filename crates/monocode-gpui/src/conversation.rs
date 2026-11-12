@@ -189,9 +189,11 @@ pub(crate) struct Conversation {
     cloud_badge: Option<crate::cloud_mark::CloudBadge>,
     /// Lists the machine types of a project's repository for the codespace panel.
     machine_loader: Option<cloud_target::MachineLoader>,
-    cloud_anchors: [AnchorSlot; 4],
-    /// The branch rows of the cloud panel (Base branch, Branch), indexed by `CloudRefField`.
-    cloud_ref_anchors: [AnchorSlot; 2],
+    cloud_anchors: [AnchorSlot; 6],
+    /// The branch rows of the cloud panel (Base branch), indexed by `CloudRefField`.
+    cloud_ref_anchors: [AnchorSlot; 1],
+    /// Lists the saved Docker accounts for the sandbox panel (off the UI thread).
+    docker_accounts_loader: cloud_target::DockerAccountsLoader,
     /// The open branch picker of one of those rows.
     cloud_picker: Option<cloud_branches::CloudRefPicker>,
     /// Where the cloud panel's branch lists come from.
@@ -827,6 +829,7 @@ impl Conversation {
             machine_loader: None,
             cloud_anchors: Default::default(),
             cloud_ref_anchors: Default::default(),
+            docker_accounts_loader: cloud_target::system_docker_accounts(),
             cloud_picker: None,
             branch_source: Default::default(),
             cloud_draft: None,

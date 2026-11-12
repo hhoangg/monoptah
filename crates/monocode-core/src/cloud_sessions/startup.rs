@@ -320,6 +320,10 @@ pub struct StartRecord {
     /// for `kit: "none"`. It can only narrow the global setting (rule D11), never widen it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub kit_off: bool,
+    /// A branch to create in the new codespace (`git switch -c`) before the project opens.
+    /// Only set for a codespace this app created on a different base branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_branch: Option<String>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -355,6 +359,7 @@ impl StartRecord {
             track_ready: resolved.created,
             sandbox_start: None,
             kit_off: false,
+            work_branch: None,
         }
     }
     /// The backend this start runs on.
@@ -561,6 +566,42 @@ impl StartRecord {
         self.error = Some(error);
         self.finished_at = Some(at);
     }
+}
+
+/// The working branch a start asks for: `Some` only for a NEW codespace when the name differs
+/// from the branch the codespace is created on. An invalid name is refused (nothing is created).
+pub(super) fn work_branch_of(target: &Target) -> Result<Option<String>, String> {
+    if target.codespace != super::CodespaceChoice::New {
+        return Ok(None);
+    }
+    let Some(branch) = target
+        .work_branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+    else {
+        return Ok(None);
+    };
+    if !super::docker_config::valid_ref(branch) {
+        return Err("The branch name contains invalid characters.".into());
+    }
+    let base = target.branch.as_deref().map(str::trim).unwrap_or_default();
+    Ok((branch != base).then(|| branch.to_owned()))
+}
+
+/// The script that puts the codespace's checkout on `branch`: nothing when it is already
+/// there, a plain switch when the branch exists, `git switch -c` otherwise. Safe to run twice.
+pub(super) fn work_branch_script(remote_cwd: &str, branch: &str) -> Result<String, String> {
+    codespaces::valid_remote_path(remote_cwd)?;
+    if !super::docker_config::valid_ref(branch) {
+        return Err("The branch name contains invalid characters.".into());
+    }
+    Ok(format!(
+        "set -e\ncd '{remote_cwd}'\n\
+         if [ \"$(git rev-parse --abbrev-ref HEAD)\" = '{branch}' ]; then exit 0; fi\n\
+         if git show-ref --verify --quiet 'refs/heads/{branch}'; then git switch '{branch}'; \
+         else git switch -c '{branch}'; fi\n"
+    ))
 }
 
 /// What [`CloudSessions::run_start`] reports, in order.
@@ -851,17 +892,60 @@ impl CloudSessions {
         // An account that cannot be used fails here, before a codespace is created for it.
         let claude = self.codespace_start_pin(local_cwd, &target)?;
         claude.validate(&*self.store()?)?;
+        // A working branch that cannot be created fails here too, before anything is billed.
+        let work_branch = work_branch_of(&target)?;
         let began = self.now();
         let resolved = self.resolve_codespace(local_cwd, target, &mut |_| {})?;
         self.invalidate(&resolved.name);
-        self.record_start(local_cwd, harness, &resolved, began, !kit, &claude)
+        let (session, mut record) = self
+            .record_start(local_cwd, harness, &resolved, began, !kit, &claude)
             .map_err(|error| {
                 if resolved.created {
                     created_note(&resolved.name, &error)
                 } else {
                     error
                 }
-            })
+            })?;
+        if let (Some(branch), true) = (work_branch, resolved.created) {
+            record.work_branch = Some(branch);
+            let saved = self
+                .store()
+                .and_then(|store| save_start_record(&store, &record));
+            if let Err(error) = saved {
+                if let Ok(store) = self.store() {
+                    let _ = store.forget_cloud_session(session.id);
+                    let _ = remove_start_record(&store, session.id);
+                }
+                return Err(created_note(&resolved.name, &error));
+            }
+        }
+        Ok((session, record))
+    }
+
+    /// Creates the working branch in the new codespace when the start asks for one. Runs the
+    /// idempotent [`work_branch_script`] over the codespace's ssh, so a retry after a failure
+    /// (or after the branch already exists) is safe.
+    fn switch_work_branch(
+        &self,
+        record: &mut StartRecord,
+        branch: &str,
+        events: &mut dyn FnMut(StartEvent),
+    ) -> Result<(), Stop> {
+        // The step the failure is shown under, until Connect starts for real.
+        record.start_step(StepKind::Connect, self.now());
+        let line = format!("{PROGRESS_PREFIX}Creating branch {branch}");
+        record.push_log(&line);
+        events(StartEvent::Log(line));
+        self.publish(record, events);
+        let script = work_branch_script(&record.remote_cwd, branch)?;
+        self.backend(record.backend())?
+            .run_script(&record.codespace, &script, false)
+            .map_err(|error| {
+                Stop::Failed(format!(
+                    "Could not create branch {branch} in the codespace: {error}"
+                ))
+            })?;
+        Ok(())
     }
     pub(super) fn record_start(
         &self,
@@ -1057,6 +1141,12 @@ impl CloudSessions {
         self.invalidate(&name);
         if aborted() {
             return Err(Stop::Aborted);
+        }
+        if let Some(branch) = record.work_branch.clone() {
+            self.switch_work_branch(record, &branch, events)?;
+            if aborted() {
+                return Err(Stop::Aborted);
+            }
         }
 
         let (tx, rx) = mpsc::channel::<Msg>();

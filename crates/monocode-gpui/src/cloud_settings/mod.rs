@@ -1011,7 +1011,10 @@ impl CloudSettings {
             DefaultBackend::Codespace => {
                 (&self.form.codespace.claude, model::CODESPACE_SECRET_LABEL)
             }
-            DefaultBackend::Sandbox => (&self.form.sandbox.claude, "None"),
+            DefaultBackend::Sandbox => (
+                &self.form.sandbox.claude,
+                crate::cloud_presets::SANDBOX_NO_CLAUDE_LABEL,
+            ),
         };
         let mut options = vec![Opt {
             label: none_label.into(),
@@ -1096,7 +1099,7 @@ impl CloudSettings {
             Select::DockerAccount => {
                 let current = &typed.sandbox.docker_account;
                 let mut options = vec![Opt {
-                    label: "Machine sign-in (sbx login)".into(),
+                    label: crate::cloud_presets::MACHINE_SIGN_IN_LABEL.into(),
                     selected: current.is_none(),
                     pick: Pick::DockerAccount(None),
                 }];
@@ -2008,7 +2011,10 @@ impl CloudSettings {
                 model::summary_line(
                     self.tab,
                     &model::size_label(typed.sandbox.cpus, &typed.sandbox.memory),
-                    &account_label(&typed.sandbox.claude, "None"),
+                    &account_label(
+                        &typed.sandbox.claude,
+                        crate::cloud_presets::SANDBOX_NO_CLAUDE_LABEL,
+                    ),
                     docker.as_deref(),
                     kit_on,
                 )

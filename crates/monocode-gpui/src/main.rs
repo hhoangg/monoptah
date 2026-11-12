@@ -19,6 +19,7 @@ mod cloud_dialog_ui;
 mod cloud_kit_ui;
 mod cloud_mark;
 mod cloud_move_dialog;
+mod cloud_presets;
 mod cloud_settings;
 mod cloud_start_view;
 mod cloud_wake;

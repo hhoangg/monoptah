@@ -38,6 +38,10 @@ struct Gh {
     /// Set once the follower delivered its lines; the host waits for it to stay deterministic.
     delivered: Arc<AtomicBool>,
     on_view: Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// The stdin of every `codespace ssh` call that had one (the scripts sent to the codespace).
+    scripts: Mutex<Vec<String>>,
+    /// Makes the script that creates the working branch fail.
+    switch_error: Mutex<Option<String>>,
 }
 impl Gh {
     fn new(states: &[&str], log: &[&'static str]) -> Arc<Self> {
@@ -48,6 +52,8 @@ impl Gh {
             calls: Mutex::new(vec![]),
             delivered: Arc::new(AtomicBool::new(log.is_empty())),
             on_view: Mutex::new(None),
+            scripts: Mutex::new(vec![]),
+            switch_error: Mutex::new(None),
         })
     }
     fn failing_follower(states: &[&str]) -> Arc<Self> {
@@ -73,9 +79,21 @@ fn ok(stdout: &str) -> Result<GhOutput, String> {
     })
 }
 impl GhRunner for Gh {
-    fn run(&self, args: &[String], _stdin: Option<&str>) -> Result<GhOutput, String> {
+    fn run(&self, args: &[String], stdin: Option<&str>) -> Result<GhOutput, String> {
         let line = args.join(" ");
         self.calls.lock().unwrap().push(line.clone());
+        if let (true, Some(script)) = (line.starts_with("codespace ssh"), stdin) {
+            self.scripts.lock().unwrap().push(script.to_owned());
+            if script.contains("git switch") {
+                if let Some(error) = self.switch_error.lock().unwrap().clone() {
+                    return Ok(GhOutput {
+                        success: false,
+                        stdout: String::new(),
+                        stderr: error,
+                    });
+                }
+            }
+        }
         if line.starts_with("auth status") {
             ok(AUTH_OK)
         } else if line.starts_with("api --method POST") {
@@ -347,6 +365,7 @@ fn new_target() -> Target {
         devcontainer_path: None,
         claude_account: None,
         claude_account_pinned: false,
+        work_branch: None,
     }
 }
 fn named_target() -> Target {
@@ -358,6 +377,7 @@ fn named_target() -> Target {
         devcontainer_path: None,
         claude_account: None,
         claude_account_pinned: false,
+        work_branch: None,
     }
 }
 impl Fx {
@@ -806,6 +826,128 @@ fn begin_start_failing_before_a_codespace_exists_creates_nothing() {
     let store = f.store.lock().unwrap();
     assert!(store.sessions().unwrap().is_empty());
     assert!(pending_starts(&store).is_empty());
+}
+
+fn switch_scripts(f: &Fx) -> Vec<String> {
+    f.gh.scripts
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| s.contains("git switch"))
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn a_working_branch_is_created_in_the_new_codespace_before_the_project_opens() {
+    let f = fx(Gh::new(&["Available"], LOG));
+    let target = Target {
+        work_branch: Some("monoptah/feature-1".into()),
+        ..new_target()
+    };
+    let (session, record) = f.svc.begin_start("/p", target, "claude").unwrap();
+    assert_eq!(record.work_branch.as_deref(), Some("monoptah/feature-1"));
+    assert_eq!(
+        f.record(session.id).unwrap().work_branch.as_deref(),
+        Some("monoptah/feature-1")
+    );
+    let (result, _) = f.run(session.id);
+    result.unwrap();
+    let scripts = switch_scripts(&f);
+    assert_eq!(scripts.len(), 1, "{scripts:?}");
+    assert!(
+        scripts[0].contains("cd '/workspaces/widgets'"),
+        "{}",
+        scripts[0]
+    );
+    assert!(scripts[0].contains("git switch -c 'monoptah/feature-1'"));
+    assert!(scripts[0].contains("git show-ref --verify --quiet 'refs/heads/monoptah/feature-1'"));
+}
+
+#[test]
+fn no_branch_is_created_when_the_working_branch_is_the_base_or_unset() {
+    for work in [None, Some("main"), Some(" main "), Some(" ")] {
+        let f = fx(Gh::new(&["Available"], LOG));
+        let target = Target {
+            work_branch: work.map(str::to_owned),
+            ..new_target()
+        };
+        let (session, record) = f.svc.begin_start("/p", target, "claude").unwrap();
+        assert_eq!(record.work_branch, None, "{work:?}");
+        f.run(session.id).0.unwrap();
+        assert!(switch_scripts(&f).is_empty(), "{work:?}");
+    }
+}
+
+#[test]
+fn a_working_branch_is_ignored_for_an_existing_codespace() {
+    let f = fx(Gh::new(&["Available"], LOG));
+    let target = Target {
+        work_branch: Some("other".into()),
+        ..named_target()
+    };
+    let (_, record) = f.svc.begin_start("/p", target, "claude").unwrap();
+    assert_eq!(record.work_branch, None);
+}
+
+#[test]
+fn an_invalid_working_branch_is_refused_before_any_call() {
+    for bad in [
+        "-x",
+        "a b",
+        "a..b",
+        "a;rm -rf /",
+        "x'y",
+        "$(id)",
+        "a/",
+        "/a",
+        "a.lock",
+    ] {
+        let f = fx(Gh::new(&["Available"], LOG));
+        let target = Target {
+            work_branch: Some(bad.into()),
+            ..new_target()
+        };
+        let error = f.svc.begin_start("/p", target, "claude").unwrap_err();
+        assert!(error.contains("invalid characters"), "{bad}: {error}");
+        assert!(f.gh.calls().is_empty(), "{bad}: {:?}", f.gh.calls());
+        assert!(f.store.lock().unwrap().sessions().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn a_failed_branch_creation_fails_the_start_and_a_retry_runs_it_again() {
+    let f = fx(Gh::new(&["Available"], LOG));
+    *f.gh.switch_error.lock().unwrap() = Some("fatal: not a git repository".into());
+    let target = Target {
+        work_branch: Some("feature/x".into()),
+        ..new_target()
+    };
+    let (session, _) = f.svc.begin_start("/p", target, "claude").unwrap();
+    let (result, _) = f.run(session.id);
+    let error = result.unwrap_err();
+    assert!(
+        error.contains("Could not create branch feature/x")
+            && error.contains("not a git repository"),
+        "{error}"
+    );
+    let record = f.record(session.id).unwrap();
+    assert!(record.is_failed());
+    assert_eq!(record.work_branch.as_deref(), Some("feature/x"));
+    // The retry goes through the same step; the script is the same idempotent one.
+    *f.gh.switch_error.lock().unwrap() = None;
+    f.run(session.id).0.unwrap();
+    assert_eq!(switch_scripts(&f).len(), 2);
+}
+
+#[test]
+fn the_working_branch_script_is_idempotent_and_quotes_its_inputs() {
+    let script = super::startup::work_branch_script("/workspaces/widgets", "a/b-1").unwrap();
+    assert!(script.contains("= 'a/b-1' ]; then exit 0"), "{script}");
+    assert!(script.contains("git switch 'a/b-1'"));
+    assert!(script.contains("git switch -c 'a/b-1'"));
+    assert!(super::startup::work_branch_script("/workspaces/w;x", "a").is_err());
+    assert!(super::startup::work_branch_script("/workspaces/w", "a'b").is_err());
 }
 
 // --------------------------------------------------------------------- run

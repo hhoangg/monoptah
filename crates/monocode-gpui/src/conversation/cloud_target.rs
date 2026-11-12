@@ -4,17 +4,19 @@
 //! `shell/cloud_create.rs`), which makes the resource and the session at once, queues the composer
 //! text as its first prompt and follows the start. With an empty prompt Send stays disabled.
 //!
-//! The project's saved Docker config is only the default. The panel (see `cloud_panel.rs`) lets
-//! the user override the size, lifetime, base branch, feature branch and Claude account of a
-//! sandbox, or the machine and branch of a codespace, for this session only: the overrides are
-//! applied to a copy of the config when the prompt is sent and nothing is saved back.
+//! The project's Cloud settings are only the defaults. The panel (see `cloud_panel.rs`) has the
+//! same rows for both backends and lets the user override them for this session only: size or
+//! machine, runtime limit or idle stop, base branch, the working branch, the Docker account and
+//! the Claude account. A row that differs from the project default is marked. The overrides are
+//! applied to a copy of the settings when the prompt is sent and nothing is saved back.
 use super::cloud_branches::BranchList;
 use super::*;
-use crate::cloud_settings::model::AccountChoice;
+use crate::cloud_presets::AccountChoice;
 use monocode_core::cloud_sessions::docker_config::{self, DockerProjectConfig};
 use monocode_core::cloud_sessions::kit::Workspace;
-use monocode_core::cloud_sessions::project_cloud::{self, CodespaceProjectConfig};
+use monocode_core::cloud_sessions::project_cloud::{self, CodespaceProjectConfig, DefaultBackend};
 use monocode_core::codespaces::{self, MachineType};
+use monocode_core::docker_accounts::{DockerAccountSummary, DockerAccounts};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CloudTarget {
@@ -33,6 +35,13 @@ impl CloudTarget {
         match self {
             Self::Codespace => "codespace",
             Self::DockerSandbox => "Docker sandbox",
+        }
+    }
+    /// The backend as the project's Cloud settings name it.
+    pub(crate) fn backend(self) -> DefaultBackend {
+        match self {
+            Self::Codespace => DefaultBackend::Codespace,
+            Self::DockerSandbox => DefaultBackend::Sandbox,
         }
     }
     /// The muted billing note under the panel title.
@@ -57,13 +66,27 @@ pub(crate) enum Machines {
 pub(crate) type MachineLoader =
     Arc<dyn Fn(String) -> Result<Vec<MachineType>, String> + Send + Sync>;
 
+/// Lists the saved Docker accounts (no token). Blocking: runs on a worker.
+pub(crate) type DockerAccountsLoader =
+    Arc<dyn Fn(&Database) -> Result<Vec<DockerAccountSummary>, String> + Send + Sync>;
+
+/// The real loader: the credentials database of the store's data directory.
+pub(crate) fn system_docker_accounts() -> DockerAccountsLoader {
+    Arc::new(|store| {
+        let accounts = DockerAccounts::for_store(&*locked(store)?)?;
+        accounts.list()
+    })
+}
+
 /// A setting of the cloud panel that opens a menu.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CloudField {
-    Compute,
+    Size,
     Runtime,
-    Account,
+    Idle,
     Machine,
+    DockerAccount,
+    Claude,
 }
 impl CloudField {
     pub(super) fn index(self) -> usize {
@@ -71,23 +94,91 @@ impl CloudField {
     }
 }
 
-/// Compute sizes a sandbox can be created with: `(cpus, memory)`.
-pub(crate) const COMPUTE_CHOICES: [(u32, &str); 2] = [(2, "4g"), (4, "8g")];
-/// Runtime limits, the sandbox stops when it runs out.
-pub(crate) const RUNTIME_CHOICES: [&str; 3] = ["1h", "2h", "4h"];
-
-/// `1h` -> `1 hour then stop`.
-pub(crate) fn runtime_label(ttl: &str) -> String {
-    match ttl.strip_suffix('h').and_then(|n| n.parse::<u32>().ok()) {
-        Some(1) => "1 hour then stop".into(),
-        Some(n) => format!("{n} hours then stop"),
-        None => format!("{ttl} then stop"),
-    }
+/// A row of the panel, in display order. Both backends show the same shape: place and size,
+/// lifetime, base and working branch, accounts, Claude setup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CloudRow {
+    Machine,
+    Size,
+    Idle,
+    Runtime,
+    Base,
+    Branch,
+    DockerAccount,
+    Claude,
+    Kit,
 }
-
-/// `2 vCPU / 4 GiB`.
-pub(crate) fn size_label(cpus: u32, memory: &str) -> String {
-    format!("{cpus} vCPU / {}", memory_label(memory))
+impl CloudRow {
+    /// The rows of `target`, top to bottom.
+    pub(crate) fn of(target: CloudTarget) -> &'static [CloudRow] {
+        match target {
+            CloudTarget::Codespace => &[
+                Self::Machine,
+                Self::Idle,
+                Self::Base,
+                Self::Branch,
+                Self::Claude,
+                Self::Kit,
+            ],
+            CloudTarget::DockerSandbox => &[
+                Self::Size,
+                Self::Runtime,
+                Self::Base,
+                Self::Branch,
+                Self::DockerAccount,
+                Self::Claude,
+                Self::Kit,
+            ],
+        }
+    }
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Machine => "Machine",
+            Self::Size => "Size",
+            Self::Idle => "Stop when idle",
+            Self::Runtime => "Runtime limit",
+            Self::Base => "Base branch",
+            Self::Branch => "Branch",
+            Self::DockerAccount => "Docker account",
+            Self::Claude => "Claude account",
+            Self::Kit => "Claude setup",
+        }
+    }
+    pub(super) fn id(self) -> &'static str {
+        match self {
+            Self::Machine => "cloud-row-machine",
+            Self::Size => "cloud-row-size",
+            Self::Idle => "cloud-row-idle",
+            Self::Runtime => "cloud-row-runtime",
+            Self::Base => "cloud-row-base",
+            Self::Branch => "cloud-row-branch",
+            Self::DockerAccount => "cloud-row-docker-account",
+            Self::Claude => "cloud-row-claude",
+            Self::Kit => "cloud-row-kit",
+        }
+    }
+    pub(super) fn icon(self) -> &'static str {
+        match self {
+            Self::Machine => "terminal",
+            Self::Size => "rocket",
+            Self::Idle | Self::Runtime => "clock",
+            Self::Base | Self::Branch => "git-branch",
+            Self::DockerAccount | Self::Claude => "account-user",
+            Self::Kit => "sparkles",
+        }
+    }
+    /// The menu behind the row, when it has one.
+    pub(super) fn field(self) -> Option<CloudField> {
+        Some(match self {
+            Self::Machine => CloudField::Machine,
+            Self::Size => CloudField::Size,
+            Self::Idle => CloudField::Idle,
+            Self::Runtime => CloudField::Runtime,
+            Self::DockerAccount => CloudField::DockerAccount,
+            Self::Claude => CloudField::Claude,
+            Self::Base | Self::Branch | Self::Kit => return None,
+        })
+    }
 }
 
 /// What sending the first prompt asks the shell for.
@@ -96,12 +187,18 @@ pub(crate) struct CloudCreate {
     pub target: CloudTarget,
     /// The local project the session twins.
     pub project: String,
-    /// Docker: the new feature branch. Codespace: the branch the codespace is created on.
+    /// Docker: the new feature branch. Codespace: the base branch the codespace is created on.
     pub branch: String,
     /// Docker only: the project config with this session's overrides applied, validated.
     pub config: Option<DockerProjectConfig>,
-    /// Codespace only: the machine type picked for this session; `None` keeps the default.
+    /// Codespace only: the machine type picked for this session; `None` keeps the project's.
     pub machine: Option<String>,
+    /// Codespace only: minutes before the idle codespace stops, only when changed for this
+    /// session; `None` keeps the project's.
+    pub idle_timeout_minutes: Option<u32>,
+    /// Codespace only: the working branch, created in the codespace with `git switch -c` when
+    /// it differs from `branch` (the base the codespace is created on).
+    pub work_branch: Option<String>,
     /// The app Claude account of this session when `account_pinned` (a Docker Sandbox carries
     /// it in `config` as well). Ignored otherwise: the instance follows the project.
     pub account: Option<String>,
@@ -121,42 +218,74 @@ pub(crate) struct CreateCloudSession(pub CloudCreate);
 /// Emitted when the Docker Sandbox row is picked and the project has no saved config.
 pub(crate) struct OpenDockerSetup(pub String);
 /// Asks the shell to open the project's Cloud settings, on `backend` or else the project's
-/// default backend. (The Workspace menu's item comes with the panel redesign.)
-#[allow(dead_code)]
+/// default backend.
 pub(crate) struct OpenProjectCloudSettings {
     pub cwd: String,
-    pub backend: Option<monocode_core::cloud_sessions::project_cloud::DefaultBackend>,
+    pub backend: Option<DefaultBackend>,
 }
 impl EventEmitter<OpenProjectCloudSettings> for Conversation {}
+/// Asks the shell to open the picker of the open project's existing instances of `backend`.
+pub(crate) struct OpenExistingInstance {
+    pub backend: DefaultBackend,
+}
+impl EventEmitter<OpenExistingInstance> for Conversation {}
 /// Emitted by the "Claude setup" row to open Settings > Cloud.
 pub(crate) struct OpenCloudSettings;
 impl EventEmitter<OpenCloudSettings> for Conversation {}
 impl EventEmitter<CreateCloudSession> for Conversation {}
 impl EventEmitter<OpenDockerSetup> for Conversation {}
 
-pub(super) struct CloudDraft {
-    pub target: CloudTarget,
-    /// Docker: the feature branch, editable. Codespace: the branch the codespace is created on.
-    pub branch: Entity<input::Input>,
-    /// Docker: the base branch, editable. Starts as the project's `base_ref`.
-    pub base: Entity<input::Input>,
-    /// What `base` holds, mirrored so labels need no entity read.
-    pub base_text: String,
-    /// The project's saved config: only the default of the overrides below (Docker).
-    pub config: Option<DockerProjectConfig>,
-    /// Docker overrides for this session, seeded from `config`.
+/// The project's values the panel starts from, and what a changed row is compared with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CloudDefaults {
+    /// Docker: the size and the runtime limit.
     pub cpus: u32,
     pub memory: String,
     pub ttl: String,
+    /// Codespace: the machine (`None` is the default machine) and the idle stop.
+    pub machine: Option<String>,
+    pub idle: u32,
+    /// The base branch text: Docker's `base_ref`; a codespace's base branch, else HEAD.
+    pub base: String,
+    /// The app Claude account of the project's backend.
+    pub claude: Option<String>,
+    pub docker_account: Option<String>,
+}
+
+pub(super) struct CloudDraft {
+    pub target: CloudTarget,
+    /// Docker: the new feature branch. Codespace: the working branch, which follows the base
+    /// branch until the user types another name.
+    pub branch: Entity<input::Input>,
+    /// The base branch, editable. Starts as the project's.
+    pub base: Entity<input::Input>,
+    /// What `base` holds, mirrored so labels need no entity read.
+    pub base_text: String,
+    /// Codespace: the working branch is still the base branch (typing another name ends it).
+    pub branch_follows_base: bool,
+    /// The project's saved Docker config: only the default of the overrides below (Docker).
+    pub config: Option<DockerProjectConfig>,
+    /// The project's values, see [`CloudDefaults`].
+    pub defaults: CloudDefaults,
+    /// Overrides for this session, seeded from `defaults`.
+    pub cpus: u32,
+    pub memory: String,
+    pub ttl: String,
+    pub idle: u32,
     pub account: Option<String>,
+    pub docker_account: Option<String>,
     /// Accounts with a setup-token or an API key, read when the panel opened.
     pub accounts: Vec<AccountChoice>,
+    /// The saved Docker accounts, `None` while they are read (Docker only).
+    pub docker_accounts: Option<Vec<DockerAccountSummary>>,
+    /// Which listing the answer belongs to.
+    pub docker_accounts_request: u64,
     /// Codespace: the machine picked, `None` while the default stays.
     pub machine: Option<String>,
     pub machines: Machines,
     /// Which listing the answer belongs to.
     pub machines_request: u64,
-    /// The repository's branches for the Base branch / Branch row.
+    /// The repository's branches for the Base branch row.
     pub branches: BranchList,
     /// Which listing the answer belongs to.
     pub branches_request: u64,
@@ -178,23 +307,61 @@ pub(super) struct CloudDraft {
     _events: Vec<Subscription>,
 }
 
+impl CloudDraft {
+    fn machine_name(&self) -> &str {
+        self.machine
+            .as_deref()
+            .unwrap_or(codespaces::DEFAULT_MACHINE)
+    }
+
+    /// The row's value differs from the project default (the row is marked for this session).
+    pub(super) fn row_changed(&self, row: CloudRow) -> bool {
+        let defaults = &self.defaults;
+        match row {
+            CloudRow::Machine => {
+                self.machine_name()
+                    != defaults
+                        .machine
+                        .as_deref()
+                        .unwrap_or(codespaces::DEFAULT_MACHINE)
+            }
+            CloudRow::Size => (self.cpus, &self.memory) != (defaults.cpus, &defaults.memory),
+            CloudRow::Idle => self.idle != defaults.idle,
+            CloudRow::Runtime => self.ttl != defaults.ttl,
+            CloudRow::Base => self.base_text.trim() != defaults.base,
+            CloudRow::DockerAccount => self.docker_account != defaults.docker_account,
+            CloudRow::Claude => self.account != defaults.claude,
+            // The working branch and the switch have no project default.
+            CloudRow::Branch | CloudRow::Kit => false,
+        }
+    }
+
+    /// How many rows differ from the project defaults.
+    pub(super) fn changed_count(&self) -> usize {
+        CloudRow::of(self.target)
+            .iter()
+            .filter(|row| self.row_changed(**row))
+            .count()
+    }
+
+    /// Starts the overrides over from `defaults`.
+    fn use_defaults(&mut self, defaults: CloudDefaults) {
+        self.cpus = defaults.cpus;
+        self.memory = defaults.memory.clone();
+        self.ttl = defaults.ttl.clone();
+        self.idle = defaults.idle;
+        self.account = defaults.claude.clone();
+        self.docker_account = defaults.docker_account.clone();
+        self.machine = defaults.machine.clone();
+        self.base_text = defaults.base.clone();
+        self.defaults = defaults;
+    }
+}
+
 /// The codespace or sandbox named by a start error that happened after it was created
 /// (`created_note_for`), if any.
 pub(crate) fn created_codespace(error: &str) -> Option<&str> {
     monocode_core::cloud_sessions::split_created_note(error).map(|(_, _, name)| name)
-}
-
-/// `4g` -> `4 GiB`, `512m` -> `512 MiB`; anything else as saved.
-pub(crate) fn memory_label(memory: &str) -> String {
-    for (suffix, unit) in [('g', "GiB"), ('m', "MiB")] {
-        if let Some(digits) = memory.strip_suffix(suffix)
-            && !digits.is_empty()
-            && digits.bytes().all(|b| b.is_ascii_digit())
-        {
-            return format!("{digits} {unit}");
-        }
-    }
-    memory.to_owned()
 }
 
 fn short_id() -> String {
@@ -204,19 +371,34 @@ fn short_id() -> String {
     format!("{:06x}", nanos & 0xff_ffff)
 }
 
-/// What the project's config (or the built-in defaults) gives the overrides to start from:
-/// `(cpus, memory, ttl, claude account, base branch)`.
-fn config_defaults(
+/// The project's values for `target`: the saved Docker config (or the built-in defaults) and
+/// the codespace settings, with `base` as the base branch text.
+fn defaults_of(
+    target: CloudTarget,
     config: Option<&DockerProjectConfig>,
-) -> (u32, String, String, Option<String>, String) {
-    let config = config.cloned().unwrap_or_default();
-    (
-        config.cpus,
-        config.memory,
-        config.ttl,
-        config.claude_account,
-        config.base_ref.trim().to_owned(),
-    )
+    codespace: &CodespaceProjectConfig,
+    codespace_base: String,
+) -> CloudDefaults {
+    let sandbox = config.cloned().unwrap_or_default();
+    let docker = target == CloudTarget::DockerSandbox;
+    CloudDefaults {
+        cpus: sandbox.cpus,
+        memory: sandbox.memory,
+        ttl: sandbox.ttl,
+        machine: codespace.machine.clone(),
+        idle: codespace.idle_timeout_minutes,
+        base: if docker {
+            sandbox.base_ref.trim().to_owned()
+        } else {
+            codespace_base
+        },
+        claude: if docker {
+            sandbox.claude_account
+        } else {
+            codespace.claude_account.clone()
+        },
+        docker_account: sandbox.docker_account,
+    }
 }
 
 /// The label of the machine type `name`, from the loaded list when it knows it.
@@ -289,14 +471,18 @@ impl Conversation {
         if !self.cloud_menu_applies() {
             return Vec::new();
         }
+        let default_backend = self.project_default_backend();
+        let default_note =
+            |backend: DefaultBackend| (default_backend == backend).then_some("(default)");
         let mut rows = Vec::new();
         if self.cloud_offers_codespace {
-            rows.push(
-                MenuAction::new("workspace:cloud-codespace", "Codespace")
-                    .icon("cloud-upload")
-                    .checked(self.cloud_target() == Some(CloudTarget::Codespace))
-                    .into(),
-            );
+            let mut row = MenuAction::new("workspace:cloud-codespace", "Codespace")
+                .icon("cloud-upload")
+                .checked(self.cloud_target() == Some(CloudTarget::Codespace));
+            if let Some(note) = default_note(DefaultBackend::Codespace) {
+                row = row.description(note);
+            }
+            rows.push(row.into());
         }
         let configured = self.docker_config().is_some();
         let mut docker = MenuAction::new("workspace:cloud-docker", "Docker Sandbox")
@@ -304,11 +490,70 @@ impl Conversation {
             .checked(self.cloud_target() == Some(CloudTarget::DockerSandbox));
         if !configured {
             docker = docker.description("Set up first");
+        } else if let Some(note) = default_note(DefaultBackend::Sandbox) {
+            docker = docker.description(note);
         }
         rows.push(docker.into());
+        // The instances of the backend that is chosen, else the project's default.
+        let backend = self
+            .cloud_target()
+            .map_or(default_backend, CloudTarget::backend);
+        let mut existing =
+            MenuAction::new("workspace:cloud-existing", "Existing instance\u{2026}").icon("plus");
+        match backend {
+            DefaultBackend::Codespace if self.cloud_offers_codespace => {
+                if let Some(name) = self.recent_codespace() {
+                    existing = existing.description(name);
+                }
+            }
+            DefaultBackend::Codespace => existing = existing.disabled(true),
+            // There is no picker of existing sandboxes yet: a sandbox is reached through the
+            // sessions that already run on it.
+            DefaultBackend::Sandbox => {
+                existing = existing
+                    .description("Not available for Docker Sandbox")
+                    .disabled(true)
+            }
+        }
+        rows.push(existing.into());
         let mut items = vec![MenuItem::Separator, MenuItem::Header("Run on cloud".into())];
         items.extend(rows);
+        items.push(MenuItem::Separator);
+        items.push(
+            MenuAction::new(
+                "workspace:cloud-settings",
+                "Cloud settings for this project\u{2026}",
+            )
+            .icon("sliders")
+            .into(),
+        );
         items
+    }
+
+    /// The project's default backend (Docker Sandbox when only that is set up, else Codespaces).
+    fn project_default_backend(&self) -> DefaultBackend {
+        locked(&self.store)
+            .ok()
+            .and_then(|store| project_cloud::load(&store, &self.summary.cwd).ok())
+            .map_or(DefaultBackend::Codespace, |project| {
+                project.effective_default_backend()
+            })
+    }
+
+    /// The codespace the project's most recently updated cloud session runs in, if any.
+    fn recent_codespace(&self) -> Option<String> {
+        let store = locked(&self.store).ok()?;
+        // Newest first.
+        store
+            .cloud_sessions(&self.summary.cwd)
+            .ok()?
+            .into_iter()
+            .filter(|s| !s.summary.archived)
+            .find_map(|s| {
+                let cloud = s.project.cloud()?;
+                (cloud.kind == monocode_core::cloud_sessions::CloudBackendKind::Codespaces)
+                    .then_some(cloud.name)
+            })
     }
 
     /// The saved config, read from the store once per menu opening, not per render.
@@ -368,6 +613,27 @@ impl Conversation {
                 cx.emit(ContinueInCloud);
                 true
             }
+            "workspace:cloud-settings" => {
+                // On the backend that is chosen; else the dialog opens on the project's default.
+                cx.emit(OpenProjectCloudSettings {
+                    cwd: self.summary.cwd.clone(),
+                    backend: self.cloud_target().map(CloudTarget::backend),
+                });
+                true
+            }
+            "workspace:cloud-existing" => {
+                let backend = self
+                    .cloud_target()
+                    .map_or_else(|| self.project_default_backend(), CloudTarget::backend);
+                if self.cloud_menu_applies()
+                    && !self.cloud_creating()
+                    && backend == DefaultBackend::Codespace
+                    && self.cloud_offers_codespace
+                {
+                    cx.emit(OpenExistingInstance { backend });
+                }
+                true
+            }
             "workspace:cloud-codespace" => {
                 if self.cloud_menu_applies()
                     && !self.cloud_creating()
@@ -412,45 +678,61 @@ impl Conversation {
         }
     }
 
+    /// The project's defaults for `target`, read once per action.
+    fn cloud_defaults(
+        &self,
+        target: CloudTarget,
+        config: Option<&DockerProjectConfig>,
+    ) -> CloudDefaults {
+        let codespace = self.codespace_project_config();
+        let base = self.codespace_default_branch(&codespace);
+        defaults_of(target, config, &codespace, base)
+    }
+
     fn choose_cloud_target(
         &mut self,
         target: CloudTarget,
         config: Option<DockerProjectConfig>,
         cx: &mut Context<Self>,
     ) {
-        if let Some(draft) = &mut self.cloud_draft
+        let docker = target == CloudTarget::DockerSandbox;
+        if let Some(draft) = &self.cloud_draft
             && draft.target == target
             && !draft.creating
         {
-            // Picked again (after Cloud settings, say): the project's config is the default
-            // again, so this session's overrides start over from it.
-            let (cpus, memory, ttl, account, base) = config_defaults(config.as_ref());
+            // Picked again (after Cloud settings, say): the project's settings are the
+            // defaults again, so this session's overrides start over from them.
+            let defaults = self.cloud_defaults(target, config.as_ref());
+            let base = defaults.base.clone();
+            let accounts = crate::cloud_settings::claude_accounts(cx);
+            let Some(draft) = &mut self.cloud_draft else {
+                return;
+            };
             draft.config = config;
-            draft.cpus = cpus;
-            draft.memory = memory;
-            draft.ttl = ttl;
-            draft.account = account;
-            draft.base_text = base.clone();
+            draft.use_defaults(defaults);
+            draft.accounts = accounts;
             let field = draft.base.clone();
-            field.update(cx, |field, cx| field.set_text(base, cx));
-            if target == CloudTarget::Codespace {
-                // The same reset for a codespace: the project's machine, its base branch (else
-                // HEAD) again and a fresh listing.
-                let project = self.codespace_project_config();
-                let head = self.codespace_default_branch(&project);
-                let Some(draft) = &mut self.cloud_draft else {
-                    return;
-                };
-                draft.machine = project.machine;
+            field.update(cx, |field, cx| field.set_text(base.clone(), cx));
+            if !docker {
+                // The same reset for a codespace: the working branch is the base again and
+                // the machines are listed afresh.
                 draft.machines = Machines::Loading;
+                draft.branch_follows_base = true;
                 let branch = draft.branch.clone();
-                branch.update(cx, |field, cx| field.set_text(head, cx));
+                branch.update(cx, |field, cx| field.set_text(base, cx));
                 self.cloud_request_seq += 1;
                 let request = self.cloud_request_seq;
                 if let Some(draft) = &mut self.cloud_draft {
                     draft.machines_request = request;
                 }
                 self.load_cloud_machines(request, cx);
+            } else {
+                self.cloud_request_seq += 1;
+                let request = self.cloud_request_seq;
+                if let Some(draft) = &mut self.cloud_draft {
+                    draft.docker_accounts_request = request;
+                }
+                self.load_docker_accounts(request, cx);
             }
             // The repository's branches again, as a fresh listing.
             self.cloud_request_seq += 1;
@@ -470,16 +752,14 @@ impl Conversation {
         {
             return;
         }
-        let docker = target == CloudTarget::DockerSandbox;
-        let (cpus, memory, ttl, account, base_text) = config_defaults(config.as_ref());
-        // Docker names a new feature branch; a codespace starts on the current branch of the
-        // project folder (HEAD, as the header picker does), empty while HEAD is detached, unless
-        // the project sets a base branch.
-        let codespace_config = self.codespace_project_config();
-        let default = if docker {
+        let defaults = self.cloud_defaults(target, config.as_ref());
+        // Docker names a new feature branch; a codespace works on its base branch (HEAD of the
+        // project folder, as the header picker does, empty while HEAD is detached, unless the
+        // project sets a base branch) until another name is typed.
+        let branch_text = if docker {
             format!("monoptah/{}", short_id())
         } else {
-            self.codespace_default_branch(&codespace_config)
+            defaults.base.clone()
         };
         let branch = cx.new(|cx| {
             let mut field = input::Input::field(
@@ -489,9 +769,10 @@ impl Conversation {
                 cx,
             );
             field.set_font_size(12.);
-            field.set_text(default, cx);
+            field.set_text(branch_text, cx);
             field
         });
+        let base_text = defaults.base.clone();
         let base = cx.new(|cx| {
             let mut field = input::Input::field("Base branch", "default branch", content(0.35), cx);
             field.set_font_size(12.);
@@ -499,14 +780,28 @@ impl Conversation {
             field
         });
         let events = vec![
-            cx.subscribe(&branch, |_, _, _: &input::Changed, cx| cx.notify()),
+            cx.subscribe(&branch, |this, branch, _: &input::Changed, cx| {
+                let text = branch.read(cx).content.to_string();
+                if let Some(draft) = &mut this.cloud_draft {
+                    draft.branch_follows_base = text.trim() == draft.base_text.trim();
+                }
+                cx.notify();
+            }),
             // Settings changed while the panel is open: count again with the new selection
             // (this also picks up the flag being turned on).
             cx.observe_global::<crate::settings::Preferences>(|this, cx| this.load_kit_summary(cx)),
             cx.subscribe(&base, |this, base, _: &input::Changed, cx| {
                 let text = base.read(cx).content.to_string();
+                let mut follow = None;
                 if let Some(draft) = &mut this.cloud_draft {
-                    draft.base_text = text;
+                    draft.base_text = text.clone();
+                    // A codespace works on its base branch until another name is typed.
+                    if draft.target == CloudTarget::Codespace && draft.branch_follows_base {
+                        follow = Some(draft.branch.clone());
+                    }
+                }
+                if let Some(branch) = follow {
+                    branch.update(cx, |field, cx| field.set_text(text, cx));
                 }
                 cx.notify();
             }),
@@ -517,30 +812,32 @@ impl Conversation {
         self.settings.worktree_removed = false;
         self.save_settings(cx);
         self.refresh_git(cx);
-        let accounts = if docker {
-            crate::cloud_settings::claude_accounts(cx)
-        } else {
-            Vec::new()
-        };
+        let accounts = crate::cloud_settings::claude_accounts(cx);
         let kit_prefs = crate::cloud_kit_ui::kit_prefs(cx);
         self.cloud_request_seq += 1;
         let machines_request = self.cloud_request_seq;
         self.cloud_request_seq += 1;
         let branches_request = self.cloud_request_seq;
+        self.cloud_request_seq += 1;
+        let docker_accounts_request = self.cloud_request_seq;
         self.cloud_draft = Some(CloudDraft {
             target,
             branch,
             base,
-            base_text,
+            base_text: defaults.base.clone(),
+            branch_follows_base: !docker,
             config,
-            cpus,
-            memory,
-            ttl,
-            account,
+            cpus: defaults.cpus,
+            memory: defaults.memory.clone(),
+            ttl: defaults.ttl.clone(),
+            idle: defaults.idle,
+            account: defaults.claude.clone(),
+            docker_account: defaults.docker_account.clone(),
             accounts,
-            machine: (!docker)
-                .then(|| codespace_config.machine.clone())
-                .flatten(),
+            docker_accounts: if docker { None } else { Some(Vec::new()) },
+            docker_accounts_request,
+            machine: (!docker).then(|| defaults.machine.clone()).flatten(),
+            defaults,
             machines: if docker {
                 Machines::Failed
             } else {
@@ -561,11 +858,43 @@ impl Conversation {
             _events: events,
         });
         self.load_kit_summary(cx);
-        if !docker {
+        if docker {
+            self.load_docker_accounts(docker_accounts_request, cx);
+        } else {
             self.load_cloud_machines(machines_request, cx);
         }
         self.load_cloud_branches(branches_request, cx);
         cx.notify();
+    }
+
+    /// Reads the saved Docker accounts on a worker; the answer only applies to the draft that
+    /// asked. A failed read leaves the machine sign-in as the only choice.
+    fn load_docker_accounts(&mut self, request: u64, cx: &mut Context<Self>) {
+        let loader = self.docker_accounts_loader.clone();
+        let store = self.store.clone();
+        let work = cx
+            .background_executor()
+            .spawn(async move { loader(&store) });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(draft) = this
+                    .cloud_draft
+                    .as_mut()
+                    .filter(|draft| draft.docker_accounts_request == request)
+                {
+                    draft.docker_accounts = Some(result.unwrap_or_default());
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Replaces how the saved Docker accounts are listed (tests hand in fakes).
+    #[cfg(test)]
+    pub(crate) fn set_docker_accounts_loader(&mut self, loader: DockerAccountsLoader) {
+        self.docker_accounts_loader = loader;
     }
 
     /// Counts the Claude setup this project would take, on a worker.
@@ -648,15 +977,17 @@ impl Conversation {
         .detach();
     }
 
-    /// Applies one choice of a panel menu (`compute:2:4g`, `runtime:1h`, `account:<id>`,
-    /// `machine:<name>`) to the draft. Nothing is saved: the choice lives for this session only.
+    /// Applies one choice of a panel menu (`size:2:4g`, `runtime:1h`, `idle:60`, `machine:<name>`,
+    /// `docker:<id>`, `claude:<id>`) to the draft. An empty id of `docker` or `claude` is "no
+    /// account". Nothing is saved: the choice lives for this session only.
     fn cloud_set(&mut self, setting: &str, cx: &mut Context<Self>) {
         let Some(draft) = self.cloud_draft.as_mut().filter(|draft| !draft.creating) else {
             return;
         };
         let (field, value) = setting.split_once(':').unwrap_or((setting, ""));
+        let some = |value: &str| (!value.is_empty()).then(|| value.to_owned());
         match field {
-            "compute" => {
+            "size" => {
                 if let Some((cpus, memory)) = value.split_once(':')
                     && let Ok(cpus) = cpus.parse()
                 {
@@ -665,8 +996,14 @@ impl Conversation {
                 }
             }
             "runtime" => draft.ttl = value.to_owned(),
-            "account" => draft.account = (!value.is_empty()).then(|| value.to_owned()),
-            "machine" => draft.machine = (!value.is_empty()).then(|| value.to_owned()),
+            "idle" => {
+                if let Ok(minutes) = value.parse() {
+                    draft.idle = minutes;
+                }
+            }
+            "claude" => draft.account = some(value),
+            "docker" => draft.docker_account = some(value),
+            "machine" => draft.machine = some(value),
             _ => return,
         }
         cx.notify();
@@ -675,7 +1012,7 @@ impl Conversation {
     /// The base branch the cloud session starts from.
     fn cloud_base(&self) -> String {
         match self.cloud_draft.as_ref() {
-            Some(draft) if draft.target == CloudTarget::DockerSandbox => {
+            Some(draft) => {
                 let base = draft.base_text.trim();
                 if base.is_empty() {
                     "default branch".into()
@@ -683,7 +1020,7 @@ impl Conversation {
                     base.to_owned()
                 }
             }
-            _ => self
+            None => self
                 .branch
                 .clone()
                 .unwrap_or_else(|| "default branch".into()),
@@ -728,26 +1065,43 @@ impl Conversation {
             return;
         }
         let typed = draft.branch.read(cx).content.trim().to_owned();
+        let typed_base = draft.base.read(cx).content.trim().to_owned();
         let codespace_base = self.codespace_project_config().base_ref;
         let mut default_account: Option<String> = None;
+        let mut work_branch = None;
         let (branch, config) = match target {
-            // The typed branch wins. Else the project's base branch, else HEAD of the project
-            // folder (as the header picker does; a worktree's branch would not exist on the
-            // remote).
-            CloudTarget::Codespace if !typed.is_empty() => (typed, None),
-            CloudTarget::Codespace if !codespace_base.is_empty() => (codespace_base, None),
-            CloudTarget::Codespace => match git_head(Path::new(&self.summary.cwd)) {
-                Some((_, true)) => {
-                    fail(
-                        self,
-                        "HEAD is detached. Check out a branch to start a codespace on it.",
-                        cx,
-                    );
-                    return;
+            // The base branch is the one typed or picked. Else the project's base branch, else
+            // HEAD of the project folder (as the header picker does; a worktree's branch would
+            // not exist on the remote).
+            CloudTarget::Codespace => {
+                let base = if !typed_base.is_empty() {
+                    typed_base
+                } else if !codespace_base.is_empty() {
+                    codespace_base
+                } else {
+                    match git_head(Path::new(&self.summary.cwd)) {
+                        Some((_, true)) => {
+                            fail(
+                                self,
+                                "HEAD is detached. Check out a branch to start a codespace on it.",
+                                cx,
+                            );
+                            return;
+                        }
+                        Some((branch, false)) => branch,
+                        None => String::new(),
+                    }
+                };
+                // The working branch is created in the codespace when it is another name.
+                if !typed.is_empty() && typed != base {
+                    if !docker_config::valid_ref(&typed) {
+                        fail(self, "The branch name contains invalid characters.", cx);
+                        return;
+                    }
+                    work_branch = Some(typed);
                 }
-                Some((branch, false)) => (branch, None),
-                None => (String::new(), None),
-            },
+                (base, None)
+            }
             CloudTarget::DockerSandbox => {
                 if typed.is_empty() {
                     fail(self, "Enter a branch name for the new session.", cx);
@@ -765,6 +1119,7 @@ impl Conversation {
                             config.memory = draft.memory.clone();
                             config.ttl = draft.ttl.clone();
                             config.claude_account = draft.account.clone();
+                            config.docker_account = draft.docker_account.clone();
                             config.base_ref = draft.base.read(cx).content.trim().to_owned();
                         }
                         match config.validated() {
@@ -790,15 +1145,35 @@ impl Conversation {
             fail(self, "There is no branch to start the codespace on.", cx);
             return;
         }
-        let machine = match target {
-            CloudTarget::Codespace => self.cloud_draft.as_ref().and_then(|d| d.machine.clone()),
-            CloudTarget::DockerSandbox => None,
+        // Only a row changed for this session is an override; the rest follows the project.
+        let changed = |row| {
+            self.cloud_draft
+                .as_ref()
+                .is_some_and(|d| d.row_changed(row))
         };
-        // A sandbox account that differs from the project's default is this session's own.
+        let (machine, idle_timeout_minutes) = match target {
+            CloudTarget::Codespace => (
+                self.cloud_draft
+                    .as_ref()
+                    .filter(|_| changed(CloudRow::Machine))
+                    .map(|d| d.machine_name().to_owned()),
+                self.cloud_draft
+                    .as_ref()
+                    .filter(|_| changed(CloudRow::Idle))
+                    .map(|d| d.idle),
+            ),
+            CloudTarget::DockerSandbox => (None, None),
+        };
+        // A Claude account that differs from the project's is this session's own: the
+        // instance keeps it across reconnects.
         let (account, account_pinned) = match (&config, target) {
             (Some(config), CloudTarget::DockerSandbox) => (
                 config.claude_account.clone(),
                 config.claude_account != default_account,
+            ),
+            (None, CloudTarget::Codespace) if changed(CloudRow::Claude) => (
+                self.cloud_draft.as_ref().and_then(|d| d.account.clone()),
+                true,
             ),
             _ => (None, false),
         };
@@ -817,6 +1192,8 @@ impl Conversation {
             branch,
             config,
             machine,
+            idle_timeout_minutes,
+            work_branch,
             account,
             account_pinned,
             prompt: (!prompt.is_empty()).then_some(prompt),

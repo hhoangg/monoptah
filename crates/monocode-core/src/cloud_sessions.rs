@@ -389,6 +389,10 @@ pub struct Target {
     /// This start carries an explicit per-session account (see [`claude_pin`]). Without it
     /// the codespace follows the project's current choice.
     pub claude_account_pinned: bool,
+    /// Working branch of a new codespace: when it differs from [`Self::branch`] it is created
+    /// in the codespace with `git switch -c` before the session opens. `None` or the same
+    /// name keeps the codespace on `branch`.
+    pub work_branch: Option<String>,
 }
 
 /// A ready remote project bound to a codespace.

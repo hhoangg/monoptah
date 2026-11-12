@@ -443,6 +443,8 @@ fn cloud_sources_never_read_the_keychain_or_claude_credentials() {
         gpui.join("panel_root.rs"),
         gpui.join("shell/cloud_picker.rs"),
         gpui.join("conversation/cloud_target.rs"),
+        gpui.join("conversation/cloud_panel.rs"),
+        gpui.join("cloud_presets.rs"),
         gpui.join("settings/preferences.rs"),
     ];
     files.extend(kit_ui.iter().cloned());

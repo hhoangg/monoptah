@@ -167,6 +167,7 @@ fn named(name: &str) -> Target {
         devcontainer_path: None,
         claude_account: None,
         claude_account_pinned: false,
+        work_branch: None,
     }
 }
 use std::path::Path;
@@ -234,6 +235,7 @@ fn new_target_creates_waits_pairs_and_skips_the_extra_wake() {
                 devcontainer_path: None,
                 claude_account: None,
                 claude_account_pinned: false,
+                work_branch: None,
             },
             &mut |line| progress.push(line.to_string()),
         )
@@ -348,6 +350,7 @@ fn bad_targets_fail_before_touching_codespaces() {
                 devcontainer_path: None,
                 claude_account: None,
                 claude_account_pinned: false,
+                work_branch: None,
             },
             &mut |_| {},
         )
@@ -620,6 +623,7 @@ fn new_codespaces_get_the_monoptah_display_name() {
             devcontainer_path: None,
             claude_account: None,
             claude_account_pinned: false,
+            work_branch: None,
         },
         &mut |_| {},
     )

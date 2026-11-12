@@ -44,8 +44,22 @@ fn save_config(view: &Conversation) -> DockerProjectConfig {
     saved
 }
 
-/// `(id, label, checked, description)` of the action rows after the section header.
+/// `(id, label, checked, description)` of the backend rows (Codespace, Docker Sandbox) after
+/// the section header.
 fn rows(view: &Conversation) -> Vec<(String, String, bool, Option<String>)> {
+    all_rows(view)
+        .into_iter()
+        .filter(|row| {
+            matches!(
+                row.0.as_str(),
+                "workspace:cloud-codespace" | "workspace:cloud-docker"
+            )
+        })
+        .collect()
+}
+
+/// `(id, label, checked, description)` of every action row of the section.
+fn all_rows(view: &Conversation) -> Vec<(String, String, bool, Option<String>)> {
     view.cloud_menu_items()
         .into_iter()
         .filter_map(|item| match item {
@@ -90,7 +104,8 @@ fn the_menu_lists_cloud_rows_with_their_gates(cx: &mut TestAppContext) {
             let labels: Vec<_> = rows(view).into_iter().map(|row| row.1).collect();
             assert_eq!(labels, ["Codespace", "Docker Sandbox"]);
             save_config(view);
-            assert_eq!(rows(view)[1].3, None);
+            // The saved sandbox config is the only one, so Docker Sandbox is the default.
+            assert_eq!(rows(view)[1].3.as_deref(), Some("(default)"));
         })
         .unwrap();
 }
@@ -503,13 +518,14 @@ fn create_and_open_validates_before_asking(cx: &mut TestAppContext) {
 }
 
 #[test]
-fn memory_and_compute_labels() {
-    assert_eq!(memory_label("4g"), "4 GiB");
-    assert_eq!(memory_label("512m"), "512 MiB");
-    assert_eq!(memory_label("lots"), "lots");
-    assert_eq!(size_label(2, "4g"), "2 vCPU / 4 GiB");
-    assert_eq!(runtime_label("1h"), "1 hour then stop");
-    assert_eq!(runtime_label("4h"), "4 hours then stop");
+fn the_panel_labels_are_the_dialogs_labels() {
+    // One module of presets and labels serves the panel and the Cloud settings dialog.
+    use crate::cloud_presets as presets;
+    assert_eq!(presets::size_label(2, "4g"), "2 CPUs, 4 GB");
+    assert_eq!(presets::runtime_label("1h"), "1 hour, then stop");
+    assert_eq!(presets::runtime_label("4h"), "4 hours, then stop");
+    assert_eq!(presets::idle_label(30), "After 30 minutes");
+    assert_eq!(presets::idle_label(120), "After 2 hours");
 }
 
 fn temp_repo(head: &str) -> String {
@@ -708,16 +724,20 @@ fn the_docker_config_is_read_once_per_menu_opening(cx: &mut TestAppContext) {
     let window = conversation(cx, PROJECT, false);
     window
         .update(cx, |view, _, _| {
-            assert!(rows(view)[0].3.is_some(), "no config yet");
+            assert_eq!(
+                rows(view)[0].3.as_deref(),
+                Some("Set up first"),
+                "no config yet"
+            );
             // Saved behind the cache's back (Cloud settings): not seen until reopened.
             let config = DockerProjectConfig {
                 repo_url: "https://github.com/octo/widgets.git".into(),
                 ..Default::default()
             };
             docker_config::save(&locked(&view.store).unwrap(), PROJECT, &config).unwrap();
-            assert!(rows(view)[0].3.is_some());
+            assert_eq!(rows(view)[0].3.as_deref(), Some("Set up first"));
             view.forget_docker_config();
-            assert!(rows(view)[0].3.is_none());
+            assert_ne!(rows(view)[0].3.as_deref(), Some("Set up first"));
         })
         .unwrap();
 }
@@ -771,7 +791,7 @@ fn the_panel_starts_from_the_project_config(cx: &mut TestAppContext) {
             assert_eq!(draft.base.read(cx).content.as_ref(), "develop");
             assert_eq!(draft.base_text, "develop");
             // The menus check the default.
-            let (_, compute) = view.cloud_field_menu(CloudField::Compute);
+            let (_, compute) = view.cloud_field_menu(CloudField::Size);
             let checked: Vec<_> = compute
                 .iter()
                 .filter_map(|item| match item {
@@ -779,7 +799,7 @@ fn the_panel_starts_from_the_project_config(cx: &mut TestAppContext) {
                     _ => None,
                 })
                 .collect();
-            assert_eq!(checked, ["4 vCPU / 8 GiB"]);
+            assert_eq!(checked, ["4 CPUs, 8 GB"]);
         })
         .unwrap();
 }
@@ -792,9 +812,9 @@ fn overrides_change_the_sandbox_request_and_never_the_project_config(cx: &mut Te
         .update(cx, |view, _, cx| {
             let saved = save_config(view);
             view.cloud_menu_choice("workspace:cloud-docker", cx);
-            assert!(view.cloud_menu_choice("cloud-set:compute:4:8g", cx));
+            assert!(view.cloud_menu_choice("cloud-set:size:4:8g", cx));
             assert!(view.cloud_menu_choice("cloud-set:runtime:1h", cx));
-            assert!(view.cloud_menu_choice("cloud-set:account:personal", cx));
+            assert!(view.cloud_menu_choice("cloud-set:claude:personal", cx));
             set_text(view, |d| d.base.clone(), "release/1.2", cx);
             set_text(view, |d| d.branch.clone(), "feature/x", cx);
             view.create_cloud(cx);
@@ -997,7 +1017,7 @@ fn the_panel_has_a_row_per_setting_and_a_collapse_chevron(cx: &mut TestAppContex
     for id in [
         "cloud-target-panel",
         "cloud-target-header",
-        "cloud-row-compute",
+        "cloud-row-size",
         "cloud-row-runtime",
         "cloud-row-base",
         "cloud-row-branch",
@@ -1009,7 +1029,7 @@ fn the_panel_has_a_row_per_setting_and_a_collapse_chevron(cx: &mut TestAppContex
     visual.simulate_click(header.center(), Default::default());
     draw(visual);
     assert!(visual.debug_bounds("cloud-target-header").is_some());
-    assert!(visual.debug_bounds("cloud-row-compute").is_none());
+    assert!(visual.debug_bounds("cloud-row-size").is_none());
     // A codespace panel has its own rows.
     window
         .update(visual, |view, _, cx| {
@@ -1020,7 +1040,7 @@ fn the_panel_has_a_row_per_setting_and_a_collapse_chevron(cx: &mut TestAppContex
     draw(visual);
     assert!(visual.debug_bounds("cloud-row-machine").is_some());
     assert!(visual.debug_bounds("cloud-row-branch").is_some());
-    assert!(visual.debug_bounds("cloud-row-compute").is_none());
+    assert!(visual.debug_bounds("cloud-row-size").is_none());
     // A settings row opens its menu.
     let machine = visual.debug_bounds("cloud-row-machine").unwrap();
     visual.simulate_click(machine.center(), Default::default());
@@ -1053,7 +1073,7 @@ fn the_error_from_a_send_stays_visible_while_the_panel_is_collapsed(cx: &mut Tes
     let header = visual.debug_bounds("cloud-target-header").unwrap();
     visual.simulate_click(header.center(), Default::default());
     draw(visual);
-    assert!(visual.debug_bounds("cloud-row-compute").is_none());
+    assert!(visual.debug_bounds("cloud-row-size").is_none());
     let send = visual.debug_bounds("send-or-stop").unwrap();
     visual.simulate_click(send.center(), Default::default());
     draw(visual);
@@ -1144,11 +1164,7 @@ fn each_setting_menu_anchors_to_the_value_of_the_clicked_row(cx: &mut TestAppCon
     draw(visual);
     let mut tops = Vec::new();
     for (field, row_id, anchor_id) in [
-        (
-            CloudField::Compute,
-            "cloud-row-compute",
-            "cloud-row-compute-anchor",
-        ),
+        (CloudField::Size, "cloud-row-size", "cloud-row-size-anchor"),
         (
             CloudField::Runtime,
             "cloud-row-runtime",
@@ -1274,8 +1290,6 @@ fn the_branch_list_comes_from_a_source_off_the_click(cx: &mut TestAppContext) {
         .update(cx, |view, _, _| {
             assert_eq!(names(view), ["main", "dev"]);
             assert!(view.cloud_picks(CloudRefField::Base));
-            // The Branch row of a Docker sandbox stays a text field.
-            assert!(!view.cloud_picks(CloudRefField::Branch));
         })
         .unwrap();
 }
@@ -1436,10 +1450,9 @@ fn a_codespace_branch_is_picked_from_origin_and_reaches_the_request(cx: &mut Tes
     cx.run_until_parked();
     window
         .update(cx, |view, window, cx| {
-            assert!(view.cloud_picks(CloudRefField::Branch));
-            assert!(!view.cloud_picks(CloudRefField::Base));
-            assert_eq!(view.cloud_ref_value(CloudRefField::Branch, cx), "main");
-            view.toggle_cloud_ref_picker(CloudRefField::Branch, window, cx);
+            assert!(view.cloud_picks(CloudRefField::Base));
+            assert_eq!(view.cloud_ref_value(CloudRefField::Base, cx), "main");
+            view.toggle_cloud_ref_picker(CloudRefField::Base, window, cx);
             let picker = view.cloud_picker.as_ref().unwrap().picker.clone();
             picker.update(cx, |_, cx| cx.emit(GitPicked::Ref(Some("topic".into()))));
         })
@@ -1449,7 +1462,10 @@ fn a_codespace_branch_is_picked_from_origin_and_reaches_the_request(cx: &mut Tes
         .update(cx, |view, _, cx| view.create_cloud(cx))
         .unwrap();
     cx.run_until_parked();
-    assert_eq!(requests.lock().unwrap()[0].branch, "topic");
+    let sent = requests.lock().unwrap();
+    assert_eq!(sent[0].branch, "topic");
+    // The working branch followed the base, so no extra branch is asked for.
+    assert_eq!(sent[0].work_branch, None);
 }
 
 #[gpui::test]
@@ -1763,10 +1779,10 @@ fn a_codespace_branch_starting_with_a_dash_is_refused(cx: &mut TestAppContext) {
     cx.run_until_parked();
     window
         .update(cx, |view, _, cx| {
-            view.cloud_ref_picked(CloudRefField::Branch, Some("--upload-pack=x".into()), cx);
-            assert_eq!(view.cloud_ref_value(CloudRefField::Branch, cx), "main");
-            view.cloud_ref_picked(CloudRefField::Branch, Some("v1.2.3".into()), cx);
-            assert_eq!(view.cloud_ref_value(CloudRefField::Branch, cx), "v1.2.3");
+            view.cloud_ref_picked(CloudRefField::Base, Some("--upload-pack=x".into()), cx);
+            assert_eq!(view.cloud_ref_value(CloudRefField::Base, cx), "main");
+            view.cloud_ref_picked(CloudRefField::Base, Some("v1.2.3".into()), cx);
+            assert_eq!(view.cloud_ref_value(CloudRefField::Base, cx), "v1.2.3");
         })
         .unwrap();
 }
@@ -2340,14 +2356,612 @@ fn a_failed_listing_still_offers_the_project_machine_the_row_shows(cx: &mut Test
                 MenuItem::Action(a)
                     if a.id.as_ref() == "cloud-set:machine:premiumLinux" && a.checked
             ));
-            // Choosing it keeps the project machine.
+            // Choosing it keeps the project machine: no override is sent, the start fills it
+            // in from the project's settings.
             assert!(view.cloud_menu_choice("cloud-set:machine:premiumLinux", cx));
+            assert!(
+                !view
+                    .cloud_draft
+                    .as_ref()
+                    .unwrap()
+                    .row_changed(CloudRow::Machine)
+            );
             view.create_cloud(cx);
         })
         .unwrap();
     cx.run_until_parked();
+    assert_eq!(requests.lock().unwrap()[0].machine, None);
+}
+
+// ------------------------------------------------ uniform rows, defaults and session changes
+
+fn docker_account(
+    id: &str,
+    docker_id: &str,
+) -> monocode_core::docker_accounts::DockerAccountSummary {
+    monocode_core::docker_accounts::DockerAccountSummary {
+        id: id.into(),
+        docker_id: docker_id.into(),
+        status: monocode_core::docker_accounts::DockerAccountStatus::Valid,
+        checked_at: None,
+        expires_at: None,
+        created_at: 1,
+    }
+}
+
+fn labels(target: CloudTarget) -> Vec<&'static str> {
+    CloudRow::of(target).iter().map(|row| row.label()).collect()
+}
+
+#[test]
+fn both_backends_show_the_same_rows_in_the_same_order() {
     assert_eq!(
-        requests.lock().unwrap()[0].machine.as_deref(),
-        Some("premiumLinux")
+        labels(CloudTarget::Codespace),
+        [
+            "Machine",
+            "Stop when idle",
+            "Base branch",
+            "Branch",
+            "Claude account",
+            "Claude setup"
+        ]
     );
+    assert_eq!(
+        labels(CloudTarget::DockerSandbox),
+        [
+            "Size",
+            "Runtime limit",
+            "Base branch",
+            "Branch",
+            "Docker account",
+            "Claude account",
+            "Claude setup"
+        ]
+    );
+    // Place, lifetime, branches, accounts, setup: the same slots, only the first two and the
+    // Docker account differ by backend.
+    let shared = |target| -> Vec<&'static str> {
+        labels(target)
+            .into_iter()
+            .filter(|l| {
+                ![
+                    "Machine",
+                    "Size",
+                    "Stop when idle",
+                    "Runtime limit",
+                    "Docker account",
+                ]
+                .contains(l)
+            })
+            .collect()
+    };
+    assert_eq!(
+        shared(CloudTarget::Codespace),
+        shared(CloudTarget::DockerSandbox)
+    );
+}
+
+#[gpui::test]
+fn the_panel_renders_every_row_of_the_backend_with_a_mark(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    let draw = |visual: &mut gpui::VisualTestContext| {
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+    };
+    window
+        .update(visual, |view, _, cx| {
+            save_config(view);
+            view.set_offers_codespace(true, cx);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+        })
+        .unwrap();
+    draw(visual);
+    for target in [CloudTarget::DockerSandbox, CloudTarget::Codespace] {
+        window
+            .update(visual, |view, _, cx| {
+                view.clear_cloud_target(cx);
+                view.cloud_menu_choice(
+                    match target {
+                        CloudTarget::Codespace => "workspace:cloud-codespace",
+                        CloudTarget::DockerSandbox => "workspace:cloud-docker",
+                    },
+                    cx,
+                );
+            })
+            .unwrap();
+        draw(visual);
+        for row in CloudRow::of(target) {
+            assert!(visual.debug_bounds(row.id()).is_some(), "{:?}", row);
+            // Rows with a project default carry a mark; the working branch and the Claude
+            // setup switch have none.
+            let marked = !matches!(row, CloudRow::Branch | CloudRow::Kit);
+            assert_eq!(
+                visual
+                    .debug_bounds(Box::leak(format!("{}-mark", row.id()).into_boxed_str()))
+                    .is_some(),
+                marked,
+                "{row:?}"
+            );
+        }
+    }
+    assert_eq!(cloud_pill_text(0), "project defaults");
+    assert_eq!(cloud_pill_text(3), "3 changed");
+}
+
+fn cloud_pill_text(changed: usize) -> String {
+    super::cloud_panel::pill_text(changed)
+}
+
+fn changed_rows(view: &Conversation) -> Vec<CloudRow> {
+    let draft = view.cloud_draft.as_ref().unwrap();
+    CloudRow::of(draft.target)
+        .iter()
+        .copied()
+        .filter(|row| draft.row_changed(*row))
+        .collect()
+}
+
+#[gpui::test]
+fn a_sandbox_row_is_marked_when_it_differs_and_clears_when_set_back(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    window
+        .update(cx, |view, _, cx| {
+            view.set_docker_accounts_loader(Arc::new(|_| {
+                Ok(vec![docker_account("acct-1", "octo")])
+            }));
+            save_config(view);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            assert!(changed_rows(view).is_empty());
+            assert_eq!(view.cloud_draft.as_ref().unwrap().changed_count(), 0);
+            // The project default is marked in the menu.
+            let (_, sizes) = view.cloud_field_menu(CloudField::Size);
+            let marked: Vec<_> = sizes
+                .iter()
+                .filter_map(|item| match item {
+                    MenuItem::Action(a) if a.description.is_some() => Some(a.label.to_string()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(marked, ["2 CPUs, 4 GB"]);
+            view.cloud_menu_choice("cloud-set:size:4:8g", cx);
+            view.cloud_menu_choice("cloud-set:runtime:1h", cx);
+            view.cloud_menu_choice("cloud-set:claude:personal", cx);
+            view.cloud_menu_choice("cloud-set:docker:acct-1", cx);
+            assert_eq!(
+                changed_rows(view),
+                [
+                    CloudRow::Size,
+                    CloudRow::Runtime,
+                    CloudRow::DockerAccount,
+                    CloudRow::Claude
+                ]
+            );
+            assert_eq!(view.cloud_draft.as_ref().unwrap().changed_count(), 4);
+            // Choosing the default again clears each mark.
+            view.cloud_menu_choice("cloud-set:size:2:4g", cx);
+            view.cloud_menu_choice("cloud-set:runtime:2h", cx);
+            view.cloud_menu_choice("cloud-set:claude:", cx);
+            view.cloud_menu_choice("cloud-set:docker:", cx);
+            assert!(changed_rows(view).is_empty());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_codespace_row_is_marked_when_it_differs_and_clears_when_set_back(cx: &mut TestAppContext) {
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    window
+        .update(cx, |view, _, cx| {
+            view.set_machine_loader(Arc::new(|_| {
+                Ok(vec![
+                    machine("basicLinux32gb", "Basic"),
+                    machine("standardLinux32gb", "Standard"),
+                ])
+            }));
+            view.set_offers_codespace(true, cx);
+            view.cloud_menu_choice("workspace:cloud-codespace", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            assert!(changed_rows(view).is_empty());
+            view.cloud_menu_choice("cloud-set:machine:standardLinux32gb", cx);
+            view.cloud_menu_choice("cloud-set:idle:120", cx);
+            view.cloud_menu_choice("cloud-set:claude:personal", cx);
+            set_text(view, |d| d.base.clone(), "dev", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            assert_eq!(
+                changed_rows(view),
+                [
+                    CloudRow::Machine,
+                    CloudRow::Idle,
+                    CloudRow::Base,
+                    CloudRow::Claude
+                ]
+            );
+            view.cloud_menu_choice("cloud-set:machine:basicLinux32gb", cx);
+            view.cloud_menu_choice("cloud-set:idle:30", cx);
+            view.cloud_menu_choice("cloud-set:claude:", cx);
+            set_text(view, |d| d.base.clone(), "main", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, _| assert!(changed_rows(view).is_empty()))
+        .unwrap();
+}
+
+#[gpui::test]
+fn an_untouched_panel_sends_no_overrides(cx: &mut TestAppContext) {
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    let requests = watch(window, cx);
+    window
+        .update(cx, |view, _, cx| {
+            save_codespace_config(view, "release", Some("standardLinux32gb"));
+            view.set_offers_codespace(true, cx);
+            view.cloud_menu_choice("workspace:cloud-codespace", cx);
+            view.create_cloud(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let sent = requests.lock().unwrap();
+    let request = &sent[0];
+    assert_eq!(request.branch, "release");
+    assert_eq!(request.machine, None);
+    assert_eq!(request.idle_timeout_minutes, None);
+    assert_eq!(request.work_branch, None);
+    assert_eq!(
+        (request.account.as_deref(), request.account_pinned),
+        (None, false)
+    );
+}
+
+#[gpui::test]
+fn a_codespace_request_carries_each_override(cx: &mut TestAppContext) {
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    let requests = watch(window, cx);
+    window
+        .update(cx, |view, _, cx| {
+            view.set_machine_loader(Arc::new(|_| {
+                Ok(vec![
+                    machine("basicLinux32gb", "Basic"),
+                    machine("standardLinux32gb", "Standard"),
+                ])
+            }));
+            view.set_offers_codespace(true, cx);
+            view.cloud_menu_choice("workspace:cloud-codespace", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            view.cloud_menu_choice("cloud-set:machine:standardLinux32gb", cx);
+            view.cloud_menu_choice("cloud-set:idle:240", cx);
+            view.cloud_menu_choice("cloud-set:claude:personal", cx);
+            set_text(view, |d| d.base.clone(), "develop", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            // The working branch followed the base until another name is typed.
+            assert_eq!(
+                view.cloud_draft
+                    .as_ref()
+                    .unwrap()
+                    .branch
+                    .read(cx)
+                    .content
+                    .as_ref(),
+                "develop"
+            );
+            set_text(view, |d| d.branch.clone(), "monoptah/cloud-setup", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| view.create_cloud(cx))
+        .unwrap();
+    cx.run_until_parked();
+    let sent = requests.lock().unwrap();
+    let request = &sent[0];
+    assert_eq!(request.branch, "develop");
+    assert_eq!(request.machine.as_deref(), Some("standardLinux32gb"));
+    assert_eq!(request.idle_timeout_minutes, Some(240));
+    assert_eq!(request.work_branch.as_deref(), Some("monoptah/cloud-setup"));
+    // A changed Claude account is this session's own.
+    assert_eq!(request.account.as_deref(), Some("personal"));
+    assert!(request.account_pinned);
+}
+
+#[gpui::test]
+fn a_codespace_choosing_the_secret_again_is_a_pinned_no_account_only_when_the_project_has_one(
+    cx: &mut TestAppContext,
+) {
+    use monocode_core::cloud_sessions::project_cloud::{
+        self, CodespaceProjectConfig, ProjectCloud,
+    };
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    let requests = watch(window, cx);
+    window
+        .update(cx, |view, _, cx| {
+            project_cloud::save(
+                &locked(&view.store).unwrap(),
+                &view.summary.cwd,
+                &ProjectCloud {
+                    codespace: CodespaceProjectConfig {
+                        claude_account: Some("work".into()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            view.set_offers_codespace(true, cx);
+            view.cloud_menu_choice("workspace:cloud-codespace", cx);
+            // The project's account is the default; switching to the secret is a change.
+            assert!(changed_rows(view).is_empty());
+            view.cloud_menu_choice("cloud-set:claude:", cx);
+            assert_eq!(changed_rows(view), [CloudRow::Claude]);
+            view.create_cloud(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let sent = requests.lock().unwrap();
+    assert_eq!(sent[0].account, None);
+    assert!(
+        sent[0].account_pinned,
+        "an explicit 'no account' is pinned too"
+    );
+}
+
+#[gpui::test]
+fn the_working_branch_follows_the_base_and_stops_when_typed(cx: &mut TestAppContext) {
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    window
+        .update(cx, |view, _, cx| {
+            view.set_offers_codespace(true, cx);
+            view.cloud_menu_choice("workspace:cloud-codespace", cx);
+            set_text(view, |d| d.base.clone(), "a", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let branch = |view: &Conversation, cx: &gpui::App| {
+        view.cloud_draft
+            .as_ref()
+            .unwrap()
+            .branch
+            .read(cx)
+            .content
+            .to_string()
+    };
+    window
+        .update(cx, |view, _, cx| {
+            assert_eq!(branch(view, cx), "a");
+            set_text(view, |d| d.branch.clone(), "mine", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            set_text(view, |d| d.base.clone(), "b", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| assert_eq!(branch(view, cx), "mine"))
+        .unwrap();
+}
+
+#[gpui::test]
+fn an_invalid_working_branch_is_refused_inline_before_any_request(cx: &mut TestAppContext) {
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    let requests = watch(window, cx);
+    window
+        .update(cx, |view, _, cx| {
+            view.set_offers_codespace(true, cx);
+            view.cloud_menu_choice("workspace:cloud-codespace", cx);
+            for bad in ["--x", "a b", "a..b", "x;y"] {
+                set_text(view, |d| d.branch.clone(), bad, cx);
+                view.create_cloud(cx);
+                let draft = view.cloud_draft.as_ref().unwrap();
+                assert!(!draft.creating, "{bad}");
+                assert!(
+                    draft
+                        .error
+                        .as_deref()
+                        .is_some_and(|e| e.contains("invalid")),
+                    "{bad}: {:?}",
+                    draft.error
+                );
+            }
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[gpui::test]
+fn the_docker_account_row_lists_machine_sign_in_and_the_saved_accounts(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    let requests = watch(window, cx);
+    window
+        .update(cx, |view, _, cx| {
+            view.set_docker_accounts_loader(Arc::new(|_| {
+                Ok(vec![
+                    docker_account("acct-1", "octo"),
+                    docker_account("acct-2", "cat"),
+                ])
+            }));
+            save_config(view);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            // Still being read: the machine sign-in is the only choice.
+            let (_, items) = view.cloud_field_menu(CloudField::DockerAccount);
+            assert_eq!(items.len(), 1);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            let (title, items) = view.cloud_field_menu(CloudField::DockerAccount);
+            assert_eq!(title, "Docker account");
+            let labels: Vec<_> = items
+                .iter()
+                .filter_map(|item| match item {
+                    MenuItem::Action(a) => Some(a.label.to_string()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(labels, ["Machine sign-in (sbx login)", "octo", "cat"]);
+            assert_eq!(
+                view.cloud_field_value(CloudField::DockerAccount),
+                "Machine sign-in (sbx login)"
+            );
+            view.cloud_menu_choice("cloud-set:docker:acct-2", cx);
+            assert_eq!(view.cloud_field_value(CloudField::DockerAccount), "cat");
+            view.create_cloud(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let sent = requests.lock().unwrap();
+    let config = sent[0].config.as_ref().unwrap();
+    assert_eq!(config.docker_account.as_deref(), Some("acct-2"));
+    // The Claude account was not touched.
+    assert!(!sent[0].account_pinned);
+}
+
+#[gpui::test]
+fn the_claude_row_names_the_secret_for_a_codespace_and_none_for_a_sandbox(cx: &mut TestAppContext) {
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    window
+        .update(cx, |view, _, cx| {
+            view.set_offers_codespace(true, cx);
+            save_config(view);
+            view.cloud_menu_choice("workspace:cloud-codespace", cx);
+            assert_eq!(
+                view.cloud_field_value(CloudField::Claude),
+                "Codespaces secret (CLAUDE_CODE_OAUTH_TOKEN)"
+            );
+            view.clear_cloud_target(cx);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            assert_eq!(view.cloud_field_value(CloudField::Claude), "None");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_workspace_menu_offers_existing_instance_and_cloud_settings(cx: &mut TestAppContext) {
+    use monocode_core::cloud_sessions::project_cloud::DefaultBackend;
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    let settings: Arc<Mutex<Vec<Option<DefaultBackend>>>> = Default::default();
+    let existing: Arc<Mutex<Vec<DefaultBackend>>> = Default::default();
+    let (a, b) = (settings.clone(), existing.clone());
+    window
+        .update(cx, |view, _, cx| {
+            cx.subscribe(
+                &cx.entity(),
+                move |_, _, e: &OpenProjectCloudSettings, _| {
+                    a.lock().unwrap().push(e.backend);
+                },
+            )
+            .detach();
+            cx.subscribe(&cx.entity(), move |_, _, e: &OpenExistingInstance, _| {
+                b.lock().unwrap().push(e.backend);
+            })
+            .detach();
+            view.set_offers_codespace(true, cx);
+            let ids: Vec<_> = all_rows(view).into_iter().map(|row| row.0).collect();
+            assert_eq!(
+                ids,
+                [
+                    "workspace:cloud-codespace",
+                    "workspace:cloud-docker",
+                    "workspace:cloud-existing",
+                    "workspace:cloud-settings"
+                ]
+            );
+            // The settings item follows a separator.
+            let items = view.cloud_menu_items();
+            assert!(matches!(items[items.len() - 2], MenuItem::Separator));
+            let rows = all_rows(view);
+            // The project default is named on its backend.
+            assert_eq!(rows[0].3.as_deref(), Some("(default)"));
+            assert_eq!(rows[2].1, "Existing instance\u{2026}");
+            assert_eq!(rows[3].1, "Cloud settings for this project\u{2026}");
+            // Nothing chosen: the dialog opens on the project's default, existing on Codespace.
+            assert!(view.cloud_menu_choice("workspace:cloud-settings", cx));
+            assert!(view.cloud_menu_choice("workspace:cloud-existing", cx));
+            // The backend that is chosen decides.
+            save_config(view);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            assert!(view.cloud_menu_choice("workspace:cloud-settings", cx));
+            // There is no picker of existing sandboxes: the item is off and emits nothing.
+            let rows = all_rows(view);
+            assert!(matches!(
+                view.cloud_menu_items().iter().find_map(|i| match i {
+                    MenuItem::Action(a) if a.id.as_ref() == "workspace:cloud-existing" =>
+                        Some(a.disabled),
+                    _ => None,
+                }),
+                Some(true)
+            ));
+            assert_eq!(
+                rows[2].3.as_deref(),
+                Some("Not available for Docker Sandbox")
+            );
+            assert!(view.cloud_menu_choice("workspace:cloud-existing", cx));
+            view.cloud_menu_choice("workspace:cloud-codespace", cx);
+            assert!(view.cloud_menu_choice("workspace:cloud-existing", cx));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        *settings.lock().unwrap(),
+        [None, Some(DefaultBackend::Sandbox)]
+    );
+    assert_eq!(
+        *existing.lock().unwrap(),
+        [DefaultBackend::Codespace, DefaultBackend::Codespace]
+    );
+}
+
+#[gpui::test]
+fn existing_instance_names_the_most_recent_codespace_of_the_project(cx: &mut TestAppContext) {
+    use monocode_core::cloud_sessions::CloudRef;
+    use monocode_core::store::pending_cloud_project;
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    window
+        .update(cx, |view, _, cx| {
+            view.set_offers_codespace(true, cx);
+            assert_eq!(all_rows(view)[2].3, None);
+            let store = locked(&view.store).unwrap();
+            store
+                .create_pending_cloud_session(
+                    "claude",
+                    pending_cloud_project(
+                        &view.summary.cwd,
+                        &CloudRef::codespace("octo-abc"),
+                        "/workspaces/widgets",
+                    ),
+                )
+                .unwrap();
+            drop(store);
+            assert_eq!(all_rows(view)[2].3.as_deref(), Some("octo-abc"));
+        })
+        .unwrap();
 }

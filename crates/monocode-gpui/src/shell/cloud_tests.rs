@@ -4383,6 +4383,8 @@ fn the_create_request_turns_the_panel_picks_into_begin_start_arguments() {
         branch: "release/1".into(),
         config: None,
         machine: machine.map(str::to_owned),
+        idle_timeout_minutes: machine.map(|_| 120),
+        work_branch: machine.map(|_| "feature/x".into()),
         account: None,
         account_pinned: false,
         prompt: None,
@@ -4393,9 +4395,14 @@ fn the_create_request_turns_the_panel_picks_into_begin_start_arguments() {
         super::cloud_create::codespace_target(&request(Some("standardLinux32gb"))).unwrap();
     assert_eq!(picked.branch.as_deref(), Some("release/1"));
     assert_eq!(picked.machine.as_deref(), Some("standardLinux32gb"));
-    // No pick keeps the default machine, chosen later by the core.
+    // The session's idle stop and working branch reach the core target.
+    assert_eq!(picked.idle_timeout_minutes, Some(120));
+    assert_eq!(picked.work_branch.as_deref(), Some("feature/x"));
+    // No pick keeps the project's machine, idle stop and branch, chosen later by the core.
     let default = super::cloud_create::codespace_target(&request(None)).unwrap();
     assert_eq!(default.machine, None);
+    assert_eq!(default.idle_timeout_minutes, None);
+    assert_eq!(default.work_branch, None);
 }
 
 #[gpui::test]

@@ -136,6 +136,7 @@ impl CodespaceProvider {
                     devcontainer_path: None,
                     claude_account: None,
                     claude_account_pinned: false,
+                    work_branch: None,
                 })
             }
             None => Ok(Target {
@@ -146,6 +147,7 @@ impl CodespaceProvider {
                 devcontainer_path: None,
                 claude_account: None,
                 claude_account_pinned: false,
+                work_branch: None,
             }),
         }
     }

@@ -3,6 +3,12 @@
 //! the warnings, the summary line and the validation that maps core errors to fields. Pure
 //! functions of their inputs: `save` is the only one that touches the store, and it never
 //! runs `gh`, `sbx` or `git`.
+pub(crate) use crate::cloud_presets::AccountChoice;
+pub(super) use crate::cloud_presets::{
+    CODESPACE_SECRET_LABEL, docker_account_label, idle_label, idle_options, machine_label,
+    memory_mib, runtime_label, runtime_options, size_label, size_options,
+};
+use crate::cloud_presets::{gb_text, plural};
 use monocode_core::{
     cloud_sessions::{
         docker_config::{self, DockerProjectConfig},
@@ -11,7 +17,7 @@ use monocode_core::{
         },
     },
     codespaces::{self, MachineType},
-    docker_accounts::{DockerAccountStatus, DockerAccountSummary},
+    docker_accounts::DockerAccountSummary,
     git_credentials::{self, GitCredentialSummary},
     store::Store,
 };
@@ -29,16 +35,6 @@ pub(super) const REPO_HINT: &str = "HTTPS, GitHub or GitLab.com.";
 pub(super) const CODESPACE_BASE_HINT: &str =
     "Empty means the current branch of the project folder.";
 pub(super) const SANDBOX_BASE_HINT: &str = "Empty means the repository's default branch.";
-pub(super) const CODESPACE_SECRET_LABEL: &str = "Codespaces secret (CLAUDE_CODE_OAUTH_TOKEN)";
-
-/// A Claude account a cloud session can use: one that has a setup-token or an API key.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct AccountChoice {
-    pub id: String,
-    pub label: String,
-    /// `setup-token` or `API key`.
-    pub kind: &'static str,
-}
 
 /// The repository URL to prefill: the project's `origin` when it is an HTTPS URL on a host
 /// the backend supports. An SSH origin is never converted.
@@ -388,90 +384,6 @@ pub(super) fn save(
 
 // ------------------------------------------------------------------ options
 
-/// The sizes the cloud offers, `(cpus, memory)`.
-pub(super) const SIZES: [(u32, &str); 5] =
-    [(1, "2g"), (2, "4g"), (4, "8g"), (8, "16g"), (16, "32g")];
-pub(super) const IDLE_MINUTES: [u32; 4] = [30, 60, 120, 240];
-pub(super) const RUNTIMES: [&str; 4] = ["1h", "2h", "4h", "8h"];
-
-/// `4g` or `512m` as MiB.
-pub(super) fn memory_mib(memory: &str) -> Option<u64> {
-    let memory = memory.trim().to_ascii_lowercase();
-    if let Some(g) = memory.strip_suffix('g') {
-        return g.parse::<u64>().ok().map(|g| g * 1024);
-    }
-    memory.strip_suffix('m')?.parse().ok()
-}
-
-/// `16384` MiB as `16 GB`.
-fn gb_text(mib: u64) -> String {
-    if mib >= 1024 && mib.is_multiple_of(1024) {
-        format!("{} GB", mib / 1024)
-    } else if mib >= 1024 {
-        format!("{:.1} GB", mib as f64 / 1024.0)
-    } else {
-        format!("{mib} MB")
-    }
-}
-
-fn plural(count: u32, unit: &str) -> String {
-    if count == 1 {
-        format!("{count} {unit}")
-    } else {
-        format!("{count} {unit}s")
-    }
-}
-
-pub(super) fn size_label(cpus: u32, memory: &str) -> String {
-    let memory = memory_mib(memory).map_or_else(|| memory.to_owned(), gb_text);
-    format!("{}, {memory}", plural(cpus, "CPU"))
-}
-
-pub(super) fn idle_label(minutes: u32) -> String {
-    let span = match minutes {
-        m if m >= 60 && m % 60 == 0 => plural(m / 60, "hour"),
-        m => plural(m, "minute"),
-    };
-    format!("After {span}")
-}
-
-pub(super) fn runtime_label(ttl: &str) -> String {
-    let long = match ttl.strip_suffix('h').and_then(|n| n.parse::<u32>().ok()) {
-        Some(hours) => plural(hours, "hour"),
-        None => match ttl.strip_suffix('m').and_then(|n| n.parse::<u32>().ok()) {
-            Some(minutes) => plural(minutes, "minute"),
-            None => ttl.to_owned(),
-        },
-    };
-    format!("{long}, then stop")
-}
-
-/// The sizes to offer: the presets, plus the current value when it is none of them.
-pub(super) fn size_options(cpus: u32, memory: &str) -> Vec<(u32, String)> {
-    let mut options: Vec<(u32, String)> =
-        SIZES.iter().map(|(c, m)| (*c, (*m).to_owned())).collect();
-    if !options.iter().any(|(c, m)| *c == cpus && m == memory) {
-        options.push((cpus, memory.to_owned()));
-    }
-    options
-}
-
-pub(super) fn idle_options(current: u32) -> Vec<u32> {
-    let mut options = IDLE_MINUTES.to_vec();
-    if !options.contains(&current) {
-        options.push(current);
-    }
-    options
-}
-
-pub(super) fn runtime_options(current: &str) -> Vec<String> {
-    let mut options: Vec<String> = RUNTIMES.iter().map(|r| (*r).to_owned()).collect();
-    if !options.iter().any(|r| r == current) {
-        options.push(current.to_owned());
-    }
-    options
-}
-
 /// "Asks for 4 CPUs and 16 GB" from the devcontainer's `hostRequirements`.
 pub(super) fn requirement_hint(info: &DevcontainerInfo) -> Option<String> {
     let memory = info.host_memory_mib.map(gb_text);
@@ -534,14 +446,6 @@ pub(super) fn devcontainer_machine<'a>(
         .min_by_key(|m| (m.cpus, m.memory_in_bytes))
 }
 
-pub(super) fn machine_label(machine: &MachineType) -> String {
-    if machine.display_name.is_empty() {
-        machine.name.clone()
-    } else {
-        machine.display_name.clone()
-    }
-}
-
 /// The machine select's options: every machine the repository offers (the one the
 /// devcontainer asks for marked), plus the current value when the list lacks it.
 pub(super) fn machine_options(
@@ -577,17 +481,6 @@ pub(super) fn selected_machine(machines: &[MachineType], current: Option<&str>) 
     match current {
         Some(name) => Some(name.to_owned()),
         None => codespaces::default_machine(machines, None),
-    }
-}
-
-/// A Docker account as the select shows it.
-pub(super) fn docker_account_label(account: &DockerAccountSummary) -> String {
-    match account.status {
-        DockerAccountStatus::Revoked => format!("{} (token needs replacing)", account.docker_id),
-        DockerAccountStatus::MissingScope => {
-            format!("{} (needs Cloud Sandboxes access)", account.docker_id)
-        }
-        DockerAccountStatus::Valid | DockerAccountStatus::Unchecked => account.docker_id.clone(),
     }
 }
 

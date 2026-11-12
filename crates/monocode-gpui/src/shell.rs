@@ -1771,6 +1771,21 @@ impl Shell {
         ));
         self.observations.push(cx.subscribe(
             &view,
+            |_, _, event: &crate::conversation::cloud_target::OpenExistingInstance, cx| {
+                let backend = event.backend;
+                cx.spawn(async move |this, cx| {
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        // Only codespaces have a picker of existing instances.
+                        if backend == monocode_core::cloud_sessions::project_cloud::DefaultBackend::Codespace {
+                            this.open_codespace_picker(window, cx);
+                        }
+                    });
+                })
+                .detach();
+            },
+        ));
+        self.observations.push(cx.subscribe(
+            &view,
             move |_, _, event: &crate::cloud_start_view::CloudStartAction, cx| {
                 let action = event.action;
                 cx.spawn(async move |this, cx| {
