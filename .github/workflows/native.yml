@@ -114,14 +114,11 @@ jobs:
 
   # The GPUI tests. macOS-only tests and the macOS build still run locally.
   desktop-test:
-    name: GPUI tests (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        # TEMP: Windows GPUI test probe - measures whether the Windows tests pass
-        # and are cheap; drop windows-latest from this list if not.
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    name: GPUI tests (ubuntu-latest)
+    # Linux only. Windows GPUI tests are not run: a probe took 23 minutes to
+    # build and its tests were still running (with failures) when it hit the
+    # 60 minute limit. Windows keeps the compile check above.
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -132,7 +129,6 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install native Linux build dependencies
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y clang cmake ninja-build pkg-config libfontconfig1-dev libfreetype6-dev libxcb1-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libasound2-dev libx11-xcb-dev libegl1-mesa-dev libvulkan-dev libdbus-1-dev squashfs-tools desktop-file-utils
