@@ -114,6 +114,63 @@ pub(crate) fn machine_label(machine: &MachineType) -> String {
     }
 }
 
+/// The label of the machine type called `name`: from `machines` when it lists it, else `name`.
+pub(crate) fn machine_name_label(machines: &[MachineType], name: &str) -> String {
+    machines
+        .iter()
+        .find(|m| m.name == name)
+        .map_or_else(|| name.to_owned(), machine_label)
+}
+
+/// How an account the app no longer has is named, so a row holding it is not a mystery.
+pub(crate) fn unavailable_account_label(id: &str) -> String {
+    format!("{id} (unavailable)")
+}
+
+/// One choice of a Claude account select.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClaudeChoice {
+    /// `None` is "no account" (the backend's own default way of signing in).
+    pub id: Option<String>,
+    pub label: String,
+    pub selected: bool,
+}
+
+/// The choices of a Claude account select: "no account" (`none_label`), every usable account
+/// and, when `current` is an account the app no longer has, that one marked unavailable.
+/// `with_kind` appends how the account signs in (setup-token or API key).
+pub(crate) fn claude_choices(
+    none_label: &str,
+    accounts: &[AccountChoice],
+    current: Option<&str>,
+    with_kind: bool,
+) -> Vec<ClaudeChoice> {
+    let mut choices = vec![ClaudeChoice {
+        id: None,
+        label: none_label.to_owned(),
+        selected: current.is_none(),
+    }];
+    choices.extend(accounts.iter().map(|account| ClaudeChoice {
+        id: Some(account.id.clone()),
+        label: if with_kind {
+            format!("{} \u{b7} {}", account.label, account.kind)
+        } else {
+            account.label.clone()
+        },
+        selected: current == Some(account.id.as_str()),
+    }));
+    if let Some(id) = current
+        && !accounts.iter().any(|account| account.id == id)
+    {
+        choices.push(ClaudeChoice {
+            id: Some(id.to_owned()),
+            label: unavailable_account_label(id),
+            selected: true,
+        });
+    }
+    choices
+}
+
 /// A Docker account as the select shows it.
 pub(crate) fn docker_account_label(account: &DockerAccountSummary) -> String {
     match account.status {
@@ -122,5 +179,65 @@ pub(crate) fn docker_account_label(account: &DockerAccountSummary) -> String {
             format!("{} (needs Cloud Sandboxes access)", account.docker_id)
         }
         DockerAccountStatus::Valid | DockerAccountStatus::Unchecked => account.docker_id.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn account(id: &str, label: &str) -> AccountChoice {
+        AccountChoice {
+            id: id.into(),
+            label: label.into(),
+            kind: "setup-token",
+        }
+    }
+
+    #[test]
+    fn claude_choices_start_with_none_and_mark_the_current_account() {
+        let accounts = [account("a", "Work"), account("b", "Home")];
+        let choices = claude_choices("None", &accounts, Some("b"), false);
+        let seen: Vec<_> = choices
+            .iter()
+            .map(|c| (c.id.as_deref(), c.label.as_str(), c.selected))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (None, "None", false),
+                (Some("a"), "Work", false),
+                (Some("b"), "Home", true)
+            ]
+        );
+        assert!(claude_choices("None", &accounts, None, false)[0].selected);
+    }
+
+    #[test]
+    fn claude_choices_keep_a_missing_account_visible_and_can_name_how_it_signs_in() {
+        let accounts = [account("a", "Work")];
+        let choices = claude_choices("None", &accounts, Some("gone"), true);
+        assert_eq!(choices[1].label, "Work \u{b7} setup-token");
+        let last = choices.last().unwrap();
+        assert_eq!(last.id.as_deref(), Some("gone"));
+        assert_eq!(last.label, "gone (unavailable)");
+        assert!(last.selected);
+        assert_eq!(last.label, unavailable_account_label("gone"));
+    }
+
+    #[test]
+    fn machine_names_use_the_display_name_when_the_list_has_one() {
+        let machine = |name: &str, display: &str| MachineType {
+            name: name.into(),
+            display_name: display.into(),
+            operating_system: "linux".into(),
+            storage_in_bytes: 0,
+            memory_in_bytes: 0,
+            cpus: 2,
+        };
+        let list = [machine("basic", "Basic"), machine("plain", "")];
+        assert_eq!(machine_name_label(&list, "basic"), "Basic");
+        assert_eq!(machine_name_label(&list, "plain"), "plain");
+        assert_eq!(machine_name_label(&list, "other"), "other");
     }
 }

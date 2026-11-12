@@ -2048,6 +2048,65 @@ fn attaching_needs_a_ready_session_on_the_instance() {
         .is_err());
 }
 
+#[test]
+fn project_instances_lists_the_projects_live_sandboxes_from_the_store_only() {
+    let gh = FakeGh::new(vec![]);
+    let fx = fixture(&gh);
+    assert!(fx
+        .api
+        .cloud
+        .project_instances(&fx.path(), CloudBackendKind::DockerSandbox)
+        .unwrap()
+        .is_empty());
+    let first = fx.bind_sandbox("box-1");
+    fx.bind_sandbox("box-1");
+    let archived = fx.bind_sandbox("box-3");
+    fx.store
+        .lock()
+        .unwrap()
+        .set_archived(archived, true)
+        .unwrap();
+    {
+        // Still on its provisional project: listed, but not ready.
+        let store = fx.store.lock().unwrap();
+        let cloud = CloudRef::sandbox("box-2");
+        let project =
+            crate::store::pending_cloud_project(&fx.path(), &cloud, "/workspaces/widgets");
+        store
+            .create_pending_cloud_session("claude", project)
+            .unwrap();
+    }
+    let listed = fx
+        .api
+        .cloud
+        .project_instances(&fx.path(), CloudBackendKind::DockerSandbox)
+        .unwrap();
+    let mut seen: Vec<(String, usize, bool)> = listed
+        .iter()
+        .map(|i| (i.cloud.name.clone(), i.sessions, i.ready))
+        .collect();
+    seen.sort();
+    assert_eq!(
+        seen,
+        [("box-1".into(), 2, true), ("box-2".into(), 1, false)],
+        "{listed:?}"
+    );
+    // Other backends and other projects are not listed. No sbx call was made.
+    assert!(fx
+        .api
+        .cloud
+        .project_instances(&fx.path(), CloudBackendKind::Codespaces)
+        .unwrap()
+        .is_empty());
+    assert!(fx
+        .api
+        .cloud
+        .project_instances("/somewhere/else", CloudBackendKind::DockerSandbox)
+        .unwrap()
+        .is_empty());
+    let _ = first;
+}
+
 struct CpGh {
     files: Vec<&'static str>,
 }

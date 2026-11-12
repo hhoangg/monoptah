@@ -1016,28 +1016,19 @@ impl CloudSettings {
                 crate::cloud_presets::SANDBOX_NO_CLAUDE_LABEL,
             ),
         };
-        let mut options = vec![Opt {
-            label: none_label.into(),
-            selected: current.is_none(),
-            pick: Pick::Claude(None),
-        }];
-        for account in &self.env.claude_accounts {
-            options.push(Opt {
-                label: account.label.clone(),
-                selected: current.as_deref() == Some(account.id.as_str()),
-                pick: Pick::Claude(Some(account.id.clone())),
-            });
-        }
-        if let Some(id) = current
-            && !self.env.claude_accounts.iter().any(|a| &a.id == id)
-        {
-            options.push(Opt {
-                label: format!("{id} (unavailable)"),
-                selected: true,
-                pick: Pick::Claude(Some(id.clone())),
-            });
-        }
-        options
+        crate::cloud_presets::claude_choices(
+            none_label,
+            &self.env.claude_accounts,
+            current.as_deref(),
+            false,
+        )
+        .into_iter()
+        .map(|choice| Opt {
+            label: choice.label,
+            selected: choice.selected,
+            pick: Pick::Claude(choice.id),
+        })
+        .collect()
     }
 
     fn options(&self, which: Select, cx: &App) -> Vec<Opt> {
@@ -1969,20 +1960,17 @@ impl CloudSettings {
                 .claude_accounts
                 .iter()
                 .find(|a| &a.id == id)
-                .map_or_else(|| format!("{id} (unavailable)"), |a| a.label.clone()),
+                .map_or_else(
+                    || crate::cloud_presets::unavailable_account_label(id),
+                    |a| a.label.clone(),
+                ),
         };
         match self.tab {
             DefaultBackend::Codespace => {
                 let machine = match &self.machines {
                     Machines::Loaded(list) => {
-                        model::selected_machine(list, typed.codespace.machine.as_deref()).and_then(
-                            |name| {
-                                list.iter()
-                                    .find(|m| m.name == name)
-                                    .map(model::machine_label)
-                                    .or(Some(name))
-                            },
-                        )
+                        model::selected_machine(list, typed.codespace.machine.as_deref())
+                            .map(|name| crate::cloud_presets::machine_name_label(list, &name))
                     }
                     _ => Some(
                         typed

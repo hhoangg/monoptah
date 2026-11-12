@@ -426,6 +426,18 @@ pub struct CloudSession {
     pub needs_input: bool,
 }
 
+/// An instance (codespace or sandbox) that sessions of a project run in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectInstance {
+    pub cloud: CloudRef,
+    /// Live (not archived) sessions of the project on it.
+    pub sessions: usize,
+    /// One of them is past its start, so another session can be attached.
+    pub ready: bool,
+    /// The most recent update among those sessions.
+    pub updated_at: u64,
+}
+
 /// A local session whose location is Cloud, as the sidebar needs it besides the
 /// [`CloudSession`] row: the move point (rewind gating) and the durable sync error.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1294,6 +1306,37 @@ impl CloudSessions {
                 std::cmp::Reverse(s.summary.id),
             )
         });
+        Ok(found)
+    }
+
+    /// The instances of `kind` that the project's sessions run in, most recently used first,
+    /// each once. Reads the store only (no gh or sbx call), so the state of an instance is not
+    /// known here. Archived sessions do not count: an instance is only offered while a live
+    /// session of the project is on it (see [`Self::attach_session`]).
+    pub fn project_instances(
+        &self,
+        local_cwd: &str,
+        kind: CloudBackendKind,
+    ) -> Result<Vec<ProjectInstance>, String> {
+        let mut found: Vec<ProjectInstance> = Vec::new();
+        for session in self.cloud_sessions_for(local_cwd)? {
+            if session.cloud.kind != kind || session.summary.archived {
+                continue;
+            }
+            let ready = !crate::store::is_pending_cloud_environment(&session.environment_id);
+            match found.iter_mut().find(|i| i.cloud == session.cloud) {
+                Some(known) => {
+                    known.sessions += 1;
+                    known.ready |= ready;
+                }
+                None => found.push(ProjectInstance {
+                    cloud: session.cloud,
+                    sessions: 1,
+                    ready,
+                    updated_at: session.summary.updated_at,
+                }),
+            }
+        }
         Ok(found)
     }
 

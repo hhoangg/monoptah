@@ -112,8 +112,23 @@ Layout, top to bottom:
 
 The flow stays: Workspace menu, RUN ON CLOUD, Codespace or Docker Sandbox, panel attached
 above the composer, instance created on first send. The Workspace menu gains:
-- "Existing instance..." (opens the existing codespace / sandbox picker of
-  `shell/cloud_picker.rs`; the description shows the most recent instance name when known),
+- "Existing instance..." for the chosen backend, else the project's default one. It carries
+  the project of the conversation that asked, so the picker lists that project's instances
+  even when another project is open in the window. The description shows the most recent
+  instance name when known.
+  - Codespace: the existing codespace picker of `shell/cloud_picker.rs` (listing through gh,
+    on a worker).
+  - Docker Sandbox: a small picker (`shell/sandbox_picker.rs`) of the sandboxes the project's
+    live cloud sessions already run in. The list comes from the store only
+    (`CloudSessions::project_instances`, like `SandboxProvider::bound_names`), so nothing
+    calls `sbx` while it opens and a sandbox's state is not shown (a stopped one starts with
+    the first send). Picking one starts another session on it through
+    `CloudSessions::attach_session`, the path Mono uses for an existing instance: the project
+    must already have a ready session on it, so a sandbox whose only sessions are still
+    starting is listed but cannot be picked. The item is disabled ("No sandbox yet") while
+    the project has no session in a sandbox. The picker runs on a worker; the menu facts
+    (default backend, most recent instance) are read once and kept until the project's cloud
+    settings are saved or its cloud sessions change.
 - "Cloud settings for this project..." (opens layer 2 on the backend currently chosen).
 
 The panel rows have the same shape for both backends:
@@ -121,14 +136,28 @@ The panel rows have the same shape for both backends:
 2. Stop when idle (codespace) / Runtime limit (sandbox)
 3. Base branch
 4. Branch (the working branch of the session; for a codespace it defaults to the base
-   branch, and a different name is created in the codespace with `git switch -c` before the
-   session starts)
+   branch). A different valid name is created in the codespace before the session starts, as
+   part of the Connect step ("Creating branch <name>"): a branch that already exists on
+   origin is fetched and checked out tracking it (never recreated from the base, which would
+   lose its commits; a single-branch clone is handled), otherwise `git switch -c` creates it.
+   The script is idempotent and runs with the long ssh timeout plus one retry, because it is
+   the first ssh to a fresh codespace. The name is validated before anything is created and is
+   part of the single start-record save. A codespace Branch row that names another branch than
+   the base counts as "changed for this session"; a sandbox's feature branch never does.
 5. Docker account (sandbox only)
 6. Claude account
 7. Claude setup toggle
 
 Each row shows the project default marked "default". A row the user changed is highlighted
 and marked "changed for this session"; it applies to this session only (as today).
+
+Only a row marked "changed" is an override. When the first prompt is sent the panel re-reads
+the project's settings and applies onto them just the changed rows, so a row the user did not
+touch always follows the project, including settings saved from "Cloud settings for this
+project..." while the panel was open (the shell also tells the open panel on save, which
+re-seeds the defaults and keeps the changed rows). A Claude account is pinned to the instance
+only when it differs from the project's current default; a Docker account override is pinned
+to the created sandbox by the per-sandbox pin.
 
 ### Codespaces Claude account
 

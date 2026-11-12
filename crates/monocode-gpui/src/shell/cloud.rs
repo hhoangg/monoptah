@@ -876,7 +876,7 @@ impl Shell {
     /// Whether "New session in Codespace" applies to the project in view: a local
     /// folder whose `origin` is a GitHub repository.
     pub(super) fn offers_codespace(&self) -> bool {
-        self.can_open_codespace()
+        self.can_open_codespace(&self.workspace.project)
             && self
                 .github_projects
                 .get(&self.workspace.project)
@@ -987,6 +987,9 @@ impl Shell {
         }
         self.github_projects.extend(snapshot.github);
         self.sync_codespace_offers(cx);
+        if snapshot.marks != self.cloud_marks {
+            self.forget_cloud_menus(cx);
+        }
         self.cloud_marks = snapshot.marks;
         self.cloud_states = snapshot.states;
         self.sync_cloud_stopped(cx);

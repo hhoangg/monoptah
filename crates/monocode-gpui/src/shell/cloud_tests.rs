@@ -5421,3 +5421,217 @@ fn removing_a_sandbox_session_locally_names_the_account_its_delete_command_needs
          Docker account alice). Its conversation is not saved on this computer."
     );
 }
+
+// ----------------------------------------------------------- "Existing instance..." (T7 review)
+
+#[gpui::test]
+fn existing_instance_opens_the_codespace_picker_for_the_conversations_project(
+    cx: &mut TestAppContext,
+) {
+    let (window, _, _) = crate::shell::tests::window(cx);
+    let chat = window
+        .update(cx, |shell, _, cx| {
+            // The shell has another project open than the conversation's.
+            shell.workspace.project = "/work/elsewhere".into();
+            let (_, chat) = add_draft(shell, "/work/widgets", cx);
+            chat
+        })
+        .unwrap();
+    window
+        .update(cx, |_, _, cx| {
+            chat.update(cx, |chat, cx| {
+                assert!(chat.cloud_menu_choice("workspace:cloud-existing", cx));
+            })
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            assert_eq!(
+                shell.codespace_picker_project(cx).as_deref(),
+                Some("/work/widgets")
+            );
+            assert!(shell.sandbox_picker.is_none());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn existing_instance_for_a_sandbox_lists_the_projects_sandboxes_and_starts_on_the_one_picked(
+    cx: &mut TestAppContext,
+) {
+    use gpui::VisualTestContext;
+    use monocode_core::cloud_sessions::docker_config::{self, DockerProjectConfig};
+    let (window, _, _) = crate::shell::tests::window(cx);
+    let sbx = FakeSbx::new("running");
+    let (before, chat) = window
+        .update(cx, |shell, _, cx| {
+            shell.cloud = Arc::new(sandbox_service(&sbx, false, shell.store.clone()));
+            shell.remote_refresh_stub = Some(Ok(()));
+            shell.workspace.project = "/work/elsewhere".into();
+            // A session of the project already runs in a sandbox.
+            let before = add_sandbox_session(&shell.store, "/work/widgets");
+            let config = DockerProjectConfig {
+                repo_url: "https://github.com/octo/widgets.git".into(),
+                ..Default::default()
+            };
+            docker_config::save(&locked(&shell.store).unwrap(), "/work/widgets", &config).unwrap();
+            let (_, chat) = add_draft(shell, "/work/widgets", cx);
+            (before, chat)
+        })
+        .unwrap();
+    window
+        .update(cx, |_, _, cx| {
+            chat.update(cx, |chat, cx| {
+                // The project's default is the only configured backend: Docker Sandbox.
+                assert!(chat.cloud_menu_choice("workspace:cloud-existing", cx));
+            })
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.refresh().unwrap();
+    // The list is the store's (sbx is not asked).
+    window
+        .update(cx, |shell, _, cx| {
+            assert_eq!(
+                shell.sandbox_picker_names(cx),
+                Some(vec![SBX_NAME.to_owned()])
+            );
+            assert!(shell.codespace_picker.is_none());
+        })
+        .unwrap();
+    assert!(sbx.calls().is_empty(), "{:?}", sbx.calls());
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    let row = visual.debug_bounds("sandbox-row-0").expect("a row");
+    visual.simulate_click(row.center(), Default::default());
+    visual.run_until_parked();
+    window
+        .update(cx, |shell, _, _| {
+            assert!(shell.sandbox_picker.is_none());
+            // A second session of the project now runs in that sandbox, and it is open.
+            let store = locked(&shell.store).unwrap();
+            let on_sandbox: Vec<_> = store
+                .cloud_sessions("/work/widgets")
+                .unwrap()
+                .into_iter()
+                .filter(|s| s.project.cloud() == Some(CloudRef::sandbox(SBX_NAME)))
+                .collect();
+            assert_eq!(on_sandbox.len(), 2);
+            let new = on_sandbox
+                .iter()
+                .map(|s| s.summary.id)
+                .find(|id| *id != before)
+                .unwrap();
+            drop(store);
+            assert_eq!(shell.workspace.active, Some(new));
+            assert!(shell.sessions.contains_key(&new));
+            let mark = &shell.cloud_marks[&new];
+            assert_eq!(mark.codespace, SBX_NAME);
+            assert_eq!(mark.kind, CloudBackendKind::DockerSandbox);
+            assert_eq!(mark.local_project, "/work/widgets");
+        })
+        .unwrap();
+    // Nothing was created in Docker: only read-only sbx verbs may have run.
+    assert!(sbx.changes().is_empty(), "{:?}", sbx.calls());
+}
+
+#[gpui::test]
+fn a_sandbox_without_a_ready_session_is_listed_but_cannot_be_picked(cx: &mut TestAppContext) {
+    use gpui::VisualTestContext;
+    let (window, _, _) = crate::shell::tests::window(cx);
+    let sbx = FakeSbx::new("running");
+    window
+        .update(cx, |shell, window, cx| {
+            shell.cloud = Arc::new(sandbox_service(&sbx, false, shell.store.clone()));
+            let cloud = CloudRef::sandbox("still-starting");
+            let project = monocode_core::store::pending_cloud_project(
+                "/work/widgets",
+                &cloud,
+                "/home/agent/widgets",
+            );
+            locked(&shell.store)
+                .unwrap()
+                .create_pending_cloud_session("claude", project)
+                .unwrap();
+            shell.open_sandbox_picker("/work/widgets".into(), window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.refresh().unwrap();
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    let row = visual.debug_bounds("sandbox-row-0").expect("a row");
+    visual.simulate_click(row.center(), Default::default());
+    visual.run_until_parked();
+    window
+        .update(cx, |shell, _, _| {
+            // Still open, nothing attached.
+            assert!(shell.sandbox_picker.is_some());
+            assert_eq!(
+                locked(&shell.store)
+                    .unwrap()
+                    .cloud_sessions("/work/widgets")
+                    .unwrap()
+                    .len(),
+                1
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn saved_project_settings_and_changed_cloud_sessions_make_the_menu_read_again(
+    cx: &mut TestAppContext,
+) {
+    let (window, _, _) = crate::shell::tests::window(cx);
+    let chat = window
+        .update(cx, |shell, _, cx| add_draft(shell, "/work/widgets", cx).1)
+        .unwrap();
+    let cached = |cx: &mut TestAppContext| {
+        window
+            .update(cx, |_, _, cx| chat.read(cx).cloud_menu_is_cached())
+            .unwrap()
+    };
+    let read = |cx: &mut TestAppContext| {
+        window
+            .update(cx, |_, _, cx| {
+                // Opens the menu facts, like the Workspace menu does.
+                chat.update(cx, |chat, cx| {
+                    chat.cloud_menu_choice("workspace:cloud-existing", cx)
+                });
+            })
+            .unwrap();
+    };
+    read(cx);
+    assert!(cached(cx));
+    // The project's Cloud settings were saved.
+    window
+        .update(cx, |shell, _, cx| {
+            shell.cloud_settings_saved("/work/widgets", cx)
+        })
+        .unwrap();
+    assert!(!cached(cx));
+    // Another project's settings do not matter.
+    read(cx);
+    window
+        .update(cx, |shell, _, cx| {
+            shell.cloud_settings_saved("/work/other", cx)
+        })
+        .unwrap();
+    assert!(cached(cx));
+    // A cloud session came or went.
+    window
+        .update(cx, |shell, _, cx| {
+            let mut snapshot = cloud::Snapshot::default();
+            snapshot.marks.insert(
+                999,
+                CloudMark {
+                    local_project: "/work/widgets".into(),
+                    codespace: "octo-abc".into(),
+                    kind: CloudBackendKind::Codespaces,
+                },
+            );
+            shell.apply_cloud_snapshot(snapshot, cx)
+        })
+        .unwrap();
+    assert!(!cached(cx));
+}

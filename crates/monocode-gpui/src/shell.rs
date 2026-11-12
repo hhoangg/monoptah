@@ -42,6 +42,7 @@ mod idle_agents;
 mod image_lightbox_tests;
 mod layout;
 mod live_agents;
+mod sandbox_picker;
 pub(crate) use app_commands::CLOUD_ARCHIVING;
 pub(crate) use cloud_app_archive::ArchiveFailure;
 pub(crate) use live_agents::live_elapsed;
@@ -777,8 +778,14 @@ pub(crate) struct Shell {
     /// A cloud session whose archive waits for its dialog (opened on the next render).
     cloud_archive_request: Vec<i64>,
     codespace_picker: Option<cloud_picker::Open>,
+    /// "Existing instance..." of a Docker Sandbox.
+    sandbox_picker: Option<sandbox_picker::Open>,
     #[cfg(test)]
     cloud_create_hook: Option<cloud_create::CreateHook>,
+    /// Tests: how the remote refresh of every session added from now on answers (there is no
+    /// Host to ask, and an unanswered refresh is retried at once).
+    #[cfg(test)]
+    remote_refresh_stub: Option<Result<(), String>>,
     _cloud_clock: gpui::Task<()>,
     sessions: HashMap<i64, Entity<Conversation>>,
     /// Sessions that run as their provider's CLI. A session is in exactly one of
@@ -1260,8 +1267,11 @@ impl Shell {
             github_projects: HashMap::new(),
             #[cfg(test)]
             cloud_create_hook: None,
+            #[cfg(test)]
+            remote_refresh_stub: None,
             cloud_archive_request: Vec::new(),
             codespace_picker: None,
+            sandbox_picker: None,
             _cloud_clock: cloud_clock,
             sessions: HashMap::new(),
             tui_sessions: HashMap::new(),
@@ -1681,6 +1691,8 @@ impl Shell {
             if let Some(start) = self.cloud_start_snapshot(id) {
                 view.set_cloud_start(Some(start), cx);
             }
+            #[cfg(test)]
+            view.stub_remote_refresh(self.remote_refresh_stub.clone());
         });
         self.observations.push(cx.subscribe(
             &view,
@@ -1772,13 +1784,15 @@ impl Shell {
         self.observations.push(cx.subscribe(
             &view,
             |_, _, event: &crate::conversation::cloud_target::OpenExistingInstance, cx| {
-                let backend = event.backend;
+                use monocode_core::cloud_sessions::project_cloud::DefaultBackend;
+                // The project of the conversation that asked, not the one open in the shell.
+                let (project, backend) = (event.cwd.clone(), event.backend);
                 cx.spawn(async move |this, cx| {
-                    let _ = this.update_in(cx, |this, window, cx| {
-                        // Only codespaces have a picker of existing instances.
-                        if backend == monocode_core::cloud_sessions::project_cloud::DefaultBackend::Codespace {
-                            this.open_codespace_picker(window, cx);
+                    let _ = this.update_in(cx, |this, window, cx| match backend {
+                        DefaultBackend::Codespace => {
+                            this.open_codespace_picker_for(project, window, cx)
                         }
+                        DefaultBackend::Sandbox => this.open_sandbox_picker(project, window, cx),
                     });
                 })
                 .detach();
@@ -9702,6 +9716,10 @@ impl Render for Shell {
                     this.close_codespace_picker(window, cx);
                     return;
                 }
+                if this.sandbox_picker.is_some() {
+                    this.close_sandbox_picker(window, cx);
+                    return;
+                }
                 // A dialog left from another project must not swallow the key.
                 this.drop_stale_provider_prompt(window, cx);
                 if this.provider_prompt.is_some() {
@@ -9971,6 +9989,7 @@ impl Render for Shell {
             .children(self.cloud_continue_modal(window, cx))
             .children(self.cloud_view_card(cx))
             .children(self.codespace_picker_modal(window, cx))
+            .children(self.sandbox_picker_modal(window, cx))
             .children(self.action_modal(window, cx))
             .children(self.resource_modal(window, cx))
             .children(self.quick_open_modal(window, cx))

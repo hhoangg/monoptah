@@ -226,6 +226,7 @@ impl Shell {
         self.cloud_states
             .entry(cloud.key())
             .or_insert(CloudState::Unknown);
+        self.forget_cloud_menus(cx);
         // A failed record (an ambiguous create) waits for the user's Retry: tracking it would
         // run the start again, and with it another create, without a click.
         let failed = record.is_failed();

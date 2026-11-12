@@ -213,32 +213,23 @@ impl Conversation {
                 ("Stop when idle", items)
             }
             CloudField::Claude => {
-                let none = self.cloud_claude_none_label();
-                let mut items = vec![item(
-                    "cloud-set:claude:".into(),
-                    none.into(),
-                    draft.account.is_none(),
-                    defaults.claude.is_none(),
-                )];
-                items.extend(draft.accounts.iter().map(|account| {
+                let items = presets::claude_choices(
+                    self.cloud_claude_none_label(),
+                    &draft.accounts,
+                    draft.account.as_deref(),
+                    true,
+                )
+                .into_iter()
+                .map(|choice| {
+                    let is_default = choice.id == defaults.claude;
                     item(
-                        format!("cloud-set:claude:{}", account.id),
-                        format!("{} \u{b7} {}", account.label, account.kind),
-                        draft.account.as_deref() == Some(account.id.as_str()),
-                        defaults.claude.as_deref() == Some(account.id.as_str()),
+                        format!("cloud-set:claude:{}", choice.id.as_deref().unwrap_or("")),
+                        choice.label,
+                        choice.selected,
+                        is_default,
                     )
-                }));
-                // An account the app no longer has stays visible so the row is not a mystery.
-                if let Some(id) = &draft.account
-                    && !draft.accounts.iter().any(|account| &account.id == id)
-                {
-                    items.push(item(
-                        format!("cloud-set:claude:{id}"),
-                        format!("{id} (unavailable)"),
-                        true,
-                        defaults.claude.as_ref() == Some(id),
-                    ));
-                }
+                })
+                .collect();
                 ("Claude account", items)
             }
             CloudField::DockerAccount => {
@@ -444,8 +435,9 @@ impl Conversation {
     fn cloud_field_row(&self, row_kind: CloudRow, field: &Entity<input::Input>) -> Stateful<Div> {
         let locked = self.cloud_creating();
         let (id, changed) = (row_kind.id(), self.cloud_row_changed(row_kind));
-        // The working branch has no project default, so it carries no mark.
-        let marked = row_kind != CloudRow::Branch;
+        // The working branch has no project default to mark, but it says so when it names
+        // another branch than the base.
+        let marked = row_kind != CloudRow::Branch || changed;
         row(id, row_kind.icon(), row_kind.label(), changed)
             .child(
                 div()

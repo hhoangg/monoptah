@@ -574,19 +574,30 @@ impl Render for CodespacePicker {
 }
 
 impl Shell {
-    /// Whether the project can host a codespace: a local folder.
-    pub(super) fn can_open_codespace(&self) -> bool {
-        !self.workspace.project.starts_with("remote://")
+    /// Whether `project` can host a codespace: a local folder.
+    pub(super) fn can_open_codespace(&self, project: &str) -> bool {
+        !project.starts_with("remote://")
     }
 
     pub(super) fn open_codespace_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.can_open_codespace() || self.codespace_picker.is_some() {
+        let project = self.workspace.project.clone();
+        self.open_codespace_picker_for(project, window, cx);
+    }
+
+    /// The picker of the codespaces of `project`, which is the project of the conversation that
+    /// asked, not necessarily the one open in the shell.
+    pub(super) fn open_codespace_picker_for(
+        &mut self,
+        project: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_open_codespace(&project) || self.codespace_picker.is_some() {
             return;
         }
         let restore = window.focused(cx);
         self.close_menu(cx);
         self.close_preview(cx);
-        let project = self.workspace.project.clone();
         let picker = cx.new(|cx| {
             CodespacePicker::new(self.cloud.clone(), self.gh.clone(), project.clone(), cx)
         });
@@ -614,6 +625,13 @@ impl Shell {
             _events: events,
         });
         cx.notify();
+    }
+
+    /// The local project the open codespace picker lists the codespaces of.
+    #[cfg(test)]
+    pub(super) fn codespace_picker_project(&self, cx: &App) -> Option<String> {
+        let open = self.codespace_picker.as_ref()?;
+        Some(open.picker.read(cx).local_project.clone())
     }
 
     pub(super) fn close_codespace_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {

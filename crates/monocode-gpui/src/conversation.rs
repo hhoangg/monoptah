@@ -206,6 +206,9 @@ pub(crate) struct Conversation {
     docker_config_cache: std::cell::RefCell<
         Option<Option<monocode_core::cloud_sessions::docker_config::DockerProjectConfig>>,
     >,
+    /// What the Workspace menu shows about the project's cloud setup, read once (see
+    /// `cloud_target.rs`).
+    cloud_menu_cache: std::cell::RefCell<Option<cloud_target::CloudMenuFacts>>,
     _cloud_events: Subscription,
     remote_plans: remote_plans::State,
     store: Database,
@@ -835,6 +838,7 @@ impl Conversation {
             cloud_draft: None,
             cloud_request_seq: 0,
             docker_config_cache: Default::default(),
+            cloud_menu_cache: Default::default(),
             _cloud_events: cloud_events,
             remote_plans: remote_plans::State::default(),
         }
@@ -2701,8 +2705,6 @@ impl Conversation {
                 ("Switch account", items, 250., MenuStyle::Explorer)
             }
             ComposerMenu::Workspace => {
-                // Cloud settings may have saved a config since the last open.
-                self.forget_docker_config();
                 let picker = cx.new(|cx| {
                     GitPicker::new(
                         self.summary.cwd.clone().into(),

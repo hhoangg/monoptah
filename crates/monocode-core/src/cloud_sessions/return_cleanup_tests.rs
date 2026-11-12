@@ -1401,8 +1401,8 @@ fn a_start_is_refused_under_the_store_lock_while_the_instance_is_being_deleted()
             HARNESS,
             &super::tests::resolved("cs-1"),
             1,
-            false,
             &Default::default(),
+            Default::default(),
         )
         .unwrap_err();
     assert!(error.contains("is being deleted"), "{error}");

@@ -42,6 +42,8 @@ struct Gh {
     scripts: Mutex<Vec<String>>,
     /// Makes the script that creates the working branch fail.
     switch_error: Mutex<Option<String>>,
+    /// Makes the next this-many branch scripts fail (a slow first ssh), then lets them pass.
+    switch_failures: Mutex<u32>,
 }
 impl Gh {
     fn new(states: &[&str], log: &[&'static str]) -> Arc<Self> {
@@ -54,6 +56,7 @@ impl Gh {
             on_view: Mutex::new(None),
             scripts: Mutex::new(vec![]),
             switch_error: Mutex::new(None),
+            switch_failures: Mutex::new(0),
         })
     }
     fn failing_follower(states: &[&str]) -> Arc<Self> {
@@ -85,6 +88,16 @@ impl GhRunner for Gh {
         if let (true, Some(script)) = (line.starts_with("codespace ssh"), stdin) {
             self.scripts.lock().unwrap().push(script.to_owned());
             if script.contains("git switch") {
+                let mut failures = self.switch_failures.lock().unwrap();
+                if *failures > 0 {
+                    *failures -= 1;
+                    return Ok(GhOutput {
+                        success: false,
+                        stdout: String::new(),
+                        stderr: "ssh: connection timed out".into(),
+                    });
+                }
+                drop(failures);
                 if let Some(error) = self.switch_error.lock().unwrap().clone() {
                     return Ok(GhOutput {
                         success: false,
@@ -937,7 +950,67 @@ fn a_failed_branch_creation_fails_the_start_and_a_retry_runs_it_again() {
     // The retry goes through the same step; the script is the same idempotent one.
     *f.gh.switch_error.lock().unwrap() = None;
     f.run(session.id).0.unwrap();
+    // The failed start tried twice (see the retry test below), the retry once more.
+    assert_eq!(switch_scripts(&f).len(), 3);
+}
+
+#[test]
+fn the_branch_script_gets_the_long_timeout_and_one_retry_on_a_fresh_codespace() {
+    let f = fx(Gh::new(&["Available"], LOG));
+    // The first ssh to a fresh codespace times out once.
+    *f.gh.switch_failures.lock().unwrap() = 1;
+    let target = Target {
+        work_branch: Some("feature/x".into()),
+        ..new_target()
+    };
+    let (session, _) = f.svc.begin_start("/p", target, "claude").unwrap();
+    f.run(session.id).0.unwrap();
     assert_eq!(switch_scripts(&f).len(), 2);
+    let marker = crate::codespaces::LONG_SCRIPT_MARKER;
+    let long =
+        f.gh.calls()
+            .iter()
+            .filter(|c| c.starts_with("codespace ssh") && c.ends_with(marker))
+            .count();
+    assert_eq!(long, 2, "{:?}", f.gh.calls());
+    // Two failures in a row still fail the start.
+    let f = fx(Gh::new(&["Available"], LOG));
+    *f.gh.switch_failures.lock().unwrap() = 2;
+    let target = Target {
+        work_branch: Some("feature/x".into()),
+        ..new_target()
+    };
+    let (session, _) = f.svc.begin_start("/p", target, "claude").unwrap();
+    let error = f.run(session.id).0.unwrap_err();
+    assert!(
+        error.contains("Could not create branch feature/x"),
+        "{error}"
+    );
+}
+
+#[test]
+fn the_connect_step_says_which_branch_is_being_created() {
+    let f = fx(Gh::new(&["Available"], LOG));
+    *f.gh.switch_error.lock().unwrap() = Some("fatal: nope".into());
+    let target = Target {
+        work_branch: Some("feature/x".into()),
+        ..new_target()
+    };
+    let (session, _) = f.svc.begin_start("/p", target, "claude").unwrap();
+    f.run(session.id).0.unwrap_err();
+    let record = f.record(session.id).unwrap();
+    let connect = record.step(StepKind::Connect);
+    assert_eq!(connect.status, StepStatus::Failed);
+    assert_eq!(connect.detail.as_deref(), Some("Creating branch feature/x"));
+    // Once the branch exists the detail goes away.
+    *f.gh.switch_error.lock().unwrap() = None;
+    let (result, events) = f.run(session.id);
+    result.unwrap();
+    let detail_seen = events.iter().any(|e| {
+        matches!(e, StartEvent::Updated(r)
+            if r.step(StepKind::Connect).detail.as_deref() == Some("Creating branch feature/x"))
+    });
+    assert!(detail_seen);
 }
 
 #[test]
@@ -948,6 +1021,113 @@ fn the_working_branch_script_is_idempotent_and_quotes_its_inputs() {
     assert!(script.contains("git switch -c 'a/b-1'"));
     assert!(super::startup::work_branch_script("/workspaces/w;x", "a").is_err());
     assert!(super::startup::work_branch_script("/workspaces/w", "a'b").is_err());
+}
+
+#[test]
+fn a_branch_that_exists_on_origin_is_fetched_and_tracked_not_recreated_from_the_base() {
+    let script = super::startup::work_branch_script("/workspaces/widgets", "a/b-1").unwrap();
+    let fetch = script
+        .find("git fetch origin 'a/b-1:refs/remotes/origin/a/b-1'")
+        .expect(&script);
+    let remote = script
+        .find("git show-ref --verify --quiet 'refs/remotes/origin/a/b-1'")
+        .expect(&script);
+    let create = script.find("else git switch -c 'a/b-1'").expect(&script);
+    // Fetch (tolerating failure), then a tracking switch to origin's branch when the remote
+    // branch exists, and only then create it from the base.
+    assert!(fetch < remote && remote < create, "{script}");
+    assert!(
+        script.contains("2>&1; then git remote set-branches --add origin 'a/b-1'; fi"),
+        "{script}"
+    );
+    let after_remote = &script[remote..create];
+    assert!(
+        after_remote.contains("git switch -c 'a/b-1' --track 'origin/a/b-1'"),
+        "{script}"
+    );
+}
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+fn run_branch_script(dir: &Path, branch: &str) {
+    let script = super::startup::work_branch_script(dir.to_str().unwrap(), branch).unwrap();
+    let out = std::process::Command::new("sh")
+        .args(["-c", &script])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn the_branch_script_switches_to_a_branch_that_exists_on_origin_in_a_single_branch_clone() {
+    let root = tempfile::tempdir().unwrap();
+    let origin = root.path().join("origin");
+    std::fs::create_dir(&origin).unwrap();
+    git(&origin, &["init", "-q", "-b", "main"]);
+    git(&origin, &["commit", "-q", "--allow-empty", "-m", "base"]);
+    git(&origin, &["switch", "-q", "-c", "feature/x"]);
+    git(
+        &origin,
+        &["commit", "-q", "--allow-empty", "-m", "work on x"],
+    );
+    git(&origin, &["switch", "-q", "main"]);
+    // A single-branch clone has no remote ref for feature/x.
+    let work = root.path().join("work");
+    git(
+        root.path(),
+        &[
+            "clone",
+            "-q",
+            "--single-branch",
+            "-b",
+            "main",
+            origin.to_str().unwrap(),
+            "work",
+        ],
+    );
+    assert!(git(&work, &["branch", "-r"]).contains("origin/main"));
+    assert!(!git(&work, &["branch", "-r"]).contains("feature/x"));
+    run_branch_script(&work, "feature/x");
+    assert_eq!(
+        git(&work, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "feature/x"
+    );
+    // It is origin's branch, not a fresh one from main.
+    assert_eq!(git(&work, &["log", "-1", "--format=%s"]), "work on x");
+    assert_eq!(
+        git(
+            &work,
+            &["rev-parse", "--abbrev-ref", "feature/x@{upstream}"]
+        ),
+        "origin/feature/x"
+    );
+    // A second run is a no-op.
+    run_branch_script(&work, "feature/x");
+    // A name origin does not have is created from the current branch.
+    git(&work, &["switch", "-q", "main"]);
+    run_branch_script(&work, "feature/new");
+    assert_eq!(
+        git(&work, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "feature/new"
+    );
+    assert_eq!(git(&work, &["log", "-1", "--format=%s"]), "base");
 }
 
 // --------------------------------------------------------------------- run
@@ -1666,5 +1846,117 @@ mod claude_account {
             .begin_start("/p", named_target(), "claude")
             .unwrap_err();
         assert!(error.contains("Cloud settings"), "{error}");
+    }
+}
+
+/// The start record and the Claude pin are written once, and a failed save leaves neither the
+/// session nor the pin behind.
+mod record_save {
+    use super::super::claude_pin::{self, ClaudePin};
+    use super::*;
+    use crate::provider::Kind;
+
+    fn fixture() -> (Fx, tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("monocode.db")).unwrap();
+        let mut book = store.provider_accounts().unwrap();
+        let usable = book.add(Kind::Claude, "Work").unwrap().id;
+        store.save_provider_accounts(&book).unwrap();
+        crate::accounts::Profile::new(&usable, dir.path())
+            .save_claude_token("sk-ant-oat01-startup-fixture")
+            .unwrap();
+        (fx_in(Gh::new(&["Available"], LOG), store), dir, usable)
+    }
+    fn sql(dir: &tempfile::TempDir, statement: &str) {
+        rusqlite::Connection::open(dir.path().join("monocode.db"))
+            .unwrap()
+            .execute_batch(statement)
+            .unwrap();
+    }
+    fn pin(f: &Fx, name: &str) -> Option<ClaudePin> {
+        claude_pin::read(&f.store.lock().unwrap(), &claude_pin::codespace_key(name))
+    }
+
+    #[test]
+    fn the_working_branch_is_in_the_one_record_save() {
+        let (f, dir, _) = fixture();
+        sql(
+            &dir,
+            "CREATE TABLE audit(n); \
+             CREATE TRIGGER a_ins AFTER INSERT ON native_settings WHEN NEW.key='cloud-starts.v1' \
+               BEGIN INSERT INTO audit VALUES (NEW.value); END; \
+             CREATE TRIGGER a_upd AFTER UPDATE ON native_settings WHEN NEW.key='cloud-starts.v1' \
+               BEGIN INSERT INTO audit VALUES (NEW.value); END;",
+        );
+        let target = Target {
+            work_branch: Some("feature/x".into()),
+            ..new_target()
+        };
+        f.svc.begin_start("/p", target, "claude").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("monocode.db")).unwrap();
+        let writes: Vec<String> = conn
+            .prepare("SELECT n FROM audit")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(writes.len(), 1, "{writes:?}");
+        assert!(
+            writes[0].contains("\"workBranch\":\"feature/x\""),
+            "{}",
+            writes[0]
+        );
+    }
+
+    #[test]
+    fn a_failed_record_save_leaves_no_session_and_no_pin() {
+        let (f, dir, usable) = fixture();
+        sql(
+            &dir,
+            "CREATE TRIGGER no_starts BEFORE INSERT ON native_settings \
+             WHEN NEW.key='cloud-starts.v1' BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+        );
+        let target = Target {
+            claude_account: Some(usable),
+            claude_account_pinned: true,
+            work_branch: Some("feature/x".into()),
+            ..new_target()
+        };
+        let error = f.svc.begin_start("/p", target, "claude").unwrap_err();
+        assert!(
+            error.contains("disk full") && error.contains("octo-new1"),
+            "{error}"
+        );
+        assert_eq!(pin(&f, "octo-new1"), None);
+        assert!(f.store.lock().unwrap().sessions().unwrap().is_empty());
+        assert!(pending_starts(&f.store.lock().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn a_failed_record_save_restores_the_pin_the_codespace_had() {
+        let (f, dir, usable) = fixture();
+        let before = ClaudePin {
+            account: None,
+            pinned: false,
+        };
+        claude_pin::write(
+            &f.store.lock().unwrap(),
+            &claude_pin::codespace_key("octo-abc"),
+            &before,
+        )
+        .unwrap();
+        sql(
+            &dir,
+            "CREATE TRIGGER no_starts BEFORE INSERT ON native_settings \
+             WHEN NEW.key='cloud-starts.v1' BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+        );
+        let target = Target {
+            claude_account: Some(usable),
+            claude_account_pinned: true,
+            ..named_target()
+        };
+        f.svc.begin_start("/p", target, "claude").unwrap_err();
+        assert_eq!(pin(&f, "octo-abc"), Some(before));
     }
 }

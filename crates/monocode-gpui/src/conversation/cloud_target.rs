@@ -12,6 +12,7 @@
 use super::cloud_branches::BranchList;
 use super::*;
 use crate::cloud_presets::AccountChoice;
+use monocode_core::cloud_sessions::CloudBackendKind;
 use monocode_core::cloud_sessions::docker_config::{self, DockerProjectConfig};
 use monocode_core::cloud_sessions::kit::Workspace;
 use monocode_core::cloud_sessions::project_cloud::{self, CodespaceProjectConfig, DefaultBackend};
@@ -224,8 +225,10 @@ pub(crate) struct OpenProjectCloudSettings {
     pub backend: Option<DefaultBackend>,
 }
 impl EventEmitter<OpenProjectCloudSettings> for Conversation {}
-/// Asks the shell to open the picker of the open project's existing instances of `backend`.
+/// Asks the shell to open the picker of the existing instances of `backend` of the project
+/// `cwd` (the project of this conversation, which is not always the one open in the shell).
 pub(crate) struct OpenExistingInstance {
+    pub cwd: String,
     pub backend: DefaultBackend,
 }
 impl EventEmitter<OpenExistingInstance> for Conversation {}
@@ -252,6 +255,24 @@ pub(super) struct CloudDefaults {
     pub docker_account: Option<String>,
 }
 
+/// What the Workspace menu shows about the project, see [`Conversation::cloud_menu_facts`].
+#[derive(Clone, Debug)]
+pub(super) struct CloudMenuFacts {
+    default_backend: DefaultBackend,
+    /// The codespace / sandbox of the project's most recently updated live cloud session.
+    recent_codespace: Option<String>,
+    recent_sandbox: Option<String>,
+}
+impl Default for CloudMenuFacts {
+    fn default() -> Self {
+        Self {
+            default_backend: DefaultBackend::Codespace,
+            recent_codespace: None,
+            recent_sandbox: None,
+        }
+    }
+}
+
 pub(super) struct CloudDraft {
     pub target: CloudTarget,
     /// Docker: the new feature branch. Codespace: the working branch, which follows the base
@@ -261,6 +282,8 @@ pub(super) struct CloudDraft {
     pub base: Entity<input::Input>,
     /// What `base` holds, mirrored so labels need no entity read.
     pub base_text: String,
+    /// What `branch` holds, mirrored so labels need no entity read.
+    pub branch_text: String,
     /// Codespace: the working branch is still the base branch (typing another name ends it).
     pub branch_follows_base: bool,
     /// The project's saved Docker config: only the default of the overrides below (Docker).
@@ -331,8 +354,16 @@ impl CloudDraft {
             CloudRow::Base => self.base_text.trim() != defaults.base,
             CloudRow::DockerAccount => self.docker_account != defaults.docker_account,
             CloudRow::Claude => self.account != defaults.claude,
-            // The working branch and the switch have no project default.
-            CloudRow::Branch | CloudRow::Kit => false,
+            // A codespace's working branch is changed for this session when it names another
+            // branch than the base it is created on (an empty field means the base).
+            CloudRow::Branch => {
+                self.target == CloudTarget::Codespace && {
+                    let branch = self.branch_text.trim();
+                    !branch.is_empty() && branch != self.base_text.trim()
+                }
+            }
+            // The switch has no project default.
+            CloudRow::Kit => false,
         }
     }
 
@@ -342,6 +373,48 @@ impl CloudDraft {
             .iter()
             .filter(|row| self.row_changed(**row))
             .count()
+    }
+
+    /// The project's settings changed under an open panel: every row the user did not change
+    /// follows the new defaults, a row they changed keeps its override. Returns whether the
+    /// base branch row followed (the caller then updates its field).
+    fn follow_defaults(&mut self, new: CloudDefaults) -> bool {
+        let changed = |row| self.row_changed(row);
+        let (machine, size, idle, runtime) = (
+            changed(CloudRow::Machine),
+            changed(CloudRow::Size),
+            changed(CloudRow::Idle),
+            changed(CloudRow::Runtime),
+        );
+        let (base, docker, claude) = (
+            changed(CloudRow::Base),
+            changed(CloudRow::DockerAccount),
+            changed(CloudRow::Claude),
+        );
+        if !machine {
+            self.machine = new.machine.clone();
+        }
+        if !size {
+            self.cpus = new.cpus;
+            self.memory = new.memory.clone();
+        }
+        if !idle {
+            self.idle = new.idle;
+        }
+        if !runtime {
+            self.ttl = new.ttl.clone();
+        }
+        if !docker {
+            self.docker_account = new.docker_account.clone();
+        }
+        if !claude {
+            self.account = new.claude.clone();
+        }
+        if !base {
+            self.base_text = new.base.clone();
+        }
+        self.defaults = new;
+        !base
     }
 
     /// Starts the overrides over from `defaults`.
@@ -404,11 +477,7 @@ fn defaults_of(
 /// The label of the machine type `name`, from the loaded list when it knows it.
 pub(super) fn machine_label(machines: &Machines, name: &str) -> String {
     match machines {
-        Machines::Loaded(list) => list
-            .iter()
-            .find(|m| m.name == name)
-            .filter(|m| !m.display_name.is_empty())
-            .map_or_else(|| name.to_owned(), |m| m.display_name.clone()),
+        Machines::Loaded(list) => crate::cloud_presets::machine_name_label(list, name),
         _ => name.to_owned(),
     }
 }
@@ -498,21 +567,22 @@ impl Conversation {
         let backend = self
             .cloud_target()
             .map_or(default_backend, CloudTarget::backend);
+        let facts = self.cloud_menu_facts();
         let mut existing =
             MenuAction::new("workspace:cloud-existing", "Existing instance\u{2026}").icon("plus");
         match backend {
             DefaultBackend::Codespace if self.cloud_offers_codespace => {
-                if let Some(name) = self.recent_codespace() {
+                if let Some(name) = facts.recent_codespace {
                     existing = existing.description(name);
                 }
             }
             DefaultBackend::Codespace => existing = existing.disabled(true),
-            // There is no picker of existing sandboxes yet: a sandbox is reached through the
-            // sessions that already run on it.
+            // A sandbox is reached through the sessions of the project that run on it.
             DefaultBackend::Sandbox => {
-                existing = existing
-                    .description("Not available for Docker Sandbox")
-                    .disabled(true)
+                existing = match facts.recent_sandbox {
+                    Some(name) => existing.description(name),
+                    None => existing.description("No sandbox yet").disabled(true),
+                }
             }
         }
         rows.push(existing.into());
@@ -530,30 +600,46 @@ impl Conversation {
         items
     }
 
-    /// The project's default backend (Docker Sandbox when only that is set up, else Codespaces).
-    fn project_default_backend(&self) -> DefaultBackend {
-        locked(&self.store)
-            .ok()
-            .and_then(|store| project_cloud::load(&store, &self.summary.cwd).ok())
-            .map_or(DefaultBackend::Codespace, |project| {
-                project.effective_default_backend()
+    /// What the Workspace menu shows about the project besides the saved Docker config: read
+    /// from the store once and kept until the project's cloud settings or cloud sessions
+    /// change ([`Self::forget_project_cloud`]), not on every opening of the menu.
+    fn cloud_menu_facts(&self) -> CloudMenuFacts {
+        self.cloud_menu_cache
+            .borrow_mut()
+            .get_or_insert_with(|| {
+                let Ok(store) = locked(&self.store) else {
+                    return CloudMenuFacts::default();
+                };
+                let default_backend = project_cloud::load(&store, &self.summary.cwd)
+                    .map_or(DefaultBackend::Codespace, |project| {
+                        project.effective_default_backend()
+                    });
+                // Newest first.
+                let sessions = store
+                    .cloud_sessions(&self.summary.cwd)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|s| !s.summary.archived)
+                    .filter_map(|s| s.project.cloud())
+                    .collect::<Vec<_>>();
+                let recent = |kind| {
+                    sessions
+                        .iter()
+                        .find(|cloud| cloud.kind == kind)
+                        .map(|cloud| cloud.name.clone())
+                };
+                CloudMenuFacts {
+                    default_backend,
+                    recent_codespace: recent(CloudBackendKind::Codespaces),
+                    recent_sandbox: recent(CloudBackendKind::DockerSandbox),
+                }
             })
+            .clone()
     }
 
-    /// The codespace the project's most recently updated cloud session runs in, if any.
-    fn recent_codespace(&self) -> Option<String> {
-        let store = locked(&self.store).ok()?;
-        // Newest first.
-        store
-            .cloud_sessions(&self.summary.cwd)
-            .ok()?
-            .into_iter()
-            .filter(|s| !s.summary.archived)
-            .find_map(|s| {
-                let cloud = s.project.cloud()?;
-                (cloud.kind == monocode_core::cloud_sessions::CloudBackendKind::Codespaces)
-                    .then_some(cloud.name)
-            })
+    /// The project's default backend (Docker Sandbox when only that is set up, else Codespaces).
+    fn project_default_backend(&self) -> DefaultBackend {
+        self.cloud_menu_facts().default_backend
     }
 
     /// The saved config, read from the store once per menu opening, not per render.
@@ -602,6 +688,60 @@ impl Conversation {
         self.docker_config_cache.take();
     }
 
+    /// Forgets everything read about the project's cloud setup: the Docker config and what the
+    /// Workspace menu shows (default backend, most recent instances).
+    pub(crate) fn forget_project_cloud(&self) {
+        self.forget_docker_config();
+        self.cloud_menu_cache.take();
+    }
+
+    /// A cloud session of the project came or went: the menu reads its most recent instance
+    /// again the next time it opens.
+    pub(crate) fn forget_cloud_menu(&self) {
+        self.cloud_menu_cache.take();
+    }
+
+    /// Whether the Workspace menu facts are cached (tests).
+    #[cfg(test)]
+    pub(crate) fn cloud_menu_is_cached(&self) -> bool {
+        self.cloud_menu_cache.borrow().is_some()
+    }
+
+    /// The project's cloud settings were saved: forget what was read, and let an open panel
+    /// follow the new defaults on every row the user did not change.
+    pub(crate) fn project_cloud_saved(&mut self, cx: &mut Context<Self>) {
+        self.forget_project_cloud();
+        self.sync_cloud_defaults(cx);
+    }
+
+    /// Reads the project's settings again for the open panel. A row that still holds the old
+    /// default takes the new one; a row the user changed keeps its override. Nothing changes
+    /// under a running create.
+    fn sync_cloud_defaults(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.cloud_target().filter(|_| !self.cloud_creating()) else {
+            return;
+        };
+        self.forget_project_cloud();
+        let config = if target == CloudTarget::DockerSandbox {
+            self.docker_config()
+        } else {
+            None
+        };
+        let fresh = self.cloud_defaults(target, config.as_ref());
+        let Some(draft) = &mut self.cloud_draft else {
+            return;
+        };
+        if fresh == draft.defaults && config == draft.config {
+            return;
+        }
+        draft.config = config;
+        if draft.follow_defaults(fresh) {
+            let (field, text) = (draft.base.clone(), draft.base_text.clone());
+            field.update(cx, |field, cx| field.set_text(text, cx));
+        }
+        cx.notify();
+    }
+
     /// Handles the cloud rows of the Workspace menu; false for any other id.
     pub(crate) fn cloud_menu_choice(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
         if let Some(setting) = id.strip_prefix("cloud-set:") {
@@ -625,12 +765,15 @@ impl Conversation {
                 let backend = self
                     .cloud_target()
                     .map_or_else(|| self.project_default_backend(), CloudTarget::backend);
-                if self.cloud_menu_applies()
-                    && !self.cloud_creating()
-                    && backend == DefaultBackend::Codespace
-                    && self.cloud_offers_codespace
-                {
-                    cx.emit(OpenExistingInstance { backend });
+                let offered = match backend {
+                    DefaultBackend::Codespace => self.cloud_offers_codespace,
+                    DefaultBackend::Sandbox => self.cloud_menu_facts().recent_sandbox.is_some(),
+                };
+                if self.cloud_menu_applies() && !self.cloud_creating() && offered {
+                    cx.emit(OpenExistingInstance {
+                        cwd: self.summary.cwd.clone(),
+                        backend,
+                    });
                 }
                 true
             }
@@ -761,6 +904,7 @@ impl Conversation {
         } else {
             defaults.base.clone()
         };
+        let branch_value = branch_text.clone();
         let branch = cx.new(|cx| {
             let mut field = input::Input::field(
                 "Branch",
@@ -769,7 +913,7 @@ impl Conversation {
                 cx,
             );
             field.set_font_size(12.);
-            field.set_text(branch_text, cx);
+            field.set_text(branch_value, cx);
             field
         });
         let base_text = defaults.base.clone();
@@ -784,6 +928,7 @@ impl Conversation {
                 let text = branch.read(cx).content.to_string();
                 if let Some(draft) = &mut this.cloud_draft {
                     draft.branch_follows_base = text.trim() == draft.base_text.trim();
+                    draft.branch_text = text;
                 }
                 cx.notify();
             }),
@@ -825,6 +970,7 @@ impl Conversation {
             branch,
             base,
             base_text: defaults.base.clone(),
+            branch_text,
             branch_follows_base: !docker,
             config,
             cpus: defaults.cpus,
@@ -1064,17 +1210,28 @@ impl Conversation {
             );
             return;
         }
+        // What the fields hold now (their change events may not have run yet), then the
+        // project's settings, which may have been saved since the panel opened: rows the user
+        // did not touch follow them, so only a real override is sent.
+        if let Some(draft) = &mut self.cloud_draft {
+            draft.base_text = draft.base.read(cx).content.to_string();
+            draft.branch_text = draft.branch.read(cx).content.to_string();
+        }
+        self.sync_cloud_defaults(cx);
+        let Some(draft) = &self.cloud_draft else {
+            return;
+        };
         let typed = draft.branch.read(cx).content.trim().to_owned();
         let typed_base = draft.base.read(cx).content.trim().to_owned();
         let codespace_base = self.codespace_project_config().base_ref;
         let mut default_account: Option<String> = None;
         let mut work_branch = None;
         let (branch, config) = match target {
-            // The base branch is the one typed or picked. Else the project's base branch, else
-            // HEAD of the project folder (as the header picker does; a worktree's branch would
-            // not exist on the remote).
+            // The base branch is the one typed or picked when the user changed it. Else the
+            // project's base branch, else HEAD of the project folder (as the header picker
+            // does; a worktree's branch would not exist on the remote).
             CloudTarget::Codespace => {
-                let base = if !typed_base.is_empty() {
+                let base = if draft.row_changed(CloudRow::Base) && !typed_base.is_empty() {
                     typed_base
                 } else if !codespace_base.is_empty() {
                     codespace_base
@@ -1107,20 +1264,28 @@ impl Conversation {
                     fail(self, "Enter a branch name for the new session.", cx);
                     return;
                 }
-                self.forget_docker_config();
                 match self.docker_config() {
                     Some(project) => {
-                        // The project's config is the default; this copy carries the session's
-                        // overrides and is checked by the same validation a saved one gets.
+                        // The project's config is the default; this copy carries only the rows
+                        // changed for this session and is checked by the same validation a
+                        // saved one gets.
                         let mut config = project;
                         default_account = config.claude_account.clone();
-                        if let Some(draft) = &self.cloud_draft {
+                        if draft.row_changed(CloudRow::Size) {
                             config.cpus = draft.cpus;
                             config.memory = draft.memory.clone();
+                        }
+                        if draft.row_changed(CloudRow::Runtime) {
                             config.ttl = draft.ttl.clone();
+                        }
+                        if draft.row_changed(CloudRow::Claude) {
                             config.claude_account = draft.account.clone();
+                        }
+                        if draft.row_changed(CloudRow::DockerAccount) {
                             config.docker_account = draft.docker_account.clone();
-                            config.base_ref = draft.base.read(cx).content.trim().to_owned();
+                        }
+                        if draft.row_changed(CloudRow::Base) {
+                            config.base_ref = typed_base;
                         }
                         match config.validated() {
                             Ok(config) => (typed, Some(config)),

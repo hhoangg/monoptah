@@ -123,13 +123,22 @@ impl Shell {
         }
     }
 
-    /// The settings were stored: open conversations of the project forget the config they
-    /// cached, so their composer offers the new defaults.
-    fn cloud_settings_saved(&mut self, project: &str, cx: &mut Context<Self>) {
+    /// The settings were stored: open conversations of the project forget what they read
+    /// (config, default backend) and an open cloud panel follows the new defaults on the rows
+    /// the user did not change.
+    pub(super) fn cloud_settings_saved(&mut self, project: &str, cx: &mut Context<Self>) {
         for session in self.sessions.values() {
             if session.read(cx).summary.cwd == project {
-                session.update(cx, |session, _| session.forget_docker_config());
+                session.update(cx, |session, cx| session.project_cloud_saved(cx));
             }
+        }
+    }
+
+    /// The project's cloud sessions changed (one started, archived, moved): the Workspace
+    /// menus re-read the most recent instance the next time they open.
+    pub(super) fn forget_cloud_menus(&mut self, cx: &mut Context<Self>) {
+        for session in self.sessions.values() {
+            session.update(cx, |session, _| session.forget_cloud_menu());
         }
     }
 

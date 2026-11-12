@@ -2,6 +2,7 @@ use super::cloud_branches::*;
 use super::cloud_target::*;
 use super::*;
 use gpui::{TestAppContext, WindowHandle};
+use monocode_core::cloud_sessions::CloudRef;
 use monocode_core::cloud_sessions::docker_config::{self, DockerProjectConfig};
 use monocode_core::codespaces;
 use monocode_core::store::Store;
@@ -40,7 +41,8 @@ fn save_config(view: &Conversation) -> DockerProjectConfig {
     };
     let saved =
         docker_config::save(&locked(&view.store).unwrap(), &view.summary.cwd, &config).unwrap();
-    view.forget_docker_config();
+    // What the shell does when the project's Cloud settings are saved.
+    view.forget_project_cloud();
     saved
 }
 
@@ -2868,7 +2870,7 @@ fn the_workspace_menu_offers_existing_instance_and_cloud_settings(cx: &mut TestA
     let repo = temp_repo("ref: refs/heads/main\n");
     let window = conversation(cx, &repo, false);
     let settings: Arc<Mutex<Vec<Option<DefaultBackend>>>> = Default::default();
-    let existing: Arc<Mutex<Vec<DefaultBackend>>> = Default::default();
+    let existing: Arc<Mutex<Vec<(String, DefaultBackend)>>> = Default::default();
     let (a, b) = (settings.clone(), existing.clone());
     window
         .update(cx, |view, _, cx| {
@@ -2880,7 +2882,7 @@ fn the_workspace_menu_offers_existing_instance_and_cloud_settings(cx: &mut TestA
             )
             .detach();
             cx.subscribe(&cx.entity(), move |_, _, e: &OpenExistingInstance, _| {
-                b.lock().unwrap().push(e.backend);
+                b.lock().unwrap().push((e.cwd.clone(), e.backend));
             })
             .detach();
             view.set_offers_codespace(true, cx);
@@ -2909,20 +2911,24 @@ fn the_workspace_menu_offers_existing_instance_and_cloud_settings(cx: &mut TestA
             save_config(view);
             view.cloud_menu_choice("workspace:cloud-docker", cx);
             assert!(view.cloud_menu_choice("workspace:cloud-settings", cx));
-            // There is no picker of existing sandboxes: the item is off and emits nothing.
-            let rows = all_rows(view);
-            assert!(matches!(
-                view.cloud_menu_items().iter().find_map(|i| match i {
-                    MenuItem::Action(a) if a.id.as_ref() == "workspace:cloud-existing" =>
-                        Some(a.disabled),
+            // No session of the project runs in a sandbox yet: nothing to pick, nothing emitted.
+            let existing_item = |view: &Conversation| {
+                view.cloud_menu_items().into_iter().find_map(|i| match i {
+                    MenuItem::Action(a) if a.id.as_ref() == "workspace:cloud-existing" => {
+                        Some((a.disabled, a.description.map(|d| d.to_string())))
+                    }
                     _ => None,
-                }),
-                Some(true)
-            ));
+                })
+            };
             assert_eq!(
-                rows[2].3.as_deref(),
-                Some("Not available for Docker Sandbox")
+                existing_item(view),
+                Some((true, Some("No sandbox yet".into())))
             );
+            assert!(view.cloud_menu_choice("workspace:cloud-existing", cx));
+            // A session bound to a sandbox makes it pickable, named on the item.
+            add_cloud_session(view, CloudRef::sandbox("sbx-2"));
+            view.forget_cloud_menu();
+            assert_eq!(existing_item(view), Some((false, Some("sbx-2".into()))));
             assert!(view.cloud_menu_choice("workspace:cloud-existing", cx));
             view.cloud_menu_choice("workspace:cloud-codespace", cx);
             assert!(view.cloud_menu_choice("workspace:cloud-existing", cx));
@@ -2933,35 +2939,375 @@ fn the_workspace_menu_offers_existing_instance_and_cloud_settings(cx: &mut TestA
         *settings.lock().unwrap(),
         [None, Some(DefaultBackend::Sandbox)]
     );
+    // Each request carries the project of the conversation.
     assert_eq!(
         *existing.lock().unwrap(),
-        [DefaultBackend::Codespace, DefaultBackend::Codespace]
+        [
+            (repo.clone(), DefaultBackend::Codespace),
+            (repo.clone(), DefaultBackend::Sandbox),
+            (repo, DefaultBackend::Codespace)
+        ]
     );
+}
+
+/// Stores a (pending) cloud session of the conversation's project on `cloud`.
+fn add_cloud_session(view: &Conversation, cloud: monocode_core::cloud_sessions::CloudRef) {
+    use monocode_core::store::pending_cloud_project;
+    locked(&view.store)
+        .unwrap()
+        .create_pending_cloud_session(
+            "claude",
+            pending_cloud_project(&view.summary.cwd, &cloud, "/workspaces/widgets"),
+        )
+        .unwrap();
 }
 
 #[gpui::test]
 fn existing_instance_names_the_most_recent_codespace_of_the_project(cx: &mut TestAppContext) {
-    use monocode_core::cloud_sessions::CloudRef;
-    use monocode_core::store::pending_cloud_project;
     let repo = temp_repo("ref: refs/heads/main\n");
     let window = conversation(cx, &repo, false);
     window
         .update(cx, |view, _, cx| {
             view.set_offers_codespace(true, cx);
             assert_eq!(all_rows(view)[2].3, None);
-            let store = locked(&view.store).unwrap();
-            store
-                .create_pending_cloud_session(
-                    "claude",
-                    pending_cloud_project(
-                        &view.summary.cwd,
-                        &CloudRef::codespace("octo-abc"),
-                        "/workspaces/widgets",
-                    ),
-                )
-                .unwrap();
-            drop(store);
+            add_cloud_session(view, CloudRef::codespace("octo-abc"));
+            // Read once: a new session shows when the shell says the project's sessions
+            // changed, not on every opening of the menu.
+            assert_eq!(all_rows(view)[2].3, None);
+            assert!(view.cloud_menu_is_cached());
+            view.forget_cloud_menu();
+            assert!(!view.cloud_menu_is_cached());
             assert_eq!(all_rows(view)[2].3.as_deref(), Some("octo-abc"));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_workspace_menu_reads_the_store_once_until_the_project_changes(cx: &mut TestAppContext) {
+    use monocode_core::cloud_sessions::project_cloud::{self, DefaultBackend, ProjectCloud};
+    let window = conversation(cx, PROJECT, false);
+    window
+        .update(cx, |view, _, cx| {
+            view.set_offers_codespace(true, cx);
+            assert!(!view.cloud_menu_is_cached());
+            assert_eq!(view.cloud_menu_items().len(), 7);
+            assert!(view.cloud_menu_is_cached());
+            // Saved behind the cache's back: the menu does not read the store again.
+            project_cloud::save(
+                &locked(&view.store).unwrap(),
+                PROJECT,
+                &ProjectCloud {
+                    default_backend: Some(DefaultBackend::Sandbox),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(all_rows(view)[0].3.as_deref(), Some("(default)"));
+            assert_eq!(all_rows(view)[1].3.as_deref(), Some("Set up first"));
+            // The shell forgets it when the project's Cloud settings are saved.
+            view.project_cloud_saved(cx);
+            assert!(!view.cloud_menu_is_cached());
+            assert_eq!(all_rows(view)[0].3, None);
+        })
+        .unwrap();
+}
+
+// ---------------------------------- project settings saved while the panel is open
+
+fn sandbox_config(
+    cpus: u32,
+    memory: &str,
+    ttl: &str,
+    base: &str,
+    claude: Option<&str>,
+    docker: Option<&str>,
+) -> DockerProjectConfig {
+    DockerProjectConfig {
+        repo_url: "https://github.com/octo/widgets.git".into(),
+        cpus,
+        memory: memory.into(),
+        ttl: ttl.into(),
+        base_ref: base.into(),
+        claude_account: claude.map(str::to_owned),
+        docker_account: docker.map(str::to_owned),
+        ..Default::default()
+    }
+}
+
+fn put_sandbox_config(view: &Conversation, config: &DockerProjectConfig) {
+    docker_config::save(&locked(&view.store).unwrap(), &view.summary.cwd, config).unwrap();
+}
+
+/// Opens the Docker panel on a project saved with the "old" settings.
+fn open_sandbox_panel(view: &mut Conversation, cx: &mut Context<Conversation>) {
+    put_sandbox_config(
+        view,
+        &sandbox_config(2, "4g", "2h", "develop", Some("old"), Some("d-old")),
+    );
+    view.forget_project_cloud();
+    view.cloud_menu_choice("workspace:cloud-docker", cx);
+}
+
+const NEW_SANDBOX: fn() -> DockerProjectConfig =
+    || sandbox_config(4, "8g", "4h", "trunk", Some("new"), Some("d-new"));
+
+#[gpui::test]
+fn saving_the_project_settings_moves_the_rows_the_user_did_not_change(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    let requests = watch(window, cx);
+    window
+        .update(cx, |view, _, cx| {
+            open_sandbox_panel(view, cx);
+            // One row is changed for this session before the save.
+            view.cloud_menu_choice("cloud-set:runtime:1h", cx);
+            put_sandbox_config(view, &NEW_SANDBOX());
+            // What the shell does when the project's Cloud settings are saved.
+            view.project_cloud_saved(cx);
+            let draft = view.cloud_draft.as_ref().unwrap();
+            assert_eq!((draft.cpus, draft.memory.as_str()), (4, "8g"));
+            assert_eq!(draft.account.as_deref(), Some("new"));
+            assert_eq!(draft.docker_account.as_deref(), Some("d-new"));
+            assert_eq!(draft.base.read(cx).content.as_ref(), "trunk");
+            assert_eq!(draft.base_text, "trunk");
+            // The override stays, the defaults are the new ones, and only it is marked.
+            assert_eq!(draft.ttl, "1h");
+            assert_eq!(draft.defaults.ttl, "4h");
+            assert_eq!(draft.changed_count(), 1);
+            assert!(draft.row_changed(CloudRow::Runtime));
+            view.input
+                .update(cx, |input, cx| input.set_text("go".into(), cx));
+            view.create_cloud(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let sent = requests.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    let config = sent[0].config.as_ref().unwrap();
+    assert_eq!((config.cpus, config.memory.as_str()), (4, "8g"));
+    assert_eq!(config.ttl, "1h");
+    assert_eq!(config.base_ref, "trunk");
+    assert_eq!(config.claude_account.as_deref(), Some("new"));
+    assert_eq!(config.docker_account.as_deref(), Some("d-new"));
+    // The Claude account is the project's: not pinned to the sandbox.
+    assert!(!sent[0].account_pinned);
+}
+
+#[gpui::test]
+fn a_send_after_a_save_the_panel_never_heard_of_still_uses_the_new_settings(
+    cx: &mut TestAppContext,
+) {
+    let window = conversation(cx, PROJECT, false);
+    let requests = watch(window, cx);
+    window
+        .update(cx, |view, _, cx| {
+            open_sandbox_panel(view, cx);
+            view.cloud_menu_choice("cloud-set:docker:d-mine", cx);
+            // Saved without the shell's notification (another window, say).
+            put_sandbox_config(view, &NEW_SANDBOX());
+            view.input
+                .update(cx, |input, cx| input.set_text("go".into(), cx));
+            view.create_cloud(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let sent = requests.lock().unwrap();
+    let config = sent[0].config.as_ref().unwrap();
+    assert_eq!(
+        (config.cpus, config.memory.as_str(), config.ttl.as_str()),
+        (4, "8g", "4h")
+    );
+    assert_eq!(config.base_ref, "trunk");
+    assert_eq!(config.claude_account.as_deref(), Some("new"));
+    assert!(!sent[0].account_pinned);
+    // The Docker account was changed for this session: it is the override, kept.
+    assert_eq!(config.docker_account.as_deref(), Some("d-mine"));
+}
+
+#[gpui::test]
+fn a_claude_account_changed_before_the_save_is_still_pinned_against_the_new_default(
+    cx: &mut TestAppContext,
+) {
+    let window = conversation(cx, PROJECT, false);
+    let requests = watch(window, cx);
+    window
+        .update(cx, |view, _, cx| {
+            open_sandbox_panel(view, cx);
+            view.cloud_menu_choice("cloud-set:claude:mine", cx);
+            put_sandbox_config(view, &NEW_SANDBOX());
+            view.project_cloud_saved(cx);
+            view.input
+                .update(cx, |input, cx| input.set_text("go".into(), cx));
+            view.create_cloud(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let sent = requests.lock().unwrap();
+    assert_eq!(
+        sent[0].config.as_ref().unwrap().claude_account.as_deref(),
+        Some("mine")
+    );
+    assert!(sent[0].account_pinned);
+    // A override equal to the NEW default is no override at all.
+}
+
+#[gpui::test]
+fn choosing_the_new_default_after_a_save_clears_the_mark(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    window
+        .update(cx, |view, _, cx| {
+            open_sandbox_panel(view, cx);
+            view.cloud_menu_choice("cloud-set:runtime:1h", cx);
+            put_sandbox_config(view, &NEW_SANDBOX());
+            view.project_cloud_saved(cx);
+            assert_eq!(view.cloud_draft.as_ref().unwrap().changed_count(), 1);
+            view.cloud_menu_choice("cloud-set:runtime:4h", cx);
+            assert_eq!(view.cloud_draft.as_ref().unwrap().changed_count(), 0);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn saving_the_codespace_settings_moves_the_untouched_rows_and_keeps_the_changed_ones(
+    cx: &mut TestAppContext,
+) {
+    use monocode_core::cloud_sessions::project_cloud::{
+        self, CodespaceProjectConfig, ProjectCloud,
+    };
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    let requests = watch(window, cx);
+    let save = |view: &Conversation, base: &str, machine: &str, idle: u32, claude: &str| {
+        project_cloud::save(
+            &locked(&view.store).unwrap(),
+            &view.summary.cwd,
+            &ProjectCloud {
+                codespace: CodespaceProjectConfig {
+                    base_ref: base.into(),
+                    machine: Some(machine.into()),
+                    idle_timeout_minutes: idle,
+                    claude_account: Some(claude.into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    };
+    window
+        .update(cx, |view, _, cx| {
+            save(view, "release", "basicLinux32gb", 30, "old");
+            view.set_offers_codespace(true, cx);
+            view.cloud_menu_choice("workspace:cloud-codespace", cx);
+            // The idle stop is changed for this session; everything else follows the project.
+            view.cloud_menu_choice("cloud-set:idle:240", cx);
+            save(view, "trunk", "standardLinux32gb", 60, "new");
+            view.project_cloud_saved(cx);
+        })
+        .unwrap();
+    // The base field's change reaches the working branch field once the update is over.
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            let draft = view.cloud_draft.as_ref().unwrap();
+            assert_eq!(draft.machine.as_deref(), Some("standardLinux32gb"));
+            assert_eq!(draft.account.as_deref(), Some("new"));
+            assert_eq!(draft.base.read(cx).content.as_ref(), "trunk");
+            // The working branch followed the base it was following.
+            assert_eq!(draft.branch.read(cx).content.as_ref(), "trunk");
+            assert_eq!(draft.idle, 240);
+            assert_eq!(draft.changed_count(), 1);
+            view.input
+                .update(cx, |input, cx| input.set_text("go".into(), cx));
+            view.create_cloud(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let sent = requests.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].branch, "trunk");
+    assert_eq!(sent[0].work_branch, None);
+    // Not changed for this session: the project's machine and account apply.
+    assert_eq!(sent[0].machine, None);
+    assert_eq!(sent[0].account, None);
+    assert!(!sent[0].account_pinned);
+    assert_eq!(sent[0].idle_timeout_minutes, Some(240));
+}
+
+#[gpui::test]
+fn the_working_branch_row_is_changed_when_it_names_another_branch(cx: &mut TestAppContext) {
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    window
+        .update(cx, |view, _, cx| {
+            view.set_offers_codespace(true, cx);
+            view.cloud_menu_choice("workspace:cloud-codespace", cx);
+            let changed = |view: &Conversation| {
+                view.cloud_draft
+                    .as_ref()
+                    .unwrap()
+                    .row_changed(CloudRow::Branch)
+            };
+            assert!(!changed(view));
+            assert_eq!(view.cloud_draft.as_ref().unwrap().changed_count(), 0);
+            set_text(view, |d| d.branch.clone(), "feature/x", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            let changed = |view: &Conversation| {
+                view.cloud_draft
+                    .as_ref()
+                    .unwrap()
+                    .row_changed(CloudRow::Branch)
+            };
+            assert!(changed(view));
+            assert_eq!(view.cloud_draft.as_ref().unwrap().changed_count(), 1);
+            // Back to the base clears it; so does emptying the field (which means the base).
+            set_text(view, |d| d.branch.clone(), "main", cx);
+            set_text(view, |d| d.base.clone(), "main", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            assert!(
+                !view
+                    .cloud_draft
+                    .as_ref()
+                    .unwrap()
+                    .row_changed(CloudRow::Branch)
+            );
+            set_text(view, |d| d.branch.clone(), "", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, _| {
+            assert!(
+                !view
+                    .cloud_draft
+                    .as_ref()
+                    .unwrap()
+                    .row_changed(CloudRow::Branch)
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_docker_feature_branch_is_never_a_changed_row(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    window
+        .update(cx, |view, _, cx| {
+            open_sandbox_panel(view, cx);
+            set_text(view, |d| d.branch.clone(), "feature/other", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, _| {
+            assert_eq!(view.cloud_draft.as_ref().unwrap().changed_count(), 0);
         })
         .unwrap();
 }
