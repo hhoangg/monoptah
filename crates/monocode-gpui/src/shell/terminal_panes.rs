@@ -361,7 +361,7 @@ mod tests {
             .unwrap();
         let mut visual = VisualTestContext::from_window(window.into(), cx);
         visual.run_until_parked();
-        visual.simulate_keystrokes("cmd-j");
+        visual.simulate_keystrokes("secondary-j");
         visual.run_until_parked();
         let (project, shell_id) = window
             .update(&mut visual, |shell, _, _| {
@@ -427,7 +427,7 @@ mod tests {
                 })
                 .unwrap();
             for answer in ["Cancel", "Close"] {
-                visual.simulate_keystrokes("cmd-w");
+                visual.simulate_keystrokes("secondary-w");
                 visual.run_until_parked();
                 assert!(visual.has_pending_prompt());
                 assert!(visual.pending_prompt().unwrap().0.contains("sleep"));
@@ -461,7 +461,7 @@ mod tests {
     fn cmd_w_closes_idle_terminal_tabs_and_split_panes_without_prompting(cx: &mut TestAppContext) {
         for split in [false, true] {
             let (window, mut visual, owner, pane) = title_terminal(cx, split);
-            visual.simulate_keystrokes("cmd-w");
+            visual.simulate_keystrokes("secondary-w");
             visual.run_until_parked();
             assert!(!visual.has_pending_prompt());
             window
@@ -666,7 +666,7 @@ mod tests {
             .unwrap();
         let mut visual = VisualTestContext::from_window(window.into(), cx);
         visual.run_until_parked();
-        visual.simulate_keystrokes("cmd-shift-j");
+        visual.simulate_keystrokes("secondary-shift-j");
         visual.run_until_parked();
         window
             .update(&mut visual, |shell, _, _| {
@@ -701,9 +701,9 @@ mod tests {
         let mut visual = VisualTestContext::from_window(window.into(), cx);
         visual.run_until_parked();
         // Each cmd-j opens another terminal tab; the dock stays closed.
-        visual.simulate_keystrokes("cmd-j");
+        visual.simulate_keystrokes("secondary-j");
         visual.run_until_parked();
-        visual.simulate_keystrokes("cmd-j");
+        visual.simulate_keystrokes("secondary-j");
         visual.run_until_parked();
         let first = window
             .update(&mut visual, |shell, _, cx| {

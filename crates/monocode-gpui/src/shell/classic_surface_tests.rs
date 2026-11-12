@@ -761,7 +761,7 @@ fn original_monos_leave_project_tabs_unchanged_and_close_as_surfaces(cx: &mut Te
             })
             .unwrap();
         visual.run_until_parked();
-        visual.simulate_keystrokes("cmd-w");
+        visual.simulate_keystrokes("secondary-w");
         visual.run_until_parked();
         window
             .read_with(visual, |shell, cx| {
@@ -1098,7 +1098,7 @@ fn new_layout_app_tabs_survive_frame_changes_and_close_like_session_tabs(cx: &mu
         visual.simulate_click(close.center(), Default::default());
         visual.run_until_parked();
         for _ in 0..2 {
-            visual.simulate_keystrokes("cmd-w");
+            visual.simulate_keystrokes("secondary-w");
             visual.run_until_parked();
         }
         window

@@ -2,10 +2,14 @@
 //! apps without activating Monoptah, and its rail moves between Monos without
 //! touching the workspace window's selection.
 use super::*;
+#[cfg(any(target_os = "macos", test))]
 use gpui::{Bounds, WindowBounds, WindowKind, WindowOptions, point, size};
 /// A 384pt conversation plus the 56pt Mono rail beside it.
+#[cfg(any(target_os = "macos", test))]
 const WIDTH: f32 = 440.;
+#[cfg(any(target_os = "macos", test))]
 const HEIGHT: f32 = 560.;
+#[cfg(any(target_os = "macos", test))]
 const MARGIN: f32 = 12.;
 struct Floating {
     owner: Entity<Monos>,
@@ -496,6 +500,7 @@ impl Monos {
         self.changed(cx);
         id
     }
+    #[cfg(any(target_os = "macos", test))]
     pub(super) fn open_floating(&mut self, id: String, cx: &mut Context<Self>) {
         if self.roster.get(&id).is_none() {
             return;

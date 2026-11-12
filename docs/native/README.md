@@ -167,6 +167,8 @@ npm run native:check
 ```
 
 This runs the script tests, Rust formatting, strict Clippy and native tests.
+CI runs most of them on Linux and Windows, so while developing
+`npm run native:check:mac` (macOS strict Clippy only) is usually enough.
 See [verification](verification.md) for individual commands, optional provider
 checks and the latest recorded results.
 

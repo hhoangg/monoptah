@@ -42,7 +42,8 @@ The production React/Tauri app continues to use the commands above. GPUI work
 lives in `crates/monocode-core` and `crates/monocode-gpui`, with an independent
 Cargo workspace and lockfile. Use `npm run native:dev` to develop,
 `npm run native:build` to package an optimized build, and
-`npm run native:check` for its checks. Keep production UI behavior, dependencies,
+`npm run native:check` for its checks (CI runs most of them; `npm run native:check:mac` is the
+local macOS-only remainder). Keep production UI behavior, dependencies,
 CI and release/update distribution intact while the native port is tested.
 See the [native guide](docs/native/README.md) and [architecture](docs/native/migration.md).
 

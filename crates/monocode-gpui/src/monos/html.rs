@@ -1,7 +1,9 @@
 //! Generated HTML lives in an opaque sandbox with no app bridge or network.
+#[cfg(target_os = "macos")]
+use gpui::canvas;
 #[cfg(not(target_os = "macos"))]
 use gpui::div;
-use gpui::{Context, Window, canvas, prelude::*};
+use gpui::{Context, Window, prelude::*};
 #[cfg(target_os = "macos")]
 use objc2::{
     DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, rc::Retained,
@@ -129,12 +131,14 @@ pub(crate) struct Html {
     #[cfg(target_os = "macos")]
     view: Rc<RefCell<Option<Hosted>>>,
 }
+#[cfg(any(target_os = "macos", test))]
 fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('"', "&quot;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
+#[cfg(any(target_os = "macos", test))]
 fn sandbox(body: &str) -> String {
     let color = |value: gpui::Hsla| {
         let value: gpui::Rgba = value.into();
@@ -177,23 +181,18 @@ impl Html {
     }
     /// Shows the page at `path` straight from disk, with read access to `root` only. Used
     /// for files downloaded from a cloud workspace, whose relative assets sit beside them.
-    /// On other platforms the path is only named, like every `Html`.
+    /// Only macOS has a web view to load it, so other platforms never build one.
+    #[cfg(target_os = "macos")]
     pub(crate) fn from_file(path: std::path::PathBuf, root: std::path::PathBuf) -> Self {
-        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut this = Self::new(path.to_string_lossy().into_owned());
-        #[cfg(target_os = "macos")]
-        {
-            // Canonical forms make the guard's folder comparison reliable (/var vs /private/var).
-            let path = std::fs::canonicalize(&path).unwrap_or(path);
-            let root = std::fs::canonicalize(&root).unwrap_or(root);
-            this.file = Some(Rc::new(FilePage {
-                marker: path.to_string_lossy().into_owned().into(),
-                path,
-                root,
-            }));
-        }
-        #[cfg(not(target_os = "macos"))]
-        let _ = root;
+        // Canonical forms make the guard's folder comparison reliable (/var vs /private/var).
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
+        this.file = Some(Rc::new(FilePage {
+            marker: path.to_string_lossy().into_owned().into(),
+            path,
+            root,
+        }));
         this
     }
     #[cfg(target_os = "macos")]
