@@ -1996,7 +1996,8 @@ mod tests {
         let host = pkg.join("monocode-host");
         std::fs::write(
             &host,
-            "#!/bin/sh\necho \"new $@\" >> \"$HOME/calls.log\"\nenv >> \"$HOME/env.log\"\ncase \"$1\" in --version) echo '1.1.0+monoptah' ;; connection-info) if [ -f \"$HOME/flaky\" ]; then n=$(cat \"$HOME/flaky\"); if [ \"$n\" -gt 0 ]; then echo $((n - 1)) > \"$HOME/flaky\"; exit 1; fi; fi; [ ! -f \"$HOME/fail-new\" ] || exit 1; echo '{\"port\":3774}' ;; service) [ \"$2\" != install ] || [ ! -f \"$HOME/fail-new\" ] || exit 1 ;; esac\nexit 0\n",
+            "#!/bin/sh\necho \"new $@\" >> \"$HOME/calls.log\"\nenv >> \"$HOME/env.log\"\ncase \"$1\" in --version) echo 'PINNED_VERSION' ;; connection-info) if [ -f \"$HOME/flaky\" ]; then n=$(cat \"$HOME/flaky\"); if [ \"$n\" -gt 0 ]; then echo $((n - 1)) > \"$HOME/flaky\"; exit 1; fi; fi; [ ! -f \"$HOME/fail-new\" ] || exit 1; echo '{\"port\":3774}' ;; service) [ \"$2\" != install ] || [ ! -f \"$HOME/fail-new\" ] || exit 1 ;; esac\nexit 0\n"
+            .replace("PINNED_VERSION", super::super::host_release::HOST_VERSION),
         )
         .unwrap();
         std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2410,7 +2411,7 @@ mod tests {
                 .join("monocode-host")
                 .is_file());
         }
-        for installed in ["1.1.0+monoptah", "1.2.0+monoptah"] {
+        for installed in [super::super::host_release::HOST_VERSION, "99.0.0+monoptah"] {
             let (ok, stderr, urls, home) = run_bootstrap_on(
                 true,
                 None,
@@ -2622,12 +2623,12 @@ mod tests {
             true,
             None,
             false,
-            Some("1.1.0+monoptah"),
+            Some(super::super::host_release::HOST_VERSION),
             format!("{claude_flags}{}", bootstrap_script(HostPlatform::Unix)),
         );
         let _ = (ok, stderr, home);
         let control = tempfile::tempdir().unwrap();
-        install_old_host(control.path(), "1.1.0+monoptah");
+        install_old_host(control.path(), super::super::host_release::HOST_VERSION);
         let (code, _, stderr) = run_in_home_env(
             control.path(),
             &format!("{claude_flags}{}", bootstrap_script(HostPlatform::Unix)),

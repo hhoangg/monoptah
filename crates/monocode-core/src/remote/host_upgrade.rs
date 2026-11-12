@@ -544,7 +544,7 @@ mod tests {
         assert!(!fake.held.get(), "the hold is released");
         assert_eq!(
             lines.last().map(String::as_str),
-            Some("Monoptah Host 1.1.0 will be installed the next time this workspace connects")
+            Some(deferred_message().as_str())
         );
         // The next connect finds it idle.
         fake.busy_answers(vec![Ok(false)]);
@@ -562,10 +562,7 @@ mod tests {
         assert!(!fake.order.borrow().contains(&"stage"));
         assert_eq!(fake.swaps(), 0);
         assert!(fake.pending.get());
-        assert_eq!(
-            lines,
-            ["Monoptah Host 1.1.0 will be installed the next time this workspace connects"]
-        );
+        assert_eq!(lines, [deferred_message()]);
     }
 
     #[test]
@@ -584,8 +581,14 @@ mod tests {
     }
 
     #[test]
+    fn the_pinned_version_is_the_bare_number_of_the_pin() {
+        assert_eq!(format!("{}+monoptah", pinned_version()), HOST_VERSION);
+        assert!(!deferred_message().contains('+'));
+    }
+
+    #[test]
     fn a_newer_fork_host_is_not_touched_and_a_stale_flag_is_cleared() {
-        let fake = Fake::new(info("monoptah", Some("1.2.0")));
+        let fake = Fake::new(info("monoptah", Some("99.0.0")));
         fake.pending.set(true);
         let (outcome, lines) = run(&fake);
         assert_eq!(outcome, Outcome::Current);

@@ -290,7 +290,7 @@ fn happy(host_state: &Arc<Mutex<HostState>>) -> OnScript {
         "swapnow" => {
             let mut state = state.lock().unwrap();
             state.flavor = "monoptah";
-            state.version = "1.1.0";
+            state.version = host_upgrade::pinned_version();
             Ok("{\"swap\":\"started\"}".into())
         }
         "status" => Ok("{\"swap\":\"done\",\"port\":3774}".into()),
@@ -328,7 +328,7 @@ fn an_older_idle_host_is_staged_swapped_and_the_tunnel_reopened_with_sends_held_
                 ));
                 let mut state = state.lock().unwrap();
                 state.flavor = "monoptah";
-                state.version = "1.1.0";
+                state.version = host_upgrade::pinned_version();
                 return Ok("{\"swap\":\"started\"}".into());
             }
             if phase == "status" {
@@ -376,10 +376,7 @@ fn a_turn_that_starts_between_the_download_and_the_swap_defers_and_sets_the_flag
     assert_eq!(fx.runner.phases(), ["stage", "discard"]);
     assert_eq!(fx.runner.tunnels.load(Ordering::SeqCst), 0);
     assert!(fx.connections.host_upgrade_pending(MACHINE));
-    assert_eq!(
-        lines.last().unwrap(),
-        "Monoptah Host 1.1.0 will be installed the next time this workspace connects"
-    );
+    assert_eq!(lines.last().unwrap(), &host_upgrade::deferred_message());
     // Sends are not left blocked.
     assert!(fx
         .connections
@@ -426,7 +423,7 @@ fn a_current_fork_host_runs_nothing() {
     let fx = setup(
         false,
         "monoptah",
-        "1.2.0",
+        host_upgrade::pinned_version(),
         vec![],
         Box::new(|_, _| unreachable!()),
     );
