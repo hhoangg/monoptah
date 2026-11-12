@@ -11,7 +11,6 @@ use super::cloud_target::*;
 use super::*;
 use crate::cloud_presets as presets;
 use gpui::{Div, Stateful};
-use monocode_core::codespaces;
 
 /// What a row says about itself on the right.
 const DEFAULT_MARK: &str = "default";
@@ -262,14 +261,11 @@ impl Conversation {
                 ("Docker account", items)
             }
             CloudField::Machine => {
-                let selected = draft
-                    .machine
-                    .as_deref()
-                    .unwrap_or(codespaces::DEFAULT_MACHINE);
-                let project = defaults
-                    .machine
-                    .as_deref()
-                    .unwrap_or(codespaces::DEFAULT_MACHINE);
+                // Only the machines the repository allows are listed; without a pick (or when the
+                // pick is no longer allowed) the smallest of them is the one checked.
+                let selected = effective_machine(&draft.machines, draft.machine.as_deref())
+                    .unwrap_or_default();
+                let project = resolved_machine(&draft.machines, defaults.machine.as_deref());
                 let items = match &draft.machines {
                     Machines::Loaded(machines) => machines
                         .iter()
@@ -355,12 +351,12 @@ impl Conversation {
                         |account| account.docker_id.clone(),
                     ),
             },
-            CloudField::Machine => match (&draft.machines, draft.machine.as_deref()) {
-                (Machines::Loading, None) => "Loading machines...".into(),
-                (machines, picked) => {
-                    machine_label(machines, picked.unwrap_or(codespaces::DEFAULT_MACHINE))
+            CloudField::Machine => {
+                match effective_machine(&draft.machines, draft.machine.as_deref()) {
+                    None => "Loading machines...".into(),
+                    Some(name) => machine_label(&draft.machines, &name),
                 }
-            },
+            }
         }
     }
 
@@ -492,6 +488,20 @@ impl Conversation {
             CloudRow::Base => self.cloud_field_row(row, &draft.base).into_any_element(),
             CloudRow::Branch => self.cloud_field_row(row, &draft.branch).into_any_element(),
             CloudRow::Kit => self.cloud_kit_row(cx).into_any_element(),
+            CloudRow::Machine => div()
+                .child(self.cloud_choice_row(row, CloudField::Machine, cx))
+                .children(draft.machine_note.clone().map(|note| {
+                    // Muted, under the machine row: the machine was replaced, nothing failed.
+                    div()
+                        .id("cloud-machine-note")
+                        .debug_selector(|| "cloud-machine-note".into())
+                        .pl(px(34.))
+                        .pb(px(6.))
+                        .text_size(px(11.))
+                        .text_color(content(0.45))
+                        .child(note)
+                }))
+                .into_any_element(),
             _ => match row.field() {
                 Some(field) => self.cloud_choice_row(row, field, cx).into_any_element(),
                 None => div().into_any_element(),

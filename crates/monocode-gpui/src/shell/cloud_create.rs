@@ -10,7 +10,8 @@ use monocode_core::cloud_sessions::{
 };
 
 /// The target `begin_start` gets for a codespace request: the branch and the machine picked in
-/// the panel (`None` keeps the project's machine).
+/// the panel (`None` keeps the project's machine while the repository allows it on that
+/// branch, else the smallest machine it allows).
 pub(super) fn codespace_target(request: &CloudCreate) -> Result<Target, String> {
     let mut target = cloud_picker::target_for(
         CodespaceChoice::New,
@@ -102,13 +103,13 @@ impl Shell {
         self.sync_cloud_moves(cx);
     }
 
-    /// How a conversation lists the machine types of its repository: `gh api` on the worker.
+    /// How a conversation lists the machine types its repository allows on a branch: `gh api`
+    /// on the worker, once per repository and branch (`CloudSessions` caches the answer).
     pub(super) fn machine_loader(&self) -> crate::conversation::cloud_target::MachineLoader {
         let cloud = self.cloud.clone();
-        let gh = self.gh.clone();
-        Arc::new(move |project| {
+        Arc::new(move |project, branch| {
             let repo = cloud.repo_for(&project)?;
-            monocode_core::codespaces::list_machines(&*gh, &repo)
+            cloud.allowed_machines(&repo, branch.as_deref())
         })
     }
 

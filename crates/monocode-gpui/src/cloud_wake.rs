@@ -117,6 +117,14 @@ pub(crate) mod fakes {
         fn run(&self, args: &[String], _: Option<&str>) -> Result<GhOutput, String> {
             let line = args.join(" ");
             self.calls.lock().unwrap().push(line.clone());
+            if line.contains("/codespaces/machines") {
+                // GitHub not reachable: the static default machine stays.
+                return Ok(GhOutput {
+                    success: false,
+                    stdout: String::new(),
+                    stderr: "HTTP 404".into(),
+                });
+            }
             let view = format!(r#"{{"state":"{}"}}"#, self.state);
             let stdout = if line.contains("auth status") {
                 self.auth

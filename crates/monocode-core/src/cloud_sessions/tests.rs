@@ -36,6 +36,11 @@ impl GhRunner for FakeGh {
             .iter()
             .find(|(key, _)| line.contains(key.as_str()))
             .map(|(_, reply)| reply.clone())
+            // An unscripted machine-types lookup fails, so the static default machine stays.
+            .or_else(|| {
+                line.contains("/codespaces/machines")
+                    .then(|| fail("HTTP 404"))
+            })
             .unwrap_or_else(|| panic!("unexpected gh call: {line}"))
     }
 }

@@ -85,8 +85,8 @@ fn load_listing(
     let repo = cloud.repo_for(local_project)?;
     let codespaces = codespaces::list(gh, &repo)?;
     // The machine list is only a convenience: a repository that does not offer
-    // it still creates codespaces with the default machine.
-    let machines = codespaces::list_machines(gh, &repo).unwrap_or_default();
+    // it still creates codespaces with the default machine. Cached per repository.
+    let machines = cloud.allowed_machines(&repo, None).unwrap_or_default();
     Ok(Listing {
         repo,
         codespaces,

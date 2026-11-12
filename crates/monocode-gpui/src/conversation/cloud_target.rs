@@ -54,18 +54,21 @@ impl CloudTarget {
     }
 }
 
-/// Machine types offered for a new codespace, loaded off the UI thread when the panel opens.
+/// Machine types offered for a new codespace: the ones GitHub allows for the repository on the
+/// branch (a devcontainer's `hostRequirements` hides the small ones), loaded off the UI thread
+/// when the panel opens and when another branch is picked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Machines {
     Loading,
     Loaded(Vec<MachineType>),
-    /// The listing failed or is not offered: the default machine stays.
+    /// The listing failed or is not offered: the static default machine stays.
     Failed,
 }
 
-/// Lists the machine types of a local project's repository. Blocking: runs on a worker.
+/// Lists the machine types a local project's repository allows on a branch (`None`: the
+/// default branch). Blocking: runs on a worker.
 pub(crate) type MachineLoader =
-    Arc<dyn Fn(String) -> Result<Vec<MachineType>, String> + Send + Sync>;
+    Arc<dyn Fn(String, Option<String>) -> Result<Vec<MachineType>, String> + Send + Sync>;
 
 /// Lists the saved Docker accounts (no token). Blocking: runs on a worker.
 pub(crate) type DockerAccountsLoader =
@@ -303,11 +306,17 @@ pub(super) struct CloudDraft {
     pub docker_accounts: Option<Vec<DockerAccountSummary>>,
     /// Which listing the answer belongs to.
     pub docker_accounts_request: u64,
-    /// Codespace: the machine picked, `None` while the default stays.
+    /// Codespace: the machine picked for this session or saved for the project; `None` while
+    /// the default stays (the smallest machine the repository allows).
     pub machine: Option<String>,
     pub machines: Machines,
     /// Which listing the answer belongs to.
     pub machines_request: u64,
+    /// The base branch the machine listing was asked for, so picking it again asks nothing.
+    pub machines_ref: String,
+    /// A muted note when the machine (picked, or saved for the project) is not allowed on the
+    /// base branch and was replaced.
+    pub machine_note: Option<String>,
     /// The repository's branches for the Base branch row.
     pub branches: BranchList,
     /// Which listing the answer belongs to.
@@ -331,22 +340,15 @@ pub(super) struct CloudDraft {
 }
 
 impl CloudDraft {
-    fn machine_name(&self) -> &str {
-        self.machine
-            .as_deref()
-            .unwrap_or(codespaces::DEFAULT_MACHINE)
-    }
-
     /// The row's value differs from the project default (the row is marked for this session).
     pub(super) fn row_changed(&self, row: CloudRow) -> bool {
         let defaults = &self.defaults;
         match row {
+            // Compared as what each one starts on: a pick of the machine the project's default
+            // resolves to is no change.
             CloudRow::Machine => {
-                self.machine_name()
-                    != defaults
-                        .machine
-                        .as_deref()
-                        .unwrap_or(codespaces::DEFAULT_MACHINE)
+                resolved_machine(&self.machines, self.machine.as_deref())
+                    != resolved_machine(&self.machines, defaults.machine.as_deref())
             }
             CloudRow::Size => (self.cpus, &self.memory) != (defaults.cpus, &defaults.memory),
             CloudRow::Idle => self.idle != defaults.idle,
@@ -471,6 +473,25 @@ fn defaults_of(
             codespace.claude_account.clone()
         },
         docker_account: sandbox.docker_account,
+    }
+}
+
+/// The machine a codespace starts on for `preferred` (a pick or the project's saved machine)
+/// given what the listing says: `preferred` while the repository allows it, else the smallest
+/// allowed machine; while the listing runs or when it failed, `preferred` or the static default.
+pub(super) fn resolved_machine(machines: &Machines, preferred: Option<&str>) -> String {
+    match machines {
+        Machines::Loaded(list) => codespaces::pick_machine(list, preferred).name,
+        _ => preferred.unwrap_or(codespaces::DEFAULT_MACHINE).to_owned(),
+    }
+}
+
+/// The machine the panel shows for a new codespace: [`resolved_machine`] of the pick. `None`
+/// while the listing still runs and nothing is picked.
+pub(super) fn effective_machine(machines: &Machines, picked: Option<&str>) -> Option<String> {
+    match (machines, picked) {
+        (Machines::Loading, None) => None,
+        _ => Some(resolved_machine(machines, picked)),
     }
 }
 
@@ -884,6 +905,7 @@ impl Conversation {
             if !docker {
                 // The same reset for a codespace: the working branch is the base again and
                 // the machines are listed afresh.
+                draft.machine_note = None;
                 draft.machines = Machines::Loading;
                 draft.branch_follows_base = true;
                 let branch = draft.branch.clone();
@@ -1015,6 +1037,8 @@ impl Conversation {
                 Machines::Loading
             },
             machines_request,
+            machines_ref: String::new(),
+            machine_note: None,
             branches: BranchList::Loading,
             branches_request,
             collapsed: false,
@@ -1106,8 +1130,11 @@ impl Conversation {
         }
     }
 
-    /// Lists the machine types on a worker; the answer only applies to the draft that asked.
-    /// The default machine stays when there is no loader or the listing fails.
+    /// Lists the machine types the repository allows on the draft's branch, on a worker; the
+    /// answer only applies to the draft that asked. The static default machine stays when there
+    /// is no loader or the listing fails (offline, no `codespace` scope): nothing blocks Send,
+    /// which leaves the choice to the start when nothing is picked. A pick the new listing does
+    /// not allow falls back to the smallest allowed machine, with a note.
     fn load_cloud_machines(&mut self, request: u64, cx: &mut Context<Self>) {
         let Some(loader) = self.machine_loader.clone() else {
             if let Some(draft) = &mut self.cloud_draft {
@@ -1115,10 +1142,23 @@ impl Conversation {
             }
             return;
         };
+        let Some(draft) = self.cloud_draft.as_mut() else {
+            return;
+        };
+        // The codespace is created on the base branch (typed, picked or the project's); with
+        // none, on HEAD of the project folder, as the start does.
+        let base = draft.base.read(cx).content.trim().to_owned();
+        draft.machines_ref = base.clone();
         let project = self.summary.cwd.clone();
-        let work = cx
-            .background_executor()
-            .spawn(async move { loader(project) });
+        let work = cx.background_executor().spawn(async move {
+            let branch = if base.is_empty() {
+                git_head(Path::new(&project))
+                    .and_then(|(branch, detached)| (!detached).then_some(branch))
+            } else {
+                Some(base)
+            };
+            loader(project, branch)
+        });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
@@ -1128,24 +1168,53 @@ impl Conversation {
                     .filter(|draft| draft.machines_request == request)
                 {
                     draft.machines = match result {
-                        Ok(machines) if !machines.is_empty() => {
-                            // A machine the repository does not offer (from the project's
-                            // settings) falls back like the header picker does.
-                            if let Some(wanted) = &draft.machine
-                                && !machines.iter().any(|m| &m.name == wanted)
-                            {
-                                draft.machine =
-                                    codespaces::default_machine(&machines, Some(wanted));
-                            }
-                            Machines::Loaded(machines)
-                        }
+                        Ok(machines) if !machines.is_empty() => Machines::Loaded(machines),
                         _ => Machines::Failed,
                     };
+                    // A machine the repository does not allow on this branch, whether the
+                    // project saved it or the user picked it on another branch, falls back to
+                    // the smallest allowed one, with a note.
+                    if let Machines::Loaded(list) = &draft.machines
+                        && let Some(machine) = draft.machine.clone()
+                    {
+                        let pick = codespaces::pick_machine(list, Some(&machine));
+                        if let Some(replaced) = pick.replaced {
+                            draft.machine = None;
+                            draft.machine_note = Some(format!(
+                                "{replaced} is not available for this repository; using {}",
+                                machine_label(&draft.machines, &pick.name)
+                            ));
+                        }
+                    }
                     cx.notify();
                 }
             });
         })
         .detach();
+    }
+
+    /// The base branch of the codespace changed through the picker: list the machines that
+    /// branch allows, unless they were listed for it already. Typing in the field asks
+    /// nothing; the start itself checks the branch it creates on.
+    pub(super) fn reload_cloud_machines_for_base(&mut self, cx: &mut Context<Self>) {
+        let Some(draft) = self
+            .cloud_draft
+            .as_ref()
+            .filter(|d| d.target == CloudTarget::Codespace && !d.creating)
+        else {
+            return;
+        };
+        if draft.base.read(cx).content.trim() == draft.machines_ref {
+            return;
+        }
+        self.cloud_request_seq += 1;
+        let request = self.cloud_request_seq;
+        if let Some(draft) = &mut self.cloud_draft {
+            draft.machines = Machines::Loading;
+            draft.machines_request = request;
+            draft.machine_note = None;
+        }
+        self.load_cloud_machines(request, cx);
     }
 
     /// Applies one choice of a panel menu (`size:2:4g`, `runtime:1h`, `idle:60`, `machine:<name>`,
@@ -1174,7 +1243,10 @@ impl Conversation {
             }
             "claude" => draft.account = some(value),
             "docker" => draft.docker_account = some(value),
-            "machine" => draft.machine = some(value),
+            "machine" => {
+                draft.machine = some(value);
+                draft.machine_note = None;
+            }
             _ => return,
         }
         cx.notify();
@@ -1343,10 +1415,13 @@ impl Conversation {
         };
         let (machine, idle_timeout_minutes) = match target {
             CloudTarget::Codespace => (
+                // The pick, only when it differs from the project's. With none the start takes
+                // the project's machine (or the smallest allowed one) for the branch it
+                // creates on.
                 self.cloud_draft
                     .as_ref()
                     .filter(|_| changed(CloudRow::Machine))
-                    .map(|d| d.machine_name().to_owned()),
+                    .and_then(|d| d.machine.clone()),
                 self.cloud_draft
                     .as_ref()
                     .filter(|_| changed(CloudRow::Idle))

@@ -432,6 +432,133 @@ fn list_machines_argv_and_parse() {
     );
 }
 
+fn sized(name: &str, cpus: u32, memory_gb: u64) -> MachineType {
+    MachineType {
+        name: name.into(),
+        display_name: format!("{cpus} cores"),
+        operating_system: "linux".into(),
+        storage_in_bytes: 32 << 30,
+        memory_in_bytes: memory_gb << 30,
+        cpus,
+    }
+}
+
+/// What GitHub answers for a repository whose devcontainer asks for 4 cores and 8 GB.
+const ONLY_STANDARD: &str = r#"{"total_count":1,"machines":[
+  {"name":"standardLinux32gb","display_name":"4 cores, 16 GB RAM, 32 GB storage","operating_system":"linux","storage_in_bytes":34359738368,"memory_in_bytes":17179869184,"cpus":4}]}"#;
+
+#[test]
+fn list_machines_at_asks_for_the_branch() {
+    let fake = Fake::new(vec![ok(ONLY_STANDARD), ok(ONLY_STANDARD)]);
+    let machines = list_machines_at(&fake, "hhoangg/monoptah", Some("feat/x y")).unwrap();
+    assert_eq!(
+        fake.argv(0),
+        v(&[
+            "api",
+            "/repos/hhoangg/monoptah/codespaces/machines?ref=feat%2Fx+y"
+        ])
+    );
+    assert_eq!(machines.len(), 1);
+    assert_eq!(machines[0].name, "standardLinux32gb");
+    // A blank branch is the default branch: no ref.
+    list_machines_at(&fake, "hhoangg/monoptah", Some("  ")).unwrap();
+    assert_eq!(
+        fake.argv(1),
+        v(&["api", "/repos/hhoangg/monoptah/codespaces/machines"])
+    );
+}
+
+#[test]
+fn the_default_machine_is_the_smallest_allowed() {
+    // Fewest cores first, then least memory, whatever GitHub's order.
+    let allowed = vec![
+        sized("premiumLinux", 8, 32),
+        sized("standardLinux32gb", 4, 16),
+        sized("standardLinuxBigMem", 4, 32),
+    ];
+    assert_eq!(
+        pick_machine(&allowed, None),
+        MachinePick {
+            name: "standardLinux32gb".into(),
+            replaced: None
+        }
+    );
+    // Unrestricted repositories keep today's default, the 2-core machine.
+    let open = vec![
+        sized("standardLinux32gb", 4, 16),
+        sized("basicLinux32gb", 2, 8),
+    ];
+    assert_eq!(pick_machine(&open, None).name, DEFAULT_MACHINE);
+}
+
+#[test]
+fn a_saved_machine_is_kept_while_allowed_and_replaced_when_not() {
+    let allowed = vec![
+        sized("standardLinux32gb", 4, 16),
+        sized("premiumLinux", 8, 32),
+    ];
+    assert_eq!(
+        pick_machine(&allowed, Some("premiumLinux")),
+        MachinePick {
+            name: "premiumLinux".into(),
+            replaced: None
+        }
+    );
+    assert_eq!(
+        pick_machine(&allowed, Some("basicLinux32gb")),
+        MachinePick {
+            name: "standardLinux32gb".into(),
+            replaced: Some("basicLinux32gb".into())
+        }
+    );
+    // Nothing known (the lookup failed): the saved machine, else the static default.
+    assert_eq!(pick_machine(&[], Some("premiumLinux")).name, "premiumLinux");
+    assert_eq!(pick_machine(&[], None).name, DEFAULT_MACHINE);
+    assert_eq!(pick_machine(&[], Some(" ")).name, DEFAULT_MACHINE);
+}
+
+#[test]
+fn the_machine_cache_asks_once_per_repo_and_branch() {
+    let fake = Fake::new(vec![ok(ONLY_STANDARD), ok(ONLY_STANDARD)]);
+    let cache = MachineCache::default();
+    for _ in 0..3 {
+        assert_eq!(
+            cache.pick(&fake, "octo/widgets", Some("main"), None).name,
+            "standardLinux32gb"
+        );
+    }
+    // Another branch is another question; the Fake panics on a third call.
+    cache.allowed(&fake, "octo/widgets", Some("feat")).unwrap();
+    cache.allowed(&fake, "octo/widgets", Some("feat")).unwrap();
+    assert_eq!(fake.calls().len(), 2);
+}
+
+#[test]
+fn a_failed_machine_lookup_keeps_the_static_default_and_is_asked_again() {
+    let fake = Fake::new(vec![
+        fail("HTTP 403: Must have admin rights to Repository."),
+        ok(r#"{"total_count":0,"machines":[]}"#),
+        Err("GitHub CLI (gh) is not installed".into()),
+        ok(ONLY_STANDARD),
+    ]);
+    let cache = MachineCache::default();
+    // 403, an empty answer and no gh: today's default, and nothing is cached.
+    for _ in 0..3 {
+        assert_eq!(
+            cache.pick(&fake, "octo/widgets", None, None),
+            MachinePick {
+                name: DEFAULT_MACHINE.into(),
+                replaced: None
+            }
+        );
+    }
+    assert_eq!(
+        cache.pick(&fake, "octo/widgets", None, None).name,
+        "standardLinux32gb"
+    );
+    assert_eq!(fake.calls().len(), 4);
+}
+
 #[test]
 fn jsonc_stripping() {
     let text = r#"{
@@ -1512,25 +1639,34 @@ fn machine(name: &str) -> MachineType {
 
 #[test]
 fn default_machine_prefers_the_project_machine_and_falls_back() {
+    let sized = |name: &str, cpus| MachineType {
+        cpus,
+        ..machine(name)
+    };
     let offered = [
-        machine("premiumLinux"),
-        machine(DEFAULT_MACHINE),
-        machine("standardLinux32gb"),
+        sized("premiumLinux", 16),
+        sized("standardLinux32gb", 4),
+        sized(DEFAULT_MACHINE, 2),
     ];
     let pick = |m: &[MachineType], preferred| default_machine(m, preferred);
     assert_eq!(
         pick(&offered, Some("standardLinux32gb")).as_deref(),
         Some("standardLinux32gb")
     );
-    // Not offered: the default machine, else the first one.
+    // Not offered: the smallest one the repository offers.
     assert_eq!(
         pick(&offered, Some("gone")).as_deref(),
         Some(DEFAULT_MACHINE)
     );
     assert_eq!(pick(&offered, None).as_deref(), Some(DEFAULT_MACHINE));
+    // The 2-core machine is not offered (a devcontainer asks for 4): the smallest one is.
     assert_eq!(
-        pick(&offered[..1], Some("gone")).as_deref(),
-        Some("premiumLinux")
+        pick(&offered[..2], Some("gone")).as_deref(),
+        Some("standardLinux32gb")
+    );
+    assert_eq!(
+        pick(&offered[..2], None).as_deref(),
+        Some("standardLinux32gb")
     );
     assert_eq!(pick(&[], Some("x")), None);
 }
