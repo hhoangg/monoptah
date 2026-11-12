@@ -646,13 +646,15 @@ fn lenient_text<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Er
 }
 
 /// One sandbox as `sbx --cloud inspect <id> --format json` / `ls --format json` report it.
-/// Unknown fields are ignored and missing ones default.
+/// Unknown fields are ignored and missing ones default. The lifecycle state is `state` in
+/// `inspect` but `status` in `ls` (sbx v0.53.0), so both names are read.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct SandboxInfo {
     pub id: String,
     pub name: String,
     pub agent: String,
+    #[serde(alias = "status")]
     pub state: String,
     pub image: String,
     pub cpus: u32,
