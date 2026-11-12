@@ -13,7 +13,13 @@ use crate::{
 };
 use std::path::Path;
 
-pub const GH_INSTALL_COMMAND: &str = "brew install gh";
+/// The command that installs `gh`: only macOS has one the app can name (Homebrew). Elsewhere
+/// there is no command to offer.
+pub const GH_INSTALL_COMMAND: Option<&str> = if cfg!(target_os = "macos") {
+    Some("brew install gh")
+} else {
+    None
+};
 pub const GH_LOGIN_COMMAND: &str = "gh auth login";
 pub const GH_REFRESH_COMMAND: &str = "gh auth refresh -h github.com -s codespace";
 pub const SBX_SSH_COMMAND: &str = "sbx --cloud setup ssh";
@@ -125,8 +131,12 @@ fn gh_item(status: Result<AuthStatus, String>) -> Item {
     let (state, text, fix) = match status {
         Err(error) if error.contains("not installed") => (
             State::Problem,
-            "GitHub CLI (gh) is not installed".to_owned(),
-            Some(Fix::Command(GH_INSTALL_COMMAND)),
+            if GH_INSTALL_COMMAND.is_some() {
+                "GitHub CLI (gh) is not installed".to_owned()
+            } else {
+                "Install the GitHub CLI (gh)".to_owned()
+            },
+            GH_INSTALL_COMMAND.map(Fix::Command),
         ),
         Err(error) => (
             State::Problem,
@@ -195,7 +205,23 @@ pub fn codespace(
     origin: Option<&str>,
     devcontainer_path: &str,
 ) -> Vec<Item> {
-    let mut items = vec![gh_item(codespaces::auth_status(gh))];
+    codespace_with_auth(
+        codespaces::auth_status(gh),
+        project_root,
+        origin,
+        devcontainer_path,
+    )
+}
+
+/// [`codespace`] for a caller that already ran `gh auth status` and wants to use the answer
+/// elsewhere too (one call, not two).
+pub fn codespace_with_auth(
+    auth: Result<AuthStatus, String>,
+    project_root: &Path,
+    origin: Option<&str>,
+    devcontainer_path: &str,
+) -> Vec<Item> {
+    let mut items = vec![gh_item(auth)];
     items.push(match origin {
         Some(url) if host_of(url).as_deref() == Some("github.com") => {
             match codespaces::repo_from_remote(url) {
@@ -269,9 +295,7 @@ fn account_item(prerequisites: &Prerequisites, account: Option<&str>) -> Item {
             "Docker is not signed in on this computer",
             Some(Fix::Command(SBX_LOGIN_COMMAND)),
         ),
-        Prerequisites::DockerAccount(why) => {
-            Item::problem(Id::DockerAccount, why.clone(), Some(Fix::ReplaceToken))
-        }
+        Prerequisites::DockerAccount(why) => account_failure(why),
         Prerequisites::Unreachable(why) => Item::problem(
             Id::DockerAccount,
             format!("{name}: Docker Sandboxes is not reachable ({why})"),
@@ -280,6 +304,34 @@ fn account_item(prerequisites: &Prerequisites, account: Option<&str>) -> Item {
         Prerequisites::SshAliasMissing | Prerequisites::Ready => {
             Item::ok(Id::DockerAccount, format!("{name} works"))
         }
+    }
+}
+
+/// The checklist line for a Docker account that could not be used. Only a token the Hub or
+/// sbx rejected can be fixed by replacing it; an account that no longer exists or cannot be
+/// read is fixed in the dialog's own Docker account picker; a network or Hub problem has no
+/// fix but "Check again". `why` is the text of a `DockerAuthError` or of sbx's rejection.
+fn account_failure(why: &str) -> Item {
+    let id = Id::DockerAccount;
+    if why.contains("token revoked or expired")
+        || why.contains("missing Cloud Sandboxes access")
+        || why.contains("did not accept this Docker account's token")
+    {
+        Item::problem(id, why, Some(Fix::ReplaceToken))
+    } else if why.contains("no longer exists") {
+        Item::problem(
+            id,
+            "That Docker account no longer exists. Choose another in the Docker account list below.",
+            None,
+        )
+    } else if why.contains("not available in this session") {
+        Item::problem(
+            id,
+            "Docker accounts are not available in this session. Choose Machine sign-in in the Docker account list below, or restart Monoptah and check again.",
+            None,
+        )
+    } else {
+        Item::problem(id, why, None)
     }
 }
 

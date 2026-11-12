@@ -64,21 +64,30 @@ Entry points:
   `mono/cloud_api/sandbox_provider.rs`) now says "Cloud settings".
 
 Layout, top to bottom:
-- **Segment** Codespaces | Docker Sandbox, plus a "Default for new cloud sessions" select.
-- **Ready**: a checklist computed when the tab opens and again before every start, with Fix
-  where possible.
+- **Segment** Codespaces | Docker Sandbox and the "Default for new cloud sessions" select, on
+  one row.
+- **Ready**: a checklist shown as inline chips, with Fix at the end of the row where possible.
+  It is computed when the tab opens and on "Check again"; the dialog says "Checked when this
+  tab opens. Every start checks sign-in and the Docker account again." Editing the repository
+  URL or a devcontainer path marks that backend's checklist "Changed: Check again" (no command
+  runs on a keystroke). Replace token (revoked or Cloud Sandboxes access missing) is offered
+  only for a rejected token; a Hub or network problem has no fix but Check again, and an
+  account that no longer exists points at the dialog's Docker account picker. Replace token
+  with unsaved edits first asks "Discard changes and open Settings > Cloud?".
   - Codespaces: gh signed in (with codespace scope), origin on GitHub, devcontainer found,
     sshd feature present in the devcontainer (the app reaches a codespace through
     `gh codespace ssh`; see `cloud-dev-environment.md`).
   - Docker Sandbox: Docker account valid, repository reachable (with the chosen Git
-    credential, read access), devcontainer found, ssh set up.
+    credential, read access), devcontainer found, ssh set up. The Docker chip names the
+    Docker ID ("Docker account <id>").
 - **Workspace** (same rows, same order for both backends):
   Repository (from origin, read-only for codespaces; editable HTTPS URL for sandboxes as
   today), Base branch, Devcontainer (path, plus a hint with `hostRequirements` cpus and
   memory when the file declares them), Machine (codespace machine types from
   `codespaces::list_machines`) or Size (sbx shapes 1/2g, 2/4g, 4/8g, 8/16g, 16/32g; sizes
   below the devcontainer's `hostRequirements` stay selectable with a warning), Stop when
-  idle (codespace: 30 minutes, 1, 2 or 4 hours) or Runtime limit (sandbox: 1, 2, 4, 8 hours).
+  idle (codespace: "After 30 minutes", 1, 2 or 4 hours) or Runtime limit (sandbox: "1 hour, then
+  stop", 2, 4, 8 hours).
 - **Credentials**:
   - Docker account (sandbox only; from layer 1, "Machine sign-in (sbx login)" keeps the old
     behavior and is the default for existing projects).
@@ -95,6 +104,9 @@ Layout, top to bottom:
   Claude setup on/off` (the dots are rendered as middle dots).
 - Footer: Cancel and Save. Save validates with the same rules as before
   (`DockerProjectConfig::validated` plus the new codespace rules) and writes both backends.
+  It also saves the Codespaces secrets typed in the secrets block (the block has no Save of
+  its own); when GitHub refuses a secret nothing is stored and the dialog stays open with the
+  error.
 
 ### Composer (RUN ON CLOUD)
 

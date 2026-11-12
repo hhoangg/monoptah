@@ -431,8 +431,9 @@ fn cloud_sources_never_read_the_keychain_or_claude_credentials() {
         gpui.join("settings/cloud_env.rs"),
         gpui.join("cloud_checks.rs"),
         gpui.join("fix_terminal.rs"),
-        // The project's Cloud settings dialog. secrets/model.rs is not scanned: it runs
-        // `git remote get-url origin`, which the kit files must not do.
+        // The project's Cloud settings dialog. secrets/model.rs is scanned for the Keychain
+        // below but not listed here: it runs `git remote get-url origin`, which the kit
+        // files must not do.
         gpui.join("cloud_settings/mod.rs"),
         gpui.join("cloud_settings/model.rs"),
         gpui.join("cloud_settings/secrets.rs"),
@@ -445,6 +446,8 @@ fn cloud_sources_never_read_the_keychain_or_claude_credentials() {
         gpui.join("settings/preferences.rs"),
     ];
     files.extend(kit_ui.iter().cloned());
+    // Scanned for the Keychain, but it may spawn `git` (not a kit file).
+    files.push(gpui.join("cloud_settings/secrets/model.rs"));
     files.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/docker_accounts.rs"));
     // The sbx seam and the per-sandbox account pin act as Docker accounts: no Keychain.
     files.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sandboxes.rs"));

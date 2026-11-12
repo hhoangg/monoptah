@@ -478,7 +478,11 @@ fn backend_chips_reflect_the_checks(cx: &mut TestAppContext) {
             .unwrap(),
         Some(crate::cloud_checks::Gh::Missing)
     );
-    assert!(has(visual, "cloud-fix-codespaces"));
+    // Only macOS has an install command to offer (Homebrew).
+    assert_eq!(
+        has(visual, "cloud-fix-codespaces"),
+        cfg!(target_os = "macos")
+    );
     assert!(!has(visual, "cloud-fix-sandbox"));
 }
 
@@ -1207,6 +1211,10 @@ fn a_removal_result_for_another_row_is_ignored(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the gh install fix (brew install gh) exists on macOS only"
+)]
 fn fix_says_why_when_the_program_cannot_be_found(cx: &mut TestAppContext) {
     let world = World::new();
     world.gh.set(Err("gh is not installed"));

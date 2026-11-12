@@ -342,6 +342,17 @@ impl Conversation {
             .unwrap_or_default()
     }
 
+    /// Reads the saved config into the cache, like opening the menu does.
+    #[cfg(test)]
+    pub(crate) fn cache_docker_config(&self) {
+        let _ = self.docker_config();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn docker_config_is_cached(&self) -> bool {
+        self.docker_config_cache.borrow().is_some()
+    }
+
     pub(crate) fn forget_docker_config(&self) {
         self.docker_config_cache.take();
     }

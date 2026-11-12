@@ -2,7 +2,7 @@ use super::*;
 use crate::terminal::TerminalEvent;
 use gpui::{TestAppContext, VisualTestContext, WindowHandle};
 use model::Gh;
-use monocode_core::codespaces::{AuthStatus, GhOutput};
+use monocode_core::codespaces::{self, AuthStatus, GhOutput};
 use std::{collections::BTreeMap, sync::Mutex};
 
 const PROJECT: &str = "/work/alpha";
@@ -143,6 +143,18 @@ fn env(gh: &Arc<FakeGh>, origin: fn(&Path) -> Option<String>) -> Env {
     }
 }
 
+/// `model::load` with the `gh` state the runner reports, like the dialog's Ready check.
+fn load(runner: &dyn GhRunner, project: &Path, origin: Option<&str>) -> Snapshot {
+    let gh = model::gh_state(codespaces::auth_status(runner));
+    model::load(runner, project, origin, gh)
+}
+
+/// Asks the view to read again with what the runner reports now.
+fn refresh(view: &mut SecretsView, cx: &mut Context<SecretsView>) {
+    let gh = model::gh_state(codespaces::auth_status(view.env.runner.as_ref()));
+    view.refresh(gh, cx);
+}
+
 fn open(cx: &mut TestAppContext, env: Env) -> WindowHandle<SecretsView> {
     open_at(cx, env, PROJECT)
 }
@@ -152,7 +164,11 @@ fn open_at(cx: &mut TestAppContext, env: Env, project: &str) -> WindowHandle<Sec
     let window = cx.update(|cx| {
         input::bind(cx);
         cx.open_window(Default::default(), |_, cx| {
-            cx.new(|cx| SecretsView::new(project, env, cx))
+            cx.new(|cx| {
+                let mut view = SecretsView::new(project, env, cx);
+                refresh(&mut view, cx);
+                view
+            })
         })
         .unwrap()
     });
@@ -249,7 +265,7 @@ fn load_maps_secret_status_and_always_lists_the_claude_token() {
     let gh = FakeGh::new(Ok(AUTH_OK))
         .with_secret("CLAUDE_CODE_OAUTH_TOKEN", &[REPO])
         .with_secret("OTHER", &["acme/else"]);
-    let snapshot = model::load(
+    let snapshot = load(
         gh.as_ref(),
         Path::new("/nonexistent"),
         Some("https://github.com/acme/alpha"),
@@ -278,7 +294,7 @@ fn devcontainer_secrets_get_a_row_each_with_their_status() {
     let gh = FakeGh::new(Ok(AUTH_OK))
         .with_secret("NPM_TOKEN", &["acme/else"])
         .with_secret("OTHER", &[REPO]);
-    let snapshot = model::load(gh.as_ref(), &dir, Some("https://github.com/acme/alpha.git"));
+    let snapshot = load(gh.as_ref(), &dir, Some("https://github.com/acme/alpha.git"));
     std::fs::remove_dir_all(dir).ok();
     let states: Vec<_> = snapshot
         .rows
@@ -298,7 +314,7 @@ fn devcontainer_secrets_get_a_row_each_with_their_status() {
 #[test]
 fn an_unready_gh_or_a_missing_repo_reads_no_secrets() {
     let gh = FakeGh::new(Ok(AUTH_NO_SCOPE));
-    let snapshot = model::load(
+    let snapshot = load(
         gh.as_ref(),
         Path::new("/x"),
         Some("git@github.com:acme/alpha.git"),
@@ -306,7 +322,7 @@ fn an_unready_gh_or_a_missing_repo_reads_no_secrets() {
     assert!(matches!(snapshot.gh, Gh::MissingScope(_)));
     assert!(snapshot.rows.iter().all(|r| r.state.is_none()));
     let gh = FakeGh::new(Ok(AUTH_OK));
-    let snapshot = model::load(gh.as_ref(), Path::new("/x"), None);
+    let snapshot = load(gh.as_ref(), Path::new("/x"), None);
     assert!(snapshot.repo.is_none());
     assert!(snapshot.rows.iter().all(|r| r.state.is_none()));
     let calls: Vec<_> = gh
@@ -335,7 +351,10 @@ fn the_dialog_loads_status_and_renders_rows(cx: &mut TestAppContext) {
             .is_some()
     );
     assert!(visual.debug_bounds("codespaces-generate").is_some());
-    assert!(visual.debug_bounds("codespaces-save").is_some());
+    // The dialog's footer Save saves the secrets: the block has no Save of its own, and the
+    // gh status line and Check again belong to the dialog's Ready checklist.
+    assert!(visual.debug_bounds("codespaces-save").is_none());
+    assert!(visual.debug_bounds("codespaces-check").is_none());
 }
 
 #[gpui::test]
@@ -560,7 +579,7 @@ fn a_missing_repository_blocks_typing_and_says_why(cx: &mut TestAppContext) {
 fn disabled_and_unknown_reasons_name_the_actual_problem() {
     let load = |auth, origin| {
         let gh = FakeGh::new(auth);
-        model::load(gh.as_ref(), Path::new("/x"), origin)
+        load(gh.as_ref(), Path::new("/x"), origin)
     };
     let ready = load(Ok(AUTH_OK), Some("git@github.com:acme/alpha.git"));
     assert_eq!(ready.disabled_reason(), None);
@@ -637,7 +656,7 @@ fn checking_again_after_fixing_gh_enables_the_field(cx: &mut TestAppContext) {
     assert!(visual.debug_bounds("codespaces-disabled").is_some());
 
     *gh.auth.lock().unwrap() = Ok(AUTH_OK.to_owned());
-    act(&window, cx, |dialog, cx| dialog.refresh(cx));
+    act(&window, cx, refresh);
     let center = field_center(&window, cx);
     let visual = &mut VisualTestContext::from_window(*window, cx);
     assert!(visual.debug_bounds("codespaces-disabled").is_none());
@@ -862,7 +881,7 @@ fn a_token_captured_while_busy_is_saved_when_the_work_ends(cx: &mut TestAppConte
     act(&window, cx, |dialog, cx| dialog.generate_token(cx));
     let terminal = terminal_of(&window, cx);
     act(&window, cx, |dialog, cx| {
-        dialog.refresh(cx);
+        refresh(dialog, cx);
         emit(&terminal, exited(TOKEN), cx);
     });
     assert_eq!(

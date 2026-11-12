@@ -147,10 +147,14 @@ fn each_codespace_problem_is_named_with_its_fix() {
         Some("https://gitlab.com/acme/alpha"),
         "",
     );
-    assert_eq!(
-        by(&items, Id::Gh).fix,
-        Some(Fix::Command(GH_INSTALL_COMMAND))
-    );
+    assert_eq!(by(&items, Id::Gh).fix, GH_INSTALL_COMMAND.map(Fix::Command));
+    if cfg!(target_os = "macos") {
+        assert_eq!(GH_INSTALL_COMMAND, Some("brew install gh"));
+    } else {
+        // No command the app can name: the line says what to install and offers no Fix.
+        assert_eq!(by(&items, Id::Gh).fix, None);
+        assert_eq!(by(&items, Id::Gh).text, "Install the GitHub CLI (gh)");
+    }
     assert!(by(&items, Id::Origin).text.contains("not on github.com"));
 
     let none = project(None);
@@ -264,7 +268,7 @@ fn a_missing_ssh_alias_offers_the_setup_command_and_nothing_else_fails() {
 }
 
 #[test]
-fn a_docker_account_that_cannot_give_a_token_asks_to_replace_it() {
+fn a_docker_account_that_cannot_give_a_token_points_at_the_account_picker() {
     let (home, dir) = (home(true), project(None));
     let items = sandbox(
         &sbx_ok(),
@@ -274,7 +278,13 @@ fn a_docker_account_that_cannot_give_a_token_asks_to_replace_it() {
     );
     let account = by(&items, Id::DockerAccount);
     assert_eq!(account.state, State::Problem);
-    assert_eq!(account.fix, Some(Fix::ReplaceToken));
+    // No account service here: replacing a token would not help, the picker is the way out.
+    assert_eq!(account.fix, None);
+    assert!(
+        account.text.contains("Docker account list below"),
+        "{}",
+        account.text
+    );
     assert!(!account.text.contains("sbx login"), "{}", account.text);
     // ssh is not judged while the account fails.
     assert_eq!(by(&items, Id::Ssh).state, State::Unknown);
@@ -353,4 +363,64 @@ fn an_empty_repository_url_is_asked_for() {
     q.repo_url = "  ";
     let items = sandbox(&sbx_ok(), &Git::default(), None, &q);
     assert!(by(&items, Id::Repository).text.contains("repository URL"));
+}
+
+#[test]
+fn only_a_rejected_docker_token_offers_replace_token() {
+    use crate::docker_accounts::DockerAuthError as E;
+    let docker_id = || "alice".to_owned();
+    let fix_of = |error: E| {
+        let item = account_item(&Prerequisites::DockerAccount(error.to_string()), Some("a1"));
+        assert_eq!(item.state, State::Problem);
+        item
+    };
+    // The token is the problem: replace it.
+    for error in [
+        E::Revoked {
+            docker_id: docker_id(),
+        },
+        E::MissingScope {
+            docker_id: docker_id(),
+        },
+    ] {
+        assert_eq!(fix_of(error).fix, Some(Fix::ReplaceToken));
+    }
+    // sbx itself rejected the token.
+    let rejected = account_item(
+        &Prerequisites::DockerAccount(
+            "Docker Sandboxes did not accept this Docker account's token. Replace it in Settings > Cloud."
+                .into(),
+        ),
+        Some("a1"),
+    );
+    assert_eq!(rejected.fix, Some(Fix::ReplaceToken));
+    // Hub or network trouble: replacing the token would not help, only Check again.
+    for error in [
+        E::Network {
+            docker_id: docker_id(),
+            detail: "timeout".into(),
+        },
+        E::Status {
+            docker_id: docker_id(),
+            code: 503,
+        },
+        E::Unexpected {
+            docker_id: docker_id(),
+        },
+        E::Storage("The database is locked.".into()),
+    ] {
+        let item = fix_of(error);
+        assert_eq!(item.fix, None, "{}", item.text);
+        assert!(!item.text.contains("Settings > Cloud"), "{}", item.text);
+    }
+    // The account is gone or accounts cannot be read: the dialog's own picker is the way out.
+    for error in [E::UnknownAccount, E::NotAvailable] {
+        let item = fix_of(error);
+        assert_eq!(item.fix, None, "{}", item.text);
+        assert!(
+            item.text.contains("Docker account list below"),
+            "{}",
+            item.text
+        );
+    }
 }

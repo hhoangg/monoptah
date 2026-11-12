@@ -368,3 +368,152 @@ fn saving_stores_the_settings_and_closes_every_layer(cx: &mut TestAppContext) {
         "an untouched sandbox stays unconfigured"
     );
 }
+
+fn click(visual: &mut VisualTestContext, selector: &'static str) {
+    let bounds = visual
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("{selector} is not drawn"));
+    visual.simulate_click(bounds.center(), Default::default());
+    visual.run_until_parked();
+}
+
+const TOKEN_FIELD: &str = "codespaces-field-CLAUDE_CODE_OAUTH_TOKEN";
+
+fn token(window: &WindowHandle<Shell>, cx: &mut TestAppContext) -> String {
+    window
+        .read_with(cx, |shell, cx| {
+            shell
+                .cloud_settings
+                .as_ref()
+                .unwrap()
+                .view
+                .read(cx)
+                .secret_text(cx)
+        })
+        .unwrap()
+}
+
+#[gpui::test]
+fn typing_and_pasting_reach_the_secret_field_inside_the_shell_modal(cx: &mut TestAppContext) {
+    let (window, _, _) = shell_with_fakes(cx);
+    open_default(&window, cx, "/work/monocode");
+    cx.refresh().unwrap();
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    // Tall enough for the whole dialog: the secret field is far down its body.
+    visual.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(2400.)));
+    visual.refresh().unwrap();
+    click(visual, TOKEN_FIELD);
+    visual.simulate_input("sk-ant");
+    visual.write_to_clipboard(gpui::ClipboardItem::new_string("-pasted".into()));
+    visual.simulate_keystrokes("secondary-v");
+    visual.run_until_parked();
+    assert_eq!(token(&window, visual), "sk-ant-pasted");
+}
+
+#[gpui::test]
+fn the_footer_save_button_saves_the_typed_secret_over_stdin(cx: &mut TestAppContext) {
+    let (window, fixture, _) = shell_with_fakes(cx);
+    open_default(&window, cx, "/work/monocode");
+    cx.refresh().unwrap();
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    // Tall enough for the whole dialog: the secret field is far down its body.
+    visual.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(2400.)));
+    visual.refresh().unwrap();
+    click(visual, TOKEN_FIELD);
+    visual.simulate_input("sk-ant-oat-footer");
+    visual.run_until_parked();
+    assert_eq!(fixture.gh.secret_calls(), 0, "typing alone saves nothing");
+    click(visual, "cloud-save");
+    visual.refresh().unwrap();
+    assert_eq!(
+        *fixture.gh.secret_sets.lock().unwrap(),
+        [(
+            "CLAUDE_CODE_OAUTH_TOKEN".to_owned(),
+            "sk-ant-oat-footer".to_owned()
+        )]
+    );
+    assert!(
+        fixture
+            .gh
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|argv| !argv.iter().any(|a| a.contains("sk-ant-oat-footer"))),
+        "the token is never in argv"
+    );
+    assert_eq!(children(&window, visual), (false, false, false), "closed");
+}
+
+#[gpui::test]
+fn escape_closes_an_open_select_before_the_dialog(cx: &mut TestAppContext) {
+    let (window, _, _) = shell_with_fakes(cx);
+    open_default(&window, cx, "/work/monocode");
+    cx.refresh().unwrap();
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    let open = |window: &WindowHandle<Shell>, visual: &mut VisualTestContext| {
+        window
+            .read_with(visual, |shell, cx| {
+                shell
+                    .cloud_settings
+                    .as_ref()
+                    .unwrap()
+                    .view
+                    .read(cx)
+                    .select_open()
+            })
+            .unwrap()
+    };
+    click(visual, "cloud-select-default");
+    visual.refresh().unwrap();
+    assert!(open(&window, visual));
+    assert!(visual.debug_bounds("cloud-select-default").is_some());
+    escape(&window, visual);
+    assert!(!open(&window, visual), "the select closed");
+    assert_eq!(
+        children(&window, visual),
+        (true, false, false),
+        "the dialog stays"
+    );
+    escape(&window, visual);
+    assert_eq!(children(&window, visual), (false, false, false));
+}
+
+#[gpui::test]
+fn saving_makes_the_projects_open_conversations_forget_their_cached_config(
+    cx: &mut TestAppContext,
+) {
+    let (window, fixture, active) = shell_with_fakes(cx);
+    // The active conversation is in /work/monocode; the other one is in another project.
+    let other = window
+        .update(cx, |shell, _, cx| {
+            let other = *shell.sessions.keys().find(|id| **id != active).unwrap();
+            for id in [active, other] {
+                shell.sessions[&id].update(cx, |session, _| session.cache_docker_config());
+                assert!(shell.sessions[&id].read(cx).docker_config_is_cached());
+            }
+            other
+        })
+        .unwrap();
+    open_default(&window, cx, "/work/monocode");
+    window
+        .update(cx, |shell, _, cx| {
+            let view = shell.cloud_settings.as_ref().unwrap().view.clone();
+            view.update(cx, |dialog, cx| dialog.save(cx));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(fixture.gh.secret_calls(), 0);
+    window
+        .read_with(cx, |shell, cx| {
+            assert!(
+                !shell.sessions[&active].read(cx).docker_config_is_cached(),
+                "the saved project's conversation forgot its copy"
+            );
+            assert!(
+                shell.sessions[&other].read(cx).docker_config_is_cached(),
+                "another project's conversation is left alone"
+            );
+        })
+        .unwrap();
+}

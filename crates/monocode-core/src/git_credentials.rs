@@ -561,6 +561,38 @@ impl GitCredentials {
     }
 }
 
+/// The arguments and environment of an isolated `git ls-remote --heads` of `url`: no helper
+/// or user configuration, HTTPS only, no redirects, no prompt. `askpass` answers the
+/// credential prompts. Shared by [`check_with`] and [`check_public`] so the two cannot drift.
+fn ls_remote_command(url: &str, askpass: &str) -> (Vec<String>, Vec<(String, String)>) {
+    let args = [
+        "-c",
+        "credential.helper=",
+        "-c",
+        "http.followRedirects=false",
+        "-c",
+        "http.lowSpeedLimit=1000",
+        "-c",
+        "http.lowSpeedTime=30",
+        "ls-remote",
+        "--heads",
+        "--",
+        url,
+    ]
+    .map(String::from)
+    .into();
+    let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+    let env = vec![
+        pair("GIT_TERMINAL_PROMPT", "0"),
+        pair("GCM_INTERACTIVE", "never"),
+        pair("GIT_CONFIG_GLOBAL", "/dev/null"),
+        pair("GIT_CONFIG_NOSYSTEM", "1"),
+        pair("GIT_ALLOW_PROTOCOL", "https"),
+        pair("GIT_ASKPASS", askpass),
+    ];
+    (args, env)
+}
+
 /// Run `git ls-remote --heads` against `repo_url` with a token that is held only in
 /// memory. Shared by a saved profile ([`GitCredentials::check_access`]) and an unsaved
 /// token ([`check_token`]); it never touches the database.
@@ -587,32 +619,8 @@ fn check_with(
             .map_err(|_| "Could not prepare the Git check.")?;
     }
     let script = write_askpass(dir.path(), &origin, username)?;
-    let args: Vec<String> = [
-        "-c",
-        "credential.helper=",
-        "-c",
-        "http.followRedirects=false",
-        "-c",
-        "http.lowSpeedLimit=1000",
-        "-c",
-        "http.lowSpeedTime=30",
-        "ls-remote",
-        "--heads",
-        "--",
-        &url,
-    ]
-    .map(String::from)
-    .into();
-    let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
-    let env = vec![
-        pair("GIT_TERMINAL_PROMPT", "0"),
-        pair("GCM_INTERACTIVE", "never"),
-        pair("GIT_CONFIG_GLOBAL", "/dev/null"),
-        pair("GIT_CONFIG_NOSYSTEM", "1"),
-        pair("GIT_ALLOW_PROTOCOL", "https"),
-        pair("GIT_ASKPASS", &script.to_string_lossy()),
-        pair(USERNAME_ENV, username),
-    ];
+    let (args, mut env) = ls_remote_command(&url, &script.to_string_lossy());
+    env.push((USERNAME_ENV.to_owned(), username.to_owned()));
     let result = runner.run(&args, &env, token);
     // Drop the helper before reporting, whatever happened.
     drop(dir);
@@ -653,31 +661,7 @@ fn check_with(
 pub fn check_public(runner: &dyn GitRunner, repo_url: &str) -> Result<AccessCheck, String> {
     let (platform, _, _) = normalize_origin(repo_url)?;
     let url = clone_url(repo_url)?;
-    let args: Vec<String> = [
-        "-c",
-        "credential.helper=",
-        "-c",
-        "http.followRedirects=false",
-        "-c",
-        "http.lowSpeedLimit=1000",
-        "-c",
-        "http.lowSpeedTime=30",
-        "ls-remote",
-        "--heads",
-        "--",
-        &url,
-    ]
-    .map(String::from)
-    .into();
-    let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
-    let env = vec![
-        pair("GIT_TERMINAL_PROMPT", "0"),
-        pair("GCM_INTERACTIVE", "never"),
-        pair("GIT_CONFIG_GLOBAL", "/dev/null"),
-        pair("GIT_CONFIG_NOSYSTEM", "1"),
-        pair("GIT_ALLOW_PROTOCOL", "https"),
-        pair("GIT_ASKPASS", "/bin/false"),
-    ];
+    let (args, env) = ls_remote_command(&url, "/bin/false");
     let output = runner.run(&args, &env, &Secret::new(String::new()))?;
     Ok(if output.success {
         AccessCheck {

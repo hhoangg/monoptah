@@ -11,7 +11,9 @@ pub(super) const PRIVACY_NOTE: &str = "Monoptah keeps no copy of these values. T
 pub(super) const NO_REPO_LINE: &str =
     "No GitHub repository found: the project needs a git origin on github.com.";
 // The gh checks live in `cloud_checks`, shared with Settings > Cloud.
-pub(super) use crate::cloud_checks::{Gh, gh_state};
+pub(super) use crate::cloud_checks::Gh;
+#[cfg(test)]
+pub(super) use crate::cloud_checks::gh_state;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Row {
@@ -83,8 +85,14 @@ impl Snapshot {
     }
 }
 
-/// Checks gh, resolves the repo from `origin` and reads the status of each secret.
-pub(super) fn load(runner: &dyn GhRunner, project: &Path, origin: Option<&str>) -> Snapshot {
+/// Resolves the repo from `origin` and reads the status of each secret. `gh` is what the
+/// dialog's Ready check already found out: no second `gh auth status`.
+pub(super) fn load(
+    runner: &dyn GhRunner,
+    project: &Path,
+    origin: Option<&str>,
+    gh: Gh,
+) -> Snapshot {
     let repo = origin.and_then(codespaces::repo_from_remote);
     let secrets = codespaces::devcontainer_secrets(project);
     let mut rows: Vec<Row> = wanted(&secrets)
@@ -95,7 +103,6 @@ pub(super) fn load(runner: &dyn GhRunner, project: &Path, origin: Option<&str>) 
             state: None,
         })
         .collect();
-    let gh = gh_state(codespaces::auth_status(runner));
     let mut error = None;
     if gh.ready()
         && let Some(repo) = &repo

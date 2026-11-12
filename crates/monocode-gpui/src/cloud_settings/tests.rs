@@ -12,9 +12,17 @@ use monocode_core::{
     git_credentials::{GitOutput, GitPlatform},
     sandboxes::SbxOutput,
 };
-use std::{cell::RefCell, rc::Rc, sync::Mutex};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 pub(crate) const JWT: &str = "jwt-secret-value-0123456789";
+const OAUTH: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 const AUTH_OK: &str = "github.com\n  \u{2713} Logged in to github.com account octo (keyring)\n  - Token scopes: 'codespace', 'repo'\n";
 const MACHINES: &str = r#"{"total_count":3,"machines":[
  {"name":"basicLinux32gb","display_name":"2-core, 8 GB","operating_system":"linux","storage_in_bytes":34359738368,"memory_in_bytes":8589934592,"cpus":2},
@@ -22,19 +30,35 @@ const MACHINES: &str = r#"{"total_count":3,"machines":[
  {"name":"premiumLinux","display_name":"8-core, 32 GB","operating_system":"linux","storage_in_bytes":68719476736,"memory_in_bytes":34359738368,"cpus":8}]}"#;
 
 pub(crate) struct FakeGh {
-    machines_fail: bool,
+    /// Listing machine types fails while set.
+    machines_fail: AtomicBool,
+    /// `gh secret set` fails while set.
+    secret_fail: AtomicBool,
     pub(crate) calls: Mutex<Vec<Vec<String>>>,
+    /// `(key, stdin)` of every `gh secret set`.
+    pub(crate) secret_sets: Mutex<Vec<(String, String)>>,
 }
 impl FakeGh {
     fn new(machines_fail: bool) -> Arc<Self> {
         Arc::new(Self {
-            machines_fail,
+            machines_fail: AtomicBool::new(machines_fail),
+            secret_fail: AtomicBool::new(false),
             calls: Mutex::new(Vec::new()),
+            secret_sets: Mutex::new(Vec::new()),
         })
+    }
+
+    pub(crate) fn secret_calls(&self) -> usize {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|args| args.first().map(String::as_str) == Some("secret"))
+            .count()
     }
 }
 impl GhRunner for FakeGh {
-    fn run(&self, args: &[String], _: Option<&str>) -> Result<GhOutput, String> {
+    fn run(&self, args: &[String], stdin: Option<&str>) -> Result<GhOutput, String> {
         self.calls.lock().unwrap().push(args.to_vec());
         let ok = |stdout: &str| {
             Ok(GhOutput {
@@ -46,13 +70,31 @@ impl GhRunner for FakeGh {
         match args.first().map(String::as_str) {
             Some("auth") => ok(AUTH_OK),
             Some("api") if args.iter().any(|a| a.ends_with("/codespaces/machines")) => {
-                if self.machines_fail {
+                if self.machines_fail.load(Ordering::SeqCst) {
                     Err("HTTP 500".into())
                 } else {
                     ok(MACHINES)
                 }
             }
+            Some("api") if args.iter().any(|a| a.ends_with("/repositories")) => {
+                ok(r#"[{"repositories":[]}]"#)
+            }
             Some("api") => ok(r#"[{"secrets":[]}]"#),
+            Some("secret") => {
+                let key = args.get(2).cloned().unwrap_or_default();
+                if self.secret_fail.load(Ordering::SeqCst) {
+                    return Ok(GhOutput {
+                        success: false,
+                        stdout: String::new(),
+                        stderr: "HTTP 422".into(),
+                    });
+                }
+                self.secret_sets
+                    .lock()
+                    .unwrap()
+                    .push((key, stdin.unwrap_or_default().to_owned()));
+                ok("")
+            }
             other => panic!("unexpected gh call {other:?}"),
         }
     }
@@ -343,7 +385,7 @@ fn an_existing_sandbox_config_opens_and_saves_back_unchanged() {
     assert_eq!(runtimes.last().map(String::as_str), Some("90m"));
     assert_eq!(model::runtime_label("90m"), "90 minutes, then stop");
     assert_eq!(model::idle_options(45).last(), Some(&45));
-    assert_eq!(model::idle_label(45), "45 minutes");
+    assert_eq!(model::idle_label(45), "After 45 minutes");
     // A preset is not duplicated.
     assert_eq!(model::size_options(2, "4g").len(), 5);
     assert_eq!(model::runtime_options("2h").len(), 4);
@@ -354,9 +396,9 @@ fn the_labels_read_naturally() {
     assert_eq!(model::size_label(1, "2g"), "1 CPU, 2 GB");
     assert_eq!(model::size_label(16, "32g"), "16 CPUs, 32 GB");
     assert_eq!(model::size_label(2, "512m"), "2 CPUs, 512 MB");
-    assert_eq!(model::idle_label(30), "30 minutes");
-    assert_eq!(model::idle_label(60), "1 hour");
-    assert_eq!(model::idle_label(240), "4 hours");
+    assert_eq!(model::idle_label(30), "After 30 minutes");
+    assert_eq!(model::idle_label(60), "After 1 hour");
+    assert_eq!(model::idle_label(240), "After 4 hours");
     assert_eq!(model::runtime_label("1h"), "1 hour, then stop");
     assert_eq!(model::runtime_label("8h"), "8 hours, then stop");
 }
@@ -725,11 +767,23 @@ fn the_sandbox_checklist_is_computed_on_first_switch(cx: &mut TestAppContext) {
     assert_eq!(fixture.sbx.calls.lock().unwrap().len(), 1);
 }
 
+/// A finished Sandbox checklist whose Docker account line carries `fix`.
+fn with_account_problem(dialog: &mut CloudSettings, fix: Option<Fix>) {
+    dialog.ready[1] = Ready::Done(vec![Item {
+        id: Id::DockerAccount,
+        state: State::Problem,
+        text: "Docker account alice: token revoked or expired.".into(),
+        fix,
+    }]);
+}
+
 #[gpui::test]
-fn a_docker_account_that_cannot_give_a_token_offers_replace_token(cx: &mut TestAppContext) {
+fn a_docker_account_that_is_not_available_points_at_the_picker_not_at_settings(
+    cx: &mut TestAppContext,
+) {
+    // No Docker account service is installed in tests: the account cannot give a token.
     let fixture = Fixture::new();
     let dialog = fixture.open(cx, Some(DefaultBackend::Sandbox), https_origin);
-    let events = events_of(&dialog, cx);
     dialog.update(cx, |d, cx| {
         d.pick(Pick::DockerAccount(Some("acct-2".into())), cx)
     });
@@ -738,14 +792,68 @@ fn a_docker_account_that_cannot_give_a_token_offers_replace_token(cx: &mut TestA
         let list = items(d, DefaultBackend::Sandbox);
         let account = list.iter().find(|i| i.id == Id::DockerAccount).unwrap();
         assert_eq!(account.state, State::Problem);
-        assert_eq!(account.fix, Some(Fix::ReplaceToken));
+        assert_eq!(account.fix, None, "replacing the token would not help");
+        assert!(
+            account.text.contains("Docker account list below"),
+            "{}",
+            account.text
+        );
         assert!(!account.text.contains("sbx login"), "{}", account.text);
         assert!(!account.text.contains(JWT));
     });
+}
+
+#[gpui::test]
+fn replace_token_opens_settings_at_once_when_nothing_is_edited(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let dialog = fixture.open(cx, Some(DefaultBackend::Sandbox), https_origin);
+    let events = events_of(&dialog, cx);
     dialog.update(cx, |d, cx| {
+        with_account_problem(d, Some(Fix::ReplaceToken));
         d.run_fix(DefaultBackend::Sandbox, Fix::ReplaceToken, cx)
     });
     assert_eq!(events.take(), ["replace-token"]);
+}
+
+#[gpui::test]
+fn replace_token_asks_before_discarding_unsaved_edits(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let dialog = fixture.open(cx, Some(DefaultBackend::Sandbox), https_origin);
+    let events = events_of(&dialog, cx);
+    dialog.update(cx, |d, cx| {
+        with_account_problem(d, Some(Fix::ReplaceToken));
+        d.set_text("sb_base", "release", cx);
+        d.run_fix(DefaultBackend::Sandbox, Fix::ReplaceToken, cx);
+        assert!(d.confirm_replace, "the question is shown");
+    });
+    assert!(events.take().is_empty(), "nothing is discarded yet");
+    // Keep editing: the question goes and the edit is still there.
+    dialog.update(cx, |d, cx| {
+        assert!(d.dismiss_transient(cx));
+        assert!(!d.confirm_replace);
+        assert_eq!(d.text("sb_base", cx), "release");
+    });
+    assert!(events.take().is_empty());
+    // Ask again and agree.
+    dialog.update(cx, |d, cx| {
+        d.run_fix(DefaultBackend::Sandbox, Fix::ReplaceToken, cx);
+        assert!(d.confirm_replace);
+        d.run_fix(DefaultBackend::Sandbox, Fix::ReplaceToken, cx);
+    });
+    assert_eq!(events.take(), ["replace-token"]);
+    // Typed secrets count as unsaved edits too.
+    let dialog = fixture.open(cx, Some(DefaultBackend::Codespace), https_origin);
+    let events = events_of(&dialog, cx);
+    dialog.update(cx, |d, cx| {
+        d.secrets
+            .as_ref()
+            .unwrap()
+            .update(cx, |v, cx| v.set_field(OAUTH, "sk-ant-oat-x", cx));
+        assert!(d.dirty(cx));
+        d.run_fix(DefaultBackend::Codespace, Fix::ReplaceToken, cx);
+        assert!(d.confirm_replace);
+    });
+    assert!(events.take().is_empty());
 }
 
 #[gpui::test]
@@ -1239,6 +1347,556 @@ fn nothing_secret_is_in_the_text_the_dialog_draws_or_reports(cx: &mut TestAppCon
             assert!(!line.contains(JWT) && !line.contains("dckr_pat_"), "{line}");
         }
     });
+}
+
+fn no_origin(_: &Path) -> Option<String> {
+    None
+}
+
+#[gpui::test]
+fn the_codespace_repository_row_tells_not_read_yet_from_no_origin(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let (project, env) = (project_of(&fixture), fixture.env(no_origin));
+    let dialog = cx.new(|cx| CloudSettings::new(project, "alpha".into(), None, env, cx));
+    // The origin is read off the UI thread: until then it is not "no origin".
+    dialog.read_with(cx, |d, _| {
+        assert_eq!(d.codespace_repo_text(), "Reading the project's origin...")
+    });
+    cx.run_until_parked();
+    dialog.read_with(cx, |d, _| {
+        assert_eq!(d.codespace_repo_text(), "The project has no git origin.")
+    });
+    let dialog = fixture.open(cx, None, https_origin);
+    dialog.read_with(cx, |d, _| assert_eq!(d.codespace_repo_text(), "acme/alpha"));
+}
+
+#[gpui::test]
+fn editing_the_repository_or_a_devcontainer_path_marks_that_checklist_changed(
+    cx: &mut TestAppContext,
+) {
+    let fixture = Fixture::new();
+    let dialog = fixture.open(cx, Some(DefaultBackend::Codespace), https_origin);
+    dialog.update(cx, |d, cx| d.switch_tab(DefaultBackend::Sandbox, cx));
+    cx.run_until_parked();
+    let gh_calls = fixture.gh.calls.lock().unwrap().len();
+    let sbx_calls = fixture.sbx.calls.lock().unwrap().len();
+    dialog.read_with(cx, |d, _| assert_eq!(d.ready_stale, [false, false]));
+    // A Codespaces devcontainer path changes the Codespaces checklist only.
+    dialog.update(cx, |d, cx| {
+        d.set_text("cs_dev", ".devcontainer/other.json", cx)
+    });
+    cx.run_until_parked();
+    dialog.read_with(cx, |d, _| {
+        assert_eq!(d.ready_stale, [true, false]);
+        assert!(
+            matches!(d.ready[0], Ready::Done(_)),
+            "the old answer stays shown"
+        );
+    });
+    // The repository and the sandbox devcontainer path change the Sandbox checklist.
+    dialog.update(cx, |d, cx| {
+        d.set_text("repo", "https://github.com/acme/other", cx)
+    });
+    cx.run_until_parked();
+    dialog.read_with(cx, |d, _| assert_eq!(d.ready_stale, [true, true]));
+    dialog.update(cx, |d, cx| {
+        d.check_ready(DefaultBackend::Sandbox, cx);
+        d.set_text("sb_dev", ".devcontainer/x.json", cx);
+    });
+    cx.run_until_parked();
+    dialog.read_with(cx, |d, _| {
+        assert!(
+            matches!(d.ready[1], Ready::Changed),
+            "an answer for the old text is dropped"
+        );
+    });
+    // No command ran for a keystroke: only the one explicit check did.
+    assert_eq!(fixture.gh.calls.lock().unwrap().len(), gh_calls);
+    assert_eq!(fixture.sbx.calls.lock().unwrap().len(), sbx_calls + 1);
+    // Check again brings both back.
+    dialog.update(cx, |d, cx| {
+        d.check_ready(DefaultBackend::Sandbox, cx);
+        d.check_ready(DefaultBackend::Codespace, cx);
+    });
+    cx.run_until_parked();
+    dialog.read_with(cx, |d, _| {
+        assert_eq!(d.ready_stale, [false, false]);
+        assert!(matches!(d.ready[0], Ready::Done(_)) && matches!(d.ready[1], Ready::Done(_)));
+    });
+    // Fields no check reads do not mark anything.
+    dialog.update(cx, |d, cx| {
+        d.set_text("cs_base", "dev", cx);
+        d.set_text("sb_base", "dev", cx);
+    });
+    cx.run_until_parked();
+    dialog.read_with(cx, |d, _| assert_eq!(d.ready_stale, [false, false]));
+}
+
+#[gpui::test]
+fn a_saved_credential_blocks_save_until_the_credential_list_is_read(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    docker_config::save(
+        &fixture.store.lock().unwrap(),
+        &project_of(&fixture),
+        &DockerProjectConfig {
+            repo_url: "https://github.com/acme/alpha".into(),
+            credential_id: Some("cred-1".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let (project, env) = (project_of(&fixture), fixture.env(https_origin));
+    let dialog = cx.new(|cx| {
+        CloudSettings::new(
+            project,
+            "alpha".into(),
+            Some(DefaultBackend::Sandbox),
+            env,
+            cx,
+        )
+    });
+    let events = events_of(&dialog, cx);
+    // The list is still being read (the read runs off the UI thread).
+    dialog.update(cx, |d, cx| {
+        assert!(!d.credentials_loaded);
+        d.save(cx);
+        let error = d.error.as_ref().expect("save is refused");
+        assert_eq!(error.field, Field::Credential);
+        assert!(
+            error
+                .message
+                .starts_with("Still reading the saved Git credentials"),
+            "{}",
+            error.message
+        );
+    });
+    assert!(events.take().is_empty());
+    assert_eq!(
+        fixture.load().sandbox.unwrap().credential_id.as_deref(),
+        Some("cred-1"),
+        "nothing was rewritten"
+    );
+    // Without a saved credential there is nothing to wait for.
+    let fresh = Fixture::new();
+    let (project, env) = (project_of(&fresh), fresh.env(https_origin));
+    let dialog = cx.new(|cx| {
+        CloudSettings::new(
+            project,
+            "alpha".into(),
+            Some(DefaultBackend::Sandbox),
+            env,
+            cx,
+        )
+    });
+    dialog.update(cx, |d, cx| {
+        d.set_text("repo", "https://github.com/acme/alpha", cx);
+        d.save(cx);
+        assert!(d.error.is_none(), "{:?}", d.error);
+    });
+}
+
+#[gpui::test]
+fn a_general_save_error_keeps_the_tab_the_user_is_on(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let dialog = fixture.open(cx, Some(DefaultBackend::Codespace), https_origin);
+    dialog.update(cx, |d, cx| {
+        d.show_error(
+            FieldError {
+                backend: DefaultBackend::Sandbox,
+                field: Field::General,
+                message: "The database is locked.".into(),
+            },
+            cx,
+        );
+        assert_eq!(d.tab, DefaultBackend::Codespace);
+        assert!(d.error.is_some());
+        // A field error still brings its tab forward.
+        d.show_error(
+            FieldError {
+                backend: DefaultBackend::Sandbox,
+                field: Field::Repo,
+                message: "x".into(),
+            },
+            cx,
+        );
+        assert_eq!(d.tab, DefaultBackend::Sandbox);
+    });
+    // And through a real save: secrets that cannot be saved (no GitHub origin) are a general
+    // error, reported on the tab the user is looking at.
+    let dialog = fixture.open(cx, Some(DefaultBackend::Codespace), no_origin);
+    dialog.update(cx, |d, cx| {
+        d.secrets
+            .as_ref()
+            .unwrap()
+            .update(cx, |v, cx| v.set_field(OAUTH, "sk-ant-oat-x", cx));
+        d.switch_tab(DefaultBackend::Sandbox, cx);
+        d.save(cx);
+        let error = d.error.as_ref().expect("the secrets could not be saved");
+        assert_eq!(error.field, Field::General);
+        assert_eq!(d.tab, DefaultBackend::Sandbox);
+    });
+}
+
+#[gpui::test]
+fn a_picked_machine_survives_a_failed_reload(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let dialog = fixture.open(cx, Some(DefaultBackend::Codespace), https_origin);
+    dialog.update(cx, |d, cx| {
+        d.pick(Pick::Machine(Some("standardLinux32gb".into())), cx)
+    });
+    // GitHub stops answering; the list is read again.
+    fixture.gh.machines_fail.store(true, Ordering::SeqCst);
+    dialog.update(cx, |d, cx| d.load_machines(cx));
+    cx.run_until_parked();
+    dialog.update(cx, |d, cx| {
+        assert!(matches!(d.machines, Machines::Failed(_)));
+        assert_eq!(
+            d.typed(cx).codespace.machine.as_deref(),
+            Some("standardLinux32gb"),
+            "the text fallback starts from the pick"
+        );
+        assert_eq!(d.text("machine", cx), "standardLinux32gb");
+        d.save(cx);
+    });
+    assert_eq!(
+        fixture.load().codespace.machine.as_deref(),
+        Some("standardLinux32gb")
+    );
+}
+
+#[gpui::test]
+fn leaving_the_codespaces_secret_ends_a_running_setup_token(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let env = Env {
+        claude: || Some(PathBuf::from("/usr/bin/true")),
+        ..fixture.env(https_origin)
+    };
+    let (project, env) = (project_of(&fixture), env);
+    let dialog = cx.new(|cx| {
+        CloudSettings::new(
+            project,
+            "alpha".into(),
+            Some(DefaultBackend::Codespace),
+            env,
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    let secrets = dialog.read_with(cx, |d, _| d.secrets.clone().expect("the secrets block"));
+    secrets.update(cx, |view, cx| view.generate_token(cx));
+    let terminal = secrets.read_with(cx, |view, _| view.terminal_entity().expect("running"));
+    dialog.update(cx, |d, cx| {
+        d.pick(Pick::Claude(Some("claude-1".into())), cx)
+    });
+    cx.run_until_parked();
+    secrets.read_with(cx, |view, _| assert!(!view.generating()));
+    // The command prints a token as it ends: it must not become the secret.
+    let token = format!("sk-ant-oat01-{}", "a".repeat(90));
+    cx.update(|cx| {
+        terminal.update(cx, |_, cx| {
+            cx.emit(crate::terminal::TerminalEvent::Exited {
+                code: Some(0),
+                error: None,
+                tail: format!("\n{token}\n"),
+            })
+        })
+    });
+    cx.run_until_parked();
+    assert_eq!(fixture.gh.secret_calls(), 0, "nothing was saved");
+    dialog.read_with(cx, |d, cx| assert_eq!(d.secret_text(cx), ""));
+}
+
+#[gpui::test]
+fn reading_the_credentials_again_drops_the_answer_of_an_older_read(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let dialog = fixture.open(cx, Some(DefaultBackend::Sandbox), https_origin);
+    dialog.update(cx, |d, cx| {
+        d.credentials_loaded = false;
+        // Two reads in flight; the dialog closes before either answers.
+        d.reload_credentials(Some("c1".into()), cx);
+        d.reload_credentials(None, cx);
+        assert_eq!(d.credentials_gen, 3);
+        d.shutdown(cx);
+    });
+    cx.run_until_parked();
+    dialog.read_with(cx, |d, _| {
+        assert!(!d.credentials_loaded, "no stale answer was applied");
+        assert_eq!(d.form.sandbox.credential_id, None);
+    });
+    // Superseded: the pick asked for by the first read lands with the newest answer.
+    let dialog = fixture.open(cx, Some(DefaultBackend::Sandbox), https_origin);
+    dialog.update(cx, |d, cx| {
+        d.reload_credentials(Some("c1".into()), cx);
+        d.reload_credentials(None, cx);
+    });
+    cx.run_until_parked();
+    dialog.read_with(cx, |d, _| {
+        assert_eq!(d.form.sandbox.credential_id.as_deref(), Some("c1"))
+    });
+}
+
+#[gpui::test]
+fn the_devcontainer_is_read_off_the_ui_thread_and_only_for_its_own_fields(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let dialog = fixture.open(cx, Some(DefaultBackend::Codespace), https_origin);
+    dialog.read_with(cx, |d, _| assert_eq!(d.infos[0].host_cpus, Some(4)));
+    let generation = dialog.read_with(cx, |d, _| d.infos_gen);
+    // Typing elsewhere reads nothing.
+    dialog.update(cx, |d, cx| {
+        d.set_text("cs_base", "release", cx);
+        d.set_text("sb_base", "release", cx);
+        d.set_text("machine", "x", cx);
+    });
+    cx.run_until_parked();
+    dialog.read_with(cx, |d, _| assert_eq!(d.infos_gen, generation));
+    // A new path is read in the background: the old hint stays until the answer is in.
+    dialog.update(cx, |d, cx| d.set_text("cs_dev", "missing.json", cx));
+    dialog.read_with(cx, |d, _| {
+        assert_eq!(d.infos[0].host_cpus, Some(4), "not read on the UI thread")
+    });
+    cx.run_until_parked();
+    dialog.read_with(cx, |d, _| {
+        assert_eq!(d.infos_gen, generation + 1);
+        assert_eq!(d.infos[0].host_cpus, None);
+    });
+}
+
+#[gpui::test]
+fn the_footer_save_also_saves_the_typed_codespaces_secrets(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let dialog = fixture.open(cx, Some(DefaultBackend::Codespace), https_origin);
+    let events = events_of(&dialog, cx);
+    dialog.update(cx, |d, cx| {
+        d.secrets
+            .as_ref()
+            .unwrap()
+            .update(cx, |v, cx| v.set_field(OAUTH, "  sk-ant-oat-footer ", cx));
+        d.set_text("cs_base", "release", cx);
+        d.save(cx);
+        // The secret goes off the UI thread: the settings are not stored before it landed.
+        assert!(d.saving);
+    });
+    assert!(events.take().is_empty());
+    assert_eq!(fixture.load(), ProjectCloud::default());
+    cx.run_until_parked();
+    assert_eq!(events.take(), ["saved", "close"]);
+    assert_eq!(
+        *fixture.gh.secret_sets.lock().unwrap(),
+        [(OAUTH.to_owned(), "sk-ant-oat-footer".to_owned())],
+        "the value reached gh over stdin, trimmed"
+    );
+    assert!(
+        fixture
+            .gh
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|argv| !argv.iter().any(|a| a.contains("sk-ant-oat-footer"))),
+        "never in argv"
+    );
+    assert_eq!(fixture.load().codespace.base_ref, "release");
+    dialog.read_with(cx, |d, cx| {
+        assert_eq!(d.secret_text(cx), "", "the field is emptied")
+    });
+}
+
+#[gpui::test]
+fn a_refused_secret_keeps_the_dialog_open_and_stores_nothing(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    fixture.gh.secret_fail.store(true, Ordering::SeqCst);
+    let dialog = fixture.open(cx, Some(DefaultBackend::Codespace), https_origin);
+    let events = events_of(&dialog, cx);
+    dialog.update(cx, |d, cx| {
+        d.secrets
+            .as_ref()
+            .unwrap()
+            .update(cx, |v, cx| v.set_field(OAUTH, "sk-ant-oat-refused", cx));
+        d.set_text("cs_base", "release", cx);
+        d.switch_tab(DefaultBackend::Sandbox, cx);
+        d.switch_tab(DefaultBackend::Codespace, cx);
+        d.save(cx);
+    });
+    cx.run_until_parked();
+    assert!(events.take().is_empty(), "the dialog stays open");
+    assert_eq!(
+        fixture.load(),
+        ProjectCloud::default(),
+        "nothing was stored"
+    );
+    dialog.read_with(cx, |d, cx| {
+        let error = d.error.as_ref().expect("the error is shown");
+        assert_eq!(error.field, Field::General);
+        assert!(error.message.contains(OAUTH), "{}", error.message);
+        assert!(!error.message.contains("sk-ant-oat-refused"));
+        assert!(!d.saving);
+        assert_eq!(d.secret_text(cx), "sk-ant-oat-refused", "kept for a retry");
+    });
+    // The retry works once GitHub accepts it.
+    fixture.gh.secret_fail.store(false, Ordering::SeqCst);
+    dialog.update(cx, |d, cx| d.save(cx));
+    cx.run_until_parked();
+    assert_eq!(events.take(), ["saved", "close"]);
+    assert_eq!(fixture.load().codespace.base_ref, "release");
+}
+
+#[gpui::test]
+fn typed_secrets_that_cannot_be_saved_are_reported_not_dropped(cx: &mut TestAppContext) {
+    // gh answers, but the project has no GitHub origin: the secrets cannot be saved.
+    let fixture = Fixture::new();
+    let dialog = fixture.open(cx, Some(DefaultBackend::Codespace), no_origin);
+    let events = events_of(&dialog, cx);
+    dialog.update(cx, |d, cx| {
+        d.secrets
+            .as_ref()
+            .unwrap()
+            .update(cx, |v, cx| v.set_field(OAUTH, "sk-ant-oat-lost", cx));
+        d.save(cx);
+        let error = d.error.as_ref().expect("reported");
+        assert_eq!(error.field, Field::General);
+        assert!(
+            error.message.contains("cannot be saved"),
+            "{}",
+            error.message
+        );
+    });
+    cx.run_until_parked();
+    assert!(events.take().is_empty());
+    assert_eq!(fixture.gh.secret_calls(), 0);
+}
+
+#[gpui::test]
+fn the_secrets_block_asks_gh_nothing_the_ready_check_did_not(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let _dialog = fixture.open(cx, Some(DefaultBackend::Codespace), https_origin);
+    let auth_calls = fixture
+        .gh
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|argv| argv.first().map(String::as_str) == Some("auth"))
+        .count();
+    assert_eq!(auth_calls, 1, "one `gh auth status` for the whole dialog");
+}
+
+#[gpui::test]
+fn save_without_edits_keeps_a_stored_config_byte_for_byte(cx: &mut TestAppContext) {
+    // Migration: a project saved by the old Docker Sandbox dialog and one that used only
+    // the Codespaces secret open and save without a change.
+    let full = DockerProjectConfig {
+        credential_id: None,
+        ..saved_sandbox()
+    };
+    let fixture = Fixture::new();
+    docker_config::save(&fixture.store.lock().unwrap(), &project_of(&fixture), &full).unwrap();
+    let raw = |fixture: &Fixture, key: &str| fixture.store.lock().unwrap().setting(key).unwrap();
+    let before = raw(&fixture, docker_config::SETTING);
+    assert!(before.is_some());
+    assert_eq!(raw(&fixture, project_cloud::SETTING), None);
+    let dialog = fixture.open(cx, None, https_origin);
+    dialog.update(cx, |d, cx| {
+        assert_eq!(
+            d.tab,
+            DefaultBackend::Sandbox,
+            "a saved sandbox is the default"
+        );
+        d.save(cx);
+        assert!(d.error.is_none(), "{:?}", d.error);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        raw(&fixture, docker_config::SETTING),
+        before,
+        "byte-identical"
+    );
+    assert_eq!(fixture.gh.secret_calls(), 0, "no secret was set");
+    assert_eq!(
+        raw(&fixture, project_cloud::SETTING),
+        None,
+        "no cloud-projects.v1 default was written"
+    );
+
+    // A credential that no longer exists is the one documented change: it is dropped, the
+    // rest stays as stored.
+    let other = Fixture::new();
+    let with_credential = saved_sandbox();
+    assert_eq!(with_credential.credential_id.as_deref(), Some("cred-1"));
+    docker_config::save(
+        &other.store.lock().unwrap(),
+        &project_of(&other),
+        &with_credential,
+    )
+    .unwrap();
+    let dialog = other.open(cx, None, https_origin);
+    dialog.update(cx, |d, cx| {
+        d.save(cx);
+        assert!(d.error.is_none(), "{:?}", d.error);
+    });
+    cx.run_until_parked();
+    let expected = Fixture::new();
+    docker_config::save(&expected.store.lock().unwrap(), &project_of(&other), &full).unwrap();
+    assert_eq!(
+        raw(&other, docker_config::SETTING),
+        raw(&expected, docker_config::SETTING),
+        "only credentialId is gone"
+    );
+
+    // A codespace project that used only the old secret: nothing is invented.
+    let codespace = Fixture::new();
+    let dialog = codespace.open(cx, None, https_origin);
+    dialog.update(cx, |d, cx| {
+        assert_eq!(d.tab, DefaultBackend::Codespace);
+        d.save(cx);
+        assert!(d.error.is_none(), "{:?}", d.error);
+    });
+    cx.run_until_parked();
+    assert_eq!(codespace.gh.secret_calls(), 0, "no secret was set");
+    assert_eq!(
+        raw(&codespace, docker_config::SETTING),
+        None,
+        "no docker entry"
+    );
+    assert_eq!(
+        raw(&codespace, project_cloud::SETTING),
+        None,
+        "no cloud-projects.v1 default was written"
+    );
+    assert_eq!(codespace.load(), ProjectCloud::default());
+}
+
+#[gpui::test]
+fn the_ready_chip_names_the_docker_account_and_the_subtitle_matches_the_mockup(
+    cx: &mut TestAppContext,
+) {
+    let fixture = Fixture::new();
+    let dialog = fixture.open(cx, Some(DefaultBackend::Sandbox), https_origin);
+    dialog.update(cx, |d, cx| {
+        d.pick(Pick::DockerAccount(Some("acct-1".into())), cx)
+    });
+    cx.run_until_parked();
+    dialog.read_with(cx, |d, _| {
+        let account = ready_item(d, DefaultBackend::Sandbox, Id::DockerAccount);
+        // The item itself is the core's; the chip names the Docker ID.
+        assert_eq!(
+            d.chip_text(&Item {
+                state: State::Ok,
+                ..account
+            }),
+            "Docker account alice"
+        );
+    });
+    assert_eq!(
+        READY_NOTE,
+        "Checked when this tab opens. Every start checks sign-in and the Docker account again."
+    );
+}
+
+fn ready_item(dialog: &CloudSettings, backend: DefaultBackend, id: Id) -> Item {
+    items(dialog, backend)
+        .into_iter()
+        .find(|i| i.id == id)
+        .unwrap()
 }
 
 // ------------------------------------------------------------------ helpers

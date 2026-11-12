@@ -325,9 +325,15 @@ fn validate_sandbox(
         .to_config()
         .validated()
         .map_err(|message| error(sb, field_of(&message), message))?;
-    if let Some(id) = &config.credential_id
-        && ctx.credentials_loaded
-    {
+    if config.credential_id.is_some() && !ctx.credentials_loaded {
+        // A saved id cannot be checked yet, and a save would keep or drop it blindly.
+        return Err(error(
+            sb,
+            Field::Credential,
+            "Still reading the saved Git credentials. Try again in a moment.",
+        ));
+    }
+    if let Some(id) = &config.credential_id {
         let Some(credential) = ctx.credentials.iter().find(|c| &c.id == id) else {
             return Err(error(
                 sb,
@@ -422,10 +428,11 @@ pub(super) fn size_label(cpus: u32, memory: &str) -> String {
 }
 
 pub(super) fn idle_label(minutes: u32) -> String {
-    match minutes {
+    let span = match minutes {
         m if m >= 60 && m % 60 == 0 => plural(m / 60, "hour"),
         m => plural(m, "minute"),
-    }
+    };
+    format!("After {span}")
 }
 
 pub(super) fn runtime_label(ttl: &str) -> String {

@@ -9,16 +9,16 @@ pub(crate) mod model;
 mod tests;
 
 use crate::{
-    cloud_dialog_ui::{alert, button, code_box, muted},
+    cloud_dialog_ui::{alert, button, muted},
     input::{self, Input},
     terminal::{Terminal, TerminalEvent},
     theme::*,
 };
 use gpui::{
-    AnyElement, Context, Div, Entity, FocusHandle, Focusable, FontWeight, IntoElement, Render,
+    AnyElement, Context, Entity, FocusHandle, Focusable, FontWeight, IntoElement, Render,
     SharedString, StyleRefinement, Subscription, Window, div, prelude::*, px, rgb,
 };
-use model::{Row, Snapshot};
+use model::{Gh, Row, Snapshot};
 use monocode_core::codespaces::{GhRunner, OAUTH_SECRET_KEY, SecretState};
 use std::{
     path::{Path, PathBuf},
@@ -40,14 +40,23 @@ fn join_lines(first: Option<String>, second: Option<String>) -> Option<String> {
     }
 }
 
-fn section() -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .border_t_1()
-        .border_color(content(0.08))
-        .pt_4()
+/// What the secrets block tells the dialog around it.
+pub(crate) enum SecretsEvent {
+    /// Enter in a secret field: the dialog's Save.
+    Submitted,
+    /// A save the dialog asked for with [`SecretsView::begin_save`] ended; `ok` when every
+    /// typed secret reached GitHub.
+    SaveFinished { ok: bool },
+}
+
+/// What [`SecretsView::begin_save`] did.
+pub(crate) enum SaveStart {
+    /// Nothing typed: nothing to wait for.
+    Nothing,
+    /// The secrets are on their way; a [`SecretsEvent::SaveFinished`] follows.
+    Started,
+    /// Secrets are typed but cannot be saved now; the text says why.
+    Blocked(String),
 }
 
 pub(crate) struct SecretsView {
@@ -63,9 +72,13 @@ pub(crate) struct SecretsView {
     terminal_events: Option<Subscription>,
     /// A captured token waits for the running check or save to end, then is saved.
     pending_auto_save: bool,
+    /// The running save was asked for by the dialog's Save, which waits for its end.
+    dialog_save: bool,
     focus: FocusHandle,
     _events: Vec<Subscription>,
 }
+
+impl gpui::EventEmitter<SecretsEvent> for SecretsView {}
 
 impl Focusable for SecretsView {
     fn focus_handle(&self, _: &gpui::App) -> FocusHandle {
@@ -74,8 +87,10 @@ impl Focusable for SecretsView {
 }
 
 impl SecretsView {
+    /// Starts empty: the dialog hands it the `gh` state with [`Self::refresh`] once its own
+    /// Ready check has run `gh auth status`.
     pub(crate) fn new(project: String, env: Env, cx: &mut Context<Self>) -> Self {
-        let mut this = Self {
+        Self {
             project,
             env,
             snapshot: None,
@@ -86,15 +101,16 @@ impl SecretsView {
             terminal: None,
             terminal_events: None,
             pending_auto_save: false,
+            dialog_save: false,
             focus: cx.focus_handle(),
             _events: Vec::new(),
-        };
-        this.refresh(cx);
-        this
+        }
     }
 
-    /// Checks gh and the secrets again, off the UI thread.
-    pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
+    /// Reads the secrets' status again, off the UI thread, for the `gh` state the dialog
+    /// found. A refresh that arrives while one runs is dropped (the dialog asks again after
+    /// every Ready check).
+    pub(crate) fn refresh(&mut self, gh: Gh, cx: &mut Context<Self>) {
         if std::mem::replace(&mut self.busy, true) {
             return;
         }
@@ -106,7 +122,7 @@ impl SecretsView {
                 .spawn(async move {
                     let path = Path::new(&project);
                     let origin = (env.origin)(path);
-                    model::load(env.runner.as_ref(), path, origin.as_deref())
+                    model::load(env.runner.as_ref(), path, origin.as_deref(), gh)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -134,7 +150,9 @@ impl SecretsView {
             self._events
                 .push(cx.subscribe(&input, |_, _, _: &input::Changed, cx| cx.notify()));
             self._events
-                .push(cx.subscribe(&input, |this, _, _: &input::Submitted, cx| this.save(cx)));
+                .push(cx.subscribe(&input, |_, _, _: &input::Submitted, cx| {
+                    cx.emit(SecretsEvent::Submitted)
+                }));
             self.fields.push((row.key.clone(), input));
         }
         self.snapshot = Some(snapshot);
@@ -159,14 +177,20 @@ impl SecretsView {
         !model::to_save(&self.typed(cx)).is_empty()
     }
 
+    /// Whether any secret is typed and not saved yet.
+    pub(crate) fn has_typed(&self, cx: &gpui::App) -> bool {
+        self.has_input(cx)
+    }
+
+    /// The error shown in the block, if any.
+    pub(crate) fn error_text(&self) -> Option<String> {
+        self.error.clone()
+    }
+
     fn clear(&mut self, key: &str, cx: &mut Context<Self>) {
         if let Some((_, input)) = self.fields.iter().find(|(k, _)| k == key) {
             input.update(cx, |input, cx| input.set_text(String::new(), cx));
         }
-    }
-
-    fn can_save(&self, cx: &gpui::App) -> bool {
-        !self.busy && self.has_input(cx) && self.gh_ready()
     }
 
     /// gh is ready and the repository is known: the two things a save needs.
@@ -178,8 +202,38 @@ impl SecretsView {
 
     /// Stores each non-empty field, then empties the ones that were saved and re-reads
     /// the status. A field whose save failed keeps its value so it can be retried.
+    #[cfg(test)]
     pub(crate) fn save(&mut self, cx: &mut Context<Self>) {
         self.save_keys(None, false, cx);
+    }
+
+    /// The dialog's Save: stores what is typed and ends with [`SecretsEvent::SaveFinished`].
+    /// Typed secrets that cannot be saved now are reported, never dropped silently.
+    pub(crate) fn begin_save(&mut self, cx: &mut Context<Self>) -> SaveStart {
+        if !self.has_input(cx) {
+            return SaveStart::Nothing;
+        }
+        let blocked = if self.busy {
+            Some("Still checking GitHub. Press Save again in a moment.".to_owned())
+        } else {
+            match &self.snapshot {
+                None => Some("Still checking GitHub. Press Save again in a moment.".to_owned()),
+                Some(snapshot) => snapshot.disabled_reason().map(|reason| {
+                    format!(
+                        "The Codespaces secrets cannot be saved yet. {}.",
+                        reason.trim_end_matches('.')
+                    )
+                }),
+            }
+        };
+        if let Some(message) = blocked {
+            self.error = Some(message.clone());
+            cx.notify();
+            return SaveStart::Blocked(message);
+        }
+        self.dialog_save = true;
+        self.save_keys(None, false, cx);
+        SaveStart::Started
     }
 
     /// `save` limited to `only` when given; other typed fields are neither saved nor cleared.
@@ -189,7 +243,11 @@ impl SecretsView {
         if self.busy || !self.gh_ready() {
             return;
         }
-        let Some(repo) = self.snapshot.as_ref().and_then(|s| s.repo.clone()) else {
+        let Some((repo, gh)) = self
+            .snapshot
+            .as_ref()
+            .and_then(|s| Some((s.repo.clone()?, s.gh.clone())))
+        else {
             return;
         };
         let mut typed = self.typed(cx);
@@ -216,13 +274,15 @@ impl SecretsView {
                         let outcome = model::save(env.runner.as_ref(), &repo, &entries);
                         let path = Path::new(&project);
                         let origin = (env.origin)(path);
-                        let snapshot = model::load(env.runner.as_ref(), path, origin.as_deref());
+                        let snapshot =
+                            model::load(env.runner.as_ref(), path, origin.as_deref(), gh);
                         (outcome, snapshot)
                     }
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.busy = false;
+                let ok = outcome.failed.is_empty();
                 for key in &outcome.saved {
                     if let Some((_, value)) = entries.iter().find(|(k, _)| k == key) {
                         this.clear_if_unchanged(key, value, cx);
@@ -238,6 +298,9 @@ impl SecretsView {
                     this.notice = saved;
                 }
                 this.apply(snapshot, cx);
+                if std::mem::take(&mut this.dialog_save) {
+                    cx.emit(SecretsEvent::SaveFinished { ok });
+                }
                 if this.pending_auto_save {
                     // That save decides whether the dialog is done.
                     this.run_pending_auto_save(cx);
@@ -360,6 +423,34 @@ impl SecretsView {
             .is_some_and(|t| t.read(cx).focus_handle(cx).contains_focused(window, cx))
     }
 
+    /// Ends a running `claude setup-token` terminal so a token it prints later is not saved.
+    /// Called when the Claude picker leaves "Codespaces secret".
+    pub(crate) fn stop_generating(&mut self, cx: &mut Context<Self>) {
+        self.pending_auto_save = false;
+        if self.terminal.is_some() {
+            self.close_terminal(cx);
+            cx.notify();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn generating(&self) -> bool {
+        self.terminal.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn terminal_entity(&self) -> Option<Entity<Terminal>> {
+        self.terminal.clone()
+    }
+
+    /// Types `text` into the secret field `key`.
+    #[cfg(test)]
+    pub(crate) fn set_field(&self, key: &str, text: &str, cx: &mut Context<Self>) {
+        if let Some((_, input)) = self.fields.iter().find(|(k, _)| k == key) {
+            input.update(cx, |input, cx| input.set_text(text.to_owned(), cx));
+        }
+    }
+
     fn close_terminal(&mut self, cx: &mut Context<Self>) {
         self.terminal_events = None;
         if let Some(terminal) = self.terminal.take() {
@@ -370,29 +461,11 @@ impl SecretsView {
     /// Ends the terminal and drops anything typed; called when the dialog closes.
     pub(crate) fn shutdown(&mut self, cx: &mut Context<Self>) {
         self.pending_auto_save = false;
+        self.dialog_save = false;
         self.close_terminal(cx);
         for (key, _) in self.fields.clone() {
             self.clear(&key, cx);
         }
-    }
-
-    fn status_section(&self, snapshot: &Snapshot) -> Div {
-        let gh = &snapshot.gh;
-        let mut column = section().child(
-            div()
-                .text_size(px(13.))
-                .font_weight(FontWeight::MEDIUM)
-                .child(gh.line()),
-        );
-        if let Some(fix) = gh.fix() {
-            column = column
-                .child(muted("Run this in a terminal, then Check again:"))
-                .child(code_box(fix));
-        }
-        column.child(muted(match &snapshot.repo {
-            Some(repo) => format!("Repository: {repo}"),
-            None => model::NO_REPO_LINE.to_owned(),
-        }))
     }
 
     fn secret_row(
@@ -558,7 +631,6 @@ impl SecretsView {
             );
             return out;
         };
-        out.push(self.status_section(&snapshot).into_any_element());
         if let Some(error) = snapshot.error.clone() {
             out.push(alert("codespaces-load-error", error).into_any_element());
         }
@@ -589,30 +661,6 @@ impl SecretsView {
             out.push(self.secret_row(row, &snapshot, enabled, cx));
         }
         out.extend(self.terminal_pane(cx));
-        let save_enabled = self.can_save(cx);
-        let busy = self.busy;
-        out.push(
-            div()
-                .flex()
-                .items_center()
-                .gap_3()
-                .child(
-                    button(
-                        "codespaces-save",
-                        if busy { "Working…" } else { "Save" },
-                        !save_enabled,
-                    )
-                    .when(save_enabled, |b| {
-                        b.on_click(cx.listener(|this, _, _, cx| this.save(cx)))
-                    }),
-                )
-                .child(
-                    button("codespaces-check", "Check again", busy).when(!busy, |b| {
-                        b.on_click(cx.listener(|this, _, _, cx| this.refresh(cx)))
-                    }),
-                )
-                .into_any_element(),
-        );
         out
     }
 }

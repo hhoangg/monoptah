@@ -5,11 +5,10 @@
 use monocode_core::{codespaces::AuthStatus, sandboxes};
 use std::path::{Path, PathBuf};
 
-pub(crate) const REFRESH_COMMAND: &str = "gh auth refresh -h github.com -s codespace";
-pub(crate) const LOGIN_COMMAND: &str = "gh auth login";
-pub(crate) const INSTALL_COMMAND: &str = "brew install gh";
-/// What fixes a missing ssh alias for Docker Sandbox.
-pub(crate) const SBX_SSH_COMMAND: &str = "sbx --cloud setup ssh";
+// The fix commands are defined once, in the core's readiness checklist.
+use monocode_core::cloud_sessions::readiness::{
+    GH_INSTALL_COMMAND, GH_LOGIN_COMMAND, GH_REFRESH_COMMAND, SBX_SSH_COMMAND,
+};
 
 /// How far the GitHub CLI is set up.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,9 +40,9 @@ impl Gh {
     /// The exact command that fixes what is missing.
     pub(crate) fn fix(&self) -> Option<&'static str> {
         match self {
-            Gh::Missing => Some(INSTALL_COMMAND),
-            Gh::NotLoggedIn => Some(LOGIN_COMMAND),
-            Gh::MissingScope(_) => Some(REFRESH_COMMAND),
+            Gh::Missing => GH_INSTALL_COMMAND,
+            Gh::NotLoggedIn => Some(GH_LOGIN_COMMAND),
+            Gh::MissingScope(_) => Some(GH_REFRESH_COMMAND),
             Gh::Ready(_) | Gh::Failed(_) => None,
         }
     }

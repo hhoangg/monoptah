@@ -16,6 +16,7 @@ pub(crate) mod secrets;
 pub(crate) mod tests;
 
 use crate::{
+    cloud_checks::{Gh, gh_state},
     cloud_dialog_ui::{alert, field_box, heading, labelled, muted},
     cloud_kit_ui,
     fix_terminal::FixCommand,
@@ -42,11 +43,18 @@ use monocode_core::{
     sandboxes::{SbxRunner, SystemSbx},
     store::Store,
 };
-use secrets::SecretsView;
+use secrets::{SaveStart, SecretsEvent, SecretsView};
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
+
+/// What the Ready section says under its title.
+const READY_NOTE: &str =
+    "Checked when this tab opens. Every start checks sign-in and the Docker account again.";
+/// Shown when an edit changed what a checklist was computed for.
+const READY_CHANGED: &str = "Changed: Check again";
+const REPLACE_CONFIRM: &str = "Discard changes and open Settings > Cloud?";
 
 /// The Claude accounts that hold a setup-token or an API key: the ones a cloud session can
 /// use.
@@ -219,6 +227,8 @@ enum Machines {
 enum Ready {
     NotStarted,
     Checking,
+    /// An edit made a running check stale: its answer was dropped.
+    Changed,
     Done(Vec<Item>),
 }
 
@@ -242,6 +252,10 @@ pub(crate) struct CloudSettings {
     sandbox_wanted: bool,
     /// The project's origin, once read.
     origin: Option<String>,
+    /// Whether the origin was read at all: "not read yet" is not "no origin".
+    origin_read: bool,
+    /// The form as it was offered, to tell whether there is anything to lose.
+    initial: Form,
     load_error: Option<String>,
     cs_base: Entity<Input>,
     cs_devcontainer: Entity<Input>,
@@ -252,6 +266,9 @@ pub(crate) struct CloudSettings {
     credentials: Vec<GitCredentialSummary>,
     credentials_loaded: bool,
     credentials_error: Option<String>,
+    credentials_gen: u64,
+    /// A credential to select once the newest read ends (an older read was superseded).
+    pending_select: Option<String>,
     docker_accounts: Vec<DockerAccountSummary>,
     docker_accounts_loaded: bool,
     docker_accounts_error: Option<String>,
@@ -259,9 +276,18 @@ pub(crate) struct CloudSettings {
     machines_gen: u64,
     ready: [Ready; 2],
     ready_gen: [u64; 2],
+    /// An edit changed what a finished checklist was computed for.
+    ready_stale: [bool; 2],
+    /// The newest `gh` state a Codespaces check found; the secrets block reuses it.
+    gh: Option<Gh>,
     infos: [DevcontainerInfo; 2],
+    infos_gen: u64,
     open_select: Option<Select>,
     error: Option<FieldError>,
+    /// Save is waiting for the Codespaces secrets to reach GitHub.
+    saving: bool,
+    /// "Replace token" was pressed with unsaved edits: asking before discarding them.
+    confirm_replace: bool,
     /// A fix waits for the Docker account's token (off the UI thread).
     fix_pending: bool,
     fix_gen: u64,
@@ -367,17 +393,23 @@ impl CloudSettings {
         events.push(cx.subscribe(&repo, |this, _, _: &input::Changed, cx| {
             this.repo_changed(cx)
         }));
-        for input in [
-            &cs_base,
-            &cs_devcontainer,
-            &cs_machine,
-            &sb_base,
-            &sb_devcontainer,
-        ] {
-            events.push(cx.subscribe(input, |this, _, _: &input::Changed, cx| {
+        // Only a path that a check or a hint reads is read again, and off the UI thread.
+        events.push(
+            cx.subscribe(&cs_devcontainer, |this, _, _: &input::Changed, cx| {
+                this.mark_stale(DefaultBackend::Codespace);
                 this.refresh_infos(cx);
                 cx.notify();
-            }));
+            }),
+        );
+        events.push(
+            cx.subscribe(&sb_devcontainer, |this, _, _: &input::Changed, cx| {
+                this.mark_stale(DefaultBackend::Sandbox);
+                this.refresh_infos(cx);
+                cx.notify();
+            }),
+        );
+        for input in [&cs_base, &cs_machine, &sb_base] {
+            events.push(cx.subscribe(input, |_, _, _: &input::Changed, cx| cx.notify()));
         }
         for input in [
             &repo,
@@ -390,6 +422,7 @@ impl CloudSettings {
             events.push(cx.subscribe(input, |this, _, _: &input::Submitted, cx| this.save(cx)));
         }
         let sandbox_baseline = form.sandbox.clone();
+        let initial = form.clone();
         let mut this = Self {
             project,
             name,
@@ -400,6 +433,8 @@ impl CloudSettings {
             sandbox_saved,
             sandbox_wanted: backend == Some(DefaultBackend::Sandbox) && !sandbox_saved,
             origin: None,
+            origin_read: false,
+            initial,
             load_error,
             cs_base,
             cs_devcontainer,
@@ -410,6 +445,8 @@ impl CloudSettings {
             credentials: Vec::new(),
             credentials_loaded: false,
             credentials_error: None,
+            credentials_gen: 0,
+            pending_select: None,
             docker_accounts: Vec::new(),
             docker_accounts_loaded: false,
             docker_accounts_error: None,
@@ -417,9 +454,14 @@ impl CloudSettings {
             machines_gen: 0,
             ready: [Ready::NotStarted, Ready::NotStarted],
             ready_gen: [0, 0],
+            ready_stale: [false, false],
+            gh: None,
             infos: [DevcontainerInfo::default(), DevcontainerInfo::default()],
+            infos_gen: 0,
             open_select: None,
             error: None,
+            saving: false,
+            confirm_replace: false,
             fix_pending: false,
             fix_gen: 0,
             fix_backend: None,
@@ -433,6 +475,32 @@ impl CloudSettings {
         this.read_origin(cx);
         this.tab_shown(cx);
         this
+    }
+
+    /// Whether leaving now would lose something typed or picked.
+    fn dirty(&self, cx: &App) -> bool {
+        self.typed(cx) != self.initial
+            || self
+                .secrets
+                .as_ref()
+                .is_some_and(|secrets| secrets.read(cx).has_typed(cx))
+    }
+
+    /// An edit changed what a checklist was computed for: its answer is dropped (or, when
+    /// already shown, marked "Changed: Check again"). No command runs on a keystroke.
+    fn mark_stale(&mut self, backend: DefaultBackend) {
+        let slot = ix(backend);
+        match self.ready[slot] {
+            Ready::NotStarted | Ready::Changed => {}
+            Ready::Checking => {
+                self.ready_gen[slot] += 1;
+                self.ready[slot] = Ready::Changed;
+            }
+            Ready::Done(_) => {
+                self.ready_gen[slot] += 1;
+                self.ready_stale[slot] = true;
+            }
+        }
     }
 
     #[cfg(test)]
@@ -461,13 +529,15 @@ impl CloudSettings {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.origin = found.clone();
+                this.origin_read = true;
                 if !this.sandbox_saved && this.repo.read(cx).content.trim().is_empty() {
                     let url = model::prefill_repo(found.as_deref());
                     if !url.is_empty() {
                         this.repo
                             .update(cx, |input, cx| input.set_text(url.clone(), cx));
                         // The prefill is not an edit of the user's.
-                        this.sandbox_baseline.repo_url = url;
+                        this.sandbox_baseline.repo_url = url.clone();
+                        this.initial.sandbox.repo_url = url;
                     }
                 }
                 this.refresh_infos(cx);
@@ -479,6 +549,12 @@ impl CloudSettings {
 
     /// Reads the saved Git credentials again, off the UI thread, and selects `select` if given.
     pub(crate) fn reload_credentials(&mut self, select: Option<String>, cx: &mut Context<Self>) {
+        // Only the newest read counts; a pick asked for by an older one is kept for it.
+        self.credentials_gen += 1;
+        let generation = self.credentials_gen;
+        if select.is_some() {
+            self.pending_select = select;
+        }
         let store = self.env.store.clone();
         cx.spawn(async move |this, cx| {
             let listed = cx
@@ -490,6 +566,10 @@ impl CloudSettings {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                if this.credentials_gen != generation {
+                    return;
+                }
+                let select = this.pending_select.take();
                 match listed {
                     Ok(list) => {
                         this.credentials = list;
@@ -543,6 +623,8 @@ impl CloudSettings {
 
     /// Lists the machine types of the project's repository, off the UI thread.
     fn load_machines(&mut self, cx: &mut Context<Self>) {
+        // What was typed in the text fallback is the machine now.
+        self.form.codespace.machine = self.typed(cx).codespace.machine;
         self.machines_gen += 1;
         let generation = self.machines_gen;
         self.machines = Machines::Loading;
@@ -569,6 +651,12 @@ impl CloudSettings {
                     Ok(_) => Machines::Failed("GitHub returned no machine types.".into()),
                     Err(message) => Machines::Failed(message),
                 };
+                if matches!(this.machines, Machines::Failed(_)) {
+                    // The text fallback starts from the machine picked so far.
+                    let text = this.form.codespace.machine.clone().unwrap_or_default();
+                    this.cs_machine
+                        .update(cx, |input, cx| input.set_text(text, cx));
+                }
                 cx.notify();
             });
         })
@@ -582,27 +670,35 @@ impl CloudSettings {
         self.ready_gen[slot] += 1;
         let generation = self.ready_gen[slot];
         self.ready[slot] = Ready::Checking;
+        self.ready_stale[slot] = false;
         cx.notify();
         let typed = self.typed(cx);
         let (env, project) = (self.env.clone(), self.project.clone());
         cx.spawn(async move |this, cx| {
-            let items = cx
+            let (items, gh) = cx
                 .background_executor()
                 .spawn(async move {
                     let root = Path::new(&project);
                     let origin = (env.origin)(root);
                     match backend {
-                        DefaultBackend::Codespace => readiness::codespace(
-                            env.gh.as_ref(),
-                            root,
-                            origin.as_deref(),
-                            &typed.codespace.devcontainer,
-                        ),
+                        DefaultBackend::Codespace => {
+                            // One `gh auth status`: the checklist and the secrets block
+                            // both use its answer.
+                            let auth = codespaces::auth_status(env.gh.as_ref());
+                            let gh = gh_state(auth.clone());
+                            let items = readiness::codespace_with_auth(
+                                auth,
+                                root,
+                                origin.as_deref(),
+                                &typed.codespace.devcontainer,
+                            );
+                            (items, Some(gh))
+                        }
                         DefaultBackend::Sandbox => {
                             let credentials = locked(&env.store)
                                 .ok()
                                 .and_then(|store| GitCredentials::for_store(&store).ok());
-                            readiness::sandbox(
+                            let items = readiness::sandbox(
                                 env.sbx.as_ref(),
                                 env.git.as_ref(),
                                 credentials.as_ref(),
@@ -615,7 +711,8 @@ impl CloudSettings {
                                     credential_id: typed.sandbox.credential_id.as_deref(),
                                     devcontainer_path: &typed.sandbox.devcontainer,
                                 },
-                            )
+                            );
+                            (items, None)
                         }
                     }
                 })
@@ -625,6 +722,12 @@ impl CloudSettings {
                     return;
                 }
                 this.ready[slot] = Ready::Done(items);
+                if let Some(gh) = gh {
+                    this.gh = Some(gh.clone());
+                    if let Some(secrets) = this.secrets.clone() {
+                        secrets.update(cx, |view, cx| view.refresh(gh, cx));
+                    }
+                }
                 cx.notify();
             });
         })
@@ -658,7 +761,19 @@ impl CloudSettings {
             claude: self.env.claude,
         };
         let project = self.project.clone();
-        self.secrets = Some(cx.new(|cx| SecretsView::new(project, env, cx)));
+        let secrets = cx.new(|cx| SecretsView::new(project, env, cx));
+        self._events.push(cx.subscribe(
+            &secrets,
+            |this, _, event: &SecretsEvent, cx| match event {
+                SecretsEvent::Submitted => this.save(cx),
+                SecretsEvent::SaveFinished { ok } => this.secrets_saved(*ok, cx),
+            },
+        ));
+        // The Ready check already ran `gh auth status`: reuse its answer, or wait for it.
+        if let Some(gh) = self.gh.clone() {
+            secrets.update(cx, |view, cx| view.refresh(gh, cx));
+        }
+        self.secrets = Some(secrets);
     }
 
     /// Re-checks what a fix was fixing. Called by the host when the fix terminal's command
@@ -667,10 +782,8 @@ impl CloudSettings {
         if let Some(backend) = self.fix_backend.take() {
             self.check_ready(backend, cx);
             if backend == DefaultBackend::Codespace {
+                // The secrets block follows the new check.
                 self.load_machines(cx);
-                if let Some(secrets) = self.secrets.clone() {
-                    secrets.update(cx, |view, cx| view.refresh(cx));
-                }
             }
         }
     }
@@ -694,19 +807,39 @@ impl CloudSettings {
         form
     }
 
-    fn refresh_infos(&mut self, cx: &App) {
-        let root = Path::new(&self.project);
+    /// Reads the devcontainer files again, off the UI thread; only the newest answer counts.
+    fn refresh_infos(&mut self, cx: &mut Context<Self>) {
+        self.infos_gen += 1;
+        let generation = self.infos_gen;
         let typed = self.typed(cx);
-        self.infos[0] = project_cloud::devcontainer_info(root, &typed.codespace.devcontainer);
         let local = self
             .origin
             .as_deref()
             .is_some_and(|origin| readiness::same_repository(origin, &typed.sandbox.repo_url));
-        self.infos[1] = if local {
-            project_cloud::devcontainer_info(root, &typed.sandbox.devcontainer)
-        } else {
-            DevcontainerInfo::default()
-        };
+        let root = PathBuf::from(&self.project);
+        let (codespace_path, sandbox_path) =
+            (typed.codespace.devcontainer, typed.sandbox.devcontainer);
+        cx.spawn(async move |this, cx| {
+            let infos = cx
+                .background_executor()
+                .spawn(async move {
+                    let codespace = project_cloud::devcontainer_info(&root, &codespace_path);
+                    let sandbox = if local {
+                        project_cloud::devcontainer_info(&root, &sandbox_path)
+                    } else {
+                        DevcontainerInfo::default()
+                    };
+                    [codespace, sandbox]
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.infos_gen == generation {
+                    this.infos = infos;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// A different host than the picked credential's drops the pick.
@@ -721,6 +854,7 @@ impl CloudSettings {
         {
             self.form.sandbox.credential_id = None;
         }
+        self.mark_stale(DefaultBackend::Sandbox);
         self.refresh_infos(cx);
         cx.notify();
     }
@@ -742,11 +876,7 @@ impl CloudSettings {
         self.tab_shown(cx);
     }
 
-    /// Validates both backends and stores them. Field errors stay in the dialog; success
-    /// closes it.
-    pub(crate) fn save(&mut self, cx: &mut Context<Self>) {
-        let form = self.typed(cx);
-        let sandbox_baseline = self.sandbox_baseline.clone();
+    fn validation_context<R>(&self, f: impl FnOnce(&model::Context<'_>) -> R) -> R {
         let ctx = model::Context {
             credentials: &self.credentials,
             credentials_loaded: self.credentials_loaded,
@@ -756,9 +886,98 @@ impl CloudSettings {
                 .then_some(self.docker_accounts.as_slice())
                 .filter(|_| self.docker_accounts_error.is_none()),
             sandbox_saved: self.sandbox_saved,
-            sandbox_baseline: &sandbox_baseline,
+            sandbox_baseline: &self.sandbox_baseline,
             sandbox_wanted: self.sandbox_wanted,
         };
+        f(&ctx)
+    }
+
+    /// Shows a save error. An error that belongs to a field brings its tab forward; a general
+    /// one (the store, the secrets) leaves the tab the user is on.
+    fn show_error(&mut self, error: FieldError, cx: &mut Context<Self>) {
+        if error.field != Field::General {
+            self.tab = error.backend;
+        }
+        self.error = Some(error);
+        self.tab_shown(cx);
+        cx.notify();
+    }
+
+    /// Validates both backends, saves the Codespaces secrets typed in the block, then stores
+    /// the settings. Field errors stay in the dialog; success closes it. When GitHub refuses
+    /// a secret nothing is stored and the dialog stays open with the error.
+    pub(crate) fn save(&mut self, cx: &mut Context<Self>) {
+        if self.saving {
+            return;
+        }
+        let form = self.typed(cx);
+        // Nothing is sent to GitHub for a form that would not be stored.
+        if let Err(error) = self.validation_context(|ctx| model::validate(&form, ctx)) {
+            self.show_error(error, cx);
+            return;
+        }
+        let start = match &self.secrets {
+            Some(secrets) if form.codespace.claude.is_none() => {
+                secrets.update(cx, |view, cx| view.begin_save(cx))
+            }
+            _ => SaveStart::Nothing,
+        };
+        match start {
+            SaveStart::Nothing => self.store_form(form, cx),
+            SaveStart::Started => {
+                self.saving = true;
+                self.error = None;
+                cx.notify();
+            }
+            SaveStart::Blocked(message) => self.show_error(
+                FieldError {
+                    backend: DefaultBackend::Codespace,
+                    field: Field::General,
+                    message,
+                },
+                cx,
+            ),
+        }
+    }
+
+    /// The Codespaces secrets save the dialog asked for ended.
+    fn secrets_saved(&mut self, ok: bool, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.saving) {
+            return;
+        }
+        if ok {
+            let form = self.typed(cx);
+            self.store_form(form, cx);
+        } else {
+            let message = self
+                .secrets
+                .as_ref()
+                .and_then(|secrets| secrets.read(cx).error_text())
+                .unwrap_or_else(|| "The Codespaces secrets could not be saved.".into());
+            self.show_error(
+                FieldError {
+                    backend: DefaultBackend::Codespace,
+                    field: Field::General,
+                    message: format!("Nothing was saved. {message}"),
+                },
+                cx,
+            );
+        }
+    }
+
+    /// Writes the validated settings and closes the dialog. A form still exactly as it was
+    /// offered writes nothing: Save without an edit must not invent a stored default.
+    fn store_form(&mut self, form: Form, cx: &mut Context<Self>) {
+        if form == self.initial && !self.sandbox_wanted {
+            if let Err(error) = self.validation_context(|ctx| model::validate(&form, ctx)) {
+                self.show_error(error, cx);
+                return;
+            }
+            self.error = None;
+            cx.emit(Event::Saved);
+            cx.emit(Event::Close);
+            return;
+        }
         // The settings are small and live in the native store like the app's other
         // settings, so they are written on the UI thread.
         let result = locked(&self.env.store)
@@ -767,7 +986,9 @@ impl CloudSettings {
                 field: Field::General,
                 message,
             })
-            .and_then(|store| model::save(&store, &self.project, &form, &ctx));
+            .and_then(|store| {
+                self.validation_context(|ctx| model::save(&store, &self.project, &form, ctx))
+            });
         match result {
             Ok(saved) => {
                 self.sandbox_saved = saved.sandbox.is_some();
@@ -777,11 +998,8 @@ impl CloudSettings {
                 cx.emit(Event::Close);
             }
             Err(error) => {
-                self.tab = error.backend;
                 self.form = form;
-                self.error = Some(error);
-                self.tab_shown(cx);
-                cx.notify();
+                self.show_error(error, cx);
             }
         }
     }
@@ -932,7 +1150,13 @@ impl CloudSettings {
         self.error = None;
         match pick {
             Pick::Default(backend) => self.form.default_backend = Some(backend),
-            Pick::Machine(machine) => self.form.codespace.machine = machine,
+            Pick::Machine(machine) => {
+                // Also in the text fallback, so a failed reload cannot bring the old one back.
+                let text = machine.clone().unwrap_or_default();
+                self.cs_machine
+                    .update(cx, |input, cx| input.set_text(text, cx));
+                self.form.codespace.machine = machine;
+            }
             Pick::Size(cpus, memory) => {
                 self.form.sandbox.cpus = cpus;
                 self.form.sandbox.memory = memory;
@@ -947,7 +1171,16 @@ impl CloudSettings {
             }
             Pick::Claude(account) => {
                 match self.tab {
-                    DefaultBackend::Codespace => self.form.codespace.claude = account,
+                    DefaultBackend::Codespace => {
+                        // Leaving "Codespaces secret" ends a running `claude setup-token`:
+                        // a token it prints later must not be saved as that secret.
+                        if account.is_some()
+                            && let Some(secrets) = self.secrets.clone()
+                        {
+                            secrets.update(cx, |view, cx| view.stop_generating(cx));
+                        }
+                        self.form.codespace.claude = account;
+                    }
                     DefaultBackend::Sandbox => self.form.sandbox.claude = account,
                 }
                 self.ensure_secrets(cx);
@@ -986,6 +1219,14 @@ impl CloudSettings {
         }
         let line = match fix {
             Fix::ReplaceToken => {
+                // Settings opens over nothing of this dialog: unsaved edits would be lost, so
+                // ask first.
+                if self.dirty(cx) && !self.confirm_replace {
+                    self.confirm_replace = true;
+                    cx.notify();
+                    return;
+                }
+                self.confirm_replace = false;
                 cx.emit(Event::ReplaceDockerToken);
                 return;
             }
@@ -1044,6 +1285,17 @@ impl CloudSettings {
         .detach();
     }
 
+    /// Closes an open select or the discard question; true when something was closed. Escape
+    /// does this before it closes the dialog.
+    pub(crate) fn dismiss_transient(&mut self, cx: &mut Context<Self>) -> bool {
+        let open = self.open_select.take().is_some();
+        let asked = std::mem::take(&mut self.confirm_replace);
+        if open || asked {
+            cx.notify();
+        }
+        open || asked
+    }
+
     /// The embedded `claude setup-token` terminal has the keyboard: Escape belongs to it.
     pub(crate) fn terminal_focused(&self, window: &Window, cx: &App) -> bool {
         self.secrets
@@ -1057,7 +1309,10 @@ impl CloudSettings {
         self.ready_gen = [self.ready_gen[0] + 1, self.ready_gen[1] + 1];
         self.machines_gen += 1;
         self.fix_gen += 1;
+        self.infos_gen += 1;
+        self.credentials_gen += 1;
         self.fix_pending = false;
+        self.saving = false;
         if let Some(secrets) = self.secrets.take() {
             secrets.update(cx, |view, cx| view.shutdown(cx));
         }
@@ -1076,6 +1331,19 @@ impl CloudSettings {
             _ => &self.cs_machine,
         };
         input.update(cx, |input, cx| input.set_text(text.to_owned(), cx));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn select_open(&self) -> bool {
+        self.open_select.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn secret_text(&self, cx: &App) -> String {
+        self.secrets
+            .as_ref()
+            .map(|secrets| secrets.read(cx).first_field_text(cx))
+            .unwrap_or_default()
     }
 
     #[cfg(test)]
@@ -1242,7 +1510,8 @@ impl CloudSettings {
 
     fn ready_section(&self, cx: &mut Context<Self>) -> Div {
         let backend = self.tab;
-        let state = &self.ready[ix(backend)];
+        let slot = ix(backend);
+        let state = &self.ready[slot];
         let checking = matches!(state, Ready::Checking | Ready::NotStarted);
         let busy = checking || self.fix_pending || self.fix_backend.is_some();
         let mut column = div().flex().flex_col().gap(px(6.));
@@ -1275,7 +1544,8 @@ impl CloudSettings {
                         .child("Check again"),
                 ),
         );
-        column = column.child(muted("Checked when this tab opens and before every start"));
+        column = column.child(muted(READY_NOTE));
+        let changed = matches!(state, Ready::Changed) || self.ready_stale[slot];
         match state {
             Ready::NotStarted | Ready::Checking => {
                 column = column.child(
@@ -1287,75 +1557,147 @@ impl CloudSettings {
                         .child("Checking..."),
                 );
             }
+            Ready::Changed => {}
             Ready::Done(items) => {
-                for item in items {
-                    column = column.child(self.ready_item(item, busy, cx));
-                }
+                column = column.child(self.ready_row(items, busy, cx));
             }
+        }
+        if changed {
+            column = column.child(
+                div()
+                    .id("cloud-ready-changed")
+                    .debug_selector(|| "cloud-ready-changed".into())
+                    .text_size(px(11.5))
+                    .text_color(rgb(AMBER))
+                    .child(READY_CHANGED),
+            );
+        }
+        if self.confirm_replace {
+            column = column.child(
+                div()
+                    .id("cloud-replace-confirm")
+                    .debug_selector(|| "cloud-replace-confirm".into())
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(12.))
+                            .text_color(rgb(AMBER))
+                            .child(REPLACE_CONFIRM),
+                    )
+                    .child(
+                        secondary_button("cloud-replace-discard", "Discard and open", true, false)
+                            .child("Discard and open")
+                            .debug_selector(|| "cloud-replace-discard".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.confirm_replace = false;
+                                cx.emit(Event::ReplaceDockerToken);
+                            })),
+                    )
+                    .child(
+                        secondary_button("cloud-replace-keep", "Keep editing", false, false)
+                            .child("Keep editing")
+                            .debug_selector(|| "cloud-replace-keep".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.confirm_replace = false;
+                                cx.notify();
+                            })),
+                    ),
+            );
         }
         column
     }
 
-    fn ready_item(&self, item: &Item, busy: bool, cx: &mut Context<Self>) -> Div {
+    /// The text of a checklist chip. A working Docker account is named by its Docker ID.
+    fn chip_text(&self, item: &Item) -> String {
+        if item.id == readiness::Id::DockerAccount
+            && item.state == State::Ok
+            && let Some(id) = &self.form.sandbox.docker_account
+            && let Some(account) = self.docker_accounts.iter().find(|a| &a.id == id)
+        {
+            return format!("Docker account {}", account.docker_id);
+        }
+        item.text.clone()
+    }
+
+    /// The checklist as chips that wrap, with the fixes at the end of the row.
+    fn ready_row(&self, items: &[Item], busy: bool, cx: &mut Context<Self>) -> Div {
         let backend = self.tab;
-        let (mark, colour) = match item.state {
-            State::Ok => ("\u{2713}", rgb(GREEN)),
-            State::Problem => ("!", rgb(AMBER)),
-            State::Unknown => ("\u{2026}", rgb(0x9ca3af)),
-        };
-        let key = item.id.key();
-        let row_id: SharedString = format!("cloud-ready-{key}").into();
-        let mut row = div()
+        let mut chips = div().min_w_0().flex_1().flex().flex_wrap().gap(px(6.));
+        let mut fixes = div().flex_shrink_0().flex().flex_col().gap(px(4.));
+        for item in items {
+            let (mark, colour) = match item.state {
+                State::Ok => ("\u{2713}", rgb(GREEN)),
+                State::Problem => ("!", rgb(AMBER)),
+                State::Unknown => ("\u{2026}", rgb(0x9ca3af)),
+            };
+            let key = item.id.key();
+            let row_id: SharedString = format!("cloud-ready-{key}").into();
+            chips = chips.child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap(px(5.))
+                    .px(px(8.))
+                    .py(px(3.))
+                    .rounded_md()
+                    .bg(content(0.05))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(12.))
+                            .text_color(colour)
+                            .child(mark),
+                    )
+                    .child(
+                        div()
+                            .id(ElementId::from(row_id.clone()))
+                            .debug_selector({
+                                let selector = row_id.to_string();
+                                move || selector.clone()
+                            })
+                            .min_w_0()
+                            .text_size(px(12.))
+                            .line_height(px(18.))
+                            .text_color(if item.state == State::Ok {
+                                content(0.8)
+                            } else {
+                                content(0.95)
+                            })
+                            .child(self.chip_text(item)),
+                    ),
+            );
+            if let Some(fix) = item.fix {
+                let label = match fix {
+                    Fix::ReplaceToken => "Replace token",
+                    Fix::Command(_) => "Fix",
+                };
+                let id: SharedString = format!("cloud-fix-{key}").into();
+                fixes = fixes.child(
+                    secondary_button(ElementId::from(id.clone()), label, false, busy)
+                        .child(label)
+                        .debug_selector({
+                            let selector = id.to_string();
+                            move || selector.clone()
+                        })
+                        .when(!busy, |b| {
+                            b.on_click(
+                                cx.listener(move |this, _, _, cx| this.run_fix(backend, fix, cx)),
+                            )
+                        }),
+                );
+            }
+        }
+        div()
             .flex()
             .items_start()
-            .gap_2()
-            .child(
-                div()
-                    .w(px(14.))
-                    .flex_shrink_0()
-                    .text_size(px(12.))
-                    .text_color(colour)
-                    .child(mark),
-            )
-            .child(
-                div()
-                    .id(ElementId::from(row_id.clone()))
-                    .debug_selector({
-                        let selector = row_id.to_string();
-                        move || selector.clone()
-                    })
-                    .min_w_0()
-                    .flex_1()
-                    .text_size(px(12.))
-                    .line_height(px(18.))
-                    .text_color(if item.state == State::Ok {
-                        content(0.8)
-                    } else {
-                        content(0.95)
-                    })
-                    .child(item.text.clone()),
-            );
-        if let Some(fix) = item.fix {
-            let label = match fix {
-                Fix::ReplaceToken => "Replace token",
-                Fix::Command(_) => "Fix",
-            };
-            let id: SharedString = format!("cloud-fix-{key}").into();
-            row = row.child(
-                secondary_button(ElementId::from(id.clone()), label, false, busy)
-                    .child(label)
-                    .debug_selector({
-                        let selector = id.to_string();
-                        move || selector.clone()
-                    })
-                    .when(!busy, |b| {
-                        b.on_click(
-                            cx.listener(move |this, _, _, cx| this.run_fix(backend, fix, cx)),
-                        )
-                    }),
-            );
-        }
-        row
+            .justify_between()
+            .gap_3()
+            .child(chips)
+            .child(fixes)
     }
 
     fn input_row(
@@ -1373,13 +1715,19 @@ impl CloudSettings {
             .children(self.error_for(backend, field))
     }
 
+    /// What the Codespaces Repository row says: the GitHub repository, or why there is none.
+    fn codespace_repo_text(&self) -> String {
+        match (&self.origin, self.origin_read) {
+            (Some(origin), _) => codespaces::repo_from_remote(origin)
+                .unwrap_or_else(|| "The origin is not a GitHub repository".into()),
+            (None, true) => "The project has no git origin.".into(),
+            (None, false) => "Reading the project's origin...".into(),
+        }
+    }
+
     fn codespace_workspace(&mut self, cx: &mut Context<Self>) -> Div {
         let cs = DefaultBackend::Codespace;
-        let repo_text = match &self.origin {
-            Some(origin) => codespaces::repo_from_remote(origin)
-                .unwrap_or_else(|| "The origin is not a GitHub repository".into()),
-            None => "Reading the project's origin...".into(),
-        };
+        let repo_text = self.codespace_repo_text();
         let mut column = div().flex().flex_col().gap_3().child(
             labelled("Repository").child(
                 div()
@@ -1677,15 +2025,24 @@ impl Render for CloudSettings {
             let current = self.current_label(Select::Default, cx);
             div()
                 .flex()
-                .flex_col()
-                .gap(px(6.))
+                .flex_1()
+                .min_w_0()
+                .items_start()
+                .justify_end()
+                .gap_2()
                 .child(
                     div()
-                        .text_size(px(12.))
-                        .font_weight(FontWeight::MEDIUM)
+                        .min_w_0()
+                        .pt(px(8.))
+                        .text_size(px(11.5))
+                        .text_color(content(0.6))
                         .child("Default for new cloud sessions"),
                 )
-                .child(self.select(Select::Default, current, cx))
+                .child(div().w(px(150.)).flex_shrink_0().child(self.select(
+                    Select::Default,
+                    current,
+                    cx,
+                )))
         };
         let subtitle = format!(
             "{} \u{b7} {}",
@@ -1707,14 +2064,22 @@ impl Render for CloudSettings {
             .child(
                 div()
                     .flex()
-                    .p(px(2.))
-                    .gap(px(2.))
-                    .rounded_lg()
-                    .bg(content(0.05))
-                    .child(self.segment(DefaultBackend::Codespace, "Codespaces", cx))
-                    .child(self.segment(DefaultBackend::Sandbox, "Docker Sandbox", cx)),
+                    .items_start()
+                    .gap_3()
+                    .child(
+                        div()
+                            .w(px(210.))
+                            .flex_shrink_0()
+                            .flex()
+                            .p(px(2.))
+                            .gap(px(2.))
+                            .rounded_lg()
+                            .bg(content(0.05))
+                            .child(self.segment(DefaultBackend::Codespace, "Codespaces", cx))
+                            .child(self.segment(DefaultBackend::Sandbox, "Docker Sandbox", cx)),
+                    )
+                    .child(default_select),
             )
-            .child(default_select)
             .child(rule())
             .child(self.ready_section(cx))
             .child(rule())
@@ -1784,10 +2149,13 @@ impl Render for CloudSettings {
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::Close))),
                     )
                     .child(
-                        modal::primary_button("cloud-save", "Save")
-                            .debug_selector(|| "cloud-save".into())
-                            .cursor_pointer()
-                            .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                        modal::primary_button(
+                            "cloud-save",
+                            if self.saving { "Saving..." } else { "Save" },
+                        )
+                        .debug_selector(|| "cloud-save".into())
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
                     ),
             );
         div()
@@ -1804,7 +2172,10 @@ impl Render for CloudSettings {
             .text_color(content(1.))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" && !this.terminal_focused(window, cx) {
-                    cx.emit(Event::Close);
+                    // An open select closes first; the dialog stays.
+                    if !this.dismiss_transient(cx) {
+                        cx.emit(Event::Close);
+                    }
                     window.prevent_default();
                     cx.stop_propagation();
                 }
