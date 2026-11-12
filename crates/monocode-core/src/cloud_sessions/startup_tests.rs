@@ -1483,4 +1483,46 @@ mod claude_account {
             })
         );
     }
+
+    #[test]
+    fn a_kept_override_is_validated_instead_of_the_projects_account() {
+        let (store, _dir, usable, empty) = store_with_accounts();
+        let f = fx_in(Gh::new(&["Shutdown"], &[]), store);
+        // The project now chooses an account that cannot be used, but the codespace keeps
+        // the override it was started with, which can: the start must go through.
+        choose(&f, Some(&empty));
+        let key = claude_pin::codespace_key("octo-abc");
+        let mine = ClaudePin {
+            account: Some(usable.clone()),
+            pinned: true,
+        };
+        claude_pin::write(&f.store.lock().unwrap(), &key, &mine).unwrap();
+        f.svc.begin_start("/p", named_target(), "claude").unwrap();
+        assert_eq!(pin_of(&f, "octo-abc"), Some(mine));
+        // An override whose account is gone fails with the session's own wording.
+        claude_pin::write(
+            &f.store.lock().unwrap(),
+            &key,
+            &ClaudePin {
+                account: Some("account-deleted".into()),
+                pinned: true,
+            },
+        )
+        .unwrap();
+        let error = f
+            .svc
+            .begin_start("/p", named_target(), "claude")
+            .unwrap_err();
+        assert!(
+            error.starts_with("This cloud session uses Claude account"),
+            "{error}"
+        );
+        // Without an override the project's unusable account still fails the start.
+        claude_pin::clear(&f.store.lock().unwrap(), &key).unwrap();
+        let error = f
+            .svc
+            .begin_start("/p", named_target(), "claude")
+            .unwrap_err();
+        assert!(error.contains("Cloud settings"), "{error}");
+    }
 }

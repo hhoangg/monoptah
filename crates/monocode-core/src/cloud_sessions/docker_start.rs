@@ -391,6 +391,31 @@ impl SandboxSecrets for StoreSecrets {
     }
 }
 
+impl CloudSessions {
+    /// The Claude credential of the account a sandbox start or reconnect runs under. A chosen
+    /// account that is gone or has no token is an error naming it (never a silent start
+    /// without a credential, the sandbox's equivalent of a codespace falling back to its
+    /// secret); no account chosen is `None`.
+    pub(super) fn required_claude_auth(
+        &self,
+        secrets: &dyn SandboxSecrets,
+        account: Option<&str>,
+        pinned: bool,
+    ) -> Result<Option<ClaudeAuth>, String> {
+        let Some(account) = account else {
+            return Ok(None);
+        };
+        match secrets.claude_auth(Some(account))? {
+            Some(auth) => Ok(Some(auth)),
+            None => Err(claude_pin::missing_auth_error(
+                &*self.store()?,
+                account,
+                pinned,
+            )),
+        }
+    }
+}
+
 /// Masks every secret this run holds, plus anything that looks like one, in text that may be
 /// shown or stored.
 struct Scrub(Vec<Zeroizing<String>>);
@@ -1016,7 +1041,14 @@ impl CloudSessions {
             .config
             .clone();
         // Secrets are read once, up front, and only kept to be masked in what we show.
-        let auth = deps.secrets.claude_auth(config.claude_account.as_deref())?;
+        let auth = self.required_claude_auth(
+            &*deps.secrets,
+            config.claude_account.as_deref(),
+            record
+                .sandbox_start
+                .as_ref()
+                .is_some_and(|start| start.claude_pinned),
+        )?;
         let payload = match &config.credential_id {
             Some(credential) => Some(deps.secrets.git_payload(credential, &config.repo_url)?),
             None => None,

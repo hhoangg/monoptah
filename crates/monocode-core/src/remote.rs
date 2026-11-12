@@ -143,33 +143,62 @@ impl Connections {
             .insert(codespace.to_owned(), fingerprint);
     }
 
+    fn delivered_fingerprint(&self, codespace: &str) -> Option<String> {
+        self.claude_delivered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(codespace)
+            .cloned()
+            .flatten()
+    }
+
+    /// True when the account codespace `name` should run under differs from the one its Host
+    /// was last bootstrapped with. A chosen account that cannot be used counts as "no change"
+    /// here: a Host that is already running keeps working, and the error surfaces where a
+    /// bootstrap needs the credential. The account id is compared first; the credential is
+    /// only read when the id is the delivered one (a replaced token is a change too).
+    fn claude_account_changed(
+        &self,
+        resolver: &dyn codespace_claude::CodespaceClaude,
+        name: &str,
+    ) -> bool {
+        let delivered = self.delivered_fingerprint(name);
+        let Ok(wanted) = resolver.account_id(name) else {
+            return false;
+        };
+        let delivered_id = delivered
+            .as_deref()
+            .and_then(|fingerprint| fingerprint.rsplit_once(':'))
+            .map(|(id, _)| id);
+        match (wanted.as_deref(), delivered_id) {
+            (None, None) => false,
+            (Some(wanted), Some(held)) if wanted == held => resolver
+                .resolve(name)
+                .map(|now| codespace_claude::fingerprint_of(now.as_ref()) != delivered)
+                .unwrap_or(false),
+            _ => true,
+        }
+    }
+
     /// True when the account a connected codespace should run under differs from the one its
     /// Host was last bootstrapped with and nothing runs on that Host (a running turn is never
-    /// restarted: the change then waits for the next ensure). `Err` when the chosen account
-    /// cannot be used.
-    fn claude_account_stale(&self, machine_id: &str) -> Result<bool, String> {
+    /// restarted: the change then waits for the next ensure). Never an error: see
+    /// [`Self::claude_account_changed`].
+    fn claude_account_stale(&self, machine_id: &str) -> bool {
         let Some(resolver) = self.codespace_claude() else {
-            return Ok(false);
+            return false;
         };
         let Some(name) = self
-            .stored_machine(machine_id)?
+            .stored_machine(machine_id)
+            .ok()
+            .flatten()
             .and_then(|m| m.ssh)
             .and_then(|t| t.codespace)
         else {
-            return Ok(false);
+            return false;
         };
-        let wanted = codespace_claude::fingerprint_of(resolver.resolve(&name)?.as_ref());
-        let delivered = self
-            .claude_delivered
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&name)
-            .cloned()
-            .flatten();
-        if wanted == delivered {
-            return Ok(false);
-        }
-        Ok(!self.host_busy(machine_id).unwrap_or(true))
+        self.claude_account_changed(&*resolver, &name)
+            && !self.host_busy(machine_id).unwrap_or(true)
     }
 
     fn store_path(&self) -> PathBuf {
@@ -985,6 +1014,12 @@ impl Connections {
             // Codespaces secret). A chosen account that cannot be used fails the job, and no
             // text the job reports carries the credential.
             let resolved = state.claude_delivery_for(&target);
+            // Sends to a live Host held back while its account changes (released when the job
+            // ends, after the new tunnel is in place).
+            let mut hold: Option<cloud_upgrade::SendHold> = None;
+            if let Ok(Some(delivery)) = &resolved {
+                job.add_mask(&delivery.prelude, &delivery.secret);
+            }
             let prepared = (|| -> Result<(StoredMachine, Tunnel, Value), String> {
                 let askpass = job.askpass()?;
                 let mut target = target;
@@ -999,8 +1034,25 @@ impl Connections {
                         );
                     }
                 };
+                // A live Host whose account changes is restarted by the bootstrap, so it
+                // follows the busy rule of the Host upgrade: hold sends back, look again, and
+                // leave a Host with a running turn as it is (the change waits for the next
+                // reconnect). A Host that does not answer is bootstrapped as always.
+                let mut leave_host = false;
+                if let (Some(existing), false, Some(name)) =
+                    (existing.as_ref(), upgrade, target.codespace.as_deref())
+                {
+                    let changed = codespace_claude::fingerprint_of(delivery.as_ref())
+                        != state.delivered_fingerprint(name);
+                    if changed && state.host_answers(&existing.id) {
+                        match state.hold_sends_if_idle(&existing.id) {
+                            Some(taken) => hold = Some(taken),
+                            None => leave_host = true,
+                        }
+                    }
+                }
                 let mut machine = if let Some(mut existing) = existing {
-                    if upgrade || cloud {
+                    if (upgrade || cloud) && !leave_host {
                         // A codespace or sandbox may have stopped, which also stopped its
                         // host. gh starts it on connect, and the bootstrap's
                         // service install brings the host back with its saved
@@ -1016,11 +1068,27 @@ impl Connections {
                         let script = if upgrade {
                             let script = ssh::upgrade_script(platform, target.remote_port);
                             match prelude.filter(|_| platform == ssh::HostPlatform::Unix) {
-                                Some(prelude) => format!("{prelude}\n{script}"),
+                                // Track the token like the bootstrap does, so the marker of
+                                // the account the Host now runs under is written.
+                                Some(prelude) => {
+                                    format!("{prelude}\nMONOCODE_HOST_TRACK_TOKEN=1\n{script}")
+                                }
                                 None => script,
                             }
                         } else {
-                            cloud_or_plain_bootstrap(&target, platform, prelude)
+                            let script = cloud_or_plain_bootstrap(&target, platform, prelude);
+                            // A codespace that stops using an app account: see the pre-step.
+                            if prelude.is_none()
+                                && platform == ssh::HostPlatform::Unix
+                                && target
+                                    .codespace
+                                    .as_deref()
+                                    .is_some_and(|name| state.delivered_fingerprint(name).is_some())
+                            {
+                                format!("{}{script}", ssh::codespace_stop_host_prestep())
+                            } else {
+                                script
+                            }
                         };
                         let output = ssh::run_script(&target, platform, script, &job, &askpass)?;
                         note_delivered(&target);
@@ -1148,6 +1216,7 @@ impl Connections {
                 state.tunnels.insert(machine.id.clone(), tunnel);
                 Ok(machine.public())
             });
+            drop(hold);
         });
         Ok(id)
     }
@@ -1344,7 +1413,7 @@ impl Connections {
                 // Connected. Unless the project's Claude account changed since the Host was
                 // bootstrapped (and nothing runs on it): the next ensure applies it.
                 Ok(_) => {
-                    if !self.claude_account_stale(machine_id)? {
+                    if !self.claude_account_stale(machine_id) {
                         return Ok(());
                     }
                     "Claude account"

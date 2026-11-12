@@ -1012,6 +1012,9 @@ impl CloudSessions {
         if let CodespaceChoice::Named(name) = &target.codespace {
             self.refuse_while_cleaning(&CloudRef::codespace(name))?;
         }
+        // The Claude account of this codespace, validated before one is created for it.
+        let claude = self.codespace_start_pin(local_cwd, &target)?;
+        claude.validate(&*self.store()?)?;
         let resolved = self.resolve_codespace(local_cwd, target, progress)?;
         if resolved.created {
             *created = Some(resolved.name.clone());
@@ -1027,6 +1030,8 @@ impl CloudSessions {
             )?;
         }
         self.invalidate(&resolved.name);
+        // Pinned before the project is opened, so its first pairing already uses the account.
+        claude.write(&*self.store()?, &resolved.name)?;
         let (binding, _) = open_project(
             &*self.backend(CloudBackendKind::Codespaces)?,
             &*self.host,

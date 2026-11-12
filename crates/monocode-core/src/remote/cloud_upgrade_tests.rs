@@ -22,6 +22,10 @@ struct HostState {
     sessions_fail: bool,
     /// A `commands.dispatch` starts a turn right away and answers only after this many ms.
     dispatch_delay_ms: u64,
+    /// How many `sessions.list` calls were answered, and the call from which a turn runs
+    /// (a turn that starts between two looks at the Host).
+    list_calls: usize,
+    running_from_list_call: Option<usize>,
 }
 
 struct FakeHost {
@@ -46,6 +50,8 @@ impl FakeHost {
             sessions,
             sessions_fail: false,
             dispatch_delay_ms: 0,
+            list_calls: 0,
+            running_from_list_call: None,
         }));
         let calls = Arc::new(Mutex::new(vec![]));
         let stop = Arc::new(AtomicBool::new(false));
@@ -82,6 +88,15 @@ impl FakeHost {
                 calls2.lock().unwrap().push(method.clone());
                 let mut state = state2.lock().unwrap();
                 let mut delay = 0;
+                if method == "sessions.list" {
+                    state.list_calls += 1;
+                    if state
+                        .running_from_list_call
+                        .is_some_and(|n| state.list_calls >= n)
+                    {
+                        state.sessions = vec!["running"];
+                    }
+                }
                 if method == "commands.dispatch" && state.dispatch_delay_ms > 0 {
                     // The turn starts on the Host at once; the answer comes later.
                     state.sessions = vec!["running"];
@@ -995,6 +1010,8 @@ mod claude_account {
     struct Chosen {
         account: Mutex<Option<(&'static str, &'static str)>>,
         error: Mutex<Option<String>>,
+        /// How often the credential itself was read.
+        resolves: AtomicUsize,
     }
     impl Chosen {
         fn set(&self, account: Option<(&'static str, &'static str)>) {
@@ -1010,8 +1027,16 @@ mod claude_account {
         }
     }
     impl CodespaceClaude for Chosen {
+        fn account_id(&self, codespace: &str) -> Result<Option<String>, String> {
+            assert_eq!(codespace, "cs");
+            if let Some(error) = self.error.lock().unwrap().clone() {
+                return Err(error);
+            }
+            Ok(self.account.lock().unwrap().map(|(id, _)| id.to_owned()))
+        }
         fn resolve(&self, codespace: &str) -> Result<Option<ClaudeDelivery>, String> {
             assert_eq!(codespace, "cs");
+            self.resolves.fetch_add(1, Ordering::SeqCst);
             if let Some(error) = self.error.lock().unwrap().clone() {
                 return Err(error);
             }
@@ -1326,13 +1351,19 @@ else:
         // And that is applied once.
         connections.ensure_codespace(&id).unwrap();
         assert_eq!(runs(), after_pairing + 1);
-        // Back to the Codespaces secret: one more bootstrap, now without the prelude.
+        // Back to the Codespaces secret: one more bootstrap, now without the prelude. It first
+        // stops the Host (a codespace without the secret has no token for the bootstrap to
+        // notice, so the old account's credential would stay in the Host's environment).
         chosen.set(None);
         connections.ensure_codespace(&id).unwrap();
         assert_eq!(runs(), after_pairing + 2);
         assert_eq!(
             gh.scripts().last().unwrap(),
-            &ssh::codespace_bootstrap_script()
+            &format!(
+                "{}{}",
+                ssh::codespace_stop_host_prestep(),
+                ssh::codespace_bootstrap_script()
+            )
         );
         connections.ensure_codespace(&id).unwrap();
         assert_eq!(runs(), after_pairing + 2);
@@ -1388,5 +1419,192 @@ else:
             "no ssh, so no fallback to the secret"
         );
         assert_eq!(gh.argv_log(), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leaving_an_account_stops_the_host_first_and_is_only_recorded_once_that_succeeded() {
+        let chosen = Arc::new(Chosen::default());
+        chosen.set(Some(("work", SECRET_A)));
+        let Some((gh, _host, connections, _dir, id)) = paired(&chosen) else {
+            eprintln!("SKIPPED: python3 not found");
+            return;
+        };
+        let prestep = ssh::codespace_stop_host_prestep();
+        // The step stops the Host's service and forgets the token marker, so the same account
+        // chosen again later restarts the Host too.
+        assert!(prestep.contains("service uninstall"), "{prestep}");
+        assert!(prestep.contains("rm -f \"$HOME/.monocode-host/host-token.sha256\""));
+        let runs = gh.scripts().len();
+        // The switch fails on the machine: the old account stays recorded, and the next ensure
+        // does the whole step again.
+        chosen.set(None);
+        std::fs::write(gh.dir.path().join("fail"), "").unwrap();
+        assert!(connections.ensure_codespace(&id).is_err());
+        std::fs::remove_file(gh.dir.path().join("fail")).unwrap();
+        connections.ensure_codespace(&id).unwrap();
+        let scripts = gh.scripts();
+        assert_eq!(scripts.len(), runs + 2);
+        for script in &scripts[runs..] {
+            assert!(script.starts_with(prestep), "stops the Host first");
+            assert!(script.ends_with(&ssh::codespace_bootstrap_script()));
+            assert!(!script.contains(SECRET_A));
+        }
+        // Recorded now: nothing more to do, and a wake of a codespace that never had an
+        // account is the bare bootstrap again.
+        connections.ensure_codespace(&id).unwrap();
+        assert_eq!(gh.scripts().len(), runs + 2);
+        connections.tunnels.clear();
+        connections.ensure_codespace(&id).unwrap();
+        assert_eq!(
+            gh.scripts().last().unwrap(),
+            &ssh::codespace_bootstrap_script()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_turn_that_starts_after_the_look_keeps_its_host_and_the_next_ensure_applies_the_change() {
+        let chosen = Arc::new(Chosen::default());
+        chosen.set(Some(("work", SECRET_A)));
+        let Some((gh, host, connections, _dir, id)) = paired(&chosen) else {
+            eprintln!("SKIPPED: python3 not found");
+            return;
+        };
+        let before = gh.scripts().len();
+        chosen.set(Some(("other", SECRET_B)));
+        // The Host looks idle to the ensure; by the look under the send hold (the second
+        // `sessions.list`) a turn has started.
+        host.set(|state| {
+            state.list_calls = 0;
+            state.running_from_list_call = Some(2);
+        });
+        connections.ensure_codespace(&id).unwrap();
+        assert_eq!(
+            gh.scripts().len(),
+            before,
+            "the turn's Host was not restarted"
+        );
+        assert!(
+            connections.gate(&id).enter().is_ok(),
+            "sends are released again"
+        );
+        // A reconnect of the live Host (Settings, a move, a convert) follows the same rule.
+        let view = wait(&connections, connections.codespace_reconnect(&id).unwrap());
+        assert_eq!(view.error, None);
+        assert_eq!(gh.scripts().len(), before, "still left alone");
+        // Nothing runs any more: the next ensure applies it.
+        host.set(|state| {
+            state.running_from_list_call = None;
+            state.sessions = vec!["idle"];
+        });
+        connections.ensure_codespace(&id).unwrap();
+        assert_eq!(gh.scripts().len(), before + 1);
+        assert_eq!(
+            gh.scripts().last().unwrap(),
+            &ssh::codespace_bootstrap_script_with(Some(&delivery("other", SECRET_B).prelude))
+        );
+        assert!(connections.gate(&id).enter().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unusable_account_does_not_block_a_connected_host_but_fails_a_wake() {
+        let chosen = Arc::new(Chosen::default());
+        chosen.set(Some(("work", SECRET_A)));
+        let Some((gh, _host, connections, _dir, id)) = paired(&chosen) else {
+            eprintln!("SKIPPED: python3 not found");
+            return;
+        };
+        let runs = gh.scripts().len();
+        let message = "This cloud session uses Claude account \"Work\", which is no longer available. Start a new cloud session or add the account back.";
+        *chosen.error.lock().unwrap() = Some(message.into());
+        // Connected: a send still goes through (the ensure is a no-op).
+        connections.ensure_codespace(&id).unwrap();
+        assert_eq!(gh.scripts().len(), runs);
+        // A wake needs the credential: it fails with the account's message.
+        connections.tunnels.clear();
+        assert_eq!(
+            connections.ensure_codespace(&id).unwrap_err(),
+            message.to_owned()
+        );
+        assert_eq!(gh.scripts().len(), runs, "nothing ran on the machine");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_credential_is_only_read_when_the_account_is_the_one_delivered() {
+        let chosen = Arc::new(Chosen::default());
+        chosen.set(Some(("work", SECRET_A)));
+        let Some((gh, _host, connections, _dir, id)) = paired(&chosen) else {
+            eprintln!("SKIPPED: python3 not found");
+            return;
+        };
+        let runs = gh.scripts().len();
+        // Same account: its token is read once, to see that it is the same token.
+        chosen.resolves.store(0, Ordering::SeqCst);
+        connections.ensure_codespace(&id).unwrap();
+        assert_eq!(chosen.resolves.load(Ordering::SeqCst), 1);
+        assert_eq!(gh.scripts().len(), runs);
+        // Another account: the ids already differ, so only the bootstrap itself reads it.
+        chosen.set(Some(("other", SECRET_B)));
+        chosen.resolves.store(0, Ordering::SeqCst);
+        connections.ensure_codespace(&id).unwrap();
+        assert_eq!(gh.scripts().len(), runs + 1);
+        assert_eq!(chosen.resolves.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_manual_upgrade_with_an_account_tracks_its_token_like_the_bootstrap() {
+        let chosen = Arc::new(Chosen::default());
+        chosen.set(Some(("work", SECRET_A)));
+        let Some((gh, _host, connections, _dir, id)) = paired(&chosen) else {
+            eprintln!("SKIPPED: python3 not found");
+            return;
+        };
+        let runs = gh.scripts().len();
+        // The job may fail afterwards (the fake Host lacks Explorer); the script is what counts.
+        let _ = wait(&connections, connections.ssh_reconnect(&id, true).unwrap());
+        let scripts = gh.scripts();
+        assert_eq!(scripts.len(), runs + 1);
+        let prelude = delivery("work", SECRET_A).prelude;
+        assert!(
+            scripts[runs].starts_with(&format!(
+                "{}\nMONOCODE_HOST_TRACK_TOKEN=1\nMONOCODE_HOST_FORCE_UPGRADE=1\n",
+                prelude.as_str()
+            )),
+            "{}",
+            &scripts[runs][..200.min(scripts[runs].len())]
+        );
+    }
+
+    #[test]
+    fn a_host_that_needs_no_update_never_resolves_the_account_or_records_a_failure() {
+        let current = || {
+            setup(
+                false,
+                "monoptah",
+                host_upgrade::pinned_version(),
+                vec!["idle"],
+                Box::new(|_, _| Ok(String::new())),
+            )
+        };
+        let fx = current();
+        let chosen = Arc::new(Chosen::default());
+        *chosen.error.lock().unwrap() = Some("Claude account \"Work\" is gone.".into());
+        fx.connections.set_codespace_claude(chosen.clone());
+        let (outcome, lines) = upgrade(&fx, None);
+        assert!(matches!(outcome, Outcome::Current), "{outcome:?}");
+        assert!(lines.is_empty(), "{lines:?}");
+        assert_eq!(fx.connections.host_upgrade_failure(MACHINE), None);
+        assert_eq!(chosen.resolves.load(Ordering::SeqCst), 0);
+        assert!(fx.runner.scripts.lock().unwrap().is_empty());
+        // Needed and possible: the account is read once, for every step of the pass.
+        let chosen = Arc::new(Chosen::default());
+        chosen.set(Some(("work", SECRET_A)));
+        let (_fx, outcome, _) = old_host_upgrade(Some(chosen.clone()));
+        assert!(matches!(outcome, Outcome::Upgraded(_)), "{outcome:?}");
+        assert_eq!(chosen.resolves.load(Ordering::SeqCst), 1);
     }
 }

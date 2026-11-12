@@ -204,3 +204,125 @@ fn the_files_the_pin_writes_never_hold_a_secret() {
     assert!(!raw.contains(TOKEN), "{raw}");
     assert!(raw.contains(&a.with_token));
 }
+
+#[test]
+fn a_pinned_codespace_names_its_own_session_when_its_account_is_gone() {
+    let a = accounts();
+    let resolver = StoreCodespaceClaude::new(a.store.clone());
+    bind(&a.store.lock().unwrap(), "/p", "cs");
+    let pinned = |account: &str| {
+        write(
+            &a.store.lock().unwrap(),
+            &codespace_key("cs"),
+            &pin(Some(account), true),
+        )
+        .unwrap();
+    };
+    // Gone: the account belongs to this session, so Cloud settings would not help.
+    pinned("account-deleted");
+    let error = resolver.resolve("cs").err().unwrap();
+    assert!(
+        error.starts_with("This cloud session uses Claude account")
+            && error.contains("no longer available")
+            && error.contains("Start a new cloud session or add the account back")
+            && !error.contains("Cloud settings"),
+        "{error}"
+    );
+    assert_eq!(resolver.account_id("cs").err().unwrap(), error);
+    // No token: the account is named.
+    pinned(&a.without_token);
+    let error = resolver.resolve("cs").err().unwrap();
+    assert!(
+        error.contains("\"Empty\"")
+            && error.contains("no setup token or API key")
+            && error.contains("Start a new cloud session"),
+        "{error}"
+    );
+    // The project's own choice keeps the Cloud settings wording.
+    write(
+        &a.store.lock().unwrap(),
+        &codespace_key("cs"),
+        &pin(Some(&a.with_token), false),
+    )
+    .unwrap();
+    project_with(&a.store.lock().unwrap(), "/p", Some(&a.without_token));
+    assert!(resolver
+        .resolve("cs")
+        .err()
+        .unwrap()
+        .contains("Cloud settings"));
+}
+
+#[test]
+fn the_account_id_is_answered_without_reading_the_credential() {
+    let a = accounts();
+    let resolver = StoreCodespaceClaude::new(a.store.clone());
+    bind(&a.store.lock().unwrap(), "/p", "cs");
+    project_with(&a.store.lock().unwrap(), "/p", Some(&a.with_token));
+    assert_eq!(
+        resolver.account_id("cs").unwrap().as_deref(),
+        Some(a.with_token.as_str())
+    );
+    // Damaging the sealed key makes the credential unreadable but not the id check, which
+    // looks at the account's metadata only.
+    for entry in std::fs::read_dir(a._dir.path()).unwrap().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.contains("key") {
+            std::fs::write(entry.path(), b"damaged").unwrap();
+        }
+    }
+    assert!(
+        resolver.resolve("cs").is_err(),
+        "the credential is unreadable"
+    );
+    assert_eq!(
+        resolver.account_id("cs").unwrap().as_deref(),
+        Some(a.with_token.as_str())
+    );
+    // No account chosen: no id.
+    project_with(&a.store.lock().unwrap(), "/p", None);
+    assert_eq!(resolver.account_id("cs").unwrap(), None);
+}
+
+#[test]
+fn instances_pinned_to_an_account_are_reported_for_removal_guards() {
+    let a = accounts();
+    let store = a.store.lock().unwrap();
+    write(&store, &codespace_key("cs-b"), &pin(Some("acct"), true)).unwrap();
+    write(&store, &codespace_key("cs-a"), &pin(Some("acct"), true)).unwrap();
+    write(&store, &sandbox_key("box"), &pin(Some("acct"), true)).unwrap();
+    // Following the project, another account, and no account: not pinned to it.
+    write(&store, &codespace_key("follows"), &pin(Some("acct"), false)).unwrap();
+    write(&store, &codespace_key("other"), &pin(Some("else"), true)).unwrap();
+    write(&store, &sandbox_key("none"), &pin(None, true)).unwrap();
+    assert_eq!(
+        instances_using_claude_account(&store, "acct").unwrap(),
+        vec![
+            PinnedInstance {
+                sandbox: false,
+                name: "cs-a".into()
+            },
+            PinnedInstance {
+                sandbox: false,
+                name: "cs-b".into()
+            },
+            PinnedInstance {
+                sandbox: true,
+                name: "box".into()
+            },
+        ]
+    );
+    assert!(instances_using_claude_account(&store, "nobody")
+        .unwrap()
+        .is_empty());
+    // A forgotten instance is no longer reported.
+    store
+        .forget_cloud(&super::CloudRef::codespace("cs-a"))
+        .unwrap();
+    assert_eq!(
+        instances_using_claude_account(&store, "acct")
+            .unwrap()
+            .len(),
+        2
+    );
+}

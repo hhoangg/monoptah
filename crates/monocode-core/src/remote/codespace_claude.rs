@@ -45,6 +45,13 @@ pub(crate) fn fingerprint_of(delivery: Option<&ClaudeDelivery>) -> Option<String
 /// [`crate::cloud_sessions::claude_pin::StoreCodespaceClaude`]. Called from worker threads
 /// only (it reads the sealed credential).
 pub trait CodespaceClaude: Send + Sync {
+    /// The id of the account codespace `name` must run under, WITHOUT reading its credential
+    /// (cheap: a connected codespace compares it with the delivered one before it decrypts
+    /// anything). `Err` as in [`Self::resolve`]. The default resolves.
+    fn account_id(&self, codespace: &str) -> Result<Option<String>, String> {
+        Ok(self.resolve(codespace)?.map(|delivery| delivery.account))
+    }
+
     /// The credential codespace `name` must run under: `Ok(None)` when it follows the
     /// Codespaces secret. `Err` when the chosen account cannot be used (deleted, no token);
     /// the caller must fail rather than fall back to the secret.
@@ -53,13 +60,18 @@ pub trait CodespaceClaude: Send + Sync {
 
 /// Masks the credential, and the whole prelude it came in, in text that may be shown.
 pub(crate) fn mask(text: &str, delivery: Option<&ClaudeDelivery>) -> String {
-    let Some(delivery) = delivery else {
-        return text.to_owned();
-    };
-    let text = if delivery.prelude.is_empty() {
+    match delivery {
+        Some(delivery) => mask_parts(text, &delivery.prelude, &delivery.secret),
+        None => text.to_owned(),
+    }
+}
+
+/// [`mask`] for a prelude and secret held apart from a [`ClaudeDelivery`].
+pub(crate) fn mask_parts(text: &str, prelude: &str, secret: &str) -> String {
+    let text = if prelude.is_empty() {
         text.to_owned()
     } else {
-        text.replace(delivery.prelude.as_str(), "[prelude]")
+        text.replace(prelude, "[prelude]")
     };
-    super::host_upgrade::scrub(&text, &delivery.secret)
+    super::host_upgrade::scrub(&text, secret)
 }

@@ -48,7 +48,10 @@ pub struct ClaudePin {
 /// The pin saved under `key`; `None` when there is none or it cannot be read (an instance
 /// from before pins existed).
 pub fn read(store: &Store, key: &str) -> Option<ClaudePin> {
-    let raw = store.setting(key).ok().flatten()?;
+    parse(&store.setting(key).ok().flatten()?)
+}
+
+fn parse(raw: &str) -> Option<ClaudePin> {
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
@@ -105,6 +108,37 @@ pub fn effective(pin: Option<&ClaudePin>, project: Option<&Option<String>>) -> O
     }
 }
 
+/// A cloud instance whose session pinned an app Claude account.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PinnedInstance {
+    /// `true` for a Docker sandbox, `false` for a codespace.
+    pub sandbox: bool,
+    pub name: String,
+}
+
+/// Instances pinned (a per-session override, `pinned: true`) to Claude account `account_id`,
+/// sorted. They run under it whatever their project says, so removing the account would
+/// break them even when no project uses it (see also
+/// [`super::project_cloud::projects_using_claude_account`]).
+pub fn instances_using_claude_account(
+    store: &Store,
+    account_id: &str,
+) -> Result<Vec<PinnedInstance>, String> {
+    let mut found = Vec::new();
+    for (sandbox, prefix) in [(false, CODESPACE_PREFIX), (true, SANDBOX_PREFIX)] {
+        for (name, raw) in store.settings_with_key_prefix(prefix)? {
+            let Some(pin) = parse(&raw) else {
+                continue;
+            };
+            if pin.pinned && pin.account.as_deref() == Some(account_id) {
+                found.push(PinnedInstance { sandbox, name });
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
 /// The local project a codespace belongs to, from the remote project bound to it.
 fn project_of_codespace(store: &Store, name: &str) -> Option<String> {
     store
@@ -115,16 +149,23 @@ fn project_of_codespace(store: &Store, name: &str) -> Option<String> {
         .and_then(|p| p.local_project)
 }
 
-/// The account codespace `name` runs under now, see [`effective`]. An unreadable project
-/// setting counts as no project, like a start does.
-pub fn codespace_account(store: &Store, name: &str) -> Option<String> {
+/// The account codespace `name` runs under now, see [`effective`], and whether it comes from
+/// this session's own pinned override. An unreadable project setting counts as no project,
+/// like a start does.
+pub fn codespace_account_choice(store: &Store, name: &str) -> (Option<String>, bool) {
     let pin = read(store, &codespace_key(name));
     let project = project_of_codespace(store, name).and_then(|cwd| {
         super::project_cloud::load_codespace(store, &cwd)
             .ok()
             .map(|c| c.codespace.claude_account)
     });
-    effective(pin.as_ref(), project.as_ref())
+    let pinned = pin.as_ref().is_some_and(|pin| pin.pinned);
+    (effective(pin.as_ref(), project.as_ref()), pinned)
+}
+
+/// The account codespace `name` runs under now, see [`codespace_account_choice`].
+pub fn codespace_account(store: &Store, name: &str) -> Option<String> {
+    codespace_account_choice(store, name).0
 }
 
 /// How to name app Claude account `id` to the user: its label, else the id.
@@ -141,10 +182,39 @@ pub fn label(store: &Store, id: &str) -> String {
         .unwrap_or_else(|| id.to_owned())
 }
 
-/// The credential of `account`, or a clear error naming the account and where to fix it. A
-/// deleted account and one without a token or key are both errors: a cloud instance never
-/// falls back to another credential silently.
-pub fn require_auth(store: &Store, account: &str) -> Result<ClaudeAuth, String> {
+/// Why an account cannot be used.
+#[derive(Clone, Copy)]
+enum Problem {
+    Gone,
+    NoToken,
+    Unreadable,
+}
+
+/// The error for account `name`. A pinned account belongs to one cloud session (fixing the
+/// project setting would not help), so that wording points to a new session instead of Cloud
+/// settings.
+fn problem_message(name: &str, pinned: bool, problem: Problem) -> String {
+    if pinned {
+        let what = match problem {
+            Problem::Gone => "is no longer available",
+            Problem::NoToken => "has no setup token or API key saved",
+            Problem::Unreadable => "has a credential that could not be read",
+        };
+        return format!(
+            "This cloud session uses Claude account \"{name}\", which {what}. Start a new cloud session or add the account back."
+        );
+    }
+    match problem {
+        Problem::Gone => "The Claude account chosen for this project is no longer available. Choose another account in Cloud settings.".to_string(),
+        Problem::NoToken => format!("Claude account \"{name}\" has no setup token or API key saved. Choose another account in Cloud settings."),
+        Problem::Unreadable => format!("The credential of Claude account \"{name}\" could not be read. Choose another account in Cloud settings."),
+    }
+}
+
+/// Checks that `account` exists and has a setup token or API key saved, WITHOUT reading the
+/// credential (metadata only, so it is cheap). `pinned`: the account belongs to one cloud
+/// session, see [`require_auth_for`].
+pub fn check_account(store: &Store, account: &str, pinned: bool) -> Result<(), String> {
     let exists = store.provider_accounts().is_ok_and(|book| {
         book.list(crate::provider::Kind::Claude)
             .iter()
@@ -152,19 +222,46 @@ pub fn require_auth(store: &Store, account: &str) -> Result<ClaudeAuth, String> 
     });
     let name = label(store, account);
     if !exists {
-        return Err(
-            "The Claude account chosen for this project is no longer available. Choose another account in Cloud settings."
-                .to_string(),
-        );
+        return Err(problem_message(&name, pinned, Problem::Gone));
     }
+    let has_token = store.data_dir().is_some_and(|root| {
+        crate::accounts::Profile::new(account, root)
+            .uses_claude_token()
+            .unwrap_or(true)
+    });
+    if !has_token {
+        return Err(problem_message(&name, pinned, Problem::NoToken));
+    }
+    Ok(())
+}
+
+/// The error for an `account` whose credential came back empty: the account is gone or has
+/// no setup token or API key. Pairs with a [`SandboxSecrets`](super::docker_start::SandboxSecrets)
+/// that answers "no credential" for a chosen account, which a cloud instance never accepts
+/// silently.
+pub fn missing_auth_error(store: &Store, account: &str, pinned: bool) -> String {
+    match check_account(store, account, pinned) {
+        Err(error) => error,
+        Ok(()) => problem_message(&label(store, account), pinned, Problem::NoToken),
+    }
+}
+
+/// The credential of `account`, or a clear error naming the account and where to fix it. A
+/// deleted account and one without a token or key are both errors: a cloud instance never
+/// falls back to another credential silently.
+pub fn require_auth(store: &Store, account: &str) -> Result<ClaudeAuth, String> {
+    require_auth_for(store, account, false)
+}
+
+/// [`require_auth`] for an account that is `pinned` to one cloud session or instance: the
+/// error then says the account belongs to this session.
+pub fn require_auth_for(store: &Store, account: &str, pinned: bool) -> Result<ClaudeAuth, String> {
+    check_account(store, account, pinned)?;
+    let name = label(store, account);
     match store_claude_auth(store, account) {
         Ok(Some(auth)) => Ok(auth),
-        Ok(None) => Err(format!(
-            "Claude account \"{name}\" has no setup token or API key saved. Choose another account in Cloud settings."
-        )),
-        Err(_) => Err(format!(
-            "The credential of Claude account \"{name}\" could not be read. Choose another account in Cloud settings."
-        )),
+        Ok(None) => Err(problem_message(&name, pinned, Problem::NoToken)),
+        Err(_) => Err(problem_message(&name, pinned, Problem::Unreadable)),
     }
 }
 
@@ -181,15 +278,29 @@ impl StoreCodespaceClaude {
 }
 
 impl CodespaceClaude for StoreCodespaceClaude {
+    fn account_id(&self, codespace: &str) -> Result<Option<String>, String> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| "Native session store unavailable".to_string())?;
+        let (account, pinned) = codespace_account_choice(&store, codespace);
+        let Some(account) = account else {
+            return Ok(None);
+        };
+        check_account(&store, &account, pinned)?;
+        Ok(Some(account))
+    }
+
     fn resolve(&self, codespace: &str) -> Result<Option<ClaudeDelivery>, String> {
         let store = self
             .store
             .lock()
             .map_err(|_| "Native session store unavailable".to_string())?;
-        let Some(account) = codespace_account(&store, codespace) else {
+        let (account, pinned) = codespace_account_choice(&store, codespace);
+        let Some(account) = account else {
             return Ok(None);
         };
-        let auth = require_auth(&store, &account)?;
+        let auth = require_auth_for(&store, &account, pinned)?;
         Ok(Some(ClaudeDelivery {
             account,
             prelude: auth.prelude(),
@@ -198,7 +309,65 @@ impl CodespaceClaude for StoreCodespaceClaude {
     }
 }
 
+/// What a codespace start records as the instance's Claude account.
+#[derive(Default)]
+pub(super) struct StartPin {
+    /// The pin this start writes.
+    pub pin: ClaudePin,
+    /// An existing instance's own per-session override, which a start that did not choose an
+    /// account keeps (nothing is written then, and this is the account to validate).
+    pub keep: Option<ClaudePin>,
+}
+
+impl StartPin {
+    /// An account that cannot be used fails the start before a codespace is created for it.
+    /// A kept pin validates its own account, never the project's.
+    pub(super) fn validate(&self, store: &Store) -> Result<(), String> {
+        let pin = self.keep.as_ref().unwrap_or(&self.pin);
+        match &pin.account {
+            Some(account) => require_auth_for(store, account, pin.pinned).map(|_| ()),
+            None => Ok(()),
+        }
+    }
+
+    /// Records the pin on codespace `name`, unless an existing override is kept.
+    pub(super) fn write(&self, store: &Store, name: &str) -> Result<(), String> {
+        if self.keep.is_some() {
+            return Ok(());
+        }
+        write(store, &codespace_key(name), &self.pin)
+    }
+}
+
 impl super::CloudSessions {
+    /// The pin a codespace start of `target` records: this session's own choice, else the
+    /// project's. An existing codespace that already carries a per-session override keeps it
+    /// when this start did not choose one.
+    pub(super) fn codespace_start_pin(
+        &self,
+        local_cwd: &str,
+        target: &super::Target,
+    ) -> Result<StartPin, String> {
+        let pin = if target.claude_account_pinned {
+            ClaudePin {
+                account: target.claude_account.clone(),
+                pinned: true,
+            }
+        } else {
+            ClaudePin {
+                account: self.codespace_project_config(local_cwd).claude_account,
+                pinned: false,
+            }
+        };
+        let keep = match &target.codespace {
+            super::CodespaceChoice::Named(name) if !pin.pinned => {
+                read(&*self.store()?, &codespace_key(name)).filter(|existing| existing.pinned)
+            }
+            _ => None,
+        };
+        Ok(StartPin { pin, keep })
+    }
+
     /// How to name app Claude account `id` to the user (its label, else the id).
     pub fn claude_account_label(&self, id: &str) -> String {
         self.store()

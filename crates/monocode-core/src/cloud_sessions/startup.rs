@@ -50,7 +50,7 @@
 //!   `Running commands...`, `Running the postCreateCommand from Feature '...'...`,
 //!   `Finished configuring codespace.`, each prefixed `2026-11-07 04:01:54.456Z: `.
 use super::backend::{CloudBackendKind, CloudRef};
-use super::claude_pin::{self, ClaudePin};
+use super::claude_pin;
 use super::docker_start::SandboxStart;
 use super::{
     created_note, require_claude, CloudBinding, CloudSessions, ResolvedCodespace, Target, WaitPlan,
@@ -848,21 +848,9 @@ impl CloudSessions {
             self.refuse_while_cleaning(&CloudRef::codespace(name))?;
         }
         // The Claude account of this codespace: this session's own choice, else the project's.
-        let claude = if target.claude_account_pinned {
-            ClaudePin {
-                account: target.claude_account.clone(),
-                pinned: true,
-            }
-        } else {
-            ClaudePin {
-                account: self.codespace_project_config(local_cwd).claude_account,
-                pinned: false,
-            }
-        };
         // An account that cannot be used fails here, before a codespace is created for it.
-        if let Some(account) = &claude.account {
-            claude_pin::require_auth(&*self.store()?, account)?;
-        }
+        let claude = self.codespace_start_pin(local_cwd, &target)?;
+        claude.validate(&*self.store()?)?;
         let began = self.now();
         let resolved = self.resolve_codespace(local_cwd, target, &mut |_| {})?;
         self.invalidate(&resolved.name);
@@ -882,7 +870,7 @@ impl CloudSessions {
         resolved: &ResolvedCodespace,
         began: u64,
         kit_off: bool,
-        claude: &ClaudePin,
+        claude: &claude_pin::StartPin,
     ) -> Result<(Session, StartRecord), String> {
         let now = self.now();
         let store = self.store()?;
@@ -895,17 +883,10 @@ impl CloudSessions {
         );
         let session = store.create_pending_cloud_session(harness, project)?;
         // Pinned before the codespace is paired, so no bootstrap of it can run under another
-        // account. An existing codespace that already carries a per-session override keeps it
-        // when this start did not choose one.
-        let key = claude_pin::codespace_key(&resolved.name);
-        let keep = !claude.pinned
-            && !resolved.created
-            && claude_pin::read(&store, &key).is_some_and(|pin| pin.pinned);
-        if !keep {
-            if let Err(error) = claude_pin::write(&store, &key, claude) {
-                let _ = store.forget_cloud_session(session.id);
-                return Err(error);
-            }
+        // account.
+        if let Err(error) = claude.write(&store, &resolved.name) {
+            let _ = store.forget_cloud_session(session.id);
+            return Err(error);
         }
         let mut record = StartRecord::fresh(resolved, session.id, local_cwd, began);
         record.kit_off = kit_off;

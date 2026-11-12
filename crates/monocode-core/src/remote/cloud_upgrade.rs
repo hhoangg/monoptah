@@ -109,6 +109,14 @@ impl SendGate {
     }
 }
 
+/// Sends to one machine are held back until this is dropped.
+pub(super) struct SendHold(Arc<SendGate>);
+impl Drop for SendHold {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 /// How the upgrade reaches the machine: the ssh runner and the tunnel. Replaced in tests.
 pub(super) trait CloudRunner: Send + Sync {
     fn run_script(
@@ -226,28 +234,17 @@ impl Connections {
         }
         // A codespace whose project chooses an app Claude account upgrades with the SAME
         // prelude as its connect step; without it the restarted Host would fall back to the
-        // Codespaces secret. An account that cannot be used leaves the Host as it is.
-        let delivery = match machine
+        // Codespaces secret. It is resolved only when a step first needs it (an upgrade is
+        // being staged), so a Host that needs no update never fails on an unusable account;
+        // an account that cannot be used then leaves the Host as it is.
+        let lazy = machine
             .ssh
-            .as_ref()
+            .clone()
             .filter(|_| auth.is_none())
-            .map(|target| self.claude_delivery_for(target))
-            .transpose()
-        {
-            Ok(delivery) => delivery.flatten(),
-            Err(error) => {
-                let text = scrub(&host_upgrade::warning(&error, false), &machine.token);
-                progress(&text);
-                self.record_upgrade_failure(machine_id, Some(&text));
-                return Outcome::Failed(text);
-            }
-        };
-        let auth = auth.or_else(|| {
-            delivery.as_ref().map(|d| SandboxAuth {
-                prelude: d.prelude.as_str(),
-                secret: d.secret.as_str(),
-            })
-        });
+            .map(|target| LazyDelivery {
+                target,
+                cell: std::sync::OnceLock::new(),
+            });
         let target = machine.ssh.as_ref().map(SshTarget::job_target);
         let (job, _slot) = match self.hold_job_slot(target, cancel, &mut || {
             progress("Waiting for another operation on this workspace…")
@@ -276,12 +273,16 @@ impl Connections {
                 return Outcome::Failed(text);
             }
         };
+        if let Some(auth) = &auth {
+            job.add_mask(auth.prelude, auth.secret);
+        }
         let runner = self.runner();
         let env = CloudUpgrade {
             connections: self,
             id: machine_id,
             sandbox: machine.ssh.as_ref().is_some_and(|t| t.sandbox.is_some()),
             auth,
+            lazy,
             device_token: machine.token.clone(),
             environment_id: machine.environment_id.clone(),
             cancel,
@@ -333,6 +334,26 @@ impl Connections {
             }
         }
         Ok(false)
+    }
+
+    /// Holds sends to `machine_id` back, waits for the ones on their way and looks again at
+    /// whether anything runs (the same order as the Host upgrade: anything that started
+    /// before the hold shows up in the look, anything after is refused). `None`: something
+    /// runs, or the Host cannot be asked, or the requests did not finish; nothing is held then.
+    pub(super) fn hold_sends_if_idle(&self, machine_id: &str) -> Option<SendHold> {
+        let gate = self.gate(machine_id);
+        gate.hold(self.drain_limit()).ok()?;
+        let hold = SendHold(gate);
+        if self.host_busy(machine_id).unwrap_or(true) {
+            return None;
+        }
+        Some(hold)
+    }
+
+    /// Whether the Host of `machine_id` answers on its tunnel now.
+    pub(super) fn host_answers(&self, machine_id: &str) -> bool {
+        self.request(machine_id, "environment.describe", json!({}))
+            .is_ok()
     }
 
     fn record_upgrade_failure(&self, machine_id: &str, warning: Option<&str>) {
@@ -525,6 +546,8 @@ struct CloudUpgrade<'a> {
     id: &'a str,
     sandbox: bool,
     auth: Option<SandboxAuth<'a>>,
+    /// A codespace's app Claude account, resolved the first time a step needs it.
+    lazy: Option<LazyDelivery>,
     /// The machine's device credential: handed to the swap worker for its last look, and
     /// never shown.
     device_token: String,
@@ -533,6 +556,12 @@ struct CloudUpgrade<'a> {
     job: &'a Arc<Job>,
     askpass: &'a Askpass,
     runner: &'a dyn CloudRunner,
+}
+
+/// The app Claude account of a codespace, resolved at most once per upgrade pass.
+struct LazyDelivery {
+    target: SshTarget,
+    cell: std::sync::OnceLock<Result<Option<super::codespace_claude::ClaudeDelivery>, String>>,
 }
 
 /// How a swap worker ended, as the machine reports it.
@@ -557,10 +586,48 @@ impl CloudUpgrade<'_> {
             .ok_or_else(|| "Machine is no longer connected".into())
     }
 
+    /// The credential every step carries: the sandbox's, or the codespace's app account
+    /// (resolved on first use; an account that cannot be used is an error, never a fall back
+    /// to the Codespaces secret).
+    fn credentials(&self) -> Result<Option<SandboxAuth<'_>>, String> {
+        if self.auth.is_some() {
+            return Ok(self.auth);
+        }
+        let Some(lazy) = &self.lazy else {
+            return Ok(None);
+        };
+        let resolved = lazy.cell.get_or_init(|| {
+            let resolved = self.connections.claude_delivery_for(&lazy.target);
+            if let Ok(Some(delivery)) = &resolved {
+                self.job.add_mask(&delivery.prelude, &delivery.secret);
+            }
+            resolved
+        });
+        match resolved {
+            Ok(delivery) => Ok(delivery.as_ref().map(|d| SandboxAuth {
+                prelude: d.prelude.as_str(),
+                secret: d.secret.as_str(),
+            })),
+            Err(error) => Err(error.clone()),
+        }
+    }
+
+    /// The credential if it has been resolved already (never resolves it).
+    fn credentials_if_known(&self) -> Option<SandboxAuth<'_>> {
+        self.auth.or_else(|| {
+            let resolved = self.lazy.as_ref()?.cell.get()?.as_ref().ok()?.as_ref()?;
+            Some(SandboxAuth {
+                prelude: resolved.prelude.as_str(),
+                secret: resolved.secret.as_str(),
+            })
+        })
+    }
+
     /// Masks the credentials, and the whole prelude they came in, in text that may be shown.
     fn clean_error(&self, text: String) -> String {
-        let secret = self.auth.map_or("", |auth| auth.secret);
-        let text = match self.auth {
+        let auth = self.credentials_if_known();
+        let secret = auth.map_or("", |auth| auth.secret);
+        let text = match auth {
             Some(auth) if !auth.prelude.is_empty() => text.replace(auth.prelude, "[prelude]"),
             _ => text,
         };
@@ -589,16 +656,19 @@ impl CloudUpgrade<'_> {
         };
         // A sandbox uses the SAME prelude as its connect step, so a restarted Host has the
         // Claude credential in its environment. It travels on stdin only.
+        let auth = self
+            .credentials()
+            .map_err(|error| self.clean_error(error))?;
         let script = if self.sandbox {
             ssh::sandbox_upgrade_script(
-                self.auth.map(|auth| auth.prelude),
+                auth.map(|auth| auth.prelude),
                 target.remote_port,
                 phase,
                 Some(check),
             )
         } else {
             ssh::codespace_upgrade_script_with(
-                self.auth.map(|auth| auth.prelude),
+                auth.map(|auth| auth.prelude),
                 target.remote_port,
                 phase,
                 Some(check),

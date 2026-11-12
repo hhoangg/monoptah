@@ -941,7 +941,10 @@ fn a_refused_create_leaves_no_session_and_no_record() {
 
 #[test]
 fn an_unclear_create_failure_keeps_a_failed_record_to_retry_or_delete() {
-    let fx = fx_with(CreateMode::Flaky, None);
+    let fx = fx_with(
+        CreateMode::Flaky,
+        Some(("CLAUDE_CODE_OAUTH_TOKEN", SECRET.into())),
+    );
     let (session, record) = fx.begin().unwrap();
     assert!(record.is_failed());
     assert!(record
@@ -5044,6 +5047,54 @@ mod claude_pins {
     }
     fn bootstrap_stdin(fx: &Fx) -> String {
         fx.shell.call("bootstrap").stdin
+    }
+
+    #[test]
+    fn a_chosen_account_without_a_credential_fails_the_start_and_the_reconnect() {
+        // The account has no token (or is gone): never a silent start without a credential.
+        let (fx, _) = fx_per_account();
+        let (session, _) = fx
+            .svc
+            .begin_sandbox_start_pinned(
+                "/Users/me/widgets",
+                &with_account("ghost"),
+                "fix/login",
+                "claude",
+                true,
+                true,
+            )
+            .unwrap();
+        let error = fx.run(session.id).0.unwrap_err();
+        assert!(
+            error.starts_with("This cloud session uses Claude account")
+                && error.contains("Start a new cloud session"),
+            "{error}"
+        );
+        assert!(fx.shell.calls().is_empty(), "nothing ran in the sandbox");
+        // Following the project, the wording points to Cloud settings.
+        let (fx, _) = fx_per_account();
+        let (id, name) = start(&fx, "work", false);
+        save_project(&fx, "ghost");
+        fx.reset();
+        let error = fx.reconnect(id).0.unwrap_err();
+        assert!(error.contains("Cloud settings"), "{error}");
+        assert!(!fx.shell.tags().contains(&"bootstrap".to_string()));
+        // A pinned override whose account is gone says it belongs to the session.
+        claude_pin::write(
+            &fx.store.lock().unwrap(),
+            &claude_pin::sandbox_key(&name),
+            &ClaudePin {
+                account: Some("ghost".into()),
+                pinned: true,
+            },
+        )
+        .unwrap();
+        let error = fx.reconnect(id).0.unwrap_err();
+        assert!(
+            error.starts_with("This cloud session uses Claude account"),
+            "{error}"
+        );
+        assert!(!fx.shell.tags().contains(&"bootstrap".to_string()));
     }
 
     #[test]

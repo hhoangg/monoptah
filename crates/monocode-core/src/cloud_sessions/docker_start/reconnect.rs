@@ -257,7 +257,11 @@ impl CloudSessions {
             }
             return Ok(());
         }
-        let auth = deps.secrets.claude_auth(config.claude_account.as_deref())?;
+        let auth = self.required_claude_auth(
+            &*deps.secrets,
+            config.claude_account.as_deref(),
+            claude_pin.as_ref().is_some_and(|pin| pin.pinned),
+        )?;
         let mut scrub = Scrub(vec![]);
         if let Some(auth) = &auth {
             scrub.0.push(Zeroizing::new(auth.secret().to_string()));

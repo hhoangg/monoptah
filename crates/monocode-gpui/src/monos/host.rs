@@ -72,6 +72,9 @@ pub(super) enum Folder {
     Existing { id: String, name: String },
     New { id: String, name: String },
 }
+/// Refused for a cloud `sessions.start` whose `account` has no setup token or API key.
+pub(super) const CLOUD_ACCOUNT_NEEDS_TOKEN: &str = "A cloud session needs a Claude account with a setup token or API key. Run accounts.list and pick an account whose authKind is setupToken or apiKey.";
+
 impl Folder {
     fn entry(&self) -> (&str, &str) {
         match self {
@@ -1539,17 +1542,17 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
             let center = center.read(cx);
             let id = monocode_core::accounts::resolve(&center.book, kind, selector)
                 .map_err(|error| error.to_string())?;
-            match cloud.as_mut() {
-                // The cloud instance gets the account's token or key, so the account must
-                // carry one (the CLI login of a machine does not travel to a codespace).
-                Some(target) => {
-                    if !center.uses_claude_token(&id) {
-                        return Err("A cloud session needs a Claude account with a setup token or API key. Run accounts.list and pick an account whose authKind is setupToken or apiKey.".into());
-                    }
-                    target.account = Some(id);
+            // A cloud instance gets the account's token or key, so the account must carry one
+            // (the CLI login of a machine does not travel to a codespace).
+            if let Some(target) = cloud.as_mut() {
+                if !center.uses_claude_token(&id) {
+                    return Err(CLOUD_ACCOUNT_NEEDS_TOKEN.into());
                 }
-                None => settings.account = center.profile(&id),
+                target.account = Some(id.clone());
             }
+            // Models and effort are validated against this account's catalog below, for a
+            // cloud session too.
+            settings.account = center.profile(&id);
         }
         let launches = mono.launches.clone();
         let draft = flag(&input, "draft", false);

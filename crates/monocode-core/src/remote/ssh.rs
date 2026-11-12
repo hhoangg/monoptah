@@ -330,6 +330,10 @@ pub struct Job {
     /// `None` for a job that is not tied to one target (a Host upgrade slot): it conflicts
     /// with every other job.
     target: Option<JobTarget>,
+    /// Credentials this job's scripts carry on stdin: (prelude, secret). Masked out of every
+    /// error text BEFORE it is shortened, so a cut can never leave half a secret that no
+    /// longer matches.
+    masks: Mutex<Vec<(zeroize::Zeroizing<String>, zeroize::Zeroizing<String>)>>,
 }
 impl Job {
     pub fn new() -> Arc<Self> {
@@ -354,7 +358,27 @@ impl Job {
                 finished: None,
             }),
             cancelled: AtomicBool::new(false),
+            masks: Mutex::new(Vec::new()),
         })
+    }
+    /// Registers a prelude and the secret inside it, to be masked out of the errors of every
+    /// script this job runs.
+    pub(crate) fn add_mask(&self, prelude: &str, secret: &str) {
+        self.masks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((prelude.to_owned().into(), secret.to_owned().into()));
+    }
+    fn mask(&self, text: &str) -> String {
+        let masks = self
+            .masks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        masks
+            .iter()
+            .fold(text.to_owned(), |text, (prelude, secret)| {
+                super::codespace_claude::mask_parts(&text, prelude, secret)
+            })
     }
     pub fn target(&self) -> Option<&JobTarget> {
         self.target.as_ref()
@@ -805,7 +829,10 @@ fn run_remote_command(
     if !succeeded {
         return Err(format!(
             "SSH setup failed: {}",
-            errors.trim().chars().take(4000).collect::<String>()
+            job.mask(errors.trim())
+                .chars()
+                .take(4000)
+                .collect::<String>()
         ));
     }
     Ok(output)
@@ -1037,6 +1064,19 @@ pub fn codespace_bootstrap_script_with(prelude: Option<&str>) -> String {
         Some(prelude) => format!("{prelude}\n{script}"),
         None => script,
     }
+}
+
+/// Prepended to the codespace bootstrap when the codespace's Host was started under an app
+/// Claude account and the project no longer chooses one. The bootstrap only restarts a Host
+/// when it has a token to track, and a codespace without a Codespaces secret has none, so
+/// the Host would keep the old account's credential. This stops the Host (the bootstrap
+/// installs and starts it again from the codespace's own environment) and forgets the token
+/// marker (so choosing the same account again later restarts it too). It sits in the same
+/// ssh script, so it is one run and nothing else changes in the bootstrap.
+pub(crate) fn codespace_stop_host_prestep() -> &'static str {
+    "ENTRY_PRE=\"$HOME/.monocode-host/bin/monocode-host\"\n\
+     if [ -x \"$ENTRY_PRE\" ]; then \"$ENTRY_PRE\" service uninstall >/dev/null 2>&1 || true; fi\n\
+     rm -f \"$HOME/.monocode-host/host-token.sha256\"\n"
 }
 
 /// A step of the cloud Host upgrade in a codespace without an app Claude account.
@@ -3446,6 +3486,49 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         script
     }
+    #[cfg(unix)]
+    #[test]
+    fn a_secret_that_straddles_the_error_limit_is_masked_before_the_cut() {
+        const SECRET: &str = "correct-horse-battery-staple-9f3a";
+        let dir = tempfile::tempdir().unwrap();
+        // The remote error is 3990 characters, then the secret: the 4000 character limit
+        // would cut it in half, and half a secret matches no mask.
+        let noise = "x".repeat(3990);
+        let fake = failing_ssh(dir.path(), &format!("{noise}{SECRET}"));
+        let target = SshTarget {
+            target: "cs".into(),
+            port: None,
+            remote_port: 3774,
+            codespace: Some("cs".into()),
+            sandbox: None,
+        };
+        let job = Job::new();
+        job.add_mask(&format!("export TOKEN='{SECRET}'"), SECRET);
+        let askpass = job.askpass().unwrap();
+        let error = run_script_with_command(
+            &target,
+            "true\n".into(),
+            &job,
+            &askpass,
+            command_with_program(&target, true, fake.as_os_str()).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.starts_with("SSH setup failed"), "{error}");
+        assert!(!error.contains(&SECRET[..6]), "{}", &error[3900..]);
+        assert!(error.chars().count() <= "SSH setup failed: ".len() + 4000);
+        // Without a mask the cut text keeps the start of the secret (the failure this prevents).
+        let bare = Job::new();
+        let error = run_script_with_command(
+            &target,
+            "true\n".into(),
+            &bare,
+            &bare.askpass().unwrap(),
+            command_with_program(&target, true, fake.as_os_str()).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.contains(&SECRET[..6]), "control: {}", &error[3900..]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_rejected_token_in_a_failed_ssh_script_drops_the_cached_token() {
