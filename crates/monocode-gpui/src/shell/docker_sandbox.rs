@@ -166,7 +166,13 @@ impl Shell {
         div()
             .absolute()
             .size_full()
-            .child(crate::modal::scrim(format!("{id}-scrim")))
+            // A barrier, not a plain scrim: the window behind gets no hover, click or scroll
+            // while the dialog is open.
+            .child(crate::modal::barrier(
+                format!("{id}-scrim"),
+                priority,
+                window,
+            ))
             .child(
                 popover(id, Anchor::Center)
                     .modal_surface(self.workspace.boxy_layout())
