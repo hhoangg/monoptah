@@ -2,7 +2,8 @@
   "name": "Monoptah Native",
   "build": { "dockerfile": "Dockerfile", "context": "." },
   "features": {
-    "ghcr.io/devcontainers/features/node:1": { "version": "22" }
+    "ghcr.io/devcontainers/features/node:1": { "version": "22" },
+    "ghcr.io/devcontainers/features/sshd:1": { "version": "latest" }
   },
   "remoteUser": "vscode",
   "hostRequirements": { "cpus": 4, "memory": "8gb" },
