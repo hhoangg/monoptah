@@ -456,7 +456,7 @@ mod tests {
             .unwrap();
         let cx = &mut VisualTestContext::from_window(window.into(), cx);
         cx.run_until_parked();
-        cx.simulate_keystrokes("cmd-j");
+        cx.simulate_keystrokes("secondary-j");
         cx.run_until_parked();
         let focused = window
             .update(cx, |shell, w, cx| shell.dock_focused(w, cx).is_some())

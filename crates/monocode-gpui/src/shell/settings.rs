@@ -966,7 +966,7 @@ mod tests {
             .update(cx, |shell, w, cx| shell.focus_active(w, cx))
             .unwrap();
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        visual.simulate_keystrokes("cmd-,");
+        visual.simulate_keystrokes("secondary-,");
         visual.run_until_parked();
         let card = visual.debug_bounds("main-pane-frame").unwrap();
         let header = visual.debug_bounds("settings-header").unwrap();
@@ -1036,7 +1036,7 @@ mod tests {
             .update(cx, |shell, w, cx| shell.focus_active(w, cx))
             .unwrap();
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        visual.simulate_keystrokes("cmd-,");
+        visual.simulate_keystrokes("secondary-,");
         visual.run_until_parked();
         let back = visual.debug_bounds("settings-nav-back").unwrap();
         let search = visual.debug_bounds("settings-search").unwrap();
@@ -1125,7 +1125,7 @@ mod tests {
         visual.run_until_parked();
         let recorder = visual.debug_bounds("shortcut-App: Settings").unwrap();
         visual.simulate_click(recorder.center(), Default::default());
-        visual.simulate_keystrokes("cmd-k");
+        visual.simulate_keystrokes("secondary-k");
         visual.run_until_parked();
         window
             .update(visual, |shell, _, _| {
@@ -1139,7 +1139,7 @@ mod tests {
                 )
             })
             .unwrap();
-        visual.simulate_keystrokes("cmd-alt-y");
+        visual.simulate_keystrokes("secondary-alt-y");
         visual.run_until_parked();
         window
             .update(visual, |shell, _, _| {
@@ -1156,14 +1156,14 @@ mod tests {
         window
             .update(visual, |shell, _, _| assert!(shell.settings.is_none()))
             .unwrap();
-        visual.simulate_keystrokes("cmd-,");
+        visual.simulate_keystrokes("secondary-,");
         visual.run_until_parked();
         window
             .update(visual, |shell, _, _| {
                 assert!(shell.settings.is_none(), "old chord is removed")
             })
             .unwrap();
-        visual.simulate_keystrokes("cmd-alt-y");
+        visual.simulate_keystrokes("secondary-alt-y");
         visual.run_until_parked();
         window
             .update(visual, |shell, _, _| {
@@ -1184,7 +1184,7 @@ mod tests {
         visual.run_until_parked();
         visual.simulate_keystrokes("escape");
         visual.run_until_parked();
-        visual.simulate_keystrokes("cmd-,");
+        visual.simulate_keystrokes("secondary-,");
         visual.run_until_parked();
         window
             .update(visual, |shell, _, _| {

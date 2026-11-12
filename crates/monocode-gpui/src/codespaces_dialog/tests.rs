@@ -543,7 +543,7 @@ fn clicking_the_field_and_typing_enters_text_when_gh_and_repo_are_ready(cx: &mut
     // Pasting goes through the same path as typing.
     let visual = &mut VisualTestContext::from_window(window.into(), cx);
     visual.write_to_clipboard(gpui::ClipboardItem::new_string("-pasted".into()));
-    visual.simulate_keystrokes("cmd-v");
+    visual.simulate_keystrokes("secondary-v");
     assert_eq!(typed_token(&window, cx), "sk-ant-oat-123-pasted");
     assert!(visual.debug_bounds("codespaces-disabled").is_none());
     assert!(

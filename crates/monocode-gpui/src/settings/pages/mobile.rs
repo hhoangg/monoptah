@@ -1105,6 +1105,8 @@ fn pairing_backdrop(classic: bool) -> impl IntoElement {
                 }
             };
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            let _ = classic;
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             let fill = {
                 let mut fill = shell_fill();
                 fill.a = 1.;

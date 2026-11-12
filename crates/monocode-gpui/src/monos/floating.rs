@@ -2,6 +2,7 @@
 //! apps without activating Monoptah, and its rail moves between Monos without
 //! touching the workspace window's selection.
 use super::*;
+#[cfg(any(target_os = "macos", test))]
 use gpui::{Bounds, WindowBounds, WindowKind, WindowOptions, point, size};
 /// A 384pt conversation plus the 56pt Mono rail beside it.
 #[cfg(any(target_os = "macos", test))]
