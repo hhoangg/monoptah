@@ -821,6 +821,8 @@ pub struct CloudSessions {
     follower_retry: Duration,
     /// Sandboxes with a user-initiated reconnect in flight, by name.
     reconnecting: Mutex<std::collections::HashSet<String>>,
+    /// Loaded cloud workspaces overviews by project, see [`workspaces`].
+    workspace_views: Mutex<HashMap<String, (Instant, workspaces::WorkspaceOverview)>>,
     /// Where the Claude setup step reads the user's kit preferences and local setup.
     kit_seams: claude_setup::KitSeams,
     /// Moves (and rollbacks) running in this process, by local session id.
@@ -855,6 +857,7 @@ impl CloudSessions {
             clock: Box::new(crate::time::now_ms),
             follower_retry: Duration::from_secs(2),
             reconnecting: Mutex::new(Default::default()),
+            workspace_views: Mutex::new(HashMap::new()),
             kit_seams: claude_setup::KitSeams::system(),
             moves: Mutex::new(HashMap::new()),
             cleaning: Mutex::new(Default::default()),
@@ -2225,6 +2228,7 @@ pub mod transcript_sync;
 pub mod startup;
 pub mod view;
 pub mod view_cache;
+pub mod workspaces;
 pub use startup::{
     pause_start, pending_starts, queue_start_message, queued_start_message, queued_start_messages,
     start_record, starting_refusal, StartEvent, StartRecord, Step, StepKind, StepStatus,
@@ -2263,3 +2267,5 @@ mod startup_tests;
 mod tests;
 #[cfg(test)]
 mod view_tests;
+#[cfg(test)]
+mod workspaces_tests;

@@ -150,7 +150,7 @@ fn list_argv_and_parse() {
             "--repo",
             "hhoangg/monoptah",
             "--json",
-            "name,displayName,state,gitStatus,machineName,repository,lastUsedAt"
+            "name,displayName,state,gitStatus,machineName,repository,lastUsedAt,createdAt"
         ])
     );
     assert_eq!(items[0].name, "cs-abc");

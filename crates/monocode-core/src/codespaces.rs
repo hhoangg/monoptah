@@ -557,9 +557,11 @@ pub struct Codespace {
     pub machine_name: String,
     pub repository: String,
     pub last_used_at: String,
+    pub created_at: String,
 }
 
-const LIST_FIELDS: &str = "name,displayName,state,gitStatus,machineName,repository,lastUsedAt";
+const LIST_FIELDS: &str =
+    "name,displayName,state,gitStatus,machineName,repository,lastUsedAt,createdAt";
 
 pub fn list(runner: &dyn GhRunner, repo: &str) -> Result<Vec<Codespace>, String> {
     valid_repo(repo)?;

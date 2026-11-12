@@ -60,6 +60,7 @@ mod project_rail;
 mod project_removal;
 pub(crate) use project_removal::FilesOutcome;
 mod project_cloud;
+mod cloud_workspaces;
 mod project_settings;
 mod provider_prompt;
 mod quick_composer;
@@ -668,6 +669,7 @@ pub(crate) struct Shell {
     session_tickets: HashMap<i64, String>,
     telegram: telegram::Telegram,
     cloud_settings: Option<project_cloud::OpenProjectCloud>,
+    cloud_workspaces: Option<cloud_workspaces::OpenCloudWorkspaces>,
     /// The sidebar rails under orchestrators and /operator threads.
     rails: rails::Rails,
     usage_footer: Entity<UsageFooter>,
@@ -1197,6 +1199,7 @@ impl Shell {
             session_tickets: HashMap::new(),
             telegram: telegram::Telegram::new(),
             cloud_settings: None,
+            cloud_workspaces: None,
             rails: Default::default(),
             usage_footer: cx.new(|cx| UsageFooter::new(active_kind, cx)),
             resources,
@@ -6260,6 +6263,11 @@ impl Shell {
                             .icon("cloud-upload")
                             .into(),
                     );
+                    items.push(
+                        MenuAction::new("cloud-workspaces", "Cloud workspaces…")
+                            .icon("cloud-upload")
+                            .into(),
+                    );
                 }
                 if *rail {
                     let mut groups = vec![MenuAction::new("project-group:new", "New group…")];
@@ -6464,6 +6472,8 @@ impl Shell {
                     self.open_telegram_dialog(path, window, cx);
                 } else if action == "cloud-settings" {
                     self.open_cloud_settings(path, None, window, cx);
+                } else if action == "cloud-workspaces" {
+                    self.open_cloud_workspaces(path, window, cx);
                 } else if action == "archive" {
                     self.archive_project(&path, window, cx);
                 } else if action == "delete" {
@@ -9759,6 +9769,10 @@ impl Render for Shell {
                     this.cloud_settings_escape(window, cx);
                     return;
                 }
+                if this.cloud_workspaces.is_some() {
+                    this.cloud_workspaces_escape(window, cx);
+                    return;
+                }
                 if this.action_dialog.is_some() {
                     this.close_action_dialog(window, cx);
                     return;
@@ -9987,6 +10001,7 @@ impl Render for Shell {
             .children(self.telegram_topic_modal(window, cx))
             .children(self.cloud_settings_modal(window, cx))
             .children(self.fix_terminal_modal(window, cx))
+            .children(self.cloud_workspaces_modal(window, cx))
             .children(self.cloud_move_modal(window, cx))
             .children(self.delete_modal(window, cx))
             .children(self.cloud_archive_modal(window, cx))

@@ -84,6 +84,17 @@ impl<F: Fn(&CloudRef) -> bool> AppBusy for F {
 /// The caller's busy state, see [`AppBusy`].
 pub type ExtraBusy<'a> = &'a dyn AppBusy;
 
+/// How [`CloudApi::delete_instance`] differs from the plain `cloud.delete`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeleteOptions {
+    /// The user was shown what the instance holds that is not in the local copy and chose to
+    /// delete anyway (`cloud.delete` refuses until the app asks).
+    pub accept_unsaved: bool,
+    /// Stop a sandbox and wait until it is stopped first, retrying a refused delete
+    /// ([`CloudSessions::delete_settled`]).
+    pub settle: bool,
+}
+
 /// The extra check of a caller that has no extra busy state.
 pub fn never_busy(_: &CloudRef) -> bool {
     false
@@ -491,6 +502,11 @@ impl CloudApi {
             .map_err(|_| "Native session store unavailable".to_string())
     }
 
+    /// The cloud service behind this API (the cloud workspaces overview reads through it).
+    pub fn cloud(&self) -> &Arc<CloudSessions> {
+        &self.cloud
+    }
+
     /// The live sessions on `cloud`, any project. See [`CloudSessions::sessions_on`].
     pub fn sessions_on(&self, cloud: &CloudRef) -> Vec<InstanceSession> {
         self.cloud.sessions_on(cloud)
@@ -649,7 +665,11 @@ impl CloudApi {
     /// a session on it wakes it). Proceeds while sessions are busy and says so in `warning`.
     pub fn stop(&self, project: &str, input: &Value, busy: ExtraBusy) -> Result<Value, String> {
         let address = self.address(project, input)?;
-        let cloud = &address.cloud;
+        self.stop_instance(&address.cloud, busy)
+    }
+
+    /// [`Self::stop`] for an instance already known by reference (the cloud workspaces overview).
+    pub fn stop_instance(&self, cloud: &CloudRef, busy: ExtraBusy) -> Result<Value, String> {
         if busy.working_on(cloud) {
             return Err(format!(
                 "Cannot stop {} {}: the app is archiving or converting a session on it, which would start it again. Try again when that finishes.",
@@ -659,6 +679,7 @@ impl CloudApi {
         }
         let sessions = self.busy_sessions_on(cloud, self.cloud.cloud_state_of(cloud), busy);
         self.cloud.stop_cloud(cloud)?;
+        self.cloud.forget_workspace_views();
         let mut result = self.outcome(cloud, "stopped", &sessions);
         let names = busy_names(&sessions);
         if !names.is_empty() {
@@ -709,7 +730,17 @@ impl CloudApi {
     /// on it) and while the local copy lacks files that only exist on the instance.
     pub fn delete(&self, project: &str, input: &Value, busy: ExtraBusy) -> Result<Value, String> {
         let address = self.address(project, input)?;
-        let cloud = &address.cloud;
+        self.delete_instance(&address.cloud, busy, DeleteOptions::default())
+    }
+
+    /// [`Self::delete`] for an instance already known by reference (the cloud workspaces
+    /// overview), with the caller's [`DeleteOptions`].
+    pub fn delete_instance(
+        &self,
+        cloud: &CloudRef,
+        busy: ExtraBusy,
+        options: DeleteOptions,
+    ) -> Result<Value, String> {
         let sessions = self.busy_sessions_on(cloud, self.cloud.cloud_state_of(cloud), busy);
         let names = busy_names(&sessions);
         if !names.is_empty() {
@@ -727,7 +758,7 @@ impl CloudApi {
             ));
         }
         let unsaved = self.cloud.unsaved_for_cloud(cloud);
-        if !unsaved.is_empty() {
+        if !unsaved.is_empty() && !options.accept_unsaved {
             return Err(format!(
                 "Deleting {} would lose files that are not in the local copy. {} Delete it from the app to confirm.",
                 cloud.name,
@@ -735,7 +766,12 @@ impl CloudApi {
             ));
         }
         let removed = self.cloud.session_ids_on(cloud);
-        let outcome = self.cloud.delete_cloud_outcome(cloud)?;
+        let outcome = if options.settle {
+            self.cloud.delete_settled(cloud)?
+        } else {
+            self.cloud.delete_cloud_outcome(cloud)?
+        };
+        self.cloud.forget_workspace_views();
         let mut result = self.outcome(cloud, "deleted", &sessions);
         // The sessions the delete removed, so the app drops them from its window and panels.
         result["removedSessionIds"] = json!(removed);
