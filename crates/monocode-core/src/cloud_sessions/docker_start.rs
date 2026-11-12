@@ -20,7 +20,7 @@
 //! | Create | id known: `inspect` it (gone -> failure, never recreated); id unknown: create or adopt by name |
 //! | Provision | `docker_provision.sh` phases `setup` (xz, Dev Container CLI), `approve` (Git credential into an in-memory `git-credential-cache`, payload on stdin) and `clone` (checkout + feature branch) |
 //! | BuildContainer, BlockingCommands | `docker_up.sh` runs `devcontainer up --skip-non-blocking-commands --log-format json` detached into a log file; the log is followed over ssh and mapped to steps by [`parse_up_line`] |
-//! | ConfigureCodespace ("Configure environment") | inside the container: git credential helper pointing at the mounted socket, for the exact repo URL |
+//! | ConfigureCodespace ("Configure environment") | inside the container: git credential helper pointing at the mounted socket, for the exact repo URL; for GitHub a `gh` wrapper in `~/.local/bin` that reads the cached token per call; an agent note in `~/.claude/rules/monoptah-cloud-git.md` |
 //! | Connect | bootstrap the Host in the container (Claude prelude on stdin), start the relay, pair and tunnel through [`Host::connect_sandbox`](super::Host::connect_sandbox) |
 //! | OpenProject | [`super::open_project`] with the container's `remoteWorkspaceFolder` |
 //! | LifecycleCommands | `devcontainer run-user-commands` detached; never blocks `Ready` |
@@ -56,6 +56,20 @@
 //!   `$HOME/.monoptah/git/sock` in the outer sandbox, bind-mounted into the container at
 //!   [`CONTAINER_GIT_DIR`]. The container's global git config names that socket for the exact
 //!   repo URL only. The daemon keeps the token in memory (24 h), nothing is written to disk.
+//! * `gh` (GitHub only): the configure step installs `~/.local/bin/gh`, a marked POSIX sh
+//!   wrapper that the Host bootstrap puts first on `PATH`. On every call it asks the cache
+//!   (`git credential-cache get`, bound to this repo's host and path) for the token and sets
+//!   `GH_TOKEN` for that one exec of the real `gh`. Through `gh` the token works for any
+//!   GitHub request its own PAT permissions allow, not only this repository. The Host
+//!   bootstrap puts `$HOME/.local/bin` first on `PATH` (both the foreground and the detached
+//!   start), which is what makes the wrapper win over `/usr/bin/gh`; the note also names the
+//!   absolute path. It holds no secret, refuses `gh auth
+//!   token`, `gh auth status -t`, `gh auth git-credential`, `gh auth login` and `gh auth
+//!   setup-git`, and respects a
+//!   `GH_TOKEN`/`GITHUB_TOKEN` already in the environment. The agent note
+//!   `~/.claude/rules/monoptah-cloud-git.md` (GitHub and GitLab, marked, no secret) tells the
+//!   agent what is preconfigured. Both files are removed (only if marked) when the session
+//!   has no credential. A foreign `~/.local/bin/gh` or note is never overwritten.
 //! * Relay: the outer sandbox listens on `127.0.0.1:`[`DEFAULT_RELAY_PORT`] (the only place
 //!   `ssh -L` may point to). Each connection runs `docker exec -i -u <remoteUser> <container>`
 //!   with the Host's own packaged Node (`$(cat ~/.monocode-host/runtime-path)/bin/node -e`)
@@ -78,6 +92,9 @@
 //! * Every process in the container, repository lifecycle commands included, can use the
 //!   Git token through the mounted socket (scoped to the one repo URL) and the Claude token
 //!   through the Host's environment.
+//! * Likewise any process in the container that can run `gh` gets the token through the
+//!   wrapper (same trade-off as the socket, except that through `gh` the token is limited only
+//!   by its own PAT permissions).
 //! * The Claude installer runs with the token exported.
 //! * The socket is reachable only by the outer sandbox user's uid: with
 //!   `updateRemoteUserUID` off and a different container uid, the container can not use it.
@@ -1459,6 +1476,9 @@ impl CloudSessions {
             .clone()
             .ok_or("Missing sandbox data.")?;
         let clone_url = git_credentials::clone_url(&start.config.repo_url)?;
+        // The host and the `path=` of the credential payload (see `GitCredentials::summary_for`),
+        // so the gh wrapper asks the cache for exactly the entry that was approved.
+        let (platform, repo_path) = git_credentials::payload_path(&start.config.repo_url)?;
         // Without a container the script runs in the outer sandbox and finds the cache
         // socket itself (empty SOCKET).
         let socket = match target.mode {
@@ -1476,6 +1496,8 @@ impl CloudSessions {
                     },
                 ),
                 ("CLONE_URL", &clone_url),
+                ("GIT_HOST", platform.host()),
+                ("REPO_PATH", &repo_path),
                 ("SOCKET", &socket),
             ],
             GIT_CONFIG_SCRIPT,

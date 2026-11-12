@@ -16,7 +16,7 @@ start_detached_host() {
     exit 1
   fi
   (
-    PATH="$PATH:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    PATH="$HOME/.local/bin:$PATH:/usr/local/bin:/usr/bin:/bin"
     export PATH
     if command -v setsid >/dev/null 2>&1; then
       setsid "$ENTRY" serve --data-dir "$BASE" --port "$HOST_PORT" </dev/null >>"$BASE/host.log" 2>&1 &

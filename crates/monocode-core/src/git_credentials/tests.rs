@@ -487,3 +487,15 @@ fn check_token_validates_like_save_and_rejects_a_host_mismatch() {
     assert!(runner.calls.lock().unwrap().is_empty(), "nothing ran");
     assert!(run(GitPlatform::GitLab, "", TOKEN, "https://gitlab.com/g/r").is_ok());
 }
+
+#[test]
+fn payload_path_matches_the_credential_payload() {
+    let f = fixture();
+    let id = save_github(&f);
+    for url in ["https://github.com/o/r.git", "https://github.com/o/r"] {
+        let payload = f.creds.credential_payload(&id, url).unwrap();
+        let (platform, path) = payload_path(url).unwrap();
+        assert_eq!(platform.host(), "github.com");
+        assert!(payload.contains(&format!("\npath={path}\n")), "{url}");
+    }
+}

@@ -1148,6 +1148,8 @@ fn the_clone_and_up_scripts_carry_the_validated_settings() {
     let git = fx.shell.call("gitconfig");
     assert!(git.stdin.contains("WANT_CRED='1'\n"));
     assert!(git.stdin.contains(&format!("CLONE_URL='{REPO}'\n")));
+    assert!(git.stdin.contains("GIT_HOST='github.com'\n"));
+    assert!(git.stdin.contains("REPO_PATH='octo/widgets.git'\n"));
     assert!(git.stdin.contains("SOCKET='/run/monoptah-git/sock'\n"));
 }
 
@@ -1851,6 +1853,8 @@ mod scripts {
             &[
                 ("WANT_CRED", "1"),
                 ("CLONE_URL", "https://github.com/octo/widgets.git"),
+                ("GIT_HOST", "github.com"),
+                ("REPO_PATH", "octo/widgets.git"),
                 ("SOCKET", "/run/monoptah-git/sock"),
             ],
             GIT_CONFIG_SCRIPT,
@@ -1955,6 +1959,8 @@ mod scripts {
             &[
                 ("WANT_CRED", "1"),
                 ("CLONE_URL", "https://github.com/octo/widgets.git"),
+                ("GIT_HOST", "github.com"),
+                ("REPO_PATH", "octo/widgets.git"),
                 ("SOCKET", ""),
             ],
             GIT_CONFIG_SCRIPT,
@@ -1982,6 +1988,393 @@ mod scripts {
             config.contains(&format!("helper = cache --socket={}", socket.display())),
             "{config}"
         );
+    }
+
+    const FAKE_TOKEN: &str = "ghp_FAKEWRAPPERTOKEN123456";
+
+    /// Runs the configure script in `outer`'s HOME; returns (ok, stdout, stderr).
+    fn configure(outer: &Outer, host: &str, want: &str) -> (bool, String, String) {
+        let url = format!("https://{host}/octo/widgets.git");
+        let script = with_vars(
+            &[
+                ("WANT_CRED", want),
+                ("CLONE_URL", &url),
+                ("GIT_HOST", host),
+                ("REPO_PATH", "octo/widgets.git"),
+                ("SOCKET", ""),
+            ],
+            GIT_CONFIG_SCRIPT,
+        );
+        assert!(!script.contains(FAKE_TOKEN));
+        let mut child = Command::new("sh")
+            .arg("-s")
+            .env("HOME", outer.home.path())
+            .env("GIT_CONFIG_GLOBAL", outer.home.path().join("gitconfig"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    /// Puts [`FAKE_TOKEN`] for `octo/widgets.git` into a real cache daemon in `outer`.
+    fn cache_fake_token(outer: &Outer) -> String {
+        let script = with_vars(
+            &[("PHASE", "approve"), ("CACHE_TIMEOUT", "600")],
+            PROVISION_SCRIPT,
+        );
+        let payload = format!(
+            "protocol=https\nhost=github.com\npath=octo/widgets.git\nusername=me\npassword={FAKE_TOKEN}\n\n"
+        );
+        let (ok, _, stderr) = outer.run_c(&script, &payload);
+        assert!(ok, "{stderr}");
+        outer
+            .home
+            .path()
+            .join(".monoptah/git/sock")
+            .display()
+            .to_string()
+    }
+
+    fn stop_cache(sock: &str) {
+        let _ = Command::new("git")
+            .args(["credential-cache", "--socket", sock, "exit"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status();
+    }
+
+    /// Stops the cache daemon when dropped, so a failing test does not leave it running.
+    struct CacheGuard(String);
+    impl Drop for CacheGuard {
+        fn drop(&mut self) {
+            stop_cache(&self.0);
+        }
+    }
+
+    /// Runs `$HOME/.local/bin/gh args` with a fake real `gh` behind it; the fake reports
+    /// whether `GH_TOKEN` equals `FAKE_EXPECT` and never prints the token.
+    fn run_wrapper(outer: &Outer, args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
+        let real = outer.home.path().join("realbin");
+        std::fs::create_dir_all(&real).unwrap();
+        executable(
+            &real.join("gh"),
+            "if [ -z \"${GH_TOKEN:-}\" ]; then echo token=none; \
+             elif [ \"$GH_TOKEN\" = \"$FAKE_EXPECT\" ]; then echo token=match; \
+             else echo token=other; fi\necho \"args=$*\"",
+        );
+        let path = format!(
+            "{}:{}:{}",
+            outer.home.path().join(".local/bin").display(),
+            real.display(),
+            std::env::var("PATH").unwrap()
+        );
+        let mut cmd = Command::new(outer.home.path().join(".local/bin/gh"));
+        cmd.args(args)
+            .env("HOME", outer.home.path())
+            .env("PATH", path)
+            .env("FAKE_EXPECT", FAKE_TOKEN)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .stdin(Stdio::null());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        (
+            out.status.code().unwrap(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    #[test]
+    fn github_configure_installs_the_gh_wrapper_and_the_note() {
+        let outer = Outer::new();
+        let sock = cache_fake_token(&outer);
+        let _guard = CacheGuard(sock.clone());
+        let (ok, stdout, stderr) = configure(&outer, "github.com", "1");
+        assert!(ok, "{stderr}");
+        assert!(stdout.contains("MONOPTAH_GIT=configured"));
+        assert!(stdout.contains("MONOPTAH_GH=wrapped"));
+        assert!(stdout.contains("MONOPTAH_NOTE=written"));
+        let gh = outer.home.path().join(".local/bin/gh");
+        let text = std::fs::read_to_string(&gh).unwrap();
+        assert!(text.starts_with("#!/bin/sh\n# monoptah-gh-wrapper v1\n"));
+        assert!(!text.contains(FAKE_TOKEN));
+        assert!(text.contains(&format!("SOCK='{sock}'")));
+        assert!(text.contains("REPO_PATH='octo/widgets.git'"));
+        assert_eq!(
+            std::fs::metadata(&gh).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        let note = std::fs::read_to_string(
+            outer
+                .home
+                .path()
+                .join(".claude/rules/monoptah-cloud-git.md"),
+        )
+        .unwrap();
+        assert!(note.starts_with("<!-- monoptah-cloud-git v1 -->\n"));
+        assert!(note.contains("https://github.com/octo/widgets.git"));
+        assert!(note.contains("gh pr create") && !note.contains(FAKE_TOKEN));
+        // The wrapper reaches the fake gh with the cached token, and is not found again
+        // as the "real" gh although its directory is first on PATH.
+        let (code, stdout, stderr) = run_wrapper(&outer, &["pr", "create"], &[]);
+        assert_eq!(code, 0, "{stderr}");
+        assert!(stdout.contains("token=match"), "{stdout}");
+        assert!(stdout.contains("args=pr create"));
+        assert!(!stdout.contains(FAKE_TOKEN) && !stderr.contains(FAKE_TOKEN));
+        // Installing again replaces our own wrapper.
+        let (ok, stdout, _) = configure(&outer, "github.com", "1");
+        assert!(ok && stdout.contains("MONOPTAH_GH=wrapped"));
+        stop_cache(&sock);
+    }
+
+    #[test]
+    fn the_gh_wrapper_serves_only_its_own_repo_and_survives_a_missing_credential() {
+        let outer = Outer::new();
+        let sock = cache_fake_token(&outer);
+        let _guard = CacheGuard(sock.clone());
+        let (ok, _, stderr) = configure(&outer, "github.com", "1");
+        assert!(ok, "{stderr}");
+        // Same cache, but a wrapper baked for another repo gets no token.
+        let gh = outer.home.path().join(".local/bin/gh");
+        let text = std::fs::read_to_string(&gh).unwrap();
+        std::fs::write(&gh, text.replace("octo/widgets.git", "octo/other.git")).unwrap();
+        let (code, stdout, stderr) = run_wrapper(&outer, &["api", "user"], &[]);
+        assert_eq!(code, 0);
+        assert!(stdout.contains("token=none"), "{stdout}");
+        assert!(stderr.contains("no Git credential for github.com/octo/other.git"));
+        assert!(!stdout.contains(FAKE_TOKEN) && !stderr.contains(FAKE_TOKEN));
+        // Cache gone: the real gh still runs, without a token.
+        std::fs::write(&gh, text).unwrap();
+        stop_cache(&sock);
+        let (code, stdout, stderr) = run_wrapper(&outer, &["api", "user"], &[]);
+        assert_eq!(code, 0);
+        assert!(stdout.contains("token=none"), "{stdout}");
+        assert!(stderr.contains("no Git credential for github.com/octo/widgets.git"));
+    }
+
+    #[test]
+    fn the_gh_wrapper_refuses_commands_that_print_or_store_the_token() {
+        let outer = Outer::new();
+        let sock = cache_fake_token(&outer);
+        let _guard = CacheGuard(sock.clone());
+        let (ok, _, stderr) = configure(&outer, "github.com", "1");
+        assert!(ok, "{stderr}");
+        for args in [
+            &["auth", "token"][..],
+            &["auth", "status", "-t"],
+            &["auth", "status", "--show-token"],
+            &["auth", "status", "-at"],
+            &["auth", "status", "-ta"],
+            &["auth", "git-credential", "get"],
+            &["auth", "login"],
+            &["auth", "setup-git"],
+        ] {
+            let (code, stdout, stderr) = run_wrapper(&outer, args, &[]);
+            assert_eq!(code, 2, "{args:?}");
+            assert!(stdout.is_empty(), "{args:?}: {stdout}");
+            assert!(!stderr.contains(FAKE_TOKEN));
+        }
+        // Other auth commands pass through, also a short flag that carries a value.
+        let (code, stdout, _) = run_wrapper(&outer, &["auth", "status"], &[]);
+        assert_eq!(code, 0);
+        assert!(stdout.contains("token=match"));
+        let (code, stdout, _) = run_wrapper(&outer, &["auth", "status", "-hgithub.com"], &[]);
+        assert_eq!(code, 0, "{stdout}");
+        assert!(stdout.contains("token=match"));
+        stop_cache(&sock);
+    }
+
+    #[test]
+    fn the_gh_wrapper_respects_an_explicit_token_and_reports_a_missing_gh() {
+        let outer = Outer::new();
+        let sock = cache_fake_token(&outer);
+        let _guard = CacheGuard(sock.clone());
+        let (ok, _, stderr) = configure(&outer, "github.com", "1");
+        assert!(ok, "{stderr}");
+        let (code, stdout, _) = run_wrapper(&outer, &["api", "user"], &[("GH_TOKEN", "mine")]);
+        assert_eq!(code, 0);
+        assert!(stdout.contains("token=other"), "{stdout}");
+        let (code, stdout, _) = run_wrapper(&outer, &["api", "user"], &[("GITHUB_TOKEN", "mine")]);
+        assert_eq!(code, 0);
+        assert!(
+            stdout.contains("token=none"),
+            "GH_TOKEN stays unset: {stdout}"
+        );
+        // No real gh on PATH: exit 127 with a clear error.
+        let out = Command::new(outer.home.path().join(".local/bin/gh"))
+            .env("HOME", outer.home.path())
+            .env("PATH", outer.home.path().join(".local/bin"))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(127));
+        assert!(String::from_utf8_lossy(&out.stderr)
+            .contains("The GitHub CLI (gh) is not installed in this sandbox."));
+        stop_cache(&sock);
+    }
+
+    #[test]
+    fn a_foreign_gh_and_a_foreign_note_are_left_alone() {
+        let outer = Outer::new();
+        let bin = outer.home.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("gh"), "#!/bin/sh\necho mine\n").unwrap();
+        let rules = outer.home.path().join(".claude/rules");
+        std::fs::create_dir_all(&rules).unwrap();
+        std::fs::write(rules.join("monoptah-cloud-git.md"), "my own rule\n").unwrap();
+        let (ok, stdout, stderr) = configure(&outer, "github.com", "1");
+        assert!(ok, "{stderr}");
+        assert!(stdout.contains("[monoptah] ~/.local/bin/gh is not ours; leaving it"));
+        assert!(!stdout.contains("MONOPTAH_GH=wrapped") && !stdout.contains("MONOPTAH_NOTE"));
+        assert_eq!(
+            std::fs::read_to_string(bin.join("gh")).unwrap(),
+            "#!/bin/sh\necho mine\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(rules.join("monoptah-cloud-git.md")).unwrap(),
+            "my own rule\n"
+        );
+        // Unbinding leaves unmarked files too.
+        let (ok, _, _) = configure(&outer, "github.com", "0");
+        assert!(ok);
+        assert!(bin.join("gh").exists() && rules.join("monoptah-cloud-git.md").exists());
+    }
+
+    #[test]
+    fn the_gh_wrapper_skips_another_copy_of_itself_on_path() {
+        let outer = Outer::new();
+        let _guard = CacheGuard(cache_fake_token(&outer));
+        let (ok, _, stderr) = configure(&outer, "github.com", "1");
+        assert!(ok, "{stderr}");
+        let copy = outer.home.path().join("copy");
+        std::fs::create_dir_all(&copy).unwrap();
+        std::fs::copy(outer.home.path().join(".local/bin/gh"), copy.join("gh")).unwrap();
+        // The copy comes before the fake real gh on PATH: it must be skipped, not exec'd.
+        let real = outer.home.path().join("realbin");
+        std::fs::create_dir_all(&real).unwrap();
+        executable(&real.join("gh"), "echo token=${GH_TOKEN:+set}");
+        let out = Command::new(outer.home.path().join(".local/bin/gh"))
+            .env("HOME", outer.home.path())
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}:{}",
+                    copy.display(),
+                    real.display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "token=set");
+    }
+
+    #[test]
+    fn a_failing_wrapper_or_note_never_fails_the_configure_step() {
+        // A dangling ~/.claude/rules symlink: the note can not be written.
+        let outer = Outer::new();
+        std::fs::create_dir_all(outer.home.path().join(".claude")).unwrap();
+        std::os::unix::fs::symlink(
+            "/nonexistent-monoptah-dir/x",
+            outer.home.path().join(".claude/rules"),
+        )
+        .unwrap();
+        let (ok, stdout, stderr) = configure(&outer, "github.com", "1");
+        assert!(ok, "{stderr}");
+        assert!(stdout.contains("MONOPTAH_GIT=configured"));
+        assert!(
+            stdout.contains("could not write the agent note"),
+            "{stdout}"
+        );
+        // A read-only ~/.local/bin: the wrapper can not be written (skipped as root, which
+        // ignores permissions).
+        let outer = Outer::new();
+        let bin = outer.home.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let (ok, stdout, stderr) = configure(&outer, "github.com", "1");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(ok, "{stderr}");
+        assert!(stdout.contains("MONOPTAH_GIT=configured"));
+        if !bin.join("gh").exists() {
+            assert!(
+                stdout.contains("could not install the gh wrapper"),
+                "{stdout}"
+            );
+            assert!(
+                std::fs::read_dir(&bin).unwrap().next().is_none(),
+                "no temp file left"
+            );
+        }
+    }
+
+    #[test]
+    fn gitlab_removes_a_wrapper_left_by_another_repo() {
+        let outer = Outer::new();
+        let (ok, _, stderr) = configure(&outer, "github.com", "1");
+        assert!(ok, "{stderr}");
+        assert!(outer.home.path().join(".local/bin/gh").exists());
+        let (ok, stdout, stderr) = configure(&outer, "gitlab.com", "1");
+        assert!(ok, "{stderr}");
+        assert!(stdout.contains("MONOPTAH_GH=removed"));
+        assert!(!outer.home.path().join(".local/bin/gh").exists());
+    }
+
+    #[test]
+    fn gitlab_gets_the_note_but_no_wrapper() {
+        let outer = Outer::new();
+        let (ok, stdout, stderr) = configure(&outer, "gitlab.com", "1");
+        assert!(ok, "{stderr}");
+        assert!(stdout.contains("MONOPTAH_NOTE=written") && !stdout.contains("MONOPTAH_GH"));
+        assert!(!outer.home.path().join(".local/bin/gh").exists());
+        let note = std::fs::read_to_string(
+            outer
+                .home
+                .path()
+                .join(".claude/rules/monoptah-cloud-git.md"),
+        )
+        .unwrap();
+        assert!(note.contains("https://gitlab.com/octo/widgets.git"));
+        assert!(note.contains("not `glab`") && !note.contains("gh pr"));
+    }
+
+    #[test]
+    fn unbinding_the_credential_removes_only_our_files() {
+        let outer = Outer::new();
+        let (ok, _, stderr) = configure(&outer, "github.com", "1");
+        assert!(ok, "{stderr}");
+        let gh = outer.home.path().join(".local/bin/gh");
+        let note = outer
+            .home
+            .path()
+            .join(".claude/rules/monoptah-cloud-git.md");
+        assert!(gh.exists() && note.exists());
+        let (ok, stdout, stderr) = configure(&outer, "github.com", "0");
+        assert!(ok, "{stderr}");
+        assert!(stdout.contains("MONOPTAH_GH=removed") && stdout.contains("MONOPTAH_NOTE=removed"));
+        assert!(!gh.exists() && !note.exists());
+        // Nothing to remove is fine.
+        let (ok, _, _) = configure(&outer, "github.com", "0");
+        assert!(ok);
     }
 
     #[test]

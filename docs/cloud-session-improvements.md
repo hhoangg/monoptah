@@ -582,7 +582,7 @@ enum PanelRoot {
 | stage, unstage, hunk stage (`git_stage_contents`) | Allowed. |
 | discard file / discard all | Allowed with the existing confirmation. Refused while a turn is running ("the agent may be editing these files"). |
 | commit | Allowed. While a turn is running: confirmation ("the agent may commit or change the index at the same time"). Commit-message generation runs locally on the remote `staged_context`; this is acceptable because the diff stays with the same user. |
-| push / pull / sync / create PR | Allowed as explicit user actions. They use the **remote's** credentials: the codespace's `GITHUB_TOKEN`, or the sandbox `git-credential-cache` from `docker_provision.sh`. A push failure shows the remote's error text (scrubbed by `sandboxes::redact`). |
+| push / pull / sync / create PR | Allowed as explicit user actions. They use the **remote's** credentials: the codespace's `GITHUB_TOKEN`, or in a sandbox the `git-credential-cache` from `docker_provision.sh` (push / pull / sync) and, for create PR, `gh` through the Monoptah wrapper that reads the same cached token (GitHub only). A push failure shows the remote's error text (scrubbed by `sandboxes::redact`). |
 | checkout / create branch / stash / worktrees | Allowed only when no turn is running, with a confirmation that says the agent's working directory changes. |
 
 **Where "refused while a turn is running" is enforced.** `engine.withIdleProject`
