@@ -866,11 +866,30 @@ impl DockerAccess {
         self.accounts.get(account_id).ok().map(|a| a.docker_id)
     }
 
+    /// The id of the saved account with this Docker ID (the oldest), `None` when there is none.
+    pub fn account_for_docker_id(&self, docker_id: &str) -> Option<String> {
+        self.accounts
+            .list()
+            .ok()?
+            .into_iter()
+            .find(|a| a.docker_id == docker_id)
+            .map(|a| a.id)
+    }
+
     /// The error to report when `sbx` rejected even a fresh JWT of this account: the
-    /// account's token is revoked or expired (or the account is gone).
+    /// account's token is revoked or expired (or the account is gone). The stored token
+    /// is marked `revoked`, so Settings shows it; the token itself is never read or logged.
     pub fn rejected(&self, account_id: &str) -> DockerAuthError {
         match self.docker_id(account_id) {
-            Some(docker_id) => DockerAuthError::Revoked { docker_id },
+            Some(docker_id) => {
+                if let Ok(Some(nonce)) = self.accounts.nonce(account_id) {
+                    let _ =
+                        self.accounts
+                            .set_status(account_id, &nonce, DockerAccountStatus::Revoked);
+                }
+                self.invalidate(account_id);
+                DockerAuthError::Revoked { docker_id }
+            }
             None => DockerAuthError::UnknownAccount,
         }
     }
@@ -902,6 +921,11 @@ static SHARED: RwLock<Option<Arc<DockerAccess>>> = RwLock::new(None);
 /// Install the process-wide instance, replacing any earlier one (tests install fakes).
 pub fn install(access: Arc<DockerAccess>) {
     *SHARED.write().unwrap_or_else(|e| e.into_inner()) = Some(access);
+}
+/// Removes the process-wide instance, returning it (tests of the app restore the state they
+/// found; an account then fails with [`DockerAuthError::NotAvailable`]).
+pub fn uninstall() -> Option<Arc<DockerAccess>> {
+    SHARED.write().unwrap_or_else(|e| e.into_inner()).take()
 }
 /// Test-only: set (or clear) the process-wide instance, returning the previous one.
 #[cfg(test)]
@@ -956,8 +980,40 @@ pub fn is_rejection(text: &str) -> bool {
     text.contains(REJECTED_MARKER)
 }
 
+/// The one rule for an ssh (or anything whose ProxyCommand runs `sbx`) that ran as Docker
+/// account `account`: when it failed and its output says the JWT was rejected, drop the
+/// account's cached JWT so the next spawn exchanges a fresh one. Returns whether that
+/// happened. `output` is only inspected, never kept or logged.
+pub fn invalidate_if_rejected(account: Option<&str>, success: bool, output: &str) -> bool {
+    let Some(account) = account.filter(|_| !success && is_rejection(output)) else {
+        return false;
+    };
+    if let Some(access) = shared() {
+        access.invalidate(account);
+    }
+    true
+}
+
+/// The terminal flavor of [`invalidate_if_rejected`]: an interactive `ssh` shows its error on
+/// the screen, so the app has no output to read, only the exit status. ssh itself exits with
+/// 255 when the connection failed, which includes a ProxyCommand (`sbx`) that refused the
+/// JWT. Drop the account's cached JWT on that status so the next terminal gets a fresh one.
+pub fn invalidate_after_ssh_exit(account: Option<&str>, code: Option<i32>) -> bool {
+    let Some(account) = account.filter(|_| code == Some(255)) else {
+        return false;
+    };
+    if let Some(access) = shared() {
+        access.invalidate(account);
+    }
+    true
+}
+
 /// [`env_for`] applied to a command: sets [`ACCESS_TOKEN_VAR`] on the child's environment
 /// only (never argv). A no-op without an account. The error is the user-facing text.
+///
+/// The JWT is a [`Secret`] (wiped on drop, never printed) up to here. `Command::env` takes
+/// an owned `OsString` and keeps it for the life of the command, so one plain copy of the
+/// token is forced by that API; it lives only as long as the `Command`.
 pub fn apply_env(command: &mut std::process::Command, account: Option<&str>) -> Result<(), String> {
     if let Some((name, token)) = env_for(account).map_err(|e| e.to_string())? {
         command.env(name, token.as_str());

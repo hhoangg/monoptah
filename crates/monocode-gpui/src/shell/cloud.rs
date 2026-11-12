@@ -641,20 +641,29 @@ pub(super) fn sandbox_ssh_args(terminal: &SandboxTerminal) -> Vec<OsString> {
     .collect()
 }
 
+/// The environment of a sandbox terminal's ssh: plain variables, and secrets that stay in a
+/// wiped, never-printed [`Secret`] until the PTY's environment is built.
+pub(super) struct SandboxEnv {
+    pub plain: Vec<(String, OsString)>,
+    pub secret: Vec<(String, monocode_core::git_credentials::Secret)>,
+}
+
 /// The environment of a sandbox terminal's ssh. The ssh alias runs `sbx` as its
 /// ProxyCommand, which a Finder-launched app cannot find on launchd's bare PATH. A sandbox in
 /// a Docker account also needs that account's token for the same ProxyCommand, resolved now
 /// because the JWT is short-lived; an account that cannot give one is an error, never the
 /// machine's sign-in.
-pub(super) fn sandbox_terminal_env(
-    terminal: &SandboxTerminal,
-) -> Result<Vec<(String, OsString)>, String> {
-    let mut env = vec![(
-        "PATH".to_string(),
-        OsString::from(monocode_core::scm::terminal_search_path()),
-    )];
-    env.extend(terminal.env()?);
-    Ok(env)
+///
+/// BLOCKS on Docker Hub when the account's JWT must be exchanged: only ever call it on the
+/// background executor (see [`Shell::new_cloud_terminal`]).
+pub(super) fn sandbox_terminal_env(terminal: &SandboxTerminal) -> Result<SandboxEnv, String> {
+    Ok(SandboxEnv {
+        plain: vec![(
+            "PATH".to_string(),
+            OsString::from(monocode_core::scm::terminal_search_path()),
+        )],
+        secret: terminal.env()?,
+    })
 }
 
 /// `ssh` on the login-shell PATH.
@@ -1042,48 +1051,45 @@ impl Shell {
         terminal
     }
 
-    /// A local PTY running `ssh -t` into the container of sandbox session `id`. `None`, with
-    /// the reason in the window's error line, when the sandbox connection cannot be found.
-    pub(super) fn spawn_sandbox_terminal(
+    /// A local PTY running `ssh -t` into the container of `command`'s sandbox, with the
+    /// environment resolved by [`sandbox_terminal_env`]. Starts a process but never waits on
+    /// the network.
+    fn launch_sandbox_terminal(
         &mut self,
-        id: i64,
+        command: SandboxTerminal,
+        env: SandboxEnv,
         cx: &mut Context<Self>,
-    ) -> Option<Entity<Terminal>> {
-        let command = match self.cloud.sandbox_terminal(id) {
-            Ok(command) => command,
-            Err(error) => {
-                self.error = Some(format!("Could not open a terminal in the sandbox: {error}"));
-                cx.notify();
-                return None;
-            }
-        };
+    ) -> Entity<Terminal> {
         let cwd = crate::terminal::home_cwd();
-        let env = match sandbox_terminal_env(&command) {
-            Ok(env) => env,
-            Err(error) => {
-                self.error = Some(format!("Could not open a terminal in the sandbox: {error}"));
-                cx.notify();
-                return None;
-            }
-        };
         let terminal = cx.new(|cx| {
-            Terminal::launch(
+            Terminal::launch_with_secrets(
                 std::path::Path::new(&cwd),
                 ssh_program(),
                 sandbox_ssh_args(&command),
-                env,
+                env.plain,
+                env.secret,
                 Vec::new(),
                 cx,
             )
         });
-        self.observations
-            .push(cx.subscribe(&terminal, |_, _, _: &TerminalEvent, cx| cx.notify()));
-        Some(terminal)
+        self.observations.push(
+            cx.subscribe(&terminal, move |_, _, event: &TerminalEvent, cx| {
+                // ssh exits 255 when its connection failed, which includes a ProxyCommand
+                // (`sbx`) that refused the JWT: drop the account's cached token so the next
+                // terminal gets a fresh one.
+                if let TerminalEvent::Exited { code, .. } = event {
+                    command.note_exit(*code);
+                }
+                cx.notify()
+            }),
+        );
+        terminal
     }
 
-    /// The terminal that belongs to cloud session `id`: `gh codespace ssh` for a codespace,
-    /// `ssh -t` into the container for a sandbox. A sandbox whose terminal cannot be opened
-    /// falls back to a local shell at home, with the reason shown.
+    /// The terminal of cloud session `id` when it can be made without waiting: a codespace's
+    /// `gh codespace ssh`. A sandbox terminal is opened only by the user, from the session
+    /// menu ([`Self::new_cloud_terminal`]), because an ssh into a sandbox resumes (and bills)
+    /// it and a Docker account's token may need a Docker Hub exchange off the UI thread.
     pub(super) fn spawn_cloud_terminal(
         &mut self,
         id: i64,
@@ -1094,25 +1100,83 @@ impl Shell {
             CloudBackendKind::Codespaces => {
                 Some(self.spawn_codespace_terminal(&mark.codespace, cx))
             }
-            CloudBackendKind::DockerSandbox => self.spawn_sandbox_terminal(id, cx),
+            CloudBackendKind::DockerSandbox => None,
         }
     }
 
     /// Terminal for a cloud session: a local PTY running `gh codespace ssh`, or `ssh` into
     /// the container for a sandbox.
+    ///
+    /// A sandbox in a Docker account needs that account's token in the ssh environment, and
+    /// getting it can mean a Docker Hub exchange. That is resolved on the background
+    /// executor; the terminal is launched and its tab added on the UI thread afterwards.
+    /// Until then nothing is added; a failure shows its reason in the window's error line.
     pub(super) fn new_cloud_terminal(
         &mut self,
         id: i64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let cwd = crate::terminal::home_cwd();
         let project = self.workspace.project.clone();
-        // Resolve the terminal first: when it can not be opened (the reason is on screen)
-        // no dock tab is added and nothing is spawned.
-        let Some(terminal) = self.spawn_cloud_terminal(id, cx) else {
+        let Some(mark) = self.cloud_marks.get(&id).cloned() else {
             return;
         };
+        if mark.kind == CloudBackendKind::Codespaces {
+            let terminal = self.spawn_codespace_terminal(&mark.codespace, cx);
+            self.add_cloud_terminal(project, terminal, window, cx);
+            return;
+        }
+        // Resolve the connection first: when it can not be found (the reason is on screen)
+        // no dock tab is added and nothing is spawned. A store read, no network.
+        let command = match self.cloud.sandbox_terminal(id) {
+            Ok(command) => command,
+            Err(error) => {
+                self.error = Some(format!("Could not open a terminal in the sandbox: {error}"));
+                cx.notify();
+                return;
+            }
+        };
+        let fail = |this: &mut Self, error: String, cx: &mut Context<Self>| {
+            this.error = Some(format!("Could not open a terminal in the sandbox: {error}"));
+            cx.notify();
+        };
+        if command.docker_account.is_none() {
+            // The machine's sign-in: no token, no exchange, nothing to wait for.
+            match sandbox_terminal_env(&command) {
+                Ok(env) => {
+                    let terminal = self.launch_sandbox_terminal(command, env, cx);
+                    self.add_cloud_terminal(project, terminal, window, cx);
+                }
+                Err(error) => fail(self, error, cx),
+            }
+            return;
+        }
+        let work = cx.background_executor().spawn(async move {
+            let env = sandbox_terminal_env(&command);
+            (command, env)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let (command, env) = work.await;
+            let _ = this.update_in(cx, |this, window, cx| match env {
+                Ok(env) => {
+                    let terminal = this.launch_sandbox_terminal(command, env, cx);
+                    this.add_cloud_terminal(project, terminal, window, cx);
+                }
+                Err(error) => fail(this, error, cx),
+            });
+        })
+        .detach();
+    }
+
+    /// Adds `terminal`, a cloud session's shell, as a tab of `project`'s dock and shows it.
+    fn add_cloud_terminal(
+        &mut self,
+        project: String,
+        terminal: Entity<Terminal>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cwd = crate::terminal::home_cwd();
         let was_open = self
             .workspace
             .docks

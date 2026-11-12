@@ -110,8 +110,8 @@ use super::backend::docker::{
 use super::backend::{CloudBackendKind, CloudRef};
 use super::docker_config::{valid_ref, DockerProjectConfig};
 use super::startup::{
-    remove_start_record, save_start_record, start_record, StartEvent, StartRecord, Step, StepKind,
-    StepStatus, PROGRESS_PREFIX,
+    pending_starts, remove_start_record, save_start_record, start_record, StartEvent, StartRecord,
+    Step, StepKind, StepStatus, PROGRESS_PREFIX,
 };
 use super::{require_claude, CloudBinding, CloudSessions, OpenRequest, START_ABORTED};
 use crate::git_credentials::{self, GitCredentials};
@@ -601,8 +601,10 @@ impl CloudSessions {
         // A sandbox this process has not been told about is looked up in the pin settings.
         let pins = self.store.clone();
         let resolver: AccountResolver = Arc::new(move |name| {
-            let store = pins.lock().ok()?;
-            sandboxes::account::pinned(&store, name)
+            let store = pins
+                .lock()
+                .map_err(|_| "Native session store unavailable".to_string())?;
+            Ok(sandboxes::account::pinned(&store, name).or_else(|| started_account(&store, name)))
         });
         let backend = Arc::new(
             DockerBackend::new(runner.clone())
@@ -710,6 +712,7 @@ impl CloudSessions {
         let request_id = uuid::Uuid::new_v4().to_string();
         let name = sandboxes::sandbox_name_for(&branch, &request_id);
         let repo_dir = repo_dir_of(&path);
+        let account = config.docker_account.clone();
         let start = SandboxStart {
             request_id,
             config,
@@ -731,13 +734,24 @@ impl CloudSessions {
             let project = pending_cloud_project(local_cwd, &CloudRef::sandbox(&name), &remote_cwd);
             let session = store.create_pending_cloud_session(harness, project)?;
             record.session_id = session.id;
+            // The Docker account is pinned to the name BEFORE `sbx create`, in the same
+            // store block as the start record: from the first moment the name is known,
+            // every lookup of it (the background state read, forget_missing) runs as the
+            // account that is about to create it, never as the machine login. A pin that
+            // can not be written fails the start before anything is created.
+            if let Err(error) = sandboxes::account::pin(&store, &name, account.as_deref()) {
+                let _ = store.forget_cloud_session(session.id);
+                return Err(error);
+            }
             // Persisted BEFORE `sbx create`: a crash from here on finds the name again.
             if let Err(error) = save_start_record(&store, &record) {
                 let _ = store.forget_cloud_session(session.id);
+                let _ = sandboxes::account::pin(&store, &name, None);
                 return Err(error);
             }
             session
         };
+        deps.backend.remember_account(&name, account.as_deref());
         match self.ensure_created(&deps, &mut record, false) {
             Ok(()) => {
                 let now = self.now();
@@ -757,6 +771,9 @@ impl CloudSessions {
                 let store = self.store()?;
                 let _ = remove_start_record(&store, session.id);
                 let _ = store.forget_cloud_session(session.id);
+                // Nothing was created: the name is not the pinned account's.
+                let _ = sandboxes::account::pin(&store, &name, None);
+                deps.backend.forget_account(&name);
                 Err(failure.message)
             }
         }
@@ -785,12 +802,20 @@ impl CloudSessions {
         // project config, so a later change of the project's account does not move a retry.
         let account = start.config.docker_account.clone();
         let runner = sandboxes::as_account(&*deps.runner, account.as_deref());
+        if lookup_first {
+            // A retry of a record that predates the pin: write it before looking.
+            let store = self.store().map_err(CreateFailure::definite)?;
+            sandboxes::account::pin(&store, &name, account.as_deref())
+                .map_err(CreateFailure::definite)?;
+            drop(store);
+            deps.backend.remember_account(&name, account.as_deref());
+        }
         let mut found = None;
         if lookup_first {
             found = sandboxes::find_by_name(&runner, &name)
                 .map_err(|e| CreateFailure {
+                    ambiguous: !sandboxes::is_account_text(&e),
                     message: e,
-                    ambiguous: true,
                 })?
                 .map(|info| info.id);
         }
@@ -800,6 +825,11 @@ impl CloudSessions {
                 Ok(id) => id,
                 Err(error) => match error.id {
                     Some(id) => id,
+                    // The Docker account could not be used (no token, revoked): sbx never
+                    // ran or refused it, so nothing was created. Say it once, no lookup.
+                    None if sandboxes::is_account_text(&error.message) => {
+                        return Err(CreateFailure::definite(error.message))
+                    }
                     None => match sandboxes::find_by_name(&runner, &name) {
                         Ok(Some(found)) => found.id,
                         Ok(None) => {
@@ -818,11 +848,6 @@ impl CloudSessions {
                 },
             },
         };
-        // Created or adopted: from here on every call for this name runs as `account`.
-        if let Ok(store) = self.store() {
-            sandboxes::account::pin(&store, &name, account.as_deref());
-        }
-        deps.backend.remember_account(&name, account.as_deref());
         deps.backend.remember(&name, &id);
         if let Some(start) = record.sandbox_start.as_mut() {
             start.sandbox_id = Some(id);
@@ -2007,6 +2032,17 @@ impl CreateFailure {
             ambiguous: false,
         }
     }
+}
+
+/// The Docker account a sandbox without a pin is being created in: the project config the
+/// start record of that name was begun with.
+fn started_account(store: &Store, name: &str) -> Option<String> {
+    pending_starts(store).into_iter().find_map(|record| {
+        let cloud = record.cloud()?;
+        (cloud.kind == CloudBackendKind::DockerSandbox && cloud.name == name)
+            .then(|| record.sandbox_start?.config.docker_account)
+            .flatten()
+    })
 }
 
 /// Setting that remembers the id of the container a sandbox's Host lives in.

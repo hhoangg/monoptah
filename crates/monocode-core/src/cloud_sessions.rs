@@ -879,11 +879,12 @@ impl CloudSessions {
     }
     /// Registers the Docker sandbox backend over the real `sbx`, `ssh` and the app's own
     /// secret store. Nothing runs until a sandbox session is used.
+    ///
+    /// The Docker accounts (`sbx` and ssh get the JWT of a project's account from
+    /// [`crate::docker_accounts::shared`]) are NOT installed here: the app installs them once
+    /// at startup ([`crate::docker_accounts::install_system`]), so building this service over
+    /// a test database never puts the real Docker Hub exchange behind it.
     pub fn with_system_sandboxes(self, store: Database) -> Self {
-        // Docker accounts: `sbx` and ssh get the JWT of a project's account from here.
-        if let Ok(guard) = store.lock() {
-            crate::docker_accounts::install_system(&guard);
-        }
         let secrets = Arc::new(docker_start::StoreSecrets::new(store));
         self.with_sandboxes(
             Arc::new(crate::sandboxes::SystemSbx),
@@ -913,13 +914,23 @@ impl CloudSessions {
     /// The Docker account sandbox `name` lives in: the one that created it (pinned per
     /// sandbox name), not the project's current choice. `None` is the machine's `sbx login`,
     /// also for a sandbox created before accounts existed.
+    ///
+    /// Locks the native store on a cache miss: call it WITHOUT holding the store guard. An
+    /// answer that could not be read is `None` here; [`Self::try_sandbox_account`] tells
+    /// that apart where it matters.
     pub fn sandbox_account(&self, name: &str) -> Option<String> {
+        self.try_sandbox_account(name).ok().flatten()
+    }
+
+    /// [`Self::sandbox_account`], with `Err` when the account could not be read (it must not
+    /// be taken for the machine login, which would report a sandbox as gone).
+    pub fn try_sandbox_account(&self, name: &str) -> Result<Option<String>, String> {
         match &self.sandbox {
-            Some(deps) => deps.backend.account_of(name),
-            None => self
-                .store()
-                .ok()
-                .and_then(|store| crate::sandboxes::account::pinned(&store, name)),
+            Some(deps) => deps.backend.try_account_of(name),
+            None => {
+                let store = self.store()?;
+                Ok(crate::sandboxes::account::pinned(&store, name))
+            }
         }
     }
 
@@ -1454,7 +1465,29 @@ impl CloudSessions {
     /// Delete one session through the normal store cleanup. A missing Codespace
     /// only loses this session's local record; live hosts must accept the delete.
     pub fn delete_session(&self, id: i64) -> Result<(), String> {
-        self.store()?.delete_with_remote(id, &*self.gh, &*self.host)
+        // A session in a Docker sandbox: ask whether the sandbox still exists BEFORE taking
+        // the store, as the account it lives in. That runs `sbx` (and may exchange a Docker
+        // Hub token), which must not happen while the store is held.
+        let probe = self.store()?.sandbox_name_of_session(id);
+        let exists = match probe {
+            Some(name) => {
+                let account = self.try_sandbox_account(&name)?;
+                let runner: Arc<dyn crate::sandboxes::SbxRunner> = match &self.sandbox {
+                    Some(deps) => deps.runner.clone(),
+                    None => Arc::new(crate::sandboxes::SystemSbx),
+                };
+                Some(
+                    crate::sandboxes::find_by_name(
+                        &crate::sandboxes::as_account(&*runner, account.as_deref()),
+                        &name,
+                    )?
+                    .is_some(),
+                )
+            }
+            None => None,
+        };
+        self.store()?
+            .delete_with_remote_known(id, &*self.gh, &*self.host, exists)
     }
 
     /// Fresh, read-only inventory check before an archive/delete can attempt a
@@ -1783,14 +1816,26 @@ pub struct SandboxTerminal {
 impl SandboxTerminal {
     /// The environment pairs the terminal's ssh must run with, resolved now (the JWT is
     /// short-lived, so call this when the terminal is spawned, not when the menu opens).
-    /// Empty without an account. The token is in the environment only, never argv.
-    pub fn env(&self) -> Result<Vec<(String, std::ffi::OsString)>, String> {
+    /// Empty without an account. The token is in the environment only, never argv, and stays
+    /// in a [`Secret`](crate::git_credentials::Secret) (wiped on drop, never printed) until
+    /// the process environment is built.
+    ///
+    /// BLOCKS on Docker Hub when the account's JWT must be exchanged: call it on a worker,
+    /// never on the UI thread.
+    pub fn env(&self) -> Result<Vec<(String, crate::git_credentials::Secret)>, String> {
         let pair = crate::docker_accounts::env_for(self.docker_account.as_deref())
             .map_err(|e| e.to_string())?;
         Ok(pair
             .into_iter()
-            .map(|(name, token)| (name.to_owned(), std::ffi::OsString::from(token.as_str())))
+            .map(|(name, token)| (name.to_owned(), token))
             .collect())
+    }
+
+    /// The terminal's ssh ended with `code`: when that says the connection failed for the
+    /// sandbox's account (ssh's 255), its cached JWT is dropped so the next terminal gets a
+    /// fresh one. Returns whether it was dropped.
+    pub fn note_exit(&self, code: Option<i32>) -> bool {
+        crate::docker_accounts::invalidate_after_ssh_exit(self.docker_account.as_deref(), code)
     }
 }
 

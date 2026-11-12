@@ -58,16 +58,21 @@ fn outer_command(path: &str) -> String {
     format!("sh -c {}", crate::remote::shell_quote(&script))
 }
 
-/// Reads the Docker account pinned to a sandbox name (see [`sandboxes::account`]).
-pub type AccountResolver = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+/// Reads the Docker account of a sandbox name: its pin setting, else the start record of the
+/// name (see [`sandboxes::account`]). `Err` means the answer could not be read (the store is
+/// unavailable): never "no account", so it is neither cached nor read as the machine login.
+///
+/// A resolver locks the native store, so it must never be called while the caller holds the
+/// store guard (see [`DockerBackend::account_of`]).
+pub type AccountResolver = Arc<dyn Fn(&str) -> Result<Option<String>, String> + Send + Sync>;
 
 pub struct DockerBackend {
     runner: Arc<dyn SbxRunner>,
     ids: Mutex<HashMap<String, String>>,
-    /// The Docker account each sandbox lives in, by name, next to the id cache. Only
-    /// accounts are kept: a sandbox without one is looked up again, so a pin written later
-    /// (a create that just succeeded) is never missed.
-    accounts: Mutex<HashMap<String, String>>,
+    /// The Docker account each sandbox lives in, by name, next to the id cache. `Some(None)`
+    /// is a resolved "no account" (the machine login): the pin is written before `sbx create`,
+    /// so a name that resolved to no account stays so. An unresolved name is looked up.
+    accounts: Mutex<HashMap<String, Option<String>>>,
     /// Where an account not seen yet is read from (the pin setting).
     resolver: Option<AccountResolver>,
     /// The ssh seam of [`Self::run_script`] and [`Self::copy_from`]; without it they refuse.
@@ -182,10 +187,10 @@ impl DockerBackend {
                 let remote = target.exec_in_container(&["sh", "-l", "-s"]);
                 // The target is what the sandbox was connected with; a pin set later (a
                 // sandbox adopted after it was paired) still counts.
-                let account = target
-                    .docker_account
-                    .clone()
-                    .or_else(|| self.account_of(name));
+                let account = match target.docker_account.clone() {
+                    Some(account) => Some(account),
+                    None => self.try_account_of(name)?,
+                };
                 (shell, target.id, remote, account)
             }
             Where::Outer(owner_path) => {
@@ -198,7 +203,7 @@ impl DockerBackend {
                     shell,
                     self.id_of(name)?,
                     outer_command(owner_path),
-                    self.account_of(name),
+                    self.try_account_of(name)?,
                 )
             }
         };
@@ -232,50 +237,63 @@ impl DockerBackend {
         if let Ok(mut ids) = self.ids.lock() {
             ids.remove(name);
         }
-        self.remember_account(name, None);
+        self.forget_account(name);
     }
-    /// Remembers the Docker account sandbox `name` lives in (`None` forgets it: the
-    /// machine login, or a sandbox that is gone).
+    /// Remembers the Docker account sandbox `name` lives in; `None` is the machine login.
     pub fn remember_account(&self, name: &str, account: Option<&str>) {
         if let Ok(mut accounts) = self.accounts.lock() {
-            match account {
-                Some(account) => {
-                    accounts.insert(name.into(), account.into());
-                }
-                None => {
-                    accounts.remove(name);
-                }
-            }
+            accounts.insert(name.into(), account.map(str::to_owned));
+        }
+    }
+    /// Forgets what is known of the account of `name` (the sandbox is gone, or never was):
+    /// the next [`Self::account_of`] resolves it again.
+    pub fn forget_account(&self, name: &str) {
+        if let Ok(mut accounts) = self.accounts.lock() {
+            accounts.remove(name);
         }
     }
     /// The Docker account sandbox `name` lives in: told to this backend, else the account of
-    /// its remembered target, else the pin setting. `None` is the machine login.
+    /// its remembered target, else the pin setting. `None` is the machine login. An answer
+    /// that could not be read is `None` here; use [`Self::try_account_of`] where that must
+    /// not be taken for the machine login.
     pub fn account_of(&self, name: &str) -> Option<String> {
-        if let Some(account) = self
+        self.try_account_of(name).ok().flatten()
+    }
+    /// [`Self::account_of`], with `Err` when the answer could not be read. Both outcomes of a
+    /// successful read are remembered, including "no account".
+    ///
+    /// Locks the native store (through the resolver) on a cache miss: callers must NOT hold
+    /// the store guard, or this deadlocks.
+    pub fn try_account_of(&self, name: &str) -> Result<Option<String>, String> {
+        if let Some(known) = self
             .accounts
             .lock()
             .ok()
             .and_then(|accounts| accounts.get(name).cloned())
         {
-            return Some(account);
+            return Ok(known);
         }
         let from_target = self
             .targets
             .lock()
             .ok()
             .and_then(|targets| targets.get(name).and_then(|t| t.docker_account.clone()));
-        let found = from_target.or_else(|| self.resolver.as_ref().and_then(|read| read(name)));
-        if let Some(account) = &found {
-            self.remember_account(name, Some(account));
-        }
-        found
+        let found = match from_target {
+            Some(account) => Some(account),
+            None => match &self.resolver {
+                Some(read) => read(name)?,
+                None => None,
+            },
+        };
+        self.remember_account(name, found.as_deref());
+        Ok(found)
     }
     /// The id of sandbox `name`: remembered, else looked up by exact name.
     fn id_of(&self, name: &str) -> Result<String, String> {
         if let Some(id) = self.ids.lock().ok().and_then(|ids| ids.get(name).cloned()) {
             return Ok(id);
         }
-        let account = self.account_of(name);
+        let account = self.try_account_of(name)?;
         match sandboxes::find_by_name(
             &sandboxes::as_account(&*self.runner, account.as_deref()),
             name,
@@ -324,7 +342,7 @@ impl CloudBackend for DockerBackend {
     }
     fn state(&self, name: &str) -> Result<String, String> {
         let id = self.id_of(name)?;
-        let account = self.account_of(name);
+        let account = self.try_account_of(name)?;
         sandboxes::state(
             &sandboxes::as_account(&*self.runner, account.as_deref()),
             &id,
@@ -340,7 +358,7 @@ impl CloudBackend for DockerBackend {
     }
     fn stop(&self, name: &str) -> Result<(), String> {
         let id = self.id_of(name)?;
-        let account = self.account_of(name);
+        let account = self.try_account_of(name)?;
         sandboxes::stop(
             &sandboxes::as_account(&*self.runner, account.as_deref()),
             &id,
@@ -348,7 +366,7 @@ impl CloudBackend for DockerBackend {
     }
     fn delete(&self, name: &str) -> Result<(), String> {
         let id = self.id_of(name)?;
-        let account = self.account_of(name);
+        let account = self.try_account_of(name)?;
         sandboxes::delete(
             &sandboxes::as_account(&*self.runner, account.as_deref()),
             &id,
@@ -867,13 +885,7 @@ impl SandboxShell for SystemShell {
         let _ = (out.join(), err.join());
         // The ProxyCommand's `sbx` refused the JWT: drop it so the next spawn exchanges a
         // fresh one (the script never ran, the connection failed before it).
-        if let Some(account) =
-            account.filter(|_| !status.success() && crate::docker_accounts::is_rejection(&stderr))
-        {
-            if let Some(access) = crate::docker_accounts::shared() {
-                access.invalidate(account);
-            }
-        }
+        crate::docker_accounts::invalidate_if_rejected(account, status.success(), &stderr);
         Ok(ShellOutput {
             success: status.success(),
             stdout,

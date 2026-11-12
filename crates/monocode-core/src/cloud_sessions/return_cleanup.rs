@@ -328,10 +328,19 @@ impl CloudSessions {
                 "Monoptah no longer lists it, so it stays until you delete it yourself, for example with `gh codespace delete -c {}`.",
                 cloud.name
             ),
-            CloudBackendKind::DockerSandbox => format!(
-                "Monoptah no longer lists it, so it stays until you delete the sandbox {} yourself with Docker's sandbox tools (sbx).",
-                cloud.name
-            ),
+            CloudBackendKind::DockerSandbox => {
+                let hint = format!(
+                    "Monoptah no longer lists it, so it stays until you delete the sandbox {} yourself with Docker's sandbox tools (sbx).",
+                    cloud.name
+                );
+                // A sandbox in a Docker account is not visible to any other account.
+                match self.sandbox_account_label(&cloud.name) {
+                    Some(account) => format!(
+                        "{hint} The command must run with the token of {account}: a sandbox is not visible to any other Docker account."
+                    ),
+                    None => hint,
+                }
+            }
         }
     }
 

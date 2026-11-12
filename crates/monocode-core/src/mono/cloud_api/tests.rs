@@ -119,6 +119,10 @@ struct Sbx {
     /// The Docker account of every call, parallel to `calls`.
     accounts: Mutex<Vec<Option<String>>>,
     broken: Mutex<Option<String>>,
+    /// Every call made as this Docker account fails with this error text.
+    broken_for: Mutex<Option<(String, String)>>,
+    /// Sandbox name -> the only Docker account whose `ls` lists it (others list it for all).
+    visible_to: Mutex<std::collections::HashMap<String, String>>,
 }
 impl Sbx {
     fn new() -> Arc<Self> {
@@ -127,6 +131,8 @@ impl Sbx {
             calls: Mutex::new(vec![]),
             accounts: Mutex::new(vec![]),
             broken: Mutex::new(None),
+            broken_for: Mutex::new(None),
+            visible_to: Mutex::new(Default::default()),
         })
     }
     /// The accounts the `ls` calls ran as, in order.
@@ -179,10 +185,27 @@ impl SbxRunner for Sbx {
         if let Some(error) = self.broken.lock().unwrap().clone() {
             return Err(error);
         }
+        if let Some((failing, error)) = self.broken_for.lock().unwrap().clone() {
+            if account == Some(failing.as_str()) {
+                return Err(error);
+            }
+        }
         let item = |(id, name, state): &(String, String, String)| json!({"id":id,"name":name,"agent":"shell","state":state,"cpus":4,"memory_mib":8192,"expires_at":"2030-01-01T00:00:00Z"});
         match args.get(2).map(String::as_str).unwrap_or("") {
             "ls" => {
-                let items: Vec<Value> = self.sandboxes.lock().unwrap().iter().map(item).collect();
+                let owners = self.visible_to.lock().unwrap().clone();
+                let items: Vec<Value> = self
+                    .sandboxes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|s| {
+                        owners
+                            .get(&s.1)
+                            .is_none_or(|owner| Some(owner.as_str()) == account)
+                    })
+                    .map(item)
+                    .collect();
                 sbx_out(true, &Value::Array(items).to_string(), "")
             }
             "inspect" => {
@@ -2364,7 +2387,7 @@ mod docker_accounts {
             .unwrap();
     }
     fn pin(fx: &Fixture, name: &str, docker_account: &str) {
-        account::pin(&fx.store.lock().unwrap(), name, Some(docker_account));
+        account::pin(&fx.store.lock().unwrap(), name, Some(docker_account)).unwrap();
     }
 
     #[test]
@@ -2394,6 +2417,94 @@ mod docker_accounts {
         asked.sort();
         assert_eq!(asked, [None, Some(a.clone())], "never the project's new B");
         assert_eq!(listed["backends"], json!({"sandbox":{"ok":true}}));
+    }
+
+    const REVOKED: &str =
+        "Docker account bob: token revoked or expired. Replace it in Settings > Cloud.";
+
+    #[test]
+    fn a_failed_account_is_reported_not_taken_for_an_empty_list() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        let b = installed.add("bob");
+        let gh = FakeGh::new(vec![]);
+        let fx = fixture(&gh);
+        fx.bind_sandbox("box-1");
+        fx.bind_sandbox("box-2");
+        pin(&fx, "box-1", &a);
+        pin(&fx, "box-2", &b);
+        *fx.sbx.broken_for.lock().unwrap() = Some((b.clone(), REVOKED.into()));
+        fx.sbx.visible_to.lock().unwrap().extend([
+            ("box-1".to_string(), a.clone()),
+            ("box-2".to_string(), b.clone()),
+        ]);
+        let listed = fx.api.list(&fx.path(), &json!({"kind":"sandbox"})).unwrap();
+        let rows = listed["instances"].as_array().unwrap();
+        let row = |name: &str| rows.iter().find(|r| r["instance"] == name).unwrap();
+        // The healthy account's sandbox is listed as it is.
+        assert_eq!(row("box-1")["state"], "available");
+        // The failed account's sandbox is still there, unknown, with the reason: it is not
+        // "not listed", which could make a caller forget a sandbox that still bills.
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(row("box-2")["state"], "unknown");
+        assert_eq!(row("box-2")["error"], REVOKED);
+        assert_eq!(listed["backends"], json!({"sandbox":{"ok":true}}));
+    }
+
+    #[test]
+    fn it_is_an_error_only_when_no_account_could_be_listed() {
+        let installed = Installed::new();
+        let b = installed.add("bob");
+        let gh = FakeGh::new(vec![]);
+        let fx = fixture(&gh);
+        fx.bind_sandbox("box-2");
+        pin(&fx, "box-2", &b);
+        *fx.sbx.broken_for.lock().unwrap() = Some((b, REVOKED.into()));
+        // Asked for the sandbox backend alone, nothing listable is an error with the reason.
+        let error = fx
+            .api
+            .list(&fx.path(), &json!({"kind":"sandbox"}))
+            .unwrap_err();
+        assert_eq!(error, REVOKED);
+    }
+
+    #[test]
+    fn an_id_is_not_called_unknown_while_an_account_could_not_be_asked() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        let b = installed.add("bob");
+        let gh = FakeGh::new(vec![]);
+        let fx = fixture(&gh);
+        fx.bind_sandbox("box-1");
+        fx.bind_sandbox("box-2");
+        pin(&fx, "box-1", &a);
+        pin(&fx, "box-2", &b);
+        *fx.sbx.broken_for.lock().unwrap() = Some((b, REVOKED.into()));
+        let error = fx
+            .api
+            .delete(
+                &fx.path(),
+                &json!({"kind":"sandbox","instance":"sbx_999zzz"}),
+                &never_busy,
+            )
+            .unwrap_err();
+        assert!(
+            error.contains("could not be looked up") && error.contains(REVOKED),
+            "{error}"
+        );
+        assert!(!error.contains("was not found"), "{error}");
+        assert_eq!(fx.sbx.count("rm"), 0);
+        // With every account healthy it is plainly not found.
+        *fx.sbx.broken_for.lock().unwrap() = None;
+        let error = fx
+            .api
+            .delete(
+                &fx.path(),
+                &json!({"kind":"sandbox","instance":"sbx_999zzz"}),
+                &never_busy,
+            )
+            .unwrap_err();
+        assert!(error.contains("was not found"), "{error}");
     }
 
     #[test]

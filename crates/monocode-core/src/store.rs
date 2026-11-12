@@ -1270,9 +1270,22 @@ impl Store {
         gh: &dyn crate::codespaces::GhRunner,
         host: &dyn crate::cloud_sessions::Host,
     ) -> Result<(), String> {
+        self.delete_with_remote_known(id, gh, host, None)
+    }
+
+    /// [`Self::delete_with_remote`] where the caller already asked whether the session's
+    /// Docker sandbox still exists (`Some`), so no `sbx` call (and no Docker Hub exchange)
+    /// runs while the caller holds the store. `None` asks here, as before.
+    pub fn delete_with_remote_known(
+        &mut self,
+        id: i64,
+        gh: &dyn crate::codespaces::GhRunner,
+        host: &dyn crate::cloud_sessions::Host,
+        sandbox_exists: Option<bool>,
+    ) -> Result<(), String> {
         self.delete_using(id, |store| {
             if store.remote_session(id)?.is_some() {
-                store.delete_remote_session_with(id, gh, host)
+                store.delete_remote_session_known(id, gh, host, sandbox_exists)
             } else {
                 store.delete_rows(id)
             }

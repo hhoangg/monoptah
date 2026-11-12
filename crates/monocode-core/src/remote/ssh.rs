@@ -731,6 +731,17 @@ fn run_script_with_command(
     run_remote_command(target, script, job, askpass, command, &["sh", "-l", "-s"])
 }
 
+/// A failed ssh to a sandbox in a Docker account whose output says the JWT was rejected:
+/// drop the account's cached JWT (the shared rule, [`crate::docker_accounts`]), so the next
+/// spawn, a reconnect, exchanges a fresh one.
+fn note_rejection(target: &SshTarget, success: bool, output: &str) {
+    let account = target
+        .sandbox
+        .as_ref()
+        .and_then(|sandbox| sandbox.docker_account.as_deref());
+    crate::docker_accounts::invalidate_if_rejected(account, success, output);
+}
+
 fn run_remote_command(
     target: &SshTarget,
     script: String,
@@ -789,7 +800,9 @@ fn run_remote_command(
     let _ = writer.join();
     let output = String::from_utf8_lossy(&stdout.join().unwrap_or_default()).to_string();
     let errors = String::from_utf8_lossy(&stderr.join().unwrap_or_default()).to_string();
-    if !result? {
+    let succeeded = result?;
+    note_rejection(target, succeeded, &errors);
+    if !succeeded {
         return Err(format!(
             "SSH setup failed: {}",
             errors.trim().chars().take(4000).collect::<String>()
@@ -1163,9 +1176,11 @@ impl Tunnel {
                 return Err("Connection cancelled".into());
             }
             if !tunnel.alive() {
+                let errors = tunnel.stderr.lock().unwrap().clone();
+                note_rejection(target, false, &errors);
                 return Err(format!(
                     "SSH connection failed: {}. Open Settings → Connections and reconnect to check access.",
-                    tunnel.stderr.lock().unwrap().trim()
+                    errors.trim()
                 ));
             }
             if port_accepts(port) {
@@ -3383,6 +3398,96 @@ mod tests {
         );
         assert_eq!(lines[3], "echo secret-script");
         assert!(!lines[..3].iter().any(|l| l.contains("secret-script")));
+    }
+    /// A fake `ssh` that fails with `stderr_text`, as the ProxyCommand's `sbx` does.
+    #[cfg(unix)]
+    fn failing_ssh(dir: &std::path::Path, stderr_text: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("fake-ssh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho '{stderr_text}' >&2\nexit 255\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_rejected_token_in_a_failed_ssh_script_drops_the_cached_token() {
+        use crate::docker_accounts::test_support::Installed;
+        let installed = Installed::new();
+        let id = installed.add("alice");
+        let target = account_target(Some(&id));
+        let dir = tempfile::tempdir().unwrap();
+        let job = Job::new();
+        let askpass = job.askpass().unwrap();
+        let token_of =
+            || env_var(&command(&target, false).unwrap(), "DOCKER_ACCESS_TOKEN").unwrap();
+        // Another failure does not drop it.
+        let other = failing_ssh(dir.path(), "ssh: connect to host: Connection refused");
+        let first = token_of();
+        let error = run_script_with_command(
+            &target,
+            "true\n".into(),
+            &job,
+            &askpass,
+            command_with_program(&target, true, other.as_os_str()).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.starts_with("SSH setup failed"), "{error}");
+        assert_eq!(token_of(), first, "same JWT: nothing was invalidated");
+        // The ProxyCommand's sbx rejected the JWT: the next spawn gets a fresh one.
+        let rejecting = failing_ssh(dir.path(), "Error: DOCKER_ACCESS_TOKEN was rejected");
+        run_script_with_command(
+            &target,
+            "true\n".into(),
+            &job,
+            &askpass,
+            command_with_program(&target, true, rejecting.as_os_str()).unwrap(),
+        )
+        .unwrap_err();
+        let fresh = token_of();
+        assert_ne!(fresh, first);
+        // The JWT is never in the error text.
+        let error = run_script_with_command(
+            &target,
+            "true\n".into(),
+            &job,
+            &askpass,
+            command_with_program(&target, true, rejecting.as_os_str()).unwrap(),
+        )
+        .unwrap_err();
+        for jwt in installed.hub.issued() {
+            assert!(!error.contains(&jwt));
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_rejected_token_in_a_failed_tunnel_drops_the_cached_token() {
+        use crate::docker_accounts::test_support::Installed;
+        let installed = Installed::new();
+        let id = installed.add("alice");
+        let target = account_target(Some(&id));
+        let dir = tempfile::tempdir().unwrap();
+        let token_of =
+            || env_var(&command(&target, false).unwrap(), "DOCKER_ACCESS_TOKEN").unwrap();
+        let first = token_of();
+        let rejecting = failing_ssh(dir.path(), "Error: DOCKER_ACCESS_TOKEN was rejected");
+        let command = command_with_program(&target, false, rejecting.as_os_str()).unwrap();
+        let error = Tunnel::start_with_command(&target, None, None, command)
+            .err()
+            .expect("the fake ssh exits, the tunnel must fail");
+        assert!(error.starts_with("SSH connection failed"), "{error}");
+        assert_ne!(token_of(), first, "a reconnect exchanges a fresh JWT");
+        // A sandbox without an account never touches the accounts.
+        let before = installed.hub.calls();
+        let plain = account_target(None);
+        let command = command_with_program(&plain, false, rejecting.as_os_str()).unwrap();
+        Tunnel::start_with_command(&plain, None, None, command)
+            .err()
+            .unwrap();
+        assert_eq!(installed.hub.calls(), before);
     }
     // The fake ssh is a shell script.
     #[cfg(unix)]

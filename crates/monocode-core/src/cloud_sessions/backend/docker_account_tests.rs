@@ -19,7 +19,7 @@ fn resolver(pins: &[(&str, &str)]) -> (AccountResolver, Arc<AtomicUsize>) {
     (
         Arc::new(move |name| {
             counted.fetch_add(1, Ordering::SeqCst);
-            map.get(name).cloned()
+            Ok(map.get(name).cloned())
         }),
         reads,
     )
@@ -71,31 +71,49 @@ fn a_sandbox_in_an_account_looks_missing_to_the_machine_login() {
 }
 
 #[test]
-fn a_known_account_is_remembered_and_a_missing_one_is_looked_up_again() {
+fn a_resolved_account_is_remembered_even_when_it_is_no_account() {
     let sbx = sandboxes();
     let late: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let reads = Arc::new(AtomicUsize::new(0));
     let (source, counted) = (late.clone(), reads.clone());
     let backend = DockerBackend::new(sbx).with_account_resolver(Arc::new(move |_| {
         counted.fetch_add(1, Ordering::SeqCst);
-        source.lock().unwrap().clone()
+        Ok(source.lock().unwrap().clone())
     }));
-    // No pin yet: not cached, so a pin written a moment later (a create that just
-    // succeeded) is seen.
+    // The pin is written before `sbx create`, so a name that resolved to no account stays
+    // so: the store is read once, not on every call.
     assert_eq!(backend.account_of("box-a"), None);
     assert_eq!(backend.account_of("box-a"), None);
-    assert_eq!(reads.load(Ordering::SeqCst), 2);
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
     *late.lock().unwrap() = Some("A".into());
-    assert_eq!(backend.account_of("box-a").as_deref(), Some("A"));
-    // Now remembered: the store is not read again.
-    *late.lock().unwrap() = None;
-    assert_eq!(backend.account_of("box-a").as_deref(), Some("A"));
-    assert_eq!(reads.load(Ordering::SeqCst), 3);
-    // Told explicitly, it wins; told nothing, it forgets.
+    assert_eq!(backend.account_of("box-a"), None, "remembered");
+    // Told explicitly, it wins; forgotten, it is resolved again.
     backend.remember_account("box-a", Some("B"));
     assert_eq!(backend.account_of("box-a").as_deref(), Some("B"));
-    backend.remember_account("box-a", None);
-    assert_eq!(backend.account_of("box-a"), None);
+    backend.forget_account("box-a");
+    assert_eq!(backend.account_of("box-a").as_deref(), Some("A"));
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn an_account_that_could_not_be_read_is_an_error_and_is_not_remembered() {
+    let sbx = sandboxes();
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let flag = fail.clone();
+    let backend = DockerBackend::new(sbx.clone()).with_account_resolver(Arc::new(move |_| {
+        if flag.load(Ordering::SeqCst) {
+            Err("Native session store unavailable".into())
+        } else {
+            Ok(Some("A".into()))
+        }
+    }));
+    // Never read as the machine login: the lookup fails, it does not say "not found".
+    assert!(backend.state("box-a").is_err());
+    assert!(backend.exists("box-a").is_err());
+    assert!(backend.try_account_of("box-a").is_err());
+    assert!(sbx.accounts_of("ls").is_empty(), "no sbx call was made");
+    fail.store(false, Ordering::SeqCst);
+    assert_eq!(backend.state("box-a").unwrap(), "running");
 }
 
 #[test]

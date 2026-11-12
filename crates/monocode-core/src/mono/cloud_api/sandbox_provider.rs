@@ -8,7 +8,7 @@ use super::provider::{
     current_branch, option_text, CloudInstance, CloudKindSpec, CloudProvider, CloudStart,
 };
 use crate::cloud_sessions::docker_config::{self, valid_ref};
-use crate::cloud_sessions::{CloudBackendKind, CloudRef, CloudSessions};
+use crate::cloud_sessions::{CloudBackendKind, CloudRef, CloudSessions, CloudState};
 use crate::sandboxes::{self, Prerequisites};
 use crate::store::{RemoteSession, Store};
 use serde_json::{json, Map, Value};
@@ -67,6 +67,25 @@ fn lowered(value: &Value) -> Option<String> {
     value.as_str().map(|s| s.trim().to_lowercase())
 }
 
+/// The Docker accounts to ask (`None` is the machine login) with the bound sandboxes of each.
+type Asked = Vec<(Option<String>, Vec<String>)>;
+
+/// What `sbx ls` answered across accounts.
+#[derive(Default)]
+struct Listing {
+    listed: Vec<sandboxes::SandboxInfo>,
+    /// Accounts that could not be listed: the bound sandboxes in them and why.
+    failed: Vec<(Vec<String>, String)>,
+}
+impl Listing {
+    /// Every failure, one text.
+    fn errors(&self) -> String {
+        let mut texts: Vec<&str> = self.failed.iter().map(|(_, e)| e.as_str()).collect();
+        texts.dedup();
+        texts.join("; ")
+    }
+}
+
 pub struct SandboxProvider {
     cloud: Arc<CloudSessions>,
     store: Arc<Mutex<Store>>,
@@ -86,46 +105,61 @@ impl SandboxProvider {
             .map(|s| s.cloud.name)
             .collect()
     }
-    /// The Docker accounts to ask when listing the project's sandboxes. A sandbox lives in
-    /// the account that created it, so each bound sandbox adds ITS account (which may differ
-    /// from the project's current choice, or from each other). With nothing bound it is the
-    /// project's own account. Without any account this is `[None]`: one `sbx ls` as the
-    /// machine login, as before.
-    fn accounts_to_ask(&self, project: &str, bound: &HashSet<String>) -> Vec<Option<String>> {
-        let mut accounts: Vec<Option<String>> = Vec::new();
-        for name in bound {
-            let account = self.cloud.sandbox_account(name);
-            if !accounts.contains(&account) {
-                accounts.push(account);
+    /// The Docker accounts to ask when listing the project's sandboxes, each with the bound
+    /// sandboxes that live in it. A sandbox lives in the account that created it, so each
+    /// bound sandbox adds ITS account (which may differ from the project's current choice, or
+    /// from each other). With nothing bound it is the project's own account, with no names.
+    /// Without any account this is one `None` entry: one `sbx ls` as the machine login, as
+    /// before. `Err` when the account of a sandbox could not be read (never taken for the
+    /// machine login, which would report the sandbox as gone).
+    fn accounts_to_ask(&self, project: &str, bound: &HashSet<String>) -> Result<Asked, String> {
+        let mut asked: Asked = Vec::new();
+        let mut names: Vec<&String> = bound.iter().collect();
+        names.sort();
+        for name in names {
+            let account = self.cloud.try_sandbox_account(name)?;
+            match asked.iter_mut().find(|(known, _)| *known == account) {
+                Some((_, bound)) => bound.push(name.clone()),
+                None => asked.push((account, vec![name.clone()])),
             }
         }
-        if accounts.is_empty() {
-            accounts.push(
+        if asked.is_empty() {
+            asked.push((
                 self.config(project)
                     .ok()
                     .flatten()
                     .and_then(|config| config.docker_account),
-            );
+                Vec::new(),
+            ));
         }
-        accounts.sort();
-        accounts
+        asked.sort();
+        Ok(asked)
     }
-    /// `sbx ls` once per account in `accounts`, results joined.
-    fn list_as(&self, accounts: &[Option<String>]) -> Result<Vec<sandboxes::SandboxInfo>, String> {
+    /// `sbx ls` once per account in `asked`. The sandboxes of the accounts that answered are
+    /// returned together with the accounts that did not, each with the error and the bound
+    /// sandboxes in it. A failed account is NOT "nothing listed": its sandboxes are unknown,
+    /// never gone.
+    fn list_as(&self, asked: &Asked) -> Result<Listing, String> {
         let (runner, _) = self.cloud.sandbox_tools()?;
-        let mut all: Vec<sandboxes::SandboxInfo> = Vec::new();
-        for account in accounts {
-            for info in sandboxes::list(&sandboxes::as_account(&*runner, account.as_deref()))? {
-                // A sandbox is listed by the one account it lives in; never twice.
-                if !all
-                    .iter()
-                    .any(|seen| seen.id == info.id && seen.name == info.name)
-                {
-                    all.push(info);
+        let mut listing = Listing::default();
+        for (account, names) in asked {
+            match sandboxes::list(&sandboxes::as_account(&*runner, account.as_deref())) {
+                Ok(found) => {
+                    for info in found {
+                        // A sandbox is listed by the one account it lives in; never twice.
+                        if !listing
+                            .listed
+                            .iter()
+                            .any(|seen| seen.id == info.id && seen.name == info.name)
+                        {
+                            listing.listed.push(info);
+                        }
+                    }
                 }
+                Err(error) => listing.failed.push((names.clone(), error)),
             }
         }
-        Ok(all)
+        Ok(listing)
     }
     fn config(&self, project: &str) -> Result<Option<docker_config::DockerProjectConfig>, String> {
         let store = self
@@ -160,8 +194,13 @@ impl CloudProvider for SandboxProvider {
 
     fn list(&self, project: &str) -> Result<Vec<CloudInstance>, String> {
         let bound = self.bound_names(project);
-        Ok(self
-            .list_as(&self.accounts_to_ask(project, &bound))?
+        let listing = self.list_as(&self.accounts_to_ask(project, &bound)?)?;
+        // Nothing could be listed: that is an error, not an empty list.
+        if listing.listed.is_empty() && !listing.failed.is_empty() {
+            return Err(listing.errors());
+        }
+        let mut instances: Vec<CloudInstance> = listing
+            .listed
             .into_iter()
             .filter(|info| bound.contains(&info.name))
             .map(|info| {
@@ -184,7 +223,27 @@ impl CloudProvider for SandboxProvider {
                     details,
                 }
             })
-            .collect())
+            .collect();
+        // The sandboxes of an account that could not be listed are reported as unknown with
+        // the reason, never left out as if they were gone.
+        for (names, error) in &listing.failed {
+            for name in names {
+                if instances.iter().any(|i| i.cloud.name == *name) {
+                    continue;
+                }
+                let mut details = Map::new();
+                details.insert("error".into(), json!(error));
+                instances.push(CloudInstance {
+                    cloud: CloudRef::sandbox(name),
+                    display_name: name.clone(),
+                    state: CloudState::Unknown,
+                    raw_state: "unknown".into(),
+                    last_used_at: None,
+                    details,
+                });
+            }
+        }
+        Ok(instances)
     }
 
     /// `{ready, installed, loggedIn, sshConfigured, message?, fixCommand?, configured,
@@ -230,11 +289,19 @@ impl CloudProvider for SandboxProvider {
     fn resolve_instance(&self, project: &str, instance: &str) -> Result<String, String> {
         let bound = self.bound_names(project);
         let name = if sandboxes::validate_sandbox_id(instance).is_ok() {
-            self.list_as(&self.accounts_to_ask(project, &bound))?
-                .into_iter()
-                .find(|info| info.id == instance)
-                .map(|info| info.name)
-                .ok_or_else(|| format!("Sandbox {instance} was not found; run cloud.list"))?
+            let listing = self.list_as(&self.accounts_to_ask(project, &bound)?)?;
+            match listing.listed.iter().find(|info| info.id == instance) {
+                Some(info) => info.name.clone(),
+                // Not found among the accounts that answered, but some did not: it may live
+                // in one of those, so do not say it does not exist.
+                None if !listing.failed.is_empty() => {
+                    return Err(format!(
+                        "Sandbox {instance} could not be looked up: {}",
+                        listing.errors()
+                    ))
+                }
+                None => return Err(format!("Sandbox {instance} was not found; run cloud.list")),
+            }
         } else {
             instance.to_owned()
         };

@@ -1001,3 +1001,92 @@ fn apply_env_sets_the_variable_on_the_command_and_never_adds_an_argument() {
     let error = apply_env(&mut std::process::Command::new("sbx"), Some("gone")).unwrap_err();
     assert!(error.contains("no longer exists"));
 }
+
+#[test]
+fn invalidate_if_rejected_drops_the_token_only_for_a_failed_run_that_says_so() {
+    use super::test_support::Installed;
+    let installed = Installed::new();
+    let id = installed.add("alice");
+    let jwt = || env_for(Some(&id)).unwrap().unwrap().1.as_str().to_owned();
+    let first = jwt();
+    let rejected = "Error: DOCKER_ACCESS_TOKEN was rejected";
+    // No account, a successful run, or another failure: nothing is dropped.
+    assert!(!invalidate_if_rejected(None, false, rejected));
+    assert!(!invalidate_if_rejected(Some(&id), true, rejected));
+    assert!(!invalidate_if_rejected(
+        Some(&id),
+        false,
+        "Connection refused"
+    ));
+    assert_eq!(jwt(), first);
+    // A failed run whose output says the JWT was rejected: the next one is fresh.
+    assert!(invalidate_if_rejected(Some(&id), false, rejected));
+    assert_ne!(jwt(), first);
+}
+
+#[test]
+fn a_terminals_ssh_exit_255_drops_the_token_and_other_exits_do_not() {
+    use super::test_support::Installed;
+    let installed = Installed::new();
+    let id = installed.add("alice");
+    let jwt = || env_for(Some(&id)).unwrap().unwrap().1.as_str().to_owned();
+    let first = jwt();
+    for code in [Some(0), Some(1), Some(130), None] {
+        assert!(!invalidate_after_ssh_exit(Some(&id), code));
+    }
+    assert!(!invalidate_after_ssh_exit(None, Some(255)));
+    assert_eq!(jwt(), first);
+    assert!(invalidate_after_ssh_exit(Some(&id), Some(255)));
+    assert_ne!(jwt(), first);
+}
+
+#[test]
+fn building_the_cloud_service_never_installs_the_real_docker_hub_over_its_database() {
+    use super::test_support::Uninstalled;
+    let _none = Uninstalled::new();
+    let dir = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::store::Store::open(&dir.path().join("monocode.db")).unwrap(),
+    ));
+    struct NoHost;
+    impl crate::cloud_sessions::Host for NoHost {
+        fn machines(&self) -> Result<Vec<crate::remote::Machine>, String> {
+            Ok(vec![])
+        }
+        fn connect(
+            &self,
+            _: &str,
+            _: &str,
+            _: &std::sync::atomic::AtomicBool,
+            _: &mut dyn FnMut(&str),
+        ) -> Result<crate::remote::Machine, String> {
+            Err("no host".into())
+        }
+        fn ensure(
+            &self,
+            _: &str,
+            _: &std::sync::atomic::AtomicBool,
+            _: &mut dyn FnMut(&str),
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn request(
+            &self,
+            _: &str,
+            _: &str,
+            _: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Err("no host".into())
+        }
+        fn disconnect(&self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    let _service = crate::cloud_sessions::CloudSessions::new(
+        std::sync::Arc::new(crate::codespaces::SystemGh),
+        std::sync::Arc::new(NoHost),
+        store.clone(),
+    )
+    .with_system_sandboxes(store);
+    assert!(shared().is_none(), "the app installs it once, at startup");
+}

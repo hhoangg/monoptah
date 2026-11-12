@@ -848,6 +848,29 @@ mod accounts {
     }
 
     #[test]
+    fn a_second_rejection_marks_the_stored_token_revoked_for_settings() {
+        use crate::docker_accounts::DockerAccountStatus;
+        let installed = Installed::new();
+        let id = installed.add("alice");
+        assert_eq!(
+            installed.accounts.get(&id).unwrap().status,
+            DockerAccountStatus::Valid
+        );
+        // One rejection followed by success leaves it valid.
+        let mut replies = VecDeque::from([rejected(), ok("[]")]);
+        run_as_account(Some(&id), &mut || replies.pop_front().unwrap()).unwrap();
+        assert_eq!(
+            installed.accounts.get(&id).unwrap().status,
+            DockerAccountStatus::Valid
+        );
+        run_as_account(Some(&id), &mut || rejected()).unwrap_err();
+        assert_eq!(
+            installed.accounts.get(&id).unwrap().status,
+            DockerAccountStatus::Revoked
+        );
+    }
+
+    #[test]
     fn a_rejection_without_an_account_is_not_retried() {
         let _installed = Installed::new();
         let mut attempts = 0;

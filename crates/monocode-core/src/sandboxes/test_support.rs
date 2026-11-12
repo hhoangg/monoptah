@@ -2,6 +2,7 @@
 //! created it, so a call made as another account answers "not found" (what the real CLI does,
 //! and how a wrong account would make the app forget a sandbox that still bills).
 use super::{SbxOutput, SbxRunner};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 #[derive(Clone, Debug)]
@@ -19,6 +20,10 @@ pub(crate) type Call = (String, Option<String>);
 pub(crate) struct AccountSbx {
     boxes: Mutex<Vec<Entry>>,
     calls: Mutex<Vec<Call>>,
+    /// `create` makes the sandbox but answers with a timeout, and the next `ls` fails too:
+    /// the app can not tell whether the sandbox exists (an ambiguous create).
+    ambiguous_create: AtomicBool,
+    fail_next_ls: AtomicBool,
 }
 
 impl AccountSbx {
@@ -33,6 +38,10 @@ impl AccountSbx {
             state: state.into(),
             account: account.map(str::to_owned),
         });
+    }
+    /// Makes the next `create` ambiguous, see [`Self::ambiguous_create`].
+    pub(crate) fn make_create_ambiguous(&self) {
+        self.ambiguous_create.store(true, Ordering::SeqCst);
     }
     pub(crate) fn calls(&self) -> Vec<Call> {
         self.calls.lock().unwrap().clone()
@@ -88,6 +97,9 @@ impl SbxRunner for AccountSbx {
             .unwrap_or_default();
         let missing = || out(false, "", &format!("error: sandbox '{id_arg}' not found"));
         match verb.as_str() {
+            "ls" if self.fail_next_ls.swap(false, Ordering::SeqCst) => {
+                Err("Could not reach Docker Sandboxes (network).".into())
+            }
             "ls" => {
                 let items: Vec<serde_json::Value> = boxes
                     .iter()
@@ -142,6 +154,13 @@ impl SbxRunner for AccountSbx {
                     state: "running".into(),
                     account: account.map(str::to_owned),
                 });
+                if self.ambiguous_create.swap(false, Ordering::SeqCst) {
+                    self.fail_next_ls.store(true, Ordering::SeqCst);
+                    return Err(
+                        "Docker Sandboxes CLI did not answer within 120 seconds (`sbx create`)."
+                            .into(),
+                    );
+                }
                 out(true, &format!("{id}\n"), "")
             }
             other => panic!("unexpected sbx call: {other} ({args:?})"),

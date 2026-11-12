@@ -48,6 +48,8 @@ enum CreateMode {
     Refused,
     /// sbx fails with an error that proves nothing about whether a sandbox was made.
     Flaky,
+    /// The call could not run as the Docker account: its token is revoked.
+    AccountRevoked,
 }
 
 struct Sbx {
@@ -186,6 +188,10 @@ impl SbxRunner for Sbx {
                     }
                     CreateMode::Refused => out(false, "", "error: quota exceeded"),
                     CreateMode::Flaky => out(false, "", "error: internal server error"),
+                    CreateMode::AccountRevoked => Err(
+                        "Docker account alice: token revoked or expired. Replace it in Settings > Cloud."
+                            .into(),
+                    ),
                 }
             }
             "stop" | "rm" => out(true, "", ""),
@@ -586,6 +592,17 @@ fn fx_with(mode: CreateMode, auth: Option<(&'static str, String)>) -> Fx {
     fx_in(mode, auth, Store::open(Path::new(":memory:")).unwrap())
 }
 fn fx_in(mode: CreateMode, auth: Option<(&'static str, String)>, store: Store) -> Fx {
+    let sbx = Sbx::new(mode);
+    fx_over(sbx.clone(), sbx, auth, Arc::new(Mutex::new(store)))
+}
+/// A flow over `runner` (the `sbx` the service talks to); `sbx` is only the fake the `Fx`
+/// field reports on, unused when `runner` is another one.
+fn fx_over(
+    runner: Arc<dyn SbxRunner>,
+    sbx: Arc<Sbx>,
+    auth: Option<(&'static str, String)>,
+    store: Arc<Mutex<Store>>,
+) -> Fx {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join(".ssh/sandboxes")).unwrap();
     std::fs::write(
@@ -593,11 +610,9 @@ fn fx_in(mode: CreateMode, auth: Option<(&'static str, String)>, store: Store) -
         "Host sbx_cloud\n  ProxyCommand sbx --cloud ssh-connect '%r' %h %p\n",
     )
     .unwrap();
-    let sbx = Sbx::new(mode);
     let shell = Shell::new();
     let host = Arc::new(FakeHost::default());
     *host.shell.lock().unwrap() = Some(shell.clone());
-    let store = Arc::new(Mutex::new(store));
     let tick = Arc::new(AtomicU64::new(1_794_024_100_000));
     let svc = CloudSessions::new(Arc::new(NoGh), host.clone(), store.clone())
         .with_timing(
@@ -605,7 +620,7 @@ fn fx_in(mode: CreateMode, auth: Option<(&'static str, String)>, store: Store) -
             |_| {},
             move || tick.fetch_add(1000, Ordering::SeqCst),
         )
-        .with_sandboxes(sbx.clone(), shell.clone(), Arc::new(Secrets { auth }))
+        .with_sandboxes(runner, shell.clone(), Arc::new(Secrets { auth }))
         .with_sandbox_home(home.path().to_path_buf());
     Fx {
         svc,
@@ -4420,6 +4435,223 @@ mod docker_accounts {
         assert!(pending_starts(&fx.store.lock().unwrap()).is_empty());
     }
 
+    /// Wraps the account-aware fake: records the pin the store held at each `create` and
+    /// whether the store was free (not held by the caller) at each `ls`.
+    struct Probe {
+        inner: Arc<crate::sandboxes::test_support::AccountSbx>,
+        store: Arc<Mutex<Store>>,
+        pin_at_create: Mutex<Vec<Option<String>>>,
+        store_free_at_ls: Mutex<Vec<bool>>,
+    }
+    impl Probe {
+        fn new(store: Arc<Mutex<Store>>) -> Arc<Self> {
+            Arc::new(Self {
+                inner: Arc::new(crate::sandboxes::test_support::AccountSbx::new()),
+                store,
+                pin_at_create: Mutex::new(vec![]),
+                store_free_at_ls: Mutex::new(vec![]),
+            })
+        }
+    }
+    impl SbxRunner for Probe {
+        fn run(&self, args: &[String], stdin: Option<&str>) -> Result<SbxOutput, String> {
+            self.run_as(None, args, stdin)
+        }
+        fn run_as(
+            &self,
+            account: Option<&str>,
+            args: &[String],
+            stdin: Option<&str>,
+        ) -> Result<SbxOutput, String> {
+            match args
+                .iter()
+                .find(|a| !a.starts_with('-'))
+                .map(String::as_str)
+            {
+                Some("create") => {
+                    let name = args[args.iter().position(|a| a == "--name").unwrap() + 1].clone();
+                    let pin = account::pinned(&self.store.lock().unwrap(), &name);
+                    self.pin_at_create.lock().unwrap().push(pin);
+                }
+                Some("ls") => {
+                    let free = self.store.try_lock().is_ok();
+                    self.store_free_at_ls.lock().unwrap().push(free);
+                }
+                _ => {}
+            }
+            self.inner.run_as(account, args, stdin)
+        }
+    }
+    fn probe_fx(probe: &Arc<Probe>, store: Arc<Mutex<Store>>) -> Fx {
+        fx_over(
+            probe.clone(),
+            Sbx::new(CreateMode::Ok),
+            Some(("CLAUDE_CODE_OAUTH_TOKEN", SECRET.into())),
+            store,
+        )
+    }
+
+    #[test]
+    fn the_pin_exists_before_create_so_an_ambiguous_create_is_not_forgotten() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        let store = Arc::new(Mutex::new(Store::open(Path::new(":memory:")).unwrap()));
+        let probe = Probe::new(store.clone());
+        probe.inner.make_create_ambiguous();
+        let fx = probe_fx(&probe, store);
+        // The create times out and the lookup after it fails too: the start is a failed
+        // record that offers Retry, and the sandbox exists under account A.
+        let (session, began) = begin_as(&fx, Some(&a)).unwrap();
+        let name = began.sandbox.clone().unwrap();
+        assert!(fx.record(session.id).unwrap().is_failed());
+        assert_eq!(
+            *probe.pin_at_create.lock().unwrap(),
+            [Some(a.clone())],
+            "pinned before sbx create ran"
+        );
+        assert_eq!(pin_of(&fx, &name).as_deref(), Some(a.as_str()));
+        // The background state read and forget_missing look the name up as A, find it, and
+        // so do not forget a sandbox that is still billing.
+        let cloud = CloudRef::sandbox(&name);
+        assert_eq!(fx.svc.cloud_raw_state(&cloud).unwrap(), "running");
+        assert_eq!(fx.svc.forget_missing(&cloud), Ok(false));
+        assert!(fx
+            .store
+            .lock()
+            .unwrap()
+            .remote_session(session.id)
+            .unwrap()
+            .is_some());
+        let lookups = probe.inner.accounts_of("ls");
+        assert!(lookups.len() >= 3 && lookups.iter().all(|l| l.as_deref() == Some(a.as_str())));
+    }
+
+    #[test]
+    fn a_pin_that_cannot_be_written_fails_the_start_before_anything_is_created() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("monocode.db");
+        let store = Store::open(&path).unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER no_pins BEFORE INSERT ON native_settings
+                 WHEN NEW.key LIKE 'sandbox-docker-account:%' BEGIN SELECT RAISE(ABORT,'no'); END;",
+            )
+            .unwrap();
+        let fx = fx_in(
+            CreateMode::Ok,
+            Some(("CLAUDE_CODE_OAUTH_TOKEN", SECRET.into())),
+            store,
+        );
+        let error = begin_as(&fx, Some(&a)).unwrap_err();
+        assert!(error.contains("Docker account"), "{error}");
+        assert_eq!(fx.sbx.count("create"), 0, "nothing was created");
+        assert!(pending_starts(&fx.store.lock().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn a_definite_create_failure_clears_the_pin() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        let fx = fx_with(
+            CreateMode::Refused,
+            Some(("CLAUDE_CODE_OAUTH_TOKEN", SECRET.into())),
+        );
+        let error = begin_as(&fx, Some(&a)).unwrap_err();
+        assert!(error.contains("quota"), "{error}");
+        let line = fx
+            .sbx
+            .calls()
+            .into_iter()
+            .find(|c| c.contains(" create "))
+            .unwrap();
+        let name = line
+            .split_whitespace()
+            .skip_while(|w| *w != "--name")
+            .nth(1)
+            .unwrap()
+            .to_string();
+        assert_eq!(pin_of(&fx, &name), None);
+        assert_eq!(
+            fx.store
+                .lock()
+                .unwrap()
+                .setting(&account::pin_key(&name))
+                .unwrap()
+                .unwrap_or_default(),
+            "",
+            "no pin is left for a sandbox that was never made"
+        );
+    }
+
+    #[test]
+    fn the_account_of_a_name_falls_back_to_its_start_record() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        let fx = fx();
+        let (_, began) = begin_as(&fx, Some(&a)).unwrap();
+        let name = began.sandbox.clone().unwrap();
+        // The pin setting is gone and the backend has not been told: the start record of
+        // the name still says which account it is being created in.
+        fx.store
+            .lock()
+            .unwrap()
+            .save_setting(&account::pin_key(&name), "")
+            .unwrap();
+        fx.svc
+            .sandbox
+            .as_ref()
+            .unwrap()
+            .backend
+            .forget_account(&name);
+        assert_eq!(fx.svc.sandbox_account(&name).as_deref(), Some(a.as_str()));
+    }
+
+    #[test]
+    fn an_account_error_on_create_is_a_definite_failure_said_once() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        let fx = fx_with(
+            CreateMode::AccountRevoked,
+            Some(("CLAUDE_CODE_OAUTH_TOKEN", SECRET.into())),
+        );
+        let error = begin_as(&fx, Some(&a)).unwrap_err();
+        assert_eq!(
+            error,
+            "Docker account alice: token revoked or expired. Replace it in Settings > Cloud."
+        );
+        // No follow-up lookup after the failed create (only diagnose asked `ls`).
+        assert_eq!(fx.sbx.count("ls"), 1);
+        assert!(pending_starts(&fx.store.lock().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn deleting_a_session_asks_sbx_outside_the_store_as_the_pinned_account() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        let store = Arc::new(Mutex::new(Store::open(Path::new(":memory:")).unwrap()));
+        let probe = Probe::new(store.clone());
+        let fx = probe_fx(&probe, store);
+        let (session, _) = begin_as(&fx, Some(&a)).unwrap();
+        fx.run(session.id).0.unwrap();
+        {
+            let store = fx.store.lock().unwrap();
+            let mut remote = store.remote_session(session.id).unwrap().unwrap();
+            remote.session_id = Some("host-session".into());
+            store.save_remote_session(&remote).unwrap();
+        }
+        fx.host.log.lock().unwrap().clear();
+        probe.store_free_at_ls.lock().unwrap().clear();
+        let before = probe.inner.accounts_of("ls").len();
+        fx.svc.delete_session(session.id).unwrap();
+        // `sbx ls` (which may exchange a Docker Hub token) ran while the store was free.
+        assert_eq!(*probe.store_free_at_ls.lock().unwrap(), [true]);
+        assert_eq!(probe.inner.accounts_of("ls")[before..], [Some(a)]);
+        assert!(host_was_asked_to_delete(&fx));
+    }
+
     #[test]
     fn an_account_that_was_removed_stops_the_start_with_a_clear_text() {
         let _installed = Installed::new();
@@ -4573,8 +4805,19 @@ mod docker_accounts {
         let env = terminal.env().unwrap();
         assert_eq!(env.len(), 1);
         assert_eq!(env[0].0, "DOCKER_ACCESS_TOKEN");
-        assert!(installed.hub.issued().iter().any(|j| env[0].1 == **j));
+        assert!(installed
+            .hub
+            .issued()
+            .iter()
+            .any(|j| env[0].1.as_str() == j));
+        assert_eq!(format!("{:?}", env[0].1), "Secret(***)");
         assert!(installed.hub.calls() >= before);
+        // ssh exiting 255 (the ProxyCommand's sbx refused the JWT) drops it; other codes do not.
+        let jwt = env[0].1.as_str().to_owned();
+        assert!(!terminal.note_exit(Some(1)) && !terminal.note_exit(None));
+        assert_eq!(terminal.env().unwrap()[0].1.as_str(), jwt);
+        assert!(terminal.note_exit(Some(255)));
+        assert_ne!(terminal.env().unwrap()[0].1.as_str(), jwt);
         // The command line the terminal runs never holds the token.
         let shown = format!("{terminal:?}");
         for jwt in installed.hub.issued() {

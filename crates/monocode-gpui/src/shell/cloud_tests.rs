@@ -5084,16 +5084,259 @@ fn a_sandbox_terminal_environment_adds_a_token_only_for_a_docker_account() {
         docker_account: docker_account.map(str::to_owned),
     };
     let plain = cloud::sandbox_terminal_env(&terminal(None)).unwrap();
-    assert_eq!(plain.len(), 1);
-    assert_eq!(plain[0].0, "PATH");
+    assert_eq!(plain.plain.len(), 1);
+    assert_eq!(plain.plain[0].0, "PATH");
+    assert!(plain.secret.is_empty());
     // An account that cannot produce a token (none is installed in this test) is an error
     // that opens no terminal, not a terminal on the machine's sign-in.
-    let error = cloud::sandbox_terminal_env(&terminal(Some("acct-1"))).unwrap_err();
+    let _none = FakeAccounts::uninstalled();
+    let error = cloud::sandbox_terminal_env(&terminal(Some("acct-1")))
+        .err()
+        .unwrap();
     assert!(
         error.contains("Docker accounts are not available"),
         "{error}"
     );
     assert!(!error.contains("sbx login"), "{error}");
+}
+
+/// A fake Docker Hub and a `DockerAccess` over a temp database, installed as the process-wide
+/// instance for as long as the value lives (the previous one is restored).
+struct FakeAccounts {
+    hub: Arc<FakeHub>,
+    account: String,
+    previous: Option<Arc<monocode_core::docker_accounts::DockerAccess>>,
+    dir: Option<std::path::PathBuf>,
+}
+#[derive(Default)]
+struct FakeHub {
+    calls: std::sync::atomic::AtomicUsize,
+    issued: std::sync::Mutex<Vec<String>>,
+}
+impl FakeHub {
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn issued(&self) -> Vec<String> {
+        self.issued.lock().unwrap().clone()
+    }
+}
+impl monocode_core::docker_accounts::DockerHub for FakeHub {
+    fn exchange(
+        &self,
+        docker_id: &str,
+        _pat: &str,
+    ) -> Result<monocode_core::git_credentials::Secret, monocode_core::docker_accounts::ExchangeError>
+    {
+        use base64::Engine;
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let b64 = |text: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text);
+        let jwt = format!(
+            "{}.{}.c2lnbmF0dXJl",
+            b64(r#"{"alg":"RS256"}"#),
+            b64(&format!(
+                r#"{{"sub":"{docker_id}","scope":"repo:read sandbox:use","exp":4000000000,"iat":1,"n":{n}}}"#
+            ))
+        );
+        self.issued.lock().unwrap().push(jwt.clone());
+        Ok(monocode_core::git_credentials::Secret::new(jwt))
+    }
+}
+impl FakeAccounts {
+    /// No process-wide instance at all.
+    fn uninstalled() -> Self {
+        Self {
+            hub: Arc::new(FakeHub::default()),
+            account: String::new(),
+            previous: monocode_core::docker_accounts::uninstall(),
+            dir: None,
+        }
+    }
+    /// One saved account, "alice", behind the fake hub.
+    fn install() -> Self {
+        use monocode_core::docker_accounts::{DockerAccess, DockerAccounts, system_clock};
+        let dir = std::env::temp_dir().join(format!(
+            "monoptah-fake-accounts-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = monocode_core::store::Store::open(&dir.join("monocode.db")).unwrap();
+        let hub = Arc::new(FakeHub::default());
+        let account = DockerAccounts::for_store(&store)
+            .unwrap()
+            .add(
+                "alice",
+                concat!("dckr_pat_", "exampleTokenValue1234567890"),
+                hub.as_ref(),
+            )
+            .unwrap()
+            .id;
+        let access = DockerAccess::for_store(&store, hub.clone(), system_clock()).unwrap();
+        let previous = monocode_core::docker_accounts::uninstall();
+        monocode_core::docker_accounts::install(Arc::new(access));
+        Self {
+            hub,
+            account,
+            previous,
+            dir: Some(dir),
+        }
+    }
+}
+impl Drop for FakeAccounts {
+    fn drop(&mut self) {
+        monocode_core::docker_accounts::uninstall();
+        if let Some(previous) = self.previous.take() {
+            monocode_core::docker_accounts::install(previous);
+        }
+        if let Some(dir) = &self.dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+#[gpui::test]
+fn a_docker_account_token_is_resolved_off_the_ui_thread_before_the_terminal_launches(
+    cx: &mut TestAppContext,
+) {
+    let accounts = FakeAccounts::install();
+    let (window, id, _) = shell_with_sandbox(cx, "running", CloudState::Available, true);
+    window
+        .update(cx, |shell, _, _| {
+            monocode_core::sandboxes::account::pin(
+                &locked(&shell.store).unwrap(),
+                SBX_NAME,
+                Some(&accounts.account),
+            )
+            .unwrap();
+        })
+        .unwrap();
+    let before = accounts.hub.calls();
+    let tabs = |shell: &Shell| {
+        shell
+            .terminals
+            .get(&shell.workspace.project)
+            .map_or(0, Vec::len)
+    };
+    window
+        .update(cx, |shell, window, cx| {
+            shell.workspace.active = Some(id);
+            shell.new_terminal(window, cx);
+            // The call returned without a Docker Hub exchange and without a terminal: the
+            // exchange runs on the background executor, not in this UI turn.
+            assert_eq!(accounts.hub.calls(), before, "no exchange on the UI thread");
+            assert_eq!(tabs(shell), 0);
+            assert!(shell.error.is_none(), "{:?}", shell.error);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            assert_eq!(
+                accounts.hub.calls(),
+                before + 1,
+                "exchanged once, in the background"
+            );
+            assert_eq!(tabs(shell), 1, "launched on the UI thread afterwards");
+            let terminal = shell.terminals[&shell.workspace.project][0].read(cx);
+            let spec = terminal.launched().expect("launched, not a login shell");
+            // The token is a secret variable, not a plain one, and never in argv.
+            let secret = spec
+                .secret_env
+                .iter()
+                .find(|(key, _)| key == "DOCKER_ACCESS_TOKEN")
+                .expect("the account's token");
+            assert!(accounts.hub.issued().contains(&secret.1));
+            assert!(
+                spec.env_set
+                    .iter()
+                    .all(|(key, _)| key != "DOCKER_ACCESS_TOKEN")
+            );
+            assert!(spec.env_set.iter().any(|(key, _)| key == "PATH"));
+            for arg in &spec.args {
+                assert!(!arg.to_string_lossy().contains(&secret.1));
+            }
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_docker_account_that_cannot_give_a_token_opens_no_terminal_and_says_why(
+    cx: &mut TestAppContext,
+) {
+    let _none = FakeAccounts::uninstalled();
+    let (window, id, _) = shell_with_sandbox(cx, "running", CloudState::Available, true);
+    window
+        .update(cx, |shell, window, cx| {
+            monocode_core::sandboxes::account::pin(
+                &locked(&shell.store).unwrap(),
+                SBX_NAME,
+                Some("acct-1"),
+            )
+            .unwrap();
+            shell.workspace.active = Some(id);
+            shell.new_terminal(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, _| {
+            assert_eq!(
+                shell
+                    .terminals
+                    .get(&shell.workspace.project)
+                    .map_or(0, Vec::len),
+                0
+            );
+            let error = shell.error.clone().expect("the reason");
+            assert!(
+                error.contains("Could not open a terminal in the sandbox")
+                    && error.contains("Docker accounts are not available"),
+                "{error}"
+            );
+            assert!(!error.contains("sbx login"), "{error}");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_sandbox_terminal_whose_ssh_exits_255_drops_the_accounts_cached_token(cx: &mut TestAppContext) {
+    let accounts = FakeAccounts::install();
+    let (window, id, _) = shell_with_sandbox(cx, "running", CloudState::Available, true);
+    window
+        .update(cx, |shell, window, cx| {
+            monocode_core::sandboxes::account::pin(
+                &locked(&shell.store).unwrap(),
+                SBX_NAME,
+                Some(&accounts.account),
+            )
+            .unwrap();
+            shell.workspace.active = Some(id);
+            shell.new_terminal(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let token = || {
+        monocode_core::docker_accounts::env_for(Some(&accounts.account))
+            .unwrap()
+            .unwrap()
+            .1
+            .as_str()
+            .to_owned()
+    };
+    let first = token();
+    // ssh's connection failure (255) ends the terminal and drops the cached JWT. (Other exit
+    // codes keep it: that is covered where the rule lives, in monocode-core.)
+    window
+        .update(cx, |shell, _, cx| {
+            let terminal = shell.terminals[&shell.workspace.project][0].clone();
+            terminal.update(cx, |t, cx| t.fake_exit(Some(255), cx));
+        })
+        .unwrap();
+    assert_ne!(token(), first, "the next terminal exchanges a fresh token");
 }
 
 #[test]

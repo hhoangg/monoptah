@@ -372,6 +372,9 @@ fn main() {
             .unwrap_or(std::path::Path::new("."))
             .join("checkpoints"),
     );
+    // Docker accounts: every `sbx` and sandbox ssh of a project that names an account gets
+    // that account's token from here. Installed once, over this database's credentials.
+    monocode_core::docker_accounts::install_system(&db);
     let saved = db.ui_state().unwrap_or_else(|e| {
         eprintln!("Cannot read workspace settings: {e}");
         None
