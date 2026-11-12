@@ -257,7 +257,59 @@ if [ ! -x "$ENTRY" ] || [ "$FORCE_UPGRADE" = 1 ]; then
   if [ "$PHASE" != swapnow ]; then
   case "$(uname -s)" in Darwin) OS=darwin ;; Linux) OS=linux ;; *) echo 'Monoptah Host supports Linux and macOS.' >&2; exit 1 ;; esac
   case "$(uname -m)" in arm64|aarch64) ARCH=arm64 ;; x86_64|amd64) ARCH=x64 ;; *) echo 'Unsupported host architecture.' >&2; exit 1 ;; esac
+  # The Host bundles a glibc build of Node (glibc 2.28 or newer) and no musl one. Say so
+  # before downloading: on musl the loader fails with a message about a missing symbol.
+  # getconf is preferred; ldd is the fallback; with neither the libc stays unknown and the
+  # execution check below is the safety net. The mere presence of a musl loader proves nothing.
+  LIBC=
+  if [ "$OS" = linux ]; then
+    if _glibc=$(getconf GNU_LIBC_VERSION 2>/dev/null) && [ -n "$_glibc" ]; then
+      LIBC="glibc ${_glibc#glibc }"
+    else
+      _ldd=$(ldd --version 2>&1 || true)
+      case "$_ldd" in
+        *[Mm][Uu][Ss][Ll]*) LIBC=musl ;;
+        *GLIBC*|*'GNU libc'*|*'GNU C Library'*) LIBC=glibc ;;
+      esac
+    fi
+    case "$LIBC" in
+      musl)
+        echo 'This machine uses musl libc (for example Alpine Linux). Monoptah Host needs a glibc-based Linux with glibc 2.28 or newer.' >&2
+        exit 1 ;;
+      'glibc '*.*)
+        _gv=${LIBC#glibc }
+        _gmaj=${_gv%%.*}
+        _gmin=${_gv#*.}
+        _gmin=${_gmin%%[!0-9]*}
+        case "$_gmaj$_gmin" in
+          *[!0-9]*|'') ;;
+          *)
+            if [ -n "$_gmaj" ] && [ -n "$_gmin" ] && { [ "$_gmaj" -lt 2 ] || { [ "$_gmaj" -eq 2 ] && [ "$_gmin" -lt 28 ]; }; }; then
+              echo "This machine has $LIBC. Monoptah Host needs glibc 2.28 or newer." >&2
+              exit 1
+            fi ;;
+        esac ;;
+    esac
+  fi
   FILE="monocode-host-$OS-$ARCH.tar.gz"
+  # Runs the packaged Host's --version and compares it with the pinned version. A runtime
+  # that cannot execute (wrong libc, missing loader) is reported as that, not as a version
+  # mismatch. On any failure the directory is removed, so nothing half-installed is left
+  # behind or selected: runtime-path is only written after this passes.
+  check_runtime() {
+    _rc=0
+    _printed=$("$1/monocode-host" --version 2>"$TMP/runtime.err") || _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+      {
+        echo 'The Monoptah Host runtime cannot run on this machine:'
+        if [ -s "$TMP/runtime.err" ]; then head -n 5 "$TMP/runtime.err"; else echo "(exit status $_rc, no output)"; fi
+        echo "Detected libc: ${LIBC:-unknown}"
+      } >&2
+      rm -rf "$1"
+      exit 1
+    fi
+    [ "$_printed" = "$VERSION" ] || { echo 'Monoptah Host version mismatch.' >&2; rm -rf "$1"; exit 1; }
+  }
   download() {
     if command -v curl >/dev/null 2>&1; then
       curl --proto '=https' --proto-redir '=https' -fLsS --connect-timeout 15 --max-time 180 "$1" -o "$2"
@@ -290,7 +342,7 @@ if [ ! -x "$ENTRY" ] || [ "$FORCE_UPGRADE" = 1 ]; then
   [ "$EXPECTED" = "$ACTUAL" ] || { echo 'Monoptah Host package checksum mismatch.' >&2; exit 1; }
   mkdir "$TMP/unpacked"
   tar -xzf "$TMP/$FILE" -C "$TMP/unpacked"
-  [ "$("$TMP/unpacked/monocode-host" --version)" = "$VERSION" ] || { echo 'Monoptah Host version mismatch.' >&2; exit 1; }
+  check_runtime "$TMP/unpacked"
   fi
   if [ "$PHASE" = stage ]; then
     # Phase A: the verified package waits next to the running Host, which is not touched.
@@ -298,7 +350,7 @@ if [ ! -x "$ENTRY" ] || [ "$FORCE_UPGRADE" = 1 ]; then
     case "$_old_staged" in "$BASE"/runtime/staged-*) rm -rf "$_old_staged" ;; esac
     DEST="$BASE/runtime/staged-$VERSION-$OS-$ARCH-$(basename "$TMP")"
     mv "$TMP/unpacked" "$DEST"
-    [ "$("$DEST/monocode-host" --version)" = "$VERSION" ] || exit 1
+    check_runtime "$DEST"
     printf '%s\n' "$DEST" > "$STAGED_FILE"
     echo '{"staged":true}'
     exit 0
@@ -330,7 +382,7 @@ if [ ! -x "$ENTRY" ] || [ "$FORCE_UPGRADE" = 1 ]; then
     DEST="$BASE/runtime/$VERSION-$OS-$ARCH-$(basename "$TMP")"
     # Concurrent installations never replace a directory used by a running host.
     mv "$TMP/unpacked" "$DEST"
-    [ "$("$DEST/monocode-host" --version)" = "$VERSION" ] || exit 1
+    check_runtime "$DEST"
   fi
   # Keep a real wrapper (rather than a symlink): it resolves the packaged Node
   # relative to the versioned executable, not this bin directory.

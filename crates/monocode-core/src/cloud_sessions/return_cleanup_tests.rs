@@ -29,7 +29,13 @@ impl Host for TestHost {
         all.extend(self.extra.clone());
         Ok(all)
     }
-    fn connect(&self, _: &str, _: &str, _: &mut dyn FnMut(&str)) -> Result<Machine, String> {
+    fn connect(
+        &self,
+        _: &str,
+        _: &str,
+        _: &AtomicBool,
+        _: &mut dyn FnMut(&str),
+    ) -> Result<Machine, String> {
         Err("unused".into())
     }
     fn ensure(

@@ -153,7 +153,7 @@ impl CloudRunner for SshRunner {
 }
 
 /// Holds the single SSH job slot; frees it when dropped.
-struct SlotGuard(Arc<Job>);
+pub(super) struct SlotGuard(Arc<Job>);
 impl Drop for SlotGuard {
     fn drop(&mut self) {
         self.0.complete(|| Err("Host update finished".into()));
@@ -222,7 +222,8 @@ impl Connections {
         if cancel.load(Ordering::Relaxed) {
             return Outcome::Cancelled;
         }
-        let (job, _slot) = match self.hold_job_slot(cancel, &mut || {
+        let target = machine.ssh.as_ref().map(SshTarget::job_target);
+        let (job, _slot) = match self.hold_job_slot(target, cancel, &mut || {
             progress("Waiting for another operation on this workspace…")
         }) {
             Ok(slot) => slot,
@@ -351,11 +352,15 @@ impl Connections {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = runner;
     }
 
-    /// Takes the single SSH job slot (waiting for a running job, bounded and cancellable), so a
-    /// bootstrap from a concurrent wake cannot run beside the upgrade. `waiting` is called once
-    /// if the slot is not free at first.
-    fn hold_job_slot(
+    /// Takes an SSH job slot for `target` (waiting for a conflicting job, bounded and
+    /// cancellable), so a bootstrap from a concurrent wake cannot run beside the upgrade. The
+    /// conflict rule is the one `start_ssh_job` uses (`jobs_conflict`), decided under the same
+    /// lock, so an upgrade of one workspace waits only for jobs on that workspace. The slot is
+    /// a job with that target, so a later setup job for it conflicts too. `waiting` is called
+    /// once if the slot is not free at first.
+    pub(super) fn hold_job_slot(
         &self,
+        target: Option<super::ssh::JobTarget>,
         cancel: &AtomicBool,
         waiting: &mut dyn FnMut(),
     ) -> Result<(Arc<Job>, SlotGuard), String> {
@@ -367,9 +372,16 @@ impl Connections {
                     .jobs
                     .lock()
                     .map_err(|_| "Connection setup is unavailable")?;
-                if !jobs.values().any(|job| !job.view().done) {
-                    jobs.retain(|_, job| !job.view().done);
-                    let job = Job::new();
+                super::prune_finished_jobs_at(&mut jobs, Instant::now());
+                let key_ready = super::ssh::codespace_key_exists();
+                if !jobs.values().any(|active| {
+                    !active.view().done
+                        && super::ssh::jobs_conflict(target.as_ref(), active.target(), key_ready)
+                }) {
+                    let job = match target.clone() {
+                        Some(target) => Job::for_target(target),
+                        None => Job::new(),
+                    };
                     jobs.insert(job.view().id, job.clone());
                     return Ok((job.clone(), SlotGuard(job)));
                 }

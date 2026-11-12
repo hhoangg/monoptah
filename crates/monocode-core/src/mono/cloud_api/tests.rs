@@ -82,6 +82,7 @@ impl Host for FakeHost {
         &self,
         codespace: &str,
         display: &str,
+        _: &AtomicBool,
         _progress: &mut dyn FnMut(&str),
     ) -> Result<Machine, String> {
         self.log

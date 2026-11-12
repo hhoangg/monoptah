@@ -633,6 +633,7 @@ mod tests {
                 &self,
                 _: &str,
                 _: &str,
+                _: &AtomicBool,
                 _: &mut dyn FnMut(&str),
             ) -> Result<Machine, String> {
                 panic!("no connect")

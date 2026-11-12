@@ -93,6 +93,7 @@ impl Host for FakeHost {
         &self,
         codespace: &str,
         _: &str,
+        _: &AtomicBool,
         progress: &mut dyn FnMut(&str),
     ) -> Result<Machine, String> {
         progress("Pairing with the codespace");
@@ -1341,8 +1342,14 @@ fn a_partial_delete_still_drops_the_sessions_and_keeps_the_warning(cx: &mut Test
         fn machines(&self) -> Result<Vec<Machine>, String> {
             self.0.machines()
         }
-        fn connect(&self, c: &str, d: &str, p: &mut dyn FnMut(&str)) -> Result<Machine, String> {
-            self.0.connect(c, d, p)
+        fn connect(
+            &self,
+            c: &str,
+            d: &str,
+            h: &AtomicBool,
+            p: &mut dyn FnMut(&str),
+        ) -> Result<Machine, String> {
+            self.0.connect(c, d, h, p)
         }
         fn ensure(&self, m: &str, c: &AtomicBool, p: &mut dyn FnMut(&str)) -> Result<(), String> {
             self.0.ensure(m, c, p)

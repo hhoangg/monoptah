@@ -190,7 +190,13 @@ pub(crate) mod fakes {
             }
             Ok(machines)
         }
-        fn connect(&self, name: &str, _: &str, _: &mut dyn FnMut(&str)) -> Result<Machine, String> {
+        fn connect(
+            &self,
+            name: &str,
+            _: &str,
+            _: &AtomicBool,
+            _: &mut dyn FnMut(&str),
+        ) -> Result<Machine, String> {
             Ok(machine(name))
         }
         fn ensure(&self, id: &str, _: &AtomicBool, _: &mut dyn FnMut(&str)) -> Result<(), String> {

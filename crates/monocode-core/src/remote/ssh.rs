@@ -252,14 +252,90 @@ pub struct JobView {
 struct JobData {
     view: JobView,
     answer: Option<String>,
+    /// When the job completed; finished jobs are kept a while for their owner to read.
+    finished: Option<Instant>,
 }
+
+/// What a setup job connects to. Two jobs for different cloud targets can run side by side;
+/// jobs for the same target, or any job on a plain SSH machine, cannot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JobTarget {
+    Codespace(String),
+    Sandbox(String),
+    /// Destination and port of a plain SSH machine.
+    Ssh(String, Option<u16>),
+}
+
+impl SshTarget {
+    pub fn job_target(&self) -> JobTarget {
+        match self.transport() {
+            Transport::Codespace(name) => JobTarget::Codespace(name.into()),
+            Transport::Sandbox(sandbox) => JobTarget::Sandbox(sandbox.name.clone()),
+            Transport::Ssh => JobTarget::Ssh(self.target.clone(), self.port),
+        }
+    }
+}
+
+/// True when an active job for `active` must finish before a job for `new` may start.
+/// `None` (a job tied to no single target) conflicts with everything.
+///
+/// * The same target twice would race on one machine.
+/// * A plain SSH job can ask for a password or a host key and writes `~/.ssh/known_hosts`,
+///   so it runs alone.
+/// * Codespace jobs for different codespaces run together, but only once `gh` has created
+///   its automatic key pair (`key_ready`): the first `gh codespace ssh` generates it, and
+///   two first runs could race on the files.
+pub fn jobs_conflict(new: Option<&JobTarget>, active: Option<&JobTarget>, key_ready: bool) -> bool {
+    let (Some(new), Some(active)) = (new, active) else {
+        return true;
+    };
+    match (new, active) {
+        (JobTarget::Ssh(..), _) | (_, JobTarget::Ssh(..)) => true,
+        (new, active) if new == active => true,
+        (JobTarget::Codespace(_), JobTarget::Codespace(_)) => !key_ready,
+        _ => false,
+    }
+}
+
+/// Whether `gh` has already created its automatic key pair for `gh codespace ssh`
+/// (`~/.ssh/codespaces.auto` and `.pub`). Without a known home it counts as missing, which
+/// only makes codespace setups run one at a time.
+pub fn codespace_key_exists() -> bool {
+    #[cfg(all(test, unix))]
+    let override_home = HOME_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    #[cfg(not(all(test, unix)))]
+    let override_home: Option<std::path::PathBuf> = None;
+    let Some(home) = override_home.or_else(|| {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(std::path::PathBuf::from)
+    }) else {
+        return false;
+    };
+    let ssh = home.join(".ssh");
+    ssh.join("codespaces.auto").is_file() && ssh.join("codespaces.auto.pub").is_file()
+}
+
 pub struct Job {
     inner: Mutex<JobData>,
     pub cancelled: AtomicBool,
+    /// `None` for a job that is not tied to one target (a Host upgrade slot): it conflicts
+    /// with every other job.
+    target: Option<JobTarget>,
 }
 impl Job {
     pub fn new() -> Arc<Self> {
+        Self::with_target(None)
+    }
+    pub fn for_target(target: JobTarget) -> Arc<Self> {
+        Self::with_target(Some(target))
+    }
+    fn with_target(target: Option<JobTarget>) -> Arc<Self> {
         Arc::new(Self {
+            target,
             inner: Mutex::new(JobData {
                 view: JobView {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -270,9 +346,17 @@ impl Job {
                     machine: None,
                 },
                 answer: None,
+                finished: None,
             }),
             cancelled: AtomicBool::new(false),
         })
+    }
+    pub fn target(&self) -> Option<&JobTarget> {
+        self.target.as_ref()
+    }
+    /// When the job completed, `None` while it runs.
+    pub fn finished_at(&self) -> Option<Instant> {
+        self.inner.lock().unwrap().finished
     }
     pub fn view(&self) -> JobView {
         self.inner.lock().unwrap().view.clone()
@@ -288,6 +372,7 @@ impl Job {
             action()
         };
         inner.view.done = true;
+        inner.finished = Some(Instant::now());
         inner.view.prompt = None;
         inner.answer = None;
         match result {
@@ -360,6 +445,8 @@ impl Job {
 static GH_OVERRIDE: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 #[cfg(all(test, unix))]
 static GH_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(all(test, unix))]
+static HOME_OVERRIDE: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 
 /// Points codespace commands at a fake `gh` for the life of the guard. The
 /// guard also serializes tests, because the override is process-global.
@@ -374,9 +461,17 @@ impl GhOverride {
     }
 }
 #[cfg(all(test, unix))]
+impl GhOverride {
+    /// Makes the codespace key lookup read this directory instead of the real home.
+    pub(super) fn set_home(&self, home: std::path::PathBuf) {
+        *HOME_OVERRIDE.lock().unwrap_or_else(PoisonError::into_inner) = Some(home);
+    }
+}
+#[cfg(all(test, unix))]
 impl Drop for GhOverride {
     fn drop(&mut self) {
         *GH_OVERRIDE.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        *HOME_OVERRIDE.lock().unwrap_or_else(PoisonError::into_inner) = None;
     }
 }
 
@@ -1256,6 +1351,8 @@ pub fn device_name() -> String {
     }
 }
 
+#[cfg(test)]
+mod bootstrap_libc_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -7,6 +7,8 @@ mod cloud_upgrade_tests;
 pub mod host_info;
 pub mod host_release;
 pub mod host_upgrade;
+#[cfg(test)]
+mod job_slot_tests;
 pub mod protocol;
 mod ssh;
 pub mod ssh_askpass;
@@ -55,9 +57,18 @@ pub struct Connections {
 }
 
 type WakeSlot = Arc<(Mutex<Option<Result<(), String>>>, Condvar)>;
+/// Returned when a setup job for the same target (or one that needs the SSH prompts to
+/// itself) is already running.
 const SSH_BUSY: &str = "Another SSH connection is being set up. Finish or cancel it first.";
-/// How long a wake waits for the single SSH job slot before giving up.
-const JOB_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// How long a wake or a start waits for a free SSH job slot before giving up.
+pub(crate) const JOB_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// How long a finished setup job stays readable. Its owner polls every 100 ms, but with
+/// several starts at once the owner may not read the result right when the job ends.
+const FINISHED_JOB_KEEP: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// How long after a job paired a target a cloud start for that target still waits (see
+/// `start_ssh_job_guarded`). Short: it only has to cover the moment between the machine being
+/// committed and the start's next look at the store.
+const JUST_PAIRED_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
 /// Error returned when a wake was cancelled by its caller.
 pub const WAKE_CANCELLED: &str = "Wake cancelled";
 
@@ -776,6 +787,14 @@ fn cloud_or_plain_bootstrap(target: &SshTarget, platform: ssh::HostPlatform) -> 
     }
 }
 
+/// Drops the finished jobs that have been kept longer than [`FINISHED_JOB_KEEP`] as of `now`.
+fn prune_finished_jobs_at(jobs: &mut HashMap<String, Arc<Job>>, now: std::time::Instant) {
+    jobs.retain(|_, job| {
+        job.finished_at()
+            .is_none_or(|at| now.saturating_duration_since(at) < FINISHED_JOB_KEEP)
+    });
+}
+
 impl Connections {
     fn start_ssh_job(
         self: &Arc<Self>,
@@ -784,18 +803,48 @@ impl Connections {
         existing: Option<StoredMachine>,
         upgrade: bool,
     ) -> Result<String, String> {
+        self.start_ssh_job_guarded(target, name, existing, upgrade, false)
+    }
+
+    /// [`Self::start_ssh_job`]. With `after_pairing_guard` (the cloud start path), a job for
+    /// the same target that finished with a machine within [`JUST_PAIRED_WINDOW`] makes the
+    /// start wait (SSH_BUSY): that job committed its machine before it was marked done, so the
+    /// start's next look at the store finds it and wakes it instead of pairing a second time.
+    fn start_ssh_job_guarded(
+        self: &Arc<Self>,
+        target: SshTarget,
+        name: String,
+        existing: Option<StoredMachine>,
+        upgrade: bool,
+        after_pairing_guard: bool,
+    ) -> Result<String, String> {
         ssh::check_target(&target)?;
-        let job = Job::new();
+        let job = Job::for_target(target.job_target());
         let id = job.view().id;
         {
             let mut jobs = self
                 .jobs
                 .lock()
                 .map_err(|_| "Connection setup is unavailable")?;
-            if jobs.values().any(|job| !job.view().done) {
+            prune_finished_jobs_at(&mut jobs, std::time::Instant::now());
+            // Check and insert under one lock, so two starts cannot both pass.
+            let key_ready = ssh::codespace_key_exists();
+            if jobs.values().any(|active| {
+                !active.view().done && ssh::jobs_conflict(job.target(), active.target(), key_ready)
+            }) {
                 return Err(SSH_BUSY.into());
             }
-            jobs.retain(|_, job| !job.view().done);
+            if after_pairing_guard
+                && jobs.values().any(|done| {
+                    done.target() == job.target()
+                        && done.view().machine.is_some()
+                        && done
+                            .finished_at()
+                            .is_some_and(|at| at.elapsed() < JUST_PAIRED_WINDOW)
+                })
+            {
+                return Err(SSH_BUSY.into());
+            }
             jobs.insert(id.clone(), job.clone());
         }
         let state = self.clone();
@@ -1006,12 +1055,31 @@ impl Connections {
         name: &str,
         display_name: Option<&str>,
     ) -> Result<String, String> {
+        self.codespace_begin_with(name, display_name, false)
+    }
+
+    /// [`Self::codespace_begin`] for the cloud start path, which must not pair a codespace
+    /// that a job it waited for has just paired.
+    pub(crate) fn codespace_begin_for_start(
+        self: &Arc<Self>,
+        name: &str,
+        display_name: Option<&str>,
+    ) -> Result<String, String> {
+        self.codespace_begin_with(name, display_name, true)
+    }
+
+    fn codespace_begin_with(
+        self: &Arc<Self>,
+        name: &str,
+        display_name: Option<&str>,
+        after_pairing_guard: bool,
+    ) -> Result<String, String> {
         let name = ssh::validate_codespace(name)?;
         let display = display_name
             .map(|d| d.trim().chars().take(100).collect::<String>())
             .filter(|d| !d.is_empty())
             .unwrap_or_else(|| name.clone());
-        self.start_ssh_job(
+        self.start_ssh_job_guarded(
             SshTarget {
                 target: name.clone(),
                 port: None,
@@ -1022,6 +1090,7 @@ impl Connections {
             display,
             None,
             false,
+            after_pairing_guard,
         )
     }
 
@@ -1157,7 +1226,7 @@ impl Connections {
     /// SSH setup runs one job at a time. Instead of failing while another
     /// job (a pairing, a wake of another machine, a just-cancelled wake) holds
     /// the slot, wait for it, bounded and cancellable.
-    fn start_when_free(
+    pub(crate) fn start_when_free(
         &self,
         cancel: &AtomicBool,
         limit: std::time::Duration,

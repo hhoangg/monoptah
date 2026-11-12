@@ -121,7 +121,13 @@ impl Host for SyncHost {
     fn machines(&self) -> Result<Vec<Machine>, String> {
         Ok(self.machines.clone())
     }
-    fn connect(&self, _: &str, _: &str, _: &mut dyn FnMut(&str)) -> Result<Machine, String> {
+    fn connect(
+        &self,
+        _: &str,
+        _: &str,
+        _: &AtomicBool,
+        _: &mut dyn FnMut(&str),
+    ) -> Result<Machine, String> {
         Err("unused".into())
     }
     fn ensure(&self, id: &str, _: &AtomicBool, _: &mut dyn FnMut(&str)) -> Result<(), String> {

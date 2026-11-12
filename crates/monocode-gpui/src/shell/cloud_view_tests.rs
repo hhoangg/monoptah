@@ -78,7 +78,13 @@ impl Host for FileHost {
             sandbox: None,
         }])
     }
-    fn connect(&self, _: &str, _: &str, _: &mut dyn FnMut(&str)) -> Result<Machine, String> {
+    fn connect(
+        &self,
+        _: &str,
+        _: &str,
+        _: &AtomicBool,
+        _: &mut dyn FnMut(&str),
+    ) -> Result<Machine, String> {
         panic!("viewing must not connect");
     }
     fn ensure(&self, _: &str, _: &AtomicBool, _: &mut dyn FnMut(&str)) -> Result<(), String> {

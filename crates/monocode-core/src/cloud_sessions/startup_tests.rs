@@ -255,6 +255,7 @@ impl super::Host for Host {
         &self,
         codespace: &str,
         display: &str,
+        _: &AtomicBool,
         progress: &mut dyn FnMut(&str),
     ) -> Result<Machine, String> {
         let gate = self.wait_for.lock().unwrap().clone();

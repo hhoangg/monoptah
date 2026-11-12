@@ -20,7 +20,7 @@ pub(super) struct State {
     /// The link was live at least once, so a later `!online` is a known drop and not a refresh
     /// that has not finished yet.
     was_online: bool,
-    app_prompt_waiting: bool,
+    pub(super) app_prompt_waiting: bool,
     app_draft_launched: bool,
     waking: bool,
     /// Stops the reconnect that is running (set by the Cancel button).
@@ -84,8 +84,12 @@ impl Conversation {
             .as_ref()
             .is_some_and(|s| s.blocks_session())
     }
+    /// A cloud launch is under way: the start runs, or its first prompt has still to go out.
+    /// A start that failed is not under way (it waits for a retry), so it is not busy.
     pub(crate) fn cloud_launch_pending(&self) -> bool {
-        self.cloud_start.is_some()
+        self.cloud_start
+            .as_ref()
+            .is_some_and(|s| s.phase != crate::cloud_start_view::StartPhase::Failed)
             && (self.cloud_start_blocks()
                 || self.remote_state.app_prompt_waiting
                 || self.remote_state.app_draft_launched)

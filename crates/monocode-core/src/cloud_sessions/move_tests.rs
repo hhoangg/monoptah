@@ -153,6 +153,7 @@ impl super::Host for FakeHost {
         &self,
         codespace: &str,
         _: &str,
+        _: &AtomicBool,
         _: &mut dyn FnMut(&str),
     ) -> Result<Machine, String> {
         if let Some(error) = self.connect_error.lock().unwrap().take() {

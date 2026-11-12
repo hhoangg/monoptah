@@ -877,7 +877,13 @@ mod tests {
         fn machines(&self) -> Result<Vec<Machine>, String> {
             Ok(vec![])
         }
-        fn connect(&self, _: &str, _: &str, _: &mut dyn FnMut(&str)) -> Result<Machine, String> {
+        fn connect(
+            &self,
+            _: &str,
+            _: &str,
+            _: &AtomicBool,
+            _: &mut dyn FnMut(&str),
+        ) -> Result<Machine, String> {
             Err("offline".into())
         }
         fn ensure(&self, _: &str, _: &AtomicBool, _: &mut dyn FnMut(&str)) -> Result<(), String> {

@@ -242,7 +242,12 @@ fn open_project(
         Some(machine) if request.sandbox.is_some() => {
             progress("Reconnecting to the sandbox");
             host.disconnect(&machine.id)?;
-            host.connect_sandbox(request.sandbox.cloned().unwrap(), request.display, progress)?
+            host.connect_sandbox(
+                request.sandbox.cloned().unwrap(),
+                request.display,
+                halt,
+                progress,
+            )?
         }
         Some(machine) => {
             progress(&format!("Connecting to the {}", request.cloud.noun()));
@@ -250,8 +255,10 @@ fn open_project(
             machine
         }
         None => match request.sandbox {
-            Some(sandbox) => host.connect_sandbox(sandbox.clone(), request.display, progress)?,
-            None => host.connect(&request.cloud.name, request.display, progress)?,
+            Some(sandbox) => {
+                host.connect_sandbox(sandbox.clone(), request.display, halt, progress)?
+            }
+            None => host.connect(&request.cloud.name, request.display, halt, progress)?,
         },
     };
     // Phase 2 of the Host upgrade, inside this user-initiated connect. Never fatal: a
@@ -434,11 +441,14 @@ impl CloudState {
 /// Machine/transport seam over [`Connections`] so the service is testable.
 pub trait Host: Send + Sync {
     fn machines(&self) -> Result<Vec<Machine>, String>;
-    /// Pair with a codespace (starting it via gh if needed); blocks until done.
+    /// Pair with a codespace (starting it via gh if needed); blocks until done. Waits for a
+    /// free SSH setup slot instead of failing; setting `halt` stops the wait or the setup with
+    /// [`START_ABORTED`].
     fn connect(
         &self,
         codespace: &str,
         display: &str,
+        halt: &AtomicBool,
         progress: &mut dyn FnMut(&str),
     ) -> Result<Machine, String>;
     /// Pair with the Host in a Docker Sandbox's devcontainer; blocks until done. The relay
@@ -447,9 +457,10 @@ pub trait Host: Send + Sync {
         &self,
         sandbox: SandboxTarget,
         display: &str,
+        halt: &AtomicBool,
         progress: &mut dyn FnMut(&str),
     ) -> Result<Machine, String> {
-        let _ = (sandbox, display, progress);
+        let _ = (sandbox, display, halt, progress);
         Err("This host cannot connect to a Docker sandbox.".into())
     }
     /// Wake the codespace and reconnect if needed (blocking, no-op when
@@ -512,6 +523,15 @@ pub trait Host: Send + Sync {
     fn disconnect(&self, machine_id: &str) -> Result<(), String>;
 }
 
+/// A halted wait for the SSH slot ends the start the way every other halted step does.
+fn start_error(error: String) -> String {
+    if error == remote::WAKE_CANCELLED {
+        START_ABORTED.into()
+    } else {
+        error
+    }
+}
+
 impl Host for Arc<Connections> {
     fn machines(&self) -> Result<Vec<Machine>, String> {
         self.list()
@@ -520,19 +540,48 @@ impl Host for Arc<Connections> {
         &self,
         codespace: &str,
         display: &str,
+        halt: &AtomicBool,
         progress: &mut dyn FnMut(&str),
     ) -> Result<Machine, String> {
-        let job = self.codespace_begin(codespace, Some(display))?;
-        self.await_pairing(&job, "codespace", progress)
+        // A start that waited for the slot may find the codespace already paired by the job
+        // it waited for. Pairing again would replace its device token and tunnel under
+        // requests in flight, so that machine is woken (a no-op when connected) instead.
+        let mut paired: Option<Machine> = None;
+        let job = self
+            .start_when_free(halt, remote::JOB_SLOT_WAIT, || {
+                paired = self
+                    .list()?
+                    .into_iter()
+                    .find(|m| m.codespace.as_deref() == Some(codespace));
+                if paired.is_some() {
+                    return Ok(String::new());
+                }
+                self.codespace_begin_for_start(codespace, Some(display))
+            })
+            .map_err(start_error)?;
+        if let Some(machine) = paired {
+            self.ensure_codespace_with(&machine.id, halt, progress)
+                .map_err(start_error)?;
+            return Ok(machine);
+        }
+        self.await_pairing(&job, "codespace", halt, progress)
     }
+    // A sandbox always pairs afresh: `open_project` drops an existing machine first on
+    // purpose (a start has just restored the relay and the Host), so a machine found here
+    // would be the one that call meant to replace.
     fn connect_sandbox(
         &self,
         sandbox: SandboxTarget,
         display: &str,
+        halt: &AtomicBool,
         progress: &mut dyn FnMut(&str),
     ) -> Result<Machine, String> {
-        let job = self.sandbox_begin(sandbox, Some(display))?;
-        self.await_pairing(&job, "sandbox", progress)
+        let job = self
+            .start_when_free(halt, remote::JOB_SLOT_WAIT, || {
+                self.sandbox_begin(sandbox.clone(), Some(display))
+            })
+            .map_err(start_error)?;
+        self.await_pairing(&job, "sandbox", halt, progress)
     }
     fn ensure(
         &self,
@@ -584,15 +633,27 @@ impl Host for Arc<Connections> {
 }
 
 impl Connections {
-    /// Follows the pairing job `job` to its end and returns the machine it paired.
+    /// Follows the pairing job `job` to its end and returns the machine it paired. Setting
+    /// `halt` cancels the job, waits for it to stop (bounded) and fails with [`START_ABORTED`].
     fn await_pairing(
         self: &Arc<Self>,
         job: &str,
         noun: &str,
+        halt: &AtomicBool,
         progress: &mut dyn FnMut(&str),
     ) -> Result<Machine, String> {
         let mut last = String::new();
         loop {
+            if halt.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = self.ssh_cancel(job);
+                for _ in 0..20 {
+                    if self.ssh_poll(job).map_or(true, |view| view.done) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                return Err(START_ABORTED.into());
+            }
             let view = self.ssh_poll(job)?;
             if view.message != last {
                 progress(&view.message);

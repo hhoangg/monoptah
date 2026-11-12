@@ -432,13 +432,20 @@ impl Host for FakeHost {
     fn machines(&self) -> Result<Vec<Machine>, String> {
         Ok(self.machines.lock().unwrap().clone())
     }
-    fn connect(&self, _: &str, _: &str, _: &mut dyn FnMut(&str)) -> Result<Machine, String> {
+    fn connect(
+        &self,
+        _: &str,
+        _: &str,
+        _: &AtomicBool,
+        _: &mut dyn FnMut(&str),
+    ) -> Result<Machine, String> {
         panic!("a sandbox must not connect as a codespace")
     }
     fn connect_sandbox(
         &self,
         sandbox: crate::remote::SandboxTarget,
         display: &str,
+        _: &AtomicBool,
         progress: &mut dyn FnMut(&str),
     ) -> Result<Machine, String> {
         if let Some(shell) = self.shell.lock().unwrap().as_ref() {
