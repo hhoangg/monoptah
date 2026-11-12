@@ -139,10 +139,13 @@ Windows x86_64 (unsigned installer). It releases separately from the Tauri app. 
 runs on GitHub Actions (hosted macOS runners are not being acquired): the macOS app is checked,
 built and packaged on the maintainer's Mac, everything else is on CI.
 
-What CI checks (`native.yml`): `monocode-core` clippy and tests on Linux and Windows, and GPUI
-with `fmt` (Linux) and `cargo check --all-targets` (Linux and Windows). GPUI clippy
-`-D warnings`, the GPUI tests and everything macOS run locally in `npm run native:check`,
-which `native:release:mac` runs.
+What CI checks (`native.yml`): `monocode-core` clippy and tests plus `native:test:dev` on Linux
+and Windows, GPUI `fmt`, clippy `-D warnings` and tests on Linux, and GPUI `cargo check
+--all-targets` on Windows. During development the local remainder is `npm run native:check:mac`
+(clippy of the macOS-only code that Linux and Windows never compile); when you change macOS-only
+code or tests gated to macOS, also run the tests you touched on macOS. `npm run native:check`
+(the full gate, including the GPUI tests on macOS) still runs locally in `native:release:mac`
+before every release.
 
 1. Edit `docs/native/monoptah-release-notes.md` (its first line must be
    `# Monoptah Native X.Y.Z`) and merge it into main through a PR.

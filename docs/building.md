@@ -81,7 +81,8 @@ Native commands do not need npm dependencies installed.
 ```sh
 npm run native:dev     # launch with a separate development database
 npm run native:build   # create an optimized app using installed MonoCode data
-npm run native:check   # run native checks
+npm run native:check   # run native checks (full)
+npm run native:check:mac   # macOS-only remainder of what CI does not run
 ```
 
 Type `r` then Enter in the development terminal to rebuild and restart. There is

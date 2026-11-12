@@ -249,6 +249,7 @@ impl Monos {
     }
     /// The tray's Quit: the window's own quit path, so busy terminals and unsaved
     /// files are asked about. The window is shown first so the dialog is seen.
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn request_quit(&mut self, cx: &mut Context<Self>) {
         let (Some(handle), true) = (self.parent_window, self.owner.upgrade().is_some()) else {
             crate::quit(cx);

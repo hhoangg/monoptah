@@ -8,7 +8,10 @@ use serde_json::Value;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Permission {
     Prompt,
+    // Only macOS reports these; the other platforms still match on them.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Granted,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Denied,
     Unsupported,
 }
@@ -91,6 +94,7 @@ impl Target {
         }
     }
 
+    #[cfg(target_os = "macos")]
     pub fn from_tag(tag: &str) -> Option<Self> {
         if let Some(rest) = tag.strip_prefix("monocode-session:") {
             let (id, sequence) = rest.split_once(':')?;

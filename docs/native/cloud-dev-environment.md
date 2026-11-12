@@ -80,8 +80,11 @@ Wayland features, `vendor/gpui-pre-linux`), so it builds here, but it is not ful
 | GPUI `clippy -D warnings` | **fails**: unused/dead code that is only used on macOS (`native.yml` says the same) |
 | GPUI tests | 3339 pass, 23 fail deterministically (terminal dock, panes, settings, quit gate, ...), at least some because tests press macOS `cmd-` shortcuts. Not triaged one by one |
 
-So GPUI clippy and the full GPUI test run stay Mac-only checks (`npm run native:check`); do
-not report them as passing from a Linux session. The GPUI test binary needs an 8g sandbox even at 1 job (see Resources). Anything needing a Metal device, a display or the real macOS app (`native:dev`,
+This was measured before the macOS-only code was gated, so those results are historical:
+GPUI clippy `-D warnings` now passes on Linux and runs in `native.yml` on CI, together with the
+GPUI tests. Only clippy of the macOS-only code (`npm run native:check:mac`) and tests gated to
+macOS stay Mac-only, and `npm run native:check` still runs in full before every release. Do not
+report macOS-only checks as passing from a Linux session. The GPUI test binary needs an 8g sandbox even at 1 job (see Resources). Anything needing a Metal device, a display or the real macOS app (`native:dev`,
 `native:build`, packaging, `native:release:mac`) is Mac-only.
 
 ## Linked git worktrees
