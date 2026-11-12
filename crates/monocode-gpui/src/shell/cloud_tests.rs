@@ -5278,6 +5278,58 @@ fn a_docker_account_token_is_resolved_off_the_ui_thread_before_the_terminal_laun
 }
 
 #[gpui::test]
+fn a_sandbox_terminal_finished_after_a_project_switch_joins_its_own_project_unfocused(
+    cx: &mut TestAppContext,
+) {
+    let accounts = FakeAccounts::install();
+    let (window, id, _) = shell_with_sandbox(cx, "running", CloudState::Available, true);
+    let original = window
+        .update(cx, |shell, window, cx| {
+            monocode_core::sandboxes::account::pin(
+                &locked(&shell.store).unwrap(),
+                SBX_NAME,
+                Some(&accounts.account),
+            )
+            .unwrap();
+            shell.workspace.active = Some(id);
+            let original = shell.workspace.project.clone();
+            shell.new_terminal(window, cx);
+            // The user moves to another project while the token is being fetched.
+            shell.workspace.project = "/somewhere/else".into();
+            original
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, _| {
+            assert_eq!(shell.workspace.project, "/somewhere/else");
+            assert_eq!(
+                shell.terminals.get(&original).map_or(0, Vec::len),
+                1,
+                "the tab joined the project the session is in"
+            );
+            assert_eq!(
+                shell
+                    .workspace
+                    .docks
+                    .get(&original)
+                    .map_or(0, |d| d.terminals.len()),
+                1
+            );
+            assert_eq!(
+                shell.terminals.get("/somewhere/else").map_or(0, Vec::len),
+                0,
+                "nothing was added to the project now in view"
+            );
+            assert!(
+                !shell.workspace.docks.contains_key("/somewhere/else"),
+                "its dock was not touched or opened"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn a_docker_account_that_cannot_give_a_token_opens_no_terminal_and_says_why(
     cx: &mut TestAppContext,
 ) {

@@ -986,7 +986,7 @@ impl Store {
                 CloudBackendKind::DockerSandbox => {
                     // Under the account the sandbox lives in. `ls` under another one would
                     // report "not found" and forget a sandbox that is still billing.
-                    let account = crate::sandboxes::account::pinned(self, &cloud.name);
+                    let account = crate::sandboxes::account::pinned(self, &cloud.name)?;
                     crate::sandboxes::find_by_name(
                         &crate::sandboxes::as_account(sbx, account.as_deref()),
                         &cloud.name,
@@ -1046,7 +1046,11 @@ impl Store {
             .cloud()
             .ok_or("This is not a cloud session.")?;
         let account = (cloud.kind == CloudBackendKind::DockerSandbox)
-            .then(|| crate::sandboxes::account::pinned(self, &cloud.name))
+            .then(|| {
+                crate::sandboxes::account::pinned(self, &cloud.name)
+                    .ok()
+                    .flatten()
+            })
             .flatten()
             .map(|account| crate::sandboxes::account::describe(self, &account));
         self.forget_cloud_session(id)?;

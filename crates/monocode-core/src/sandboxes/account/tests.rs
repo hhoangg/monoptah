@@ -2,6 +2,10 @@ use super::*;
 use crate::docker_accounts::test_support::Installed;
 use std::path::Path;
 
+fn pinned(store: &Store, name: &str) -> Option<String> {
+    super::pinned(store, name).unwrap()
+}
+
 fn store() -> Store {
     Store::open(Path::new(":memory:")).unwrap()
 }
@@ -79,9 +83,10 @@ fn a_plain_id_written_by_the_first_format_is_still_read() {
     let store = store();
     store.save_setting(&pin_key("box-1"), "acct-A").unwrap();
     assert_eq!(pinned(&store, "box-1").as_deref(), Some("acct-A"));
-    // And a pin of the new format with an unusable body is no pin.
+    // A pin of the new format with an unusable body can not be read: an error, never "no
+    // account" (which would send the sandbox's calls under the machine login).
     store.save_setting(&pin_key("box-2"), "{broken").unwrap();
-    assert_eq!(pinned(&store, "box-2"), None);
+    assert!(super::pinned(&store, "box-2").is_err());
 }
 
 #[test]
@@ -130,4 +135,36 @@ fn a_pin_follows_the_docker_id_when_the_account_was_added_again() {
     // Another Docker ID is never taken for it.
     let bob = installed.add("bob");
     assert_ne!(pinned(&store, "box-1").as_deref(), Some(bob.as_str()));
+}
+
+#[test]
+fn a_pin_follows_the_docker_id_ignoring_case() {
+    let installed = Installed::new();
+    let first = installed.add("Alice");
+    let store = store();
+    pin(&store, "box-1", Some(&first)).unwrap();
+    installed.accounts.remove(&first).unwrap();
+    let second = installed.add("alice");
+    assert_ne!(first, second);
+    assert_eq!(pinned(&store, "box-1").as_deref(), Some(second.as_str()));
+}
+
+#[test]
+fn an_unreadable_pin_is_an_error_never_no_account() {
+    // The setting holds something that is not a pin.
+    let store = store();
+    store.save_setting(&pin_key("box-1"), "{not json").unwrap();
+    let error = super::pinned(&store, "box-1").unwrap_err();
+    assert!(error.contains("Could not read"), "{error}");
+    // The setting table cannot be read at all.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("monocode.db");
+    let file = Store::open(&path).unwrap();
+    pin(&file, "box-2", Some("acct-A")).unwrap();
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TABLE native_settings;")
+        .unwrap();
+    assert!(super::pinned(&file, "box-2").is_err());
+    assert!(clear_pin(&file, "box-2").is_err());
 }

@@ -19,6 +19,7 @@ const EXP: u64 = 4_000_000_000;
 pub(crate) struct CountingHub {
     calls: AtomicUsize,
     reject: AtomicBool,
+    offline: AtomicBool,
     issued: Mutex<Vec<String>>,
 }
 impl CountingHub {
@@ -33,6 +34,10 @@ impl CountingHub {
     pub(crate) fn reject_from_now_on(&self) {
         self.reject.store(true, Ordering::SeqCst);
     }
+    /// Makes every later exchange fail as if Docker Hub could not be reached.
+    pub(crate) fn go_offline(&self) {
+        self.offline.store(true, Ordering::SeqCst);
+    }
     pub(crate) fn last(&self) -> String {
         self.issued().pop().expect("no JWT was issued")
     }
@@ -40,6 +45,9 @@ impl CountingHub {
 impl DockerHub for CountingHub {
     fn exchange(&self, docker_id: &str, _pat: &str) -> Result<Secret, ExchangeError> {
         let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.offline.load(Ordering::SeqCst) {
+            return Err(ExchangeError::Network("connection refused".into()));
+        }
         if self.reject.load(Ordering::SeqCst) {
             return Err(ExchangeError::Rejected(401));
         }

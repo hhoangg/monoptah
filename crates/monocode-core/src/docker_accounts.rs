@@ -441,6 +441,9 @@ impl DockerAccounts {
             }
             _ => "Could not save the Docker account.".to_owned(),
         })?;
+        if let Some(access) = shared() {
+            access.accounts_changed();
+        }
         self.get(&id)
     }
 
@@ -479,6 +482,7 @@ impl DockerAccounts {
         }
         if let Some(access) = shared() {
             access.invalidate(id);
+            access.accounts_changed();
         }
         self.get(id)
     }
@@ -560,6 +564,7 @@ impl DockerAccounts {
         }
         if let Some(access) = shared() {
             access.invalidate(id);
+            access.accounts_changed();
         }
         Ok(())
     }
@@ -757,6 +762,8 @@ struct SlotState {
     /// The outcome of the latest finished attempt, handed to callers that were waiting
     /// while it ran (failures included, so a failing hub is asked once per burst).
     last: Option<Result<Secret, DockerAuthError>>,
+    /// The `Slot::generation` this state already reflects.
+    applied: u64,
 }
 /// One account's slot. `state` is locked across the exchange so concurrent refreshes of
 /// one account coalesce while other accounts proceed. `finished` counts finished attempts:
@@ -764,6 +771,9 @@ struct SlotState {
 /// latest attempt's outcome instead of starting another exchange.
 #[derive(Default)]
 struct Slot {
+    /// Bumped by [`DockerAccess::invalidate`] without taking `state` (which is held across
+    /// an exchange); the next `access_token` drops the cache and remembered outcome.
+    generation: AtomicU64,
     finished: AtomicU64,
     /// Callers between reading `finished` and holding the lock (lets tests wait for a
     /// burst to queue up without sleeping).
@@ -777,6 +787,8 @@ pub struct DockerAccess {
     hub: Arc<dyn DockerHub>,
     clock: Clock,
     cache: Mutex<HashMap<String, Arc<Slot>>>,
+    /// Bumped whenever an account is added, re-tokened or removed (see [`Self::epoch`]).
+    epoch: AtomicU64,
 }
 impl DockerAccess {
     pub fn new(database: PathBuf, hub: Arc<dyn DockerHub>, clock: Clock) -> Self {
@@ -785,7 +797,18 @@ impl DockerAccess {
             hub,
             clock,
             cache: Mutex::new(HashMap::new()),
+            epoch: AtomicU64::new(0),
         }
+    }
+
+    /// Changes whenever an account is added, re-tokened or removed through
+    /// [`DockerAccounts`]. A holder of a remembered "which account id" answer drops it when
+    /// this moved, because the id may now belong to another account (removed and re-added).
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+    fn accounts_changed(&self) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
     }
 
     /// A JWT for `account_id`: reused while it has MORE than 60 s left and still belongs
@@ -801,6 +824,13 @@ impl DockerAccess {
         slot.queued.fetch_add(1, Ordering::SeqCst);
         let mut state = lock(&slot.state);
         slot.queued.fetch_sub(1, Ordering::SeqCst);
+        let generation = slot.generation.load(Ordering::SeqCst);
+        if state.applied != generation {
+            *state = SlotState {
+                applied: generation,
+                ..SlotState::default()
+            };
+        }
         let now = (self.clock)();
         // The row may have been removed or re-tokened since the JWT was cached.
         let stored = self
@@ -808,7 +838,10 @@ impl DockerAccess {
             .nonce(account_id)
             .map_err(DockerAuthError::Storage)?
             .ok_or_else(|| {
-                *state = SlotState::default();
+                *state = SlotState {
+                    applied: generation,
+                    ..SlotState::default()
+                };
                 DockerAuthError::UnknownAccount
             })?;
         if let Some(entry) = state.cached.as_ref() {
@@ -866,13 +899,14 @@ impl DockerAccess {
         self.accounts.get(account_id).ok().map(|a| a.docker_id)
     }
 
-    /// The id of the saved account with this Docker ID (the oldest), `None` when there is none.
+    /// The id of the saved account with this Docker ID (the oldest; the match ignores case,
+    /// as Docker IDs do), `None` when there is none.
     pub fn account_for_docker_id(&self, docker_id: &str) -> Option<String> {
         self.accounts
             .list()
             .ok()?
             .into_iter()
-            .find(|a| a.docker_id == docker_id)
+            .find(|a| a.docker_id.eq_ignore_ascii_case(docker_id))
             .map(|a| a.id)
     }
 
@@ -907,11 +941,13 @@ impl DockerAccess {
     }
 
     /// Drop the cached JWT and the remembered outcome of an account (after a rejection,
-    /// token replacement or removal), so the next call exchanges again.
+    /// token replacement or removal), so the next call exchanges again. Never blocks on an
+    /// exchange in flight (safe on the UI thread): it only bumps the account's generation,
+    /// which the next [`access_token`](Self::access_token) applies.
     pub fn invalidate(&self, account_id: &str) {
         let slot = lock(&self.cache).get(account_id).cloned();
         if let Some(slot) = slot {
-            *lock(&slot.state) = SlotState::default();
+            slot.generation.fetch_add(1, Ordering::SeqCst);
         }
     }
 }

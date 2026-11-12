@@ -117,6 +117,30 @@ fn an_account_that_could_not_be_read_is_an_error_and_is_not_remembered() {
 }
 
 #[test]
+fn an_unreadable_pin_setting_makes_no_sbx_call_under_the_machine_login() {
+    let sbx = sandboxes();
+    let store = Arc::new(Mutex::new(
+        crate::store::Store::open(std::path::Path::new(":memory:")).unwrap(),
+    ));
+    store
+        .lock()
+        .unwrap()
+        .save_setting(&crate::sandboxes::account::pin_key("box-a"), "{broken")
+        .unwrap();
+    let reader = store.clone();
+    let backend = DockerBackend::new(sbx.clone()).with_account_resolver(Arc::new(move |name| {
+        crate::sandboxes::account::pinned(&reader.lock().unwrap(), name)
+    }));
+    // The pin can not be read: an error, not "not found" (which would forget a sandbox
+    // that still bills) and not a call as the machine login.
+    assert!(backend.exists("box-a").is_err());
+    assert!(backend.state("box-a").is_err());
+    assert!(backend.delete("box-a").is_err());
+    assert!(sbx.calls().is_empty(), "{:?}", sbx.calls());
+    assert!(sbx.exists("sbx_001a"), "nothing was removed");
+}
+
+#[test]
 fn deleting_a_sandbox_forgets_its_account() {
     let sbx = sandboxes();
     let (resolve, reads) = resolver(&[("box-a", "A")]);
@@ -222,6 +246,33 @@ fn scripts_copies_and_outer_scripts_run_as_the_sandboxs_account() {
             ("sbx_001a".to_string(), Some("A".to_string())),
             ("sbx_003m".to_string(), None),
             ("sbx_004o".to_string(), Some("C".to_string())),
+        ]
+    );
+}
+
+#[test]
+fn a_stale_target_account_follows_the_pin_after_the_account_is_replaced() {
+    let installed = Installed::new();
+    let old = installed.add("alice");
+    let shell = Arc::new(RecordingShell::default());
+    let current = Arc::new(Mutex::new(old.clone()));
+    let source = current.clone();
+    let backend = DockerBackend::new(Arc::new(AccountSbx::new()))
+        .with_shell(shell.clone())
+        .with_account_resolver(Arc::new(move |_| Ok(Some(source.lock().unwrap().clone()))));
+    backend.remember_target(&target("box-a", "sbx_001a", Some(&old)));
+    backend.run_script("box-a", "echo", false).unwrap();
+    // The account is removed and added again (new id); the pin follows it, the target
+    // (the machine record) still holds the old id.
+    installed.accounts.remove(&old).unwrap();
+    let new = installed.add("ALICE");
+    *current.lock().unwrap() = new.clone();
+    backend.run_script("box-a", "echo", false).unwrap();
+    assert_eq!(
+        *shell.accounts.lock().unwrap(),
+        [
+            ("sbx_001a".to_string(), Some(old)),
+            ("sbx_001a".to_string(), Some(new)),
         ]
     );
 }

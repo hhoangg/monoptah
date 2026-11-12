@@ -1183,6 +1183,20 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let cwd = crate::terminal::home_cwd();
+        if project != self.workspace.project {
+            // The user moved to another project while the token was being fetched: the tab
+            // belongs to the project the session is in. Add it there without showing,
+            // focusing or sliding anything of the project now in view.
+            self.ensure_terminals(&project, cx);
+            let viewport = self.viewport();
+            let dock = self.workspace.docks.entry(project.clone()).or_default();
+            dock.size = dock.side.clamp(dock.size, viewport);
+            dock.add(cwd);
+            self.terminals.entry(project).or_default().push(terminal);
+            self.persist(cx);
+            cx.notify();
+            return;
+        }
         let was_open = self
             .workspace
             .docks

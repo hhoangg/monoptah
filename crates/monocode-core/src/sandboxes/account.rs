@@ -29,21 +29,26 @@ struct Pin {
     docker_id: Option<String>,
 }
 
-fn read_pin(store: &Store, name: &str) -> Option<Pin> {
-    let raw = store.setting(&pin_key(name)).ok().flatten()?;
+/// The pin of sandbox `name`. `Ok(None)` is "no pin" (never written or cleared); an `Err` is
+/// a pin that could not be read (store or content): never to be taken for "no account".
+fn read_pin(store: &Store, name: &str) -> Result<Option<Pin>, String> {
+    let unreadable = || "Could not read which Docker account this sandbox belongs to.".to_string();
+    let Some(raw) = store.setting(&pin_key(name)).map_err(|_| unreadable())? else {
+        return Ok(None);
+    };
     let raw = raw.trim();
     if raw.is_empty() {
-        return None;
+        return Ok(None);
     }
     if raw.starts_with('{') {
-        let pin: Pin = serde_json::from_str(raw).ok()?;
+        let pin: Pin = serde_json::from_str(raw).map_err(|_| unreadable())?;
         let account = pin.account.trim().to_owned();
-        return (!account.is_empty()).then_some(Pin { account, ..pin });
+        return Ok((!account.is_empty()).then_some(Pin { account, ..pin }));
     }
-    Some(Pin {
+    Ok(Some(Pin {
         account: raw.to_owned(),
         docker_id: None,
-    })
+    }))
 }
 
 /// The Docker ID of a saved account: from the process-wide accounts, else from the store's
@@ -70,23 +75,27 @@ fn account_of_docker_id(store: &Store, docker_id: &str) -> Option<String> {
                 .list()
                 .ok()?
                 .into_iter()
-                .find(|a| a.docker_id == docker_id)
+                .find(|a| a.docker_id.eq_ignore_ascii_case(docker_id))
                 .map(|a| a.id)
         })
 }
 
-/// The pinned account of sandbox `name`; `None` for a sandbox without a pin or when the
-/// setting cannot be read. When the pinned account no longer exists but an account with the
-/// same Docker ID does, that one (the owner re-added the token).
-pub fn pinned(store: &Store, name: &str) -> Option<String> {
-    let pin = read_pin(store, name)?;
+/// The pinned account of sandbox `name`; `Ok(None)` for a sandbox without a pin. When the
+/// pinned account no longer exists but an account with the same Docker ID does, that one
+/// (the owner re-added the token). `Err` when the pin cannot be read: callers must not fall
+/// back to the machine login on it.
+pub fn pinned(store: &Store, name: &str) -> Result<Option<String>, String> {
+    let Some(pin) = read_pin(store, name)? else {
+        return Ok(None);
+    };
     if docker_id_of(store, &pin.account).is_some() {
-        return Some(pin.account);
+        return Ok(Some(pin.account));
     }
-    pin.docker_id
+    Ok(pin
+        .docker_id
         .as_deref()
         .and_then(|docker_id| account_of_docker_id(store, docker_id))
-        .or(Some(pin.account))
+        .or(Some(pin.account)))
 }
 
 /// Pins sandbox `name` to `account`, together with the account's Docker ID. A `None` account
@@ -109,7 +118,11 @@ pub fn pin(store: &Store, name: &str, account: Option<&str>) -> Result<(), Strin
 
 /// Forgets the pin of sandbox `name` (the sandbox was deleted).
 pub fn clear_pin(store: &Store, name: &str) -> Result<(), String> {
-    if store.setting(&pin_key(name)).ok().flatten().is_some() {
+    if store
+        .setting(&pin_key(name))
+        .map_err(|_| "Could not forget which Docker account this sandbox belonged to.".to_string())?
+        .is_some()
+    {
         store.save_setting(&pin_key(name), "").map_err(|_| {
             "Could not forget which Docker account this sandbox belonged to.".to_string()
         })?;

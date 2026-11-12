@@ -74,6 +74,8 @@ type Asked = Vec<(Option<String>, Vec<String>)>;
 #[derive(Default)]
 struct Listing {
     listed: Vec<sandboxes::SandboxInfo>,
+    /// Accounts whose `ls` succeeded (they may have listed nothing).
+    answered: usize,
     /// Accounts that could not be listed: the bound sandboxes in them and why.
     failed: Vec<(Vec<String>, String)>,
 }
@@ -145,6 +147,7 @@ impl SandboxProvider {
         for (account, names) in asked {
             match sandboxes::list(&sandboxes::as_account(&*runner, account.as_deref())) {
                 Ok(found) => {
+                    listing.answered += 1;
                     for info in found {
                         // A sandbox is listed by the one account it lives in; never twice.
                         if !listing
@@ -195,8 +198,10 @@ impl CloudProvider for SandboxProvider {
     fn list(&self, project: &str) -> Result<Vec<CloudInstance>, String> {
         let bound = self.bound_names(project);
         let listing = self.list_as(&self.accounts_to_ask(project, &bound)?)?;
-        // Nothing could be listed: that is an error, not an empty list.
-        if listing.listed.is_empty() && !listing.failed.is_empty() {
+        // No account could be listed: that is an error, not an empty list. A healthy account
+        // with no sandboxes next to a failed one still answers (the failed one's bound
+        // sandboxes are reported as unknown below).
+        if listing.answered == 0 && !listing.failed.is_empty() {
             return Err(listing.errors());
         }
         let mut instances: Vec<CloudInstance> = listing

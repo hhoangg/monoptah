@@ -2472,6 +2472,34 @@ mod docker_accounts {
     }
 
     #[test]
+    fn a_healthy_account_with_no_sandboxes_next_to_a_failed_one_is_not_an_error() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        let b = installed.add("bob");
+        let gh = FakeGh::new(vec![]);
+        let fx = fixture(&gh);
+        fx.bind_sandbox("box-1");
+        fx.bind_sandbox("box-2");
+        pin(&fx, "box-1", &a);
+        pin(&fx, "box-2", &b);
+        let b2 = b.clone();
+        *fx.sbx.broken_for.lock().unwrap() = Some((b, REVOKED.into()));
+        // A answers `ls` but lists nothing (box-1 is visible to another account only).
+        fx.sbx.visible_to.lock().unwrap().extend([
+            ("box-1".to_string(), "somebody-else".to_string()),
+            ("box-2".to_string(), b2),
+        ]);
+        let listed = fx
+            .api
+            .list(&fx.path(), &json!({"kind":"sandbox"}))
+            .expect("one account answered, so this is a list and not an error");
+        let rows = listed["instances"].as_array().unwrap();
+        let row = rows.iter().find(|r| r["instance"] == "box-2").unwrap();
+        assert_eq!(row["state"], "unknown");
+        assert_eq!(row["error"], REVOKED);
+    }
+
+    #[test]
     fn an_id_is_not_called_unknown_while_an_account_could_not_be_asked() {
         let installed = Installed::new();
         let a = installed.add("alice");

@@ -936,7 +936,7 @@ impl CloudSessions {
             Some(deps) => deps.backend.try_account_of(name),
             None => {
                 let store = self.store()?;
-                Ok(crate::sandboxes::account::pinned(&store, name))
+                crate::sandboxes::account::pinned(&store, name)
             }
         }
     }
@@ -1925,10 +1925,11 @@ impl CloudSessions {
         Ok(SandboxTerminal {
             destination: crate::sandboxes::ssh_destination(&target.id),
             remote: target.exec_in_container(&["bash", "-l"]),
-            docker_account: target
-                .docker_account
-                .clone()
-                .or_else(|| self.sandbox_account(&cloud.name)),
+            // The pin follows its Docker ID to a re-added account; the machine record keeps
+            // the id it was paired with.
+            docker_account: self
+                .try_sandbox_account(&cloud.name)?
+                .or_else(|| target.docker_account.clone()),
         })
     }
 }

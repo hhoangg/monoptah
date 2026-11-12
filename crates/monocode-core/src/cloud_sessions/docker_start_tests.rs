@@ -4226,7 +4226,7 @@ mod docker_accounts {
         .unwrap();
     }
     fn pin_of(fx: &Fx, name: &str) -> Option<String> {
-        account::pinned(&fx.store.lock().unwrap(), name)
+        account::pinned(&fx.store.lock().unwrap(), name).unwrap()
     }
     fn only(accounts: Vec<Option<String>>, want: Option<&str>) -> bool {
         !accounts.is_empty() && accounts.iter().all(|a| a.as_deref() == want)
@@ -4376,6 +4376,56 @@ mod docker_accounts {
     }
 
     #[test]
+    fn a_removed_and_re_added_account_is_followed_by_ssh_terminal_and_reconnect() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        let fx = fx();
+        let (session, began) = begin_as(&fx, Some(&a)).unwrap();
+        let name = began.sandbox.clone().unwrap();
+        fx.run(session.id).0.unwrap();
+        super::super::docker_config::save(
+            &fx.store.lock().unwrap(),
+            "/Users/me/widgets",
+            &account_config(Some(&a)),
+        )
+        .unwrap();
+        fx.sbx.set_state(&sandbox_id(&fx), "stopped");
+        // The owner removes the account and adds the same Docker ID again (other case): a new
+        // id. The machine record and the backend's memory still hold the old one.
+        installed.accounts.remove(&a).unwrap();
+        let b = installed.add("Alice");
+        assert_ne!(a, b);
+        let backend = fx.svc.sandbox.as_ref().unwrap().backend.clone();
+        // What every backend ssh and sbx call of the sandbox runs as.
+        assert_eq!(backend.account_of(&name).as_deref(), Some(b.as_str()));
+        // The terminal.
+        let terminal = fx.svc.sandbox_terminal(session.id).unwrap();
+        assert_eq!(terminal.docker_account.as_deref(), Some(b.as_str()));
+        // Reconnect: sbx, ssh and the re-paired machine.
+        fx.reset();
+        fx.reconnect(session.id).0.unwrap();
+        assert!(!fx.sbx.calls().is_empty() && !fx.shell.calls().is_empty());
+        assert!(
+            only(sbx_accounts(&fx), Some(&b)),
+            "{:?}",
+            fx.sbx.verbs_with_accounts()
+        );
+        assert!(only(shell_accounts(&fx), Some(&b)), "{:?}", fx.shell.tags());
+        let machines = fx.host.machines.lock().unwrap().clone();
+        assert_eq!(
+            machines
+                .last()
+                .unwrap()
+                .sandbox
+                .as_ref()
+                .unwrap()
+                .docker_account
+                .as_deref(),
+            Some(b.as_str())
+        );
+    }
+
+    #[test]
     fn a_sandbox_without_a_pin_keeps_the_machine_login_whatever_the_project_names_now() {
         let installed = Installed::new();
         let b = installed.add("bob");
@@ -4478,7 +4528,7 @@ mod docker_accounts {
             {
                 Some("create") => {
                     let name = args[args.iter().position(|a| a == "--name").unwrap() + 1].clone();
-                    let pin = account::pinned(&self.store.lock().unwrap(), &name);
+                    let pin = account::pinned(&self.store.lock().unwrap(), &name).unwrap();
                     self.pin_at_create.lock().unwrap().push(pin);
                 }
                 Some("ls") => {
@@ -4633,6 +4683,40 @@ mod docker_accounts {
         // No follow-up lookup after the failed create (only diagnose asked `ls`).
         assert_eq!(fx.sbx.count("ls"), 1);
         assert!(pending_starts(&fx.store.lock().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn a_retry_whose_account_cannot_reach_docker_hub_fails_definitely_and_said_once() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        let fx = fx_with(
+            CreateMode::TimeoutLost,
+            Some(("CLAUDE_CODE_OAUTH_TOKEN", SECRET.into())),
+        );
+        let (session, record) = begin_as(&fx, Some(&a)).unwrap();
+        assert!(record.is_failed());
+        // Docker Hub is unreachable and the cached token is gone: the retry's token step
+        // fails before `sbx` is spawned. That is a definite failure (nothing was created
+        // by it): no lookup, and the account's own text once, not doubled.
+        installed.hub.go_offline();
+        crate::docker_accounts::shared().unwrap().invalidate(&a);
+        let lookups = fx.sbx.count("ls");
+        let creates = fx.sbx.count("create");
+        let (result, _) = fx.run(session.id);
+        let error = result.unwrap_err();
+        let want = crate::docker_accounts::DockerAuthError::Network {
+            docker_id: "alice".into(),
+            detail: "connection refused".into(),
+        }
+        .to_string();
+        assert!(error.starts_with(&want), "{error}");
+        assert_eq!(error.matches("Docker Hub").count(), 1, "said once: {error}");
+        assert_eq!(
+            fx.sbx.count("ls"),
+            lookups,
+            "no lookup after the token failure"
+        );
+        assert_eq!(fx.sbx.count("create"), creates);
     }
 
     #[test]

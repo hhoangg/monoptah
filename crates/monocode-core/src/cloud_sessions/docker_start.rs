@@ -628,7 +628,7 @@ impl CloudSessions {
             let store = pins
                 .lock()
                 .map_err(|_| "Native session store unavailable".to_string())?;
-            Ok(sandboxes::account::pinned(&store, name).or_else(|| started_account(&store, name)))
+            Ok(sandboxes::account::pinned(&store, name)?.or_else(|| started_account(&store, name)))
         });
         let backend = Arc::new(
             DockerBackend::new(runner.clone())
@@ -887,6 +887,12 @@ impl CloudSessions {
         // A sandbox lives in the account that creates it: the start's own snapshot of the
         // project config, so a later change of the project's account does not move a retry.
         let account = start.config.docker_account.clone();
+        // The Docker account must be able to produce its token BEFORE anything is spawned:
+        // any DockerAuthError here (revoked, no access, network, status, unexpected, not
+        // available) means `sbx` never ran, so nothing was created and no lookup is needed.
+        if let Err(error) = crate::docker_accounts::env_for(account.as_deref()) {
+            return Err(CreateFailure::definite(error.to_string()));
+        }
         let runner = sandboxes::as_account(&*deps.runner, account.as_deref());
         if lookup_first {
             // A retry of a record that predates the pin: write it before looking.
@@ -900,7 +906,7 @@ impl CloudSessions {
         if lookup_first {
             found = sandboxes::find_by_name(&runner, &name)
                 .map_err(|e| CreateFailure {
-                    ambiguous: !sandboxes::is_account_text(&e),
+                    ambiguous: true,
                     message: e,
                 })?
                 .map(|info| info.id);
@@ -911,8 +917,9 @@ impl CloudSessions {
                 Ok(id) => id,
                 Err(error) => match error.id {
                     Some(id) => id,
-                    // The Docker account could not be used (no token, revoked): sbx never
-                    // ran or refused it, so nothing was created. Say it once, no lookup.
+                    // Token problems were settled by the check above. What is left is `sbx`
+                    // refusing even a fresh JWT (the runner's "revoked" text): it rejected
+                    // the call before creating anything, so say it once, no lookup.
                     None if sandboxes::is_account_text(&error.message) => {
                         return Err(CreateFailure::definite(error.message))
                     }

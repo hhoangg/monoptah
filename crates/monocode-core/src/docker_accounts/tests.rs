@@ -778,7 +778,6 @@ fn invalidate_forgets_a_remembered_failure() {
     let access = access(&f, hub.clone(), &now_at(1));
     assert!(access.access_token(&a.id).is_err());
     access.invalidate(&a.id);
-    assert!(lock(&slot_of(&access, &a.id).state).last.is_none());
     assert!(access.access_token(&a.id).is_err());
     assert_eq!(hub.calls(), 2);
 }
@@ -791,16 +790,16 @@ fn replace_token_and_remove_invalidate_the_shared_cache() {
     let access = Arc::new(access(&f, hub.clone(), &now_at(1)));
     let _guard = SharedGuard::install(access.clone());
     access.access_token(&a.id).unwrap();
-    let slot = slot_of(&access, &a.id);
-    assert!(lock(&slot.state).cached.is_some());
+    access.access_token(&a.id).unwrap();
+    assert_eq!(hub.calls(), 1, "cached");
     f.accounts
         .replace_token(&a.id, PAT2, ok_hub().as_ref())
         .unwrap();
-    assert!(lock(&slot.state).cached.is_none(), "replace drops the JWT");
     access.access_token(&a.id).unwrap();
-    assert!(lock(&slot.state).cached.is_some());
+    assert_eq!(hub.calls(), 2, "replace drops the JWT");
+    access.access_token(&a.id).unwrap();
+    assert_eq!(hub.calls(), 2, "cached again");
     f.accounts.remove(&a.id).unwrap();
-    assert!(lock(&slot.state).cached.is_none(), "remove drops the JWT");
     assert_eq!(
         access.access_token(&a.id).unwrap_err(),
         DockerAuthError::UnknownAccount
@@ -1089,4 +1088,57 @@ fn building_the_cloud_service_never_installs_the_real_docker_hub_over_its_databa
     )
     .with_system_sandboxes(store);
     assert!(shared().is_none(), "the app installs it once, at startup");
+}
+
+#[test]
+fn invalidate_returns_while_an_exchange_holds_the_slot_and_still_applies() {
+    let f = fixture();
+    let a = f.accounts.add("alice", PAT, ok_hub().as_ref()).unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let started_tx = Mutex::new(started_tx);
+    let release_rx = Mutex::new(release_rx);
+    let hub = FakeHub::new(Arc::new(move |_, _, n| {
+        if n == 1 {
+            started_tx.lock().unwrap().send(()).unwrap();
+            release_rx.lock().unwrap().recv_timeout(TIMEOUT).unwrap();
+        }
+        Ok(jwt(10_000, n as u64))
+    }));
+    let access = Arc::new(access(&f, hub.clone(), &now_at(1)));
+    let id = a.id.clone();
+    let first = {
+        let access = access.clone();
+        std::thread::spawn(move || access.access_token(&id))
+    };
+    started_rx.recv_timeout(TIMEOUT).expect("exchange started");
+    // The exchange holds the account's slot. invalidate (called on the UI thread) must not
+    // wait for it: run it on a thread and demand an answer well before the release.
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    {
+        let access = access.clone();
+        let id = a.id.clone();
+        std::thread::spawn(move || {
+            access.invalidate(&id);
+            let _ = done_tx.send(());
+        });
+    }
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("invalidate did not block on the exchange in flight");
+    release_tx.send(()).unwrap();
+    first.join().unwrap().unwrap();
+    // The invalidation made during the exchange still applies: the next call exchanges again.
+    access.access_token(&a.id).unwrap();
+    assert_eq!(hub.calls(), 2);
+}
+
+#[test]
+fn docker_ids_are_matched_ignoring_case() {
+    let f = fixture();
+    let a = f.accounts.add("Alice", PAT, ok_hub().as_ref()).unwrap();
+    let access = access(&f, ok_hub(), &now_at(1));
+    assert_eq!(access.account_for_docker_id("alice"), Some(a.id.clone()));
+    assert_eq!(access.account_for_docker_id("ALICE"), Some(a.id));
+    assert_eq!(access.account_for_docker_id("bob"), None);
 }

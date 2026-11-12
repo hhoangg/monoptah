@@ -58,6 +58,11 @@ fn outer_command(path: &str) -> String {
     format!("sh -c {}", crate::remote::shell_quote(&script))
 }
 
+/// The process-wide accounts epoch (0 without accounts), see `DockerAccess::epoch`.
+fn accounts_epoch() -> u64 {
+    crate::docker_accounts::shared().map_or(0, |access| access.epoch())
+}
+
 /// Reads the Docker account of a sandbox name: its pin setting, else the start record of the
 /// name (see [`sandboxes::account`]). `Err` means the answer could not be read (the store is
 /// unavailable): never "no account", so it is neither cached nor read as the machine login.
@@ -72,7 +77,10 @@ pub struct DockerBackend {
     /// The Docker account each sandbox lives in, by name, next to the id cache. `Some(None)`
     /// is a resolved "no account" (the machine login): the pin is written before `sbx create`,
     /// so a name that resolved to no account stays so. An unresolved name is looked up.
-    accounts: Mutex<HashMap<String, Option<String>>>,
+    /// Each answer carries the accounts epoch it was learned in: when accounts were added,
+    /// re-tokened or removed since, the answer is dropped and read again (an account id may
+    /// now belong to another account, or the pin may follow its Docker ID to a new id).
+    accounts: Mutex<HashMap<String, (Option<String>, u64)>>,
     /// Where an account not seen yet is read from (the pin setting).
     resolver: Option<AccountResolver>,
     /// The ssh seam of [`Self::run_script`] and [`Self::copy_from`]; without it they refuse.
@@ -187,10 +195,9 @@ impl DockerBackend {
                 let remote = target.exec_in_container(&["sh", "-l", "-s"]);
                 // The target is what the sandbox was connected with; a pin set later (a
                 // sandbox adopted after it was paired) still counts.
-                let account = match target.docker_account.clone() {
-                    Some(account) => Some(account),
-                    None => self.try_account_of(name)?,
-                };
+                let account = self
+                    .try_account_of(name)?
+                    .or_else(|| target.docker_account.clone());
                 (shell, target.id, remote, account)
             }
             Where::Outer(owner_path) => {
@@ -242,7 +249,7 @@ impl DockerBackend {
     /// Remembers the Docker account sandbox `name` lives in; `None` is the machine login.
     pub fn remember_account(&self, name: &str, account: Option<&str>) {
         if let Ok(mut accounts) = self.accounts.lock() {
-            accounts.insert(name.into(), account.map(str::to_owned));
+            accounts.insert(name.into(), (account.map(str::to_owned), accounts_epoch()));
         }
     }
     /// Forgets what is known of the account of `name` (the sandbox is gone, or never was):
@@ -270,21 +277,22 @@ impl DockerBackend {
             .lock()
             .ok()
             .and_then(|accounts| accounts.get(name).cloned())
+            .filter(|(_, epoch)| *epoch == accounts_epoch())
         {
-            return Ok(known);
+            return Ok(known.0);
         }
         let from_target = self
             .targets
             .lock()
             .ok()
             .and_then(|targets| targets.get(name).and_then(|t| t.docker_account.clone()));
-        let found = match from_target {
-            Some(account) => Some(account),
-            None => match &self.resolver {
-                Some(read) => read(name)?,
-                None => None,
-            },
-        };
+        // The pin first: it follows its Docker ID when the account was removed and added
+        // again, which the account id in a remembered target cannot.
+        let found = match &self.resolver {
+            Some(read) => read(name)?,
+            None => None,
+        }
+        .or(from_target);
         self.remember_account(name, found.as_deref());
         Ok(found)
     }
