@@ -2,6 +2,9 @@
 //! src/app/shell/SettingsRail.tsx: the Settings pages, their rail and the
 //! breadcrumb, search and actions the inset layout puts in its title bar.
 mod bulk_delete;
+pub(crate) mod cloud_env;
+#[cfg(test)]
+mod cloud_tests;
 mod data;
 mod keymap;
 #[cfg(test)]
@@ -73,6 +76,8 @@ pub(crate) struct SettingsContext {
     pub mobile_invite: Option<monocode_core::mobile::Invite>,
     /// Minutes after midnight when the Today work day starts; `None` until Today has loaded it.
     pub today_rollover_minutes: Option<u32>,
+    /// The native store, for the Cloud page's Docker accounts. `None` without one.
+    pub store: Option<cloud_env::StoreHandle>,
 }
 impl PartialEq for SettingsContext {
     fn eq(&self, other: &Self) -> bool {
@@ -98,6 +103,7 @@ impl PartialEq for SettingsContext {
             && self.mobile == other.mobile
             && self.mobile_invite == other.mobile_invite
             && self.today_rollover_minutes == other.today_rollover_minutes
+            && self.store == other.store
     }
 }
 #[derive(Clone, Debug, PartialEq)]
@@ -502,6 +508,9 @@ impl SettingsView {
             if let Some(center) = crate::accounts::get(cx) {
                 center.update(cx, |center, _| center.hide_emails());
             }
+            if self.section == Section::Cloud {
+                self.leave_cloud(cx);
+            }
             self.management = None;
             self.selected_trees.clear();
             self.management_generation += 1;
@@ -528,6 +537,9 @@ impl SettingsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.dismiss_fix(window, cx) {
+            return true;
+        }
         if self.dismiss_notification_transient(window, cx) {
             return true;
         }
@@ -1175,6 +1187,7 @@ impl Render for SettingsView {
             })
             .children(self.management_overlay(window, cx))
             .children(self.notification_overlay(cx))
+            .children(self.fix_overlay(window))
     }
 }
 

@@ -76,6 +76,7 @@ impl Shell {
                 .as_ref()
                 .and_then(|t| t.read(cx).rollover_minutes()),
             data_dir: self.data_dir.clone(),
+            store: Some(crate::settings::cloud_env::StoreHandle(self.store.clone())),
             remote: Some(self.remote.clone()),
             mobile: self.mobile_status(),
             mobile_invite: self.mobile.invite.clone(),

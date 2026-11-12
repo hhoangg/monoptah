@@ -636,6 +636,10 @@ fn cloud_window(cx: &mut TestAppContext) -> WindowHandle<SettingsView> {
         .unwrap();
     cx.run_until_parked();
     cx.refresh().unwrap();
+    // The Cloud page now starts with the Backends and Docker accounts groups, so the kit
+    // sits below an 800 point window; a taller window keeps its rows on screen.
+    VisualTestContext::from_window(window.into(), cx).simulate_resize(size(px(1200.), px(2400.)));
+    cx.run_until_parked();
     window
 }
 

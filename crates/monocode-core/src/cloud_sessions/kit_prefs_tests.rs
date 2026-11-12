@@ -426,6 +426,11 @@ fn cloud_sources_never_read_the_keychain_or_claude_credentials() {
     let kit_ui = [
         gpui.join("cloud_kit_ui.rs"),
         gpui.join("settings/pages/cloud.rs"),
+        gpui.join("settings/pages/cloud_backends.rs"),
+        gpui.join("settings/pages/cloud_docker.rs"),
+        gpui.join("settings/cloud_env.rs"),
+        gpui.join("cloud_checks.rs"),
+        gpui.join("fix_terminal.rs"),
         gpui.join("shell/claude_setup.rs"),
         gpui.join("shell.rs"),
         gpui.join("panel_root.rs"),

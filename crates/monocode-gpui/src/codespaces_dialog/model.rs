@@ -2,65 +2,16 @@
 //! as an argument, so the dialog runs them on the background executor and tests use a fake.
 //! Secret values only ever pass through `save`, which hands them to `set_secret` (stdin).
 use monocode_core::codespaces::{
-    self, AuthStatus, DevcontainerSecret, GhRunner, OAUTH_SECRET_KEY, SecretState,
+    self, DevcontainerSecret, GhRunner, OAUTH_SECRET_KEY, SecretState,
 };
 use std::path::Path;
 
 pub(super) const CLAUDE_TOKEN_NOTE: &str = "GitHub only injects a changed secret into a codespace when it starts. After changing CLAUDE_CODE_OAUTH_TOKEN, stop and restart the codespace (or create a new one), then reconnect. Whitespace from a wrapped `claude setup-token` paste is removed.";
 pub(super) const PRIVACY_NOTE: &str = "Monoptah keeps no copy of these values. They go straight to GitHub as user Codespaces secrets for this repository.";
-pub(super) const REFRESH_COMMAND: &str = "gh auth refresh -h github.com -s codespace";
-pub(super) const LOGIN_COMMAND: &str = "gh auth login";
 pub(super) const NO_REPO_LINE: &str =
     "No GitHub repository found: the project needs a git origin on github.com.";
-pub(super) const INSTALL_COMMAND: &str = "brew install gh";
-
-/// How far the GitHub CLI is set up.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Gh {
-    Missing,
-    NotLoggedIn,
-    MissingScope(Option<String>),
-    Ready(Option<String>),
-    /// gh ran but the check failed.
-    Failed(String),
-}
-
-impl Gh {
-    pub(super) fn ready(&self) -> bool {
-        matches!(self, Gh::Ready(_))
-    }
-
-    pub(super) fn line(&self) -> String {
-        match self {
-            Gh::Missing => "GitHub CLI (gh) is not installed".into(),
-            Gh::NotLoggedIn => "GitHub CLI is not logged in".into(),
-            Gh::MissingScope(_) => "GitHub CLI token has no codespace scope".into(),
-            Gh::Ready(Some(user)) => format!("GitHub CLI is ready (logged in as {user})"),
-            Gh::Ready(None) => "GitHub CLI is ready".into(),
-            Gh::Failed(error) => format!("GitHub CLI check failed: {error}"),
-        }
-    }
-
-    /// The exact command that fixes what is missing.
-    pub(super) fn fix(&self) -> Option<&'static str> {
-        match self {
-            Gh::Missing => Some(INSTALL_COMMAND),
-            Gh::NotLoggedIn => Some(LOGIN_COMMAND),
-            Gh::MissingScope(_) => Some(REFRESH_COMMAND),
-            Gh::Ready(_) | Gh::Failed(_) => None,
-        }
-    }
-}
-
-pub(super) fn gh_state(result: Result<AuthStatus, String>) -> Gh {
-    match result {
-        Err(error) if error.contains("not installed") => Gh::Missing,
-        Err(error) => Gh::Failed(error),
-        Ok(status) if !status.logged_in => Gh::NotLoggedIn,
-        Ok(status) if !status.has_codespace_scope => Gh::MissingScope(status.user),
-        Ok(status) => Gh::Ready(status.user),
-    }
-}
+// The gh checks live in `cloud_checks`, shared with Settings > Cloud.
+pub(super) use crate::cloud_checks::{Gh, gh_state};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Row {

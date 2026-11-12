@@ -127,7 +127,7 @@ impl Section {
             Section::Archive => "Projects and conversations you have archived.",
             Section::Worktrees => "Manage additional worktrees for each project.",
             Section::Cloud => {
-                "What Monoptah copies from this computer to your cloud workspaces: skills, MCP servers and plugins."
+                "Applies to every project. Repository, machine and credentials of each project live in its Cloud settings dialog."
             }
         }
     }
@@ -155,7 +155,9 @@ impl Section {
             }
             Section::Archive => "archived restore delete hidden",
             Section::Worktrees => "git branch worktree working copy project create delete",
-            Section::Cloud => "codespace sandbox docker kit claude setup secrets sign in copy",
+            Section::Cloud => {
+                "codespace sandbox docker account token gh backend ssh kit claude setup secrets sign in copy"
+            }
         }
     }
     /// SettingsRail.tsx's SECTION_ICONS.
