@@ -1069,12 +1069,13 @@ mod ask {
             .unwrap();
     }
 
-    /// Points `TMPDIR` somewhere else for a test (single test thread).
+    /// Points `TMPDIR` somewhere else for a test (one test at a time, see SAFETY).
     struct TmpDir(Option<std::ffi::OsString>);
     impl TmpDir {
         fn set(path: &std::path::Path) -> Self {
             let old = std::env::var_os("TMPDIR");
-            // SAFETY: gpui tests run with one test thread (`--test-threads=1`).
+            // SAFETY: each test runs alone: locally with `--test-threads=1`, on CI as its own
+            // process under cargo-nextest, so no other test thread reads or writes the environment.
             unsafe { std::env::set_var("TMPDIR", path) };
             Self(old)
         }

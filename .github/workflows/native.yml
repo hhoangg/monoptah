@@ -5,19 +5,6 @@ on:
     branches: [main, mc/migrate-monocode-to-gpui]
   workflow_dispatch:
   pull_request:
-    paths:
-      - 'crates/monocode-core/**'
-      - 'crates/monocode-gpui/**'
-      - 'crates/mobile-link/**'
-      - 'vendor/gpui-pre*/**'
-      - 'scripts/*native*'
-      - 'scripts/native-editor/**'
-      - 'scripts/native-settings/**'
-      - 'package.json'
-      - 'package-lock.json'
-      - '.github/workflows/native.yml'
-      - '.github/workflows/native-release.yml'
-      - '.github/workflows/native-release-monoptah.yml'
 
 permissions:
   contents: read
@@ -33,9 +20,63 @@ concurrency:
 # stays local: clippy of the macOS-only code (npm run native:check:mac), macOS-only
 # tests, and building and packaging (npm run native:release:mac, which also runs
 # the full npm run native:check before every release).
+#
+# Job graph:
+#   changes -> core, desktop-lint, desktop, desktop-test-build -> desktop-test (shards)
+#   release-cache, release-cache-rpm (push to main only, never blocking)
+#   ci-passed waits for every job above and is the one check to require for merging.
+#
+# The workflow runs on every pull request (no `paths:` filter) so that `ci-passed`
+# always reports. `changes` decides whether the native paths were touched; when they
+# were not, the heavy jobs are skipped and `ci-passed` still succeeds.
 jobs:
+  # Path filter as a job instead of `on.pull_request.paths`: a required check must
+  # report on every pull request, or one touching none of these paths could never
+  # merge. Pushes and manual runs always build.
+  changes:
+    name: Detect native changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      native: ${{ steps.decide.outputs.native }}
+    steps:
+      - id: filter
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            native:
+              - 'crates/monocode-core/**'
+              - 'crates/monocode-gpui/**'
+              - 'crates/mobile-link/**'
+              - 'vendor/gpui-pre*/**'
+              - 'scripts/*native*'
+              - 'scripts/native-editor/**'
+              - 'scripts/native-settings/**'
+              - 'package.json'
+              - 'package-lock.json'
+              - '.github/workflows/native.yml'
+              - '.github/workflows/native-release.yml'
+              - '.github/workflows/native-release-monoptah.yml'
+      - id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          FILTERED: ${{ steps.filter.outputs.native }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            native="$FILTERED"
+          else
+            native=true
+          fi
+          echo "native=$native" >> "$GITHUB_OUTPUT"
+          echo "native=$native"
+
   core:
     name: Core (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -77,6 +118,8 @@ jobs:
   # target, so a separate cargo check on Linux would only waste time.
   desktop-lint:
     name: GPUI lint (ubuntu-latest)
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -100,6 +143,8 @@ jobs:
   # breaks the Windows build fails here and not halfway through a release.
   desktop:
     name: GPUI check (windows-latest)
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -112,12 +157,21 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-core -p monocode-gpui --all-targets --profile native-dev
 
-  # The GPUI tests. macOS-only tests and the macOS build still run locally.
-  desktop-test:
-    name: GPUI tests (ubuntu-latest)
-    # Linux only. Windows GPUI tests are not run: a probe took 23 minutes to
-    # build and its tests were still running (with failures) when it hit the
-    # 60 minute limit. Windows keeps the compile check above.
+  # The GPUI tests, built once and run in shards. macOS-only tests and the macOS
+  # build still run locally.
+  #
+  # Build: `cargo nextest archive` compiles the test binaries (the slow part) and packs
+  # them into one artifact. shared-key keeps restoring the cache that main saved under
+  # the old job id `desktop-test`; its key hashes CARGO*/RUST*/CC*/CMAKE* env vars, so do
+  # not add such variables to this job.
+  #
+  # Linux only. Windows GPUI tests are not run: a probe took 23 minutes to build and its
+  # tests were still running (with failures) when it hit the 60 minute limit. Windows
+  # keeps the compile check above.
+  desktop-test-build:
+    name: GPUI test build (ubuntu-latest)
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -128,11 +182,85 @@ jobs:
           workspaces: crates/monocode-gpui
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: desktop-test
       - name: Install native Linux build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y clang cmake ninja-build pkg-config libfontconfig1-dev libfreetype6-dev libxcb1-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libasound2-dev libx11-xcb-dev libegl1-mesa-dev libvulkan-dev libdbus-1-dev squashfs-tools desktop-file-utils
-      - run: cargo test --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-gpui --profile native-dev -- --test-threads=1
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.151
+      - run: cargo nextest archive --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-gpui --cargo-profile native-dev --archive-file "$RUNNER_TEMP/gpui-tests.tar.zst"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gpui-test-archive
+          path: ${{ runner.temp }}/gpui-tests.tar.zst
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+  # Each shard runs its share of the archived tests, every test in its own process
+  # (profile `ci` in crates/monocode-gpui/.config/nextest.toml, so `env::set_var` in a
+  # test cannot reach another test). No rust-cache: nothing is compiled here. The
+  # checkout is needed because tests read repo files at run time. Tune `total` (and the
+  # matrix list) from the measured shard times; keep them equal.
+  desktop-test:
+    name: GPUI tests (shard ${{ matrix.shard }}/${{ matrix.total }})
+    needs: [changes, desktop-test-build]
+    if: needs.changes.outputs.native == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+        total: [3]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native Linux runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y clang cmake ninja-build pkg-config libfontconfig1-dev libfreetype6-dev libxcb1-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libasound2-dev libx11-xcb-dev libegl1-mesa-dev libvulkan-dev libdbus-1-dev squashfs-tools desktop-file-utils
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.151
+      - uses: actions/download-artifact@v4
+        with:
+          name: gpui-test-archive
+          path: ${{ runner.temp }}/gpui-archive
+      - name: Run shard
+        shell: bash
+        env:
+          SHARD: ${{ matrix.shard }}
+          TOTAL: ${{ matrix.total }}
+        run: |
+          # pipefail is on (shell: bash), so the status below is nextest's, not tee's.
+          status=0
+          cargo nextest run \
+            --archive-file "$RUNNER_TEMP/gpui-archive/gpui-tests.tar.zst" \
+            --workspace-remap "$GITHUB_WORKSPACE/crates/monocode-gpui" \
+            --config-file "$GITHUB_WORKSPACE/crates/monocode-gpui/.config/nextest.toml" \
+            --profile ci \
+            --partition "slice:$SHARD/$TOTAL" 2>&1 | tee "$RUNNER_TEMP/nextest.log" || status=$?
+          # nextest writes the JUnit file under the remapped workspace.
+          junit="$GITHUB_WORKSPACE/crates/monocode-gpui/target/nextest/ci/junit.xml"
+          if [ -f "$junit" ]; then cp "$junit" "$RUNNER_TEMP/junit-shard-$SHARD.xml" || true; fi
+          # "Summary [ 12.3s] 1200 tests run: 1199 passed (2 slow), 1 failed, 1 timed out, 6 skipped"
+          # Every command below is guarded so the summary can never replace nextest's exit status.
+          line="$(grep -E 'tests? run:' "$RUNNER_TEMP/nextest.log" | tail -n 1 || true)"
+          count() { printf '%s' "$line" | grep -oE "[0-9]+ $1" | head -n 1 | grep -oE '[0-9]+' || echo 0; }
+          run="$(printf '%s' "$line" | grep -oE '[0-9]+ tests? run' | grep -oE '[0-9]+' || echo 0)"
+          {
+            echo "Shard $SHARD/$TOTAL: run $run, passed $(count passed || true), failed $(count failed || true), timed out $(count 'timed out' || true), skipped (incl. other shards and ignored) $(count skipped || true) (exit $status)"
+          } >> "$GITHUB_STEP_SUMMARY" || true
+          exit "$status"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gpui-junit-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/junit-shard-${{ matrix.shard }}.xml
+          retention-days: 7
+          if-no-files-found: error
 
   # Release runs restore these, which is what makes a native release faster (a miss is
   # only slower). Keep the toolchain, per-OS setup and build command in step with
@@ -216,3 +344,62 @@ jobs:
           lookup-only: true
       - if: steps.cache.outputs.cache-hit != 'true'
         run: cargo build --locked --manifest-path crates/monocode-gpui/Cargo.toml -p monocode-gpui --release
+
+  # The one check to require for merging. It runs on every pull request and push
+  # (the workflow has no path filter), also when jobs failed or were skipped.
+  ci-passed:
+    name: CI passed
+    if: always()
+    needs:
+      - changes
+      - core
+      - desktop-lint
+      - desktop
+      - desktop-test-build
+      - desktop-test
+      - release-cache
+      - release-cache-rpm
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the results of all jobs
+        shell: bash
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          native="$(jq -r '.changes.outputs.native // ""' <<<"$NEEDS")"
+          changes_result="$(jq -r '.changes.result' <<<"$NEEDS")"
+          failed=0
+          printf '%-22s %-10s %s\n' JOB RESULT VERDICT
+          for job in changes core desktop-lint desktop desktop-test-build desktop-test release-cache release-cache-rpm; do
+            result="$(jq -r --arg job "$job" '.[$job].result' <<<"$NEEDS")"
+            reason=""
+            case "$result" in
+              success) ;;
+              skipped)
+                case "$job" in
+                  release-cache|release-cache-rpm) ;; # main pushes only
+                  changes) reason="the change detection must run" ;;
+                  *)
+                    if [ "$changes_result" != success ]; then
+                      reason="skipped but change detection did not succeed"
+                    elif [ "$native" = true ]; then
+                      reason="skipped although native paths changed"
+                    fi
+                    ;;
+                esac
+                ;;
+              *) reason="job result is $result" ;;
+            esac
+            if [ -n "$reason" ]; then
+              failed=1
+              printf '%-22s %-10s FAIL: %s\n' "$job" "$result" "$reason"
+            else
+              printf '%-22s %-10s ok\n' "$job" "$result"
+            fi
+          done
+          echo "native changes: ${native:-unknown}"
+          if [ "$failed" -ne 0 ]; then
+            echo "CI failed: see the FAIL rows above."
+            exit 1
+          fi
+          echo "CI passed."

@@ -16,7 +16,8 @@ impl NoClis {
             .map(|kind| {
                 let key = format!("MONOCODE_{}_BINARY", kind.id().to_uppercase());
                 let old = std::env::var_os(&key);
-                // SAFETY: gpui tests run with one test thread (`--test-threads=1`).
+                // SAFETY: each test runs alone: locally with `--test-threads=1`, on CI as its own
+                // process under cargo-nextest, so no other test thread reads or writes the environment.
                 unsafe { std::env::set_var(&key, "/nonexistent/monoptah-test-cli") };
                 (key, old)
             })
