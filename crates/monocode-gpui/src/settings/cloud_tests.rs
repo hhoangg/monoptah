@@ -19,10 +19,7 @@ use monocode_core::{
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex, atomic::Ordering},
 };
 
 const PAT: &str = concat!("dckr_pat_", "exampleTokenValue1234567890");
@@ -123,40 +120,44 @@ impl GhRunner for FakeGh {
     }
 }
 
-static SBX_INSTALLED: AtomicBool = AtomicBool::new(true);
-fn resolve(name: &str) -> Option<PathBuf> {
-    (name != "sbx" || SBX_INSTALLED.load(Ordering::SeqCst))
-        .then(|| PathBuf::from("/fake/bin").join(name))
-}
-
 struct World {
     root: TempDir,
     home: TempDir,
     store: Database,
     hub: Arc<FakeHub>,
     gh: Arc<FakeGh>,
+    /// Programs the fake lookup cannot find. Per world, so tests can run in parallel.
+    missing: Arc<Mutex<Vec<String>>>,
 }
 impl World {
     fn new() -> Self {
         let root = TempDir::new("store");
         let home = TempDir::new("home");
         let store = Store::open(&root.path().join("monocode.db")).unwrap();
-        SBX_INSTALLED.store(true, Ordering::SeqCst);
         Self {
             root,
             home,
             store: Arc::new(Mutex::new(store)),
             hub: FakeHub::new(Reply::Sandbox),
             gh: FakeGh::new(Ok(AUTH_OK)),
+            missing: Arc::new(Mutex::new(Vec::new())),
         }
     }
     fn services(&self) -> CloudServices {
+        let missing = self.missing.clone();
         CloudServices {
             hub: self.hub.clone(),
             gh: self.gh.clone(),
             home: Some(self.home.path().to_owned()),
-            resolve,
+            resolve: Arc::new(move |name| {
+                (!missing.lock().unwrap().iter().any(|m| m == name))
+                    .then(|| PathBuf::from("/fake/bin").join(name))
+            }),
         }
+    }
+    /// Makes the fake program lookup fail for `name`.
+    fn hide(&self, name: &str) {
+        self.missing.lock().unwrap().push(name.to_owned());
     }
     fn set_up_ssh(&self) {
         let ssh = self.home.path().join(".ssh");
@@ -201,9 +202,20 @@ impl log::Log for CaptureLog {
     fn flush(&self) {}
 }
 static LOG: CaptureLog = CaptureLog(Mutex::new(Vec::new()));
+/// Installs the capture and proves it works: a marker logged now must be captured, so an
+/// empty log can never pass for "the token was not logged".
 fn capture_logs() {
     let _ = log::set_logger(&LOG);
     log::set_max_level(log::LevelFilter::Trace);
+    log::info!("capture-control-marker");
+    assert!(
+        LOG.0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line == "capture-control-marker"),
+        "the log capture is not installed, so a clean log proves nothing"
+    );
 }
 
 fn open(world: &World, cx: &mut TestAppContext) -> WindowHandle<SettingsView> {
@@ -298,18 +310,34 @@ fn has(visual: &mut VisualTestContext, selector: &'static str) -> bool {
     visual.debug_bounds(selector).is_some()
 }
 
-/// The text of the form's outcome (the success line or the error).
-fn form_outcome(
+/// The error under the form, if the last Save failed.
+fn form_error(
     window: &WindowHandle<SettingsView>,
     visual: &mut VisualTestContext,
-) -> Option<Result<String, String>> {
+) -> Option<String> {
     window
         .update(visual, |view, _, _| {
             view.cloud
                 .docker
                 .form
                 .as_ref()
-                .and_then(|form| form.outcome.clone())
+                .and_then(|form| form.error.clone())
+        })
+        .unwrap()
+}
+
+/// The line under the account list: `(ok, text)`.
+fn notice(
+    window: &WindowHandle<SettingsView>,
+    visual: &mut VisualTestContext,
+) -> Option<(bool, String)> {
+    window
+        .update(visual, |view, _, _| {
+            view.cloud
+                .docker
+                .notice
+                .as_ref()
+                .map(|notice| (notice.ok, notice.text.clone()))
         })
         .unwrap()
 }
@@ -442,7 +470,7 @@ fn backend_chips_reflect_the_checks(cx: &mut TestAppContext) {
         Some(crate::cloud_checks::Gh::NotLoggedIn)
     );
     world.gh.set(Err("gh is not installed"));
-    SBX_INSTALLED.store(false, Ordering::SeqCst);
+    world.hide("sbx");
     click(visual, "cloud-check-codespaces");
     assert_eq!(
         window
@@ -452,7 +480,6 @@ fn backend_chips_reflect_the_checks(cx: &mut TestAppContext) {
     );
     assert!(has(visual, "cloud-fix-codespaces"));
     assert!(!has(visual, "cloud-fix-sandbox"));
-    SBX_INSTALLED.store(true, Ordering::SeqCst);
 }
 
 #[gpui::test]
@@ -576,13 +603,16 @@ fn adding_an_account_checks_the_token_and_lists_it(cx: &mut TestAppContext) {
         .unwrap();
     add_account(&window, visual, "octo-dev", PAT);
 
+    // A success closes the form and says so under the list.
+    assert!(!has(visual, "docker-form"));
     assert_eq!(
-        form_outcome(&window, visual),
-        Some(Ok(
+        notice(&window, visual),
+        Some((
+            true,
             "Checked: token works and has Cloud Sandboxes access".into()
         ))
     );
-    assert!(has(visual, "docker-form-result"));
+    assert!(has(visual, "docker-notice"));
     assert_eq!(account_ids(&window, visual), ["octo-dev"]);
     assert!(has(visual, "docker-account-octo-dev"));
     assert!(has(visual, "docker-status-octo-dev"));
@@ -607,7 +637,6 @@ fn adding_an_account_checks_the_token_and_lists_it(cx: &mut TestAppContext) {
         .unwrap();
     // Close the form; the token is nowhere: not in the page state, the database files, the
     // home folder or the app log.
-    click(visual, "docker-form-cancel");
     assert!(!has(visual, "docker-form"));
     assert!(!world.files_contain(PAT));
     assert!(
@@ -626,7 +655,7 @@ fn add_errors_are_precise_and_keep_the_token_out_of_sight(cx: &mut TestAppContex
 
     world.hub.set(Reply::Rejected);
     add_account(&window, visual, "octo-dev", PAT);
-    let Some(Err(rejected)) = form_outcome(&window, visual) else {
+    let Some(rejected) = form_error(&window, visual) else {
         panic!("expected an error");
     };
     assert!(rejected.contains("Wrong Docker ID or token"), "{rejected}");
@@ -636,14 +665,14 @@ fn add_errors_are_precise_and_keep_the_token_out_of_sight(cx: &mut TestAppContex
 
     world.hub.set(Reply::NoSandbox);
     click(visual, "docker-form-save");
-    let Some(Err(no_scope)) = form_outcome(&window, visual) else {
+    let Some(no_scope) = form_error(&window, visual) else {
         panic!("expected an error");
     };
     assert!(no_scope.contains("no Cloud Sandboxes access"), "{no_scope}");
 
     world.hub.set(Reply::Offline);
     click(visual, "docker-form-save");
-    let Some(Err(offline)) = form_outcome(&window, visual) else {
+    let Some(offline) = form_error(&window, visual) else {
         panic!("expected an error");
     };
     assert!(offline.contains("Could not reach Docker Hub"), "{offline}");
@@ -652,7 +681,7 @@ fn add_errors_are_precise_and_keep_the_token_out_of_sight(cx: &mut TestAppContex
     let calls = world.hub.calls.lock().unwrap().len();
     type_into(&window, visual, false, "x");
     click(visual, "docker-form-save");
-    let Some(Err(bad_id)) = form_outcome(&window, visual) else {
+    let Some(bad_id) = form_error(&window, visual) else {
         panic!("expected an error");
     };
     assert!(bad_id.contains("Docker ID"), "{bad_id}");
@@ -771,7 +800,6 @@ fn remove_succeeds_when_no_project_uses_the_account(cx: &mut TestAppContext) {
     let visual = &mut VisualTestContext::from_window(window.into(), cx);
     visual.refresh().unwrap();
     add_account(&window, visual, "octo-dev", PAT);
-    click(visual, "docker-form-cancel");
     click(visual, "docker-remove-octo-dev");
     assert!(has(visual, "docker-remove-panel"));
     // Cancel keeps it.
@@ -793,7 +821,6 @@ fn replace_token_updates_the_status(cx: &mut TestAppContext) {
     let visual = &mut VisualTestContext::from_window(window.into(), cx);
     visual.refresh().unwrap();
     add_account(&window, visual, "octo-dev", PAT);
-    click(visual, "docker-form-cancel");
     // The token is revoked: checking again shows it.
     world.hub.set(Reply::Rejected);
     click(visual, "docker-check-octo-dev");
@@ -813,9 +840,11 @@ fn replace_token_updates_the_status(cx: &mut TestAppContext) {
     assert!(!has(visual, "docker-form-id"));
     type_into(&window, visual, true, PAT2);
     click(visual, "docker-form-save");
+    assert!(!has(visual, "docker-form"));
     assert_eq!(
-        form_outcome(&window, visual),
-        Some(Ok(
+        notice(&window, visual),
+        Some((
+            true,
             "Checked: token works and has Cloud Sandboxes access".into()
         ))
     );
@@ -853,4 +882,406 @@ fn no_store_means_no_accounts_and_no_crash(cx: &mut TestAppContext) {
     let visual = &mut VisualTestContext::from_window(window.into(), cx);
     assert!(has(visual, "docker-add-button"));
     assert!(!has(visual, "docker-form"));
+}
+
+/// Every string the Cloud page puts on screen. GPUI's test windows have no accessibility
+/// adapter, so the text cannot be read back from a frame; this collects what the render
+/// functions are fed instead: the account rows, the notice, the form error, the removal
+/// message, the fix lines and what each input draws (a masked input draws stars).
+fn page_text(window: &WindowHandle<SettingsView>, visual: &mut VisualTestContext) -> String {
+    visual.refresh().unwrap();
+    window
+        .update(visual, |view, _, cx| {
+            let mut out = Vec::new();
+            if let pages::cloud_docker::AccountList::Ready(rows) = &view.cloud.docker.list {
+                for row in rows {
+                    out.push(row.summary.docker_id.clone());
+                    out.push(row.summary.status.label().to_owned());
+                    out.extend(row.used_by.clone());
+                }
+            }
+            if let Some(notice) = &view.cloud.docker.notice {
+                out.push(notice.text.clone());
+            }
+            if let Some(form) = &view.cloud.docker.form {
+                out.extend(form.error.clone());
+            }
+            if let Some(removal) = &view.cloud.docker.removal {
+                out.push(removal.docker_id.clone());
+                if let pages::cloud_docker::RemoveStage::Failed(error) = &removal.stage {
+                    out.push(error.clone());
+                }
+            }
+            out.extend(view.fix_hint());
+            out.extend(view.cloud.backends.fix_error.clone());
+            if view.cloud.docker.form.is_some()
+                && let Some(inputs) = &view.cloud.docker.inputs
+            {
+                for input in [&inputs.docker_id, &inputs.pat] {
+                    let input = input.read(cx);
+                    // What the input draws: stars for a masked one.
+                    out.push(if input.is_secret() {
+                        "*".repeat(input.content.chars().count())
+                    } else {
+                        input.content.to_string()
+                    });
+                }
+            }
+            out.join("\n")
+        })
+        .unwrap()
+}
+
+#[gpui::test]
+fn the_token_never_appears_in_the_rendered_page(cx: &mut TestAppContext) {
+    let world = World::new();
+    let window = open(&world, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    // Positive control: the scan sees the page's own text.
+    click(visual, "docker-add-button");
+    type_into(&window, visual, false, "octo-dev");
+    type_into(&window, visual, true, PAT);
+    let typed = page_text(&window, visual);
+    assert!(typed.contains("octo-dev"), "the scan must see typed text");
+    assert!(
+        typed.contains("****"),
+        "the masked token draws stars: {typed}"
+    );
+    assert!(!typed.contains(PAT), "the typed token is on the page");
+
+    world.hub.set(Reply::Rejected);
+    click(visual, "docker-form-save");
+    let failed = page_text(&window, visual);
+    assert!(failed.contains("Wrong Docker ID or token"), "{failed}");
+    assert!(!failed.contains(PAT), "the token is in the error state");
+
+    world.hub.set(Reply::Sandbox);
+    click(visual, "docker-form-save");
+    let saved = page_text(&window, visual);
+    assert!(saved.contains("Cloud Sandboxes access"), "{saved}");
+    assert!(!saved.contains(PAT), "the token is on the page after Save");
+}
+
+/// The summary of the only listed account.
+fn first_summary(
+    window: &WindowHandle<SettingsView>,
+    visual: &mut VisualTestContext,
+) -> monocode_core::docker_accounts::DockerAccountSummary {
+    window
+        .update(visual, |view, _, _| match &view.cloud.docker.list {
+            pages::cloud_docker::AccountList::Ready(rows) => rows[0].summary.clone(),
+            _ => panic!("not loaded"),
+        })
+        .unwrap()
+}
+
+fn busy(window: &WindowHandle<SettingsView>, visual: &mut VisualTestContext) -> bool {
+    window
+        .update(visual, |view, _, _| view.cloud.docker.busy)
+        .unwrap()
+}
+
+#[gpui::test]
+fn a_running_check_blocks_every_other_action_and_ends_clean(cx: &mut TestAppContext) {
+    let world = World::new();
+    let window = open(&world, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.refresh().unwrap();
+    add_account(&window, visual, "octo-dev", PAT);
+    let id = first_summary(&window, visual).id;
+    let calls = world.hub.calls.lock().unwrap().len();
+
+    // A check starts and has not been polled yet.
+    window
+        .update(visual, |view, _, cx| view.docker_check(id.clone(), cx))
+        .unwrap();
+    assert!(busy(&window, visual));
+    // Add and Save are blocked: no form opens, nothing is sent to Docker.
+    window
+        .update(visual, |view, window, cx| {
+            view.open_docker_form(pages::cloud_docker::FormKind::Add, window, cx);
+            assert!(view.cloud.docker.form.is_none(), "a form opened while busy");
+            view.docker_save(cx);
+            view.docker_remove_start(id.clone(), "octo-dev".into(), cx);
+            assert!(view.cloud.docker.removal.is_none(), "removal while busy");
+            // A second check does not start either.
+            view.docker_check(id.clone(), cx);
+        })
+        .unwrap();
+    visual.run_until_parked();
+    assert_eq!(
+        world.hub.calls.lock().unwrap().len(),
+        calls + 1,
+        "exactly one check reached Docker"
+    );
+    assert!(
+        !busy(&window, visual),
+        "busy is released when the check ends"
+    );
+    assert!(notice(&window, visual).is_some_and(|(ok, _)| ok));
+}
+
+#[gpui::test]
+fn a_running_save_is_not_replaced_by_a_check(cx: &mut TestAppContext) {
+    let world = World::new();
+    let window = open(&world, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.refresh().unwrap();
+    add_account(&window, visual, "octo-dev", PAT);
+    let id = first_summary(&window, visual).id;
+    click(visual, "docker-replace-octo-dev");
+    type_into(&window, visual, true, PAT2);
+    let calls = world.hub.calls.lock().unwrap().len();
+
+    window
+        .update(visual, |view, _, cx| {
+            view.docker_save(cx);
+            assert!(view.cloud.docker.busy);
+            // Before the fix this overwrote (cancelled) the save and left busy stuck.
+            view.docker_check(id.clone(), cx);
+        })
+        .unwrap();
+    visual.run_until_parked();
+    assert_eq!(
+        world.hub.calls.lock().unwrap().len(),
+        calls + 1,
+        "only the save reached Docker"
+    );
+    assert!(!busy(&window, visual));
+    assert_eq!(
+        notice(&window, visual).map(|(_, text)| text),
+        Some("Checked: token works and has Cloud Sandboxes access".into()),
+        "the save finished and reported"
+    );
+    assert!(!has(visual, "docker-form"));
+    // The buttons are usable again.
+    click(visual, "docker-check-octo-dev");
+    assert_eq!(world.hub.calls.lock().unwrap().len(), calls + 2);
+}
+
+#[gpui::test]
+fn a_form_opened_during_a_save_does_not_take_its_outcome(cx: &mut TestAppContext) {
+    let world = World::new();
+    let window = open(&world, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.refresh().unwrap();
+    add_account(&window, visual, "octo-dev", PAT);
+    let id = first_summary(&window, visual).id;
+    click(visual, "docker-add-button");
+    type_into(&window, visual, false, "second");
+    type_into(&window, visual, true, PAT2);
+    window
+        .update(visual, |view, window, cx| {
+            view.docker_save(cx);
+            // Opening the Replace form for the other row is refused while the save runs.
+            view.open_docker_form(
+                pages::cloud_docker::FormKind::Replace {
+                    id: id.clone(),
+                    docker_id: "octo-dev".into(),
+                },
+                window,
+                cx,
+            );
+            assert_eq!(
+                view.cloud
+                    .docker
+                    .form
+                    .as_ref()
+                    .map(|form| form.kind.clone()),
+                Some(pages::cloud_docker::FormKind::Add)
+            );
+        })
+        .unwrap();
+    visual.run_until_parked();
+    assert_eq!(account_ids(&window, visual), ["octo-dev", "second"]);
+}
+
+#[gpui::test]
+fn a_stale_save_never_clears_the_token_typed_in_a_newer_form(cx: &mut TestAppContext) {
+    let world = World::new();
+    let window = open(&world, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.refresh().unwrap();
+    add_account(&window, visual, "octo-dev", PAT);
+    let summary = first_summary(&window, visual);
+
+    // A newer form with a token being typed.
+    click(visual, "docker-add-button");
+    type_into(&window, visual, false, "second");
+    type_into(&window, visual, true, PAT2);
+    // The answer of a save from before this form was opened arrives.
+    window
+        .update(visual, |view, _, cx| {
+            let old = view.cloud.docker.epoch - 1;
+            view.docker_saved(old, Ok(summary.clone()), cx);
+        })
+        .unwrap();
+    visual.run_until_parked();
+    assert_eq!(
+        pat_field(&window, visual),
+        PAT2,
+        "the typed token was wiped"
+    );
+    assert!(has(visual, "docker-form"), "the newer form was closed");
+    assert!(notice(&window, visual).is_none());
+
+    // The same for a stale error: it is not shown under the newer form.
+    window
+        .update(visual, |view, _, cx| {
+            let old = view.cloud.docker.epoch - 1;
+            view.docker_saved(old, Err("old failure".into()), cx);
+        })
+        .unwrap();
+    assert_eq!(form_error(&window, visual), None);
+}
+
+#[gpui::test]
+fn leaving_the_page_during_a_save_drops_its_result_but_refreshes_the_list(cx: &mut TestAppContext) {
+    let world = World::new();
+    let window = open(&world, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.refresh().unwrap();
+    click(visual, "docker-add-button");
+    type_into(&window, visual, false, "octo-dev");
+    type_into(&window, visual, true, PAT);
+    window
+        .update(visual, |view, _, cx| {
+            view.docker_save(cx);
+            view.leave_cloud(cx);
+        })
+        .unwrap();
+    visual.run_until_parked();
+    assert!(!busy(&window, visual));
+    assert!(notice(&window, visual).is_none(), "a stale result reported");
+    assert!(
+        window
+            .update(visual, |view, _, _| view.cloud.docker.form.is_none())
+            .unwrap()
+    );
+    // The account was saved all the same, so the list shows it.
+    assert_eq!(account_ids(&window, visual), ["octo-dev"]);
+    assert_eq!(pat_field(&window, visual), "");
+}
+
+#[gpui::test]
+fn a_removal_result_for_another_row_is_ignored(cx: &mut TestAppContext) {
+    let world = World::new();
+    let window = open(&world, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.refresh().unwrap();
+    add_account(&window, visual, "octo-dev", PAT);
+    add_account(&window, visual, "second", PAT2);
+    click(visual, "docker-remove-octo-dev");
+    let other = window
+        .update(visual, |view, _, _| match &view.cloud.docker.list {
+            pages::cloud_docker::AccountList::Ready(rows) => rows
+                .iter()
+                .find(|row| row.summary.docker_id == "second")
+                .unwrap()
+                .summary
+                .id
+                .clone(),
+            _ => panic!("not loaded"),
+        })
+        .unwrap();
+    window
+        .update(visual, |view, _, cx| {
+            let epoch = view.cloud.docker.epoch;
+            view.cloud.docker.busy = true;
+            view.docker_removed(epoch, other.clone(), Ok(Ok(())), cx);
+            let removal = view.cloud.docker.removal.as_ref().expect("still open");
+            assert_eq!(removal.docker_id, "octo-dev");
+            assert!(matches!(
+                removal.stage,
+                pages::cloud_docker::RemoveStage::Confirm
+            ));
+            view.cloud.docker.busy = true;
+            view.docker_removed(epoch, other, Err("boom".into()), cx);
+            assert!(matches!(
+                view.cloud.docker.removal.as_ref().unwrap().stage,
+                pages::cloud_docker::RemoveStage::Confirm
+            ));
+            assert!(!view.cloud.docker.busy);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn fix_says_why_when_the_program_cannot_be_found(cx: &mut TestAppContext) {
+    let world = World::new();
+    world.gh.set(Err("gh is not installed"));
+    world.hide("brew");
+    let window = open(&world, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.refresh().unwrap();
+    click(visual, "cloud-fix-codespaces");
+    assert!(!has(visual, "fix-terminal"), "nothing can run");
+    let error = window
+        .update(visual, |view, _, _| view.cloud.backends.fix_error.clone())
+        .unwrap()
+        .expect("the user is told why Fix did nothing");
+    assert!(
+        error.contains("`brew`") && error.contains("brew install gh"),
+        "{error}"
+    );
+    // Checking again clears it, and with brew found Fix opens the terminal.
+    world.missing.lock().unwrap().clear();
+    click(visual, "cloud-check-codespaces");
+    assert!(
+        window
+            .update(visual, |view, _, _| view.cloud.backends.fix_error.is_none())
+            .unwrap()
+    );
+    click(visual, "cloud-fix-codespaces");
+    assert!(has(visual, "fix-terminal"));
+}
+
+#[gpui::test]
+fn the_fix_hint_names_both_commands_when_both_backends_need_fixing(cx: &mut TestAppContext) {
+    let world = World::new();
+    world.gh.set(Ok(AUTH_NO_SCOPE));
+    let window = open(&world, cx);
+    let hint = window
+        .update(cx, |view, _, _| view.fix_hint())
+        .unwrap()
+        .expect("both need fixing");
+    assert!(
+        hint.contains("gh auth refresh -h github.com -s codespace"),
+        "{hint}"
+    );
+    assert!(hint.contains("sbx --cloud setup ssh"), "{hint}");
+
+    // Only one: its command alone.
+    world.set_up_ssh();
+    window
+        .update(cx, |view, _, cx| view.refresh_backends(cx))
+        .unwrap();
+    settle(cx);
+    let hint = window
+        .update(cx, |view, _, _| view.fix_hint())
+        .unwrap()
+        .unwrap();
+    assert!(
+        hint.contains("gh auth refresh") && !hint.contains("sbx"),
+        "{hint}"
+    );
+}
+
+#[gpui::test]
+fn a_finished_save_cannot_be_pressed_again_into_a_validation_error(cx: &mut TestAppContext) {
+    let world = World::new();
+    let window = open(&world, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.refresh().unwrap();
+    add_account(&window, visual, "octo-dev", PAT);
+    let line = notice(&window, visual);
+    assert!(line.as_ref().is_some_and(|(ok, _)| *ok));
+    let calls = world.hub.calls.lock().unwrap().len();
+    // Enter or a second Save press on the emptied inputs does nothing.
+    window
+        .update(visual, |view, _, cx| view.docker_save(cx))
+        .unwrap();
+    visual.run_until_parked();
+    assert_eq!(notice(&window, visual), line);
+    assert_eq!(world.hub.calls.lock().unwrap().len(), calls);
 }

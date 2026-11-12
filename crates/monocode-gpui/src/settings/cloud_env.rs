@@ -51,6 +51,9 @@ impl GhRunner for Offline {
     }
 }
 
+/// Finds a program by name. Shared and `Send` so tests can give each window its own.
+pub(crate) type Resolver = Arc<dyn Fn(&str) -> Option<PathBuf> + Send + Sync>;
+
 /// The outside world of the Cloud page.
 #[derive(Clone)]
 pub(crate) struct CloudServices {
@@ -59,7 +62,7 @@ pub(crate) struct CloudServices {
     pub gh: Arc<dyn GhRunner>,
     pub home: Option<PathBuf>,
     /// Finds a program the way a GUI app must (a short `PATH`).
-    pub resolve: fn(&str) -> Option<PathBuf>,
+    pub resolve: Resolver,
 }
 impl Global for CloudServices {}
 
@@ -70,7 +73,7 @@ impl CloudServices {
             hub: Arc::new(SystemDockerHub),
             gh: Arc::new(SystemGh),
             home: monocode_core::accounts::home(),
-            resolve: monocode_core::scm::resolve_gui_binary,
+            resolve: Arc::new(monocode_core::scm::resolve_gui_binary),
         }
     }
 
@@ -95,7 +98,7 @@ impl CloudServices {
             hub: Arc::new(Offline),
             gh: Arc::new(Offline),
             home: None,
-            resolve: |_| None,
+            resolve: Arc::new(|_| None),
         }
     }
 }

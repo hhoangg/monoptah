@@ -54,7 +54,7 @@ impl FixCommand {
     pub(crate) fn from_line(
         title: impl Into<String>,
         line: &str,
-        resolve: fn(&str) -> Option<PathBuf>,
+        resolve: impl Fn(&str) -> Option<PathBuf>,
     ) -> Option<Self> {
         let mut words = line.split_whitespace();
         let name = words.next()?;

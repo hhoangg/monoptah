@@ -53,11 +53,7 @@ impl Backend {
 
 /// A check mark or an exclamation mark with its text.
 pub(in crate::settings) fn chip(selector: &'static str, ok: bool, text: String) -> AnyElement {
-    let color = if ok {
-        gpui::rgb(0x34d399).into()
-    } else {
-        warning_color()
-    };
+    let color = if ok { success_color() } else { warning_color() };
     div()
         .id(selector)
         .debug_selector(move || selector.into())
@@ -100,10 +96,11 @@ impl SettingsView {
         self.cloud.backends.generation += 1;
         let generation = self.cloud.backends.generation;
         self.cloud.backends.checking = true;
+        self.cloud.backends.fix_error = None;
         let services = CloudServices::get(cx);
         let work = cx.background_executor().spawn(async move {
             let gh = gh_state(codespaces::auth_status(&*services.gh));
-            let sbx = Sbx::check(services.resolve, services.home.as_deref());
+            let sbx = Sbx::check(&*services.resolve, services.home.as_deref());
             (gh, sbx)
         });
         self.cloud.backends.task = Some(cx.spawn(async move |this, cx| {
@@ -140,7 +137,15 @@ impl SettingsView {
             return;
         };
         let services = CloudServices::get(cx);
-        let Some(command) = FixCommand::from_line(title, line, services.resolve) else {
+        let program = line.split_whitespace().next().unwrap_or_default();
+        if (services.resolve)(program).is_none() {
+            self.cloud.backends.fix_error = Some(format!(
+                "Fix cannot run: `{program}` was not found on this Mac. Run `{line}` yourself in a terminal, then press Check again."
+            ));
+            cx.notify();
+            return;
+        }
+        let Some(command) = FixCommand::from_line(title, line, &*services.resolve) else {
             return;
         };
         let cwd = services.home.unwrap_or_else(std::env::temp_dir);
@@ -228,18 +233,20 @@ impl SettingsView {
         )
     }
 
-    /// What Fix will run, so the user knows before pressing it.
-    fn fix_hint(&self) -> Option<String> {
-        let line = self
-            .cloud
-            .backends
-            .codespaces
-            .as_ref()
-            .and_then(Gh::fix)
-            .or_else(|| self.cloud.backends.sandbox.and_then(|sbx| sbx.fix()))?;
-        Some(format!(
-            "Fix runs `{line}` in a terminal, then checks again."
-        ))
+    /// What Fix will run, so the user knows before pressing it. Both commands when both
+    /// backends need fixing.
+    pub(in crate::settings) fn fix_hint(&self) -> Option<String> {
+        let codespaces = self.cloud.backends.codespaces.as_ref().and_then(Gh::fix);
+        let sandbox = self.cloud.backends.sandbox.and_then(|sbx| sbx.fix());
+        Some(match (codespaces, sandbox) {
+            (Some(gh), Some(sbx)) => format!(
+                "Fix runs `{gh}` for GitHub Codespaces and `{sbx}` for Docker Sandbox, each in a terminal, then checks again."
+            ),
+            (Some(line), None) | (None, Some(line)) => {
+                format!("Fix runs `{line}` in a terminal, then checks again.")
+            }
+            (None, None) => return None,
+        })
     }
 
     fn codespace_chips(&self) -> Vec<AnyElement> {

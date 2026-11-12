@@ -68,7 +68,7 @@ pub(crate) struct Sbx {
 
 impl Sbx {
     /// `sbx` is on the path and the ssh alias exists. Neither check signs in to Docker.
-    pub(crate) fn check(resolve: fn(&str) -> Option<PathBuf>, home: Option<&Path>) -> Self {
+    pub(crate) fn check(resolve: impl Fn(&str) -> Option<PathBuf>, home: Option<&Path>) -> Self {
         Self {
             installed: resolve("sbx").is_some(),
             ssh_set_up: home.is_some_and(sandboxes::ssh_alias_configured),

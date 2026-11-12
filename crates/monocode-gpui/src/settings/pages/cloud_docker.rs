@@ -55,9 +55,10 @@ pub(in crate::settings) enum FormKind {
 
 pub(in crate::settings) struct Form {
     pub(in crate::settings) kind: FormKind,
+    /// The form's own Save is running (the label reads "Checking...").
     pub(in crate::settings) checking: bool,
-    /// The last Save: the success line or the error text.
-    pub(in crate::settings) outcome: Option<Result<String, String>>,
+    /// Why the last Save failed. A success closes the form and shows a notice instead.
+    pub(in crate::settings) error: Option<String>,
 }
 
 pub(in crate::settings) enum RemoveStage {
@@ -75,8 +76,8 @@ pub(in crate::settings) struct Removal {
 }
 
 pub(in crate::settings) struct Notice {
-    ok: bool,
-    text: String,
+    pub(in crate::settings) ok: bool,
+    pub(in crate::settings) text: String,
 }
 
 pub(in crate::settings) struct Inputs {
@@ -94,7 +95,11 @@ pub(in crate::settings) struct DockerState {
     pub(in crate::settings) inputs: Option<Inputs>,
     pub(in crate::settings) removal: Option<Removal>,
     pub(in crate::settings) notice: Option<Notice>,
-    /// A save, check or removal is running.
+    /// Counts form openings and leaves of the page. An action answers to the epoch it
+    /// started in; a result from an older one is stale and changes nothing but the list.
+    pub(in crate::settings) epoch: u64,
+    /// A save, a check or a removal is running. The one flag for all three: every entry
+    /// point is blocked while it is set, so `action` is never overwritten while running.
     pub(in crate::settings) busy: bool,
     pub(in crate::settings) action: Option<Task<()>>,
 }
@@ -109,6 +114,7 @@ impl Default for DockerState {
             inputs: None,
             removal: None,
             notice: None,
+            epoch: 0,
             busy: false,
             action: None,
         }
@@ -250,16 +256,50 @@ impl SettingsView {
         }
     }
 
-    /// Leaving the page drops what was typed and any open dialog.
+    /// Leaving the page drops what was typed and any open dialog. A save, check or removal
+    /// still running is not cancelled (the store call cannot be): its result is stale
+    /// because the epoch moved on, so it only refreshes the list, and `busy` stays set until
+    /// it ends so nothing overwrites it.
     pub(in crate::settings) fn leave_cloud(&mut self, cx: &mut Context<Self>) {
         self.close_fix(cx);
+        self.cloud.docker.epoch += 1;
         self.cloud.docker.form = None;
         self.cloud.docker.removal = None;
         self.cloud.docker.notice = None;
         self.clear_docker_inputs(cx);
     }
 
-    fn open_docker_form(&mut self, kind: FormKind, window: &mut Window, cx: &mut Context<Self>) {
+    /// Claims the single action slot, or `None` while another action runs. The returned
+    /// epoch goes back to [`Self::end_docker_action`].
+    fn begin_docker_action(&mut self) -> Option<u64> {
+        if self.cloud.docker.busy {
+            return None;
+        }
+        self.cloud.docker.busy = true;
+        Some(self.cloud.docker.epoch)
+    }
+
+    /// Frees the action slot. `true` when the result still belongs to what is on screen; a
+    /// stale result (the page was left meanwhile) only gets the list refreshed.
+    fn end_docker_action(&mut self, epoch: u64, cx: &mut Context<Self>) -> bool {
+        self.cloud.docker.busy = false;
+        let current = self.cloud.docker.epoch == epoch;
+        if !current {
+            self.refresh_docker(cx);
+        }
+        current
+    }
+
+    pub(in crate::settings) fn open_docker_form(
+        &mut self,
+        kind: FormKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.cloud.docker.busy {
+            return;
+        }
+        self.cloud.docker.epoch += 1;
         let (docker_id, pat) = self.docker_inputs(cx);
         self.clear_docker_inputs(cx);
         let target = if kind == FormKind::Add {
@@ -271,7 +311,7 @@ impl SettingsView {
         self.cloud.docker.form = Some(Form {
             kind,
             checking: false,
-            outcome: None,
+            error: None,
         });
         self.cloud.docker.removal = None;
         self.cloud.docker.notice = None;
@@ -295,25 +335,37 @@ impl SettingsView {
 
     /// Add or Replace: checks the token against Docker, then saves it.
     pub(in crate::settings) fn docker_save(&mut self, cx: &mut Context<Self>) {
-        let Some(form) = &mut self.cloud.docker.form else {
-            return;
-        };
-        if form.checking {
+        if self.cloud.docker.busy {
             return;
         }
-        let kind = form.kind.clone();
-        let Some(store) = self.ctx.store.as_ref().map(|handle| handle.0.clone()) else {
-            form.outcome = Some(Err(NO_STORE.into()));
+        let Some(kind) = self
+            .cloud
+            .docker
+            .form
+            .as_ref()
+            .map(|form| form.kind.clone())
+        else {
+            return;
+        };
+        let Some(store) = self.docker_store() else {
+            if let Some(form) = &mut self.cloud.docker.form {
+                form.error = Some(NO_STORE.into());
+            }
             cx.notify();
             return;
         };
-        form.checking = true;
-        form.outcome = None;
         let Some(inputs) = &self.cloud.docker.inputs else {
             return;
         };
         let docker_id = inputs.docker_id.read(cx).content.trim().to_owned();
         let pat = Secret::new(inputs.pat.read(cx).content.trim().to_owned());
+        let Some(epoch) = self.begin_docker_action() else {
+            return;
+        };
+        if let Some(form) = &mut self.cloud.docker.form {
+            form.checking = true;
+            form.error = None;
+        }
         let hub = CloudServices::get(cx).hub;
         let work = cx.background_executor().spawn(async move {
             let accounts = accounts_of(&store)?;
@@ -324,37 +376,55 @@ impl SettingsView {
         });
         self.cloud.docker.action = Some(cx.spawn(async move |this, cx| {
             let result = work.await;
-            let _ = this.update(cx, |this, cx| this.docker_saved(result, cx));
+            let _ = this.update(cx, |this, cx| this.docker_saved(epoch, result, cx));
         }));
         cx.notify();
     }
 
-    fn docker_saved(
+    /// A success closes the form and reports in the notice, so the Save button cannot be
+    /// pressed again on the emptied inputs and replace the success line with a validation
+    /// error. A failure keeps the form and what was typed.
+    pub(in crate::settings) fn docker_saved(
         &mut self,
+        epoch: u64,
         result: Result<DockerAccountSummary, String>,
         cx: &mut Context<Self>,
     ) {
-        let saved = result.is_ok();
-        if let Some(form) = &mut self.cloud.docker.form {
-            form.checking = false;
-            form.outcome = Some(match result {
-                Ok(summary) if summary.status == DockerAccountStatus::Valid => Ok(SAVED.into()),
-                Ok(summary) => Ok(summary.status.label().into()),
-                Err(error) => Err(error),
-            });
+        if !self.end_docker_action(epoch, cx) {
+            // Another form may be open now: its inputs are not ours to clear.
+            return;
         }
-        if saved {
-            self.clear_docker_inputs(cx);
+        match result {
+            Ok(summary) => {
+                self.cloud.docker.form = None;
+                self.clear_docker_inputs(cx);
+                self.cloud.docker.notice = Some(Notice {
+                    ok: summary.status == DockerAccountStatus::Valid,
+                    text: if summary.status == DockerAccountStatus::Valid {
+                        SAVED.into()
+                    } else {
+                        format!("{}: {}", summary.docker_id, summary.status.label())
+                    },
+                });
+            }
+            Err(error) => {
+                if let Some(form) = &mut self.cloud.docker.form {
+                    form.checking = false;
+                    form.error = Some(error);
+                }
+            }
         }
         self.refresh_docker(cx);
     }
 
     /// Re-exchanges the stored token and updates the status.
-    fn docker_check(&mut self, id: String, cx: &mut Context<Self>) {
-        let (Some(store), false) = (self.docker_store(), self.cloud.docker.busy) else {
+    pub(in crate::settings) fn docker_check(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(store) = self.docker_store() else {
             return;
         };
-        self.cloud.docker.busy = true;
+        let Some(epoch) = self.begin_docker_action() else {
+            return;
+        };
         self.cloud.docker.notice = None;
         let hub = CloudServices::get(cx).hub;
         let work = cx
@@ -362,27 +432,44 @@ impl SettingsView {
             .spawn(async move { accounts_of(&store)?.check(&id, &*hub) });
         self.cloud.docker.action = Some(cx.spawn(async move |this, cx| {
             let result = work.await;
-            let _ = this.update(cx, |this, cx| {
-                this.cloud.docker.busy = false;
-                this.cloud.docker.notice = Some(match result {
-                    Ok(summary) => Notice {
-                        ok: summary.status == DockerAccountStatus::Valid,
-                        text: format!("{}: {}", summary.docker_id, summary.status.label()),
-                    },
-                    Err(error) => Notice {
-                        ok: false,
-                        text: error,
-                    },
-                });
-                this.refresh_docker(cx);
-            });
+            let _ = this.update(cx, |this, cx| this.docker_checked(epoch, result, cx));
         }));
         cx.notify();
     }
 
+    pub(in crate::settings) fn docker_checked(
+        &mut self,
+        epoch: u64,
+        result: Result<DockerAccountSummary, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.end_docker_action(epoch, cx) {
+            return;
+        }
+        self.cloud.docker.notice = Some(match result {
+            Ok(summary) => Notice {
+                ok: summary.status == DockerAccountStatus::Valid,
+                text: format!("{}: {}", summary.docker_id, summary.status.label()),
+            },
+            Err(error) => Notice {
+                ok: false,
+                text: error,
+            },
+        });
+        self.refresh_docker(cx);
+    }
+
     /// Remove: refused with the project names while a project uses the account, otherwise
     /// asks first.
-    fn docker_remove_start(&mut self, id: String, docker_id: String, cx: &mut Context<Self>) {
+    pub(in crate::settings) fn docker_remove_start(
+        &mut self,
+        id: String,
+        docker_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.cloud.docker.busy {
+            return;
+        }
         let AccountList::Ready(rows) = &self.cloud.docker.list else {
             return;
         };
@@ -391,6 +478,7 @@ impl SettingsView {
             .find(|row| row.summary.id == id)
             .map(|row| row.used_by.clone())
             .unwrap_or_default();
+        self.cloud.docker.epoch += 1;
         self.cloud.docker.form = None;
         self.cloud.docker.notice = None;
         self.clear_docker_inputs(cx);
@@ -408,44 +496,72 @@ impl SettingsView {
 
     /// Confirmed: asks the store again (a project may have chosen the account since the page
     /// was read), then removes.
-    fn docker_remove_confirm(&mut self, cx: &mut Context<Self>) {
-        let (Some(store), Some(removal)) = (self.docker_store(), &mut self.cloud.docker.removal)
-        else {
+    pub(in crate::settings) fn docker_remove_confirm(&mut self, cx: &mut Context<Self>) {
+        let Some(store) = self.docker_store() else {
             return;
         };
-        if matches!(removal.stage, RemoveStage::Removing) {
+        let Some(removal) = &self.cloud.docker.removal else {
+            return;
+        };
+        if !matches!(removal.stage, RemoveStage::Confirm) {
             return;
         }
-        removal.stage = RemoveStage::Removing;
         let id = removal.id.clone();
+        let Some(epoch) = self.begin_docker_action() else {
+            return;
+        };
+        if let Some(removal) = &mut self.cloud.docker.removal {
+            removal.stage = RemoveStage::Removing;
+        }
+        let asked = id.clone();
         let work = cx.background_executor().spawn(async move {
-            let users = users_of(&store, &id)?;
+            let users = users_of(&store, &asked)?;
             if !users.is_empty() {
                 return Ok(Err(users));
             }
-            accounts_of(&store)?.remove(&id)?;
+            accounts_of(&store)?.remove(&asked)?;
             Ok::<_, String>(Ok(()))
         });
         self.cloud.docker.action = Some(cx.spawn(async move |this, cx| {
             let result = work.await;
-            let _ = this.update(cx, |this, cx| {
-                match result {
-                    Ok(Ok(())) => this.cloud.docker.removal = None,
-                    Ok(Err(users)) => {
-                        if let Some(removal) = &mut this.cloud.docker.removal {
-                            removal.stage = RemoveStage::Refused(users);
-                        }
-                    }
-                    Err(error) => {
-                        if let Some(removal) = &mut this.cloud.docker.removal {
-                            removal.stage = RemoveStage::Failed(error);
-                        }
-                    }
-                }
-                this.refresh_docker(cx);
-            });
+            let _ = this.update(cx, |this, cx| this.docker_removed(epoch, id, result, cx));
         }));
         cx.notify();
+    }
+
+    /// Applies the answer to the removal of `id`, and only to that one.
+    pub(in crate::settings) fn docker_removed(
+        &mut self,
+        epoch: u64,
+        id: String,
+        result: Result<Result<(), Vec<String>>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.end_docker_action(epoch, cx) {
+            return;
+        }
+        if self
+            .cloud
+            .docker
+            .removal
+            .as_ref()
+            .is_some_and(|removal| removal.id == id)
+        {
+            match result {
+                Ok(Ok(())) => self.cloud.docker.removal = None,
+                Ok(Err(users)) => {
+                    if let Some(removal) = &mut self.cloud.docker.removal {
+                        removal.stage = RemoveStage::Refused(users);
+                    }
+                }
+                Err(error) => {
+                    if let Some(removal) = &mut self.cloud.docker.removal {
+                        removal.stage = RemoveStage::Failed(error);
+                    }
+                }
+            }
+        }
+        self.refresh_docker(cx);
     }
 
     pub(in crate::settings) fn docker_group(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -689,6 +805,7 @@ impl SettingsView {
             RemoveStage::Failed(error) => (error.clone(), false, false),
         };
         let refused = !can_confirm && !working;
+        let busy = self.cloud.docker.busy;
         Some(
             div()
                 .id("docker-remove-panel")
@@ -726,13 +843,17 @@ impl SettingsView {
                                     "docker-remove-confirm",
                                     "Remove account",
                                     true,
-                                    false,
+                                    busy,
                                 )
                                 .debug_selector(|| "docker-remove-confirm".into())
                                 .child("Remove account")
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.docker_remove_confirm(cx)),
-                                ),
+                                .when(!busy, |d| {
+                                    d.on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.docker_remove_confirm(cx)
+                                        }),
+                                    )
+                                }),
                             )
                         })
                         .child(
@@ -757,6 +878,7 @@ impl SettingsView {
     }
 
     fn docker_footer(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let busy = self.cloud.docker.busy;
         let adding = self
             .cloud
             .docker
@@ -785,11 +907,11 @@ impl SettingsView {
                     "docker-add-button",
                     "Add Docker account",
                     false,
-                    self.docker_store().is_none(),
+                    self.docker_store().is_none() || busy,
                 )
                 .debug_selector(|| "docker-add-button".into())
                 .child("Add Docker account")
-                .when(self.docker_store().is_some() && !adding, |d| {
+                .when(self.docker_store().is_some() && !adding && !busy, |d| {
                     d.on_click(cx.listener(|this, _, window, cx| {
                         this.open_docker_form(FormKind::Add, window, cx)
                     }))
@@ -802,9 +924,9 @@ impl SettingsView {
         let form = self.cloud.docker.form.as_ref()?;
         let kind = form.kind.clone();
         let checking = form.checking;
-        let outcome = form.outcome.clone();
+        let busy = self.cloud.docker.busy;
+        let error = form.error.clone();
         let (docker_id_input, pat_input) = self.docker_inputs(cx);
-        let done = matches!(outcome, Some(Ok(_)));
         let save_label = if checking { "Checking..." } else { "Save" };
         let id_field = match &kind {
             FormKind::Add => labelled("Docker ID")
@@ -854,19 +976,16 @@ impl SettingsView {
                                 .debug_selector(|| "docker-form-hint".into()),
                         ),
                 )
-                .children(outcome.map(|outcome| {
-                    match outcome {
-                        Ok(text) => chip("docker-form-result", true, text),
-                        Err(error) => div()
-                            .id("docker-form-error")
-                            .debug_selector(|| "docker-form-error".into())
-                            .role(Role::Alert)
-                            .text_size(px(12.))
-                            .line_height(px(18.))
-                            .text_color(danger_color())
-                            .child(error)
-                            .into_any_element(),
-                    }
+                .children(error.map(|error| {
+                    div()
+                        .id("docker-form-error")
+                        .debug_selector(|| "docker-form-error".into())
+                        .role(Role::Alert)
+                        .text_size(px(12.))
+                        .line_height(px(18.))
+                        .text_color(danger_color())
+                        .child(error)
+                        .into_any_element()
                 }))
                 .child(
                     div()
@@ -874,23 +993,20 @@ impl SettingsView {
                         .justify_end()
                         .gap_2()
                         .child(
-                            secondary_button(
-                                "docker-form-cancel",
-                                if done { "Close" } else { "Cancel" },
-                                false,
-                                checking,
-                            )
-                            .debug_selector(|| "docker-form-cancel".into())
-                            .child(if done { "Close" } else { "Cancel" })
-                            .when(!checking, |d| {
-                                d.on_click(cx.listener(|this, _, _, cx| this.close_docker_form(cx)))
-                            }),
+                            secondary_button("docker-form-cancel", "Cancel", false, checking)
+                                .debug_selector(|| "docker-form-cancel".into())
+                                .child("Cancel")
+                                .when(!checking, |d| {
+                                    d.on_click(
+                                        cx.listener(|this, _, _, cx| this.close_docker_form(cx)),
+                                    )
+                                }),
                         )
                         .child(
-                            primary_button("docker-form-save", save_label, checking)
+                            primary_button("docker-form-save", save_label, busy)
                                 .debug_selector(|| "docker-form-save".into())
                                 .child(save_label)
-                                .when(!checking, |d| {
+                                .when(!busy, |d| {
                                     d.on_click(cx.listener(|this, _, _, cx| this.docker_save(cx)))
                                 }),
                         ),

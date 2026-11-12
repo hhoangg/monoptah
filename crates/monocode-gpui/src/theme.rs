@@ -326,6 +326,10 @@ pub(crate) fn is_light() -> bool {
 pub(crate) fn warning_color() -> Hsla {
     rgb(if is_light() { 0xb45309 } else { 0xfbbf24 }).into()
 }
+/// Green for "done" and "works" marks: darker on light themes so it stays readable.
+pub(crate) fn success_color() -> Hsla {
+    rgb(if is_light() { 0x059669 } else { 0x34d399 }).into()
+}
 /// Red for failed or urgent text, darkened on light themes.
 pub(crate) fn danger_color() -> Hsla {
     rgb(if is_light() { 0xdc2626 } else { 0xf87171 }).into()
