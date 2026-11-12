@@ -404,7 +404,8 @@ if [ "$EXISTED" = 1 ] && [ "$FORCE_UPGRADE" = 1 ]; then
 fi
 TOKEN_MARKER="$BASE/host-token.sha256"
 TOKEN_HASH=
-# A sandbox may track an API key instead (MONOCODE_HOST_TOKEN_VAR); a codespace never sets it.
+# A sandbox, or a codespace whose project chooses an app Claude account, may track an API key
+# instead (MONOCODE_HOST_TOKEN_VAR, set by the stdin prelude).
 case "${MONOCODE_HOST_TOKEN_VAR:-}" in
   ANTHROPIC_API_KEY) TOKEN_VALUE=${ANTHROPIC_API_KEY:-} ;;
   *) TOKEN_VALUE=${CLAUDE_CODE_OAUTH_TOKEN:-} ;;

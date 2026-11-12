@@ -314,6 +314,9 @@ struct Fixture {
 }
 /// A real git project on branch `trunk` whose origin is a GitHub repository.
 fn fixture(gh: &Arc<FakeGh>) -> Fixture {
+    fixture_in(gh, Store::open(Path::new(":memory:")).unwrap())
+}
+fn fixture_in(gh: &Arc<FakeGh>, store: Store) -> Fixture {
     let project = tempfile::tempdir().unwrap();
     let path = project.path().to_str().unwrap().to_owned();
     for args in [
@@ -346,7 +349,7 @@ fn fixture(gh: &Arc<FakeGh>) -> Fixture {
     )
     .unwrap();
     let host = Arc::new(FakeHost::default());
-    let store = Arc::new(Mutex::new(Store::open(Path::new(":memory:")).unwrap()));
+    let store = Arc::new(Mutex::new(store));
     let sbx = Sbx::new();
     let shell = Arc::new(Shell::default());
     let cloud = CloudSessions::new(gh.clone(), host.clone(), store.clone())
@@ -2548,5 +2551,187 @@ mod docker_accounts {
         assert!(sandbox.get("fixCommand").is_none(), "{sandbox}");
         assert!(!status.to_string().contains("sbx login"));
         assert_eq!(fx.sbx.ls_accounts().len(), 1, "sbx was not asked again");
+    }
+}
+
+/// The app Claude account of a cloud instance: a Mono's `account` for a NEW instance, and the
+/// status of a codespace whose project chooses one.
+mod claude_account {
+    use super::*;
+    use crate::cloud_sessions::claude_pin::{self, ClaudePin};
+    use crate::cloud_sessions::project_cloud::{self, CodespaceProjectConfig, ProjectCloud};
+    use crate::provider::Kind;
+
+    fn store_with_account() -> (Store, tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("monocode.db")).unwrap();
+        let mut book = store.provider_accounts().unwrap();
+        let id = book.add(Kind::Claude, "Work").unwrap().id;
+        store.save_provider_accounts(&book).unwrap();
+        crate::accounts::Profile::new(&id, dir.path())
+            .save_claude_token("sk-ant-oat01-api-fixture")
+            .unwrap();
+        (store, dir, id)
+    }
+    fn with_account(kind: CloudBackendKind, instance: InstanceChoice, id: &str) -> CloudTarget {
+        let mut target = CloudTarget::new(kind, instance);
+        target.account = Some(id.to_owned());
+        target
+    }
+    fn gh() -> Arc<FakeGh> {
+        FakeGh::new(vec![
+            ("auth status", ok(AUTH_OK)),
+            ("codespace list", ok(LIST)),
+            ("codespace view", ok(r#"{"state":"Shutdown"}"#)),
+            (
+                "--method POST",
+                ok(r#"{"name":"octo-new1","state":"Provisioning"}"#),
+            ),
+        ])
+    }
+    fn pin_of(fx: &Fixture, name: &str, sandbox: bool) -> Option<ClaudePin> {
+        let key = if sandbox {
+            claude_pin::sandbox_key(name)
+        } else {
+            claude_pin::codespace_key(name)
+        };
+        claude_pin::read(&fx.store.lock().unwrap(), &key)
+    }
+
+    #[test]
+    fn a_new_codespace_takes_the_account_as_a_pinned_override() {
+        let (store, _dir, id) = store_with_account();
+        let gh = gh();
+        let fx = fixture_in(&gh, store);
+        let target = with_account(CloudBackendKind::Codespaces, InstanceChoice::New, &id);
+        let start = fx.api.begin_start(&fx.path(), target, "claude").unwrap();
+        assert_eq!(
+            pin_of(&fx, &start.instance(), false),
+            Some(ClaudePin {
+                account: Some(id.clone()),
+                pinned: true
+            })
+        );
+        // Without `account` the codespace follows the project.
+        let start = fx
+            .api
+            .begin_start(
+                &fx.path(),
+                CloudTarget::new(CloudBackendKind::Codespaces, InstanceChoice::New),
+                "claude",
+            )
+            .unwrap();
+        assert!(!pin_of(&fx, &start.instance(), false).unwrap().pinned);
+    }
+
+    #[test]
+    fn a_new_sandbox_takes_the_account_as_a_pinned_override_over_the_project() {
+        let (store, _dir, id) = store_with_account();
+        let gh = FakeGh::new(vec![]);
+        let fx = fixture_in(&gh, store);
+        fx.save_docker_config();
+        let target = with_account(CloudBackendKind::DockerSandbox, InstanceChoice::New, &id);
+        let start = fx.api.begin_start(&fx.path(), target, "claude").unwrap();
+        let sandbox_start = start.record().unwrap().sandbox_start.as_ref().unwrap();
+        assert_eq!(
+            sandbox_start.config.claude_account.as_deref(),
+            Some(id.as_str())
+        );
+        assert!(sandbox_start.claude_pinned);
+        assert_eq!(
+            pin_of(&fx, &start.instance(), true),
+            Some(ClaudePin {
+                account: Some(id.clone()),
+                pinned: true
+            })
+        );
+        // The project's own config keeps its choice.
+        let stored =
+            crate::cloud_sessions::docker_config::load(&fx.store.lock().unwrap(), &fx.path())
+                .unwrap()
+                .unwrap();
+        assert_eq!(stored.claude_account, None);
+    }
+
+    #[test]
+    fn an_existing_instance_refuses_the_account() {
+        let (store, _dir, id) = store_with_account();
+        let gh = gh();
+        let fx = fixture_in(&gh, store);
+        fx.save_docker_config();
+        fx.bind_sandbox("box-1");
+        let refused = [
+            with_account(
+                CloudBackendKind::Codespaces,
+                InstanceChoice::Named("octo-abc".into()),
+                &id,
+            ),
+            with_account(
+                CloudBackendKind::DockerSandbox,
+                InstanceChoice::Named("box-1".into()),
+                &id,
+            ),
+        ];
+        for target in refused {
+            let error = fx
+                .api
+                .begin_start(&fx.path(), target, "claude")
+                .unwrap_err();
+            assert_eq!(error, crate::mono::api::ACCOUNT_EXISTING_INSTANCE);
+        }
+        assert_eq!(pin_of(&fx, "octo-abc", false), None);
+    }
+
+    fn secrets_gh() -> Arc<FakeGh> {
+        FakeGh::new(vec![
+            ("auth status", ok(AUTH_OK)),
+            (
+                "user/codespaces/secrets/CLAUDE_CODE_OAUTH_TOKEN/repositories",
+                ok(r#"{"repositories":[]}"#),
+            ),
+            (
+                "user/codespaces/secrets",
+                ok(r#"{"secrets":[{"name":"CLAUDE_CODE_OAUTH_TOKEN","value":"leak-me"}]}"#),
+            ),
+        ])
+    }
+    fn status(fx: &Fixture) -> Value {
+        fx.api
+            .status(&fx.path(), &json!({"kind":"codespace"}))
+            .unwrap()["backends"]["codespace"]
+            .clone()
+    }
+
+    #[test]
+    fn the_secret_is_optional_in_the_status_when_the_project_chooses_an_account() {
+        let (store, _dir, id) = store_with_account();
+        let gh = secrets_gh();
+        let fx = fixture_in(&gh, store);
+        // Unchanged without an account: no new field, no optional marker.
+        let plain = status(&fx);
+        assert!(plain.get("claudeAccount").is_none() && plain.get("secretRequired").is_none());
+        assert!(!plain["secrets"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("optional"));
+        project_cloud::save(
+            &fx.store.lock().unwrap(),
+            &fx.path(),
+            &ProjectCloud {
+                codespace: CodespaceProjectConfig {
+                    claude_account: Some(id),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let chosen = status(&fx);
+        assert_eq!(chosen["claudeAccount"], "Work");
+        assert_eq!(chosen["secretRequired"], false);
+        assert_eq!(chosen["secrets"][0]["key"], "CLAUDE_CODE_OAUTH_TOKEN");
+        assert_eq!(chosen["secrets"][0]["optional"], true);
+        assert!(!chosen.to_string().contains("leak-me"));
+        assert!(!chosen.to_string().contains("sk-ant-oat01"));
     }
 }

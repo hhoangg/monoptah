@@ -191,7 +191,9 @@ impl Connections {
     /// nothing runs on it, stage the pinned Host, hold sends and look again, have the machine
     /// swap it (detached, with a last look on the Host itself) and reopen the tunnel; if
     /// something runs, mark the machine and leave it for the next connect. `auth` is the
-    /// sandbox's Claude prelude (the same the connect step used); a codespace passes `None`.
+    /// sandbox's Claude prelude (the same the connect step used); a codespace passes `None`
+    /// and gets the app Claude account its project chooses (if any) from the resolver of
+    /// [`Connections::set_codespace_claude`].
     /// `cancel` aborts between steps, never in the middle of the swap. `progress` hears the
     /// status lines.
     ///
@@ -222,6 +224,30 @@ impl Connections {
         if cancel.load(Ordering::Relaxed) {
             return Outcome::Cancelled;
         }
+        // A codespace whose project chooses an app Claude account upgrades with the SAME
+        // prelude as its connect step; without it the restarted Host would fall back to the
+        // Codespaces secret. An account that cannot be used leaves the Host as it is.
+        let delivery = match machine
+            .ssh
+            .as_ref()
+            .filter(|_| auth.is_none())
+            .map(|target| self.claude_delivery_for(target))
+            .transpose()
+        {
+            Ok(delivery) => delivery.flatten(),
+            Err(error) => {
+                let text = scrub(&host_upgrade::warning(&error, false), &machine.token);
+                progress(&text);
+                self.record_upgrade_failure(machine_id, Some(&text));
+                return Outcome::Failed(text);
+            }
+        };
+        let auth = auth.or_else(|| {
+            delivery.as_ref().map(|d| SandboxAuth {
+                prelude: d.prelude.as_str(),
+                secret: d.secret.as_str(),
+            })
+        });
         let target = machine.ssh.as_ref().map(SshTarget::job_target);
         let (job, _slot) = match self.hold_job_slot(target, cancel, &mut || {
             progress("Waiting for another operation on this workspace…")
@@ -284,6 +310,29 @@ impl Connections {
             }
         }
         outcome
+    }
+
+    /// Whether a session on the Host of `machine_id` runs, waits for input, or is in a state
+    /// this code does not know: the Host must not be restarted now.
+    pub(super) fn host_busy(&self, machine_id: &str) -> Result<bool, String> {
+        let projects = self.request(machine_id, "projects.list", json!({}))?;
+        let projects = projects
+            .as_array()
+            .ok_or("Invalid remote projects response")?;
+        for project in projects {
+            let sessions = self.request(
+                machine_id,
+                "sessions.list",
+                json!({"projectId": project["id"]}),
+            )?;
+            let sessions = sessions
+                .as_array()
+                .ok_or("Invalid remote sessions response")?;
+            if sessions.iter().any(session_is_active) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn record_upgrade_failure(&self, machine_id: &str, warning: Option<&str>) {
@@ -548,7 +597,12 @@ impl CloudUpgrade<'_> {
                 Some(check),
             )
         } else {
-            ssh::codespace_upgrade_script(target.remote_port, phase, Some(check))
+            ssh::codespace_upgrade_script_with(
+                self.auth.map(|auth| auth.prelude),
+                target.remote_port,
+                phase,
+                Some(check),
+            )
         };
         let output = self
             .runner
@@ -640,26 +694,7 @@ impl UpgradeEnv for CloudUpgrade<'_> {
     }
 
     fn busy(&self) -> Result<bool, String> {
-        let projects = self
-            .connections
-            .request(self.id, "projects.list", json!({}))?;
-        let projects = projects
-            .as_array()
-            .ok_or("Invalid remote projects response")?;
-        for project in projects {
-            let sessions = self.connections.request(
-                self.id,
-                "sessions.list",
-                json!({"projectId": project["id"]}),
-            )?;
-            let sessions = sessions
-                .as_array()
-                .ok_or("Invalid remote sessions response")?;
-            if sessions.iter().any(session_is_active) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        self.connections.host_busy(self.id)
     }
 
     fn pending(&self) -> bool {

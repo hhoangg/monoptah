@@ -16,6 +16,8 @@ pub(super) fn codespace_target(request: &CloudCreate) -> Result<Target, String> 
         CodespaceChoice::New,
         &request.branch,
         request.machine.as_deref(),
+        request.account.as_deref(),
+        request.account_pinned,
     )
 }
 
@@ -38,12 +40,13 @@ pub(super) fn begin_cloud_create(
                 .config
                 .as_ref()
                 .ok_or("Set up Docker Sandbox for this project first.")?;
-            cloud.begin_sandbox_start_with_kit(
+            cloud.begin_sandbox_start_pinned(
                 &request.project,
                 config,
                 &request.branch,
                 HARNESS,
                 request.kit,
+                request.account_pinned,
             )
         }
     }

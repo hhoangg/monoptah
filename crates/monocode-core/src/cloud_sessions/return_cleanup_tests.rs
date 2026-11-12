@@ -1032,6 +1032,8 @@ fn new_work_on_the_instance_is_refused_while_it_is_being_deleted() {
                 machine: None,
                 idle_timeout_minutes: None,
                 devcontainer_path: None,
+                claude_account: None,
+                claude_account_pinned: false,
             },
             HARNESS,
         );
@@ -1043,6 +1045,8 @@ fn new_work_on_the_instance_is_refused_while_it_is_being_deleted() {
                 machine: None,
                 idle_timeout_minutes: None,
                 devcontainer_path: None,
+                claude_account: None,
+                claude_account_pinned: false,
             },
             &mut |_| {},
         );
@@ -1390,7 +1394,14 @@ fn a_start_is_refused_under_the_store_lock_while_the_instance_is_being_deleted()
     r.svc.cleaning.lock().unwrap().insert("cs-1".into());
     let error = r
         .svc
-        .record_start("/p", HARNESS, &super::tests::resolved("cs-1"), 1, false)
+        .record_start(
+            "/p",
+            HARNESS,
+            &super::tests::resolved("cs-1"),
+            1,
+            false,
+            &Default::default(),
+        )
         .unwrap_err();
     assert!(error.contains("is being deleted"), "{error}");
     assert!(pending_starts(&r.svc.store().unwrap()).is_empty());

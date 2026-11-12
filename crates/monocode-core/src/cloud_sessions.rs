@@ -382,6 +382,13 @@ pub struct Target {
     /// Devcontainer path for a new codespace; `None` fills from the project's cloud settings,
     /// then the repository default.
     pub devcontainer_path: Option<String>,
+    /// App Claude account of a per-session override; only read when
+    /// [`Self::claude_account_pinned`]. `None` there means "no account" (the Codespaces
+    /// secret) for this session.
+    pub claude_account: Option<String>,
+    /// This start carries an explicit per-session account (see [`claude_pin`]). Without it
+    /// the codespace follows the project's current choice.
+    pub claude_account_pinned: bool,
 }
 
 /// A ready remote project bound to a codespace.
@@ -2099,6 +2106,7 @@ impl StartupSummary {
 }
 
 pub mod backend;
+pub mod claude_pin;
 pub mod claude_setup;
 pub mod docker_config;
 pub mod docker_start;
@@ -2128,6 +2136,8 @@ pub use startup::{
 };
 
 // These fixtures execute the Linux host scripts against local Unix paths.
+#[cfg(test)]
+mod claude_pin_tests;
 #[cfg(all(test, unix))]
 mod continue_tests;
 #[cfg(all(test, unix))]

@@ -361,6 +361,19 @@ impl Store {
             // A stale pin of a deleted sandbox is harmless, so a failure here is not an error.
             let _ = crate::sandboxes::account::clear_pin(self, &cloud.name);
         }
+        // The Claude account choice of the instance goes with it (a stale one is harmless
+        // too, the name is unique).
+        let _ = crate::cloud_sessions::claude_pin::clear(
+            self,
+            &match cloud.kind {
+                CloudBackendKind::DockerSandbox => {
+                    crate::cloud_sessions::claude_pin::sandbox_key(&cloud.name)
+                }
+                CloudBackendKind::Codespaces => {
+                    crate::cloud_sessions::claude_pin::codespace_key(&cloud.name)
+                }
+            },
+        );
         self.save_setting(
             SESSIONS,
             &serde_json::to_string(&sessions).map_err(|e| e.to_string())?,

@@ -35,6 +35,8 @@ pub(super) fn target_for(
     choice: CodespaceChoice,
     branch: &str,
     machine: Option<&str>,
+    account: Option<&str>,
+    account_pinned: bool,
 ) -> Result<Target, String> {
     let branch = branch.trim();
     if choice == CodespaceChoice::New && branch.is_empty() {
@@ -45,6 +47,8 @@ pub(super) fn target_for(
         machine: machine.map(str::to_owned),
         idle_timeout_minutes: None,
         devcontainer_path: None,
+        claude_account: account.map(str::to_owned),
+        claude_account_pinned: account_pinned,
         codespace: choice,
     })
 }
@@ -265,7 +269,7 @@ impl CodespacePicker {
             return;
         }
         let branch = self.branch.read(cx).content.to_string();
-        let target = match target_for(choice, &branch, self.machine.as_deref()) {
+        let target = match target_for(choice, &branch, self.machine.as_deref(), None, false) {
             Ok(target) => target,
             Err(error) => {
                 self.error = error;

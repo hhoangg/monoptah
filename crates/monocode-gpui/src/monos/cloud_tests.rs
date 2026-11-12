@@ -503,7 +503,7 @@ fn a_mono_start_with_a_target_fails_before_creating_anything_when_validation_fai
 }
 
 #[gpui::test]
-fn a_mono_start_with_an_account_and_a_cloud_target_is_refused_before_any_cloud_call(
+fn a_mono_start_with_an_account_is_refused_before_any_cloud_call_unless_it_is_usable_and_new(
     cx: &mut TestAppContext,
 ) {
     let ((s, gh, host, _guard), sbx) = sandbox_setup(cx, "Shutdown", "running");
@@ -512,10 +512,9 @@ fn a_mono_start_with_an_account_and_a_cloud_target_is_refused_before_any_cloud_c
         sbx.calls.lock().unwrap().len(),
     );
     let sessions = super::tests::session_count(&s);
+    // An existing instance keeps the account it started with.
     for (request, target) in [
-        ("a1", json!({"kind":"codespace","instance":"new"})),
         ("a2", json!({"kind":"codespace","instance":"octo-run"})),
-        ("a3", json!({"kind":"sandbox","instance":"new"})),
         ("a4", json!({"kind":"sandbox","instance":"box-1"})),
         ("a5", json!({"kind":"sandbox","instance":{"session":1}})),
     ] {
@@ -529,8 +528,29 @@ fn a_mono_start_with_an_account_and_a_cloud_target_is_refused_before_any_cloud_c
         .unwrap_err();
         assert_eq!(
             error,
-            monocode_core::mono::api::ACCOUNT_LOCAL_ONLY,
+            monocode_core::mono::api::ACCOUNT_EXISTING_INSTANCE,
             "{request}"
+        );
+    }
+    // A new instance needs an account that exists and carries a setup token or API key: an
+    // unknown name, and the CLI login (no token to deliver), are refused.
+    for (request, target, account) in [
+        ("a1", json!({"kind":"codespace","instance":"new"}), "Nobody"),
+        ("a3", json!({"kind":"sandbox","instance":"new"}), "Nobody"),
+        ("a6", json!({"kind":"codespace"}), "default"),
+        ("a7", json!({"kind":"sandbox"}), "default"),
+    ] {
+        let error = run(
+            &s,
+            request,
+            "sessions.start",
+            json!({"prompt":"x","account":account,"target":target}),
+            cx,
+        )
+        .unwrap_err();
+        assert!(
+            error != monocode_core::mono::api::ACCOUNT_EXISTING_INSTANCE,
+            "{request}: {error}"
         );
     }
     assert_eq!(gh.calls.lock().unwrap().len(), gh_before, "no gh call");

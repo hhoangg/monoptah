@@ -317,9 +317,12 @@ struct Fx {
     store: Arc<Mutex<Store>>,
 }
 fn fx(gh: Arc<Gh>) -> Fx {
+    fx_in(gh, Store::open(Path::new(":memory:")).unwrap())
+}
+fn fx_in(gh: Arc<Gh>, store: Store) -> Fx {
     let host = Arc::new(Host::default());
     *host.wait_for.lock().unwrap() = Some(gh.delivered.clone());
-    let store = Arc::new(Mutex::new(Store::open(Path::new(":memory:")).unwrap()));
+    let store = Arc::new(Mutex::new(store));
     let tick = Arc::new(AtomicU64::new(1_794_024_100_000));
     let svc = CloudSessions::new(gh.clone(), host.clone(), store.clone())
         .with_origin(|_| Ok("git@github.com:octo/widgets.git".into()))
@@ -342,6 +345,8 @@ fn new_target() -> Target {
         machine: None,
         idle_timeout_minutes: None,
         devcontainer_path: None,
+        claude_account: None,
+        claude_account_pinned: false,
     }
 }
 fn named_target() -> Target {
@@ -351,6 +356,8 @@ fn named_target() -> Target {
         machine: None,
         idle_timeout_minutes: None,
         devcontainer_path: None,
+        claude_account: None,
+        claude_account_pinned: false,
     }
 }
 impl Fx {
@@ -1330,3 +1337,150 @@ fn a_start_record_without_a_codespace_names_no_workspace() {
 
 #[path = "claude_setup_tests.rs"]
 mod claude_setup;
+
+/// The app Claude account of a codespace is pinned by the start that creates or adopts it.
+mod claude_account {
+    use super::super::claude_pin::{self, ClaudePin};
+    use super::super::project_cloud::{self, CodespaceProjectConfig, ProjectCloud};
+    use super::*;
+    use crate::provider::Kind;
+
+    fn store_with_accounts() -> (Store, tempfile::TempDir, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("monocode.db")).unwrap();
+        let mut book = store.provider_accounts().unwrap();
+        let usable = book.add(Kind::Claude, "Work").unwrap().id;
+        let empty = book.add(Kind::Claude, "Empty").unwrap().id;
+        store.save_provider_accounts(&book).unwrap();
+        crate::accounts::Profile::new(&usable, dir.path())
+            .save_claude_token("sk-ant-oat01-startup-fixture")
+            .unwrap();
+        (store, dir, usable, empty)
+    }
+    fn choose(f: &Fx, account: Option<&str>) {
+        project_cloud::save(
+            &f.store.lock().unwrap(),
+            "/p",
+            &ProjectCloud {
+                codespace: CodespaceProjectConfig {
+                    claude_account: account.map(str::to_owned),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+    fn pin_of(f: &Fx, name: &str) -> Option<ClaudePin> {
+        claude_pin::read(&f.store.lock().unwrap(), &claude_pin::codespace_key(name))
+    }
+    fn created(f: &Fx) -> bool {
+        f.gh.calls()
+            .iter()
+            .any(|c| c.starts_with("api --method POST"))
+    }
+
+    #[test]
+    fn a_start_without_an_override_pins_the_projects_choice_as_the_default() {
+        let (store, _dir, usable, _) = store_with_accounts();
+        let f = fx_in(Gh::new(&["Provisioning"], &[]), store);
+        choose(&f, Some(&usable));
+        let (_, record) = f.svc.begin_start("/p", new_target(), "claude").unwrap();
+        assert_eq!(
+            pin_of(&f, &record.codespace),
+            Some(ClaudePin {
+                account: Some(usable.clone()),
+                pinned: false
+            })
+        );
+        // No account in the project: pinned as "none", still following the project.
+        let f = fx_in(Gh::new(&["Provisioning"], &[]), store_with_accounts().0);
+        let (_, record) = f.svc.begin_start("/p", new_target(), "claude").unwrap();
+        assert_eq!(
+            pin_of(&f, &record.codespace),
+            Some(ClaudePin {
+                account: None,
+                pinned: false
+            })
+        );
+    }
+
+    #[test]
+    fn a_per_session_account_is_pinned_and_beats_the_project() {
+        let (store, _dir, usable, _) = store_with_accounts();
+        let f = fx_in(Gh::new(&["Provisioning"], &[]), store);
+        choose(&f, None);
+        let target = Target {
+            claude_account: Some(usable.clone()),
+            claude_account_pinned: true,
+            ..new_target()
+        };
+        let (_, record) = f.svc.begin_start("/p", target, "claude").unwrap();
+        assert_eq!(
+            pin_of(&f, &record.codespace),
+            Some(ClaudePin {
+                account: Some(usable.clone()),
+                pinned: true
+            })
+        );
+        // An account carried by an unpinned target is ignored: the project decides.
+        let target = Target {
+            claude_account: Some("ignored".into()),
+            claude_account_pinned: false,
+            ..new_target()
+        };
+        let (_, record) = f.svc.begin_start("/p", target, "claude").unwrap();
+        assert_eq!(pin_of(&f, &record.codespace).unwrap().account, None);
+    }
+
+    #[test]
+    fn an_account_without_a_credential_fails_before_any_codespace_is_created() {
+        let (store, _dir, _, empty) = store_with_accounts();
+        let f = fx_in(Gh::new(&["Provisioning"], &[]), store);
+        choose(&f, Some(&empty));
+        let error = f.svc.begin_start("/p", new_target(), "claude").unwrap_err();
+        assert!(
+            error.contains("Cloud settings") && error.contains("\"Empty\""),
+            "{error}"
+        );
+        assert!(!created(&f), "nothing was created");
+        // The same for a per-session account that is gone.
+        let target = Target {
+            claude_account: Some("account-deleted".into()),
+            claude_account_pinned: true,
+            ..new_target()
+        };
+        let error = f.svc.begin_start("/p", target, "claude").unwrap_err();
+        assert!(error.contains("no longer available"), "{error}");
+        assert!(!created(&f));
+        assert!(pending_starts(&f.store.lock().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn adopting_a_codespace_keeps_an_override_unless_this_start_pins_another() {
+        let (store, _dir, usable, _) = store_with_accounts();
+        let f = fx_in(Gh::new(&["Shutdown"], &[]), store);
+        let key = claude_pin::codespace_key("octo-abc");
+        let mine = ClaudePin {
+            account: Some(usable.clone()),
+            pinned: true,
+        };
+        claude_pin::write(&f.store.lock().unwrap(), &key, &mine).unwrap();
+        f.svc.begin_start("/p", named_target(), "claude").unwrap();
+        assert_eq!(pin_of(&f, "octo-abc"), Some(mine));
+        // A start that pins its own account replaces it.
+        let target = Target {
+            claude_account: None,
+            claude_account_pinned: true,
+            ..named_target()
+        };
+        f.svc.begin_start("/p", target, "claude").unwrap();
+        assert_eq!(
+            pin_of(&f, "octo-abc"),
+            Some(ClaudePin {
+                account: None,
+                pinned: true
+            })
+        );
+    }
+}

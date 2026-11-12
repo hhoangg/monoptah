@@ -102,6 +102,11 @@ pub(crate) struct CloudCreate {
     pub config: Option<DockerProjectConfig>,
     /// Codespace only: the machine type picked for this session; `None` keeps the default.
     pub machine: Option<String>,
+    /// The app Claude account of this session when `account_pinned` (a Docker Sandbox carries
+    /// it in `config` as well). Ignored otherwise: the instance follows the project.
+    pub account: Option<String>,
+    /// `account` was changed for this session and is kept by the instance across reconnects.
+    pub account_pinned: bool,
     /// The composer text, queued as the first prompt.
     pub prompt: Option<String>,
     /// Copy the global Claude setup to the new workspace. `false` is recorded on the start
@@ -705,6 +710,7 @@ impl Conversation {
         }
         let typed = draft.branch.read(cx).content.trim().to_owned();
         let codespace_base = self.codespace_project_config().base_ref;
+        let mut default_account: Option<String> = None;
         let (branch, config) = match target {
             // The typed branch wins. Else the project's base branch, else HEAD of the project
             // folder (as the header picker does; a worktree's branch would not exist on the
@@ -734,6 +740,7 @@ impl Conversation {
                         // The project's config is the default; this copy carries the session's
                         // overrides and is checked by the same validation a saved one gets.
                         let mut config = project;
+                        default_account = config.claude_account.clone();
                         if let Some(draft) = &self.cloud_draft {
                             config.cpus = draft.cpus;
                             config.memory = draft.memory.clone();
@@ -764,6 +771,14 @@ impl Conversation {
             CloudTarget::Codespace => self.cloud_draft.as_ref().and_then(|d| d.machine.clone()),
             CloudTarget::DockerSandbox => None,
         };
+        // A sandbox account that differs from the project's default is this session's own.
+        let (account, account_pinned) = match (&config, target) {
+            (Some(config), CloudTarget::DockerSandbox) => (
+                config.claude_account.clone(),
+                config.claude_account != default_account,
+            ),
+            _ => (None, false),
+        };
         let prompt = self.input.read(cx).content.trim().to_owned();
         // The prompt leaves the composer for the send queue at once. The queue copy is not
         // saved: this draft is a local session, the new cloud session gets its own stored copy.
@@ -779,6 +794,8 @@ impl Conversation {
             branch,
             config,
             machine,
+            account,
+            account_pinned,
             prompt: (!prompt.is_empty()).then_some(prompt),
             // The switch is this start's own choice, but it can only narrow Settings: if the
             // kit was turned off while the panel was open, nothing is sent.

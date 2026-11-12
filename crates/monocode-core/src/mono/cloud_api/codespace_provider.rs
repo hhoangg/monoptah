@@ -134,6 +134,8 @@ impl CodespaceProvider {
                     machine: None,
                     idle_timeout_minutes: None,
                     devcontainer_path: None,
+                    claude_account: None,
+                    claude_account_pinned: false,
                 })
             }
             None => Ok(Target {
@@ -142,6 +144,8 @@ impl CodespaceProvider {
                 machine: option_text(options, "machine").map(str::to_owned),
                 idle_timeout_minutes: None,
                 devcontainer_path: None,
+                claude_account: None,
+                claude_account_pinned: false,
             }),
         }
     }
@@ -201,6 +205,13 @@ impl CloudProvider for CodespaceProvider {
             "devcontainerSecrets":wanted,
             "secrets":[],
         });
+        // A project that chooses an app Claude account does not need the Codespaces secret:
+        // the account's credential is delivered to the codespace's Host at connect time.
+        let account = self.cloud.codespace_project_config(project).claude_account;
+        if let Some(account) = &account {
+            result["claudeAccount"] = json!(self.cloud.claude_account_label(account));
+            result["secretRequired"] = json!(false);
+        }
         let Some(repo) = repo else {
             result["note"] = json!("The project's origin is not a GitHub repository.");
             return Ok(result);
@@ -213,7 +224,15 @@ impl CloudProvider for CodespaceProvider {
             return Ok(result);
         }
         let keys: Vec<String> = wanted.iter().map(|s| s.key.clone()).collect();
-        result["secrets"] = json!(codespaces::secrets_status(&*self.gh, &repo, &keys)?);
+        let mut secrets = json!(codespaces::secrets_status(&*self.gh, &repo, &keys)?);
+        if account.is_some() {
+            for secret in secrets.as_array_mut().into_iter().flatten() {
+                if secret["key"] == "CLAUDE_CODE_OAUTH_TOKEN" {
+                    secret["optional"] = json!(true);
+                }
+            }
+        }
+        result["secrets"] = secrets;
         result["ready"] = json!(true);
         Ok(result)
     }
@@ -276,8 +295,17 @@ impl CloudProvider for CodespaceProvider {
         instance: Option<&str>,
         options: &Map<String, Value>,
         kit: bool,
+        account: Option<&str>,
     ) -> Result<CloudStart, String> {
-        let target = self.target(project, instance, options)?;
+        let mut target = self.target(project, instance, options)?;
+        if let Some(account) = account {
+            // The account belongs to the instance: only a new one takes it.
+            if instance.is_some() {
+                return Err(super::super::api::ACCOUNT_EXISTING_INSTANCE.into());
+            }
+            target.claude_account = Some(account.to_owned());
+            target.claude_account_pinned = true;
+        }
         let (session, record) = self
             .cloud
             .begin_start_with_kit(project, target, harness, kit)?;

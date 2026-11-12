@@ -182,7 +182,9 @@ pub trait CloudProvider: Send + Sync {
     /// returns its canonical name.
     fn resolve_instance(&self, project: &str, instance: &str) -> Result<String, String>;
     /// `sessions.start`: `instance` is `None` for a new one, else the name of an existing
-    /// one. `options` are the target options (only with a new instance).
+    /// one. `options` are the target options (only with a new instance). `account` is the app
+    /// Claude account id of this session (a per-session override, pinned to the new instance);
+    /// `None` follows the project's choice.
     fn start(
         &self,
         project: &str,
@@ -190,6 +192,7 @@ pub trait CloudProvider: Send + Sync {
         instance: Option<&str>,
         options: &Map<String, Value>,
         kit: bool,
+        account: Option<&str>,
     ) -> Result<CloudStart, String>;
     /// Blocking variant of a start that returns the ready binding.
     fn prepare(

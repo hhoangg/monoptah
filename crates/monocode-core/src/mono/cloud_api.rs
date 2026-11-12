@@ -149,6 +149,11 @@ pub struct CloudTarget {
     pub options: Map<String, Value>,
     /// `target.kit`. The API can only turn the user's kit off, never widen it.
     pub kit: ApiKit,
+    /// The app Claude account id this session runs under, resolved by the GUI from the
+    /// request's `account` (never parsed from the input here). Pinned to the new instance as
+    /// a per-session override; `None` follows the project's default. Only with
+    /// [`InstanceChoice::New`].
+    pub account: Option<String>,
 }
 
 impl CloudTarget {
@@ -158,6 +163,7 @@ impl CloudTarget {
             instance,
             options: Map::new(),
             kit: ApiKit::Default,
+            account: None,
         }
     }
     /// Text option `key`, e.g. `branch`.
@@ -204,6 +210,7 @@ pub fn target_from_input(input: &Value) -> Result<Option<CloudTarget>, String> {
         instance,
         options,
         kit,
+        account: None,
     }))
 }
 
@@ -793,6 +800,7 @@ impl CloudApi {
             instance.as_deref(),
             &target.options,
             target.kit != ApiKit::None,
+            target.account.as_deref(),
         )
     }
     /// A blank session on the binding (Claude only).

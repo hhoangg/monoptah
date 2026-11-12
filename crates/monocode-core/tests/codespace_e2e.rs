@@ -130,6 +130,8 @@ fn codespace_end_to_end() {
                 machine: None,
                 idle_timeout_minutes: None,
                 devcontainer_path: None,
+                claude_account: None,
+                claude_account_pinned: false,
             },
             &mut |m| step(&format!("progress: {m}")),
         )
@@ -420,6 +422,8 @@ fn codespace_archive_to_local() {
                 machine: None,
                 idle_timeout_minutes: None,
                 devcontainer_path: None,
+                claude_account: None,
+                claude_account_pinned: false,
             },
             &mut |m| step(&format!("progress: {m}")),
         )

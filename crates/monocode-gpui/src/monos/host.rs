@@ -1496,7 +1496,7 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
             options,
         } = context;
         let prompt = app::prompt(&input)?;
-        let cloud = cloud_api::target_from_input(&input)?;
+        let mut cloud = cloud_api::target_from_input(&input)?;
         let provider = input["harness"]
             .as_str()
             .map(str::to_owned)
@@ -1527,14 +1527,29 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
         // choice. It is resolved against the same book the GUI uses and before the model
         // catalog below, so models are validated for the chosen account.
         if let Some(selector) = input.get("account").and_then(Value::as_str) {
-            if cloud.is_some() {
-                return Err(mono::api::ACCOUNT_LOCAL_ONLY.into());
+            // A cloud session takes the account only for a NEW instance: the account belongs to
+            // the instance (the API validation refuses an existing one first).
+            if cloud
+                .as_ref()
+                .is_some_and(|target| target.instance != cloud_api::InstanceChoice::New)
+            {
+                return Err(mono::api::ACCOUNT_EXISTING_INSTANCE.into());
             }
             let center = crate::accounts::get(cx).ok_or("Provider accounts are unavailable")?;
             let center = center.read(cx);
             let id = monocode_core::accounts::resolve(&center.book, kind, selector)
                 .map_err(|error| error.to_string())?;
-            settings.account = center.profile(&id);
+            match cloud.as_mut() {
+                // The cloud instance gets the account's token or key, so the account must
+                // carry one (the CLI login of a machine does not travel to a codespace).
+                Some(target) => {
+                    if !center.uses_claude_token(&id) {
+                        return Err("A cloud session needs a Claude account with a setup token or API key. Run accounts.list and pick an account whose authKind is setupToken or apiKey.".into());
+                    }
+                    target.account = Some(id);
+                }
+                None => settings.account = center.profile(&id),
+            }
         }
         let launches = mono.launches.clone();
         let draft = flag(&input, "draft", false);

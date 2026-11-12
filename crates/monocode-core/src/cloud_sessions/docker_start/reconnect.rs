@@ -198,6 +198,17 @@ impl CloudSessions {
         // the container is still brought back, just without those two.
         let have_config = config.is_some();
         let mut config = config.unwrap_or_default();
+        // The Claude account is the sandbox's own: a per-session override pinned at its start
+        // survives this reconnect, otherwise the project's current choice applies (so a
+        // change in Cloud settings reaches the next reconnect).
+        let claude_pin = {
+            let store = self.store()?;
+            claude_pin::read(&store, &claude_pin::sandbox_key(&name))
+        };
+        config.claude_account = claude_pin::effective(
+            claude_pin.as_ref(),
+            have_config.then_some(&config.claude_account),
+        );
         if let Some(path) = &target.config {
             config.devcontainer_path = path.clone();
         }
@@ -267,6 +278,7 @@ impl CloudSessions {
             relay_port: target.relay_port,
             rebuild: false,
             defer_lifecycle: false,
+            claude_pinned: claude_pin.as_ref().is_some_and(|pin| pin.pinned),
         };
         let mut record = fresh_sandbox_record(
             &name,

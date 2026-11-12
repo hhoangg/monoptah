@@ -323,6 +323,7 @@ pub(crate) mod fixtures {
                 relay_port: 0,
                 rebuild: false,
                 defer_lifecycle: false,
+                claude_pinned: false,
             });
         Arc::new(snapshot)
     }

@@ -324,8 +324,12 @@ impl CloudProvider for SandboxProvider {
         instance: Option<&str>,
         options: &Map<String, Value>,
         kit: bool,
+        account: Option<&str>,
     ) -> Result<CloudStart, String> {
         if let Some(instance) = instance {
+            if account.is_some() {
+                return Err(super::super::api::ACCOUNT_EXISTING_INSTANCE.into());
+            }
             if !options.is_empty() {
                 return Err("Options only apply when creating a sandbox".into());
             }
@@ -346,14 +350,23 @@ impl CloudProvider for SandboxProvider {
         if let Some(ttl) = option_text(options, "ttl") {
             config.ttl = ttl.to_owned();
         }
+        // This session's own Claude account replaces the project's for this sandbox only.
+        if let Some(account) = account {
+            config.claude_account = Some(account.to_owned());
+        }
         let config = config.validated()?;
         let branch = match option_text(options, "branch") {
             Some(branch) => branch.to_owned(),
             None => current_branch(project, "sandbox")?,
         };
-        let (session, record) = self
-            .cloud
-            .begin_sandbox_start_with_kit(project, &config, &branch, harness, kit)?;
+        let (session, record) = self.cloud.begin_sandbox_start_pinned(
+            project,
+            &config,
+            &branch,
+            harness,
+            kit,
+            account.is_some(),
+        )?;
         Ok(CloudStart::Pending(session, record))
     }
 

@@ -837,6 +837,12 @@ pub(super) fn service(
     remote: Arc<monocode_core::remote::Connections>,
     store: Database,
 ) -> Arc<CloudSessions> {
+    // Every codespace bootstrap and Host upgrade resolves the app Claude account the project
+    // chooses (or none) through the app's own store, so none can put a Host back on the
+    // Codespaces secret. The sealed credential is only read on the connection worker threads.
+    remote.set_codespace_claude(Arc::new(
+        monocode_core::cloud_sessions::claude_pin::StoreCodespaceClaude::new(store.clone()),
+    ));
     let cloud = CloudSessions::new(gh, Arc::new(remote), store.clone());
     // The app registers the real Docker sandbox backend (sbx, ssh, its own secret store).
     // Tests inject fakes through their own constructors and never reach the real `sbx`.

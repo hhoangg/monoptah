@@ -4,6 +4,7 @@ pub mod attachments;
 mod cloud_upgrade;
 #[cfg(test)]
 mod cloud_upgrade_tests;
+pub mod codespace_claude;
 pub mod host_info;
 pub mod host_release;
 pub mod host_upgrade;
@@ -54,6 +55,12 @@ pub struct Connections {
     upgrade_failures: Mutex<HashMap<String, String>>,
     /// How the Host upgrade reaches a machine (replaced in tests).
     runner: Mutex<Arc<dyn cloud_upgrade::CloudRunner>>,
+    /// Which app Claude account each codespace runs under; `None` until the app installs one,
+    /// which keeps every codespace on its Codespaces secret.
+    claude: Mutex<Option<Arc<dyn codespace_claude::CodespaceClaude>>>,
+    /// Codespace name to the fingerprint of the account its Host was last bootstrapped with
+    /// (memory only; a codespace not in it counts as bootstrapped without an account).
+    claude_delivered: Mutex<HashMap<String, Option<String>>>,
 }
 
 type WakeSlot = Arc<(Mutex<Option<Result<(), String>>>, Condvar)>;
@@ -91,7 +98,78 @@ impl Connections {
             upgrade_passes: Mutex::new(HashMap::new()),
             upgrade_failures: Mutex::new(HashMap::new()),
             runner: Mutex::new(Arc::new(cloud_upgrade::SshRunner)),
+            claude: Mutex::new(None),
+            claude_delivered: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Installs the source of the app Claude account of each codespace. Every codespace
+    /// bootstrap and Host upgrade resolves its account through it, so none of them can put a
+    /// Host back on the Codespaces secret.
+    pub fn set_codespace_claude(&self, resolver: Arc<dyn codespace_claude::CodespaceClaude>) {
+        *self
+            .claude
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(resolver);
+    }
+
+    fn codespace_claude(&self) -> Option<Arc<dyn codespace_claude::CodespaceClaude>> {
+        self.claude
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The credential a bootstrap or upgrade of `target` must carry: only a codespace has
+    /// one, and only when its project chooses an app account. Reads the sealed credential:
+    /// worker threads only.
+    pub(crate) fn claude_delivery_for(
+        &self,
+        target: &SshTarget,
+    ) -> Result<Option<codespace_claude::ClaudeDelivery>, String> {
+        let Some(name) = target.codespace.as_deref() else {
+            return Ok(None);
+        };
+        match self.codespace_claude() {
+            Some(resolver) => resolver.resolve(name),
+            None => Ok(None),
+        }
+    }
+
+    fn note_claude_delivered(&self, codespace: &str, fingerprint: Option<String>) {
+        self.claude_delivered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(codespace.to_owned(), fingerprint);
+    }
+
+    /// True when the account a connected codespace should run under differs from the one its
+    /// Host was last bootstrapped with and nothing runs on that Host (a running turn is never
+    /// restarted: the change then waits for the next ensure). `Err` when the chosen account
+    /// cannot be used.
+    fn claude_account_stale(&self, machine_id: &str) -> Result<bool, String> {
+        let Some(resolver) = self.codespace_claude() else {
+            return Ok(false);
+        };
+        let Some(name) = self
+            .stored_machine(machine_id)?
+            .and_then(|m| m.ssh)
+            .and_then(|t| t.codespace)
+        else {
+            return Ok(false);
+        };
+        let wanted = codespace_claude::fingerprint_of(resolver.resolve(&name)?.as_ref());
+        let delivered = self
+            .claude_delivered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&name)
+            .cloned()
+            .flatten();
+        if wanted == delivered {
+            return Ok(false);
+        }
+        Ok(!self.host_busy(machine_id).unwrap_or(true))
     }
 
     fn store_path(&self) -> PathBuf {
@@ -826,10 +904,15 @@ pub(crate) fn supported_remote_method(method: &str) -> bool {
 }
 
 /// Bootstrap script for a target: cloud targets track the token and install
-/// Claude; a sandbox has no per-start secret prelude yet.
-fn cloud_or_plain_bootstrap(target: &SshTarget, platform: ssh::HostPlatform) -> String {
+/// Claude. A codespace carries the app Claude account's `prelude` when its project chooses
+/// one; a sandbox has no per-start secret prelude here.
+fn cloud_or_plain_bootstrap(
+    target: &SshTarget,
+    platform: ssh::HostPlatform,
+    prelude: Option<&str>,
+) -> String {
     match (&target.codespace, &target.sandbox) {
-        (Some(_), _) => ssh::codespace_bootstrap_script(),
+        (Some(_), _) => ssh::codespace_bootstrap_script_with(prelude),
         (None, Some(_)) => ssh::sandbox_bootstrap_script(None),
         (None, None) => ssh::bootstrap_script(platform),
     }
@@ -897,10 +980,25 @@ impl Connections {
         }
         let state = self.clone();
         std::thread::spawn(move || {
+            // The codespace's app Claude account, resolved on this worker thread for EVERY
+            // bootstrap of it (a run without the prelude would put the Host back on the
+            // Codespaces secret). A chosen account that cannot be used fails the job, and no
+            // text the job reports carries the credential.
+            let resolved = state.claude_delivery_for(&target);
             let prepared = (|| -> Result<(StoredMachine, Tunnel, Value), String> {
                 let askpass = job.askpass()?;
                 let mut target = target;
                 let cloud = target.is_cloud();
+                let delivery = resolved.as_ref().map_err(Clone::clone)?;
+                let prelude = delivery.as_ref().map(|d| d.prelude.as_str());
+                let note_delivered = |target: &SshTarget| {
+                    if let Some(name) = &target.codespace {
+                        state.note_claude_delivered(
+                            name,
+                            codespace_claude::fingerprint_of(delivery.as_ref()),
+                        );
+                    }
+                };
                 let mut machine = if let Some(mut existing) = existing {
                     if upgrade || cloud {
                         // A codespace or sandbox may have stopped, which also stopped its
@@ -916,11 +1014,16 @@ impl Connections {
                             "Starting Monoptah Host on the codespace…"
                         });
                         let script = if upgrade {
-                            ssh::upgrade_script(platform, target.remote_port)
+                            let script = ssh::upgrade_script(platform, target.remote_port);
+                            match prelude.filter(|_| platform == ssh::HostPlatform::Unix) {
+                                Some(prelude) => format!("{prelude}\n{script}"),
+                                None => script,
+                            }
                         } else {
-                            cloud_or_plain_bootstrap(&target, platform)
+                            cloud_or_plain_bootstrap(&target, platform, prelude)
                         };
                         let output = ssh::run_script(&target, platform, script, &job, &askpass)?;
+                        note_delivered(&target);
                         let info: Value = serde_json::from_str(output.lines().last().unwrap_or(""))
                             .map_err(|_| "Host update returned an invalid response")?;
                         target.remote_port = info
@@ -940,10 +1043,11 @@ impl Connections {
                     let output = ssh::run_script(
                         &target,
                         platform,
-                        cloud_or_plain_bootstrap(&target, platform),
+                        cloud_or_plain_bootstrap(&target, platform, prelude),
                         &job,
                         &askpass,
                     )?;
+                    note_delivered(&target);
                     let info: Value = serde_json::from_str(output.lines().last().unwrap_or(""))
                         .map_err(|_| "Host setup returned an invalid response")?;
                     target.remote_port = info
@@ -1034,7 +1138,10 @@ impl Connections {
                         .collect();
                 }
                 Ok((machine, tunnel, descriptor))
-            })();
+            })()
+            .map_err(|error| {
+                codespace_claude::mask(&error, resolved.as_ref().ok().and_then(Option::as_ref))
+            });
             job.complete(|| {
                 let (machine, tunnel, descriptor) = prepared?;
                 let machine = state.commit_machine(machine, &descriptor)?;
@@ -1234,13 +1341,24 @@ impl Connections {
     ) -> Result<(), String> {
         self.run_coalesced(machine_id, cancel, progress, |progress| {
             let noun = match self.request(machine_id, "environment.describe", json!({})) {
-                Ok(_) => return Ok(()),
+                // Connected. Unless the project's Claude account changed since the Host was
+                // bootstrapped (and nothing runs on it): the next ensure applies it.
+                Ok(_) => {
+                    if !self.claude_account_stale(machine_id)? {
+                        return Ok(());
+                    }
+                    "Claude account"
+                }
                 Err(error) if error.starts_with("Codespace is not connected") => "codespace",
                 // Never wake a sandbox here (any ssh resumes and bills it, and the relay and
                 // credentials would not be restored): the caller shows the state.
                 Err(error) => return Err(error),
             };
-            progress(&format!("Waking {noun}…"));
+            progress(&if noun == "Claude account" {
+                "Applying the Claude account…".to_owned()
+            } else {
+                format!("Waking {noun}…")
+            });
             let job = self.start_when_free(cancel, JOB_SLOT_WAIT, || {
                 self.codespace_reconnect(machine_id)
             })?;

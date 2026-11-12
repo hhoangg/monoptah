@@ -371,9 +371,14 @@ fn the_new_session_flow_begins_a_start_and_lists_a_pending_claude_session() {
     let host = Arc::new(FakeHost::default());
     let store = memory_store();
     let svc = service(&gh, &host, store.clone());
-    let target =
-        cloud_picker::target_for(CodespaceChoice::New, " feature ", Some("basicLinux32gb"))
-            .unwrap();
+    let target = cloud_picker::target_for(
+        CodespaceChoice::New,
+        " feature ",
+        Some("basicLinux32gb"),
+        None,
+        false,
+    )
+    .unwrap();
     assert_eq!(target.branch.as_deref(), Some("feature"));
     let (summary, record) = cloud_picker::begin_cloud_start(&svc, &local, target, true).unwrap();
     assert_eq!(summary.provider, "claude");
@@ -403,12 +408,18 @@ fn an_existing_codespace_is_used_without_creating_and_a_new_one_needs_a_branch()
     let host = Arc::new(FakeHost::default());
     host.machines.lock().unwrap().push(machine("octo-abc"));
     let svc = service(&gh, &host, memory_store());
-    let target =
-        cloud_picker::target_for(CodespaceChoice::Named("octo-abc".into()), "", None).unwrap();
+    let target = cloud_picker::target_for(
+        CodespaceChoice::Named("octo-abc".into()),
+        "",
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     cloud_picker::begin_cloud_start(&svc, &local, target, true).unwrap();
     assert!(!gh.calls().iter().any(|c| c.contains("--method POST")));
     assert_eq!(
-        cloud_picker::target_for(CodespaceChoice::New, "  ", None).unwrap_err(),
+        cloud_picker::target_for(CodespaceChoice::New, "  ", None, None, false).unwrap_err(),
         "Enter a branch for the new codespace."
     );
 }
@@ -2289,7 +2300,8 @@ fn begin(
     checkout: &Checkout,
 ) -> (Session, monocode_core::cloud_sessions::StartRecord) {
     let local = checkout.path().to_string_lossy().into_owned();
-    let target = cloud_picker::target_for(CodespaceChoice::New, "feature", None).unwrap();
+    let target =
+        cloud_picker::target_for(CodespaceChoice::New, "feature", None, None, false).unwrap();
     cloud_picker::begin_cloud_start(svc, &local, target, true).unwrap()
 }
 
@@ -4371,6 +4383,8 @@ fn the_create_request_turns_the_panel_picks_into_begin_start_arguments() {
         branch: "release/1".into(),
         config: None,
         machine: machine.map(str::to_owned),
+        account: None,
+        account_pinned: false,
         prompt: None,
         kit: false,
         request_id: 1,

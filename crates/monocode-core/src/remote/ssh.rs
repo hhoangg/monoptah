@@ -1013,21 +1013,48 @@ fn sandbox_script_with(prelude: Option<&str>, extra: &str) -> String {
     }
 }
 
-/// Bootstrap for a codespace. Codespace user secrets (CLAUDE_CODE_OAUTH_TOKEN)
-/// reach the login shell's environment, and the host's agents only inherit what
-/// the host process itself was started with. The script restarts the host once
-/// when that token differs from the one the running host was started with
-/// (tracked as a hash, never the token itself).
+/// Bootstrap for a codespace without an app Claude account: the Codespaces secret
+/// (CLAUDE_CODE_OAUTH_TOKEN) reaches the login shell's environment, and the host's agents only
+/// inherit what the host process itself was started with. The script restarts the host once
+/// when that token differs from the one the running host was started with (tracked as a hash,
+/// never the token itself).
 pub fn codespace_bootstrap_script() -> String {
-    format!(
-        "MONOCODE_HOST_TRACK_TOKEN=1\nMONOCODE_HOST_INSTALL_CLAUDE=1\n{}",
-        bootstrap_script(HostPlatform::Unix)
-    )
+    codespace_bootstrap_script_with(None)
 }
 
-/// A step of the cloud Host upgrade in a codespace. Codespace secrets reach the login shell,
-/// so the restarted Host inherits the Claude token without a prelude.
+/// [`codespace_bootstrap_script`] for a project that chooses an app Claude account: the
+/// `prelude` ([`crate::cloud_sessions::docker_start::ClaudeAuth::prelude`]) is prepended
+/// verbatim, so it unsets the credential variables the login shell got from the Codespaces
+/// secret and exports the account's own. It reaches the codespace on stdin only. Without a
+/// prelude the script is exactly [`codespace_bootstrap_script`] (nothing changes for a project
+/// without an account).
+pub fn codespace_bootstrap_script_with(prelude: Option<&str>) -> String {
+    let script = format!(
+        "MONOCODE_HOST_TRACK_TOKEN=1\nMONOCODE_HOST_INSTALL_CLAUDE=1\n{}",
+        bootstrap_script(HostPlatform::Unix)
+    );
+    match prelude {
+        Some(prelude) => format!("{prelude}\n{script}"),
+        None => script,
+    }
+}
+
+/// A step of the cloud Host upgrade in a codespace without an app Claude account.
+#[cfg(test)]
 pub(crate) fn codespace_upgrade_script(
+    port: u16,
+    phase: UpgradePhase,
+    check: Option<SwapCheck<'_>>,
+) -> String {
+    codespace_upgrade_script_with(None, port, phase, check)
+}
+
+/// A step of the cloud Host upgrade in a codespace. Without a `prelude` the restarted Host
+/// inherits the Claude token of the Codespaces secret from the login shell; with one (a
+/// project that chooses an app Claude account) it is the SAME prelude the connect step uses,
+/// like a sandbox, so an upgrade never puts the Host back on the secret.
+pub(crate) fn codespace_upgrade_script_with(
+    prelude: Option<&str>,
     port: u16,
     phase: UpgradePhase,
     check: Option<SwapCheck<'_>>,
@@ -1038,9 +1065,16 @@ pub(crate) fn codespace_upgrade_script(
         codespace_bootstrap_script()
     );
     if phase == UpgradePhase::Swap {
-        swap_launcher(&script, check)
-    } else {
-        script
+        // The worker inherits the prelude's exports; it carries none itself.
+        let launcher = swap_launcher(&script, check);
+        return match prelude {
+            Some(prelude) => format!("{prelude}\n{launcher}"),
+            None => launcher,
+        };
+    }
+    match prelude {
+        Some(prelude) => format!("{prelude}\n{script}"),
+        None => script,
     }
 }
 
@@ -3646,6 +3680,44 @@ mod tests {
         target.sandbox.as_mut().unwrap().workspace = "/a;rm -rf /".into();
         assert!(check_target(&target).is_err());
     }
+    #[test]
+    fn a_codespace_script_with_a_prelude_starts_with_it_and_without_one_is_unchanged() {
+        const PRELUDE: &str = "unset ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN\nexport CLAUDE_CODE_OAUTH_TOKEN='sk-ant-oat01-x'\n";
+        let plain = format!(
+            "MONOCODE_HOST_TRACK_TOKEN=1\nMONOCODE_HOST_INSTALL_CLAUDE=1\n{}",
+            bootstrap_script(HostPlatform::Unix)
+        );
+        // Byte for byte what it was before accounts existed.
+        assert_eq!(codespace_bootstrap_script(), plain);
+        assert_eq!(codespace_bootstrap_script_with(None), plain);
+        let with = codespace_bootstrap_script_with(Some(PRELUDE));
+        assert_eq!(with, format!("{PRELUDE}\n{plain}"));
+        assert!(with.ends_with(&plain));
+        // The upgrade steps: the same prelude before every phase, the launcher included.
+        let check = SwapCheck {
+            device_token: "d",
+            environment_id: "e",
+            nonce: "n",
+        };
+        for phase in [
+            UpgradePhase::Stage,
+            UpgradePhase::Swap,
+            UpgradePhase::Discard,
+            UpgradePhase::Status,
+        ] {
+            let without = codespace_upgrade_script_with(None, 3774, phase, Some(check));
+            assert_eq!(
+                without,
+                codespace_upgrade_script(3774, phase, Some(check)),
+                "{phase:?}"
+            );
+            let with = codespace_upgrade_script_with(Some(PRELUDE), 3774, phase, Some(check));
+            assert_eq!(with, format!("{PRELUDE}\n{without}"), "{phase:?}");
+            // Only the prelude carries the secret: it is not part of any script without one.
+            assert!(!without.contains("sk-ant-oat01-x"), "{phase:?}");
+        }
+    }
+
     #[test]
     fn detached_flag_and_helpers_exist_only_in_the_sandbox_bootstrap() {
         let sandbox = sandbox_bootstrap_script(None);

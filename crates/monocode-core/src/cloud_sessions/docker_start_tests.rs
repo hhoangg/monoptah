@@ -603,6 +603,14 @@ fn fx_over(
     auth: Option<(&'static str, String)>,
     store: Arc<Mutex<Store>>,
 ) -> Fx {
+    fx_over_secrets(runner, sbx, Arc::new(Secrets { auth }), store)
+}
+fn fx_over_secrets(
+    runner: Arc<dyn SbxRunner>,
+    sbx: Arc<Sbx>,
+    secrets: Arc<dyn SandboxSecrets>,
+    store: Arc<Mutex<Store>>,
+) -> Fx {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join(".ssh/sandboxes")).unwrap();
     std::fs::write(
@@ -620,7 +628,7 @@ fn fx_over(
             |_| {},
             move || tick.fetch_add(1000, Ordering::SeqCst),
         )
-        .with_sandboxes(runner, shell.clone(), Arc::new(Secrets { auth }))
+        .with_sandboxes(runner, shell.clone(), secrets)
         .with_sandbox_home(home.path().to_path_buf());
     Fx {
         svc,
@@ -4866,5 +4874,205 @@ mod docker_accounts {
         assert_eq!(fx.shell.calls().len(), 2);
         assert!(only(shell_accounts(&fx), Some(&a)));
         drop(installed);
+    }
+}
+
+/// The Claude account of a sandbox: a per-session override is pinned and survives a reconnect,
+/// otherwise a reconnect follows the project's current choice.
+mod claude_pins {
+    use super::*;
+    use crate::cloud_sessions::claude_pin::{self, ClaudePin};
+    use crate::cloud_sessions::CloudRef;
+
+    const WORK_SECRET: &str = "sk-ant-oat01-work-secret-aaaa";
+    const OTHER_SECRET: &str = "sk-ant-oat01-other-secret-bbbb";
+
+    /// Gives each account its own token and remembers which accounts were asked for.
+    struct PerAccount {
+        asked: Mutex<Vec<Option<String>>>,
+    }
+    impl SandboxSecrets for PerAccount {
+        fn claude_auth(&self, account: Option<&str>) -> Result<Option<ClaudeAuth>, String> {
+            self.asked.lock().unwrap().push(account.map(str::to_owned));
+            Ok(match account {
+                Some("work") => Some(ClaudeAuth::new(
+                    "CLAUDE_CODE_OAUTH_TOKEN",
+                    WORK_SECRET.into(),
+                )),
+                Some("other") => Some(ClaudeAuth::new(
+                    "CLAUDE_CODE_OAUTH_TOKEN",
+                    OTHER_SECRET.into(),
+                )),
+                _ => None,
+            })
+        }
+        fn git_payload(&self, _: &str, _: &str) -> Result<Zeroizing<String>, String> {
+            Ok(Zeroizing::new(format!(
+                "protocol=https\nhost=github.com\npath=octo/widgets.git\nusername=me\npassword={GIT_TOKEN}\n\n"
+            )))
+        }
+    }
+
+    fn fx_per_account() -> (Fx, Arc<PerAccount>) {
+        let secrets = Arc::new(PerAccount {
+            asked: Mutex::new(vec![]),
+        });
+        let sbx = Sbx::new(CreateMode::Ok);
+        let fx = fx_over_secrets(
+            sbx.clone(),
+            sbx,
+            secrets.clone(),
+            Arc::new(Mutex::new(Store::open(Path::new(":memory:")).unwrap())),
+        );
+        (fx, secrets)
+    }
+    fn with_account(account: &str) -> DockerProjectConfig {
+        DockerProjectConfig {
+            claude_account: Some(account.into()),
+            ..config()
+        }
+    }
+    fn save_project(fx: &Fx, account: &str) {
+        super::super::docker_config::save(
+            &fx.store.lock().unwrap(),
+            "/Users/me/widgets",
+            &with_account(account),
+        )
+        .unwrap();
+    }
+    fn start(fx: &Fx, account: &str, pinned: bool) -> (i64, String) {
+        let (session, began) = fx
+            .svc
+            .begin_sandbox_start_pinned(
+                "/Users/me/widgets",
+                &with_account(account),
+                "fix/login",
+                "claude",
+                true,
+                pinned,
+            )
+            .unwrap();
+        fx.run(session.id).0.unwrap();
+        (session.id, began.sandbox.unwrap())
+    }
+    fn pin(fx: &Fx, name: &str) -> Option<ClaudePin> {
+        claude_pin::read(&fx.store.lock().unwrap(), &claude_pin::sandbox_key(name))
+    }
+    fn bootstrap_stdin(fx: &Fx) -> String {
+        fx.shell.call("bootstrap").stdin
+    }
+
+    #[test]
+    fn the_start_pins_the_account_before_the_sandbox_is_created() {
+        let (fx, _) = fx_per_account();
+        let (session, began) = fx
+            .svc
+            .begin_sandbox_start_pinned(
+                "/Users/me/widgets",
+                &with_account("other"),
+                "fix/login",
+                "claude",
+                true,
+                true,
+            )
+            .unwrap();
+        // begin has created the sandbox; the pin was written with the start record.
+        let name = began.sandbox.unwrap();
+        assert_eq!(
+            pin(&fx, &name),
+            Some(ClaudePin {
+                account: Some("other".into()),
+                pinned: true
+            })
+        );
+        assert!(
+            fx.record(session.id)
+                .unwrap()
+                .sandbox_start
+                .unwrap()
+                .claude_pinned,
+            "the pinned flag travels on the start record"
+        );
+        // An ordinary start follows the project default and says so.
+        let (_, plain) = fx
+            .svc
+            .begin_sandbox_start_pinned(
+                "/Users/me/widgets",
+                &with_account("work"),
+                "fix/other",
+                "claude",
+                true,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            pin(&fx, &plain.sandbox.unwrap()),
+            Some(ClaudePin {
+                account: Some("work".into()),
+                pinned: false
+            })
+        );
+    }
+
+    #[test]
+    fn a_pinned_override_survives_a_reconnect_even_when_the_project_says_otherwise() {
+        let (fx, secrets) = fx_per_account();
+        let (id, name) = start(&fx, "other", true);
+        save_project(&fx, "work");
+        fx.reset();
+        secrets.asked.lock().unwrap().clear();
+        fx.reconnect(id).0.unwrap();
+        let stdin = bootstrap_stdin(&fx);
+        assert!(stdin.contains(OTHER_SECRET) && !stdin.contains(WORK_SECRET));
+        assert_eq!(
+            secrets.asked.lock().unwrap().as_slice(),
+            [Some("other".to_owned())]
+        );
+        assert!(pin(&fx, &name).unwrap().pinned);
+        for call in fx.shell.calls() {
+            assert!(!call.remote.contains(OTHER_SECRET), "never in argv");
+        }
+    }
+
+    #[test]
+    fn an_unpinned_sandbox_follows_the_projects_current_choice_on_reconnect() {
+        let (fx, _) = fx_per_account();
+        let (id, _) = start(&fx, "work", false);
+        // Same account as the project: unchanged.
+        save_project(&fx, "work");
+        fx.reset();
+        fx.reconnect(id).0.unwrap();
+        assert!(bootstrap_stdin(&fx).contains(WORK_SECRET));
+        // The project switches: the next reconnect applies it.
+        save_project(&fx, "other");
+        fx.reset();
+        fx.reconnect(id).0.unwrap();
+        let stdin = bootstrap_stdin(&fx);
+        assert!(stdin.contains(OTHER_SECRET) && !stdin.contains(WORK_SECRET));
+    }
+
+    #[test]
+    fn a_sandbox_without_a_pin_uses_the_project_config_as_before() {
+        let (fx, _) = fx_per_account();
+        let (id, name) = start(&fx, "work", false);
+        claude_pin::clear(&fx.store.lock().unwrap(), &claude_pin::sandbox_key(&name)).unwrap();
+        assert_eq!(pin(&fx, &name), None);
+        save_project(&fx, "other");
+        fx.reset();
+        fx.reconnect(id).0.unwrap();
+        assert!(bootstrap_stdin(&fx).contains(OTHER_SECRET));
+    }
+
+    #[test]
+    fn deleting_the_sandbox_forgets_its_pin() {
+        let (fx, _) = fx_per_account();
+        let (_, name) = start(&fx, "other", true);
+        assert!(pin(&fx, &name).is_some());
+        fx.store
+            .lock()
+            .unwrap()
+            .forget_cloud(&CloudRef::sandbox(&name))
+            .unwrap();
+        assert_eq!(pin(&fx, &name), None);
     }
 }
