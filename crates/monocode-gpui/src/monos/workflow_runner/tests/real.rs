@@ -955,6 +955,8 @@ fn a_command_waits_on_a_thread_of_its_own_so_the_executor_stays_free(cx: &mut Te
     cx.executor().allow_parking();
     // `-c` with `/bin/sh`, never the user's login shell.
     let shell = std::env::var_os("SHELL");
+    // SAFETY: each test runs alone: locally with `--test-threads=1`, on CI as its own
+    // process under cargo-nextest, so no other test thread touches the environment.
     unsafe { std::env::set_var("SHELL", "/nonexistent/monoptah-test-shell") };
     let host = host_of(&s, cx);
     let slot = collect(
@@ -980,6 +982,7 @@ fn a_command_waits_on_a_thread_of_its_own_so_the_executor_stays_free(cx: &mut Te
     }
     let result = slot.borrow_mut().take().unwrap().unwrap();
     assert!(result.cancelled);
+    // SAFETY: as above.
     match shell {
         Some(old) => unsafe { std::env::set_var("SHELL", old) },
         None => unsafe { std::env::remove_var("SHELL") },

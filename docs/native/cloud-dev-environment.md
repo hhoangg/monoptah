@@ -71,7 +71,8 @@ cargo test   --locked --manifest-path $M -p monocode-gpui --profile native-dev -
 
 Core fmt/clippy/tests are what the `native.yml` core job runs on Linux. For GPUI, `native.yml`
 runs fmt, clippy `-D warnings` (`-p monocode-core -p monocode-gpui --all-targets`) and the GPUI
-tests (`-p monocode-gpui -- --test-threads=1`) on Linux; Windows keeps a `cargo check`. GPUI is
+tests on Linux (cargo-nextest, one process per test, 3 shards; the `cargo test ... --test-threads=1`
+above is the local equivalent); Windows keeps a `cargo check`. GPUI is
 supported on Linux by the source (X11 and Wayland features, `vendor/gpui-pre-linux`). Tests gated
 to macOS and clippy of the macOS-only code (`npm run native:check:mac`) stay Mac-only, and
 `npm run native:check` still runs in full before every release. Do not report macOS-only checks
