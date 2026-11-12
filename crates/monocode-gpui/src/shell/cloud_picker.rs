@@ -31,10 +31,16 @@ enum Picked {
 }
 
 /// Machine selected for a new codespace when the user does not choose.
-fn default_machine(machines: &[MachineType]) -> Option<String> {
+/// The project's own machine wins when the repository offers it.
+fn default_machine(machines: &[MachineType], preferred: Option<&str>) -> Option<String> {
     machines
         .iter()
-        .find(|m| m.name == codespaces::DEFAULT_MACHINE)
+        .find(|m| Some(m.name.as_str()) == preferred)
+        .or_else(|| {
+            machines
+                .iter()
+                .find(|m| m.name == codespaces::DEFAULT_MACHINE)
+        })
         .or_else(|| machines.first())
         .map(|m| m.name.clone())
 }
@@ -52,6 +58,8 @@ pub(super) fn target_for(
     Ok(Target {
         branch: (!branch.is_empty()).then(|| branch.to_owned()),
         machine: machine.map(str::to_owned),
+        idle_timeout_minutes: None,
+        devcontainer_path: None,
         codespace: choice,
     })
 }
@@ -131,8 +139,13 @@ impl CodespacePicker {
         local_project: String,
         cx: &mut Context<Self>,
     ) -> Self {
-        let current = crate::conversation::git_branch(std::path::Path::new(&local_project))
-            .unwrap_or_default();
+        let base = cloud.codespace_project_config(&local_project).base_ref;
+        let current = if base.is_empty() {
+            crate::conversation::git_branch(std::path::Path::new(&local_project))
+                .unwrap_or_default()
+        } else {
+            base
+        };
         let branch = cx.new(|cx| {
             let mut input = input::Input::field("Branch", "main", content(0.35), cx);
             input.set_font_size(12.);
@@ -180,7 +193,11 @@ impl CodespacePicker {
             let _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(listing) => {
-                        this.machine = default_machine(&listing.machines);
+                        let preferred = this
+                            .cloud
+                            .codespace_project_config(&this.local_project)
+                            .machine;
+                        this.machine = default_machine(&listing.machines, preferred.as_deref());
                         this.listing = Some(listing);
                     }
                     Err(error) => this.error = error,

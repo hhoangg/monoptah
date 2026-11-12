@@ -1029,6 +1029,8 @@ fn new_work_on_the_instance_is_refused_while_it_is_being_deleted() {
                 codespace: CodespaceChoice::Named("cs-1".into()),
                 branch: None,
                 machine: None,
+                idle_timeout_minutes: None,
+                devcontainer_path: None,
             },
             HARNESS,
         );
@@ -1038,6 +1040,8 @@ fn new_work_on_the_instance_is_refused_while_it_is_being_deleted() {
                 codespace: CodespaceChoice::Named("cs-1".into()),
                 branch: None,
                 machine: None,
+                idle_timeout_minutes: None,
+                devcontainer_path: None,
             },
             &mut |_| {},
         );

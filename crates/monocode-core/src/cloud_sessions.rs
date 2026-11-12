@@ -376,6 +376,12 @@ pub struct Target {
     pub branch: Option<String>,
     /// Machine type for a new codespace (default `basicLinux32gb`).
     pub machine: Option<String>,
+    /// Minutes before an idle new codespace stops; `None` fills from the project's cloud
+    /// settings, then the default of 30.
+    pub idle_timeout_minutes: Option<u32>,
+    /// Devcontainer path for a new codespace; `None` fills from the project's cloud settings,
+    /// then the repository default.
+    pub devcontainer_path: Option<String>,
 }
 
 /// A ready remote project bound to a codespace.
@@ -900,6 +906,19 @@ impl CloudSessions {
             .lock()
             .map_err(|_| "Native session store unavailable".into())
     }
+    /// The codespace part of the project's cloud settings; the defaults when none is saved
+    /// or the saved settings cannot be read (a start then behaves as before the settings
+    /// existed).
+    pub fn codespace_project_config(
+        &self,
+        local_cwd: &str,
+    ) -> project_cloud::CodespaceProjectConfig {
+        self.store()
+            .ok()
+            .and_then(|store| project_cloud::load(&store, local_cwd).ok())
+            .map(|p| p.codespace)
+            .unwrap_or_default()
+    }
     /// The registered backend for `kind`.
     pub(crate) fn backend(&self, kind: CloudBackendKind) -> Result<Arc<dyn CloudBackend>, String> {
         self.backends
@@ -1014,19 +1033,30 @@ impl CloudSessions {
                     .filter(|b| !b.is_empty())
                     .ok_or("A branch is required to create a codespace")?;
                 progress("Creating codespace");
-                let started = codespaces::create_started(
-                    &*self.gh,
-                    &repo,
-                    branch,
-                    target.machine.as_deref(),
-                    None,
-                )?;
+                // Whatever the caller left unset comes from the project's cloud settings.
+                let project = self.codespace_project_config(local_cwd);
                 let machine = target
                     .machine
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|m| !m.is_empty())
-                    .unwrap_or(codespaces::DEFAULT_MACHINE);
+                    .clone()
+                    .or(project.machine)
+                    .map(|m| m.trim().to_owned())
+                    .filter(|m| !m.is_empty());
+                let devcontainer = target
+                    .devcontainer_path
+                    .clone()
+                    .or(Some(project.devcontainer_path))
+                    .filter(|p| !p.trim().is_empty());
+                let options = codespaces::CreateOptions {
+                    machine: machine.as_deref(),
+                    idle_timeout_minutes: Some(
+                        target
+                            .idle_timeout_minutes
+                            .unwrap_or(project.idle_timeout_minutes),
+                    ),
+                    devcontainer_path: devcontainer.as_deref(),
+                };
+                let started = codespaces::create_started(&*self.gh, &repo, branch, &options, None)?;
+                let machine = machine.unwrap_or_else(|| codespaces::DEFAULT_MACHINE.to_owned());
                 Ok(ResolvedCodespace {
                     name: started.name,
                     display: codespaces::display_name_for(branch),
@@ -1036,7 +1066,7 @@ impl CloudSessions {
                     web_url: started.web_url,
                     state: started.state,
                     branch: Some(branch.to_string()),
-                    machine: Some(machine.to_string()),
+                    machine: Some(machine),
                 })
             }
             CodespaceChoice::Named(name) => {
@@ -1992,6 +2022,7 @@ pub mod move_out;
 #[path = "cloud_sessions/move.rs"]
 pub mod move_session;
 pub mod move_ui;
+pub mod project_cloud;
 pub use backend::{CloudBackend, CloudBackendKind, CloudRef, CodespacesBackend};
 
 mod continue_local;
@@ -2030,6 +2061,8 @@ mod move_out_tests;
 mod move_tests;
 #[cfg(test)]
 mod move_ui_tests;
+#[cfg(test)]
+mod project_cloud_tests;
 #[cfg(all(test, unix))]
 mod return_cleanup_tests;
 #[cfg(test)]

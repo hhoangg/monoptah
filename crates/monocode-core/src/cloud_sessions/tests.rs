@@ -150,6 +150,8 @@ fn named(name: &str) -> Target {
         codespace: CodespaceChoice::Named(name.into()),
         branch: None,
         machine: None,
+        idle_timeout_minutes: None,
+        devcontainer_path: None,
     }
 }
 use std::path::Path;
@@ -213,6 +215,8 @@ fn new_target_creates_waits_pairs_and_skips_the_extra_wake() {
                 codespace: CodespaceChoice::New,
                 branch: Some("main".into()),
                 machine: None,
+                idle_timeout_minutes: None,
+                devcontainer_path: None,
             },
             &mut |line| progress.push(line.to_string()),
         )
@@ -243,6 +247,8 @@ fn bad_targets_fail_before_touching_codespaces() {
                 codespace: CodespaceChoice::New,
                 branch: Some("  ".into()),
                 machine: None,
+                idle_timeout_minutes: None,
+                devcontainer_path: None,
             },
             &mut |_| {},
         )
@@ -511,6 +517,8 @@ fn new_codespaces_get_the_monoptah_display_name() {
             codespace: CodespaceChoice::New,
             branch: Some("main".into()),
             machine: None,
+            idle_timeout_minutes: None,
+            devcontainer_path: None,
         },
         &mut |_| {},
     )

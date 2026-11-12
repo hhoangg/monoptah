@@ -32,7 +32,7 @@ pub(crate) enum Event {
     /// Close the dialog. A running move goes on in the background.
     Close,
     /// The user confirmed. The only way a move starts.
-    Confirm(MoveTarget),
+    Confirm(Box<MoveTarget>),
     /// Continue at the failed step (or resume an interrupted move).
     Retry,
     /// Roll the move back. `delete_workspace` also deletes a workspace the move created.
@@ -410,7 +410,7 @@ impl MoveDialog {
         self.stage = Stage::Running;
         self.error = None;
         cx.notify();
-        cx.emit(Event::Confirm(target));
+        cx.emit(Event::Confirm(Box::new(target)));
     }
 
     pub(crate) fn retry(&mut self, cx: &mut Context<Self>) {

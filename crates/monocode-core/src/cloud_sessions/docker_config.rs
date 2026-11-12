@@ -35,6 +35,9 @@ pub struct DockerProjectConfig {
     pub ttl: String,
     pub platform: Option<String>,
     pub claude_account: Option<String>,
+    /// Id of a saved Docker account ([`crate::docker_accounts`]); `None` uses the machine's
+    /// `sbx login`.
+    pub docker_account: Option<String>,
 }
 impl Default for DockerProjectConfig {
     fn default() -> Self {
@@ -48,6 +51,7 @@ impl Default for DockerProjectConfig {
             ttl: DEFAULT_TTL.into(),
             platform: None,
             claude_account: None,
+            docker_account: None,
         }
     }
 }
@@ -74,6 +78,17 @@ fn path_chars(value: &str) -> bool {
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'-'))
+}
+/// A repository-relative devcontainer path such as `.devcontainer/devcontainer.json`.
+pub fn valid_devcontainer_path(path: &str) -> bool {
+    path_chars(path)
+        && path.len() <= 200
+        && !path.starts_with('/')
+        && !path.split('/').any(|part| matches!(part, "" | "." | ".."))
+}
+/// An account or credential id: ASCII letters, digits and `-`, at most 64 bytes.
+pub fn valid_account_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 /// A branch, tag or commit name under `git check-ref-format` rules.
 pub fn valid_ref(value: &str) -> bool {
@@ -125,6 +140,7 @@ impl DockerProjectConfig {
             &mut cfg.credential_id,
             &mut cfg.platform,
             &mut cfg.claude_account,
+            &mut cfg.docker_account,
         ] {
             *field = field
                 .take()
@@ -137,12 +153,7 @@ impl DockerProjectConfig {
         if !cfg.base_ref.is_empty() && !valid_ref(&cfg.base_ref) {
             return Err("The base branch contains invalid characters.".into());
         }
-        let path = &cfg.devcontainer_path;
-        if !path_chars(path)
-            || path.len() > 200
-            || path.starts_with('/')
-            || path.split('/').any(|part| matches!(part, "" | "." | ".."))
-        {
+        if !valid_devcontainer_path(&cfg.devcontainer_path) {
             return Err("The devcontainer path must be relative to the repository root.".into());
         }
         check_cpus(cfg.cpus)?;
@@ -159,8 +170,13 @@ impl DockerProjectConfig {
             }
         }
         if let Some(id) = &cfg.credential_id {
-            if !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') || id.len() > 64 {
+            if !valid_account_id(id) {
                 return Err("The Git credential reference is invalid.".into());
+            }
+        }
+        if let Some(id) = &cfg.docker_account {
+            if !valid_account_id(id) {
+                return Err("The Docker account reference is invalid.".into());
             }
         }
         Ok(cfg)
@@ -181,6 +197,12 @@ fn save_map(store: &Store, map: &BTreeMap<String, DockerProjectConfig>) -> Resul
         SETTING,
         &serde_json::to_string(map).map_err(|e| e.to_string())?,
     )
+}
+
+/// Every stored config by project cwd, as saved (not re-validated), so one stale entry never
+/// hides the others. An unreadable setting is an error.
+pub fn load_all(store: &Store) -> Result<BTreeMap<String, DockerProjectConfig>, String> {
+    load_map(store)
 }
 
 /// The config of the project at `cwd`, if one was saved. A stored config that

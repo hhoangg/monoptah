@@ -445,7 +445,7 @@ impl Shell {
     ) {
         match event {
             Event::Close => self.close_cloud_move_dialog(window, cx),
-            Event::Confirm(target) => self.confirm_cloud_move(id, target.clone(), cx),
+            Event::Confirm(target) => self.confirm_cloud_move(id, (**target).clone(), cx),
             Event::Retry => self.retry_cloud_move(id, cx),
             Event::CancelMove { delete_workspace } => {
                 self.cancel_cloud_move(id, *delete_workspace, cx)

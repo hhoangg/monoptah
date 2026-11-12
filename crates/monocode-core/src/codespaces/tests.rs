@@ -249,9 +249,14 @@ fn create_argv_defaults_and_progress() {
         stderr: "Creating codespace...\nStill working\n".into(),
     })]);
     let lines = RefCell::new(Vec::new());
-    let name = create(&fake, "hhoangg/monoptah", "main", None, None, &mut |l| {
-        lines.borrow_mut().push(l.to_string())
-    })
+    let name = create(
+        &fake,
+        "hhoangg/monoptah",
+        "main",
+        &CreateOptions::default(),
+        None,
+        &mut |l| lines.borrow_mut().push(l.to_string()),
+    )
     .unwrap();
     assert_eq!(name, "fuzzy-space-123");
     assert_eq!(
@@ -288,7 +293,10 @@ fn create_custom_machine_and_truncated_display() {
         &fake,
         "a/b",
         &branch,
-        Some("standardLinux32gb"),
+        &CreateOptions {
+            machine: Some("standardLinux32gb"),
+            ..Default::default()
+        },
         None,
         &mut |_| {},
     )
@@ -304,13 +312,37 @@ fn create_custom_machine_and_truncated_display() {
 fn create_failure_and_bad_output() {
     let fake = Fake::new(vec![fail("no such branch")]);
     assert_eq!(
-        create(&fake, "a/b", "x", None, None, &mut |_| {}).unwrap_err(),
+        create(
+            &fake,
+            "a/b",
+            "x",
+            &CreateOptions::default(),
+            None,
+            &mut |_| {}
+        )
+        .unwrap_err(),
         "no such branch"
     );
     let fake = Fake::new(vec![ok("")]);
-    assert!(create(&fake, "a/b", "x", None, None, &mut |_| {}).is_err());
+    assert!(create(
+        &fake,
+        "a/b",
+        "x",
+        &CreateOptions::default(),
+        None,
+        &mut |_| {}
+    )
+    .is_err());
     let fake = Fake::new(vec![]);
-    assert!(create(&fake, "bad repo", "x", None, None, &mut |_| {}).is_err());
+    assert!(create(
+        &fake,
+        "bad repo",
+        "x",
+        &CreateOptions::default(),
+        None,
+        &mut |_| {}
+    )
+    .is_err());
 }
 
 #[test]
@@ -1104,7 +1136,14 @@ const STARTED: &str = r#"{"name":"fuzzy-space-123","state":"Provisioning","web_u
 #[test]
 fn create_started_uses_the_rest_api_and_returns_the_name() {
     let fake = Fake::new(vec![ok(STARTED)]);
-    let started = create_started(&fake, "hhoangg/monoptah", "main", None, None).unwrap();
+    let started = create_started(
+        &fake,
+        "hhoangg/monoptah",
+        "main",
+        &CreateOptions::default(),
+        None,
+    )
+    .unwrap();
     assert_eq!(
         started,
         StartedCodespace {
@@ -1140,7 +1179,17 @@ fn create_started_uses_the_rest_api_and_returns_the_name() {
 fn create_started_custom_values_and_failures() {
     let fake = Fake::new(vec![ok(r#"{"name":"cs-1"}"#)]);
     let branch = "feature/".to_string() + &"x".repeat(80);
-    let started = create_started(&fake, "a/b", &branch, Some("standardLinux32gb"), None).unwrap();
+    let started = create_started(
+        &fake,
+        "a/b",
+        &branch,
+        &CreateOptions {
+            machine: Some("standardLinux32gb"),
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
     assert_eq!(started.state, "Provisioning");
     assert_eq!(started.web_url, None);
     let args = fake.argv(0);
@@ -1152,19 +1201,21 @@ fn create_started_custom_values_and_failures() {
     assert_eq!(display.chars().count(), "display_name=".len() + 48);
     // gh errors, bad JSON, a missing or unsafe name and bad input never reach the network.
     let fake = Fake::new(vec![fail("HTTP 422: no such branch")]);
-    assert!(create_started(&fake, "a/b", "x", None, None)
-        .unwrap_err()
-        .contains("no such branch"));
+    assert!(
+        create_started(&fake, "a/b", "x", &CreateOptions::default(), None)
+            .unwrap_err()
+            .contains("no such branch")
+    );
     for body in ["not json", "{}", r#"{"name":"a b; rm"}"#] {
         let fake = Fake::new(vec![ok(body)]);
         assert!(
-            create_started(&fake, "a/b", "x", None, None).is_err(),
+            create_started(&fake, "a/b", "x", &CreateOptions::default(), None).is_err(),
             "{body}"
         );
     }
     let fake = Fake::new(vec![]);
-    assert!(create_started(&fake, "bad repo", "x", None, None).is_err());
-    assert!(create_started(&fake, "a/b", "  ", None, None).is_err());
+    assert!(create_started(&fake, "bad repo", "x", &CreateOptions::default(), None).is_err());
+    assert!(create_started(&fake, "a/b", "  ", &CreateOptions::default(), None).is_err());
 }
 
 #[test]
@@ -1355,4 +1406,80 @@ fn parse_log_line_reads_real_creation_log_lines() {
             .at_ms,
         None
     );
+}
+
+fn opts(idle: Option<u32>, path: Option<&'static str>) -> CreateOptions<'static> {
+    CreateOptions {
+        machine: None,
+        idle_timeout_minutes: idle,
+        devcontainer_path: path,
+    }
+}
+
+#[test]
+fn create_cli_passes_idle_timeout_and_devcontainer_path_only_when_set() {
+    let fake = Fake::new(vec![ok("cs-1\n")]);
+    let options = opts(Some(120), Some(".devcontainer/web/devcontainer.json"));
+    create(&fake, "a/b", "x", &options, None, &mut |_| {}).unwrap();
+    let args = fake.argv(0);
+    let at = |flag: &str| args[args.iter().position(|a| a == flag).unwrap() + 1].clone();
+    assert_eq!(at("--idle-timeout"), "120m");
+    assert_eq!(
+        at("--devcontainer-path"),
+        ".devcontainer/web/devcontainer.json"
+    );
+    assert_eq!(at("--retention-period"), "72h");
+    let fake = Fake::new(vec![ok("cs-1\n")]);
+    create(
+        &fake,
+        "a/b",
+        "x",
+        &opts(None, Some("  ")),
+        None,
+        &mut |_| {},
+    )
+    .unwrap();
+    let args = fake.argv(0);
+    assert!(!args.contains(&"--devcontainer-path".to_string()));
+    assert_eq!(
+        args[args.iter().position(|a| a == "--idle-timeout").unwrap() + 1],
+        "30m"
+    );
+}
+
+#[test]
+fn create_started_passes_idle_timeout_and_devcontainer_path_only_when_set() {
+    let fake = Fake::new(vec![ok(r#"{"name":"cs-1"}"#)]);
+    let options = opts(Some(45), Some(".devcontainer.json"));
+    create_started(&fake, "a/b", "x", &options, None).unwrap();
+    let args = fake.argv(0);
+    assert!(args.contains(&"idle_timeout_minutes=45".to_string()));
+    assert!(!args.contains(&"idle_timeout_minutes=30".to_string()));
+    assert!(args.contains(&"devcontainer_path=.devcontainer.json".to_string()));
+    let fake = Fake::new(vec![ok(r#"{"name":"cs-1"}"#)]);
+    create_started(&fake, "a/b", "x", &CreateOptions::default(), None).unwrap();
+    let args = fake.argv(0);
+    assert!(args.contains(&"idle_timeout_minutes=30".to_string()));
+    assert!(!args.iter().any(|a| a.starts_with("devcontainer_path")));
+}
+
+#[test]
+fn create_rejects_out_of_range_idle_timeout_and_unsafe_devcontainer_path() {
+    let fake = Fake::new(vec![]);
+    for bad in [
+        opts(Some(4), None),
+        opts(Some(241), None),
+        opts(None, Some("../x")),
+        opts(None, Some("/etc/x")),
+        opts(None, Some("a b")),
+    ] {
+        assert!(
+            create(&fake, "a/b", "x", &bad, None, &mut |_| {}).is_err(),
+            "{bad:?}"
+        );
+        assert!(
+            create_started(&fake, "a/b", "x", &bad, None).is_err(),
+            "{bad:?}"
+        );
+    }
 }

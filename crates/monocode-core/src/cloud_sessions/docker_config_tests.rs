@@ -226,3 +226,37 @@ fn safe_refs_and_ids_are_accepted() {
     cfg.credential_id = Some("1b2c-3d".into());
     assert!(save(&store, "/p", &cfg).is_ok());
 }
+
+#[test]
+fn old_stored_json_loads_without_docker_account() {
+    let (_dir, store) = store();
+    store
+        .save_setting(
+            SETTING,
+            r#"{"/p":{"repoUrl":"https://github.com/o/r","claudeAccount":"acc-1","credentialId":"cred-1","cpus":4,"memory":"8g","ttl":"4h","baseRef":"main","devcontainerPath":".devcontainer.json"}}"#,
+        )
+        .unwrap();
+    let cfg = load(&store, "/p").unwrap().unwrap();
+    assert_eq!(cfg.docker_account, None);
+    assert_eq!(cfg.claude_account.as_deref(), Some("acc-1"));
+    assert_eq!(
+        (cfg.cpus, cfg.memory.as_str(), cfg.base_ref.as_str()),
+        (4, "8g", "main")
+    );
+}
+
+#[test]
+fn docker_account_is_trimmed_and_checked() {
+    let mut cfg = config();
+    cfg.docker_account = Some("  ".into());
+    assert_eq!(cfg.validated().unwrap().docker_account, None);
+    cfg.docker_account = Some(" acc-1 ".into());
+    assert_eq!(
+        cfg.validated().unwrap().docker_account.as_deref(),
+        Some("acc-1")
+    );
+    for bad in ["a/b", "a b", "a;b", &"x".repeat(65)] {
+        cfg.docker_account = Some(bad.into());
+        assert!(cfg.validated().is_err(), "{bad}");
+    }
+}

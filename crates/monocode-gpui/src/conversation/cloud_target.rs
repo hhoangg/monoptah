@@ -13,6 +13,7 @@ use super::*;
 use crate::docker_dialog::model::AccountChoice;
 use monocode_core::cloud_sessions::docker_config::{self, DockerProjectConfig};
 use monocode_core::cloud_sessions::kit::Workspace;
+use monocode_core::cloud_sessions::project_cloud::{self, CodespaceProjectConfig};
 use monocode_core::codespaces::MachineType;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -311,6 +312,26 @@ impl Conversation {
             .clone()
     }
 
+    /// The codespace part of the project's cloud settings (the defaults when none is saved).
+    fn codespace_project_config(&self) -> CodespaceProjectConfig {
+        locked(&self.store)
+            .ok()
+            .and_then(|store| project_cloud::load(&store, &self.summary.cwd).ok())
+            .map(|p| p.codespace)
+            .unwrap_or_default()
+    }
+
+    /// The branch a new codespace starts on: the project's base branch when set, else HEAD of
+    /// the project folder (empty while HEAD is detached).
+    fn codespace_default_branch(&self, config: &CodespaceProjectConfig) -> String {
+        if !config.base_ref.is_empty() {
+            return config.base_ref.clone();
+        }
+        git_head(Path::new(&self.summary.cwd))
+            .and_then(|(branch, detached)| (!detached).then_some(branch))
+            .unwrap_or_default()
+    }
+
     pub(super) fn forget_docker_config(&self) {
         self.docker_config_cache.take();
     }
@@ -394,12 +415,14 @@ impl Conversation {
             if target == CloudTarget::Codespace {
                 // The same reset for a codespace: no machine pick, the branch from HEAD again
                 // and a fresh listing.
-                draft.machine = None;
+                let project = self.codespace_project_config();
+                let head = self.codespace_default_branch(&project);
+                let Some(draft) = &mut self.cloud_draft else {
+                    return;
+                };
+                draft.machine = project.machine;
                 draft.machines = Machines::Loading;
                 let branch = draft.branch.clone();
-                let head = git_head(Path::new(&self.summary.cwd))
-                    .and_then(|(name, detached)| (!detached).then_some(name))
-                    .unwrap_or_default();
                 branch.update(cx, |field, cx| field.set_text(head, cx));
                 self.cloud_request_seq += 1;
                 let request = self.cloud_request_seq;
@@ -430,12 +453,11 @@ impl Conversation {
         let (cpus, memory, ttl, account, base_text) = config_defaults(config.as_ref());
         // Docker names a new feature branch; a codespace starts on the current branch of the
         // project folder (HEAD, as the header picker does), empty while HEAD is detached.
+        let codespace_config = self.codespace_project_config();
         let default = if docker {
             format!("monoptah/{}", short_id())
         } else {
-            git_head(Path::new(&self.summary.cwd))
-                .and_then(|(branch, detached)| (!detached).then_some(branch))
-                .unwrap_or_default()
+            self.codespace_default_branch(&codespace_config)
         };
         let branch = cx.new(|cx| {
             let mut field = input::Input::field(
@@ -494,7 +516,9 @@ impl Conversation {
             ttl,
             account,
             accounts,
-            machine: None,
+            machine: (!docker)
+                .then(|| codespace_config.machine.clone())
+                .flatten(),
             machines: if docker {
                 Machines::Failed
             } else {
@@ -676,6 +700,9 @@ impl Conversation {
             // Same source as the header picker unless the user typed another branch: HEAD of
             // the project folder (a worktree's branch would not exist on the remote).
             CloudTarget::Codespace if !typed.is_empty() => (typed, None),
+            CloudTarget::Codespace if !self.codespace_project_config().base_ref.is_empty() => {
+                (self.codespace_project_config().base_ref, None)
+            }
             CloudTarget::Codespace => match git_head(Path::new(&self.summary.cwd)) {
                 Some((_, true)) => {
                     fail(

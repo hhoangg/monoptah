@@ -104,6 +104,19 @@ impl CodespaceProvider {
         codespaces::auth_status(&*self.gh)?.require_codespace_scope()?;
         self.cloud.repo_for(project)
     }
+    /// The requested branch, else the project's cloud settings base branch, else the branch
+    /// checked out in the project folder.
+    fn default_branch(&self, project: &str, requested: Option<&str>) -> Result<String, String> {
+        if let Some(branch) = requested {
+            return Ok(branch.to_owned());
+        }
+        let base = self.cloud.codespace_project_config(project).base_ref;
+        if base.is_empty() {
+            current_branch(project, "codespace")
+        } else {
+            Ok(base)
+        }
+    }
     fn target(
         &self,
         project: &str,
@@ -119,15 +132,16 @@ impl CodespaceProvider {
                     codespace: CodespaceChoice::Named(name.into()),
                     branch: None,
                     machine: None,
+                    idle_timeout_minutes: None,
+                    devcontainer_path: None,
                 })
             }
             None => Ok(Target {
                 codespace: CodespaceChoice::New,
-                branch: Some(match option_text(options, "branch") {
-                    Some(branch) => branch.to_owned(),
-                    None => current_branch(project, "codespace")?,
-                }),
+                branch: Some(self.default_branch(project, option_text(options, "branch"))?),
                 machine: option_text(options, "machine").map(str::to_owned),
+                idle_timeout_minutes: None,
+                devcontainer_path: None,
             }),
         }
     }
@@ -213,15 +227,17 @@ impl CloudProvider for CodespaceProvider {
     ) -> Result<Value, String> {
         let repo = self.scoped_repo(project)?;
         let text = |key: &str| input.get(key).and_then(Value::as_str);
-        let branch = match text("branch") {
-            Some(branch) => branch.to_owned(),
-            None => current_branch(project, "codespace")?,
-        };
+        let branch = self.default_branch(project, text("branch"))?;
+        let config = self.cloud.codespace_project_config(project);
         let name = codespaces::create(
             &*self.gh,
             &repo,
             &branch,
-            text("machine"),
+            &codespaces::CreateOptions {
+                machine: text("machine").or(config.machine.as_deref()),
+                idle_timeout_minutes: Some(config.idle_timeout_minutes),
+                devcontainer_path: Some(config.devcontainer_path.as_str()),
+            },
             text("displayName"),
             progress,
         )?;

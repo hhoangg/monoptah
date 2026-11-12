@@ -175,6 +175,8 @@ impl Form {
             ttl: runtime.ttl.into(),
             platform: saved.and_then(|c| c.platform.clone()),
             claude_account: self.account.clone(),
+            // This dialog does not edit the Docker account; keep the saved one.
+            docker_account: saved.and_then(|c| c.docker_account.clone()),
         }
     }
 }

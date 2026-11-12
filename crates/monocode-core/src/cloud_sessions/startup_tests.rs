@@ -340,6 +340,8 @@ fn new_target() -> Target {
         codespace: CodespaceChoice::New,
         branch: Some("main".into()),
         machine: None,
+        idle_timeout_minutes: None,
+        devcontainer_path: None,
     }
 }
 fn named_target() -> Target {
@@ -347,6 +349,8 @@ fn named_target() -> Target {
         codespace: CodespaceChoice::Named("octo-abc".into()),
         branch: None,
         machine: None,
+        idle_timeout_minutes: None,
+        devcontainer_path: None,
     }
 }
 impl Fx {
@@ -615,6 +619,81 @@ fn begin_start_creates_the_pending_session_and_its_record_in_seconds() {
     assert!(store.remote_projects().unwrap().is_empty());
     assert_eq!(start_record(&store, session.id), Some(record.clone()));
     assert_eq!(pending_starts(&store), vec![record]);
+}
+
+fn create_call(f: &Fx) -> String {
+    f.gh.calls()
+        .into_iter()
+        .find(|c| c.starts_with("api --method POST"))
+        .unwrap()
+}
+
+#[test]
+fn a_start_without_project_cloud_settings_uses_the_defaults() {
+    let f = fx(Gh::new(&["Provisioning"], &[]));
+    f.svc.begin_start("/p", new_target(), "claude").unwrap();
+    let call = create_call(&f);
+    assert!(call.contains("machine=basicLinux32gb"), "{call}");
+    assert!(call.contains("idle_timeout_minutes=30"), "{call}");
+    assert!(!call.contains("devcontainer_path"), "{call}");
+}
+
+#[test]
+fn a_start_takes_machine_idle_timeout_and_devcontainer_from_the_project_settings() {
+    use super::project_cloud::{self, CodespaceProjectConfig, ProjectCloud};
+    let f = fx(Gh::new(&["Provisioning"], &[]));
+    project_cloud::save(
+        &f.store.lock().unwrap(),
+        "/p",
+        &ProjectCloud {
+            codespace: CodespaceProjectConfig {
+                machine: Some("standardLinux32gb".into()),
+                idle_timeout_minutes: 90,
+                devcontainer_path: ".devcontainer/web/devcontainer.json".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let (_, record) = f.svc.begin_start("/p", new_target(), "claude").unwrap();
+    let call = create_call(&f);
+    assert!(call.contains("machine=standardLinux32gb"), "{call}");
+    assert!(call.contains("idle_timeout_minutes=90"), "{call}");
+    assert!(
+        call.contains("devcontainer_path=.devcontainer/web/devcontainer.json"),
+        "{call}"
+    );
+    assert_eq!(record.machine.as_deref(), Some("standardLinux32gb"));
+    // The target's own values win over the project's.
+    let f2 = fx(Gh::new(&["Provisioning"], &[]));
+    project_cloud::save(
+        &f2.store.lock().unwrap(),
+        "/p",
+        &ProjectCloud {
+            codespace: CodespaceProjectConfig {
+                machine: Some("standardLinux32gb".into()),
+                idle_timeout_minutes: 90,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let target = Target {
+        machine: Some("premiumLinux".into()),
+        idle_timeout_minutes: Some(15),
+        devcontainer_path: Some(".devcontainer.json".into()),
+        ..new_target()
+    };
+    f2.svc.begin_start("/p", target, "claude").unwrap();
+    let call = create_call(&f2);
+    assert!(call.contains("machine=premiumLinux"), "{call}");
+    assert!(call.contains("idle_timeout_minutes=15"), "{call}");
+    assert!(
+        call.contains("devcontainer_path=.devcontainer.json"),
+        "{call}"
+    );
 }
 
 #[test]
