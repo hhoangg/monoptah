@@ -111,7 +111,7 @@ fn round_trip_add_list_get_replace_check_remove() {
         .unwrap();
     assert_eq!(replaced.id, added.id);
     assert_eq!(
-        f.accounts.secret(&added.id).unwrap().unwrap().1.as_str(),
+        f.accounts.secret(&added.id).unwrap().unwrap().2.as_str(),
         PAT2
     );
     let checked = f.accounts.check(&added.id, hub.as_ref()).unwrap();
@@ -196,10 +196,10 @@ fn input_validation() {
 #[test]
 fn rejected_and_missing_scope_and_network_at_add() {
     let f = fixture();
-    let rejected = FakeHub::new(Arc::new(|_, _, _| Err(ExchangeError::Rejected)));
+    let rejected = FakeHub::new(Arc::new(|_, _, _| Err(ExchangeError::Rejected(401))));
     assert_eq!(
         f.accounts.add("alice", PAT, rejected.as_ref()).unwrap_err(),
-        "Docker Hub rejected this Docker ID and token. Check both, and that the token is not revoked or expired."
+        "Wrong Docker ID or token, or the token is revoked or expired."
     );
     let no_scope = FakeHub::new(Arc::new(|_, _, _| {
         Ok(jwt_with(r#"{"scope":"repo:read","exp":9999999999}"#))
@@ -216,17 +216,22 @@ fn rejected_and_missing_scope_and_network_at_add() {
         "Could not reach Docker Hub (Dns Failed). Check your connection and try again."
     );
     let status = FakeHub::new(Arc::new(|_, _, _| Err(ExchangeError::Status(503))));
-    assert!(f
-        .accounts
-        .add("alice", PAT, status.as_ref())
-        .unwrap_err()
-        .contains("HTTP 503"));
+    assert_eq!(
+        f.accounts.add("alice", PAT, status.as_ref()).unwrap_err(),
+        "Docker Hub answered HTTP 503. Try again later."
+    );
     let malformed = FakeHub::new(Arc::new(|_, _, _| Ok("not-a-jwt".into())));
-    assert!(f
-        .accounts
-        .add("alice", PAT, malformed.as_ref())
-        .unwrap_err()
-        .contains("unexpected answer"));
+    assert_eq!(
+        f.accounts
+            .add("alice", PAT, malformed.as_ref())
+            .unwrap_err(),
+        "Docker Hub sent an unexpected answer. Try again later."
+    );
+    let unusable = FakeHub::new(Arc::new(|_, _, _| Err(ExchangeError::Malformed)));
+    assert_eq!(
+        f.accounts.add("alice", PAT, unusable.as_ref()).unwrap_err(),
+        "Docker Hub sent an unexpected answer. Try again later."
+    );
     assert!(f.accounts.list().unwrap().is_empty());
 }
 
@@ -239,12 +244,12 @@ fn replace_token_checks_input_and_scope_and_keeps_old_token_on_failure() {
         .accounts
         .replace_token(&a.id, "nope", hub.as_ref())
         .is_err());
-    let rejected = FakeHub::new(Arc::new(|_, _, _| Err(ExchangeError::Rejected)));
+    let rejected = FakeHub::new(Arc::new(|_, _, _| Err(ExchangeError::Rejected(401))));
     assert!(f
         .accounts
         .replace_token(&a.id, PAT2, rejected.as_ref())
         .is_err());
-    assert_eq!(f.accounts.secret(&a.id).unwrap().unwrap().1.as_str(), PAT);
+    assert_eq!(f.accounts.secret(&a.id).unwrap().unwrap().2.as_str(), PAT);
     assert_eq!(
         f.accounts
             .replace_token("missing", PAT2, hub.as_ref())
@@ -257,7 +262,7 @@ fn replace_token_checks_input_and_scope_and_keeps_old_token_on_failure() {
 fn check_updates_status_and_network_failure_keeps_it() {
     let f = fixture();
     let a = f.accounts.add("alice", PAT, ok_hub().as_ref()).unwrap();
-    let rejected = FakeHub::new(Arc::new(|_, _, _| Err(ExchangeError::Rejected)));
+    let rejected = FakeHub::new(Arc::new(|_, _, _| Err(ExchangeError::Rejected(401))));
     let after = f.accounts.check(&a.id, rejected.as_ref()).unwrap();
     assert_eq!(after.status, DockerAccountStatus::Revoked);
     assert_eq!(
@@ -284,6 +289,7 @@ fn check_updates_status_and_network_failure_keeps_it() {
     let after = f.accounts.check(&a.id, no_scope.as_ref()).unwrap();
     assert_eq!(after.status, DockerAccountStatus::MissingScope);
     assert_eq!(after.status.label(), "Missing Cloud Sandboxes access");
+    assert_eq!(DockerAccountStatus::Valid.label(), "Cloud Sandboxes access");
     let after = f.accounts.check(&a.id, ok_hub().as_ref()).unwrap();
     assert_eq!(after.status, DockerAccountStatus::Valid);
     assert_eq!(
@@ -387,7 +393,7 @@ fn access_token_errors_and_status_updates() {
     let f = fixture();
     let a = f.accounts.add("alice", PAT, ok_hub().as_ref()).unwrap();
     let now = now_at(1);
-    let hub = FakeHub::new(Arc::new(|_, _, _| Err(ExchangeError::Rejected)));
+    let hub = FakeHub::new(Arc::new(|_, _, _| Err(ExchangeError::Rejected(401))));
     let access = access(&f, hub.clone(), &now);
     let error = access.access_token(&a.id).unwrap_err();
     assert_eq!(
@@ -465,16 +471,21 @@ fn different_accounts_refresh_independently() {
     let ok = ok_hub();
     let a = f.accounts.add("alice", PAT, ok.as_ref()).unwrap();
     let b = f.accounts.add("bob", PAT2, ok.as_ref()).unwrap();
-    // Each exchange takes 80 ms; if one lock covered both accounts the pair would take
-    // 160 ms or more, so overlapping is observed through the peak concurrency.
-    let live = Arc::new(AtomicUsize::new(0));
-    let peak = Arc::new(AtomicUsize::new(0));
-    let (l, p) = (live.clone(), peak.clone());
+    // Each exchange waits until BOTH are inside the hub. If one lock covered both
+    // accounts the second could never arrive, the wait times out and the test fails.
+    let arrived = Arc::new((Mutex::new(0usize), std::sync::Condvar::new()));
+    let gate = arrived.clone();
     let hub = FakeHub::new(Arc::new(move |_, _, n| {
-        let now = l.fetch_add(1, Ordering::SeqCst) + 1;
-        p.fetch_max(now, Ordering::SeqCst);
-        std::thread::sleep(std::time::Duration::from_millis(80));
-        l.fetch_sub(1, Ordering::SeqCst);
+        let (count, cv) = &*gate;
+        let mut count = count.lock().unwrap();
+        *count += 1;
+        cv.notify_all();
+        let (count, wait) = cv
+            .wait_timeout_while(count, TIMEOUT, |count| *count < 2)
+            .unwrap();
+        if wait.timed_out() || *count < 2 {
+            return Err(ExchangeError::Network("not concurrent".into()));
+        }
         Ok(jwt(100_000, n as u64))
     }));
     let access = Arc::new(access(&f, hub.clone(), &now_at(1)));
@@ -482,14 +493,13 @@ fn different_accounts_refresh_independently() {
         .into_iter()
         .map(|id| {
             let access = access.clone();
-            std::thread::spawn(move || access.access_token(&id).unwrap())
+            std::thread::spawn(move || access.access_token(&id))
         })
         .collect();
     for h in handles {
-        h.join().unwrap();
+        h.join().unwrap().expect("both refreshes ran at once");
     }
     assert_eq!(hub.calls(), 2);
-    assert_eq!(peak.load(Ordering::SeqCst), 2, "exchanges overlapped");
 }
 
 #[test]
@@ -507,7 +517,7 @@ fn secrets_never_appear_in_errors_debug_or_the_database() {
 
     let mut texts = Vec::new();
     let failing: Vec<Arc<FakeHub>> = vec![
-        FakeHub::new(Arc::new(|_, _, _| Err(ExchangeError::Rejected))),
+        FakeHub::new(Arc::new(|_, _, _| Err(ExchangeError::Rejected(401)))),
         FakeHub::new(Arc::new(|_, _, _| {
             Err(ExchangeError::Network(format!("boom {PAT}")))
         })),
@@ -590,13 +600,312 @@ fn missing_database_or_table_is_empty_and_never_created() {
     assert_eq!(accounts.get("x").unwrap_err(), NOT_FOUND);
 }
 
+/// Serializes tests that touch the process-wide slot and restores it afterwards.
+static SHARED_LOCK: Mutex<()> = Mutex::new(());
+struct SharedGuard {
+    previous: Option<Arc<DockerAccess>>,
+    _lock: MutexGuard<'static, ()>,
+}
+impl SharedGuard {
+    fn install(access: Arc<DockerAccess>) -> Self {
+        let lock = lock(&SHARED_LOCK);
+        Self {
+            previous: replace_shared_for_test(Some(access)),
+            _lock: lock,
+        }
+    }
+}
+impl Drop for SharedGuard {
+    fn drop(&mut self) {
+        replace_shared_for_test(self.previous.take());
+    }
+}
+
 #[test]
 fn shared_slot_can_be_replaced() {
     let f = fixture();
     let one = Arc::new(access(&f, ok_hub(), &now_at(1)));
     let two = Arc::new(access(&f, ok_hub(), &now_at(1)));
-    install(one.clone());
+    let guard = SharedGuard::install(one.clone());
     assert!(Arc::ptr_eq(&shared().unwrap(), &one));
     install(two.clone());
     assert!(Arc::ptr_eq(&shared().unwrap(), &two));
+    let previous = guard.previous.clone();
+    drop(guard);
+    assert_eq!(
+        shared().map(|a| Arc::as_ptr(&a)),
+        previous.map(|a| Arc::as_ptr(&a)),
+        "the guard restores the earlier instance"
+    );
+}
+
+fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while !done() {
+        assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+        std::thread::yield_now();
+    }
+}
+const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn slot_of(access: &DockerAccess, id: &str) -> Arc<Slot> {
+    lock(&access.cache).get(id).cloned().expect("slot exists")
+}
+
+#[test]
+fn stale_rejection_does_not_overwrite_a_replaced_token_status() {
+    let f = fixture();
+    let a = f.accounts.add("alice", PAT, ok_hub().as_ref()).unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let started_tx = Mutex::new(started_tx);
+    let release_rx = Mutex::new(release_rx);
+    // The exchange of the OLD pat blocks until released, then answers "rejected".
+    let hub = FakeHub::new(Arc::new(move |_, pat, _| {
+        assert_eq!(pat, PAT);
+        started_tx.lock().unwrap().send(()).unwrap();
+        release_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(TIMEOUT)
+            .expect("released in time");
+        Err(ExchangeError::Rejected(401))
+    }));
+    let access = Arc::new(access(&f, hub, &now_at(1)));
+    let worker = {
+        let access = access.clone();
+        let id = a.id.clone();
+        std::thread::spawn(move || access.access_token(&id))
+    };
+    started_rx.recv_timeout(TIMEOUT).expect("exchange started");
+    let replaced = f
+        .accounts
+        .replace_token(&a.id, PAT2, ok_hub().as_ref())
+        .unwrap();
+    assert_eq!(replaced.status, DockerAccountStatus::Valid);
+    release_tx.send(()).unwrap();
+    assert!(matches!(
+        worker.join().unwrap(),
+        Err(DockerAuthError::Revoked { .. })
+    ));
+    assert_eq!(
+        f.accounts.get(&a.id).unwrap().status,
+        DockerAccountStatus::Valid,
+        "a stale rejection of the old token must not mark the new one revoked"
+    );
+}
+
+#[test]
+fn stale_check_result_does_not_overwrite_a_replaced_token_status() {
+    let f = fixture();
+    let a = f.accounts.add("alice", PAT, ok_hub().as_ref()).unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let started_tx = Mutex::new(started_tx);
+    let release_rx = Mutex::new(release_rx);
+    let hub = FakeHub::new(Arc::new(move |_, _, _| {
+        started_tx.lock().unwrap().send(()).unwrap();
+        release_rx.lock().unwrap().recv_timeout(TIMEOUT).unwrap();
+        Err(ExchangeError::Rejected(401))
+    }));
+    let accounts = Arc::new(DockerAccounts::at(f.database.clone()));
+    let worker = {
+        let (accounts, id) = (accounts.clone(), a.id.clone());
+        std::thread::spawn(move || accounts.check(&id, hub.as_ref()))
+    };
+    started_rx.recv_timeout(TIMEOUT).expect("check started");
+    f.accounts
+        .replace_token(&a.id, PAT2, ok_hub().as_ref())
+        .unwrap();
+    release_tx.send(()).unwrap();
+    worker.join().unwrap().unwrap();
+    assert_eq!(
+        f.accounts.get(&a.id).unwrap().status,
+        DockerAccountStatus::Valid
+    );
+}
+
+#[test]
+fn failures_are_coalesced_too() {
+    let f = fixture();
+    let a = f.accounts.add("alice", PAT, ok_hub().as_ref()).unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let started_tx = Mutex::new(started_tx);
+    let release_rx = Mutex::new(release_rx);
+    let hub = FakeHub::new(Arc::new(move |_, _, _| {
+        started_tx.lock().unwrap().send(()).unwrap();
+        release_rx.lock().unwrap().recv_timeout(TIMEOUT).unwrap();
+        Err(ExchangeError::Status(503))
+    }));
+    let access = Arc::new(access(&f, hub.clone(), &now_at(1)));
+    let spawn = |access: Arc<DockerAccess>, id: String| {
+        std::thread::spawn(move || access.access_token(&id))
+    };
+    let first = spawn(access.clone(), a.id.clone());
+    started_rx.recv_timeout(TIMEOUT).expect("exchange started");
+    let slot = slot_of(&access, &a.id);
+    let rest: Vec<_> = (0..4)
+        .map(|_| spawn(access.clone(), a.id.clone()))
+        .collect();
+    wait_until("four callers queued", || {
+        slot.queued.load(Ordering::SeqCst) == 4
+    });
+    release_tx.send(()).unwrap();
+    let mut results = vec![first.join().unwrap()];
+    results.extend(rest.into_iter().map(|h| h.join().unwrap()));
+    assert_eq!(hub.calls(), 1, "one exchange for the whole burst");
+    for result in results {
+        assert_eq!(
+            result.unwrap_err(),
+            DockerAuthError::Status {
+                docker_id: "alice".into(),
+                code: 503
+            }
+        );
+    }
+    // A caller arriving after the burst starts a new attempt.
+    release_tx.send(()).unwrap();
+    assert!(access.access_token(&a.id).is_err());
+    assert_eq!(hub.calls(), 2);
+}
+
+#[test]
+fn invalidate_forgets_a_remembered_failure() {
+    let f = fixture();
+    let a = f.accounts.add("alice", PAT, ok_hub().as_ref()).unwrap();
+    let hub = FakeHub::new(Arc::new(|_, _, _| Err(ExchangeError::Status(500))));
+    let access = access(&f, hub.clone(), &now_at(1));
+    assert!(access.access_token(&a.id).is_err());
+    access.invalidate(&a.id);
+    assert!(lock(&slot_of(&access, &a.id).state).last.is_none());
+    assert!(access.access_token(&a.id).is_err());
+    assert_eq!(hub.calls(), 2);
+}
+
+#[test]
+fn replace_token_and_remove_invalidate_the_shared_cache() {
+    let f = fixture();
+    let a = f.accounts.add("alice", PAT, ok_hub().as_ref()).unwrap();
+    let hub = ok_hub();
+    let access = Arc::new(access(&f, hub.clone(), &now_at(1)));
+    let _guard = SharedGuard::install(access.clone());
+    access.access_token(&a.id).unwrap();
+    let slot = slot_of(&access, &a.id);
+    assert!(lock(&slot.state).cached.is_some());
+    f.accounts
+        .replace_token(&a.id, PAT2, ok_hub().as_ref())
+        .unwrap();
+    assert!(lock(&slot.state).cached.is_none(), "replace drops the JWT");
+    access.access_token(&a.id).unwrap();
+    assert!(lock(&slot.state).cached.is_some());
+    f.accounts.remove(&a.id).unwrap();
+    assert!(lock(&slot.state).cached.is_none(), "remove drops the JWT");
+    assert_eq!(
+        access.access_token(&a.id).unwrap_err(),
+        DockerAuthError::UnknownAccount
+    );
+}
+
+#[test]
+fn a_cache_hit_never_outlives_a_removed_or_replaced_row() {
+    let f = fixture();
+    let a = f.accounts.add("alice", PAT, ok_hub().as_ref()).unwrap();
+    let hub = ok_hub();
+    // Not installed as the shared instance: only the row check can protect it.
+    let access = access(&f, hub.clone(), &now_at(1));
+    access.access_token(&a.id).unwrap();
+    access.access_token(&a.id).unwrap();
+    assert_eq!(hub.calls(), 1, "cache hit");
+    f.accounts
+        .replace_token(&a.id, PAT2, ok_hub().as_ref())
+        .unwrap();
+    access.access_token(&a.id).unwrap();
+    assert_eq!(hub.calls(), 2, "a replaced token is exchanged again");
+    f.accounts.remove(&a.id).unwrap();
+    assert_eq!(
+        access.access_token(&a.id).unwrap_err(),
+        DockerAuthError::UnknownAccount
+    );
+    assert_eq!(hub.calls(), 2);
+}
+
+#[test]
+fn error_copy_for_status_and_unexpected_answers() {
+    assert_eq!(ExchangeError::Rejected(401).detail(), "HTTP 401");
+    assert_eq!(ExchangeError::Rejected(403).detail(), "HTTP 403");
+    let f = fixture();
+    let a = f.accounts.add("alice", PAT, ok_hub().as_ref()).unwrap();
+    let status = FakeHub::new(Arc::new(|_, _, _| Err(ExchangeError::Status(502))));
+    assert_eq!(
+        f.accounts.check(&a.id, status.as_ref()).unwrap_err(),
+        "Docker Hub answered HTTP 502. Try again later."
+    );
+    let access = access(&f, status, &now_at(1));
+    assert_eq!(
+        access.access_token(&a.id).unwrap_err().to_string(),
+        "Docker account alice: Docker Hub answered HTTP 502. Try again later."
+    );
+    let junk = FakeHub::new(Arc::new(|_, _, _| Ok("junk".into())));
+    let error = DockerAccess::new(f.database.clone(), junk, clock(&now_at(1)))
+        .access_token(&a.id)
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Docker account alice: Docker Hub sent an unexpected answer. Try again later."
+    );
+    assert!(!matches!(error, DockerAuthError::Network { .. }));
+}
+
+#[test]
+fn a_concurrent_add_of_the_same_docker_id_hits_the_unique_index() {
+    let f = fixture();
+    let database = f.database.clone();
+    // While the exchange runs, another window adds the same Docker ID (other casing).
+    let hub = FakeHub::new(Arc::new(move |_, _, n| {
+        let conn = Connection::open(&database).unwrap();
+        conn.execute(
+            "INSERT INTO docker_accounts(id,docker_id,nonce,ciphertext,status,created_at)
+             VALUES('other','ALICE',x'00',x'00','valid',1)",
+            [],
+        )
+        .unwrap();
+        Ok(jwt(10_000, n as u64))
+    }));
+    let error = f.accounts.add("alice", PAT, hub.as_ref()).unwrap_err();
+    assert_eq!(
+        error,
+        "Docker account alice is already added; use Replace token."
+    );
+    assert_eq!(f.accounts.list().unwrap().len(), 1);
+
+    let conn = Connection::open(&f.database).unwrap();
+    let direct = conn.execute(
+        "INSERT INTO docker_accounts(id,docker_id,nonce,ciphertext,status,created_at)
+         VALUES('x','aLiCe',x'00',x'00','valid',1)",
+        [],
+    );
+    assert!(direct.is_err(), "the index is case-insensitive");
+}
+
+#[test]
+fn float_exp_is_accepted() {
+    let c = parse_claims(&jwt_with(
+        r#"{"scope":"sandbox:use","exp":1700000000.0,"iat":1699999000.5}"#,
+    ))
+    .unwrap();
+    assert_eq!((c.exp, c.iat), (Some(1_700_000_000), Some(1_699_999_000)));
+    let c = parse_claims(&jwt_with(r#"{"exp":-5.0,"iat":"x"}"#)).unwrap();
+    assert_eq!((c.exp, c.iat), (None, None));
+}
+
+#[test]
+fn the_token_reply_is_parsed_without_keeping_a_plain_copy() {
+    let reply: TokenReply = serde_json::from_str(r#"{"access_token":"abc.def.ghi"}"#).unwrap();
+    assert_eq!(
+        reply.access_token.unwrap().into_inner().as_str(),
+        "abc.def.ghi"
+    );
+    let none: TokenReply = serde_json::from_str("{}").unwrap();
+    assert!(none.access_token.is_none());
 }

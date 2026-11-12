@@ -11,8 +11,10 @@
 //!   (never decrypts), [`check`](DockerAccounts::check).
 //! * [`DockerHub`]: injectable HTTP exchange (PAT to JWT); [`SystemDockerHub`] is the real one.
 //! * [`DockerAccess`]: the process-wide in-memory JWT cache. [`DockerAccess::access_token`]
-//!   refreshes when less than 60 s remain and coalesces concurrent refreshes of one
-//!   account. [`install`] / [`shared`] hold the process-wide instance.
+//!   reuses a cached JWT only while MORE than 60 s remain (so it refreshes at 60 s or
+//!   fewer) and coalesces concurrent refreshes of one account, failures included. A cache
+//!   hit is checked against the stored row, so a removed or re-tokened account never
+//!   gets a stale JWT. [`install`] / [`shared`] hold the process-wide instance.
 //! * [`DockerClaims`] / [`parse_claims`]: the claims of a JWT we received.
 //!
 //! The PAT and the JWT are [`Secret`]s: they never appear in an error, in `Debug` output
@@ -25,20 +27,24 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 /// DDL for the Docker account table, shared with the native store schema.
 pub(crate) const DOCKER_ACCOUNTS_TABLE: &str = "CREATE TABLE IF NOT EXISTS docker_accounts(
   id TEXT PRIMARY KEY, docker_id TEXT NOT NULL, nonce BLOB NOT NULL,
   ciphertext BLOB NOT NULL, status TEXT NOT NULL, checked_at INTEGER,
-  expires_at INTEGER, created_at INTEGER NOT NULL);";
+  expires_at INTEGER, created_at INTEGER NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS docker_accounts_docker_id ON docker_accounts(lower(docker_id));";
 
 const UNAVAILABLE: &str = "Docker account storage is unavailable.";
 const NOT_FOUND: &str = "That Docker account no longer exists.";
-const REJECTED: &str = "Docker Hub rejected this Docker ID and token. Check both, and that the token is not revoked or expired.";
+const REJECTED: &str = "Wrong Docker ID or token, or the token is revoked or expired.";
+const UNEXPECTED: &str = "Docker Hub sent an unexpected answer. Try again later.";
 const NO_SCOPE: &str = "This token has no Cloud Sandboxes access. Create a token with \"Allow Cloud Sandboxes access\" ticked.";
 const TOKEN_URL: &str = "https://hub.docker.com/v2/auth/token";
-/// A cached JWT is refreshed when fewer seconds than this remain.
+/// A cached JWT is reused only while MORE than this many seconds remain; at this many
+/// or fewer it is exchanged again.
 const REFRESH_MARGIN_SECS: u64 = 60;
 
 // ---------------------------------------------------------------------------
@@ -48,8 +54,8 @@ const REFRESH_MARGIN_SECS: u64 = 60;
 /// Why a PAT to JWT exchange failed. Carries no secret and no response body.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExchangeError {
-    /// Docker Hub answered 401 or 403: wrong Docker ID or PAT, revoked or expired.
-    Rejected,
+    /// Docker Hub answered 401 or 403 (the code): wrong Docker ID or PAT, revoked or expired.
+    Rejected(u16),
     /// Any other HTTP status.
     Status(u16),
     /// The request did not complete (short, redacted detail).
@@ -61,8 +67,7 @@ impl ExchangeError {
     /// Short text for "Could not reach Docker Hub (<detail>)".
     fn detail(&self) -> String {
         match self {
-            Self::Rejected => "HTTP 401".into(),
-            Self::Status(code) => format!("HTTP {code}"),
+            Self::Rejected(code) | Self::Status(code) => format!("HTTP {code}"),
             Self::Network(detail) => {
                 let detail = crate::sandboxes::redact(detail);
                 detail.chars().take(80).collect()
@@ -96,7 +101,9 @@ impl DockerHub for SystemDockerHub {
             .send_string(&body);
         let response = match response {
             Ok(response) => response,
-            Err(ureq::Error::Status(401 | 403, _)) => return Err(ExchangeError::Rejected),
+            Err(ureq::Error::Status(code @ (401 | 403), _)) => {
+                return Err(ExchangeError::Rejected(code))
+            }
             Err(ureq::Error::Status(code, _)) => return Err(ExchangeError::Status(code)),
             // The kind alone: the transport message may repeat the URL.
             Err(ureq::Error::Transport(error)) => {
@@ -109,13 +116,32 @@ impl DockerHub for SystemDockerHub {
             .take(1 << 20)
             .read_to_string(&mut text)
             .map_err(|_| ExchangeError::Malformed)?;
-        let value: serde_json::Value =
+        let reply: TokenReply =
             serde_json::from_str(&text).map_err(|_| ExchangeError::Malformed)?;
-        match value.get("access_token").and_then(|v| v.as_str()) {
-            Some(token) if !token.is_empty() => Ok(Secret::new(token.to_owned())),
+        match reply.access_token {
+            Some(token) if !token.0.is_empty() => {
+                Ok(Secret::new(std::mem::take(&mut *token.into_inner())))
+            }
             _ => Err(ExchangeError::Malformed),
         }
     }
+}
+
+/// A JWT held in memory that is wiped on drop, for the parsed token reply.
+struct WipedToken(zeroize::Zeroizing<String>);
+impl WipedToken {
+    fn into_inner(self) -> zeroize::Zeroizing<String> {
+        self.0
+    }
+}
+impl<'de> Deserialize<'de> for WipedToken {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(|text| Self(zeroize::Zeroizing::new(text)))
+    }
+}
+#[derive(Deserialize)]
+struct TokenReply {
+    access_token: Option<WipedToken>,
 }
 
 // ---------------------------------------------------------------------------
@@ -146,12 +172,23 @@ pub fn parse_claims(jwt: &str) -> Option<DockerClaims> {
     let mut parts = jwt.split('.');
     let (_, payload) = (parts.next()?, parts.next()?);
     parts.next()?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload.trim_end_matches('='))
-        .ok()?;
+    let bytes = zeroize::Zeroizing::new(
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload.trim_end_matches('='))
+            .ok()?,
+    );
     let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     let object = value.as_object()?;
-    let number = |key: &str| object.get(key).and_then(|v| v.as_u64());
+    // Some issuers write NumericDate as a float (1700000000.0); accept it.
+    let number = |key: &str| {
+        let value = object.get(key)?;
+        value.as_u64().or_else(|| {
+            value
+                .as_f64()
+                .filter(|f| f.is_finite() && *f >= 0.0)
+                .map(|f| f as u64)
+        })
+    };
     let scopes = match object.get("scope") {
         Some(serde_json::Value::String(text)) => {
             text.split_whitespace().map(str::to_owned).collect()
@@ -209,7 +246,7 @@ impl DockerAccountStatus {
     /// UI text.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Valid => "Valid",
+            Self::Valid => "Cloud Sandboxes access",
             Self::Revoked => "Token revoked or expired",
             Self::MissingScope => "Missing Cloud Sandboxes access",
             Self::Unchecked => "Not checked yet",
@@ -274,6 +311,8 @@ enum Failure {
     Rejected,
     MissingScope,
     Network(String),
+    Status(u16),
+    Unexpected,
 }
 /// Exchange and require sandbox scope. The JWT is returned with its claims.
 fn exchange_checked(
@@ -282,11 +321,12 @@ fn exchange_checked(
     pat: &str,
 ) -> Result<(Secret, DockerClaims), Failure> {
     let jwt = hub.exchange(docker_id, pat).map_err(|error| match error {
-        ExchangeError::Rejected => Failure::Rejected,
-        other => Failure::Network(other.detail()),
+        ExchangeError::Rejected(_) => Failure::Rejected,
+        ExchangeError::Status(code) => Failure::Status(code),
+        ExchangeError::Malformed => Failure::Unexpected,
+        network @ ExchangeError::Network(_) => Failure::Network(network.detail()),
     })?;
-    let claims = parse_claims(jwt.as_str())
-        .ok_or_else(|| Failure::Network(ExchangeError::Malformed.detail()))?;
+    let claims = parse_claims(jwt.as_str()).ok_or(Failure::Unexpected)?;
     if !claims.has_sandbox_access() {
         return Err(Failure::MissingScope);
     }
@@ -299,6 +339,8 @@ fn failure_text(failure: Failure) -> String {
         Failure::Network(detail) => {
             format!("Could not reach Docker Hub ({detail}). Check your connection and try again.")
         }
+        Failure::Status(code) => format!("Docker Hub answered HTTP {code}. Try again later."),
+        Failure::Unexpected => UNEXPECTED.into(),
     }
 }
 
@@ -335,6 +377,10 @@ impl DockerAccounts {
         Ok(Some(conn))
     }
 
+    fn already_added(docker_id: &str) -> String {
+        format!("Docker account {docker_id} is already added; use Replace token.")
+    }
+
     fn duplicate(conn: &Connection, docker_id: &str) -> Result<(), String> {
         let found: Option<String> = conn
             .query_row(
@@ -345,9 +391,7 @@ impl DockerAccounts {
             .optional()
             .map_err(|_| UNAVAILABLE)?;
         if found.is_some() {
-            return Err(format!(
-                "Docker account {docker_id} is already added; use Replace token."
-            ));
+            return Err(Self::already_added(docker_id));
         }
         Ok(())
     }
@@ -367,7 +411,8 @@ impl DockerAccounts {
             .map_err(|_| UNAVAILABLE)?;
         Self::duplicate(&conn, &docker_id)?;
         exchange_checked(hub, &docker_id, pat.as_str()).map_err(failure_text)?;
-        Self::duplicate(&conn, &docker_id)?;
+        // No second duplicate check: the unique index on lower(docker_id) arbitrates a
+        // concurrent add that finished while the exchange was running.
         let id = crate::accounts::request_id();
         let (nonce, ciphertext) = sealed::seal(
             &self.database,
@@ -388,12 +433,19 @@ impl DockerAccounts {
                 now
             ],
         )
-        .map_err(|_| "Could not save the Docker account.")?;
+        .map_err(|error| match error {
+            rusqlite::Error::SqliteFailure(failure, _)
+                if failure.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                Self::already_added(&docker_id)
+            }
+            _ => "Could not save the Docker account.".to_owned(),
+        })?;
         self.get(&id)
     }
 
     /// Replace the token of an account, keeping its id. Same checks as [`add`](Self::add).
-    /// Callers should also drop the account's cached JWT ([`DockerAccess::invalidate`]).
+    /// Also drops the account's cached JWT in the shared [`DockerAccess`].
     pub fn replace_token(
         &self,
         id: &str,
@@ -424,6 +476,9 @@ impl DockerAccounts {
             .map_err(|_| "Could not save the Docker account.")?;
         if changed == 0 {
             return Err(NOT_FOUND.into());
+        }
+        if let Some(access) = shared() {
+            access.invalidate(id);
         }
         self.get(id)
     }
@@ -492,20 +547,46 @@ impl DockerAccounts {
         }
     }
 
-    /// Delete an account. Never decrypts, so a lost key cannot block removal.
+    /// Delete an account and drop its cached JWT in the shared [`DockerAccess`]. Never
+    /// decrypts, so a lost key cannot block removal.
     pub fn remove(&self, id: &str) -> Result<(), String> {
         let Some(conn) = self.open()? else {
             return Ok(());
         };
         match conn.execute("DELETE FROM docker_accounts WHERE id=?1", [id]) {
-            Ok(_) => Ok(()),
-            Err(e) if e.to_string().contains("no such table") => Ok(()),
-            Err(_) => Err("Could not remove the Docker account.".into()),
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("no such table") => {}
+            Err(_) => return Err("Could not remove the Docker account.".into()),
+        }
+        if let Some(access) = shared() {
+            access.invalidate(id);
+        }
+        Ok(())
+    }
+
+    /// The nonce of the stored token (it changes on every seal), `None` when the account
+    /// does not exist. Never decrypts.
+    fn nonce(&self, id: &str) -> Result<Option<Vec<u8>>, String> {
+        let Some(conn) = self.open()? else {
+            return Ok(None);
+        };
+        match conn
+            .query_row(
+                "SELECT nonce FROM docker_accounts WHERE id=?1",
+                [id],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+        {
+            Ok(found) => Ok(found),
+            Err(e) if e.to_string().contains("no such table") => Ok(None),
+            Err(_) => Err(UNAVAILABLE.into()),
         }
     }
 
-    /// The Docker ID and decrypted PAT, `None` when the account does not exist.
-    fn secret(&self, id: &str) -> Result<Option<(String, Secret)>, String> {
+    /// The Docker ID, the nonce of the stored token (identifies which token this is) and
+    /// the decrypted PAT; `None` when the account does not exist.
+    fn secret(&self, id: &str) -> Result<Option<(String, Vec<u8>, Secret)>, String> {
         let Some(conn) = self.open()? else {
             return Ok(None);
         };
@@ -535,21 +616,28 @@ impl DockerAccounts {
             &ciphertext,
         )
         .map_err(|_| "Could not read the saved Docker token. Replace it in Settings > Cloud.")?;
-        let pat = String::from_utf8(plain.to_vec()).map_err(|_| {
+        let pat = std::str::from_utf8(&plain).map_err(|_| {
             "Could not read the saved Docker token. Replace it in Settings > Cloud."
         })?;
-        Ok(Some((docker_id, Secret::new(pat))))
+        Ok(Some((docker_id, nonce, Secret::new(pat.to_owned()))))
     }
 
-    /// Persist a status and the check time. Failures are ignored by callers that
+    /// Persist a status and the check time, but only while the stored token is still the
+    /// one (`nonce`) that produced the answer: a slow answer about a replaced token must
+    /// not overwrite the status of the new one. Failures are ignored by callers that
     /// already have an answer for the user.
-    fn set_status(&self, id: &str, status: DockerAccountStatus) -> Result<(), String> {
+    fn set_status(
+        &self,
+        id: &str,
+        nonce: &[u8],
+        status: DockerAccountStatus,
+    ) -> Result<(), String> {
         let Some(conn) = self.open()? else {
             return Ok(());
         };
         conn.execute(
-            "UPDATE docker_accounts SET status=?2, checked_at=?3 WHERE id=?1",
-            params![id, status.as_str(), crate::time::now_ms() as i64],
+            "UPDATE docker_accounts SET status=?2, checked_at=?3 WHERE id=?1 AND nonce=?4",
+            params![id, status.as_str(), crate::time::now_ms() as i64, nonce],
         )
         .map(|_| ())
         .map_err(|_| UNAVAILABLE.into())
@@ -559,14 +647,14 @@ impl DockerAccounts {
     /// is a result (the returned summary carries the new status). A network failure keeps
     /// the stored status and returns the error.
     pub fn check(&self, id: &str, hub: &dyn DockerHub) -> Result<DockerAccountSummary, String> {
-        let (docker_id, pat) = self.secret(id)?.ok_or(NOT_FOUND)?;
+        let (docker_id, nonce, pat) = self.secret(id)?.ok_or(NOT_FOUND)?;
         let status = match exchange_checked(hub, &docker_id, pat.as_str()) {
             Ok(_) => DockerAccountStatus::Valid,
             Err(Failure::Rejected) => DockerAccountStatus::Revoked,
             Err(Failure::MissingScope) => DockerAccountStatus::MissingScope,
-            Err(network) => return Err(failure_text(network)),
+            Err(other) => return Err(failure_text(other)),
         };
-        self.set_status(id, status)?;
+        self.set_status(id, &nonce, status)?;
         self.get(id)
     }
 }
@@ -579,9 +667,25 @@ impl DockerAccounts {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DockerAuthError {
     UnknownAccount,
-    Revoked { docker_id: String },
-    MissingScope { docker_id: String },
-    Network { docker_id: String, detail: String },
+    Revoked {
+        docker_id: String,
+    },
+    MissingScope {
+        docker_id: String,
+    },
+    Network {
+        docker_id: String,
+        detail: String,
+    },
+    /// Docker Hub answered with another HTTP status.
+    Status {
+        docker_id: String,
+        code: u16,
+    },
+    /// Docker Hub's answer was not a usable token.
+    Unexpected {
+        docker_id: String,
+    },
     Storage(String),
 }
 impl std::fmt::Display for DockerAuthError {
@@ -602,6 +706,14 @@ impl std::fmt::Display for DockerAuthError {
                 f,
                 "Docker account {docker_id}: could not reach Docker Hub ({detail}). Check your connection and try again."
             ),
+            Self::Status { docker_id, code } => write!(
+                f,
+                "Docker account {docker_id}: Docker Hub answered HTTP {code}. Try again later."
+            ),
+            Self::Unexpected { docker_id } => write!(
+                f,
+                "Docker account {docker_id}: Docker Hub sent an unexpected answer. Try again later."
+            ),
             Self::Storage(text) => f.write_str(text),
         }
     }
@@ -617,6 +729,8 @@ pub fn system_clock() -> Clock {
 
 struct Cached {
     token: Secret,
+    /// Nonce of the stored token this JWT came from.
+    nonce: Vec<u8>,
     /// Seconds. A token without `exp` is stored as already expired (never reused).
     exp: u64,
 }
@@ -624,14 +738,40 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Copy of a token result (a `Secret` is not `Clone` on purpose).
+fn copy_result(result: &Result<Secret, DockerAuthError>) -> Result<Secret, DockerAuthError> {
+    match result {
+        Ok(token) => Ok(Secret::new(token.as_str().to_owned())),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+#[derive(Default)]
+struct SlotState {
+    cached: Option<Cached>,
+    /// The outcome of the latest finished attempt, handed to callers that were waiting
+    /// while it ran (failures included, so a failing hub is asked once per burst).
+    last: Option<Result<Secret, DockerAuthError>>,
+}
+/// One account's slot. `state` is locked across the exchange so concurrent refreshes of
+/// one account coalesce while other accounts proceed. `finished` counts finished attempts:
+/// a caller that read it before waiting and sees it grown after getting the lock takes the
+/// latest attempt's outcome instead of starting another exchange.
+#[derive(Default)]
+struct Slot {
+    finished: AtomicU64,
+    /// Callers between reading `finished` and holding the lock (lets tests wait for a
+    /// burst to queue up without sleeping).
+    queued: AtomicUsize,
+    state: Mutex<SlotState>,
+}
+
 /// Process-wide cache of Docker JWTs, one entry per account.
 pub struct DockerAccess {
     accounts: DockerAccounts,
     hub: Arc<dyn DockerHub>,
     clock: Clock,
-    /// Per-account slot; its lock is held across the exchange so concurrent refreshes of
-    /// one account coalesce while other accounts proceed.
-    cache: Mutex<HashMap<String, Arc<Mutex<Option<Cached>>>>>,
+    cache: Mutex<HashMap<String, Arc<Slot>>>,
 }
 impl DockerAccess {
     pub fn new(database: PathBuf, hub: Arc<dyn DockerHub>, clock: Clock) -> Self {
@@ -643,58 +783,85 @@ impl DockerAccess {
         }
     }
 
-    /// A JWT for `account_id`: cached while more than 60 s remain, otherwise exchanged
-    /// again. Updates the stored status (`valid`, `revoked`, `missing_scope`).
+    /// A JWT for `account_id`: reused while it has MORE than 60 s left and still belongs
+    /// to the stored token, otherwise exchanged again (so at 60 s or fewer it refreshes).
+    /// Updates the stored status (`valid`, `revoked`, `missing_scope`) of the token that
+    /// was checked.
     pub fn access_token(&self, account_id: &str) -> Result<Secret, DockerAuthError> {
         let slot = lock(&self.cache)
             .entry(account_id.to_owned())
             .or_default()
             .clone();
-        let mut cached = lock(&slot);
+        let seen = slot.finished.load(Ordering::SeqCst);
+        slot.queued.fetch_add(1, Ordering::SeqCst);
+        let mut state = lock(&slot.state);
+        slot.queued.fetch_sub(1, Ordering::SeqCst);
         let now = (self.clock)();
-        if let Some(entry) = cached.as_ref() {
-            if entry.exp > now.saturating_add(REFRESH_MARGIN_SECS) {
+        // The row may have been removed or re-tokened since the JWT was cached.
+        let stored = self
+            .accounts
+            .nonce(account_id)
+            .map_err(DockerAuthError::Storage)?
+            .ok_or_else(|| {
+                *state = SlotState::default();
+                DockerAuthError::UnknownAccount
+            })?;
+        if let Some(entry) = state.cached.as_ref() {
+            if entry.nonce == stored && entry.exp > now.saturating_add(REFRESH_MARGIN_SECS) {
                 return Ok(Secret::new(entry.token.as_str().to_owned()));
             }
         }
-        *cached = None;
-        let (docker_id, pat) = self
+        if slot.finished.load(Ordering::SeqCst) > seen {
+            if let Some(last) = state.last.as_ref() {
+                return copy_result(last);
+            }
+        }
+        state.cached = None;
+        let result = self.refresh(account_id, &mut state);
+        state.last = Some(copy_result(&result));
+        slot.finished.fetch_add(1, Ordering::SeqCst);
+        result
+    }
+
+    fn refresh(&self, account_id: &str, state: &mut SlotState) -> Result<Secret, DockerAuthError> {
+        let (docker_id, nonce, pat) = self
             .accounts
             .secret(account_id)
             .map_err(DockerAuthError::Storage)?
             .ok_or(DockerAuthError::UnknownAccount)?;
+        let mark = |status| {
+            let _ = self.accounts.set_status(account_id, &nonce, status);
+        };
         match exchange_checked(self.hub.as_ref(), &docker_id, pat.as_str()) {
             Ok((jwt, claims)) => {
-                let _ = self
-                    .accounts
-                    .set_status(account_id, DockerAccountStatus::Valid);
-                *cached = Some(Cached {
+                mark(DockerAccountStatus::Valid);
+                state.cached = Some(Cached {
                     token: Secret::new(jwt.as_str().to_owned()),
+                    nonce: nonce.clone(),
                     exp: claims.exp.unwrap_or(0),
                 });
                 Ok(jwt)
             }
             Err(Failure::Rejected) => {
-                let _ = self
-                    .accounts
-                    .set_status(account_id, DockerAccountStatus::Revoked);
+                mark(DockerAccountStatus::Revoked);
                 Err(DockerAuthError::Revoked { docker_id })
             }
             Err(Failure::MissingScope) => {
-                let _ = self
-                    .accounts
-                    .set_status(account_id, DockerAccountStatus::MissingScope);
+                mark(DockerAccountStatus::MissingScope);
                 Err(DockerAuthError::MissingScope { docker_id })
             }
             Err(Failure::Network(detail)) => Err(DockerAuthError::Network { docker_id, detail }),
+            Err(Failure::Status(code)) => Err(DockerAuthError::Status { docker_id, code }),
+            Err(Failure::Unexpected) => Err(DockerAuthError::Unexpected { docker_id }),
         }
     }
 
-    /// Drop the cached JWT of an account (after a rejection, token replacement or removal).
+    /// Drop the cached JWT and the remembered outcome of an account (after a rejection,
+    /// token replacement or removal), so the next call exchanges again.
     pub fn invalidate(&self, account_id: &str) {
         let slot = lock(&self.cache).get(account_id).cloned();
         if let Some(slot) = slot {
-            *lock(&slot) = None;
+            *lock(&slot.state) = SlotState::default();
         }
     }
 }
@@ -704,6 +871,16 @@ static SHARED: RwLock<Option<Arc<DockerAccess>>> = RwLock::new(None);
 /// Install the process-wide instance, replacing any earlier one (tests install fakes).
 pub fn install(access: Arc<DockerAccess>) {
     *SHARED.write().unwrap_or_else(|e| e.into_inner()) = Some(access);
+}
+/// Test-only: set (or clear) the process-wide instance, returning the previous one.
+#[cfg(test)]
+pub(crate) fn replace_shared_for_test(
+    access: Option<Arc<DockerAccess>>,
+) -> Option<Arc<DockerAccess>> {
+    std::mem::replace(
+        &mut *SHARED.write().unwrap_or_else(|e| e.into_inner()),
+        access,
+    )
 }
 /// The process-wide instance, if one was installed.
 pub fn shared() -> Option<Arc<DockerAccess>> {
