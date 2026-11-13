@@ -443,7 +443,7 @@ fn settings_match_react_dialog_and_left_navigation_geometry(cx: &mut TestAppCont
     );
     assert!((dialog.center().x - viewport.width / 2.).abs() <= px(1.));
     assert_eq!(nav.size.width, px(192.));
-    for section in ["General", "Soul", "Memory"] {
+    for section in ["General", "Soul", "Memory", "Emoji"] {
         let row = visual
             .debug_bounds(Box::leak(
                 format!("mono-settings-{section}").into_boxed_str(),

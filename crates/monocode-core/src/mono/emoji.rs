@@ -7,6 +7,8 @@
 
 pub mod import;
 pub mod sort;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod token;
 
 use serde::{Deserialize, Serialize};

@@ -23,6 +23,7 @@ pub(super) enum SettingsSection {
     General,
     Soul,
     Memory,
+    Emoji,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Route {
@@ -87,7 +88,7 @@ pub(super) fn button(
         .hover(|s| s.bg(content(0.08)).text_color(content(1.)))
         .child(label)
 }
-fn setting(label: &str, description: Option<&str>, control: AnyElement) -> Div {
+pub(super) fn setting(label: &str, description: Option<&str>, control: AnyElement) -> Div {
     div()
         .min_h(px(48.))
         .flex()
@@ -129,7 +130,12 @@ fn setting(label: &str, description: Option<&str>, control: AnyElement) -> Div {
                 .child(control),
         )
 }
-fn switch_setting(label: &str, description: &str, disabled: bool, control: AnyElement) -> Div {
+pub(super) fn switch_setting(
+    label: &str,
+    description: &str,
+    disabled: bool,
+    control: AnyElement,
+) -> Div {
     div()
         .flex()
         .items_center()
@@ -159,7 +165,32 @@ fn switch_setting(label: &str, description: &str, disabled: bool, control: AnyEl
         )
         .child(control)
 }
-fn heading(title: &str, description: Option<&str>) -> Div {
+/// The 36 x 20 switch every settings page draws; the caller adds the click.
+pub(super) fn switch_track(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<SharedString>,
+    on: bool,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .role(Role::Switch)
+        .aria_label(label)
+        .aria_selected(on)
+        .w(px(36.))
+        .h(px(20.))
+        .flex_shrink_0()
+        .rounded_full()
+        .bg(if on { accent_color() } else { content(0.2) })
+        .child(
+            div()
+                .size(px(16.))
+                .mt(px(2.))
+                .ml(px(if on { 18. } else { 2. }))
+                .rounded_full()
+                .bg(gpui::white()),
+        )
+}
+pub(super) fn heading(title: &str, description: Option<&str>) -> Div {
     div()
         .pt_7()
         .pb_2()
@@ -359,7 +390,7 @@ fn sub_agent_card(agent: SubAgent) -> Stateful<Div> {
             ),
     )
 }
-fn card() -> Div {
+pub(super) fn card() -> Div {
     div()
         .rounded_xl()
         .border_1()
@@ -1656,6 +1687,7 @@ impl Monos {
             SettingsSection::General => self.general_settings(mono, window, cx),
             SettingsSection::Soul => self.soul_page(mono, cx),
             SettingsSection::Memory => self.memory_page(mono, window, cx),
+            SettingsSection::Emoji => self.emoji_page(mono, window, cx),
         };
         self.bind_settings_blurs(window, cx);
         let weak = cx.weak_entity();
@@ -1740,6 +1772,7 @@ impl Monos {
                                             (SettingsSection::General, "General", "settings"),
                                             (SettingsSection::Soul, "Soul", "sparkles"),
                                             (SettingsSection::Memory, "Memory", "sticky-note"),
+                                            (SettingsSection::Emoji, "Emoji", "smile"),
                                         ]
                                         .into_iter()
                                         .map(
@@ -1812,6 +1845,9 @@ impl Monos {
                                                         move |this, _, window, cx| {
                                                             this.save_open_file(cx);
                                                             this.settings = Some(tab);
+                                                            if tab == SettingsSection::Emoji {
+                                                                this.open_emoji_page(cx);
+                                                            }
                                                             window.focus(&this.settings_focus, cx);
                                                             cx.notify();
                                                         },
@@ -2057,24 +2093,7 @@ impl Monos {
         change: fn(&mut Mono, bool),
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        div()
-            .id(id)
-            .role(Role::Switch)
-            .aria_label(id)
-            .aria_selected(on)
-            .w(px(36.))
-            .h(px(20.))
-            .flex_shrink_0()
-            .rounded_full()
-            .bg(if on { accent_color() } else { content(0.2) })
-            .child(
-                div()
-                    .size(px(16.))
-                    .mt(px(2.))
-                    .ml(px(if on { 18. } else { 2. }))
-                    .rounded_full()
-                    .bg(gpui::white()),
-            )
+        switch_track(id, id, on)
             .on_click(cx.listener(move |this, _, _, cx| {
                 if disabled {
                     return;

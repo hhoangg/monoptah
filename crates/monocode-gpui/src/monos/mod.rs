@@ -7,6 +7,10 @@ mod changes;
 mod cloud_tests;
 pub(crate) mod color_picker;
 mod dashboard;
+mod emoji_import;
+#[cfg(test)]
+mod emoji_tests;
+mod emoji_ui;
 mod files;
 mod filters;
 mod floating;
@@ -117,6 +121,10 @@ pub(crate) struct Monos {
     /// Monos a paired phone is resetting; there is no dialog to mark them busy.
     phone_resets: HashSet<String>,
     cleanup: reset::CleanupRunner,
+    /// Each Mono's emoji library as last loaded or edited, with its folder. The page edits it
+    /// in place; a chat that holds an older `Arc` keeps a stable snapshot.
+    emoji: HashMap<String, (PathBuf, std::sync::Arc<monocode_core::mono::emoji::Library>)>,
+    emoji_ui: emoji_ui::EmojiUi,
     notice_region: AnchorSlot,
     pub(crate) details: Entity<overview::Overview>,
     original_chrome: bool,
@@ -407,6 +415,8 @@ impl Monos {
             reset: None,
             phone_resets: HashSet::new(),
             cleanup: reset::default_cleanup(),
+            emoji: HashMap::new(),
+            emoji_ui: emoji_ui::EmojiUi::new(),
             notice_region,
             details,
             original_chrome: false,
@@ -786,6 +796,8 @@ impl Monos {
         let Some(mono) = self.roster.get(id).cloned() else {
             return;
         };
+        // The emoji library is read with the chat, so it can be handed to the chat.
+        self.load_emoji(id, false, cx);
         let store = self.store.clone();
         let prefs = self.prefs.clone();
         let id = id.to_string();
@@ -1827,6 +1839,8 @@ impl gpui::Render for Monos {
             )
             .children(self.settings_modal(&mono, window, cx))
             .children(self.reset_modal(window, cx))
+            .children(self.emoji_import_modal(window, cx))
+            .children(self.emoji_select_popover(cx))
             .children(self.picker_surface(cx))
             .children(self.options_surface(cx))
             .children(self.background_modal())
