@@ -1551,3 +1551,141 @@ fn scrolling_the_dialog_body_closes_the_open_list(cx: &mut TestAppContext) {
     assert_eq!(open_select_id(&window, visual), None);
     assert_eq!(children(&window, visual), (true, false), "the dialog stays");
 }
+
+/// Opens `select` before its data is read, loads the data with `load`, presses Enter and returns
+/// the (highlighted, checked) rows seen right after the load.
+fn enter_after_a_late_load(
+    window: &WindowHandle<Shell>,
+    visual: &mut VisualTestContext,
+    select: &'static str,
+    forget: fn(
+        &mut cloud_settings::CloudSettings,
+        &mut gpui::Context<cloud_settings::CloudSettings>,
+    ),
+    load: fn(&mut cloud_settings::CloudSettings, &mut gpui::Context<cloud_settings::CloudSettings>),
+) -> (Option<usize>, Option<usize>) {
+    let on_dialog = |visual: &mut VisualTestContext,
+                     f: fn(
+        &mut cloud_settings::CloudSettings,
+        &mut gpui::Context<cloud_settings::CloudSettings>,
+    )| {
+        window
+            .update(visual, |shell, _, cx| {
+                let view = shell.cloud_settings.as_ref().unwrap().view.clone();
+                view.update(cx, f);
+            })
+            .unwrap();
+    };
+    on_dialog(visual, forget);
+    visual.refresh().unwrap();
+    click(visual, select);
+    visual.refresh().unwrap();
+    on_dialog(visual, load);
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    let rows = dialog_state(window, visual, |d, cx| d.open_select_rows(cx))
+        .expect("the list stays open after the load");
+    visual.simulate_keystrokes("enter");
+    visual.run_until_parked();
+    assert_eq!(open_select_id(window, visual), None, "Enter picked a row");
+    rows
+}
+
+#[gpui::test]
+fn enter_in_a_docker_list_that_grew_keeps_the_checked_account(cx: &mut TestAppContext) {
+    let (window, _, _) = shell_with_fakes(cx);
+    open_sandbox_tab(&window, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    window
+        .update(visual, |shell, _, cx| {
+            let view = shell.cloud_settings.as_ref().unwrap().view.clone();
+            view.update(cx, |d, _| d.select_docker_account(Some("acct-2".into())));
+        })
+        .unwrap();
+    let (highlighted, checked) = enter_after_a_late_load(
+        &window,
+        visual,
+        "cloud-select-docker",
+        |d, cx| d.forget_docker_accounts(cx),
+        |d, cx| d.reload_docker_accounts(cx),
+    );
+    assert_eq!(checked, Some(2), "premise: the saved account is row 2");
+    assert_eq!(highlighted, checked, "the checked row is highlighted");
+    let account = dialog_state(&window, visual, |d, _| d.selected_docker_account());
+    assert_eq!(account.as_deref(), Some("acct-2"), "Enter kept the account");
+}
+
+#[gpui::test]
+fn enter_in_a_git_list_that_grew_keeps_the_checked_profile(cx: &mut TestAppContext) {
+    let (window, fixture, _) = shell_with_fakes(cx);
+    let credentials =
+        monocode_core::git_credentials::GitCredentials::for_store(&fixture.store.lock().unwrap())
+            .unwrap();
+    for label in ["Work A", "Work B"] {
+        credentials
+            .save(
+                label,
+                monocode_core::git_credentials::GitPlatform::GitHub,
+                "https://github.com",
+                "me",
+                "ghp_exampleTokenValue1234567890",
+            )
+            .unwrap();
+    }
+    drop(credentials);
+    open_sandbox_tab(&window, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    let ids = dialog_state(&window, visual, |d, _| d.saved_credential_ids());
+    assert_eq!(ids.len(), 2, "premise: both profiles are listed");
+    let chosen = ids[1].clone();
+    window
+        .update(visual, |shell, _, cx| {
+            let view = shell.cloud_settings.as_ref().unwrap().view.clone();
+            view.update(cx, |d, _| d.select_credential(Some(chosen)));
+        })
+        .unwrap();
+    let (highlighted, checked) = enter_after_a_late_load(
+        &window,
+        visual,
+        "cloud-select-git",
+        |d, cx| d.forget_credentials(cx),
+        |d, cx| d.reload_credentials(None, cx),
+    );
+    assert!(checked.is_some(), "premise: a profile row is checked");
+    assert_eq!(highlighted, checked, "the checked row is highlighted");
+    assert_eq!(chosen_credential(&window, visual), Some(ids[1].clone()));
+}
+
+#[gpui::test]
+fn scrolling_the_body_closes_the_list_and_the_field_keeps_the_keyboard(cx: &mut TestAppContext) {
+    let (window, _, _) = shell_with_fakes(cx);
+    open_sandbox_tab(&window, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    click(visual, "cloud-field-repo");
+    // Opened without a click: a click on the trigger would first move the keyboard to the
+    // dialog, and the list would then give it back there.
+    window
+        .update(visual, |shell, window, cx| {
+            let view = shell.cloud_settings.as_ref().unwrap().view.clone();
+            view.update(cx, |d, cx| d.toggle_select_id("size", window, cx));
+        })
+        .unwrap();
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    assert_eq!(open_select_id(&window, visual), Some("size"));
+    let at = bounds_of(visual, "cloud-segments").center();
+    visual.simulate_event(gpui::ScrollWheelEvent {
+        position: at,
+        delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-40.))),
+        ..Default::default()
+    });
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    assert_eq!(open_select_id(&window, visual), None);
+    visual.simulate_input("zz");
+    let text = dialog_state(&window, visual, |d, cx| d.text("repo", cx));
+    assert!(
+        text.contains("zz"),
+        "typing reached the Repository field: {text}"
+    );
+}

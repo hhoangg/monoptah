@@ -1072,10 +1072,14 @@ impl Menu {
             .unwrap_or_else(|| self.focus.clone())
     }
     pub(crate) fn select_value(mut self, value: &str) -> Self {
+        self.highlight_value(value);
+        self
+    }
+    /// Highlights the enabled action with id `value` (none when there is no such row).
+    pub(crate) fn highlight_value(&mut self, value: &str) {
         self.active = self.items.iter().position(|item| {
             matches!(item, MenuItem::Action(action) if action.id.as_ref() == value && !action.disabled)
         });
-        self
     }
     pub(crate) fn style(mut self, style: MenuStyle) -> Self {
         self.style = style;
@@ -1939,20 +1943,65 @@ impl<T: 'static> Choices<T> {
         }
     }
 
-    /// Replaces the rows of the open list (its options changed under it), keeping the
-    /// highlighted row when it is still there and starting on the checked one otherwise.
-    pub(crate) fn refresh(&self, choices: Vec<Choice<T>>, cx: &mut App) {
+    /// Replaces the rows of the open list (its options changed under it). The highlight follows
+    /// its VALUE to the new rows. It starts on the checked row (the first row when none is
+    /// checked), so when it is still there, or its value is gone, the new checked row gets it.
+    pub(crate) fn refresh(&self, choices: Vec<Choice<T>>, cx: &mut App)
+    where
+        T: PartialEq,
+    {
         let (items, values) = choice_items(choices);
         let checked = checked_id(&items);
-        *self.values.borrow_mut() = values;
+        let old = std::mem::replace(&mut *self.values.borrow_mut(), values);
+        let new = self.values.clone();
         self.menu.update(cx, |menu, cx| {
+            let first = menu
+                .items
+                .iter()
+                .position(|item| matches!(item, MenuItem::Action(a) if !a.disabled));
+            let old_default = menu
+                .items
+                .iter()
+                .position(|item| matches!(item, MenuItem::Action(a) if a.checked))
+                .or(first);
+            let moved = menu
+                .active
+                .filter(|&ix| Some(ix) != old_default)
+                .and_then(|ix| old.get(ix)?.as_ref())
+                .and_then(|value| new.borrow().iter().position(|v| v.as_ref() == Some(value)));
             menu.replace_items(items, cx);
-            if menu.active.is_none()
-                && let Some(ix) = checked.and_then(|id| id.parse::<usize>().ok())
-            {
-                menu.active = Some(ix);
+            match (moved, checked) {
+                (Some(ix), _) => menu.highlight_value(&ix.to_string()),
+                (None, Some(id)) => menu.highlight_value(&id),
+                (None, None) => menu.highlight_first(cx),
             }
+            cx.notify();
         });
+    }
+
+    /// Closes the list without emitting and gives the keyboard back to where it was when the
+    /// list opened. Dropping a `Choices` alone leaves focus on the closed list.
+    pub(crate) fn close(self, window: &mut Window, cx: &mut App) {
+        if let Some(handle) = self.release(cx) {
+            window.focus(&handle, cx);
+        }
+    }
+
+    /// Closes the list without emitting and hands back the focus it should return to, for
+    /// callers that have no window at hand.
+    pub(crate) fn release(self, cx: &mut App) -> Option<FocusHandle> {
+        self.menu.update(cx, |menu, _| menu.restore.take())
+    }
+
+    /// The highlighted row and the checked row of the open list (tests only).
+    #[cfg(test)]
+    pub(crate) fn highlight_and_checked(&self, cx: &App) -> (Option<usize>, Option<usize>) {
+        let menu = self.menu.read(cx);
+        let checked = menu
+            .items
+            .iter()
+            .position(|item| matches!(item, MenuItem::Action(a) if a.checked));
+        (menu.active, checked)
     }
 
     /// The list drawn under `anchor`, as wide as it was opened with. `priority` is where it

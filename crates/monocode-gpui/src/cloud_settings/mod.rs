@@ -200,10 +200,6 @@ impl Select {
         Self::Git,
     ];
 
-    fn index(self) -> usize {
-        self as usize
-    }
-
     fn id(self) -> &'static str {
         match self {
             Self::Default => "default",
@@ -340,6 +336,9 @@ pub(crate) struct CloudSettings {
     panel: Option<(Entity<GitCredentialPanel>, Subscription)>,
     /// Focus returns to the dialog on the next render (the panel that had it is gone).
     refocus: bool,
+    /// Focus returns here on the next render: where it was when a select's list opened, for
+    /// closes that have no window at hand.
+    restore_focus: Option<FocusHandle>,
     focus: FocusHandle,
     _events: Vec<Subscription>,
 }
@@ -515,6 +514,7 @@ impl CloudSettings {
             secrets: None,
             panel: None,
             refocus: false,
+            restore_focus: None,
             focus: cx.focus_handle(),
             _events: events,
         };
@@ -1352,9 +1352,7 @@ impl CloudSettings {
         window: Option<&Window>,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.open_select.take().is_some() {
-            // The list had the keyboard; the dialog takes it back on the next render.
-            self.refocus = true;
+        if self.release_select(cx) {
             cx.notify();
             return true;
         }
@@ -1488,6 +1486,53 @@ impl CloudSettings {
     #[cfg(test)]
     pub(crate) fn selected_credential(&self) -> Option<String> {
         self.form.sandbox.credential_id.clone()
+    }
+
+    /// The highlighted and the checked row of the open list (tests only).
+    #[cfg(test)]
+    pub(crate) fn open_select_rows(&self, cx: &App) -> Option<(Option<usize>, Option<usize>)> {
+        self.open_select
+            .as_ref()
+            .map(|open| open.choices.highlight_and_checked(cx))
+    }
+
+    /// Opens or closes the list of the select `id` as its trigger does, but without the click
+    /// (a click on the trigger moves the keyboard to the dialog before the list opens).
+    #[cfg(test)]
+    pub(crate) fn toggle_select_id(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let which = Select::ALL
+            .into_iter()
+            .find(|s| s.id() == id)
+            .expect("a select id");
+        self.toggle_select(which, window, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selected_docker_account(&self) -> Option<String> {
+        self.form.sandbox.docker_account.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn select_docker_account(&mut self, account: Option<String>) {
+        self.form.sandbox.docker_account = account;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn select_credential(&mut self, id: Option<String>) {
+        self.form.sandbox.credential_id = id;
+    }
+
+    /// Back to before the saved Git credentials were read (tests only).
+    #[cfg(test)]
+    pub(crate) fn forget_credentials(&mut self, cx: &mut Context<Self>) {
+        self.credentials.clear();
+        self.refresh_open_select(cx);
+        cx.notify();
     }
 
     /// A select's list is open.
@@ -1644,8 +1689,9 @@ impl CloudSettings {
     /// nothing in the form.
     fn toggle_select(&mut self, which: Select, window: &mut Window, cx: &mut Context<Self>) {
         if self.open_select.as_ref().is_some_and(|o| o.which == which) {
-            self.open_select = None;
-            self.refocus = true;
+            if let Some(open) = self.open_select.take() {
+                open.choices.close(window, cx);
+            }
             cx.notify();
             return;
         }
@@ -1655,7 +1701,7 @@ impl CloudSettings {
             cx.notify();
             return;
         }
-        let width = self.select_anchors[which.index()]
+        let width = self.select_anchors[which as usize]
             .get()
             .map_or(220., |bounds| bounds.size.width.as_f32());
         let choices = Self::choices(options);
@@ -1697,19 +1743,32 @@ impl CloudSettings {
         };
         let options = self.options(which, cx);
         if options.is_empty() {
-            self.open_select = None;
-            self.refocus = true;
+            self.release_select(cx);
         } else if let Some(open) = &self.open_select {
             open.choices.refresh(Self::choices(options), cx);
         }
         cx.notify();
     }
 
+    /// Closes the open select's list, if any, without a window at hand: focus goes back to
+    /// where it was when the list opened on the next render (to the dialog when nothing was
+    /// focused then). True when a list was open.
+    fn release_select(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(open) = self.open_select.take() else {
+            return false;
+        };
+        match open.choices.release(cx) {
+            Some(handle) => self.restore_focus = Some(handle),
+            None => self.refocus = true,
+        }
+        true
+    }
+
     /// The open select's list, drawn above the dialog (see [`SELECT_PRIORITY`]).
     fn select_popover(&self, cx: &App) -> Option<Popover> {
         let open = self.open_select.as_ref()?;
         Some(open.choices.popover(
-            &self.select_anchors[open.which.index()],
+            &self.select_anchors[open.which as usize],
             SELECT_PRIORITY,
             cx,
         ))
@@ -1748,7 +1807,7 @@ impl CloudSettings {
                 .on_click(
                     cx.listener(move |this, _, window, cx| this.toggle_select(which, window, cx)),
                 )
-                .child(self.select_anchors[which.index()].probe())
+                .child(self.select_anchors[which as usize].probe())
                 .child(div().min_w_0().truncate().child(current))
                 .child(
                     div()
@@ -2282,7 +2341,10 @@ impl Render for CloudSettings {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let height = window.viewport_size().height.as_f32() - 34.;
         let backend = self.tab;
-        if std::mem::take(&mut self.refocus) {
+        if let Some(handle) = self.restore_focus.take() {
+            self.refocus = false;
+            window.focus(&handle, cx);
+        } else if std::mem::take(&mut self.refocus) {
             window.focus(&self.focus, cx);
         }
         let default_select = {
@@ -2323,9 +2385,9 @@ impl Render for CloudSettings {
             .overflow_y_scroll()
             // The list is placed against its trigger once; scrolling would leave it over the
             // header or footer, so it closes (the scroll itself goes on).
-            .on_scroll_wheel(cx.listener(|this, _: &gpui::ScrollWheelEvent, _, cx| {
-                if this.open_select.take().is_some() {
-                    this.refocus = true;
+            .on_scroll_wheel(cx.listener(|this, _: &gpui::ScrollWheelEvent, window, cx| {
+                if let Some(open) = this.open_select.take() {
+                    open.choices.close(window, cx);
                     cx.notify();
                 }
             }))
