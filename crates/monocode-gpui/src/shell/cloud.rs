@@ -996,6 +996,7 @@ impl Shell {
         self.cloud_marks = snapshot.marks;
         self.cloud_states = snapshot.states;
         self.sync_cloud_stopped(cx);
+        self.sync_auto_stopping(cx);
         self.sync_cloud_location(cx);
         if changed {
             self.invalidate_chrome(cx);

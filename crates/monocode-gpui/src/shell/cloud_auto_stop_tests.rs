@@ -5,7 +5,7 @@ use super::cloud::CloudMark;
 use super::*;
 use gpui::TestAppContext;
 use monocode_core::{
-    cloud_sessions::{CloudBackendKind, CloudSessions, CloudState, Host},
+    cloud_sessions::{CloudBackendKind, CloudRef, CloudSessions, CloudState, Host},
     codespaces::{GhOutput, GhRunner},
     remote::Machine,
     store::Session,
@@ -781,4 +781,134 @@ fn a_panel_shell_the_app_opened_holds_the_workspace_only_once_it_is_typed_in(
         check_at(window, minute, cx);
     }
     assert_eq!(gh.stops(), 0);
+}
+
+#[gpui::test]
+fn a_conversation_opened_while_the_workspace_is_being_stopped_is_locked_too(
+    cx: &mut TestAppContext,
+) {
+    let (window, _, gh) = world(cx, "Available", Some(10));
+    let live = live_view(window, cx);
+    check_at(window, 0, cx);
+    window
+        .update(cx, |shell, _, cx| {
+            // The conversation was not open when the stop began (history, a tab restored later).
+            shell.sessions.remove(&live);
+            shell.auto_stop_epoch = std::time::Instant::now() - Duration::from_secs(11 * 60);
+            shell.check_auto_stop(cx);
+            assert!(shell.auto_stop_running.contains(CODESPACE));
+            // Opened now, a few seconds into the stop.
+            let view = shell.ensure_session(live, cx).expect("opens");
+            assert!(view.read(cx).auto_stopping, "locked as it opens");
+            assert!(view.update(cx, |v, cx| v.refuse_while_saving_copy(cx)));
+            let sent = view.update(cx, |v, cx| v.mono_external_send("hi".into(), false, cx));
+            assert_eq!(sent, Err(crate::conversation::AUTO_STOPPING.to_owned()));
+        })
+        .unwrap();
+    assert_eq!(gh.stops(), 0, "the worker has not run yet");
+    cx.run_until_parked();
+    assert_eq!(gh.stops(), 1);
+    window
+        .update(cx, |shell, _, cx| {
+            let view = shell.sessions[&live].clone();
+            assert!(!view.read(cx).auto_stopping, "released with the others");
+            assert!(!view.update(cx, |v, cx| v.refuse_while_saving_copy(cx)));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_session_marked_as_cloud_during_the_stop_is_locked_when_the_marks_are_applied(
+    cx: &mut TestAppContext,
+) {
+    let (window, _, _) = world(cx, "Available", Some(10));
+    let live = live_view(window, cx);
+    check_at(window, 0, cx);
+    window
+        .update(cx, |shell, _, cx| {
+            shell.auto_stop_epoch = std::time::Instant::now() - Duration::from_secs(11 * 60);
+            shell.check_auto_stop(cx);
+            assert!(shell.sessions[&live].read(cx).auto_stopping);
+            // An open conversation the marks did not know as cloud yet: not locked...
+            let mark = shell.cloud_marks.remove(&live).unwrap();
+            shell.sync_auto_stopping(cx);
+            assert!(!shell.sessions[&live].read(cx).auto_stopping);
+            // ...and locked as soon as a refresh marks it as a session of the stopping workspace.
+            shell.cloud_marks.insert(live, mark);
+            shell.sync_auto_stopping(cx);
+            assert!(shell.sessions[&live].read(cx).auto_stopping);
+        })
+        .unwrap();
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn a_new_session_on_the_workspace_being_stopped_is_refused_and_nothing_is_created(
+    cx: &mut TestAppContext,
+) {
+    use monocode_core::mono::cloud_api::{CloudTarget, InstanceChoice};
+    let (window, _, gh) = world(cx, "Available", Some(10));
+    let live = live_view(window, cx);
+    let named = |name: &str| {
+        CloudTarget::new(
+            CloudBackendKind::Codespaces,
+            InstanceChoice::Named(name.into()),
+        )
+    };
+    check_at(window, 0, cx);
+    window
+        .update(cx, |shell, window, cx| {
+            let session = CloudTarget::new(
+                CloudBackendKind::Codespaces,
+                InstanceChoice::OfSession(live),
+            );
+            let new = CloudTarget::new(CloudBackendKind::Codespaces, InstanceChoice::New);
+            // Before the stop: everything is allowed.
+            assert_eq!(shell.refuse_new_session_on(&named(CODESPACE)), Ok(()));
+            shell.auto_stop_epoch = std::time::Instant::now() - Duration::from_secs(11 * 60);
+            shell.check_auto_stop(cx);
+            let refused = Err(super::cloud_auto_stop::STOPPING_NEW_SESSION.to_owned());
+            // `sessions.start` of an app or a Mono, by name or by a session of the workspace.
+            assert_eq!(shell.refuse_new_session_on(&named(CODESPACE)), refused);
+            assert_eq!(shell.refuse_new_session_on(&session), refused);
+            // A new workspace and another workspace are not held.
+            assert_eq!(shell.refuse_new_session_on(&new), Ok(()));
+            assert_eq!(shell.refuse_new_session_on(&named("octo-other")), Ok(()));
+            // The codespace picker refuses the click, before anything is created.
+            let sessions = shell.session_summaries.len();
+            shell.open_codespace_picker_for("/work/monocode".into(), window, cx);
+            assert_eq!(
+                shell.pick_codespace_for_test(CODESPACE, cx).as_deref(),
+                Some(super::cloud_auto_stop::STOPPING_NEW_SESSION)
+            );
+            assert!(!shell.codespace_picker_busy(cx), "no worker was started");
+            assert_eq!(shell.session_summaries.len(), sessions);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(gh.stops(), 1);
+    // Over: the same requests are allowed again.
+    window
+        .update(cx, |shell, _, _| {
+            assert_eq!(shell.refuse_new_session_on(&named(CODESPACE)), Ok(()));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_sandbox_picker_refuses_a_sandbox_that_is_being_stopped(cx: &mut TestAppContext) {
+    let (window, _, _) = crate::shell::tests::window(cx);
+    window
+        .update(cx, |shell, window, cx| {
+            let key = CloudRef::sandbox("sbx-held").key();
+            shell.auto_stop_running.insert(key.clone());
+            shell.open_sandbox_picker("/work/widgets".into(), window, cx);
+            assert_eq!(
+                shell.pick_sandbox_for_test("sbx-held", cx).as_deref(),
+                Some(super::cloud_auto_stop::STOPPING_NEW_SESSION)
+            );
+            assert!(!shell.sandbox_picker_busy(cx), "no worker was started");
+            shell.auto_stop_running.remove(&key);
+        })
+        .unwrap();
 }

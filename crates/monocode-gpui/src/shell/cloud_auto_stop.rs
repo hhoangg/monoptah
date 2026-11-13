@@ -13,6 +13,11 @@
 //! `cloud.*` actions refuse), the composers of its sessions are locked (`auto_stopping`: a send
 //! or an app/Mono turn is refused with a clear message and the typed text stays), and the worker
 //! gets the same busy snapshot `cloud.stop` gets. Open cloud terminals count as activity.
+//!
+//! The hold also covers what is opened *during* the stop: a conversation registered or marked
+//! as cloud while the worker runs is locked at once (`sync_auto_stopping`), and a NEW session on
+//! the workspace (pickers, `sessions.start` of an app or a Mono) is refused while its key is in
+//! [`StoppingWorkspaces`].
 //! A failed stop is shown in the window's error line, once per workspace until one works.
 use super::*;
 use monocode_core::cloud_sessions::{
@@ -21,7 +26,43 @@ use monocode_core::cloud_sessions::{
         CHECK_EVERY_SECS, Decision, SessionFacts, StopOutcome, WorkspaceFacts, stop_if_still_idle,
     },
 };
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// Why a NEW session on a workspace is refused while it is being stopped. Nothing was created.
+pub(crate) const STOPPING_NEW_SESSION: &str = "Monoptah is stopping this workspace after it sat idle. \
+     Nothing was started; try again in a moment and it will resume.";
+
+/// The workspaces (`CloudRef::key`) whose automatic stop runs now. A shared handle: the shell
+/// changes it on the UI thread and the pickers read it when the user clicks, so a click never
+/// works from a copy taken earlier.
+#[derive(Clone, Default)]
+pub(crate) struct StoppingWorkspaces(Arc<Mutex<HashSet<String>>>);
+
+impl StoppingWorkspaces {
+    fn set(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        // A poisoned set is still a valid set of keys.
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    pub(crate) fn contains(&self, key: &str) -> bool {
+        self.set().contains(key)
+    }
+    pub(crate) fn insert(&self, key: String) -> bool {
+        self.set().insert(key)
+    }
+    pub(crate) fn remove(&self, key: &str) -> bool {
+        self.set().remove(key)
+    }
+    /// `Err` with the reason when `cloud` is being stopped.
+    pub(crate) fn refuse_new_session(&self, cloud: &CloudRef) -> Result<(), String> {
+        if self.contains(&cloud.key()) {
+            Err(STOPPING_NEW_SESSION.into())
+        } else {
+            Ok(())
+        }
+    }
+}
 
 pub(super) fn clock(cx: &mut Context<Shell>) -> gpui::Task<()> {
     cx.spawn(async move |this, cx| {
@@ -204,7 +245,7 @@ impl Shell {
         // on it refuse, and its conversations take no message (the typed text stays).
         self.auto_stop_running.insert(key.clone());
         self.cloud_workspaces_busy.insert(key);
-        self.lock_auto_stopping(&decision.cloud, true, cx);
+        self.sync_auto_stopping(cx);
         let cloud = self.cloud.clone();
         let asked = decision.clone();
         let work = cx
@@ -217,19 +258,41 @@ impl Shell {
         .detach();
     }
 
-    /// Refuses (or allows again) messages to every open conversation on `target`.
-    fn lock_auto_stopping(&mut self, target: &CloudRef, locked: bool, cx: &mut Context<Self>) {
-        let ids: Vec<i64> = self
-            .cloud_marks
-            .iter()
-            .filter(|(_, mark)| mark.cloud() == *target)
-            .map(|(id, _)| *id)
-            .collect();
-        for id in ids {
-            if let Some(view) = self.sessions.get(&id) {
+    /// Makes every open conversation agree with the stopping set: a conversation whose workspace
+    /// is being stopped takes no message, every other one does. Called when a stop starts and
+    /// ends, and whenever a conversation is registered or the cloud marks change, so a
+    /// composer opened while the worker runs is locked like the ones that were open before.
+    pub(super) fn sync_auto_stopping(&mut self, cx: &mut Context<Self>) {
+        for (id, view) in &self.sessions {
+            let locked = self
+                .cloud_marks
+                .get(id)
+                .is_some_and(|mark| self.auto_stop_running.contains(&mark.key()));
+            if view.read(cx).auto_stopping != locked {
                 view.update(cx, |view, _| view.auto_stopping = locked);
             }
         }
+    }
+
+    /// Refuses a NEW session that would run on the workspace `target` names, while it is being
+    /// stopped. `New` names nothing yet, so it is never refused.
+    pub(crate) fn refuse_new_session_on(
+        &self,
+        target: &monocode_core::mono::cloud_api::CloudTarget,
+    ) -> Result<(), String> {
+        use monocode_core::mono::cloud_api::InstanceChoice;
+        let cloud = match &target.instance {
+            InstanceChoice::New => return Ok(()),
+            InstanceChoice::Named(name) => CloudRef {
+                kind: target.kind,
+                name: name.clone(),
+            },
+            InstanceChoice::OfSession(id) => match self.cloud_marks.get(id) {
+                Some(mark) => mark.cloud(),
+                None => return Ok(()),
+            },
+        };
+        self.auto_stop_running.refuse_new_session(&cloud)
     }
 
     pub(super) fn finish_auto_stop(
@@ -241,7 +304,7 @@ impl Shell {
         let key = decision.cloud.key();
         self.auto_stop_running.remove(&key);
         self.cloud_workspaces_busy.remove(&key);
-        self.lock_auto_stopping(&decision.cloud, false, cx);
+        self.sync_auto_stopping(cx);
         let now = self.auto_stop_now();
         self.auto_stop.finished(&decision, &outcome, now);
         match outcome {

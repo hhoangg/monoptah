@@ -1506,6 +1506,10 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
         } = context;
         let prompt = app::prompt(&input)?;
         let mut cloud = cloud_api::target_from_input(&input)?;
+        // A new session on a workspace that is being stopped would be cut off.
+        if let (Some(target), Some(owner)) = (&cloud, self.owner.upgrade()) {
+            owner.read(cx).refuse_new_session_on(target)?;
+        }
         let provider = input["harness"]
             .as_str()
             .map(str::to_owned)

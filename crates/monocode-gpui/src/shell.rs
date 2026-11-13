@@ -795,7 +795,7 @@ pub(crate) struct Shell {
     auto_stop_epoch: std::time::Instant,
     _auto_stop_clock: gpui::Task<()>,
     /// Workspaces (`CloudRef::key`) whose auto-stop worker runs now.
-    auto_stop_running: HashSet<String>,
+    auto_stop_running: cloud_auto_stop::StoppingWorkspaces,
     /// Workspaces whose last automatic stop failed and was already shown in the error line.
     auto_stop_failed: HashSet<String>,
     /// Terminals running a shell on a cloud workspace, with whether the user asked for it (the
@@ -1297,7 +1297,7 @@ impl Shell {
             auto_stop: Default::default(),
             auto_stop_epoch: std::time::Instant::now(),
             _auto_stop_clock: auto_stop_clock,
-            auto_stop_running: HashSet::new(),
+            auto_stop_running: cloud_auto_stop::StoppingWorkspaces::default(),
             auto_stop_failed: HashSet::new(),
             cloud_terminals: Vec::new(),
             sessions: HashMap::new(),
@@ -1896,6 +1896,9 @@ impl Shell {
         if !self.order.contains(&id) {
             self.order.push(id);
         }
+        // Opened while its workspace is being stopped: locked like the conversations that were
+        // already open.
+        self.sync_auto_stopping(cx);
     }
     /// SessionPane's reviewUndoLocked: another running session shares the checkout.
     fn sync_review_locks(&mut self, cx: &mut Context<Self>) {

@@ -364,6 +364,22 @@ fn call_timeouts_by_verb() {
     assert_eq!(call_timeout(&args(&["create", "x"])), SLOW_CALL_TIMEOUT);
     assert_eq!(call_timeout(&args(&["rm", ID])), SLOW_CALL_TIMEOUT);
     assert_eq!(call_timeout(&args(&["inspect", ID])), CALL_TIMEOUT);
+    // A hung `sbx stop` is killed too, so it cannot hold a worker forever.
+    assert_eq!(call_timeout(&args(&["stop", ID])), SLOW_CALL_TIMEOUT);
+}
+
+#[test]
+fn a_stop_is_one_bounded_call_that_never_removes() {
+    let fake = Fake::new(vec![Err(
+        "Docker Sandboxes CLI did not answer within 120 seconds (`sbx stop`).".into(),
+    )]);
+    let error = stop(&fake, ID).unwrap_err();
+    assert!(error.contains("did not answer"), "{error}");
+    assert_eq!(
+        fake.argv(0),
+        ["--cloud", "--no-input", "stop", ID],
+        "only a stop, never rm"
+    );
 }
 
 #[test]

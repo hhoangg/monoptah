@@ -6,7 +6,9 @@ use super::*;
 use crate::settings::widgets::secondary_button;
 use gpui::EventEmitter;
 use monocode_core::{
-    cloud_sessions::{CloudSessions, CloudState, CodespaceChoice, HARNESS, StartRecord, Target},
+    cloud_sessions::{
+        CloudRef, CloudSessions, CloudState, CodespaceChoice, HARNESS, StartRecord, Target,
+    },
     codespaces::{self, Codespace, GhRunner, MachineType},
 };
 
@@ -108,6 +110,8 @@ struct CodespacePicker {
     progress: String,
     busy: bool,
     error: String,
+    /// Workspaces the shell is stopping right now: none of them takes a new session.
+    stopping: super::cloud_auto_stop::StoppingWorkspaces,
     /// The per-start switch of the Claude setup row.
     kit: bool,
     kit_summary: crate::cloud_kit_ui::Summary,
@@ -127,6 +131,7 @@ impl CodespacePicker {
         cloud: Arc<CloudSessions>,
         gh: Arc<dyn GhRunner>,
         local_project: String,
+        stopping: super::cloud_auto_stop::StoppingWorkspaces,
         cx: &mut Context<Self>,
     ) -> Self {
         let base = cloud.codespace_project_config(&local_project).base_ref;
@@ -160,6 +165,7 @@ impl CodespacePicker {
             progress: String::new(),
             busy: false,
             error: String::new(),
+            stopping,
             kit: crate::cloud_kit_ui::default_on(&crate::cloud_kit_ui::kit_prefs(cx)),
             kit_summary: crate::cloud_kit_ui::Summary::Loading,
             kit_task: None,
@@ -267,6 +273,16 @@ impl CodespacePicker {
 
     fn start(&mut self, choice: CodespaceChoice, cx: &mut Context<Self>) {
         if self.busy {
+            return;
+        }
+        // Read now, at the click: a stop that began a moment ago holds this codespace.
+        if let CodespaceChoice::Named(name) = &choice
+            && let Err(error) = self
+                .stopping
+                .refuse_new_session(&CloudRef::codespace(name.as_str()))
+        {
+            self.error = error;
+            cx.notify();
             return;
         }
         let branch = self.branch.read(cx).content.to_string();
@@ -599,7 +615,13 @@ impl Shell {
         self.close_menu(cx);
         self.close_preview(cx);
         let picker = cx.new(|cx| {
-            CodespacePicker::new(self.cloud.clone(), self.gh.clone(), project.clone(), cx)
+            CodespacePicker::new(
+                self.cloud.clone(),
+                self.gh.clone(),
+                project.clone(),
+                self.auto_stop_running.clone(),
+                cx,
+            )
         });
         let events = cx.subscribe_in(
             &picker,
@@ -633,6 +655,16 @@ impl Shell {
         if let Some(open) = &self.codespace_picker {
             open.picker.update(cx, |picker, _| picker.busy = busy);
         }
+    }
+
+    /// Clicks the codespace `name` in the open picker; what the picker shows as its error (tests).
+    #[cfg(test)]
+    pub(super) fn pick_codespace_for_test(&self, name: &str, cx: &mut App) -> Option<String> {
+        let open = self.codespace_picker.as_ref()?;
+        open.picker.update(cx, |picker, cx| {
+            picker.start(CodespaceChoice::Named(name.to_owned()), cx);
+            (!picker.error.is_empty()).then(|| picker.error.clone())
+        })
     }
 
     /// The local project the open codespace picker lists the codespaces of.

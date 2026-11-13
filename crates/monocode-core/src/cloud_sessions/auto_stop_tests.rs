@@ -328,6 +328,8 @@ struct Scripted {
     on_state: Mutex<Option<Arc<AtomicBool>>>,
     state: Mutex<String>,
     calls: Mutex<Vec<String>>,
+    /// When set, `stop` fails with this text and the workspace keeps running.
+    stop_error: Mutex<Option<String>>,
 }
 impl Scripted {
     fn new(state: &str) -> Arc<Self> {
@@ -335,7 +337,11 @@ impl Scripted {
             on_state: Mutex::new(None),
             state: Mutex::new(state.into()),
             calls: Mutex::new(vec![]),
+            stop_error: Mutex::new(None),
         })
+    }
+    fn fail_stop(&self, error: &str) {
+        *self.stop_error.lock().unwrap() = Some(error.into());
     }
     fn on_state(&self, flag: Arc<AtomicBool>) {
         *self.on_state.lock().unwrap() = Some(flag);
@@ -382,6 +388,9 @@ impl CloudBackend for Scripted {
     }
     fn stop(&self, name: &str) -> Result<(), String> {
         self.calls.lock().unwrap().push(format!("stop {name}"));
+        if let Some(error) = self.stop_error.lock().unwrap().clone() {
+            return Err(error);
+        }
         *self.state.lock().unwrap() = "Stopped".into();
         Ok(())
     }
@@ -484,6 +493,23 @@ fn the_worker_stops_a_running_idle_workspace_with_one_call_and_never_deletes_or_
     );
     assert_eq!(backend.stops(), 1);
     assert_eq!(svc.cloud_state_of(&sandbox()), CloudState::Stopped);
+}
+
+#[test]
+fn a_stop_that_never_answers_ends_as_a_failure_and_the_workspace_is_never_deleted() {
+    // What the real runners report when `sbx stop` or `gh codespace stop` outlives its timeout
+    // (the child is killed, the call returns): the worker gets an `Err`, not a hang.
+    let (svc, backend) = world("Available", true);
+    backend.fail_stop("Docker Sandboxes CLI did not answer within 120 seconds (`sbx stop`).");
+    let outcome = stop_if_still_idle(&svc, &idle(), &Nothing);
+    match outcome {
+        StopOutcome::Failed(error) => assert!(error.contains("did not answer"), "{error}"),
+        other => panic!("expected a failed stop, got {other:?}"),
+    }
+    // One stop call, no delete (the backend panics on `delete`), nothing else changed.
+    assert_eq!(backend.stops(), 1);
+    assert!(backend.calls().iter().all(|c| !c.starts_with("delete")));
+    assert_eq!(svc.cloud_state_of(&sandbox()), CloudState::Available);
 }
 
 #[test]
