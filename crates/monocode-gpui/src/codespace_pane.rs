@@ -2,16 +2,17 @@
 //! starts. A meta block, the phase list with durations and the creation log, in the style of
 //! the Changes pane.
 use crate::{
+    cloud_dialog_ui::docker_usage_link,
     cloud_start_view::{CloudStartSnapshot, StartAction, StartPhase, step_ms},
     right_panel::{icon_action, pane_header, spinner, tabular},
     settings::widgets::secondary_button,
     theme::*,
 };
 use gpui::{
-    AnyElement, Context, EventEmitter, FontWeight, Role, ScrollHandle, SharedString, Window, div,
-    point, prelude::*, px, rgb,
+    AnyElement, Context, EventEmitter, FocusHandle, FontWeight, Role, ScrollHandle, SharedString,
+    Window, div, point, prelude::*, px, rgb,
 };
-use monocode_core::cloud_sessions::{StepKind, StepStatus};
+use monocode_core::cloud_sessions::{CloudBackendKind, StepKind, StepStatus};
 use std::sync::Arc;
 
 const GREEN: u32 = 0x4ade80;
@@ -29,6 +30,7 @@ pub(crate) struct CodespacePane {
     shown_lines: usize,
     log_text: SharedString,
     clock: Option<gpui::Task<()>>,
+    usage_focus: FocusHandle,
 }
 impl EventEmitter<PaneEvent> for CodespacePane {}
 
@@ -41,7 +43,7 @@ pub(crate) fn state_word(phase: StartPhase) -> &'static str {
 }
 
 impl CodespacePane {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(cx: &mut Context<Self>) -> Self {
         Self {
             start: None,
             scroll: ScrollHandle::new(),
@@ -50,6 +52,7 @@ impl CodespacePane {
             shown_lines: 0,
             log_text: "Waiting for the creation log...".into(),
             clock: None,
+            usage_focus: cx.focus_handle(),
         }
     }
 
@@ -128,7 +131,7 @@ impl CodespacePane {
             .child(title)
     }
 
-    fn meta_row(label: &'static str, value: String) -> AnyElement {
+    fn meta_row(label: &'static str, value: impl IntoElement) -> AnyElement {
         div()
             .px_3()
             .py(px(2.))
@@ -342,7 +345,16 @@ impl Render for CodespacePane {
                     "State"
                 },
                 record.gh_state.clone().unwrap_or_else(|| "Unknown".into()),
-            ));
+            ))
+            .when(start.backend() == CloudBackendKind::DockerSandbox, |d| {
+                d.child(Self::meta_row(
+                    "Usage",
+                    // A flex row keeps the link as wide as its text, not the whole row.
+                    div()
+                        .flex()
+                        .child(docker_usage_link("codespace-usage-link", &self.usage_focus)),
+                ))
+            });
         let phases = div().flex().flex_col().children(
             StepKind::ALL
                 .iter()
@@ -509,5 +521,108 @@ impl Render for CodespacePane {
                     ),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        cloud_dialog_ui::DOCKER_USAGE_URL,
+        cloud_start_view::fixtures::{as_sandbox, starting},
+    };
+    use gpui::{TestAppContext, VisualTestContext};
+
+    fn pane(
+        start: Arc<CloudStartSnapshot>,
+        cx: &mut TestAppContext,
+    ) -> (gpui::WindowHandle<CodespacePane>, VisualTestContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|cx| {
+                    let mut pane = CodespacePane::new(cx);
+                    pane.set_start(Some(start), cx);
+                    pane
+                })
+            })
+            .unwrap()
+        });
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.refresh().unwrap();
+        (window, visual)
+    }
+
+    #[gpui::test]
+    fn a_docker_sandbox_offers_the_usage_page_and_a_click_opens_exactly_that_url(
+        cx: &mut TestAppContext,
+    ) {
+        let (_, mut visual) = pane(as_sandbox(starting(1)), cx);
+        let bounds = visual
+            .debug_bounds("codespace-usage-link")
+            .expect("the usage link is drawn for a sandbox");
+        assert_eq!(cx.opened_url(), None);
+        visual.simulate_click(bounds.center(), Default::default());
+        assert_eq!(cx.opened_url().as_deref(), Some(DOCKER_USAGE_URL));
+        assert_eq!(
+            DOCKER_USAGE_URL,
+            "https://agentic-platform.docker.com/usage"
+        );
+    }
+
+    /// Opens a sandbox pane and, when `focused`, moves the focus onto its usage link.
+    fn pane_with_link_focus(
+        focused: bool,
+        cx: &mut TestAppContext,
+    ) -> (gpui::WindowHandle<CodespacePane>, VisualTestContext) {
+        let (window, mut visual) = pane(as_sandbox(starting(1)), cx);
+        window
+            .update(&mut visual, |pane, window, cx| {
+                assert!(!pane.usage_focus.is_focused(window));
+                if focused {
+                    window.focus(&pane.usage_focus, cx);
+                }
+            })
+            .unwrap();
+        visual.run_until_parked();
+        (window, visual)
+    }
+
+    #[gpui::test]
+    fn enter_on_the_focused_usage_link_opens_the_usage_page(cx: &mut TestAppContext) {
+        let (_, mut visual) = pane_with_link_focus(true, cx);
+        assert_eq!(cx.opened_url(), None);
+        visual.simulate_keystrokes("enter");
+        assert_eq!(cx.opened_url().as_deref(), Some(DOCKER_USAGE_URL));
+    }
+
+    #[gpui::test]
+    fn space_on_the_focused_usage_link_opens_the_usage_page(cx: &mut TestAppContext) {
+        let (_, mut visual) = pane_with_link_focus(true, cx);
+        visual.simulate_keystrokes("space");
+        assert_eq!(cx.opened_url().as_deref(), Some(DOCKER_USAGE_URL));
+    }
+
+    #[gpui::test]
+    fn enter_does_nothing_while_the_usage_link_is_not_focused(cx: &mut TestAppContext) {
+        let (_, mut visual) = pane_with_link_focus(false, cx);
+        visual.simulate_keystrokes("enter");
+        assert_eq!(cx.opened_url(), None);
+    }
+
+    #[gpui::test]
+    fn the_usage_row_sits_in_the_meta_block_with_the_other_rows(cx: &mut TestAppContext) {
+        let (_, mut visual) = pane(as_sandbox(starting(1)), cx);
+        let link = visual.debug_bounds("codespace-usage-link").unwrap();
+        let pane = visual.debug_bounds("codespace-pane").unwrap();
+        assert!(pane.contains(&link.center()));
+        // The link is as wide as its text, not the whole row, so a click beside it misses.
+        assert!(link.size.width < pane.size.width / 2., "{link:?} {pane:?}");
+    }
+
+    #[gpui::test]
+    fn a_codespace_has_no_usage_link(cx: &mut TestAppContext) {
+        let (_, mut visual) = pane(starting(1), cx);
+        assert!(visual.debug_bounds("codespace-pane").is_some());
+        assert!(visual.debug_bounds("codespace-usage-link").is_none());
     }
 }

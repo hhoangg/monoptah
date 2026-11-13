@@ -17,7 +17,7 @@ pub(crate) mod tests;
 
 use crate::{
     cloud_checks::{Gh, gh_state},
-    cloud_dialog_ui::{alert, field_box, heading, labelled, muted},
+    cloud_dialog_ui::{alert, docker_usage_link, field_box, heading, labelled, muted},
     fix_terminal::FixCommand,
     git_credential_panel::{self, GitCredentialPanel},
     input::{self, Input},
@@ -339,6 +339,8 @@ pub(crate) struct CloudSettings {
     /// closes that have no window at hand.
     restore_focus: Option<FocusHandle>,
     focus: FocusHandle,
+    /// The focus of the Docker usage link beside the Docker account select.
+    usage_focus: FocusHandle,
     _events: Vec<Subscription>,
 }
 
@@ -515,6 +517,7 @@ impl CloudSettings {
             refocus: false,
             restore_focus: None,
             focus: cx.focus_handle(),
+            usage_focus: cx.focus_handle(),
             _events: events,
         };
         this.refresh_infos(cx);
@@ -1833,6 +1836,11 @@ impl CloudSettings {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
+    pub(crate) fn usage_focus(&self) -> &FocusHandle {
+        &self.usage_focus
+    }
+
     fn select_row(&mut self, label: &'static str, which: Select, cx: &mut Context<Self>) -> Div {
         let current = self.current_label(which, cx);
         labelled(label).child(self.select(which, current, cx))
@@ -2230,8 +2238,24 @@ impl CloudSettings {
         let backend = self.tab;
         let mut column = div().flex().flex_col().gap_3();
         if backend == DefaultBackend::Sandbox {
+            // The usage link sits right of the select, like Manage beside Git, so the row keeps
+            // its height. Its tooltip says the Console page shows the account signed in in the
+            // browser, which is not necessarily this project's.
+            let current = self.current_label(Select::DockerAccount, cx);
+            let select = self.select(Select::DockerAccount, current, cx);
             column = column.child(
-                self.select_row("Docker account", Select::DockerAccount, cx)
+                labelled("Docker account")
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(div().min_w_0().flex_1().child(select))
+                            .child(docker_usage_link(
+                                "cloud-docker-usage-link",
+                                &self.usage_focus,
+                            )),
+                    )
                     .children(
                         self.docker_accounts_error
                             .clone()
