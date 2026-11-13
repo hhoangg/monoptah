@@ -142,24 +142,31 @@ impl Monos {
             .map(|mono| mono.id.clone())
             .collect();
         for id in stale {
-            // The chat, and the transcripts of the habit runs of this Mono that are open.
-            let views: Vec<_> = self
-                .chats
-                .get(&id)
-                .cloned()
-                .into_iter()
-                .chain(
-                    self.running
-                        .values()
-                        .filter(|run| run.mono == id)
-                        .map(|run| run.view.clone()),
-                )
-                .collect();
-            for view in views {
-                self.push_emoji(&id, &view, cx);
-            }
+            self.push_emoji_to_views(&id, cx);
         }
         cx.notify();
+    }
+
+    /// The conversations that show this Mono's emoji: its chat, and the transcripts of the habit
+    /// runs of this Mono that are open.
+    pub(super) fn emoji_views(&self, id: &str) -> Vec<Entity<Conversation>> {
+        self.chats
+            .get(id)
+            .cloned()
+            .into_iter()
+            .chain(
+                self.running
+                    .values()
+                    .filter(|run| run.mono == id)
+                    .map(|run| run.view.clone()),
+            )
+            .collect()
+    }
+
+    fn push_emoji_to_views(&mut self, id: &str, cx: &mut Context<Self>) {
+        for view in self.emoji_views(id) {
+            self.push_emoji(id, &view, cx);
+        }
     }
 
     /// Gives a conversation that runs in this Mono's mode the shared library and the Mono's
@@ -209,7 +216,9 @@ impl Monos {
         };
         change(&mut mono.emoji);
         self.save(cx);
-        self.configure_chat(&id, cx);
+        // The chat and the open habit runs all get the push, so the shared key stays true.
+        self.configure_chat_with(&id, false, cx);
+        self.push_emoji_to_views(&id, cx);
         cx.notify();
     }
 

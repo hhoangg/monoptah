@@ -222,6 +222,8 @@ pub(crate) struct SettingsView {
     notification_state: notification_preferences::State,
     ctx: SettingsContext,
     focus: FocusHandle,
+    /// A page change dropped an import dialog: focus returns here if it was lost with it.
+    refocus: bool,
     scroll: ScrollHandle,
     /// The row or group search just landed on, flashing for 1.8s.
     revealed: Option<String>,
@@ -384,6 +386,7 @@ impl SettingsView {
             notification_state: notification_preferences::State::default(),
             ctx,
             focus: cx.focus_handle(),
+            refocus: false,
             scroll: ScrollHandle::new(),
             revealed: None,
             pending_scroll: false,
@@ -520,7 +523,9 @@ impl SettingsView {
             if self.section == Section::Monos
                 && let Some(library) = self.emoji_library.clone()
             {
-                library.update(cx, |library, cx| library.abandon_import(cx));
+                let abandoned = library.update(cx, |library, cx| library.abandon_import(cx));
+                // The dialog's focus handle goes with it; the next frame puts focus back.
+                self.refocus = self.refocus || abandoned;
             }
             self.management = None;
             self.selected_trees.clear();
@@ -1144,6 +1149,9 @@ impl Render for SettingsView {
                     cx.notify();
                 });
             });
+        }
+        if std::mem::take(&mut self.refocus) && !self.focus.contains_focused(window, cx) {
+            window.focus(&self.focus, cx);
         }
         self.notification_window_state(window, cx);
         self.connections_window_state(window, cx);

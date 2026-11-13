@@ -488,3 +488,54 @@ fn a_library_on_disk_before_the_app_starts_is_drawn_without_opening_settings(
     visual.refresh().unwrap();
     assert!(visual.debug_bounds("mono-emoji-happy").is_some());
 }
+
+#[gpui::test]
+fn a_mono_change_reaches_the_habit_runs_of_that_mono_too(cx: &mut TestAppContext) {
+    use super::tests::fake_run;
+    let (s, visual) = open(cx);
+    visual.run_until_parked();
+    let none = s
+        .manager
+        .read_with(&visual, |m, _| m.emoji_views(&s.id).len());
+    assert_eq!(none, 1, "the chat alone");
+    let _ = fake_run(&s, cx);
+    let targets = s
+        .manager
+        .read_with(&visual, |m, _| m.emoji_views(&s.id).len());
+    assert_eq!(targets, 2, "the chat and the open habit run");
+    let other = s
+        .manager
+        .read_with(&visual, |m, _| m.emoji_views("another-mono").len());
+    assert_eq!(other, 0, "runs of other Monos are not targets");
+}
+
+#[gpui::test]
+fn a_failed_library_edit_after_a_pack_removal_still_pushes_the_chats(cx: &mut TestAppContext) {
+    let (s, mut visual) = open(cx);
+    visual.run_until_parked();
+    let mut library = Library::default();
+    seed(
+        &s,
+        &mut library,
+        "pack-seed",
+        vec![entry("a.png", "alpha", Format::Png, Some("happy"))],
+    );
+    reload(&s, &mut visual);
+    s.manager.update(&mut visual, |m, cx| {
+        m.emoji_update(cx, |e| {
+            e.enabled = true;
+            e.packs = vec!["pack-seed".into()];
+        });
+    });
+    let _ = chat_transcript(&s, &mut visual);
+    let before = rebuilds(&s, &visual);
+    let store = store(&s, &visual);
+    store.update(&mut visual, |st, cx| {
+        st.remove_pack("pack-seed", cx);
+        // The library is refused after the folder is gone.
+        st.set_read_only_for_test(true);
+    });
+    visual.run_until_parked();
+    assert!(mono_emoji(&s, &visual).packs.is_empty());
+    assert_eq!(rebuilds(&s, &visual), before + 1, "the chat was pushed");
+}

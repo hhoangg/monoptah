@@ -19,7 +19,7 @@ pub(crate) use store::{EmojiEvent, EmojiStore, SortModel, get, install};
 pub(crate) use view::EmojiLibraryView;
 
 #[cfg(test)]
-pub(crate) use import::{ItemState, SortParts, dialog_texts, names_notice};
+pub(crate) use import::{ItemState, SortParts, dialog_texts, names_notice, wait_for_discards};
 #[cfg(test)]
 pub(crate) use store::SAVE_DELAY;
 

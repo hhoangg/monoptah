@@ -164,8 +164,25 @@ impl Guard {
 impl Drop for Guard {
     fn drop(&mut self) {
         if let Some(staged) = self.0.take() {
-            import::discard(staged);
+            // Up to hundreds of files: never on the thread that is dropping the dialog.
+            PENDING_DISCARDS.fetch_add(1, Ordering::SeqCst);
+            std::thread::spawn(move || {
+                import::discard(staged);
+                PENDING_DISCARDS.fetch_sub(1, Ordering::SeqCst);
+            });
         }
+    }
+}
+
+/// Removals that a dropped guard still has to finish.
+static PENDING_DISCARDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Waits until every removal started by a dropped guard is done.
+#[cfg(test)]
+pub(crate) fn wait_for_discards() {
+    let start = std::time::Instant::now();
+    while PENDING_DISCARDS.load(Ordering::SeqCst) > 0 && start.elapsed().as_secs() < 10 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
 }
 
@@ -841,17 +858,25 @@ impl EmojiLibraryView {
                     .store
                     .clone()
                     .update(cx, |store, cx| store.commit_import(staged, pack, cx));
+                let store = self.store.clone();
                 cx.spawn_in(window, async move |this, cx| {
                     let result = done
                         .recv()
                         .await
                         .unwrap_or_else(|_| Err("The import was interrupted".into()));
-                    let _ = this.update_in(cx, |this, window, cx| {
+                    let failure = result.clone().err();
+                    let shown = this.update_in(cx, |this, window, cx| {
                         if this.import.as_ref().is_none_or(|d| d.token != token) {
                             return;
                         }
                         this.finish_item(result, window, cx);
                     });
+                    // The page is gone: the store keeps the failure for the next visit.
+                    if shown.is_err()
+                        && let Some(error) = failure
+                    {
+                        store.update(cx, |store, cx| store.report_error(error, cx));
+                    }
                 })
                 .detach();
             }
@@ -890,9 +915,10 @@ impl EmojiLibraryView {
 
     /// Stops the dialog, deletes its staging folder and lets a refused read go ahead. Used by
     /// Cancel and when another Settings page is shown, so no dialog runs hidden.
-    pub(crate) fn abandon_import(&mut self, cx: &mut Context<Self>) {
+    /// True when a dialog was open.
+    pub(crate) fn abandon_import(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(mut d) = self.import.take() else {
-            return;
+            return false;
         };
         d.stop();
         self.picker = None;
@@ -905,6 +931,22 @@ impl EmojiLibraryView {
             .clone()
             .update(cx, |store, cx| store.retry_load(cx));
         cx.notify();
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn import_for_test(
+        &mut self,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.import_paths(paths, window, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn accept_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.accept(true, window, cx);
     }
 
     /// Opens the shared model list under the dialog's model button.

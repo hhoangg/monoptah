@@ -408,10 +408,21 @@ impl EmojiStore {
                     .unwrap_or_else(|e| Err(e.to_string())),
                 Err(error) => Err(error),
             };
-            let _ = tx.send(result).await;
+            if tx.send(result.clone()).await.is_err()
+                && let Err(error) = result
+            {
+                // The page that asked is gone: the next visit still learns of the failure.
+                let _ = this.update(cx, |this, cx| this.report_error(error, cx));
+            }
         })
         .detach();
         rx
+    }
+
+    /// Keeps a failure for the page to show, whenever it is opened.
+    pub(crate) fn report_error(&mut self, error: String, cx: &mut Context<Self>) {
+        self.error = Some(error);
+        cx.notify();
     }
 
     /// Removes a pack and its folder. The folder goes first, off the main thread; the library
@@ -435,10 +446,14 @@ impl EmojiStore {
                         // The listeners drop the id from their selections first, so the
                         // library's own change is the one push a chat gets.
                         cx.emit(EmojiEvent::PackRemoved(pack_id.clone()));
-                        let _ = this.edit(cx, |l| {
+                        let edited = this.edit(cx, |l| {
                             l.packs.retain(|p| p.id != pack_id);
                             Ok(())
                         });
+                        if edited.is_err() {
+                            // The listeners already dropped the id; tell the chats again.
+                            cx.emit(EmojiEvent::Changed);
+                        }
                     }
                     Err(error) => this.error = Some(error),
                 }
@@ -446,6 +461,11 @@ impl EmojiStore {
             });
         })
         .detach();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_read_only_for_test(&mut self, read_only: bool) {
+        self.read_only = read_only;
     }
 
     #[cfg(test)]

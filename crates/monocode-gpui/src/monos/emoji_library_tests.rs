@@ -160,6 +160,7 @@ fn settle(visual: &mut VisualTestContext) {
 }
 
 fn staging_dirs(s: &Setup) -> Vec<PathBuf> {
+    crate::emoji_library::wait_for_discards();
     std::fs::read_dir(emoji_dir(s))
         .map(|rd| {
             rd.flatten()
@@ -1187,12 +1188,14 @@ fn closing_settings_while_saving_still_lands_the_pack(cx: &mut TestAppContext) {
     install_fake(&s, vec!["happy"], &mut visual);
     import(&s, &mut visual, vec![make_zip("late.zip")]);
     // Press "Use this sorting" and close Settings before the save has run.
-    let at = visual
-        .debug_bounds("emoji-lib-import-use")
-        .unwrap()
-        .center();
-    visual.simulate_click(at, Default::default());
-    close_settings(&s, &mut visual);
+    // Both happen inside one update, so nothing runs between the accept and the close.
+    let page = view(&s, &visual);
+    s.window
+        .update(&mut visual, |shell, window, cx| {
+            page.update(cx, |v, cx| v.accept_for_test(window, cx));
+            shell.close_settings_for_test(window, cx);
+        })
+        .unwrap();
     visual.run_until_parked();
     let saved = disk(&s);
     assert_eq!(saved.packs.len(), 1, "the pack is in the library file");
@@ -1221,18 +1224,48 @@ fn closing_settings_removes_the_staging_folder_of_an_open_import(cx: &mut TestAp
         "the review's staging folder goes"
     );
     assert!(library_of(&s, &visual).packs.is_empty());
-    // The same while the zip is still being unpacked.
+}
+
+#[gpui::test]
+fn closing_settings_while_unpacking_leaves_no_staging_folder(cx: &mut TestAppContext) {
     let (s, mut visual) = open(cx);
     show(&s, &mut visual);
     let zip = make_zip("early.zip");
-    let spot = visual.debug_bounds("emoji-lib-drop-hint").unwrap().center();
-    visual.simulate_event(FileDropEvent::Entered {
-        position: spot,
-        paths: ExternalPaths(vec![zip].into()),
-    });
-    visual.simulate_event(FileDropEvent::Submit { position: spot });
-    close_settings(&s, &mut visual);
+    // Start and close inside one update: the unpack job has not run, and its staging folder
+    // appears after the page is gone.
+    let page = view(&s, &visual);
+    s.window
+        .update(&mut visual, |shell, window, cx| {
+            page.update(cx, |v, cx| v.import_for_test(vec![zip], window, cx));
+            assert!(page.read(cx).dialog().is_some());
+            shell.close_settings_for_test(window, cx);
+        })
+        .unwrap();
+    drop(page);
     visual.run_until_parked();
+    assert!(staging_dirs(&s).is_empty());
+    assert!(library_of(&s, &visual).packs.is_empty());
+}
+
+#[gpui::test]
+fn a_commit_that_fails_after_the_page_closed_is_reported_next_time(cx: &mut TestAppContext) {
+    let (s, mut visual) = open(cx);
+    show(&s, &mut visual);
+    install_fake(&s, vec!["happy"], &mut visual);
+    import(&s, &mut visual, vec![make_zip("broken.zip")]);
+    // A file where the packs folder should be makes the commit fail.
+    std::fs::write(emoji_dir(&s).join("packs"), b"not a folder").unwrap();
+    let page = view(&s, &visual);
+    s.window
+        .update(&mut visual, |shell, window, cx| {
+            page.update(cx, |v, cx| v.accept_for_test(window, cx));
+            shell.close_settings_for_test(window, cx);
+        })
+        .unwrap();
+    drop(page);
+    visual.run_until_parked();
+    let error = store(&s, &visual).read_with(&visual, |st, _| st.error().map(str::to_owned));
+    assert!(error.is_some(), "the store remembers the failed import");
     assert!(staging_dirs(&s).is_empty());
     assert!(library_of(&s, &visual).packs.is_empty());
 }
@@ -1252,6 +1285,15 @@ fn showing_another_settings_page_cancels_the_import(cx: &mut TestAppContext) {
         v.select_section(crate::settings::Section::General, cx)
     });
     visual.run_until_parked();
+    visual.refresh().unwrap();
+    use gpui::Focusable;
+    let inside = visual.update(|window, cx| {
+        settings
+            .read(cx)
+            .focus_handle(cx)
+            .contains_focused(window, cx)
+    });
+    assert!(inside, "keys still reach the settings view");
     assert!(!dialog_open(&s, &visual), "no dialog runs hidden");
     assert!(staging_dirs(&s).is_empty());
     assert!(library_of(&s, &visual).packs.is_empty());
