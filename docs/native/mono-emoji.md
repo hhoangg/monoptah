@@ -154,18 +154,32 @@ Untrusted input. The importer in `crates/monocode-core/src/mono/emoji/import.rs`
 - Limits: the zip file itself at most 200 MB, at most 500 entries, each file at most 10 MB,
   total uncompressed at most 200 MB. Sizes are enforced on the bytes actually read (a reader
   capped at the limit plus one), not on the header, which an attacker controls.
+- Before the zip library parses anything, the importer reads the last end of central directory
+  record itself and refuses a declared entry count (or a zip64 count) above the entry limit.
+  The whole archive is then read through a wrapper that counts bytes (at most 2 x the file size
+  plus 1 MiB across all reads, which also stops overlapping-entry and many-candidate tricks)
+  and checks the cancel flag on every read.
 - Detects the format by magic bytes, never by extension: PNG, JPEG, GIF and WebP. GPUI's
   image loader decodes more (BMP, ICO, TIFF, TGA, QOI and others, plus SVG for anything
   unrecognized) but emoji packs use these four, and SVG is excluded on purpose.
-  Each image must decode its header with the `image` crate; dimensions are capped at
-  1024 x 1024 and animations at 300 frames, so a tiny file cannot expand into a huge
-  decoded image.
+  Static images are fully decoded (a valid header over a broken body is rejected). Dimensions
+  are capped at 1024 x 1024 and animations at 300 frames. GPUI decodes every GIF and animated
+  WebP frame at the logical screen (canvas) size and keeps all of them, so
+  `width x height x frames` (screen size, checked arithmetic) must also stay within
+  `max_decoded_pixels` (16,777,216, about 64 MB of RGBA). GIFs are walked block by block
+  without decompressing pixel data; a frame that does not fit inside the screen is rejected.
+  Animated WebP frames are counted from the `ANMF` chunks before any frame is decoded.
+  Decoding runs under `catch_unwind`, so a decoder panic only skips that entry.
 - Dedupes by SHA-256 within the zip and against emoji already in this Mono's packs.
 - Sanitizes display names: file stem, emoji.gg numeric prefix removed, control characters
-  and path separators dropped, at most 64 chars, fallback "emoji".
+  and path separators dropped, Unicode format characters (bidi controls, zero-width, BOM, soft
+  hyphen, tags) and all combining marks dropped after NFC composing (also in the skipped-entry
+  display), at most 64 chars, fallback "emoji".
 - Extracts to `.staging-<uuid>` inside the Mono's emoji folder (same filesystem), then
-  renames it to `packs/<pack id>` when the user confirms, then writes `emoji.json`
-  atomically. A failure or cancel removes the staging folder.
+  moves the files into `packs/<pack id>` when the user confirms (the target is created with
+  `create_dir` as an exclusive lock, an empty import is refused, a failed move is rolled
+  back), then writes `emoji.json` atomically. A failure, cancel or panic during staging removes
+  the staging folder (RAII guard); `discard` only touches `.staging-*` folders.
 
 ## Tests
 

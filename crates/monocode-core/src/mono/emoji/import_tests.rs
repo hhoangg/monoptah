@@ -1,7 +1,7 @@
 use super::*;
 use image::{ExtendedColorType, ImageEncoder, RgbaImage};
-use zip::write::SimpleFileOptions;
 use zip::CompressionMethod;
+use zip::write::SimpleFileOptions;
 
 fn rgba(w: u32, h: u32, seed: u8) -> RgbaImage {
     RgbaImage::from_fn(w, h, |x, y| {
@@ -194,6 +194,8 @@ fn skips_each_unsafe_or_ignored_entry_with_its_reason() {
         w.finish().unwrap();
     }
     let g = gif(1);
+    // Cut two bytes into the IDAT body: the header stays valid, only decoding the body fails.
+    let idat_body = good.windows(4).position(|w| w == b"IDAT").unwrap() + 4 + 2;
     env.build(&[
         ("../evil.png", &good),
         ("/abs.png", &good),
@@ -209,7 +211,7 @@ fn skips_each_unsafe_or_ignored_entry_with_its_reason() {
         ("fake.png", b"just text"),
         ("vector.svg", b"<svg xmlns='http://www.w3.org/2000/svg'/>"),
         ("real.txt", &g),
-        ("broken.png", &good[..20]),
+        ("broken.png", &good[..idat_body]),
         ("keep.png", &good),
     ]);
     let s = env.run(&Limits::default()).unwrap();
@@ -224,9 +226,10 @@ fn skips_each_unsafe_or_ignored_entry_with_its_reason() {
     has("/abs.png", SkipReason::UnsafePath);
     has("C:\\x.png", SkipReason::UnsafePath);
     has("a\\..\\..\\b.png", SkipReason::UnsafePath);
-    assert!(r
-        .iter()
-        .any(|(n, rs)| n.starts_with("nul") && *rs == SkipReason::UnsafePath));
+    assert!(
+        r.iter()
+            .any(|(n, rs)| n.starts_with("nul") && *rs == SkipReason::UnsafePath)
+    );
     has("__MACOSX/._a.png", SkipReason::MacMetadata);
     has("x/__MACOSX/a.png", SkipReason::MacMetadata);
     has(".hidden.png", SkipReason::Hidden);
@@ -310,10 +313,11 @@ fn nested_archive_magic_bytes_are_detected() {
     ]);
     let s = env.run(&Limits::default()).unwrap();
     assert_eq!(s.skipped.len(), 7);
-    assert!(s
-        .skipped
-        .iter()
-        .all(|k| k.reason == SkipReason::NestedArchive));
+    assert!(
+        s.skipped
+            .iter()
+            .all(|k| k.reason == SkipReason::NestedArchive)
+    );
 }
 
 #[test]
@@ -430,10 +434,11 @@ fn duplicates_within_zip_and_against_existing_are_skipped() {
         .unwrap();
     assert_eq!(s.images.len(), 1);
     assert_eq!(s.images[0].name, "a");
-    assert!(s
-        .skipped
-        .iter()
-        .any(|k| k.entry == "b.png" && k.reason == SkipReason::Duplicate));
+    assert!(
+        s.skipped
+            .iter()
+            .any(|k| k.entry == "b.png" && k.reason == SkipReason::Duplicate)
+    );
 }
 
 #[test]
@@ -587,4 +592,342 @@ fn sniff_cases() {
     assert_eq!(sniff(b"BM......"), None);
     assert_eq!(sniff(b"<svg>"), None);
     assert_eq!(sniff(b""), None);
+}
+
+fn patch_u16(bytes: &mut [u8], at: usize, v: u16) {
+    bytes[at..at + 2].copy_from_slice(&v.to_le_bytes());
+}
+
+fn patch_u32(bytes: &mut [u8], at: usize, v: u32) {
+    bytes[at..at + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+/// Calls `f(bytes, offset, is_central)` at every local (`PK 3 4`) and central (`PK 1 2`) header.
+fn for_each_header(bytes: &mut [u8], mut f: impl FnMut(&mut [u8], usize, bool)) {
+    for i in 0..bytes.len().saturating_sub(46) {
+        if bytes[i..].starts_with(b"PK\x03\x04") {
+            f(bytes, i, false);
+        } else if bytes[i..].starts_with(b"PK\x01\x02") {
+            f(bytes, i, true);
+        }
+    }
+}
+
+fn gif_sized(w: u32, h: u32, frames: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut enc = image::codecs::gif::GifEncoder::new(&mut out);
+        let list = (0..frames).map(|i| image::Frame::new(rgba(w, h, (i % 5) as u8 * 40)));
+        enc.encode_frames(list).unwrap();
+    }
+    out
+}
+
+/// A minimal animated WebP: `frames` lossless frames of 3x3 on a 3x3 canvas.
+fn animated_webp(frames: usize) -> Vec<u8> {
+    let still = webp();
+    assert_eq!(&still[12..16], b"VP8L");
+    let size = u32::from_le_bytes(still[16..20].try_into().unwrap()) as usize;
+    let vp8l = &still[12..20 + size + (size & 1)];
+    let chunk = |tag: &[u8; 4], payload: &[u8]| {
+        let mut c = tag.to_vec();
+        c.extend((payload.len() as u32).to_le_bytes());
+        c.extend(payload);
+        if payload.len() & 1 == 1 {
+            c.push(0);
+        }
+        c
+    };
+    let mut body = b"WEBP".to_vec();
+    let mut vp8x = vec![0x02, 0, 0, 0];
+    vp8x.extend([2, 0, 0, 2, 0, 0]); // canvas 3x3, stored as size - 1
+    body.extend(chunk(b"VP8X", &vp8x));
+    body.extend(chunk(b"ANIM", &[0, 0, 0, 0, 0, 0]));
+    for _ in 0..frames {
+        let mut anmf = vec![0, 0, 0, 0, 0, 0]; // x, y
+        anmf.extend([2, 0, 0, 2, 0, 0]); // frame 3x3
+        anmf.extend([10, 0, 0, 0]); // duration 10 ms, flags
+        anmf.extend(vp8l);
+        body.extend(chunk(b"ANMF", &anmf));
+    }
+    let mut out = b"RIFF".to_vec();
+    out.extend((body.len() as u32).to_le_bytes());
+    out.extend(body);
+    out
+}
+
+#[test]
+fn lying_header_size_still_stops_at_the_byte_limit() {
+    let env = Env::new();
+    std::fs::create_dir_all(env.zip().parent().unwrap()).unwrap();
+    let mut w = zip::ZipWriter::new(std::fs::File::create(env.zip()).unwrap());
+    w.start_file(
+        "liar.png",
+        SimpleFileOptions::default().compression_method(CompressionMethod::Deflated),
+    )
+    .unwrap();
+    let chunk = vec![0u8; 1024 * 1024];
+    for _ in 0..11 {
+        w.write_all(&chunk).unwrap();
+    }
+    w.finish().unwrap();
+    let mut bytes = std::fs::read(env.zip()).unwrap();
+    // The headers claim 100 uncompressed bytes.
+    for_each_header(&mut bytes, |b, at, central| {
+        patch_u32(b, at + if central { 24 } else { 22 }, 100);
+    });
+    std::fs::write(env.zip(), bytes).unwrap();
+    let s = env.run(&Limits::default()).unwrap();
+    assert!(s.images.is_empty());
+    assert_eq!(s.skipped.len(), 1);
+    assert!(
+        matches!(
+            s.skipped[0].reason,
+            SkipReason::TooLarge | SkipReason::BadImage
+        ),
+        "{:?}",
+        s.skipped
+    );
+    assert!(files_of(&s.dir).is_empty());
+}
+
+#[test]
+fn unsupported_compression_method_is_skipped_safely() {
+    let env = Env::new();
+    env.build(&[("a.png", &png(2, 2, 1)), ("b.png", &png(2, 2, 2))]);
+    let mut bytes = std::fs::read(env.zip()).unwrap();
+    for_each_header(&mut bytes, |b, at, central| {
+        let name_at = at + if central { 46 } else { 30 };
+        if b[name_at..].starts_with(b"a.png") {
+            patch_u16(b, at + if central { 10 } else { 8 }, 12); // bzip2
+        }
+    });
+    std::fs::write(env.zip(), bytes).unwrap();
+    let s = env.run(&Limits::default()).unwrap();
+    assert_eq!(
+        reasons(&s),
+        vec![("a.png".to_string(), SkipReason::BadImage)]
+    );
+    assert_eq!(s.images.len(), 1);
+}
+
+#[test]
+fn decoded_pixel_budget_uses_screen_size_times_frames() {
+    let env = Env::new();
+    env.build(&[
+        ("five.gif", &gif_sized(64, 64, 5)),
+        ("four.gif", &gif_sized(64, 64, 4)),
+    ]);
+    let limits = Limits {
+        max_decoded_pixels: 64 * 64 * 4,
+        ..Limits::default()
+    };
+    let s = env.run(&limits).unwrap();
+    assert_eq!(
+        reasons(&s),
+        vec![("five.gif".to_string(), SkipReason::TooManyPixels)]
+    );
+    assert_eq!(s.images.len(), 1);
+    assert_eq!(s.images[0].name, "four");
+}
+
+#[test]
+fn small_file_with_many_frames_is_stopped_by_the_default_budget() {
+    // A 1024x1024 screen with 300 tiny frames is a few KB on disk but 1.17 GiB decoded.
+    let mut g = gif_sized(1, 1, 300);
+    patch_u16(&mut g, 6, 1024);
+    patch_u16(&mut g, 8, 1024);
+    assert!(g.len() < 20_000);
+    assert_eq!(
+        inspect(&g, Format::Gif, &Limits::default()).err(),
+        Some(SkipReason::TooManyPixels)
+    );
+}
+
+#[test]
+fn gif_frame_larger_than_screen_is_rejected() {
+    let env = Env::new();
+    let mut g = gif(1);
+    patch_u16(&mut g, 6, 1);
+    patch_u16(&mut g, 8, 1);
+    env.build(&[("big.gif", &g), ("ok.gif", &gif(1))]);
+    let s = env.run(&Limits::default()).unwrap();
+    assert_eq!(
+        reasons(&s),
+        vec![("big.gif".to_string(), SkipReason::BadImage)]
+    );
+}
+
+#[test]
+fn animated_webp_uses_canvas_times_frames() {
+    let w = animated_webp(3);
+    let info = inspect(&w, Format::Webp, &Limits::default()).unwrap();
+    assert!(info.animated);
+    assert_eq!((info.width, info.height), (3, 3));
+    let few = Limits {
+        max_frames: 2,
+        ..Limits::default()
+    };
+    assert_eq!(
+        inspect(&w, Format::Webp, &few).err(),
+        Some(SkipReason::TooManyFrames)
+    );
+    let small = Limits {
+        max_decoded_pixels: 3 * 3 * 2,
+        ..Limits::default()
+    };
+    assert_eq!(
+        inspect(&w, Format::Webp, &small).err(),
+        Some(SkipReason::TooManyPixels)
+    );
+}
+
+#[test]
+fn declared_entry_count_is_checked_before_parsing() {
+    let env = Env::new();
+    env.build(&[("a.png", &png(2, 2, 1))]);
+    let mut bytes = std::fs::read(env.zip()).unwrap();
+    let eocd = bytes.windows(4).rposition(|w| w == b"PK\x05\x06").unwrap();
+    patch_u16(&mut bytes, eocd + 8, 501);
+    patch_u16(&mut bytes, eocd + 10, 501);
+    std::fs::write(env.zip(), bytes).unwrap();
+    let err = env.run(&Limits::default()).unwrap_err();
+    assert!(err.contains("too many files (501"), "{err}");
+    assert!(env.staging_dirs().is_empty());
+}
+
+#[test]
+fn zip64_marker_count_is_refused() {
+    let env = Env::new();
+    env.build(&[("a.png", &png(2, 2, 1))]);
+    let mut bytes = std::fs::read(env.zip()).unwrap();
+    let eocd = bytes.windows(4).rposition(|w| w == b"PK\x05\x06").unwrap();
+    patch_u16(&mut bytes, eocd + 10, 0xFFFF);
+    std::fs::write(env.zip(), bytes).unwrap();
+    let err = env.run(&Limits::default()).unwrap_err();
+    assert!(err.contains("too many files"), "{err}");
+}
+
+#[test]
+fn cancel_before_parsing_returns_cancelled_and_leaves_nothing() {
+    let env = Env::new();
+    env.build(&[("a.png", &png(2, 2, 1))]);
+    let cancel = AtomicBool::new(true);
+    let err = env
+        .run_with(&HashSet::new(), &Limits::default(), &cancel)
+        .unwrap_err();
+    assert_eq!(err, "Cancelled");
+    assert!(env.staging_dirs().is_empty());
+}
+
+#[test]
+fn guarded_file_stops_on_cancel_and_on_budget() {
+    let env = Env::new();
+    let path = env.tmp.path().join("data.bin");
+    std::fs::write(&path, vec![7u8; 100]).unwrap();
+    let cancel = AtomicBool::new(false);
+    let over = AtomicBool::new(false);
+    let mut g = GuardedFile {
+        file: std::fs::File::open(&path).unwrap(),
+        remaining: 10,
+        cancel: &cancel,
+        over_budget: &over,
+    };
+    let mut buf = [0u8; 64];
+    assert_eq!(g.read(&mut buf).unwrap(), 10);
+    assert!(g.read(&mut buf).is_err());
+    assert!(over.load(Ordering::Relaxed));
+    cancel.store(true, Ordering::Relaxed);
+    let err = g.read(&mut buf).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+}
+
+#[test]
+fn staging_guard_removes_the_folder_unless_kept() {
+    let env = Env::new();
+    let a = env.tmp.path().join(".staging-a");
+    let b = env.tmp.path().join(".staging-b");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    drop(StagingGuard {
+        dir: a.clone(),
+        armed: true,
+    });
+    StagingGuard {
+        dir: b.clone(),
+        armed: true,
+    }
+    .keep();
+    assert!(!a.exists());
+    assert!(b.exists());
+}
+
+#[test]
+fn bidi_zero_width_and_combining_chars_are_removed() {
+    assert_eq!(
+        sanitize_name("a\u{202E}b\u{200B}c\u{FEFF}d\u{2066}e.png"),
+        "abcde"
+    );
+    assert_eq!(sanitize_name("x\u{AD}y\u{061C}z\u{2060}.png"), "xyz");
+    // Stacked marks are dropped, a precomposed accent survives.
+    assert_eq!(
+        sanitize_name("e\u{301}\u{302}\u{303}\u{304}a.png"),
+        "\u{e9}a"
+    );
+    let env = Env::new();
+    env.build(&[("../ev\u{202E}il\u{200B}.png", &png(2, 2, 1))]);
+    let s = env.run(&Limits::default()).unwrap();
+    assert_eq!(s.skipped.len(), 1);
+    assert_eq!(s.skipped[0].entry, "../evil.png");
+}
+
+#[test]
+fn commit_refuses_empty_images_and_keeps_staging() {
+    let env = Env::new();
+    env.build(&[("fake.png", b"text")]);
+    let s = env.run(&Limits::default()).unwrap();
+    assert!(s.images.is_empty());
+    assert!(commit(&s, &env.emoji(), "empty").is_err());
+    assert!(s.dir.is_dir());
+    assert!(!env.emoji().join("packs").join("empty").exists());
+}
+
+#[test]
+fn commit_does_not_replace_an_existing_pack() {
+    let env = Env::new();
+    env.build(&[("a.png", &png(2, 2, 1))]);
+    let s = env.run(&Limits::default()).unwrap();
+    let packs = env.emoji().join("packs");
+    std::fs::create_dir_all(packs.join("taken")).unwrap();
+    let err = commit(&s, &env.emoji(), "taken").unwrap_err();
+    assert!(err.contains("already exists"), "{err}");
+    assert!(s.dir.is_dir());
+    assert_eq!(files_of(&s.dir).len(), 1);
+}
+
+#[test]
+fn commit_rolls_back_when_a_file_is_missing() {
+    let env = Env::new();
+    env.build(&[("a.png", &png(2, 2, 1)), ("b.png", &png(2, 2, 2))]);
+    let s = env.run(&Limits::default()).unwrap();
+    std::fs::remove_file(s.dir.join(&s.images[1].file)).unwrap();
+    assert!(commit(&s, &env.emoji(), "broken").is_err());
+    assert!(!env.emoji().join("packs").join("broken").exists());
+    assert!(s.dir.join(&s.images[0].file).is_file());
+}
+
+#[test]
+fn discard_ignores_a_folder_that_is_not_staging() {
+    let env = Env::new();
+    let other = env.tmp.path().join("precious");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("keep.txt"), b"x").unwrap();
+    discard(Staged {
+        dir: other.clone(),
+        source_name: String::new(),
+        entries: 0,
+        images: vec![],
+        skipped: vec![],
+    });
+    assert!(other.join("keep.txt").is_file());
 }
