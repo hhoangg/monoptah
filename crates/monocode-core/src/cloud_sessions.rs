@@ -2208,6 +2208,7 @@ impl StartupSummary {
     }
 }
 
+pub mod auto_stop;
 pub mod backend;
 pub mod claude_pin;
 pub mod claude_setup;
@@ -2241,6 +2242,8 @@ pub use startup::{
 };
 
 // These fixtures execute the Linux host scripts against local Unix paths.
+#[cfg(test)]
+mod auto_stop_tests;
 #[cfg(test)]
 mod claude_pin_tests;
 #[cfg(all(test, unix))]

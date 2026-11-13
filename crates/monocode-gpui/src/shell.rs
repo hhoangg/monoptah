@@ -11,6 +11,9 @@ mod classic_surfaces;
 mod claude_setup;
 mod cloud;
 mod cloud_app_archive;
+mod cloud_auto_stop;
+#[cfg(test)]
+mod cloud_auto_stop_tests;
 mod cloud_continue;
 #[cfg(test)]
 mod cloud_continue_tests;
@@ -791,6 +794,23 @@ pub(crate) struct Shell {
     #[cfg(test)]
     remote_refresh_stub: Option<Result<(), String>>,
     _cloud_clock: gpui::Task<()>,
+    /// The cloud auto-stop policy: idle clocks only, see `shell/cloud_auto_stop.rs`.
+    auto_stop: monocode_core::cloud_sessions::auto_stop::AutoStop,
+    auto_stop_epoch: std::time::Instant,
+    _auto_stop_clock: gpui::Task<()>,
+    /// Workspaces (`CloudRef::key`) whose auto-stop worker runs now.
+    auto_stop_running: cloud_auto_stop::StoppingWorkspaces,
+    /// Workspaces whose last automatic stop failed and was already shown in the error line.
+    auto_stop_failed: HashSet<String>,
+    /// Terminals running a shell on a cloud workspace, with whether the user asked for it (the
+    /// session menu) as opposed to the app opening a codespace's panel shell by itself. Activity
+    /// for the auto-stop while open (and, for the app's own, once typed in). Weak, so closing
+    /// one in the dock drops it.
+    cloud_terminals: Vec<(
+        monocode_core::cloud_sessions::CloudRef,
+        gpui::WeakEntity<crate::terminal::Terminal>,
+        bool,
+    )>,
     sessions: HashMap<i64, Entity<Conversation>>,
     /// Sessions that run as their provider's CLI. A session is in exactly one of
     /// this map and `sessions`; a terminal session never gets a `Conversation`.
@@ -1080,6 +1100,7 @@ impl Shell {
         let gh = cloud::default_gh();
         let cloud = cloud::service(gh.clone(), remote.clone(), store.clone());
         let cloud_clock = cloud::refresh_loop(cx);
+        let auto_stop_clock = cloud_auto_stop::clock(cx);
         let metadata: Vec<_> = summaries.iter().map(|s| (s.id, s.cwd.clone())).collect();
         let workspace = Workspace::restore(saved.as_deref(), &metadata, &cwd);
         monocode_core::cli::initialize(&workspace.preferences.binary_paths);
@@ -1279,6 +1300,12 @@ impl Shell {
             codespace_picker: None,
             sandbox_picker: None,
             _cloud_clock: cloud_clock,
+            auto_stop: Default::default(),
+            auto_stop_epoch: std::time::Instant::now(),
+            _auto_stop_clock: auto_stop_clock,
+            auto_stop_running: cloud_auto_stop::StoppingWorkspaces::default(),
+            auto_stop_failed: HashSet::new(),
+            cloud_terminals: Vec::new(),
             sessions: HashMap::new(),
             tui_sessions: HashMap::new(),
             tui_events: HashMap::new(),
@@ -1876,6 +1903,9 @@ impl Shell {
         if !self.order.contains(&id) {
             self.order.push(id);
         }
+        // Opened while its workspace is being stopped: locked like the conversations that were
+        // already open.
+        self.sync_auto_stopping(cx);
     }
     /// SessionPane's reviewUndoLocked: another running session shares the checkout.
     fn sync_review_locks(&mut self, cx: &mut Context<Self>) {

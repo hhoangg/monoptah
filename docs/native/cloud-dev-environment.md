@@ -134,3 +134,68 @@ toolchain and libraries, and reports a missing token as a warning.
   is app-side work (the secrets seam in `cloud_sessions/docker_start.rs`), outside this change.
   In Codespaces, `GITHUB_TOKEN`/`GH_TOKEN` can come from Codespaces secrets.
 - Never put a token in this folder, the Dockerfile or `containerEnv`.
+
+## Stopping idle workspaces (cost control)
+
+A running workspace costs money whether or not anyone uses it. A Docker sandbox bills per runtime
+second (after the credit, to the card) until its runtime limit ends it, and a session that is
+finished or forgotten leaves it running. **Settings > Cloud > Cost control** makes the app stop such
+a workspace. It only ever **stops**: nothing is deleted, the state is kept, and the session shows the
+usual Stopped state with Resume. The next message you send resumes it, exactly as after a manual Stop.
+
+| Setting | Docker sandbox | Codespace |
+| --- | --- | --- |
+| Auto-stop after N minutes of inactivity (Off, 5, 10, 15, 30) | **10** | **Off** |
+| Auto-stop when its last session is gone (archived or deleted) | **On** | **Off** |
+
+These are Monoptah's own rules and are named apart from the per-project **Stop when idle** of a
+project's cloud settings, which is GitHub's codespace timeout, set when the codespace is created.
+
+Codespaces default to off because GitHub already idles a codespace out after 30 minutes; turn it on
+to stop sooner. The settings are global (they apply to every project); a per-project override is not
+there yet.
+
+**Idle** means all of this, for every session on the workspace:
+
+* no turn is running and nothing waits for input, no terminal or background task is busy, and **no
+  terminal is open on the workspace**: a shell you opened from the session menu, or a codespace's
+  panel shell once you typed in it (the app opens that one by itself, and an untouched prompt is not
+  work). A dev server or a build there is work too, and a quiet one cannot be told from a forgotten
+  prompt, so an open shell holds the workspace until you close it. The idle time counts from then;
+* nothing is queued, starting, restoring, being moved, archived or converted, and no file is waiting
+  to be copied to this computer (a session with a sync problem, or an unsaved file in the editor,
+  counts as busy);
+* the app saw no typing in a composer (an edit by you: not a restored draft or a placeholder), send or
+  Resume click in those sessions for N minutes, counted from the last such activity (or from when the app first saw the workspace, so restarting the app never stops
+  anything at once).
+
+When the app does not know something (the workspace state has not been read, or a session's data is
+missing) it does **not** stop. Only a workspace the app reads as running is ever stopped.
+
+**Last session archived or deleted**: when no session of the window uses a workspace any more, it is
+stopped after a short grace (the idle time, or 5 minutes when idle stopping is off). Your own choices
+win: a workspace you archived with **Keep running**, or removed with **Remove from Monoptah**, is
+**never** stopped for being unused (those dialogs say it keeps running), until you resume it from a
+session. An open terminal on it also holds it. The app re-reads the store first and does nothing if a
+session of another project still uses it. While other sessions still use it, the idle rule applies to it
+as usual.
+
+How it runs: once a minute the app looks at session state it already holds in memory. It does not
+call `gh` or `sbx` for the check. Only when a workspace crosses its threshold does one worker read the
+state again and stop it through the same call the Stop menu uses. The stop takes seconds, so for that
+long the app holds the workspace the way an archive does: it is marked busy (archive, delete, continue
+locally, a new terminal and the `cloud.*` app actions refuse), the composers of its sessions refuse a
+send ("Monoptah is stopping this workspace after it sat idle. Nothing was sent; send again in a moment
+and it will resume.", the typed text stays) and so do app and Mono turns. The worker is given the same
+live view of busy sessions that `cloud.stop` gets and checks it before the state read and again just
+before the stop call, so a turn that started a second ago, which the stored flags (polled every 30 s)
+do not show yet, is never cut off. If the stop fails (an expired Docker token, `sbx` or `gh` failing)
+the error line says so and that the workspace is still running; it is shown once per workspace until a
+stop works, and every failure is also written to the log. A notice says what happened ("Stopped
+Docker sandbox NAME after 10 min idle; send a message to resume."). A stop is asked for once; a
+stopped workspace is not stopped again, and a refused or failed stop waits for a whole new window.
+Background work (a Mono, an automation, the app API) never resumes a stopped workspace; only your own
+send or the Resume button does.
+
+Not covered: a workspace with **no** Monoptah session (an orphan, for example from a failed start)
+is never stopped by this. Stop or delete it by hand in **Cloud workspaces**.

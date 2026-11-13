@@ -159,6 +159,9 @@ pub(crate) struct Terminal {
     /// A command other than the shell holds the terminal.
     pub foreground: Option<String>,
     pub exited: bool,
+    /// The user typed, pasted or ran a command here (any byte `input` sent), ever. A shell
+    /// the app opened by itself that nobody touched stays false.
+    pub(crate) user_typed: bool,
     size: GridSize,
     geometry: Rc<Cell<Option<Geometry>>>,
     master_fd: i32,
@@ -589,6 +592,7 @@ impl Terminal {
             cwd,
             foreground: None,
             exited: false,
+            user_typed: false,
             size,
             geometry: Rc::default(),
             master_fd,
@@ -761,6 +765,7 @@ impl Terminal {
     }
     /// Typing returns a scrolled-back view to the prompt.
     fn input(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        self.user_typed = true;
         self.stop_selection();
         {
             let mut term = self.term.lock();

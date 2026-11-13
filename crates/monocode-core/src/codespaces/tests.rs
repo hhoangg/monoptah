@@ -414,6 +414,22 @@ fn stop_and_delete_argv() {
 }
 
 #[test]
+fn a_stop_is_one_bounded_call_that_never_deletes() {
+    // The real runner kills a call at `call_timeout`: a stop gets the slow class (120 s), so a
+    // hung `gh codespace stop` fails instead of holding its worker forever.
+    let argv = v(&["codespace", "stop", "-c", "cs-1"]);
+    assert_eq!(super::call_timeout(&argv), super::SLOW_CALL_TIMEOUT);
+    // A runner that gave up (what a kill reports) makes `stop` an `Err` after exactly one call.
+    let fake = Fake::new(vec![Err(
+        "GitHub CLI did not answer within 120 seconds (`gh codespace stop`).".into(),
+    )]);
+    let error = stop(&fake, "cs-1").unwrap_err();
+    assert!(error.contains("did not answer"), "{error}");
+    assert_eq!(fake.calls().len(), 1);
+    assert_eq!(fake.argv(0), argv);
+}
+
+#[test]
 fn list_machines_argv_and_parse() {
     let json = r#"{"total_count":2,"machines":[
       {"name":"basicLinux32gb","display_name":"2 cores, 8 GB RAM, 32 GB storage","operating_system":"linux","storage_in_bytes":34359738368,"memory_in_bytes":8589934592,"cpus":2,"prebuild_availability":null},
