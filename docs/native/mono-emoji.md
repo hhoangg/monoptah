@@ -91,8 +91,8 @@ title, body, actions, buttons) above the settings modal.
   ...)", "Sorting into emotions with <Mono>'s model (<model>)... X of N" with a progress bar.
 - Review grid: one box per emotion plus Unsorted with the suggested emoji, and a line like
   "1 emoji went to Unsorted." When sorting fell back to names, a notice says so.
-- Buttons: Cancel (drops the staging folder, nothing saved), Import without sorting (all to
-  Unsorted), Use this sorting. Nothing is saved until one of the last two is pressed. Then
+- Buttons: Cancel (stops the whole queue, drops the staging folder, nothing more is saved;
+  zips already saved stay), Import without sorting (all to Unsorted), Use this sorting. Nothing is saved until one of the last two is pressed. Then
   the next zip in the queue starts. Footer note: "Files are copied into Monoptah's data
   folder; the zip can be deleted."
 - Re-sort reuses the same dialog for an existing pack (no unpack step; Use this sorting
@@ -119,24 +119,34 @@ title, body, actions, buttons) above the settings modal.
   one-off text support (`session_title::supports(kind)` false), or a call that fails or
   returns no usable JSON, falls back to a name-based suggestion (keywords from the file name
   matched against emotion names, descriptions and a small synonym table) and the dialog
-  says "<model> could not sort by image, so emoji were suggested from their file names."
+  says "<model> cannot sort by image, so emoji were suggested from their file names." (no
+  runner) or "<model> could not sort by image, so ..." (the first batch failed or returned no
+  usable JSON). A later batch that fails leaves its emoji in Unsorted. The names fallback
+  suggests nothing for a file name that matches no emotion (it stays Unsorted).
 
 ## Mono usage
 
 - When the switch is on and at least one emotion has an emoji in an enabled pack,
   `mono::context` gets an `<emoji>` block (inside `<monocode_context>`, after memory): the
   usable emotion names with descriptions (no image list), the frequency guidance, and the
-  syntax: write `:emo[<emotion>]` inline or on its own line; never in code, code blocks,
+  syntax: write `:emo[<emotion>]` inline or alone on its line; never in code, code blocks,
   commands, commit messages, PR text, reports, files or tool input. The context fingerprint
   in `runtime.rs` resends it when it changes.
 - Rendering, Mono chat transcripts only (`TranscriptView` in Mono mode with the Mono's emoji
-  library set): after markdown parsing, plain runs (not code, math, links) are scanned for
+  library set, pushed by `Monos` after the library loads or changes and after a chat is
+  configured; habit and workflow run transcripts get it too when the library is already
+  loaded): after markdown parsing, plain runs (not code, math, links) are scanned for
   `:emo[<name>]`. The name matches an emotion case-insensitively. The pick is a random emoji
-  of that emotion across enabled packs, seeded from the session id, the message's stable
-  store row and the token index, so a re-render shows the same picture. A token inline is
-  drawn at text size; a token alone on its line is drawn larger (56 px). GIFs animate.
-  Hover shows "<emoji name> · <emotion>". An unknown or empty emotion, or the switch off,
-  renders nothing. Tokens inside code blocks and inline code stay as text.
+  of that emotion across enabled packs, seeded from the session id, a hash of the message's
+  raw source text before the token and the token index within the message. It does not use
+  row numbers, so a re-render, a history page or an app restart shows the same picture, and
+  text streaming in after the token does not change it. Two messages with the same text
+  before a token get the same picture. A token inline is drawn at text size (20 px); a token
+  alone on its line (only a quote or list marker before it, nothing after) is drawn larger
+  (56 px). GIFs animate. Hover shows "<emoji name> · <emotion>". Nothing is drawn, and no
+  space is left, for: the switch off, an unknown or empty emotion, an emotion with no emoji
+  in an enabled pack, an image file that is gone, or a library that is not loaded yet.
+  Tokens inside code blocks and inline code stay as text.
 - The token is an empty-text run, so selection copy and search see nothing. "Copy response",
   "Save as note", "Quote response" and outward reply text (Telegram, phone) strip tokens with
   a code-aware stripper in core.

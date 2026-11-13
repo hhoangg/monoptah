@@ -771,3 +771,50 @@ fn rapid_edits_are_written_one_at_a_time_and_the_last_wins(cx: &mut TestAppConte
     assert_eq!(saved.frequency, emoji::Frequency::Often);
     assert!(!saved.enabled);
 }
+
+#[gpui::test]
+fn the_chat_draws_emoji_tokens_while_the_switch_is_on(cx: &mut TestAppContext) {
+    use monocode_core::transcript::Row;
+    let (s, mut visual, _) = seeded_page(cx, three());
+    click(&mut visual, "mono-emoji-enabled");
+    visual.run_until_parked();
+    assert!(library_of(&s, &visual).enabled);
+    let chat = s.manager.read_with(&visual, |m, _| m.chats[&s.id].clone());
+    // A Mono chat shows its transcript once the session has messages.
+    chat.update(&mut visual, |c, cx| {
+        c.summary.has_messages = true;
+        cx.notify();
+    });
+    let transcript = chat.read_with(&visual, |c, _| c.transcript.clone());
+    let row = |role: &str, text: &str| Row {
+        role: role.into(),
+        text: text.into(),
+        first: true,
+        sent_at: None,
+    };
+    transcript.update(&mut visual, |t, cx| {
+        t.patch(
+            0,
+            vec![row("user", "hi"), row("assistant", "Nice :emo[happy] work")],
+            cx,
+        )
+    });
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    let rows = transcript.read_with(&visual, |t, _| t.source_rows().len());
+    assert_eq!(rows, 2, "the patched rows are still there");
+    assert!(
+        visual.debug_bounds("mono-emoji-happy").is_some(),
+        "the chat draws the picture"
+    );
+    click(&mut visual, "mono-emoji-enabled");
+    visual.run_until_parked();
+    assert!(!library_of(&s, &visual).enabled);
+    visual.refresh().unwrap();
+    assert!(
+        visual.debug_bounds("mono-emoji-happy").is_none(),
+        "switching it off removes the picture"
+    );
+}

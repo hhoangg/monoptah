@@ -903,6 +903,9 @@ impl Monos {
                     }
                     view.load(cx);
                 });
+                // Pushed after `configure_mono`, so the chat draws emoji right away when
+                // the library finished loading first; otherwise `emoji_changed` follows it.
+                this.push_emoji(&id, &view, cx);
                 let source = id.clone();
                 this.observations.push(cx.subscribe(
                     &view,
@@ -1058,6 +1061,7 @@ impl Monos {
                 .unwrap_or_default();
             let root = self.root.clone();
             view.update(cx, |view, cx| view.configure_mono(mono, root, env, cx));
+            self.push_emoji(id, &view, cx);
         }
     }
     fn enqueue(

@@ -901,8 +901,6 @@ impl TranscriptView {
     }
     /// Set (or clear) the Mono's emoji library. Every message is laid out again, because the
     /// pictures, and whether tokens show at all, come from it.
-    // Reached through `Conversation::set_mono_emoji`, which the Mono settings page calls.
-    #[allow(dead_code)]
     pub(crate) fn set_emoji(&mut self, emoji: Option<emoji::MonoEmoji>, cx: &mut Context<Self>) {
         let unchanged = match (&self.emoji, &emoji) {
             (None, None) => true,
@@ -3860,12 +3858,8 @@ impl TranscriptView {
                 } else {
                     shown
                 };
-                let mut tokens = (self.mono && role == "assistant").then(|| {
-                    // Store rows keep their number through a page prepend, which moves
-                    // `at` and `base` together.
-                    let stable = (at as isize - self.base as isize) as usize;
-                    emoji::MessageTokens::new(self.emoji.as_ref(), stable, shown)
-                });
+                let mut tokens = (self.mono && role == "assistant")
+                    .then(|| emoji::MessageTokens::new(self.emoji.as_ref(), shown));
                 parser.set_text(shown);
                 let tree = if self.reveals.get(&at).is_some_and(PacedText::behind)
                     || (self.streaming && end == self.source.len())

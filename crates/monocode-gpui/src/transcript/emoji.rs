@@ -22,8 +22,6 @@ pub(crate) struct MonoEmoji {
 }
 
 impl MonoEmoji {
-    // The Mono settings page builds it when it loads or edits the library.
-    #[allow(dead_code)]
     pub(crate) fn new(library: Arc<Library>, dir: PathBuf) -> Self {
         Self {
             library,
@@ -36,8 +34,12 @@ impl MonoEmoji {
 /// The tokens of one assistant message while its blocks are turned into rows.
 pub(super) struct MessageTokens<'a> {
     emoji: Option<&'a MonoEmoji>,
-    /// The stable store row of the message start.
-    row: usize,
+    /// The raw message source. The pick seed hashes the part before a token: unlike a view
+    /// row or a store row, it is the same after a restart that loads another history
+    /// window, and it does not change while the reply streams in after the token.
+    text: &'a str,
+    /// Start offset in `text` of every token outside code, in source order.
+    starts: Vec<usize>,
     /// Name and "alone on its line" of every token outside code, in source order.
     lines: Vec<(String, bool)>,
     /// How many tokens earlier blocks of this message held. It is the seed index.
@@ -45,10 +47,14 @@ pub(super) struct MessageTokens<'a> {
 }
 
 impl<'a> MessageTokens<'a> {
-    pub fn new(emoji: Option<&'a MonoEmoji>, row: usize, text: &str) -> Self {
+    pub fn new(emoji: Option<&'a MonoEmoji>, text: &'a str) -> Self {
         Self {
             emoji,
-            row,
+            text,
+            starts: token::outside_code(text)
+                .into_iter()
+                .map(|t| t.range.start)
+                .collect(),
             lines: token::standalone(text),
             cursor: 0,
         }
@@ -174,7 +180,8 @@ impl<'a> MessageTokens<'a> {
 
     fn pick(&self, name: &str, index: usize, large: bool) -> Option<EmojiPick> {
         let emoji = self.emoji?;
-        let seed = token::seed(&emoji.session, self.row, index);
+        let start = self.starts.get(index).copied().unwrap_or(self.text.len());
+        let seed = token::seed_for(&emoji.session, &self.text[..start], index);
         let (pack, picked) = token::pick(&emoji.library, name, seed)?;
         let path = image_path(&emoji.dir, pack, picked);
         // A file that is gone draws nothing and takes no room.

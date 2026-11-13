@@ -1,4 +1,4 @@
-use super::token::{find, incomplete_tail, pick, seed, standalone, strip};
+use super::token::{find, incomplete_tail, pick, seed_for, standalone, strip};
 use super::*;
 use std::collections::HashMap;
 
@@ -440,16 +440,18 @@ fn incomplete_tail_ignores_code() {
     assert_eq!(incomplete_tail("`a` :emo[ha"), Some(4));
 }
 
-const PINNED_SEED: u64 = 0x8b7e_502d_ca56_4b79;
+const PINNED_SEED: u64 = 0xd519_5361_3938_39fe;
 
 #[test]
 fn seed_is_stable_and_varies() {
-    assert_eq!(seed("s", 1, 0), seed("s", 1, 0));
-    assert_ne!(seed("s", 1, 0), seed("s", 1, 1));
-    assert_ne!(seed("s", 1, 0), seed("s", 2, 0));
-    assert_ne!(seed("s", 1, 0), seed("t", 1, 0));
+    assert_eq!(seed_for("s", "Nice ", 0), seed_for("s", "Nice ", 0));
+    assert_ne!(seed_for("s", "Nice ", 0), seed_for("s", "Nice ", 1));
+    assert_ne!(seed_for("s", "Nice ", 0), seed_for("s", "Great ", 0));
+    assert_ne!(seed_for("s", "Nice ", 0), seed_for("t", "Nice ", 0));
+    // The boundary byte keeps session and prefix from running together.
+    assert_ne!(seed_for("ab", "c", 0), seed_for("a", "bc", 0));
     // A fixed value guards against swapping the hash for a per-process one.
-    assert_eq!(seed("session", 3, 2), PINNED_SEED);
+    assert_eq!(seed_for("session", "Nice ", 2), PINNED_SEED);
 }
 
 #[test]

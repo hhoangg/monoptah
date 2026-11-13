@@ -1,7 +1,7 @@
 use super::*;
 use image::{ExtendedColorType, ImageEncoder, RgbaImage};
-use zip::CompressionMethod;
 use zip::write::SimpleFileOptions;
+use zip::CompressionMethod;
 
 fn rgba(w: u32, h: u32, seed: u8) -> RgbaImage {
     RgbaImage::from_fn(w, h, |x, y| {
@@ -226,10 +226,9 @@ fn skips_each_unsafe_or_ignored_entry_with_its_reason() {
     has("/abs.png", SkipReason::UnsafePath);
     has("C:\\x.png", SkipReason::UnsafePath);
     has("a\\..\\..\\b.png", SkipReason::UnsafePath);
-    assert!(
-        r.iter()
-            .any(|(n, rs)| n.starts_with("nul") && *rs == SkipReason::UnsafePath)
-    );
+    assert!(r
+        .iter()
+        .any(|(n, rs)| n.starts_with("nul") && *rs == SkipReason::UnsafePath));
     has("__MACOSX/._a.png", SkipReason::MacMetadata);
     has("x/__MACOSX/a.png", SkipReason::MacMetadata);
     has(".hidden.png", SkipReason::Hidden);
@@ -313,11 +312,10 @@ fn nested_archive_magic_bytes_are_detected() {
     ]);
     let s = env.run(&Limits::default()).unwrap();
     assert_eq!(s.skipped.len(), 7);
-    assert!(
-        s.skipped
-            .iter()
-            .all(|k| k.reason == SkipReason::NestedArchive)
-    );
+    assert!(s
+        .skipped
+        .iter()
+        .all(|k| k.reason == SkipReason::NestedArchive));
 }
 
 #[test]
@@ -434,11 +432,10 @@ fn duplicates_within_zip_and_against_existing_are_skipped() {
         .unwrap();
     assert_eq!(s.images.len(), 1);
     assert_eq!(s.images[0].name, "a");
-    assert!(
-        s.skipped
-            .iter()
-            .any(|k| k.entry == "b.png" && k.reason == SkipReason::Duplicate)
-    );
+    assert!(s
+        .skipped
+        .iter()
+        .any(|k| k.entry == "b.png" && k.reason == SkipReason::Duplicate));
 }
 
 #[test]

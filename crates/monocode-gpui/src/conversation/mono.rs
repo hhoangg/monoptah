@@ -186,8 +186,6 @@ impl Conversation {
     /// each `:emo[<emotion>]` token of the Mono's replies as a picture of that emotion.
     /// `emoji.session` is overwritten with this conversation's session id, so the same
     /// reply shows the same pictures after a re-render, a history page or a restart.
-    // Called by the Mono settings page when it loads or edits the library.
-    #[allow(dead_code)]
     pub(crate) fn set_mono_emoji(
         &mut self,
         emoji: Option<crate::transcript::emoji::MonoEmoji>,

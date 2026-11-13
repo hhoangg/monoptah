@@ -190,11 +190,8 @@ pub fn strip(markdown: &str) -> String {
     out
 }
 
-/// For every token outside code, in source order: its name and whether it is alone on its
-/// line (nothing but a quote or list marker before it, nothing after). The markdown parser
-/// folds soft breaks into spaces, so a renderer asks this to tell a token on its own line
-/// from one inside a sentence.
-pub fn standalone(markdown: &str) -> Vec<(String, bool)> {
+/// The tokens outside code, in source order.
+pub fn outside_code(markdown: &str) -> Vec<Token> {
     if !markdown.contains(PREFIX) {
         return Vec::new();
     }
@@ -202,6 +199,16 @@ pub fn standalone(markdown: &str) -> Vec<(String, bool)> {
     find(markdown)
         .into_iter()
         .filter(|t| !in_code(&code, t.range.start))
+        .collect()
+}
+
+/// For every token outside code, in source order: its name and whether it is alone on its
+/// line (nothing but a quote or list marker before it, nothing after). The markdown parser
+/// folds soft breaks into spaces, so a renderer asks this to tell a token on its own line
+/// from one inside a sentence.
+pub fn standalone(markdown: &str) -> Vec<(String, bool)> {
+    outside_code(markdown)
+        .into_iter()
         .map(|token| {
             let line_start = markdown[..token.range.start]
                 .rfind('\n')
@@ -261,9 +268,12 @@ pub fn incomplete_tail(text: &str) -> Option<usize> {
     (!in_code(&code, start)).then_some(start)
 }
 
-/// A stable seed for a token: the same session, message row and token index always give
-/// the same value, on every run and platform (FNV-1a 64).
-pub fn seed(session_id: &str, message_row: usize, index: usize) -> u64 {
+/// A stable seed for a token: the session, the message source before the token and the
+/// token index within the message always give the same value, on every run and platform
+/// (FNV-1a 64). The prefix does not change while the reply streams in, and it does not
+/// depend on which rows the loaded history window starts at, so a picture stays the same
+/// after a re-render, a history page or an app restart.
+pub fn seed_for(session_id: &str, prefix: &str, index: usize) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let mut feed = |bytes: &[u8]| {
         for byte in bytes {
@@ -273,7 +283,8 @@ pub fn seed(session_id: &str, message_row: usize, index: usize) -> u64 {
     };
     feed(session_id.as_bytes());
     feed(&[0xff]);
-    feed(&(message_row as u64).to_le_bytes());
+    feed(prefix.as_bytes());
+    feed(&[0xff]);
     feed(&(index as u64).to_le_bytes());
     hash
 }

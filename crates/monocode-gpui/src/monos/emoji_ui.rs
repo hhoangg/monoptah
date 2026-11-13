@@ -7,6 +7,7 @@
 use super::emoji_import::{self, ImportDialog};
 use super::panels::{card, setting, switch_setting, switch_track};
 use super::*;
+use crate::transcript::emoji::MonoEmoji;
 use crate::{
     attachment_tray::{DropHooks, NO_FILE_DRAGGED, bind_drop},
     cloud_dialog_ui::alert,
@@ -231,12 +232,27 @@ impl Monos {
         .detach();
     }
 
-    /// The Mono's library changed, or was loaded or saved.
+    /// The Mono's library changed, or was loaded or saved: hand it to the Mono's chat.
     pub(super) fn emoji_changed(&mut self, mono_id: &str, cx: &mut Context<Self>) {
-        // Wire to Conversation::set_mono_emoji: pass this Mono's `(dir, Arc<Library>)` from
-        // `self.emoji` to its chat (`self.chats`) so the transcript can draw `:emo[...]`.
-        let _ = mono_id;
+        if let Some(chat) = self.chats.get(mono_id).cloned() {
+            self.push_emoji(mono_id, &chat, cx);
+        }
         cx.notify();
+    }
+
+    /// Gives a conversation that runs in this Mono's mode the Mono's current library. Nothing
+    /// is changed while the library is not loaded yet; `emoji_changed` follows the load.
+    pub(super) fn push_emoji(
+        &self,
+        mono_id: &str,
+        chat: &Entity<Conversation>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((dir, library)) = self.emoji.get(mono_id) else {
+            return;
+        };
+        let emoji = MonoEmoji::new(library.clone(), dir.clone());
+        chat.update(cx, |chat, cx| chat.set_mono_emoji(Some(emoji), cx));
     }
 
     /// Changes a Mono's library in place and queues it for writing. An `Err` leaves the library

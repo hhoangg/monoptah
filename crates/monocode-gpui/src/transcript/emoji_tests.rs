@@ -100,8 +100,8 @@ fn fixture(enabled: bool) -> Fixture {
     }
 }
 
-fn rows_of(text: &str, emoji: Option<&MonoEmoji>, row_ix: usize) -> Vec<MarkdownRow> {
-    let mut tokens = MessageTokens::new(emoji, row_ix, text);
+fn rows_of(text: &str, emoji: Option<&MonoEmoji>) -> Vec<MarkdownRow> {
+    let mut tokens = MessageTokens::new(emoji, text);
     let mut out = Vec::new();
     for block in parse_full(text).blocks {
         out.extend(tokens.apply(markdown::rows(&block.block)));
@@ -142,7 +142,7 @@ fn picks(rows: &[MarkdownRow]) -> Vec<PathBuf> {
 #[test]
 fn an_inline_token_becomes_a_small_picture_with_one_space_each_side() {
     let fx = fixture(true);
-    let rows = rows_of("Great :emo[happy] job", Some(&fx.emoji), 4);
+    let rows = rows_of("Great :emo[happy] job", Some(&fx.emoji));
     assert_eq!(shape(&rows), [["Great ", "<happy>", "job"]]);
     assert_eq!(
         markdown::selection_text(&rows[0]),
@@ -154,14 +154,14 @@ fn an_inline_token_becomes_a_small_picture_with_one_space_each_side() {
 #[test]
 fn a_token_alone_on_its_line_is_large_and_the_line_breaks_around_it() {
     let fx = fixture(true);
-    let rows = rows_of("Hello\n:emo[celebrate]\nbye", Some(&fx.emoji), 2);
+    let rows = rows_of("Hello\n:emo[celebrate]\nbye", Some(&fx.emoji));
     assert_eq!(shape(&rows), [["Hello", "<<celebrate>>", "bye"]]);
 }
 
 #[test]
 fn a_paragraph_of_only_tokens_is_large() {
     let fx = fixture(true);
-    let rows = rows_of("Done.\n\n:emo[celebrate]\n\nNext", Some(&fx.emoji), 2);
+    let rows = rows_of("Done.\n\n:emo[celebrate]\n\nNext", Some(&fx.emoji));
     assert_eq!(
         shape(&rows),
         [vec!["Done."], vec!["<<celebrate>>"], vec!["Next"]]
@@ -174,7 +174,6 @@ fn several_tokens_are_each_sized_by_their_own_place() {
     let rows = rows_of(
         "a :emo[happy] b :emo[celebrate] c\n:emo[happy]\n",
         Some(&fx.emoji),
-        2,
     );
     assert_eq!(
         shape(&rows),
@@ -186,12 +185,12 @@ fn several_tokens_are_each_sized_by_their_own_place() {
 fn an_unknown_empty_or_missing_file_token_is_removed_without_a_double_space() {
     let fx = fixture(true);
     for token in ["nonsense", "", "sad"] {
-        let rows = rows_of(&format!("Hi :emo[{token}] there"), Some(&fx.emoji), 1);
+        let rows = rows_of(&format!("Hi :emo[{token}] there"), Some(&fx.emoji));
         assert_eq!(shape(&rows), [["Hi there"]], "token {token:?}");
     }
-    let rows = rows_of("Bye :emo[nonsense]", Some(&fx.emoji), 1);
+    let rows = rows_of("Bye :emo[nonsense]", Some(&fx.emoji));
     assert_eq!(shape(&rows), [["Bye"]]);
-    let rows = rows_of("Before\n\n:emo[nonsense]\n\nAfter", Some(&fx.emoji), 1);
+    let rows = rows_of("Before\n\n:emo[nonsense]\n\nAfter", Some(&fx.emoji));
     assert_eq!(
         shape(&rows),
         [vec!["Before"], vec!["After"]],
@@ -202,16 +201,16 @@ fn an_unknown_empty_or_missing_file_token_is_removed_without_a_double_space() {
 #[test]
 fn the_match_ignores_case_and_surrounding_space() {
     let fx = fixture(true);
-    let rows = rows_of("x :emo[ HAPPY ] y", Some(&fx.emoji), 1);
+    let rows = rows_of("x :emo[ HAPPY ] y", Some(&fx.emoji));
     assert_eq!(shape(&rows), [["x ", "<happy>", "y"]]);
 }
 
 #[test]
 fn a_disabled_or_missing_library_removes_every_token() {
     let off = fixture(false);
-    let rows = rows_of("Hi :emo[happy] there", Some(&off.emoji), 1);
+    let rows = rows_of("Hi :emo[happy] there", Some(&off.emoji));
     assert_eq!(shape(&rows), [["Hi there"]]);
-    let rows = rows_of("Hi :emo[happy] there", None, 1);
+    let rows = rows_of("Hi :emo[happy] there", None);
     assert_eq!(shape(&rows), [["Hi there"]]);
 }
 
@@ -221,7 +220,6 @@ fn code_keeps_the_literal_token() {
     let rows = rows_of(
         "Run `:emo[happy]` ok :emo[happy]\n\n```\n:emo[happy]\n```\n",
         Some(&fx.emoji),
-        1,
     );
     let Part::Text { runs, .. } = &rows[0].part else {
         panic!("text row")
@@ -243,7 +241,6 @@ fn links_are_not_scanned_and_tables_are() {
     let rows = rows_of(
         "[:emo[happy]](https://example.com)\n\n| a | b |\n|---|---|\n| :emo[happy] | x |\n",
         Some(&fx.emoji),
-        1,
     );
     let Part::Text { runs, .. } = &rows[0].part else {
         panic!("text row")
@@ -258,14 +255,17 @@ fn links_are_not_scanned_and_tables_are() {
 }
 
 #[test]
-fn the_pick_is_the_same_on_every_render_and_follows_the_seed() {
+fn the_pick_is_the_same_on_every_render_and_follows_the_content() {
     let fx = fixture(true);
     let text = "a :emo[happy] b :emo[happy] c :emo[happy] d :emo[happy]";
-    let first = picks(&rows_of(text, Some(&fx.emoji), 9));
-    assert_eq!(first, picks(&rows_of(text, Some(&fx.emoji), 9)));
+    let first = picks(&rows_of(text, Some(&fx.emoji)));
+    assert_eq!(first, picks(&rows_of(text, Some(&fx.emoji))));
     assert_eq!(first.len(), 4);
+    // The text after a token does not move it (a streaming reply keeps its pictures).
+    let longer = format!("{text} and then more");
+    assert_eq!(first, picks(&rows_of(&longer, Some(&fx.emoji))));
     let varied = (0..12)
-        .map(|row| picks(&rows_of(text, Some(&fx.emoji), row)))
+        .map(|n| picks(&rows_of(&format!("{n} {text}"), Some(&fx.emoji))))
         .collect::<std::collections::HashSet<_>>();
     assert!(varied.len() > 1, "other messages draw other pictures");
 }
@@ -430,6 +430,31 @@ fn a_history_page_above_the_window_does_not_change_the_pictures(cx: &mut TestApp
         })
         .unwrap();
     assert_eq!(before, after);
+}
+
+#[gpui::test]
+fn two_views_with_different_window_bases_pick_the_same_emoji(cx: &mut TestAppContext) {
+    let fx = fixture(true);
+    let text = "a :emo[happy] b :emo[happy]";
+    let picks_in = |cx: &mut TestAppContext, lead: usize| {
+        let window = open_view(cx, Some(fx.emoji.clone()), true);
+        window
+            .update(cx, |view, _, cx| {
+                let mut rows = Vec::new();
+                for _ in 0..lead {
+                    rows.push(row("user", "hi"));
+                    rows.push(row("assistant", "old"));
+                }
+                rows.push(row("user", "hi"));
+                rows.push(row("assistant", text));
+                view.patch(0, rows, cx);
+                first_pick(view)
+            })
+            .unwrap()
+    };
+    // The same message sits at row 1 in one view and at row 7 in the other, as after a
+    // restart that loads another history window.
+    assert_eq!(picks_in(cx, 0), picks_in(cx, 3));
 }
 
 #[gpui::test]
