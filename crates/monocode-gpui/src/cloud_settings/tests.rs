@@ -746,7 +746,7 @@ fn the_codespace_checklist_is_computed_when_the_tab_opens(cx: &mut TestAppContex
 fn the_sandbox_checklist_is_computed_on_first_switch(cx: &mut TestAppContext) {
     let fixture = Fixture::with(false, false);
     let dialog = fixture.open(cx, Some(DefaultBackend::Codespace), https_origin);
-    dialog.update(cx, |d, cx| d.switch_tab(DefaultBackend::Sandbox, cx));
+    dialog.update(cx, |d, cx| d.switch_tab(DefaultBackend::Sandbox, None, cx));
     cx.run_until_parked();
     dialog.read_with(cx, |d, _| {
         let list = items(d, DefaultBackend::Sandbox);
@@ -760,8 +760,8 @@ fn the_sandbox_checklist_is_computed_on_first_switch(cx: &mut TestAppContext) {
     assert_eq!(*fixture.sbx.calls.lock().unwrap(), [None]);
     // Switching back and forth does not repeat the checks.
     dialog.update(cx, |d, cx| {
-        d.switch_tab(DefaultBackend::Codespace, cx);
-        d.switch_tab(DefaultBackend::Sandbox, cx);
+        d.switch_tab(DefaultBackend::Codespace, None, cx);
+        d.switch_tab(DefaultBackend::Sandbox, None, cx);
     });
     cx.run_until_parked();
     assert_eq!(fixture.sbx.calls.lock().unwrap().len(), 1);
@@ -829,7 +829,7 @@ fn replace_token_asks_before_discarding_unsaved_edits(cx: &mut TestAppContext) {
     assert!(events.take().is_empty(), "nothing is discarded yet");
     // Keep editing: the question goes and the edit is still there.
     dialog.update(cx, |d, cx| {
-        assert!(d.dismiss_transient(cx));
+        assert!(d.dismiss_transient(None, cx));
         assert!(!d.confirm_replace);
         assert_eq!(d.text("sb_base", cx), "release");
     });
@@ -1020,7 +1020,7 @@ fn the_default_shown_is_the_default_stored_when_the_save_adds_the_sandbox(cx: &m
         // Docker tab and leaves the select alone.
         let shown = d.effective_default();
         assert_eq!(shown, DefaultBackend::Codespace);
-        d.switch_tab(DefaultBackend::Sandbox, cx);
+        d.switch_tab(DefaultBackend::Sandbox, None, cx);
         d.set_text("repo", "https://github.com/acme/other", cx);
         d.save(cx);
         assert!(d.error.is_none(), "{:?}", d.error);
@@ -1038,14 +1038,14 @@ fn switching_the_segment_keeps_both_backends_edits_and_save_writes_both(cx: &mut
     dialog.update(cx, |d, cx| {
         d.set_text("cs_base", "release", cx);
         d.pick(Pick::Idle(120), cx);
-        d.switch_tab(DefaultBackend::Sandbox, cx);
+        d.switch_tab(DefaultBackend::Sandbox, None, cx);
         d.set_text("repo", "https://github.com/acme/other", cx);
         d.set_text("sb_base", "dev", cx);
         d.pick(Pick::Size(4, "8g".into()), cx);
         d.pick(Pick::Runtime("4h".into()), cx);
         d.pick(Pick::DockerAccount(Some("acct-1".into())), cx);
         d.pick(Pick::Claude(Some("claude-1".into())), cx);
-        d.switch_tab(DefaultBackend::Codespace, cx);
+        d.switch_tab(DefaultBackend::Codespace, None, cx);
         // The first backend's edits survived the trip.
         assert_eq!(d.text("cs_base", cx), "release");
         assert_eq!(d.form.codespace.idle, 120);
@@ -1078,7 +1078,7 @@ fn cancel_writes_nothing_and_an_untouched_sandbox_stays_unconfigured(cx: &mut Te
     let dialog = fixture.open(cx, Some(DefaultBackend::Codespace), https_origin);
     dialog.update(cx, |d, cx| {
         d.set_text("cs_base", "release", cx);
-        d.switch_tab(DefaultBackend::Sandbox, cx);
+        d.switch_tab(DefaultBackend::Sandbox, None, cx);
     });
     cx.run_until_parked();
     // Closed without saving: nothing was written.
@@ -1087,8 +1087,8 @@ fn cancel_writes_nothing_and_an_untouched_sandbox_stays_unconfigured(cx: &mut Te
     // Saving with the sandbox tab only looked at does not create a docker entry.
     let dialog = fixture.open(cx, Some(DefaultBackend::Codespace), https_origin);
     dialog.update(cx, |d, cx| {
-        d.switch_tab(DefaultBackend::Sandbox, cx);
-        d.switch_tab(DefaultBackend::Codespace, cx);
+        d.switch_tab(DefaultBackend::Sandbox, None, cx);
+        d.switch_tab(DefaultBackend::Codespace, None, cx);
         d.set_text("cs_base", "release", cx);
         d.save(cx);
         assert!(d.error.is_none(), "{:?}", d.error);
@@ -1123,7 +1123,7 @@ fn a_save_error_shows_under_its_field_on_its_tab(cx: &mut TestAppContext) {
     let dialog = fixture.open(cx, Some(DefaultBackend::Sandbox), https_origin);
     dialog.update(cx, |d, cx| {
         d.set_text("repo", "git@github.com:acme/alpha.git", cx);
-        d.switch_tab(DefaultBackend::Codespace, cx);
+        d.switch_tab(DefaultBackend::Codespace, None, cx);
         d.pick(Pick::Default(DefaultBackend::Sandbox), cx);
         d.save(cx);
         let error = d.error.as_ref().expect("the sandbox URL is refused");
@@ -1275,7 +1275,7 @@ fn the_claude_picker_offers_the_codespaces_secret_only_on_codespaces(cx: &mut Te
             "New cloud sessions use Codespaces \u{b7} 2-core, 8 GB \u{b7} Claude work@company \u{b7} Claude setup off"
         );
     });
-    dialog.update(cx, |d, cx| d.switch_tab(DefaultBackend::Sandbox, cx));
+    dialog.update(cx, |d, cx| d.switch_tab(DefaultBackend::Sandbox, None, cx));
     dialog.read_with(cx, |d, cx| {
         let labels: Vec<_> = d
             .options(Select::Claude, cx)
@@ -1316,7 +1316,9 @@ fn the_secrets_block_is_only_built_when_it_is_needed(cx: &mut TestAppContext) {
     let dialog = fixture.open(cx, Some(DefaultBackend::Sandbox), https_origin);
     dialog.read_with(cx, |d, _| assert!(d.secrets.is_none()));
     assert!(fixture.gh.calls.lock().unwrap().is_empty());
-    dialog.update(cx, |d, cx| d.switch_tab(DefaultBackend::Codespace, cx));
+    dialog.update(cx, |d, cx| {
+        d.switch_tab(DefaultBackend::Codespace, None, cx)
+    });
     cx.run_until_parked();
     dialog.read_with(cx, |d, _| assert!(d.secrets.is_some()));
     assert!(!fixture.gh.calls.lock().unwrap().is_empty());
@@ -1398,7 +1400,7 @@ fn editing_the_repository_or_a_devcontainer_path_marks_that_checklist_changed(
 ) {
     let fixture = Fixture::new();
     let dialog = fixture.open(cx, Some(DefaultBackend::Codespace), https_origin);
-    dialog.update(cx, |d, cx| d.switch_tab(DefaultBackend::Sandbox, cx));
+    dialog.update(cx, |d, cx| d.switch_tab(DefaultBackend::Sandbox, None, cx));
     cx.run_until_parked();
     let gh_calls = fixture.gh.calls.lock().unwrap().len();
     let sbx_calls = fixture.sbx.calls.lock().unwrap().len();
@@ -1551,7 +1553,7 @@ fn a_general_save_error_keeps_the_tab_the_user_is_on(cx: &mut TestAppContext) {
             .as_ref()
             .unwrap()
             .update(cx, |v, cx| v.set_field(OAUTH, "sk-ant-oat-x", cx));
-        d.switch_tab(DefaultBackend::Sandbox, cx);
+        d.switch_tab(DefaultBackend::Sandbox, None, cx);
         d.save(cx);
         let error = d.error.as_ref().expect("the secrets could not be saved");
         assert_eq!(error.field, Field::General);
@@ -1735,8 +1737,8 @@ fn a_refused_secret_keeps_the_dialog_open_and_stores_nothing(cx: &mut TestAppCon
             .unwrap()
             .update(cx, |v, cx| v.set_field(OAUTH, "sk-ant-oat-refused", cx));
         d.set_text("cs_base", "release", cx);
-        d.switch_tab(DefaultBackend::Sandbox, cx);
-        d.switch_tab(DefaultBackend::Codespace, cx);
+        d.switch_tab(DefaultBackend::Sandbox, None, cx);
+        d.switch_tab(DefaultBackend::Codespace, None, cx);
         d.save(cx);
     });
     cx.run_until_parked();

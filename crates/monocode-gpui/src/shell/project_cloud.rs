@@ -141,7 +141,7 @@ impl Shell {
         }
         // An open select (or the discard question) closes first; the dialog stays.
         let view = open.view.clone();
-        if view.update(cx, |dialog, cx| dialog.dismiss_transient(cx)) {
+        if view.update(cx, |dialog, cx| dialog.dismiss_transient(Some(window), cx)) {
             return;
         }
         self.close_cloud_settings(window, cx);

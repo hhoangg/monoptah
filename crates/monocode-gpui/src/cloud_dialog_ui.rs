@@ -1,4 +1,4 @@
-//! Small building blocks the Docker Sandbox and Git credential dialogs share: hints,
+//! Small building blocks the Cloud settings dialog and the Git credential panel share: hints,
 //! alerts, labelled fields and one-of-many rows. They carry no state of their own.
 use crate::{input::Input, settings::widgets::secondary_button, theme::*};
 use gpui::{Div, Entity, FontWeight, Role, SharedString, Stateful, div, prelude::*, px, rgb};

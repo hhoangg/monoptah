@@ -600,6 +600,42 @@ fn fix_opens_the_terminal_with_the_right_command_and_checks_again_on_exit(cx: &m
 }
 
 #[gpui::test]
+fn the_docker_token_link_opens_from_the_keyboard(cx: &mut TestAppContext) {
+    let world = World::new();
+    let window = open(&world, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.refresh().unwrap();
+    click(visual, "docker-add-button");
+    for key in ["enter", "space"] {
+        // Focus the link without clicking it, as Tab would.
+        window
+            .update(visual, |view, window, cx| {
+                let handle = view
+                    .cloud
+                    .docker
+                    .inputs
+                    .as_ref()
+                    .unwrap()
+                    .link_focus
+                    .clone();
+                window.focus(&handle, cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        visual.simulate_keystrokes(key);
+        visual.run_until_parked();
+        assert_eq!(
+            visual.opened_url().as_deref(),
+            Some("https://app.docker.com/settings/personal-access-tokens"),
+            "{key}"
+        );
+        // Forget the URL: the next key must open it again.
+        visual.update(|_, cx| cx.open_url("about:blank"));
+        assert_eq!(visual.opened_url().as_deref(), Some("about:blank"));
+    }
+}
+
+#[gpui::test]
 fn adding_an_account_checks_the_token_and_lists_it(cx: &mut TestAppContext) {
     capture_logs();
     let world = World::new();

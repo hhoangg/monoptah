@@ -20,8 +20,8 @@ use crate::{
     theme::*,
 };
 use gpui::{
-    AnyElement, Context, Entity, Focusable, FontWeight, Role, SharedString, Subscription, Task,
-    Window, div, prelude::*, px,
+    AnyElement, Context, Entity, FocusHandle, Focusable, FontWeight, Role, SharedString,
+    Subscription, Task, Window, div, prelude::*, px,
 };
 use monocode_core::{
     cloud_sessions::project_cloud::projects_using_docker_account,
@@ -87,6 +87,8 @@ pub(in crate::settings) struct Notice {
 pub(in crate::settings) struct Inputs {
     pub(in crate::settings) docker_id: Entity<Input>,
     pub(in crate::settings) pat: Entity<Input>,
+    /// The token page link: Tab reaches it, Enter and Space open it.
+    pub(in crate::settings) link_focus: FocusHandle,
     pub(in crate::settings) _subscriptions: Vec<Subscription>,
 }
 
@@ -274,6 +276,7 @@ impl SettingsView {
             self.cloud.docker.inputs = Some(Inputs {
                 docker_id,
                 pat,
+                link_focus: cx.focus_handle(),
                 _subscriptions: subscriptions,
             });
         }
@@ -952,6 +955,13 @@ impl SettingsView {
         let busy = self.cloud.docker.busy;
         let error = form.error.clone();
         let (docker_id_input, pat_input) = self.docker_inputs(cx);
+        let link_focus = self
+            .cloud
+            .docker
+            .inputs
+            .as_ref()
+            .map(|inputs| inputs.link_focus.clone())
+            .expect("made by docker_inputs");
         let save_label = if checking { "Checking..." } else { "Save" };
         let id_field = match &kind {
             FormKind::Add => labelled("Docker ID")
@@ -1008,12 +1018,23 @@ impl SettingsView {
                                             .debug_selector(|| "docker-token-link".into())
                                             .role(Role::Link)
                                             .aria_label("Open the Docker token page")
+                                            .track_focus(&link_focus)
+                                            .tab_index(0)
                                             .text_color(content(0.7))
                                             .underline()
                                             .cursor_pointer()
                                             .hover(|s| s.text_color(content(1.)))
                                             .child(TOKEN_LINK_TEXT)
-                                            .on_click(|_, _, cx| cx.open_url(TOKEN_URL)),
+                                            .on_click(|_, _, cx| cx.open_url(TOKEN_URL))
+                                            .on_key_down(|event, _, cx| {
+                                                if matches!(
+                                                    event.keystroke.key.as_str(),
+                                                    "enter" | "space"
+                                                ) {
+                                                    cx.open_url(TOKEN_URL);
+                                                    cx.stop_propagation();
+                                                }
+                                            }),
                                     ),
                                 )
                                 .child(muted(HINT)),

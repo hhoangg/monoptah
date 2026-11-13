@@ -90,8 +90,11 @@ Layout, top to bottom:
   8/16g, 16/32g) and Runtime limit (sandbox: "1 hour, then stop", 2, 4, 8 hours). Sizes below
   the devcontainer's `hostRequirements` stay selectable; the warning shows under that row.
   There are no explanatory captions under the fields: hints are input placeholders, and only
-  validation errors and required warnings (size below the devcontainer, a Docker token that
-  needs replacing) are written under a field.
+  validation errors and the size-below-devcontainer warning are written under a field. A
+  Docker token that needs replacing is shown in the Ready checklist (the Docker account
+  item and its Replace token fix), not under a field. The Codespaces secrets block keeps its
+  `CLAUDE_TOKEN_NOTE` warning, the secret descriptions that come from the project's
+  `devcontainer.json`, and a one-line privacy note.
 - **Credentials**:
   - Docker account (sandbox only; from layer 1, "Machine sign-in (sbx login)" keeps the old
     behavior and is the default for existing projects).
@@ -104,12 +107,16 @@ Layout, top to bottom:
     sandbox keeps the saved Git credential picker plus Manage. Manage does not open a second
     dialog: the Cloud settings dialog widens and a Git credential panel appears on its right
     (select a saved profile, add an HTTPS token, check access, remove). The dialog stays the
-    only modal. Escape closes the panel first (a pending "Confirm remove" question closes
-    before that), then the dialog; Close (or switching to the Codespaces tab) returns the
-    dialog to its normal width. Saving or using a credential selects it in the form and
+    only modal. Escape closes one layer per press, see "Escape order" below; Close (or
+    switching to the Codespaces tab) returns the dialog to its normal width. The panel's body
+    fills the dialog's height so its footer sits on the dialog's footer line. Saving or using a credential selects it in the form and
     closes the panel.
   - One line under the Credentials group, not per field: changing an account applies from
     the next start or reconnect; running sessions keep theirs.
+- **Escape order**: one layer per Escape press: an open select, the Git credential panel's
+  "Confirm remove" question, the Git credential panel, the replace-token question, then the
+  dialog itself. The keyboard returns to the dialog when the panel is closed, unless a field
+  in the main column had it.
 - **Summary line**: `New cloud sessions use <backend> . <size> . Claude <x> [. Docker <id>] .
   Claude setup on/off` (the dots are rendered as middle dots).
 - Footer: Cancel and Save. Save validates with the same rules as before

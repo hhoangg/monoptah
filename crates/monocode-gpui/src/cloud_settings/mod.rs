@@ -877,14 +877,19 @@ impl CloudSettings {
         })
     }
 
-    fn switch_tab(&mut self, backend: DefaultBackend, cx: &mut Context<Self>) {
+    fn switch_tab(
+        &mut self,
+        backend: DefaultBackend,
+        window: Option<&Window>,
+        cx: &mut Context<Self>,
+    ) {
         if self.tab == backend {
             return;
         }
         self.tab = backend;
         self.open_select = None;
         // The Git credential panel belongs to the Docker Sandbox tab.
-        self.close_credentials(cx);
+        self.close_credentials(window, cx);
         self.tab_shown(cx);
     }
 
@@ -1291,9 +1296,15 @@ impl CloudSettings {
         .detach();
     }
 
-    /// Closes an open select or the discard question; true when something was closed. Escape
-    /// does this before it closes the dialog.
-    pub(crate) fn dismiss_transient(&mut self, cx: &mut Context<Self>) -> bool {
+    /// Closes the topmost transient layer, one per call; true when something was closed.
+    /// Escape does this before it closes the dialog. The order is: an open select, the Git
+    /// credential panel (its "Confirm remove" question first, then the panel itself), the
+    /// replace-token question.
+    pub(crate) fn dismiss_transient(
+        &mut self,
+        window: Option<&Window>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let open = self.open_select.take().is_some();
         if open {
             cx.notify();
@@ -1302,7 +1313,7 @@ impl CloudSettings {
         // Then the Git credential panel: its own question first, then the panel itself.
         if let Some((panel, _)) = &self.panel {
             if !panel.update(cx, |panel, cx| panel.dismiss_transient(cx)) {
-                self.close_credentials(cx);
+                self.close_credentials(window, cx);
             }
             return true;
         }
@@ -1331,15 +1342,16 @@ impl CloudSettings {
                 self.form.sandbox.credential_id.clone(),
             );
             let panel = cx.new(|cx| GitCredentialPanel::new(name, repo_url, selected, env, cx));
-            let events = cx.subscribe(
+            let events = cx.subscribe_in(
                 &panel,
-                |this, _, event: &git_credential_panel::Event, cx| match event {
-                    git_credential_panel::Event::Close => this.close_credentials(cx),
+                window,
+                |this, _, event: &git_credential_panel::Event, window, cx| match event {
+                    git_credential_panel::Event::Close => this.close_credentials(Some(window), cx),
                     // A saved or picked profile becomes the form's selection and the panel
                     // closes: the choice is made.
                     git_credential_panel::Event::Chosen(id) => {
+                        this.close_credentials(Some(window), cx);
                         this.reload_credentials(Some(id.clone()), cx);
-                        this.close_credentials(cx);
                     }
                     git_credential_panel::Event::Removed => this.reload_credentials(None, cx),
                 },
@@ -1355,11 +1367,16 @@ impl CloudSettings {
     }
 
     /// Closes the Git credential panel and forgets anything typed in it. The dialog takes the
-    /// keyboard back on the next render.
-    fn close_credentials(&mut self, cx: &mut Context<Self>) {
+    /// keyboard back on the next render, but only when the panel had it: a field in the main
+    /// column keeps its caret. The saved list is read again, because a save or remove that
+    /// ends after the panel is gone can no longer report itself.
+    fn close_credentials(&mut self, window: Option<&Window>, cx: &mut Context<Self>) {
         if let Some((panel, _)) = self.panel.take() {
+            let had_focus =
+                window.is_some_and(|window| panel.focus_handle(cx).contains_focused(window, cx));
             panel.update(cx, |panel, cx| panel.shutdown(cx));
-            self.refocus = true;
+            self.refocus = had_focus;
+            self.reload_credentials(None, cx);
             cx.emit(Event::Resized);
             cx.notify();
         }
@@ -1438,8 +1455,21 @@ impl CloudSettings {
             .unwrap_or_default()
     }
 
+    /// Pretends the project's devcontainer asks for `info` on both backends.
     #[cfg(test)]
-    fn text(&self, which: &str, cx: &App) -> String {
+    pub(crate) fn set_requirements(&mut self, info: DevcontainerInfo, cx: &mut Context<Self>) {
+        self.infos_gen += 1;
+        self.infos = [info.clone(), info];
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn saved_credential_ids(&self) -> Vec<String> {
+        self.credentials.iter().map(|c| c.id.clone()).collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn text(&self, which: &str, cx: &App) -> String {
         let input = match which {
             "repo" => &self.repo,
             "sb_base" => &self.sb_base,
@@ -1525,7 +1555,9 @@ impl CloudSettings {
             .when(!on, |d| {
                 d.text_color(content(0.6)).hover(|s| s.bg(content(0.06)))
             })
-            .on_click(cx.listener(move |this, _, _, cx| this.switch_tab(backend, cx)))
+            .on_click(
+                cx.listener(move |this, _, window, cx| this.switch_tab(backend, Some(window), cx)),
+            )
             .child(label)
     }
 
@@ -2008,7 +2040,11 @@ impl CloudSettings {
         }
         column = column.child(self.git_row(cx));
         // The one line the spec asks for, for the whole group.
-        column.child(muted(model::ACCOUNT_CHANGE_NOTE).id("cloud-credentials-note"))
+        column.child(
+            muted(model::ACCOUNT_CHANGE_NOTE)
+                .id("cloud-credentials-note")
+                .debug_selector(|| "cloud-credentials-note".into()),
+        )
     }
 
     fn git_row(&mut self, cx: &mut Context<Self>) -> Div {
@@ -2287,7 +2323,7 @@ impl Render for CloudSettings {
                 if event.keystroke.key == "escape" && !this.terminal_focused(window, cx) {
                     // An open select or the Git credential panel closes first; the dialog
                     // stays.
-                    if !this.dismiss_transient(cx) {
+                    if !this.dismiss_transient(Some(window), cx) {
                         cx.emit(Event::Close);
                     }
                     window.prevent_default();

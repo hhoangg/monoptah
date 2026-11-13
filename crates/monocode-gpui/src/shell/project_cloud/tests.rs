@@ -614,11 +614,36 @@ fn manage_opens_a_side_panel_inside_the_dialog_and_close_restores_the_width(
     assert!(panel_of(&window, visual).is_some());
     // No second modal: the panel is part of the dialog's own surface, and the shell holds
     // no credential dialog of its own.
-    assert!(visual.debug_bounds("git-credential-dialog").is_none());
     assert_eq!(children(&window, visual), (true, false));
     let after = bounds_of(visual, "cloud-settings");
     let panel = bounds_of(visual, "git-credential-panel");
     let side = bounds_of(visual, "cloud-credentials-side");
+    // Structurally inside the one modal: the whole panel lies within the dialog surface,
+    // which is the modal popover's only content and as wide as the popover was asked to be.
+    assert!(
+        panel.left() >= after.left()
+            && panel.right() <= after.right() + gpui::px(1.)
+            && panel.top() >= after.top()
+            && panel.bottom() <= after.bottom() + gpui::px(1.),
+        "panel {panel:?} dialog {after:?}"
+    );
+    let wanted = window
+        .read_with(visual, |shell, cx| {
+            shell
+                .cloud_settings
+                .as_ref()
+                .unwrap()
+                .view
+                .read(cx)
+                .dialog_width()
+        })
+        .unwrap();
+    let viewport = visual.update(|window, _| window.viewport_size().width.as_f32());
+    // The popover keeps a 1px margin on each side of its content.
+    assert!(
+        (after.size.width.as_f32() - wanted.min(viewport - 24.)).abs() <= 2.5,
+        "dialog {after:?} popover width {wanted}"
+    );
     assert!(
         after.size.width.as_f32() > before.size.width.as_f32(),
         "{before:?} {after:?}"
@@ -731,4 +756,314 @@ fn the_panel_belongs_to_the_docker_tab_and_the_dialog_close_ends_it(cx: &mut Tes
     );
     escape(&window, visual);
     assert_eq!(children(&window, visual), (false, false));
+}
+
+fn set_requirements(window: &WindowHandle<Shell>, cx: &mut VisualTestContext) {
+    // The devcontainer asks for far more than any listed machine or default size.
+    window
+        .update(cx, |shell, _, cx| {
+            let view = shell.cloud_settings.as_ref().unwrap().view.clone();
+            view.update(cx, |dialog, cx| {
+                dialog.set_requirements(
+                    monocode_core::cloud_sessions::project_cloud::DevcontainerInfo {
+                        host_cpus: Some(64),
+                        host_memory_mib: Some(512 * 1024),
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            });
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.refresh().unwrap();
+}
+
+#[gpui::test]
+fn the_required_warnings_are_drawn_under_their_rows(cx: &mut TestAppContext) {
+    let (window, _, _) = shell_with_fakes(cx);
+    open_default(&window, cx, "/work/monocode");
+    cx.refresh().unwrap();
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    set_requirements(&window, visual);
+    // Codespaces: under the Machine and Stop when idle row.
+    let (machine, idle, warning) = (
+        bounds_of(visual, "cloud-select-machine"),
+        bounds_of(visual, "cloud-select-idle"),
+        bounds_of(visual, "cloud-machine-warning"),
+    );
+    assert!(warning.top() >= machine.bottom(), "{warning:?} {machine:?}");
+    assert!(warning.top() >= idle.bottom(), "{warning:?} {idle:?}");
+    assert!(visual.debug_bounds("cloud-size-warning").is_none());
+    // Docker Sandbox: under the Size and Runtime limit row.
+    click(visual, "cloud-seg-sandbox");
+    visual.refresh().unwrap();
+    let (size, runtime, warning) = (
+        bounds_of(visual, "cloud-select-size"),
+        bounds_of(visual, "cloud-select-runtime"),
+        bounds_of(visual, "cloud-size-warning"),
+    );
+    assert!(warning.top() >= size.bottom(), "{warning:?} {size:?}");
+    assert!(warning.top() >= runtime.bottom(), "{warning:?} {runtime:?}");
+    assert!(visual.debug_bounds("cloud-machine-warning").is_none());
+}
+
+#[gpui::test]
+fn the_account_change_note_is_drawn_once_under_the_credentials_on_each_tab(
+    cx: &mut TestAppContext,
+) {
+    let (window, _, _) = shell_with_fakes(cx);
+    open_default(&window, cx, "/work/monocode");
+    cx.refresh().unwrap();
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    // A debug selector names one element, and the note has no other selector: it is drawn
+    // by the Credentials group alone, below its last row, on both tabs.
+    let note = bounds_of(visual, "cloud-credentials-note");
+    let git = bounds_of(visual, "cloud-git-codespace");
+    assert!(note.top() >= git.bottom(), "{note:?} {git:?}");
+    click(visual, "cloud-seg-sandbox");
+    visual.refresh().unwrap();
+    let note = bounds_of(visual, "cloud-credentials-note");
+    let git = bounds_of(visual, "cloud-select-git");
+    assert!(note.top() >= git.bottom(), "{note:?} {git:?}");
+}
+
+#[gpui::test]
+fn no_caption_sits_between_a_field_and_the_next_label(cx: &mut TestAppContext) {
+    let (window, _, _) = shell_with_fakes(cx);
+    open_default(&window, cx, "/work/monocode");
+    cx.refresh().unwrap();
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    // The distance from one field's box to the next field's box is the next label plus the
+    // column gaps; a caption under a field would add its height to one of them.
+    let gap = |visual: &mut VisualTestContext, above: &'static str, below: &'static str| {
+        bounds_of(visual, below).top().as_f32() - bounds_of(visual, above).bottom().as_f32()
+    };
+    let same = |gaps: &[f32]| {
+        assert!(
+            gaps.iter().all(|g| (g - gaps[0]).abs() <= 1.),
+            "unequal gaps {gaps:?}"
+        );
+        // 12px label, 6px label gap, 12px column gap, with some slack for line heights.
+        assert!(gaps[0] <= 44., "gap {gaps:?} holds more than a label");
+    };
+    same(&[
+        gap(visual, "cloud-field-cs-base", "cloud-field-cs-devcontainer"),
+        gap(
+            visual,
+            "cloud-field-cs-devcontainer",
+            "cloud-select-machine",
+        ),
+    ]);
+    click(visual, "cloud-seg-sandbox");
+    visual.refresh().unwrap();
+    same(&[
+        gap(visual, "cloud-field-repo", "cloud-field-sb-base"),
+        gap(visual, "cloud-field-sb-base", "cloud-field-sb-devcontainer"),
+        gap(visual, "cloud-field-sb-devcontainer", "cloud-select-size"),
+        gap(visual, "cloud-select-docker", "cloud-select-claude"),
+        gap(visual, "cloud-select-claude", "cloud-select-git"),
+    ]);
+}
+
+/// Saves a profile straight into the fixture's store.
+fn save_profile(fixture: &Fixture) -> String {
+    monocode_core::git_credentials::GitCredentials::for_store(&fixture.store.lock().unwrap())
+        .unwrap()
+        .save(
+            "Work",
+            monocode_core::git_credentials::GitPlatform::GitHub,
+            "https://github.com",
+            "me",
+            "ghp_exampleTokenValue1234567890",
+        )
+        .unwrap()
+}
+
+fn profile_selector(id: &str) -> &'static str {
+    Box::leak(format!("git-profile-{id}").into_boxed_str())
+}
+
+fn panel_has_focus(window: &WindowHandle<Shell>, cx: &mut VisualTestContext) -> bool {
+    let panel = panel_of(window, cx).unwrap();
+    window
+        .update(cx, |_, w, cx| {
+            use gpui::Focusable;
+            panel.focus_handle(cx).is_focused(w)
+        })
+        .unwrap()
+}
+
+#[gpui::test]
+fn a_panel_showing_a_saved_profile_takes_focus_itself_not_a_hidden_input(cx: &mut TestAppContext) {
+    let (window, fixture, _) = shell_with_fakes(cx);
+    let id = save_profile(&fixture);
+    open_sandbox_tab(&window, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    // Pick the profile through the panel, then open the panel again on it.
+    click(visual, "cloud-git-manage");
+    visual.refresh().unwrap();
+    click(visual, profile_selector(&id));
+    click(visual, "git-save");
+    visual.refresh().unwrap();
+    assert_eq!(
+        chosen_credential(&window, visual).as_deref(),
+        Some(id.as_str())
+    );
+    click(visual, "cloud-git-manage");
+    visual.refresh().unwrap();
+    assert!(
+        panel_has_focus(&window, visual),
+        "the panel itself has the keyboard"
+    );
+    // The saved-profile form draws no input: typing goes nowhere, and Escape still reaches
+    // the dialog through the panel.
+    visual.simulate_input("zzz");
+    let panel = panel_of(&window, visual).unwrap();
+    assert_eq!(
+        panel.read_with(visual, |p, cx| p.typed(cx)),
+        (String::new(), String::new())
+    );
+    visual.simulate_keystrokes("escape");
+    visual.run_until_parked();
+    assert!(panel_of(&window, visual).is_none());
+    assert_eq!(children(&window, visual), (true, false));
+}
+
+#[gpui::test]
+fn closing_the_panel_leaves_the_keyboard_in_a_main_column_field(cx: &mut TestAppContext) {
+    let (window, _, _) = shell_with_fakes(cx);
+    open_sandbox_tab(&window, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    click(visual, "cloud-git-manage");
+    visual.refresh().unwrap();
+    // The caret moves to a field of the dialog while the panel stays open.
+    click(visual, "cloud-field-sb-base");
+    visual.simulate_input("rel");
+    // Escape closes the panel (a click on Close would move the focus itself).
+    visual.simulate_keystrokes("escape");
+    visual.run_until_parked();
+    assert!(panel_of(&window, visual).is_none());
+    // The field keeps the keyboard: more typing lands there.
+    visual.simulate_input("ease");
+    let text = window
+        .read_with(visual, |shell, cx| {
+            shell
+                .cloud_settings
+                .as_ref()
+                .unwrap()
+                .view
+                .read(cx)
+                .text("sb_base", cx)
+        })
+        .unwrap();
+    assert!(text.ends_with("release"), "{text}");
+}
+
+#[gpui::test]
+fn closing_the_panel_reads_the_saved_list_again(cx: &mut TestAppContext) {
+    let (window, fixture, _) = shell_with_fakes(cx);
+    let id = save_profile(&fixture);
+    open_sandbox_tab(&window, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    click(visual, "cloud-git-manage");
+    visual.refresh().unwrap();
+    click(visual, profile_selector(&id));
+    click(visual, "git-save");
+    assert_eq!(
+        chosen_credential(&window, visual).as_deref(),
+        Some(id.as_str())
+    );
+    click(visual, "cloud-git-manage");
+    visual.refresh().unwrap();
+    // The profile goes away behind the open panel (a remove that ended too late to report
+    // itself); closing the panel brings the dialog's list and selection up to date.
+    monocode_core::git_credentials::GitCredentials::for_store(&fixture.store.lock().unwrap())
+        .unwrap()
+        .remove(&id)
+        .unwrap();
+    let ids = |window: &WindowHandle<Shell>, cx: &mut VisualTestContext| {
+        window
+            .read_with(cx, |shell, cx| {
+                shell
+                    .cloud_settings
+                    .as_ref()
+                    .unwrap()
+                    .view
+                    .read(cx)
+                    .saved_credential_ids()
+            })
+            .unwrap()
+    };
+    assert_eq!(
+        ids(&window, visual),
+        std::slice::from_ref(&id),
+        "stale until the panel closes"
+    );
+    click(visual, "git-cancel");
+    visual.run_until_parked();
+    assert!(ids(&window, visual).is_empty());
+    assert_eq!(chosen_credential(&window, visual), None);
+}
+
+#[gpui::test]
+fn escape_closes_the_confirm_remove_question_before_the_panel(cx: &mut TestAppContext) {
+    let (window, fixture, _) = shell_with_fakes(cx);
+    let id = save_profile(&fixture);
+    open_sandbox_tab(&window, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    click(visual, "cloud-git-manage");
+    visual.refresh().unwrap();
+    click(visual, profile_selector(&id));
+    click(visual, "git-remove");
+    let panel = panel_of(&window, visual).unwrap();
+    assert!(panel.read_with(visual, |p, _| p.confirm_remove_asked()));
+    escape(&window, visual);
+    assert!(panel_of(&window, visual).is_some(), "the panel stays");
+    assert!(!panel.read_with(visual, |p, _| p.confirm_remove_asked()));
+    escape(&window, visual);
+    assert!(panel_of(&window, visual).is_none());
+    assert_eq!(children(&window, visual), (true, false), "the dialog stays");
+    escape(&window, visual);
+    assert_eq!(children(&window, visual), (false, false));
+}
+
+#[gpui::test]
+fn removing_the_selected_profile_clears_the_dialogs_selection_and_list(cx: &mut TestAppContext) {
+    let (window, fixture, _) = shell_with_fakes(cx);
+    let id = save_profile(&fixture);
+    open_sandbox_tab(&window, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    click(visual, "cloud-git-manage");
+    visual.refresh().unwrap();
+    click(visual, profile_selector(&id));
+    click(visual, "git-save");
+    assert_eq!(
+        chosen_credential(&window, visual).as_deref(),
+        Some(id.as_str())
+    );
+    click(visual, "cloud-git-manage");
+    visual.refresh().unwrap();
+    click(visual, "git-remove");
+    click(visual, "git-remove");
+    visual.refresh().unwrap();
+    assert_eq!(chosen_credential(&window, visual), None);
+    assert!(panel_of(&window, visual).is_some(), "the panel stays open");
+}
+
+#[gpui::test]
+fn the_panels_footer_sits_on_the_dialogs_footer_line(cx: &mut TestAppContext) {
+    let (window, _, _) = shell_with_fakes(cx);
+    open_sandbox_tab(&window, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    click(visual, "cloud-git-manage");
+    visual.refresh().unwrap();
+    let (panel_button, dialog_button) = (
+        bounds_of(visual, "git-save"),
+        bounds_of(visual, "cloud-save"),
+    );
+    assert!(
+        (panel_button.bottom().as_f32() - dialog_button.bottom().as_f32()).abs() <= 1.,
+        "{panel_button:?} {dialog_button:?}"
+    );
 }

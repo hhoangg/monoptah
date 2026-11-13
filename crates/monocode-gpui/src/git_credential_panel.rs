@@ -1,8 +1,8 @@
 //! The Git credential panel, the right-hand side panel of the Cloud settings dialog (Docker
 //! Sandbox tab): pick a saved HTTPS profile or add one (GitHub or GitLab.com), check its read
 //! access and remove it. It is not a modal: it renders inside the dialog, which stays the only
-//! modal, and the dialog owns Escape and focus. `model`
-//! holds the decisions. The access token lives only in a masked input until Save hands it to
+//! modal, and the dialog owns Escape and focus; Escape closes, in order, the "Confirm remove"
+//! question and then the panel itself. `model` holds the decisions. The access token lives only in a masked input until Save hands it to
 //! the encrypted store, then the input is emptied; it is never echoed back or logged. Check
 //! access runs on the background executor.
 mod model;
@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 pub(crate) enum Event {
     Close,
-    /// A profile was saved or picked: the Docker dialog selects it.
+    /// A profile was saved or picked: Cloud settings selects it.
     Chosen(String),
     /// A profile was removed: the saved list the dialog shows is out of date.
     Removed,
@@ -50,6 +50,8 @@ pub(crate) struct GitCredentialPanel {
     /// The profile shown; none while a new one is being added.
     selected: Option<String>,
     platform: GitPlatform,
+    /// The user picked the platform: the repository no longer decides it.
+    platform_picked: bool,
     label: Entity<Input>,
     username: Entity<Input>,
     token: Entity<Input>,
@@ -108,6 +110,7 @@ impl GitCredentialPanel {
             profiles: Vec::new(),
             selected: None,
             platform,
+            platform_picked: false,
             label,
             username,
             token,
@@ -187,10 +190,22 @@ impl GitCredentialPanel {
             return;
         }
         self.repo_url = repo_url;
+        // The default platform follows the repository host until the user picks one.
+        if !self.platform_picked
+            && let Ok((platform, _, _)) =
+                monocode_core::git_credentials::normalize_origin(&self.repo_url)
+        {
+            self.apply_platform(platform, cx);
+        }
         self.generation += 1;
         self.checking = false;
         self.check = None;
         cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn confirm_remove_asked(&self) -> bool {
+        self.confirm_remove
     }
 
     #[cfg(test)]
@@ -201,14 +216,15 @@ impl GitCredentialPanel {
         )
     }
 
-    /// Where the keyboard goes when the panel opens: the first field of the form.
+    /// Where the keyboard goes when the panel opens: the first field of the new-credential
+    /// form, or the panel itself when a saved profile is shown (or about to be): that form
+    /// has no input, and a field that is not drawn cannot take focus.
     pub(crate) fn focus_form(&self, window: &mut Window, cx: &mut gpui::App) {
-        let input = if self.selected.is_some() {
-            &self.token
+        if self.selected.is_some() || self.pending_select.is_some() {
+            window.focus(&self.focus, cx);
         } else {
-            &self.label
-        };
-        window.focus(&input.focus_handle(cx), cx);
+            window.focus(&self.label.focus_handle(cx), cx);
+        }
     }
 
     fn select(&mut self, id: Option<String>, cx: &mut Context<Self>) {
@@ -223,6 +239,11 @@ impl GitCredentialPanel {
     }
 
     pub(crate) fn set_platform(&mut self, platform: GitPlatform, cx: &mut Context<Self>) {
+        self.platform_picked = true;
+        self.apply_platform(platform, cx);
+    }
+
+    fn apply_platform(&mut self, platform: GitPlatform, cx: &mut Context<Self>) {
         if self.platform == platform {
             return;
         }
@@ -373,7 +394,7 @@ impl GitCredentialPanel {
         .detach();
     }
 
-    fn remove(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn remove(&mut self, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
@@ -515,6 +536,7 @@ impl Render for GitCredentialPanel {
         );
         let mut body = div()
             .id("git-panel-body")
+            .flex_1()
             .min_h_0()
             .overflow_y_scroll()
             .flex()
