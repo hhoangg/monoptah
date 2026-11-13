@@ -326,3 +326,53 @@ fn instances_pinned_to_an_account_are_reported_for_removal_guards() {
         2
     );
 }
+
+#[test]
+fn the_delivered_hint_is_an_id_only_setting_cleared_with_the_instance() {
+    let a = accounts();
+    let resolver = StoreCodespaceClaude::new(a.store.clone());
+    assert_eq!(delivered_key("cs"), "codespace-claude-delivered:cs");
+    assert_eq!(resolver.delivered_hint("cs"), None);
+    resolver.note_delivered("cs", Some(&a.with_token));
+    assert_eq!(
+        resolver.delivered_hint("cs").as_deref(),
+        Some(a.with_token.as_str())
+    );
+    // The setting holds the id and nothing else.
+    let raw = a
+        .store
+        .lock()
+        .unwrap()
+        .setting(&delivered_key("cs"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(raw, a.with_token);
+    assert!(!raw.contains(TOKEN));
+    // Delivering without an account forgets it.
+    resolver.note_delivered("cs", None);
+    assert_eq!(resolver.delivered_hint("cs"), None);
+    // Forgetting the codespace forgets it too.
+    resolver.note_delivered("cs", Some(&a.with_token));
+    a.store
+        .lock()
+        .unwrap()
+        .forget_cloud(&super::CloudRef::codespace("cs"))
+        .unwrap();
+    assert_eq!(resolver.delivered_hint("cs"), None);
+}
+
+#[test]
+fn a_named_account_resolves_for_a_codespace_whatever_the_project_chooses_now() {
+    let a = accounts();
+    let resolver = StoreCodespaceClaude::new(a.store.clone());
+    bind(&a.store.lock().unwrap(), "/p", "cs");
+    project_with(&a.store.lock().unwrap(), "/p", None);
+    let delivery = resolver
+        .resolve_account("cs", &a.with_token)
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivery.account, a.with_token);
+    assert_eq!(delivery.secret.as_str(), TOKEN);
+    let error = resolver.resolve_account("cs", "gone").err().unwrap();
+    assert!(!error.contains(TOKEN), "{error}");
+}

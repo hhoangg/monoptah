@@ -22,10 +22,17 @@ use std::sync::{Arc, Mutex};
 
 const CODESPACE_PREFIX: &str = "codespace-claude-account:";
 const SANDBOX_PREFIX: &str = "sandbox-claude-account:";
+const DELIVERED_PREFIX: &str = "codespace-claude-delivered:";
 
 /// The setting that pins the Claude account of codespace `name`.
 pub fn codespace_key(name: &str) -> String {
     format!("{CODESPACE_PREFIX}{name}")
+}
+
+/// The setting that holds the id of the account the Host of codespace `name` was last
+/// bootstrapped with (an id only; empty or missing: the Codespaces secret, or unknown).
+pub fn delivered_key(name: &str) -> String {
+    format!("{DELIVERED_PREFIX}{name}")
 }
 
 /// The setting that pins the Claude account of sandbox `name`.
@@ -300,13 +307,51 @@ impl CodespaceClaude for StoreCodespaceClaude {
         let Some(account) = account else {
             return Ok(None);
         };
-        let auth = require_auth_for(&store, &account, pinned)?;
-        Ok(Some(ClaudeDelivery {
-            account,
-            prelude: auth.prelude(),
-            secret: zeroize::Zeroizing::new(auth.secret().to_owned()),
-        }))
+        delivery_of(&store, account, pinned).map(Some)
     }
+
+    fn resolve_account(
+        &self,
+        codespace: &str,
+        account: &str,
+    ) -> Result<Option<ClaudeDelivery>, String> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| "Native session store unavailable".to_string())?;
+        let pinned = read(&store, &codespace_key(codespace)).is_some_and(|pin| pin.pinned);
+        delivery_of(&store, account.to_owned(), pinned).map(Some)
+    }
+
+    fn delivered_hint(&self, codespace: &str) -> Option<String> {
+        let store = self.store.lock().ok()?;
+        store
+            .setting(&delivered_key(codespace))
+            .ok()
+            .flatten()
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty())
+    }
+
+    fn note_delivered(&self, codespace: &str, account: Option<&str>) {
+        let Ok(store) = self.store.lock() else {
+            return;
+        };
+        let key = delivered_key(codespace);
+        let _ = match account {
+            Some(account) => store.save_setting(&key, account),
+            None => clear(&store, &key),
+        };
+    }
+}
+
+fn delivery_of(store: &Store, account: String, pinned: bool) -> Result<ClaudeDelivery, String> {
+    let auth = require_auth_for(store, &account, pinned)?;
+    Ok(ClaudeDelivery {
+        account,
+        prelude: auth.prelude(),
+        secret: zeroize::Zeroizing::new(auth.secret().to_owned()),
+    })
 }
 
 /// What a codespace start records as the instance's Claude account.

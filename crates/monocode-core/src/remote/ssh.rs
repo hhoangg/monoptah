@@ -1079,6 +1079,14 @@ pub(crate) fn codespace_stop_host_prestep() -> &'static str {
      rm -f \"$HOME/.monocode-host/host-token.sha256\"\n"
 }
 
+/// Prepended to the codespace bootstrap that applies a changed app Claude account to a Host
+/// verified idle: forgets the token marker, so a stale marker (for instance one left by an
+/// earlier account) cannot make the bootstrap think the Host already runs under this token
+/// and skip the restart.
+pub(crate) fn codespace_forget_token_marker() -> &'static str {
+    "rm -f \"$HOME/.monocode-host/host-token.sha256\"\n"
+}
+
 /// A step of the cloud Host upgrade in a codespace without an app Claude account.
 #[cfg(test)]
 pub(crate) fn codespace_upgrade_script(

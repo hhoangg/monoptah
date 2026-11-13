@@ -15,7 +15,7 @@ mod ssh;
 pub mod ssh_askpass;
 pub mod uploads;
 
-pub use cloud_upgrade::HOST_UPDATING;
+pub use cloud_upgrade::{ACCOUNT_APPLYING, HOST_UPDATING};
 pub(crate) use ssh::{
     sandbox_bootstrap_script, shell_quote, validate_sandbox as validate_sandbox_target,
     validate_sandbox_workspace,
@@ -136,27 +136,71 @@ impl Connections {
         }
     }
 
-    fn note_claude_delivered(&self, codespace: &str, fingerprint: Option<String>) {
+    /// Records what the Host of `codespace` was bootstrapped with, in memory and (account id
+    /// only) in the app's store, so a restart of the app still knows it.
+    pub(crate) fn note_claude_delivered(&self, codespace: &str, fingerprint: Option<String>) {
+        if let Some(resolver) = self.codespace_claude() {
+            resolver.note_delivered(
+                codespace,
+                fingerprint.as_deref().map(codespace_claude::account_of),
+            );
+        }
         self.claude_delivered
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(codespace.to_owned(), fingerprint);
     }
 
+    /// The fingerprint of the last delivery to `codespace`. Without an entry in memory (the
+    /// app restarted) the persisted hint stands in for it: an account id with no digest, so
+    /// it only answers "which account", and "the token was replaced" is not seen then.
     fn delivered_fingerprint(&self, codespace: &str) -> Option<String> {
-        self.claude_delivered
+        let known = self
+            .claude_delivered
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(codespace)
-            .cloned()
-            .flatten()
+            .cloned();
+        match known {
+            Some(fingerprint) => fingerprint,
+            None => self
+                .codespace_claude()?
+                .delivered_hint(codespace)
+                .map(|id| format!("{id}:")),
+        }
+    }
+
+    /// What the Host of `codespace` was last bootstrapped with, to be delivered again while a
+    /// change to `wanted` has to wait. `None`: deliver `wanted` after all (same account with a
+    /// replaced token, or the delivered account can no longer be used and `wanted` is an
+    /// account). `Some(None)`: the plain script.
+    fn last_delivered(
+        &self,
+        codespace: &str,
+        delivered: Option<&str>,
+        wanted: &Option<codespace_claude::ClaudeDelivery>,
+    ) -> Option<Option<codespace_claude::ClaudeDelivery>> {
+        let Some(delivered) = delivered else {
+            return Some(None);
+        };
+        let id = codespace_claude::account_of(delivered);
+        if wanted.as_ref().is_some_and(|w| w.account == id) {
+            return None;
+        }
+        match self.codespace_claude()?.resolve_account(codespace, id) {
+            Ok(old) => Some(old),
+            Err(_) if wanted.is_some() => None,
+            Err(_) => Some(None),
+        }
     }
 
     /// True when the account codespace `name` should run under differs from the one its Host
     /// was last bootstrapped with. A chosen account that cannot be used counts as "no change"
-    /// here: a Host that is already running keeps working, and the error surfaces where a
-    /// bootstrap needs the credential. The account id is compared first; the credential is
-    /// only read when the id is the delivered one (a replaced token is a change too).
+    /// here, the new one as well as the delivered one: a Host that is already running keeps
+    /// working on the old account, and the error surfaces where a bootstrap needs the
+    /// credential. The account id is compared first; the credential is only read when it has
+    /// to be (the same account, whose token may have been replaced, or a new account, which
+    /// must be usable before the change is attempted).
     fn claude_account_changed(
         &self,
         resolver: &dyn codespace_claude::CodespaceClaude,
@@ -166,17 +210,25 @@ impl Connections {
         let Ok(wanted) = resolver.account_id(name) else {
             return false;
         };
-        let delivered_id = delivered
-            .as_deref()
-            .and_then(|fingerprint| fingerprint.rsplit_once(':'))
-            .map(|(id, _)| id);
+        let delivered_id = delivered.as_deref().map(codespace_claude::account_of);
         match (wanted.as_deref(), delivered_id) {
             (None, None) => false,
-            (Some(wanted), Some(held)) if wanted == held => resolver
-                .resolve(name)
-                .map(|now| codespace_claude::fingerprint_of(now.as_ref()) != delivered)
-                .unwrap_or(false),
-            _ => true,
+            // Leaving an account needs no credential.
+            (None, Some(_)) => true,
+            (Some(wanted), held) => {
+                // The same account known by id only (the persisted hint): nothing to compare.
+                if held == Some(wanted) && delivered.as_deref().is_some_and(|d| d.ends_with(':')) {
+                    return false;
+                }
+                let Ok(now) = resolver.resolve(name) else {
+                    return false;
+                };
+                held != Some(wanted)
+                    || !codespace_claude::same_delivery(
+                        codespace_claude::fingerprint_of(now.as_ref()).as_deref(),
+                        delivered.as_deref(),
+                    )
+            }
         }
     }
 
@@ -1014,9 +1066,13 @@ impl Connections {
             // Codespaces secret). A chosen account that cannot be used fails the job, and no
             // text the job reports carries the credential.
             let resolved = state.claude_delivery_for(&target);
-            // Sends to a live Host held back while its account changes (released when the job
-            // ends, after the new tunnel is in place).
+            // Sends to a live Host held back while its account changes (released inside the
+            // job's completion, once the new tunnel is in place).
             let mut hold: Option<cloud_upgrade::SendHold> = None;
+            // A change that could not be applied yet: the Host runs under the last delivered
+            // account, so that is what this bootstrap carries (`Some(None)`: the plain
+            // script), and the old fingerprint stays recorded.
+            let mut kept: Option<Option<codespace_claude::ClaudeDelivery>> = None;
             if let Ok(Some(delivery)) = &resolved {
                 job.add_mask(&delivery.prelude, &delivery.secret);
             }
@@ -1025,32 +1081,49 @@ impl Connections {
                 let mut target = target;
                 let cloud = target.is_cloud();
                 let delivery = resolved.as_ref().map_err(Clone::clone)?;
-                let prelude = delivery.as_ref().map(|d| d.prelude.as_str());
+                // A live Host whose account changes is restarted by the bootstrap, so it
+                // follows the busy rule of the Host upgrade: hold sends back, look again, and
+                // leave a Host with a running turn as it is (the change waits for the next
+                // reconnect). The change is applied only to a Host verified idle that way. A
+                // Host that cannot be asked (no tunnel, no answer) may be running a turn: its
+                // bootstrap carries the account it already runs under, and the next ensure
+                // over a live tunnel applies the change.
+                let mut leave_host = false;
+                if let (Some(existing), false, Some(name)) =
+                    (existing.as_ref(), upgrade, target.codespace.as_deref())
+                {
+                    let wanted = codespace_claude::fingerprint_of(delivery.as_ref());
+                    let delivered = state.delivered_fingerprint(name);
+                    if !codespace_claude::same_delivery(wanted.as_deref(), delivered.as_deref()) {
+                        if state.host_answers(&existing.id) {
+                            match state.hold_sends_if_idle(&existing.id) {
+                                Some(taken) => hold = Some(taken),
+                                None => leave_host = true,
+                            }
+                        } else {
+                            kept = state.last_delivered(name, delivered.as_deref(), delivery);
+                            if let Some(Some(old)) = &kept {
+                                job.add_mask(&old.prelude, &old.secret);
+                            }
+                        }
+                    }
+                }
+                let delivered_before = target
+                    .codespace
+                    .as_deref()
+                    .and_then(|name| state.delivered_fingerprint(name));
+                let prelude = match &kept {
+                    Some(old) => old.as_ref().map(|d| d.prelude.as_str()),
+                    None => delivery.as_ref().map(|d| d.prelude.as_str()),
+                };
                 let note_delivered = |target: &SshTarget| {
-                    if let Some(name) = &target.codespace {
+                    if let (Some(name), None) = (&target.codespace, &kept) {
                         state.note_claude_delivered(
                             name,
                             codespace_claude::fingerprint_of(delivery.as_ref()),
                         );
                     }
                 };
-                // A live Host whose account changes is restarted by the bootstrap, so it
-                // follows the busy rule of the Host upgrade: hold sends back, look again, and
-                // leave a Host with a running turn as it is (the change waits for the next
-                // reconnect). A Host that does not answer is bootstrapped as always.
-                let mut leave_host = false;
-                if let (Some(existing), false, Some(name)) =
-                    (existing.as_ref(), upgrade, target.codespace.as_deref())
-                {
-                    let changed = codespace_claude::fingerprint_of(delivery.as_ref())
-                        != state.delivered_fingerprint(name);
-                    if changed && state.host_answers(&existing.id) {
-                        match state.hold_sends_if_idle(&existing.id) {
-                            Some(taken) => hold = Some(taken),
-                            None => leave_host = true,
-                        }
-                    }
-                }
                 let mut machine = if let Some(mut existing) = existing {
                     if (upgrade || cloud) && !leave_host {
                         // A codespace or sandbox may have stopped, which also stopped its
@@ -1077,15 +1150,20 @@ impl Connections {
                             }
                         } else {
                             let script = cloud_or_plain_bootstrap(&target, platform, prelude);
-                            // A codespace that stops using an app account: see the pre-step.
-                            if prelude.is_none()
-                                && platform == ssh::HostPlatform::Unix
-                                && target
-                                    .codespace
-                                    .as_deref()
-                                    .is_some_and(|name| state.delivered_fingerprint(name).is_some())
-                            {
-                                format!("{}{script}", ssh::codespace_stop_host_prestep())
+                            // Only a change applied under the hold (the Host is idle) may
+                            // restart the Host.
+                            if hold.is_some() && platform == ssh::HostPlatform::Unix {
+                                if prelude.is_none() {
+                                    // Leaving an app account: see the pre-step.
+                                    if delivered_before.is_some() {
+                                        format!("{}{script}", ssh::codespace_stop_host_prestep())
+                                    } else {
+                                        script
+                                    }
+                                } else {
+                                    // A stale marker must not suppress the restart.
+                                    format!("{}{script}", ssh::codespace_forget_token_marker())
+                                }
                             } else {
                                 script
                             }
@@ -1208,15 +1286,18 @@ impl Connections {
                 Ok((machine, tunnel, descriptor))
             })()
             .map_err(|error| {
-                codespace_claude::mask(&error, resolved.as_ref().ok().and_then(Option::as_ref))
+                let error =
+                    codespace_claude::mask(&error, resolved.as_ref().ok().and_then(Option::as_ref));
+                codespace_claude::mask(&error, kept.as_ref().and_then(Option::as_ref))
             });
-            job.complete(|| {
+            job.complete(move || {
                 let (machine, tunnel, descriptor) = prepared?;
                 let machine = state.commit_machine(machine, &descriptor)?;
                 state.tunnels.insert(machine.id.clone(), tunnel);
+                // Sends flow again before any waiter sees the job done.
+                drop(hold);
                 Ok(machine.public())
             });
-            drop(hold);
         });
         Ok(id)
     }

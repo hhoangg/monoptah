@@ -41,6 +41,28 @@ pub(crate) fn fingerprint_of(delivery: Option<&ClaudeDelivery>) -> Option<String
     delivery.map(ClaudeDelivery::fingerprint)
 }
 
+/// The account id inside a fingerprint (`<id>:<digest>`; the digest is empty for a delivery
+/// known from the persisted hint only).
+pub(crate) fn account_of(fingerprint: &str) -> &str {
+    fingerprint
+        .rsplit_once(':')
+        .map_or(fingerprint, |(id, _)| id)
+}
+
+/// Whether two fingerprints (`None`: the Codespaces secret) stand for the same delivery. A
+/// fingerprint without a digest only knows the account, so it matches on the id alone.
+pub(crate) fn same_delivery(wanted: Option<&str>, delivered: Option<&str>) -> bool {
+    match (wanted, delivered) {
+        (None, None) => true,
+        (Some(wanted), Some(delivered)) => {
+            wanted == delivered
+                || (account_of(wanted) == account_of(delivered)
+                    && (wanted.ends_with(':') || delivered.ends_with(':')))
+        }
+        _ => false,
+    }
+}
+
 /// Where a codespace's Claude account comes from. Injectable; the app installs
 /// [`crate::cloud_sessions::claude_pin::StoreCodespaceClaude`]. Called from worker threads
 /// only (it reads the sealed credential).
@@ -56,6 +78,28 @@ pub trait CodespaceClaude: Send + Sync {
     /// Codespaces secret. `Err` when the chosen account cannot be used (deleted, no token);
     /// the caller must fail rather than fall back to the secret.
     fn resolve(&self, codespace: &str) -> Result<Option<ClaudeDelivery>, String>;
+
+    /// The credential of app account `account`, as codespace `codespace` would run under it
+    /// (used to re-deliver the account a Host already runs under when a change cannot be
+    /// applied yet). `Err` when that account can no longer be used.
+    fn resolve_account(
+        &self,
+        codespace: &str,
+        account: &str,
+    ) -> Result<Option<ClaudeDelivery>, String>;
+
+    /// The id of the account the Host of `codespace` was last bootstrapped with, kept across
+    /// app restarts (an id only, never a credential). The default keeps nothing.
+    fn delivered_hint(&self, codespace: &str) -> Option<String> {
+        let _ = codespace;
+        None
+    }
+
+    /// Records the account (`None`: the Codespaces secret) the Host of `codespace` was just
+    /// bootstrapped with, see [`Self::delivered_hint`]. Best effort.
+    fn note_delivered(&self, codespace: &str, account: Option<&str>) {
+        let _ = (codespace, account);
+    }
 }
 
 /// Masks the credential, and the whole prelude it came in, in text that may be shown.

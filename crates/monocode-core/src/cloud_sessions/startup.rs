@@ -1003,7 +1003,9 @@ impl CloudSessions {
             if claude.keep.is_none() {
                 let _ = match &previous_pin {
                     Some(previous) => claude_pin::write(store, &pin_key, previous),
-                    None => claude_pin::clear(store, &pin_key),
+                    None => claude_pin::clear(store, &pin_key).and_then(|()| {
+                        claude_pin::clear(store, &claude_pin::delivered_key(&resolved.name))
+                    }),
                 };
             }
         };

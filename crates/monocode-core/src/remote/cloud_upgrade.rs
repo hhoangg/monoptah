@@ -34,6 +34,18 @@ const SHUTDOWN_WAIT: Duration = Duration::from_secs(60);
 
 /// Returned for a request that starts a turn while the Host is being swapped.
 pub const HOST_UPDATING: &str = "Monoptah Host is being updated. Try again in a moment.";
+/// Returned for a request that starts a turn while a codespace's Claude account is applied.
+pub const ACCOUNT_APPLYING: &str =
+    "Applying the Claude account to the codespace. Try again in a moment.";
+
+/// Why sends to a machine are held back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HoldKind {
+    /// A Host swap (the cloud upgrade).
+    Swap,
+    /// A codespace's Claude account is being applied.
+    Account,
+}
 
 /// Requests that start a turn (a send, a workspace command). Held back while the machine's
 /// Host is swapped. Reads and session imports are not: they start nothing.
@@ -52,7 +64,18 @@ pub(super) struct SendGate {
 #[derive(Default)]
 struct GateState {
     in_flight: usize,
-    held: bool,
+    /// How many holds of each kind are in place. Counters, so one holder finishing never
+    /// lifts another holder's hold.
+    swap_holds: usize,
+    account_holds: usize,
+}
+impl GateState {
+    fn counter(&mut self, kind: HoldKind) -> &mut usize {
+        match kind {
+            HoldKind::Swap => &mut self.swap_holds,
+            HoldKind::Account => &mut self.account_holds,
+        }
+    }
 }
 /// One turn-starting request in flight; frees its place when dropped.
 pub(super) struct Entry(Arc<SendGate>);
@@ -74,38 +97,44 @@ impl SendGate {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.held {
+        if state.swap_holds > 0 {
             return Err(HOST_UPDATING.into());
+        }
+        if state.account_holds > 0 {
+            return Err(ACCOUNT_APPLYING.into());
         }
         state.in_flight += 1;
         Ok(Entry(self.clone()))
     }
     /// Refuses new requests, then waits for the ones in flight. On timeout the hold is undone.
-    fn hold(&self, limit: Duration) -> Result<(), String> {
+    pub(super) fn hold(&self, limit: Duration, kind: HoldKind) -> Result<(), String> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.held = true;
+        *state.counter(kind) += 1;
         let (mut state, timeout) = self
             .drained
             .wait_timeout_while(state, limit, |state| state.in_flight > 0)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if timeout.timed_out() {
-            state.held = false;
+            let held = state.counter(kind);
+            *held = held.saturating_sub(1);
             return Err("Requests to the Host did not finish in time.".into());
         }
         Ok(())
     }
     #[cfg(test)]
     pub(super) fn hold_for_test(&self) {
-        self.state.lock().unwrap().held = true;
+        self.state.lock().unwrap().swap_holds += 1;
     }
-    fn release(&self) {
-        self.state
+    fn release(&self, kind: HoldKind) {
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .held = false;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let held = state.counter(kind);
+        *held = held.saturating_sub(1);
     }
 }
 
@@ -113,7 +142,7 @@ impl SendGate {
 pub(super) struct SendHold(Arc<SendGate>);
 impl Drop for SendHold {
     fn drop(&mut self) {
-        self.0.release();
+        self.0.release(HoldKind::Account);
     }
 }
 
@@ -342,7 +371,7 @@ impl Connections {
     /// runs, or the Host cannot be asked, or the requests did not finish; nothing is held then.
     pub(super) fn hold_sends_if_idle(&self, machine_id: &str) -> Option<SendHold> {
         let gate = self.gate(machine_id);
-        gate.hold(self.drain_limit()).ok()?;
+        gate.hold(self.drain_limit(), HoldKind::Account).ok()?;
         let hold = SendHold(gate);
         if self.host_busy(machine_id).unwrap_or(true) {
             return None;
@@ -612,6 +641,22 @@ impl CloudUpgrade<'_> {
         }
     }
 
+    /// Records that the Host of a codespace now runs under the account its upgrade steps
+    /// carried (`None`, the Codespaces secret, included).
+    fn note_delivered(&self) {
+        let Some(lazy) = &self.lazy else {
+            return;
+        };
+        let (Some(name), Some(Ok(resolved))) = (lazy.target.codespace.as_deref(), lazy.cell.get())
+        else {
+            return;
+        };
+        self.connections.note_claude_delivered(
+            name,
+            super::codespace_claude::fingerprint_of(resolved.as_ref()),
+        );
+    }
+
     /// The credential if it has been resolved already (never resolves it).
     fn credentials_if_known(&self) -> Option<SandboxAuth<'_>> {
         self.auth.or_else(|| {
@@ -817,9 +862,9 @@ impl UpgradeEnv for CloudUpgrade<'_> {
     fn hold_sends(&self, held: bool) -> Result<(), String> {
         let gate = self.connections.gate(self.id);
         if held {
-            gate.hold(self.connections.drain_limit())
+            gate.hold(self.connections.drain_limit(), HoldKind::Swap)
         } else {
-            gate.release();
+            gate.release(HoldKind::Swap);
             Ok(())
         }
     }
@@ -835,6 +880,8 @@ impl UpgradeEnv for CloudUpgrade<'_> {
         let ended = finished.is_ok();
         let result = match finished {
             Ok(Finished::Done(port)) => {
+                // The restarted Host runs under the account the swap carried, like a bootstrap.
+                self.note_delivered();
                 let mut target = self
                     .machine()
                     .and_then(|m| {

@@ -374,6 +374,12 @@ impl Store {
                 }
             },
         );
+        if cloud.kind == CloudBackendKind::Codespaces {
+            let _ = crate::cloud_sessions::claude_pin::clear(
+                self,
+                &crate::cloud_sessions::claude_pin::delivered_key(&cloud.name),
+            );
+        }
         self.save_setting(
             SESSIONS,
             &serde_json::to_string(&sessions).map_err(|e| e.to_string())?,
