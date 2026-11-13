@@ -374,7 +374,9 @@ pub struct Target {
     pub codespace: CodespaceChoice,
     /// Branch for a new codespace.
     pub branch: Option<String>,
-    /// Machine type for a new codespace (default `basicLinux32gb`).
+    /// Machine type for a new codespace, used as is. `None` takes the project's saved machine
+    /// while the repository allows it on that branch, else the smallest allowed machine
+    /// ([`CloudSessions::default_machine`]), `basicLinux32gb` when GitHub does not say.
     pub machine: Option<String>,
     /// Minutes before an idle new codespace stops; `None` fills from the project's cloud
     /// settings, then the default of 30.
@@ -802,6 +804,8 @@ pub struct CloudSessions {
     states: Mutex<HashMap<String, (Instant, String)>>,
     /// Codespaces gh reported as not found (or that were deleted here).
     gone: Mutex<std::collections::HashSet<String>>,
+    /// Machine types each repository allows, asked once per repository and branch.
+    machines: codespaces::MachineCache,
     ttl: Duration,
     origin: OriginFn,
     claude_dir: std::path::PathBuf,
@@ -841,6 +845,7 @@ impl CloudSessions {
             store,
             states: Mutex::new(HashMap::new()),
             gone: Mutex::new(Default::default()),
+            machines: Default::default(),
             ttl: STATE_TTL,
             origin: Box::new(origin_url),
             claude_dir: convert::default_claude_dir(),
@@ -997,6 +1002,35 @@ impl CloudSessions {
             .ok_or_else(|| "The project's origin is not a GitHub repository.".to_string())
     }
 
+    /// The machine types `repo` allows for a new codespace on `branch` (`None`: the default
+    /// branch), cached for the life of the app. BLOCKS on the first call (one `gh api`). Only
+    /// reads GitHub's catalogue: no codespace is touched or woken.
+    pub fn allowed_machines(
+        &self,
+        repo: &str,
+        branch: Option<&str>,
+    ) -> Result<Vec<codespaces::MachineType>, String> {
+        self.machines.allowed(&*self.gh, repo, branch)
+    }
+
+    /// The machine a new codespace of `repo` on `branch` gets when none is named: the smallest
+    /// the repository allows (a devcontainer's `hostRequirements` can rule out the 2-core
+    /// `basicLinux32gb`). A failed lookup keeps [`codespaces::DEFAULT_MACHINE`]. BLOCKS.
+    pub fn default_machine(&self, repo: &str, branch: Option<&str>) -> String {
+        self.pick_machine(repo, branch, None)
+    }
+
+    /// Like [`Self::default_machine`], but keeps `preferred` (a project's saved machine) while
+    /// the repository still allows it on `branch`. BLOCKS.
+    pub fn pick_machine(
+        &self,
+        repo: &str,
+        branch: Option<&str>,
+        preferred: Option<&str>,
+    ) -> String {
+        self.machines.pick(&*self.gh, repo, branch, preferred).name
+    }
+
     /// Get a connected, project-open codespace for `local_cwd`. BLOCKS.
     ///
     /// A codespace this call created is never deleted on failure: the error then names it
@@ -1092,7 +1126,6 @@ impl CloudSessions {
                     .map(str::trim)
                     .filter(|b| !b.is_empty())
                     .ok_or("A branch is required to create a codespace")?;
-                progress("Creating codespace");
                 // Whatever the caller left unset comes from the project's cloud settings.
                 let project = self.codespace_project_config(local_cwd);
                 // A blank target value counts as unset, so it falls back to the project's.
@@ -1103,11 +1136,19 @@ impl CloudSessions {
                         .filter(|v| !v.is_empty())
                         .map(str::to_owned)
                 };
-                let machine = set(&target.machine).or_else(|| set(&project.machine));
+                // A machine the caller named is used as is (GitHub refuses one the repository
+                // does not allow, and says so). Otherwise the project's saved machine is only a
+                // preference: it is kept while the repository allows it on this branch, else the
+                // smallest allowed machine is taken (a lookup that fails keeps the preference
+                // or `basicLinux32gb`, so it never blocks a start).
+                let machine = match set(&target.machine) {
+                    Some(named) => named,
+                    None => self.pick_machine(&repo, Some(branch), project.machine.as_deref()),
+                };
                 let devcontainer = set(&target.devcontainer_path)
                     .or_else(|| set(&Some(project.devcontainer_path.clone())));
                 let options = codespaces::CreateOptions {
-                    machine: machine.as_deref(),
+                    machine: Some(&machine),
                     idle_timeout_minutes: Some(
                         target
                             .idle_timeout_minutes
@@ -1115,8 +1156,8 @@ impl CloudSessions {
                     ),
                     devcontainer_path: devcontainer.as_deref(),
                 };
+                progress("Creating codespace");
                 let started = codespaces::create_started(&*self.gh, &repo, branch, &options, None)?;
-                let machine = machine.unwrap_or_else(|| codespaces::DEFAULT_MACHINE.to_owned());
                 Ok(ResolvedCodespace {
                     name: started.name,
                     display: codespaces::display_name_for(branch),

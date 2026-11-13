@@ -47,6 +47,16 @@ impl GhRunner for FakeGh {
             .iter()
             .find(|(key, _)| line.contains(key.as_str()))
             .map(|(_, reply)| reply.clone())
+            // An unscripted machine-types lookup fails, so the static default machine stays.
+            .or_else(|| {
+                line.contains("/codespaces/machines").then(|| {
+                    Ok(GhOutput {
+                        success: false,
+                        stdout: String::new(),
+                        stderr: "HTTP 404".into(),
+                    })
+                })
+            })
             .unwrap_or_else(|| panic!("unexpected gh call: {line}"))
     }
 }
@@ -1838,6 +1848,75 @@ fn starting_a_codespace_session_resolves_every_instance_form() {
         .api
         .begin_start(&fx.path(), cs("octo-abc"), "codex")
         .is_err());
+}
+
+/// GitHub's machine list for a repository whose devcontainer asks for 4 cores.
+const ONLY_STANDARD: &str = r#"{"total_count":1,"machines":[{"name":"standardLinux32gb","display_name":"4 cores, 16 GB RAM","cpus":4,"memory_in_bytes":17179869184}]}"#;
+
+#[test]
+fn a_new_codespace_without_a_machine_gets_one_the_repository_allows() {
+    // sessions.start {kind:"codespace",instance:"new"}, machine omitted.
+    let gh = FakeGh::new(vec![
+        ("auth status", ok(AUTH_OK)),
+        ("codespaces/machines?ref=trunk", ok(ONLY_STANDARD)),
+        (
+            "--method POST",
+            ok(r#"{"name":"octo-new1","state":"Provisioning"}"#),
+        ),
+    ]);
+    let fx = fixture(&gh);
+    let target = start_target(CloudBackendKind::Codespaces, InstanceChoice::New);
+    fx.api.begin_start(&fx.path(), target, "claude").unwrap();
+    let calls = gh.calls();
+    let post = calls.iter().find(|c| c.contains("--method POST")).unwrap();
+    assert!(post.contains("machine=standardLinux32gb"), "{post}");
+    assert!(!post.contains("basicLinux32gb"), "{post}");
+    // cloud.create, machine omitted: the same choice (asked again only for another branch).
+    let gh = FakeGh::new(vec![
+        ("auth status", ok(AUTH_OK)),
+        ("codespaces/machines?ref=feat", ok(ONLY_STANDARD)),
+        ("codespace create", ok("octo-new2\n")),
+        ("codespace view", ok(r#"{"state":"Available"}"#)),
+    ]);
+    let fx = fixture(&gh);
+    fx.api
+        .create(
+            &fx.path(),
+            &json!({"kind":"codespace","branch":"feat"}),
+            &mut |_| {},
+        )
+        .unwrap();
+    let calls = gh.calls();
+    let create = calls
+        .iter()
+        .find(|c| c.contains("codespace create"))
+        .unwrap();
+    assert!(create.contains("--machine standardLinux32gb"), "{create}");
+}
+
+#[test]
+fn a_failed_machine_lookup_keeps_the_documented_default() {
+    let gh = FakeGh::new(vec![
+        ("auth status", ok(AUTH_OK)),
+        (
+            "codespaces/machines",
+            Ok(GhOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: "HTTP 403: Resource not accessible by integration".into(),
+            }),
+        ),
+        (
+            "--method POST",
+            ok(r#"{"name":"octo-new1","state":"Provisioning"}"#),
+        ),
+    ]);
+    let fx = fixture(&gh);
+    let target = start_target(CloudBackendKind::Codespaces, InstanceChoice::New);
+    fx.api.begin_start(&fx.path(), target, "claude").unwrap();
+    let calls = gh.calls();
+    let post = calls.iter().find(|c| c.contains("--method POST")).unwrap();
+    assert!(post.contains("machine=basicLinux32gb"), "{post}");
 }
 
 #[test]

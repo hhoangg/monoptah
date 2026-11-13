@@ -905,7 +905,7 @@ fn machines_load_off_the_spot_and_the_pick_reaches_the_request(cx: &mut TestAppC
     let sink = listed.clone();
     window
         .update(cx, |view, _, cx| {
-            view.set_machine_loader(Arc::new(move |project| {
+            view.set_machine_loader(Arc::new(move |project, _| {
                 sink.lock().unwrap().push(project);
                 Ok(vec![
                     machine("basicLinux32gb", "2 cores, 8 GB RAM"),
@@ -960,7 +960,7 @@ fn a_failed_machine_listing_keeps_the_default_machine(cx: &mut TestAppContext) {
     let requests = watch(window, cx);
     window
         .update(cx, |view, _, cx| {
-            view.set_machine_loader(Arc::new(|_| Err("gh is not installed".into())));
+            view.set_machine_loader(Arc::new(|_, _| Err("gh is not installed".into())));
             view.set_offers_codespace(true, cx);
             view.cloud_menu_choice("workspace:cloud-codespace", cx);
         })
@@ -984,13 +984,179 @@ fn a_failed_machine_listing_keeps_the_default_machine(cx: &mut TestAppContext) {
     assert_eq!(requests.lock().unwrap()[0].machine, None);
 }
 
+/// A machine type with a size, as `gh api repos/o/r/codespaces/machines` reports it.
+fn sized(name: &str, cpus: u32, memory_gb: u64) -> codespaces::MachineType {
+    codespaces::MachineType {
+        name: name.into(),
+        display_name: format!("{cpus} cores, {memory_gb} GB RAM"),
+        operating_system: "linux".into(),
+        storage_in_bytes: 32 << 30,
+        memory_in_bytes: memory_gb << 30,
+        cpus,
+    }
+}
+
+#[gpui::test]
+fn only_allowed_machines_are_offered_and_the_smallest_is_the_default(cx: &mut TestAppContext) {
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    let requests = watch(window, cx);
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let sink = asked.clone();
+    window
+        .update(cx, |view, _, cx| {
+            // A devcontainer asking for 4 cores: GitHub leaves basicLinux32gb out, in any order.
+            view.set_machine_loader(Arc::new(move |_, branch| {
+                sink.lock().unwrap().push(branch);
+                Ok(vec![
+                    sized("premiumLinux", 8, 32),
+                    sized("standardLinux32gb", 4, 16),
+                    sized("largePremiumLinux", 16, 64),
+                ])
+            }));
+            view.set_offers_codespace(true, cx);
+            view.cloud_menu_choice("workspace:cloud-codespace", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    // Asked once, for the branch the codespace would be created on.
+    assert_eq!(*asked.lock().unwrap(), vec![Some("main".to_string())]);
+    window
+        .update(cx, |view, _, cx| {
+            assert_eq!(
+                view.cloud_field_value(CloudField::Machine),
+                "4 cores, 16 GB RAM"
+            );
+            let (_, items) = view.cloud_field_menu(CloudField::Machine);
+            let offered: Vec<(String, bool)> = items
+                .iter()
+                .filter_map(|item| match item {
+                    MenuItem::Action(a) => Some((a.id.to_string(), a.checked)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                offered,
+                vec![
+                    ("cloud-set:machine:premiumLinux".to_string(), false),
+                    ("cloud-set:machine:standardLinux32gb".to_string(), true),
+                    ("cloud-set:machine:largePremiumLinux".to_string(), false),
+                ]
+            );
+            assert!(
+                !offered
+                    .iter()
+                    .any(|(id, _)| id.contains(codespaces::DEFAULT_MACHINE))
+            );
+            assert_eq!(view.cloud_draft.as_ref().unwrap().machine_note, None);
+            view.create_cloud(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    // No pick: the start takes the smallest machine allowed on the branch it creates on (the
+    // same one here), never the static basicLinux32gb.
+    assert_eq!(requests.lock().unwrap()[0].machine, None);
+}
+
+#[gpui::test]
+fn a_pick_another_branch_does_not_allow_falls_back_with_a_note(cx: &mut TestAppContext) {
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    let requests = watch(window, cx);
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let sink = asked.clone();
+    window
+        .update(cx, |view, _, cx| {
+            view.set_machine_loader(Arc::new(move |_, branch: Option<String>| {
+                sink.lock().unwrap().push(branch.clone());
+                Ok(match branch.as_deref() {
+                    // This branch's devcontainer needs 4 cores.
+                    Some("big") => vec![
+                        sized("standardLinux32gb", 4, 16),
+                        sized("premiumLinux", 8, 32),
+                    ],
+                    _ => vec![
+                        sized("basicLinux32gb", 2, 8),
+                        sized("standardLinux32gb", 4, 16),
+                        sized("premiumLinux", 8, 32),
+                    ],
+                })
+            }));
+            view.set_offers_codespace(true, cx);
+            view.cloud_menu_choice("workspace:cloud-codespace", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            assert_eq!(
+                view.cloud_field_value(CloudField::Machine),
+                "2 cores, 8 GB RAM"
+            );
+            // A pick the next branch still allows is kept.
+            assert!(view.cloud_menu_choice("cloud-set:machine:premiumLinux", cx));
+            view.cloud_ref_picked(CloudRefField::Base, Some("big".into()), cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            let draft = view.cloud_draft.as_ref().unwrap();
+            assert_eq!(draft.machine.as_deref(), Some("premiumLinux"));
+            assert_eq!(draft.machine_note, None);
+            // Back to main, pick the 2-core machine, then a branch that rules it out.
+            view.cloud_ref_picked(CloudRefField::Base, Some("main".into()), cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            assert!(view.cloud_menu_choice("cloud-set:machine:basicLinux32gb", cx));
+            view.cloud_ref_picked(CloudRefField::Base, Some("big".into()), cx);
+            // The same branch again asks nothing more.
+            view.cloud_ref_picked(CloudRefField::Base, Some("big".into()), cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        *asked.lock().unwrap(),
+        vec![
+            Some("main".to_string()),
+            Some("big".to_string()),
+            Some("main".to_string()),
+            Some("big".to_string()),
+        ]
+    );
+    window
+        .update(cx, |view, _, cx| {
+            let draft = view.cloud_draft.as_ref().unwrap();
+            assert_eq!(draft.machine, None);
+            let note = draft.machine_note.clone().unwrap();
+            assert!(note.contains("basicLinux32gb"), "{note}");
+            assert!(note.contains("4 cores, 16 GB RAM"), "{note}");
+            assert_eq!(
+                view.cloud_field_value(CloudField::Machine),
+                "4 cores, 16 GB RAM"
+            );
+            // Picking a machine again clears the note.
+            assert!(view.cloud_menu_choice("cloud-set:machine:premiumLinux", cx));
+            assert_eq!(view.cloud_draft.as_ref().unwrap().machine_note, None);
+            view.create_cloud(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let sent = requests.lock().unwrap();
+    assert_eq!(sent[0].machine.as_deref(), Some("premiumLinux"));
+    assert_eq!(sent[0].branch, "big");
+}
+
 #[gpui::test]
 fn a_late_machine_listing_for_a_replaced_draft_is_ignored(cx: &mut TestAppContext) {
     let repo = temp_repo("ref: refs/heads/main\n");
     let window = conversation(cx, &repo, false);
     window
         .update(cx, |view, _, cx| {
-            view.set_machine_loader(Arc::new(|_| Ok(vec![machine("a", "A")])));
+            view.set_machine_loader(Arc::new(|_, _| Ok(vec![machine("a", "A")])));
             view.set_offers_codespace(true, cx);
             view.cloud_menu_choice("workspace:cloud-codespace", cx);
             view.clear_cloud_target(cx);
@@ -1120,7 +1286,7 @@ fn picking_the_codespace_again_resets_the_machine_branch_and_listing(cx: &mut Te
     let count = listed.clone();
     window
         .update(cx, |view, _, cx| {
-            view.set_machine_loader(Arc::new(move |_| {
+            view.set_machine_loader(Arc::new(move |_, _| {
                 *count.lock().unwrap() += 1;
                 Ok(vec![machine("basicLinux32gb", "Basic")])
             }));
@@ -2257,7 +2423,7 @@ fn the_composer_starts_and_resets_from_the_saved_project_machine_and_branch(
     window
         .update(cx, |view, _, cx| {
             save_codespace_config(view, "release", Some("standardLinux32gb"));
-            view.set_machine_loader(Arc::new(|_| {
+            view.set_machine_loader(Arc::new(|_, _| {
                 Ok(vec![
                     machine("basicLinux32gb", "Basic"),
                     machine("standardLinux32gb", "Standard"),
@@ -2308,7 +2474,7 @@ fn an_empty_branch_field_starts_on_the_project_base_branch(cx: &mut TestAppConte
 }
 
 #[gpui::test]
-fn a_project_machine_the_repository_does_not_offer_falls_back_like_the_picker(
+fn a_project_machine_the_repository_does_not_allow_falls_back_to_the_smallest_with_a_note(
     cx: &mut TestAppContext,
 ) {
     let repo = temp_repo("ref: refs/heads/main\n");
@@ -2317,10 +2483,11 @@ fn a_project_machine_the_repository_does_not_offer_falls_back_like_the_picker(
     window
         .update(cx, |view, _, cx| {
             save_codespace_config(view, "", Some("gone32gb"));
-            view.set_machine_loader(Arc::new(|_| {
+            view.set_machine_loader(Arc::new(|_, _| {
+                // The devcontainer asks for 4 cores: no 2-core machine, and not the saved one.
                 Ok(vec![
-                    machine("standardLinux32gb", "Standard"),
-                    machine("basicLinux32gb", "Basic"),
+                    sized("premiumLinux", 8, 32),
+                    sized("standardLinux32gb", 4, 16),
                 ])
             }));
             view.set_offers_codespace(true, cx);
@@ -2331,16 +2498,23 @@ fn a_project_machine_the_repository_does_not_offer_falls_back_like_the_picker(
     window
         .update(cx, |view, _, cx| {
             let draft = view.cloud_draft.as_ref().unwrap();
-            assert_eq!(draft.machine.as_deref(), Some(codespaces::DEFAULT_MACHINE));
-            assert_eq!(view.cloud_field_value(CloudField::Machine), "Basic");
+            // The saved machine is only a preference: the smallest allowed one is shown and
+            // checked, with a note, and nothing counts as changed for this session.
+            assert_eq!(draft.machine, None);
+            let note = draft.machine_note.clone().unwrap();
+            assert!(note.contains("gone32gb"), "{note}");
+            assert!(note.contains("4 cores, 16 GB RAM"), "{note}");
+            assert_eq!(
+                view.cloud_field_value(CloudField::Machine),
+                "4 cores, 16 GB RAM"
+            );
+            assert!(!draft.row_changed(CloudRow::Machine));
             view.create_cloud(cx);
         })
         .unwrap();
     cx.run_until_parked();
-    assert_eq!(
-        requests.lock().unwrap()[0].machine.as_deref(),
-        Some(codespaces::DEFAULT_MACHINE)
-    );
+    // No override: the start applies the same rule for the branch it creates on.
+    assert_eq!(requests.lock().unwrap()[0].machine, None);
 }
 
 #[gpui::test]
@@ -2351,7 +2525,7 @@ fn a_failed_listing_still_offers_the_project_machine_the_row_shows(cx: &mut Test
     window
         .update(cx, |view, _, cx| {
             save_codespace_config(view, "", Some("premiumLinux"));
-            view.set_machine_loader(Arc::new(|_| Err("gh is not installed".into())));
+            view.set_machine_loader(Arc::new(|_, _| Err("gh is not installed".into())));
             view.set_offers_codespace(true, cx);
             view.cloud_menu_choice("workspace:cloud-codespace", cx);
         })
@@ -2565,7 +2739,7 @@ fn a_codespace_row_is_marked_when_it_differs_and_clears_when_set_back(cx: &mut T
     let window = conversation(cx, &repo, false);
     window
         .update(cx, |view, _, cx| {
-            view.set_machine_loader(Arc::new(|_| {
+            view.set_machine_loader(Arc::new(|_, _| {
                 Ok(vec![
                     machine("basicLinux32gb", "Basic"),
                     machine("standardLinux32gb", "Standard"),
@@ -2642,7 +2816,7 @@ fn a_codespace_request_carries_each_override(cx: &mut TestAppContext) {
     let requests = watch(window, cx);
     window
         .update(cx, |view, _, cx| {
-            view.set_machine_loader(Arc::new(|_| {
+            view.set_machine_loader(Arc::new(|_, _| {
                 Ok(vec![
                     machine("basicLinux32gb", "Basic"),
                     machine("standardLinux32gb", "Standard"),

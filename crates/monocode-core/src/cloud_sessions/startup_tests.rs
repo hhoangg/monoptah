@@ -44,6 +44,8 @@ struct Gh {
     switch_error: Mutex<Option<String>>,
     /// Makes the next this-many branch scripts fail (a slow first ssh), then lets them pass.
     switch_failures: Mutex<u32>,
+    /// The answer to the machine-types lookup; `None` fails it (GitHub not reachable).
+    machines: Mutex<Option<&'static str>>,
 }
 impl Gh {
     fn new(states: &[&str], log: &[&'static str]) -> Arc<Self> {
@@ -57,6 +59,7 @@ impl Gh {
             scripts: Mutex::new(vec![]),
             switch_error: Mutex::new(None),
             switch_failures: Mutex::new(0),
+            machines: Mutex::new(None),
         })
     }
     fn failing_follower(states: &[&str]) -> Arc<Self> {
@@ -109,6 +112,15 @@ impl GhRunner for Gh {
         }
         if line.starts_with("auth status") {
             ok(AUTH_OK)
+        } else if line.contains("/codespaces/machines") {
+            match *self.machines.lock().unwrap() {
+                Some(json) => ok(json),
+                None => Ok(GhOutput {
+                    success: false,
+                    stdout: String::new(),
+                    stderr: "HTTP 404: Not Found".into(),
+                }),
+            }
         } else if line.starts_with("api --method POST") {
             ok(CREATED)
         } else if line.starts_with("api user/codespaces") {
@@ -798,6 +810,48 @@ fn blank_target_values_fall_back_to_the_project_settings() {
         "{call}"
     );
     assert_eq!(record.machine.as_deref(), Some("standardLinux32gb"));
+}
+
+#[test]
+fn a_new_codespace_without_a_machine_gets_the_smallest_the_branch_allows() {
+    // The devcontainer asks for 4 cores: GitHub offers no 2-core machine on this branch.
+    let gh = Gh::new(&["Provisioning"], &[]);
+    *gh.machines.lock().unwrap() = Some(
+        r#"{"total_count":2,"machines":[
+          {"name":"premiumLinux","display_name":"8 cores","cpus":8,"memory_in_bytes":34359738368},
+          {"name":"standardLinux32gb","display_name":"4 cores","cpus":4,"memory_in_bytes":17179869184}]}"#,
+    );
+    let f = fx(gh);
+    let (_, record) = f
+        .svc
+        .begin_start("/Users/me/widgets", new_target(), "claude")
+        .unwrap();
+    assert_eq!(record.machine.as_deref(), Some("standardLinux32gb"));
+    let calls = f.gh.calls();
+    let lookup = f.gh.position("/codespaces/machines").unwrap();
+    assert!(calls[lookup].ends_with("/repos/octo/widgets/codespaces/machines?ref=main"));
+    let create = f.gh.position("api --method POST").unwrap();
+    assert!(lookup < create);
+    assert!(
+        calls[create].contains("machine=standardLinux32gb"),
+        "{}",
+        calls[create]
+    );
+    // A second start asks GitHub nothing more: the answer is kept for the session.
+    f.svc
+        .begin_start("/Users/me/widgets", new_target(), "claude")
+        .unwrap();
+    assert_eq!(f.gh.count("/codespaces/machines"), 1);
+    // A machine the caller names is used as is.
+    let named = Target {
+        machine: Some("premiumLinux".into()),
+        ..new_target()
+    };
+    let (_, record) = f
+        .svc
+        .begin_start("/Users/me/widgets", named, "claude")
+        .unwrap();
+    assert_eq!(record.machine.as_deref(), Some("premiumLinux"));
 }
 
 #[test]

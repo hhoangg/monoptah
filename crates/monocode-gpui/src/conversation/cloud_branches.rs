@@ -581,6 +581,10 @@ impl Conversation {
             draft.base_text = name.clone();
         }
         input.update(cx, |input, cx| input.set_text(name, cx));
+        if field == CloudRefField::Base {
+            // Another base branch can have another devcontainer, so other allowed machines.
+            self.reload_cloud_machines_for_base(cx);
+        }
         cx.notify();
     }
 }

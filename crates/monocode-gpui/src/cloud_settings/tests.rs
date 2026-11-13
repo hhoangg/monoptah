@@ -69,7 +69,7 @@ impl GhRunner for FakeGh {
         };
         match args.first().map(String::as_str) {
             Some("auth") => ok(AUTH_OK),
-            Some("api") if args.iter().any(|a| a.ends_with("/codespaces/machines")) => {
+            Some("api") if args.iter().any(|a| a.contains("/codespaces/machines")) => {
                 if self.machines_fail.load(Ordering::SeqCst) {
                     Err("HTTP 500".into())
                 } else {
@@ -619,7 +619,7 @@ fn the_machine_the_devcontainer_asks_for_is_marked() {
         host_memory_mib: Some(16 * 1024),
         ..Default::default()
     };
-    let labels: Vec<_> = model::machine_options(&machines, None, &info)
+    let labels: Vec<_> = model::machine_options(&machines, &info)
         .into_iter()
         .map(|o| o.label)
         .collect();
@@ -631,14 +631,33 @@ fn the_machine_the_devcontainer_asks_for_is_marked() {
             "8-core, 32 GB"
         ]
     );
-    // No requirement, no mark. A saved machine the list lacks stays selectable.
-    let plain = model::machine_options(&machines, Some("legacy"), &DevcontainerInfo::default());
+    // No requirement, no mark.
+    let plain = model::machine_options(&machines, &DevcontainerInfo::default());
     assert!(plain.iter().all(|o| !o.label.contains("devcontainer")));
-    assert_eq!(plain.last().map(|o| o.name.as_str()), Some("legacy"));
-    // None selects the machine a codespace starts on.
+    // None selects the machine a codespace starts on, a saved one while it is allowed.
     assert_eq!(
         model::selected_machine(&machines, None).as_deref(),
         Some("basicLinux32gb")
+    );
+    assert_eq!(
+        model::selected_machine(&machines, Some("premiumLinux")).as_deref(),
+        Some("premiumLinux")
+    );
+    // A saved machine the repository no longer allows is not offered; the smallest allowed one
+    // is selected instead and the dialog says so.
+    let allowed = &machines[1..];
+    assert_eq!(
+        model::unavailable_machine(allowed, Some("basicLinux32gb")),
+        Some("basicLinux32gb")
+    );
+    assert_eq!(
+        model::unavailable_machine(allowed, Some("premiumLinux")),
+        None
+    );
+    assert_eq!(model::unavailable_machine(allowed, None), None);
+    assert_eq!(
+        model::selected_machine(allowed, Some("basicLinux32gb")).as_deref(),
+        Some("standardLinux32gb")
     );
 }
 
@@ -1570,6 +1589,40 @@ fn a_picked_machine_survives_a_failed_reload(cx: &mut TestAppContext) {
         fixture.load().codespace.machine.as_deref(),
         Some("standardLinux32gb")
     );
+}
+
+#[gpui::test]
+fn the_machines_are_listed_for_the_base_branch_and_a_saved_one_that_is_gone_is_replaced(
+    cx: &mut TestAppContext,
+) {
+    let fixture = Fixture::new();
+    let dialog = fixture.open(cx, Some(DefaultBackend::Codespace), https_origin);
+    // A saved machine the repository does not list (a devcontainer on another branch rules it
+    // out) is not offered; the smallest listed one is selected and the dialog says so.
+    dialog.update(cx, |d, cx| {
+        d.pick(Pick::Machine(Some("legacyLinux".into())), cx);
+        d.set_text("cs_base", "feature/big", cx);
+        d.load_machines(cx);
+    });
+    cx.run_until_parked();
+    let asked = fixture.gh.calls.lock().unwrap().clone();
+    assert!(
+        asked.iter().any(|call| call
+            .iter()
+            .any(|a| a.ends_with("/codespaces/machines?ref=feature%2Fbig"))),
+        "{asked:?}"
+    );
+    dialog.read_with(cx, |d, cx| {
+        let labels: Vec<_> = d
+            .options(Select::Machine, cx)
+            .into_iter()
+            .map(|o| o.label)
+            .collect();
+        assert_eq!(labels.len(), 3, "{labels:?}");
+        assert!(labels.iter().all(|label| !label.contains("legacyLinux")));
+        assert_eq!(d.current_label(Select::Machine, cx), "2-core, 8 GB");
+        assert!(d.machine_warning(cx).is_some());
+    });
 }
 
 #[gpui::test]

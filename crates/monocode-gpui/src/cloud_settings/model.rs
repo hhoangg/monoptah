@@ -444,15 +444,15 @@ pub(super) fn devcontainer_machine<'a>(
         .min_by_key(|m| (m.cpus, m.memory_in_bytes))
 }
 
-/// The machine select's options: every machine the repository offers (the one the
-/// devcontainer asks for marked), plus the current value when the list lacks it.
+/// The machine select's options: every machine the repository allows on the base branch (the
+/// one the devcontainer asks for marked). A saved machine the list lacks is not offered:
+/// GitHub would refuse it, see [`unavailable_machine`].
 pub(super) fn machine_options(
     machines: &[MachineType],
-    current: Option<&str>,
     info: &DevcontainerInfo,
 ) -> Vec<MachineOption> {
     let marked = devcontainer_machine(machines, info).map(|m| m.name.clone());
-    let mut options: Vec<MachineOption> = machines
+    machines
         .iter()
         .map(|machine| MachineOption {
             name: machine.name.clone(),
@@ -462,22 +462,20 @@ pub(super) fn machine_options(
                 machine_label(machine)
             },
         })
-        .collect();
-    if let Some(current) = current
-        && !options.iter().any(|o| o.name == current)
-    {
-        options.push(MachineOption {
-            name: current.to_owned(),
-            label: current.to_owned(),
-        });
-    }
-    options
+        .collect()
 }
 
-/// The name that is selected: the project's machine, else the one a codespace starts on.
+/// The name that is selected: the project's machine while the repository allows it, else the
+/// smallest allowed one (the machine a codespace then starts on).
 pub(super) fn selected_machine(machines: &[MachineType], current: Option<&str>) -> Option<String> {
-    match current {
-        Some(name) => Some(name.to_owned()),
-        None => codespaces::default_machine(machines, None),
-    }
+    codespaces::default_machine(machines, current)
+}
+
+/// The saved machine when the listed machines do not include it (the repository's devcontainer
+/// or policy rules it out now): the start then uses [`selected_machine`] instead.
+pub(super) fn unavailable_machine<'a>(
+    machines: &[MachineType],
+    current: Option<&'a str>,
+) -> Option<&'a str> {
+    current.filter(|name| !machines.is_empty() && !machines.iter().any(|m| m.name == *name))
 }
