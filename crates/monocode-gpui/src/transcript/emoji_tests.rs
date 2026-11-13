@@ -672,6 +672,11 @@ fn a_drag_across_a_line_with_an_emoji_still_selects_the_text_around_it(cx: &mut 
     let emoji = visual.debug_bounds("mono-emoji-happy").unwrap();
     let from = point(emoji.left() - px(60.), emoji.center().y);
     let to = point(emoji.right() + px(80.), emoji.center().y);
+    hover(visual, emoji.center());
+    assert!(
+        visual.debug_bounds("mono-emoji-preview").is_some(),
+        "the preview is showing during the drag"
+    );
     visual.simulate_mouse_down(from, gpui::MouseButton::Left, gpui::Modifiers::default());
     visual.simulate_mouse_move(
         emoji.center(),
@@ -684,4 +689,54 @@ fn a_drag_across_a_line_with_an_emoji_still_selects_the_text_around_it(cx: &mut 
         .read_with(visual, |view, _| view.selected_text())
         .unwrap();
     assert_eq!(selected.as_deref(), Some("Nice work"));
+}
+
+#[gpui::test]
+fn the_preview_stays_clear_of_the_emoji_when_the_mouse_moves_inside_it(cx: &mut TestAppContext) {
+    let fx = fixture(true);
+    let visual = &mut hover_view(cx, &fx, "Done.\n\n:emo[celebrate]\n\nNext");
+    let emoji = visual.debug_bounds("mono-emoji-large-celebrate").unwrap();
+    hover(visual, point(emoji.center().x, emoji.top() + px(4.)));
+    let first = visual.debug_bounds("mono-emoji-preview").unwrap();
+    assert!(!first.intersects(&emoji));
+    hover(visual, point(emoji.center().x, emoji.bottom() - px(4.)));
+    visual.update(|window, _| window.refresh());
+    visual.run_until_parked();
+    let preview = visual
+        .debug_bounds("mono-emoji-preview")
+        .expect("still shown while the mouse is on the emoji");
+    assert_eq!(
+        preview.origin, first.origin,
+        "the card does not follow the mouse"
+    );
+    assert!(
+        !preview.intersects(&emoji),
+        "the card does not drift onto the emoji"
+    );
+}
+
+#[gpui::test]
+fn the_preview_stays_clear_of_an_emoji_near_the_window_bottom(cx: &mut TestAppContext) {
+    let mut seen_flipped = false;
+    let mut seen_below = false;
+    for trailing in [0usize, 2, 4, 6, 8, 10] {
+        let fx = fixture(true);
+        let reply = format!(
+            "Done.\n\n:emo[celebrate]{}",
+            "\n\nmore text".repeat(trailing)
+        );
+        let visual = &mut hover_view(cx, &fx, &reply);
+        let emoji = visual.debug_bounds("mono-emoji-large-celebrate").unwrap();
+        hover(visual, point(emoji.center().x, emoji.top() + px(5.)));
+        let preview = visual
+            .debug_bounds("mono-emoji-preview")
+            .unwrap_or_else(|| panic!("preview with {trailing} trailing paragraphs"));
+        assert!(
+            !preview.intersects(&emoji),
+            "{trailing} trailing paragraphs: {preview:?} covers {emoji:?}"
+        );
+        seen_flipped |= preview.bottom() <= emoji.top();
+        seen_below |= preview.top() >= emoji.bottom();
+    }
+    assert!(seen_below && seen_flipped, "both placements were exercised");
 }
