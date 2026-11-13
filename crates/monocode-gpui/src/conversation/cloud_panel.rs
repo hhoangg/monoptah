@@ -501,6 +501,9 @@ impl Conversation {
                         .text_color(content(0.45))
                         .child(note)
                 }))
+                // The usage line comes last: under the machine row and its note, Codespaces
+                // only (the Docker panel has no Machine row).
+                .children(self.cloud_usage_row(draft, cx))
                 .into_any_element(),
             _ => match row.field() {
                 Some(field) => self.cloud_choice_row(row, field, cx).into_any_element(),

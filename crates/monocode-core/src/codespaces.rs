@@ -13,6 +13,8 @@ use std::time::Duration;
 use crate::cloud_sessions::backend::CloudBackendKind;
 use serde::{Deserialize, Serialize};
 
+pub mod usage;
+
 pub const OAUTH_SECRET_KEY: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 pub const DEFAULT_MACHINE: &str = "basicLinux32gb";
 pub const IDLE_TIMEOUT: &str = "30m";
