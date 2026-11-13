@@ -2233,13 +2233,13 @@ pub use startup::{
 
 // These fixtures execute the Linux host scripts against local Unix paths.
 #[cfg(test)]
+mod auto_stop_tests;
+#[cfg(test)]
 mod claude_pin_tests;
 #[cfg(all(test, unix))]
 mod continue_tests;
 #[cfg(all(test, unix))]
 mod convert_tests;
-#[cfg(test)]
-mod auto_stop_tests;
 #[cfg(test)]
 mod docker_config_tests;
 #[cfg(test)]

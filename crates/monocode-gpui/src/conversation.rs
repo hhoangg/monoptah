@@ -1,7 +1,7 @@
 mod accounts;
 mod approvals;
-mod auto_stop;
 mod attachment_drop;
+mod auto_stop;
 mod background_tasks;
 mod btw;
 mod changes_shelf;

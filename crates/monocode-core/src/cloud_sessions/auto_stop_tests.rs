@@ -267,14 +267,19 @@ fn the_notices_name_the_workspace_and_say_how_to_resume() {
         cloud: sandbox(),
         reason: Reason::Unused,
     };
-    assert!(unused.notice().contains("last session was archived or deleted"));
+    assert!(unused
+        .notice()
+        .contains("last session was archived or deleted"));
 }
 
 #[test]
 fn an_absurd_idle_time_is_brought_into_range() {
     let mut odd = prefs();
     odd.sandbox.idle_minutes = Some(0);
-    assert_eq!(odd.policy(CloudBackendKind::DockerSandbox).idle_minutes, Some(1));
+    assert_eq!(
+        odd.policy(CloudBackendKind::DockerSandbox).idle_minutes,
+        Some(1)
+    );
     odd.sandbox.idle_minutes = Some(u32::MAX);
     assert_eq!(
         odd.policy(CloudBackendKind::DockerSandbox).idle_minutes,
@@ -331,7 +336,10 @@ impl Scripted {
         self.calls.lock().unwrap().clone()
     }
     fn stops(&self) -> usize {
-        self.calls().iter().filter(|c| c.starts_with("stop")).count()
+        self.calls()
+            .iter()
+            .filter(|c| c.starts_with("stop"))
+            .count()
     }
 }
 impl CloudBackend for Scripted {
@@ -391,8 +399,8 @@ fn world(state: &str, with_session: bool) -> (CloudSessions, Arc<Scripted>) {
         Store::open(std::path::Path::new(":memory:")).unwrap(),
     ));
     let backend = Scripted::new(state);
-    let svc = CloudSessions::new(Arc::new(NoGh), Arc::new(NoHost), store)
-        .with_backend(backend.clone());
+    let svc =
+        CloudSessions::new(Arc::new(NoGh), Arc::new(NoHost), store).with_backend(backend.clone());
     if with_session {
         let project = crate::store::pending_cloud_project(
             "/Users/me/widgets",

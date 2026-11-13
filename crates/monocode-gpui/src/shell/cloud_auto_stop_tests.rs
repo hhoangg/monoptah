@@ -141,7 +141,12 @@ fn world(
                 .cloud_states
                 .insert(CODESPACE.into(), CloudState::Available);
             if let Some(minutes) = idle {
-                shell.workspace.preferences.cloud_auto_stop.codespace.idle_minutes = Some(minutes);
+                shell
+                    .workspace
+                    .preferences
+                    .cloud_auto_stop
+                    .codespace
+                    .idle_minutes = Some(minutes);
             }
             id
         })
@@ -176,7 +181,9 @@ fn an_idle_workspace_is_stopped_once_with_a_notice_and_resume_starts_a_new_windo
             let notice = shell.notice.clone().unwrap();
             assert_eq!(
                 notice,
-                format!("Stopped codespace {CODESPACE} after 10 min idle; send a message to resume.")
+                format!(
+                    "Stopped codespace {CODESPACE} after 10 min idle; send a message to resume."
+                )
             );
         })
         .unwrap();
@@ -234,9 +241,7 @@ fn a_working_session_a_queue_or_an_unknown_state_keeps_the_workspace(cx: &mut Te
             shell
                 .cloud_states
                 .insert(CODESPACE.into(), CloudState::Available);
-            shell
-                .cloud_workspaces_busy
-                .insert(CODESPACE.to_owned());
+            shell.cloud_workspaces_busy.insert(CODESPACE.to_owned());
         })
         .unwrap();
     check_at(window, 240, cx);
@@ -285,7 +290,12 @@ fn the_last_session_going_away_stops_the_workspace_after_the_grace(cx: &mut Test
     let (window, id, gh) = world(cx, "Available", None);
     window
         .update(cx, |shell, _, _| {
-            shell.workspace.preferences.cloud_auto_stop.codespace.stop_when_unused = true;
+            shell
+                .workspace
+                .preferences
+                .cloud_auto_stop
+                .codespace
+                .stop_when_unused = true;
         })
         .unwrap();
     check_at(window, 0, cx);
@@ -295,6 +305,7 @@ fn the_last_session_going_away_stops_the_workspace_after_the_grace(cx: &mut Test
             locked(&shell.store).unwrap().delete(id).unwrap();
             shell.cloud_marks.remove(&id);
             shell.session_summaries.remove(&id);
+            shell.order.retain(|other| *other != id);
         })
         .unwrap();
     check_at(window, 2, cx);
@@ -322,7 +333,12 @@ fn a_session_of_a_closed_project_keeps_a_workspace_the_window_forgot(cx: &mut Te
     let (window, id, gh) = world(cx, "Available", None);
     window
         .update(cx, |shell, _, _| {
-            shell.workspace.preferences.cloud_auto_stop.codespace.stop_when_unused = true;
+            shell
+                .workspace
+                .preferences
+                .cloud_auto_stop
+                .codespace
+                .stop_when_unused = true;
         })
         .unwrap();
     check_at(window, 0, cx);

@@ -141,7 +141,11 @@ mod tests {
         assert_eq!(minutes_of("off"), None);
         for minutes in IDLE_CHOICES {
             assert_eq!(minutes_of(&option_of(Some(minutes))), Some(minutes));
-            assert!(OPTIONS.iter().any(|(value, _)| *value == minutes.to_string()));
+            assert!(
+                OPTIONS
+                    .iter()
+                    .any(|(value, _)| *value == minutes.to_string())
+            );
         }
         assert_eq!(minutes_of("7"), None);
     }

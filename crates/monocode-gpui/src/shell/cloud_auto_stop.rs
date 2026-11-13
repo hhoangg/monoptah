@@ -22,7 +22,10 @@ pub(super) fn clock(cx: &mut Context<Shell>) -> gpui::Task<()> {
             cx.background_executor()
                 .timer(Duration::from_secs(CHECK_EVERY_SECS))
                 .await;
-            if this.update(cx, |this, cx| this.check_auto_stop(cx)).is_err() {
+            if this
+                .update(cx, |this, cx| this.check_auto_stop(cx))
+                .is_err()
+            {
                 break;
             }
         }
@@ -84,15 +87,17 @@ impl Shell {
                     ..Default::default()
                 },
             };
-            let stored = self.remote_marks.get(&id).copied().unwrap_or((false, false));
+            let stored = self
+                .remote_marks
+                .get(&id)
+                .copied()
+                .unwrap_or((false, false));
             facts.busy |= stored.0 || stored.1 || self.terminal_busy(id, cx);
             facts.pending |= self.cloud_busy.contains(&id)
                 || self.cloud_moves.contains_key(&id)
                 || self.queued_cloud_opens.has(id)
                 || self.cloud_open_due == Some(id)
-                || self.cloud_starts.get(&id).is_some_and(|start| {
-                    start.phase() != crate::cloud_start_view::StartPhase::Failed
-                })
+                || (self.cloud_starts.contains_key(&id) && !self.cloud_start_failed(id))
                 || self
                     .cloud_located
                     .get(&id)

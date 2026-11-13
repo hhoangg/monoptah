@@ -12,6 +12,8 @@ mod claude_setup;
 mod cloud;
 mod cloud_app_archive;
 mod cloud_auto_stop;
+#[cfg(test)]
+mod cloud_auto_stop_tests;
 mod cloud_continue;
 #[cfg(test)]
 mod cloud_continue_tests;
@@ -25,8 +27,6 @@ mod cloud_return_cleanup;
 mod cloud_start;
 #[cfg(test)]
 mod cloud_tests;
-#[cfg(test)]
-mod cloud_auto_stop_tests;
 mod cloud_view;
 #[cfg(test)]
 mod cloud_view_tests;
