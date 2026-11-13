@@ -328,7 +328,7 @@ impl Accounts {
     }
     /// Re-read one account's credential kind after it may have changed. A read
     /// error keeps an explicit `Unreadable` entry instead of dropping it.
-    fn refresh_credential(&mut self, id: &str) {
+    pub(crate) fn refresh_credential(&mut self, id: &str) {
         match read_credential(&self.profile(id)) {
             Some(state) => self.credentials.insert(id.to_owned(), state),
             None => self.credentials.remove(id),

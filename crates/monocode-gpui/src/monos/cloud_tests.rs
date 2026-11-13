@@ -503,7 +503,7 @@ fn a_mono_start_with_a_target_fails_before_creating_anything_when_validation_fai
 }
 
 #[gpui::test]
-fn a_mono_start_with_an_account_and_a_cloud_target_is_refused_before_any_cloud_call(
+fn a_mono_start_with_an_account_is_refused_before_any_cloud_call_unless_it_is_usable_and_new(
     cx: &mut TestAppContext,
 ) {
     let ((s, gh, host, _guard), sbx) = sandbox_setup(cx, "Shutdown", "running");
@@ -512,10 +512,9 @@ fn a_mono_start_with_an_account_and_a_cloud_target_is_refused_before_any_cloud_c
         sbx.calls.lock().unwrap().len(),
     );
     let sessions = super::tests::session_count(&s);
+    // An existing instance keeps the account it started with.
     for (request, target) in [
-        ("a1", json!({"kind":"codespace","instance":"new"})),
         ("a2", json!({"kind":"codespace","instance":"octo-run"})),
-        ("a3", json!({"kind":"sandbox","instance":"new"})),
         ("a4", json!({"kind":"sandbox","instance":"box-1"})),
         ("a5", json!({"kind":"sandbox","instance":{"session":1}})),
     ] {
@@ -529,14 +528,146 @@ fn a_mono_start_with_an_account_and_a_cloud_target_is_refused_before_any_cloud_c
         .unwrap_err();
         assert_eq!(
             error,
-            monocode_core::mono::api::ACCOUNT_LOCAL_ONLY,
+            monocode_core::mono::api::ACCOUNT_EXISTING_INSTANCE,
             "{request}"
         );
+    }
+    // A new instance needs an account that exists and carries a setup token or API key: an
+    // unknown name, and the CLI login (no token to deliver), are refused.
+    for (request, target, account) in [
+        ("a1", json!({"kind":"codespace","instance":"new"}), "Nobody"),
+        ("a3", json!({"kind":"sandbox","instance":"new"}), "Nobody"),
+        ("a6", json!({"kind":"codespace"}), "default"),
+        ("a7", json!({"kind":"sandbox"}), "default"),
+    ] {
+        let error = run(
+            &s,
+            request,
+            "sessions.start",
+            json!({"prompt":"x","account":account,"target":target}),
+            cx,
+        )
+        .unwrap_err();
+        assert!(
+            error != monocode_core::mono::api::ACCOUNT_EXISTING_INSTANCE,
+            "{request}: {error}"
+        );
+        // The CLI login has no token to deliver: that exact refusal. An unknown name fails in
+        // the account lookup, before the token check.
+        if account == "default" {
+            assert_eq!(error, super::host::CLOUD_ACCOUNT_NEEDS_TOKEN, "{request}");
+            assert!(error.contains("setup token or API key"), "{request}");
+        } else {
+            assert!(
+                error != super::host::CLOUD_ACCOUNT_NEEDS_TOKEN,
+                "{request}: {error}"
+            );
+        }
     }
     assert_eq!(gh.calls.lock().unwrap().len(), gh_before, "no gh call");
     assert_eq!(sbx.calls.lock().unwrap().len(), sbx_before, "no sbx call");
     assert!(host.0.lock().unwrap().is_empty());
     assert_eq!(super::tests::session_count(&s), sessions, "no session row");
+}
+
+/// Adds a Claude account to the window's accounts and the store, with or without a setup token.
+fn claude_account(s: &Setup, label: &str, token: Option<&str>, cx: &mut TestAppContext) -> String {
+    let store = s.store.clone();
+    s.window
+        .update(cx, |_, _, cx| {
+            crate::accounts::get(cx).unwrap().update(cx, |center, _| {
+                let id = center
+                    .book
+                    .add(monocode_core::provider::Kind::Claude, label)
+                    .unwrap()
+                    .id;
+                locked(&store)
+                    .unwrap()
+                    .save_provider_accounts(&center.book)
+                    .unwrap();
+                if let Some(token) = token {
+                    center.profile(&id).save_claude_token(token).unwrap();
+                    center.refresh_credential(&id);
+                }
+                id
+            })
+        })
+        .unwrap()
+}
+
+#[gpui::test]
+fn a_mono_start_with_a_token_account_pins_it_to_the_new_codespace_and_checks_models_against_it(
+    cx: &mut TestAppContext,
+) {
+    let _clis = crate::shell::surface_tests::NoClis::new();
+    let (s, _gh, _host, _guard) = cloud_setup(cx, "Failed");
+    let work = claude_account(&s, "Work", Some("sk-ant-oat01-mono-fixture"), cx);
+    let bare = claude_account(&s, "Bare", None, cx);
+    // An account without a token or key is refused with the exact message, before anything.
+    let error = run(
+        &s,
+        "t1",
+        "sessions.start",
+        json!({"prompt":"go","account":"Bare","target":{"kind":"codespace","instance":"new","branch":"trunk"}}),
+        cx,
+    )
+    .unwrap_err();
+    assert_eq!(error, super::host::CLOUD_ACCOUNT_NEEDS_TOKEN);
+    assert!(error.contains("setup token or API key"));
+    let _ = bare;
+    // Models are validated against the CHOSEN account's catalog, like a local start: this
+    // account only lists `only-work-model`.
+    cx.update(|cx| {
+        let center = crate::accounts::get(cx).unwrap();
+        monocode_core::catalog::seed_cached(
+            monocode_core::provider::Kind::Claude,
+            &center.read(cx).profile(&work),
+            vec![monocode_core::catalog::Model {
+                id: "only-work-model".into(),
+                name: "only-work-model".into(),
+                alias_target: None,
+                efforts: Vec::new(),
+                default_effort: None,
+                fast: false,
+                thinking: false,
+                default: true,
+                tiers: Vec::new(),
+                controls: Vec::new(),
+            }],
+        );
+    });
+    let target = json!({"kind":"codespace","instance":"new","branch":"trunk"});
+    let error = run(
+        &s,
+        "t2",
+        "sessions.start",
+        json!({"prompt":"go","account":"Work","model":"not-in-the-catalog","target":target}),
+        cx,
+    )
+    .unwrap_err();
+    assert!(error.to_lowercase().contains("model"), "{error}");
+    // A usable account reaches the provider as the pinned account of the new instance.
+    let started = run(
+        &s,
+        "t3",
+        "sessions.start",
+        json!({"prompt":"go","account":"Work","model":"only-work-model","target":target}),
+        cx,
+    )
+    .unwrap();
+    let name = started["target"]["instance"].as_str().unwrap().to_owned();
+    let raw = locked(&s.store)
+        .unwrap()
+        .setting(&monocode_core::cloud_sessions::claude_pin::codespace_key(
+            &name,
+        ))
+        .unwrap()
+        .expect("the instance was pinned");
+    assert_eq!(
+        serde_json::from_str::<Value>(&raw).unwrap(),
+        json!({"account": work, "pinned": true})
+    );
+    assert!(!raw.contains("sk-ant"), "only the id is stored");
 }
 
 #[gpui::test]

@@ -500,6 +500,18 @@ impl Store {
         shared.extras.borrow_mut().insert(key.into(), value.into());
         Ok(())
     }
+    pub(super) fn shared_delete_setting(&self, key: &str) -> Result<(), String> {
+        self.shared_writable()?;
+        let shared = self.shared.as_ref().unwrap();
+        if !shared.extras.borrow().contains_key(key) {
+            return Ok(());
+        }
+        if let Some(conn) = &shared.extras_db {
+            sql(conn.execute("DELETE FROM settings WHERE key=?1", params![key]))?;
+        }
+        shared.extras.borrow_mut().remove(key);
+        Ok(())
+    }
     pub(super) fn shared_sessions(&self) -> Result<Vec<Session>, String> {
         let columns = [
             "id",

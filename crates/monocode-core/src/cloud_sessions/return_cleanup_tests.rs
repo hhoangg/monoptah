@@ -210,6 +210,7 @@ fn sandbox_machine() -> Machine {
             relay_port: 1,
             config: None,
             mode: Default::default(),
+            docker_account: None,
         }),
     }
 }
@@ -1029,6 +1030,11 @@ fn new_work_on_the_instance_is_refused_while_it_is_being_deleted() {
                 codespace: CodespaceChoice::Named("cs-1".into()),
                 branch: None,
                 machine: None,
+                idle_timeout_minutes: None,
+                devcontainer_path: None,
+                claude_account: None,
+                claude_account_pinned: false,
+                work_branch: None,
             },
             HARNESS,
         );
@@ -1038,6 +1044,11 @@ fn new_work_on_the_instance_is_refused_while_it_is_being_deleted() {
                 codespace: CodespaceChoice::Named("cs-1".into()),
                 branch: None,
                 machine: None,
+                idle_timeout_minutes: None,
+                devcontainer_path: None,
+                claude_account: None,
+                claude_account_pinned: false,
+                work_branch: None,
             },
             &mut |_| {},
         );
@@ -1283,6 +1294,28 @@ fn a_kept_instance_names_a_path_that_exists() {
 }
 
 #[test]
+fn a_kept_sandbox_in_a_docker_account_says_the_command_needs_that_accounts_token() {
+    let r = rig();
+    r.svc
+        .store()
+        .unwrap()
+        .forget_cloud_session(r.w.cloud_id)
+        .unwrap();
+    let cloud = CloudRef::sandbox("sbx-1");
+    let plain = r.svc.kept_instance_hint(&cloud, None);
+    assert!(!plain.contains("token of"), "{plain}");
+    crate::sandboxes::account::pin(&r.svc.store().unwrap(), "sbx-1", Some("acct-1")).unwrap();
+    let hint = r.svc.kept_instance_hint(&cloud, None);
+    assert!(hint.starts_with(&plain), "{hint}");
+    assert!(
+        hint.contains("must run with the token of") && hint.contains("any other Docker account"),
+        "{hint}"
+    );
+    // A codespace is unaffected.
+    assert!(!r.svc.kept_instance_hint(&cs(), None).contains("token of"));
+}
+
+#[test]
 fn the_hint_points_at_the_session_menu_when_the_returned_session_has_an_origin() {
     let r = rig();
     let done = r.cont(r.w.cloud_id).unwrap();
@@ -1363,7 +1396,14 @@ fn a_start_is_refused_under_the_store_lock_while_the_instance_is_being_deleted()
     r.svc.cleaning.lock().unwrap().insert("cs-1".into());
     let error = r
         .svc
-        .record_start("/p", HARNESS, &super::tests::resolved("cs-1"), 1, false)
+        .record_start(
+            "/p",
+            HARNESS,
+            &super::tests::resolved("cs-1"),
+            1,
+            &Default::default(),
+            Default::default(),
+        )
         .unwrap_err();
     assert!(error.contains("is being deleted"), "{error}");
     assert!(pending_starts(&r.svc.store().unwrap()).is_empty());

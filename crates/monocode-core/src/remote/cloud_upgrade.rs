@@ -34,6 +34,18 @@ const SHUTDOWN_WAIT: Duration = Duration::from_secs(60);
 
 /// Returned for a request that starts a turn while the Host is being swapped.
 pub const HOST_UPDATING: &str = "Monoptah Host is being updated. Try again in a moment.";
+/// Returned for a request that starts a turn while a codespace's Claude account is applied.
+pub const ACCOUNT_APPLYING: &str =
+    "Applying the Claude account to the codespace. Try again in a moment.";
+
+/// Why sends to a machine are held back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HoldKind {
+    /// A Host swap (the cloud upgrade).
+    Swap,
+    /// A codespace's Claude account is being applied.
+    Account,
+}
 
 /// Requests that start a turn (a send, a workspace command). Held back while the machine's
 /// Host is swapped. Reads and session imports are not: they start nothing.
@@ -52,7 +64,18 @@ pub(super) struct SendGate {
 #[derive(Default)]
 struct GateState {
     in_flight: usize,
-    held: bool,
+    /// How many holds of each kind are in place. Counters, so one holder finishing never
+    /// lifts another holder's hold.
+    swap_holds: usize,
+    account_holds: usize,
+}
+impl GateState {
+    fn counter(&mut self, kind: HoldKind) -> &mut usize {
+        match kind {
+            HoldKind::Swap => &mut self.swap_holds,
+            HoldKind::Account => &mut self.account_holds,
+        }
+    }
 }
 /// One turn-starting request in flight; frees its place when dropped.
 pub(super) struct Entry(Arc<SendGate>);
@@ -74,38 +97,52 @@ impl SendGate {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.held {
+        if state.swap_holds > 0 {
             return Err(HOST_UPDATING.into());
+        }
+        if state.account_holds > 0 {
+            return Err(ACCOUNT_APPLYING.into());
         }
         state.in_flight += 1;
         Ok(Entry(self.clone()))
     }
     /// Refuses new requests, then waits for the ones in flight. On timeout the hold is undone.
-    fn hold(&self, limit: Duration) -> Result<(), String> {
+    pub(super) fn hold(&self, limit: Duration, kind: HoldKind) -> Result<(), String> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.held = true;
+        *state.counter(kind) += 1;
         let (mut state, timeout) = self
             .drained
             .wait_timeout_while(state, limit, |state| state.in_flight > 0)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if timeout.timed_out() {
-            state.held = false;
+            let held = state.counter(kind);
+            *held = held.saturating_sub(1);
             return Err("Requests to the Host did not finish in time.".into());
         }
         Ok(())
     }
     #[cfg(test)]
     pub(super) fn hold_for_test(&self) {
-        self.state.lock().unwrap().held = true;
+        self.state.lock().unwrap().swap_holds += 1;
     }
-    fn release(&self) {
-        self.state
+    fn release(&self, kind: HoldKind) {
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .held = false;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let held = state.counter(kind);
+        *held = held.saturating_sub(1);
+    }
+}
+
+/// Sends to one machine are held back until this is dropped.
+pub(super) struct SendHold(Arc<SendGate>);
+impl Drop for SendHold {
+    fn drop(&mut self) {
+        self.0.release(HoldKind::Account);
     }
 }
 
@@ -191,7 +228,9 @@ impl Connections {
     /// nothing runs on it, stage the pinned Host, hold sends and look again, have the machine
     /// swap it (detached, with a last look on the Host itself) and reopen the tunnel; if
     /// something runs, mark the machine and leave it for the next connect. `auth` is the
-    /// sandbox's Claude prelude (the same the connect step used); a codespace passes `None`.
+    /// sandbox's Claude prelude (the same the connect step used); a codespace passes `None`
+    /// and gets the app Claude account its project chooses (if any) from the resolver of
+    /// [`Connections::set_codespace_claude`].
     /// `cancel` aborts between steps, never in the middle of the swap. `progress` hears the
     /// status lines.
     ///
@@ -222,6 +261,19 @@ impl Connections {
         if cancel.load(Ordering::Relaxed) {
             return Outcome::Cancelled;
         }
+        // A codespace whose project chooses an app Claude account upgrades with the SAME
+        // prelude as its connect step; without it the restarted Host would fall back to the
+        // Codespaces secret. It is resolved only when a step first needs it (an upgrade is
+        // being staged), so a Host that needs no update never fails on an unusable account;
+        // an account that cannot be used then leaves the Host as it is.
+        let lazy = machine
+            .ssh
+            .clone()
+            .filter(|_| auth.is_none())
+            .map(|target| LazyDelivery {
+                target,
+                cell: std::sync::OnceLock::new(),
+            });
         let target = machine.ssh.as_ref().map(SshTarget::job_target);
         let (job, _slot) = match self.hold_job_slot(target, cancel, &mut || {
             progress("Waiting for another operation on this workspace…")
@@ -250,12 +302,16 @@ impl Connections {
                 return Outcome::Failed(text);
             }
         };
+        if let Some(auth) = &auth {
+            job.add_mask(auth.prelude, auth.secret);
+        }
         let runner = self.runner();
         let env = CloudUpgrade {
             connections: self,
             id: machine_id,
             sandbox: machine.ssh.as_ref().is_some_and(|t| t.sandbox.is_some()),
             auth,
+            lazy,
             device_token: machine.token.clone(),
             environment_id: machine.environment_id.clone(),
             cancel,
@@ -284,6 +340,58 @@ impl Connections {
             }
         }
         outcome
+    }
+
+    /// Whether a session on the Host of `machine_id` runs, waits for input, or is in a state
+    /// this code does not know: the Host must not be restarted now.
+    pub(super) fn host_busy(&self, machine_id: &str) -> Result<bool, String> {
+        let projects = self.request(machine_id, "projects.list", json!({}))?;
+        let projects = projects
+            .as_array()
+            .ok_or("Invalid remote projects response")?;
+        for project in projects {
+            let sessions = self.request(
+                machine_id,
+                "sessions.list",
+                json!({"projectId": project["id"]}),
+            )?;
+            let sessions = sessions
+                .as_array()
+                .ok_or("Invalid remote sessions response")?;
+            if sessions.iter().any(session_is_active) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Holds sends to `machine_id` back, waits for the ones on their way and looks again at
+    /// whether anything runs (the same order as the Host upgrade: anything that started
+    /// before the hold shows up in the look, anything after is refused). `None`: something
+    /// runs, or the Host cannot be asked, or the requests did not finish; nothing is held then.
+    pub(super) fn hold_sends_if_idle(&self, machine_id: &str) -> Option<SendHold> {
+        let gate = self.gate(machine_id);
+        gate.hold(self.drain_limit(), HoldKind::Account).ok()?;
+        let hold = SendHold(gate);
+        if self.host_busy(machine_id).unwrap_or(true) {
+            return None;
+        }
+        Some(hold)
+    }
+
+    /// Holds sends to `machine_id` back without asking its Host whether it is idle: for a
+    /// codespace known to be stopped, where no Host runs and no turn needs protecting.
+    /// `None` when the hold could not be taken.
+    pub(super) fn hold_sends_stopped(&self, machine_id: &str) -> Option<SendHold> {
+        let gate = self.gate(machine_id);
+        gate.hold(self.drain_limit(), HoldKind::Account).ok()?;
+        Some(SendHold(gate))
+    }
+
+    /// Whether the Host of `machine_id` answers on its tunnel now.
+    pub(super) fn host_answers(&self, machine_id: &str) -> bool {
+        self.request(machine_id, "environment.describe", json!({}))
+            .is_ok()
     }
 
     fn record_upgrade_failure(&self, machine_id: &str, warning: Option<&str>) {
@@ -476,6 +584,8 @@ struct CloudUpgrade<'a> {
     id: &'a str,
     sandbox: bool,
     auth: Option<SandboxAuth<'a>>,
+    /// A codespace's app Claude account, resolved the first time a step needs it.
+    lazy: Option<LazyDelivery>,
     /// The machine's device credential: handed to the swap worker for its last look, and
     /// never shown.
     device_token: String,
@@ -484,6 +594,12 @@ struct CloudUpgrade<'a> {
     job: &'a Arc<Job>,
     askpass: &'a Askpass,
     runner: &'a dyn CloudRunner,
+}
+
+/// The app Claude account of a codespace, resolved at most once per upgrade pass.
+struct LazyDelivery {
+    target: SshTarget,
+    cell: std::sync::OnceLock<Result<Option<super::codespace_claude::ClaudeDelivery>, String>>,
 }
 
 /// How a swap worker ended, as the machine reports it.
@@ -508,10 +624,64 @@ impl CloudUpgrade<'_> {
             .ok_or_else(|| "Machine is no longer connected".into())
     }
 
+    /// The credential every step carries: the sandbox's, or the codespace's app account
+    /// (resolved on first use; an account that cannot be used is an error, never a fall back
+    /// to the Codespaces secret).
+    fn credentials(&self) -> Result<Option<SandboxAuth<'_>>, String> {
+        if self.auth.is_some() {
+            return Ok(self.auth);
+        }
+        let Some(lazy) = &self.lazy else {
+            return Ok(None);
+        };
+        let resolved = lazy.cell.get_or_init(|| {
+            let resolved = self.connections.claude_delivery_for(&lazy.target);
+            if let Ok(Some(delivery)) = &resolved {
+                self.job.add_mask(&delivery.prelude, &delivery.secret);
+            }
+            resolved
+        });
+        match resolved {
+            Ok(delivery) => Ok(delivery.as_ref().map(|d| SandboxAuth {
+                prelude: d.prelude.as_str(),
+                secret: d.secret.as_str(),
+            })),
+            Err(error) => Err(error.clone()),
+        }
+    }
+
+    /// Records that the Host of a codespace now runs under the account its upgrade steps
+    /// carried (`None`, the Codespaces secret, included).
+    fn note_delivered(&self) {
+        let Some(lazy) = &self.lazy else {
+            return;
+        };
+        let (Some(name), Some(Ok(resolved))) = (lazy.target.codespace.as_deref(), lazy.cell.get())
+        else {
+            return;
+        };
+        self.connections.note_claude_delivered(
+            name,
+            super::codespace_claude::fingerprint_of(resolved.as_ref()),
+        );
+    }
+
+    /// The credential if it has been resolved already (never resolves it).
+    fn credentials_if_known(&self) -> Option<SandboxAuth<'_>> {
+        self.auth.or_else(|| {
+            let resolved = self.lazy.as_ref()?.cell.get()?.as_ref().ok()?.as_ref()?;
+            Some(SandboxAuth {
+                prelude: resolved.prelude.as_str(),
+                secret: resolved.secret.as_str(),
+            })
+        })
+    }
+
     /// Masks the credentials, and the whole prelude they came in, in text that may be shown.
     fn clean_error(&self, text: String) -> String {
-        let secret = self.auth.map_or("", |auth| auth.secret);
-        let text = match self.auth {
+        let auth = self.credentials_if_known();
+        let secret = auth.map_or("", |auth| auth.secret);
+        let text = match auth {
             Some(auth) if !auth.prelude.is_empty() => text.replace(auth.prelude, "[prelude]"),
             _ => text,
         };
@@ -540,15 +710,23 @@ impl CloudUpgrade<'_> {
         };
         // A sandbox uses the SAME prelude as its connect step, so a restarted Host has the
         // Claude credential in its environment. It travels on stdin only.
+        let auth = self
+            .credentials()
+            .map_err(|error| self.clean_error(error))?;
         let script = if self.sandbox {
             ssh::sandbox_upgrade_script(
-                self.auth.map(|auth| auth.prelude),
+                auth.map(|auth| auth.prelude),
                 target.remote_port,
                 phase,
                 Some(check),
             )
         } else {
-            ssh::codespace_upgrade_script(target.remote_port, phase, Some(check))
+            ssh::codespace_upgrade_script_with(
+                auth.map(|auth| auth.prelude),
+                target.remote_port,
+                phase,
+                Some(check),
+            )
         };
         let output = self
             .runner
@@ -640,26 +818,7 @@ impl UpgradeEnv for CloudUpgrade<'_> {
     }
 
     fn busy(&self) -> Result<bool, String> {
-        let projects = self
-            .connections
-            .request(self.id, "projects.list", json!({}))?;
-        let projects = projects
-            .as_array()
-            .ok_or("Invalid remote projects response")?;
-        for project in projects {
-            let sessions = self.connections.request(
-                self.id,
-                "sessions.list",
-                json!({"projectId": project["id"]}),
-            )?;
-            let sessions = sessions
-                .as_array()
-                .ok_or("Invalid remote sessions response")?;
-            if sessions.iter().any(session_is_active) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        self.connections.host_busy(self.id)
     }
 
     fn pending(&self) -> bool {
@@ -712,9 +871,9 @@ impl UpgradeEnv for CloudUpgrade<'_> {
     fn hold_sends(&self, held: bool) -> Result<(), String> {
         let gate = self.connections.gate(self.id);
         if held {
-            gate.hold(self.connections.drain_limit())
+            gate.hold(self.connections.drain_limit(), HoldKind::Swap)
         } else {
-            gate.release();
+            gate.release(HoldKind::Swap);
             Ok(())
         }
     }
@@ -730,6 +889,8 @@ impl UpgradeEnv for CloudUpgrade<'_> {
         let ended = finished.is_ok();
         let result = match finished {
             Ok(Finished::Done(port)) => {
+                // The restarted Host runs under the account the swap carried, like a bootstrap.
+                self.note_delivered();
                 let mut target = self
                     .machine()
                     .and_then(|m| {

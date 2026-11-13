@@ -3,6 +3,8 @@ mod appearance;
 mod archive;
 mod chat;
 mod cloud;
+pub(super) mod cloud_backends;
+pub(super) mod cloud_docker;
 mod connections;
 mod general;
 mod inbox;

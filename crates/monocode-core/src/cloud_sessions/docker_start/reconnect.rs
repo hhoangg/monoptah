@@ -189,18 +189,40 @@ impl CloudSessions {
                     && m.sandbox.as_ref().is_some_and(|s| s.name == name)
             })
             .ok_or("The sandbox connection was removed. Start a new session.")?;
-        let target = machine
+        let mut target = machine
             .sandbox
             .clone()
             .ok_or("The sandbox connection was removed. Start a new session.")?;
+        // The account follows the pin (and its Docker ID) when the account was removed and
+        // added again; the machine record keeps the id it was paired with. The re-paired
+        // target below carries the resolved one, so the ssh and the tunnel use it.
+        target.docker_account = deps
+            .backend
+            .try_account_of(&name)?
+            .or_else(|| target.docker_account.clone());
         crate::remote::validate_sandbox_target(&target)?;
         // The project config only supplies the credential and the Claude account; without it
         // the container is still brought back, just without those two.
         let have_config = config.is_some();
         let mut config = config.unwrap_or_default();
+        // The Claude account is the sandbox's own: a per-session override pinned at its start
+        // survives this reconnect, otherwise the project's current choice applies (so a
+        // change in Cloud settings reaches the next reconnect).
+        let claude_pin = {
+            let store = self.store()?;
+            claude_pin::read(&store, &claude_pin::sandbox_key(&name))
+        };
+        config.claude_account = claude_pin::effective(
+            claude_pin.as_ref(),
+            have_config.then_some(&config.claude_account),
+        );
         if let Some(path) = &target.config {
             config.devcontainer_path = path.clone();
         }
+        // The sandbox lives in the Docker account that created it, whatever the project
+        // names now: a change of the project's account applies to new sandboxes only. The
+        // config is used from here on only to run things in THIS sandbox.
+        config.docker_account = target.docker_account.clone();
         // A live tunnel needs the container and the Host left alone (this uses the tunnel
         // only, never ssh). The Git credential cache is the one thing that expires on its
         // own, so a delivery older than [`CREDENTIAL_REFRESH_MS`] is repeated: it is cheap,
@@ -235,7 +257,11 @@ impl CloudSessions {
             }
             return Ok(());
         }
-        let auth = deps.secrets.claude_auth(config.claude_account.as_deref())?;
+        let auth = self.required_claude_auth(
+            &*deps.secrets,
+            config.claude_account.as_deref(),
+            claude_pin.as_ref().is_some_and(|pin| pin.pinned),
+        )?;
         let mut scrub = Scrub(vec![]);
         if let Some(auth) = &auth {
             scrub.0.push(Zeroizing::new(auth.secret().to_string()));
@@ -260,6 +286,7 @@ impl CloudSessions {
             relay_port: target.relay_port,
             rebuild: false,
             defer_lifecycle: false,
+            claude_pinned: claude_pin.as_ref().is_some_and(|pin| pin.pinned),
         };
         let mut record = fresh_sandbox_record(
             &name,

@@ -506,6 +506,11 @@ impl Conversation {
             self.refresh_remote_snapshot(cx);
         }
     }
+    /// Tests: answer the remote refresh without a Host.
+    #[cfg(test)]
+    pub(crate) fn stub_remote_refresh(&mut self, stub: Option<Result<(), String>>) {
+        self.remote_state.refresh_stub = stub;
+    }
     pub(super) fn refresh_remote_snapshot(&mut self, cx: &mut Context<Self>) {
         if self.cloud_start_blocks() || self.remote_state.refreshing || self.busy || self.stopping {
             return;

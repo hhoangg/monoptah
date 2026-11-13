@@ -1,5 +1,4 @@
-//! The branches offered by the cloud panel's Base branch (Docker Sandbox) and Branch
-//! (Codespace) rows. The session twins a local project, so the list comes from that checkout's
+//! The branches offered by the cloud panel's Base branch row (both backends). The session twins a local project, so the list comes from that checkout's
 //! remote-tracking branches of the remote that is the session's repository: the one whose URL
 //! matches the saved Docker config's `repo_url`, or `origin` for a codespace. Reading them is
 //! local git only (no network) and runs off the UI thread. A `git ls-remote --heads` refresh
@@ -71,13 +70,12 @@ pub(crate) enum BranchList {
     Unmatched,
 }
 
-/// A row of the panel that picks a branch.
+/// A row of the panel that picks a branch. (The Branch row names a new branch, so it is free
+/// text and picks nothing.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CloudRefField {
-    /// Docker: the base branch.
+    /// The base branch: Docker's `base_ref`, the branch a codespace is created on.
     Base,
-    /// Codespace: the branch the codespace is created on.
-    Branch,
 }
 impl CloudRefField {
     pub(super) fn index(self) -> usize {
@@ -92,7 +90,7 @@ pub(super) struct CloudRefPicker {
     pub _events: Subscription,
 }
 
-/// A typed codespace branch: there is no validator for it, but it must not read as an option.
+/// A codespace base branch: there is no validator for it, but it must not read as an option.
 fn codespace_branch_ok(name: &str) -> bool {
     !name.is_empty() && !name.starts_with('-') && !name.contains(char::is_whitespace)
 }
@@ -450,11 +448,7 @@ impl Conversation {
     /// Whether `field` picks from the repository's branches rather than taking free text.
     pub(super) fn cloud_picks(&self, field: CloudRefField) -> bool {
         self.cloud_draft.as_ref().is_some_and(|draft| {
-            matches!(draft.branches, BranchList::Ready { .. })
-                && match field {
-                    CloudRefField::Base => draft.target == CloudTarget::DockerSandbox,
-                    CloudRefField::Branch => draft.target == CloudTarget::Codespace,
-                }
+            matches!(draft.branches, BranchList::Ready { .. }) && field == CloudRefField::Base
         })
     }
 
@@ -462,7 +456,6 @@ impl Conversation {
     fn cloud_ref_input(&self, field: CloudRefField) -> Option<Entity<input::Input>> {
         self.cloud_draft.as_ref().map(|draft| match field {
             CloudRefField::Base => draft.base.clone(),
-            CloudRefField::Branch => draft.branch.clone(),
         })
     }
 
@@ -472,9 +465,9 @@ impl Conversation {
             .cloud_ref_input(field)
             .map(|input| input.read(cx).content.trim().to_owned())
             .unwrap_or_default();
-        match (field, text.is_empty()) {
-            (CloudRefField::Base, true) => "Default branch".into(),
-            (CloudRefField::Branch, true) => "Choose a branch".into(),
+        match (self.cloud_target(), text.is_empty()) {
+            (Some(CloudTarget::DockerSandbox), true) => "Default branch".into(),
+            (_, true) => "Choose a branch".into(),
             _ => text,
         }
     }
@@ -526,7 +519,8 @@ impl Conversation {
             .cloud_ref_input(field)
             .map(|input| input.read(cx).content.trim().to_owned())
             .filter(|text| !text.is_empty());
-        let default_entry = field == CloudRefField::Base;
+        // Only a sandbox can leave the base empty (the repository's default branch).
+        let default_entry = self.cloud_target() == Some(CloudTarget::DockerSandbox);
         let footer = format!("Branches of {remote}");
         let accept: fn(&str) -> bool = if self.cloud_target() == Some(CloudTarget::DockerSandbox) {
             docker_config::valid_ref
@@ -583,9 +577,7 @@ impl Conversation {
         let Some(input) = self.cloud_ref_input(field) else {
             return;
         };
-        if field == CloudRefField::Base
-            && let Some(draft) = &mut self.cloud_draft
-        {
+        if let Some(draft) = &mut self.cloud_draft {
             draft.base_text = name.clone();
         }
         input.update(cx, |input, cx| input.set_text(name, cx));

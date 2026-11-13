@@ -1,7 +1,7 @@
 //! The real [`Connections`] layer of the cloud Host upgrade, against a fake Host (a local
 //! HTTP server that answers the RPCs) and a fake ssh runner (records the scripts it is given
 //! and plays back what a machine would print).
-use super::cloud_upgrade::{CloudRunner, HOST_UPDATING};
+use super::cloud_upgrade::{CloudRunner, HoldKind, ACCOUNT_APPLYING, HOST_UPDATING};
 use super::host_upgrade::{Outcome, SandboxAuth};
 use super::ssh::{Job, SshTarget, Tunnel};
 use super::ssh_askpass::Askpass;
@@ -22,6 +22,10 @@ struct HostState {
     sessions_fail: bool,
     /// A `commands.dispatch` starts a turn right away and answers only after this many ms.
     dispatch_delay_ms: u64,
+    /// How many `sessions.list` calls were answered, and the call from which a turn runs
+    /// (a turn that starts between two looks at the Host).
+    list_calls: usize,
+    running_from_list_call: Option<usize>,
 }
 
 struct FakeHost {
@@ -46,6 +50,8 @@ impl FakeHost {
             sessions,
             sessions_fail: false,
             dispatch_delay_ms: 0,
+            list_calls: 0,
+            running_from_list_call: None,
         }));
         let calls = Arc::new(Mutex::new(vec![]));
         let stop = Arc::new(AtomicBool::new(false));
@@ -82,6 +88,15 @@ impl FakeHost {
                 calls2.lock().unwrap().push(method.clone());
                 let mut state = state2.lock().unwrap();
                 let mut delay = 0;
+                if method == "sessions.list" {
+                    state.list_calls += 1;
+                    if state
+                        .running_from_list_call
+                        .is_some_and(|n| state.list_calls >= n)
+                    {
+                        state.sessions = vec!["running"];
+                    }
+                }
                 if method == "commands.dispatch" && state.dispatch_delay_ms > 0 {
                     // The turn starts on the Host at once; the answer comes later.
                     state.sessions = vec!["running"];
@@ -208,6 +223,7 @@ fn target(sandbox: bool) -> SshTarget {
                 relay_port: 3900,
                 config: None,
                 mode: SandboxMode::Container,
+                docker_account: None,
             }),
         }
     } else {
@@ -976,4 +992,978 @@ fn an_app_quit_leaves_a_swap_past_the_point_of_no_return_alone_and_waits_for_it(
         started.elapsed() >= std::time::Duration::from_millis(250),
         "it waited for the swap"
     );
+}
+
+/// The app Claude account of a codespace: resolved inside `Connections` for every bootstrap
+/// and every Host upgrade, delivered on stdin only.
+#[test]
+fn one_holder_finishing_never_lifts_another_holders_hold() {
+    let fx = setup_happy(vec!["idle"]);
+    let gate = fx.connections.gate(MACHINE);
+    // A Host upgrade holds sends back; an account apply holds and finishes meanwhile.
+    gate.hold(std::time::Duration::from_secs(1), HoldKind::Swap)
+        .unwrap();
+    let apply = fx.connections.hold_sends_if_idle(MACHINE).expect("idle");
+    assert_eq!(gate.enter().err().as_deref(), Some(HOST_UPDATING));
+    drop(apply);
+    assert_eq!(
+        gate.enter().err().as_deref(),
+        Some(HOST_UPDATING),
+        "the upgrade's hold survives the apply finishing"
+    );
+    // The other way round: the apply's hold survives the upgrade releasing.
+    let apply = fx.connections.hold_sends_if_idle(MACHINE).expect("idle");
+    assert!(fx
+        .connections
+        .request(MACHINE, "commands.dispatch", json!({}))
+        .is_err());
+    drop(apply);
+    assert_eq!(gate.enter().err().as_deref(), Some(HOST_UPDATING));
+}
+
+#[test]
+fn a_send_refused_while_the_account_is_applied_says_so() {
+    let fx = setup_happy(vec!["idle"]);
+    let hold = fx.connections.hold_sends_if_idle(MACHINE).expect("idle");
+    let error = fx
+        .connections
+        .request(MACHINE, "commands.dispatch", json!({}))
+        .unwrap_err();
+    assert_eq!(error, ACCOUNT_APPLYING);
+    assert_eq!(
+        ACCOUNT_APPLYING,
+        "Applying the Claude account to the codespace. Try again in a moment."
+    );
+    drop(hold);
+    assert!(fx
+        .connections
+        .request(MACHINE, "commands.dispatch", json!({}))
+        .is_ok());
+}
+
+mod claude_account {
+    use super::*;
+    use crate::cloud_sessions::docker_start::ClaudeAuth;
+    use crate::remote::codespace_claude::{ClaudeDelivery, CodespaceClaude};
+    use zeroize::Zeroizing;
+
+    const SECRET_A: &str = "sk-ant-oat01-account-a-secret-1111";
+    const SECRET_B: &str = "sk-ant-oat01-account-b-secret-2222";
+
+    /// What the project chooses now, changeable between steps.
+    #[derive(Default)]
+    struct Chosen {
+        account: Mutex<Option<(&'static str, &'static str)>>,
+        error: Mutex<Option<String>>,
+        /// Only reading the credential fails (the account id still answers).
+        resolve_error: Mutex<Option<String>>,
+        /// The persisted delivered-account hint (what the app's store keeps).
+        hint: Mutex<Option<String>>,
+        /// How often the credential itself was read.
+        resolves: AtomicUsize,
+        /// The codespace is shut down (no Host runs).
+        stopped: AtomicBool,
+    }
+    impl Chosen {
+        fn set(&self, account: Option<(&'static str, &'static str)>) {
+            *self.account.lock().unwrap() = account;
+        }
+    }
+    fn delivery(id: &str, secret: &str) -> ClaudeDelivery {
+        let auth = ClaudeAuth::new("CLAUDE_CODE_OAUTH_TOKEN", secret.to_owned());
+        ClaudeDelivery {
+            account: id.to_owned(),
+            prelude: auth.prelude(),
+            secret: Zeroizing::new(secret.to_owned()),
+        }
+    }
+    impl CodespaceClaude for Chosen {
+        fn account_id(&self, codespace: &str) -> Result<Option<String>, String> {
+            assert_eq!(codespace, "cs");
+            if let Some(error) = self.error.lock().unwrap().clone() {
+                return Err(error);
+            }
+            Ok(self.account.lock().unwrap().map(|(id, _)| id.to_owned()))
+        }
+        fn resolve(&self, codespace: &str) -> Result<Option<ClaudeDelivery>, String> {
+            assert_eq!(codespace, "cs");
+            self.resolves.fetch_add(1, Ordering::SeqCst);
+            if let Some(error) = self.error.lock().unwrap().clone() {
+                return Err(error);
+            }
+            if let Some(error) = self.resolve_error.lock().unwrap().clone() {
+                return Err(error);
+            }
+            Ok(self
+                .account
+                .lock()
+                .unwrap()
+                .map(|(id, secret)| delivery(id, secret)))
+        }
+        fn resolve_account(
+            &self,
+            codespace: &str,
+            account: &str,
+        ) -> Result<Option<ClaudeDelivery>, String> {
+            assert_eq!(codespace, "cs");
+            let secret = match account {
+                "work" => SECRET_A,
+                "other" => SECRET_B,
+                other => panic!("unknown account {other}"),
+            };
+            Ok(Some(delivery(account, secret)))
+        }
+        fn is_stopped(&self, codespace: &str) -> bool {
+            assert_eq!(codespace, "cs");
+            self.stopped.load(Ordering::SeqCst)
+        }
+        fn delivered_hint(&self, codespace: &str) -> Option<String> {
+            assert_eq!(codespace, "cs");
+            self.hint.lock().unwrap().clone()
+        }
+        fn note_delivered(&self, codespace: &str, account: Option<&str>) {
+            assert_eq!(codespace, "cs");
+            *self.hint.lock().unwrap() = account.map(str::to_owned);
+        }
+    }
+
+    // ------------------------------------------------------------- upgrade
+
+    fn old_host_upgrade(chosen: Option<Arc<Chosen>>) -> (Fx, Outcome, Vec<String>) {
+        let fx = setup_happy(vec!["idle"]);
+        if let Some(chosen) = chosen {
+            fx.connections.set_codespace_claude(chosen);
+        }
+        let (outcome, lines) = upgrade(&fx, None);
+        (fx, outcome, lines)
+    }
+    const PRELUDE_MARK: &str =
+        "unset ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN";
+
+    #[test]
+    fn every_step_of_a_codespace_upgrade_carries_the_account_prelude() {
+        let chosen = Arc::new(Chosen::default());
+        chosen.set(Some(("work", SECRET_A)));
+        let (fx, outcome, lines) = old_host_upgrade(Some(chosen));
+        assert!(matches!(outcome, Outcome::Upgraded(_)), "{outcome:?}");
+        let scripts = fx.runner.scripts.lock().unwrap().clone();
+        let phases: Vec<&str> = scripts.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(
+            phases.contains(&"stage") && phases.contains(&"swapnow"),
+            "{phases:?}"
+        );
+        let prelude = delivery("work", SECRET_A).prelude;
+        for (phase, script) in &scripts {
+            assert!(
+                script.starts_with(prelude.as_str()),
+                "{phase} lacks the prelude"
+            );
+        }
+        // Nothing the user can read carries the credential.
+        assert!(!lines.iter().any(|l| l.contains(SECRET_A)), "{lines:?}");
+    }
+
+    #[test]
+    fn without_an_account_the_upgrade_scripts_are_exactly_what_they_were() {
+        let (fx, outcome, _) = old_host_upgrade(None);
+        assert!(matches!(outcome, Outcome::Upgraded(_)));
+        for (phase, script) in fx.runner.scripts.lock().unwrap().iter() {
+            assert!(!script.contains(PRELUDE_MARK), "{phase}");
+        }
+        // A resolver that answers "no account" changes nothing either.
+        let none = Arc::new(Chosen::default());
+        let (fx, outcome, _) = old_host_upgrade(Some(none));
+        assert!(matches!(outcome, Outcome::Upgraded(_)));
+        for (phase, script) in fx.runner.scripts.lock().unwrap().iter() {
+            assert!(!script.contains(PRELUDE_MARK), "{phase}");
+            let expected = match phase.as_str() {
+                "stage" => Some(ssh::codespace_upgrade_script(
+                    3774,
+                    ssh::UpgradePhase::Stage,
+                    Some(ssh::SwapCheck {
+                        device_token: &"t".repeat(43),
+                        environment_id: ENV,
+                        nonce: "",
+                    }),
+                )),
+                _ => None,
+            };
+            if let Some(expected) = expected {
+                assert_eq!(*script, expected, "{phase}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_account_that_cannot_be_used_leaves_the_host_alone_and_never_falls_back() {
+        let chosen = Arc::new(Chosen::default());
+        *chosen.error.lock().unwrap() =
+            Some("Claude account \"Work\" has no setup token or API key saved. Choose another account in Cloud settings.".into());
+        let (fx, outcome, lines) = old_host_upgrade(Some(chosen));
+        let Outcome::Failed(text) = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(text.contains("Cloud settings"), "{text}");
+        assert!(
+            fx.runner.scripts.lock().unwrap().is_empty(),
+            "no script ran"
+        );
+        assert!(lines.iter().any(|l| l.contains("Cloud settings")));
+    }
+
+    // -------------------------------------------- bootstrap, wake, ensure
+
+    #[cfg(unix)]
+    struct Gh {
+        _guard: ssh::GhOverride,
+        dir: tempfile::TempDir,
+    }
+    #[cfg(unix)]
+    impl Gh {
+        /// A fake `gh`: logs its arguments, saves each ssh script it is fed on stdin as
+        /// `stdin-<n>`, pairs, and forwards tunnels to `host_port`. With a `fail` file it
+        /// echoes the script into stderr and fails.
+        fn new(host_port: u16) -> Option<Self> {
+            use std::os::unix::fs::PermissionsExt;
+            let python = [
+                "/usr/bin/python3",
+                "/opt/homebrew/bin/python3",
+                "/usr/local/bin/python3",
+            ]
+            .into_iter()
+            .find(|p| Path::new(p).exists())?;
+            let dir = tempfile::tempdir().unwrap();
+            let gh = dir.path().join("gh");
+            std::fs::write(
+                &gh,
+                format!(
+                    r#"#!{python}
+import os, socket, sys, threading, time
+d = {dir:?}
+args = sys.argv[1:]
+with open(os.path.join(d, "gh.log"), "a") as f:
+    f.write(" ".join(args) + "\n")
+if "-N" in args:
+    port = int(args[args.index("-L") + 1].split(":")[1])
+    srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", port)); srv.listen(8)
+    def pump(a, b):
+        try:
+            while True:
+                x = a.recv(65536)
+                if not x: break
+                b.sendall(x)
+        except OSError: pass
+        try: b.shutdown(socket.SHUT_WR)
+        except OSError: pass
+    def serve(c):
+        first = c.recv(65536)
+        if not first:
+            c.close(); return
+        u = socket.create_connection(("127.0.0.1", {host_port}))
+        u.sendall(first)
+        threading.Thread(target=pump, args=(u, c), daemon=True).start()
+        pump(c, u)
+    while True:
+        c, _ = srv.accept()
+        threading.Thread(target=serve, args=(c,), daemon=True).start()
+else:
+    script = sys.stdin.read()
+    n = len([x for x in os.listdir(d) if x.startswith("stdin-")])
+    with open(os.path.join(d, "stdin-%d" % n), "w") as f:
+        f.write(script)
+    while os.path.exists(os.path.join(d, "block")):
+        time.sleep(0.02)
+    if os.path.exists(os.path.join(d, "fail")):
+        sys.stderr.write("remote said: " + script)
+        sys.exit(1)
+    if "pair --name" in script:
+        print('{{"token":"{token}","environmentId":"{ENV}"}}')
+    else:
+        print('{{"port":3774}}')
+"#,
+                    dir = dir.path().display().to_string(),
+                    token = "b".repeat(43),
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Some(Self {
+                _guard: ssh::GhOverride::set(gh),
+                dir,
+            })
+        }
+        fn scripts(&self) -> Vec<String> {
+            let mut files: Vec<_> = std::fs::read_dir(self.dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    name.strip_prefix("stdin-")?.parse::<usize>().ok()
+                })
+                .collect();
+            files.sort();
+            files
+                .into_iter()
+                .map(|n| {
+                    std::fs::read_to_string(self.dir.path().join(format!("stdin-{n}"))).unwrap()
+                })
+                .collect()
+        }
+        fn argv_log(&self) -> String {
+            std::fs::read_to_string(self.dir.path().join("gh.log")).unwrap_or_default()
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait(connections: &Connections, job: String) -> ssh::JobView {
+        for _ in 0..600 {
+            let view = connections.ssh_poll(&job).unwrap();
+            if view.done {
+                return view;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("job did not finish");
+    }
+
+    #[cfg(unix)]
+    fn paired(
+        chosen: &Arc<Chosen>,
+    ) -> Option<(Gh, FakeHost, Arc<Connections>, tempfile::TempDir, String)> {
+        let host = FakeHost::start("monoptah", host_upgrade::pinned_version(), vec!["idle"]);
+        let gh = Gh::new(host.port)?;
+        let dir = tempfile::tempdir().unwrap();
+        let connections = Arc::new(Connections::new(dir.path()));
+        connections.set_codespace_claude(chosen.clone());
+        let done = wait(
+            &connections,
+            connections.codespace_begin("cs", Some("Cloud")).unwrap(),
+        );
+        assert_eq!(done.error, None);
+        let id = done.machine.unwrap().id;
+        Some((gh, host, connections, dir, id))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_bootstrap_of_every_pairing_and_wake_carries_the_account_on_stdin_only() {
+        let chosen = Arc::new(Chosen::default());
+        chosen.set(Some(("work", SECRET_A)));
+        let Some((gh, _host, connections, _dir, id)) = paired(&chosen) else {
+            eprintln!("SKIPPED: python3 not found");
+            return;
+        };
+        let prelude = delivery("work", SECRET_A).prelude;
+        let scripts = gh.scripts();
+        // The bootstrap (with the prelude), then the pairing script (without it).
+        assert_eq!(scripts.len(), 2, "{}", gh.argv_log());
+        assert_eq!(
+            scripts[0],
+            ssh::codespace_bootstrap_script_with(Some(&prelude))
+        );
+        assert!(scripts[0].contains(SECRET_A));
+        assert!(!scripts[1].contains(SECRET_A));
+        // A wake of the dead codespace re-runs the bootstrap with the same prelude.
+        connections.tunnels.clear();
+        connections.ensure_codespace(&id).unwrap();
+        let scripts = gh.scripts();
+        assert_eq!(scripts.len(), 3);
+        assert_eq!(
+            scripts[2],
+            ssh::codespace_bootstrap_script_with(Some(&prelude))
+        );
+        // The credential is never in an argument of gh.
+        assert!(!gh.argv_log().contains(SECRET_A), "{}", gh.argv_log());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn without_an_account_the_codespace_bootstrap_is_byte_for_byte_what_it_was() {
+        let chosen = Arc::new(Chosen::default());
+        let Some((gh, _host, connections, _dir, id)) = paired(&chosen) else {
+            eprintln!("SKIPPED: python3 not found");
+            return;
+        };
+        connections.tunnels.clear();
+        connections.ensure_codespace(&id).unwrap();
+        let scripts = gh.scripts();
+        assert_eq!(scripts[0], ssh::codespace_bootstrap_script());
+        assert_eq!(scripts[2], ssh::codespace_bootstrap_script());
+        assert!(scripts.iter().all(|s| !s.contains(PRELUDE_MARK)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_changed_account_is_applied_by_the_next_ensure_and_an_unchanged_one_costs_nothing() {
+        let chosen = Arc::new(Chosen::default());
+        chosen.set(Some(("work", SECRET_A)));
+        let Some((gh, host, connections, _dir, id)) = paired(&chosen) else {
+            eprintln!("SKIPPED: python3 not found");
+            return;
+        };
+        let runs = || gh.scripts().len();
+        let after_pairing = runs();
+        // Unchanged: connected and nothing to apply.
+        connections.ensure_codespace(&id).unwrap();
+        assert_eq!(runs(), after_pairing, "no extra bootstrap");
+        // The project switches account, but a turn runs: the Host is not restarted.
+        chosen.set(Some(("other", SECRET_B)));
+        host.set(|state| state.sessions = vec!["running"]);
+        connections.ensure_codespace(&id).unwrap();
+        assert_eq!(runs(), after_pairing, "a running Host is left alone");
+        // Idle again: the next ensure re-runs the bootstrap with the new account.
+        host.set(|state| state.sessions = vec!["idle"]);
+        let mut lines = vec![];
+        connections
+            .ensure_codespace_with(&id, &AtomicBool::new(false), &mut |l| {
+                lines.push(l.to_owned())
+            })
+            .unwrap();
+        assert_eq!(runs(), after_pairing + 1);
+        let prelude_b = delivery("other", SECRET_B).prelude;
+        assert_eq!(
+            gh.scripts().last().unwrap(),
+            &format!(
+                "{}{}",
+                ssh::codespace_forget_token_marker(),
+                ssh::codespace_bootstrap_script_with(Some(&prelude_b))
+            ),
+            "applied under the hold, with a stale marker removed first"
+        );
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("Applying the Claude account")));
+        // And that is applied once.
+        connections.ensure_codespace(&id).unwrap();
+        assert_eq!(runs(), after_pairing + 1);
+        // Back to the Codespaces secret: one more bootstrap, now without the prelude. It first
+        // stops the Host (a codespace without the secret has no token for the bootstrap to
+        // notice, so the old account's credential would stay in the Host's environment).
+        chosen.set(None);
+        connections.ensure_codespace(&id).unwrap();
+        assert_eq!(runs(), after_pairing + 2);
+        assert_eq!(
+            gh.scripts().last().unwrap(),
+            &format!(
+                "{}{}",
+                ssh::codespace_stop_host_prestep(),
+                ssh::codespace_bootstrap_script()
+            )
+        );
+        connections.ensure_codespace(&id).unwrap();
+        assert_eq!(runs(), after_pairing + 2);
+        assert!(!gh.argv_log().contains(SECRET_A) && !gh.argv_log().contains(SECRET_B));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_job_error_never_shows_the_credential_or_the_prelude() {
+        let host = FakeHost::start("monoptah", host_upgrade::pinned_version(), vec!["idle"]);
+        let Some(gh) = Gh::new(host.port) else {
+            eprintln!("SKIPPED: python3 not found");
+            return;
+        };
+        std::fs::write(gh.dir.path().join("fail"), "").unwrap();
+        let chosen = Arc::new(Chosen::default());
+        chosen.set(Some(("work", SECRET_A)));
+        let dir = tempfile::tempdir().unwrap();
+        let connections = Arc::new(Connections::new(dir.path()));
+        connections.set_codespace_claude(chosen);
+        let view = wait(
+            &connections,
+            connections.codespace_begin("cs", None).unwrap(),
+        );
+        let error = view.error.expect("the remote failed");
+        assert!(error.contains("remote said"), "{error}");
+        assert!(!error.contains(SECRET_A), "{error}");
+        assert!(!error.contains("export CLAUDE_CODE_OAUTH_TOKEN"), "{error}");
+        assert!(error.contains("[prelude]"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_account_that_cannot_be_used_fails_the_pairing_without_running_anything() {
+        let host = FakeHost::start("monoptah", host_upgrade::pinned_version(), vec!["idle"]);
+        let Some(gh) = Gh::new(host.port) else {
+            eprintln!("SKIPPED: python3 not found");
+            return;
+        };
+        let message = "Claude account \"Work\" has no setup token or API key saved. Choose another account in Cloud settings.";
+        let chosen = Arc::new(Chosen::default());
+        *chosen.error.lock().unwrap() = Some(message.into());
+        let dir = tempfile::tempdir().unwrap();
+        let connections = Arc::new(Connections::new(dir.path()));
+        connections.set_codespace_claude(chosen);
+        let view = wait(
+            &connections,
+            connections.codespace_begin("cs", None).unwrap(),
+        );
+        assert_eq!(view.error.as_deref(), Some(message));
+        assert!(
+            gh.scripts().is_empty(),
+            "no ssh, so no fallback to the secret"
+        );
+        assert_eq!(gh.argv_log(), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leaving_an_account_stops_the_host_first_and_is_only_recorded_once_that_succeeded() {
+        let chosen = Arc::new(Chosen::default());
+        chosen.set(Some(("work", SECRET_A)));
+        let Some((gh, _host, connections, _dir, id)) = paired(&chosen) else {
+            eprintln!("SKIPPED: python3 not found");
+            return;
+        };
+        let prestep = ssh::codespace_stop_host_prestep();
+        // The step stops the Host's service and forgets the token marker, so the same account
+        // chosen again later restarts the Host too.
+        assert!(prestep.contains("service uninstall"), "{prestep}");
+        assert!(prestep.contains("rm -f \"$HOME/.monocode-host/host-token.sha256\""));
+        let runs = gh.scripts().len();
+        // The switch fails on the machine: the old account stays recorded, and the next ensure
+        // does the whole step again.
+        chosen.set(None);
+        std::fs::write(gh.dir.path().join("fail"), "").unwrap();
+        assert!(connections.ensure_codespace(&id).is_err());
+        std::fs::remove_file(gh.dir.path().join("fail")).unwrap();
+        connections.ensure_codespace(&id).unwrap();
+        let scripts = gh.scripts();
+        assert_eq!(scripts.len(), runs + 2);
+        for script in &scripts[runs..] {
+            assert!(script.starts_with(prestep), "stops the Host first");
+            assert!(script.ends_with(&ssh::codespace_bootstrap_script()));
+            assert!(!script.contains(SECRET_A));
+        }
+        // Recorded now: nothing more to do, and a wake of a codespace that never had an
+        // account is the bare bootstrap again.
+        connections.ensure_codespace(&id).unwrap();
+        assert_eq!(gh.scripts().len(), runs + 2);
+        connections.tunnels.clear();
+        connections.ensure_codespace(&id).unwrap();
+        assert_eq!(
+            gh.scripts().last().unwrap(),
+            &ssh::codespace_bootstrap_script()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_turn_that_starts_after_the_look_keeps_its_host_and_the_next_ensure_applies_the_change() {
+        let chosen = Arc::new(Chosen::default());
+        chosen.set(Some(("work", SECRET_A)));
+        let Some((gh, host, connections, _dir, id)) = paired(&chosen) else {
+            eprintln!("SKIPPED: python3 not found");
+            return;
+        };
+        let before = gh.scripts().len();
+        chosen.set(Some(("other", SECRET_B)));
+        // The Host looks idle to the ensure; by the look under the send hold (the second
+        // `sessions.list`) a turn has started.
+        host.set(|state| {
+            state.list_calls = 0;
+            state.running_from_list_call = Some(2);
+        });
+        connections.ensure_codespace(&id).unwrap();
+        assert_eq!(
+            gh.scripts().len(),
+            before,
+            "the turn's Host was not restarted"
+        );
+        assert!(
+            connections.gate(&id).enter().is_ok(),
+            "sends are released again"
+        );
+        // A reconnect of the live Host (Settings, a move, a convert) follows the same rule.
+        let view = wait(&connections, connections.codespace_reconnect(&id).unwrap());
+        assert_eq!(view.error, None);
+        assert_eq!(gh.scripts().len(), before, "still left alone");
+        // Nothing runs any more: the next ensure applies it.
+        host.set(|state| {
+            state.running_from_list_call = None;
+            state.sessions = vec!["idle"];
+        });
+        connections.ensure_codespace(&id).unwrap();
+        assert_eq!(gh.scripts().len(), before + 1);
+        assert_eq!(
+            gh.scripts().last().unwrap(),
+            &format!(
+                "{}{}",
+                ssh::codespace_forget_token_marker(),
+                ssh::codespace_bootstrap_script_with(Some(&delivery("other", SECRET_B).prelude))
+            )
+        );
+        assert!(connections.gate(&id).enter().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unusable_account_does_not_block_a_connected_host_but_fails_a_wake() {
+        let chosen = Arc::new(Chosen::default());
+        chosen.set(Some(("work", SECRET_A)));
+        let Some((gh, _host, connections, _dir, id)) = paired(&chosen) else {
+            eprintln!("SKIPPED: python3 not found");
+            return;
+        };
+        let runs = gh.scripts().len();
+        let message = "This cloud session uses Claude account \"Work\", which is no longer available. Start a new cloud session or add the account back.";
+        *chosen.error.lock().unwrap() = Some(message.into());
+        // Connected: a send still goes through (the ensure is a no-op).
+        connections.ensure_codespace(&id).unwrap();
+        assert_eq!(gh.scripts().len(), runs);
+        // A wake needs the credential: it fails with the account's message.
+        connections.tunnels.clear();
+        assert_eq!(
+            connections.ensure_codespace(&id).unwrap_err(),
+            message.to_owned()
+        );
+        assert_eq!(gh.scripts().len(), runs, "nothing ran on the machine");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_credential_is_only_read_when_the_account_is_the_one_delivered() {
+        let chosen = Arc::new(Chosen::default());
+        chosen.set(Some(("work", SECRET_A)));
+        let Some((gh, _host, connections, _dir, id)) = paired(&chosen) else {
+            eprintln!("SKIPPED: python3 not found");
+            return;
+        };
+        let runs = gh.scripts().len();
+        // Same account: its token is read once, to see that it is the same token.
+        chosen.resolves.store(0, Ordering::SeqCst);
+        connections.ensure_codespace(&id).unwrap();
+        assert_eq!(chosen.resolves.load(Ordering::SeqCst), 1);
+        assert_eq!(gh.scripts().len(), runs);
+        // Another account: the ids already differ, so it is read to see that it can be used
+        // (a change to an unusable account is not attempted), then by the bootstrap itself.
+        chosen.set(Some(("other", SECRET_B)));
+        chosen.resolves.store(0, Ordering::SeqCst);
+        connections.ensure_codespace(&id).unwrap();
+        assert_eq!(gh.scripts().len(), runs + 1);
+        assert_eq!(chosen.resolves.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_manual_upgrade_with_an_account_tracks_its_token_like_the_bootstrap() {
+        let chosen = Arc::new(Chosen::default());
+        chosen.set(Some(("work", SECRET_A)));
+        let Some((gh, _host, connections, _dir, id)) = paired(&chosen) else {
+            eprintln!("SKIPPED: python3 not found");
+            return;
+        };
+        let runs = gh.scripts().len();
+        // The job may fail afterwards (the fake Host lacks Explorer); the script is what counts.
+        let _ = wait(&connections, connections.ssh_reconnect(&id, true).unwrap());
+        let scripts = gh.scripts();
+        assert_eq!(scripts.len(), runs + 1);
+        let prelude = delivery("work", SECRET_A).prelude;
+        assert!(
+            scripts[runs].starts_with(&format!(
+                "{}\nMONOCODE_HOST_TRACK_TOKEN=1\nMONOCODE_HOST_FORCE_UPGRADE=1\n",
+                prelude.as_str()
+            )),
+            "{}",
+            &scripts[runs][..200.min(scripts[runs].len())]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_change_is_delivered_at_once_when_the_codespace_is_known_to_be_stopped() {
+        let chosen = Arc::new(Chosen::default());
+        chosen.set(Some(("work", SECRET_A)));
+        let Some((gh, _host, connections, _dir, id)) = paired(&chosen) else {
+            eprintln!("SKIPPED: python3 not found");
+            return;
+        };
+        let after_pairing = gh.scripts().len();
+        // The project switches account and the codespace shuts down: no Host, no turn.
+        chosen.set(Some(("other", SECRET_B)));
+        chosen.stopped.store(true, Ordering::SeqCst);
+        connections.tunnels.clear();
+        connections.ensure_codespace(&id).unwrap();
+        let scripts = gh.scripts();
+        assert_eq!(scripts.len(), after_pairing + 1);
+        let last = scripts.last().unwrap();
+        assert!(
+            last.contains(&*delivery("other", SECRET_B).prelude),
+            "wanted account delivered"
+        );
+        assert!(!last.contains(SECRET_A));
+        assert!(connections
+            .delivered_fingerprint("cs")
+            .is_some_and(|f| f.starts_with("other:")));
+        assert!(
+            connections.gate(&id).enter().is_ok(),
+            "the hold is released"
+        );
+        assert!(!gh.argv_log().contains(SECRET_B), "{}", gh.argv_log());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_change_that_cannot_be_checked_for_idleness_is_deferred_with_the_old_account() {
+        let chosen = Arc::new(Chosen::default());
+        chosen.set(Some(("work", SECRET_A)));
+        let Some((gh, host, connections, _dir, id)) = paired(&chosen) else {
+            eprintln!("SKIPPED: python3 not found");
+            return;
+        };
+        let after_pairing = gh.scripts().len();
+        let old = connections.delivered_fingerprint("cs");
+        assert!(old.as_deref().is_some_and(|f| f.starts_with("work:")));
+        // The project switches account while a turn runs: the change is deferred.
+        chosen.set(Some(("other", SECRET_B)));
+        host.set(|state| state.sessions = vec!["running"]);
+        connections.ensure_codespace(&id).unwrap();
+        assert_eq!(gh.scripts().len(), after_pairing);
+        // The tunnel is gone: idleness cannot be verified. The bootstrap carries the account
+        // the Host already runs under, with no stop pre-step and no marker removal.
+        connections.tunnels.clear();
+        connections.ensure_codespace(&id).unwrap();
+        let scripts = gh.scripts();
+        assert_eq!(scripts.len(), after_pairing + 1);
+        assert_eq!(
+            scripts.last().unwrap(),
+            &ssh::codespace_bootstrap_script_with(Some(&delivery("work", SECRET_A).prelude))
+        );
+        assert!(!scripts.last().unwrap().contains(SECRET_B));
+        assert_eq!(connections.delivered_fingerprint("cs"), old, "kept");
+        assert!(connections.gate(&id).enter().is_ok());
+        // Over a live tunnel and an idle Host the next ensure applies the change.
+        host.set(|state| state.sessions = vec!["idle"]);
+        connections.ensure_codespace(&id).unwrap();
+        let scripts = gh.scripts();
+        assert_eq!(scripts.len(), after_pairing + 2);
+        assert_eq!(
+            scripts.last().unwrap(),
+            &format!(
+                "{}{}",
+                ssh::codespace_forget_token_marker(),
+                ssh::codespace_bootstrap_script_with(Some(&delivery("other", SECRET_B).prelude))
+            )
+        );
+        assert!(connections
+            .delivered_fingerprint("cs")
+            .is_some_and(|f| f.starts_with("other:")));
+        assert!(!gh.argv_log().contains(SECRET_A) && !gh.argv_log().contains(SECRET_B));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leaving_an_account_while_the_host_cannot_be_asked_does_not_stop_it() {
+        let chosen = Arc::new(Chosen::default());
+        chosen.set(Some(("work", SECRET_A)));
+        let Some((gh, _host, connections, _dir, id)) = paired(&chosen) else {
+            eprintln!("SKIPPED: python3 not found");
+            return;
+        };
+        let runs = gh.scripts().len();
+        chosen.set(None);
+        connections.tunnels.clear();
+        connections.ensure_codespace(&id).unwrap();
+        let scripts = gh.scripts();
+        assert_eq!(scripts.len(), runs + 1);
+        // Not even the bare script: the Host is bootstrapped under the account it runs under.
+        assert_eq!(
+            scripts.last().unwrap(),
+            &ssh::codespace_bootstrap_script_with(Some(&delivery("work", SECRET_A).prelude))
+        );
+        assert!(!scripts
+            .last()
+            .unwrap()
+            .contains(ssh::codespace_stop_host_prestep()));
+        // Live and idle: now the Host is stopped and the bare bootstrap runs.
+        connections.ensure_codespace(&id).unwrap();
+        assert_eq!(
+            gh.scripts().last().unwrap(),
+            &format!(
+                "{}{}",
+                ssh::codespace_stop_host_prestep(),
+                ssh::codespace_bootstrap_script()
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_account_that_cannot_be_used_does_not_disturb_a_live_host() {
+        let chosen = Arc::new(Chosen::default());
+        chosen.set(Some(("work", SECRET_A)));
+        let Some((gh, _host, connections, _dir, id)) = paired(&chosen) else {
+            eprintln!("SKIPPED: python3 not found");
+            return;
+        };
+        let runs = gh.scripts().len();
+        let message = "Claude account \"Other\" has no setup token or API key saved. Choose another account in Cloud settings.";
+        chosen.set(Some(("other", SECRET_B)));
+        *chosen.resolve_error.lock().unwrap() = Some(message.into());
+        // Live: sends keep working on the old account, nothing runs on the machine.
+        connections.ensure_codespace(&id).unwrap();
+        assert_eq!(gh.scripts().len(), runs);
+        // The error surfaces at the next real bootstrap (the Host is gone), and nothing ran.
+        connections.tunnels.clear();
+        assert_eq!(
+            connections.ensure_codespace(&id).unwrap_err(),
+            message.to_owned()
+        );
+        assert_eq!(gh.scripts().len(), runs);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_delivered_account_survives_an_app_restart_as_an_id_only_hint() {
+        let chosen = Arc::new(Chosen::default());
+        chosen.set(Some(("work", SECRET_A)));
+        let Some((gh, host, connections, dir, id)) = paired(&chosen) else {
+            eprintln!("SKIPPED: python3 not found");
+            return;
+        };
+        // Only the account id is persisted.
+        assert_eq!(chosen.hint.lock().unwrap().as_deref(), Some("work"));
+        let after_pairing = gh.scripts().len();
+        drop(connections);
+        // The app restarted: a new Connections over the same data, nothing in memory.
+        let connections = Arc::new(Connections::new(dir.path()));
+        connections.set_codespace_claude(chosen.clone());
+        assert!(connections
+            .delivered_fingerprint("cs")
+            .is_some_and(|f| f == "work:"));
+        // The same account (id only): nothing to apply, and its credential is not even read.
+        chosen.resolves.store(0, Ordering::SeqCst);
+        connections.ensure_codespace(&id).unwrap();
+        assert_eq!(gh.scripts().len(), after_pairing + 1, "wake only");
+        assert_eq!(
+            gh.scripts().last().unwrap(),
+            &ssh::codespace_bootstrap_script_with(Some(&delivery("work", SECRET_A).prelude))
+        );
+        // The project switched meanwhile: the first reconnect after the restart (the tunnel is
+        // gone, idleness unknown) keeps the hint, and the next live idle ensure applies it.
+        connections.tunnels.clear();
+        chosen.set(Some(("other", SECRET_B)));
+        connections.ensure_codespace(&id).unwrap();
+        assert_eq!(gh.scripts().len(), after_pairing + 2);
+        assert_eq!(
+            gh.scripts().last().unwrap(),
+            &ssh::codespace_bootstrap_script_with(Some(&delivery("work", SECRET_A).prelude))
+        );
+        assert_eq!(chosen.hint.lock().unwrap().as_deref(), Some("work"));
+        host.set(|state| state.sessions = vec!["idle"]);
+        connections.ensure_codespace(&id).unwrap();
+        assert_eq!(gh.scripts().len(), after_pairing + 3);
+        assert_eq!(chosen.hint.lock().unwrap().as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn a_cloud_swap_records_the_account_it_delivered() {
+        let chosen = Arc::new(Chosen::default());
+        chosen.set(Some(("work", SECRET_A)));
+        let (fx, outcome, _) = old_host_upgrade(Some(chosen.clone()));
+        assert!(matches!(outcome, Outcome::Upgraded(_)), "{outcome:?}");
+        assert!(fx
+            .connections
+            .delivered_fingerprint("cs")
+            .is_some_and(|f| f.starts_with("work:")));
+        assert_eq!(chosen.hint.lock().unwrap().as_deref(), Some("work"));
+        // A swap in a codespace without an account records that too.
+        let none = Arc::new(Chosen::default());
+        let (fx, outcome, _) = old_host_upgrade(Some(none));
+        assert!(matches!(outcome, Outcome::Upgraded(_)), "{outcome:?}");
+        assert_eq!(fx.connections.delivered_fingerprint("cs"), None);
+        assert!(fx
+            .connections
+            .claude_delivered
+            .lock()
+            .unwrap()
+            .contains_key("cs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_manual_upgrade_records_the_account_it_delivered() {
+        let chosen = Arc::new(Chosen::default());
+        chosen.set(Some(("work", SECRET_A)));
+        let Some((gh, _host, connections, _dir, id)) = paired(&chosen) else {
+            eprintln!("SKIPPED: python3 not found");
+            return;
+        };
+        chosen.set(Some(("other", SECRET_B)));
+        let _ = wait(&connections, connections.ssh_reconnect(&id, true).unwrap());
+        assert!(connections
+            .delivered_fingerprint("cs")
+            .is_some_and(|f| f.starts_with("other:")));
+        // Nothing left to apply for the next ensure.
+        let runs = gh.scripts().len();
+        connections.ensure_codespace(&id).unwrap();
+        assert_eq!(gh.scripts().len(), runs);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_send_during_the_account_apply_is_refused_and_accepted_after() {
+        let chosen = Arc::new(Chosen::default());
+        chosen.set(Some(("work", SECRET_A)));
+        let Some((gh, _host, connections, _dir, id)) = paired(&chosen) else {
+            eprintln!("SKIPPED: python3 not found");
+            return;
+        };
+        let before = gh.scripts().len();
+        chosen.set(Some(("other", SECRET_B)));
+        // The bootstrap on the machine is stuck until the file goes away.
+        std::fs::write(gh.dir.path().join("block"), "").unwrap();
+        let worker = {
+            let (connections, id) = (connections.clone(), id.clone());
+            std::thread::spawn(move || connections.ensure_codespace(&id))
+        };
+        for _ in 0..400 {
+            if gh.scripts().len() > before {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert_eq!(gh.scripts().len(), before + 1, "the apply is running");
+        assert_eq!(
+            connections
+                .request(&id, "commands.dispatch", json!({}))
+                .unwrap_err(),
+            ACCOUNT_APPLYING
+        );
+        std::fs::remove_file(gh.dir.path().join("block")).unwrap();
+        worker.join().unwrap().unwrap();
+        assert!(connections
+            .request(&id, "commands.dispatch", json!({}))
+            .is_ok());
+    }
+
+    #[test]
+    fn a_host_that_needs_no_update_never_resolves_the_account_or_records_a_failure() {
+        let current = || {
+            setup(
+                false,
+                "monoptah",
+                host_upgrade::pinned_version(),
+                vec!["idle"],
+                Box::new(|_, _| Ok(String::new())),
+            )
+        };
+        let fx = current();
+        let chosen = Arc::new(Chosen::default());
+        *chosen.error.lock().unwrap() = Some("Claude account \"Work\" is gone.".into());
+        fx.connections.set_codespace_claude(chosen.clone());
+        let (outcome, lines) = upgrade(&fx, None);
+        assert!(matches!(outcome, Outcome::Current), "{outcome:?}");
+        assert!(lines.is_empty(), "{lines:?}");
+        assert_eq!(fx.connections.host_upgrade_failure(MACHINE), None);
+        assert_eq!(chosen.resolves.load(Ordering::SeqCst), 0);
+        assert!(fx.runner.scripts.lock().unwrap().is_empty());
+        // Needed and possible: the account is read once, for every step of the pass.
+        let chosen = Arc::new(Chosen::default());
+        chosen.set(Some(("work", SECRET_A)));
+        let (_fx, outcome, _) = old_host_upgrade(Some(chosen.clone()));
+        assert!(matches!(outcome, Outcome::Upgraded(_)), "{outcome:?}");
+        assert_eq!(chosen.resolves.load(Ordering::SeqCst), 1);
+    }
 }

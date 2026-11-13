@@ -128,6 +128,11 @@ fn codespace_end_to_end() {
                 codespace: CodespaceChoice::Named(name.clone()),
                 branch: None,
                 machine: None,
+                idle_timeout_minutes: None,
+                devcontainer_path: None,
+                claude_account: None,
+                claude_account_pinned: false,
+                work_branch: None,
             },
             &mut |m| step(&format!("progress: {m}")),
         )
@@ -416,6 +421,11 @@ fn codespace_archive_to_local() {
                 codespace: CodespaceChoice::Named(name.clone()),
                 branch: None,
                 machine: None,
+                idle_timeout_minutes: None,
+                devcontainer_path: None,
+                claude_account: None,
+                claude_account_pinned: false,
+                work_branch: None,
             },
             &mut |m| step(&format!("progress: {m}")),
         )

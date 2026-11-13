@@ -104,12 +104,15 @@
 //! Background code never runs ssh into a sandbox (that resumes and bills it): only
 //! `run_start` and `rebuild_start` (user actions) do. `inspect` is the only read they use
 //! before ssh.
-use super::backend::docker::{DockerBackend, SandboxShell, ShellOutput, SHELL_ABORTED};
+use super::backend::docker::{
+    AccountResolver, DockerBackend, SandboxShell, ShellOutput, SHELL_ABORTED,
+};
 use super::backend::{CloudBackendKind, CloudRef};
+use super::claude_pin::{self, ClaudePin};
 use super::docker_config::{valid_ref, DockerProjectConfig};
 use super::startup::{
-    remove_start_record, save_start_record, start_record, StartEvent, StartRecord, Step, StepKind,
-    StepStatus, PROGRESS_PREFIX,
+    pending_starts, remove_start_record, save_start_record, start_record, StartEvent, StartRecord,
+    Step, StepKind, StepStatus, PROGRESS_PREFIX,
 };
 use super::{require_claude, CloudBinding, CloudSessions, OpenRequest, START_ABORTED};
 use crate::git_credentials::{self, GitCredentials};
@@ -200,6 +203,11 @@ pub struct SandboxStart {
     /// [`DeferredLifecycle`].
     #[serde(default)]
     pub defer_lifecycle: bool,
+    /// The Claude account in `config` is a per-session override, not the project's default:
+    /// it is pinned to the sandbox as such and survives a reconnect (see
+    /// [`super::claude_pin`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub claude_pinned: bool,
 }
 
 /// What the move needs to start the lifecycle commands of a sandbox it started, after the
@@ -220,6 +228,9 @@ pub struct DeferredLifecycle {
     /// The commands were started (or were tried once): never again.
     #[serde(default)]
     pub started: bool,
+    /// The Docker account the sandbox lives in; the ssh that starts the commands runs as it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docker_account: Option<String>,
 }
 
 /// Why the LifecycleCommands step of a move's sandbox did not run in the start.
@@ -263,6 +274,7 @@ impl DeferredLifecycle {
             config: config_arg(&start.config),
             mount: start.config.credential_id.is_some(),
             started: false,
+            docker_account: start.config.docker_account.clone(),
         })
     }
 }
@@ -315,6 +327,21 @@ impl ClaudeAuth {
     }
 }
 
+/// The Claude credential of app account `account`, read from the app's own store; `None` when
+/// the account has no saved token or key. The one place both backends load it (a sandbox
+/// through [`StoreSecrets`], a codespace through
+/// [`super::claude_pin::StoreCodespaceClaude`]). Reads the sealed credential: worker threads
+/// only.
+pub fn store_claude_auth(store: &Store, account: &str) -> Result<Option<ClaudeAuth>, String> {
+    let root = store
+        .data_dir()
+        .ok_or("Provider account storage is unavailable")?;
+    let profile = crate::accounts::Profile::new(account, root);
+    Ok(profile
+        .claude_secret()?
+        .map(|(credential, secret)| ClaudeAuth::new(credential.variable(), secret)))
+}
+
 /// Where a sandbox gets its secrets. Injectable; also used by reconnect.
 pub trait SandboxSecrets: Send + Sync {
     /// The Claude credential of the pinned account; `None` when there is no account or it
@@ -349,13 +376,7 @@ impl SandboxSecrets for StoreSecrets {
             .store
             .lock()
             .map_err(|_| "Native session store unavailable".to_string())?;
-        let root = store
-            .data_dir()
-            .ok_or("Provider account storage is unavailable")?;
-        let profile = crate::accounts::Profile::new(account, root);
-        Ok(profile
-            .claude_secret()?
-            .map(|(credential, secret)| ClaudeAuth::new(credential.variable(), secret)))
+        store_claude_auth(&store, account)
     }
     fn git_payload(
         &self,
@@ -367,6 +388,31 @@ impl SandboxSecrets for StoreSecrets {
             .lock()
             .map_err(|_| "Native session store unavailable".to_string())?;
         GitCredentials::for_store(&store)?.credential_payload(credential_id, repo_url)
+    }
+}
+
+impl CloudSessions {
+    /// The Claude credential of the account a sandbox start or reconnect runs under. A chosen
+    /// account that is gone or has no token is an error naming it (never a silent start
+    /// without a credential, the sandbox's equivalent of a codespace falling back to its
+    /// secret); no account chosen is `None`.
+    pub(super) fn required_claude_auth(
+        &self,
+        secrets: &dyn SandboxSecrets,
+        account: Option<&str>,
+        pinned: bool,
+    ) -> Result<Option<ClaudeAuth>, String> {
+        let Some(account) = account else {
+            return Ok(None);
+        };
+        match secrets.claude_auth(Some(account))? {
+            Some(auth) => Ok(Some(auth)),
+            None => Err(claude_pin::missing_auth_error(
+                &*self.store()?,
+                account,
+                pinned,
+            )),
+        }
     }
 }
 
@@ -583,6 +629,15 @@ struct Run<'a> {
 
 // ------------------------------------------------------------------- sessions
 
+/// How a sandbox start differs from an ordinary one.
+#[derive(Clone, Copy, Default)]
+struct StartFlags {
+    /// A move starts it: the lifecycle commands wait for the code restore.
+    defer_lifecycle: bool,
+    /// `config.claude_account` is this session's own choice, pinned to the sandbox.
+    claude_pinned: bool,
+}
+
 impl CloudSessions {
     /// Registers the Docker sandbox backend with the given `sbx` runner, ssh seam and secret
     /// source. Without it every sandbox start is refused.
@@ -592,7 +647,24 @@ impl CloudSessions {
         shell: Arc<dyn SandboxShell>,
         secrets: Arc<dyn SandboxSecrets>,
     ) -> Self {
-        let backend = Arc::new(DockerBackend::new(runner.clone()).with_shell(shell.clone()));
+        // A sandbox this process has not been told about is looked up in the pin settings.
+        let pins = self.store.clone();
+        let resolver: AccountResolver = Arc::new(move |name| {
+            let store = pins
+                .lock()
+                .map_err(|_| "Native session store unavailable".to_string())?;
+            // A sandbox whose Docker account was removed says so, instead of failing later with
+            // a text that tells the user to choose another account.
+            if let Some(error) = sandboxes::account::removed_account_error(&store, name) {
+                return Err(error);
+            }
+            Ok(sandboxes::account::pinned(&store, name)?.or_else(|| started_account(&store, name)))
+        });
+        let backend = Arc::new(
+            DockerBackend::new(runner.clone())
+                .with_shell(shell.clone())
+                .with_account_resolver(resolver),
+        );
         self.backends
             .insert(CloudBackendKind::DockerSandbox, backend.clone());
         self.sandbox = Some(SandboxDeps {
@@ -648,7 +720,40 @@ impl CloudSessions {
         harness: &str,
         kit: bool,
     ) -> Result<(Session, StartRecord), String> {
-        self.begin_sandbox_start_inner(local_cwd, config, branch, harness, kit, false)
+        self.begin_sandbox_start_inner(
+            local_cwd,
+            config,
+            branch,
+            harness,
+            kit,
+            StartFlags::default(),
+        )
+    }
+
+    /// [`Self::begin_sandbox_start_with_kit`] where `config.claude_account` may be this
+    /// session's own choice. With `claude_pinned` it is pinned to the sandbox as an override
+    /// that survives a reconnect; without it the sandbox follows the project's current
+    /// choice (see [`super::claude_pin`]).
+    pub fn begin_sandbox_start_pinned(
+        &self,
+        local_cwd: &str,
+        config: &DockerProjectConfig,
+        branch: &str,
+        harness: &str,
+        kit: bool,
+        claude_pinned: bool,
+    ) -> Result<(Session, StartRecord), String> {
+        self.begin_sandbox_start_inner(
+            local_cwd,
+            config,
+            branch,
+            harness,
+            kit,
+            StartFlags {
+                claude_pinned,
+                ..Default::default()
+            },
+        )
     }
 
     /// [`Self::begin_sandbox_start_with_kit`] for a sandbox a move creates: the start leaves
@@ -662,7 +767,17 @@ impl CloudSessions {
         harness: &str,
         kit: bool,
     ) -> Result<(Session, StartRecord), String> {
-        self.begin_sandbox_start_inner(local_cwd, config, branch, harness, kit, true)
+        self.begin_sandbox_start_inner(
+            local_cwd,
+            config,
+            branch,
+            harness,
+            kit,
+            StartFlags {
+                defer_lifecycle: true,
+                ..Default::default()
+            },
+        )
     }
 
     fn begin_sandbox_start_inner(
@@ -672,8 +787,12 @@ impl CloudSessions {
         branch: &str,
         harness: &str,
         kit: bool,
-        defer_lifecycle: bool,
+        flags: StartFlags,
     ) -> Result<(Session, StartRecord), String> {
+        let StartFlags {
+            defer_lifecycle,
+            claude_pinned,
+        } = flags;
         require_claude(harness)?;
         let deps = self.sandbox_deps()?;
         let config = config.validated()?;
@@ -683,7 +802,16 @@ impl CloudSessions {
         }
         compute_of(&config)?;
         let (_, _, path) = git_credentials::normalize_origin(&config.repo_url)?;
-        let prerequisites = sandboxes::diagnose(&*deps.runner, &deps.home);
+        // The chosen Claude account is checked (metadata only) before anything is created or
+        // pinned: a missing credential must not first cost a sandbox.
+        if let Some(account) = config.claude_account.as_deref() {
+            let store = self.store()?;
+            claude_pin::check_account(&store, account, claude_pinned)?;
+        }
+        // Under the project's Docker account when it names one: an account problem then
+        // reads as such (with where to fix it), never as "run `sbx login`".
+        let prerequisites =
+            sandboxes::diagnose_as(&*deps.runner, &deps.home, config.docker_account.as_deref());
         if !prerequisites.is_ready() {
             return Err(prerequisites.message());
         }
@@ -691,6 +819,11 @@ impl CloudSessions {
         let request_id = uuid::Uuid::new_v4().to_string();
         let name = sandboxes::sandbox_name_for(&branch, &request_id);
         let repo_dir = repo_dir_of(&path);
+        let account = config.docker_account.clone();
+        let claude = ClaudePin {
+            account: config.claude_account.clone(),
+            pinned: claude_pinned,
+        };
         let start = SandboxStart {
             request_id,
             config,
@@ -702,6 +835,7 @@ impl CloudSessions {
             relay_port: DEFAULT_RELAY_PORT,
             rebuild: false,
             defer_lifecycle,
+            claude_pinned,
         };
         let remote_cwd = format!("/workspaces/{repo_dir}");
         let mut record =
@@ -712,13 +846,33 @@ impl CloudSessions {
             let project = pending_cloud_project(local_cwd, &CloudRef::sandbox(&name), &remote_cwd);
             let session = store.create_pending_cloud_session(harness, project)?;
             record.session_id = session.id;
+            // The Docker account is pinned to the name BEFORE `sbx create`, in the same
+            // store block as the start record: from the first moment the name is known,
+            // every lookup of it (the background state read, forget_missing) runs as the
+            // account that is about to create it, never as the machine login. A pin that
+            // can not be written fails the start before anything is created.
+            if let Err(error) = sandboxes::account::pin(&store, &name, account.as_deref()) {
+                let _ = store.forget_cloud_session(session.id);
+                return Err(error);
+            }
+            // The Claude account follows the same rule: written before the sandbox exists,
+            // so a reconnect can never run it under another account than its start.
+            if let Err(error) = claude_pin::write(&store, &claude_pin::sandbox_key(&name), &claude)
+            {
+                let _ = store.forget_cloud_session(session.id);
+                let _ = sandboxes::account::pin(&store, &name, None);
+                return Err(error);
+            }
             // Persisted BEFORE `sbx create`: a crash from here on finds the name again.
             if let Err(error) = save_start_record(&store, &record) {
                 let _ = store.forget_cloud_session(session.id);
+                let _ = sandboxes::account::pin(&store, &name, None);
+                let _ = claude_pin::clear(&store, &claude_pin::sandbox_key(&name));
                 return Err(error);
             }
             session
         };
+        deps.backend.remember_account(&name, account.as_deref());
         match self.ensure_created(&deps, &mut record, false) {
             Ok(()) => {
                 let now = self.now();
@@ -738,6 +892,10 @@ impl CloudSessions {
                 let store = self.store()?;
                 let _ = remove_start_record(&store, session.id);
                 let _ = store.forget_cloud_session(session.id);
+                // Nothing was created: the name is not the pinned account's.
+                let _ = sandboxes::account::pin(&store, &name, None);
+                let _ = claude_pin::clear(&store, &claude_pin::sandbox_key(&name));
+                deps.backend.forget_account(&name);
                 Err(failure.message)
             }
         }
@@ -762,22 +920,46 @@ impl CloudSessions {
             .as_ref()
             .ok_or_else(|| CreateFailure::definite("This start has no sandbox data.".into()))?;
         let compute = compute_of(&start.config).map_err(CreateFailure::definite)?;
+        // A sandbox lives in the account that creates it: the start's own snapshot of the
+        // project config, so a later change of the project's account does not move a retry.
+        let account = start.config.docker_account.clone();
+        // The Docker account must be able to produce its token BEFORE anything is spawned:
+        // any DockerAuthError here (revoked, no access, network, status, unexpected, not
+        // available) means `sbx` never ran, so nothing was created and no lookup is needed.
+        if let Err(error) = crate::docker_accounts::env_for(account.as_deref()) {
+            return Err(CreateFailure::definite(error.to_string()));
+        }
+        let runner = sandboxes::as_account(&*deps.runner, account.as_deref());
+        if lookup_first {
+            // A retry of a record that predates the pin: write it before looking.
+            let store = self.store().map_err(CreateFailure::definite)?;
+            sandboxes::account::pin(&store, &name, account.as_deref())
+                .map_err(CreateFailure::definite)?;
+            drop(store);
+            deps.backend.remember_account(&name, account.as_deref());
+        }
         let mut found = None;
         if lookup_first {
-            found = sandboxes::find_by_name(&*deps.runner, &name)
+            found = sandboxes::find_by_name(&runner, &name)
                 .map_err(|e| CreateFailure {
-                    message: e,
                     ambiguous: true,
+                    message: e,
                 })?
                 .map(|info| info.id);
         }
         let id = match found {
             Some(id) => id,
-            None => match sandboxes::create(&*deps.runner, &name, &compute) {
+            None => match sandboxes::create(&runner, &name, &compute) {
                 Ok(id) => id,
                 Err(error) => match error.id {
                     Some(id) => id,
-                    None => match sandboxes::find_by_name(&*deps.runner, &name) {
+                    // Token problems were settled by the check above. What is left is `sbx`
+                    // refusing even a fresh JWT (the runner's "revoked" text): it rejected
+                    // the call before creating anything, so say it once, no lookup.
+                    None if sandboxes::is_account_text(&error.message) => {
+                        return Err(CreateFailure::definite(error.message))
+                    }
+                    None => match sandboxes::find_by_name(&runner, &name) {
                         Ok(Some(found)) => found.id,
                         Ok(None) => {
                             return Err(CreateFailure {
@@ -870,7 +1052,14 @@ impl CloudSessions {
             .config
             .clone();
         // Secrets are read once, up front, and only kept to be masked in what we show.
-        let auth = deps.secrets.claude_auth(config.claude_account.as_deref())?;
+        let auth = self.required_claude_auth(
+            &*deps.secrets,
+            config.claude_account.as_deref(),
+            record
+                .sandbox_start
+                .as_ref()
+                .is_some_and(|start| start.claude_pinned),
+        )?;
         let payload = match &config.credential_id {
             Some(credential) => Some(deps.secrets.git_payload(credential, &config.repo_url)?),
             None => None,
@@ -975,6 +1164,7 @@ impl CloudSessions {
         what: &str,
     ) -> Result<ShellOutput, Stop> {
         let shell = run.deps.shell.clone();
+        let account = Self::run_account(run);
         let cancel = run.cancel;
         let session_id = run.record.session_id;
         let detached = run.detached;
@@ -985,7 +1175,15 @@ impl CloudSessions {
                     self.log_line(run, line);
                 }
             };
-            shell.run(id, remote, stdin, &mut on_line, &abort, timeout)
+            shell.run_as(
+                account.as_deref(),
+                id,
+                remote,
+                stdin,
+                &mut on_line,
+                &abort,
+                timeout,
+            )
         };
         let out = result.map_err(|e| Stop::from(run.scrub.apply(&e)))?;
         if !out.success {
@@ -1017,7 +1215,8 @@ impl CloudSessions {
         }
         let out = deps
             .shell
-            .run(
+            .run_as(
+                config.docker_account.as_deref(),
                 sandbox_id,
                 &approve_remote(),
                 &payload,
@@ -1031,6 +1230,15 @@ impl CloudSessions {
         } else {
             Err(failure_text(&out, &scrub, "Delivering the Git credential"))
         }
+    }
+
+    /// The Docker account this run's sandbox lives in: the start's own snapshot of the
+    /// project config (a reconnect overwrites it with the sandbox's pinned account).
+    fn run_account(run: &Run) -> Option<String> {
+        run.record
+            .sandbox_start
+            .as_ref()
+            .and_then(|s| s.config.docker_account.clone())
     }
 
     fn sandbox_id(run: &Run) -> Result<String, Stop> {
@@ -1061,7 +1269,11 @@ impl CloudSessions {
         let id = Self::sandbox_id(run)?;
         run.deps.backend.remember(name, &id);
         // Reconcile: the sandbox may be stopped, or gone. Never recreated.
-        match sandboxes::inspect(&*run.deps.runner, &id) {
+        let account = Self::run_account(run);
+        match sandboxes::inspect(
+            &sandboxes::as_account(&*run.deps.runner, account.as_deref()),
+            &id,
+        ) {
             Ok(info) => {
                 let state = info.state.trim().to_ascii_lowercase();
                 match state.as_str() {
@@ -1371,6 +1583,7 @@ impl CloudSessions {
         self.sandbox_exec(run, &id, SH_S, &vars, SHORT, "Starting the container build")?;
         let follow_vars = Self::up_vars(run, "follow")?;
         let shell = run.deps.shell.clone();
+        let account = Self::run_account(run);
         let mut delivered = 0usize;
         let mut exit: Option<String> = None;
         let mut outcome: Option<UpLine> = None;
@@ -1395,7 +1608,15 @@ impl CloudSessions {
                         exit = Some(code.trim().to_string());
                     }
                 };
-                shell.run(&id, SH_S, &follow, &mut on_line, &abort, LONG)
+                shell.run_as(
+                    account.as_deref(),
+                    &id,
+                    SH_S,
+                    &follow,
+                    &mut on_line,
+                    &abort,
+                    LONG,
+                )
             };
             match result {
                 Err(error) => {
@@ -1539,6 +1760,7 @@ impl CloudSessions {
             relay_port: start.relay_port,
             config: config_arg(&start.config),
             mode,
+            docker_account: start.config.docker_account.clone(),
         };
         crate::remote::validate_sandbox_target(&target)?;
         Ok((target, container))
@@ -1837,7 +2059,15 @@ impl CloudSessions {
         );
         let out = deps
             .shell
-            .run(&deferred.sandbox_id, SH_S, &vars, &mut |_| {}, abort, SHORT)
+            .run_as(
+                deferred.docker_account.as_deref(),
+                &deferred.sandbox_id,
+                SH_S,
+                &vars,
+                &mut |_| {},
+                abort,
+                SHORT,
+            )
             .map_err(|e| Scrub(vec![]).apply(&e))?;
         if !out.success {
             return Err(failure_text(
@@ -1940,6 +2170,17 @@ impl CreateFailure {
     }
 }
 
+/// The Docker account a sandbox without a pin is being created in: the project config the
+/// start record of that name was begun with.
+fn started_account(store: &Store, name: &str) -> Option<String> {
+    pending_starts(store).into_iter().find_map(|record| {
+        let cloud = record.cloud()?;
+        (cloud.kind == CloudBackendKind::DockerSandbox && cloud.name == name)
+            .then(|| record.sandbox_start?.config.docker_account)
+            .flatten()
+    })
+}
+
 /// Setting that remembers the id of the container a sandbox's Host lives in.
 pub(super) fn container_key(name: &str) -> String {
     format!("sandbox-container:{name}")
@@ -2000,5 +2241,6 @@ fn fresh_sandbox_record(
         track_ready: false,
         sandbox_start: Some(start),
         kit_off: false,
+        work_branch: None,
     }
 }

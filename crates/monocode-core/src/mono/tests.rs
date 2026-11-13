@@ -231,8 +231,8 @@ fn the_prompt_and_help_describe_each_delivery_and_habit_reporting() {
         "accounts.list {provider?}",
         "target?,account?}",
         "sessions.start account:",
-        "local sessions only",
-        "the cloud setup",
+        "NEW codespace or sandbox only",
+        "the account belongs to the instance",
     ] {
         assert!(bridge::HELP.contains(needle), "help lacks {needle}");
     }

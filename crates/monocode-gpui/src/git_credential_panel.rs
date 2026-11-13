@@ -1,6 +1,8 @@
-//! The Git credential dialog, a child modal of the Docker Sandbox dialog: pick a saved HTTPS
-//! profile or add one (GitHub or GitLab.com), check its read access and remove it. `model`
-//! holds the decisions. The access token lives only in a masked input until Save hands it to
+//! The Git credential panel, the right-hand side panel of the Cloud settings dialog (Docker
+//! Sandbox tab): pick a saved HTTPS profile or add one (GitHub or GitLab.com), check its read
+//! access and remove it. It is not a modal: it renders inside the dialog, which stays the only
+//! modal, and the dialog owns Escape and focus; Escape closes, in order, the "Confirm remove"
+//! question and then the panel itself. `model` holds the decisions. The access token lives only in a masked input until Save hands it to
 //! the encrypted store, then the input is emptied; it is never echoed back or logged. Check
 //! access runs on the background executor.
 mod model;
@@ -15,8 +17,8 @@ use crate::{
     theme::*,
 };
 use gpui::{
-    AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, KeyDownEvent,
-    Render, Role, Window, div, prelude::*, px, rgb,
+    AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, Render, Role,
+    Window, div, prelude::*, px, rgb,
 };
 use model::CheckLine;
 use monocode_core::git_credentials::{
@@ -26,8 +28,10 @@ use std::sync::Arc;
 
 pub(crate) enum Event {
     Close,
-    /// A profile was saved or picked: the Docker dialog selects it.
+    /// A profile was saved or picked: Cloud settings selects it.
     Chosen(String),
+    /// A profile was removed: the saved list the dialog shows is out of date.
+    Removed,
 }
 
 #[derive(Clone)]
@@ -36,7 +40,7 @@ pub(crate) struct Env {
     pub git: Arc<dyn GitRunner>,
 }
 
-pub(crate) struct GitCredentialDialog {
+pub(crate) struct GitCredentialPanel {
     /// The profile to show once the list has been read.
     pending_select: Option<String>,
     env: Env,
@@ -46,6 +50,8 @@ pub(crate) struct GitCredentialDialog {
     /// The profile shown; none while a new one is being added.
     selected: Option<String>,
     platform: GitPlatform,
+    /// The user picked the platform: the repository no longer decides it.
+    platform_picked: bool,
     label: Entity<Input>,
     username: Entity<Input>,
     token: Entity<Input>,
@@ -63,15 +69,15 @@ pub(crate) struct GitCredentialDialog {
     _events: Vec<gpui::Subscription>,
 }
 
-impl EventEmitter<Event> for GitCredentialDialog {}
+impl EventEmitter<Event> for GitCredentialPanel {}
 
-impl Focusable for GitCredentialDialog {
+impl Focusable for GitCredentialPanel {
     fn focus_handle(&self, _: &gpui::App) -> FocusHandle {
         self.focus.clone()
     }
 }
 
-impl GitCredentialDialog {
+impl GitCredentialPanel {
     pub(crate) fn new(
         project_name: String,
         repo_url: String,
@@ -104,6 +110,7 @@ impl GitCredentialDialog {
             profiles: Vec::new(),
             selected: None,
             platform,
+            platform_picked: false,
             label,
             username,
             token,
@@ -168,6 +175,58 @@ impl GitCredentialDialog {
         self.clear_token(cx);
     }
 
+    /// Escape: the "Confirm remove" question closes first. Returns whether something closed.
+    pub(crate) fn dismiss_transient(&mut self, cx: &mut Context<Self>) -> bool {
+        let asked = std::mem::take(&mut self.confirm_remove);
+        if asked {
+            cx.notify();
+        }
+        asked
+    }
+
+    /// The dialog's repository URL changed: a check made for the old one no longer applies.
+    pub(crate) fn set_repo_url(&mut self, repo_url: String, cx: &mut Context<Self>) {
+        if self.repo_url == repo_url {
+            return;
+        }
+        self.repo_url = repo_url;
+        // The default platform follows the repository host until the user picks one.
+        if !self.platform_picked
+            && let Ok((platform, _, _)) =
+                monocode_core::git_credentials::normalize_origin(&self.repo_url)
+        {
+            self.apply_platform(platform, cx);
+        }
+        self.generation += 1;
+        self.checking = false;
+        self.check = None;
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn confirm_remove_asked(&self) -> bool {
+        self.confirm_remove
+    }
+
+    #[cfg(test)]
+    pub(crate) fn typed(&self, cx: &gpui::App) -> (String, String) {
+        (
+            self.label.read(cx).content.to_string(),
+            self.token.read(cx).content.to_string(),
+        )
+    }
+
+    /// Where the keyboard goes when the panel opens: the first field of the new-credential
+    /// form, or the panel itself when a saved profile is shown (or about to be): that form
+    /// has no input, and a field that is not drawn cannot take focus.
+    pub(crate) fn focus_form(&self, window: &mut Window, cx: &mut gpui::App) {
+        if self.selected.is_some() || self.pending_select.is_some() {
+            window.focus(&self.focus, cx);
+        } else {
+            window.focus(&self.label.focus_handle(cx), cx);
+        }
+    }
+
     fn select(&mut self, id: Option<String>, cx: &mut Context<Self>) {
         self.selected = id;
         self.generation += 1;
@@ -180,6 +239,11 @@ impl GitCredentialDialog {
     }
 
     pub(crate) fn set_platform(&mut self, platform: GitPlatform, cx: &mut Context<Self>) {
+        self.platform_picked = true;
+        self.apply_platform(platform, cx);
+    }
+
+    fn apply_platform(&mut self, platform: GitPlatform, cx: &mut Context<Self>) {
         if self.platform == platform {
             return;
         }
@@ -330,7 +394,7 @@ impl GitCredentialDialog {
         .detach();
     }
 
-    fn remove(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn remove(&mut self, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
@@ -356,6 +420,7 @@ impl GitCredentialDialog {
                     Ok(()) => {
                         this.select(None, cx);
                         this.reload(cx);
+                        cx.emit(Event::Removed);
                     }
                     Err(message) => {
                         this.confirm_remove = false;
@@ -409,23 +474,6 @@ impl GitCredentialDialog {
                 .child(field_box("git-field-label", &self.label))
                 .into_any_element(),
             self.platform_row(cx),
-            labelled("Host")
-                .child(
-                    div()
-                        .id("git-host")
-                        .debug_selector(|| "git-host".into())
-                        .h(px(36.))
-                        .flex()
-                        .items_center()
-                        .px_3()
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(content(0.1))
-                        .text_size(px(13.))
-                        .text_color(content(0.6))
-                        .child(self.platform.host()),
-                )
-                .into_any_element(),
             labelled("Username")
                 .child(field_box("git-field-username", &self.username))
                 .child(muted(model::username_hint(self.platform)))
@@ -444,9 +492,8 @@ fn git_credentials_platform_of(repo_url: &str) -> GitPlatform {
         .map_or(GitPlatform::GitHub, |(platform, _, _)| platform)
 }
 
-impl Render for GitCredentialDialog {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let height = window.viewport_size().height.as_f32() - 34.;
+impl Render for GitCredentialPanel {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let busy = self.busy;
         let checking = self.checking;
         let existing = self.selected.is_some();
@@ -471,7 +518,8 @@ impl Render for GitCredentialDialog {
             .on_click(cx.listener(|this, _, _, cx| this.select(None, cx))),
         );
         let mut body = div()
-            .id("git-dialog-body")
+            .id("git-panel-body")
+            .flex_1()
             .min_h_0()
             .overflow_y_scroll()
             .flex()
@@ -548,7 +596,7 @@ impl Render for GitCredentialDialog {
             .child(
                 actions
                     .child(
-                        modal::ghost_button("git-cancel", "Cancel")
+                        modal::ghost_button("git-cancel", "Close")
                             .debug_selector(|| "git-cancel".into())
                             .cursor_pointer()
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::Close))),
@@ -569,24 +617,17 @@ impl Render for GitCredentialDialog {
                     ),
             );
         div()
-            .id("git-credential-dialog")
-            .debug_selector(|| "git-credential-dialog".into())
-            .role(Role::Dialog)
+            .id("git-credential-panel")
+            .debug_selector(|| "git-credential-panel".into())
+            .role(Role::Group)
             .aria_label("Git credential")
             .track_focus(&self.focus)
             .relative()
+            .size_full()
             .min_h_0()
-            .max_h(px(height))
             .flex()
             .flex_col()
             .text_color(content(1.))
-            .on_key_down(cx.listener(|_, event: &KeyDownEvent, window, cx| {
-                if event.keystroke.key == "escape" {
-                    cx.emit(Event::Close);
-                    window.prevent_default();
-                    cx.stop_propagation();
-                }
-            }))
             .child(
                 div()
                     .flex_shrink_0()

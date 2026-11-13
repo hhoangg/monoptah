@@ -14,6 +14,7 @@ pub mod context;
 pub mod contributors;
 pub mod desktop_preferences;
 pub mod diff;
+pub mod docker_accounts;
 pub mod external_editor;
 pub mod files;
 pub mod follow_up;

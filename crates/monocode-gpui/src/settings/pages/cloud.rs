@@ -29,6 +29,8 @@ pub(crate) enum Load {
 pub(in crate::settings) struct CloudState {
     tab: KitTab,
     pub(in crate::settings) load: Load,
+    pub(in crate::settings) backends: super::cloud_backends::BackendsState,
+    pub(in crate::settings) docker: super::cloud_docker::DockerState,
     /// Counts answers so a slow scan of the previous project is dropped.
     generation: u64,
     task: Option<Task<()>>,
@@ -41,6 +43,8 @@ impl Default for CloudState {
         Self {
             tab: KitTab::Skills,
             load: Load::Idle,
+            backends: Default::default(),
+            docker: Default::default(),
             generation: 0,
             task: None,
             notice_open: false,
@@ -55,6 +59,8 @@ fn tab_key(tab: KitTab) -> &'static str {
 impl SettingsView {
     /// Reads the inventory of the selected project on a worker thread.
     pub(in crate::settings) fn refresh_cloud(&mut self, cx: &mut Context<Self>) {
+        self.refresh_backends(cx);
+        self.refresh_docker(cx);
         let project = self.selected_project.clone();
         self.cloud.generation += 1;
         let generation = self.cloud.generation;
@@ -117,9 +123,10 @@ impl SettingsView {
 
     pub(super) fn cloud_page(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let kit = self.prefs.cloud_kit.clone();
-        let mut page = vec![self.group(
+        let mut page = vec![self.backends_group(cx), self.docker_group(cx)];
+        page.push(self.group(
             Some("cloud-kit"),
-            true,
+            false,
             "Claude setup",
             Some(
                 "Copy your skills, MCP servers, plugins and instructions to new cloud workspaces, so Claude works there the way it does here."
@@ -140,7 +147,7 @@ impl SettingsView {
                     |this, on, cx| this.set_kit_enabled(on, cx),
                 )],
             )],
-        )];
+        ));
         if self.cloud.notice_open {
             page.push(self.kit_notice(cx));
         }

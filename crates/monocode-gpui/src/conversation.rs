@@ -189,9 +189,11 @@ pub(crate) struct Conversation {
     cloud_badge: Option<crate::cloud_mark::CloudBadge>,
     /// Lists the machine types of a project's repository for the codespace panel.
     machine_loader: Option<cloud_target::MachineLoader>,
-    cloud_anchors: [AnchorSlot; 4],
-    /// The branch rows of the cloud panel (Base branch, Branch), indexed by `CloudRefField`.
-    cloud_ref_anchors: [AnchorSlot; 2],
+    cloud_anchors: [AnchorSlot; 6],
+    /// The branch rows of the cloud panel (Base branch), indexed by `CloudRefField`.
+    cloud_ref_anchors: [AnchorSlot; 1],
+    /// Lists the saved Docker accounts for the sandbox panel (off the UI thread).
+    docker_accounts_loader: cloud_target::DockerAccountsLoader,
     /// The open branch picker of one of those rows.
     cloud_picker: Option<cloud_branches::CloudRefPicker>,
     /// Where the cloud panel's branch lists come from.
@@ -204,6 +206,9 @@ pub(crate) struct Conversation {
     docker_config_cache: std::cell::RefCell<
         Option<Option<monocode_core::cloud_sessions::docker_config::DockerProjectConfig>>,
     >,
+    /// What the Workspace menu shows about the project's cloud setup, read once (see
+    /// `cloud_target.rs`).
+    cloud_menu_cache: std::cell::RefCell<Option<cloud_target::CloudMenuFacts>>,
     _cloud_events: Subscription,
     remote_plans: remote_plans::State,
     store: Database,
@@ -827,11 +832,13 @@ impl Conversation {
             machine_loader: None,
             cloud_anchors: Default::default(),
             cloud_ref_anchors: Default::default(),
+            docker_accounts_loader: cloud_target::system_docker_accounts(),
             cloud_picker: None,
             branch_source: Default::default(),
             cloud_draft: None,
             cloud_request_seq: 0,
             docker_config_cache: Default::default(),
+            cloud_menu_cache: Default::default(),
             _cloud_events: cloud_events,
             remote_plans: remote_plans::State::default(),
         }
@@ -2698,8 +2705,6 @@ impl Conversation {
                 ("Switch account", items, 250., MenuStyle::Explorer)
             }
             ComposerMenu::Workspace => {
-                // The setup dialog may have saved a config since the last open.
-                self.forget_docker_config();
                 let picker = cx.new(|cx| {
                     GitPicker::new(
                         self.summary.cwd.clone().into(),

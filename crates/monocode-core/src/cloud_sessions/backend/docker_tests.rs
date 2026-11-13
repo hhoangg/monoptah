@@ -240,6 +240,7 @@ fn target() -> SandboxTarget {
         relay_port: 47200,
         config: None,
         mode: Default::default(),
+        docker_account: None,
     }
 }
 fn backend(shell: &Arc<Container>) -> DockerBackend {

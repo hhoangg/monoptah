@@ -371,9 +371,14 @@ fn the_new_session_flow_begins_a_start_and_lists_a_pending_claude_session() {
     let host = Arc::new(FakeHost::default());
     let store = memory_store();
     let svc = service(&gh, &host, store.clone());
-    let target =
-        cloud_picker::target_for(CodespaceChoice::New, " feature ", Some("basicLinux32gb"))
-            .unwrap();
+    let target = cloud_picker::target_for(
+        CodespaceChoice::New,
+        " feature ",
+        Some("basicLinux32gb"),
+        None,
+        false,
+    )
+    .unwrap();
     assert_eq!(target.branch.as_deref(), Some("feature"));
     let (summary, record) = cloud_picker::begin_cloud_start(&svc, &local, target, true).unwrap();
     assert_eq!(summary.provider, "claude");
@@ -403,12 +408,18 @@ fn an_existing_codespace_is_used_without_creating_and_a_new_one_needs_a_branch()
     let host = Arc::new(FakeHost::default());
     host.machines.lock().unwrap().push(machine("octo-abc"));
     let svc = service(&gh, &host, memory_store());
-    let target =
-        cloud_picker::target_for(CodespaceChoice::Named("octo-abc".into()), "", None).unwrap();
+    let target = cloud_picker::target_for(
+        CodespaceChoice::Named("octo-abc".into()),
+        "",
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     cloud_picker::begin_cloud_start(&svc, &local, target, true).unwrap();
     assert!(!gh.calls().iter().any(|c| c.contains("--method POST")));
     assert_eq!(
-        cloud_picker::target_for(CodespaceChoice::New, "  ", None).unwrap_err(),
+        cloud_picker::target_for(CodespaceChoice::New, "  ", None, None, false).unwrap_err(),
         "Enter a branch for the new codespace."
     );
 }
@@ -2289,7 +2300,8 @@ fn begin(
     checkout: &Checkout,
 ) -> (Session, monocode_core::cloud_sessions::StartRecord) {
     let local = checkout.path().to_string_lossy().into_owned();
-    let target = cloud_picker::target_for(CodespaceChoice::New, "feature", None).unwrap();
+    let target =
+        cloud_picker::target_for(CodespaceChoice::New, "feature", None, None, false).unwrap();
     cloud_picker::begin_cloud_start(svc, &local, target, true).unwrap()
 }
 
@@ -2769,6 +2781,7 @@ fn sandbox_machine() -> Machine {
             relay_port: 47200,
             config: None,
             mode: Default::default(),
+            docker_account: None,
         }),
     }
 }
@@ -3247,6 +3260,12 @@ fn a_sandbox_terminal_runs_ssh_into_the_container_and_a_missing_connection_says_
             assert!(remote.contains("/home/agent/widgets"), "{remote}");
             assert!(remote.ends_with("-- bash -l"), "{remote}");
             assert!(spec.env_set.iter().any(|(key, _)| key == "PATH"));
+            // No Docker account on this sandbox: nothing is added to the machine's sign-in.
+            assert!(
+                spec.env_set
+                    .iter()
+                    .all(|(key, _)| key != "DOCKER_ACCESS_TOKEN")
+            );
             assert_eq!(terminal.cwd, crate::terminal::home_cwd());
         })
         .unwrap();
@@ -3365,6 +3384,7 @@ fn the_sandbox_terminal_args_carry_the_connection_options_and_the_delete_note_is
     let args = cloud::sandbox_ssh_args(&monocode_core::cloud_sessions::SandboxTerminal {
         destination: "sbx_1abc@sbx_cloud".into(),
         remote: "devcontainer exec -- bash -l".into(),
+        docker_account: None,
     });
     let args: Vec<String> = args
         .iter()
@@ -3394,7 +3414,7 @@ fn the_sandbox_terminal_args_carry_the_connection_options_and_the_delete_note_is
     }]);
     assert_eq!(cloud::delete_start_note(&cs, true), None);
     assert_eq!(
-        cloud::remove_confirm_body("Fix  login", "box-1"),
+        cloud::remove_confirm_body("Fix  login", "box-1", None),
         "Remove \u{2018}Fix login\u{2019} from Monoptah? The sandbox box-1 keeps existing and keeps \
          costing money until you delete it (`sbx --cloud rm box-1`). Its conversation is not saved \
          on this computer."
@@ -4363,6 +4383,10 @@ fn the_create_request_turns_the_panel_picks_into_begin_start_arguments() {
         branch: "release/1".into(),
         config: None,
         machine: machine.map(str::to_owned),
+        idle_timeout_minutes: machine.map(|_| 120),
+        work_branch: machine.map(|_| "feature/x".into()),
+        account: None,
+        account_pinned: false,
         prompt: None,
         kit: false,
         request_id: 1,
@@ -4371,9 +4395,14 @@ fn the_create_request_turns_the_panel_picks_into_begin_start_arguments() {
         super::cloud_create::codespace_target(&request(Some("standardLinux32gb"))).unwrap();
     assert_eq!(picked.branch.as_deref(), Some("release/1"));
     assert_eq!(picked.machine.as_deref(), Some("standardLinux32gb"));
-    // No pick keeps the default machine, chosen later by the core.
+    // The session's idle stop and working branch reach the core target.
+    assert_eq!(picked.idle_timeout_minutes, Some(120));
+    assert_eq!(picked.work_branch.as_deref(), Some("feature/x"));
+    // No pick keeps the project's machine, idle stop and branch, chosen later by the core.
     let default = super::cloud_create::codespace_target(&request(None)).unwrap();
     assert_eq!(default.machine, None);
+    assert_eq!(default.idle_timeout_minutes, None);
+    assert_eq!(default.work_branch, None);
 }
 
 #[gpui::test]
@@ -5066,4 +5095,601 @@ fn a_cloud_session_is_marked_beside_its_title_and_a_local_one_is_not(cx: &mut Te
             );
         })
         .unwrap();
+}
+
+#[test]
+fn a_sandbox_terminal_environment_adds_a_token_only_for_a_docker_account() {
+    let terminal = |docker_account: Option<&str>| monocode_core::cloud_sessions::SandboxTerminal {
+        destination: "sbx_1abc@sbx_cloud".into(),
+        remote: "devcontainer exec -- bash -l".into(),
+        docker_account: docker_account.map(str::to_owned),
+    };
+    let plain = cloud::sandbox_terminal_env(&terminal(None)).unwrap();
+    assert_eq!(plain.plain.len(), 1);
+    assert_eq!(plain.plain[0].0, "PATH");
+    assert!(plain.secret.is_empty());
+    // An account that cannot produce a token (none is installed in this test) is an error
+    // that opens no terminal, not a terminal on the machine's sign-in.
+    let _none = FakeAccounts::uninstalled();
+    let error = cloud::sandbox_terminal_env(&terminal(Some("acct-1")))
+        .err()
+        .unwrap();
+    assert!(
+        error.contains("Docker accounts are not available"),
+        "{error}"
+    );
+    assert!(!error.contains("sbx login"), "{error}");
+}
+
+/// A fake Docker Hub and a `DockerAccess` over a temp database, installed as the process-wide
+/// instance for as long as the value lives (the previous one is restored).
+struct FakeAccounts {
+    hub: Arc<FakeHub>,
+    account: String,
+    previous: Option<Arc<monocode_core::docker_accounts::DockerAccess>>,
+    dir: Option<std::path::PathBuf>,
+}
+#[derive(Default)]
+struct FakeHub {
+    calls: std::sync::atomic::AtomicUsize,
+    issued: std::sync::Mutex<Vec<String>>,
+}
+impl FakeHub {
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn issued(&self) -> Vec<String> {
+        self.issued.lock().unwrap().clone()
+    }
+}
+impl monocode_core::docker_accounts::DockerHub for FakeHub {
+    fn exchange(
+        &self,
+        docker_id: &str,
+        _pat: &str,
+    ) -> Result<monocode_core::git_credentials::Secret, monocode_core::docker_accounts::ExchangeError>
+    {
+        use base64::Engine;
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let b64 = |text: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text);
+        let jwt = format!(
+            "{}.{}.c2lnbmF0dXJl",
+            b64(r#"{"alg":"RS256"}"#),
+            b64(&format!(
+                r#"{{"sub":"{docker_id}","scope":"repo:read sandbox:use","exp":4000000000,"iat":1,"n":{n}}}"#
+            ))
+        );
+        self.issued.lock().unwrap().push(jwt.clone());
+        Ok(monocode_core::git_credentials::Secret::new(jwt))
+    }
+}
+impl FakeAccounts {
+    /// No process-wide instance at all.
+    fn uninstalled() -> Self {
+        Self {
+            hub: Arc::new(FakeHub::default()),
+            account: String::new(),
+            previous: monocode_core::docker_accounts::uninstall(),
+            dir: None,
+        }
+    }
+    /// One saved account, "alice", behind the fake hub.
+    fn install() -> Self {
+        use monocode_core::docker_accounts::{DockerAccess, DockerAccounts, system_clock};
+        let dir = std::env::temp_dir().join(format!(
+            "monoptah-fake-accounts-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = monocode_core::store::Store::open(&dir.join("monocode.db")).unwrap();
+        let hub = Arc::new(FakeHub::default());
+        let account = DockerAccounts::for_store(&store)
+            .unwrap()
+            .add(
+                "alice",
+                concat!("dckr_pat_", "exampleTokenValue1234567890"),
+                hub.as_ref(),
+            )
+            .unwrap()
+            .id;
+        let access = DockerAccess::for_store(&store, hub.clone(), system_clock()).unwrap();
+        let previous = monocode_core::docker_accounts::uninstall();
+        monocode_core::docker_accounts::install(Arc::new(access));
+        Self {
+            hub,
+            account,
+            previous,
+            dir: Some(dir),
+        }
+    }
+}
+impl Drop for FakeAccounts {
+    fn drop(&mut self) {
+        monocode_core::docker_accounts::uninstall();
+        if let Some(previous) = self.previous.take() {
+            monocode_core::docker_accounts::install(previous);
+        }
+        if let Some(dir) = &self.dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+#[gpui::test]
+fn a_docker_account_token_is_resolved_off_the_ui_thread_before_the_terminal_launches(
+    cx: &mut TestAppContext,
+) {
+    let accounts = FakeAccounts::install();
+    let (window, id, _) = shell_with_sandbox(cx, "running", CloudState::Available, true);
+    window
+        .update(cx, |shell, _, _| {
+            monocode_core::sandboxes::account::pin(
+                &locked(&shell.store).unwrap(),
+                SBX_NAME,
+                Some(&accounts.account),
+            )
+            .unwrap();
+        })
+        .unwrap();
+    let before = accounts.hub.calls();
+    let tabs = |shell: &Shell| {
+        shell
+            .terminals
+            .get(&shell.workspace.project)
+            .map_or(0, Vec::len)
+    };
+    window
+        .update(cx, |shell, window, cx| {
+            shell.workspace.active = Some(id);
+            shell.new_terminal(window, cx);
+            // The call returned without a Docker Hub exchange and without a terminal: the
+            // exchange runs on the background executor, not in this UI turn.
+            assert_eq!(accounts.hub.calls(), before, "no exchange on the UI thread");
+            assert_eq!(tabs(shell), 0);
+            assert!(shell.error.is_none(), "{:?}", shell.error);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            assert_eq!(
+                accounts.hub.calls(),
+                before + 1,
+                "exchanged once, in the background"
+            );
+            assert_eq!(tabs(shell), 1, "launched on the UI thread afterwards");
+            let terminal = shell.terminals[&shell.workspace.project][0].read(cx);
+            let spec = terminal.launched().expect("launched, not a login shell");
+            // The token is a secret variable, not a plain one, and never in argv.
+            let secret = spec
+                .secret_env
+                .iter()
+                .find(|(key, _)| key == "DOCKER_ACCESS_TOKEN")
+                .expect("the account's token");
+            assert!(accounts.hub.issued().contains(&secret.1));
+            assert!(
+                spec.env_set
+                    .iter()
+                    .all(|(key, _)| key != "DOCKER_ACCESS_TOKEN")
+            );
+            assert!(spec.env_set.iter().any(|(key, _)| key == "PATH"));
+            for arg in &spec.args {
+                assert!(!arg.to_string_lossy().contains(&secret.1));
+            }
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_sandbox_terminal_finished_after_a_project_switch_joins_its_own_project_unfocused(
+    cx: &mut TestAppContext,
+) {
+    let accounts = FakeAccounts::install();
+    let (window, id, _) = shell_with_sandbox(cx, "running", CloudState::Available, true);
+    let original = window
+        .update(cx, |shell, window, cx| {
+            monocode_core::sandboxes::account::pin(
+                &locked(&shell.store).unwrap(),
+                SBX_NAME,
+                Some(&accounts.account),
+            )
+            .unwrap();
+            shell.workspace.active = Some(id);
+            let original = shell.workspace.project.clone();
+            shell.new_terminal(window, cx);
+            // The user moves to another project while the token is being fetched.
+            shell.workspace.project = "/somewhere/else".into();
+            original
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, _| {
+            assert_eq!(shell.workspace.project, "/somewhere/else");
+            assert_eq!(
+                shell.terminals.get(&original).map_or(0, Vec::len),
+                1,
+                "the tab joined the project the session is in"
+            );
+            assert_eq!(
+                shell
+                    .workspace
+                    .docks
+                    .get(&original)
+                    .map_or(0, |d| d.terminals.len()),
+                1
+            );
+            assert_eq!(
+                shell.terminals.get("/somewhere/else").map_or(0, Vec::len),
+                0,
+                "nothing was added to the project now in view"
+            );
+            assert!(
+                !shell.workspace.docks.contains_key("/somewhere/else"),
+                "its dock was not touched or opened"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_docker_account_that_cannot_give_a_token_opens_no_terminal_and_says_why(
+    cx: &mut TestAppContext,
+) {
+    let _none = FakeAccounts::uninstalled();
+    let (window, id, _) = shell_with_sandbox(cx, "running", CloudState::Available, true);
+    window
+        .update(cx, |shell, window, cx| {
+            monocode_core::sandboxes::account::pin(
+                &locked(&shell.store).unwrap(),
+                SBX_NAME,
+                Some("acct-1"),
+            )
+            .unwrap();
+            shell.workspace.active = Some(id);
+            shell.new_terminal(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, _| {
+            assert_eq!(
+                shell
+                    .terminals
+                    .get(&shell.workspace.project)
+                    .map_or(0, Vec::len),
+                0
+            );
+            let error = shell.error.clone().expect("the reason");
+            assert!(
+                error.contains("Could not open a terminal in the sandbox")
+                    && error.contains("Docker accounts are not available"),
+                "{error}"
+            );
+            assert!(!error.contains("sbx login"), "{error}");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_sandbox_terminal_whose_ssh_exits_255_drops_the_accounts_cached_token(cx: &mut TestAppContext) {
+    let accounts = FakeAccounts::install();
+    let (window, id, _) = shell_with_sandbox(cx, "running", CloudState::Available, true);
+    window
+        .update(cx, |shell, window, cx| {
+            monocode_core::sandboxes::account::pin(
+                &locked(&shell.store).unwrap(),
+                SBX_NAME,
+                Some(&accounts.account),
+            )
+            .unwrap();
+            shell.workspace.active = Some(id);
+            shell.new_terminal(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let token = || {
+        monocode_core::docker_accounts::env_for(Some(&accounts.account))
+            .unwrap()
+            .unwrap()
+            .1
+            .as_str()
+            .to_owned()
+    };
+    let first = token();
+    // ssh's connection failure (255) ends the terminal and drops the cached JWT. (Other exit
+    // codes keep it: that is covered where the rule lives, in monocode-core.)
+    window
+        .update(cx, |shell, _, cx| {
+            let terminal = shell.terminals[&shell.workspace.project][0].clone();
+            terminal.update(cx, |t, cx| t.fake_exit(Some(255), cx));
+        })
+        .unwrap();
+    assert_ne!(token(), first, "the next terminal exchanges a fresh token");
+}
+
+#[test]
+fn removing_a_sandbox_session_locally_names_the_account_its_delete_command_needs() {
+    assert_eq!(
+        cloud::remove_confirm_body("Fix login", "box-1", Some("Docker account alice")),
+        "Remove \u{2018}Fix login\u{2019} from Monoptah? The sandbox box-1 keeps existing and keeps \
+         costing money until you delete it (`sbx --cloud rm box-1`, which must run with the token of \
+         Docker account alice). Its conversation is not saved on this computer."
+    );
+}
+
+// ----------------------------------------------------------- "Existing instance..." (T7 review)
+
+#[gpui::test]
+fn existing_instance_opens_the_codespace_picker_for_the_conversations_project(
+    cx: &mut TestAppContext,
+) {
+    let (window, _, _) = crate::shell::tests::window(cx);
+    let chat = window
+        .update(cx, |shell, _, cx| {
+            // The shell has another project open than the conversation's.
+            shell.workspace.project = "/work/elsewhere".into();
+            let (_, chat) = add_draft(shell, "/work/widgets", cx);
+            chat
+        })
+        .unwrap();
+    window
+        .update(cx, |_, _, cx| {
+            chat.update(cx, |chat, cx| {
+                assert!(chat.cloud_menu_choice("workspace:cloud-existing", cx));
+            })
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            assert_eq!(
+                shell.codespace_picker_project(cx).as_deref(),
+                Some("/work/widgets")
+            );
+            assert!(shell.sandbox_picker.is_none());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn existing_instance_for_a_sandbox_lists_the_projects_sandboxes_and_starts_on_the_one_picked(
+    cx: &mut TestAppContext,
+) {
+    use gpui::VisualTestContext;
+    use monocode_core::cloud_sessions::docker_config::{self, DockerProjectConfig};
+    let (window, _, _) = crate::shell::tests::window(cx);
+    let sbx = FakeSbx::new("running");
+    let (before, chat) = window
+        .update(cx, |shell, _, cx| {
+            shell.cloud = Arc::new(sandbox_service(&sbx, false, shell.store.clone()));
+            shell.remote_refresh_stub = Some(Ok(()));
+            shell.workspace.project = "/work/elsewhere".into();
+            // A session of the project already runs in a sandbox.
+            let before = add_sandbox_session(&shell.store, "/work/widgets");
+            let config = DockerProjectConfig {
+                repo_url: "https://github.com/octo/widgets.git".into(),
+                ..Default::default()
+            };
+            docker_config::save(&locked(&shell.store).unwrap(), "/work/widgets", &config).unwrap();
+            let (_, chat) = add_draft(shell, "/work/widgets", cx);
+            (before, chat)
+        })
+        .unwrap();
+    window
+        .update(cx, |_, _, cx| {
+            chat.update(cx, |chat, cx| {
+                // The project's default is the only configured backend: Docker Sandbox.
+                assert!(chat.cloud_menu_choice("workspace:cloud-existing", cx));
+            })
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.refresh().unwrap();
+    // The list is the store's (sbx is not asked).
+    window
+        .update(cx, |shell, _, cx| {
+            assert_eq!(
+                shell.sandbox_picker_names(cx),
+                Some(vec![SBX_NAME.to_owned()])
+            );
+            assert!(shell.codespace_picker.is_none());
+        })
+        .unwrap();
+    assert!(sbx.calls().is_empty(), "{:?}", sbx.calls());
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    let row = visual.debug_bounds("sandbox-row-0").expect("a row");
+    visual.simulate_click(row.center(), Default::default());
+    visual.run_until_parked();
+    window
+        .update(cx, |shell, _, _| {
+            assert!(shell.sandbox_picker.is_none());
+            // A second session of the project now runs in that sandbox, and it is open.
+            let store = locked(&shell.store).unwrap();
+            let on_sandbox: Vec<_> = store
+                .cloud_sessions("/work/widgets")
+                .unwrap()
+                .into_iter()
+                .filter(|s| s.project.cloud() == Some(CloudRef::sandbox(SBX_NAME)))
+                .collect();
+            assert_eq!(on_sandbox.len(), 2);
+            let new = on_sandbox
+                .iter()
+                .map(|s| s.summary.id)
+                .find(|id| *id != before)
+                .unwrap();
+            drop(store);
+            assert_eq!(shell.workspace.active, Some(new));
+            assert!(shell.sessions.contains_key(&new));
+            let mark = &shell.cloud_marks[&new];
+            assert_eq!(mark.codespace, SBX_NAME);
+            assert_eq!(mark.kind, CloudBackendKind::DockerSandbox);
+            assert_eq!(mark.local_project, "/work/widgets");
+        })
+        .unwrap();
+    // Nothing was created in Docker: only read-only sbx verbs may have run.
+    assert!(sbx.changes().is_empty(), "{:?}", sbx.calls());
+}
+
+#[gpui::test]
+fn escape_does_not_close_the_sandbox_picker_while_it_is_working(cx: &mut TestAppContext) {
+    use gpui::VisualTestContext;
+    let (window, _, _) = crate::shell::tests::window(cx);
+    let sbx = FakeSbx::new("running");
+    window
+        .update(cx, |shell, window, cx| {
+            shell.cloud = Arc::new(sandbox_service(&sbx, false, shell.store.clone()));
+            shell.open_sandbox_picker("/work/widgets".into(), window, cx);
+            shell.set_sandbox_picker_busy(true, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.refresh().unwrap();
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_keystrokes("escape");
+    window
+        .update(visual, |shell, _, cx| {
+            assert!(shell.sandbox_picker.is_some(), "busy: stays open");
+            shell.set_sandbox_picker_busy(false, cx);
+        })
+        .unwrap();
+    visual.simulate_keystrokes("escape");
+    window
+        .update(visual, |shell, _, _| {
+            assert!(shell.sandbox_picker.is_none())
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn escape_does_not_close_the_codespace_picker_while_it_is_working(cx: &mut TestAppContext) {
+    use gpui::VisualTestContext;
+    let (window, _, _) = crate::shell::tests::window(cx);
+    window
+        .update(cx, |shell, window, cx| {
+            shell.open_codespace_picker_for("/work/widgets".into(), window, cx);
+            shell.set_codespace_picker_busy(true, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.refresh().unwrap();
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_keystrokes("escape");
+    window
+        .update(visual, |shell, _, cx| {
+            assert!(shell.codespace_picker.is_some(), "busy: stays open");
+            shell.set_codespace_picker_busy(false, cx);
+        })
+        .unwrap();
+    visual.simulate_keystrokes("escape");
+    window
+        .update(visual, |shell, _, _| {
+            assert!(shell.codespace_picker.is_none())
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_sandbox_without_a_ready_session_is_listed_but_cannot_be_picked(cx: &mut TestAppContext) {
+    use gpui::VisualTestContext;
+    let (window, _, _) = crate::shell::tests::window(cx);
+    let sbx = FakeSbx::new("running");
+    window
+        .update(cx, |shell, window, cx| {
+            shell.cloud = Arc::new(sandbox_service(&sbx, false, shell.store.clone()));
+            let cloud = CloudRef::sandbox("still-starting");
+            let project = monocode_core::store::pending_cloud_project(
+                "/work/widgets",
+                &cloud,
+                "/home/agent/widgets",
+            );
+            locked(&shell.store)
+                .unwrap()
+                .create_pending_cloud_session("claude", project)
+                .unwrap();
+            shell.open_sandbox_picker("/work/widgets".into(), window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.refresh().unwrap();
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    let row = visual.debug_bounds("sandbox-row-0").expect("a row");
+    visual.simulate_click(row.center(), Default::default());
+    visual.run_until_parked();
+    window
+        .update(cx, |shell, _, _| {
+            // Still open, nothing attached.
+            assert!(shell.sandbox_picker.is_some());
+            assert_eq!(
+                locked(&shell.store)
+                    .unwrap()
+                    .cloud_sessions("/work/widgets")
+                    .unwrap()
+                    .len(),
+                1
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn saved_project_settings_and_changed_cloud_sessions_make_the_menu_read_again(
+    cx: &mut TestAppContext,
+) {
+    let (window, _, _) = crate::shell::tests::window(cx);
+    let chat = window
+        .update(cx, |shell, _, cx| add_draft(shell, "/work/widgets", cx).1)
+        .unwrap();
+    let cached = |cx: &mut TestAppContext| {
+        window
+            .update(cx, |_, _, cx| chat.read(cx).cloud_menu_is_cached())
+            .unwrap()
+    };
+    let read = |cx: &mut TestAppContext| {
+        window
+            .update(cx, |_, _, cx| {
+                // Opens the menu facts, like the Workspace menu does.
+                chat.update(cx, |chat, cx| {
+                    chat.cloud_menu_choice("workspace:cloud-existing", cx)
+                });
+            })
+            .unwrap();
+    };
+    read(cx);
+    assert!(cached(cx));
+    // The project's Cloud settings were saved.
+    window
+        .update(cx, |shell, _, cx| {
+            shell.cloud_settings_saved("/work/widgets", cx)
+        })
+        .unwrap();
+    assert!(!cached(cx));
+    // Another project's settings do not matter.
+    read(cx);
+    window
+        .update(cx, |shell, _, cx| {
+            shell.cloud_settings_saved("/work/other", cx)
+        })
+        .unwrap();
+    assert!(cached(cx));
+    // A cloud session came or went.
+    window
+        .update(cx, |shell, _, cx| {
+            let mut snapshot = cloud::Snapshot::default();
+            snapshot.marks.insert(
+                999,
+                CloudMark {
+                    local_project: "/work/widgets".into(),
+                    codespace: "octo-abc".into(),
+                    kind: CloudBackendKind::Codespaces,
+                },
+            );
+            shell.apply_cloud_snapshot(snapshot, cx)
+        })
+        .unwrap();
+    assert!(!cached(cx));
 }

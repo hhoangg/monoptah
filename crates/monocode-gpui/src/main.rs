@@ -14,14 +14,16 @@ mod attachment_tray;
 mod automations;
 mod changes;
 mod cloud_actions;
+mod cloud_checks;
 mod cloud_dialog_ui;
 mod cloud_kit_ui;
 mod cloud_mark;
 mod cloud_move_dialog;
+mod cloud_presets;
+mod cloud_settings;
 mod cloud_start_view;
 mod cloud_wake;
 mod codespace_pane;
-mod codespaces_dialog;
 mod composer_box;
 mod composer_completion;
 mod composer_motion;
@@ -32,7 +34,6 @@ mod conversation;
 #[cfg(debug_assertions)]
 mod dev_reload;
 mod diff_view;
-mod docker_dialog;
 mod document_lightbox;
 mod editor_analysis;
 mod editor_scrollbar;
@@ -40,12 +41,13 @@ mod editor_syntax;
 mod explorer;
 mod file_editor;
 mod file_icons;
+mod fix_terminal;
 mod fixtures;
 mod fonts;
 mod frame_log;
 mod fs_watch;
 mod git_cache;
-mod git_credential_dialog;
+mod git_credential_panel;
 mod git_gate;
 mod git_graph;
 mod git_picker;
@@ -370,6 +372,9 @@ fn main() {
             .unwrap_or(std::path::Path::new("."))
             .join("checkpoints"),
     );
+    // Docker accounts: every `sbx` and sandbox ssh of a project that names an account gets
+    // that account's token from here. Installed once, over this database's credentials.
+    monocode_core::docker_accounts::install_system(&db);
     let saved = db.ui_state().unwrap_or_else(|e| {
         eprintln!("Cannot read workspace settings: {e}");
         None

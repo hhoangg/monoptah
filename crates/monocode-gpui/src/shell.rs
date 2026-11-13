@@ -42,6 +42,7 @@ mod idle_agents;
 mod image_lightbox_tests;
 mod layout;
 mod live_agents;
+mod sandbox_picker;
 pub(crate) use app_commands::CLOUD_ARCHIVING;
 pub(crate) use cloud_app_archive::ArchiveFailure;
 pub(crate) use live_agents::live_elapsed;
@@ -58,8 +59,7 @@ mod pinned_tabs;
 mod project_rail;
 mod project_removal;
 pub(crate) use project_removal::FilesOutcome;
-mod codespaces;
-mod docker_sandbox;
+mod project_cloud;
 mod project_settings;
 mod provider_prompt;
 mod quick_composer;
@@ -667,8 +667,7 @@ pub(crate) struct Shell {
     /// Ticket id of the inbox item a session was started from, which Telegram questions name.
     session_tickets: HashMap<i64, String>,
     telegram: telegram::Telegram,
-    codespaces: Option<codespaces::OpenCodespaces>,
-    docker_sandbox: Option<docker_sandbox::OpenDocker>,
+    cloud_settings: Option<project_cloud::OpenProjectCloud>,
     /// The sidebar rails under orchestrators and /operator threads.
     rails: rails::Rails,
     usage_footer: Entity<UsageFooter>,
@@ -779,8 +778,14 @@ pub(crate) struct Shell {
     /// A cloud session whose archive waits for its dialog (opened on the next render).
     cloud_archive_request: Vec<i64>,
     codespace_picker: Option<cloud_picker::Open>,
+    /// "Existing instance..." of a Docker Sandbox.
+    sandbox_picker: Option<sandbox_picker::Open>,
     #[cfg(test)]
     cloud_create_hook: Option<cloud_create::CreateHook>,
+    /// Tests: how the remote refresh of every session added from now on answers (there is no
+    /// Host to ask, and an unanswered refresh is retried at once).
+    #[cfg(test)]
+    remote_refresh_stub: Option<Result<(), String>>,
     _cloud_clock: gpui::Task<()>,
     sessions: HashMap<i64, Entity<Conversation>>,
     /// Sessions that run as their provider's CLI. A session is in exactly one of
@@ -1191,8 +1196,7 @@ impl Shell {
             started_by: sidebar_metadata.started_by,
             session_tickets: HashMap::new(),
             telegram: telegram::Telegram::new(),
-            codespaces: None,
-            docker_sandbox: None,
+            cloud_settings: None,
             rails: Default::default(),
             usage_footer: cx.new(|cx| UsageFooter::new(active_kind, cx)),
             resources,
@@ -1263,8 +1267,11 @@ impl Shell {
             github_projects: HashMap::new(),
             #[cfg(test)]
             cloud_create_hook: None,
+            #[cfg(test)]
+            remote_refresh_stub: None,
             cloud_archive_request: Vec::new(),
             codespace_picker: None,
+            sandbox_picker: None,
             _cloud_clock: cloud_clock,
             sessions: HashMap::new(),
             tui_sessions: HashMap::new(),
@@ -1684,6 +1691,8 @@ impl Shell {
             if let Some(start) = self.cloud_start_snapshot(id) {
                 view.set_cloud_start(Some(start), cx);
             }
+            #[cfg(test)]
+            view.stub_remote_refresh(self.remote_refresh_stub.clone());
         });
         self.observations.push(cx.subscribe(
             &view,
@@ -1749,7 +1758,41 @@ impl Shell {
                 let path = event.0.clone();
                 cx.spawn(async move |this, cx| {
                     let _ = this.update_in(cx, |this, window, cx| {
-                        this.open_docker_dialog(path, window, cx)
+                        this.open_cloud_settings(
+                            path,
+                            Some(monocode_core::cloud_sessions::project_cloud::DefaultBackend::Sandbox),
+                            window,
+                            cx,
+                        )
+                    });
+                })
+                .detach();
+            },
+        ));
+        self.observations.push(cx.subscribe(
+            &view,
+            |_, _, event: &crate::conversation::cloud_target::OpenProjectCloudSettings, cx| {
+                let (path, backend) = (event.cwd.clone(), event.backend);
+                cx.spawn(async move |this, cx| {
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.open_cloud_settings(path, backend, window, cx)
+                    });
+                })
+                .detach();
+            },
+        ));
+        self.observations.push(cx.subscribe(
+            &view,
+            |_, _, event: &crate::conversation::cloud_target::OpenExistingInstance, cx| {
+                use monocode_core::cloud_sessions::project_cloud::DefaultBackend;
+                // The project of the conversation that asked, not the one open in the shell.
+                let (project, backend) = (event.cwd.clone(), event.backend);
+                cx.spawn(async move |this, cx| {
+                    let _ = this.update_in(cx, |this, window, cx| match backend {
+                        DefaultBackend::Codespace => {
+                            this.open_codespace_picker_for(project, window, cx)
+                        }
+                        DefaultBackend::Sandbox => this.open_sandbox_picker(project, window, cx),
                     });
                 })
                 .detach();
@@ -6213,12 +6256,8 @@ impl Shell {
                             .into(),
                     );
                     items.push(
-                        MenuAction::new("cloud-setup", "Cloud setup")
+                        MenuAction::new("cloud-settings", "Cloud settings…")
                             .icon("cloud-upload")
-                            .submenu(vec![
-                                MenuAction::new("codespaces", "Codespaces"),
-                                MenuAction::new("docker-sandbox", "Docker Sandbox"),
-                            ])
                             .into(),
                     );
                 }
@@ -6423,10 +6462,8 @@ impl Shell {
                     self.open_background_dialog(path, window, cx);
                 } else if action == "telegram" {
                     self.open_telegram_dialog(path, window, cx);
-                } else if action == "codespaces" {
-                    self.open_codespaces_dialog(path, window, cx);
-                } else if action == "docker-sandbox" {
-                    self.open_docker_dialog(path, window, cx);
+                } else if action == "cloud-settings" {
+                    self.open_cloud_settings(path, None, window, cx);
                 } else if action == "archive" {
                     self.archive_project(&path, window, cx);
                 } else if action == "delete" {
@@ -9675,8 +9712,17 @@ impl Render for Shell {
                     this.close_cloud_archive(window, cx);
                     return;
                 }
+                // A picker that is working (attaching) stays open; the key is still consumed.
                 if this.codespace_picker.is_some() {
-                    this.close_codespace_picker(window, cx);
+                    if !this.codespace_picker_busy(cx) {
+                        this.close_codespace_picker(window, cx);
+                    }
+                    return;
+                }
+                if this.sandbox_picker.is_some() {
+                    if !this.sandbox_picker_busy(cx) {
+                        this.close_sandbox_picker(window, cx);
+                    }
                     return;
                 }
                 // A dialog left from another project must not swallow the key.
@@ -9709,17 +9755,8 @@ impl Render for Shell {
                     this.close_telegram_topic(window, cx);
                     return;
                 }
-                if let Some(open) = &this.codespaces
-                    && open.view.read(cx).terminal_focused(window, cx)
-                {
-                    return;
-                }
-                if this.codespaces.is_some() {
-                    this.close_codespaces_dialog(window, cx);
-                    return;
-                }
-                if this.docker_sandbox.is_some() {
-                    this.docker_escape(window, cx);
+                if this.cloud_settings.is_some() {
+                    this.cloud_settings_escape(window, cx);
                     return;
                 }
                 if this.action_dialog.is_some() {
@@ -9948,15 +9985,15 @@ impl Render for Shell {
             .children(self.link_modal(window, cx))
             .children(self.telegram_modal(window, cx))
             .children(self.telegram_topic_modal(window, cx))
-            .children(self.codespaces_modal(window, cx))
-            .children(self.docker_modal(window, cx))
-            .children(self.git_credential_modal(window, cx))
+            .children(self.cloud_settings_modal(window, cx))
+            .children(self.fix_terminal_modal(window, cx))
             .children(self.cloud_move_modal(window, cx))
             .children(self.delete_modal(window, cx))
             .children(self.cloud_archive_modal(window, cx))
             .children(self.cloud_continue_modal(window, cx))
             .children(self.cloud_view_card(cx))
             .children(self.codespace_picker_modal(window, cx))
+            .children(self.sandbox_picker_modal(window, cx))
             .children(self.action_modal(window, cx))
             .children(self.resource_modal(window, cx))
             .children(self.quick_open_modal(window, cx))

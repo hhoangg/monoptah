@@ -178,6 +178,8 @@ impl Store {
             .map_err(|e| e.to_string())?;
         conn.execute_batch(crate::git_credentials::GIT_CREDENTIALS_TABLE)
             .map_err(|e| e.to_string())?;
+        conn.execute_batch(crate::docker_accounts::DOCKER_ACCOUNTS_TABLE)
+            .map_err(|e| e.to_string())?;
         conn.execute_batch(crate::mobile::identity_store::MOBILE_IDENTITY_TABLE)
             .map_err(|e| e.to_string())?;
         if let Some(dir) = path.parent() {
@@ -276,6 +278,17 @@ impl Store {
         }
 
         self.conn.execute("INSERT INTO native_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key,value])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    /// Deletes the setting `key` (no error when there is none).
+    pub fn delete_setting(&self, key: &str) -> Result<(), String> {
+        if self.shared.is_some() {
+            return self.shared_delete_setting(key);
+        }
+
+        self.conn
+            .execute("DELETE FROM native_settings WHERE key=?1", [key])
             .map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -1268,9 +1281,22 @@ impl Store {
         gh: &dyn crate::codespaces::GhRunner,
         host: &dyn crate::cloud_sessions::Host,
     ) -> Result<(), String> {
+        self.delete_with_remote_known(id, gh, host, None)
+    }
+
+    /// [`Self::delete_with_remote`] where the caller already asked whether the session's
+    /// Docker sandbox still exists (`Some`), so no `sbx` call (and no Docker Hub exchange)
+    /// runs while the caller holds the store. `None` asks here, as before.
+    pub fn delete_with_remote_known(
+        &mut self,
+        id: i64,
+        gh: &dyn crate::codespaces::GhRunner,
+        host: &dyn crate::cloud_sessions::Host,
+        sandbox_exists: Option<bool>,
+    ) -> Result<(), String> {
         self.delete_using(id, |store| {
             if store.remote_session(id)?.is_some() {
-                store.delete_remote_session_with(id, gh, host)
+                store.delete_remote_session_known(id, gh, host, sandbox_exists)
             } else {
                 store.delete_rows(id)
             }

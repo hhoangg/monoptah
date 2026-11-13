@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 pub const OAUTH_SECRET_KEY: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 pub const DEFAULT_MACHINE: &str = "basicLinux32gb";
 pub const IDLE_TIMEOUT: &str = "30m";
+/// [`IDLE_TIMEOUT`] in minutes, for the REST API.
+pub const DEFAULT_IDLE_TIMEOUT_MINUTES: u32 = 30;
 pub const RETENTION_PERIOD: &str = "72h";
 pub const READY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 pub const READY_POLL: Duration = Duration::from_secs(5);
@@ -575,12 +577,60 @@ pub fn display_name_for(branch: &str) -> String {
         .collect()
 }
 
+/// Optional settings of a new codespace; every `None` keeps today's default (machine
+/// [`DEFAULT_MACHINE`], idle timeout [`IDLE_TIMEOUT`], the repository's default devcontainer).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CreateOptions<'a> {
+    pub machine: Option<&'a str>,
+    /// Minutes before an idle codespace stops (GitHub allows 5 to 240).
+    pub idle_timeout_minutes: Option<u32>,
+    /// Devcontainer config path relative to the repository root.
+    pub devcontainer_path: Option<&'a str>,
+}
+
+/// Lowest and highest idle timeout `gh` accepts, in minutes.
+pub const IDLE_TIMEOUT_MINUTES: std::ops::RangeInclusive<u32> = 5..=240;
+/// The message for an idle timeout outside [`IDLE_TIMEOUT_MINUTES`].
+pub const IDLE_TIMEOUT_ERROR: &str = "Stop when idle must be between 5 and 240 minutes.";
+
+impl<'a> CreateOptions<'a> {
+    /// The machine type to request.
+    fn machine(&self) -> &'a str {
+        self.machine
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .unwrap_or(DEFAULT_MACHINE)
+    }
+    /// The idle timeout, when it differs from the default; rejects values gh refuses.
+    fn idle(&self) -> Result<Option<u32>, String> {
+        match self.idle_timeout_minutes {
+            None => Ok(None),
+            Some(m) if IDLE_TIMEOUT_MINUTES.contains(&m) => Ok(Some(m)),
+            Some(_) => Err(IDLE_TIMEOUT_ERROR.into()),
+        }
+    }
+    /// The devcontainer path to request, when set; rejects anything but a relative path.
+    fn devcontainer(&self) -> Result<Option<&'a str>, String> {
+        match self
+            .devcontainer_path
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        {
+            None => Ok(None),
+            Some(p) if crate::cloud_sessions::docker_config::valid_devcontainer_path(p) => {
+                Ok(Some(p))
+            }
+            Some(_) => Err("The devcontainer path must be relative to the repository root".into()),
+        }
+    }
+}
+
 /// Create a codespace and return its name. Progress lines go to `on_progress`.
 pub fn create(
     runner: &dyn GhRunner,
     repo: &str,
     branch: &str,
-    machine: Option<&str>,
+    options: &CreateOptions,
     display: Option<&str>,
     on_progress: &mut dyn FnMut(&str),
 ) -> Result<String, String> {
@@ -588,14 +638,14 @@ pub fn create(
     if branch.trim().is_empty() {
         return Err("A branch is required to create a codespace".into());
     }
-    let machine = machine
-        .filter(|m| !m.trim().is_empty())
-        .unwrap_or(DEFAULT_MACHINE);
+    let machine = options.machine();
+    let idle = options.idle()?.map(|m| format!("{m}m"));
+    let devcontainer = options.devcontainer()?;
     let display = match display.filter(|d| !d.trim().is_empty()) {
         Some(d) => d.chars().take(DISPLAY_NAME_MAX).collect(),
         None => display_name_for(branch),
     };
-    let args = argv(&[
+    let mut args = argv(&[
         "codespace",
         "create",
         "--repo",
@@ -607,11 +657,14 @@ pub fn create(
         "--display-name",
         &display,
         "--idle-timeout",
-        IDLE_TIMEOUT,
+        idle.as_deref().unwrap_or(IDLE_TIMEOUT),
         "--retention-period",
         RETENTION_PERIOD,
         "--default-permissions",
     ]);
+    if let Some(path) = devcontainer {
+        args.extend(argv(&["--devcontainer-path", path]));
+    }
     let out = runner.run_streaming(&args, on_progress)?;
     if !out.success {
         return Err(failure(&args, &out));
@@ -650,22 +703,22 @@ pub fn create_started(
     runner: &dyn GhRunner,
     repo: &str,
     branch: &str,
-    machine: Option<&str>,
+    options: &CreateOptions,
     display: Option<&str>,
 ) -> Result<StartedCodespace, String> {
     valid_repo(repo)?;
     if branch.trim().is_empty() {
         return Err("A branch is required to create a codespace".into());
     }
-    let machine = machine
-        .filter(|m| !m.trim().is_empty())
-        .unwrap_or(DEFAULT_MACHINE);
+    let machine = options.machine();
+    let idle = options.idle()?.unwrap_or(DEFAULT_IDLE_TIMEOUT_MINUTES);
+    let devcontainer = options.devcontainer()?;
     let display: String = match display.filter(|d| !d.trim().is_empty()) {
         Some(d) => d.chars().take(DISPLAY_NAME_MAX).collect(),
         None => display_name_for(branch),
     };
     let path = format!("repos/{repo}/codespaces");
-    let args = argv(&[
+    let mut args = argv(&[
         "api",
         "--method",
         "POST",
@@ -677,12 +730,15 @@ pub fn create_started(
         "-f",
         &format!("display_name={display}"),
         "-F",
-        "idle_timeout_minutes=30",
+        &format!("idle_timeout_minutes={idle}"),
         "-F",
         "retention_period_minutes=4320",
         "-F",
         "multi_repo_permissions_opt_out=true",
     ]);
+    if let Some(path) = devcontainer {
+        args.extend(argv(&["-f", &format!("devcontainer_path={path}")]));
+    }
     let out = runner.run(&args, None)?;
     if !out.success {
         return Err(failure(&args, &out));
@@ -1151,6 +1207,17 @@ pub struct MachineType {
     pub storage_in_bytes: u64,
     pub memory_in_bytes: u64,
     pub cpus: u32,
+}
+
+/// The machine a new codespace starts on when the user does not choose: `preferred` (the
+/// project's machine) when the repository offers it, else [`DEFAULT_MACHINE`], else the first.
+pub fn default_machine(machines: &[MachineType], preferred: Option<&str>) -> Option<String> {
+    machines
+        .iter()
+        .find(|m| Some(m.name.as_str()) == preferred)
+        .or_else(|| machines.iter().find(|m| m.name == DEFAULT_MACHINE))
+        .or_else(|| machines.first())
+        .map(|m| m.name.clone())
 }
 
 /// The REST API uses snake_case; accept both so tests and gh versions agree.

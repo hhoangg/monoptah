@@ -1,4 +1,4 @@
-//! What the Git credential dialog decides. The access token only ever passes through the
+//! What the Git credential panel decides. The access token only ever passes through the
 //! arguments of these functions: nothing here keeps it, and every message that could echo it
 //! is redacted first.
 use monocode_core::git_credentials::{

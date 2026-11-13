@@ -356,6 +356,30 @@ impl Store {
             &serde_json::to_string(&projects).map_err(|e| e.to_string())?,
         )?;
         crate::cloud_sessions::startup::forget_cloud_starts(self, cloud)?;
+        // The sandbox is gone: so is the record of the Docker account it lived in.
+        if cloud.kind == CloudBackendKind::DockerSandbox {
+            // A stale pin of a deleted sandbox is harmless, so a failure here is not an error.
+            let _ = crate::sandboxes::account::clear_pin(self, &cloud.name);
+        }
+        // The Claude account choice of the instance goes with it (a stale one is harmless
+        // too, the name is unique).
+        let _ = crate::cloud_sessions::claude_pin::clear(
+            self,
+            &match cloud.kind {
+                CloudBackendKind::DockerSandbox => {
+                    crate::cloud_sessions::claude_pin::sandbox_key(&cloud.name)
+                }
+                CloudBackendKind::Codespaces => {
+                    crate::cloud_sessions::claude_pin::codespace_key(&cloud.name)
+                }
+            },
+        );
+        if cloud.kind == CloudBackendKind::Codespaces {
+            let _ = crate::cloud_sessions::claude_pin::clear(
+                self,
+                &crate::cloud_sessions::claude_pin::delivered_key(&cloud.name),
+            );
+        }
         self.save_setting(
             SESSIONS,
             &serde_json::to_string(&sessions).map_err(|e| e.to_string())?,
@@ -889,6 +913,35 @@ impl Store {
         self.delete_remote_session_using(id, gh, &crate::sandboxes::SystemSbx, Some(host))
     }
 
+    /// [`Self::delete_remote_session_with`] when the caller already knows whether the
+    /// session's Docker sandbox exists (see `Store::delete_with_remote_known`).
+    pub(crate) fn delete_remote_session_known(
+        &self,
+        id: i64,
+        gh: &dyn crate::codespaces::GhRunner,
+        host: &dyn crate::cloud_sessions::Host,
+        sandbox_exists: Option<bool>,
+    ) -> Result<(), String> {
+        self.delete_remote_session_inner(
+            id,
+            gh,
+            &crate::sandboxes::SystemSbx,
+            Some(host),
+            sandbox_exists,
+        )
+    }
+
+    /// The name of the Docker sandbox session `id` lives in, `None` for any other session:
+    /// what a caller needs to ask `sbx ls` OUTSIDE the store lock.
+    /// A pending start or an unsent draft (no host conversation) is deleted locally without
+    /// asking `sbx`, so it has no such name.
+    pub fn sandbox_name_of_session(&self, id: i64) -> Option<String> {
+        let remote = self.remote_session(id).ok().flatten()?;
+        remote.session_id.as_ref()?;
+        let cloud = remote.project.cloud()?;
+        (cloud.kind == CloudBackendKind::DockerSandbox).then_some(cloud.name)
+    }
+
     /// [`Self::delete_remote_session_with`] with an injectable `sbx` boundary, for sessions
     /// that live in a Docker sandbox.
     #[cfg(test)]
@@ -909,6 +962,17 @@ impl Store {
         sbx: &dyn crate::sandboxes::SbxRunner,
         host: Option<&dyn crate::cloud_sessions::Host>,
     ) -> Result<(), String> {
+        self.delete_remote_session_inner(id, gh, sbx, host, None)
+    }
+
+    fn delete_remote_session_inner(
+        &self,
+        id: i64,
+        gh: &dyn crate::codespaces::GhRunner,
+        sbx: &dyn crate::sandboxes::SbxRunner,
+        host: Option<&dyn crate::cloud_sessions::Host>,
+        sandbox_exists: Option<bool>,
+    ) -> Result<(), String> {
         let remote = self
             .remote_session(id)?
             .ok_or("Remote session no longer exists")?;
@@ -922,12 +986,38 @@ impl Store {
         if let Some(cloud) = remote.project.cloud() {
             let exists = match cloud.kind {
                 CloudBackendKind::Codespaces => crate::codespaces::exists(gh, &cloud.name)?,
+                CloudBackendKind::DockerSandbox if sandbox_exists.is_some() => {
+                    sandbox_exists == Some(true)
+                }
                 CloudBackendKind::DockerSandbox => {
-                    crate::sandboxes::find_by_name(sbx, &cloud.name)?.is_some()
+                    // Under the account the sandbox lives in. `ls` under another one would
+                    // report "not found" and forget a sandbox that is still billing.
+                    if let Some(error) =
+                        crate::sandboxes::account::removed_account_error(self, &cloud.name)
+                    {
+                        return Err(error);
+                    }
+                    let account = crate::sandboxes::account::pinned(self, &cloud.name)?;
+                    crate::sandboxes::find_by_name(
+                        &crate::sandboxes::as_account(sbx, account.as_deref()),
+                        &cloud.name,
+                    )?
+                    .is_some()
                 }
             };
             if !exists {
-                return self.forget_cloud_session(id);
+                self.forget_cloud_session(id)?;
+                // The instance is gone for good: once no session refers to it any more, its
+                // pins (Docker account, Claude account, delivery marker) and project go too,
+                // or a removed sandbox would keep its Docker account in use.
+                let still_used = self
+                    .remote_sessions()?
+                    .values()
+                    .any(|s| s.project.cloud().as_ref() == Some(&cloud));
+                if !still_used {
+                    self.forget_cloud(&cloud)?;
+                }
+                return Ok(());
             }
         }
         if let Some(session_id) = &remote.session_id {
@@ -977,13 +1067,29 @@ impl Store {
             .project
             .cloud()
             .ok_or("This is not a cloud session.")?;
+        let account = (cloud.kind == CloudBackendKind::DockerSandbox)
+            .then(|| {
+                crate::sandboxes::account::pinned(self, &cloud.name)
+                    .ok()
+                    .flatten()
+            })
+            .flatten()
+            .map(|account| crate::sandboxes::account::describe(self, &account));
         self.forget_cloud_session(id)?;
-        Ok(format!(
-            "Removed from Monoptah. The {} {} still exists and keeps costing money until you delete it with `sbx --cloud rm {}`.",
-            cloud.noun(),
-            cloud.name,
-            cloud.name
-        ))
+        Ok(match account {
+            Some(account) => format!(
+                "Removed from Monoptah. The {} {} still exists and keeps costing money until you delete it with `sbx --cloud rm {}`. That command must run with the token of {account}: a sandbox is not visible to any other Docker account.",
+                cloud.noun(),
+                cloud.name,
+                cloud.name
+            ),
+            None => format!(
+                "Removed from Monoptah. The {} {} still exists and keeps costing money until you delete it with `sbx --cloud rm {}`.",
+                cloud.noun(),
+                cloud.name,
+                cloud.name
+            ),
+        })
     }
 }
 

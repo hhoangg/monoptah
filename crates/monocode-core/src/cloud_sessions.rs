@@ -376,6 +376,23 @@ pub struct Target {
     pub branch: Option<String>,
     /// Machine type for a new codespace (default `basicLinux32gb`).
     pub machine: Option<String>,
+    /// Minutes before an idle new codespace stops; `None` fills from the project's cloud
+    /// settings, then the default of 30.
+    pub idle_timeout_minutes: Option<u32>,
+    /// Devcontainer path for a new codespace; `None` fills from the project's cloud settings,
+    /// then the repository default.
+    pub devcontainer_path: Option<String>,
+    /// App Claude account of a per-session override; only read when
+    /// [`Self::claude_account_pinned`]. `None` there means "no account" (the Codespaces
+    /// secret) for this session.
+    pub claude_account: Option<String>,
+    /// This start carries an explicit per-session account (see [`claude_pin`]). Without it
+    /// the codespace follows the project's current choice.
+    pub claude_account_pinned: bool,
+    /// Working branch of a new codespace: when it differs from [`Self::branch`] it is created
+    /// in the codespace with `git switch -c` before the session opens. `None` or the same
+    /// name keeps the codespace on `branch`.
+    pub work_branch: Option<String>,
 }
 
 /// A ready remote project bound to a codespace.
@@ -407,6 +424,18 @@ pub struct CloudSession {
     pub session_id: Option<String>,
     pub running: bool,
     pub needs_input: bool,
+}
+
+/// An instance (codespace or sandbox) that sessions of a project run in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectInstance {
+    pub cloud: CloudRef,
+    /// Live (not archived) sessions of the project on it.
+    pub sessions: usize,
+    /// One of them is past its start, so another session can be attached.
+    pub ready: bool,
+    /// The most recent update among those sessions.
+    pub updated_at: u64,
 }
 
 /// A local session whose location is Cloud, as the sidebar needs it besides the
@@ -873,6 +902,11 @@ impl CloudSessions {
     }
     /// Registers the Docker sandbox backend over the real `sbx`, `ssh` and the app's own
     /// secret store. Nothing runs until a sandbox session is used.
+    ///
+    /// The Docker accounts (`sbx` and ssh get the JWT of a project's account from
+    /// [`crate::docker_accounts::shared`]) are NOT installed here: the app installs them once
+    /// at startup ([`crate::docker_accounts::install_system`]), so building this service over
+    /// a test database never puts the real Docker Hub exchange behind it.
     pub fn with_system_sandboxes(self, store: Database) -> Self {
         let secrets = Arc::new(docker_start::StoreSecrets::new(store));
         self.with_sandboxes(
@@ -899,6 +933,46 @@ impl CloudSessions {
         self.store
             .lock()
             .map_err(|_| "Native session store unavailable".into())
+    }
+    /// The Docker account sandbox `name` lives in: the one that created it (pinned per
+    /// sandbox name), not the project's current choice. `None` is the machine's `sbx login`,
+    /// also for a sandbox created before accounts existed.
+    ///
+    /// Locks the native store on a cache miss: call it WITHOUT holding the store guard. An
+    /// answer that could not be read is `None` here; [`Self::try_sandbox_account`] tells
+    /// that apart where it matters.
+    pub fn sandbox_account(&self, name: &str) -> Option<String> {
+        self.try_sandbox_account(name).ok().flatten()
+    }
+
+    /// [`Self::sandbox_account`], with `Err` when the account could not be read (it must not
+    /// be taken for the machine login, which would report a sandbox as gone).
+    pub fn try_sandbox_account(&self, name: &str) -> Result<Option<String>, String> {
+        match &self.sandbox {
+            Some(deps) => deps.backend.try_account_of(name),
+            None => {
+                let store = self.store()?;
+                crate::sandboxes::account::pinned(&store, name)
+            }
+        }
+    }
+
+    /// How to name the Docker account of sandbox `name` to the user (its Docker ID), or
+    /// `None` when the sandbox uses the machine login.
+    pub fn sandbox_account_label(&self, name: &str) -> Option<String> {
+        let account = self.sandbox_account(name)?;
+        let store = self.store().ok()?;
+        Some(crate::sandboxes::account::describe(&store, &account))
+    }
+
+    /// The codespace part of the project's cloud settings; the defaults when none is saved
+    /// or the saved settings cannot be read (a start then behaves as before the settings
+    /// existed).
+    pub fn codespace_project_config(
+        &self,
+        local_cwd: &str,
+    ) -> project_cloud::CodespaceProjectConfig {
+        project_cloud::codespace_config_or_default(&self.store, local_cwd)
     }
     /// The registered backend for `kind`.
     pub(crate) fn backend(&self, kind: CloudBackendKind) -> Result<Arc<dyn CloudBackend>, String> {
@@ -954,6 +1028,9 @@ impl CloudSessions {
         if let CodespaceChoice::Named(name) = &target.codespace {
             self.refuse_while_cleaning(&CloudRef::codespace(name))?;
         }
+        // The Claude account of this codespace, validated before one is created for it.
+        let claude = self.codespace_start_pin(local_cwd, &target)?;
+        claude.validate(&*self.store()?)?;
         let resolved = self.resolve_codespace(local_cwd, target, progress)?;
         if resolved.created {
             *created = Some(resolved.name.clone());
@@ -969,6 +1046,8 @@ impl CloudSessions {
             )?;
         }
         self.invalidate(&resolved.name);
+        // Pinned before the project is opened, so its first pairing already uses the account.
+        claude.write(&*self.store()?, &resolved.name)?;
         let (binding, _) = open_project(
             &*self.backend(CloudBackendKind::Codespaces)?,
             &*self.host,
@@ -1014,19 +1093,30 @@ impl CloudSessions {
                     .filter(|b| !b.is_empty())
                     .ok_or("A branch is required to create a codespace")?;
                 progress("Creating codespace");
-                let started = codespaces::create_started(
-                    &*self.gh,
-                    &repo,
-                    branch,
-                    target.machine.as_deref(),
-                    None,
-                )?;
-                let machine = target
-                    .machine
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|m| !m.is_empty())
-                    .unwrap_or(codespaces::DEFAULT_MACHINE);
+                // Whatever the caller left unset comes from the project's cloud settings.
+                let project = self.codespace_project_config(local_cwd);
+                // A blank target value counts as unset, so it falls back to the project's.
+                let set = |value: &Option<String>| {
+                    value
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_owned)
+                };
+                let machine = set(&target.machine).or_else(|| set(&project.machine));
+                let devcontainer = set(&target.devcontainer_path)
+                    .or_else(|| set(&Some(project.devcontainer_path.clone())));
+                let options = codespaces::CreateOptions {
+                    machine: machine.as_deref(),
+                    idle_timeout_minutes: Some(
+                        target
+                            .idle_timeout_minutes
+                            .unwrap_or(project.idle_timeout_minutes),
+                    ),
+                    devcontainer_path: devcontainer.as_deref(),
+                };
+                let started = codespaces::create_started(&*self.gh, &repo, branch, &options, None)?;
+                let machine = machine.unwrap_or_else(|| codespaces::DEFAULT_MACHINE.to_owned());
                 Ok(ResolvedCodespace {
                     name: started.name,
                     display: codespaces::display_name_for(branch),
@@ -1036,7 +1126,7 @@ impl CloudSessions {
                     web_url: started.web_url,
                     state: started.state,
                     branch: Some(branch.to_string()),
-                    machine: Some(machine.to_string()),
+                    machine: Some(machine),
                 })
             }
             CodespaceChoice::Named(name) => {
@@ -1216,6 +1306,37 @@ impl CloudSessions {
                 std::cmp::Reverse(s.summary.id),
             )
         });
+        Ok(found)
+    }
+
+    /// The instances of `kind` that the project's sessions run in, most recently used first,
+    /// each once. Reads the store only (no gh or sbx call), so the state of an instance is not
+    /// known here. Archived sessions do not count: an instance is only offered while a live
+    /// session of the project is on it (see [`Self::attach_session`]).
+    pub fn project_instances(
+        &self,
+        local_cwd: &str,
+        kind: CloudBackendKind,
+    ) -> Result<Vec<ProjectInstance>, String> {
+        let mut found: Vec<ProjectInstance> = Vec::new();
+        for session in self.cloud_sessions_for(local_cwd)? {
+            if session.cloud.kind != kind || session.summary.archived {
+                continue;
+            }
+            let ready = !crate::store::is_pending_cloud_environment(&session.environment_id);
+            match found.iter_mut().find(|i| i.cloud == session.cloud) {
+                Some(known) => {
+                    known.sessions += 1;
+                    known.ready |= ready;
+                }
+                None => found.push(ProjectInstance {
+                    cloud: session.cloud,
+                    sessions: 1,
+                    ready,
+                    updated_at: session.summary.updated_at,
+                }),
+            }
+        }
         Ok(found)
     }
 
@@ -1403,7 +1524,29 @@ impl CloudSessions {
     /// Delete one session through the normal store cleanup. A missing Codespace
     /// only loses this session's local record; live hosts must accept the delete.
     pub fn delete_session(&self, id: i64) -> Result<(), String> {
-        self.store()?.delete_with_remote(id, &*self.gh, &*self.host)
+        // A session in a Docker sandbox: ask whether the sandbox still exists BEFORE taking
+        // the store, as the account it lives in. That runs `sbx` (and may exchange a Docker
+        // Hub token), which must not happen while the store is held.
+        let probe = self.store()?.sandbox_name_of_session(id);
+        let exists = match probe {
+            Some(name) => {
+                let account = self.try_sandbox_account(&name)?;
+                let runner: Arc<dyn crate::sandboxes::SbxRunner> = match &self.sandbox {
+                    Some(deps) => deps.runner.clone(),
+                    None => Arc::new(crate::sandboxes::SystemSbx),
+                };
+                Some(
+                    crate::sandboxes::find_by_name(
+                        &crate::sandboxes::as_account(&*runner, account.as_deref()),
+                        &name,
+                    )?
+                    .is_some(),
+                )
+            }
+            None => None,
+        };
+        self.store()?
+            .delete_with_remote_known(id, &*self.gh, &*self.host, exists)
     }
 
     /// Fresh, read-only inventory check before an archive/delete can attempt a
@@ -1724,6 +1867,35 @@ pub struct SandboxTerminal {
     /// The single remote word: `devcontainer exec ... -- bash -l`, or `cd <workspace> && bash
     /// -l` for a sandbox without a devcontainer.
     pub remote: String,
+    /// The Docker account the sandbox lives in; `None` is the machine's `sbx login`. The
+    /// ssh needs its token in the environment: [`Self::env`].
+    pub docker_account: Option<String>,
+}
+
+impl SandboxTerminal {
+    /// The environment pairs the terminal's ssh must run with, resolved now (the JWT is
+    /// short-lived, so call this when the terminal is spawned, not when the menu opens).
+    /// Empty without an account. The token is in the environment only, never argv, and stays
+    /// in a [`Secret`](crate::git_credentials::Secret) (wiped on drop, never printed) until
+    /// the process environment is built.
+    ///
+    /// BLOCKS on Docker Hub when the account's JWT must be exchanged: call it on a worker,
+    /// never on the UI thread.
+    pub fn env(&self) -> Result<Vec<(String, crate::git_credentials::Secret)>, String> {
+        let pair = crate::docker_accounts::env_for(self.docker_account.as_deref())
+            .map_err(|e| e.to_string())?;
+        Ok(pair
+            .into_iter()
+            .map(|(name, token)| (name.to_owned(), token))
+            .collect())
+    }
+
+    /// The terminal's ssh ended with `code`: when that says the connection failed for the
+    /// sandbox's account (ssh's 255), its cached JWT is dropped so the next terminal gets a
+    /// fresh one. Returns whether it was dropped.
+    pub fn note_exit(&self, code: Option<i32>) -> bool {
+        crate::docker_accounts::invalidate_after_ssh_exit(self.docker_account.as_deref(), code)
+    }
 }
 
 /// The Host worktree a session runs in, as the store recorded it, unless that worktree was
@@ -1805,6 +1977,11 @@ impl CloudSessions {
         Ok(SandboxTerminal {
             destination: crate::sandboxes::ssh_destination(&target.id),
             remote: target.exec_in_container(&["bash", "-l"]),
+            // The pin follows its Docker ID to a re-added account; the machine record keeps
+            // the id it was paired with.
+            docker_account: self
+                .try_sandbox_account(&cloud.name)?
+                .or_else(|| target.docker_account.clone()),
         })
     }
 }
@@ -1982,6 +2159,7 @@ impl StartupSummary {
 }
 
 pub mod backend;
+pub mod claude_pin;
 pub mod claude_setup;
 pub mod docker_config;
 pub mod docker_start;
@@ -1992,6 +2170,8 @@ pub mod move_out;
 #[path = "cloud_sessions/move.rs"]
 pub mod move_session;
 pub mod move_ui;
+pub mod project_cloud;
+pub mod readiness;
 pub use backend::{CloudBackend, CloudBackendKind, CloudRef, CodespacesBackend};
 
 mod continue_local;
@@ -2010,6 +2190,8 @@ pub use startup::{
 };
 
 // These fixtures execute the Linux host scripts against local Unix paths.
+#[cfg(test)]
+mod claude_pin_tests;
 #[cfg(all(test, unix))]
 mod continue_tests;
 #[cfg(all(test, unix))]
@@ -2030,6 +2212,8 @@ mod move_out_tests;
 mod move_tests;
 #[cfg(test)]
 mod move_ui_tests;
+#[cfg(test)]
+mod project_cloud_tests;
 #[cfg(all(test, unix))]
 mod return_cleanup_tests;
 #[cfg(test)]

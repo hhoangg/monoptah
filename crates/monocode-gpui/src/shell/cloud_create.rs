@@ -10,13 +10,19 @@ use monocode_core::cloud_sessions::{
 };
 
 /// The target `begin_start` gets for a codespace request: the branch and the machine picked in
-/// the panel (`None` keeps the default machine).
+/// the panel (`None` keeps the project's machine).
 pub(super) fn codespace_target(request: &CloudCreate) -> Result<Target, String> {
-    cloud_picker::target_for(
+    let mut target = cloud_picker::target_for(
         CodespaceChoice::New,
         &request.branch,
         request.machine.as_deref(),
-    )
+        request.account.as_deref(),
+        request.account_pinned,
+    )?;
+    // The idle stop and the working branch are this session's own choices.
+    target.idle_timeout_minutes = request.idle_timeout_minutes;
+    target.work_branch = request.work_branch.clone();
+    Ok(target)
 }
 
 /// Creates the resource and the session for `request`. Blocking: call it on a worker.
@@ -37,13 +43,14 @@ pub(super) fn begin_cloud_create(
             let config = request
                 .config
                 .as_ref()
-                .ok_or("Set up Docker Sandbox for this project first.")?;
-            cloud.begin_sandbox_start_with_kit(
+                .ok_or("Set up Docker Sandbox in the project's Cloud settings first.")?;
+            cloud.begin_sandbox_start_pinned(
                 &request.project,
                 config,
                 &request.branch,
                 HARNESS,
                 request.kit,
+                request.account_pinned,
             )
         }
     }

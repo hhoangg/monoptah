@@ -50,6 +50,7 @@
 //!   `Running commands...`, `Running the postCreateCommand from Feature '...'...`,
 //!   `Finished configuring codespace.`, each prefixed `2026-11-07 04:01:54.456Z: `.
 use super::backend::{CloudBackendKind, CloudRef};
+use super::claude_pin;
 use super::docker_start::SandboxStart;
 use super::{
     created_note, require_claude, CloudBinding, CloudSessions, ResolvedCodespace, Target, WaitPlan,
@@ -319,6 +320,10 @@ pub struct StartRecord {
     /// for `kit: "none"`. It can only narrow the global setting (rule D11), never widen it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub kit_off: bool,
+    /// A branch to create in the new codespace (`git switch -c`) before the project opens.
+    /// Only set for a codespace this app created on a different base branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_branch: Option<String>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -354,6 +359,7 @@ impl StartRecord {
             track_ready: resolved.created,
             sandbox_start: None,
             kit_off: false,
+            work_branch: None,
         }
     }
     /// The backend this start runs on.
@@ -560,6 +566,61 @@ impl StartRecord {
         self.error = Some(error);
         self.finished_at = Some(at);
     }
+}
+
+/// The working branch a start asks for: `Some` only for a NEW codespace when the name differs
+/// from the branch the codespace is created on. An invalid name is refused (nothing is created).
+pub(super) fn work_branch_of(target: &Target) -> Result<Option<String>, String> {
+    if target.codespace != super::CodespaceChoice::New {
+        return Ok(None);
+    }
+    let Some(branch) = target
+        .work_branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+    else {
+        return Ok(None);
+    };
+    if !super::docker_config::valid_ref(branch) {
+        return Err("The branch name contains invalid characters.".into());
+    }
+    let base = target.branch.as_deref().map(str::trim).unwrap_or_default();
+    Ok((branch != base).then(|| branch.to_owned()))
+}
+
+/// The script that puts the codespace's checkout on `branch`: nothing when it is already
+/// there, a plain switch when the branch exists locally or on origin (it then tracks origin's),
+/// `git switch -c` otherwise. Safe to run twice.
+pub(super) fn work_branch_script(remote_cwd: &str, branch: &str) -> Result<String, String> {
+    codespaces::valid_remote_path(remote_cwd)?;
+    if !super::docker_config::valid_ref(branch) {
+        return Err("The branch name contains invalid characters.".into());
+    }
+    // A branch that already exists on origin is checked out (tracking it), never created again
+    // from the base: its commits would be lost. A single-branch clone has no remote ref for it
+    // yet (and no fetch refspec to track it by), so it is fetched and added first; a failed
+    // fetch (no such branch, offline) is not an error.
+    Ok(format!(
+        "set -e\ncd '{remote_cwd}'\n\
+         if [ \"$(git rev-parse --abbrev-ref HEAD)\" = '{branch}' ]; then exit 0; fi\n\
+         if git show-ref --verify --quiet 'refs/heads/{branch}'; then git switch '{branch}'; exit 0; fi\n\
+         if git fetch origin '{branch}:refs/remotes/origin/{branch}' >/dev/null 2>&1; \
+         then git remote set-branches --add origin '{branch}'; fi\n\
+         if git show-ref --verify --quiet 'refs/remotes/origin/{branch}'; \
+         then git switch -c '{branch}' --track 'origin/{branch}'; \
+         else git switch -c '{branch}'; fi\n"
+    ))
+}
+
+/// What the first save of a start record carries besides the codespace (so a crash cannot
+/// drop either).
+#[derive(Default)]
+pub(super) struct RecordOptions {
+    /// This start sends no Claude kit.
+    pub kit_off: bool,
+    /// The branch to create in the new codespace before the project opens.
+    pub work_branch: Option<String>,
 }
 
 /// What [`CloudSessions::run_start`] reports, in order.
@@ -846,17 +907,68 @@ impl CloudSessions {
         if let crate::cloud_sessions::CodespaceChoice::Named(name) = &target.codespace {
             self.refuse_while_cleaning(&CloudRef::codespace(name))?;
         }
+        // The Claude account of this codespace: this session's own choice, else the project's.
+        // An account that cannot be used fails here, before a codespace is created for it.
+        let claude = self.codespace_start_pin(local_cwd, &target)?;
+        claude.validate(&*self.store()?)?;
+        // A working branch that cannot be created fails here too, before anything is billed.
+        let work_branch = work_branch_of(&target)?;
         let began = self.now();
         let resolved = self.resolve_codespace(local_cwd, target, &mut |_| {})?;
         self.invalidate(&resolved.name);
-        self.record_start(local_cwd, harness, &resolved, began, !kit)
+        // Part of the one record save, so a crash cannot drop it. Only a codespace this app
+        // created is on the base branch and needs one.
+        let (session, record) = self
+            .record_start(
+                local_cwd,
+                harness,
+                &resolved,
+                began,
+                &claude,
+                RecordOptions {
+                    kit_off: !kit,
+                    work_branch: work_branch.filter(|_| resolved.created),
+                },
+            )
             .map_err(|error| {
                 if resolved.created {
                     created_note(&resolved.name, &error)
                 } else {
                     error
                 }
-            })
+            })?;
+        Ok((session, record))
+    }
+
+    /// Creates the working branch in the new codespace when the start asks for one. Runs the
+    /// idempotent [`work_branch_script`] over the codespace's ssh, so a retry after a failure
+    /// (or after the branch already exists) is safe.
+    fn switch_work_branch(
+        &self,
+        record: &mut StartRecord,
+        branch: &str,
+        events: &mut dyn FnMut(StartEvent),
+    ) -> Result<(), Stop> {
+        // The step the failure is shown under, until Connect starts for real.
+        record.start_step(StepKind::Connect, self.now());
+        // Its own detail, so the checklist says what Connect is doing.
+        record.step_mut(StepKind::Connect).detail = Some(format!("Creating branch {branch}"));
+        let line = format!("{PROGRESS_PREFIX}Creating branch {branch}");
+        record.push_log(&line);
+        events(StartEvent::Log(line));
+        self.publish(record, events);
+        let script = work_branch_script(&record.remote_cwd, branch)?;
+        let backend = self.backend(record.backend())?;
+        // The first ssh to a fresh codespace is slow (it may still be settling), so it gets
+        // the long timeout and one more try; the script is safe to run twice.
+        let run = || backend.run_script(&record.codespace, &script, true);
+        run().or_else(|_| run()).map_err(|error| {
+            Stop::Failed(format!(
+                "Could not create branch {branch} in the codespace: {error}"
+            ))
+        })?;
+        record.step_mut(StepKind::Connect).detail = None;
+        Ok(())
     }
     pub(super) fn record_start(
         &self,
@@ -864,8 +976,13 @@ impl CloudSessions {
         harness: &str,
         resolved: &ResolvedCodespace,
         began: u64,
-        kit_off: bool,
+        claude: &claude_pin::StartPin,
+        options: RecordOptions,
     ) -> Result<(Session, StartRecord), String> {
+        let RecordOptions {
+            kit_off,
+            work_branch,
+        } = options;
         let now = self.now();
         let store = self.store()?;
         // Again with the store held, see `refuse_while_cleaning`.
@@ -876,8 +993,29 @@ impl CloudSessions {
             &resolved.remote_cwd,
         );
         let session = store.create_pending_cloud_session(harness, project)?;
+        // Pinned before the codespace is paired, so no bootstrap of it can run under another
+        // account.
+        let pin_key = claude_pin::codespace_key(&resolved.name);
+        let previous_pin = claude_pin::read(&store, &pin_key);
+        // A failed start leaves neither the session nor the pin it wrote.
+        let undo = |store: &Store| {
+            let _ = store.forget_cloud_session(session.id);
+            if claude.keep.is_none() {
+                let _ = match &previous_pin {
+                    Some(previous) => claude_pin::write(store, &pin_key, previous),
+                    // The delivered marker is not the start's to undo: it says what the Host
+                    // of an existing codespace really runs under.
+                    None => claude_pin::clear(store, &pin_key),
+                };
+            }
+        };
+        if let Err(error) = claude.write(&store, &resolved.name) {
+            undo(&store);
+            return Err(error);
+        }
         let mut record = StartRecord::fresh(resolved, session.id, local_cwd, began);
         record.kit_off = kit_off;
+        record.work_branch = work_branch;
         let create = record.step_mut(StepKind::Create);
         if resolved.created {
             create.status = StepStatus::Done;
@@ -892,7 +1030,7 @@ impl CloudSessions {
         provision.started_at = Some(now);
         provision.detail = Some(resolved.state.clone());
         if let Err(error) = save_start_record(&store, &record) {
-            let _ = store.forget_cloud_session(session.id);
+            undo(&store);
             return Err(error);
         }
         Ok((session, record))
@@ -1045,6 +1183,12 @@ impl CloudSessions {
         self.invalidate(&name);
         if aborted() {
             return Err(Stop::Aborted);
+        }
+        if let Some(branch) = record.work_branch.clone() {
+            self.switch_work_branch(record, &branch, events)?;
+            if aborted() {
+                return Err(Stop::Aborted);
+            }
         }
 
         let (tx, rx) = mpsc::channel::<Msg>();

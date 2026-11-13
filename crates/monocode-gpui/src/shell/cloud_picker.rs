@@ -30,20 +30,13 @@ enum Picked {
     Cancel,
 }
 
-/// Machine selected for a new codespace when the user does not choose.
-fn default_machine(machines: &[MachineType]) -> Option<String> {
-    machines
-        .iter()
-        .find(|m| m.name == codespaces::DEFAULT_MACHINE)
-        .or_else(|| machines.first())
-        .map(|m| m.name.clone())
-}
-
 /// The target a picker choice turns into. A new codespace needs a branch.
 pub(super) fn target_for(
     choice: CodespaceChoice,
     branch: &str,
     machine: Option<&str>,
+    account: Option<&str>,
+    account_pinned: bool,
 ) -> Result<Target, String> {
     let branch = branch.trim();
     if choice == CodespaceChoice::New && branch.is_empty() {
@@ -52,6 +45,11 @@ pub(super) fn target_for(
     Ok(Target {
         branch: (!branch.is_empty()).then(|| branch.to_owned()),
         machine: machine.map(str::to_owned),
+        idle_timeout_minutes: None,
+        devcontainer_path: None,
+        claude_account: account.map(str::to_owned),
+        claude_account_pinned: account_pinned,
+        work_branch: None,
         codespace: choice,
     })
 }
@@ -131,8 +129,13 @@ impl CodespacePicker {
         local_project: String,
         cx: &mut Context<Self>,
     ) -> Self {
-        let current = crate::conversation::git_branch(std::path::Path::new(&local_project))
-            .unwrap_or_default();
+        let base = cloud.codespace_project_config(&local_project).base_ref;
+        let current = if base.is_empty() {
+            crate::conversation::git_branch(std::path::Path::new(&local_project))
+                .unwrap_or_default()
+        } else {
+            base
+        };
         let branch = cx.new(|cx| {
             let mut input = input::Input::field("Branch", "main", content(0.35), cx);
             input.set_font_size(12.);
@@ -180,7 +183,12 @@ impl CodespacePicker {
             let _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(listing) => {
-                        this.machine = default_machine(&listing.machines);
+                        let preferred = this
+                            .cloud
+                            .codespace_project_config(&this.local_project)
+                            .machine;
+                        this.machine =
+                            codespaces::default_machine(&listing.machines, preferred.as_deref());
                         this.listing = Some(listing);
                     }
                     Err(error) => this.error = error,
@@ -262,7 +270,7 @@ impl CodespacePicker {
             return;
         }
         let branch = self.branch.read(cx).content.to_string();
-        let target = match target_for(choice, &branch, self.machine.as_deref()) {
+        let target = match target_for(choice, &branch, self.machine.as_deref(), None, false) {
             Ok(target) => target,
             Err(error) => {
                 self.error = error;
@@ -566,19 +574,30 @@ impl Render for CodespacePicker {
 }
 
 impl Shell {
-    /// Whether the project can host a codespace: a local folder.
-    pub(super) fn can_open_codespace(&self) -> bool {
-        !self.workspace.project.starts_with("remote://")
+    /// Whether `project` can host a codespace: a local folder.
+    pub(super) fn can_open_codespace(&self, project: &str) -> bool {
+        !project.starts_with("remote://")
     }
 
     pub(super) fn open_codespace_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.can_open_codespace() || self.codespace_picker.is_some() {
+        let project = self.workspace.project.clone();
+        self.open_codespace_picker_for(project, window, cx);
+    }
+
+    /// The picker of the codespaces of `project`, which is the project of the conversation that
+    /// asked, not necessarily the one open in the shell.
+    pub(super) fn open_codespace_picker_for(
+        &mut self,
+        project: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_open_codespace(&project) || self.codespace_picker.is_some() {
             return;
         }
         let restore = window.focused(cx);
         self.close_menu(cx);
         self.close_preview(cx);
-        let project = self.workspace.project.clone();
         let picker = cx.new(|cx| {
             CodespacePicker::new(self.cloud.clone(), self.gh.clone(), project.clone(), cx)
         });
@@ -606,6 +625,28 @@ impl Shell {
             _events: events,
         });
         cx.notify();
+    }
+
+    /// Marks the open codespace picker as working (tests).
+    #[cfg(test)]
+    pub(super) fn set_codespace_picker_busy(&self, busy: bool, cx: &mut App) {
+        if let Some(open) = &self.codespace_picker {
+            open.picker.update(cx, |picker, _| picker.busy = busy);
+        }
+    }
+
+    /// The local project the open codespace picker lists the codespaces of.
+    #[cfg(test)]
+    pub(super) fn codespace_picker_project(&self, cx: &App) -> Option<String> {
+        let open = self.codespace_picker.as_ref()?;
+        Some(open.picker.read(cx).local_project.clone())
+    }
+
+    /// Whether the open codespace picker is working: Escape must not close it then.
+    pub(super) fn codespace_picker_busy(&self, cx: &App) -> bool {
+        self.codespace_picker
+            .as_ref()
+            .is_some_and(|open| open.picker.read(cx).busy)
     }
 
     pub(super) fn close_codespace_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {

@@ -116,15 +116,33 @@ impl Host for FakeHost {
 struct Sbx {
     sandboxes: Mutex<Vec<(String, String, String)>>,
     calls: Mutex<Vec<String>>,
+    /// The Docker account of every call, parallel to `calls`.
+    accounts: Mutex<Vec<Option<String>>>,
     broken: Mutex<Option<String>>,
+    /// Every call made as this Docker account fails with this error text.
+    broken_for: Mutex<Option<(String, String)>>,
+    /// Sandbox name -> the only Docker account whose `ls` lists it (others list it for all).
+    visible_to: Mutex<std::collections::HashMap<String, String>>,
 }
 impl Sbx {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             sandboxes: Mutex::new(vec![]),
             calls: Mutex::new(vec![]),
+            accounts: Mutex::new(vec![]),
             broken: Mutex::new(None),
+            broken_for: Mutex::new(None),
+            visible_to: Mutex::new(Default::default()),
         })
+    }
+    /// The accounts the `ls` calls ran as, in order.
+    fn ls_accounts(&self) -> Vec<Option<String>> {
+        self.calls()
+            .iter()
+            .zip(self.accounts.lock().unwrap().iter())
+            .filter(|(line, _)| line.split_whitespace().nth(2) == Some("ls"))
+            .map(|(_, account)| account.clone())
+            .collect()
     }
     fn add(&self, id: &str, name: &str, state: &str) {
         self.sandboxes
@@ -150,15 +168,44 @@ fn sbx_out(success: bool, stdout: &str, stderr: &str) -> Result<SbxOutput, Strin
     })
 }
 impl SbxRunner for Sbx {
-    fn run(&self, args: &[String], _stdin: Option<&str>) -> Result<SbxOutput, String> {
+    fn run(&self, args: &[String], stdin: Option<&str>) -> Result<SbxOutput, String> {
+        self.run_as(None, args, stdin)
+    }
+    fn run_as(
+        &self,
+        account: Option<&str>,
+        args: &[String],
+        _stdin: Option<&str>,
+    ) -> Result<SbxOutput, String> {
         self.calls.lock().unwrap().push(args.join(" "));
+        self.accounts
+            .lock()
+            .unwrap()
+            .push(account.map(str::to_owned));
         if let Some(error) = self.broken.lock().unwrap().clone() {
             return Err(error);
+        }
+        if let Some((failing, error)) = self.broken_for.lock().unwrap().clone() {
+            if account == Some(failing.as_str()) {
+                return Err(error);
+            }
         }
         let item = |(id, name, state): &(String, String, String)| json!({"id":id,"name":name,"agent":"shell","state":state,"cpus":4,"memory_mib":8192,"expires_at":"2030-01-01T00:00:00Z"});
         match args.get(2).map(String::as_str).unwrap_or("") {
             "ls" => {
-                let items: Vec<Value> = self.sandboxes.lock().unwrap().iter().map(item).collect();
+                let owners = self.visible_to.lock().unwrap().clone();
+                let items: Vec<Value> = self
+                    .sandboxes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|s| {
+                        owners
+                            .get(&s.1)
+                            .is_none_or(|owner| Some(owner.as_str()) == account)
+                    })
+                    .map(item)
+                    .collect();
                 sbx_out(true, &Value::Array(items).to_string(), "")
             }
             "inspect" => {
@@ -250,6 +297,7 @@ fn sandbox_machine(name: &str) -> Machine {
             relay_port: 47200,
             config: None,
             mode: Default::default(),
+            docker_account: None,
         }),
     }
 }
@@ -266,6 +314,9 @@ struct Fixture {
 }
 /// A real git project on branch `trunk` whose origin is a GitHub repository.
 fn fixture(gh: &Arc<FakeGh>) -> Fixture {
+    fixture_in(gh, Store::open(Path::new(":memory:")).unwrap())
+}
+fn fixture_in(gh: &Arc<FakeGh>, store: Store) -> Fixture {
     let project = tempfile::tempdir().unwrap();
     let path = project.path().to_str().unwrap().to_owned();
     for args in [
@@ -298,7 +349,7 @@ fn fixture(gh: &Arc<FakeGh>) -> Fixture {
     )
     .unwrap();
     let host = Arc::new(FakeHost::default());
-    let store = Arc::new(Mutex::new(Store::open(Path::new(":memory:")).unwrap()));
+    let store = Arc::new(Mutex::new(store));
     let sbx = Sbx::new();
     let shell = Arc::new(Shell::default());
     let cloud = CloudSessions::new(gh.clone(), host.clone(), store.clone())
@@ -748,6 +799,53 @@ fn create_defaults_to_the_current_branch_and_waits_until_available() {
             && create.contains("mine"),
         "{create}"
     );
+}
+
+#[test]
+fn create_uses_the_project_cloud_settings_for_branch_and_options() {
+    use crate::cloud_sessions::project_cloud::{self, CodespaceProjectConfig, ProjectCloud};
+    let create_call = |input: Value| {
+        let gh = FakeGh::new(vec![
+            ("auth status", ok(AUTH_OK)),
+            ("codespace create", ok("octo-new1\n")),
+            ("codespace view", ok(r#"{"state":"Available"}"#)),
+        ]);
+        let fx = fixture(&gh);
+        project_cloud::save(
+            &fx.store.lock().unwrap(),
+            &fx.path(),
+            &ProjectCloud {
+                codespace: CodespaceProjectConfig {
+                    base_ref: "release".into(),
+                    machine: Some("premiumLinux".into()),
+                    idle_timeout_minutes: 90,
+                    devcontainer_path: ".devcontainer/web/devcontainer.json".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fx.api.create(&fx.path(), &input, &mut |_| {}).unwrap();
+        gh.calls()
+            .into_iter()
+            .find(|c| c.contains("codespace create"))
+            .unwrap()
+    };
+    let create = create_call(json!({"kind":"codespace"}));
+    assert!(create.contains("--branch release"), "{create}");
+    assert!(create.contains("--machine premiumLinux"), "{create}");
+    assert!(create.contains("--idle-timeout 90m"), "{create}");
+    assert!(
+        create.contains("--devcontainer-path .devcontainer/web/devcontainer.json"),
+        "{create}"
+    );
+    // The request's own branch and machine win; the other settings still apply.
+    let create =
+        create_call(json!({"kind":"codespace","branch":"feat","machine":"standardLinux32gb"}));
+    assert!(create.contains("--branch feat"), "{create}");
+    assert!(create.contains("--machine standardLinux32gb"), "{create}");
+    assert!(create.contains("--idle-timeout 90m"), "{create}");
 }
 
 #[test]
@@ -1950,6 +2048,65 @@ fn attaching_needs_a_ready_session_on_the_instance() {
         .is_err());
 }
 
+#[test]
+fn project_instances_lists_the_projects_live_sandboxes_from_the_store_only() {
+    let gh = FakeGh::new(vec![]);
+    let fx = fixture(&gh);
+    assert!(fx
+        .api
+        .cloud
+        .project_instances(&fx.path(), CloudBackendKind::DockerSandbox)
+        .unwrap()
+        .is_empty());
+    let first = fx.bind_sandbox("box-1");
+    fx.bind_sandbox("box-1");
+    let archived = fx.bind_sandbox("box-3");
+    fx.store
+        .lock()
+        .unwrap()
+        .set_archived(archived, true)
+        .unwrap();
+    {
+        // Still on its provisional project: listed, but not ready.
+        let store = fx.store.lock().unwrap();
+        let cloud = CloudRef::sandbox("box-2");
+        let project =
+            crate::store::pending_cloud_project(&fx.path(), &cloud, "/workspaces/widgets");
+        store
+            .create_pending_cloud_session("claude", project)
+            .unwrap();
+    }
+    let listed = fx
+        .api
+        .cloud
+        .project_instances(&fx.path(), CloudBackendKind::DockerSandbox)
+        .unwrap();
+    let mut seen: Vec<(String, usize, bool)> = listed
+        .iter()
+        .map(|i| (i.cloud.name.clone(), i.sessions, i.ready))
+        .collect();
+    seen.sort();
+    assert_eq!(
+        seen,
+        [("box-1".into(), 2, true), ("box-2".into(), 1, false)],
+        "{listed:?}"
+    );
+    // Other backends and other projects are not listed. No sbx call was made.
+    assert!(fx
+        .api
+        .cloud
+        .project_instances(&fx.path(), CloudBackendKind::Codespaces)
+        .unwrap()
+        .is_empty());
+    assert!(fx
+        .api
+        .cloud
+        .project_instances("/somewhere/else", CloudBackendKind::DockerSandbox)
+        .unwrap()
+        .is_empty());
+    let _ = first;
+}
+
 struct CpGh {
     files: Vec<&'static str>,
 }
@@ -2273,4 +2430,395 @@ fn a_cloud_located_local_session_is_a_cloud_session_of_its_project() {
     assert!(!is_cloud_session_of(&store, local, "/somewhere/else"));
     let serving = serving_record(&store, local).unwrap();
     assert_eq!(serving.0, host_id);
+}
+
+// ---------------------------------------------------------------- Docker accounts
+
+mod docker_accounts {
+    use super::*;
+    use crate::docker_accounts::test_support::Installed;
+    use crate::sandboxes::account;
+
+    fn save_account_config(fx: &Fixture, docker_account: Option<&str>) {
+        let config = crate::cloud_sessions::docker_config::DockerProjectConfig {
+            repo_url: REPO_URL.into(),
+            docker_account: docker_account.map(str::to_owned),
+            ..Default::default()
+        };
+        crate::cloud_sessions::docker_config::save(&fx.store.lock().unwrap(), &fx.path(), &config)
+            .unwrap();
+    }
+    fn pin(fx: &Fixture, name: &str, docker_account: &str) {
+        account::pin(&fx.store.lock().unwrap(), name, Some(docker_account)).unwrap();
+    }
+
+    #[test]
+    fn listing_without_any_account_is_one_ls_as_the_machine_login() {
+        let gh = FakeGh::new(vec![]);
+        let fx = fixture(&gh);
+        fx.bind_sandbox("box-1");
+        fx.api.list(&fx.path(), &json!({"kind":"sandbox"})).unwrap();
+        assert_eq!(fx.sbx.ls_accounts(), [None]);
+    }
+
+    #[test]
+    fn listing_asks_each_bound_sandbox_in_the_account_that_created_it() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        let b = installed.add("bob");
+        let gh = FakeGh::new(vec![]);
+        let fx = fixture(&gh);
+        // The project names B today; its two sandboxes were made under A and under no account.
+        save_account_config(&fx, Some(&b));
+        fx.bind_sandbox("box-1");
+        fx.bind_sandbox("box-2");
+        pin(&fx, "box-1", &a);
+        let listed = fx.api.list(&fx.path(), &json!({"kind":"sandbox"})).unwrap();
+        assert_eq!(listed["instances"].as_array().unwrap().len(), 2);
+        let mut asked = fx.sbx.ls_accounts();
+        asked.sort();
+        assert_eq!(asked, [None, Some(a.clone())], "never the project's new B");
+        assert_eq!(listed["backends"], json!({"sandbox":{"ok":true}}));
+    }
+
+    const REVOKED: &str =
+        "Docker account bob: token revoked or expired. Replace it in Settings > Cloud.";
+
+    #[test]
+    fn a_failed_account_is_reported_not_taken_for_an_empty_list() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        let b = installed.add("bob");
+        let gh = FakeGh::new(vec![]);
+        let fx = fixture(&gh);
+        fx.bind_sandbox("box-1");
+        fx.bind_sandbox("box-2");
+        pin(&fx, "box-1", &a);
+        pin(&fx, "box-2", &b);
+        *fx.sbx.broken_for.lock().unwrap() = Some((b.clone(), REVOKED.into()));
+        fx.sbx.visible_to.lock().unwrap().extend([
+            ("box-1".to_string(), a.clone()),
+            ("box-2".to_string(), b.clone()),
+        ]);
+        let listed = fx.api.list(&fx.path(), &json!({"kind":"sandbox"})).unwrap();
+        let rows = listed["instances"].as_array().unwrap();
+        let row = |name: &str| rows.iter().find(|r| r["instance"] == name).unwrap();
+        // The healthy account's sandbox is listed as it is.
+        assert_eq!(row("box-1")["state"], "available");
+        // The failed account's sandbox is still there, unknown, with the reason: it is not
+        // "not listed", which could make a caller forget a sandbox that still bills.
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(row("box-2")["state"], "unknown");
+        assert_eq!(row("box-2")["error"], REVOKED);
+        assert_eq!(listed["backends"], json!({"sandbox":{"ok":true}}));
+    }
+
+    #[test]
+    fn it_is_an_error_only_when_no_account_could_be_listed() {
+        let installed = Installed::new();
+        let b = installed.add("bob");
+        let gh = FakeGh::new(vec![]);
+        let fx = fixture(&gh);
+        fx.bind_sandbox("box-2");
+        pin(&fx, "box-2", &b);
+        *fx.sbx.broken_for.lock().unwrap() = Some((b, REVOKED.into()));
+        // Asked for the sandbox backend alone, nothing listable is an error with the reason.
+        let error = fx
+            .api
+            .list(&fx.path(), &json!({"kind":"sandbox"}))
+            .unwrap_err();
+        assert_eq!(error, REVOKED);
+    }
+
+    #[test]
+    fn a_healthy_account_with_no_sandboxes_next_to_a_failed_one_is_not_an_error() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        let b = installed.add("bob");
+        let gh = FakeGh::new(vec![]);
+        let fx = fixture(&gh);
+        fx.bind_sandbox("box-1");
+        fx.bind_sandbox("box-2");
+        pin(&fx, "box-1", &a);
+        pin(&fx, "box-2", &b);
+        let b2 = b.clone();
+        *fx.sbx.broken_for.lock().unwrap() = Some((b, REVOKED.into()));
+        // A answers `ls` but lists nothing (box-1 is visible to another account only).
+        fx.sbx.visible_to.lock().unwrap().extend([
+            ("box-1".to_string(), "somebody-else".to_string()),
+            ("box-2".to_string(), b2),
+        ]);
+        let listed = fx
+            .api
+            .list(&fx.path(), &json!({"kind":"sandbox"}))
+            .expect("one account answered, so this is a list and not an error");
+        let rows = listed["instances"].as_array().unwrap();
+        let row = rows.iter().find(|r| r["instance"] == "box-2").unwrap();
+        assert_eq!(row["state"], "unknown");
+        assert_eq!(row["error"], REVOKED);
+    }
+
+    #[test]
+    fn an_id_is_not_called_unknown_while_an_account_could_not_be_asked() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        let b = installed.add("bob");
+        let gh = FakeGh::new(vec![]);
+        let fx = fixture(&gh);
+        fx.bind_sandbox("box-1");
+        fx.bind_sandbox("box-2");
+        pin(&fx, "box-1", &a);
+        pin(&fx, "box-2", &b);
+        *fx.sbx.broken_for.lock().unwrap() = Some((b, REVOKED.into()));
+        let error = fx
+            .api
+            .delete(
+                &fx.path(),
+                &json!({"kind":"sandbox","instance":"sbx_999zzz"}),
+                &never_busy,
+            )
+            .unwrap_err();
+        assert!(
+            error.contains("could not be looked up") && error.contains(REVOKED),
+            "{error}"
+        );
+        assert!(!error.contains("was not found"), "{error}");
+        assert_eq!(fx.sbx.count("rm"), 0);
+        // With every account healthy it is plainly not found.
+        *fx.sbx.broken_for.lock().unwrap() = None;
+        let error = fx
+            .api
+            .delete(
+                &fx.path(),
+                &json!({"kind":"sandbox","instance":"sbx_999zzz"}),
+                &never_busy,
+            )
+            .unwrap_err();
+        assert!(error.contains("was not found"), "{error}");
+    }
+
+    #[test]
+    fn with_nothing_bound_the_projects_own_account_is_asked() {
+        let installed = Installed::new();
+        let b = installed.add("bob");
+        let gh = FakeGh::new(vec![]);
+        let fx = fixture(&gh);
+        save_account_config(&fx, Some(&b));
+        fx.api.list(&fx.path(), &json!({"kind":"sandbox"})).unwrap();
+        assert_eq!(fx.sbx.ls_accounts(), [Some(b)]);
+    }
+
+    #[test]
+    fn status_checks_as_the_projects_account_and_reports_a_revoked_one_in_its_own_words() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        let gh = FakeGh::new(vec![]);
+        let fx = fixture(&gh);
+        save_account_config(&fx, Some(&a));
+        let status = fx
+            .api
+            .status(&fx.path(), &json!({"kind":"sandbox"}))
+            .unwrap();
+        assert_eq!(status["backends"]["sandbox"]["ready"], true);
+        assert_eq!(fx.sbx.ls_accounts(), [Some(a.clone())]);
+        // The token is revoked: the answer names the account and where to fix it.
+        installed.hub.reject_from_now_on();
+        crate::docker_accounts::shared().unwrap().invalidate(&a);
+        let status = fx
+            .api
+            .status(&fx.path(), &json!({"kind":"sandbox"}))
+            .unwrap();
+        let sandbox = &status["backends"]["sandbox"];
+        assert_eq!(sandbox["ready"], false);
+        assert_eq!(sandbox["loggedIn"], false);
+        assert_eq!(
+            sandbox["message"],
+            "Docker account alice: token revoked or expired. Replace it in Settings > Cloud."
+        );
+        assert!(sandbox.get("fixCommand").is_none(), "{sandbox}");
+        assert!(!status.to_string().contains("sbx login"));
+        assert_eq!(fx.sbx.ls_accounts().len(), 1, "sbx was not asked again");
+    }
+}
+
+/// The app Claude account of a cloud instance: a Mono's `account` for a NEW instance, and the
+/// status of a codespace whose project chooses one.
+mod claude_account {
+    use super::*;
+    use crate::cloud_sessions::claude_pin::{self, ClaudePin};
+    use crate::cloud_sessions::project_cloud::{self, CodespaceProjectConfig, ProjectCloud};
+    use crate::provider::Kind;
+
+    fn store_with_account() -> (Store, tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("monocode.db")).unwrap();
+        let mut book = store.provider_accounts().unwrap();
+        let id = book.add(Kind::Claude, "Work").unwrap().id;
+        store.save_provider_accounts(&book).unwrap();
+        crate::accounts::Profile::new(&id, dir.path())
+            .save_claude_token("sk-ant-oat01-api-fixture")
+            .unwrap();
+        (store, dir, id)
+    }
+    fn with_account(kind: CloudBackendKind, instance: InstanceChoice, id: &str) -> CloudTarget {
+        let mut target = CloudTarget::new(kind, instance);
+        target.account = Some(id.to_owned());
+        target
+    }
+    fn gh() -> Arc<FakeGh> {
+        FakeGh::new(vec![
+            ("auth status", ok(AUTH_OK)),
+            ("codespace list", ok(LIST)),
+            ("codespace view", ok(r#"{"state":"Shutdown"}"#)),
+            (
+                "--method POST",
+                ok(r#"{"name":"octo-new1","state":"Provisioning"}"#),
+            ),
+        ])
+    }
+    fn pin_of(fx: &Fixture, name: &str, sandbox: bool) -> Option<ClaudePin> {
+        let key = if sandbox {
+            claude_pin::sandbox_key(name)
+        } else {
+            claude_pin::codespace_key(name)
+        };
+        claude_pin::read(&fx.store.lock().unwrap(), &key)
+    }
+
+    #[test]
+    fn a_new_codespace_takes_the_account_as_a_pinned_override() {
+        let (store, _dir, id) = store_with_account();
+        let gh = gh();
+        let fx = fixture_in(&gh, store);
+        let target = with_account(CloudBackendKind::Codespaces, InstanceChoice::New, &id);
+        let start = fx.api.begin_start(&fx.path(), target, "claude").unwrap();
+        assert_eq!(
+            pin_of(&fx, &start.instance(), false),
+            Some(ClaudePin {
+                account: Some(id.clone()),
+                pinned: true
+            })
+        );
+        // Without `account` the codespace follows the project.
+        let start = fx
+            .api
+            .begin_start(
+                &fx.path(),
+                CloudTarget::new(CloudBackendKind::Codespaces, InstanceChoice::New),
+                "claude",
+            )
+            .unwrap();
+        assert!(!pin_of(&fx, &start.instance(), false).unwrap().pinned);
+    }
+
+    #[test]
+    fn a_new_sandbox_takes_the_account_as_a_pinned_override_over_the_project() {
+        let (store, _dir, id) = store_with_account();
+        let gh = FakeGh::new(vec![]);
+        let fx = fixture_in(&gh, store);
+        fx.save_docker_config();
+        let target = with_account(CloudBackendKind::DockerSandbox, InstanceChoice::New, &id);
+        let start = fx.api.begin_start(&fx.path(), target, "claude").unwrap();
+        let sandbox_start = start.record().unwrap().sandbox_start.as_ref().unwrap();
+        assert_eq!(
+            sandbox_start.config.claude_account.as_deref(),
+            Some(id.as_str())
+        );
+        assert!(sandbox_start.claude_pinned);
+        assert_eq!(
+            pin_of(&fx, &start.instance(), true),
+            Some(ClaudePin {
+                account: Some(id.clone()),
+                pinned: true
+            })
+        );
+        // The project's own config keeps its choice.
+        let stored =
+            crate::cloud_sessions::docker_config::load(&fx.store.lock().unwrap(), &fx.path())
+                .unwrap()
+                .unwrap();
+        assert_eq!(stored.claude_account, None);
+    }
+
+    #[test]
+    fn an_existing_instance_refuses_the_account() {
+        let (store, _dir, id) = store_with_account();
+        let gh = gh();
+        let fx = fixture_in(&gh, store);
+        fx.save_docker_config();
+        fx.bind_sandbox("box-1");
+        let refused = [
+            with_account(
+                CloudBackendKind::Codespaces,
+                InstanceChoice::Named("octo-abc".into()),
+                &id,
+            ),
+            with_account(
+                CloudBackendKind::DockerSandbox,
+                InstanceChoice::Named("box-1".into()),
+                &id,
+            ),
+        ];
+        for target in refused {
+            let error = fx
+                .api
+                .begin_start(&fx.path(), target, "claude")
+                .unwrap_err();
+            assert_eq!(error, crate::mono::api::ACCOUNT_EXISTING_INSTANCE);
+        }
+        assert_eq!(pin_of(&fx, "octo-abc", false), None);
+    }
+
+    fn secrets_gh() -> Arc<FakeGh> {
+        FakeGh::new(vec![
+            ("auth status", ok(AUTH_OK)),
+            (
+                "user/codespaces/secrets/CLAUDE_CODE_OAUTH_TOKEN/repositories",
+                ok(r#"{"repositories":[]}"#),
+            ),
+            (
+                "user/codespaces/secrets",
+                ok(r#"{"secrets":[{"name":"CLAUDE_CODE_OAUTH_TOKEN","value":"leak-me"}]}"#),
+            ),
+        ])
+    }
+    fn status(fx: &Fixture) -> Value {
+        fx.api
+            .status(&fx.path(), &json!({"kind":"codespace"}))
+            .unwrap()["backends"]["codespace"]
+            .clone()
+    }
+
+    #[test]
+    fn the_secret_is_optional_in_the_status_when_the_project_chooses_an_account() {
+        let (store, _dir, id) = store_with_account();
+        let gh = secrets_gh();
+        let fx = fixture_in(&gh, store);
+        // Unchanged without an account: no new field, no optional marker.
+        let plain = status(&fx);
+        assert!(plain.get("claudeAccount").is_none() && plain.get("secretRequired").is_none());
+        assert!(!plain["secrets"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("optional"));
+        project_cloud::save(
+            &fx.store.lock().unwrap(),
+            &fx.path(),
+            &ProjectCloud {
+                codespace: CodespaceProjectConfig {
+                    claude_account: Some(id),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let chosen = status(&fx);
+        assert_eq!(chosen["claudeAccount"], "Work");
+        assert_eq!(chosen["secretRequired"], false);
+        assert_eq!(chosen["secrets"][0]["key"], "CLAUDE_CODE_OAUTH_TOKEN");
+        assert_eq!(chosen["secrets"][0]["optional"], true);
+        assert!(!chosen.to_string().contains("leak-me"));
+        assert!(!chosen.to_string().contains("sk-ant-oat01"));
+    }
 }

@@ -426,14 +426,41 @@ fn cloud_sources_never_read_the_keychain_or_claude_credentials() {
     let kit_ui = [
         gpui.join("cloud_kit_ui.rs"),
         gpui.join("settings/pages/cloud.rs"),
+        gpui.join("settings/pages/cloud_backends.rs"),
+        gpui.join("settings/pages/cloud_docker.rs"),
+        gpui.join("settings/cloud_env.rs"),
+        gpui.join("cloud_checks.rs"),
+        gpui.join("fix_terminal.rs"),
+        // The project's Cloud settings dialog. secrets/model.rs is scanned for the Keychain
+        // below but not listed here: it runs `git remote get-url origin`, which the kit
+        // files must not do.
+        gpui.join("git_credential_panel.rs"),
+        gpui.join("git_credential_panel/model.rs"),
+        gpui.join("cloud_settings/mod.rs"),
+        gpui.join("cloud_settings/model.rs"),
+        gpui.join("cloud_settings/secrets.rs"),
+        gpui.join("shell/project_cloud.rs"),
         gpui.join("shell/claude_setup.rs"),
         gpui.join("shell.rs"),
         gpui.join("panel_root.rs"),
         gpui.join("shell/cloud_picker.rs"),
+        gpui.join("shell/sandbox_picker.rs"),
         gpui.join("conversation/cloud_target.rs"),
+        gpui.join("conversation/cloud_panel.rs"),
+        gpui.join("cloud_presets.rs"),
         gpui.join("settings/preferences.rs"),
     ];
     files.extend(kit_ui.iter().cloned());
+    // Scanned for the Keychain, but it may spawn `git` (not a kit file).
+    files.push(gpui.join("cloud_settings/secrets/model.rs"));
+    files.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/docker_accounts.rs"));
+    // The sbx seam and the per-sandbox account pin act as Docker accounts: no Keychain.
+    files.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sandboxes.rs"));
+    files.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sandboxes/account.rs"));
+    // The codespace Claude account (resolved from the app store, delivered on stdin).
+    files.push(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/remote/codespace_claude.rs"),
+    );
     assert!(files.len() >= 20, "the scan found {files:?}");
     for must in [
         "kit.rs",

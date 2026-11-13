@@ -30,6 +30,7 @@ use gpui::{
     ShapedLine, SharedString, Size, StrikethroughStyle, Style, Task, TextAlign, TextRun,
     UTF16Selection, UnderlineStyle, Window, actions, div, point, prelude::*, px, rgb, size,
 };
+use monocode_core::git_credentials::Secret;
 use std::{
     borrow::Cow,
     cell::Cell,
@@ -218,6 +219,8 @@ struct Plan {
     args: Vec<String>,
     /// Set on top of the base environment.
     env: Vec<(String, String)>,
+    /// Secrets set on top of it (a Docker token): wiped on drop, never printed.
+    secret_env: Vec<(String, Secret)>,
     /// Read the output left in the PTY after the child exits.
     drain: bool,
     /// Names the program in the "could not start" note.
@@ -234,6 +237,7 @@ impl Plan {
             program,
             args,
             env: Vec::new(),
+            secret_env: Vec::new(),
             drain: false,
             verify: None,
         }
@@ -251,6 +255,7 @@ impl Plan {
             program: lossy(program),
             args: args.into_iter().map(lossy).collect(),
             env: env.into_iter().map(|(k, v)| (k, lossy(v))).collect(),
+            secret_env: Vec::new(),
             // The last words a CLI prints before it dies are the exit tail.
             drain: true,
             label,
@@ -345,6 +350,11 @@ fn spawn(cwd: &str, size: GridSize, id: u64, plan: Plan) -> Spawned {
         env.insert(key.to_owned(), value);
     }
     env.extend(plan.env);
+    // alacritty's `tty::Options.env` is a `HashMap<String, String>`: the API forces a plain,
+    // unwiped copy of each secret here. `plan.secret_env` itself is wiped when `plan` drops.
+    for (key, value) in &plan.secret_env {
+        env.insert(key.clone(), value.as_str().to_owned());
+    }
     let problem = plan
         .verify
         .as_deref()
@@ -433,6 +443,8 @@ pub(crate) struct LaunchSpec {
     pub args: Vec<OsString>,
     pub env_set: Vec<(String, OsString)>,
     pub env_remove: Vec<&'static str>,
+    /// The secret variables (tests only: the real launch keeps them in a `Secret`).
+    pub secret_env: Vec<(String, String)>,
 }
 
 const GRID: GridSize = GridSize {
@@ -465,15 +477,34 @@ impl Terminal {
         env_remove: Vec<&'static str>,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::launch_with_secrets(cwd, program, args, env_set, Vec::new(), env_remove, cx)
+    }
+
+    /// [`Self::launch`] with `secret_env` set as well: values that stay in a wiped,
+    /// never-printed [`Secret`] until the PTY's environment is built.
+    pub(crate) fn launch_with_secrets(
+        cwd: &Path,
+        program: OsString,
+        args: Vec<OsString>,
+        env_set: Vec<(String, OsString)>,
+        secret_env: Vec<(String, Secret)>,
+        env_remove: Vec<&'static str>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         #[cfg(test)]
         let spec = LaunchSpec {
             program: program.clone(),
             args: args.clone(),
             env_set: env_set.clone(),
             env_remove: env_remove.clone(),
+            secret_env: secret_env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.as_str().to_owned()))
+                .collect(),
         };
         let cwd = cwd.to_string_lossy().into_owned();
-        let plan = Plan::launch(program, args, env_set, &env_remove);
+        let mut plan = Plan::launch(program, args, env_set, &env_remove);
+        plan.secret_env = secret_env;
         let spawned = if cfg!(test) {
             detached(GRID)
         } else {

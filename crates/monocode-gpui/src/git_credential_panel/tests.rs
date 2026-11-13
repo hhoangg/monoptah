@@ -49,7 +49,7 @@ impl GitRunner for FakeGit {
 
 fn store() -> (Scratch, Database, GitCredentials) {
     let dir = std::env::temp_dir().join(format!(
-        "monoptah-git-dialog-{}",
+        "monoptah-git-panel-{}",
         monocode_core::mono::new_id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -140,16 +140,16 @@ fn a_rejected_save_does_not_echo_the_token() {
     assert_eq!(credentials.list().unwrap()[0].username, "oauth2");
 }
 
-fn open(cx: &mut TestAppContext, db: &Database, git: Arc<FakeGit>) -> Entity<GitCredentialDialog> {
+fn open(cx: &mut TestAppContext, db: &Database, git: Arc<FakeGit>) -> Entity<GitCredentialPanel> {
     let env = Env {
         store: db.clone(),
         git,
     };
-    cx.new(|cx| GitCredentialDialog::new("alpha".into(), REPO.into(), None, env, cx))
+    cx.new(|cx| GitCredentialPanel::new("alpha".into(), REPO.into(), None, env, cx))
 }
 
 fn type_into(
-    dialog: &Entity<GitCredentialDialog>,
+    dialog: &Entity<GitCredentialPanel>,
     cx: &mut TestAppContext,
     label: &str,
     username: &str,
@@ -163,7 +163,7 @@ fn type_into(
     });
 }
 
-fn token_text(dialog: &Entity<GitCredentialDialog>, cx: &mut TestAppContext) -> String {
+fn token_text(dialog: &Entity<GitCredentialPanel>, cx: &mut TestAppContext) -> String {
     dialog.read_with(cx, |d, cx| d.token.read(cx).content.to_string())
 }
 
@@ -188,6 +188,8 @@ fn saving_stores_the_profile_empties_the_token_and_reports_it(cx: &mut TestAppCo
     assert_eq!(list.len(), 1);
     assert_eq!(chosen.lock().unwrap().as_slice(), [list[0].id.clone()]);
     assert_eq!(token_text(&dialog, cx), "", "the token is not kept");
+    assert_eq!(list[0].platform, GitPlatform::GitHub);
+    assert_eq!(list[0].origin, "https://github.com");
     dialog.read_with(cx, |d, cx| {
         for input in [&d.label, &d.username, &d.token] {
             assert!(!input.read(cx).content.contains(TOKEN));
@@ -258,7 +260,7 @@ fn removing_a_profile_asks_to_confirm_first(cx: &mut TestAppContext) {
         git: FakeGit::new(true, ""),
     };
     let dialog =
-        cx.new(|cx| GitCredentialDialog::new("alpha".into(), REPO.into(), Some(id), env, cx));
+        cx.new(|cx| GitCredentialPanel::new("alpha".into(), REPO.into(), Some(id), env, cx));
     cx.run_until_parked();
     dialog.update(cx, |d, cx| d.remove(cx));
     cx.run_until_parked();
@@ -288,4 +290,190 @@ fn a_check_result_for_a_selection_that_changed_is_dropped(cx: &mut TestAppContex
         assert!(d.check.is_none(), "{:?}", d.check);
         assert!(!d.checking);
     });
+}
+
+fn saved(credentials: &GitCredentials) -> String {
+    credentials
+        .save(
+            "Work",
+            GitPlatform::GitHub,
+            "https://github.com",
+            "me",
+            TOKEN,
+        )
+        .unwrap()
+}
+
+#[gpui::test]
+fn the_default_platform_follows_the_repository_host_until_the_user_picks_one(
+    cx: &mut TestAppContext,
+) {
+    let (_dir, db, _credentials) = store();
+    let panel = open(cx, &db, FakeGit::new(true, ""));
+    panel.read_with(cx, |p, _| assert_eq!(p.platform, GitPlatform::GitHub));
+    panel.update(cx, |p, cx| {
+        p.set_repo_url("https://gitlab.com/acme/alpha".into(), cx)
+    });
+    panel.read_with(cx, |p, cx| {
+        assert_eq!(p.platform, GitPlatform::GitLab);
+        assert_eq!(p.username.read(cx).content.as_ref(), "oauth2");
+    });
+    // An unsupported host decides nothing.
+    panel.update(cx, |p, cx| {
+        p.set_repo_url("https://example.com/acme/alpha".into(), cx)
+    });
+    panel.read_with(cx, |p, _| assert_eq!(p.platform, GitPlatform::GitLab));
+    // A pick made by the user is not overridden by the repository.
+    panel.update(cx, |p, cx| p.set_platform(GitPlatform::GitHub, cx));
+    panel.update(cx, |p, cx| {
+        p.set_repo_url("https://gitlab.com/acme/beta".into(), cx)
+    });
+    panel.read_with(cx, |p, _| assert_eq!(p.platform, GitPlatform::GitHub));
+}
+
+#[gpui::test]
+fn the_removed_event_follows_a_remove_and_the_list_and_selection_are_refreshed(
+    cx: &mut TestAppContext,
+) {
+    let (_dir, db, credentials) = store();
+    let id = saved(&credentials);
+    let env = Env {
+        store: db.clone(),
+        git: FakeGit::new(true, ""),
+    };
+    let panel = cx
+        .new(|cx| GitCredentialPanel::new("alpha".into(), REPO.into(), Some(id.clone()), env, cx));
+    cx.run_until_parked();
+    panel.read_with(cx, |p, _| {
+        assert_eq!(p.selected.as_deref(), Some(id.as_str()));
+        assert_eq!(p.profiles.len(), 1);
+    });
+    let removed = Arc::new(Mutex::new(0));
+    let seen = removed.clone();
+    let _sub = cx.update(|cx| {
+        cx.subscribe(&panel, move |_, event: &Event, _| {
+            if matches!(event, Event::Removed) {
+                *seen.lock().unwrap() += 1;
+            }
+        })
+    });
+    panel.update(cx, |p, cx| p.remove(cx));
+    panel.update(cx, |p, cx| p.remove(cx));
+    cx.run_until_parked();
+    assert_eq!(*removed.lock().unwrap(), 1);
+    panel.read_with(cx, |p, _| {
+        assert!(
+            p.selected.is_none() && p.profiles.is_empty(),
+            "list and selection"
+        );
+    });
+}
+
+#[gpui::test]
+fn dismissing_closes_the_confirm_remove_question_only(cx: &mut TestAppContext) {
+    let (_dir, db, credentials) = store();
+    let id = saved(&credentials);
+    let env = Env {
+        store: db.clone(),
+        git: FakeGit::new(true, ""),
+    };
+    let panel =
+        cx.new(|cx| GitCredentialPanel::new("alpha".into(), REPO.into(), Some(id), env, cx));
+    cx.run_until_parked();
+    assert!(
+        !panel.update(cx, |p, cx| p.dismiss_transient(cx)),
+        "nothing asked"
+    );
+    panel.update(cx, |p, cx| p.remove(cx));
+    panel.read_with(cx, |p, _| assert!(p.confirm_remove));
+    assert!(panel.update(cx, |p, cx| p.dismiss_transient(cx)));
+    panel.read_with(cx, |p, _| assert!(!p.confirm_remove));
+    cx.run_until_parked();
+    assert_eq!(credentials.list().unwrap().len(), 1, "nothing was removed");
+}
+
+#[gpui::test]
+fn opening_on_a_saved_profile_focuses_the_panel_and_a_new_one_the_name_field(
+    cx: &mut TestAppContext,
+) {
+    let (_dir, db, credentials) = store();
+    let id = saved(&credentials);
+    let env = || Env {
+        store: db.clone(),
+        git: FakeGit::new(true, ""),
+    };
+    // A profile is going to be shown: the form has no input, so the panel itself has focus.
+    let window = cx.add_window(|_, cx| {
+        GitCredentialPanel::new("alpha".into(), REPO.into(), Some(id.clone()), env(), cx)
+    });
+    cx.run_until_parked();
+    window
+        .update(cx, |panel, window, cx| {
+            panel.focus_form(window, cx);
+            assert!(panel.focus.is_focused(window));
+            assert!(!panel.label.focus_handle(cx).is_focused(window));
+            assert!(!panel.token.focus_handle(cx).is_focused(window));
+        })
+        .unwrap();
+    // Nothing to show: the first field of the new-credential form.
+    let window = cx
+        .add_window(|_, cx| GitCredentialPanel::new("alpha".into(), REPO.into(), None, env(), cx));
+    cx.run_until_parked();
+    window
+        .update(cx, |panel, window, cx| {
+            panel.focus_form(window, cx);
+            assert!(panel.label.focus_handle(cx).is_focused(window));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_new_credential_form_has_no_host_field_and_the_platform_decides_the_host(
+    cx: &mut TestAppContext,
+) {
+    use gpui::VisualTestContext;
+    let (_dir, db, credentials) = store();
+    let env = Env {
+        store: db.clone(),
+        git: FakeGit::new(true, ""),
+    };
+    let window =
+        cx.add_window(|_, cx| GitCredentialPanel::new("alpha".into(), REPO.into(), None, env, cx));
+    cx.run_until_parked();
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.refresh().unwrap();
+    assert!(visual.debug_bounds("git-host").is_none(), "no Host field");
+    assert!(visual.debug_bounds("git-platform-github.com").is_some());
+    assert!(visual.debug_bounds("git-platform-gitlab.com").is_some());
+    // Each platform stores its own fixed origin.
+    for (platform, host) in [
+        (GitPlatform::GitHub, "github.com"),
+        (GitPlatform::GitLab, "gitlab.com"),
+    ] {
+        window
+            .update(visual, |panel, _, cx| panel.set_platform(platform, cx))
+            .unwrap();
+        window
+            .update(visual, |panel, _, cx| {
+                let (l, u, t) = (
+                    panel.label.clone(),
+                    panel.username.clone(),
+                    panel.token.clone(),
+                );
+                l.update(cx, |i, cx| i.set_text(host.into(), cx));
+                u.update(cx, |i, cx| i.set_text("me".into(), cx));
+                t.update(cx, |i, cx| i.set_text(TOKEN.into(), cx));
+                panel.save(cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let saved = credentials
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.label == host)
+            .expect("saved");
+        assert_eq!(saved.platform, platform);
+        assert_eq!(saved.origin, format!("https://{host}"));
+    }
 }

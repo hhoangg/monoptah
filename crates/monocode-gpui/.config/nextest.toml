@@ -27,6 +27,13 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 status-level = "fail"
 final-status-level = "slow"
 
+# Parses the 580 KB App.tsx twice under a wall-clock budget of about one second per
+# 64 KiB (editor_analysis::analyze). Sharing the runner's CPUs with parallel tests can
+# push it past that budget, so it runs alone.
+[[profile.ci.overrides]]
+filter = 'test(=editor_analysis::parity_tests::large_tsx_analysis_highlights_the_end_of_the_current_and_original_file)'
+threads-required = "num-test-threads"
+
 [profile.ci.junit]
 # Written to <workspace>/target/nextest/ci/junit.xml (the remapped workspace root
 # when run from an archive).

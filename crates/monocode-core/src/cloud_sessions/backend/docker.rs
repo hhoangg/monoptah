@@ -58,9 +58,31 @@ fn outer_command(path: &str) -> String {
     format!("sh -c {}", crate::remote::shell_quote(&script))
 }
 
+/// The process-wide accounts epoch (0 without accounts), see `DockerAccess::epoch`.
+fn accounts_epoch() -> u64 {
+    crate::docker_accounts::shared().map_or(0, |access| access.epoch())
+}
+
+/// Reads the Docker account of a sandbox name: its pin setting, else the start record of the
+/// name (see [`sandboxes::account`]). `Err` means the answer could not be read (the store is
+/// unavailable): never "no account", so it is neither cached nor read as the machine login.
+///
+/// A resolver locks the native store, so it must never be called while the caller holds the
+/// store guard (see [`DockerBackend::account_of`]).
+pub type AccountResolver = Arc<dyn Fn(&str) -> Result<Option<String>, String> + Send + Sync>;
+
 pub struct DockerBackend {
     runner: Arc<dyn SbxRunner>,
     ids: Mutex<HashMap<String, String>>,
+    /// The Docker account each sandbox lives in, by name, next to the id cache. `Some(None)`
+    /// is a resolved "no account" (the machine login): the pin is written before `sbx create`,
+    /// so a name that resolved to no account stays so. An unresolved name is looked up.
+    /// Each answer carries the accounts epoch it was learned in: when accounts were added,
+    /// re-tokened or removed since, the answer is dropped and read again (an account id may
+    /// now belong to another account, or the pin may follow its Docker ID to a new id).
+    accounts: Mutex<HashMap<String, (Option<String>, u64)>>,
+    /// Where an account not seen yet is read from (the pin setting).
+    resolver: Option<AccountResolver>,
     /// The ssh seam of [`Self::run_script`] and [`Self::copy_from`]; without it they refuse.
     shell: Option<Arc<dyn SandboxShell>>,
     /// Where each sandbox's devcontainer is, by name (set by the start and reconnect flows).
@@ -76,11 +98,19 @@ impl DockerBackend {
         Self {
             runner,
             ids: Mutex::new(HashMap::new()),
+            accounts: Mutex::new(HashMap::new()),
+            resolver: None,
             shell: None,
             targets: Mutex::new(HashMap::new()),
             copy_limit: COPY_LIMIT_BYTES,
             notes: Mutex::new(Vec::new()),
         }
+    }
+    /// Reads the account of a sandbox this backend has not been told about from `resolver`
+    /// (the app passes the store's pin setting).
+    pub fn with_account_resolver(mut self, resolver: AccountResolver) -> Self {
+        self.resolver = Some(resolver);
+        self
     }
     /// Uses `bytes` as the copy size limit instead of [`COPY_LIMIT_BYTES`].
     pub fn with_copy_limit(mut self, bytes: usize) -> Self {
@@ -96,6 +126,9 @@ impl DockerBackend {
     /// Remembers where the devcontainer of `target.name` is.
     pub fn remember_target(&self, target: &SandboxTarget) {
         self.remember(&target.name, &target.id);
+        if let Some(account) = &target.docker_account {
+            self.remember_account(&target.name, Some(account));
+        }
         if let Ok(mut targets) = self.targets.lock() {
             targets.insert(target.name.clone(), target.clone());
         }
@@ -156,11 +189,16 @@ impl DockerBackend {
         abort: &dyn Fn() -> bool,
         timeout: Duration,
     ) -> Result<ShellOutput, String> {
-        let (shell, id, remote) = match at {
+        let (shell, id, remote, account) = match at {
             Where::Container => {
                 let (shell, target) = self.target_of(name)?;
                 let remote = target.exec_in_container(&["sh", "-l", "-s"]);
-                (shell, target.id, remote)
+                // The target is what the sandbox was connected with; a pin set later (a
+                // sandbox adopted after it was paired) still counts.
+                let account = self
+                    .try_account_of(name)?
+                    .or_else(|| target.docker_account.clone());
+                (shell, target.id, remote, account)
             }
             Where::Outer(owner_path) => {
                 codespaces::valid_remote_path(owner_path)?;
@@ -168,11 +206,24 @@ impl DockerBackend {
                     .shell
                     .clone()
                     .ok_or_else(|| "Docker sandboxes are not available.".to_string())?;
-                (shell, self.id_of(name)?, outer_command(owner_path))
+                (
+                    shell,
+                    self.id_of(name)?,
+                    outer_command(owner_path),
+                    self.try_account_of(name)?,
+                )
             }
         };
         shell
-            .run(&id, &remote, stdin, on_line, abort, timeout)
+            .run_as(
+                account.as_deref(),
+                &id,
+                &remote,
+                stdin,
+                on_line,
+                abort,
+                timeout,
+            )
             .map_err(|e| sandboxes::redact(&e))
     }
     /// Whether the remembered target of `name` runs without a devcontainer.
@@ -193,13 +244,68 @@ impl DockerBackend {
         if let Ok(mut ids) = self.ids.lock() {
             ids.remove(name);
         }
+        self.forget_account(name);
+    }
+    /// Remembers the Docker account sandbox `name` lives in; `None` is the machine login.
+    pub fn remember_account(&self, name: &str, account: Option<&str>) {
+        if let Ok(mut accounts) = self.accounts.lock() {
+            accounts.insert(name.into(), (account.map(str::to_owned), accounts_epoch()));
+        }
+    }
+    /// Forgets what is known of the account of `name` (the sandbox is gone, or never was):
+    /// the next [`Self::account_of`] resolves it again.
+    pub fn forget_account(&self, name: &str) {
+        if let Ok(mut accounts) = self.accounts.lock() {
+            accounts.remove(name);
+        }
+    }
+    /// The Docker account sandbox `name` lives in: told to this backend, else the account of
+    /// its remembered target, else the pin setting. `None` is the machine login. An answer
+    /// that could not be read is `None` here; use [`Self::try_account_of`] where that must
+    /// not be taken for the machine login.
+    pub fn account_of(&self, name: &str) -> Option<String> {
+        self.try_account_of(name).ok().flatten()
+    }
+    /// [`Self::account_of`], with `Err` when the answer could not be read. Both outcomes of a
+    /// successful read are remembered, including "no account".
+    ///
+    /// Locks the native store (through the resolver) on a cache miss: callers must NOT hold
+    /// the store guard, or this deadlocks.
+    pub fn try_account_of(&self, name: &str) -> Result<Option<String>, String> {
+        if let Some(known) = self
+            .accounts
+            .lock()
+            .ok()
+            .and_then(|accounts| accounts.get(name).cloned())
+            .filter(|(_, epoch)| *epoch == accounts_epoch())
+        {
+            return Ok(known.0);
+        }
+        let from_target = self
+            .targets
+            .lock()
+            .ok()
+            .and_then(|targets| targets.get(name).and_then(|t| t.docker_account.clone()));
+        // The pin first: it follows its Docker ID when the account was removed and added
+        // again, which the account id in a remembered target cannot.
+        let found = match &self.resolver {
+            Some(read) => read(name)?,
+            None => None,
+        }
+        .or(from_target);
+        self.remember_account(name, found.as_deref());
+        Ok(found)
     }
     /// The id of sandbox `name`: remembered, else looked up by exact name.
     fn id_of(&self, name: &str) -> Result<String, String> {
         if let Some(id) = self.ids.lock().ok().and_then(|ids| ids.get(name).cloned()) {
             return Ok(id);
         }
-        match sandboxes::find_by_name(&*self.runner, name)? {
+        let account = self.try_account_of(name)?;
+        match sandboxes::find_by_name(
+            &sandboxes::as_account(&*self.runner, account.as_deref()),
+            name,
+        )? {
             Some(info) => {
                 self.remember(name, &info.id);
                 Ok(info.id)
@@ -244,7 +350,12 @@ impl CloudBackend for DockerBackend {
     }
     fn state(&self, name: &str) -> Result<String, String> {
         let id = self.id_of(name)?;
-        sandboxes::state(&*self.runner, &id).inspect_err(|e| self.after_missing(name, &id, e))
+        let account = self.try_account_of(name)?;
+        sandboxes::state(
+            &sandboxes::as_account(&*self.runner, account.as_deref()),
+            &id,
+        )
+        .inspect_err(|e| self.after_missing(name, &id, e))
     }
     fn exists(&self, name: &str) -> Result<bool, String> {
         match self.state(name) {
@@ -255,11 +366,19 @@ impl CloudBackend for DockerBackend {
     }
     fn stop(&self, name: &str) -> Result<(), String> {
         let id = self.id_of(name)?;
-        sandboxes::stop(&*self.runner, &id)
+        let account = self.try_account_of(name)?;
+        sandboxes::stop(
+            &sandboxes::as_account(&*self.runner, account.as_deref()),
+            &id,
+        )
     }
     fn delete(&self, name: &str) -> Result<(), String> {
         let id = self.id_of(name)?;
-        sandboxes::delete(&*self.runner, &id)?;
+        let account = self.try_account_of(name)?;
+        sandboxes::delete(
+            &sandboxes::as_account(&*self.runner, account.as_deref()),
+            &id,
+        )?;
         self.forget(name);
         Ok(())
     }
@@ -595,6 +714,25 @@ pub trait SandboxShell: Send + Sync {
         abort: &dyn Fn() -> bool,
         timeout: Duration,
     ) -> Result<ShellOutput, String>;
+
+    /// [`Self::run`] as Docker account `account`: the ssh alias's ProxyCommand runs
+    /// `sbx --cloud ssh-connect`, which needs the account's `DOCKER_ACCESS_TOKEN` in the
+    /// ssh process's environment. `None` is the machine login. The default ignores the
+    /// account, so a fake needs no change; [`SystemShell`] honors it.
+    #[allow(clippy::too_many_arguments)]
+    fn run_as(
+        &self,
+        account: Option<&str>,
+        id: &str,
+        remote: &str,
+        stdin: &str,
+        on_line: &mut dyn FnMut(&str),
+        abort: &dyn Fn() -> bool,
+        timeout: Duration,
+    ) -> Result<ShellOutput, String> {
+        let _ = account;
+        self.run(id, remote, stdin, on_line, abort, timeout)
+    }
 }
 
 /// Real ssh.
@@ -617,7 +755,7 @@ impl SystemShell {
             program: program.into(),
         }
     }
-    fn command(&self, id: &str, remote: &str) -> Command {
+    fn command(&self, account: Option<&str>, id: &str, remote: &str) -> Result<Command, String> {
         let mut command = Command::new(&self.program);
         command
             .args([
@@ -655,7 +793,9 @@ impl SystemShell {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         crate::process::configure_child(&mut command);
-        command
+        // The token goes in the environment only, never in argv.
+        crate::docker_accounts::apply_env(&mut command, account)?;
+        Ok(command)
     }
 }
 
@@ -669,9 +809,21 @@ impl SandboxShell for SystemShell {
         abort: &dyn Fn() -> bool,
         timeout: Duration,
     ) -> Result<ShellOutput, String> {
+        self.run_as(None, id, remote, stdin, on_line, abort, timeout)
+    }
+    fn run_as(
+        &self,
+        account: Option<&str>,
+        id: &str,
+        remote: &str,
+        stdin: &str,
+        on_line: &mut dyn FnMut(&str),
+        abort: &dyn Fn() -> bool,
+        timeout: Duration,
+    ) -> Result<ShellOutput, String> {
         sandboxes::validate_sandbox_id(id)?;
         let mut child = self
-            .command(id, remote)
+            .command(account, id, remote)?
             .spawn()
             .map_err(|e| format!("Could not start OpenSSH: {e}"))?;
         let (tx, rx) = mpsc::channel::<(bool, String)>();
@@ -739,6 +891,9 @@ impl SandboxShell for SystemShell {
             }
         };
         let _ = (out.join(), err.join());
+        // The ProxyCommand's `sbx` refused the JWT: drop it so the next spawn exchanges a
+        // fresh one (the script never ran, the connection failed before it).
+        crate::docker_accounts::invalidate_if_rejected(account, status.success(), &stderr);
         Ok(ShellOutput {
             success: status.success(),
             stdout,

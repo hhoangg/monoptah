@@ -59,6 +59,8 @@ struct FakeHost {
     machines: Mutex<Vec<Machine>>,
     log: Mutex<Vec<String>>,
     request_error: Mutex<Option<String>>,
+    /// A store whose codespace Claude pin is logged at every pairing.
+    pin_probe: Mutex<Option<Arc<Mutex<Store>>>>,
 }
 impl FakeHost {
     fn with_machine(name: &str) -> Arc<Self> {
@@ -93,6 +95,17 @@ impl Host for FakeHost {
         progress: &mut dyn FnMut(&str),
     ) -> Result<Machine, String> {
         progress("pairing");
+        if let Some(store) = self.pin_probe.lock().unwrap().clone() {
+            let pin = store
+                .lock()
+                .unwrap()
+                .setting(&claude_pin::codespace_key(codespace))
+                .unwrap();
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("pin at pairing {pin:?}"));
+        }
         self.log
             .lock()
             .unwrap()
@@ -150,6 +163,11 @@ fn named(name: &str) -> Target {
         codespace: CodespaceChoice::Named(name.into()),
         branch: None,
         machine: None,
+        idle_timeout_minutes: None,
+        devcontainer_path: None,
+        claude_account: None,
+        claude_account_pinned: false,
+        work_branch: None,
     }
 }
 use std::path::Path;
@@ -213,6 +231,11 @@ fn new_target_creates_waits_pairs_and_skips_the_extra_wake() {
                 codespace: CodespaceChoice::New,
                 branch: Some("main".into()),
                 machine: None,
+                idle_timeout_minutes: None,
+                devcontainer_path: None,
+                claude_account: None,
+                claude_account_pinned: false,
+                work_branch: None,
             },
             &mut |line| progress.push(line.to_string()),
         )
@@ -222,6 +245,86 @@ fn new_target_creates_waits_pairs_and_skips_the_extra_wake() {
     assert_eq!(host.log()[0], "connect octo-new1 monoptah-main".to_string());
     assert!(!host.log().iter().any(|l| l.starts_with("ensure")));
     assert!(progress.iter().any(|p| p == "pairing"), "{progress:?}");
+}
+
+/// A Mono's `cloud.create` path pins the Claude account before the first pairing, so that
+/// pairing already runs under it (and honors a per-session override).
+#[test]
+fn a_prepared_new_codespace_is_pinned_before_its_first_pairing() {
+    use crate::provider::Kind;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("monocode.db")).unwrap();
+    let mut book = store.provider_accounts().unwrap();
+    let project = book.add(Kind::Claude, "Project").unwrap().id;
+    let session = book.add(Kind::Claude, "Session").unwrap().id;
+    store.save_provider_accounts(&book).unwrap();
+    for id in [&project, &session] {
+        crate::accounts::Profile::new(id, dir.path())
+            .save_claude_token("sk-ant-oat01-prepare-fixture")
+            .unwrap();
+    }
+    project_cloud::save(
+        &store,
+        "/p",
+        &project_cloud::ProjectCloud {
+            codespace: project_cloud::CodespaceProjectConfig {
+                claude_account: Some(project.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let store = Arc::new(Mutex::new(store));
+    let target = |account: Option<&str>, pinned: bool| Target {
+        codespace: CodespaceChoice::New,
+        branch: Some("main".into()),
+        claude_account: account.map(str::to_owned),
+        claude_account_pinned: pinned,
+        ..named("x")
+    };
+    let pin_at_pairing = |target: Target| {
+        let gh = FakeGh::new(vec![
+            ("auth status", ok(AUTH_OK)),
+            (
+                "--method POST",
+                ok(r#"{"name":"octo-new1","state":"Provisioning"}"#),
+            ),
+            ("codespace view", ok(r#"{"state":"Available"}"#)),
+        ]);
+        let host = Arc::new(FakeHost::default());
+        *host.pin_probe.lock().unwrap() = Some(store.clone());
+        let svc = CloudSessions::new(gh, host.clone(), store.clone())
+            .with_origin(|_| Ok("git@github.com:octo/widgets.git".into()));
+        svc.prepare_target("/p", target, &mut |_| {}).unwrap();
+        host.log()
+            .into_iter()
+            .find(|l| l.starts_with("pin at pairing"))
+            .expect("the codespace was paired")
+    };
+    // Following the project: the project's account, not pinned.
+    let line = pin_at_pairing(target(None, false));
+    assert!(
+        line.contains(&format!("\\\"account\\\":\\\"{project}\\\""))
+            && line.contains("pinned\\\":false"),
+        "{line}"
+    );
+    // A per-session account wins and is pinned.
+    let line = pin_at_pairing(target(Some(&session), true));
+    assert!(
+        line.contains(&format!("\\\"account\\\":\\\"{session}\\\""))
+            && line.contains("pinned\\\":true"),
+        "{line}"
+    );
+    // An account that cannot be used fails before a codespace is created.
+    let gh = FakeGh::new(vec![("auth status", ok(AUTH_OK))]);
+    let svc = CloudSessions::new(gh.clone(), Arc::new(FakeHost::default()), store.clone())
+        .with_origin(|_| Ok("git@github.com:octo/widgets.git".into()));
+    let error = svc
+        .prepare_target("/p", target(Some("gone"), true), &mut |_| {})
+        .unwrap_err();
+    assert!(error.contains("no longer available"), "{error}");
+    assert_eq!(gh.calls().len(), 0, "{:?}", gh.calls());
 }
 
 #[test]
@@ -243,6 +346,11 @@ fn bad_targets_fail_before_touching_codespaces() {
                 codespace: CodespaceChoice::New,
                 branch: Some("  ".into()),
                 machine: None,
+                idle_timeout_minutes: None,
+                devcontainer_path: None,
+                claude_account: None,
+                claude_account_pinned: false,
+                work_branch: None,
             },
             &mut |_| {},
         )
@@ -511,6 +619,11 @@ fn new_codespaces_get_the_monoptah_display_name() {
             codespace: CodespaceChoice::New,
             branch: Some("main".into()),
             machine: None,
+            idle_timeout_minutes: None,
+            devcontainer_path: None,
+            claude_account: None,
+            claude_account_pinned: false,
+            work_branch: None,
         },
         &mut |_| {},
     )

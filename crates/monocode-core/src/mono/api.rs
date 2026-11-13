@@ -1,7 +1,9 @@
 use super::cloud_api::validate as cloud;
 use serde_json::Value;
-/// Refusal for `sessions.start` with both `account` and a cloud `target`.
-pub const ACCOUNT_LOCAL_ONLY: &str = "account applies to local sessions only; a cloud session uses the cloud setup (the API key or setup token configured for Codespaces or Docker Sandbox)";
+/// Refusal for `sessions.start` with `account` and a cloud `target` that names an existing
+/// instance: a new cloud instance takes the account, an existing one keeps its own.
+pub const ACCOUNT_EXISTING_INSTANCE: &str =
+    "The account belongs to the instance; it cannot change for an existing one.";
 /// Reject misspelled fields and ambiguous types before any app mutation.
 pub fn validate(action: &str, input: &Value) -> Result<(), String> {
     let cloud_fields;
@@ -170,8 +172,14 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         .filter(|_| action != super::move_api::MOVE_TO_CLOUD);
     if let Some(target) = start_target {
         cloud::validate_target(target, input)?;
-        if input.get("account").is_some() {
-            return Err(ACCOUNT_LOCAL_ONLY.into());
+        // A new codespace or sandbox takes the account (the GUI resolves it and requires a
+        // setup token or API key); an existing instance keeps the one it started with.
+        let new_instance = match target.get("instance") {
+            None => true,
+            Some(instance) => instance.as_str() == Some("new"),
+        };
+        if input.get("account").is_some() && !new_instance {
+            return Err(ACCOUNT_EXISTING_INSTANCE.into());
         }
     }
     if action.starts_with("cloud.") {
@@ -258,7 +266,7 @@ mod tests {
         .is_ok());
     }
     #[test]
-    fn account_is_bounded_text_for_local_starts_only() {
+    fn account_is_bounded_text_and_cloud_starts_take_it_for_new_instances_only() {
         let start = |input| validate("sessions.start", &input);
         assert!(start(json!({"prompt":"x","account":"Work"})).is_ok());
         assert!(start(json!({"prompt":"x","account":"a".repeat(128)})).is_ok());
@@ -276,15 +284,31 @@ mod tests {
         }
         for target in [
             json!({"kind":"codespace","instance":"new"}),
+            json!({"kind":"codespace"}),
+            json!({"kind":"sandbox","instance":"new"}),
+            json!({"kind":"sandbox"}),
+        ] {
+            assert!(
+                start(json!({"prompt":"x","account":"Work","target":target})).is_ok(),
+                "a new instance takes the account"
+            );
+        }
+        for target in [
             json!({"kind":"codespace","instance":"my-box"}),
             json!({"kind":"sandbox","instance":{"session":5}}),
-            json!({"kind":"sandbox"}),
+            json!({"kind":"sandbox","instance":"my-sbx"}),
         ] {
             assert_eq!(
                 start(json!({"prompt":"x","account":"Work","target":target})).unwrap_err(),
-                ACCOUNT_LOCAL_ONLY
+                ACCOUNT_EXISTING_INSTANCE
             );
         }
+        // The bounds are the same with a cloud target.
+        assert_eq!(
+            start(json!({"prompt":"x","account":"a".repeat(129),"target":{"kind":"codespace"}}))
+                .unwrap_err(),
+            "account must be a non-empty string of at most 128 characters"
+        );
         assert_eq!(
             validate("sessions.send", &json!({"sessionId":1,"account":"Work"})).unwrap_err(),
             "sessions.send does not take account"

@@ -6,10 +6,14 @@ use gpui::{
     AnyElement, AnyView, App, Bounds, BoxShadow, Context, Corners, DispatchPhase, Display, Element,
     ElementId, Entity, EventEmitter, FocusHandle, Focusable, GlobalElementId, Hsla,
     InspectorElementId, KeyBinding, LayoutId, MouseDownEvent, Pixels, Point,
-    Position as CssPosition, Role, SharedString, Style, Toggled, Window, actions, canvas, deferred,
-    div, point, prelude::*, px, rgb, rgba, size,
+    Position as CssPosition, Role, SharedString, Style, Subscription, Toggled, Window, actions,
+    canvas, deferred, div, point, prelude::*, px, rgb, rgba, size,
 };
-use std::{cell::Cell, rc::Rc, time::Instant};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    time::Instant,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Side {
@@ -1068,10 +1072,14 @@ impl Menu {
             .unwrap_or_else(|| self.focus.clone())
     }
     pub(crate) fn select_value(mut self, value: &str) -> Self {
+        self.highlight_value(value);
+        self
+    }
+    /// Highlights the enabled action with id `value` (none when there is no such row).
+    pub(crate) fn highlight_value(&mut self, value: &str) {
         self.active = self.items.iter().position(|item| {
             matches!(item, MenuItem::Action(action) if action.id.as_ref() == value && !action.disabled)
         });
-        self
     }
     pub(crate) fn style(mut self, style: MenuStyle) -> Self {
         self.style = style;
@@ -1837,6 +1845,175 @@ pub(crate) fn menu_popover(menu: &Entity<Menu>, anchor: Anchor, cx: &App) -> Pop
             let _ = weak.update(cx, |m, cx| m.finish(MenuEvent::Dismissed, window, cx));
         })
         .child(menu.clone())
+}
+
+/// One entry of a [`Choices`] list: the value it stands for, its label and whether it is the
+/// current one (drawn with a check).
+pub(crate) struct Choice<T> {
+    pub value: T,
+    pub label: SharedString,
+    pub checked: bool,
+}
+
+/// What an open [`Choices`] list reports to its owner.
+pub(crate) enum ChoiceEvent<T> {
+    Picked(T),
+    Dismissed,
+}
+
+/// An open single-choice dropdown: the app's [`Menu`] (the style of the Providers "sign-in
+/// options" menu) listing `Choice`s, floating under the trigger it is anchored to instead of
+/// taking room in the layout. Hold it while the list is open and drop it to close; render
+/// [`Choices::popover`] next to the trigger. The row ids are the choices' indexes, so the rows
+/// draw as `menu-action-0`, `menu-action-1`, ...
+pub(crate) struct Choices<T> {
+    menu: Entity<Menu>,
+    values: Rc<RefCell<Vec<Option<T>>>>,
+    _events: Subscription,
+}
+
+/// The menu rows of `choices` and the values they stand for.
+fn choice_items<T>(choices: Vec<Choice<T>>) -> (Vec<MenuItem>, Vec<Option<T>>) {
+    let mut values = Vec::with_capacity(choices.len());
+    let mut items = Vec::with_capacity(choices.len());
+    for (ix, choice) in choices.into_iter().enumerate() {
+        items.push(
+            MenuAction::new(ix.to_string(), choice.label)
+                .checked(choice.checked)
+                .into(),
+        );
+        values.push(Some(choice.value));
+    }
+    (items, values)
+}
+
+/// The id of the row that is checked, which the keyboard starts on.
+fn checked_id(items: &[MenuItem]) -> Option<String> {
+    items.iter().find_map(|item| match item {
+        MenuItem::Action(a) if a.checked => Some(a.id.to_string()),
+        _ => None,
+    })
+}
+
+impl<T: 'static> Choices<T> {
+    /// Opens the list, `width` wide, and gives it the keyboard (arrows, Enter and Escape work as
+    /// in any [`Menu`]). `on_event` runs once per pick or dismissal; the owner drops the
+    /// `Choices` in it.
+    pub(crate) fn open<V: 'static>(
+        label: impl Into<SharedString>,
+        choices: Vec<Choice<T>>,
+        width: f32,
+        window: &mut Window,
+        cx: &mut Context<V>,
+        on_event: impl Fn(&mut V, ChoiceEvent<T>, &mut Window, &mut Context<V>) + 'static,
+    ) -> Self {
+        let (items, values) = choice_items(choices);
+        let checked = checked_id(&items);
+        let menu = cx.new(|cx| {
+            let menu = Menu::new(label, items, window, cx)
+                .width(width)
+                .style(MenuStyle::Git);
+            // The keyboard starts on the current value.
+            match checked {
+                Some(id) => menu.select_value(&id),
+                None => menu,
+            }
+        });
+        let values = Rc::new(RefCell::new(values));
+        let picked = values.clone();
+        let events = cx.subscribe_in(
+            &menu,
+            window,
+            move |this, _, event: &MenuEvent, window, cx| {
+                let event = match event {
+                    MenuEvent::Picked(id, _) => id
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|ix| picked.borrow_mut().get_mut(ix)?.take())
+                        .map_or(ChoiceEvent::Dismissed, ChoiceEvent::Picked),
+                    MenuEvent::Dismissed => ChoiceEvent::Dismissed,
+                };
+                on_event(this, event, window, cx);
+            },
+        );
+        Self {
+            menu,
+            values,
+            _events: events,
+        }
+    }
+
+    /// Replaces the rows of the open list (its options changed under it). The highlight follows
+    /// its VALUE to the new rows. It starts on the checked row (the first row when none is
+    /// checked), so when it is still there, or its value is gone, the new checked row gets it.
+    pub(crate) fn refresh(&self, choices: Vec<Choice<T>>, cx: &mut App)
+    where
+        T: PartialEq,
+    {
+        let (items, values) = choice_items(choices);
+        let checked = checked_id(&items);
+        let old = std::mem::replace(&mut *self.values.borrow_mut(), values);
+        let new = self.values.clone();
+        self.menu.update(cx, |menu, cx| {
+            let first = menu
+                .items
+                .iter()
+                .position(|item| matches!(item, MenuItem::Action(a) if !a.disabled));
+            let old_default = menu
+                .items
+                .iter()
+                .position(|item| matches!(item, MenuItem::Action(a) if a.checked))
+                .or(first);
+            let moved = menu
+                .active
+                .filter(|&ix| Some(ix) != old_default)
+                .and_then(|ix| old.get(ix)?.as_ref())
+                .and_then(|value| new.borrow().iter().position(|v| v.as_ref() == Some(value)));
+            menu.replace_items(items, cx);
+            match (moved, checked) {
+                (Some(ix), _) => menu.highlight_value(&ix.to_string()),
+                (None, Some(id)) => menu.highlight_value(&id),
+                (None, None) => menu.highlight_first(cx),
+            }
+            cx.notify();
+        });
+    }
+
+    /// Closes the list without emitting and gives the keyboard back to where it was when the
+    /// list opened. Dropping a `Choices` alone leaves focus on the closed list.
+    pub(crate) fn close(self, window: &mut Window, cx: &mut App) {
+        if let Some(handle) = self.release(cx) {
+            window.focus(&handle, cx);
+        }
+    }
+
+    /// Closes the list without emitting and hands back the focus it should return to, for
+    /// callers that have no window at hand.
+    pub(crate) fn release(self, cx: &mut App) -> Option<FocusHandle> {
+        self.menu.update(cx, |menu, _| menu.restore.take())
+    }
+
+    /// The highlighted row and the checked row of the open list (tests only).
+    #[cfg(test)]
+    pub(crate) fn highlight_and_checked(&self, cx: &App) -> (Option<usize>, Option<usize>) {
+        let menu = self.menu.read(cx);
+        let checked = menu
+            .items
+            .iter()
+            .position(|item| matches!(item, MenuItem::Action(a) if a.checked));
+        (menu.active, checked)
+    }
+
+    /// The list drawn under `anchor`, as wide as it was opened with. `priority` is where it
+    /// draws: above the modal dialog that holds the trigger.
+    pub(crate) fn popover(&self, anchor: &AnchorSlot, priority: usize, cx: &App) -> Popover {
+        let width = self.menu.read(cx).width;
+        menu_popover(&self.menu, Anchor::Slot(anchor.clone()), cx)
+            .width(width)
+            .gap(4.)
+            .max_height(320.)
+            .priority(priority)
+    }
 }
 
 #[cfg(test)]
