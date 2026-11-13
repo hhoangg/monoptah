@@ -474,23 +474,6 @@ impl GitCredentialPanel {
                 .child(field_box("git-field-label", &self.label))
                 .into_any_element(),
             self.platform_row(cx),
-            labelled("Host")
-                .child(
-                    div()
-                        .id("git-host")
-                        .debug_selector(|| "git-host".into())
-                        .h(px(36.))
-                        .flex()
-                        .items_center()
-                        .px_3()
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(content(0.1))
-                        .text_size(px(13.))
-                        .text_color(content(0.6))
-                        .child(self.platform.host()),
-                )
-                .into_any_element(),
             labelled("Username")
                 .child(field_box("git-field-username", &self.username))
                 .child(muted(model::username_hint(self.platform)))

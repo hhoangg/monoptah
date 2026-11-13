@@ -188,6 +188,8 @@ fn saving_stores_the_profile_empties_the_token_and_reports_it(cx: &mut TestAppCo
     assert_eq!(list.len(), 1);
     assert_eq!(chosen.lock().unwrap().as_slice(), [list[0].id.clone()]);
     assert_eq!(token_text(&dialog, cx), "", "the token is not kept");
+    assert_eq!(list[0].platform, GitPlatform::GitHub);
+    assert_eq!(list[0].origin, "https://github.com");
     dialog.read_with(cx, |d, cx| {
         for input in [&d.label, &d.username, &d.token] {
             assert!(!input.read(cx).content.contains(TOKEN));
@@ -423,4 +425,55 @@ fn opening_on_a_saved_profile_focuses_the_panel_and_a_new_one_the_name_field(
             assert!(panel.label.focus_handle(cx).is_focused(window));
         })
         .unwrap();
+}
+
+#[gpui::test]
+fn the_new_credential_form_has_no_host_field_and_the_platform_decides_the_host(
+    cx: &mut TestAppContext,
+) {
+    use gpui::VisualTestContext;
+    let (_dir, db, credentials) = store();
+    let env = Env {
+        store: db.clone(),
+        git: FakeGit::new(true, ""),
+    };
+    let window =
+        cx.add_window(|_, cx| GitCredentialPanel::new("alpha".into(), REPO.into(), None, env, cx));
+    cx.run_until_parked();
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.refresh().unwrap();
+    assert!(visual.debug_bounds("git-host").is_none(), "no Host field");
+    assert!(visual.debug_bounds("git-platform-github.com").is_some());
+    assert!(visual.debug_bounds("git-platform-gitlab.com").is_some());
+    // Each platform stores its own fixed origin.
+    for (platform, host) in [
+        (GitPlatform::GitHub, "github.com"),
+        (GitPlatform::GitLab, "gitlab.com"),
+    ] {
+        window
+            .update(visual, |panel, _, cx| panel.set_platform(platform, cx))
+            .unwrap();
+        window
+            .update(visual, |panel, _, cx| {
+                let (l, u, t) = (
+                    panel.label.clone(),
+                    panel.username.clone(),
+                    panel.token.clone(),
+                );
+                l.update(cx, |i, cx| i.set_text(host.into(), cx));
+                u.update(cx, |i, cx| i.set_text("me".into(), cx));
+                t.update(cx, |i, cx| i.set_text(TOKEN.into(), cx));
+                panel.save(cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let saved = credentials
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.label == host)
+            .expect("saved");
+        assert_eq!(saved.platform, platform);
+        assert_eq!(saved.origin, format!("https://{host}"));
+    }
 }
