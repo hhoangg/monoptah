@@ -624,16 +624,21 @@ pub fn context_block(library: &Library) -> Option<String> {
         })
         .collect::<Vec<_>>()
         .join("\n");
+    /// Shown in every mode, after the frequency line.
+    const EXPLICIT_REQUEST: &str =
+        "If the user explicitly asks for emoji (for example \"send several\"), you may use more than this limit.";
     let frequency = match library.frequency {
         Frequency::Rarely => {
             "Rarely: at most one emoji, in about one reply in five, only for a clear mood."
         }
         Frequency::Sometimes => {
-            "Sometimes: at most one emoji per reply, in about one reply in three."
+            "Sometimes: at most two emoji per reply; a long reply may use the second where the mood or topic changes."
         }
-        Frequency::Often => "Often: one emoji in most conversational replies, never more than two.",
+        Frequency::Often => {
+            "Often: about one emoji per paragraph that carries a mood, at most four per reply."
+        }
     };
     Some(format!(
-        "<emoji>\nYou may add a picture emoji to a conversational reply when it fits the mood. Write `:emo[<emotion>]` inline or on its own line; the app shows a picture. Emotions you can use:\n{list}\n\n{frequency}\nNever inside code, code blocks, commands, commit messages, PR or issue text, reports, files you write or tool input.\n</emoji>"
+        "<emoji>\nYou may add a picture emoji to a conversational reply when it fits the mood. Write `:emo[<emotion>]` inline or on its own line; the app shows a picture. Emotions you can use:\n{list}\n\n{frequency} {EXPLICIT_REQUEST}\nNever inside code, code blocks, commands, commit messages, PR or issue text, reports, files you write or tool input.\n</emoji>"
     ))
 }

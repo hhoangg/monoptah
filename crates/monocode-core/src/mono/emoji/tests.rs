@@ -404,18 +404,22 @@ fn context_block_lists_only_usable_emotions_and_guidance() {
     assert!(block.contains("- happy: Glad, pleased, things went well"));
     assert!(block.contains("- sad: Bad news, a failure, something lost"));
     assert!(!block.contains("- love"));
-    assert!(block.contains("Sometimes: at most one emoji per reply, in about one reply in three."));
+    let explicit = "If the user explicitly asks for emoji (for example \"send several\"), you may use more than this limit.";
+    let sometimes = "Sometimes: at most two emoji per reply; a long reply may use the second where the mood or topic changes.";
+    assert!(block.contains(&format!("{sometimes} {explicit}\n")));
     assert!(block.contains(
         "Never inside code, code blocks, commands, commit messages, PR or issue text, reports, files you write or tool input."
     ));
     library.frequency = Frequency::Rarely;
-    assert!(context_block(&library)
-        .unwrap()
-        .contains("Rarely: at most one emoji, in about one reply in five, only for a clear mood."));
+    let rarely = "Rarely: at most one emoji, in about one reply in five, only for a clear mood.";
+    let block = context_block(&library).unwrap();
+    assert!(block.contains(&format!("{rarely} {explicit}\n")));
+    assert!(!block.contains("Sometimes:") && !block.contains("Often:"));
     library.frequency = Frequency::Often;
-    assert!(context_block(&library)
-        .unwrap()
-        .contains("Often: one emoji in most conversational replies, never more than two."));
+    let often = "Often: about one emoji per paragraph that carries a mood, at most four per reply.";
+    let block = context_block(&library).unwrap();
+    assert!(block.contains(&format!("{often} {explicit}\n")));
+    assert!(!block.contains("Sometimes:") && !block.contains("Rarely:"));
 }
 
 #[test]

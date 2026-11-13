@@ -560,3 +560,128 @@ fn picks_in(view: &TranscriptView) -> usize {
         })
         .sum()
 }
+
+/// Opens a Mono transcript with one reply and returns the drawn view.
+fn hover_view(cx: &mut TestAppContext, fx: &Fixture, reply: &str) -> VisualTestContext {
+    let window = open_view(cx, Some(fx.emoji.clone()), true);
+    window
+        .update(cx, |view, _, cx| {
+            view.patch(0, vec![row("user", "hi"), row("assistant", reply)], cx)
+        })
+        .unwrap();
+    let visual = VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    visual
+}
+
+fn hover(visual: &mut VisualTestContext, at: gpui::Point<gpui::Pixels>) {
+    visual.simulate_mouse_move(at, None, gpui::Modifiers::default());
+    visual
+        .executor()
+        .advance_clock(std::time::Duration::from_millis(600));
+    visual.run_until_parked();
+}
+
+fn preview_is_shown_for(
+    selector: &'static str,
+    size_of_emoji: f32,
+    reply: &str,
+    cx: &mut TestAppContext,
+) {
+    let fx = fixture(true);
+    let visual = &mut hover_view(cx, &fx, reply);
+    let emoji = visual.debug_bounds(selector).unwrap();
+    assert_eq!(emoji.size, size(px(size_of_emoji), px(size_of_emoji)));
+    assert!(visual.debug_bounds("mono-emoji-preview").is_none());
+    hover(visual, emoji.center());
+    let preview = visual
+        .debug_bounds("mono-emoji-preview")
+        .expect("the preview shows on hover");
+    assert_eq!(preview.size, size(px(112.), px(112.)));
+    assert!(
+        !preview.intersects(&emoji),
+        "the preview does not cover the emoji"
+    );
+    assert_eq!(
+        visual.debug_bounds(selector).unwrap(),
+        emoji,
+        "no layout shift"
+    );
+    hover(visual, point(px(700.), px(650.)));
+    assert!(visual.debug_bounds("mono-emoji-preview").is_none());
+    assert_eq!(visual.debug_bounds(selector).unwrap(), emoji);
+}
+
+#[gpui::test]
+fn hovering_an_inline_emoji_shows_a_larger_preview_that_leaves_with_the_mouse(
+    cx: &mut TestAppContext,
+) {
+    preview_is_shown_for("mono-emoji-happy", 20., "Nice :emo[happy] work", cx);
+}
+
+#[gpui::test]
+fn hovering_a_large_emoji_shows_a_larger_preview_that_leaves_with_the_mouse(
+    cx: &mut TestAppContext,
+) {
+    preview_is_shown_for(
+        "mono-emoji-large-celebrate",
+        56.,
+        "Done.\n\n:emo[celebrate]\n\nNext",
+        cx,
+    );
+}
+
+#[gpui::test]
+fn the_preview_carries_the_name_and_emotion_label_under_the_picture(cx: &mut TestAppContext) {
+    let fx = fixture(true);
+    let rows = rows_of("Nice :emo[celebrate] work", Some(&fx.emoji));
+    let pick = rows
+        .iter()
+        .find_map(|row| match &row.part {
+            Part::Text { runs, .. } => runs.iter().find_map(|run| run.style.emoji.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        markdown::emoji_label(&pick).as_ref(),
+        "Dance \u{b7} celebrate"
+    );
+    let visual = &mut hover_view(cx, &fx, "Nice :emo[celebrate] work");
+    let emoji = visual.debug_bounds("mono-emoji-celebrate").unwrap();
+    hover(visual, emoji.center());
+    let picture = visual.debug_bounds("mono-emoji-preview").unwrap();
+    let label = visual.debug_bounds("mono-emoji-preview-label").unwrap();
+    assert!(label.size.width > px(0.) && label.top() >= picture.bottom());
+}
+
+#[gpui::test]
+fn a_drag_across_a_line_with_an_emoji_still_selects_the_text_around_it(cx: &mut TestAppContext) {
+    let fx = fixture(true);
+    let window = open_view(cx, Some(fx.emoji.clone()), true);
+    window
+        .update(cx, |view, _, cx| {
+            view.patch(
+                0,
+                vec![row("user", "hi"), row("assistant", "Nice :emo[happy] work")],
+                cx,
+            )
+        })
+        .unwrap();
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    let emoji = visual.debug_bounds("mono-emoji-happy").unwrap();
+    let from = point(emoji.left() - px(60.), emoji.center().y);
+    let to = point(emoji.right() + px(80.), emoji.center().y);
+    visual.simulate_mouse_down(from, gpui::MouseButton::Left, gpui::Modifiers::default());
+    visual.simulate_mouse_move(
+        emoji.center(),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    visual.simulate_mouse_move(to, gpui::MouseButton::Left, gpui::Modifiers::default());
+    visual.simulate_mouse_up(to, gpui::MouseButton::Left, gpui::Modifiers::default());
+    let selected = window
+        .read_with(visual, |view, _| view.selected_text())
+        .unwrap();
+    assert_eq!(selected.as_deref(), Some("Nice work"));
+}

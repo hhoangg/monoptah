@@ -10,7 +10,12 @@ Settings > Emoji, the import dialog, and a Mono reply with emoji.
 
 - One emoji belongs to exactly one emotion (or Unsorted).
 - Packs and emotions are per Mono, not shared between Monos.
-- The "How often" frequency setting is kept (Rarely, Sometimes, Often).
+- The "How often" frequency setting is kept (Rarely, Sometimes, Often). Limits in the
+  guidance: Rarely, at most one emoji, in about one reply in five, only for a clear mood;
+  Sometimes, at most two per reply (a long reply may use the second where the mood or topic
+  changes); Often, about one per paragraph that carries a mood, at most four per reply. In
+  every mode one extra sentence lets the Mono exceed the limit when the user explicitly asks
+  for emoji (for example "send several").
 
 ## Storage
 
@@ -145,7 +150,7 @@ title, body, actions, buttons) above the settings modal.
   text streaming in after the token does not change it. Two messages with the same text
   before a token get the same picture. A token inline is drawn at text size (20 px); a token
   alone on its line (only a quote or list marker before it, nothing after) is drawn larger
-  (56 px). GIFs animate (in settings they play on hover only, in chat always). While a reply streams, a token that ends the text so far counts as inline until a line break follows it. Hover shows "<emoji name> · <emotion>". Nothing is drawn, and no
+  (56 px). GIFs animate (in settings they play on hover only, in chat always). While a reply streams, a token that ends the text so far counts as inline until a line break follows it. Hovering an emoji (inline or large) shows a floating tooltip with a 112 px preview of the same picture (aspect kept, a GIF animates) above its "<emoji name> · <emotion>" label (`EmojiPreviewTip` in `markdown.rs`, a plain GPUI tooltip, placed just below the emoji or above it near the window bottom). Nothing is drawn, and no
   space is left, for: the switch off, an unknown or empty emotion, an emotion with no emoji
   in an enabled pack, an image file that is gone, or a library that is not loaded yet.
   Tokens inside code blocks and inline code stay as text.
