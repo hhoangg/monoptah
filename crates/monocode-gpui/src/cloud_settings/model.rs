@@ -23,18 +23,10 @@ use monocode_core::{
 };
 use std::path::Path;
 
-pub(super) const CLAUDE_NOTE: &str = "Applies from the next start or reconnect. Running sessions keep the account they started with.";
-pub(super) const DOCKER_ACCOUNT_NOTE: &str =
-    "Creates and runs this project's sandboxes. Add accounts in Settings > Cloud.";
+/// The single line under the Credentials group: the account pickers apply later.
+pub(super) const ACCOUNT_CHANGE_NOTE: &str =
+    "Changing an account applies from the next start or reconnect; running sessions keep theirs.";
 pub(super) const GIT_CODESPACE_LINE: &str = "GitHub token built into the codespace (git and gh)";
-pub(super) const GIT_SANDBOX_NOTE: &str =
-    "Also signs in gh for pull requests. The token stays in memory.";
-pub(super) const NO_ACCOUNT_LINE: &str =
-    "No Claude account with a setup-token or API key. Add one in Settings, Providers.";
-pub(super) const REPO_HINT: &str = "HTTPS, GitHub or GitLab.com.";
-pub(super) const CODESPACE_BASE_HINT: &str =
-    "Empty means the current branch of the project folder.";
-pub(super) const SANDBOX_BASE_HINT: &str = "Empty means the repository's default branch.";
 
 /// The repository URL to prefill: the project's `origin` when it is an HTTPS URL on a host
 /// the backend supports. An SSH origin is never converted.

@@ -31,7 +31,10 @@ use monocode_core::{
 use std::path::Path;
 
 pub(crate) const SAVED: &str = "Checked: token works and has Cloud Sandboxes access";
-pub(crate) const HINT: &str = "Create one at app.docker.com/settings/personal-access-tokens. Tick Allow Cloud Sandboxes access; Repository permissions can stay \"Repo Public Read-only\". Prefer an expiration date. Not your Docker password.";
+/// The page where a personal access token is created; the hint links to it.
+pub(crate) const TOKEN_URL: &str = "https://app.docker.com/settings/personal-access-tokens";
+const TOKEN_LINK_TEXT: &str = "app.docker.com/settings/personal-access-tokens";
+pub(crate) const HINT: &str = "Tick Allow Cloud Sandboxes access; Repository permissions can stay \"Repo Public Read-only\". Prefer an expiration date. Not your Docker password.";
 const FOOTER: &str = "Tokens are stored encrypted in Monoptah's database, never in the Keychain. Access tokens derived from them live only in memory (15 minutes).";
 const NO_STORE: &str = "Docker accounts need the Monoptah database, which is not available here.";
 
@@ -993,9 +996,27 @@ impl SettingsView {
                     labelled("Personal access token")
                         .child(field_box("docker-form-pat", &pat_input))
                         .child(
-                            muted(HINT)
+                            div()
                                 .id("docker-form-hint")
-                                .debug_selector(|| "docker-form-hint".into()),
+                                .debug_selector(|| "docker-form-hint".into())
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    muted("Create one at").flex().flex_wrap().gap_x_1().child(
+                                        div()
+                                            .id("docker-token-link")
+                                            .debug_selector(|| "docker-token-link".into())
+                                            .role(Role::Link)
+                                            .aria_label("Open the Docker token page")
+                                            .text_color(content(0.7))
+                                            .underline()
+                                            .cursor_pointer()
+                                            .hover(|s| s.text_color(content(1.)))
+                                            .child(TOKEN_LINK_TEXT)
+                                            .on_click(|_, _, cx| cx.open_url(TOKEN_URL)),
+                                    ),
+                                )
+                                .child(muted(HINT)),
                         ),
                 )
                 .children(error.map(|error| {

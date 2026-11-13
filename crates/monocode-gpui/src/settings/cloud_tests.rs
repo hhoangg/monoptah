@@ -610,6 +610,14 @@ fn adding_an_account_checks_the_token_and_lists_it(cx: &mut TestAppContext) {
     click(visual, "docker-add-button");
     assert!(has(visual, "docker-form"));
     assert!(has(visual, "docker-form-hint"));
+    // The token page is a link that opens exactly that URL.
+    assert!(has(visual, "docker-token-link"));
+    assert_eq!(visual.opened_url(), None);
+    click(visual, "docker-token-link");
+    assert_eq!(
+        visual.opened_url().as_deref(),
+        Some("https://app.docker.com/settings/personal-access-tokens")
+    );
     // The token field is masked.
     window
         .update(visual, |view, _, cx| {

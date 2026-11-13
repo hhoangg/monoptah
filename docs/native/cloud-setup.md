@@ -36,7 +36,8 @@ machine (macOS Keychain), so several Docker accounts could not be used side by s
    (when known; Docker's token exchange does not report it, so it reads "Not known" until a
    source exists), and the projects that use it. Actions: Add, Replace token, Remove.
    - Add form: Docker ID and Personal access token (PAT, `dckr_pat_...`), with the guidance:
-     create it at `app.docker.com/settings/personal-access-tokens`, tick
+     create it at `app.docker.com/settings/personal-access-tokens` (a link that opens
+     `https://app.docker.com/settings/personal-access-tokens` in the browser), tick
      "Allow Cloud Sandboxes access" (scope `sandbox:use`), Repository permissions can stay
      "Repo Public Read-only", prefer an expiration date, never use the Docker password.
    - Save exchanges the PAT (see "Docker auth per account") and checks the JWT `scope`
@@ -65,8 +66,8 @@ Entry points:
   `mono/cloud_api/sandbox_provider.rs`) now says "Cloud settings".
 
 Layout, top to bottom:
-- **Segment** Codespaces | Docker Sandbox and the "Default for new cloud sessions" select, on
-  one row.
+- **Segment** Codespaces | Docker Sandbox, full width of the dialog body (two equal halves).
+  Below it, on its own row, "Default for new cloud sessions" (label and select on one line).
 - **Ready**: a checklist shown as inline chips, with Fix at the end of the row where possible.
   It is computed when the tab opens and on "Check again"; the dialog says "Checked when this
   tab opens. Every start checks sign-in and the Docker account again." Editing the repository
@@ -83,12 +84,14 @@ Layout, top to bottom:
     Docker ID ("Docker account <id>").
 - **Workspace** (same rows, same order for both backends):
   Repository (from origin, read-only for codespaces; editable HTTPS URL for sandboxes as
-  today), Base branch, Devcontainer (path, plus a hint with `hostRequirements` cpus and
-  memory when the file declares them), Machine (codespace machine types from
-  `codespaces::list_machines`) or Size (sbx shapes 1/2g, 2/4g, 4/8g, 8/16g, 16/32g; sizes
-  below the devcontainer's `hostRequirements` stay selectable with a warning), Stop when
-  idle (codespace: "After 30 minutes", 1, 2 or 4 hours) or Runtime limit (sandbox: "1 hour, then
-  stop", 2, 4, 8 hours).
+  today), Base branch, Devcontainer (path), then one row with two compact selects side by
+  side: Machine (codespace machine types from `codespaces::list_machines`) and Stop when idle
+  (codespace: "After 30 minutes", 1, 2 or 4 hours), or Size (sbx shapes 1/2g, 2/4g, 4/8g,
+  8/16g, 16/32g) and Runtime limit (sandbox: "1 hour, then stop", 2, 4, 8 hours). Sizes below
+  the devcontainer's `hostRequirements` stay selectable; the warning shows under that row.
+  There are no explanatory captions under the fields: hints are input placeholders, and only
+  validation errors and required warnings (size below the devcontainer, a Docker token that
+  needs replacing) are written under a field.
 - **Credentials**:
   - Docker account (sandbox only; from layer 1, "Machine sign-in (sbx login)" keeps the old
     behavior and is the default for existing projects).
@@ -98,9 +101,15 @@ Layout, top to bottom:
     dialog shows the secret status and the "Generate with claude setup-token" flow of the
     old Codespaces dialog. Sandboxes keep "None".
   - Git: codespace shows read-only text "GitHub token built into the codespace (git and gh)";
-    sandbox keeps the saved Git credential picker plus Manage (the Git credential dialog).
-  - Hint under the account pickers: changing an account applies from the next start or
-    reconnect; running sessions keep the account they started with.
+    sandbox keeps the saved Git credential picker plus Manage. Manage does not open a second
+    dialog: the Cloud settings dialog widens and a Git credential panel appears on its right
+    (select a saved profile, add an HTTPS token, check access, remove). The dialog stays the
+    only modal. Escape closes the panel first (a pending "Confirm remove" question closes
+    before that), then the dialog; Close (or switching to the Codespaces tab) returns the
+    dialog to its normal width. Saving or using a credential selects it in the form and
+    closes the panel.
+  - One line under the Credentials group, not per field: changing an account applies from
+    the next start or reconnect; running sessions keep theirs.
 - **Summary line**: `New cloud sessions use <backend> . <size> . Claude <x> [. Docker <id>] .
   Claude setup on/off` (the dots are rendered as middle dots).
 - Footer: Cancel and Save. Save validates with the same rules as before

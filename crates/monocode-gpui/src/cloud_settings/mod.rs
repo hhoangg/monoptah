@@ -20,6 +20,7 @@ use crate::{
     cloud_dialog_ui::{alert, field_box, heading, labelled, muted},
     cloud_kit_ui,
     fix_terminal::FixCommand,
+    git_credential_panel::{self, GitCredentialPanel},
     input::{self, Input},
     modal,
     runtime::{Database, locked},
@@ -80,15 +81,17 @@ pub(crate) fn claude_accounts(cx: &App) -> Vec<AccountChoice> {
         .collect()
 }
 
+/// The width of the dialog, and the extra width of the Git credential side panel.
+pub(crate) const DIALOG_WIDTH: f32 = 540.;
+pub(crate) const PANEL_WIDTH: f32 = 340.;
+
 pub(crate) enum Event {
     Close,
     /// The settings were stored: conversations of the project forget their cached copy.
     Saved,
-    /// Open the Git credential dialog for this repository, with this profile selected.
-    ManageCredentials {
-        repo_url: String,
-        selected: Option<String>,
-    },
+    /// The dialog got wider or narrower (the Git credential side panel opened or closed): the
+    /// host resizes the modal.
+    Resized,
     /// Run a fix in a terminal; call [`CloudSettings::fix_finished`] when it ends.
     Fix(FixSlot),
     /// The Docker account's token must be replaced: open Settings > Cloud.
@@ -294,6 +297,10 @@ pub(crate) struct CloudSettings {
     /// The backend whose fix is running in the terminal.
     fix_backend: Option<DefaultBackend>,
     secrets: Option<Entity<SecretsView>>,
+    /// The Git credential side panel (Docker Sandbox tab), inside this dialog.
+    panel: Option<(Entity<GitCredentialPanel>, Subscription)>,
+    /// Focus returns to the dialog on the next render (the panel that had it is gone).
+    refocus: bool,
     focus: FocusHandle,
     _events: Vec<Subscription>,
 }
@@ -466,6 +473,8 @@ impl CloudSettings {
             fix_gen: 0,
             fix_backend: None,
             secrets: None,
+            panel: None,
+            refocus: false,
             focus: cx.focus_handle(),
             _events: events,
         };
@@ -506,10 +515,6 @@ impl CloudSettings {
     #[cfg(test)]
     pub(crate) fn tab(&self) -> DefaultBackend {
         self.tab
-    }
-
-    pub(crate) fn project_name(&self) -> &str {
-        &self.name
     }
 
     pub(crate) fn repo_url(&self, cx: &App) -> String {
@@ -856,6 +861,11 @@ impl CloudSettings {
         }
         self.mark_stale(DefaultBackend::Sandbox);
         self.refresh_infos(cx);
+        if let Some((panel, _)) = &self.panel {
+            panel.update(cx, |panel, cx| {
+                panel.set_repo_url(url.trim().to_owned(), cx)
+            });
+        }
         cx.notify();
     }
 
@@ -873,6 +883,8 @@ impl CloudSettings {
         }
         self.tab = backend;
         self.open_select = None;
+        // The Git credential panel belongs to the Docker Sandbox tab.
+        self.close_credentials(cx);
         self.tab_shown(cx);
     }
 
@@ -1283,11 +1295,89 @@ impl CloudSettings {
     /// does this before it closes the dialog.
     pub(crate) fn dismiss_transient(&mut self, cx: &mut Context<Self>) -> bool {
         let open = self.open_select.take().is_some();
+        if open {
+            cx.notify();
+            return true;
+        }
+        // Then the Git credential panel: its own question first, then the panel itself.
+        if let Some((panel, _)) = &self.panel {
+            if !panel.update(cx, |panel, cx| panel.dismiss_transient(cx)) {
+                self.close_credentials(cx);
+            }
+            return true;
+        }
         let asked = std::mem::take(&mut self.confirm_replace);
-        if open || asked {
+        if asked {
             cx.notify();
         }
-        open || asked
+        asked
+    }
+
+    /// Opens the Git credential side panel for the repository typed in the form, with the
+    /// picked profile shown, and gives it the keyboard.
+    fn open_credentials(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab != DefaultBackend::Sandbox {
+            return;
+        }
+        self.open_select = None;
+        if self.panel.is_none() {
+            let env = git_credential_panel::Env {
+                store: self.env.store.clone(),
+                git: self.env.git.clone(),
+            };
+            let (name, repo_url, selected) = (
+                self.name.clone(),
+                self.repo_url(cx),
+                self.form.sandbox.credential_id.clone(),
+            );
+            let panel = cx.new(|cx| GitCredentialPanel::new(name, repo_url, selected, env, cx));
+            let events = cx.subscribe(
+                &panel,
+                |this, _, event: &git_credential_panel::Event, cx| match event {
+                    git_credential_panel::Event::Close => this.close_credentials(cx),
+                    // A saved or picked profile becomes the form's selection and the panel
+                    // closes: the choice is made.
+                    git_credential_panel::Event::Chosen(id) => {
+                        this.reload_credentials(Some(id.clone()), cx);
+                        this.close_credentials(cx);
+                    }
+                    git_credential_panel::Event::Removed => this.reload_credentials(None, cx),
+                },
+            );
+            self.panel = Some((panel, events));
+            cx.emit(Event::Resized);
+        }
+        if let Some((panel, _)) = &self.panel {
+            let panel = panel.clone();
+            panel.update(cx, |panel, cx| panel.focus_form(window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Closes the Git credential panel and forgets anything typed in it. The dialog takes the
+    /// keyboard back on the next render.
+    fn close_credentials(&mut self, cx: &mut Context<Self>) {
+        if let Some((panel, _)) = self.panel.take() {
+            panel.update(cx, |panel, cx| panel.shutdown(cx));
+            self.refocus = true;
+            cx.emit(Event::Resized);
+            cx.notify();
+        }
+    }
+
+    /// The width the modal needs now.
+    pub(crate) fn dialog_width(&self) -> f32 {
+        DIALOG_WIDTH
+            + if self.panel.is_some() {
+                PANEL_WIDTH
+            } else {
+                0.
+            }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn credentials_panel(&self) -> Option<Entity<GitCredentialPanel>> {
+        self.panel.as_ref().map(|(panel, _)| panel.clone())
     }
 
     /// The embedded `claude setup-token` terminal has the keyboard: Escape belongs to it.
@@ -1310,6 +1400,9 @@ impl CloudSettings {
         if let Some(secrets) = self.secrets.take() {
             secrets.update(cx, |view, cx| view.shutdown(cx));
         }
+        if let Some((panel, _)) = self.panel.take() {
+            panel.update(cx, |panel, cx| panel.shutdown(cx));
+        }
     }
 
     // -------------------------------------------------------------- tests
@@ -1325,6 +1418,11 @@ impl CloudSettings {
             _ => &self.cs_machine,
         };
         input.update(cx, |input, cx| input.set_text(text.to_owned(), cx));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selected_credential(&self) -> Option<String> {
+        self.form.sandbox.credential_id.clone()
     }
 
     #[cfg(test)]
@@ -1371,6 +1469,16 @@ fn section_title(text: &'static str, note: Option<&'static str>) -> Div {
                 .child(text),
         )
         .children(note.map(muted))
+}
+
+/// Two fields side by side, equal halves, tops aligned.
+fn pair(left: Div, right: Div) -> Div {
+    div()
+        .flex()
+        .items_start()
+        .gap_3()
+        .child(left.flex_1().min_w_0())
+        .child(right.flex_1().min_w_0())
 }
 
 fn rule() -> Div {
@@ -1699,13 +1807,11 @@ impl CloudSettings {
         label: &'static str,
         id: &'static str,
         input: &Entity<Input>,
-        hint: Option<String>,
         backend: DefaultBackend,
         field: Field,
     ) -> Div {
         labelled(label)
             .child(field_box(id, input))
-            .children(hint.map(muted))
             .children(self.error_for(backend, field))
     }
 
@@ -1755,7 +1861,6 @@ impl CloudSettings {
             "Base branch",
             "cloud-field-cs-base",
             &self.cs_base.clone(),
-            Some(model::CODESPACE_BASE_HINT.into()),
             cs,
             Field::Base,
         ));
@@ -1763,11 +1868,10 @@ impl CloudSettings {
             "Devcontainer",
             "cloud-field-cs-devcontainer",
             &self.cs_devcontainer.clone(),
-            model::requirement_hint(&self.infos[0]),
             cs,
             Field::Devcontainer,
         ));
-        // Machine
+        // Machine and Stop when idle share a row; the warning and the errors sit under it.
         let machine = match &self.machines {
             Machines::Loaded(_) => {
                 let current = self.current_label(Select::Machine, cx);
@@ -1777,23 +1881,30 @@ impl CloudSettings {
                 div()
                     .id("cloud-machines-loading")
                     .debug_selector(|| "cloud-machines-loading".into())
+                    .h(px(34.))
+                    .flex()
+                    .items_center()
                     .text_size(px(12.))
                     .text_color(content(0.55))
                     .child("Reading the machine types..."),
             ),
-            Machines::Failed(message) => labelled("Machine")
-                .child(field_box("cloud-field-cs-machine", &self.cs_machine))
-                .child(muted(format!(
-                    "Could not list the machine types ({}). Type one, or leave empty for {}.",
-                    message.trim_end_matches('.'),
-                    codespaces::DEFAULT_MACHINE
-                ))),
+            Machines::Failed(_) => {
+                labelled("Machine").child(field_box("cloud-field-cs-machine", &self.cs_machine))
+            }
         };
-        column = column.child(machine.children(self.machine_warning(cx)));
+        column = column.child(pair(
+            machine,
+            self.select_row("Stop when idle", Select::Idle, cx),
+        ));
+        if let Machines::Failed(message) = &self.machines {
+            column = column.child(muted(format!(
+                "Could not list the machine types ({}).",
+                message.trim_end_matches('.')
+            )));
+        }
+        column = column.children(self.machine_warning(cx));
         column = column.children(self.error_for(cs, Field::Machine));
-        column
-            .child(self.select_row("Stop when idle", Select::Idle, cx))
-            .children(self.error_for(cs, Field::Idle))
+        column.children(self.error_for(cs, Field::Idle))
     }
 
     fn machine_warning(&self, cx: &App) -> Option<Stateful<Div>> {
@@ -1841,7 +1952,6 @@ impl CloudSettings {
             "Repository",
             "cloud-field-repo",
             &self.repo.clone(),
-            Some(model::REPO_HINT.into()),
             sb,
             Field::Repo,
         ));
@@ -1849,29 +1959,24 @@ impl CloudSettings {
             "Base branch",
             "cloud-field-sb-base",
             &self.sb_base.clone(),
-            Some(model::SANDBOX_BASE_HINT.into()),
             sb,
             Field::Base,
         ));
-        let dev_hint = model::requirement_hint(&self.infos[1]).unwrap_or_else(|| {
-            "Relative to the repository root. If the repository has none, the session runs directly in the sandbox.".into()
-        });
         column = column.child(self.input_row(
             "Devcontainer",
             "cloud-field-sb-devcontainer",
             &self.sb_devcontainer.clone(),
-            Some(dev_hint),
             sb,
             Field::Devcontainer,
         ));
-        column = column.child(
-            self.select_row("Size", Select::Size, cx)
-                .children(self.size_warning()),
-        );
+        // Size and Runtime limit share a row; the warning and the errors sit under it.
+        column = column.child(pair(
+            self.select_row("Size", Select::Size, cx),
+            self.select_row("Runtime limit", Select::Runtime, cx),
+        ));
+        column = column.children(self.size_warning());
         column = column.children(self.error_for(sb, Field::Size));
-        column
-            .child(self.select_row("Runtime limit", Select::Runtime, cx))
-            .children(self.error_for(sb, Field::Runtime))
+        column.children(self.error_for(sb, Field::Runtime))
     }
 
     fn credentials_section(&mut self, cx: &mut Context<Self>) -> Div {
@@ -1880,7 +1985,6 @@ impl CloudSettings {
         if backend == DefaultBackend::Sandbox {
             column = column.child(
                 self.select_row("Docker account", Select::DockerAccount, cx)
-                    .child(muted(model::DOCKER_ACCOUNT_NOTE))
                     .children(
                         self.docker_accounts_error
                             .clone()
@@ -1890,21 +1994,21 @@ impl CloudSettings {
             );
         }
         let claude = if self.env.claude_accounts.is_empty() {
-            labelled("Claude")
-                .child(self.select(Select::Claude, self.current_label(Select::Claude, cx), cx))
-                .child(muted(model::NO_ACCOUNT_LINE))
+            labelled("Claude").child(self.select(
+                Select::Claude,
+                self.current_label(Select::Claude, cx),
+                cx,
+            ))
         } else {
             self.select_row("Claude", Select::Claude, cx)
         };
-        column = column.child(
-            claude
-                .child(muted(model::CLAUDE_NOTE))
-                .children(self.error_for(backend, Field::Claude)),
-        );
+        column = column.child(claude.children(self.error_for(backend, Field::Claude)));
         if backend == DefaultBackend::Codespace && self.form.codespace.claude.is_none() {
             column = column.children(self.secrets.clone());
         }
-        column.child(self.git_row(cx))
+        column = column.child(self.git_row(cx));
+        // The one line the spec asks for, for the whole group.
+        column.child(muted(model::ACCOUNT_CHANGE_NOTE).id("cloud-credentials-note"))
     }
 
     fn git_row(&mut self, cx: &mut Context<Self>) -> Div {
@@ -1931,16 +2035,11 @@ impl CloudSettings {
                                     .child("Manage")
                                     .debug_selector(|| "cloud-git-manage".into())
                                     .h(px(34.))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        let event = Event::ManageCredentials {
-                                            repo_url: this.repo_url(cx),
-                                            selected: this.form.sandbox.credential_id.clone(),
-                                        };
-                                        cx.emit(event);
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_credentials(window, cx)
                                     })),
                             ),
                     )
-                    .child(muted(model::GIT_SANDBOX_NOTE))
                     .children(
                         self.credentials_error
                             .clone()
@@ -2017,14 +2116,17 @@ impl Render for CloudSettings {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let height = window.viewport_size().height.as_f32() - 34.;
         let backend = self.tab;
+        if std::mem::take(&mut self.refocus) {
+            window.focus(&self.focus, cx);
+        }
         let default_select = {
             let current = self.current_label(Select::Default, cx);
             div()
+                .id("cloud-default-row")
+                .debug_selector(|| "cloud-default-row".into())
                 .flex()
-                .flex_1()
-                .min_w_0()
                 .items_start()
-                .justify_end()
+                .justify_between()
                 .gap_2()
                 .child(
                     div()
@@ -2059,23 +2161,18 @@ impl Render for CloudSettings {
             .p_4()
             .child(
                 div()
+                    .id("cloud-segments")
+                    .debug_selector(|| "cloud-segments".into())
+                    .w_full()
                     .flex()
-                    .items_start()
-                    .gap_3()
-                    .child(
-                        div()
-                            .w(px(210.))
-                            .flex_shrink_0()
-                            .flex()
-                            .p(px(2.))
-                            .gap(px(2.))
-                            .rounded_lg()
-                            .bg(content(0.05))
-                            .child(self.segment(DefaultBackend::Codespace, "Codespaces", cx))
-                            .child(self.segment(DefaultBackend::Sandbox, "Docker Sandbox", cx)),
-                    )
-                    .child(default_select),
+                    .p(px(2.))
+                    .gap(px(2.))
+                    .rounded_lg()
+                    .bg(content(0.05))
+                    .child(self.segment(DefaultBackend::Codespace, "Codespaces", cx))
+                    .child(self.segment(DefaultBackend::Sandbox, "Docker Sandbox", cx)),
             )
+            .child(default_select)
             .child(rule())
             .child(self.ready_section(cx))
             .child(rule())
@@ -2084,10 +2181,7 @@ impl Render for CloudSettings {
                     .flex()
                     .flex_col()
                     .gap_3()
-                    .child(section_title(
-                        "Workspace",
-                        Some("Same fields, same order for both backends"),
-                    ))
+                    .child(section_title("Workspace", None))
                     .child(workspace),
             )
             .child(rule())
@@ -2096,10 +2190,7 @@ impl Render for CloudSettings {
                     .flex()
                     .flex_col()
                     .gap_3()
-                    .child(section_title(
-                        "Credentials",
-                        Some("One Claude picker for both backends"),
-                    ))
+                    .child(section_title("Credentials", None))
                     .child(self.credentials_section(cx)),
             )
             .children(
@@ -2154,28 +2245,15 @@ impl Render for CloudSettings {
                         .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
                     ),
             );
-        div()
-            .id("cloud-settings")
-            .debug_selector(|| "cloud-settings".into())
-            .role(Role::Dialog)
-            .aria_label("Cloud settings")
-            .track_focus(&self.focus)
-            .relative()
+        let main = div()
+            .id("cloud-settings-main")
+            .debug_selector(|| "cloud-settings-main".into())
+            .flex_1()
+            .min_w_0()
             .min_h_0()
             .max_h(px(height))
             .flex()
             .flex_col()
-            .text_color(content(1.))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                if event.keystroke.key == "escape" && !this.terminal_focused(window, cx) {
-                    // An open select closes first; the dialog stays.
-                    if !this.dismiss_transient(cx) {
-                        cx.emit(Event::Close);
-                    }
-                    window.prevent_default();
-                    cx.stop_propagation();
-                }
-            }))
             .child(
                 div()
                     .flex_shrink_0()
@@ -2192,6 +2270,42 @@ impl Render for CloudSettings {
                     ),
             )
             .child(body)
-            .child(footer)
+            .child(footer);
+        div()
+            .id("cloud-settings")
+            .debug_selector(|| "cloud-settings".into())
+            .role(Role::Dialog)
+            .aria_label("Cloud settings")
+            .track_focus(&self.focus)
+            .relative()
+            .min_h_0()
+            .max_h(px(height))
+            .flex()
+            .flex_row()
+            .text_color(content(1.))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" && !this.terminal_focused(window, cx) {
+                    // An open select or the Git credential panel closes first; the dialog
+                    // stays.
+                    if !this.dismiss_transient(cx) {
+                        cx.emit(Event::Close);
+                    }
+                    window.prevent_default();
+                    cx.stop_propagation();
+                }
+            }))
+            .child(main)
+            .children(self.panel.as_ref().map(|(panel, _)| {
+                div()
+                    .id("cloud-credentials-side")
+                    .debug_selector(|| "cloud-credentials-side".into())
+                    .w(px(PANEL_WIDTH))
+                    .flex_shrink_0()
+                    .min_h_0()
+                    .max_h(px(height))
+                    .border_l_1()
+                    .border_color(content(0.08))
+                    .child(panel.clone())
+            }))
     }
 }

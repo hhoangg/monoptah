@@ -434,6 +434,8 @@ fn cloud_sources_never_read_the_keychain_or_claude_credentials() {
         // The project's Cloud settings dialog. secrets/model.rs is scanned for the Keychain
         // below but not listed here: it runs `git remote get-url origin`, which the kit
         // files must not do.
+        gpui.join("git_credential_panel.rs"),
+        gpui.join("git_credential_panel/model.rs"),
         gpui.join("cloud_settings/mod.rs"),
         gpui.join("cloud_settings/model.rs"),
         gpui.join("cloud_settings/secrets.rs"),

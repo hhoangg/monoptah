@@ -9986,7 +9986,6 @@ impl Render for Shell {
             .children(self.telegram_modal(window, cx))
             .children(self.telegram_topic_modal(window, cx))
             .children(self.cloud_settings_modal(window, cx))
-            .children(self.git_credential_modal(window, cx))
             .children(self.fix_terminal_modal(window, cx))
             .children(self.cloud_move_modal(window, cx))
             .children(self.delete_modal(window, cx))

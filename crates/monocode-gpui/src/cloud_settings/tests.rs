@@ -1940,7 +1940,7 @@ fn events_of(dialog: &Entity<CloudSettings>, cx: &mut TestAppContext) -> Seen {
             sink.0.borrow_mut().push(match event {
                 Event::Close => "close",
                 Event::Saved => "saved",
-                Event::ManageCredentials { .. } => "manage",
+                Event::Resized => "resized",
                 Event::Fix(_) => "fix",
                 Event::ReplaceDockerToken => "replace-token",
             })
@@ -1968,4 +1968,37 @@ fn commands_of(
         .detach();
     });
     commands
+}
+
+#[test]
+fn the_helper_captions_under_the_form_fields_are_gone() {
+    // The captions were literals in these two files; a caption that is not in the source
+    // cannot be rendered.
+    let source = [include_str!("mod.rs"), include_str!("model.rs")].concat();
+    for caption in [
+        "Empty means",
+        "HTTPS, GitHub or GitLab.com.",
+        "Relative to the repository root",
+        "Creates and runs this project's sandboxes",
+        "Also signs in gh for pull requests",
+        "Applies from the next start or reconnect. Running sessions keep the account",
+        "No Claude account with a setup-token or API key",
+        "Type one, or leave empty for",
+        "Same fields, same order for both backends",
+        "One Claude picker for both backends",
+    ] {
+        assert!(!source.contains(caption), "{caption}");
+    }
+    // The one line the spec requires, once, for the whole Credentials group.
+    assert_eq!(
+        source
+            .matches("applies from the next start or reconnect")
+            .count(),
+        1
+    );
+    assert_eq!(
+        model::ACCOUNT_CHANGE_NOTE,
+        "Changing an account applies from the next start or reconnect; running sessions keep theirs."
+    );
+    assert_eq!(source.matches("ACCOUNT_CHANGE_NOTE").count(), 2);
 }

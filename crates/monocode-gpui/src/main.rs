@@ -47,7 +47,7 @@ mod fonts;
 mod frame_log;
 mod fs_watch;
 mod git_cache;
-mod git_credential_dialog;
+mod git_credential_panel;
 mod git_gate;
 mod git_graph;
 mod git_picker;

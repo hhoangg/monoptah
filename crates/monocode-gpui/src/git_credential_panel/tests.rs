@@ -49,7 +49,7 @@ impl GitRunner for FakeGit {
 
 fn store() -> (Scratch, Database, GitCredentials) {
     let dir = std::env::temp_dir().join(format!(
-        "monoptah-git-dialog-{}",
+        "monoptah-git-panel-{}",
         monocode_core::mono::new_id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -140,16 +140,16 @@ fn a_rejected_save_does_not_echo_the_token() {
     assert_eq!(credentials.list().unwrap()[0].username, "oauth2");
 }
 
-fn open(cx: &mut TestAppContext, db: &Database, git: Arc<FakeGit>) -> Entity<GitCredentialDialog> {
+fn open(cx: &mut TestAppContext, db: &Database, git: Arc<FakeGit>) -> Entity<GitCredentialPanel> {
     let env = Env {
         store: db.clone(),
         git,
     };
-    cx.new(|cx| GitCredentialDialog::new("alpha".into(), REPO.into(), None, env, cx))
+    cx.new(|cx| GitCredentialPanel::new("alpha".into(), REPO.into(), None, env, cx))
 }
 
 fn type_into(
-    dialog: &Entity<GitCredentialDialog>,
+    dialog: &Entity<GitCredentialPanel>,
     cx: &mut TestAppContext,
     label: &str,
     username: &str,
@@ -163,7 +163,7 @@ fn type_into(
     });
 }
 
-fn token_text(dialog: &Entity<GitCredentialDialog>, cx: &mut TestAppContext) -> String {
+fn token_text(dialog: &Entity<GitCredentialPanel>, cx: &mut TestAppContext) -> String {
     dialog.read_with(cx, |d, cx| d.token.read(cx).content.to_string())
 }
 
@@ -258,7 +258,7 @@ fn removing_a_profile_asks_to_confirm_first(cx: &mut TestAppContext) {
         git: FakeGit::new(true, ""),
     };
     let dialog =
-        cx.new(|cx| GitCredentialDialog::new("alpha".into(), REPO.into(), Some(id), env, cx));
+        cx.new(|cx| GitCredentialPanel::new("alpha".into(), REPO.into(), Some(id), env, cx));
     cx.run_until_parked();
     dialog.update(cx, |d, cx| d.remove(cx));
     cx.run_until_parked();
