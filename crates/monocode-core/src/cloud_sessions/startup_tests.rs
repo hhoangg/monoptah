@@ -1076,6 +1076,10 @@ fn run_branch_script(dir: &Path, branch: &str) {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "runs the codespace's POSIX sh script on a local clone; the script only accepts Linux paths"
+)]
 fn the_branch_script_switches_to_a_branch_that_exists_on_origin_in_a_single_branch_clone() {
     let root = tempfile::tempdir().unwrap();
     let origin = root.path().join("origin");
