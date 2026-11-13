@@ -1082,6 +1082,9 @@ pub fn is_account_text(text: &str) -> bool {
 pub fn access_problem(error: &str) -> Prerequisites {
     if error.contains("not installed") {
         Prerequisites::SbxMissing
+    } else if is_account_text(error) {
+        // A Docker account that cannot sign in says where to fix it; `sbx login` is not that.
+        Prerequisites::DockerAccount(error.to_owned())
     } else if looks_logged_out(error) {
         Prerequisites::NotLoggedIn(error.to_owned())
     } else {

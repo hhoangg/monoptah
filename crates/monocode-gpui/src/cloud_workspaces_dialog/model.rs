@@ -1,11 +1,11 @@
 //! What the Cloud workspaces dialog says and decides: the words for a state, an age, a cost
 //! line, the summary and the notices about a backend that could not be read. It holds no
 //! widgets and runs no CLI, so tests read it directly.
+use crate::cloud_checks::gh_state;
 use crate::cloud_mark::{Tone, backend_name};
-use crate::codespaces_dialog::model::gh_state;
 use monocode_core::cloud_sessions::{
     CloudBackendKind, CloudRef,
-    workspaces::{WorkspaceOverview, WorkspaceRow, WorkspaceState},
+    workspaces::{DeletePreview, WorkspaceOverview, WorkspaceRow, WorkspaceState},
 };
 use monocode_core::sandboxes::Prerequisites;
 
@@ -67,25 +67,67 @@ pub(super) fn age_line(row: &WorkspaceRow, now_ms: u64) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" \u{b7} "))
 }
 
-/// `fix/login · Medium · 4 vCPU / 8g`: branch and size, whatever is known.
+/// `fix/login · Medium · 4 vCPU / 8g · Docker account me`: branch, size and the account of a
+/// sandbox, whatever is known.
 pub(super) fn detail_line(row: &WorkspaceRow) -> String {
     let mut parts: Vec<&str> = Vec::new();
     if let Some(branch) = &row.branch {
         parts.push(branch);
     }
     parts.push(&row.size);
+    if let Some(account) = &row.account_label {
+        parts.push(account);
+    }
     parts.join(" \u{b7} ")
 }
 
-/// Who uses the workspace, and whether nobody does.
-pub(super) fn uses_line(row: &WorkspaceRow) -> (String, bool) {
+/// What GitHub last said a codespace holds that git does not have, so the row warns before the
+/// user opens Delete. `None` when it reported nothing to warn about.
+pub(super) fn git_line(row: &WorkspaceRow) -> Option<String> {
+    let git = row.git?;
+    let mut parts = Vec::new();
+    if git.uncommitted {
+        parts.push("uncommitted changes");
+    }
+    if git.unpushed {
+        parts.push("unpushed commits");
+    }
+    (!parts.is_empty()).then(|| format!("Has {} (as GitHub last reported)", parts.join(" and ")))
+}
+
+/// How a row relates to this app, for its colour and its words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Use {
+    /// Live sessions use it.
+    Sessions,
+    /// This app made it and nothing uses it any more: the one the overview exists to find.
+    Orphan,
+    /// This app's store does not know it: another app, another computer or a person made it.
+    Foreign,
+}
+
+/// Who uses the workspace, and whether it is this app's at all.
+pub(super) fn uses_line(row: &WorkspaceRow) -> (String, Use) {
+    if !row.ours {
+        let used = if row.sessions.is_empty() {
+            String::new()
+        } else {
+            format!(" Sessions here use it: {}.", titles(row))
+        };
+        return (
+            format!(
+                "Not created by this app \u{2014} another app, another computer or a person made it and may be using it.{used}"
+            ),
+            Use::Foreign,
+        );
+    }
     if row.sessions.is_empty() {
         return (
             "No Monoptah session uses it \u{2014} nothing will stop it for you".into(),
-            true,
+            Use::Orphan,
         );
     }
-    (format!("Used by {}", titles(row)), false)
+    (format!("Used by {}", titles(row)), Use::Sessions)
 }
 
 fn titles(row: &WorkspaceRow) -> String {
@@ -151,7 +193,10 @@ pub(super) struct Summary {
     pub total: usize,
     /// Rows that are, or may be, drawing compute.
     pub running: usize,
+    /// Made by this app and used by no session.
     pub orphans: usize,
+    /// Not made by this app (see [`WorkspaceRow::ours`]).
+    pub foreign: usize,
     /// Estimated USD per hour of the running rows whose size has a rate.
     pub burn: f64,
 }
@@ -163,6 +208,7 @@ pub(super) fn summary(view: &WorkspaceOverview) -> Summary {
     };
     for row in &view.rows {
         sum.orphans += usize::from(row.orphan());
+        sum.foreign += usize::from(!row.ours);
         if row.state.accruing() {
             sum.running += 1;
             sum.burn += row.cost.rate_per_hour.unwrap_or(0.);
@@ -189,6 +235,9 @@ pub(super) fn summary_line(sum: &Summary) -> String {
     }
     if sum.orphans > 0 {
         line.push_str(&format!(" \u{b7} {} with no session", sum.orphans));
+    }
+    if sum.foreign > 0 {
+        line.push_str(&format!(" \u{b7} {} not created by this app", sum.foreign));
     }
     line
 }
@@ -234,12 +283,24 @@ pub(super) fn notices(view: &WorkspaceOverview) -> Vec<Notice> {
             problem: true,
         });
     }
-    if let Some(problem) = &view.sandbox_problem {
+    for (index, found) in view.sandbox_problems.iter().enumerate() {
+        let whose = found
+            .account
+            .as_deref()
+            .map(|account| format!(" for {account}"))
+            .unwrap_or_default();
         out.push(Notice {
-            id: "cloud-workspaces-sbx",
-            text: format!("Docker sandboxes are not listed. {}", problem.message()),
-            fix: problem.fix_command().map(str::to_owned),
-            problem: !matches!(problem, Prerequisites::SbxMissing),
+            id: if index == 0 {
+                "cloud-workspaces-sbx"
+            } else {
+                "cloud-workspaces-sbx-more"
+            },
+            text: format!(
+                "Docker sandboxes are not listed{whose}. {}",
+                found.problem.message()
+            ),
+            fix: found.problem.fix_command().map(str::to_owned),
+            problem: !matches!(found.problem, Prerequisites::SbxMissing),
         });
     }
     out
@@ -262,13 +323,33 @@ pub(super) fn offers(row: &WorkspaceRow) -> Offers {
     }
 }
 
-/// The paragraphs of the Delete confirmation.
-pub(super) fn delete_prompt(row: &WorkspaceRow) -> Vec<String> {
+/// What the Delete confirmation says before the workspace has been read.
+pub(super) const READING_PROMPT: &str = "Checking what would be lost\u{2026}";
+
+/// The checkbox that arms Delete when [`DeletePreview::needs_acknowledgement`].
+pub(super) fn acknowledgement_label(row: &WorkspaceRow, preview: &DeletePreview) -> String {
     let noun = row.cloud.noun();
-    let mut lines = vec![format!(
-        "Delete {noun} {}? This permanently deletes it and everything in it that was not saved to Monoptah. It cannot be undone.",
+    if !preview.ours {
+        format!("I know what is in this {noun}, it is not Monoptah\u{2019}s, and I want it deleted")
+    } else {
+        format!("I understand what is lost and want this {noun} deleted")
+    }
+}
+
+/// The paragraphs of the Delete confirmation, from what was read just now.
+pub(super) fn delete_prompt(row: &WorkspaceRow, preview: &DeletePreview) -> Vec<String> {
+    let noun = row.cloud.noun();
+    let mut lines = Vec::new();
+    if !preview.ours {
+        lines.push(format!(
+            "Monoptah did not create \u{201c}{}\u{201d}: another app, another computer or a person made this {noun}, and it may be in use right now.",
+            row.display_name
+        ));
+    }
+    lines.push(format!(
+        "Delete {noun} {}? This permanently deletes it and everything in it. It cannot be undone.",
         row.display_name
-    )];
+    ));
     if !row.sessions.is_empty() {
         let n = row.sessions.len();
         lines.push(format!(
@@ -283,12 +364,14 @@ pub(super) fn delete_prompt(row: &WorkspaceRow) -> Vec<String> {
                 .into(),
         );
     }
-    if !row.unsaved.is_empty() {
-        lines.push(format!(
-            "Not copied to Monoptah yet: {}",
-            row.unsaved.join(" ")
-        ));
+    for blocker in &preview.blockers {
+        lines.push(format!("Delete is refused: {blocker}"));
     }
+    if !preview.lines.is_empty() {
+        lines.push("What would be lost:".into());
+        lines.extend(preview.lines.iter().map(|line| format!("\u{2022} {line}")));
+    }
+    lines.extend(preview.notes.iter().cloned());
     if row.cloud.kind == CloudBackendKind::DockerSandbox {
         lines.push(
             "The sandbox is stopped first and deleted once it has stopped; that can take a couple of minutes."

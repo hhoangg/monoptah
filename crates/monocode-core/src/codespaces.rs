@@ -875,6 +875,23 @@ pub fn state(runner: &dyn GhRunner, name: &str) -> Result<String, String> {
     Ok(view.state)
 }
 
+/// The git state of codespace `name` as GitHub last reported it (`gh codespace view`, which
+/// reads the API and never starts or connects to the codespace). `None` when GitHub reports no
+/// git state for it.
+pub fn git_status(runner: &dyn GhRunner, name: &str) -> Result<Option<GitStatus>, String> {
+    valid_codespace_name(name)?;
+    #[derive(Default, Deserialize)]
+    #[serde(rename_all = "camelCase", default)]
+    struct View {
+        git_status: Option<GitStatus>,
+    }
+    let view: View = run_json(
+        runner,
+        argv(&["codespace", "view", "-c", name, "--json", "gitStatus"]),
+    )?;
+    Ok(view.git_status)
+}
+
 /// Whether a Codespace is in the authenticated user's complete inventory. Read-only;
 /// never starts or connects to it. A failed lookup (including 404, which can hide a
 /// permission failure) is not evidence that a Codespace was deleted.

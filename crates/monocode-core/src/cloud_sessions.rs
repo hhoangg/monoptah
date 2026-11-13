@@ -1606,6 +1606,7 @@ impl CloudSessions {
         self.store()?.forget_cloud(cloud)?;
         self.invalidate_ref(cloud);
         self.mark_gone(cloud);
+        self.forget_workspace_views();
         Ok(true)
     }
 
@@ -1628,9 +1629,11 @@ impl CloudSessions {
                 )?;
             }
         }
-        backend.stop(&cloud.name)?;
+        let stopped = backend.stop(&cloud.name);
         self.invalidate_ref(cloud);
-        Ok(())
+        // Whatever the outcome, an overview loaded before this call no longer says what is there.
+        self.forget_workspace_views();
+        stopped
     }
 
     /// Delete the codespace, disconnect its machine and forget all bindings.
@@ -1654,7 +1657,10 @@ impl CloudSessions {
     /// [`Self::delete_codespace_outcome`] for any backend.
     pub fn delete_cloud_outcome(&self, cloud: &CloudRef) -> Result<DeleteOutcome, String> {
         let backend = self.backend(cloud.kind)?;
-        if let Err(error) = backend.delete(&cloud.name) {
+        let deleted = backend.delete(&cloud.name);
+        // Whatever the outcome, an overview loaded before this call no longer says what is there.
+        self.forget_workspace_views();
+        if let Err(error) = deleted {
             if !backend.is_missing_error(&error) {
                 return Err(error);
             }

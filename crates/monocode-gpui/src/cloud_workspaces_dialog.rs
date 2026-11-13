@@ -10,9 +10,16 @@
 //! other backend still lists. There is no spinner: the old rows stay put while a refresh runs.
 //!
 //! Stop and Delete reuse the app API's `cloud.stop` / `cloud.delete` checks (busy sessions,
-//! unsaved files). The dialog does not run them itself: it emits [`Event::Act`], the shell adds
-//! its live busy view and calls [`CloudWorkspacesDialog::run`], and a delete is reported with
-//! [`Event::Deleted`] so the shell forgets the sessions exactly like the other delete paths.
+//! unsaved files) and run as the Docker account a sandbox row was listed under. The dialog does
+//! not run them itself: it emits [`Event::Act`], the shell adds its live busy view and calls
+//! [`CloudWorkspacesDialog::run`], and a delete is reported with [`Event::Deleted`] so the shell
+//! forgets the sessions exactly like the other delete paths.
+//!
+//! Delete asks the workspace what would be lost before it asks the user
+//! ([`monocode_core::cloud_sessions::CloudSessions::delete_preview`]), shows it, and sends back the
+//! lines the user saw: the delete refuses anything new it finds. A workspace that this app's
+//! store does not know needs an explicit acknowledgement on top. The dialog cannot be closed while
+//! a stop or delete runs, so its result always reaches the shell.
 pub(crate) mod model;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -22,7 +29,7 @@ use crate::{
     cloud_dialog_ui::{alert, code_box, heading, muted},
     cloud_mark::tone_color,
     runtime::Database,
-    settings::widgets::secondary_button,
+    settings::widgets::{checkbox, secondary_button},
     theme::*,
 };
 use gpui::{
@@ -33,7 +40,7 @@ use gpui::{
 use monocode_core::{
     cloud_sessions::{
         CloudRef,
-        workspaces::{WorkspaceOverview, WorkspaceRow},
+        workspaces::{self, DeletePreview, WorkspaceOverview, WorkspaceRow, WorkspaceTarget},
     },
     mono::cloud_api::{CloudApi, DeleteOptions},
 };
@@ -48,10 +55,12 @@ pub(crate) enum Action {
 pub(crate) enum Event {
     Close,
     /// The user chose Stop or confirmed Delete: the shell adds its live busy view and calls
-    /// [`CloudWorkspacesDialog::run`].
+    /// [`CloudWorkspacesDialog::run`]. `confirmed` is what the user was shown that a delete
+    /// would lose.
     Act {
-        cloud: CloudRef,
+        target: WorkspaceTarget,
         action: Action,
+        confirmed: Vec<String>,
     },
     /// A workspace was stopped; the shell re-reads its session badges.
     Stopped(CloudRef),
@@ -92,13 +101,29 @@ pub(crate) struct CloudWorkspacesDialog {
     loading: bool,
     /// The cloud service itself could not be built.
     load_error: Option<String>,
-    /// Actions in flight, by workspace key: `true` is a delete.
+    /// Actions in flight, by [`WorkspaceRow::key`]: `true` is a delete.
     pending: HashMap<String, bool>,
     /// The workspace whose Delete asks for confirmation.
-    confirm: Option<String>,
-    /// The last failed action or browser lookup, by workspace key.
+    confirm: Option<Confirm>,
+    /// The last failed action or browser lookup, by [`WorkspaceRow::key`].
     errors: HashMap<String, String>,
     focus: FocusHandle,
+}
+
+/// What a Delete confirmation is waiting on.
+struct Confirm {
+    key: String,
+    preview: Preview,
+    /// The user ticked the acknowledgement that arms Delete.
+    acknowledged: bool,
+}
+
+enum Preview {
+    /// The workspace is being asked what would be lost.
+    Reading,
+    Ready(DeletePreview),
+    /// What would be lost could not be read: the delete is not offered.
+    Failed(String),
 }
 
 impl EventEmitter<Event> for CloudWorkspacesDialog {}
@@ -176,12 +201,36 @@ impl CloudWorkspacesDialog {
         self.loading
     }
     #[cfg(test)]
-    pub(crate) fn error_of(&self, cloud: &CloudRef) -> Option<&str> {
-        self.errors.get(&cloud.key()).map(String::as_str)
+    pub(crate) fn error_of(&self, target: &WorkspaceTarget) -> Option<&str> {
+        self.errors
+            .get(&workspaces::target_key(
+                &target.cloud,
+                target.account.as_deref(),
+            ))
+            .map(String::as_str)
     }
     #[cfg(test)]
-    pub(crate) fn asks_to_delete(&self, cloud: &CloudRef) -> bool {
-        self.confirm.as_deref() == Some(cloud.key().as_str())
+    pub(crate) fn asks_to_delete(&self, target: &WorkspaceTarget) -> bool {
+        self.confirm.as_ref().is_some_and(|c| {
+            c.key == workspaces::target_key(&target.cloud, target.account.as_deref())
+        })
+    }
+    #[cfg(test)]
+    pub(crate) fn preview(&self) -> Option<&DeletePreview> {
+        match &self.confirm.as_ref()?.preview {
+            Preview::Ready(preview) => Some(preview),
+            _ => None,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn acknowledged(&self) -> bool {
+        self.confirm.as_ref().is_some_and(|c| c.acknowledged)
+    }
+
+    /// A stop or delete is running. The dialog stays open until it ends, so its result reaches
+    /// the shell.
+    pub(crate) fn working(&self) -> bool {
+        !self.pending.is_empty()
     }
 
     /// Escape: leaves the delete confirmation first. `true` when it did.
@@ -193,25 +242,74 @@ impl CloudWorkspacesDialog {
         had
     }
 
-    pub(crate) fn ask_to_delete(&mut self, cloud: &CloudRef, cx: &mut Context<Self>) {
-        if !self.pending.contains_key(&cloud.key()) {
-            self.confirm = Some(cloud.key());
+    /// Delete was pressed: the workspace is asked what would be lost (on a worker thread; a
+    /// codespace answers from GitHub, a sandbox is never started to read it) and the
+    /// confirmation shows the answer.
+    pub(crate) fn ask_to_delete(&mut self, target: &WorkspaceTarget, cx: &mut Context<Self>) {
+        let key = workspaces::target_key(&target.cloud, target.account.as_deref());
+        if self.pending.contains_key(&key) {
+            return;
+        }
+        self.errors.remove(&key);
+        self.confirm = Some(Confirm {
+            key: key.clone(),
+            preview: Preview::Reading,
+            acknowledged: false,
+        });
+        cx.notify();
+        let env = self.env.clone();
+        let asked = target.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { env.api()?.cloud().delete_preview(&asked) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                // The user may have left or opened another one meanwhile.
+                if let Some(confirm) = this.confirm.as_mut().filter(|c| c.key == key) {
+                    confirm.preview = match result {
+                        Ok(preview) => Preview::Ready(preview),
+                        Err(error) => Preview::Failed(error),
+                    };
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn toggle_acknowledgement(&mut self, cx: &mut Context<Self>) {
+        if let Some(confirm) = &mut self.confirm {
+            confirm.acknowledged = !confirm.acknowledged;
             cx.notify();
         }
     }
 
-    /// Stops or deletes `cloud` on a worker thread with the shell's live busy view. The checks
-    /// are the app API's: a working session, an archive in progress or unsaved files refuse the
-    /// call (the confirmation already showed the unsaved files). A sandbox delete stops it first
-    /// and waits until it has stopped.
+    /// What the Delete button sends: the lines the user saw, once the workspace was read and the
+    /// user said what the read asked for. `None` while Delete is not allowed.
+    fn confirmed_lines(&self) -> Option<Vec<String>> {
+        let confirm = self.confirm.as_ref()?;
+        let Preview::Ready(preview) = &confirm.preview else {
+            return None;
+        };
+        let armed = !preview.needs_acknowledgement() || confirm.acknowledged;
+        (armed && preview.blockers.is_empty()).then(|| preview.lines.clone())
+    }
+
+    /// Stops or deletes `target` on a worker thread with the shell's live busy view. The checks
+    /// are the app API's: a working session, an archive in progress, a session moved into the
+    /// workspace or anything to lose that `confirmed` does not name refuse the call, and they are
+    /// made again right before the delete. A sandbox delete stops it first and waits until it has
+    /// stopped.
     pub(crate) fn run(
         &mut self,
-        cloud: CloudRef,
+        target: WorkspaceTarget,
         action: Action,
+        confirmed: Vec<String>,
         busy: LiveBusy,
         cx: &mut Context<Self>,
     ) {
-        let key = cloud.key();
+        let key = workspaces::target_key(&target.cloud, target.account.as_deref());
         if self.pending.contains_key(&key) {
             return;
         }
@@ -221,38 +319,39 @@ impl CloudWorkspacesDialog {
         cx.notify();
         let env = self.env.clone();
         cx.spawn(async move |this, cx| {
-            let target = cloud.clone();
+            let acted = target.clone();
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     let api = env.api()?;
                     match action {
-                        Action::Stop => api.stop_instance(&target, &busy),
+                        Action::Stop => api.stop_instance(&acted, &busy),
                         Action::Delete => api.delete_instance(
-                            &target,
+                            &acted,
                             &busy,
                             DeleteOptions {
-                                accept_unsaved: true,
+                                confirmed: Some(confirmed),
                                 settle: true,
                             },
                         ),
                     }
                 })
                 .await;
-            let _ = this.update(cx, |this, cx| this.finish(cloud, action, result, cx));
+            let _ = this.update(cx, |this, cx| this.finish(target, action, result, cx));
         })
         .detach();
     }
 
     fn finish(
         &mut self,
-        cloud: CloudRef,
+        target: WorkspaceTarget,
         action: Action,
         result: Result<serde_json::Value, String>,
         cx: &mut Context<Self>,
     ) {
-        let key = cloud.key();
+        let key = workspaces::target_key(&target.cloud, target.account.as_deref());
         self.pending.remove(&key);
+        let cloud = target.cloud;
         match result {
             Ok(value) => match action {
                 Action::Stop => cx.emit(Event::Stopped(cloud)),
@@ -261,7 +360,7 @@ impl CloudWorkspacesDialog {
                         .map(|(_, ids)| ids)
                         .unwrap_or_default();
                     if let Some(view) = &mut self.view {
-                        view.rows.retain(|row| row.cloud != cloud);
+                        view.rows.retain(|row| row.key() != key);
                     }
                     cx.emit(Event::Deleted { cloud, removed });
                 }
@@ -280,7 +379,8 @@ impl CloudWorkspacesDialog {
     /// starts it.
     pub(crate) fn open_in_browser(&mut self, cloud: CloudRef, cx: &mut Context<Self>) {
         let env = self.env.clone();
-        self.errors.remove(&cloud.key());
+        let key = workspaces::target_key(&cloud, None);
+        self.errors.remove(&key);
         cx.spawn(async move |this, cx| {
             let target = cloud.clone();
             let url = cx
@@ -291,7 +391,7 @@ impl CloudWorkspacesDialog {
                 match url {
                     Ok(url) => cx.open_url(&url),
                     Err(error) => {
-                        this.errors.insert(cloud.key(), error);
+                        this.errors.insert(key, error);
                     }
                 }
                 cx.notify();
@@ -335,12 +435,15 @@ impl CloudWorkspacesDialog {
 
     fn row(&mut self, row: &WorkspaceRow, now: u64, cx: &mut Context<Self>) -> AnyElement {
         let cloud = row.cloud.clone();
+        let target = row.target();
         let name = cloud.name.clone();
-        let key = cloud.key();
+        let key = row.key();
         let offers = model::offers(row);
         let working = self.pending.get(&key).copied();
-        let confirming = self.confirm.as_deref() == Some(key.as_str());
-        let (uses, orphan) = model::uses_line(row);
+        let confirming = self.confirm.as_ref().is_some_and(|c| c.key == key);
+        let (uses, usage) = model::uses_line(row);
+        let orphan = usage == model::Use::Orphan;
+        let foreign = usage == model::Use::Foreign;
         let tone = model::state_tone(row.state);
         let id = |part: &str| format!("cloud-ws-{part}-{name}");
 
@@ -401,14 +504,25 @@ impl CloudWorkspacesDialog {
             .p_3()
             .rounded_lg()
             .border_1()
-            .border_color(if orphan {
+            .border_color(if orphan || foreign {
                 rgba(0xfbbf2480).into()
             } else {
                 content(0.1)
             })
-            .when(orphan, |d| d.bg(rgba(0xfbbf2412)))
+            .when(orphan || foreign, |d| d.bg(rgba(0xfbbf2412)))
             .child(title)
             .child(muted(model::detail_line(row)));
+        if let Some(git) = model::git_line(row) {
+            card = card.child(
+                div()
+                    .id(SharedString::from(id("git")))
+                    .debug_selector({
+                        let selector = id("git");
+                        move || selector.clone()
+                    })
+                    .child(muted(git)),
+            );
+        }
         if let Some(age) = model::age_line(row, now) {
             card = card.child(muted(age));
         }
@@ -417,12 +531,18 @@ impl CloudWorkspacesDialog {
                 div()
                     .id(SharedString::from(id("uses")))
                     .debug_selector({
-                        let selector = id(if orphan { "orphan" } else { "uses" });
+                        let selector = id(if orphan {
+                            "orphan"
+                        } else if foreign {
+                            "foreign"
+                        } else {
+                            "uses"
+                        });
                         move || selector.clone()
                     })
                     .text_size(px(12.))
                     .line_height(px(18.))
-                    .text_color(if orphan {
+                    .text_color(if orphan || foreign {
                         rgb(0xfbbf24).into()
                     } else {
                         content(0.7)
@@ -461,66 +581,11 @@ impl CloudWorkspacesDialog {
                 .into_any_element();
         }
         if confirming {
-            let mut prompt = div()
-                .id(SharedString::from(id("confirm")))
-                .debug_selector({
-                    let selector = id("confirm");
-                    move || selector.clone()
-                })
-                .flex()
-                .flex_col()
-                .gap_1()
-                .p_2()
-                .rounded_md()
-                .border_1()
-                .border_color(rgba(0xf8717166))
-                .bg(rgba(0xf871710f));
-            for line in model::delete_prompt(row) {
-                prompt = prompt.child(
-                    div()
-                        .text_size(px(12.))
-                        .line_height(px(18.))
-                        .text_color(content(0.85))
-                        .child(line),
-                );
-            }
-            let target = cloud.clone();
-            let cancel_name = id("cancel");
-            return card
-                .child(
-                    prompt.child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .pt_1()
-                            .child(
-                                Self::button(
-                                    id("confirm-delete"),
-                                    "Delete permanently",
-                                    true,
-                                    false,
-                                )
-                                .on_click(cx.listener(
-                                    move |_, _, _, cx| {
-                                        cx.emit(Event::Act {
-                                            cloud: target.clone(),
-                                            action: Action::Delete,
-                                        })
-                                    },
-                                )),
-                            )
-                            .child(Self::button(cancel_name, "Cancel", false, false).on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.cancel_confirm(cx);
-                                }),
-                            )),
-                    ),
-                )
-                .into_any_element();
+            return self.confirm_block(card, row, cx);
         }
 
-        let stop_target = cloud.clone();
-        let delete_target = cloud.clone();
+        let stop_target = target.clone();
+        let delete_target = target.clone();
         let open_target = cloud.clone();
         let mut actions = div().flex().gap_2().pt_1();
         actions = actions
@@ -528,8 +593,9 @@ impl CloudWorkspacesDialog {
                 Self::button(id("stop"), "Stop", false, !offers.stop).when(offers.stop, |b| {
                     b.on_click(cx.listener(move |_, _, _, cx| {
                         cx.emit(Event::Act {
-                            cloud: stop_target.clone(),
+                            target: stop_target.clone(),
                             action: Action::Stop,
+                            confirmed: Vec::new(),
                         })
                     }))
                 }),
@@ -549,6 +615,118 @@ impl CloudWorkspacesDialog {
             );
         }
         card.child(actions).into_any_element()
+    }
+
+    /// The row while its Delete asks: what the workspace says would be lost, the acknowledgement
+    /// the read asks for, and Delete (armed only once the read is in and the user answered).
+    fn confirm_block(
+        &mut self,
+        card: Stateful<Div>,
+        row: &WorkspaceRow,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let name = row.cloud.name.clone();
+        let id = |part: &str| format!("cloud-ws-{part}-{name}");
+        let mut prompt = div()
+            .id(SharedString::from(id("confirm")))
+            .debug_selector({
+                let selector = id("confirm");
+                move || selector.clone()
+            })
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgba(0xf8717166))
+            .bg(rgba(0xf871710f));
+        let line = |text: String| {
+            div()
+                .text_size(px(12.))
+                .line_height(px(18.))
+                .text_color(content(0.85))
+                .child(text)
+        };
+        let armed = self.confirmed_lines();
+        let mut acknowledgement = None;
+        match self.confirm.as_ref().map(|c| (&c.preview, c.acknowledged)) {
+            Some((Preview::Ready(preview), acknowledged)) => {
+                for text in model::delete_prompt(row, preview) {
+                    prompt = prompt.child(line(text));
+                }
+                if preview.needs_acknowledgement() && preview.blockers.is_empty() {
+                    acknowledgement =
+                        Some((model::acknowledgement_label(row, preview), acknowledged));
+                }
+            }
+            Some((Preview::Failed(error), _)) => {
+                prompt = prompt.child(
+                    div()
+                        .id(SharedString::from(id("preview-error")))
+                        .debug_selector({
+                            let selector = id("preview-error");
+                            move || selector.clone()
+                        })
+                        .child(alert(
+                            id("preview-error-text"),
+                            format!(
+                                "Could not read what would be lost, so Delete is not offered: {error}"
+                            ),
+                        )),
+                );
+            }
+            _ => {
+                prompt = prompt.child(line(model::READING_PROMPT.into()));
+            }
+        }
+        if let Some((label, acknowledged)) = acknowledgement {
+            prompt = prompt.child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .child(
+                        checkbox(id("acknowledge"), label.clone(), acknowledged, false).on_click(
+                            cx.listener(|this, _, _, cx| this.toggle_acknowledgement(cx)),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .line_height(px(18.))
+                            .text_color(content(0.85))
+                            .child(label),
+                    ),
+            );
+        }
+        let target = row.target();
+        let confirmed = armed.clone();
+        let delete = Self::button(
+            id("confirm-delete"),
+            "Delete permanently",
+            true,
+            armed.is_none(),
+        )
+        .when_some(confirmed, |button, lines| {
+            button.on_click(cx.listener(move |_, _, _, cx| {
+                cx.emit(Event::Act {
+                    target: target.clone(),
+                    action: Action::Delete,
+                    confirmed: lines.clone(),
+                })
+            }))
+        });
+        card.child(
+            prompt.child(div().flex().gap_2().pt_1().child(delete).child(
+                Self::button(id("cancel"), "Cancel", false, false).on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.cancel_confirm(cx);
+                    },
+                )),
+            )),
+        )
+        .into_any_element()
     }
 
     fn body(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -606,6 +784,7 @@ impl Render for CloudWorkspacesDialog {
             None => self.name.clone(),
         };
         let loading = self.loading;
+        let working = self.working();
         div()
             .id("cloud-workspaces-dialog")
             .debug_selector(|| "cloud-workspaces-dialog".into())
@@ -620,7 +799,8 @@ impl Render for CloudWorkspacesDialog {
             .text_color(content(1.))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
-                    if !this.cancel_confirm(cx) {
+                    // While a stop or delete runs the dialog stays, so its result reaches the shell.
+                    if !this.working() && !this.cancel_confirm(cx) {
                         cx.emit(Event::Close);
                     }
                     window.prevent_default();
@@ -654,7 +834,12 @@ impl Render for CloudWorkspacesDialog {
                     .child(
                         icon_button("cloud-ws-close", "Close Cloud workspaces", "close")
                             .size(px(28.))
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::Close))),
+                            .when(working, |b| b.opacity(0.4))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if !this.working() {
+                                    cx.emit(Event::Close)
+                                }
+                            })),
                     ),
             )
             .child(

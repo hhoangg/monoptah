@@ -44,6 +44,10 @@ pub(crate) struct Gh {
     pub auth: Mutex<Result<GhOutput, String>>,
     pub list: Mutex<String>,
     pub calls: Mutex<Vec<String>>,
+    /// `(uncommitted, unpushed)` per codespace for `view --json gitStatus`; clean when absent.
+    pub git: Mutex<std::collections::HashMap<String, (bool, bool)>>,
+    /// `view --json gitStatus` fails.
+    pub git_fails: std::sync::atomic::AtomicBool,
 }
 
 impl Gh {
@@ -52,6 +56,8 @@ impl Gh {
             auth: Mutex::new(Ok(ok(AUTH_OK))),
             list: Mutex::new(list.to_string()),
             calls: Mutex::new(vec![]),
+            git: Mutex::new(Default::default()),
+            git_fails: AtomicBool::new(false),
         })
     }
     pub(crate) fn count(&self, word: &str) -> usize {
@@ -81,6 +87,22 @@ impl GhRunner for Gh {
         }
         if line.starts_with("codespace list") {
             return Ok(ok(&self.list.lock().unwrap()));
+        }
+        if line.starts_with("codespace view") && line.contains("gitStatus") {
+            if self.git_fails.load(Ordering::Relaxed) {
+                return Err("HTTP 502 from GitHub".into());
+            }
+            let (uncommitted, unpushed) = self
+                .git
+                .lock()
+                .unwrap()
+                .get(&args[3])
+                .copied()
+                .unwrap_or_default();
+            return Ok(ok(&json!({"gitStatus": {"ahead": 0, "behind": 0,
+                "hasUncommittedChanges": uncommitted, "hasUnpushedChanges": unpushed,
+                "ref": "fix/login"}})
+            .to_string()));
         }
         if line.starts_with("codespace view") {
             return Ok(ok(r#"{"state":"Available"}"#));
@@ -367,6 +389,11 @@ pub(crate) fn world_in(store: Database) -> World {
     ]);
     let used_session = add_session(&store, &checkout.path(), &CloudRef::codespace(USED));
     let sandbox_session = add_session(&store, &checkout.path(), &CloudRef::sandbox(SBX_USED));
+    // The two orphans were this app's: an archived session still names each of them.
+    for cloud in [CloudRef::codespace(LOST), CloudRef::sandbox(SBX_LOST)] {
+        let id = add_session(&store, &checkout.path(), &cloud);
+        store.lock().unwrap().set_archived(id, true).unwrap();
+    }
     let api = api(&store, &gh, &sbx);
     World {
         checkout,
@@ -380,6 +407,14 @@ pub(crate) fn world_in(store: Database) -> World {
 }
 
 // --------------------------------------------------------------------------- helpers
+
+/// A workspace of the machine login (or a codespace), as a stop or delete names it.
+pub(crate) fn target(cloud: CloudRef) -> WorkspaceTarget {
+    WorkspaceTarget {
+        cloud,
+        account: None,
+    }
+}
 
 fn open(w: &World, cx: &mut TestAppContext) -> WindowHandle<CloudWorkspacesDialog> {
     let env = Env {
@@ -427,7 +462,11 @@ fn record(
         cx.subscribe(&entity, move |_, event: &Event, _| {
             log.lock().unwrap().push(match event {
                 Event::Close => "close".to_owned(),
-                Event::Act { cloud, action } => format!("act {action:?} {}", cloud.name),
+                Event::Act {
+                    target,
+                    action,
+                    confirmed,
+                } => format!("act {action:?} {} {confirmed:?}", target.cloud.name),
                 Event::Stopped(cloud) => format!("stopped {}", cloud.name),
                 Event::Deleted { cloud, removed } => format!("deleted {} {removed:?}", cloud.name),
             })
@@ -501,7 +540,7 @@ fn the_rows_carry_the_state_the_age_the_sessions_and_the_estimated_cost(cx: &mut
             .next(),
         Some("Created 3h 0m ago")
     );
-    assert!(!model::uses_line(used).1);
+    assert_eq!(model::uses_line(used).1, model::Use::Sessions);
     // 3 h x 2 cores x $0.09
     assert_eq!(
         model::cost_line(used),
@@ -518,7 +557,7 @@ fn the_rows_carry_the_state_the_age_the_sessions_and_the_estimated_cost(cx: &mut
 
     let lost = row(LOST);
     assert_eq!(lost.state, WorkspaceState::Stopped);
-    assert!(model::uses_line(lost).1, "an orphan");
+    assert_eq!(model::uses_line(lost).1, model::Use::Orphan);
     assert_eq!(
         model::cost_line(lost),
         "Est. Not running, so no compute cost \u{b7} \u{2248} $0.36/h when it runs \u{b7} storage may still be billed"
@@ -615,8 +654,9 @@ fn stop_goes_through_the_app_api_and_the_row_is_read_again(cx: &mut TestAppConte
     let events = record(&window, cx);
     act(&window, cx, |d, cx| {
         d.run(
-            CloudRef::codespace(USED),
+            target(CloudRef::codespace(USED)),
             Action::Stop,
+            vec![],
             LiveBusy::default(),
             cx,
         )
@@ -628,8 +668,9 @@ fn stop_goes_through_the_app_api_and_the_row_is_read_again(cx: &mut TestAppConte
 
     act(&window, cx, |d, cx| {
         d.run(
-            CloudRef::sandbox(SBX_USED),
+            target(CloudRef::sandbox(SBX_USED)),
             Action::Stop,
+            vec![],
             LiveBusy::default(),
             cx,
         )
@@ -656,33 +697,103 @@ fn stop_is_offered_only_for_a_workspace_that_is_up(cx: &mut TestAppContext) {
     }
 }
 
+/// Presses the control `selector` and lets what it starts finish.
+fn click(visual: &mut VisualTestContext, selector: &str) {
+    let at = bounds(visual, selector)
+        .unwrap_or_else(|| panic!("no {selector}"))
+        .center();
+    visual.simulate_click(at, Default::default());
+    visual.run_until_parked();
+}
+
+/// What the Delete confirmation of `cloud` shows now, as the dialog read it.
+fn prompt_of(
+    window: &WindowHandle<CloudWorkspacesDialog>,
+    cx: &mut TestAppContext,
+    cloud: &CloudRef,
+) -> Vec<String> {
+    let loaded = view(window, cx);
+    let row = loaded
+        .rows
+        .iter()
+        .find(|r| &r.cloud == cloud)
+        .unwrap()
+        .clone();
+    window
+        .read_with(cx, |d, _| {
+            model::delete_prompt(&row, d.preview().expect("the workspace was read"))
+        })
+        .unwrap()
+}
+
 #[gpui::test]
-fn delete_asks_first_and_names_what_goes_with_it(cx: &mut TestAppContext) {
+fn delete_reads_what_would_be_lost_asks_first_and_sends_back_what_was_shown(
+    cx: &mut TestAppContext,
+) {
     let w = world();
+    // The codespace holds uncommitted changes GitHub reports.
+    w.gh.git.lock().unwrap().insert(USED.into(), (true, false));
     let window = open(&w, cx);
     let events = record(&window, cx);
-    let used = CloudRef::codespace(USED);
+    let used = target(CloudRef::codespace(USED));
     act(&window, cx, |d, cx| d.ask_to_delete(&used, cx));
     assert!(
         window
             .read_with(cx, |d, _| d.asks_to_delete(&used))
             .unwrap()
     );
-    let mut visual = draw(&window, cx);
-    assert!(bounds(&mut visual, &format!("cloud-ws-confirm-{USED}")).is_some());
-    assert!(bounds(&mut visual, &format!("cloud-ws-confirm-delete-{USED}")).is_some());
+    assert_eq!(
+        w.gh.count("codespace view -c octo-used --json gitStatus"),
+        1,
+        "the workspace was asked"
+    );
     assert_eq!(w.gh.count("codespace delete"), 0, "asking deletes nothing");
 
-    let loaded = view(&window, cx);
-    let prompt = model::delete_prompt(loaded.rows.iter().find(|r| r.cloud == used).unwrap());
+    let prompt = prompt_of(&window, cx, &used.cloud);
     assert!(prompt[0].contains("cannot be undone") && prompt[0].contains("codespace"));
     assert!(
         prompt
             .iter()
             .any(|l| l.contains("1 Monoptah session on it will be removed"))
     );
+    assert!(prompt.iter().any(|l| l == "What would be lost:"));
+    assert!(
+        prompt
+            .iter()
+            .any(|l| l.contains("changes that were not committed"))
+    );
 
-    // Escape leaves the confirmation, not the dialog; nothing was deleted.
+    // Delete is not armed until the user says they understood what is lost.
+    let mut visual = draw(&window, cx);
+    assert!(bounds(&mut visual, &format!("cloud-ws-confirm-{USED}")).is_some());
+    assert!(bounds(&mut visual, &format!("cloud-ws-acknowledge-{USED}")).is_some());
+    click(&mut visual, &format!("cloud-ws-confirm-delete-{USED}"));
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "a disarmed Delete does nothing"
+    );
+    click(&mut visual, &format!("cloud-ws-acknowledge-{USED}"));
+    assert!(window.read_with(&visual, |d, _| d.acknowledged()).unwrap());
+    click(&mut visual, &format!("cloud-ws-confirm-delete-{USED}"));
+    // What the user was shown travels with the confirmation.
+    assert_eq!(
+        *events.lock().unwrap(),
+        ["act Delete octo-used [\"It has changes that were not committed.\"]"]
+    );
+    assert_eq!(
+        w.gh.count("codespace delete"),
+        0,
+        "the shell runs it, not the dialog"
+    );
+}
+
+#[gpui::test]
+fn escape_leaves_the_confirmation_and_deletes_nothing(cx: &mut TestAppContext) {
+    let w = world();
+    let window = open(&w, cx);
+    let events = record(&window, cx);
+    let used = target(CloudRef::codespace(USED));
+    act(&window, cx, |d, cx| d.ask_to_delete(&used, cx));
     act(&window, cx, |d, cx| {
         assert!(d.cancel_confirm(cx));
         assert!(!d.cancel_confirm(cx));
@@ -697,14 +808,269 @@ fn delete_asks_first_and_names_what_goes_with_it(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn a_clean_codespace_of_this_app_needs_no_acknowledgement_but_a_sandbox_always_does(
+    cx: &mut TestAppContext,
+) {
+    let w = world();
+    let window = open(&w, cx);
+    let events = record(&window, cx);
+    let used = target(CloudRef::codespace(USED));
+    act(&window, cx, |d, cx| d.ask_to_delete(&used, cx));
+    let mut visual = draw(&window, cx);
+    assert!(bounds(&mut visual, &format!("cloud-ws-acknowledge-{USED}")).is_none());
+    click(&mut visual, &format!("cloud-ws-confirm-delete-{USED}"));
+    assert_eq!(*events.lock().unwrap(), ["act Delete octo-used []"]);
+
+    // A sandbox cannot be read without starting it: the user has to say they understood.
+    let sandbox = target(CloudRef::sandbox(SBX_USED));
+    act(&window, cx, |d, cx| {
+        d.cancel_confirm(cx);
+        d.ask_to_delete(&sandbox, cx)
+    });
+    let prompt = prompt_of(&window, cx, &sandbox.cloud);
+    assert!(
+        prompt
+            .iter()
+            .any(|l| l.contains("cannot look inside a sandbox")),
+        "{prompt:?}"
+    );
+    let mut visual = draw(&window, cx);
+    assert!(bounds(&mut visual, &format!("cloud-ws-acknowledge-{SBX_USED}")).is_some());
+    events.lock().unwrap().clear();
+    click(&mut visual, &format!("cloud-ws-confirm-delete-{SBX_USED}"));
+    assert!(events.lock().unwrap().is_empty());
+    click(&mut visual, &format!("cloud-ws-acknowledge-{SBX_USED}"));
+    click(&mut visual, &format!("cloud-ws-confirm-delete-{SBX_USED}"));
+    assert_eq!(
+        *events.lock().unwrap(),
+        [format!("act Delete {SBX_USED} []")]
+    );
+    assert!(
+        w.sbx.verbs().iter().all(|v| v == "ls"),
+        "nothing was started"
+    );
+}
+
+#[gpui::test]
+fn a_workspace_this_app_did_not_create_is_not_an_orphan_and_deleting_it_is_guarded(
+    cx: &mut TestAppContext,
+) {
+    const BY_HAND: &str = "octo-by-hand";
+    const ELSEWHERE: &str = "monoptah-elsewhere-999999";
+    let w = world();
+    let mut list: Vec<Value> = serde_json::from_str(&w.gh.list.lock().unwrap()).unwrap();
+    list.push(codespace(
+        BY_HAND,
+        "basicLinux32gb",
+        "Available",
+        hours_ago(5.0),
+    ));
+    *w.gh.list.lock().unwrap() = Value::Array(list).to_string();
+    w.sbx.boxes.lock().unwrap().push(Bx {
+        id: "sbx_other",
+        name: ELSEWHERE,
+        state: "running".into(),
+        cpus: 2,
+        memory_mib: 4096,
+        created: hours_ago(1.0),
+    });
+    let window = open(&w, cx);
+    let events = record(&window, cx);
+    let loaded = view(&window, cx);
+    for name in [BY_HAND, ELSEWHERE] {
+        let row = loaded.rows.iter().find(|r| r.cloud.name == name).unwrap();
+        assert!(!row.ours && !row.orphan(), "{name}");
+        let (text, usage) = model::uses_line(row);
+        assert_eq!(usage, model::Use::Foreign);
+        assert!(text.starts_with("Not created by this app"), "{text}");
+    }
+    let sum = model::summary(&loaded);
+    assert_eq!((sum.orphans, sum.foreign), (2, 2));
+    assert!(model::summary_line(&sum).ends_with("2 not created by this app"));
+    let mut visual = draw(&window, cx);
+    for name in [BY_HAND, ELSEWHERE] {
+        assert!(bounds(&mut visual, &format!("cloud-ws-foreign-{name}")).is_some());
+        assert!(bounds(&mut visual, &format!("cloud-ws-orphan-{name}")).is_none());
+    }
+
+    // Delete says it is not this app's, and nothing happens until the user acknowledges it,
+    // although nothing is known to be lost.
+    let hand = target(CloudRef::codespace(BY_HAND));
+    act(&window, cx, |d, cx| d.ask_to_delete(&hand, cx));
+    let prompt = prompt_of(&window, cx, &hand.cloud);
+    assert!(
+        prompt[0].starts_with("Monoptah did not create") && prompt[0].contains(BY_HAND),
+        "{prompt:?}"
+    );
+    assert!(prompt.iter().any(|l| l.contains("cannot see who uses it")));
+    let mut visual = draw(&window, cx);
+    click(&mut visual, &format!("cloud-ws-confirm-delete-{BY_HAND}"));
+    assert!(events.lock().unwrap().is_empty());
+    let label = window
+        .read_with(&visual, |d, _| {
+            model::acknowledgement_label(&view_row(d, BY_HAND), d.preview().expect("read"))
+        })
+        .unwrap();
+    assert!(label.contains("not Monoptah"), "{label}");
+    click(&mut visual, &format!("cloud-ws-acknowledge-{BY_HAND}"));
+    click(&mut visual, &format!("cloud-ws-confirm-delete-{BY_HAND}"));
+    assert_eq!(
+        *events.lock().unwrap(),
+        [format!("act Delete {BY_HAND} []")]
+    );
+}
+
+fn view_row(d: &CloudWorkspacesDialog, name: &str) -> WorkspaceRow {
+    d.view()
+        .unwrap()
+        .rows
+        .iter()
+        .find(|r| r.cloud.name == name)
+        .unwrap()
+        .clone()
+}
+
+#[gpui::test]
+fn delete_is_not_offered_when_what_would_be_lost_cannot_be_read(cx: &mut TestAppContext) {
+    let w = world();
+    w.gh.git_fails.store(true, Ordering::Relaxed);
+    let window = open(&w, cx);
+    let events = record(&window, cx);
+    let used = target(CloudRef::codespace(USED));
+    act(&window, cx, |d, cx| d.ask_to_delete(&used, cx));
+    assert!(window.read_with(cx, |d, _| d.preview().is_none()).unwrap());
+    let mut visual = draw(&window, cx);
+    assert!(bounds(&mut visual, &format!("cloud-ws-preview-error-{USED}")).is_some());
+    click(&mut visual, &format!("cloud-ws-confirm-delete-{USED}"));
+    assert!(events.lock().unwrap().is_empty());
+    assert_eq!(w.gh.count("codespace delete"), 0);
+}
+
+#[gpui::test]
+fn a_session_moved_into_the_workspace_blocks_the_delete_in_the_dialog(cx: &mut TestAppContext) {
+    use monocode_core::store::{CloudLocation, SessionLocation};
+    let w = world();
+    {
+        let store = w.store.lock().unwrap();
+        let local = store.create("claude", &w.checkout.path()).unwrap();
+        store
+            .set_cloud_location(
+                local.id,
+                &SessionLocation::Cloud(CloudLocation {
+                    cloud: CloudRef::codespace(LOST),
+                    environment_id: "env-moved".into(),
+                    project_id: "p".into(),
+                    host_session_id: "host-1".into(),
+                    remote_cwd: "/workspaces/alpha".into(),
+                    local_cwd: w.checkout.path(),
+                    moved_at_row: 0,
+                    pushed_branch: None,
+                }),
+            )
+            .unwrap();
+    }
+    let window = open(&w, cx);
+    let events = record(&window, cx);
+    let loaded = view(&window, cx);
+    let lost = loaded.rows.iter().find(|r| r.cloud.name == LOST).unwrap();
+    assert!(!lost.orphan(), "a moved conversation uses it");
+    assert!(lost.sessions.iter().any(|s| s.moved));
+    let lost = target(CloudRef::codespace(LOST));
+    act(&window, cx, |d, cx| d.ask_to_delete(&lost, cx));
+    let prompt = prompt_of(&window, cx, &lost.cloud);
+    assert!(
+        prompt
+            .iter()
+            .any(|l| l.starts_with("Delete is refused:") && l.contains("moved into it")),
+        "{prompt:?}"
+    );
+    let mut visual = draw(&window, cx);
+    click(&mut visual, &format!("cloud-ws-confirm-delete-{LOST}"));
+    assert!(events.lock().unwrap().is_empty(), "never armed");
+}
+
+#[gpui::test]
+fn work_that_appeared_after_the_confirmation_refuses_the_delete_and_the_row_says_so(
+    cx: &mut TestAppContext,
+) {
+    let w = world();
+    let window = open(&w, cx);
+    let used = target(CloudRef::codespace(USED));
+    act(&window, cx, |d, cx| d.ask_to_delete(&used, cx));
+    let confirmed = window
+        .read_with(cx, |d, _| d.confirmed_lines())
+        .unwrap()
+        .expect("clean: armed at once");
+    assert!(confirmed.is_empty());
+    // Uncommitted work appears while the confirmation is open.
+    w.gh.git.lock().unwrap().insert(USED.into(), (true, false));
+    act(&window, cx, |d, cx| {
+        d.run(
+            used.clone(),
+            Action::Delete,
+            confirmed,
+            LiveBusy::default(),
+            cx,
+        )
+    });
+    assert_eq!(w.gh.count("codespace delete"), 0);
+    let error = window
+        .read_with(cx, |d, _| d.error_of(&used).map(str::to_owned))
+        .unwrap()
+        .expect("the refusal is shown on the row");
+    assert!(
+        error.contains("not shown") && error.contains("not committed"),
+        "{error}"
+    );
+}
+
+#[gpui::test]
+fn the_dialog_cannot_be_closed_while_a_delete_runs(cx: &mut TestAppContext) {
+    let w = world();
+    let window = open(&w, cx);
+    let events = record(&window, cx);
+    let mut visual = draw(&window, cx);
+    window
+        .update(&mut visual, |d, window, cx| {
+            window.focus(&d.focus.clone(), cx);
+            d.run(
+                target(CloudRef::codespace(USED)),
+                Action::Delete,
+                vec![],
+                LiveBusy::default(),
+                cx,
+            );
+            assert!(d.working());
+        })
+        .unwrap();
+    // The delete is still running: Escape does not close the dialog.
+    visual.simulate_keystrokes("escape");
+    assert!(
+        !events.lock().unwrap().contains(&"close".to_owned()),
+        "{:?}",
+        events.lock().unwrap()
+    );
+    visual.run_until_parked();
+    assert_eq!(
+        *events.lock().unwrap(),
+        [format!("deleted {USED} [{}]", w.used_session)]
+    );
+    // Done: Escape closes it again.
+    assert!(!window.read_with(&visual, |d, _| d.working()).unwrap());
+    visual.simulate_keystrokes("escape");
+    assert!(events.lock().unwrap().contains(&"close".to_owned()));
+}
+
+#[gpui::test]
 fn deleting_a_codespace_forgets_its_sessions_and_reports_their_ids(cx: &mut TestAppContext) {
     let w = world();
     let window = open(&w, cx);
     let events = record(&window, cx);
     act(&window, cx, |d, cx| {
         d.run(
-            CloudRef::codespace(USED),
+            target(CloudRef::codespace(USED)),
             Action::Delete,
+            vec![],
             LiveBusy::default(),
             cx,
         )
@@ -738,8 +1104,9 @@ fn deleting_a_running_sandbox_stops_it_first(cx: &mut TestAppContext) {
     let events = record(&window, cx);
     act(&window, cx, |d, cx| {
         d.run(
-            CloudRef::sandbox(SBX_USED),
+            target(CloudRef::sandbox(SBX_USED)),
             Action::Delete,
+            vec![],
             LiveBusy::default(),
             cx,
         )
@@ -762,18 +1129,30 @@ fn a_hibernating_sandbox_can_be_deleted_once_it_has_stopped(cx: &mut TestAppCont
     let events = record(&window, cx);
     // It is not offered Stop, but Delete waits for it to be stopped and then removes it.
     let hibernating = CloudRef::sandbox(SBX_LOST);
+    // Its archived session goes with it.
+    let archived = w.api.cloud().session_ids_on(&hibernating);
+    assert_eq!(archived.len(), 1);
     let loaded = view(&window, cx);
     let row = loaded.rows.iter().find(|r| r.cloud == hibernating).unwrap();
     assert!(!model::offers(row).stop && model::offers(row).delete);
     act(&window, cx, |d, cx| {
-        d.run(hibernating.clone(), Action::Delete, LiveBusy::default(), cx)
+        d.run(
+            target(hibernating.clone()),
+            Action::Delete,
+            vec![],
+            LiveBusy::default(),
+            cx,
+        )
     });
     assert!(w.sbx.gone("sbx_001b"));
     assert!(
         !w.sbx.verbs().contains(&"stop".to_owned()),
         "already going down"
     );
-    assert_eq!(*events.lock().unwrap(), [format!("deleted {SBX_LOST} []")]);
+    assert_eq!(
+        *events.lock().unwrap(),
+        [format!("deleted {SBX_LOST} {archived:?}")]
+    );
 }
 
 #[gpui::test]
@@ -786,13 +1165,20 @@ fn a_working_session_blocks_the_delete_and_the_row_says_so(cx: &mut TestAppConte
         ..LiveBusy::default()
     };
     act(&window, cx, |d, cx| {
-        d.run(CloudRef::codespace(USED), Action::Delete, busy, cx)
+        d.run(
+            target(CloudRef::codespace(USED)),
+            Action::Delete,
+            vec![],
+            busy,
+            cx,
+        )
     });
     assert_eq!(w.gh.count("codespace delete"), 0);
     assert!(events.lock().unwrap().is_empty());
     let error = window
         .read_with(cx, |d, _| {
-            d.error_of(&CloudRef::codespace(USED)).map(str::to_owned)
+            d.error_of(&target(CloudRef::codespace(USED)))
+                .map(str::to_owned)
         })
         .unwrap()
         .expect("the refusal is shown on the row");
@@ -808,6 +1194,32 @@ fn a_working_session_blocks_the_delete_and_the_row_says_so(cx: &mut TestAppConte
             .unwrap()
             .is_some()
     );
+}
+
+#[gpui::test]
+fn a_docker_account_that_cannot_be_listed_is_named_in_its_notice(_cx: &mut TestAppContext) {
+    use monocode_core::{cloud_sessions::workspaces::SandboxProblem, sandboxes::Prerequisites};
+    let overview = WorkspaceOverview {
+        project: "/p".into(),
+        repo: None,
+        loaded_ms: 0,
+        rows: vec![],
+        gh: None,
+        codespaces_error: None,
+        sandbox_problems: vec![SandboxProblem {
+            account: Some("Docker account octo".into()),
+            problem: Prerequisites::DockerAccount(
+                "Docker rejected the token. Choose another in Cloud settings.".into(),
+            ),
+        }],
+    };
+    let notes = model::notices(&overview);
+    let sbx = notes
+        .iter()
+        .find(|n| n.id == "cloud-workspaces-sbx")
+        .unwrap();
+    assert!(sbx.text.contains("for Docker account octo"), "{}", sbx.text);
+    assert!(sbx.problem && sbx.fix.is_none(), "not `sbx login`");
 }
 
 #[gpui::test]

@@ -1,6 +1,7 @@
-//! The Cloud workspaces dialog opened from the project menu's Cloud setup submenu, and what the
-//! shell does with its Stop and Delete: adds its live busy view, and on a delete forgets the
-//! sessions of the deleted workspace in the window and the Sub-agents panel.
+//! The Cloud workspaces dialog opened from the project menu's "Cloud workspaces…" item (next to
+//! "Cloud settings…"), and what the shell does with its Stop and Delete: adds its live busy view,
+//! and on a delete forgets the sessions of the deleted workspace in the window and the Sub-agents
+//! panel. The dialog stays open while a stop or delete runs, so the result always gets here.
 use super::*;
 use crate::cloud_workspaces_dialog::{self, CloudWorkspacesDialog};
 
@@ -37,11 +38,17 @@ impl Shell {
             window,
             move |this, _, event: &cloud_workspaces_dialog::Event, window, cx| match event {
                 cloud_workspaces_dialog::Event::Close => this.close_cloud_workspaces(window, cx),
-                cloud_workspaces_dialog::Event::Act { cloud, action } => {
+                cloud_workspaces_dialog::Event::Act {
+                    target,
+                    action,
+                    confirmed,
+                } => {
                     // The dialog runs the call; the live view of what is busy is the shell's.
                     let busy = this.cloud_busy_snapshot(cx);
-                    let (cloud, action) = (cloud.clone(), *action);
-                    dialog.update(cx, |dialog, cx| dialog.run(cloud, action, busy, cx));
+                    let (target, action, confirmed) = (target.clone(), *action, confirmed.clone());
+                    dialog.update(cx, |dialog, cx| {
+                        dialog.run(target, action, confirmed, busy, cx)
+                    });
                 }
                 cloud_workspaces_dialog::Event::Stopped(cloud) => {
                     this.cloud_states.remove(&cloud.key());
@@ -60,8 +67,15 @@ impl Shell {
         cx.notify();
     }
 
+    /// Closes the dialog, unless a stop or delete is running: closing would drop the dialog and
+    /// the subscription that carries the result back here, and the window would keep sessions of
+    /// a workspace that is gone.
     pub(super) fn close_cloud_workspaces(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.cloud_workspaces.take().is_some() {
+        if let Some(open) = &self.cloud_workspaces {
+            if open.view.read(cx).working() {
+                return;
+            }
+            self.cloud_workspaces = None;
             self.focus_workspace(window, cx);
             cx.notify();
         }
@@ -72,6 +86,7 @@ impl Shell {
         let Some(open) = &self.cloud_workspaces else {
             return;
         };
+        // A running stop or delete keeps the dialog open; `close_cloud_workspaces` checks that.
         if !open.view.update(cx, |dialog, cx| dialog.cancel_confirm(cx)) {
             self.close_cloud_workspaces(window, cx);
         }
@@ -101,29 +116,17 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let view = self.cloud_workspaces.as_ref()?.view.clone();
-        let viewport = window.viewport_size();
-        let width = 640f32.min(viewport.width.as_f32() - 24.);
-        let weak = cx.weak_entity();
-        Some(
-            div()
-                .absolute()
-                .size_full()
-                .child(crate::modal::scrim("cloud-workspaces-scrim"))
-                .child(
-                    popover("cloud-workspaces-modal", Anchor::Center)
-                        .modal_surface(self.workspace.boxy_layout())
-                        .width(width)
-                        .gap(0.)
-                        .max_height(viewport.height.as_f32() - 32.)
-                        .priority(60)
-                        .on_dismiss(move |window, cx| {
-                            let _ = weak
-                                .update(cx, |this, cx| this.cloud_workspaces_escape(window, cx));
-                        })
-                        .child(view),
-                )
-                .into_any_element(),
-        )
+        // The shared cloud dialog frame: a barrier (the window behind gets no hover, click or
+        // scroll) and the modal surface.
+        Some(self.cloud_modal_sized(
+            "cloud-workspaces-modal",
+            view,
+            60,
+            640.,
+            |this, window, cx| this.cloud_workspaces_escape(window, cx),
+            window,
+            cx,
+        ))
     }
 }
 
@@ -135,7 +138,7 @@ mod tests {
     use monocode_core::cloud_sessions::{CloudBackendKind, CloudRef, CloudSessions};
 
     #[gpui::test]
-    fn the_cloud_setup_entry_opens_the_dialog_and_escape_closes_it(cx: &mut TestAppContext) {
+    fn the_menu_entry_opens_the_dialog_and_escape_closes_it(cx: &mut TestAppContext) {
         let (window, _, _) = crate::shell::tests::window(cx);
         let w = fixtures::world_in(window.read_with(cx, |s, _| s.store.clone()).unwrap());
         let env = Env {
@@ -207,8 +210,9 @@ mod tests {
             .unwrap();
         dialog.update(cx, |_, cx| {
             cx.emit(Event::Act {
-                cloud: used.clone(),
+                target: fixtures::target(used.clone()),
                 action: Action::Delete,
+                confirmed: vec![],
             })
         });
         cx.run_until_parked();
@@ -233,5 +237,88 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[gpui::test]
+    fn closing_during_a_delete_is_refused_and_the_result_still_cleans_the_window(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let store = window.read_with(cx, |s, _| s.store.clone()).unwrap();
+        let w = fixtures::world_in(store.clone());
+        let id = w.used_session;
+        let used = CloudRef::codespace("octo-used");
+        window
+            .update(cx, |shell, window, cx| {
+                let summary = crate::runtime::locked(&shell.store)
+                    .unwrap()
+                    .sessions()
+                    .unwrap()
+                    .into_iter()
+                    .find(|s| s.id == id)
+                    .unwrap();
+                shell.cloud = Arc::new(CloudSessions::new(
+                    w.gh.clone(),
+                    Arc::new(fixtures::FakeHost::default()),
+                    shell.store.clone(),
+                ));
+                shell.session_summaries.insert(id, summary);
+                shell.order.push(id);
+                shell.cloud_marks.insert(
+                    id,
+                    cloud::CloudMark {
+                        local_project: w.checkout.path(),
+                        codespace: "octo-used".into(),
+                        kind: CloudBackendKind::Codespaces,
+                    },
+                );
+                let env = Env {
+                    api: Some(w.api.clone()),
+                    store: w.store.clone(),
+                };
+                shell.open_cloud_workspaces_with(w.checkout.path(), env, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let dialog = window
+            .read_with(cx, |shell, _| {
+                shell.cloud_workspaces.as_ref().unwrap().view.clone()
+            })
+            .unwrap();
+        // The user confirmed Delete and presses Escape (or Close) while it runs.
+        dialog.update(cx, |_, cx| {
+            cx.emit(Event::Act {
+                target: fixtures::target(used.clone()),
+                action: Action::Delete,
+                confirmed: vec![],
+            })
+        });
+        window
+            .update(cx, |shell, window, cx| {
+                // The event ran the delete on a worker; it has not finished.
+                assert!(dialog.read(cx).working());
+                shell.cloud_workspaces_escape(window, cx);
+                assert!(shell.cloud_workspaces.is_some(), "Escape is ignored");
+                shell.close_cloud_workspaces(window, cx);
+                assert!(shell.cloud_workspaces.is_some(), "Close is ignored");
+            })
+            .unwrap();
+        // The result reaches the shell, which forgets the deleted workspace's sessions.
+        cx.run_until_parked();
+        cx.run_until_parked();
+        assert_eq!(w.gh.count("codespace delete -c octo-used --force"), 1);
+        window
+            .read_with(cx, |shell, _| {
+                assert!(!shell.cloud_marks.contains_key(&id));
+                assert!(shell.cloud_gone.contains(&used.key()), "marked gone");
+            })
+            .unwrap();
+        // Now it can be closed.
+        window
+            .update(cx, |shell, window, cx| {
+                shell.cloud_workspaces_escape(window, cx);
+                assert!(shell.cloud_workspaces.is_none());
+            })
+            .unwrap();
     }
 }

@@ -86,6 +86,18 @@ fn the_project_menu_has_one_cloud_settings_item_for_local_projects_only(cx: &mut
                 .position(|l| l == "Cloud settings…")
                 .expect("Cloud settings");
             assert_eq!(names[at - 1], "Telegram…");
+            // The overview of what is running sits right after it, as its own item.
+            assert_eq!(names[at + 1], "Cloud workspaces…");
+            let Some(MenuItem::Action(workspaces)) = items
+                .iter()
+                .find(|i| matches!(i, MenuItem::Action(a) if a.id == "cloud-workspaces"))
+            else {
+                panic!("no cloud-workspaces item");
+            };
+            assert!(
+                workspaces.submenu.is_empty(),
+                "it opens the dialog directly"
+            );
             let Some(MenuItem::Action(item)) = items
                 .iter()
                 .find(|i| matches!(i, MenuItem::Action(a) if a.id == "cloud-settings"))
@@ -94,11 +106,34 @@ fn the_project_menu_has_one_cloud_settings_item_for_local_projects_only(cx: &mut
             };
             assert!(item.submenu.is_empty(), "it opens the dialog directly");
             let remote = project_items(shell, "remote://box/work/monocode", w, cx);
-            assert!(
-                !remote
-                    .iter()
-                    .any(|i| matches!(i, MenuItem::Action(a) if a.id == "cloud-settings"))
+            assert!(!remote.iter().any(
+                |i| matches!(i, MenuItem::Action(a) if a.id == "cloud-settings"
+                        || a.id == "cloud-workspaces")
+            ));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_cloud_workspaces_menu_item_opens_its_dialog(cx: &mut TestAppContext) {
+    let (window, _, _) = window(cx);
+    window
+        .update(cx, |shell, w, cx| {
+            shell.run_menu(
+                MenuTarget::Project {
+                    path: "/work/monocode".into(),
+                    rail: false,
+                },
+                "cloud-workspaces",
+                None,
+                w,
+                cx,
             );
+            assert!(shell.cloud_workspaces.is_some());
+            assert!(shell.cloud_settings.is_none(), "not the settings dialog");
+            // Nothing runs: close it before its load is ever polled.
+            shell.close_cloud_workspaces(w, cx);
+            assert!(shell.cloud_workspaces.is_none());
         })
         .unwrap();
 }

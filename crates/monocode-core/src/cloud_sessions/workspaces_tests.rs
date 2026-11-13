@@ -9,6 +9,7 @@ use crate::mono::cloud_api::{CloudApi, DeleteOptions};
 use crate::remote::Machine;
 use crate::sandboxes::{Prerequisites, SbxOutput, SbxRunner};
 use crate::store::Store;
+use crate::store::{CloudLocation, SessionLocation};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -39,6 +40,10 @@ struct Gh {
     auth: Mutex<Result<GhOutput, String>>,
     list: Mutex<String>,
     calls: Mutex<Vec<String>>,
+    /// What `gh codespace view --json gitStatus` answers per codespace; clean when absent.
+    git: Mutex<std::collections::HashMap<String, Value>>,
+    /// `view --json gitStatus` fails with this.
+    git_error: Mutex<Option<String>>,
 }
 
 impl Gh {
@@ -47,6 +52,8 @@ impl Gh {
             auth: Mutex::new(Ok(out(true, AUTH_OK))),
             list: Mutex::new(list.to_string()),
             calls: Mutex::new(vec![]),
+            git: Mutex::new(Default::default()),
+            git_error: Mutex::new(None),
         })
     }
     fn calls(&self) -> Vec<String> {
@@ -54,6 +61,15 @@ impl Gh {
     }
     fn count(&self, word: &str) -> usize {
         self.calls().iter().filter(|c| c.contains(word)).count()
+    }
+    /// The codespace has these git flags from now on.
+    fn set_git(&self, name: &str, uncommitted: bool, unpushed: bool) {
+        self.git.lock().unwrap().insert(
+            name.into(),
+            json!({"gitStatus": {"ahead": i32::from(unpushed), "behind": 0,
+                "hasUncommittedChanges": uncommitted, "hasUnpushedChanges": unpushed,
+                "ref": "fix/login"}}),
+        );
     }
 }
 
@@ -77,6 +93,23 @@ impl GhRunner for Gh {
         }
         if line.starts_with("codespace stop") || line.starts_with("codespace delete") {
             return Ok(out(true, ""));
+        }
+        if line.starts_with("codespace view") && line.contains("gitStatus") {
+            if let Some(error) = self.git_error.lock().unwrap().clone() {
+                return Err(error);
+            }
+            let name = &args[3];
+            let reply = self
+                .git
+                .lock()
+                .unwrap()
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| {
+                    json!({"gitStatus": {"ahead": 0, "behind": 0, "hasUncommittedChanges": false,
+                    "hasUnpushedChanges": false, "ref": "fix/login"}})
+                });
+            return Ok(out(true, &reply.to_string()));
         }
         if line.starts_with("codespace view") {
             return Ok(out(true, r#"{"state":"Available"}"#));
@@ -103,6 +136,8 @@ struct Bx {
     id: String,
     name: String,
     agent: &'static str,
+    /// The Docker account it lives in (`None`: the machine login).
+    account: Option<&'static str>,
     state: String,
     cpus: u32,
     memory_mib: u64,
@@ -114,6 +149,7 @@ fn bx(id: &str, name: &str, state: &str, cpus: u32, memory_mib: u64, created: St
         id: id.into(),
         name: name.into(),
         agent: "shell",
+        account: None,
         state: state.into(),
         cpus,
         memory_mib,
@@ -130,6 +166,12 @@ struct Sbx {
     settle_after: Mutex<usize>,
     /// The next this-many `rm` calls are refused as too early.
     rm_refusals: Mutex<usize>,
+    /// `(verb, account)` of every call, in order.
+    accounts: Mutex<Vec<(String, Option<String>)>>,
+    /// The accounts whose `ls` answers this instead of their boxes.
+    ls_fail: Mutex<std::collections::HashMap<Option<String>, Result<SbxOutput, String>>>,
+    /// Once a box has read `stopped` it reads `running` again (something woke it).
+    wake_after_stopped: Mutex<bool>,
 }
 
 impl Sbx {
@@ -140,6 +182,9 @@ impl Sbx {
             ls_reply: Mutex::new(None),
             settle_after: Mutex::new(2),
             rm_refusals: Mutex::new(0),
+            accounts: Mutex::new(vec![]),
+            ls_fail: Mutex::new(Default::default()),
+            wake_after_stopped: Mutex::new(false),
         })
     }
     fn calls(&self) -> Vec<String> {
@@ -149,6 +194,16 @@ impl Sbx {
         self.calls()
             .iter()
             .map(|c| c.split_whitespace().next().unwrap().to_owned())
+            .collect()
+    }
+    /// The accounts the calls of `verb` ran as.
+    fn accounts_of(&self, verb: &str) -> Vec<Option<String>> {
+        self.accounts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(v, _)| v == verb)
+            .map(|(_, account)| account.clone())
             .collect()
     }
     fn state_of(&self, id: &str) -> Option<String> {
@@ -183,7 +238,15 @@ fn sbx_fail(stderr: &str) -> Result<SbxOutput, String> {
 }
 
 impl SbxRunner for Sbx {
-    fn run(&self, args: &[String], _: Option<&str>) -> Result<SbxOutput, String> {
+    fn run(&self, args: &[String], stdin: Option<&str>) -> Result<SbxOutput, String> {
+        self.run_as(None, args, stdin)
+    }
+    fn run_as(
+        &self,
+        account: Option<&str>,
+        args: &[String],
+        _: Option<&str>,
+    ) -> Result<SbxOutput, String> {
         // The base flags every call carries are not part of what a test cares about.
         let args: Vec<String> = args
             .iter()
@@ -192,16 +255,38 @@ impl SbxRunner for Sbx {
             .collect();
         self.calls.lock().unwrap().push(args.join(" "));
         let verb = args.first().map(String::as_str).unwrap_or_default();
+        self.accounts
+            .lock()
+            .unwrap()
+            .push((verb.to_owned(), account.map(str::to_owned)));
         let mut boxes = self.boxes.lock().unwrap();
+        // A sandbox lives in one account: asked as another, sbx does not know it.
+        let mine = |b: &Bx| b.account == account;
         match verb {
             "ls" => {
                 if let Some(reply) = self.ls_reply.lock().unwrap().clone() {
                     return reply;
                 }
-                sbx_ok(json!(boxes.iter().map(json_of).collect::<Vec<_>>()).to_string())
+                if let Some(reply) = self
+                    .ls_fail
+                    .lock()
+                    .unwrap()
+                    .get(&account.map(str::to_owned))
+                    .cloned()
+                {
+                    return reply;
+                }
+                sbx_ok(
+                    json!(boxes
+                        .iter()
+                        .filter(|b| mine(b))
+                        .map(json_of)
+                        .collect::<Vec<_>>())
+                    .to_string(),
+                )
             }
             "inspect" => {
-                let Some(b) = boxes.iter_mut().find(|b| b.id == args[1]) else {
+                let Some(b) = boxes.iter_mut().find(|b| b.id == args[1] && mine(b)) else {
                     return sbx_fail(&format!("error: sandbox '{}' not found", args[1]));
                 };
                 if matches!(b.state.as_str(), "stopping" | "hibernating") {
@@ -210,17 +295,25 @@ impl SbxRunner for Sbx {
                     if *left == 0 {
                         b.state = "stopped".into();
                     }
+                } else if b.state == "stopped" && *self.wake_after_stopped.lock().unwrap() {
+                    // The read that ended the wait said stopped; the next one finds it up again.
+                    *self.wake_after_stopped.lock().unwrap() = false;
+                    b.state = "running".into();
                 }
                 sbx_ok(json_of(b).to_string())
             }
             "stop" => {
-                if let Some(b) = boxes.iter_mut().find(|b| b.id == args[1]) {
-                    b.state = "stopping".into();
-                }
+                let Some(b) = boxes.iter_mut().find(|b| b.id == args[1] && mine(b)) else {
+                    return sbx_fail(&format!("error: sandbox '{}' not found", args[1]));
+                };
+                b.state = "stopping".into();
                 sbx_ok(String::new())
             }
             "rm" => {
                 let id = args.last().unwrap();
+                if !boxes.iter().any(|b| &b.id == id && mine(b)) {
+                    return sbx_fail(&format!("error: sandbox '{id}' not found"));
+                }
                 let mut refusals = self.rm_refusals.lock().unwrap();
                 if *refusals > 0 {
                     *refusals -= 1;
@@ -329,6 +422,14 @@ fn add_session(store: &Mutex<Store>, local: &str, cloud: &CloudRef) -> i64 {
     store.create("claude", &project.key).unwrap().id
 }
 
+/// The reasons sandboxes could not be listed, whatever account they belong to.
+fn problems(view: &WorkspaceOverview) -> Vec<Prerequisites> {
+    view.sandbox_problems
+        .iter()
+        .map(|p| p.problem.clone())
+        .collect()
+}
+
 fn row<'a>(view: &'a WorkspaceOverview, name: &str) -> &'a WorkspaceRow {
     view.rows
         .iter()
@@ -380,6 +481,15 @@ fn full() -> Fx {
         PROJECT,
         &CloudRef::sandbox("monoptah-fix-login-a1b2c3"),
     );
+    // The two orphans were this app's: an archived session still names each, so the store knows
+    // them although no live session uses them.
+    for cloud in [
+        CloudRef::codespace("octo-lost"),
+        CloudRef::sandbox("monoptah-main-d4e5f6"),
+    ] {
+        let id = add_session(&fx.store, PROJECT, &cloud);
+        fx.store.lock().unwrap().set_archived(id, true).unwrap();
+    }
     fx
 }
 
@@ -390,7 +500,7 @@ fn lists_a_row_per_workspace_of_both_backends() {
     let fx = full();
     let view = fx.svc.workspaces_overview(PROJECT, false);
     assert_eq!(view.repo.as_deref(), Some("octo/widgets"));
-    assert!(view.codespaces_error.is_none() && view.sandbox_problem.is_none());
+    assert!(view.codespaces_error.is_none() && view.sandbox_problems.is_empty());
     // The sandbox that is not Monoptah's is not listed.
     assert_eq!(view.rows.len(), 4, "{:?}", view.rows);
 
@@ -598,13 +708,13 @@ fn without_sbx_the_codespaces_still_list_and_the_fix_is_named() {
     *fx.sbx.ls_reply.lock().unwrap() =
         Some(Err("Docker Sandboxes CLI (sbx) is not installed".into()));
     let view = fx.svc.workspaces_overview(PROJECT, false);
-    assert_eq!(view.sandbox_problem, Some(Prerequisites::SbxMissing));
+    assert_eq!(problems(&view), [Prerequisites::SbxMissing]);
     assert_eq!(view.rows.len(), 2);
     assert!(view.rows.iter().all(|r| r.cloud.name.starts_with("octo-")));
 
     *fx.sbx.ls_reply.lock().unwrap() = Some(sbx_fail("not logged in: run `sbx login`"));
     let view = fx.svc.workspaces_overview(PROJECT, true);
-    let problem = view.sandbox_problem.unwrap();
+    let problem = problems(&view).remove(0);
     assert!(
         matches!(problem, Prerequisites::NotLoggedIn(_)),
         "{problem:?}"
@@ -614,8 +724,8 @@ fn without_sbx_the_codespaces_still_list_and_the_fix_is_named() {
     *fx.sbx.ls_reply.lock().unwrap() = Some(sbx_fail("connection refused"));
     let view = fx.svc.workspaces_overview(PROJECT, true);
     assert!(matches!(
-        view.sandbox_problem,
-        Some(Prerequisites::Unreachable(_))
+        problems(&view)[..],
+        [Prerequisites::Unreachable(_)]
     ));
     assert_eq!(view.rows.len(), 2);
 }
@@ -664,13 +774,25 @@ fn stopping_a_codespace_goes_through_the_existing_stop_and_forgets_the_view() {
     let api = api_over(&fx);
     api.cloud().workspaces_overview(PROJECT, false);
     assert!(api.cloud().cached_workspaces(PROJECT).is_some());
-    api.stop_instance(&CloudRef::codespace("octo-used"), &|_: &CloudRef| false)
+    api.stop_instance(&target_of("octo-used"), &|_: &CloudRef| false)
         .unwrap();
     assert_eq!(fx.gh.count("codespace stop -c octo-used"), 1);
     assert!(
         api.cloud().cached_workspaces(PROJECT).is_none(),
         "the view is stale now"
     );
+}
+
+/// A codespace, or a sandbox of the machine login, as a stop or delete names it.
+fn target_of(name: &str) -> WorkspaceTarget {
+    WorkspaceTarget {
+        cloud: if name.starts_with("octo-") {
+            CloudRef::codespace(name)
+        } else {
+            CloudRef::sandbox(name)
+        },
+        account: None,
+    }
 }
 
 /// A `CloudApi` over the same fakes (its own service, like the app's shared one).
@@ -692,7 +814,7 @@ fn deleting_a_running_sandbox_stops_it_waits_for_stopped_then_removes_it() {
     let ids = fx.svc.session_ids_on(&cloud);
     assert_eq!(ids.len(), 1);
     assert_eq!(
-        fx.svc.delete_settled(&cloud).unwrap(),
+        fx.svc.delete_settled(&cloud, &|| Ok(())).unwrap(),
         DeleteOutcome::Deleted
     );
     let verbs = fx.sbx.verbs();
@@ -717,7 +839,7 @@ fn deleting_a_hibernating_sandbox_waits_without_stopping_it_again() {
     let fx = full();
     fx.sbx.boxes.lock().unwrap()[0].state = "hibernating".into();
     let cloud = CloudRef::sandbox("monoptah-fix-login-a1b2c3");
-    fx.svc.delete_settled(&cloud).unwrap();
+    fx.svc.delete_settled(&cloud, &|| Ok(())).unwrap();
     assert!(
         !fx.sbx.verbs().contains(&"stop".to_owned()),
         "{:?}",
@@ -734,7 +856,7 @@ fn a_delete_the_sandbox_refuses_as_too_early_is_retried() {
     fx.sbx.boxes.lock().unwrap()[1].state = "stopped".into();
     *fx.sbx.rm_refusals.lock().unwrap() = 2;
     let cloud = CloudRef::sandbox("monoptah-main-d4e5f6");
-    fx.svc.delete_settled(&cloud).unwrap();
+    fx.svc.delete_settled(&cloud, &|| Ok(())).unwrap();
     let rms = fx.sbx.verbs().iter().filter(|v| *v == "rm").count();
     assert_eq!(rms, 3);
     assert!(fx.sbx.state_of("sbx_001b").is_none());
@@ -746,7 +868,7 @@ fn a_sandbox_that_never_settles_is_not_deleted() {
     fx.sbx.boxes.lock().unwrap()[0].state = "hibernating".into();
     *fx.sbx.settle_after.lock().unwrap() = usize::MAX;
     let cloud = CloudRef::sandbox("monoptah-fix-login-a1b2c3");
-    let error = fx.svc.delete_settled(&cloud).unwrap_err();
+    let error = fx.svc.delete_settled(&cloud, &|| Ok(())).unwrap_err();
     assert!(
         error.contains("hibernating") && error.contains("not deleted"),
         "{error}"
@@ -761,60 +883,637 @@ fn a_sandbox_that_never_settles_is_not_deleted() {
 fn deleting_a_codespace_needs_no_wait_and_forgets_its_sessions() {
     let fx = full();
     let cloud = CloudRef::codespace("octo-used");
-    fx.svc.delete_settled(&cloud).unwrap();
+    fx.svc.delete_settled(&cloud, &|| Ok(())).unwrap();
     assert_eq!(fx.gh.count("codespace delete -c octo-used --force"), 1);
     assert_eq!(fx.sleeps.load(Ordering::SeqCst), 0);
     assert!(fx.svc.session_ids_on(&cloud).is_empty());
     assert!(fx.sbx.calls().is_empty(), "no sbx call for a codespace");
 }
 
+// ------------------------------------------------------- what is lost, and whose it is
+
+/// The app's live view of what is busy: a session, and from which `working_on` call on it says
+/// it is archiving (the calls are counted).
+struct AppView {
+    session: Option<i64>,
+    working_from: usize,
+    working_calls: AtomicUsize,
+}
+impl AppView {
+    fn session(id: i64) -> Self {
+        Self {
+            session: Some(id),
+            working_from: usize::MAX,
+            working_calls: AtomicUsize::new(0),
+        }
+    }
+    fn working_from(call: usize) -> Self {
+        Self {
+            session: None,
+            working_from: call,
+            working_calls: AtomicUsize::new(0),
+        }
+    }
+}
+impl crate::mono::cloud_api::AppBusy for AppView {
+    fn working_on(&self, _: &CloudRef) -> bool {
+        self.working_calls.fetch_add(1, Ordering::SeqCst) >= self.working_from
+    }
+    fn session_busy(&self, id: i64) -> bool {
+        self.session == Some(id)
+    }
+}
+
+fn confirmed(lines: &[&str]) -> DeleteOptions {
+    DeleteOptions {
+        confirmed: Some(lines.iter().map(|l| (*l).to_owned()).collect()),
+        settle: true,
+    }
+}
+
 #[test]
-fn the_delete_refuses_busy_sessions_and_unsaved_files_until_the_user_accepted() {
+fn the_delete_refuses_busy_sessions_and_unsaved_files_unless_the_user_confirmed_them() {
     let fx = full();
     let api = api_over(&fx);
-    let cloud = CloudRef::codespace("octo-used");
+    let target = target_of("octo-used");
+    let cloud = target.cloud.clone();
     let session = fx.svc.session_ids_on(&cloud)[0];
     let none = |_: &CloudRef| false;
 
     // A session the live view says is busy blocks the delete.
-    struct Busy(i64);
-    impl crate::mono::cloud_api::AppBusy for Busy {
-        fn working_on(&self, _: &CloudRef) -> bool {
-            false
-        }
-        fn session_busy(&self, id: i64) -> bool {
-            id == self.0
-        }
-    }
     let error = api
-        .delete_instance(&cloud, &Busy(session), DeleteOptions::default())
+        .delete_instance(&target, &AppView::session(session), confirmed(&[]))
         .unwrap_err();
     assert!(error.contains("sessions are working on it"), "{error}");
     assert_eq!(fx.gh.count("codespace delete"), 0);
 
-    // Files that exist only in the workspace need the user's say-so.
+    // Files that exist only in the workspace: the plain `cloud.delete` refuses outright ...
     api.cloud()
         .record_unsaved_cloud(&cloud, &["3 files were not copied.".into()])
         .unwrap();
     let error = api
-        .delete_instance(&cloud, &none, DeleteOptions::default())
+        .delete_instance(&target, &none, DeleteOptions::default())
         .unwrap_err();
     assert!(error.contains("would lose files"), "{error}");
+    // ... and the overview refuses what the user was not shown.
+    let error = api
+        .delete_instance(&target, &none, confirmed(&[]))
+        .unwrap_err();
+    assert!(
+        error.contains("not shown") && error.contains("3 files were not copied."),
+        "{error}"
+    );
     assert_eq!(fx.gh.count("codespace delete"), 0);
     let done = api
-        .delete_instance(
-            &cloud,
-            &none,
-            DeleteOptions {
-                accept_unsaved: true,
-                settle: true,
-            },
-        )
+        .delete_instance(&target, &none, confirmed(&["3 files were not copied."]))
         .unwrap();
     assert_eq!(done["deleted"], true);
     // The window drops these sessions, like after a `cloud.delete`.
     assert_eq!(done["removedSessionIds"], json!([session]));
     assert_eq!(fx.gh.count("codespace delete -c octo-used --force"), 1);
+}
+
+#[test]
+fn the_preview_reads_the_git_state_of_a_codespace_and_asks_for_an_acknowledgement() {
+    let fx = full();
+    let target = target_of("octo-used");
+    // Clean and this app's own: a plain confirmation is enough.
+    let clean = fx.svc.delete_preview(&target).unwrap();
+    assert!(clean.lines.is_empty() && clean.notes.is_empty() && clean.blockers.is_empty());
+    assert!(clean.ours && !clean.contents_unknown && !clean.needs_acknowledgement());
+    // Uncommitted and unpushed work is named, and needs the user's say-so.
+    fx.gh.set_git("octo-used", true, true);
+    let dirty = fx.svc.delete_preview(&target).unwrap();
+    assert_eq!(dirty.lines, [LINE_UNCOMMITTED, LINE_UNPUSHED]);
+    assert!(dirty.needs_acknowledgement());
+    // What an earlier archive recorded is part of it.
+    fx.svc
+        .record_unsaved_cloud(&target.cloud, &["A file was not copied.".into()])
+        .unwrap();
+    assert_eq!(
+        fx.svc.delete_preview(&target).unwrap().lines,
+        ["A file was not copied.", LINE_UNCOMMITTED, LINE_UNPUSHED]
+    );
+    // GitHub saying nothing is not "nothing to lose".
+    fx.gh
+        .git
+        .lock()
+        .unwrap()
+        .insert("octo-used".into(), json!({}));
+    assert!(fx
+        .svc
+        .delete_preview(&target)
+        .unwrap()
+        .lines
+        .contains(&LINE_GIT_UNKNOWN.to_owned()));
+    // A read that fails is an error: no Delete is offered without knowing.
+    *fx.gh.git_error.lock().unwrap() = Some("HTTP 502".into());
+    assert!(fx.svc.delete_preview(&target).unwrap_err().contains("502"));
+    // Reading never starts anything.
+    assert_eq!(
+        fx.gh.count("codespace stop") + fx.gh.count("codespace delete"),
+        0
+    );
+}
+
+#[test]
+fn a_sandbox_is_not_started_to_read_it_and_always_needs_an_acknowledgement() {
+    let fx = full();
+    let preview = fx
+        .svc
+        .delete_preview(&target_of("monoptah-fix-login-a1b2c3"))
+        .unwrap();
+    assert!(preview.ours && preview.contents_unknown && preview.lines.is_empty());
+    assert!(preview.notes.contains(&NOTE_SANDBOX_CONTENTS.to_owned()));
+    assert!(preview.needs_acknowledgement());
+    assert!(fx.sbx.calls().is_empty(), "{:?}", fx.sbx.calls());
+}
+
+#[test]
+fn a_delete_refuses_what_appeared_after_the_user_confirmed() {
+    let fx = full();
+    let api = api_over(&fx);
+    let target = target_of("octo-used");
+    let none = |_: &CloudRef| false;
+    let seen = fx.svc.delete_preview(&target).unwrap().lines;
+    assert!(seen.is_empty());
+    // Work was left in the codespace after the confirmation opened.
+    fx.gh.set_git("octo-used", true, false);
+    let error = api
+        .delete_instance(&target, &none, confirmed(&[]))
+        .unwrap_err();
+    assert!(
+        error.contains(LINE_UNCOMMITTED) && error.contains("not shown"),
+        "{error}"
+    );
+    assert_eq!(fx.gh.count("codespace delete"), 0);
+    // Once it is shown and confirmed, the delete goes through.
+    api.delete_instance(&target, &none, confirmed(&[LINE_UNCOMMITTED]))
+        .unwrap();
+    assert_eq!(fx.gh.count("codespace delete -c octo-used --force"), 1);
+    // A git state that cannot be read now refuses too.
+    let fx = full();
+    let api = api_over(&fx);
+    *fx.gh.git_error.lock().unwrap() = Some("HTTP 502".into());
+    assert!(api
+        .delete_instance(&target, &none, confirmed(&[]))
+        .unwrap_err()
+        .contains("502"));
+    assert_eq!(fx.gh.count("codespace delete"), 0);
+}
+
+#[test]
+fn a_workspace_this_store_does_not_know_is_not_an_orphan_and_needs_a_strong_confirmation() {
+    let fx = full();
+    // Made by hand or by another app: a codespace of the repository and a Monoptah-named sandbox
+    // that no session, start, move or pin of this store names.
+    let mut list: Vec<Value> = serde_json::from_str(&fx.gh.list.lock().unwrap()).unwrap();
+    list.push(codespace(
+        "octo-by-hand",
+        "basicLinux32gb",
+        "Available",
+        hours_ago(5.0),
+    ));
+    *fx.gh.list.lock().unwrap() = Value::Array(list).to_string();
+    fx.sbx.boxes.lock().unwrap().push(bx(
+        "sbx_other",
+        "monoptah-elsewhere-999999",
+        "running",
+        2,
+        4096,
+        hours_ago(1.0),
+    ));
+    let view = fx.svc.workspaces_overview(PROJECT, false);
+    for name in ["octo-by-hand", "monoptah-elsewhere-999999"] {
+        let foreign = row(&view, name);
+        assert!(!foreign.ours, "{name}");
+        assert!(!foreign.orphan(), "{name} must not be called an orphan");
+        assert!(foreign.sessions.is_empty());
+    }
+    // This store's own are unchanged.
+    for name in [
+        "octo-used",
+        "octo-lost",
+        "monoptah-fix-login-a1b2c3",
+        "monoptah-main-d4e5f6",
+    ] {
+        assert!(row(&view, name).ours, "{name}");
+    }
+    let orphans: Vec<_> = view
+        .rows
+        .iter()
+        .filter(|r| r.orphan())
+        .map(|r| r.cloud.name.as_str())
+        .collect();
+    assert_eq!(orphans, ["octo-lost", "monoptah-main-d4e5f6"]);
+
+    // Deleting one says whose it is and needs the acknowledgement, whatever it holds.
+    let preview = fx.svc.delete_preview(&target_of("octo-by-hand")).unwrap();
+    assert!(!preview.ours && preview.lines.is_empty());
+    assert!(preview.notes.contains(&NOTE_NOT_OURS.to_owned()));
+    assert!(preview.needs_acknowledgement());
+}
+
+#[test]
+fn what_makes_a_workspace_known_to_this_store() {
+    let fx = full();
+    let svc = &fx.svc;
+    let unknown = CloudRef::codespace("octo-nobody");
+    assert!(!svc.known_to_this_app(&unknown));
+    // A live session, an archived one, a saved list of what a delete loses.
+    assert!(svc.known_to_this_app(&CloudRef::codespace("octo-used")));
+    assert!(svc.known_to_this_app(&CloudRef::codespace("octo-lost")));
+    svc.record_unsaved_cloud(&unknown, &["A file.".into()])
+        .unwrap();
+    assert!(svc.known_to_this_app(&unknown));
+    // A local session moved into it.
+    let moved = CloudRef::codespace("octo-moved");
+    assert!(!svc.known_to_this_app(&moved));
+    move_local_session(&fx, &moved);
+    assert!(svc.known_to_this_app(&moved));
+    // A Docker account pin names a sandbox this store created.
+    let sandbox = CloudRef::sandbox("monoptah-pinned-123456");
+    assert!(!svc.known_to_this_app(&sandbox));
+    crate::sandboxes::account::pin(&fx.store.lock().unwrap(), &sandbox.name, Some("acctone"))
+        .unwrap();
+    assert!(svc.known_to_this_app(&sandbox));
+    // A store that cannot be read knows nothing.
+    let poisoned = fx.store.clone();
+    let _ = std::thread::spawn(move || {
+        let _guard = poisoned.lock().unwrap();
+        panic!("poison the store");
+    })
+    .join();
+    assert!(!svc.known_to_this_app(&CloudRef::codespace("octo-used")));
+}
+
+/// A LOCAL session of [`PROJECT`] whose location is `cloud` (moved there); returns its id.
+fn move_local_session(fx: &Fx, cloud: &CloudRef) -> i64 {
+    let store = fx.store.lock().unwrap();
+    let local = store.create("claude", PROJECT).unwrap();
+    store
+        .set_cloud_location(
+            local.id,
+            &SessionLocation::Cloud(CloudLocation {
+                cloud: cloud.clone(),
+                environment_id: "env-moved".into(),
+                project_id: "p".into(),
+                host_session_id: "host-1".into(),
+                remote_cwd: "/workspaces/widgets".into(),
+                local_cwd: PROJECT.into(),
+                moved_at_row: 0,
+                pushed_branch: None,
+            }),
+        )
+        .unwrap();
+    local.id
+}
+
+#[test]
+fn a_local_session_moved_into_a_workspace_is_counted_and_blocks_its_delete() {
+    let fx = full();
+    let cloud = CloudRef::codespace("octo-lost");
+    let moved = move_local_session(&fx, &cloud);
+    let view = fx.svc.workspaces_overview(PROJECT, false);
+    let lost = row(&view, "octo-lost");
+    // It uses the workspace, so the workspace is no orphan, and the row says it was moved there.
+    assert!(!lost.orphan());
+    assert!(lost.sessions.iter().any(|s| s.id == moved && s.moved));
+    // Deleting it is refused whatever the user confirms: bring the conversation back first.
+    let preview = fx.svc.delete_preview(&target_of("octo-lost")).unwrap();
+    assert_eq!(preview.blockers.len(), 1, "{preview:?}");
+    assert!(preview.blockers[0].contains("moved into it"));
+    let api = api_over(&fx);
+    let error = api
+        .delete_instance(
+            &target_of("octo-lost"),
+            &|_: &CloudRef| false,
+            confirmed(&[]),
+        )
+        .unwrap_err();
+    assert!(error.contains("moved into it"), "{error}");
+    assert_eq!(fx.gh.count("codespace delete"), 0);
+    // An unreadable location could be this workspace's too, and blocks as well.
+    fx.store
+        .lock()
+        .unwrap()
+        .save_setting("cloud-location:9999", "{not json")
+        .unwrap();
+    assert!(fx
+        .svc
+        .delete_blockers(&CloudRef::codespace("octo-used"))
+        .iter()
+        .any(|b| b.contains("cannot be read")));
+}
+
+// ---------------------------------------------------------------- Docker accounts
+
+fn use_account(fx: &Fx, account: &str) {
+    let store = fx.store.lock().unwrap();
+    super::docker_config::save(
+        &store,
+        PROJECT,
+        &super::docker_config::DockerProjectConfig {
+            repo_url: "https://github.com/octo/widgets".into(),
+            docker_account: Some(account.into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+}
+
+fn bx_in(account: &'static str, id: &str, name: &str, state: &str) -> Bx {
+    Bx {
+        account: Some(account),
+        ..bx(id, name, state, 4, 8192, hours_ago(2.0))
+    }
+}
+
+#[test]
+fn sandboxes_are_listed_as_the_projects_docker_account_not_the_machine_login() {
+    let fx = full();
+    use_account(&fx, "acctone");
+    // The two sandboxes the fixture's sessions are bound to belong to that account too.
+    for name in ["monoptah-fix-login-a1b2c3", "monoptah-main-d4e5f6"] {
+        crate::sandboxes::account::pin(&fx.store.lock().unwrap(), name, Some("acctone")).unwrap();
+    }
+    {
+        let mut boxes = fx.sbx.boxes.lock().unwrap();
+        boxes.clear();
+        boxes.push(bx_in("acctone", "sbx_a", "monoptah-acct-a11111", "running"));
+        // The machine login has its own sandbox, and no working login at all.
+        boxes.push(bx(
+            "sbx_m",
+            "monoptah-login-m22222",
+            "running",
+            2,
+            4096,
+            hours_ago(1.0),
+        ));
+    }
+    fx.sbx
+        .ls_fail
+        .lock()
+        .unwrap()
+        .insert(None, sbx_fail("not logged in: run `sbx login`"));
+    let view = fx.svc.workspaces_overview(PROJECT, false);
+    // Only the project's account was asked: no `sbx login` is needed and none is reported.
+    assert_eq!(fx.sbx.accounts_of("ls"), [Some("acctone".to_owned())]);
+    assert!(
+        view.sandbox_problems.is_empty(),
+        "{:?}",
+        view.sandbox_problems
+    );
+    let listed = row(&view, "monoptah-acct-a11111");
+    assert_eq!(listed.account.as_deref(), Some("acctone"));
+    assert!(view
+        .rows
+        .iter()
+        .all(|r| r.cloud.name != "monoptah-login-m22222"));
+    // Rows of the same name in two accounts stay apart.
+    assert_ne!(
+        target_key(&listed.cloud, Some("acctone")),
+        target_key(&listed.cloud, None)
+    );
+    assert_eq!(listed.key(), target_key(&listed.cloud, Some("acctone")));
+}
+
+#[test]
+fn a_sandbox_bound_to_another_account_adds_that_account_to_the_listing() {
+    let fx = full();
+    use_account(&fx, "acctone");
+    let name = "monoptah-fix-login-a1b2c3";
+    // The session's sandbox was created by another account; the pin remembers which.
+    crate::sandboxes::account::pin(&fx.store.lock().unwrap(), name, Some("acctwo")).unwrap();
+    crate::sandboxes::account::pin(
+        &fx.store.lock().unwrap(),
+        "monoptah-main-d4e5f6",
+        Some("acctone"),
+    )
+    .unwrap();
+    {
+        let mut boxes = fx.sbx.boxes.lock().unwrap();
+        boxes.clear();
+        boxes.push(bx_in("acctone", "sbx_a", "monoptah-acct-a11111", "stopped"));
+        boxes.push(bx_in("acctwo", "sbx_b", name, "running"));
+    }
+    let view = fx.svc.workspaces_overview(PROJECT, false);
+    assert_eq!(
+        fx.sbx.accounts_of("ls"),
+        [Some("acctone".to_owned()), Some("acctwo".to_owned())]
+    );
+    assert_eq!(row(&view, name).account.as_deref(), Some("acctwo"));
+    assert_eq!(
+        row(&view, "monoptah-acct-a11111").account.as_deref(),
+        Some("acctone")
+    );
+}
+
+#[test]
+fn an_account_that_cannot_be_listed_is_named_and_the_others_still_list() {
+    let fx = full();
+    use_account(&fx, "acctone");
+    let name = "monoptah-fix-login-a1b2c3";
+    crate::sandboxes::account::pin(&fx.store.lock().unwrap(), name, Some("acctwo")).unwrap();
+    crate::sandboxes::account::pin(
+        &fx.store.lock().unwrap(),
+        "monoptah-main-d4e5f6",
+        Some("acctone"),
+    )
+    .unwrap();
+    {
+        let mut boxes = fx.sbx.boxes.lock().unwrap();
+        boxes.clear();
+        boxes.push(bx_in("acctone", "sbx_a", "monoptah-acct-a11111", "running"));
+        boxes.push(bx_in("acctwo", "sbx_b", name, "running"));
+    }
+    fx.sbx.ls_fail.lock().unwrap().insert(
+        Some("acctwo".into()),
+        Err(
+            "Docker rejected the access token of this account. Choose another in Cloud settings."
+                .into(),
+        ),
+    );
+    let view = fx.svc.workspaces_overview(PROJECT, false);
+    assert_eq!(view.sandbox_problems.len(), 1);
+    assert!(
+        matches!(
+            view.sandbox_problems[0].problem,
+            Prerequisites::DockerAccount(_)
+        ),
+        "{:?}",
+        view.sandbox_problems
+    );
+    // Not the machine login's fix.
+    assert_eq!(view.sandbox_problems[0].problem.fix_command(), None);
+    row(&view, "monoptah-acct-a11111");
+    assert!(view.rows.iter().all(|r| r.cloud.name != name));
+}
+
+/// The overview row of `name` and a stop or delete API over the same fakes.
+fn listed(fx: &Fx, name: &str) -> (WorkspaceRow, CloudApi) {
+    let view = fx.svc.workspaces_overview(PROJECT, true);
+    (row(&view, name).clone(), api_over(fx))
+}
+
+#[test]
+fn stop_and_delete_run_as_the_account_the_row_was_listed_under() {
+    let fx = full();
+    use_account(&fx, "acctone");
+    let name = "monoptah-acct-a11111";
+    // No pin for it (another install created it): only the listing knows the account.
+    {
+        let mut boxes = fx.sbx.boxes.lock().unwrap();
+        boxes.clear();
+        boxes.push(bx_in("acctone", "sbx_a", name, "running"));
+    }
+    let (found, api) = listed(&fx, name);
+    assert_eq!(found.account.as_deref(), Some("acctone"));
+    assert!(!found.ours, "nothing in this store names it");
+    let none = |_: &CloudRef| false;
+    api.stop_instance(&found.target(), &none).unwrap();
+    assert_eq!(fx.sbx.accounts_of("stop"), [Some("acctone".to_owned())]);
+
+    let (found, api) = listed(&fx, name);
+    api.delete_instance(&found.target(), &none, confirmed(&[]))
+        .unwrap();
+    // Every call of the delete, the state reads and the removal included, ran as the account.
+    for verb in ["inspect", "rm"] {
+        let accounts = fx.sbx.accounts_of(verb);
+        assert!(!accounts.is_empty(), "{verb}");
+        assert!(
+            accounts.iter().all(|a| a.as_deref() == Some("acctone")),
+            "{verb}: {accounts:?}"
+        );
+    }
+    assert!(fx.sbx.state_of("sbx_a").is_none(), "it was really removed");
+}
+
+#[test]
+fn a_pin_that_disagrees_with_the_listing_is_left_alone_not_overridden() {
+    let fx = full();
+    use_account(&fx, "acctone");
+    let name = "monoptah-acct-a11111";
+    fx.sbx.boxes.lock().unwrap().clear();
+    fx.sbx
+        .boxes
+        .lock()
+        .unwrap()
+        .push(bx_in("acctone", "sbx_a", name, "running"));
+    let (found, api) = listed(&fx, name);
+    crate::sandboxes::account::pin(&fx.store.lock().unwrap(), name, Some("acctthree")).unwrap();
+    let before = fx.sbx.calls().len();
+    let none = |_: &CloudRef| false;
+    for error in [
+        api.stop_instance(&found.target(), &none).unwrap_err(),
+        api.delete_instance(&found.target(), &none, confirmed(&[]))
+            .unwrap_err(),
+        fx.svc.delete_preview(&found.target()).unwrap_err(),
+    ] {
+        assert!(error.contains("different Docker account"), "{error}");
+    }
+    assert_eq!(fx.sbx.calls().len(), before, "nothing was sent to sbx");
+    assert!(fx.sbx.state_of("sbx_a").is_some());
+}
+
+// ---------------------------------------------------- checks before the destructive call
+
+#[test]
+fn the_busy_check_is_made_again_right_before_the_delete() {
+    let fx = full();
+    let api = api_over(&fx);
+    let target = target_of("monoptah-fix-login-a1b2c3");
+    // The app is idle when the delete starts (call 0) and archiving by the time the wait ended.
+    let view = AppView::working_from(1);
+    let error = api
+        .delete_instance(&target, &view, confirmed(&[]))
+        .unwrap_err();
+    assert!(error.contains("archiving or converting"), "{error}");
+    assert!(
+        !fx.sbx.verbs().contains(&"rm".to_owned()),
+        "{:?}",
+        fx.sbx.calls()
+    );
+    assert!(fx.sbx.state_of("sbx_001a").is_some());
+    // Its sessions are still there.
+    assert_eq!(fx.svc.session_ids_on(&target.cloud).len(), 1);
+}
+
+#[test]
+fn a_sandbox_that_woke_up_during_the_wait_is_not_deleted() {
+    let fx = full();
+    let api = api_over(&fx);
+    let target = target_of("monoptah-fix-login-a1b2c3");
+    // Once it reads `stopped`, a send to a session on it starts it again.
+    *fx.sbx.wake_after_stopped.lock().unwrap() = true;
+    let error = api
+        .delete_instance(&target, &|_: &CloudRef| false, confirmed(&[]))
+        .unwrap_err();
+    assert!(error.contains("started again"), "{error}");
+    assert!(
+        !fx.sbx.verbs().contains(&"rm".to_owned()),
+        "{:?}",
+        fx.sbx.calls()
+    );
+    assert_eq!(fx.sbx.state_of("sbx_001a").as_deref(), Some("running"));
+    assert_eq!(fx.svc.session_ids_on(&target.cloud).len(), 1);
+}
+
+#[test]
+fn the_guard_runs_before_every_delete_call_and_can_stop_it() {
+    let fx = full();
+    let cloud = CloudRef::sandbox("monoptah-main-d4e5f6");
+    let asked = AtomicUsize::new(0);
+    *fx.sbx.rm_refusals.lock().unwrap() = 1;
+    // The first removal is refused as too early and retried: the guard ran for both.
+    fx.svc
+        .delete_settled(&cloud, &|| {
+            asked.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(asked.load(Ordering::SeqCst), 2);
+    // A guard that says no ends the delete before any `rm`.
+    let fx = full();
+    let error = fx
+        .svc
+        .delete_settled(&cloud, &|| Err("something changed".into()))
+        .unwrap_err();
+    assert_eq!(error, "something changed");
+    assert!(!fx.sbx.verbs().contains(&"rm".to_owned()));
+}
+
+// ------------------------------------------------------------- the overview cache
+
+#[test]
+fn every_stop_and_delete_clears_the_cached_overview_not_just_the_api_paths() {
+    let fx = full();
+    let cached = |fx: &Fx| fx.svc.cached_workspaces(PROJECT).is_some();
+    fx.svc.workspaces_overview(PROJECT, false);
+    assert!(cached(&fx));
+    // The archive dialog and the session Stop call these directly.
+    fx.svc
+        .stop_cloud(&CloudRef::codespace("octo-used"))
+        .unwrap();
+    assert!(!cached(&fx), "stop_cloud");
+    fx.svc.workspaces_overview(PROJECT, false);
+    fx.svc
+        .delete_cloud_outcome(&CloudRef::codespace("octo-lost"))
+        .unwrap();
+    assert!(!cached(&fx), "delete_cloud_outcome");
+    // A stop that fails leaves the view stale just as well.
+    fx.svc.workspaces_overview(PROJECT, false);
+    fx.sbx.boxes.lock().unwrap().clear();
+    let _ = fx
+        .svc
+        .stop_cloud(&CloudRef::sandbox("monoptah-fix-login-a1b2c3"));
+    assert!(!cached(&fx), "a failed stop");
+    // Forgetting a workspace that is gone.
+    fx.svc.workspaces_overview(PROJECT, false);
+    let _ = fx
+        .svc
+        .forget_missing(&CloudRef::sandbox("monoptah-main-d4e5f6"));
+    assert!(!cached(&fx), "forget_missing");
 }
 
 #[test]
