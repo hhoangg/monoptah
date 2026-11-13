@@ -192,14 +192,19 @@ jobs:
           SHARD: ${{ matrix.shard }}
           TOTAL: ${{ matrix.total }}
         run: |
-          # pipefail is on (shell: bash), so the status below is nextest's, not tee's.
+          # Written to a file, not piped through tee: on Windows a process that a test
+          # leaves running inherits nextest's stdout, so tee would wait for it to exit
+          # (one shard sat 10 minutes after nextest's summary). The log is printed after
+          # the run. --status-level leak names the tests that leave a process behind.
           status=0
           cargo nextest run \
             --archive-file "$RUNNER_TEMP/core-archive/core-tests.tar.zst" \
             --workspace-remap "$GITHUB_WORKSPACE/crates/monocode-gpui" \
             --config-file "$GITHUB_WORKSPACE/crates/monocode-gpui/.config/nextest.toml" \
             --profile ci \
-            --partition "slice:$SHARD/$TOTAL" 2>&1 | tee "$RUNNER_TEMP/nextest.log" || status=$?
+            --status-level leak \
+            --partition "slice:$SHARD/$TOTAL" > "$RUNNER_TEMP/nextest.log" 2>&1 || status=$?
+          cat "$RUNNER_TEMP/nextest.log" || true
           # nextest writes the JUnit file under the remapped workspace.
           junit="$GITHUB_WORKSPACE/crates/monocode-gpui/target/nextest/ci/junit.xml"
           if [ -f "$junit" ]; then cp "$junit" "$RUNNER_TEMP/junit-shard-$SHARD.xml" || true; fi
