@@ -57,8 +57,9 @@ Entry points:
 - Project menu: the "Cloud setup" submenu becomes one item, "Cloud settings...". It opens on
   the project's default backend.
 - Composer Workspace menu: new item "Cloud settings for this project...".
-- Composer Workspace menu "Docker Sandbox" while the project has no sandbox config
-  (previously `OpenDockerSetup`): opens the dialog on Docker Sandbox.
+- Composer Workspace menu "Docker Sandbox" while the project has no sandbox config (the
+  conversation emits `OpenDockerSetup`, which the shell now answers by opening the dialog on
+  Docker Sandbox): opens the dialog on Docker Sandbox.
 - Copy that pointed users to "Codespaces setup" or "the project's Docker Sandbox settings"
   (`mono/bridge.rs`, `shell/cloud_create.rs`, `cloud_target.rs`,
   `mono/cloud_api/sandbox_provider.rs`) now says "Cloud settings".
@@ -269,12 +270,23 @@ Unverified (handled defensively, listed for manual verification):
 
 Changing the Project settings dialog; GitLab or `glab`; Host changes.
 
+## Known limitations
+
+- "Existing instance" for sandboxes lists only the sandboxes that have a ready session of
+  the project; a sandbox with no session in the app is not offered.
+- A Docker token's expiry is shown as "Not known": Docker Hub does not report it.
+- Mono `sessions.start` target options do not take an idle timeout or a working branch.
+- Removing a Claude account in Providers does not yet check the cloud instances pinned to it
+  (Docker account removal does check the sandboxes created in it).
+
 ## Manual verification (needs a second Docker account and a fresh PAT)
 
 1. Settings > Cloud > Docker accounts > Add: enter the second Docker ID and a PAT created
    with "Allow Cloud Sandboxes access". Expect "Cloud Sandboxes access". Repeat with a PAT
-   without that box: expect "Missing Cloud Sandboxes access". Repeat with a wrong PAT:
-   expect "Wrong Docker ID or token".
+   without that box: adding it is refused with "This token has no Cloud Sandboxes access..."
+   (nothing is saved). The "Missing Cloud Sandboxes access" status appears on an account
+   that already exists, after Check again or Replace token finds the access gone. Repeat
+   with a wrong PAT: expect "Wrong Docker ID or token".
 2. Project A: Cloud settings > Docker Sandbox > Docker account = account 1. Project B:
    account 2. Start a sandbox session in each. In the Docker dashboard of each account,
    confirm the sandbox appears under the right account only.
@@ -285,7 +297,9 @@ Changing the Project settings dialog; GitLab or `glab`; Host changes.
 5. Archive and delete the sandbox sessions; confirm both sandboxes are removed from the right
    accounts.
 6. Revoke account 2's PAT on Docker Hub. Within 15 minutes, start or reconnect in project B:
-   expect "token revoked or expired" with Replace token; replace it and retry.
+   expect "token revoked or expired. Replace it in Settings > Cloud." Replace token is in
+   Settings > Cloud (the account's row) and in the Ready checklist of the project's Cloud
+   settings dialog; replace it and retry.
 7. With `sbx login` signed in as account 1 and project B on account 2, run
    `sbx --cloud ls` in a terminal (machine login) and confirm the app's project B sandboxes
    are not affected by the machine login.

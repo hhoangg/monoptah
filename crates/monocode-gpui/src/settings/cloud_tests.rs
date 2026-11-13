@@ -173,6 +173,19 @@ impl World {
         };
         docker_config::save(&self.store.lock().unwrap(), cwd, &config).unwrap();
     }
+    /// A live sandbox (a session of a project runs in it) created with the Docker account `id`.
+    fn pin_sandbox(&self, name: &str, id: &str) {
+        let store = self.store.lock().unwrap();
+        store
+            .remember_cloud_ref_project(
+                "env-1",
+                &serde_json::json!({"cwd": format!("/ws/{name}"), "id": name}),
+                "/work/app",
+                &monocode_core::cloud_sessions::CloudRef::sandbox(name),
+            )
+            .unwrap();
+        monocode_core::sandboxes::account::pin(&store, name, Some(id)).unwrap();
+    }
     fn files_contain(&self, needle: &str) -> bool {
         fn walk(dir: &Path, needle: &[u8]) -> bool {
             std::fs::read_dir(dir).unwrap().flatten().any(|entry| {
@@ -798,6 +811,50 @@ fn remove_is_refused_while_a_project_uses_the_account(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn remove_is_refused_while_a_sandbox_lives_in_the_account(cx: &mut TestAppContext) {
+    let world = World::new();
+    let window = open(&world, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.refresh().unwrap();
+    add_account(&window, visual, "octo-dev", PAT);
+    let id = window
+        .update(visual, |view, _, _| match &view.cloud.docker.list {
+            pages::cloud_docker::AccountList::Ready(rows) => rows[0].summary.id.clone(),
+            _ => panic!("not loaded"),
+        })
+        .unwrap();
+    // No project names the account, but a sandbox was created in it.
+    world.pin_sandbox("box-1", &id);
+    window
+        .update(visual, |view, _, cx| view.refresh_cloud(cx))
+        .unwrap();
+    settle(visual);
+    let used_by = window
+        .update(visual, |view, _, _| match &view.cloud.docker.list {
+            pages::cloud_docker::AccountList::Ready(rows) => rows[0].used_by.clone(),
+            _ => panic!("not loaded"),
+        })
+        .unwrap();
+    assert_eq!(used_by, ["sandbox box-1"]);
+    click(visual, "docker-remove-octo-dev");
+    assert!(
+        !has(visual, "docker-remove-confirm"),
+        "an account with a sandbox cannot be confirmed away"
+    );
+    let removal = window
+        .update(visual, |view, _, _| match &view.cloud.docker.removal {
+            Some(pages::cloud_docker::Removal {
+                stage: pages::cloud_docker::RemoveStage::Refused(users),
+                ..
+            }) => users.clone(),
+            _ => panic!("expected a refusal"),
+        })
+        .unwrap();
+    assert_eq!(removal, ["sandbox box-1"]);
+    assert_eq!(account_ids(&window, visual), ["octo-dev"]);
+}
+
+#[gpui::test]
 fn remove_succeeds_when_no_project_uses_the_account(cx: &mut TestAppContext) {
     let world = World::new();
     let window = open(&world, cx);
@@ -1210,12 +1267,48 @@ fn a_removal_result_for_another_row_is_ignored(cx: &mut TestAppContext) {
         .unwrap();
 }
 
+/// Fix on a backend whose program the app cannot find says why instead of doing nothing, and
+/// opens the terminal once the program is found. `gh` is signed out (the fix is
+/// `gh auth login` on every OS) and then hidden from the program lookup.
+#[gpui::test]
+fn fix_says_why_when_the_program_cannot_be_found(cx: &mut TestAppContext) {
+    let world = World::new();
+    world.gh.set(Ok(AUTH_OUT));
+    world.hide("gh");
+    let window = open(&world, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.refresh().unwrap();
+    click(visual, "cloud-fix-codespaces");
+    assert!(!has(visual, "fix-terminal"), "nothing can run");
+    let error = window
+        .update(visual, |view, _, _| view.cloud.backends.fix_error.clone())
+        .unwrap()
+        .expect("the user is told why Fix did nothing");
+    assert!(
+        error.contains("`gh`")
+            && error.contains("gh auth login")
+            && error.contains("was not found on this computer"),
+        "{error}"
+    );
+    assert!(!error.contains("this Mac"), "{error}");
+    // Checking again clears it, and with gh found Fix opens the terminal.
+    world.missing.lock().unwrap().clear();
+    click(visual, "cloud-check-codespaces");
+    assert!(
+        window
+            .update(visual, |view, _, _| view.cloud.backends.fix_error.is_none())
+            .unwrap()
+    );
+    click(visual, "cloud-fix-codespaces");
+    assert!(has(visual, "fix-terminal"));
+}
+
 #[gpui::test]
 #[cfg_attr(
     not(target_os = "macos"),
     ignore = "the gh install fix (brew install gh) exists on macOS only"
 )]
-fn fix_says_why_when_the_program_cannot_be_found(cx: &mut TestAppContext) {
+fn fix_says_why_brew_cannot_be_found_to_install_gh(cx: &mut TestAppContext) {
     let world = World::new();
     world.gh.set(Err("gh is not installed"));
     world.hide("brew");

@@ -140,7 +140,7 @@ impl SettingsView {
         let program = line.split_whitespace().next().unwrap_or_default();
         if (services.resolve)(program).is_none() {
             self.cloud.backends.fix_error = Some(format!(
-                "Fix cannot run: `{program}` was not found on this Mac. Run `{line}` yourself in a terminal, then press Check again."
+                "Fix cannot run: `{program}` was not found on this computer. Run `{line}` yourself in a terminal, then press Check again."
             ));
             cx.notify();
             return;

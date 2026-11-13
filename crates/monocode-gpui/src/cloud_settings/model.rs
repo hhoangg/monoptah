@@ -305,8 +305,14 @@ pub(super) fn validate(form: &Form, ctx: &Context<'_>) -> Result<ProjectCloud, F
     } else {
         None
     };
+    // The default shown in the form is Codespaces until a sandbox is stored. A save that
+    // newly stores the sandbox would flip the stored fallback to Docker Sandbox behind the
+    // user's back, so the shown value is stored explicitly instead.
+    let default_backend = form
+        .default_backend
+        .or_else(|| (sandbox.is_some() && !ctx.sandbox_saved).then_some(DefaultBackend::Codespace));
     Ok(ProjectCloud {
-        default_backend: form.default_backend,
+        default_backend,
         codespace,
         sandbox,
     })

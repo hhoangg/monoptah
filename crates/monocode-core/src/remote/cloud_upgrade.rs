@@ -379,6 +379,15 @@ impl Connections {
         Some(hold)
     }
 
+    /// Holds sends to `machine_id` back without asking its Host whether it is idle: for a
+    /// codespace known to be stopped, where no Host runs and no turn needs protecting.
+    /// `None` when the hold could not be taken.
+    pub(super) fn hold_sends_stopped(&self, machine_id: &str) -> Option<SendHold> {
+        let gate = self.gate(machine_id);
+        gate.hold(self.drain_limit(), HoldKind::Account).ok()?;
+        Some(SendHold(gate))
+    }
+
     /// Whether the Host of `machine_id` answers on its tunnel now.
     pub(super) fn host_answers(&self, machine_id: &str) -> bool {
         self.request(machine_id, "environment.describe", json!({}))

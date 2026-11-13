@@ -1061,6 +1061,8 @@ mod claude_account {
         hint: Mutex<Option<String>>,
         /// How often the credential itself was read.
         resolves: AtomicUsize,
+        /// The codespace is shut down (no Host runs).
+        stopped: AtomicBool,
     }
     impl Chosen {
         fn set(&self, account: Option<(&'static str, &'static str)>) {
@@ -1110,6 +1112,10 @@ mod claude_account {
                 other => panic!("unknown account {other}"),
             };
             Ok(Some(delivery(account, secret)))
+        }
+        fn is_stopped(&self, codespace: &str) -> bool {
+            assert_eq!(codespace, "cs");
+            self.stopped.load(Ordering::SeqCst)
         }
         fn delivered_hint(&self, codespace: &str) -> Option<String> {
             assert_eq!(codespace, "cs");
@@ -1662,6 +1668,39 @@ else:
             "{}",
             &scripts[runs][..200.min(scripts[runs].len())]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_change_is_delivered_at_once_when_the_codespace_is_known_to_be_stopped() {
+        let chosen = Arc::new(Chosen::default());
+        chosen.set(Some(("work", SECRET_A)));
+        let Some((gh, _host, connections, _dir, id)) = paired(&chosen) else {
+            eprintln!("SKIPPED: python3 not found");
+            return;
+        };
+        let after_pairing = gh.scripts().len();
+        // The project switches account and the codespace shuts down: no Host, no turn.
+        chosen.set(Some(("other", SECRET_B)));
+        chosen.stopped.store(true, Ordering::SeqCst);
+        connections.tunnels.clear();
+        connections.ensure_codespace(&id).unwrap();
+        let scripts = gh.scripts();
+        assert_eq!(scripts.len(), after_pairing + 1);
+        let last = scripts.last().unwrap();
+        assert!(
+            last.contains(&*delivery("other", SECRET_B).prelude),
+            "wanted account delivered"
+        );
+        assert!(!last.contains(SECRET_A));
+        assert!(connections
+            .delivered_fingerprint("cs")
+            .is_some_and(|f| f.starts_with("other:")));
+        assert!(
+            connections.gate(&id).enter().is_ok(),
+            "the hold is released"
+        );
+        assert!(!gh.argv_log().contains(SECRET_B), "{}", gh.argv_log());
     }
 
     #[cfg(unix)]

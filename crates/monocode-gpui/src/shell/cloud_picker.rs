@@ -627,11 +627,26 @@ impl Shell {
         cx.notify();
     }
 
+    /// Marks the open codespace picker as working (tests).
+    #[cfg(test)]
+    pub(super) fn set_codespace_picker_busy(&self, busy: bool, cx: &mut App) {
+        if let Some(open) = &self.codespace_picker {
+            open.picker.update(cx, |picker, _| picker.busy = busy);
+        }
+    }
+
     /// The local project the open codespace picker lists the codespaces of.
     #[cfg(test)]
     pub(super) fn codespace_picker_project(&self, cx: &App) -> Option<String> {
         let open = self.codespace_picker.as_ref()?;
         Some(open.picker.read(cx).local_project.clone())
+    }
+
+    /// Whether the open codespace picker is working: Escape must not close it then.
+    pub(super) fn codespace_picker_busy(&self, cx: &App) -> bool {
+        self.codespace_picker
+            .as_ref()
+            .is_some_and(|open| open.picker.read(cx).busy)
     }
 
     pub(super) fn close_codespace_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {

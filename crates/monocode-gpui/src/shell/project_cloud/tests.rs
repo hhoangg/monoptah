@@ -295,12 +295,11 @@ fn the_fix_terminal_gets_the_token_only_in_its_environment(cx: &mut TestAppConte
                 assert!(!fix.command_line().contains(JWT));
                 fix.terminal().update(cx, |terminal, _| {
                     let spec = terminal.launched().unwrap();
+                    // A wiped secret for the PTY, never a plain environment value.
+                    assert!(spec.env_set.is_empty(), "{:?}", spec.env_set);
                     assert_eq!(
-                        spec.env_set,
-                        [(
-                            "DOCKER_ACCESS_TOKEN".to_owned(),
-                            std::ffi::OsString::from(JWT)
-                        )]
+                        spec.secret_env,
+                        [("DOCKER_ACCESS_TOKEN".to_owned(), JWT.to_owned())]
                     );
                     assert!(!spec.args.iter().any(|a| a.to_string_lossy().contains(JWT)));
                 });

@@ -99,7 +99,7 @@ fn the_menu_lists_cloud_rows_with_their_gates(cx: &mut TestAppContext) {
                     "workspace:cloud-docker".to_string(),
                     "Docker Sandbox".to_string(),
                     false,
-                    Some("Set up first".to_string())
+                    Some("Paid compute in your Docker account \u{b7} Set up first".to_string())
                 )]
             );
             view.set_offers_codespace(true, cx);
@@ -107,7 +107,10 @@ fn the_menu_lists_cloud_rows_with_their_gates(cx: &mut TestAppContext) {
             assert_eq!(labels, ["Codespace", "Docker Sandbox"]);
             save_config(view);
             // The saved sandbox config is the only one, so Docker Sandbox is the default.
-            assert_eq!(rows(view)[1].3.as_deref(), Some("(default)"));
+            assert_eq!(
+                rows(view)[1].3.as_deref(),
+                Some("Paid compute in your Docker account \u{b7} default")
+            );
         })
         .unwrap();
 }
@@ -728,7 +731,7 @@ fn the_docker_config_is_read_once_per_menu_opening(cx: &mut TestAppContext) {
         .update(cx, |view, _, _| {
             assert_eq!(
                 rows(view)[0].3.as_deref(),
-                Some("Set up first"),
+                Some("Paid compute in your Docker account \u{b7} Set up first"),
                 "no config yet"
             );
             // Saved behind the cache's back (Cloud settings): not seen until reopened.
@@ -737,9 +740,15 @@ fn the_docker_config_is_read_once_per_menu_opening(cx: &mut TestAppContext) {
                 ..Default::default()
             };
             docker_config::save(&locked(&view.store).unwrap(), PROJECT, &config).unwrap();
-            assert_eq!(rows(view)[0].3.as_deref(), Some("Set up first"));
+            assert_eq!(
+                rows(view)[0].3.as_deref(),
+                Some("Paid compute in your Docker account \u{b7} Set up first")
+            );
             view.forget_docker_config();
-            assert_ne!(rows(view)[0].3.as_deref(), Some("Set up first"));
+            assert_ne!(
+                rows(view)[0].3.as_deref(),
+                Some("Paid compute in your Docker account \u{b7} Set up first")
+            );
         })
         .unwrap();
 }
@@ -2901,7 +2910,10 @@ fn the_workspace_menu_offers_existing_instance_and_cloud_settings(cx: &mut TestA
             assert!(matches!(items[items.len() - 2], MenuItem::Separator));
             let rows = all_rows(view);
             // The project default is named on its backend.
-            assert_eq!(rows[0].3.as_deref(), Some("(default)"));
+            assert_eq!(
+                rows[0].3.as_deref(),
+                Some("Billed to your GitHub account \u{b7} default")
+            );
             assert_eq!(rows[2].1, "Existing instance\u{2026}");
             assert_eq!(rows[3].1, "Cloud settings for this project\u{2026}");
             // Nothing chosen: the dialog opens on the project's default, existing on Codespace.
@@ -3002,12 +3014,22 @@ fn the_workspace_menu_reads_the_store_once_until_the_project_changes(cx: &mut Te
                 },
             )
             .unwrap();
-            assert_eq!(all_rows(view)[0].3.as_deref(), Some("(default)"));
-            assert_eq!(all_rows(view)[1].3.as_deref(), Some("Set up first"));
+            assert_eq!(
+                all_rows(view)[0].3.as_deref(),
+                Some("Billed to your GitHub account \u{b7} default")
+            );
+            assert_eq!(
+                all_rows(view)[1].3.as_deref(),
+                Some("Paid compute in your Docker account \u{b7} Set up first")
+            );
             // The shell forgets it when the project's Cloud settings are saved.
             view.project_cloud_saved(cx);
             assert!(!view.cloud_menu_is_cached());
-            assert_eq!(all_rows(view)[0].3, None);
+            // The default mark is gone; the billing note stays.
+            assert_eq!(
+                all_rows(view)[0].3.as_deref(),
+                Some("Billed to your GitHub account")
+            );
         })
         .unwrap();
 }
@@ -3090,6 +3112,62 @@ fn saving_the_project_settings_moves_the_rows_the_user_did_not_change(cx: &mut T
     assert_eq!(config.docker_account.as_deref(), Some("d-new"));
     // The Claude account is the project's: not pinned to the sandbox.
     assert!(!sent[0].account_pinned);
+}
+
+#[gpui::test]
+fn saving_the_project_settings_reads_the_docker_accounts_again(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    window
+        .update(cx, |view, _, cx| {
+            // The account is not in the list yet (it is added in the dialog that saves).
+            view.set_docker_accounts_loader(Arc::new(|_| Ok(Vec::new())));
+            put_sandbox_config(
+                view,
+                &sandbox_config(2, "4g", "2h", "develop", None, Some("acct-1")),
+            );
+            view.forget_project_cloud();
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            // A listed-but-missing account reads like the menu's entry, not as a raw id.
+            assert_eq!(
+                view.cloud_field_value(CloudField::DockerAccount),
+                crate::cloud_presets::unavailable_account_label("acct-1")
+            );
+            view.set_docker_accounts_loader(Arc::new(|_| {
+                Ok(vec![docker_account("acct-1", "octo")])
+            }));
+            view.project_cloud_saved(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, _| {
+            assert_eq!(view.cloud_field_value(CloudField::DockerAccount), "octo");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_claude_account_the_app_no_longer_has_reads_like_the_menu_entry(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    window
+        .update(cx, |view, _, cx| {
+            put_sandbox_config(
+                view,
+                &sandbox_config(2, "4g", "2h", "develop", Some("gone"), None),
+            );
+            view.forget_project_cloud();
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            assert_eq!(
+                view.cloud_field_value(CloudField::Claude),
+                crate::cloud_presets::unavailable_account_label("gone")
+            );
+        })
+        .unwrap();
 }
 
 #[gpui::test]

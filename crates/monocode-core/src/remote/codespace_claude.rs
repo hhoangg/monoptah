@@ -95,6 +95,13 @@ pub trait CodespaceClaude: Send + Sync {
         None
     }
 
+    /// Whether `codespace` is known to be stopped (shut down), so no Host runs on it and no
+    /// turn needs protecting. Read-only; `false` when unknown (the default).
+    fn is_stopped(&self, codespace: &str) -> bool {
+        let _ = codespace;
+        false
+    }
+
     /// Records the account (`None`: the Codespaces secret) the Host of `codespace` was just
     /// bootstrapped with, see [`Self::delivered_hint`]. Best effort.
     fn note_delivered(&self, codespace: &str, account: Option<&str>) {

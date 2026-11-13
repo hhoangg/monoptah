@@ -992,6 +992,11 @@ impl Store {
                 CloudBackendKind::DockerSandbox => {
                     // Under the account the sandbox lives in. `ls` under another one would
                     // report "not found" and forget a sandbox that is still billing.
+                    if let Some(error) =
+                        crate::sandboxes::account::removed_account_error(self, &cloud.name)
+                    {
+                        return Err(error);
+                    }
                     let account = crate::sandboxes::account::pinned(self, &cloud.name)?;
                     crate::sandboxes::find_by_name(
                         &crate::sandboxes::as_account(sbx, account.as_deref()),
@@ -1001,7 +1006,18 @@ impl Store {
                 }
             };
             if !exists {
-                return self.forget_cloud_session(id);
+                self.forget_cloud_session(id)?;
+                // The instance is gone for good: once no session refers to it any more, its
+                // pins (Docker account, Claude account, delivery marker) and project go too,
+                // or a removed sandbox would keep its Docker account in use.
+                let still_used = self
+                    .remote_sessions()?
+                    .values()
+                    .any(|s| s.project.cloud().as_ref() == Some(&cloud));
+                if !still_used {
+                    self.forget_cloud(&cloud)?;
+                }
+                return Ok(());
             }
         }
         if let Some(session_id) = &remote.session_id {

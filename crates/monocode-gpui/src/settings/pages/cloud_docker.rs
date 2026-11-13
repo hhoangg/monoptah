@@ -26,6 +26,7 @@ use gpui::{
 use monocode_core::{
     cloud_sessions::project_cloud::projects_using_docker_account,
     docker_accounts::{DockerAccountStatus, DockerAccountSummary, DockerAccounts, Secret},
+    sandboxes::account::sandboxes_pinned_to,
 };
 use std::path::Path;
 
@@ -134,13 +135,42 @@ fn folder_name(cwd: &str) -> String {
     )
 }
 
-/// The projects (folder names) whose sandbox uses the account.
+/// What uses the account: the projects (folder names) whose sandbox config names it, then the
+/// live sandboxes created in it ("sandbox NAME"; a sandbox stays in its account whatever its
+/// project says now).
 fn users_of(store: &Database, id: &str) -> Result<Vec<String>, String> {
     let store = locked(store)?;
-    Ok(projects_using_docker_account(&store, id)?
+    let mut users: Vec<String> = projects_using_docker_account(&store, id)?
         .iter()
         .map(|cwd| folder_name(cwd))
-        .collect())
+        .collect();
+    users.extend(
+        sandboxes_pinned_to(&store, id)?
+            .into_iter()
+            .map(|name| format!("{SANDBOX_USER_PREFIX}{name}")),
+    );
+    Ok(users)
+}
+
+/// How a sandbox is listed among the users of an account.
+const SANDBOX_USER_PREFIX: &str = "sandbox ";
+
+/// Why an account in use cannot be removed, and what to do first.
+fn refusal_text(docker_id: &str, users: &[String]) -> String {
+    let has_sandboxes = users.iter().any(|u| u.starts_with(SANDBOX_USER_PREFIX));
+    let has_projects = users.iter().any(|u| !u.starts_with(SANDBOX_USER_PREFIX));
+    let mut text = format!("{docker_id} is used by {}.", users.join(", "));
+    if has_projects {
+        text.push_str(
+            " Pick another Docker account in the Cloud settings of each of these projects first.",
+        );
+    }
+    if has_sandboxes {
+        text.push_str(
+            " A sandbox stays in the account that created it: delete the listed sandboxes first.",
+        );
+    }
+    text
 }
 
 fn load_rows(store: &Database) -> Result<Vec<AccountRow>, String> {
@@ -792,15 +822,7 @@ impl SettingsView {
                 true,
                 false,
             ),
-            RemoveStage::Refused(users) => (
-                format!(
-                    "{} is used by {}. Pick another Docker account in the Cloud settings of each of these projects first.",
-                    removal.docker_id,
-                    users.join(", ")
-                ),
-                false,
-                false,
-            ),
+            RemoveStage::Refused(users) => (refusal_text(&removal.docker_id, users), false, false),
             RemoveStage::Removing => (format!("Removing {}...", removal.docker_id), false, true),
             RemoveStage::Failed(error) => (error.clone(), false, false),
         };

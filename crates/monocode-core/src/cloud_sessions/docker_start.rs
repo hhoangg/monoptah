@@ -653,6 +653,11 @@ impl CloudSessions {
             let store = pins
                 .lock()
                 .map_err(|_| "Native session store unavailable".to_string())?;
+            // A sandbox whose Docker account was removed says so, instead of failing later with
+            // a text that tells the user to choose another account.
+            if let Some(error) = sandboxes::account::removed_account_error(&store, name) {
+                return Err(error);
+            }
             Ok(sandboxes::account::pinned(&store, name)?.or_else(|| started_account(&store, name)))
         });
         let backend = Arc::new(
@@ -797,6 +802,12 @@ impl CloudSessions {
         }
         compute_of(&config)?;
         let (_, _, path) = git_credentials::normalize_origin(&config.repo_url)?;
+        // The chosen Claude account is checked (metadata only) before anything is created or
+        // pinned: a missing credential must not first cost a sandbox.
+        if let Some(account) = config.claude_account.as_deref() {
+            let store = self.store()?;
+            claude_pin::check_account(&store, account, claude_pinned)?;
+        }
         // Under the project's Docker account when it names one: an account problem then
         // reads as such (with where to fix it), never as "run `sbx login`".
         let prerequisites =

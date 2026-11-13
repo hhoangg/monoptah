@@ -119,14 +119,21 @@ impl FixTerminal {
     /// Starts the command in a terminal whose directory is `cwd` (home when it is missing).
     pub(crate) fn new(command: FixCommand, cwd: &Path, cx: &mut Context<Self>) -> Self {
         let line = command.line();
-        let env_set = command
-            .env
-            .iter()
-            .map(|(name, value)| (name.clone(), OsString::from(value.as_str())))
-            .collect();
+        // The values go to the terminal as wiped `Secret`s, never as plain strings.
+        let secret_env = command.env;
         let args = command.args.iter().map(OsString::from).collect();
         let program = command.program.clone();
-        let terminal = cx.new(|cx| Terminal::launch(cwd, program, args, env_set, Vec::new(), cx));
+        let terminal = cx.new(|cx| {
+            Terminal::launch_with_secrets(
+                cwd,
+                program,
+                args,
+                Vec::new(),
+                secret_env,
+                Vec::new(),
+                cx,
+            )
+        });
         let events = cx.subscribe(&terminal, Self::on_terminal_event);
         Self {
             title: command.title,
@@ -421,9 +428,11 @@ mod tests {
                 let spec = terminal.launched().expect("the launch is recorded");
                 assert_eq!(spec.program, OsString::from("/bin/true"));
                 assert_eq!(spec.args, ["--cloud", "setup", "ssh"].map(OsString::from));
+                // The token travels as a wiped secret, not as a plain environment value.
+                assert!(spec.env_set.is_empty(), "{:?}", spec.env_set);
                 assert_eq!(
-                    spec.env_set,
-                    [("TOOL_TOKEN".to_owned(), OsString::from(TOKEN))]
+                    spec.secret_env,
+                    [("TOOL_TOKEN".to_owned(), TOKEN.to_owned())]
                 );
             });
         });

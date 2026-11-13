@@ -1003,9 +1003,9 @@ impl CloudSessions {
             if claude.keep.is_none() {
                 let _ = match &previous_pin {
                     Some(previous) => claude_pin::write(store, &pin_key, previous),
-                    None => claude_pin::clear(store, &pin_key).and_then(|()| {
-                        claude_pin::clear(store, &claude_pin::delivered_key(&resolved.name))
-                    }),
+                    // The delivered marker is not the start's to undo: it says what the Host
+                    // of an existing codespace really runs under.
+                    None => claude_pin::clear(store, &pin_key),
                 };
             }
         };

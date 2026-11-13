@@ -113,6 +113,12 @@ impl Connections {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(resolver);
     }
 
+    /// Whether codespace `name` is known to be stopped (see [`codespace_claude::CodespaceClaude::is_stopped`]).
+    fn codespace_stopped(&self, name: &str) -> bool {
+        self.codespace_claude()
+            .is_some_and(|resolver| resolver.is_stopped(name))
+    }
+
     fn codespace_claude(&self) -> Option<Arc<dyn codespace_claude::CodespaceClaude>> {
         self.claude
             .lock()
@@ -1100,6 +1106,14 @@ impl Connections {
                                 Some(taken) => hold = Some(taken),
                                 None => leave_host = true,
                             }
+                        } else if let Some(taken) = state
+                            .codespace_stopped(name)
+                            .then(|| state.hold_sends_stopped(&existing.id))
+                            .flatten()
+                        {
+                            // The codespace is shut down: no Host runs and no turn needs
+                            // protecting, so the wanted account is delivered now.
+                            hold = Some(taken);
                         } else {
                             kept = state.last_delivered(name, delivered.as_deref(), delivery);
                             if let Some(Some(old)) = &kept {

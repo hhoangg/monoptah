@@ -586,10 +586,39 @@ struct Fx {
     host: Arc<FakeHost>,
     store: Arc<Mutex<Store>>,
     _home: tempfile::TempDir,
+    /// The data directory of a store made by [`store_with_accounts`].
+    _data: Option<tempfile::TempDir>,
 }
 
+/// Registers the Claude accounts "work" and "other" in `store`, each with a token saved under
+/// `data_dir` (the store's own directory): a sandbox start checks the chosen account before it
+/// creates anything.
+fn add_accounts(store: &Store, data_dir: &Path) {
+    let mut book = store.provider_accounts().unwrap();
+    for id in ["work", "other"] {
+        book.accounts.push(crate::accounts::Account {
+            id: id.into(),
+            provider: "claude".into(),
+            label: id.into(),
+        });
+        crate::accounts::Profile::new(id, data_dir)
+            .save_claude_token("sk-ant-oat01-fixture-token")
+            .unwrap();
+    }
+    store.save_provider_accounts(&book).unwrap();
+}
+/// A store in its own data directory that knows the accounts of [`add_accounts`].
+fn store_with_accounts() -> (Store, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("monocode.db")).unwrap();
+    add_accounts(&store, dir.path());
+    (store, dir)
+}
 fn fx_with(mode: CreateMode, auth: Option<(&'static str, String)>) -> Fx {
-    fx_in(mode, auth, Store::open(Path::new(":memory:")).unwrap())
+    let (store, dir) = store_with_accounts();
+    let mut fx = fx_in(mode, auth, store);
+    fx._data = Some(dir);
+    fx
 }
 fn fx_in(mode: CreateMode, auth: Option<(&'static str, String)>, store: Store) -> Fx {
     let sbx = Sbx::new(mode);
@@ -637,6 +666,7 @@ fn fx_over_secrets(
         host,
         store,
         _home: home,
+        _data: None,
     }
 }
 fn fx() -> Fx {
@@ -3654,7 +3684,11 @@ mod files_only {
         let fx = fx_in(
             CreateMode::Ok,
             Some(("CLAUDE_CODE_OAUTH_TOKEN", SECRET.into())),
-            Store::open(&root.join("native.db")).unwrap(),
+            {
+                let store = Store::open(&root.join("native.db")).unwrap();
+                add_accounts(&store, &root);
+                store
+            },
         );
         *fx.shell.devcontainer.lock().unwrap() = devcontainer.into();
         let local = project.to_str().unwrap().to_string();
@@ -4556,10 +4590,12 @@ mod docker_accounts {
     fn the_pin_exists_before_create_so_an_ambiguous_create_is_not_forgotten() {
         let installed = Installed::new();
         let a = installed.add("alice");
-        let store = Arc::new(Mutex::new(Store::open(Path::new(":memory:")).unwrap()));
+        let (opened, data) = store_with_accounts();
+        let store = Arc::new(Mutex::new(opened));
         let probe = Probe::new(store.clone());
         probe.inner.make_create_ambiguous();
-        let fx = probe_fx(&probe, store);
+        let mut fx = probe_fx(&probe, store);
+        fx._data = Some(data);
         // The create times out and the lookup after it fails too: the start is a failed
         // record that offers Retry, and the sandbox exists under account A.
         let (session, began) = begin_as(&fx, Some(&a)).unwrap();
@@ -4594,6 +4630,7 @@ mod docker_accounts {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("monocode.db");
         let store = Store::open(&path).unwrap();
+        add_accounts(&store, dir.path());
         rusqlite::Connection::open(&path)
             .unwrap()
             .execute_batch(
@@ -4726,9 +4763,11 @@ mod docker_accounts {
     fn deleting_a_session_asks_sbx_outside_the_store_as_the_pinned_account() {
         let installed = Installed::new();
         let a = installed.add("alice");
-        let store = Arc::new(Mutex::new(Store::open(Path::new(":memory:")).unwrap()));
+        let (opened, data) = store_with_accounts();
+        let store = Arc::new(Mutex::new(opened));
         let probe = Probe::new(store.clone());
-        let fx = probe_fx(&probe, store);
+        let mut fx = probe_fx(&probe, store);
+        fx._data = Some(data);
         let (session, _) = begin_as(&fx, Some(&a)).unwrap();
         fx.run(session.id).0.unwrap();
         {
@@ -4848,6 +4887,87 @@ mod docker_accounts {
             .remote_session(id)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn a_gone_sandbox_takes_every_pin_of_it_along() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        let (fx, id, sbx) = deletable(Some(&a), Some(&a), false);
+        let name = {
+            let store = fx.store.lock().unwrap();
+            let name = store
+                .remote_session(id)
+                .unwrap()
+                .unwrap()
+                .project
+                .sandbox
+                .clone()
+                .unwrap();
+            assert_eq!(
+                crate::sandboxes::account::sandboxes_pinned_to(&store, &a).unwrap(),
+                std::slice::from_ref(&name)
+            );
+            name
+        };
+        fx.store
+            .lock()
+            .unwrap()
+            .delete_remote_session_with_sbx(id, &NoGh, &sbx, &*fx.host)
+            .unwrap();
+        let store = fx.store.lock().unwrap();
+        assert_eq!(
+            store
+                .setting(&crate::sandboxes::account::pin_key(&name))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .setting(&crate::cloud_sessions::claude_pin::sandbox_key(&name))
+                .unwrap(),
+            None
+        );
+        assert!(crate::sandboxes::account::sandboxes_pinned_to(&store, &a)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_sandbox_of_a_removed_account_says_what_to_do_instead_of_choosing_another() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        let (fx, id, sbx) = deletable(Some(&a), Some(&a), true);
+        let name = fx
+            .store
+            .lock()
+            .unwrap()
+            .remote_session(id)
+            .unwrap()
+            .unwrap()
+            .project
+            .sandbox
+            .clone()
+            .unwrap();
+        installed.accounts.remove(&a).unwrap();
+        let expected = format!(
+            "Sandbox {name} was created with Docker account alice, which was removed. Add a token for alice again in Settings > Cloud."
+        );
+        let error = fx
+            .store
+            .lock()
+            .unwrap()
+            .delete_remote_session_with_sbx(id, &NoGh, &sbx, &*fx.host)
+            .unwrap_err();
+        assert_eq!(error, expected);
+        assert!(
+            sbx.accounts_of("ls").is_empty(),
+            "nothing ran as another login"
+        );
+        // The backend that wakes, stops or deletes the sandbox reads its account the same way.
+        let error = fx.svc.try_sandbox_account(&name).unwrap_err();
+        assert_eq!(error, expected);
+        assert!(!error.contains("Choose another"));
     }
 
     #[test]
@@ -5005,12 +5125,14 @@ mod claude_pins {
             asked: Mutex::new(vec![]),
         });
         let sbx = Sbx::new(CreateMode::Ok);
-        let fx = fx_over_secrets(
+        let (store, dir) = store_with_accounts();
+        let mut fx = fx_over_secrets(
             sbx.clone(),
             sbx,
             secrets.clone(),
-            Arc::new(Mutex::new(Store::open(Path::new(":memory:")).unwrap())),
+            Arc::new(Mutex::new(store)),
         );
+        fx._data = Some(dir);
         (fx, secrets)
     }
     fn with_account(account: &str) -> DockerProjectConfig {
@@ -5053,7 +5175,7 @@ mod claude_pins {
     fn a_chosen_account_without_a_credential_fails_the_start_and_the_reconnect() {
         // The account has no token (or is gone): never a silent start without a credential.
         let (fx, _) = fx_per_account();
-        let (session, _) = fx
+        let error = fx
             .svc
             .begin_sandbox_start_pinned(
                 "/Users/me/widgets",
@@ -5063,14 +5185,23 @@ mod claude_pins {
                 true,
                 true,
             )
-            .unwrap();
-        let error = fx.run(session.id).0.unwrap_err();
+            .unwrap_err();
         assert!(
             error.starts_with("This cloud session uses Claude account")
                 && error.contains("Start a new cloud session"),
             "{error}"
         );
+        // The start is refused before anything is created or pinned.
+        assert_eq!(fx.sbx.count("create"), 0);
+        assert!(fx.sbx.calls().is_empty(), "{:?}", fx.sbx.calls());
         assert!(fx.shell.calls().is_empty(), "nothing ran in the sandbox");
+        assert!(fx
+            .store
+            .lock()
+            .unwrap()
+            .settings_with_key_prefix("sandbox-")
+            .unwrap()
+            .is_empty());
         // Following the project, the wording points to Cloud settings.
         let (fx, _) = fx_per_account();
         let (id, name) = start(&fx, "work", false);

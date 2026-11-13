@@ -1012,6 +1012,26 @@ fn machines_are_listed_off_the_ui_thread_and_a_failure_keeps_a_text_fallback(
 }
 
 #[gpui::test]
+fn the_default_shown_is_the_default_stored_when_the_save_adds_the_sandbox(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let dialog = fixture.open(cx, Some(DefaultBackend::Codespace), https_origin);
+    let shown = dialog.update(cx, |d, cx| {
+        // No sandbox is stored: Codespaces is what the select shows. The user fills the
+        // Docker tab and leaves the select alone.
+        let shown = d.effective_default();
+        assert_eq!(shown, DefaultBackend::Codespace);
+        d.switch_tab(DefaultBackend::Sandbox, cx);
+        d.set_text("repo", "https://github.com/acme/other", cx);
+        d.save(cx);
+        assert!(d.error.is_none(), "{:?}", d.error);
+        shown
+    });
+    let saved = fixture.load();
+    assert!(saved.sandbox.is_some(), "the sandbox was stored");
+    assert_eq!(saved.effective_default_backend(), shown);
+}
+
+#[gpui::test]
 fn switching_the_segment_keeps_both_backends_edits_and_save_writes_both(cx: &mut TestAppContext) {
     let fixture = Fixture::new();
     let dialog = fixture.open(cx, Some(DefaultBackend::Codespace), https_origin);
@@ -1367,7 +1387,9 @@ fn the_codespace_repository_row_tells_not_read_yet_from_no_origin(cx: &mut TestA
         assert_eq!(d.codespace_repo_text(), "The project has no git origin.")
     });
     let dialog = fixture.open(cx, None, https_origin);
-    dialog.read_with(cx, |d, _| assert_eq!(d.codespace_repo_text(), "acme/alpha"));
+    dialog.read_with(cx, |d, _| {
+        assert_eq!(d.codespace_repo_text(), "github.com/acme/alpha")
+    });
 }
 
 #[gpui::test]

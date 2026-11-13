@@ -77,6 +77,8 @@ fn a_pin_round_trips_holds_only_an_id_and_is_cleared_on_forget() {
         write(&store, &key, &pin(None, false)).unwrap();
         store.forget_cloud(&cloud).unwrap();
         assert_eq!(read(&store, &key), None, "{key}");
+        // The setting row itself is gone, not left behind as an empty value.
+        assert_eq!(store.setting(&key).unwrap(), None, "{key}");
     }
 }
 
@@ -282,49 +284,6 @@ fn the_account_id_is_answered_without_reading_the_credential() {
     // No account chosen: no id.
     project_with(&a.store.lock().unwrap(), "/p", None);
     assert_eq!(resolver.account_id("cs").unwrap(), None);
-}
-
-#[test]
-fn instances_pinned_to_an_account_are_reported_for_removal_guards() {
-    let a = accounts();
-    let store = a.store.lock().unwrap();
-    write(&store, &codespace_key("cs-b"), &pin(Some("acct"), true)).unwrap();
-    write(&store, &codespace_key("cs-a"), &pin(Some("acct"), true)).unwrap();
-    write(&store, &sandbox_key("box"), &pin(Some("acct"), true)).unwrap();
-    // Following the project, another account, and no account: not pinned to it.
-    write(&store, &codespace_key("follows"), &pin(Some("acct"), false)).unwrap();
-    write(&store, &codespace_key("other"), &pin(Some("else"), true)).unwrap();
-    write(&store, &sandbox_key("none"), &pin(None, true)).unwrap();
-    assert_eq!(
-        instances_using_claude_account(&store, "acct").unwrap(),
-        vec![
-            PinnedInstance {
-                sandbox: false,
-                name: "cs-a".into()
-            },
-            PinnedInstance {
-                sandbox: false,
-                name: "cs-b".into()
-            },
-            PinnedInstance {
-                sandbox: true,
-                name: "box".into()
-            },
-        ]
-    );
-    assert!(instances_using_claude_account(&store, "nobody")
-        .unwrap()
-        .is_empty());
-    // A forgotten instance is no longer reported.
-    store
-        .forget_cloud(&super::CloudRef::codespace("cs-a"))
-        .unwrap();
-    assert_eq!(
-        instances_using_claude_account(&store, "acct")
-            .unwrap()
-            .len(),
-        2
-    );
 }
 
 #[test]

@@ -168,3 +168,65 @@ fn an_unreadable_pin_is_an_error_never_no_account() {
     assert!(super::pinned(&file, "box-2").is_err());
     assert!(clear_pin(&file, "box-2").is_err());
 }
+
+fn live_sandbox(store: &Store, name: &str) {
+    store
+        .remember_cloud_ref_project(
+            "env",
+            &serde_json::json!({"cwd": format!("/ws/{name}"), "id": name}),
+            "/local/project",
+            &crate::cloud_sessions::CloudRef::sandbox(name),
+        )
+        .unwrap();
+}
+
+#[test]
+fn sandboxes_pinned_to_lists_only_live_sandboxes_of_that_account() {
+    let store = store();
+    pin(&store, "live-a", Some("acct-A")).unwrap();
+    pin(&store, "live-b", Some("acct-B")).unwrap();
+    pin(&store, "gone-a", Some("acct-A")).unwrap();
+    live_sandbox(&store, "live-a");
+    live_sandbox(&store, "live-b");
+    assert_eq!(sandboxes_pinned_to(&store, "acct-A").unwrap(), ["live-a"]);
+    assert_eq!(sandboxes_pinned_to(&store, "acct-B").unwrap(), ["live-b"]);
+    assert!(sandboxes_pinned_to(&store, "nobody").unwrap().is_empty());
+    // A cleared pin is no use.
+    clear_pin(&store, "live-a").unwrap();
+    assert!(sandboxes_pinned_to(&store, "acct-A").unwrap().is_empty());
+}
+
+#[test]
+fn clearing_a_pin_deletes_the_setting_row() {
+    let store = store();
+    pin(&store, "box-1", Some("acct-A")).unwrap();
+    clear_pin(&store, "box-1").unwrap();
+    assert_eq!(store.setting(&pin_key("box-1")).unwrap(), None);
+    assert!(store
+        .settings_with_key_prefix(PIN_PREFIX)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn a_removed_account_names_the_sandbox_and_where_to_add_the_token_again() {
+    let installed = Installed::new();
+    let id = installed.add("alice");
+    let store = store();
+    pin(&store, "box-1", Some(&id)).unwrap();
+    assert_eq!(removed_account_error(&store, "box-1"), None);
+    installed.accounts.remove(&id).unwrap();
+    let error = removed_account_error(&store, "box-1").unwrap();
+    assert_eq!(
+        error,
+        "Sandbox box-1 was created with Docker account alice, which was removed. Add a token for alice again in Settings > Cloud."
+    );
+    assert!(!error.contains("Choose another"), "{error}");
+    // Adding the same Docker ID again makes it usable again.
+    installed.add("alice");
+    assert_eq!(removed_account_error(&store, "box-1"), None);
+    // A sandbox without a pin, or with a pin that has no recorded Docker ID, has no such text.
+    assert_eq!(removed_account_error(&store, "box-2"), None);
+    store.save_setting(&pin_key("box-3"), "old-id").unwrap();
+    assert_eq!(removed_account_error(&store, "box-3"), None);
+}

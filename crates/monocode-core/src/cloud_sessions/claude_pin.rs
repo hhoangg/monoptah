@@ -83,19 +83,11 @@ pub fn write(store: &Store, key: &str, pin: &ClaudePin) -> Result<(), String> {
         .map_err(|_| "Could not save which Claude account this session uses.".to_string())
 }
 
-/// Forgets the pin under `key` (the instance was deleted).
+/// Forgets the pin under `key` (the instance was deleted): the setting row is deleted.
 pub fn clear(store: &Store, key: &str) -> Result<(), String> {
-    if store
-        .setting(key)
-        .ok()
-        .flatten()
-        .is_some_and(|v| !v.is_empty())
-    {
-        store
-            .save_setting(key, "")
-            .map_err(|_| "Could not forget which Claude account this session used.".to_string())?;
-    }
-    Ok(())
+    store
+        .delete_setting(key)
+        .map_err(|_| "Could not forget which Claude account this session used.".to_string())
 }
 
 /// The account an instance runs under. `pin` is its saved pin and `project` is the project's
@@ -113,37 +105,6 @@ pub fn effective(pin: Option<&ClaudePin>, project: Option<&Option<String>>) -> O
         (Some(pin), None) => pin.account.clone(),
         (None, None) => None,
     }
-}
-
-/// A cloud instance whose session pinned an app Claude account.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct PinnedInstance {
-    /// `true` for a Docker sandbox, `false` for a codespace.
-    pub sandbox: bool,
-    pub name: String,
-}
-
-/// Instances pinned (a per-session override, `pinned: true`) to Claude account `account_id`,
-/// sorted. They run under it whatever their project says, so removing the account would
-/// break them even when no project uses it (see also
-/// [`super::project_cloud::projects_using_claude_account`]).
-pub fn instances_using_claude_account(
-    store: &Store,
-    account_id: &str,
-) -> Result<Vec<PinnedInstance>, String> {
-    let mut found = Vec::new();
-    for (sandbox, prefix) in [(false, CODESPACE_PREFIX), (true, SANDBOX_PREFIX)] {
-        for (name, raw) in store.settings_with_key_prefix(prefix)? {
-            let Some(pin) = parse(&raw) else {
-                continue;
-            };
-            if pin.pinned && pin.account.as_deref() == Some(account_id) {
-                found.push(PinnedInstance { sandbox, name });
-            }
-        }
-    }
-    found.sort();
-    Ok(found)
 }
 
 /// The local project a codespace belongs to, from the remote project bound to it.
@@ -276,15 +237,31 @@ pub fn require_auth_for(store: &Store, account: &str, pinned: bool) -> Result<Cl
 /// [`crate::remote::Connections`] by the app.
 pub struct StoreCodespaceClaude {
     store: Arc<Mutex<Store>>,
+    /// Where the state of a codespace is read (`gh codespace view`); without it no codespace
+    /// is known to be stopped.
+    gh: Option<Arc<dyn crate::codespaces::GhRunner>>,
 }
 
 impl StoreCodespaceClaude {
     pub fn new(store: Arc<Mutex<Store>>) -> Self {
-        Self { store }
+        Self { store, gh: None }
+    }
+
+    /// Reads codespace states through `gh`, so a shut-down codespace is known to run no Host.
+    pub fn with_gh(mut self, gh: Arc<dyn crate::codespaces::GhRunner>) -> Self {
+        self.gh = Some(gh);
+        self
     }
 }
 
 impl CodespaceClaude for StoreCodespaceClaude {
+    fn is_stopped(&self, codespace: &str) -> bool {
+        self.gh.as_ref().is_some_and(|gh| {
+            crate::codespaces::state(&**gh, codespace)
+                .is_ok_and(|state| matches!(state.as_str(), "Shutdown" | "ShuttingDown"))
+        })
+    }
+
     fn account_id(&self, codespace: &str) -> Result<Option<String>, String> {
         let store = self
             .store

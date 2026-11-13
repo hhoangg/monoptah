@@ -1712,8 +1712,10 @@ impl CloudSettings {
     /// What the Codespaces Repository row says: the GitHub repository, or why there is none.
     fn codespace_repo_text(&self) -> String {
         match (&self.origin, self.origin_read) {
-            (Some(origin), _) => codespaces::repo_from_remote(origin)
-                .unwrap_or_else(|| "The origin is not a GitHub repository".into()),
+            (Some(origin), _) => codespaces::repo_from_remote(origin).map_or_else(
+                || "The origin is not a GitHub repository".into(),
+                |repo| format!("github.com/{repo}"),
+            ),
             (None, true) => "The project has no git origin.".into(),
             (None, false) => "Reading the project's origin...".into(),
         }

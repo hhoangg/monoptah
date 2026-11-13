@@ -98,7 +98,6 @@ fn unreadable_setting_is_an_error_and_never_overwritten() {
     assert!(load(&store, "/p").is_err());
     assert!(save(&store, "/p", &ProjectCloud::default()).is_err());
     assert_eq!(store.setting(SETTING).unwrap().unwrap(), "{not json");
-    assert!(projects_using_claude_account(&store, "a").is_err());
 }
 
 #[test]
@@ -232,10 +231,6 @@ fn projects_using_accounts() {
     assert_eq!(
         projects_using_docker_account(&store, "nope").unwrap(),
         Vec::<String>::new()
-    );
-    assert_eq!(
-        projects_using_claude_account(&store, "c1").unwrap(),
-        ["/a", "/b", "/d"]
     );
 }
 

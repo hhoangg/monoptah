@@ -5536,6 +5536,64 @@ fn existing_instance_for_a_sandbox_lists_the_projects_sandboxes_and_starts_on_th
 }
 
 #[gpui::test]
+fn escape_does_not_close_the_sandbox_picker_while_it_is_working(cx: &mut TestAppContext) {
+    use gpui::VisualTestContext;
+    let (window, _, _) = crate::shell::tests::window(cx);
+    let sbx = FakeSbx::new("running");
+    window
+        .update(cx, |shell, window, cx| {
+            shell.cloud = Arc::new(sandbox_service(&sbx, false, shell.store.clone()));
+            shell.open_sandbox_picker("/work/widgets".into(), window, cx);
+            shell.set_sandbox_picker_busy(true, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.refresh().unwrap();
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_keystrokes("escape");
+    window
+        .update(visual, |shell, _, cx| {
+            assert!(shell.sandbox_picker.is_some(), "busy: stays open");
+            shell.set_sandbox_picker_busy(false, cx);
+        })
+        .unwrap();
+    visual.simulate_keystrokes("escape");
+    window
+        .update(visual, |shell, _, _| {
+            assert!(shell.sandbox_picker.is_none())
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn escape_does_not_close_the_codespace_picker_while_it_is_working(cx: &mut TestAppContext) {
+    use gpui::VisualTestContext;
+    let (window, _, _) = crate::shell::tests::window(cx);
+    window
+        .update(cx, |shell, window, cx| {
+            shell.open_codespace_picker_for("/work/widgets".into(), window, cx);
+            shell.set_codespace_picker_busy(true, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.refresh().unwrap();
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_keystrokes("escape");
+    window
+        .update(visual, |shell, _, cx| {
+            assert!(shell.codespace_picker.is_some(), "busy: stays open");
+            shell.set_codespace_picker_busy(false, cx);
+        })
+        .unwrap();
+    visual.simulate_keystrokes("escape");
+    window
+        .update(visual, |shell, _, _| {
+            assert!(shell.codespace_picker.is_none())
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn a_sandbox_without_a_ready_session_is_listed_but_cannot_be_picked(cx: &mut TestAppContext) {
     use gpui::VisualTestContext;
     let (window, _, _) = crate::shell::tests::window(cx);

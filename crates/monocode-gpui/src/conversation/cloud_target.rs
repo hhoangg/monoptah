@@ -541,27 +541,37 @@ impl Conversation {
             return Vec::new();
         }
         let default_backend = self.project_default_backend();
+        // Each row says who pays (the panel's own note), then whether it is the project's
+        // default, or that it must be set up first.
+        let described = |target: CloudTarget, extra: Option<&str>| match extra {
+            Some(extra) => format!("{} \u{b7} {extra}", target.billing_note()),
+            None => target.billing_note().to_owned(),
+        };
         let default_note =
-            |backend: DefaultBackend| (default_backend == backend).then_some("(default)");
+            |backend: DefaultBackend| (default_backend == backend).then_some("default");
         let mut rows = Vec::new();
         if self.cloud_offers_codespace {
-            let mut row = MenuAction::new("workspace:cloud-codespace", "Codespace")
+            let row = MenuAction::new("workspace:cloud-codespace", "Codespace")
                 .icon("cloud-upload")
-                .checked(self.cloud_target() == Some(CloudTarget::Codespace));
-            if let Some(note) = default_note(DefaultBackend::Codespace) {
-                row = row.description(note);
-            }
+                .checked(self.cloud_target() == Some(CloudTarget::Codespace))
+                .description(described(
+                    CloudTarget::Codespace,
+                    default_note(DefaultBackend::Codespace),
+                ));
             rows.push(row.into());
         }
         let configured = self.docker_config().is_some();
-        let mut docker = MenuAction::new("workspace:cloud-docker", "Docker Sandbox")
+        let docker = MenuAction::new("workspace:cloud-docker", "Docker Sandbox")
             .icon("cloud-upload")
-            .checked(self.cloud_target() == Some(CloudTarget::DockerSandbox));
-        if !configured {
-            docker = docker.description("Set up first");
-        } else if let Some(note) = default_note(DefaultBackend::Sandbox) {
-            docker = docker.description(note);
-        }
+            .checked(self.cloud_target() == Some(CloudTarget::DockerSandbox))
+            .description(described(
+                CloudTarget::DockerSandbox,
+                if configured {
+                    default_note(DefaultBackend::Sandbox)
+                } else {
+                    Some("Set up first")
+                },
+            ));
         rows.push(docker.into());
         // The instances of the backend that is chosen, else the project's default.
         let backend = self
@@ -728,10 +738,25 @@ impl Conversation {
             None
         };
         let fresh = self.cloud_defaults(target, config.as_ref());
+        // The save may have added, replaced or removed accounts: read them again, so a row
+        // names its account by label (Docker ID) and not by a raw id.
+        let accounts = crate::cloud_settings::claude_accounts(cx);
+        self.cloud_request_seq += 1;
+        let request = self.cloud_request_seq;
+        let docker = target == CloudTarget::DockerSandbox;
+        let Some(draft) = &mut self.cloud_draft else {
+            return;
+        };
+        draft.accounts = accounts;
+        if docker {
+            draft.docker_accounts_request = request;
+            self.load_docker_accounts(request, cx);
+        }
         let Some(draft) = &mut self.cloud_draft else {
             return;
         };
         if fresh == draft.defaults && config == draft.config {
+            cx.notify();
             return;
         }
         draft.config = config;

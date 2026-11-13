@@ -281,6 +281,17 @@ impl Store {
             .map_err(|e| e.to_string())?;
         Ok(())
     }
+    /// Deletes the setting `key` (no error when there is none).
+    pub fn delete_setting(&self, key: &str) -> Result<(), String> {
+        if self.shared.is_some() {
+            return self.shared_delete_setting(key);
+        }
+
+        self.conn
+            .execute("DELETE FROM native_settings WHERE key=?1", [key])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
     pub fn ui_state(&self) -> Result<Option<String>, String> {
         if self.shared.is_some() {
             return self.shared_ui_state();

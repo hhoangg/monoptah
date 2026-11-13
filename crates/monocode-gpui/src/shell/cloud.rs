@@ -841,7 +841,8 @@ pub(super) fn service(
     // chooses (or none) through the app's own store, so none can put a Host back on the
     // Codespaces secret. The sealed credential is only read on the connection worker threads.
     remote.set_codespace_claude(Arc::new(
-        monocode_core::cloud_sessions::claude_pin::StoreCodespaceClaude::new(store.clone()),
+        monocode_core::cloud_sessions::claude_pin::StoreCodespaceClaude::new(store.clone())
+            .with_gh(gh.clone()),
     ));
     let cloud = CloudSessions::new(gh, Arc::new(remote), store.clone());
     // The app registers the real Docker sandbox backend (sbx, ssh, its own secret store).

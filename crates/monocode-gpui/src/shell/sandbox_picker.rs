@@ -305,6 +305,13 @@ impl Shell {
         cx.notify();
     }
 
+    /// Whether the open sandbox picker is working (attaching): Escape must not close it then.
+    pub(super) fn sandbox_picker_busy(&self, cx: &App) -> bool {
+        self.sandbox_picker
+            .as_ref()
+            .is_some_and(|open| open.picker.read(cx).busy)
+    }
+
     pub(super) fn close_sandbox_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(open) = self.sandbox_picker.take() {
             if let Some(restore) = open.restore {
@@ -390,6 +397,14 @@ impl Shell {
                 )
                 .into_any_element(),
         )
+    }
+
+    /// Marks the open sandbox picker as working (tests).
+    #[cfg(test)]
+    pub(super) fn set_sandbox_picker_busy(&self, busy: bool, cx: &mut App) {
+        if let Some(open) = &self.sandbox_picker {
+            open.picker.update(cx, |picker, _| picker.busy = busy);
+        }
     }
 
     /// The sandboxes the open picker lists, by name (tests).

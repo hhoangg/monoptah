@@ -329,7 +329,10 @@ impl Conversation {
                     .accounts
                     .iter()
                     .find(|account| account.id == id)
-                    .map_or_else(|| id.to_owned(), |account| account.label.clone()),
+                    .map_or_else(
+                        || presets::unavailable_account_label(id),
+                        |account| account.label.clone(),
+                    ),
             },
             CloudField::DockerAccount => match draft.docker_account.as_deref() {
                 None => presets::MACHINE_SIGN_IN_LABEL.into(),
@@ -339,7 +342,18 @@ impl Conversation {
                     .unwrap_or_default()
                     .iter()
                     .find(|account| account.id == id)
-                    .map_or_else(|| id.to_owned(), |account| account.docker_id.clone()),
+                    .map_or_else(
+                        || {
+                            // Until the list is read the id is all there is; after it, an
+                            // account that is not in it reads like the menu's entry.
+                            if draft.docker_accounts.is_some() {
+                                presets::unavailable_account_label(id)
+                            } else {
+                                id.to_owned()
+                            }
+                        },
+                        |account| account.docker_id.clone(),
+                    ),
             },
             CloudField::Machine => match (&draft.machines, draft.machine.as_deref()) {
                 (Machines::Loading, None) => "Loading machines...".into(),

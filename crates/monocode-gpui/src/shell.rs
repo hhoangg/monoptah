@@ -9712,12 +9712,17 @@ impl Render for Shell {
                     this.close_cloud_archive(window, cx);
                     return;
                 }
+                // A picker that is working (attaching) stays open; the key is still consumed.
                 if this.codespace_picker.is_some() {
-                    this.close_codespace_picker(window, cx);
+                    if !this.codespace_picker_busy(cx) {
+                        this.close_codespace_picker(window, cx);
+                    }
                     return;
                 }
                 if this.sandbox_picker.is_some() {
-                    this.close_sandbox_picker(window, cx);
+                    if !this.sandbox_picker_busy(cx) {
+                        this.close_sandbox_picker(window, cx);
+                    }
                     return;
                 }
                 // A dialog left from another project must not swallow the key.

@@ -1959,4 +1959,37 @@ mod record_save {
         f.svc.begin_start("/p", target, "claude").unwrap_err();
         assert_eq!(pin(&f, "octo-abc"), Some(before));
     }
+
+    #[test]
+    fn a_failed_record_save_keeps_the_delivered_marker_of_an_existing_codespace() {
+        let (f, dir, usable) = fixture();
+        // The codespace has no pin (legacy) but its Host really runs under an app account.
+        let delivered = claude_pin::delivered_key("octo-abc");
+        f.store
+            .lock()
+            .unwrap()
+            .save_setting(&delivered, "acct-on-the-host")
+            .unwrap();
+        sql(
+            &dir,
+            "CREATE TRIGGER no_starts BEFORE INSERT ON native_settings \
+             WHEN NEW.key='cloud-starts.v1' BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+        );
+        let target = Target {
+            claude_account: Some(usable),
+            claude_account_pinned: true,
+            ..named_target()
+        };
+        f.svc.begin_start("/p", target, "claude").unwrap_err();
+        assert_eq!(pin(&f, "octo-abc"), None);
+        assert_eq!(
+            f.store
+                .lock()
+                .unwrap()
+                .setting(&delivered)
+                .unwrap()
+                .as_deref(),
+            Some("acct-on-the-host")
+        );
+    }
 }

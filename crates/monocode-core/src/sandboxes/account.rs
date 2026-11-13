@@ -116,18 +116,51 @@ pub fn pin(store: &Store, name: &str, account: Option<&str>) -> Result<(), Strin
         .map_err(|_| "Could not save which Docker account this sandbox belongs to.".to_string())
 }
 
-/// Forgets the pin of sandbox `name` (the sandbox was deleted).
+/// Forgets the pin of sandbox `name` (the sandbox was deleted): the setting row is deleted.
 pub fn clear_pin(store: &Store, name: &str) -> Result<(), String> {
-    if store
-        .setting(&pin_key(name))
-        .map_err(|_| "Could not forget which Docker account this sandbox belonged to.".to_string())?
-        .is_some()
-    {
-        store.save_setting(&pin_key(name), "").map_err(|_| {
-            "Could not forget which Docker account this sandbox belonged to.".to_string()
-        })?;
+    store
+        .delete_setting(&pin_key(name))
+        .map_err(|_| "Could not forget which Docker account this sandbox belonged to.".to_string())
+}
+
+/// Names of the live sandboxes (ones the app still has a cloud project for) pinned to
+/// Docker account `account_id`, sorted. They live in that account, so removing it would
+/// strand them even when no project names it.
+pub fn sandboxes_pinned_to(store: &Store, account_id: &str) -> Result<Vec<String>, String> {
+    let live: std::collections::BTreeSet<String> = store
+        .remote_projects()?
+        .into_values()
+        .filter_map(|p| p.sandbox)
+        .collect();
+    let mut found = Vec::new();
+    // The keys come back without the prefix: they are the sandbox names.
+    for (name, _) in store.settings_with_key_prefix(PIN_PREFIX)? {
+        if !live.contains(&name) {
+            continue;
+        }
+        if read_pin(store, &name)?.is_some_and(|pin| pin.account == account_id) {
+            found.push(name);
+        }
     }
-    Ok(())
+    found.sort();
+    Ok(found)
+}
+
+/// The user-facing error for sandbox `name` when the Docker account it was created with was
+/// removed (and no saved account has its Docker ID). `None` when the sandbox has no pin, the
+/// account still exists, or the pin predates the recorded Docker ID (then the generic account
+/// error applies).
+pub fn removed_account_error(store: &Store, name: &str) -> Option<String> {
+    let pin = read_pin(store, name).ok().flatten()?;
+    let docker_id = pin.docker_id?;
+    if docker_id_of(store, &pin.account).is_some()
+        || account_of_docker_id(store, &docker_id).is_some()
+    {
+        return None;
+    }
+    Some(format!(
+        "Sandbox {name} was created with Docker account {docker_id}, which was removed. Add a token for {docker_id} again in Settings > Cloud."
+    ))
 }
 
 /// How to name the account of a sandbox to the user: its Docker ID when the account is

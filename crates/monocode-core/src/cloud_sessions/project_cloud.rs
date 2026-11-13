@@ -7,7 +7,7 @@
 use super::docker_config::{self, DockerProjectConfig};
 use crate::store::Store;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Native store setting holding the cwd -> [`StoredProject`] map.
@@ -245,25 +245,6 @@ pub fn projects_using_docker_account(
         .filter(|(_, c)| c.docker_account.as_deref() == Some(account_id))
         .map(|(cwd, _)| cwd)
         .collect())
-}
-
-/// Project cwds that use Claude account `account_id` on either backend, sorted.
-pub fn projects_using_claude_account(
-    store: &Store,
-    account_id: &str,
-) -> Result<Vec<String>, String> {
-    let mut cwds = BTreeSet::new();
-    for (cwd, c) in docker_config::load_all(store)? {
-        if c.claude_account.as_deref() == Some(account_id) {
-            cwds.insert(cwd);
-        }
-    }
-    for (cwd, p) in load_map(store)? {
-        if p.codespace.claude_account.as_deref() == Some(account_id) {
-            cwds.insert(cwd);
-        }
-    }
-    Ok(cwds.into_iter().collect())
 }
 
 /// What the project's devcontainer file declares that matters to cloud setup.
