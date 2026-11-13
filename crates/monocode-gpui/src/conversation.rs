@@ -28,6 +28,7 @@ pub(crate) use cloud_location::CloudLocationReset;
 mod cloud_move;
 pub(crate) use cloud_move::{CancelCloudMove, ContinueInCloud, MOVE_PAUSED, MoveOffer};
 mod cloud_panel;
+pub(crate) mod cloud_usage;
 mod remote;
 pub(crate) use remote::CloudResumed;
 pub(crate) mod remote_plans;
@@ -189,6 +190,8 @@ pub(crate) struct Conversation {
     cloud_badge: Option<crate::cloud_mark::CloudBadge>,
     /// Lists the machine types of a project's repository for the codespace panel.
     machine_loader: Option<cloud_target::MachineLoader>,
+    /// This month's Codespaces usage for the line under the machine row (see `cloud_usage`).
+    cloud_usage: cloud_usage::UsageState,
     cloud_anchors: [AnchorSlot; 6],
     /// The branch rows of the cloud panel (Base branch), indexed by `CloudRefField`.
     cloud_ref_anchors: [AnchorSlot; 1],
@@ -830,6 +833,7 @@ impl Conversation {
             move_settings_stale: false,
             cloud_badge: None,
             machine_loader: None,
+            cloud_usage: Default::default(),
             cloud_anchors: Default::default(),
             cloud_ref_anchors: Default::default(),
             docker_accounts_loader: cloud_target::system_docker_accounts(),

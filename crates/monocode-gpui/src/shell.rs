@@ -720,6 +720,8 @@ pub(crate) struct Shell {
     _remote_clock: gpui::Task<()>,
     /// `gh` runner shared by the cloud session service and the codespace picker.
     gh: Arc<dyn monocode_core::codespaces::GhRunner>,
+    /// This month's Codespaces usage, kept for 10 minutes (see `cloud_usage`).
+    codespaces_usage: Arc<monocode_core::codespaces::usage::UsageCache>,
     cloud: Arc<monocode_core::cloud_sessions::CloudSessions>,
     /// The move engine "Continue in cloud" uses; the real one is `cloud`.
     cloud_move_engine: Arc<dyn cloud_move::MoveEngine>,
@@ -1243,6 +1245,7 @@ impl Shell {
             move_labels: HashMap::new(),
             cloud,
             gh,
+            codespaces_usage: Default::default(),
             cloud_marks: HashMap::new(),
             claude_setups: Default::default(),
             panel_modes: HashMap::new(),
@@ -1672,6 +1675,7 @@ impl Shell {
             }
             view.set_offers_codespace(offers, cx);
             view.set_machine_loader(self.machine_loader());
+            view.set_usage_loader(self.usage_loader());
             view.set_cloud_stopped(
                 self.cloud_marks.get(&id).is_some_and(|mark| {
                     !mark.codespace.is_empty()

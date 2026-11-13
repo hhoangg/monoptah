@@ -1057,6 +1057,9 @@ impl Conversation {
             self.load_docker_accounts(docker_accounts_request, cx);
         } else {
             self.load_cloud_machines(machines_request, cx);
+            // The usage line under the machine row: asked once per opening (a cached answer
+            // when fresh), never on render.
+            self.load_codespace_usage(false, cx);
         }
         self.load_cloud_branches(branches_request, cx);
         cx.notify();

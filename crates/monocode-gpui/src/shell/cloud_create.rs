@@ -113,6 +113,14 @@ impl Shell {
         })
     }
 
+    /// How a conversation reads this month's Codespaces usage: `gh api` on the worker, through
+    /// the app-wide 10-minute cache.
+    pub(super) fn usage_loader(&self) -> crate::conversation::cloud_usage::UsageLoader {
+        let cache = self.codespaces_usage.clone();
+        let gh = self.gh.clone();
+        Arc::new(move |force| cache.get(&*gh, force))
+    }
+
     pub(super) fn create_cloud_session(
         &mut self,
         draft: i64,
