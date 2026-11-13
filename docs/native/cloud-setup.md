@@ -311,3 +311,13 @@ Changing the Project settings dialog; GitLab or `glab`; Host changes.
 10. Switch the project back to "Codespaces secret"; reconnect; confirm the secret is used.
 11. Confirm no token appears in `~/Library/Logs` / the app log, in session archives, or in
    the codespace or sandbox file system (`grep -r dckr_pat_ ~/.monocode-host` and so on).
+12. In the composer, start a sandbox session in project A with the panel's Docker account
+   changed to account 2 for this session only. Confirm the sandbox is created under account
+   2, and that stop, reconnect and delete of that session keep using account 2 after
+   project A's default is changed again.
+13. With a codespace session running a long turn, change the project's Claude account in
+   Cloud settings. Confirm the turn is not interrupted and the new account applies once the
+   Host is idle (the next send says "Applying the Claude account to the codespace" while it
+   happens).
+14. Confirm the scope Docker Hub puts in the access token for a PAT with Cloud Sandboxes
+   access (expected `sandbox:use`; the app accepts any scope word starting with `sandbox`).
