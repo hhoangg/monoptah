@@ -353,6 +353,30 @@ impl Conversation {
     pub(crate) fn hold_working_for_test(&mut self, on: bool) {
         self.stopping = on;
     }
+    /// Gives the conversation a Codex model whose reasoning efforts its settings can pick.
+    #[cfg(test)]
+    pub(crate) fn seed_mono_model_for_test(&mut self, id: &str, efforts: &[&str]) {
+        self.summary.provider = "codex".into();
+        self.model = Some(id.into());
+        self.settings.effort = efforts.first().map(|e| e.to_string());
+        self.catalog = vec![monocode_core::catalog::Model {
+            id: id.into(),
+            name: id.into(),
+            alias_target: None,
+            efforts: efforts.iter().map(|e| e.to_string()).collect(),
+            default_effort: efforts.first().map(|e| e.to_string()),
+            fast: false,
+            thinking: false,
+            default: true,
+            tiers: Vec::new(),
+            controls: Vec::new(),
+        }];
+    }
+    /// Makes the conversation look like it is preparing a provider handoff.
+    #[cfg(test)]
+    pub(crate) fn hold_handoff_for_test(&mut self) {
+        self.status = "Preparing handoff…".into();
+    }
     /// Whether a turn is going, or a message sent from outside is waiting to start one.
     pub(crate) fn workflow_working(&self) -> bool {
         self.external_submission_pending() || self.stopping
@@ -587,18 +611,16 @@ impl Conversation {
         });
         items.into_iter().map(MenuItem::from).collect()
     }
-    pub(crate) fn mono_pick_model_option(
-        &mut self,
-        id: &str,
-        cx: &mut Context<Self>,
-    ) -> Result<(), String> {
-        if self.busy || self.stopping {
-            return Err("Wait for the current reply before changing model settings".into());
-        }
+    /// Applies a setting of the current model (effort, fast mode, tier, ...). A reply that is
+    /// still going keeps the settings it started with: the next turn reads the new ones, as in
+    /// the composer's menus.
+    pub(crate) fn mono_pick_model_option(&mut self, id: &str, cx: &mut Context<Self>) {
         self.menu_choice(id, cx);
         cx.emit(SessionChanged);
-        Ok(())
     }
+    /// Switches the Mono's provider and model through the same path as its composer's picker. A
+    /// reply that is still going is not touched: the new model starts with the next turn, and
+    /// another provider takes over with a handoff when that turn is sent.
     pub(crate) fn mono_config(
         &mut self,
         provider: Kind,
@@ -606,27 +628,13 @@ impl Conversation {
         values: std::collections::HashMap<String, String>,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        if self.busy || self.stopping {
-            return Err("Wait for the current reply before changing models".into());
+        if !self.apply_model_pick(&ModelPicked(provider, model), cx) {
+            return Err("Wait for the model switch to finish before changing models".into());
         }
-        if self.summary.provider != provider.id() {
-            self.summary.provider = provider.id().into();
-            self.summary.provider_id = None;
-            self.catalog.clear();
+        if !values.is_empty() {
+            self.settings.model_settings = values;
+            self.save_settings(cx);
         }
-        self.model = model;
-        self.settings.effort = super::preferred_effort(provider.id(), cx);
-        self.settings.fast = false;
-        self.settings.thinking = None;
-        self.settings.service_tier = None;
-        if let Some(context) = &mut self.context {
-            context.window = None;
-        }
-        self.settings.model_settings = values;
-        self.resolved_model = None;
-        self.refresh_catalog(cx);
-        self.save_settings(cx);
-        cx.emit(SessionChanged);
         cx.notify();
         Ok(())
     }

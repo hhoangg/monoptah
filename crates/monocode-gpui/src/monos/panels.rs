@@ -1924,7 +1924,7 @@ impl Monos {
             .child(heading("Model", None))
             .child(card()
                 .child(setting("Model",Some("What it thinks and replies with."),
-                    div().id("mono-settings-model").role(Role::Button).aria_label(format!("Choose model, {model}"))
+                    div().id("mono-settings-model").debug_selector(||"mono-settings-model".into()).role(Role::Button).aria_label(format!("Choose model, {model}"))
                         .h(px(28.)).px_1p5().mx(px(-6.)).rounded_md().flex().items_center().gap_2()
                         .text_size(px(12.)).text_color(content(0.85)).hover(|s|s.bg(content(0.06)))
                         .child(self.model_anchor.probe()).child(provider_icon(&provider,14.)).child(model)
@@ -1935,16 +1935,16 @@ impl Monos {
                     let value=option.value.clone().unwrap_or_else(||if option.checked {"On"}else{"Off"}.into());
                     let anchor=AnchorSlot::default(); let probe=anchor.probe();
                     Some(setting(&label,None,
-                        plain(SharedString::from(format!("mono-option-{}",option.id)),value).child(probe)
+                        plain(SharedString::from(format!("mono-option-{}",option.id)),value).debug_selector({let id=format!("mono-option-{}",option.id); move||id.clone()}).child(probe)
                             .on_click(cx.listener(move |this,_,w,cx| {
                                 if option.submenu.is_empty() {
-                                    if let Some(chat)=this.chat() && let Err(e)=chat.update(cx,|v,cx|v.mono_pick_model_option(&option.id,cx)) { this.error=Some(e); }
+                                    if let Some(chat)=this.chat() { chat.update(cx,|v,cx|v.mono_pick_model_option(&option.id,cx)); }
                                     this.changed(cx);
                                 } else { this.open_model_option(option.label.clone(),option.submenu.clone(),anchor.clone(),w,cx); }
                             })).into_any_element()).border_t_1().border_color(content(0.04)))
                 }))
                 .child(setting("Permissions",Some("What it may do without asking."),
-                    div().id("mono-settings-access").role(Role::Button).aria_label(format!("Permissions, {}",mode.label()))
+                    div().id("mono-settings-access").debug_selector(||"mono-settings-access".into()).role(Role::Button).aria_label(format!("Permissions, {}",mode.label()))
                         .h(px(28.)).max_w(px(208.)).px_1p5().mx(px(-6.)).rounded_md().flex().items_center().gap_2()
                         .text_size(px(12.)).text_color(content(0.85)).hover(|s|s.bg(content(0.06)))
                         .child(self.access_anchor.probe()).child(icon(access_icon,14.).when(mode==AccessMode::FullAccess,|i|i.text_color(rgb(0xffb900))))
@@ -2433,9 +2433,8 @@ impl Monos {
         let picked = cx.subscribe(&menu, |this, _, event: &MenuEvent, cx| {
             if let MenuEvent::Picked(id, _) = event
                 && let Some(chat) = this.chat()
-                && let Err(e) = chat.update(cx, |v, cx| v.mono_pick_model_option(id, cx))
             {
-                this.error = Some(e);
+                chat.update(cx, |v, cx| v.mono_pick_model_option(id, cx));
             }
             this.picker = None;
             this.changed(cx);

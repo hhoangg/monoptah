@@ -512,6 +512,7 @@ impl Popover {
                     .border_color(content(border)),
             );
         deferred(Placed {
+            priority: self.priority,
             anchor: self.anchor,
             options: self.options,
             progress: enter,
@@ -590,7 +591,36 @@ pub(crate) fn shadow() -> Vec<BoxShadow> {
     ]
 }
 
+/// A popover's card as last painted: which window it is in, how high it is drawn and where.
+struct Layer {
+    window: gpui::WindowId,
+    priority: usize,
+    surface: Bounds<Pixels>,
+}
+thread_local! {
+    /// Every popover painted for the frames still alive. A layer is held strongly only by its
+    /// popover's mouse listener, so it lives exactly as long as the frame that painted it: the
+    /// window drops the listeners of a frame once the next one is drawn.
+    static LAYERS: RefCell<Vec<std::rc::Weak<Layer>>> = const { RefCell::new(Vec::new()) };
+}
+/// Whether `position` is on the card of a popover drawn above `priority` in `window`. A press
+/// there belongs to that popover, so the ones beneath it, a modal for one, must not take it for
+/// an outside press and dismiss themselves before the item under the pointer is clicked.
+fn on_higher_layer(window: gpui::WindowId, priority: usize, position: &Point<Pixels>) -> bool {
+    LAYERS.with_borrow(|layers| {
+        layers
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .any(|layer| {
+                layer.window == window
+                    && layer.priority > priority
+                    && layer.surface.contains(position)
+            })
+    })
+}
+
 struct Placed {
+    priority: usize,
     anchor: Anchor,
     options: Options,
     progress: f32,
@@ -683,9 +713,16 @@ impl Element for Placed {
         cx: &mut App,
     ) {
         self.frame.paint(window, cx);
-        let Some(dismiss) = self.on_dismiss.clone() else {
-            return;
-        };
+        let layer = Rc::new(Layer {
+            window: window.window_handle().window_id(),
+            priority: self.priority,
+            surface: *surface,
+        });
+        LAYERS.with_borrow_mut(|layers| {
+            layers.retain(|layer| layer.strong_count() > 0);
+            layers.push(Rc::downgrade(&layer));
+        });
+        let dismiss = self.on_dismiss.clone();
         let surface = *surface;
         let anchor = self.anchor.bounds();
         let ignore = self.ignore.clone();
@@ -696,12 +733,17 @@ impl Element for Placed {
                 && !ignore
                     .iter()
                     .any(|slot| slot.get().is_some_and(|b| b.contains(position)))
+                && !on_higher_layer(layer.window, layer.priority, position)
         };
         // Capture, so a trigger beneath that stops propagation still closes
         // the popover, and before that trigger reacts to the same press.
         // Then consume that press in bubble so the
         // content behind cannot act on it too; the next press reaches it.
+        // Registered even without a dismissal: it keeps the layer alive.
         window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+            let Some(dismiss) = &dismiss else {
+                return;
+            };
             if !outside(&event.position) {
                 return;
             }
@@ -2074,6 +2116,90 @@ mod tests {
                     .render_at(1., window.viewport_size()),
             )
         }
+    }
+
+    struct LayersHost {
+        above: bool,
+        dismissed: Rc<Cell<usize>>,
+        below_card: AnchorSlot,
+        above_card: AnchorSlot,
+    }
+    impl Render for LayersHost {
+        fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let dismissed = self.dismissed.clone();
+            div()
+                .size_full()
+                .child(
+                    popover("layer-below", Anchor::Point(point(px(100.), px(100.))))
+                        .priority(70)
+                        .width(300.)
+                        .height(200.)
+                        .track(self.below_card.clone())
+                        .on_dismiss(move |_, _| dismissed.set(dismissed.get() + 1))
+                        .render_at(1., window.viewport_size()),
+                )
+                .when(self.above, |d| {
+                    d.child(
+                        popover("layer-above", Anchor::Point(point(px(350.), px(150.))))
+                            .priority(90)
+                            .width(200.)
+                            .height(100.)
+                            .track(self.above_card.clone())
+                            .render_at(1., window.viewport_size()),
+                    )
+                })
+        }
+    }
+
+    #[gpui::test]
+    fn a_press_on_a_popover_drawn_above_does_not_dismiss_the_one_beneath(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (below_card, above_card) = (AnchorSlot::default(), AnchorSlot::default());
+        let dismissed = Rc::new(Cell::new(0));
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|_| LayersHost {
+                    above: true,
+                    dismissed: dismissed.clone(),
+                    below_card: below_card.clone(),
+                    above_card: above_card.clone(),
+                })
+            })
+            .unwrap()
+        });
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let (below, above) = (below_card.get().unwrap(), above_card.get().unwrap());
+        // The card above hangs over the edge of the one beneath: its right half is outside it.
+        let beyond = point(above.right() - px(10.), above.center().y);
+        assert!(above.contains(&beyond) && !below.contains(&beyond));
+        visual.simulate_click(beyond, Default::default());
+        assert_eq!(
+            dismissed.get(),
+            0,
+            "a press on the card above is not outside"
+        );
+        // A press on neither card is outside the one beneath.
+        visual.simulate_click(
+            point(below.right() + px(300.), below.bottom() + px(300.)),
+            Default::default(),
+        );
+        assert_eq!(dismissed.get(), 1);
+        // The card above is gone: the point it covered is outside again, not still claimed.
+        window
+            .update(visual, |host, _, cx| {
+                host.above = false;
+                cx.notify();
+            })
+            .unwrap();
+        visual.run_until_parked();
+        visual.simulate_click(beyond, Default::default());
+        assert_eq!(
+            dismissed.get(),
+            2,
+            "a closed popover no longer claims presses"
+        );
     }
 
     #[gpui::test]
