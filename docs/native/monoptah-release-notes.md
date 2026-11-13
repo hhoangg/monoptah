@@ -1,37 +1,23 @@
-# Monoptah Native 0.51.0
+# Monoptah Native 0.51.1
 
-## Changes since 0.50.4
+## Changes since 0.51.0
 
 ### New
 
-- Continue in cloud and Continue locally. A local session can be moved to a GitHub Codespace or Docker Sandbox from its menu, and brought back later, as one session with one conversation on both sides. Code travels by pushing the session's branch (never with force, never to the repository's default branch; if the branch has diverged the target is `<branch>-cloud`), and uncommitted tracked changes travel as a patch. Ignored files such as `.env.local` are never carried. A divider in the transcript marks the move. While a session is in the cloud, local runs and the local terminal are refused, and rewinding to before the move is blocked. If the transcripts on both sides diverged, the session forks to a new id instead of overwriting.
-- Continue locally does not destroy local work. It saves a verified backup first, updates the working tree only if you have no conflicting changes, and offers Restore my backup and Discard backup afterwards. If the cloud workspace was lost, you get a summary and Reset to local. After a fully successful return the codespace or sandbox is deleted, unless other sessions still use it (they are named) or something could not be saved; a failed cleanup offers Retry or Keep in the session menu.
-- Claude setup for cloud workspaces. Settings > Cloud holds one kit (skills, plugins, MCP servers, settings and your user `CLAUDE.md` with its `@` imports and `rules/*.md`) that is copied to every new cloud workspace in a "Claude setup" start step, with a per-start switch in the cloud picker. This step never fails the start. Secret values in MCP `headers` and `env` are stored on the workspace with mode 0600 and given only to Claude processes. MCP servers that sign in with OAuth are copied as configuration only and marked "Sign in in the cloud"; the app never reads the macOS Keychain or Claude Code's credentials for them.
-- Docker Sandbox sessions now sign `gh` in with the saved Git credential (GitHub only), so Create PR works in the sandbox, and the agent is told that git and `gh` are set up and must not print the token.
-- Cloud sessions are marked with a cloud badge wherever sessions are listed: sidebar rows (both layouts), title tabs, split pane headers, Mono launch cards, the Mono Sub-agents panel and app search results. Hovering shows the backend, workspace and state, for example `Codespace - octo-abc - Available`. The Sub-agents panel can be filtered to local or cloud sessions.
-- Files and Changes now show the cloud workspace of a cloud session, with a Cloud / Local switch and a connection strip whose Connect action is the only thing that wakes a workspace. Saving a cloud file checks that the cloud copy has not changed; if it has, a conflict dialog lets you keep yours or take the cloud version. Remote text files over 1 MB open read-only. Push, pull, sync and PR on a cloud workspace are confirmed actions with timeouts. When the workspace is disconnected the panels show the last known files and Git state.
-- Mono app API: `sessions.moveToCloud`, `sessions.moveToLocal`, `sessions.moveStatus` and `sessions.cancelMove`. `moveToCloud` takes the same cloud target as `sessions.start`. `moveToLocal` only opens the Continue locally dialog; you confirm it. All four are refused for unattended runs (habits, heartbeats, workflow questions).
-- Mono app API: `accounts.list` lists the Claude, Codex and Devin accounts a session can use, and `sessions.start` takes an `account` field (a label, an id or `default`) for local sessions. In a Mono composer you can also write `@provider/label` to pick an account.
-- Undo and redo in the composer and other plain text fields (Cmd+Z / Cmd+Shift+Z on macOS, Ctrl+Z / Ctrl+Y elsewhere; rebindable in Settings > Keybindings), and terminal-style prompt history: Up on the first line recalls earlier prompts of that chat, Down returns to your unsent draft. History comes from the saved transcript, so it survives restarts. Secret fields keep neither undo steps nor history.
-- You can select and copy text in Documents (Mono documents, lightbox, plans, Markdown previews) and in the Notes preview, with drag, double-click (word), triple-click (paragraph), Cmd/Ctrl+C and Select All.
+- Docker accounts in Settings > Cloud. Add an account with its Docker ID and a personal access token created with "Allow Cloud Sandboxes access" (the token page opens from a link). The token is checked when you save, with a clear error for a wrong Docker ID or token and for a token without Cloud Sandboxes access, and nothing is saved then. Each account can replace its token, be checked again or be removed; removing is refused while a project or a sandbox uses it. Tokens are stored encrypted in the app database, never in the Keychain, and never appear in commands, logs or files.
+- A Docker account per project. Every `sbx` command and every sandbox ssh connection (tunnels, scripts, terminal, Host upgrade) runs as the account that created the sandbox, or as the project's account before a sandbox exists. A revoked or expired token tells you to replace it in Settings > Cloud.
+- Settings > Cloud has a Backends checklist: `gh` signed in with the codespace scope, `sbx` installed and its ssh set up. Check again runs the checks again, and Fix runs the needed command in a terminal.
+- One Cloud settings dialog per project, opened with "Cloud settings…" in the project menu or from the composer. It replaces the Codespaces setup and Docker Sandbox setup dialogs. A Codespaces | Docker Sandbox switch shows the same rows for both backends: the default backend, a Ready checklist with Fix, the workspace (repository, base branch, dev container, machine or size, stop when idle or runtime limit) and the credentials (Docker account, Claude account, Git). Git credentials are managed in a side panel inside the dialog instead of a second dialog.
+- Codespaces can use a Claude account from the app instead of the Codespaces secret. Pick it in the project's Cloud settings; it reaches the codespace on every start, reconnect, wake and Host upgrade. A change never interrupts a running turn: it is applied once the codespace is idle, and the next send says "Applying the Claude account to the codespace" while it happens.
+- Mono app API: `sessions.start` now takes `account` for a new cloud instance too.
 
 ### Improvements
 
-- Monoptah Host 1.2.0 is released with this version, and the app now installs the Host from Monoptah's own releases, pinned with checksums. The cloud features above need it (copying your `CLAUDE.md` needs 1.2.0; until then the rest of the kit is copied and the setup says your instructions follow after the update). Codespace and Docker Sandbox workspaces get it automatically: a new workspace installs it, and an existing one is upgraded when you start or reconnect it. A running turn is never interrupted; the upgrade then waits for the next connect. A Host on your own SSH machine is not upgraded automatically; use Update Host in Settings > Connections.
-- Clicking a file in a cloud session chat now opens it directly instead of offering to copy it to this Mac. Large files download with progress and Cancel, and above 500 MB the app asks first. Files no viewer can show open in the default app only if they are a document, image, audio, video or data file; programs and installers are revealed instead.
-- Starting several codespace sessions at once no longer fails with "Another SSH connection is being set up". The Host install now refuses Linux systems with musl or glibc older than 2.28 before downloading and reports the real error.
-- Moving a session to a new Docker Sandbox waits for a slow code restore (up to 15 minutes) instead of failing with "The host request did not complete".
-- The Continue in cloud, Continue locally, archive, Docker Sandbox setup and Git credential dialogs now block the window behind them: no hover, clicks, scroll or shortcuts reach it.
-- Starting a session in a codespace without an SSH server now says to add the `ghcr.io/devcontainers/features/sshd:1` dev container feature, with a "How to fix" link, instead of showing the raw `gh` error.
-- Transcript text selection can start from a margin or a gap between lines and paragraphs, and drags snap to the nearest line. A plain click still selects nothing.
-- Setup-token quota: a manual refresh checks at most once every 60 seconds, a click during a running check is ignored, the idle chip reads "refresh to check usage", and a 404 names the model used for the check.
-- Settings: the CLI account row is named "CLI login", and opening Settings loads the model list of every installed provider whose list is missing.
-
-### Fixes
-
-- Cloud sessions were missing from the title tab strip, also after a restart.
-- After a Mono deleted a codespace or sandbox, its sessions stayed in the Sub-agents panel. They are now removed, and a session whose workspace failed to start shows "Failed to start".
-- In automation runs, a continued session keeps its own account unless that account was removed.
+- Existing setups keep working as before: without a Docker account, sandboxes keep using the Mac's `sbx login`, and codespaces keep using the Codespaces secret until you choose an app account. Saved sandbox settings are read as they are.
+- The composer's cloud panel shows the same rows for both backends (Machine or Size, Stop when idle or Runtime limit, Base branch, Branch, Docker account, Claude account, Claude setup), each marked as the project default or "changed for this session". Only changed rows override the project settings. A codespace can start on a new working branch. The Workspace menu gains "Existing instance…" and "Cloud settings for this project…".
+- A Docker or Claude account changed for one session stays with its codespace or sandbox across stop, reconnect and delete, also after the project default changes.
+- The selects in Cloud settings open as a floating menu under the field instead of pushing the form down, pick up accounts, credentials and machines that load while they are open, and keep the checked value highlighted.
+- The Git credential form no longer shows a read-only Host row; the platform (GitHub or GitLab) already sets it.
 
 ## Downloads and updates
 
@@ -41,6 +27,9 @@
 - Every updater package and the shared native update feed are signed. Native releases use their own feed and do not replace the Tauri update feed.
 
 ## Known limits
+
+- No Host update comes with this version; Monoptah Host stays at 1.2.0.
+- "Existing instance…" for Docker Sandbox lists only sandboxes that have a ready session of the project. Docker token expiry shows "Not known", because Docker Hub does not report it.
 
 - macOS packages are ad-hoc signed and are not Apple-notarized. The Windows installer is unsigned, so SmartScreen warns on first install.
 - Linux and Windows desktop interaction still need broader runtime testing. The in-app HTML viewer is macOS only; on Linux and Windows the viewer offers to open HTML with the default app.
