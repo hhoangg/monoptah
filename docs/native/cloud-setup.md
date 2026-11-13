@@ -124,8 +124,6 @@ Layout, top to bottom:
   "Confirm remove" question, the Git credential panel, the replace-token question, then the
   dialog itself. The keyboard returns to the dialog when the panel is closed, unless a field
   in the main column had it.
-- **Summary line**: `New cloud sessions use <backend> . <size> . Claude <x> [. Docker <id>] .
-  Claude setup on/off` (the dots are rendered as middle dots).
 - Footer: Cancel and Save. Save validates with the same rules as before
   (`DockerProjectConfig::validated` plus the new codespace rules) and writes both backends.
   It also saves the Codespaces secrets typed in the secrets block (the block has no Save of

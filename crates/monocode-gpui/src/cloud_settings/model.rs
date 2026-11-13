@@ -1,6 +1,6 @@
 //! What the project's Cloud settings dialog knows and decides: the form of both backends,
 //! the option lists of its selects (a saved value that is not a preset stays selectable),
-//! the warnings, the summary line and the validation that maps core errors to fields. Pure
+//! the warnings and the validation that maps core errors to fields. Pure
 //! functions of their inputs: `save` is the only one that touches the store, and it never
 //! runs `gh`, `sbx` or `git`.
 pub(crate) use crate::cloud_presets::AccountChoice;
@@ -480,29 +480,4 @@ pub(super) fn selected_machine(machines: &[MachineType], current: Option<&str>) 
         Some(name) => Some(name.to_owned()),
         None => codespaces::default_machine(machines, None),
     }
-}
-
-/// `New cloud sessions use <backend> . <size or machine> . Claude <x> [. Docker <id>] .
-/// Claude setup on|off`, the dots as middle dots.
-pub(super) fn summary_line(
-    backend: DefaultBackend,
-    place: &str,
-    claude: &str,
-    docker: Option<&str>,
-    kit_on: bool,
-) -> String {
-    let name = match backend {
-        DefaultBackend::Codespace => "Codespaces",
-        DefaultBackend::Sandbox => "Docker Sandbox",
-    };
-    let mut parts = vec![format!("New cloud sessions use {name}"), place.to_owned()];
-    parts.push(format!("Claude {claude}"));
-    if let Some(docker) = docker {
-        parts.push(format!("Docker {docker}"));
-    }
-    parts.push(format!(
-        "Claude setup {}",
-        if kit_on { "on" } else { "off" }
-    ));
-    parts.join(" \u{b7} ")
 }

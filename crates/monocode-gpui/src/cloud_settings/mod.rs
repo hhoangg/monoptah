@@ -18,7 +18,6 @@ pub(crate) mod tests;
 use crate::{
     cloud_checks::{Gh, gh_state},
     cloud_dialog_ui::{alert, field_box, heading, labelled, muted},
-    cloud_kit_ui,
     fix_terminal::FixCommand,
     git_credential_panel::{self, GitCredentialPanel},
     input::{self, Input},
@@ -2274,67 +2273,6 @@ impl CloudSettings {
             }
         }
     }
-
-    /// `New cloud sessions use ...` for the backend shown.
-    pub(crate) fn summary(&self, cx: &App) -> String {
-        let typed = self.typed(cx);
-        let kit_on = cloud_kit_ui::default_on(&cloud_kit_ui::kit_prefs(cx));
-        let account_label = |id: &Option<String>, none: &str| match id {
-            None => none.to_owned(),
-            Some(id) => self
-                .env
-                .claude_accounts
-                .iter()
-                .find(|a| &a.id == id)
-                .map_or_else(
-                    || crate::cloud_presets::unavailable_account_label(id),
-                    |a| a.label.clone(),
-                ),
-        };
-        match self.tab {
-            DefaultBackend::Codespace => {
-                let machine = match &self.machines {
-                    Machines::Loaded(list) => {
-                        model::selected_machine(list, typed.codespace.machine.as_deref())
-                            .map(|name| crate::cloud_presets::machine_name_label(list, &name))
-                    }
-                    _ => Some(
-                        typed
-                            .codespace
-                            .machine
-                            .clone()
-                            .unwrap_or_else(|| codespaces::DEFAULT_MACHINE.to_owned()),
-                    ),
-                }
-                .unwrap_or_else(|| codespaces::DEFAULT_MACHINE.to_owned());
-                model::summary_line(
-                    self.tab,
-                    &machine,
-                    &account_label(&typed.codespace.claude, "Codespaces secret"),
-                    None,
-                    kit_on,
-                )
-            }
-            DefaultBackend::Sandbox => {
-                let docker = typed.sandbox.docker_account.as_ref().map(|id| {
-                    self.docker_accounts
-                        .iter()
-                        .find(|a| &a.id == id)
-                        .map_or_else(|| id.clone(), |a| a.docker_id.clone())
-                });
-                model::summary_line(
-                    self.tab,
-                    &model::size_label(typed.sandbox.cpus, &typed.sandbox.memory),
-                    &account_label(
-                        &typed.sandbox.claude,
-                        crate::cloud_presets::SANDBOX_NO_CLAUDE_LABEL,
-                    ),
-                    docker.as_deref(),
-                    kit_on,
-                )
-            }
-        }
-    }
 }
 
 impl Render for CloudSettings {
@@ -2440,7 +2378,6 @@ impl Render for CloudSettings {
                     .filter(|e| e.field == Field::General)
                     .map(|e| alert("cloud-error-general", e.message.clone())),
             );
-        let summary = self.summary(cx);
         let footer = div()
             .flex_shrink_0()
             .flex()
@@ -2451,17 +2388,6 @@ impl Render for CloudSettings {
             .pt_3()
             .border_t_1()
             .border_color(content(0.08))
-            .child(
-                div()
-                    .id("cloud-summary")
-                    .debug_selector(|| "cloud-summary".into())
-                    .role(Role::Status)
-                    .aria_label(summary.clone())
-                    .text_size(px(11.5))
-                    .line_height(px(17.))
-                    .text_color(content(0.65))
-                    .child(summary),
-            )
             .child(
                 modal::actions()
                     .mt(px(0.))

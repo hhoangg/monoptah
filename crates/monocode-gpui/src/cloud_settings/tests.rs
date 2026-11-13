@@ -578,30 +578,6 @@ fn only_credentials_for_the_repository_host_are_offered() {
 }
 
 #[test]
-fn the_summary_line_follows_the_backend_shown() {
-    assert_eq!(
-        model::summary_line(
-            DefaultBackend::Sandbox,
-            "4 CPUs, 8 GB",
-            "work",
-            Some("alice"),
-            true
-        ),
-        "New cloud sessions use Docker Sandbox \u{b7} 4 CPUs, 8 GB \u{b7} Claude work \u{b7} Docker alice \u{b7} Claude setup on"
-    );
-    assert_eq!(
-        model::summary_line(
-            DefaultBackend::Codespace,
-            "4-core, 16 GB",
-            "Codespaces secret",
-            None,
-            false
-        ),
-        "New cloud sessions use Codespaces \u{b7} 4-core, 16 GB \u{b7} Claude Codespaces secret \u{b7} Claude setup off"
-    );
-}
-
-#[test]
 fn a_size_below_the_devcontainer_warns_but_stays_selectable() {
     let info = DevcontainerInfo {
         host_cpus: Some(4),
@@ -917,7 +893,9 @@ fn the_fix_for_ssh_carries_the_account_token_only_in_the_environment(cx: &mut Te
     assert!(!format!("{command:?}").contains(JWT));
     dialog.read_with(cx, |d, cx| {
         assert!(!d.fix_pending);
-        assert!(!d.summary(cx).contains(JWT));
+        for select in [Select::DockerAccount, Select::Claude, Select::Size] {
+            assert!(!d.current_label(select, cx).contains(JWT));
+        }
     });
     // Without an account the machine's sign-in is used: no token at all.
     let dialog = fixture.open(cx, Some(DefaultBackend::Sandbox), https_origin);
@@ -988,9 +966,13 @@ fn machines_are_listed_off_the_ui_thread_and_a_failure_keeps_a_text_fallback(
         assert_eq!(labels[1], "4-core, 16 GB (devcontainer)");
         // None shows the machine a codespace starts on.
         assert_eq!(d.current_label(Select::Machine, cx), "2-core, 8 GB");
+        // No machine and no Claude account chosen: the machine default and the secret.
+        let typed = d.typed(cx);
+        assert_eq!(typed.codespace.machine, None);
+        assert_eq!(typed.codespace.claude, None);
         assert_eq!(
-            d.summary(cx),
-            "New cloud sessions use Codespaces \u{b7} 2-core, 8 GB \u{b7} Claude Codespaces secret \u{b7} Claude setup off"
+            d.current_label(Select::Claude, cx),
+            model::CODESPACE_SECRET_LABEL
         );
         // The default machine is below the devcontainer's: warned, still selectable.
         assert!(d.machine_warning(cx).is_some());
@@ -1270,10 +1252,7 @@ fn the_claude_picker_offers_the_codespaces_secret_only_on_codespaces(cx: &mut Te
     });
     dialog.read_with(cx, |d, cx| {
         assert_eq!(d.current_label(Select::Claude, cx), "work@company");
-        assert_eq!(
-            d.summary(cx),
-            "New cloud sessions use Codespaces \u{b7} 2-core, 8 GB \u{b7} Claude work@company \u{b7} Claude setup off"
-        );
+        assert_eq!(d.typed(cx).codespace.claude.as_deref(), Some("claude-1"));
     });
     dialog.update(cx, |d, cx| d.switch_tab(DefaultBackend::Sandbox, None, cx));
     dialog.read_with(cx, |d, cx| {
@@ -1283,16 +1262,18 @@ fn the_claude_picker_offers_the_codespaces_secret_only_on_codespaces(cx: &mut Te
             .map(|o| o.label)
             .collect();
         assert_eq!(labels, ["None", "work@company", "Team API key"]);
-        assert!(d.summary(cx).contains("Claude None"));
+        assert_eq!(d.current_label(Select::Claude, cx), "None");
+        assert_eq!(d.typed(cx).sandbox.claude, None);
     });
     dialog.update(cx, |d, cx| {
         d.pick(Pick::DockerAccount(Some("acct-1".into())), cx)
     });
     dialog.read_with(cx, |d, cx| {
-        assert_eq!(
-            d.summary(cx),
-            "New cloud sessions use Docker Sandbox \u{b7} 2 CPUs, 4 GB \u{b7} Claude None \u{b7} Docker alice \u{b7} Claude setup off"
-        );
+        let typed = d.typed(cx);
+        assert_eq!(d.current_label(Select::Size, cx), "2 CPUs, 4 GB");
+        assert_eq!(typed.sandbox.claude, None);
+        assert_eq!(typed.sandbox.docker_account.as_deref(), Some("acct-1"));
+        assert_eq!(d.current_label(Select::DockerAccount, cx), "alice");
         let docker: Vec<_> = d
             .options(Select::DockerAccount, cx)
             .into_iter()
@@ -1346,11 +1327,14 @@ fn nothing_secret_is_in_the_text_the_dialog_draws_or_reports(cx: &mut TestAppCon
     });
     cx.run_until_parked();
     dialog.read_with(cx, |d, cx| {
-        let mut text = vec![d.summary(cx)];
+        let mut text: Vec<String> = items(d, DefaultBackend::Sandbox)
+            .into_iter()
+            .map(|i| i.text)
+            .collect();
         text.extend(
-            items(d, DefaultBackend::Sandbox)
+            [Select::DockerAccount, Select::Claude, Select::Size]
                 .into_iter()
-                .map(|i| i.text),
+                .map(|s| d.current_label(s, cx)),
         );
         text.extend(
             [

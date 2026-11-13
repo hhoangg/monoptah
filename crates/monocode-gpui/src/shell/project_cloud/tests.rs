@@ -120,12 +120,13 @@ fn the_menu_item_opens_the_dialog_and_draws_it(cx: &mut TestAppContext) {
         "cloud-field-cs-base",
         "cloud-select-claude",
         "cloud-git-codespace",
-        "cloud-summary",
         "cloud-cancel",
         "cloud-save",
     ] {
         assert!(visual.debug_bounds(selector).is_some(), "{selector}");
     }
+    // The footer holds only Cancel and Save: no summary line.
+    assert!(visual.debug_bounds("cloud-summary").is_none());
     // Cancel writes nothing and closes.
     let cancel = visual.debug_bounds("cloud-cancel").unwrap();
     visual.simulate_click(cancel.center(), Default::default());
@@ -1111,7 +1112,6 @@ fn form_layout(
         "cloud-select-git",
         "cloud-git-manage",
         "cloud-credentials-note",
-        "cloud-summary",
         "cloud-save",
         "cloud-settings-main",
         "cloud-settings",
