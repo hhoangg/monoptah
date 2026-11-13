@@ -9,6 +9,13 @@ on:
 permissions:
   contents: read
 
+# The native-dev profile is incremental for local builds; CI builds start from a
+# cache restore, where incremental data only costs time and cache space.
+# dtolnay/rust-toolchain sets the same value when it is unset, so this does not
+# change any rust-cache key (they hash CARGO* variables by name and value).
+env:
+  CARGO_INCREMENTAL: "0"
+
 concurrency:
   group: native-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
@@ -22,7 +29,8 @@ concurrency:
 # the full npm run native:check before every release).
 #
 # Job graph:
-#   changes -> core, desktop-lint, desktop, desktop-test-build -> desktop-test (shards)
+#   changes -> core, desktop-lint, desktop, desktop-test-build -> desktop-test (shards),
+#              core-windows-build -> core-windows-test (shards)
 #   release-cache, release-cache-rpm (push to main only, never blocking)
 #   ci-passed waits for every job above and is the one check to require for merging.
 #
@@ -73,15 +81,13 @@ jobs:
           echo "native=$native" >> "$GITHUB_OUTPUT"
           echo "native=$native"
 
+  # Core crate on Linux: native node tests, clippy and the tests in one job. The Windows
+  # core tests are sharded below (core-windows-build and core-windows-test).
   core:
-    name: Core (${{ matrix.os }})
+    name: Core (ubuntu-latest)
     needs: changes
     if: needs.changes.outputs.native == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -96,18 +102,128 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install Linux core dependencies
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y libdbus-1-dev pkg-config
       # ci.yml, the other npm ci, is paused; the native release needs a good lock.
       # It also installs @tauri-apps/cli, without which the signing tests in
       # native:test:dev are skipped.
-      - if: runner.os == 'Linux'
-        run: npm ci
+      - run: npm ci
       - run: npm run native:test:dev
       - run: cargo clippy --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-core --all-targets --profile native-dev -- -D warnings
       - run: cargo test --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-core --profile native-dev
+
+  # Core crate on Windows, built once and run in shards, the same way as the GPUI tests
+  # below: one `cargo test` run took about 12 minutes (3.6 compile, 8.5 running the lib
+  # tests), which made it the critical path.
+  #
+  # Build: native node tests and clippy (as on Linux), then `cargo nextest archive`
+  # compiles the core test binaries into one artifact. shared-key keeps restoring the
+  # cache that main saved under the old matrix job id `core`; its key hashes
+  # CARGO*/RUST*/CC*/CFLAGS*/CXX*/CMAKE* env vars, so do not add such variables to
+  # this job.
+  core-windows-build:
+    name: Core test build (windows-latest)
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/monocode-gpui
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: core
+      - run: npm run native:test:dev
+      - run: cargo clippy --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-core --all-targets --profile native-dev -- -D warnings
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.151
+      - name: Archive the core tests
+        shell: bash
+        run: cargo nextest archive --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-core --cargo-profile native-dev --archive-file "$RUNNER_TEMP/core-tests.tar.zst"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: core-test-archive
+          path: ${{ runner.temp }}/core-tests.tar.zst
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+  # Each shard runs its share of the archived core tests, every test in its own process
+  # (profile `ci` in crates/monocode-gpui/.config/nextest.toml). No rust-cache: nothing
+  # is compiled here. The checkout is needed because tests read repo files and run git
+  # at run time. Tune `total` (and the matrix list) from the measured shard times; keep
+  # them equal.
+  core-windows-test:
+    name: Core tests (windows-latest, shard ${{ matrix.shard }}/${{ matrix.total }})
+    needs: [changes, core-windows-build]
+    if: needs.changes.outputs.native == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+        total: [3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.151
+      - uses: actions/download-artifact@v4
+        with:
+          name: core-test-archive
+          path: ${{ runner.temp }}/core-archive
+      - name: Run shard
+        shell: bash
+        env:
+          SHARD: ${{ matrix.shard }}
+          TOTAL: ${{ matrix.total }}
+        run: |
+          # Written to a file, not piped through tee: on Windows a process that a test
+          # leaves running inherits nextest's stdout, so tee would wait for it to exit
+          # (one shard sat 10 minutes after nextest's summary). The log is printed after
+          # the run. --status-level leak names the tests that leave a process behind.
+          status=0
+          cargo nextest run \
+            --archive-file "$RUNNER_TEMP/core-archive/core-tests.tar.zst" \
+            --workspace-remap "$GITHUB_WORKSPACE/crates/monocode-gpui" \
+            --config-file "$GITHUB_WORKSPACE/crates/monocode-gpui/.config/nextest.toml" \
+            --profile ci \
+            --status-level leak \
+            --partition "slice:$SHARD/$TOTAL" > "$RUNNER_TEMP/nextest.log" 2>&1 || status=$?
+          cat "$RUNNER_TEMP/nextest.log" || true
+          # nextest writes the JUnit file under the remapped workspace.
+          junit="$GITHUB_WORKSPACE/crates/monocode-gpui/target/nextest/ci/junit.xml"
+          if [ -f "$junit" ]; then cp "$junit" "$RUNNER_TEMP/junit-shard-$SHARD.xml" || true; fi
+          # "Summary [ 12.3s] 1200 tests run: 1199 passed (2 slow), 1 failed, 1 timed out, 6 skipped"
+          # Every command below is guarded so the summary can never replace nextest's exit status.
+          line="$(grep -E 'tests? run:' "$RUNNER_TEMP/nextest.log" | tail -n 1 || true)"
+          count() { printf '%s' "$line" | grep -oE "[0-9]+ $1" | head -n 1 | grep -oE '[0-9]+' || echo 0; }
+          run="$(printf '%s' "$line" | grep -oE '[0-9]+ tests? run' | grep -oE '[0-9]+' || echo 0)"
+          {
+            echo "Core shard $SHARD/$TOTAL: run $run, passed $(count passed || true), failed $(count failed || true), timed out $(count 'timed out' || true), skipped (incl. other shards and ignored) $(count skipped || true) (exit $status)"
+          } >> "$GITHUB_STEP_SUMMARY" || true
+          exit "$status"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: core-windows-junit-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/junit-shard-${{ matrix.shard }}.xml
+          retention-days: 7
+          if-no-files-found: error
 
   # GPUI itself, split into parallel jobs on purpose: clippy only produces
   # metadata while the test build needs full codegen, so they share little and
@@ -357,6 +473,8 @@ jobs:
       - desktop
       - desktop-test-build
       - desktop-test
+      - core-windows-build
+      - core-windows-test
       - release-cache
       - release-cache-rpm
     runs-on: ubuntu-latest
@@ -369,8 +487,8 @@ jobs:
           native="$(jq -r '.changes.outputs.native // ""' <<<"$NEEDS")"
           changes_result="$(jq -r '.changes.result' <<<"$NEEDS")"
           failed=0
-          printf '%-22s %-10s %s\n' JOB RESULT VERDICT
-          for job in changes core desktop-lint desktop desktop-test-build desktop-test release-cache release-cache-rpm; do
+          printf '%-24s %-10s %s\n' JOB RESULT VERDICT
+          for job in changes core core-windows-build core-windows-test desktop-lint desktop desktop-test-build desktop-test release-cache release-cache-rpm; do
             result="$(jq -r --arg job "$job" '.[$job].result' <<<"$NEEDS")"
             reason=""
             case "$result" in
@@ -392,9 +510,9 @@ jobs:
             esac
             if [ -n "$reason" ]; then
               failed=1
-              printf '%-22s %-10s FAIL: %s\n' "$job" "$result" "$reason"
+              printf '%-24s %-10s FAIL: %s\n' "$job" "$result" "$reason"
             else
-              printf '%-22s %-10s ok\n' "$job" "$result"
+              printf '%-24s %-10s ok\n' "$job" "$result"
             fi
           done
           echo "native changes: ${native:-unknown}"

@@ -1,6 +1,8 @@
-# cargo-nextest settings for the GPUI tests. Only CI uses nextest (the sharded
-# `desktop-test` jobs in .github/workflows/native.yml); local runs keep
-# `cargo test ... -- --test-threads=1`.
+# cargo-nextest settings for CI. Two sets of sharded jobs in .github/workflows/native.yml
+# use it, both with the `ci` profile: the GPUI tests (`desktop-test`, Linux) and the
+# monocode-core tests (`core-windows-test`). Local runs keep
+# `cargo test ... -- --test-threads=1`. An override below must name its tests precisely,
+# so it never changes tests of the other package.
 #
 # nextest runs every test in its own process, so process-global state (statics,
 # env vars set by a test) never leaks between tests. Tests that share a fixed
