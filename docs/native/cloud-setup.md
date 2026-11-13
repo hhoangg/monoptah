@@ -113,7 +113,14 @@ Layout, top to bottom:
     closes the panel.
   - One line under the Credentials group, not per field: changing an account applies from
     the next start or reconnect; running sessions keep theirs.
-- **Escape order**: one layer per Escape press: an open select, the Git credential panel's
+- **Selects float**: every select (default backend, Machine, Size, Runtime limit, Stop when
+  idle, Docker account, Claude, Git credential) opens a floating list under its trigger, the
+  same dropdown as the Providers "sign-in options" menu (`popover::Choices`, the app's
+  `Menu`): the current value is checked, arrows and Enter work, and opening it moves nothing
+  in the form. The list draws above the dialog (layer 61, the dialog is 60) and below the fix
+  terminal (62), is as wide as its trigger, and a press on it is not "outside" the dialog. A
+  press outside it closes only the list (the press reaches nothing else).
+- **Escape order**: one layer per Escape press: an open select's list, the Git credential panel's
   "Confirm remove" question, the Git credential panel, the replace-token question, then the
   dialog itself. The keyboard returns to the dialog when the panel is closed, unless a field
   in the main column had it.

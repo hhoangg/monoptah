@@ -6,8 +6,8 @@ use gpui::{
     AnyElement, AnyView, App, Bounds, BoxShadow, Context, Corners, DispatchPhase, Display, Element,
     ElementId, Entity, EventEmitter, FocusHandle, Focusable, GlobalElementId, Hsla,
     InspectorElementId, KeyBinding, LayoutId, MouseDownEvent, Pixels, Point,
-    Position as CssPosition, Role, SharedString, Style, Toggled, Window, actions, canvas, deferred,
-    div, point, prelude::*, px, rgb, rgba, size,
+    Position as CssPosition, Role, SharedString, Style, Subscription, Toggled, Window, actions,
+    canvas, deferred, div, point, prelude::*, px, rgb, rgba, size,
 };
 use std::{cell::Cell, rc::Rc, time::Instant};
 
@@ -1837,6 +1837,103 @@ pub(crate) fn menu_popover(menu: &Entity<Menu>, anchor: Anchor, cx: &App) -> Pop
             let _ = weak.update(cx, |m, cx| m.finish(MenuEvent::Dismissed, window, cx));
         })
         .child(menu.clone())
+}
+
+/// One entry of a [`Choices`] list: the value it stands for, its label and whether it is the
+/// current one (drawn with a check).
+pub(crate) struct Choice<T> {
+    pub value: T,
+    pub label: SharedString,
+    pub checked: bool,
+}
+
+/// What an open [`Choices`] list reports to its owner.
+pub(crate) enum ChoiceEvent<T> {
+    Picked(T),
+    Dismissed,
+}
+
+/// An open single-choice dropdown: the app's [`Menu`] (the style of the Providers "sign-in
+/// options" menu) listing `Choice`s, floating under the trigger it is anchored to instead of
+/// taking room in the layout. Hold it while the list is open and drop it to close; render
+/// [`Choices::popover`] next to the trigger. The row ids are the choices' indexes, so the rows
+/// draw as `menu-action-0`, `menu-action-1`, ...
+pub(crate) struct Choices {
+    menu: Entity<Menu>,
+    _events: Subscription,
+}
+
+impl Choices {
+    /// Opens the list, `width` wide, and gives it the keyboard (arrows, Enter and Escape work as
+    /// in any [`Menu`]). `on_event` runs once per pick or dismissal; the owner drops the
+    /// `Choices` in it.
+    pub(crate) fn open<V: 'static, T: 'static>(
+        label: impl Into<SharedString>,
+        choices: Vec<Choice<T>>,
+        width: f32,
+        window: &mut Window,
+        cx: &mut Context<V>,
+        on_event: impl Fn(&mut V, ChoiceEvent<T>, &mut Window, &mut Context<V>) + 'static,
+    ) -> Self {
+        let mut values = Vec::with_capacity(choices.len());
+        let mut items = Vec::with_capacity(choices.len());
+        for (ix, choice) in choices.into_iter().enumerate() {
+            items.push(
+                MenuAction::new(ix.to_string(), choice.label)
+                    .checked(choice.checked)
+                    .into(),
+            );
+            values.push(Some(choice.value));
+        }
+        let at = items
+            .iter()
+            .position(|item| matches!(item, MenuItem::Action(a) if a.checked));
+        let menu = cx.new(|cx| {
+            let mut menu = Menu::new(label, items, window, cx)
+                .width(width)
+                .style(MenuStyle::Git);
+            // The keyboard starts on the current value.
+            if let Some(ix) = at {
+                menu.active = Some(ix);
+            }
+            menu
+        });
+        let events = cx.subscribe_in(
+            &menu,
+            window,
+            move |this, _, event: &MenuEvent, window, cx| {
+                let event = match event {
+                    MenuEvent::Picked(id, _) => id
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|ix| values.get_mut(ix)?.take())
+                        .map_or(ChoiceEvent::Dismissed, ChoiceEvent::Picked),
+                    MenuEvent::Dismissed => ChoiceEvent::Dismissed,
+                };
+                on_event(this, event, window, cx);
+            },
+        );
+        Self {
+            menu,
+            _events: events,
+        }
+    }
+
+    /// The list drawn under `anchor`, as wide as it was opened with. `priority` is where it
+    /// draws: above the modal dialog that holds the trigger.
+    pub(crate) fn popover(&self, anchor: &AnchorSlot, priority: usize, cx: &App) -> Popover {
+        let width = self.menu.read(cx).width;
+        menu_popover(&self.menu, Anchor::Slot(anchor.clone()), cx)
+            .width(width)
+            .gap(4.)
+            .max_height(320.)
+            .priority(priority)
+    }
+
+    /// The card's window bounds once drawn, so a dialog beneath can treat presses on it as inside.
+    pub(crate) fn surface(&self, cx: &App) -> AnchorSlot {
+        self.menu.read(cx).surface_region()
+    }
 }
 
 #[cfg(test)]

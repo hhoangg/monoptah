@@ -23,6 +23,7 @@ use crate::{
     git_credential_panel::{self, GitCredentialPanel},
     input::{self, Input},
     modal,
+    popover::{AnchorSlot, Choice, ChoiceEvent, Choices, Popover},
     runtime::{Database, locked},
     settings::{cloud_env::CloudServices, cloud_env::Resolver, widgets::secondary_button},
     theme::*,
@@ -186,6 +187,22 @@ enum Select {
 }
 
 impl Select {
+    /// Every select, in the order of `CloudSettings::select_anchors`.
+    const COUNT: usize = 8;
+
+    fn index(self) -> usize {
+        match self {
+            Self::Default => 0,
+            Self::Machine => 1,
+            Self::Size => 2,
+            Self::Idle => 3,
+            Self::Runtime => 4,
+            Self::DockerAccount => 5,
+            Self::Claude => 6,
+            Self::Git => 7,
+        }
+    }
+
     fn id(self) -> &'static str {
         match self {
             Self::Default => "default",
@@ -212,6 +229,19 @@ enum Pick {
     Claude(Option<String>),
     Git(Option<String>),
 }
+
+/// The floating list of the select that is open, and which opening it belongs to.
+struct OpenSelect {
+    which: Select,
+    /// An event of an older list (one that was replaced by another select's) is not this one's.
+    opening: u64,
+    choices: Choices,
+}
+
+/// Where an open select's list draws: above the dialog's own layer (60 in the shell) and its
+/// barrier, below the fix terminal that stacks on the dialog. A select is closed before a fix
+/// terminal can open, so the two never share a layer.
+pub(crate) const SELECT_PRIORITY: usize = 61;
 
 struct Opt {
     label: String,
@@ -285,7 +315,11 @@ pub(crate) struct CloudSettings {
     gh: Option<Gh>,
     infos: [DevcontainerInfo; 2],
     infos_gen: u64,
-    open_select: Option<Select>,
+    open_select: Option<OpenSelect>,
+    /// Counts the lists opened, to tell a stale list's event from the current one's.
+    select_openings: u64,
+    /// Each select trigger's bounds, which its floating list is placed against.
+    select_anchors: [AnchorSlot; Select::COUNT],
     error: Option<FieldError>,
     /// Save is waiting for the Codespaces secrets to reach GitHub.
     saving: bool,
@@ -466,6 +500,8 @@ impl CloudSettings {
             infos: [DevcontainerInfo::default(), DevcontainerInfo::default()],
             infos_gen: 0,
             open_select: None,
+            select_openings: 0,
+            select_anchors: Default::default(),
             error: None,
             saving: false,
             confirm_replace: false,
@@ -1254,6 +1290,7 @@ impl CloudSettings {
             .flatten();
         let Some(account) = account else {
             self.fix_backend = Some(backend);
+            self.open_select = None;
             cx.emit(Event::Fix(FixSlot::new(command)));
             return;
         };
@@ -1280,6 +1317,7 @@ impl CloudSettings {
                             None => command,
                         };
                         this.fix_backend = Some(backend);
+                        this.open_select = None;
                         cx.emit(Event::Fix(FixSlot::new(command)));
                     }
                     Err(error) => {
@@ -1305,8 +1343,9 @@ impl CloudSettings {
         window: Option<&Window>,
         cx: &mut Context<Self>,
     ) -> bool {
-        let open = self.open_select.take().is_some();
-        if open {
+        if self.open_select.take().is_some() {
+            // The list had the keyboard; the dialog takes it back on the next render.
+            self.refocus = true;
             cx.notify();
             return true;
         }
@@ -1442,9 +1481,32 @@ impl CloudSettings {
         self.form.sandbox.credential_id.clone()
     }
 
-    #[cfg(test)]
+    /// A select's list is open.
     pub(crate) fn select_open(&self) -> bool {
         self.open_select.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn select_label(&self, id: &str, cx: &App) -> String {
+        let which = [
+            Select::Default,
+            Select::Machine,
+            Select::Size,
+            Select::Idle,
+            Select::Runtime,
+            Select::DockerAccount,
+            Select::Claude,
+            Select::Git,
+        ]
+        .into_iter()
+        .find(|s| s.id() == id)
+        .expect("a select id");
+        self.current_label(which, cx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_select_id(&self) -> Option<&'static str> {
+        self.open_select.as_ref().map(|open| open.which.id())
     }
 
     #[cfg(test)]
@@ -1561,12 +1623,91 @@ impl CloudSettings {
             .child(label)
     }
 
-    /// A select: the current value in a box; clicking opens the options below it.
+    /// Opens the floating list of `which` under its trigger (or closes it when it is the open
+    /// one). The list is the app's dropdown [`Menu`](crate::popover::Menu), so opening it moves
+    /// nothing in the form.
+    fn toggle_select(&mut self, which: Select, window: &mut Window, cx: &mut Context<Self>) {
+        if self.open_select.as_ref().is_some_and(|o| o.which == which) {
+            self.open_select = None;
+            self.refocus = true;
+            cx.notify();
+            return;
+        }
+        let options = self.options(which, cx);
+        if options.is_empty() {
+            self.open_select = None;
+            cx.notify();
+            return;
+        }
+        let width = self.select_anchors[which.index()]
+            .get()
+            .map_or(220., |bounds| bounds.size.width.as_f32());
+        self.select_openings += 1;
+        let opening = self.select_openings;
+        let choices = options
+            .into_iter()
+            .map(|option| Choice {
+                value: option.pick,
+                label: option.label.into(),
+                checked: option.selected,
+            })
+            .collect();
+        let choices = Choices::open(
+            which.id(),
+            choices,
+            width,
+            window,
+            cx,
+            move |this, event, _, cx| {
+                // A newer list replaced this one: its close is not the new list's.
+                if this
+                    .open_select
+                    .as_ref()
+                    .is_none_or(|o| o.opening != opening)
+                {
+                    return;
+                }
+                match event {
+                    ChoiceEvent::Picked(pick) => this.pick(pick, cx),
+                    ChoiceEvent::Dismissed => {
+                        this.open_select = None;
+                        cx.notify();
+                    }
+                }
+            },
+        );
+        self.open_select = Some(OpenSelect {
+            which,
+            opening,
+            choices,
+        });
+        cx.notify();
+    }
+
+    /// The open select's list, drawn above the dialog (see [`SELECT_PRIORITY`]).
+    fn select_popover(&self, cx: &App) -> Option<Popover> {
+        let open = self.open_select.as_ref()?;
+        Some(open.choices.popover(
+            &self.select_anchors[open.which.index()],
+            SELECT_PRIORITY,
+            cx,
+        ))
+    }
+
+    /// Where the open select's list is drawn, so the dialog's own outside-press dismissal
+    /// treats a press on it as inside (it can reach past the dialog's card).
+    pub(crate) fn select_surface(&self, cx: &App) -> Option<AnchorSlot> {
+        self.open_select
+            .as_ref()
+            .map(|open| open.choices.surface(cx))
+    }
+
+    /// A select: the current value in a box; clicking opens its list floating below it.
     fn select(&mut self, which: Select, current: String, cx: &mut Context<Self>) -> Div {
-        let open = self.open_select == Some(which);
+        let open = self.open_select.as_ref().is_some_and(|o| o.which == which);
         let id = which.id();
         let trigger_id: SharedString = format!("cloud-select-{id}").into();
-        let mut column = div().flex().flex_col().gap(px(4.)).child(
+        div().flex().flex_col().child(
             div()
                 .id(ElementId::from(trigger_id.clone()))
                 .debug_selector({
@@ -1575,6 +1716,8 @@ impl CloudSettings {
                 })
                 .role(Role::ComboBox)
                 .aria_label(current.clone())
+                .aria_expanded(open)
+                .relative()
                 .h(px(34.))
                 .min_w_0()
                 .px_3()
@@ -1589,10 +1732,10 @@ impl CloudSettings {
                 .cursor_pointer()
                 .text_size(px(12.5))
                 .hover(|s| s.bg(content(0.06)))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.open_select = (this.open_select != Some(which)).then_some(which);
-                    cx.notify();
-                }))
+                .on_click(
+                    cx.listener(move |this, _, window, cx| this.toggle_select(which, window, cx)),
+                )
+                .child(self.select_anchors[which.index()].probe())
                 .child(div().min_w_0().truncate().child(current))
                 .child(
                     div()
@@ -1600,33 +1743,7 @@ impl CloudSettings {
                         .text_color(content(0.5))
                         .child(if open { "\u{25b4}" } else { "\u{25be}" }),
                 ),
-        );
-        if open {
-            let mut list = div()
-                .id(ElementId::from(SharedString::from(format!(
-                    "cloud-options-{id}"
-                ))))
-                .flex()
-                .flex_col()
-                .p(px(2.))
-                .rounded_lg()
-                .border_1()
-                .border_color(content(0.1))
-                .bg(content(0.03));
-            for (n, option) in self.options(which, cx).into_iter().enumerate() {
-                let pick = option.pick.clone();
-                list = list.child(
-                    crate::cloud_dialog_ui::choice(
-                        format!("cloud-option-{id}-{n}"),
-                        option.label,
-                        option.selected,
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| this.pick(pick.clone(), cx))),
-                );
-            }
-            column = column.child(list);
-        }
-        column
+        )
     }
 
     fn current_label(&self, which: Select, cx: &App) -> String {
@@ -2331,6 +2448,7 @@ impl Render for CloudSettings {
                 }
             }))
             .child(main)
+            .children(self.select_popover(cx))
             .children(self.panel.as_ref().map(|(panel, _)| {
                 div()
                     .id("cloud-credentials-side")
