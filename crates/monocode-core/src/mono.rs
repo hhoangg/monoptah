@@ -6,6 +6,7 @@ pub mod bridge;
 pub mod cards;
 pub mod cloud_api;
 mod desktop;
+pub mod emoji;
 pub mod files;
 pub mod habit_yaml;
 #[cfg(test)]
