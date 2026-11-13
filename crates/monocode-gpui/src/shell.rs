@@ -1037,7 +1037,11 @@ impl Shell {
         crate::emoji_library::install(
             store.clone(),
             &data_dir.clone().unwrap_or_else(|| {
-                std::env::temp_dir().join(format!("monocode-emoji-{}", std::process::id()))
+                std::env::temp_dir().join(format!(
+                    "monocode-emoji-{}-{}",
+                    std::process::id(),
+                    monocode_core::mono::new_id()
+                ))
             }),
             cx,
         );

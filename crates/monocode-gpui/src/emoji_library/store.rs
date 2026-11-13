@@ -10,7 +10,7 @@ use crate::runtime::Database;
 use gpui::{App, AppContext, Context, Entity, EventEmitter, Global};
 use monocode_core::{
     accounts::Profile,
-    mono::emoji::{self, Library},
+    mono::emoji::{self, Library, import},
     provider::Kind,
 };
 use std::{
@@ -382,6 +382,38 @@ impl EmojiStore {
         added
     }
 
+    /// Moves a staged import into the library folder and adds its pack. The store does it all,
+    /// so the pack lands (or its folder is deleted) even if the page that asked is gone. The
+    /// receiver gets the result.
+    pub(crate) fn commit_import(
+        &mut self,
+        staged: import::Staged,
+        pack: emoji::Pack,
+        cx: &mut Context<Self>,
+    ) -> async_channel::Receiver<Result<(), String>> {
+        let (tx, rx) = async_channel::bounded(1);
+        let dir = self.dir.clone();
+        let id = pack.id.clone();
+        let work = cx.background_executor().spawn(async move {
+            let result = import::commit(&staged, &dir, &id);
+            if result.is_err() {
+                import::discard(staged);
+            }
+            result.map(|_| ())
+        });
+        cx.spawn(async move |this, cx| {
+            let result = match work.await {
+                Ok(()) => this
+                    .update(cx, |this, cx| this.add_pack(pack, cx))
+                    .unwrap_or_else(|e| Err(e.to_string())),
+                Err(error) => Err(error),
+            };
+            let _ = tx.send(result).await;
+        })
+        .detach();
+        rx
+    }
+
     /// Removes a pack and its folder. The folder goes first, off the main thread; the library
     /// follows once it is gone. Listeners hear `PackRemoved` so no Mono keeps the id.
     pub(crate) fn remove_pack(&mut self, pack_id: &str, cx: &mut Context<Self>) {
@@ -400,11 +432,13 @@ impl EmojiStore {
             let _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(()) => {
+                        // The listeners drop the id from their selections first, so the
+                        // library's own change is the one push a chat gets.
+                        cx.emit(EmojiEvent::PackRemoved(pack_id.clone()));
                         let _ = this.edit(cx, |l| {
                             l.packs.retain(|p| p.id != pack_id);
                             Ok(())
                         });
-                        cx.emit(EmojiEvent::PackRemoved(pack_id));
                     }
                     Err(error) => this.error = Some(error),
                 }

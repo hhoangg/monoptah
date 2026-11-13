@@ -390,16 +390,7 @@ fn sub_agent_card(agent: SubAgent) -> Stateful<Div> {
             ),
     )
 }
-pub(super) fn card() -> Div {
-    div()
-        .rounded_xl()
-        .border_1()
-        .border_color(content(0.04))
-        .overflow_hidden()
-        .bg(content(0.02))
-        .flex()
-        .flex_col()
-}
+pub(super) use crate::emoji_library::card;
 /// MonoOverview's search row above the Sessions, Habits and Documents lists.
 pub(super) fn search_bar(field: Entity<Input>) -> Div {
     div()

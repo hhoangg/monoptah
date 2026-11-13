@@ -41,7 +41,7 @@ fn show(s: &Setup, visual: &mut VisualTestContext) {
     visual.simulate_resize(gpui::size(px(1300.), px(3400.)));
     s.window
         .update(visual, |shell, window, cx| {
-            shell.open_emoji_library(window, cx)
+            shell.open_emoji_library_for_test(window, cx)
         })
         .unwrap();
     visual.run_until_parked();
@@ -934,6 +934,29 @@ fn record_parts(s: &Setup, cx: &mut VisualTestContext) -> Arc<std::sync::Mutex<V
 fn the_dialog_starts_on_the_model_of_the_mono_whose_settings_were_open(cx: &mut TestAppContext) {
     let (s, mut visual) = open(cx);
     visual.run_until_parked();
+    // The Mono runs on a model that is not the app default (Codex), so only remembering it
+    // when its settings open can make the dialog start on it.
+    visual.update(|_, cx| {
+        let mut prefs = cx
+            .try_global::<crate::settings::Preferences>()
+            .cloned()
+            .unwrap_or_default();
+        prefs.default_provider = Some("codex".into());
+        cx.set_global(prefs);
+    });
+    s.manager
+        .update(&mut visual, |m, cx| {
+            m.chats[&s.id].update(cx, |chat, cx| {
+                chat.mono_config(
+                    Kind::Claude,
+                    Some("claude-test".into()),
+                    std::collections::HashMap::new(),
+                    cx,
+                )
+            })
+        })
+        .unwrap();
+    store(&s, &visual).update(&mut visual, |store, _| store.forget_model());
     // The Mono's settings are open on the Emoji page: its model is remembered.
     click(&mut visual, "mono-settings-Emoji");
     let (kind, model, account) = s.manager.read_with(&visual, |m, cx| {
@@ -944,6 +967,8 @@ fn the_dialog_starts_on_the_model_of_the_mono_whose_settings_were_open(cx: &mut 
             chat.settings.account.clone(),
         )
     });
+    assert_eq!(kind, Kind::Claude);
+    assert_eq!(model.as_deref(), Some("claude-test"));
     show(&s, &mut visual);
     let seen = record_parts(&s, &mut visual);
     import(&s, &mut visual, vec![make_zip("parts.zip")]);
@@ -1027,6 +1052,16 @@ fn picking_another_model_sorts_the_open_zip_again_with_it(cx: &mut TestAppContex
             .is_none(),
         "the list closes after a pick"
     );
+    // An event of the first run, arriving late, changes nothing.
+    let library_view = view(&s, &visual);
+    visual.update(|window, cx| {
+        library_view.update(cx, |v, cx| v.stale_event_for_test(window, cx));
+    });
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    let state =
+        view(&s, &visual).read_with(&visual, |v, _| v.dialog().unwrap().queue[0].state.clone());
+    assert_eq!(state, ItemState::Review, "a stale run's event is dropped");
     // The new sorting can be reviewed and saved.
     assert!(visual.debug_bounds("emoji-lib-review").is_some());
     click(&mut visual, "emoji-lib-import-skip");
@@ -1135,4 +1170,144 @@ fn a_failed_write_after_an_import_removes_the_new_pack_and_its_folder(cx: &mut T
         "{error}"
     );
     assert!(staging_dirs(&s).is_empty());
+}
+
+fn close_settings(s: &Setup, visual: &mut VisualTestContext) {
+    s.window
+        .update(visual, |shell, window, cx| {
+            shell.close_settings_for_test(window, cx)
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn closing_settings_while_saving_still_lands_the_pack(cx: &mut TestAppContext) {
+    let (s, mut visual) = open(cx);
+    show(&s, &mut visual);
+    install_fake(&s, vec!["happy"], &mut visual);
+    import(&s, &mut visual, vec![make_zip("late.zip")]);
+    // Press "Use this sorting" and close Settings before the save has run.
+    let at = visual
+        .debug_bounds("emoji-lib-import-use")
+        .unwrap()
+        .center();
+    visual.simulate_click(at, Default::default());
+    close_settings(&s, &mut visual);
+    visual.run_until_parked();
+    let saved = disk(&s);
+    assert_eq!(saved.packs.len(), 1, "the pack is in the library file");
+    for e in &saved.packs[0].emoji {
+        assert!(emoji::image_path(&emoji_dir(&s), &saved.packs[0], e).is_file());
+    }
+    assert_eq!(library_of(&s, &visual), saved);
+    assert!(staging_dirs(&s).is_empty());
+    let folders = std::fs::read_dir(emoji_dir(&s).join("packs"))
+        .unwrap()
+        .count();
+    assert_eq!(folders, 1, "no orphan pack folder");
+}
+
+#[gpui::test]
+fn closing_settings_removes_the_staging_folder_of_an_open_import(cx: &mut TestAppContext) {
+    let (s, mut visual) = open(cx);
+    show(&s, &mut visual);
+    install_fake(&s, vec!["happy"], &mut visual);
+    import(&s, &mut visual, vec![make_zip("review.zip")]);
+    assert_eq!(staging_dirs(&s).len(), 1);
+    close_settings(&s, &mut visual);
+    visual.run_until_parked();
+    assert!(
+        staging_dirs(&s).is_empty(),
+        "the review's staging folder goes"
+    );
+    assert!(library_of(&s, &visual).packs.is_empty());
+    // The same while the zip is still being unpacked.
+    let (s, mut visual) = open(cx);
+    show(&s, &mut visual);
+    let zip = make_zip("early.zip");
+    let spot = visual.debug_bounds("emoji-lib-drop-hint").unwrap().center();
+    visual.simulate_event(FileDropEvent::Entered {
+        position: spot,
+        paths: ExternalPaths(vec![zip].into()),
+    });
+    visual.simulate_event(FileDropEvent::Submit { position: spot });
+    close_settings(&s, &mut visual);
+    visual.run_until_parked();
+    assert!(staging_dirs(&s).is_empty());
+    assert!(library_of(&s, &visual).packs.is_empty());
+}
+
+#[gpui::test]
+fn showing_another_settings_page_cancels_the_import(cx: &mut TestAppContext) {
+    let (s, mut visual) = open(cx);
+    show(&s, &mut visual);
+    install_fake(&s, vec!["happy"], &mut visual);
+    import(&s, &mut visual, vec![make_zip("hidden.zip")]);
+    let settings = s
+        .window
+        .read_with(&visual, |shell, _| shell.settings_view())
+        .unwrap()
+        .unwrap();
+    settings.update(&mut visual, |v, cx| {
+        v.select_section(crate::settings::Section::General, cx)
+    });
+    visual.run_until_parked();
+    assert!(!dialog_open(&s, &visual), "no dialog runs hidden");
+    assert!(staging_dirs(&s).is_empty());
+    assert!(library_of(&s, &visual).packs.is_empty());
+}
+
+#[gpui::test]
+fn after_the_dialog_closes_keys_still_reach_the_settings_view(cx: &mut TestAppContext) {
+    use gpui::Focusable;
+    let (s, mut visual) = open(cx);
+    show(&s, &mut visual);
+    install_fake(&s, vec!["happy"], &mut visual);
+    import(&s, &mut visual, vec![make_zip("focus.zip")]);
+    click(&mut visual, "emoji-lib-import-cancel");
+    visual.run_until_parked();
+    let settings = s
+        .window
+        .read_with(&visual, |shell, _| shell.settings_view())
+        .unwrap()
+        .unwrap();
+    let inside = visual.update(|window, cx| {
+        settings
+            .read(cx)
+            .focus_handle(cx)
+            .contains_focused(window, cx)
+    });
+    assert!(inside, "the focus stays inside the settings view");
+}
+
+#[gpui::test]
+fn removing_a_pack_lays_the_chat_out_once(cx: &mut TestAppContext) {
+    use super::emoji_tests::{chat_transcript, rebuilds};
+    let (s, mut visual) = open(cx);
+    visual.run_until_parked();
+    let mut library = Library::default();
+    seed(
+        &s,
+        &mut library,
+        "pack-seed",
+        vec![entry("a.png", "alpha", Format::Png, Some("happy"))],
+    );
+    reload(&s, &mut visual);
+    s.manager.update(&mut visual, |m, cx| {
+        m.emoji_update(cx, |e| {
+            e.enabled = true;
+            e.packs = vec!["pack-seed".into()];
+        });
+    });
+    let _ = chat_transcript(&s, &mut visual);
+    assert!(visual.debug_bounds("mono-emoji-happy").is_some());
+    show(&s, &mut visual);
+    let before = rebuilds(&s, &visual);
+    click(&mut visual, "emoji-lib-remove-pack-seed");
+    visual.simulate_prompt_answer("Remove");
+    visual.run_until_parked();
+    assert_eq!(rebuilds(&s, &visual), before + 1, "one push, not two");
+    assert!(s.manager.read_with(&visual, |m, _| {
+        m.roster.get(&s.id).unwrap().emoji.packs.is_empty()
+    }));
 }

@@ -18,16 +18,23 @@ impl SettingsView {
                 .debug_selector(|| "settings-emoji-library".into())
                 .relative()
                 .pt_8()
-                .child(self.reveal_probe(EMOJI_LIBRARY))
                 .child(
-                    div().pb(px(10.)).child(
-                        div()
-                            .text_size(px(13.))
-                            .line_height(px(19.5))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(if flash { accent_color() } else { content(1.) })
-                            .child("Emoji"),
-                    ),
+                    // The probe sits on the title row, so a reveal scrolls to the title and
+                    // the Packs card below it, not to the middle of the tall section.
+                    div()
+                        .id("settings-emoji-title")
+                        .debug_selector(|| "settings-emoji-title".into())
+                        .relative()
+                        .pb(px(10.))
+                        .child(self.reveal_probe(EMOJI_LIBRARY))
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .line_height(px(19.5))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(if flash { accent_color() } else { content(1.) })
+                                .child("Emoji"),
+                        ),
                 )
                 .child(view)
                 .into_any_element(),

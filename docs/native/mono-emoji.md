@@ -102,9 +102,17 @@ Default emotions (name, description):
    emoji no Mono uses. Reset to defaults restores the 13 default emotions; emoji whose
    emotion name matches a default keep it, the rest go to Unsorted.
 
-The section is its own entity (`EmojiLibraryView`), so a GIF that plays on hover redraws only
-it. "Manage emoji library..." in a Mono's settings closes that modal and opens this section
+The section is its own entity (`EmojiLibraryView`), so its state (a hovered GIF, a field
+being typed in) lives there and notifies only it. GPUI still re-renders the Settings view
+around it on each frame of a playing GIF (an uncached view cannot size itself), which is why
+only the chip under the pointer plays. "Manage emoji library..." in a Mono's settings closes that modal and opens this section
 (`ShowEmojiLibrary` from `Monos`, handled by the shell with `open_settings(Section::Monos)`).
+The scroll target is the section's title row, so the title and the Packs card land in view
+instead of the middle of the tall section. The page reads the library again when it is made
+(waiting while an edit, a write or an import is under way). Showing another Settings page, or
+closing Settings, cancels an open import and deletes its staging folder (`Guard` in `import.rs`
+removes it when dropped). The result of "Use this sorting" is committed by the store, which
+lives for the app, so closing Settings right after pressing it still lands the pack.
 
 ## A Mono's Settings > Emoji page
 
@@ -116,7 +124,12 @@ it. "Manage emoji library..." in a Mono's settings closes that modal and opens t
    the pack for this Mono. Under the list: "New packs are not turned on for this Mono
    automatically." An empty library shows an empty state with the same button.
 
-Every change is saved on the Mono in the roster and handed to its chat at once.
+Every change is saved on the Mono in the roster and handed to its chat at once. The model
+of the Mono whose settings opened last is remembered when the settings open, and again when
+its chat finishes opening (a new Mono's chat is not ready when its settings first open).
+Removing a pack updates the roster first and the chat gets one push from the library's own
+change. Open habit run transcripts of a Mono get the library too; the Ask view of a workflow
+run gets it when it starts only.
 
 ## Import dialog
 

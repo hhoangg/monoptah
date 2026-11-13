@@ -119,9 +119,10 @@ impl Monos {
             return;
         }
         self.save(cx);
+        // The library's own change follows and is the one push the chats get.
         for id in touched {
             if self.chats.contains_key(&id) {
-                self.configure_chat(&id, cx);
+                self.configure_chat_with(&id, false, cx);
             }
         }
         cx.notify();
@@ -132,18 +133,30 @@ impl Monos {
     pub(super) fn emoji_changed(&mut self, cx: &mut Context<Self>) {
         let library = self.emoji_store.read(cx).library().clone();
         let stale: Vec<String> = self
-            .chats
-            .keys()
-            .filter(|id| {
-                self.roster.get(id).is_some_and(|mono| {
-                    Some(&render_key(&library, &mono.emoji)) != self.emoji_ui.pushed.get(*id)
-                })
+            .roster
+            .monos
+            .iter()
+            .filter(|mono| {
+                Some(&render_key(&library, &mono.emoji)) != self.emoji_ui.pushed.get(&mono.id)
             })
-            .cloned()
+            .map(|mono| mono.id.clone())
             .collect();
         for id in stale {
-            if let Some(chat) = self.chats.get(&id).cloned() {
-                self.push_emoji(&id, &chat, cx);
+            // The chat, and the transcripts of the habit runs of this Mono that are open.
+            let views: Vec<_> = self
+                .chats
+                .get(&id)
+                .cloned()
+                .into_iter()
+                .chain(
+                    self.running
+                        .values()
+                        .filter(|run| run.mono == id)
+                        .map(|run| run.view.clone()),
+                )
+                .collect();
+            for view in views {
+                self.push_emoji(&id, &view, cx);
             }
         }
         cx.notify();

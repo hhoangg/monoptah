@@ -36,7 +36,7 @@ pub(crate) fn picture(path: &Path, side: f32, animate: Option<SharedString>) -> 
 }
 
 /// "29 PNG, 3 GIF" for a list of formats, in a fixed order.
-pub(crate) fn format_list(formats: impl IntoIterator<Item = Format>) -> Vec<(Format, usize)> {
+fn format_list(formats: impl IntoIterator<Item = Format>) -> Vec<(Format, usize)> {
     let formats: Vec<Format> = formats.into_iter().collect();
     [Format::Png, Format::Gif, Format::Jpeg, Format::Webp]
         .into_iter()
@@ -47,7 +47,7 @@ pub(crate) fn format_list(formats: impl IntoIterator<Item = Format>) -> Vec<(For
         .collect()
 }
 
-pub(crate) fn format_text(counts: &[(Format, usize)]) -> String {
+fn format_text(counts: &[(Format, usize)]) -> String {
     counts
         .iter()
         .map(|(format, count)| format!("{count} {}", format.label()))
@@ -55,7 +55,7 @@ pub(crate) fn format_text(counts: &[(Format, usize)]) -> String {
         .join(", ")
 }
 
-pub(crate) fn plural(count: usize, one: &str, many: &str) -> String {
+fn plural(count: usize, one: &str, many: &str) -> String {
     format!("{count} {}", if count == 1 { one } else { many })
 }
 

@@ -146,10 +146,33 @@ pub(crate) struct Review {
     pub source: Source,
 }
 
+/// A staging folder that is removed when it is dropped, so a dialog that goes away (Settings
+/// closed, another page shown) or an event that is never received leaves nothing behind.
+pub(crate) struct Guard(Option<Staged>);
+
+impl Guard {
+    fn new(staged: Staged) -> Self {
+        Self(Some(staged))
+    }
+
+    /// Takes the staging folder out; the guard then removes nothing.
+    fn take(&mut self) -> Option<Staged> {
+        self.0.take()
+    }
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        if let Some(staged) = self.0.take() {
+            import::discard(staged);
+        }
+    }
+}
+
 /// The zip being worked on.
 #[derive(Default)]
 pub(crate) struct Step {
-    staged: Option<Staged>,
+    staged: Option<Guard>,
     entries: Option<usize>,
     kept: Option<Kept>,
     items: Vec<sort::Item>,
@@ -214,7 +237,7 @@ pub(crate) struct ModelPicker {
 
 enum Event {
     Staged {
-        staged: Staged,
+        staged: Guard,
         items: Vec<sort::Item>,
         kept: Kept,
         entries: usize,
@@ -449,6 +472,12 @@ impl EmojiLibraryView {
     }
 
     /// Deletes a staging folder off the main thread.
+    fn discard_guard(&self, mut staged: Guard, cx: &mut Context<Self>) {
+        if let Some(staged) = staged.take() {
+            self.discard(staged, cx);
+        }
+    }
+
     fn discard(&self, staged: Staged, cx: &mut Context<Self>) {
         cx.background_executor()
             .spawn(async move { import::discard(staged) })
@@ -663,7 +692,7 @@ impl EmojiLibraryView {
                 let entries = staged.entries;
                 let sorting = items.clone();
                 let _ = tx.send_blocking(Event::Staged {
-                    staged,
+                    staged: Guard::new(staged),
                     items,
                     kept,
                     entries,
@@ -700,7 +729,7 @@ impl EmojiLibraryView {
             // The dialog was cancelled, or a newer sorting replaced this one: nothing may stay
             // behind.
             if let Event::Staged { staged, .. } = event {
-                self.discard(staged, cx);
+                self.discard_guard(staged, cx);
             }
             return;
         };
@@ -740,7 +769,7 @@ impl EmojiLibraryView {
                 let staged = d.step.take().and_then(|s| s.staged);
                 d.queue[index].state = ItemState::Failed(error);
                 if let Some(staged) = staged {
-                    self.discard(staged, cx);
+                    self.discard_guard(staged, cx);
                 }
                 self.import_next(window, cx);
             }
@@ -777,13 +806,13 @@ impl EmojiLibraryView {
                 self.finish_item(result, window, cx);
             }
             Mode::Import => {
-                let Some(staged) = step.staged.take() else {
+                let Some(mut guard) = step.staged.take() else {
                     return;
                 };
-                let (dir, mut scratch) = {
-                    let store = self.store.read(cx);
-                    (store.dir().to_path_buf(), (**store.library()).clone())
+                let Some(staged) = guard.take() else {
+                    return;
                 };
+                let mut scratch = (**self.store.read(cx).library()).clone();
                 let emoji_list = staged
                     .images
                     .iter()
@@ -806,27 +835,21 @@ impl EmojiLibraryView {
                 if let Some(d) = self.import.as_mut() {
                     d.queue[index].state = ItemState::Saving;
                 }
-                // The pack joins the library only after its folder is in place.
-                let work = cx.background_executor().spawn(async move {
-                    let result = import::commit(&staged, &dir, &pack_id);
-                    if result.is_err() {
-                        import::discard(staged);
-                    }
-                    result.map(|_| ())
-                });
+                // The store commits the folder and adds the pack, so the result lands even if
+                // this page is gone by then.
+                let done = self
+                    .store
+                    .clone()
+                    .update(cx, |store, cx| store.commit_import(staged, pack, cx));
                 cx.spawn_in(window, async move |this, cx| {
-                    let result = work.await;
+                    let result = done
+                        .recv()
+                        .await
+                        .unwrap_or_else(|_| Err("The import was interrupted".into()));
                     let _ = this.update_in(cx, |this, window, cx| {
                         if this.import.as_ref().is_none_or(|d| d.token != token) {
                             return;
                         }
-                        let result = match result {
-                            Ok(()) => this
-                                .store
-                                .clone()
-                                .update(cx, |store, cx| store.add_pack(pack, cx)),
-                            Err(error) => Err(error),
-                        };
                         this.finish_item(result, window, cx);
                     });
                 })
@@ -861,16 +884,22 @@ impl EmojiLibraryView {
     }
 
     fn import_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(d) = self.import.take() else {
+        self.abandon_import(cx);
+        window.focus(&self.focus, cx);
+    }
+
+    /// Stops the dialog, deletes its staging folder and lets a refused read go ahead. Used by
+    /// Cancel and when another Settings page is shown, so no dialog runs hidden.
+    pub(crate) fn abandon_import(&mut self, cx: &mut Context<Self>) {
+        let Some(mut d) = self.import.take() else {
             return;
         };
         d.stop();
         self.picker = None;
         self.import_flag.store(false, Ordering::Relaxed);
-        if let Some(staged) = d.step.and_then(|s| s.staged) {
-            self.discard(staged, cx);
+        if let Some(staged) = d.step.take().and_then(|s| s.staged) {
+            self.discard_guard(staged, cx);
         }
-        window.focus(&self.focus, cx);
         // A read that was refused while the import was open can go ahead.
         self.store
             .clone()
@@ -1498,4 +1527,16 @@ fn sort_job(
         Ok(sorted) => Event::Sorted(sorted),
         Err(error) => Event::Failed(error),
     });
+}
+
+impl EmojiLibraryView {
+    /// An event of an earlier sorting run reaches the dialog (tests): it must change nothing.
+    #[cfg(test)]
+    pub(crate) fn stale_event_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(d) = self.import.as_ref() else {
+            return;
+        };
+        let (token, run) = (d.token, d.run.saturating_sub(1));
+        self.import_event(token, run, Event::Failed("stale".into()), window, cx);
+    }
 }

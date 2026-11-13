@@ -3,7 +3,7 @@
 //! `emoji_library_tests.rs`.
 use super::workflows_ui::tests::click;
 use super::*;
-use crate::monos::tests::{Setup, setup};
+use crate::monos::tests::{Setup, setup, setup_prepared};
 use gpui::{TestAppContext, VisualTestContext};
 use monocode_core::mono::emoji::{self, Emoji, Format, Library, Pack, test_support};
 
@@ -268,7 +268,7 @@ fn the_manage_button_closes_the_mono_settings_and_opens_the_library_page(cx: &mu
     assert!(visual.debug_bounds("emoji-lib-import").is_some());
 }
 
-fn chat_transcript(
+pub(super) fn chat_transcript(
     s: &Setup,
     visual: &mut VisualTestContext,
 ) -> gpui::Entity<crate::transcript::TranscriptView> {
@@ -364,7 +364,7 @@ fn a_pack_id_the_library_does_not_have_is_ignored(cx: &mut TestAppContext) {
     );
 }
 
-fn rebuilds(s: &Setup, visual: &VisualTestContext) -> usize {
+pub(super) fn rebuilds(s: &Setup, visual: &VisualTestContext) -> usize {
     s.manager.read_with(visual, |m, cx| {
         m.chats[&s.id].read(cx).transcript.read(cx).emoji_rebuilds
     })
@@ -414,4 +414,77 @@ fn a_description_never_rebuilds_the_chat_but_a_pack_choice_does(cx: &mut TestApp
     click(&mut visual, "mono-emoji-use-pack-b");
     visual.run_until_parked();
     assert_eq!(rebuilds(&s, &visual), before + 1);
+}
+
+#[gpui::test]
+fn the_manage_button_brings_the_emoji_title_and_import_button_into_view(cx: &mut TestAppContext) {
+    // A normal window, not one tall enough for the whole page.
+    let (s, mut visual) = open(cx);
+    visual.run_until_parked();
+    two_packs(&s, &mut visual);
+    click(&mut visual, "mono-emoji-manage");
+    for _ in 0..3 {
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+    }
+    let window = visual.update(|window, _| window.viewport_size());
+    for selector in ["settings-emoji-title", "emoji-lib-import"] {
+        let bounds = visual
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} is not drawn"));
+        assert!(
+            bounds.top() >= px(0.) && bounds.bottom() <= window.height,
+            "{selector} is in view: {bounds:?} in {window:?}"
+        );
+    }
+}
+
+#[gpui::test]
+fn a_mono_made_with_its_settings_open_records_its_model_when_the_chat_opens(
+    cx: &mut TestAppContext,
+) {
+    let (s, visual) = open(cx);
+    visual.run_until_parked();
+    let kind = s.manager.read_with(&visual, |m, cx| {
+        Kind::from_id(&m.chats[&s.id].read(cx).summary.provider)
+    });
+    let remembered =
+        store(&s, &visual).read_with(&visual, |store, _| store.last_model().map(|m| m.kind));
+    assert_eq!(remembered, Some(kind));
+}
+
+fn write_library_before_start(dir: &std::path::Path) {
+    let emoji_dir = emoji::dir(dir);
+    let folder = emoji::pack_dir(&emoji_dir, "pack-a");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("a.png"), test_support::png(4, 4, 10)).unwrap();
+    let mut library = Library::default();
+    library.packs.push(Pack {
+        id: "pack-a".into(),
+        name: "pack-a".into(),
+        sorted_by: None,
+        emoji: vec![entry("a.png", "alpha", Format::Png, Some("happy"))],
+    });
+    emoji::save(&emoji_dir, &library).unwrap();
+}
+
+#[gpui::test]
+fn a_library_on_disk_before_the_app_starts_is_drawn_without_opening_settings(
+    cx: &mut TestAppContext,
+) {
+    let s = setup_prepared(cx, false, write_library_before_start);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let mut visual = VisualTestContext::from_window(s.window.into(), cx);
+    visual.run_until_parked();
+    // No settings page is opened and nothing reads the library again: the start-up read did.
+    s.manager.update(&mut visual, |m, cx| {
+        m.settings = None;
+        m.emoji_update(cx, |e| {
+            e.enabled = true;
+            e.packs = vec!["pack-a".into()];
+        });
+    });
+    let _ = chat_transcript(&s, &mut visual);
+    visual.refresh().unwrap();
+    assert!(visual.debug_bounds("mono-emoji-happy").is_some());
 }

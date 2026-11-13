@@ -312,8 +312,17 @@ pub(super) fn setup(cx: &mut TestAppContext) -> Setup {
 }
 /// `shared` opens the desktop database layout the app uses, not the legacy native one.
 pub(super) fn setup_with(cx: &mut TestAppContext, shared: bool) -> Setup {
+    setup_prepared(cx, shared, |_| {})
+}
+/// `setup_with`, after `prepare` ran on the data folder and before the app starts.
+pub(super) fn setup_prepared(
+    cx: &mut TestAppContext,
+    shared: bool,
+    prepare: impl FnOnce(&std::path::Path),
+) -> Setup {
     let dir = std::env::temp_dir().join(format!("native-monos-{}", mono::new_id()));
     std::fs::create_dir_all(&dir).unwrap();
+    prepare(&dir);
     let project = dir.to_string_lossy().to_string();
     let store = Arc::new(Mutex::new(if shared {
         Store::open_monocode(&dir.join("monocode.db")).unwrap()

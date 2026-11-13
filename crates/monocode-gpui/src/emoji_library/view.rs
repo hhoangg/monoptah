@@ -65,8 +65,9 @@ impl Drop for EmojiLibraryView {
 impl EmojiLibraryView {
     pub(crate) fn new(store: Entity<EmojiStore>, cx: &mut Context<Self>) -> Self {
         let watch = cx.observe(&store, |_, _, cx| cx.notify());
-        // A library that could not be read earlier gets another try when the page is made.
-        store.update(cx, |store, cx| store.load(false, cx));
+        // The page reads the library again when it is made, so a file changed outside the app
+        // shows. The read waits while an edit, a write or an import is under way.
+        store.update(cx, |store, cx| store.load(true, cx));
         let import_flag = store.read(cx).import_flag();
         Self {
             store,
@@ -558,6 +559,7 @@ impl Render for EmojiLibraryView {
             div()
                 .id("emoji-lib")
                 .debug_selector(|| "emoji-lib".into())
+                .track_focus(&self.focus)
                 .relative()
                 .flex()
                 .flex_col()

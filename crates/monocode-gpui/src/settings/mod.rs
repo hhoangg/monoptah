@@ -516,6 +516,12 @@ impl SettingsView {
             if self.section == Section::Cloud {
                 self.leave_cloud(cx);
             }
+            // An import dialog does not keep running on a page that is not shown.
+            if self.section == Section::Monos
+                && let Some(library) = self.emoji_library.clone()
+            {
+                library.update(cx, |library, cx| library.abandon_import(cx));
+            }
             self.management = None;
             self.selected_trees.clear();
             self.management_generation += 1;

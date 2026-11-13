@@ -1014,6 +1014,10 @@ impl Monos {
                     },
                 ));
                 this.chats.insert(id.clone(), view);
+                // Settings may have opened before this chat existed: remember its model now.
+                if this.settings.is_some() && this.active.as_deref() == Some(&id) {
+                    this.note_settings_model(cx);
+                }
                 cx.emit(ChatOpened);
                 if let Some(handle) = this.parent_window {
                     let owner = cx.weak_entity();
@@ -1049,6 +1053,10 @@ impl Monos {
         self.configure_chat(source, cx);
     }
     fn configure_chat(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.configure_chat_with(id, true, cx);
+    }
+    /// `configure_chat`; without `push_emoji` the caller pushes the library itself right after.
+    fn configure_chat_with(&mut self, id: &str, push_emoji: bool, cx: &mut Context<Self>) {
         self.refresh_work(id, cx);
         if let Some(mono) = self.roster.get(id) {
             // The shell may be mid-update when this runs; reach it afterwards.
@@ -1068,7 +1076,9 @@ impl Monos {
                 .unwrap_or_default();
             let root = self.root.clone();
             view.update(cx, |view, cx| view.configure_mono(mono, root, env, cx));
-            self.push_emoji(id, &view, cx);
+            if push_emoji {
+                self.push_emoji(id, &view, cx);
+            }
         }
     }
     fn enqueue(
