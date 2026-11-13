@@ -9,7 +9,11 @@ use gpui::{
     Position as CssPosition, Role, SharedString, Style, Subscription, Toggled, Window, actions,
     canvas, deferred, div, point, prelude::*, px, rgb, rgba, size,
 };
-use std::{cell::Cell, rc::Rc, time::Instant};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    time::Instant,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Side {
@@ -1858,16 +1862,40 @@ pub(crate) enum ChoiceEvent<T> {
 /// taking room in the layout. Hold it while the list is open and drop it to close; render
 /// [`Choices::popover`] next to the trigger. The row ids are the choices' indexes, so the rows
 /// draw as `menu-action-0`, `menu-action-1`, ...
-pub(crate) struct Choices {
+pub(crate) struct Choices<T> {
     menu: Entity<Menu>,
+    values: Rc<RefCell<Vec<Option<T>>>>,
     _events: Subscription,
 }
 
-impl Choices {
+/// The menu rows of `choices` and the values they stand for.
+fn choice_items<T>(choices: Vec<Choice<T>>) -> (Vec<MenuItem>, Vec<Option<T>>) {
+    let mut values = Vec::with_capacity(choices.len());
+    let mut items = Vec::with_capacity(choices.len());
+    for (ix, choice) in choices.into_iter().enumerate() {
+        items.push(
+            MenuAction::new(ix.to_string(), choice.label)
+                .checked(choice.checked)
+                .into(),
+        );
+        values.push(Some(choice.value));
+    }
+    (items, values)
+}
+
+/// The id of the row that is checked, which the keyboard starts on.
+fn checked_id(items: &[MenuItem]) -> Option<String> {
+    items.iter().find_map(|item| match item {
+        MenuItem::Action(a) if a.checked => Some(a.id.to_string()),
+        _ => None,
+    })
+}
+
+impl<T: 'static> Choices<T> {
     /// Opens the list, `width` wide, and gives it the keyboard (arrows, Enter and Escape work as
     /// in any [`Menu`]). `on_event` runs once per pick or dismissal; the owner drops the
     /// `Choices` in it.
-    pub(crate) fn open<V: 'static, T: 'static>(
+    pub(crate) fn open<V: 'static>(
         label: impl Into<SharedString>,
         choices: Vec<Choice<T>>,
         width: f32,
@@ -1875,29 +1903,20 @@ impl Choices {
         cx: &mut Context<V>,
         on_event: impl Fn(&mut V, ChoiceEvent<T>, &mut Window, &mut Context<V>) + 'static,
     ) -> Self {
-        let mut values = Vec::with_capacity(choices.len());
-        let mut items = Vec::with_capacity(choices.len());
-        for (ix, choice) in choices.into_iter().enumerate() {
-            items.push(
-                MenuAction::new(ix.to_string(), choice.label)
-                    .checked(choice.checked)
-                    .into(),
-            );
-            values.push(Some(choice.value));
-        }
-        let at = items
-            .iter()
-            .position(|item| matches!(item, MenuItem::Action(a) if a.checked));
+        let (items, values) = choice_items(choices);
+        let checked = checked_id(&items);
         let menu = cx.new(|cx| {
-            let mut menu = Menu::new(label, items, window, cx)
+            let menu = Menu::new(label, items, window, cx)
                 .width(width)
                 .style(MenuStyle::Git);
             // The keyboard starts on the current value.
-            if let Some(ix) = at {
-                menu.active = Some(ix);
+            match checked {
+                Some(id) => menu.select_value(&id),
+                None => menu,
             }
-            menu
         });
+        let values = Rc::new(RefCell::new(values));
+        let picked = values.clone();
         let events = cx.subscribe_in(
             &menu,
             window,
@@ -1906,7 +1925,7 @@ impl Choices {
                     MenuEvent::Picked(id, _) => id
                         .parse::<usize>()
                         .ok()
-                        .and_then(|ix| values.get_mut(ix)?.take())
+                        .and_then(|ix| picked.borrow_mut().get_mut(ix)?.take())
                         .map_or(ChoiceEvent::Dismissed, ChoiceEvent::Picked),
                     MenuEvent::Dismissed => ChoiceEvent::Dismissed,
                 };
@@ -1915,8 +1934,25 @@ impl Choices {
         );
         Self {
             menu,
+            values,
             _events: events,
         }
+    }
+
+    /// Replaces the rows of the open list (its options changed under it), keeping the
+    /// highlighted row when it is still there and starting on the checked one otherwise.
+    pub(crate) fn refresh(&self, choices: Vec<Choice<T>>, cx: &mut App) {
+        let (items, values) = choice_items(choices);
+        let checked = checked_id(&items);
+        *self.values.borrow_mut() = values;
+        self.menu.update(cx, |menu, cx| {
+            menu.replace_items(items, cx);
+            if menu.active.is_none()
+                && let Some(ix) = checked.and_then(|id| id.parse::<usize>().ok())
+            {
+                menu.active = Some(ix);
+            }
+        });
     }
 
     /// The list drawn under `anchor`, as wide as it was opened with. `priority` is where it
@@ -1928,11 +1964,6 @@ impl Choices {
             .gap(4.)
             .max_height(320.)
             .priority(priority)
-    }
-
-    /// The card's window bounds once drawn, so a dialog beneath can treat presses on it as inside.
-    pub(crate) fn surface(&self, cx: &App) -> AnchorSlot {
-        self.menu.read(cx).surface_region()
     }
 }
 

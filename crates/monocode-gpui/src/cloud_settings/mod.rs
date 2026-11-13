@@ -187,20 +187,21 @@ enum Select {
 }
 
 impl Select {
-    /// Every select, in the order of `CloudSettings::select_anchors`.
-    const COUNT: usize = 8;
+    /// Every select, in declaration order (a select's discriminant is its place here and in
+    /// `CloudSettings::select_anchors`).
+    const ALL: [Select; 8] = [
+        Self::Default,
+        Self::Machine,
+        Self::Size,
+        Self::Idle,
+        Self::Runtime,
+        Self::DockerAccount,
+        Self::Claude,
+        Self::Git,
+    ];
 
     fn index(self) -> usize {
-        match self {
-            Self::Default => 0,
-            Self::Machine => 1,
-            Self::Size => 2,
-            Self::Idle => 3,
-            Self::Runtime => 4,
-            Self::DockerAccount => 5,
-            Self::Claude => 6,
-            Self::Git => 7,
-        }
+        self as usize
     }
 
     fn id(self) -> &'static str {
@@ -230,17 +231,23 @@ enum Pick {
     Git(Option<String>),
 }
 
-/// The floating list of the select that is open, and which opening it belongs to.
+/// The floating list of the select that is open.
 struct OpenSelect {
     which: Select,
-    /// An event of an older list (one that was replaced by another select's) is not this one's.
-    opening: u64,
-    choices: Choices,
+    choices: Choices<Pick>,
 }
 
+const _: () = {
+    let mut at = 0;
+    while at < Select::ALL.len() {
+        assert!(Select::ALL[at] as usize == at);
+        at += 1;
+    }
+};
+
 /// Where an open select's list draws: above the dialog's own layer (60 in the shell) and its
-/// barrier, below the fix terminal that stacks on the dialog. A select is closed before a fix
-/// terminal can open, so the two never share a layer.
+/// barrier, below the fix terminal that stacks on the dialog. The shell asserts the order
+/// (`SETTINGS_PRIORITY < SELECT_PRIORITY < FIX_PRIORITY`) at compile time.
 pub(crate) const SELECT_PRIORITY: usize = 61;
 
 struct Opt {
@@ -316,10 +323,8 @@ pub(crate) struct CloudSettings {
     infos: [DevcontainerInfo; 2],
     infos_gen: u64,
     open_select: Option<OpenSelect>,
-    /// Counts the lists opened, to tell a stale list's event from the current one's.
-    select_openings: u64,
     /// Each select trigger's bounds, which its floating list is placed against.
-    select_anchors: [AnchorSlot; Select::COUNT],
+    select_anchors: [AnchorSlot; Select::ALL.len()],
     error: Option<FieldError>,
     /// Save is waiting for the Codespaces secrets to reach GitHub.
     saving: bool,
@@ -500,7 +505,6 @@ impl CloudSettings {
             infos: [DevcontainerInfo::default(), DevcontainerInfo::default()],
             infos_gen: 0,
             open_select: None,
-            select_openings: 0,
             select_anchors: Default::default(),
             error: None,
             saving: false,
@@ -631,6 +635,7 @@ impl CloudSettings {
                 {
                     this.form.sandbox.credential_id = None;
                 }
+                this.refresh_open_select(cx);
                 cx.notify();
             });
         })
@@ -656,6 +661,7 @@ impl CloudSettings {
                     }
                 }
                 this.docker_accounts_loaded = true;
+                this.refresh_open_select(cx);
                 cx.notify();
             });
         })
@@ -669,6 +675,7 @@ impl CloudSettings {
         self.machines_gen += 1;
         let generation = self.machines_gen;
         self.machines = Machines::Loading;
+        self.refresh_open_select(cx);
         cx.notify();
         let (gh, origin, project) = (self.env.gh.clone(), self.env.origin, self.project.clone());
         cx.spawn(async move |this, cx| {
@@ -698,6 +705,7 @@ impl CloudSettings {
                     this.cs_machine
                         .update(cx, |input, cx| input.set_text(text, cx));
                 }
+                this.refresh_open_select(cx);
                 cx.notify();
             });
         })
@@ -876,6 +884,7 @@ impl CloudSettings {
             let _ = this.update(cx, |this, cx| {
                 if this.infos_gen == generation {
                     this.infos = infos;
+                    this.refresh_open_select(cx);
                     cx.notify();
                 }
             });
@@ -1488,20 +1497,26 @@ impl CloudSettings {
 
     #[cfg(test)]
     pub(crate) fn select_label(&self, id: &str, cx: &App) -> String {
-        let which = [
-            Select::Default,
-            Select::Machine,
-            Select::Size,
-            Select::Idle,
-            Select::Runtime,
-            Select::DockerAccount,
-            Select::Claude,
-            Select::Git,
-        ]
-        .into_iter()
-        .find(|s| s.id() == id)
-        .expect("a select id");
+        let which = Select::ALL
+            .into_iter()
+            .find(|s| s.id() == id)
+            .expect("a select id");
         self.current_label(which, cx)
+    }
+
+    /// Back to the state before the Docker accounts were read (tests only).
+    #[cfg(test)]
+    pub(crate) fn forget_docker_accounts(&mut self, cx: &mut Context<Self>) {
+        self.docker_accounts.clear();
+        self.docker_accounts_loaded = false;
+        self.refresh_open_select(cx);
+        cx.notify();
+    }
+
+    /// Reads the Docker accounts again, off the UI thread (tests only).
+    #[cfg(test)]
+    pub(crate) fn reload_docker_accounts(&mut self, cx: &mut Context<Self>) {
+        self.load_docker_accounts(cx);
     }
 
     #[cfg(test)]
@@ -1522,6 +1537,7 @@ impl CloudSettings {
     pub(crate) fn set_requirements(&mut self, info: DevcontainerInfo, cx: &mut Context<Self>) {
         self.infos_gen += 1;
         self.infos = [info.clone(), info];
+        self.refresh_open_select(cx);
         cx.notify();
     }
 
@@ -1642,45 +1658,50 @@ impl CloudSettings {
         let width = self.select_anchors[which.index()]
             .get()
             .map_or(220., |bounds| bounds.size.width.as_f32());
-        self.select_openings += 1;
-        let opening = self.select_openings;
-        let choices = options
-            .into_iter()
-            .map(|option| Choice {
-                value: option.pick,
-                label: option.label.into(),
-                checked: option.selected,
-            })
-            .collect();
+        let choices = Self::choices(options);
         let choices = Choices::open(
             which.id(),
             choices,
             width,
             window,
             cx,
-            move |this, event, _, cx| {
-                // A newer list replaced this one: its close is not the new list's.
-                if this
-                    .open_select
-                    .as_ref()
-                    .is_none_or(|o| o.opening != opening)
-                {
-                    return;
-                }
-                match event {
-                    ChoiceEvent::Picked(pick) => this.pick(pick, cx),
-                    ChoiceEvent::Dismissed => {
-                        this.open_select = None;
-                        cx.notify();
-                    }
+            move |this, event, _, cx| match event {
+                ChoiceEvent::Picked(pick) => this.pick(pick, cx),
+                ChoiceEvent::Dismissed => {
+                    this.open_select = None;
+                    cx.notify();
                 }
             },
         );
-        self.open_select = Some(OpenSelect {
-            which,
-            opening,
-            choices,
-        });
+        self.open_select = Some(OpenSelect { which, choices });
+        cx.notify();
+    }
+
+    fn choices(options: Vec<Opt>) -> Vec<Choice<Pick>> {
+        options
+            .into_iter()
+            .map(|option| Choice {
+                value: option.pick,
+                label: option.label.into(),
+                checked: option.selected,
+            })
+            .collect()
+    }
+
+    /// The options of the open select changed under its list (accounts, credentials, machines
+    /// or the devcontainer's requirements loaded): redraws the rows, keeping the highlight.
+    /// A list left with no option closes.
+    fn refresh_open_select(&mut self, cx: &mut Context<Self>) {
+        let Some(which) = self.open_select.as_ref().map(|open| open.which) else {
+            return;
+        };
+        let options = self.options(which, cx);
+        if options.is_empty() {
+            self.open_select = None;
+            self.refocus = true;
+        } else if let Some(open) = &self.open_select {
+            open.choices.refresh(Self::choices(options), cx);
+        }
         cx.notify();
     }
 
@@ -1692,14 +1713,6 @@ impl CloudSettings {
             SELECT_PRIORITY,
             cx,
         ))
-    }
-
-    /// Where the open select's list is drawn, so the dialog's own outside-press dismissal
-    /// treats a press on it as inside (it can reach past the dialog's card).
-    pub(crate) fn select_surface(&self, cx: &App) -> Option<AnchorSlot> {
-        self.open_select
-            .as_ref()
-            .map(|open| open.choices.surface(cx))
     }
 
     /// A select: the current value in a box; clicking opens its list floating below it.
@@ -2308,6 +2321,14 @@ impl Render for CloudSettings {
             .id("cloud-settings-body")
             .min_h_0()
             .overflow_y_scroll()
+            // The list is placed against its trigger once; scrolling would leave it over the
+            // header or footer, so it closes (the scroll itself goes on).
+            .on_scroll_wheel(cx.listener(|this, _: &gpui::ScrollWheelEvent, _, cx| {
+                if this.open_select.take().is_some() {
+                    this.refocus = true;
+                    cx.notify();
+                }
+            }))
             .flex()
             .flex_col()
             .gap_4()

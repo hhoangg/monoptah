@@ -1241,6 +1241,7 @@ fn the_codespaces_tab_floats_its_selects_too(cx: &mut TestAppContext) {
     let before = form_layout(visual);
     for id in [
         "cloud-select-default",
+        "cloud-select-machine",
         "cloud-select-idle",
         "cloud-select-claude",
     ] {
@@ -1263,6 +1264,14 @@ fn the_codespaces_tab_floats_its_selects_too(cx: &mut TestAppContext) {
     assert_eq!(open_select_id(&window, visual), None);
     assert_ne!(select_label(&window, visual, "idle"), before_label);
     assert_same_layout(&form_layout(visual), &before, "after the pick");
+    // Machine: pick another machine type through the list.
+    click(visual, "cloud-select-machine");
+    visual.refresh().unwrap();
+    let before_label = select_label(&window, visual, "machine");
+    click(visual, "menu-action-1");
+    assert_eq!(open_select_id(&window, visual), None);
+    assert_ne!(select_label(&window, visual, "machine"), before_label);
+    assert_same_layout(&form_layout(visual), &before, "after the machine pick");
 }
 
 #[gpui::test]
@@ -1355,7 +1364,7 @@ fn a_press_outside_the_list_closes_only_the_list(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn a_press_on_the_trigger_closes_its_own_list_and_another_trigger_moves_it(
+fn a_press_on_a_trigger_closes_the_open_list_and_the_next_press_opens_that_triggers(
     cx: &mut TestAppContext,
 ) {
     let (window, _, _) = shell_with_fakes(cx);
@@ -1365,21 +1374,25 @@ fn a_press_on_the_trigger_closes_its_own_list_and_another_trigger_moves_it(
     visual.refresh().unwrap();
     click(visual, "cloud-select-size");
     assert_eq!(open_select_id(&window, visual), None, "the trigger toggles");
+    // A press on another trigger is outside the open list: it closes it and nothing else.
     click(visual, "cloud-select-size");
     visual.refresh().unwrap();
     click(visual, "cloud-select-runtime");
-    visual.refresh().unwrap();
-    let open = open_select_id(&window, visual);
-    assert!(
-        open == Some("runtime") || open.is_none(),
-        "never the old one: {open:?}"
+    assert_eq!(
+        open_select_id(&window, visual),
+        None,
+        "the press only closes"
     );
+    visual.refresh().unwrap();
+    click(visual, "cloud-select-runtime");
+    visual.refresh().unwrap();
+    assert_eq!(open_select_id(&window, visual), Some("runtime"));
 }
 
 #[gpui::test]
 fn the_lists_work_with_the_git_credential_panel_open(cx: &mut TestAppContext) {
     let (window, fixture, _) = shell_with_fakes(cx);
-    let id = save_profile(&fixture);
+    save_profile(&fixture);
     open_sandbox_tab(&window, cx);
     let visual = &mut VisualTestContext::from_window(window.into(), cx);
     click(visual, "cloud-git-manage");
@@ -1408,38 +1421,133 @@ fn the_lists_work_with_the_git_credential_panel_open(cx: &mut TestAppContext) {
     visual.run_until_parked();
     assert!(panel_of(&window, visual).is_none());
     assert_eq!(children(&window, visual), (true, false));
-    // Opening the panel while a list is open closes the list (the panel takes the keyboard).
+    // A press on Manage while a list is open only closes the list; it does not open the panel.
     click(visual, "cloud-select-git");
     visual.refresh().unwrap();
     assert_eq!(open_select_id(&window, visual), Some("git"));
-    let _ = id;
+    click(visual, "cloud-git-manage");
+    assert_eq!(open_select_id(&window, visual), None);
+    assert!(
+        panel_of(&window, visual).is_none(),
+        "the press reached nothing else"
+    );
+    assert_eq!(children(&window, visual), (true, false));
 }
 
 #[gpui::test]
 fn the_git_list_reaches_past_the_dialog_card_and_still_takes_the_click(cx: &mut TestAppContext) {
     let (window, fixture, _) = shell_with_fakes(cx);
-    let id = save_profile(&fixture);
+    // Several saved profiles make the Git list tall (rows: the profiles, then "None").
+    let credentials =
+        monocode_core::git_credentials::GitCredentials::for_store(&fixture.store.lock().unwrap())
+            .unwrap();
+    let ids: Vec<String> = (0..7)
+        .map(|n| {
+            credentials
+                .save(
+                    &format!("Work {n}"),
+                    monocode_core::git_credentials::GitPlatform::GitHub,
+                    "https://github.com",
+                    "me",
+                    "ghp_exampleTokenValue1234567890",
+                )
+                .unwrap()
+        })
+        .collect();
+    drop(credentials);
     open_sandbox_tab(&window, cx);
     let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    // The dialog card ends well above the bottom of the window, so a tall list reaches past it
+    // (the window is tall enough to hold the dialog and the list).
+    visual.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1300.)));
+    visual.refresh().unwrap();
+    assert_eq!(chosen_credential(&window, visual), None);
     click(visual, "cloud-select-git");
     visual.refresh().unwrap();
-    // Two rows: the saved profile (when it matches the repository) and "None".
-    let last = (0..3)
-        .rev()
-        .find_map(|n| visual.debug_bounds(Box::leak(format!("menu-action-{n}").into_boxed_str())))
-        .expect("rows");
-    visual.simulate_click(last.center(), Default::default());
+    assert_eq!(open_select_id(&window, visual), Some("git"));
+    // The last saved profile is the row that lies furthest down (then comes "None").
+    let row = bounds_of(visual, "menu-action-6");
+    let card = bounds_of(visual, "cloud-settings");
+    assert!(
+        row.center().y > card.bottom(),
+        "the premise: the row lies below the dialog card: {row:?} {card:?}"
+    );
+    let label_of_row = |visual: &mut VisualTestContext| {
+        dialog_state(&window, visual, |d, cx| d.select_label("git", cx))
+    };
+    visual.simulate_click(row.center(), Default::default());
     visual.run_until_parked();
     assert_eq!(open_select_id(&window, visual), None);
-    assert_eq!(
-        chosen_credential(&window, visual),
-        None,
-        "None (read-only clone)"
-    );
+    let chosen = chosen_credential(&window, visual).expect("the click reached the row");
+    assert!(ids.contains(&chosen));
+    assert!(label_of_row(visual).starts_with("Work "));
     assert_eq!(
         children(&window, visual),
         (true, false),
         "a click on the list is not outside the dialog"
     );
-    let _ = id;
+}
+
+#[gpui::test]
+fn a_list_opened_before_the_docker_accounts_load_shows_them_once_they_do(cx: &mut TestAppContext) {
+    let (window, _, _) = shell_with_fakes(cx);
+    open_sandbox_tab(&window, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    let on_dialog = |visual: &mut VisualTestContext,
+                     f: fn(
+        &mut cloud_settings::CloudSettings,
+        &mut gpui::Context<cloud_settings::CloudSettings>,
+    )| {
+        window
+            .update(visual, |shell, _, cx| {
+                let view = shell.cloud_settings.as_ref().unwrap().view.clone();
+                view.update(cx, f);
+            })
+            .unwrap();
+    };
+    // Back to before the accounts were read, then open the list.
+    on_dialog(visual, |d, cx| d.forget_docker_accounts(cx));
+    visual.refresh().unwrap();
+    click(visual, "cloud-select-docker");
+    visual.refresh().unwrap();
+    assert_eq!(open_select_id(&window, visual), Some("docker"));
+    assert!(visual.debug_bounds("menu-action-0").is_some());
+    assert!(
+        visual.debug_bounds("menu-action-1").is_none(),
+        "only the machine sign-in before the accounts are read"
+    );
+    // The accounts arrive: the open list shows them and stays open.
+    on_dialog(visual, |d, cx| d.reload_docker_accounts(cx));
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    assert_eq!(open_select_id(&window, visual), Some("docker"));
+    assert!(visual.debug_bounds("menu-action-1").is_some());
+    assert!(visual.debug_bounds("menu-action-2").is_some());
+    // Picking a new row sets the account.
+    click(visual, "menu-action-1");
+    assert_eq!(open_select_id(&window, visual), None);
+    assert_ne!(
+        select_label(&window, visual, "docker"),
+        crate::cloud_presets::MACHINE_SIGN_IN_LABEL
+    );
+}
+
+#[gpui::test]
+fn scrolling_the_dialog_body_closes_the_open_list(cx: &mut TestAppContext) {
+    let (window, _, _) = shell_with_fakes(cx);
+    open_sandbox_tab(&window, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    click(visual, "cloud-select-size");
+    visual.refresh().unwrap();
+    assert_eq!(open_select_id(&window, visual), Some("size"));
+    // Over the body, away from the list.
+    let at = bounds_of(visual, "cloud-segments").center();
+    visual.simulate_event(gpui::ScrollWheelEvent {
+        position: at,
+        delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-40.))),
+        ..Default::default()
+    });
+    visual.run_until_parked();
+    assert_eq!(open_select_id(&window, visual), None);
+    assert_eq!(children(&window, visual), (true, false), "the dialog stays");
 }

@@ -14,6 +14,10 @@ use std::path::PathBuf;
 const SETTINGS_PRIORITY: usize = 60;
 /// The fix terminal stacks on the dialog and over a select's list.
 const FIX_PRIORITY: usize = 62;
+const _: () = assert!(
+    SETTINGS_PRIORITY < cloud_settings::SELECT_PRIORITY
+        && cloud_settings::SELECT_PRIORITY < FIX_PRIORITY
+);
 
 pub(super) struct OpenProjectCloud {
     view: Entity<CloudSettings>,
@@ -211,7 +215,7 @@ impl Shell {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        self.cloud_modal_sized(id, view, priority, 460., None, close, window, cx)
+        self.cloud_modal_sized(id, view, priority, 460., close, window, cx)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -221,8 +225,6 @@ impl Shell {
         view: impl Into<AnyView>,
         priority: usize,
         width: f32,
-        // A layer drawn over the card (the open select's list): a press on it is inside.
-        inside: Option<crate::popover::AnchorSlot>,
         close: fn(&mut Shell, &mut Window, &mut Context<Shell>),
         window: &Window,
         cx: &mut Context<Self>,
@@ -247,7 +249,6 @@ impl Shell {
                     .gap(0.)
                     .max_height(viewport.height.as_f32() - 32.)
                     .priority(priority)
-                    .when_some(inside, |p, slot| p.ignore(slot))
                     .on_dismiss(move |window, cx| {
                         let _ = weak.update(cx, |this, cx| close(this, window, cx));
                     })
@@ -264,13 +265,11 @@ impl Shell {
         let view = self.cloud_settings.as_ref()?.view.clone();
         // Wider while the Git credential side panel is open.
         let width = view.read(cx).dialog_width();
-        let select = view.read(cx).select_surface(cx);
         Some(self.cloud_modal_sized(
             "cloud-settings-modal",
             view,
             SETTINGS_PRIORITY,
             width,
-            select,
             |this, window, cx| {
                 // A press outside the dialog that also dismisses an open select's list (the
                 // list's own listener handles it in the same press) closes only the list.
