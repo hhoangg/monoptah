@@ -1689,3 +1689,57 @@ fn scrolling_the_body_closes_the_list_and_the_field_keeps_the_keyboard(cx: &mut 
         "typing reached the Repository field: {text}"
     );
 }
+
+#[gpui::test]
+fn the_docker_tab_links_the_usage_page_beside_the_docker_account_select(cx: &mut TestAppContext) {
+    use crate::cloud_dialog_ui::{DOCKER_USAGE_TIP, DOCKER_USAGE_URL};
+    let (window, _, _) = shell_with_fakes(cx);
+    open_default(&window, cx, "/work/monocode");
+    cx.refresh().unwrap();
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    // Codespaces are billed by GitHub: no Docker link on that tab.
+    assert!(visual.debug_bounds("cloud-docker-usage-link").is_none());
+    click(visual, "cloud-seg-sandbox");
+    visual.refresh().unwrap();
+    // It sits right of the Docker account select, on the same line.
+    let select = bounds_of(visual, "cloud-select-docker");
+    let link = bounds_of(visual, "cloud-docker-usage-link");
+    assert!(link.left() >= select.right(), "{link:?} {select:?}");
+    assert!(link.center().y >= select.top() && link.center().y <= select.bottom());
+    // The tooltip warns that the page shows the browser's account, not the project's.
+    assert!(DOCKER_USAGE_TIP.contains("signed in in your browser"));
+    assert!(DOCKER_USAGE_TIP.contains("may not be this project's Docker account"));
+    // A click opens exactly the usage page.
+    assert_eq!(visual.opened_url(), None);
+    click(visual, "cloud-docker-usage-link");
+    assert_eq!(visual.opened_url().as_deref(), Some(DOCKER_USAGE_URL));
+}
+
+#[gpui::test]
+fn enter_on_the_focused_docker_usage_link_opens_the_usage_page(cx: &mut TestAppContext) {
+    use crate::cloud_dialog_ui::DOCKER_USAGE_URL;
+    let (window, _, _) = shell_with_fakes(cx);
+    open_default(&window, cx, "/work/monocode");
+    cx.refresh().unwrap();
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    click(visual, "cloud-seg-sandbox");
+    visual.refresh().unwrap();
+    window
+        .update(visual, |shell, w, cx| {
+            let focus = shell
+                .cloud_settings
+                .as_ref()
+                .unwrap()
+                .view
+                .read(cx)
+                .usage_focus()
+                .clone();
+            assert!(!focus.is_focused(w));
+            w.focus(&focus, cx);
+        })
+        .unwrap();
+    visual.run_until_parked();
+    assert_eq!(visual.opened_url(), None);
+    visual.simulate_keystrokes("enter");
+    assert_eq!(visual.opened_url().as_deref(), Some(DOCKER_USAGE_URL));
+}

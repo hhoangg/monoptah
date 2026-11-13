@@ -1,7 +1,60 @@
 //! Small building blocks the Cloud settings dialog and the Git credential panel share: hints,
 //! alerts, labelled fields and one-of-many rows. They carry no state of their own.
-use crate::{input::Input, settings::widgets::secondary_button, theme::*};
-use gpui::{Div, Entity, FontWeight, Role, SharedString, Stateful, div, prelude::*, px, rgb};
+use crate::{cloud_mark::CloudTip, input::Input, settings::widgets::secondary_button, theme::*};
+use gpui::{
+    Div, Entity, FocusHandle, FontWeight, Role, SharedString, Stateful, div, prelude::*, px, rgb,
+};
+
+/// Where Docker shows the credit and compute usage of Sandboxes. `sbx` has no command that
+/// reads the balance, so the Console page is the only place; the app opens it in the browser.
+pub(crate) const DOCKER_USAGE_URL: &str = "https://agentic-platform.docker.com/usage";
+
+/// The hover text of [`docker_usage_link`]. The Console page shows the Docker account that is
+/// signed in in the browser, which is not necessarily the account a project runs `sbx` as.
+pub(crate) const DOCKER_USAGE_TIP: &str = "Opens the Docker Console usage page for the account \
+     signed in in your browser, which may not be this project's Docker account. Credits and \
+     compute usage may lag by up to 48 hours.";
+
+/// The visible text of [`docker_usage_link`].
+pub(crate) const DOCKER_USAGE_TEXT: &str = "View usage & credits \u{2197}";
+
+/// A link that opens `url` in the default browser. It is reachable with the keyboard: it takes
+/// part in the tab order through `focus` and opens on Enter or Space as well as on a click. The
+/// caller adds the content and any size. `id` is also its debug selector.
+pub(crate) fn external_link(
+    id: &'static str,
+    aria_label: &'static str,
+    url: &'static str,
+    focus: &FocusHandle,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .debug_selector(move || id.into())
+        .role(Role::Link)
+        .aria_label(aria_label)
+        .track_focus(focus)
+        .tab_index(0)
+        .text_color(content(0.7))
+        .underline()
+        .cursor_pointer()
+        .hover(|s| s.text_color(content(1.)))
+        .on_click(move |_, _, cx| cx.open_url(url))
+        .on_key_down(move |event, _, cx| {
+            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                cx.open_url(url);
+                cx.stop_propagation();
+            }
+        })
+}
+
+/// The link to the Docker usage page. Only Docker Sandbox surfaces use it: Codespaces are billed
+/// by GitHub.
+pub(crate) fn docker_usage_link(id: &'static str, focus: &FocusHandle) -> Stateful<Div> {
+    external_link(id, "View Docker usage and credits", DOCKER_USAGE_URL, focus)
+        .text_size(px(12.))
+        .tooltip(|_, cx| cx.new(|_| CloudTip(DOCKER_USAGE_TIP.into())).into())
+        .child(DOCKER_USAGE_TEXT)
+}
 
 pub(crate) fn muted(text: impl Into<SharedString>) -> Div {
     div()
