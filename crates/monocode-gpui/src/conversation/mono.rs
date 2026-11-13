@@ -112,6 +112,9 @@ impl Conversation {
         if self.cloud_locked {
             return Err(crate::shell::CLOUD_ARCHIVING.into());
         }
+        if self.auto_stopping {
+            return Err(super::auto_stop::AUTO_STOPPING.into());
+        }
         if self.move_locked {
             return Err(MOVE_PAUSED.into());
         }

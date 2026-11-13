@@ -11,13 +11,18 @@
 //!   with `now` (seconds on any monotonic clock), and it answers with the workspaces to stop.
 //! * [`stop_if_still_idle`]: the one place that talks to the backend, and only for a
 //!   [`Decision`]. It re-reads the state and the stored sessions first and stops through
-//!   [`CloudSessions::stop_cloud`], the path every other Stop uses.
+//!   [`CloudSessions::stop_cloud`], the path every other Stop uses. The app calls it with the
+//!   workspace already marked busy and its composers locked, so nothing can start on it
+//!   between the last look at the facts and the backend call (see `shell/cloud_auto_stop.rs`).
 //!
 //! The policy is conservative: an unknown state, a session that is working, waiting, starting,
 //! restoring, being archived, holding a queued prompt or with files not yet copied locally
-//! all count as "not idle". It only ever stops. A stopped workspace is resumed by the user's
+//! all count as "not idle", and so does an open terminal on the workspace. A workspace the
+//! user chose to keep running, or removed from Monoptah, is never stopped for being unused
+//! ([`AutoStop::keep_running`]). It only ever stops. A stopped workspace is resumed by the user's
 //! next send, as before; nothing in the background wakes it.
 use super::{CloudBackendKind, CloudRef, CloudSessions, CloudState};
+use crate::mono::cloud_api::AppBusy;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -173,7 +178,8 @@ pub enum StopOutcome {
     Stopped,
     /// It was not running (or its state could not be read): nothing to do.
     NotRunning,
-    /// A session works on it, or still uses it: left alone.
+    /// A session works on it, or still uses it, or the app has something open on it (an
+    /// archive, a terminal): left alone.
     InUse,
     Failed(String),
 }
@@ -189,6 +195,9 @@ pub struct AutoStop {
     unused_since: HashMap<String, u64>,
     /// Stops asked for and not yet seen in the state, with the time of the request.
     requested: HashMap<String, u64>,
+    /// Workspaces the user chose to leave running or to remove from the app: never stopped
+    /// for being unused, and not remembered as having had a session.
+    exempt: HashSet<String>,
 }
 
 impl AutoStop {
@@ -206,9 +215,14 @@ impl AutoStop {
     ) -> Vec<Decision> {
         let mut decisions = Vec::new();
         let live: HashSet<String> = workspaces.iter().map(|w| w.cloud.key()).collect();
+        // A workspace that left the window and came back (a kept workspace used again) starts
+        // a new idle window, not the one it had before it left.
+        self.since.retain(|key, _| live.contains(key));
         for workspace in workspaces {
             let key = workspace.cloud.key();
-            self.known.insert(key.clone(), workspace.cloud.clone());
+            if !self.exempt.contains(&key) {
+                self.known.insert(key.clone(), workspace.cloud.clone());
+            }
             self.unused_since.remove(&key);
             // A stop is over once the state shows anything but running; a request the state
             // never confirmed (an old cache, a lost call) expires.
@@ -300,29 +314,58 @@ impl AutoStop {
         }
     }
 
-    /// The user resumed the workspace: it starts a fresh idle window.
+    /// The user resumed the workspace: it starts a fresh idle window, and an earlier "keep
+    /// running" no longer applies (the user is using it again).
     pub fn resumed(&mut self, cloud: &CloudRef, now: u64) {
         let key = cloud.key();
         self.requested.remove(&key);
+        self.exempt.remove(&key);
         self.since.insert(key, now);
+    }
+
+    /// The user chose "Keep running" when archiving, or removed the session from the app:
+    /// the workspace is theirs to stop. It is never stopped for having no session left (idle
+    /// stops still apply while another session uses it) until it is resumed.
+    pub fn keep_running(&mut self, cloud: &CloudRef) {
+        let key = cloud.key();
+        self.known.remove(&key);
+        self.unused_since.remove(&key);
+        self.exempt.insert(key);
     }
 }
 
 /// Stops the workspace of `decision` if it still qualifies. BLOCKS (state read, backend stop):
 /// call it on a worker, and only for a decision, never on a timer of its own.
-pub fn stop_if_still_idle(cloud: &CloudSessions, decision: &Decision) -> StopOutcome {
+///
+/// `busy` is what the app knows right now that the store does not: the workspaces it works on
+/// or has a terminal open on, and the sessions that are mid-turn in a live view (the stored
+/// flags lag by up to 30 s). It is asked before the state is read and again right before the
+/// stop call, so an implementation that answers live sees what happened during the read. The
+/// app's is a snapshot, so the caller must also keep anything new from starting for the whole
+/// call (mark the workspace busy, lock the composers): a stop that begins after a send would
+/// cut that turn off.
+pub fn stop_if_still_idle(
+    cloud: &CloudSessions,
+    decision: &Decision,
+    busy: &dyn AppBusy,
+) -> StopOutcome {
     let target = &decision.cloud;
+    if busy.working_on(target) {
+        return StopOutcome::InUse;
+    }
     // The cached state can lag a stop done elsewhere; one fresh read before the real call.
     cloud.invalidate_ref(target);
     match cloud.cloud_state_of(target) {
         CloudState::Available => {}
         _ => return StopOutcome::NotRunning,
     }
+    // The state read takes seconds: look at the sessions and the app again after it.
     let sessions = cloud.sessions_on(target);
-    let in_use = match decision.reason {
-        Reason::Idle { .. } => sessions.iter().any(|s| s.busy()),
-        Reason::Unused => !sessions.is_empty(),
-    };
+    let in_use = busy.working_on(target)
+        || match decision.reason {
+            Reason::Idle { .. } => sessions.iter().any(|s| s.busy() || busy.session_busy(s.id)),
+            Reason::Unused => !sessions.is_empty(),
+        };
     if in_use {
         return StopOutcome::InUse;
     }

@@ -796,6 +796,17 @@ pub(crate) struct Shell {
     _auto_stop_clock: gpui::Task<()>,
     /// Workspaces (`CloudRef::key`) whose auto-stop worker runs now.
     auto_stop_running: HashSet<String>,
+    /// Workspaces whose last automatic stop failed and was already shown in the error line.
+    auto_stop_failed: HashSet<String>,
+    /// Terminals running a shell on a cloud workspace, with whether the user asked for it (the
+    /// session menu) as opposed to the app opening a codespace's panel shell by itself. Activity
+    /// for the auto-stop while open (and, for the app's own, once typed in). Weak, so closing
+    /// one in the dock drops it.
+    cloud_terminals: Vec<(
+        monocode_core::cloud_sessions::CloudRef,
+        gpui::WeakEntity<crate::terminal::Terminal>,
+        bool,
+    )>,
     sessions: HashMap<i64, Entity<Conversation>>,
     /// Sessions that run as their provider's CLI. A session is in exactly one of
     /// this map and `sessions`; a terminal session never gets a `Conversation`.
@@ -1287,6 +1298,8 @@ impl Shell {
             auto_stop_epoch: std::time::Instant::now(),
             _auto_stop_clock: auto_stop_clock,
             auto_stop_running: HashSet::new(),
+            auto_stop_failed: HashSet::new(),
+            cloud_terminals: Vec::new(),
             sessions: HashMap::new(),
             tui_sessions: HashMap::new(),
             tui_events: HashMap::new(),

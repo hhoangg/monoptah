@@ -7,6 +7,13 @@ use monocode_core::cloud_sessions::{
     auto_stop::{DEFAULT_SANDBOX_IDLE_MINUTES, IDLE_CHOICES},
 };
 
+// These are Monoptah's own rule (it stops the workspace). They are worded apart from the
+// per-project "Stop when idle" of the cloud settings, which is GitHub's codespace timeout.
+const SANDBOX_IDLE: &str = "Auto-stop sandboxes after inactivity";
+const CODESPACE_IDLE: &str = "Auto-stop codespaces after inactivity";
+const SANDBOX_UNUSED: &str = "Auto-stop a sandbox when its last session is gone";
+const CODESPACE_UNUSED: &str = "Auto-stop a codespace when its last session is gone";
+
 /// `off`, then each [`IDLE_CHOICES`] in minutes.
 const OPTIONS: [(&str, &str); 5] = [
     ("off", "Off"),
@@ -39,16 +46,16 @@ impl SettingsView {
             self.row(
                 Some("cloud-auto-stop-sandbox"),
                 true,
-                "Stop Docker sandboxes when idle",
+                SANDBOX_IDLE,
                 Some(
                     format!(
-                        "A sandbox bills per runtime second until its runtime limit ends it. Stopped after this long with no turn running, nothing queued or starting, and no typing. Default {DEFAULT_SANDBOX_IDLE_MINUTES} min."
+                        "A sandbox bills per runtime second until its runtime limit ends it. Monoptah stops it after this long with no turn running, nothing queued or starting, no typing and no terminal open on it. Default {DEFAULT_SANDBOX_IDLE_MINUTES} min."
                     )
                     .into(),
                 ),
                 vec![self.segmented(
                     "cloud-auto-stop-sandbox",
-                    "Stop Docker sandboxes when idle",
+                    SANDBOX_IDLE,
                     &option_of(sandbox.idle_minutes),
                     &OPTIONS,
                     cx,
@@ -62,14 +69,14 @@ impl SettingsView {
             self.row(
                 Some("cloud-auto-stop-sandbox-unused"),
                 false,
-                "Stop a sandbox when its last session is archived or deleted",
+                SANDBOX_UNUSED,
                 Some(
-                    "Waits a few minutes first, so a sandbox you chose to keep running is not cut off at once."
+                    "Gone means archived or deleted. Waits a few minutes first. A sandbox you kept running when archiving, or removed from Monoptah, is left alone."
                         .into(),
                 ),
                 vec![self.toggle(
                     "cloud-auto-stop-sandbox-unused",
-                    "Stop a sandbox when its last session is archived or deleted",
+                    SANDBOX_UNUSED,
                     sandbox.stop_when_unused,
                     false,
                     cx,
@@ -81,14 +88,14 @@ impl SettingsView {
             self.row(
                 Some("cloud-auto-stop-codespace"),
                 false,
-                "Stop codespaces when idle",
+                CODESPACE_IDLE,
                 Some(
-                    "Off by default: GitHub already idles a codespace out after 30 minutes. Turn it on to stop sooner."
+                    "Off by default: GitHub already idles a codespace out after its own timeout (Stop when idle in the cloud settings of a project). Turn this on to have Monoptah stop it sooner, by the same rules as sandboxes."
                         .into(),
                 ),
                 vec![self.segmented(
                     "cloud-auto-stop-codespace",
-                    "Stop codespaces when idle",
+                    CODESPACE_IDLE,
                     &option_of(codespace.idle_minutes),
                     &OPTIONS,
                     cx,
@@ -102,11 +109,14 @@ impl SettingsView {
             self.row(
                 Some("cloud-auto-stop-codespace-unused"),
                 false,
-                "Stop a codespace when its last session is archived or deleted",
-                None,
+                CODESPACE_UNUSED,
+                Some(
+                    "A codespace you kept running when archiving, or removed from Monoptah, is left alone."
+                        .into(),
+                ),
                 vec![self.toggle(
                     "cloud-auto-stop-codespace-unused",
-                    "Stop a codespace when its last session is archived or deleted",
+                    CODESPACE_UNUSED,
                     codespace.stop_when_unused,
                     false,
                     cx,
@@ -121,7 +131,7 @@ impl SettingsView {
             false,
             "Cost control",
             Some(
-                "Monoptah stops a workspace that is no longer needed, and only stops it: nothing is deleted and your work is kept. Send a message in its session to resume it. Workspaces without a Monoptah session are never stopped here; use Cloud workspaces for those."
+                "Monoptah stops a workspace that is no longer needed, and only stops it: nothing is deleted and your work is kept. Send a message in its session to resume it. A turn that is running, a queued message, an unsaved copy or an open terminal keeps a workspace running. Workspaces without a Monoptah session are never stopped here; use Cloud workspaces for those."
                     .into(),
             ),
             None,

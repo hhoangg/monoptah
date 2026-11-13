@@ -274,6 +274,9 @@ pub struct Input {
     /// The next edit is Backspace/Delete removing one grapheme.
     char_delete: bool,
     prompt_history: Option<prompt_history::PromptHistory>,
+    /// Counts the edits the user made (typing, IME, paste, undo, prompt recall), never
+    /// `set_text`/`take`/placeholder changes, so a watcher can tell typing from a notify.
+    user_edits: u64,
 }
 impl EventEmitter<Submitted> for Input {}
 impl EventEmitter<AlternateSubmitted> for Input {}
@@ -349,6 +352,7 @@ impl Input {
             drag_position: None,
             autoscroll: None,
             edits: Default::default(),
+            user_edits: 0,
             edit_step: false,
             char_delete: false,
             prompt_history: None,
@@ -602,6 +606,10 @@ impl Input {
         self.reversed = false;
         cx.notify();
     }
+    /// How many edits the user has made here so far; see the field.
+    pub(crate) fn user_edits(&self) -> u64 {
+        self.user_edits
+    }
     pub fn take(&mut self, cx: &mut Context<Self>) -> Option<String> {
         if self.is_composing() || self.content.trim().is_empty() {
             return None;
@@ -687,6 +695,7 @@ impl Input {
     }
     /// Put back text and selection from undo, redo or prompt recall.
     fn restore_snapshot(&mut self, snapshot: edit_history::Snapshot, cx: &mut Context<Self>) {
+        self.user_edits += 1;
         self.manual_scroll = false;
         self.reveal_pending = self.reveal_in_parent;
         let previous_command = self
@@ -1462,6 +1471,7 @@ impl EntityInputHandler for Input {
         if self.read_only {
             return;
         }
+        self.user_edits += 1;
         self.manual_scroll = false;
         self.reveal_pending = self.reveal_in_parent;
         let mut r = self.replacement_range(r);
@@ -1568,6 +1578,7 @@ impl EntityInputHandler for Input {
         if self.read_only {
             return;
         }
+        self.user_edits += 1;
         self.manual_scroll = false;
         self.reveal_pending = self.reveal_in_parent;
         let r = self.replacement_range(r);

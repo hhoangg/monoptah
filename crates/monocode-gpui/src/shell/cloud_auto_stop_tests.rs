@@ -20,13 +20,19 @@ const CODESPACE: &str = "octo-abc";
 struct Gh {
     state: Mutex<&'static str>,
     calls: Mutex<Vec<String>>,
+    fail_stop: std::sync::atomic::AtomicBool,
 }
 impl Gh {
     fn new(state: &'static str) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(state),
             calls: Mutex::new(vec![]),
+            fail_stop: Default::default(),
         })
+    }
+    fn fail_stops(&self, fail: bool) {
+        self.fail_stop
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
     }
     fn stops(&self) -> usize {
         self.calls
@@ -44,6 +50,15 @@ impl GhRunner for Gh {
     fn run(&self, args: &[String], _: Option<&str>) -> Result<GhOutput, String> {
         let line = args.join(" ");
         self.calls.lock().unwrap().push(line.clone());
+        if line.starts_with("codespace stop")
+            && self.fail_stop.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(GhOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: "gh: HTTP 500 (the token expired)".into(),
+            });
+        }
         let stdout = if line.starts_with("codespace view") {
             format!(r#"{{"state":"{}"}}"#, self.state.lock().unwrap())
         } else {
@@ -382,4 +397,388 @@ fn the_facts_leave_out_archived_sessions_and_mark_missing_data_unknown(cx: &mut 
             assert!(shell.auto_stop_facts(cx).is_empty());
         })
         .unwrap();
+}
+
+/// A conversation of the window put on the workspace of `world`, so there is a live view to lock.
+fn live_view(window: gpui::WindowHandle<Shell>, cx: &mut TestAppContext) -> i64 {
+    window
+        .update(cx, |shell, _, cx| {
+            let live = *shell.sessions.keys().next().unwrap();
+            shell.sessions[&live].update(cx, |view, _| view.loaded_for_test());
+            shell.cloud_marks.insert(
+                live,
+                CloudMark {
+                    local_project: "/work/monocode".into(),
+                    codespace: CODESPACE.into(),
+                    kind: CloudBackendKind::Codespaces,
+                },
+            );
+            live
+        })
+        .unwrap()
+}
+
+#[gpui::test]
+fn nothing_can_start_on_the_workspace_while_the_worker_stops_it(cx: &mut TestAppContext) {
+    let (window, _, gh) = world(cx, "Available", Some(10));
+    let live = live_view(window, cx);
+    check_at(window, 0, cx);
+    // The decision is made and the worker is spawned, but has not run yet: this is the window
+    // in which a send used to slip through.
+    window
+        .update(cx, |shell, window, cx| {
+            shell.auto_stop_epoch = std::time::Instant::now() - Duration::from_secs(11 * 60);
+            shell.check_auto_stop(cx);
+            assert!(shell.auto_stop_running.contains(CODESPACE));
+            // Archive, delete, continue and the cloud.* actions see the workspace as held.
+            assert!(shell.cloud_workspaces_busy.contains(CODESPACE));
+            // A send from the composer is refused, with the reason and the text kept.
+            let view = shell.sessions[&live].clone();
+            assert!(view.update(cx, |v, cx| v.refuse_while_saving_copy(cx)));
+            // So is a Mono / app turn.
+            let sent = view.update(cx, |v, cx| v.mono_external_send("hi".into(), false, cx));
+            assert_eq!(sent, Err(crate::conversation::AUTO_STOPPING.to_owned()));
+            // And a new terminal on it, which would be cut off or wake it again.
+            let id = shell.cloud_marks.keys().copied().min().unwrap();
+            shell.error = None;
+            shell.new_cloud_terminal(id, window, cx);
+            assert_eq!(shell.error.as_deref(), Some(super::cloud::WORKSPACE_BUSY));
+            assert!(shell.cloud_terminals.is_empty());
+        })
+        .unwrap();
+    assert_eq!(gh.stops(), 0, "the worker has not run yet");
+    cx.run_until_parked();
+    assert_eq!(gh.stops(), 1);
+    // Everything is released when the stop is over; the next send resumes the workspace.
+    window
+        .update(cx, |shell, _, cx| {
+            assert!(!shell.cloud_workspaces_busy.contains(CODESPACE));
+            assert!(!shell.auto_stop_running.contains(CODESPACE));
+            let view = shell.sessions[&live].clone();
+            assert!(!view.update(cx, |v, cx| v.refuse_while_saving_copy(cx)));
+            assert!(!view.read(cx).auto_stopping);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_turn_the_stored_flags_do_not_show_yet_stops_nothing(cx: &mut TestAppContext) {
+    // The decision is made on a tick; the live view shows a turn that the stored flags (polled
+    // every 30 s) do not have. The worker gets the live snapshot and leaves the workspace.
+    let (window, id, gh) = world(cx, "Available", Some(10));
+    check_at(window, 0, cx);
+    window
+        .update(cx, |shell, _, cx| {
+            let view = shell.ensure_session(id, cx).unwrap();
+            view.update(cx, |view, _| {
+                view.loaded_for_test();
+                view.busy = true;
+            });
+            assert!(shell.cloud_busy_snapshot(cx).sessions.contains(&id));
+            // Pretend the facts were gathered a moment earlier, when it was still idle.
+            let decision = monocode_core::cloud_sessions::auto_stop::Decision {
+                cloud: monocode_core::cloud_sessions::CloudRef::codespace(CODESPACE),
+                reason: monocode_core::cloud_sessions::auto_stop::Reason::Idle { minutes: 10 },
+            };
+            shell.run_auto_stop(decision, cx);
+            assert_eq!(shell.remote_marks.get(&id), None);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(gh.stops(), 0);
+    window
+        .update(cx, |shell, _, _| {
+            assert!(!shell.cloud_workspaces_busy.contains(CODESPACE));
+            assert!(shell.notice.is_none());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn an_open_cloud_terminal_keeps_the_workspace_running_until_it_is_closed(cx: &mut TestAppContext) {
+    let (window, _, gh) = world(cx, "Available", Some(10));
+    check_at(window, 0, cx);
+    let terminal = window
+        .update(cx, |shell, _, cx| {
+            shell.spawn_codespace_terminal(CODESPACE, true, cx)
+        })
+        .unwrap();
+    // Hours of a dev server, with nobody typing in the composer.
+    for minute in [11, 60, 600] {
+        check_at(window, minute, cx);
+    }
+    assert_eq!(gh.stops(), 0);
+    // The shell ends: the window starts from there, as for any activity.
+    terminal.update(cx, |t, cx| t.fake_exit(Some(0), cx));
+    check_at(window, 601, cx);
+    check_at(window, 605, cx);
+    assert_eq!(gh.stops(), 0);
+    check_at(window, 612, cx);
+    assert_eq!(gh.stops(), 1);
+}
+
+#[gpui::test]
+fn a_closed_cloud_terminal_no_longer_counts(cx: &mut TestAppContext) {
+    let (window, _, gh) = world(cx, "Available", Some(10));
+    check_at(window, 0, cx);
+    let terminal = window
+        .update(cx, |shell, _, cx| {
+            let terminal = shell.spawn_codespace_terminal(CODESPACE, true, cx);
+            assert_eq!(shell.open_cloud_terminals(cx).len(), 1);
+            terminal
+        })
+        .unwrap();
+    // Closed from the dock: the last handle goes away and the entity is released.
+    drop(terminal);
+    window
+        .update(cx, |shell, _, cx| {
+            assert!(shell.open_cloud_terminals(cx).is_empty())
+        })
+        .unwrap();
+    check_at(window, 1, cx);
+    check_at(window, 12, cx);
+    assert_eq!(gh.stops(), 1);
+}
+
+#[gpui::test]
+fn an_open_terminal_holds_a_workspace_whose_sessions_are_gone(cx: &mut TestAppContext) {
+    let (window, id, gh) = world(cx, "Available", None);
+    window
+        .update(cx, |shell, _, _| {
+            shell
+                .workspace
+                .preferences
+                .cloud_auto_stop
+                .codespace
+                .stop_when_unused = true;
+        })
+        .unwrap();
+    check_at(window, 0, cx);
+    let terminal = window
+        .update(cx, |shell, _, cx| {
+            let terminal = shell.spawn_codespace_terminal(CODESPACE, true, cx);
+            locked(&shell.store).unwrap().delete(id).unwrap();
+            shell.cloud_marks.remove(&id);
+            shell.session_summaries.remove(&id);
+            shell.order.retain(|other| *other != id);
+            terminal
+        })
+        .unwrap();
+    for minute in [2, 10, 60, 300] {
+        check_at(window, minute, cx);
+    }
+    assert_eq!(gh.stops(), 0, "a shell is still open on it");
+    terminal.update(cx, |t, cx| t.fake_exit(Some(0), cx));
+    check_at(window, 301, cx);
+    check_at(window, 304, cx);
+    assert_eq!(gh.stops(), 0, "inside the grace");
+    check_at(window, 307, cx);
+    assert_eq!(gh.stops(), 1);
+}
+
+#[gpui::test]
+fn keep_running_in_the_archive_dialog_is_not_overridden_by_the_unused_rule(
+    cx: &mut TestAppContext,
+) {
+    let (window, id, gh) = world(cx, "Available", None);
+    window
+        .update(cx, |shell, _, _| {
+            shell
+                .workspace
+                .preferences
+                .cloud_auto_stop
+                .codespace
+                .stop_when_unused = true;
+        })
+        .unwrap();
+    check_at(window, 0, cx);
+    window
+        .update(cx, |shell, window, cx| {
+            shell.open_cloud_archive(vec![id], window, cx);
+            shell.confirm_cloud_archive(super::cloud::ArchiveChoice::Keep, window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    for minute in [1, 6, 12, 60, 600] {
+        check_at(window, minute, cx);
+    }
+    assert_eq!(gh.stops(), 0, "the user chose to keep it running");
+}
+
+#[gpui::test]
+fn without_a_keep_choice_the_unused_rule_still_stops_an_archived_workspace(
+    cx: &mut TestAppContext,
+) {
+    // Control for the test above: without the Keep choice the same flow does stop it.
+    let (window, id, gh) = world(cx, "Available", None);
+    window
+        .update(cx, |shell, _, _| {
+            shell
+                .workspace
+                .preferences
+                .cloud_auto_stop
+                .codespace
+                .stop_when_unused = true;
+        })
+        .unwrap();
+    check_at(window, 0, cx);
+    window
+        .update(cx, |shell, _, cx| {
+            shell.toggle_archive_now(id, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    for minute in [1, 6, 8] {
+        check_at(window, minute, cx);
+    }
+    assert_eq!(gh.stops(), 1);
+}
+
+#[gpui::test]
+fn removing_a_session_from_monoptah_leaves_its_workspace_running(cx: &mut TestAppContext) {
+    let (window, id, gh) = world(cx, "Available", None);
+    window
+        .update(cx, |shell, _, _| {
+            shell
+                .workspace
+                .preferences
+                .cloud_auto_stop
+                .codespace
+                .stop_when_unused = true;
+        })
+        .unwrap();
+    check_at(window, 0, cx);
+    window
+        .update(cx, |shell, window, cx| {
+            shell.remove_cloud_session_locally(id, window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, _| {
+            assert!(!shell.cloud_marks.contains_key(&id))
+        })
+        .unwrap();
+    for minute in [1, 6, 12, 60, 600] {
+        check_at(window, minute, cx);
+    }
+    assert_eq!(gh.stops(), 0, "its confirmation says it keeps running");
+}
+
+#[gpui::test]
+fn a_failed_stop_is_shown_once_per_workspace_and_logged_every_time(cx: &mut TestAppContext) {
+    let (window, _, gh) = world(cx, "Available", Some(10));
+    gh.fail_stops(true);
+    check_at(window, 0, cx);
+    check_at(window, 11, cx);
+    assert_eq!(gh.stops(), 1);
+    window
+        .update(cx, |shell, _, _| {
+            let error = shell.error.clone().unwrap();
+            assert!(
+                error.contains(&format!("Could not stop codespace {CODESPACE}")),
+                "{error}"
+            );
+            assert!(error.contains("token expired"), "{error}");
+            assert!(error.contains("still running"), "{error}");
+            assert_eq!(shell.cloud_states[CODESPACE], CloudState::Available);
+            // Released: the user can work and the workspace is not held.
+            assert!(!shell.cloud_workspaces_busy.contains(CODESPACE));
+            // The user dismisses it.
+            shell.error = None;
+        })
+        .unwrap();
+    // The retry a window later fails again: no second banner.
+    check_at(window, 22, cx);
+    assert_eq!(gh.stops(), 2);
+    window
+        .update(cx, |shell, _, _| assert!(shell.error.is_none()))
+        .unwrap();
+    // It works at last: the notice, and a later failure is shown again.
+    gh.fail_stops(false);
+    check_at(window, 33, cx);
+    assert_eq!(gh.stops(), 3);
+    window
+        .update(cx, |shell, _, _| {
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .is_some_and(|n| n.starts_with("Stopped codespace"))
+            );
+            assert!(shell.auto_stop_failed.is_empty());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn typing_counts_as_input_but_other_notifies_of_the_composer_do_not(cx: &mut TestAppContext) {
+    let (window, _, _) = world(cx, "Available", Some(10));
+    let live = live_view(window, cx);
+    let input = window
+        .update(cx, |shell, _, cx| {
+            shell.sessions[&live].read(cx).input.clone()
+        })
+        .unwrap();
+    let last = |window: gpui::WindowHandle<Shell>, cx: &mut TestAppContext| {
+        window
+            .update(cx, |shell, _, cx| {
+                shell.sessions[&live]
+                    .read(cx)
+                    .auto_stop_facts(shell.auto_stop_epoch)
+                    .last_input
+            })
+            .unwrap()
+    };
+    // Programmatic notifies: a placeholder, `set_text`, a plain notify.
+    window
+        .update(cx, |_, window, cx| {
+            input.update(cx, |input, cx| {
+                input.set_text("restored draft".into(), cx);
+                cx.notify();
+            });
+            let _ = window;
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(last(window, cx), None, "not the user");
+    // A keystroke: an edit through the input handler.
+    window
+        .update(cx, |_, window, cx| {
+            input.update(cx, |input, cx| {
+                use gpui::EntityInputHandler;
+                input.replace_text_in_range(None, "x", window, cx)
+            });
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(last(window, cx).is_some(), "typing counts");
+}
+
+#[gpui::test]
+fn a_panel_shell_the_app_opened_holds_the_workspace_only_once_it_is_typed_in(
+    cx: &mut TestAppContext,
+) {
+    let (window, _, gh) = world(cx, "Available", Some(10));
+    check_at(window, 0, cx);
+    let terminal = window
+        .update(cx, |shell, _, cx| {
+            // What `ensure_panel_terminal` does by itself when a codespace session is shown.
+            let terminal = shell.spawn_codespace_terminal(CODESPACE, false, cx);
+            assert!(shell.open_cloud_terminals(cx).is_empty());
+            terminal
+        })
+        .unwrap();
+    // Nobody touched it: it is a prompt, not work. The idle rule still works.
+    check_at(window, 5, cx);
+    terminal.update(cx, |t, cx| t.run("npm run dev", cx));
+    window
+        .update(cx, |shell, _, cx| {
+            assert_eq!(shell.open_cloud_terminals(cx).len(), 1)
+        })
+        .unwrap();
+    for minute in [11, 120] {
+        check_at(window, minute, cx);
+    }
+    assert_eq!(gh.stops(), 0);
 }

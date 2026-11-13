@@ -5,10 +5,23 @@ use super::*;
 use monocode_core::cloud_sessions::auto_stop::SessionFacts;
 use std::time::Instant;
 
+/// Why a send is refused while the shell stops this session's workspace (cost control). Nothing
+/// is lost: the typed text stays in the composer and the next send resumes the workspace.
+pub(crate) const AUTO_STOPPING: &str = "Monoptah is stopping this workspace after it sat idle. \
+     Nothing was sent; send again in a moment and it will resume.";
+
 impl Conversation {
-    /// The user typed, sent or clicked Resume in this conversation just now.
+    /// The user typed (an edit of the composer, not any notify of it), sent or clicked Resume in
+    /// this conversation just now.
     pub(super) fn note_user_input(&mut self) {
         self.last_user_input = Some(Instant::now());
+    }
+
+    /// Test support: the conversation finished loading, so it is not "pending" for the policy.
+    #[cfg(test)]
+    pub(crate) fn loaded_for_test(&mut self) {
+        self.loaded = true;
+        self.loading = false;
     }
 
     /// The facts the policy needs, on the clock of `epoch` (seconds since it).

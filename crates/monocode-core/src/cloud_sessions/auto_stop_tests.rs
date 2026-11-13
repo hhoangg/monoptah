@@ -3,6 +3,8 @@
 use super::auto_stop::*;
 use super::*;
 use crate::codespaces::{GhOutput, GhRunner};
+use crate::mono::cloud_api::AppBusy;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const MIN: u64 = 60;
 
@@ -322,15 +324,21 @@ impl Host for NoHost {
 
 /// A sandbox backend that remembers its state and every call.
 struct Scripted {
+    /// Set when `state` is read: the app gets busy while the backend answers.
+    on_state: Mutex<Option<Arc<AtomicBool>>>,
     state: Mutex<String>,
     calls: Mutex<Vec<String>>,
 }
 impl Scripted {
     fn new(state: &str) -> Arc<Self> {
         Arc::new(Self {
+            on_state: Mutex::new(None),
             state: Mutex::new(state.into()),
             calls: Mutex::new(vec![]),
         })
+    }
+    fn on_state(&self, flag: Arc<AtomicBool>) {
+        *self.on_state.lock().unwrap() = Some(flag);
     }
     fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
@@ -364,6 +372,9 @@ impl CloudBackend for Scripted {
     }
     fn state(&self, name: &str) -> Result<String, String> {
         self.calls.lock().unwrap().push(format!("state {name}"));
+        if let Some(flag) = self.on_state.lock().unwrap().as_ref() {
+            flag.store(true, Ordering::SeqCst);
+        }
         Ok(self.state.lock().unwrap().clone())
     }
     fn exists(&self, _: &str) -> Result<bool, String> {
@@ -414,6 +425,37 @@ fn world(state: &str, with_session: bool) -> (CloudSessions, Arc<Scripted>) {
     }
     (svc, backend)
 }
+/// The app has nothing of its own going on.
+struct Nothing;
+impl AppBusy for Nothing {
+    fn working_on(&self, _: &CloudRef) -> bool {
+        false
+    }
+}
+/// What the UI thread knows: an archive or a terminal on the workspace, sessions mid-turn in a
+/// live view, and (`late`) something that only shows up while the worker reads the state.
+struct App {
+    working: bool,
+    sessions: Vec<i64>,
+    late: Arc<AtomicBool>,
+}
+impl App {
+    fn new() -> Self {
+        Self {
+            working: false,
+            sessions: vec![],
+            late: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+impl AppBusy for App {
+    fn working_on(&self, _: &CloudRef) -> bool {
+        self.working || self.late.load(Ordering::SeqCst)
+    }
+    fn session_busy(&self, id: i64) -> bool {
+        self.sessions.contains(&id)
+    }
+}
 fn idle() -> Decision {
     Decision {
         cloud: sandbox(),
@@ -430,10 +472,16 @@ fn unused() -> Decision {
 #[test]
 fn the_worker_stops_a_running_idle_workspace_with_one_call_and_never_deletes_or_wakes() {
     let (svc, backend) = world("Available", true);
-    assert_eq!(stop_if_still_idle(&svc, &idle()), StopOutcome::Stopped);
+    assert_eq!(
+        stop_if_still_idle(&svc, &idle(), &Nothing),
+        StopOutcome::Stopped
+    );
     assert_eq!(backend.stops(), 1);
     // The next decision for the same workspace finds it stopped: no second stop call.
-    assert_eq!(stop_if_still_idle(&svc, &idle()), StopOutcome::NotRunning);
+    assert_eq!(
+        stop_if_still_idle(&svc, &idle(), &Nothing),
+        StopOutcome::NotRunning
+    );
     assert_eq!(backend.stops(), 1);
     assert_eq!(svc.cloud_state_of(&sandbox()), CloudState::Stopped);
 }
@@ -442,7 +490,10 @@ fn the_worker_stops_a_running_idle_workspace_with_one_call_and_never_deletes_or_
 fn the_worker_leaves_a_stopped_or_unreadable_workspace_alone() {
     for state in ["Stopped", "Broken"] {
         let (svc, backend) = world(state, true);
-        assert_eq!(stop_if_still_idle(&svc, &idle()), StopOutcome::NotRunning);
+        assert_eq!(
+            stop_if_still_idle(&svc, &idle(), &Nothing),
+            StopOutcome::NotRunning
+        );
         assert_eq!(backend.stops(), 0, "{state}");
     }
 }
@@ -451,10 +502,132 @@ fn the_worker_leaves_a_stopped_or_unreadable_workspace_alone() {
 fn the_worker_refuses_an_unused_stop_while_a_session_still_uses_the_workspace() {
     // The window forgot it (a closed project), but the store still has a session on it.
     let (svc, backend) = world("Available", true);
-    assert_eq!(stop_if_still_idle(&svc, &unused()), StopOutcome::InUse);
+    assert_eq!(
+        stop_if_still_idle(&svc, &unused(), &Nothing),
+        StopOutcome::InUse
+    );
     assert_eq!(backend.stops(), 0);
     // With none left, it stops.
     let (svc, backend) = world("Available", false);
-    assert_eq!(stop_if_still_idle(&svc, &unused()), StopOutcome::Stopped);
+    assert_eq!(
+        stop_if_still_idle(&svc, &unused(), &Nothing),
+        StopOutcome::Stopped
+    );
     assert_eq!(backend.stops(), 1);
+}
+
+#[test]
+fn the_worker_never_calls_the_backend_while_the_app_works_on_the_workspace() {
+    // An archive, a delete, a terminal open on it: the key is held by the app.
+    let (svc, backend) = world("Available", true);
+    let app = App {
+        working: true,
+        ..App::new()
+    };
+    for decision in [idle(), unused()] {
+        assert_eq!(
+            stop_if_still_idle(&svc, &decision, &app),
+            StopOutcome::InUse
+        );
+    }
+    assert!(backend.calls().is_empty(), "{:?}", backend.calls());
+}
+
+#[test]
+fn the_worker_sees_a_turn_the_stored_flags_do_not_show_yet() {
+    // The send started a second ago: the store still says not running (it lags by up to 30 s),
+    // the live view knows. This is the send that raced the decision.
+    let (svc, backend) = world("Available", true);
+    let id = svc.sessions_on(&sandbox())[0].id;
+    assert!(!svc.sessions_on(&sandbox())[0].busy());
+    let app = App {
+        sessions: vec![id],
+        ..App::new()
+    };
+    assert_eq!(stop_if_still_idle(&svc, &idle(), &app), StopOutcome::InUse);
+    assert_eq!(backend.stops(), 0);
+    // A live session elsewhere does not hold this workspace.
+    let other = App {
+        sessions: vec![id + 100],
+        ..App::new()
+    };
+    assert_eq!(
+        stop_if_still_idle(&svc, &idle(), &other),
+        StopOutcome::Stopped
+    );
+}
+
+#[test]
+fn the_worker_looks_at_the_app_again_after_the_slow_state_read() {
+    // Something appears while `sbx` answers: the check right before the stop call sees it.
+    struct Slow(Arc<AtomicBool>);
+    impl AppBusy for Slow {
+        fn working_on(&self, _: &CloudRef) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+    let (svc, backend) = world("Available", true);
+    let late = Arc::new(AtomicBool::new(false));
+    backend.on_state(late.clone());
+    assert_eq!(
+        stop_if_still_idle(&svc, &idle(), &Slow(late)),
+        StopOutcome::InUse
+    );
+    assert_eq!(backend.stops(), 0);
+}
+
+#[test]
+fn keeping_a_workspace_running_means_it_is_never_stopped_for_being_unused() {
+    let mut engine = AutoStop::new();
+    assert!(run(&mut engine, &prefs(), 0, 3, &running()).is_empty());
+    // The user archived the last session with "Keep running" (or removed it from the app).
+    engine.keep_running(&sandbox());
+    assert!(run(&mut engine, &prefs(), 4, 600, &[]).is_empty());
+    // Other sessions on it that come and go later do not bring the rule back either.
+    assert!(run(&mut engine, &prefs(), 601, 603, &running()).is_empty());
+    assert!(run(&mut engine, &prefs(), 1000, 2000, &[]).is_empty());
+}
+
+#[test]
+fn a_kept_workspace_is_stopped_again_for_being_unused_once_the_user_resumes_it() {
+    let mut engine = AutoStop::new();
+    assert!(run(&mut engine, &prefs(), 0, 3, &running()).is_empty());
+    engine.keep_running(&sandbox());
+    assert!(run(&mut engine, &prefs(), 4, 100, &[]).is_empty());
+    // The user resumes it from a session, so it is in use again, then ends that session.
+    engine.resumed(&sandbox(), 101 * MIN);
+    assert!(run(&mut engine, &prefs(), 101, 102, &running()).is_empty());
+    let found = run(&mut engine, &prefs(), 103, 200, &[]);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].1.reason, Reason::Unused);
+}
+
+#[test]
+fn keeping_one_workspace_leaves_the_others_on_the_default_rule() {
+    let mut engine = AutoStop::new();
+    let other = CloudRef::sandbox("monoptah-2");
+    let both = vec![
+        workspace(sandbox(), vec![session(1)]),
+        workspace(other.clone(), vec![session(2)]),
+    ];
+    assert!(run(&mut engine, &prefs(), 0, 3, &both).is_empty());
+    engine.keep_running(&sandbox());
+    let found = run(&mut engine, &prefs(), 4, 60, &[]);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].1.cloud, other);
+}
+
+#[test]
+fn an_open_terminal_keeps_a_workspace_with_no_session_in_the_facts() {
+    // The shell lists a workspace held only by a terminal as working, with no session: it is
+    // not idle, and not "unused" either, until the terminal is closed.
+    let mut engine = AutoStop::new();
+    assert!(run(&mut engine, &prefs(), 0, 3, &running()).is_empty());
+    let mut held = workspace(sandbox(), vec![]);
+    held.app_working = true;
+    assert!(run(&mut engine, &prefs(), 4, 300, &[held]).is_empty());
+    // The terminal is closed at minute 301: the unused grace counts from there.
+    let found = run(&mut engine, &prefs(), 301, 330, &[]);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].0 >= 306, "{found:?}");
 }

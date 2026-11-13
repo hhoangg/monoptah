@@ -7,9 +7,16 @@
 //! `CloudSessions::stop_cloud`, the path every other Stop uses. The workspace then reads
 //! Stopped, so the conversation offers Resume, and the user's next send wakes it as before.
 //! Nothing here ever wakes a workspace, and nothing here deletes one.
+//!
+//! The worker takes seconds, so for that long the shell holds the workspace the way an
+//! archive does: its key is in `cloud_workspaces_busy` (archive, delete, continue and the
+//! `cloud.*` actions refuse), the composers of its sessions are locked (`auto_stopping`: a send
+//! or an app/Mono turn is refused with a clear message and the typed text stays), and the worker
+//! gets the same busy snapshot `cloud.stop` gets. Open cloud terminals count as activity.
+//! A failed stop is shown in the window's error line, once per workspace until one works.
 use super::*;
 use monocode_core::cloud_sessions::{
-    CloudState,
+    CloudRef, CloudState,
     auto_stop::{
         CHECK_EVERY_SECS, Decision, SessionFacts, StopOutcome, WorkspaceFacts, stop_if_still_idle,
     },
@@ -48,6 +55,7 @@ impl Shell {
             .as_ref()
             .map(|dialog| dialog.groups.iter().map(|g| g.cloud().key()).collect())
             .unwrap_or_default();
+        let terminals = self.open_cloud_terminals(cx);
         let mut by_key: HashMap<String, WorkspaceFacts> = HashMap::new();
         let mut ids: Vec<i64> = self.cloud_marks.keys().copied().collect();
         ids.sort_unstable();
@@ -63,6 +71,7 @@ impl Shell {
                     .unwrap_or(CloudState::Unknown),
                 sessions: Vec::new(),
                 app_working: unsaved
+                    || terminals.contains_key(&key)
                     || self.cloud_workspaces_busy.contains(&key)
                     || self.cloud_return_cleanup.running.contains(&key)
                     || self.cloud_continue.dialog.is_some()
@@ -104,14 +113,64 @@ impl Shell {
                     .is_some_and(|l| l.sync_error.is_some() || l.unsynced || l.host_active);
             workspace.sessions.push(facts);
         }
+        // A terminal open on a workspace holds it even when every session on it is archived or
+        // gone (a dev server, a build): it stays in the facts, as working, until it is closed.
+        for (key, cloud) in &terminals {
+            by_key
+                .entry(key.clone())
+                .or_insert_with(|| WorkspaceFacts {
+                    cloud: cloud.clone(),
+                    state: self
+                        .cloud_states
+                        .get(key)
+                        .copied()
+                        .unwrap_or(CloudState::Unknown),
+                    sessions: Vec::new(),
+                    app_working: true,
+                })
+                .app_working = true;
+        }
         // A workspace whose sessions are all archived is not used any more: leave it out, so
         // the policy sees it vanish.
         let mut found: Vec<WorkspaceFacts> = by_key
             .into_values()
-            .filter(|w| !w.sessions.is_empty())
+            .filter(|w| !w.sessions.is_empty() || terminals.contains_key(&w.cloud.key()))
             .collect();
         found.sort_by_key(|w| w.cloud.key());
         found
+    }
+
+    /// Cloud terminals that hold their workspace, by workspace key: still open (the process has
+    /// not exited) and either opened by the user or typed in. The app opens a codespace's panel
+    /// shell by itself when its dock is shown; one nobody touched is not use, or no codespace
+    /// would ever be stopped. A dropped terminal, closed from the dock, no longer upgrades.
+    /// A quiet process in a shell (a dev server) cannot be told from a forgotten prompt through
+    /// ssh, so an open shell holds the workspace until it is closed.
+    pub(super) fn open_cloud_terminals(&self, cx: &App) -> HashMap<String, CloudRef> {
+        self.cloud_terminals
+            .iter()
+            .filter(|(_, terminal, explicit)| {
+                terminal.upgrade().is_some_and(|terminal| {
+                    let terminal = terminal.read(cx);
+                    !terminal.exited && (*explicit || terminal.user_typed)
+                })
+            })
+            .map(|(cloud, _, _)| (cloud.key(), cloud.clone()))
+            .collect()
+    }
+
+    /// Remembers `terminal` as a shell on `cloud`, so the auto-stop counts it as activity.
+    /// `explicit`: the user asked for it (session menu).
+    pub(super) fn track_cloud_terminal(
+        &mut self,
+        cloud: CloudRef,
+        terminal: &Entity<crate::terminal::Terminal>,
+        explicit: bool,
+    ) {
+        self.cloud_terminals
+            .retain(|(_, t, _)| t.upgrade().is_some());
+        self.cloud_terminals
+            .push((cloud, terminal.downgrade(), explicit));
     }
 
     /// The once-a-minute check. A refresh in flight means the marks and states are about to
@@ -128,21 +187,49 @@ impl Shell {
         }
     }
 
-    fn run_auto_stop(&mut self, decision: Decision, cx: &mut Context<Self>) {
+    pub(super) fn run_auto_stop(&mut self, decision: Decision, cx: &mut Context<Self>) {
         let key = decision.cloud.key();
-        if !self.auto_stop_running.insert(key) {
+        // An archive, delete or continue holds the workspace: leave it, try again in a window.
+        if self.auto_stop_running.contains(&key) || self.cloud_workspaces_busy.contains(&key) {
+            let now = self.auto_stop_now();
+            self.auto_stop.finished(&decision, &StopOutcome::InUse, now);
             return;
         }
+        // What the worker may not see on its own: live turns and open terminals, read now, on
+        // this thread, before the workspace is held.
+        let mut busy = self.cloud_busy_snapshot(cx);
+        busy.workspaces
+            .extend(self.open_cloud_terminals(cx).into_keys());
+        // From here until `finish_auto_stop` nothing may start on the workspace: other actions
+        // on it refuse, and its conversations take no message (the typed text stays).
+        self.auto_stop_running.insert(key.clone());
+        self.cloud_workspaces_busy.insert(key);
+        self.lock_auto_stopping(&decision.cloud, true, cx);
         let cloud = self.cloud.clone();
         let asked = decision.clone();
         let work = cx
             .background_executor()
-            .spawn(async move { stop_if_still_idle(&cloud, &asked) });
+            .spawn(async move { stop_if_still_idle(&cloud, &asked, &busy) });
         cx.spawn(async move |this, cx| {
             let outcome = work.await;
             let _ = this.update(cx, |this, cx| this.finish_auto_stop(decision, outcome, cx));
         })
         .detach();
+    }
+
+    /// Refuses (or allows again) messages to every open conversation on `target`.
+    fn lock_auto_stopping(&mut self, target: &CloudRef, locked: bool, cx: &mut Context<Self>) {
+        let ids: Vec<i64> = self
+            .cloud_marks
+            .iter()
+            .filter(|(_, mark)| mark.cloud() == *target)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            if let Some(view) = self.sessions.get(&id) {
+                view.update(cx, |view, _| view.auto_stopping = locked);
+            }
+        }
     }
 
     pub(super) fn finish_auto_stop(
@@ -153,10 +240,13 @@ impl Shell {
     ) {
         let key = decision.cloud.key();
         self.auto_stop_running.remove(&key);
+        self.cloud_workspaces_busy.remove(&key);
+        self.lock_auto_stopping(&decision.cloud, false, cx);
         let now = self.auto_stop_now();
         self.auto_stop.finished(&decision, &outcome, now);
         match outcome {
             StopOutcome::Stopped => {
+                self.auto_stop_failed.remove(&key);
                 self.cloud_states.insert(key, CloudState::Stopped);
                 self.sync_cloud_stopped(cx);
                 self.invalidate_chrome(cx);
@@ -166,11 +256,27 @@ impl Shell {
             // The cached state was behind: read it again.
             StopOutcome::NotRunning => self.refresh_cloud(cx),
             StopOutcome::InUse => {}
-            StopOutcome::Failed(error) => crate::native_log::warn(&format!(
-                "Auto-stop of {} {} failed: {error}",
-                decision.cloud.noun(),
-                decision.cloud.name
-            )),
+            StopOutcome::Failed(error) => {
+                let message = failure_message(&decision, &error);
+                // The window says so once per workspace (a retry a window later would repeat
+                // the same line); the log keeps every failure.
+                eprintln!("{message}");
+                if self.auto_stop_failed.insert(key) {
+                    self.error = Some(message);
+                    cx.notify();
+                }
+            }
         }
     }
+}
+
+/// What the error line says when an automatic stop failed: the workspace keeps running and
+/// billing, and the user can stop it by hand.
+pub(super) fn failure_message(decision: &Decision, error: &str) -> String {
+    format!(
+        "Could not stop {} {} automatically ({error}). It is still running and may keep costing \
+         money: stop it from the session menu.",
+        decision.cloud.noun(),
+        decision.cloud.name
+    )
 }

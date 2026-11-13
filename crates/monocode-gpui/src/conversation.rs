@@ -27,6 +27,7 @@ mod cloud_branches;
 mod cloud_location;
 pub(crate) use cloud_location::CloudLocationReset;
 mod cloud_move;
+pub(crate) use auto_stop::AUTO_STOPPING;
 pub(crate) use cloud_move::{CancelCloudMove, ContinueInCloud, MOVE_PAUSED, MoveOffer};
 mod cloud_panel;
 mod remote;
@@ -253,6 +254,10 @@ pub(crate) struct Conversation {
     pub(crate) busy: bool,
     /// When the user last typed, sent or clicked Resume here; the cloud auto-stop policy reads it.
     last_user_input: Option<std::time::Instant>,
+    /// `Input::user_edits` as of the last notify, to tell typing from other notifies.
+    seen_input_edits: u64,
+    /// The shell is stopping this session's cloud workspace for cost (auto-stop): sends wait.
+    pub(crate) auto_stopping: bool,
     /// The UI is idle; serialize the next launch behind the worker's last save.
     stopping: bool,
     /// A cloud session whose local copy is being saved: nothing may be sent meanwhile.
@@ -593,7 +598,13 @@ impl Conversation {
             this.clear_mode(event.0, cx)
         });
         let draft_observation = cx.observe(&input, |this, input, cx| {
-            this.note_user_input();
+            // Only typing counts for the idle clock; a placeholder change, `set_text` or `take`
+            // also notify the input but are not the user.
+            let edits = input.read(cx).user_edits();
+            if edits != this.seen_input_edits {
+                this.seen_input_edits = edits;
+                this.note_user_input();
+            }
             let content = input.read(cx).content.clone();
             let folder = monocode_core::composer::consume_command(&content, "add-to-folder");
             if folder.is_none() {
@@ -751,6 +762,8 @@ impl Conversation {
             loading: false,
             busy: false,
             last_user_input: None,
+            seen_input_edits: 0,
+            auto_stopping: false,
             stopping: false,
             cloud_locked: false,
             user_send: false,
@@ -1078,7 +1091,11 @@ impl Conversation {
                 "This session is being saved as a local copy. Wait for it to finish.".into();
             cx.notify();
         }
-        self.cloud_locked
+        if self.auto_stopping {
+            self.status = auto_stop::AUTO_STOPPING.into();
+            cx.notify();
+        }
+        self.cloud_locked || self.auto_stopping
     }
     fn send(&mut self, cx: &mut Context<Self>) {
         self.send_follow_up(false, cx);

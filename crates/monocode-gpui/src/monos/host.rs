@@ -957,6 +957,12 @@ impl Monos {
                     return;
                 }
                 if matches!(action.as_str(), "sessions.send" | "sessions.draft")
+                    && view.read(cx).auto_stopping
+                {
+                    self.finish_call(call, Err(crate::conversation::AUTO_STOPPING.into()), cx);
+                    return;
+                }
+                if matches!(action.as_str(), "sessions.send" | "sessions.draft")
                     && (view.read(cx).cloud_locked
                         || self
                             .owner
