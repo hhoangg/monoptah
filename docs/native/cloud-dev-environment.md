@@ -45,6 +45,52 @@ at 1 job; running the GPUI tests needs a 4 CPU / 8g sandbox. 8g with 1 job is th
 verified GPUI-test setup.
 `scripts/native-dev-doctor.sh` reads the cgroup limit and warns about all of this.
 
+## Stopping idle workspaces (cost control)
+
+A running workspace costs money whether or not anyone uses it. A Docker sandbox bills per runtime
+second (after the credit, to the card) until its runtime limit ends it, and a session that is
+finished or forgotten leaves it running. **Settings > Cloud > Cost control** makes the app stop such
+a workspace. It only ever **stops**: nothing is deleted, the state is kept, and the session shows the
+usual Stopped state with Resume. The next message you send resumes it, exactly as after a manual Stop.
+
+| Setting | Docker sandbox | Codespace |
+| --- | --- | --- |
+| Stop when idle for N minutes (Off, 5, 10, 15, 30) | **10** | **Off** |
+| Stop when its last session is archived or deleted | **On** | **Off** |
+
+Codespaces default to off because GitHub already idles a codespace out after 30 minutes; turn it on
+to stop sooner. The settings are global (they apply to every project); a per-project override is not
+there yet.
+
+**Idle** means all of this, for every session on the workspace:
+
+* no turn is running and nothing waits for input, no terminal or background task is busy;
+* nothing is queued, starting, restoring, being moved, archived or converted, and no file is waiting
+  to be copied to this computer (a session with a sync problem, or an unsaved file in the editor,
+  counts as busy);
+* the app saw no typing, send or Resume click in those sessions for N minutes, counted from the last
+  such activity (or from when the app first saw the workspace, so restarting the app never stops
+  anything at once).
+
+When the app does not know something (the workspace state has not been read, or a session's data is
+missing) it does **not** stop. Only a workspace the app reads as running is ever stopped.
+
+**Last session archived or deleted**: when no session of the window uses a workspace any more, it is
+stopped after a short grace (the idle time, or 5 minutes when idle stopping is off), so a workspace
+you chose to "Keep running" in the archive dialog is not cut off the same second. The app re-reads
+the store first and does nothing if a session of another project still uses it.
+
+How it runs: once a minute the app looks at session state it already holds in memory. It does not
+call `gh` or `sbx` for the check. Only when a workspace crosses its threshold does one worker read the
+state again and stop it through the same call the Stop menu uses. A notice says what happened ("Stopped
+Docker sandbox NAME after 10 min idle; send a message to resume."). A stop is asked for once; a
+stopped workspace is not stopped again, and a refused or failed stop waits for a whole new window.
+Background work (a Mono, an automation, the app API) never resumes a stopped workspace; only your own
+send or the Resume button does.
+
+Not covered: a workspace with **no** Monoptah session (an orphan, for example from a failed start)
+is never stopped by this. Stop or delete it by hand in **Cloud workspaces**.
+
 ## Codespaces need an SSH server
 
 The app reaches a codespace through `gh codespace ssh`, so the dev container must run an SSH

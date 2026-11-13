@@ -153,6 +153,7 @@ impl SettingsView {
         }
         page.push(self.kit_instructions(&kit, cx));
         page.push(self.kit_items(&kit, cx));
+        page.push(self.auto_stop_group(cx));
         page
     }
 

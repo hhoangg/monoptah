@@ -11,6 +11,7 @@ mod classic_surfaces;
 mod claude_setup;
 mod cloud;
 mod cloud_app_archive;
+mod cloud_auto_stop;
 mod cloud_continue;
 #[cfg(test)]
 mod cloud_continue_tests;
@@ -24,6 +25,8 @@ mod cloud_return_cleanup;
 mod cloud_start;
 #[cfg(test)]
 mod cloud_tests;
+#[cfg(test)]
+mod cloud_auto_stop_tests;
 mod cloud_view;
 #[cfg(test)]
 mod cloud_view_tests;
@@ -787,6 +790,12 @@ pub(crate) struct Shell {
     #[cfg(test)]
     remote_refresh_stub: Option<Result<(), String>>,
     _cloud_clock: gpui::Task<()>,
+    /// The cloud auto-stop policy: idle clocks only, see `shell/cloud_auto_stop.rs`.
+    auto_stop: monocode_core::cloud_sessions::auto_stop::AutoStop,
+    auto_stop_epoch: std::time::Instant,
+    _auto_stop_clock: gpui::Task<()>,
+    /// Workspaces (`CloudRef::key`) whose auto-stop worker runs now.
+    auto_stop_running: HashSet<String>,
     sessions: HashMap<i64, Entity<Conversation>>,
     /// Sessions that run as their provider's CLI. A session is in exactly one of
     /// this map and `sessions`; a terminal session never gets a `Conversation`.
@@ -1076,6 +1085,7 @@ impl Shell {
         let gh = cloud::default_gh();
         let cloud = cloud::service(gh.clone(), remote.clone(), store.clone());
         let cloud_clock = cloud::refresh_loop(cx);
+        let auto_stop_clock = cloud_auto_stop::clock(cx);
         let metadata: Vec<_> = summaries.iter().map(|s| (s.id, s.cwd.clone())).collect();
         let workspace = Workspace::restore(saved.as_deref(), &metadata, &cwd);
         monocode_core::cli::initialize(&workspace.preferences.binary_paths);
@@ -1273,6 +1283,10 @@ impl Shell {
             codespace_picker: None,
             sandbox_picker: None,
             _cloud_clock: cloud_clock,
+            auto_stop: Default::default(),
+            auto_stop_epoch: std::time::Instant::now(),
+            _auto_stop_clock: auto_stop_clock,
+            auto_stop_running: HashSet::new(),
             sessions: HashMap::new(),
             tui_sessions: HashMap::new(),
             tui_events: HashMap::new(),

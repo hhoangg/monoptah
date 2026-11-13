@@ -2199,6 +2199,7 @@ impl StartupSummary {
     }
 }
 
+pub mod auto_stop;
 pub mod backend;
 pub mod claude_pin;
 pub mod claude_setup;
@@ -2237,6 +2238,8 @@ mod claude_pin_tests;
 mod continue_tests;
 #[cfg(all(test, unix))]
 mod convert_tests;
+#[cfg(test)]
+mod auto_stop_tests;
 #[cfg(test)]
 mod docker_config_tests;
 #[cfg(test)]

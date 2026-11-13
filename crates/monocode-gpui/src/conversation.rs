@@ -1,5 +1,6 @@
 mod accounts;
 mod approvals;
+mod auto_stop;
 mod attachment_drop;
 mod background_tasks;
 mod btw;
@@ -250,6 +251,8 @@ pub(crate) struct Conversation {
     pending_search: Option<(usize, String)>,
     loading: bool,
     pub(crate) busy: bool,
+    /// When the user last typed, sent or clicked Resume here; the cloud auto-stop policy reads it.
+    last_user_input: Option<std::time::Instant>,
     /// The UI is idle; serialize the next launch behind the worker's last save.
     stopping: bool,
     /// A cloud session whose local copy is being saved: nothing may be sent meanwhile.
@@ -590,6 +593,7 @@ impl Conversation {
             this.clear_mode(event.0, cx)
         });
         let draft_observation = cx.observe(&input, |this, input, cx| {
+            this.note_user_input();
             let content = input.read(cx).content.clone();
             let folder = monocode_core::composer::consume_command(&content, "add-to-folder");
             if folder.is_none() {
@@ -614,12 +618,14 @@ impl Conversation {
         });
         input.update(cx, |input, _| input.set_alternate_submit(true));
         let submission = cx.subscribe(&input, |this, _, _: &input::Submitted, cx| {
+            this.note_user_input();
             this.user_send = true;
             this.send(cx);
             this.user_send = false;
         });
         let alternate_submission =
             cx.subscribe(&input, |this, _, _: &input::AlternateSubmitted, cx| {
+                this.note_user_input();
                 this.user_send = true;
                 this.send_follow_up(true, cx);
                 this.user_send = false;
@@ -744,6 +750,7 @@ impl Conversation {
             pending_search: None,
             loading: false,
             busy: false,
+            last_user_input: None,
             stopping: false,
             cloud_locked: false,
             user_send: false,
@@ -3668,6 +3675,7 @@ impl Conversation {
                         modifiers.control
                     };
                     // The click is the user's own hand: it may resume a stopped workspace.
+                    this.note_user_input();
                     this.user_send = true;
                     this.resume_click = true;
                     this.send_follow_up(alternate, cx);

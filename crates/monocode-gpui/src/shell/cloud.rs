@@ -925,6 +925,8 @@ impl Shell {
     pub(super) fn cloud_resumed(&mut self, id: i64, cx: &mut Context<Self>) {
         if let Some(mark) = self.cloud_marks.get(&id) {
             self.cloud_states.insert(mark.key(), CloudState::Available);
+            // A resumed workspace gets a whole new idle window.
+            self.auto_stop.resumed(&mark.cloud(), self.auto_stop_now());
         }
         self.sync_cloud_stopped(cx);
         self.invalidate_chrome(cx);
