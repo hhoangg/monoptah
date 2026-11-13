@@ -155,6 +155,9 @@ pub fn validate_target(target: &Value, input: &Value) -> Result<(), String> {
             spec.check_start_option(key, value)?;
         }
     }
+    if creating {
+        spec.check_start_combination(target)?;
+    }
     validate_session_options(input)
 }
 

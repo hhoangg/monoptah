@@ -5,6 +5,7 @@
 //! local project's cwd (like the other per-project cloud settings). A config
 //! never holds a secret: `credential_id` only names a profile saved through
 //! [`crate::git_credentials`]. A public repo uses `credential_id: None`.
+use crate::sandboxes::SandboxSource;
 use crate::store::Store;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -38,6 +39,16 @@ pub struct DockerProjectConfig {
     /// Id of a saved Docker account ([`crate::docker_accounts`]); `None` uses the machine's
     /// `sbx login`.
     pub docker_account: Option<String>,
+    /// Where the sandbox filesystem comes from: the stock sandbox (default), a saved cloud
+    /// template or a public image. Absent in older configs: the stock sandbox.
+    #[serde(skip_serializing_if = "SandboxSource::is_default")]
+    pub environment: SandboxSource,
+    /// Whether the repository's dev container is built in the sandbox. `None` means the
+    /// source decides: yes for the stock sandbox (today's behaviour), no for a template or
+    /// image, whose toolchain is already on disk (the session then runs directly in the
+    /// sandbox, "Plain" mode). Only meaningful with a template or image.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub use_devcontainer: Option<bool>,
 }
 impl Default for DockerProjectConfig {
     fn default() -> Self {
@@ -52,6 +63,8 @@ impl Default for DockerProjectConfig {
             platform: None,
             claude_account: None,
             docker_account: None,
+            environment: SandboxSource::Default,
+            use_devcontainer: None,
         }
     }
 }
@@ -128,6 +141,18 @@ pub fn check_ttl(ttl: &str) -> Result<(), String> {
 }
 
 impl DockerProjectConfig {
+    /// True when the repository's dev container is built in the sandbox. The stock sandbox
+    /// always does (when the repository has one); a template or image does only when
+    /// `use_devcontainer` says so.
+    pub fn uses_devcontainer(&self) -> bool {
+        self.environment.is_default() || self.use_devcontainer.unwrap_or(false)
+    }
+
+    /// True when the template fixes the size, so `cpus` and `memory` are not used.
+    pub fn size_from_template(&self) -> bool {
+        self.environment.is_template()
+    }
+
     /// Trim the text fields and check every value. Returns the cleaned config.
     pub fn validated(&self) -> Result<Self, String> {
         let mut cfg = self.clone();
@@ -136,6 +161,12 @@ impl DockerProjectConfig {
         cfg.devcontainer_path = cfg.devcontainer_path.trim().to_owned();
         cfg.memory = cfg.memory.trim().to_lowercase();
         cfg.ttl = cfg.ttl.trim().to_lowercase();
+        cfg.environment = cfg.environment.trimmed();
+        cfg.environment.validate()?;
+        if cfg.environment.is_default() {
+            // The flag only means something for a template or image.
+            cfg.use_devcontainer = None;
+        }
         for field in [
             &mut cfg.credential_id,
             &mut cfg.platform,
@@ -156,8 +187,11 @@ impl DockerProjectConfig {
         if !valid_devcontainer_path(&cfg.devcontainer_path) {
             return Err("The devcontainer path must be relative to the repository root.".into());
         }
-        check_cpus(cfg.cpus)?;
-        check_memory(&cfg.memory)?;
+        // A template carries its own size; the saved cpus/memory are kept but unused.
+        if !cfg.size_from_template() {
+            check_cpus(cfg.cpus)?;
+            check_memory(&cfg.memory)?;
+        }
         check_ttl(&cfg.ttl)?;
         if let Some(platform) = &cfg.platform {
             let parts: Vec<&str> = platform.split('/').collect();

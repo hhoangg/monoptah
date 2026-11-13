@@ -10,7 +10,7 @@ use monocode_core::{
     codespaces::GhOutput,
     docker_accounts::DockerAccountStatus,
     git_credentials::{GitOutput, GitPlatform},
-    sandboxes::SbxOutput,
+    sandboxes::{SandboxSource, SbxOutput},
 };
 use std::{
     cell::RefCell,
@@ -288,6 +288,29 @@ fn saved_sandbox() -> DockerProjectConfig {
         platform: Some("linux/amd64".into()),
         claude_account: Some("claude-1".into()),
         docker_account: Some("acct-1".into()),
+        environment: SandboxSource::Default,
+        use_devcontainer: None,
+    }
+}
+
+/// A saved project that starts from a template (a size nobody validated rides along).
+fn saved_template(name: &str) -> DockerProjectConfig {
+    DockerProjectConfig {
+        credential_id: None,
+        environment: SandboxSource::Template { name: name.into() },
+        use_devcontainer: Some(true),
+        ..saved_sandbox()
+    }
+}
+fn saved_image(reference: &str) -> DockerProjectConfig {
+    DockerProjectConfig {
+        credential_id: None,
+        environment: SandboxSource::Image {
+            reference: reference.into(),
+        },
+        cpus: 4,
+        memory: "8g".into(),
+        ..saved_sandbox()
     }
 }
 
@@ -2040,4 +2063,311 @@ fn the_helper_captions_under_the_form_fields_are_gone() {
         "Changing an account applies from the next start or reconnect; running sessions keep theirs."
     );
     assert_eq!(source.matches("ACCOUNT_CHANGE_NOTE").count(), 2);
+}
+
+// ------------------------------------------------ the Environment row
+
+#[test]
+fn a_saved_template_or_image_comes_back_into_the_form_and_out_again_unchanged() {
+    // The review's round trip: load a template config, save it unchanged, the environment
+    // is still there, field for field (including the dev container choice and the size).
+    for saved in [
+        saved_template("rust-small"),
+        saved_image("docker.io/library/rust:slim"),
+        DockerProjectConfig {
+            use_devcontainer: None,
+            ..saved_template("t-2")
+        },
+        DockerProjectConfig {
+            use_devcontainer: Some(false),
+            ..saved_image("rust:slim")
+        },
+    ] {
+        let project = ProjectCloud {
+            default_backend: None,
+            codespace: CodespaceProjectConfig::default(),
+            sandbox: Some(saved.clone()),
+        };
+        let form = Form::initial(&project, None);
+        assert_ne!(form.sandbox.env_kind, model::EnvKind::Default);
+        assert_eq!(
+            form.sandbox.env_text,
+            saved.environment.value().unwrap_or_default()
+        );
+        assert_eq!(form.sandbox.to_config(), saved);
+        let baseline = form.sandbox.clone();
+        let out = model::validate(&form, &context(&[], &[], &baseline, true)).unwrap_err();
+        // The saved Claude account is not offered in this bare context: the check is about
+        // the account, never about the environment.
+        assert_eq!(out.field, Field::Claude, "{}", out.message);
+        let claude = claude_accounts_fixture();
+        let out = model::validate(&form, &context(&[], &claude, &baseline, true)).unwrap();
+        assert_eq!(out.sandbox.as_ref(), Some(&saved));
+    }
+}
+
+#[test]
+fn the_form_describes_each_environment_and_a_default_never_stores_a_dev_container_flag() {
+    let mut form = SandboxForm::initial(None, Some("https://github.com/acme/alpha"));
+    assert_eq!(form.env_kind, model::EnvKind::Default);
+    let config = form.to_config();
+    assert!(config.environment.is_default());
+    assert_eq!(config.use_devcontainer, None);
+
+    form.env_kind = model::EnvKind::Template;
+    form.env_text = "rust-small".into();
+    let config = form.to_config();
+    assert_eq!(config.environment.value(), Some("rust-small"));
+    assert!(config.size_from_template() && !config.uses_devcontainer());
+    form.use_devcontainer = Some(true);
+    assert!(form.to_config().uses_devcontainer());
+
+    form.env_kind = model::EnvKind::Image;
+    form.env_text = "docker.io/library/rust:slim".into();
+    let config = form.to_config();
+    assert!(!config.size_from_template());
+    assert_eq!(
+        config.environment.label().as_deref(),
+        Some("image docker.io/library/rust:slim")
+    );
+    // Back to the default: the flag is not carried into the stored config.
+    form.env_kind = model::EnvKind::Default;
+    assert_eq!(form.to_config().use_devcontainer, None);
+}
+
+#[test]
+fn a_template_keeps_a_valid_size_shape_even_when_the_stored_one_is_not() {
+    let mut form = SandboxForm::initial(Some(&saved_template("t")), None);
+    // Valid stored values are kept as they are (3 CPUs, 6g is not a preset, but valid).
+    assert_eq!((form.cpus, form.memory.as_str()), (3, "6g"));
+    let config = form.to_config();
+    assert_eq!((config.cpus, config.memory.as_str()), (3, "6g"));
+    // A stored shape the core would refuse is written as the defaults, so a later switch
+    // to an image never meets a size nobody checked.
+    for (cpus, memory) in [(0, "6g"), (99, "6g"), (3, "lots"), (3, "")] {
+        form.cpus = cpus;
+        form.memory = memory.into();
+        let config = form.to_config();
+        assert_eq!(
+            (config.cpus, config.memory.as_str()),
+            (docker_config::DEFAULT_CPUS, docker_config::DEFAULT_MEMORY),
+            "{cpus} {memory:?}"
+        );
+        assert!(docker_config::check_cpus(config.cpus).is_ok());
+        assert!(docker_config::check_memory(&config.memory).is_ok());
+    }
+    // An image's size is the user's to fix: it is reported, never replaced.
+    form.env_kind = model::EnvKind::Image;
+    form.env_text = "rust:slim".into();
+    form.cpus = 99;
+    assert_eq!(form.to_config().cpus, 99);
+}
+
+#[test]
+fn environment_errors_land_under_the_environment_field() {
+    let claude = claude_accounts_fixture();
+    for (kind, text) in [
+        (model::EnvKind::Template, ""),
+        (model::EnvKind::Template, "--cpus=64"),
+        (model::EnvKind::Template, "two words"),
+        (model::EnvKind::Image, "two words"),
+        (model::EnvKind::Image, ""),
+        (model::EnvKind::Image, "caf\u{e9}:1"),
+    ] {
+        let mut form = Form::initial(
+            &ProjectCloud::default(),
+            Some("https://github.com/acme/alpha"),
+        );
+        form.default_backend = Some(DefaultBackend::Sandbox);
+        form.sandbox.env_kind = kind;
+        form.sandbox.env_text = text.into();
+        let baseline = form.sandbox.clone();
+        let error = model::validate(&form, &context(&[], &claude, &baseline, false)).unwrap_err();
+        assert_eq!(
+            (error.backend, error.field),
+            (DefaultBackend::Sandbox, Field::Environment),
+            "{text:?}: {}",
+            error.message
+        );
+    }
+    // A valid one passes, and a template needs no size to be right.
+    let mut form = Form::initial(
+        &ProjectCloud::default(),
+        Some("https://github.com/acme/alpha"),
+    );
+    form.default_backend = Some(DefaultBackend::Sandbox);
+    form.sandbox.env_kind = model::EnvKind::Template;
+    form.sandbox.env_text = "rust-small".into();
+    let baseline = form.sandbox.clone();
+    assert!(model::validate(&form, &context(&[], &claude, &baseline, false)).is_ok());
+}
+
+#[gpui::test]
+fn a_template_project_saved_from_the_dialog_stays_a_template(cx: &mut TestAppContext) {
+    // The wipe the review feared: any save of an edited dialog rebuilds the config, so the
+    // environment must be carried by the form, not by `..Default::default()`.
+    let fixture = Fixture::new();
+    let saved = saved_template("rust-small");
+    docker_config::save(
+        &fixture.store.lock().unwrap(),
+        &project_of(&fixture),
+        &saved,
+    )
+    .unwrap();
+    let dialog = fixture.open(cx, None, https_origin);
+    // Not an edit of the environment: only the runtime changes.
+    dialog.update(cx, |d, cx| {
+        assert_eq!(d.tab, DefaultBackend::Sandbox);
+        assert_eq!(d.form.sandbox.env_kind, model::EnvKind::Template);
+        assert_eq!(d.text("sb_env", cx), "rust-small");
+        d.pick(Pick::Runtime("4h".into()), cx);
+        d.save(cx);
+        assert!(d.error.is_none(), "{:?}", d.error);
+    });
+    cx.run_until_parked();
+    let stored = fixture.load().sandbox.unwrap();
+    assert_eq!(
+        stored,
+        DockerProjectConfig {
+            ttl: "4h".into(),
+            ..saved.clone()
+        }
+    );
+    // Editing another field of the same dialog (the base branch) does not reset it either,
+    // and neither does a pick of the Claude or Docker account.
+    let dialog = fixture.open(cx, None, https_origin);
+    dialog.update(cx, |d, cx| {
+        d.set_text("sb_base", "release", cx);
+        d.pick(Pick::DockerAccount(None), cx);
+        d.save(cx);
+        assert!(d.error.is_none(), "{:?}", d.error);
+    });
+    cx.run_until_parked();
+    let stored = fixture.load().sandbox.unwrap();
+    assert_eq!(stored.environment, saved.environment);
+    assert_eq!(stored.use_devcontainer, Some(true));
+    assert_eq!((stored.cpus, stored.memory.as_str()), (3, "6g"));
+    assert_eq!(stored.base_ref, "release");
+    // A save of the codespace tab alone keeps the template too.
+    let dialog = fixture.open(cx, Some(DefaultBackend::Codespace), https_origin);
+    dialog.update(cx, |d, cx| {
+        d.set_text("cs_base", "main", cx);
+        d.save(cx);
+        assert!(d.error.is_none(), "{:?}", d.error);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        fixture.load().sandbox.unwrap().environment,
+        saved.environment
+    );
+}
+
+#[gpui::test]
+fn save_without_edits_keeps_a_template_config_byte_for_byte(cx: &mut TestAppContext) {
+    for saved in [saved_template("rust-small"), saved_image("rust:slim")] {
+        let fixture = Fixture::new();
+        docker_config::save(
+            &fixture.store.lock().unwrap(),
+            &project_of(&fixture),
+            &saved,
+        )
+        .unwrap();
+        let before = fixture
+            .store
+            .lock()
+            .unwrap()
+            .setting(docker_config::SETTING)
+            .unwrap();
+        let dialog = fixture.open(cx, None, https_origin);
+        dialog.update(cx, |d, cx| {
+            d.save(cx);
+            assert!(d.error.is_none(), "{:?}", d.error);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            fixture
+                .store
+                .lock()
+                .unwrap()
+                .setting(docker_config::SETTING)
+                .unwrap(),
+            before
+        );
+    }
+}
+
+#[gpui::test]
+fn picking_an_environment_saves_it_and_calls_no_cloud(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let dialog = fixture.open(cx, Some(DefaultBackend::Sandbox), https_origin);
+    cx.run_until_parked();
+    let sbx_before = fixture.sbx.calls.lock().unwrap().len();
+    dialog.update(cx, |d, cx| {
+        d.pick(Pick::Environment(model::EnvKind::Template), cx);
+        // An empty name is the field's error and stores nothing.
+        d.save(cx);
+        let error = d.error.as_ref().expect("a name is required");
+        assert_eq!(
+            (error.backend, error.field),
+            (DefaultBackend::Sandbox, Field::Environment)
+        );
+    });
+    assert!(fixture.load().sandbox.is_none());
+    dialog.update(cx, |d, cx| {
+        d.set_text("sb_env", "rust-small", cx);
+        d.save(cx);
+        assert!(d.error.is_none(), "{:?}", d.error);
+    });
+    let saved = fixture.load().sandbox.unwrap();
+    assert_eq!(saved.environment.value(), Some("rust-small"));
+    assert!(saved.size_from_template() && !saved.uses_devcontainer());
+    cx.run_until_parked();
+    assert_eq!(
+        fixture.sbx.calls.lock().unwrap().len(),
+        sbx_before,
+        "saving never asks the cloud whether the template exists"
+    );
+}
+
+#[gpui::test]
+fn the_environment_choices_and_the_text_follow_the_kind(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let dialog = fixture.open(cx, Some(DefaultBackend::Sandbox), https_origin);
+    dialog.update(cx, |d, cx| {
+        let labels = |d: &CloudSettings, cx: &App| {
+            d.options(Select::Environment, cx)
+                .into_iter()
+                .map(|o| (o.label, o.selected))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            labels(d, cx),
+            [
+                ("Default".to_owned(), true),
+                ("Template".to_owned(), false),
+                ("Public image".to_owned(), false)
+            ]
+        );
+        d.pick(Pick::Environment(model::EnvKind::Template), cx);
+        d.set_text("sb_env", "rust-small", cx);
+        assert_eq!(d.current_label(Select::Environment, cx), "Template");
+        // Going to the default and back keeps what was typed ...
+        d.pick(Pick::Environment(model::EnvKind::Default), cx);
+        d.pick(Pick::Environment(model::EnvKind::Template), cx);
+        assert_eq!(d.text("sb_env", cx), "rust-small");
+        // ... but a template name is not carried over as an image reference.
+        d.pick(Pick::Environment(model::EnvKind::Image), cx);
+        assert_eq!(d.text("sb_env", cx), "");
+        assert_eq!(
+            d.sb_env.read(cx).placeholder_text().as_ref(),
+            "docker.io/library/rust:slim"
+        );
+        assert_eq!(
+            model::EnvKind::Template.hint(),
+            Some(model::ENV_TEMPLATE_HINT)
+        );
+        assert!(model::ENV_TEMPLATE_HINT.contains("already exist"));
+        assert!(model::ENV_TEMPLATE_HINT.contains("size is fixed"));
+        assert_eq!(model::EnvKind::Default.hint(), None);
+    });
 }

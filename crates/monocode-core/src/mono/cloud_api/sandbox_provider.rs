@@ -7,9 +7,9 @@
 use super::provider::{
     current_branch, option_text, CloudInstance, CloudKindSpec, CloudProvider, CloudStart,
 };
-use crate::cloud_sessions::docker_config::{self, valid_ref};
+use crate::cloud_sessions::docker_config::{self, valid_ref, DockerProjectConfig};
 use crate::cloud_sessions::{CloudBackendKind, CloudRef, CloudSessions, CloudState};
-use crate::sandboxes::{self, Prerequisites};
+use crate::sandboxes::{self, Prerequisites, SandboxSource};
 use crate::store::{RemoteSession, Store};
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
@@ -33,7 +33,7 @@ impl CloudKindSpec for SandboxSpec {
         })
     }
     fn start_options(&self) -> &'static [&'static str] {
-        &["branch", "cpus", "memory", "ttl"]
+        &["branch", "cpus", "memory", "ttl", "template", "image"]
     }
     fn resume_without_session_advice(&self, _: &str) -> String {
         // sessions.start on an existing sandbox needs a ready session, so it cannot help here.
@@ -58,8 +58,28 @@ impl CloudKindSpec for SandboxSpec {
                 .map_err(|e| format!("target.memory: {e}")),
             "ttl" => docker_config::check_ttl(&lowered(value).ok_or_else(bad)?)
                 .map_err(|e| format!("target.ttl: {e}")),
+            "template" => sandboxes::validate_template_name(value.as_str().ok_or_else(bad)?)
+                .map_err(|e| format!("target.template: {e}")),
+            "image" => sandboxes::validate_image_ref(value.as_str().ok_or_else(bad)?)
+                .map_err(|e| format!("target.image: {e}")),
             _ => Err(bad()),
         }
+    }
+    fn check_start_combination(&self, target: &Map<String, Value>) -> Result<(), String> {
+        if target.contains_key("template") && target.contains_key("image") {
+            return Err("target takes either template or image, not both".into());
+        }
+        if target.contains_key("template") {
+            if let Some(size) = ["cpus", "memory"]
+                .into_iter()
+                .find(|k| target.contains_key(*k))
+            {
+                return Err(format!(
+                    "target.{size} cannot be combined with target.template: a template fixes the sandbox size"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -171,6 +191,48 @@ impl SandboxProvider {
             .map_err(|_| "Native session store unavailable")?;
         docker_config::load(&store, project)
     }
+}
+
+/// A project saved on a template stores a size nobody validated (the template fixes the
+/// real one). When a start switches it to an image, the part of the size the caller did not
+/// send is that stored one: check it here the way an image start will, and say where it came
+/// from, instead of failing later with a cpus/memory error the caller never caused.
+fn check_saved_size(
+    config: &DockerProjectConfig,
+    options: &Map<String, Value>,
+) -> Result<(), String> {
+    let saved_cpus = !options.contains_key("cpus");
+    let saved_memory = !options.contains_key("memory");
+    if !saved_cpus && !saved_memory {
+        return Ok(());
+    }
+    let what = match (saved_cpus, saved_memory) {
+        (true, true) => "size",
+        (true, false) => "CPU count",
+        _ => "memory",
+    };
+    let memory = config.memory.trim().to_lowercase();
+    let check = || -> Result<(), String> {
+        if saved_cpus {
+            docker_config::check_cpus(config.cpus)?;
+        }
+        if saved_memory {
+            docker_config::check_memory(&memory)?;
+        }
+        let cpus = u8::try_from(config.cpus).map_err(|_| "CPUs are out of range.".to_string())?;
+        sandboxes::Compute {
+            cpus,
+            memory: memory.clone(),
+            ..Default::default()
+        }
+        .validate_size()
+    };
+    check().map_err(|reason| {
+        format!(
+            "The {what} saved with the project's template ({} CPUs, {}) cannot be used for an image: {reason} Send target.cpus and target.memory, or fix the size in the project's Cloud settings.",
+            config.cpus, config.memory
+        )
+    })
 }
 
 /// `4096` MiB as `4g`, `512` as `512m`.
@@ -321,7 +383,9 @@ impl CloudProvider for SandboxProvider {
 
     /// New: the project's Docker config (with optional `cpus`, `memory`, `ttl` overrides) and
     /// `branch` (default: the current branch) through `begin_sandbox_start`. Existing: another
-    /// ready session on the sandbox, see `CloudSessions::attach_session`.
+    /// ready session on the sandbox, see `CloudSessions::attach_session`. A `template` or `image`
+    /// option replaces the project's environment for this start; a template cannot be combined
+    /// with `cpus` / `memory`.
     fn start(
         &self,
         project: &str,
@@ -358,6 +422,41 @@ impl CloudProvider for SandboxProvider {
         // This session's own Claude account replaces the project's for this sandbox only.
         if let Some(account) = account {
             config.claude_account = Some(account.to_owned());
+        }
+        // A project on a template never had its saved cpus/memory checked (the template fixes
+        // the size), so remember that before an override can turn the start into an image one.
+        let size_unchecked = config.size_from_template();
+        // A template or image named here replaces the project's environment for this start.
+        let template = option_text(options, "template");
+        let image = option_text(options, "image");
+        match (template, image) {
+            (Some(name), _) => {
+                config.environment = SandboxSource::Template {
+                    name: name.to_owned(),
+                }
+            }
+            (None, Some(reference)) => {
+                config.environment = SandboxSource::Image {
+                    reference: reference.to_owned(),
+                }
+            }
+            (None, None) => {}
+        }
+        if config.size_from_template() {
+            // Also covers a project whose saved environment is a template.
+            if let Some(size) = ["cpus", "memory"]
+                .into_iter()
+                .find(|k| options.contains_key(*k))
+            {
+                return Err(format!(
+                    "target.{size} cannot be used with a template: the template fixes the sandbox size"
+                ));
+            }
+        } else if size_unchecked {
+            // Template project switched to an image: the size the caller did not send comes
+            // from the project's saved one, which nothing ever validated. Name its origin
+            // instead of failing with a cpus/memory error the caller never caused.
+            check_saved_size(&config, options)?;
         }
         let config = config.validated()?;
         let branch = match option_text(options, "branch") {

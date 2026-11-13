@@ -340,6 +340,13 @@ pub(super) struct CloudDraft {
 }
 
 impl CloudDraft {
+    /// The project starts its sandbox from a saved template, which fixes the size.
+    pub(super) fn size_from_template(&self) -> bool {
+        self.config
+            .as_ref()
+            .is_some_and(|config| config.size_from_template())
+    }
+
     /// The row's value differs from the project default (the row is marked for this session).
     pub(super) fn row_changed(&self, row: CloudRow) -> bool {
         let defaults = &self.defaults;
@@ -350,7 +357,11 @@ impl CloudDraft {
                 resolved_machine(&self.machines, self.machine.as_deref())
                     != resolved_machine(&self.machines, defaults.machine.as_deref())
             }
-            CloudRow::Size => (self.cpus, &self.memory) != (defaults.cpus, &defaults.memory),
+            // A template fixes the size: there is nothing to change for this session.
+            CloudRow::Size => {
+                !self.size_from_template()
+                    && (self.cpus, &self.memory) != (defaults.cpus, &defaults.memory)
+            }
             CloudRow::Idle => self.idle != defaults.idle,
             CloudRow::Runtime => self.ttl != defaults.ttl,
             CloudRow::Base => self.base_text.trim() != defaults.base,
@@ -1371,6 +1382,8 @@ impl Conversation {
                         // saved one gets.
                         let mut config = project;
                         default_account = config.claude_account.clone();
+                        // Never for a template: `row_changed` is false then, and the saved
+                        // size of such a project is not a size anyone checked.
                         if draft.row_changed(CloudRow::Size) {
                             config.cpus = draft.cpus;
                             config.memory = draft.memory.clone();

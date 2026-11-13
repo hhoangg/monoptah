@@ -22,6 +22,9 @@ pub(crate) struct AccountChoice {
     pub kind: &'static str,
 }
 
+/// What a size row says when the project starts from a saved template: the template fixed it.
+pub(crate) const SIZE_FROM_TEMPLATE: &str = "Size comes from the template";
+
 /// The sizes the cloud offers, `(cpus, memory)`.
 pub(crate) const SIZES: [(u32, &str); 5] =
     [(1, "2g"), (2, "4g"), (4, "8g"), (8, "16g"), (16, "32g")];

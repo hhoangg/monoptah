@@ -2901,3 +2901,253 @@ mod claude_account {
         assert!(!chosen.to_string().contains("sk-ant-oat01"));
     }
 }
+
+// ------------------------------------------------ template and image targets
+
+fn target_error(target: Value) -> String {
+    validate::validate_target(&target, &json!({})).unwrap_err()
+}
+
+#[test]
+fn a_sandbox_target_takes_a_template_or_an_image() {
+    let check = |target: Value| validate::validate_target(&target, &json!({}));
+    check(json!({"kind":"sandbox","instance":"new","template":"rust-small"})).unwrap();
+    check(json!({"kind":"sandbox","template":"rust-small","ttl":"1h","branch":"feat/x"})).unwrap();
+    check(json!({"kind":"sandbox","image":"docker.io/library/rust:slim"})).unwrap();
+    // An image is a normal sandbox with a size.
+    check(json!({"kind":"sandbox","image":"rust:slim","cpus":4,"memory":"8g"})).unwrap();
+    // A codespace takes neither.
+    assert!(target_error(json!({"kind":"codespace","template":"t"})).contains("does not take"));
+    assert!(target_error(json!({"kind":"codespace","image":"i"})).contains("does not take"));
+    // Only when creating.
+    assert!(
+        target_error(json!({"kind":"sandbox","instance":"box-1","template":"t"}))
+            .contains("only applies when creating")
+    );
+}
+
+#[test]
+fn a_template_is_refused_together_with_a_size_or_an_image() {
+    for size in [json!({"cpus":4}), json!({"memory":"8g"})] {
+        let mut target = json!({"kind":"sandbox","template":"rust-small"});
+        target
+            .as_object_mut()
+            .unwrap()
+            .extend(size.as_object().unwrap().clone());
+        let error = target_error(target);
+        assert!(error.contains("fixes the sandbox size"), "{error}");
+    }
+    let error = target_error(json!({"kind":"sandbox","template":"t","image":"i"}));
+    assert!(error.contains("either template or image"), "{error}");
+}
+
+#[test]
+fn bad_templates_and_images_are_refused_before_anything_is_created() {
+    for bad in [
+        json!("--cpus=64"),
+        json!("-t"),
+        json!("two words"),
+        json!(""),
+        json!(7),
+        json!(null),
+    ] {
+        for key in ["template", "image"] {
+            let target = json!({"kind":"sandbox", key: bad});
+            assert!(
+                validate::validate_target(&target, &json!({})).is_err(),
+                "{key}: {bad}"
+            );
+        }
+    }
+}
+
+#[test]
+fn starting_a_new_sandbox_from_a_template_or_an_image() {
+    let gh = FakeGh::new(vec![]);
+    let fx = fixture(&gh);
+    fx.save_docker_config();
+    let with = |key: &str, value: Value| {
+        let mut target = start_target(CloudBackendKind::DockerSandbox, InstanceChoice::New);
+        target.options.insert(key.into(), value);
+        target
+    };
+    let start = fx
+        .api
+        .begin_start(&fx.path(), with("template", json!("rust-small")), "claude")
+        .unwrap();
+    let config = &start
+        .record()
+        .unwrap()
+        .sandbox_start
+        .as_ref()
+        .unwrap()
+        .config;
+    assert_eq!(
+        config.environment,
+        crate::sandboxes::SandboxSource::Template {
+            name: "rust-small".into()
+        }
+    );
+    assert!(!config.uses_devcontainer(), "Plain mode by default");
+    let create = fx
+        .sbx
+        .calls()
+        .into_iter()
+        .find(|c| c.split_whitespace().nth(2) == Some("create"))
+        .unwrap();
+    assert!(create.contains("--template rust-small"), "{create}");
+    assert!(
+        !create.contains("--cpus") && !create.contains("--memory"),
+        "{create}"
+    );
+    // The project's own setting is not changed by one start.
+    let stored = crate::cloud_sessions::docker_config::load(&fx.store.lock().unwrap(), &fx.path())
+        .unwrap()
+        .unwrap();
+    assert!(stored.environment.is_default());
+
+    let start = fx
+        .api
+        .begin_start(
+            &fx.path(),
+            with("image", json!("docker.io/library/rust:slim")),
+            "claude",
+        )
+        .unwrap();
+    let config = &start
+        .record()
+        .unwrap()
+        .sandbox_start
+        .as_ref()
+        .unwrap()
+        .config;
+    assert_eq!(
+        config.environment.value(),
+        Some("docker.io/library/rust:slim")
+    );
+    let create = fx
+        .sbx
+        .calls()
+        .into_iter()
+        .rfind(|c| c.split_whitespace().nth(2) == Some("create"))
+        .unwrap();
+    assert!(
+        create.contains("--image-ref docker.io/library/rust:slim")
+            && create.contains("--cpus 2 --memory 4g"),
+        "{create}"
+    );
+    // Bad values never reach sbx.
+    let creates = fx.sbx.count("create");
+    for target in [with("template", json!("-x")), with("image", json!("a b"))] {
+        assert!(fx.api.begin_start(&fx.path(), target, "claude").is_err());
+    }
+    assert_eq!(fx.sbx.count("create"), creates);
+}
+
+#[test]
+fn a_project_whose_environment_is_a_template_refuses_size_options() {
+    let gh = FakeGh::new(vec![]);
+    let fx = fixture(&gh);
+    crate::cloud_sessions::docker_config::save(
+        &fx.store.lock().unwrap(),
+        &fx.path(),
+        &crate::cloud_sessions::docker_config::DockerProjectConfig {
+            repo_url: REPO_URL.into(),
+            environment: crate::sandboxes::SandboxSource::Template {
+                name: "saved".into(),
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut sized = start_target(CloudBackendKind::DockerSandbox, InstanceChoice::New);
+    sized.options.insert("cpus".into(), json!(4));
+    let error = fx.api.begin_start(&fx.path(), sized, "claude").unwrap_err();
+    assert!(error.contains("template fixes the sandbox size"), "{error}");
+    assert_eq!(fx.sbx.count("create"), 0);
+    // Without sizes the saved template is used; an image option replaces it for this start.
+    let plain = start_target(CloudBackendKind::DockerSandbox, InstanceChoice::New);
+    fx.api.begin_start(&fx.path(), plain, "claude").unwrap();
+    let create = fx
+        .sbx
+        .calls()
+        .into_iter()
+        .find(|c| c.split_whitespace().nth(2) == Some("create"))
+        .unwrap();
+    assert!(create.contains("--template saved"), "{create}");
+    let mut image = start_target(CloudBackendKind::DockerSandbox, InstanceChoice::New);
+    image.options.insert("image".into(), json!("rust:slim"));
+    image.options.insert("cpus".into(), json!(4));
+    image.options.insert("memory".into(), json!("8g"));
+    fx.api.begin_start(&fx.path(), image, "claude").unwrap();
+    assert_eq!(fx.sbx.count("create"), 2);
+}
+
+#[test]
+fn an_image_override_on_a_template_project_reports_a_saved_size_nobody_checked() {
+    let gh = FakeGh::new(vec![]);
+    let fx = fixture(&gh);
+    // A template project keeps whatever size was stored with it: the core never checks it.
+    crate::cloud_sessions::docker_config::save(
+        &fx.store.lock().unwrap(),
+        &fx.path(),
+        &crate::cloud_sessions::docker_config::DockerProjectConfig {
+            repo_url: REPO_URL.into(),
+            environment: crate::sandboxes::SandboxSource::Template {
+                name: "saved".into(),
+            },
+            cpus: 3,
+            memory: "5g".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let image = |options: &[(&str, Value)]| {
+        let mut target = start_target(CloudBackendKind::DockerSandbox, InstanceChoice::New);
+        target.options.insert("image".into(), json!("rust:slim"));
+        for (key, value) in options {
+            target.options.insert((*key).into(), value.clone());
+        }
+        target
+    };
+    // The caller sent no size: the error says the size came from the project's template.
+    let error = fx
+        .api
+        .begin_start(&fx.path(), image(&[]), "claude")
+        .unwrap_err();
+    assert!(
+        error.contains("saved with the project's template")
+            && error.contains("not a billable shape")
+            && error.contains("3 CPUs, 5g"),
+        "{error}"
+    );
+    assert!(error.contains("target.cpus"), "{error}");
+    // Sending only one half still meets the other, stored, half.
+    let error = fx
+        .api
+        .begin_start(&fx.path(), image(&[("cpus", json!(4))]), "claude")
+        .unwrap_err();
+    assert!(
+        error.contains("memory saved with the project's template"),
+        "{error}"
+    );
+    let error = fx
+        .api
+        .begin_start(&fx.path(), image(&[("memory", json!("8g"))]), "claude")
+        .unwrap_err();
+    assert!(error.contains("CPU count saved with"), "{error}");
+    assert_eq!(fx.sbx.count("create"), 0, "nothing was created");
+    // A full valid size from the caller never looks at the stored one.
+    fx.api
+        .begin_start(
+            &fx.path(),
+            image(&[("cpus", json!(4)), ("memory", json!("8g"))]),
+            "claude",
+        )
+        .unwrap();
+    assert_eq!(fx.sbx.count("create"), 1);
+    // And the template itself still starts without any size.
+    let plain = start_target(CloudBackendKind::DockerSandbox, InstanceChoice::New);
+    fx.api.begin_start(&fx.path(), plain, "claude").unwrap();
+    assert_eq!(fx.sbx.count("create"), 2);
+}

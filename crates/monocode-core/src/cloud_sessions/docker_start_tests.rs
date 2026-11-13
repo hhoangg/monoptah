@@ -50,6 +50,11 @@ enum CreateMode {
     Flaky,
     /// The call could not run as the Docker account: its token is revoked.
     AccountRevoked,
+    /// The named template is not in the cloud registry.
+    TemplateMissing,
+    /// A template-mode create that fails AFTER the sandbox exists (its text still says
+    /// "template" and "not found", about something else).
+    TemplateLateFailure,
 }
 
 struct Sbx {
@@ -191,6 +196,14 @@ impl SbxRunner for Sbx {
                     CreateMode::AccountRevoked => Err(
                         "Docker account alice: token revoked or expired. Replace it in Settings > Cloud."
                             .into(),
+                    ),
+                    CreateMode::TemplateMissing => {
+                        out(false, "", "error: template 'rust-small' not found")
+                    }
+                    CreateMode::TemplateLateFailure => out(
+                        false,
+                        "",
+                        "error: template-mode sandbox sbx_late: network not found",
                     ),
                 }
             }
@@ -5340,5 +5353,288 @@ mod claude_pins {
             .forget_cloud(&CloudRef::sandbox(&name))
             .unwrap();
         assert_eq!(pin(&fx, &name), None);
+    }
+}
+
+// ------------------------------------------------ template and image environments
+
+mod environment {
+    use super::*;
+    use crate::remote::SandboxMode;
+    use crate::sandboxes::SandboxSource;
+
+    fn template_config() -> DockerProjectConfig {
+        DockerProjectConfig {
+            environment: SandboxSource::Template {
+                name: "rust-small".into(),
+            },
+            ..config()
+        }
+    }
+    fn image_config() -> DockerProjectConfig {
+        DockerProjectConfig {
+            environment: SandboxSource::Image {
+                reference: "docker.io/library/rust:slim".into(),
+            },
+            ..config()
+        }
+    }
+    fn begin(fx: &Fx, config: &DockerProjectConfig) -> Result<(Session, StartRecord), String> {
+        fx.svc
+            .begin_sandbox_start("/Users/me/widgets", config, "fix/login", "claude")
+    }
+    fn create_call(fx: &Fx) -> String {
+        fx.sbx
+            .calls()
+            .into_iter()
+            .find(|c| c.split_whitespace().nth(2) == Some("create"))
+            .expect("a create call")
+    }
+    fn machine_target(fx: &Fx) -> crate::remote::SandboxTarget {
+        fx.host.machines.lock().unwrap()[0].sandbox.clone().unwrap()
+    }
+
+    #[test]
+    fn a_template_start_creates_from_the_template_without_a_size_and_runs_plain() {
+        // The repository HAS a devcontainer; the template's toolchain wins by default.
+        let fx = fx();
+        let (session, record) = begin(&fx, &template_config()).unwrap();
+        let create = create_call(&fx);
+        assert!(create.contains("--template rust-small"), "{create}");
+        assert!(
+            !create.contains("--cpus") && !create.contains("--memory"),
+            "{create}"
+        );
+        assert_eq!(record.machine.as_deref(), Some("template rust-small"));
+        let (result, events) = fx.run(session.id);
+        result.unwrap();
+        // No Dev Container CLI install, no lookup, no container, no relay.
+        assert_eq!(
+            fx.shell.tags(),
+            [
+                "phase:setup",
+                "phase:approve",
+                "phase:clone",
+                "gitconfig",
+                "bootstrap",
+                "evidence"
+            ]
+        );
+        assert!(fx
+            .shell
+            .call("phase:setup")
+            .stdin
+            .contains("DEVCONTAINER='0'"));
+        assert_eq!(machine_target(&fx).mode, SandboxMode::Plain);
+        let last = events
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                StartEvent::Updated(record) => Some(record.clone()),
+                _ => None,
+            })
+            .unwrap();
+        for kind in [StepKind::BuildContainer, StepKind::BlockingCommands] {
+            assert_eq!(status(&last, kind), StepStatus::Skipped, "{kind:?}");
+        }
+        assert_eq!(status(&last, StepKind::Connect), StepStatus::Done);
+        // Never the stock sandbox's kit.
+        assert!(!create.ends_with("shell"), "{create}");
+    }
+
+    #[test]
+    fn a_template_start_may_ask_for_the_dev_container_after_all() {
+        let fx = fx();
+        let mut cfg = template_config();
+        cfg.use_devcontainer = Some(true);
+        let (session, _) = begin(&fx, &cfg).unwrap();
+        fx.run(session.id).0.unwrap();
+        let tags = fx.shell.tags();
+        assert!(tags.contains(&"detect".to_string()) && tags.contains(&"relay".to_string()));
+        assert!(fx
+            .shell
+            .call("phase:setup")
+            .stdin
+            .contains("DEVCONTAINER='1'"));
+        assert_eq!(machine_target(&fx).mode, SandboxMode::Container);
+        // The template still sent no size.
+        assert!(!create_call(&fx).contains("--cpus"));
+    }
+
+    #[test]
+    fn an_image_start_sends_the_reference_and_the_size_and_runs_plain() {
+        let fx = fx();
+        let (session, record) = begin(&fx, &image_config()).unwrap();
+        let create = create_call(&fx);
+        assert!(
+            create.contains("--cpus 2 --memory 4g")
+                && create.contains("--image-ref docker.io/library/rust:slim"),
+            "{create}"
+        );
+        assert!(!create.contains("--template"));
+        assert_eq!(record.machine.as_deref(), Some("2 CPU / 4g"));
+        fx.run(session.id).0.unwrap();
+        assert!(!fx.shell.tags().contains(&"detect".to_string()));
+        assert_eq!(machine_target(&fx).mode, SandboxMode::Plain);
+    }
+
+    #[test]
+    fn the_default_start_is_unchanged() {
+        let fx = fx();
+        let (session, _) = fx.begin().unwrap();
+        let create = create_call(&fx);
+        assert!(
+            create.contains("--cpus 2 --memory 4g") && create.ends_with(" shell"),
+            "{create}"
+        );
+        assert!(!create.contains("--template") && !create.contains("--image-ref"));
+        fx.run(session.id).0.unwrap();
+        assert!(fx
+            .shell
+            .call("phase:setup")
+            .stdin
+            .contains("DEVCONTAINER='1'"));
+        assert!(fx.shell.tags().contains(&"detect".to_string()));
+    }
+
+    #[test]
+    fn the_environment_survives_a_restart_in_the_stored_record() {
+        let fx = fx();
+        let (session, _) = begin(&fx, &template_config()).unwrap();
+        let stored = fx.record(session.id).unwrap();
+        let start = stored.sandbox_start.unwrap();
+        assert_eq!(start.config.environment, template_config().environment);
+        assert!(!start.config.uses_devcontainer());
+        // A record written before the field existed is the default sandbox.
+        let mut value = serde_json::to_value(&start).unwrap();
+        let config = value["config"].as_object_mut().unwrap();
+        config.remove("environment");
+        config.remove("useDevcontainer");
+        let old: super::super::docker_start::SandboxStart = serde_json::from_value(value).unwrap();
+        assert!(old.config.environment.is_default() && old.config.uses_devcontainer());
+    }
+
+    #[test]
+    fn a_missing_template_leaves_no_session_and_no_record() {
+        let fx = fx_with(CreateMode::TemplateMissing, None);
+        let error = begin(&fx, &template_config()).unwrap_err();
+        assert!(error.contains("template 'rust-small' not found"), "{error}");
+        assert!(pending_starts(&fx.store.lock().unwrap()).is_empty());
+        assert_eq!(fx.sbx.count("create"), 1);
+    }
+
+    #[test]
+    fn a_late_template_mode_failure_stays_ambiguous_and_keeps_the_record() {
+        // The text has "template" and "not found", but about something other than the
+        // template we asked for: the sandbox may exist and bill, so the record stays.
+        let fx = fx_with(
+            CreateMode::TemplateLateFailure,
+            Some(("CLAUDE_CODE_OAUTH_TOKEN", SECRET.into())),
+        );
+        let (session, record) = begin(&fx, &template_config()).unwrap();
+        assert!(record.is_failed());
+        assert!(record
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("network not found"));
+        assert!(fx.record(session.id).unwrap().is_failed());
+        assert!(!pending_starts(&fx.store.lock().unwrap()).is_empty());
+        // A retry looks the name up first, as for any unclear failure.
+        let before = fx.sbx.count("ls");
+        assert!(fx.run(session.id).0.is_err());
+        assert!(fx.sbx.count("ls") > before);
+    }
+
+    #[test]
+    fn only_a_refusal_about_the_requested_template_is_clear() {
+        use super::super::docker_start::is_clear_refusal_for_test as clear;
+        let t = SandboxSource::Template {
+            name: "rust-small".into(),
+        };
+        for yes in [
+            "error: template 'rust-small' not found",
+            "Error: template \"rust-small\" does not exist",
+            "template rust-small: not found",
+            "error: template not found: rust-small",
+            "error: no such template: 'rust-small'",
+        ] {
+            assert!(clear(yes, &t), "{yes}");
+        }
+        for no in [
+            "error: template-mode sandbox sbx_late: network not found",
+            "error: template 'other' not found",
+            "error: template 'rust-small-2' not found",
+            "error: sandbox from template rust-small: network not found",
+            "error: template not found: rust-small-2",
+            "error: image 'rust-small' not found",
+            "error: internal server error",
+        ] {
+            assert!(!clear(no, &t), "{no}");
+        }
+        // The template text does not apply to an image or the default sandbox.
+        let image = SandboxSource::Image {
+            reference: "rust-small".into(),
+        };
+        assert!(!clear("error: template 'rust-small' not found", &image));
+        assert!(!clear(
+            "error: template 'rust-small' not found",
+            &SandboxSource::Default
+        ));
+        // The generic refusals still count for every source.
+        assert!(clear("error: quota exceeded", &SandboxSource::Default));
+    }
+
+    #[test]
+    fn a_template_or_image_is_created_as_the_projects_docker_account() {
+        use crate::docker_accounts::test_support::Installed;
+        let installed = Installed::new();
+        let account = installed.add("alice");
+        for mut cfg in [template_config(), image_config()] {
+            cfg.docker_account = Some(account.clone());
+            let fx = fx();
+            begin(&fx, &cfg).unwrap();
+            let creates: Vec<_> = fx
+                .sbx
+                .verbs_with_accounts()
+                .into_iter()
+                .filter(|(verb, _)| verb == "create")
+                .collect();
+            assert_eq!(creates.len(), 1, "{:?}", fx.sbx.calls());
+            assert_eq!(creates[0].1.as_deref(), Some(account.as_str()));
+            let create = create_call(&fx);
+            assert!(
+                create.contains("--template") || create.contains("--image-ref"),
+                "{create}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_template_start_does_not_need_a_billable_size_but_an_image_does() {
+        let fx = fx();
+        let mut cfg = template_config();
+        cfg.cpus = 3;
+        cfg.memory = "5g".into();
+        assert!(begin(&fx, &cfg).is_ok());
+        let mut image = image_config();
+        image.cpus = 3;
+        image.memory = "5g".into();
+        let error = begin(&fx, &image).unwrap_err();
+        assert!(error.contains("billable shape"), "{error}");
+        assert_eq!(fx.sbx.count("create"), 1);
+    }
+
+    #[test]
+    fn a_bad_name_never_reaches_sbx() {
+        let fx = fx();
+        for bad in ["--cpus=64", "two words", ""] {
+            let cfg = DockerProjectConfig {
+                environment: SandboxSource::Template { name: bad.into() },
+                ..config()
+            };
+            assert!(begin(&fx, &cfg).is_err(), "{bad:?}");
+        }
+        assert_eq!(fx.sbx.count("create"), 0);
     }
 }

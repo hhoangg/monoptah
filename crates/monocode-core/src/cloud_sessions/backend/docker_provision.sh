@@ -1,9 +1,18 @@
 set -eu
 # Provisions the OUTER sandbox. The app prepends the variables PHASE, REPO_URL,
-# REPO_DIR, BASE_REF, BRANCH and CACHE_TIMEOUT (seconds the credential stays cached). Nothing here holds a secret: the Git credential
+# REPO_DIR, BASE_REF, BRANCH and CACHE_TIMEOUT (seconds the credential stays cached) and
+# DEVCONTAINER (0 skips installing the Dev Container CLI: a template or image sandbox runs
+# without a dev container; absent means 1). Nothing here holds a secret: the Git credential
 # arrives on stdin in the `approve` phase only and is kept in memory by
 # git-credential-cache, never written to disk.
 umask 077
+# A template or image sandbox may log in as a user whose HOME is not exported (no assumption of
+# root or `agent`): take it from the passwd entry of the current uid.
+if [ -z "${HOME:-}" ]; then
+  HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)
+  [ -n "$HOME" ] || { echo 'Cannot tell the home folder of the sandbox user.' >&2; exit 1; }
+  export HOME
+fi
 STATE="$HOME/.monoptah"
 GITDIR="$STATE/git"
 SOCK="$GITDIR/sock"
@@ -11,21 +20,23 @@ case "$PHASE" in
 setup)
   mkdir -p "$STATE/run" "$GITDIR" "$HOME/workspaces"
   chmod 700 "$STATE" "$GITDIR"
-  if ! command -v xz >/dev/null 2>&1; then
-    echo '[monoptah] installing xz-utils'
-    sudo -n apt-get install -y xz-utils >/dev/null 2>&1 || {
-      sudo -n apt-get update >/dev/null 2>&1 || true
-      sudo -n apt-get install -y xz-utils >/dev/null
-    }
+  if [ "${DEVCONTAINER:-1}" != 0 ]; then
+    if ! command -v xz >/dev/null 2>&1; then
+      echo '[monoptah] installing xz-utils'
+      sudo -n apt-get install -y xz-utils >/dev/null 2>&1 || {
+        sudo -n apt-get update >/dev/null 2>&1 || true
+        sudo -n apt-get install -y xz-utils >/dev/null
+      }
+    fi
+    if [ ! -x "$HOME/.devcontainers/bin/devcontainer" ]; then
+      echo '[monoptah] installing the Dev Container CLI'
+      curl --proto '=https' -fsSL --connect-timeout 15 --max-time 300 \
+        https://raw.githubusercontent.com/devcontainers/cli/v0.90.0/scripts/install.sh \
+        -o "$STATE/install-devcontainer.sh"
+      sh "$STATE/install-devcontainer.sh" --version 0.90.0 >/dev/null
+    fi
+    [ -x "$HOME/.devcontainers/bin/devcontainer" ] || { echo 'The Dev Container CLI is not installed.' >&2; exit 1; }
   fi
-  if [ ! -x "$HOME/.devcontainers/bin/devcontainer" ]; then
-    echo '[monoptah] installing the Dev Container CLI'
-    curl --proto '=https' -fsSL --connect-timeout 15 --max-time 300 \
-      https://raw.githubusercontent.com/devcontainers/cli/v0.90.0/scripts/install.sh \
-      -o "$STATE/install-devcontainer.sh"
-    sh "$STATE/install-devcontainer.sh" --version 0.90.0 >/dev/null
-  fi
-  [ -x "$HOME/.devcontainers/bin/devcontainer" ] || { echo 'The Dev Container CLI is not installed.' >&2; exit 1; }
   echo "MONOPTAH_HOME=$HOME"
   ;;
 approve)

@@ -368,6 +368,24 @@ impl Conversation {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let locked = self.cloud_creating();
+        // A template fixes the sandbox size: a plain line saying so replaces the menu, and
+        // the row can never read as changed for this session.
+        if row_kind == CloudRow::Size
+            && self
+                .cloud_draft
+                .as_ref()
+                .is_some_and(|draft| draft.size_from_template())
+        {
+            return row(row_kind.id(), row_kind.icon(), row_kind.label(), false).child(
+                div()
+                    .id("cloud-size-from-template")
+                    .debug_selector(|| "cloud-size-from-template".into())
+                    .flex_shrink_0()
+                    .text_size(px(12.))
+                    .text_color(content(0.45))
+                    .child(presets::SIZE_FROM_TEMPLATE),
+            );
+        }
         let open = self.menu_is(ComposerMenu::CloudField(field));
         let (id, changed) = (row_kind.id(), self.cloud_row_changed(row_kind));
         row(id, row_kind.icon(), row_kind.label(), changed)
