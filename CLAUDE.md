@@ -80,6 +80,61 @@ On macOS the dev bundle reads the same overlay through `TAURI_CONFIG` in
 `src-tauri/src/macos.rs`. Without that, the bundle would keep the production
 identifier and share WebKit storage (localStorage) with the installed app.
 
+For the native app, run Native Dev from a clean worktree that matches origin, so what you
+see is what was pushed:
+
+```bash
+npm run native:dev -- --detach
+```
+
+`--detach` keeps the app alive when the task that started it ends (a background task
+would otherwise take it down) and writes its stdout and stderr to a log file whose path it
+prints. Native Dev keeps its data in `~/Library/Application Support/Monoptah Development`,
+separate from the installed app.
+
+## Developing the native app
+
+These rules are team-wide and come from measurement: one session spent about 468 minutes
+on about 240 cargo test runs because it re-ran tests after every small edit. Each run
+relinks the large `monocode-gpui` test binary (median 1.4 min, p90 4.1 min).
+
+- **Test in one pass per task.** Make all the edits for a task first. Then run `cargo fmt`,
+  clippy and only the related tests, filtered to the touched modules, once, in a single
+  pass. Fix and rerun only what failed. Do not run tests after each small edit. Run the full
+  `npm run native:check` once per batch (before a release or a merge to main), not per task:
+  CI runs the GPUI and core suites on Linux for every PR (see "What CI checks").
+- **Seed the build cache in a new worktree.** Before the first cargo command, clone an
+  existing target dir from the main checkout (or another worktree that has one) so crates
+  are not rebuilt from scratch. The native workspace (`monocode-gpui` and `monocode-core`)
+  builds into `crates/monocode-gpui/target`; the root workspace (`src-tauri`,
+  `crates/mobile-link`) builds into `target`. On macOS `cp -c -R` makes an APFS clone,
+  which is instant and takes no extra space:
+
+  ```bash
+  cp -c -R <checkout>/crates/monocode-gpui/target crates/monocode-gpui/target
+  ```
+
+  Elsewhere use plain `cp -R` (a real copy).
+- **Keep tests Linux-portable.** GPUI tests run on Ubuntu in CI. Use `secondary-...`
+  keystrokes (cmd on macOS, ctrl elsewhere), never `cmd-...`. Do not assume macOS paths,
+  Keychain, WKWebView, AVPlayer or Metal. A test that truly runs only on macOS gets
+  `#[cfg_attr(not(target_os = "macos"), ignore = "<specific reason>")]` or
+  `#[cfg(target_os = "macos")]`. Never weaken an assertion to make a test pass.
+- **Fix at the root, in the shared component.** Prefer the shared pieces (the modal dialog in
+  `crates/monocode-gpui/src/modal.rs`, the popover menus and choice selects in
+  `crates/monocode-gpui/src/popover.rs`, the one `sbx` runner in
+  `crates/monocode-core/src/sandboxes.rs`) so a fix reaches every caller. The first fix for the dialog
+  input barrier went into individual dialogs and covered 2 of about 35.
+- **Review once per request.** Agents do one review per user request, not one per step. The
+  implementer hands over a checklist that maps each point of the request to its change
+  (`file:line`) and its test. The reviewer gets the original request, marks each point done
+  or missing with evidence, then reviews the diff. Reviewers read code; they build or run
+  tests only to prove a specific finding. High-risk changes (tokens and secrets, deleting
+  data, migrations, billable cloud lifecycle) get their own review.
+- **No realistic secrets in tests.** GitHub push protection blocks realistic-looking tokens
+  such as `dckr_pat_...` in test sources. Build fake tokens with `concat!` or use obviously
+  fake values.
+
 ## Releasing
 
 Releases are native only for now, see "Releasing the native app". The Tauri workflows
@@ -147,7 +202,8 @@ no native path changed) and the `CI passed` job is the single check to require f
 (clippy of the macOS-only code that Linux and Windows never compile); when you change macOS-only
 code or tests gated to macOS, also run the tests you touched on macOS. `npm run native:check`
 (the full gate, including the GPUI tests on macOS) still runs locally in `native:release:mac`
-before every release.
+before every release. How often to run which check while developing is in "Developing the
+native app".
 
 1. Edit `docs/native/monoptah-release-notes.md` (its first line must be
    `# Monoptah Native X.Y.Z`) and merge it into main through a PR.
