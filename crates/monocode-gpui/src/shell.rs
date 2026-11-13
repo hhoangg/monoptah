@@ -49,7 +49,7 @@ pub(crate) use live_agents::live_elapsed;
 mod mobile_host;
 mod mono_panes;
 pub(crate) mod monos;
-mod new_chat_choice;
+pub(crate) mod new_chat_choice;
 #[cfg(test)]
 mod new_chat_choice_tests;
 mod notifications;
@@ -1034,6 +1034,13 @@ impl Shell {
         let data_dir = locked(&store)
             .ok()
             .and_then(|store| store.data_dir().map(std::path::Path::to_path_buf));
+        crate::emoji_library::install(
+            store.clone(),
+            &data_dir.clone().unwrap_or_else(|| {
+                std::env::temp_dir().join(format!("monocode-emoji-{}", std::process::id()))
+            }),
+            cx,
+        );
         let remote_dir = data_dir.clone().unwrap_or_else(|| {
             std::env::temp_dir().join(format!("monocode-remote-{}", std::process::id()))
         });
@@ -1505,6 +1512,16 @@ impl Shell {
                             this.set_right_panel_open(true, window, cx);
                         }
                     });
+                })
+                .detach();
+            },
+        ));
+        this.observations.push(cx.subscribe(
+            &monos,
+            |_, _, _: &crate::monos::ShowEmojiLibrary, cx| {
+                cx.spawn(async move |this, cx| {
+                    let _ =
+                        this.update_in(cx, |this, window, cx| this.open_emoji_library(window, cx));
                 })
                 .detach();
             },

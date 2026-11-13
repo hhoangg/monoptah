@@ -1,7 +1,8 @@
-//! Per-Mono picture emoji: the packs a user imported, the emotions they are sorted into,
-//! and the settings that let a Mono use them in replies. See `docs/native/mono-emoji.md`.
+//! The shared picture emoji library: the packs a user imported, the emotions they are sorted
+//! into, and the per-Mono settings that let a Mono use some of those packs in replies. See
+//! `docs/native/mono-emoji.md`.
 //!
-//! Layout, inside the Mono's folder:
+//! Layout, inside the app data folder:
 //! `emoji/emoji.json` (metadata), `emoji/packs/<pack id>/<hash>.<ext>` (images) and
 //! `emoji/.staging-<uuid>/` (an import that is not confirmed yet).
 
@@ -86,6 +87,36 @@ pub enum Frequency {
     Often,
 }
 
+/// What one Mono keeps about emoji: the switch, how often, and which packs of the shared
+/// library it may use. It lives on the Mono in the roster. A new pack is never added to it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MonoEmoji {
+    pub enabled: bool,
+    pub frequency: Frequency,
+    /// Ids of the selected packs. An id that is not in the library is ignored.
+    pub packs: Vec<String>,
+}
+
+impl MonoEmoji {
+    /// Whether nothing was ever changed, so the roster need not store it.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn uses(&self, pack_id: &str) -> bool {
+        self.packs.iter().any(|id| id == pack_id)
+    }
+
+    /// Select or deselect a pack.
+    pub fn set_pack(&mut self, pack_id: &str, on: bool) {
+        self.packs.retain(|id| id != pack_id);
+        if on {
+            self.packs.push(pack_id.to_owned());
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Emotion {
@@ -119,27 +150,14 @@ impl Default for Emoji {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Pack {
     pub id: String,
     pub name: String,
-    pub enabled: bool,
     /// The model label used for the sorting, or none when imported without sorting.
     pub sorted_by: Option<String>,
     pub emoji: Vec<Emoji>,
-}
-
-impl Default for Pack {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            name: String::new(),
-            enabled: true,
-            sorted_by: None,
-            emoji: Vec::new(),
-        }
-    }
 }
 
 /// The content of `emoji.json`.
@@ -147,8 +165,6 @@ impl Default for Pack {
 #[serde(rename_all = "camelCase", default)]
 pub struct Library {
     pub version: u32,
-    pub enabled: bool,
-    pub frequency: Frequency,
     pub emotions: Vec<Emotion>,
     pub packs: Vec<Pack>,
 }
@@ -168,8 +184,6 @@ impl Default for Library {
     fn default() -> Self {
         Self {
             version: VERSION,
-            enabled: false,
-            frequency: Frequency::Sometimes,
             emotions: default_emotions(),
             packs: Vec::new(),
         }
@@ -184,13 +198,15 @@ pub struct Loaded {
     pub read_only: bool,
 }
 
-/// The Mono's emoji folder. `root` is `mono::root(store)`. Nothing here is reachable
-/// through `files::resolve_file`, so the Mono's own CLI cannot read these files.
-pub fn dir(root: &Path, mono_id: &str) -> Result<PathBuf, String> {
-    if !super::files::valid_id(mono_id) {
-        return Err("Not a Mono id".into());
-    }
-    Ok(root.join(mono_id).join("emoji"))
+/// The shared emoji folder inside the app data folder. Nothing here is reachable through
+/// `files::resolve_file`, so a Mono's own CLI cannot read these files.
+pub fn dir(data: &Path) -> PathBuf {
+    data.join("emoji")
+}
+
+/// The shared emoji folder for `root`, which is `mono::root(store)` (`<data>/monos`).
+pub fn dir_for_root(root: &Path) -> PathBuf {
+    dir(root.parent().unwrap_or(root))
 }
 
 /// The last path component only, so a hand-edited name cannot climb out of its folder.
@@ -210,7 +226,7 @@ pub fn image_path(dir: &Path, pack: &Pack, emoji: &Emoji) -> PathBuf {
 
 /// Remove every `.staging-*` folder (an import that was not confirmed) and every `sort-*`
 /// scratch folder (thumbnails of a sorting that was interrupted). Only call this when no
-/// import or sorting of this Mono is under way: `load` never does, so a turn cannot delete
+/// import or sorting is under way: `load` never does, so a turn cannot delete
 /// the folder of an import that is open.
 pub fn clean_stale(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -254,8 +270,7 @@ fn disk_version(text: &str) -> Result<u32, String> {
 
 /// Read the library. A missing file gives the default. A file that cannot be parsed is an
 /// error and is left as it is. A newer version comes back read-only.
-pub fn load(root: &Path, mono_id: &str) -> Result<Loaded, String> {
-    let dir = dir(root, mono_id)?;
+pub fn load(dir: &Path) -> Result<Loaded, String> {
     let path = dir.join(FILE);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
@@ -294,8 +309,7 @@ fn valid_emotion_name(name: &str) -> bool {
 }
 
 /// Write the library atomically. Refuses when the file on disk is newer or unreadable.
-pub fn save(root: &Path, mono_id: &str, library: &Library) -> Result<(), String> {
-    let dir = dir(root, mono_id)?;
+pub fn save(dir: &Path, library: &Library) -> Result<(), String> {
     let path = dir.join(FILE);
     match std::fs::read_to_string(&path) {
         Ok(text) => {
@@ -306,7 +320,7 @@ pub fn save(root: &Path, mono_id: &str, library: &Library) -> Result<(), String>
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("{}: {e}", path.display())),
     }
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let mut library = library.clone();
     library.version = VERSION;
     let text = serde_json::to_string_pretty(&library).map_err(|e| e.to_string())?;
@@ -448,12 +462,6 @@ impl Library {
         }
     }
 
-    pub fn set_pack_enabled(&mut self, pack_id: &str, enabled: bool) {
-        if let Some(pack) = self.packs.iter_mut().find(|p| p.id == pack_id) {
-            pack.enabled = enabled;
-        }
-    }
-
     /// Drop a pack from the library and delete its folder (only inside `<dir>/packs/`).
     pub fn remove_pack(&mut self, dir: &Path, pack_id: &str) -> Result<(), String> {
         if !super::files::valid_id(pack_id) {
@@ -492,7 +500,7 @@ impl Library {
         self.emotions = defaults;
     }
 
-    /// Add a pack (enabled) and return its new id. The display name is made unique.
+    /// Add a pack and return its new id. The display name is made unique.
     pub fn add_pack(&mut self, name: &str, sorted_by: Option<String>, emoji: Vec<Emoji>) -> String {
         let wanted = match name.trim() {
             "" => "Emoji pack",
@@ -511,7 +519,6 @@ impl Library {
         self.packs.push(Pack {
             id: id.clone(),
             name,
-            enabled: true,
             sorted_by,
             emoji,
         });
@@ -556,30 +563,34 @@ impl Library {
             .collect()
     }
 
-    /// Emotions with at least one emoji in an enabled pack, in order.
-    pub fn usable_emotions(&self) -> Vec<&Emotion> {
+    /// Emotions with at least one emoji in one of the `selected` packs, in order. An id that
+    /// is not a pack of this library is ignored.
+    pub fn usable_emotions(&self, selected: &[String]) -> Vec<&Emotion> {
         self.emotions
             .iter()
             .filter(|emotion| {
-                self.packs.iter().filter(|p| p.enabled).any(|p| {
-                    p.emoji
-                        .iter()
-                        .any(|e| e.emotion.as_deref() == Some(&emotion.id))
-                })
+                self.packs
+                    .iter()
+                    .filter(|p| selected.contains(&p.id))
+                    .any(|p| {
+                        p.emoji
+                            .iter()
+                            .any(|e| e.emotion.as_deref() == Some(&emotion.id))
+                    })
             })
             .collect()
     }
 
-    /// The emoji of the emotion called `emotion_name` in enabled packs, ordered by pack id
-    /// and then file so a pick is stable.
-    pub fn candidates(&self, emotion_name: &str) -> Vec<(&Pack, &Emoji)> {
+    /// The emoji of the emotion called `emotion_name` in the `selected` packs, ordered by
+    /// pack id and then file so a pick is stable.
+    pub fn candidates(&self, emotion_name: &str, selected: &[String]) -> Vec<(&Pack, &Emoji)> {
         let Some(id) = self.emotion_id(emotion_name) else {
             return Vec::new();
         };
         let mut found: Vec<(&Pack, &Emoji)> = self
             .packs
             .iter()
-            .filter(|p| p.enabled)
+            .filter(|p| selected.contains(&p.id))
             .flat_map(|p| {
                 p.emoji
                     .iter()
@@ -603,13 +614,13 @@ pub fn format_counts(pack: &Pack) -> Vec<(Format, usize)> {
         .collect()
 }
 
-/// The `<emoji>` block of the Mono context, or none when the feature is off or no emotion
-/// has a picture to show.
-pub fn context_block(library: &Library) -> Option<String> {
-    if !library.enabled {
+/// The `<emoji>` block of the Mono context, or none when the Mono's switch is off or no
+/// emotion has a picture in the packs it selected.
+pub fn context_block(library: &Library, mono: &MonoEmoji) -> Option<String> {
+    if !mono.enabled {
         return None;
     }
-    let usable = library.usable_emotions();
+    let usable = library.usable_emotions(&mono.packs);
     if usable.is_empty() {
         return None;
     }
@@ -627,7 +638,7 @@ pub fn context_block(library: &Library) -> Option<String> {
     /// Shown in every mode, after the frequency line.
     const EXPLICIT_REQUEST: &str =
         "If the user explicitly asks for emoji (for example \"send several\"), you may use more than this limit.";
-    let frequency = match library.frequency {
+    let frequency = match mono.frequency {
         Frequency::Rarely => {
             "Rarely: at most one emoji, in about one reply in five, only for a clear mood."
         }

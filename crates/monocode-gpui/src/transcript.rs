@@ -905,13 +905,16 @@ impl TranscriptView {
         self.list.set_follow_mode(FollowMode::Tail);
         self.scroll_bound = false;
     }
-    /// Set (or clear) the Mono's emoji library. Every message is laid out again, because the
+    /// Set (or clear) the shared emoji library and the Mono's packs. Every message is laid out again, because the
     /// pictures, and whether tokens show at all, come from it.
     pub(crate) fn set_emoji(&mut self, emoji: Option<emoji::MonoEmoji>, cx: &mut Context<Self>) {
         let unchanged = match (&self.emoji, &emoji) {
             (None, None) => true,
             (Some(a), Some(b)) => {
-                Arc::ptr_eq(&a.library, &b.library) && a.dir == b.dir && a.session == b.session
+                Arc::ptr_eq(&a.library, &b.library)
+                    && a.dir == b.dir
+                    && a.packs == b.packs
+                    && a.session == b.session
             }
             _ => false,
         };

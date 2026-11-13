@@ -1,32 +1,48 @@
-//! The "Import emoji packs" dialog: unpack each zip, let the Mono's model suggest an emotion for
-//! every image, review the suggestion, then save. Re-sorting a pack reuses the same dialog.
+//! The "Import emoji packs" dialog: unpack each zip, let a model suggest an emotion for every
+//! image, review the suggestion, then save. Re-sorting a pack reuses the same dialog. The model
+//! is chosen in the dialog with the shared model picker.
 //!
 //! Unpacking and sorting run on the background executor and report through a channel. Cancel
-//! stops the whole queue: it sets one shared flag, deletes the staging folder and saves nothing
+//! stops the whole queue: it sets the shared flags, deletes the staging folder and saves nothing
 //! for the zip that was open.
-use super::emoji_ui::{format_list, format_text, picture};
-use super::*;
-use crate::{cloud_mark::CloudTip, modal};
-use gpui::FontWeight;
+use super::{EmojiLibraryView, SortModel, format_list, format_text, picture, store::READ_ONLY};
+use crate::{
+    cloud_mark::CloudTip,
+    modal,
+    pickers::{ModelList, ModelPicked, cached_model_name},
+    popover::{Align, Anchor, Menu, MenuEvent, MenuItem, Popover, menu_popover, popover},
+    runtime::{Database, locked},
+    theme::*,
+};
+use gpui::{
+    AnyElement, App, Context, FontWeight, Role, SharedString, Subscription, Window, div,
+    prelude::*, px,
+};
 use monocode_core::{
-    agent::AccessMode,
+    agent::{AccessMode, Settings},
     mono::emoji::{
         self, Format,
         import::{self, Limits, Staged},
         sort::{self, EmotionRef, Progress, Sorted, Source},
     },
-    provider::{self, Request},
+    provider::{self, Kind, Request},
 };
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 const PRIORITY: usize = 85;
+/// Above the dialog, so the model list opens over it.
+const PICKER_PRIORITY: usize = 90;
 const NOTE: &str = "Files are copied into Monoptah's data folder; the zip can be deleted.";
 
-/// What a sorting run needs from the Mono's chat to talk to its model.
-pub(super) struct SortParts {
+/// What a sorting run needs to talk to the chosen model.
+pub(crate) struct SortParts {
     pub kind: Kind,
     pub model: Option<String>,
     pub cwd: String,
@@ -34,10 +50,10 @@ pub(super) struct SortParts {
     pub store: Database,
 }
 
-/// Makes the runner that asks the model, from the Mono's chat settings. It runs on a background
-/// thread. `Ok(None)` means there is no model to ask, so emoji are sorted by their file names.
-/// Tests replace it; under `cfg(test)` the default never starts a real model.
-pub(super) type SorterFactory =
+/// Makes the runner that asks the model, from the chosen provider, model and account. It runs
+/// on a background thread. `Ok(None)` means there is no model to ask, so emoji are sorted by
+/// their file names. Tests replace it; under `cfg(test)` the default never starts a real model.
+pub(crate) type SorterFactory =
     Arc<dyn Fn(SortParts) -> Result<Option<Arc<dyn sort::Runner>>, String> + Send + Sync>;
 
 pub(super) fn default_sorter() -> SorterFactory {
@@ -79,7 +95,7 @@ pub(super) fn default_sorter() -> SorterFactory {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum ItemState {
+pub(crate) enum ItemState {
     Waiting,
     Unpacking,
     Sorting,
@@ -105,7 +121,7 @@ impl ItemState {
     }
 }
 
-pub(super) struct QueueItem {
+pub(crate) struct QueueItem {
     pub path: PathBuf,
     pub name: String,
     pub size: u64,
@@ -113,26 +129,26 @@ pub(super) struct QueueItem {
 }
 
 #[derive(Clone)]
-pub(super) enum Mode {
+pub(crate) enum Mode {
     Import,
     Resort { pack: String, name: String },
 }
 
 /// What the unpacking kept, for the "Kept N images" line.
-pub(super) struct Kept {
+pub(crate) struct Kept {
     count: usize,
     formats: Vec<(Format, usize)>,
     skipped: String,
 }
 
-pub(super) struct Review {
+pub(crate) struct Review {
     pub suggestion: HashMap<String, Option<String>>,
     pub source: Source,
 }
 
 /// The zip being worked on.
 #[derive(Default)]
-pub(super) struct Step {
+pub(crate) struct Step {
     staged: Option<Staged>,
     entries: Option<usize>,
     kept: Option<Kept>,
@@ -141,15 +157,19 @@ pub(super) struct Step {
     pub review: Option<Review>,
 }
 
-pub(super) struct ImportDialog {
-    pub mono: String,
-    mono_name: String,
+pub(crate) struct ImportDialog {
+    model: SortModel,
     model_label: String,
     mode: Mode,
     pub queue: Vec<QueueItem>,
-    current: usize,
+    pub current: usize,
     pub step: Option<Step>,
+    /// Stops unpacking, and the dialog as a whole.
     cancel: Arc<AtomicBool>,
+    /// Stops the sorting run that is going; a new run (another model) gets a new flag.
+    sort_cancel: Arc<AtomicBool>,
+    /// The number of the sorting run whose events count.
+    run: u64,
     token: u64,
     focus: gpui::FocusHandle,
     /// The queue is finished but something was skipped or failed, so the dialog stays to say so.
@@ -160,6 +180,36 @@ impl ImportDialog {
     fn saving(&self) -> bool {
         self.queue.iter().any(|i| i.state == ItemState::Saving)
     }
+
+    /// Whether the model can be changed now: a zip is being sorted or waits for review.
+    fn model_changeable(&self) -> bool {
+        !self.done
+            && !self.saving()
+            && self.step.as_ref().is_some_and(|s| !s.items.is_empty())
+            && matches!(
+                self.queue.get(self.current).map(|i| &i.state),
+                Some(ItemState::Sorting | ItemState::Review)
+            )
+    }
+
+    /// Tells every background job of this dialog to stop.
+    pub(super) fn stop(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        self.sort_cancel.store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn model(&self) -> &SortModel {
+        &self.model
+    }
+}
+
+/// The open model list.
+pub(crate) struct ModelPicker {
+    menu: gpui::Entity<Menu>,
+    #[cfg(test)]
+    pub(super) list: gpui::Entity<ModelList>,
+    _events: Vec<Subscription>,
 }
 
 enum Event {
@@ -207,7 +257,7 @@ fn skipped_text(staged: &Staged) -> String {
 }
 
 /// The sentence for a names fallback: the reason may already say what happened.
-pub(super) fn names_notice(reason: &str) -> String {
+pub(crate) fn names_notice(reason: &str) -> String {
     if reason.contains("suggested from their file names") {
         reason.to_owned()
     } else {
@@ -215,94 +265,132 @@ pub(super) fn names_notice(reason: &str) -> String {
     }
 }
 
-impl Monos {
-    /// "Import zip...": the native picker, several files at once.
-    pub(super) fn emoji_pick_zips(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.emoji_ui.import.is_some() {
-            return;
+/// The sentences of the dialog that depend on the queue and the model.
+pub(crate) mod dialog_texts {
+    /// "3 files · into your emoji library", or the pack name of a re-sort.
+    pub(crate) fn subtitle(resort: bool, pack: &str, files: usize) -> String {
+        if resort {
+            format!("{pack} \u{b7} your emoji library")
+        } else if files == 1 {
+            "1 file \u{b7} into your emoji library".to_string()
+        } else {
+            format!("{files} files \u{b7} into your emoji library")
         }
-        let picked = crate::attachment_tray::pick_files(cx);
-        cx.spawn_in(window, async move |this, cx| {
-            if let Some(paths) = picked.await {
-                let _ = this.update_in(cx, |this, window, cx| {
-                    this.emoji_import_paths(paths, window, cx)
-                });
-            }
-        })
-        .detach();
     }
 
-    /// What a sorting run needs: the way to reach the Mono's model, or why there is none, the
-    /// model's label and the emotions.
-    fn emoji_sort_inputs(
-        &self,
-        mono: &str,
-        cx: &App,
-    ) -> (Result<SortParts, String>, String, Vec<EmotionRef>) {
-        let emotions = self
-            .emoji
-            .get(mono)
-            .map(|(_, library)| {
-                library
-                    .emotions
-                    .iter()
-                    .map(|e| EmotionRef {
-                        name: e.name.clone(),
-                        description: e.description.clone(),
-                    })
-                    .collect()
-            })
+    pub(crate) fn sorting_line(model: &str, done: usize, total: usize) -> String {
+        format!("Sorting into emotions with {model}... {done} of {total}")
+    }
+}
+
+/// The label of a model, as the dialog shows it.
+fn model_label(model: &SortModel) -> String {
+    cached_model_name(model.kind, model.model.as_deref()).to_string()
+}
+
+impl EmojiLibraryView {
+    /// The folder a sorting runs in: the app data folder.
+    fn work_dir(&self, cx: &App) -> String {
+        let store = self.store.read(cx);
+        store
+            .dir()
+            .parent()
+            .unwrap_or(store.dir())
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// The model a dialog starts with: the one of the Mono whose settings were opened last,
+    /// else the app's default provider and model.
+    fn default_model(&self, cx: &App) -> SortModel {
+        if let Some(model) = self.store.read(cx).last_model() {
+            return model.clone();
+        }
+        let cwd = self.work_dir(cx);
+        let prefs = cx
+            .try_global::<crate::settings::Preferences>()
+            .cloned()
             .unwrap_or_default();
-        let Some(chat) = self.chats.get(mono) else {
-            let who = self.roster.get(mono).map(Mono::label).unwrap_or_default();
-            let reason = format!("Open {who}'s chat once so its model can sort by image");
-            return (Err(reason), "This Mono's model".into(), emotions);
-        };
-        let chat = chat.read(cx);
+        let choice = crate::shell::new_chat_choice::resolve(&prefs, &cwd);
+        let account = crate::accounts::get(cx)
+            .map(|accounts| accounts.read(cx).selected(choice.kind, &cwd))
+            .unwrap_or_default();
+        SortModel {
+            kind: choice.kind,
+            model: choice.model,
+            account,
+        }
+    }
+
+    /// What a sorting run needs: the way to reach the chosen model, the model's label and the
+    /// emotions of the library.
+    fn sort_inputs(&self, cx: &App) -> (SortParts, String, Vec<EmotionRef>) {
+        let store = self.store.read(cx);
+        let emotions = store
+            .library()
+            .emotions
+            .iter()
+            .map(|e| EmotionRef {
+                name: e.name.clone(),
+                description: e.description.clone(),
+            })
+            .collect();
+        let model = self
+            .import
+            .as_ref()
+            .map(|d| d.model.clone())
+            .unwrap_or_else(|| self.default_model(cx));
         let parts = SortParts {
-            kind: Kind::from_id(&chat.summary.provider),
-            model: chat.mono_model(),
-            cwd: chat.summary.cwd.clone(),
+            kind: model.kind,
+            model: model.model.clone(),
+            cwd: self.work_dir(cx),
             settings: Settings {
-                account: chat.settings.account.clone(),
-                environment: chat.settings.environment.clone(),
-                effort: chat.settings.effort.clone(),
-                model_settings: chat.settings.model_settings.clone(),
+                account: model.account.clone(),
                 text_only: true,
                 disable_claude_hooks: true,
                 access: AccessMode::ReadOnly,
                 ..Default::default()
             },
-            store: self.store.clone(),
+            store: store.database(),
         };
-        (Ok(parts), chat.mono_model_label().to_string(), emotions)
+        (parts, model_label(&model), emotions)
+    }
+
+    /// "Import zip...": the native picker, several files at once.
+    pub(super) fn pick_zips(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.import.is_some() {
+            return;
+        }
+        let picked = crate::attachment_tray::pick_files(cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if let Some(paths) = picked.await {
+                let _ = this.update_in(cx, |this, window, cx| this.import_paths(paths, window, cx));
+            }
+        })
+        .detach();
     }
 
     /// Opens the dialog for the zips among `paths`; anything else is listed as skipped.
-    pub(super) fn emoji_import_paths(
+    pub(super) fn import_paths(
         &mut self,
         paths: Vec<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(mono) = self.active.clone() else {
-            return;
-        };
-        if self.emoji_ui.import.is_some() || paths.is_empty() {
+        if self.import.is_some() || paths.is_empty() {
             return;
         }
-        if self.emoji_ui.read_only.contains(&mono) {
-            self.emoji_ui
-                .errors
-                .insert(mono, super::emoji_ui::READ_ONLY.into());
+        let (loaded, read_only) = {
+            let store = self.store.read(cx);
+            (store.loaded(), store.read_only())
+        };
+        if read_only {
+            self.error = Some(READ_ONLY.into());
             cx.notify();
             return;
         }
-        if !self.emoji.contains_key(&mono) {
-            self.emoji_ui.errors.insert(
-                mono,
-                "The emoji settings are still loading. Try again in a moment.".into(),
-            );
+        if !loaded {
+            self.error = Some("The emoji library is still loading. Try again in a moment.".into());
             cx.notify();
             return;
         }
@@ -328,13 +416,14 @@ impl Monos {
                 }
             })
             .collect();
-        self.emoji_open_dialog(&mono, Mode::Import, queue, window, cx);
-        self.emoji_load_sizes(cx);
+        self.error = None;
+        self.open_dialog(Mode::Import, queue, window, cx);
+        self.load_sizes(cx);
     }
 
     /// Looks up the size of every picked file off the main thread.
-    fn emoji_load_sizes(&mut self, cx: &mut Context<Self>) {
-        let Some(d) = self.emoji_ui.import.as_ref() else {
+    fn load_sizes(&mut self, cx: &mut Context<Self>) {
+        let Some(d) = self.import.as_ref() else {
             return;
         };
         let token = d.token;
@@ -348,7 +437,7 @@ impl Monos {
         cx.spawn(async move |this, cx| {
             let sizes = work.await;
             let _ = this.update(cx, |this, cx| {
-                if let Some(d) = this.emoji_ui.import.as_mut().filter(|d| d.token == token) {
+                if let Some(d) = this.import.as_mut().filter(|d| d.token == token) {
                     for (item, size) in d.queue.iter_mut().zip(sizes) {
                         item.size = size;
                     }
@@ -360,56 +449,55 @@ impl Monos {
     }
 
     /// Deletes a staging folder off the main thread.
-    fn emoji_discard(&self, staged: Staged, cx: &mut Context<Self>) {
+    fn discard(&self, staged: Staged, cx: &mut Context<Self>) {
         cx.background_executor()
             .spawn(async move { import::discard(staged) })
             .detach();
     }
 
-    fn emoji_open_dialog(
+    fn open_dialog(
         &mut self,
-        mono: &str,
         mode: Mode,
         queue: Vec<QueueItem>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (_, model_label, _) = self.emoji_sort_inputs(mono, cx);
-        let mono_name = self.roster.get(mono).map(Mono::label).unwrap_or_default();
-        self.emoji_ui.next_token += 1;
+        let model = self.default_model(cx);
+        self.next_token += 1;
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
-        self.emoji_ui.import = Some(ImportDialog {
-            mono: mono.into(),
-            mono_name,
-            model_label,
+        self.import_flag.store(true, Ordering::Relaxed);
+        self.import = Some(ImportDialog {
+            model_label: model_label(&model),
+            model,
             mode,
             queue,
             current: 0,
             step: None,
             cancel: Arc::new(AtomicBool::new(false)),
-            token: self.emoji_ui.next_token,
+            sort_cancel: Arc::new(AtomicBool::new(false)),
+            run: 0,
+            token: self.next_token,
             focus,
             done: false,
         });
-        self.emoji_import_next(window, cx);
+        self.import_next(window, cx);
         cx.notify();
     }
 
     /// Re-sorts an existing pack with the same dialog, without the unpack steps.
-    pub(super) fn emoji_resort(
-        &mut self,
-        mono: &str,
-        pack_id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.emoji_ui.import.is_some() || self.emoji_ui.read_only.contains(mono) {
+    pub(super) fn resort(&mut self, pack_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let (dir, library, read_only) = {
+            let store = self.store.read(cx);
+            (
+                store.dir().to_path_buf(),
+                store.library().clone(),
+                store.read_only(),
+            )
+        };
+        if self.import.is_some() || read_only {
             return;
         }
-        let Some((dir, library)) = self.emoji.get(mono) else {
-            return;
-        };
         let Some(pack) = library.packs.iter().find(|p| p.id == pack_id) else {
             return;
         };
@@ -419,7 +507,7 @@ impl Monos {
             .map(|e| sort::Item {
                 key: e.file.clone(),
                 name: e.name.clone(),
-                path: emoji::image_path(dir, pack, e),
+                path: emoji::image_path(&dir, pack, e),
                 format: e.format,
             })
             .collect();
@@ -434,37 +522,49 @@ impl Monos {
             pack: pack_id.into(),
             name: pack_name,
         };
-        self.emoji_open_dialog(mono, mode, queue, window, cx);
-        if let Some(step) = self.emoji_ui.import.as_mut().and_then(|d| d.step.as_mut()) {
+        self.open_dialog(mode, queue, window, cx);
+        if let Some(step) = self.import.as_mut().and_then(|d| d.step.as_mut()) {
             step.progress = (0, items.len());
             step.items = items;
         }
-        self.emoji_start_resort(window, cx);
+        self.start_sort(window, cx);
     }
 
-    fn emoji_start_resort(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(d) = self.emoji_ui.import.as_ref() else {
+    /// Starts a sorting run of the open step, and stops the one that was going.
+    fn start_sort(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(d) = self.import.as_mut() else {
             return;
         };
-        let (mono, token, cancel) = (d.mono.clone(), d.token, d.cancel.clone());
-        let items = d.step.as_ref().map(|s| s.items.clone()).unwrap_or_default();
-        let (parts, label, emotions) = self.emoji_sort_inputs(&mono, cx);
-        let factory = self.emoji_ui.sorter.clone();
-        let Ok(dir) = emoji::dir(&self.root, &mono) else {
+        d.sort_cancel.store(true, Ordering::Relaxed);
+        d.sort_cancel = Arc::new(AtomicBool::new(false));
+        d.run += 1;
+        let (token, run, cancel) = (d.token, d.run, d.sort_cancel.clone());
+        let Some(step) = d.step.as_mut() else {
             return;
         };
+        step.review = None;
+        step.progress = (0, step.items.len());
+        let items = step.items.clone();
+        if let Some(item) = d.queue.get_mut(d.current) {
+            item.state = ItemState::Sorting;
+        }
+        let (parts, label, emotions) = self.sort_inputs(cx);
+        let factory = self.sorter.clone();
+        let dir = self.store.read(cx).dir().to_path_buf();
         let (tx, rx) = async_channel::unbounded();
         cx.background_executor()
             .spawn(async move {
                 sort_job(items, emotions, parts, factory, label, dir, cancel, tx);
             })
             .detach();
-        self.emoji_watch(token, rx, window, cx);
+        self.watch(token, run, rx, window, cx);
+        cx.notify();
     }
 
-    fn emoji_watch(
+    fn watch(
         &mut self,
         token: u64,
+        run: u64,
         rx: async_channel::Receiver<Event>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -473,7 +573,7 @@ impl Monos {
             while let Ok(event) = rx.recv().await {
                 let last = matches!(event, Event::Sorted(_) | Event::Failed(_));
                 let alive = this.update_in(cx, |this, window, cx| {
-                    this.emoji_import_event(token, event, window, cx)
+                    this.import_event(token, run, event, window, cx)
                 });
                 if alive.is_err() || last {
                     break;
@@ -484,8 +584,8 @@ impl Monos {
     }
 
     /// Starts the next waiting zip, or finishes when none is left.
-    fn emoji_import_next(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(d) = self.emoji_ui.import.as_mut() else {
+    fn import_next(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(d) = self.import.as_mut() else {
             return;
         };
         let Some(index) = d.queue.iter().position(|i| i.state == ItemState::Waiting) else {
@@ -497,7 +597,7 @@ impl Monos {
                 d.step = None;
                 cx.notify();
             } else {
-                self.emoji_import_close(window, cx);
+                self.import_close(window, cx);
             }
             return;
         };
@@ -508,18 +608,18 @@ impl Monos {
             return;
         }
         d.queue[index].state = ItemState::Unpacking;
-        let (mono, token, cancel) = (d.mono.clone(), d.token, d.cancel.clone());
+        d.sort_cancel.store(true, Ordering::Relaxed);
+        d.sort_cancel = Arc::new(AtomicBool::new(false));
+        d.run += 1;
+        let (token, run, cancel, sort_cancel) =
+            (d.token, d.run, d.cancel.clone(), d.sort_cancel.clone());
         let zip = d.queue[index].path.clone();
-        let Ok(dir) = emoji::dir(&self.root, &mono) else {
-            return;
+        let (dir, existing) = {
+            let store = self.store.read(cx);
+            (store.dir().to_path_buf(), store.library().known_hashes())
         };
-        let existing = self
-            .emoji
-            .get(&mono)
-            .map(|(_, l)| l.known_hashes())
-            .unwrap_or_default();
-        let (parts, label, emotions) = self.emoji_sort_inputs(&mono, cx);
-        let factory = self.emoji_ui.sorter.clone();
+        let (parts, label, emotions) = self.sort_inputs(cx);
+        let factory = self.sorter.clone();
         let (tx, rx) = async_channel::unbounded();
         cx.background_executor()
             .spawn(async move {
@@ -568,24 +668,39 @@ impl Monos {
                     kept,
                     entries,
                 });
-                sort_job(sorting, emotions, parts, factory, label, dir, cancel, tx);
+                sort_job(
+                    sorting,
+                    emotions,
+                    parts,
+                    factory,
+                    label,
+                    dir,
+                    sort_cancel,
+                    tx,
+                );
             })
             .detach();
-        self.emoji_watch(token, rx, window, cx);
+        self.watch(token, run, rx, window, cx);
         cx.notify();
     }
 
-    fn emoji_import_event(
+    fn import_event(
         &mut self,
         token: u64,
+        run: u64,
         event: Event,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(d) = self.emoji_ui.import.as_mut().filter(|d| d.token == token) else {
-            // The dialog was cancelled while this was working: nothing may stay behind.
+        let Some(d) = self
+            .import
+            .as_mut()
+            .filter(|d| d.token == token && d.run == run)
+        else {
+            // The dialog was cancelled, or a newer sorting replaced this one: nothing may stay
+            // behind.
             if let Event::Staged { staged, .. } = event {
-                self.emoji_discard(staged, cx);
+                self.discard(staged, cx);
             }
             return;
         };
@@ -625,29 +740,23 @@ impl Monos {
                 let staged = d.step.take().and_then(|s| s.staged);
                 d.queue[index].state = ItemState::Failed(error);
                 if let Some(staged) = staged {
-                    self.emoji_discard(staged, cx);
+                    self.discard(staged, cx);
                 }
-                self.emoji_import_next(window, cx);
+                self.import_next(window, cx);
             }
         }
         cx.notify();
     }
 
     /// "Use this sorting" (`sorted`) or "Import without sorting": saves the open zip.
-    pub(super) fn emoji_import_accept(
-        &mut self,
-        sorted: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(d) = self.emoji_ui.import.as_mut() else {
+    pub(super) fn accept(&mut self, sorted: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(d) = self.import.as_mut() else {
             return;
         };
         let index = d.current;
         if d.queue[index].state != ItemState::Review {
             return;
         }
-        let mono = d.mono.clone();
         let token = d.token;
         let Some(mut step) = d.step.take() else {
             return;
@@ -661,21 +770,20 @@ impl Monos {
         };
         match d.mode.clone() {
             Mode::Resort { pack, .. } => {
-                let result = self.emoji_edit(&mono, cx, |l| {
+                let result = self.edit(cx, |l| {
                     l.apply_sorting(&pack, &review.suggestion, sorted_by);
                     Ok(())
                 });
-                self.emoji_finish_item(result, window, cx);
+                self.finish_item(result, window, cx);
             }
             Mode::Import => {
                 let Some(staged) = step.staged.take() else {
                     return;
                 };
-                let Some((dir, library)) = self.emoji.get(&mono) else {
-                    self.emoji_discard(staged, cx);
-                    return;
+                let (dir, mut scratch) = {
+                    let store = self.store.read(cx);
+                    (store.dir().to_path_buf(), (**store.library()).clone())
                 };
-                let (dir, mut scratch) = (dir.clone(), (**library).clone());
                 let emoji_list = staged
                     .images
                     .iter()
@@ -692,14 +800,13 @@ impl Monos {
                     scratch.apply_sorting(&pack_id, &review.suggestion, sorted_by);
                 }
                 let Some(pack) = scratch.packs.iter().find(|p| p.id == pack_id).cloned() else {
-                    self.emoji_discard(staged, cx);
+                    self.discard(staged, cx);
                     return;
                 };
-                if let Some(d) = self.emoji_ui.import.as_mut() {
+                if let Some(d) = self.import.as_mut() {
                     d.queue[index].state = ItemState::Saving;
                 }
                 // The pack joins the library only after its folder is in place.
-                let (folder_dir, new_pack) = (dir.clone(), pack_id.clone());
                 let work = cx.background_executor().spawn(async move {
                     let result = import::commit(&staged, &dir, &pack_id);
                     if result.is_err() {
@@ -710,42 +817,17 @@ impl Monos {
                 cx.spawn_in(window, async move |this, cx| {
                     let result = work.await;
                     let _ = this.update_in(cx, |this, window, cx| {
-                        if this
-                            .emoji_ui
-                            .import
-                            .as_ref()
-                            .is_none_or(|d| d.token != token)
-                        {
+                        if this.import.as_ref().is_none_or(|d| d.token != token) {
                             return;
                         }
                         let result = match result {
-                            Ok(()) => {
-                                // Noted first: the write starts inside `emoji_edit`.
-                                this.emoji_ui
-                                    .fresh
-                                    .entry(mono.clone())
-                                    .or_default()
-                                    .push(new_pack.clone());
-                                let added = this.emoji_edit(&mono, cx, move |l| {
-                                    l.packs.push(pack);
-                                    Ok(())
-                                });
-                                if added.is_err() {
-                                    // The library cannot take it: no file will ever know it.
-                                    if let Some(fresh) = this.emoji_ui.fresh.get_mut(&mono) {
-                                        fresh.retain(|id| *id != new_pack);
-                                    }
-                                    this.emoji_discard_pack_folders(
-                                        folder_dir.clone(),
-                                        vec![new_pack.clone()],
-                                        cx,
-                                    );
-                                }
-                                added
-                            }
+                            Ok(()) => this
+                                .store
+                                .clone()
+                                .update(cx, |store, cx| store.add_pack(pack, cx)),
                             Err(error) => Err(error),
                         };
-                        this.emoji_finish_item(result, window, cx);
+                        this.finish_item(result, window, cx);
                     });
                 })
                 .detach();
@@ -754,53 +836,146 @@ impl Monos {
         cx.notify();
     }
 
-    fn emoji_finish_item(
+    fn finish_item(
         &mut self,
         result: Result<(), String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(d) = self.emoji_ui.import.as_mut() {
+        if let Some(d) = self.import.as_mut() {
             d.queue[d.current].state = match result {
                 Ok(()) => ItemState::Saved,
                 Err(error) => ItemState::Failed(error),
             };
         }
-        self.emoji_import_next(window, cx);
+        self.import_next(window, cx);
         cx.notify();
     }
 
     /// Cancel, Escape, a press outside, or Close: stops everything and keeps nothing.
-    pub(super) fn emoji_import_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.emoji_ui.import.as_ref().is_some_and(|d| d.saving()) {
+    pub(super) fn import_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.import.as_ref().is_some_and(|d| d.saving()) {
             return;
         }
-        self.emoji_import_close(window, cx);
+        self.import_close(window, cx);
     }
 
-    fn emoji_import_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(d) = self.emoji_ui.import.take() else {
+    fn import_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(d) = self.import.take() else {
             return;
         };
-        d.cancel.store(true, Ordering::Relaxed);
+        d.stop();
+        self.picker = None;
+        self.import_flag.store(false, Ordering::Relaxed);
         if let Some(staged) = d.step.and_then(|s| s.staged) {
-            self.emoji_discard(staged, cx);
+            self.discard(staged, cx);
         }
-        window.focus(&self.settings_focus, cx);
+        window.focus(&self.focus, cx);
         // A read that was refused while the import was open can go ahead.
-        self.emoji_retry_loads(cx);
+        self.store
+            .clone()
+            .update(cx, |store, cx| store.retry_load(cx));
         cx.notify();
     }
 
-    pub(super) fn emoji_import_modal(
+    /// Opens the shared model list under the dialog's model button.
+    fn open_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.picker.take().is_some() {
+            cx.notify();
+            return;
+        }
+        let Some(d) = self.import.as_ref().filter(|d| d.model_changeable()) else {
+            return;
+        };
+        let (kind, model, account) = (d.model.kind, d.model.model.clone(), d.model.account.clone());
+        let project = self.work_dir(cx);
+        let list = cx.new(|cx| ModelList::new_for(kind, model, &project, account, cx));
+        #[cfg(test)]
+        let list_for_test = list.clone();
+        let focus = list.read(cx).search_focus(cx);
+        let picked = cx.subscribe_in(
+            &list,
+            window,
+            |this, _, picked: &ModelPicked, window, cx| {
+                this.picker = None;
+                this.pick_model(picked.0, picked.1.clone(), window, cx);
+            },
+        );
+        let menu = cx.new(|cx| {
+            Menu::new(
+                "Model",
+                vec![MenuItem::Custom(list.into(), focus)],
+                window,
+                cx,
+            )
+            .width(400.)
+        });
+        let closed = cx.subscribe(&menu, |this, _, _: &MenuEvent, cx| {
+            this.picker = None;
+            cx.notify();
+        });
+        self.picker = Some(ModelPicker {
+            menu,
+            #[cfg(test)]
+            list: list_for_test,
+            _events: vec![picked, closed],
+        });
+        cx.notify();
+    }
+
+    /// A model was picked: the zip under review is sorted again with it.
+    fn pick_model(
+        &mut self,
+        kind: Kind,
+        model: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cwd = self.work_dir(cx);
+        let Some(d) = self.import.as_mut() else {
+            return;
+        };
+        if !d.model_changeable() {
+            return;
+        }
+        let account = if d.model.kind == kind {
+            d.model.account.clone()
+        } else {
+            crate::accounts::get(cx)
+                .map(|accounts| accounts.read(cx).selected(kind, &cwd))
+                .unwrap_or_default()
+        };
+        d.model = SortModel {
+            kind,
+            model,
+            account,
+        };
+        d.model_label = model_label(&d.model);
+        window.focus(&d.focus, cx);
+        self.start_sort(window, cx);
+    }
+
+    pub(super) fn model_popover(&self, cx: &App) -> Option<Popover> {
+        let picker = self.picker.as_ref()?;
+        Some(
+            menu_popover(&picker.menu, Anchor::Slot(self.model_anchor.clone()), cx)
+                .align(Align::Start)
+                .without_animation()
+                .priority(PICKER_PRIORITY)
+                .width(400.),
+        )
+    }
+
+    pub(super) fn import_modal(
         &self,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let d = self.emoji_ui.import.as_ref()?;
+        let d = self.import.as_ref()?;
+        let library = self.store.read(cx).library().clone();
         let size = window.viewport_size();
         let width = 760f32.min(size.width.as_f32() - 24.);
-        let max_body = (size.height.as_f32() - 220.).max(160.);
+        let max_body = (size.height.as_f32() - 260.).max(160.);
         let weak = cx.weak_entity();
         let resort = matches!(d.mode, Mode::Resort { .. });
         let review_ready = d.queue[d.current].state == ItemState::Review && !d.done;
@@ -810,16 +985,8 @@ impl Monos {
             Mode::Resort { name, .. } => format!("Re-sort {name}"),
         };
         let subtitle = match &d.mode {
-            Mode::Import => format!(
-                "{} \u{b7} into {}'s emoji",
-                if d.queue.len() == 1 {
-                    "1 file".to_string()
-                } else {
-                    format!("{} files", d.queue.len())
-                },
-                d.mono_name
-            ),
-            Mode::Resort { name, .. } => format!("{name} \u{b7} {}'s emoji", d.mono_name),
+            Mode::Import => dialog_texts::subtitle(false, "", d.queue.len()),
+            Mode::Resort { name, .. } => dialog_texts::subtitle(true, name, 1),
         };
         let queue = (!resort).then(|| {
             div()
@@ -829,8 +996,8 @@ impl Monos {
                 .children(d.queue.iter().enumerate().map(|(i, item)| {
                     let current = i == d.current && !d.done;
                     div()
-                        .id(SharedString::from(format!("mono-emoji-import-queue-{i}")))
-                        .debug_selector(move || format!("mono-emoji-import-queue-{i}"))
+                        .id(SharedString::from(format!("emoji-lib-import-queue-{i}")))
+                        .debug_selector(move || format!("emoji-lib-import-queue-{i}"))
                         .px_2p5()
                         .py_1p5()
                         .rounded_lg()
@@ -866,35 +1033,70 @@ impl Monos {
                 }))
         });
         let body = div()
-            .id("mono-emoji-import-body")
+            .id("emoji-lib-import-body")
             .max_h(px(max_body))
             .overflow_y_scroll()
             .flex()
             .flex_col()
             .gap_3()
             .children(queue)
-            .children(d.step.as_ref().map(|step| self.emoji_steps(d, step)))
-            .children(
-                d.step
+            .children(d.step.as_ref().map(|step| self.steps(d, step)))
+            .children(d.step.as_ref().and_then(|step| {
+                step.review
                     .as_ref()
-                    .and_then(|step| step.review.as_ref().map(|r| self.emoji_review(d, step, r))),
+                    .map(|r| self.review(&library, d, step, r))
+            }));
+        let changeable = d.model_changeable();
+        let model_row = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_size(px(12.))
+            .text_color(content(0.55))
+            .child("Sort with")
+            .child(
+                modal::disabled(
+                    div()
+                        .id("emoji-lib-import-model")
+                        .debug_selector(|| "emoji-lib-import-model".into())
+                        .role(Role::Button)
+                        .aria_label(format!("Model: {}", d.model_label))
+                        .relative()
+                        .h(px(26.))
+                        .max_w(px(320.))
+                        .px_2p5()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(content(0.1))
+                        .text_color(content(0.85))
+                        .child(self.model_anchor.probe())
+                        .child(div().min_w_0().truncate().child(d.model_label.clone()))
+                        .child(icon("chevron-down", 12.).text_color(content(0.5))),
+                    !changeable,
+                )
+                .when(changeable, |b| {
+                    b.cursor_pointer().hover(|s| s.bg(content(0.06))).on_click(
+                        cx.listener(|this, _, window, cx| this.open_model_picker(window, cx)),
+                    )
+                }),
             );
         let cancel = modal::disabled(
-            modal::ghost_button("mono-emoji-import-cancel", "Cancel")
-                .debug_selector(|| "mono-emoji-import-cancel".into()),
+            modal::ghost_button("emoji-lib-import-cancel", "Cancel")
+                .debug_selector(|| "emoji-lib-import-cancel".into()),
             saving,
         )
         .when(!saving, |b| {
-            b.on_click(cx.listener(|this, _, window, cx| this.emoji_import_cancel(window, cx)))
+            b.on_click(cx.listener(|this, _, window, cx| this.import_cancel(window, cx)))
         });
         let buttons = if d.done {
             div().child(
-                modal::primary_button("mono-emoji-import-close", "Close")
-                    .debug_selector(|| "mono-emoji-import-close".into())
+                modal::primary_button("emoji-lib-import-close", "Close")
+                    .debug_selector(|| "emoji-lib-import-close".into())
                     .cursor_pointer()
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.emoji_import_cancel(window, cx)),
-                    ),
+                    .on_click(cx.listener(|this, _, window, cx| this.import_cancel(window, cx))),
             )
         } else {
             div()
@@ -904,52 +1106,56 @@ impl Monos {
                 .child(cancel)
                 .children((!resort).then(|| {
                     modal::disabled(
-                        modal::ghost_button("mono-emoji-import-skip", "Import without sorting")
-                            .debug_selector(|| "mono-emoji-import-skip".into()),
+                        modal::ghost_button("emoji-lib-import-skip", "Import without sorting")
+                            .debug_selector(|| "emoji-lib-import-skip".into()),
                         !review_ready,
                     )
                     .when(review_ready, |b| {
-                        b.on_click(cx.listener(|this, _, window, cx| {
-                            this.emoji_import_accept(false, window, cx)
-                        }))
+                        b.on_click(
+                            cx.listener(|this, _, window, cx| this.accept(false, window, cx)),
+                        )
                     })
                 }))
                 .child(
                     modal::disabled(
-                        modal::primary_button("mono-emoji-import-use", "Use this sorting")
-                            .debug_selector(|| "mono-emoji-import-use".into()),
+                        modal::primary_button("emoji-lib-import-use", "Use this sorting")
+                            .debug_selector(|| "emoji-lib-import-use".into()),
                         !review_ready,
                     )
                     .when(review_ready, |b| {
-                        b.on_click(cx.listener(|this, _, window, cx| {
-                            this.emoji_import_accept(true, window, cx)
-                        }))
+                        b.on_click(cx.listener(|this, _, window, cx| this.accept(true, window, cx)))
                     }),
                 )
         };
+        let picker_surface = self
+            .picker
+            .as_ref()
+            .map(|p| p.menu.read(cx).surface_region());
         Some(
             div()
-                .absolute()
-                .size_full()
-                .child(modal::barrier("mono-emoji-import-scrim", PRIORITY, window))
+                .child(modal::barrier("emoji-lib-import-scrim", PRIORITY, window))
                 .child(
-                    popover("mono-emoji-import-modal", Anchor::Center)
+                    popover("emoji-lib-import-modal", Anchor::Center)
                         .modal_surface(true)
                         .width(width)
                         .gap(0.)
                         .priority(PRIORITY)
+                        .map(|p| match picker_surface {
+                            // A press in the open model list is not a press outside.
+                            Some(surface) => p.ignore(surface),
+                            None => p,
+                        })
                         .on_dismiss(move |window, cx| {
-                            let _ =
-                                weak.update(cx, |this, cx| this.emoji_import_cancel(window, cx));
+                            let _ = weak.update(cx, |this, cx| this.import_cancel(window, cx));
                         })
                         .child(
                             div()
-                                .id("mono-emoji-import-dialog")
-                                .debug_selector(|| "mono-emoji-import-dialog".into())
+                                .id("emoji-lib-import-dialog")
+                                .debug_selector(|| "emoji-lib-import-dialog".into())
                                 .role(Role::Dialog)
                                 .aria_label(heading.clone())
                                 .track_focus(&d.focus)
-                                .key_context("MonoEmojiImport")
+                                .key_context("EmojiImport")
                                 .p_5()
                                 .flex()
                                 .flex_col()
@@ -957,10 +1163,11 @@ impl Monos {
                                 .child(
                                     div().child(modal::title(heading)).child(
                                         modal::body(subtitle)
-                                            .id("mono-emoji-import-subtitle")
-                                            .debug_selector(|| "mono-emoji-import-subtitle".into()),
+                                            .id("emoji-lib-import-subtitle")
+                                            .debug_selector(|| "emoji-lib-import-subtitle".into()),
                                     ),
                                 )
+                                .child(model_row)
                                 .child(body)
                                 .child(
                                     div()
@@ -987,7 +1194,7 @@ impl Monos {
         )
     }
 
-    fn emoji_steps(&self, d: &ImportDialog, step: &Step) -> AnyElement {
+    fn steps(&self, d: &ImportDialog, step: &Step) -> AnyElement {
         let row = |id: &'static str, done: bool, text: String| {
             div()
                 .id(id)
@@ -1012,16 +1219,16 @@ impl Monos {
         if !resort {
             rows = rows.child(match step.entries {
                 Some(n) => row(
-                    "mono-emoji-step-unpacked",
+                    "emoji-lib-step-unpacked",
                     true,
                     format!("Unpacked {n} files"),
                 ),
-                None => row("mono-emoji-step-unpacked", false, "Unpacking...".into()),
+                None => row("emoji-lib-step-unpacked", false, "Unpacking...".into()),
             });
         }
         if let Some(kept) = &step.kept {
             rows = rows.child(row(
-                "mono-emoji-step-kept",
+                "emoji-lib-step-kept",
                 true,
                 format!(
                     "Kept {} images: {} (skipped: {})",
@@ -1033,32 +1240,27 @@ impl Monos {
         }
         let (done, total) = step.progress;
         if step.kept.is_some() || resort {
-            let sorting = format!(
-                "Sorting into emotions with {}'s model ({})...",
-                d.mono_name, d.model_label
-            );
             rows = match &step.review {
                 Some(review) => rows.child(row(
-                    "mono-emoji-step-sorting",
+                    "emoji-lib-step-sorting",
                     true,
                     match &review.source {
-                        Source::Model { .. } => format!(
-                            "Sorted into emotions with {}'s model ({})",
-                            d.mono_name, d.model_label
-                        ),
+                        Source::Model { .. } => {
+                            format!("Sorted into emotions with {}", d.model_label)
+                        }
                         Source::Names { .. } => "Suggested a sorting from the file names".into(),
                     },
                 )),
                 None => rows
                     .child(row(
-                        "mono-emoji-step-sorting",
+                        "emoji-lib-step-sorting",
                         false,
-                        format!("{sorting} {done} of {total}"),
+                        dialog_texts::sorting_line(&d.model_label, done, total),
                     ))
                     .child(
                         div()
-                            .id("mono-emoji-progress")
-                            .debug_selector(|| "mono-emoji-progress".into())
+                            .id("emoji-lib-progress")
+                            .debug_selector(|| "emoji-lib-progress".into())
                             .ml(px(24.))
                             .w(px(300.))
                             .h(px(6.))
@@ -1081,10 +1283,13 @@ impl Monos {
         rows.into_any_element()
     }
 
-    fn emoji_review(&self, d: &ImportDialog, step: &Step, review: &Review) -> AnyElement {
-        let Some((_, library)) = self.emoji.get(&d.mono) else {
-            return div().into_any_element();
-        };
+    fn review(
+        &self,
+        library: &emoji::Library,
+        d: &ImportDialog,
+        step: &Step,
+        review: &Review,
+    ) -> AnyElement {
         let mut groups: Vec<(String, Vec<&sort::Item>)> = library
             .emotions
             .iter()
@@ -1111,10 +1316,10 @@ impl Monos {
             .map(|(name, items)| {
                 let key = name.to_lowercase().replace(' ', "-");
                 div()
-                    .id(SharedString::from(format!("mono-emoji-review-{key}")))
+                    .id(SharedString::from(format!("emoji-lib-review-{key}")))
                     .debug_selector({
                         let key = key.clone();
-                        move || format!("mono-emoji-review-{key}")
+                        move || format!("emoji-lib-review-{key}")
                     })
                     .flex_1()
                     .min_w_0()
@@ -1165,8 +1370,8 @@ impl Monos {
             );
         }
         div()
-            .id("mono-emoji-review")
-            .debug_selector(|| "mono-emoji-review".into())
+            .id("emoji-lib-review")
+            .debug_selector(|| "emoji-lib-review".into())
             .flex()
             .flex_col()
             .gap_2()
@@ -1184,8 +1389,8 @@ impl Monos {
             .children(match &review.source {
                 Source::Names { reason } => Some(
                     div()
-                        .id("mono-emoji-import-notice")
-                        .debug_selector(|| "mono-emoji-import-notice".into())
+                        .id("emoji-lib-import-notice")
+                        .debug_selector(|| "emoji-lib-import-notice".into())
                         .role(Role::Status)
                         .rounded_lg()
                         .bg(content(0.05))
@@ -1201,8 +1406,8 @@ impl Monos {
             .child(div().flex().flex_col().gap_2().children(rows))
             .children((went > 0).then(|| {
                 div()
-                    .id("mono-emoji-import-unsorted")
-                    .debug_selector(|| "mono-emoji-import-unsorted".into())
+                    .id("emoji-lib-import-unsorted")
+                    .debug_selector(|| "emoji-lib-import-unsorted".into())
                     .text_size(px(12.))
                     .text_color(content(0.55))
                     .child(format!("{went} emoji went to Unsorted."))
@@ -1214,7 +1419,7 @@ impl Monos {
 /// A 36 point chip in the review grid.
 fn review_chip(item: &sort::Item) -> AnyElement {
     let tip: SharedString = format!("{} \u{b7} {}", item.name, item.format.label()).into();
-    let id = format!("mono-emoji-review-chip-{}", item.key);
+    let id = format!("emoji-lib-review-chip-{}", item.key);
     let selector = id.clone();
     div()
         .id(SharedString::from(id.clone()))
@@ -1254,7 +1459,7 @@ fn review_chip(item: &sort::Item) -> AnyElement {
 fn sort_job(
     items: Vec<sort::Item>,
     emotions: Vec<EmotionRef>,
-    parts: Result<SortParts, String>,
+    parts: SortParts,
     factory: SorterFactory,
     label: String,
     scratch: PathBuf,
@@ -1263,18 +1468,15 @@ fn sort_job(
 ) {
     // A model that cannot be reached is not an error: the names fallback says why. A provider
     // that cannot read images keeps the wording `sort` gives.
-    let (runner, why) = match parts {
-        Ok(parts) => match factory(parts) {
-            Ok(runner) => (runner, None),
-            Err(error) => (
-                None,
-                Some(format!(
-                    "{label} is not available: {}",
-                    error.trim_end_matches('.')
-                )),
-            ),
-        },
-        Err(reason) => (None, Some(reason)),
+    let (runner, why) = match factory(parts) {
+        Ok(runner) => (runner, None),
+        Err(error) => (
+            None,
+            Some(format!(
+                "{label} is not available: {}",
+                error.trim_end_matches('.')
+            )),
+        ),
     };
     let mut result = sort::sort(
         &items,

@@ -1000,6 +1000,7 @@ impl Monos {
                     .debug_selector(|| "mono-settings".into())
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.settings = Some(SettingsSection::General);
+                        this.note_settings_model(cx);
                         window.focus(&this.settings_focus, cx);
                         this.reload_files(&id, cx);
                         cx.notify();
@@ -1845,9 +1846,7 @@ impl Monos {
                                                         move |this, _, window, cx| {
                                                             this.save_open_file(cx);
                                                             this.settings = Some(tab);
-                                                            if tab == SettingsSection::Emoji {
-                                                                this.open_emoji_page(cx);
-                                                            }
+                                                            this.note_settings_model(cx);
                                                             window.focus(&this.settings_focus, cx);
                                                             cx.notify();
                                                         },

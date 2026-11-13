@@ -14,12 +14,14 @@ use std::{
 
 const PREFIX: &str = ":emo[";
 
-/// A Mono's emoji library as the transcript needs it.
+/// The shared emoji library and the packs one Mono selected, as the transcript needs them.
 #[derive(Clone)]
 pub(crate) struct MonoEmoji {
     pub library: Arc<Library>,
-    /// The Mono's emoji folder (`mono::emoji::dir`).
+    /// The library's folder (`mono::emoji::dir`).
     pub dir: PathBuf,
+    /// Ids of the packs the Mono may use. An id the library does not have is ignored.
+    pub packs: Vec<String>,
     /// The seed key. `Conversation::set_mono_emoji` fills it with the session id, so a
     /// caller can leave it empty.
     pub session: String,
@@ -29,10 +31,11 @@ pub(crate) struct MonoEmoji {
 }
 
 impl MonoEmoji {
-    pub(crate) fn new(library: Arc<Library>, dir: PathBuf) -> Self {
+    pub(crate) fn new(library: Arc<Library>, dir: PathBuf, packs: Vec<String>) -> Self {
         Self {
             library,
             dir,
+            packs,
             session: String::new(),
             exists: Arc::default(),
         }
@@ -215,7 +218,7 @@ impl<'a> MessageTokens<'a> {
         let emoji = self.emoji?;
         let start = self.starts.get(index).copied().unwrap_or(self.text.len());
         let seed = token::seed_for(&emoji.session, &self.text[..start], index);
-        let (pack, picked) = token::pick(&emoji.library, name, seed)?;
+        let (pack, picked) = token::pick(&emoji.library, &emoji.packs, name, seed)?;
         let path = image_path(&emoji.dir, pack, picked);
         // A file that is gone draws nothing and takes no room.
         if !emoji.file_exists(&path) {

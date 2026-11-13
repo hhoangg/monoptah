@@ -340,13 +340,18 @@ pub fn seed_for(session_id: &str, prefix: &str, index: usize) -> u64 {
     hash
 }
 
-/// The emoji a token shows: one of the emotion's candidates, chosen by `seed`. None when
-/// the feature is off, the name is empty or unknown, or the emotion has no picture.
-pub fn pick<'a>(library: &'a Library, name: &str, seed: u64) -> Option<(&'a Pack, &'a Emoji)> {
-    if !library.enabled || name.trim().is_empty() {
+/// The emoji a token shows: one of the emotion's candidates in the `selected` packs, chosen
+/// by `seed`. None when the name is empty or unknown, or the emotion has no picture there.
+pub fn pick<'a>(
+    library: &'a Library,
+    selected: &[String],
+    name: &str,
+    seed: u64,
+) -> Option<(&'a Pack, &'a Emoji)> {
+    if name.trim().is_empty() {
         return None;
     }
-    let candidates = library.candidates(name);
+    let candidates = library.candidates(name, selected);
     if candidates.is_empty() {
         return None;
     }

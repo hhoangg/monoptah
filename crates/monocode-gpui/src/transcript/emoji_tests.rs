@@ -35,18 +35,15 @@ fn row(role: &str, text: &str) -> Row {
 }
 
 /// A library with three "happy" pictures, one "celebrate" GIF and one "sad" whose file is
-/// missing, written into a temporary Mono emoji folder.
-fn fixture(enabled: bool) -> Fixture {
+/// missing, written into a temporary emoji folder. With `selected`, the Mono uses the pack.
+fn fixture(selected: bool) -> Fixture {
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
         "monoptah-emoji-render-{}-{}",
         std::process::id(),
         COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     ));
-    let mut library = Library {
-        enabled,
-        ..Library::default()
-    };
+    let mut library = Library::default();
     let item = |file: &str, name: &str, format, emotion: &str| Emoji {
         file: file.into(),
         hash: format!("hash-{file}"),
@@ -93,7 +90,11 @@ fn fixture(enabled: bool) -> Fixture {
     Fixture {
         emoji: MonoEmoji {
             session: "7".into(),
-            ..MonoEmoji::new(Arc::new(library), dir.clone())
+            ..MonoEmoji::new(
+                Arc::new(library),
+                dir.clone(),
+                if selected { vec![pack_id] } else { Vec::new() },
+            )
         },
         dir,
     }
@@ -235,9 +236,14 @@ fn the_match_ignores_case_and_surrounding_space() {
 }
 
 #[test]
-fn a_disabled_or_missing_library_removes_every_token() {
+fn a_mono_without_packs_or_without_a_library_removes_every_token() {
     let off = fixture(false);
     let rows = rows_of("Hi :emo[happy] there", Some(&off.emoji));
+    assert_eq!(shape(&rows), [["Hi there"]]);
+    // An id the library does not have is ignored.
+    let mut gone = fixture(false);
+    gone.emoji.packs = vec!["pack-gone".into()];
+    let rows = rows_of("Hi :emo[happy] there", Some(&gone.emoji));
     assert_eq!(shape(&rows), [["Hi there"]]);
     let rows = rows_of("Hi :emo[happy] there", None);
     assert_eq!(shape(&rows), [["Hi there"]]);
