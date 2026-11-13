@@ -428,14 +428,18 @@ pub fn context(
     files: &files::AgentFiles,
     executable: &Path,
     rules_in_system: bool,
+    emoji: Option<&str>,
 ) -> String {
+    let emoji = emoji
+        .map(|block| format!("\n\n{block}"))
+        .unwrap_or_default();
     let rules = if rules_in_system {
         String::new()
     } else {
         format!("{}\n\n", instructions(mono, executable))
     };
     format!(
-        "<monocode_context>\nMonoptah adds this context, not the user. Act on it without quoting or describing it.\n\n{rules}<soul>\n{}\n</soul>\n\n<memory>\n{}\nTopic notes: {}\n</memory>\n</monocode_context>",
+        "<monocode_context>\nMonoptah adds this context, not the user. Act on it without quoting or describing it.\n\n{rules}<soul>\n{}\n</soul>\n\n<memory>\n{}\nTopic notes: {}\n</memory>{emoji}\n</monocode_context>",
         files.soul.as_deref().unwrap_or_default(),
         memory::within_budget(&files.memory),
         files.topics.join(", "),
