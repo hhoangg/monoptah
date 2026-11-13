@@ -924,10 +924,20 @@ impl crate::mono::cloud_api::AppBusy for AppView {
     }
 }
 
+/// What the dialog sends once the user confirmed `lines` and ticked the acknowledgement.
 fn confirmed(lines: &[&str]) -> DeleteOptions {
     DeleteOptions {
         confirmed: Some(lines.iter().map(|l| (*l).to_owned()).collect()),
+        acknowledged: true,
         settle: true,
+    }
+}
+
+/// The same confirmation of the lines, without the acknowledgement of a foreign workspace.
+fn confirmed_unacknowledged(lines: &[&str]) -> DeleteOptions {
+    DeleteOptions {
+        acknowledged: false,
+        ..confirmed(lines)
     }
 }
 
@@ -1112,6 +1122,103 @@ fn a_workspace_this_store_does_not_know_is_not_an_orphan_and_needs_a_strong_conf
     assert!(!preview.ours && preview.lines.is_empty());
     assert!(preview.notes.contains(&NOTE_NOT_OURS.to_owned()));
     assert!(preview.needs_acknowledgement());
+}
+
+#[test]
+fn the_api_refuses_a_workspace_this_store_does_not_know_without_the_acknowledgement() {
+    let fx = full();
+    // A codespace made by hand and a Monoptah-named sandbox made elsewhere.
+    let mut list: Vec<Value> = serde_json::from_str(&fx.gh.list.lock().unwrap()).unwrap();
+    list.push(codespace(
+        "octo-by-hand",
+        "basicLinux32gb",
+        "Available",
+        hours_ago(5.0),
+    ));
+    *fx.gh.list.lock().unwrap() = Value::Array(list).to_string();
+    fx.sbx.boxes.lock().unwrap().push(bx(
+        "sbx_other",
+        "monoptah-elsewhere-999999",
+        "stopped",
+        2,
+        4096,
+        hours_ago(1.0),
+    ));
+    let api = api_over(&fx);
+    let none = |_: &CloudRef| false;
+    for name in ["octo-by-hand", "monoptah-elsewhere-999999"] {
+        let target = target_of(name);
+        // Whatever lines were confirmed, `acknowledged: false` is not enough for a foreign one.
+        for options in [
+            confirmed_unacknowledged(&[]),
+            DeleteOptions {
+                confirmed: Some(vec![]),
+                ..Default::default()
+            },
+        ] {
+            let error = api.delete_instance(&target, &none, options).unwrap_err();
+            assert!(error.contains("did not create"), "{name}: {error}");
+        }
+        assert_eq!(fx.gh.count("codespace delete"), 0, "{name}");
+        assert!(!fx.sbx.verbs().contains(&"rm".to_owned()), "{name}");
+    }
+    assert!(fx.sbx.state_of("sbx_other").is_some());
+    // Acknowledged, it goes through.
+    api.delete_instance(&target_of("octo-by-hand"), &none, confirmed(&[]))
+        .unwrap();
+    assert_eq!(fx.gh.count("codespace delete -c octo-by-hand --force"), 1);
+    // A workspace this store knows needs no acknowledgement to be deleted (the dialog still
+    // asks for one when something would be lost).
+    api.delete_instance(
+        &target_of("octo-lost"),
+        &none,
+        confirmed_unacknowledged(&[]),
+    )
+    .unwrap();
+    assert_eq!(fx.gh.count("codespace delete -c octo-lost --force"), 1);
+}
+
+#[test]
+fn a_sandbox_in_an_unrecognised_state_is_neither_stopped_nor_deleted() {
+    let fx = full();
+    let api = api_over(&fx);
+    let target = target_of("monoptah-fix-login-a1b2c3");
+    // A state this app has no word for may well be a running sandbox.
+    fx.sbx
+        .boxes
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .find(|b| b.id == "sbx_001a")
+        .unwrap()
+        .state = "quantum".into();
+    let error = api
+        .delete_instance(&target, &|_: &CloudRef| false, confirmed(&[]))
+        .unwrap_err();
+    assert!(
+        error.contains("does not recognise") && error.contains("quantum"),
+        "{error}"
+    );
+    let verbs = fx.sbx.verbs();
+    assert!(
+        !verbs.contains(&"rm".to_owned()) && !verbs.contains(&"stop".to_owned()),
+        "{:?}",
+        fx.sbx.calls()
+    );
+    assert!(fx.sbx.state_of("sbx_001a").is_some());
+    assert_eq!(fx.svc.session_ids_on(&target.cloud).len(), 1);
+    // A recognised one still settles: stopped goes straight to the delete.
+    fx.sbx
+        .boxes
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .find(|b| b.id == "sbx_001a")
+        .unwrap()
+        .state = "stopped".into();
+    api.delete_instance(&target, &|_: &CloudRef| false, confirmed(&[]))
+        .unwrap();
+    assert!(fx.sbx.state_of("sbx_001a").is_none());
 }
 
 #[test]

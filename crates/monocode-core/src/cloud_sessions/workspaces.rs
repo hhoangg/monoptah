@@ -13,7 +13,8 @@
 //!   session, a start record, a move, a saved copy or a Docker account pin names it) can be called
 //!   an orphan. Every other one is `Not created by this app`: another app, another computer or the
 //!   user by hand made it, and Monoptah cannot see what is in it. Deleting such a workspace takes a
-//!   stronger confirmation ([`DeletePreview::needs_acknowledgement`]).
+//!   stronger confirmation ([`DeletePreview::needs_acknowledgement`]), and the core refuses it
+//!   without `DeleteOptions::acknowledged` whatever a dialog did.
 //! * Which sessions use a workspace comes from the local store: the live sessions bound to it and
 //!   the local sessions moved there. Sandbox names carry no repository, so a sandbox is listed when
 //!   a session of the project uses it or when no session at all does; one that only other
@@ -940,7 +941,8 @@ impl CloudSessions {
 
     /// Waits until a sandbox can be deleted: stops it when it is up, then polls until it reports
     /// `stopped`. A codespace needs no wait. `Err` when it is still changing state after
-    /// [`SETTLE_MAX_WAIT`]; nothing is deleted then. A sandbox that is already gone is `Ok`.
+    /// [`SETTLE_MAX_WAIT`], or reports a state this app does not recognise (it could be running);
+    /// nothing is deleted then. A sandbox that is already gone is `Ok`.
     pub fn settle_for_delete(&self, cloud: &CloudRef) -> Result<(), String> {
         if cloud.kind != CloudBackendKind::DockerSandbox {
             return Ok(());
@@ -956,8 +958,15 @@ impl CloudSessions {
             };
             let state = WorkspaceState::of_sandbox(&raw);
             match state {
-                WorkspaceState::Stopped | WorkspaceState::Failed | WorkspaceState::Unknown => {
-                    return Ok(());
+                WorkspaceState::Stopped | WorkspaceState::Failed => return Ok(()),
+                // A state this app does not recognise may be a sandbox that is running: it is
+                // neither stopped nor deleted blind.
+                WorkspaceState::Unknown => {
+                    return Err(format!(
+                        "{} reports a state Monoptah does not recognise (\u{201c}{}\u{201d}), so it was not stopped or deleted. Stop it first, then try again.",
+                        cloud.name,
+                        raw.trim()
+                    ));
                 }
                 WorkspaceState::Running | WorkspaceState::Starting if !asked => {
                     self.stop_cloud(cloud)?;
