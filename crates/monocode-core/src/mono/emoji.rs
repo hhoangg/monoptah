@@ -23,7 +23,9 @@ mod tests;
 /// The `emoji.json` version this build reads and writes.
 pub const VERSION: u32 = 1;
 const FILE: &str = "emoji.json";
-const MAX_EMOTION_NAME: usize = 32;
+pub const MAX_EMOTION_NAME: usize = 32;
+/// The longest description of an emotion, in characters.
+pub const MAX_DESCRIPTION: usize = 200;
 
 /// The default emotions: name and description. The id of a default emotion is its name.
 pub const DEFAULT_EMOTIONS: [(&str, &str); 13] = [
@@ -206,17 +208,39 @@ pub fn image_path(dir: &Path, pack: &Pack, emoji: &Emoji) -> PathBuf {
     pack_dir(dir, &pack.id).join(component(&emoji.file))
 }
 
-/// Remove every `.staging-*` folder: an import that was not confirmed.
-pub fn clean_staging(dir: &Path) {
+/// Remove every `.staging-*` folder (an import that was not confirmed) and every `sort-*`
+/// scratch folder (thumbnails of a sorting that was interrupted). Only call this when no
+/// import or sorting of this Mono is under way: `load` never does, so a turn cannot delete
+/// the folder of an import that is open.
+pub fn clean_stale(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
-        let staging = entry.file_name().to_string_lossy().starts_with(".staging-");
-        if staging && entry.path().is_dir() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let stale = name.starts_with(".staging-") || name.starts_with("sort-");
+        if stale && entry.path().is_dir() {
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }
+}
+
+/// The text of a description or an emotion name as it goes into a prompt: white space
+/// (line breaks included) collapsed to single spaces, `<` and `>` replaced so the text cannot
+/// open or close a tag, and at most `max` characters.
+pub fn prompt_text(text: &str, max: usize) -> String {
+    let flat = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('<', "\u{2039}")
+        .replace('>', "\u{203a}");
+    flat.chars()
+        .take(max)
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
 }
 
 fn disk_version(text: &str) -> Result<u32, String> {
@@ -232,7 +256,6 @@ fn disk_version(text: &str) -> Result<u32, String> {
 /// error and is left as it is. A newer version comes back read-only.
 pub fn load(root: &Path, mono_id: &str) -> Result<Loaded, String> {
     let dir = dir(root, mono_id)?;
-    clean_staging(&dir);
     let path = dir.join(FILE);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
@@ -246,17 +269,28 @@ pub fn load(root: &Path, mono_id: &str) -> Result<Loaded, String> {
     };
     if disk_version(&text)? > VERSION {
         // A newer app wrote it: show what we understand, never write it back.
+        let mut library: Library = serde_json::from_str(&text).unwrap_or_default();
+        library.normalize_emotions();
         return Ok(Loaded {
-            library: serde_json::from_str(&text).unwrap_or_default(),
+            library,
             read_only: true,
         });
     }
-    let library =
+    let mut library: Library =
         serde_json::from_str(&text).map_err(|e| format!("{FILE} is not readable: {e}"))?;
+    library.normalize_emotions();
     Ok(Loaded {
         library,
         read_only: false,
     })
+}
+
+/// Whether `name` is acceptable as an emotion name (see `rename_emotion`).
+fn valid_emotion_name(name: &str) -> bool {
+    !name.is_empty()
+        && name == name.trim()
+        && name.chars().count() <= MAX_EMOTION_NAME
+        && !name.contains(['[', ']', '\n', '\r'])
 }
 
 /// Write the library atomically. Refuses when the file on disk is newer or unreadable.
@@ -295,6 +329,35 @@ fn unique_name(wanted: &str, taken: impl Fn(&str) -> bool) -> String {
 }
 
 impl Library {
+    /// A hand-edited file may hold names the app would refuse. Give every such emotion a
+    /// valid, unique name ("emotion N") and cut over-long descriptions; nothing fails.
+    fn normalize_emotions(&mut self) {
+        let mut seen: HashSet<String> = HashSet::new();
+        for index in 0..self.emotions.len() {
+            let name = self.emotions[index].name.clone();
+            let ok = valid_emotion_name(&name) && !seen.contains(&name.to_lowercase());
+            if !ok {
+                let fixed = (1..)
+                    .map(|n| format!("emotion {n}"))
+                    .find(|candidate| {
+                        let lowered = candidate.to_lowercase();
+                        !seen.contains(&lowered)
+                            && !self
+                                .emotions
+                                .iter()
+                                .any(|e| e.name.to_lowercase() == lowered)
+                    })
+                    .unwrap_or_else(|| "emotion".into());
+                self.emotions[index].name = fixed;
+            }
+            seen.insert(self.emotions[index].name.to_lowercase());
+            let description = &mut self.emotions[index].description;
+            if description.chars().count() > MAX_DESCRIPTION {
+                *description = description.chars().take(MAX_DESCRIPTION).collect();
+            }
+        }
+    }
+
     fn emotion_index(&self, id: &str) -> Option<usize> {
         self.emotions.iter().position(|e| e.id == id)
     }
@@ -349,7 +412,13 @@ impl Library {
 
     pub fn describe_emotion(&mut self, id: &str, text: &str) {
         if let Some(index) = self.emotion_index(id) {
-            self.emotions[index].description = text.trim().to_owned();
+            self.emotions[index].description = text
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(MAX_DESCRIPTION)
+                .collect();
         }
     }
 
@@ -546,9 +615,12 @@ pub fn context_block(library: &Library) -> Option<String> {
     }
     let list = usable
         .iter()
-        .map(|e| match e.description.trim() {
-            "" => format!("- {}", e.name),
-            description => format!("- {}: {description}", e.name),
+        .map(|e| {
+            let name = prompt_text(&e.name, MAX_EMOTION_NAME);
+            match prompt_text(&e.description, MAX_DESCRIPTION).as_str() {
+                "" => format!("- {name}"),
+                description => format!("- {name}: {description}"),
+            }
         })
         .collect::<Vec<_>>()
         .join("\n");

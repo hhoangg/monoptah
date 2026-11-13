@@ -5,7 +5,11 @@ use super::{Emoji, Library, Pack};
 use std::ops::Range;
 
 const PREFIX: &str = ":emo[";
-const MAX_NAME: usize = 64;
+/// An emotion name has at most this many characters (`rename_emotion`).
+const MAX_NAME_CHARS: usize = super::MAX_EMOTION_NAME;
+/// The most bytes between the brackets: every character of a name may take 4 bytes, and the
+/// name may be padded with white space that is trimmed.
+const MAX_NAME: usize = MAX_NAME_CHARS * 4 + 32;
 
 /// One token in a plain text run.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,7 +39,8 @@ pub fn find(text: &str) -> Vec<Token> {
                 _ => {}
             }
         }
-        match end.filter(|end| end - body <= MAX_NAME) {
+        let name = end.map(|end| text[body..end].trim());
+        match end.filter(|_| name.is_some_and(|n| n.chars().count() <= MAX_NAME_CHARS)) {
             Some(end) => {
                 tokens.push(Token {
                     range: start..end + 1,
@@ -54,37 +59,70 @@ pub fn find(text: &str) -> Vec<Token> {
 /// paragraph, which is what a streaming view needs.
 fn code_ranges(text: &str, open_ended: bool) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
-    let mut fence: Option<(u8, usize, usize)> = None;
+    // The open fence: marker, width, start offset and the indent of its opener.
+    let mut fence: Option<(u8, usize, usize, usize)> = None;
     let mut paragraph = 0;
     let mut offset = 0;
-    for line in text.split_inclusive('\n') {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    for (at, line) in lines.iter().copied().enumerate() {
         let start = offset;
         offset += line.len();
-        let trimmed = line.trim_start_matches(' ');
-        let indent = line.len() - trimmed.len();
-        let marker = trimmed.as_bytes().first().copied().unwrap_or(0);
-        let width = trimmed.bytes().take_while(|b| *b == marker).count();
-        let is_fence = indent <= 3 && matches!(marker, b'`' | b'~') && width >= 3;
-        if let Some((opened, count, from)) = fence {
-            if is_fence && marker == opened && width >= count && trimmed[width..].trim().is_empty()
+        let Some((marker, width, indent)) = fence_line(line) else {
+            if fence.is_none() && line.trim().is_empty() {
+                inline_spans(text, paragraph..start, open_ended, &mut ranges);
+                paragraph = offset;
+            }
+            continue;
+        };
+        if let Some((opened, count, from, opener_indent)) = fence {
+            let rest = line.trim_start_matches(' ')[width..].trim();
+            if indent <= opener_indent.max(3)
+                && marker == opened
+                && width >= count
+                && rest.is_empty()
             {
                 ranges.push(from..offset);
                 fence = None;
                 paragraph = offset;
             }
-        } else if is_fence {
+        } else if indent <= 3 || closes_later(&lines[at + 1..], marker, width, indent) {
+            // A fence indented past 3 spaces is code in markdown, unless it sits in a list
+            // item: then a closer with the same or less indent follows.
             inline_spans(text, paragraph..start, open_ended, &mut ranges);
-            fence = Some((marker, width, start));
-        } else if line.trim().is_empty() {
-            inline_spans(text, paragraph..start, open_ended, &mut ranges);
-            paragraph = offset;
+            fence = Some((marker, width, start, indent));
         }
     }
     match fence {
-        Some((_, _, from)) => ranges.push(from..text.len()),
+        Some((_, _, from, _)) => ranges.push(from..text.len()),
         None => inline_spans(text, paragraph..text.len(), open_ended, &mut ranges),
     }
     ranges
+}
+
+/// The marker, width and indent of a line that looks like a code fence (``` or ~~~), at any
+/// indent.
+fn fence_line(line: &str) -> Option<(u8, usize, usize)> {
+    let trimmed = line.trim_start_matches(' ');
+    let marker = trimmed.as_bytes().first().copied().unwrap_or(0);
+    let width = trimmed.bytes().take_while(|b| *b == marker).count();
+    (matches!(marker, b'`' | b'~') && width >= 3).then_some((
+        marker,
+        width,
+        line.len() - trimmed.len(),
+    ))
+}
+
+/// Whether one of `lines` closes a fence opened with `marker` and `width` at `indent`: the
+/// same marker, at least as wide, nothing after it, and no deeper indent than the opener.
+fn closes_later(lines: &[&str], marker: u8, width: usize, indent: usize) -> bool {
+    lines.iter().any(|line| {
+        fence_line(line).is_some_and(|(m, w, i)| {
+            m == marker
+                && w >= width
+                && i <= indent
+                && line.trim_start_matches(' ')[w..].trim().is_empty()
+        })
+    })
 }
 
 fn inline_spans(text: &str, span: Range<usize>, open_ended: bool, out: &mut Vec<Range<usize>>) {
@@ -182,7 +220,7 @@ pub fn strip(markdown: &str) -> String {
             }
         }
         kept.push_str(&body[at..]);
-        if !kept.trim().is_empty() {
+        if !kept.trim().is_empty() && !only_block_prefix(&kept) {
             out.push_str(&kept);
             out.push_str(ending);
         }
@@ -222,6 +260,19 @@ pub fn standalone(markdown: &str) -> Vec<(String, bool)> {
             (token.name, alone)
         })
         .collect()
+}
+
+/// Whether a line is nothing but quote markers and a list marker, such as `-` or `> 1.`.
+fn only_block_prefix(line: &str) -> bool {
+    let mut rest = line.trim();
+    while let Some(after) = rest.strip_prefix('>') {
+        rest = after.trim_start();
+    }
+    if matches!(rest, "" | "-" | "*" | "+") {
+        return true;
+    }
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    digits > 0 && matches!(&rest[digits..], "." | ")")
 }
 
 /// What is left of a line start after quote markers and one list marker.

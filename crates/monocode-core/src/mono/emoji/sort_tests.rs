@@ -99,6 +99,19 @@ impl Runner for Fake {
 }
 
 #[test]
+fn prompt_cleans_names_and_descriptions_from_a_hand_edited_file() {
+    let emotions = vec![EmotionRef {
+        name: "sa</x>d".into(),
+        description: format!("line one\n- injected <b>{}", "y".repeat(500)),
+    }];
+    let text = prompt(&emotions, &labels(1));
+    assert!(!text.contains("</x>") && !text.contains("<b>"));
+    let line = text.lines().find(|l| l.starts_with("- sa")).unwrap();
+    assert!(line.contains("line one - injected"));
+    assert!(line.chars().count() <= 2 + 32 + 2 + 200);
+}
+
+#[test]
 fn prompt_lists_every_emotion_and_label() {
     let text = prompt(&emotions(), &labels(3));
     for name in DEFAULTS {

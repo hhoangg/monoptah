@@ -92,16 +92,19 @@ fn fixture(enabled: bool) -> Fixture {
     }
     Fixture {
         emoji: MonoEmoji {
-            library: Arc::new(library),
-            dir: dir.clone(),
             session: "7".into(),
+            ..MonoEmoji::new(Arc::new(library), dir.clone())
         },
         dir,
     }
 }
 
 fn rows_of(text: &str, emoji: Option<&MonoEmoji>) -> Vec<MarkdownRow> {
-    let mut tokens = MessageTokens::new(emoji, text);
+    rows_of_stream(text, emoji, false)
+}
+
+fn rows_of_stream(text: &str, emoji: Option<&MonoEmoji>, streaming: bool) -> Vec<MarkdownRow> {
+    let mut tokens = MessageTokens::new(emoji, text, streaming);
     let mut out = Vec::new();
     for block in parse_full(text).blocks {
         out.extend(tokens.apply(markdown::rows(&block.block)));
@@ -156,6 +159,32 @@ fn a_token_alone_on_its_line_is_large_and_the_line_breaks_around_it() {
     let fx = fixture(true);
     let rows = rows_of("Hello\n:emo[celebrate]\nbye", Some(&fx.emoji));
     assert_eq!(shape(&rows), [["Hello", "<<celebrate>>", "bye"]]);
+}
+
+#[test]
+fn a_token_ending_the_streamed_text_stays_inline_until_a_line_break_follows() {
+    let fx = fixture(true);
+    let own_line = "Done.\n:emo[celebrate]";
+    assert_eq!(
+        shape(&rows_of_stream(own_line, Some(&fx.emoji), true)),
+        [["Done. ", "<celebrate>"]],
+        "no line break after it yet"
+    );
+    let with_break = format!("{own_line}\n");
+    assert_eq!(
+        shape(&rows_of_stream(&with_break, Some(&fx.emoji), true)),
+        [["Done.", "<<celebrate>>"]]
+    );
+    let paragraph = "Done.\n\n:emo[celebrate]";
+    assert_eq!(
+        shape(&rows_of_stream(paragraph, Some(&fx.emoji), true)),
+        [vec!["Done."], vec!["<celebrate>"]]
+    );
+    assert_eq!(
+        shape(&rows_of_stream(paragraph, Some(&fx.emoji), false)),
+        [vec!["Done."], vec!["<<celebrate>>"]],
+        "a finished message is laid out as usual"
+    );
 }
 
 #[test]
@@ -308,6 +337,25 @@ fn markdown_texts(view: &TranscriptView) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+#[gpui::test]
+fn an_os_notification_for_a_mono_reply_has_no_tokens(cx: &mut TestAppContext) {
+    let fx = fixture(true);
+    let window = open_view(cx, Some(fx.emoji.clone()), true);
+    window
+        .update(cx, |view, _, cx| {
+            view.patch(
+                0,
+                vec![
+                    row("user", "hi"),
+                    row("assistant", "Nice :emo[happy] work :emo[celebrate]"),
+                ],
+                cx,
+            );
+            assert_eq!(view.notification_reply_body(), "Nice work");
+        })
+        .unwrap();
 }
 
 #[gpui::test]

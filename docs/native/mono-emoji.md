@@ -21,14 +21,16 @@ Per Mono, next to its other files, in `<data>/monos/<mono id>/emoji/`
 emoji/
   emoji.json                 versioned metadata, written atomically
   packs/<pack id>/<hash>.<ext>  copied image files, named by content hash
-  .staging-<uuid>/           an import in progress; removed on cancel and on next load
+  .staging-<uuid>/           an import in progress; removed on cancel, and when the Mono is first read after the app starts
+  sort-<uuid>/               thumbnails of a sorting in progress; removed the same way
+  (reading the library for a turn never removes anything)
 ```
 
 `emoji.json` (`version: 1`, camelCase):
 
 - `enabled` (bool, default false), `frequency` (`rarely` | `sometimes` | `often`,
   default `sometimes`).
-- `emotions`: ordered list of `{id, name, description}`. The id is stable, so a rename keeps
+- `emotions`: ordered list of `{id, name, description}` (a description has at most 200 chars and one line; a name from a hand-edited file that is not valid becomes "emotion N" on load). The id is stable, so a rename keeps
   the emoji. Names are trimmed, unique case-insensitively, at most 32 chars, and may not
   contain `[`, `]` or a newline.
 - `packs`: list of `{id, name, enabled, sortedBy, emoji: [{file, name, format, emotion}]}`.
@@ -73,7 +75,7 @@ Default emotions (name, description):
    Mono when to use the emotion." under it; on the right a pack filter (All packs, or one
    pack) and "Reset to defaults" (confirm). One card per emotion: editable name, editable
    description (placeholder "When should Mono use it?"), count, delete (its emoji move to
-   Unsorted; confirm when it is not empty). Chips show the image (GIFs animate), with a
+   Unsorted; confirm when it is not empty). Chips show the image (a GIF plays only while its chip is hovered; pack thumbnails and the import review show the first frame), with a
    tooltip "<name> · <FORMAT>". Dragging a chip onto another card moves it. "+ Add emotion"
    adds a card named "new emotion" and focuses its name. The dashed "Unsorted" card holds
    emoji Mono never uses. Reset to defaults restores the 13 default emotions; emoji whose
@@ -143,7 +145,7 @@ title, body, actions, buttons) above the settings modal.
   text streaming in after the token does not change it. Two messages with the same text
   before a token get the same picture. A token inline is drawn at text size (20 px); a token
   alone on its line (only a quote or list marker before it, nothing after) is drawn larger
-  (56 px). GIFs animate. Hover shows "<emoji name> · <emotion>". Nothing is drawn, and no
+  (56 px). GIFs animate (in settings they play on hover only, in chat always). While a reply streams, a token that ends the text so far counts as inline until a line break follows it. Hover shows "<emoji name> · <emotion>". Nothing is drawn, and no
   space is left, for: the switch off, an unknown or empty emotion, an emotion with no emoji
   in an enabled pack, an image file that is gone, or a library that is not loaded yet.
   Tokens inside code blocks and inline code stay as text.

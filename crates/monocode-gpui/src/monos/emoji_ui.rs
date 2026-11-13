@@ -16,7 +16,10 @@ use crate::{
 };
 use gpui::{CursorStyle, Div, ObjectFit, PromptLevel, Render, Stateful};
 use monocode_core::mono::emoji::{self, Emoji, Emotion, Format, Frequency, Library, Pack};
-use std::{path::Path, sync::Arc};
+use std::{path::Path, sync::Arc, time::Duration};
+
+/// How long a text field rests before what was typed is written.
+pub(super) const SAVE_DELAY: Duration = Duration::from_millis(400);
 
 pub(super) const SUBTITLE: &str =
     "Let this Mono add an emoji from its packs to a reply when it fits the mood.";
@@ -49,7 +52,23 @@ pub(super) struct EmojiUi {
     pub(super) errors: HashMap<String, String>,
     /// Monos whose library changed since it was last written.
     dirty: HashSet<String>,
-    saving: bool,
+    /// The Mono whose library is being written; one write runs at a time.
+    saving: Option<String>,
+    /// Monos with typed text that is waiting for its write, by the number of the timer.
+    debounce: HashMap<String, u64>,
+    debounce_next: u64,
+    /// How many edits each Mono's library has had: a read that began before an edit is stale.
+    edit_gen: HashMap<String, u64>,
+    /// Monos whose stale scratch folders were removed since the app started.
+    pub(super) cleaned: HashSet<String>,
+    /// Loads that were refused because the Mono was busy, and whether they were forced.
+    pub(super) wanted: HashMap<String, bool>,
+    /// The render key of the library last handed to each Mono's chat.
+    pub(super) pushed: HashMap<String, u64>,
+    /// Packs a finished import added and no write has covered yet, by Mono.
+    pub(super) fresh: HashMap<String, Vec<String>>,
+    /// The chip under the pointer: only its GIF plays.
+    pub(super) hovered_chip: Option<String>,
     /// Show only the emoji of this pack on the board.
     pub(super) filter: Option<String>,
     /// Why the name being typed into an emotion card was refused, by emotion id.
@@ -77,7 +96,15 @@ impl EmojiUi {
             read_only: HashSet::new(),
             errors: HashMap::new(),
             dirty: HashSet::new(),
-            saving: false,
+            saving: None,
+            debounce: HashMap::new(),
+            debounce_next: 0,
+            edit_gen: HashMap::new(),
+            cleaned: HashSet::new(),
+            wanted: HashMap::new(),
+            pushed: HashMap::new(),
+            fresh: HashMap::new(),
+            hovered_chip: None,
             filter: None,
             name_errors: HashMap::new(),
             wired: HashSet::new(),
@@ -113,16 +140,38 @@ impl Render for DraggedEmoji {
             .flex()
             .items_center()
             .justify_center()
-            .child(picture(&self.path, 36., "emoji-dragged".into()))
+            .child(picture(&self.path, 36., None))
     }
 }
 
-/// An emoji image, `side` points square. The id lets a GIF animate.
-pub(super) fn picture(path: &Path, side: f32, id: SharedString) -> impl IntoElement + use<> {
-    crate::image_memory::thumbnail(path.to_path_buf())
+/// An emoji image, `side` points square. A GIF shows its first frame; with an `animate` id it
+/// plays, and then GPUI redraws the whole view on every frame, so only a hovered chip gets one.
+pub(super) fn picture(path: &Path, side: f32, animate: Option<SharedString>) -> AnyElement {
+    let image = crate::image_memory::thumbnail(path.to_path_buf())
         .object_fit(ObjectFit::Contain)
-        .size(px(side))
-        .id(id)
+        .size(px(side));
+    match animate {
+        Some(id) => image.id(id).into_any_element(),
+        None => image.into_any_element(),
+    }
+}
+
+/// What the chat draws from a library: whether it is on, the emotions, the packs that count and
+/// where each picture sits. A description or the frequency is not part of it.
+fn render_key(library: &Library) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    library.enabled.hash(&mut hasher);
+    for emotion in &library.emotions {
+        (&emotion.id, &emotion.name).hash(&mut hasher);
+    }
+    for pack in &library.packs {
+        (&pack.id, pack.enabled).hash(&mut hasher);
+        for emoji in &pack.emoji {
+            (&emoji.file, &emoji.name, emoji.format, &emoji.emotion).hash(&mut hasher);
+        }
+    }
+    hasher.finish()
 }
 
 /// "29 PNG, 3 GIF" for a list of formats, in a fixed order.
@@ -178,15 +227,23 @@ impl Monos {
         }
     }
 
-    /// Reads a Mono's library in the background. `force` reads again even when one is loaded.
-    pub(super) fn load_emoji(&mut self, id: &str, force: bool, cx: &mut Context<Self>) {
+    /// Whether this Mono has an edit, a write or an import that a read must not run over.
+    fn emoji_busy(&self, id: &str) -> bool {
         let ui = &self.emoji_ui;
-        if ui.loading.contains(id)
-            || (!force && self.emoji.contains_key(id))
-            || ui.dirty.contains(id)
-            || ui.saving
-            || ui.import.is_some()
-        {
+        ui.dirty.contains(id)
+            || ui.debounce.contains_key(id)
+            || ui.saving.as_deref() == Some(id)
+            || ui.import.as_ref().is_some_and(|d| d.mono == id)
+    }
+
+    /// Reads a Mono's library in the background. `force` reads again even when one is loaded.
+    /// A read refused because the Mono is busy is tried again when it is not.
+    pub(super) fn load_emoji(&mut self, id: &str, force: bool, cx: &mut Context<Self>) {
+        if self.emoji_ui.loading.contains(id) || (!force && self.emoji.contains_key(id)) {
+            return;
+        }
+        if self.emoji_busy(id) {
+            *self.emoji_ui.wanted.entry(id.into()).or_default() |= force;
             return;
         }
         let Ok(dir) = emoji::dir(&self.root, id) else {
@@ -196,21 +253,29 @@ impl Monos {
             return;
         };
         self.emoji_ui.loading.insert(id.into());
+        // The first read of a Mono since the app started also removes what an earlier run left
+        // behind. No import of this Mono can be open yet: it needs the library loaded.
+        let clean = self.emoji_ui.cleaned.insert(id.into());
+        let generation = self.emoji_ui.edit_gen.get(id).copied().unwrap_or(0);
         let (root, mono) = (self.root.clone(), id.to_string());
         let work = {
-            let mono = mono.clone();
-            cx.background_executor()
-                .spawn(async move { emoji::load(&root, &mono) })
+            let (mono, dir) = (mono.clone(), dir.clone());
+            cx.background_executor().spawn(async move {
+                if clean {
+                    emoji::clean_stale(&dir);
+                }
+                emoji::load(&root, &mono)
+            })
         };
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
                 this.emoji_ui.loading.remove(&mono);
+                let stale = this.emoji_ui.edit_gen.get(&mono).copied().unwrap_or(0) != generation
+                    || this.emoji_busy(&mono);
                 match result {
-                    // An edit or an import that began while this was reading wins.
-                    Ok(_)
-                        if this.emoji_ui.dirty.contains(&mono)
-                            || this.emoji_ui.import.is_some() => {}
+                    // An edit, a write or an import that began while this was reading wins.
+                    Ok(_) if stale => {}
                     Ok(loaded) => {
                         this.emoji
                             .insert(mono.clone(), (dir, Arc::new(loaded.library)));
@@ -232,10 +297,21 @@ impl Monos {
         .detach();
     }
 
+    /// Starts the reads that were refused while their Mono was busy and are free now.
+    pub(super) fn emoji_retry_loads(&mut self, cx: &mut Context<Self>) {
+        for (id, force) in std::mem::take(&mut self.emoji_ui.wanted) {
+            self.load_emoji(&id, force, cx);
+        }
+    }
+
     /// The Mono's library changed, or was loaded or saved: hand it to the Mono's chat.
+    /// The chat is only told when something it draws changed: it lays out every message again.
     pub(super) fn emoji_changed(&mut self, mono_id: &str, cx: &mut Context<Self>) {
         if let Some(chat) = self.chats.get(mono_id).cloned() {
-            self.push_emoji(mono_id, &chat, cx);
+            let key = self.emoji.get(mono_id).map(|(_, l)| render_key(l));
+            if key != self.emoji_ui.pushed.get(mono_id).copied() {
+                self.push_emoji(mono_id, &chat, cx);
+            }
         }
         cx.notify();
     }
@@ -243,7 +319,7 @@ impl Monos {
     /// Gives a conversation that runs in this Mono's mode the Mono's current library. Nothing
     /// is changed while the library is not loaded yet; `emoji_changed` follows the load.
     pub(super) fn push_emoji(
-        &self,
+        &mut self,
         mono_id: &str,
         chat: &Entity<Conversation>,
         cx: &mut Context<Self>,
@@ -251,6 +327,9 @@ impl Monos {
         let Some((dir, library)) = self.emoji.get(mono_id) else {
             return;
         };
+        self.emoji_ui
+            .pushed
+            .insert(mono_id.into(), render_key(library));
         let emoji = MonoEmoji::new(library.clone(), dir.clone());
         chat.update(cx, |chat, cx| chat.set_mono_emoji(Some(emoji), cx));
     }
@@ -263,6 +342,26 @@ impl Monos {
         cx: &mut Context<Self>,
         edit: impl FnOnce(&mut Library) -> Result<R, String>,
     ) -> Result<R, String> {
+        self.emoji_edit_with(mono, cx, false, edit)
+    }
+
+    /// Like `emoji_edit` for text typed into a field: the write waits until typing pauses.
+    fn emoji_edit_typed<R>(
+        &mut self,
+        mono: &str,
+        cx: &mut Context<Self>,
+        edit: impl FnOnce(&mut Library) -> Result<R, String>,
+    ) -> Result<R, String> {
+        self.emoji_edit_with(mono, cx, true, edit)
+    }
+
+    fn emoji_edit_with<R>(
+        &mut self,
+        mono: &str,
+        cx: &mut Context<Self>,
+        typed: bool,
+        edit: impl FnOnce(&mut Library) -> Result<R, String>,
+    ) -> Result<R, String> {
         if self.emoji_ui.read_only.contains(mono) {
             return Err(READ_ONLY.into());
         }
@@ -270,16 +369,48 @@ impl Monos {
             return Err("The emoji settings are not loaded yet".into());
         };
         let value = edit(Arc::make_mut(library))?;
-        self.emoji_ui.dirty.insert(mono.into());
-        self.emoji_pump(cx);
+        *self.emoji_ui.edit_gen.entry(mono.into()).or_default() += 1;
+        if typed {
+            self.emoji_wait_to_save(mono, cx);
+        } else {
+            // This write carries the typed text too.
+            self.emoji_ui.debounce.remove(mono);
+            self.emoji_ui.dirty.insert(mono.into());
+            self.emoji_pump(cx);
+        }
         cx.notify();
         Ok(value)
+    }
+
+    /// Writes the Mono's library `SAVE_DELAY` after the last typed change; the last state wins.
+    fn emoji_wait_to_save(&mut self, mono: &str, cx: &mut Context<Self>) {
+        self.emoji_ui.debounce_next += 1;
+        let turn = self.emoji_ui.debounce_next;
+        self.emoji_ui.debounce.insert(mono.into(), turn);
+        let mono = mono.to_owned();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SAVE_DELAY).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.emoji_ui.debounce.get(&mono) == Some(&turn) {
+                    this.emoji_flush(&mono, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Queues the write of typed text now, for example when its field is left.
+    pub(super) fn emoji_flush(&mut self, mono: &str, cx: &mut Context<Self>) {
+        if self.emoji_ui.debounce.remove(mono).is_some() {
+            self.emoji_ui.dirty.insert(mono.into());
+            self.emoji_pump(cx);
+        }
     }
 
     /// Writes the next changed library, one write at a time. A change made during a write
     /// marks the Mono dirty again, so the latest state is always written last.
     fn emoji_pump(&mut self, cx: &mut Context<Self>) {
-        if self.emoji_ui.saving {
+        if self.emoji_ui.saving.is_some() {
             return;
         }
         let Some(mono) = self.emoji_ui.dirty.iter().next().cloned() else {
@@ -290,7 +421,9 @@ impl Monos {
             return;
         };
         let snapshot = library.clone();
-        self.emoji_ui.saving = true;
+        self.emoji_ui.saving = Some(mono.clone());
+        // The packs this write covers: if it fails they are not kept.
+        let fresh = self.emoji_ui.fresh.remove(&mono).unwrap_or_default();
         let root = self.root.clone();
         let work = {
             let mono = mono.clone();
@@ -300,24 +433,70 @@ impl Monos {
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
-                this.emoji_ui.saving = false;
+                this.emoji_ui.saving = None;
                 match result {
                     Ok(()) => {
                         this.emoji_ui.errors.remove(&mono);
                         this.emoji_changed(&mono, cx);
                     }
                     Err(error) => {
+                        let kept = this.emoji_drop_unsaved_packs(&mono, &fresh, cx);
+                        let note = if kept {
+                            ""
+                        } else {
+                            " The imported pack was not kept."
+                        };
                         this.emoji_ui.errors.insert(
                             mono.clone(),
-                            format!("Could not save the emoji settings. {error}"),
+                            format!("Could not save the emoji settings. {error}{note}"),
                         );
                     }
                 }
                 this.emoji_pump(cx);
+                this.emoji_retry_loads(cx);
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// A write that failed after an import: take the new packs out of memory and delete their
+    /// folders, so nothing is left on disk that no saved file knows about. True when there was
+    /// nothing to take out.
+    fn emoji_drop_unsaved_packs(
+        &mut self,
+        mono: &str,
+        packs: &[String],
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if packs.is_empty() {
+            return true;
+        }
+        if let Some((dir, library)) = self.emoji.get_mut(mono) {
+            Arc::make_mut(library)
+                .packs
+                .retain(|p| !packs.contains(&p.id));
+            let dir = dir.clone();
+            self.emoji_discard_pack_folders(dir, packs.to_vec(), cx);
+        }
+        self.emoji_changed(mono, cx);
+        false
+    }
+
+    /// Deletes `<dir>/packs/<id>` for each id, off the main thread.
+    pub(super) fn emoji_discard_pack_folders(
+        &self,
+        dir: PathBuf,
+        packs: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.background_executor()
+            .spawn(async move {
+                for id in packs {
+                    let _ = std::fs::remove_dir_all(emoji::pack_dir(&dir, &id));
+                }
+            })
+            .detach();
     }
 
     fn emoji_ask(
@@ -494,7 +673,7 @@ impl Monos {
         if description {
             if current.description != text.trim() {
                 let (id, text) = (emotion.to_owned(), text.to_owned());
-                let _ = self.emoji_edit(mono, cx, move |l| {
+                let _ = self.emoji_edit_typed(mono, cx, move |l| {
                     l.describe_emotion(&id, &text);
                     Ok(())
                 });
@@ -504,7 +683,7 @@ impl Monos {
             cx.notify();
         } else {
             let (id, name) = (emotion.to_owned(), text.to_owned());
-            match self.emoji_edit(mono, cx, move |l| l.rename_emotion(&id, &name)) {
+            match self.emoji_edit_typed(mono, cx, move |l| l.rename_emotion(&id, &name)) {
                 Ok(()) => {
                     self.emoji_ui.name_errors.remove(emotion);
                 }
@@ -538,6 +717,7 @@ impl Monos {
         let key = format!("emoji-{kind}:{mono}:{}", emotion.id);
         let field = self.field(&key, label, text.clone(), false, cx);
         if self.emoji_ui.wired.insert(field.entity_id()) {
+            let blur_mono = mono.to_owned();
             let (mono, id) = (mono.to_owned(), emotion.id.clone());
             self.observations.push(cx.subscribe(
                 &field,
@@ -546,11 +726,12 @@ impl Monos {
                     this.emoji_text_changed(description, &mono, &id, &text, cx);
                 },
             ));
-            let id = emotion.id.clone();
+            let (id, mono) = (emotion.id.clone(), blur_mono);
             self.observations.push(cx.on_blur(
                 &field.focus_handle(cx),
                 window,
                 move |this, _, cx| {
+                    this.emoji_flush(&mono, cx);
                     // A refused name goes back to the saved one when the field is left.
                     if this.emoji_ui.name_errors.remove(&id).is_some() {
                         cx.notify();
@@ -588,11 +769,24 @@ impl Monos {
             file: emoji.file.clone(),
             path: path.clone(),
         };
-        let _ = cx;
+        // Only the chip under the pointer plays its GIF.
+        let playing = emoji.format == Format::Gif
+            && self.emoji_ui.hovered_chip.as_deref() == Some(id.as_str());
+        let hover_id = id.clone();
         div()
             .id(SharedString::from(id.clone()))
             .debug_selector(move || selector.clone())
             .aria_label(tip.clone())
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                let current = this.emoji_ui.hovered_chip.as_deref() == Some(hover_id.as_str());
+                if *hovered && !current {
+                    this.emoji_ui.hovered_chip = Some(hover_id.clone());
+                    cx.notify();
+                } else if !*hovered && current {
+                    this.emoji_ui.hovered_chip = None;
+                    cx.notify();
+                }
+            }))
             .relative()
             .size(px(side + 8.))
             .flex_shrink_0()
@@ -604,7 +798,11 @@ impl Monos {
             .items_center()
             .justify_center()
             .hover(|s| s.border_color(accent_color().opacity(0.7)))
-            .child(picture(&path, side, format!("{id}-image").into()))
+            .child(picture(
+                &path,
+                side,
+                playing.then(|| format!("{id}-image").into()),
+            ))
             .when(emoji.format == Format::Gif, |d| {
                 d.child(
                     div()
@@ -905,13 +1103,11 @@ impl Monos {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let pid = pack.id.clone();
-        let thumbs = pack.emoji.iter().take(5).map(|e| {
-            picture(
-                &emoji::image_path(dir, pack, e),
-                22.,
-                format!("mono-emoji-thumb-{}-{}", pack.id, e.file).into(),
-            )
-        });
+        let thumbs = pack
+            .emoji
+            .iter()
+            .take(5)
+            .map(|e| picture(&emoji::image_path(dir, pack, e), 22., None));
         let pill = if !pack.enabled {
             ("turned off".to_string(), false)
         } else if let Some(model) = &pack.sorted_by {

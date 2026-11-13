@@ -136,9 +136,28 @@ fn scroll_page(visual: &mut VisualTestContext, dy: f32) {
     visual.refresh().unwrap();
 }
 
-fn make_zip(name: &str) -> PathBuf {
+/// A folder for test zips that is removed when the test's thread ends.
+struct ZipDir(PathBuf);
+
+impl Drop for ZipDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+thread_local! {
+    static ZIP_DIRS: std::cell::RefCell<Vec<ZipDir>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn zip_dir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("emoji-zips-{}", mono::new_id()));
-    let zip = dir.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    ZIP_DIRS.with(|dirs| dirs.borrow_mut().push(ZipDir(dir.clone())));
+    dir
+}
+
+fn make_zip(name: &str) -> PathBuf {
+    let zip = zip_dir().join(name);
     test_support::zip(
         &zip,
         &[
@@ -160,6 +179,25 @@ fn import(s: &Setup, visual: &mut VisualTestContext, zips: Vec<PathBuf>) {
     visual.run_until_parked();
     visual.refresh().unwrap();
     assert!(dialog_open(s, visual), "the import dialog opens");
+}
+
+/// The reason of the names fallback of the zip under review.
+fn names_reason(s: &Setup, visual: &VisualTestContext) -> String {
+    s.manager.read_with(visual, |m, _| {
+        let step = m.emoji_ui.import.as_ref().unwrap().step.as_ref().unwrap();
+        match &step.review.as_ref().unwrap().source {
+            Source::Names { reason } => reason.clone(),
+            Source::Model { label } => panic!("sorted by {label}"),
+        }
+    })
+}
+
+/// Lets typed text rest long enough to be written, then runs the write.
+fn settle(visual: &mut VisualTestContext) {
+    visual
+        .executor()
+        .advance_clock(emoji_ui::SAVE_DELAY + std::time::Duration::from_millis(50));
+    visual.run_until_parked();
 }
 
 fn staging_dirs(s: &Setup) -> Vec<PathBuf> {
@@ -265,6 +303,8 @@ fn a_zip_is_unpacked_sorted_reviewed_and_saved(cx: &mut TestAppContext) {
         "mono-emoji-step-sorting",
         "mono-emoji-review",
         "mono-emoji-review-happy",
+        "mono-emoji-review-chill",
+        "mono-emoji-review-unsorted",
         "mono-emoji-import-use",
         "mono-emoji-import-skip",
     ] {
@@ -348,8 +388,7 @@ fn cancel_saves_nothing_and_leaves_no_staging_folder(cx: &mut TestAppContext) {
 fn without_a_model_the_dialog_suggests_from_file_names_and_says_so(cx: &mut TestAppContext) {
     let (s, mut visual) = open(cx);
     show(&s, &mut visual);
-    let dir = std::env::temp_dir().join(format!("emoji-zips-{}", mono::new_id()));
-    let zip = dir.join("names.zip");
+    let zip = zip_dir().join("names.zip");
     test_support::zip(
         &zip,
         &[
@@ -361,23 +400,18 @@ fn without_a_model_the_dialog_suggests_from_file_names_and_says_so(cx: &mut Test
     import(&s, &mut visual, vec![zip]);
     assert!(visual.debug_bounds("mono-emoji-import-notice").is_some());
     assert!(visual.debug_bounds("mono-emoji-import-unsorted").is_some());
-    let names = s.manager.read_with(&visual, |m, _| {
-        matches!(
-            m.emoji_ui
-                .import
-                .as_ref()
-                .unwrap()
-                .step
-                .as_ref()
-                .unwrap()
-                .review
-                .as_ref()
-                .unwrap()
-                .source,
-            Source::Names { .. }
-        )
+    let label = s.manager.read_with(&visual, |m, cx| {
+        m.chats[&s.id].read(cx).mono_model_label().to_string()
     });
-    assert!(names);
+    assert_eq!(
+        names_reason(&s, &visual),
+        format!("{label} cannot sort by image"),
+        "a provider that cannot read images keeps its wording"
+    );
+    assert_eq!(
+        emoji_import::names_notice(&names_reason(&s, &visual)),
+        format!("{label} cannot sort by image, so emoji were suggested from their file names.")
+    );
     click(&mut visual, "mono-emoji-import-use");
     visual.run_until_parked();
     let saved = disk(&s);
@@ -395,8 +429,7 @@ fn a_bad_zip_is_reported_and_the_queue_moves_on(cx: &mut TestAppContext) {
     let (s, mut visual) = open(cx);
     show(&s, &mut visual);
     install_fake(&s, vec!["happy"], &mut visual);
-    let dir = std::env::temp_dir().join(format!("emoji-zips-{}", mono::new_id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = zip_dir();
     let broken = dir.join("broken.zip");
     std::fs::write(&broken, b"this is not a zip").unwrap();
     let note = dir.join("notes.txt");
@@ -562,6 +595,7 @@ fn an_emotion_can_be_added_and_renamed_and_a_bad_name_shows_an_error(cx: &mut Te
     field.update(&mut visual, |f, cx| f.set_text("joyful".into(), cx));
     visual.run_until_parked();
     visual.refresh().unwrap();
+    settle(&mut visual);
     assert_eq!(name(&s, &visual).as_deref(), Some("joyful"));
     assert!(
         visual
@@ -581,6 +615,7 @@ fn an_emotion_can_be_added_and_renamed_and_a_bad_name_shows_an_error(cx: &mut Te
     });
     description.update(&mut visual, |f, cx| f.set_text("Pure delight".into(), cx));
     visual.run_until_parked();
+    settle(&mut visual);
     assert_eq!(
         disk(&s)
             .emotions
@@ -817,4 +852,286 @@ fn the_chat_draws_emoji_tokens_while_the_switch_is_on(cx: &mut TestAppContext) {
         visual.debug_bounds("mono-emoji-happy").is_none(),
         "switching it off removes the picture"
     );
+}
+
+fn desc_field(
+    s: &Setup,
+    visual: &VisualTestContext,
+    emotion: &str,
+) -> gpui::Entity<crate::input::Input> {
+    s.manager.read_with(visual, |m, _| {
+        m.fields[&format!("emoji-desc:{}:{emotion}", s.id)].clone()
+    })
+}
+
+fn rebuilds(s: &Setup, visual: &VisualTestContext) -> usize {
+    s.manager.read_with(visual, |m, cx| {
+        m.chats[&s.id].read(cx).transcript.read(cx).emoji_rebuilds
+    })
+}
+
+#[gpui::test]
+fn typing_a_description_waits_before_it_is_saved_and_never_rebuilds_the_chat(
+    cx: &mut TestAppContext,
+) {
+    let (s, mut visual, _) = seeded_page(cx, three());
+    visual.refresh().unwrap();
+    click(&mut visual, "mono-emoji-enabled");
+    visual.run_until_parked();
+    let before = rebuilds(&s, &visual);
+    assert!(before >= 1, "turning it on is drawn: the chat was told");
+    let field = desc_field(&s, &visual, "happy");
+    field.update(&mut visual, |f, cx| f.set_text("Typing".into(), cx));
+    visual.run_until_parked();
+    field.update(&mut visual, |f, cx| f.set_text("Typing on".into(), cx));
+    visual.run_until_parked();
+    assert_ne!(
+        disk(&s).emotions[0].description,
+        "Typing on",
+        "nothing is written while typing"
+    );
+    assert_eq!(library_of(&s, &visual).emotions[0].description, "Typing on");
+    settle(&mut visual);
+    assert_eq!(disk(&s).emotions[0].description, "Typing on");
+    assert_eq!(
+        rebuilds(&s, &visual),
+        before,
+        "a description is not drawn, so the chat is not laid out again"
+    );
+    // A change the chat draws still reaches it.
+    click(&mut visual, "mono-emoji-enabled");
+    visual.run_until_parked();
+    assert_eq!(rebuilds(&s, &visual), before + 1);
+}
+
+#[gpui::test]
+fn flushing_a_field_writes_what_was_typed_at_once(cx: &mut TestAppContext) {
+    // Leaving a field calls this; GPUI's test window does not deliver the focus-out event.
+    let (s, mut visual, _) = seeded_page(cx, three());
+    let field = desc_field(&s, &visual, "happy");
+    field.update(&mut visual, |f, cx| f.set_text("Quick".into(), cx));
+    visual.run_until_parked();
+    assert_ne!(disk(&s).emotions[0].description, "Quick");
+    let id = s.id.clone();
+    s.manager
+        .update(&mut visual, |m, cx| m.emoji_flush(&id, cx));
+    visual.run_until_parked();
+    assert_eq!(disk(&s).emotions[0].description, "Quick");
+}
+
+#[gpui::test]
+fn an_edit_made_while_a_read_is_pending_is_not_overwritten(cx: &mut TestAppContext) {
+    let (s, mut visual, _) = seeded_page(cx, three());
+    let id = s.id.clone();
+    s.manager.update(&mut visual, |m, cx| {
+        m.load_emoji(&id, true, cx);
+        m.emoji_edit(&id, cx, |l| {
+            l.enabled = true;
+            Ok(())
+        })
+        .unwrap();
+    });
+    visual.run_until_parked();
+    assert!(library_of(&s, &visual).enabled, "the read did not undo it");
+    assert!(disk(&s).enabled, "and it was saved");
+}
+
+#[gpui::test]
+fn a_read_refused_while_the_mono_is_busy_runs_when_it_is_free(cx: &mut TestAppContext) {
+    let (s, mut visual, _) = seeded_page(cx, three());
+    let id = s.id.clone();
+    let field = desc_field(&s, &visual, "happy");
+    field.update(&mut visual, |f, cx| f.set_text("Busy".into(), cx));
+    s.manager
+        .update(&mut visual, |m, cx| m.load_emoji(&id, true, cx));
+    assert_eq!(
+        s.manager
+            .read_with(&visual, |m, _| m.emoji_ui.wanted.get(&id).copied()),
+        Some(true),
+        "the read waits for the Mono"
+    );
+    settle(&mut visual);
+    assert!(
+        s.manager
+            .read_with(&visual, |m, _| m.emoji_ui.wanted.is_empty()),
+        "it was started once the write was done"
+    );
+    assert_eq!(library_of(&s, &visual).emotions[0].description, "Busy");
+}
+
+#[gpui::test]
+fn the_first_read_cleans_stale_folders_and_a_later_one_leaves_an_open_import(
+    cx: &mut TestAppContext,
+) {
+    let (s, mut visual) = open(cx);
+    show(&s, &mut visual);
+    let dir = emoji_dir(&s);
+    std::fs::create_dir_all(dir.join(".staging-old")).unwrap();
+    std::fs::create_dir_all(dir.join("sort-old")).unwrap();
+    // As if the app had just started: the Mono has not been read yet.
+    s.manager
+        .update(&mut visual, |m, _| m.emoji_ui.cleaned.clear());
+    let id = s.id.clone();
+    s.manager
+        .update(&mut visual, |m, cx| m.load_emoji(&id, true, cx));
+    visual.run_until_parked();
+    assert!(!dir.join(".staging-old").exists());
+    assert!(!dir.join("sort-old").exists());
+    // Another read, such as the one a turn makes, takes nothing away.
+    std::fs::create_dir_all(dir.join(".staging-open")).unwrap();
+    s.manager
+        .update(&mut visual, |m, cx| m.load_emoji(&id, true, cx));
+    visual.run_until_parked();
+    assert!(dir.join(".staging-open").exists());
+}
+
+#[gpui::test]
+fn only_the_chip_under_the_pointer_plays_its_gif(cx: &mut TestAppContext) {
+    let (s, mut visual, _) = seeded_page(cx, three());
+    scroll_page(&mut visual, 2000.);
+    let selector = "mono-emoji-chip-pack-seed-c.gif";
+    let chip = visual.debug_bounds(selector).expect("the chip is drawn");
+    assert_eq!(
+        s.manager
+            .read_with(&visual, |m, _| m.emoji_ui.hovered_chip.clone()),
+        None
+    );
+    visual.simulate_mouse_move(chip.center(), None, gpui::Modifiers::default());
+    visual.run_until_parked();
+    assert_eq!(
+        s.manager
+            .read_with(&visual, |m, _| m.emoji_ui.hovered_chip.clone()),
+        Some(selector.to_string())
+    );
+    visual.simulate_mouse_move(
+        gpui::point(px(1.), px(1.)),
+        None,
+        gpui::Modifiers::default(),
+    );
+    visual.run_until_parked();
+    assert_eq!(
+        s.manager
+            .read_with(&visual, |m, _| m.emoji_ui.hovered_chip.clone()),
+        None
+    );
+}
+
+/// Records the parts the factory is given and answers that there is no model.
+fn record_parts(
+    s: &Setup,
+    cx: &mut VisualTestContext,
+) -> Arc<std::sync::Mutex<Vec<emoji_import::SortParts>>> {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    s.manager.update(cx, |m, _| {
+        m.emoji_ui.sorter = Arc::new(move |parts| {
+            sink.lock().unwrap().push(parts);
+            Ok(None)
+        });
+    });
+    seen
+}
+
+#[gpui::test]
+fn the_sorter_gets_the_provider_model_and_account_of_the_monos_chat(cx: &mut TestAppContext) {
+    let (s, mut visual) = open(cx);
+    show(&s, &mut visual);
+    let seen = record_parts(&s, &mut visual);
+    import(&s, &mut visual, vec![make_zip("parts.zip")]);
+    let (kind, model, cwd, account) = s.manager.read_with(&visual, |m, cx| {
+        let chat = m.chats[&s.id].read(cx);
+        (
+            Kind::from_id(&chat.summary.provider),
+            chat.mono_model(),
+            chat.summary.cwd.clone(),
+            chat.settings.account.clone(),
+        )
+    });
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "one sorting run asked for a runner");
+    let parts = &seen[0];
+    assert_eq!(parts.kind, kind);
+    assert_eq!(parts.model, model);
+    assert_eq!(parts.cwd, cwd);
+    assert_eq!(parts.settings.account.id, account.id);
+    assert!(parts.settings.text_only);
+    assert_eq!(
+        parts.settings.access,
+        monocode_core::agent::AccessMode::ReadOnly
+    );
+}
+
+#[gpui::test]
+fn the_notice_says_why_the_model_was_not_asked(cx: &mut TestAppContext) {
+    // A model that cannot be started: the error is the reason.
+    let (s, mut visual) = open(cx);
+    show(&s, &mut visual);
+    s.manager.update(&mut visual, |m, _| {
+        m.emoji_ui.sorter = Arc::new(|_| Err("The CLI is missing.".into()));
+    });
+    import(&s, &mut visual, vec![make_zip("a.zip")]);
+    let label = s.manager.read_with(&visual, |m, cx| {
+        m.chats[&s.id].read(cx).mono_model_label().to_string()
+    });
+    assert_eq!(
+        emoji_import::names_notice(&names_reason(&s, &visual)),
+        format!(
+            "{label} is not available: The CLI is missing, so emoji were suggested from their file names."
+        )
+    );
+    click(&mut visual, "mono-emoji-import-cancel");
+    // The chat of the Mono is not open: say so.
+    s.manager.update(&mut visual, |m, _| {
+        m.chats.remove(&s.id);
+    });
+    import(&s, &mut visual, vec![make_zip("b.zip")]);
+    let who = s.manager.read_with(&visual, |m, _| {
+        m.roster.get(&s.id).map(Mono::label).unwrap()
+    });
+    assert_eq!(
+        emoji_import::names_notice(&names_reason(&s, &visual)),
+        format!(
+            "Open {who}'s chat once so its model can sort by image, so emoji were suggested from their file names."
+        )
+    );
+}
+
+#[gpui::test]
+fn the_size_of_a_picked_file_is_read_off_the_main_thread(cx: &mut TestAppContext) {
+    let (s, mut visual) = open(cx);
+    show(&s, &mut visual);
+    install_fake(&s, vec!["happy"], &mut visual);
+    import(&s, &mut visual, vec![make_zip("sized.zip")]);
+    let size = s.manager.read_with(&visual, |m, _| {
+        m.emoji_ui.import.as_ref().unwrap().queue[0].size
+    });
+    assert!(size > 0);
+}
+
+#[gpui::test]
+fn a_failed_write_after_an_import_removes_the_new_pack_and_its_folder(cx: &mut TestAppContext) {
+    let (s, mut visual) = open(cx);
+    show(&s, &mut visual);
+    install_fake(&s, vec!["happy"], &mut visual);
+    import(&s, &mut visual, vec![make_zip("doomed.zip")]);
+    // A folder where the file belongs makes every write fail.
+    std::fs::create_dir_all(emoji_dir(&s).join("emoji.json")).unwrap();
+    click(&mut visual, "mono-emoji-import-use");
+    visual.run_until_parked();
+    assert!(
+        library_of(&s, &visual).packs.is_empty(),
+        "the pack is not kept"
+    );
+    let packs = emoji_dir(&s).join("packs");
+    let left = std::fs::read_dir(&packs).map_or(0, |rd| rd.count());
+    assert_eq!(left, 0, "no folder is left behind");
+    let error = s
+        .manager
+        .read_with(&visual, |m, _| m.emoji_ui.errors.get(&s.id).cloned())
+        .expect("the error is shown");
+    assert!(
+        error.contains("Could not save the emoji settings"),
+        "{error}"
+    );
+    assert!(staging_dirs(&s).is_empty());
 }

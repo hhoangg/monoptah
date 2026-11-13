@@ -6,7 +6,11 @@
 use crate::markdown::{MarkdownRow, Part};
 use crate::markdown_model::{EmojiPick, InlineRun, InlineStyle};
 use monocode_core::mono::emoji::{Library, image_path, token};
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 
 const PREFIX: &str = ":emo[";
 
@@ -19,6 +23,9 @@ pub(crate) struct MonoEmoji {
     /// The seed key. `Conversation::set_mono_emoji` fills it with the session id, so a
     /// caller can leave it empty.
     pub session: String,
+    /// Whether each picked file exists, found out once per library push so laying out a
+    /// message does not touch the disk for every token.
+    exists: Arc<Mutex<HashMap<PathBuf, bool>>>,
 }
 
 impl MonoEmoji {
@@ -27,7 +34,17 @@ impl MonoEmoji {
             library,
             dir,
             session: String::new(),
+            exists: Arc::default(),
         }
+    }
+
+    fn file_exists(&self, path: &Path) -> bool {
+        let Ok(mut known) = self.exists.lock() else {
+            return path.is_file();
+        };
+        *known
+            .entry(path.to_path_buf())
+            .or_insert_with(|| path.is_file())
     }
 }
 
@@ -44,20 +61,34 @@ pub(super) struct MessageTokens<'a> {
     lines: Vec<(String, bool)>,
     /// How many tokens earlier blocks of this message held. It is the seed index.
     pub cursor: usize,
+    /// While the message streams: the index of a token that ends the shown text. Nothing
+    /// says yet whether it will stay alone on its line, so it is drawn inline.
+    open_tail: Option<usize>,
 }
 
 impl<'a> MessageTokens<'a> {
-    pub fn new(emoji: Option<&'a MonoEmoji>, text: &'a str) -> Self {
+    pub fn new(emoji: Option<&'a MonoEmoji>, text: &'a str, streaming: bool) -> Self {
+        let found = token::outside_code(text);
+        let open_tail = (streaming && found.last().is_some_and(|t| t.range.end == text.len()))
+            .then(|| found.len() - 1);
         Self {
             emoji,
             text,
-            starts: token::outside_code(text)
-                .into_iter()
-                .map(|t| t.range.start)
-                .collect(),
+            starts: found.iter().map(|t| t.range.start).collect(),
             lines: token::standalone(text),
             cursor: 0,
+            open_tail,
         }
+    }
+
+    /// Whether the open tail token is one of the next `count` tokens.
+    pub fn tail_within(&self, count: usize) -> bool {
+        self.open_tail_in(self.cursor..self.cursor + count)
+    }
+
+    /// Whether the open tail token has an index in `range`.
+    pub fn open_tail_in(&self, range: std::ops::Range<usize>) -> bool {
+        self.open_tail.is_some_and(|tail| range.contains(&tail))
     }
 
     /// Turn the tokens of a block's rows into pictures, or remove them. A row left with
@@ -67,7 +98,8 @@ impl<'a> MessageTokens<'a> {
         for mut row in rows {
             match &mut row.part {
                 Part::Text { runs, heading } if has_token(runs) => {
-                    let whole = *heading == 0 && only_tokens(runs);
+                    let whole =
+                        *heading == 0 && only_tokens(runs) && !self.tail_within(token_count(runs));
                     let converted = self.convert(runs, whole, *heading == 0);
                     if converted.is_empty() {
                         continue;
@@ -133,6 +165,7 @@ impl<'a> MessageTokens<'a> {
                 let index = self.cursor;
                 self.cursor += 1;
                 let large = allow_large
+                    && self.open_tail != Some(index)
                     && (whole
                         || self
                             .lines
@@ -185,7 +218,7 @@ impl<'a> MessageTokens<'a> {
         let (pack, picked) = token::pick(&emoji.library, name, seed)?;
         let path = image_path(&emoji.dir, pack, picked);
         // A file that is gone draws nothing and takes no room.
-        if !path.is_file() {
+        if !emoji.file_exists(&path) {
             return None;
         }
         let emotion = emoji
@@ -221,6 +254,17 @@ fn has_token(runs: &[InlineRun]) -> bool {
             let text: String = group.iter().map(|r| r.text.as_str()).collect();
             text.contains(PREFIX)
         })
+}
+
+/// How many tokens the plain text of `runs` holds.
+fn token_count(runs: &[InlineRun]) -> usize {
+    runs.chunk_by(|a, b| a.style == b.style)
+        .filter(|group| plain(&group[0].style))
+        .map(|group| {
+            let text: String = group.iter().map(|r| r.text.as_str()).collect();
+            token::find(&text).len()
+        })
+        .sum()
 }
 
 /// Whether a paragraph holds tokens and nothing else but white space.

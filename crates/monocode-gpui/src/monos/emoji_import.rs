@@ -207,7 +207,7 @@ fn skipped_text(staged: &Staged) -> String {
 }
 
 /// The sentence for a names fallback: the reason may already say what happened.
-fn names_notice(reason: &str) -> String {
+pub(super) fn names_notice(reason: &str) -> String {
     if reason.contains("suggested from their file names") {
         reason.to_owned()
     } else {
@@ -232,11 +232,13 @@ impl Monos {
         .detach();
     }
 
+    /// What a sorting run needs: the way to reach the Mono's model, or why there is none, the
+    /// model's label and the emotions.
     fn emoji_sort_inputs(
         &self,
         mono: &str,
         cx: &App,
-    ) -> (Option<SortParts>, String, Vec<EmotionRef>) {
+    ) -> (Result<SortParts, String>, String, Vec<EmotionRef>) {
         let emotions = self
             .emoji
             .get(mono)
@@ -252,7 +254,9 @@ impl Monos {
             })
             .unwrap_or_default();
         let Some(chat) = self.chats.get(mono) else {
-            return (None, "This Mono's model".into(), emotions);
+            let who = self.roster.get(mono).map(Mono::label).unwrap_or_default();
+            let reason = format!("Open {who}'s chat once so its model can sort by image");
+            return (Err(reason), "This Mono's model".into(), emotions);
         };
         let chat = chat.read(cx);
         let parts = SortParts {
@@ -271,7 +275,7 @@ impl Monos {
             },
             store: self.store.clone(),
         };
-        (Some(parts), chat.mono_model_label().to_string(), emotions)
+        (Ok(parts), chat.mono_model_label().to_string(), emotions)
     }
 
     /// Opens the dialog for the zips among `paths`; anything else is listed as skipped.
@@ -313,7 +317,7 @@ impl Monos {
                     .extension()
                     .is_some_and(|e| e.eq_ignore_ascii_case("zip"));
                 QueueItem {
-                    size: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+                    size: 0,
                     state: if is_zip {
                         ItemState::Waiting
                     } else {
@@ -325,6 +329,41 @@ impl Monos {
             })
             .collect();
         self.emoji_open_dialog(&mono, Mode::Import, queue, window, cx);
+        self.emoji_load_sizes(cx);
+    }
+
+    /// Looks up the size of every picked file off the main thread.
+    fn emoji_load_sizes(&mut self, cx: &mut Context<Self>) {
+        let Some(d) = self.emoji_ui.import.as_ref() else {
+            return;
+        };
+        let token = d.token;
+        let paths: Vec<PathBuf> = d.queue.iter().map(|i| i.path.clone()).collect();
+        let work = cx.background_executor().spawn(async move {
+            paths
+                .iter()
+                .map(|p| std::fs::metadata(p).map_or(0, |m| m.len()))
+                .collect::<Vec<u64>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let sizes = work.await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(d) = this.emoji_ui.import.as_mut().filter(|d| d.token == token) {
+                    for (item, size) in d.queue.iter_mut().zip(sizes) {
+                        item.size = size;
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Deletes a staging folder off the main thread.
+    fn emoji_discard(&self, staged: Staged, cx: &mut Context<Self>) {
+        cx.background_executor()
+            .spawn(async move { import::discard(staged) })
+            .detach();
     }
 
     fn emoji_open_dialog(
@@ -546,7 +585,7 @@ impl Monos {
         let Some(d) = self.emoji_ui.import.as_mut().filter(|d| d.token == token) else {
             // The dialog was cancelled while this was working: nothing may stay behind.
             if let Event::Staged { staged, .. } = event {
-                import::discard(staged);
+                self.emoji_discard(staged, cx);
             }
             return;
         };
@@ -583,10 +622,11 @@ impl Monos {
                 window.focus(&d.focus, cx);
             }
             Event::Failed(error) => {
-                if let Some(staged) = d.step.take().and_then(|s| s.staged) {
-                    import::discard(staged);
-                }
+                let staged = d.step.take().and_then(|s| s.staged);
                 d.queue[index].state = ItemState::Failed(error);
+                if let Some(staged) = staged {
+                    self.emoji_discard(staged, cx);
+                }
                 self.emoji_import_next(window, cx);
             }
         }
@@ -632,7 +672,7 @@ impl Monos {
                     return;
                 };
                 let Some((dir, library)) = self.emoji.get(&mono) else {
-                    import::discard(staged);
+                    self.emoji_discard(staged, cx);
                     return;
                 };
                 let (dir, mut scratch) = (dir.clone(), (**library).clone());
@@ -652,13 +692,14 @@ impl Monos {
                     scratch.apply_sorting(&pack_id, &review.suggestion, sorted_by);
                 }
                 let Some(pack) = scratch.packs.iter().find(|p| p.id == pack_id).cloned() else {
-                    import::discard(staged);
+                    self.emoji_discard(staged, cx);
                     return;
                 };
                 if let Some(d) = self.emoji_ui.import.as_mut() {
                     d.queue[index].state = ItemState::Saving;
                 }
                 // The pack joins the library only after its folder is in place.
+                let (folder_dir, new_pack) = (dir.clone(), pack_id.clone());
                 let work = cx.background_executor().spawn(async move {
                     let result = import::commit(&staged, &dir, &pack_id);
                     if result.is_err() {
@@ -678,10 +719,30 @@ impl Monos {
                             return;
                         }
                         let result = match result {
-                            Ok(()) => this.emoji_edit(&mono, cx, move |l| {
-                                l.packs.push(pack);
-                                Ok(())
-                            }),
+                            Ok(()) => {
+                                // Noted first: the write starts inside `emoji_edit`.
+                                this.emoji_ui
+                                    .fresh
+                                    .entry(mono.clone())
+                                    .or_default()
+                                    .push(new_pack.clone());
+                                let added = this.emoji_edit(&mono, cx, move |l| {
+                                    l.packs.push(pack);
+                                    Ok(())
+                                });
+                                if added.is_err() {
+                                    // The library cannot take it: no file will ever know it.
+                                    if let Some(fresh) = this.emoji_ui.fresh.get_mut(&mono) {
+                                        fresh.retain(|id| *id != new_pack);
+                                    }
+                                    this.emoji_discard_pack_folders(
+                                        folder_dir.clone(),
+                                        vec![new_pack.clone()],
+                                        cx,
+                                    );
+                                }
+                                added
+                            }
                             Err(error) => Err(error),
                         };
                         this.emoji_finish_item(result, window, cx);
@@ -723,11 +784,11 @@ impl Monos {
         };
         d.cancel.store(true, Ordering::Relaxed);
         if let Some(staged) = d.step.and_then(|s| s.staged) {
-            cx.background_executor()
-                .spawn(async move { import::discard(staged) })
-                .detach();
+            self.emoji_discard(staged, cx);
         }
         window.focus(&self.settings_focus, cx);
+        // A read that was refused while the import was open can go ahead.
+        self.emoji_retry_loads(cx);
         cx.notify();
     }
 
@@ -792,11 +853,15 @@ impl Monos {
                                 .max_w(px(320.))
                                 .truncate()
                                 .text_color(content(0.45))
-                                .child(format!(
-                                    "{} \u{b7} {}",
-                                    size_text(item.size),
+                                .child(if item.size == 0 {
                                     item.state.label()
-                                )),
+                                } else {
+                                    format!(
+                                        "{} \u{b7} {}",
+                                        size_text(item.size),
+                                        item.state.label()
+                                    )
+                                }),
                         )
                 }))
         });
@@ -1040,7 +1105,6 @@ impl Monos {
             }
         }
         let went = unsorted.len();
-        groups.retain(|(_, items)| !items.is_empty());
         groups.push(("Unsorted".into(), unsorted));
         let boxes: Vec<AnyElement> = groups
             .into_iter()
@@ -1165,7 +1229,7 @@ fn review_chip(item: &sort::Item) -> AnyElement {
         .flex()
         .items_center()
         .justify_center()
-        .child(picture(&item.path, 28., format!("{id}-image").into()))
+        .child(picture(&item.path, 28., None))
         .when(item.format == Format::Gif, |d| {
             d.child(
                 div()
@@ -1190,16 +1254,29 @@ fn review_chip(item: &sort::Item) -> AnyElement {
 fn sort_job(
     items: Vec<sort::Item>,
     emotions: Vec<EmotionRef>,
-    parts: Option<SortParts>,
+    parts: Result<SortParts, String>,
     factory: SorterFactory,
     label: String,
     scratch: PathBuf,
     cancel: Arc<AtomicBool>,
     tx: async_channel::Sender<Event>,
 ) {
-    // A model that cannot be reached is not an error: the names fallback explains itself.
-    let runner = parts.and_then(|p| factory(p).ok().flatten());
-    let result = sort::sort(
+    // A model that cannot be reached is not an error: the names fallback says why. A provider
+    // that cannot read images keeps the wording `sort` gives.
+    let (runner, why) = match parts {
+        Ok(parts) => match factory(parts) {
+            Ok(runner) => (runner, None),
+            Err(error) => (
+                None,
+                Some(format!(
+                    "{label} is not available: {}",
+                    error.trim_end_matches('.')
+                )),
+            ),
+        },
+        Err(reason) => (None, Some(reason)),
+    };
+    let mut result = sort::sort(
         &items,
         &emotions,
         runner.as_deref(),
@@ -1210,6 +1287,11 @@ fn sort_job(
             let _ = tx.send_blocking(Event::Progress(p));
         },
     );
+    if let (Some(why), Ok(sorted)) = (why, result.as_mut())
+        && let Source::Names { reason } = &mut sorted.source
+    {
+        *reason = format!("{why}, so emoji were suggested from their file names.");
+    }
     let _ = tx.send_blocking(match result {
         Ok(sorted) => Event::Sorted(sorted),
         Err(error) => Event::Failed(error),

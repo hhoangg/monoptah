@@ -5,7 +5,7 @@
 //! images (or a call fails) the items are suggested from their file names instead.
 //! The caller always lets the user review the suggestion; nothing here writes metadata.
 
-use super::Format;
+use super::{self as emoji, Format};
 use crate::provider;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -112,7 +112,11 @@ pub fn prompt(emotions: &[EmotionRef], labels: &[String]) -> String {
          single best matching emotion from this list, or \"unsorted\" when none fits:\n",
     );
     for emotion in emotions {
-        text.push_str(&format!("- {}: {}\n", emotion.name, emotion.description));
+        text.push_str(&format!(
+            "- {}: {}\n",
+            emoji::prompt_text(&emotion.name, emoji::MAX_EMOTION_NAME),
+            emoji::prompt_text(&emotion.description, emoji::MAX_DESCRIPTION)
+        ));
     }
     text.push_str("\nThe images are attached in this order, with these labels:\n");
     for (i, label) in labels.iter().enumerate() {

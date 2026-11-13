@@ -149,6 +149,9 @@ struct RenderedBlock {
     /// The emoji tokens of the message before this block, and in it.
     emoji_start: usize,
     emoji_count: usize,
+    /// It held the token that ended a streaming text, drawn inline for now: lay it out again
+    /// once the stream moves on.
+    open_tail: bool,
 }
 #[derive(Clone)]
 enum Body {
@@ -725,6 +728,9 @@ pub(crate) struct TranscriptView {
     mono: bool,
     /// The Mono's emoji library, for `:emo[..]` tokens in its replies.
     emoji: Option<emoji::MonoEmoji>,
+    /// How many times a changed library laid every message out again.
+    #[cfg(test)]
+    pub(crate) emoji_rebuilds: usize,
     mono_groups: std::cell::RefCell<HashMap<usize, usize>>,
     /// The Mono's mascot, colour and name, which sign its turns.
     mono_look: Option<(String, u32, SharedString)>,
@@ -912,6 +918,10 @@ impl TranscriptView {
         self.emoji = emoji;
         if unchanged || !self.mono {
             return;
+        }
+        #[cfg(test)]
+        {
+            self.emoji_rebuilds += 1;
         }
         for message in &mut self.messages {
             message.markdown_blocks.clear();
@@ -2674,6 +2684,8 @@ impl TranscriptView {
             prepared_parsers: HashMap::new(),
             mono: false,
             emoji: None,
+            #[cfg(test)]
+            emoji_rebuilds: 0,
             mono_groups: Default::default(),
             mono_look: None,
             hovered_turn: None,
@@ -3061,6 +3073,10 @@ impl TranscriptView {
             if text.encode_utf16().count() > 480 {
                 break;
             }
+        }
+        // A Mono's emoji is a picture in the chat; an OS notification has none.
+        if self.mono {
+            text = monocode_core::mono::emoji::token::strip(&text);
         }
         crate::notifications::delivery::clip_body(&text)
     }
@@ -3858,8 +3874,9 @@ impl TranscriptView {
                 } else {
                     shown
                 };
+                let streaming_tail = self.streaming && end == self.source.len();
                 let mut tokens = (self.mono && role == "assistant")
-                    .then(|| emoji::MessageTokens::new(self.emoji.as_ref(), shown));
+                    .then(|| emoji::MessageTokens::new(self.emoji.as_ref(), shown, streaming_tail));
                 parser.set_text(shown);
                 let tree = if self.reveals.get(&at).is_some_and(PacedText::behind)
                     || (self.streaming && end == self.source.len())
@@ -3887,7 +3904,12 @@ impl TranscriptView {
                                 .is_none_or(|row| row.word_start == word_cursor)
                         })
                         .filter(|old| tokens.as_ref().is_none_or(|t| t.cursor == old.emoji_start))
-                    {
+                        .filter(|old| {
+                            !old.open_tail
+                                && tokens
+                                    .as_ref()
+                                    .is_none_or(|t| !t.tail_within(old.emoji_count))
+                        }) {
                         if let Some(tokens) = &mut tokens {
                             tokens.cursor += old.emoji_count;
                         }
@@ -3927,6 +3949,9 @@ impl TranscriptView {
                         words,
                         emoji_start,
                         emoji_count: tokens.as_ref().map_or(0, |t| t.cursor) - emoji_start,
+                        open_tail: tokens
+                            .as_ref()
+                            .is_some_and(|t| t.open_tail_in(emoji_start..t.cursor)),
                     });
                 }
                 markdown_blocks = cached;
