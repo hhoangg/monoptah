@@ -243,6 +243,83 @@ fn list_parses_array_and_empty() {
     assert!(parse_list("42").is_err());
 }
 
+// Captured from a real sandbox with sbx v0.53.0 (`sbx --cloud ls --format json`); the id is
+// redacted. `ls` names the lifecycle field `status`, `inspect` names it `state`, and `ls`
+// has no `on_timeout`, `auto_resume` or `ttl_paused`.
+fn real_ls(status: &str) -> String {
+    format!(
+        r#"[
+  {{
+    "name": "zprobe-ls",
+    "id": "sbx_001mREDACTED",
+    "agent": "shell",
+    "status": "{status}",
+    "cpus": 1,
+    "memory_mib": 2048,
+    "image": "docker.io/sbx/shell@sha256:3628a57975c45c96037629303c13337f19a1d657870c1b67863051f4fb268d82",
+    "created_at": "2026-11-12T18:34:04.573831Z",
+    "expires_at": "2026-11-12T18:49:02.279936Z"
+  }}
+]"#
+    )
+}
+
+#[test]
+fn list_reads_the_status_field_real_ls_output_uses() {
+    for (raw, shown) in [
+        ("running", CloudState::Available),
+        ("stopping", CloudState::Stopping),
+        ("stopped", CloudState::Stopped),
+    ] {
+        let all = parse_list(&real_ls(raw)).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].state, raw);
+        assert_eq!(display_state(&all[0].state), shown);
+        assert_eq!(all[0].name, "zprobe-ls");
+        assert_eq!(all[0].agent, "shell");
+        assert_eq!(all[0].cpus, 1);
+        assert_eq!(all[0].memory_mib, 2048);
+        assert_eq!(
+            all[0].expires_at.as_deref(),
+            Some("2026-11-12T18:49:02.279936Z")
+        );
+    }
+}
+
+#[test]
+fn find_by_name_returns_the_state_from_ls_status() {
+    let fake = Fake::new(vec![ok(&real_ls("stopped"))]);
+    let found = find_by_name(&fake, "zprobe-ls").unwrap().unwrap();
+    assert_eq!(found.id, "sbx_001mREDACTED");
+    assert!(is_stopped(&found.state));
+}
+
+#[test]
+fn inspect_reads_the_state_field_real_inspect_output_uses() {
+    // Captured from the same sandbox just after `sbx --cloud stop` settled.
+    let info = parse_inspect(
+        r#"{
+  "id": "sbx_001mREDACTED",
+  "name": "zprobe-ls",
+  "agent": "shell",
+  "state": "stopped",
+  "image": "docker.io/sbx/shell@sha256:3628a57975c45c96037629303c13337f19a1d657870c1b67863051f4fb268d82",
+  "cpus": 1,
+  "memory_mib": 2048,
+  "on_timeout": "stop",
+  "auto_resume": true,
+  "age": "40s",
+  "created_at": "2026-11-12T18:34:04.573831Z",
+  "expires_at": "2026-11-12T18:49:02.279936Z",
+  "ttl_paused": true
+}"#,
+    )
+    .unwrap();
+    assert_eq!(info.state, "stopped");
+    assert!(info.ttl_paused);
+    assert!(info.auto_resume);
+}
+
 #[test]
 fn ttl_parses_and_extends() {
     let fake = Fake::new(vec![
