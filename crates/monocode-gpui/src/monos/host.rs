@@ -272,7 +272,7 @@ impl Monos {
     /// After `cloud.delete`: the sessions on the deleted instance are gone from the store, so
     /// their launches are dismissed and the window forgets them, or the Sub-agents panel keeps
     /// showing them (as working, when their start never finished).
-    pub(super) fn forget_deleted_cloud(
+    pub(crate) fn forget_deleted_cloud(
         &mut self,
         cloud: monocode_core::cloud_sessions::CloudRef,
         ids: Vec<i64>,

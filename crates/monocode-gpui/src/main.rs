@@ -23,6 +23,7 @@ mod cloud_presets;
 mod cloud_settings;
 mod cloud_start_view;
 mod cloud_wake;
+mod cloud_workspaces_dialog;
 mod codespace_pane;
 mod composer_box;
 mod composer_completion;

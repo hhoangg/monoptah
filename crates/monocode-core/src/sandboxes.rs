@@ -604,6 +604,9 @@ impl Compute {
     }
 }
 
+/// Every sandbox the app creates is named with this prefix (see [`sandbox_name_for`]).
+pub const NAME_PREFIX: &str = "monoptah-";
+
 /// `monoptah-<branch-slug>-<6 chars of the request id>`; always a valid sandbox name.
 pub fn sandbox_name_for(branch: &str, request_id: &str) -> String {
     let mut slug = String::new();
@@ -630,7 +633,7 @@ pub fn sandbox_name_for(branch: &str, request_id: &str) -> String {
     while suffix.len() < REQUEST_SUFFIX_LEN {
         suffix.push('0');
     }
-    format!("monoptah-{slug}-{suffix}")
+    format!("{NAME_PREFIX}{slug}-{suffix}")
 }
 
 // --------------------------------------------------------------------- types
@@ -897,7 +900,8 @@ pub fn display_state(raw: &str) -> CloudState {
         "creating" | "starting" | "resuming" | "pending" | "provisioning" | "restarting" => {
             CloudState::Starting
         }
-        "stopping" | "suspending" => CloudState::Stopping,
+        // `hibernating` is on its way to `stopped`: a delete has to wait for it.
+        "stopping" | "suspending" | "hibernating" => CloudState::Stopping,
         "stopped" | "suspended" => CloudState::Stopped,
         "failed" | "error" | "deleting" | "deleted" | "terminated" => CloudState::Unavailable,
         _ => CloudState::Unknown,
@@ -1071,6 +1075,21 @@ fn is_account_rejection(out: &SbxOutput) -> bool {
 /// [`crate::docker_accounts::DockerAuthError`] that tells where to fix it).
 pub fn is_account_text(text: &str) -> bool {
     text.contains("in Settings > Cloud.") || text.contains("Choose another in Cloud settings.")
+}
+
+/// What a failed [`list`] says about this machine, for callers that already ran it: sbx
+/// missing, signed out, or unreachable (the same words as [`diagnose`], without a second call).
+pub fn access_problem(error: &str) -> Prerequisites {
+    if error.contains("not installed") {
+        Prerequisites::SbxMissing
+    } else if is_account_text(error) {
+        // A Docker account that cannot sign in says where to fix it; `sbx login` is not that.
+        Prerequisites::DockerAccount(error.to_owned())
+    } else if looks_logged_out(error) {
+        Prerequisites::NotLoggedIn(error.to_owned())
+    } else {
+        Prerequisites::Unreachable(redact(error))
+    }
 }
 
 fn looks_logged_out(error: &str) -> bool {
