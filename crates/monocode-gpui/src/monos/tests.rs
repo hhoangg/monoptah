@@ -6358,10 +6358,12 @@ fn pick_each_dropdown_value(busy: bool, cx: &mut TestAppContext) {
     click(visual, "mono-settings-model");
     assert!(modal_state(&s, visual).1, "the model list opens");
     let star = visual.debug_bounds("model-star-1").expect("model-b's row");
-    visual.simulate_click(
-        gpui::point(star.left() - px(120.), star.center().y),
-        Default::default(),
+    let press = gpui::point(star.left() - px(120.), star.center().y);
+    assert!(
+        !dialog.contains(&press),
+        "the model row must lie outside the dialog: {press:?} against {dialog:?}"
     );
+    visual.simulate_click(press, Default::default());
     visual.run_until_parked();
     assert_eq!(
         modal_state(&s, visual),
@@ -6417,4 +6419,49 @@ fn a_refused_model_switch_says_so_in_a_toast_above_the_settings(cx: &mut TestApp
     // Its close button works without dismissing the dialog behind it.
     click(visual, "mono-error-close");
     assert_eq!(modal_state(&s, visual), (true, false, None));
+}
+
+#[gpui::test]
+fn escape_closes_the_model_list_first_and_the_settings_on_the_second_press(
+    cx: &mut TestAppContext,
+) {
+    let s = setup(cx);
+    cx.update(|cx| {
+        cx.set_reduce_motion(true);
+        crate::shell::bind_keys(cx);
+        crate::popover::bind(cx);
+    });
+    settings_with_models(&s, false, cx);
+    let visual = &mut gpui::VisualTestContext::from_window(s.window.into(), cx);
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    click(visual, "mono-settings-model");
+    assert!(modal_state(&s, visual).1, "the model list opens");
+    visual.simulate_keystrokes("escape");
+    visual.run_until_parked();
+    assert_eq!(modal_state(&s, visual), (true, false, None));
+    visual.simulate_keystrokes("escape");
+    visual.run_until_parked();
+    assert!(!modal_state(&s, visual).0, "the second escape closes it");
+}
+
+#[gpui::test]
+fn a_press_outside_the_settings_and_its_model_list_still_closes_the_settings(
+    cx: &mut TestAppContext,
+) {
+    let s = setup(cx);
+    cx.update(|cx| {
+        cx.set_reduce_motion(true);
+        crate::shell::bind_keys(cx);
+        crate::popover::bind(cx);
+    });
+    settings_with_models(&s, false, cx);
+    let visual = &mut gpui::VisualTestContext::from_window(s.window.into(), cx);
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    click(visual, "mono-settings-model");
+    visual.simulate_click(gpui::point(px(5.), px(5.)), Default::default());
+    visual.run_until_parked();
+    let (open, picker, _) = modal_state(&s, visual);
+    assert!(!open && !picker);
 }
