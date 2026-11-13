@@ -604,12 +604,17 @@ impl Conversation {
                         12.,
                     )),
             );
-        let body = div().id("cloud-target-rows").children(
-            CloudRow::of(draft.target)
-                .iter()
-                .map(|row| self.cloud_row(*row, draft, cx))
-                .collect::<Vec<_>>(),
-        );
+        let mut rows = Vec::new();
+        for row in CloudRow::of(draft.target) {
+            rows.push(self.cloud_row(*row, draft, cx));
+            // Under the Size row only: a size below the devcontainer stays selectable.
+            if *row == CloudRow::Size
+                && let Some(warning) = draft.size_warning()
+            {
+                rows.push(cloud_size_warning(warning));
+            }
+        }
+        let body = div().id("cloud-target-rows").children(rows);
         let tail = div()
             .id("cloud-target-tail")
             .children(draft.error.clone().map(|error| {
@@ -652,4 +657,19 @@ impl Conversation {
             .child(card)
             .into_any_element()
     }
+}
+
+/// The muted warning under the Size row, in the same words as Cloud settings.
+fn cloud_size_warning(text: String) -> AnyElement {
+    div()
+        .id("cloud-size-warning")
+        .debug_selector(|| "cloud-size-warning".into())
+        .role(Role::Alert)
+        .pl(px(34.))
+        .pb(px(6.))
+        .text_size(px(11.))
+        .line_height(px(15.))
+        .text_color(warning_color())
+        .child(text)
+        .into_any_element()
 }

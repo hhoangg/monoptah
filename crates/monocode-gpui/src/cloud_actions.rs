@@ -65,6 +65,8 @@ pub(crate) fn deleted(action: &str, result: &Value) -> Option<(CloudRef, Vec<i64
 }
 
 /// Adds `target`, `cloudState` and (while provisioning) `startup` to a `sessions.start` result.
+/// A new sandbox also reports the size it is created with (`target.cpus`, `target.memory`),
+/// and `note` says why it is not the project's saved one when it was changed.
 pub(crate) fn describe_start(result: &mut Value, start: &CloudStart) {
     let state = cloud_api::state_id(start.initial_state());
     let cloud = start.cloud_ref();
@@ -76,6 +78,13 @@ pub(crate) fn describe_start(result: &mut Value, start: &CloudStart) {
     result["cloudState"] = json!(state);
     if let Some(record) = start.record() {
         result["startup"] = json!({"step":record.current().map(|step| step.id())});
+        if let Some(sandbox) = &record.sandbox_start {
+            result["target"]["cpus"] = json!(sandbox.config.cpus);
+            result["target"]["memory"] = json!(sandbox.config.memory);
+        }
+    }
+    if let Some(note) = start.note() {
+        result["note"] = json!(note);
     }
 }
 
@@ -148,14 +157,14 @@ mod tests {
 
     #[test]
     fn a_failed_sandbox_start_is_worded_for_the_sandbox() {
-        let start = CloudStart::Pending(session(), record(Some("box-9"), ""));
+        let start = CloudStart::Pending(session(), record(Some("box-9"), ""), None);
         let note = failure_note(Some(&start), "store failed".into());
         assert!(
             note.contains("sandbox box-9 was created and kept"),
             "{note}"
         );
         assert!(!note.contains("codespace"), "{note}");
-        let start = CloudStart::Pending(session(), record(None, "octo-1"));
+        let start = CloudStart::Pending(session(), record(None, "octo-1"), None);
         let note = failure_note(Some(&start), "store failed".into());
         assert!(
             note.contains("codespace octo-1 was created and kept"),

@@ -1531,3 +1531,90 @@ fn a_session_whose_codespace_failed_to_start_is_not_working(cx: &mut TestAppCont
         "a failed start waits for Retry: not working, shown as failed"
     );
 }
+
+#[gpui::test]
+fn deleting_a_sandbox_drops_its_sessions_from_the_window_and_the_sub_agents_panel(
+    cx: &mut TestAppContext,
+) {
+    let ((s, _gh, _host, _guard), sbx) = sandbox_setup(cx, "Available", "running");
+    let id = sandbox_cloud_session(&s, cx);
+    cx.update(|cx| {
+        s.manager.update(cx, |m, _| {
+            let mono = m.roster.get_mut(&s.id).unwrap();
+            let cwd = mono.projects[0].clone();
+            mono.launches.push(launch_of(id, &cwd));
+        })
+    });
+    let views = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            s.manager
+                .read(cx)
+                .owner
+                .upgrade()
+                .unwrap()
+                .read(cx)
+                .mono_session_views(cx)
+                .iter()
+                .map(|v| v.id)
+                .collect::<Vec<_>>()
+        })
+    };
+    assert!(views(cx).contains(&id), "shown before the delete");
+    let deleted = run(
+        &s,
+        "sd1",
+        "cloud.delete",
+        json!({"kind":"sandbox","instance":SANDBOX}),
+        cx,
+    )
+    .unwrap();
+    assert_eq!(deleted["kind"], "sandbox", "{deleted}");
+    assert_eq!(deleted["removedSessionIds"], json!([id]), "{deleted}");
+    assert!(sbx.calls.lock().unwrap().iter().any(|c| c.contains(" rm ")));
+    cx.run_until_parked();
+    assert!(
+        !views(cx).contains(&id),
+        "the deleted sandbox's session is gone from the panel's views"
+    );
+    let launch = launches_of(&s, cx)
+        .into_iter()
+        .find(|l| l.session_id == id)
+        .unwrap();
+    assert!(launch.dismissed, "its launch is dismissed");
+}
+
+#[gpui::test]
+fn a_session_whose_sandbox_failed_to_start_is_not_working(cx: &mut TestAppContext) {
+    use crate::cloud_start_view::fixtures::{as_sandbox, failed, starting};
+    let ((s, _gh, _host, _guard), _sbx) = sandbox_setup(cx, "Available", "running");
+    let id = sandbox_cloud_session(&s, cx);
+    let owner = cx.update(|cx| s.manager.read(cx).owner.upgrade().unwrap());
+    let view = cx
+        .update(|cx| owner.update(cx, |o, cx| o.mono_ensure_session(id, cx)))
+        .unwrap();
+    let state = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            let views = owner.read(cx).mono_session_views(cx);
+            let v = views.iter().find(|v| v.id == id).unwrap();
+            (v.busy, v.start_failed)
+        })
+    };
+    cx.update(|cx| {
+        view.update(cx, |v, cx| {
+            v.set_cloud_start(Some(as_sandbox(starting(2))), cx)
+        })
+    });
+    assert_eq!(state(cx), (true, false), "a running start is working");
+    let error =
+        "Sign in to Docker first: run `sbx login`. Then Retry. (Cloning the repository failed)";
+    cx.update(|cx| {
+        view.update(cx, |v, cx| {
+            v.set_cloud_start(Some(as_sandbox(failed(3, error))), cx)
+        })
+    });
+    assert_eq!(
+        state(cx),
+        (false, true),
+        "a failed sandbox start waits for Retry: not working, shown as failed"
+    );
+}
