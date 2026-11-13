@@ -190,6 +190,57 @@ pub fn strip(markdown: &str) -> String {
     out
 }
 
+/// For every token outside code, in source order: its name and whether it is alone on its
+/// line (nothing but a quote or list marker before it, nothing after). The markdown parser
+/// folds soft breaks into spaces, so a renderer asks this to tell a token on its own line
+/// from one inside a sentence.
+pub fn standalone(markdown: &str) -> Vec<(String, bool)> {
+    if !markdown.contains(PREFIX) {
+        return Vec::new();
+    }
+    let code = code_ranges(markdown, false);
+    find(markdown)
+        .into_iter()
+        .filter(|t| !in_code(&code, t.range.start))
+        .map(|token| {
+            let line_start = markdown[..token.range.start]
+                .rfind('\n')
+                .map_or(0, |at| at + 1);
+            let line_end = markdown[token.range.end..]
+                .find('\n')
+                .map_or(markdown.len(), |at| token.range.end + at);
+            let before = markdown[line_start..token.range.start].trim_start();
+            let after = &markdown[token.range.end..line_end];
+            let alone = after.trim().is_empty() && block_prefix(before).trim().is_empty();
+            (token.name, alone)
+        })
+        .collect()
+}
+
+/// What is left of a line start after quote markers and one list marker.
+fn block_prefix(mut line: &str) -> &str {
+    while let Some(rest) = line.strip_prefix('>') {
+        line = rest.trim_start();
+    }
+    if let Some(rest) = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .or_else(|| line.strip_prefix("+ "))
+    {
+        return rest;
+    }
+    let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+    if digits > 0 {
+        if let Some(rest) = line[digits..]
+            .strip_prefix(". ")
+            .or_else(|| line[digits..].strip_prefix(") "))
+        {
+            return rest;
+        }
+    }
+    line
+}
+
 /// Where an unfinished token at the very end of `text` starts (`:`, `:em`, `:emo[ha`), so
 /// a streaming view can hide it until it completes. None when the end is not such a prefix
 /// or it sits in code.

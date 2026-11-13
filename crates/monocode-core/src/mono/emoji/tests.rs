@@ -1,4 +1,4 @@
-use super::token::{find, incomplete_tail, pick, seed, strip};
+use super::token::{find, incomplete_tail, pick, seed, standalone, strip};
 use super::*;
 use std::collections::HashMap;
 
@@ -474,4 +474,15 @@ fn pick_is_deterministic_and_respects_state() {
     assert!(pick(&library, "sad", 0).is_none());
     library.enabled = false;
     assert!(pick(&library, "happy", 0).is_none());
+}
+
+#[test]
+fn standalone_tells_own_line_tokens_from_inline_ones() {
+    let text = "Hi :emo[happy] there\n:emo[love]\nmore\n\n- :emo[sad]\n> :emo[cool]\n2. :emo[chill] x\n\n```\n:emo[code]\n```\n`:emo[span]` :emo[last]";
+    let found = standalone(text);
+    let names: Vec<&str> = found.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["happy", "love", "sad", "cool", "chill", "last"]);
+    let flags: Vec<bool> = found.iter().map(|(_, a)| *a).collect();
+    assert_eq!(flags, [false, true, true, true, false, false]);
+    assert!(standalone("no tokens").is_empty());
 }

@@ -15,6 +15,19 @@ pub(crate) struct InlineStyle {
     /// Text of a link whose target has not streamed in yet. It is never
     /// autolinked, so a URL in the label cannot open the wrong address.
     pub pending_link: bool,
+    /// A Mono emoji picture. The run's text is empty, so selection, search and copy see
+    /// nothing; only the rich inline path draws it.
+    pub emoji: Option<Arc<EmojiPick>>,
+}
+/// The picture chosen for one `:emo[...]` token. See `transcript/emoji.rs`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct EmojiPick {
+    pub path: std::path::PathBuf,
+    pub name: String,
+    pub emotion: String,
+    pub format: &'static str,
+    /// Drawn large on a row of its own, instead of at text size.
+    pub large: bool,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TaskMarker {

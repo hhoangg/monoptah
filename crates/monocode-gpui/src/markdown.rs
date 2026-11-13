@@ -2,7 +2,7 @@
 mod cache;
 pub(crate) mod mermaid;
 mod search;
-use crate::markdown_model::{Block, InlineRun, TableAlign};
+use crate::markdown_model::{Block, EmojiPick, InlineRun, TableAlign};
 use crate::syntax::HighlightedDocument;
 use crate::theme::*;
 use crate::transcript::selection::TextSelection;
@@ -10,7 +10,7 @@ pub(crate) use cache::{PreparedRow, RenderCache};
 use gpui::Window;
 use gpui::{
     AnyElement, App, ClickEvent, Div, FontStyle, FontWeight, HighlightStyle, InteractiveText,
-    MouseButton, Pixels, Point, Role, SharedString, StrikethroughStyle, StyledText, div,
+    MouseButton, ObjectFit, Pixels, Point, Role, SharedString, StrikethroughStyle, StyledText, div,
     prelude::*, px, rgb,
 };
 pub(crate) use search::{mark_row, mark_styles, row_text};
@@ -479,6 +479,10 @@ pub(crate) fn word_count(row: &MarkdownRow) -> usize {
         _ => 0,
     }
 }
+/// Runs the text-only path cannot draw: inline code chips and Mono emoji pictures.
+pub(crate) fn needs_rich(runs: &[InlineRun]) -> bool {
+    runs.iter().any(|r| r.style.code || r.style.emoji.is_some())
+}
 #[allow(clippy::too_many_arguments)]
 fn inline_selected(
     runs: &[InlineRun],
@@ -491,7 +495,7 @@ fn inline_selected(
     selection: Option<TextSelection>,
     prepared: Option<&cache::PreparedInline>,
 ) -> AnyElement {
-    if runs.iter().any(|r| r.style.code) {
+    if needs_rich(runs) {
         return rich_inline(runs, id, tone, fade, now, word_base, font_size, selection);
     }
     let uncached;
@@ -610,6 +614,16 @@ fn rich_inline(
     let mut offset = 0;
     for (run_ix, run) in runs.iter().enumerate() {
         let style = &run.style;
+        if let Some(pick) = &style.emoji {
+            if pick.large {
+                children.push(div().w_full().h(px(0.)).into_any_element());
+            }
+            children.push(emoji_element(pick, &id, run_ix));
+            if pick.large {
+                children.push(div().w_full().h(px(0.)).into_any_element());
+            }
+            continue;
+        }
         if style.code {
             let text = run.text.clone();
             let file = is_file_chip(&text);
@@ -765,6 +779,40 @@ fn rich_inline(
         .flex_wrap()
         .items_center()
         .children(children)
+        .into_any_element()
+}
+/// Inline emoji height, inside the 24px line.
+pub(crate) const EMOJI_INLINE: f32 = 20.;
+/// Height of an emoji that stands alone on its line.
+pub(crate) const EMOJI_LARGE: f32 = 56.;
+/// One Mono emoji picture. A missing or unreadable file draws nothing. The element id
+/// keeps a GIF or WebP animating across frames.
+fn emoji_element(pick: &Arc<EmojiPick>, id: &SharedString, run_ix: usize) -> AnyElement {
+    let size = if pick.large {
+        EMOJI_LARGE
+    } else {
+        EMOJI_INLINE
+    };
+    let tip: SharedString = format!("{} \u{b7} {}", pick.name, pick.emotion).into();
+    let selector = if pick.large {
+        format!("mono-emoji-large-{}", pick.emotion)
+    } else {
+        format!("mono-emoji-{}", pick.emotion)
+    };
+    let picture = crate::image_memory::thumbnail(pick.path.clone())
+        .id(SharedString::from(format!("{id}-emoji-{run_ix}")))
+        .size(px(size))
+        .object_fit(ObjectFit::Contain)
+        .with_fallback(|| div().into_any_element())
+        .tooltip(move |_, cx| cx.new(|_| crate::cloud_mark::CloudTip(tip.clone())).into());
+    div()
+        .flex_none()
+        .size(px(size))
+        .ml(px(2.))
+        .mr(px(4.))
+        .my(px(if pick.large { 4. } else { 0. }))
+        .debug_selector(move || selector.clone())
+        .child(picture)
         .into_any_element()
 }
 fn is_file_chip(text: &str) -> bool {
