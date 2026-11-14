@@ -33,7 +33,9 @@ impl HarnessUpdates {
             checking: false,
             generation: 0,
         };
-        if harness_updates::claim_launch_check() {
+        // Tests must not spawn real CLI/npm probes: a machine with an outdated
+        // CLI would show the toast and cover whatever the test inspects.
+        if !cfg!(test) && harness_updates::claim_launch_check() {
             this.check_now(hidden, cx);
         }
         this
