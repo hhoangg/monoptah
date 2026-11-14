@@ -135,6 +135,16 @@ relinks the large `monocode-gpui` test binary (median 1.4 min, p90 4.1 min).
   such as `dckr_pat_...` in test sources. Build fake tokens with `concat!` or use obviously
   fake values.
 
+## Cleaning up worktrees
+
+When a session created a PR and that PR is merged, the agent cleans up after itself: its
+worktree, local and remote branch, and any temp worktrees, using the `cleanup-worktree` skill
+(`npm run worktrees:clean`). It refuses anything unmerged, dirty, unpushed, running, or the
+worktree Native Dev runs from, and never forces. Do not delete worktrees by hand.
+
+For the user: `npm run worktrees:clean -- --merged --dry-run` lists what would go and why the
+rest stays, then run it without `--dry-run` to delete (it asks first; non-TTY needs `--yes`).
+
 ## Releasing
 
 Releases are native only for now, see "Releasing the native app". The Tauri workflows
