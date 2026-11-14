@@ -2242,6 +2242,7 @@ pub mod default_branch;
 pub mod docker_config;
 pub mod docker_size;
 pub mod docker_start;
+pub mod footer_status;
 pub mod instance_action;
 pub mod kit;
 pub mod kit_pack;
@@ -2286,6 +2287,8 @@ mod docker_config_tests;
 mod docker_size_tests;
 #[cfg(test)]
 mod docker_start_tests;
+#[cfg(test)]
+mod footer_status_tests;
 #[cfg(test)]
 mod instance_action_tests;
 #[cfg(test)]

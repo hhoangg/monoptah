@@ -1235,7 +1235,14 @@ impl Shell {
             cloud_settings: None,
             cloud_workspaces: None,
             rails: Default::default(),
-            usage_footer: cx.new(|cx| UsageFooter::new(active_kind, cx)),
+            usage_footer: cx.new(|cx| {
+                let mut footer = UsageFooter::new(active_kind, cx);
+                footer.set_cloud_env(
+                    crate::cloud_workspaces_dialog::Env::system(store.clone()),
+                    cx,
+                );
+                footer
+            }),
             resources,
             sidebar_frame,
             projects_frame,
@@ -4650,6 +4657,12 @@ impl Shell {
         })
         .detach();
     }
+    /// The cloud status chip asks `gh` and `sbx` only while this window is active.
+    fn sync_cloud_chip_window(&self, cx: &mut Context<Self>) {
+        let active = self.window_active;
+        let chip = self.usage_footer.read(cx).cloud_chip().clone();
+        chip.update(cx, |chip, cx| chip.set_window_active(active, cx));
+    }
     fn update_usage_provider(&self, cx: &mut Context<Self>) {
         let view = self
             .monos
@@ -4670,8 +4683,18 @@ impl Shell {
             let model = view.account_model().map(str::to_owned);
             let project = view.summary.cwd.clone();
             let session = Some(view.summary.id);
+            // A cloud session's folder is `remote://...`; its cloud chip reports on the local
+            // project it belongs to.
+            let cloud_project = self
+                .cloud_marks
+                .get(&view.summary.id)
+                .map(|mark| mark.local_project.clone())
+                .unwrap_or_else(|| project.clone());
             self.usage_footer.update(cx, |footer, cx| {
-                footer.context(kind, profile, model.as_deref(), project, session, cx)
+                footer.context(kind, profile, model.as_deref(), project, session, cx);
+                footer
+                    .cloud_chip()
+                    .update(cx, |chip, cx| chip.set_project(cloud_project, cx));
             });
         }
     }
@@ -9361,9 +9384,21 @@ impl Render for Shell {
                     window.focus(&target, cx);
                 }));
             self.window_active = window.is_window_active();
+            self.sync_cloud_chip_window(cx);
+            let chip = self.usage_footer.read(cx).cloud_chip().clone();
+            self.observations.push(cx.subscribe_in(
+                &chip,
+                window,
+                |this, _, event: &crate::usage_footer::cloud_chip::Event, window, cx| match event {
+                    crate::usage_footer::cloud_chip::Event::Open { project, env } => {
+                        this.open_cloud_workspaces_with(project.clone(), env.clone(), window, cx)
+                    }
+                },
+            ));
             self.observations
                 .push(cx.observe_window_activation(window, |this, window, cx| {
                     this.window_active = window.is_window_active();
+                    this.sync_cloud_chip_window(cx);
                     if this.window_active {
                         this.reconcile_sync_jobs(cx);
                         if this.active_app_view == Some(app_views::AppView::Contributors)

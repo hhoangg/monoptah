@@ -79,14 +79,24 @@ pub struct Mono {
     pub emoji: emoji::MonoEmoji,
 }
 
-/// What a Mono's sessions start with when it names no provider, model or
-/// effort itself. Each part left unset is inherited from the Mono, as before.
+/// What a Mono's sessions start with when it names no provider, model,
+/// effort or account itself. Each part left unset is inherited from the Mono,
+/// as before.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Subsessions {
     pub harness: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// The id of a provider account (never a label, token or email). It belongs to
+    /// `harness`, or to the Mono's own provider while the harness is inherited. Unset
+    /// keeps the old behavior: the Mono's account for its own provider, otherwise the
+    /// project's choice or the provider's default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+}
+fn same_provider(a: &str, b: &str) -> bool {
+    crate::provider::Kind::from_id(a) == crate::provider::Kind::from_id(b)
 }
 impl Subsessions {
     /// None when every part is inherited, as a cleared setting is kept.
@@ -98,28 +108,82 @@ impl Subsessions {
             model: harness.as_ref().and(keep(self.model)),
             harness,
             effort: keep(self.effort),
+            account: keep(self.account),
         };
         (next != Self::default()).then_some(next)
     }
-    /// Fills a `sessions.start` request that names no provider, model or
-    /// settings. One that names any is the agent's own choice and is left
-    /// as it is, rather than mixing an effort into a model it doesn't fit.
-    pub fn fill(&self, input: &mut serde_json::Value) {
-        const CHOSEN: [&str; 4] = ["harness", "model", "modelSettings", "effort"];
-        if CHOSEN.iter().any(|key| input.get(key).is_some()) {
-            return;
+    /// The provider these defaults apply to: the one set, else the Mono's own.
+    pub fn provider<'a>(&'a self, own: &'a str) -> &'a str {
+        self.harness.as_deref().unwrap_or(own)
+    }
+    /// Picks a provider and model. An effort set for another model may not fit this
+    /// one, and an account belongs to its provider, so a change of provider resets
+    /// the account to that provider's default.
+    pub fn pick_model(&mut self, own: &str, harness: &str, model: Option<String>) {
+        if self.harness.as_deref() != Some(harness) || self.model != model {
+            self.effort = None;
         }
+        if !same_provider(self.provider(own), harness) {
+            self.account = None;
+        }
+        self.harness = Some(harness.into());
+        self.model = model;
+    }
+    /// Goes back to the Mono's own provider and model. An account of another provider
+    /// is dropped.
+    pub fn inherit_model(&mut self, own: &str) {
+        if !same_provider(self.provider(own), own) {
+            self.account = None;
+        }
+        self.harness = None;
+        self.model = None;
+        self.effort = None;
+    }
+    /// The Mono's own provider changed. While this inherits it, an account of the old
+    /// provider no longer applies.
+    pub fn follow_own_provider(&mut self, from: &str, to: &str) {
+        if self.harness.is_none() && !same_provider(from, to) {
+            self.account = None;
+        }
+    }
+    /// Fills a `sessions.start` request. One that names a provider, model or settings
+    /// is the agent's own choice and keeps them, rather than mixing an effort into a
+    /// model it doesn't fit. The account is filled separately, only when the session
+    /// ends up on the provider it was set for and the request names no account; a
+    /// cloud `target` keeps its own account rules. `own` is the Mono's provider.
+    pub fn fill(&self, input: &mut serde_json::Value, own: &str) {
+        const CHOSEN: [&str; 4] = ["harness", "model", "modelSettings", "effort"];
+        let named = CHOSEN.iter().any(|key| input.get(key).is_some());
         let Some(object) = input.as_object_mut() else {
             return;
         };
-        for (key, value) in [
-            ("harness", &self.harness),
-            ("model", &self.model),
-            ("effort", &self.effort),
-        ] {
-            if let Some(value) = value {
-                object.insert(key.into(), value.clone().into());
+        let applies = self.provider(own);
+        let effective = if named {
+            object
+                .get("harness")
+                .and_then(|v| v.as_str())
+                .unwrap_or(own)
+        } else {
+            applies
+        };
+        let account = self.account.clone().filter(|_| {
+            !object.contains_key("account")
+                && !object.contains_key("target")
+                && same_provider(effective, applies)
+        });
+        if !named {
+            for (key, value) in [
+                ("harness", &self.harness),
+                ("model", &self.model),
+                ("effort", &self.effort),
+            ] {
+                if let Some(value) = value {
+                    object.insert(key.into(), value.clone().into());
+                }
             }
+        }
+        if let Some(account) = account {
+            object.insert("account".into(), account.into());
         }
     }
 }
@@ -388,7 +452,7 @@ This is a live chat, so speed matters more than thoroughness. Think only as much
 ## The app\n\
 Reach the app through your `app` tool (MCP server monocode_app): pass the action and its JSON input. It is much faster than a shell command, so use it whenever you have it. Without it, use the app CLI `{cli} ACTION --json JSON`. Its credentials are already in your environment; never print them. The tool's description, or `{cli} help`, lists the exact actions and inputs. Use sessions.*, worktrees.* and folders.* with project set to an assigned path.\n\n\
 ## Background sessions\n\
-Start one directly, without reading help first: the app tool with action sessions.start, or `{cli} sessions.start --json '{{\"project\":\"<assigned path>\",\"title\":\"<short title>\",\"prompt\":\"<complete instructions>\",\"notifyOnComplete\":true}}'`. Only prompt is required, plus project when you have several; the session inherits your harness, model and account unless you pass harness, model or account. When the user mentions @provider/label (for example @claude/work), pass that account as account (use the id from the mention's context, with harness set to the provider); it applies to local sessions only, a cloud target uses the cloud setup. accounts.list shows the accounts. To continue a local conversation in the cloud (or bring it back), use sessions.moveToCloud / sessions.moveToLocal only when the user asked for it: they push a branch and create or wake a workspace, run in the app where the user can cancel them, and return at once (read sessions.moveStatus, and do not poll in a loop). Choose another model only when it is clearly better for the work, and avoid overlapping edits. Once a launch is accepted, tell the user and end your turn; never poll delegated work. Sessions started in one turn form a group: you receive one completion report after every session in that group stops, as a new turn once you are idle; inspect and integrate the results, then reply with a brief summary, not the whole transcript. Add completionDelivery:\"each\" to sessions.start or sessions.send to get a session's report as soon as it stops, without waiting for the turn or its siblings; use it when one result starts the next step. A habit run always reports this way, and the sessions it starts report to your chat, not to the run, even after the run has ended. parentSessionId (the ID of a session you started in the same project, one level deep) shows a new session under it, and folderName or folderId files it in a folder. sessions.send supports notifyOnComplete:true. While sessions run, answer other messages and start other work if asked; the user can open the sessions you started from your details panel.\n\n\
+Start one directly, without reading help first: the app tool with action sessions.start, or `{cli} sessions.start --json '{{\"project\":\"<assigned path>\",\"title\":\"<short title>\",\"prompt\":\"<complete instructions>\",\"notifyOnComplete\":true}}'`. Only prompt is required, plus project when you have several; the session takes the harness, model, effort and account your settings name for sessions you start, else your own, unless you pass harness, model or account (a harness of another provider uses that provider's project or default account). When the user mentions @provider/label (for example @claude/work), pass that account as account (use the id from the mention's context, with harness set to the provider); it applies to local sessions only, a cloud target uses the cloud setup. accounts.list shows the accounts. To continue a local conversation in the cloud (or bring it back), use sessions.moveToCloud / sessions.moveToLocal only when the user asked for it: they push a branch and create or wake a workspace, run in the app where the user can cancel them, and return at once (read sessions.moveStatus, and do not poll in a loop). Choose another model only when it is clearly better for the work, and avoid overlapping edits. Once a launch is accepted, tell the user and end your turn; never poll delegated work. Sessions started in one turn form a group: you receive one completion report after every session in that group stops, as a new turn once you are idle; inspect and integrate the results, then reply with a brief summary, not the whole transcript. Add completionDelivery:\"each\" to sessions.start or sessions.send to get a session's report as soon as it stops, without waiting for the turn or its siblings; use it when one result starts the next step. A habit run always reports this way, and the sessions it starts report to your chat, not to the run, even after the run has ended. parentSessionId (the ID of a session you started in the same project, one level deep) shows a new session under it, and folderName or folderId files it in a folder. sessions.send supports notifyOnComplete:true. While sessions run, answer other messages and start other work if asked; the user can open the sessions you started from your details panel.\n\n\
 ## Soul, memory and habits\n\
 Your soul holds the user's standing instructions; they rank below the user's current request. Change it only when asked, through soul.read and soul.update with expectedHash; never edit its file directly. Keep useful facts through memory.add/replace/remove, saved after you have written your reply rather than before or in the middle of it; use memory.search before answering about earlier facts, and never save credentials. Topic notes are read with memory.read. Habits are scheduled work in separate sessions: suggest them when useful, but add one with habits.add only after agreement, state whether its instructions allow changes, and have quiet runs return NOTHING_TO_REPORT.\n\n\
 ## Workflows\n\

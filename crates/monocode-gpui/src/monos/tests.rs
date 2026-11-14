@@ -2271,8 +2271,7 @@ fn subsessions_fill_a_start_that_names_no_model_and_yield_to_one_that_does(
     edit_mono(&s, cx, |m| {
         m.subsessions = Some(mono::Subsessions {
             harness: Some(other.into()),
-            model: None,
-            effort: None,
+            ..Default::default()
         });
     });
     // Names no harness, model or effort: the Mono's subsessions apply.
@@ -2300,8 +2299,7 @@ fn subsessions_fill_a_start_that_names_no_model_and_yield_to_one_that_does(
     edit_mono(&s, cx, |m| {
         m.subsessions = Some(mono::Subsessions {
             harness: Some("no-such-harness".into()),
-            model: None,
-            effort: None,
+            ..Default::default()
         });
     });
     let before = session_count(&s);
@@ -6216,6 +6214,213 @@ fn sessions_start_runs_with_the_named_account_and_validates_models_against_it(
     )
     .unwrap();
     assert_eq!(started_account(&s, &started, cx), codex);
+}
+
+#[gpui::test]
+fn sessions_start_takes_the_account_set_for_the_sessions_unless_the_start_names_one(
+    cx: &mut TestAppContext,
+) {
+    let s = setup(cx);
+    let (work, home, _codex) = add_accounts(&s, cx);
+    // Whatever the Mono itself runs on, its sessions go to Claude on the "Work" account.
+    edit_mono(&s, cx, |m| {
+        m.subsessions = Some(mono::Subsessions {
+            harness: Some("claude".into()),
+            account: Some(work.clone()),
+            ..Default::default()
+        });
+    });
+    let provider_of = |id: i64| {
+        locked(&s.store)
+            .unwrap()
+            .sessions()
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.id == id)
+            .unwrap()
+            .provider
+    };
+    let base = json!({"project":s.project,"prompt":"Go","draft":true});
+    // A bare start uses the defaults, not the provider's preferred account (home).
+    let started = start(&s, "sub-acc-default", base.clone(), cx).unwrap();
+    assert_eq!(
+        provider_of(started["sessionId"].as_i64().unwrap()),
+        "claude"
+    );
+    assert_eq!(started_account(&s, &started, cx), work);
+    // An explicit account wins.
+    let mut named = base.clone();
+    named["account"] = json!(home);
+    let started = start(&s, "sub-acc-named", named, cx).unwrap();
+    assert_eq!(started_account(&s, &started, cx), home);
+    // An explicit harness of another provider is not given the Claude account.
+    let mut codex = base.clone();
+    codex["harness"] = json!("codex");
+    let started = start(&s, "sub-acc-codex", codex, cx).unwrap();
+    assert_eq!(provider_of(started["sessionId"].as_i64().unwrap()), "codex");
+    assert_eq!(started_account(&s, &started, cx), "default");
+    // An account that was removed fails the start clearly and leaves no session.
+    edit_mono(&s, cx, |m| {
+        m.subsessions = Some(mono::Subsessions {
+            harness: Some("claude".into()),
+            account: Some("acct-gone".into()),
+            ..Default::default()
+        });
+    });
+    let before = session_count(&s);
+    let refused = start(&s, "sub-acc-gone", base.clone(), cx).unwrap_err();
+    assert_eq!(refused, host::DEFAULT_ACCOUNT_GONE);
+    assert_eq!(session_count(&s), before);
+    // An explicit account still starts, so the Mono can route around it.
+    let mut named = base;
+    named["account"] = json!(home);
+    start(&s, "sub-acc-route", named, cx).unwrap();
+}
+
+#[test]
+fn a_removed_default_account_is_refused_and_one_for_a_provider_without_accounts_is_dropped() {
+    use monocode_core::accounts::Book;
+    let mut book = Book::default();
+    let work = book.add(Kind::Claude, "Work").unwrap().id;
+    let check = |kind, id: &str| host::default_account_check(Some(book.clone()), kind, id);
+    assert_eq!(check(Kind::Claude, &work), host::DefaultAccount::Use);
+    assert_eq!(check(Kind::Claude, "default"), host::DefaultAccount::Use);
+    assert_eq!(check(Kind::Claude, "gone"), host::DefaultAccount::Gone);
+    // An account of another provider is not valid for this one.
+    assert_eq!(check(Kind::Codex, &work), host::DefaultAccount::Gone);
+    assert_eq!(check(Kind::Cursor, "x"), host::DefaultAccount::Drop);
+    // No account book (not loaded): the start uses the provider's default instead of failing.
+    assert_eq!(
+        host::default_account_check(None, Kind::Claude, "x"),
+        host::DefaultAccount::Drop
+    );
+}
+
+#[test]
+fn a_usage_limited_session_names_its_account_label_in_the_report() {
+    use monocode_core::usage::Limit;
+    let now = 1_000_000;
+    let note = host::usage_limit_note("claude", "Work account", &Limit::default(), now);
+    assert!(
+        note.contains("Claude") && note.contains("\"Work account\""),
+        "{note}"
+    );
+    assert!(note.contains("another account"), "{note}");
+    assert!(!note.contains("resets"), "{note}");
+    let timed = Limit {
+        resets_at: Some(now + 90 * 60_000),
+        resume_at_reset: false,
+    };
+    let note = host::usage_limit_note("codex", "Codex Pro", &timed, now);
+    assert!(
+        note.contains("Codex") && note.contains("Codex Pro"),
+        "{note}"
+    );
+    assert!(note.contains("resets in about 91 min"), "{note}");
+    // A reset in the past is not announced.
+    let past = Limit {
+        resets_at: Some(now - 1),
+        resume_at_reset: false,
+    };
+    assert!(!host::usage_limit_note("claude", "Home", &past, now).contains("resets"));
+    // The note reaches the Mono ahead of the session's own text, with the label only.
+    let report = host::completion_message(
+        host::Batch::Each(7),
+        &[(7, "Review".into(), format!("{note}\nNothing to add"))],
+    );
+    assert!(report.contains("Session 7: Review\n[Stopped:"), "{report}");
+    assert!(report.contains("Codex Pro"), "{report}");
+}
+
+#[gpui::test]
+fn an_unloaded_chat_still_has_the_monos_own_provider_for_the_default_account(
+    cx: &mut TestAppContext,
+) {
+    let s = setup(cx);
+    let (work, _home, _codex) = add_accounts(&s, cx);
+    // The Mono is a Claude one, but its chat is not open (a habit or heartbeat run).
+    locked(&s.store)
+        .unwrap()
+        .change_provider(s.session, "claude")
+        .unwrap();
+    cx.update(|cx| {
+        s.manager.update(cx, |m, _| {
+            m.chats.remove(&s.id);
+        })
+    });
+    let own = cx.update(|cx| s.manager.read(cx).own_provider_of(&s.id, None, cx));
+    assert_eq!(own, "claude");
+    // An account alone applies to that provider: the start runs on Claude with it.
+    edit_mono(&s, cx, |m| {
+        m.subsessions = Some(mono::Subsessions {
+            account: Some(work.clone()),
+            ..Default::default()
+        });
+    });
+    let started = start(
+        &s,
+        "unloaded",
+        json!({"project":s.project,"prompt":"Go","draft":true}),
+        cx,
+    )
+    .unwrap();
+    assert_eq!(started_account(&s, &started, cx), work);
+    let provider = locked(&s.store)
+        .unwrap()
+        .mono_session(started["sessionId"].as_i64().unwrap())
+        .unwrap()
+        .unwrap()
+        .provider;
+    assert_eq!(provider, "claude");
+}
+
+#[gpui::test]
+fn the_completion_report_reads_the_live_limit_and_the_saved_one_only_for_closed_sessions(
+    cx: &mut TestAppContext,
+) {
+    use monocode_core::usage::Limit;
+    let s = setup(cx);
+    let (work, _home, _codex) = add_accounts(&s, cx);
+    let started = start(
+        &s,
+        "limited",
+        json!({"project":s.project,"prompt":"Go","draft":true,"harness":"claude","account":work}),
+        cx,
+    )
+    .unwrap();
+    let child = started["sessionId"].as_i64().unwrap();
+    let book = cx.update(|cx| crate::accounts::get(cx).unwrap().read(cx).book.clone());
+    let report = |live, cx: &mut TestAppContext| {
+        let _ = cx;
+        host::completion_results(&s.store, vec![(child, "Review".into())], Some(&book), live)
+            .remove(0)
+            .2
+    };
+    // Open, and no limit in memory (a newer turn cleared it): no note, whatever was saved.
+    let open = cx.update(|cx| s.manager.read(cx).live_limits(&[child], cx));
+    assert!(matches!(open.get(&child), Some(None)));
+    assert!(!report(open, cx).contains("usage limit"));
+    // The limit is only in memory, not saved yet: the report still names the account.
+    cx.update(|cx| {
+        let owner = s.manager.read(cx).owner.upgrade().unwrap();
+        let view = owner.read(cx).mono_session_entity(child).unwrap();
+        view.update(cx, |v, _| v.settings.usage_limit = Some(Limit::default()));
+    });
+    let open = cx.update(|cx| s.manager.read(cx).live_limits(&[child], cx));
+    let text = report(open, cx);
+    assert!(
+        text.contains("\"Work account\"") && text.contains("Claude"),
+        "{text}"
+    );
+    // A session that is not open reports the saved limit.
+    {
+        let db = locked(&s.store).unwrap();
+        let mut saved = db.agent_settings(child).unwrap().unwrap();
+        saved.usage_limit = Some(Limit::default());
+        db.save_agent_settings(child, &saved).unwrap();
+    }
+    let text = report(std::collections::HashMap::new(), cx);
+    assert!(text.contains("\"Work account\""), "{text}");
 }
 
 #[gpui::test]

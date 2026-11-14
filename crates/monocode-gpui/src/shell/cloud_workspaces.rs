@@ -55,10 +55,12 @@ impl Shell {
                 }
                 cloud_workspaces_dialog::Event::Stopped(cloud) => {
                     this.cloud_states.remove(&cloud.key());
-                    this.refresh_cloud(cx)
+                    this.refresh_cloud(cx);
+                    this.cloud_chip_changed(cx);
                 }
                 cloud_workspaces_dialog::Event::Deleted { cloud, removed } => {
-                    this.forget_deleted_workspace(cloud.clone(), removed.clone(), window, cx)
+                    this.forget_deleted_workspace(cloud.clone(), removed.clone(), window, cx);
+                    this.cloud_chip_changed(cx);
                 }
             },
         );
@@ -68,6 +70,12 @@ impl Shell {
             _events: events,
         });
         cx.notify();
+    }
+
+    /// A stop or delete changed the workspaces: the footer's cloud chip reads them again.
+    fn cloud_chip_changed(&self, cx: &mut Context<Self>) {
+        let chip = self.usage_footer.read(cx).cloud_chip().clone();
+        chip.update(cx, |chip, cx| chip.changed(cx));
     }
 
     /// Closes the dialog, unless a stop or delete is running: closing would drop the dialog and
@@ -157,6 +165,75 @@ mod tests {
         cx.run_until_parked();
         window
             .update(cx, |shell, window, cx| {
+                shell.cloud_workspaces_escape(window, cx);
+                assert!(shell.cloud_workspaces.is_none());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn the_footer_chip_follows_the_local_project_of_a_cloud_session_and_opens_the_dialog(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let store = window.read_with(cx, |s, _| s.store.clone()).unwrap();
+        let w = fixtures::world_in(store);
+        let env = Env {
+            api: Some(w.api.clone()),
+            store: w.store.clone(),
+        };
+        let chip = window
+            .read_with(cx, |s, cx| s.usage_footer.read(cx).cloud_chip().clone())
+            .unwrap();
+        // The open session runs in a codespace: its folder is `remote://...`, the chip reports on
+        // the local project it belongs to.
+        window
+            .update(cx, |shell, _, cx| {
+                let pane = shell.workspace.active.unwrap();
+                let id = shell.workspace.session_for_pane(pane);
+                shell.cloud_marks.insert(
+                    id,
+                    cloud::CloudMark {
+                        local_project: w.checkout.path(),
+                        codespace: "octo-used".into(),
+                        kind: CloudBackendKind::Codespaces,
+                    },
+                );
+                shell.update_usage_provider(cx);
+            })
+            .unwrap();
+        chip.update(cx, |chip, cx| {
+            assert_eq!(chip.project(), w.checkout.path());
+            chip.set_env(env, cx);
+            chip.set_window_active(true, cx);
+        });
+        cx.run_until_parked();
+        assert!(chip.read_with(cx, |chip, _| chip.visible()));
+
+        // Clicking it opens the same dialog the menu item opens.
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.refresh().unwrap();
+        visual.run_until_parked();
+        let at = visual
+            .debug_bounds("cloud-status-chip")
+            .expect("the chip is in the footer")
+            .center();
+        window
+            .read_with(&visual, |shell, _| {
+                assert!(shell.cloud_workspaces.is_none())
+            })
+            .unwrap();
+        visual.simulate_click(at, Default::default());
+        visual.run_until_parked();
+        window
+            .read_with(&visual, |shell, cx| {
+                let open = shell.cloud_workspaces.as_ref().expect("the dialog opened");
+                assert!(open.view.read(cx).view().is_some(), "and it loaded");
+            })
+            .unwrap();
+        // Escape closes it, as for the menu entry.
+        window
+            .update(&mut visual, |shell, window, cx| {
                 shell.cloud_workspaces_escape(window, cx);
                 assert!(shell.cloud_workspaces.is_none());
             })

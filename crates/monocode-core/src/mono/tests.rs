@@ -237,7 +237,7 @@ fn the_prompt_and_help_describe_each_delivery_and_habit_reporting() {
         assert!(bridge::HELP.contains(needle), "help lacks {needle}");
     }
     for needle in [
-        "model and account",
+        "model, effort and account",
         "@provider/label",
         "local sessions only",
     ] {
@@ -378,9 +378,10 @@ fn subsessions_fill_only_a_start_that_names_no_model() {
         harness: Some("claude".into()),
         model: Some("opus".into()),
         effort: Some("high".into()),
+        account: None,
     };
     let mut bare = serde_json::json!({"prompt": "x"});
-    set.fill(&mut bare);
+    set.fill(&mut bare, "codex");
     assert_eq!(
         bare,
         serde_json::json!({"prompt": "x", "harness": "claude", "model": "opus", "effort": "high"})
@@ -388,7 +389,7 @@ fn subsessions_fill_only_a_start_that_names_no_model() {
     for chosen in ["harness", "model", "modelSettings", "effort"] {
         let mut named = serde_json::json!({"prompt": "x", chosen: "codex"});
         let before = named.clone();
-        set.fill(&mut named);
+        set.fill(&mut named, "codex");
         assert_eq!(named, before, "{chosen} is the agent's own choice");
     }
     let effort_only = Subsessions {
@@ -396,8 +397,141 @@ fn subsessions_fill_only_a_start_that_names_no_model() {
         ..Default::default()
     };
     let mut input = serde_json::json!({"prompt": "x"});
-    effort_only.fill(&mut input);
+    effort_only.fill(&mut input, "codex");
     assert_eq!(input, serde_json::json!({"prompt": "x", "effort": "low"}));
+}
+
+#[test]
+fn old_subsessions_data_reads_back_unchanged_and_writes_no_account() {
+    // Saved before the account existed: it deserializes, and serializes the same.
+    let old = serde_json::json!({"harness": "claude", "model": "opus", "effort": null});
+    let set: Subsessions = serde_json::from_value(old.clone()).unwrap();
+    assert_eq!(set.account, None);
+    assert_eq!(serde_json::to_value(&set).unwrap()["harness"], "claude");
+    assert!(serde_json::to_value(&set).unwrap().get("account").is_none());
+    let empty: Subsessions = serde_json::from_value(serde_json::json!({})).unwrap();
+    assert_eq!(empty, Subsessions::default());
+    // A whole Mono saved without `subsessions` keeps its defaults.
+    let mono: Mono = serde_json::from_value(serde_json::json!({"id": "m1"})).unwrap();
+    assert_eq!(mono.subsessions, None);
+    // The account round trips by id.
+    let with = Subsessions {
+        account: Some("acct-1".into()),
+        ..Default::default()
+    };
+    let back: Subsessions = serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+    assert_eq!(back.account.as_deref(), Some("acct-1"));
+    // An account alone (the Mono's own provider) is a real setting, not "inherit everything".
+    assert_eq!(with.clone().normalized(), Some(with));
+    let blank = Subsessions {
+        account: Some("  ".into()),
+        ..Default::default()
+    };
+    assert_eq!(blank.normalized(), None);
+}
+
+#[test]
+fn subsessions_default_account_fills_only_for_the_provider_it_was_set_for() {
+    let set = Subsessions {
+        harness: Some("claude".into()),
+        model: Some("opus".into()),
+        effort: None,
+        account: Some("work".into()),
+    };
+    // Mono on codex, sessions on claude: a bare start takes the other provider and its account.
+    let mut bare = serde_json::json!({"prompt": "x"});
+    set.fill(&mut bare, "codex");
+    assert_eq!(
+        bare,
+        serde_json::json!({"prompt": "x", "harness": "claude", "model": "opus", "account": "work"})
+    );
+    // An explicit account wins.
+    let mut named = serde_json::json!({"prompt": "x", "account": "home"});
+    set.fill(&mut named, "codex");
+    assert_eq!(named["account"], "home");
+    assert_eq!(named["harness"], "claude");
+    // An explicit harness of another provider never gets this provider's account.
+    let mut other = serde_json::json!({"prompt": "x", "harness": "codex"});
+    set.fill(&mut other, "codex");
+    assert_eq!(
+        other,
+        serde_json::json!({"prompt": "x", "harness": "codex"})
+    );
+    // The same provider with only a model named keeps its account.
+    let mut same = serde_json::json!({"prompt": "x", "harness": "claude", "model": "sonnet"});
+    set.fill(&mut same, "codex");
+    assert_eq!(same["account"], "work");
+    assert_eq!(same["model"], "sonnet");
+    // A cloud target keeps its own account rules.
+    let mut cloud = serde_json::json!({"prompt": "x", "target": {"kind": "codespace"}});
+    set.fill(&mut cloud, "codex");
+    assert!(cloud.get("account").is_none());
+    // Provider inherited: an account alone applies to the Mono's own provider only.
+    let own = Subsessions {
+        account: Some("work".into()),
+        ..Default::default()
+    };
+    let mut bare = serde_json::json!({"prompt": "x"});
+    own.fill(&mut bare, "claude");
+    assert_eq!(bare, serde_json::json!({"prompt": "x", "account": "work"}));
+    let mut elsewhere = serde_json::json!({"prompt": "x", "harness": "codex"});
+    own.fill(&mut elsewhere, "claude");
+    assert!(elsewhere.get("account").is_none());
+    let mut model_only = serde_json::json!({"prompt": "x", "model": "opus"});
+    own.fill(&mut model_only, "claude");
+    assert_eq!(model_only["account"], "work");
+}
+
+#[test]
+fn subsessions_account_resets_when_the_provider_changes_and_effort_follows_the_model() {
+    let mut set = Subsessions {
+        harness: Some("claude".into()),
+        model: Some("opus".into()),
+        effort: Some("high".into()),
+        account: Some("work".into()),
+    };
+    // Same provider and model: nothing resets.
+    set.pick_model("codex", "claude", Some("opus".into()));
+    assert_eq!(set.account.as_deref(), Some("work"));
+    assert_eq!(set.effort.as_deref(), Some("high"));
+    // Same provider, another model: the effort may not fit, the account does.
+    set.pick_model("codex", "claude", Some("sonnet".into()));
+    assert_eq!(set.account.as_deref(), Some("work"));
+    assert_eq!(set.effort, None);
+    // Another provider: the account goes back to that provider's default.
+    set.effort = Some("low".into());
+    set.pick_model("codex", "codex", Some("gpt".into()));
+    assert_eq!(set.account, None);
+    assert_eq!(set.effort, None);
+    assert_eq!(set.harness.as_deref(), Some("codex"));
+    // An account picked for codex survives a model change within codex.
+    set.account = Some("pro".into());
+    set.pick_model("claude", "codex", None);
+    assert_eq!(set.account.as_deref(), Some("pro"));
+    // Back to inheriting: a codex account does not apply to a claude Mono.
+    set.inherit_model("claude");
+    assert_eq!(set, Subsessions::default());
+    // Inheriting keeps an account of the Mono's own provider.
+    let mut own = Subsessions {
+        harness: Some("claude".into()),
+        model: Some("opus".into()),
+        effort: None,
+        account: Some("work".into()),
+    };
+    own.inherit_model("claude");
+    assert_eq!(own.account.as_deref(), Some("work"));
+    assert_eq!(own.harness, None);
+    // The Mono moving to another provider drops an account that followed the old one,
+    // but not one of an explicitly chosen provider.
+    own.follow_own_provider("claude", "codex");
+    assert_eq!(own.account, None);
+    let mut chosen = Subsessions {
+        harness: Some("claude".into()),
+        account: Some("work".into()),
+        ..Default::default()
+    };
+    chosen.follow_own_provider("claude", "codex");
+    assert_eq!(chosen.account.as_deref(), Some("work"));
 }
 
 #[test]

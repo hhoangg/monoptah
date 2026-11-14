@@ -190,6 +190,52 @@ pub(super) fn report_to(
         ),
     }
 }
+/// Refused for a `sessions.start` that takes the account set in the Mono's settings after that
+/// account was removed.
+pub(super) const DEFAULT_ACCOUNT_GONE: &str = "The account set for sessions this Mono starts no longer exists. Pass account (run accounts.list for the valid ones) or ask the user to choose another in the Mono's settings under Sessions it starts.";
+/// What to do with the account the Mono's settings name for its sessions.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum DefaultAccount {
+    Use,
+    Drop,
+    Gone,
+}
+pub(super) fn default_account_check(
+    book: Option<monocode_core::accounts::Book>,
+    kind: Kind,
+    id: &str,
+) -> DefaultAccount {
+    if !monocode_core::accounts::supports_accounts(kind) {
+        return DefaultAccount::Drop;
+    }
+    match book {
+        Some(book) if book.exists(kind, id) => DefaultAccount::Use,
+        Some(_) => DefaultAccount::Gone,
+        // The accounts are not loaded (they are in tests and very early at start): the
+        // session starts on the provider's default account rather than failing every bare start.
+        None => DefaultAccount::Drop,
+    }
+}
+/// What a usage-limited session tells the Mono: the provider and the account's label (never a
+/// token or email), so it does not keep starting work on an account that cannot run it.
+pub(super) fn usage_limit_note(
+    provider: &str,
+    label: &str,
+    limit: &monocode_core::usage::Limit,
+    now: i64,
+) -> String {
+    let reset = match limit.resets_at {
+        Some(at) if at > now => {
+            let minutes = (at - now) / 60_000 + 1;
+            format!(" It resets in about {minutes} min.")
+        }
+        _ => String::new(),
+    };
+    format!(
+        "[Stopped: the usage limit of the {} account \"{label}\" was reached.{reset} Start further work on another account or provider, or tell the user.]",
+        Kind::from_id(provider).label()
+    )
+}
 /// The message the Mono receives. The results share one budget, so a large
 /// group still names every session.
 pub(super) fn completion_message(batch: Batch, results: &[(i64, String, String)]) -> String {
@@ -820,7 +866,41 @@ impl Monos {
         if action == "sessions.start"
             && let Some(subsessions) = &mono.subsessions
         {
-            subsessions.fill(&mut input);
+            let own = self.own_provider_of(&mono.id, Some(call.session), cx);
+            let named_account = input.get("account").is_some();
+            subsessions.fill(&mut input, &own);
+            let filled = input
+                .get("account")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if !named_account && let Some(id) = filled {
+                // Without a loaded chat the start would fall back to its own default provider,
+                // which may not be the one the account belongs to.
+                if input.get("harness").is_none()
+                    && let Some(fields) = input.as_object_mut()
+                {
+                    fields.insert("harness".into(), own.clone().into());
+                }
+                let kind =
+                    Kind::from_id(input.get("harness").and_then(Value::as_str).unwrap_or(&own));
+                match default_account_check(
+                    crate::accounts::get(cx).map(|center| center.read(cx).book.clone()),
+                    kind,
+                    &id,
+                ) {
+                    DefaultAccount::Use => {}
+                    // A provider without accounts has nothing to choose.
+                    DefaultAccount::Drop => {
+                        if let Some(fields) = input.as_object_mut() {
+                            fields.remove("account");
+                        }
+                    }
+                    DefaultAccount::Gone => {
+                        self.finish_call(call, Err(DEFAULT_ACCOUNT_GONE.into()), cx);
+                        return;
+                    }
+                }
+            }
         }
         let root = self.root.clone();
         let target = mono.id.clone();
@@ -1830,6 +1910,45 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
         }
         self.apply_groups(project, groups, cx);
     }
+    /// The provider a Mono runs on: its open chat, else the habit run calling for it, else
+    /// what its saved conversation says, so a Mono whose chat is not loaded (a habit or
+    /// heartbeat run) is not taken for a Codex one.
+    pub(super) fn own_provider_of(&self, mono: &str, caller: Option<i64>, cx: &App) -> String {
+        self.chats
+            .get(mono)
+            .or_else(|| caller.and_then(|c| self.running.get(&c)).map(|r| &r.view))
+            .map(|v| v.read(cx).summary.provider.clone())
+            .or_else(|| {
+                let session = self.roster.get(mono)?.session_id?;
+                locked(&self.store)
+                    .ok()?
+                    .mono_session(session)
+                    .ok()
+                    .flatten()
+                    .map(|s| s.provider)
+            })
+            .unwrap_or_else(|| "codex".into())
+    }
+    /// What the open sessions say about their usage limit now. The limit is set in memory when
+    /// a turn ends and saved in the background, so a report must not read the saved copy of a
+    /// session that is open. A session never opened has only the saved one.
+    pub(super) fn live_limits(&self, ids: &[i64], cx: &App) -> HashMap<i64, Option<LimitFacts>> {
+        let Some(owner) = self.owner.upgrade() else {
+            return HashMap::new();
+        };
+        ids.iter()
+            .filter_map(|&id| {
+                let view = owner.read(cx).mono_session_entity(id)?;
+                let view = view.read(cx);
+                let facts = view.settings.usage_limit.clone().map(|limit| LimitFacts {
+                    provider: view.summary.provider.clone(),
+                    account: view.settings.account.id.clone(),
+                    limit,
+                });
+                Some((id, facts))
+            })
+            .collect()
+    }
     pub(super) fn check_completions(&mut self, cx: &mut Context<Self>) {
         let views = self
             .owner
@@ -1859,18 +1978,12 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
         for (id, batch, sessions) in ready {
             self.completion_work.insert((id.clone(), batch));
             let store = self.store.clone();
-            let work = cx.background_executor().spawn(async move {
-                sessions
-                    .into_iter()
-                    .map(|(id, title)| {
-                        let prose = locked(&store)
-                            .and_then(|db| db.load(id))
-                            .map(|t| monocode_core::response::prose(&t.rows))
-                            .unwrap_or_else(|_| "Session was removed".into());
-                        (id, title, prose)
-                    })
-                    .collect::<Vec<_>>()
-            });
+            let book = crate::accounts::get(cx).map(|center| center.read(cx).book.clone());
+            let live =
+                self.live_limits(&sessions.iter().map(|(id, _)| *id).collect::<Vec<_>>(), cx);
+            let work = cx
+                .background_executor()
+                .spawn(async move { completion_results(&store, sessions, book.as_ref(), live) });
             cx.spawn(async move |this, cx| {
                 let results = work.await;
                 let _ = this.update(cx, |this, cx| {
@@ -1892,6 +2005,73 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
             .detach();
         }
     }
+}
+
+/// A session's usage limit and the account it was on.
+pub(super) struct LimitFacts {
+    pub provider: String,
+    pub account: String,
+    pub limit: monocode_core::usage::Limit,
+}
+/// What each stopped session reports: its last prose, led by a usage-limit note naming the
+/// account when it stopped on one. A limit is cleared when a new turn starts, so a set one
+/// belongs to the latest turn. `live` holds the open sessions, which win over the saved copy.
+pub(super) fn completion_results(
+    store: &Database,
+    sessions: Vec<(i64, String)>,
+    book: Option<&monocode_core::accounts::Book>,
+    mut live: HashMap<i64, Option<LimitFacts>>,
+) -> Vec<(i64, String, String)> {
+    sessions
+        .into_iter()
+        .map(|(id, title)| {
+            let db = locked(store);
+            let mut prose = db
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(|db| db.load(id))
+                .map(|t| monocode_core::response::prose(&t.rows))
+                .unwrap_or_else(|_| "Session was removed".into());
+            let facts = match live.remove(&id) {
+                Some(facts) => facts,
+                None => db.as_ref().ok().and_then(|db| stored_limit(db, id)),
+            };
+            if let Some(facts) = facts {
+                let note = usage_limit_note(
+                    &facts.provider,
+                    &account_label(book, &facts.provider, &facts.account),
+                    &facts.limit,
+                    monocode_core::usage::now_ms(),
+                );
+                prose = format!("{note}\n{prose}");
+            }
+            (id, title, prose)
+        })
+        .collect()
+}
+/// The label of a session's account; never its id's credentials, and "unknown" when it is gone.
+fn account_label(
+    book: Option<&monocode_core::accounts::Book>,
+    provider: &str,
+    account: &str,
+) -> String {
+    book.and_then(|book| {
+        book.list(Kind::from_id(provider))
+            .into_iter()
+            .find(|a| a.id == account)
+    })
+    .map(|a| a.label)
+    .unwrap_or_else(|| "unknown".into())
+}
+/// The saved limit of a session that is not open.
+fn stored_limit(db: &monocode_core::store::Store, id: i64) -> Option<LimitFacts> {
+    let session = db.mono_session(id).ok().flatten()?;
+    let settings = db.agent_settings(id).ok().flatten()?;
+    Some(LimitFacts {
+        provider: session.provider,
+        account: settings.account.id,
+        limit: settings.usage_limit?,
+    })
 }
 
 /// The project a launch is recorded and filed under: a cloud session belongs to the local project
