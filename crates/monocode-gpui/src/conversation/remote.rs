@@ -530,19 +530,22 @@ impl Conversation {
         }
         let client = self.remote_state.client.clone();
         let work = cx.background_executor().spawn(async move {
-            let (mut remote, mut settings) = {
+            let (mut remote, mut settings, queue) = {
                 let store = locked(&store)?;
                 (
                     store
                         .remote_session(id)?
                         .ok_or("Remote session no longer exists")?,
                     store.agent_settings(id)?.unwrap_or_default(),
+                    // The send queue is read once, with the first load: a conversation made
+                    // after a prompt was queued for it (a cloud launch) has not seen it yet.
+                    initial.then(|| store.follow_ups(id)).transpose()?,
                 )
             };
             #[cfg(test)]
             if let Some(stub) = stub {
                 stub?;
-                return Ok::<_, String>((remote, settings, None, None, None));
+                return Ok::<_, String>((remote, settings, None, None, None, queue));
             }
             let client = client.ok_or("Remote connections are unavailable")?;
             let machine = remote.machine(&client)?;
@@ -591,7 +594,7 @@ impl Conversation {
             } else {
                 None
             };
-            Ok::<_, String>((remote, settings, snapshot, history, host))
+            Ok::<_, String>((remote, settings, snapshot, history, host, queue))
         });
         cx.spawn(async move |this, cx| {
             let result = work.await;
@@ -610,7 +613,10 @@ impl Conversation {
                 this.remote_state.refreshing = false;
                 this.loading = false;
                 match result {
-                    Ok((remote, settings, snapshot, history, host)) => {
+                    Ok((remote, settings, snapshot, history, host, queue)) => {
+                        if let Some(queue) = queue {
+                            this.adopt_stored_queue(queue);
+                        }
                         this.remote_state.online = true;
                         this.remote_state.was_online = true;
                         this.remote_state.error = remote
@@ -690,6 +696,31 @@ impl Conversation {
             });
         })
         .detach();
+    }
+    /// Takes the send queue the store holds for this session when it is newer than the one in
+    /// memory. A cloud launch queues its first prompt in the store before this conversation
+    /// exists, and a remote session never goes through the local load that reads the queue, so
+    /// without this the prompt is stored but never shown or sent. The draft stays the host's.
+    ///
+    /// The store returns a queue paused (recovery is explicit). A queue that holds only the
+    /// first prompt of a launch is that prompt, sent on purpose: it is not paused, so it goes
+    /// out once the workspace is ready. Anything else left in the store waits for a resume.
+    fn adopt_stored_queue(&mut self, stored: monocode_core::follow_up::State) {
+        if stored.revision <= self.follow_ups.state.revision {
+            return;
+        }
+        let draft = self.follow_ups.state.draft.take();
+        let launch_only = !stored.messages.is_empty()
+            && stored
+                .messages
+                .iter()
+                .all(monocode_core::cloud_sessions::is_queued_start_message);
+        self.follow_ups.persisted = stored.revision;
+        self.follow_ups.state = stored;
+        self.follow_ups.state.draft = draft;
+        if launch_only {
+            self.follow_ups.state.paused = false;
+        }
     }
     fn install_remote_draft(&mut self, snapshot: &Value, cx: &mut Context<Self>) {
         let draft = snapshot["session"]["blocks"]

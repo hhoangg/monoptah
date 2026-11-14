@@ -767,6 +767,13 @@ pub fn queue_start_message(store: &Store, session_id: i64, text: &str) -> Result
     store.save_follow_ups(session_id, &state)
 }
 
+/// Whether `message` is one [`queue_start_message`] added: a first prompt the user sent when
+/// starting the session, which goes out on its own once the workspace is ready (the store
+/// returns any other stored queue paused, to be resumed by hand).
+pub fn is_queued_start_message(message: &crate::follow_up::Message) -> bool {
+    message.id.starts_with(START_QUEUE)
+}
+
 /// The texts [`queue_start_message`] left in the session's send queue, oldest first.
 pub fn queued_start_messages(store: &Store, id: i64) -> Vec<String> {
     store
@@ -775,7 +782,7 @@ pub fn queued_start_messages(store: &Store, id: i64) -> Vec<String> {
             state
                 .messages
                 .into_iter()
-                .filter(|message| message.id.starts_with(START_QUEUE))
+                .filter(is_queued_start_message)
                 .map(|message| message.text)
                 .collect()
         })
