@@ -73,6 +73,35 @@ impl Shell {
         Some(pane)
     }
 
+    /// Forgets detached file panes that no tab holds and that have no unsaved
+    /// edits. Closing a pane's tab keeps its entry so a dirty editor can be
+    /// recovered; a clean one has nothing to recover, and its stale owner
+    /// entry would later make the owning session look like it still has a
+    /// file pane open.
+    pub(super) fn release_closed_file_panes(&mut self, cx: &mut Context<Self>) {
+        let closed: Vec<i64> = self
+            .workspace
+            .review_owners
+            .keys()
+            .copied()
+            .filter(|pane| {
+                self.workspace.tab_of(*pane).is_none()
+                    && !self
+                        .reviews
+                        .get(pane)
+                        .is_some_and(|r| r.read(cx).unsaved_files(cx))
+            })
+            .collect();
+        for pane in closed {
+            self.workspace.review_owners.remove(&pane);
+            self.workspace.reviews.remove(&pane);
+            self.reviews.remove(&pane);
+            self.workspace
+                .project_focus
+                .retain(|_, focus| *focus != pane);
+        }
+    }
+
     pub(super) fn open_file_pane(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
         let owner = self.workspace.session_for_pane(id);
         if self.deleting.contains(&owner) {
@@ -578,6 +607,163 @@ mod tests {
                 assert_eq!(restored.layout(file), shell.workspace.layout(file));
                 assert_eq!(restored.active, Some(session));
                 assert_eq!(restored.review_owners, shell.workspace.review_owners);
+            })
+            .unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Detaches the session's file into its own pane, then closes its title tab.
+    fn detach_and_close_file_pane(
+        window: gpui::WindowHandle<Shell>,
+        cx: &mut TestAppContext,
+        session: i64,
+        path: &str,
+        edit: bool,
+    ) -> i64 {
+        let path = path.to_string();
+        let pane = window
+            .update(cx, |shell, w, cx| {
+                shell.open_review(
+                    ReviewTab::File {
+                        cwd: shell.workspace.project.clone(),
+                        path,
+                    },
+                    w,
+                    cx,
+                );
+                let pane = shell.take_review_pane(session, cx).unwrap();
+                shell.open_file_pane(pane, w, cx);
+                pane
+            })
+            .unwrap();
+        cx.run_until_parked();
+        if edit {
+            window
+                .update(cx, |shell, w, cx| {
+                    let editor = shell.reviews[&pane].read(cx).active_editor().unwrap();
+                    let input = editor.read(cx).input.clone();
+                    input.update(cx, |i, cx| i.replace_text_in_range(None, "unsaved ", w, cx));
+                })
+                .unwrap();
+        }
+        window
+            .update(cx, |shell, w, cx| {
+                let tab = shell.workspace.tab_of(pane).unwrap();
+                shell.close_title_tabs(&[TitleTab::Session(tab)], None, w, cx);
+                assert!(shell.workspace.tab_of(pane).is_none());
+            })
+            .unwrap();
+        cx.run_until_parked();
+        pane
+    }
+
+    #[gpui::test]
+    fn closing_a_clean_detached_file_pane_forgets_its_owner_entry(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, session) = window(cx);
+        let path = std::env::temp_dir().join(format!(
+            "monocode-closed-clean-pane-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&path, "original\n").unwrap();
+        let pane = detach_and_close_file_pane(window, cx, session, &path.to_string_lossy(), false);
+        window
+            .update(cx, |shell, w, cx| {
+                // A stale owner entry used to outlive the closed pane.
+                assert!(!shell.workspace.review_owners.contains_key(&pane));
+                assert!(!shell.workspace.reviews.contains_key(&pane));
+                assert!(!shell.reviews.contains_key(&pane));
+                shell.delete_session(session, w, cx);
+                assert!(
+                    shell
+                        .error
+                        .as_deref()
+                        .is_none_or(|e| !e.contains("detached file panes"))
+                );
+            })
+            .unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[gpui::test]
+    fn delete_does_not_block_on_an_orphan_pane_tab_missing_from_the_strip(cx: &mut TestAppContext) {
+        let (window, _, session) = window(cx);
+        window
+            .update(cx, |shell, w, cx| {
+                // The pane sits in `tabs` but no strip lists it: the old guard
+                // refused the delete while nothing was visible to close.
+                shell.workspace.review_owners.insert(9_000_001, session);
+                shell.workspace.tabs.push(9_000_001);
+                assert!(
+                    !shell
+                        .workspace
+                        .title_order
+                        .contains(&TitleTab::Session(9_000_001))
+                );
+                shell.delete_session(session, w, cx);
+                assert!(
+                    shell
+                        .error
+                        .as_deref()
+                        .is_none_or(|e| !e.contains("detached file panes"))
+                );
+                // The guard never closes tabs, which may hold other panes.
+                assert!(shell.workspace.tab_of(9_000_001).is_some());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn delete_blocked_by_a_pane_in_another_scope_brings_it_into_view(cx: &mut TestAppContext) {
+        let (window, _, session) = window(cx);
+        let pane = 9_000_002;
+        window
+            .update(cx, |shell, w, cx| {
+                shell.workspace.review_owners.insert(pane, session);
+                shell.workspace.tabs.push(pane);
+                shell.workspace.title_order.push(TitleTab::Session(pane));
+                // The tab belongs to a worktree the strip is not showing.
+                shell
+                    .workspace
+                    .tab_workspaces
+                    .insert(pane, "/nonexistent/other-worktree".into());
+                assert!(!shell.visible_tabs(cx).contains(&TitleTab::Session(pane)));
+                shell.delete_session(session, w, cx);
+                assert!(
+                    shell
+                        .error
+                        .as_deref()
+                        .unwrap()
+                        .contains("detached file panes")
+                );
+                // Not a silent refusal: the user is taken to the pane.
+                assert_eq!(shell.workspace.active, Some(pane));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn delete_blocked_by_an_unsaved_closed_pane_names_the_file_and_shows_it(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, session) = window(cx);
+        let path = std::env::temp_dir().join(format!(
+            "monocode-closed-dirty-pane-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&path, "original\n").unwrap();
+        let pane = detach_and_close_file_pane(window, cx, session, &path.to_string_lossy(), true);
+        window
+            .update(cx, |shell, w, cx| {
+                // Unsaved edits keep the closed pane so they can be recovered.
+                assert!(shell.workspace.review_owners.contains_key(&pane));
+                shell.delete_session(session, w, cx);
+                let error = shell.error.clone().unwrap();
+                assert!(error.contains("detached file panes"), "{error}");
+                assert!(error.contains("monocode-closed-dirty-pane"), "{error}");
+                // The blocking pane is brought back into view.
+                assert!(shell.workspace.tab_of(pane).is_some());
             })
             .unwrap();
         std::fs::remove_file(path).unwrap();

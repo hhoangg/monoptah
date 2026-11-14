@@ -1419,6 +1419,10 @@ mod tests {
                 put_folders(shell, &[("f", &[one])]);
                 shell.workspace.review_owners.insert(9_000_001, one);
                 shell.workspace.tabs.push(9_000_001);
+                shell
+                    .workspace
+                    .title_order
+                    .push(crate::workspace::TitleTab::Session(9_000_001));
                 shell.delete_session(one, w, cx);
                 one
             })

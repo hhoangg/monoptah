@@ -4082,6 +4082,7 @@ impl Shell {
         self.fit_sidebar(cx);
         // A Mono left alone becomes its tab again, and shows when focused.
         self.settle_mono_panes(window, cx);
+        self.release_closed_file_panes(cx);
         if self.mono_active(cx) {
             return;
         }
