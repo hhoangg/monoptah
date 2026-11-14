@@ -319,7 +319,7 @@ impl CloudProvider for CodespaceProvider {
         let (session, record) = self
             .cloud
             .begin_start_with_kit(project, target, harness, kit)?;
-        Ok(CloudStart::Pending(session, record))
+        Ok(CloudStart::Pending(session, record, None))
     }
 
     /// A codespace created here is never deleted on failure; the error names it so the caller

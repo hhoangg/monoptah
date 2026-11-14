@@ -287,6 +287,14 @@ fn devcontainer_memory_units() {
         ("512mb", 512),
         ("1tb", 1024 * 1024),
         ("1.5gb", 1536),
+        // Binary spellings and bare letters, any case, an optional space.
+        ("8gib", 8 * 1024),
+        ("8 GiB", 8 * 1024),
+        ("512MiB", 512),
+        ("2g", 2 * 1024),
+        ("256m", 256),
+        ("1tib", 1024 * 1024),
+        ("1024kb", 1),
     ] {
         let dir = project_with(
             ".devcontainer.json",
@@ -429,4 +437,23 @@ fn a_failed_cloud_projects_write_leaves_the_sandbox_setting_untouched() {
     assert!(save(&store, "/p", &next).is_err());
     assert_eq!(store.setting(docker_config::SETTING).unwrap(), before);
     assert_eq!(docker_config::load(&store, "/p").unwrap().unwrap().cpus, 2);
+}
+
+#[test]
+fn what_a_devcontainer_asks_for_reads_as_one_phrase() {
+    let ask = |cpus, memory_mib| {
+        DevcontainerInfo {
+            host_cpus: cpus,
+            host_memory_mib: memory_mib,
+            ..Default::default()
+        }
+        .asks_for()
+    };
+    assert_eq!(
+        ask(Some(4), Some(16 * 1024)).as_deref(),
+        Some("4 CPUs and 16 GB")
+    );
+    assert_eq!(ask(Some(1), None).as_deref(), Some("1 CPU"));
+    assert_eq!(ask(None, Some(1536)).as_deref(), Some("1.5 GB"));
+    assert_eq!(ask(None, None), None);
 }

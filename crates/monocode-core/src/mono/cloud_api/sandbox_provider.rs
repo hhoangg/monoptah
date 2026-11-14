@@ -8,11 +8,14 @@ use super::provider::{
     current_branch, option_text, CloudInstance, CloudKindSpec, CloudProvider, CloudStart,
 };
 use crate::cloud_sessions::docker_config::{self, valid_ref};
+use crate::cloud_sessions::docker_size;
+use crate::cloud_sessions::project_cloud;
 use crate::cloud_sessions::{CloudBackendKind, CloudRef, CloudSessions, CloudState};
 use crate::sandboxes::{self, Prerequisites};
 use crate::store::{RemoteSession, Store};
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
@@ -319,8 +322,8 @@ impl CloudProvider for SandboxProvider {
         }
     }
 
-    /// New: the project's Docker config (with optional `cpus`, `memory`, `ttl` overrides) and
-    /// `branch` (default: the current branch) through `begin_sandbox_start`. Existing: another
+    /// New: the project's Docker config (with optional `cpus`, `memory`, `ttl` overrides, the
+    /// size fitted by [`docker_size::requested_size`]) and `branch` (default: the current branch) through `begin_sandbox_start`. Existing: another
     /// ready session on the sandbox, see `CloudSessions::attach_session`.
     fn start(
         &self,
@@ -346,12 +349,23 @@ impl CloudProvider for SandboxProvider {
         let mut config = self.config(project)?.ok_or(
             "Docker Sandbox is not set up for this project. Set it up in the project's Cloud settings first.",
         )?;
-        if let Some(cpus) = options.get("cpus").and_then(Value::as_u64) {
-            config.cpus = u32::try_from(cpus).map_err(|_| "cpus is too large")?;
-        }
-        if let Some(memory) = option_text(options, "memory") {
-            config.memory = memory.to_owned();
-        }
+        // A lone cpus or memory takes its shape's other half; neither takes the saved size,
+        // raised to fit the devcontainer's hostRequirements (up to a cap), with a note that
+        // goes back to the caller.
+        let cpus = match options.get("cpus").and_then(Value::as_u64) {
+            Some(cpus) => Some(u32::try_from(cpus).map_err(|_| "cpus is too large")?),
+            None => None,
+        };
+        let devcontainer =
+            project_cloud::devcontainer_info(Path::new(project), &config.devcontainer_path);
+        let size = docker_size::requested_size(
+            &config,
+            cpus,
+            option_text(options, "memory"),
+            &devcontainer,
+        )?;
+        config.cpus = size.cpus;
+        config.memory = size.memory;
         if let Some(ttl) = option_text(options, "ttl") {
             config.ttl = ttl.to_owned();
         }
@@ -372,7 +386,7 @@ impl CloudProvider for SandboxProvider {
             kit,
             account.is_some(),
         )?;
-        Ok(CloudStart::Pending(session, record))
+        Ok(CloudStart::Pending(session, record, size.note))
     }
 
     /// Reconnects the sandbox (resuming it when stopped) through the session. BLOCKS for
