@@ -19,6 +19,11 @@
 [profile.default]
 fail-fast = false
 
+# Same wall-clock budget test as the `ci` override below: run it alone locally too.
+[[profile.default.overrides]]
+filter = 'test(=editor_analysis::parity_tests::large_tsx_analysis_highlights_the_end_of_the_current_and_original_file)'
+threads-required = "num-test-threads"
+
 [profile.ci]
 # Report every failure of a run, and never retry: a flaky test must show up.
 fail-fast = false
