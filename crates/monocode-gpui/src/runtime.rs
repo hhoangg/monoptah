@@ -516,6 +516,22 @@ fn run_turn_using(
                 .as_deref()
                 .and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok())
                 .and_then(|r| r["rules"].as_str().map(str::to_owned));
+            // A library that cannot be read adds no emoji block; the turn still runs. Reading never
+            // removes anything.
+            let emoji = mono
+                .mono
+                .emoji
+                .enabled
+                .then(|| {
+                    monocode_core::mono::emoji::load(&monocode_core::mono::emoji::dir_for_root(
+                        &mono.root,
+                    ))
+                    .ok()
+                })
+                .flatten()
+                .and_then(|loaded| {
+                    monocode_core::mono::emoji::context_block(&loaded.library, &mono.mono.emoji)
+                });
             let added = monocode_core::mono::context(
                 &mono.mono,
                 &files,
@@ -526,6 +542,7 @@ fn run_turn_using(
                     held_rules.as_deref(),
                     &rules,
                 ),
+                emoji.as_deref(),
             );
             let fingerprint = monocode_core::mono::files::content_hash(&added);
             mono_fingerprint = Some((fingerprint.clone(), rules.clone()));

@@ -6,6 +6,7 @@ pub(crate) mod dates;
 #[cfg(test)]
 mod document_selection_tests;
 mod drafts;
+pub(crate) mod emoji;
 #[cfg(test)]
 mod follow_tests;
 pub(crate) mod git_turns;
@@ -145,6 +146,12 @@ struct RenderedBlock {
     source: Arc<crate::markdown_model::TopBlock>,
     rows: Vec<Arc<MarkdownRow>>,
     words: usize,
+    /// The emoji tokens of the message before this block, and in it.
+    emoji_start: usize,
+    emoji_count: usize,
+    /// It held the token that ended a streaming text, drawn inline for now: lay it out again
+    /// once the stream moves on.
+    open_tail: bool,
 }
 #[derive(Clone)]
 enum Body {
@@ -719,6 +726,11 @@ pub(crate) struct TranscriptView {
     history_search: Option<(usize, String)>,
     prepared_parsers: HashMap<usize, MarkdownParser>,
     mono: bool,
+    /// The Mono's emoji library, for `:emo[..]` tokens in its replies.
+    emoji: Option<emoji::MonoEmoji>,
+    /// How many times a changed library laid every message out again.
+    #[cfg(test)]
+    pub(crate) emoji_rebuilds: usize,
     mono_groups: std::cell::RefCell<HashMap<usize, usize>>,
     /// The Mono's mascot, colour and name, which sign its turns.
     mono_look: Option<(String, u32, SharedString)>,
@@ -892,6 +904,32 @@ impl TranscriptView {
         self.list = ListState::new(self.rows.len() + 1, ListAlignment::Bottom, px(320.));
         self.list.set_follow_mode(FollowMode::Tail);
         self.scroll_bound = false;
+    }
+    /// Set (or clear) the shared emoji library and the Mono's packs. Every message is laid out again, because the
+    /// pictures, and whether tokens show at all, come from it.
+    pub(crate) fn set_emoji(&mut self, emoji: Option<emoji::MonoEmoji>, cx: &mut Context<Self>) {
+        let unchanged = match (&self.emoji, &emoji) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                Arc::ptr_eq(&a.library, &b.library)
+                    && a.dir == b.dir
+                    && a.packs == b.packs
+                    && a.session == b.session
+            }
+            _ => false,
+        };
+        self.emoji = emoji;
+        if unchanged || !self.mono {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.emoji_rebuilds += 1;
+        }
+        for message in &mut self.messages {
+            message.markdown_blocks.clear();
+        }
+        self.rebuild(0, cx);
     }
     pub(crate) fn reveal_search(&mut self, row: usize, query: &str, cx: &mut Context<Self>) {
         if row < self.history_start {
@@ -1071,6 +1109,17 @@ impl TranscriptView {
             return;
         };
         self.turns.entry(turn).or_default().provider_turn_id = Some(id);
+    }
+    /// The text "Copy response", "Save as note" and "Quote response" hand out. A Mono's
+    /// emoji is a picture, not text, so none of its tokens are in it.
+    pub(crate) fn response_text(&self, turn: usize) -> String {
+        let (rows, _) = self.response_rows(turn);
+        let text = monocode_core::response::prose(&rows);
+        if self.mono {
+            monocode_core::mono::emoji::token::strip(&text)
+        } else {
+            text
+        }
     }
     pub(crate) fn response_rows(&self, turn: usize) -> (Vec<Row>, Vec<Row>) {
         let end = (turn..self.source.len())
@@ -2338,8 +2387,7 @@ impl TranscriptView {
                 }))
                 .into_any_element();
         }
-        let (rows, _) = self.response_rows(turn);
-        let output = monocode_core::response::prose(&rows);
+        let output = self.response_text(turn);
         if self.mono {
             return self.mono_actions(turn, output, before_user, cx);
         }
@@ -2638,6 +2686,9 @@ impl TranscriptView {
             history_search: None,
             prepared_parsers: HashMap::new(),
             mono: false,
+            emoji: None,
+            #[cfg(test)]
+            emoji_rebuilds: 0,
             mono_groups: Default::default(),
             mono_look: None,
             hovered_turn: None,
@@ -3026,6 +3077,10 @@ impl TranscriptView {
                 break;
             }
         }
+        // A Mono's emoji is a picture in the chat; an OS notification has none.
+        if self.mono {
+            text = monocode_core::mono::emoji::token::strip(&text);
+        }
         crate::notifications::delivery::clip_body(&text)
     }
 
@@ -3049,10 +3104,15 @@ impl TranscriptView {
             start -= 1;
             size += self.source[start].text.len();
         }
-        self.source[start..=end]
+        let text: String = self.source[start..=end]
             .iter()
             .map(|row| row.text.as_str())
-            .collect()
+            .collect();
+        if self.mono {
+            monocode_core::mono::emoji::token::strip(&text)
+        } else {
+            text
+        }
     }
 
     /// Tauri's appendUser: paint the prompt and working receipt in the send
@@ -3805,7 +3865,22 @@ impl TranscriptView {
                     });
                 }
                 self.prepare_reveal(at, end, &text, role == "assistant", now, cx.reduce_motion());
-                parser.set_text(self.reveals.get(&at).map_or(text.as_str(), PacedText::text));
+                let shown = self.reveals.get(&at).map_or(text.as_str(), PacedText::text);
+                // A token still streaming in would flash as text.
+                let shown = if self.mono
+                    && role == "assistant"
+                    && self.streaming
+                    && end == self.source.len()
+                {
+                    monocode_core::mono::emoji::token::incomplete_tail(shown)
+                        .map_or(shown, |cut| &shown[..cut])
+                } else {
+                    shown
+                };
+                let streaming_tail = self.streaming && end == self.source.len();
+                let mut tokens = (self.mono && role == "assistant")
+                    .then(|| emoji::MessageTokens::new(self.emoji.as_ref(), shown, streaming_tail));
+                parser.set_text(shown);
                 let tree = if self.reveals.get(&at).is_some_and(PacedText::behind)
                     || (self.streaming && end == self.source.len())
                 {
@@ -3822,6 +3897,7 @@ impl TranscriptView {
                     .filter(|_| role != "reasoning" || self.expanded.contains(&at))
                     .enumerate()
                 {
+                    let emoji_start = tokens.as_ref().map_or(0, |t| t.cursor);
                     let (rows, words) = if let Some(old) = markdown_blocks
                         .get(block_ix)
                         .filter(|old| Arc::ptr_eq(&old.source, block))
@@ -3829,11 +3905,25 @@ impl TranscriptView {
                             old.rows
                                 .first()
                                 .is_none_or(|row| row.word_start == word_cursor)
+                        })
+                        .filter(|old| tokens.as_ref().is_none_or(|t| t.cursor == old.emoji_start))
+                        .filter(|old| {
+                            !old.open_tail
+                                && tokens
+                                    .as_ref()
+                                    .is_none_or(|t| !t.tail_within(old.emoji_count))
                         }) {
+                        if let Some(tokens) = &mut tokens {
+                            tokens.cursor += old.emoji_count;
+                        }
                         (old.rows.clone(), old.words)
                     } else {
                         let mut base = word_cursor;
-                        let rows = markdown::rows(&block.block)
+                        let mut rows = markdown::rows(&block.block);
+                        if let Some(tokens) = &mut tokens {
+                            rows = tokens.apply(rows);
+                        }
+                        let rows = rows
                             .into_iter()
                             .map(|mut row| {
                                 row.word_start = base;
@@ -3860,6 +3950,11 @@ impl TranscriptView {
                         source: block.clone(),
                         rows,
                         words,
+                        emoji_start,
+                        emoji_count: tokens.as_ref().map_or(0, |t| t.cursor) - emoji_start,
+                        open_tail: tokens
+                            .as_ref()
+                            .is_some_and(|t| t.open_tail_in(emoji_start..t.cursor)),
                     });
                 }
                 markdown_blocks = cached;

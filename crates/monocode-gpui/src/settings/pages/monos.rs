@@ -4,7 +4,43 @@ use crate::{
     theme::*,
 };
 use gpui::{AnyElement, Context, SharedString, div, prelude::*, px};
+/// The id of the emoji library section: the target of "Manage emoji library...".
+pub(in crate::settings) const EMOJI_LIBRARY: &str = "emoji-library";
+
 impl SettingsView {
+    /// The shared emoji library, below the list of Monos.
+    fn emoji_library_section(&self) -> Option<AnyElement> {
+        let view = self.emoji_library.clone()?;
+        let flash = self.revealed.as_deref() == Some(EMOJI_LIBRARY);
+        Some(
+            div()
+                .id("settings-emoji-library")
+                .debug_selector(|| "settings-emoji-library".into())
+                .relative()
+                .pt_8()
+                .child(
+                    // The probe sits on the title row, so a reveal scrolls to the title and
+                    // the Packs card below it, not to the middle of the tall section.
+                    div()
+                        .id("settings-emoji-title")
+                        .debug_selector(|| "settings-emoji-title".into())
+                        .relative()
+                        .pb(px(10.))
+                        .child(self.reveal_probe(EMOJI_LIBRARY))
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .line_height(px(19.5))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(if flash { accent_color() } else { content(1.) })
+                                .child("Emoji"),
+                        ),
+                )
+                .child(view)
+                .into_any_element(),
+        )
+    }
+
     pub(super) fn monos_page(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let p = self.prefs.clone();
         let mut rows=vec![
@@ -95,6 +131,8 @@ impl SettingsView {
         if roster.is_empty() {
             roster.push(super::super::widgets::note("No monos yet."));
         }
-        vec![self.group(None,true,"Monos",None,None,rows),self.group(Some("mono-list"),false,"Your monos",Some("Show or hide sessions started by each Mono. Hidden sessions remain available from the Mono's chat.".into()),None,roster)]
+        let mut page = vec![self.group(None,true,"Monos",None,None,rows),self.group(Some("mono-list"),false,"Your monos",Some("Show or hide sessions started by each Mono. Hidden sessions remain available from the Mono's chat.".into()),None,roster)];
+        page.extend(self.emoji_library_section());
+        page
     }
 }

@@ -660,7 +660,14 @@ fn agent_turn(source: &Source, turn: &Turn, live: bool) -> Value {
         );
         out.insert(
             "copyText".into(),
-            monocode_core::response::prose(&rows[run.prompt..run.end]).into(),
+            if source.mono.is_some() {
+                monocode_core::mono::emoji::token::strip(&monocode_core::response::prose(
+                    &rows[run.prompt..run.end],
+                ))
+            } else {
+                monocode_core::response::prose(&rows[run.prompt..run.end])
+            }
+            .into(),
         );
         put(&mut out, "durationMs", duration);
         if let Some(metrics) = info.and_then(|info| info.metrics).filter(|m| m.reported()) {
@@ -702,8 +709,16 @@ fn mono_turn(source: &Source, turn: &Turn, live: bool, name: &str) -> Value {
         let internal = run.key > run.prompt && rows[run.key - 1].role == "mono-system";
         for (at, end) in messages_in(rows, run.key, run.end) {
             let role = rows[at].role.as_str();
-            let text = joined(&rows[at..end]);
+            let mut text = joined(&rows[at..end]);
             if role == "assistant" {
+                // The phone has no emoji library: it never shows a token.
+                text = monocode_core::mono::emoji::token::strip(&text);
+                if live && end == rows.len() {
+                    // A token still streaming in would flash as text.
+                    if let Some(cut) = monocode_core::mono::emoji::token::incomplete_tail(&text) {
+                        text.truncate(cut);
+                    }
+                }
                 if let Some(emoji) = reaction(&text) {
                     // MonoReactionBadge: the emoji sits on the message it answers.
                     let prompt = rows[..at]

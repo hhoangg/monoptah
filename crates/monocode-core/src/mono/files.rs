@@ -168,7 +168,7 @@ pub fn content_hash(text: &str) -> String {
 
 /// Write beside the target and rename over it, so a crash mid-write leaves
 /// the old file whole. Owner-only, since memory can hold personal details.
-fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
+pub(crate) fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
     use std::io::Write;
 
     let temp = path.with_extension("md.tmp");
@@ -210,7 +210,7 @@ fn read_index(root: &Path) -> AgentIndex {
         .unwrap_or_default()
 }
 
-fn valid_id(id: &str) -> bool {
+pub(crate) fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id
             .bytes()

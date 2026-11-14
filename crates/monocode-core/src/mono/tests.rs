@@ -204,7 +204,7 @@ fn the_prompt_and_help_describe_each_delivery_and_habit_reporting() {
         memory_path: String::new(),
         topics: Vec::new(),
     };
-    let context = context(&mono, &files, std::path::Path::new("/bin/app"), false);
+    let context = context(&mono, &files, std::path::Path::new("/bin/app"), false, None);
     for needle in [
         "completionDelivery",
         "\"each\"",
@@ -258,7 +258,7 @@ fn the_prompt_and_help_describe_workflows() {
         memory_path: String::new(),
         topics: Vec::new(),
     };
-    let context = context(&mono, &files, std::path::Path::new("/bin/app"), false);
+    let context = context(&mono, &files, std::path::Path::new("/bin/app"), false, None);
     for needle in [
         "workflows.guide",
         "workflows.validate",
@@ -345,11 +345,11 @@ fn context_shows_how_to_delegate_without_running_help() {
     assert!(rules.contains("## Be quick"));
     assert!(rules.contains("- /repo"));
     // Without system instructions, the rules ride along in the message.
-    let inline = context(&mono, &files, executable, false);
+    let inline = context(&mono, &files, executable, false, None);
     assert!(inline.contains(&rules));
     assert!(inline.contains("<soul>"));
     // With them, the message carries only what changes between turns.
-    let system = context(&mono, &files, executable, true);
+    let system = context(&mono, &files, executable, true, None);
     assert!(!system.contains(start));
     assert!(system.contains("<soul>") && system.contains("<memory>"));
     assert!(system_instructions_supported(crate::provider::Kind::Claude));
@@ -443,7 +443,7 @@ fn rules_live_in_instructions_and_the_context_only_repeats_them_when_not_in_syst
         assert!(rules.contains(needle), "instructions lack {needle}");
     }
     // Rules held by the system instructions are not repeated in the message.
-    let slim = context(&mono, &files, path, true);
+    let slim = context(&mono, &files, path, true, None);
     for absent in [
         "Workflows are graphs of steps",
         "workflows.guide",
@@ -455,7 +455,7 @@ fn rules_live_in_instructions_and_the_context_only_repeats_them_when_not_in_syst
         assert!(slim.contains(needle), "context lacks {needle}");
     }
     // Without system instructions the same rules travel in the message.
-    let full = context(&mono, &files, path, false);
+    let full = context(&mono, &files, path, false, None);
     assert!(full.contains("Workflows are graphs of steps"));
     assert!(full.contains("completionDelivery"));
 }
