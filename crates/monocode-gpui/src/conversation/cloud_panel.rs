@@ -1,10 +1,8 @@
 //! The cloud setup panel: once a cloud target is chosen in the Workspace menu it sits attached
 //! above the composer box, like the background-tasks panel. A header (cloud icon, backend name,
-//! billing note, a pill that says whether anything differs from the project defaults, collapse
-//! chevron) and one row per setting, the same rows for both backends (`CloudRow`). A row shows
-//! its label and current value and opens a small menu to change it (or holds an inline field for
-//! a branch). A row marks the project default as "default"; one the user changed is highlighted
-//! and marked "changed for this session". Creating happens when the first prompt is sent, see
+//! billing note, collapse chevron) and one row per setting, the same rows for both backends
+//! (`CloudRow`). A row shows its label and current value and opens a small menu to change it (or
+//! holds an inline field for a branch). Creating happens when the first prompt is sent, see
 //! `cloud_target.rs`. The values are this session's overrides of the project's saved defaults.
 use super::cloud_branches::CloudRefField;
 use super::cloud_target::*;
@@ -12,10 +10,8 @@ use super::*;
 use crate::cloud_presets as presets;
 use gpui::{Div, Stateful};
 
-/// What a row says about itself on the right.
+/// The hint beside the project's own choice in a row's menu.
 const DEFAULT_MARK: &str = "default";
-const CHANGED_MARK: &str = "changed for this session";
-const MARK_WIDTH: f32 = 150.;
 
 const ROW_HEIGHT: f32 = 38.;
 
@@ -62,12 +58,7 @@ fn row_value(id: &'static str, anchor: &AnchorSlot, value: String, locked: bool)
 
 /// One row of the panel: a leading icon tile, the label, and whatever the caller puts on the
 /// right.
-fn row(
-    id: &'static str,
-    icon_name: &'static str,
-    label: impl Into<SharedString>,
-    changed: bool,
-) -> Stateful<Div> {
+fn row(id: &'static str, icon_name: &'static str, label: impl Into<SharedString>) -> Stateful<Div> {
     let label: SharedString = label.into();
     div()
         .id(id)
@@ -81,7 +72,6 @@ fn row(
         .gap(px(10.))
         .border_t_1()
         .border_color(content(0.05))
-        .when(changed, |d| d.bg(warning_color().opacity(0.08)))
         .child(
             div()
                 .size(px(24.))
@@ -102,33 +92,6 @@ fn row(
                 .text_color(content(0.8))
                 .child(label),
         )
-}
-
-/// The header pill: whether anything differs from the project defaults.
-pub(super) fn pill_text(changed: usize) -> String {
-    if changed > 0 {
-        format!("{changed} changed")
-    } else {
-        "project defaults".to_owned()
-    }
-}
-
-/// The right end of a row: "default", or "changed for this session" when it differs.
-fn mark(id: &'static str, changed: bool) -> Stateful<Div> {
-    div()
-        .id((id, 2usize))
-        .debug_selector(move || format!("{id}-mark"))
-        .w(px(MARK_WIDTH))
-        .flex_shrink_0()
-        .truncate()
-        .text_right()
-        .text_size(px(11.))
-        .text_color(if changed {
-            warning_color()
-        } else {
-            content(0.3)
-        })
-        .child(if changed { CHANGED_MARK } else { DEFAULT_MARK })
 }
 
 /// `options` plus `extra` when it is not among them, so the project's own value and the
@@ -369,8 +332,8 @@ impl Conversation {
     ) -> Stateful<Div> {
         let locked = self.cloud_creating();
         let open = self.menu_is(ComposerMenu::CloudField(field));
-        let (id, changed) = (row_kind.id(), self.cloud_row_changed(row_kind));
-        row(id, row_kind.icon(), row_kind.label(), changed)
+        let id = row_kind.id();
+        row(id, row_kind.icon(), row_kind.label())
             .aria_expanded(open)
             .when(!locked, |d| d.cursor_pointer())
             .child(row_value(
@@ -379,7 +342,6 @@ impl Conversation {
                 self.cloud_field_value(field),
                 locked,
             ))
-            .child(mark(id, changed))
             .on_click(cx.listener(move |this, _, window, cx| {
                 if !this.cloud_creating() {
                     this.toggle_menu(ComposerMenu::CloudField(field), window, cx);
@@ -395,8 +357,8 @@ impl Conversation {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let locked = self.cloud_creating();
-        let (id, changed) = (row_kind.id(), self.cloud_row_changed(row_kind));
-        row(id, row_kind.icon(), row_kind.label(), changed)
+        let id = row_kind.id();
+        row(id, row_kind.icon(), row_kind.label())
             .aria_expanded(self.cloud_ref_menu_open(field))
             .when(!locked, |d| d.cursor_pointer())
             .child(row_value(
@@ -405,7 +367,6 @@ impl Conversation {
                 self.cloud_ref_value(field, cx),
                 locked,
             ))
-            .child(mark(id, changed))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.toggle_cloud_ref_picker(field, window, cx);
             }))
@@ -422,7 +383,7 @@ impl Conversation {
         let on = globally && draft.is_some_and(|d| d.kit);
         let summary = draft.map_or(kit::Summary::Loading, |d| d.kit_summary);
         let label = format!("Claude setup: {}", kit::summary_text(&summary, globally));
-        row("cloud-row-kit", "sparkles", label, false)
+        row("cloud-row-kit", "sparkles", label)
             .child(
                 kit::settings_link("cloud-kit-settings")
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(OpenCloudSettings))),
@@ -444,39 +405,23 @@ impl Conversation {
     /// A row with an inline text field for a branch.
     fn cloud_field_row(&self, row_kind: CloudRow, field: &Entity<input::Input>) -> Stateful<Div> {
         let locked = self.cloud_creating();
-        let (id, changed) = (row_kind.id(), self.cloud_row_changed(row_kind));
-        // The working branch has no project default to mark, but it says so when it names
-        // another branch than the base.
-        let marked = row_kind != CloudRow::Branch || changed;
-        row(id, row_kind.icon(), row_kind.label(), changed)
-            .child(
-                div()
-                    .when(locked, |d| d.opacity(0.55))
-                    .w(px(190.))
-                    .h(px(26.))
-                    .flex_shrink_0()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(content(0.1))
-                    .bg(content(0.03))
-                    .px(px(8.))
-                    .flex()
-                    .items_center()
-                    .font_family("Menlo")
-                    .child(field.clone()),
-            )
-            .child(if marked {
-                mark(id, changed)
-            } else {
-                div().id((id, 2usize)).w(px(MARK_WIDTH)).flex_shrink_0()
-            })
-    }
-
-    /// The row's value differs from the project default.
-    fn cloud_row_changed(&self, row: CloudRow) -> bool {
-        self.cloud_draft
-            .as_ref()
-            .is_some_and(|draft| draft.row_changed(row))
+        let id = row_kind.id();
+        row(id, row_kind.icon(), row_kind.label()).child(
+            div()
+                .when(locked, |d| d.opacity(0.55))
+                .w(px(190.))
+                .h(px(26.))
+                .flex_shrink_0()
+                .rounded_md()
+                .border_1()
+                .border_color(content(0.1))
+                .bg(content(0.03))
+                .px(px(8.))
+                .flex()
+                .items_center()
+                .font_family("Menlo")
+                .child(field.clone()),
+        )
     }
 
     /// The row `row` of the panel.
@@ -524,7 +469,6 @@ impl Conversation {
         let inset = px(8.);
         let collapsed = draft.collapsed;
         let title = draft.target.label();
-        let changed = draft.changed_count();
         let header = div()
             .id("cloud-target-header")
             .debug_selector(|| "cloud-target-header".into())
@@ -564,26 +508,6 @@ impl Conversation {
                     .truncate()
                     .text_color(content(0.35))
                     .child(draft.target.billing_note()),
-            )
-            .child(
-                div()
-                    .id("cloud-target-pill")
-                    .debug_selector(|| "cloud-target-pill".into())
-                    .flex_shrink_0()
-                    .px(px(8.))
-                    .rounded_full()
-                    .bg(if changed > 0 {
-                        warning_color().opacity(0.14)
-                    } else {
-                        content(0.07)
-                    })
-                    .text_size(px(11.))
-                    .text_color(if changed > 0 {
-                        warning_color()
-                    } else {
-                        content(0.5)
-                    })
-                    .child(pill_text(changed)),
             )
             .child(
                 div()
