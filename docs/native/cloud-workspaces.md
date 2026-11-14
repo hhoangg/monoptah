@@ -98,8 +98,13 @@ focusable like the usage chip) from the same Cloud workspaces dialog the menu it
 item stays.
 
 * **Shown** only while at least one workspace of the open project is **Running or Starting**. With
-  nothing running it is not drawn and takes no room. A cloud session's own project is used when the
-  open session runs in a workspace (its folder is `remote://…`).
+  nothing running it is not drawn and takes no room. It reports on **the window's project** on every
+  tab: a session, the MonoCrab (Mono) tab, an app view (Today, Inbox, Notes, Contributors…), a
+  terminal or a file pane, whatever folder that tab shows. Only a cloud session uses its own
+  project, the local one it belongs to (its folder is `remote://…`). A window on a remote project
+  that is not a cloud session of a local one shows no chip. One place decides this
+  (`Shell::cloud_chip_project`, `crates/monocode-gpui/src/shell.rs`) and runs whenever the tab, the
+  app view or the project changes.
 * **Warning colour** (the theme's warning amber) when any workspace has a concern:
   * **Failed**: the workspace is in a failed state;
   * **Orphan**: it is this app's (see "Whose workspace it is"), no live session uses it and it is
