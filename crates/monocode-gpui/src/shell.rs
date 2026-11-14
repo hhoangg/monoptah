@@ -2129,6 +2129,7 @@ impl Shell {
         self.sidebar_frame.update(cx, |_, cx| cx.notify());
     }
     fn invalidate_chrome(&self, cx: &mut Context<Self>) {
+        self.sync_cloud_chip_project(cx);
         self.notify_sidebar(cx);
         self.sync_today_sessions(cx);
         self.tabs_frame.update(cx, |_, cx| cx.notify());
@@ -4683,20 +4684,41 @@ impl Shell {
             let model = view.account_model().map(str::to_owned);
             let project = view.summary.cwd.clone();
             let session = Some(view.summary.id);
-            // A cloud session's folder is `remote://...`; its cloud chip reports on the local
-            // project it belongs to.
-            let cloud_project = self
-                .cloud_marks
-                .get(&view.summary.id)
-                .map(|mark| mark.local_project.clone())
-                .unwrap_or_else(|| project.clone());
             self.usage_footer.update(cx, |footer, cx| {
-                footer.context(kind, profile, model.as_deref(), project, session, cx);
-                footer
-                    .cloud_chip()
-                    .update(cx, |chip, cx| chip.set_project(cloud_project, cx));
+                footer.context(kind, profile, model.as_deref(), project, session, cx)
             });
         }
+        self.sync_cloud_chip_project(cx);
+    }
+    /// The local project the footer's cloud chip reports on, decided here for every view:
+    /// * a cloud session in view (its folder is `remote://...`): the local project it belongs to;
+    /// * a Mono chat, an app view (Today, Inbox, Notes...), a terminal or file pane and every
+    ///   other session: the project the window is on (`workspace.project`), whatever the cwd of
+    ///   what is shown;
+    /// * a remote project that is not a cloud session of a local one: none (the chip hides).
+    ///
+    /// It reads only the shell's own fields: it runs from `invalidate_chrome`, which other
+    /// entities (a Mono among them) call while they are being updated.
+    fn cloud_chip_project(&self) -> String {
+        let marked = self
+            .workspace
+            .active
+            .filter(|_| !self.app_view_open())
+            .and_then(|id| self.cloud_marks.get(&self.workspace.session_for_pane(id)))
+            .map(|mark| mark.local_project.as_str());
+        let project = marked.unwrap_or(self.workspace.project.as_str());
+        if project.starts_with("remote://") {
+            String::new()
+        } else {
+            project.to_owned()
+        }
+    }
+    /// Points the cloud chip at [`Self::cloud_chip_project`]. Runs whenever the usage provider or
+    /// the chrome (tab, app view, project) changes; the chip ignores a project it already has.
+    fn sync_cloud_chip_project(&self, cx: &mut Context<Self>) {
+        let project = self.cloud_chip_project();
+        let chip = self.usage_footer.read(cx).cloud_chip().clone();
+        chip.update(cx, |chip, cx| chip.set_project(project, cx));
     }
     pub(crate) fn focus_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.keep_visible_idle_agents(cx);

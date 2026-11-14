@@ -145,7 +145,7 @@ impl Shell {
 mod tests {
     use super::*;
     use crate::cloud_workspaces_dialog::{Action, Env, Event, tests as fixtures};
-    use gpui::TestAppContext;
+    use gpui::{TestAppContext, WindowHandle};
     use monocode_core::cloud_sessions::{CloudBackendKind, CloudRef, CloudSessions};
 
     #[gpui::test]
@@ -238,6 +238,180 @@ mod tests {
                 assert!(shell.cloud_workspaces.is_none());
             })
             .unwrap();
+    }
+
+    /// A window whose footer chip reads the fixtures' fake `gh` and `sbx` (never the real ones).
+    fn window_with_chip(
+        cx: &mut TestAppContext,
+    ) -> (
+        WindowHandle<Shell>,
+        fixtures::World,
+        Entity<crate::usage_footer::cloud_chip::CloudChip>,
+    ) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let store = window.read_with(cx, |s, _| s.store.clone()).unwrap();
+        let w = fixtures::world_in(store);
+        let env = Env {
+            api: Some(w.api.clone()),
+            store: w.store.clone(),
+        };
+        let chip = window
+            .read_with(cx, |s, cx| s.usage_footer.read(cx).cloud_chip().clone())
+            .unwrap();
+        chip.update(cx, |chip, cx| {
+            chip.set_env(env, cx);
+            chip.set_window_active(true, cx);
+        });
+        (window, w, chip)
+    }
+
+    fn chip_reports(
+        chip: &Entity<crate::usage_footer::cloud_chip::CloudChip>,
+        project: &str,
+        cx: &mut TestAppContext,
+    ) {
+        cx.run_until_parked();
+        chip.read_with(cx, |chip, _| {
+            assert_eq!(chip.project(), project);
+            assert!(chip.visible(), "{:?}", chip.status());
+        });
+    }
+
+    #[gpui::test]
+    fn the_footer_chip_stays_on_the_mono_tab_and_the_app_views(cx: &mut TestAppContext) {
+        let (window, w, chip) = window_with_chip(cx);
+        let project = w.checkout.path();
+        // The window is on a project that uses cloud, and shows a session of it.
+        window
+            .update(cx, |shell, window, cx| {
+                shell.workspace.add_project(&project);
+                shell.select_project(project.clone(), window, cx);
+            })
+            .unwrap();
+        chip_reports(&chip, &project, cx);
+
+        // The MonoCrab tab: a Mono chat has its own cwd, the chip still reports on the project.
+        window
+            .update(cx, |shell, window, cx| {
+                let project = shell.workspace.project.clone();
+                shell.mono_manager().update(cx, |monos, cx| {
+                    let id = monos.roster.create(vec![project]).id.clone();
+                    monos.open(&id, window, cx);
+                });
+                assert!(shell.mono_active(cx));
+            })
+            .unwrap();
+        chip_reports(&chip, &project, cx);
+
+        // The app views, one after the other.
+        window
+            .update(cx, |shell, window, cx| shell.open_today(window, cx))
+            .unwrap();
+        chip_reports(&chip, &project, cx);
+        window
+            .update(cx, |shell, window, cx| shell.open_inbox(window, cx))
+            .unwrap();
+        chip_reports(&chip, &project, cx);
+        window
+            .update(cx, |shell, window, cx| shell.open_notes(window, cx))
+            .unwrap();
+        window
+            .read_with(cx, |shell, _| assert!(shell.app_view_open()))
+            .unwrap();
+        chip_reports(&chip, &project, cx);
+    }
+
+    #[gpui::test]
+    fn the_footer_chip_keeps_the_local_project_of_a_cloud_session_across_tabs(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, w, chip) = window_with_chip(cx);
+        let project = w.checkout.path();
+        window
+            .update(cx, |shell, _, cx| {
+                let pane = shell.workspace.active.unwrap();
+                let id = shell.workspace.session_for_pane(pane);
+                shell.cloud_marks.insert(
+                    id,
+                    cloud::CloudMark {
+                        local_project: project.clone(),
+                        codespace: "octo-used".into(),
+                        kind: CloudBackendKind::Codespaces,
+                    },
+                );
+                // The window is on a folder that is not the session's project (a restored
+                // window, a remote folder): the session's mark decides.
+                shell.workspace.project = "remote://host/elsewhere".into();
+                shell.invalidate_chrome(cx);
+            })
+            .unwrap();
+        chip_reports(&chip, &project, cx);
+
+        // Leaving the session for the Mono tab: the window's project, no longer a remote one.
+        window
+            .update(cx, |shell, window, cx| {
+                shell.workspace.project = project.clone();
+                let id = shell.workspace.project.clone();
+                shell.mono_manager().update(cx, |monos, cx| {
+                    let mono = monos.roster.create(vec![id]).id.clone();
+                    monos.open(&mono, window, cx);
+                });
+            })
+            .unwrap();
+        chip_reports(&chip, &project, cx);
+    }
+
+    #[gpui::test]
+    fn the_footer_chip_follows_the_project_and_hides_for_one_that_does_not_use_cloud(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, w, chip) = window_with_chip(cx);
+        let project = w.checkout.path();
+        // A project that never used cloud: no session, no Cloud settings.
+        let plain = fixtures::Checkout::new();
+        let plain_project = plain.path();
+        window
+            .update(cx, |shell, window, cx| {
+                shell.workspace.add_project(&project);
+                shell.workspace.add_project(&plain_project);
+                shell.select_project(plain_project.clone(), window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        chip.read_with(cx, |chip, _| {
+            assert_eq!(chip.project(), plain_project);
+            assert!(!chip.visible());
+        });
+        let asked = w.gh.count("codespace list");
+
+        // Its Mono tab and app views do not show it either, and never start `gh`.
+        window
+            .update(cx, |shell, window, cx| {
+                let project = shell.workspace.project.clone();
+                shell.mono_manager().update(cx, |monos, cx| {
+                    let id = monos.roster.create(vec![project]).id.clone();
+                    monos.open(&id, window, cx);
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, window, cx| shell.open_today(window, cx))
+            .unwrap();
+        cx.run_until_parked();
+        chip.read_with(cx, |chip, _| {
+            assert_eq!(chip.project(), plain_project);
+            assert!(!chip.visible());
+        });
+        assert_eq!(w.gh.count("codespace list"), asked);
+
+        // Back to the project that uses cloud: the chip is there, on every tab of it.
+        window
+            .update(cx, |shell, window, cx| {
+                shell.select_project(project.clone(), window, cx)
+            })
+            .unwrap();
+        chip_reports(&chip, &project, cx);
     }
 
     #[gpui::test]
