@@ -111,7 +111,10 @@ jobs:
       - run: npm ci
       - run: npm run native:test:dev
       - run: cargo clippy --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-core --all-targets --profile native-dev -- -D warnings
-      - run: cargo test --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-core --profile native-dev
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.151
+      - run: cargo nextest run --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-core --cargo-profile native-dev --profile ci
 
   # Core crate on Windows, built once and run in shards, the same way as the GPUI tests
   # below: one `cargo test` run took about 12 minutes (3.6 compile, 8.5 running the lib
