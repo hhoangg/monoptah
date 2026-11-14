@@ -13,6 +13,8 @@ use std::time::Duration;
 use crate::cloud_sessions::backend::CloudBackendKind;
 use serde::{Deserialize, Serialize};
 
+pub mod usage;
+
 pub const OAUTH_SECRET_KEY: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 pub const DEFAULT_MACHINE: &str = "basicLinux32gb";
 pub const IDLE_TIMEOUT: &str = "30m";
@@ -557,9 +559,11 @@ pub struct Codespace {
     pub machine_name: String,
     pub repository: String,
     pub last_used_at: String,
+    pub created_at: String,
 }
 
-const LIST_FIELDS: &str = "name,displayName,state,gitStatus,machineName,repository,lastUsedAt";
+const LIST_FIELDS: &str =
+    "name,displayName,state,gitStatus,machineName,repository,lastUsedAt,createdAt";
 
 pub fn list(runner: &dyn GhRunner, repo: &str) -> Result<Vec<Codespace>, String> {
     valid_repo(repo)?;
@@ -871,6 +875,23 @@ pub fn state(runner: &dyn GhRunner, name: &str) -> Result<String, String> {
         argv(&["codespace", "view", "-c", name, "--json", "state"]),
     )?;
     Ok(view.state)
+}
+
+/// The git state of codespace `name` as GitHub last reported it (`gh codespace view`, which
+/// reads the API and never starts or connects to the codespace). `None` when GitHub reports no
+/// git state for it.
+pub fn git_status(runner: &dyn GhRunner, name: &str) -> Result<Option<GitStatus>, String> {
+    valid_codespace_name(name)?;
+    #[derive(Default, Deserialize)]
+    #[serde(rename_all = "camelCase", default)]
+    struct View {
+        git_status: Option<GitStatus>,
+    }
+    let view: View = run_json(
+        runner,
+        argv(&["codespace", "view", "-c", name, "--json", "gitStatus"]),
+    )?;
+    Ok(view.git_status)
 }
 
 /// Whether a Codespace is in the authenticated user's complete inventory. Read-only;
@@ -1210,14 +1231,10 @@ pub struct MachineType {
 }
 
 /// The machine a new codespace starts on when the user does not choose: `preferred` (the
-/// project's machine) when the repository offers it, else [`DEFAULT_MACHINE`], else the first.
+/// project's machine) while the repository offers it, else the smallest machine it offers
+/// ([`pick_machine`]). `None` when the list is empty.
 pub fn default_machine(machines: &[MachineType], preferred: Option<&str>) -> Option<String> {
-    machines
-        .iter()
-        .find(|m| Some(m.name.as_str()) == preferred)
-        .or_else(|| machines.iter().find(|m| m.name == DEFAULT_MACHINE))
-        .or_else(|| machines.first())
-        .map(|m| m.name.clone())
+    (!machines.is_empty()).then(|| pick_machine(machines, preferred).name)
 }
 
 /// The REST API uses snake_case; accept both so tests and gh versions agree.
@@ -1259,12 +1276,117 @@ fn parse_machines(text: &str) -> Result<Vec<MachineType>, String> {
 }
 
 pub fn list_machines(runner: &dyn GhRunner, repo: &str) -> Result<Vec<MachineType>, String> {
+    list_machines_at(runner, repo, None)
+}
+
+/// The machine types GitHub lets this repository create a codespace with. With `git_ref` the
+/// answer honours that branch's devcontainer (`hostRequirements` hides machines that are too
+/// small), so `basicLinux32gb` is missing for a repository that needs 4 cores.
+pub fn list_machines_at(
+    runner: &dyn GhRunner,
+    repo: &str,
+    git_ref: Option<&str>,
+) -> Result<Vec<MachineType>, String> {
     valid_repo(repo)?;
-    let text = run_ok(
-        runner,
-        argv(&["api", &format!("/repos/{repo}/codespaces/machines")]),
-    )?;
-    parse_machines(&text)
+    let mut path = format!("/repos/{repo}/codespaces/machines");
+    if let Some(git_ref) = git_ref.map(str::trim).filter(|r| !r.is_empty()) {
+        let encoded: String = url::form_urlencoded::byte_serialize(git_ref.as_bytes()).collect();
+        path.push_str(&format!("?ref={encoded}"));
+    }
+    parse_machines(&run_ok(runner, argv(&["api", &path]))?)
+}
+
+/// The cheapest machine: fewest cores, then least memory, then least storage (name breaks a
+/// tie so the answer never depends on GitHub's order).
+pub fn smallest_machine(machines: &[MachineType]) -> Option<&MachineType> {
+    machines.iter().min_by(|a, b| {
+        (a.cpus, a.memory_in_bytes, a.storage_in_bytes, &a.name).cmp(&(
+            b.cpus,
+            b.memory_in_bytes,
+            b.storage_in_bytes,
+            &b.name,
+        ))
+    })
+}
+
+/// The machine a new codespace gets, from what the repository allows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MachinePick {
+    pub name: String,
+    /// The preferred machine that is no longer allowed and was replaced by `name`.
+    pub replaced: Option<String>,
+}
+
+/// `preferred` when the repository still allows it, else the smallest allowed machine. An
+/// empty `allowed` means GitHub did not say (offline, no scope, an older gh): `preferred` or
+/// [`DEFAULT_MACHINE`] then, as before the lookup existed.
+pub fn pick_machine(allowed: &[MachineType], preferred: Option<&str>) -> MachinePick {
+    let preferred = preferred.map(str::trim).filter(|m| !m.is_empty());
+    if allowed.is_empty() {
+        return MachinePick {
+            name: preferred.unwrap_or(DEFAULT_MACHINE).to_owned(),
+            replaced: None,
+        };
+    }
+    if let Some(name) = preferred.filter(|name| allowed.iter().any(|m| m.name == *name)) {
+        return MachinePick {
+            name: name.to_owned(),
+            replaced: None,
+        };
+    }
+    MachinePick {
+        name: smallest_machine(allowed)
+            .map_or_else(|| DEFAULT_MACHINE.to_owned(), |m| m.name.clone()),
+        replaced: preferred.map(str::to_owned),
+    }
+}
+
+/// Allowed machine types by `(repo, ref)`, kept for the life of the process: they change only
+/// when a devcontainer's `hostRequirements` or the account's policy does. Only an answer that
+/// names machines is kept, so a failed lookup (offline, auth) is asked again next time.
+#[derive(Default)]
+pub struct MachineCache {
+    entries: std::sync::Mutex<std::collections::HashMap<(String, String), Vec<MachineType>>>,
+}
+
+impl MachineCache {
+    /// The allowed machines of `repo` at `git_ref`, from the cache or one `gh api` call.
+    pub fn allowed(
+        &self,
+        runner: &dyn GhRunner,
+        repo: &str,
+        git_ref: Option<&str>,
+    ) -> Result<Vec<MachineType>, String> {
+        let key = (
+            repo.to_owned(),
+            git_ref.map(str::trim).unwrap_or_default().to_owned(),
+        );
+        if let Some(hit) = self.entries.lock().ok().and_then(|e| e.get(&key).cloned()) {
+            return Ok(hit);
+        }
+        let machines = list_machines_at(runner, repo, git_ref)?;
+        if machines.is_empty() {
+            return Err(format!("GitHub listed no machine types for {repo}"));
+        }
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.insert(key, machines.clone());
+        }
+        Ok(machines)
+    }
+
+    /// The machine for a new codespace of `repo` on `git_ref` when the caller names none (or
+    /// names one the repository no longer allows): the smallest allowed one. A failed lookup
+    /// keeps `preferred` or [`DEFAULT_MACHINE`], so it never blocks a start.
+    pub fn pick(
+        &self,
+        runner: &dyn GhRunner,
+        repo: &str,
+        git_ref: Option<&str>,
+        preferred: Option<&str>,
+    ) -> MachinePick {
+        let allowed = self.allowed(runner, repo, git_ref).unwrap_or_default();
+        pick_machine(&allowed, preferred)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]

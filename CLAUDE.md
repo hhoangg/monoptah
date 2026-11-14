@@ -195,7 +195,7 @@ runs on GitHub Actions (hosted macOS runners are not being acquired): the macOS 
 built and packaged on the maintainer's Mac, everything else is on CI.
 
 What CI checks (`native.yml`): `monocode-core` clippy and tests plus `native:test:dev` on Linux
-and Windows, GPUI `fmt` and clippy `-D warnings` on Linux, GPUI tests on Linux (built once with
+and Windows (the Windows core tests run in 3 shards from one nextest archive), GPUI `fmt` and clippy `-D warnings` on Linux, GPUI tests on Linux (built once with
 `cargo nextest archive`, run in 3 shards, one process per test), and GPUI `cargo check
 --all-targets` on Windows. The workflow runs on every PR (a `changes` job skips the heavy jobs when
 no native path changed) and the `CI passed` job is the single check to require for merging. During development the local remainder is `npm run native:check:mac`

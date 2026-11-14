@@ -22,7 +22,7 @@ pub(super) struct State {
     was_online: bool,
     pub(super) app_prompt_waiting: bool,
     app_draft_launched: bool,
-    waking: bool,
+    pub(super) waking: bool,
     /// Stops the reconnect that is running (set by the Cancel button).
     wake_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     error: Option<String>,

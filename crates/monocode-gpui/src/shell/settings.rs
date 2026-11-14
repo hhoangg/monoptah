@@ -138,6 +138,29 @@ impl Shell {
                 .collect(),
         }
     }
+    #[cfg(test)]
+    pub(crate) fn settings_view(&self) -> Option<Entity<crate::settings::SettingsView>> {
+        self.settings.clone()
+    }
+    #[cfg(test)]
+    pub(crate) fn open_emoji_library_for_test(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_emoji_library(window, cx);
+    }
+    #[cfg(test)]
+    pub(crate) fn close_settings_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_settings(window, cx);
+    }
+    /// Settings > Monos > Emoji: the shared emoji library.
+    pub(super) fn open_emoji_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings(Section::Monos, window, cx);
+        if let Some(view) = self.settings.clone() {
+            view.update(cx, |view, cx| view.show_emoji_library(cx));
+        }
+    }
     pub(super) fn open_settings(
         &mut self,
         section: Section,

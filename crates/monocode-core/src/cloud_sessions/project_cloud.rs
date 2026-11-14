@@ -260,20 +260,50 @@ pub struct DevcontainerInfo {
     pub has_sshd: bool,
 }
 
-/// `16gb`, `8GB`, `512mb`, `1tb` (whole or decimal) as MiB.
+/// A devcontainer memory such as `16gb`, `8GiB`, `512m` or `1.5 tb` (whole or decimal, any
+/// case, an optional space) as MiB. The units are `tb`, `gb`, `mb`, `kb`, their binary
+/// spellings (`tib`, `gib`, `mib`, `kib`) and the bare letters `t`, `g`, `m`, `k`, all read as
+/// binary (1 gb = 1024 MiB), which never asks for less than meant. A bare number or an
+/// unknown unit is `None`: not stated, never "zero".
 fn memory_mib(text: &str) -> Option<u64> {
     let text = text.trim().to_ascii_lowercase();
     let split = text.find(|c: char| !(c.is_ascii_digit() || c == '.'))?;
     let amount: f64 = text[..split].parse().ok()?;
     let factor = match text[split..].trim() {
-        "tb" => 1024.0 * 1024.0,
-        "gb" => 1024.0,
-        "mb" => 1.0,
-        "kb" => 1.0 / 1024.0,
+        "tb" | "tib" | "t" => 1024.0 * 1024.0,
+        "gb" | "gib" | "g" => 1024.0,
+        "mb" | "mib" | "m" => 1.0,
+        "kb" | "kib" | "k" => 1.0 / 1024.0,
         _ => return None,
     };
     let mib = (amount * factor).ceil();
     (mib.is_finite() && mib >= 0.0).then_some(mib as u64)
+}
+
+/// `16384` MiB as `16 GB`, `1536` as `1.5 GB`, `512` as `512 MB`.
+pub fn gb_text(mib: u64) -> String {
+    if mib >= 1024 && mib.is_multiple_of(1024) {
+        format!("{} GB", mib / 1024)
+    } else if mib >= 1024 {
+        format!("{:.1} GB", mib as f64 / 1024.0)
+    } else {
+        format!("{mib} MB")
+    }
+}
+
+impl DevcontainerInfo {
+    /// What `hostRequirements` asks for, as `4 CPUs and 16 GB`; `None` when it asks for
+    /// nothing.
+    pub fn asks_for(&self) -> Option<String> {
+        let cpus = self
+            .host_cpus
+            .map(|n| format!("{n} CPU{}", if n == 1 { "" } else { "s" }));
+        let memory = self.host_memory_mib.map(gb_text);
+        match (cpus, memory) {
+            (Some(cpus), Some(memory)) => Some(format!("{cpus} and {memory}")),
+            (one, other) => one.or(other),
+        }
+    }
 }
 
 /// Whether the feature id `id` names the sshd feature: its last path segment, without a

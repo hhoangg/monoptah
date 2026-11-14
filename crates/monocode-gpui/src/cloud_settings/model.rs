@@ -8,7 +8,6 @@ pub(super) use crate::cloud_presets::{
     CODESPACE_SECRET_LABEL, docker_account_label, idle_label, idle_options, machine_label,
     memory_mib, runtime_label, runtime_options, size_label, size_options,
 };
-use crate::cloud_presets::{gb_text, plural};
 use monocode_core::{
     cloud_sessions::{
         docker_config::{self, DockerProjectConfig},
@@ -382,37 +381,9 @@ pub(super) fn save(
 
 // ------------------------------------------------------------------ options
 
-/// "Asks for 4 CPUs and 16 GB" from the devcontainer's `hostRequirements`.
-pub(super) fn requirement_hint(info: &DevcontainerInfo) -> Option<String> {
-    let memory = info.host_memory_mib.map(gb_text);
-    match (info.host_cpus, memory) {
-        (Some(cpus), Some(memory)) => {
-            Some(format!("Asks for {} and {memory}", plural(cpus, "CPU")))
-        }
-        (Some(cpus), None) => Some(format!("Asks for {}", plural(cpus, "CPU"))),
-        (None, Some(memory)) => Some(format!("Asks for {memory}")),
-        (None, None) => None,
-    }
-}
-
-/// A warning when a size has fewer CPUs or less memory than the devcontainer asks for. The
-/// size stays selectable.
-pub(super) fn size_warning(
-    cpus: u32,
-    memory_mib: Option<u64>,
-    info: &DevcontainerInfo,
-) -> Option<String> {
-    let low_cpus = info.host_cpus.is_some_and(|need| cpus < need);
-    let low_memory =
-        matches!((info.host_memory_mib, memory_mib), (Some(need), Some(have)) if have < need);
-    if !(low_cpus || low_memory) {
-        return None;
-    }
-    let ask = requirement_hint(info)?.replacen("Asks for", "asks for", 1);
-    Some(format!(
-        "Below what the devcontainer {ask}. The environment may not build or run."
-    ))
-}
+#[cfg(test)]
+pub(super) use crate::cloud_presets::requirement_hint;
+pub(super) use crate::cloud_presets::size_warning;
 
 /// One machine type as the select shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -444,15 +415,15 @@ pub(super) fn devcontainer_machine<'a>(
         .min_by_key(|m| (m.cpus, m.memory_in_bytes))
 }
 
-/// The machine select's options: every machine the repository offers (the one the
-/// devcontainer asks for marked), plus the current value when the list lacks it.
+/// The machine select's options: every machine the repository allows on the base branch (the
+/// one the devcontainer asks for marked). A saved machine the list lacks is not offered:
+/// GitHub would refuse it, see [`unavailable_machine`].
 pub(super) fn machine_options(
     machines: &[MachineType],
-    current: Option<&str>,
     info: &DevcontainerInfo,
 ) -> Vec<MachineOption> {
     let marked = devcontainer_machine(machines, info).map(|m| m.name.clone());
-    let mut options: Vec<MachineOption> = machines
+    machines
         .iter()
         .map(|machine| MachineOption {
             name: machine.name.clone(),
@@ -462,22 +433,20 @@ pub(super) fn machine_options(
                 machine_label(machine)
             },
         })
-        .collect();
-    if let Some(current) = current
-        && !options.iter().any(|o| o.name == current)
-    {
-        options.push(MachineOption {
-            name: current.to_owned(),
-            label: current.to_owned(),
-        });
-    }
-    options
+        .collect()
 }
 
-/// The name that is selected: the project's machine, else the one a codespace starts on.
+/// The name that is selected: the project's machine while the repository allows it, else the
+/// smallest allowed one (the machine a codespace then starts on).
 pub(super) fn selected_machine(machines: &[MachineType], current: Option<&str>) -> Option<String> {
-    match current {
-        Some(name) => Some(name.to_owned()),
-        None => codespaces::default_machine(machines, None),
-    }
+    codespaces::default_machine(machines, current)
+}
+
+/// The saved machine when the listed machines do not include it (the repository's devcontainer
+/// or policy rules it out now): the start then uses [`selected_machine`] instead.
+pub(super) fn unavailable_machine<'a>(
+    machines: &[MachineType],
+    current: Option<&'a str>,
+) -> Option<&'a str> {
+    current.filter(|name| !machines.is_empty() && !machines.iter().any(|m| m.name == *name))
 }

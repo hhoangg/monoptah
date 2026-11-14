@@ -1842,6 +1842,13 @@ impl GhRunner for StartGh {
         };
         if line.starts_with("auth status") {
             out(AUTH_OK)
+        } else if line.contains("/codespaces/machines") {
+            // GitHub not reachable: the static default machine stays.
+            Ok(GhOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: "HTTP 404".into(),
+            })
         } else if line.starts_with("api --method POST") {
             (self.on_create)();
             out(

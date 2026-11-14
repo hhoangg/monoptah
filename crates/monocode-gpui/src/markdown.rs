@@ -2,7 +2,7 @@
 mod cache;
 pub(crate) mod mermaid;
 mod search;
-use crate::markdown_model::{Block, InlineRun, TableAlign};
+use crate::markdown_model::{Block, EmojiPick, InlineRun, TableAlign};
 use crate::syntax::HighlightedDocument;
 use crate::theme::*;
 use crate::transcript::selection::TextSelection;
@@ -10,7 +10,7 @@ pub(crate) use cache::{PreparedRow, RenderCache};
 use gpui::Window;
 use gpui::{
     AnyElement, App, ClickEvent, Div, FontStyle, FontWeight, HighlightStyle, InteractiveText,
-    MouseButton, Pixels, Point, Role, SharedString, StrikethroughStyle, StyledText, div,
+    MouseButton, ObjectFit, Pixels, Point, Role, SharedString, StrikethroughStyle, StyledText, div,
     prelude::*, px, rgb,
 };
 pub(crate) use search::{mark_row, mark_styles, row_text};
@@ -479,6 +479,10 @@ pub(crate) fn word_count(row: &MarkdownRow) -> usize {
         _ => 0,
     }
 }
+/// Runs the text-only path cannot draw: inline code chips and Mono emoji pictures.
+pub(crate) fn needs_rich(runs: &[InlineRun]) -> bool {
+    runs.iter().any(|r| r.style.code || r.style.emoji.is_some())
+}
 #[allow(clippy::too_many_arguments)]
 fn inline_selected(
     runs: &[InlineRun],
@@ -491,7 +495,7 @@ fn inline_selected(
     selection: Option<TextSelection>,
     prepared: Option<&cache::PreparedInline>,
 ) -> AnyElement {
-    if runs.iter().any(|r| r.style.code) {
+    if needs_rich(runs) {
         return rich_inline(runs, id, tone, fade, now, word_base, font_size, selection);
     }
     let uncached;
@@ -610,6 +614,16 @@ fn rich_inline(
     let mut offset = 0;
     for (run_ix, run) in runs.iter().enumerate() {
         let style = &run.style;
+        if let Some(pick) = &style.emoji {
+            if pick.large {
+                children.push(div().w_full().h(px(0.)).into_any_element());
+            }
+            children.push(emoji_element(pick, &id, run_ix));
+            if pick.large {
+                children.push(div().w_full().h(px(0.)).into_any_element());
+            }
+            continue;
+        }
         if style.code {
             let text = run.text.clone();
             let file = is_file_chip(&text);
@@ -765,6 +779,140 @@ fn rich_inline(
         .flex_wrap()
         .items_center()
         .children(children)
+        .into_any_element()
+}
+/// Inline emoji height, inside the 24px line.
+pub(crate) const EMOJI_INLINE: f32 = 20.;
+/// Height of an emoji that stands alone on its line.
+pub(crate) const EMOJI_LARGE: f32 = 56.;
+/// Edge of the square preview shown while hovering an emoji.
+pub(crate) const EMOJI_PREVIEW: f32 = 112.;
+/// Space kept between the emoji and its preview.
+const EMOJI_PREVIEW_GAP: f32 = 4.;
+
+thread_local! {
+    /// Last painted bounds of every drawn emoji, by picture element id. The tooltip builder
+    /// reads the latest entry when it runs, so a scroll or reflow between the render that
+    /// registered the tooltip and the moment it shows cannot leave it with stale bounds.
+    static EMOJI_BOUNDS: std::cell::RefCell<std::collections::HashMap<SharedString, gpui::Bounds<Pixels>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Tooltip view for a hovered Mono emoji: a larger copy of the picture above its
+/// "<name> \u{b7} <emotion>" label. GPUI's plain tooltip puts a view at the mouse position
+/// taken once when it shows (+1px, below and right), and flips it above (or left) when it
+/// would leave the window. That would cover the emoji the mouse is on, so the view pads its
+/// top by the distance from that position to the emoji's bottom, and its bottom by the
+/// distance to the emoji's top. Unflipped, the card starts below the emoji; flipped, it ends
+/// above it, whatever the card's height. Both paddings are computed once in the builder
+/// (`emoji_element`) and the view never reads the mouse, because a GIF redraws it every
+/// frame while the origin stays fixed. It is not hoverable and takes no focus. Limitation:
+/// GPUI tests a mouse-down or scroll against the padded box, so after the mouse moves down
+/// inside the emoji such an event may not dismiss the preview until the mouse leaves.
+struct EmojiPreviewTip {
+    path: Arc<std::path::PathBuf>,
+    label: SharedString,
+    id: SharedString,
+    pad_top: Pixels,
+    pad_bottom: Pixels,
+}
+impl gpui::Render for EmojiPreviewTip {
+    fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+        let card = div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_1()
+            .max_w(px(EMOJI_PREVIEW + 48.))
+            .p_2()
+            .rounded_md()
+            .bg(shell_fill())
+            .border_1()
+            .border_color(content(0.12))
+            .child(
+                div()
+                    .size(px(EMOJI_PREVIEW))
+                    .debug_selector(|| "mono-emoji-preview".into())
+                    .child(
+                        crate::image_memory::preview((*self.path).clone())
+                            .id(self.id.clone())
+                            .size(px(EMOJI_PREVIEW))
+                            .object_fit(ObjectFit::Contain)
+                            .with_fallback(|| div().into_any_element()),
+                    ),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "mono-emoji-preview-label".into())
+                    .text_size(px(12.))
+                    .text_color(content(0.85))
+                    .child(self.label.clone()),
+            );
+        div().pt(self.pad_top).pb(self.pad_bottom).child(card)
+    }
+}
+/// The tooltip label of an emoji: `<name> \u{b7} <emotion>`.
+pub(crate) fn emoji_label(pick: &EmojiPick) -> SharedString {
+    format!("{} \u{b7} {}", pick.name, pick.emotion).into()
+}
+/// One Mono emoji picture. A missing or unreadable file draws nothing. The element id
+/// keeps a GIF or WebP animating across frames. Hovering shows [`EmojiPreviewTip`].
+fn emoji_element(pick: &Arc<EmojiPick>, id: &SharedString, run_ix: usize) -> AnyElement {
+    let size = if pick.large {
+        EMOJI_LARGE
+    } else {
+        EMOJI_INLINE
+    };
+    let label = emoji_label(pick);
+    let selector = if pick.large {
+        format!("mono-emoji-large-{}", pick.emotion)
+    } else {
+        format!("mono-emoji-{}", pick.emotion)
+    };
+    let key = SharedString::from(format!("{id}-emoji-{run_ix}"));
+    let preview_id = SharedString::from(format!("{id}-emoji-preview-{run_ix}"));
+    let path = Arc::new(pick.path.clone());
+    let picture = crate::image_memory::thumbnail(pick.path.clone())
+        .id(key.clone())
+        .size(px(size))
+        .object_fit(ObjectFit::Contain)
+        .with_fallback(|| div().into_any_element())
+        .tooltip({
+            let key = key.clone();
+            move |window, cx| {
+                // Snapshot once: GPUI fixes the tooltip origin at this same mouse position.
+                let mouse = window.mouse_position();
+                let emoji = EMOJI_BOUNDS
+                    .with(|map| map.borrow().get(&key).copied())
+                    .unwrap_or_default();
+                let gap = px(EMOJI_PREVIEW_GAP);
+                cx.new(|_| EmojiPreviewTip {
+                    path: path.clone(),
+                    label: label.clone(),
+                    id: preview_id.clone(),
+                    pad_top: (emoji.bottom() - mouse.y).max(px(0.)) + gap,
+                    pad_bottom: (mouse.y - emoji.top()).max(px(0.)) + gap,
+                })
+                .into()
+            }
+        });
+    let track = gpui::canvas(
+        move |area, _, _| {
+            EMOJI_BOUNDS.with(|map| map.borrow_mut().insert(key, area));
+        },
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .size_full();
+    div()
+        .flex_none()
+        .size(px(size))
+        .ml(px(2.))
+        .mr(px(4.))
+        .my(px(if pick.large { 4. } else { 0. }))
+        .debug_selector(move || selector.clone())
+        .child(track)
+        .child(picture)
         .into_any_element()
 }
 fn is_file_chip(text: &str) -> bool {

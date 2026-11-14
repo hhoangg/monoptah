@@ -315,7 +315,7 @@ impl RightPanel {
         let explorer = cx.new(|cx| Explorer::new(git.clone(), window, cx));
         let changes = cx.new(|cx| Changes::new(git.clone(), window, cx));
         let history = cx.new(|cx| History::new(git.clone(), window, cx));
-        let codespace = cx.new(|_| crate::codespace_pane::CodespacePane::new());
+        let codespace = cx.new(crate::codespace_pane::CodespacePane::new);
         let subscriptions = vec![
             cx.observe(&git, |_, _, cx| cx.notify()),
             cx.subscribe(&git, |_, _, _: &GitChanged, cx| cx.notify()),

@@ -336,7 +336,7 @@ pub(crate) fn popover(id: impl Into<ElementId>, anchor: Anchor) -> Popover {
         anchor,
         options: Options::default(),
         padding: 0.,
-        priority: 40,
+        priority: DEFAULT_PRIORITY,
         track: Vec::new(),
         ignore: Vec::new(),
         on_dismiss: None,
@@ -448,6 +448,10 @@ impl RenderOnce for Popover {
 }
 impl Popover {
     fn render_at(self, enter: f32, viewport: gpui::Size<Pixels>) -> impl IntoElement {
+        // Built inside another popover's content: draw above it, whatever priority was asked.
+        let priority = HOST_PRIORITY
+            .get()
+            .map_or(self.priority, |host| self.priority.max(host + 1));
         let (viewport_width, viewport_height) = (viewport.width, viewport.height);
         let radius = if self.modal_classic.is_some() {
             16.
@@ -512,6 +516,7 @@ impl Popover {
                     .border_color(content(border)),
             );
         deferred(Placed {
+            priority,
             anchor: self.anchor,
             options: self.options,
             progress: enter,
@@ -521,7 +526,7 @@ impl Popover {
             on_dismiss: self.on_dismiss,
             consume_outside_press: self.consume_outside_press,
         })
-        .with_priority(self.priority)
+        .with_priority(priority)
     }
 }
 fn tint() -> Hsla {
@@ -590,7 +595,57 @@ pub(crate) fn shadow() -> Vec<BoxShadow> {
     ]
 }
 
+/// A popover's card as last painted: which window it is in, how high it is drawn and where.
+struct Layer {
+    window: gpui::WindowId,
+    priority: usize,
+    surface: Bounds<Pixels>,
+}
+thread_local! {
+    /// Every popover painted for the frames still alive. A layer is held strongly only by its
+    /// popover's mouse listener, so it lives exactly as long as the frame that painted it: the
+    /// window drops the listeners of a frame once the next one is drawn.
+    static LAYERS: RefCell<Vec<std::rc::Weak<Layer>>> = const { RefCell::new(Vec::new()) };
+}
+/// Whether `position` is on the card of a popover drawn above `priority` in `window`. A press
+/// there belongs to that popover, so the ones beneath it, a modal for one, must not take it for
+/// an outside press and dismiss themselves before the item under the pointer is clicked.
+fn on_higher_layer(window: gpui::WindowId, priority: usize, position: &Point<Pixels>) -> bool {
+    LAYERS.with_borrow(|layers| {
+        layers
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .any(|layer| {
+                layer.window == window
+                    && layer.priority > priority
+                    && layer.surface.contains(position)
+            })
+    })
+}
+
+thread_local! {
+    /// The priority of the popover whose content is being laid out, if any. A popover built
+    /// inside it (a submenu, a flyout, a dropdown of a dialog's own widget) is raised above it,
+    /// so it is never hidden beneath its host and a press on it is never an outside press for it.
+    static HOST_PRIORITY: Cell<Option<usize>> = const { Cell::new(None) };
+}
+/// Where a popover draws unless its caller says otherwise.
+const DEFAULT_PRIORITY: usize = 40;
+/// Marks `priority` as the host layer until dropped, restoring the previous one.
+struct HostLayer(Option<usize>);
+impl HostLayer {
+    fn enter(priority: usize) -> Self {
+        Self(HOST_PRIORITY.replace(Some(priority)))
+    }
+}
+impl Drop for HostLayer {
+    fn drop(&mut self) {
+        HOST_PRIORITY.set(self.0);
+    }
+}
+
 struct Placed {
+    priority: usize,
     anchor: Anchor,
     options: Options,
     progress: f32,
@@ -622,7 +677,11 @@ impl Element for Placed {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, LayoutId) {
-        let child = self.frame.request_layout(window, cx);
+        // The content renders here, so a menu in it learns the layer it is drawn on.
+        let child = {
+            let _host = HostLayer::enter(self.priority);
+            self.frame.request_layout(window, cx)
+        };
         let style = Style {
             position: CssPosition::Absolute,
             display: Display::Flex,
@@ -683,9 +742,16 @@ impl Element for Placed {
         cx: &mut App,
     ) {
         self.frame.paint(window, cx);
-        let Some(dismiss) = self.on_dismiss.clone() else {
-            return;
-        };
+        let layer = Rc::new(Layer {
+            window: window.window_handle().window_id(),
+            priority: self.priority,
+            surface: *surface,
+        });
+        LAYERS.with_borrow_mut(|layers| {
+            layers.retain(|layer| layer.strong_count() > 0);
+            layers.push(Rc::downgrade(&layer));
+        });
+        let dismiss = self.on_dismiss.clone();
         let surface = *surface;
         let anchor = self.anchor.bounds();
         let ignore = self.ignore.clone();
@@ -696,12 +762,17 @@ impl Element for Placed {
                 && !ignore
                     .iter()
                     .any(|slot| slot.get().is_some_and(|b| b.contains(position)))
+                && !on_higher_layer(layer.window, layer.priority, position)
         };
         // Capture, so a trigger beneath that stops propagation still closes
         // the popover, and before that trigger reacts to the same press.
         // Then consume that press in bubble so the
         // content behind cannot act on it too; the next press reaches it.
+        // Registered even without a dismissal: it keeps the layer alive.
         window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+            let Some(dismiss) = &dismiss else {
+                return;
+            };
             if !outside(&event.position) {
                 return;
             }
@@ -2095,6 +2166,90 @@ mod tests {
         }
     }
 
+    struct LayersHost {
+        above: bool,
+        dismissed: Rc<Cell<usize>>,
+        below_card: AnchorSlot,
+        above_card: AnchorSlot,
+    }
+    impl Render for LayersHost {
+        fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let dismissed = self.dismissed.clone();
+            div()
+                .size_full()
+                .child(
+                    popover("layer-below", Anchor::Point(point(px(100.), px(100.))))
+                        .priority(70)
+                        .width(300.)
+                        .height(200.)
+                        .track(self.below_card.clone())
+                        .on_dismiss(move |_, _| dismissed.set(dismissed.get() + 1))
+                        .render_at(1., window.viewport_size()),
+                )
+                .when(self.above, |d| {
+                    d.child(
+                        popover("layer-above", Anchor::Point(point(px(350.), px(150.))))
+                            .priority(90)
+                            .width(200.)
+                            .height(100.)
+                            .track(self.above_card.clone())
+                            .render_at(1., window.viewport_size()),
+                    )
+                })
+        }
+    }
+
+    #[gpui::test]
+    fn a_press_on_a_popover_drawn_above_does_not_dismiss_the_one_beneath(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (below_card, above_card) = (AnchorSlot::default(), AnchorSlot::default());
+        let dismissed = Rc::new(Cell::new(0));
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|_| LayersHost {
+                    above: true,
+                    dismissed: dismissed.clone(),
+                    below_card: below_card.clone(),
+                    above_card: above_card.clone(),
+                })
+            })
+            .unwrap()
+        });
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let (below, above) = (below_card.get().unwrap(), above_card.get().unwrap());
+        // The card above hangs over the edge of the one beneath: its right half is outside it.
+        let beyond = point(above.right() - px(10.), above.center().y);
+        assert!(above.contains(&beyond) && !below.contains(&beyond));
+        visual.simulate_click(beyond, Default::default());
+        assert_eq!(
+            dismissed.get(),
+            0,
+            "a press on the card above is not outside"
+        );
+        // A press on neither card is outside the one beneath.
+        visual.simulate_click(
+            point(below.right() + px(300.), below.bottom() + px(300.)),
+            Default::default(),
+        );
+        assert_eq!(dismissed.get(), 1);
+        // The card above is gone: the point it covered is outside again, not still claimed.
+        window
+            .update(visual, |host, _, cx| {
+                host.above = false;
+                cx.notify();
+            })
+            .unwrap();
+        visual.run_until_parked();
+        visual.simulate_click(beyond, Default::default());
+        assert_eq!(
+            dismissed.get(),
+            2,
+            "a closed popover no longer claims presses"
+        );
+    }
+
     #[gpui::test]
     fn a_max_width_card_hugs_short_content_and_caps_long_content(cx: &mut gpui::TestAppContext) {
         let card = AnchorSlot::default();
@@ -2556,5 +2711,364 @@ mod tests {
             &with(|o| o.side = Side::Right),
         );
         assert_eq!((low.top, low.max_height), (Some(292.), 300.));
+    }
+
+    /// How the dialog under test is built.
+    #[derive(Clone, Copy)]
+    enum DialogKind {
+        /// `modal::window_overlay` around `modal::overlay`: the scrim's press dismisses.
+        Overlay,
+        /// A modal popover at this priority over an occluding scrim just beneath it, as the
+        /// Mono settings and the Cloud settings are built.
+        Popover(usize),
+    }
+    type Opened = (
+        gpui::WindowHandle<DialogHost>,
+        Rc<Cell<usize>>,
+        Rc<RefCell<Vec<String>>>,
+    );
+    struct DialogHost {
+        kind: DialogKind,
+        /// A busy dialog has no dismissal.
+        busy: bool,
+        /// Where the dropdown opens, once it is open.
+        menu_at: Option<Point<Pixels>>,
+        /// Overrides the dropdown's priority; `None` keeps what `menu_popover` gives it.
+        menu_priority: Option<usize>,
+        menu: Entity<Menu>,
+        dismissed: Rc<Cell<usize>>,
+        card: AnchorSlot,
+        _picked: gpui::Subscription,
+    }
+    impl DialogHost {
+        fn open(
+            kind: DialogKind,
+            busy: bool,
+            menu_priority: Option<usize>,
+            cx: &mut gpui::TestAppContext,
+        ) -> Opened {
+            let dismissed = Rc::new(Cell::new(0));
+            let picked = Rc::new(RefCell::new(Vec::new()));
+            let (d, p) = (dismissed.clone(), picked.clone());
+            let window = cx.update(|cx| {
+                cx.set_reduce_motion(true);
+                cx.open_window(Default::default(), move |window, cx| {
+                    cx.new(|cx| {
+                        let menu = cx.new(|cx| {
+                            Menu::new(
+                                "Dropdown",
+                                vec![
+                                    MenuAction::new("plain", "Plain").into(),
+                                    MenuAction::new("nested", "Nested")
+                                        .submenu(vec![MenuAction::new("deep", "Deep")])
+                                        .into(),
+                                ],
+                                window,
+                                cx,
+                            )
+                            .width(300.)
+                        });
+                        let sink = p.clone();
+                        let _picked =
+                            cx.subscribe(&menu, move |host: &mut Self, _, e: &MenuEvent, cx| {
+                                if let MenuEvent::Picked(id, _) = e {
+                                    sink.borrow_mut().push(id.to_string());
+                                }
+                                // Picked or dismissed, the dropdown closes.
+                                host.menu_at = None;
+                                cx.notify();
+                            });
+                        Self {
+                            kind,
+                            busy,
+                            menu_at: None,
+                            menu_priority,
+                            menu,
+                            dismissed: d,
+                            card: AnchorSlot::default(),
+                            _picked,
+                        }
+                    })
+                })
+                .unwrap()
+            });
+            let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+            visual.run_until_parked();
+            (window, dismissed, picked)
+        }
+        /// Opens the dropdown with its left edge `inset` inside the card's right edge, so most of
+        /// it hangs outside the dialog, and returns the dialog card's bounds.
+        fn open_menu(
+            window: gpui::WindowHandle<Self>,
+            inset: f32,
+            cx: &mut gpui::VisualTestContext,
+        ) -> Bounds<Pixels> {
+            let card = cx.debug_bounds("dialog-card").expect("the dialog card");
+            window
+                .update(cx, |host, _, cx| {
+                    host.menu_at = Some(point(card.right() - px(inset), card.top() + px(40.)));
+                    cx.notify();
+                })
+                .unwrap();
+            cx.run_until_parked();
+            card
+        }
+    }
+    impl Render for DialogHost {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let dismissed = self.dismissed.clone();
+            let busy = self.busy;
+            let body = div()
+                .id("dialog-card")
+                .debug_selector(|| "dialog-card".into())
+                .w(px(300.))
+                .h(px(200.))
+                .bg(rgb(0x202020))
+                .child("Dialog");
+            let dialog = match self.kind {
+                DialogKind::Overlay => crate::modal::window_overlay(
+                    window,
+                    crate::modal::overlay("dialog-test", body, move |_, _| {
+                        if !busy {
+                            dismissed.set(dismissed.get() + 1);
+                        }
+                    }),
+                )
+                .into_any_element(),
+                DialogKind::Popover(priority) => div()
+                    .absolute()
+                    .size_full()
+                    .child(
+                        deferred(
+                            gpui::anchored().position(point(px(0.), px(0.))).child(
+                                div()
+                                    .w(window.viewport_size().width)
+                                    .h(window.viewport_size().height)
+                                    .occlude(),
+                            ),
+                        )
+                        .with_priority(priority - 1),
+                    )
+                    .child(
+                        popover("dialog-test", Anchor::Point(point(px(300.), px(200.))))
+                            .priority(priority)
+                            .width(300.)
+                            .height(200.)
+                            .track(self.card.clone())
+                            .when(!busy, |p| {
+                                p.on_dismiss(move |_, _| dismissed.set(dismissed.get() + 1))
+                            })
+                            .child(body),
+                    )
+                    .into_any_element(),
+            };
+            let menu = self.menu_at.map(|at| {
+                menu_popover(&self.menu, Anchor::Point(at), cx)
+                    .map(|p| match self.menu_priority {
+                        Some(priority) => p.priority(priority),
+                        None => p,
+                    })
+                    .into_any_element()
+            });
+            div().size_full().child(dialog).children(menu)
+        }
+    }
+    fn dropdown_item_outside_the_dialog(
+        kind: DialogKind,
+        menu_priority: Option<usize>,
+        item: &'static str,
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, dismissed, picked) = DialogHost::open(kind, false, menu_priority, cx);
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        let card = DialogHost::open_menu(window, 20., visual);
+        if item == "deep" {
+            window
+                .update(visual, |host, window, cx| {
+                    host.menu
+                        .update(cx, |menu, cx| menu.open_submenu(1, None, window, cx));
+                })
+                .unwrap();
+            visual.run_until_parked();
+        }
+        let row = visual
+            .debug_bounds(Box::leak(format!("menu-action-{item}").into_boxed_str()))
+            .expect("the dropdown row");
+        let at = row.center();
+        assert!(
+            !card.contains(&at),
+            "the press must land outside the dialog: {at:?} {card:?}"
+        );
+        visual.simulate_click(at, Default::default());
+        assert_eq!(dismissed.get(), 0, "the dialog stays open");
+        assert_eq!(*picked.borrow(), [item], "the option is applied once");
+        assert!(
+            window
+                .read_with(visual, |h, _| h.menu_at.is_none())
+                .unwrap()
+        );
+    }
+
+    #[gpui::test]
+    fn a_dropdown_over_an_overlay_dialog_takes_a_press_outside_the_dialog(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        dropdown_item_outside_the_dialog(DialogKind::Overlay, None, "plain", cx);
+    }
+    #[gpui::test]
+    fn a_dropdown_over_a_popover_dialog_takes_a_press_outside_the_dialog(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        dropdown_item_outside_the_dialog(DialogKind::Popover(70), Some(90), "plain", cx);
+    }
+    #[gpui::test]
+    fn a_submenu_of_a_dropdown_takes_a_press_outside_the_dialog(cx: &mut gpui::TestAppContext) {
+        dropdown_item_outside_the_dialog(DialogKind::Popover(70), Some(90), "deep", cx);
+    }
+    #[gpui::test]
+    fn a_submenu_of_a_dropdown_over_an_overlay_dialog_takes_a_press_outside_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        dropdown_item_outside_the_dialog(DialogKind::Overlay, None, "deep", cx);
+    }
+    #[gpui::test]
+    fn a_press_outside_both_the_dialog_and_its_dropdown_still_dismisses_the_dialog(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        for kind in [DialogKind::Overlay, DialogKind::Popover(70)] {
+            let (window, dismissed, picked) = DialogHost::open(kind, false, Some(90), cx);
+            let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+            DialogHost::open_menu(window, 20., visual);
+            visual.simulate_click(point(px(5.), px(5.)), Default::default());
+            assert!(picked.borrow().is_empty());
+            assert!(
+                window
+                    .read_with(visual, |h, _| h.menu_at.is_none())
+                    .unwrap()
+            );
+            // A popover dialog sees the same press as the dropdown. An overlay's scrim is behind
+            // the dropdown's consumed press, so only the next press reaches it.
+            if matches!(kind, DialogKind::Overlay) {
+                assert_eq!(
+                    dismissed.get(),
+                    0,
+                    "the first press only closes the dropdown"
+                );
+                visual.simulate_click(point(px(5.), px(5.)), Default::default());
+            }
+            assert_eq!(dismissed.get(), 1, "the dialog's own policy still applies");
+        }
+    }
+    #[gpui::test]
+    fn a_dropdown_over_a_dialog_without_dismissal_takes_its_press_and_closes_alone(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // `busy` builds the dialog with no `on_dismiss`, so only the dropdown reacts to presses.
+        for kind in [DialogKind::Overlay, DialogKind::Popover(70)] {
+            let (window, _, picked) = DialogHost::open(kind, true, Some(90), cx);
+            let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+            let card = DialogHost::open_menu(window, 20., visual);
+            let row = visual.debug_bounds("menu-action-plain").unwrap();
+            assert!(!card.contains(&row.center()));
+            visual.simulate_click(row.center(), Default::default());
+            assert_eq!(*picked.borrow(), ["plain"]);
+            assert!(
+                window
+                    .read_with(visual, |h, _| h.menu_at.is_none())
+                    .unwrap()
+            );
+        }
+    }
+
+    /// A dialog at 100 whose content builds a popover that asks for the lower priority 70, as
+    /// the Mono background dialog's Effect list does.
+    struct NestedList {
+        picked: Rc<Cell<usize>>,
+    }
+    impl Render for NestedList {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let picked = self.picked.clone();
+            let _ = cx;
+            popover("nested-list", Anchor::Point(point(px(560.), px(240.))))
+                .priority(70)
+                .width(200.)
+                .height(60.)
+                .track(AnchorSlot::default())
+                .child(
+                    div()
+                        .id("nested-item")
+                        .debug_selector(|| "nested-item".into())
+                        .size_full()
+                        .on_click(move |_, _, _| picked.set(picked.get() + 1)),
+                )
+        }
+    }
+    struct NestedHost {
+        list: Entity<NestedList>,
+        dismissed: Rc<Cell<usize>>,
+        card: AnchorSlot,
+    }
+    impl Render for NestedHost {
+        fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let dismissed = self.dismissed.clone();
+            div()
+                .size_full()
+                .child(
+                    deferred(
+                        gpui::anchored().position(point(px(0.), px(0.))).child(
+                            div()
+                                .w(window.viewport_size().width)
+                                .h(window.viewport_size().height)
+                                .occlude(),
+                        ),
+                    )
+                    .with_priority(99),
+                )
+                .child(
+                    popover("nested-host", Anchor::Point(point(px(300.), px(200.))))
+                        .priority(100)
+                        .width(300.)
+                        .height(200.)
+                        .track(self.card.clone())
+                        .on_dismiss(move |_, _| dismissed.set(dismissed.get() + 1))
+                        .child(self.list.clone()),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn a_popover_built_inside_a_high_priority_dialog_draws_above_it_and_takes_presses(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (picked, dismissed, card) = (
+            Rc::new(Cell::new(0)),
+            Rc::new(Cell::new(0)),
+            AnchorSlot::default(),
+        );
+        let window = cx.update(|cx| {
+            let (p, d, c) = (picked.clone(), dismissed.clone(), card.clone());
+            cx.open_window(Default::default(), move |_, cx| {
+                cx.new(|cx| NestedHost {
+                    list: cx.new(|_| NestedList { picked: p }),
+                    dismissed: d,
+                    card: c,
+                })
+            })
+            .unwrap()
+        });
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let (card, item) = (
+            card.get().unwrap(),
+            visual.debug_bounds("nested-item").expect("the nested list"),
+        );
+        let at = point(item.right() - px(10.), item.center().y);
+        assert!(
+            !card.contains(&at),
+            "the press must be outside the host card"
+        );
+        visual.simulate_click(at, Default::default());
+        assert_eq!(picked.get(), 1, "the nested list takes the press");
+        assert_eq!(dismissed.get(), 0, "and the host dialog stays open");
     }
 }

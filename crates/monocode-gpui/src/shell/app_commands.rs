@@ -552,7 +552,13 @@ impl Shell {
                 let caller = call.session;
                 let request = call.request_id.clone();
                 let fingerprint = app::fingerprint(&action, &input);
-                let cloud = match cloud_api::target_from_input(&input) {
+                let cloud = match cloud_api::target_from_input(&input).and_then(|cloud| {
+                    // A new session on a workspace that is being stopped would be cut off.
+                    if let Some(target) = &cloud {
+                        self.refuse_new_session_on(target)?;
+                    }
+                    Ok(cloud)
+                }) {
                     Ok(cloud) => cloud,
                     Err(e) => {
                         self.finish_app_call(call, Err(e), cx);
@@ -670,6 +676,16 @@ impl Shell {
                             self.finish_app_call(
                                 call,
                                 Err(crate::conversation::MOVE_PAUSED.into()),
+                                cx,
+                            );
+                            return;
+                        }
+                        if matches!(action.as_str(), "sessions.send" | "sessions.draft")
+                            && view.read(cx).auto_stopping
+                        {
+                            self.finish_app_call(
+                                call,
+                                Err(crate::conversation::AUTO_STOPPING.into()),
                                 cx,
                             );
                             return;

@@ -8,7 +8,7 @@
 //! emptied after a success, on Cancel and when the section is left. It is never put in an
 //! error, a log line or the rendered page.
 use crate::{
-    cloud_dialog_ui::{field_box, labelled, muted},
+    cloud_dialog_ui::{external_link, field_box, labelled, muted},
     input::{self, Input},
     runtime::{Database, locked},
     settings::{
@@ -1013,28 +1013,13 @@ impl SettingsView {
                                 .flex_col()
                                 .child(
                                     muted("Create one at").flex().flex_wrap().gap_x_1().child(
-                                        div()
-                                            .id("docker-token-link")
-                                            .debug_selector(|| "docker-token-link".into())
-                                            .role(Role::Link)
-                                            .aria_label("Open the Docker token page")
-                                            .track_focus(&link_focus)
-                                            .tab_index(0)
-                                            .text_color(content(0.7))
-                                            .underline()
-                                            .cursor_pointer()
-                                            .hover(|s| s.text_color(content(1.)))
-                                            .child(TOKEN_LINK_TEXT)
-                                            .on_click(|_, _, cx| cx.open_url(TOKEN_URL))
-                                            .on_key_down(|event, _, cx| {
-                                                if matches!(
-                                                    event.keystroke.key.as_str(),
-                                                    "enter" | "space"
-                                                ) {
-                                                    cx.open_url(TOKEN_URL);
-                                                    cx.stop_propagation();
-                                                }
-                                            }),
+                                        external_link(
+                                            "docker-token-link",
+                                            "Open the Docker token page",
+                                            TOKEN_URL,
+                                            &link_focus,
+                                        )
+                                        .child(TOKEN_LINK_TEXT),
                                     ),
                                 )
                                 .child(muted(HINT)),

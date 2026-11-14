@@ -159,7 +159,7 @@ impl RenderCache {
             source.clone()
         };
         let inline = match &row.part {
-            Part::Text { runs, heading } if !runs.iter().any(|run| run.style.code) => {
+            Part::Text { runs, heading } if !super::needs_rich(runs) => {
                 Some(PreparedInline::new(runs, *heading > 0))
             }
             _ => None,

@@ -1319,13 +1319,32 @@ pub fn run_with_controls(
 
 /// A bounded, separate conversation for titles and other background text work.
 /// Never resume the user's conversation or inherit its app capabilities/tools.
-pub fn run_text(mut request: Request, cancel: Arc<AtomicBool>) -> Result<String, String> {
+pub fn run_text(request: Request, cancel: Arc<AtomicBool>) -> Result<String, String> {
+    run_text_inner(request, Vec::new(), cancel)
+}
+
+/// Like [`run_text`], but attaches `images` to the one prompt. Still a separate text-only,
+/// read-only conversation without tools; a model that cannot read images fails the call.
+pub fn run_text_with_images(
+    request: Request,
+    images: Vec<PathBuf>,
+    cancel: Arc<AtomicBool>,
+) -> Result<String, String> {
+    run_text_inner(request, images, cancel)
+}
+
+fn run_text_inner(
+    mut request: Request,
+    attachments: Vec<PathBuf>,
+    cancel: Arc<AtomicBool>,
+) -> Result<String, String> {
     request.provider_id = None;
     request.settings = Settings {
         account: request.settings.account.clone(),
         text_only: true,
         access: AccessMode::ReadOnly,
         effort: (request.kind == Kind::Codex).then(|| "low".into()),
+        attachments,
         ..Default::default()
     };
     let mut output = String::new();

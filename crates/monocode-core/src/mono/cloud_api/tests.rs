@@ -47,6 +47,16 @@ impl GhRunner for FakeGh {
             .iter()
             .find(|(key, _)| line.contains(key.as_str()))
             .map(|(_, reply)| reply.clone())
+            // An unscripted machine-types lookup fails, so the static default machine stays.
+            .or_else(|| {
+                line.contains("/codespaces/machines").then(|| {
+                    Ok(GhOutput {
+                        success: false,
+                        stdout: String::new(),
+                        stderr: "HTTP 404".into(),
+                    })
+                })
+            })
             .unwrap_or_else(|| panic!("unexpected gh call: {line}"))
     }
 }
@@ -1268,7 +1278,7 @@ fn a_starting_session_is_listed_as_starting_and_refuses_sends() {
         .api
         .begin_start(&fx.path(), cs("octo-abc"), "claude")
         .unwrap();
-    let CloudStart::Pending(session, record) = start.clone() else {
+    let CloudStart::Pending(session, record, _) = start.clone() else {
         panic!("a codespace start is pending")
     };
     assert_eq!(start.cloud_ref(), CloudRef::codespace("octo-abc"));
@@ -1487,7 +1497,7 @@ fn a_failed_sandbox_start_names_the_sandbox_and_keeps_it_reachable() {
             "claude",
         )
         .unwrap();
-    let CloudStart::Pending(session, record) = &start else {
+    let CloudStart::Pending(session, record, _) = &start else {
         panic!("a new sandbox start is pending")
     };
     // The record is a sandbox one: no codespace name, created.
@@ -1738,7 +1748,7 @@ fn kit_none_marks_the_pending_start_so_no_kit_is_sent() {
     let fx = fixture(&gh);
     let new = || start_target(CloudBackendKind::Codespaces, InstanceChoice::New);
     // The default leaves the user's choice alone.
-    let CloudStart::Pending(session, record) =
+    let CloudStart::Pending(session, record, _) =
         fx.api.begin_start(&fx.path(), new(), "claude").unwrap()
     else {
         panic!("not pending");
@@ -1752,7 +1762,7 @@ fn kit_none_marks_the_pending_start_so_no_kit_is_sent() {
     // `kit: "none"` turns it off for this start, in the answer and in the stored record.
     let mut target = new();
     target.kit = ApiKit::None;
-    let CloudStart::Pending(session, record) =
+    let CloudStart::Pending(session, record, _) =
         fx.api.begin_start(&fx.path(), target, "claude").unwrap()
     else {
         panic!("not pending");
@@ -1840,6 +1850,75 @@ fn starting_a_codespace_session_resolves_every_instance_form() {
         .is_err());
 }
 
+/// GitHub's machine list for a repository whose devcontainer asks for 4 cores.
+const ONLY_STANDARD: &str = r#"{"total_count":1,"machines":[{"name":"standardLinux32gb","display_name":"4 cores, 16 GB RAM","cpus":4,"memory_in_bytes":17179869184}]}"#;
+
+#[test]
+fn a_new_codespace_without_a_machine_gets_one_the_repository_allows() {
+    // sessions.start {kind:"codespace",instance:"new"}, machine omitted.
+    let gh = FakeGh::new(vec![
+        ("auth status", ok(AUTH_OK)),
+        ("codespaces/machines?ref=trunk", ok(ONLY_STANDARD)),
+        (
+            "--method POST",
+            ok(r#"{"name":"octo-new1","state":"Provisioning"}"#),
+        ),
+    ]);
+    let fx = fixture(&gh);
+    let target = start_target(CloudBackendKind::Codespaces, InstanceChoice::New);
+    fx.api.begin_start(&fx.path(), target, "claude").unwrap();
+    let calls = gh.calls();
+    let post = calls.iter().find(|c| c.contains("--method POST")).unwrap();
+    assert!(post.contains("machine=standardLinux32gb"), "{post}");
+    assert!(!post.contains("basicLinux32gb"), "{post}");
+    // cloud.create, machine omitted: the same choice (asked again only for another branch).
+    let gh = FakeGh::new(vec![
+        ("auth status", ok(AUTH_OK)),
+        ("codespaces/machines?ref=feat", ok(ONLY_STANDARD)),
+        ("codespace create", ok("octo-new2\n")),
+        ("codespace view", ok(r#"{"state":"Available"}"#)),
+    ]);
+    let fx = fixture(&gh);
+    fx.api
+        .create(
+            &fx.path(),
+            &json!({"kind":"codespace","branch":"feat"}),
+            &mut |_| {},
+        )
+        .unwrap();
+    let calls = gh.calls();
+    let create = calls
+        .iter()
+        .find(|c| c.contains("codespace create"))
+        .unwrap();
+    assert!(create.contains("--machine standardLinux32gb"), "{create}");
+}
+
+#[test]
+fn a_failed_machine_lookup_keeps_the_documented_default() {
+    let gh = FakeGh::new(vec![
+        ("auth status", ok(AUTH_OK)),
+        (
+            "codespaces/machines",
+            Ok(GhOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: "HTTP 403: Resource not accessible by integration".into(),
+            }),
+        ),
+        (
+            "--method POST",
+            ok(r#"{"name":"octo-new1","state":"Provisioning"}"#),
+        ),
+    ]);
+    let fx = fixture(&gh);
+    let target = start_target(CloudBackendKind::Codespaces, InstanceChoice::New);
+    fx.api.begin_start(&fx.path(), target, "claude").unwrap();
+    let calls = gh.calls();
+    let post = calls.iter().find(|c| c.contains("--method POST")).unwrap();
+    assert!(post.contains("machine=basicLinux32gb"), "{post}");
+}
+
 #[test]
 fn starting_a_new_sandbox_uses_the_project_config_and_overrides() {
     let gh = FakeGh::new(vec![]);
@@ -1850,7 +1929,7 @@ fn starting_a_new_sandbox_uses_the_project_config_and_overrides() {
     assert!(error.contains("not set up for this project"), "{error}");
     fx.save_docker_config();
     let start = fx.api.begin_start(&fx.path(), new(), "claude").unwrap();
-    let CloudStart::Pending(session, record) = &start else {
+    let CloudStart::Pending(session, record, _) = &start else {
         panic!("a new sandbox start is pending")
     };
     assert_eq!(start.cloud_ref().kind, CloudBackendKind::DockerSandbox);
@@ -1905,6 +1984,78 @@ fn starting_a_new_sandbox_uses_the_project_config_and_overrides() {
     assert_eq!(fx.sbx.count("create"), creates);
     // Claude only.
     assert!(fx.api.begin_start(&fx.path(), new(), "codex").is_err());
+}
+
+#[test]
+fn a_new_sandbox_gets_a_size_the_devcontainer_and_sbx_allow() {
+    let gh = FakeGh::new(vec![]);
+    let fx = fixture(&gh);
+    fx.save_docker_config();
+    let new = || start_target(CloudBackendKind::DockerSandbox, InstanceChoice::New);
+    let size_of = |start: &CloudStart| {
+        let config = &start
+            .record()
+            .unwrap()
+            .sandbox_start
+            .as_ref()
+            .unwrap()
+            .config;
+        (config.cpus, config.memory.clone())
+    };
+    // A lone cpus takes its shape's memory: 4 CPUs / 8g, not 4 CPUs with the saved 4g
+    // (which sbx refuses at create).
+    let mut target = new();
+    target.options.insert("cpus".into(), json!(4));
+    let start = fx.api.begin_start(&fx.path(), target, "claude").unwrap();
+    assert_eq!(size_of(&start), (4, "8g".to_string()));
+    assert_eq!(start.note(), None);
+    let mut target = new();
+    target.options.insert("memory".into(), json!("16g"));
+    let start = fx.api.begin_start(&fx.path(), target, "claude").unwrap();
+    assert_eq!(size_of(&start), (8, "16g".to_string()));
+    // A pair that is not a shape is refused before anything is created, naming the shapes.
+    let creates = fx.sbx.count("create");
+    let mut target = new();
+    target.options.insert("cpus".into(), json!(4));
+    target.options.insert("memory".into(), json!("4g"));
+    let error = fx
+        .api
+        .begin_start(&fx.path(), target, "claude")
+        .unwrap_err();
+    assert!(error.contains("2 CPU / 4g, 4 CPU / 8g"), "{error}");
+    assert_eq!(fx.sbx.count("create"), creates);
+    // The project's devcontainer asks for 4 CPUs and 8 GB: the saved 2 CPUs / 4g is raised
+    // for this start and the caller is told, in the note and in the size of the start.
+    let devcontainer = |text: &str| {
+        let dir = std::path::Path::new(&fx.path()).join(".devcontainer");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("devcontainer.json"), text).unwrap();
+    };
+    devcontainer(
+        r#"{ // JSONC
+          "hostRequirements": {"cpus": 4, "memory": "8gib"},
+        }"#,
+    );
+    let start = fx.api.begin_start(&fx.path(), new(), "claude").unwrap();
+    assert_eq!(size_of(&start), (4, "8g".to_string()));
+    let note = start.note().expect("the raise is reported");
+    assert!(note.contains("asks for 4 CPUs and 8 GB"), "{note}");
+    assert!(note.contains("raised 2 CPU / 4g to 4 CPU / 8g"), "{note}");
+    let stored = crate::cloud_sessions::docker_config::load(&fx.store.lock().unwrap(), &fx.path())
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.cpus, 2, "the project config is untouched");
+    // A requirement above the cap (16 CPUs) is never billed unasked: the saved size stays.
+    devcontainer(r#"{"hostRequirements": {"cpus": 16}}"#);
+    let start = fx.api.begin_start(&fx.path(), new(), "claude").unwrap();
+    assert_eq!(size_of(&start), (2, "4g".to_string()));
+    assert!(start.note().unwrap().contains("asks for 16 CPUs"));
+    // Naming a size is the caller's choice: used as it is, whatever the devcontainer asks.
+    let mut target = new();
+    target.options.insert("cpus".into(), json!(1));
+    let start = fx.api.begin_start(&fx.path(), target, "claude").unwrap();
+    assert_eq!(size_of(&start), (1, "2g".to_string()));
+    assert_eq!(start.note(), None);
 }
 
 #[test]

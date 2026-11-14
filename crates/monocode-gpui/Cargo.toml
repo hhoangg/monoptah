@@ -106,10 +106,18 @@ gpui-pre-linux = { path = "../../vendor/gpui-pre-linux" }
 gpui-pre-macos = { path = "../../vendor/gpui-pre-macos" }
 gpui-pre-windows = { path = "../../vendor/gpui-pre-windows" }
 
+# Local test and dev builds. `debug = 0` keeps compile and link time low (no
+# debuginfo for any crate, and cargo then strips the std debuginfo too).
+# Incremental compilation only applies to local crates (the workspace members
+# and the vendor/gpui-pre* path patches), not to crates.io ones: after editing
+# one file of monocode-gpui, `cargo test --no-run` took about 17s instead of
+# about 3 minutes. It costs several GB of target/native-dev/incremental. CI
+# turns it off with CARGO_INCREMENTAL=0 (set in native.yml and by
+# dtolnay/rust-toolchain), where every build starts from a cache restore.
 [profile.native-dev]
 inherits = "dev"
 debug = 0
-incremental = false
+incremental = true
 
 [profile.native-dev.package."*"]
 opt-level = 1

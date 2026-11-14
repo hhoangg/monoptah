@@ -219,7 +219,7 @@ impl Shell {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn cloud_modal_sized(
+    pub(super) fn cloud_modal_sized(
         &self,
         id: &'static str,
         view: impl Into<AnyView>,

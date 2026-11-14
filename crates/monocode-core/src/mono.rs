@@ -6,6 +6,7 @@ pub mod bridge;
 pub mod cards;
 pub mod cloud_api;
 mod desktop;
+pub mod emoji;
 pub mod files;
 pub mod habit_yaml;
 #[cfg(test)]
@@ -73,6 +74,9 @@ pub struct Mono {
     /// The model and effort for sessions it starts without naming any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subsessions: Option<Subsessions>,
+    /// The switch, frequency and selected packs of the shared emoji library.
+    #[serde(skip_serializing_if = "emoji::MonoEmoji::is_default")]
+    pub emoji: emoji::MonoEmoji,
 }
 
 /// What a Mono's sessions start with when it names no provider, model or
@@ -142,6 +146,7 @@ impl Default for Mono {
             seen_rows: 0,
             heartbeat_minutes: heartbeat::DEFAULT_MINUTES,
             subsessions: None,
+            emoji: emoji::MonoEmoji::default(),
         }
     }
 }
@@ -427,14 +432,18 @@ pub fn context(
     files: &files::AgentFiles,
     executable: &Path,
     rules_in_system: bool,
+    emoji: Option<&str>,
 ) -> String {
+    let emoji = emoji
+        .map(|block| format!("\n\n{block}"))
+        .unwrap_or_default();
     let rules = if rules_in_system {
         String::new()
     } else {
         format!("{}\n\n", instructions(mono, executable))
     };
     format!(
-        "<monocode_context>\nMonoptah adds this context, not the user. Act on it without quoting or describing it.\n\n{rules}<soul>\n{}\n</soul>\n\n<memory>\n{}\nTopic notes: {}\n</memory>\n</monocode_context>",
+        "<monocode_context>\nMonoptah adds this context, not the user. Act on it without quoting or describing it.\n\n{rules}<soul>\n{}\n</soul>\n\n<memory>\n{}\nTopic notes: {}\n</memory>{emoji}\n</monocode_context>",
         files.soul.as_deref().unwrap_or_default(),
         memory::within_budget(&files.memory),
         files.topics.join(", "),

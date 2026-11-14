@@ -197,7 +197,7 @@ impl TranscriptView {
     }
     /// Put an older page above the loaded rows. Every view row index moves
     /// down by the page; store rows keep their numbers through `base`.
-    fn prepend_history(
+    pub(super) fn prepend_history(
         &mut self,
         page: HistoryPage,
         parsers: HashMap<usize, MarkdownParser>,

@@ -250,12 +250,20 @@ impl CloudProvider for CodespaceProvider {
         let text = |key: &str| input.get(key).and_then(Value::as_str);
         let branch = self.default_branch(project, text("branch"))?;
         let config = self.cloud.codespace_project_config(project);
+        // A machine named in the request is used as is. None named: the project's saved machine
+        // while the repository allows it on that branch, else the smallest allowed machine.
+        let machine = match text("machine").map(str::trim).filter(|m| !m.is_empty()) {
+            Some(machine) => machine.to_owned(),
+            None => self
+                .cloud
+                .pick_machine(&repo, Some(&branch), config.machine.as_deref()),
+        };
         let name = codespaces::create(
             &*self.gh,
             &repo,
             &branch,
             &codespaces::CreateOptions {
-                machine: text("machine").or(config.machine.as_deref()),
+                machine: Some(&machine),
                 idle_timeout_minutes: Some(config.idle_timeout_minutes),
                 devcontainer_path: Some(config.devcontainer_path.as_str()),
             },
@@ -311,7 +319,7 @@ impl CloudProvider for CodespaceProvider {
         let (session, record) = self
             .cloud
             .begin_start_with_kit(project, target, harness, kit)?;
-        Ok(CloudStart::Pending(session, record))
+        Ok(CloudStart::Pending(session, record, None))
     }
 
     /// A codespace created here is never deleted on failure; the error names it so the caller

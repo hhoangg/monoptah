@@ -34,6 +34,8 @@ struct SandboxPicker {
     instances: Option<Vec<ProjectInstance>>,
     busy: bool,
     error: String,
+    /// Workspaces the shell is stopping right now: none of them takes a new session.
+    stopping: super::cloud_auto_stop::StoppingWorkspaces,
     focus: FocusHandle,
 }
 impl EventEmitter<Picked> for SandboxPicker {}
@@ -44,13 +46,19 @@ impl Focusable for SandboxPicker {
 }
 
 impl SandboxPicker {
-    fn new(cloud: Arc<CloudSessions>, local_project: String, cx: &mut Context<Self>) -> Self {
+    fn new(
+        cloud: Arc<CloudSessions>,
+        local_project: String,
+        stopping: super::cloud_auto_stop::StoppingWorkspaces,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut this = Self {
             cloud,
             local_project,
             instances: None,
             busy: false,
             error: String::new(),
+            stopping,
             focus: cx.focus_handle(),
         };
         this.load(cx);
@@ -82,11 +90,17 @@ impl SandboxPicker {
         if self.busy {
             return;
         }
+        let target = CloudRef::sandbox(&name);
+        // Read now, at the click: a stop that began a moment ago holds this sandbox.
+        if let Err(error) = self.stopping.refuse_new_session(&target) {
+            self.error = error;
+            cx.notify();
+            return;
+        }
         self.busy = true;
         self.error.clear();
         let cloud = self.cloud.clone();
         let project = self.local_project.clone();
-        let target = CloudRef::sandbox(&name);
         let work = {
             let target = target.clone();
             cx.background_executor()
@@ -278,7 +292,14 @@ impl Shell {
         self.close_menu(cx);
         self.close_preview(cx);
         let picked_project = project.clone();
-        let picker = cx.new(|cx| SandboxPicker::new(self.cloud.clone(), project, cx));
+        let picker = cx.new(|cx| {
+            SandboxPicker::new(
+                self.cloud.clone(),
+                project,
+                self.auto_stop_running.clone(),
+                cx,
+            )
+        });
         let events = cx.subscribe_in(
             &picker,
             window,
@@ -405,6 +426,16 @@ impl Shell {
         if let Some(open) = &self.sandbox_picker {
             open.picker.update(cx, |picker, _| picker.busy = busy);
         }
+    }
+
+    /// Clicks the sandbox `name` in the open picker; what the picker shows as its error (tests).
+    #[cfg(test)]
+    pub(super) fn pick_sandbox_for_test(&self, name: &str, cx: &mut App) -> Option<String> {
+        let open = self.sandbox_picker.as_ref()?;
+        open.picker.update(cx, |picker, cx| {
+            picker.start(name.to_owned(), cx);
+            (!picker.error.is_empty()).then(|| picker.error.clone())
+        })
     }
 
     /// The sandboxes the open picker lists, by name (tests).

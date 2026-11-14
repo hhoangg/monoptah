@@ -23,6 +23,7 @@ pub(super) enum SettingsSection {
     General,
     Soul,
     Memory,
+    Emoji,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Route {
@@ -87,7 +88,7 @@ pub(super) fn button(
         .hover(|s| s.bg(content(0.08)).text_color(content(1.)))
         .child(label)
 }
-fn setting(label: &str, description: Option<&str>, control: AnyElement) -> Div {
+pub(super) fn setting(label: &str, description: Option<&str>, control: AnyElement) -> Div {
     div()
         .min_h(px(48.))
         .flex()
@@ -129,7 +130,12 @@ fn setting(label: &str, description: Option<&str>, control: AnyElement) -> Div {
                 .child(control),
         )
 }
-fn switch_setting(label: &str, description: &str, disabled: bool, control: AnyElement) -> Div {
+pub(super) fn switch_setting(
+    label: &str,
+    description: &str,
+    disabled: bool,
+    control: AnyElement,
+) -> Div {
     div()
         .flex()
         .items_center()
@@ -159,7 +165,32 @@ fn switch_setting(label: &str, description: &str, disabled: bool, control: AnyEl
         )
         .child(control)
 }
-fn heading(title: &str, description: Option<&str>) -> Div {
+/// The 36 x 20 switch every settings page draws; the caller adds the click.
+pub(super) fn switch_track(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<SharedString>,
+    on: bool,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .role(Role::Switch)
+        .aria_label(label)
+        .aria_selected(on)
+        .w(px(36.))
+        .h(px(20.))
+        .flex_shrink_0()
+        .rounded_full()
+        .bg(if on { accent_color() } else { content(0.2) })
+        .child(
+            div()
+                .size(px(16.))
+                .mt(px(2.))
+                .ml(px(if on { 18. } else { 2. }))
+                .rounded_full()
+                .bg(gpui::white()),
+        )
+}
+pub(super) fn heading(title: &str, description: Option<&str>) -> Div {
     div()
         .pt_7()
         .pb_2()
@@ -359,16 +390,7 @@ fn sub_agent_card(agent: SubAgent) -> Stateful<Div> {
             ),
     )
 }
-fn card() -> Div {
-    div()
-        .rounded_xl()
-        .border_1()
-        .border_color(content(0.04))
-        .overflow_hidden()
-        .bg(content(0.02))
-        .flex()
-        .flex_col()
-}
+pub(super) use crate::emoji_library::card;
 /// MonoOverview's search row above the Sessions, Habits and Documents lists.
 pub(super) fn search_bar(field: Entity<Input>) -> Div {
     div()
@@ -969,6 +991,7 @@ impl Monos {
                     .debug_selector(|| "mono-settings".into())
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.settings = Some(SettingsSection::General);
+                        this.note_settings_model(cx);
                         window.focus(&this.settings_focus, cx);
                         this.reload_files(&id, cx);
                         cx.notify();
@@ -1656,6 +1679,7 @@ impl Monos {
             SettingsSection::General => self.general_settings(mono, window, cx),
             SettingsSection::Soul => self.soul_page(mono, cx),
             SettingsSection::Memory => self.memory_page(mono, window, cx),
+            SettingsSection::Emoji => self.emoji_page(mono, window, cx),
         };
         self.bind_settings_blurs(window, cx);
         let weak = cx.weak_entity();
@@ -1740,6 +1764,7 @@ impl Monos {
                                             (SettingsSection::General, "General", "settings"),
                                             (SettingsSection::Soul, "Soul", "sparkles"),
                                             (SettingsSection::Memory, "Memory", "sticky-note"),
+                                            (SettingsSection::Emoji, "Emoji", "smile"),
                                         ]
                                         .into_iter()
                                         .map(
@@ -1812,6 +1837,7 @@ impl Monos {
                                                         move |this, _, window, cx| {
                                                             this.save_open_file(cx);
                                                             this.settings = Some(tab);
+                                                            this.note_settings_model(cx);
                                                             window.focus(&this.settings_focus, cx);
                                                             cx.notify();
                                                         },
@@ -1924,7 +1950,7 @@ impl Monos {
             .child(heading("Model", None))
             .child(card()
                 .child(setting("Model",Some("What it thinks and replies with."),
-                    div().id("mono-settings-model").role(Role::Button).aria_label(format!("Choose model, {model}"))
+                    div().id("mono-settings-model").debug_selector(||"mono-settings-model".into()).role(Role::Button).aria_label(format!("Choose model, {model}"))
                         .h(px(28.)).px_1p5().mx(px(-6.)).rounded_md().flex().items_center().gap_2()
                         .text_size(px(12.)).text_color(content(0.85)).hover(|s|s.bg(content(0.06)))
                         .child(self.model_anchor.probe()).child(provider_icon(&provider,14.)).child(model)
@@ -1935,16 +1961,16 @@ impl Monos {
                     let value=option.value.clone().unwrap_or_else(||if option.checked {"On"}else{"Off"}.into());
                     let anchor=AnchorSlot::default(); let probe=anchor.probe();
                     Some(setting(&label,None,
-                        plain(SharedString::from(format!("mono-option-{}",option.id)),value).child(probe)
+                        plain(SharedString::from(format!("mono-option-{}",option.id)),value).debug_selector({let id=format!("mono-option-{}",option.id); move||id.clone()}).child(probe)
                             .on_click(cx.listener(move |this,_,w,cx| {
                                 if option.submenu.is_empty() {
-                                    if let Some(chat)=this.chat() && let Err(e)=chat.update(cx,|v,cx|v.mono_pick_model_option(&option.id,cx)) { this.error=Some(e); }
+                                    if let Some(chat)=this.chat() { chat.update(cx,|v,cx|v.mono_pick_model_option(&option.id,cx)); }
                                     this.changed(cx);
                                 } else { this.open_model_option(option.label.clone(),option.submenu.clone(),anchor.clone(),w,cx); }
                             })).into_any_element()).border_t_1().border_color(content(0.04)))
                 }))
                 .child(setting("Permissions",Some("What it may do without asking."),
-                    div().id("mono-settings-access").role(Role::Button).aria_label(format!("Permissions, {}",mode.label()))
+                    div().id("mono-settings-access").debug_selector(||"mono-settings-access".into()).role(Role::Button).aria_label(format!("Permissions, {}",mode.label()))
                         .h(px(28.)).max_w(px(208.)).px_1p5().mx(px(-6.)).rounded_md().flex().items_center().gap_2()
                         .text_size(px(12.)).text_color(content(0.85)).hover(|s|s.bg(content(0.06)))
                         .child(self.access_anchor.probe()).child(icon(access_icon,14.).when(mode==AccessMode::FullAccess,|i|i.text_color(rgb(0xffb900))))
@@ -2057,24 +2083,7 @@ impl Monos {
         change: fn(&mut Mono, bool),
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        div()
-            .id(id)
-            .role(Role::Switch)
-            .aria_label(id)
-            .aria_selected(on)
-            .w(px(36.))
-            .h(px(20.))
-            .flex_shrink_0()
-            .rounded_full()
-            .bg(if on { accent_color() } else { content(0.2) })
-            .child(
-                div()
-                    .size(px(16.))
-                    .mt(px(2.))
-                    .ml(px(if on { 18. } else { 2. }))
-                    .rounded_full()
-                    .bg(gpui::white()),
-            )
+        switch_track(id, id, on)
             .on_click(cx.listener(move |this, _, _, cx| {
                 if disabled {
                     return;
@@ -2433,9 +2442,8 @@ impl Monos {
         let picked = cx.subscribe(&menu, |this, _, event: &MenuEvent, cx| {
             if let MenuEvent::Picked(id, _) = event
                 && let Some(chat) = this.chat()
-                && let Err(e) = chat.update(cx, |v, cx| v.mono_pick_model_option(id, cx))
             {
-                this.error = Some(e);
+                chat.update(cx, |v, cx| v.mono_pick_model_option(id, cx));
             }
             this.picker = None;
             this.changed(cx);

@@ -1664,10 +1664,12 @@ impl Monos {
                         settings.internal_message = true;
                         settings.mono = None;
                         settings.environment.clear();
+                        let mono_id = mono.id.clone();
                         view.update(cx, |v, cx| {
                             v.install_transfer(settings, None, cx);
                             v.configure_mono(mono, root, env, cx);
                         });
+                        this.push_emoji(&mono_id, &view, cx);
                         this.observations.push(
                             cx.subscribe(&view, move |this, _, _: &SessionChanged, cx| {
                                 this.habit_changed(session, cx)

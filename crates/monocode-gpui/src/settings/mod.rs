@@ -222,6 +222,8 @@ pub(crate) struct SettingsView {
     notification_state: notification_preferences::State,
     ctx: SettingsContext,
     focus: FocusHandle,
+    /// A page change dropped an import dialog: focus returns here if it was lost with it.
+    refocus: bool,
     scroll: ScrollHandle,
     /// The row or group search just landed on, flashing for 1.8s.
     revealed: Option<String>,
@@ -282,6 +284,8 @@ pub(crate) struct SettingsView {
     mobile: pages::MobileState,
     ticket_scoring: pages::ScoringState,
     cloud: pages::CloudState,
+    /// The emoji library page of the Monos section, once the app has installed the library.
+    emoji_library: Option<Entity<crate::emoji_library::EmojiLibraryView>>,
     _subscriptions: Vec<Subscription>,
 }
 impl EventEmitter<SettingsEvent> for SettingsView {}
@@ -374,12 +378,15 @@ impl SettingsView {
             });
         }));
         let selected_project = ctx.cwd.clone();
+        let emoji_library = crate::emoji_library::get(cx)
+            .map(|store| cx.new(|cx| crate::emoji_library::EmojiLibraryView::new(store, cx)));
         let mut this = Self {
             section,
             prefs,
             notification_state: notification_preferences::State::default(),
             ctx,
             focus: cx.focus_handle(),
+            refocus: false,
             scroll: ScrollHandle::new(),
             revealed: None,
             pending_scroll: false,
@@ -435,6 +442,7 @@ impl SettingsView {
             mobile: pages::MobileState::default(),
             ticket_scoring: pages::ScoringState::default(),
             cloud: pages::CloudState::default(),
+            emoji_library,
             _subscriptions: subscriptions,
         };
         this.watch_mobile(cx);
@@ -511,6 +519,14 @@ impl SettingsView {
             if self.section == Section::Cloud {
                 self.leave_cloud(cx);
             }
+            // An import dialog does not keep running on a page that is not shown.
+            if self.section == Section::Monos
+                && let Some(library) = self.emoji_library.clone()
+            {
+                let abandoned = library.update(cx, |library, cx| library.abandon_import(cx));
+                // The dialog's focus handle goes with it; the next frame puts focus back.
+                self.refocus = self.refocus || abandoned;
+            }
             self.management = None;
             self.selected_trees.clear();
             self.management_generation += 1;
@@ -537,6 +553,11 @@ impl SettingsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if let Some(library) = self.emoji_library.clone()
+            && library.update(cx, |library, cx| library.dismiss(window, cx))
+        {
+            return true;
+        }
         if self.dismiss_fix(window, cx) {
             return true;
         }
@@ -598,11 +619,15 @@ impl SettingsView {
             self.select_section(result.section, cx);
             cx.emit(SettingsEvent::Section(result.section));
         }
-        self.revealed = result.setting.map(str::to_owned);
-        self.pending_scroll = self.revealed.is_some();
         self.search_query.clear();
         self.search
             .update(cx, |input, cx| input.set_text(String::new(), cx));
+        self.reveal_setting(result.setting.map(str::to_owned), cx);
+    }
+    /// Scroll to a row or group and flash it for 1.8s.
+    fn reveal_setting(&mut self, setting: Option<String>, cx: &mut Context<Self>) {
+        self.revealed = setting;
+        self.pending_scroll = self.revealed.is_some();
         self._reveal = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(1800))
@@ -614,6 +639,17 @@ impl SettingsView {
             });
         }));
         cx.notify();
+    }
+    #[cfg(test)]
+    pub(crate) fn emoji_library_view(
+        &self,
+    ) -> Option<Entity<crate::emoji_library::EmojiLibraryView>> {
+        self.emoji_library.clone()
+    }
+    /// Settings > Monos > Emoji: the Monos page, scrolled to the emoji library.
+    pub(crate) fn show_emoji_library(&mut self, cx: &mut Context<Self>) {
+        self.select_section(Section::Monos, cx);
+        self.reveal_setting(Some(pages::EMOJI_LIBRARY.to_owned()), cx);
     }
     /// Centre the revealed row in the page once it has been laid out.
     fn scroll_to_revealed(&mut self) {
@@ -1113,6 +1149,9 @@ impl Render for SettingsView {
                     cx.notify();
                 });
             });
+        }
+        if std::mem::take(&mut self.refocus) && !self.focus.contains_focused(window, cx) {
+            window.focus(&self.focus, cx);
         }
         self.notification_window_state(window, cx);
         self.connections_window_state(window, cx);

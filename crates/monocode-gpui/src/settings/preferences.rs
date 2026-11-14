@@ -131,6 +131,9 @@ pub(crate) struct Preferences {
     /// The one global kit: item ids only, never values.
     #[serde(rename = "cloudKit")]
     pub cloud_kit: CloudKitPrefs,
+    /// Stop (never delete) idle or unused cloud workspaces, per backend.
+    #[serde(rename = "cloudAutoStop")]
+    pub cloud_auto_stop: monocode_core::cloud_sessions::auto_stop::AutoStopPrefs,
 }
 
 pub(crate) const UI_SCALE_PERCENTS: [u32; 16] = [
@@ -217,6 +220,7 @@ impl Default for Preferences {
             show_archived: false,
             keybindings: HashMap::new(),
             cloud_kit: CloudKitPrefs::default(),
+            cloud_auto_stop: Default::default(),
         }
     }
 }

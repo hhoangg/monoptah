@@ -24,7 +24,8 @@ for line in sys.stdin:
         send({{'id':2,'result':{{'thread':{{'id':'fresh-text-thread'}}}}}})
     elif value.get('id') == 3:
         assert value['params']['threadId'] == 'fresh-text-thread'
-        assert len(value['params']['input']) == 1
+        open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'input.json'), 'w').write(json.dumps(value['params']['input']))
+        assert mode == 'images' or len(value['params']['input']) == 1
         if mode == 'cancel':
             time.sleep(10)
         elif mode == 'tool':
@@ -79,4 +80,36 @@ fn background_titles_reject_tools_and_reap_on_cancellation() {
     thread::sleep(Duration::from_millis(150));
     cancel.store(true, Ordering::Relaxed);
     assert!(task.join().unwrap().unwrap_err().contains("Stopped"));
+}
+
+fn sent_input(dir: &tempfile::TempDir) -> Vec<serde_json::Value> {
+    let raw = std::fs::read_to_string(dir.path().join("input.json")).unwrap();
+    serde_json::from_str(&raw).unwrap()
+}
+
+#[test]
+fn text_with_images_sends_one_local_image_per_path_and_plain_text_sends_none() {
+    let (dir, request) = fixture("images");
+    let images = vec![dir.path().join("e01.png"), dir.path().join("e02.png")];
+    run_text_with_images(request, images.clone(), Arc::new(AtomicBool::new(false))).unwrap();
+    let input = sent_input(&dir);
+    let sent: Vec<&str> = input
+        .iter()
+        .filter(|item| item["type"] == "localImage")
+        .map(|item| item["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        sent,
+        images
+            .iter()
+            .map(|p| p.to_str().unwrap())
+            .collect::<Vec<_>>()
+    );
+    assert!(input.iter().any(|item| item["type"] == "text"));
+
+    let (dir, request) = fixture("images");
+    run_text(request, Arc::new(AtomicBool::new(false))).unwrap();
+    let input = sent_input(&dir);
+    assert!(input.iter().all(|item| item["type"] != "localImage"));
+    assert!(input.iter().any(|item| item["type"] == "text"));
 }

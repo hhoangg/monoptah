@@ -312,8 +312,17 @@ pub(super) fn setup(cx: &mut TestAppContext) -> Setup {
 }
 /// `shared` opens the desktop database layout the app uses, not the legacy native one.
 pub(super) fn setup_with(cx: &mut TestAppContext, shared: bool) -> Setup {
+    setup_prepared(cx, shared, |_| {})
+}
+/// `setup_with`, after `prepare` ran on the data folder and before the app starts.
+pub(super) fn setup_prepared(
+    cx: &mut TestAppContext,
+    shared: bool,
+    prepare: impl FnOnce(&std::path::Path),
+) -> Setup {
     let dir = std::env::temp_dir().join(format!("native-monos-{}", mono::new_id()));
     std::fs::create_dir_all(&dir).unwrap();
+    prepare(&dir);
     let project = dir.to_string_lossy().to_string();
     let store = Arc::new(Mutex::new(if shared {
         Store::open_monocode(&dir.join("monocode.db")).unwrap()
@@ -443,7 +452,7 @@ fn settings_match_react_dialog_and_left_navigation_geometry(cx: &mut TestAppCont
     );
     assert!((dialog.center().x - viewport.width / 2.).abs() <= px(1.));
     assert_eq!(nav.size.width, px(192.));
-    for section in ["General", "Soul", "Memory"] {
+    for section in ["General", "Soul", "Memory", "Emoji"] {
         let row = visual
             .debug_bounds(Box::leak(
                 format!("mono-settings-{section}").into_boxed_str(),
@@ -6249,4 +6258,219 @@ fn accounts_list_returns_ids_labels_and_kinds_only(cx: &mut TestAppContext) {
                 .is_err()
         );
     }
+}
+
+/// A Mono on Codex with two models, the first with two reasoning efforts, its settings open.
+fn settings_with_models(s: &Setup, busy: bool, cx: &mut TestAppContext) {
+    let profile = s.manager.read_with(cx, |m, cx| {
+        let chat = m.chats[&s.id].read(cx);
+        chat.settings.account.clone()
+    });
+    cx.update(|cx| {
+        // Discovery does not run in tests: the list offers Default, then the recent models.
+        cx.set_global(crate::settings::Preferences {
+            recent_models: vec![crate::settings::ModelChoice {
+                provider: "codex".into(),
+                model: Some("model-b".into()),
+            }],
+            ..Default::default()
+        });
+        let mut other = catalog_model("model-b");
+        other.default = false;
+        monocode_core::catalog::seed_cached(
+            Kind::Codex,
+            &profile,
+            vec![catalog_model("model-a"), other],
+        );
+    });
+    s.manager.update(cx, |m, cx| {
+        m.chats[&s.id].update(cx, |chat, _| {
+            chat.seed_mono_model_for_test("model-a", &["low", "high"]);
+            chat.busy = busy;
+        });
+        m.settings = Some(SettingsSection::General);
+        cx.notify();
+    });
+    cx.run_until_parked();
+}
+fn mono_chat_state(
+    s: &Setup,
+    cx: &mut TestAppContext,
+) -> (Option<String>, Option<String>, AccessMode) {
+    s.manager.read_with(cx, |m, cx| {
+        let chat = m.chats[&s.id].read(cx);
+        (
+            chat.mono_model(),
+            chat.settings.effort.clone(),
+            chat.settings.access,
+        )
+    })
+}
+fn click(visual: &mut gpui::VisualTestContext, selector: &'static str) {
+    let bounds = visual
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("{selector} is not on screen"));
+    visual.simulate_click(bounds.center(), Default::default());
+    visual.run_until_parked();
+}
+fn modal_state(s: &Setup, cx: &mut gpui::VisualTestContext) -> (bool, bool, Option<String>) {
+    s.manager.read_with(cx, |m, _| {
+        (m.settings.is_some(), m.picker.is_some(), m.error.clone())
+    })
+}
+
+/// Opens each dropdown of the Mono settings and picks a value in it, as the user does.
+fn pick_each_dropdown_value(busy: bool, cx: &mut TestAppContext) {
+    let s = setup(cx);
+    cx.update(|cx| {
+        cx.set_reduce_motion(true);
+        crate::shell::bind_keys(cx);
+        crate::popover::bind(cx);
+    });
+    settings_with_models(&s, busy, cx);
+    let visual = &mut gpui::VisualTestContext::from_window(s.window.into(), cx);
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    assert_eq!(
+        mono_chat_state(&s, visual),
+        (Some("model-a".into()), Some("low".into()), AccessMode::Auto)
+    );
+    // Permissions
+    click(visual, "mono-settings-access");
+    assert!(modal_state(&s, visual).1, "the permissions menu opens");
+    // The 288px menu hangs off the right-aligned control past the dialog's edge: the pick is
+    // pressed on a point outside the dialog, which must not dismiss it.
+    let dialog = visual.debug_bounds("mono-settings-dialog").unwrap();
+    let item = visual.debug_bounds("menu-action-access:read-only").unwrap();
+    assert!(
+        item.right() > dialog.right() && !dialog.contains(&item.center()),
+        "the fixture must put the item beyond the dialog: {item:?} against {dialog:?}"
+    );
+    click(visual, "menu-action-access:read-only");
+    assert_eq!(
+        modal_state(&s, visual),
+        (true, false, None),
+        "picking closes only the menu, the settings stay, with no error"
+    );
+    assert_eq!(mono_chat_state(&s, visual).2, AccessMode::ReadOnly);
+    // Effort
+    click(visual, "mono-option-reasoning");
+    assert!(modal_state(&s, visual).1, "the effort menu opens");
+    click(visual, "menu-action-effort:high");
+    assert_eq!(
+        modal_state(&s, visual),
+        (true, false, None),
+        "picking closes only the menu, the settings stay, with no error"
+    );
+    assert_eq!(mono_chat_state(&s, visual).1.as_deref(), Some("high"));
+    // Model
+    click(visual, "mono-settings-model");
+    assert!(modal_state(&s, visual).1, "the model list opens");
+    let star = visual.debug_bounds("model-star-1").expect("model-b's row");
+    let press = gpui::point(star.left() - px(120.), star.center().y);
+    assert!(
+        !dialog.contains(&press),
+        "the model row must lie outside the dialog: {press:?} against {dialog:?}"
+    );
+    visual.simulate_click(press, Default::default());
+    visual.run_until_parked();
+    assert_eq!(
+        modal_state(&s, visual),
+        (true, false, None),
+        "picking closes only the list, the settings stay, with no error"
+    );
+    assert_eq!(mono_chat_state(&s, visual).0.as_deref(), Some("model-b"));
+}
+#[gpui::test]
+fn settings_dropdowns_apply_the_picked_value_when_the_mono_is_idle(cx: &mut TestAppContext) {
+    pick_each_dropdown_value(false, cx);
+}
+#[gpui::test]
+fn settings_dropdowns_apply_the_picked_value_to_the_next_turn_while_the_mono_replies(
+    cx: &mut TestAppContext,
+) {
+    pick_each_dropdown_value(true, cx);
+}
+#[gpui::test]
+fn a_refused_model_switch_says_so_in_a_toast_above_the_settings(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    cx.update(|cx| {
+        cx.set_reduce_motion(true);
+        crate::shell::bind_keys(cx);
+        crate::popover::bind(cx);
+    });
+    settings_with_models(&s, true, cx);
+    s.manager.update(cx, |m, cx| {
+        m.chats[&s.id].update(cx, |chat, _| chat.hold_handoff_for_test())
+    });
+    let visual = &mut gpui::VisualTestContext::from_window(s.window.into(), cx);
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    click(visual, "mono-settings-model");
+    let star = visual.debug_bounds("model-star-1").expect("model-b's row");
+    visual.simulate_click(
+        gpui::point(star.left() - px(120.), star.center().y),
+        Default::default(),
+    );
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    let (open, _, error) = modal_state(&s, visual);
+    assert!(open, "the settings stay open");
+    assert_eq!(
+        error.as_deref(),
+        Some("Wait for the model switch to finish before changing models")
+    );
+    assert_eq!(mono_chat_state(&s, visual).0.as_deref(), Some("model-a"));
+    assert!(
+        visual.debug_bounds("mono-error").is_some(),
+        "the toast is drawn"
+    );
+    // Its close button works without dismissing the dialog behind it.
+    click(visual, "mono-error-close");
+    assert_eq!(modal_state(&s, visual), (true, false, None));
+}
+
+#[gpui::test]
+fn escape_closes_the_model_list_first_and_the_settings_on_the_second_press(
+    cx: &mut TestAppContext,
+) {
+    let s = setup(cx);
+    cx.update(|cx| {
+        cx.set_reduce_motion(true);
+        crate::shell::bind_keys(cx);
+        crate::popover::bind(cx);
+    });
+    settings_with_models(&s, false, cx);
+    let visual = &mut gpui::VisualTestContext::from_window(s.window.into(), cx);
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    click(visual, "mono-settings-model");
+    assert!(modal_state(&s, visual).1, "the model list opens");
+    visual.simulate_keystrokes("escape");
+    visual.run_until_parked();
+    assert_eq!(modal_state(&s, visual), (true, false, None));
+    visual.simulate_keystrokes("escape");
+    visual.run_until_parked();
+    assert!(!modal_state(&s, visual).0, "the second escape closes it");
+}
+
+#[gpui::test]
+fn a_press_outside_the_settings_and_its_model_list_still_closes_the_settings(
+    cx: &mut TestAppContext,
+) {
+    let s = setup(cx);
+    cx.update(|cx| {
+        cx.set_reduce_motion(true);
+        crate::shell::bind_keys(cx);
+        crate::popover::bind(cx);
+    });
+    settings_with_models(&s, false, cx);
+    let visual = &mut gpui::VisualTestContext::from_window(s.window.into(), cx);
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    click(visual, "mono-settings-model");
+    visual.simulate_click(gpui::point(px(5.), px(5.)), Default::default());
+    visual.run_until_parked();
+    let (open, picker, _) = modal_state(&s, visual);
+    assert!(!open && !picker);
 }

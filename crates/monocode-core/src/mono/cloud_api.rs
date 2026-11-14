@@ -31,6 +31,7 @@
 //!
 //! Secret values never pass through this module.
 use crate::cloud_sessions::kit_prefs::ApiKit;
+use crate::cloud_sessions::workspaces::WorkspaceTarget;
 use crate::cloud_sessions::{
     CloudBackendKind, CloudBinding, CloudRef, CloudSessions, CloudState, DeleteOutcome,
     InstanceSession, SessionTarget, StartupSummary,
@@ -83,6 +84,29 @@ impl<F: Fn(&CloudRef) -> bool> AppBusy for F {
 
 /// The caller's busy state, see [`AppBusy`].
 pub type ExtraBusy<'a> = &'a dyn AppBusy;
+
+/// How [`CloudApi::delete_instance`] differs from the plain `cloud.delete`.
+#[derive(Clone, Debug, Default)]
+pub struct DeleteOptions {
+    /// What the user was shown that would be lost and confirmed ([`DeletePreview::lines`]).
+    /// `None` is the plain `cloud.delete`: any file the local copy lacks refuses it. `Some`
+    /// reads what would be lost again right before the delete (the saved list and, for a
+    /// codespace, its git state) and refuses when that holds a line the user did not confirm.
+    ///
+    /// [`DeletePreview::lines`]: crate::cloud_sessions::workspaces::DeletePreview::lines
+    pub confirmed: Option<Vec<String>>,
+    /// The caller showed the user that the workspace was not made by this app
+    /// ([`DeletePreview::ours`]) and the user said they understood. Only read with
+    /// [`Self::confirmed`]: a workspace this app's store does not know is refused without it,
+    /// whatever `confirmed` holds, so the acknowledgement is enforced here and not only by the
+    /// dialog. It means nothing for a workspace the store knows.
+    ///
+    /// [`DeletePreview::ours`]: crate::cloud_sessions::workspaces::DeletePreview::ours
+    pub acknowledged: bool,
+    /// Stop a sandbox and wait until it is stopped first, retrying a refused delete
+    /// ([`CloudSessions::delete_settled`]).
+    pub settle: bool,
+}
 
 /// The extra check of a caller that has no extra busy state.
 pub fn never_busy(_: &CloudRef) -> bool {
@@ -491,6 +515,11 @@ impl CloudApi {
             .map_err(|_| "Native session store unavailable".to_string())
     }
 
+    /// The cloud service behind this API (the cloud workspaces overview reads through it).
+    pub fn cloud(&self) -> &Arc<CloudSessions> {
+        &self.cloud
+    }
+
     /// The live sessions on `cloud`, any project. See [`CloudSessions::sessions_on`].
     pub fn sessions_on(&self, cloud: &CloudRef) -> Vec<InstanceSession> {
         self.cloud.sessions_on(cloud)
@@ -649,7 +678,21 @@ impl CloudApi {
     /// a session on it wakes it). Proceeds while sessions are busy and says so in `warning`.
     pub fn stop(&self, project: &str, input: &Value, busy: ExtraBusy) -> Result<Value, String> {
         let address = self.address(project, input)?;
-        let cloud = &address.cloud;
+        self.stop_target(&address.cloud, busy)
+    }
+
+    /// [`Self::stop`] for a workspace of the cloud workspaces overview, as the Docker account its
+    /// row was listed under.
+    pub fn stop_instance(
+        &self,
+        target: &WorkspaceTarget,
+        busy: ExtraBusy,
+    ) -> Result<Value, String> {
+        self.cloud.use_listed_account(target)?;
+        self.stop_target(&target.cloud, busy)
+    }
+
+    fn stop_target(&self, cloud: &CloudRef, busy: ExtraBusy) -> Result<Value, String> {
         if busy.working_on(cloud) {
             return Err(format!(
                 "Cannot stop {} {}: the app is archiving or converting a session on it, which would start it again. Try again when that finishes.",
@@ -709,8 +752,53 @@ impl CloudApi {
     /// on it) and while the local copy lacks files that only exist on the instance.
     pub fn delete(&self, project: &str, input: &Value, busy: ExtraBusy) -> Result<Value, String> {
         let address = self.address(project, input)?;
-        let cloud = &address.cloud;
-        let sessions = self.busy_sessions_on(cloud, self.cloud.cloud_state_of(cloud), busy);
+        self.delete_target(&address.cloud, busy, &DeleteOptions::default())
+    }
+
+    /// [`Self::delete`] for a workspace of the cloud workspaces overview, as the Docker account its
+    /// row was listed under, with the caller's [`DeleteOptions`].
+    pub fn delete_instance(
+        &self,
+        target: &WorkspaceTarget,
+        busy: ExtraBusy,
+        options: DeleteOptions,
+    ) -> Result<Value, String> {
+        self.cloud.use_listed_account(target)?;
+        self.delete_target(&target.cloud, busy, &options)
+    }
+
+    /// Why `cloud` must not be deleted right now. The store and the backend are read fresh on
+    /// every call: sessions working on it, local sessions moved into it, whether this app knows
+    /// the workspace at all (and the caller acknowledged it when it does not), and what would be
+    /// lost that the caller did not confirm. `woke` also refuses a sandbox that is running again
+    /// after it was stopped (a send to a session on it wakes it). Returns the sessions on it.
+    ///
+    /// What is NOT fresh is `busy`: the caller's [`AppBusy`], which for the overview is a copy
+    /// the window took when the user clicked Delete. During a sandbox's wait (up to minutes) an
+    /// archive that started after that click is not seen here; what protects the delete then is
+    /// the `woke` state check, which refuses a workspace that is running again.
+    fn delete_refusal(
+        &self,
+        cloud: &CloudRef,
+        busy: ExtraBusy,
+        options: &DeleteOptions,
+        woke: bool,
+    ) -> Result<Vec<InstanceSession>, String> {
+        let state = if woke {
+            // The state cached from before the wait says nothing about now.
+            self.cloud.invalidate_ref(cloud);
+            let state = self.cloud.cloud_state_of(cloud);
+            if matches!(state, CloudState::Available | CloudState::Starting) {
+                return Err(format!(
+                    "{} started again while Monoptah waited for it to stop (a session or another app woke it), so it was not deleted. Check what is using it, then try again.",
+                    cloud.name
+                ));
+            }
+            state
+        } else {
+            self.cloud.cloud_state_of(cloud)
+        };
+        let sessions = self.busy_sessions_on(cloud, state, busy);
         let names = busy_names(&sessions);
         if !names.is_empty() {
             return Err(format!(
@@ -726,16 +814,78 @@ impl CloudApi {
                 cloud.name
             ));
         }
-        let unsaved = self.cloud.unsaved_for_cloud(cloud);
-        if !unsaved.is_empty() {
+        // Only the overview refuses on a conversation moved into the workspace: the app's own
+        // `cloud.delete` keeps such a session and marks it lost (its callers know the cost).
+        if options.confirmed.is_some()
+            && !options.acknowledged
+            && !self.cloud.known_to_this_app(cloud)
+        {
             return Err(format!(
-                "Deleting {} would lose files that are not in the local copy. {} Delete it from the app to confirm.",
-                cloud.name,
-                unsaved.join(" ")
+                "Not deleted: Monoptah did not create {} {}, and the confirmation did not say the user was told so. Open Delete again and tick the acknowledgement.",
+                cloud.noun(),
+                cloud.name
             ));
         }
+        let blockers = if options.confirmed.is_some() {
+            self.cloud.delete_blockers(cloud)
+        } else {
+            Vec::new()
+        };
+        if !blockers.is_empty() {
+            return Err(format!(
+                "Cannot delete {} {}: {}",
+                cloud.noun(),
+                cloud.name,
+                blockers.join(" ")
+            ));
+        }
+        match &options.confirmed {
+            None => {
+                let unsaved = self.cloud.unsaved_for_cloud(cloud);
+                if !unsaved.is_empty() {
+                    return Err(format!(
+                        "Deleting {} would lose files that are not in the local copy. {} Delete it from the app to confirm.",
+                        cloud.name,
+                        unsaved.join(" ")
+                    ));
+                }
+            }
+            Some(confirmed) => {
+                let unseen: Vec<String> = self
+                    .cloud
+                    .loss_lines(cloud)?
+                    .into_iter()
+                    .filter(|line| !confirmed.contains(line))
+                    .collect();
+                if !unseen.is_empty() {
+                    return Err(format!(
+                        "Not deleted: {} has something you were not shown when you confirmed. {} Open Delete again to review it.",
+                        cloud.name,
+                        unseen.join(" ")
+                    ));
+                }
+            }
+        }
+        Ok(sessions)
+    }
+
+    fn delete_target(
+        &self,
+        cloud: &CloudRef,
+        busy: ExtraBusy,
+        options: &DeleteOptions,
+    ) -> Result<Value, String> {
+        let sessions = self.delete_refusal(cloud, busy, options, false)?;
         let removed = self.cloud.session_ids_on(cloud);
-        let outcome = self.cloud.delete_cloud_outcome(cloud)?;
+        let outcome = if options.settle {
+            // The wait can take minutes; everything is checked again right before the delete.
+            self.cloud.delete_settled(cloud, &|| {
+                let woke = cloud.kind == CloudBackendKind::DockerSandbox;
+                self.delete_refusal(cloud, busy, options, woke).map(|_| ())
+            })?
+        } else {
+            self.cloud.delete_cloud_outcome(cloud)?
+        };
         let mut result = self.outcome(cloud, "deleted", &sessions);
         // The sessions the delete removed, so the app drops them from its window and panels.
         result["removedSessionIds"] = json!(removed);

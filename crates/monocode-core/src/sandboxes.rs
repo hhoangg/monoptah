@@ -45,8 +45,8 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 const SLOW_CALL_TIMEOUT: Duration = Duration::from_secs(120);
 const BRANCH_SLUG_MAX: usize = 30;
 const REQUEST_SUFFIX_LEN: usize = 6;
-/// `(cpus, memory)` pairs the cloud accepts: micro, small, medium, large, xl.
-const SHAPES: [(u8, &str); 5] = [(1, "2g"), (2, "4g"), (4, "8g"), (8, "16g"), (16, "32g")];
+/// `(cpus, memory)` pairs the cloud accepts: micro, small, medium, large, xl. Smallest first.
+pub const SHAPES: [(u8, &str); 5] = [(1, "2g"), (2, "4g"), (4, "8g"), (8, "16g"), (16, "32g")];
 
 /// Captured result of one `sbx` invocation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -579,19 +579,32 @@ impl Default for Compute {
     }
 }
 
+/// Whether `cpus` / `memory` (any case) is one of the [`SHAPES`] the cloud accepts.
+pub fn is_shape(cpus: u32, memory: &str) -> bool {
+    let memory = memory.trim().to_ascii_lowercase();
+    SHAPES
+        .iter()
+        .any(|(c, m)| u32::from(*c) == cpus && *m == memory)
+}
+
+/// `1 CPU / 2g, 2 CPU / 4g, ...`, for an error.
+pub fn shapes_text() -> String {
+    SHAPES
+        .iter()
+        .map(|(c, m)| format!("{c} CPU / {m}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 impl Compute {
     /// Checks the cpus/memory pair is a billable shape and ttl/platform are well formed.
     pub fn validate(&self) -> Result<(), String> {
-        let memory = self.memory.to_ascii_lowercase();
-        if !SHAPES.iter().any(|(c, m)| *c == self.cpus && *m == memory) {
-            let shapes = SHAPES
-                .iter()
-                .map(|(c, m)| format!("{c} CPU / {m}"))
-                .collect::<Vec<_>>()
-                .join(", ");
+        if !is_shape(u32::from(self.cpus), &self.memory) {
             return Err(format!(
-                "{} CPUs with {} memory is not a billable shape. Choose one of: {shapes}",
-                self.cpus, self.memory
+                "{} CPUs with {} memory is not a billable shape. Choose one of: {}",
+                self.cpus,
+                self.memory,
+                shapes_text()
             ));
         }
         validate_ttl(&self.ttl)?;
@@ -603,6 +616,9 @@ impl Compute {
         Ok(())
     }
 }
+
+/// Every sandbox the app creates is named with this prefix (see [`sandbox_name_for`]).
+pub const NAME_PREFIX: &str = "monoptah-";
 
 /// `monoptah-<branch-slug>-<6 chars of the request id>`; always a valid sandbox name.
 pub fn sandbox_name_for(branch: &str, request_id: &str) -> String {
@@ -630,7 +646,7 @@ pub fn sandbox_name_for(branch: &str, request_id: &str) -> String {
     while suffix.len() < REQUEST_SUFFIX_LEN {
         suffix.push('0');
     }
-    format!("monoptah-{slug}-{suffix}")
+    format!("{NAME_PREFIX}{slug}-{suffix}")
 }
 
 // --------------------------------------------------------------------- types
@@ -646,13 +662,15 @@ fn lenient_text<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Er
 }
 
 /// One sandbox as `sbx --cloud inspect <id> --format json` / `ls --format json` report it.
-/// Unknown fields are ignored and missing ones default.
+/// Unknown fields are ignored and missing ones default. The lifecycle state is `state` in
+/// `inspect` but `status` in `ls` (sbx v0.53.0), so both names are read.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct SandboxInfo {
     pub id: String,
     pub name: String,
     pub agent: String,
+    #[serde(alias = "status")]
     pub state: String,
     pub image: String,
     pub cpus: u32,
@@ -895,7 +913,8 @@ pub fn display_state(raw: &str) -> CloudState {
         "creating" | "starting" | "resuming" | "pending" | "provisioning" | "restarting" => {
             CloudState::Starting
         }
-        "stopping" | "suspending" => CloudState::Stopping,
+        // `hibernating` is on its way to `stopped`: a delete has to wait for it.
+        "stopping" | "suspending" | "hibernating" => CloudState::Stopping,
         "stopped" | "suspended" => CloudState::Stopped,
         "failed" | "error" | "deleting" | "deleted" | "terminated" => CloudState::Unavailable,
         _ => CloudState::Unknown,
@@ -1069,6 +1088,46 @@ fn is_account_rejection(out: &SbxOutput) -> bool {
 /// [`crate::docker_accounts::DockerAuthError`] that tells where to fix it).
 pub fn is_account_text(text: &str) -> bool {
     text.contains("in Settings > Cloud.") || text.contains("Choose another in Cloud settings.")
+}
+
+/// What a failed [`list`] says about this machine, for callers that already ran it: sbx
+/// missing, signed out, or unreachable (the same words as [`diagnose`], without a second call).
+pub fn access_problem(error: &str) -> Prerequisites {
+    if error.contains("not installed") {
+        Prerequisites::SbxMissing
+    } else if is_account_text(error) {
+        // A Docker account that cannot sign in says where to fix it; `sbx login` is not that.
+        Prerequisites::DockerAccount(error.to_owned())
+    } else if looks_logged_out(error) {
+        Prerequisites::NotLoggedIn(error.to_owned())
+    } else {
+        Prerequisites::Unreachable(redact(error))
+    }
+}
+
+/// Whether the text of a failed start step could come from a missing prerequisite (sbx gone,
+/// signed out, the ssh alias removed, the account refused) rather than from the work the step
+/// ran (a Git 401, a devcontainer build). It only decides whether `diagnose_as` is worth
+/// asking after a failure: the diagnosis still decides what the user is told, so a wrong
+/// "yes" costs one `sbx ls`, never a wrong hint.
+pub fn may_be_prerequisite_failure(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    looks_logged_out(error)
+        || [
+            "not installed",
+            SSH_HOST_ALIAS,
+            "kex_exchange_identification",
+            "could not resolve hostname",
+            "connection closed",
+            "connection refused",
+            "connection reset",
+            "broken pipe",
+            "permission denied (publickey",
+            "ssh:",
+            "sbx ",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
 }
 
 fn looks_logged_out(error: &str) -> bool {

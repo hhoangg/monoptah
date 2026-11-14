@@ -925,6 +925,8 @@ impl Shell {
     pub(super) fn cloud_resumed(&mut self, id: i64, cx: &mut Context<Self>) {
         if let Some(mark) = self.cloud_marks.get(&id) {
             self.cloud_states.insert(mark.key(), CloudState::Available);
+            // A resumed workspace gets a whole new idle window.
+            self.auto_stop.resumed(&mark.cloud(), self.auto_stop_now());
         }
         self.sync_cloud_stopped(cx);
         self.invalidate_chrome(cx);
@@ -994,6 +996,7 @@ impl Shell {
         self.cloud_marks = snapshot.marks;
         self.cloud_states = snapshot.states;
         self.sync_cloud_stopped(cx);
+        self.sync_auto_stopping(cx);
         self.sync_cloud_location(cx);
         if changed {
             self.invalidate_chrome(cx);
@@ -1043,6 +1046,7 @@ impl Shell {
     pub(super) fn spawn_codespace_terminal(
         &mut self,
         codespace: &str,
+        explicit: bool,
         cx: &mut Context<Self>,
     ) -> Entity<Terminal> {
         let cwd = crate::terminal::home_cwd();
@@ -1058,6 +1062,7 @@ impl Shell {
         });
         self.observations
             .push(cx.subscribe(&terminal, |_, _, _: &TerminalEvent, cx| cx.notify()));
+        self.track_cloud_terminal(CloudRef::codespace(codespace), &terminal, explicit);
         terminal
     }
 
@@ -1066,6 +1071,7 @@ impl Shell {
     /// the network.
     fn launch_sandbox_terminal(
         &mut self,
+        sandbox: CloudRef,
         command: SandboxTerminal,
         env: SandboxEnv,
         cx: &mut Context<Self>,
@@ -1093,6 +1099,7 @@ impl Shell {
                 cx.notify()
             }),
         );
+        self.track_cloud_terminal(sandbox, &terminal, true);
         terminal
     }
 
@@ -1108,7 +1115,7 @@ impl Shell {
         let mark = self.cloud_marks.get(&id)?.clone();
         match mark.kind {
             CloudBackendKind::Codespaces => {
-                Some(self.spawn_codespace_terminal(&mark.codespace, cx))
+                Some(self.spawn_codespace_terminal(&mark.codespace, false, cx))
             }
             CloudBackendKind::DockerSandbox => None,
         }
@@ -1131,8 +1138,15 @@ impl Shell {
         let Some(mark) = self.cloud_marks.get(&id).cloned() else {
             return;
         };
+        // An archive, a delete or an automatic stop holds the workspace: a shell opened now
+        // would be cut off (or would wake it again).
+        if self.cloud_workspaces_busy.contains(&mark.key()) {
+            self.error = Some(WORKSPACE_BUSY.into());
+            cx.notify();
+            return;
+        }
         if mark.kind == CloudBackendKind::Codespaces {
-            let terminal = self.spawn_codespace_terminal(&mark.codespace, cx);
+            let terminal = self.spawn_codespace_terminal(&mark.codespace, true, cx);
             self.add_cloud_terminal(project, terminal, window, cx);
             return;
         }
@@ -1154,13 +1168,14 @@ impl Shell {
             // The machine's sign-in: no token, no exchange, nothing to wait for.
             match sandbox_terminal_env(&command) {
                 Ok(env) => {
-                    let terminal = self.launch_sandbox_terminal(command, env, cx);
+                    let terminal = self.launch_sandbox_terminal(mark.cloud(), command, env, cx);
                     self.add_cloud_terminal(project, terminal, window, cx);
                 }
                 Err(error) => fail(self, error, cx),
             }
             return;
         }
+        let sandbox = mark.cloud();
         let work = cx.background_executor().spawn(async move {
             let env = sandbox_terminal_env(&command);
             (command, env)
@@ -1168,8 +1183,11 @@ impl Shell {
         cx.spawn_in(window, async move |this, cx| {
             let (command, env) = work.await;
             let _ = this.update_in(cx, |this, window, cx| match env {
+                Ok(_) if this.cloud_workspaces_busy.contains(&sandbox.key()) => {
+                    fail(this, WORKSPACE_BUSY.into(), cx)
+                }
                 Ok(env) => {
-                    let terminal = this.launch_sandbox_terminal(command, env, cx);
+                    let terminal = this.launch_sandbox_terminal(sandbox, command, env, cx);
                     this.add_cloud_terminal(project, terminal, window, cx);
                 }
                 Err(error) => fail(this, error, cx),
@@ -1755,6 +1773,10 @@ impl Shell {
                 return;
             };
             self.focus_active(window, cx);
+            // The user's choice: the auto-stop never stops these for being unused.
+            for group in &dialog.groups {
+                self.auto_stop.keep_running(&group.cloud());
+            }
             for id in dialog.ids() {
                 self.toggle_archive_now(id, cx);
             }
@@ -1919,6 +1941,9 @@ impl Shell {
                 risky,
                 unreachable: unreached,
             } = outcome;
+            if choice == ArchiveChoice::Keep {
+                self.auto_stop.keep_running(&group.cloud());
+            }
             if let Some((id, reason)) = unreached {
                 let title = self.session_metadata(id, cx).display_title();
                 unreachable.push(Unreachable {
@@ -2242,6 +2267,10 @@ impl Shell {
             || self.cloud_busy.contains(&id)
         {
             return;
+        }
+        // "Remove from Monoptah" leaves the workspace running on purpose: no automatic stop.
+        if let Some(mark) = self.cloud_marks.get(&id) {
+            self.auto_stop.keep_running(&mark.cloud());
         }
         self.cloud_busy.insert(id);
         let store = self.store.clone();
