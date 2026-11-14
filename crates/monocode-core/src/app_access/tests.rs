@@ -512,3 +512,26 @@ fn operator_is_refused_an_account_but_may_list_accounts() {
     assert!(validate_operator("accounts.list", &json!({"provider":"claude"})).is_ok());
     assert!(validate_operator("accounts.list", &json!({"provider":"cursor"})).is_err());
 }
+
+#[test]
+fn operator_may_stop_the_instance_of_a_deleted_cloud_session_but_not_delete_it() {
+    for cloud in ["keep", "stop"] {
+        assert!(
+            validate_operator("sessions.delete", &json!({"sessionId":1,"cloud":cloud})).is_ok()
+        );
+    }
+    assert_eq!(
+        validate_operator("sessions.delete", &json!({"sessionId":1,"cloud":"delete"})).unwrap_err(),
+        "Deleting a cloud instance is only available to a Mono"
+    );
+    assert!(
+        crate::mono::api::validate("sessions.delete", &json!({"sessionId":1,"cloud":"delete"}))
+            .is_ok(),
+        "a Mono may"
+    );
+    assert!(crate::mono::api::validate(
+        "sessions.delete",
+        &json!({"sessionId":1,"cloud":"stop","removeWorktree":true})
+    )
+    .is_err());
+}

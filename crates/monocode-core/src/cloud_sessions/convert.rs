@@ -950,6 +950,15 @@ impl CloudSessions {
         converted.evidence = pulled.files;
         converted.evidence_partial = evidence_partial;
         converted.warnings = warnings;
+        // The backup is safe on disk: bring the local default branch up to date when that is
+        // a plain fast-forward, and say so (or why not) as a notice, never as a question.
+        if matches!(mode, Mode::Archive) {
+            converted
+                .warnings
+                .extend(super::default_branch::refresh_default_branch(Path::new(
+                    &local_project,
+                )));
+        }
         Ok(converted)
     }
 

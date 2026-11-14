@@ -1618,3 +1618,55 @@ fn a_session_whose_sandbox_failed_to_start_is_not_working(cx: &mut TestAppContex
         "a failed sandbox start waits for Retry: not working, shown as failed"
     );
 }
+
+#[gpui::test]
+fn a_mono_session_delete_with_cloud_stop_also_stops_the_instance(cx: &mut TestAppContext) {
+    let (s, gh, _host, _guard) = cloud_setup(cx, "Available");
+    let id = cloud_session(&s, cx);
+    cx.update(|cx| {
+        let cloud = monocode_core::mono::cloud_api::CloudApi::shared(&s.store)
+            .unwrap()
+            .cloud()
+            .clone();
+        s.manager
+            .read(cx)
+            .owner
+            .upgrade()
+            .unwrap()
+            .update(cx, |owner, _| owner.mono_set_cloud(cloud))
+    });
+    let reply = call(
+        &s,
+        "d1",
+        "sessions.delete",
+        json!({"sessionId":id,"cloud":"stop"}),
+        cx,
+    );
+    cx.run_until_parked();
+    let result = reply.try_recv().unwrap();
+    assert!(result.is_ok(), "{result:?}");
+    let calls = gh.calls.lock().unwrap();
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.contains("codespace stop -c octo-run")),
+        "{calls:?}"
+    );
+    assert!(!calls.iter().any(|c| c.contains("codespace delete")));
+}
+
+#[gpui::test]
+fn a_mono_session_delete_without_cloud_leaves_the_instance_alone(cx: &mut TestAppContext) {
+    let (s, gh, _host, _guard) = cloud_setup(cx, "Available");
+    let id = cloud_session(&s, cx);
+    let reply = call(&s, "d2", "sessions.delete", json!({"sessionId":id}), cx);
+    cx.run_until_parked();
+    assert!(reply.try_recv().unwrap().is_ok());
+    let calls = gh.calls.lock().unwrap();
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.contains("codespace stop") || c.contains("codespace delete")),
+        "{calls:?}"
+    );
+}

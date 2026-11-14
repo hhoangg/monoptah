@@ -31,8 +31,17 @@ impl CloudBackend for CodespacesBackend {
     }
     fn is_missing_error(&self, error: &str) -> bool {
         // gh prints "HTTP 404: Not Found" for a missing codespace; a missing `gh` binary
-        // says "command not found" and must not count.
-        error.to_lowercase().contains("http 404")
+        // says "command not found" and must not count. The codespace-specific phrasings
+        // ("codespace not found", "no such codespace") are the same fact in other words, but
+        // only as the START of a line (after an optional "error:"): the same words inside a
+        // longer message (an auth or network failure that quotes them) prove nothing.
+        let lower = error.to_lowercase();
+        lower.contains("http 404")
+            || lower.lines().any(|line| {
+                let line = line.trim();
+                let line = line.strip_prefix("error:").map_or(line, str::trim);
+                line.starts_with("codespace not found") || line.starts_with("no such codespace")
+            })
     }
     fn state(&self, name: &str) -> Result<String, String> {
         codespaces::state(&*self.gh, name)

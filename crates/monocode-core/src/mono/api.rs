@@ -24,8 +24,8 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         "sessions.draft"=>"sessionId prompt project",
         "sessions.pullEvidence"=>"sessionId project path taskId",
         "sessions.stop"=>"sessionId project",
-        "sessions.archive"=>"sessionId project cloud",
-        "sessions.delete"=>"sessionId project providerFiles removeWorktree",
+        "sessions.archive"=>"sessionId project cloud backup",
+        "sessions.delete"=>"sessionId project providerFiles removeWorktree cloud",
         "worktrees.create"=>"branch base existing project",
         "folders.move"=>"sessionId folderId newFolderName project",
         "notes.list"=>"limit offset","notes.read"=>"id","notes.write"=>"id title body tags",
@@ -81,6 +81,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             "enabled",
             "providerFiles",
             "removeWorktree",
+            "backup",
         ]
         .contains(&key.as_str())
             && !value.is_boolean()
@@ -114,6 +115,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             "enabled",
             "providerFiles",
             "removeWorktree",
+            "backup",
             "before",
             "limit",
             "offset",
@@ -151,6 +153,12 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         return Err(
             "removeWorktree and providerFiles cannot be combined; choose one per call".into(),
         );
+    }
+    if action == "sessions.delete"
+        && input["removeWorktree"] == true
+        && input.get("cloud").is_some()
+    {
+        return Err("removeWorktree and cloud cannot be combined; choose one per call".into());
     }
     if let Some(account) = input.get("account") {
         let account = account.as_str().unwrap_or_default();
@@ -367,6 +375,24 @@ mod tests {
             validate("sessions.stop", &json!({"sessionId":1,"cloud":"stop"})).unwrap_err(),
             "sessions.stop does not take cloud"
         );
+    }
+    #[test]
+    fn backup_is_a_boolean_on_archive_only_and_delete_takes_cloud() {
+        assert!(validate(
+            "sessions.archive",
+            &json!({"sessionId":1,"cloud":"stop","backup":false})
+        )
+        .is_ok());
+        assert_eq!(
+            validate("sessions.archive", &json!({"sessionId":1,"backup":"no"})).unwrap_err(),
+            "backup must be true or false"
+        );
+        assert_eq!(
+            validate("sessions.delete", &json!({"sessionId":1,"backup":true})).unwrap_err(),
+            "sessions.delete does not take backup"
+        );
+        assert!(validate("sessions.delete", &json!({"sessionId":1,"cloud":"delete"})).is_ok());
+        assert!(validate("sessions.delete", &json!({"sessionId":1,"cloud":"bogus"})).is_err());
     }
     #[test]
     fn remove_worktree_is_a_boolean_on_delete_only() {

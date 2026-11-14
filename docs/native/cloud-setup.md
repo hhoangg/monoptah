@@ -303,6 +303,28 @@ Unverified (handled defensively, listed for manual verification):
 - The exact `scope` value (`sandbox:use` is expected; any scope word starting with `sandbox`
   is accepted).
 
+## Archiving and deleting a cloud session
+
+Archive and Delete of a cloud session that is not archived open one dialog with two buttons,
+Close and the action.
+
+- A radio picks Stop (default, recoverable: the next message wakes the instance) or Delete the
+  instance. If other live sessions use the same codespace or sandbox the dialog names them and
+  Delete is disabled; the same guard runs in core (`CloudSessions::apply_instance_action`), so
+  an instance is never deleted under another live session. A Stop is skipped, with a note, while
+  another session is busy in it.
+- Archive only: a checkbox "Back up this session to local" (checked by default) runs the local
+  copy first. The instance is stopped or deleted only after the copy succeeded; on failure the
+  dialog offers Retry and the instance is untouched. There is no "anyway" step.
+- After a backup the local default branch is fetched and fast-forwarded only when it is behind
+  origin, the checkout is clean and git allows a fast-forward. Otherwise it is left as it is and
+  a notice says so; no dialog asks. The backup never depends on it.
+- Deleting a cloud session acts on the instance by the same radio. App API: `sessions.archive`
+  takes `backup` (default true) and `cloud`; `sessions.delete` takes optional `cloud`
+  (`stop` or `delete`, default leaves the instance alone).
+- Stopping or deleting an instance that no longer exists (removed by hand or by another process)
+  is a success everywhere, including the Cloud workspaces screen and `cloud.stop` / `cloud.delete`.
+
 ## Data and migration
 
 - **Sandbox**: stays in `docker-sandbox-projects.v1` as `DockerProjectConfig`, which gains

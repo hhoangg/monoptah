@@ -920,15 +920,24 @@ impl Store {
         id: i64,
         gh: &dyn crate::codespaces::GhRunner,
         host: &dyn crate::cloud_sessions::Host,
-        sandbox_exists: Option<bool>,
+        exists_known: Option<bool>,
     ) -> Result<(), String> {
         self.delete_remote_session_inner(
             id,
             gh,
             &crate::sandboxes::SystemSbx,
             Some(host),
-            sandbox_exists,
+            exists_known,
         )
+    }
+
+    /// The instance session `id` lives in, when deleting it has to ask whether that instance
+    /// still exists (it has a host conversation). `None` for a pending start, an unsent draft
+    /// and a session outside the cloud: those are deleted locally without asking anything.
+    pub fn hosted_cloud_of_session(&self, id: i64) -> Option<CloudRef> {
+        let remote = self.remote_session(id).ok().flatten()?;
+        remote.session_id.as_ref()?;
+        remote.project.cloud()
     }
 
     /// The name of the Docker sandbox session `id` lives in, `None` for any other session:
@@ -971,7 +980,7 @@ impl Store {
         gh: &dyn crate::codespaces::GhRunner,
         sbx: &dyn crate::sandboxes::SbxRunner,
         host: Option<&dyn crate::cloud_sessions::Host>,
-        sandbox_exists: Option<bool>,
+        exists_known: Option<bool>,
     ) -> Result<(), String> {
         let remote = self
             .remote_session(id)?
@@ -985,9 +994,13 @@ impl Store {
         // read-only call (`gh codespace view` / `sbx ls`): nothing is woken here.
         if let Some(cloud) = remote.project.cloud() {
             let exists = match cloud.kind {
-                CloudBackendKind::Codespaces => crate::codespaces::exists(gh, &cloud.name)?,
-                CloudBackendKind::DockerSandbox if sandbox_exists.is_some() => {
-                    sandbox_exists == Some(true)
+                // The caller may have asked already (outside the store lock) and passes the answer.
+                CloudBackendKind::Codespaces => match exists_known {
+                    Some(known) => known,
+                    None => crate::codespaces::exists(gh, &cloud.name)?,
+                },
+                CloudBackendKind::DockerSandbox if exists_known.is_some() => {
+                    exists_known == Some(true)
                 }
                 CloudBackendKind::DockerSandbox => {
                     // Under the account the sandbox lives in. `ls` under another one would

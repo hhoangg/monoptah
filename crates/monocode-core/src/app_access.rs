@@ -51,7 +51,7 @@ pub fn validate_operator(action: &str, input: &Value) -> Result<(), String> {
     if input["notifyOnComplete"] == true {
         return Err("Completion notifications are only available in a Mono's chat".into());
     }
-    if action == "sessions.archive" && input["cloud"] == "delete" {
+    if matches!(action, "sessions.archive" | "sessions.delete") && input["cloud"] == "delete" {
         return Err("Deleting a cloud instance is only available to a Mono".into());
     }
     if input["providerFiles"] == true {

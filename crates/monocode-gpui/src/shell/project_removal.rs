@@ -1,6 +1,7 @@
 //! Archiving and deleting projects from their menu, and opening them in an
 //! external editor (useProjectMenu.tsx and App.tsx's onRemoveProject).
 use super::*;
+use monocode_core::cloud_sessions::{CloudRef, InstanceAction};
 use monocode_core::{
     external_editor::{self, ExternalEditor},
     files::{is_equal_or_inside, path_key},
@@ -33,6 +34,25 @@ pub(super) struct DeleteOptions {
     /// Receives what became of the provider files once the delete is over, or
     /// why the session could not be deleted.
     pub report: Option<async_channel::Sender<Result<FilesOutcome, String>>>,
+    /// What to do with the cloud instance once the session is gone. `None` leaves it as it is.
+    pub instance: Option<InstanceTask>,
+}
+
+/// An action on the cloud instance, run after the session delete that frees it.
+#[derive(Clone, Debug)]
+pub(super) struct InstanceTask {
+    pub target: CloudRef,
+    pub action: InstanceAction,
+    /// Every session this delete takes away from the instance (the guard ignores them).
+    pub selected: Vec<i64>,
+}
+
+/// The sessions of a delete that live in one cloud instance, and who else uses it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CloudDeleteTarget {
+    pub target: CloudRef,
+    pub ids: Vec<i64>,
+    pub shared: Vec<super::cloud::SharedUser>,
 }
 
 /// What a delete did about the provider session files.
@@ -82,8 +102,12 @@ pub(super) struct DeleteDialog {
     pub(super) ids: Vec<i64>,
     title: String,
     pub(super) provider_files: Option<ProviderFiles>,
-    /// What deleting leaves behind in cloud workspaces, when a session lives in one.
+    /// What deleting leaves behind in cloud workspaces, for sessions the radio does not cover.
     pub(super) cloud_notice: Option<String>,
+    /// The cloud instances of the sessions that are not archived: the radio acts on these.
+    pub(super) cloud_targets: Vec<CloudDeleteTarget>,
+    /// What to do with those instances. Stop by default: it is recoverable, a delete is not.
+    pub(super) instance: InstanceAction,
     /// Each session's worktree that nothing else uses, so deleting leaves it unused.
     worktrees: Vec<(i64, String)>,
     pub(super) delete_provider_files: bool,
@@ -498,8 +522,36 @@ impl Shell {
                     (clouds, unreadable)
                 })
                 .unwrap_or_default();
+        // Sessions that are not archived hold their instance: the radio decides what happens to it.
+        let mut cloud_targets: Vec<CloudDeleteTarget> = Vec::new();
+        for id in &ids {
+            let Some(mark) = self.cloud_marks.get(id) else {
+                continue;
+            };
+            if self.cloud_located.contains_key(id)
+                || self.session_summaries.get(id).is_none_or(|s| s.archived)
+            {
+                continue;
+            }
+            let target = mark.cloud();
+            match cloud_targets.iter_mut().find(|t| t.target == target) {
+                Some(found) => found.ids.push(*id),
+                None => cloud_targets.push(CloudDeleteTarget {
+                    target,
+                    ids: vec![*id],
+                    shared: Vec::new(),
+                }),
+            }
+        }
+        for t in &mut cloud_targets {
+            t.shared = self.shared_users_of(&t.target, &t.ids, cx);
+            // Another session of this same delete is not "another user".
+            t.shared.retain(|user| !ids.contains(&user.id));
+        }
         let dialog = DeleteDialog {
             cloud_notice: provider_cleanup::cloud_delete_notice(&clouds, unreadable),
+            cloud_targets,
+            instance: InstanceAction::Stop,
             ids,
             title,
             provider_files,
@@ -530,7 +582,26 @@ impl Shell {
         for (id, path) in &dialog.worktrees {
             last.insert(path_key(path), *id);
         }
+        // The instance action rides on the last session of each instance, so it runs once the
+        // others are gone and the guard sees only what is really left.
+        let mut tasks: HashMap<i64, InstanceTask> = HashMap::new();
+        for t in &dialog.cloud_targets {
+            if dialog.instance == InstanceAction::Delete && !t.shared.is_empty() {
+                continue;
+            }
+            if let Some(last) = t.ids.last() {
+                tasks.insert(
+                    *last,
+                    InstanceTask {
+                        target: t.target.clone(),
+                        action: dialog.instance,
+                        selected: t.ids.clone(),
+                    },
+                );
+            }
+        }
         for id in dialog.ids {
+            let instance = tasks.remove(&id);
             let worktree = dialog
                 .worktrees
                 .iter()
@@ -548,6 +619,7 @@ impl Shell {
                     provider_files: provider_files && has_files,
                     worktree,
                     report: None,
+                    instance,
                 },
                 window,
                 cx,
@@ -565,58 +637,8 @@ impl Shell {
         let count = dialog.ids.len();
         let width = 400f32.min(window.viewport_size().width.as_f32() - 24.);
         let weak = cx.weak_entity();
-        let note = |text: String| {
-            div()
-                .mt(px(4.))
-                .text_size(px(11.))
-                .line_height(px(15.))
-                .text_color(content(0.45))
-                .child(text)
-        };
         let option = |id: &'static str, checked: bool, label: String, notes: Vec<String>| {
-            div()
-                .id(id)
-                .debug_selector(move || id.into())
-                .role(Role::CheckBox)
-                .aria_label(label.clone())
-                .aria_toggled(if checked {
-                    gpui::Toggled::True
-                } else {
-                    gpui::Toggled::False
-                })
-                .cursor_pointer()
-                .flex()
-                .items_start()
-                .gap_2()
-                .child(
-                    div()
-                        .mt(px(2.))
-                        .size(px(14.))
-                        .flex_shrink_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(4.))
-                        .border_1()
-                        .border_color(if checked {
-                            accent_color()
-                        } else {
-                            content(0.3)
-                        })
-                        .when(checked, |d| {
-                            d.bg(accent_color())
-                                .child(icon("check", 10.).text_color(gpui::white()))
-                        }),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_size(px(12.))
-                        .line_height(px(17.))
-                        .child(label)
-                        .children(notes.into_iter().map(&note)),
-                )
+            crate::modal::check_row(id, checked, false, label, notes)
         };
         let paths: Vec<String> = {
             let mut seen = HashSet::new();
@@ -682,6 +704,9 @@ impl Shell {
                                             .text_color(content(0.55))
                                             .child(notice),
                                     )
+                                })
+                                .when(!dialog.cloud_targets.is_empty(), |d| {
+                                    d.child(self.delete_instance_radio(dialog, cx))
                                 })
                                 .when_some(dialog.provider_files, |d, files| {
                                     d.child(
@@ -762,6 +787,72 @@ impl Shell {
                 )
                 .into_any_element(),
         )
+    }
+
+    /// The radio of the delete dialog: what to do with the cloud instance(s) of the sessions.
+    fn delete_instance_radio(
+        &self,
+        dialog: &DeleteDialog,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let shared: Vec<super::cloud::SharedUser> = dialog
+            .cloud_targets
+            .iter()
+            .flat_map(|t| t.shared.clone())
+            .collect();
+        let noun = dialog
+            .cloud_targets
+            .first()
+            .map_or("instance", |t| t.target.noun());
+        let blocked = super::cloud::delete_blocked_note(&shared, noun);
+        let stopping = dialog.instance == InstanceAction::Stop;
+        let mut stop_notes =
+            vec!["Keeps its files; a new message in another session wakes it again.".to_string()];
+        stop_notes.extend(super::cloud::stop_shared_note(&shared, noun));
+        let delete_notes = vec![
+            blocked
+                .clone()
+                .unwrap_or_else(|| format!("Removes the {noun} and everything in it for good.")),
+        ];
+        let delete_row = crate::modal::radio_row(
+            "delete-instance-delete",
+            !stopping,
+            blocked.is_some(),
+            format!("Delete the cloud {noun}"),
+            delete_notes,
+        );
+        div()
+            .id("delete-instance")
+            .role(Role::RadioGroup)
+            .aria_label(format!("What to do with the cloud {noun}"))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                crate::modal::radio_row(
+                    "delete-instance-stop",
+                    stopping,
+                    false,
+                    format!("Stop the cloud {noun}"),
+                    stop_notes,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(d) = &mut this.delete_dialog {
+                        d.instance = InstanceAction::Stop;
+                        cx.notify();
+                    }
+                })),
+            )
+            .child(if blocked.is_some() {
+                delete_row
+            } else {
+                delete_row.on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(d) = &mut this.delete_dialog {
+                        d.instance = InstanceAction::Delete;
+                        cx.notify();
+                    }
+                }))
+            })
     }
 
     fn project_sessions(&self, path: &str) -> Vec<i64> {
@@ -1583,7 +1674,7 @@ mod tests {
                         kept: 2,
                         problems: Vec::new(),
                     });
-                    shell.mono_delete_with_files(id, tx, w, cx);
+                    shell.mono_delete_with_files(id, tx, &json!({"providerFiles": true}), w, cx);
                 })
                 .unwrap();
             cx.run_until_parked();
@@ -1695,7 +1786,7 @@ mod tests {
                     removed: 1,
                     ..Default::default()
                 });
-                shell.mono_delete_with_files(a, tx, w, cx);
+                shell.mono_delete_with_files(a, tx, &json!({"providerFiles": true}), w, cx);
             })
             .unwrap();
         cx.run_until_parked();
@@ -1704,7 +1795,7 @@ mod tests {
         let (tx, rx) = async_channel::bounded(1);
         window
             .update(cx, |shell, w, cx| {
-                shell.mono_delete_with_files(a, tx, w, cx)
+                shell.mono_delete_with_files(a, tx, &json!({"providerFiles": true}), w, cx)
             })
             .unwrap();
         assert!(rx.try_recv().unwrap().is_err());
