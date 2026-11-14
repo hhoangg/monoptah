@@ -115,6 +115,16 @@ relinks the large `monocode-gpui` test binary (median 1.4 min, p90 4.1 min).
   ```
 
   Elsewhere use plain `cp -R` (a real copy).
+- **Always build the native workspace with the `native-dev` profile.** Plain `cargo test`,
+  `build`, `check` or `clippy` uses the `dev` profile and fills a second `target/debug` (several
+  GB) that nothing else reuses. Cargo has no setting for a default profile and ignores an alias
+  that shadows a built-in command, so use the aliases in `crates/monocode-gpui/.cargo/config.toml`
+  from inside `crates/monocode-gpui`: `cargo ntest`, `cargo nbuild`, `cargo ncheck`,
+  `cargo nclippy`, `cargo nrun`. From the repo root pass
+  `--manifest-path crates/monocode-gpui/Cargo.toml --profile native-dev`, as the npm scripts do.
+  In `native-dev` the `monocode-gpui` crate is `opt-level = 0` and dependencies are `opt-level = 1`.
+  `npm run worktrees:clean -- --prune-target` removes a leftover `target/debug` and stale
+  incremental data (see the `cleanup-worktree` skill).
 - **Keep tests Linux-portable.** GPUI tests run on Ubuntu in CI. Use `secondary-...`
   keystrokes (cmd on macOS, ctrl elsewhere), never `cmd-...`. Do not assume macOS paths,
   Keychain, WKWebView, AVPlayer or Metal. A test that truly runs only on macOS gets

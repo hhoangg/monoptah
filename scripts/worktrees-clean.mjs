@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, lstatSync, readdirSync, realpathSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { basename, join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
 
@@ -15,6 +15,22 @@ const MAIN_REF = "origin/main";
 export const REGENERABLE_IGNORED = new Set(["target", "node_modules", "dist", "dist-ssr", "build", ".turbo", ".vite", "coverage", "playwright-report", "test-results", ".next", ".cache", ".tsbuildinfo"]);
 const LOG_PREFIX = "monoptah-native-dev-";
 const LOG_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+// Cargo target pruning. The native workspace builds into <worktree>/crates/monocode-gpui/target
+// and the root workspace into <worktree>/target.
+const NATIVE_TARGET = join("crates", "monocode-gpui", "target");
+const ROOT_TARGET = "target";
+// The only profile the native workspace uses is native-dev, so its plain `debug` dir is leftover.
+// Only removed from the native target: the root workspace (src-tauri) legitimately builds into debug.
+const UNUSED_NATIVE_PROFILE = "debug";
+// Worktrees whose build artifacts are needed as the seed for new worktrees and for releases: only
+// stale incremental data is pruned there, never a profile dir.
+const SEED_WORKTREE_NAMES = new Set(["release-main"]);
+// An incremental dir (<crate>-<hash>) nobody wrote to for this long belongs to a hash that is no
+// longer built (changed path, flags or toolchain).
+const INCREMENTAL_ORPHAN_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
+// Inside a live incremental dir only the newest session (s-*) is read; older ones are dead weight
+// once they are this old.
+const SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 export function run(command, args, { cwd } = {}) {
   const result = spawnSync(command, args, { cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
@@ -240,23 +256,103 @@ export function staleLogDirs(tmp, now = Date.now(), maxAge = LOG_MAX_AGE_MS) {
   });
 }
 
+function entries(path) {
+  try { return readdirSync(path, { withFileTypes: true }); } catch { return []; }
+}
+
+function newestMtime(path) {
+  let newest = 0;
+  try { newest = lstatSync(path).mtimeMs; } catch { return 0; }
+  for (const entry of entries(path)) {
+    try { newest = Math.max(newest, lstatSync(join(path, entry.name)).mtimeMs); } catch { /* vanished */ }
+  }
+  return newest;
+}
+
+// Profile dirs directly under a target dir (and under <target>/<triple> for cross builds).
+function profileDirs(target) {
+  const found = [];
+  for (const entry of entries(target)) {
+    if (!entry.isDirectory()) continue;
+    const dir = join(target, entry.name);
+    if (existsSync(join(dir, "incremental"))) found.push({ dir, name: entry.name });
+    else for (const inner of entries(dir)) {
+      if (inner.isDirectory() && existsSync(join(dir, inner.name, "incremental"))) found.push({ dir: join(dir, inner.name), name: inner.name });
+    }
+  }
+  return found;
+}
+
+// Lists stale cargo build data of one worktree as [{ path, reason }] (never deletes anything).
+// - `crates/monocode-gpui/target/debug` (unused profile) unless the worktree seeds others.
+// - Incremental dirs: a <crate>-<hash> dir untouched for 14 days; in the others, every s-* session
+//   dir (and its .lock) except the newest that is older than 1 day. `-working` dirs are never touched.
+// Every path is a real directory (symlinks are skipped) inside the worktree.
+export function cargoPruneCandidates(worktree, { now = Date.now(), seed = false } = {}) {
+  const out = [];
+  const inside = (path) => {
+    try { return !lstatSync(path).isSymbolicLink() && isInside(path, worktree); } catch { return false; }
+  };
+  const nativeTarget = join(worktree, NATIVE_TARGET);
+  if (!seed && inside(join(nativeTarget, UNUSED_NATIVE_PROFILE)) && lstatSync(join(nativeTarget, UNUSED_NATIVE_PROFILE)).isDirectory()) {
+    out.push({ path: join(nativeTarget, UNUSED_NATIVE_PROFILE), reason: "unused cargo profile (the native workspace uses native-dev)" });
+  }
+  for (const target of [nativeTarget, join(worktree, ROOT_TARGET)]) {
+    if (!inside(target)) continue;
+    for (const { dir, name } of profileDirs(target)) {
+      if (target === nativeTarget && dir === join(nativeTarget, UNUSED_NATIVE_PROFILE) && !seed) continue; // removed as a whole
+      const incremental = join(dir, "incremental");
+      if (!inside(incremental)) continue;
+      for (const crate of entries(incremental)) {
+        const crateDir = join(incremental, crate.name);
+        if (!crate.isDirectory() || !inside(crateDir)) continue;
+        if (now - newestMtime(crateDir) > INCREMENTAL_ORPHAN_MAX_AGE_MS) {
+          out.push({ path: crateDir, reason: `incremental dir for ${crate.name} unused for over 14 days (${name})` });
+          continue;
+        }
+        const sessions = entries(crateDir).filter((e) => e.isDirectory() && e.name.startsWith("s-") && !e.name.endsWith("-working"))
+          .map((e) => ({ name: e.name, mtime: lstatSync(join(crateDir, e.name)).mtimeMs }))
+          .sort((a, b) => b.mtime - a.mtime);
+        for (const session of sessions.slice(1)) {
+          if (now - session.mtime <= SESSION_MAX_AGE_MS) continue;
+          out.push({ path: join(crateDir, session.name), reason: `old incremental session of ${crate.name} (${name})` });
+          // Cargo's lock file for the session is s-<ts>-<hash>.lock, next to the session dir.
+          const lock = join(crateDir, `${session.name.replace(/-[a-z0-9]+$/, "")}.lock`);
+          if (existsSync(lock) && inside(lock)) out.push({ path: lock, reason: "lock of the old session above" });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+export function isSeedWorktree(wt, main) {
+  return realPath(wt.path) === realPath(main) || SEED_WORKTREE_NAMES.has(basename(wt.path));
+}
+
 export function parseArgs(argv) {
-  const options = { targets: [], merged: false, dryRun: false, yes: false };
+  const options = { targets: [], merged: false, dryRun: false, yes: false, pruneTarget: false, noPruneTarget: false };
   for (const arg of argv) {
     if (arg === "--merged") options.merged = true;
+    else if (arg === "--prune-target") options.pruneTarget = true;
+    else if (arg === "--no-prune-target") options.noPruneTarget = true;
     else if (arg === "--dry-run") options.dryRun = true;
     else if (arg === "--yes" || arg === "-y") options.yes = true;
     else if (arg === "--help" || arg === "-h") options.help = true;
     else if (arg.startsWith("--")) throw new Error(`Unknown option ${arg}`);
     else options.targets.push(arg);
   }
-  if (!options.help && options.merged === (options.targets.length > 0)) {
-    throw new Error("Pass either --merged or one or more worktree paths/branches.");
+  if (options.pruneTarget && options.noPruneTarget) throw new Error("--prune-target and --no-prune-target conflict.");
+  const pruneOnly = options.pruneTarget && !options.merged && options.targets.length === 0;
+  if (!options.help && !pruneOnly && options.merged === (options.targets.length > 0)) {
+    throw new Error("Pass either --merged or one or more worktree paths/branches (or --prune-target alone).");
   }
   return options;
 }
 
-const USAGE = "Usage: npm run worktrees:clean -- [<worktree path|branch>...] [--merged] [--dry-run] [--yes]";
+const USAGE = "Usage: npm run worktrees:clean -- [<worktree path|branch>...] [--merged] [--prune-target] [--no-prune-target] [--dry-run] [--yes]\n"
+  + "  --merged           also prunes stale cargo build data of the worktrees that stay (skip with --no-prune-target)\n"
+  + "  --prune-target     prune stale cargo build data only (no worktree is removed)";
 
 export function resolveTargets(targets, worktrees) {
   return targets.map((target) => {
@@ -304,10 +400,12 @@ export async function runClean(options, {
   let processes;
   try { processes = collectProcesses(deps); } catch (error) { log(`Cannot inspect running processes: ${error.message}. Every worktree will be kept.`); }
 
+  const pruneOnly = options.pruneTarget && !options.merged && options.targets.length === 0;
   const explicit = !options.merged;
-  const candidates = explicit
-    ? resolveTargets(options.targets, worktrees)
-    : worktrees.filter((wt) => realPath(wt.path) !== realPath(main));
+  const candidates = pruneOnly ? []
+    : explicit
+      ? resolveTargets(options.targets, worktrees)
+      : worktrees.filter((wt) => realPath(wt.path) !== realPath(main));
   const verdicts = candidates.map((wt) => evaluateWorktree(wt, { deps, main, processes, explicit }));
 
   const removable = verdicts.filter((v) => v.ok).map((v) => ({ ...v, kib: dirSizeKib(v.path, deps) }));
@@ -319,12 +417,29 @@ export async function runClean(options, {
   const logs = staleLogDirs(tmp, now).map((path) => ({ path, kib: dirSizeKib(path, deps) }));
   for (const l of logs) log(`DELETE ${l.path}  ${formatSize(l.kib)}  (temp log older than 1 day)`);
 
-  const total = [...removable, ...logs].reduce((sum, item) => sum + item.kib, 0);
-  if (removable.length === 0 && logs.length === 0) { log("Nothing to delete."); return { removed: [], freedKib: 0, dryRun: true }; }
+  // Stale cargo build data of the worktrees that stay. A worktree with a process inside, or when the
+  // process list is unknown, is skipped: pruning under a running cargo could break its build.
+  const prune = [];
+  if ((options.merged || options.pruneTarget) && !options.noPruneTarget) {
+    const removing = new Set(removable.map((v) => realPath(v.path)));
+    for (const wt of worktrees) {
+      if (!existsSync(wt.path) || wt.bare || removing.has(realPath(wt.path))) continue;
+      if (!processes) { log(`NOPRUNE ${wt.path}  process list unavailable`); continue; }
+      const busy = blockingProcesses(wt.path, processes);
+      if (busy.length) { log(`NOPRUNE ${wt.path}  ${busy.join("; ")}`); continue; }
+      for (const item of cargoPruneCandidates(wt.path, { now, seed: isSeedWorktree(wt, main) })) {
+        prune.push({ ...item, worktree: wt.path, kib: dirSizeKib(item.path, deps) });
+      }
+    }
+    for (const item of prune) log(`PRUNE  ${item.path}  ${formatSize(item.kib)}  (${item.reason})`);
+  }
+
+  const total = [...removable, ...logs, ...prune].reduce((sum, item) => sum + item.kib, 0);
+  if (removable.length === 0 && logs.length === 0 && prune.length === 0) { log("Nothing to delete."); return { removed: [], freedKib: 0, dryRun: true }; }
 
   let dryRun = options.dryRun;
   if (!dryRun && !options.yes) {
-    if (isTty) dryRun = !(await ask(`Delete ${removable.length} worktree(s) and ${logs.length} log dir(s), freeing ${formatSize(total)}? [y/N] `));
+    if (isTty) dryRun = !(await ask(`Delete ${removable.length} worktree(s), ${logs.length} log dir(s) and ${prune.length} stale cargo path(s), freeing ${formatSize(total)}? [y/N] `));
     else { log("Not a TTY and no --yes: dry run only."); dryRun = true; }
   }
   if (dryRun) { log(`Dry run: would free ${formatSize(total)}.`); return { removed: [], freedKib: 0, dryRun: true }; }
@@ -358,6 +473,25 @@ export async function runClean(options, {
   deps.run("git", ["worktree", "prune"], { cwd: main });
   for (const l of logs) {
     try { await rm(l.path, { recursive: true, force: true }); freed += l.kib; log(`removed ${l.path}`); } catch (error) { log(`FAILED ${l.path}: ${error.message}`); }
+  }
+  // Processes may have started during the confirmation prompt: look again, per worktree, before any rm.
+  let freshProcesses = null;
+  if (prune.length) { try { freshProcesses = collectProcesses(deps); } catch { /* unknown: prune nothing */ } }
+  const blocked = new Map();
+  for (const item of prune) {
+    if (!blocked.has(item.worktree)) {
+      const busy = freshProcesses ? blockingProcesses(item.worktree, freshProcesses) : ["process list unavailable"];
+      blocked.set(item.worktree, busy);
+      if (busy.length) log(`NOPRUNE ${item.worktree}  ${busy.join("; ")}`);
+    }
+  }
+  for (const item of prune) {
+    if (blocked.get(item.worktree).length) continue;
+    // Re-check right before deleting: still a real path inside its own worktree, not a symlink.
+    let safe = false;
+    try { safe = !lstatSync(item.path).isSymbolicLink() && isInside(item.path, item.worktree) && realPath(item.path) !== realPath(item.worktree); } catch { /* gone */ }
+    if (!safe) continue;
+    try { await rm(item.path, { recursive: true, force: true }); freed += item.kib; log(`pruned ${item.path}`); } catch (error) { log(`FAILED ${item.path}: ${error.message}`); }
   }
   log(`Freed ${formatSize(freed)}.`);
   return { removed, freedKib: freed, dryRun: false };
