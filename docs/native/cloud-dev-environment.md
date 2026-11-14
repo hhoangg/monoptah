@@ -154,6 +154,13 @@ agent argument, which is what the app sends for an image or a template):
   (uid 2000, `HOME=/home/user`). The provisioning scripts take `$HOME` from the login user and
   assume neither `root` nor `agent`.
 
+### A Docker Sandbox as your own Linux build box
+
+This page is about the sandboxes the app starts. To use a sandbox yourself, or from an agent,
+as the Linux machine for fmt, clippy and tests of a ticket (a warm large sandbox, an edit loop
+of 6.5 to 8 minutes, scripts in `scripts/sandbox/`), see [sandbox-build-box.md](sandbox-build-box.md).
+It also lists what a sandbox cannot check.
+
 ## Codespaces need an SSH server
 
 The app reaches a codespace through `gh codespace ssh`, so the dev container must run an SSH
