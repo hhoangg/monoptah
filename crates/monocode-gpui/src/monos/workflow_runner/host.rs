@@ -642,6 +642,7 @@ impl Monos {
             v.install_transfer(settings, None, cx);
             v.configure_mono(mono, root, env, cx);
         });
+        self.push_emoji(&mono_id, &view, cx);
         let changes = cx.subscribe(&view, move |this, _, _: &SessionChanged, cx| {
             this.workflow_ask_changed(session, cx)
         });

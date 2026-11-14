@@ -466,7 +466,11 @@ fn record(
                     target,
                     action,
                     confirmed,
-                } => format!("act {action:?} {} {confirmed:?}", target.cloud.name),
+                    acknowledged,
+                } => format!(
+                    "act {action:?} {} {confirmed:?} ack={acknowledged}",
+                    target.cloud.name
+                ),
                 Event::Stopped(cloud) => format!("stopped {}", cloud.name),
                 Event::Deleted { cloud, removed } => format!("deleted {} {removed:?}", cloud.name),
             })
@@ -657,6 +661,7 @@ fn stop_goes_through_the_app_api_and_the_row_is_read_again(cx: &mut TestAppConte
             target(CloudRef::codespace(USED)),
             Action::Stop,
             vec![],
+            false,
             LiveBusy::default(),
             cx,
         )
@@ -671,6 +676,7 @@ fn stop_goes_through_the_app_api_and_the_row_is_read_again(cx: &mut TestAppConte
             target(CloudRef::sandbox(SBX_USED)),
             Action::Stop,
             vec![],
+            false,
             LiveBusy::default(),
             cx,
         )
@@ -778,7 +784,7 @@ fn delete_reads_what_would_be_lost_asks_first_and_sends_back_what_was_shown(
     // What the user was shown travels with the confirmation.
     assert_eq!(
         *events.lock().unwrap(),
-        ["act Delete octo-used [\"It has changes that were not committed.\"]"]
+        ["act Delete octo-used [\"It has changes that were not committed.\"] ack=true"]
     );
     assert_eq!(
         w.gh.count("codespace delete"),
@@ -819,7 +825,10 @@ fn a_clean_codespace_of_this_app_needs_no_acknowledgement_but_a_sandbox_always_d
     let mut visual = draw(&window, cx);
     assert!(bounds(&mut visual, &format!("cloud-ws-acknowledge-{USED}")).is_none());
     click(&mut visual, &format!("cloud-ws-confirm-delete-{USED}"));
-    assert_eq!(*events.lock().unwrap(), ["act Delete octo-used []"]);
+    assert_eq!(
+        *events.lock().unwrap(),
+        ["act Delete octo-used [] ack=false"]
+    );
 
     // A sandbox cannot be read without starting it: the user has to say they understood.
     let sandbox = target(CloudRef::sandbox(SBX_USED));
@@ -843,7 +852,7 @@ fn a_clean_codespace_of_this_app_needs_no_acknowledgement_but_a_sandbox_always_d
     click(&mut visual, &format!("cloud-ws-confirm-delete-{SBX_USED}"));
     assert_eq!(
         *events.lock().unwrap(),
-        [format!("act Delete {SBX_USED} []")]
+        [format!("act Delete {SBX_USED} [] ack=true")]
     );
     assert!(
         w.sbx.verbs().iter().all(|v| v == "ls"),
@@ -916,7 +925,7 @@ fn a_workspace_this_app_did_not_create_is_not_an_orphan_and_deleting_it_is_guard
     click(&mut visual, &format!("cloud-ws-confirm-delete-{BY_HAND}"));
     assert_eq!(
         *events.lock().unwrap(),
-        [format!("act Delete {BY_HAND} []")]
+        [format!("act Delete {BY_HAND} [] ack=true")]
     );
 }
 
@@ -1009,6 +1018,7 @@ fn work_that_appeared_after_the_confirmation_refuses_the_delete_and_the_row_says
             used.clone(),
             Action::Delete,
             confirmed,
+            false,
             LiveBusy::default(),
             cx,
         )
@@ -1037,6 +1047,7 @@ fn the_dialog_cannot_be_closed_while_a_delete_runs(cx: &mut TestAppContext) {
                 target(CloudRef::codespace(USED)),
                 Action::Delete,
                 vec![],
+                false,
                 LiveBusy::default(),
                 cx,
             );
@@ -1071,6 +1082,7 @@ fn deleting_a_codespace_forgets_its_sessions_and_reports_their_ids(cx: &mut Test
             target(CloudRef::codespace(USED)),
             Action::Delete,
             vec![],
+            false,
             LiveBusy::default(),
             cx,
         )
@@ -1107,6 +1119,7 @@ fn deleting_a_running_sandbox_stops_it_first(cx: &mut TestAppContext) {
             target(CloudRef::sandbox(SBX_USED)),
             Action::Delete,
             vec![],
+            false,
             LiveBusy::default(),
             cx,
         )
@@ -1140,6 +1153,7 @@ fn a_hibernating_sandbox_can_be_deleted_once_it_has_stopped(cx: &mut TestAppCont
             target(hibernating.clone()),
             Action::Delete,
             vec![],
+            false,
             LiveBusy::default(),
             cx,
         )
@@ -1169,6 +1183,7 @@ fn a_working_session_blocks_the_delete_and_the_row_says_so(cx: &mut TestAppConte
             target(CloudRef::codespace(USED)),
             Action::Delete,
             vec![],
+            false,
             busy,
             cx,
         )
@@ -1236,4 +1251,218 @@ fn the_estimate_helpers_read_as_the_dialog_words_them(_cx: &mut TestAppContext) 
         model::summary_line(&model::Summary::default()),
         model::NO_WORKSPACES
     );
+}
+
+#[gpui::test]
+fn stop_asks_first_when_a_session_works_on_the_row_or_the_workspace_is_not_ours(
+    cx: &mut TestAppContext,
+) {
+    const BY_HAND: &str = "octo-by-hand";
+    let w = world();
+    let mut list: Vec<Value> = serde_json::from_str(&w.gh.list.lock().unwrap()).unwrap();
+    list.push(codespace(
+        BY_HAND,
+        "basicLinux32gb",
+        "Available",
+        hours_ago(5.0),
+    ));
+    *w.gh.list.lock().unwrap() = Value::Array(list).to_string();
+    let window = open(&w, cx);
+    let events = record(&window, cx);
+    let loaded = view(&window, cx);
+    let row = |name: &str| loaded.rows.iter().find(|r| r.cloud.name == name).unwrap();
+
+    // The rule: ours and idle stops at once; a working session or a foreign workspace asks.
+    assert!(!model::stop_asks(row(USED)));
+    let mut working = row(USED).clone();
+    working.sessions[0].busy = true;
+    assert!(model::stop_asks(&working));
+    assert!(model::stop_asks(row(BY_HAND)));
+    let prompt = model::stop_prompt(&working);
+    assert!(
+        prompt
+            .iter()
+            .any(|l| l.contains("working on it right now") && l.contains("interrupts that turn")),
+        "{prompt:?}"
+    );
+    let prompt = model::stop_prompt(row(BY_HAND));
+    assert!(
+        prompt[0].starts_with("Monoptah did not create") && prompt[0].contains(BY_HAND),
+        "{prompt:?}"
+    );
+    assert!(prompt.last().unwrap().starts_with("Stop codespace"));
+
+    // A workspace of this app that nothing works on stops with one click.
+    let mut visual = draw(&window, cx);
+    click(&mut visual, &format!("cloud-ws-stop-{USED}"));
+    assert_eq!(*events.lock().unwrap(), ["act Stop octo-used [] ack=false"]);
+    events.lock().unwrap().clear();
+
+    // A foreign one asks: the click emits nothing until the user confirms.
+    let hand = target(CloudRef::codespace(BY_HAND));
+    click(&mut visual, &format!("cloud-ws-stop-{BY_HAND}"));
+    assert!(events.lock().unwrap().is_empty(), "asked, did not act");
+    assert!(
+        window
+            .read_with(&visual, |d, _| d.asks_to_stop(&hand))
+            .unwrap()
+    );
+    assert!(bounds(&mut visual, &format!("cloud-ws-confirm-stop-{BY_HAND}")).is_some());
+    // Cancel leaves it as it was (and Escape does the same).
+    click(&mut visual, &format!("cloud-ws-cancel-stop-{BY_HAND}"));
+    assert!(
+        !window
+            .read_with(&visual, |d, _| d.asks_to_stop(&hand))
+            .unwrap()
+    );
+    assert!(events.lock().unwrap().is_empty());
+    click(&mut visual, &format!("cloud-ws-stop-{BY_HAND}"));
+    act(&window, cx, |d, cx| assert!(d.cancel_confirm(cx)));
+    assert!(!window.read_with(cx, |d, _| d.asks_to_stop(&hand)).unwrap());
+    // Confirmed, it acts.
+    let mut visual = draw(&window, cx);
+    click(&mut visual, &format!("cloud-ws-stop-{BY_HAND}"));
+    click(
+        &mut visual,
+        &format!("cloud-ws-confirm-stop-button-{BY_HAND}"),
+    );
+    assert_eq!(
+        *events.lock().unwrap(),
+        ["act Stop octo-by-hand [] ack=false"]
+    );
+    assert_eq!(w.gh.count("codespace stop"), 0, "the shell runs it");
+}
+
+#[gpui::test]
+fn the_warning_of_a_stop_is_shown_not_dropped(cx: &mut TestAppContext) {
+    let w = world();
+    let window = open(&w, cx);
+    // The shell says a session of the workspace is mid-turn: the stop goes on and warns.
+    let busy = LiveBusy {
+        sessions: [w.used_session].into(),
+        ..LiveBusy::default()
+    };
+    act(&window, cx, |d, cx| {
+        d.run(
+            target(CloudRef::codespace(USED)),
+            Action::Stop,
+            vec![],
+            false,
+            busy,
+            cx,
+        )
+    });
+    assert_eq!(w.gh.count("codespace stop -c octo-used"), 1);
+    let warnings = window.read_with(cx, |d, _| d.warnings()).unwrap();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].starts_with(
+            "octo-used: Sessions that were working on this codespace were interrupted"
+        ),
+        "{warnings:?}"
+    );
+    let mut visual = draw(&window, cx);
+    assert!(bounds(&mut visual, "cloud-ws-warning-0").is_some());
+    // The next action on the same workspace clears it.
+    act(&window, cx, |d, cx| {
+        d.run(
+            target(CloudRef::codespace(USED)),
+            Action::Stop,
+            vec![],
+            false,
+            LiveBusy::default(),
+            cx,
+        )
+    });
+    assert!(
+        window
+            .read_with(cx, |d, _| d.warnings().is_empty())
+            .unwrap()
+    );
+}
+
+#[gpui::test]
+fn deleting_a_workspace_this_app_did_not_create_needs_the_acknowledgement_in_the_call_too(
+    cx: &mut TestAppContext,
+) {
+    const BY_HAND: &str = "octo-by-hand";
+    let w = world();
+    let mut list: Vec<Value> = serde_json::from_str(&w.gh.list.lock().unwrap()).unwrap();
+    list.push(codespace(
+        BY_HAND,
+        "basicLinux32gb",
+        "Available",
+        hours_ago(5.0),
+    ));
+    *w.gh.list.lock().unwrap() = Value::Array(list).to_string();
+    let window = open(&w, cx);
+    let hand = target(CloudRef::codespace(BY_HAND));
+    // `confirmed: []` without the acknowledgement (a caller that skipped the dialog's checkbox).
+    act(&window, cx, |d, cx| {
+        d.run(
+            hand.clone(),
+            Action::Delete,
+            vec![],
+            false,
+            LiveBusy::default(),
+            cx,
+        )
+    });
+    assert_eq!(w.gh.count("codespace delete"), 0);
+    let error = window
+        .read_with(cx, |d, _| d.error_of(&hand).map(str::to_owned))
+        .unwrap()
+        .expect("the refusal is shown on the row");
+    assert!(error.contains("did not create"), "{error}");
+    act(&window, cx, |d, cx| {
+        d.run(
+            hand.clone(),
+            Action::Delete,
+            vec![],
+            true,
+            LiveBusy::default(),
+            cx,
+        )
+    });
+    assert_eq!(w.gh.count("codespace delete -c octo-by-hand --force"), 1);
+}
+
+#[gpui::test]
+fn the_delete_prompt_of_a_codespace_says_the_git_state_is_as_github_last_reported(
+    cx: &mut TestAppContext,
+) {
+    let w = world();
+    let window = open(&w, cx);
+    let used = target(CloudRef::codespace(USED));
+    act(&window, cx, |d, cx| d.ask_to_delete(&used, cx));
+    // A clean report is still only GitHub's last word.
+    let prompt = prompt_of(&window, cx, &used.cloud);
+    assert!(
+        prompt
+            .iter()
+            .any(|l| l.contains("as GitHub last reported it")),
+        "{prompt:?}"
+    );
+    // A sandbox has no git state to report, so it does not say so.
+    let sandbox = target(CloudRef::sandbox(SBX_USED));
+    act(&window, cx, |d, cx| d.ask_to_delete(&sandbox, cx));
+    let prompt = prompt_of(&window, cx, &sandbox.cloud);
+    assert!(!prompt.iter().any(|l| l.contains("GitHub")), "{prompt:?}");
+}
+
+#[gpui::test]
+fn a_refresh_asked_for_while_a_load_runs_is_kept_and_read_after_it(cx: &mut TestAppContext) {
+    let w = world();
+    let window = open(&w, cx);
+    assert_eq!(w.gh.count("codespace list"), 1);
+    // An action finished while a load was in flight: two refreshes in a row.
+    act(&window, cx, |d, cx| {
+        d.refresh(cx);
+        assert!(d.is_loading());
+        d.refresh(cx);
+    });
+    // The first (stale) result was dropped for a second read, not shown and then left alone.
+    assert_eq!(w.gh.count("codespace list"), 3);
+    assert!(!window.read_with(cx, |d, _| d.is_loading()).unwrap());
+    assert!(window.read_with(cx, |d, _| d.view().is_some()).unwrap());
 }

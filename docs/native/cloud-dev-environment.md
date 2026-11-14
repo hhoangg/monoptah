@@ -22,12 +22,21 @@ sandboxes both work (aarch64 verified; x86_64 uses the same file, with the
 
 ## Resources: what is applied, and what you need
 
-- **Docker Sandbox**: size comes only from the project's sandbox setup (`cpus`/`memory`,
-  default 2 CPUs / 4g; shapes 1/2g, 2/4g, 4/8g, ...). The app passes them to
-  `sbx create --cpus --memory` when the sandbox is created, so changing them later needs a
-  new sandbox. `hostRequirements` in `devcontainer.json` is ignored here; it only makes
-  Codespaces offer a big enough machine. This change does not alter the app's defaults or
-  any project's settings.
+- **Docker Sandbox**: size comes from the project's sandbox setup (`cpus`/`memory`,
+  default 2 CPUs / 4g). `sbx` accepts only the shapes 1/2g, 2/4g, 4/8g, 8/16g and 16/32g.
+  The app passes the size to `sbx create --cpus --memory` when the sandbox is created, so
+  changing it later needs a new sandbox. `sbx` itself ignores `hostRequirements` in
+  `devcontainer.json`, so the app reads it from the local checkout (the project's devcontainer
+  path) and warns, in Cloud settings and in the composer's Size row, when a size is below it.
+  Every size stays selectable and nothing is raised for you there. A Mono starting a sandbox
+  through the app API without naming a size gets the saved size raised to the smallest shape
+  that meets `hostRequirements`, but never above 8 CPUs / 16g by itself (a larger requirement
+  keeps the saved size and says so); the start result reports the size in `target.cpus` and
+  `target.memory` and why in `note`, and the saved setting is not changed. A saved size that is
+  not a shape is rounded up to the next shape, never down. A Mono giving only `cpus` or only
+  `memory` gets the other half of that shape, and a pair that is not a shape is refused before
+  anything is created. A size named explicitly is used as it is. For this repository
+  (`cpus: 4`, `memory: 8gb`) the raise is 4 CPUs / 8g.
 - **Concurrency**: the container sets `CARGO_BUILD_JOBS=1`. Memory, not CPU, is the limit:
   one `rustc` for the GPUI test binary needs more than 4g by itself, and several in parallel
   add up (the 4-job GPUI test build on 8g was killed with SIGKILL, the OOM-killer signature). 2 jobs was not tried on 8g. Raise the variable only
@@ -80,7 +89,8 @@ delete.
 
 A template fixes the sandbox size: `sbx` rejects `--cpus` and `--memory` with it
 ("template-mode sandboxes use the template's baked-in sizing"). The app therefore sends none,
-does not check the saved size, shows **Size comes from the template** in the Cloud settings
+does not check the saved size (when an image overrides a template project through the Mono
+API, the saved size is rounded up to a billable shape and the response says so), shows **Size comes from the template** in the Cloud settings
 dialog and in the composer panel, and refuses `cpus` / `memory` next to `template` in `sessions.start`.
 You need one template per size, and per platform (a template inherits the platform it was
 saved on; without `--platform` the new sandbox inherits it). A public image is different: `sbx`

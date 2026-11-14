@@ -7,12 +7,15 @@
 use super::provider::{
     current_branch, option_text, CloudInstance, CloudKindSpec, CloudProvider, CloudStart,
 };
-use crate::cloud_sessions::docker_config::{self, valid_ref, DockerProjectConfig};
+use crate::cloud_sessions::docker_config::{self, valid_ref};
+use crate::cloud_sessions::docker_size;
+use crate::cloud_sessions::project_cloud;
 use crate::cloud_sessions::{CloudBackendKind, CloudRef, CloudSessions, CloudState};
 use crate::sandboxes::{self, Prerequisites, SandboxSource};
 use crate::store::{RemoteSession, Store};
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
@@ -193,48 +196,6 @@ impl SandboxProvider {
     }
 }
 
-/// A project saved on a template stores a size nobody validated (the template fixes the
-/// real one). When a start switches it to an image, the part of the size the caller did not
-/// send is that stored one: check it here the way an image start will, and say where it came
-/// from, instead of failing later with a cpus/memory error the caller never caused.
-fn check_saved_size(
-    config: &DockerProjectConfig,
-    options: &Map<String, Value>,
-) -> Result<(), String> {
-    let saved_cpus = !options.contains_key("cpus");
-    let saved_memory = !options.contains_key("memory");
-    if !saved_cpus && !saved_memory {
-        return Ok(());
-    }
-    let what = match (saved_cpus, saved_memory) {
-        (true, true) => "size",
-        (true, false) => "CPU count",
-        _ => "memory",
-    };
-    let memory = config.memory.trim().to_lowercase();
-    let check = || -> Result<(), String> {
-        if saved_cpus {
-            docker_config::check_cpus(config.cpus)?;
-        }
-        if saved_memory {
-            docker_config::check_memory(&memory)?;
-        }
-        let cpus = u8::try_from(config.cpus).map_err(|_| "CPUs are out of range.".to_string())?;
-        sandboxes::Compute {
-            cpus,
-            memory: memory.clone(),
-            ..Default::default()
-        }
-        .validate_size()
-    };
-    check().map_err(|reason| {
-        format!(
-            "The {what} saved with the project's template ({} CPUs, {}) cannot be used for an image: {reason} Send target.cpus and target.memory, or fix the size in the project's Cloud settings.",
-            config.cpus, config.memory
-        )
-    })
-}
-
 /// `4096` MiB as `4g`, `512` as `512m`.
 fn memory_text(mib: u64) -> String {
     if mib >= 1024 && mib.is_multiple_of(1024) {
@@ -381,11 +342,12 @@ impl CloudProvider for SandboxProvider {
         }
     }
 
-    /// New: the project's Docker config (with optional `cpus`, `memory`, `ttl` overrides) and
-    /// `branch` (default: the current branch) through `begin_sandbox_start`. Existing: another
-    /// ready session on the sandbox, see `CloudSessions::attach_session`. A `template` or `image`
-    /// option replaces the project's environment for this start; a template cannot be combined
-    /// with `cpus` / `memory`.
+    /// New: the project's Docker config (with optional `cpus`, `memory`, `ttl` overrides, the
+    /// size fitted by [`docker_size::requested_size`]) and `branch` (default: the current
+    /// branch) through `begin_sandbox_start`. Existing: another ready session on the sandbox,
+    /// see `CloudSessions::attach_session`. A `template` or `image` option replaces the
+    /// project's environment for this start; a template cannot be combined with `cpus` /
+    /// `memory`.
     fn start(
         &self,
         project: &str,
@@ -410,22 +372,6 @@ impl CloudProvider for SandboxProvider {
         let mut config = self.config(project)?.ok_or(
             "Docker Sandbox is not set up for this project. Set it up in the project's Cloud settings first.",
         )?;
-        if let Some(cpus) = options.get("cpus").and_then(Value::as_u64) {
-            config.cpus = u32::try_from(cpus).map_err(|_| "cpus is too large")?;
-        }
-        if let Some(memory) = option_text(options, "memory") {
-            config.memory = memory.to_owned();
-        }
-        if let Some(ttl) = option_text(options, "ttl") {
-            config.ttl = ttl.to_owned();
-        }
-        // This session's own Claude account replaces the project's for this sandbox only.
-        if let Some(account) = account {
-            config.claude_account = Some(account.to_owned());
-        }
-        // A project on a template never had its saved cpus/memory checked (the template fixes
-        // the size), so remember that before an override can turn the start into an image one.
-        let size_unchecked = config.size_from_template();
         // A template or image named here replaces the project's environment for this start.
         let template = option_text(options, "template");
         let image = option_text(options, "image");
@@ -442,8 +388,15 @@ impl CloudProvider for SandboxProvider {
             }
             (None, None) => {}
         }
+        // A lone cpus or memory takes its shape's other half; neither takes the saved size,
+        // raised to fit the devcontainer's hostRequirements (up to a cap) when a dev container
+        // is built, with a note that goes back to the caller. A saved size nobody validated
+        // (a template project's) is rounded up to a shape, so an override that turns a
+        // template project into an image one starts with that fitted size.
+        let mut note = None;
         if config.size_from_template() {
-            // Also covers a project whose saved environment is a template.
+            // Also covers a project whose saved environment is a template: it fixes the size,
+            // so there is nothing to fit and no note.
             if let Some(size) = ["cpus", "memory"]
                 .into_iter()
                 .find(|k| options.contains_key(*k))
@@ -452,11 +405,33 @@ impl CloudProvider for SandboxProvider {
                     "target.{size} cannot be used with a template: the template fixes the sandbox size"
                 ));
             }
-        } else if size_unchecked {
-            // Template project switched to an image: the size the caller did not send comes
-            // from the project's saved one, which nothing ever validated. Name its origin
-            // instead of failing with a cpus/memory error the caller never caused.
-            check_saved_size(&config, options)?;
+        } else {
+            let cpus = match options.get("cpus").and_then(Value::as_u64) {
+                Some(cpus) => Some(u32::try_from(cpus).map_err(|_| "cpus is too large")?),
+                None => None,
+            };
+            // hostRequirements only matter when the dev container is built in the sandbox.
+            let devcontainer = if config.uses_devcontainer() {
+                project_cloud::devcontainer_info(Path::new(project), &config.devcontainer_path)
+            } else {
+                Default::default()
+            };
+            let size = docker_size::requested_size(
+                &config,
+                cpus,
+                option_text(options, "memory"),
+                &devcontainer,
+            )?;
+            config.cpus = size.cpus;
+            config.memory = size.memory;
+            note = size.note;
+        }
+        if let Some(ttl) = option_text(options, "ttl") {
+            config.ttl = ttl.to_owned();
+        }
+        // This session's own Claude account replaces the project's for this sandbox only.
+        if let Some(account) = account {
+            config.claude_account = Some(account.to_owned());
         }
         let config = config.validated()?;
         let branch = match option_text(options, "branch") {
@@ -471,7 +446,7 @@ impl CloudProvider for SandboxProvider {
             kit,
             account.is_some(),
         )?;
-        Ok(CloudStart::Pending(session, record))
+        Ok(CloudStart::Pending(session, record, note))
     }
 
     /// Reconnects the sandbox (resuming it when stopped) through the session. BLOCKS for

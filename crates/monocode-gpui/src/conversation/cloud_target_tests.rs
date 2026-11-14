@@ -853,6 +853,82 @@ fn overrides_change_the_sandbox_request_and_never_the_project_config(cx: &mut Te
     assert_eq!(sent[0].machine, None);
 }
 
+/// The Size menu's `(id, checked)` rows.
+fn size_rows(view: &Conversation) -> Vec<(String, bool)> {
+    let (_, items) = view.cloud_field_menu(CloudField::Size);
+    items
+        .iter()
+        .filter_map(|item| match item {
+            MenuItem::Action(a) => Some((a.id.to_string(), a.checked)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[gpui::test]
+fn a_size_below_the_devcontainer_warns_but_stays_selectable_and_is_not_raised(
+    cx: &mut TestAppContext,
+) {
+    // This repository's devcontainer asks for 4 CPUs and 8 GB; the saved size is the default,
+    // 2 CPUs / 4g. Like Cloud settings, the composer warns and changes nothing by itself.
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let dir = std::path::Path::new(&repo).join(".devcontainer");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("devcontainer.json"),
+        r#"{ "hostRequirements": { "cpus": 4, "memory": "8gb" } }"#,
+    )
+    .unwrap();
+    let window = conversation(cx, &repo, false);
+    let requests = watch(window, cx);
+    window
+        .update(cx, |view, _, cx| {
+            save_config(view);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            let draft = view.cloud_draft.as_ref().unwrap();
+            // Not raised: the draft keeps the saved size.
+            assert_eq!((draft.cpus, draft.memory.as_str()), (2, "4g"));
+            let warning = draft.size_warning().unwrap();
+            assert_eq!(
+                warning,
+                "Below what the devcontainer asks for 4 CPUs and 8 GB. The environment may not build or run."
+            );
+            // Every size is still offered, the smaller ones too, and the saved one is checked.
+            let rows = size_rows(view);
+            assert_eq!(rows.len(), 5, "{rows:?}");
+            assert_eq!(
+                rows.iter()
+                    .filter(|(_, checked)| *checked)
+                    .map(|(id, _)| id.as_str())
+                    .collect::<Vec<_>>(),
+                ["cloud-set:size:2:4g"]
+            );
+            assert!(rows.iter().any(|(id, _)| id == "cloud-set:size:1:2g"));
+            // A smaller one can be chosen, and a size that meets the devcontainer ends the warning.
+            assert!(view.cloud_menu_choice("cloud-set:size:1:2g", cx));
+            assert!(view.cloud_draft.as_ref().unwrap().size_warning().is_some());
+            assert!(view.cloud_menu_choice("cloud-set:size:4:8g", cx));
+            assert_eq!(view.cloud_draft.as_ref().unwrap().size_warning(), None);
+            assert!(view.cloud_menu_choice("cloud-set:size:2:4g", cx));
+            view.create_cloud(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let sent = requests.lock().unwrap();
+    let config = sent[0].config.as_ref().unwrap();
+    assert_eq!((config.cpus, config.memory.as_str()), (2, "4g"));
+    drop(sent);
+    // A project without a devcontainer has nothing to warn about.
+    let window = conversation(cx, PROJECT, false);
+    window
+        .update(cx, |view, _, cx| {
+            save_config(view);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            assert_eq!(view.cloud_draft.as_ref().unwrap().size_warning(), None);
+        })
+        .unwrap();
+}
+
 #[gpui::test]
 fn an_invalid_override_is_refused_inline_with_the_config_validation(cx: &mut TestAppContext) {
     let window = conversation(cx, PROJECT, false);
@@ -3646,6 +3722,15 @@ fn the_size_row_of_a_template_project_is_never_a_change_for_this_session(cx: &mu
             draft.memory = "16g".into();
             assert!(!draft.row_changed(CloudRow::Size));
             assert_eq!(draft.changed_count(), 0);
+            // Nor does the devcontainer size warning apply to a size nobody uses.
+            draft.devcontainer = monocode_core::cloud_sessions::project_cloud::DevcontainerInfo {
+                host_cpus: Some(16),
+                host_memory_mib: Some(64 * 1024),
+                ..Default::default()
+            };
+            draft.cpus = 1;
+            draft.memory = "2g".into();
+            assert_eq!(draft.size_warning(), None);
             set_text(view, |d| d.branch.clone(), "feature/x", cx);
             view.create_cloud(cx);
         })
@@ -3655,6 +3740,38 @@ fn the_size_row_of_a_template_project_is_never_a_change_for_this_session(cx: &mu
     assert_eq!(sent.len(), 1, "the start was not refused");
     let config = sent[0].config.as_ref().unwrap();
     assert_eq!((config.cpus, config.memory.as_str()), (3, "5g"));
+}
+
+#[gpui::test]
+fn the_devcontainer_size_warning_needs_a_built_devcontainer(cx: &mut TestAppContext) {
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    window
+        .update(cx, |view, _, cx| {
+            save_template_config(view, 2, "4g");
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            let draft = view.cloud_draft.as_mut().unwrap();
+            draft.devcontainer = monocode_core::cloud_sessions::project_cloud::DevcontainerInfo {
+                host_cpus: Some(8),
+                host_memory_mib: Some(16 * 1024),
+                ..Default::default()
+            };
+            draft.cpus = 2;
+            draft.memory = "4g".into();
+            let mut config = draft.config.clone().unwrap();
+            config.environment = monocode_core::sandboxes::SandboxSource::Image {
+                reference: "rust:slim".into(),
+            };
+            // An image without the dev container: nothing is built, nothing to warn about.
+            config.use_devcontainer = None;
+            draft.config = Some(config.clone());
+            assert_eq!(draft.size_warning(), None);
+            // With the dev container built the size can be below what it asks for.
+            config.use_devcontainer = Some(true);
+            draft.config = Some(config);
+            assert!(draft.size_warning().is_some());
+        })
+        .unwrap();
 }
 
 #[gpui::test]

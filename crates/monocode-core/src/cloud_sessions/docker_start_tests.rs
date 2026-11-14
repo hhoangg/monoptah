@@ -63,6 +63,8 @@ struct Sbx {
     calls: Mutex<Vec<String>>,
     /// The Docker account of every call, parallel to `calls`.
     accounts: Mutex<Vec<Option<String>>>,
+    /// When set, `ls` fails with this text (signed out, say).
+    ls_error: Mutex<Option<String>>,
 }
 impl Sbx {
     fn new(mode: CreateMode) -> Arc<Self> {
@@ -71,6 +73,7 @@ impl Sbx {
             mode: Mutex::new(mode),
             calls: Mutex::new(vec![]),
             accounts: Mutex::new(vec![]),
+            ls_error: Mutex::new(None),
         })
     }
     fn calls(&self) -> Vec<String> {
@@ -155,7 +158,10 @@ impl SbxRunner for Sbx {
             serde_json::to_string(&items).unwrap()
         };
         match verb {
-            "ls" => out(true, &list(), ""),
+            "ls" => match self.ls_error.lock().unwrap().clone() {
+                Some(error) => out(false, "", &error),
+                None => out(true, &list(), ""),
+            },
             "inspect" => {
                 let id = &args[3];
                 let found = self
@@ -1361,6 +1367,79 @@ fn failures_are_redacted_and_name_the_phase() {
         if let StartEvent::Log(line) = event {
             assert!(!line.contains(GIT_TOKEN) && !line.contains(SECRET));
         }
+    }
+}
+
+/// The tags of the shell calls made after the first `skip` ones.
+fn shell_tags_after(fx: &Fx, skip: usize) -> Vec<String> {
+    fx.shell.tags().into_iter().skip(skip).collect()
+}
+
+#[test]
+fn a_step_failing_for_a_missing_prerequisite_says_what_to_run_before_retry() {
+    let fx = fx();
+    let (session, _) = fx.begin().unwrap();
+    // Signed out of Docker since the sandbox was created: ssh into it fails.
+    fx.shell.fail(
+        "phase:clone",
+        "kex_exchange_identification: Connection closed",
+    );
+    *fx.sbx.ls_error.lock().unwrap() =
+        Some("error: not logged in, run `sbx login` to authenticate".into());
+    let shell_before = fx.shell.calls().len();
+    let (result, _) = fx.run(session.id);
+    let error = result.unwrap_err();
+    assert!(
+        error.starts_with("Sign in to Docker first: run `sbx login`."),
+        "{error}"
+    );
+    assert!(error.contains("Then Retry."), "{error}");
+    assert!(error.contains("Cloning the repository failed"), "{error}");
+    assert!(
+        error.contains("was kept; Retry resumes this start"),
+        "{error}"
+    );
+    assert_eq!(
+        fx.record(session.id).unwrap().error.as_deref(),
+        Some(error.as_str())
+    );
+    // The diagnosis asked `sbx ls` only: after the failing step nothing ran in the sandbox
+    // (no ssh to find out), so nothing was woken or billed.
+    let after = shell_tags_after(&fx, shell_before);
+    assert_eq!(after.last().map(String::as_str), Some("phase:clone"));
+    // The ssh alias was removed: `sbx --cloud setup ssh`.
+    *fx.sbx.ls_error.lock().unwrap() = None;
+    std::fs::remove_file(fx._home.path().join(".ssh/sandboxes/config")).unwrap();
+    let (result, _) = fx.run(session.id);
+    let error = result.unwrap_err();
+    assert!(
+        error.starts_with("SSH is not set up for cloud sandboxes: run `sbx --cloud setup ssh`."),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_step_failing_on_its_own_work_is_not_diagnosed() {
+    // `sbx ls` calls a start makes when a step fails with `failure`, `sbx` being healthy.
+    let ls_calls = |failure: &str| {
+        let fx = fx();
+        let (session, _) = fx.begin().unwrap();
+        fx.shell.fail("phase:clone", failure);
+        fx.sbx.forget_calls();
+        let (result, _) = fx.run(session.id);
+        let error = result.unwrap_err();
+        // A healthy sbx has nothing to add: the error is the step's own.
+        assert!(!error.contains("Then Retry"), "{error}");
+        fx.sbx.count("ls")
+    };
+    let probed = ls_calls("kex_exchange_identification: Connection closed");
+    // A Git 401 or a build error is no sign of a missing prerequisite: no extra `sbx ls`
+    // (up to 20 s each when sbx is slow) is spent after the failure.
+    for failure in [
+        "fatal: Authentication failed for 'https://github.com/octo/widgets.git/' (HTTP 401)",
+        "error: devcontainer build failed: exit 2",
+    ] {
+        assert_eq!(ls_calls(failure) + 1, probed, "{failure}");
     }
 }
 
@@ -4290,6 +4369,39 @@ mod docker_accounts {
     }
     fn shell_accounts(fx: &Fx) -> Vec<Option<String>> {
         fx.shell.calls().into_iter().map(|c| c.account).collect()
+    }
+
+    #[test]
+    fn a_prerequisite_hint_after_a_failed_step_is_asked_as_the_projects_account() {
+        let installed = Installed::new();
+        let a = installed.add("alice");
+        let fx = fx();
+        let (session, _) = begin_as(&fx, Some(&a)).unwrap();
+        // The machine login is signed out and so is what `sbx ls` reports now; the project
+        // runs as its account, so the advice is never `sbx login`.
+        fx.shell.fail(
+            "phase:clone",
+            "kex_exchange_identification: Connection closed",
+        );
+        *fx.sbx.ls_error.lock().unwrap() =
+            Some("error: not logged in, run `sbx login` to authenticate".into());
+        fx.sbx.forget_calls();
+        let (result, _) = fx.run(session.id);
+        let error = result.unwrap_err();
+        assert!(
+            error.starts_with(
+                "Docker Sandboxes did not accept this Docker account's token. Replace it in Settings > Cloud."
+            ),
+            "{error}"
+        );
+        assert!(!error.contains("Sign in to Docker first"), "{error}");
+        assert!(error.contains("Cloning the repository failed"), "{error}");
+        // Every probe, the diagnosis included, ran as the account.
+        assert!(
+            only(sbx_accounts(&fx), Some(&a)),
+            "{:?}",
+            fx.sbx.verbs_with_accounts()
+        );
     }
 
     #[test]

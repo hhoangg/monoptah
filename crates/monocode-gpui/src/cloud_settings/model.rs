@@ -8,7 +8,6 @@ pub(super) use crate::cloud_presets::{
     CODESPACE_SECRET_LABEL, docker_account_label, idle_label, idle_options, machine_label,
     memory_mib, runtime_label, runtime_options, size_label, size_options,
 };
-use crate::cloud_presets::{gb_text, plural};
 use monocode_core::{
     cloud_sessions::{
         docker_config::{self, DockerProjectConfig},
@@ -229,8 +228,9 @@ impl SandboxForm {
     }
 
     /// The size to store. A template's size is never checked by the core, so a stored one
-    /// that is not a valid shape (an old or hand-edited file) is replaced by the defaults:
-    /// switching the project to an image later must not meet a size nobody ever validated.
+    /// that is out of range (an old or hand-edited file) is replaced by the defaults. A size
+    /// that is in range but not a shape (3 CPUs / 5g) is kept: a Mono API start rounds it up
+    /// to a shape when an image override uses it; a composer start refuses it at Send.
     fn stored_size(&self) -> (u32, String) {
         let memory = self.memory.trim().to_lowercase();
         if self.size_from_template()
@@ -487,37 +487,9 @@ pub(super) fn save(
 
 // ------------------------------------------------------------------ options
 
-/// "Asks for 4 CPUs and 16 GB" from the devcontainer's `hostRequirements`.
-pub(super) fn requirement_hint(info: &DevcontainerInfo) -> Option<String> {
-    let memory = info.host_memory_mib.map(gb_text);
-    match (info.host_cpus, memory) {
-        (Some(cpus), Some(memory)) => {
-            Some(format!("Asks for {} and {memory}", plural(cpus, "CPU")))
-        }
-        (Some(cpus), None) => Some(format!("Asks for {}", plural(cpus, "CPU"))),
-        (None, Some(memory)) => Some(format!("Asks for {memory}")),
-        (None, None) => None,
-    }
-}
-
-/// A warning when a size has fewer CPUs or less memory than the devcontainer asks for. The
-/// size stays selectable.
-pub(super) fn size_warning(
-    cpus: u32,
-    memory_mib: Option<u64>,
-    info: &DevcontainerInfo,
-) -> Option<String> {
-    let low_cpus = info.host_cpus.is_some_and(|need| cpus < need);
-    let low_memory =
-        matches!((info.host_memory_mib, memory_mib), (Some(need), Some(have)) if have < need);
-    if !(low_cpus || low_memory) {
-        return None;
-    }
-    let ask = requirement_hint(info)?.replacen("Asks for", "asks for", 1);
-    Some(format!(
-        "Below what the devcontainer {ask}. The environment may not build or run."
-    ))
-}
+#[cfg(test)]
+pub(super) use crate::cloud_presets::requirement_hint;
+pub(super) use crate::cloud_presets::size_warning;
 
 /// One machine type as the select shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]

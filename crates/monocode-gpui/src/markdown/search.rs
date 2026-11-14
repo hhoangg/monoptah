@@ -40,6 +40,11 @@ pub(crate) fn mark_row(row: &mut MarkdownRow, query: &str, current: bool) {
         let mut offset = 0;
         for run in runs.drain(..) {
             let end = offset + run.text.len();
+            if run.text.is_empty() {
+                // An emoji picture has no text to match, but it must survive the split.
+                marked.push(run);
+                continue;
+            }
             let mut cuts = vec![offset, end];
             for m in &matches {
                 if m.start > offset && m.start < end {

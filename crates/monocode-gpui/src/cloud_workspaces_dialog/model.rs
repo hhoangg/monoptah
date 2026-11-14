@@ -350,6 +350,13 @@ pub(super) fn delete_prompt(row: &WorkspaceRow, preview: &DeletePreview) -> Vec<
         "Delete {noun} {}? This permanently deletes it and everything in it. It cannot be undone.",
         row.display_name
     ));
+    if row.cloud.kind == CloudBackendKind::Codespaces {
+        // The git state comes from GitHub's own record of the codespace, which is not live.
+        lines.push(
+            "The git state below is as GitHub last reported it. It can be a few minutes behind, so changes made in the codespace just now may not show."
+                .into(),
+        );
+    }
     if !row.sessions.is_empty() {
         let n = row.sessions.len();
         lines.push(format!(
@@ -378,6 +385,54 @@ pub(super) fn delete_prompt(row: &WorkspaceRow, preview: &DeletePreview) -> Vec<
                 .into(),
         );
     }
+    lines
+}
+
+/// Whether Stop asks before it acts: a session is working on the workspace (the turn would be
+/// cut off) or this app did not create it (whoever uses it would be).
+pub(super) fn stop_asks(row: &WorkspaceRow) -> bool {
+    row.busy() || !row.ours
+}
+
+/// The paragraphs of the Stop confirmation: why it asks. Stopping keeps the state; it cuts off
+/// whatever is running in the workspace.
+pub(super) fn stop_prompt(row: &WorkspaceRow) -> Vec<String> {
+    let noun = row.cloud.noun();
+    let mut lines = Vec::new();
+    if !row.ours {
+        lines.push(format!(
+            "Monoptah did not create \u{201c}{}\u{201d}: another app, another computer or a person made this {noun}, and it may be in use right now. Stopping it ends whatever is running in it.",
+            row.display_name
+        ));
+    }
+    let working: Vec<String> = row
+        .sessions
+        .iter()
+        .filter(|s| s.busy)
+        .map(|s| {
+            let title = s.title.trim();
+            format!(
+                "\u{201c}{}\u{201d}",
+                if title.is_empty() { "Untitled" } else { title }
+            )
+        })
+        .collect();
+    if !working.is_empty() {
+        lines.push(format!(
+            "{} {} working on it right now. Stopping it interrupts {}.",
+            working.join(", "),
+            if working.len() == 1 { "is" } else { "are" },
+            if working.len() == 1 {
+                "that turn"
+            } else {
+                "those turns"
+            },
+        ));
+    }
+    lines.push(format!(
+        "Stop {noun} {}? It keeps its files and can be started again.",
+        row.display_name
+    ));
     lines
 }
 

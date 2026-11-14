@@ -185,6 +185,30 @@ impl Conversation {
         });
         cx.notify();
     }
+    /// Give a Mono chat its emoji library, or take it away with `None`. The transcript draws
+    /// each `:emo[<emotion>]` token of the Mono's replies as a picture of that emotion.
+    /// `emoji.session` is overwritten with this conversation's session id, so the same
+    /// reply shows the same pictures after a re-render, a history page or a restart.
+    pub(crate) fn set_mono_emoji(
+        &mut self,
+        emoji: Option<crate::transcript::emoji::MonoEmoji>,
+        cx: &mut Context<Self>,
+    ) {
+        let session = self.summary.id.to_string();
+        let emoji = emoji.map(|mut emoji| {
+            emoji.session = session;
+            emoji
+        });
+        self.transcript.update(cx, |t, cx| t.set_emoji(emoji, cx));
+    }
+    /// A reply read from outside the chat carries no emoji tokens when it came from a Mono.
+    fn outward_reply(&self, reply: String) -> String {
+        if self.settings.mono.is_some() {
+            monocode_core::mono::emoji::token::strip(&reply)
+        } else {
+            reply
+        }
+    }
     /// The user's queued messages show in the transcript as bubbles; the one
     /// just delivered is already a transcript row.
     pub(super) fn sync_mono_pending(&mut self, cx: &mut Context<Self>) {
@@ -390,7 +414,9 @@ impl Conversation {
         if self.workflow_working() {
             return None;
         }
-        let reply = monocode_core::response::final_reply(self.transcript.read(cx).source_rows());
+        let reply = self.outward_reply(monocode_core::response::final_reply(
+            self.transcript.read(cx).source_rows(),
+        ));
         let end = if self.notification_was_cancelled() {
             TurnEnd::Cancelled
         } else if self.status == "Ready" {
@@ -402,7 +428,9 @@ impl Conversation {
     }
     /// The last message of the conversation's final turn, for a run reading a reply.
     pub(crate) fn workflow_reply(&self, cx: &App) -> String {
-        monocode_core::response::final_reply(self.transcript.read(cx).source_rows())
+        self.outward_reply(monocode_core::response::final_reply(
+            self.transcript.read(cx).source_rows(),
+        ))
     }
     pub(crate) fn mono_post(
         &mut self,

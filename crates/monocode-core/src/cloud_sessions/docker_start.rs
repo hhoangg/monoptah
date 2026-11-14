@@ -1030,6 +1030,7 @@ impl CloudSessions {
             }
             Err(Stop::Aborted) => Err(START_ABORTED.into()),
             Err(Stop::Failed(error)) => {
+                let error = self.explain_sandbox_failure(&record, error);
                 let kept = record
                     .sandbox_start
                     .as_ref()
@@ -1045,6 +1046,35 @@ impl CloudSessions {
                 events(StartEvent::Failed(record));
                 Err(error)
             }
+        }
+    }
+
+    /// A step of a start that already has a sandbox failed. When the text looks like a missing
+    /// prerequisite (sbx gone, signed out, the ssh alias removed, the Docker account refused)
+    /// and a check confirms one, say what to fix before the raw error, as the first start does.
+    ///
+    /// The check is `sbx ls` run as the START's Docker account (its own account text, never
+    /// `sbx login`, for a project that names one) plus a read of `~/.ssh/config`: never ssh,
+    /// so it neither wakes nor bills the sandbox. It is skipped for a failure that is plainly
+    /// the work of the step (a Git 401, a devcontainer build): that keeps its error as it
+    /// is, and costs no `sbx` call.
+    fn explain_sandbox_failure(&self, record: &StartRecord, error: String) -> String {
+        if error.starts_with(SANDBOX_GONE) || !sandboxes::may_be_prerequisite_failure(&error) {
+            return error;
+        }
+        let Ok(deps) = self.sandbox_deps() else {
+            return error;
+        };
+        let account = record
+            .sandbox_start
+            .as_ref()
+            .and_then(|start| start.config.docker_account.as_deref());
+        match sandboxes::diagnose_as(&*deps.runner, &deps.home, account) {
+            // `Unreachable` (network, service) is not a cause the user fixes with one command.
+            sandboxes::Prerequisites::Ready | sandboxes::Prerequisites::Unreachable(_) => error,
+            // The step already said it (an account failure names where to fix it): once.
+            problem if error.contains(&problem.message()) => error,
+            problem => format!("{} Then Retry. ({error})", problem.message()),
         }
     }
 

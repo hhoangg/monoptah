@@ -2,6 +2,7 @@
 //! composer's RUN ON CLOUD panel, so both offer the same presets under the same names: sizes,
 //! stop-when-idle and runtime limits, machine and account labels. Pure data and formatting.
 use monocode_core::{
+    cloud_sessions::project_cloud::DevcontainerInfo,
     codespaces::MachineType,
     docker_accounts::{DockerAccountStatus, DockerAccountSummary},
 };
@@ -40,16 +41,7 @@ pub(crate) fn memory_mib(memory: &str) -> Option<u64> {
     memory.strip_suffix('m')?.parse().ok()
 }
 
-/// `16384` MiB as `16 GB`.
-pub(crate) fn gb_text(mib: u64) -> String {
-    if mib >= 1024 && mib.is_multiple_of(1024) {
-        format!("{} GB", mib / 1024)
-    } else if mib >= 1024 {
-        format!("{:.1} GB", mib as f64 / 1024.0)
-    } else {
-        format!("{mib} MB")
-    }
-}
+pub(crate) use monocode_core::cloud_sessions::project_cloud::gb_text;
 
 pub(crate) fn plural(count: u32, unit: &str) -> String {
     if count == 1 {
@@ -57,6 +49,30 @@ pub(crate) fn plural(count: u32, unit: &str) -> String {
     } else {
         format!("{count} {unit}s")
     }
+}
+
+/// "Asks for 4 CPUs and 16 GB" from the devcontainer's `hostRequirements`.
+pub(crate) fn requirement_hint(info: &DevcontainerInfo) -> Option<String> {
+    info.asks_for().map(|asks| format!("Asks for {asks}"))
+}
+
+/// A warning when a size has fewer CPUs or less memory than the devcontainer asks for. The
+/// size stays selectable. Shared by Cloud settings and the composer, so both say the same.
+pub(crate) fn size_warning(
+    cpus: u32,
+    memory_mib: Option<u64>,
+    info: &DevcontainerInfo,
+) -> Option<String> {
+    let low_cpus = info.host_cpus.is_some_and(|need| cpus < need);
+    let low_memory =
+        matches!((info.host_memory_mib, memory_mib), (Some(need), Some(have)) if have < need);
+    if !(low_cpus || low_memory) {
+        return None;
+    }
+    let ask = requirement_hint(info)?.replacen("Asks for", "asks for", 1);
+    Some(format!(
+        "Below what the devcontainer {ask}. The environment may not build or run."
+    ))
 }
 
 pub(crate) fn size_label(cpus: u32, memory: &str) -> String {

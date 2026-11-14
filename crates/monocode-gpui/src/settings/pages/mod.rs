@@ -26,6 +26,7 @@ pub(super) use cloud::Load as CloudLoad;
 pub(super) use connections::ConnectionsState;
 pub(crate) use keybindings::command_shortcut;
 pub(super) use mobile::MobileState;
+pub(super) use monos::EMOJI_LIBRARY;
 pub(super) use ticket_scoring::ScoringState;
 
 use super::{Section, SettingsView};

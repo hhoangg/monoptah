@@ -1,0 +1,655 @@
+//! The shared picture emoji library: the packs a user imported, the emotions they are sorted
+//! into, and the per-Mono settings that let a Mono use some of those packs in replies. See
+//! `docs/native/mono-emoji.md`.
+//!
+//! Layout, inside the app data folder:
+//! `emoji/emoji.json` (metadata), `emoji/packs/<pack id>/<hash>.<ext>` (images) and
+//! `emoji/.staging-<uuid>/` (an import that is not confirmed yet).
+
+pub mod import;
+pub mod sort;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+pub mod token;
+
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+};
+
+#[cfg(test)]
+mod tests;
+
+/// The `emoji.json` version this build reads and writes.
+pub const VERSION: u32 = 1;
+const FILE: &str = "emoji.json";
+pub const MAX_EMOTION_NAME: usize = 32;
+/// The longest description of an emotion, in characters.
+pub const MAX_DESCRIPTION: usize = 200;
+
+/// The default emotions: name and description. The id of a default emotion is its name.
+pub const DEFAULT_EMOTIONS: [(&str, &str); 13] = [
+    ("happy", "Glad, pleased, things went well"),
+    ("celebrate", "A task finished, something shipped, a win"),
+    ("laugh", "Something funny, a light joke"),
+    ("love", "Thanks, warmth, appreciation"),
+    ("sad", "Bad news, a failure, something lost"),
+    ("angry", "Frustration with a bug or a broken tool"),
+    ("thinking", "Investigating, weighing options"),
+    ("surprised", "Unexpected result, wow"),
+    ("approve", "Agree, ok, looks good"),
+    ("cool", "Confident, smooth, under control"),
+    ("clever", "A neat trick or a smart fix"),
+    ("nervous", "Risky change, worry, deadline"),
+    ("chill", "Relaxed, nothing urgent"),
+];
+
+/// An image format an emoji may have. Detected from magic bytes, never from the extension.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Format {
+    Png,
+    Jpeg,
+    Gif,
+    Webp,
+}
+
+impl Format {
+    /// The label shown to the user, such as "PNG".
+    pub fn label(self) -> &'static str {
+        match self {
+            Format::Png => "PNG",
+            Format::Jpeg => "JPG",
+            Format::Gif => "GIF",
+            Format::Webp => "WebP",
+        }
+    }
+
+    /// The extension used for the stored file.
+    pub fn extension(self) -> &'static str {
+        match self {
+            Format::Png => "png",
+            Format::Jpeg => "jpg",
+            Format::Gif => "gif",
+            Format::Webp => "webp",
+        }
+    }
+}
+
+/// How often a Mono may add an emoji.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Frequency {
+    Rarely,
+    #[default]
+    Sometimes,
+    Often,
+}
+
+/// What one Mono keeps about emoji: the switch, how often, and which packs of the shared
+/// library it may use. It lives on the Mono in the roster. A new pack is never added to it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MonoEmoji {
+    pub enabled: bool,
+    pub frequency: Frequency,
+    /// Ids of the selected packs. An id that is not in the library is ignored.
+    pub packs: Vec<String>,
+}
+
+impl MonoEmoji {
+    /// Whether nothing was ever changed, so the roster need not store it.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn uses(&self, pack_id: &str) -> bool {
+        self.packs.iter().any(|id| id == pack_id)
+    }
+
+    /// Select or deselect a pack.
+    pub fn set_pack(&mut self, pack_id: &str, on: bool) {
+        self.packs.retain(|id| id != pack_id);
+        if on {
+            self.packs.push(pack_id.to_owned());
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Emotion {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Emoji {
+    /// The stored file name inside the pack folder, `<hash>.<ext>`.
+    pub file: String,
+    /// Full SHA-256 of the image bytes, as hex.
+    pub hash: String,
+    pub name: String,
+    pub format: Format,
+    /// An emotion id, or none for Unsorted.
+    pub emotion: Option<String>,
+}
+
+impl Default for Emoji {
+    fn default() -> Self {
+        Self {
+            file: String::new(),
+            hash: String::new(),
+            name: String::new(),
+            format: Format::Png,
+            emotion: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Pack {
+    pub id: String,
+    pub name: String,
+    /// The model label used for the sorting, or none when imported without sorting.
+    pub sorted_by: Option<String>,
+    pub emoji: Vec<Emoji>,
+}
+
+/// The content of `emoji.json`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Library {
+    pub version: u32,
+    pub emotions: Vec<Emotion>,
+    pub packs: Vec<Pack>,
+}
+
+fn default_emotions() -> Vec<Emotion> {
+    DEFAULT_EMOTIONS
+        .iter()
+        .map(|(name, description)| Emotion {
+            id: (*name).to_owned(),
+            name: (*name).to_owned(),
+            description: (*description).to_owned(),
+        })
+        .collect()
+}
+
+impl Default for Library {
+    fn default() -> Self {
+        Self {
+            version: VERSION,
+            emotions: default_emotions(),
+            packs: Vec::new(),
+        }
+    }
+}
+
+/// A library read from disk. A `read_only` one came from a newer version of the app and
+/// must not be written back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Loaded {
+    pub library: Library,
+    pub read_only: bool,
+}
+
+/// The shared emoji folder inside the app data folder. Nothing here is reachable through
+/// `files::resolve_file`, so a Mono's own CLI cannot read these files.
+pub fn dir(data: &Path) -> PathBuf {
+    data.join("emoji")
+}
+
+/// The shared emoji folder for `root`, which is `mono::root(store)` (`<data>/monos`).
+pub fn dir_for_root(root: &Path) -> PathBuf {
+    dir(root.parent().unwrap_or(root))
+}
+
+/// The last path component only, so a hand-edited name cannot climb out of its folder.
+fn component(name: &str) -> &std::ffi::OsStr {
+    Path::new(name).file_name().unwrap_or_default()
+}
+
+/// The folder of one pack: `<dir>/packs/<pack id>`.
+pub fn pack_dir(dir: &Path, pack_id: &str) -> PathBuf {
+    dir.join("packs").join(component(pack_id))
+}
+
+/// The stored image of an emoji.
+pub fn image_path(dir: &Path, pack: &Pack, emoji: &Emoji) -> PathBuf {
+    pack_dir(dir, &pack.id).join(component(&emoji.file))
+}
+
+/// Remove every `.staging-*` folder (an import that was not confirmed) and every `sort-*`
+/// scratch folder (thumbnails of a sorting that was interrupted). Only call this when no
+/// import or sorting is under way: `load` never does, so a turn cannot delete
+/// the folder of an import that is open.
+pub fn clean_stale(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let stale = name.starts_with(".staging-") || name.starts_with("sort-");
+        if stale && entry.path().is_dir() {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// The text of a description or an emotion name as it goes into a prompt: white space
+/// (line breaks included) collapsed to single spaces, `<` and `>` replaced so the text cannot
+/// open or close a tag, and at most `max` characters.
+pub fn prompt_text(text: &str, max: usize) -> String {
+    let flat = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('<', "\u{2039}")
+        .replace('>', "\u{203a}");
+    flat.chars()
+        .take(max)
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
+}
+
+fn disk_version(text: &str) -> Result<u32, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("{FILE} is not readable: {e}"))?;
+    Ok(value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .map_or(VERSION, |v| u32::try_from(v).unwrap_or(u32::MAX)))
+}
+
+/// Read the library. A missing file gives the default. A file that cannot be parsed is an
+/// error and is left as it is. A newer version comes back read-only.
+pub fn load(dir: &Path) -> Result<Loaded, String> {
+    let path = dir.join(FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Loaded {
+                library: Library::default(),
+                read_only: false,
+            });
+        }
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    if disk_version(&text)? > VERSION {
+        // A newer app wrote it: show what we understand, never write it back.
+        let mut library: Library = serde_json::from_str(&text).unwrap_or_default();
+        library.normalize_emotions();
+        return Ok(Loaded {
+            library,
+            read_only: true,
+        });
+    }
+    let mut library: Library =
+        serde_json::from_str(&text).map_err(|e| format!("{FILE} is not readable: {e}"))?;
+    library.normalize_emotions();
+    Ok(Loaded {
+        library,
+        read_only: false,
+    })
+}
+
+/// Whether `name` is acceptable as an emotion name (see `rename_emotion`).
+fn valid_emotion_name(name: &str) -> bool {
+    !name.is_empty()
+        && name == name.trim()
+        && name.chars().count() <= MAX_EMOTION_NAME
+        && !name.contains(['[', ']', '\n', '\r'])
+}
+
+/// Write the library atomically. Refuses when the file on disk is newer or unreadable.
+pub fn save(dir: &Path, library: &Library) -> Result<(), String> {
+    let path = dir.join(FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            if disk_version(&text)? > VERSION {
+                return Err("The emoji settings come from a newer version of the app".into());
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    }
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut library = library.clone();
+    library.version = VERSION;
+    let text = serde_json::to_string_pretty(&library).map_err(|e| e.to_string())?;
+    super::files::write_atomic(&path, &text)
+}
+
+fn short_id(prefix: &str) -> String {
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    format!("{prefix}-{}", &id[..8])
+}
+
+fn unique_name(wanted: &str, taken: impl Fn(&str) -> bool) -> String {
+    if !taken(wanted) {
+        return wanted.to_owned();
+    }
+    (2..)
+        .map(|n| format!("{wanted} {n}"))
+        .find(|candidate| !taken(candidate))
+        .unwrap_or_else(|| wanted.to_owned())
+}
+
+impl Library {
+    /// A hand-edited file may hold names the app would refuse. Give every such emotion a
+    /// valid, unique name ("emotion N") and cut over-long descriptions; nothing fails.
+    fn normalize_emotions(&mut self) {
+        let mut seen: HashSet<String> = HashSet::new();
+        for index in 0..self.emotions.len() {
+            let name = self.emotions[index].name.clone();
+            let ok = valid_emotion_name(&name) && !seen.contains(&name.to_lowercase());
+            if !ok {
+                let fixed = (1..)
+                    .map(|n| format!("emotion {n}"))
+                    .find(|candidate| {
+                        let lowered = candidate.to_lowercase();
+                        !seen.contains(&lowered)
+                            && !self
+                                .emotions
+                                .iter()
+                                .any(|e| e.name.to_lowercase() == lowered)
+                    })
+                    .unwrap_or_else(|| "emotion".into());
+                self.emotions[index].name = fixed;
+            }
+            seen.insert(self.emotions[index].name.to_lowercase());
+            let description = &mut self.emotions[index].description;
+            if description.chars().count() > MAX_DESCRIPTION {
+                *description = description.chars().take(MAX_DESCRIPTION).collect();
+            }
+        }
+    }
+
+    fn emotion_index(&self, id: &str) -> Option<usize> {
+        self.emotions.iter().position(|e| e.id == id)
+    }
+
+    /// The id of the emotion called `name`, compared case-insensitively.
+    pub fn emotion_id(&self, name: &str) -> Option<&str> {
+        let name = name.trim().to_lowercase();
+        self.emotions
+            .iter()
+            .find(|e| e.name.to_lowercase() == name)
+            .map(|e| e.id.as_str())
+    }
+
+    /// Add an emotion called "new emotion" (made unique with a number); returns its id.
+    pub fn add_emotion(&mut self) -> String {
+        let name = unique_name("new emotion", |name| self.emotion_id(name).is_some());
+        let id = short_id("emo");
+        self.emotions.push(Emotion {
+            id: id.clone(),
+            name,
+            description: String::new(),
+        });
+        id
+    }
+
+    pub fn rename_emotion(&mut self, id: &str, name: &str) -> Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("An emotion needs a name".into());
+        }
+        if name.chars().count() > MAX_EMOTION_NAME {
+            return Err(format!(
+                "An emotion name has at most {MAX_EMOTION_NAME} characters"
+            ));
+        }
+        if name.contains(['[', ']', '\n', '\r']) {
+            return Err("An emotion name cannot contain [ ] or a line break".into());
+        }
+        let index = self.emotion_index(id).ok_or("No such emotion")?;
+        let lowered = name.to_lowercase();
+        let clash = self
+            .emotions
+            .iter()
+            .enumerate()
+            .any(|(i, e)| i != index && e.name.to_lowercase() == lowered);
+        if clash {
+            return Err("Another emotion has this name".into());
+        }
+        self.emotions[index].name = name.to_owned();
+        Ok(())
+    }
+
+    pub fn describe_emotion(&mut self, id: &str, text: &str) {
+        if let Some(index) = self.emotion_index(id) {
+            self.emotions[index].description = text
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(MAX_DESCRIPTION)
+                .collect();
+        }
+    }
+
+    /// Remove an emotion. Its emoji become Unsorted.
+    pub fn delete_emotion(&mut self, id: &str) {
+        self.emotions.retain(|e| e.id != id);
+        for emoji in self.packs.iter_mut().flat_map(|p| p.emoji.iter_mut()) {
+            if emoji.emotion.as_deref() == Some(id) {
+                emoji.emotion = None;
+            }
+        }
+    }
+
+    /// Move one emoji to an emotion, or to Unsorted with `None`. An unknown emotion id
+    /// counts as Unsorted.
+    pub fn move_emoji(&mut self, pack_id: &str, file: &str, emotion: Option<&str>) {
+        let emotion = emotion
+            .filter(|id| self.emotion_index(id).is_some())
+            .map(str::to_owned);
+        if let Some(emoji) = self
+            .packs
+            .iter_mut()
+            .find(|p| p.id == pack_id)
+            .and_then(|p| p.emoji.iter_mut().find(|e| e.file == file))
+        {
+            emoji.emotion = emotion;
+        }
+    }
+
+    /// Drop a pack from the library and delete its folder (only inside `<dir>/packs/`).
+    pub fn remove_pack(&mut self, dir: &Path, pack_id: &str) -> Result<(), String> {
+        if !super::files::valid_id(pack_id) {
+            return Err("Not a pack id".into());
+        }
+        let index = self
+            .packs
+            .iter()
+            .position(|p| p.id == pack_id)
+            .ok_or("No such pack")?;
+        let folder = pack_dir(dir, pack_id);
+        match std::fs::remove_dir_all(&folder) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("{}: {e}", folder.display())),
+        }
+        self.packs.remove(index);
+        Ok(())
+    }
+
+    /// Restore the default emotions. An emoji keeps its emotion when the name of its
+    /// current emotion is one of the defaults; the rest become Unsorted.
+    pub fn reset_emotions(&mut self) {
+        let names: HashMap<String, String> = self
+            .emotions
+            .iter()
+            .map(|e| (e.id.clone(), e.name.to_lowercase()))
+            .collect();
+        let defaults = default_emotions();
+        for emoji in self.packs.iter_mut().flat_map(|p| p.emoji.iter_mut()) {
+            let name = emoji.emotion.as_ref().and_then(|id| names.get(id));
+            emoji.emotion = name
+                .and_then(|name| defaults.iter().find(|d| d.name == *name))
+                .map(|d| d.id.clone());
+        }
+        self.emotions = defaults;
+    }
+
+    /// Add a pack and return its new id. The display name is made unique.
+    pub fn add_pack(&mut self, name: &str, sorted_by: Option<String>, emoji: Vec<Emoji>) -> String {
+        let wanted = match name.trim() {
+            "" => "Emoji pack",
+            trimmed => trimmed,
+        };
+        let name = unique_name(wanted, |candidate| {
+            let lowered = candidate.to_lowercase();
+            self.packs.iter().any(|p| p.name.to_lowercase() == lowered)
+        });
+        let id = loop {
+            let id = short_id("pack");
+            if self.packs.iter().all(|p| p.id != id) {
+                break id;
+            }
+        };
+        self.packs.push(Pack {
+            id: id.clone(),
+            name,
+            sorted_by,
+            emoji,
+        });
+        id
+    }
+
+    /// Set the emotion of the emoji named in `map` (file to emotion name). Names match
+    /// case-insensitively; an unknown name or `None` means Unsorted. Files that are not in
+    /// the map keep their emotion.
+    pub fn apply_sorting(
+        &mut self,
+        pack_id: &str,
+        map: &HashMap<String, Option<String>>,
+        sorted_by: Option<String>,
+    ) {
+        let resolved: HashMap<&String, Option<String>> = map
+            .iter()
+            .map(|(file, name)| {
+                let id = name
+                    .as_deref()
+                    .and_then(|name| self.emotion_id(name))
+                    .map(str::to_owned);
+                (file, id)
+            })
+            .collect();
+        let Some(pack) = self.packs.iter_mut().find(|p| p.id == pack_id) else {
+            return;
+        };
+        for emoji in &mut pack.emoji {
+            if let Some(id) = resolved.get(&emoji.file) {
+                emoji.emotion = id.clone();
+            }
+        }
+        pack.sorted_by = sorted_by;
+    }
+
+    /// The content hashes of every emoji in every pack, for de-duplicating an import.
+    pub fn known_hashes(&self) -> HashSet<String> {
+        self.packs
+            .iter()
+            .flat_map(|p| p.emoji.iter().map(|e| e.hash.clone()))
+            .collect()
+    }
+
+    /// Emotions with at least one emoji in one of the `selected` packs, in order. An id that
+    /// is not a pack of this library is ignored.
+    pub fn usable_emotions(&self, selected: &[String]) -> Vec<&Emotion> {
+        self.emotions
+            .iter()
+            .filter(|emotion| {
+                self.packs
+                    .iter()
+                    .filter(|p| selected.contains(&p.id))
+                    .any(|p| {
+                        p.emoji
+                            .iter()
+                            .any(|e| e.emotion.as_deref() == Some(&emotion.id))
+                    })
+            })
+            .collect()
+    }
+
+    /// The emoji of the emotion called `emotion_name` in the `selected` packs, ordered by
+    /// pack id and then file so a pick is stable.
+    pub fn candidates(&self, emotion_name: &str, selected: &[String]) -> Vec<(&Pack, &Emoji)> {
+        let Some(id) = self.emotion_id(emotion_name) else {
+            return Vec::new();
+        };
+        let mut found: Vec<(&Pack, &Emoji)> = self
+            .packs
+            .iter()
+            .filter(|p| selected.contains(&p.id))
+            .flat_map(|p| {
+                p.emoji
+                    .iter()
+                    .filter(|e| e.emotion.as_deref() == Some(id))
+                    .map(move |e| (p, e))
+            })
+            .collect();
+        found.sort_by(|a, b| (&a.0.id, &a.1.file).cmp(&(&b.0.id, &b.1.file)));
+        found
+    }
+}
+
+/// How many emoji of each format a pack holds, in a fixed order, skipping empty formats.
+pub fn format_counts(pack: &Pack) -> Vec<(Format, usize)> {
+    [Format::Png, Format::Gif, Format::Jpeg, Format::Webp]
+        .into_iter()
+        .filter_map(|format| {
+            let count = pack.emoji.iter().filter(|e| e.format == format).count();
+            (count > 0).then_some((format, count))
+        })
+        .collect()
+}
+
+/// The `<emoji>` block of the Mono context, or none when the Mono's switch is off or no
+/// emotion has a picture in the packs it selected.
+pub fn context_block(library: &Library, mono: &MonoEmoji) -> Option<String> {
+    if !mono.enabled {
+        return None;
+    }
+    let usable = library.usable_emotions(&mono.packs);
+    if usable.is_empty() {
+        return None;
+    }
+    let list = usable
+        .iter()
+        .map(|e| {
+            let name = prompt_text(&e.name, MAX_EMOTION_NAME);
+            match prompt_text(&e.description, MAX_DESCRIPTION).as_str() {
+                "" => format!("- {name}"),
+                description => format!("- {name}: {description}"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    /// Shown in every mode, after the frequency line.
+    const EXPLICIT_REQUEST: &str =
+        "If the user explicitly asks for emoji (for example \"send several\"), you may use more than this limit.";
+    let frequency = match mono.frequency {
+        Frequency::Rarely => {
+            "Rarely: at most one emoji, in about one reply in five, only for a clear mood."
+        }
+        Frequency::Sometimes => {
+            "Sometimes: at most two emoji per reply; a long reply may use the second where the mood or topic changes."
+        }
+        Frequency::Often => {
+            "Often: about one emoji per paragraph that carries a mood, at most four per reply."
+        }
+    };
+    Some(format!(
+        "<emoji>\nYou may add a picture emoji to a conversational reply when it fits the mood. Write `:emo[<emotion>]` inline or on its own line; the app shows a picture. Emotions you can use:\n{list}\n\n{frequency} {EXPLICIT_REQUEST}\nNever inside code, code blocks, commands, commit messages, PR or issue text, reports, files you write or tool input.\n</emoji>"
+    ))
+}

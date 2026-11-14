@@ -119,8 +119,8 @@ Layout, top to bottom:
     256 characters, no leading `-`, printable ASCII without spaces. An error shows under the
     field.
   - Save keeps what is stored: the environment, the dev container choice and the saved size
-    (a template project whose stored size is not a valid shape is saved with the default size,
-    so a later switch to an image never meets a value nobody checked) are carried by the form,
+    (a template project whose stored size is out of range is saved with the default size; one
+    that is in range but not a billable shape is kept: a Mono API start with an image override rounds it up to a shape, a composer start refuses it) are carried by the form,
     not rebuilt from defaults. Opening the dialog on a template project and saving without an
     edit writes nothing.
 - **Credentials**:

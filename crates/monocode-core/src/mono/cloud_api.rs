@@ -95,6 +95,14 @@ pub struct DeleteOptions {
     ///
     /// [`DeletePreview::lines`]: crate::cloud_sessions::workspaces::DeletePreview::lines
     pub confirmed: Option<Vec<String>>,
+    /// The caller showed the user that the workspace was not made by this app
+    /// ([`DeletePreview::ours`]) and the user said they understood. Only read with
+    /// [`Self::confirmed`]: a workspace this app's store does not know is refused without it,
+    /// whatever `confirmed` holds, so the acknowledgement is enforced here and not only by the
+    /// dialog. It means nothing for a workspace the store knows.
+    ///
+    /// [`DeletePreview::ours`]: crate::cloud_sessions::workspaces::DeletePreview::ours
+    pub acknowledged: bool,
     /// Stop a sandbox and wait until it is stopped first, retrying a refused delete
     /// ([`CloudSessions::delete_settled`]).
     pub settle: bool,
@@ -759,10 +767,16 @@ impl CloudApi {
         self.delete_target(&target.cloud, busy, &options)
     }
 
-    /// Why `cloud` must not be deleted right now, from fresh reads: sessions working on it, the
-    /// app archiving it, local sessions moved into it, and what would be lost that the caller
-    /// did not confirm. `woke` also refuses a sandbox that is running again after it was
-    /// stopped (a send to a session on it wakes it). Returns the sessions on it.
+    /// Why `cloud` must not be deleted right now. The store and the backend are read fresh on
+    /// every call: sessions working on it, local sessions moved into it, whether this app knows
+    /// the workspace at all (and the caller acknowledged it when it does not), and what would be
+    /// lost that the caller did not confirm. `woke` also refuses a sandbox that is running again
+    /// after it was stopped (a send to a session on it wakes it). Returns the sessions on it.
+    ///
+    /// What is NOT fresh is `busy`: the caller's [`AppBusy`], which for the overview is a copy
+    /// the window took when the user clicked Delete. During a sandbox's wait (up to minutes) an
+    /// archive that started after that click is not seen here; what protects the delete then is
+    /// the `woke` state check, which refuses a workspace that is running again.
     fn delete_refusal(
         &self,
         cloud: &CloudRef,
@@ -802,6 +816,16 @@ impl CloudApi {
         }
         // Only the overview refuses on a conversation moved into the workspace: the app's own
         // `cloud.delete` keeps such a session and marks it lost (its callers know the cost).
+        if options.confirmed.is_some()
+            && !options.acknowledged
+            && !self.cloud.known_to_this_app(cloud)
+        {
+            return Err(format!(
+                "Not deleted: Monoptah did not create {} {}, and the confirmation did not say the user was told so. Open Delete again and tick the acknowledgement.",
+                cloud.noun(),
+                cloud.name
+            ));
+        }
         let blockers = if options.confirmed.is_some() {
             self.cloud.delete_blockers(cloud)
         } else {

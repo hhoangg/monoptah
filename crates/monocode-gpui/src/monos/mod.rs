@@ -7,6 +7,11 @@ mod changes;
 mod cloud_tests;
 pub(crate) mod color_picker;
 mod dashboard;
+#[cfg(test)]
+mod emoji_library_tests;
+#[cfg(test)]
+mod emoji_tests;
+mod emoji_ui;
 mod files;
 mod filters;
 mod floating;
@@ -65,6 +70,8 @@ use std::{
 pub(crate) struct Changed;
 pub(crate) struct TabOpened(pub String);
 pub(crate) struct ShowDetails(pub String);
+/// The Mono's emoji settings asked for the shared library: Settings > Monos > Emoji.
+pub(crate) struct ShowEmojiLibrary;
 /// A Mono's chat has opened, so a paired phone can follow it.
 pub(crate) struct ChatOpened;
 pub(crate) use notifications::{NotificationChanged, NotificationFinished, NotificationPosted};
@@ -117,6 +124,9 @@ pub(crate) struct Monos {
     /// Monos a paired phone is resetting; there is no dialog to mark them busy.
     phone_resets: HashSet<String>,
     cleanup: reset::CleanupRunner,
+    /// The one emoji library every Mono picks packs from.
+    emoji_store: Entity<crate::emoji_library::EmojiStore>,
+    emoji_ui: emoji_ui::EmojiUi,
     notice_region: AnchorSlot,
     pub(crate) details: Entity<overview::Overview>,
     original_chrome: bool,
@@ -208,6 +218,7 @@ pub(crate) struct Monos {
 impl EventEmitter<Changed> for Monos {}
 impl EventEmitter<TabOpened> for Monos {}
 impl EventEmitter<ShowDetails> for Monos {}
+impl EventEmitter<ShowEmojiLibrary> for Monos {}
 impl EventEmitter<ChatOpened> for Monos {}
 impl Monos {
     #[cfg(test)]
@@ -381,6 +392,9 @@ impl Monos {
             .and_then(|s| s.setting("mono-session-filters").ok().flatten())
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
+        let emoji_store = crate::emoji_library::get(cx).unwrap_or_else(|| {
+            crate::emoji_library::install(store.clone(), root.parent().unwrap_or(&root), cx)
+        });
         let manager = cx.entity();
         let details = cx.new(|cx| overview::Overview::new(manager, cx));
         let signals = std::sync::Arc::<mono::workflows::cli::Signals>::default();
@@ -407,6 +421,8 @@ impl Monos {
             reset: None,
             phone_resets: HashSet::new(),
             cleanup: reset::default_cleanup(),
+            emoji_store,
+            emoji_ui: emoji_ui::EmojiUi::new(),
             notice_region,
             details,
             original_chrome: false,
@@ -479,6 +495,7 @@ impl Monos {
             today: Default::default(),
         };
         cx.set_global(workflow_schedule::QuitTarget(this.workflows.clone()));
+        this.watch_emoji_library(cx);
         this.start_workflow_checks(cx);
         if let Some(rx) = rx {
             this._bridge_task = Some(cx.spawn(async move |this, cx| {
@@ -649,6 +666,7 @@ impl Monos {
             return;
         };
         self.settings = Some(SettingsSection::General);
+        self.note_settings_model(cx);
         window.focus(&self.settings_focus, cx);
         self.reload_files(&id, cx);
         cx.notify();
@@ -891,6 +909,10 @@ impl Monos {
                     }
                     view.load(cx);
                 });
+                // Pushed after `configure_mono`, so the chat draws emoji right away when
+                // the library finished loading first; otherwise the library's `Changed`
+                // follows it.
+                this.push_emoji(&id, &view, cx);
                 let source = id.clone();
                 this.observations.push(cx.subscribe(
                     &view,
@@ -992,6 +1014,10 @@ impl Monos {
                     },
                 ));
                 this.chats.insert(id.clone(), view);
+                // Settings may have opened before this chat existed: remember its model now.
+                if this.settings.is_some() && this.active.as_deref() == Some(&id) {
+                    this.note_settings_model(cx);
+                }
                 cx.emit(ChatOpened);
                 if let Some(handle) = this.parent_window {
                     let owner = cx.weak_entity();
@@ -1027,6 +1053,10 @@ impl Monos {
         self.configure_chat(source, cx);
     }
     fn configure_chat(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.configure_chat_with(id, true, cx);
+    }
+    /// `configure_chat`; without `push_emoji` the caller pushes the library itself right after.
+    fn configure_chat_with(&mut self, id: &str, push_emoji: bool, cx: &mut Context<Self>) {
         self.refresh_work(id, cx);
         if let Some(mono) = self.roster.get(id) {
             // The shell may be mid-update when this runs; reach it afterwards.
@@ -1046,6 +1076,9 @@ impl Monos {
                 .unwrap_or_default();
             let root = self.root.clone();
             view.update(cx, |view, cx| view.configure_mono(mono, root, env, cx));
+            if push_emoji {
+                self.push_emoji(id, &view, cx);
+            }
         }
     }
     fn enqueue(
@@ -1315,6 +1348,7 @@ impl Monos {
         self.save(cx);
         self.open(&id, window, cx);
         self.settings = Some(SettingsSection::General);
+        self.note_settings_model(cx);
         window.focus(&self.settings_focus, cx);
         self.changed(cx);
     }
@@ -1827,6 +1861,7 @@ impl gpui::Render for Monos {
             )
             .children(self.settings_modal(&mono, window, cx))
             .children(self.reset_modal(window, cx))
+            .children(self.emoji_select_popover(cx))
             .children(self.picker_surface(cx))
             .children(self.options_surface(cx))
             .children(self.background_modal())

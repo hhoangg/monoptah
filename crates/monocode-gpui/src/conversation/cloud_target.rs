@@ -15,7 +15,9 @@ use crate::cloud_presets::AccountChoice;
 use monocode_core::cloud_sessions::CloudBackendKind;
 use monocode_core::cloud_sessions::docker_config::{self, DockerProjectConfig};
 use monocode_core::cloud_sessions::kit::Workspace;
-use monocode_core::cloud_sessions::project_cloud::{self, CodespaceProjectConfig, DefaultBackend};
+use monocode_core::cloud_sessions::project_cloud::{
+    self, CodespaceProjectConfig, DefaultBackend, DevcontainerInfo,
+};
 use monocode_core::codespaces::{self, MachineType};
 use monocode_core::docker_accounts::{DockerAccountSummary, DockerAccounts};
 
@@ -296,6 +298,9 @@ pub(super) struct CloudDraft {
     /// Overrides for this session, seeded from `defaults`.
     pub cpus: u32,
     pub memory: String,
+    /// Docker: what the project's devcontainer asks for (`hostRequirements`), read when the
+    /// panel opened; empty for a codespace. Only used to warn under the Size row.
+    pub devcontainer: DevcontainerInfo,
     pub ttl: String,
     pub idle: u32,
     pub account: Option<String>,
@@ -428,6 +433,26 @@ impl CloudDraft {
         }
         self.defaults = new;
         !base
+    }
+
+    /// The warning under the Size row when this session's size is below what the devcontainer
+    /// asks for. Every size stays selectable; this is the same text Cloud settings shows.
+    pub fn size_warning(&self) -> Option<String> {
+        // A template fixes the size, and a dev container that is not built asks for nothing:
+        // same rule as Cloud settings.
+        if self.size_from_template()
+            || self
+                .config
+                .as_ref()
+                .is_some_and(|config| !config.uses_devcontainer())
+        {
+            return None;
+        }
+        crate::cloud_presets::size_warning(
+            self.cpus,
+            crate::cloud_presets::memory_mib(&self.memory),
+            &self.devcontainer,
+        )
     }
 
     /// Starts the overrides over from `defaults`.
@@ -878,6 +903,20 @@ impl Conversation {
         }
     }
 
+    /// What the devcontainer of the Docker config asks for: a small local file read, no `sbx`
+    /// call. Nothing for a codespace (it has no Size row; GitHub filters its machines).
+    fn cloud_devcontainer(
+        &self,
+        target: CloudTarget,
+        config: Option<&DockerProjectConfig>,
+    ) -> DevcontainerInfo {
+        if target != CloudTarget::DockerSandbox {
+            return DevcontainerInfo::default();
+        }
+        let path = config.map_or("", |config| config.devcontainer_path.as_str());
+        project_cloud::devcontainer_info(Path::new(&self.summary.cwd), path)
+    }
+
     /// The project's defaults for `target`, read once per action.
     fn cloud_defaults(
         &self,
@@ -903,12 +942,14 @@ impl Conversation {
             // Picked again (after Cloud settings, say): the project's settings are the
             // defaults again, so this session's overrides start over from them.
             let defaults = self.cloud_defaults(target, config.as_ref());
+            let devcontainer = self.cloud_devcontainer(target, config.as_ref());
             let base = defaults.base.clone();
             let accounts = crate::cloud_settings::claude_accounts(cx);
             let Some(draft) = &mut self.cloud_draft else {
                 return;
             };
             draft.config = config;
+            draft.devcontainer = devcontainer;
             draft.use_defaults(defaults);
             draft.accounts = accounts;
             let field = draft.base.clone();
@@ -954,6 +995,7 @@ impl Conversation {
             return;
         }
         let defaults = self.cloud_defaults(target, config.as_ref());
+        let devcontainer = self.cloud_devcontainer(target, config.as_ref());
         // Docker names a new feature branch; a codespace works on its base branch (HEAD of the
         // project folder, as the header picker does, empty while HEAD is detached, unless the
         // project sets a base branch) until another name is typed.
@@ -1031,6 +1073,7 @@ impl Conversation {
             branch_text,
             branch_follows_base: !docker,
             config,
+            devcontainer,
             cpus: defaults.cpus,
             memory: defaults.memory.clone(),
             ttl: defaults.ttl.clone(),

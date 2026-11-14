@@ -11,15 +11,21 @@
 //!
 //! Stop and Delete reuse the app API's `cloud.stop` / `cloud.delete` checks (busy sessions,
 //! unsaved files) and run as the Docker account a sandbox row was listed under. The dialog does
-//! not run them itself: it emits [`Event::Act`], the shell adds its live busy view and calls
-//! [`CloudWorkspacesDialog::run`], and a delete is reported with [`Event::Deleted`] so the shell
-//! forgets the sessions exactly like the other delete paths.
+//! not run them itself: it emits [`Event::Act`], the shell adds its view of what is busy (a copy
+//! taken at that moment, see [`CloudWorkspacesDialog::run`]) and calls it, and a delete is
+//! reported with [`Event::Deleted`] so the shell forgets the sessions exactly like the other
+//! delete paths.
+//!
+//! Stop asks first when a session is working on the row or the workspace is not this app's (it
+//! would cut the turn off, or the work of whoever uses it), and a warning the stop returns (the
+//! sessions it interrupted) stays on screen.
 //!
 //! Delete asks the workspace what would be lost before it asks the user
 //! ([`monocode_core::cloud_sessions::CloudSessions::delete_preview`]), shows it, and sends back the
 //! lines the user saw: the delete refuses anything new it finds. A workspace that this app's
-//! store does not know needs an explicit acknowledgement on top. The dialog cannot be closed while
-//! a stop or delete runs, so its result always reaches the shell.
+//! store does not know needs an explicit acknowledgement on top, and the call carries
+//! `acknowledged` so the core refuses it without one. The dialog cannot be closed while a stop or
+//! delete runs, so its result always reaches the shell.
 pub(crate) mod model;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -54,13 +60,16 @@ pub(crate) enum Action {
 
 pub(crate) enum Event {
     Close,
-    /// The user chose Stop or confirmed Delete: the shell adds its live busy view and calls
+    /// The user chose Stop or confirmed Delete: the shell adds its busy view (a copy) and calls
     /// [`CloudWorkspacesDialog::run`]. `confirmed` is what the user was shown that a delete
     /// would lose.
     Act {
         target: WorkspaceTarget,
         action: Action,
         confirmed: Vec<String>,
+        /// The user ticked the acknowledgement the confirmation asked for (a workspace this app
+        /// did not create, something to lose, or contents that cannot be read).
+        acknowledged: bool,
     },
     /// A workspace was stopped; the shell re-reads its session badges.
     Stopped(CloudRef),
@@ -105,6 +114,16 @@ pub(crate) struct CloudWorkspacesDialog {
     pending: HashMap<String, bool>,
     /// The workspace whose Delete asks for confirmation.
     confirm: Option<Confirm>,
+    /// The workspace whose Stop asks for confirmation ([`WorkspaceRow::key`]).
+    confirm_stop: Option<String>,
+    /// What a finished stop or delete warned about, as `(row key, text)`: the sessions a stop
+    /// interrupted, a machine that could not be disconnected. Kept until the next action on the
+    /// same workspace.
+    warnings: Vec<(String, String)>,
+    /// A reload was asked for while one was running (an action finished): the running one began
+    /// before it and may carry the old state, so it is read again as soon as it ends. Holds
+    /// whether that reload is forced.
+    reload_queued: Option<bool>,
     /// The last failed action or browser lookup, by [`WorkspaceRow::key`].
     errors: HashMap<String, String>,
     focus: FocusHandle,
@@ -149,6 +168,9 @@ impl CloudWorkspacesDialog {
             load_error: None,
             pending: HashMap::new(),
             confirm: None,
+            confirm_stop: None,
+            warnings: Vec::new(),
+            reload_queued: None,
             errors: HashMap::new(),
             focus: cx.focus_handle(),
         };
@@ -164,9 +186,11 @@ impl CloudWorkspacesDialog {
     }
 
     fn load(&mut self, force: bool, cx: &mut Context<Self>) {
-        if std::mem::replace(&mut self.loading, true) {
+        if self.loading {
+            self.reload_queued = Some(self.reload_queued.unwrap_or(false) || force);
             return;
         }
+        self.loading = true;
         cx.notify();
         let (env, project) = (self.env.clone(), self.project.clone());
         cx.spawn(async move |this, cx| {
@@ -179,6 +203,12 @@ impl CloudWorkspacesDialog {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.loading = false;
+                // Asked for again while this ran: this result predates what asked, so it is not
+                // shown (nor does it replace the old rows with a stale list).
+                if let Some(force) = this.reload_queued.take() {
+                    this.load(force, cx);
+                    return;
+                }
                 match result {
                     Ok(view) => {
                         this.load_error = None;
@@ -223,6 +253,19 @@ impl CloudWorkspacesDialog {
         }
     }
     #[cfg(test)]
+    pub(crate) fn asks_to_stop(&self, target: &WorkspaceTarget) -> bool {
+        self.confirm_stop.as_deref()
+            == Some(&workspaces::target_key(
+                &target.cloud,
+                target.account.as_deref(),
+            ))
+    }
+    /// What finished actions warned about, as `(workspace name, text)`.
+    #[cfg(test)]
+    pub(crate) fn warnings(&self) -> Vec<String> {
+        self.warnings.iter().map(|(_, text)| text.clone()).collect()
+    }
+    #[cfg(test)]
     pub(crate) fn acknowledged(&self) -> bool {
         self.confirm.as_ref().is_some_and(|c| c.acknowledged)
     }
@@ -235,7 +278,7 @@ impl CloudWorkspacesDialog {
 
     /// Escape: leaves the delete confirmation first. `true` when it did.
     pub(crate) fn cancel_confirm(&mut self, cx: &mut Context<Self>) -> bool {
-        let had = self.confirm.take().is_some();
+        let had = self.confirm.take().is_some() | self.confirm_stop.take().is_some();
         if had {
             cx.notify();
         }
@@ -251,6 +294,7 @@ impl CloudWorkspacesDialog {
             return;
         }
         self.errors.remove(&key);
+        self.confirm_stop = None;
         self.confirm = Some(Confirm {
             key: key.clone(),
             preview: Preview::Reading,
@@ -285,6 +329,35 @@ impl CloudWorkspacesDialog {
         }
     }
 
+    /// Stop was pressed. A row a session is working on, or one this app did not create, asks
+    /// first; any other stops at once (it only stops, the state is kept).
+    pub(crate) fn stop_pressed(
+        &mut self,
+        target: &WorkspaceTarget,
+        needs_confirmation: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let key = workspaces::target_key(&target.cloud, target.account.as_deref());
+        if self.pending.contains_key(&key) {
+            return;
+        }
+        if !needs_confirmation {
+            self.confirm = None;
+            self.confirm_stop = None;
+            cx.emit(Event::Act {
+                target: target.clone(),
+                action: Action::Stop,
+                confirmed: Vec::new(),
+                acknowledged: false,
+            });
+            return;
+        }
+        self.errors.remove(&key);
+        self.confirm = None;
+        self.confirm_stop = Some(key);
+        cx.notify();
+    }
+
     /// What the Delete button sends: the lines the user saw, once the workspace was read and the
     /// user said what the read asked for. `None` while Delete is not allowed.
     fn confirmed_lines(&self) -> Option<Vec<String>> {
@@ -296,16 +369,23 @@ impl CloudWorkspacesDialog {
         (armed && preview.blockers.is_empty()).then(|| preview.lines.clone())
     }
 
-    /// Stops or deletes `target` on a worker thread with the shell's live busy view. The checks
-    /// are the app API's: a working session, an archive in progress, a session moved into the
-    /// workspace or anything to lose that `confirmed` does not name refuse the call, and they are
-    /// made again right before the delete. A sandbox delete stops it first and waits until it has
+    /// Stops or deletes `target` on a worker thread. The checks are the app API's: a working
+    /// session, a session moved into the workspace, a workspace this app did not create without
+    /// `acknowledged`, or anything to lose that `confirmed` does not name refuse a delete, and they
+    /// are made again right before it. A sandbox delete stops it first and waits until it has
     /// stopped.
+    ///
+    /// `busy` is the shell's view of an archive or convert in progress, COPIED when the user
+    /// clicked: it does not change during the wait, so an archive that begins after the click is
+    /// not seen by the re-check. During a sandbox's wait the protection is the state check (a
+    /// sandbox that is running again is not deleted), and the sessions the store and the backend
+    /// are read for again.
     pub(crate) fn run(
         &mut self,
         target: WorkspaceTarget,
         action: Action,
         confirmed: Vec<String>,
+        acknowledged: bool,
         busy: LiveBusy,
         cx: &mut Context<Self>,
     ) {
@@ -315,7 +395,9 @@ impl CloudWorkspacesDialog {
         }
         self.pending.insert(key.clone(), action == Action::Delete);
         self.errors.remove(&key);
+        self.warnings.retain(|(warned, _)| *warned != key);
         self.confirm = None;
+        self.confirm_stop = None;
         cx.notify();
         let env = self.env.clone();
         cx.spawn(async move |this, cx| {
@@ -331,6 +413,7 @@ impl CloudWorkspacesDialog {
                             &busy,
                             DeleteOptions {
                                 confirmed: Some(confirmed),
+                                acknowledged,
                                 settle: true,
                             },
                         ),
@@ -353,18 +436,26 @@ impl CloudWorkspacesDialog {
         self.pending.remove(&key);
         let cloud = target.cloud;
         match result {
-            Ok(value) => match action {
-                Action::Stop => cx.emit(Event::Stopped(cloud)),
-                Action::Delete => {
-                    let removed = crate::cloud_actions::deleted("cloud.delete", &value)
-                        .map(|(_, ids)| ids)
-                        .unwrap_or_default();
-                    if let Some(view) = &mut self.view {
-                        view.rows.retain(|row| row.key() != key);
-                    }
-                    cx.emit(Event::Deleted { cloud, removed });
+            Ok(value) => {
+                // What the call warned about (the sessions a stop interrupted, a machine that
+                // could not be disconnected) is shown, not dropped.
+                if let Some(warning) = value["warning"].as_str() {
+                    self.warnings
+                        .push((key.clone(), format!("{}: {warning}", cloud.name)));
                 }
-            },
+                match action {
+                    Action::Stop => cx.emit(Event::Stopped(cloud)),
+                    Action::Delete => {
+                        let removed = crate::cloud_actions::deleted("cloud.delete", &value)
+                            .map(|(_, ids)| ids)
+                            .unwrap_or_default();
+                        if let Some(view) = &mut self.view {
+                            view.rows.retain(|row| row.key() != key);
+                        }
+                        cx.emit(Event::Deleted { cloud, removed });
+                    }
+                }
+            }
             Err(error) => {
                 self.errors.insert(key, error);
             }
@@ -441,6 +532,7 @@ impl CloudWorkspacesDialog {
         let offers = model::offers(row);
         let working = self.pending.get(&key).copied();
         let confirming = self.confirm.as_ref().is_some_and(|c| c.key == key);
+        let confirming_stop = self.confirm_stop.as_deref() == Some(key.as_str());
         let (uses, usage) = model::uses_line(row);
         let orphan = usage == model::Use::Orphan;
         let foreign = usage == model::Use::Foreign;
@@ -583,20 +675,21 @@ impl CloudWorkspacesDialog {
         if confirming {
             return self.confirm_block(card, row, cx);
         }
+        if confirming_stop {
+            return self.confirm_stop_block(card, row, cx);
+        }
 
         let stop_target = target.clone();
+        // Cutting off a working session, or stopping what someone else may be using, is asked.
+        let stop_asks = model::stop_asks(row);
         let delete_target = target.clone();
         let open_target = cloud.clone();
         let mut actions = div().flex().gap_2().pt_1();
         actions = actions
             .child(
                 Self::button(id("stop"), "Stop", false, !offers.stop).when(offers.stop, |b| {
-                    b.on_click(cx.listener(move |_, _, _, cx| {
-                        cx.emit(Event::Act {
-                            target: stop_target.clone(),
-                            action: Action::Stop,
-                            confirmed: Vec::new(),
-                        })
+                    b.on_click(cx.listener(move |this, _, _, cx| {
+                        this.stop_pressed(&stop_target, stop_asks, cx)
                     }))
                 }),
             )
@@ -702,6 +795,7 @@ impl CloudWorkspacesDialog {
         }
         let target = row.target();
         let confirmed = armed.clone();
+        let acknowledged = self.confirm.as_ref().is_some_and(|c| c.acknowledged);
         let delete = Self::button(
             id("confirm-delete"),
             "Delete permanently",
@@ -714,6 +808,7 @@ impl CloudWorkspacesDialog {
                     target: target.clone(),
                     action: Action::Delete,
                     confirmed: lines.clone(),
+                    acknowledged,
                 })
             }))
         });
@@ -726,6 +821,59 @@ impl CloudWorkspacesDialog {
                 )),
             )),
         )
+        .into_any_element()
+    }
+
+    /// The row while its Stop asks: why it asks, and Stop (the state is kept) or Cancel.
+    fn confirm_stop_block(
+        &mut self,
+        card: Stateful<Div>,
+        row: &WorkspaceRow,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let name = row.cloud.name.clone();
+        let id = |part: &str| format!("cloud-ws-{part}-{name}");
+        let mut prompt = div()
+            .id(SharedString::from(id("confirm-stop")))
+            .debug_selector({
+                let selector = id("confirm-stop");
+                move || selector.clone()
+            })
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgba(0xfbbf2466))
+            .bg(rgba(0xfbbf240f));
+        for text in model::stop_prompt(row) {
+            prompt = prompt.child(
+                div()
+                    .text_size(px(12.))
+                    .line_height(px(18.))
+                    .text_color(content(0.85))
+                    .child(text),
+            );
+        }
+        let target = row.target();
+        let stop = Self::button(id("confirm-stop-button"), "Stop it", false, false).on_click(
+            cx.listener(move |_, _, _, cx| {
+                cx.emit(Event::Act {
+                    target: target.clone(),
+                    action: Action::Stop,
+                    confirmed: Vec::new(),
+                    acknowledged: false,
+                })
+            }),
+        );
+        card.child(prompt.child(div().flex().gap_2().pt_1().child(stop).child(
+            Self::button(id("cancel-stop"), "Cancel", false, false).on_click(cx.listener(
+                |this, _, _, cx| {
+                    this.cancel_confirm(cx);
+                },
+            )),
+        )))
         .into_any_element()
     }
 
@@ -747,6 +895,20 @@ impl CloudWorkspacesDialog {
             return out;
         };
         out.extend(model::notices(&view).iter().map(Self::notice));
+        for (ix, (_, text)) in self.warnings.iter().enumerate() {
+            let id = format!("cloud-ws-warning-{ix}");
+            out.push(
+                div()
+                    .id(SharedString::from(id.clone()))
+                    .debug_selector(move || id.clone())
+                    .role(Role::Alert)
+                    .text_size(px(12.))
+                    .line_height(px(18.))
+                    .text_color(rgb(0xfbbf24))
+                    .child(text.clone())
+                    .into_any_element(),
+            );
+        }
         let summary = model::summary_line(&model::summary(&view));
         out.push(
             div()

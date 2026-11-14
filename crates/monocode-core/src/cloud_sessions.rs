@@ -2213,6 +2213,7 @@ pub mod backend;
 pub mod claude_pin;
 pub mod claude_setup;
 pub mod docker_config;
+pub mod docker_size;
 pub mod docker_start;
 pub mod kit;
 pub mod kit_pack;
@@ -2252,6 +2253,8 @@ mod continue_tests;
 mod convert_tests;
 #[cfg(test)]
 mod docker_config_tests;
+#[cfg(test)]
+mod docker_size_tests;
 #[cfg(test)]
 mod docker_start_tests;
 #[cfg(test)]

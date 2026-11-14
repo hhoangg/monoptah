@@ -77,8 +77,8 @@ fn number_with_unit(value: &str, unit: char) -> Option<u64> {
     }
     digits.parse().ok()
 }
-/// `4g`, `512m`: whole mebibytes or gibibytes.
-fn memory_mib(value: &str) -> Option<u64> {
+/// `4g`, `512m`: whole mebibytes or gibibytes, as MiB.
+pub fn memory_mib(value: &str) -> Option<u64> {
     number_with_unit(value, 'm').or_else(|| number_with_unit(value, 'g')?.checked_mul(1024))
 }
 /// `30m`, `2h`: minutes or hours.

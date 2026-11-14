@@ -104,8 +104,9 @@ pub struct CloudInstance {
 #[derive(Clone, Debug)]
 pub enum CloudStart {
     /// A new instance is being provisioned (or an existing codespace is being connected): the
-    /// session is pending and the record drives `run_start`.
-    Pending(Session, StartRecord),
+    /// session is pending and the record drives `run_start`. The text, when set, says why the
+    /// instance differs from what the project saved (a sandbox size that was raised).
+    Pending(Session, StartRecord, Option<String>),
     /// A ready session on an instance that already has one. Nothing to provision; the first
     /// send wakes the instance if it is stopped. The state was read from the cache.
     Attached(Session, CloudRef, CloudState),
@@ -114,18 +115,18 @@ pub enum CloudStart {
 impl CloudStart {
     pub fn session(&self) -> &Session {
         match self {
-            Self::Pending(session, _) | Self::Attached(session, _, _) => session,
+            Self::Pending(session, ..) | Self::Attached(session, _, _) => session,
         }
     }
     pub fn into_session(self) -> Session {
         match self {
-            Self::Pending(session, _) | Self::Attached(session, _, _) => session,
+            Self::Pending(session, ..) | Self::Attached(session, _, _) => session,
         }
     }
     /// The instance the session runs on.
     pub fn cloud_ref(&self) -> CloudRef {
         match self {
-            Self::Pending(_, record) => record
+            Self::Pending(_, record, _) => record
                 .cloud()
                 .unwrap_or_else(|| CloudRef::codespace(record.codespace.clone())),
             Self::Attached(_, cloud, _) => cloud.clone(),
@@ -145,14 +146,21 @@ impl CloudStart {
     /// The start step in progress, `None` for an attached session.
     pub fn startup_step(&self) -> Option<StepKind> {
         match self {
-            Self::Pending(_, record) => crate::cloud_sessions::StartupSummary::of(record).step,
+            Self::Pending(_, record, _) => crate::cloud_sessions::StartupSummary::of(record).step,
+            Self::Attached(..) => None,
+        }
+    }
+    /// Why the instance being created differs from the project's saved setup, if it does.
+    pub fn note(&self) -> Option<&str> {
+        match self {
+            Self::Pending(_, _, note) => note.as_deref(),
             Self::Attached(..) => None,
         }
     }
     /// The start record of a pending start.
     pub fn record(&self) -> Option<&StartRecord> {
         match self {
-            Self::Pending(_, record) => Some(record),
+            Self::Pending(_, record, _) => Some(record),
             Self::Attached(..) => None,
         }
     }

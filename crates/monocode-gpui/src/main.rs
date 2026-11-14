@@ -39,6 +39,7 @@ mod document_lightbox;
 mod editor_analysis;
 mod editor_scrollbar;
 mod editor_syntax;
+mod emoji_library;
 mod explorer;
 mod file_editor;
 mod file_icons;
