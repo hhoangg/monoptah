@@ -197,6 +197,9 @@ impl MoveStep {
 /// Where the session goes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
+// The sandbox config grew with its environment (template / image); a move target is built once
+// per move and never stored in bulk, so the size gap costs nothing.
+#[allow(clippy::large_enum_variant)]
 pub enum MoveTarget {
     /// A new codespace on the pushed branch.
     NewCodespace { machine: Option<String> },

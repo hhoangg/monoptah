@@ -85,7 +85,8 @@ Layout, top to bottom:
     Docker ID ("Docker account <id>").
 - **Workspace** (same rows, same order for both backends):
   Repository (from origin, read-only for codespaces; editable HTTPS URL for sandboxes as
-  today), Base branch, Devcontainer (path), then one row with two compact selects side by
+  today), Base branch, Devcontainer (path; on the Docker Sandbox tab the Environment row sits
+  before it, see "Environment" below), then one row with two compact selects side by
   side: Machine (codespace machine types from `codespaces::list_machines`) and Stop when idle
   (codespace: "After 30 minutes", 1, 2 or 4 hours), or Size (sbx shapes 1/2g, 2/4g, 4/8g,
   8/16g, 16/32g) and Runtime limit (sandbox: "1 hour, then stop", 2, 4, 8 hours). Sizes below
@@ -96,6 +97,32 @@ Layout, top to bottom:
   item and its Replace token fix), not under a field. The Codespaces secrets block keeps its
   `CLAUDE_TOKEN_NOTE` warning, the secret descriptions that come from the project's
   `devcontainer.json`, and a one-line privacy note.
+- **Environment** (Docker Sandbox tab only, between Base branch and Devcontainer): a select
+  with **Default**, **Template** and **Public image**, where the sandbox starts from. The
+  default is the stock `shell` sandbox plus the repository's dev container (today's
+  behaviour).
+  - **Template** shows a name field and the hint "The template must already exist in the
+    Docker cloud registry (`sbx --cloud template ls`). Monoptah does not upload it, and its
+    size is fixed." The app never creates or checks the template: an unknown name fails the
+    create with the CLI's own error and leaves no session behind.
+  - **Public image** shows a reference field (for example `docker.io/library/rust:slim`) and a
+    hint that the image needs `sh`, `git` and `curl`.
+  - Under the field, **Also build the repository's dev container** (off by default): a template
+    or image brings its toolchain, so the session runs directly in the sandbox. The
+    Devcontainer path row is only shown while the dev container is built.
+  - A template fixes the size, so the **Size** half of the Size / Runtime limit row is replaced
+    by the line "Size comes from the template" (nothing to choose, no devcontainer size
+    warning). An image keeps the Size select, because `sbx` needs `--cpus` and `--memory` for
+    it. Picking Template after Public image (or the other way round) clears the field: a
+    template name is not an image reference.
+  - Name and reference rules (also checked at start and by the Mono API): not empty, at most
+    256 characters, no leading `-`, printable ASCII without spaces. An error shows under the
+    field.
+  - Save keeps what is stored: the environment, the dev container choice and the saved size
+    (a template project whose stored size is out of range is saved with the default size; one
+    that is in range but not a billable shape is kept: a Mono API start with an image override rounds it up to a shape, a composer start refuses it) are carried by the form,
+    not rebuilt from defaults. Opening the dialog on a template project and saving without an
+    edit writes nothing.
 - **Credentials**:
   - Docker account (sandbox only; from layer 1, "Machine sign-in (sbx login)" keeps the old
     behavior and is the default for existing projects).
@@ -114,8 +141,8 @@ Layout, top to bottom:
     closes the panel.
   - One line under the Credentials group, not per field: changing an account applies from
     the next start or reconnect; running sessions keep theirs.
-- **Selects float**: every select (default backend, Machine, Size, Runtime limit, Stop when
-  idle, Docker account, Claude, Git credential) opens a floating list under its trigger, the
+- **Selects float**: every select (default backend, Environment, Machine, Size, Runtime limit,
+  Stop when idle, Docker account, Claude, Git credential) opens a floating list under its trigger, the
   same dropdown as the Providers "sign-in options" menu (`popover::Choices`, the app's
   `Menu`): the current value is checked, arrows and Enter work, and opening it moves nothing
   in the form. The list draws above the dialog (layer 61, the dialog is 60) and below the fix
@@ -132,6 +159,10 @@ Layout, top to bottom:
   error.
 
 ### Composer (RUN ON CLOUD)
+
+For a project on a saved template, the Size row of the Docker Sandbox panel is the plain line
+"Size comes from the template" (it opens no menu and never counts as changed for this
+session); the other rows are as for any sandbox.
 
 The flow stays: Workspace menu, RUN ON CLOUD, Codespace or Docker Sandbox, panel attached
 above the composer, instance created on first send. The Workspace menu gains:
@@ -275,7 +306,9 @@ Unverified (handled defensively, listed for manual verification):
 ## Data and migration
 
 - **Sandbox**: stays in `docker-sandbox-projects.v1` as `DockerProjectConfig`, which gains
-  `dockerAccount` (serde default `None`). Existing fields (`claudeAccount`, `credentialId`,
+  `dockerAccount` (serde default `None`), `environment` (`{kind: "template", name}` or
+  `{kind: "image", reference}`; absent for the default sandbox) and `useDevcontainer`
+  (optional, only written with a template or image). Existing fields (`claudeAccount`, `credentialId`,
   `cpus`, `memory`, `ttl`, `baseRef`, `devcontainerPath`, `repoUrl`, `platform`) are kept as
   they are, so every existing reader keeps working and nothing has to be rewritten.
 - **Codespace and default backend**: new setting `cloud-projects.v1`, a map keyed by the

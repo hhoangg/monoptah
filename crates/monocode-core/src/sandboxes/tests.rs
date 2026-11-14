@@ -1178,3 +1178,226 @@ case "$*" in *eyJ*) echo argv-leak;; esac"#,
         assert!(error.contains("[redacted]"));
     }
 }
+
+// ------------------------------------------------- template and image sources
+
+fn template(name: &str) -> SandboxSource {
+    SandboxSource::Template { name: name.into() }
+}
+fn image(reference: &str) -> SandboxSource {
+    SandboxSource::Image {
+        reference: reference.into(),
+    }
+}
+
+#[test]
+fn the_default_source_builds_exactly_the_argv_create_always_built() {
+    let a = Fake::new(vec![ok(PROGRESS)]);
+    let b = Fake::new(vec![ok(PROGRESS)]);
+    create(&a, "monoptah-x-000000", &Compute::default()).unwrap();
+    create_from(
+        &b,
+        "monoptah-x-000000",
+        &Compute::default(),
+        &SandboxSource::Default,
+    )
+    .unwrap();
+    assert_eq!(a.argv(0), b.argv(0));
+}
+
+#[test]
+fn a_template_is_named_and_sends_no_size_flags() {
+    let fake = Fake::new(vec![ok(PROGRESS)]);
+    let id = create_from(
+        &fake,
+        "monoptah-x-000000",
+        &Compute::default(),
+        &template("rust-small"),
+    )
+    .unwrap();
+    assert_eq!(id, ID);
+    let argv = fake.argv(0);
+    assert_eq!(&argv[..3], ["--cloud", "--no-input", "create"]);
+    let at = argv.iter().position(|a| a == "--template").unwrap();
+    assert_eq!(argv[at + 1], "rust-small");
+    for flag in ["--cpus", "--memory", "--image-ref"] {
+        assert!(!argv.contains(&flag.to_string()), "{flag} in {argv:?}");
+    }
+    let joined = argv.join(" ");
+    assert!(joined.contains("--ttl 2h") && joined.contains("--on-timeout stop"));
+    // The template names the environment, so no agent is named.
+    assert!(!argv.contains(&"shell".to_string()));
+}
+
+#[test]
+fn a_template_ignores_a_size_that_is_not_a_billable_shape() {
+    let fake = Fake::new(vec![ok(PROGRESS)]);
+    let odd = Compute {
+        cpus: 3,
+        memory: "5g".into(),
+        ..Compute::default()
+    };
+    assert!(create(&fake, "monoptah-x-000000", &odd).is_err());
+    create_from(&fake, "monoptah-x-000000", &odd, &template("t")).unwrap();
+    assert_eq!(fake.count(), 1);
+    assert!(!fake.argv(0).contains(&"--cpus".to_string()));
+}
+
+#[test]
+fn a_template_keeps_the_platform_and_ttl_checks() {
+    let fake = Fake::new(vec![]);
+    let bad_ttl = Compute {
+        ttl: "forever".into(),
+        ..Compute::default()
+    };
+    assert!(create_from(&fake, "monoptah-x-000000", &bad_ttl, &template("t")).is_err());
+    let bad_platform = Compute {
+        platform: Some("windows/amd64".into()),
+        ..Compute::default()
+    };
+    assert!(create_from(&fake, "monoptah-x-000000", &bad_platform, &template("t")).is_err());
+    assert_eq!(fake.count(), 0);
+    let arm = Compute {
+        platform: Some("linux/arm64".into()),
+        ..Compute::default()
+    };
+    let fake = Fake::new(vec![ok(PROGRESS)]);
+    create_from(&fake, "monoptah-x-000000", &arm, &template("t")).unwrap();
+    let argv = fake.argv(0);
+    let at = argv.iter().position(|a| a == "--platform").unwrap();
+    assert_eq!(argv[at + 1], "linux/arm64");
+}
+
+#[test]
+fn an_image_is_referenced_and_keeps_the_size_flags() {
+    let fake = Fake::new(vec![ok(PROGRESS)]);
+    create_from(
+        &fake,
+        "monoptah-x-000000",
+        &Compute::default(),
+        &image("docker.io/library/rust:slim"),
+    )
+    .unwrap();
+    let argv = fake.argv(0);
+    let joined = argv.join(" ");
+    assert!(joined.contains("--cpus 2 --memory 4g"), "{joined}");
+    let at = argv.iter().position(|a| a == "--image-ref").unwrap();
+    assert_eq!(argv[at + 1], "docker.io/library/rust:slim");
+    assert!(!argv.contains(&"--template".to_string()));
+    // An image still needs a billable shape.
+    let odd = Compute {
+        cpus: 3,
+        ..Compute::default()
+    };
+    let err = create_from(&fake, "monoptah-x-000000", &odd, &image("rust:slim")).unwrap_err();
+    assert!(err.message.contains("billable shape"));
+    assert_eq!(fake.count(), 1);
+}
+
+#[test]
+fn template_names_and_image_references_cannot_inject_flags() {
+    for bad in [
+        "",
+        "-x",
+        "--cpus=64",
+        "-t",
+        "two words",
+        "tab\there",
+        "new\nline",
+        " leading",
+        "trailing ",
+        "ctl\u{7}",
+        "nul\0",
+        "uni\u{e9}code",
+        "zero\u{200b}width",
+    ] {
+        assert!(validate_template_name(bad).is_err(), "{bad:?}");
+        assert!(validate_image_ref(bad).is_err(), "{bad:?}");
+        let fake = Fake::new(vec![]);
+        for source in [template(bad), image(bad)] {
+            assert!(
+                create_from(&fake, "monoptah-x-000000", &Compute::default(), &source).is_err(),
+                "{source:?}"
+            );
+        }
+        assert_eq!(fake.count(), 0, "{bad:?} reached sbx");
+    }
+    let long = "a".repeat(257);
+    assert!(validate_template_name(&long).is_err());
+    for good in [
+        "rust-small",
+        "my_template.v2",
+        "team/rust:1.99",
+        "docker.io/library/rust:slim",
+        "ghcr.io/o/i@sha256:0123abcd",
+    ] {
+        assert!(validate_template_name(good).is_ok(), "{good}");
+        assert!(validate_image_ref(good).is_ok(), "{good}");
+    }
+}
+
+#[test]
+fn a_missing_template_is_a_plain_error_without_an_id() {
+    let fake = Fake::new(vec![fail("error: template 'nope' not found")]);
+    let err = create_from(
+        &fake,
+        "monoptah-x-000000",
+        &Compute::default(),
+        &template("nope"),
+    )
+    .unwrap_err();
+    assert!(err.message.contains("template 'nope' not found"));
+    assert_eq!(err.id, None);
+    assert!(!err.already_exists);
+}
+
+#[test]
+fn find_by_name_also_finds_a_sandbox_that_lists_with_an_empty_agent() {
+    // A sandbox made from a template or an image has an empty AGENT column.
+    let fake = Fake::new(vec![ok(
+        r#"[{"id":"sbx_t","name":"monoptah-x-000000","agent":""},{"id":"sbx_o","name":"monoptah-y-000000"}]"#,
+    )]);
+    let found = find_by_name(&fake, "monoptah-x-000000").unwrap().unwrap();
+    assert_eq!(found.id, "sbx_t");
+    let fake = Fake::new(vec![ok(
+        r#"[{"id":"sbx_o","name":"monoptah-y-000000","agent":"claude"}]"#,
+    )]);
+    assert_eq!(find_by_name(&fake, "monoptah-y-000000").unwrap(), None);
+}
+
+#[test]
+fn a_template_sandbox_stops_inspects_and_deletes_by_id_like_any_other() {
+    // Nothing in these calls depends on how the sandbox was made.
+    let json = r#"{"id":"sbx_t","name":"monoptah-x-000000","agent":"","state":"running"}"#;
+    let fake = Fake::new(vec![ok(json), ok(""), ok("")]);
+    assert_eq!(inspect(&fake, "sbx_t").unwrap().state, "running");
+    stop(&fake, "sbx_t").unwrap();
+    delete(&fake, "sbx_t").unwrap();
+    assert_eq!(fake.argv(1), ["--cloud", "--no-input", "stop", "sbx_t"]);
+    assert_eq!(
+        fake.argv(2),
+        ["--cloud", "--no-input", "rm", "--force", "sbx_t"]
+    );
+}
+
+#[test]
+fn a_source_round_trips_through_json_and_old_values_stay_default() {
+    for source in [SandboxSource::Default, template("t"), image("rust:slim")] {
+        let text = serde_json::to_string(&source).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SandboxSource>(&text).unwrap(),
+            source
+        );
+    }
+    assert_eq!(
+        serde_json::to_string(&template("t")).unwrap(),
+        r#"{"kind":"template","name":"t"}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&image("r")).unwrap(),
+        r#"{"kind":"image","reference":"r"}"#
+    );
+    assert!(SandboxSource::default().is_default());
+    assert_eq!(template("t").label().as_deref(), Some("template t"));
+    assert_eq!(SandboxSource::Default.label(), None);
+}

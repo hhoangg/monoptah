@@ -42,6 +42,13 @@
 //!   forwards to the Host's own port. The project opens at the outer workspace path. There
 //!   is nothing to rebuild.
 //!
+//! A project that starts from a saved template or a public image
+//! ([`DockerProjectConfig::environment`](super::docker_config::DockerProjectConfig::environment))
+//! brings its toolchain, so unless `use_devcontainer` is on it is decided `Plain` without the
+//! lookup, and the Provision `setup` phase does not install the Dev Container CLI
+//! (`DEVCONTAINER=0`). `sbx create` then gets `--template NAME` (no `--cpus` / `--memory`) or
+//! `--image-ref REF` ([`sandboxes::create_from`]).
+//!
 //! A record that failed at Build container because the config was missing has no mode yet, so
 //! Retry decides again and switches to Plain. A record that already has a container stays
 //! Container.
@@ -120,7 +127,7 @@ use crate::remote::host_upgrade::SandboxAuth;
 use crate::remote::{
     sandbox_bootstrap_script, shell_quote, validate_sandbox_workspace, SandboxMode, SandboxTarget,
 };
-use crate::sandboxes::{self, Compute, SbxRunner};
+use crate::sandboxes::{self, Compute, SandboxSource, SbxRunner};
 use crate::store::{pending_cloud_project, Session, Store};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -463,7 +470,7 @@ fn compute_of(config: &DockerProjectConfig) -> Result<Compute, String> {
         ttl: config.ttl.clone(),
         platform: config.platform.clone(),
     };
-    compute.validate()?;
+    compute.validate_for(&config.environment)?;
     Ok(compute)
 }
 
@@ -949,33 +956,38 @@ impl CloudSessions {
         }
         let id = match found {
             Some(id) => id,
-            None => match sandboxes::create(&runner, &name, &compute) {
-                Ok(id) => id,
-                Err(error) => match error.id {
-                    Some(id) => id,
-                    // Token problems were settled by the check above. What is left is `sbx`
-                    // refusing even a fresh JWT (the runner's "revoked" text): it rejected
-                    // the call before creating anything, so say it once, no lookup.
-                    None if sandboxes::is_account_text(&error.message) => {
-                        return Err(CreateFailure::definite(error.message))
-                    }
-                    None => match sandboxes::find_by_name(&runner, &name) {
-                        Ok(Some(found)) => found.id,
-                        Ok(None) => {
-                            return Err(CreateFailure {
-                                ambiguous: !is_clear_refusal(&error.message),
-                                message: error.message,
-                            })
+            None => {
+                match sandboxes::create_from(&runner, &name, &compute, &start.config.environment) {
+                    Ok(id) => id,
+                    Err(error) => match error.id {
+                        Some(id) => id,
+                        // Token problems were settled by the check above. What is left is `sbx`
+                        // refusing even a fresh JWT (the runner's "revoked" text): it rejected
+                        // the call before creating anything, so say it once, no lookup.
+                        None if sandboxes::is_account_text(&error.message) => {
+                            return Err(CreateFailure::definite(error.message))
                         }
-                        Err(lookup) => {
-                            return Err(CreateFailure {
-                                ambiguous: true,
-                                message: format!("{} ({lookup})", error.message),
-                            })
-                        }
+                        None => match sandboxes::find_by_name(&runner, &name) {
+                            Ok(Some(found)) => found.id,
+                            Ok(None) => {
+                                return Err(CreateFailure {
+                                    ambiguous: !is_clear_refusal(
+                                        &error.message,
+                                        &start.config.environment,
+                                    ),
+                                    message: error.message,
+                                })
+                            }
+                            Err(lookup) => {
+                                return Err(CreateFailure {
+                                    ambiguous: true,
+                                    message: format!("{} ({lookup})", error.message),
+                                })
+                            }
+                        },
                     },
-                },
-            },
+                }
+            }
         };
         deps.backend.remember(&name, &id);
         if let Some(start) = record.sandbox_start.as_mut() {
@@ -1346,6 +1358,8 @@ impl CloudSessions {
         let clone_url = git_credentials::clone_url(&start.config.repo_url)?;
         let provisioned = run.record.step(StepKind::Provision).status == StepStatus::Done
             && start.workspace.is_some();
+        // Without a dev container there is nothing to install it for (template or image).
+        let devcontainer = start.config.uses_devcontainer();
         let vars = |phase: &'static str| {
             with_vars(
                 &[
@@ -1354,12 +1368,21 @@ impl CloudSessions {
                     ("REPO_DIR", &start.repo_dir),
                     ("BASE_REF", &start.config.base_ref),
                     ("BRANCH", &branch),
+                    ("DEVCONTAINER", if devcontainer { "1" } else { "0" }),
                 ],
                 PROVISION_SCRIPT,
             )
         };
         if !provisioned {
-            self.set_detail(run, StepKind::Provision, "Installing tools");
+            self.set_detail(
+                run,
+                StepKind::Provision,
+                if devcontainer {
+                    "Installing tools"
+                } else {
+                    "Preparing the sandbox"
+                },
+            );
             self.sandbox_exec(
                 run,
                 &id,
@@ -1444,7 +1467,12 @@ impl CloudSessions {
         if start.container.is_none() {
             self.refresh_devcontainer_path(run, &mut start);
         }
-        let mode = if start.container.is_some() {
+        // A template or image brings its toolchain: unless the project asks for the dev
+        // container, skip the lookup and run directly in the sandbox.
+        let from_environment = start.container.is_none() && !start.config.uses_devcontainer();
+        let mode = if from_environment {
+            SandboxMode::Plain
+        } else if start.container.is_some() {
             SandboxMode::Container
         } else {
             let id = Self::sandbox_id(run)?;
@@ -1500,10 +1528,14 @@ impl CloudSessions {
             start.mode = Some(mode);
         }
         if mode == SandboxMode::Plain {
-            self.progress_line(
-                run,
-                "The repository has no devcontainer; the session runs directly in the sandbox",
-            );
+            let reason = match start.config.environment.label() {
+                Some(label) if from_environment => format!(
+                    "The environment comes from the {label}; the session runs directly in the sandbox"
+                ),
+                _ => "The repository has no devcontainer; the session runs directly in the sandbox"
+                    .to_string(),
+            };
+            self.progress_line(run, &reason);
             if let Some(workspace) = run
                 .record
                 .sandbox_start
@@ -2160,9 +2192,15 @@ impl CloudSessions {
 }
 
 /// True for a `create` failure that is certainly a refusal before anything was made
-/// (validation, sign-in, plan or quota); every other failure may have created a sandbox.
-fn is_clear_refusal(message: &str) -> bool {
+/// (validation, sign-in, plan or quota, or the template named in `source` is not in the
+/// registry); every other failure may have created a sandbox.
+fn is_clear_refusal(message: &str, source: &SandboxSource) -> bool {
     let lower = message.to_ascii_lowercase();
+    if matches!(source, SandboxSource::Template { name }
+        if template_not_found(&lower, &name.to_ascii_lowercase()))
+    {
+        return true;
+    }
     [
         "quota",
         "plan limit",
@@ -2177,6 +2215,56 @@ fn is_clear_refusal(message: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+}
+
+#[cfg(test)]
+pub(crate) fn is_clear_refusal_for_test(message: &str, source: &SandboxSource) -> bool {
+    is_clear_refusal(message, source)
+}
+
+/// The CLI says the template we asked for is not there: the requested name, the word
+/// "template" and the "not found" verdict are one phrase, in either order. Anything looser
+/// would also take a late failure of a sandbox that already exists ("template-mode sandbox
+/// ...: network not found") for a refusal, and leave a billable sandbox untracked. `lower`
+/// and `name` are lower case; quotes around the name are ignored.
+fn template_not_found(lower: &str, name: &str) -> bool {
+    let plain: String = lower
+        .chars()
+        .filter(|c| !matches!(c, '\'' | '"' | '`'))
+        .collect();
+    // The name ends here: "rust-small-2" is not the "rust-small" we asked for.
+    let ends = |rest: &str| {
+        rest.chars()
+            .next()
+            .is_none_or(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/')))
+    };
+    let skip = |rest: &str| rest.trim_start_matches([':', ' ']).to_owned();
+    // `template NAME not found`, `template NAME: does not exist`.
+    let lead = format!("template {name}");
+    let named_first = plain.match_indices(&lead).any(|(at, _)| {
+        let rest = &plain[at + lead.len()..];
+        ends(rest) && {
+            let rest = skip(rest);
+            ["not found", "does not exist"]
+                .iter()
+                .any(|verdict| rest.starts_with(verdict))
+        }
+    });
+    // `template not found: NAME`, `no such template: NAME`.
+    let verdict_first = [
+        "template not found",
+        "template does not exist",
+        "no such template",
+    ]
+    .iter()
+    .any(|lead| {
+        plain.match_indices(lead).any(|(at, _)| {
+            skip(&plain[at + lead.len()..])
+                .strip_prefix(name)
+                .is_some_and(ends)
+        })
+    });
+    named_first || verdict_first
 }
 
 impl Stop {
@@ -2245,7 +2333,11 @@ fn fresh_sandbox_record(
     start: SandboxStart,
     now: u64,
 ) -> StartRecord {
-    let machine = format!("{} CPU / {}", start.config.cpus, start.config.memory);
+    let machine = match &start.config.environment {
+        // The template fixes the size, so the saved cpus/memory would be wrong to show.
+        template @ SandboxSource::Template { .. } => template.label().unwrap_or_default(),
+        _ => format!("{} CPU / {}", start.config.cpus, start.config.memory),
+    };
     let mut steps: Vec<Step> = StepKind::ALL.iter().map(|k| Step::pending(*k)).collect();
     steps[0].status = StepStatus::Running;
     steps[0].started_at = Some(now);

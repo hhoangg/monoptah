@@ -546,6 +546,9 @@ fn open_sandbox_tab(window: &WindowHandle<Shell>, cx: &mut TestAppContext) {
     open_default(window, cx, "/work/monocode");
     cx.refresh().unwrap();
     let visual = &mut VisualTestContext::from_window((*window).into(), cx);
+    // The Docker Sandbox tab (with its Environment row) is taller than the default 1080px
+    // window's card, so the body would scroll and hide the Git row under the footer.
+    visual.simulate_resize(gpui::size(gpui::px(1536.), gpui::px(1300.)));
     click(visual, "cloud-seg-sandbox");
     visual.refresh().unwrap();
 }
@@ -896,7 +899,12 @@ fn no_caption_sits_between_a_field_and_the_next_label(cx: &mut TestAppContext) {
     visual.refresh().unwrap();
     same(&[
         gap(visual, "cloud-field-repo", "cloud-field-sb-base"),
-        gap(visual, "cloud-field-sb-base", "cloud-field-sb-devcontainer"),
+        gap(visual, "cloud-field-sb-base", "cloud-select-environment"),
+        gap(
+            visual,
+            "cloud-select-environment",
+            "cloud-field-sb-devcontainer",
+        ),
         gap(visual, "cloud-field-sb-devcontainer", "cloud-select-size"),
         gap(visual, "cloud-select-docker", "cloud-select-claude"),
         gap(visual, "cloud-select-claude", "cloud-select-git"),
@@ -1494,7 +1502,7 @@ fn the_git_list_reaches_past_the_dialog_card_and_still_takes_the_click(cx: &mut 
     let visual = &mut VisualTestContext::from_window(window.into(), cx);
     // The dialog card ends well above the bottom of the window, so a tall list reaches past it
     // (the window is tall enough to hold the dialog and the list).
-    visual.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1300.)));
+    visual.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1500.)));
     visual.refresh().unwrap();
     assert_eq!(chosen_credential(&window, visual), None);
     click(visual, "cloud-select-git");
@@ -1777,4 +1785,65 @@ fn enter_on_the_focused_docker_usage_link_opens_the_usage_page(cx: &mut TestAppC
     assert_eq!(visual.opened_url(), None);
     visual.simulate_keystrokes("enter");
     assert_eq!(visual.opened_url().as_deref(), Some(DOCKER_USAGE_URL));
+}
+
+#[gpui::test]
+fn the_environment_row_picks_a_template_or_an_image_and_replaces_the_size(cx: &mut TestAppContext) {
+    let (window, _, _) = shell_with_fakes(cx);
+    open_sandbox_tab(&window, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    // The default sandbox: no field, the size and the dev container path as before.
+    assert_eq!(select_label(&window, visual, "environment"), "Default");
+    for id in ["cloud-select-size", "cloud-field-sb-devcontainer"] {
+        assert!(visual.debug_bounds(id).is_some(), "{id}");
+    }
+    for id in [
+        "cloud-field-sb-env",
+        "cloud-env-hint",
+        "cloud-size-from-template",
+    ] {
+        assert!(visual.debug_bounds(id).is_none(), "{id}");
+    }
+    // A template: a name field with the hint under it, and no size to choose.
+    click(visual, "cloud-select-environment");
+    visual.refresh().unwrap();
+    click(visual, "menu-action-1");
+    visual.refresh().unwrap();
+    assert_eq!(select_label(&window, visual, "environment"), "Template");
+    let field = bounds_of(visual, "cloud-field-sb-env");
+    let hint = bounds_of(visual, "cloud-env-hint");
+    assert!(hint.top() >= field.bottom(), "{hint:?} {field:?}");
+    assert!(
+        bounds_of(visual, "cloud-select-environment").bottom() <= field.top(),
+        "the field sits under the select"
+    );
+    assert!(visual.debug_bounds("cloud-select-size").is_none());
+    let size = bounds_of(visual, "cloud-size-from-template");
+    let runtime = bounds_of(visual, "cloud-select-runtime");
+    assert!(
+        (size.top() - runtime.top()).abs() <= gpui::px(2.),
+        "the line stands where the Size select stood: {size:?} {runtime:?}"
+    );
+    // The dev container is off by default, so its path is not asked for.
+    assert!(visual.debug_bounds("cloud-field-sb-devcontainer").is_none());
+    click(visual, "cloud-env-devcontainer");
+    visual.refresh().unwrap();
+    assert!(visual.debug_bounds("cloud-field-sb-devcontainer").is_some());
+    // A public image keeps the size choice.
+    click(visual, "cloud-select-environment");
+    visual.refresh().unwrap();
+    click(visual, "menu-action-2");
+    visual.refresh().unwrap();
+    assert_eq!(select_label(&window, visual, "environment"), "Public image");
+    assert!(visual.debug_bounds("cloud-select-size").is_some());
+    assert!(visual.debug_bounds("cloud-size-from-template").is_none());
+    assert!(visual.debug_bounds("cloud-field-sb-env").is_some());
+    // Back to the default: the extra rows are gone.
+    click(visual, "cloud-select-environment");
+    visual.refresh().unwrap();
+    click(visual, "menu-action-0");
+    visual.refresh().unwrap();
+    for id in ["cloud-field-sb-env", "cloud-env-hint"] {
+        assert!(visual.debug_bounds(id).is_none(), "{id}");
+    }
 }

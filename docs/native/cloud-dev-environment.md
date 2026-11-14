@@ -12,7 +12,9 @@ How a cloud session gets a working Rust toolchain for `crates/monocode-core` and
 | Local Mac | nothing | Use rustup and Xcode as before. |
 
 So there is one config, not a separate Sandbox template. If a project has no devcontainer
-the app runs the session directly in the sandbox, which has no toolchain.
+the app runs the session directly in the sandbox, which has no toolchain. A project can also
+start the sandbox from a saved template or a public image, which skips the dev container
+(see "Docker Sandbox: start from a template or an image").
 
 Platforms: the image builds for the host architecture, so Linux aarch64 and x86_64
 sandboxes both work (aarch64 verified; x86_64 uses the same file, with the
@@ -53,6 +55,104 @@ So the default 2 CPU / 4g sandbox can run fmt, clippy and `cargo check`, and the
 at 1 job; running the GPUI tests needs a 4 CPU / 8g sandbox. 8g with 1 job is the only
 verified GPUI-test setup.
 `scripts/native-dev-doctor.sh` reads the cgroup limit and warns about all of this.
+
+## Docker Sandbox: start from a template or an image
+
+By default the sandbox is a stock `shell` sandbox and the app builds the repository's dev
+container in it. That costs about 3m37s before the session is usable (the Dockerfile alone
+builds in about 150 s on a 2 vCPU / 4g sandbox). A project can instead start from something
+that already has the toolchain: in the project's **Cloud settings**, Docker Sandbox tab, the
+**Environment** row (see "Environment" in [cloud-setup.md](cloud-setup.md)), or with
+`sessions.start` target `{kind: "sandbox", template: NAME}` / `{kind: "sandbox", image: REF}`:
+
+| Environment | What the app runs | Measured (aarch64) |
+| --- | --- | --- |
+| Default | `sbx create ... shell`, then Dev Container CLI | about 3m37s to ready |
+| Template | `sbx --cloud create --template NAME`, no `--cpus` / `--memory` | 396 MB toolchain template: created in 9 s, first command 4 s later (about 13 s; 4-13 s across the templates tried) |
+| Public image | `sbx --cloud create --image-ref REF --cpus N --memory M` | `docker.io/library/rust:slim`: created in 9 s, first command 3 s later (about 12 s) |
+
+A template or image brings its own toolchain, so the app skips the dev container build
+(`Plain` mode: the session runs directly in the sandbox, the Dev Container CLI is not even
+installed). Turn **Also build the repository's dev container** on (under the Environment
+field) to get the old behaviour on top of it (config `useDevcontainer`, default off for a template or image).
+
+What the app does **not** do: it never creates, uploads or deletes a template (a later
+slice will). The template must already exist in the Docker cloud registry
+(`sbx --cloud template ls`). An unknown name fails the create with the CLI's own error. The
+start treats that as a refusal (no session and no record left behind) only when the error says
+that the template **we asked for** is not found or does not exist, naming it; any other
+failure, including a late one whose text merely mentions a template, is unclear (a sandbox may
+exist and bill), so the app keeps a failed start to Retry (which looks the name up first) or
+delete.
+
+### Size
+
+A template fixes the sandbox size: `sbx` rejects `--cpus` and `--memory` with it
+("template-mode sandboxes use the template's baked-in sizing"). The app therefore sends none,
+does not check the saved size (when an image overrides a template project through the Mono
+API, the saved size is rounded up to a billable shape and the response says so), shows **Size comes from the template** in the Cloud settings
+dialog and in the composer panel, and refuses `cpus` / `memory` next to `template` in `sessions.start`.
+You need one template per size, and per platform (a template inherits the platform it was
+saved on; without `--platform` the new sandbox inherits it). A public image is different: `sbx`
+requires `--cpus` and `--memory` for `--image-ref`, so the normal sizes apply.
+
+### Preparing a template by hand
+
+Do this in a terminal with `sbx` signed in, **before** any credential reaches the sandbox:
+
+```bash
+# 1. A sandbox of the size the template should have (this fixes the template's size).
+ID=$(sbx --cloud create --no-progress --name tpl-rust --cpus 4 --memory 8g --ttl 1h shell | grep -E '^sbx_')
+# 2. Install the toolchain on the sandbox's OWN filesystem, not in an inner Docker image.
+sbx --cloud exec "$ID" sh -c 'sudo apt-get update && sudo apt-get install -y \
+  git curl xz-utils build-essential pkg-config clang && \
+  curl --proto =https -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal -c rustfmt,clippy'
+# 3. Save it. The default `disk` capture mode; do NOT pass --capture-mode all.
+sbx --cloud template save "$ID" rust-medium --description "rust toolchain, 4 vCPU / 8g"
+# 4. The sandbox was only the source: stop it, wait until `sbx --cloud ls` says stopped, remove it.
+sbx --cloud stop "$ID"
+sbx --cloud rm --force "$ID"
+sbx --cloud template ls
+```
+
+The template needs `sh`, `git` and `curl` (the app clones the repository and installs its Host
+in the sandbox). The commands above follow `sbx` 0.53; check `sbx --cloud template save --help` if your
+version differs.
+
+Measured on a micro/small sandbox: installing apt packages plus rustup took 33 s, saving the
+template 34 s and the template is 396 MB; a sandbox created from it ran `rustc`, `gcc` and the
+system libraries on the first command. Warnings from that spike:
+
+- **Never snapshot a sandbox that already received credentials** (a Git token, a Claude
+  token, the Host token). Docker's docs say credential files in the filesystem end up in
+  templates, and `--capture-mode all` also captures process memory (for example a
+  `git-credential-cache` daemon). Prepare the template in a sandbox the app never touched.
+- **A `disk` template does not keep the Docker image built inside the sandbox.** An image built
+  by the dev container lives under `/var/lib/docker` and is not captured; only the sandbox's
+  own filesystem is. That is why the toolchain has to be installed outside Docker.
+- `--capture-mode all` keeps the inner images but produced a **26.6 GB** template (137 s to
+  save) and removed its source sandbox before the save finished. Avoid it.
+- **Storage cost is unknown.** The Docker documentation gives no storage price for templates;
+  ask Docker billing before keeping several multi-hundred-MB templates per size and platform.
+- Every template is tied to its size and platform: one per size and architecture. Everything
+  above was run on aarch64; x86_64 was not.
+
+### A public image
+
+`--image-ref` needs no template: the image must be public, and the sandbox it makes has only
+what the image contains. `docker.io/library/rust:slim` has no `git`, `curl`, `sudo` or Docker,
+so it cannot be used as is (the clone and the Host install need `git` and `curl`); use an
+image that has them.
+
+Checked once more with a micro sandbox from `docker.io/library/rust:slim` (`create` without an
+agent argument, which is what the app sends for an image or a template):
+
+- It was created in 4 s and `rustc` ran 3 s later.
+- `sbx --cloud ls` shows an **empty AGENT column** for it, as for a template. The app's
+  lookup by name therefore accepts an empty agent as well as `shell`.
+- `sbx exec` runs as `root`, but `ssh <id>@sbx_cloud` (which the app uses) logs in as `user`
+  (uid 2000, `HOME=/home/user`). The provisioning scripts take `$HOME` from the login user and
+  assume neither `root` nor `agent`.
 
 ## Codespaces need an SSH server
 

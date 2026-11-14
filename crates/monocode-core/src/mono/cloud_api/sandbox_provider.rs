@@ -11,7 +11,7 @@ use crate::cloud_sessions::docker_config::{self, valid_ref};
 use crate::cloud_sessions::docker_size;
 use crate::cloud_sessions::project_cloud;
 use crate::cloud_sessions::{CloudBackendKind, CloudRef, CloudSessions, CloudState};
-use crate::sandboxes::{self, Prerequisites};
+use crate::sandboxes::{self, Prerequisites, SandboxSource};
 use crate::store::{RemoteSession, Store};
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
@@ -36,7 +36,7 @@ impl CloudKindSpec for SandboxSpec {
         })
     }
     fn start_options(&self) -> &'static [&'static str] {
-        &["branch", "cpus", "memory", "ttl"]
+        &["branch", "cpus", "memory", "ttl", "template", "image"]
     }
     fn resume_without_session_advice(&self, _: &str) -> String {
         // sessions.start on an existing sandbox needs a ready session, so it cannot help here.
@@ -61,8 +61,28 @@ impl CloudKindSpec for SandboxSpec {
                 .map_err(|e| format!("target.memory: {e}")),
             "ttl" => docker_config::check_ttl(&lowered(value).ok_or_else(bad)?)
                 .map_err(|e| format!("target.ttl: {e}")),
+            "template" => sandboxes::validate_template_name(value.as_str().ok_or_else(bad)?)
+                .map_err(|e| format!("target.template: {e}")),
+            "image" => sandboxes::validate_image_ref(value.as_str().ok_or_else(bad)?)
+                .map_err(|e| format!("target.image: {e}")),
             _ => Err(bad()),
         }
+    }
+    fn check_start_combination(&self, target: &Map<String, Value>) -> Result<(), String> {
+        if target.contains_key("template") && target.contains_key("image") {
+            return Err("target takes either template or image, not both".into());
+        }
+        if target.contains_key("template") {
+            if let Some(size) = ["cpus", "memory"]
+                .into_iter()
+                .find(|k| target.contains_key(*k))
+            {
+                return Err(format!(
+                    "target.{size} cannot be combined with target.template: a template fixes the sandbox size"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -323,8 +343,11 @@ impl CloudProvider for SandboxProvider {
     }
 
     /// New: the project's Docker config (with optional `cpus`, `memory`, `ttl` overrides, the
-    /// size fitted by [`docker_size::requested_size`]) and `branch` (default: the current branch) through `begin_sandbox_start`. Existing: another
-    /// ready session on the sandbox, see `CloudSessions::attach_session`.
+    /// size fitted by [`docker_size::requested_size`]) and `branch` (default: the current
+    /// branch) through `begin_sandbox_start`. Existing: another ready session on the sandbox,
+    /// see `CloudSessions::attach_session`. A `template` or `image` option replaces the
+    /// project's environment for this start; a template cannot be combined with `cpus` /
+    /// `memory`.
     fn start(
         &self,
         project: &str,
@@ -349,23 +372,60 @@ impl CloudProvider for SandboxProvider {
         let mut config = self.config(project)?.ok_or(
             "Docker Sandbox is not set up for this project. Set it up in the project's Cloud settings first.",
         )?;
+        // A template or image named here replaces the project's environment for this start.
+        let template = option_text(options, "template");
+        let image = option_text(options, "image");
+        match (template, image) {
+            (Some(name), _) => {
+                config.environment = SandboxSource::Template {
+                    name: name.to_owned(),
+                }
+            }
+            (None, Some(reference)) => {
+                config.environment = SandboxSource::Image {
+                    reference: reference.to_owned(),
+                }
+            }
+            (None, None) => {}
+        }
         // A lone cpus or memory takes its shape's other half; neither takes the saved size,
-        // raised to fit the devcontainer's hostRequirements (up to a cap), with a note that
-        // goes back to the caller.
-        let cpus = match options.get("cpus").and_then(Value::as_u64) {
-            Some(cpus) => Some(u32::try_from(cpus).map_err(|_| "cpus is too large")?),
-            None => None,
-        };
-        let devcontainer =
-            project_cloud::devcontainer_info(Path::new(project), &config.devcontainer_path);
-        let size = docker_size::requested_size(
-            &config,
-            cpus,
-            option_text(options, "memory"),
-            &devcontainer,
-        )?;
-        config.cpus = size.cpus;
-        config.memory = size.memory;
+        // raised to fit the devcontainer's hostRequirements (up to a cap) when a dev container
+        // is built, with a note that goes back to the caller. A saved size nobody validated
+        // (a template project's) is rounded up to a shape, so an override that turns a
+        // template project into an image one starts with that fitted size.
+        let mut note = None;
+        if config.size_from_template() {
+            // Also covers a project whose saved environment is a template: it fixes the size,
+            // so there is nothing to fit and no note.
+            if let Some(size) = ["cpus", "memory"]
+                .into_iter()
+                .find(|k| options.contains_key(*k))
+            {
+                return Err(format!(
+                    "target.{size} cannot be used with a template: the template fixes the sandbox size"
+                ));
+            }
+        } else {
+            let cpus = match options.get("cpus").and_then(Value::as_u64) {
+                Some(cpus) => Some(u32::try_from(cpus).map_err(|_| "cpus is too large")?),
+                None => None,
+            };
+            // hostRequirements only matter when the dev container is built in the sandbox.
+            let devcontainer = if config.uses_devcontainer() {
+                project_cloud::devcontainer_info(Path::new(project), &config.devcontainer_path)
+            } else {
+                Default::default()
+            };
+            let size = docker_size::requested_size(
+                &config,
+                cpus,
+                option_text(options, "memory"),
+                &devcontainer,
+            )?;
+            config.cpus = size.cpus;
+            config.memory = size.memory;
+            note = size.note;
+        }
         if let Some(ttl) = option_text(options, "ttl") {
             config.ttl = ttl.to_owned();
         }
@@ -386,7 +446,7 @@ impl CloudProvider for SandboxProvider {
             kit,
             account.is_some(),
         )?;
-        Ok(CloudStart::Pending(session, record, size.note))
+        Ok(CloudStart::Pending(session, record, note))
     }
 
     /// Reconnects the sandbox (resuming it when stopped) through the session. BLOCKS for

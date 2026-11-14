@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::cloud_sessions::CloudState;
 
@@ -599,13 +599,30 @@ pub fn shapes_text() -> String {
 impl Compute {
     /// Checks the cpus/memory pair is a billable shape and ttl/platform are well formed.
     pub fn validate(&self) -> Result<(), String> {
-        if !is_shape(u32::from(self.cpus), &self.memory) {
-            return Err(format!(
-                "{} CPUs with {} memory is not a billable shape. Choose one of: {}",
-                self.cpus,
-                self.memory,
-                shapes_text()
-            ));
+        self.validate_for(&SandboxSource::Default)
+    }
+
+    /// Checks only that the cpus/memory pair is a billable shape (the size a template never
+    /// has to satisfy).
+    pub fn validate_size(&self) -> Result<(), String> {
+        if is_shape(u32::from(self.cpus), &self.memory) {
+            return Ok(());
+        }
+        Err(format!(
+            "{} CPUs with {} memory is not a billable shape. Choose one of: {}",
+            self.cpus,
+            self.memory,
+            shapes_text()
+        ))
+    }
+
+    /// Like [`Compute::validate`] for the sandbox source it is used with. A template carries
+    /// its own sizing (the CLI refuses `--cpus` / `--memory` with it), so cpus and memory are
+    /// not checked and not sent; ttl and platform still are.
+    pub fn validate_for(&self, source: &SandboxSource) -> Result<(), String> {
+        source.validate()?;
+        if !source.is_template() {
+            self.validate_size()?;
         }
         validate_ttl(&self.ttl)?;
         if let Some(p) = &self.platform {
@@ -619,6 +636,111 @@ impl Compute {
 
 /// Every sandbox the app creates is named with this prefix (see [`sandbox_name_for`]).
 pub const NAME_PREFIX: &str = "monoptah-";
+
+/// Where a new sandbox's filesystem comes from.
+///
+/// * `Default`: the stock `shell` sandbox.
+/// * `Template`: a template saved in the cloud registry (`sbx --cloud template ls`). The CLI
+///   never uploads one, so it must already exist. Its size is baked in: no `--cpus` /
+///   `--memory`.
+/// * `Image`: a public OCI image (`--image-ref`). Unlike a template it needs `--cpus` and
+///   `--memory`, so the normal size rules apply.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum SandboxSource {
+    #[default]
+    Default,
+    Template {
+        name: String,
+    },
+    Image {
+        reference: String,
+    },
+}
+
+/// Longest template name or image reference accepted.
+const SOURCE_MAX: usize = 256;
+
+impl SandboxSource {
+    pub fn is_default(&self) -> bool {
+        matches!(self, Self::Default)
+    }
+
+    /// A template fixes the sandbox size.
+    pub fn is_template(&self) -> bool {
+        matches!(self, Self::Template { .. })
+    }
+
+    /// The template name or image reference, `None` for the default sandbox.
+    pub fn value(&self) -> Option<&str> {
+        match self {
+            Self::Default => None,
+            Self::Template { name } => Some(name),
+            Self::Image { reference } => Some(reference),
+        }
+    }
+
+    /// `template NAME` / `image REF` for messages; `None` for the default sandbox.
+    pub fn label(&self) -> Option<String> {
+        match self {
+            Self::Default => None,
+            Self::Template { name } => Some(format!("template {name}")),
+            Self::Image { reference } => Some(format!("image {reference}")),
+        }
+    }
+
+    /// Trims the text; nothing else changes.
+    pub fn trimmed(&self) -> Self {
+        match self {
+            Self::Default => Self::Default,
+            Self::Template { name } => Self::Template {
+                name: name.trim().to_owned(),
+            },
+            Self::Image { reference } => Self::Image {
+                reference: reference.trim().to_owned(),
+            },
+        }
+    }
+
+    /// Checks the name or reference is safe to hand to `sbx` as one argument.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Default => Ok(()),
+            Self::Template { name } => validate_source_text("Template name", name),
+            Self::Image { reference } => validate_source_text("Image reference", reference),
+        }
+    }
+}
+
+/// Rejects empty text, a leading `-` (it would read as a flag), whitespace, control
+/// characters and anything outside printable ASCII.
+fn validate_source_text(what: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{what} is required"));
+    }
+    if value.len() > SOURCE_MAX {
+        return Err(format!("{what} must have at most {SOURCE_MAX} characters"));
+    }
+    if value.starts_with('-') {
+        return Err(format!("{what} must not start with a hyphen"));
+    }
+    if !value.chars().all(|c| c.is_ascii_graphic()) {
+        return Err(format!(
+            "{what} must not contain spaces, control or non-ASCII characters"
+        ));
+    }
+    Ok(())
+}
+
+/// Validates a saved cloud template name (see [`SandboxSource::validate`]).
+pub fn validate_template_name(name: &str) -> Result<(), String> {
+    validate_source_text("Template name", name)
+}
+
+/// Validates a public OCI image reference (see [`SandboxSource::validate`]).
+pub fn validate_image_ref(reference: &str) -> Result<(), String> {
+    validate_source_text("Image reference", reference)
+}
 
 /// `monoptah-<branch-slug>-<6 chars of the request id>`; always a valid sandbox name.
 pub fn sandbox_name_for(branch: &str, request_id: &str) -> String {
@@ -731,28 +853,50 @@ pub fn create(
     name: &str,
     compute: &Compute,
 ) -> Result<String, CreateError> {
+    create_from(runner, name, compute, &SandboxSource::Default)
+}
+
+/// [`create`] from a `source`. A template adds `--template NAME` and sends no `--cpus` /
+/// `--memory` (the CLI refuses them: "template-mode sandboxes use the template's baked-in
+/// sizing"); an image adds `--image-ref REF` and keeps the size flags (the CLI requires them).
+pub fn create_from(
+    runner: &dyn SbxRunner,
+    name: &str,
+    compute: &Compute,
+    source: &SandboxSource,
+) -> Result<String, CreateError> {
     validate_sandbox_name(name)?;
-    compute.validate()?;
-    let cpus = compute.cpus.to_string();
-    let mut argv = args(&[
-        "create",
-        "--no-progress",
-        "--name",
-        name,
-        "--cpus",
-        &cpus,
-        "--memory",
-        &compute.memory.to_ascii_lowercase(),
-        "--ttl",
-        &compute.ttl,
-        "--on-timeout",
-        "stop",
+    compute.validate_for(source)?;
+    let mut argv = args(&["create", "--no-progress", "--name", name]);
+    match source {
+        SandboxSource::Template { name } => {
+            argv.extend(["--template".to_string(), name.clone()]);
+        }
+        SandboxSource::Default | SandboxSource::Image { .. } => {
+            argv.extend([
+                "--cpus".to_string(),
+                compute.cpus.to_string(),
+                "--memory".to_string(),
+                compute.memory.to_ascii_lowercase(),
+            ]);
+            if let SandboxSource::Image { reference } = source {
+                argv.extend(["--image-ref".to_string(), reference.clone()]);
+            }
+        }
+    }
+    argv.extend([
+        "--ttl".to_string(),
+        compute.ttl.clone(),
+        "--on-timeout".to_string(),
+        "stop".to_string(),
     ]);
     if let Some(platform) = &compute.platform {
         argv.push("--platform".into());
         argv.push(platform.clone());
     }
-    argv.push("shell".into());
+    if let Some(agent) = agent_arg(source) {
+        argv.push(agent.into());
+    }
     let out = runner.run(&argv, None)?;
     let id = parse_created_id(&out.stdout).or_else(|| parse_created_id(&out.stderr));
     if !out.success {
@@ -768,6 +912,12 @@ pub fn create(
         message: "Docker Sandboxes did not report the new sandbox id".into(),
         already_exists: false,
     })
+}
+
+/// The positional agent of `create`: `shell` for the stock sandbox; a template or image
+/// carries its own environment, so none is named.
+fn agent_arg(source: &SandboxSource) -> Option<&'static str> {
+    source.is_default().then_some("shell")
 }
 
 /// Removes ANSI CSI escape sequences (colours, cursor moves, line erases).
@@ -800,13 +950,15 @@ pub fn parse_created_id(output: &str) -> Option<String> {
 }
 
 /// Finds the one `shell` sandbox called exactly `name` (cloud names are not unique handles).
+/// A sandbox made from a template or an image lists with an empty AGENT column, so an empty
+/// agent counts as ours too; the generated names are unique per start.
 /// Use it after a `create` that timed out or reported `already_exists`. More than one match
 /// is an error listing the ids rather than a guess.
 pub fn find_by_name(runner: &dyn SbxRunner, name: &str) -> Result<Option<SandboxInfo>, String> {
     validate_sandbox_name(name)?;
     let mut found: Vec<SandboxInfo> = list(runner)?
         .into_iter()
-        .filter(|s| s.name == name && s.agent == "shell")
+        .filter(|s| s.name == name && matches!(s.agent.as_str(), "shell" | ""))
         .collect();
     match found.len() {
         0 => Ok(None),

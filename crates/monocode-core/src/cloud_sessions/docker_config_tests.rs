@@ -1,4 +1,5 @@
 use super::docker_config::*;
+use crate::sandboxes::SandboxSource;
 use crate::store::Store;
 
 fn store() -> (tempfile::TempDir, Store) {
@@ -259,4 +260,126 @@ fn docker_account_is_trimmed_and_checked() {
         cfg.docker_account = Some(bad.into());
         assert!(cfg.validated().is_err(), "{bad}");
     }
+}
+// ------------------------------------------------------- template and image
+
+fn template_config(name: &str) -> DockerProjectConfig {
+    DockerProjectConfig {
+        environment: SandboxSource::Template { name: name.into() },
+        ..config()
+    }
+}
+
+#[test]
+fn an_old_config_without_an_environment_is_the_default_sandbox() {
+    // Exactly what an earlier build stored.
+    let old = r#"{"repoUrl":"https://github.com/o/r","credentialId":null,"baseRef":"","devcontainerPath":".devcontainer/devcontainer.json","cpus":4,"memory":"8g","ttl":"4h","platform":null,"claudeAccount":null}"#;
+    let cfg: DockerProjectConfig = serde_json::from_str(old).unwrap();
+    assert_eq!(cfg.environment, SandboxSource::Default);
+    assert_eq!(cfg.use_devcontainer, None);
+    assert!(cfg.uses_devcontainer() && !cfg.size_from_template());
+    let checked = cfg.validated().unwrap();
+    assert_eq!((checked.cpus, checked.memory.as_str()), (4, "8g"));
+    // A default config writes nothing new, so an older build reads it back unchanged.
+    let json = serde_json::to_value(&checked).unwrap();
+    assert!(json.get("environment").is_none() && json.get("useDevcontainer").is_none());
+}
+
+#[test]
+fn a_template_or_image_round_trips_through_the_store() {
+    let (_dir, store) = store();
+    let mut template = template_config(" rust-small ");
+    template.use_devcontainer = Some(true);
+    let saved = save(&store, "/p/t", &template).unwrap();
+    assert_eq!(
+        saved.environment,
+        SandboxSource::Template {
+            name: "rust-small".into()
+        }
+    );
+    let image = DockerProjectConfig {
+        environment: SandboxSource::Image {
+            reference: "docker.io/library/rust:slim".into(),
+        },
+        ..config()
+    };
+    save(&store, "/p/i", &image).unwrap();
+    assert_eq!(load(&store, "/p/t").unwrap().unwrap(), saved);
+    let loaded = load(&store, "/p/i").unwrap().unwrap();
+    assert_eq!(loaded.environment, image.environment);
+    let raw = store.setting(SETTING).unwrap().unwrap();
+    assert!(raw.contains(r#""environment":{"kind":"template","name":"rust-small"}"#));
+    assert!(raw.contains(r#""useDevcontainer":true"#));
+}
+
+#[test]
+fn the_dev_container_is_off_for_a_template_or_image_unless_asked_for() {
+    assert!(config().uses_devcontainer());
+    let mut cfg = template_config("t");
+    assert_eq!(cfg.use_devcontainer, None);
+    assert!(!cfg.uses_devcontainer());
+    cfg.use_devcontainer = Some(true);
+    assert!(cfg.uses_devcontainer());
+    cfg.environment = SandboxSource::Image {
+        reference: "rust:slim".into(),
+    };
+    cfg.use_devcontainer = Some(false);
+    assert!(!cfg.uses_devcontainer());
+    // The flag means nothing for the default sandbox, which keeps today's behaviour.
+    let mut default = config();
+    default.use_devcontainer = Some(false);
+    let checked = default.validated().unwrap();
+    assert_eq!(checked.use_devcontainer, None);
+    assert!(checked.uses_devcontainer());
+}
+
+#[test]
+fn a_template_skips_the_size_checks_and_an_image_keeps_them() {
+    let mut cfg = template_config("t");
+    cfg.cpus = 0;
+    cfg.memory = "banana".into();
+    assert!(cfg.size_from_template());
+    assert!(cfg.validated().is_ok());
+    let mut image = cfg.clone();
+    image.environment = SandboxSource::Image {
+        reference: "rust:slim".into(),
+    };
+    assert!(image.validated().is_err());
+    // The lifetime still applies to a template.
+    cfg.ttl = "forever".into();
+    assert!(cfg.validated().is_err());
+}
+
+#[test]
+fn bad_template_names_and_image_references_are_rejected_and_not_stored() {
+    let (_dir, store) = store();
+    for bad in [
+        "",
+        "   ",
+        "-t",
+        "--cpus=64",
+        "a b",
+        "a\tb",
+        "a\nb",
+        "a\u{7}b",
+    ] {
+        for environment in [
+            SandboxSource::Template { name: bad.into() },
+            SandboxSource::Image {
+                reference: bad.into(),
+            },
+        ] {
+            let cfg = DockerProjectConfig {
+                environment,
+                ..config()
+            };
+            let error = cfg.validated().unwrap_err();
+            assert!(
+                error.contains("Template name") || error.contains("Image reference"),
+                "{bad:?}: {error}"
+            );
+            assert!(save(&store, "/p/x", &cfg).is_err());
+        }
+    }
+    assert!(store.setting(SETTING).unwrap().is_none());
 }

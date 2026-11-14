@@ -28,6 +28,8 @@ pub(crate) const STARTED_BY_AGENT: &str =
 
 /// What the dialog asks the shell to do.
 #[derive(Clone, Debug, PartialEq)]
+// The sandbox config inside `MoveTarget` grew with its environment; one event per click.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Event {
     /// Close the dialog. A running move goes on in the background.
     Close,

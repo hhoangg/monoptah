@@ -3626,3 +3626,158 @@ fn a_docker_feature_branch_is_never_a_changed_row(cx: &mut TestAppContext) {
         })
         .unwrap();
 }
+
+// ------------------------------------------------ a project that starts from a template
+
+fn save_template_config(view: &Conversation, cpus: u32, memory: &str) {
+    let config = DockerProjectConfig {
+        repo_url: "https://github.com/octo/widgets.git".into(),
+        environment: monocode_core::sandboxes::SandboxSource::Template {
+            name: "rust-small".into(),
+        },
+        cpus,
+        memory: memory.into(),
+        ..Default::default()
+    };
+    docker_config::save(&locked(&view.store).unwrap(), &view.summary.cwd, &config).unwrap();
+    view.forget_project_cloud();
+}
+
+#[gpui::test]
+fn a_template_project_replaces_the_size_row_and_sends_the_template(cx: &mut TestAppContext) {
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    let requests = watch(window, cx);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    let draw = |visual: &mut gpui::VisualTestContext| {
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+    };
+    window
+        .update(visual, |view, _, cx| {
+            save_template_config(view, 2, "4g");
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+        })
+        .unwrap();
+    draw(visual);
+    // The row stays, but it only says where the size comes from.
+    assert!(visual.debug_bounds("cloud-row-size").is_some());
+    assert!(visual.debug_bounds("cloud-size-from-template").is_some());
+    assert!(visual.debug_bounds("cloud-row-size-anchor").is_none());
+    let row = visual.debug_bounds("cloud-row-size").unwrap();
+    visual.simulate_click(row.center(), Default::default());
+    draw(visual);
+    window
+        .update(visual, |view, _, _| {
+            assert!(!view.menu_is(ComposerMenu::CloudField(CloudField::Size)));
+        })
+        .unwrap();
+    // The other rows are untouched, and the template travels with the request.
+    for id in ["cloud-row-runtime", "cloud-row-base", "cloud-row-branch"] {
+        assert!(visual.debug_bounds(id).is_some(), "{id}");
+    }
+    window
+        .update(visual, |view, _, cx| {
+            set_text(view, |d| d.branch.clone(), "feature/x", cx);
+            view.create_cloud(cx);
+        })
+        .unwrap();
+    visual.run_until_parked();
+    let sent = requests.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    let config = sent[0].config.as_ref().unwrap();
+    assert_eq!(config.environment.value(), Some("rust-small"));
+    assert!(config.size_from_template() && !config.uses_devcontainer());
+}
+
+#[gpui::test]
+fn the_size_row_of_a_template_project_is_never_a_change_for_this_session(cx: &mut TestAppContext) {
+    // A saved size that is not a valid shape rides along with a template: no row, field or
+    // stale draft value may turn it into an override the start then checks.
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    let requests = watch(window, cx);
+    window
+        .update(cx, |view, _, cx| {
+            save_template_config(view, 3, "5g");
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            let draft = view.cloud_draft.as_mut().unwrap();
+            assert!(draft.size_from_template());
+            assert!(!draft.row_changed(CloudRow::Size));
+            // Even a draft value that differs from the project's is not a changed row.
+            draft.cpus = 8;
+            draft.memory = "16g".into();
+            assert!(!draft.row_changed(CloudRow::Size));
+            assert!(
+                CloudRow::of(draft.target)
+                    .iter()
+                    .all(|row| !draft.row_changed(*row))
+            );
+            // Nor does the devcontainer size warning apply to a size nobody uses.
+            draft.devcontainer = monocode_core::cloud_sessions::project_cloud::DevcontainerInfo {
+                host_cpus: Some(16),
+                host_memory_mib: Some(64 * 1024),
+                ..Default::default()
+            };
+            draft.cpus = 1;
+            draft.memory = "2g".into();
+            assert_eq!(draft.size_warning(), None);
+            set_text(view, |d| d.branch.clone(), "feature/x", cx);
+            view.create_cloud(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let sent = requests.lock().unwrap();
+    assert_eq!(sent.len(), 1, "the start was not refused");
+    let config = sent[0].config.as_ref().unwrap();
+    assert_eq!((config.cpus, config.memory.as_str()), (3, "5g"));
+}
+
+#[gpui::test]
+fn the_devcontainer_size_warning_needs_a_built_devcontainer(cx: &mut TestAppContext) {
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    window
+        .update(cx, |view, _, cx| {
+            save_template_config(view, 2, "4g");
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            let draft = view.cloud_draft.as_mut().unwrap();
+            draft.devcontainer = monocode_core::cloud_sessions::project_cloud::DevcontainerInfo {
+                host_cpus: Some(8),
+                host_memory_mib: Some(16 * 1024),
+                ..Default::default()
+            };
+            draft.cpus = 2;
+            draft.memory = "4g".into();
+            let mut config = draft.config.clone().unwrap();
+            config.environment = monocode_core::sandboxes::SandboxSource::Image {
+                reference: "rust:slim".into(),
+            };
+            // An image without the dev container: nothing is built, nothing to warn about.
+            config.use_devcontainer = None;
+            draft.config = Some(config.clone());
+            assert_eq!(draft.size_warning(), None);
+            // With the dev container built the size can be below what it asks for.
+            config.use_devcontainer = Some(true);
+            draft.config = Some(config);
+            assert!(draft.size_warning().is_some());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_default_project_keeps_the_size_menu(cx: &mut TestAppContext) {
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    window
+        .update(visual, |view, _, cx| {
+            save_config(view);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+        })
+        .unwrap();
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    assert!(visual.debug_bounds("cloud-row-size-anchor").is_some());
+    assert!(visual.debug_bounds("cloud-size-from-template").is_none());
+}

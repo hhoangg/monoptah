@@ -18,6 +18,7 @@ use monocode_core::{
     codespaces::{self, MachineType},
     docker_accounts::DockerAccountSummary,
     git_credentials::{self, GitCredentialSummary},
+    sandboxes::SandboxSource,
     store::Store,
 };
 use std::path::Path;
@@ -25,6 +26,10 @@ use std::path::Path;
 /// The single line under the Credentials group: the account pickers apply later.
 pub(super) const ACCOUNT_CHANGE_NOTE: &str =
     "Changing an account applies from the next start or reconnect; running sessions keep theirs.";
+pub(super) const ENV_TEMPLATE_HINT: &str = "The template must already exist in the Docker cloud registry (sbx --cloud template ls). Monoptah does not upload it, and its size is fixed.";
+pub(super) const ENV_IMAGE_HINT: &str = "A public OCI image, for example docker.io/library/rust:slim. It needs sh, git and curl; Monoptah does not build or publish it.";
+pub(super) const ENV_DEVCONTAINER_LABEL: &str = "Also build the repository's dev container";
+pub(super) const ENV_DEVCONTAINER_NOTE: &str = "Off by default: the toolchain comes from the template or image, so the session runs directly in the sandbox.";
 pub(super) const GIT_CODESPACE_LINE: &str = "GitHub token built into the codespace (git and gh)";
 
 /// The repository URL to prefill: the project's `origin` when it is an HTTPS URL on a host
@@ -101,6 +106,51 @@ impl CodespaceForm {
     }
 }
 
+/// Where the sandbox starts from, as the Environment row offers it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum EnvKind {
+    #[default]
+    Default,
+    Template,
+    Image,
+}
+
+impl EnvKind {
+    pub(super) const ALL: [EnvKind; 3] = [Self::Default, Self::Template, Self::Image];
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Default => "Default",
+            Self::Template => "Template",
+            Self::Image => "Public image",
+        }
+    }
+
+    pub(super) fn hint(self) -> Option<&'static str> {
+        match self {
+            Self::Default => None,
+            Self::Template => Some(ENV_TEMPLATE_HINT),
+            Self::Image => Some(ENV_IMAGE_HINT),
+        }
+    }
+
+    pub(super) fn placeholder(self) -> &'static str {
+        match self {
+            Self::Default => "",
+            Self::Template => "Template name",
+            Self::Image => "docker.io/library/rust:slim",
+        }
+    }
+
+    fn of(source: &SandboxSource) -> Self {
+        match source {
+            SandboxSource::Default => Self::Default,
+            SandboxSource::Template { .. } => Self::Template,
+            SandboxSource::Image { .. } => Self::Image,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct SandboxForm {
     pub repo_url: String,
@@ -114,6 +164,12 @@ pub(super) struct SandboxForm {
     pub docker_account: Option<String>,
     /// Not edited here; kept so a save writes back what was stored.
     pub platform: Option<String>,
+    pub env_kind: EnvKind,
+    /// The template name or image reference, as typed; unused for the default sandbox.
+    pub env_text: String,
+    /// Whether the repository's dev container is built in a template or image sandbox.
+    /// Kept as the stored `Option` so a save writes back what was stored.
+    pub use_devcontainer: Option<bool>,
 }
 
 impl SandboxForm {
@@ -131,6 +187,9 @@ impl SandboxForm {
                 claude: config.claude_account.clone(),
                 docker_account: config.docker_account.clone(),
                 platform: config.platform.clone(),
+                env_kind: EnvKind::of(&config.environment),
+                env_text: config.environment.value().unwrap_or_default().to_owned(),
+                use_devcontainer: config.use_devcontainer,
             },
             None => Self {
                 repo_url: prefill_repo(origin),
@@ -143,22 +202,66 @@ impl SandboxForm {
                 claude: None,
                 docker_account: None,
                 platform: None,
+                env_kind: EnvKind::Default,
+                env_text: String::new(),
+                use_devcontainer: None,
             },
         }
     }
 
+    /// The environment the form describes.
+    pub(super) fn environment(&self) -> SandboxSource {
+        match self.env_kind {
+            EnvKind::Default => SandboxSource::Default,
+            EnvKind::Template => SandboxSource::Template {
+                name: self.env_text.clone(),
+            },
+            EnvKind::Image => SandboxSource::Image {
+                reference: self.env_text.clone(),
+            },
+        }
+    }
+
+    /// True while the template fixes the size, so the Size row has nothing to choose.
+    pub(super) fn size_from_template(&self) -> bool {
+        self.env_kind == EnvKind::Template
+    }
+
+    /// The size to store. A template's size is never checked by the core, so a stored one
+    /// that is out of range (an old or hand-edited file) is replaced by the defaults. A size
+    /// that is in range but not a shape (3 CPUs / 5g) is kept: a Mono API start rounds it up
+    /// to a shape when an image override uses it; a composer start refuses it at Send.
+    fn stored_size(&self) -> (u32, String) {
+        let memory = self.memory.trim().to_lowercase();
+        if self.size_from_template()
+            && (docker_config::check_cpus(self.cpus).is_err()
+                || docker_config::check_memory(&memory).is_err())
+        {
+            return (
+                docker_config::DEFAULT_CPUS,
+                docker_config::DEFAULT_MEMORY.into(),
+            );
+        }
+        (self.cpus, self.memory.clone())
+    }
+
     pub(super) fn to_config(&self) -> DockerProjectConfig {
+        let (cpus, memory) = self.stored_size();
         DockerProjectConfig {
             repo_url: self.repo_url.clone(),
             credential_id: self.credential_id.clone(),
             base_ref: self.base_ref.clone(),
             devcontainer_path: self.devcontainer.clone(),
-            cpus: self.cpus,
-            memory: self.memory.clone(),
+            cpus,
+            memory,
             ttl: self.ttl.clone(),
             platform: self.platform.clone(),
             claude_account: self.claude.clone(),
             docker_account: self.docker_account.clone(),
+            environment: self.environment(),
+            use_devcontainer: (self.env_kind != EnvKind::Default)
+                .then_some(self.use_devcontainer)
+                .flatten(),
         }
     }
 }
@@ -191,6 +294,7 @@ pub(super) enum Field {
     Credential,
     Devcontainer,
     Base,
+    Environment,
     Machine,
     Idle,
     Runtime,
@@ -218,7 +322,9 @@ fn error(backend: DefaultBackend, field: Field, message: impl Into<String>) -> F
 /// Which field a validation message from the core is about.
 fn field_of(message: &str) -> Field {
     let lower = message.to_lowercase();
-    if lower.contains("repository url") {
+    if lower.contains("template name") || lower.contains("image reference") {
+        Field::Environment
+    } else if lower.contains("repository url") {
         // Includes "Remove the credentials from the repository URL".
         Field::Repo
     } else if lower.contains("devcontainer") {

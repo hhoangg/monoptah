@@ -29,6 +29,12 @@ pub trait CloudKindSpec: Sync {
     fn start_options(&self) -> &'static [&'static str];
     /// Checks the value of one of [`Self::start_options`].
     fn check_start_option(&self, key: &str, value: &Value) -> Result<(), String>;
+    /// Checks start options that only make sense together (or not at all), once each one is
+    /// valid. `target` holds every key of the `sessions.start` target. Default: nothing.
+    fn check_start_combination(&self, target: &Map<String, Value>) -> Result<(), String> {
+        let _ = target;
+        Ok(())
+    }
     /// What `cloud.resume` tells the caller when no ready session of the project runs on the
     /// instance `name` (the instance is reconnected through such a session).
     fn resume_without_session_advice(&self, name: &str) -> String;

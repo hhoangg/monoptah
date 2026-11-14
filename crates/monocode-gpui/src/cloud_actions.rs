@@ -65,7 +65,8 @@ pub(crate) fn deleted(action: &str, result: &Value) -> Option<(CloudRef, Vec<i64
 }
 
 /// Adds `target`, `cloudState` and (while provisioning) `startup` to a `sessions.start` result.
-/// A new sandbox also reports the size it is created with (`target.cpus`, `target.memory`),
+/// A new sandbox also reports the size it is created with (`target.cpus`, `target.memory`;
+/// not for a template, which fixes the size),
 /// and `note` says why it is not the project's saved one when it was changed.
 pub(crate) fn describe_start(result: &mut Value, start: &CloudStart) {
     let state = cloud_api::state_id(start.initial_state());
@@ -78,7 +79,12 @@ pub(crate) fn describe_start(result: &mut Value, start: &CloudStart) {
     result["cloudState"] = json!(state);
     if let Some(record) = start.record() {
         result["startup"] = json!({"step":record.current().map(|step| step.id())});
-        if let Some(sandbox) = &record.sandbox_start {
+        // A template fixes the size, so there is no size to report.
+        if let Some(sandbox) = record
+            .sandbox_start
+            .as_ref()
+            .filter(|sandbox| !sandbox.config.size_from_template())
+        {
             result["target"]["cpus"] = json!(sandbox.config.cpus);
             result["target"]["memory"] = json!(sandbox.config.memory);
         }
@@ -171,6 +177,51 @@ mod tests {
             "{note}"
         );
         assert_eq!(failure_note(None, "plain".into()), "plain");
+    }
+
+    #[test]
+    fn a_template_start_reports_no_size_and_an_image_start_does() {
+        use monocode_core::sandboxes::SandboxSource;
+        let start_of = |environment: SandboxSource| {
+            use monocode_core::cloud_sessions::{Step, StepKind, StepStatus};
+            let mut record = record(Some("box-9"), "");
+            record.steps = StepKind::ALL
+                .iter()
+                .map(|kind| Step {
+                    kind: *kind,
+                    status: StepStatus::Pending,
+                    started_at: None,
+                    finished_at: None,
+                    detail: None,
+                })
+                .collect();
+            record.sandbox_start = Some(
+                serde_json::from_value(json!({
+                    "requestId":"r","config":{"repoUrl":"https://github.com/o/r.git","cpus":4,
+                        "memory":"8g","environment":environment},
+                    "sandboxId":null,"repoDir":"r","workspace":null,"container":null,
+                    "relayPort":1,
+                }))
+                .unwrap(),
+            );
+            CloudStart::Pending(session(), record, None)
+        };
+        let mut template = json!({});
+        describe_start(
+            &mut template,
+            &start_of(SandboxSource::Template { name: "t".into() }),
+        );
+        assert!(template["target"].get("cpus").is_none(), "{template}");
+        assert!(template["target"].get("memory").is_none(), "{template}");
+        let mut image = json!({});
+        describe_start(
+            &mut image,
+            &start_of(SandboxSource::Image {
+                reference: "rust:slim".into(),
+            }),
+        );
+        assert_eq!(image["target"]["cpus"], 4);
+        assert_eq!(image["target"]["memory"], "8g");
     }
 
     #[test]

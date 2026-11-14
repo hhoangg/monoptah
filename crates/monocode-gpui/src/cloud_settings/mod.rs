@@ -24,7 +24,11 @@ use crate::{
     modal,
     popover::{AnchorSlot, Choice, ChoiceEvent, Choices, Popover},
     runtime::{Database, locked},
-    settings::{cloud_env::CloudServices, cloud_env::Resolver, widgets::secondary_button},
+    settings::{
+        cloud_env::CloudServices,
+        cloud_env::Resolver,
+        widgets::{checkbox, secondary_button},
+    },
     theme::*,
 };
 use gpui::{
@@ -32,7 +36,7 @@ use gpui::{
     FontWeight, IntoElement, KeyDownEvent, Render, Role, SharedString, Stateful, Subscription,
     Window, div, prelude::*, px, rgb,
 };
-use model::{AccountChoice, Field, FieldError, Form};
+use model::{AccountChoice, EnvKind, Field, FieldError, Form};
 use monocode_core::{
     cloud_sessions::{
         project_cloud::{self, DefaultBackend, DevcontainerInfo, ProjectCloud},
@@ -176,6 +180,7 @@ impl gpui::Global for EnvOverride {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Select {
     Default,
+    Environment,
     Machine,
     Size,
     Idle,
@@ -188,8 +193,9 @@ enum Select {
 impl Select {
     /// Every select, in declaration order (a select's discriminant is its place here and in
     /// `CloudSettings::select_anchors`).
-    const ALL: [Select; 8] = [
+    const ALL: [Select; 9] = [
         Self::Default,
+        Self::Environment,
         Self::Machine,
         Self::Size,
         Self::Idle,
@@ -202,6 +208,7 @@ impl Select {
     fn id(self) -> &'static str {
         match self {
             Self::Default => "default",
+            Self::Environment => "environment",
             Self::Machine => "machine",
             Self::Size => "size",
             Self::Idle => "idle",
@@ -217,6 +224,7 @@ impl Select {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Pick {
     Default(DefaultBackend),
+    Environment(EnvKind),
     Machine(Option<String>),
     Size(u32, String),
     Idle(u32),
@@ -298,6 +306,8 @@ pub(crate) struct CloudSettings {
     repo: Entity<Input>,
     sb_base: Entity<Input>,
     sb_devcontainer: Entity<Input>,
+    /// The template name or image reference (the Environment row).
+    sb_env: Entity<Input>,
     credentials: Vec<GitCredentialSummary>,
     credentials_loaded: bool,
     credentials_error: Option<String>,
@@ -435,6 +445,12 @@ impl CloudSettings {
             &form.sandbox.devcontainer,
             cx,
         );
+        let sb_env = text_input(
+            "Template name or image reference",
+            form.sandbox.env_kind.placeholder(),
+            &form.sandbox.env_text,
+            cx,
+        );
         let mut events = Vec::new();
         events.push(cx.subscribe(&repo, |this, _, _: &input::Changed, cx| {
             this.repo_changed(cx)
@@ -454,7 +470,7 @@ impl CloudSettings {
                 cx.notify();
             }),
         );
-        for input in [&cs_base, &cs_machine, &sb_base] {
+        for input in [&cs_base, &cs_machine, &sb_base, &sb_env] {
             events.push(cx.subscribe(input, |_, _, _: &input::Changed, cx| cx.notify()));
         }
         for input in [
@@ -464,6 +480,7 @@ impl CloudSettings {
             &cs_machine,
             &sb_base,
             &sb_devcontainer,
+            &sb_env,
         ] {
             events.push(cx.subscribe(input, |this, _, _: &input::Submitted, cx| this.save(cx)));
         }
@@ -488,6 +505,7 @@ impl CloudSettings {
             repo,
             sb_base,
             sb_devcontainer,
+            sb_env,
             credentials: Vec::new(),
             credentials_loaded: false,
             credentials_error: None,
@@ -863,6 +881,7 @@ impl CloudSettings {
         form.sandbox.repo_url = text(&self.repo);
         form.sandbox.base_ref = text(&self.sb_base);
         form.sandbox.devcontainer = text(&self.sb_devcontainer);
+        form.sandbox.env_text = text(&self.sb_env);
         form
     }
 
@@ -1120,6 +1139,14 @@ impl CloudSettings {
                 })
                 .collect()
             }
+            Select::Environment => EnvKind::ALL
+                .into_iter()
+                .map(|kind| Opt {
+                    label: kind.label().into(),
+                    selected: kind == typed.sandbox.env_kind,
+                    pick: Pick::Environment(kind),
+                })
+                .collect(),
             Select::Machine => {
                 let Machines::Loaded(machines) = &self.machines else {
                     return Vec::new();
@@ -1216,6 +1243,18 @@ impl CloudSettings {
         self.error = None;
         match pick {
             Pick::Default(backend) => self.form.default_backend = Some(backend),
+            Pick::Environment(kind) => {
+                let before = self.form.sandbox.env_kind;
+                self.form.sandbox.env_kind = kind;
+                // A template name is not an image reference: do not carry one to the other.
+                if before != kind && before != EnvKind::Default && kind != EnvKind::Default {
+                    self.sb_env
+                        .update(cx, |input, cx| input.set_text(String::new(), cx));
+                }
+                let placeholder = kind.placeholder();
+                self.sb_env
+                    .update(cx, |input, cx| input.set_placeholder(placeholder, cx));
+            }
             Pick::Machine(machine) => {
                 // Also in the text fallback, so a failed reload cannot bring the old one back.
                 let text = machine.clone().unwrap_or_default();
@@ -1486,6 +1525,7 @@ impl CloudSettings {
             "repo" => &self.repo,
             "sb_base" => &self.sb_base,
             "sb_dev" => &self.sb_devcontainer,
+            "sb_env" => &self.sb_env,
             "cs_base" => &self.cs_base,
             "cs_dev" => &self.cs_devcontainer,
             _ => &self.cs_machine,
@@ -1607,6 +1647,7 @@ impl CloudSettings {
             "repo" => &self.repo,
             "sb_base" => &self.sb_base,
             "sb_dev" => &self.sb_devcontainer,
+            "sb_env" => &self.sb_env,
             "cs_base" => &self.cs_base,
             "cs_dev" => &self.cs_devcontainer,
             _ => &self.cs_machine,
@@ -2200,6 +2241,86 @@ impl CloudSettings {
         )
     }
 
+    /// Where the sandbox starts from: the default shell sandbox, a saved cloud template or a
+    /// public image. A template or image brings its toolchain, so the dev container is off
+    /// unless the box under the field asks for it.
+    fn environment_rows(&mut self, cx: &mut Context<Self>) -> Div {
+        let sb = DefaultBackend::Sandbox;
+        let kind = self.form.sandbox.env_kind;
+        let mut column = div().flex().flex_col().gap_3();
+        column = column.child(self.select_row("Environment", Select::Environment, cx));
+        let Some(hint) = kind.hint() else {
+            return column;
+        };
+        let on = self.form.sandbox.use_devcontainer.unwrap_or(false);
+        column.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(field_box("cloud-field-sb-env", &self.sb_env))
+                .child(
+                    muted(hint)
+                        .id("cloud-env-hint")
+                        .debug_selector(|| "cloud-env-hint".into()),
+                )
+                .children(self.error_for(sb, Field::Environment))
+                .child(
+                    div()
+                        .flex()
+                        .items_start()
+                        .gap_2()
+                        .child(
+                            checkbox(
+                                "cloud-env-devcontainer",
+                                model::ENV_DEVCONTAINER_LABEL,
+                                on,
+                                false,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let on = this.form.sandbox.use_devcontainer.unwrap_or(false);
+                                this.form.sandbox.use_devcontainer = Some(!on);
+                                cx.notify();
+                            })),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .text_size(px(12.5))
+                                        .child(model::ENV_DEVCONTAINER_LABEL),
+                                )
+                                .child(muted(model::ENV_DEVCONTAINER_NOTE)),
+                        ),
+                ),
+        )
+    }
+
+    /// The Size and Runtime limit row. A template fixes the size, so its half says so instead
+    /// of offering a choice.
+    fn size_runtime_row(&mut self, cx: &mut Context<Self>) -> Div {
+        let runtime = self.select_row("Runtime limit", Select::Runtime, cx);
+        if self.form.sandbox.size_from_template() {
+            return pair(
+                labelled("Size").child(
+                    div()
+                        .id("cloud-size-from-template")
+                        .debug_selector(|| "cloud-size-from-template".into())
+                        .h(px(34.))
+                        .flex()
+                        .items_center()
+                        .text_size(px(12.5))
+                        .text_color(content(0.55))
+                        .child(crate::cloud_presets::SIZE_FROM_TEMPLATE),
+                ),
+                runtime,
+            );
+        }
+        pair(self.select_row("Size", Select::Size, cx), runtime)
+    }
+
     fn sandbox_workspace(&mut self, cx: &mut Context<Self>) -> Div {
         let sb = DefaultBackend::Sandbox;
         let mut column = div().flex().flex_col().gap_3();
@@ -2217,19 +2338,24 @@ impl CloudSettings {
             sb,
             Field::Base,
         ));
-        column = column.child(self.input_row(
-            "Devcontainer",
-            "cloud-field-sb-devcontainer",
-            &self.sb_devcontainer.clone(),
-            sb,
-            Field::Devcontainer,
-        ));
+        column = column.child(self.environment_rows(cx));
+        // The path (and what the devcontainer asks for) matters only while it is built.
+        let devcontainer = self.form.sandbox.env_kind == EnvKind::Default
+            || self.form.sandbox.use_devcontainer.unwrap_or(false);
+        if devcontainer {
+            column = column.child(self.input_row(
+                "Devcontainer",
+                "cloud-field-sb-devcontainer",
+                &self.sb_devcontainer.clone(),
+                sb,
+                Field::Devcontainer,
+            ));
+        }
         // Size and Runtime limit share a row; the warning and the errors sit under it.
-        column = column.child(pair(
-            self.select_row("Size", Select::Size, cx),
-            self.select_row("Runtime limit", Select::Runtime, cx),
-        ));
-        column = column.children(self.size_warning());
+        column = column.child(self.size_runtime_row(cx));
+        if devcontainer && !self.form.sandbox.size_from_template() {
+            column = column.children(self.size_warning());
+        }
         column = column.children(self.error_for(sb, Field::Size));
         column.children(self.error_for(sb, Field::Runtime))
     }
