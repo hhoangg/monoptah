@@ -1,7 +1,7 @@
-# cargo-nextest settings for CI. Two sets of sharded jobs in .github/workflows/native.yml
-# use it, both with the `ci` profile: the GPUI tests (`desktop-test`, Linux) and the
-# monocode-core tests (`core-windows-test`). Local runs keep
-# `cargo test ... -- --test-threads=1`. An override below must name its tests precisely,
+# cargo-nextest settings. Two sets of sharded jobs in .github/workflows/native.yml use
+# the `ci` profile: the GPUI tests (`desktop-test`, Linux) and the monocode-core tests
+# (`core-windows-test`); the Linux `core` job runs it unsharded. `npm run native:test`
+# runs both packages with the `default` profile. An override below must name its tests precisely,
 # so it never changes tests of the other package.
 #
 # nextest runs every test in its own process, so process-global state (statics,
@@ -18,6 +18,11 @@
 
 [profile.default]
 fail-fast = false
+
+# Same wall-clock budget test as the `ci` override below: run it alone locally too.
+[[profile.default.overrides]]
+filter = 'test(=editor_analysis::parity_tests::large_tsx_analysis_highlights_the_end_of_the_current_and_original_file)'
+threads-required = "num-test-threads"
 
 [profile.ci]
 # Report every failure of a run, and never retry: a flaky test must show up.

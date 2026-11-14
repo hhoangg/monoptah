@@ -106,6 +106,16 @@ gpui-pre-linux = { path = "../../vendor/gpui-pre-linux" }
 gpui-pre-macos = { path = "../../vendor/gpui-pre-macos" }
 gpui-pre-windows = { path = "../../vendor/gpui-pre-windows" }
 
+# Plain `cargo build`/`cargo test` (the dev and test profiles): line tables only for the
+# workspace crates, so panic backtraces keep file and line, and no debuginfo for
+# dependencies. Full debuginfo roughly doubles compile and link time and target size.
+# `native-dev` below inherits these and sets `debug = 0` for everything.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 # Local test and dev builds. `debug = 0` keeps compile and link time low (no
 # debuginfo for any crate, and cargo then strips the std debuginfo too).
 # Incremental compilation only applies to local crates (the workspace members
