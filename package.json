@@ -31,7 +31,7 @@
     "build:windows": "set \"RUSTUP_TOOLCHAIN=stable-x86_64-pc-windows-msvc\" && tauri build --bundles nsis",
     "worktrees:clean": "node scripts/worktrees-clean.mjs",
     "native:dev": "node scripts/dev-native.mjs",
-    "native:test:dev": "node --test scripts/dev-native.test.mjs scripts/bundle-native-macos.test.mjs scripts/native-dependencies.test.mjs scripts/native-release.test.mjs scripts/package-native.test.mjs scripts/package-native-monoptah.test.mjs scripts/native-release-monoptah.test.mjs scripts/native-release-macos-local.test.mjs scripts/pin-host-release.test.mjs scripts/worktrees-clean.test.mjs",
+    "native:test:dev": "node --test scripts/dev-native.test.mjs scripts/bundle-native-macos.test.mjs scripts/native-dependencies.test.mjs scripts/native-release.test.mjs scripts/package-native.test.mjs scripts/package-native-monoptah.test.mjs scripts/native-release-monoptah.test.mjs scripts/native-release-macos-local.test.mjs scripts/pin-host-release.test.mjs scripts/sandbox-scripts.test.mjs scripts/worktrees-clean.test.mjs",
     "native:release:mac": "node scripts/native-release-macos-local.mjs",
     "native:build": "node scripts/build-native.mjs",
     "native:test": "cargo nextest run --locked --manifest-path crates/monocode-gpui/Cargo.toml -p monocode-core --cargo-profile native-dev && cargo nextest run --locked --manifest-path crates/monocode-gpui/Cargo.toml -p monocode-gpui --cargo-profile native-dev",
