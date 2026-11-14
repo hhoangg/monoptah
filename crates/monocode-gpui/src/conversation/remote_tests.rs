@@ -1779,6 +1779,95 @@ fn a_running_turn_found_after_the_resume_leaves_the_prompt_waiting_in_the_queue(
 }
 
 #[gpui::test]
+fn a_prompt_queued_in_the_store_for_a_launch_is_sent_by_the_first_load(cx: &mut TestAppContext) {
+    let (window, _host) = stopped_codespace(cx, "");
+    window
+        .update(cx, |view, _, cx| {
+            // The conversation of a cloud launch is made after the app queued the first prompt
+            // in the store, so its own queue is empty and a remote load never read the store's.
+            monocode_core::cloud_sessions::queue_start_message(
+                &view.store.lock().unwrap(),
+                view.summary.id,
+                "fix it",
+            )
+            .unwrap();
+            assert!(view.follow_ups.state.messages.is_empty());
+            view.set_cloud_stopped(false, cx);
+            view.loaded = false;
+            view.remote_state.refreshing = false;
+            view.load(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, _| {
+            assert!(view.loaded && view.remote_state.online);
+            assert_eq!(view.follow_ups.persisted, view.follow_ups.state.revision);
+        })
+        .unwrap();
+    assert_eq!(launched(window, cx), vec!["fix it".to_owned()]);
+}
+
+#[gpui::test]
+fn a_queue_left_in_the_store_by_a_session_stays_paused_until_resumed(cx: &mut TestAppContext) {
+    let view = conversation(cx);
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            let message = |id: &str| monocode_core::follow_up::Message {
+                id: id.into(),
+                text: "left over".into(),
+                ..Default::default()
+            };
+            let stored = |messages| monocode_core::follow_up::State {
+                revision: 1,
+                messages,
+                paused: true,
+                ..Default::default()
+            };
+            // Only the first prompt of a launch goes out on its own.
+            view.adopt_stored_queue(stored(vec![message("cloud-start-1")]));
+            assert!(!view.follow_ups.state.paused);
+            view.follow_ups.state = Default::default();
+            view.adopt_stored_queue(stored(vec![message("cloud-start-1"), message("other")]));
+            assert!(view.follow_ups.state.paused);
+            view.follow_ups.state = Default::default();
+            view.adopt_stored_queue(stored(vec![message("other")]));
+            assert!(view.follow_ups.state.paused);
+        })
+    });
+}
+
+#[gpui::test]
+fn the_stored_queue_never_replaces_a_newer_one_in_memory(cx: &mut TestAppContext) {
+    let view = conversation(cx);
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.queue_composer_prompt(true, cx).unwrap();
+            let newer = view.follow_ups.state.revision;
+            let mut stored = view.follow_ups.state.clone();
+            stored.revision = newer - 1;
+            stored.messages[0].text = "an older copy".into();
+            view.adopt_stored_queue(stored);
+            assert_eq!(view.follow_ups.state.messages[0].text, "Keep this next message");
+            assert_eq!(view.follow_ups.state.revision, newer);
+
+            // A newer stored queue is taken, and the host's draft is kept.
+            view.install_remote_draft(&json!({"session": {"blocks": [
+                {"id": "saved-remote-draft", "role": "user", "draft": true, "text": "Saved on the host"}
+            ]}}), cx);
+            let mut stored = view.follow_ups.state.clone();
+            stored.revision = newer + 1;
+            stored.draft = None;
+            stored.messages[0].text = "a newer copy".into();
+            view.adopt_stored_queue(stored);
+            assert_eq!(view.follow_ups.state.messages[0].text, "a newer copy");
+            assert_eq!(view.follow_ups.persisted, newer + 1);
+            assert_eq!(view.follow_ups.state.draft.as_ref().unwrap().id, "saved-remote-draft");
+        })
+    });
+}
+
+#[gpui::test]
 fn a_still_stopped_workspace_does_not_drain_the_queue(cx: &mut TestAppContext) {
     let (window, _host) = stopped_codespace(cx, "fix it");
     window

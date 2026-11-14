@@ -2239,8 +2239,9 @@ pub mod view;
 pub mod view_cache;
 pub mod workspaces;
 pub use startup::{
-    pause_start, pending_starts, queue_start_message, queued_start_message, queued_start_messages,
-    start_record, starting_refusal, StartEvent, StartRecord, Step, StepKind, StepStatus,
+    is_queued_start_message, pause_start, pending_starts, queue_start_message,
+    queued_start_message, queued_start_messages, start_record, starting_refusal, StartEvent,
+    StartRecord, Step, StepKind, StepStatus,
 };
 
 // These fixtures execute the Linux host scripts against local Unix paths.
