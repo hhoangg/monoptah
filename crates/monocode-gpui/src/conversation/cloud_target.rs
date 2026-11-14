@@ -337,7 +337,7 @@ impl CloudDraft {
             .unwrap_or(codespaces::DEFAULT_MACHINE)
     }
 
-    /// The row's value differs from the project default (the row is marked for this session).
+    /// The row's value differs from the project default (an override for this session).
     pub(super) fn row_changed(&self, row: CloudRow) -> bool {
         let defaults = &self.defaults;
         match row {
@@ -365,14 +365,6 @@ impl CloudDraft {
             // The switch has no project default.
             CloudRow::Kit => false,
         }
-    }
-
-    /// How many rows differ from the project defaults.
-    pub(super) fn changed_count(&self) -> usize {
-        CloudRow::of(self.target)
-            .iter()
-            .filter(|row| self.row_changed(**row))
-            .count()
     }
 
     /// The project's settings changed under an open panel: every row the user did not change
@@ -541,23 +533,17 @@ impl Conversation {
             return Vec::new();
         }
         let default_backend = self.project_default_backend();
-        // Each row says who pays (the panel's own note), then whether it is the project's
-        // default, or that it must be set up first.
+        // Each row says who pays (the panel's own note), then that it must be set up first.
         let described = |target: CloudTarget, extra: Option<&str>| match extra {
             Some(extra) => format!("{} \u{b7} {extra}", target.billing_note()),
             None => target.billing_note().to_owned(),
         };
-        let default_note =
-            |backend: DefaultBackend| (default_backend == backend).then_some("default");
         let mut rows = Vec::new();
         if self.cloud_offers_codespace {
             let row = MenuAction::new("workspace:cloud-codespace", "Codespace")
                 .icon("cloud-upload")
                 .checked(self.cloud_target() == Some(CloudTarget::Codespace))
-                .description(described(
-                    CloudTarget::Codespace,
-                    default_note(DefaultBackend::Codespace),
-                ));
+                .description(described(CloudTarget::Codespace, None));
             rows.push(row.into());
         }
         let configured = self.docker_config().is_some();
@@ -566,11 +552,7 @@ impl Conversation {
             .checked(self.cloud_target() == Some(CloudTarget::DockerSandbox))
             .description(described(
                 CloudTarget::DockerSandbox,
-                if configured {
-                    default_note(DefaultBackend::Sandbox)
-                } else {
-                    Some("Set up first")
-                },
+                (!configured).then_some("Set up first"),
             ));
         rows.push(docker.into());
         // The instances of the backend that is chosen, else the project's default.

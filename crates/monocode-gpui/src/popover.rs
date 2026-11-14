@@ -964,6 +964,19 @@ pub(crate) enum MenuEvent {
 /// A separate event so lazy flyouts can load without dismissing menu owners.
 pub(crate) struct MenuOpened(pub SharedString);
 
+/// Vertical padding of a row that shows a description under its title.
+const TWO_LINE_PAD: f32 = 6.;
+
+/// A row's height: fixed at `height` for one line, but a row with a description grows to fit
+/// its second line (never below `height`), so the hint cannot draw over the next row.
+fn row_height<E: gpui::Styled>(row: E, height: f32, two_line: bool) -> E {
+    if two_line {
+        row.min_h(px(height)).py(px(TWO_LINE_PAD))
+    } else {
+        row.h(px(height))
+    }
+}
+
 const MENU_WIDTH: f32 = 228.;
 /// Content-sized menus never shrink below this.
 const MENU_MIN_WIDTH: f32 = 160.;
@@ -1317,6 +1330,7 @@ impl Menu {
         });
         let has_submenu = !action.submenu.is_empty() || action.flyout.is_some();
         let selector = action.id.clone();
+        let two_line = action.description.is_some();
         div()
             .id((
                 if in_submenu {
@@ -1379,18 +1393,23 @@ impl Menu {
                     .rounded(px(8.))
                     .min_h(px(32.))
                     .when(action.description.is_some(), |d| d.py_2()),
-                MenuStyle::Switcher => d.items_center().gap(px(10.)).rounded(px(6.)).h(px(32.)),
-                MenuStyle::Git | MenuStyle::Filter => {
-                    d.items_center().gap_2().rounded(px(8.)).h(px(28.))
+                MenuStyle::Switcher => {
+                    row_height(d.items_center().gap(px(10.)).rounded(px(6.)), 32., two_line)
                 }
-                MenuStyle::Settings => d.items_center().gap_2().rounded(px(8.)).h(px(36.)),
+                MenuStyle::Git | MenuStyle::Filter => {
+                    row_height(d.items_center().gap_2().rounded(px(8.)), 28., two_line)
+                }
+                MenuStyle::Settings => {
+                    row_height(d.items_center().gap_2().rounded(px(8.)), 36., two_line)
+                }
+                // Sized for its title (16px) over a one-line hint (16px): already two lines.
                 MenuStyle::Recent => d.items_center().gap_2().rounded(px(8.)).h(px(40.)),
                 MenuStyle::Composer | MenuStyle::Access => {
                     d.items_start().gap(px(10.)).rounded(px(8.)).py_2()
                 }
             })
             .when_some(self.row_metrics, |d, (height, _)| {
-                d.h(px(height)).gap(px(8.))
+                row_height(d, height, two_line).gap(px(8.))
             })
             .when(filled && !action.disabled, |d| d.bg(fill))
             .when(!filled && !action.disabled, |d| d.hover(|s| s.bg(hover)))
@@ -2197,6 +2216,77 @@ mod tests {
             div()
                 .size_full()
                 .child(menu_popover(&self.menu, Anchor::Point(self.anchor), cx))
+        }
+    }
+
+    #[gpui::test]
+    fn rows_with_a_description_grow_instead_of_overlapping_the_next_row(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        // The style's own fixed height, and the `row_metrics` override that replaces it.
+        for (style, metrics) in [
+            (MenuStyle::Settings, None),
+            (MenuStyle::Switcher, None),
+            (MenuStyle::Git, None),
+            (MenuStyle::Filter, None),
+            (MenuStyle::Settings, Some(36.)),
+        ] {
+            let window = cx.update(|cx| {
+                cx.open_window(Default::default(), |window, cx| {
+                    cx.new(|cx| {
+                        let menu = cx.new(|cx| {
+                            let menu = Menu::new(
+                                "Rows",
+                                vec![
+                                    MenuAction::new("plain", "Plain").into(),
+                                    MenuAction::new("first", "Codespace")
+                                        .description("Billed to your GitHub account")
+                                        .into(),
+                                    MenuAction::new("second", "Docker Sandbox")
+                                        .description("Paid compute in your Docker account")
+                                        .into(),
+                                ],
+                                window,
+                                cx,
+                            )
+                            .style(style);
+                            match metrics {
+                                Some(height) => menu.row_metrics(height, 14.),
+                                None => menu,
+                            }
+                        });
+                        MenuHost {
+                            menu,
+                            anchor: point(px(100.), px(100.)),
+                        }
+                    })
+                })
+                .unwrap()
+            });
+            cx.run_until_parked();
+            window
+                .update(cx, |host, _, cx| {
+                    let menu = host.menu.read(cx);
+                    let rect = |ix: usize| menu.rows[ix].get().unwrap();
+                    let (plain, first, second) = (rect(0), rect(1), rect(2));
+                    // A one-line row keeps the style's fixed height.
+                    let one_line = plain.size.height;
+                    // A title plus a 15px hint cannot fit the one-line height.
+                    assert!(
+                        first.size.height > one_line,
+                        "{style:?}: a described row must be taller than a plain one"
+                    );
+                    assert!(
+                        first.size.height >= px(13. + 15.),
+                        "{style:?}: the row must hold both lines"
+                    );
+                    assert!(
+                        first.bottom() <= second.top(),
+                        "{style:?}: the first row overlaps the second"
+                    );
+                })
+                .unwrap();
         }
     }
 

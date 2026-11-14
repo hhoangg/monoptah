@@ -106,10 +106,9 @@ fn the_menu_lists_cloud_rows_with_their_gates(cx: &mut TestAppContext) {
             let labels: Vec<_> = rows(view).into_iter().map(|row| row.1).collect();
             assert_eq!(labels, ["Codespace", "Docker Sandbox"]);
             save_config(view);
-            // The saved sandbox config is the only one, so Docker Sandbox is the default.
             assert_eq!(
                 rows(view)[1].3.as_deref(),
-                Some("Paid compute in your Docker account \u{b7} default")
+                Some("Paid compute in your Docker account")
             );
         })
         .unwrap();
@@ -2453,7 +2452,7 @@ fn both_backends_show_the_same_rows_in_the_same_order() {
 }
 
 #[gpui::test]
-fn the_panel_renders_every_row_of_the_backend_with_a_mark(cx: &mut TestAppContext) {
+fn the_panel_renders_every_row_of_the_backend_without_a_status_column(cx: &mut TestAppContext) {
     let window = conversation(cx, PROJECT, false);
     let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
     let draw = |visual: &mut gpui::VisualTestContext| {
@@ -2484,24 +2483,16 @@ fn the_panel_renders_every_row_of_the_backend_with_a_mark(cx: &mut TestAppContex
         draw(visual);
         for row in CloudRow::of(target) {
             assert!(visual.debug_bounds(row.id()).is_some(), "{:?}", row);
-            // Rows with a project default carry a mark; the working branch and the Claude
-            // setup switch have none.
-            let marked = !matches!(row, CloudRow::Branch | CloudRow::Kit);
-            assert_eq!(
+            // No status column: a row has no mark, whatever it holds.
+            assert!(
                 visual
                     .debug_bounds(Box::leak(format!("{}-mark", row.id()).into_boxed_str()))
-                    .is_some(),
-                marked,
+                    .is_none(),
                 "{row:?}"
             );
         }
+        assert!(visual.debug_bounds("cloud-target-pill").is_none());
     }
-    assert_eq!(cloud_pill_text(0), "project defaults");
-    assert_eq!(cloud_pill_text(3), "3 changed");
-}
-
-fn cloud_pill_text(changed: usize) -> String {
-    super::cloud_panel::pill_text(changed)
 }
 
 fn changed_rows(view: &Conversation) -> Vec<CloudRow> {
@@ -2524,7 +2515,7 @@ fn a_sandbox_row_is_marked_when_it_differs_and_clears_when_set_back(cx: &mut Tes
             save_config(view);
             view.cloud_menu_choice("workspace:cloud-docker", cx);
             assert!(changed_rows(view).is_empty());
-            assert_eq!(view.cloud_draft.as_ref().unwrap().changed_count(), 0);
+            assert_eq!(changed_rows(view).len(), 0);
             // The project default is marked in the menu.
             let (_, sizes) = view.cloud_field_menu(CloudField::Size);
             let marked: Vec<_> = sizes
@@ -2548,7 +2539,7 @@ fn a_sandbox_row_is_marked_when_it_differs_and_clears_when_set_back(cx: &mut Tes
                     CloudRow::Claude
                 ]
             );
-            assert_eq!(view.cloud_draft.as_ref().unwrap().changed_count(), 4);
+            assert_eq!(changed_rows(view).len(), 4);
             // Choosing the default again clears each mark.
             view.cloud_menu_choice("cloud-set:size:2:4g", cx);
             view.cloud_menu_choice("cloud-set:runtime:2h", cx);
@@ -2909,11 +2900,7 @@ fn the_workspace_menu_offers_existing_instance_and_cloud_settings(cx: &mut TestA
             let items = view.cloud_menu_items();
             assert!(matches!(items[items.len() - 2], MenuItem::Separator));
             let rows = all_rows(view);
-            // The project default is named on its backend.
-            assert_eq!(
-                rows[0].3.as_deref(),
-                Some("Billed to your GitHub account \u{b7} default")
-            );
+            assert_eq!(rows[0].3.as_deref(), Some("Billed to your GitHub account"));
             assert_eq!(rows[2].1, "Existing instance\u{2026}");
             assert_eq!(rows[3].1, "Cloud settings for this project\u{2026}");
             // Nothing chosen: the dialog opens on the project's default, existing on Codespace.
@@ -3016,7 +3003,7 @@ fn the_workspace_menu_reads_the_store_once_until_the_project_changes(cx: &mut Te
             .unwrap();
             assert_eq!(
                 all_rows(view)[0].3.as_deref(),
-                Some("Billed to your GitHub account \u{b7} default")
+                Some("Billed to your GitHub account")
             );
             assert_eq!(
                 all_rows(view)[1].3.as_deref(),
@@ -3025,7 +3012,7 @@ fn the_workspace_menu_reads_the_store_once_until_the_project_changes(cx: &mut Te
             // The shell forgets it when the project's Cloud settings are saved.
             view.project_cloud_saved(cx);
             assert!(!view.cloud_menu_is_cached());
-            // The default mark is gone; the billing note stays.
+            // Only the billing note is shown.
             assert_eq!(
                 all_rows(view)[0].3.as_deref(),
                 Some("Billed to your GitHub account")
@@ -3091,10 +3078,10 @@ fn saving_the_project_settings_moves_the_rows_the_user_did_not_change(cx: &mut T
             assert_eq!(draft.docker_account.as_deref(), Some("d-new"));
             assert_eq!(draft.base.read(cx).content.as_ref(), "trunk");
             assert_eq!(draft.base_text, "trunk");
-            // The override stays, the defaults are the new ones, and only it is marked.
+            // The override stays, the defaults are the new ones, and only it is an override.
             assert_eq!(draft.ttl, "1h");
             assert_eq!(draft.defaults.ttl, "4h");
-            assert_eq!(draft.changed_count(), 1);
+            assert_eq!(changed_rows(view).len(), 1);
             assert!(draft.row_changed(CloudRow::Runtime));
             view.input
                 .update(cx, |input, cx| input.set_text("go".into(), cx));
@@ -3237,9 +3224,9 @@ fn choosing_the_new_default_after_a_save_clears_the_mark(cx: &mut TestAppContext
             view.cloud_menu_choice("cloud-set:runtime:1h", cx);
             put_sandbox_config(view, &NEW_SANDBOX());
             view.project_cloud_saved(cx);
-            assert_eq!(view.cloud_draft.as_ref().unwrap().changed_count(), 1);
+            assert_eq!(changed_rows(view).len(), 1);
             view.cloud_menu_choice("cloud-set:runtime:4h", cx);
-            assert_eq!(view.cloud_draft.as_ref().unwrap().changed_count(), 0);
+            assert_eq!(changed_rows(view).len(), 0);
         })
         .unwrap();
 }
@@ -3293,7 +3280,7 @@ fn saving_the_codespace_settings_moves_the_untouched_rows_and_keeps_the_changed_
             // The working branch followed the base it was following.
             assert_eq!(draft.branch.read(cx).content.as_ref(), "trunk");
             assert_eq!(draft.idle, 240);
-            assert_eq!(draft.changed_count(), 1);
+            assert_eq!(changed_rows(view).len(), 1);
             view.input
                 .update(cx, |input, cx| input.set_text("go".into(), cx));
             view.create_cloud(cx);
@@ -3326,7 +3313,7 @@ fn the_working_branch_row_is_changed_when_it_names_another_branch(cx: &mut TestA
                     .row_changed(CloudRow::Branch)
             };
             assert!(!changed(view));
-            assert_eq!(view.cloud_draft.as_ref().unwrap().changed_count(), 0);
+            assert_eq!(changed_rows(view).len(), 0);
             set_text(view, |d| d.branch.clone(), "feature/x", cx);
         })
         .unwrap();
@@ -3340,7 +3327,7 @@ fn the_working_branch_row_is_changed_when_it_names_another_branch(cx: &mut TestA
                     .row_changed(CloudRow::Branch)
             };
             assert!(changed(view));
-            assert_eq!(view.cloud_draft.as_ref().unwrap().changed_count(), 1);
+            assert_eq!(changed_rows(view).len(), 1);
             // Back to the base clears it; so does emptying the field (which means the base).
             set_text(view, |d| d.branch.clone(), "main", cx);
             set_text(view, |d| d.base.clone(), "main", cx);
@@ -3385,7 +3372,7 @@ fn a_docker_feature_branch_is_never_a_changed_row(cx: &mut TestAppContext) {
     cx.run_until_parked();
     window
         .update(cx, |view, _, _| {
-            assert_eq!(view.cloud_draft.as_ref().unwrap().changed_count(), 0);
+            assert_eq!(changed_rows(view).len(), 0);
         })
         .unwrap();
 }
