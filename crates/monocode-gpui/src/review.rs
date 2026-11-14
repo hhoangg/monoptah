@@ -676,6 +676,18 @@ impl ReviewPane {
             .filter_map(|s| s.editor.as_ref())
             .any(|e| e.read(cx).dirty || e.read(cx).saving)
     }
+    /// Labels of the files with unsaved or still-saving edits.
+    pub(crate) fn unsaved_labels(&self, cx: &gpui::App) -> Vec<String> {
+        self.sources
+            .iter()
+            .filter(|s| {
+                s.editor
+                    .as_ref()
+                    .is_some_and(|e| e.read(cx).dirty || e.read(cx).saving)
+            })
+            .map(|s| s.tab.label())
+            .collect()
+    }
     fn closing_editors(&self, cx: &gpui::App) -> Vec<Entity<FileEditor>> {
         let Some((target, others)) = self.pending_close else {
             return Vec::new();

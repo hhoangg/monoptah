@@ -996,17 +996,71 @@ impl Shell {
                 let _ = report.try_send(Err(message.to_string()));
             }
         };
-        if self.workspace.review_owners.iter().any(|(pane, owner)| {
-            *owner == id
-                && (self.workspace.tab_of(*pane).is_some()
-                    || self
-                        .reviews
-                        .get(pane)
-                        .is_some_and(|r| r.read(cx).unsaved_files(cx)))
-        }) {
-            let message = "Close this session's detached file panes before deleting it";
-            refuse(&report, message);
-            self.error = Some(message.into());
+        // Only a pane the user can reach blocks. A pane in a tab the strip
+        // does not list (an orphan) and holds no unsaved edits is ignored.
+        let visible = self.visible_tabs(cx);
+        let mut owned: Vec<i64> = self
+            .workspace
+            .review_owners
+            .iter()
+            .filter(|(_, owner)| **owner == id)
+            .map(|(pane, _)| *pane)
+            .collect();
+        owned.sort_unstable();
+        // (pane, in the visible strip, files that block)
+        let mut blocking: Vec<(i64, bool, Vec<String>)> = Vec::new();
+        for pane in owned {
+            let unsaved = self
+                .reviews
+                .get(&pane)
+                .map(|r| r.read(cx).unsaved_labels(cx))
+                .unwrap_or_default();
+            let tab = self.workspace.tab_of(pane);
+            let shown = tab.is_some_and(|tab| visible.contains(&TitleTab::Session(tab)));
+            let orphan = tab
+                .is_some_and(|tab| !self.workspace.title_order.contains(&TitleTab::Session(tab)));
+            if orphan && unsaved.is_empty() {
+                // Unreachable and nothing to lose: skip it. Never close the
+                // tab here, it may hold other panes.
+                continue;
+            }
+            if tab.is_none() && unsaved.is_empty() {
+                continue;
+            }
+            let files = if unsaved.is_empty() {
+                self.workspace
+                    .reviews
+                    .get(&pane)
+                    .map(|state| state.tabs.iter().map(|tab| tab.label()).collect())
+                    .unwrap_or_default()
+            } else {
+                unsaved
+            };
+            blocking.push((pane, shown, files));
+        }
+        if !blocking.is_empty() {
+            let files = blocking
+                .iter()
+                .flat_map(|(_, _, files)| files.iter().cloned())
+                .collect::<Vec<_>>();
+            let mut message =
+                "Close this session's detached file panes before deleting it".to_string();
+            if !files.is_empty() {
+                message = format!("{message}: {}", files.join(", "));
+            }
+            let hidden = blocking.iter().find(|(_, shown, _)| !shown).map(|b| b.0);
+            if let Some(pane) = hidden {
+                if report.is_none() {
+                    // Interactive: bring the pane into view, switching project
+                    // or worktree as needed.
+                    self.open_file_pane(pane, window, cx);
+                } else {
+                    let project = self.project_of(id, &self.session_metadata(id, cx).summary.cwd);
+                    message = format!("{message} (in project {project})");
+                }
+            }
+            refuse(&report, &message);
+            self.error = Some(message);
             cx.notify();
             return;
         }
@@ -1167,6 +1221,7 @@ impl Shell {
         if self.workspace.tab_of(id).is_some() {
             return;
         }
+        self.release_closed_file_panes(cx);
         if self
             .session_preview
             .as_ref()

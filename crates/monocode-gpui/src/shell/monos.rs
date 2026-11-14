@@ -275,6 +275,9 @@ impl Shell {
         let pane = 9_000_001;
         self.workspace.review_owners.insert(pane, session);
         self.workspace.tabs.push(pane);
+        self.workspace
+            .title_order
+            .push(crate::workspace::TitleTab::Session(pane));
     }
     pub(crate) fn mono_remove(
         &mut self,

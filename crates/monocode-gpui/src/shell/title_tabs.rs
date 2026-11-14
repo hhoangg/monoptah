@@ -394,6 +394,7 @@ impl Shell {
                 session_active.filter(|id| self.workspace.tab_of(*id).is_some());
         }
         self.settle_mono_panes(window, cx);
+        self.release_closed_file_panes(cx);
         self.history
             .prune(&self.workspace.open_sessions(), self.workspace.active);
         if self.workspace.active.is_none() && !self.mono_active(cx) && !self.app_view_open() {
