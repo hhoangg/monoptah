@@ -1292,11 +1292,11 @@ impl Store {
         id: i64,
         gh: &dyn crate::codespaces::GhRunner,
         host: &dyn crate::cloud_sessions::Host,
-        sandbox_exists: Option<bool>,
+        exists_known: Option<bool>,
     ) -> Result<(), String> {
         self.delete_using(id, |store| {
             if store.remote_session(id)?.is_some() {
-                store.delete_remote_session_known(id, gh, host, sandbox_exists)
+                store.delete_remote_session_known(id, gh, host, exists_known)
             } else {
                 store.delete_rows(id)
             }

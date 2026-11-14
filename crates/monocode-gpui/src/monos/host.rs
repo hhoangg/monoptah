@@ -477,13 +477,14 @@ impl Monos {
         let (report, outcome) = async_channel::bounded(1);
         let owner = self.owner.clone();
         let handle = window.window_handle();
+        let input = call.input.clone();
         let app: &mut App = cx;
         // Deferred like the other removals, to stay clear of the entities that
         // are being updated right now.
         app.defer(move |cx| {
             let _ = handle.update(cx, |_, window, cx| {
                 let _ = owner.update(cx, |owner, cx| {
-                    owner.mono_delete_with_files(session, report, window, cx)
+                    owner.mono_delete_with_files(session, report, &input, window, cx)
                 });
             });
         });
@@ -572,11 +573,12 @@ impl Monos {
         let owner = self.owner.clone();
         let handle = window.window_handle();
         let choice = call.input["cloud"].as_str().unwrap_or_default().to_owned();
+        let backup = call.input["backup"].as_bool().unwrap_or(true);
         let app: &mut App = cx;
         app.defer(move |cx| {
             let _ = handle.update(cx, |_, window, cx| {
                 let _ = owner.update(cx, |owner, cx| {
-                    owner.app_archive_cloud(session, &choice, reply, window, cx)
+                    owner.app_archive_cloud(session, &choice, backup, reply, window, cx)
                 });
             });
         });
@@ -1155,7 +1157,10 @@ impl Monos {
                         self.archive_cloud(call, session, flipped, window, cx);
                         return;
                     }
-                    if action == "sessions.delete" && flag(&input, "providerFiles", false) {
+                    if action == "sessions.delete"
+                        && (flag(&input, "providerFiles", false)
+                            || matches!(input["cloud"].as_str(), Some("stop" | "delete")))
+                    {
                         self.delete_with_files(call, session, flipped, window, cx);
                         return;
                     }

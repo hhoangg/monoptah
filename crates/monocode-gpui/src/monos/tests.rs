@@ -5862,7 +5862,7 @@ fn the_help_documents_the_worktree_fields_and_removal() {
         "worktreePath",
         "worktreeDirty",
         "worktreeUnpushed",
-        "sessions.delete {sessionId,project?,providerFiles?,removeWorktree?}",
+        "sessions.delete {sessionId,project?,providerFiles?,removeWorktree?,cloud?}",
         "removeWorktree: true",
         "branchDeleted",
     ] {

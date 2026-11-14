@@ -44,6 +44,35 @@ impl ArchiveChoice {
 }
 
 impl Shell {
+    /// The instance action of `sessions.delete` with `cloud: "stop" | "delete"` for a cloud
+    /// session; `None` otherwise (the instance is left alone).
+    pub(super) fn app_delete_instance_task(
+        &self,
+        id: i64,
+        input: &Value,
+    ) -> Option<super::project_removal::InstanceTask> {
+        let action = match input["cloud"].as_str()? {
+            "stop" => monocode_core::cloud_sessions::InstanceAction::Stop,
+            "delete" => monocode_core::cloud_sessions::InstanceAction::Delete,
+            _ => return None,
+        };
+        // The window's mark, else the stored binding (a session the sidebar has not marked yet).
+        let target = match self.cloud_marks.get(&id) {
+            Some(mark) => mark.cloud(),
+            None => locked(&self.store)
+                .ok()?
+                .remote_session(id)
+                .ok()??
+                .project
+                .cloud()?,
+        };
+        Some(super::project_removal::InstanceTask {
+            target,
+            action,
+            selected: vec![id],
+        })
+    }
+
     /// Archives cloud session `id` and applies `choice` ("keep", "stop" or "delete") to its
     /// workspace. Nothing is stopped or deleted unless the local copy is complete. `reply` gets
     /// the result, or why the workspace was left as it was.
@@ -51,6 +80,7 @@ impl Shell {
         &mut self,
         id: i64,
         choice: &str,
+        backup: bool,
         reply: async_channel::Sender<Result<Value, ArchiveFailure>>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -156,7 +186,7 @@ impl Shell {
                 &cloud,
                 vec![work_group],
                 choice,
-                true,
+                backup,
                 &convert,
                 &cancel,
                 &[],

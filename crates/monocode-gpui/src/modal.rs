@@ -232,6 +232,103 @@ pub(crate) fn danger_button(
         .font_weight(FontWeight::MEDIUM)
         .hover(|s| s.bg(danger(0.85)))
 }
+/// What the marker of an [`option_row`] looks like.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Marker {
+    /// A square box with a tick: any number of rows can be on.
+    Check,
+    /// A round dot: one row of a group is on.
+    Radio,
+}
+
+/// The shared row of a checkbox or a radio choice in a dialog: the marker, the label and muted
+/// notes under it. The caller adds `on_click` when the row is enabled; a disabled row is dimmed
+/// and shows no pointer.
+fn option_row(
+    id: &'static str,
+    marker: Marker,
+    on: bool,
+    disabled: bool,
+    label: SharedString,
+    notes: Vec<String>,
+) -> Stateful<Div> {
+    let note = |text: String| {
+        div()
+            .mt(px(4.))
+            .text_size(px(11.))
+            .line_height(px(15.))
+            .text_color(content(0.45))
+            .child(text)
+    };
+    let mark = div()
+        .mt(px(2.))
+        .size(px(14.))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .border_1()
+        .border_color(if on { accent_color() } else { content(0.3) });
+    let mark = match marker {
+        Marker::Check => mark.rounded(px(4.)).when(on, |d| {
+            d.bg(accent_color())
+                .child(icon("check", 10.).text_color(gpui::white()))
+        }),
+        Marker::Radio => mark.rounded_full().when(on, |d| {
+            d.child(div().size(px(6.)).rounded_full().bg(accent_color()))
+        }),
+    };
+    div()
+        .id(id)
+        .debug_selector(move || id.into())
+        .role(match marker {
+            Marker::Check => Role::CheckBox,
+            Marker::Radio => Role::RadioButton,
+        })
+        .aria_label(label.clone())
+        .aria_toggled(if on {
+            gpui::Toggled::True
+        } else {
+            gpui::Toggled::False
+        })
+        .when(disabled, |d| d.opacity(0.5))
+        .when(!disabled, |d| d.cursor_pointer())
+        .flex()
+        .items_start()
+        .gap_2()
+        .child(mark)
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_size(px(12.))
+                .line_height(px(17.))
+                .child(label)
+                .children(notes.into_iter().map(note)),
+        )
+}
+
+/// A checkbox row of a dialog (see [`option_row`]).
+pub(crate) fn check_row(
+    id: &'static str,
+    checked: bool,
+    disabled: bool,
+    label: impl Into<SharedString>,
+    notes: Vec<String>,
+) -> Stateful<Div> {
+    option_row(id, Marker::Check, checked, disabled, label.into(), notes)
+}
+
+/// One choice of a pick-one group in a dialog (see [`option_row`]).
+pub(crate) fn radio_row(
+    id: &'static str,
+    selected: bool,
+    disabled: bool,
+    label: impl Into<SharedString>,
+    notes: Vec<String>,
+) -> Stateful<Div> {
+    option_row(id, Marker::Radio, selected, disabled, label.into(), notes)
+}
 /// Disables a dialog button without changing its size.
 pub(crate) fn disabled(button: Stateful<Div>, disabled: bool) -> Stateful<Div> {
     if disabled {

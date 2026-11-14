@@ -716,7 +716,18 @@ impl Shell {
                             .detach();
                             return;
                         } else if action == "sessions.delete" {
-                            self.delete_session(id, window, cx);
+                            // Optional: also stop or delete the cloud instance the session
+                            // runs in. Omitted (or "keep"), the instance is left as it is.
+                            let instance = self.app_delete_instance_task(id, &input);
+                            self.delete_session_with(
+                                id,
+                                super::project_removal::DeleteOptions {
+                                    instance,
+                                    ..Default::default()
+                                },
+                                window,
+                                cx,
+                            );
                             if !self.deleting.contains(&id) {
                                 self.finish_app_call(
                                     call,
@@ -752,7 +763,8 @@ impl Shell {
                         } else if action == "sessions.archive" && input.get("cloud").is_some() {
                             let (reply, answer) = async_channel::bounded(1);
                             let choice = input["cloud"].as_str().unwrap_or_default().to_owned();
-                            self.app_archive_cloud(id, &choice, reply, window, cx);
+                            let backup = input["backup"].as_bool().unwrap_or(true);
+                            self.app_archive_cloud(id, &choice, backup, reply, window, cx);
                             cx.spawn(async move |this, cx| {
                                 let result = match answer.recv().await {
                                     Ok(result) => result.map_err(|failure| failure.message),

@@ -1573,3 +1573,42 @@ fn a_missing_ssh_server_is_recognised_with_its_fix() {
         assert_eq!(start_error_hint(other), None, "{other}");
     }
 }
+
+#[test]
+fn a_codespace_absent_from_the_active_accounts_listing_is_not_marked_gone_by_a_session_delete() {
+    // The listing covers the active gh account only: another account's codespace looks missing.
+    let gh = FakeGh::new(vec![
+        ("auth status", ok(AUTH_OK)),
+        ("codespace list", ok(LIST)),
+        (
+            "user/codespaces",
+            ok(r#"[{"total_count":0,"codespaces":[]}]"#),
+        ),
+        ("codespace stop", ok("")),
+    ]);
+    let host = FakeHost::with_machine("octo-abc");
+    let svc = service(&gh, &host);
+    let binding = svc
+        .prepare_target("/p", named("octo-abc"), &mut |_| {})
+        .unwrap();
+    let session = svc.create_session(&binding, "claude").unwrap();
+    {
+        let store = svc.store().unwrap();
+        let mut remote = store.remote_session(session.id).unwrap().unwrap();
+        remote.session_id = Some("host-session".into());
+        store.save_remote_session(&remote).unwrap();
+    }
+    svc.delete_session(session.id).unwrap();
+    let cloud = CloudRef::codespace("octo-abc");
+    assert!(!svc.marked_gone(&cloud), "not proven missing");
+    // The instance action still reaches the backend.
+    svc.apply_instance_action(&cloud, InstanceAction::Stop, &[session.id])
+        .unwrap();
+    assert!(
+        gh.calls()
+            .iter()
+            .any(|c| c.contains("codespace stop -c octo-abc")),
+        "{:?}",
+        gh.calls()
+    );
+}

@@ -8,8 +8,8 @@ use super::*;
 use monocode_core::{
     cloud_sessions::{
         CloudBackendKind, CloudRef, CloudSessions, CloudState, ConvertError, Converted,
-        DeleteOutcome, LocatedSession, Restored, SandboxTerminal, pending_restore_for,
-        restore_code,
+        DeleteOutcome, InstanceAction, InstanceOutcome, LocatedSession, Restored, SandboxTerminal,
+        pending_restore_for, restore_code,
     },
     codespaces::GhRunner,
 };
@@ -124,21 +124,84 @@ pub(super) enum ArchiveChoice {
     Keep,
 }
 
-/// The preselected choice: stopping is right unless other sessions still use
-/// the codespace, and then it is left running.
-pub(super) fn default_choice(others: usize) -> ArchiveChoice {
-    if others > 0 {
-        ArchiveChoice::Keep
-    } else {
-        ArchiveChoice::Stop
+impl ArchiveChoice {
+    /// What the dialog's radio group asks for.
+    pub(super) fn of(action: InstanceAction) -> Self {
+        match action {
+            InstanceAction::Stop => Self::Stop,
+            InstanceAction::Delete => Self::Delete,
+        }
+    }
+    /// The instance action of a choice; `Keep` touches nothing.
+    pub(super) fn action(self) -> Option<InstanceAction> {
+        match self {
+            Self::Keep => None,
+            Self::Stop => Some(InstanceAction::Stop),
+            Self::Delete => Some(InstanceAction::Delete),
+        }
     }
 }
 
-pub(super) fn others_note(others: usize, noun: &str) -> Option<String> {
-    match others {
-        0 => None,
-        1 => Some(format!("1 other session uses this {noun}.")),
-        n => Some(format!("{n} other sessions use this {noun}.")),
+/// Another live session that uses the instance being archived or deleted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct SharedUser {
+    pub id: i64,
+    pub title: String,
+    /// A turn is running in it or it waits for input.
+    pub busy: bool,
+}
+
+/// Why the radio cannot offer "Delete instance": other live sessions still use it.
+pub(super) fn delete_blocked_note(shared: &[SharedUser], noun: &str) -> Option<String> {
+    if shared.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Not available: {} still use{} this {noun}. Archive or delete {} first.",
+        shared_names(shared),
+        if shared.len() == 1 { "s" } else { "" },
+        if shared.len() == 1 { "it" } else { "them" },
+    ))
+}
+
+/// What Stop does when other sessions share the instance and some are busy.
+pub(super) fn stop_shared_note(shared: &[SharedUser], noun: &str) -> Option<String> {
+    let busy: Vec<&SharedUser> = shared.iter().filter(|s| s.busy).collect();
+    if shared.is_empty() {
+        return None;
+    }
+    if busy.is_empty() {
+        return Some(format!(
+            "Shared with {}. A new message in {} wakes it again.",
+            shared_names(shared),
+            if shared.len() == 1 { "it" } else { "them" },
+        ));
+    }
+    Some(format!(
+        "{} {} busy in this {noun}, so it is left running.",
+        shared_names(&busy.into_iter().cloned().collect::<Vec<_>>()),
+        if shared.iter().filter(|s| s.busy).count() == 1 {
+            "is"
+        } else {
+            "are"
+        },
+    ))
+}
+
+fn shared_names(shared: &[SharedUser]) -> String {
+    let name = |s: &SharedUser| {
+        let title = quoted_title(&s.title);
+        if s.title.trim().is_empty() {
+            "an untitled session".to_string()
+        } else {
+            title
+        }
+    };
+    match shared {
+        [] => String::new(),
+        [one] => name(one),
+        [a, b] => format!("{} and {}", name(a), name(b)),
+        [a, b, rest @ ..] => format!("{}, {} and {} more", name(a), name(b), rest.len()),
     }
 }
 
@@ -234,11 +297,15 @@ pub(super) fn review_note(words: &Words) -> String {
     )
 }
 
-/// The warning under a failed save or stop.
-pub(super) fn failed_note(words: &Words) -> String {
+/// The line under a failed backup or instance call: nothing was lost, and how to go on.
+pub(super) fn failed_note(words: &Words, choice: ArchiveChoice) -> String {
+    let left = match choice {
+        ArchiveChoice::Delete => "was not deleted",
+        ArchiveChoice::Stop => "was not stopped",
+        ArchiveChoice::Keep => "was left as it is",
+    };
     format!(
-        "Going on without a complete local copy can lose the code and files that only exist \
-         on the {}.",
+        "The {} {left}. To archive without a backup, close this and untick the backup box.",
         words.noun
     )
 }
@@ -271,30 +338,74 @@ pub(super) enum Then {
 
 /// Runs the codespace side of an archive. The second value is a warning to show
 /// although the call took effect. Blocking: call it on a worker.
+#[cfg(test)]
 pub(super) fn apply_choice(
     cloud: &CloudSessions,
     choice: ArchiveChoice,
     target: &CloudRef,
 ) -> Result<(Then, Option<String>), String> {
-    match choice {
-        ArchiveChoice::Keep => Ok((Then::Archive, None)),
-        ArchiveChoice::Stop => cloud
-            .stop_cloud(target)
-            .map(|()| (Then::Archive, None))
-            .map_err(|e| format!("Could not stop the {}: {e}", target.noun())),
+    apply_choice_for(cloud, choice, target, &[], false)
+}
+
+/// [`apply_choice`] on behalf of the sessions `selected`: the other live sessions of the
+/// instance decide whether a stop is held back (busy ones) or a delete refused (any), see
+/// `monocode_core::cloud_sessions::instance_action`.
+pub(super) fn apply_choice_for(
+    cloud: &CloudSessions,
+    choice: ArchiveChoice,
+    target: &CloudRef,
+    selected: &[i64],
+    whole_workspace: bool,
+) -> Result<(Then, Option<String>), String> {
+    let Some(action) = choice.action() else {
+        return Ok((Then::Archive, None));
+    };
+    // The workspace menu acts on the whole instance with no session of its own: it confirms
+    // that itself, and the guard has nobody to protect. A session archive never takes this
+    // road, even when none of its selected sessions is left (they were all converted).
+    if whole_workspace {
+        return match action {
+            InstanceAction::Stop => cloud
+                .stop_cloud(target)
+                .map(|()| (Then::Archive, None))
+                .map_err(|e| format!("Could not stop the {}: {e}", target.noun())),
+            InstanceAction::Delete => match cloud.delete_cloud_outcome(target) {
+                Ok(DeleteOutcome::Deleted) => Ok((Then::Forget, None)),
+                Ok(DeleteOutcome::DeletedWithWarning(e)) => Ok((
+                    Then::Forget,
+                    Some(format!(
+                        "{} deleted, but disconnecting failed: {e}",
+                        target.title()
+                    )),
+                )),
+                Err(e) => Err(format!("Could not delete the {}: {e}", target.noun())),
+            },
+        };
+    }
+    match (
+        action,
+        cloud.apply_instance_action(target, action, selected),
+    ) {
+        (_, Ok(InstanceOutcome::Stopped)) => Ok((Then::Archive, None)),
+        // Gone already (another process or the user removed it): done, not an error.
+        (InstanceAction::Stop, Ok(InstanceOutcome::AlreadyGone)) => Ok((Then::Archive, None)),
+        (InstanceAction::Delete, Ok(InstanceOutcome::AlreadyGone)) => Ok((Then::Forget, None)),
+        // The user's archive goes on; the instance stays up and the note says why.
+        (_, Ok(InstanceOutcome::LeftRunning(note))) => Ok((Then::Archive, Some(note))),
         // The workspace is gone and its bindings were dropped even when only
         // disconnecting the machine failed, so the sessions go either way.
-        ArchiveChoice::Delete => match cloud.delete_cloud_outcome(target) {
-            Ok(DeleteOutcome::Deleted) => Ok((Then::Forget, None)),
-            Ok(DeleteOutcome::DeletedWithWarning(e)) => Ok((
-                Then::Forget,
-                Some(format!(
-                    "{} deleted, but disconnecting failed: {e}",
-                    target.title()
-                )),
+        (_, Ok(InstanceOutcome::Deleted(DeleteOutcome::Deleted))) => Ok((Then::Forget, None)),
+        (_, Ok(InstanceOutcome::Deleted(DeleteOutcome::DeletedWithWarning(e)))) => Ok((
+            Then::Forget,
+            Some(format!(
+                "{} deleted, but disconnecting failed: {e}",
+                target.title()
             )),
-            Err(e) => Err(format!("Could not delete the {}: {e}", target.noun())),
-        },
+        )),
+        (InstanceAction::Stop, Err(e)) => Err(format!("Could not stop the {}: {e}", target.noun())),
+        (InstanceAction::Delete, Err(e)) => {
+            Err(format!("Could not delete the {}: {e}", target.noun()))
+        }
     }
 }
 
@@ -434,6 +545,7 @@ pub(super) fn archive_groups(
         .map(|group| {
             let mut ids = group.ids.clone();
             if save_copy && choice == ArchiveChoice::Delete {
+                // Nothing else is live here (checked below), so these are archived leftovers.
                 for id in cloud.sessions_in_cloud(&group.cloud()) {
                     if !ids.contains(&id) {
                         ids.push(id);
@@ -458,6 +570,23 @@ pub(super) fn archive_groups(
                 cloud.forget_missing(&group.cloud())
             } else {
                 Ok(false)
+            };
+            // Never delete under another live session, and say so before any backup is made.
+            let preflight = match preflight {
+                Ok(false) if choice == ArchiveChoice::Delete && !group.whole_workspace => {
+                    let others = cloud.sessions_sharing(&group.cloud(), &group.ids);
+                    if others.is_empty() {
+                        Ok(false)
+                    } else {
+                        let sharing: Vec<String> =
+                            others.iter().map(|s| s.title.clone()).collect();
+                        Err(monocode_core::cloud_sessions::instance_action::refused_delete_message(
+                            &group.cloud(),
+                            &sharing,
+                        ))
+                    }
+                }
+                other => other,
             };
             match preflight {
                 Ok(true) => {
@@ -553,7 +682,14 @@ pub(super) fn archive_groups(
                         ArchiveChoice::Delete => format!("Deleting the {}", group.kind.noun()),
                         _ => format!("Stopping the {}", group.kind.noun()),
                     });
-                    apply_choice(cloud, choice, &group.cloud()).map(|(then, warning)| {
+                    apply_choice_for(
+                        cloud,
+                        choice,
+                        &group.cloud(),
+                        &group.ids,
+                        group.whole_workspace,
+                    )
+                    .map(|(then, warning)| {
                         let joined = [warning, store_warning]
                             .into_iter()
                             .flatten()
@@ -697,6 +833,9 @@ pub(super) struct CodespaceGroup {
     pub others: usize,
     /// Every cloud session the window knows in this codespace, archived or not: what Delete saves.
     pub total: usize,
+    /// The group stands for the whole instance (workspace menu, Cloud workspaces), not for the
+    /// sessions of a session archive: nobody else's session needs protecting from the delete.
+    pub whole_workspace: bool,
 }
 
 impl CodespaceGroup {
@@ -731,6 +870,7 @@ pub(super) fn group_by_codespace(
                     .values()
                     .filter(|m| m.codespace == mark.codespace && m.kind == mark.kind)
                     .count(),
+                whole_workspace: false,
             }),
         }
     }
@@ -795,6 +935,15 @@ pub(super) struct ArchiveDialog {
     /// their own "Archive files only?" step once the failed ones are dealt with, so a "Delete
     /// anyway" never reaches them unseen.
     deferred: Vec<Unreachable>,
+    /// What to do with the instance: the radio of the Choose step. Stop is the default because
+    /// it is recoverable (the next message wakes the instance) while a delete is not.
+    pub(super) instance: InstanceAction,
+    /// Back the session up to this computer before touching the instance: the checkbox of the
+    /// Choose step, on by default.
+    pub(super) backup: bool,
+    /// Other live sessions that use the same instance(s). While there are any, Delete is not
+    /// offered, and a Stop is held back for the busy ones.
+    pub(super) shared: Vec<SharedUser>,
     focus: FocusHandle,
 }
 
@@ -819,9 +968,6 @@ struct Unreachable {
 impl ArchiveDialog {
     pub(super) fn ids(&self) -> Vec<i64> {
         self.groups.iter().flat_map(|g| g.ids.clone()).collect()
-    }
-    pub(super) fn others(&self) -> usize {
-        self.groups.iter().map(|g| g.others).sum()
     }
     pub(super) fn focus_handle(&self) -> FocusHandle {
         self.focus.clone()
@@ -1597,6 +1743,47 @@ impl Shell {
             .count()
     }
 
+    /// The other live (not archived) sessions that use the instances of `groups`, with what
+    /// each is doing. The selected sessions never count.
+    pub(super) fn shared_users(&self, groups: &[CodespaceGroup], cx: &App) -> Vec<SharedUser> {
+        let mut found: Vec<SharedUser> = Vec::new();
+        for group in groups {
+            found.extend(self.shared_users_of(&group.cloud(), &group.ids, cx));
+        }
+        found
+    }
+
+    /// [`Self::shared_users`] for one instance and the sessions `selected`.
+    pub(super) fn shared_users_of(
+        &self,
+        target: &CloudRef,
+        selected: &[i64],
+        cx: &App,
+    ) -> Vec<SharedUser> {
+        let mut found: Vec<SharedUser> = self
+            .cloud_marks
+            .iter()
+            .filter(|(id, mark)| {
+                mark.cloud() == *target
+                    && !selected.contains(id)
+                    && self
+                        .session_summaries
+                        .get(id)
+                        .is_some_and(|summary| !summary.archived)
+            })
+            .map(|(id, _)| SharedUser {
+                id: *id,
+                title: self.session_metadata(*id, cx).display_title(),
+                busy: self
+                    .remote_marks
+                    .get(id)
+                    .is_some_and(|(running, needs_input)| *running || *needs_input),
+            })
+            .collect();
+        found.sort_by_key(|user| user.id);
+        found
+    }
+
     /// Archiving cloud sessions asks what to do with their codespaces first: one
     /// dialog for all of `ids`, grouped by codespace.
     pub(super) fn open_cloud_archive(
@@ -1625,12 +1812,16 @@ impl Shell {
             [id] => self.session_metadata(*id, cx).display_title(),
             _ => String::new(),
         };
+        let shared = self.shared_users(&groups, cx);
         let dialog = ArchiveDialog {
             groups,
             title,
             phase: Phase::Choose,
             files_only: Vec::new(),
             deferred: Vec::new(),
+            instance: InstanceAction::Stop,
+            backup: true,
+            shared,
             focus: cx.focus_handle(),
         };
         window.focus(&dialog.focus, cx);
@@ -1691,11 +1882,15 @@ impl Shell {
                 ids: vec![],
                 others: 0,
                 total,
+                whole_workspace: true,
             }],
             title: String::new(),
             phase: Phase::Choose,
             files_only: Vec::new(),
             deferred: Vec::new(),
+            instance: InstanceAction::Stop,
+            backup: true,
+            shared: Vec::new(),
             focus: cx.focus_handle(),
         });
         if choice == ArchiveChoice::Delete {
@@ -1718,7 +1913,8 @@ impl Shell {
         self.run_cloud_archive(choice, false, Vec::new(), window, cx);
     }
 
-    /// Whether any session living in `target` has an agent turn running.
+    /// Whether any session living in `target` has an agent turn running, waits for input or
+    /// is still starting: stopping the workspace would cut that off.
     pub(super) fn workspace_has_running_turn(&self, target: &CloudRef) -> bool {
         self.cloud_marks
             .iter()
@@ -1726,8 +1922,9 @@ impl Shell {
             .any(|(id, _)| {
                 self.remote_marks
                     .get(id)
-                    .is_some_and(|(running, _)| *running)
+                    .is_some_and(|(running, needs_input)| *running || *needs_input)
             })
+            || self.cloud.sessions_on(target).iter().any(|s| s.busy())
     }
 
     /// Backdrop and Escape: closes the dialog, but never cancels a running save. Only the
@@ -1755,6 +1952,40 @@ impl Shell {
         }
     }
 
+    /// The radio of the Choose step. Delete is refused while other live sessions share the
+    /// instance, whatever the caller asks.
+    pub(super) fn set_archive_instance(&mut self, action: InstanceAction, cx: &mut Context<Self>) {
+        let Some(dialog) = self.cloud_archive.as_mut() else {
+            return;
+        };
+        if !matches!(dialog.phase, Phase::Choose) {
+            return;
+        }
+        if action == InstanceAction::Delete && !dialog.shared.is_empty() {
+            return;
+        }
+        dialog.instance = action;
+        cx.notify();
+    }
+
+    /// The Archive button (and Enter): archives with what the Choose step shows, the instance
+    /// action of its radio and the backup checkbox.
+    pub(super) fn submit_cloud_archive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dialog) = self.cloud_archive.as_ref() else {
+            return;
+        };
+        if !matches!(dialog.phase, Phase::Choose) {
+            return;
+        }
+        // Delete is not on offer while others use the instance; never let it through.
+        if dialog.instance == InstanceAction::Delete && !dialog.shared.is_empty() {
+            return;
+        }
+        let (choice, backup) = (ArchiveChoice::of(dialog.instance), dialog.backup);
+        self.run_cloud_archive(choice, backup, Vec::new(), window, cx);
+    }
+
+    #[cfg(test)]
     pub(super) fn confirm_cloud_archive(
         &mut self,
         choice: ArchiveChoice,
@@ -2234,6 +2465,7 @@ impl Shell {
                 ids: vec![],
                 others: 0,
                 total: 1,
+                whole_workspace: false,
             }],
             title: String::new(),
             phase: Phase::ConfirmRemove {
@@ -2246,6 +2478,9 @@ impl Shell {
             },
             files_only: Vec::new(),
             deferred: Vec::new(),
+            instance: InstanceAction::Stop,
+            backup: true,
+            shared: Vec::new(),
             focus: cx.focus_handle(),
         };
         window.focus(&dialog.focus, cx);
@@ -2303,27 +2538,16 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let dialog = self.cloud_archive.as_ref()?;
-        let default = default_choice(dialog.others());
         let words = words(&dialog.groups);
         let width = 560f32.min(window.viewport_size().width.as_f32() - 24.);
         let weak = cx.weak_entity();
-        let button =
-            |id: &'static str, label: String, choice: ArchiveChoice, cx: &mut Context<Self>| {
-                let base = if choice == ArchiveChoice::Delete {
-                    crate::modal::danger_button(id, label)
-                } else if choice == default {
-                    crate::modal::primary_button(id, label)
-                } else {
-                    crate::modal::ghost_button(id, label)
-                };
-                base.debug_selector(move || id.into())
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.confirm_cloud_archive(choice, window, cx)
-                    }))
-            };
         let cancel = crate::modal::ghost_button("cloud-archive-cancel", "Cancel")
             .debug_selector(|| "cloud-archive-cancel".into())
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, window, cx| this.close_cloud_archive(window, cx)));
+        // The Choose step has no work to cancel: its only dismissal is "Close".
+        let close = crate::modal::ghost_button("cloud-archive-close", "Close")
+            .debug_selector(|| "cloud-archive-close".into())
             .cursor_pointer()
             .on_click(cx.listener(|this, _, window, cx| this.close_cloud_archive(window, cx)));
         let text = |id: &'static str, text: String, dim: bool| {
@@ -2341,55 +2565,121 @@ impl Shell {
             .justify_end()
             .gap_2();
         let (heading, body, footer) = match &dialog.phase {
-            Phase::Choose => (
-                "Archive cloud session?".to_string(),
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child(text(
-                        "cloud-archive-summary",
-                        format!(
-                            "{} {} Stopping or deleting it first saves an archived local copy \
-                             with the conversation, evidence and code (branches, the stash and \
-                             uncommitted changes; ignored files are listed but not saved). {}",
-                            archive_summary(&dialog.title, &dialog.groups),
-                            words.cost(),
-                            delete_note(&dialog.groups),
-                        ),
-                        false,
-                    ))
-                    .children(others_note(dialog.others(), words.noun).map(|note| {
-                        text(
-                            "cloud-archive-others",
+            Phase::Choose => {
+                let blocked = delete_blocked_note(&dialog.shared, words.noun);
+                let stopping = dialog.instance == InstanceAction::Stop;
+                let mut stop_notes = vec![
+                    "Keeps its files and costs nothing while stopped. A new message in a session \
+                     wakes it again."
+                        .to_string(),
+                ];
+                stop_notes.extend(stop_shared_note(&dialog.shared, words.noun));
+                let mut delete_notes = match &blocked {
+                    Some(note) => vec![note.clone()],
+                    None => vec![format!(
+                        "Removes the {} and everything in it for good.",
+                        words.noun
+                    )],
+                };
+                if blocked.is_none() && dialog.backup {
+                    delete_notes.push(delete_note(&dialog.groups));
+                }
+                if blocked.is_none() && !dialog.backup {
+                    delete_notes
+                        .push("Without a backup, work that only exists there is lost.".into());
+                }
+                let backup_note = if dialog.backup {
+                    "Saves an archived local copy with the conversation, evidence and code \
+                     (branches, the stash and uncommitted changes; ignored files are listed but \
+                     not saved). The instance is only stopped or deleted once it succeeded."
+                        .to_string()
+                } else {
+                    "The session is archived as it is, without a local copy.".to_string()
+                };
+                let go_label = "Archive";
+                let go = if dialog.instance == InstanceAction::Delete {
+                    crate::modal::danger_button("cloud-archive-go", go_label)
+                } else {
+                    crate::modal::primary_button("cloud-archive-go", go_label)
+                };
+                (
+                    "Archive cloud session?".to_string(),
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(text(
+                            "cloud-archive-summary",
                             format!(
-                                "{note} Deleting the {} removes those sessions from Monoptah too.",
-                                words.noun
+                                "{} {}",
+                                archive_summary(&dialog.title, &dialog.groups),
+                                words.cost()
                             ),
-                            true,
+                            false,
+                        ))
+                        .child(
+                            div()
+                                .id("cloud-archive-instance")
+                                .role(Role::RadioGroup)
+                                .aria_label(format!("What to do with the {}", words.noun))
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(
+                                    crate::modal::radio_row(
+                                        "cloud-archive-stop",
+                                        stopping,
+                                        false,
+                                        format!("Stop the {}", words.noun),
+                                        stop_notes,
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _, _, cx| {
+                                            this.set_archive_instance(InstanceAction::Stop, cx)
+                                        },
+                                    )),
+                                )
+                                .child({
+                                    let row = crate::modal::radio_row(
+                                        "cloud-archive-delete",
+                                        !stopping,
+                                        blocked.is_some(),
+                                        format!("Delete the {}", words.noun),
+                                        delete_notes,
+                                    );
+                                    if blocked.is_some() {
+                                        row
+                                    } else {
+                                        row.on_click(cx.listener(|this, _, _, cx| {
+                                            this.set_archive_instance(InstanceAction::Delete, cx)
+                                        }))
+                                    }
+                                }),
                         )
-                    })),
-                footer
-                    .child(cancel)
-                    .child(button(
-                        "cloud-archive-keep",
-                        "Keep running".into(),
-                        ArchiveChoice::Keep,
-                        cx,
-                    ))
-                    .child(button(
-                        "cloud-archive-delete",
-                        format!("Delete {}", words.noun),
-                        ArchiveChoice::Delete,
-                        cx,
-                    ))
-                    .child(button(
-                        "cloud-archive-stop",
-                        format!("Stop {}", words.noun),
-                        ArchiveChoice::Stop,
-                        cx,
-                    )),
-            ),
+                        .child(
+                            crate::modal::check_row(
+                                "cloud-archive-backup",
+                                dialog.backup,
+                                false,
+                                "Back up this session to local",
+                                vec![backup_note],
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(d) = this.cloud_archive.as_mut() {
+                                    d.backup = !d.backup;
+                                    cx.notify();
+                                }
+                            })),
+                        ),
+                    footer.child(close).child(
+                        go.debug_selector(|| "cloud-archive-go".into())
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.submit_cloud_archive(window, cx)
+                            })),
+                    ),
+                )
+            }
             Phase::Working { progress, .. } => (
                 "Saving a local copy".to_string(),
                 div().child(text(
@@ -2600,11 +2890,6 @@ impl Shell {
             }
             Phase::Failed { choice, error } => {
                 let choice = *choice;
-                let anyway = if choice == ArchiveChoice::Delete {
-                    "Delete anyway"
-                } else {
-                    "Stop anyway"
-                };
                 (
                     "Could not finish".to_string(),
                     div()
@@ -2612,25 +2897,21 @@ impl Shell {
                         .flex_col()
                         .gap_3()
                         .child(text("cloud-archive-error", error.clone(), false))
-                        .child(text("cloud-archive-warning", failed_note(&words), true)),
-                    footer
-                        .child(cancel)
-                        .child(
-                            crate::modal::danger_button("cloud-archive-anyway", anyway)
-                                .debug_selector(|| "cloud-archive-anyway".into())
-                                .cursor_pointer()
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.run_cloud_archive(choice, false, Vec::new(), window, cx)
-                                })),
-                        )
-                        .child(
-                            crate::modal::primary_button("cloud-archive-retry", "Retry")
-                                .debug_selector(|| "cloud-archive-retry".into())
-                                .cursor_pointer()
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.run_cloud_archive(choice, true, Vec::new(), window, cx)
-                                })),
-                        ),
+                        .child(text(
+                            "cloud-archive-warning",
+                            failed_note(&words, choice),
+                            true,
+                        )),
+                    // No "anyway": a failed backup never reaches the instance. Skipping the
+                    // backup is the checkbox of the first step.
+                    footer.child(close).child(
+                        crate::modal::primary_button("cloud-archive-retry", "Retry")
+                            .debug_selector(|| "cloud-archive-retry".into())
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.run_cloud_archive(choice, true, Vec::new(), window, cx)
+                            })),
+                    ),
                 )
             }
         };

@@ -990,6 +990,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let report = options.report.take();
+        let instance = options.instance.take();
         let refuse = |report: &Option<async_channel::Sender<Result<FilesOutcome, String>>>,
                       message: &str| {
             if let Some(report) = report {
@@ -1112,18 +1113,64 @@ impl Shell {
                     (request, store.data_dir().map(std::path::Path::to_path_buf))
                 };
                 cloud.delete_session(id)?;
+                // The session is gone; now the instance, as the user chose. A missing instance
+                // counts as done, and the guard keeps another live session's instance safe.
+                let instance_note = match &instance {
+                    Some(task) => {
+                        // Only this session and the siblings of the same delete that are really
+                        // gone now count as leaving. One that was refused or failed is still
+                        // live and keeps the instance (re-read here, not trusted from the dialog).
+                        let leaving: Vec<i64> = match locked(&removed) {
+                            Ok(store) => task
+                                .selected
+                                .iter()
+                                .copied()
+                                .filter(|sibling| {
+                                    *sibling == id
+                                        || store
+                                            .remote_session(*sibling)
+                                            .is_ok_and(|found| found.is_none())
+                                })
+                                .collect(),
+                            Err(_) => vec![id],
+                        };
+                        match cloud.apply_instance_action(&task.target, task.action, &leaving) {
+                            Ok(monocode_core::cloud_sessions::InstanceOutcome::LeftRunning(
+                                note,
+                            )) => Some(note),
+                            Ok(_) => None,
+                            Err(error) => Some(format!(
+                                "The session was deleted, but the {} could not be {}: {error}",
+                                task.target.noun(),
+                                if task.action
+                                    == monocode_core::cloud_sessions::InstanceAction::Stop
+                                {
+                                    "stopped"
+                                } else {
+                                    "deleted"
+                                }
+                            )),
+                        }
+                    }
+                    None => None,
+                };
                 // Drop the session's recorded turns and their Git refs.
                 if let Some(checkpoints) = monocode_core::checkpoint::store() {
                     let _ = checkpoints.exclusive(|c| c.forget(&id.to_string()));
                 }
-                Ok::<_, String>((request, data_dir))
+                Ok::<_, String>((request, data_dir, instance_note))
             });
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
                 this.deleting.remove(&id);
                 match result {
-                    Ok((request, data_dir)) => {
+                    Ok((request, data_dir, instance_note)) => {
                         this.forget_session(id, cx);
+                        if let Some(note) = instance_note {
+                            this.error = Some(note);
+                        }
+                        // The instance may be gone or stopped now: the cached state is stale.
+                        this.refresh_cloud(cx);
                         // The row is gone, so the file cleanup and the worktree
                         // removal run apart from the group writes: they can be
                         // slow and nothing queued behind them depends on them.

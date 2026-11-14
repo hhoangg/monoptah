@@ -158,8 +158,7 @@ impl Shell {
             if escape {
                 self.dismiss_cloud_archive(window, cx);
             } else if enter && matches!(dialog.phase, cloud::Phase::Choose) {
-                let default = cloud::default_choice(dialog.others());
-                self.confirm_cloud_archive(default, window, cx);
+                self.submit_cloud_archive(window, cx);
             }
         }
     }

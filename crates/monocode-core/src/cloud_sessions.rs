@@ -1480,6 +1480,11 @@ impl CloudSessions {
             }
         }
     }
+    /// Whether this app already learned that `cloud` no longer exists. Reads the memory only:
+    /// unlike [`Self::cloud_gone`] it never asks the backend.
+    pub(crate) fn marked_gone(&self, cloud: &CloudRef) -> bool {
+        self.gone.lock().is_ok_and(|g| g.contains(&cloud.key()))
+    }
     fn mark_gone(&self, cloud: &CloudRef) {
         if let Ok(mut gone) = self.gone.lock() {
             gone.insert(cloud.key());
@@ -1568,13 +1573,15 @@ impl CloudSessions {
     /// Delete one session through the normal store cleanup. A missing Codespace
     /// only loses this session's local record; live hosts must accept the delete.
     pub fn delete_session(&self, id: i64) -> Result<(), String> {
-        // A session in a Docker sandbox: ask whether the sandbox still exists BEFORE taking
-        // the store, as the account it lives in. That runs `sbx` (and may exchange a Docker
-        // Hub token), which must not happen while the store is held.
-        let probe = self.store()?.sandbox_name_of_session(id);
-        let exists = match probe {
-            Some(name) => {
-                let account = self.try_sandbox_account(&name)?;
+        // Ask whether the instance still exists BEFORE taking the store. For a Docker sandbox
+        // that runs `sbx` as the account it lives in (and may exchange a Docker Hub token),
+        // which must not happen while the store is held. The answer is handed to the store so
+        // it is not asked twice, and an instance that is gone is remembered as such, so the
+        // instance action that follows a delete does not call a backend for nothing.
+        let hosted = self.store()?.hosted_cloud_of_session(id);
+        let exists = match &hosted {
+            Some(cloud) if cloud.kind == CloudBackendKind::DockerSandbox => {
+                let account = self.try_sandbox_account(&cloud.name)?;
                 let runner: Arc<dyn crate::sandboxes::SbxRunner> = match &self.sandbox {
                     Some(deps) => deps.runner.clone(),
                     None => Arc::new(crate::sandboxes::SystemSbx),
@@ -1582,13 +1589,23 @@ impl CloudSessions {
                 Some(
                     crate::sandboxes::find_by_name(
                         &crate::sandboxes::as_account(&*runner, account.as_deref()),
-                        &name,
+                        &cloud.name,
                     )?
                     .is_some(),
                 )
             }
+            Some(cloud) => Some(codespaces::exists(&*self.gh, &cloud.name)?),
             None => None,
         };
+        // Only a sandbox lookup is proof: it runs as the account the sandbox lives in. The
+        // codespace listing covers the active gh account only, so a codespace of another
+        // account would look missing; the backend's own not-found answer on the later stop or
+        // delete is what marks it gone.
+        if let (Some(cloud), Some(false)) = (&hosted, exists) {
+            if cloud.kind == CloudBackendKind::DockerSandbox {
+                self.mark_gone(cloud);
+            }
+        }
         self.store()?
             .delete_with_remote_known(id, &*self.gh, &*self.host, exists)
     }
@@ -1629,7 +1646,16 @@ impl CloudSessions {
                 )?;
             }
         }
-        let stopped = backend.stop(&cloud.name);
+        let stopped = match backend.stop(&cloud.name) {
+            // An instance that no longer exists (deleted by another process or by hand) is
+            // as stopped as it can be, so this is not an error. The delete follows the same
+            // rule; every caller of the shared stop path gets it.
+            Err(error) if backend.is_missing_error(&error) => {
+                self.mark_gone(cloud);
+                Ok(())
+            }
+            other => other,
+        };
         self.invalidate_ref(cloud);
         // Whatever the outcome, an overview loaded before this call no longer says what is there.
         self.forget_workspace_views();
@@ -2212,10 +2238,12 @@ pub mod auto_stop;
 pub mod backend;
 pub mod claude_pin;
 pub mod claude_setup;
+pub mod default_branch;
 pub mod docker_config;
 pub mod docker_size;
 pub mod docker_start;
 pub mod footer_status;
+pub mod instance_action;
 pub mod kit;
 pub mod kit_pack;
 pub mod kit_prefs;
@@ -2226,6 +2254,7 @@ pub mod move_ui;
 pub mod project_cloud;
 pub mod readiness;
 pub use backend::{CloudBackend, CloudBackendKind, CloudRef, CodespacesBackend};
+pub use instance_action::{plan_instance_action, InstanceAction, InstanceOutcome, InstancePlan};
 
 mod continue_local;
 mod convert;
@@ -2260,6 +2289,8 @@ mod docker_size_tests;
 mod docker_start_tests;
 #[cfg(test)]
 mod footer_status_tests;
+#[cfg(test)]
+mod instance_action_tests;
 #[cfg(test)]
 mod kit_pack_tests;
 #[cfg(test)]

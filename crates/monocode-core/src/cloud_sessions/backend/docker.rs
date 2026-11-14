@@ -346,6 +346,8 @@ impl CloudBackend for DockerBackend {
             let lower = line.to_ascii_lowercase();
             (lower.starts_with("sandbox '") && lower.ends_with("' not found"))
                 || (lower.starts_with("sandbox ") && lower.ends_with(NOT_FOUND))
+                // "no such sandbox: <ref>", the other way the CLI words the same answer.
+                || lower.starts_with("no such sandbox")
         })
     }
     fn state(&self, name: &str) -> Result<String, String> {

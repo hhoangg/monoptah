@@ -205,21 +205,34 @@ impl Shell {
         &mut self,
         id: i64,
         report: async_channel::Sender<Result<super::project_removal::FilesOutcome, String>>,
+        input: &serde_json::Value,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let provider_files =
-            self.session_summaries.contains_key(&id) && self.local_files_kind(id, cx).is_some();
+        // `cloud: "stop" | "delete"` of the call; anything else leaves the instance alone.
+        let instance = self.app_delete_instance_task(id, input);
+        let provider_files = self.session_summaries.contains_key(&id)
+            && input["providerFiles"] == true
+            && self.local_files_kind(id, cx).is_some();
         self.delete_session_with(
             id,
             super::project_removal::DeleteOptions {
                 provider_files,
                 worktree: None,
                 report: Some(report),
+                instance,
             },
             window,
             cx,
         );
+    }
+    /// Points the shell at the cloud service a test installed (fake gh and host).
+    #[cfg(test)]
+    pub(crate) fn mono_set_cloud(
+        &mut self,
+        cloud: std::sync::Arc<monocode_core::cloud_sessions::CloudSessions>,
+    ) {
+        self.cloud = cloud;
     }
     /// Whether an orchestration lead is running this session as a worker.
     pub(crate) fn mono_is_worker(&self, id: i64) -> bool {
