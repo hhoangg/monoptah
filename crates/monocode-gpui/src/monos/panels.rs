@@ -1911,6 +1911,7 @@ impl Monos {
             .map(|v| v.read(cx).mono_model_options())
             .unwrap_or_default();
         let sub = self.subsession_choice(mono, cx);
+        let (own_accounts, own_account_label) = self.mono_account_choice(cx);
         let access_icon = match mode {
             AccessMode::FullAccess => "shield-alert",
             AccessMode::Auto => "sparkles",
@@ -1969,6 +1970,11 @@ impl Monos {
                                 } else { this.open_model_option(option.label.clone(),option.submenu.clone(),anchor.clone(),w,cx); }
                             })).into_any_element()).border_t_1().border_color(content(0.04)))
                 }))
+                .when(!own_accounts.is_empty(),|d|d.child(setting("Account",Some("The sign-in it thinks and replies with."),
+                    plain(SharedString::from("mono-settings-account"),own_account_label.clone()).aria_label(format!("Account, {own_account_label}"))
+                        .child(self.mono_account_anchor.probe()).child(icon("chevron-down",12.))
+                        .on_click(cx.listener(|this,_,w,cx|this.open_mono_account_picker(w,cx))).into_any_element())
+                    .border_t_1().border_color(content(0.04))))
                 .child(setting("Permissions",Some("What it may do without asking."),
                     div().id("mono-settings-access").debug_selector(||"mono-settings-access".into()).role(Role::Button).aria_label(format!("Permissions, {}",mode.label()))
                         .h(px(28.)).max_w(px(208.)).px_1p5().mx(px(-6.)).rounded_md().flex().items_center().gap_2()
@@ -2019,6 +2025,11 @@ impl Monos {
                         .when_some(sub.provider,|d,kind|d.child(provider_icon(kind.id(),14.))).child(sub.model_label.clone())
                         .on_click(cx.listener(|this,_,w,cx|this.open_subsession_model_picker(w,cx))).into_any_element())
                     .border_t_1().border_color(content(0.04)))
+                .when(!sub.accounts.is_empty(),|d|d.child(setting("Account",Some("Which sign-in they run on."),
+                    plain(SharedString::from("mono-subsession-account"),sub.account_label.clone()).aria_label(format!("Account for sessions it starts, {}",sub.account_label))
+                        .child(self.subsession_account_anchor.probe()).child(icon("chevron-down",12.))
+                        .on_click(cx.listener(|this,_,w,cx|this.open_subsession_account_picker(w,cx))).into_any_element())
+                    .border_t_1().border_color(content(0.04))))
                 .when(!sub.efforts.is_empty(),|d|d.child(setting("Effort",None,
                     plain(SharedString::from("mono-subsession-effort"),sub.effort_label.clone()).child(self.subsession_effort_anchor.probe())
                         .on_click(cx.listener(|this,_,w,cx|this.open_subsession_effort_picker(w,cx))).into_any_element())
@@ -2201,12 +2212,18 @@ impl Monos {
         let list = cx.new(|cx| ModelList::new_for(provider, model, &project, account, cx));
         let focus = list.read(cx).search_focus(cx);
         let picked = cx.subscribe(&list, |this, _, picked: &ModelPicked, cx| {
+            let before = this.own_provider(cx);
             if let Some(view) = this.chat()
                 && let Err(e) = view.update(cx, |v, cx| {
                     v.mono_config(picked.0, picked.1.clone(), HashMap::new(), cx)
                 })
             {
                 this.error = Some(e);
+            }
+            // Sessions that follow its provider drop an account that belonged to the old one.
+            let after = this.own_provider(cx);
+            if before != after {
+                this.set_subsessions(|s| s.follow_own_provider(&before, &after), cx);
             }
             this.picker = None;
             this.changed(cx);
@@ -2242,6 +2259,7 @@ impl Monos {
             .map(|v| v.read(cx).summary.provider.clone())
             .unwrap_or_else(|| "codex".into());
         let kind = Kind::from_id(set.harness.as_deref().unwrap_or(&own));
+        let own = Kind::from_id(&own).id();
         let profile = chat
             .as_ref()
             .filter(|v| v.read(cx).summary.provider == kind.id())
@@ -2251,6 +2269,30 @@ impl Monos {
                 crate::accounts::get(cx).map(|c| c.read(cx).selected(kind, &project))
             })
             .unwrap_or_default();
+        let center = crate::accounts::get(cx);
+        let accounts = center
+            .as_ref()
+            .map(|c| c.read(cx).book.list(kind))
+            .unwrap_or_default();
+        // The account set for these sessions decides which catalog their model is read from.
+        let chosen = set
+            .account
+            .as_deref()
+            .and_then(|id| accounts.iter().find(|a| a.id == id));
+        let profile = match (chosen, center.as_ref()) {
+            (Some(account), Some(center)) => center.read(cx).profile(&account.id),
+            _ => profile,
+        };
+        let account_label = match (&set.account, chosen) {
+            (_, Some(account)) => account.label.clone(),
+            (Some(_), None) => "Removed account".into(),
+            (None, None) if kind.id() == own => format!("Same as {}", mono.label()),
+            (None, None) => "Default account".into(),
+        };
+        let account_ids = accounts
+            .iter()
+            .map(|a| (a.id.clone(), a.label.clone()))
+            .collect();
         let models = monocode_core::catalog::cached_models_for(kind, &profile).unwrap_or_default();
         // Inherited, its effort levels are those of the Mono's own model.
         let model = if set.harness.is_some() {
@@ -2294,7 +2336,43 @@ impl Monos {
             model_label: model_label.into(),
             efforts,
             effort_label: effort_label.into(),
+            // A provider with only its own login has nothing to choose, unless a stale
+            // choice must stay visible.
+            accounts: if set.account.is_some() || accounts.len() > 1 {
+                account_ids
+            } else {
+                Vec::new()
+            },
+            account: set.account.clone(),
+            account_label: account_label.into(),
+            same_provider: kind.id() == own,
         }
+    }
+    /// The accounts of the Mono's own provider and the label of the one its chat runs on.
+    fn mono_account_choice(&self, cx: &App) -> (Vec<(String, String)>, SharedString) {
+        let (Some(chat), Some(center)) = (self.chat(), crate::accounts::get(cx)) else {
+            return (Vec::new(), "".into());
+        };
+        let chat = chat.read(cx);
+        let kind = Kind::from_id(&chat.summary.provider);
+        let rows = center.read(cx).book.list(kind);
+        let label = rows
+            .iter()
+            .find(|a| a.id == chat.settings.account.id)
+            .or_else(|| {
+                // The CLI login is always there, even when the book does not list it yet.
+                (chat.settings.account.id == monocode_core::accounts::DEFAULT)
+                    .then(|| rows.iter().find(|a| a.is_default()))
+                    .flatten()
+            })
+            .map(|a| a.label.clone())
+            .unwrap_or_else(|| "Unknown account".into());
+        let rows = if rows.len() > 1 {
+            rows.into_iter().map(|a| (a.id, a.label)).collect()
+        } else {
+            Vec::new()
+        };
+        (rows, label.into())
     }
     fn set_subsessions(
         &mut self,
@@ -2331,17 +2409,8 @@ impl Monos {
         let picked = cx.subscribe(&list, |this, _, picked: &ModelPicked, cx| {
             let harness = picked.0.id().to_owned();
             let model = picked.1.clone();
-            this.set_subsessions(
-                |s| {
-                    // An effort set for another model may not fit this one.
-                    if s.harness.as_deref() != Some(harness.as_str()) || s.model != model {
-                        s.effort = None;
-                    }
-                    s.harness = Some(harness);
-                    s.model = model;
-                },
-                cx,
-            );
+            let own = this.own_provider(cx);
+            this.set_subsessions(|s| s.pick_model(&own, &harness, model), cx);
             this.picker = None;
             cx.notify();
         });
@@ -2357,14 +2426,8 @@ impl Monos {
             if let MenuEvent::Picked(id, _) = event
                 && id == "subsessions:inherit"
             {
-                this.set_subsessions(
-                    |s| {
-                        s.harness = None;
-                        s.model = None;
-                        s.effort = None;
-                    },
-                    cx,
-                );
+                let own = this.own_provider(cx);
+                this.set_subsessions(|s| s.inherit_model(&own), cx);
             }
             this.picker = None;
             cx.notify();
@@ -2375,6 +2438,94 @@ impl Monos {
             width: 400.,
             align: crate::popover::Align::Start,
             _events: vec![picked, closed],
+        });
+        cx.notify();
+    }
+    /// The provider id of the active Mono, from its chat or else its saved conversation.
+    fn own_provider(&self, cx: &App) -> String {
+        self.active
+            .as_deref()
+            .map(|id| self.own_provider_of(id, None, cx))
+            .unwrap_or_else(|| "codex".into())
+    }
+    fn open_subsession_account_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mono) = self.current().cloned() else {
+            return;
+        };
+        let choice = self.subsession_choice(&mono, cx);
+        let unset = if choice.same_provider {
+            format!("Same as {}", mono.label())
+        } else {
+            "Default account".into()
+        };
+        let mut items: Vec<MenuItem> = vec![
+            MenuAction::new("subaccount:", unset)
+                .checked(choice.account.is_none())
+                .into(),
+        ];
+        items.extend(choice.accounts.iter().map(|(id, label)| {
+            MenuAction::new(format!("subaccount:{id}"), label.clone())
+                .checked(choice.account.as_deref() == Some(id.as_str()))
+                .into()
+        }));
+        let menu = cx.new(|cx| Menu::new("Account", items, window, cx));
+        let picked = cx.subscribe(&menu, |this, _, event: &MenuEvent, cx| {
+            if let MenuEvent::Picked(id, _) = event
+                && let Some(value) = id.strip_prefix("subaccount:")
+            {
+                let value = (!value.is_empty()).then(|| value.to_owned());
+                this.set_subsessions(|s| s.account = value, cx);
+            }
+            this.picker = None;
+            cx.notify();
+        });
+        self.picker = Some(OpenPicker {
+            menu,
+            anchor: Anchor::Slot(self.subsession_account_anchor.clone()),
+            width: 228.,
+            align: crate::popover::Align::Start,
+            _events: vec![picked],
+        });
+        cx.notify();
+    }
+    fn open_mono_account_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(chat) = self.chat() else {
+            return;
+        };
+        let current = chat.read(cx).settings.account.id.clone();
+        let (rows, _) = self.mono_account_choice(cx);
+        let items: Vec<MenuItem> = rows
+            .iter()
+            .map(|(id, label)| {
+                MenuAction::new(format!("account:{id}"), label.clone())
+                    .checked(*id == current)
+                    .into()
+            })
+            .collect();
+        let menu = cx.new(|cx| Menu::new("Account", items, window, cx));
+        let picked = cx.subscribe(&menu, |this, _, event: &MenuEvent, cx| {
+            if let MenuEvent::Picked(id, _) = event
+                && let Some(value) = id.strip_prefix("account:")
+                && let Some(view) = this.chat()
+                && let Some(center) = crate::accounts::get(cx)
+            {
+                if view.read(cx).mono_settled() {
+                    let profile = center.read(cx).profile(value);
+                    view.update(cx, |v, cx| v.switch_account(profile, cx));
+                } else {
+                    this.error =
+                        Some("Wait for its reply to finish before changing its account".into());
+                }
+            }
+            this.picker = None;
+            this.changed(cx);
+        });
+        self.picker = Some(OpenPicker {
+            menu,
+            anchor: Anchor::Slot(self.mono_account_anchor.clone()),
+            width: 228.,
+            align: crate::popover::Align::Start,
+            _events: vec![picked],
         });
         cx.notify();
     }
@@ -2636,4 +2787,11 @@ struct SubsessionChoice {
     model_label: SharedString,
     efforts: Vec<(String, String)>,
     effort_label: SharedString,
+    /// The (id, label) accounts of that provider to choose from; empty when there is no choice.
+    accounts: Vec<(String, String)>,
+    /// The account set, if any.
+    account: Option<String>,
+    account_label: SharedString,
+    /// The provider is the Mono's own, so an unset account means "the Mono's".
+    same_provider: bool,
 }
