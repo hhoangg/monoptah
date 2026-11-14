@@ -29,6 +29,10 @@
 # `nextest@X` pin in .github/workflows/native.yml), so the box follows the repo's own pins.
 : "${BOX_RUST_VERSION:=}"
 : "${BOX_NEXTEST_VERSION:=}"
+# sha256 of the Node tarball / nextest archive for the box architecture. Needed only for a version
+# that inner.sh has no pinned hash for; the download is refused without a matching hash.
+: "${BOX_NODE_SHA256:=}"
+: "${BOX_NEXTEST_SHA256:=}"
 : "${BOX_APT_PACKAGES:=build-essential clang cmake ninja-build pkg-config libfontconfig1-dev libfreetype6-dev libxcb1-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libasound2-dev libx11-xcb-dev libegl1-mesa-dev libvulkan-dev libdbus-1-dev squashfs-tools desktop-file-utils ca-certificates xz-utils zstd git curl}"
 # --- local behaviour -----------------------------------------------------------------------------
 : "${BOX_POLL:=20}"                 # seconds between log polls of a detached run
@@ -45,6 +49,32 @@ guard_no_secret_in_url() {
   case $1 in
     *://*@*) die "BOX_REPO_URL must not contain credentials (user:token@host). The box clones public repos; for a private one use sbx's own secret mechanism." ;;
   esac
+}
+
+# --- which repo the patch is taken against ----------------------------------------------------------
+# Remote NAMES differ per checkout (origin is the fork in one, the main repo in another), so the base
+# is chosen by URL: the remote that points at the repo the box clones.
+norm_git_url() { # https://github.com/o/r.git, git@github.com:o/r and ssh://git@github.com/o/r/ -> github.com/o/r
+  local u
+  case $1 in *://*) u=${1#*://} ;; *) u=${1/:/\/} ;; esac
+  u=${u#*@}; u=${u%/}; u=${u%.git}; u=${u%/}
+  printf '%s\n' "$u" | tr '[:upper:]' '[:lower:]'
+}
+matching_remote() { # matching_remote URL: first remote of the current repo whose URL is the same repo
+  local want r
+  want=$(norm_git_url "$1")
+  for r in $(git remote); do
+    [ "$(norm_git_url "$(git remote get-url "$r" 2>/dev/null)")" = "$want" ] && { printf '%s\n' "$r"; return 0; }
+  done
+  return 1
+}
+# Names that usually hold a secret. Checked on the lower-cased file name.
+is_secret_name() {
+  local b; b=$(basename -- "$1" | tr '[:upper:]' '[:lower:]')
+  case $b in
+    .env|.env.*|*.pem|*.key|id_rsa*|id_ed25519*|id_ecdsa*|credentials*|*.p12|*.pfx|*.token) return 0 ;;
+  esac
+  return 1
 }
 
 require_sbx() {
@@ -86,7 +116,7 @@ write_env_file() { # write_env_file PATH [EXTRA_VAR ...]
   : > "$out"
   for v in BOX_REPO_URL BOX_REF BOX_MANIFEST BOX_PACKAGES BOX_CARGO_PROFILE BOX_NEXTEST_CONFIG \
            BOX_NEXTEST_PROFILE BOX_JOBS BOX_NODE_TEST_CMD BOX_NODE_VERSION BOX_RUST_VERSION \
-           BOX_NEXTEST_VERSION BOX_APT_PACKAGES "$@"; do
+           BOX_NEXTEST_VERSION BOX_NODE_SHA256 BOX_NEXTEST_SHA256 BOX_APT_PACKAGES "$@"; do
     printf '%s=%q\n' "$v" "${!v:-}" >> "$out"
   done
 }
@@ -104,8 +134,11 @@ remote_run() { # remote_run NAME SUBCOMMAND [ARG]
   sx cp "$tmp/box-env" "$name:$BOX_HOME/box-env" >/dev/null || { rm -rf "$tmp"; die "could not copy the env file into $name"; }
   rm -rf "$tmp"
   # The subshell form returns at once; the wrapper records its own pid and, when the run ends, its status.
+  # SUB and ARG reach the wrapper as positional parameters, shell-quoted with %q, so a BOX_HOME with
+  # spaces (or any other character) stays one argument.
+  local q_args; q_args=$(printf '%q' "$sub"); [ -z "$arg" ] || q_args="$q_args $(printf '%q' "$arg")"
   sx exec "$name" bash -c "cd ~ && rm -f box.rc box.log box.pid && \
-    (setsid nohup bash -c 'echo \$\$ > ~/box.pid; bash ~/box-inner.sh $sub $arg > ~/box.log 2>&1; echo \$? > ~/box.rc' >/dev/null 2>&1 </dev/null &)" \
+    (setsid nohup bash -c 'echo \$\$ > ~/box.pid; bash ~/box-inner.sh \"\$@\" > ~/box.log 2>&1; echo \$? > ~/box.rc' _ $q_args >/dev/null 2>&1 </dev/null &)" \
     || die "could not start $sub in $name"
   local next=1 fails=0 out head body rc alive
   while :; do

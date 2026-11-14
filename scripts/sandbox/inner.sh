@@ -89,13 +89,49 @@ ENV
   rustc --version
 }
 
+# sha256 of the release artifacts for the pinned versions, per architecture. Downloads are verified
+# against these and refused otherwise (fail closed). Another version needs BOX_NODE_SHA256 /
+# BOX_NEXTEST_SHA256 (the hash for the box architecture) or an entry here.
+# Node: the official SHASUMS256.txt of that release, https://nodejs.org/dist/v22.12.0/SHASUMS256.txt.
+# nextest: computed with sha256 over the release download at pin time (2026-11-14),
+#   https://get.nexte.st/0.9.151/linux and /linux-arm (redirects to the GitHub release
+#   nextest-rs/nextest cargo-nextest-0.9.151); nextest publishes no checksum file for these.
+node_sha() {
+  case $BOX_NODE_VERSION/$NODE_ARCH in
+    22.12.0/x64)   echo 22982235e1b71fa8850f82edd09cdae7e3f32df1764a9ec298c72d25ef2c164f ;;
+    22.12.0/arm64) echo 8cfd5a8b9afae5a2e0bd86b0148ca31d2589c0ea669c2d0b11c132e35d90ed68 ;;
+    *) echo "$BOX_NODE_SHA256" ;;
+  esac
+}
+nextest_sha() {
+  case $BOX_NEXTEST_VERSION/$NEXTEST_OS in
+    0.9.151/linux)     echo 1d4ce302b820c41f4b89c5fb9bce45f0f0c94882c1cf08fc360caf08be6e7df4 ;;
+    0.9.151/linux-arm) echo 3e35e8f6913af92558ba09d7155f74e35dd1f0024ef3cd891637433ae4eacbdd ;;
+    *) echo "$BOX_NEXTEST_SHA256" ;;
+  esac
+}
+
+# fetch_verified URL SHA256 FILE: download to FILE, check the hash, fail closed (FILE is removed).
+fetch_verified() {
+  local url=$1 sha=$2 out=$3
+  [ -n "$sha" ] || { ts "no pinned sha256 for $url: set BOX_NODE_SHA256 / BOX_NEXTEST_SHA256 (or pin it in inner.sh); refusing an unverified download"; return 1; }
+  printf '%s' "$sha" | grep -Eq '^[0-9a-f]{64}$' || { ts "malformed sha256 for $url"; return 1; }
+  curl --proto '=https' --tlsv1.2 -fsSL "$url" -o "$out" || { rm -f "$out"; return 1; }
+  if ! echo "$sha  $out" | sha256sum -c - >/dev/null; then
+    ts "sha256 mismatch for $url (expected $sha); download discarded"; rm -f "$out"; return 1
+  fi
+}
+
 do_nextest() {
   arch_names || return 1
   env_rust
   if cargo nextest --version 2>/dev/null | head -n 1 | grep -q "nextest $BOX_NEXTEST_VERSION"; then
     cargo nextest --version | head -n 1; return 0
   fi
-  curl -LsSf "https://get.nexte.st/$BOX_NEXTEST_VERSION/$NEXTEST_OS" | tar zxf - -C "$CARGO_HOME/bin" || return 1
+  local dl; dl=$(mktemp -d) || return 1
+  fetch_verified "https://get.nexte.st/$BOX_NEXTEST_VERSION/$NEXTEST_OS" "$(nextest_sha)" "$dl/nextest.tar.gz" || { rm -rf "$dl"; return 1; }
+  tar zxf "$dl/nextest.tar.gz" -C "$CARGO_HOME/bin" || { rm -rf "$dl"; return 1; }
+  rm -rf "$dl"
   cargo nextest --version | head -n 1
 }
 
@@ -103,9 +139,11 @@ do_node() {
   [ -n "$BOX_NODE_TEST_CMD" ] || { ts "no node step configured, skipping node"; return 0; }
   arch_names || return 1
   if [ -x /opt/node/bin/node ]; then /opt/node/bin/node --version; return 0; fi
+  local dl; dl=$(mktemp -d) || return 1
+  fetch_verified "https://nodejs.org/dist/v$BOX_NODE_VERSION/node-v$BOX_NODE_VERSION-linux-$NODE_ARCH.tar.xz" "$(node_sha)" "$dl/node.tar.xz" || { rm -rf "$dl"; return 1; }
   sudo mkdir -p /opt/node && sudo chown "$(id -u):$(id -g)" /opt/node
-  curl -fsSL "https://nodejs.org/dist/v$BOX_NODE_VERSION/node-v$BOX_NODE_VERSION-linux-$NODE_ARCH.tar.xz" \
-    | tar -xJ -C /opt/node --strip-components=1 || return 1
+  tar -xJf "$dl/node.tar.xz" -C /opt/node --strip-components=1 || { rm -rf "$dl"; return 1; }
+  rm -rf "$dl"
   /opt/node/bin/node --version
 }
 

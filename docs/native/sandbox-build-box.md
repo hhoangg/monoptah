@@ -44,7 +44,7 @@ scripts/sandbox/clean.sh
 - `refresh.sh [--name NAME]` moves a warm sandbox to the current `main` and rebuilds what
   changed. A refresh from 4 commits behind (one Rust file changed) took 6 min 42 s.
 - `check.sh` takes the diff of your working tree (committed, staged, unstaged and new files)
-  against `upstream/main` (or `--base REF`), copies it with `sbx cp`, checks out the base
+  against a base (see "What gets uploaded" below), copies it with `sbx cp`, checks out the base
   commit in the sandbox, runs `git apply --index`, then `cargo fmt --check`, clippy
   `-D warnings`, and the tests **only if clippy passed**. `--filter` runs the tests that match a
   nextest filter expression, `--full` runs everything, and with neither only fmt and clippy run.
@@ -140,6 +140,36 @@ macOS tests you touched, and `npm run native:check` before a release. A pass in 
 a Linux pass; do not report it as a macOS pass. The sandbox also does not run doctests
 (`cargo test`, which the core job in CI runs), because nextest does not.
 
+## What gets uploaded
+
+`check.sh` uploads one patch: your commits and working tree compared with a base commit.
+
+**Base.** `--base REF` (or `BOX_BASE`) wins. Otherwise it is `<remote>/main` of the remote whose
+URL is the repo the box clones (`BOX_REPO_URL`; https and ssh forms and a trailing `.git` count
+as the same repo). Remote names differ per checkout (`origin` is the fork in one and the main
+repo in another), so it never goes by name. With no matching remote it falls back to
+`origin/main`. The line `base <sha> (<ref>: <why>)` says which one was used. A wrong base, such
+as the upstream project, would put every fork-only change in the patch and make the loop slow.
+
+**Untracked files.** New files that are not git-ignored are part of the patch. Before the upload
+`check.sh` lists them. A secret-looking name (`.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa*`,
+`id_ed25519*`, `id_ecdsa*`, `credentials*`, `*.p12`, `*.pfx`, `*.token`) prints a warning and stops
+the run. Add the file to `.gitignore`, pass `--no-untracked` (or `BOX_NO_UNTRACKED=1`) to leave
+all untracked files out, or set `BOX_UPLOAD_UNTRACKED_SECRETS=1` to upload them anyway. Files
+that are already tracked are not checked, and `--no-untracked` also leaves out the new files a
+test would need until they are added with `git add`.
+
+## Downloads are verified
+
+Inside the sandbox, rustup, cargo-nextest and Node are downloaded to a file, checked with
+`sha256sum -c` and only then extracted; a missing or wrong hash stops the step. The hashes for
+nextest 0.9.151 and Node 22.12.0 (x86_64 and aarch64) are pinned in `scripts/sandbox/inner.sh`.
+The Node ones come from `https://nodejs.org/dist/v22.12.0/SHASUMS256.txt`; nextest publishes no
+checksum file for these downloads, so its hashes were computed from the release download at pin
+time. A different version (the repo bumping nextest, `BOX_NODE_VERSION`) fails with a message until
+you pin its hash in `inner.sh` or set `BOX_NEXTEST_SHA256` / `BOX_NODE_SHA256` for the box's
+architecture. `BOX_NEXTEST_VERSION=latest` cannot be verified and is refused.
+
 ## Reusing the scripts for another Rust project
 
 Every setting is an environment variable with a Monoptah default (see the top of
@@ -157,6 +187,8 @@ Every setting is an environment variable with a Monoptah default (see the top of
 | `BOX_TTL`, `BOX_ON_TIMEOUT` | `2h`, `stop` | Lifetime and what happens at the end. |
 | `BOX_NODE_TEST_CMD` | `npm run native:test:dev` | Node step of `--full` and of Rust-free patches; empty means no Node at all. |
 | `BOX_RUST_VERSION`, `BOX_NEXTEST_VERSION` | read from the repo | Override the toolchain pins. |
+| `BOX_NODE_VERSION`, `BOX_NODE_SHA256`, `BOX_NEXTEST_SHA256` | `22.12.0`, empty, empty | Node version; the sha256 a downloaded Node or nextest archive must have when its version is not pinned in `inner.sh` (see "Downloads are verified"). |
+| `BOX_BASE`, `BOX_NO_UNTRACKED`, `BOX_UPLOAD_UNTRACKED_SECRETS` | empty, `0`, `0` | `check.sh` base, skip untracked files, allow secret-looking untracked files. |
 | `BOX_APT_PACKAGES` | the native Linux build dependencies | System packages to install. |
 | `BOX_NAME`, `BOX_STATE_DIR` | last recorded box, `~/.local/state/sandbox-build-box` | Which sandbox, and where the list of created ones lives. |
 
