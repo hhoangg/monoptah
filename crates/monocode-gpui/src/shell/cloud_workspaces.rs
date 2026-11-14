@@ -1,5 +1,5 @@
 //! The Cloud workspaces dialog opened from the project menu's "Cloud workspaces…" item (next to
-//! "Cloud settings…"), and what the shell does with its Stop and Delete: adds its live busy view,
+//! "Cloud settings…"), and what the shell does with its Stop and Delete: adds its busy view (a copy),
 //! and on a delete forgets the sessions of the deleted workspace in the window and the Sub-agents
 //! panel. The dialog stays open while a stop or delete runs, so the result always gets here.
 use super::*;
@@ -42,12 +42,15 @@ impl Shell {
                     target,
                     action,
                     confirmed,
+                    acknowledged,
                 } => {
-                    // The dialog runs the call; the live view of what is busy is the shell's.
+                    // The dialog runs the call; what is busy is the shell's, copied now (it does
+                    // not follow what starts during a wait, see `CloudWorkspacesDialog::run`).
                     let busy = this.cloud_busy_snapshot(cx);
                     let (target, action, confirmed) = (target.clone(), *action, confirmed.clone());
+                    let acknowledged = *acknowledged;
                     dialog.update(cx, |dialog, cx| {
-                        dialog.run(target, action, confirmed, busy, cx)
+                        dialog.run(target, action, confirmed, acknowledged, busy, cx)
                     });
                 }
                 cloud_workspaces_dialog::Event::Stopped(cloud) => {
@@ -213,6 +216,7 @@ mod tests {
                 target: fixtures::target(used.clone()),
                 action: Action::Delete,
                 confirmed: vec![],
+                acknowledged: false,
             })
         });
         cx.run_until_parked();
@@ -291,6 +295,7 @@ mod tests {
                 target: fixtures::target(used.clone()),
                 action: Action::Delete,
                 confirmed: vec![],
+                acknowledged: false,
             })
         });
         window

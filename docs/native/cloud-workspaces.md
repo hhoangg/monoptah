@@ -39,12 +39,16 @@ from it, a saved list of what a delete would lose, or a Docker account pin.
 ## Actions
 
 * **Stop** (workspace is up): the app API's `cloud.stop`, run as the Docker account the row was
-  listed under.
+  listed under. It **asks first** when a session is working on the workspace (the turn would be cut
+  off) or the workspace is not this app's (whoever uses it would be); any other row stops at once.
+  Stopping keeps the state. If the stop says the sessions it interrupted, that warning stays on
+  screen under the summary until the next action on that workspace.
 * **Delete** (irreversible). Pressing it first **asks the workspace what would be lost**, on a worker
   thread, and shows the answer before anything can be confirmed:
   * a codespace: what GitHub reports (`gh codespace view --json gitStatus`, which never starts it):
     uncommitted changes, unpushed commits, or "GitHub did not report"; if that cannot be read, Delete
-    is not offered;
+    is not offered. The prompt says this is **as GitHub last reported it**: it can be a few minutes
+    behind, so a clean report is not proof that nothing was changed there just now;
   * what an earlier archive or convert recorded as not copied to this computer;
   * a sandbox is **not started to read it** (that would bill it again): the prompt says so, and says
     that anything in it that was not pushed or copied to this computer is lost.
@@ -52,13 +56,18 @@ from it, a saved list of what a delete would lose, or a Docker account pin.
   Delete needs an explicit acknowledgement ("I understand what is lost…") whenever something is
   listed, the contents cannot be read (every sandbox), or the workspace is not this app's; for a
   workspace not created by this app the prompt names it and says Monoptah cannot see who uses it. A
-  clean codespace of this app asks only for the plain confirmation.
+  clean codespace of this app asks only for the plain confirmation. The acknowledgement is not only
+  a checkbox: the delete call carries `acknowledged`, and the app API refuses a workspace this app
+  did not create without it, whatever the caller confirmed.
 
   The confirmation sends back the lines it showed. Right before the delete (after a sandbox's wait of
-  up to 4 minutes, when it is stopped and reported `stopped`), the app **checks again**: a session
-  working on it, an archive or convert in progress, a sandbox that was woken again, a session moved
-  into it, and any line that was not in what the user confirmed all refuse the delete. Nothing is
-  removed then.
+  up to 4 minutes, when it is stopped and reported `stopped`), the app **checks again**. What it
+  reads fresh: the sessions in the store, a sandbox that was woken again (it is running again after
+  it was stopped), a session moved into it, and any line that was not in what the user confirmed.
+  Each refuses the delete and nothing is removed. What it does **not** see is an archive or convert
+  that began after the click: the window's "is something working on it" is a copy taken when Delete
+  was confirmed, so during the wait the protection is the woke check above. A sandbox in a state
+  Monoptah does not recognise is neither stopped nor deleted (it could be running).
 
   A **local session moved into the workspace** (its location is Cloud) blocks the delete from this dialog
   outright, like the automatic cleanup after a return (the app API's `cloud.delete` is unchanged): bring the conversation back to this computer first
