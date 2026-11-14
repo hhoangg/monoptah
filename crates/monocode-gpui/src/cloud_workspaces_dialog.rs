@@ -93,7 +93,7 @@ impl Env {
     pub(crate) fn system(store: Database) -> Self {
         Self { api: None, store }
     }
-    fn api(&self) -> Result<Arc<CloudApi>, String> {
+    pub(crate) fn api(&self) -> Result<Arc<CloudApi>, String> {
         match &self.api {
             Some(api) => Ok(api.clone()),
             None => CloudApi::shared(&self.store),

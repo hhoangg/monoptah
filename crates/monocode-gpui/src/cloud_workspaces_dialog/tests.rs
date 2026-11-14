@@ -25,13 +25,13 @@ use std::{
 };
 
 const AUTH_OK: &str = "github.com\n  \u{2713} Logged in to github.com account octo (keyring)\n  - Token scopes: 'codespace', 'repo'\n";
-const USED: &str = "octo-used";
-const LOST: &str = "octo-lost";
-const SBX_USED: &str = "monoptah-fix-login-a1b2c3";
-const SBX_LOST: &str = "monoptah-main-d4e5f6";
+pub(crate) const USED: &str = "octo-used";
+pub(crate) const LOST: &str = "octo-lost";
+pub(crate) const SBX_USED: &str = "monoptah-fix-login-a1b2c3";
+pub(crate) const SBX_LOST: &str = "monoptah-main-d4e5f6";
 
 /// A time `hours` before now, as gh and sbx write it.
-fn hours_ago(hours: f64) -> String {
+pub(crate) fn hours_ago(hours: f64) -> String {
     let ms = monocode_core::time::now_ms() - (hours * 3_600_000.0) as u64;
     chrono::DateTime::from_timestamp_millis(ms as i64)
         .unwrap()

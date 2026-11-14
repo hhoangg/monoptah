@@ -3,7 +3,7 @@
 Cost control for cloud sessions. A failed or forgotten codespace or Docker sandbox keeps drawing
 quota (Codespaces: the free dollar pool) or credit (Docker: per runtime second, billed to the card
 after the credit). **Project menu > Cloud workspaces…** (the item right after "Cloud settings…")
-lists them all and lets you stop or delete them.
+lists them all and lets you stop or delete them; a chip in the footer shows what runs (see "The footer chip").
 
 ## What a row shows
 
@@ -89,6 +89,37 @@ dialog opens or Refresh is pressed; the result is reused for 30 seconds and forg
 or delete, whichever part of the app made it. Nothing starts a stopped workspace. If `gh` or `sbx`
 is missing or signed out, the dialog says so with the command that fixes it and the other backend
 still lists.
+
+## The footer chip
+
+The cost is also visible without opening the menu: a **cloud chip** sits in the footer next to the
+provider usage chip (cloud glyph and `2 running`). It is one click or one Enter or Space (it is
+focusable like the usage chip) from the same Cloud workspaces dialog the menu item opens. The menu
+item stays.
+
+* **Shown** only while at least one workspace of the open project is **Running or Starting**. With
+  nothing running it is not drawn and takes no room. A cloud session's own project is used when the
+  open session runs in a workspace (its folder is `remote://…`).
+* **Warning colour** (the theme's warning amber) when any workspace has a concern:
+  * **Failed**: the workspace is in a failed state;
+  * **Orphan**: it is this app's (see "Whose workspace it is"), no live session uses it and it is
+    up, starting or stopping. A stopped orphan costs nothing and is not flagged; a workspace this
+    app did not create is never flagged as an orphan;
+  * **Running for hours with no session working**: up for at least `LONG_RUNNING` (6 hours,
+    `crates/monocode-core/src/cloud_sessions/footer_status.rs`) and no session of it is busy. The age
+    counts from creation, an upper bound, like the cost estimate (neither CLI reports uptime).
+
+  A failed or orphan workspace shows the chip only together with something that runs (nothing
+  running: nothing drawn). The chip's accessible description and hover tooltip name each workspace
+  with its backend, state and concern, the worrying ones first.
+* **Reading** reuses the overview loader above, so it is read-only and never wakes or starts a
+  workspace and spends no billable call. It asks at most about **once a minute**, **only while the
+  window is active**, and **only for a project that uses cloud**: it has saved Cloud settings (either
+  backend) or a cloud session. A plain GitHub project never starts `gh`. Coming back to the window,
+  switching project, or a stop or delete from the dialog read again at once (the core service still
+  reuses an overview younger than 30 seconds). A missing or signed-out `gh` or `sbx` is **silent**: that
+  backend lists nothing, the chip stays hidden when nothing runs, and there is no toast or error
+  text. The dialog is where such a problem is explained.
 
 ## Cost numbers are estimates
 

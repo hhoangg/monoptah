@@ -151,6 +151,12 @@ fn load_map(store: &Store) -> Result<BTreeMap<String, StoredProject>, String> {
     }
 }
 
+/// Whether codespace settings were saved for the project at `cwd`. An unreadable setting counts
+/// as none (this only decides whether to ask about the project, it never writes).
+pub fn has_saved_settings(store: &Store, cwd: &str) -> bool {
+    load_map(store).is_ok_and(|map| map.contains_key(cwd))
+}
+
 /// Both parts of the project at `cwd`. A stored part that no longer validates is an error.
 pub fn load(store: &Store, cwd: &str) -> Result<ProjectCloud, String> {
     let CodespaceCloud {
