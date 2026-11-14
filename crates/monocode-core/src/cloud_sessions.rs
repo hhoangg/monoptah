@@ -2215,6 +2215,7 @@ pub mod claude_setup;
 pub mod docker_config;
 pub mod docker_size;
 pub mod docker_start;
+pub mod footer_status;
 pub mod kit;
 pub mod kit_pack;
 pub mod kit_prefs;
@@ -2257,6 +2258,8 @@ mod docker_config_tests;
 mod docker_size_tests;
 #[cfg(test)]
 mod docker_start_tests;
+#[cfg(test)]
+mod footer_status_tests;
 #[cfg(test)]
 mod kit_pack_tests;
 #[cfg(test)]

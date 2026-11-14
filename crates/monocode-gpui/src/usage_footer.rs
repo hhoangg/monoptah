@@ -11,9 +11,13 @@ use monocode_core::usage::{FetchError, Snapshot};
 use monocode_core::{provider::Kind, usage};
 use std::time::{Duration, Instant};
 
+pub(crate) mod cloud_chip;
 mod resets;
 
-actions!(usage_footer, [DismissUsage, ToggleUsage, RefreshUsage]);
+actions!(
+    usage_footer,
+    [DismissUsage, ToggleUsage, RefreshUsage, OpenCloudStatus]
+);
 pub(crate) fn bind(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("escape", DismissUsage, Some("UsageDetails")),
@@ -21,6 +25,8 @@ pub(crate) fn bind(cx: &mut App) {
         KeyBinding::new("space", ToggleUsage, Some("UsageChip")),
         KeyBinding::new("enter", RefreshUsage, Some("UsageRefresh")),
         KeyBinding::new("space", RefreshUsage, Some("UsageRefresh")),
+        KeyBinding::new("enter", OpenCloudStatus, Some("CloudChip")),
+        KeyBinding::new("space", OpenCloudStatus, Some("CloudChip")),
     ]);
 }
 
@@ -60,6 +66,10 @@ pub(crate) struct UsageFooter {
     /// UsageFooter's `footer` variant: the classic layout's bordered strip.
     classic: bool,
     show_remaining: bool,
+    /// The cloud status chip beside the usage chip, see [`cloud_chip`]. It shows only while a
+    /// cloud workspace of the open project runs.
+    cloud: gpui::Entity<cloud_chip::CloudChip>,
+    _cloud_observation: gpui::Subscription,
     _clock: gpui::Task<()>,
 }
 impl UsageFooter {
@@ -111,7 +121,12 @@ impl UsageFooter {
                 cx.notify();
             })
         });
+        let cloud = cx.new(cloud_chip::CloudChip::new);
+        // The chip appearing or going away changes this row.
+        let cloud_observation = cx.observe(&cloud, |_, _, cx| cx.notify());
         let mut this = Self {
+            cloud,
+            _cloud_observation: cloud_observation,
             _account_events: crate::accounts::get(cx).map(|center| {
                 cx.subscribe(
                     &center,
@@ -182,6 +197,20 @@ impl UsageFooter {
             self.classic = classic;
             cx.notify();
         }
+        self.cloud
+            .update(cx, |chip, cx| chip.set_classic(classic, cx));
+    }
+    /// Hands the chip the store it reads cloud workspaces through.
+    pub(crate) fn set_cloud_env(
+        &mut self,
+        env: crate::cloud_workspaces_dialog::Env,
+        cx: &mut Context<Self>,
+    ) {
+        self.cloud.update(cx, |chip, cx| chip.set_env(env, cx));
+    }
+    /// The cloud status chip, for the shell to wire its click, window focus and project.
+    pub(crate) fn cloud_chip(&self) -> &gpui::Entity<cloud_chip::CloudChip> {
+        &self.cloud
     }
     #[cfg(test)]
     pub(crate) fn provider(&mut self, kind: Kind, cx: &mut Context<Self>) {
@@ -883,6 +912,8 @@ impl Render for UsageFooter {
             .and_then(|s| s.windows.iter().map(|w| w.used_percent).reduce(f64::max));
         let weak = cx.weak_entity();
         let classic = self.classic;
+        let cloud = self.cloud.clone();
+        let show_cloud = cloud.read(cx).visible();
         div()
             .id("usage-footer")
             .debug_selector(|| "usage-footer".into())
@@ -974,6 +1005,7 @@ impl Render for UsageFooter {
                         cx.listener(|this, _: &RefreshUsage, _, cx| this.refresh_manual(cx)),
                     ),
             )
+            .when(show_cloud, |d| d.child(cloud))
             .when(self.open, |d| {
                 d.child(
                     popover("usage-details", Anchor::Slot(self.anchor.clone()))

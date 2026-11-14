@@ -703,6 +703,39 @@ fn loading_only_reads_and_the_result_is_cached() {
 }
 
 #[test]
+fn the_footer_asks_about_a_project_only_when_it_uses_cloud_and_never_calls_a_cli() {
+    use super::{docker_config, project_cloud};
+    let fx = fx(Gh::new(json!([])), Sbx::new(vec![]));
+    assert!(!fx.svc.project_uses_cloud(PROJECT), "a plain project");
+    assert!(!fx.svc.project_uses_cloud(""));
+    assert!(!fx
+        .svc
+        .project_uses_cloud("remote://env-fake/workspaces/widgets"));
+
+    // Saved settings of either backend.
+    {
+        let store = fx.store.lock().unwrap();
+        project_cloud::save(&store, "/work/codespace", &Default::default()).unwrap();
+        let config = docker_config::DockerProjectConfig {
+            repo_url: "https://github.com/octo/widgets.git".into(),
+            ..Default::default()
+        };
+        docker_config::save(&store, "/work/sandbox", &config).unwrap();
+    }
+    assert!(fx.svc.project_uses_cloud("/work/codespace"));
+    assert!(fx.svc.project_uses_cloud("/work/sandbox"));
+    assert!(!fx.svc.project_uses_cloud(PROJECT));
+
+    // A cloud session of the project, with nothing saved.
+    add_session(&fx.store, PROJECT, &CloudRef::codespace("octo-used"));
+    assert!(fx.svc.project_uses_cloud(PROJECT));
+    assert!(!fx.svc.project_uses_cloud("/work/other"));
+
+    assert!(fx.gh.calls().is_empty(), "{:?}", fx.gh.calls());
+    assert!(fx.sbx.calls().is_empty(), "{:?}", fx.sbx.calls());
+}
+
+#[test]
 fn without_sbx_the_codespaces_still_list_and_the_fix_is_named() {
     let fx = full();
     *fx.sbx.ls_reply.lock().unwrap() =
