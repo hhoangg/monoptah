@@ -1,13 +1,16 @@
-# Monoptah Native 0.52.1
+# Monoptah Native 0.53.0
 
 ## Changes since 0.52.0
 
 ### New
 
 - A Mono can use its own account. Its Settings has an Account row for the sign-in it thinks and replies with, and the defaults for sessions it starts have an Account row too, next to the model. Sessions a Mono starts take the harness, model, effort and account from those defaults unless the Mono names them, and a start that would use a removed account is refused with a clear message; a harness of another provider uses that provider's project or default account. The report after a session stops at a usage limit names the account.
+- A cloud status chip in the footer, next to the usage chip, shows "N running" while a cloud workspace of the window's project runs or starts, and takes no room when nothing does. It turns to the warning colour for a workspace no session uses, a failed one, or one up for 6 hours with no busy session. Click it to open Cloud workspaces. It only reads state (nothing is woken or started), at most about once a minute while the window is active, and it follows the window's project on every tab and app view.
+- Archiving or deleting a cloud session now acts on its cloud instance. One confirm dialog offers Stop instance (default) or Delete instance; Delete is refused while another live session shares the instance. Archive has a "Back up this session to local" option (on by default), and the instance is touched only after the backup succeeds. An instance that no longer exists counts as stopped or deleted.
 
 ### Fixes
 
+- The first prompt of a cloud session started from the new-session composer is sent once the workspace is ready. Before, it was stored but never shown or sent, and the session stayed empty as "New session".
 - Deleting a session is no longer blocked by a file pane you cannot see. Only a visible file tab or a pane with unsaved edits blocks it; the message names the file, and a delete started in the app brings that pane into view.
 
 ## Downloads and updates
