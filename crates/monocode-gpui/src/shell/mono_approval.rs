@@ -10,7 +10,8 @@
 //!   Escape is ignored (and starts the `GUARD` wait over), and Run and Allow ignore clicks, so a
 //!   keystroke or click aimed at what was on screen a moment ago cannot approve anything.
 //!   The keyboard moves between Deny and Run only: "Allow this ... for this Mono" is a
-//!   standing permission and is only ever given by a click.
+//!   standing permission and is only ever given by a click. A history key (up, down, tab, esc)
+//!   has no Allow at all: each press is asked, with the last lines on screen shown.
 //! - A request that outlives `APPROVAL_WAIT` (counted from the moment the bridge received the
 //!   call), whose terminal, Mono or project went away, or whose Mono's turn was stopped, is
 //!   answered with an error and dropped, and writes nothing even if answered late. The bridge
@@ -227,12 +228,15 @@ impl Shell {
         }
         if std::mem::take(&mut self.mono_approvals.switched) {
             // The call selected another title tab, so what had the keyboard may be hidden. The
-            // shell root takes it (never the terminal); with a dialog up, it is what the
-            // keyboard returns to.
+            // shell root takes it (never the terminal) unless what had it is still on screen;
+            // with a dialog up, it is what the keyboard returns to.
             if self.mono_approvals.queue.is_empty() {
-                window.focus(&self.focus, cx);
-            } else if self.mono_approvals.before.is_some() {
-                self.mono_approvals.before = Some(self.focus.clone());
+                let held = window.focused(cx);
+                let target = self.focus_after_switch(held.as_ref(), window, cx);
+                window.focus(&target, cx);
+            } else if let Some(before) = self.mono_approvals.before.clone() {
+                self.mono_approvals.before =
+                    Some(self.focus_after_switch(Some(&before), window, cx));
             }
         }
         if self.mono_approvals.queue.is_empty() {
@@ -271,6 +275,38 @@ impl Shell {
             .detach();
         }
         cx.notify();
+    }
+
+    /// Where the keyboard goes after a call selected another title tab: `saved` (what had it
+    /// before) when it is a surface the switch does not hide (the Mono's composer or its
+    /// details panel), else the shell root. The same rule serves a new pane and a reused one.
+    pub(super) fn focus_after_switch(
+        &self,
+        saved: Option<&FocusHandle>,
+        window: &Window,
+        cx: &App,
+    ) -> FocusHandle {
+        let still_shown = |saved: &FocusHandle| {
+            let mut surfaces = Vec::new();
+            if let Some(monos) = self.monos.as_ref().map(|m| m.read(cx)) {
+                surfaces.push(monos.details.focus_handle(cx));
+                if let Some(chat) = monos.chat() {
+                    surfaces.push(chat.read(cx).input.focus_handle(cx));
+                }
+            }
+            if self.workspace.right_panel_open
+                && let Some(panel) = &self.right_panel
+            {
+                surfaces.push(panel.focus_handle(cx));
+            }
+            surfaces
+                .iter()
+                .any(|surface| surface.contains(saved, window))
+        };
+        saved
+            .filter(|saved| still_shown(saved))
+            .cloned()
+            .unwrap_or_else(|| self.focus.clone())
     }
 
     /// Disarms the front dialog and starts the guard over. A dialog that just appeared, or that
@@ -390,6 +426,7 @@ impl Shell {
                     // Remembered only once the checked write went through.
                     if result.is_ok()
                         && choice == Choice::Allow
+                        && approval.request.allowable()
                         && let Some(monos) = self.monos.clone()
                     {
                         let (kind, text) = (approval.request.kind, approval.request.text.clone());
@@ -404,7 +441,8 @@ impl Shell {
         let _ = approval.reply.try_send(result);
         // An explicit reveal selected another tab: the keyboard cannot go back to what had it.
         if std::mem::take(&mut self.mono_approvals.switched) {
-            self.mono_approvals.before = Some(self.focus.clone());
+            let before = self.mono_approvals.before.take();
+            self.mono_approvals.before = Some(self.focus_after_switch(before.as_ref(), window, cx));
         }
         if self.mono_approvals.queue.is_empty() {
             // Exactly where the keyboard was, not wherever the call's `reveal` selected.
@@ -449,7 +487,7 @@ impl Shell {
         let choice = match ix {
             DENY => Choice::Deny,
             _ if !front.armed => return,
-            ALLOW if by_key => return,
+            ALLOW if by_key || !front.request.allowable() => return,
             ALLOW => Choice::Allow,
             _ => Choice::Run,
         };
@@ -512,18 +550,33 @@ impl Shell {
         let focus = self.mono_approvals.focus.as_ref()?;
         let request = &approval.request;
         // Typing text at a shell is running it once Enter follows, so the dialog says so.
-        let what = if request.kind == "command" {
-            "run this command"
+        let key_name = request
+            .then_key
+            .as_deref()
+            .map(|key| {
+                let mut chars = key.chars();
+                chars
+                    .next()
+                    .map(|first| first.to_uppercase().chain(chars).collect::<String>())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let key_only = request.kind == "key";
+        let what = if key_only {
+            format!("press {key_name} in a terminal")
+        } else if request.kind == "command" {
+            "run this command".to_owned()
         } else if request.then_key.as_deref() == Some("enter") {
-            "run this in a terminal"
+            "run this in a terminal".to_owned()
         } else {
-            "type this into a terminal, where it can run"
+            "type this into a terminal, where it can run".to_owned()
         };
         let allow = if request.kind == "command" {
             "Allow this command for this Mono"
         } else {
             "Allow this text for this Mono"
         };
+        let allowable = request.allowable();
         let more = self.mono_approvals.queue.len() - 1;
         let size = window.viewport_size();
         let width = 520f32.min(size.width.as_f32() - 24.);
@@ -590,10 +643,54 @@ impl Shell {
                     if request.cwd_live { "Folder" } else { "Started in" },
                     visible(&request.cwd),
                 ))
-                .when_some(request.then_key.clone(), |d, key| {
+                .when(key_only, |d| {
+                    d.child(line(
+                        "mono-approval-press",
+                        "Press",
+                        format!(
+                            "{key_name} in terminal {} (Program: {})",
+                            visible(&request.label),
+                            request
+                                .seen
+                                .as_ref()
+                                .map_or("unknown", |seen| seen.front.name())
+                        ),
+                    ))
+                })
+                .when_some(request.then_key.clone().filter(|_| !key_only), |d, key| {
                     d.child(line("mono-approval-key", "Then", format!("presses {key}")))
                 })
-                .child(
+                .when_some(request.screen.clone(), |d, screen| {
+                    d.child(
+                        div()
+                            .id("mono-approval-screen")
+                            .debug_selector(|| "mono-approval-screen".into())
+                            .flex()
+                            .gap_2()
+                            .text_size(px(12.))
+                            .child(
+                                div()
+                                    .w(px(64.))
+                                    .flex_shrink_0()
+                                    .text_color(content(0.5))
+                                    .child("Screen"),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .p_2()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(content(0.1))
+                                    .bg(content(0.06))
+                                    .font_family(crate::fonts::mono())
+                                    .text_color(content(1.))
+                                    .child(visible(&screen)),
+                            ),
+                    )
+                })
+                .when(!key_only, |d| d.child(
                     div()
                         .id("mono-approval-text")
                         .debug_selector(|| "mono-approval-text".into())
@@ -609,7 +706,7 @@ impl Shell {
                         .line_height(px(17.))
                         .text_color(content(1.))
                         .child(shown),
-                )
+                ))
                 .when_some(pinned, |d, last| {
                     d.child(
                         div()
@@ -629,7 +726,17 @@ impl Shell {
                             ),
                     )
                 })
-                .child(modal::body(format!(
+                .when(key_only, |d| {
+                    d.child(modal::body(format!(
+                        "{key_name} can recall or complete a line in a shell or a program that reads lines, and Enter would then run it. Check the screen above. Nothing is sent until you choose Run, and each press asks again.{}",
+                        if more > 0 {
+                            format!(" {more} more waiting.")
+                        } else {
+                            String::new()
+                        }
+                    )))
+                })
+                .when(!key_only, |d| d.child(modal::body(format!(
                     "{bytes} bytes, {lines} line{}. Run {}. Nothing runs until you choose Run.{}",
                     if lines == 1 { "" } else { "s" },
                     match (request.kind, request.then_key.as_deref()) {
@@ -643,7 +750,7 @@ impl Shell {
                     } else {
                         String::new()
                     }
-                )))
+                ))))
                 .when(escaped, |d| {
                     d.child(modal::body(
                         "\\n is a line break, \\\\ a backslash, a dot a space that is hard to see.",
@@ -674,17 +781,19 @@ impl Shell {
                                     this.press_mono_approval(DENY, false, window, cx)
                                 })),
                         )
-                        .child(
-                            guarded(
-                                modal::ghost_button("mono-approval-allow", allow)
-                                    .debug_selector(|| "mono-approval-allow".into())
-                                    .border_1()
-                                    .border_color(ring(ALLOW)),
+                        .when(allowable, |d| {
+                            d.child(
+                                guarded(
+                                    modal::ghost_button("mono-approval-allow", allow)
+                                        .debug_selector(|| "mono-approval-allow".into())
+                                        .border_1()
+                                        .border_color(ring(ALLOW)),
+                                )
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.press_mono_approval(ALLOW, false, window, cx)
+                                })),
                             )
-                            .on_click(cx.listener(
-                                |this, _, window, cx| this.press_mono_approval(ALLOW, false, window, cx),
-                            )),
-                        )
+                        })
                         .child(
                             guarded(
                                 modal::primary_button("mono-approval-run", "Run")

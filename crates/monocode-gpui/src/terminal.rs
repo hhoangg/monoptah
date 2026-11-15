@@ -545,7 +545,8 @@ pub(crate) fn shell_like(name: &str) -> bool {
 
 impl Front {
     /// A program that holds the terminal and is not a line editor with history (see
-    /// `shell_like`): the only front where esc, up, down and tab are free.
+    /// `shell_like`): the only front where enter alone is free. (Up, down, tab and esc always
+    /// need approval, see `MonoKey::needs_approval`.)
     pub(crate) fn is_plain_program(&self) -> bool {
         matches!(self, Self::Program(name) if !shell_like(name))
     }
@@ -602,6 +603,13 @@ impl MonoKey {
             "esc" => Self::Esc,
             _ => return None,
         })
+    }
+    /// Keys that recall history, complete a line or start a meta-key recall in a shell or a
+    /// REPL, and so lead to a line nobody was shown: each press waits for the user, whatever
+    /// holds the terminal (the process name cannot tell a REPL behind a wrapper such as
+    /// `uv run python` or `docker exec -it`).
+    pub(crate) fn needs_approval(self) -> bool {
+        matches!(self, Self::Up | Self::Down | Self::Tab | Self::Esc)
     }
     pub(crate) fn bytes(self) -> &'static [u8] {
         match self {
@@ -2673,10 +2681,9 @@ pub(crate) fn command_label(args: &str) -> Option<String> {
     let exe = parts.next()?;
     let base = std::path::Path::new(exe).file_name()?.to_str()?.to_owned();
     let base = base.trim_start_matches('-').to_owned();
-    if matches!(
-        base.as_str(),
-        "node" | "nodejs" | "python" | "python3" | "ruby" | "deno" | "bun"
-    ) {
+    // A versioned interpreter (`python3.12`, `ruby3.2`) names its script like the plain one.
+    let stem = base.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    if matches!(stem, "node" | "nodejs" | "python" | "ruby" | "deno" | "bun") {
         for part in parts {
             if part.starts_with('-') {
                 continue;
@@ -3134,6 +3141,20 @@ mod tests {
             Some("cargo")
         );
         assert_eq!(command_label("-zsh").as_deref(), Some("zsh"));
+        // A versioned interpreter names its script too, instead of reading as a REPL.
+        assert_eq!(
+            command_label("/usr/bin/python3.12 app.py --port 80").as_deref(),
+            Some("app.py")
+        );
+        assert_eq!(
+            command_label("python3.12 -m http.server").as_deref(),
+            Some("http.server")
+        );
+        assert_eq!(
+            command_label("ruby3.2 serve.rb").as_deref(),
+            Some("serve.rb")
+        );
+        assert_eq!(command_label("python3.12").as_deref(), Some("python3.12"));
         assert!(is_shell_name("zsh"));
         assert_eq!(default_title("/work/monocode"), "monocode");
         assert_eq!(default_title("/"), "Terminal");
