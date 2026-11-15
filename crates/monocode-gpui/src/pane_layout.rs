@@ -104,6 +104,50 @@ fn split(dir: SplitDir, children: Vec<PaneNode>) -> PaneNode {
         sizes,
     }
 }
+/// A ready-made arrangement of several panes (`terminals.layout`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Preset {
+    /// Side by side.
+    Columns,
+    /// Stacked.
+    Rows,
+    /// Two columns, rows filled left to right; an odd last pane spans its row.
+    Grid,
+}
+
+impl Preset {
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "columns" => Some(Self::Columns),
+            "rows" => Some(Self::Rows),
+            "grid" => Some(Self::Grid),
+            _ => None,
+        }
+    }
+}
+
+/// The tree for `ids` laid out as `preset`, every part the same size. None when `ids` is
+/// empty. Panes keep the order given: left to right, top to bottom.
+pub(crate) fn preset_layout(preset: Preset, ids: &[i64]) -> Option<PaneNode> {
+    let leaves: Vec<PaneNode> = ids.iter().copied().map(leaf).collect();
+    let group = |dir: SplitDir, mut nodes: Vec<PaneNode>| match nodes.len() {
+        0 => None,
+        1 => nodes.pop(),
+        _ => Some(split(dir, nodes)),
+    };
+    match preset {
+        Preset::Columns => group(SplitDir::Right, leaves),
+        Preset::Rows => group(SplitDir::Down, leaves),
+        Preset::Grid => {
+            let rows = leaves
+                .chunks(2)
+                .filter_map(|row| group(SplitDir::Right, row.to_vec()))
+                .collect();
+            group(SplitDir::Down, rows)
+        }
+    }
+}
+
 fn equal_sizes(n: usize) -> Vec<f32> {
     vec![1. / n as f32; n]
 }
@@ -653,6 +697,56 @@ mod tests {
                 assert!((x - y).abs() < 1e-5, "{a:?} != {b:?}");
             }
         }
+    }
+
+    #[test]
+    fn presets_lay_out_one_to_six_panes_with_equal_sizes() {
+        assert_eq!(preset_layout(Preset::Grid, &[]), None);
+        assert_eq!(Preset::parse("grid"), Some(Preset::Grid));
+        assert_eq!(Preset::parse("stack"), None);
+        for n in 1..=6usize {
+            let panes: Vec<i64> = (1..=n as i64).map(|i| -i).collect();
+            let columns = preset_layout(Preset::Columns, &panes).unwrap();
+            let rows = preset_layout(Preset::Rows, &panes).unwrap();
+            let grid = preset_layout(Preset::Grid, &panes).unwrap();
+            let k = n as f32;
+            close(
+                &rects(&columns),
+                &(0..n)
+                    .map(|i| [i as f32 / k, 0., 1. / k, 1.])
+                    .collect::<Vec<_>>(),
+            );
+            close(
+                &rects(&rows),
+                &(0..n)
+                    .map(|i| [0., i as f32 / k, 1., 1. / k])
+                    .collect::<Vec<_>>(),
+            );
+            let grid_rows = n.div_ceil(2) as f32;
+            close(
+                &rects(&grid),
+                &(0..n)
+                    .map(|i| {
+                        let (row, col) = ((i / 2) as f32, i % 2);
+                        let alone = n % 2 == 1 && i == n - 1;
+                        let (x, w) = match (n == 1 || alone, col) {
+                            (true, _) => (0., 1.),
+                            (false, 0) => (0., 0.5),
+                            (false, _) => (0.5, 0.5),
+                        };
+                        [x, row / grid_rows, w, 1. / grid_rows]
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            for tree in [&columns, &rows, &grid] {
+                assert_eq!(ids(tree), panes, "reading order is the given order");
+            }
+        }
+        // Two panes in a grid are one row.
+        assert_eq!(
+            preset_layout(Preset::Grid, &[-1, -2]),
+            preset_layout(Preset::Columns, &[-1, -2])
+        );
     }
 
     #[test]

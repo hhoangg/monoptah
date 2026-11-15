@@ -541,6 +541,8 @@ impl TuiSession {
             }
             TerminalEvent::Exited { code, error, tail } => self.exited(code, error, &tail, cx),
             TerminalEvent::Changed => cx.notify(),
+            // Only a Mono's restored terminal has a "Run again" bar.
+            TerminalEvent::RunAgain => {}
         }
     }
 

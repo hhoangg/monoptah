@@ -697,6 +697,7 @@ impl Shell {
                                 let t = terminal.read(cx);
                                 let label: SharedString = t.display_title().to_owned().into();
                                 let agent = t.agent();
+                                let by_mono = t.by_mono;
                                 let description = SharedString::from(format!(
                                     "{} — {}",
                                     t.display_title(),
@@ -794,6 +795,12 @@ impl Shell {
                                                     .truncate()
                                                     .child(label.clone()),
                                             )
+                                            .children(by_mono.then(|| {
+                                                super::mono_terminals::mono_mark(
+                                                    ("terminal-mono-mark", ix),
+                                                    format!("terminal-mono-mark-{ix}"),
+                                                )
+                                            }))
                                             .on_click(cx.listener(move |this, _, window, cx| {
                                                 if std::mem::take(&mut this.dock_skip_click) {
                                                     return;

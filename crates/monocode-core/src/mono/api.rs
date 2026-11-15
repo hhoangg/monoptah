@@ -6,6 +6,8 @@ pub const ACCOUNT_EXISTING_INSTANCE: &str =
     "The account belongs to the instance; it cannot change for an existing one.";
 /// The most bytes of `command` or `text` a terminal call takes.
 pub const TERMINAL_INPUT_MAX: usize = 4096;
+/// The most terminals one `terminals.layout` arranges.
+pub const TERMINAL_LAYOUT_MAX: usize = 6;
 
 /// Reject misspelled fields and ambiguous types before any app mutation.
 pub fn validate(action: &str, input: &Value) -> Result<(), String> {
@@ -35,6 +37,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         "terminals.send"=>"id text key project",
         "terminals.read"=>"id lines project",
         "terminals.stop"|"terminals.close"=>"id project",
+        "terminals.layout"=>"preset ids reveal project",
         "folders.move"=>"sessionId folderId newFolderName project",
         "notes.list"=>"limit offset","notes.read"=>"id","notes.write"=>"id title body tags",
         "artifacts.list"=>"kind limit offset","artifacts.read"=>"id","artifacts.write"=>"id kind title body summary",
@@ -138,6 +141,8 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             "schedule",
             "tags",
             "options",
+            // terminals.layout; checked below.
+            "ids",
             "parentSessionId",
             // sessions.start target; checked by validate_target.
             "target",
@@ -170,6 +175,26 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         return Err("removeWorktree and cloud cannot be combined; choose one per call".into());
     }
     // What a Mono types into a terminal is shown to the user whole, so it stays small.
+    if action == "terminals.layout" {
+        if !matches!(input["preset"].as_str(), Some("columns" | "rows" | "grid")) {
+            return Err("preset must be \"columns\", \"rows\" or \"grid\"".into());
+        }
+        let ids = input["ids"]
+            .as_array()
+            .filter(|ids| ids.iter().all(Value::is_string))
+            .ok_or("ids must be a list of terminal ids")?;
+        if ids.is_empty() || ids.len() > TERMINAL_LAYOUT_MAX {
+            return Err(format!("ids holds 1 to {TERMINAL_LAYOUT_MAX} terminal ids"));
+        }
+        let mut seen = std::collections::HashSet::new();
+        if !ids
+            .iter()
+            .filter_map(Value::as_str)
+            .all(|id| seen.insert(id))
+        {
+            return Err("ids must not repeat a terminal".into());
+        }
+    }
     if action.starts_with("terminals.") {
         for key in ["text", "command"] {
             if input

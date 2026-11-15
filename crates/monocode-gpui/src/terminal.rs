@@ -105,6 +105,8 @@ impl Dimensions for GridSize {
 pub(crate) enum TerminalEvent {
     /// Title, foreground process or running state changed.
     Changed,
+    /// The user pressed "Run again" (see `run_again`); the shell runs the stored command.
+    RunAgain,
     /// A launched program is running. Only `Terminal::launch` emits the rest,
     /// from the event task, so subscribe right after creating the entity.
     Started { at: Instant },
@@ -161,6 +163,13 @@ pub(crate) struct Terminal {
     pub label: Option<String>,
     /// The user allowed Mono to read this terminal's output ("Let Mono read"); runtime only.
     pub(crate) mono_read: bool,
+    /// A Mono opened this terminal (also after a restart); it wears the Mono mark. Runtime only:
+    /// the saved state in `TerminalPane` / `TerminalDock` is what survives.
+    pub(crate) by_mono: bool,
+    /// A command a Mono terminal ran before the app was restarted. It is only offered, as a
+    /// "Run again" bar, and never runs by itself. Cleared once anything runs here or the user
+    /// types.
+    pub(crate) run_again: Option<crate::workspace::SavedRun>,
     /// How the shell ended, once it has (`None` while it runs or when a signal killed it).
     pub(crate) exit_code: Option<i32>,
     /// A command other than the shell holds the terminal.
@@ -637,6 +646,8 @@ impl Terminal {
             title: default_title(&cwd),
             label: None,
             mono_read: false,
+            by_mono: false,
+            run_again: None,
             exit_code: None,
             cwd,
             foreground: None,
@@ -876,6 +887,7 @@ impl Terminal {
     /// Typing returns a scrolled-back view to the prompt.
     fn input(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
         self.user_typed = true;
+        self.run_again = None;
         self.stop_selection();
         {
             let mut term = self.term.lock();
@@ -884,6 +896,55 @@ impl Terminal {
         }
         self.write(bytes);
         cx.notify();
+    }
+    /// The "Run again" bar's button: asks the shell to run the stored command. The shell
+    /// decides how (one function shared with every other run, see `run_mono_input`).
+    fn request_run_again(&mut self, cx: &mut Context<Self>) {
+        if self.run_again.is_some() {
+            cx.emit(TerminalEvent::RunAgain);
+        }
+    }
+    /// The bar over a restored Mono terminal that names what it ran before.
+    fn run_again_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let run = self.run_again.as_ref()?;
+        let command: SharedString = run
+            .text
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+            .into();
+        Some(
+            div()
+                .id("terminal-run-again-bar")
+                .debug_selector(|| "terminal-run-again-bar".into())
+                .absolute()
+                .top_2()
+                .right_2()
+                .max_w(px(480.))
+                .h(px(32.))
+                .pl_3()
+                .pr_1()
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded(px(9.))
+                .border_1()
+                .border_color(content(0.1))
+                .bg(floating_fill())
+                .shadow_md()
+                .text_size(px(12.))
+                .text_color(content(0.6))
+                // The click is the user's answer, not a click on the terminal.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(div().min_w_0().truncate().child(command))
+                .child(
+                    crate::modal::ghost_button("terminal-run-again", "Run again")
+                        .debug_selector(|| "terminal-run-again".into())
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| this.request_run_again(cx))),
+                ),
+        )
     }
     /// Types `command` at the prompt and runs it. The footer names it at
     /// once; the foreground poll corrects the label within a second.
@@ -1251,6 +1312,7 @@ impl Render for Terminal {
             .key_context("Terminal")
             .track_focus(&self.focus)
             .size_full()
+            .relative()
             .cursor(gpui::CursorStyle::IBeam)
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 if this.hover != Some(event.position) {
@@ -1288,6 +1350,7 @@ impl Render for Terminal {
                 terminal: cx.entity(),
                 focused,
             })
+            .children(self.run_again_bar(cx))
             .children(self.editing_menu(cx))
     }
 }

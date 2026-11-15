@@ -417,6 +417,7 @@ pub fn app_activity(action: &str, running: bool) -> (&'static str, &'static str)
         "terminals.read" | "terminals.list" => ("Reading", "Read", "terminals"),
         "terminals.stop" => ("Stopping", "Stopped", "a terminal"),
         "terminals.close" => ("Closing", "Closed", "a terminal"),
+        "terminals.layout" => ("Arranging", "Arranged", "terminals"),
         a if a.starts_with("worktrees.") || a.starts_with("folders.") => {
             ("Organizing", "Organized", "the project")
         }

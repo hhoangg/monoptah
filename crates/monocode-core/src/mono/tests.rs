@@ -604,6 +604,7 @@ fn terminal_actions_are_documented_validated_and_captioned() {
         "terminals.read",
         "terminals.stop",
         "terminals.close",
+        "terminals.layout",
     ] {
         assert!(
             bridge::HELP.contains(&format!("{action} {{")),
@@ -627,13 +628,29 @@ fn terminal_actions_are_documented_validated_and_captioned() {
         ("terminals.read", json!({"id": "t-1", "lines": 50})),
         ("terminals.stop", json!({"id": "t-1"})),
         ("terminals.close", json!({"id": "t-1"})),
+        (
+            "terminals.layout",
+            json!({"preset": "columns", "ids": ["t-1", "t-2"], "reveal": false, "project": "/p"}),
+        ),
     ] {
         assert_eq!(api::validate(action, &input), Ok(()), "{action}");
     }
     assert!(api::validate("terminals.read", &json!({"id": "t-1", "lines": "many"})).is_err());
     assert!(api::validate("terminals.open", &json!({"label": "BE", "reveal": "yes"})).is_err());
     assert!(api::validate("terminals.send", &json!({"id": "t-1", "bogus": 1})).is_err());
-    assert!(api::validate("terminals.layout", &json!({"preset": "grid"})).is_err());
+    assert_eq!(
+        crate::tool::app_activity("terminals.layout", false),
+        ("Arranged", "terminals")
+    );
+    let layout = |input| api::validate("terminals.layout", &input);
+    assert!(layout(json!({"preset": "grid"})).is_err());
+    assert!(layout(json!({"preset": "stack", "ids": ["t-1"]})).is_err());
+    assert!(layout(json!({"preset": "rows", "ids": []})).is_err());
+    assert!(layout(json!({"preset": "rows", "ids": [1]})).is_err());
+    assert!(layout(json!({"preset": "rows", "ids": ["t-1", "t-1"]})).is_err());
+    let seven: Vec<_> = (1..=7).map(|n| format!("t-{n}")).collect();
+    assert!(layout(json!({"preset": "grid", "ids": seven})).is_err());
+    assert!(layout(json!({"preset": "grid", "ids": ["t-1"], "bogus": 1})).is_err());
     // Not an Operator action: only a Mono drives terminals.
     assert!(crate::app_access::validate_operator("terminals.list", &json!({})).is_err());
     let rules = instructions(&Mono::default(), std::path::Path::new("/bin/app"));
