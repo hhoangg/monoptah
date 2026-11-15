@@ -27,6 +27,11 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         "sessions.archive"=>"sessionId project cloud backup",
         "sessions.delete"=>"sessionId project providerFiles removeWorktree cloud",
         "worktrees.create"=>"branch base existing project",
+        "terminals.list"=>"project",
+        "terminals.open"=>"label action command cwd place beside direction reveal project",
+        "terminals.send"=>"id text key project",
+        "terminals.read"=>"id lines project",
+        "terminals.stop"|"terminals.close"=>"id project",
         "folders.move"=>"sessionId folderId newFolderName project",
         "notes.list"=>"limit offset","notes.read"=>"id","notes.write"=>"id title body tags",
         "artifacts.list"=>"kind limit offset","artifacts.read"=>"id","artifacts.write"=>"id kind title body summary",
@@ -88,7 +93,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         {
             return Err(format!("{key} must be true or false"));
         }
-        if ["limit", "offset", "maxChars", "number"].contains(&key.as_str())
+        if ["limit", "offset", "maxChars", "number", "lines"].contains(&key.as_str())
             && value.as_u64().is_none()
         {
             return Err(format!("{key} must be a non-negative integer"));
@@ -121,6 +126,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             "offset",
             "maxChars",
             "number",
+            "lines",
             "id",
             "sessionId",
             "session",

@@ -784,6 +784,20 @@ fn the_question_session_reads_the_app_but_cannot_schedule_work(cx: &mut TestAppC
             "{action}"
         );
     }
+    let refused = call_from(
+        &s,
+        session,
+        "t1",
+        "terminals.open",
+        json!({"label": "X"}),
+        cx,
+    )
+    .try_recv()
+    .unwrap();
+    assert_eq!(
+        refused,
+        Err("A habit run, heartbeat or workflow question cannot use terminals".into())
+    );
     assert!(
         call_from(&s, session, "h2", "habits.list", json!({}), cx)
             .try_recv()

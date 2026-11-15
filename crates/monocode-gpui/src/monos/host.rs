@@ -375,6 +375,11 @@ impl Monos {
         {
             return Err("A habit run cannot schedule more runs".into());
         }
+        // A terminal outlives the turn that started it and can run commands: only the Mono's
+        // own chat drives them, never an unattended or injected context.
+        if call.action.starts_with("terminals.") && (habit_run || question || heartbeat) {
+            return Err("A habit run, heartbeat or workflow question cannot use terminals".into());
+        }
         // A workflow must not start workflows through its own question to the Mono.
         if call.action.starts_with("workflows.") && question {
             return Err("A workflow's question to its Mono cannot use workflows".into());
@@ -428,7 +433,12 @@ impl Monos {
         // A read has nothing to replay, and a day's list is large to keep as a receipt.
         if matches!(
             call.action.as_str(),
-            "today.list" | "today.sources" | "today.statuses" | "today.tags"
+            "today.list"
+                | "today.sources"
+                | "today.statuses"
+                | "today.tags"
+                | "terminals.list"
+                | "terminals.read"
         ) {
             let _ = call.reply.send(result);
             return;
@@ -908,6 +918,7 @@ impl Monos {
             || action.starts_with("folders.")
             || action.starts_with("worktrees.")
             || action.starts_with("cloud.")
+            || action.starts_with("terminals.")
         {
             match mono.project(input.get("project").and_then(Value::as_str)) {
                 Ok(p) => p,
@@ -1482,6 +1493,22 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
                         _=>unreachable!(),
                     };Ok((value,Effect::None))
                 },cx);
+                return;
+            }
+            terminals if terminals.starts_with("terminals.") => {
+                // Run after this update: the shell may read the Monos entity being updated now.
+                let owner = self.owner.clone();
+                let mono = mono.id.clone();
+                cx.spawn(async move |this, cx| {
+                    let result = owner
+                        .update(cx, |owner, cx| {
+                            owner.mono_terminals_call(&mono, &project, &action, &input, cx)
+                        })
+                        .map_err(|_| "The app window is gone".to_owned())
+                        .and_then(|result| result);
+                    let _ = this.update(cx, |this, cx| this.finish_call(call, result, cx));
+                })
+                .detach();
                 return;
             }
             today if today.starts_with("today.") => {

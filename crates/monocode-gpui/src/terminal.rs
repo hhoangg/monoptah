@@ -156,6 +156,13 @@ pub(crate) struct Terminal {
     pub cwd: String,
     /// The tab label: the foreground command, else the directory.
     pub title: String,
+    /// A name a Mono gave the terminal. It takes precedence over `title` wherever the title is
+    /// shown (see `display_title`); runtime only.
+    pub label: Option<String>,
+    /// The user allowed Mono to read this terminal's output ("Let Mono read"); runtime only.
+    pub(crate) mono_read: bool,
+    /// How the shell ended, once it has (`None` while it runs or when a signal killed it).
+    pub(crate) exit_code: Option<i32>,
     /// A command other than the shell holds the terminal.
     pub foreground: Option<String>,
     pub exited: bool,
@@ -439,6 +446,45 @@ fn detached(size: GridSize) -> Spawned {
     }
 }
 
+/// The keys a Mono may press in a terminal (`terminals.send`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MonoKey {
+    CtrlC,
+    Enter,
+    Up,
+    Down,
+    Q,
+    Tab,
+    Esc,
+}
+
+impl MonoKey {
+    pub(crate) const NAMES: &'static str = "ctrl-c, enter, up, down, q, tab, esc";
+    pub(crate) fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "ctrl-c" => Self::CtrlC,
+            "enter" => Self::Enter,
+            "up" => Self::Up,
+            "down" => Self::Down,
+            "q" => Self::Q,
+            "tab" => Self::Tab,
+            "esc" => Self::Esc,
+            _ => return None,
+        })
+    }
+    pub(crate) fn bytes(self) -> &'static [u8] {
+        match self {
+            Self::CtrlC => b"\x03",
+            Self::Enter => b"\r",
+            Self::Up => b"\x1b[A",
+            Self::Down => b"\x1b[B",
+            Self::Q => b"q",
+            Self::Tab => b"\t",
+            Self::Esc => b"\x1b",
+        }
+    }
+}
+
 /// What `Terminal::launch` was asked to run, kept so tests can assert on it.
 #[cfg(test)]
 pub(crate) struct LaunchSpec {
@@ -589,6 +635,9 @@ impl Terminal {
             sender,
             focus: cx.focus_handle(),
             title: default_title(&cwd),
+            label: None,
+            mono_read: false,
+            exit_code: None,
             cwd,
             foreground: None,
             exited: false,
@@ -677,6 +726,7 @@ impl Terminal {
             // tail and the note wait for it.
             self.child_code = Some(code);
         } else {
+            self.exit_code = code;
             write_note(&self.term, &Self::exit_note(code));
             self.finish(cx);
         }
@@ -711,6 +761,35 @@ impl Terminal {
     /// The keyboard is here (tracked from the first draw).
     pub(crate) fn has_focus(&self) -> bool {
         self.focused
+    }
+    /// The tab and pane title: a Mono's label when it set one, else the foreground command or
+    /// directory.
+    pub(crate) fn display_title(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.title)
+    }
+    /// A shell the app opened for the user or a Mono, not a launched program (an agent
+    /// session, a login or a cloud shell).
+    pub(crate) fn is_plain_shell(&self) -> bool {
+        !self.launched
+    }
+    /// The last `lines` lines of the grid as plain text (history included), and whether older
+    /// lines were left out.
+    pub(crate) fn recent_text(&self, lines: usize) -> (String, bool) {
+        let text = grid_text(&self.term.lock());
+        let all: Vec<&str> = text.split('\n').collect();
+        let skip = all.len().saturating_sub(lines);
+        (all[skip..].join("\n"), skip > 0)
+    }
+    /// Presses one key as a Mono asked. It is not typing by the user, so `user_typed` stays.
+    pub(crate) fn send_key(&mut self, key: MonoKey, cx: &mut Context<Self>) {
+        self.term.lock().scroll_display(Scroll::Bottom);
+        self.write(key.bytes());
+        cx.notify();
+    }
+    /// Every byte `write` was asked to send, since a test PTY has no reader.
+    #[cfg(test)]
+    pub(crate) fn sent_bytes(&self) -> Vec<u8> {
+        self.sent.borrow().clone()
     }
     /// The grid as plain text (history included), last `TAIL_CHARS` characters.
     #[cfg(test)]
@@ -3071,5 +3150,40 @@ mod tests {
             }
         }
         assert!(exited);
+    }
+
+    #[test]
+    fn mono_keys_are_the_documented_bytes_and_nothing_else() {
+        for (name, bytes) in [
+            ("ctrl-c", &b"\x03"[..]),
+            ("enter", b"\r"),
+            ("up", b"\x1b[A"),
+            ("down", b"\x1b[B"),
+            ("q", b"q"),
+            ("tab", b"\t"),
+            ("esc", b"\x1b"),
+        ] {
+            assert_eq!(MonoKey::parse(name).unwrap().bytes(), bytes, "{name}");
+        }
+        for bad in ["ctrl-d", "Enter", "", "left", "ctrl-z"] {
+            assert!(MonoKey::parse(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[gpui::test]
+    fn a_label_wins_over_the_title_and_recent_text_keeps_the_tail(cx: &mut gpui::TestAppContext) {
+        let terminal = cx.new(|cx| Terminal::new("/tmp".into(), cx));
+        terminal.update(cx, |t, cx| {
+            assert!(t.is_plain_shell());
+            assert_eq!(t.display_title(), t.title);
+            t.label = Some("BE".into());
+            assert_eq!(t.display_title(), "BE");
+            t.fake_output("one\r\ntwo\r\nthree\r\n", cx);
+            assert_eq!(t.recent_text(2), ("two\nthree".to_owned(), true));
+            assert_eq!(t.recent_text(50), ("one\ntwo\nthree".to_owned(), false));
+            t.send_key(MonoKey::Up, cx);
+            assert_eq!(t.sent_bytes(), b"\x1b[A");
+            assert!(!t.user_typed, "a Mono's key is not the user typing");
+        });
     }
 }

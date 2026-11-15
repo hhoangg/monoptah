@@ -340,7 +340,11 @@ impl Shell {
             self.toggle_running_terminal(ix, window, cx);
         }
     }
-    pub(super) fn terminal_tab_menu(&self, ix: usize) -> Vec<MenuItem> {
+    pub(super) fn terminal_tab_menu(&self, ix: usize, cx: &App) -> Vec<MenuItem> {
+        let readable = self
+            .live_terminals()
+            .get(ix)
+            .is_some_and(|t| t.read(cx).mono_read);
         let count = self
             .workspace
             .docks
@@ -351,6 +355,8 @@ impl Shell {
             MenuAction::new("close-others", "Close Others")
                 .disabled(count < 2 || ix >= count)
                 .into(),
+            MenuItem::Separator,
+            Self::mono_read_item(readable),
         ]
     }
     pub(super) fn run_terminal_tab_menu(
@@ -363,6 +369,7 @@ impl Shell {
         match action {
             "close" => self.close_terminal(ix, window, cx),
             "close-others" => self.close_other_terminals(ix, window, cx),
+            "mono-read" => self.toggle_mono_read_dock(ix, cx),
             _ => {}
         }
     }
@@ -380,7 +387,7 @@ impl Shell {
             .filter_map(|(_, terminal)| {
                 let t = terminal.read(cx);
                 let process = t.foreground.as_deref()?.trim().to_owned();
-                (!process.is_empty()).then(|| (t.title.clone(), process))
+                (!process.is_empty()).then(|| (t.display_title().to_owned(), process))
             })
             .collect();
         let message = match running.as_slice() {
@@ -644,7 +651,12 @@ impl Shell {
         let animate = self.workspace.preferences.tab_animations && !reduced && dragged.is_none();
         let keyed = live
             .iter()
-            .map(|t| (t.entity_id(), SharedString::from(t.read(cx).title.clone())))
+            .map(|t| {
+                (
+                    t.entity_id(),
+                    SharedString::from(t.read(cx).display_title().to_owned()),
+                )
+            })
             .collect();
         let (slots, opening) = self
             .dock_tab_motion
@@ -683,10 +695,13 @@ impl Shell {
                             .enumerate()
                             .map(|(ix, terminal)| {
                                 let t = terminal.read(cx);
-                                let label: SharedString = t.title.clone().into();
+                                let label: SharedString = t.display_title().to_owned().into();
                                 let agent = t.agent();
-                                let description =
-                                    SharedString::from(format!("{} — {}", t.title, t.cwd));
+                                let description = SharedString::from(format!(
+                                    "{} — {}",
+                                    t.display_title(),
+                                    t.cwd
+                                ));
                                 let active = ix == dock.active;
                                 let held = dragged == Some(ix);
                                 let hovered = self.dock_hover == Some(ix) && dragged.is_none();
@@ -1126,7 +1141,7 @@ impl Shell {
         match target {
             MenuTarget::TerminalTab(ix) => Some((
                 "File tab actions".into(),
-                self.terminal_tab_menu(*ix),
+                self.terminal_tab_menu(*ix, cx),
                 160.,
                 MenuStyle::Explorer,
             )),

@@ -225,10 +225,35 @@ impl DockSide {
 }
 /// A terminal living in the pane tree. Shells are not restored; the pane
 /// reopens a fresh shell in the same directory, as a dock tab does.
+///
+/// `owner` is a SESSION id and stays that for every terminal pane, including one a Mono opened
+/// (`terminals.open`). The owner lends the pane its project and worktree scope
+/// (`Workspace::session_for_pane`), restore drops a pane whose owner session is unknown, and a
+/// session with terminal panes cannot be deleted. A Mono's own chat is a hidden session outside
+/// the project, so it is never the owner: a Mono pane borrows a real session of the Mono's
+/// project (`Shell::mono_pane_owner`), and falls back to the dock when the project has none.
+/// `mono` and `label` are optional and `serde(default)`, so state saved before them still loads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TerminalPane {
     pub owner: i64,
     pub cwd: String,
+    /// The Mono that opened this terminal, if one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mono: Option<String>,
+    /// The name a Mono gave it; reapplied to the shell reopened after a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+impl TerminalPane {
+    pub fn new(owner: i64, cwd: String) -> Self {
+        Self {
+            owner,
+            cwd,
+            mono: None,
+            label: None,
+        }
+    }
 }
 
 /// A project's dock: its place, size and the terminals it holds. Shells are

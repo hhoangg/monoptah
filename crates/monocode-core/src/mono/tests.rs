@@ -593,3 +593,50 @@ fn rules_live_in_instructions_and_the_context_only_repeats_them_when_not_in_syst
     assert!(full.contains("Workflows are graphs of steps"));
     assert!(full.contains("completionDelivery"));
 }
+
+#[test]
+fn terminal_actions_are_documented_validated_and_captioned() {
+    use serde_json::json;
+    for action in [
+        "terminals.list",
+        "terminals.open",
+        "terminals.send",
+        "terminals.read",
+        "terminals.stop",
+        "terminals.close",
+    ] {
+        assert!(
+            bridge::HELP.contains(&format!("{action} {{")),
+            "help lacks {action}"
+        );
+        assert!(
+            crate::tool::app_activity(action, false).1 != "the app",
+            "{action} has no caption"
+        );
+    }
+    assert!(
+        bridge::HELP.contains("needs the user's approval")
+            || bridge::HELP.contains("will need the user's approval")
+    );
+    for (action, input) in [
+        ("terminals.list", json!({"project": "/p"})),
+        (
+            "terminals.open",
+            json!({"label": "BE", "action": "a1", "place": "split", "beside": "t-1", "direction": "down", "reveal": true, "cwd": "src", "project": "/p"}),
+        ),
+        ("terminals.send", json!({"id": "t-1", "key": "ctrl-c"})),
+        ("terminals.read", json!({"id": "t-1", "lines": 50})),
+        ("terminals.stop", json!({"id": "t-1"})),
+        ("terminals.close", json!({"id": "t-1"})),
+    ] {
+        assert_eq!(api::validate(action, &input), Ok(()), "{action}");
+    }
+    assert!(api::validate("terminals.read", &json!({"id": "t-1", "lines": "many"})).is_err());
+    assert!(api::validate("terminals.open", &json!({"label": "BE", "reveal": "yes"})).is_err());
+    assert!(api::validate("terminals.send", &json!({"id": "t-1", "bogus": 1})).is_err());
+    assert!(api::validate("terminals.layout", &json!({"preset": "grid"})).is_err());
+    // Not an Operator action: only a Mono drives terminals.
+    assert!(crate::app_access::validate_operator("terminals.list", &json!({})).is_err());
+    let rules = instructions(&Mono::default(), std::path::Path::new("/bin/app"));
+    assert!(rules.contains("terminals.open") && rules.contains("agent CLI"));
+}

@@ -63,6 +63,7 @@ mod project_rail;
 mod project_removal;
 pub(crate) use project_removal::FilesOutcome;
 mod cloud_workspaces;
+mod mono_terminals;
 mod project_cloud;
 mod project_settings;
 mod provider_prompt;
@@ -995,6 +996,8 @@ pub(crate) struct Shell {
     terminals: HashMap<String, Vec<Entity<Terminal>>>,
     /// Live shells of `workspace.terminal_panes`, spawned when first shown.
     terminal_pane_views: HashMap<i64, Entity<Terminal>>,
+    /// Ids of the terminals a Mono may drive (`terminals.*`), over the dock and the panes.
+    mono_registry: mono_terminals::Registry,
     /// A project's dock sliding open (toward 1) or shut (toward 0).
     dock_slide: Option<(String, PaneSlide)>,
     dock_resize: Option<(f32, f32)>,
@@ -1469,6 +1472,7 @@ impl Shell {
             sidebar_fitted_room: None,
             terminals: HashMap::new(),
             terminal_pane_views: HashMap::new(),
+            mono_registry: Default::default(),
             dock_slide: None,
             dock_resize: None,
             dock_hover: None,
@@ -6072,6 +6076,22 @@ impl Shell {
                         .disabled(count < 2 && !closable)
                         .into(),
                 ];
+                if let TitleTab::Session(id) = &tab {
+                    let focus = self.workspace.tab_focus(*id);
+                    if let Some(view) = self
+                        .terminal_pane_views
+                        .get(&focus)
+                        .filter(|_| self.workspace.terminal_panes.contains_key(&focus))
+                    {
+                        items.splice(
+                            0..0,
+                            [
+                                Self::mono_read_item(view.read(cx).mono_read),
+                                MenuItem::Separator,
+                            ],
+                        );
+                    }
+                }
                 // Closing a tab keeps its session; archive also hides it from
                 // the active history while preserving everything on disk.
                 if let Some(id) = tab.session().filter(|id| {
@@ -6464,6 +6484,10 @@ impl Shell {
     ) {
         if let MenuTarget::Tab(id) = target {
             match action {
+                "mono-read" => {
+                    let focus = self.workspace.tab_focus(id);
+                    return self.toggle_mono_read_pane(focus, cx);
+                }
                 "archive" => return self.toggle_archive(id, cx),
                 "delete" => return self.confirm_delete_session(id, window, cx),
                 _ => {}
