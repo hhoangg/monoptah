@@ -267,19 +267,17 @@ impl Plan {
     /// The login shell with no command history: a Mono must not recall (and so re-run, or read)
     /// what the user typed in their own shells. Best effort: a startup file that sets
     /// `HISTFILE` itself wins, which is why `terminals.send` also refuses the keys that
-    /// recall a line while the shell holds the terminal.
+    /// recall a line while the shell holds the terminal: history-off is best effort and
+    /// those key rules are the real defense.
+    ///
+    /// Only `HISTFILE` is set. `HISTFILESIZE=0` or `SAVEHIST=0` would make bash or zsh
+    /// truncate a `HISTFILE` that the user's startup file set, destroying their history.
     fn shell_private() -> Self {
         Self::private(Self::shell())
     }
     fn private(mut plan: Self) -> Self {
-        for (key, value) in [
-            ("HISTFILE", "/dev/null"),
-            ("SAVEHIST", "0"),
-            ("HISTSIZE", "0"),
-            ("HISTFILESIZE", "0"),
-        ] {
-            plan.env.push((key.to_owned(), value.to_owned()));
-        }
+        plan.env
+            .push(("HISTFILE".to_owned(), "/dev/null".to_owned()));
         let stem = Path::new(&plan.program)
             .file_stem()
             .and_then(|n| n.to_str())
@@ -502,7 +500,62 @@ pub(crate) enum Front {
     Unknown,
 }
 
+/// Whether a foreground program name is itself a line editor with history: a shell, a remote
+/// or multiplexed shell, a privilege shell, or an interpreter REPL. Up, tab and enter in front
+/// of one recall and run lines nobody was shown, so the key rules treat it like a shell.
+/// Matches the basename, ignoring a login `-` prefix, `.exe` and version suffixes
+/// (`python3.12`, `ksh93`).
+pub(crate) fn shell_like(name: &str) -> bool {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let base = base.trim_start_matches('-').to_ascii_lowercase();
+    let base = base.strip_suffix(".exe").unwrap_or(&base);
+    let base = base.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    matches!(
+        base,
+        "ssh"
+            | "mosh"
+            | "mosh-client"
+            | "tmux"
+            | "screen"
+            | "sudo"
+            | "su"
+            | "bash"
+            | "zsh"
+            | "fish"
+            | "sh"
+            | "dash"
+            | "ksh"
+            | "tcsh"
+            | "csh"
+            | "nu"
+            | "pwsh"
+            | "powershell"
+            | "cmd"
+            | "python"
+            | "node"
+            | "nodejs"
+            | "irb"
+            | "psql"
+            | "mysql"
+            | "sqlite"
+            | "redis-cli"
+            | "ipython"
+    )
+}
+
 impl Front {
+    /// A program that holds the terminal and is not a line editor with history (see
+    /// `shell_like`): the only front where esc, up, down and tab are free.
+    pub(crate) fn is_plain_program(&self) -> bool {
+        matches!(self, Self::Program(name) if !shell_like(name))
+    }
+    /// The supported agent CLI this front is, if any.
+    pub(crate) fn agent(&self) -> Option<&'static str> {
+        match self {
+            Self::Program(label) => agent_cli(label),
+            _ => None,
+        }
+    }
     /// The name the approval dialog shows.
     pub(crate) fn name(&self) -> &str {
         match self {
@@ -894,13 +947,6 @@ impl Terminal {
         match &self.foreground {
             Some(label) if !is_shell_name(label) => Front::Program(label.clone()),
             _ => Front::Shell("zsh".into()),
-        }
-    }
-    /// The supported agent CLI holding the terminal now (not as of the last poll).
-    pub(crate) fn live_agent(&self) -> Option<&'static str> {
-        match self.live_front() {
-            Front::Program(label) => agent_cli(&label),
-            _ => None,
         }
     }
     /// The directory of the process that gets typed input, when the system tells it cheaply.
@@ -3541,17 +3587,68 @@ mod tests {
     }
 
     #[test]
+    fn shell_like_programs_are_told_by_basename_and_version() {
+        for name in [
+            "ssh",
+            "-zsh",
+            "/bin/bash",
+            "python3.12",
+            "python3",
+            "ksh93",
+            "tmux",
+            "sudo",
+            "su",
+            "mosh",
+            "screen",
+            "fish",
+            "dash",
+            "tcsh",
+            "nu",
+            "pwsh",
+            "powershell",
+            "cmd.exe",
+            "node",
+            "irb",
+            "psql",
+            "mysql",
+            "sqlite3",
+            "redis-cli",
+            "ipython",
+            "ipython3",
+        ] {
+            assert!(shell_like(name), "{name}");
+        }
+        for name in [
+            "vim",
+            "less",
+            "top",
+            "htop",
+            "vite",
+            "manage.py",
+            "sleep",
+            "claude",
+            "cargo",
+        ] {
+            assert!(!shell_like(name), "{name}");
+        }
+        assert!(Front::Program("vim".into()).is_plain_program());
+        assert!(!Front::Program("ssh".into()).is_plain_program());
+        assert!(!Front::Shell("zsh".into()).is_plain_program());
+        assert!(!Front::Unknown.is_plain_program());
+    }
+
+    #[test]
     fn a_mono_shell_is_started_without_command_history() {
         let zsh = Plan::private(plain("/bin/zsh", &["-l"]));
-        for (key, value) in [
-            ("HISTFILE", "/dev/null"),
-            ("SAVEHIST", "0"),
-            ("HISTSIZE", "0"),
-            ("HISTFILESIZE", "0"),
-        ] {
+        assert!(
+            zsh.env
+                .contains(&("HISTFILE".to_owned(), "/dev/null".to_owned()))
+        );
+        // These would truncate a history file the user's own startup file chose.
+        for key in ["SAVEHIST", "HISTSIZE", "HISTFILESIZE"] {
             assert!(
-                zsh.env.contains(&(key.to_owned(), value.to_owned())),
-                "{key}"
+                zsh.env.iter().all(|(k, _)| k != key),
+                "{key} must be absent"
             );
         }
         assert_eq!(zsh.args, ["-l"]);

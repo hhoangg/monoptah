@@ -379,14 +379,33 @@ impl Monos {
             self.save(cx);
         }
     }
-    /// Whether the chat `session` of `mono` is no longer working on a turn: it was stopped or
-    /// finished. A call that was waiting for the user inside that turn has no one to answer.
-    /// A chat that is not loaded is not known to be stopped.
-    pub(crate) fn session_stopped(&self, session: i64, mono: &str, cx: &App) -> bool {
-        self.chats
-            .get(mono)
-            .map(|chat| chat.read(cx))
-            .is_some_and(|chat| chat.summary.id == session && !chat.busy)
+    /// The loaded chat of `mono` as a call sees it: its session and the identity of the turn
+    /// now running (it changes whenever a turn starts). `None` when no chat is loaded.
+    pub(crate) fn chat_turn(&self, mono: &str, cx: &App) -> Option<(i64, u64)> {
+        let chat = self.chats.get(mono)?.read(cx);
+        Some((chat.summary.id, chat.submission_generation))
+    }
+    /// Whether the turn a call was made in is over: the chat `session` of `mono` is no longer
+    /// working on it, it was stopped or finished, a new turn started since the call (`turn` is
+    /// what `chat_turn` said when the call arrived), or a different chat replaced it. A call
+    /// that was waiting for the user inside that turn has no one to answer. A chat that is not
+    /// loaded is not known to be stopped.
+    pub(crate) fn session_stopped(
+        &self,
+        session: i64,
+        mono: &str,
+        turn: Option<(i64, u64)>,
+        cx: &App,
+    ) -> bool {
+        let Some(chat) = self.chats.get(mono).map(|chat| chat.read(cx)) else {
+            return false;
+        };
+        match turn {
+            Some((id, generation)) => {
+                chat.summary.id != id || chat.submission_generation != generation || !chat.busy
+            }
+            None => chat.summary.id == session && !chat.busy,
+        }
     }
     /// Makes `view` the loaded chat of `mono`, as opening it does.
     #[cfg(test)]

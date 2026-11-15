@@ -15,8 +15,9 @@
 //! showed (`Seen`: the program in front, the folder, bracketed paste) must still be true.
 //! A saved Project Action never asks: the user wrote it.
 //!
-//! Keys: ctrl-c, q and esc are always free. Up, down and tab need a program in front (they
-//! recall history and complete at a shell prompt), and enter needs one too, unless the same
+//! Keys: ctrl-c and q are always free. Up, down, tab and esc need a plain program in front
+//! (they recall history and complete at a shell prompt, and a shell-like program such as ssh
+//! or python counts as a shell), and enter needs one too, unless the same
 //! call carries approved text for the shell (see `key_refusal`).
 use super::*;
 use crate::{
@@ -183,6 +184,14 @@ fn inside(root: &str, path: &str) -> bool {
     path == root || path.starts_with(&format!("{}/", root.trim_end_matches('/')))
 }
 
+/// A folder's identity for comparing two spellings of it: symlinks resolved when it exists.
+fn real_key(path: &str) -> String {
+    let real = std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_owned());
+    monocode_core::files::path_key(&real)
+}
+
 fn project_worktrees(project: &str) -> Vec<String> {
     monocode_core::git::worktrees(Path::new(project))
         .map(|trees| trees.into_iter().map(|t| t.path).collect())
@@ -198,22 +207,25 @@ fn live_cwd_inside(project: &str, cwd: &str) -> bool {
 const CHANGED: &str = "The terminal changed after the dialog was shown (its program, folder or paste mode), so nothing was written. Ask again";
 const OUTSIDE: &str = "The terminal's folder is outside the project and its worktrees, so Mono does not type into it. Close it, or open a new terminal with terminals.open";
 
-/// Why `key` may not be pressed now, if it may not. Ctrl-C, q and Esc are always free. Up,
-/// down and tab recall history and complete lines at a shell prompt, where they would lead to
-/// a command nobody was shown, so they need a program in front. Enter at a shell prompt runs
-/// whatever line is there, so it only goes with text the user approved in the same call (the
-/// dialog then says "presses enter"); it is free in front of a program.
+/// Why `key` may not be pressed now, if it may not. Ctrl-C and q are always free. Up, down,
+/// tab and esc recall history, complete lines and start meta-key recalls (esc then `.`) at a
+/// shell prompt, where they would lead to a command nobody was shown, so they need a plain
+/// program in front: a shell, a remote or multiplexed shell (ssh, tmux, sudo) or a REPL with
+/// history (python, psql) counts as a shell here (`Front::is_plain_program`). Enter at a
+/// shell prompt runs whatever line is there, so it only goes with text the user approved in
+/// the same call (the dialog then says "presses enter"); it is free in front of a plain
+/// program.
 fn key_refusal(key: MonoKey, front: &Front, with_text: bool) -> Option<&'static str> {
-    let program = matches!(front, Front::Program(_));
+    let program = front.is_plain_program();
     match key {
-        MonoKey::CtrlC | MonoKey::Q | MonoKey::Esc => None,
+        MonoKey::CtrlC | MonoKey::Q => None,
         MonoKey::Enter if program || with_text => None,
         MonoKey::Enter => Some(
             "A shell is at its prompt: enter only goes with text the user approves in the same call (terminals.send text and key enter)",
         ),
-        MonoKey::Up | MonoKey::Down | MonoKey::Tab if program => None,
-        MonoKey::Up | MonoKey::Down | MonoKey::Tab => Some(
-            "up, down and tab are refused while the shell itself holds the terminal (they recall history and complete lines); use them for a program that is running",
+        MonoKey::Up | MonoKey::Down | MonoKey::Tab | MonoKey::Esc if program => None,
+        MonoKey::Up | MonoKey::Down | MonoKey::Tab | MonoKey::Esc => Some(
+            "up, down, tab and esc are refused while a shell (or a program that reads lines with history, like ssh or python) holds the terminal (they recall history and complete lines); use them for a program that is running",
         ),
     }
 }
@@ -447,7 +459,7 @@ impl Shell {
                         .unwrap_or_default()
                 })?;
                 if let Some(id) = input.get("beside").and_then(Value::as_str) {
-                    self.find_mono_terminal(mono, project, id)?;
+                    self.find_beside(mono, project, id)?;
                 }
                 Ok(())
             }
@@ -577,6 +589,14 @@ impl Shell {
             );
         }
         Ok(found)
+    }
+
+    /// The terminal `beside` names: one of this Mono's own. A user's terminal pane may sit in
+    /// the user's chat tab, and a Mono never splits that.
+    fn find_beside(&self, mono: &str, project: &str, id: &str) -> Result<Found, String> {
+        self.find_own_terminal(mono, project, id).map_err(|_| {
+            "beside must be a terminal this Mono opened (see terminals.list); the user's terminals are never split".to_owned()
+        })
     }
 
     fn mono_list_terminals(&mut self, mono: &str, project: &str, cx: &App) -> Value {
@@ -889,14 +909,10 @@ impl Shell {
             Some("down") => Edge::Bottom,
             Some(_) => return Err("direction must be \"right\" or \"down\"".into()),
         };
-        // Visible by default only where the user is looking.
-        let reveal = input.get("reveal").and_then(Value::as_bool).unwrap_or(
-            monocode_core::files::path_key(project)
-                == monocode_core::files::path_key(&self.workspace.project),
-        );
+        let (reveal, switch) = self.reveal_mode(project, input);
         let beside = match input.get("beside").and_then(Value::as_str) {
             None => None,
-            Some(id) => Some(self.find_mono_terminal(mono, project, id)?),
+            Some(id) => Some(self.find_beside(mono, project, id)?),
         };
         let run = match (&action, &command) {
             (Some(action), _) => Some(SavedRun {
@@ -915,19 +931,34 @@ impl Shell {
         // is the Mono's, stands at its shell prompt right now (not as of the last poll) and is
         // in the folder asked for (the project's own when none was). Where it stands is asked
         // of the system when it can tell, else it is where it started.
+        let wanted = real_key(&cwd);
         let reusable = self.mono_registry.entries.iter().find_map(|entry| {
+            // The cheap tests first: the system is asked about a terminal only when it is this
+            // Mono's, in this project, with this label.
+            if entry.origin != Origin::Mono
+                || entry.mono.as_deref() != Some(mono)
+                || monocode_core::files::path_key(&entry.project)
+                    != monocode_core::files::path_key(project)
+            {
+                return None;
+            }
             let terminal = entry.terminal.upgrade()?;
             let t = terminal.read(cx);
+            if t.label.as_deref() != Some(label.as_str()) || t.exited {
+                return None;
+            }
             let seen = Seen::of(t);
+            // When the system cannot tell who holds it, the last poll decides whether this is
+            // the same idle terminal (else every call would open a duplicate). Writing still
+            // treats `Unknown` as not a shell.
+            let at_prompt = match &seen.front {
+                Front::Shell(_) => true,
+                Front::Unknown => t.foreground.is_none(),
+                Front::Program(_) => false,
+            };
             let there = seen.cwd.clone().unwrap_or_else(|| t.cwd.clone());
-            let same = entry.origin == Origin::Mono
-                && entry.mono.as_deref() == Some(mono)
-                && monocode_core::files::path_key(&entry.project)
-                    == monocode_core::files::path_key(project)
-                && t.label.as_deref() == Some(label.as_str())
-                && matches!(seen.front, Front::Shell(_))
-                && !t.exited
-                && monocode_core::files::path_key(&there) == monocode_core::files::path_key(&cwd)
+            let same = at_prompt
+                && real_key(&there) == wanted
                 && seen
                     .cwd
                     .as_deref()
@@ -981,7 +1012,7 @@ impl Shell {
             if let Some(run) = run.clone() {
                 self.run_mono_input(&terminal, run, cx);
             }
-            let revealed = !reveal || self.reveal_mono_terminal(project, spot, cx);
+            let revealed = !reveal || self.reveal_mono_terminal(project, spot, switch, cx);
             let mut done = json!({"id": id, "reused": true, "place": self.place_name(spot)});
             if !revealed {
                 done["revealed"] = json!(false);
@@ -997,15 +1028,17 @@ impl Shell {
         let mut opened = None;
         if split {
             let target = self.mono_split_target(mono, project, beside.as_ref())?;
-            opened =
-                self.open_mono_terminal_pane(mono, project, &label, &cwd, target, edge, reveal, cx);
+            opened = self.open_mono_terminal_pane(
+                mono, project, &label, &cwd, target, edge, reveal, switch, cx,
+            );
         } else if let Some(beside) = &beside
             && matches!(beside.spot, Spot::Pane(_))
         {
             // Beside a pane means a pane, whatever the user's default says.
             let target = self.mono_split_target(mono, project, Some(beside))?;
-            opened =
-                self.open_mono_terminal_pane(mono, project, &label, &cwd, target, edge, reveal, cx);
+            opened = self.open_mono_terminal_pane(
+                mono, project, &label, &cwd, target, edge, reveal, switch, cx,
+            );
         }
         let (terminal, spot) = match opened {
             Some(opened) => opened,
@@ -1015,13 +1048,23 @@ impl Shell {
         if let Some(run) = run {
             self.run_mono_input(&terminal, run, cx);
         }
-        let revealed = !reveal || self.reveal_mono_terminal(project, spot, cx);
+        let revealed = !reveal || self.reveal_mono_terminal(project, spot, switch, cx);
         cx.notify();
         let mut done = json!({"id": id, "reused": false, "place": self.place_name(spot)});
         if !revealed {
             done["revealed"] = json!(false);
         }
         Ok(Step::Done(done))
+    }
+
+    /// How a call's `reveal` reads, as `(reveal, switch)`. Omitted, it shows the terminal only
+    /// where the user is looking and only without navigating: the tab it is in must already
+    /// be the visible one. Only an explicit `true` may select another title tab (`switch`).
+    fn reveal_mode(&self, project: &str, input: &Value) -> (bool, bool) {
+        let explicit = input.get("reveal").and_then(Value::as_bool);
+        let in_view = monocode_core::files::path_key(project)
+            == monocode_core::files::path_key(&self.workspace.project);
+        (explicit.unwrap_or(in_view), explicit == Some(true))
     }
 
     /// The pane a new split terminal goes beside: `beside`, else the Mono's Logs tab of the
@@ -1067,6 +1110,7 @@ impl Shell {
         target: Option<i64>,
         edge: Edge,
         reveal: bool,
+        switch: bool,
         cx: &mut Context<Self>,
     ) -> Option<(Entity<Terminal>, Spot)> {
         let owner = self.mono_pane_owner(project, None)?;
@@ -1094,6 +1138,13 @@ impl Shell {
         self.workspace.terminal_panes.insert(pane, state);
         self.terminal_pane_views.insert(pane, terminal.clone());
         let previous = self.workspace.active;
+        // The new pane takes the view only where nothing is left behind: a visible tab, or an
+        // explicit `reveal: true`. A tab of its own just joins the strip.
+        let joins_visible = target.is_some_and(|t| {
+            self.workspace.tab_of(t).is_some()
+                && self.workspace.tab_of(t) == self.workspace.active_tab()
+        });
+        let activate = reveal && (switch || joins_visible);
         match target.filter(|t| self.workspace.tab_of(*t).is_some()) {
             Some(target) => {
                 let animate = self.workspace.tab_of(target) == self.workspace.active_tab();
@@ -1111,7 +1162,7 @@ impl Shell {
             }
         }
         // The user's pane stays the active one: opening is not navigating.
-        if !reveal {
+        if !activate {
             self.workspace.active = previous;
             if let Some(previous) = previous
                 && let Some(tab) = self.workspace.tab_of(previous)
@@ -1215,7 +1266,17 @@ impl Shell {
     /// user is looking: another project's dock or tabs are not in view.
     /// Returns whether it is shown: not for another project, nor for a dock terminal while the
     /// terminal lives in the right panel (opening the panel takes a window and the keyboard).
-    fn reveal_mono_terminal(&mut self, project: &str, spot: Spot, cx: &mut Context<Self>) -> bool {
+    ///
+    /// A pane in a tab that is not the visible one is shown only when `switch` (an explicit
+    /// `reveal: true`) allows selecting that tab; the keyboard then goes to the shell root,
+    /// because what had it may be hidden now.
+    fn reveal_mono_terminal(
+        &mut self,
+        project: &str,
+        spot: Spot,
+        switch: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if monocode_core::files::path_key(project)
             != monocode_core::files::path_key(&self.workspace.project)
         {
@@ -1241,7 +1302,15 @@ impl Shell {
                 !in_panel
             }
             Spot::Pane(pane) => {
+                let tab = self.workspace.tab_of(pane);
+                let from = self.workspace.active_tab();
+                if !switch && (tab.is_none() || tab != from) {
+                    return false;
+                }
                 self.reveal_terminal_pane(pane, cx);
+                if self.workspace.active_tab() != from {
+                    self.mono_approvals.switched = true;
+                }
                 true
             }
         }
@@ -1286,10 +1355,7 @@ impl Shell {
         {
             return Err("The project has no session to hold terminal panes".into());
         }
-        let reveal = input.get("reveal").and_then(Value::as_bool).unwrap_or(
-            monocode_core::files::path_key(project)
-                == monocode_core::files::path_key(&self.workspace.project),
-        );
+        let (reveal, switch) = self.reveal_mode(project, input);
         let title = logs_title(project);
         let mut panes = Vec::new();
         for terminal in &terminals {
@@ -1328,7 +1394,8 @@ impl Shell {
         self.pane_motion = None;
         self.history
             .prune(&self.workspace.open_sessions(), self.workspace.active);
-        let revealed = !reveal || self.reveal_mono_terminal(project, Spot::Pane(panes[0]), cx);
+        let revealed =
+            !reveal || self.reveal_mono_terminal(project, Spot::Pane(panes[0]), switch, cx);
         self.fit_sidebar(cx);
         self.persist(cx);
         cx.notify();
@@ -1371,10 +1438,12 @@ impl Shell {
             if t.exited {
                 return Err("The terminal has exited".into());
             }
-            if t.live_agent().is_some() {
+            // One probe: the front says both who holds the terminal and whether it is an agent.
+            let seen = Seen::of(t);
+            if seen.front.agent().is_some() {
                 return Err("This terminal runs an agent CLI; Mono never types into those".into());
             }
-            (t.display_title().to_owned(), Seen::of(t))
+            (t.display_title().to_owned(), seen)
         };
         if let Some((_, key)) = key
             && let Some(refusal) = key_refusal(key, &seen.front, text.is_some())
@@ -2284,38 +2353,207 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(snapshot(cx), before);
-        // Pane: its tab is selected, nothing else moves.
+        // Pane, default reveal: the Mono's new tab joins the strip, but the user stays where
+        // they were, with the keyboard where it was.
         window
             .update(cx, |shell, _, _| {
                 shell.workspace.preferences.set_terminal_placement("title")
             })
             .unwrap();
-        let pane = open(
+        let (tabs, active) = window
+            .update(cx, |s, _, _| (s.workspace.tabs.len(), s.workspace.active))
+            .unwrap();
+        let quiet = call(
             window,
             cx,
-            json!({"label": "FE", "place": "split", "reveal": true}),
-        );
+            "m1",
+            "terminals.open",
+            json!({"label": "FE", "place": "split"}),
+        )
+        .unwrap();
+        assert_eq!(quiet["revealed"], false, "{quiet}");
+        assert_eq!(snapshot(cx), before);
         window
-            .update(cx, |shell, _, _| {
+            .update(cx, |s, _, _| {
+                assert_eq!(s.workspace.tabs.len(), tabs + 1);
+                assert_eq!(s.workspace.active, active);
+            })
+            .unwrap();
+        // An explicit reveal may switch tabs, and then the keyboard is not given to the
+        // terminal: the composer that had it is hidden now, so the shell root takes it.
+        let shown = call(
+            window,
+            cx,
+            "m1",
+            "terminals.open",
+            json!({"label": "BE2", "place": "split", "reveal": true}),
+        )
+        .unwrap();
+        assert!(shown.get("revealed").is_none(), "{shown}");
+        let pane = shown["id"].as_str().unwrap().to_owned();
+        window
+            .update(cx, |shell, w, cx| {
                 let Spot::Pane(p) = shell.find_mono_terminal("m1", PROJECT, &pane).unwrap().spot
                 else {
                     panic!("not a pane");
                 };
                 assert_eq!(shell.workspace.active, Some(p));
+                let terminal_focus = shell.terminal_pane_views[&p].focus_handle(cx);
+                assert!(w.focused(cx) != Some(terminal_focus));
+                assert_eq!(w.focused(cx), Some(shell.focus.clone()));
+                assert_eq!(shell.navigation_revision, before.1);
+                assert_eq!(shell.workspace.project, before.2);
             })
             .unwrap();
-        // The Mono's tab is a different tab from the chat's, whose composer is not on screen
-        // any more: the keyboard is not given to the terminal, and nothing navigated.
-        let after = snapshot(cx);
-        assert_eq!((after.1, after.2), (before.1, before.2.clone()));
-        let pane_focus = window
-            .update(cx, |shell, _, cx| {
-                let active = shell.workspace.active.unwrap();
-                shell.terminal_pane_views[&active].focus_handle(cx)
-            })
-            .unwrap();
-        assert!(after.0 != Some(pane_focus));
         let _ = hidden;
+    }
+
+    #[gpui::test]
+    fn a_default_reveal_shows_a_pane_only_in_the_tab_the_user_is_looking_at(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, _chat) = logs_setup(cx);
+        // The first open makes the Logs tab in the strip without selecting it.
+        let first = call(
+            window,
+            cx,
+            "m1",
+            "terminals.open",
+            json!({"label": "BE", "place": "split"}),
+        )
+        .unwrap();
+        assert_eq!(first["revealed"], false);
+        let active = window.update(cx, |s, _, _| s.workspace.active).unwrap();
+        // The user opens that tab; now a new split lands in the visible tab and is revealed.
+        let be = first["id"].as_str().unwrap().to_owned();
+        window
+            .update(cx, |shell, _, cx| {
+                let Spot::Pane(p) = shell.find_mono_terminal("m1", PROJECT, &be).unwrap().spot
+                else {
+                    panic!("not a pane");
+                };
+                shell.reveal_terminal_pane(p, cx);
+            })
+            .unwrap();
+        let second = call(
+            window,
+            cx,
+            "m1",
+            "terminals.open",
+            json!({"label": "FE", "place": "split"}),
+        )
+        .unwrap();
+        assert!(second.get("revealed").is_none(), "{second}");
+        assert_ne!(
+            window.update(cx, |s, _, _| s.workspace.active).unwrap(),
+            active
+        );
+    }
+
+    #[test]
+    fn a_folder_is_compared_through_its_symlinks() {
+        #[cfg(unix)]
+        {
+            let dir = std::env::temp_dir().join(format!("mono-real-{}", std::process::id()));
+            let real = dir.join("real");
+            std::fs::create_dir_all(&real).unwrap();
+            let link = dir.join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            let (real, link) = (real.to_string_lossy(), link.to_string_lossy());
+            assert_ne!(
+                monocode_core::files::path_key(&real),
+                monocode_core::files::path_key(&link)
+            );
+            assert_eq!(real_key(&real), real_key(&link));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        // A folder that does not exist is compared as spelled.
+        assert_eq!(
+            real_key("/no/such/dir/"),
+            monocode_core::files::path_key("/no/such/dir/")
+        );
+    }
+
+    #[gpui::test]
+    fn an_unknown_foreground_reuses_by_the_poll_and_still_refuses_shell_keys(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, _, _) = window(cx);
+        let first = dock(window, cx, "BE");
+        let t = terminal(window, cx, &first);
+        // `ps` failed or this is Windows: the live answer is "unknown".
+        set_front(window, cx, &t, Some(Front::Unknown));
+        let again = call(
+            window,
+            cx,
+            "m1",
+            "terminals.open",
+            json!({"label": "BE", "place": "dock"}),
+        )
+        .unwrap();
+        assert_eq!(
+            (again["id"].as_str(), again["reused"].as_bool()),
+            (Some(first.as_str()), Some(true))
+        );
+        assert_eq!(rows(window, cx).len(), 1);
+        assert_eq!(Front::Unknown.name(), "unknown");
+        // Keys treat it as a shell.
+        for key in ["up", "down", "tab", "esc", "enter"] {
+            assert!(send_key(window, cx, &first, key).is_err(), "{key}");
+        }
+        // The last poll saw a program: not the same idle terminal, so a new one opens.
+        window
+            .update(cx, |_, _, cx| {
+                t.update(cx, |t, _| t.foreground = Some("sleep".into()))
+            })
+            .unwrap();
+        let busy = call(
+            window,
+            cx,
+            "m1",
+            "terminals.open",
+            json!({"label": "BE", "place": "dock"}),
+        )
+        .unwrap();
+        assert_eq!(busy["reused"], false);
+    }
+
+    #[gpui::test]
+    fn beside_must_be_one_of_the_monos_own_terminals(cx: &mut TestAppContext) {
+        let (window, _chat) = logs_setup(cx);
+        let user = user_terminal(window, cx);
+        let user_id = rows(window, cx)
+            .iter()
+            .find(|r| r["owner"] == "user")
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let _ = user;
+        let err = call(
+            window,
+            cx,
+            "m1",
+            "terminals.open",
+            json!({"label": "X", "place": "split", "beside": user_id}),
+        )
+        .unwrap_err();
+        assert!(err.contains("this Mono opened"), "{err}");
+        // Another Mono's terminal is not its own either.
+        let other = dock_as(window, cx, "m2", "OTHER");
+        let err = call(
+            window,
+            cx,
+            "m1",
+            "terminals.open",
+            json!({"label": "X", "place": "split", "beside": other}),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("Unknown terminal") || err.contains("this Mono opened"),
+            "{err}"
+        );
+        assert_eq!(rows(window, cx).len(), 1, "nothing opened");
     }
 
     fn set_front(
@@ -2354,7 +2592,7 @@ mod tests {
         let id = dock(window, cx, "BE");
         let t = terminal(window, cx, &id);
         // A program holds the terminal, so every key is meant for it.
-        set_front(window, cx, &t, program("python3"));
+        set_front(window, cx, &t, program("vite"));
         let mut want = Vec::new();
         for (key, bytes) in [
             ("ctrl-c", &b"\x03"[..]),
@@ -2388,16 +2626,17 @@ mod tests {
         let id = dock(window, cx, "BE");
         // The shell itself holds the terminal: up recalls the user's history and enter would
         // run the recalled line with nobody asked.
-        for key in ["up", "down", "tab", "enter"] {
+        // Esc starts a meta-key recall (esc then `.`) there, so it is refused too.
+        for key in ["up", "down", "tab", "enter", "esc"] {
             let err = send_key(window, cx, &id, key).unwrap_err();
             assert!(err.contains("shell"), "{key}: {err}");
         }
         assert!(sent(window, cx, &id).is_empty());
-        // Ctrl-C, q and Esc are harmless there.
-        for key in ["ctrl-c", "q", "esc"] {
+        // Ctrl-C and q are harmless there.
+        for key in ["ctrl-c", "q"] {
             send_key(window, cx, &id, key).unwrap();
         }
-        assert_eq!(sent(window, cx, &id), b"\x03q\x1b");
+        assert_eq!(sent(window, cx, &id), b"\x03q");
         // Text approved in the same call may press Enter, and only Enter.
         let ok = wait(
             window,
@@ -2408,7 +2647,7 @@ mod tests {
         );
         choose(window, cx, mono_approval::Choice::Run);
         assert!(ok.try_recv().unwrap().is_ok());
-        for key in ["up", "down", "tab"] {
+        for key in ["up", "down", "tab", "esc"] {
             let err = call(
                 window,
                 cx,
@@ -2420,7 +2659,30 @@ mod tests {
             assert!(err.contains("shell"), "{key}: {err}");
         }
         assert_eq!(waiting(window, cx), 0);
-        assert_eq!(sent(window, cx, &id), b"\x03q\x1bls\r");
+        assert_eq!(sent(window, cx, &id), b"\x03qls\r");
+    }
+
+    #[gpui::test]
+    fn a_program_that_is_a_shell_or_a_repl_gets_the_shell_key_rules(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        let id = dock(window, cx, "BE");
+        let t = terminal(window, cx, &id);
+        for name in ["ssh", "python3.12", "sudo", "tmux", "psql", "-bash"] {
+            set_front(window, cx, &t, program(name));
+            for key in ["up", "down", "tab", "esc", "enter"] {
+                let err = send_key(window, cx, &id, key).unwrap_err();
+                assert!(err.contains("shell"), "{name} {key}: {err}");
+            }
+            // Ctrl-C and q stay free.
+            send_key(window, cx, &id, "ctrl-c").unwrap();
+            send_key(window, cx, &id, "q").unwrap();
+        }
+        assert_eq!(sent(window, cx, &id), b"\x03q".repeat(6));
+        // A plain program gets them all.
+        set_front(window, cx, &t, program("vim"));
+        for key in ["up", "esc", "enter"] {
+            send_key(window, cx, &id, key).unwrap();
+        }
     }
 
     #[gpui::test]
@@ -2443,7 +2705,7 @@ mod tests {
             .update(cx, |_, _, cx| {
                 t.update(cx, |t, _| {
                     t.foreground = None;
-                    t.fake.front = program("python3");
+                    t.fake.front = program("vite");
                 })
             })
             .unwrap();
@@ -3630,7 +3892,7 @@ mod tests {
             })
             .unwrap();
         // A program took the terminal after the dialog was shown: the text would go to it.
-        set_front(window, cx, &t, program("python3"));
+        set_front(window, cx, &t, program("vite"));
         choose(window, cx, mono_approval::Choice::Run);
         let err = answer.try_recv().unwrap().unwrap_err();
         assert!(err.contains("changed"), "{err}");
@@ -3657,7 +3919,7 @@ mod tests {
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         let id = dock(window, cx, "BE");
         let t = terminal(window, cx, &id);
-        set_front(window, cx, &t, program("python3"));
+        set_front(window, cx, &t, program("vite"));
         let answer = wait(
             window,
             cx,
@@ -3671,7 +3933,7 @@ mod tests {
         window
             .update(cx, |shell, _, _| {
                 let ask = &shell.mono_approvals.queue[0].request;
-                assert_eq!(ask.seen.as_ref().unwrap().front.name(), "python3");
+                assert_eq!(ask.seen.as_ref().unwrap().front.name(), "vite");
                 // No live folder to read here, so the dialog says where it started.
                 assert!(!ask.cwd_live);
                 assert_eq!(ask.cwd, PROJECT);
@@ -3765,7 +4027,7 @@ mod tests {
         // says nothing.
         let second = again["id"].as_str().unwrap().to_owned();
         let t2 = terminal(window, cx, &second);
-        set_front(window, cx, &t2, program("node"));
+        set_front(window, cx, &t2, program("vite"));
         let third = call(
             window,
             cx,
@@ -3883,6 +4145,67 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_new_turn_or_a_new_chat_cancels_the_old_dialog(cx: &mut TestAppContext) {
+        let (window, _, chat) = window(cx);
+        add_monos(window, cx, &["m1"]);
+        let view = window
+            .update(cx, |shell, _, cx| {
+                let view = shell.sessions.get(&chat).unwrap().clone();
+                view.update(cx, |v, _| v.busy = true);
+                shell
+                    .mono_manager()
+                    .update(cx, |monos, _| monos.adopt_chat("m1", view.clone()));
+                view
+            })
+            .unwrap();
+        let session = window
+            .update(cx, |_, _, cx| view.read(cx).summary.id)
+            .unwrap();
+        let id = dock(window, cx, "BE");
+        let ask_text = |cx: &mut TestAppContext| match ask_via(
+            window,
+            cx,
+            "m1",
+            "terminals.send",
+            json!({"id": id, "text": "ls"}),
+            Via {
+                session,
+                received: Instant::now(),
+            },
+        ) {
+            MonoTerminalReply::Later(answer) => answer,
+            MonoTerminalReply::Now(result) => panic!("did not wait: {result:?}"),
+        };
+        // The user stops the turn and starts another one inside the watch window: the busy
+        // flag is on again, but it is not the turn that asked.
+        let answer = ask_text(cx);
+        window
+            .update(cx, |_, _, cx| {
+                view.update(cx, |v, _| {
+                    v.busy = false;
+                    v.busy = true;
+                    v.submission_generation = v.submission_generation.wrapping_add(1);
+                })
+            })
+            .unwrap();
+        cx.executor().advance_clock(Duration::from_millis(600));
+        cx.run_until_parked();
+        let err = answer.try_recv().unwrap().unwrap_err();
+        assert!(err.contains("turn was stopped"), "{err}");
+        assert!(sent(window, cx, &id).is_empty());
+        // A different chat in place of the one that asked: the same.
+        let answer = ask_text(cx);
+        window
+            .update(cx, |_, _, cx| view.update(cx, |v, _| v.summary.id += 1000))
+            .unwrap();
+        cx.executor().advance_clock(Duration::from_millis(600));
+        cx.run_until_parked();
+        let err = answer.try_recv().unwrap().unwrap_err();
+        assert!(err.contains("turn was stopped"), "{err}");
+        assert!(sent(window, cx, &id).is_empty());
+    }
+
+    #[gpui::test]
     fn a_mono_has_one_request_waiting_at_a_time(cx: &mut TestAppContext) {
         let (window, _, _) = window(cx);
         add_monos(window, cx, &["m1", "m2"]);
@@ -3990,7 +4313,7 @@ mod tests {
             "terminals.send",
             json!({"id": id, "text": "ls"}),
         );
-        set_front(window, cx, &t, program("python3"));
+        set_front(window, cx, &t, program("vite"));
         choose(window, cx, mono_approval::Choice::Allow);
         assert!(answer.try_recv().unwrap().is_err());
         window
@@ -4987,9 +5310,9 @@ mod tests {
         dock(window, cx, "BE");
         window
             .update(cx, |shell, _, cx| {
-                assert!(shell.reveal_mono_terminal(PROJECT, Spot::Dock(0), cx));
+                assert!(shell.reveal_mono_terminal(PROJECT, Spot::Dock(0), false, cx));
                 // Not the project in view: nothing to show.
-                assert!(!shell.reveal_mono_terminal("/elsewhere", Spot::Dock(0), cx));
+                assert!(!shell.reveal_mono_terminal("/elsewhere", Spot::Dock(0), true, cx));
             })
             .unwrap();
         // A background open reports nothing odd; only a reveal that failed says so.

@@ -39,10 +39,11 @@ const STOPPED: &str = "The Mono's turn was stopped, so nothing was run";
 pub(super) const BUSY: &str =
     "Wait for the user's answer to your previous request before asking again";
 
-/// The most lines the dialog's scroll box shows before the last line is also pinned below it,
-/// and the most characters it shows on one line before the same.
+/// The most rendered lines the dialog's scroll box shows before the last line is also pinned
+/// below it. A rendered line wraps at about `PIN_COLUMNS` characters (a conservative guess: the
+/// real width is wider, so a pin may show early but never late).
 const PIN_LINES: usize = 8;
-const PIN_CHARS: usize = 400;
+const PIN_COLUMNS: usize = 50;
 
 /// The buttons, left to right. The focused one starts on Deny. Only Deny and Run can be
 /// focused: Allow is for the pointer.
@@ -58,6 +59,9 @@ pub(super) struct Approval {
     pub(super) request: Request,
     /// The Mono chat session that made the call, and when the bridge received it.
     pub(super) session: i64,
+    /// The Mono's loaded chat and its turn when the call arrived: a new chat or a new turn is
+    /// not the one that is waiting.
+    pub(super) turn: Option<(i64, u64)>,
     pub(super) received: Instant,
     pub(super) reply: async_channel::Sender<Result<Value, String>>,
     /// The dialog has been put in front of the user (it is the first in the queue).
@@ -80,6 +84,9 @@ pub(super) struct Approvals {
     /// What had the keyboard when the first dialog of the queue took it. It gets it back when
     /// the queue empties, whatever the approved call revealed meanwhile.
     pub(super) before: Option<FocusHandle>,
+    /// A call selected another title tab (an explicit `reveal: true`): what had the keyboard
+    /// may be hidden now, so the keyboard goes to the shell root instead.
+    pub(super) switched: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,23 +137,25 @@ pub(super) fn visible(text: &str) -> String {
 }
 
 /// The last line of `text`, shown pinned below the scroll box when the text is long, so the
-/// end of what runs is always in view. At most its last 160 characters.
+/// end of what runs is always in view. Long is decided on what the box really shows: the
+/// escaped text (`visible`, where one hidden character becomes up to eleven), its lines and
+/// their wrapping. At most its last 160 rendered characters.
 fn pinned_last_line(text: &str) -> Option<String> {
-    let lines = text.matches('\n').count() + 1;
-    if lines <= PIN_LINES && text.chars().count() <= PIN_CHARS {
+    let rendered = visible(text);
+    let rows: usize = rendered
+        .split('\n')
+        .map(|line| line.chars().count().div_ceil(PIN_COLUMNS).max(1))
+        .sum();
+    if rows <= PIN_LINES {
         return None;
     }
-    let last = text.rsplit('\n').next().unwrap_or_default();
+    let last = rendered.rsplit('\n').next().unwrap_or_default();
     if last.is_empty() {
         return Some("(ends with a line break)".into());
     }
     let count = last.chars().count();
     let tail: String = last.chars().skip(count.saturating_sub(160)).collect();
-    Some(format!(
-        "{}{}",
-        if count > 160 { "..." } else { "" },
-        visible(&tail)
-    ))
+    Some(format!("{}{}", if count > 160 { "..." } else { "" }, tail))
 }
 
 impl Shell {
@@ -180,6 +189,10 @@ impl Shell {
             project: project.to_owned(),
             request,
             session: via.session,
+            turn: self
+                .monos
+                .as_ref()
+                .and_then(|monos| monos.read(cx).chat_turn(mono, cx)),
             received: via.received,
             reply,
             shown: false,
@@ -211,6 +224,16 @@ impl Shell {
                 });
             })
             .detach();
+        }
+        if std::mem::take(&mut self.mono_approvals.switched) {
+            // The call selected another title tab, so what had the keyboard may be hidden. The
+            // shell root takes it (never the terminal); with a dialog up, it is what the
+            // keyboard returns to.
+            if self.mono_approvals.queue.is_empty() {
+                window.focus(&self.focus, cx);
+            } else if self.mono_approvals.before.is_some() {
+                self.mono_approvals.before = Some(self.focus.clone());
+            }
         }
         if self.mono_approvals.queue.is_empty() {
             return;
@@ -314,7 +337,7 @@ impl Shell {
         if self.monos.as_ref().is_some_and(|monos| {
             monos
                 .read(cx)
-                .session_stopped(approval.session, &approval.mono, cx)
+                .session_stopped(approval.session, &approval.mono, approval.turn, cx)
         }) {
             return Some(STOPPED.into());
         }
@@ -379,6 +402,10 @@ impl Shell {
             }
         };
         let _ = approval.reply.try_send(result);
+        // An explicit reveal selected another tab: the keyboard cannot go back to what had it.
+        if std::mem::take(&mut self.mono_approvals.switched) {
+            self.mono_approvals.before = Some(self.focus.clone());
+        }
         if self.mono_approvals.queue.is_empty() {
             // Exactly where the keyboard was, not wherever the call's `reveal` selected.
             let before = self.mono_approvals.before.take();
@@ -800,5 +827,18 @@ mod tests {
             pinned.starts_with("...") && pinned.ends_with("··&& rm x"),
             "{pinned}"
         );
+    }
+
+    #[test]
+    fn escaped_text_is_pinned_by_what_the_box_shows_not_by_its_raw_length() {
+        // 90 raw characters, about 720 rendered: far more than the box holds.
+        let hidden = format!("{}rm x", "\u{200b}".repeat(90));
+        assert!(hidden.chars().count() < 400);
+        let pinned = pinned_last_line(&hidden).expect("pinned");
+        assert!(pinned.ends_with("rm x"), "{pinned}");
+        assert!(pinned.chars().count() <= 163, "{pinned}");
+        // A line that wraps over many rows is pinned too.
+        assert!(pinned_last_line(&"a".repeat(PIN_COLUMNS * PIN_LINES + 1)).is_some());
+        assert_eq!(pinned_last_line(&"a".repeat(PIN_COLUMNS * PIN_LINES)), None);
     }
 }
