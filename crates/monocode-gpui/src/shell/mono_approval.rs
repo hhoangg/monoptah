@@ -77,6 +77,9 @@ pub(super) struct Approvals {
     pub(super) next: u64,
     pub(super) watching: bool,
     pub(super) focus: Option<FocusHandle>,
+    /// What had the keyboard when the first dialog of the queue took it. It gets it back when
+    /// the queue empties, whatever the approved call revealed meanwhile.
+    pub(super) before: Option<FocusHandle>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -221,8 +224,11 @@ impl Shell {
             front.shown = true;
             front.selected = DENY;
             self.restart_mono_guard(cx);
-            if let Some(focus) = &self.mono_approvals.focus {
-                window.focus(focus, cx);
+            if let Some(focus) = self.mono_approvals.focus.clone() {
+                if self.mono_approvals.before.is_none() {
+                    self.mono_approvals.before = window.focused(cx).filter(|held| *held != focus);
+                }
+                window.focus(&focus, cx);
             }
         }
         if !self.mono_approvals.watching {
@@ -374,8 +380,13 @@ impl Shell {
         };
         let _ = approval.reply.try_send(result);
         if self.mono_approvals.queue.is_empty() {
+            // Exactly where the keyboard was, not wherever the call's `reveal` selected.
+            let before = self.mono_approvals.before.take();
             if was_front {
-                self.focus_active(window, cx);
+                match before {
+                    Some(before) => window.focus(&before, cx),
+                    None => window.blur(cx),
+                }
             }
         } else {
             self.show_mono_approval(window, cx);

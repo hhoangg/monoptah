@@ -23,13 +23,13 @@ pub(super) struct DockTabDrag {
     /// Where the press landed; pulling far enough off the strip turns the
     /// drag into a pane drag that can drop the terminal in a split or on
     /// the title strip.
-    start: Point<Pixels>,
-    from: usize,
-    to: usize,
-    origin: Pixels,
-    offset: Pixels,
-    active: bool,
-    bounds: Vec<Bounds<Pixels>>,
+    pub(super) start: Point<Pixels>,
+    pub(super) from: usize,
+    pub(super) to: usize,
+    pub(super) origin: Pixels,
+    pub(super) offset: Pixels,
+    pub(super) active: bool,
+    pub(super) bounds: Vec<Bounds<Pixels>>,
 }
 
 /// How far off the dock's strip a tab must be pulled before it can leave
@@ -357,7 +357,11 @@ impl Shell {
         .into_iter()
         // The item names this terminal, not the tab position: the tabs can move before it is
         // chosen.
-        .chain(terminal.map(|t| Self::mono_read_item(&t, t.read(cx).mono_read)))
+        .chain(
+            terminal
+                .filter(|t| Self::offers_mono_read(t.read(cx)))
+                .map(|t| Self::mono_read_item(&t, t.read(cx).mono_read)),
+        )
         .collect()
     }
     pub(super) fn run_terminal_tab_menu(
@@ -544,6 +548,22 @@ impl Shell {
             return;
         }
         let project = self.workspace.project.clone();
+        // The dock can have shrunk since the press (a Mono closed or moved a terminal): the
+        // captured indexes then name nothing, or another terminal.
+        let count = self.terminals.get(&project).map_or(0, Vec::len);
+        let docked = self
+            .workspace
+            .docks
+            .get(&project)
+            .map_or(0, |dock| dock.terminals.len());
+        if drag.from >= count
+            || drag.to >= count
+            || drag.from.max(drag.to) >= docked
+            || drag.bounds.len() != count
+        {
+            cx.notify();
+            return;
+        }
         let now = Instant::now();
         let live = self.live_terminals();
         // Each tab glides from where it is drawn into its new slot.
@@ -595,6 +615,32 @@ impl Shell {
         }
         self.persist(cx);
         cx.notify();
+    }
+    /// Something other than the user's own gesture is about to remove, move or add a dock
+    /// terminal of `project` (a Mono's call). Whatever the user holds that names a tab by its
+    /// position is dropped: a tab drag, a drag out of the dock and an open tab menu would act
+    /// on the wrong terminal, or on none.
+    pub(super) fn cancel_dock_gestures(&mut self, project: &str, cx: &mut Context<Self>) {
+        if monocode_core::files::path_key(project)
+            != monocode_core::files::path_key(&self.workspace.project)
+        {
+            return;
+        }
+        self.dock_drag = None;
+        if self
+            .pane_drag
+            .as_ref()
+            .is_some_and(|drag| matches!(drag.source, DragSource::DockTerminal(_)))
+        {
+            self.pane_drag = None;
+        }
+        if self
+            .menu
+            .as_ref()
+            .is_some_and(|menu| matches!(menu.target, MenuTarget::TerminalTab(_)))
+        {
+            self.close_menu(cx);
+        }
     }
     fn dock_tab_shift(&self, ix: usize) -> Pixels {
         let Some(d) = self.dock_drag.as_ref().filter(|d| d.active) else {

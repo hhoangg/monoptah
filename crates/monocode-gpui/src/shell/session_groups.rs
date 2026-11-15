@@ -1065,13 +1065,14 @@ impl Shell {
             cx.notify();
             return;
         }
-        if self
-            .workspace
-            .terminal_panes
-            .iter()
-            .any(|(pane, t)| t.owner == id && self.workspace.tab_of(*pane).is_some())
-        {
-            self.error = Some("Close this session's terminal panes before deleting it".into());
+        // A Mono's terminal pane only borrows this session's scope: it moves to another
+        // session of the project (or the dock) when this one is gone, so it never blocks.
+        if self.workspace.terminal_panes.iter().any(|(pane, t)| {
+            t.owner == id && t.mono.is_none() && self.workspace.tab_of(*pane).is_some()
+        }) {
+            let message = "Close this session's terminal panes before deleting it";
+            refuse(&report, message);
+            self.error = Some(message.into());
             cx.notify();
             return;
         }
@@ -1269,6 +1270,7 @@ impl Shell {
             return;
         }
         self.release_closed_file_panes(cx);
+        self.rehome_mono_panes(id, cx);
         if self
             .session_preview
             .as_ref()

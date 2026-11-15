@@ -862,6 +862,11 @@ impl Terminal {
     pub(crate) fn is_plain_shell(&self) -> bool {
         !self.launched
     }
+    /// Makes this shell count as a launched program, as a login or cloud tab is.
+    #[cfg(test)]
+    pub(crate) fn pretend_launched(&mut self) {
+        self.launched = true;
+    }
     /// The last `lines` lines of the grid as plain text (history included), and whether older
     /// lines were left out.
     #[cfg(test)]

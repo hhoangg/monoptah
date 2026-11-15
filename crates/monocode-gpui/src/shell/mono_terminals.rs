@@ -326,6 +326,8 @@ impl Shell {
         via: Via,
         cx: &mut Context<Self>,
     ) -> MonoTerminalReply {
+        let project = self.workspace_project_key(project);
+        let project = project.as_str();
         match self.mono_terminals_step(mono, project, action, input, None, cx) {
             Ok(Step::Done(value)) => MonoTerminalReply::Now(Ok(value)),
             Ok(Step::Ask(request)) => self.queue_mono_approval(mono, project, request, via, cx),
@@ -342,6 +344,8 @@ impl Shell {
         request: &Request,
         cx: &mut Context<Self>,
     ) -> Result<Value, String> {
+        let project = self.workspace_project_key(project);
+        let project = project.as_str();
         let step = self.mono_terminals_step(
             mono,
             project,
@@ -389,6 +393,26 @@ impl Shell {
                 .and_then(done),
             _ => Err("Unknown terminals action".into()),
         }
+    }
+
+    /// The key the workspace already knows `project` by (its current project, a dock, a live
+    /// terminal list or a session's project), so a path spelled with a trailing slash or other
+    /// case-insensitive form addresses the same docks and terminals as the user's own.
+    fn workspace_project_key(&self, project: &str) -> String {
+        let key = monocode_core::files::path_key(project);
+        let sessions = self
+            .session_summaries
+            .iter()
+            .map(|(id, s)| self.project_of(*id, &s.cwd).to_owned());
+        std::iter::once(self.workspace.project.clone())
+            .chain(self.workspace.docks.keys().cloned())
+            .chain(self.terminals.keys().cloned())
+            .chain(sessions)
+            .find(|known| monocode_core::files::path_key(known) == key)
+            .unwrap_or_else(|| {
+                let trimmed = project.trim_end_matches('/');
+                if trimmed.is_empty() { project } else { trimmed }.to_owned()
+            })
     }
 
     /// Whether a queued call could still run: the checks it makes before writing, without
@@ -443,6 +467,21 @@ impl Shell {
         let owner = self.workspace.terminal_panes.get(&pane)?.owner;
         let summary = self.session_summaries.get(&owner)?;
         Some(self.project_of(owner, &summary.cwd).to_owned())
+    }
+
+    /// Where a terminal is, as `terminals.list` and `terminals.open` both say it: "dock", "tab"
+    /// (a pane alone in its title tab) or "split" (a pane sharing its tab).
+    fn place_name(&self, spot: Spot) -> &'static str {
+        match spot {
+            Spot::Dock(_) => "dock",
+            Spot::Pane(pane) => {
+                let split = self
+                    .workspace
+                    .tab_of(pane)
+                    .is_some_and(|tab| self.workspace.layout(tab).is_split());
+                if split { "split" } else { "tab" }
+            }
+        }
     }
 
     fn terminal_spot(&self, project: &str, terminal: &Entity<Terminal>) -> Option<Spot> {
@@ -583,16 +622,7 @@ impl Shell {
             let origin = known.map_or(Origin::User, |(origin, _)| origin);
             let id = self.registry_id(&terminal, origin, None, project);
             let t = terminal.read(cx);
-            let place = match spot {
-                Spot::Dock(_) => "dock",
-                Spot::Pane(pane) => {
-                    let split = self
-                        .workspace
-                        .tab_of(pane)
-                        .is_some_and(|tab| self.workspace.layout(tab).is_split());
-                    if split { "split" } else { "tab" }
-                }
-            };
+            let place = self.place_name(spot);
             rows.push(json!({
                 "id": id,
                 "label": t.display_title(),
@@ -667,9 +697,45 @@ impl Shell {
             }
             t.run_again.clone()
         };
-        if let Some(run) = run {
-            self.run_mono_input(terminal, run, cx);
+        let Some(run) = run else {
+            return;
+        };
+        // What the bar showed must be exactly what runs. A saved action edited since the
+        // bar was drawn shows its current command first; the next press runs that one.
+        let current = self.locate_terminal(terminal).map_or_else(
+            || run.clone(),
+            |(project, _)| self.current_run(&project, &run),
+        );
+        if current != run {
+            terminal.update(cx, |t, cx| {
+                t.run_again = Some(current);
+                cx.notify();
+            });
+            return;
         }
+        self.run_mono_input(terminal, run, cx);
+    }
+
+    /// `run` with the saved action's current command, when it names an action that still
+    /// exists (else the text as stored).
+    fn current_run(&self, project: &str, run: &SavedRun) -> SavedRun {
+        run.action
+            .as_deref()
+            .filter(|_| run.kind == "action")
+            .and_then(|id| {
+                self.workspace
+                    .actions
+                    .get(project)?
+                    .iter()
+                    .find(|action| action.id == id)
+            })
+            .map_or_else(
+                || run.clone(),
+                |action| SavedRun {
+                    text: action.command.clone(),
+                    ..run.clone()
+                },
+            )
     }
 
     /// The project and place of a terminal, wherever it is.
@@ -734,8 +800,10 @@ impl Shell {
             return;
         }
         let mut restored: Vec<(Entity<Terminal>, String, Option<String>)> = Vec::new();
-        if !dock_metas.is_empty() {
-            self.ensure_terminals(project, cx);
+        if let Some(last) = dock_metas.iter().map(|(ix, _)| *ix).max() {
+            // The live shells are a prefix of the dock's tabs: only those up to the last Mono
+            // terminal are spawned, so the user's tabs after it stay unspawned.
+            self.ensure_terminals_through(project, last, cx);
             for (ix, meta) in dock_metas {
                 if let Some(t) = self.terminals.get(project).and_then(|live| live.get(ix)) {
                     restored.push((t.clone(), meta.mono, meta.run.and_then(|r| r.action)));
@@ -913,12 +981,12 @@ impl Shell {
             if let Some(run) = run.clone() {
                 self.run_mono_input(&terminal, run, cx);
             }
-            if reveal {
-                self.reveal_mono_terminal(project, spot, cx);
+            let revealed = !reveal || self.reveal_mono_terminal(project, spot, cx);
+            let mut done = json!({"id": id, "reused": true, "place": self.place_name(spot)});
+            if !revealed {
+                done["revealed"] = json!(false);
             }
-            return Ok(Step::Done(
-                json!({"id": id, "reused": true, "place": spot_name(spot)}),
-            ));
+            return Ok(Step::Done(done));
         }
 
         let in_panel = self.terminal_in_panel(cx);
@@ -947,18 +1015,18 @@ impl Shell {
         if let Some(run) = run {
             self.run_mono_input(&terminal, run, cx);
         }
-        if reveal {
-            self.reveal_mono_terminal(project, spot, cx);
-        }
+        let revealed = !reveal || self.reveal_mono_terminal(project, spot, cx);
         cx.notify();
-        Ok(Step::Done(
-            json!({"id": id, "reused": false, "place": spot_name(spot)}),
-        ))
+        let mut done = json!({"id": id, "reused": false, "place": self.place_name(spot)});
+        if !revealed {
+            done["revealed"] = json!(false);
+        }
+        Ok(Step::Done(done))
     }
 
-    /// The pane a new split terminal goes beside: `beside`, else the Mono's latest terminal
-    /// pane of the project, else the active pane when it belongs to the project. `None` opens
-    /// a title tab of its own.
+    /// The pane a new split terminal goes beside: `beside`, else the Mono's Logs tab of the
+    /// project. `None` opens a title tab of its own (a Logs tab of one, which later splits
+    /// join); the user's own tabs are never split.
     fn mono_split_target(
         &self,
         mono: &str,
@@ -983,21 +1051,8 @@ impl Shell {
         if let Some(tab) = self.workspace.logs_tab(mono, &logs_name, in_project) {
             return Ok(Some(self.workspace.layout(tab).first_leaf()));
         }
-        let own = self.mono_registry.entries.iter().rev().find_map(|entry| {
-            let terminal = entry.terminal.upgrade()?;
-            let Spot::Pane(pane) = self.terminal_spot(project, &terminal)? else {
-                return None;
-            };
-            (entry.origin == Origin::Mono
-                && entry.mono.as_deref() == Some(mono)
-                && self.workspace.tab_of(pane).is_some())
-            .then_some(pane)
-        });
-        Ok(own.or_else(|| {
-            self.workspace
-                .active
-                .filter(|id| self.workspace.tab_of(*id).is_some() && in_project(*id))
-        }))
+        // Otherwise a Logs tab of its own: the user's chat tab is never split by a Mono.
+        Ok(None)
     }
 
     /// A new terminal pane. `None` when the project has no session to lend its scope: the
@@ -1014,7 +1069,7 @@ impl Shell {
         reveal: bool,
         cx: &mut Context<Self>,
     ) -> Option<(Entity<Terminal>, Spot)> {
-        let owner = self.mono_pane_owner(project)?;
+        let owner = self.mono_pane_owner(project, None)?;
         let terminal = self.spawn_terminal_as(cwd.to_owned(), true, cx);
         terminal.update(cx, |t, _| {
             t.label = Some(label.to_owned());
@@ -1024,17 +1079,18 @@ impl Shell {
         let mut state = TerminalPane::new(owner, cwd.to_owned());
         state.mono = Some(mono.to_owned());
         state.label = Some(label.to_owned());
-        // Joining the Mono's Logs tab keeps it a Logs tab.
-        state.logs = target
-            .filter(|t| {
-                self.workspace
-                    .terminal_panes
-                    .get(t)
-                    .is_some_and(|p| p.mono.as_deref() == Some(mono))
-            })
-            .and_then(|t| self.workspace.tab_of(t))
-            .and_then(|tab| self.workspace.logs_title(tab))
-            .map(str::to_owned);
+        // Joining the Mono's Logs tab keeps it a Logs tab, and a tab of its own is one.
+        state.logs = match target.filter(|t| self.workspace.tab_of(*t).is_some()) {
+            None => Some(logs_title(project)),
+            Some(target) => self
+                .workspace
+                .terminal_panes
+                .get(&target)
+                .filter(|p| p.mono.as_deref() == Some(mono))
+                .and_then(|_| self.workspace.tab_of(target))
+                .and_then(|tab| self.workspace.logs_title(tab))
+                .map(str::to_owned),
+        };
         self.workspace.terminal_panes.insert(pane, state);
         self.terminal_pane_views.insert(pane, terminal.clone());
         let previous = self.workspace.active;
@@ -1072,12 +1128,21 @@ impl Shell {
     /// A session of the project that lends a Mono's terminal pane its scope: the project's
     /// focused one, else any open one, else any in the sidebar. Never the Mono's own chat,
     /// a hidden session that does not live in the project.
-    fn mono_pane_owner(&self, project: &str) -> Option<i64> {
+    ///
+    /// Only a local session qualifies: a cloud or remote one would bind the Files and Git
+    /// panels to its workspace and could wake it. `skip` is a session on its way out.
+    fn mono_pane_owner(&self, project: &str, skip: Option<i64>) -> Option<i64> {
         let key = monocode_core::files::path_key(project);
         let known = |id: i64| {
             self.session_summaries
                 .get(&id)
-                .filter(|s| monocode_core::files::path_key(self.project_of(id, &s.cwd)) == key)
+                .filter(|s| {
+                    Some(id) != skip
+                        && !self.cloud_marks.contains_key(&id)
+                        && !self.remote_marks.contains_key(&id)
+                        && !s.cwd.starts_with("remote://")
+                        && monocode_core::files::path_key(self.project_of(id, &s.cwd)) == key
+                })
                 .map(|_| id)
         };
         self.workspace
@@ -1105,6 +1170,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> (Entity<Terminal>, Spot) {
         self.ensure_terminals(project, cx);
+        self.cancel_dock_gestures(project, cx);
         let viewport = self.viewport();
         let dock = self.workspace.docks.entry(project.to_owned()).or_default();
         let before = (!dock.terminals.is_empty()).then_some((dock.active, dock.open));
@@ -1147,17 +1213,19 @@ impl Shell {
 
     /// Shows a terminal without taking the keyboard or leaving a Mono's view. Only where the
     /// user is looking: another project's dock or tabs are not in view.
-    fn reveal_mono_terminal(&mut self, project: &str, spot: Spot, cx: &mut Context<Self>) {
+    /// Returns whether it is shown: not for another project, nor for a dock terminal while the
+    /// terminal lives in the right panel (opening the panel takes a window and the keyboard).
+    fn reveal_mono_terminal(&mut self, project: &str, spot: Spot, cx: &mut Context<Self>) -> bool {
         if monocode_core::files::path_key(project)
             != monocode_core::files::path_key(&self.workspace.project)
         {
-            return;
+            return false;
         }
         match spot {
             Spot::Dock(ix) => {
                 let in_panel = self.terminal_in_panel(cx);
                 let Some(dock) = self.workspace.docks.get_mut(project) else {
-                    return;
+                    return false;
                 };
                 let was_open = dock.open;
                 dock.active = ix.min(dock.terminals.len().saturating_sub(1));
@@ -1170,8 +1238,12 @@ impl Shell {
                 }
                 self.persist(cx);
                 cx.notify();
+                !in_panel
             }
-            Spot::Pane(pane) => self.reveal_terminal_pane(pane, cx),
+            Spot::Pane(pane) => {
+                self.reveal_terminal_pane(pane, cx);
+                true
+            }
         }
     }
 
@@ -1206,7 +1278,7 @@ impl Shell {
         for id in &ids {
             terminals.push(self.find_own_terminal(mono, project, id)?.terminal);
         }
-        let owner = self.mono_pane_owner(project);
+        let owner = self.mono_pane_owner(project, None);
         if owner.is_none()
             && terminals
                 .iter()
@@ -1225,6 +1297,8 @@ impl Shell {
                 Some(Spot::Pane(pane)) => pane,
                 Some(Spot::Dock(ix)) => {
                     let owner = owner.expect("checked above");
+                    // A drag or an open tab menu of the dock names tabs by position.
+                    self.cancel_dock_gestures(project, cx);
                     self.move_dock_terminal_to_pane(project, ix, terminal.clone(), owner, cx)
                 }
                 None => return Err("A terminal went away; run terminals.list".into()),
@@ -1233,7 +1307,6 @@ impl Shell {
             if let Some(state) = self.workspace.terminal_panes.get_mut(&pane) {
                 state.mono = Some(mono.to_owned());
                 state.label = state.label.take().or(label);
-                state.logs = Some(title.clone());
             }
             panes.push(pane);
         }
@@ -1246,16 +1319,24 @@ impl Shell {
         self.workspace
             .arrange_panes(tree, reuse)
             .ok_or("The terminals could not be arranged")?;
+        // Moving a pane clears its Logs identity, so it is set once they are in place.
+        for pane in &panes {
+            if let Some(state) = self.workspace.terminal_panes.get_mut(pane) {
+                state.logs = Some(title.clone());
+            }
+        }
         self.pane_motion = None;
         self.history
             .prune(&self.workspace.open_sessions(), self.workspace.active);
-        if reveal {
-            self.reveal_mono_terminal(project, Spot::Pane(panes[0]), cx);
-        }
+        let revealed = !reveal || self.reveal_mono_terminal(project, Spot::Pane(panes[0]), cx);
         self.fit_sidebar(cx);
         self.persist(cx);
         cx.notify();
-        Ok(json!({"tab": title, "ids": ids}))
+        let mut done = json!({"tab": title, "ids": ids});
+        if !revealed {
+            done["revealed"] = json!(false);
+        }
+        Ok(done)
     }
 
     fn mono_send_terminal(
@@ -1435,6 +1516,8 @@ impl Shell {
 
     /// The user's close of a dock tab, without the prompt and without moving the keyboard.
     fn close_mono_dock_terminal(&mut self, project: &str, ix: usize, cx: &mut Context<Self>) {
+        // A drag or an open tab menu of the dock names tabs by position.
+        self.cancel_dock_gestures(project, cx);
         if let Some(live) = self.terminals.get_mut(project)
             && ix < live.len()
         {
@@ -1460,6 +1543,100 @@ impl Shell {
         }
         self.persist(cx);
         cx.notify();
+    }
+
+    /// A session that lends Mono terminal panes their scope is going away: each Mono pane it
+    /// owns moves to another local session of the same project, or to the project's dock when
+    /// none is left, keeping its shell, label, Mono and last run. Call before the session's
+    /// summary is dropped (the pane's project is the owner's).
+    pub(super) fn rehome_mono_panes(&mut self, gone: i64, cx: &mut Context<Self>) {
+        let panes: Vec<(i64, String)> = self
+            .workspace
+            .terminal_panes
+            .iter()
+            .filter(|(_, state)| state.owner == gone && state.mono.is_some())
+            .map(|(pane, _)| {
+                let project = self
+                    .terminal_pane_project(*pane)
+                    .unwrap_or_else(|| self.workspace.project.clone());
+                (*pane, project)
+            })
+            .collect();
+        if panes.is_empty() {
+            return;
+        }
+        for (pane, project) in panes {
+            match self.mono_pane_owner(&project, Some(gone)) {
+                Some(owner) => {
+                    if let Some(state) = self.workspace.terminal_panes.get_mut(&pane) {
+                        state.owner = owner;
+                    }
+                }
+                None => self.move_mono_pane_to_dock(pane, &project, cx),
+            }
+        }
+        self.persist(cx);
+        cx.notify();
+    }
+
+    /// A Mono terminal pane becomes a tab of its project's dock, keeping its live shell and
+    /// what the Mono saved for it. The dock stays as the user had it.
+    fn move_mono_pane_to_dock(&mut self, pane: i64, project: &str, cx: &mut Context<Self>) {
+        let Some(state) = self.workspace.terminal_panes.get(&pane).cloned() else {
+            return;
+        };
+        let Some(view) = self.terminal_pane_view(pane, cx) else {
+            return;
+        };
+        let Some(mono) = state.mono.clone() else {
+            return;
+        };
+        if self.workspace.tab_of(pane).is_some() {
+            let before = self.active_leaves();
+            let split = self
+                .workspace
+                .tab_of(pane)
+                .is_some_and(|tab| self.workspace.layout(tab).is_split());
+            if !(split && self.workspace.close_pane(pane)) {
+                self.workspace.close(pane);
+            }
+            self.begin_pane_motion(before, cx);
+        }
+        self.workspace.terminal_panes.remove(&pane);
+        self.terminal_pane_views.remove(&pane);
+        self.ensure_terminals(project, cx);
+        self.cancel_dock_gestures(project, cx);
+        let label = state
+            .label
+            .clone()
+            .or_else(|| view.read(cx).label.clone())
+            .unwrap_or_default();
+        let dock = self.workspace.docks.entry(project.to_owned()).or_default();
+        let before = (!dock.terminals.is_empty()).then_some((dock.active, dock.open));
+        let ix = dock.add(state.cwd.clone());
+        dock.set_mono_meta(
+            ix,
+            Some(MonoTerminalMeta {
+                mono,
+                label,
+                run: state.run.clone(),
+            }),
+        );
+        match before {
+            Some((active, open)) => {
+                dock.active = active;
+                dock.open = open;
+            }
+            None => dock.open = false,
+        }
+        self.terminals
+            .entry(project.to_owned())
+            .or_default()
+            .push(view);
+        self.dock_shifts.clear();
+        self.history
+            .prune(&self.workspace.open_sessions(), self.workspace.active);
+        self.fit_sidebar(cx);
     }
 
     /// The user's close of a terminal pane, without the prompt and without moving the
@@ -1502,6 +1679,13 @@ impl Shell {
         }
     }
 
+    /// Whether "Let Mono read" means anything for `terminal`: a plain shell the user opened.
+    /// A Mono's own terminal is readable already, and a launched program (agent CLI, login,
+    /// cloud shell) is never read.
+    pub(super) fn offers_mono_read(terminal: &Terminal) -> bool {
+        terminal.is_plain_shell() && !terminal.by_mono
+    }
+
     /// The menu item that switches "Let Mono read" for `terminal`. Its id carries the terminal.
     pub(super) fn mono_read_item(terminal: &Entity<Terminal>, on: bool) -> MenuItem {
         MenuAction::new(
@@ -1540,13 +1724,6 @@ pub(super) fn mono_mark(
         .flex()
         .items_center()
         .child(icon("bot", 12.).text_color(content(0.4)))
-}
-
-fn spot_name(spot: Spot) -> &'static str {
-    match spot {
-        Spot::Dock(_) => "dock",
-        Spot::Pane(_) => "split",
-    }
 }
 
 #[cfg(test)]
@@ -1985,7 +2162,8 @@ mod tests {
             json!({"label": "BE", "reveal": false}),
         )
         .unwrap();
-        assert_eq!(be["place"], "split");
+        // Alone in a Logs tab of its own: the user's chat tab is never split by a Mono.
+        assert_eq!(be["place"], "tab");
         let fe = open(
             window,
             cx,
@@ -1994,8 +2172,15 @@ mod tests {
         window
             .update(cx, |shell, _, cx| {
                 let tab = shell.workspace.tab_of(chat).unwrap();
-                assert_eq!(shell.workspace.layout(tab).leaf_ids().len(), 3);
+                assert_eq!(shell.workspace.layout(tab).leaf_ids(), vec![chat]);
                 assert_eq!(shell.workspace.terminal_panes.len(), 2);
+                let logs = shell
+                    .workspace
+                    .tab_of(*shell.workspace.terminal_panes.keys().next().unwrap())
+                    .unwrap();
+                assert_ne!(logs, tab);
+                assert_eq!(shell.workspace.layout(logs).leaf_ids().len(), 2);
+                assert_eq!(shell.workspace.logs_title(logs), Some("Logs monocode"));
                 for pane in shell.workspace.terminal_panes.values() {
                     assert_eq!(pane.owner, chat);
                     assert_eq!(pane.mono.as_deref(), Some("m1"));
@@ -2046,7 +2231,7 @@ mod tests {
             json!({"label": "BE", "place": "split", "reveal": false}),
         )
         .unwrap();
-        assert_eq!(opened["place"], "split");
+        assert_eq!(opened["place"], "tab");
         window
             .update(cx, |shell, _, _| {
                 assert_eq!(shell.workspace.tabs.len(), before + 1);
@@ -2119,7 +2304,17 @@ mod tests {
                 assert_eq!(shell.workspace.active, Some(p));
             })
             .unwrap();
-        assert_eq!(snapshot(cx), before);
+        // The Mono's tab is a different tab from the chat's, whose composer is not on screen
+        // any more: the keyboard is not given to the terminal, and nothing navigated.
+        let after = snapshot(cx);
+        assert_eq!((after.1, after.2), (before.1, before.2.clone()));
+        let pane_focus = window
+            .update(cx, |shell, _, cx| {
+                let active = shell.workspace.active.unwrap();
+                shell.terminal_pane_views[&active].focus_handle(cx)
+            })
+            .unwrap();
+        assert!(after.0 != Some(pane_focus));
         let _ = hidden;
     }
 
@@ -2559,27 +2754,49 @@ mod tests {
     #[gpui::test]
     fn a_cwd_outside_the_project_is_refused(cx: &mut TestAppContext) {
         let (window, _, _) = window(cx);
-        for cwd in ["/tmp", "../etc", "sub/../../x", ""] {
-            let err = call(
-                window,
-                cx,
-                "m1",
-                "terminals.open",
-                json!({"label": "BE", "cwd": cwd}),
-            );
-            assert!(err.is_err(), "{cwd}");
-        }
-        assert!(
-            call(
-                window,
-                cx,
-                "m1",
-                "terminals.open",
-                json!({"label": "BE", "cwd": 3})
-            )
-            .is_err()
-        );
-        assert!(rows(window, cx).is_empty());
+        // A real project with a real folder beside it: the refusal is about the folder being
+        // outside, not about a path that does not exist.
+        let root = scratch("outside");
+        let project = root.join("app");
+        let outside = root.join("other");
+        std::fs::create_dir_all(project.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let project = project.to_string_lossy().into_owned();
+        let open_in = |cx: &mut TestAppContext, cwd: Value| {
+            window
+                .update(cx, |shell, _, cx| {
+                    shell.mono_terminals_call(
+                        "m1",
+                        &project,
+                        "terminals.open",
+                        &json!({"label": "BE", "place": "dock", "reveal": false, "cwd": cwd}),
+                        now(),
+                        cx,
+                    )
+                })
+                .unwrap()
+        };
+        let refused = |reply: MonoTerminalReply| match reply {
+            MonoTerminalReply::Now(Err(error)) => error,
+            _ => panic!("the cwd was accepted"),
+        };
+        let error = refused(open_in(cx, json!(outside.to_string_lossy())));
+        assert!(error.contains("must be inside the project"), "{error}");
+        let error = refused(open_in(cx, json!("../other")));
+        assert!(error.contains(".."), "{error}");
+        let error = refused(open_in(cx, json!("sub/../../other")));
+        assert!(error.contains(".."), "{error}");
+        let error = refused(open_in(cx, json!("")));
+        assert!(error.contains("must not be empty"), "{error}");
+        let error = refused(open_in(cx, json!(3)));
+        assert!(error.contains("cwd must be text"), "{error}");
+        assert_eq!(all_terminals(window, cx), 0);
+        // The same call with a folder inside the project goes through.
+        let MonoTerminalReply::Now(Ok(done)) = open_in(cx, json!("sub")) else {
+            panic!("a folder inside the project was refused");
+        };
+        assert_eq!(done["reused"], false);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn open_command(label: &str, command: &str) -> Value {
@@ -3994,7 +4211,11 @@ mod tests {
                 ));
                 // The chat keeps its own tab; the dock lost BE and kept DB.
                 assert_ne!(w.tab_of(chat), Some(tab));
-                assert_eq!(w.tabs.len(), tabs_before + 1);
+                assert_eq!(
+                    w.tabs.len(),
+                    tabs_before,
+                    "FE's own tab became the Logs tab"
+                );
                 assert_eq!(w.docks[PROJECT].terminals.len(), 1);
                 assert_eq!(shell.terminals[PROJECT].len(), 1);
                 assert_eq!(w.logs_title(tab), Some("Logs monocode"));
@@ -4186,6 +4407,14 @@ mod tests {
         );
         visual.run_until_parked();
         let fe_pane = pane_of(window, cx, &fe);
+        // The user drags their chat beside it: the split's headers tell the two apart.
+        window
+            .update(cx, |shell, _, cx| {
+                shell.workspace.place(chat, fe_pane, Edge::Right);
+                cx.notify();
+            })
+            .unwrap();
+        visual.run_until_parked();
         assert!(bounds(&mut visual, format!("split-mono-mark-{fe_pane}")).is_some());
         assert!(bounds(&mut visual, format!("split-mono-mark-{chat}")).is_none());
         // The Logs tab's title carries it too; the chat's tab does not.
@@ -4419,6 +4648,539 @@ mod tests {
         )
         .unwrap();
         assert_eq!(other["reused"], false);
+    }
+
+    /// A second local session of the project, in the sidebar order.
+    fn extra_session(window: WindowHandle<Shell>, cx: &mut TestAppContext) -> i64 {
+        window
+            .update(cx, |shell, _, _| {
+                let session = shell
+                    .store
+                    .lock()
+                    .unwrap()
+                    .create("claude", PROJECT)
+                    .unwrap();
+                let id = session.id;
+                shell.session_summaries.insert(id, session);
+                shell.order.push(id);
+                id
+            })
+            .unwrap()
+    }
+
+    fn stale_drag(from: usize, to: usize, tabs: usize) -> super::super::terminal_dock::DockTabDrag {
+        super::super::terminal_dock::DockTabDrag {
+            start: gpui::point(px(0.), px(0.)),
+            from,
+            to,
+            origin: px(0.),
+            offset: px(0.),
+            active: true,
+            bounds: (0..tabs)
+                .map(|i| {
+                    gpui::Bounds::new(
+                        gpui::point(px(i as f32 * 80.), px(0.)),
+                        gpui::size(px(80.), px(20.)),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[gpui::test]
+    fn a_mono_closing_a_dock_terminal_cancels_a_tab_drag_and_a_tab_menu(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        let user = user_terminal(window, cx);
+        let be = dock(window, cx, "BE");
+        let fe = dock(window, cx, "FE");
+        let fe_t = terminal(window, cx, &fe);
+        // The user holds the last tab in a drag; the Mono closes another one.
+        window
+            .update(cx, |shell, _, _| {
+                shell.dock_drag = Some(stale_drag(2, 0, 3))
+            })
+            .unwrap();
+        call(window, cx, "m1", "terminals.close", json!({"id": be})).unwrap();
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(shell.dock_drag.is_none(), "the drag was cancelled");
+                shell.finish_dock_drag(cx);
+                assert_eq!(shell.terminals[PROJECT], [user.clone(), fe_t.clone()]);
+                // A drag that outlived the change anyway cannot index past the dock.
+                shell.dock_drag = Some(stale_drag(2, 0, 3));
+                shell.finish_dock_drag(cx);
+                assert_eq!(shell.terminals[PROJECT], [user.clone(), fe_t.clone()]);
+                assert_eq!(shell.workspace.docks[PROJECT].terminals.len(), 2);
+            })
+            .unwrap();
+        // An open tab menu names its tab by position: closed when a Mono changes the dock.
+        window
+            .update(cx, |shell, w, cx| {
+                shell.open_menu(
+                    MenuTarget::TerminalTab(1),
+                    Anchor::Point(gpui::point(px(10.), px(10.))),
+                    w,
+                    cx,
+                );
+                assert!(shell.menu.is_some());
+            })
+            .unwrap();
+        call(window, cx, "m1", "terminals.close", json!({"id": fe})).unwrap();
+        window
+            .update(cx, |shell, _, _| {
+                assert!(shell.menu.is_none());
+                assert_eq!(shell.terminals[PROJECT], std::slice::from_ref(&user));
+            })
+            .unwrap();
+        // Moving a dock terminal into a pane (terminals.layout) cancels a drag too.
+        let db = dock(window, cx, "DB");
+        window
+            .update(cx, |shell, _, _| {
+                shell.dock_drag = Some(stale_drag(1, 0, 2))
+            })
+            .unwrap();
+        layout(window, cx, "columns", &[&db]).unwrap();
+        window
+            .update(cx, |shell, _, _| {
+                assert!(shell.dock_drag.is_none());
+                assert_eq!(shell.terminals[PROJECT], std::slice::from_ref(&user));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_mono_pane_never_blocks_deleting_the_session_it_borrows_and_moves_on(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, chat) = logs_setup(cx);
+        let other = extra_session(window, cx);
+        let id = open(
+            window,
+            cx,
+            json!({"label": "BE", "place": "split", "reveal": false}),
+        );
+        let pane = pane_of(window, cx, &id);
+        window
+            .update(cx, |shell, _, _| {
+                shell.workspace.terminal_panes.get_mut(&pane).unwrap().owner = other;
+            })
+            .unwrap();
+        window
+            .update(cx, |shell, w, cx| shell.delete_session(other, w, cx))
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                assert!(!shell.session_summaries.contains_key(&other));
+                let state = &shell.workspace.terminal_panes[&pane];
+                assert_eq!(state.owner, chat);
+                assert_eq!(state.mono.as_deref(), Some("m1"));
+                assert!(shell.workspace.tab_of(pane).is_some());
+            })
+            .unwrap();
+        // The last session of the project goes: the pane moves to the dock, still the same
+        // terminal with its label and Mono.
+        let shell_before = terminal(window, cx, &id);
+        window
+            .update(cx, |shell, w, cx| shell.delete_session(chat, w, cx))
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                assert!(!shell.session_summaries.contains_key(&chat));
+                assert!(shell.workspace.terminal_panes.is_empty());
+                assert!(shell.workspace.tab_of(pane).is_none());
+                let meta = shell.workspace.docks[PROJECT].mono_meta(0).unwrap();
+                assert_eq!((meta.mono.as_str(), meta.label.as_str()), ("m1", "BE"));
+                assert_eq!(
+                    shell.terminals[PROJECT],
+                    std::slice::from_ref(&shell_before)
+                );
+            })
+            .unwrap();
+        let list = rows(window, cx);
+        assert_eq!(list.len(), 1);
+        assert_eq!(
+            (list[0]["id"].as_str(), list[0]["place"].as_str()),
+            (Some(id.as_str()), Some("dock"))
+        );
+    }
+
+    #[gpui::test]
+    fn a_users_terminal_pane_still_blocks_deleting_its_session_and_says_so(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, chat) = logs_setup(cx);
+        let (report, answer) = async_channel::bounded(1);
+        window
+            .update(cx, |shell, w, cx| {
+                let pane = shell.workspace.next_pane_id();
+                shell
+                    .workspace
+                    .terminal_panes
+                    .insert(pane, TerminalPane::new(chat, PROJECT.into()));
+                shell.workspace.open(pane);
+                shell.delete_session_with(
+                    chat,
+                    super::super::project_removal::DeleteOptions {
+                        report: Some(report),
+                        ..Default::default()
+                    },
+                    w,
+                    cx,
+                );
+                assert!(shell.session_summaries.contains_key(&chat));
+            })
+            .unwrap();
+        let error = answer
+            .try_recv()
+            .expect("the call was answered")
+            .unwrap_err();
+        assert!(error.contains("terminal panes"), "{error}");
+    }
+
+    #[gpui::test]
+    fn a_pane_never_borrows_a_cloud_or_remote_session(cx: &mut TestAppContext) {
+        let (window, chat) = logs_setup(cx);
+        let cloud = extra_session(window, cx);
+        let remote = extra_session(window, cx);
+        window
+            .update(cx, |shell, _, _| {
+                shell.cloud_marks.insert(
+                    cloud,
+                    cloud::CloudMark {
+                        local_project: PROJECT.into(),
+                        codespace: "cs".into(),
+                        kind: monocode_core::cloud_sessions::CloudBackendKind::Codespaces,
+                    },
+                );
+                shell.session_summaries.get_mut(&remote).unwrap().cwd = "remote://host/p".into();
+                shell.order.retain(|id| *id != chat);
+                shell.order.extend([cloud, remote, chat]);
+                shell.workspace.project_focus.insert(PROJECT.into(), cloud);
+                // Both are listed first, yet neither is chosen.
+                assert_eq!(shell.mono_pane_owner(PROJECT, None), Some(chat));
+                assert_eq!(shell.mono_pane_owner(PROJECT, Some(chat)), None);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_second_split_joins_the_logs_tab_of_the_first_and_leaves_the_chat_alone(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, chat) = logs_setup(cx);
+        let be = open(
+            window,
+            cx,
+            json!({"label": "BE", "place": "split", "reveal": false}),
+        );
+        assert_eq!(rows(window, cx)[0]["place"], "tab");
+        let fe = open(
+            window,
+            cx,
+            json!({"label": "FE", "place": "split", "reveal": false}),
+        );
+        let (be_pane, fe_pane) = (pane_of(window, cx, &be), pane_of(window, cx, &fe));
+        window
+            .update(cx, |shell, _, _| {
+                let w = &shell.workspace;
+                assert_eq!(w.tab_of(be_pane), w.tab_of(fe_pane));
+                assert_ne!(w.tab_of(be_pane), w.tab_of(chat));
+                assert_eq!(w.layout(w.tab_of(chat).unwrap()).leaf_ids(), vec![chat]);
+                assert_eq!(w.active, Some(chat));
+            })
+            .unwrap();
+        assert!(rows(window, cx).iter().all(|r| r["place"] == "split"));
+    }
+
+    #[gpui::test]
+    fn approving_gives_the_keyboard_back_to_where_it_was(cx: &mut TestAppContext) {
+        let (window, chat) = logs_setup(cx);
+        let user = user_terminal(window, cx);
+        let focus = |cx: &mut TestAppContext| window.update(cx, |_, w, cx| w.focused(cx)).unwrap();
+        window
+            .update(cx, |_, w, cx| w.focus(&user.focus_handle(cx), cx))
+            .unwrap();
+        let before = focus(cx);
+        assert!(before.is_some());
+        for choice in [
+            mono_approval::Choice::Run,
+            mono_approval::Choice::Deny,
+            mono_approval::Choice::Expired,
+        ] {
+            let answer = wait(
+                window,
+                cx,
+                "m1",
+                "terminals.open",
+                json!({"label": "FE", "command": "ls", "place": "split", "reveal": true}),
+            );
+            assert!(focus(cx) != before, "the dialog holds the keyboard");
+            choose(window, cx, choice.clone());
+            let _ = answer.try_recv();
+            assert!(focus(cx) == before, "{choice:?}");
+        }
+        // Revealing selected the Mono's tab but the keyboard did not follow.
+        window
+            .update(cx, |shell, _, _| {
+                assert_ne!(shell.workspace.active, Some(chat));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_pane_dragged_out_of_the_logs_tab_is_not_a_logs_tab_any_more(cx: &mut TestAppContext) {
+        let (window, _chat) = logs_setup(cx);
+        let be = dock(window, cx, "BE");
+        let fe = dock(window, cx, "FE");
+        layout(window, cx, "columns", &[&be, &fe]).unwrap();
+        let (be_pane, fe_pane) = (pane_of(window, cx, &be), pane_of(window, cx, &fe));
+        // The user pulls FE onto the title strip.
+        window
+            .update(cx, |shell, _, _| {
+                let end = shell.workspace.tabs.len();
+                shell.workspace.detach(fe_pane, end);
+                let w = &shell.workspace;
+                assert_ne!(w.tab_of(fe_pane), w.tab_of(be_pane));
+                assert_eq!(w.terminal_panes[&fe_pane].logs, None);
+                assert_eq!(w.logs_title(w.tab_of(fe_pane).unwrap()), None);
+                assert_eq!(
+                    w.logs_title(w.tab_of(be_pane).unwrap()),
+                    Some("Logs monocode")
+                );
+            })
+            .unwrap();
+        // A new split joins BE's Logs tab, not the tab FE was pulled into.
+        let qa = open(
+            window,
+            cx,
+            json!({"label": "QA", "place": "split", "reveal": false}),
+        );
+        let qa_pane = pane_of(window, cx, &qa);
+        window
+            .update(cx, |shell, _, _| {
+                let w = &shell.workspace;
+                assert_eq!(w.tab_of(qa_pane), w.tab_of(be_pane));
+                assert_ne!(w.tab_of(qa_pane), w.tab_of(fe_pane));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn layout_leaves_the_active_pane_none_when_nothing_was_active(cx: &mut TestAppContext) {
+        let (window, _chat) = logs_setup(cx);
+        let be = dock(window, cx, "BE");
+        let fe = dock(window, cx, "FE");
+        window
+            .update(cx, |shell, _, _| shell.workspace.active = None)
+            .unwrap();
+        layout(window, cx, "columns", &[&be, &fe]).unwrap();
+        window
+            .update(cx, |shell, _, _| assert_eq!(shell.workspace.active, None))
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn reveal_says_when_it_could_not_show_the_terminal(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        dock(window, cx, "BE");
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(shell.reveal_mono_terminal(PROJECT, Spot::Dock(0), cx));
+                // Not the project in view: nothing to show.
+                assert!(!shell.reveal_mono_terminal("/elsewhere", Spot::Dock(0), cx));
+            })
+            .unwrap();
+        // A background open reports nothing odd; only a reveal that failed says so.
+        let ok = call(
+            window,
+            cx,
+            "m1",
+            "terminals.open",
+            json!({"label": "FE", "place": "dock", "reveal": true}),
+        )
+        .unwrap();
+        assert!(ok.get("revealed").is_none());
+    }
+
+    #[gpui::test]
+    fn a_project_spelled_with_a_trailing_slash_is_the_same_project(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        let spelled = format!("{PROJECT}/");
+        let opened = window
+            .update(cx, |shell, _, cx| {
+                shell.mono_terminals_call(
+                    "m1",
+                    &spelled,
+                    "terminals.open",
+                    &json!({"label": "BE", "place": "dock", "reveal": false}),
+                    now(),
+                    cx,
+                )
+            })
+            .unwrap();
+        let MonoTerminalReply::Now(Ok(opened)) = opened else {
+            panic!("the open failed");
+        };
+        window
+            .update(cx, |shell, _, _| {
+                assert_eq!(shell.terminals.keys().collect::<Vec<_>>(), [PROJECT]);
+                assert_eq!(shell.workspace.docks.keys().collect::<Vec<_>>(), [PROJECT]);
+            })
+            .unwrap();
+        // Listed under the plain spelling, and reused through the other one.
+        let list = rows(window, cx);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["id"], opened["id"]);
+        let again = window
+            .update(cx, |shell, _, cx| {
+                shell.mono_terminals_call(
+                    "m1",
+                    &spelled,
+                    "terminals.open",
+                    &json!({"label": "BE", "place": "dock", "reveal": false}),
+                    now(),
+                    cx,
+                )
+            })
+            .unwrap();
+        let MonoTerminalReply::Now(Ok(again)) = again else {
+            panic!("the second open failed");
+        };
+        assert_eq!(
+            (again["reused"].clone(), again["id"].clone()),
+            (json!(true), opened["id"].clone())
+        );
+    }
+
+    #[gpui::test]
+    fn let_mono_read_is_offered_for_plain_user_shells_only(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        let user = user_terminal(window, cx);
+        let mono = dock(window, cx, "BE");
+        let mono_t = terminal(window, cx, &mono);
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(Shell::offers_mono_read(user.read(cx)));
+                assert!(!Shell::offers_mono_read(mono_t.read(cx)));
+                // Close, Close Others and a separator for a Mono's tab; one more item for the
+                // user's.
+                assert_eq!(shell.terminal_tab_menu(0, cx).len(), 4);
+                assert_eq!(shell.terminal_tab_menu(1, cx).len(), 3);
+                user.update(cx, |t, _| t.pretend_launched());
+                assert!(!Shell::offers_mono_read(user.read(cx)));
+                assert_eq!(shell.terminal_tab_menu(0, cx).len(), 3);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_restart_listing_spawns_only_the_shells_up_to_the_last_mono_terminal(
+        cx: &mut TestAppContext,
+    ) {
+        // A project that is not in view: its dock was saved with a Mono's tab and two of
+        // the user's.
+        let away = "/work/another-project";
+        let (window, _chat) = logs_setup(cx);
+        window
+            .update(cx, |shell, _, _| {
+                let dock = shell.workspace.docks.entry(away.into()).or_default();
+                for _ in 0..3 {
+                    dock.add(away.into());
+                }
+                dock.set_mono_meta(
+                    0,
+                    Some(MonoTerminalMeta {
+                        mono: "m1".into(),
+                        label: "BE".into(),
+                        run: None,
+                    }),
+                );
+            })
+            .unwrap();
+        let json = saved(window, cx);
+        let window = restarted(cx, json);
+        add_monos(window, cx, &["m1"]);
+        let reply = window
+            .update(cx, |shell, _, cx| {
+                shell.mono_manager().update(cx, |monos, _| {
+                    monos
+                        .roster
+                        .get_mut("m1")
+                        .unwrap()
+                        .projects
+                        .push(away.into())
+                });
+                shell.mono_terminals_call("m1", away, "terminals.list", &json!({}), now(), cx)
+            })
+            .unwrap();
+        let MonoTerminalReply::Now(Ok(list)) = reply else {
+            panic!("the list failed");
+        };
+        assert_eq!(list.as_array().unwrap().len(), 1, "{list:?}");
+        assert_eq!(list[0]["label"], "BE");
+        window
+            .update(cx, |shell, _, _| {
+                assert_eq!(shell.workspace.docks[away].terminals.len(), 3);
+                assert_eq!(
+                    shell.terminals[away].len(),
+                    1,
+                    "the user's tabs stay unspawned"
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn run_again_shows_and_runs_the_actions_current_command(cx: &mut TestAppContext) {
+        let json = before_restart(cx);
+        let window = restarted(cx, json);
+        add_monos(window, cx, &["m1"]);
+        cx.update(|cx| {
+            bind_keys(cx);
+            crate::terminal::bind(cx);
+            cx.set_reduce_motion(true);
+        });
+        let list = rows(window, cx);
+        let be = list.iter().find(|r| r["label"] == "BE").unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        // The saved action was edited while the app was closed.
+        window
+            .update(cx, |shell, _, _| {
+                shell.workspace.actions.insert(
+                    PROJECT.into(),
+                    vec![ProjectAction {
+                        id: "a1".into(),
+                        name: "Dev".into(),
+                        command: "npm run dev -- --port 4000".into(),
+                        ..Default::default()
+                    }],
+                );
+            })
+            .unwrap();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let button = visual.debug_bounds("terminal-run-again").unwrap();
+        visual.simulate_click(button.center(), gpui::Modifiers::default());
+        visual.run_until_parked();
+        // The press only brought the bar up to date: what it shows is what runs next.
+        assert!(sent(window, cx, &be).is_empty());
+        let t = terminal(window, cx, &be);
+        window
+            .update(cx, |_, _, cx| {
+                assert_eq!(
+                    t.read(cx).run_again.as_ref().unwrap().text,
+                    "npm run dev -- --port 4000"
+                );
+            })
+            .unwrap();
+        let button = visual.debug_bounds("terminal-run-again").unwrap();
+        visual.simulate_click(button.center(), gpui::Modifiers::default());
+        visual.run_until_parked();
+        assert_eq!(sent(window, cx, &be), b"npm run dev -- --port 4000\r");
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {

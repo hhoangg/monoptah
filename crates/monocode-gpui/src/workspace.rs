@@ -989,6 +989,11 @@ impl Workspace {
         };
         let layout = self.layout(tab);
         self.project_focus.retain(|_, focus| *focus != id);
+        // A pane that leaves its tab leaves its Logs identity there: the tab it lands in is
+        // not the Mono's Logs tab. `terminals.layout` sets it again for what it arranges.
+        if let Some(pane) = self.terminal_panes.get_mut(&id) {
+            pane.logs = None;
+        }
         match layout.remove(id) {
             Some(rest) => {
                 let next = layout.sibling(id).unwrap_or_else(|| rest.first_leaf());
@@ -1192,7 +1197,7 @@ impl Workspace {
     /// of it that `tree` leaves out become title tabs of their own. Without it the first pane's
     /// own tab is kept when it holds nothing else, else a new tab opens at the end. Panes
     /// come out of the tabs that held them (an emptied tab closes). The active pane stays
-    /// where it was; only when its tab is gone does another take over.
+    /// where it was, `None` included; only when its tab is gone does another take over.
     pub fn arrange_panes(&mut self, tree: PaneNode, reuse: Option<i64>) -> Option<i64> {
         let ids = tree.leaf_ids();
         let first = *ids.first()?;
@@ -1237,12 +1242,16 @@ impl Workspace {
             let focus = previous.filter(|id| ids.contains(id)).unwrap_or(first);
             self.focused.insert(key, focus);
         }
-        match previous.filter(|id| self.tab_of(*id).is_some()) {
-            Some(previous) => self.active = Some(previous),
-            None if self.active.is_none_or(|id| self.tab_of(id).is_none()) => {
-                self.active = Some(first)
+        // Arranging is not navigating: the active pane is restored exactly, `None` included
+        // (`place` made a pane of the tab active).
+        match previous {
+            Some(previous) if self.tab_of(previous).is_some() => self.active = Some(previous),
+            None => self.active = None,
+            Some(_) => {
+                if self.active.is_none_or(|id| self.tab_of(id).is_none()) {
+                    self.active = Some(first);
+                }
             }
-            None => {}
         }
         Some(key)
     }
@@ -1970,5 +1979,33 @@ mod tests {
         assert_eq!(state.layout(again), rows);
         assert_eq!(state.tabs.len(), 3);
         assert_eq!(state.layout(state.tab_of(-2).unwrap()).leaf_ids(), vec![-2]);
+    }
+
+    #[test]
+    fn arranging_leaves_no_active_pane_when_there_was_none_and_a_moved_pane_loses_its_logs() {
+        let mut state = Workspace::default();
+        for id in [-1, -2] {
+            let mut pane = TerminalPane::new(1, "/w".into());
+            pane.mono = Some("m1".into());
+            pane.logs = Some("Logs w".into());
+            state.terminal_panes.insert(id, pane);
+        }
+        state.open(1);
+        state.active = None;
+        let tree =
+            crate::pane_layout::preset_layout(crate::pane_layout::Preset::Columns, &[-1, -2])
+                .unwrap();
+        let tab = state.arrange_panes(tree, None).unwrap();
+        assert_eq!(state.active, None);
+        assert_eq!(state.tab_of(-2), Some(tab));
+        // Leaving the tab (a drag to the title strip) drops the Logs identity.
+        let end = state.tabs.len();
+        state.detach(-2, end);
+        assert_eq!(state.terminal_panes[&-2].logs, None);
+        assert_eq!(state.terminal_panes[&-1].logs.as_deref(), Some("Logs w"));
+        assert_eq!(
+            state.logs_tab("m1", "Logs w", |_| true),
+            Some(state.tab_of(-1).unwrap())
+        );
     }
 }

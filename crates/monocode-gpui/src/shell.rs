@@ -3617,6 +3617,12 @@ impl Shell {
     }
     /// A restored dock reopens its tabs as fresh shells once it is shown.
     fn ensure_terminals(&mut self, project: &str, cx: &mut Context<Self>) {
+        self.ensure_terminals_through(project, usize::MAX, cx);
+    }
+    /// Spawns the saved dock shells up to and including tab `last`. The live shells are a
+    /// prefix of the dock's tabs (tab positions are shared), so a caller that needs only the
+    /// first few leaves the later ones unspawned until they are shown.
+    fn ensure_terminals_through(&mut self, project: &str, last: usize, cx: &mut Context<Self>) {
         if project.starts_with("remote://") {
             return;
         }
@@ -3627,6 +3633,9 @@ impl Shell {
         let metas = dock.mono_terminals.clone();
         let have = self.terminals.get(project).map_or(0, Vec::len);
         for (ix, cwd) in wanted.into_iter().enumerate().skip(have) {
+            if ix > last {
+                break;
+            }
             let by_mono = matches!(metas.get(ix), Some(Some(_)));
             let terminal = self.spawn_terminal_as(cwd, by_mono, cx);
             if let Some(Some(meta)) = metas.get(ix) {
@@ -6133,6 +6142,7 @@ impl Shell {
                         .terminal_pane_views
                         .get(&focus)
                         .filter(|_| self.workspace.terminal_panes.contains_key(&focus))
+                        .filter(|view| Self::offers_mono_read(view.read(cx)))
                     {
                         items.splice(
                             0..0,
