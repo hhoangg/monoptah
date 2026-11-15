@@ -63,7 +63,9 @@ mod project_rail;
 mod project_removal;
 pub(crate) use project_removal::FilesOutcome;
 mod cloud_workspaces;
+mod mono_approval;
 mod mono_terminals;
+pub(crate) use mono_terminals::MonoTerminalReply;
 mod project_cloud;
 mod project_settings;
 mod provider_prompt;
@@ -998,6 +1000,8 @@ pub(crate) struct Shell {
     terminal_pane_views: HashMap<i64, Entity<Terminal>>,
     /// Ids of the terminals a Mono may drive (`terminals.*`), over the dock and the panes.
     mono_registry: mono_terminals::Registry,
+    /// Free commands and typed text a Mono asked for, waiting for the user's answer.
+    mono_approvals: mono_approval::Approvals,
     /// A project's dock sliding open (toward 1) or shut (toward 0).
     dock_slide: Option<(String, PaneSlide)>,
     dock_resize: Option<(f32, f32)>,
@@ -1473,6 +1477,7 @@ impl Shell {
             terminals: HashMap::new(),
             terminal_pane_views: HashMap::new(),
             mono_registry: Default::default(),
+            mono_approvals: Default::default(),
             dock_slide: None,
             dock_resize: None,
             dock_hover: None,
@@ -9848,6 +9853,9 @@ impl Render for Shell {
                 if this.cancel_classic_sidebar_tab(cx) {
                     return;
                 }
+                if this.deny_front_mono_approval(window, cx) {
+                    return;
+                }
                 if this.dismiss_overlay(window, cx) {
                     return;
                 }
@@ -10153,6 +10161,7 @@ impl Render for Shell {
             .children(self.remote_project_modal(window, cx))
             .children(self.provider_prompt_modal(window, cx))
             .children(self.notice_modals(window, cx))
+            .children(self.mono_approval_modal(window, cx))
             .children(self.folder_picker_popover(window, cx))
             .children(crate::accounts::get(cx))
             .children(

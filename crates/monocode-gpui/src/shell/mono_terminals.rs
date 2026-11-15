@@ -6,9 +6,12 @@
 //! every call finds the terminal again by entity identity (`terminal_spot`) and forgets entries
 //! whose terminal is gone.
 //!
-//! Phase 2 adds free `command` and `send.text` behind a confirmation. Every command a Mono
-//! starts goes through `run_in_terminal`, so the approval step belongs in front of that one
-//! function.
+//! A free `command` (`terminals.open`) and typed `text` (`terminals.send`) wait for the user:
+//! the call validates everything, then either runs at once (the Mono's remembered exact
+//! string, see `mono_approval.rs`) or returns a `Step::Ask` that the shell queues as a dialog.
+//! Approving runs the very same function again with `approved` set, so every guard (terminal
+//! still there, owned by the Mono, cwd inside the project) is checked a second time right
+//! before anything is written. A saved Project Action never asks: the user wrote it.
 use super::*;
 use crate::{
     pane_layout::Edge,
@@ -21,14 +24,41 @@ use std::{
     time::Duration,
 };
 
-/// What phase 1 says to a free `command` or `text`.
-pub(crate) const NEEDS_APPROVAL: &str = "Free commands need the user's approval, not available yet";
+/// The most bytes of a free `command` or typed `text`.
+const INPUT_MAX: usize = monocode_core::mono::api::TERMINAL_INPUT_MAX;
 const LABEL_MAX: usize = 40;
 const READ_LINES_DEFAULT: usize = 200;
 const READ_LINES_MAX: usize = 1000;
 const READ_BYTES_MAX: usize = 32 * 1024;
 /// How long `terminals.stop` waits after Ctrl-C before it hangs the job up.
 const STOP_GRACE: Duration = Duration::from_secs(3);
+
+/// What a `terminals.*` call comes to: the answer now, or the answer once the user decides.
+pub(crate) enum MonoTerminalReply {
+    Now(Result<Value, String>),
+    Later(async_channel::Receiver<Result<Value, String>>),
+}
+
+/// A checked call that needs the user's approval before it may write anything.
+pub(super) struct Request {
+    /// "command" (terminals.open) or "text" (terminals.send): which remembered list it is in.
+    pub kind: &'static str,
+    /// The exact string, as the Mono sent it.
+    pub text: String,
+    /// The terminal's name: the label the Mono asked for, else the terminal's current title.
+    pub label: String,
+    pub cwd: String,
+    /// A key the call presses after the text.
+    pub then_key: Option<String>,
+    /// The call to run again, once approved.
+    pub input: Value,
+    pub action: &'static str,
+}
+
+enum Step {
+    Done(Value),
+    Ask(Request),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Origin {
@@ -156,6 +186,34 @@ fn id_of(input: &Value) -> Result<String, String> {
         .ok_or_else(|| "Provide id: a terminal id from terminals.list or terminals.open".into())
 }
 
+/// `command` or `text`, checked before the user is asked: text, not empty, at most 4096
+/// bytes, and no control character except line breaks and tabs. ESC, Enter (`\r`), Ctrl-C and
+/// the rest are keys, never text, so a Mono cannot type an escape sequence.
+fn parse_typed(input: &Value, field: &str) -> Result<Option<String>, String> {
+    let Some(value) = input.get(field) else {
+        return Ok(None);
+    };
+    let text = value
+        .as_str()
+        .ok_or_else(|| format!("{field} must be text"))?;
+    if text.is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    if text.len() > INPUT_MAX {
+        return Err(format!("{field} is at most {INPUT_MAX} bytes"));
+    }
+    if text
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\t')
+    {
+        return Err(format!(
+            "{field} must not contain control characters: use key for control keys ({})",
+            MonoKey::NAMES
+        ));
+    }
+    Ok(Some(text.to_owned()))
+}
+
 impl Shell {
     pub(crate) fn mono_terminals_call(
         &mut self,
@@ -164,20 +222,104 @@ impl Shell {
         action: &str,
         input: &Value,
         cx: &mut Context<Self>,
+    ) -> MonoTerminalReply {
+        match self.mono_terminals_step(mono, project, action, input, false, cx) {
+            Ok(Step::Done(value)) => MonoTerminalReply::Now(Ok(value)),
+            Ok(Step::Ask(request)) => self.queue_mono_approval(mono, project, request, cx),
+            Err(error) => MonoTerminalReply::Now(Err(error)),
+        }
+    }
+
+    /// Runs a call that was approved: the same checks as the call itself, now allowed to write.
+    pub(super) fn mono_terminals_approved(
+        &mut self,
+        mono: &str,
+        project: &str,
+        action: &str,
+        input: &Value,
+        cx: &mut Context<Self>,
     ) -> Result<Value, String> {
+        match self.mono_terminals_step(mono, project, action, input, true, cx)? {
+            Step::Done(value) => Ok(value),
+            Step::Ask(_) => Err("The command was not approved".into()),
+        }
+    }
+
+    fn mono_terminals_step(
+        &mut self,
+        mono: &str,
+        project: &str,
+        action: &str,
+        input: &Value,
+        approved: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<Step, String> {
         if project.starts_with("remote://") {
             return Err("Terminals are not available on remote projects".into());
         }
         self.prune_mono_terminals();
+        let done = |value| Ok(Step::Done(value));
         match action {
-            "terminals.list" => Ok(self.mono_list_terminals(mono, project, cx)),
-            "terminals.open" => self.mono_open_terminal(mono, project, input, cx),
-            "terminals.send" => self.mono_send_terminal(mono, project, input, cx),
-            "terminals.read" => self.mono_read_terminal(mono, project, input, cx),
-            "terminals.stop" => self.mono_stop_terminal(mono, project, input, cx),
-            "terminals.close" => self.mono_close_terminal(mono, project, input, cx),
+            "terminals.list" => done(self.mono_list_terminals(mono, project, cx)),
+            "terminals.open" => self.mono_open_terminal(mono, project, input, approved, cx),
+            "terminals.send" => self.mono_send_terminal(mono, project, input, approved, cx),
+            "terminals.read" => self
+                .mono_read_terminal(mono, project, input, cx)
+                .and_then(done),
+            "terminals.stop" => self
+                .mono_stop_terminal(mono, project, input, cx)
+                .and_then(done),
+            "terminals.close" => self
+                .mono_close_terminal(mono, project, input, cx)
+                .and_then(done),
             _ => Err("Unknown terminals action".into()),
         }
+    }
+
+    /// Whether a queued call could still run: the checks it makes before writing, without
+    /// writing. The shell asks again every half second while the dialog waits, and once more
+    /// when the user approves.
+    pub(super) fn mono_terminal_ready(
+        &self,
+        mono: &str,
+        project: &str,
+        action: &str,
+        input: &Value,
+        cx: &App,
+    ) -> Result<(), String> {
+        match action {
+            "terminals.send" => {
+                let found = self.find_own_terminal(mono, project, &id_of(input)?)?;
+                let t = found.terminal.read(cx);
+                if t.exited {
+                    return Err("The terminal has exited".into());
+                }
+                if t.agent().is_some() {
+                    return Err(
+                        "This terminal runs an agent CLI; Mono never types into those".into(),
+                    );
+                }
+                Ok(())
+            }
+            _ => {
+                resolve_cwd(project, input.get("cwd").and_then(Value::as_str), || {
+                    monocode_core::git::worktrees(Path::new(project))
+                        .map(|trees| trees.into_iter().map(|t| t.path).collect())
+                        .unwrap_or_default()
+                })?;
+                if let Some(id) = input.get("beside").and_then(Value::as_str) {
+                    self.find_mono_terminal(mono, project, id)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Whether the user let this Mono run exactly `text` as `kind` without asking.
+    fn mono_allows(&self, mono: &str, kind: &str, text: &str, cx: &App) -> bool {
+        self.monos
+            .as_ref()
+            .is_some_and(|monos| monos.read(cx).terminal_allowed(mono, kind, text))
     }
 
     /// The project a terminal pane belongs to: its owner session's.
@@ -349,8 +491,8 @@ impl Shell {
         Value::Array(rows)
     }
 
-    /// The one place a Mono's command reaches a shell. Phase 2 puts the user's approval in
-    /// front of the free-command callers; saved Project Actions run without asking.
+    /// A saved Project Action reaches a shell here, with no question: the user wrote it. A free
+    /// command goes through `Terminal::send_text` instead, and only once approved.
     fn run_in_terminal(&mut self, terminal: &Entity<Terminal>, command: &str, cx: &mut App) {
         terminal.update(cx, |t, cx| t.run(command, cx));
     }
@@ -360,11 +502,13 @@ impl Shell {
         mono: &str,
         project: &str,
         input: &Value,
+        approved: bool,
         cx: &mut Context<Self>,
-    ) -> Result<Value, String> {
+    ) -> Result<Step, String> {
         let label = parse_label(input)?;
-        if input.get("command").is_some() {
-            return Err(NEEDS_APPROVAL.into());
+        let command = parse_typed(input, "command")?;
+        if command.is_some() && input.get("action").is_some() {
+            return Err("Give action or command, not both".into());
         }
         let action = match input.get("action") {
             None => None,
@@ -415,6 +559,20 @@ impl Shell {
             None => None,
             Some(id) => Some(self.find_mono_terminal(mono, project, id)?),
         };
+        if let Some(command) = &command
+            && !approved
+            && !self.mono_allows(mono, "command", command, cx)
+        {
+            return Ok(Step::Ask(Request {
+                kind: "command",
+                text: command.clone(),
+                label,
+                cwd,
+                then_key: None,
+                input: input.clone(),
+                action: "terminals.open",
+            }));
+        }
 
         // An idle terminal with this label is reused, like an action's own terminal.
         let reusable = self.mono_registry.entries.iter().find_map(|entry| {
@@ -441,10 +599,15 @@ impl Shell {
                     entry.action = Some(action.id.clone());
                 }
             }
+            if let Some(command) = &command {
+                terminal.update(cx, |t, cx| t.send_text(command, true, cx));
+            }
             if reveal {
                 self.reveal_mono_terminal(project, spot, cx);
             }
-            return Ok(json!({"id": id, "reused": true, "place": spot_name(spot)}));
+            return Ok(Step::Done(
+                json!({"id": id, "reused": true, "place": spot_name(spot)}),
+            ));
         }
 
         let in_panel = self.terminal_in_panel(cx);
@@ -476,11 +639,16 @@ impl Shell {
                 entry.action = Some(action.id.clone());
             }
         }
+        if let Some(command) = &command {
+            terminal.update(cx, |t, cx| t.send_text(command, true, cx));
+        }
         if reveal {
             self.reveal_mono_terminal(project, spot, cx);
         }
         cx.notify();
-        Ok(json!({"id": id, "reused": false, "place": spot_name(spot)}))
+        Ok(Step::Done(
+            json!({"id": id, "reused": false, "place": spot_name(spot)}),
+        ))
     }
 
     /// The pane a new split terminal goes beside: `beside`, else the Mono's latest terminal
@@ -675,20 +843,27 @@ impl Shell {
         mono: &str,
         project: &str,
         input: &Value,
+        approved: bool,
         cx: &mut Context<Self>,
-    ) -> Result<Value, String> {
-        if input.get("text").is_some() {
-            return Err(NEEDS_APPROVAL.into());
-        }
+    ) -> Result<Step, String> {
         let id = id_of(input)?;
-        let name = input
-            .get("key")
-            .and_then(Value::as_str)
-            .ok_or_else(|| format!("Provide key: one of {}", MonoKey::NAMES))?;
-        let key = MonoKey::parse(name)
-            .ok_or_else(|| format!("Unknown key {name}. Use one of {}", MonoKey::NAMES))?;
+        let text = parse_typed(input, "text")?;
+        let key = match input.get("key") {
+            None => None,
+            Some(name) => {
+                let name = name
+                    .as_str()
+                    .ok_or_else(|| format!("key must be one of {}", MonoKey::NAMES))?;
+                let key = MonoKey::parse(name)
+                    .ok_or_else(|| format!("Unknown key {name}. Use one of {}", MonoKey::NAMES))?;
+                Some((name, key))
+            }
+        };
+        if text.is_none() && key.is_none() {
+            return Err(format!("Provide text or key: one of {}", MonoKey::NAMES));
+        }
         let found = self.find_own_terminal(mono, project, &id)?;
-        {
+        let label = {
             let t = found.terminal.read(cx);
             if t.exited {
                 return Err("The terminal has exited".into());
@@ -696,9 +871,37 @@ impl Shell {
             if t.agent().is_some() {
                 return Err("This terminal runs an agent CLI; Mono never types into those".into());
             }
+            (t.display_title().to_owned(), t.cwd.clone())
+        };
+        if let Some(text) = &text
+            && !approved
+            && !self.mono_allows(mono, "text", text, cx)
+        {
+            return Ok(Step::Ask(Request {
+                kind: "text",
+                text: text.clone(),
+                label: label.0,
+                cwd: label.1,
+                then_key: key.map(|(name, _)| name.to_owned()),
+                input: input.clone(),
+                action: "terminals.send",
+            }));
         }
-        found.terminal.update(cx, |t, cx| t.send_key(key, cx));
-        Ok(json!({"sent": name}))
+        if let Some(text) = &text {
+            found
+                .terminal
+                .update(cx, |t, cx| t.send_text(text, false, cx));
+        }
+        if let Some((_, key)) = key {
+            found.terminal.update(cx, |t, cx| t.send_key(key, cx));
+        }
+        Ok(Step::Done(match (&text, key) {
+            (None, Some((name, _))) => json!({"sent": name}),
+            (Some(text), key) => {
+                json!({"sent": "text", "bytes": text.len(), "key": key.map(|(name, _)| name)})
+            }
+            (None, None) => unreachable!("checked above"),
+        }))
     }
 
     fn mono_read_terminal(
@@ -883,9 +1086,83 @@ mod tests {
         action: &str,
         input: Value,
     ) -> Result<Value, String> {
+        match ask(window, cx, mono, action, input) {
+            MonoTerminalReply::Now(result) => result,
+            MonoTerminalReply::Later(_) => panic!("{action} waited for the user"),
+        }
+    }
+
+    /// The call as the host makes it: with a window, then the dialog is put in front.
+    fn ask(
+        window: WindowHandle<Shell>,
+        cx: &mut TestAppContext,
+        mono: &str,
+        action: &str,
+        input: Value,
+    ) -> MonoTerminalReply {
+        window
+            .update(cx, |shell, w, cx| {
+                let reply = shell.mono_terminals_call(mono, PROJECT, action, &input, cx);
+                shell.show_mono_approval(w, cx);
+                reply
+            })
+            .unwrap()
+    }
+
+    /// A call that must wait for the user: its channel, still empty.
+    fn wait(
+        window: WindowHandle<Shell>,
+        cx: &mut TestAppContext,
+        mono: &str,
+        action: &str,
+        input: Value,
+    ) -> async_channel::Receiver<Result<Value, String>> {
+        match ask(window, cx, mono, action, input) {
+            MonoTerminalReply::Later(answer) => {
+                assert!(answer.try_recv().is_err(), "answered before the user chose");
+                answer
+            }
+            MonoTerminalReply::Now(result) => panic!("{action} did not wait: {result:?}"),
+        }
+    }
+
+    /// The Monos the tests speak for, with the project, as the roster has them.
+    fn add_monos(window: WindowHandle<Shell>, cx: &mut TestAppContext, ids: &[&str]) {
         window
             .update(cx, |shell, _, cx| {
-                shell.mono_terminals_call(mono, PROJECT, action, &input, cx)
+                shell.mono_manager().update(cx, |monos, _| {
+                    for id in ids {
+                        monos.roster.monos.push(monocode_core::mono::Mono {
+                            id: (*id).into(),
+                            name: format!("Mono {id}"),
+                            projects: vec![PROJECT.into()],
+                            ..Default::default()
+                        });
+                    }
+                })
+            })
+            .unwrap();
+    }
+
+    fn choose(window: WindowHandle<Shell>, cx: &mut TestAppContext, choice: mono_approval::Choice) {
+        window
+            .update(cx, |shell, w, cx| {
+                let seq = shell.mono_approvals.queue.front().expect("a dialog").seq;
+                shell.answer_mono_approval(seq, choice, w, cx)
+            })
+            .unwrap();
+    }
+
+    fn waiting(window: WindowHandle<Shell>, cx: &mut TestAppContext) -> usize {
+        window
+            .update(cx, |shell, _, _| shell.mono_approvals.queue.len())
+            .unwrap()
+    }
+
+    fn all_terminals(window: WindowHandle<Shell>, cx: &mut TestAppContext) -> usize {
+        window
+            .update(cx, |shell, _, _| {
+                shell.terminals.values().map(Vec::len).sum::<usize>()
             })
             .unwrap()
     }
@@ -1139,30 +1416,6 @@ mod tests {
         .unwrap();
         assert_eq!(again["reused"], true);
         assert_eq!(sent(window, cx, &id), b"npm run dev\rnpm run dev\r");
-    }
-
-    #[gpui::test]
-    fn free_commands_and_text_wait_for_the_users_approval(cx: &mut TestAppContext) {
-        let (window, _, _) = window(cx);
-        let refused = call(
-            window,
-            cx,
-            "m1",
-            "terminals.open",
-            json!({"label": "x", "command": "ls"}),
-        );
-        assert_eq!(refused, Err(NEEDS_APPROVAL.to_owned()));
-        assert!(rows(window, cx).is_empty());
-        let id = dock(window, cx, "BE");
-        let text = call(
-            window,
-            cx,
-            "m1",
-            "terminals.send",
-            json!({"id": id, "text": "ls\n"}),
-        );
-        assert_eq!(text, Err(NEEDS_APPROVAL.to_owned()));
-        assert!(sent(window, cx, &id).is_empty());
     }
 
     #[gpui::test]
@@ -1608,6 +1861,9 @@ mod tests {
                 )
             })
             .unwrap();
+        let MonoTerminalReply::Now(remote) = remote else {
+            panic!("a refusal is immediate");
+        };
         assert!(remote.unwrap_err().contains("remote"));
         assert!(call(window, cx, "m1", "terminals.read", json!({"id": "t-99"})).is_err());
         assert!(call(window, cx, "m1", "terminals.read", json!({})).is_err());
@@ -1637,6 +1893,678 @@ mod tests {
             .is_err()
         );
         assert!(rows(window, cx).is_empty());
+    }
+
+    fn open_command(label: &str, command: &str) -> Value {
+        json!({"label": label, "command": command, "place": "dock"})
+    }
+
+    fn declined() -> Result<Value, String> {
+        Err(mono_approval::DECLINED.to_owned())
+    }
+
+    /// Key bindings, as the running app has them, for the tests that press keys.
+    fn bind(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::input::bind(cx);
+            crate::popover::bind(cx);
+            crate::image_lightbox::bind(cx);
+            crate::shell::bind_keys(cx);
+            cx.set_reduce_motion(true);
+        });
+    }
+
+    fn guard_over(cx: &mut TestAppContext) {
+        cx.executor()
+            .advance_clock(mono_approval::GUARD + Duration::from_millis(50));
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn a_command_waits_for_the_user_and_runs_exactly_what_was_shown(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        add_monos(window, cx, &["m1"]);
+        let answer = wait(
+            window,
+            cx,
+            "m1",
+            "terminals.open",
+            open_command("BE", "npm run dev -- --port 3000"),
+        );
+        cx.run_until_parked();
+        // Showing the dialog opened and wrote nothing.
+        assert_eq!(all_terminals(window, cx), 0);
+        assert!(rows(window, cx).is_empty());
+        assert_eq!(waiting(window, cx), 1);
+        window
+            .update(cx, |shell, _, _| {
+                let ask = shell.mono_approvals.queue.front().unwrap();
+                assert_eq!(ask.request.text, "npm run dev -- --port 3000");
+                assert_eq!(ask.request.label, "BE");
+                assert_eq!(ask.request.cwd, PROJECT);
+                assert_eq!(ask.mono_name, "Mono m1");
+            })
+            .unwrap();
+        choose(window, cx, mono_approval::Choice::Run);
+        cx.run_until_parked();
+        let id = answer.try_recv().unwrap().unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(sent(window, cx, &id), b"npm run dev -- --port 3000\r");
+        assert_eq!(waiting(window, cx), 0);
+    }
+
+    #[gpui::test]
+    fn deny_and_escape_answer_an_error_and_write_nothing(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        add_monos(window, cx, &["m1"]);
+        let first = wait(
+            window,
+            cx,
+            "m1",
+            "terminals.open",
+            open_command("BE", "rm x"),
+        );
+        choose(window, cx, mono_approval::Choice::Deny);
+        assert_eq!(first.try_recv().unwrap(), declined());
+        assert_eq!(all_terminals(window, cx), 0);
+
+        // Escape, as the user presses it with the dialog in front.
+        bind(cx);
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        let second = wait(
+            window,
+            cx,
+            "m1",
+            "terminals.open",
+            open_command("BE", "rm y"),
+        );
+        visual.run_until_parked();
+        visual.simulate_keystrokes("escape");
+        visual.run_until_parked();
+        assert_eq!(second.try_recv().unwrap(), declined());
+        assert_eq!(waiting(window, cx), 0);
+        assert_eq!(all_terminals(window, cx), 0);
+
+        // Typing the terminal's text: the same.
+        let id = dock(window, cx, "BE");
+        let third = wait(
+            window,
+            cx,
+            "m1",
+            "terminals.send",
+            json!({"id": id, "text": "rm z"}),
+        );
+        visual.run_until_parked();
+        visual.simulate_keystrokes("escape");
+        visual.run_until_parked();
+        assert_eq!(third.try_recv().unwrap(), declined());
+        assert!(sent(window, cx, &id).is_empty());
+    }
+
+    #[gpui::test]
+    fn enter_denies_until_the_focus_is_moved_to_run_and_the_guard_is_over(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        add_monos(window, cx, &["m1"]);
+        bind(cx);
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        // Deny holds the focus first: Enter declines.
+        let first = wait(window, cx, "m1", "terminals.open", open_command("BE", "ls"));
+        visual.run_until_parked();
+        guard_over(cx);
+        visual.simulate_keystrokes("enter");
+        visual.run_until_parked();
+        assert_eq!(first.try_recv().unwrap(), declined());
+        assert_eq!(all_terminals(window, cx), 0);
+
+        // Tab and an arrow reach Run, but a keystroke in the first moments approves nothing.
+        let second = wait(window, cx, "m1", "terminals.open", open_command("BE", "ls"));
+        visual.run_until_parked();
+        visual.simulate_keystrokes("tab right");
+        visual.run_until_parked();
+        assert_eq!(
+            window
+                .update(cx, |s, _, _| s.mono_approvals.queue[0].selected)
+                .unwrap(),
+            2,
+            "Tab and an arrow moved the focus to Run"
+        );
+        visual.simulate_keystrokes("enter");
+        visual.run_until_parked();
+        assert_eq!(waiting(window, cx), 1, "the guard held");
+        assert!(second.try_recv().is_err());
+        assert_eq!(all_terminals(window, cx), 0);
+        guard_over(cx);
+        visual.simulate_keystrokes("enter");
+        visual.run_until_parked();
+        let id = second.try_recv().unwrap().unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(sent(window, cx, &id), b"ls\r");
+    }
+
+    #[gpui::test]
+    fn the_dialog_shows_the_text_and_its_buttons_work_by_click_after_the_guard(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, _, _) = window(cx);
+        add_monos(window, cx, &["m1"]);
+        bind(cx);
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        let answer = wait(window, cx, "m1", "terminals.open", open_command("BE", "ls"));
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        for part in [
+            "mono-approval-text",
+            "mono-approval-deny",
+            "mono-approval-allow",
+            "mono-approval-run",
+        ] {
+            assert!(visual.debug_bounds(part).is_some(), "{part}");
+        }
+        let run = visual.debug_bounds("mono-approval-run").unwrap().center();
+        visual.simulate_click(run, Default::default());
+        visual.run_until_parked();
+        assert_eq!(
+            waiting(window, cx),
+            1,
+            "a click in the guard approves nothing"
+        );
+        guard_over(cx);
+        visual.refresh().unwrap();
+        let run = visual.debug_bounds("mono-approval-run").unwrap().center();
+        visual.simulate_click(run, Default::default());
+        visual.run_until_parked();
+        assert!(answer.try_recv().unwrap().is_ok());
+        assert_eq!(waiting(window, cx), 0);
+        // Deny by click.
+        let denied = wait(window, cx, "m1", "terminals.open", open_command("FE", "ls"));
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        let deny = visual.debug_bounds("mono-approval-deny").unwrap().center();
+        visual.simulate_click(deny, Default::default());
+        visual.run_until_parked();
+        assert_eq!(denied.try_recv().unwrap(), declined());
+    }
+
+    #[gpui::test]
+    fn allow_remembers_the_exact_string_for_that_mono_only(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        add_monos(window, cx, &["m1", "m2"]);
+        let first = wait(
+            window,
+            cx,
+            "m1",
+            "terminals.open",
+            open_command("BE", "npm test"),
+        );
+        choose(window, cx, mono_approval::Choice::Allow);
+        assert!(first.try_recv().unwrap().is_ok());
+        window
+            .update(cx, |shell, _, cx| {
+                let monos = shell.mono_manager();
+                let m = monos.read(cx).roster.get("m1").unwrap();
+                assert_eq!(m.terminal_allow, ["command:npm test"]);
+                assert!(
+                    monos
+                        .read(cx)
+                        .roster
+                        .get("m2")
+                        .unwrap()
+                        .terminal_allow
+                        .is_empty()
+                );
+            })
+            .unwrap();
+        // The same string runs at once, with no dialog.
+        let again = call(
+            window,
+            cx,
+            "m1",
+            "terminals.open",
+            open_command("FE", "npm test"),
+        )
+        .unwrap();
+        assert_eq!(waiting(window, cx), 0);
+        let id = again["id"].as_str().unwrap().to_owned();
+        assert_eq!(sent(window, cx, &id), b"npm test\r");
+        // One space, one letter or a missing one is another string, and asks.
+        for near in [
+            "npm test ",
+            " npm test",
+            "npm  test",
+            "npm Test",
+            "npm tes",
+            "npm test\n",
+        ] {
+            let answer = wait(window, cx, "m1", "terminals.open", open_command("X", near));
+            choose(window, cx, mono_approval::Choice::Deny);
+            assert_eq!(answer.try_recv().unwrap(), declined(), "{near:?}");
+        }
+        // Another Mono is asked about the very same string.
+        let other = wait(
+            window,
+            cx,
+            "m2",
+            "terminals.open",
+            open_command("X", "npm test"),
+        );
+        choose(window, cx, mono_approval::Choice::Deny);
+        assert_eq!(other.try_recv().unwrap(), declined());
+        // A remembered command is not remembered text.
+        let text = wait(
+            window,
+            cx,
+            "m1",
+            "terminals.send",
+            json!({"id": id, "text": "npm test"}),
+        );
+        choose(window, cx, mono_approval::Choice::Deny);
+        assert_eq!(text.try_recv().unwrap(), declined());
+        // Remembered text types without asking, and still presses no key by itself.
+        let typed = wait(
+            window,
+            cx,
+            "m1",
+            "terminals.send",
+            json!({"id": id, "text": "y"}),
+        );
+        choose(window, cx, mono_approval::Choice::Allow);
+        assert!(typed.try_recv().unwrap().is_ok());
+        call(
+            window,
+            cx,
+            "m1",
+            "terminals.send",
+            json!({"id": id, "text": "y"}),
+        )
+        .unwrap();
+        assert_eq!(sent(window, cx, &id), b"npm test\ryy");
+        assert_eq!(waiting(window, cx), 0);
+    }
+
+    #[gpui::test]
+    fn input_over_4_kib_or_with_control_bytes_is_refused_before_asking(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        add_monos(window, cx, &["m1"]);
+        let id = dock(window, cx, "BE");
+        let fits = "x".repeat(4096);
+        for (action, field) in [("terminals.send", "text"), ("terminals.open", "command")] {
+            let build = |value: &str| {
+                if field == "text" {
+                    json!({"id": id, "text": value})
+                } else {
+                    open_command("BE2", value)
+                }
+            };
+            for bad in ["x".repeat(4097), "\u{e9}".repeat(2049)] {
+                let err = call(window, cx, "m1", action, build(&bad)).unwrap_err();
+                assert!(err.contains("4096"), "{action}: {err}");
+            }
+            let err = call(window, cx, "m1", action, build("")).unwrap_err();
+            assert!(err.contains("empty"), "{err}");
+            let ok = wait(window, cx, "m1", action, build(&fits));
+            choose(window, cx, mono_approval::Choice::Deny);
+            assert_eq!(ok.try_recv().unwrap(), declined());
+            for bad in [
+                "a\u{1b}[2Jb",
+                "a\rb",
+                "\u{7f}",
+                "\u{3}",
+                "a\u{0}b",
+                "a\u{9b}b",
+                "a\u{8}b",
+            ] {
+                let err = call(window, cx, "m1", action, build(bad)).unwrap_err();
+                assert!(err.contains("use key for control keys"), "{bad:?}: {err}");
+            }
+            // Line breaks and tabs are text.
+            let multi = wait(window, cx, "m1", action, build("one\ntwo\tthree"));
+            choose(window, cx, mono_approval::Choice::Deny);
+            assert_eq!(multi.try_recv().unwrap(), declined());
+        }
+        assert!(sent(window, cx, &id).is_empty());
+        let both = call(
+            window,
+            cx,
+            "m1",
+            "terminals.open",
+            json!({"label": "X", "action": "a1", "command": "ls"}),
+        );
+        assert!(both.unwrap_err().contains("not both"));
+        let bad_key = call(
+            window,
+            cx,
+            "m1",
+            "terminals.send",
+            json!({"id": id, "text": "ls", "key": "ctrl-d"}),
+        );
+        assert!(bad_key.unwrap_err().contains("Unknown key"));
+        let none = call(window, cx, "m1", "terminals.send", json!({"id": id}));
+        assert!(none.unwrap_err().contains("text or key"));
+    }
+
+    #[gpui::test]
+    fn multi_line_text_is_a_bracketed_paste_only_when_the_program_asked_for_one(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, _, _) = window(cx);
+        add_monos(window, cx, &["m1"]);
+        let id = dock(window, cx, "BE");
+        let t = terminal(window, cx, &id);
+        let run = |cx: &mut TestAppContext, input: Value| {
+            let answer = wait(window, cx, "m1", "terminals.send", input);
+            choose(window, cx, mono_approval::Choice::Run);
+            answer.try_recv().unwrap().unwrap()
+        };
+        // Off: each line ends in Enter, as a paste into a plain terminal does.
+        run(cx, json!({"id": id, "text": "a\nb"}));
+        assert_eq!(sent(window, cx, &id), b"a\rb");
+        window
+            .update(cx, |_, _, cx| {
+                t.update(cx, |t, cx| t.fake_output("\x1b[?2004h", cx))
+            })
+            .unwrap();
+        run(cx, json!({"id": id, "text": "c\nd"}));
+        assert_eq!(sent(window, cx, &id), b"a\rb\x1b[200~c\nd\x1b[201~");
+        // One line stays bare in both modes, and a key can follow in the same call.
+        let before = sent(window, cx, &id).len();
+        let result = run(cx, json!({"id": id, "text": "ls -la", "key": "enter"}));
+        assert_eq!(result["key"], "enter");
+        assert_eq!(sent(window, cx, &id)[before..], *b"ls -la\r");
+        window
+            .update(cx, |_, _, cx| {
+                t.update(cx, |t, cx| t.fake_output("\x1b[?2004l", cx))
+            })
+            .unwrap();
+        let before = sent(window, cx, &id).len();
+        run(cx, json!({"id": id, "text": "q"}));
+        assert_eq!(sent(window, cx, &id)[before..], *b"q");
+    }
+
+    #[gpui::test]
+    fn pending_approvals_queue_one_dialog_at_a_time_and_answer_in_order(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        add_monos(window, cx, &["m1", "m2"]);
+        let first = wait(window, cx, "m1", "terminals.open", open_command("A", "one"));
+        let second = wait(window, cx, "m2", "terminals.open", open_command("B", "two"));
+        let third = wait(
+            window,
+            cx,
+            "m1",
+            "terminals.open",
+            open_command("C", "three"),
+        );
+        assert_eq!(waiting(window, cx), 3);
+        window
+            .update(cx, |shell, _, _| {
+                assert_eq!(shell.mono_approvals.queue[0].request.text, "one");
+                assert!(shell.mono_approvals.queue[0].shown);
+                assert!(!shell.mono_approvals.queue[1].shown, "one dialog at a time");
+            })
+            .unwrap();
+        choose(window, cx, mono_approval::Choice::Run);
+        assert!(first.try_recv().unwrap().is_ok());
+        assert!(second.try_recv().is_err() && third.try_recv().is_err());
+        window
+            .update(cx, |shell, _, _| {
+                let front = shell.mono_approvals.queue.front().unwrap();
+                assert_eq!(front.request.text, "two");
+                assert!(front.shown && !front.armed, "the next one starts guarded");
+            })
+            .unwrap();
+        choose(window, cx, mono_approval::Choice::Deny);
+        assert_eq!(second.try_recv().unwrap(), declined());
+        assert!(third.try_recv().is_err());
+        choose(window, cx, mono_approval::Choice::Run);
+        assert!(third.try_recv().unwrap().is_ok());
+        assert_eq!(all_terminals(window, cx), 2);
+    }
+
+    #[gpui::test]
+    fn a_terminal_closed_while_the_dialog_waits_answers_an_error_and_writes_nothing(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, _, _) = window(cx);
+        add_monos(window, cx, &["m1"]);
+        let id = dock(window, cx, "BE");
+        let t = terminal(window, cx, &id);
+        let a = wait(
+            window,
+            cx,
+            "m1",
+            "terminals.send",
+            json!({"id": id, "text": "ls"}),
+        );
+        let b = wait(
+            window,
+            cx,
+            "m1",
+            "terminals.send",
+            json!({"id": id, "text": "pwd"}),
+        );
+        window
+            .update(cx, |shell, w, cx| shell.remove_terminal(PROJECT, 0, w, cx))
+            .unwrap();
+        // The check that runs while the dialog is up drops both without anyone choosing.
+        cx.executor().advance_clock(Duration::from_millis(600));
+        cx.run_until_parked();
+        for answer in [a, b] {
+            let err = answer.try_recv().unwrap().unwrap_err();
+            assert!(err.contains("Unknown terminal"), "{err}");
+        }
+        assert_eq!(waiting(window, cx), 0);
+        assert!(
+            window
+                .update(cx, |_, _, cx| t.read(cx).sent_bytes().is_empty())
+                .unwrap()
+        );
+
+        // Closed between the last check and the click: approving checks again.
+        let id = dock(window, cx, "BE");
+        let t = terminal(window, cx, &id);
+        let c = wait(
+            window,
+            cx,
+            "m1",
+            "terminals.send",
+            json!({"id": id, "text": "ls"}),
+        );
+        window
+            .update(cx, |shell, w, cx| shell.remove_terminal(PROJECT, 0, w, cx))
+            .unwrap();
+        choose(window, cx, mono_approval::Choice::Run);
+        assert!(
+            c.try_recv()
+                .unwrap()
+                .unwrap_err()
+                .contains("Unknown terminal")
+        );
+        assert!(
+            window
+                .update(cx, |_, _, cx| t.read(cx).sent_bytes().is_empty())
+                .unwrap()
+        );
+    }
+
+    #[gpui::test]
+    fn a_deleted_mono_or_an_unlisted_project_runs_nothing(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        add_monos(window, cx, &["m1", "m2"]);
+        let gone = wait(window, cx, "m1", "terminals.open", open_command("A", "one"));
+        let moved = wait(window, cx, "m2", "terminals.open", open_command("B", "two"));
+        window
+            .update(cx, |shell, _, cx| {
+                shell.mono_manager().update(cx, |monos, _| {
+                    monos.roster.monos.retain(|m| m.id != "m1");
+                    monos.roster.get_mut("m2").unwrap().projects = vec!["/elsewhere".into()];
+                })
+            })
+            .unwrap();
+        // The user clicks Run on the first before the check had a chance to drop it.
+        choose(window, cx, mono_approval::Choice::Run);
+        let err = gone.try_recv().unwrap().unwrap_err();
+        assert!(err.contains("no longer available"), "{err}");
+        cx.executor().advance_clock(Duration::from_millis(600));
+        cx.run_until_parked();
+        assert!(
+            moved
+                .try_recv()
+                .unwrap()
+                .unwrap_err()
+                .contains("no longer available")
+        );
+        assert_eq!((waiting(window, cx), all_terminals(window, cx)), (0, 0));
+        // A Mono that is not on the roster is not asked about at all.
+        let unknown = ask(
+            window,
+            cx,
+            "ghost",
+            "terminals.open",
+            open_command("A", "one"),
+        );
+        let MonoTerminalReply::Now(Err(err)) = unknown else {
+            panic!("a Mono that is gone cannot be asked about");
+        };
+        assert!(err.contains("no longer available"));
+    }
+
+    #[gpui::test]
+    fn an_approval_after_the_call_was_abandoned_runs_nothing(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        add_monos(window, cx, &["m1"]);
+        let answer = wait(window, cx, "m1", "terminals.open", open_command("A", "one"));
+        drop(answer);
+        choose(window, cx, mono_approval::Choice::Run);
+        assert_eq!(all_terminals(window, cx), 0, "no terminal, no command");
+        let id = dock(window, cx, "BE");
+        let answer = wait(
+            window,
+            cx,
+            "m1",
+            "terminals.send",
+            json!({"id": id, "text": "ls", "key": "enter"}),
+        );
+        drop(answer);
+        choose(window, cx, mono_approval::Choice::Allow);
+        assert!(sent(window, cx, &id).is_empty());
+        assert_eq!(waiting(window, cx), 0);
+    }
+
+    #[gpui::test]
+    fn an_unanswered_dialog_expires_before_the_bridge_gives_up(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        add_monos(window, cx, &["m1"]);
+        let id = dock(window, cx, "BE");
+        let answer = wait(
+            window,
+            cx,
+            "m1",
+            "terminals.send",
+            json!({"id": id, "text": "ls"}),
+        );
+        let later = wait(
+            window,
+            cx,
+            "m1",
+            "terminals.send",
+            json!({"id": id, "text": "pwd"}),
+        );
+        let wait_for = monocode_core::mono::bridge::APPROVAL_WAIT;
+        assert!(wait_for < monocode_core::mono::bridge::wait_for("terminals.send"));
+        cx.executor()
+            .advance_clock(wait_for - Duration::from_secs(1));
+        cx.run_until_parked();
+        assert!(answer.try_recv().is_err(), "still waiting just before");
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        for answer in [answer, later] {
+            let err = answer.try_recv().unwrap().unwrap_err();
+            assert!(err.contains("did not answer in time"), "{err}");
+        }
+        assert_eq!(waiting(window, cx), 0);
+        assert!(sent(window, cx, &id).is_empty());
+    }
+
+    #[gpui::test]
+    fn free_input_is_refused_before_asking_when_it_could_never_run(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        add_monos(window, cx, &["m1"]);
+        let user = user_terminal(window, cx);
+        let user_id = rows(window, cx)[0]["id"].as_str().unwrap().to_owned();
+        let err = call(
+            window,
+            cx,
+            "m1",
+            "terminals.send",
+            json!({"id": user_id, "text": "ls"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("user opened"), "{err}");
+        let agent = dock(window, cx, "AI");
+        let t = terminal(window, cx, &agent);
+        window
+            .update(cx, |_, _, cx| {
+                t.update(cx, |t, _| t.foreground = Some("claude".into()))
+            })
+            .unwrap();
+        let err = call(
+            window,
+            cx,
+            "m1",
+            "terminals.send",
+            json!({"id": agent, "text": "ls"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("agent CLI"), "{err}");
+        for cwd in ["/tmp", "../x"] {
+            let mut input = open_command("X", "ls");
+            input["cwd"] = json!(cwd);
+            assert!(
+                call(window, cx, "m1", "terminals.open", input).is_err(),
+                "{cwd}"
+            );
+        }
+        assert_eq!(waiting(window, cx), 0);
+        assert!(
+            window
+                .update(cx, |_, _, cx| user.read(cx).sent_bytes().is_empty())
+                .unwrap()
+        );
+    }
+
+    #[gpui::test]
+    fn a_saved_action_still_runs_without_asking(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        add_monos(window, cx, &["m1"]);
+        window
+            .update(cx, |shell, _, _| {
+                shell.workspace.actions.insert(
+                    PROJECT.into(),
+                    vec![ProjectAction {
+                        id: "a1".into(),
+                        name: "Dev".into(),
+                        command: "npm run dev".into(),
+                        ..Default::default()
+                    }],
+                );
+            })
+            .unwrap();
+        let opened = call(
+            window,
+            cx,
+            "m1",
+            "terminals.open",
+            json!({"label": "BE", "action": "a1", "place": "dock"}),
+        )
+        .unwrap();
+        assert_eq!(waiting(window, cx), 0);
+        assert_eq!(
+            sent(window, cx, opened["id"].as_str().unwrap()),
+            b"npm run dev\r"
+        );
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {

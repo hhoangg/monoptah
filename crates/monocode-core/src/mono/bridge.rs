@@ -14,6 +14,21 @@ use std::{
     time::Duration,
 };
 
+/// How long the user has to answer an approval dialog (`terminals.open command`,
+/// `terminals.send text`). The app answers the call with an error when it runs out, and the
+/// bridge waits a little longer than that ([`wait_for`]), so an approval can never be given
+/// after the Mono stopped waiting and then run late.
+pub const APPROVAL_WAIT: Duration = Duration::from_secs(90);
+
+/// How long the bridge waits for the app's answer to `action`.
+pub fn wait_for(action: &str) -> Duration {
+    if matches!(action, "terminals.open" | "terminals.send") {
+        APPROVAL_WAIT + Duration::from_secs(10)
+    } else {
+        Duration::from_secs(60)
+    }
+}
+
 pub const HELP: &str = r#"Monoptah app access
 Usage: monocode-gpui app ACTION --json '{...}' [--request-id ID]
 Pass --input FILE or --input - to read a JSON object instead.
@@ -59,8 +74,8 @@ sessions.delete providerFiles: true also removes the session's provider session 
 worktrees.list {project?}
 worktrees.create {branch,base?,existing?,project?}
 terminals.list {project?}: the project's terminals you may see: [{id,label,cwd,place:"dock"|"split"|"tab",running,exited,exitCode,owner:"mono"|"user"}]. Ids are opaque (t-1, t-2). Mono only.
-terminals.open {label,action?,cwd?,place?:"dock"|"split",beside?,direction?:"right"|"down",reveal?,project?}: opens a terminal named label (up to 40 characters) in the project and returns {id,reused}. action is the id of a Project Action the user saved; it runs there without asking. Without action it opens a plain shell. place defaults to the user's terminal setting; split puts it as a pane beside the terminal id in beside (else beside your other terminals, else the active pane), direction right (default) or down, so BE and FE can sit side by side. An idle terminal of yours with the same label is reused (reused:true). cwd must stay inside the project or one of its worktrees. reveal shows the terminal without moving the keyboard focus. command (a free shell command) is not available yet: it will need the user's approval.
-terminals.send {id,key,project?}: key is one of ctrl-c, enter, up, down, q, tab, esc. Only terminals you opened; never a terminal that runs an agent CLI. text is not available yet (it will need the user's approval).
+terminals.open {label,action?,command?,cwd?,place?:"dock"|"split",beside?,direction?:"right"|"down",reveal?,project?}: opens a terminal named label (up to 40 characters) in the project and returns {id,reused}. action is the id of a Project Action the user saved; it runs there without asking. command is a free shell command (up to 4096 bytes, no control characters; give action or command, not both): it is typed into the terminal and Enter is pressed, but only after the user approves it in a dialog that shows the exact command, the terminal's label and its directory. The user may Run it once, Allow it for you (that exact string, byte for byte, then runs without asking), or Deny it (the call fails with "The user declined this command"). The call waits for that answer for up to 90 seconds, then fails and nothing runs; it never runs late. Prefer action. Without action or command it opens a plain shell. place defaults to the user's terminal setting; split puts it as a pane beside the terminal id in beside (else beside your other terminals, else the active pane), direction right (default) or down, so BE and FE can sit side by side. An idle terminal of yours with the same label is reused (reused:true). cwd must stay inside the project or one of its worktrees. reveal shows the terminal without moving the keyboard focus.
+terminals.send {id,text?,key?,project?}: types into a terminal you opened (never one that runs an agent CLI); give text, key or both. key is one of ctrl-c, enter, up, down, q, tab, esc and needs no approval. text (up to 4096 bytes) is typed exactly as given and no Enter is added: follow it with key enter in the same call (the text is typed first, then the key) or in the next call to run it. text may contain \n and \t but no other control character (use key for those; the call fails with "use key for control keys"). Text with a line break is sent as one bracketed paste when the program has turned that on, else line by line. Like command, text needs the user's approval (Run, Allow this text for you, Deny), waits up to 90 seconds and never runs late.
 terminals.read {id,lines?,project?}: {text,truncated,running,exited,exitCode}, the last lines (default 200, at most 1000) of the terminal's output, secrets masked. A terminal the user opened can be read only if they turned on Let Mono read for it.
 terminals.stop {id,project?}: sends ctrl-c, then hangs up the foreground job after 3 seconds if it is still running; returns {stopping:true} at once. terminals.close {id,project?}: closes a terminal you opened.
 folders.list {project?}
@@ -209,6 +224,7 @@ fn serve(
     }
     let (reply, result) = mpsc::channel();
     let request_id = wire.request_id;
+    let wait = wait_for(&wire.action);
     tx.send_blocking(Call {
         session: wire.session,
         request_id: request_id.clone(),
@@ -217,7 +233,7 @@ fn serve(
         reply,
     })
     .map_err(|_| "App closed")?;
-    let response = match result.recv_timeout(Duration::from_secs(60)) {
+    let response = match result.recv_timeout(wait) {
         Ok(Ok(value)) => json!({"ok":true,"result":value,"requestId":request_id}),
         Ok(Err(error)) => json!({"ok":false,"error":error,"requestId":request_id}),
         Err(_) => {
@@ -296,7 +312,7 @@ fn call(action: String, input: Value, request_id: String) -> Result<Value, Strin
     let mut stream =
         TcpStream::connect_timeout(&endpoint, Duration::from_secs(3)).map_err(|e| e.to_string())?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(65)))
+        .set_read_timeout(Some(wait_for(&wire.action) + Duration::from_secs(5)))
         .map_err(|e| e.to_string())?;
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))

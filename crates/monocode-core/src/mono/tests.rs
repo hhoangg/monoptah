@@ -614,10 +614,9 @@ fn terminal_actions_are_documented_validated_and_captioned() {
             "{action} has no caption"
         );
     }
-    assert!(
-        bridge::HELP.contains("needs the user's approval")
-            || bridge::HELP.contains("will need the user's approval")
-    );
+    assert!(bridge::HELP.contains("only after the user approves it"));
+    assert!(bridge::HELP.contains("The user declined this command"));
+    assert!(bridge::HELP.contains("use key for control keys"));
     for (action, input) in [
         ("terminals.list", json!({"project": "/p"})),
         (
@@ -639,4 +638,61 @@ fn terminal_actions_are_documented_validated_and_captioned() {
     assert!(crate::app_access::validate_operator("terminals.list", &json!({})).is_err());
     let rules = instructions(&Mono::default(), std::path::Path::new("/bin/app"));
     assert!(rules.contains("terminals.open") && rules.contains("agent CLI"));
+    // The approval is explained, and a saved action is the way that needs none.
+    assert!(rules.contains("Prefer a saved Project Action"));
+    assert!(rules.contains("that exact string, byte for byte"));
+    assert!(rules.contains("do not retry the same or a disguised command"));
+}
+
+#[test]
+fn terminal_input_is_capped_and_the_bridge_waits_for_the_user_not_longer() {
+    use serde_json::json;
+    let big = "x".repeat(api::TERMINAL_INPUT_MAX + 1);
+    let fits = "x".repeat(api::TERMINAL_INPUT_MAX);
+    for (action, field, base) in [
+        ("terminals.send", "text", json!({"id": "t-1"})),
+        ("terminals.open", "command", json!({"label": "BE"})),
+    ] {
+        let mut ok = base.clone();
+        ok[field] = json!(fits);
+        assert_eq!(api::validate(action, &ok), Ok(()), "{field}");
+        let mut bad = base;
+        bad[field] = json!(big);
+        assert!(api::validate(action, &bad).unwrap_err().contains("4096"));
+    }
+    // The call waits on a person, so the bridge outlasts the approval and never gives up first.
+    for action in ["terminals.open", "terminals.send"] {
+        assert!(bridge::wait_for(action) > bridge::APPROVAL_WAIT, "{action}");
+    }
+    assert_eq!(bridge::wait_for("terminals.read").as_secs(), 60);
+    assert_eq!(bridge::wait_for("sessions.list").as_secs(), 60);
+}
+
+#[test]
+fn a_monos_terminal_allow_list_is_exact_per_kind_capped_and_persisted() {
+    let mut mono = Mono::default();
+    assert!(!mono.allows_terminal("command", "npm test"));
+    assert!(mono.allow_terminal("command", "npm test"));
+    assert!(!mono.allow_terminal("command", "npm test"), "no duplicates");
+    assert!(mono.allows_terminal("command", "npm test"));
+    for near in ["npm test ", " npm test", "npm  test", "NPM test", "npm"] {
+        assert!(!mono.allows_terminal("command", near), "{near:?}");
+    }
+    // A command is not text, and another Mono has its own list.
+    assert!(!mono.allows_terminal("text", "npm test"));
+    assert!(!Mono::default().allows_terminal("command", "npm test"));
+    // Older rosters have no list; an empty one stays out of the file.
+    let empty: Mono = serde_json::from_str(r#"{"id":"a"}"#).unwrap();
+    assert!(empty.terminal_allow.is_empty());
+    assert!(!serde_json::to_string(&empty)
+        .unwrap()
+        .contains("terminalAllow"));
+    let back: Mono = serde_json::from_str(&serde_json::to_string(&mono).unwrap()).unwrap();
+    assert!(back.allows_terminal("command", "npm test"));
+    for n in 0..(TERMINAL_ALLOW_MAX + 5) {
+        mono.allow_terminal("command", &format!("c{n}"));
+    }
+    assert_eq!(mono.terminal_allow.len(), TERMINAL_ALLOW_MAX);
+    assert!(!mono.allows_terminal("command", "npm test"), "oldest first");
+    assert!(mono.allows_terminal("command", &format!("c{}", TERMINAL_ALLOW_MAX + 4)));
 }

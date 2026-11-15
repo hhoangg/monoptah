@@ -346,6 +346,37 @@ impl Monos {
         });
         cx.notify();
     }
+    /// Whether the user let this Mono run exactly `text` as `kind` ("command" or "text") in a
+    /// terminal without asking again.
+    pub(crate) fn terminal_allowed(&self, mono: &str, kind: &str, text: &str) -> bool {
+        self.roster
+            .get(mono)
+            .is_some_and(|m| m.allows_terminal(kind, text))
+    }
+    /// Remembers that exact string for this Mono, saved with the rest of its settings.
+    pub(crate) fn allow_terminal(
+        &mut self,
+        mono: &str,
+        kind: &str,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = self
+            .roster
+            .monos
+            .iter_mut()
+            .find(|m| m.id == mono)
+            .is_some_and(|m| m.allow_terminal(kind, text));
+        if changed {
+            self.save(cx);
+        }
+    }
+    /// A Mono's name for a dialog, and whether it still exists and still has `project`.
+    pub(crate) fn terminal_caller(&self, mono: &str, project: &str) -> Option<String> {
+        let mono = self.roster.get(mono)?;
+        mono.project(Some(project)).ok()?;
+        Some(mono.label())
+    }
     fn app_caller(&self, call: &Call) -> Result<Mono, String> {
         let mono = self
             .roster
@@ -1497,15 +1528,32 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
             }
             terminals if terminals.starts_with("terminals.") => {
                 // Run after this update: the shell may read the Monos entity being updated now.
+                // A free command or typed text waits for the user: the shell answers through
+                // the channel it hands back, and the call stays pending until then.
                 let owner = self.owner.clone();
+                let handle = window.window_handle();
                 let mono = mono.id.clone();
                 cx.spawn(async move |this, cx| {
-                    let result = owner
-                        .update(cx, |owner, cx| {
-                            owner.mono_terminals_call(&mono, &project, &action, &input, cx)
+                    let reply = handle
+                        .update(cx, |_, window, cx| {
+                            owner.update(cx, |owner, cx| {
+                                let reply =
+                                    owner.mono_terminals_call(&mono, &project, &action, &input, cx);
+                                owner.show_mono_approval(window, cx);
+                                reply
+                            })
                         })
                         .map_err(|_| "The app window is gone".to_owned())
-                        .and_then(|result| result);
+                        .and_then(|reply| reply.map_err(|_| "The app window is gone".to_owned()));
+                    let result = match reply {
+                        Ok(crate::shell::MonoTerminalReply::Now(result)) => result,
+                        Ok(crate::shell::MonoTerminalReply::Later(answer)) => {
+                            answer.recv().await.unwrap_or_else(|_| {
+                                Err("The approval dialog is gone; nothing was run".into())
+                            })
+                        }
+                        Err(error) => Err(error),
+                    };
                     let _ = this.update(cx, |this, cx| this.finish_call(call, result, cx));
                 })
                 .detach();

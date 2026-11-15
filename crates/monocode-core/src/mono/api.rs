@@ -4,6 +4,9 @@ use serde_json::Value;
 /// instance: a new cloud instance takes the account, an existing one keeps its own.
 pub const ACCOUNT_EXISTING_INSTANCE: &str =
     "The account belongs to the instance; it cannot change for an existing one.";
+/// The most bytes of `command` or `text` a terminal call takes.
+pub const TERMINAL_INPUT_MAX: usize = 4096;
+
 /// Reject misspelled fields and ambiguous types before any app mutation.
 pub fn validate(action: &str, input: &Value) -> Result<(), String> {
     let cloud_fields;
@@ -165,6 +168,18 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         && input.get("cloud").is_some()
     {
         return Err("removeWorktree and cloud cannot be combined; choose one per call".into());
+    }
+    // What a Mono types into a terminal is shown to the user whole, so it stays small.
+    if action.starts_with("terminals.") {
+        for key in ["text", "command"] {
+            if input
+                .get(key)
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.len() > TERMINAL_INPUT_MAX)
+            {
+                return Err(format!("{key} is at most {TERMINAL_INPUT_MAX} bytes"));
+            }
+        }
     }
     if let Some(account) = input.get("account") {
         let account = account.as_str().unwrap_or_default();

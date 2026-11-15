@@ -6034,12 +6034,32 @@ fn terminals_belong_to_the_monos_own_chat_and_not_to_habit_runs_or_heartbeats(
     )
     .unwrap();
     assert!(ask_habit(&s, "t-read", "terminals.read", json!({"id": id}), cx).is_ok());
+    // Typed text is not refused: it waits for the user, who declines it here.
+    let typed = call(
+        &s,
+        "t-text",
+        "terminals.send",
+        json!({"id": id, "text": "ls"}),
+        cx,
+    );
+    assert_eq!(typed.try_recv(), Err(mpsc::TryRecvError::Empty));
+    cx.update(|cx| {
+        s.window
+            .update(cx, |shell, w, cx| shell.deny_front_mono_approval(w, cx))
+            .unwrap()
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        typed.try_recv().unwrap(),
+        Err("The user declined this command".into())
+    );
+    // A control character is refused outright.
     assert!(
         ask_habit(
             &s,
-            "t-text",
+            "t-ctl",
             "terminals.send",
-            json!({"id": id, "text": "ls"}),
+            json!({"id": id, "text": "ls\u{1b}[2J"}),
             cx
         )
         .is_err()
@@ -6076,6 +6096,46 @@ fn terminals_belong_to_the_monos_own_chat_and_not_to_habit_runs_or_heartbeats(
     // Nothing the refused calls asked for happened.
     let after = ask_habit(&s, "t-list2", "terminals.list", json!({}), cx).unwrap();
     assert_eq!(after.as_array().unwrap().len(), 1);
+}
+
+#[gpui::test]
+fn an_allowed_terminal_command_is_saved_with_the_mono_and_leaves_with_it(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    s.manager.update(cx, |m, cx| {
+        m.allow_terminal(&s.id, "command", "npm test", cx)
+    });
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let m = s.manager.read(cx);
+        assert!(m.terminal_allowed(&s.id, "command", "npm test"));
+        assert!(!m.terminal_allowed(&s.id, "command", "npm test "));
+        assert!(!m.terminal_allowed(&s.id, "text", "npm test"));
+        assert!(!m.terminal_allowed("another", "command", "npm test"));
+    });
+    // On disk, so a restart finds it.
+    let saved = Roster::load(&locked(&s.store).unwrap()).unwrap();
+    assert!(
+        saved
+            .get(&s.id)
+            .unwrap()
+            .allows_terminal("command", "npm test")
+    );
+    // Deleting the Mono forgets it.
+    s.manager.update(cx, |m, cx| m.remove_mono(&s.id, cx));
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert!(
+            !s.manager
+                .read(cx)
+                .terminal_allowed(&s.id, "command", "npm test")
+        )
+    });
+    assert!(
+        Roster::load(&locked(&s.store).unwrap())
+            .unwrap()
+            .get(&s.id)
+            .is_none()
+    );
 }
 
 #[gpui::test]

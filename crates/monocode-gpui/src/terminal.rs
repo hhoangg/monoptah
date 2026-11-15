@@ -786,6 +786,37 @@ impl Terminal {
         self.write(key.bytes());
         cx.notify();
     }
+    /// Types `text` as a Mono asked, after the user approved it. It goes in as given, never
+    /// trimmed. A text with a line break is one bracketed paste when the program turned that
+    /// mode on (so the shell does not run each line as it arrives), else its lines end in
+    /// Enter like a paste into a plain terminal. `submit` presses Enter after the text.
+    /// The caller has already refused control characters. Not typing by the user, so
+    /// `user_typed` stays.
+    pub(crate) fn send_text(&mut self, text: &str, submit: bool, cx: &mut Context<Self>) {
+        let multiline = text.contains('\n');
+        let bracketed = self.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
+        let mut bytes = if !multiline {
+            text.as_bytes().to_vec()
+        } else if bracketed {
+            // The end marker inside the text must not end the paste early.
+            let text = text.replace("\x1b[201~", "");
+            format!("\x1b[200~{text}\x1b[201~").into_bytes()
+        } else {
+            text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
+        };
+        if submit {
+            bytes.push(b'\r');
+        }
+        self.term.lock().scroll_display(Scroll::Bottom);
+        self.write(bytes);
+        if submit
+            && !multiline
+            && let Some(label) = command_label(text.trim())
+        {
+            self.set_foreground(Some(label), cx);
+        }
+        cx.notify();
+    }
     /// Every byte `write` was asked to send, since a test PTY has no reader.
     #[cfg(test)]
     pub(crate) fn sent_bytes(&self) -> Vec<u8> {
@@ -3184,6 +3215,25 @@ mod tests {
             t.send_key(MonoKey::Up, cx);
             assert_eq!(t.sent_bytes(), b"\x1b[A");
             assert!(!t.user_typed, "a Mono's key is not the user typing");
+        });
+    }
+
+    #[gpui::test]
+    fn send_text_types_as_given_and_pastes_only_in_bracketed_mode(cx: &mut gpui::TestAppContext) {
+        let terminal = cx.new(|cx| Terminal::new("/tmp".into(), cx));
+        terminal.update(cx, |t, cx| {
+            // Not trimmed, no Enter unless asked, and not the user typing.
+            t.send_text("  ls  ", false, cx);
+            assert_eq!(t.sent_bytes(), b"  ls  ");
+            t.send_text("a\r\nb\nc", true, cx);
+            assert_eq!(t.sent_bytes(), b"  ls  a\rb\rc\r");
+            assert!(!t.user_typed);
+            t.fake_output("\x1b[?2004h", cx);
+            t.send_text("x\ny\x1b[201~z", false, cx);
+            assert_eq!(
+                t.sent_bytes(),
+                b"  ls  a\rb\rc\r\x1b[200~x\nyz\x1b[201~".to_vec()
+            );
         });
     }
 }
