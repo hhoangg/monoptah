@@ -1007,6 +1007,11 @@ impl CloudSessions {
         // Without the sandbox seams nothing is touched, the record included.
         self.sandbox_deps()?;
         let session_id = record.session_id;
+        // A start (or its Retry) that binds to this sandbox is the user bringing it back: what
+        // was said about its last Stop is history.
+        if let Some(name) = &record.sandbox {
+            self.forget_stop(&super::backend::CloudRef::sandbox(name));
+        }
         record.reset_for_run();
         if cancel.load(Ordering::Relaxed) {
             return Err(START_ABORTED.into());
@@ -2150,6 +2155,9 @@ impl CloudSessions {
         mut record: StartRecord,
     ) -> Result<StartRecord, String> {
         let session_id = record.session_id;
+        if let Some(name) = &record.sandbox {
+            self.forget_stop(&super::backend::CloudRef::sandbox(name));
+        }
         let now = self.now();
         let provisioned = record
             .sandbox_start

@@ -674,8 +674,10 @@ impl CloudApi {
         result
     }
 
-    /// `cloud.stop {sessionId | kind+instance}`: stops the instance (state is kept; a send to
-    /// a session on it wakes it). Proceeds while sessions are busy and says so in `warning`.
+    /// `cloud.stop {sessionId | kind+instance}`: asks the instance to stop (state is kept; a send
+    /// to a session on it wakes it). Proceeds while sessions are busy and says so in `warning`.
+    /// The answer says the stop was requested and accepted (`stopped: true`),
+    /// not that the instance has stopped: a sandbox takes seconds to minutes and can come back.
     pub fn stop(&self, project: &str, input: &Value, busy: ExtraBusy) -> Result<Value, String> {
         let address = self.address(project, input)?;
         self.stop_target(&address.cloud, busy)
@@ -701,14 +703,22 @@ impl CloudApi {
             ));
         }
         let sessions = self.busy_sessions_on(cloud, self.cloud.cloud_state_of(cloud), busy);
-        self.cloud.stop_cloud(cloud)?;
+        let note = self.cloud.stop_cloud_noted(cloud)?;
+        // `stopped` is the field callers (and tests) pin, so its name stays; it means the stop
+        // was REQUESTED and accepted. The workspaces overview says what became of it (see
+        // `cloud_sessions::stopping`).
         let mut result = self.outcome(cloud, "stopped", &sessions);
         let names = busy_names(&sessions);
+        let mut warnings = Vec::new();
         if !names.is_empty() {
-            result["warning"] = json!(format!(
+            warnings.push(format!(
                 "Sessions that were working on this {} were interrupted: {names}.",
                 cloud.noun()
             ));
+        }
+        warnings.extend(note);
+        if !warnings.is_empty() {
+            result["warning"] = json!(warnings.join(" "));
         }
         Ok(result)
     }

@@ -1145,9 +1145,24 @@ pub fn pairing_script(platform: HostPlatform, name: &str) -> String {
     }
 }
 
+/// What closing a machine's tunnel did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TunnelClose {
+    /// A live tunnel was closed (its ssh process killed).
+    Closed,
+    /// There was no live tunnel to close, or it was started after the listing that asked.
+    NoneOpen,
+    /// A request or a start holds the machine's lock, so nothing was looked at without waiting:
+    /// the tunnel closes when that ends. For a Stop this means it may still wake the sandbox.
+    Deferred,
+}
+
 pub struct Tunnel {
     child: Child,
     pub port: u16,
+    /// When the ssh process was spawned (ms since the epoch): a listing read before this says
+    /// nothing about the tunnel.
+    started_ms: u64,
     stderr: Arc<Mutex<String>>,
     /// Distinguishes this tunnel from every other one ever started, even on a reused port.
     id: u64,
@@ -1176,6 +1191,7 @@ impl Tunnel {
         Self {
             child,
             port,
+            started_ms: crate::time::now_ms(),
             stderr: Arc::default(),
             id: next_tunnel_id(),
         }
@@ -1246,6 +1262,7 @@ impl Tunnel {
         let mut tunnel = Self {
             child,
             port,
+            started_ms: crate::time::now_ms(),
             stderr,
             id: next_tunnel_id(),
         };
@@ -1343,8 +1360,66 @@ impl Tunnels {
         drop(old);
     }
     pub fn remove(&self, id: &str) {
-        let old = self.slots().remove(id);
-        drop(old);
+        self.close(id);
+    }
+    /// Takes the tunnel of `id` out of use and closes it now, without waiting: the machine lock
+    /// is held by a (re)start for up to 20 seconds, and a caller may hold the connection store.
+    /// When the lock is busy the slot is already unreachable, so the tunnel being started is
+    /// dropped (and killed) with its last lease instead, and the answer is
+    /// [`TunnelClose::Deferred`].
+    pub fn close(&self, id: &str) -> TunnelClose {
+        let Some(old) = self.slots().remove(id) else {
+            return TunnelClose::NoneOpen;
+        };
+        let tunnel = match old.try_lock() {
+            Ok(mut slot) => slot.tunnel.take(),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().tunnel.take(),
+            Err(std::sync::TryLockError::WouldBlock) => return TunnelClose::Deferred,
+        };
+        Self::closed(tunnel)
+    }
+    /// [`Self::close`], but only a tunnel that was started BEFORE `listed_at_ms` (the moment a
+    /// listing was read). A listing that was read before a reconnect finished says nothing
+    /// about the tunnel that reconnect opened. A busy machine lock is left alone (the next
+    /// listing asks again): [`TunnelClose::Deferred`].
+    pub fn close_if_started_before(&self, id: &str, listed_at_ms: u64) -> TunnelClose {
+        let Some(slot) = self.slots().get(id).cloned() else {
+            return TunnelClose::NoneOpen;
+        };
+        let tunnel = match slot.try_lock() {
+            Ok(mut current) => {
+                if current
+                    .tunnel
+                    .as_ref()
+                    .is_none_or(|tunnel| tunnel.started_ms >= listed_at_ms)
+                {
+                    return TunnelClose::NoneOpen;
+                }
+                current.tunnel.take()
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().tunnel.take(),
+            Err(std::sync::TryLockError::WouldBlock) => return TunnelClose::Deferred,
+        };
+        let mut slots = self.slots();
+        if slots.get(id).is_some_and(|now| Arc::ptr_eq(now, &slot)) {
+            slots.remove(id);
+        }
+        drop(slots);
+        Self::closed(tunnel)
+    }
+    fn closed(tunnel: Option<Tunnel>) -> TunnelClose {
+        match tunnel {
+            Some(mut tunnel) => {
+                let live = tunnel.alive();
+                drop(tunnel);
+                if live {
+                    TunnelClose::Closed
+                } else {
+                    TunnelClose::NoneOpen
+                }
+            }
+            None => TunnelClose::NoneOpen,
+        }
     }
     /// A live tunnel for `id`, or None. Never spawns a process and holds the
     /// machine lock only for a liveness check.
@@ -3679,6 +3754,124 @@ mod tests {
         );
         assert!(!args.contains("47200"), "{args}");
     }
+    /// Whether process `pid` exists (signal 0).
+    #[cfg(unix)]
+    fn process_exists(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    /// The tunnel kill is real: the ssh process is gone, the machine stays listed, and a tunnel
+    /// is never started again by it. (On Windows `Child::kill` ends ssh.exe; whether the
+    /// `sbx ssh-connect` child then exits was measured on macOS only.)
+    #[cfg(unix)]
+    #[test]
+    fn closing_a_machines_tunnel_kills_the_process_and_keeps_the_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("remote-machines.json"),
+            r#"[{"id":"a","name":"x","endpoint":"sbx://box","environmentId":"env","token":"t","ssh":{"target":"sbx_001abc@sbx_cloud","port":null,"remotePort":3774,"sandbox":{"id":"sbx_001abc","name":"box","workspace":"/home/agent/ws","relayPort":47200}}}]"#,
+        )
+        .unwrap();
+        let connections = std::sync::Arc::new(crate::remote::Connections::new(dir.path()));
+        let tunnel = Tunnel::for_test(4321);
+        let pid = tunnel.child.id();
+        connections.tunnels.insert("a".into(), tunnel);
+        assert!(connections.tunnels.existing("a").is_some());
+        assert!(process_exists(pid));
+
+        assert_eq!(connections.close_tunnel("a"), TunnelClose::Closed);
+        assert!(
+            !process_exists(pid),
+            "the ssh process was killed and reaped"
+        );
+        assert!(connections.tunnels.existing("a").is_none());
+        assert_eq!(connections.list().unwrap().len(), 1, "the machine is kept");
+        // Nothing left to close, and a closed tunnel is not started again by the close.
+        assert_eq!(connections.close_tunnel("a"), TunnelClose::NoneOpen);
+        assert_eq!(
+            connections.close_tunnel("never-paired"),
+            TunnelClose::NoneOpen
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closing_a_tunnel_does_not_wait_for_a_start_that_holds_the_machine_lock() {
+        let tunnels = Tunnels::default();
+        let tunnel = Tunnel::for_test(4321);
+        let pid = tunnel.child.id();
+        tunnels.insert("a".into(), tunnel);
+        let slot = tunnels.slots().get("a").cloned().unwrap();
+        // `endpoint()` holds this lock for up to 20 seconds while it starts ssh.
+        let held = slot.lock().unwrap();
+        assert_eq!(
+            tunnels.close("a"),
+            TunnelClose::Deferred,
+            "returns at once, and says it could not close it now"
+        );
+        assert!(tunnels.existing("a").is_none(), "the slot is out of use");
+        assert!(
+            process_exists(pid),
+            "still held by the request that holds the lock"
+        );
+        drop(held);
+        // The request ends: the last lease drops the slot, and the tunnel dies with it.
+        drop(slot);
+        assert!(
+            !process_exists(pid),
+            "the tunnel was killed when its lease ended"
+        );
+    }
+
+    /// A listing that was read before a tunnel was started says nothing about that tunnel.
+    #[cfg(unix)]
+    #[test]
+    fn a_listing_closes_only_a_tunnel_that_was_started_before_it_was_read() {
+        let tunnels = Tunnels::default();
+        let tunnel = Tunnel::for_test(4321);
+        let started = tunnel.started_ms;
+        let pid = tunnel.child.id();
+        tunnels.insert("a".into(), tunnel);
+        // Read before the tunnel started (a Reconnect finished while it was processed).
+        assert_eq!(
+            tunnels.close_if_started_before("a", started - 5_000),
+            TunnelClose::NoneOpen
+        );
+        assert_eq!(
+            tunnels.close_if_started_before("a", started),
+            TunnelClose::NoneOpen,
+            "read no later than the start: not older"
+        );
+        assert!(tunnels.existing("a").is_some() && process_exists(pid));
+        // Read after it started: it is the stale one.
+        assert_eq!(
+            tunnels.close_if_started_before("a", started + 5_000),
+            TunnelClose::Closed
+        );
+        assert!(tunnels.existing("a").is_none() && !process_exists(pid));
+        assert_eq!(
+            tunnels.close_if_started_before("a", started + 5_000),
+            TunnelClose::NoneOpen
+        );
+        // A busy machine lock is left alone, tunnel and slot.
+        tunnels.insert("b".into(), Tunnel::for_test(4322));
+        let slot = tunnels.slots().get("b").cloned().unwrap();
+        let held = slot.lock().unwrap();
+        assert_eq!(
+            tunnels.close_if_started_before("b", u64::MAX),
+            TunnelClose::Deferred
+        );
+        drop(held);
+        assert!(
+            tunnels.existing("b").is_some(),
+            "not removed by a deferred close"
+        );
+    }
+
     #[test]
     fn plain_sandbox_scripts_run_in_the_outer_workspace_without_devcontainer() {
         let mut target = sandbox_target().sandbox.unwrap();

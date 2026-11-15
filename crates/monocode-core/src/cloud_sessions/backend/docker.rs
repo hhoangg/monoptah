@@ -366,6 +366,10 @@ impl CloudBackend for DockerBackend {
             Err(error) => Err(error),
         }
     }
+    fn prepare_stop(&self, name: &str) -> Result<(), String> {
+        self.id_of(name)?;
+        self.try_account_of(name).map(|_| ())
+    }
     fn stop(&self, name: &str) -> Result<(), String> {
         let id = self.id_of(name)?;
         let account = self.try_account_of(name)?;

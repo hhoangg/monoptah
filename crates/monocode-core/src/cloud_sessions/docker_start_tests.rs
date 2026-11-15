@@ -486,6 +486,8 @@ type UpgradeCall = (String, Option<String>, Option<String>);
 struct FakeHost {
     machines: Mutex<Vec<Machine>>,
     log: Mutex<Vec<String>>,
+    /// Machines whose connection was closed (a Stop's tunnel close), apart from `log`.
+    closed: Mutex<Vec<String>>,
     /// Shell tags seen when the host was asked to connect (ordering evidence).
     shell: Mutex<Option<Arc<Shell>>>,
     seen_before_connect: Mutex<Vec<String>>,
@@ -595,6 +597,14 @@ impl Host for FakeHost {
         self.log.lock().unwrap().push(format!("disconnect {id}"));
         self.machines.lock().unwrap().retain(|m| m.id != id);
         Ok(())
+    }
+    fn close_connection(
+        &self,
+        id: &str,
+        _: Option<u64>,
+    ) -> Result<crate::remote::TunnelClose, String> {
+        self.closed.lock().unwrap().push(id.to_owned());
+        Ok(crate::remote::TunnelClose::Closed)
     }
 }
 
@@ -5749,4 +5759,92 @@ mod environment {
         }
         assert_eq!(fx.sbx.count("create"), 0);
     }
+}
+
+#[test]
+fn a_refused_or_duplicate_reconnect_keeps_the_stop_that_is_followed() {
+    let (fx, id, name) = started();
+    let cloud = super::backend::CloudRef::sandbox(&name);
+    let followed = || fx.svc.stops.lock().unwrap().followed();
+    fx.svc
+        .note_stop_accepted(&cloud, super::stopping::Connection::NoneOpen);
+    assert_eq!(followed(), 1);
+
+    // A send typed into a session of a sandbox that is stopping is refused: the Stop line and
+    // the stopping timer stay.
+    fx.sbx.set_state(&sandbox_id(&fx), "stopping");
+    assert_eq!(
+        fx.reconnect(id).0.unwrap_err(),
+        "Sandbox is stopping. Try again in a minute."
+    );
+    assert_eq!(followed(), 1);
+
+    // So does a second reconnect while one is in flight.
+    fx.sbx.set_state(&sandbox_id(&fx), "stopped");
+    fx.svc.reconnecting.lock().unwrap().insert(name.clone());
+    assert_eq!(
+        fx.reconnect(id).0.unwrap_err(),
+        "This sandbox is already reconnecting."
+    );
+    assert_eq!(followed(), 1);
+    fx.svc.reconnecting.lock().unwrap().remove(&name);
+
+    // A reconnect that really goes ahead is the user bringing it back: the Stop is history.
+    fx.reconnect(id).0.unwrap();
+    assert_eq!(followed(), 0);
+}
+
+#[test]
+fn a_listing_never_closes_the_connection_of_a_sandbox_with_a_start_pending() {
+    let fx = fx();
+    let (_session, record) = fx.begin().unwrap();
+    let name = record.sandbox.clone().unwrap();
+    let cloud = super::backend::CloudRef::sandbox(&name);
+    let machine = |id: &str| Machine {
+        id: id.into(),
+        name: name.clone(),
+        endpoint: "sbx://x".into(),
+        environment_id: format!("env-{id}"),
+        ssh: None,
+        codespace: None,
+        sandbox: Some(crate::remote::SandboxTarget {
+            id: sandbox_id(&fx),
+            name: name.clone(),
+            workspace: WORKSPACE.into(),
+            relay_port: 47200,
+            config: None,
+            mode: Default::default(),
+            docker_account: None,
+        }),
+    };
+    fx.host.machines.lock().unwrap().push(machine("m-open"));
+    fx.sbx.set_state(&sandbox_id(&fx), "stopped");
+    let row = || {
+        let mut row = super::workspaces::WorkspaceRow::for_close_test(&cloud);
+        row.state = super::workspaces::WorkspaceState::Stopped;
+        row
+    };
+    for _ in 0..4 {
+        fx.svc.close_connections_of_stopped(&[row()], 1);
+    }
+    assert!(
+        fx.host.closed.lock().unwrap().is_empty(),
+        "a start of it is pending: another flow may be opening a connection"
+    );
+    // Once the start is gone the same readings close it.
+    super::startup::remove_start_record(&fx.store.lock().unwrap(), record.session_id).unwrap();
+    fx.svc.close_connections_of_stopped(&[row()], 1);
+    assert_eq!(*fx.host.closed.lock().unwrap(), ["m-open"]);
+}
+
+#[test]
+fn a_start_that_binds_to_the_sandbox_clears_what_was_said_about_its_last_stop() {
+    let fx = fx();
+    let (session, record) = fx.begin().unwrap();
+    let cloud = super::backend::CloudRef::sandbox(record.sandbox.clone().unwrap());
+    fx.svc
+        .note_stop_accepted(&cloud, super::stopping::Connection::NoneOpen);
+    assert_eq!(fx.svc.stops.lock().unwrap().followed(), 1);
+    fx.run(session.id).0.unwrap();
+    assert_eq!(fx.svc.stops.lock().unwrap().followed(), 0);
 }

@@ -4,10 +4,15 @@
 //! [`CloudSessions::workspaces_overview`], which only lists and never wakes anything), so asking
 //! for it costs no CLI call beyond that load.
 //!
-//! * The chip is visible only while something is [`WorkspaceState::Running`] or
-//!   [`WorkspaceState::Starting`] ([`FooterStatus::visible`]).
-//! * It turns to a warning when a workspace carries a [`Concern`] ([`FooterStatus::warns`]).
+//! * The chip is visible while something is [`WorkspaceState::Running`] or
+//!   [`WorkspaceState::Starting`], and also while something is [`WorkspaceState::Stopping`]
+//!   (or hibernating, on its way to stopped): a workspace that is stopping still bills until
+//!   it has stopped, and a Stop that gets stuck must not make the chip vanish
+//!   ([`FooterStatus::visible`]). It hides only when every workspace is stopped or gone.
+//! * It turns to a warning when a workspace carries a [`Concern`] ([`FooterStatus::warns`]). A
+//!   stopping workspace is neutral until it has been stopping for [`STOPPING_WARN`].
 //! * [`CloudSessions::project_uses_cloud`] says whether a project is worth asking about at all.
+use super::stopping::{StopReport, STOPPING_WARN};
 use super::workspaces::{WorkspaceOverview, WorkspaceRow, WorkspaceState};
 use super::{docker_config, project_cloud, CloudBackendKind, CloudSessions};
 use std::time::Duration;
@@ -30,6 +35,10 @@ pub enum Concern {
     Orphan,
     /// It has been up longer than [`LONG_RUNNING`] and no session of it is working.
     LongRunning,
+    /// A Stop was accepted and the workspace is running again (it resumed on its own).
+    StopUndone,
+    /// It has been stopping for longer than [`STOPPING_WARN`].
+    StuckStopping,
 }
 
 impl Concern {
@@ -38,6 +47,8 @@ impl Concern {
             Self::Failed => "failed",
             Self::Orphan => "no session uses it",
             Self::LongRunning => "running for hours with no session working",
+            Self::StopUndone => "running again after a stop",
+            Self::StuckStopping => "still stopping after more than 15 minutes",
         }
     }
 }
@@ -56,19 +67,26 @@ pub struct FooterEntry {
 pub struct FooterStatus {
     /// Workspaces that are running or starting.
     pub running: usize,
+    /// Workspaces that are stopping (or hibernating, on their way to stopped).
+    pub stopping: usize,
     /// What the chip names, running ones first (the overview's order).
     pub entries: Vec<FooterEntry>,
 }
 
 /// The concern of a row at `now_ms`; the most serious one when several apply.
 pub fn concern_of(row: &WorkspaceRow, now_ms: u64) -> Option<Concern> {
-    let up = matches!(
-        row.state,
-        WorkspaceState::Running | WorkspaceState::Starting
-    );
+    let up = is_up(row.state);
     if row.state == WorkspaceState::Failed {
         Some(Concern::Failed)
-    } else if row.orphan() && row.state.accruing() {
+    } else if row.going_down() {
+        // Neutral while it goes down; stuck once it has taken too long. An orphan is not
+        // flagged for this: nothing more can be done for it than wait.
+        row.stopping_since_ms
+            .filter(|since| now_ms.saturating_sub(*since) >= STOPPING_WARN.as_millis() as u64)
+            .map(|_| Concern::StuckStopping)
+    } else if up && matches!(row.stop, Some(StopReport::StillRunning(_))) {
+        Some(Concern::StopUndone)
+    } else if row.orphan() && up {
         Some(Concern::Orphan)
     } else if up
         && !row.busy()
@@ -82,19 +100,22 @@ pub fn concern_of(row: &WorkspaceRow, now_ms: u64) -> Option<Concern> {
     }
 }
 
+fn is_up(state: WorkspaceState) -> bool {
+    matches!(state, WorkspaceState::Running | WorkspaceState::Starting)
+}
+
 impl FooterStatus {
     /// Reads `view` as of `now_ms` (the age of a workspace is measured against it, not against
     /// when the view was loaded: a cached view keeps aging).
     pub fn of(view: &WorkspaceOverview, now_ms: u64) -> Self {
         let mut status = Self::default();
         for row in &view.rows {
-            let up = matches!(
-                row.state,
-                WorkspaceState::Running | WorkspaceState::Starting
-            );
+            let up = is_up(row.state);
+            let going_down = row.going_down();
             let concern = concern_of(row, now_ms);
             status.running += usize::from(up);
-            if up || concern.is_some() {
+            status.stopping += usize::from(going_down);
+            if up || going_down || concern.is_some() {
                 status.entries.push(FooterEntry {
                     name: row.display_name.clone(),
                     backend: row.cloud.kind,
@@ -106,9 +127,9 @@ impl FooterStatus {
         status
     }
 
-    /// The chip shows: something runs or starts.
+    /// The chip shows: something runs, starts or is stopping.
     pub fn visible(&self) -> bool {
-        self.running > 0
+        self.running > 0 || self.stopping > 0
     }
 
     /// The chip takes the warning colour.

@@ -128,6 +128,13 @@ pub trait CloudBackend: Send + Sync {
     fn state(&self, name: &str) -> Result<String, String>;
     /// Fresh, read-only existence check.
     fn exists(&self, name: &str) -> Result<bool, String>;
+    /// Resolves everything [`Self::stop`] needs (a sandbox's id and its Docker account) without
+    /// changing anything, so a failure here leaves the app's connections untouched. The default
+    /// has nothing to resolve.
+    fn prepare_stop(&self, name: &str) -> Result<(), String> {
+        let _ = name;
+        Ok(())
+    }
     fn stop(&self, name: &str) -> Result<(), String>;
     fn delete(&self, name: &str) -> Result<(), String>;
     /// Rebuilds the workspace's container from its definition.

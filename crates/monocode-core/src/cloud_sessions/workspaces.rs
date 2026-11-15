@@ -29,6 +29,7 @@
 //!   did not see.
 //! * Costs are ESTIMATES: see the rate constants below.
 use super::move_session::{pending_moves, MoveTarget};
+use super::stopping::{StopReport, UnreadStop};
 use super::{
     convert, docker_config, start_record, CloudBackendKind, CloudRef, CloudSessions, CloudState,
     DeleteOutcome, InstanceSession,
@@ -299,6 +300,13 @@ pub struct WorkspaceRow {
     pub cost: CostEstimate,
     /// The backend has a web page for it (a codespace).
     pub has_web: bool,
+    /// Since when it has been stopping, in milliseconds since the epoch: from the Stop this app
+    /// had accepted, else from the first listing that showed it stopping. `None` unless the
+    /// state is stopping. The footer chip warns when this is old.
+    pub stopping_since_ms: Option<u64>,
+    /// What became of the last Stop this app asked for, read from the listing (see
+    /// [`super::stopping`]); `None` when there is nothing to tell.
+    pub stop: Option<StopReport>,
 }
 
 impl WorkspaceRow {
@@ -309,6 +317,44 @@ impl WorkspaceRow {
     }
     pub fn busy(&self) -> bool {
         self.sessions.iter().any(|s| s.busy)
+    }
+    /// A bare row of `cloud` for tests of the code that only reads its kind, name and state.
+    #[cfg(test)]
+    pub(super) fn for_close_test(cloud: &CloudRef) -> Self {
+        Self {
+            cloud: cloud.clone(),
+            id: None,
+            account: None,
+            account_label: None,
+            display_name: cloud.name.clone(),
+            branch: None,
+            size: String::new(),
+            raw_state: String::new(),
+            state: WorkspaceState::Unknown,
+            created_ms: None,
+            last_used_ms: None,
+            ours: true,
+            sessions: vec![],
+            unsaved: vec![],
+            git: None,
+            cost: CostEstimate::default(),
+            has_web: false,
+            stopping_since_ms: None,
+            stop: None,
+        }
+    }
+    /// A sandbox that is being removed reads as stopping, but it is not on its way to
+    /// `stopped`: it is going away.
+    pub fn is_deleting(&self) -> bool {
+        self.raw_state.trim().eq_ignore_ascii_case("deleting")
+    }
+    /// On its way to stopped (stopping or hibernating), and not being deleted: what the footer
+    /// chip counts as stopping and what a Stop is followed through.
+    pub fn going_down(&self) -> bool {
+        matches!(
+            self.state,
+            WorkspaceState::Stopping | WorkspaceState::Hibernating
+        ) && !self.is_deleting()
     }
     /// What Stop and Delete act on.
     pub fn target(&self) -> WorkspaceTarget {
@@ -355,6 +401,9 @@ pub struct WorkspaceOverview {
     /// The Docker accounts whose sandboxes could not be listed, and why. Empty when every
     /// account could be read.
     pub sandbox_problems: Vec<SandboxProblem>,
+    /// Stops this app is following whose workspace could not be read in this load (the listing
+    /// failed, or no longer lists it), so the dialog says so instead of the row just vanishing.
+    pub stop_unread: Vec<UnreadStop>,
 }
 
 /// What the user must be told, and has to confirm, before a workspace is deleted. Read when the
@@ -501,6 +550,7 @@ impl CloudSessions {
             gh: None,
             codespaces_error: None,
             sandbox_problems: Vec::new(),
+            stop_unread: Vec::new(),
         };
         if let Ok(repo) = self.repo_for(project) {
             let auth = codespaces::auth_status(&*self.gh);
@@ -519,7 +569,42 @@ impl CloudSessions {
             view.repo = Some(repo);
         }
         self.load_sandboxes(project, now, &mut view);
+        self.finish_view(&mut view, now);
+        view
+    }
+
+    /// Orders the rows, reads them against the Stops being followed and closes the connections
+    /// of sandboxes that are down.
+    fn finish_view(&self, view: &mut WorkspaceOverview, now: u64) {
         order(&mut view.rows);
+        self.apply_stop_reports(view, now);
+        self.close_connections_of_stopped(&view.rows, view.loaded_ms);
+    }
+
+    /// A read for the dialog's follow tick while a Stop is on its way: the sandbox listing only
+    /// (no `gh`), merged into the last loaded overview. Read-only like every load. With nothing
+    /// loaded yet it is a full forced load. The cache keeps its age, so codespace rows are not
+    /// made to look fresher than they are.
+    pub fn refresh_sandbox_rows(&self, project: &str) -> WorkspaceOverview {
+        let base = self
+            .workspace_views
+            .lock()
+            .ok()
+            .and_then(|views| views.get(project).cloned());
+        let Some((at, mut view)) = base else {
+            return self.workspaces_overview(project, true);
+        };
+        let now = (self.clock)();
+        view.rows
+            .retain(|row| row.cloud.kind != CloudBackendKind::DockerSandbox);
+        view.sandbox_problems.clear();
+        view.stop_unread.clear();
+        view.loaded_ms = now;
+        self.load_sandboxes(project, now, &mut view);
+        self.finish_view(&mut view, now);
+        if let Ok(mut views) = self.workspace_views.lock() {
+            views.insert(project.to_owned(), (at, view.clone()));
+        }
         view
     }
 
@@ -634,6 +719,8 @@ impl CloudSessions {
             last_used_ms: parse_time_ms(&c.last_used_at),
             cost: CostEstimate::compute(rate, state, created_ms, now),
             has_web: true,
+            stopping_since_ms: None,
+            stop: None,
             git,
             id: None,
             account: None,
@@ -685,6 +772,8 @@ impl CloudSessions {
             last_used_ms: None,
             cost: CostEstimate::compute(rate, state, created_ms, now),
             has_web: false,
+            stopping_since_ms: None,
+            stop: None,
             git: None,
             cloud,
         })
@@ -761,7 +850,7 @@ impl CloudSessions {
     }
 
     /// The project folders of the local sessions moved into `cloud`.
-    fn moved_projects(&self, cloud: &CloudRef) -> Vec<String> {
+    pub(super) fn moved_projects(&self, cloud: &CloudRef) -> Vec<String> {
         let Ok(store) = self.store() else {
             return Vec::new();
         };

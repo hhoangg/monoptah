@@ -1,6 +1,7 @@
 //! The cloud status chip next to the provider usage chip in the footer: how many cloud
-//! workspaces (codespaces and Docker sandboxes) of the open project are running, so a forgotten
-//! one that keeps billing is visible without opening the project menu. Clicking it (or Enter or
+//! workspaces (codespaces and Docker sandboxes) of the open project are running or stopping, so a
+//! forgotten one that keeps billing, or a Stop that is not finishing, is visible without opening
+//! the project menu. Clicking it (or Enter or
 //! Space with it focused) opens the Cloud workspaces dialog, the same one the menu item opens.
 //!
 //! What it reads is [`monocode_core::cloud_sessions::footer_status::FooterStatus`], computed
@@ -11,7 +12,10 @@
 //!   a store read) so a plain project never starts `gh`;
 //! * at most about once a minute ([`REFRESH_EVERY`]) and only while the window is active;
 //! * a failing `gh` or `sbx` is silent: that backend lists nothing, and with nothing running the
-//!   chip is hidden. No toast, no error text.
+//!   chip is hidden. No toast, no error text;
+//! * a workspace that is stopping keeps the chip on screen (`1 stopping`, neutral colour) until
+//!   it has stopped, and the chip turns to the warning colour once it has been stopping for more
+//!   than 15 minutes ([`monocode_core::cloud_sessions::stopping::STOPPING_WARN`]).
 use super::OpenCloudStatus;
 use crate::{
     cloud_mark::{CloudTip, backend_name},
@@ -142,7 +146,7 @@ impl CloudChip {
         self.refresh(cx);
     }
 
-    /// Something runs or starts: the chip shows.
+    /// Something runs, starts or is stopping: the chip shows.
     pub(crate) fn visible(&self) -> bool {
         self.status.visible()
     }
@@ -223,9 +227,13 @@ fn read(env: &Env, project: &str) -> FooterStatus {
     )
 }
 
-/// The chip's text: `2 running`.
+/// The chip's text: `2 running`, `1 stopping`, or `2 running, 1 stopping`.
 pub(crate) fn label(status: &FooterStatus) -> String {
-    format!("{} running", status.running)
+    match (status.running, status.stopping) {
+        (running, 0) => format!("{running} running"),
+        (0, stopping) => format!("{stopping} stopping"),
+        (running, stopping) => format!("{running} running, {stopping} stopping"),
+    }
 }
 
 fn entry_line(entry: &FooterEntry) -> String {
@@ -341,6 +349,7 @@ mod tests {
     fn the_label_counts_and_the_tooltip_names_each_workspace_with_the_worrying_ones_first() {
         let status = FooterStatus {
             running: 2,
+            stopping: 0,
             entries: vec![
                 entry("fake-fine", WorkspaceState::Running, None),
                 entry("fake-lost", WorkspaceState::Running, Some(Concern::Orphan)),
@@ -365,6 +374,7 @@ mod tests {
             .collect();
         let status = FooterStatus {
             running: 8,
+            stopping: 0,
             entries,
         };
         let tip = tip_text(&status);
@@ -464,9 +474,16 @@ mod tests {
 
     #[gpui::test]
     fn it_warns_for_an_orphan_a_failure_and_a_workspace_up_for_hours(cx: &mut TestAppContext) {
-        // The world's unused, hibernating sandbox belongs to this app and no session uses it.
+        // The world's unused sandbox belongs to this app and no session uses it. It is on its way
+        // down (hibernating): that is neutral, so nothing warns yet.
         let w = fixtures::world();
         let window = open_chip(&w, cx, true);
+        let status = status_of(&window, cx);
+        assert!(status.visible() && !status.warns(), "{status:?}");
+        assert_eq!(status.stopping, 1);
+        // Once it is running again, with nobody using it, it is the orphan the chip warns about.
+        w.sbx.boxes.lock().unwrap()[1].state = "running".into();
+        reread(&window, &w, cx);
         let status = status_of(&window, cx);
         assert!(status.visible() && status.warns(), "{status:?}");
         assert_eq!(
@@ -706,5 +723,110 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         assert!(!status_of(&window, cx).visible());
+    }
+    // ------------------------------------------------------------------ stopping
+
+    #[test]
+    fn the_label_counts_what_stops_alone_or_next_to_what_runs() {
+        let stopping = |running, stopping| FooterStatus {
+            running,
+            stopping,
+            entries: vec![],
+        };
+        assert_eq!(label(&stopping(2, 0)), "2 running");
+        assert_eq!(label(&stopping(0, 1)), "1 stopping");
+        assert_eq!(label(&stopping(2, 1)), "2 running, 1 stopping");
+    }
+
+    #[gpui::test]
+    fn it_stays_while_a_sandbox_stops_neutral_and_goes_once_it_has_stopped(
+        cx: &mut TestAppContext,
+    ) {
+        let w = fixtures::world();
+        quiet(&w);
+        set_codespaces(&w, json!([]));
+        let window = open_chip(&w, cx, true);
+        assert_eq!(label(&status_of(&window, cx)), "1 running");
+
+        // The user presses Stop on the sandbox. The listing says stopping: the chip stays.
+        w.api
+            .stop_instance(
+                &fixtures::target(monocode_core::cloud_sessions::CloudRef::sandbox(
+                    fixtures::SBX_USED,
+                )),
+                &|_: &monocode_core::cloud_sessions::CloudRef| false,
+            )
+            .unwrap();
+        reread(&window, &w, cx);
+        let status = status_of(&window, cx);
+        assert_eq!((status.running, status.stopping), (0, 1), "{status:?}");
+        assert_eq!(label(&status), "1 stopping");
+        window
+            .read_with(cx, |chip, _| assert!(chip.visible() && !chip.warns()))
+            .unwrap();
+        assert!(
+            tip_text(&status).contains("Stopping"),
+            "{}",
+            tip_text(&status)
+        );
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("cloud-status-chip").is_some());
+
+        // Only when it has stopped does the chip hide.
+        w.sbx.boxes.lock().unwrap()[0].state = "stopped".into();
+        reread(&window, &w, cx);
+        window
+            .read_with(cx, |chip, _| assert!(!chip.visible()))
+            .unwrap();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("cloud-status-chip").is_none());
+    }
+
+    #[gpui::test]
+    fn a_stop_that_has_taken_more_than_fifteen_minutes_turns_the_chip_to_the_warning(
+        cx: &mut TestAppContext,
+    ) {
+        let w = fixtures::world();
+        let window = open_chip(&w, cx, true);
+        let stuck = FooterStatus {
+            running: 0,
+            stopping: 1,
+            entries: vec![entry(
+                "fake-box",
+                WorkspaceState::Stopping,
+                Some(Concern::StuckStopping),
+            )],
+        };
+        let calm = FooterStatus {
+            entries: vec![entry("fake-box", WorkspaceState::Stopping, None)],
+            ..stuck.clone()
+        };
+        window
+            .update(cx, |chip, _, cx| {
+                chip.status = calm.clone();
+                cx.notify();
+            })
+            .unwrap();
+        window
+            .read_with(cx, |chip, _| assert!(chip.visible() && !chip.warns()))
+            .unwrap();
+        window
+            .update(cx, |chip, _, cx| {
+                chip.status = stuck.clone();
+                cx.notify();
+            })
+            .unwrap();
+        window
+            .read_with(cx, |chip, _| assert!(chip.visible() && chip.warns()))
+            .unwrap();
+        let tip = tip_text(&stuck);
+        assert!(
+            tip.contains("Stopping") && tip.contains("still stopping after more than 15 minutes"),
+            "{tip}"
+        );
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("cloud-status-chip").is_some());
     }
 }

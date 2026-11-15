@@ -21,7 +21,7 @@ pub(crate) use ssh::{
     validate_sandbox_workspace,
 };
 use ssh::{Job, Tunnel, Tunnels};
-pub use ssh::{JobView, Prompt, SandboxMode, SandboxTarget, SshTarget};
+pub use ssh::{JobView, Prompt, SandboxMode, SandboxTarget, SshTarget, TunnelClose};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -796,6 +796,28 @@ impl Connections {
         self.tunnels.remove(machine_id);
         self.host_info.drop_machine(machine_id);
         Ok(())
+    }
+
+    /// Closes the live tunnel of `machine_id` (the ssh process, and with it the ProxyCommand's
+    /// `sbx ssh-connect`) and forgets what was cached about its Host, but keeps the machine
+    /// itself. Nothing reconnects a cloud machine by itself ([`SANDBOX_NOT_CONNECTED`]), so it
+    /// stays closed until an explicit Reconnect. Never waits (see [`ssh::Tunnels::close`]).
+    pub fn close_tunnel(&self, machine_id: &str) -> TunnelClose {
+        let closed = self.tunnels.close(machine_id);
+        self.host_info.drop_machine(machine_id);
+        closed
+    }
+
+    /// [`Self::close_tunnel`] for a tunnel started before `listed_at_ms` only; a newer one is
+    /// left alone and so is its cached Host description.
+    pub fn close_tunnel_started_before(&self, machine_id: &str, listed_at_ms: u64) -> TunnelClose {
+        let closed = self
+            .tunnels
+            .close_if_started_before(machine_id, listed_at_ms);
+        if closed == TunnelClose::Closed {
+            self.host_info.drop_machine(machine_id);
+        }
+        closed
     }
 
     /// What the last `environment.describe` of this machine reported, if any.

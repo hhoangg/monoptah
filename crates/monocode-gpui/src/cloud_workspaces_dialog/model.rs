@@ -5,6 +5,7 @@ use crate::cloud_checks::gh_state;
 use crate::cloud_mark::{Tone, backend_name};
 use monocode_core::cloud_sessions::{
     CloudBackendKind, CloudRef,
+    stopping::StopReport,
     workspaces::{DeletePreview, WorkspaceOverview, WorkspaceRow, WorkspaceState},
 };
 use monocode_core::sandboxes::Prerequisites;
@@ -435,6 +436,56 @@ pub(super) fn stop_prompt(row: &WorkspaceRow) -> Vec<String> {
     ));
     lines
 }
+
+/// What became of the last Stop of a row, read from the listing and never from the stop call
+/// alone (see `monocode_core::cloud_sessions::stopping`): the words and the colour of the line
+/// under the row. `None` when no Stop of this app is being followed.
+pub(super) fn stop_line(row: &WorkspaceRow, now_ms: u64) -> Option<(String, Tone)> {
+    let noun = row.cloud.noun();
+    let waited = |since: Option<u64>| {
+        since
+            .map(|ms| age_text(now_ms.saturating_sub(ms) / 1000))
+            .unwrap_or_else(|| "a moment".into())
+    };
+    Some(match row.stop.as_ref()? {
+        StopReport::Stopping => (
+            format!(
+                "Stopping\u{2026} the stop was accepted. A large {noun} can take 7 to 9 minutes. This updates by itself."
+            ),
+            Tone::Busy,
+        ),
+        StopReport::TakingLong => (
+            format!(
+                "Taking longer than expected: still stopping after {}. It may still bill until it has stopped. Refresh to check again.",
+                waited(row.stopping_since_ms)
+            ),
+            Tone::Bad,
+        ),
+        StopReport::Stopped => ("Stopped".to_owned(), Tone::Idle),
+        StopReport::StillRunning(reason) => (format!("Still running: {reason}"), Tone::Bad),
+    })
+}
+
+/// How soon the dialog reads the listing again while a Stop is being followed: quickly while it
+/// is expected to finish, slowly once it is taking longer than expected.
+pub(super) fn stop_poll(
+    row_reports: impl Iterator<Item = StopReport>,
+    unread: bool,
+) -> Option<std::time::Duration> {
+    // A Stop whose state cannot be read is asked about again, slowly: the listing may come back.
+    let mut poll = unread.then_some(STOP_POLL_SLOW);
+    for report in row_reports {
+        match report {
+            StopReport::Stopping => return Some(STOP_POLL),
+            StopReport::TakingLong => poll = Some(STOP_POLL_SLOW),
+            StopReport::Stopped | StopReport::StillRunning(_) => {}
+        }
+    }
+    poll
+}
+
+pub(super) const STOP_POLL: std::time::Duration = std::time::Duration::from_secs(15);
+pub(super) const STOP_POLL_SLOW: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// What a running action says while it works.
 pub(super) fn working_text(cloud: &CloudRef, deleting: bool) -> String {

@@ -46,6 +46,7 @@ use gpui::{
 use monocode_core::{
     cloud_sessions::{
         CloudRef,
+        stopping::StopReport,
         workspaces::{self, DeletePreview, WorkspaceOverview, WorkspaceRow, WorkspaceTarget},
     },
     mono::cloud_api::{CloudApi, DeleteOptions},
@@ -126,6 +127,8 @@ pub(crate) struct CloudWorkspacesDialog {
     reload_queued: Option<bool>,
     /// The last failed action or browser lookup, by [`WorkspaceRow::key`].
     errors: HashMap<String, String>,
+    /// A read of the listing is scheduled because a Stop is being followed.
+    following_stop: bool,
     focus: FocusHandle,
 }
 
@@ -172,6 +175,7 @@ impl CloudWorkspacesDialog {
             warnings: Vec::new(),
             reload_queued: None,
             errors: HashMap::new(),
+            following_stop: false,
             focus: cx.focus_handle(),
         };
         // Opening is one of the two moments the CLIs are asked; the service answers from its
@@ -186,6 +190,13 @@ impl CloudWorkspacesDialog {
     }
 
     fn load(&mut self, force: bool, cx: &mut Context<Self>) {
+        self.load_with(force, false, cx);
+    }
+
+    /// `sandboxes_only` is the follow tick of a Stop: the sandbox listing alone (no `gh`), merged
+    /// into the rows already loaded. Asked for while another load runs, it becomes a full forced
+    /// load after it.
+    fn load_with(&mut self, force: bool, sandboxes_only: bool, cx: &mut Context<Self>) {
         if self.loading {
             self.reload_queued = Some(self.reload_queued.unwrap_or(false) || force);
             return;
@@ -198,7 +209,12 @@ impl CloudWorkspacesDialog {
                 .background_executor()
                 .spawn(async move {
                     let api = env.api()?;
-                    Ok::<_, String>(api.cloud().workspaces_overview(&project, force))
+                    let cloud = api.cloud();
+                    Ok::<_, String>(if sandboxes_only {
+                        cloud.refresh_sandbox_rows(&project)
+                    } else {
+                        cloud.workspaces_overview(&project, force)
+                    })
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -216,7 +232,48 @@ impl CloudWorkspacesDialog {
                     }
                     Err(error) => this.load_error = Some(error),
                 }
+                this.follow_stops(cx);
                 cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Dismiss was pressed on a `Still running: …` line: the core forgets that verdict and the
+    /// row loses its line at once; the chip reads again at its next tick.
+    fn dismiss_stop(&mut self, cloud: &CloudRef, cx: &mut Context<Self>) {
+        if let Ok(api) = self.env.api() {
+            api.cloud().dismiss_stop(cloud);
+        }
+        if let Some(view) = self.view.as_mut() {
+            for row in view.rows.iter_mut().filter(|row| row.cloud == *cloud) {
+                row.stop = None;
+            }
+        }
+        cx.notify();
+    }
+
+    /// While a Stop is on its way (the listing says stopping, or has not caught up), reads the
+    /// listing again by itself, so the row says Stopped, Still running or Taking longer than
+    /// expected without a click on Refresh. Read-only: it never wakes anything.
+    fn follow_stops(&mut self, cx: &mut Context<Self>) {
+        if self.following_stop {
+            return;
+        }
+        let Some(every) = self.view.as_ref().and_then(|view| {
+            model::stop_poll(
+                view.rows.iter().filter_map(|row| row.stop.clone()),
+                !view.stop_unread.is_empty(),
+            )
+        }) else {
+            return;
+        };
+        self.following_stop = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(every).await;
+            let _ = this.update(cx, |this, cx| {
+                this.following_stop = false;
+                this.load_with(true, true, cx);
             });
         })
         .detach();
@@ -654,6 +711,46 @@ impl CloudWorkspacesDialog {
                     .child(model::cost_line(row)),
             );
 
+        if let Some((text, tone)) = model::stop_line(row, now) {
+            card = card.child(
+                div()
+                    .id(SharedString::from(id("stop-report")))
+                    .debug_selector({
+                        let selector = id("stop-report");
+                        move || selector.clone()
+                    })
+                    .flex()
+                    .items_start()
+                    .gap(px(6.))
+                    .text_size(px(12.))
+                    .line_height(px(18.))
+                    .text_color(content(0.75))
+                    .child(
+                        div()
+                            .mt(px(5.))
+                            .size(px(7.))
+                            .flex_shrink_0()
+                            .rounded_full()
+                            .bg(tone_color(tone)),
+                    )
+                    .child(div().min_w_0().flex_1().child(text))
+                    .when(
+                        matches!(row.stop, Some(StopReport::StillRunning(_))),
+                        |line| {
+                            // It was resumed on purpose by other means (sbx run, another
+                            // computer): the line stays only until the user says so.
+                            let dismissed = cloud.clone();
+                            line.child(
+                                Self::button(id("dismiss-stop"), "Dismiss", false, false).on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.dismiss_stop(&dismissed, cx)
+                                    }),
+                                ),
+                            )
+                        },
+                    ),
+            );
+        }
         if let Some(error) = self.errors.get(&key) {
             card = card.child(alert(id("error"), error.clone()));
         }
@@ -906,6 +1003,20 @@ impl CloudWorkspacesDialog {
                     .line_height(px(18.))
                     .text_color(rgb(0xfbbf24))
                     .child(text.clone())
+                    .into_any_element(),
+            );
+        }
+        for unread in &view.stop_unread {
+            let id = format!("cloud-ws-stop-unread-{}", unread.cloud.name);
+            out.push(
+                div()
+                    .id(SharedString::from(id.clone()))
+                    .debug_selector(move || id.clone())
+                    .role(Role::Alert)
+                    .text_size(px(12.))
+                    .line_height(px(18.))
+                    .text_color(rgb(0xfbbf24))
+                    .child(unread.text.clone())
                     .into_any_element(),
             );
         }

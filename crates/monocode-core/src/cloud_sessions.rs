@@ -578,6 +578,20 @@ pub trait Host: Send + Sync {
         remote::host_upgrade::Outcome::Current
     }
     fn disconnect(&self, machine_id: &str) -> Result<(), String>;
+    /// Closes the live connection of a machine (its tunnel) and keeps the machine, so a later
+    /// explicit Reconnect pairs it again. A Stop uses this: a sandbox with Auto-resume starts
+    /// again for anything that connects to it, an open tunnel included. `listed_at_ms` is the
+    /// moment of the listing that asked (a close that follows a listing): a connection opened
+    /// after it is left alone. `None` closes whatever is open (a Stop being sent). Never waits.
+    /// The default has no connection to close.
+    fn close_connection(
+        &self,
+        machine_id: &str,
+        listed_at_ms: Option<u64>,
+    ) -> Result<remote::TunnelClose, String> {
+        let _ = (machine_id, listed_at_ms);
+        Ok(remote::TunnelClose::NoneOpen)
+    }
 }
 
 /// A halted wait for the SSH slot ends the start the way every other halted step does.
@@ -686,6 +700,16 @@ impl Host for Arc<Connections> {
     }
     fn disconnect(&self, machine_id: &str) -> Result<(), String> {
         Connections::disconnect(self, machine_id)
+    }
+    fn close_connection(
+        &self,
+        machine_id: &str,
+        listed_at_ms: Option<u64>,
+    ) -> Result<remote::TunnelClose, String> {
+        Ok(match listed_at_ms {
+            Some(listed) => Connections::close_tunnel_started_before(self, machine_id, listed),
+            None => Connections::close_tunnel(self, machine_id),
+        })
     }
 }
 
@@ -821,6 +845,8 @@ pub struct CloudSessions {
     follower_retry: Duration,
     /// Sandboxes with a user-initiated reconnect in flight, by name.
     reconnecting: Mutex<std::collections::HashSet<String>>,
+    /// What became of the Stops this process asked for, see [`stopping`].
+    stops: Mutex<stopping::StopWatches>,
     /// Loaded cloud workspaces overviews by project, see [`workspaces`].
     workspace_views: Mutex<HashMap<String, (Instant, workspaces::WorkspaceOverview)>>,
     /// Where the Claude setup step reads the user's kit preferences and local setup.
@@ -857,6 +883,7 @@ impl CloudSessions {
             clock: Box::new(crate::time::now_ms),
             follower_retry: Duration::from_secs(2),
             reconnecting: Mutex::new(Default::default()),
+            stops: Mutex::new(Default::default()),
             workspace_views: Mutex::new(HashMap::new()),
             kit_seams: claude_setup::KitSeams::system(),
             moves: Mutex::new(HashMap::new()),
@@ -1631,7 +1658,21 @@ impl CloudSessions {
         self.stop_cloud(&CloudRef::codespace(name))
     }
     /// Stops the workspace and pauses the starts that were waiting on it.
+    ///
+    /// A sandbox is stopped only after this app's own connection to it is closed: a sandbox
+    /// with Auto-resume starts again for anything that connects, and the tunnel of a session
+    /// (`sbx ssh-connect`, with its keepalives) would be such a connection. The machine stays
+    /// known, so Reconnect on a session pairs it again, and nothing reconnects it before that
+    /// ([`crate::remote::SANDBOX_NOT_CONNECTED`]). `Ok` says the request was accepted, not that
+    /// the workspace has stopped: [`stopping`] tells what became of it from the listings.
     pub fn stop_cloud(&self, cloud: &CloudRef) -> Result<(), String> {
+        self.stop_cloud_noted(cloud).map(|_| ())
+    }
+
+    /// [`Self::stop_cloud`] that also says what the caller should show although the stop was
+    /// accepted: the app could not close its own connection to the sandbox, so that connection
+    /// may wake it again.
+    pub fn stop_cloud_noted(&self, cloud: &CloudRef) -> Result<Option<String>, String> {
         let backend = self.backend(cloud.kind)?;
         {
             let store = self.store()?;
@@ -1646,20 +1687,90 @@ impl CloudSessions {
                 )?;
             }
         }
+        // Everything the stop needs is resolved BEFORE a connection is closed: a failure here
+        // (the sandbox's id, its pinned account) must not leave the sessions disconnected while
+        // the sandbox keeps running.
+        if let Err(error) = backend.prepare_stop(&cloud.name) {
+            self.invalidate_ref(cloud);
+            self.forget_workspace_views();
+            return if backend.is_missing_error(&error) {
+                self.mark_gone(cloud);
+                self.forget_stop(cloud);
+                Ok(None)
+            } else {
+                Err(error)
+            };
+        }
+        let connection = self.close_connections_before_stop(cloud, None);
         let stopped = match backend.stop(&cloud.name) {
             // An instance that no longer exists (deleted by another process or by hand) is
             // as stopped as it can be, so this is not an error. The delete follows the same
             // rule; every caller of the shared stop path gets it.
             Err(error) if backend.is_missing_error(&error) => {
                 self.mark_gone(cloud);
-                Ok(())
+                self.forget_stop(cloud);
+                Ok(None)
             }
-            other => other,
+            Ok(()) => {
+                let warning = connection.warning();
+                self.note_stop_accepted(cloud, connection);
+                Ok(warning)
+            }
+            Err(error) => Err(match connection {
+                stopping::Connection::Closed(_) => format!(
+                    "{error} Its connection was closed first, so its sessions need Reconnect."
+                ),
+                _ => error,
+            }),
         };
         self.invalidate_ref(cloud);
         // Whatever the outcome, an overview loaded before this call no longer says what is there.
         self.forget_workspace_views();
         stopped
+    }
+
+    /// Closes the connections this app holds to the sandbox `cloud` (a tunnel per session
+    /// machine). A codespace is left alone: `gh codespace ssh` is what wakes it, and nothing
+    /// holds one open. `listed_at_ms` is `Some` when a listing asked: only a tunnel started
+    /// before it is closed.
+    fn close_connections_before_stop(
+        &self,
+        cloud: &CloudRef,
+        listed_at_ms: Option<u64>,
+    ) -> stopping::Connection {
+        if cloud.kind != CloudBackendKind::DockerSandbox {
+            return stopping::Connection::NoneOpen;
+        }
+        let machines = match self.host.machines() {
+            Ok(machines) => machines,
+            Err(error) => return stopping::Connection::CloseFailed(error),
+        };
+        let mut closed = 0;
+        let mut deferred = false;
+        let mut failed = None;
+        for machine in machines {
+            let ours = machine
+                .sandbox
+                .as_ref()
+                .is_some_and(|sandbox| sandbox.name == cloud.name);
+            if !ours {
+                continue;
+            }
+            match self.host.close_connection(&machine.id, listed_at_ms) {
+                Ok(remote::TunnelClose::Closed) => closed += 1,
+                Ok(remote::TunnelClose::NoneOpen) => {}
+                Ok(remote::TunnelClose::Deferred) => deferred = true,
+                Err(error) => {
+                    failed.get_or_insert(error);
+                }
+            }
+        }
+        match failed {
+            Some(error) => stopping::Connection::CloseFailed(error),
+            None if deferred => stopping::Connection::Deferred,
+            None if closed > 0 => stopping::Connection::Closed(closed),
+            None => stopping::Connection::NoneOpen,
+        }
     }
 
     /// Delete the codespace, disconnect its machine and forget all bindings.
@@ -1715,6 +1826,7 @@ impl CloudSessions {
             Err(e) => disconnect_error = Some(e),
         }
         self.mark_gone(cloud);
+        self.forget_stop(cloud);
         // The workspace is gone, so what it held is no longer a question.
         let _ = self
             .store()?
@@ -2264,6 +2376,7 @@ pub use return_cleanup::{CleanupOutcome, HostCheck, ReturnCleanup};
 pub mod transcript_sync;
 
 pub mod startup;
+pub mod stopping;
 pub mod view;
 pub mod view_cache;
 pub mod workspaces;
