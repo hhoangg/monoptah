@@ -718,3 +718,41 @@ fn redact_masks_a_private_key_whose_end_is_missing_to_the_end_of_the_text() {
     // Ordinary text is untouched.
     assert_eq!(redact("no secrets here"), "no secrets here");
 }
+
+#[test]
+fn redact_masks_named_secrets_vendor_tokens_and_url_passwords() {
+    use super::memory::redact;
+    let masked = |text: &str, secret: &str| {
+        let out = redact(text);
+        assert!(!out.contains(secret), "{secret} survived in {out}");
+        assert!(out.contains("redacted"), "{out}");
+        out
+    };
+    masked("DB_PASSWORD=hunter2", "hunter2");
+    masked("export NPM_TOKEN=abc123xyz", "abc123xyz");
+    masked("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI", "wJalrXUtnFEMI");
+    masked("{\"password\": \"s3cret-value\"}", "s3cret-value");
+    masked("api_key: topsecretvalue", "topsecretvalue");
+    masked("client_secret = abcdef", "abcdef");
+    // Vendor tokens, built so no realistic token sits in this source.
+    let stripe = concat!("sk_", "live_", "4eC39HqLyjWDarjtT1zdp7dc");
+    masked(&format!("key {stripe} here"), stripe);
+    masked(
+        &format!("sk_{}_{}", "test", "51HabcDEFghiJKLmno"),
+        "51HabcDEF",
+    );
+    let google = format!("{}{}", "AIza", "SyA".to_owned() + &"b".repeat(32));
+    masked(&format!("g {google}"), &google);
+    let npm = format!("{}{}", "npm_", "a".repeat(36));
+    masked(&format!("//registry:_authToken={npm}"), &npm);
+    masked(&format!("x {npm} y"), &npm);
+    let github = format!("{}{}", "ghp_", "A".repeat(36));
+    masked(&format!("token {github}"), &github);
+    // Only the password of an address is masked; the address stays readable.
+    let url = masked("postgres://admin:pa55w0rd@db.internal:5432/app", "pa55w0rd");
+    assert!(url.starts_with("postgres://admin:") && url.ends_with("@db.internal:5432/app"));
+    assert_eq!(
+        redact("see https://example.com:8080/path and user@host"),
+        "see https://example.com:8080/path and user@host"
+    );
+}

@@ -235,7 +235,7 @@ impl DockSide {
 /// the project, so it is never the owner: a Mono pane borrows a real session of the Mono's
 /// project (`Shell::mono_pane_owner`), and falls back to the dock when the project has none.
 ///
-/// A terminal a Mono opened is not saved: `mono`, `label` and `logs` are runtime only, the
+/// A terminal a Mono opened is not saved: `mono` and `logs` are runtime only, the
 /// workspace is saved without such panes (`saved_panes`) and a restart brings none of them
 /// back. `mono` is still read from state saved by an older version, only so that restore can
 /// drop that pane instead of reopening it as a user's terminal.
@@ -246,9 +246,6 @@ pub(crate) struct TerminalPane {
     /// The Mono that opened this terminal, if one did. Never written.
     #[serde(default, skip_serializing)]
     pub mono: Option<String>,
-    /// The name a Mono gave it.
-    #[serde(skip)]
-    pub label: Option<String>,
     /// The title ("Logs <project>") of the Logs tab this pane was arranged into
     /// (`terminals.layout`). A tab whose panes are all terminals and one of which has it shows
     /// that title.
@@ -262,7 +259,6 @@ impl TerminalPane {
             owner,
             cwd,
             mono: None,
-            label: None,
             logs: None,
         }
     }
@@ -1903,7 +1899,6 @@ mod tests {
     fn mono_pane(mono: &str) -> TerminalPane {
         let mut pane = TerminalPane::new(1, "/w".into());
         pane.mono = Some(mono.into());
-        pane.label = Some("BE".into());
         pane.logs = Some("Logs w".into());
         pane
     }

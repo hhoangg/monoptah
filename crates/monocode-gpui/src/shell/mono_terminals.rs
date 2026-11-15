@@ -8,28 +8,31 @@
 //!
 //! Input is free and has no approval: a `command` (`terminals.open`), typed `text` and every
 //! key of `MonoKey` (`terminals.send`) are written at once. The one rule is scope: the
-//! terminal's folder must be the project or inside it or one of its git worktrees. It is
-//! asked again right before each write, of the live folder of the process holding the
-//! terminal when the system can tell it (a `cd` inside the shell counts), else of the folder
-//! the terminal started in. A Mono only types into terminals it opened, and never into one
-//! that runs an agent CLI.
+//! terminal's folder must be the project or inside it or one of its git worktrees (those the
+//! repository itself vouches for, see `monocode_core::git::scoped_worktrees`). It is asked
+//! again right before each write, of EVERY process of the foreground group (a `cd` inside the
+//! shell counts, and so does `true | (cd / && exec zsh)`, whose leader is gone). On macOS and
+//! Linux a lookup that fails is a refusal; only where the system has no lookup at all
+//! (Windows) the folder the terminal started in is used. A Mono only types into terminals it
+//! opened, and never into one that runs, or ever ran, an agent CLI.
 //!
-//! Reading is wider: a Mono reads every terminal of its project, the user's included, and an
-//! ordinary coding session reads, read-only, the terminals inside its own project or
-//! worktree (`session_terminals_call`). Terminals that are not plain shells (agent sessions,
-//! logins, cloud shells, `FixTerminal`) and those running an agent CLI are never listed or
-//! read.
+//! Reading is wider: a Mono reads every terminal of its project, the user's and other Monos'
+//! included, and an ordinary coding session reads, read-only, the terminals inside its own
+//! project or worktree (`session_terminals_call`). Terminals that are not plain shells (agent
+//! sessions, logins, cloud shells, `FixTerminal`) and those that run or ever ran an agent CLI
+//! are never listed or read. Where the system cannot inspect processes (Windows) an agent CLI
+//! cannot be told apart, so only the Mono's own terminals are listed or read there.
 //!
 //! A Mono's terminals are not saved: a restart brings none back (see `workspace::TerminalPane`).
 use super::*;
 use crate::{
     pane_layout::{Edge, Preset, preset_layout},
-    terminal::{Front, MonoKey, Terminal, tail_lines},
+    terminal::{Front, Member, MonoKey, Terminal, group_agent, tail_lines},
     workspace::TerminalPane,
 };
 use monocode_core::mono::api::is_format_char;
 use serde_json::{Value, json};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 /// The most bytes of a free `command` or typed `text`.
@@ -106,6 +109,8 @@ enum Spot {
 
 struct Found {
     origin: Origin,
+    /// The Mono that opened it, for a Mono terminal.
+    mono: Option<String>,
     terminal: Entity<Terminal>,
     spot: Spot,
 }
@@ -113,7 +118,7 @@ struct Found {
 /// Who asks for a listing or a read, which decides what it may see.
 #[derive(Clone, Copy)]
 enum Viewer<'a> {
-    /// A Mono: its own terminals and the user's, never another Mono's.
+    /// A Mono: every terminal of the project, to read; only its own to drive.
     Mono(&'a str),
     /// A coding session: every terminal of its project that lies inside `roots` (the
     /// project and the session's worktree).
@@ -132,20 +137,27 @@ fn cap_tail(text: String, max: usize) -> (String, bool) {
     (text[start..].to_owned(), true)
 }
 
-fn inside(root: &str, path: &str) -> bool {
-    let (root, path) = (
-        monocode_core::files::path_key(root),
-        monocode_core::files::path_key(path),
-    );
-    path == root || path.starts_with(&format!("{}/", root.trim_end_matches('/')))
+/// Whether `path` is `root` or inside it, compared component by component (bytes on unix, so
+/// two names that differ only in non-UTF-8 bytes never collide). A file system root is never
+/// a root of a scope: everything is inside `/`.
+fn inside(root: &Path, path: &Path) -> bool {
+    let fold = |p: &Path| {
+        if cfg!(windows) {
+            PathBuf::from(p.to_string_lossy().to_lowercase())
+        } else {
+            p.to_path_buf()
+        }
+    };
+    let root = fold(root);
+    root.components().any(|c| matches!(c, Component::Normal(_))) && fold(path).starts_with(&root)
 }
 
 /// A folder's identity for comparing two spellings of it: symlinks resolved. A folder that is
 /// gone keeps its name under the nearest ancestor that exists.
-fn real_key(path: &str) -> String {
+fn real_path(path: &str) -> PathBuf {
     let mut rest = Vec::new();
     let mut head = Path::new(path);
-    let real = loop {
+    loop {
         if let Ok(real) = std::fs::canonicalize(head) {
             break rest
                 .iter()
@@ -159,20 +171,23 @@ fn real_key(path: &str) -> String {
             }
             _ => break Path::new(path).to_path_buf(),
         }
-    };
-    monocode_core::files::path_key(&real.to_string_lossy())
+    }
 }
 
 /// Whether `cwd` is one of `roots` or inside one, symlinks resolved.
 fn in_roots(roots: &[String], cwd: &str) -> bool {
-    let real = real_key(cwd);
-    roots.iter().any(|root| inside(&real_key(root), &real))
+    let real = real_path(cwd);
+    roots.iter().any(|root| inside(&real_path(root), &real))
 }
 
+/// The git worktrees that count as part of `project`'s scope (see
+/// `monocode_core::git::scoped_worktrees`). Only UTF-8 names, since the scope is spelled in
+/// text; a worktree whose name is not text is left out.
 fn project_worktrees(project: &str) -> Vec<String> {
-    monocode_core::git::worktrees(Path::new(project))
-        .map(|trees| trees.into_iter().map(|t| t.path).collect())
-        .unwrap_or_default()
+    monocode_core::git::scoped_worktrees(Path::new(project))
+        .into_iter()
+        .filter_map(|tree| tree.to_str().map(str::to_owned))
+        .collect()
 }
 
 /// Whether a terminal's folder is the project or inside it or one of its worktrees, symlinks
@@ -185,10 +200,20 @@ fn folder_allowed(project: &str, cwd: &str) -> bool {
     {
         return false;
     }
-    let real = real_key(cwd);
-    let within = |root: &str| inside(&real_key(root), &real);
+    let real = real_path(cwd);
+    let within = |root: &str| inside(&real_path(root), &real);
     within(project) || project_worktrees(project).iter().any(|tree| within(tree))
 }
+
+/// Whether the system can tell what runs in a terminal and where. Where it cannot (Windows),
+/// an agent CLI cannot be recognised, so a terminal the user opened is never listed or read,
+/// and a write is judged by the folder the terminal started in.
+const CAN_INSPECT: bool = cfg!(unix);
+
+const CANNOT_TELL: &str = "Mono cannot tell where this terminal is right now (a process holding it hides its folder or the lookup failed), so it does not type into it. Close it and open a new one with terminals.open";
+const AGENT_WRITE: &str = "This terminal runs, or ran, an agent CLI; Mono never types into those";
+const AGENT_READ: &str =
+    "This terminal runs, or ran, an agent CLI; Mono never reads or types into those";
 
 const OUTSIDE: &str = "The terminal's folder is outside the project and its worktrees, so Mono does not type into it. Stop or close it, or open a new terminal with terminals.open";
 
@@ -216,13 +241,17 @@ fn multiline_refusal(text: &str, bracketed: bool) -> Option<&'static str> {
 
 /// The directory a Mono terminal starts in: the project, or `requested` when it stays inside
 /// the project or one of its worktrees (`worktrees` is asked only then). `..` is refused
-/// outright and symlinks are resolved before the comparison.
+/// outright and symlinks are resolved before the comparison. A requested folder is returned
+/// as it was resolved, so the terminal starts exactly where it was checked; a folder that is
+/// not there is an error, never a fallback to the home folder.
 fn resolve_cwd(
     project: &str,
     requested: Option<&str>,
     worktrees: impl FnOnce() -> Vec<String>,
 ) -> Result<String, String> {
     let Some(requested) = requested.map(str::trim) else {
+        // The terminal starts strictly in it (`Terminal::new_strict`): a project folder that
+        // is gone fails the open there, it does not become a shell in the home folder.
         return Ok(project.to_owned());
     };
     if requested.is_empty() {
@@ -242,12 +271,12 @@ fn resolve_cwd(
     if !real.is_dir() {
         return Err("cwd is not a directory".into());
     }
-    let real = real.to_string_lossy().into_owned();
-    let within = |root: &str| {
-        std::fs::canonicalize(root).is_ok_and(|root| inside(&root.to_string_lossy(), &real))
-    };
+    let within = |root: &str| std::fs::canonicalize(root).is_ok_and(|root| inside(&root, &real));
     if within(project) || worktrees().iter().any(|tree| within(tree)) {
-        return Ok(full.to_string_lossy().into_owned());
+        return real
+            .to_str()
+            .map(str::to_owned)
+            .ok_or_else(|| "cwd must be a UTF-8 path".into());
     }
     Err("cwd must be inside the project or one of its worktrees".into())
 }
@@ -332,15 +361,70 @@ fn read_answer(t: &Terminal, lines: usize) -> Value {
 
 /// Whether `t` is never listed or read: a launched program (an agent session, a login, a
 /// cloud shell, `FixTerminal`) is not a plain shell, and an agent CLI typed into a shell holds
-/// the user's conversation.
-fn hidden(t: &Terminal) -> bool {
-    !t.is_plain_shell() || t.agent().is_some()
+/// the user's conversation, now or earlier (the scrollback keeps it). `group` is the probe the
+/// caller just made of the foreground group.
+fn hidden(t: &Terminal, group: Option<&[Member]>) -> bool {
+    !t.is_plain_shell() || t.note_agent(group)
 }
 
-/// The folder a terminal is in now: its live one when the system tells it, else where it
-/// started (a `cd` may have moved a shell since).
-fn terminal_folder(t: &Terminal) -> String {
-    t.live_cwd().unwrap_or_else(|| t.cwd.clone())
+/// Whether `origin` may be listed or read: where the system cannot inspect processes an
+/// agent CLI in a terminal the user opened cannot be told, so only a Mono's own are shown.
+fn readable_origin(origin: Origin, can_inspect: bool) -> bool {
+    origin == Origin::Mono || can_inspect
+}
+
+/// Whether a terminal lies inside `roots`, for a coding session's read: every process of the
+/// foreground group must, and a group that cannot be listed is out. Where nothing can be
+/// inspected, the folder the terminal started in.
+fn within_roots(
+    group: Option<&[Member]>,
+    start: &str,
+    roots: &[String],
+    can_inspect: bool,
+) -> bool {
+    if !can_inspect {
+        return in_roots(roots, start);
+    }
+    group.is_some_and(|group| {
+        !group.is_empty()
+            && group
+                .iter()
+                .all(|m| m.cwd.as_deref().is_some_and(|cwd| in_roots(roots, cwd)))
+    })
+}
+
+/// The scope check of a write: nothing in the foreground group may be an agent CLI, and every
+/// process of it must stand in a folder `allowed` accepts. A group that cannot be listed, or a
+/// member whose folder is unknown, is a refusal. Only where nothing can be inspected
+/// (`can_inspect` false) is the folder the terminal started in used.
+fn write_gate(
+    group: Option<&[Member]>,
+    agent: bool,
+    start: &str,
+    can_inspect: bool,
+    allowed: impl Fn(&str) -> bool,
+) -> Result<(), String> {
+    if agent || group.is_some_and(|g| group_agent(g).is_some()) {
+        return Err(AGENT_WRITE.into());
+    }
+    if !can_inspect {
+        return if allowed(start) {
+            Ok(())
+        } else {
+            Err(OUTSIDE.into())
+        };
+    }
+    let Some(group) = group.filter(|g| !g.is_empty()) else {
+        return Err(CANNOT_TELL.into());
+    };
+    for member in group {
+        match member.cwd.as_deref() {
+            None => return Err(CANNOT_TELL.into()),
+            Some(cwd) if !allowed(cwd) => return Err(OUTSIDE.into()),
+            Some(_) => {}
+        }
+    }
+    Ok(())
 }
 
 impl Shell {
@@ -574,9 +658,9 @@ impl Shell {
         id
     }
 
-    /// A terminal `viewer` may read: in the project, plain, not running an agent CLI, and for
-    /// a Mono its own or a user's (another Mono's and anything not in the registry are
-    /// unknown), for a session inside its roots.
+    /// A terminal `viewer` may read: in the project, plain, never one that runs or ran an
+    /// agent CLI, and for a session inside its roots (a Mono reads the whole project).
+    /// Anything not in the registry is unknown.
     fn find_terminal(
         &self,
         viewer: Viewer,
@@ -594,12 +678,7 @@ impl Shell {
             .filter(|e| {
                 monocode_core::files::path_key(&e.project)
                     == monocode_core::files::path_key(project)
-                    && match viewer {
-                        Viewer::Mono(mono) => {
-                            e.origin == Origin::User || e.mono.as_deref() == Some(mono)
-                        }
-                        Viewer::Session(_) => true,
-                    }
+                    && (!reading || readable_origin(e.origin, CAN_INSPECT))
             })
             .ok_or_else(unknown)?;
         let terminal = entry.terminal.upgrade().ok_or_else(unknown)?;
@@ -608,19 +687,22 @@ impl Shell {
         if !t.is_plain_shell() {
             return Err(unknown());
         }
-        // Only a read goes by the poll; typing asks the PTY itself (`mono_send_terminal`).
-        if reading && t.agent().is_some() {
-            return Err(
-                "This terminal runs an agent CLI; Mono never reads or types into those".into(),
-            );
-        }
-        if let Viewer::Session(roots) = viewer
-            && !in_roots(roots, &terminal_folder(t))
-        {
-            return Err(unknown());
+        // Only a read probes here; typing asks the PTY itself (`mono_send_terminal`), and
+        // stopping or closing a terminal that once ran an agent stays possible.
+        if reading {
+            let group = t.live_group();
+            if t.note_agent(group.as_deref()) {
+                return Err(AGENT_READ.into());
+            }
+            if let Viewer::Session(roots) = viewer
+                && !within_roots(group.as_deref(), &t.cwd, roots, CAN_INSPECT)
+            {
+                return Err(unknown());
+            }
         }
         Ok(Found {
             origin: entry.origin,
+            mono: entry.mono.clone(),
             terminal,
             spot,
         })
@@ -649,6 +731,11 @@ impl Shell {
         if found.origin != Origin::Mono {
             return Err(
                 "A terminal the user opened cannot be typed into, stopped or closed".into(),
+            );
+        }
+        if found.mono.as_deref() != Some(mono) {
+            return Err(
+                "Another Mono opened this terminal: only it can type into, stop or close it".into(),
             );
         }
         Ok(found)
@@ -696,11 +783,16 @@ impl Shell {
         let mut rows = Vec::new();
         for (terminal, spot) in self.project_terminals(project) {
             let t = terminal.read(cx);
-            if hidden(t) {
+            if !t.is_plain_shell() {
+                continue;
+            }
+            // One probe of the process group serves the agent check and the scope check.
+            let group = t.live_group();
+            if hidden(t, group.as_deref()) {
                 continue;
             }
             if let Viewer::Session(roots) = viewer
-                && !in_roots(roots, &terminal_folder(t))
+                && !within_roots(group.as_deref(), &t.cwd, roots, CAN_INSPECT)
             {
                 continue;
             }
@@ -710,17 +802,18 @@ impl Shell {
                 .iter()
                 .find(|e| e.terminal.entity_id() == terminal.entity_id())
                 .map(|e| (e.origin, e.mono.clone()));
-            // Another Mono's terminals are not this one's to see.
-            if let Viewer::Mono(mono) = viewer
-                && matches!(&known, Some((Origin::Mono, m)) if m.as_deref() != Some(mono))
-            {
+            let origin = known.as_ref().map_or(Origin::User, |(origin, _)| *origin);
+            if !readable_origin(origin, CAN_INSPECT) {
                 continue;
             }
-            let origin = known.map_or(Origin::User, |(origin, _)| origin);
+            let mine = matches!(
+                (&known, viewer),
+                (Some((Origin::Mono, Some(owner))), Viewer::Mono(me)) if owner == me
+            );
             let id = self.registry_id(&terminal, origin, None, project);
             let t = terminal.read(cx);
             let place = self.place_name(spot);
-            rows.push(json!({
+            let mut row = json!({
                 "id": id,
                 "label": t.display_title(),
                 "cwd": t.cwd,
@@ -729,7 +822,12 @@ impl Shell {
                 "exited": t.exited,
                 "exitCode": t.exit_code,
                 "owner": origin.name(),
-            }));
+            });
+            // A Mono reads the other Monos' terminals too, and tells which are its own.
+            if matches!(viewer, Viewer::Mono(_)) {
+                row["mine"] = json!(mine);
+            }
+            rows.push(row);
         }
         Value::Array(rows)
     }
@@ -815,7 +913,7 @@ impl Shell {
         // is the Mono's, stands at its shell prompt right now (not as of the last poll) and is
         // in the folder asked for (the project's own when none was). Where it stands is asked
         // of the system when it can tell, else it is where it started.
-        let wanted = real_key(&cwd);
+        let wanted = real_path(&cwd);
         let reusable = self.mono_registry.entries.iter().find_map(|entry| {
             // The cheap tests first: the system is asked about a terminal only when it is this
             // Mono's, in this project, with this label.
@@ -831,14 +929,25 @@ impl Shell {
             if t.label.as_deref() != Some(label.as_str()) || t.exited {
                 return None;
             }
-            let live = t.live_cwd();
+            let group = t.live_group();
             let at_prompt = idle_for_reuse(&t.live_front(), t.foreground.is_none(), cfg!(unix));
-            let there = live.clone().unwrap_or_else(|| t.cwd.clone());
+            // Where every process of the group stands, asked of the system when it can tell
+            // (else where the terminal started); a lookup that fails is no reuse.
+            let folders: Option<Vec<String>> = if CAN_INSPECT {
+                group
+                    .as_ref()
+                    .filter(|g| !g.is_empty())
+                    .and_then(|g| g.iter().map(|m| m.cwd.clone()).collect::<Option<Vec<_>>>())
+            } else {
+                Some(vec![t.cwd.clone()])
+            };
             let same = at_prompt
-                && real_key(&there) == wanted
-                && live
-                    .as_deref()
-                    .is_none_or(|live| folder_allowed(project, live));
+                && !t.note_agent(group.as_deref())
+                && folders.is_some_and(|folders| {
+                    folders.iter().all(|folder| {
+                        real_path(folder) == wanted && folder_allowed(project, folder)
+                    })
+                });
             same.then(|| (entry.id.clone(), terminal.clone(), t.bracketed_paste()))
         });
         let reusable =
@@ -894,6 +1003,14 @@ impl Shell {
             Some(opened) => opened,
             None => self.open_mono_dock_terminal(project, &label, &cwd, reveal, in_panel, cx),
         };
+        // A folder that vanished since it was checked is a failed open, not a shell elsewhere.
+        if let Some(problem) = terminal.read(cx).spawn_problem().map(str::to_owned) {
+            match spot {
+                Spot::Dock(ix) => self.close_mono_dock_terminal(project, ix, cx),
+                Spot::Pane(pane) => self.close_mono_pane(pane, cx),
+            }
+            return Err(format!("The terminal could not start in {cwd}: {problem}"));
+        }
         let id = self.registry_id(&terminal, Origin::Mono, Some(mono), project);
         if let Some(run) = &run {
             Self::run_mono_input(&terminal, run, cx);
@@ -966,7 +1083,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Option<(Entity<Terminal>, Spot)> {
         let owner = self.mono_pane_owner(project, None)?;
-        let terminal = self.spawn_terminal(cwd.to_owned(), cx);
+        let terminal = self.spawn_mono_terminal(cwd.to_owned(), cx);
         terminal.update(cx, |t, _| {
             t.label = Some(label.to_owned());
             t.by_mono = true;
@@ -974,7 +1091,6 @@ impl Shell {
         let pane = self.workspace.next_pane_id();
         let mut state = TerminalPane::new(owner, cwd.to_owned());
         state.mono = Some(mono.to_owned());
-        state.label = Some(label.to_owned());
         // Joining the Mono's Logs tab keeps it a Logs tab, and a tab of its own is one unless
         // it was asked to be a plain tab.
         state.logs = match target.filter(|t| self.workspace.tab_of(*t).is_some()) {
@@ -1093,7 +1209,7 @@ impl Shell {
         if in_panel {
             dock.open = false;
         }
-        let terminal = self.spawn_terminal(cwd.to_owned(), cx);
+        let terminal = self.spawn_mono_terminal(cwd.to_owned(), cx);
         terminal.update(cx, |t, _| {
             t.label = Some(label.to_owned());
             t.by_mono = true;
@@ -1216,10 +1332,8 @@ impl Shell {
                 }
                 None => return Err("A terminal went away; run terminals.list".into()),
             };
-            let label = terminal.read(cx).label.clone();
             if let Some(state) = self.workspace.terminal_panes.get_mut(&pane) {
                 state.mono = Some(mono.to_owned());
-                state.label = state.label.take().or(label);
             }
             panes.push(pane);
         }
@@ -1283,14 +1397,13 @@ impl Shell {
         if t.exited {
             return Err("The terminal has exited".into());
         }
-        // One probe: the front says whether an agent CLI holds the terminal.
-        if t.live_front().agent().is_some() {
-            return Err("This terminal runs an agent CLI; Mono never types into those".into());
-        }
-        // The scope rule, at write time: wherever the terminal is now, not where it was opened.
-        if !folder_allowed(project, &terminal_folder(t)) {
-            return Err(OUTSIDE.into());
-        }
+        // One probe of the foreground group now, for the agent check and the scope rule at
+        // write time: wherever every process of it is now, not where the terminal was opened.
+        let group = t.live_group();
+        let agent = t.note_agent(group.as_deref());
+        write_gate(group.as_deref(), agent, &t.cwd, CAN_INSPECT, |folder| {
+            folder_allowed(project, folder)
+        })?;
         if let Some(text) = &text
             && let Some(refusal) = multiline_refusal(text, t.bracketed_paste())
         {
@@ -1753,13 +1866,69 @@ mod tests {
             .iter()
             .map(|r| (r["id"].as_str().unwrap(), r["owner"].as_str().unwrap()))
             .collect();
-        assert_eq!(owners.len(), 2, "{list:?}");
+        // Another Mono's terminal is listed too (read-only), marked as not mine.
+        assert_eq!(owners.len(), 3, "{list:?}");
         assert_eq!(owners[0], (mine.as_str(), "mono"));
-        assert_eq!(owners[1].1, "user");
-        let user_id = owners[1].0.to_owned();
+        assert_eq!(owners[1].1, "mono");
+        assert_eq!(owners[2].1, "user");
+        assert_eq!(list[0]["mine"], true);
+        assert_eq!(list[1]["mine"], false);
+        assert_eq!(list[1]["label"], "theirs");
+        assert_eq!(list[2]["mine"], false);
+        let user_id = owners[2].0.to_owned();
         assert_eq!(terminal(window, cx, &user_id), user);
         assert_eq!(list[0]["place"], "dock");
         assert_eq!(list[0]["running"], false);
+    }
+
+    #[gpui::test]
+    fn a_mono_reads_another_monos_terminal_but_cannot_drive_it(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        let theirs = dock_as(window, cx, "m2", "theirs");
+        let t = terminal(window, cx, &theirs);
+        window
+            .update(cx, |_, _, cx| {
+                t.update(cx, |t, cx| t.fake_output("build ok\r\n", cx))
+            })
+            .unwrap();
+        let read = call(window, cx, "m1", "terminals.read", json!({"id": theirs})).unwrap();
+        assert!(
+            read["text"].as_str().unwrap().contains("build ok"),
+            "{read}"
+        );
+        for (action, input) in [
+            ("terminals.send", json!({"id": theirs, "key": "ctrl-c"})),
+            ("terminals.stop", json!({"id": theirs})),
+            ("terminals.close", json!({"id": theirs})),
+        ] {
+            let refused = call(window, cx, "m1", action, input).unwrap_err();
+            assert!(
+                refused.contains("Another Mono opened"),
+                "{action}: {refused}"
+            );
+        }
+        assert!(sent(window, cx, &theirs).is_empty());
+        let beside = call(
+            window,
+            cx,
+            "m1",
+            "terminals.open",
+            json!({"label": "x", "place": "split", "beside": theirs}),
+        )
+        .unwrap_err();
+        assert!(
+            beside.contains("beside must be a terminal this Mono opened"),
+            "{beside}"
+        );
+        // The owner still can.
+        call(
+            window,
+            cx,
+            "m2",
+            "terminals.send",
+            json!({"id": theirs, "key": "ctrl-c"}),
+        )
+        .unwrap();
     }
 
     #[gpui::test]
@@ -2132,14 +2301,171 @@ mod tests {
                 monocode_core::files::path_key(&real),
                 monocode_core::files::path_key(&link)
             );
-            assert_eq!(real_key(&real), real_key(&link));
+            assert_eq!(real_path(&real), real_path(&link));
             let _ = std::fs::remove_dir_all(&dir);
         }
         // A folder that does not exist is compared as spelled.
-        assert_eq!(
-            real_key("/no/such/dir/"),
-            monocode_core::files::path_key("/no/such/dir/")
+        assert_eq!(real_path("/no/such/dir/"), Path::new("/no/such/dir"));
+    }
+
+    fn git(cwd: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .current_dir(cwd)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .status()
+            .expect("git is installed");
+        assert!(status.success(), "git {args:?}");
+    }
+
+    #[test]
+    fn a_planted_worktree_or_a_parent_repository_never_widens_the_scope() {
+        let root = std::fs::canonicalize(scratch("wide")).unwrap();
+        let repo = root.join("repo");
+        let package = repo.join("packages/api");
+        std::fs::create_dir_all(&package).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["commit", "--allow-empty", "-m", "Initial"]);
+        let sibling = repo.join("packages/web");
+        std::fs::create_dir_all(&sibling).unwrap();
+        // The project is a package of a repository: the repository is not its worktree.
+        let (package_text, sibling_text) = (
+            package.to_string_lossy().into_owned(),
+            sibling.to_string_lossy().into_owned(),
         );
+        assert!(folder_allowed(&package_text, &package_text));
+        assert!(!folder_allowed(&package_text, &sibling_text));
+        assert!(!folder_allowed(&package_text, &repo.to_string_lossy()));
+        // A repository whose `.git` registers `/` as a worktree: `/` is still outside.
+        let admin = repo.join(".git/worktrees/root");
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::write(admin.join("gitdir"), "/.git\n").unwrap();
+        std::fs::write(admin.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+        let repo_text = repo.to_string_lossy().into_owned();
+        assert!(folder_allowed(&repo_text, &format!("{repo_text}/packages")));
+        for outside in ["/", "/etc", &root.to_string_lossy()] {
+            assert!(!folder_allowed(&repo_text, outside), "{outside}");
+        }
+        assert!(project_worktrees(&repo_text).iter().all(|t| t != "/"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_file_system_root_is_never_the_root_of_a_scope() {
+        assert!(inside(Path::new("/work"), Path::new("/work")));
+        assert!(inside(Path::new("/work"), Path::new("/work/app")));
+        assert!(!inside(Path::new("/work"), Path::new("/workshop")));
+        assert!(!inside(Path::new("/"), Path::new("/")));
+        assert!(!inside(Path::new("/"), Path::new("/etc")));
+        assert!(!in_roots(&["/".to_owned()], "/etc"));
+        assert!(!folder_allowed("/", "/etc"));
+        #[cfg(windows)]
+        assert!(!inside(Path::new("C:\\"), Path::new("C:\\Users")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn names_that_differ_only_in_non_utf8_bytes_do_not_collide() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let root = Path::new(OsStr::from_bytes(b"/work/a\xff"));
+        let same = Path::new(OsStr::from_bytes(b"/work/a\xff/sub"));
+        let other = Path::new(OsStr::from_bytes(b"/work/a\xfe/sub"));
+        // Both would read "/work/a\u{fffd}" through a lossy conversion.
+        assert_eq!(
+            root.to_string_lossy(),
+            Path::new("/work/a\u{fffd}").to_string_lossy()
+        );
+        assert!(inside(root, same));
+        assert!(!inside(root, other));
+        // A real folder pair that differs only in such bytes stays two folders.
+        let dir = std::env::temp_dir().join(format!("mono-bytes-{}", std::process::id()));
+        let (first, second) = (
+            dir.join(OsStr::from_bytes(b"d\xff")),
+            dir.join(OsStr::from_bytes(b"d\xfe")),
+        );
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        assert!(!inside(&first, &second));
+        assert!(inside(&first, &first.join("x")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn member(pid: i32, args: &str, cwd: Option<&str>) -> Member {
+        Member {
+            pid,
+            args: args.into(),
+            cwd: cwd.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_write_needs_every_process_in_front_to_be_inside_the_scope() {
+        let allowed = |folder: &str| folder.starts_with("/work");
+        let gate = |group: Option<Vec<Member>>, agent, can_inspect| {
+            write_gate(group.as_deref(), agent, "/work", can_inspect, allowed)
+        };
+        let ok = vec![member(1, "zsh", Some("/work/app"))];
+        assert_eq!(gate(Some(ok.clone()), false, true), Ok(()));
+        // A pipeline: the leader is inside, a later process is not.
+        let split = vec![
+            member(1, "sleep 1e9", Some("/work")),
+            member(2, "zsh -i", Some("/")),
+        ];
+        assert_eq!(gate(Some(split), false, true), Err(OUTSIDE.into()));
+        // The leader's folder alone does not decide.
+        let one_unknown = vec![
+            member(1, "sleep 1e9", Some("/work")),
+            member(2, "zsh -i", None),
+        ];
+        assert_eq!(
+            gate(Some(one_unknown), false, true),
+            Err(CANNOT_TELL.into())
+        );
+        // A lookup that failed, or an empty group, is a refusal, never the start folder.
+        assert_eq!(gate(None, false, true), Err(CANNOT_TELL.into()));
+        assert_eq!(gate(Some(Vec::new()), false, true), Err(CANNOT_TELL.into()));
+        // An agent anywhere in the group, or one seen before, is never typed into.
+        let piped = vec![
+            member(1, "cat prompt.txt", Some("/work")),
+            member(2, "claude", Some("/work")),
+        ];
+        assert_eq!(gate(Some(piped), false, true), Err(AGENT_WRITE.into()));
+        assert_eq!(gate(Some(ok), true, true), Err(AGENT_WRITE.into()));
+        // Where nothing can be inspected the folder it started in decides (Windows).
+        assert_eq!(gate(None, false, false), Ok(()));
+        assert_eq!(
+            write_gate(None, false, "/tmp", false, allowed),
+            Err(OUTSIDE.into())
+        );
+    }
+
+    #[test]
+    fn a_session_sees_a_terminal_only_when_every_process_is_inside_its_roots() {
+        let roots = vec!["/work/app".to_owned()];
+        let inside_all = vec![member(1, "zsh", Some("/work/app/src"))];
+        assert!(within_roots(Some(&inside_all), "/", &roots, true));
+        let mixed = vec![
+            member(1, "sleep 9", Some("/work/app")),
+            member(2, "zsh", Some("/tmp")),
+        ];
+        assert!(!within_roots(Some(&mixed), "/work/app", &roots, true));
+        let unknown = vec![member(1, "zsh", None)];
+        assert!(!within_roots(Some(&unknown), "/work/app", &roots, true));
+        assert!(!within_roots(None, "/work/app", &roots, true));
+        // Nothing to inspect: where it started.
+        assert!(within_roots(None, "/work/app", &roots, false));
+        assert!(!within_roots(None, "/tmp", &roots, false));
+    }
+
+    #[test]
+    fn where_nothing_can_be_inspected_only_a_monos_own_terminals_are_readable() {
+        assert!(readable_origin(Origin::Mono, false));
+        assert!(!readable_origin(Origin::User, false));
+        assert!(readable_origin(Origin::User, true));
+        assert!(readable_origin(Origin::Mono, true));
     }
 
     #[test]
@@ -2192,7 +2518,8 @@ mod tests {
             err.contains("Unknown terminal") || err.contains("this Mono opened"),
             "{err}"
         );
-        assert_eq!(rows(window, cx).len(), 1, "nothing opened");
+        // The user's and the other Mono's are listed, and nothing new opened.
+        assert_eq!(rows(window, cx).len(), 2, "nothing opened");
     }
 
     fn set_front(
@@ -3389,7 +3716,17 @@ mod tests {
         {
             std::os::unix::fs::symlink(&outside, project.join("link")).unwrap();
             assert!(resolve_cwd(&project_text, Some("link"), Vec::new).is_err());
+            // A link that stays inside resolves to the folder it names: the terminal starts
+            // in what was checked, not in whatever the link points to later.
+            std::os::unix::fs::symlink(project.join("src"), project.join("alias")).unwrap();
+            let resolved = resolve_cwd(&project_text, Some("alias"), Vec::new).unwrap();
+            assert_eq!(
+                Path::new(&resolved),
+                std::fs::canonicalize(project.join("src")).unwrap()
+            );
         }
+        // A project that is `/` makes everything inside it, which is no scope at all.
+        assert!(resolve_cwd("/", Some("tmp"), Vec::new).is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3449,23 +3786,12 @@ mod tests {
     }
 
     #[gpui::test]
-    fn the_foreground_is_asked_live_for_the_agent_guard_and_not_taken_from_the_poll(
-        cx: &mut TestAppContext,
-    ) {
+    fn an_agent_cli_seen_live_or_by_the_poll_closes_the_terminal_for_good(cx: &mut TestAppContext) {
         let (window, _, _) = window(cx);
         let id = dock(window, cx, "BE");
         let t = terminal(window, cx, &id);
-        // The poll still says "claude", but the shell has the terminal again: it is typed into.
-        window
-            .update(cx, |_, _, cx| {
-                t.update(cx, |t, _| {
-                    t.foreground = Some("claude".into());
-                    t.fake.front = Some(Front::Shell("zsh".into()));
-                })
-            })
-            .unwrap();
         send_key(window, cx, &id, "enter").unwrap();
-        // An agent CLI that started since the last poll still gets nothing.
+        // An agent CLI that started since the last poll still gets nothing: asked live.
         window
             .update(cx, |_, _, cx| {
                 t.update(cx, |t, _| {
@@ -3476,21 +3802,118 @@ mod tests {
             .unwrap();
         let err = send_key(window, cx, &id, "q").unwrap_err();
         assert!(err.contains("agent CLI"), "{err}");
+        // The shell has the terminal again, but the conversation stays in its scrollback and
+        // the terminal stays closed: not typed into, not listed, not read.
+        set_front(window, cx, &t, Some(Front::Shell("zsh".into())));
+        let err = send_key(window, cx, &id, "q").unwrap_err();
+        assert!(err.contains("agent CLI"), "{err}");
+        assert!(rows(window, cx).is_empty());
+        let err = call(window, cx, "m1", "terminals.read", json!({"id": id})).unwrap_err();
+        assert!(err.contains("agent CLI"), "{err}");
         assert_eq!(sent(window, cx, &id), b"\r");
-        // A terminal that cannot be asked is not an agent: it is typed into like a shell.
-        set_front(window, cx, &t, Some(Front::Unknown));
-        send_key(window, cx, &id, "q").unwrap();
-        assert_eq!(sent(window, cx, &id), b"\rq");
+        // It can still be stopped and closed: that only ends what the Mono started.
+        call(window, cx, "m1", "terminals.close", json!({"id": id})).unwrap();
+        // The poll alone counts too: one sighting is enough.
+        let other = dock(window, cx, "FE");
+        let o = terminal(window, cx, &other);
+        window
+            .update(cx, |_, _, cx| {
+                o.update(cx, |t, _| t.foreground = Some("codex".into()))
+            })
+            .unwrap();
+        assert!(send_key(window, cx, &other, "q").is_err());
+        window
+            .update(cx, |_, _, cx| o.update(cx, |t, _| t.foreground = None))
+            .unwrap();
+        assert!(send_key(window, cx, &other, "q").is_err());
     }
 
     #[gpui::test]
-    fn an_unknown_foreground_is_reused_by_the_poll_only_where_the_poll_can_see(
+    fn a_terminal_that_cannot_be_asked_is_not_typed_into_where_the_system_can_look(
         cx: &mut TestAppContext,
     ) {
         let (window, _, _) = window(cx);
+        let id = dock(window, cx, "BE");
+        let t = terminal(window, cx, &id);
+        set_front(window, cx, &t, Some(Front::Unknown));
+        let attempt = send_key(window, cx, &id, "q");
+        if CAN_INSPECT {
+            assert!(attempt.unwrap_err().contains("cannot tell"));
+            assert!(sent(window, cx, &id).is_empty());
+        } else {
+            attempt.unwrap();
+        }
+        // A group that cannot be listed is the same.
+        set_front(window, cx, &t, None);
+        window
+            .update(cx, |_, _, cx| {
+                t.update(cx, |t, _| t.fake.group_unknown = true)
+            })
+            .unwrap();
+        assert_eq!(send_key(window, cx, &id, "q").is_ok(), !CAN_INSPECT);
+    }
+
+    #[gpui::test]
+    fn every_process_in_front_must_be_inside_the_project_to_be_typed_into(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        let id = dock(window, cx, "BE");
+        let t = terminal(window, cx, &id);
+        // `true | (cd / && exec zsh -i)`: the leader is inside, the shell that has the keyboard
+        // is not (and `sudo -s` would hide its folder altogether).
+        window
+            .update(cx, |_, _, cx| {
+                t.update(cx, |t, _| {
+                    t.fake.group = Some(vec![
+                        Member {
+                            pid: 10,
+                            args: "sleep 1000000000".into(),
+                            cwd: Some(PROJECT.into()),
+                        },
+                        Member {
+                            pid: 11,
+                            args: "zsh -i".into(),
+                            cwd: Some("/".into()),
+                        },
+                    ]);
+                })
+            })
+            .unwrap();
+        let err = send_key(window, cx, &id, "enter").unwrap_err();
+        assert!(err.contains("outside the project") || !CAN_INSPECT, "{err}");
+        // An agent piped into: the group holds it.
+        window
+            .update(cx, |_, _, cx| {
+                t.update(cx, |t, _| {
+                    t.fake.group = Some(vec![
+                        Member {
+                            pid: 10,
+                            args: "cat prompt.txt".into(),
+                            cwd: Some(PROJECT.into()),
+                        },
+                        Member {
+                            pid: 11,
+                            args: "claude".into(),
+                            cwd: Some(PROJECT.into()),
+                        },
+                    ]);
+                })
+            })
+            .unwrap();
+        assert!(
+            send_key(window, cx, &id, "enter")
+                .unwrap_err()
+                .contains("agent CLI")
+        );
+        assert!(sent(window, cx, &id).is_empty());
+    }
+
+    #[gpui::test]
+    fn an_unknown_foreground_is_not_reused_and_a_busy_one_neither(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
         let first = dock(window, cx, "BE");
         let t = terminal(window, cx, &first);
-        // `ps` failed or this is Windows: the live answer is "unknown".
+        // `ps` failed or this is Windows: the live answer is "unknown". Reusing types a
+        // command, which needs the same answers a write does, so a new terminal opens.
         set_front(window, cx, &t, Some(Front::Unknown));
         let again = call(
             window,
@@ -3500,16 +3923,20 @@ mod tests {
             json!({"label": "BE", "place": "dock"}),
         )
         .unwrap();
-        // Off unix the poll proves nothing, so a program could be running: a new terminal
-        // opens under the same label instead of reusing this one.
-        assert_eq!(again["reused"].as_bool(), Some(cfg!(unix)), "{again}");
-        assert_eq!(rows(window, cx).len(), if cfg!(unix) { 1 } else { 2 });
+        assert_eq!(again["reused"], false, "{again}");
+        assert_eq!(rows(window, cx).len(), 2);
         // The last poll saw a program: not the same idle terminal, so a new one opens.
-        window
-            .update(cx, |_, _, cx| {
-                t.update(cx, |t, _| t.foreground = Some("sleep".into()))
-            })
-            .unwrap();
+        let second = terminal(window, cx, again["id"].as_str().unwrap());
+        for terminal in [&t, &second] {
+            window
+                .update(cx, |_, _, cx| {
+                    terminal.update(cx, |t, _| {
+                        t.fake.front = None;
+                        t.foreground = Some("sleep".into())
+                    })
+                })
+                .unwrap();
+        }
         let busy = call(
             window,
             cx,
@@ -3549,7 +3976,7 @@ mod tests {
         // Reading needs no per-terminal switch any more.
         let read = call(window, cx, "m1", "terminals.read", json!({"id": id})).unwrap();
         assert!(read["text"].as_str().unwrap().contains("user output"));
-        // Another Mono's terminal is unknown to this one.
+        // Another Mono's terminal is read-only to this one.
         let theirs = call(
             window,
             cx,
@@ -3558,15 +3985,14 @@ mod tests {
             json!({"label": "T", "place": "dock"}),
         )
         .unwrap();
-        let err = call(
+        call(
             window,
             cx,
             "m1",
             "terminals.read",
             json!({"id": theirs["id"]}),
         )
-        .unwrap_err();
-        assert!(err.contains("Unknown terminal"));
+        .unwrap();
     }
 
     #[gpui::test]
@@ -3634,7 +4060,7 @@ mod tests {
             json!({"id": id, "text": "ls"}),
         )
         .unwrap();
-        // When the system cannot tell where the shell is, the folder it started in decides.
+        // A terminal the test PTY places nowhere is judged where it started.
         window
             .update(cx, |_, _, cx| {
                 t.update(cx, |t, _| {
@@ -3991,7 +4417,20 @@ mod tests {
     #[gpui::test]
     fn a_restart_brings_back_no_mono_terminal_and_keeps_the_users(cx: &mut TestAppContext) {
         let (window, _chat) = logs_setup(cx);
-        let user = user_terminal(window, cx);
+        // The user's dock tab is in its own folder, so it cannot be mistaken for a Mono's.
+        let user_cwd = format!("{PROJECT}/api");
+        window
+            .update(cx, |shell, _, cx| {
+                let t = shell.spawn_terminal(user_cwd.clone(), cx);
+                shell.terminals.entry(PROJECT.into()).or_default().push(t);
+                shell
+                    .workspace
+                    .docks
+                    .entry(PROJECT.into())
+                    .or_default()
+                    .add(user_cwd.clone());
+            })
+            .unwrap();
         let be = dock(window, cx, "BE");
         let tab = open(
             window,
@@ -4003,15 +4442,24 @@ mod tests {
             cx,
             json!({"label": "FE", "place": "split", "reveal": false}),
         );
-        let _ = (user, be, tab, fe);
+        let before: Vec<_> = rows(window, cx)
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_owned())
+            .collect();
+        for id in [&be, &tab, &fe] {
+            assert!(before.contains(id), "{id} not in {before:?}");
+        }
         let saved = saved(window, cx);
         assert!(!saved.contains("\"mono\""), "{saved}");
         assert!(!saved.contains("BE") && !saved.contains("FE"), "{saved}");
         let window = restarted(cx, saved);
         window
-            .update(cx, |shell, _, _| {
+            .update(cx, |shell, _, cx| {
                 // Only the user's own dock tab came back, and no pane at all.
-                assert_eq!(shell.workspace.docks[PROJECT].terminals.len(), 1);
+                assert_eq!(
+                    shell.workspace.docks[PROJECT].terminals,
+                    std::slice::from_ref(&user_cwd)
+                );
                 assert!(shell.workspace.terminal_panes.is_empty());
                 assert!(shell.workspace.tabs.iter().all(|tab| {
                     shell
@@ -4021,11 +4469,19 @@ mod tests {
                         .iter()
                         .all(|id| *id >= 0)
                 }));
+                // Shown, the dock reopens that one tab as a fresh shell.
+                shell.ensure_terminals(PROJECT, cx);
             })
             .unwrap();
-        assert!(rows(window, cx).len() <= 1);
-        // No ids survive: an id of the earlier run names nothing.
-        assert!(call(window, cx, "m1", "terminals.read", json!({"id": "t-1"})).is_err());
+        let after = rows(window, cx);
+        assert_eq!(after.len(), 1, "{after:?}");
+        assert_eq!(after[0]["cwd"], user_cwd.as_str());
+        assert_eq!(after[0]["owner"], "user");
+        // No id survives: the ids of the earlier run name nothing, the Mono's among them.
+        for id in [&be, &tab, &fe] {
+            let err = call(window, cx, "m1", "terminals.read", json!({"id": id})).unwrap_err();
+            assert!(err.contains("Unknown terminal"), "{id}: {err}");
+        }
     }
 
     #[gpui::test]

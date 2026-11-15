@@ -634,6 +634,18 @@ fn run_turn_using(
                 shlex_quote(&cli.to_string_lossy())
             );
         }
+        // A plain local session (no Operator, no Mono) can still read the project's terminals.
+        if !raw_native_command
+            && !settings.operator_enabled
+            && settings.mono.is_none()
+            && !summary.cwd.starts_with("remote://")
+        {
+            let cli = std::env::current_exe().map_err(|e| e.to_string())?;
+            prompt = format!(
+                "{}\n\n{prompt}",
+                terminals_read_preamble(&shlex_quote(&cli.to_string_lossy()))
+            );
+        }
         if !raw_native_command
             && settings.mono.is_none()
             && let Some(task) = {
@@ -1240,6 +1252,13 @@ fn today_task_preamble(key: &str, title: &str, cli: &str) -> String {
     )
 }
 
+/// The per-turn line that tells a plain local session it can read terminals.
+fn terminals_read_preamble(cli: &str) -> String {
+    format!(
+        "Read-only: with the CLI {cli} app ACTION --json JSON, terminals.list {{}} and terminals.read {{id,lines?}} list and read this project's or your worktree's terminals (secrets masked). App credentials are in the environment; never print them."
+    )
+}
+
 fn shlex_quote(text: &str) -> String {
     format!(
         "\"{}\"",
@@ -1253,6 +1272,14 @@ fn shlex_quote(text: &str) -> String {
 #[cfg(test)]
 mod today_preamble_tests {
     use super::*;
+
+    #[test]
+    fn plain_sessions_learn_that_terminals_can_be_read() {
+        assert_eq!(
+            terminals_read_preamble("\"/bin/monoptah\""),
+            "Read-only: with the CLI \"/bin/monoptah\" app ACTION --json JSON, terminals.list {} and terminals.read {id,lines?} list and read this project's or your worktree's terminals (secrets masked). App credentials are in the environment; never print them."
+        );
+    }
 
     #[test]
     fn preamble_names_the_task_and_the_cli() {

@@ -32,9 +32,15 @@ fn visual_turn(request: Option<&str>) {
         None => "Show a native visual".to_owned(),
     };
     let prepared_prompt = request.map(monocode_core::visual_bridge::requested_prompt);
+    // A plain local session is told it can read the project's terminals, ahead of the prompt.
+    let cli = shlex_quote(&std::env::current_exe().unwrap().to_string_lossy());
     std::fs::write(
         fixture.0.join("expected-prompt.txt"),
-        prepared_prompt.as_ref().unwrap_or(&prompt),
+        format!(
+            "{}\n\n{}",
+            terminals_read_preamble(&cli),
+            prepared_prompt.as_ref().unwrap_or(&prompt)
+        ),
     )
     .unwrap();
     let binary = fixture.0.join("mock-provider");

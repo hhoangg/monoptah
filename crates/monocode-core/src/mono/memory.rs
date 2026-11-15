@@ -18,7 +18,14 @@ static SECRETS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         r"\bxox[abprs]-[A-Za-z0-9-]{10,}",
         r"\bAKIA[0-9A-Z]{16}\b",
         r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
-        r"(?i)\b(?:password|passwd|secret|token|api[_-]?key)\s*[:=]\s*\S+",
+        r"\bsk_(?:live|test)_[A-Za-z0-9]+",
+        r"\bAIza[0-9A-Za-z_-]{35}",
+        r"\bnpm_[A-Za-z0-9]{36}",
+        // A name that carries one of these words (`DB_PASSWORD`, `NPM_TOKEN`,
+        // `AWS_SECRET_ACCESS_KEY`), with or without a closing quote, and its value.
+        r#"(?i)\b[A-Za-z0-9_]*(?:password|passwd|token|secret|api[_-]?key|private_key|access_key)[A-Za-z0-9_]*["']?\s*[:=]\s*\S+"#,
+        // The password of `scheme://user:password@host`; the rest of the address stays.
+        r"://[^/\s:@]+:(?P<v>[^@\s]+)@",
     ]
     .iter()
     .map(|p| Regex::new(p).unwrap())
@@ -27,7 +34,12 @@ static SECRETS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 pub fn redact(text: &str) -> String {
     SECRETS.iter().fold(text.into(), |s, re| {
         re.replace_all(&s, |c: &regex::Captures<'_>| {
-            format!("«redacted {} chars»", c[0].chars().count())
+            // A pattern with a `v` group masks only that part of the match.
+            let (whole, value) = (c.get(0).unwrap(), c.name("v").unwrap_or(c.get(0).unwrap()));
+            let mask = format!("«redacted {} chars»", value.as_str().chars().count());
+            let text = whole.as_str();
+            let (from, to) = (value.start() - whole.start(), value.end() - whole.start());
+            format!("{}{mask}{}", &text[..from], &text[to..])
         })
         .into_owned()
     })

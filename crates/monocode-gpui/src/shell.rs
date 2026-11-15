@@ -3592,6 +3592,13 @@ impl Shell {
             .push(cx.subscribe(&terminal, |_, _, _: &TerminalEvent, cx| cx.notify()));
         terminal
     }
+    /// A terminal a Mono opened: it starts in `cwd` or not at all, never in the home folder.
+    fn spawn_mono_terminal(&mut self, cwd: String, cx: &mut Context<Self>) -> Entity<Terminal> {
+        let terminal = cx.new(|cx| Terminal::new_strict(cwd, cx));
+        self.observations
+            .push(cx.subscribe(&terminal, |_, _, _: &TerminalEvent, cx| cx.notify()));
+        terminal
+    }
     /// A restored dock reopens its tabs as fresh shells once it is shown.
     fn ensure_terminals(&mut self, project: &str, cx: &mut Context<Self>) {
         if project.starts_with("remote://") {

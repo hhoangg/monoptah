@@ -162,6 +162,10 @@ pub(crate) struct Terminal {
     /// A Mono opened this terminal; it wears the Mono mark. Runtime only: a Mono's terminals
     /// are not saved.
     pub(crate) by_mono: bool,
+    /// An agent CLI has held this terminal at some point (seen by the poll or by a live
+    /// probe). Sticky for the terminal's life: its conversation stays in the scrollback after
+    /// the agent exits, so the terminal is never listed or read by a Mono or a session.
+    agent_seen: Cell<bool>,
     /// How the shell ended, once it has (`None` while it runs or when a signal killed it).
     pub(crate) exit_code: Option<i32>,
     /// A command other than the shell holds the terminal.
@@ -242,6 +246,8 @@ struct Plan {
     /// The real program when it runs under the `env` wrapper: `env` would
     /// start fine and then exit 127, so it is checked before spawning.
     verify: Option<String>,
+    /// The folder must exist: a missing one is a start error, not a fall back to home.
+    strict_dir: bool,
 }
 impl Plan {
     fn shell() -> Self {
@@ -254,6 +260,7 @@ impl Plan {
             secret_env: Vec::new(),
             drain: false,
             verify: None,
+            strict_dir: false,
         }
     }
     fn launch(
@@ -274,6 +281,7 @@ impl Plan {
             drain: true,
             label,
             verify,
+            strict_dir: false,
         }
     }
 }
@@ -369,10 +377,16 @@ fn spawn(cwd: &str, size: GridSize, id: u64, plan: Plan) -> Spawned {
     for (key, value) in &plan.secret_env {
         env.insert(key.clone(), value.as_str().to_owned());
     }
-    let problem = plan
-        .verify
-        .as_deref()
-        .and_then(|program| program_problem(program, &env["PATH"], &workdir));
+    let problem = if plan.strict_dir && !Path::new(cwd).is_dir() {
+        Some(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("the folder {cwd} does not exist"),
+        ))
+    } else {
+        plan.verify
+            .as_deref()
+            .and_then(|program| program_problem(program, &env["PATH"], &workdir))
+    };
     let options = tty::Options {
         shell: Some(tty::Shell::new(
             shell::pty_program(&plan.program),
@@ -469,16 +483,6 @@ pub(crate) enum Front {
     Unknown,
 }
 
-impl Front {
-    /// The supported agent CLI this front is, if any.
-    pub(crate) fn agent(&self) -> Option<&'static str> {
-        match self {
-            Self::Program(label) => agent_cli(label),
-            _ => None,
-        }
-    }
-}
-
 /// What a test PTY cannot answer. Unset, a test terminal is at its shell prompt, or runs
 /// `foreground` when that is set, in a process group 100.
 #[cfg(test)]
@@ -486,6 +490,10 @@ impl Front {
 pub(crate) struct Fake {
     pub front: Option<Front>,
     pub cwd: Option<String>,
+    /// The whole foreground group; unset, one member made from `front` and `cwd`.
+    pub group: Option<Vec<Member>>,
+    /// The system cannot tell what runs in front.
+    pub group_unknown: bool,
     pub pgrp: Option<i32>,
     /// The process groups `hang_up_group` signalled.
     pub hung_up: Vec<i32>,
@@ -548,12 +556,26 @@ const GRID: GridSize = GridSize {
 
 impl Terminal {
     pub(crate) fn new(cwd: String, cx: &mut Context<Self>) -> Self {
+        Self::shell_in(cwd, false, cx)
+    }
+
+    /// A shell that starts exactly in `cwd` or not at all: a folder that is gone is a start
+    /// error shown in the terminal, not a shell in the home folder. For a Mono's terminals.
+    pub(crate) fn new_strict(cwd: String, cx: &mut Context<Self>) -> Self {
+        Self::shell_in(cwd, true, cx)
+    }
+
+    fn shell_in(cwd: String, strict_dir: bool, cx: &mut Context<Self>) -> Self {
         let spawned = if cfg!(test) {
             // GPUI's deterministic test scheduler rejects wakeups from the
             // PTY thread; UI tests run the dock without a shell behind it.
             detached(GRID)
         } else {
-            spawn(&cwd, GRID, cx.entity_id().as_u64(), Plan::shell())
+            let plan = Plan {
+                strict_dir,
+                ..Plan::shell()
+            };
+            spawn(&cwd, GRID, cx.entity_id().as_u64(), plan)
         };
         Self::build(cwd, spawned, false, cx)
     }
@@ -682,6 +704,7 @@ impl Terminal {
             title: default_title(&cwd),
             label: None,
             by_mono: false,
+            agent_seen: Cell::new(false),
             exit_code: None,
             cwd,
             foreground: None,
@@ -814,6 +837,10 @@ impl Terminal {
     pub(crate) fn display_title(&self) -> &str {
         self.label.as_deref().unwrap_or(&self.title)
     }
+    /// Why the shell could not start, if it could not.
+    pub(crate) fn spawn_problem(&self) -> Option<&str> {
+        self.spawn_error.as_deref()
+    }
     /// A shell the app opened for the user or a Mono, not a launched program (an agent
     /// session, a login or a cloud shell).
     pub(crate) fn is_plain_shell(&self) -> bool {
@@ -841,7 +868,7 @@ impl Terminal {
     /// What holds the terminal now, asked of the PTY.
     #[cfg(not(test))]
     pub(crate) fn live_front(&self) -> Front {
-        live_front_of(self.master_fd, self.shell_pid)
+        front_of(self.live_group().as_deref(), self.shell_pid)
     }
     #[cfg(test)]
     pub(crate) fn live_front(&self) -> Front {
@@ -853,23 +880,48 @@ impl Terminal {
             _ => Front::Shell("zsh".into()),
         }
     }
-    /// The directory of the process that gets typed input, when the system tells it cheaply.
-    /// `None` is "not known", never "the project".
+    /// Every process of the foreground group, each with its command line and folder, asked of
+    /// the system now. `None` is "cannot tell" (no PTY, the lookup failed, the group is gone,
+    /// a platform with no lookup): never "nothing runs here" and never "the project".
     #[cfg(all(not(test), unix))]
-    pub(crate) fn live_cwd(&self) -> Option<String> {
-        if self.master_fd < 0 {
+    pub(crate) fn live_group(&self) -> Option<Vec<Member>> {
+        if self.master_fd < 0 || self.exited {
             return None;
         }
         let pgrp = unsafe { libc::tcgetpgrp(self.master_fd) };
-        (pgrp > 0).then(|| process_cwd(pgrp)).flatten()
+        (pgrp > 0).then(|| group_members(pgrp)).flatten()
     }
     #[cfg(all(not(test), not(unix)))]
-    pub(crate) fn live_cwd(&self) -> Option<String> {
+    pub(crate) fn live_group(&self) -> Option<Vec<Member>> {
         None
     }
     #[cfg(test)]
-    pub(crate) fn live_cwd(&self) -> Option<String> {
-        self.fake.cwd.clone()
+    pub(crate) fn live_group(&self) -> Option<Vec<Member>> {
+        if self.fake.group_unknown {
+            return None;
+        }
+        if let Some(group) = &self.fake.group {
+            return Some(group.clone());
+        }
+        let args = match self.live_front() {
+            Front::Shell(name) | Front::Program(name) => name,
+            Front::Unknown => return None,
+        };
+        Some(vec![Member {
+            pid: self.shell_pid as i32,
+            args,
+            cwd: Some(self.fake.cwd.clone().unwrap_or_else(|| self.cwd.clone())),
+        }])
+    }
+    /// Whether an agent CLI holds this terminal in `group` (the probe the caller just made),
+    /// or ever held it. Remembers a hit for the terminal's life.
+    pub(crate) fn note_agent(&self, group: Option<&[Member]>) -> bool {
+        if !self.agent_seen.get()
+            && (self.agent().is_some() || group.is_some_and(|g| group_agent(g).is_some()))
+        {
+            self.agent_seen.set(true);
+        }
+        self.agent_seen.get()
     }
     /// The process group of a job holding the terminal (not the shell itself).
     #[cfg(all(not(test), unix))]
@@ -910,7 +962,7 @@ impl Terminal {
         self.write(key.bytes());
         cx.notify();
     }
-    /// Types `text` as a Mono asked, after the user approved it. It goes in as given, never
+    /// Types `text` as a Mono asked. It goes in as given, never
     /// trimmed. A text with a line break is one bracketed paste when the program turned that
     /// mode on (so the shell does not run each line as it arrives), else its lines end in
     /// Enter like a paste into a plain terminal. `submit` presses Enter after the text.
@@ -973,6 +1025,9 @@ impl Terminal {
             return;
         }
         self.title = label.clone().unwrap_or_else(|| default_title(&self.cwd));
+        if label.as_deref().and_then(guarded_agent).is_some() {
+            self.agent_seen.set(true);
+        }
         self.foreground = label;
         cx.emit(TerminalEvent::Changed);
     }
@@ -2456,7 +2511,7 @@ fn process_label(pid: i32) -> Option<String> {
     command_label(String::from_utf8_lossy(&output.stdout).trim())
 }
 /// What holds the terminal right now: the shell at its prompt, another program, or unknown.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn live_front_of(master_fd: i32, shell_pid: u32) -> Front {
     if master_fd < 0 {
         return Front::Unknown;
@@ -2465,20 +2520,142 @@ fn live_front_of(master_fd: i32, shell_pid: u32) -> Front {
     if pgrp <= 0 {
         return Front::Unknown;
     }
-    let label = process_label(pgrp);
-    if pgrp == shell_pid as i32 {
-        return Front::Shell(label.unwrap_or_else(|| "shell".into()));
-    }
-    match label {
-        Some(label) if is_shell_name(&label) => Front::Shell(label),
-        Some(label) => Front::Program(label),
-        None => Front::Unknown,
+    front_of(group_members(pgrp).as_deref(), shell_pid)
+}
+
+/// One process of the group in front of a terminal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Member {
+    pub pid: i32,
+    /// Its command line, as `ps` prints it.
+    pub args: String,
+    /// Its working folder; `None` when the system would not say (another user's process, a
+    /// process that just ended).
+    pub cwd: Option<String>,
+}
+
+impl Member {
+    /// The agent CLI this process is, if any (see `agent_in_args`).
+    pub(crate) fn agent(&self) -> Option<&'static str> {
+        agent_in_args(&self.args)
     }
 }
-#[cfg(not(unix))]
-#[cfg_attr(test, allow(dead_code))]
-fn live_front_of(_: i32, _: u32) -> Front {
-    Front::Unknown
+
+/// The agent CLI any process of `group` is.
+pub(crate) fn group_agent(group: &[Member]) -> Option<&'static str> {
+    group.iter().find_map(Member::agent)
+}
+
+/// What holds the terminal, from its foreground group: the shell at its prompt when every
+/// member is a shell, else the first other program. Nothing known is `Unknown`.
+fn front_of(group: Option<&[Member]>, shell_pid: u32) -> Front {
+    let Some(group) = group.filter(|g| !g.is_empty()) else {
+        return Front::Unknown;
+    };
+    let label = |m: &Member| command_label(&m.args).unwrap_or_else(|| "shell".into());
+    let is_shell = |m: &Member| m.pid == shell_pid as i32 || is_shell_name(&label(m));
+    match group.iter().find(|m| !is_shell(m)) {
+        Some(program) => Front::Program(label(program)),
+        None => Front::Shell(label(&group[0])),
+    }
+}
+
+/// The processes of group `pgrp` (the leader may be long gone: `true | (cd / && exec zsh)`).
+/// `None` when the group cannot be listed or `ps` cannot run.
+#[cfg(unix)]
+fn group_members(pgrp: i32) -> Option<Vec<Member>> {
+    let mut members = Vec::new();
+    for pid in group_pids(pgrp)? {
+        let args = match process_args(pid) {
+            Err(()) => return None,
+            // Ended since the listing.
+            Ok(None) => continue,
+            Ok(Some(args)) if is_zombie(&args) => continue,
+            Ok(Some(args)) => args,
+        };
+        members.push(Member {
+            pid,
+            args,
+            cwd: process_cwd(pid),
+        });
+    }
+    (!members.is_empty()).then_some(members)
+}
+
+/// An ended process its parent has not reaped yet: no folder, no command, no input.
+#[cfg(unix)]
+fn is_zombie(args: &str) -> bool {
+    args.contains("<defunct>") || (args.starts_with('(') && args.ends_with(')'))
+}
+
+#[cfg(target_os = "macos")]
+fn group_pids(pgrp: i32) -> Option<Vec<i32>> {
+    const SIZE: usize = std::mem::size_of::<libc::pid_t>();
+    unsafe {
+        let bytes = libc::proc_listpgrppids(pgrp, std::ptr::null_mut(), 0);
+        if bytes <= 0 {
+            return None;
+        }
+        // Zero-filled and read to the end, so the unit of the answer (bytes or entries)
+        // does not matter; a pid is never 0.
+        let mut pids: Vec<libc::pid_t> = vec![0; bytes as usize / SIZE + 16];
+        let got = libc::proc_listpgrppids(
+            pgrp,
+            pids.as_mut_ptr().cast(),
+            (pids.len() * SIZE) as libc::c_int,
+        );
+        if got <= 0 {
+            return None;
+        }
+        pids.retain(|pid| *pid > 0);
+        (!pids.is_empty()).then_some(pids)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn group_pids(pgrp: i32) -> Option<Vec<i32>> {
+    let mut pids = Vec::new();
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| stat_pgrp(&stat))
+            == Some(pgrp)
+        {
+            pids.push(pid);
+        }
+    }
+    (!pids.is_empty()).then_some(pids)
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn group_pids(_: i32) -> Option<Vec<i32>> {
+    None
+}
+
+/// The process group in `/proc/<pid>/stat`: the third field after the command, which is in
+/// parentheses and may itself contain spaces and parentheses.
+#[cfg(any(target_os = "linux", test))]
+fn stat_pgrp(stat: &str) -> Option<i32> {
+    let after = &stat[stat.rfind(')')? + 1..];
+    after.split_whitespace().nth(2)?.parse().ok()
+}
+
+/// The command line of process `pid`: `Ok(None)` when it is gone, `Err` when `ps` cannot run.
+#[cfg(unix)]
+fn process_args(pid: i32) -> Result<Option<String>, ()> {
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "args="])
+        .output()
+        .map_err(|_| ())?;
+    let args = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    Ok((output.status.success() && !args.is_empty()).then_some(args))
 }
 /// The working directory of process `pid`.
 #[cfg(target_os = "macos")]
@@ -2551,6 +2728,146 @@ pub(crate) fn agent_cli(label: &str) -> Option<&'static str> {
         _ => {}
     }
     monocode_core::provider::Kind::parse(name).map(|kind| kind.id())
+}
+/// Agent CLIs a Mono must never read or drive that `agent_cli` does not name (it maps the
+/// providers the app itself supports), by the name they run as.
+const OTHER_AGENTS: &[(&str, &str)] = &[
+    ("claude-code", "claude"),
+    ("gemini", "gemini"),
+    ("gemini-cli", "gemini"),
+    ("aider", "aider"),
+    ("aider-chat", "aider"),
+    ("copilot", "copilot"),
+    ("github-copilot", "copilot"),
+    ("amp", "amp"),
+    ("opencode-ai", "opencode"),
+];
+
+/// The agent CLI a foreground label or program name is: the app's providers and
+/// `OTHER_AGENTS`. Used to hide a terminal, never to draw a provider mark (that is
+/// `agent_cli`).
+pub(crate) fn guarded_agent(name: &str) -> Option<&'static str> {
+    agent_cli(name).or_else(|| {
+        let stem = name.split('.').next()?;
+        OTHER_AGENTS
+            .iter()
+            .find_map(|(known, id)| (*known == stem).then_some(*id))
+    })
+}
+
+/// Programs that run another program named in their arguments (an interpreter, a package
+/// runner, `sudo`, `caffeinate`, `op run --`, a shell with `-c`).
+fn is_wrapper(base: &str) -> bool {
+    let stem = base.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    matches!(
+        stem,
+        "node"
+            | "nodejs"
+            | "npx"
+            | "pnpx"
+            | "pnpm"
+            | "yarn"
+            | "npm"
+            | "bun"
+            | "bunx"
+            | "deno"
+            | "python"
+            | "ruby"
+            | "perl"
+            | "uv"
+            | "uvx"
+            | "pipx"
+            | "env"
+            | "caffeinate"
+            | "op"
+            | "nice"
+            | "nohup"
+            | "time"
+            | "sudo"
+            | "doas"
+            | "exec"
+            | "command"
+            | "stdbuf"
+            | "timeout"
+            | "xargs"
+            | "script"
+            | "arch"
+            | "rlwrap"
+            | "sh"
+            | "bash"
+            | "zsh"
+            | "dash"
+            | "ksh"
+            | "fish"
+    )
+}
+
+/// The agent CLI an argument of a wrapper names: a program (`claude`, `codex.js`), a package
+/// (`@anthropic-ai/claude-code`, `@openai/codex@latest`, `aider-chat`) or a path into one.
+fn argument_agent(arg: &str) -> Option<&'static str> {
+    let arg = arg.trim_matches(['"', '\'']);
+    if arg.starts_with('-') {
+        return None;
+    }
+    // Package folders whose name alone says what runs, wherever they sit in a path.
+    for part in arg.split(['/', '\\']) {
+        if matches!(
+            part,
+            "claude-code" | "gemini-cli" | "opencode-ai" | "aider-chat"
+        ) {
+            return guarded_agent(part);
+        }
+    }
+    let base = arg.rsplit(['/', '\\']).next()?;
+    // `codex@latest`: the version is not part of the name.
+    let base = match base.find('@') {
+        Some(at) if at > 0 => &base[..at],
+        _ => base,
+    };
+    let name = ["js", "mjs", "cjs", "ts", "py"]
+        .iter()
+        .find_map(|ext| base.strip_suffix(&format!(".{ext}")))
+        .unwrap_or(base);
+    // Only names that say what they are: `pi`, `fx`, `omp` and `cursor` are real words and
+    // short names, and would flag an unrelated argument.
+    matches!(
+        name,
+        "claude"
+            | "claude-code"
+            | "codex"
+            | "gemini"
+            | "gemini-cli"
+            | "aider"
+            | "copilot"
+            | "amp"
+            | "opencode"
+            | "opencode-ai"
+            | "cursor-agent"
+            | "grok"
+            | "pi-coding-agent"
+    )
+    .then(|| guarded_agent(name))
+    .flatten()
+}
+
+/// The agent CLI a process is, from its command line: its own program name (as the label
+/// names it) and, when it is a wrapper (`node`, `npx`, `sudo`, `caffeinate`, `op run --`),
+/// every argument. A terminal holding an agent inside `tmux`, `ssh` or `docker` shows only
+/// that program and is not seen.
+pub(crate) fn agent_in_args(args: &str) -> Option<&'static str> {
+    if let Some(agent) = command_label(args).and_then(|label| guarded_agent(&label)) {
+        return Some(agent);
+    }
+    let mut parts = args.split_whitespace();
+    let exe = parts.next()?;
+    let base = exe.rsplit(['/', '\\']).next()?.trim_start_matches('-');
+    if let Some(agent) = guarded_agent(base) {
+        return Some(agent);
+    }
+    if !is_wrapper(base) {
+        return None;
+    }
+    parts.find_map(argument_agent)
 }
 impl Terminal {
     /// The agent CLI holding this terminal, if any.
@@ -3448,6 +3765,7 @@ mod tests {
             drain: false,
             label: program.into(),
             verify: None,
+            strict_dir: false,
         }
     }
 
@@ -3508,6 +3826,206 @@ mod tests {
             live_front_of(spawned.master_fd, spawned.shell_pid),
             Front::Shell(_)
         )));
+        let _ = sender.send(Msg::Input(Cow::Borrowed(b"exit\r")));
+    }
+
+    fn member(pid: i32, args: &str) -> Member {
+        Member {
+            pid,
+            args: args.into(),
+            cwd: Some("/work".into()),
+        }
+    }
+
+    #[test]
+    fn agent_clis_are_found_through_wrappers_and_pipelines() {
+        for args in [
+            "claude",
+            "/usr/local/bin/claude --resume",
+            "-claude",
+            "node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js",
+            "node /usr/lib/node_modules/@openai/codex/bin/codex.js",
+            "npx @anthropic-ai/claude-code",
+            "npx -y @openai/codex@latest",
+            "bunx @google/gemini-cli",
+            "caffeinate -i claude",
+            "op run -- claude",
+            "sudo -E codex",
+            "env FOO=1 claude --model x",
+            "bash -c claude",
+            "python3 -m aider",
+            "uvx --from aider-chat aider",
+            "gemini",
+            "aider",
+            "copilot",
+            "amp",
+            "opencode",
+            "cursor-agent",
+        ] {
+            assert!(agent_in_args(args).is_some(), "{args} is an agent CLI");
+        }
+        for args in [
+            "zsh",
+            "-zsh",
+            "vim claude.md",
+            "cat claude.md",
+            "grep codex notes.txt",
+            "tail -f codex.log",
+            "node server.js",
+            "node /home/me/claude/app.js",
+            "npm run dev",
+            "python3 -m http.server",
+            "sleep 1000000000",
+            "ssh host",
+            "tmux attach",
+            "docker run -it img",
+        ] {
+            assert_eq!(agent_in_args(args), None, "{args} is not an agent CLI");
+        }
+        // Every process of a pipeline is looked at, not just the first.
+        let piped = [member(1, "cat prompt.txt"), member(2, "claude")];
+        assert_eq!(group_agent(&piped), Some("claude"));
+        assert_eq!(group_agent(&[member(1, "cat a"), member(2, "wc -l")]), None);
+    }
+
+    #[test]
+    fn the_front_follows_every_process_of_the_group() {
+        assert_eq!(front_of(None, 5), Front::Unknown);
+        assert_eq!(front_of(Some(&[]), 5), Front::Unknown);
+        // The terminal's own shell, whatever it is called, is a shell; so is a shell in front.
+        assert_eq!(
+            front_of(Some(&[member(5, "-/opt/odd-shell")]), 5),
+            Front::Shell("odd-shell".into())
+        );
+        assert_eq!(
+            front_of(Some(&[member(9, "-zsh")]), 5),
+            Front::Shell("zsh".into())
+        );
+        // One program anywhere in the group makes it a program.
+        assert_eq!(
+            front_of(Some(&[member(7, "true"), member(8, "zsh -i")]), 5),
+            Front::Program("true".into())
+        );
+        assert_eq!(
+            front_of(Some(&[member(8, "zsh -i"), member(9, "vite --port 1")]), 5),
+            Front::Program("vite".into())
+        );
+    }
+
+    #[test]
+    fn a_linux_stat_line_gives_its_process_group_whatever_the_command_is_called() {
+        assert_eq!(stat_pgrp("123 (zsh) S 1 456 456 0 -1 4194560"), Some(456));
+        assert_eq!(stat_pgrp("124 (a b) c) R 123 789 789 0"), Some(789));
+        assert_eq!(stat_pgrp("garbage"), None);
+        assert_eq!(stat_pgrp("1 (x) S 1"), None);
+    }
+
+    #[test]
+    fn a_shell_plan_sets_no_history_variable_and_no_private_mode() {
+        let plan = Plan::shell();
+        for (key, _) in &plan.env {
+            assert!(
+                ![
+                    "HISTFILE",
+                    "HISTSIZE",
+                    "HISTFILESIZE",
+                    "SAVEHIST",
+                    "HISTCONTROL"
+                ]
+                .contains(&key.as_str()),
+                "{key}"
+            );
+        }
+        assert!(plan.secret_env.is_empty());
+        assert!(
+            !plan.args.iter().any(|a| a.contains("private")),
+            "{:?}",
+            plan.args
+        );
+    }
+
+    #[test]
+    fn a_strict_plan_does_not_fall_back_to_home_for_a_missing_folder() {
+        let size = GridSize {
+            columns: 80,
+            lines: 10,
+        };
+        let missing = std::env::temp_dir().join(format!("mono-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        let plan = Plan {
+            strict_dir: true,
+            ..plain("/bin/sh", &[])
+        };
+        let spawned = spawn(&missing.to_string_lossy(), size, 3, plan);
+        assert!(spawned.sender.is_none());
+        assert!(
+            spawned
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("does not exist"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_whole_foreground_group_is_listed_when_its_leader_is_gone() {
+        let dir = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let size = GridSize {
+            columns: 80,
+            lines: 10,
+        };
+        let spawned = spawn(&dir, size, 4, plain("/bin/sh", &[]));
+        let sender = spawned.sender.clone().expect("the shell started");
+        let wait_for = |what: &dyn Fn() -> bool| {
+            for _ in 0..250 {
+                if what() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        };
+        let group = || {
+            let pgrp = unsafe { libc::tcgetpgrp(spawned.master_fd) };
+            (pgrp > 0).then(|| group_members(pgrp)).flatten()
+        };
+        // `true` leads the pipeline and is gone at once; what holds the terminal is the
+        // `sleep` in the other part, standing in `/`.
+        let _ = sender.send(Msg::Input(Cow::Borrowed(
+            b"true | (cd / && exec sleep 30)\r",
+        )));
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let in_root = |members: &Vec<Member>| {
+                members.iter().any(|m| {
+                    m.args.starts_with("sleep")
+                        && m.cwd.as_deref().is_some_and(|c| {
+                            std::fs::canonicalize(c).is_ok_and(|c| c == Path::new("/"))
+                        })
+                })
+            };
+            assert!(
+                wait_for(&|| group().as_ref().is_some_and(in_root)),
+                "{:?}",
+                group()
+            );
+            // The leader alone would have said nothing (or the project): the group says `/`.
+            let front = front_of(group().as_deref(), spawned.shell_pid);
+            assert!(
+                matches!(front, Front::Program(ref name) if name == "sleep"),
+                "{front:?}"
+            );
+        }
+        let _ = sender.send(Msg::Input(Cow::Borrowed(b"\x03")));
+        let _ = wait_for(&|| {
+            matches!(
+                live_front_of(spawned.master_fd, spawned.shell_pid),
+                Front::Shell(_)
+            )
+        });
         let _ = sender.send(Msg::Input(Cow::Borrowed(b"exit\r")));
     }
 }

@@ -101,7 +101,6 @@ impl Shell {
                 .get(&pane)
                 .map(|t| t.read(cx).display_title().to_owned())
                 .filter(|t| !t.is_empty())
-                .or_else(|| state.label.clone())
                 .unwrap_or_else(|| project_name(&state.cwd)),
         )
     }
@@ -169,7 +168,6 @@ impl Shell {
         let mut state = TerminalPane::new(owner, cwd);
         if let Some(mono) = self.mono_registry.mono_of(&terminal) {
             state.mono = Some(mono);
-            state.label = terminal.read(cx).label.clone();
         }
         self.workspace.terminal_panes.insert(pane, state);
         self.terminal_pane_views.insert(pane, terminal);
