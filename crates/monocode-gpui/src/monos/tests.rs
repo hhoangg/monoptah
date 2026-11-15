@@ -419,6 +419,7 @@ pub(super) fn call_from(
 ) -> mpsc::Receiver<Result<Value, String>> {
     let (reply, rx) = mpsc::channel();
     let call = mono::bridge::Call {
+        received: std::time::Instant::now(),
         session,
         request_id: request.into(),
         action: action.into(),
@@ -731,6 +732,7 @@ fn app_receipt_lookup_does_not_wait_for_storage_on_the_ui_thread(cx: &mut TestAp
     acquired.recv().unwrap();
     let (reply, response) = mpsc::channel();
     let call = mono::bridge::Call {
+        received: std::time::Instant::now(),
         session: s.session,
         request_id: "contended-lookup".into(),
         action: "sessions.list".into(),
@@ -5714,6 +5716,7 @@ fn a_move_racing_a_delete_cannot_bring_the_deleted_session_back(cx: &mut TestApp
     let send = |request: &str, action: &str, input: Value, cx: &mut TestAppContext| {
         let (reply, rx) = mpsc::channel();
         let call = mono::bridge::Call {
+            received: std::time::Instant::now(),
             session: s.session,
             request_id: request.into(),
             action: action.into(),
@@ -6029,7 +6032,7 @@ fn terminals_belong_to_the_monos_own_chat_and_not_to_habit_runs_or_heartbeats(
         &s,
         "t-send",
         "terminals.send",
-        json!({"id": id, "key": "enter"}),
+        json!({"id": id, "key": "ctrl-c"}),
         cx,
     )
     .unwrap();
@@ -6102,15 +6105,16 @@ fn terminals_belong_to_the_monos_own_chat_and_not_to_habit_runs_or_heartbeats(
 fn an_allowed_terminal_command_is_saved_with_the_mono_and_leaves_with_it(cx: &mut TestAppContext) {
     let s = setup(cx);
     s.manager.update(cx, |m, cx| {
-        m.allow_terminal(&s.id, "command", "npm test", cx)
+        m.allow_terminal(&s.id, "/work/app", "command", "npm test", cx)
     });
     cx.run_until_parked();
     cx.update(|cx| {
         let m = s.manager.read(cx);
-        assert!(m.terminal_allowed(&s.id, "command", "npm test"));
-        assert!(!m.terminal_allowed(&s.id, "command", "npm test "));
-        assert!(!m.terminal_allowed(&s.id, "text", "npm test"));
-        assert!(!m.terminal_allowed("another", "command", "npm test"));
+        assert!(m.terminal_allowed(&s.id, "/work/app", "command", "npm test"));
+        assert!(!m.terminal_allowed(&s.id, "/work/app", "command", "npm test "));
+        assert!(!m.terminal_allowed(&s.id, "/work/app", "text", "npm test"));
+        assert!(!m.terminal_allowed(&s.id, "/work/other", "command", "npm test"));
+        assert!(!m.terminal_allowed("another", "/work/app", "command", "npm test"));
     });
     // On disk, so a restart finds it.
     let saved = Roster::load(&locked(&s.store).unwrap()).unwrap();
@@ -6118,7 +6122,7 @@ fn an_allowed_terminal_command_is_saved_with_the_mono_and_leaves_with_it(cx: &mu
         saved
             .get(&s.id)
             .unwrap()
-            .allows_terminal("command", "npm test")
+            .allows_terminal("/work/app", "command", "npm test")
     );
     // Deleting the Mono forgets it.
     s.manager.update(cx, |m, cx| m.remove_mono(&s.id, cx));
@@ -6127,7 +6131,7 @@ fn an_allowed_terminal_command_is_saved_with_the_mono_and_leaves_with_it(cx: &mu
         assert!(
             !s.manager
                 .read(cx)
-                .terminal_allowed(&s.id, "command", "npm test")
+                .terminal_allowed(&s.id, "/work/app", "command", "npm test")
         )
     });
     assert!(

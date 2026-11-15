@@ -91,7 +91,7 @@ impl Shell {
         let state = self.workspace.terminal_panes.get(&pane)?;
         let (cwd, label) = (state.cwd.clone(), state.label.clone());
         let (by_mono, run) = (state.mono.is_some(), state.run.clone());
-        let view = self.spawn_terminal(cwd, cx);
+        let view = self.spawn_terminal_as(cwd, by_mono, cx);
         if by_mono {
             Self::restore_mono_terminal(&view, label, run, cx);
         } else {

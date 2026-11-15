@@ -347,16 +347,24 @@ impl Monos {
         cx.notify();
     }
     /// Whether the user let this Mono run exactly `text` as `kind` ("command" or "text") in a
-    /// terminal without asking again.
-    pub(crate) fn terminal_allowed(&self, mono: &str, kind: &str, text: &str) -> bool {
+    /// terminal of `project` without asking again.
+    pub(crate) fn terminal_allowed(
+        &self,
+        mono: &str,
+        project: &str,
+        kind: &str,
+        text: &str,
+    ) -> bool {
         self.roster
             .get(mono)
-            .is_some_and(|m| m.allows_terminal(kind, text))
+            .is_some_and(|m| m.allows_terminal(project, kind, text))
     }
-    /// Remembers that exact string for this Mono, saved with the rest of its settings.
+    /// Remembers that exact string for this Mono and project, saved with the rest of its
+    /// settings.
     pub(crate) fn allow_terminal(
         &mut self,
         mono: &str,
+        project: &str,
         kind: &str,
         text: &str,
         cx: &mut Context<Self>,
@@ -366,10 +374,24 @@ impl Monos {
             .monos
             .iter_mut()
             .find(|m| m.id == mono)
-            .is_some_and(|m| m.allow_terminal(kind, text));
+            .is_some_and(|m| m.allow_terminal(project, kind, text));
         if changed {
             self.save(cx);
         }
+    }
+    /// Whether the chat `session` of `mono` is no longer working on a turn: it was stopped or
+    /// finished. A call that was waiting for the user inside that turn has no one to answer.
+    /// A chat that is not loaded is not known to be stopped.
+    pub(crate) fn session_stopped(&self, session: i64, mono: &str, cx: &App) -> bool {
+        self.chats
+            .get(mono)
+            .map(|chat| chat.read(cx))
+            .is_some_and(|chat| chat.summary.id == session && !chat.busy)
+    }
+    /// Makes `view` the loaded chat of `mono`, as opening it does.
+    #[cfg(test)]
+    pub(crate) fn adopt_chat(&mut self, mono: &str, view: Entity<Conversation>) {
+        self.chats.insert(mono.to_owned(), view);
     }
     /// A Mono's name for a dialog, and whether it still exists and still has `project`.
     pub(crate) fn terminal_caller(&self, mono: &str, project: &str) -> Option<String> {
@@ -1533,12 +1555,16 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
                 let owner = self.owner.clone();
                 let handle = window.window_handle();
                 let mono = mono.id.clone();
+                let via = crate::shell::MonoTerminalVia {
+                    session: call.session,
+                    received: call.received,
+                };
                 cx.spawn(async move |this, cx| {
                     let reply = handle
                         .update(cx, |_, window, cx| {
                             owner.update(cx, |owner, cx| {
-                                let reply =
-                                    owner.mono_terminals_call(&mono, &project, &action, &input, cx);
+                                let reply = owner
+                                    .mono_terminals_call(&mono, &project, &action, &input, via, cx);
                                 owner.show_mono_approval(window, cx);
                                 reply
                             })

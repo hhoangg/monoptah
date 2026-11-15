@@ -686,18 +686,25 @@ fn terminal_input_is_capped_and_the_bridge_waits_for_the_user_not_longer() {
 }
 
 #[test]
-fn a_monos_terminal_allow_list_is_exact_per_kind_capped_and_persisted() {
+fn a_monos_terminal_allow_list_is_exact_per_project_and_kind_capped_and_persisted() {
+    const P: &str = "/work/app";
     let mut mono = Mono::default();
-    assert!(!mono.allows_terminal("command", "npm test"));
-    assert!(mono.allow_terminal("command", "npm test"));
-    assert!(!mono.allow_terminal("command", "npm test"), "no duplicates");
-    assert!(mono.allows_terminal("command", "npm test"));
+    assert!(!mono.allows_terminal(P, "command", "npm test"));
+    assert!(mono.allow_terminal(P, "command", "npm test"));
+    assert!(
+        !mono.allow_terminal(P, "command", "npm test"),
+        "no duplicates"
+    );
+    assert!(mono.allows_terminal(P, "command", "npm test"));
     for near in ["npm test ", " npm test", "npm  test", "NPM test", "npm"] {
-        assert!(!mono.allows_terminal("command", near), "{near:?}");
+        assert!(!mono.allows_terminal(P, "command", near), "{near:?}");
     }
-    // A command is not text, and another Mono has its own list.
-    assert!(!mono.allows_terminal("text", "npm test"));
-    assert!(!Mono::default().allows_terminal("command", "npm test"));
+    // A command is not text, another project is not this one, another Mono has its own list.
+    assert!(!mono.allows_terminal(P, "text", "npm test"));
+    assert!(!mono.allows_terminal("/work/other", "command", "npm test"));
+    assert!(!Mono::default().allows_terminal(P, "command", "npm test"));
+    // The project is compared by its path key: a trailing slash is the same project.
+    assert!(mono.allows_terminal("/work/app/", "command", "npm test"));
     // Older rosters have no list; an empty one stays out of the file.
     let empty: Mono = serde_json::from_str(r#"{"id":"a"}"#).unwrap();
     assert!(empty.terminal_allow.is_empty());
@@ -705,11 +712,49 @@ fn a_monos_terminal_allow_list_is_exact_per_kind_capped_and_persisted() {
         .unwrap()
         .contains("terminalAllow"));
     let back: Mono = serde_json::from_str(&serde_json::to_string(&mono).unwrap()).unwrap();
-    assert!(back.allows_terminal("command", "npm test"));
+    assert!(back.allows_terminal(P, "command", "npm test"));
     for n in 0..(TERMINAL_ALLOW_MAX + 5) {
-        mono.allow_terminal("command", &format!("c{n}"));
+        mono.allow_terminal(P, "command", &format!("c{n}"));
     }
     assert_eq!(mono.terminal_allow.len(), TERMINAL_ALLOW_MAX);
-    assert!(!mono.allows_terminal("command", "npm test"), "oldest first");
-    assert!(mono.allows_terminal("command", &format!("c{}", TERMINAL_ALLOW_MAX + 4)));
+    assert!(
+        !mono.allows_terminal(P, "command", "npm test"),
+        "oldest first"
+    );
+    assert!(mono.allows_terminal(P, "command", &format!("c{}", TERMINAL_ALLOW_MAX + 4)));
+}
+
+#[test]
+fn an_allow_entry_saved_before_projects_were_part_of_the_key_matches_nothing_and_is_dropped() {
+    let mut old: Mono =
+        serde_json::from_str(r#"{"id":"a","terminalAllow":["command:npm test","text:y"]}"#)
+            .unwrap();
+    assert!(!old.allows_terminal("/work/app", "command", "npm test"));
+    assert!(!old.allows_terminal("", "command", "npm test"));
+    assert!(!old.allows_terminal("/work/app", "text", "y"));
+    assert!(old.allow_terminal("/work/app", "command", "ls"));
+    assert_eq!(old.terminal_allow.len(), 1, "old entries are dropped");
+}
+
+#[test]
+fn redact_masks_a_private_key_whose_end_is_missing_to_the_end_of_the_text() {
+    use super::memory::redact;
+    let body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC";
+    // A complete block is masked on its own and the text around it stays.
+    let whole = redact(&format!(
+        "before\n-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----\nafter"
+    ));
+    assert!(whole.starts_with("before\n") && whole.ends_with("\nafter"));
+    assert!(!whole.contains(body));
+    // A block cut off by a window or a cap is a secret to the end.
+    let cut = redact(&format!(
+        "before\n-----BEGIN OPENSSH PRIVATE KEY-----\n{body}\nmore secret lines"
+    ));
+    assert!(cut.starts_with("before\n") && cut.contains("redacted"));
+    assert!(!cut.contains(body) && !cut.contains("more secret"));
+    // Only the start of a block is in the text: nothing of it is left readable.
+    let start = redact("-----BEGIN RSA PRIVATE KEY-----");
+    assert!(!start.contains("BEGIN") && start.contains("redacted"));
+    // Ordinary text is untouched.
+    assert_eq!(redact("no secrets here"), "no secrets here");
 }

@@ -9,6 +9,9 @@ pub const MAX_BYTES: usize = 24 * 1024;
 static SECRETS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     [
         r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+        // A key whose end was cut off (a scrollback window, a capped read) is a secret to the
+        // end of the text: its body is the part that matters.
+        r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*",
         r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}",
         r"\bgh[pousr]_[A-Za-z0-9]{20,}",
         r"\bgithub_pat_[A-Za-z0-9_]{20,}",

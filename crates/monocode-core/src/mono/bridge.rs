@@ -73,9 +73,9 @@ sessions.delete removeWorktree: true also removes the session's own worktree (th
 sessions.delete providerFiles: true also removes the session's provider session files from disk (Claude Code and Codex only). It is irreversible; use it only for sessions the user clearly asked about. The call then waits and reports providerFiles "removed", "none" (nothing to remove, for example a harness with no cleanup) or "failed" with problems (a removal failed, or files were kept on purpose, such as a Codex thread another conversation continues from), in which case the session is deleted and some files may remain. Without it, the session's files stay and the result is {accepted:true}. Deleting a folder's last session removes the folder; an archived session keeps it.
 worktrees.list {project?}
 worktrees.create {branch,base?,existing?,project?}
-terminals.list {project?}: the project's terminals you may see: [{id,label,cwd,place:"dock"|"split"|"tab",running,exited,exitCode,owner:"mono"|"user"}]. Ids are opaque (t-1, t-2). Mono only.
-terminals.open {label,action?,command?,cwd?,place?:"dock"|"split",beside?,direction?:"right"|"down",reveal?,project?}: opens a terminal named label (up to 40 characters) in the project and returns {id,reused}. action is the id of a Project Action the user saved; it runs there without asking. command is a free shell command (up to 4096 bytes, no control characters; give action or command, not both): it is typed into the terminal and Enter is pressed, but only after the user approves it in a dialog that shows the exact command, the terminal's label and its directory. The user may Run it once, Allow it for you (that exact string, byte for byte, then runs without asking), or Deny it (the call fails with "The user declined this command"). The call waits for that answer for up to 90 seconds, then fails and nothing runs; it never runs late. Prefer action. Without action or command it opens a plain shell. place defaults to the user's terminal setting; split puts it as a pane beside the terminal id in beside (else beside your other terminals, else the active pane), direction right (default) or down, so BE and FE can sit side by side. An idle terminal of yours with the same label is reused (reused:true). cwd must stay inside the project or one of its worktrees. reveal shows the terminal without moving the keyboard focus.
-terminals.send {id,text?,key?,project?}: types into a terminal you opened (never one that runs an agent CLI); give text, key or both. key is one of ctrl-c, enter, up, down, q, tab, esc and needs no approval. text (up to 4096 bytes) is typed exactly as given and no Enter is added: follow it with key enter in the same call (the text is typed first, then the key) or in the next call to run it. text may contain \n and \t but no other control character (use key for those; the call fails with "use key for control keys"). Text with a line break is sent as one bracketed paste when the program has turned that on, else line by line. Like command, text needs the user's approval (Run, Allow this text for you, Deny), waits up to 90 seconds and never runs late.
+terminals.list {project?}: the project's terminals you may see: [{id,label,cwd,place:"dock"|"split"|"tab",running,exited,exitCode,owner:"mono"|"user"}]. Ids are opaque (like t-3fa9-1) and only valid until the app restarts. Mono only.
+terminals.open {label,action?,command?,cwd?,place?:"dock"|"split",beside?,direction?:"right"|"down",reveal?,project?}: opens a terminal named label (up to 40 characters) in the project and returns {id,reused}. action is the id of a Project Action the user saved; it runs there without asking. command is a free shell command (up to 4096 bytes, no control characters; give action or command, not both): it is typed into the terminal and Enter is pressed, but only after the user approves it in a dialog that shows the exact command, the terminal's label, the program in front and its directory. Approving RUNS it. The user may Run it once, Allow it for you (that exact string, byte for byte, then runs without asking), or Deny it (the call fails with "The user declined this command"). The call waits for that answer for up to 90 seconds, then fails and nothing runs; it never runs late. Prefer action. Without action or command it opens a plain shell. place defaults to the user's terminal setting; split puts it as a pane beside the terminal id in beside (else beside your other terminals, else the active pane), direction right (default) or down, so BE and FE can sit side by side. An idle terminal of yours with the same label, standing in the folder you asked for (the project's by default), is reused (reused:true). A multi-line command is refused (a new terminal has not asked for bracketed paste). cwd must stay inside the project or one of its worktrees. reveal shows the terminal without moving the keyboard focus.
+terminals.send {id,text?,key?,project?}: types into a terminal you opened (never one that runs an agent CLI); give text, key or both. key is one of ctrl-c, enter, up, down, q, tab, esc. ctrl-c, q and esc need no approval and work anywhere. up, down and tab are refused while the shell itself holds the terminal (they recall history and complete lines): use them for a program that is running. enter is free only in front of a program; at a shell prompt it is accepted only together with approved text in the same call (text plus key enter), which is how a command is run there. text (up to 4096 bytes) is typed exactly as given and no Enter is added: follow it with key enter in the same call (the text is typed first, then the key) or in the next call to run it. text may contain \n but no other control character, tab included (use key for those; the call fails with "use key for control keys"). Text with a line break is sent as one bracketed paste when the program has turned that on, else it is refused (a line break would run each line as it arrives). The dialog names the program in front; if that, the folder or the paste mode changed after the dialog was shown, nothing is written. Only one request of yours may wait for an answer at a time: a second one is refused until the first is answered. Like command, text needs the user's approval (Run, Allow this text for you, Deny): typing at a shell and pressing Enter runs it. It waits up to 90 seconds, is cancelled if the user stops your turn, and never runs late.
 terminals.read {id,lines?,project?}: {text,truncated,running,exited,exitCode}, the last lines (default 200, at most 1000) of the terminal's output, secrets masked. A terminal the user opened can be read only if they turned on Let Mono read for it.
 terminals.layout {preset:"columns"|"rows"|"grid",ids,reveal?,project?}: arranges 1 to 6 of your terminals (ids from terminals.list or terminals.open, no repeats, all yours) into ONE title tab named "Logs <project>" and returns {tab,ids}. columns puts them side by side, rows stacks them, grid uses two columns filled left to right; every part gets the same size. Terminals in the dock leave it and become panes; panes from other tabs move in; an existing Logs tab of yours is reused and its other panes become tabs of their own. It never moves the keyboard focus. Use it to show BE and FE side by side. After the app restarts your terminals come back stopped: terminals.list shows them and terminals.open with the same label reuses them (an action runs again; a free command asks the user again).
 terminals.stop {id,project?}: sends ctrl-c, then hangs up the foreground job after 3 seconds if it is still running; returns {stopping:true} at once. terminals.close {id,project?}: closes a terminal you opened.
@@ -114,6 +114,9 @@ struct Wire {
     input: Value,
 }
 pub struct Call {
+    /// When the bridge received the call. A reply is only useful until `received + wait_for`,
+    /// and an approval must not run anything once its own wait ([`APPROVAL_WAIT`]) is over.
+    pub received: std::time::Instant,
     pub session: i64,
     pub request_id: String,
     pub action: String,
@@ -227,6 +230,7 @@ fn serve(
     let request_id = wire.request_id;
     let wait = wait_for(&wire.action);
     tx.send_blocking(Call {
+        received: std::time::Instant::now(),
         session: wire.session,
         request_id: request_id.clone(),
         action: wire.action,
@@ -376,6 +380,13 @@ pub fn acp_server(
     Some(server)
 }
 
+/// How long a provider's MCP client waits for the app tool: longer than the slowest call the
+/// bridge waits for ([`wait_for`], an approval dialog), so the client never gives up on a call
+/// the user is still answering and the Mono retries it blindly.
+pub fn mcp_tool_timeout() -> Duration {
+    wait_for("terminals.send") + Duration::from_secs(20)
+}
+
 pub fn configure_codex(
     command: &mut std::process::Command,
     mono: Option<&crate::agent::MonoContext>,
@@ -392,6 +403,9 @@ pub fn configure_codex(
         // projects. Without this, Codex's auto-review spends a model call
         // (~3s) approving each one.
         ("default_tools_approval_mode", json!("approve")),
+        // Codex gives a tool 60 seconds unless told otherwise; an approval dialog can take
+        // longer than that.
+        ("tool_timeout_sec", json!(mcp_tool_timeout().as_secs())),
     ] {
         // JSON's strings and arrays are valid TOML literals for these values.
         command.args(["-c", &format!("mcp_servers.{MCP_SERVER}.{key}={value}")]);
@@ -539,6 +553,15 @@ mod capability_tests {
         assert!(args.contains(
             &r#"mcp_servers.monocode_app.default_tools_approval_mode="approve""#.to_string()
         ));
+        // The tool outlasts the longest wait for the user's answer.
+        let timeout = args
+            .iter()
+            .find_map(|a| a.strip_prefix("mcp_servers.monocode_app.tool_timeout_sec="))
+            .expect("a tool timeout is set")
+            .parse::<u64>()
+            .unwrap();
+        assert!(timeout > wait_for("terminals.open").as_secs());
+        assert!(timeout > APPROVAL_WAIT.as_secs());
         let acp = acp_server(Some(&mono), &environment).unwrap();
         assert_eq!(acp["name"], MCP_SERVER);
         assert_eq!(acp["env"].as_array().unwrap().len(), 3);

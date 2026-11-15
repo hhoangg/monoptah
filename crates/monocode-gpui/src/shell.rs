@@ -65,7 +65,7 @@ pub(crate) use project_removal::FilesOutcome;
 mod cloud_workspaces;
 mod mono_approval;
 mod mono_terminals;
-pub(crate) use mono_terminals::MonoTerminalReply;
+pub(crate) use mono_terminals::{MonoTerminalReply, Via as MonoTerminalVia};
 mod project_cloud;
 mod project_settings;
 mod provider_prompt;
@@ -3588,7 +3588,22 @@ impl Shell {
             .unwrap_or_else(|| self.working_copy().to_owned())
     }
     fn spawn_terminal(&mut self, cwd: String, cx: &mut Context<Self>) -> Entity<Terminal> {
-        let terminal = cx.new(|cx| Terminal::new(cwd, cx));
+        self.spawn_terminal_as(cwd, false, cx)
+    }
+    /// A shell a Mono drives (`private`) keeps no command history (see `Terminal::new_private`).
+    fn spawn_terminal_as(
+        &mut self,
+        cwd: String,
+        private: bool,
+        cx: &mut Context<Self>,
+    ) -> Entity<Terminal> {
+        let terminal = cx.new(|cx| {
+            if private {
+                Terminal::new_private(cwd, cx)
+            } else {
+                Terminal::new(cwd, cx)
+            }
+        });
         self.observations.push(cx.subscribe(
             &terminal,
             |this, terminal, event: &TerminalEvent, cx| {
@@ -3612,7 +3627,8 @@ impl Shell {
         let metas = dock.mono_terminals.clone();
         let have = self.terminals.get(project).map_or(0, Vec::len);
         for (ix, cwd) in wanted.into_iter().enumerate().skip(have) {
-            let terminal = self.spawn_terminal(cwd, cx);
+            let by_mono = matches!(metas.get(ix), Some(Some(_)));
+            let terminal = self.spawn_terminal_as(cwd, by_mono, cx);
             if let Some(Some(meta)) = metas.get(ix) {
                 Self::restore_mono_terminal(
                     &terminal,
@@ -6121,7 +6137,7 @@ impl Shell {
                         items.splice(
                             0..0,
                             [
-                                Self::mono_read_item(view.read(cx).mono_read),
+                                Self::mono_read_item(view, view.read(cx).mono_read),
                                 MenuItem::Separator,
                             ],
                         );
@@ -6519,9 +6535,11 @@ impl Shell {
     ) {
         if let MenuTarget::Tab(id) = target {
             match action {
-                "mono-read" => {
-                    let focus = self.workspace.tab_focus(id);
-                    return self.toggle_mono_read_pane(focus, cx);
+                other if Self::mono_read_target(other).is_some() => {
+                    if let Some(entity) = Self::mono_read_target(other) {
+                        self.toggle_mono_read(entity, cx);
+                    }
+                    return;
                 }
                 "archive" => return self.toggle_archive(id, cx),
                 "delete" => return self.confirm_delete_session(id, window, cx),

@@ -35,6 +35,7 @@ fn call(
         .update(cx, |shell, window, cx| {
             shell.handle_app_call(
                 Call {
+                    received: std::time::Instant::now(),
                     session: caller,
                     request_id: request.into(),
                     action: action.into(),
@@ -87,6 +88,7 @@ fn submitted_operator_access_survives_the_composer_reset(cx: &mut TestAppContext
             shell
                 .authorize_app_call(
                     &Call {
+                        received: std::time::Instant::now(),
                         session: caller,
                         request_id: "after-submit".into(),
                         action: "sessions.list".into(),
@@ -802,6 +804,7 @@ fn a_session_an_agent_starts_is_a_chat_whatever_the_preference(cx: &mut TestAppC
             let (reply, result) = std::sync::mpsc::channel();
             shell.handle_app_call(
                 Call {
+                    received: std::time::Instant::now(),
                     session: active,
                     request_id: "start".into(),
                     action: "sessions.start".into(),

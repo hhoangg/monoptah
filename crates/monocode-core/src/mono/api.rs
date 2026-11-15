@@ -9,6 +9,36 @@ pub const TERMINAL_INPUT_MAX: usize = 4096;
 /// The most terminals one `terminals.layout` arranges.
 pub const TERMINAL_LAYOUT_MAX: usize = 6;
 
+/// A character that draws nothing or changes how the text around it reads: a control, a
+/// format character (Unicode Cf: zero width, direction changing, soft hyphen, tags), a
+/// filler (Hangul, Braille blank) or a variation-selector-like invisible. Labels refuse
+/// these; accents (combining marks) are fine there.
+pub fn is_format_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{ad}' | '\u{34f}' | '\u{61c}' | '\u{115f}' | '\u{1160}' | '\u{17b4}' | '\u{17b5}'
+                | '\u{180b}'..='\u{180f}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{2800}' | '\u{3164}' | '\u{feff}' | '\u{ffa0}'
+                | '\u{fff9}'..='\u{fffb}'
+                | '\u{e0000}'..='\u{e007f}'
+        )
+}
+
+/// A character a person reading a dialog cannot see as itself: everything `is_format_char`
+/// names, plus non-ASCII spaces, variation selectors and any zero-width mark (combining marks).
+pub fn is_hidden_char(c: char) -> bool {
+    use unicode_width::UnicodeWidthChar;
+    is_format_char(c)
+        || (!c.is_ascii()
+            && (c.is_whitespace()
+                || matches!(c, '\u{a0}' | '\u{fe00}'..='\u{fe0f}' | '\u{e0100}'..='\u{e01ef}')
+                || c.width() == Some(0)))
+}
+
 /// Reject misspelled fields and ambiguous types before any app mutation.
 pub fn validate(action: &str, input: &Value) -> Result<(), String> {
     let cloud_fields;
@@ -308,6 +338,34 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn invisible_characters_are_told_from_visible_ones() {
+        for c in [
+            '\u{200b}',
+            '\u{202e}',
+            '\u{2066}',
+            '\u{feff}',
+            '\u{ad}',
+            '\u{3164}',
+            '\u{115f}',
+            '\u{ffa0}',
+            '\u{2800}',
+            '\u{e0041}',
+            '\u{7}',
+            '\u{85}',
+        ] {
+            assert!(is_format_char(c) && is_hidden_char(c), "{:x}", c as u32);
+        }
+        // Combining marks, variation selectors and odd spaces are hidden in a dialog, but a
+        // label may carry an accent.
+        for c in ['\u{301}', '\u{fe0f}', '\u{a0}', '\u{2003}', '\u{3000}'] {
+            assert!(is_hidden_char(c), "{:x}", c as u32);
+        }
+        assert!(!is_format_char('\u{301}') && !is_format_char('\u{3000}'));
+        for c in ['a', ' ', 'é', 'ệ', '日', '😀', '-', '\\', '·'] {
+            assert!(!is_hidden_char(c) && !is_format_char(c), "{c}");
+        }
+    }
     #[test]
     fn validates_before_mutation() {
         assert!(validate("sessions.start", &json!({"prompt":"x","draft":"false"})).is_err());

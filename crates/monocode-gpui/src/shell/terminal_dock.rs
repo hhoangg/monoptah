@@ -341,10 +341,7 @@ impl Shell {
         }
     }
     pub(super) fn terminal_tab_menu(&self, ix: usize, cx: &App) -> Vec<MenuItem> {
-        let readable = self
-            .live_terminals()
-            .get(ix)
-            .is_some_and(|t| t.read(cx).mono_read);
+        let terminal = self.live_terminals().get(ix).cloned();
         let count = self
             .workspace
             .docks
@@ -356,8 +353,12 @@ impl Shell {
                 .disabled(count < 2 || ix >= count)
                 .into(),
             MenuItem::Separator,
-            Self::mono_read_item(readable),
         ]
+        .into_iter()
+        // The item names this terminal, not the tab position: the tabs can move before it is
+        // chosen.
+        .chain(terminal.map(|t| Self::mono_read_item(&t, t.read(cx).mono_read)))
+        .collect()
     }
     pub(super) fn run_terminal_tab_menu(
         &mut self,
@@ -369,8 +370,11 @@ impl Shell {
         match action {
             "close" => self.close_terminal(ix, window, cx),
             "close-others" => self.close_other_terminals(ix, window, cx),
-            "mono-read" => self.toggle_mono_read_dock(ix, cx),
-            _ => {}
+            other => {
+                if let Some(entity) = Self::mono_read_target(other) {
+                    self.toggle_mono_read(entity, cx);
+                }
+            }
         }
     }
     /// confirmCloseTerminals: the terminals still running something ask first.

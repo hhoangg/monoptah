@@ -211,6 +211,9 @@ pub(crate) struct Terminal {
     /// Every byte `write` was asked to send, since a test PTY has no reader.
     #[cfg(test)]
     sent: std::cell::RefCell<Vec<u8>>,
+    /// What a test PTY cannot tell: see [`Fake`].
+    #[cfg(test)]
+    pub(crate) fake: Fake,
     _focus_watch: Vec<gpui::Subscription>,
     _events: Task<()>,
     /// The dock's foreground poll; a launched program has no shell to watch.
@@ -260,6 +263,31 @@ impl Plan {
             drain: false,
             verify: None,
         }
+    }
+    /// The login shell with no command history: a Mono must not recall (and so re-run, or read)
+    /// what the user typed in their own shells. Best effort: a startup file that sets
+    /// `HISTFILE` itself wins, which is why `terminals.send` also refuses the keys that
+    /// recall a line while the shell holds the terminal.
+    fn shell_private() -> Self {
+        Self::private(Self::shell())
+    }
+    fn private(mut plan: Self) -> Self {
+        for (key, value) in [
+            ("HISTFILE", "/dev/null"),
+            ("SAVEHIST", "0"),
+            ("HISTSIZE", "0"),
+            ("HISTFILESIZE", "0"),
+        ] {
+            plan.env.push((key.to_owned(), value.to_owned()));
+        }
+        let stem = Path::new(&plan.program)
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if stem == "fish" && !plan.args.iter().any(|a| a == "--private") {
+            plan.args.push("--private".to_owned());
+        }
+        plan
     }
     fn launch(
         program: OsString,
@@ -455,6 +483,47 @@ fn detached(size: GridSize) -> Spawned {
     }
 }
 
+/// The last `lines` lines of `text`, and whether older ones were left out.
+pub(crate) fn tail_lines(text: &str, lines: usize) -> (String, bool) {
+    let all: Vec<&str> = text.split('\n').collect();
+    let skip = all.len().saturating_sub(lines);
+    (all[skip..].join("\n"), skip > 0)
+}
+
+/// What holds a terminal's foreground right now (asked of the PTY, not the 1 s poll).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Front {
+    /// A shell at its command line (the terminal's own or one started inside it): typing
+    /// edits a line, and Enter runs it.
+    Shell(String),
+    /// Any other program: typing goes to it.
+    Program(String),
+    /// It could not be told (no PTY, not unix, `ps` failed). Never trusted as a program.
+    Unknown,
+}
+
+impl Front {
+    /// The name the approval dialog shows.
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            Self::Shell(name) | Self::Program(name) => name,
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// What a test PTY cannot answer. Unset, a test terminal is at its shell prompt, or runs
+/// `foreground` when that is set, in a process group 100.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct Fake {
+    pub front: Option<Front>,
+    pub cwd: Option<String>,
+    pub pgrp: Option<i32>,
+    /// The process groups `hang_up_group` signalled.
+    pub hung_up: Vec<i32>,
+}
+
 /// The keys a Mono may press in a terminal (`terminals.send`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MonoKey {
@@ -512,12 +581,20 @@ const GRID: GridSize = GridSize {
 
 impl Terminal {
     pub(crate) fn new(cwd: String, cx: &mut Context<Self>) -> Self {
+        Self::with_plan(cwd, Plan::shell(), cx)
+    }
+    /// A shell a Mono drives: it keeps no command history (see `Plan::shell_private`).
+    pub(crate) fn new_private(cwd: String, cx: &mut Context<Self>) -> Self {
+        Self::with_plan(cwd, Plan::shell_private(), cx)
+    }
+    fn with_plan(cwd: String, plan: Plan, cx: &mut Context<Self>) -> Self {
         let spawned = if cfg!(test) {
             // GPUI's deterministic test scheduler rejects wakeups from the
             // PTY thread; UI tests run the dock without a shell behind it.
+            let _ = plan;
             detached(GRID)
         } else {
-            spawn(&cwd, GRID, cx.entity_id().as_u64(), Plan::shell())
+            spawn(&cwd, GRID, cx.entity_id().as_u64(), plan)
         };
         Self::build(cwd, spawned, false, cx)
     }
@@ -677,6 +754,8 @@ impl Terminal {
             marked: None,
             #[cfg(test)]
             sent: Default::default(),
+            #[cfg(test)]
+            fake: Fake::default(),
             _focus_watch: Vec::new(),
             _events: events,
             _poll: poll,
@@ -785,11 +864,90 @@ impl Terminal {
     }
     /// The last `lines` lines of the grid as plain text (history included), and whether older
     /// lines were left out.
+    #[cfg(test)]
     pub(crate) fn recent_text(&self, lines: usize) -> (String, bool) {
-        let text = grid_text(&self.term.lock());
-        let all: Vec<&str> = text.split('\n').collect();
-        let skip = all.len().saturating_sub(lines);
-        (all[skip..].join("\n"), skip > 0)
+        tail_lines(&self.scrollback_text(), lines)
+    }
+    /// The whole grid as plain text, scrollback included, for the caller to mask and cut.
+    pub(crate) fn scrollback_text(&self) -> String {
+        grid_text(&self.term.lock())
+    }
+    /// Whether the program in front turned bracketed paste on (a shell at its prompt does).
+    pub(crate) fn bracketed_paste(&self) -> bool {
+        self.term.lock().mode().contains(TermMode::BRACKETED_PASTE)
+    }
+    /// What holds the terminal now, asked of the PTY.
+    #[cfg(not(test))]
+    pub(crate) fn live_front(&self) -> Front {
+        live_front_of(self.master_fd, self.shell_pid)
+    }
+    #[cfg(test)]
+    pub(crate) fn live_front(&self) -> Front {
+        if let Some(front) = &self.fake.front {
+            return front.clone();
+        }
+        match &self.foreground {
+            Some(label) if !is_shell_name(label) => Front::Program(label.clone()),
+            _ => Front::Shell("zsh".into()),
+        }
+    }
+    /// The supported agent CLI holding the terminal now (not as of the last poll).
+    pub(crate) fn live_agent(&self) -> Option<&'static str> {
+        match self.live_front() {
+            Front::Program(label) => agent_cli(&label),
+            _ => None,
+        }
+    }
+    /// The directory of the process that gets typed input, when the system tells it cheaply.
+    /// `None` is "not known", never "the project".
+    #[cfg(all(not(test), unix))]
+    pub(crate) fn live_cwd(&self) -> Option<String> {
+        if self.master_fd < 0 {
+            return None;
+        }
+        let pgrp = unsafe { libc::tcgetpgrp(self.master_fd) };
+        (pgrp > 0).then(|| process_cwd(pgrp)).flatten()
+    }
+    #[cfg(all(not(test), not(unix)))]
+    pub(crate) fn live_cwd(&self) -> Option<String> {
+        None
+    }
+    #[cfg(test)]
+    pub(crate) fn live_cwd(&self) -> Option<String> {
+        self.fake.cwd.clone()
+    }
+    /// The process group of a job holding the terminal (not the shell itself).
+    #[cfg(all(not(test), unix))]
+    pub(crate) fn foreground_pgrp(&self) -> Option<i32> {
+        if self.master_fd < 0 || self.exited {
+            return None;
+        }
+        let pgrp = unsafe { libc::tcgetpgrp(self.master_fd) };
+        (pgrp > 1 && pgrp != self.shell_pid as i32).then_some(pgrp)
+    }
+    #[cfg(all(not(test), not(unix)))]
+    pub(crate) fn foreground_pgrp(&self) -> Option<i32> {
+        None
+    }
+    #[cfg(test)]
+    pub(crate) fn foreground_pgrp(&self) -> Option<i32> {
+        self.fake
+            .pgrp
+            .or_else(|| self.foreground.as_ref().map(|_| 100))
+    }
+    /// Hangs up process group `pgrp`, but only while it is still the one in front: a job that
+    /// ended and was replaced since is not this call's to signal.
+    pub(crate) fn hang_up_group(&mut self, pgrp: i32, cx: &mut Context<Self>) {
+        if self.exited || self.foreground_pgrp() != Some(pgrp) {
+            return;
+        }
+        #[cfg(test)]
+        self.fake.hung_up.push(pgrp);
+        #[cfg(all(not(test), unix))]
+        unsafe {
+            libc::kill(-pgrp, libc::SIGHUP);
+        }
+        self.set_foreground(None, cx);
     }
     /// Presses one key as a Mono asked. It is not typing by the user, so `user_typed` stays.
     pub(crate) fn send_key(&mut self, key: MonoKey, cx: &mut Context<Self>) {
@@ -2379,15 +2537,80 @@ fn foreground_label(master_fd: i32, shell_pid: u32) -> Option<String> {
     if pgrp <= 0 || pgrp == shell_pid as i32 {
         return None;
     }
+    let label = process_label(pgrp)?;
+    (!is_shell_name(&label)).then_some(label)
+}
+/// The command line of process `pid`, as `command_label` names it.
+#[cfg(unix)]
+fn process_label(pid: i32) -> Option<String> {
     let output = std::process::Command::new("ps")
-        .args(["-p", &pgrp.to_string(), "-o", "args="])
+        .args(["-p", &pid.to_string(), "-o", "args="])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    let label = command_label(String::from_utf8_lossy(&output.stdout).trim())?;
-    (!is_shell_name(&label)).then_some(label)
+    command_label(String::from_utf8_lossy(&output.stdout).trim())
+}
+/// What holds the terminal right now: the shell at its prompt, another program, or unknown.
+#[cfg(unix)]
+fn live_front_of(master_fd: i32, shell_pid: u32) -> Front {
+    if master_fd < 0 {
+        return Front::Unknown;
+    }
+    let pgrp = unsafe { libc::tcgetpgrp(master_fd) };
+    if pgrp <= 0 {
+        return Front::Unknown;
+    }
+    let label = process_label(pgrp);
+    if pgrp == shell_pid as i32 {
+        return Front::Shell(label.unwrap_or_else(|| "shell".into()));
+    }
+    match label {
+        Some(label) if is_shell_name(&label) => Front::Shell(label),
+        Some(label) => Front::Program(label),
+        None => Front::Unknown,
+    }
+}
+#[cfg(not(unix))]
+#[cfg_attr(test, allow(dead_code))]
+fn live_front_of(_: i32, _: u32) -> Front {
+    Front::Unknown
+}
+/// The working directory of process `pid`.
+#[cfg(target_os = "macos")]
+fn process_cwd(pid: i32) -> Option<String> {
+    unsafe {
+        let mut info: libc::proc_vnodepathinfo = std::mem::zeroed();
+        let size = std::mem::size_of_val(&info) as i32;
+        if libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            &mut info as *mut _ as *mut _,
+            size,
+        ) != size
+        {
+            return None;
+        }
+        let path = &info.pvi_cdir.vip_path;
+        let bytes =
+            std::slice::from_raw_parts(path.as_ptr() as *const u8, std::mem::size_of_val(path));
+        let end = bytes.iter().position(|b| *b == 0)?;
+        String::from_utf8(bytes[..end].to_vec())
+            .ok()
+            .filter(|p| !p.is_empty())
+    }
+}
+#[cfg(target_os = "linux")]
+fn process_cwd(pid: i32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/cwd"))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn process_cwd(_: i32) -> Option<String> {
+    None
 }
 #[cfg(not(unix))]
 fn foreground_label(_: i32, _: u32) -> Option<String> {
@@ -3298,5 +3521,106 @@ mod tests {
                 b"  ls  a\rb\rc\r\x1b[200~x\nyz\x1b[201~".to_vec()
             );
         });
+    }
+
+    fn plain(program: &str, args: &[&str]) -> Plan {
+        Plan {
+            program: program.into(),
+            args: args.iter().map(|a| (*a).to_owned()).collect(),
+            env: Vec::new(),
+            secret_env: Vec::new(),
+            drain: false,
+            label: program.into(),
+            verify: None,
+        }
+    }
+
+    #[test]
+    fn a_mono_shell_is_started_without_command_history() {
+        let zsh = Plan::private(plain("/bin/zsh", &["-l"]));
+        for (key, value) in [
+            ("HISTFILE", "/dev/null"),
+            ("SAVEHIST", "0"),
+            ("HISTSIZE", "0"),
+            ("HISTFILESIZE", "0"),
+        ] {
+            assert!(
+                zsh.env.contains(&(key.to_owned(), value.to_owned())),
+                "{key}"
+            );
+        }
+        assert_eq!(zsh.args, ["-l"]);
+        // fish keeps no history in a private session.
+        let fish = Plan::private(plain("/usr/bin/fish", &["-l"]));
+        assert_eq!(fish.args, ["-l", "--private"]);
+        let again = Plan::private(fish);
+        assert_eq!(again.args, ["-l", "--private"], "never added twice");
+        // The user's own shells are untouched.
+        assert!(Plan::shell().env.iter().all(|(k, _)| k != "HISTFILE"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_shell_has_no_history_file_and_the_pty_tells_who_holds_it() {
+        let dir = std::env::temp_dir().to_string_lossy().into_owned();
+        let size = GridSize {
+            columns: 80,
+            lines: 10,
+        };
+        // `sh` reads no startup file that could set the variables again.
+        let spawned = spawn(&dir, size, 2, Plan::private(plain("/bin/sh", &[])));
+        let sender = spawned.sender.clone().expect("the shell started");
+        let screen = || {
+            let term = spawned.term.lock();
+            let grid = term.grid();
+            (0..grid.screen_lines())
+                .map(|line| {
+                    (0..grid.columns())
+                        .map(|c| grid[Line(line as i32)][Column(c)].c)
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let wait_for = |what: &dyn Fn() -> bool| {
+            for _ in 0..250 {
+                if what() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        };
+        let _ = sender.send(Msg::Input(Cow::Borrowed(b"echo hist=$HISTFILE=\r")));
+        assert!(
+            wait_for(&|| screen().contains("hist=/dev/null=")),
+            "{}",
+            screen()
+        );
+        // At the prompt the shell holds the terminal and its folder is the one it started in.
+        assert!(matches!(
+            live_front_of(spawned.master_fd, spawned.shell_pid),
+            Front::Shell(_)
+        ));
+        let real = |p: &str| std::fs::canonicalize(p).unwrap();
+        let pgrp = unsafe { libc::tcgetpgrp(spawned.master_fd) };
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        assert_eq!(real(&process_cwd(pgrp).unwrap()), real(&dir));
+        // A job in front is a program, and the shell is back when it ends.
+        let _ = sender.send(Msg::Input(Cow::Borrowed(b"sleep 30\r")));
+        assert!(
+            wait_for(&|| matches!(
+                live_front_of(spawned.master_fd, spawned.shell_pid),
+                Front::Program(ref name) if name == "sleep"
+            )),
+            "{:?}",
+            live_front_of(spawned.master_fd, spawned.shell_pid)
+        );
+        let _ = sender.send(Msg::Input(Cow::Borrowed(b"\x03")));
+        assert!(wait_for(&|| matches!(
+            live_front_of(spawned.master_fd, spawned.shell_pid),
+            Front::Shell(_)
+        )));
+        let _ = sender.send(Msg::Input(Cow::Borrowed(b"exit\r")));
     }
 }
