@@ -720,8 +720,8 @@ fn redact_masks_a_private_key_whose_end_is_missing_to_the_end_of_the_text() {
 }
 
 #[test]
-fn redact_masks_named_secrets_vendor_tokens_and_url_passwords() {
-    use super::memory::redact;
+fn redact_output_masks_named_secrets_vendor_tokens_and_url_passwords() {
+    use super::memory::redact_output as redact;
     let masked = |text: &str, secret: &str| {
         let out = redact(text);
         assert!(!out.contains(secret), "{secret} survived in {out}");
@@ -755,4 +755,39 @@ fn redact_masks_named_secrets_vendor_tokens_and_url_passwords() {
         redact("see https://example.com:8080/path and user@host"),
         "see https://example.com:8080/path and user@host"
     );
+    // A value one vendor pattern also knows is masked once, whole.
+    let twice = redact(&format!("NPM_TOKEN={npm}"));
+    assert_eq!(twice.matches("redacted").count(), 1, "{twice}");
+    assert!(
+        twice.ends_with("chars»") && !twice.contains("chars» "),
+        "{twice}"
+    );
+    // A key's header is not eaten by a name in front of it.
+    let key =
+        redact("API_KEY=-----BEGIN PRIVATE KEY-----\nMIIEvQIBADAN\n-----END PRIVATE KEY-----");
+    assert!(!key.contains("MIIEvQ"), "{key}");
+}
+
+#[test]
+fn prose_that_only_mentions_a_secret_word_is_not_masked() {
+    use super::memory::{redact, redact_output};
+    for text in [
+        "max_tokens: 8192",
+        "Design tokens: colors and spacing",
+        "secretary: Bob",
+        "passwords: rotate monthly",
+        "tokenizer = bpe",
+    ] {
+        assert_eq!(redact(text), text);
+        assert_eq!(redact_output(text), text, "terminal output keeps {text}");
+    }
+    // A name that ends in the word is masked in output, with or without a quote.
+    for text in ["db_password=x1", "\"api_key\": \"abc\"", "NPM_TOKEN: t0k"] {
+        assert!(redact_output(text).contains("redacted"), "{text}");
+    }
+    // Memory keeps its old, narrow rule: the word on its own, and vendor tokens.
+    assert!(redact("password: hunter2").contains("redacted"));
+    assert_eq!(redact("DB_PASSWORD=hunter2"), "DB_PASSWORD=hunter2");
+    assert!(redact("sk-abcdefghijklmnopqrstuv").contains("redacted"));
+    assert_eq!(redact("postgres://a:pw@h/db"), "postgres://a:pw@h/db");
 }

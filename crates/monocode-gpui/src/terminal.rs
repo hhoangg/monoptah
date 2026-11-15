@@ -670,25 +670,39 @@ impl Terminal {
                 }
             }
         });
-        // TerminalView's 1s foreground poll; a hidden dock has no title to paint.
+        // TerminalView's 1s foreground poll. A hidden dock has no title to paint, so it is
+        // asked for its agent CLI only (a Mono's terminal in a hidden dock still must be
+        // recognised), and both probes run off the main thread.
         let poll = (!launched).then(|| {
             cx.spawn(async move |this, cx| {
                 loop {
                     cx.background_executor().timer(Duration::from_secs(1)).await;
-                    let Ok(Some((fd, pid))) = this.update(cx, |this, _| {
-                        (this.visible && !this.exited).then_some((this.master_fd, this.shell_pid))
+                    let Ok(Some((fd, pid, visible))) = this.update(cx, |this, _| {
+                        (!this.exited).then_some((this.master_fd, this.shell_pid, this.visible))
                     }) else {
                         if this.update(cx, |_, _| ()).is_err() {
                             break;
                         }
                         continue;
                     };
-                    let label = cx
+                    let (label, agent) = cx
                         .background_executor()
-                        .spawn(async move { foreground_label(fd, pid) })
+                        .spawn(async move {
+                            (
+                                visible.then(|| foreground_label(fd, pid)),
+                                foreground_agent(fd, pid),
+                            )
+                        })
                         .await;
                     if this
-                        .update(cx, |this, cx| this.set_foreground(label, cx))
+                        .update(cx, |this, cx| {
+                            if agent {
+                                this.agent_seen.set(true);
+                            }
+                            if let Some(label) = label {
+                                this.set_foreground(label, cx);
+                            }
+                        })
                         .is_err()
                     {
                         break;
@@ -865,13 +879,17 @@ impl Terminal {
     pub(crate) fn bracketed_paste(&self) -> bool {
         self.term.lock().mode().contains(TermMode::BRACKETED_PASTE)
     }
-    /// What holds the terminal now, asked of the PTY.
+    /// What holds the terminal, from `group` (the probe the caller just made of it).
     #[cfg(not(test))]
-    pub(crate) fn live_front(&self) -> Front {
-        front_of(self.live_group().as_deref(), self.shell_pid)
+    pub(crate) fn front_in(&self, group: Option<&[Member]>) -> Front {
+        front_of(group, self.shell_pid)
     }
     #[cfg(test)]
-    pub(crate) fn live_front(&self) -> Front {
+    pub(crate) fn front_in(&self, _: Option<&[Member]>) -> Front {
+        self.live_front()
+    }
+    #[cfg(test)]
+    fn live_front(&self) -> Front {
         if let Some(front) = &self.fake.front {
             return front.clone();
         }
@@ -2510,6 +2528,23 @@ fn process_label(pid: i32) -> Option<String> {
     }
     command_label(String::from_utf8_lossy(&output.stdout).trim())
 }
+/// Whether an agent CLI is in the foreground group of the terminal right now, when it is not
+/// the shell's own group. Run by the poll, off the main thread.
+#[cfg(unix)]
+fn foreground_agent(master_fd: i32, shell_pid: u32) -> bool {
+    if master_fd < 0 {
+        return false;
+    }
+    let pgrp = unsafe { libc::tcgetpgrp(master_fd) };
+    if pgrp <= 1 || pgrp == shell_pid as i32 {
+        return false;
+    }
+    group_members(pgrp).is_some_and(|group| group_agent(&group).is_some())
+}
+#[cfg(not(unix))]
+fn foreground_agent(_: i32, _: u32) -> bool {
+    false
+}
 /// What holds the terminal right now: the shell at its prompt, another program, or unknown.
 #[cfg(all(unix, test))]
 fn live_front_of(master_fd: i32, shell_pid: u32) -> Front {
@@ -2560,32 +2595,73 @@ fn front_of(group: Option<&[Member]>, shell_pid: u32) -> Front {
     }
 }
 
-/// The processes of group `pgrp` (the leader may be long gone: `true | (cd / && exec zsh)`).
-/// `None` when the group cannot be listed or `ps` cannot run.
+/// The processes of group `pgrp` (the leader may be long gone: `true | (cd / && exec zsh)`),
+/// from one `ps` call for the whole group. `None` when the group cannot be listed or `ps`
+/// cannot run.
 #[cfg(unix)]
 fn group_members(pgrp: i32) -> Option<Vec<Member>> {
-    let mut members = Vec::new();
-    for pid in group_pids(pgrp)? {
-        let args = match process_args(pid) {
-            Err(()) => return None,
-            // Ended since the listing.
-            Ok(None) => continue,
-            Ok(Some(args)) if is_zombie(&args) => continue,
-            Ok(Some(args)) => args,
-        };
-        members.push(Member {
-            pid,
-            args,
-            cwd: process_cwd(pid),
-        });
-    }
+    let pids = group_pids(pgrp)?;
+    let list = pids
+        .iter()
+        .map(i32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let output = std::process::Command::new("ps")
+        .args(["-o", "pid=,stat=,args=", "-p", &list])
+        .output()
+        .ok()?;
+    let members: Vec<Member> =
+        parse_process_table(&String::from_utf8_lossy(&output.stdout), &pids)?
+            .into_iter()
+            .filter(|row| !row.zombie)
+            .map(|row| Member {
+                pid: row.pid,
+                args: row.args,
+                cwd: process_cwd(row.pid),
+            })
+            .collect();
     (!members.is_empty()).then_some(members)
 }
 
-/// An ended process its parent has not reaped yet: no folder, no command, no input.
-#[cfg(unix)]
-fn is_zombie(args: &str) -> bool {
-    args.contains("<defunct>") || (args.starts_with('(') && args.ends_with(')'))
+/// One line of `ps -o pid=,stat=,args=`.
+#[cfg(any(unix, test))]
+#[derive(Debug, PartialEq, Eq)]
+struct ProcessRow {
+    pid: i32,
+    /// The kernel says it ended and its parent has not reaped it (state `Z`). Never judged
+    /// from the command line, which a process sets for itself.
+    zombie: bool,
+    args: String,
+}
+
+#[cfg(any(unix, test))]
+fn parse_process_row(line: &str) -> Option<ProcessRow> {
+    let (pid, rest) = line.trim_start().split_once(char::is_whitespace)?;
+    let rest = rest.trim_start();
+    let (stat, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    Some(ProcessRow {
+        pid: pid.parse().ok()?,
+        zombie: stat.starts_with('Z'),
+        args: args.trim().to_owned(),
+    })
+}
+
+/// The rows of `ps` for the processes in `wanted`. A pid missing from the output has ended
+/// since the listing. A pid on two lines (a command line with a line break can forge one) is
+/// not trusted: `None`.
+#[cfg(any(unix, test))]
+fn parse_process_table(output: &str, wanted: &[i32]) -> Option<Vec<ProcessRow>> {
+    let mut rows: Vec<ProcessRow> = Vec::new();
+    for row in output.lines().filter_map(parse_process_row) {
+        if !wanted.contains(&row.pid) {
+            continue;
+        }
+        if rows.iter().any(|seen| seen.pid == row.pid) {
+            return None;
+        }
+        rows.push(row);
+    }
+    Some(rows)
 }
 
 #[cfg(target_os = "macos")]
@@ -2623,12 +2699,17 @@ fn group_pids(pgrp: i32) -> Option<Vec<i32>> {
         else {
             continue;
         };
-        if std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        // Bytes, not text: the command name is whatever the process called itself.
+        match std::fs::read(format!("/proc/{pid}/stat"))
             .ok()
             .and_then(|stat| stat_pgrp(&stat))
-            == Some(pgrp)
         {
-            pids.push(pid);
+            Some(group) if group == pgrp => pids.push(pid),
+            Some(_) => {}
+            // Not readable or not understood: skipped only when the process is gone, else
+            // the group cannot be told and the lookup fails (closed).
+            None if !std::path::Path::new(&format!("/proc/{pid}")).exists() => {}
+            None => return None,
         }
     }
     (!pids.is_empty()).then_some(pids)
@@ -2642,21 +2723,11 @@ fn group_pids(_: i32) -> Option<Vec<i32>> {
 /// The process group in `/proc/<pid>/stat`: the third field after the command, which is in
 /// parentheses and may itself contain spaces and parentheses.
 #[cfg(any(target_os = "linux", test))]
-fn stat_pgrp(stat: &str) -> Option<i32> {
-    let after = &stat[stat.rfind(')')? + 1..];
+fn stat_pgrp(stat: &[u8]) -> Option<i32> {
+    let after = std::str::from_utf8(&stat[stat.iter().rposition(|b| *b == b')')? + 1..]).ok()?;
     after.split_whitespace().nth(2)?.parse().ok()
 }
 
-/// The command line of process `pid`: `Ok(None)` when it is gone, `Err` when `ps` cannot run.
-#[cfg(unix)]
-fn process_args(pid: i32) -> Result<Option<String>, ()> {
-    let output = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "args="])
-        .output()
-        .map_err(|_| ())?;
-    let args = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    Ok((output.status.success() && !args.is_empty()).then_some(args))
-}
 /// The working directory of process `pid`.
 #[cfg(target_os = "macos")]
 fn process_cwd(pid: i32) -> Option<String> {
@@ -2684,9 +2755,13 @@ fn process_cwd(pid: i32) -> Option<String> {
 }
 #[cfg(target_os = "linux")]
 fn process_cwd(pid: i32) -> Option<String> {
-    std::fs::read_link(format!("/proc/{pid}/cwd"))
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned())
+    utf8_path(std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?)
+}
+/// `path` as text, or `None` when it is not UTF-8: a lossy copy could name another folder
+/// (U+FFFD in place of the bad bytes), so an unreadable name is an unknown folder.
+#[cfg(any(target_os = "linux", test))]
+fn utf8_path(path: std::path::PathBuf) -> Option<String> {
+    path.into_os_string().into_string().ok()
 }
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 fn process_cwd(_: i32) -> Option<String> {
@@ -3914,10 +3989,39 @@ mod tests {
 
     #[test]
     fn a_linux_stat_line_gives_its_process_group_whatever_the_command_is_called() {
-        assert_eq!(stat_pgrp("123 (zsh) S 1 456 456 0 -1 4194560"), Some(456));
-        assert_eq!(stat_pgrp("124 (a b) c) R 123 789 789 0"), Some(789));
-        assert_eq!(stat_pgrp("garbage"), None);
-        assert_eq!(stat_pgrp("1 (x) S 1"), None);
+        assert_eq!(stat_pgrp(b"123 (zsh) S 1 456 456 0 -1 4194560"), Some(456));
+        assert_eq!(stat_pgrp(b"124 (a b) c) R 123 789 789 0"), Some(789));
+        assert_eq!(stat_pgrp(b"garbage"), None);
+        assert_eq!(stat_pgrp(b"1 (x) S 1"), None);
+        // A command name that is not UTF-8 (or has `)` in it) does not hide the process.
+        assert_eq!(stat_pgrp(b"125 (\xff\xfe) S 1 321 321 0"), Some(321));
+        assert_eq!(stat_pgrp(b"126 (\xff) \xfe) Z 1 654 654 0"), Some(654));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_is_not_text_is_unknown_not_a_lookalike() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/work/\xff".to_vec()));
+        assert_eq!(utf8_path(bad), None);
+        assert_eq!(utf8_path("/work/app".into()), Some("/work/app".into()));
+    }
+
+    #[test]
+    fn the_kernel_state_decides_a_zombie_not_the_command_line() {
+        let table = "  10 Ss   zsh -i\n  11 Z+   zsh\n  12 S+   zsh <defunct>\n  13 S+   (zsh)\n  99 S other\n";
+        let rows = parse_process_table(table, &[10, 11, 12, 13, 14]).unwrap();
+        let zombies: Vec<(i32, bool)> = rows.iter().map(|r| (r.pid, r.zombie)).collect();
+        // 12 and 13 only look ended (`exec -a 'zsh <defunct>' zsh`); 14 ended since the
+        // listing; 99 was not asked for.
+        assert_eq!(zombies, [(10, false), (11, true), (12, false), (13, false)]);
+        assert_eq!(rows[2].args, "zsh <defunct>");
+    }
+
+    #[test]
+    fn a_pid_on_two_lines_is_not_trusted() {
+        let forged = "  10 S   evil\n12 Z+ x\n  12 S zsh\n";
+        assert_eq!(parse_process_table(forged, &[10, 12]), None);
     }
 
     #[test]

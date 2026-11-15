@@ -597,7 +597,9 @@ mod tests {
         std::fs::remove_dir_all(&gone).unwrap();
         // Planted entries, as a program that can write inside the repository could register.
         for (name, target) in [
-            ("root", "/.git".to_owned()),
+            // `/.git` would not do: git strips the `.git`, leaves `` and falls back to the
+            // admin folder. `//.git` is the spelling that makes git list `/` itself.
+            ("root", "//.git".to_owned()),
             (
                 "parent",
                 temp.path().join(".git").to_string_lossy().into_owned(),
@@ -628,6 +630,14 @@ mod tests {
             ),
         )
         .unwrap();
+        // The planted `/` really reaches the filter, so only `refused_worktree_root` keeps it out.
+        assert!(
+            worktrees(&project)
+                .unwrap()
+                .iter()
+                .any(|tree| tree.path == "/" && !tree.missing),
+            "git must list / for the planted entry"
+        );
         let mut got = scoped_worktrees(&project);
         got.sort();
         let mut want = vec![canon(&project), canon(&linked)];

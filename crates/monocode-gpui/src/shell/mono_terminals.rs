@@ -190,19 +190,46 @@ fn project_worktrees(project: &str) -> Vec<String> {
         .collect()
 }
 
-/// Whether a terminal's folder is the project or inside it or one of its worktrees, symlinks
-/// resolved. A folder reached through `..` is not. A folder that is gone is compared by its
-/// name, since it cannot be resolved.
-fn folder_allowed(project: &str, cwd: &str) -> bool {
-    if Path::new(cwd)
-        .components()
-        .any(|c| c == Component::ParentDir)
-    {
-        return false;
+/// The folders a Mono's terminals may stand in: the project and its scoped git worktrees.
+/// The worktrees are asked of git once, on first use, and kept for the call that built it
+/// (a call checks many processes and must not spawn `git` for each).
+struct ProjectScope<'a> {
+    project: &'a str,
+    worktrees: std::cell::OnceCell<Vec<String>>,
+}
+
+impl<'a> ProjectScope<'a> {
+    fn new(project: &'a str) -> Self {
+        Self {
+            project,
+            worktrees: std::cell::OnceCell::new(),
+        }
     }
-    let real = real_path(cwd);
-    let within = |root: &str| inside(&real_path(root), &real);
-    within(project) || project_worktrees(project).iter().any(|tree| within(tree))
+
+    /// Whether a folder is the project or inside it or one of its worktrees, symlinks
+    /// resolved. A folder reached through `..` is not. A folder that is gone is compared by
+    /// its name, since it cannot be resolved.
+    fn allows(&self, cwd: &str) -> bool {
+        if Path::new(cwd)
+            .components()
+            .any(|c| c == Component::ParentDir)
+        {
+            return false;
+        }
+        let real = real_path(cwd);
+        let within = |root: &str| inside(&real_path(root), &real);
+        within(self.project)
+            || self
+                .worktrees
+                .get_or_init(|| project_worktrees(self.project))
+                .iter()
+                .any(|tree| within(tree))
+    }
+}
+
+#[cfg(test)]
+fn folder_allowed(project: &str, cwd: &str) -> bool {
+    ProjectScope::new(project).allows(cwd)
 }
 
 /// Whether the system can tell what runs in a terminal and where. Where it cannot (Windows),
@@ -217,17 +244,13 @@ const AGENT_READ: &str =
 
 const OUTSIDE: &str = "The terminal's folder is outside the project and its worktrees, so Mono does not type into it. Stop or close it, or open a new terminal with terminals.open";
 
-/// Whether a terminal with this front is idle enough for `terminals.open` to reuse it.
-/// When the system cannot tell who holds it (`Unknown`), the last poll decides on unix (else
-/// every call would open a duplicate). Off unix the poll never sees anything, so "no program"
-/// proves nothing and a running program would be taken for an idle shell: it is not reused,
-/// and a new terminal opens under the same label (terminals are found by id, never by label).
-fn idle_for_reuse(front: &Front, poll_idle: bool, unix: bool) -> bool {
-    match front {
-        Front::Shell(_) => true,
-        Front::Unknown => unix && poll_idle,
-        Front::Program(_) => false,
-    }
+/// Whether a terminal with this front is idle enough for `terminals.open` to reuse it: only
+/// a shell at its prompt. A front the system could not tell (`Unknown`: the lookup failed, or
+/// nothing can be inspected off unix) is never reused, so a running program is not taken for
+/// an idle shell; a new terminal opens under the same label (terminals are found by id,
+/// never by label).
+fn idle_for_reuse(front: &Front) -> bool {
+    matches!(front, Front::Shell(_))
 }
 
 /// Multi-line input is one bracketed paste when the program asked for that, else each line
@@ -347,7 +370,7 @@ fn parse_lines(input: &Value) -> Result<usize, String> {
 fn read_answer(t: &Terminal, lines: usize) -> Value {
     // Masked over the whole scrollback first, then cut: a secret that starts above the
     // window (a private key's first line) must not survive as an unmarked tail.
-    let all = monocode_core::mono::memory::redact(&t.scrollback_text());
+    let all = monocode_core::mono::memory::redact_output(&t.scrollback_text());
     let (text, older) = tail_lines(&all, lines);
     let (text, capped) = cap_tail(text, READ_BYTES_MAX);
     json!({
@@ -367,10 +390,13 @@ fn hidden(t: &Terminal, group: Option<&[Member]>) -> bool {
     !t.is_plain_shell() || t.note_agent(group)
 }
 
-/// Whether `origin` may be listed or read: where the system cannot inspect processes an
-/// agent CLI in a terminal the user opened cannot be told, so only a Mono's own are shown.
-fn readable_origin(origin: Origin, can_inspect: bool) -> bool {
-    origin == Origin::Mono || can_inspect
+/// Whether a terminal of `origin` opened by `owner` may be listed or read by `viewer`: where
+/// the system cannot inspect processes an agent CLI in a terminal the user opened cannot be
+/// told, and another Mono's terminal cannot be vouched for either, so only the calling Mono's
+/// own are shown. A coding session has no terminals of its own: it gets none there.
+fn readable_origin(origin: Origin, owner: Option<&str>, viewer: Viewer, can_inspect: bool) -> bool {
+    can_inspect
+        || (origin == Origin::Mono && matches!(viewer, Viewer::Mono(me) if owner == Some(me)))
 }
 
 /// Whether a terminal lies inside `roots`, for a coding session's read: every process of the
@@ -678,7 +704,8 @@ impl Shell {
             .filter(|e| {
                 monocode_core::files::path_key(&e.project)
                     == monocode_core::files::path_key(project)
-                    && (!reading || readable_origin(e.origin, CAN_INSPECT))
+                    && (!reading
+                        || readable_origin(e.origin, e.mono.as_deref(), viewer, CAN_INSPECT))
             })
             .ok_or_else(unknown)?;
         let terminal = entry.terminal.upgrade().ok_or_else(unknown)?;
@@ -803,7 +830,8 @@ impl Shell {
                 .find(|e| e.terminal.entity_id() == terminal.entity_id())
                 .map(|e| (e.origin, e.mono.clone()));
             let origin = known.as_ref().map_or(Origin::User, |(origin, _)| *origin);
-            if !readable_origin(origin, CAN_INSPECT) {
+            let owner = known.as_ref().and_then(|(_, owner)| owner.as_deref());
+            if !readable_origin(origin, owner, viewer, CAN_INSPECT) {
                 continue;
             }
             let mine = matches!(
@@ -914,6 +942,7 @@ impl Shell {
         // in the folder asked for (the project's own when none was). Where it stands is asked
         // of the system when it can tell, else it is where it started.
         let wanted = real_path(&cwd);
+        let scope = ProjectScope::new(project);
         let reusable = self.mono_registry.entries.iter().find_map(|entry| {
             // The cheap tests first: the system is asked about a terminal only when it is this
             // Mono's, in this project, with this label.
@@ -930,7 +959,7 @@ impl Shell {
                 return None;
             }
             let group = t.live_group();
-            let at_prompt = idle_for_reuse(&t.live_front(), t.foreground.is_none(), cfg!(unix));
+            let at_prompt = idle_for_reuse(&t.front_in(group.as_deref()));
             // Where every process of the group stands, asked of the system when it can tell
             // (else where the terminal started); a lookup that fails is no reuse.
             let folders: Option<Vec<String>> = if CAN_INSPECT {
@@ -944,9 +973,9 @@ impl Shell {
             let same = at_prompt
                 && !t.note_agent(group.as_deref())
                 && folders.is_some_and(|folders| {
-                    folders.iter().all(|folder| {
-                        real_path(folder) == wanted && folder_allowed(project, folder)
-                    })
+                    folders
+                        .iter()
+                        .all(|folder| real_path(folder) == wanted && scope.allows(folder))
                 });
             same.then(|| (entry.id.clone(), terminal.clone(), t.bracketed_paste()))
         });
@@ -1401,8 +1430,9 @@ impl Shell {
         // write time: wherever every process of it is now, not where the terminal was opened.
         let group = t.live_group();
         let agent = t.note_agent(group.as_deref());
+        let scope = ProjectScope::new(project);
         write_gate(group.as_deref(), agent, &t.cwd, CAN_INSPECT, |folder| {
-            folder_allowed(project, folder)
+            scope.allows(folder)
         })?;
         if let Some(text) = &text
             && let Some(refusal) = multiline_refusal(text, t.bracketed_paste())
@@ -2340,7 +2370,8 @@ mod tests {
         // A repository whose `.git` registers `/` as a worktree: `/` is still outside.
         let admin = repo.join(".git/worktrees/root");
         std::fs::create_dir_all(&admin).unwrap();
-        std::fs::write(admin.join("gitdir"), "/.git\n").unwrap();
+        // `//.git` is the spelling that makes git list `/` (`/.git` does not).
+        std::fs::write(admin.join("gitdir"), "//.git\n").unwrap();
         std::fs::write(admin.join("HEAD"), "ref: refs/heads/main\n").unwrap();
         std::fs::write(admin.join("commondir"), "../..\n").unwrap();
         let repo_text = repo.to_string_lossy().into_owned();
@@ -2348,6 +2379,11 @@ mod tests {
         for outside in ["/", "/etc", &root.to_string_lossy()] {
             assert!(!folder_allowed(&repo_text, outside), "{outside}");
         }
+        let listed = monocode_core::git::worktrees(&repo).unwrap();
+        assert!(
+            listed.iter().any(|tree| tree.path == "/" && !tree.missing),
+            "git must list / for the planted entry"
+        );
         assert!(project_worktrees(&repo_text).iter().all(|t| t != "/"));
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2461,26 +2497,37 @@ mod tests {
     }
 
     #[test]
-    fn where_nothing_can_be_inspected_only_a_monos_own_terminals_are_readable() {
-        assert!(readable_origin(Origin::Mono, false));
-        assert!(!readable_origin(Origin::User, false));
-        assert!(readable_origin(Origin::User, true));
-        assert!(readable_origin(Origin::Mono, true));
+    fn where_nothing_can_be_inspected_only_the_calling_monos_own_terminals_are_readable() {
+        let (me, other) = (Viewer::Mono("m1"), Viewer::Mono("m2"));
+        // Off unix: the caller's own only; the user's, another Mono's and a session's: none.
+        assert!(readable_origin(Origin::Mono, Some("m1"), me, false));
+        assert!(!readable_origin(Origin::Mono, Some("m1"), other, false));
+        assert!(!readable_origin(Origin::Mono, None, me, false));
+        assert!(!readable_origin(Origin::User, None, me, false));
+        let roots = ["/work".to_owned()];
+        assert!(!readable_origin(
+            Origin::Mono,
+            Some("m1"),
+            Viewer::Session(&roots),
+            false
+        ));
+        // Where processes can be inspected the group check decides, not the origin.
+        assert!(readable_origin(Origin::User, None, me, true));
+        assert!(readable_origin(Origin::Mono, Some("m1"), other, true));
+        assert!(readable_origin(
+            Origin::Mono,
+            Some("m1"),
+            Viewer::Session(&roots),
+            true
+        ));
     }
 
     #[test]
-    fn an_unknown_front_is_reused_by_the_poll_only_where_the_poll_can_see() {
-        let (shell, program) = (Front::Shell("zsh".into()), Front::Program("vite".into()));
-        for unix in [true, false] {
-            assert!(idle_for_reuse(&shell, false, unix));
-            assert!(!idle_for_reuse(&program, true, unix));
-        }
-        // Unix: no program at the last poll means the same idle terminal.
-        assert!(idle_for_reuse(&Front::Unknown, true, true));
-        assert!(!idle_for_reuse(&Front::Unknown, false, true));
-        // Elsewhere the poll always says "nothing", which proves nothing: never reused.
-        assert!(!idle_for_reuse(&Front::Unknown, true, false));
-        assert!(!idle_for_reuse(&Front::Unknown, false, false));
+    fn only_a_shell_at_its_prompt_is_reused() {
+        assert!(idle_for_reuse(&Front::Shell("zsh".into())));
+        assert!(!idle_for_reuse(&Front::Program("vite".into())));
+        // A lookup that failed is no reuse, whatever the last poll said.
+        assert!(!idle_for_reuse(&Front::Unknown));
     }
 
     #[gpui::test]
