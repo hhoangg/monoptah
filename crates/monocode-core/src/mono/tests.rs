@@ -593,3 +593,201 @@ fn rules_live_in_instructions_and_the_context_only_repeats_them_when_not_in_syst
     assert!(full.contains("Workflows are graphs of steps"));
     assert!(full.contains("completionDelivery"));
 }
+
+#[test]
+fn terminal_actions_are_documented_validated_and_captioned() {
+    use serde_json::json;
+    for action in [
+        "terminals.list",
+        "terminals.open",
+        "terminals.send",
+        "terminals.read",
+        "terminals.stop",
+        "terminals.close",
+        "terminals.layout",
+    ] {
+        assert!(
+            bridge::HELP.contains(&format!("{action} {{")),
+            "help lacks {action}"
+        );
+        assert!(
+            crate::tool::app_activity(action, false).1 != "the app",
+            "{action} has no caption"
+        );
+    }
+    assert!(bridge::HELP.contains("use key for control keys"));
+    assert!(!bridge::HELP.contains("Allow it for you"));
+    assert!(!bridge::HELP.contains("The user declined this command"));
+    assert!(bridge::HELP.contains("place:\"dock\"|\"tab\"|\"split\""));
+    assert!(bridge::HELP.contains("may only call terminals.list and terminals.read"));
+    for (action, input) in [
+        ("terminals.list", json!({"project": "/p"})),
+        (
+            "terminals.open",
+            json!({"label": "BE", "action": "a1", "place": "split", "beside": "t-1", "direction": "down", "reveal": true, "cwd": "src", "project": "/p"}),
+        ),
+        ("terminals.open", json!({"label": "BE", "place": "tab"})),
+        ("terminals.open", json!({"label": "BE", "place": "dock"})),
+        ("terminals.send", json!({"id": "t-1", "key": "ctrl-c"})),
+        ("terminals.read", json!({"id": "t-1", "lines": 50})),
+        ("terminals.stop", json!({"id": "t-1"})),
+        ("terminals.close", json!({"id": "t-1"})),
+        (
+            "terminals.layout",
+            json!({"preset": "columns", "ids": ["t-1", "t-2"], "reveal": false, "project": "/p"}),
+        ),
+    ] {
+        assert_eq!(api::validate(action, &input), Ok(()), "{action}");
+    }
+    assert!(api::validate("terminals.read", &json!({"id": "t-1", "lines": "many"})).is_err());
+    assert!(api::validate("terminals.open", &json!({"label": "BE", "reveal": "yes"})).is_err());
+    assert!(api::validate("terminals.send", &json!({"id": "t-1", "bogus": 1})).is_err());
+    assert_eq!(
+        crate::tool::app_activity("terminals.layout", false),
+        ("Arranged", "terminals")
+    );
+    let layout = |input| api::validate("terminals.layout", &input);
+    assert!(layout(json!({"preset": "grid"})).is_err());
+    assert!(layout(json!({"preset": "stack", "ids": ["t-1"]})).is_err());
+    assert!(layout(json!({"preset": "rows", "ids": []})).is_err());
+    assert!(layout(json!({"preset": "rows", "ids": [1]})).is_err());
+    assert!(layout(json!({"preset": "rows", "ids": ["t-1", "t-1"]})).is_err());
+    let seven: Vec<_> = (1..=7).map(|n| format!("t-{n}")).collect();
+    assert!(layout(json!({"preset": "grid", "ids": seven})).is_err());
+    assert!(layout(json!({"preset": "grid", "ids": ["t-1"], "bogus": 1})).is_err());
+    // Not an Operator action: only a Mono drives terminals.
+    assert!(crate::app_access::validate_operator("terminals.list", &json!({})).is_err());
+    let rules = instructions(&Mono::default(), std::path::Path::new("/bin/app"));
+    assert!(rules.contains("terminals.open") && rules.contains("agent CLI"));
+    // Free input has no approval; the scope rule and where it can be placed are said.
+    assert!(rules.contains("with no approval"));
+    assert!(rules.contains("inside the project or one of its git worktrees"));
+    assert!(rules.contains("place \"dock\""));
+    assert!(!rules.contains("Allow this command"));
+}
+
+#[test]
+fn terminal_input_is_capped() {
+    use serde_json::json;
+    let big = "x".repeat(api::TERMINAL_INPUT_MAX + 1);
+    let fits = "x".repeat(api::TERMINAL_INPUT_MAX);
+    for (action, field, base) in [
+        ("terminals.send", "text", json!({"id": "t-1"})),
+        ("terminals.open", "command", json!({"label": "BE"})),
+    ] {
+        let mut ok = base.clone();
+        ok[field] = json!(fits);
+        assert_eq!(api::validate(action, &ok), Ok(()), "{field}");
+        let mut bad = base;
+        bad[field] = json!(big);
+        assert!(api::validate(action, &bad).unwrap_err().contains("4096"));
+    }
+}
+
+#[test]
+fn a_roster_saved_with_a_terminal_allow_list_still_loads_and_drops_it() {
+    let old: Mono = serde_json::from_str(
+        r#"{"id":"a","name":"N","terminalAllow":["v2\u001f/work/app\u001fcommand\u001fnpm test"]}"#,
+    )
+    .unwrap();
+    assert_eq!((old.id.as_str(), old.name.as_str()), ("a", "N"));
+    assert!(!serde_json::to_string(&old)
+        .unwrap()
+        .contains("terminalAllow"));
+}
+
+#[test]
+fn redact_masks_a_private_key_whose_end_is_missing_to_the_end_of_the_text() {
+    use super::memory::redact;
+    let body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC";
+    // A complete block is masked on its own and the text around it stays.
+    let whole = redact(&format!(
+        "before\n-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----\nafter"
+    ));
+    assert!(whole.starts_with("before\n") && whole.ends_with("\nafter"));
+    assert!(!whole.contains(body));
+    // A block cut off by a window or a cap is a secret to the end.
+    let cut = redact(&format!(
+        "before\n-----BEGIN OPENSSH PRIVATE KEY-----\n{body}\nmore secret lines"
+    ));
+    assert!(cut.starts_with("before\n") && cut.contains("redacted"));
+    assert!(!cut.contains(body) && !cut.contains("more secret"));
+    // Only the start of a block is in the text: nothing of it is left readable.
+    let start = redact("-----BEGIN RSA PRIVATE KEY-----");
+    assert!(!start.contains("BEGIN") && start.contains("redacted"));
+    // Ordinary text is untouched.
+    assert_eq!(redact("no secrets here"), "no secrets here");
+}
+
+#[test]
+fn redact_output_masks_named_secrets_vendor_tokens_and_url_passwords() {
+    use super::memory::redact_output as redact;
+    let masked = |text: &str, secret: &str| {
+        let out = redact(text);
+        assert!(!out.contains(secret), "{secret} survived in {out}");
+        assert!(out.contains("redacted"), "{out}");
+        out
+    };
+    masked("DB_PASSWORD=hunter2", "hunter2");
+    masked("export NPM_TOKEN=abc123xyz", "abc123xyz");
+    masked("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI", "wJalrXUtnFEMI");
+    masked("{\"password\": \"s3cret-value\"}", "s3cret-value");
+    masked("api_key: topsecretvalue", "topsecretvalue");
+    masked("client_secret = abcdef", "abcdef");
+    // Vendor tokens, built so no realistic token sits in this source.
+    let stripe = concat!("sk_", "live_", "4eC39HqLyjWDarjtT1zdp7dc");
+    masked(&format!("key {stripe} here"), stripe);
+    masked(
+        &format!("sk_{}_{}", "test", "51HabcDEFghiJKLmno"),
+        "51HabcDEF",
+    );
+    let google = format!("{}{}", "AIza", "SyA".to_owned() + &"b".repeat(32));
+    masked(&format!("g {google}"), &google);
+    let npm = format!("{}{}", "npm_", "a".repeat(36));
+    masked(&format!("//registry:_authToken={npm}"), &npm);
+    masked(&format!("x {npm} y"), &npm);
+    let github = format!("{}{}", "ghp_", "A".repeat(36));
+    masked(&format!("token {github}"), &github);
+    // Only the password of an address is masked; the address stays readable.
+    let url = masked("postgres://admin:pa55w0rd@db.internal:5432/app", "pa55w0rd");
+    assert!(url.starts_with("postgres://admin:") && url.ends_with("@db.internal:5432/app"));
+    assert_eq!(
+        redact("see https://example.com:8080/path and user@host"),
+        "see https://example.com:8080/path and user@host"
+    );
+    // A value one vendor pattern also knows is masked once, whole.
+    let twice = redact(&format!("NPM_TOKEN={npm}"));
+    assert_eq!(twice.matches("redacted").count(), 1, "{twice}");
+    assert!(
+        twice.ends_with("chars»") && !twice.contains("chars» "),
+        "{twice}"
+    );
+    // A key's header is not eaten by a name in front of it.
+    let key =
+        redact("API_KEY=-----BEGIN PRIVATE KEY-----\nMIIEvQIBADAN\n-----END PRIVATE KEY-----");
+    assert!(!key.contains("MIIEvQ"), "{key}");
+}
+
+#[test]
+fn prose_that_only_mentions_a_secret_word_is_not_masked() {
+    use super::memory::{redact, redact_output};
+    for text in [
+        "max_tokens: 8192",
+        "Design tokens: colors and spacing",
+        "secretary: Bob",
+        "passwords: rotate monthly",
+        "tokenizer = bpe",
+    ] {
+        assert_eq!(redact(text), text);
+        assert_eq!(redact_output(text), text, "terminal output keeps {text}");
+    }
+    // A name that ends in the word is masked in output, with or without a quote.
+    for text in ["db_password=x1", "\"api_key\": \"abc\"", "NPM_TOKEN: t0k"] {
+        assert!(redact_output(text).contains("redacted"), "{text}");
+    }
+    // Memory keeps its old, narrow rule: the word on its own, and vendor tokens.
+    assert!(redact("password: hunter2").contains("redacted"));
+    assert_eq!(redact("DB_PASSWORD=hunter2"), "DB_PASSWORD=hunter2");
+    assert!(redact("sk-abcdefghijklmnopqrstuv").contains("redacted"));
+    assert_eq!(redact("postgres://a:pw@h/db"), "postgres://a:pw@h/db");
+}

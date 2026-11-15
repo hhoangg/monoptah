@@ -80,7 +80,7 @@ impl Shell {
     }
 
     /// A terminal pane's shell, reopened in its directory after a restart.
-    fn terminal_pane_view(
+    pub(super) fn terminal_pane_view(
         &mut self,
         pane: i64,
         cx: &mut Context<Self>,
@@ -99,7 +99,7 @@ impl Shell {
         Some(
             self.terminal_pane_views
                 .get(&pane)
-                .map(|t| t.read(cx).title.clone())
+                .map(|t| t.read(cx).display_title().to_owned())
                 .filter(|t| !t.is_empty())
                 .unwrap_or_else(|| project_name(&state.cwd)),
         )
@@ -113,7 +113,7 @@ impl Shell {
                 .terminals
                 .get(&self.workspace.project)?
                 .get(ix)
-                .map(|t| t.read(cx).title.clone()),
+                .map(|t| t.read(cx).display_title().to_owned()),
             DragSource::Pane(id) => self.terminal_pane_title(id, cx),
             _ => None,
         }
@@ -130,6 +130,48 @@ impl Shell {
                 let focus = *self.workspace.project_focus.get(&self.workspace.project)?;
                 known(self.workspace.session_for_pane(focus))
             })
+    }
+
+    /// Takes dock tab `ix` of `project` out of the dock and makes its live shell a terminal
+    /// pane owned by session `owner`, in no tab yet (the caller places it). A Mono's
+    /// label and mark move with it. Moves no keyboard focus
+    /// and, for a project that is not in view, leaves the dock's slide alone.
+    pub(super) fn move_dock_terminal_to_pane(
+        &mut self,
+        project: &str,
+        ix: usize,
+        terminal: Entity<Terminal>,
+        owner: i64,
+        cx: &mut Context<Self>,
+    ) -> i64 {
+        let in_view = monocode_core::files::path_key(project)
+            == monocode_core::files::path_key(&self.workspace.project);
+        if let Some(live) = self.terminals.get_mut(project) {
+            live.remove(ix);
+        }
+        self.dock_shifts.remove(&terminal.entity_id());
+        if let Some(dock) = self.workspace.docks.get_mut(project)
+            && !dock.close(ix)
+        {
+            dock.open = false;
+            if in_view {
+                self.slide_dock(false, cx);
+                // The panel's Terminal tab is never left empty: a fresh shell
+                // takes the place of the one pulled out, and the panel stays.
+                if self.terminal_in_panel(cx) {
+                    self.ensure_panel_terminal(cx);
+                }
+            }
+        }
+        let cwd = terminal.read(cx).cwd.clone();
+        let pane = self.workspace.next_pane_id();
+        let mut state = TerminalPane::new(owner, cwd);
+        if let Some(mono) = self.mono_registry.mono_of(&terminal) {
+            state.mono = Some(mono);
+        }
+        self.workspace.terminal_panes.insert(pane, state);
+        self.terminal_pane_views.insert(pane, terminal);
+        pane
     }
 
     /// A dock tab dropped on a pane edge or on the title strip leaves the
@@ -166,27 +208,7 @@ impl Shell {
             return;
         }
         let before = self.active_leaves();
-        if let Some(live) = self.terminals.get_mut(&project) {
-            live.remove(ix);
-        }
-        self.dock_shifts.remove(&terminal.entity_id());
-        if let Some(dock) = self.workspace.docks.get_mut(&project)
-            && !dock.close(ix)
-        {
-            dock.open = false;
-            self.slide_dock(false, cx);
-            // The panel's Terminal tab is never left empty: a fresh shell
-            // takes the place of the one pulled out, and the panel stays.
-            if self.terminal_in_panel(cx) {
-                self.ensure_panel_terminal(cx);
-            }
-        }
-        let cwd = terminal.read(cx).cwd.clone();
-        let pane = self.workspace.next_pane_id();
-        self.workspace
-            .terminal_panes
-            .insert(pane, TerminalPane { owner, cwd });
-        self.terminal_pane_views.insert(pane, terminal);
+        let pane = self.move_dock_terminal_to_pane(&project, ix, terminal, owner, cx);
         if let Some(to) = insert {
             self.workspace.open(pane);
             self.reorder_title_tab(&TitleTab::Session(pane), to, cx);
@@ -211,7 +233,7 @@ impl Shell {
         let pane = self.workspace.next_pane_id();
         self.workspace
             .terminal_panes
-            .insert(pane, TerminalPane { owner, cwd });
+            .insert(pane, TerminalPane::new(owner, cwd));
         self.terminal_pane_views.insert(pane, terminal);
         self.workspace.open(pane);
         self.pane_motion = None;
@@ -238,7 +260,7 @@ impl Shell {
         let pane = self.workspace.next_pane_id();
         self.workspace
             .terminal_panes
-            .insert(pane, TerminalPane { owner, cwd });
+            .insert(pane, TerminalPane::new(owner, cwd));
         self.terminal_pane_views.insert(pane, terminal);
         let before = self.active_leaves();
         self.workspace.split(pane, SplitDir::Right);
@@ -270,15 +292,32 @@ impl Shell {
         self.leave_app_views(cx);
         self.leave_app_search(cx);
         self.close_preview(cx);
+        self.review_focused = false;
+        self.select_terminal_pane(pane, tab, cx);
+        self.focus_terminal_pane(window, cx);
+        self.persist(cx);
+        cx.notify();
+    }
+
+    /// Makes `pane`, in title tab `tab`, the selected pane of its project and brings its tab
+    /// into the strip. Moves no keyboard focus.
+    fn select_terminal_pane(&mut self, pane: i64, tab: i64, cx: &mut Context<Self>) {
         self.workspace.open(pane);
         self.workspace
             .project_focus
             .insert(self.workspace.project.clone(), pane);
         self.history.record(pane);
-        self.review_focused = false;
         self.remember_title_tab(TitleTab::Session(tab));
         self.reveal_active_tab(cx);
-        self.focus_terminal_pane(window, cx);
+    }
+
+    /// Shows a terminal pane the way a Mono's `reveal` asks: its tab is selected, but the
+    /// keyboard stays where it was and a Mono's view stays open (unlike `open_terminal_pane`).
+    pub(super) fn reveal_terminal_pane(&mut self, pane: i64, cx: &mut Context<Self>) {
+        let Some(tab) = self.workspace.tab_of(pane) else {
+            return;
+        };
+        self.select_terminal_pane(pane, tab, cx);
         self.persist(cx);
         cx.notify();
     }
@@ -783,10 +822,7 @@ mod tests {
         state
             .layouts
             .insert(1, leaf(1).split_pane(1, SplitDir::Right, -1));
-        let pane = |owner| TerminalPane {
-            owner,
-            cwd: "/w".into(),
-        };
+        let pane = |owner| TerminalPane::new(owner, "/w".into());
         state.terminal_panes.insert(-1, pane(1));
         // Its own tab, but its owner is gone.
         state.terminal_panes.insert(-2, pane(9));

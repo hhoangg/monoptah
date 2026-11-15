@@ -6006,6 +6006,91 @@ fn a_habit_run_can_export_but_not_import(cx: &mut TestAppContext) {
     }
 }
 
+const TERMINALS_REFUSED: &str = "A habit run, heartbeat or workflow question cannot use terminals";
+
+#[gpui::test]
+fn terminals_belong_to_the_monos_own_chat_and_not_to_habit_runs_or_heartbeats(
+    cx: &mut TestAppContext,
+) {
+    let s = setup(cx);
+    let opened = ask_habit(
+        &s,
+        "t-open",
+        "terminals.open",
+        json!({"label": "BE", "place": "dock", "reveal": false}),
+        cx,
+    )
+    .unwrap();
+    let id = opened["id"].as_str().unwrap().to_owned();
+    let listed = ask_habit(&s, "t-list", "terminals.list", json!({}), cx).unwrap();
+    assert_eq!(listed[0]["id"], id.as_str());
+    assert_eq!(listed[0]["label"], "BE");
+    ask_habit(
+        &s,
+        "t-send",
+        "terminals.send",
+        json!({"id": id, "key": "ctrl-c"}),
+        cx,
+    )
+    .unwrap();
+    assert!(ask_habit(&s, "t-read", "terminals.read", json!({"id": id}), cx).is_ok());
+    // Typed text is written at once: there is no dialog to wait for.
+    assert_eq!(
+        ask_habit(
+            &s,
+            "t-text",
+            "terminals.send",
+            json!({"id": id, "text": "ls"}),
+            cx
+        )
+        .unwrap()["sent"],
+        "text"
+    );
+    // A control character is refused outright.
+    assert!(
+        ask_habit(
+            &s,
+            "t-ctl",
+            "terminals.send",
+            json!({"id": id, "text": "ls\u{1b}[2J"}),
+            cx
+        )
+        .is_err()
+    );
+    let run = fake_run(&s, cx);
+    let heartbeat = fake_run(&s, cx);
+    cx.update(|cx| {
+        s.manager.update(cx, |m, _| {
+            m.running.get_mut(&heartbeat).unwrap().habit = mono::heartbeat::RUN_ID.into();
+        })
+    });
+    for session in [run, heartbeat] {
+        for (action, input) in [
+            ("terminals.list", json!({})),
+            ("terminals.open", json!({"label": "X"})),
+            ("terminals.send", json!({"id": id, "key": "enter"})),
+            ("terminals.read", json!({"id": id})),
+            ("terminals.stop", json!({"id": id})),
+            ("terminals.close", json!({"id": id})),
+        ] {
+            let refused = call_from(
+                &s,
+                session,
+                &format!("{session}-{action}"),
+                action,
+                input,
+                cx,
+            )
+            .try_recv()
+            .unwrap();
+            assert_eq!(refused, Err(TERMINALS_REFUSED.into()), "{action}");
+        }
+    }
+    // Nothing the refused calls asked for happened.
+    let after = ask_habit(&s, "t-list2", "terminals.list", json!({}), cx).unwrap();
+    assert_eq!(after.as_array().unwrap().len(), 1);
+}
+
 #[gpui::test]
 fn imports_respect_the_habit_limit(cx: &mut TestAppContext) {
     let s = setup(cx);

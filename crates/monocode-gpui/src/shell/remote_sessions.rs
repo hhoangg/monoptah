@@ -91,6 +91,7 @@ impl Shell {
                             // Open tabs retain an explanatory placeholder. A stale
                             // tab must not be rebound to a new host conversation.
                             if this.workspace.tab_of(id).is_none() {
+                                this.rehome_mono_panes(id, cx);
                                 this.session_summaries.remove(&id);
                                 this.sessions.remove(&id);
                             }

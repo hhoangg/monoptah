@@ -63,6 +63,7 @@ mod project_rail;
 mod project_removal;
 pub(crate) use project_removal::FilesOutcome;
 mod cloud_workspaces;
+mod mono_terminals;
 mod project_cloud;
 mod project_settings;
 mod provider_prompt;
@@ -596,6 +597,8 @@ struct TabPane {
     key: (i64, bool),
     title: String,
     mark: PaneMark,
+    /// A Mono opened this terminal pane: its line wears the Mono mark.
+    by_mono: bool,
 }
 enum PaneMark {
     /// The provider, with the session id when its mark is lit.
@@ -995,6 +998,11 @@ pub(crate) struct Shell {
     terminals: HashMap<String, Vec<Entity<Terminal>>>,
     /// Live shells of `workspace.terminal_panes`, spawned when first shown.
     terminal_pane_views: HashMap<i64, Entity<Terminal>>,
+    /// Ids of the terminals a Mono may drive (`terminals.*`), over the dock and the panes.
+    mono_registry: mono_terminals::Registry,
+    /// A `terminals.*` call selected another title tab: the keyboard must leave what that tab
+    /// hides (see `settle_mono_focus`).
+    mono_switched: bool,
     /// A project's dock sliding open (toward 1) or shut (toward 0).
     dock_slide: Option<(String, PaneSlide)>,
     dock_resize: Option<(f32, f32)>,
@@ -1469,6 +1477,8 @@ impl Shell {
             sidebar_fitted_room: None,
             terminals: HashMap::new(),
             terminal_pane_views: HashMap::new(),
+            mono_registry: Default::default(),
+            mono_switched: false,
             dock_slide: None,
             dock_resize: None,
             dock_hover: None,
@@ -2908,6 +2918,18 @@ impl Shell {
                     .text_color(content(1.))
                     .child(title),
             )
+            .children(
+                self.workspace
+                    .terminal_panes
+                    .get(&id)
+                    .is_some_and(|pane| pane.mono.is_some())
+                    .then(|| {
+                        mono_terminals::mono_mark(
+                            ("split-mono-mark", id as usize),
+                            format!("split-mono-mark-{id}"),
+                        )
+                    }),
+            )
             .child(
                 div()
                     .id(("close-chat-pane", id as usize))
@@ -3566,6 +3588,13 @@ impl Shell {
     }
     fn spawn_terminal(&mut self, cwd: String, cx: &mut Context<Self>) -> Entity<Terminal> {
         let terminal = cx.new(|cx| Terminal::new(cwd, cx));
+        self.observations
+            .push(cx.subscribe(&terminal, |_, _, _: &TerminalEvent, cx| cx.notify()));
+        terminal
+    }
+    /// A terminal a Mono opened: it starts in `cwd` or not at all, never in the home folder.
+    fn spawn_mono_terminal(&mut self, cwd: String, cx: &mut Context<Self>) -> Entity<Terminal> {
+        let terminal = cx.new(|cx| Terminal::new_strict(cwd, cx));
         self.observations
             .push(cx.subscribe(&terminal, |_, _, _: &TerminalEvent, cx| cx.notify()));
         terminal
@@ -7979,6 +8008,11 @@ impl Shell {
                     key: (id, false),
                     title,
                     mark,
+                    by_mono: self
+                        .workspace
+                        .terminal_panes
+                        .get(&id)
+                        .is_some_and(|pane| pane.mono.is_some()),
                 });
             }
             if sessions.contains(&id) {
@@ -7995,6 +8029,7 @@ impl Shell {
                         title
                     },
                     mark: PaneMark::Session(session.summary.provider.clone(), lit.then_some(id)),
+                    by_mono: false,
                 });
             }
             if let Some(r) = review(&id)
@@ -8006,8 +8041,24 @@ impl Shell {
                     mark: PaneMark::File(
                         matches!(t, crate::review::ReviewTab::File { .. }).then(|| t.label()),
                     ),
+                    by_mono: false,
                 });
             }
+        }
+        let mut headline = headline;
+        // A Logs tab (`terminals.layout`) is one tab with one title, whichever pane has focus.
+        if let Some(name) = self.workspace.logs_title(tab) {
+            headline = name.to_owned();
+            panes = vec![TabPane {
+                key: (focus, false),
+                title: name.to_owned(),
+                mark: PaneMark::Terminal,
+                by_mono: self
+                    .workspace
+                    .terminal_panes
+                    .values()
+                    .any(|pane| pane.mono.is_some() && pane.logs.as_deref() == Some(name)),
+            }];
         }
         let focused = (focus, file_focused && review(&focus).is_some());
         let focus = panes.iter().position(|p| p.key == focused).unwrap_or(0);
@@ -8099,6 +8150,16 @@ impl Shell {
                         .h_full()
                         .child(crate::tab_label::tab_label(pane.title.clone())),
                 )
+                .children(pane.by_mono.then(|| {
+                    mono_terminals::mono_mark(
+                        SharedString::from(format!("title-mono-mark-{pane_id}-{leaving}")),
+                        if leaving {
+                            format!("title-tab-mono-mark-leaving-{pane_id}")
+                        } else {
+                            format!("title-tab-mono-mark-{pane_id}")
+                        },
+                    )
+                }))
         };
         div()
             .flex_1()

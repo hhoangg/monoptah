@@ -412,6 +412,12 @@ pub fn app_activity(action: &str, running: bool) -> (&'static str, &'static str)
         "soul.read" => ("Checking", "Checked", "instructions"),
         "models.list" => ("Checking", "Checked", "models"),
         "chat.card" => ("Preparing", "Prepared", "a card"),
+        "terminals.open" => ("Opening", "Opened", "a terminal"),
+        "terminals.send" => ("Typing in", "Typed in", "a terminal"),
+        "terminals.read" | "terminals.list" => ("Reading", "Read", "terminals"),
+        "terminals.stop" => ("Stopping", "Stopped", "a terminal"),
+        "terminals.close" => ("Closing", "Closed", "a terminal"),
+        "terminals.layout" => ("Arranging", "Arranged", "terminals"),
         a if a.starts_with("worktrees.") || a.starts_with("folders.") => {
             ("Organizing", "Organized", "the project")
         }

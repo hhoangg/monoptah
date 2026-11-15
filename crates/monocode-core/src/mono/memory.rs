@@ -6,28 +6,79 @@ use serde::Serialize;
 use std::{path::Path, sync::LazyLock};
 pub const MAX_LINES: usize = 200;
 pub const MAX_BYTES: usize = 24 * 1024;
+fn compile(patterns: &[&str]) -> Vec<Regex> {
+    patterns.iter().map(|p| Regex::new(p).unwrap()).collect()
+}
+const PRIVATE_KEYS: [&str; 2] = [
+    r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+    // A key whose end was cut off (a scrollback window, a capped read) is a secret to the
+    // end of the text: its body is the part that matters.
+    r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*",
+];
+const VENDOR_TOKENS: [&str; 6] = [
+    r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}",
+    r"\bgh[pousr]_[A-Za-z0-9]{20,}",
+    r"\bgithub_pat_[A-Za-z0-9_]{20,}",
+    r"\bxox[abprs]-[A-Za-z0-9-]{10,}",
+    r"\bAKIA[0-9A-Z]{16}\b",
+    r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
+];
+/// A secret word on its own, then its value: all a memory fact is checked for by name.
+const PLAIN_NAMED: &str = r"(?i)\b(?:password|passwd|secret|token|api[_-]?key)\s*[:=]\s*\S+";
+/// What a memory fact is masked with. Narrow on purpose: a fact is prose
+/// (`max_tokens: 8192`, `Design tokens:`) and must stay readable.
 static SECRETS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    [
-        r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
-        r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}",
-        r"\bgh[pousr]_[A-Za-z0-9]{20,}",
-        r"\bgithub_pat_[A-Za-z0-9_]{20,}",
-        r"\bxox[abprs]-[A-Za-z0-9-]{10,}",
-        r"\bAKIA[0-9A-Z]{16}\b",
-        r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
-        r"(?i)\b(?:password|passwd|secret|token|api[_-]?key)\s*[:=]\s*\S+",
-    ]
-    .iter()
-    .map(|p| Regex::new(p).unwrap())
-    .collect()
+    let patterns: Vec<&str> = PRIVATE_KEYS
+        .into_iter()
+        .chain(VENDOR_TOKENS)
+        .chain([PLAIN_NAMED])
+        .collect();
+    compile(&patterns)
 });
-pub fn redact(text: &str) -> String {
-    SECRETS.iter().fold(text.into(), |s, re| {
+/// What a terminal's output is masked with, in this order: private keys first (a named value
+/// must not eat the header of a key), then a name that ENDS in a secret word with its value
+/// (`DB_PASSWORD=...`, `NPM_TOKEN: ...`, not `max_tokens:` or `passwords:`), then vendor
+/// tokens, then the password of an address. The named pattern runs before the vendor ones so
+/// a value is masked once, whole.
+static OUTPUT_SECRETS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    compile(&[
+        PRIVATE_KEYS[0],
+        PRIVATE_KEYS[1],
+        r#"(?i)\b[A-Za-z0-9_]*(?:password|passwd|token|secret|api[_-]?key|private_key|access_key)["']?\s*[:=]\s*\S+"#,
+        VENDOR_TOKENS[0],
+        VENDOR_TOKENS[1],
+        VENDOR_TOKENS[2],
+        VENDOR_TOKENS[3],
+        VENDOR_TOKENS[4],
+        VENDOR_TOKENS[5],
+        r"\bsk_(?:live|test)_[A-Za-z0-9]+",
+        r"\bAIza[0-9A-Za-z_-]{35}",
+        r"\bnpm_[A-Za-z0-9]{36}",
+        // The password of `scheme://user:password@host`; the rest of the address stays.
+        r"://[^/\s:@]+:(?P<v>[^@\s]+)@",
+    ])
+});
+fn mask_all(patterns: &[Regex], text: &str) -> String {
+    patterns.iter().fold(text.into(), |s, re| {
         re.replace_all(&s, |c: &regex::Captures<'_>| {
-            format!("«redacted {} chars»", c[0].chars().count())
+            // A pattern with a `v` group masks only that part of the match.
+            let (whole, value) = (c.get(0).unwrap(), c.name("v").unwrap_or(c.get(0).unwrap()));
+            let mask = format!("«redacted {} chars»", value.as_str().chars().count());
+            let text = whole.as_str();
+            let (from, to) = (value.start() - whole.start(), value.end() - whole.start());
+            format!("{}{mask}{}", &text[..from], &text[to..])
         })
         .into_owned()
     })
+}
+/// Masks secrets in a memory fact.
+pub fn redact(text: &str) -> String {
+    mask_all(&SECRETS, text)
+}
+/// Masks secrets in a terminal's output: `redact`'s and more (named secrets, more vendor
+/// tokens, URL passwords). Output is not prose, so it can afford to be stricter.
+pub fn redact_output(text: &str) -> String {
+    mask_all(&OUTPUT_SECRETS, text)
 }
 pub fn date() -> String {
     Local::now().format("%Y-%m-%d").to_string()

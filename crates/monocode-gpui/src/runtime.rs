@@ -630,8 +630,20 @@ fn run_turn_using(
         if !raw_native_command && settings.operator_enabled {
             let cli = std::env::current_exe().map_err(|e| e.to_string())?;
             prompt = format!(
-                "You have Monoptah app access for this project. Use the CLI: {} app ACTION --json JSON. Supported actions: models.list {{}}, sessions.list {{}}, sessions.read {{sessionId}}, sessions.start {{prompt,harness?,model?,title?,draft?,reveal?,target?}} (target {{kind:\"codespace\"|\"sandbox\",instance?:\"new\"|\"<name>\"|{{session:<sessionId>}},...options}} runs a Claude session in a cloud instance of this project: a GitHub codespace or a Docker Sandbox; check both with cloud.status; instance defaults to \"new\"; options apply only to a new instance: codespace takes branch? and machine?, sandbox takes branch?, cpus?, memory? and ttl?; a name or {{session:<sessionId>}} reuses an existing instance: an existing sandbox returns a ready session at once (the project must already have a session on it) and the first send wakes it if it is stopped, while an existing codespace returns a pending start like a new one; creating or connecting can take minutes: on a timeout repeat the same call with --request-id <the requestId in the reply>), sessions.list/read also return target ({{kind:\"local\"}} or {{kind,instance,state}}) and, for cloud sessions, cloudState, sessions.send/draft {{sessionId,prompt}} (a send to a session on a stopped instance wakes it and asks you to retry in a minute with a new request ID), sessions.stop {{sessionId}}, sessions.pullEvidence {{sessionId,path?,taskId?}} (copies a cloud session's files from its codespace or sandbox .evidence/ folder to this machine and returns their paths; taskId also appends them as file:// URLs to that Today task's note), folders.list {{}}, folders.move {{sessionId,folderId?,newFolderName?}}, notes.list {{}}, notes.read {{id}}, notes.write {{id?,title,body}}, worktrees.list {{}}, cloud.list {{kind?}}, cloud.status {{kind?}} (without kind they cover the backends this project uses or has set up, and say how to enable one when there are none), cloud.create {{kind:\"codespace\",branch?,machine?,displayName?}}, cloud.stop {{sessionId | kind+instance}}, cloud.resume {{sessionId | kind+instance}}. Scope is this thread's project. App credentials are in the environment; never print them. Respect the user’s request and selected access policy.\n\n{prompt}",
+                "You have Monoptah app access for this project. Use the CLI: {} app ACTION --json JSON. Supported actions: models.list {{}}, sessions.list {{}}, sessions.read {{sessionId}}, sessions.start {{prompt,harness?,model?,title?,draft?,reveal?,target?}} (target {{kind:\"codespace\"|\"sandbox\",instance?:\"new\"|\"<name>\"|{{session:<sessionId>}},...options}} runs a Claude session in a cloud instance of this project: a GitHub codespace or a Docker Sandbox; check both with cloud.status; instance defaults to \"new\"; options apply only to a new instance: codespace takes branch? and machine?, sandbox takes branch?, cpus?, memory? and ttl?; a name or {{session:<sessionId>}} reuses an existing instance: an existing sandbox returns a ready session at once (the project must already have a session on it) and the first send wakes it if it is stopped, while an existing codespace returns a pending start like a new one; creating or connecting can take minutes: on a timeout repeat the same call with --request-id <the requestId in the reply>), sessions.list/read also return target ({{kind:\"local\"}} or {{kind,instance,state}}) and, for cloud sessions, cloudState, sessions.send/draft {{sessionId,prompt}} (a send to a session on a stopped instance wakes it and asks you to retry in a minute with a new request ID), sessions.stop {{sessionId}}, sessions.pullEvidence {{sessionId,path?,taskId?}} (copies a cloud session's files from its codespace or sandbox .evidence/ folder to this machine and returns their paths; taskId also appends them as file:// URLs to that Today task's note), folders.list {{}}, folders.move {{sessionId,folderId?,newFolderName?}}, notes.list {{}}, notes.read {{id}}, notes.write {{id?,title,body}}, worktrees.list {{}}, cloud.list {{kind?}}, cloud.status {{kind?}} (without kind they cover the backends this project uses or has set up, and say how to enable one when there are none), cloud.create {{kind:\"codespace\",branch?,machine?,displayName?}}, cloud.stop {{sessionId | kind+instance}}, cloud.resume {{sessionId | kind+instance}}, terminals.list {{}} and terminals.read {{id,lines?}} (read-only: the terminals open in this project or your worktree, secrets masked; only a Mono opens or drives terminals). Scope is this thread's project. App credentials are in the environment; never print them. Respect the user’s request and selected access policy.\n\n{prompt}",
                 shlex_quote(&cli.to_string_lossy())
+            );
+        }
+        // A plain local session (no Operator, no Mono) can still read the project's terminals.
+        if !raw_native_command
+            && !settings.operator_enabled
+            && settings.mono.is_none()
+            && !summary.cwd.starts_with("remote://")
+        {
+            let cli = std::env::current_exe().map_err(|e| e.to_string())?;
+            prompt = format!(
+                "{}\n\n{prompt}",
+                terminals_read_preamble(&shlex_quote(&cli.to_string_lossy()))
             );
         }
         if !raw_native_command
@@ -1240,6 +1252,13 @@ fn today_task_preamble(key: &str, title: &str, cli: &str) -> String {
     )
 }
 
+/// The per-turn line that tells a plain local session it can read terminals.
+fn terminals_read_preamble(cli: &str) -> String {
+    format!(
+        "Read-only: with the CLI {cli} app ACTION --json JSON, terminals.list {{}} and terminals.read {{id,lines?}} list and read this project's or your worktree's terminals (secrets masked). App credentials are in the environment; never print them."
+    )
+}
+
 fn shlex_quote(text: &str) -> String {
     format!(
         "\"{}\"",
@@ -1253,6 +1272,14 @@ fn shlex_quote(text: &str) -> String {
 #[cfg(test)]
 mod today_preamble_tests {
     use super::*;
+
+    #[test]
+    fn plain_sessions_learn_that_terminals_can_be_read() {
+        assert_eq!(
+            terminals_read_preamble("\"/bin/monoptah\""),
+            "Read-only: with the CLI \"/bin/monoptah\" app ACTION --json JSON, terminals.list {} and terminals.read {id,lines?} list and read this project's or your worktree's terminals (secrets masked). App credentials are in the environment; never print them."
+        );
+    }
 
     #[test]
     fn preamble_names_the_task_and_the_cli() {

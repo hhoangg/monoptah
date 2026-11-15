@@ -194,6 +194,18 @@ impl Shell {
         }
         Ok(roots)
     }
+    /// A plain coding session's terminal actions: it may list and read the terminals of its
+    /// own project and worktree. Operator need not be enabled; the session only has to exist
+    /// and be local. Everything else about terminals is a Mono's. Returns the project and the
+    /// folders its terminals must be in.
+    fn authorize_session_terminals(
+        &self,
+        call: &Call,
+        cx: &App,
+    ) -> Result<(String, Vec<String>), String> {
+        Self::check_request_id(call)?;
+        self.session_terminal_scope(call.session, &call.action, &call.input, cx)
+    }
     fn authorize_app_call(&self, call: &Call, cx: &App) -> Result<(), String> {
         app::validate_operator(&call.action, &call.input)?;
         Self::check_request_id(call)?;
@@ -241,6 +253,8 @@ impl Shell {
     fn handle_app_call(&mut self, call: Call, window: &mut Window, cx: &mut Context<Self>) {
         let allowed = if monocode_core::today::actions::session_action(&call.action) {
             self.authorize_session_today(&call, cx).map(drop)
+        } else if call.action.starts_with("terminals.") {
+            self.authorize_session_terminals(&call, cx).map(drop)
         } else {
             self.authorize_app_call(&call, cx)
         };
@@ -444,6 +458,12 @@ impl Shell {
                 }
                 Err(error) => self.finish_app_call(call, Err(error), cx),
             }
+            return;
+        }
+        if call.action.starts_with("terminals.") {
+            let (session, action, input) = (call.session, call.action.clone(), call.input.clone());
+            let result = self.session_terminals_call(session, &action, &input, cx);
+            self.finish_app_call(call, result, cx);
             return;
         }
         if let Err(error) = self.authorize_app_call(&call, cx) {
@@ -1035,6 +1055,8 @@ fn mutating(action: &str) -> bool {
         "models.list"
             | "accounts.list"
             | "today.current"
+            | "terminals.list"
+            | "terminals.read"
             | "sessions.list"
             | "sessions.read"
             | "folders.list"

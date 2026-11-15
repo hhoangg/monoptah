@@ -254,6 +254,109 @@ pub fn worktrees(cwd: &Path) -> Result<Vec<Worktree>, String> {
     }
     Ok(trees)
 }
+/// The folders a Mono's terminal scope may add to a project: its git worktrees, each one
+/// checked against the repository so a planted or stale entry cannot widen the scope.
+///
+/// Empty unless `project` is exactly the top level of its working copy (a project that is a
+/// subfolder of a repository, a package of a monorepo or `$HOME` with dotfiles, would
+/// otherwise take the whole repository). An entry is dropped when its folder is missing,
+/// when it is `/`, a drive root, the home folder or an ancestor of the project, and, for a
+/// linked worktree, unless its `.git` file and the repository's `worktrees/<name>/gitdir`
+/// point at each other.
+pub fn scoped_worktrees(project: &Path) -> Vec<PathBuf> {
+    let Ok(project) = std::fs::canonicalize(project) else {
+        return Vec::new();
+    };
+    let Some(top) = git_path(&project, "--show-toplevel") else {
+        return Vec::new();
+    };
+    if top != project {
+        return Vec::new();
+    }
+    let Some(common) = git_path(&project, "--git-common-dir") else {
+        return Vec::new();
+    };
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .and_then(|home| std::fs::canonicalize(home).ok());
+    let Ok(trees) = worktrees(&project) else {
+        return Vec::new();
+    };
+    trees
+        .into_iter()
+        .filter(|tree| !tree.missing)
+        .filter_map(|tree| std::fs::canonicalize(&tree.path).ok().map(|p| (tree, p)))
+        .filter(|(tree, path)| {
+            !refused_worktree_root(path, &project, home.as_deref())
+                && if tree.main {
+                    main_worktree_is(path, &common)
+                } else {
+                    linked_worktree_is(path, &common)
+                }
+        })
+        .map(|(_, path)| path)
+        .collect()
+}
+
+/// A path `git rev-parse <flag>` prints for `cwd`, made absolute and canonical.
+fn git_path(cwd: &Path, flag: &str) -> Option<PathBuf> {
+    let out = git(cwd, &["rev-parse", flag]).ok()?;
+    let path = Path::new(out.trim());
+    let full = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    std::fs::canonicalize(full).ok()
+}
+
+/// Folders a worktree entry can never be: a file system root, the user's home folder, or a
+/// folder that contains the project (the scope would then reach beyond it).
+fn refused_worktree_root(path: &Path, project: &Path, home: Option<&Path>) -> bool {
+    path.parent().is_none()
+        || home.is_some_and(|home| path == home)
+        || (path != project && project.starts_with(path))
+}
+
+/// The main working copy is the one whose `.git` is the common git directory.
+fn main_worktree_is(path: &Path, common: &Path) -> bool {
+    std::fs::canonicalize(path.join(".git")).is_ok_and(|git| git == common && git.is_dir())
+}
+
+/// A linked worktree has a `.git` file naming `<common>/worktrees/<name>`, and that folder's
+/// `gitdir` names the file back.
+fn linked_worktree_is(path: &Path, common: &Path) -> bool {
+    let dot_git = path.join(".git");
+    if !std::fs::symlink_metadata(&dot_git).is_ok_and(|m| m.is_file()) {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(&dot_git) else {
+        return false;
+    };
+    let Some(named) = text.lines().find_map(|l| l.strip_prefix("gitdir:")) else {
+        return false;
+    };
+    let named = Path::new(named.trim());
+    let named = if named.is_absolute() {
+        named.to_path_buf()
+    } else {
+        path.join(named)
+    };
+    let (Ok(admin), Ok(worktrees)) = (
+        std::fs::canonicalize(named),
+        std::fs::canonicalize(common.join("worktrees")),
+    ) else {
+        return false;
+    };
+    if admin.parent() != Some(worktrees.as_path()) {
+        return false;
+    }
+    std::fs::read_to_string(admin.join("gitdir"))
+        .ok()
+        .and_then(|back| std::fs::canonicalize(back.trim()).ok())
+        .zip(std::fs::canonicalize(&dot_git).ok())
+        .is_some_and(|(back, dot_git)| back == dot_git)
+}
 /// A repository whose main working copy has no commits yet (HEAD is all zeros),
 /// where a new worktree has nothing to start from. Anything else is false.
 pub fn unborn(cwd: &Path) -> bool {
@@ -445,6 +548,148 @@ pub fn create_project_worktree(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn commit_all(cwd: &Path) {
+        git(
+            cwd,
+            &[
+                "-c",
+                "user.name=Native test",
+                "-c",
+                "user.email=native@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "Initial",
+            ],
+        )
+        .unwrap();
+    }
+    fn canon(path: &Path) -> PathBuf {
+        std::fs::canonicalize(path).unwrap()
+    }
+    #[test]
+    fn scoped_worktrees_keep_real_ones_and_drop_planted_missing_and_wide_ones() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        git(&project, &["init", "-b", "main"]).unwrap();
+        commit_all(&project);
+        let linked = temp.path().join("linked");
+        git(
+            &project,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                &linked.to_string_lossy(),
+            ],
+        )
+        .unwrap();
+        let gone = temp.path().join("gone");
+        git(
+            &project,
+            &["worktree", "add", "-b", "gone", &gone.to_string_lossy()],
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&gone).unwrap();
+        // Planted entries, as a program that can write inside the repository could register.
+        for (name, target) in [
+            // `/.git` would not do: git strips the `.git`, leaves `` and falls back to the
+            // admin folder. `//.git` is the spelling that makes git list `/` itself.
+            ("root", "//.git".to_owned()),
+            (
+                "parent",
+                temp.path().join(".git").to_string_lossy().into_owned(),
+            ),
+            (
+                "forged",
+                temp.path()
+                    .join("forged/.git")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        ] {
+            let admin = project.join(".git/worktrees").join(name);
+            std::fs::create_dir_all(&admin).unwrap();
+            std::fs::write(admin.join("gitdir"), format!("{target}\n")).unwrap();
+            std::fs::write(admin.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+            std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+        }
+        // A real folder registered as a worktree whose own `.git` names another entry of this
+        // repository: the two files do not point at each other.
+        let forged = temp.path().join("forged");
+        std::fs::create_dir(&forged).unwrap();
+        std::fs::write(
+            forged.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                project.join(".git/worktrees/root").display()
+            ),
+        )
+        .unwrap();
+        // The planted `/` really reaches the filter, so only `refused_worktree_root` keeps it out.
+        assert!(
+            worktrees(&project)
+                .unwrap()
+                .iter()
+                .any(|tree| tree.path == "/" && !tree.missing),
+            "git must list / for the planted entry"
+        );
+        let mut got = scoped_worktrees(&project);
+        got.sort();
+        let mut want = vec![canon(&project), canon(&linked)];
+        want.sort();
+        assert_eq!(got, want);
+        // From the linked worktree the main working copy is in scope too.
+        let mut from_linked = scoped_worktrees(&linked);
+        from_linked.sort();
+        assert_eq!(from_linked, want);
+    }
+    #[test]
+    fn a_project_inside_a_repository_gets_no_worktrees() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let package = repo.join("packages/api");
+        std::fs::create_dir_all(&package).unwrap();
+        git(&repo, &["init", "-b", "main"]).unwrap();
+        commit_all(&repo);
+        let linked = temp.path().join("linked");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                &linked.to_string_lossy(),
+            ],
+        )
+        .unwrap();
+        assert!(scoped_worktrees(&package).is_empty());
+        assert!(scoped_worktrees(&temp.path().join("missing")).is_empty());
+        assert!(!scoped_worktrees(&repo).is_empty());
+    }
+    #[test]
+    fn worktree_roots_that_would_widen_the_scope_are_refused() {
+        let project = Path::new("/home/me/work/app");
+        let home = Path::new("/home/me");
+        assert!(refused_worktree_root(Path::new("/"), project, None));
+        assert!(refused_worktree_root(home, project, Some(home)));
+        assert!(refused_worktree_root(
+            Path::new("/home/me/work"),
+            project,
+            None
+        ));
+        assert!(!refused_worktree_root(project, project, Some(home)));
+        assert!(!refused_worktree_root(
+            Path::new("/home/me/work/app-feature"),
+            project,
+            Some(home)
+        ));
+    }
     #[test]
     fn unborn_is_true_only_for_a_repository_without_commits() {
         let temp = tempfile::tempdir().unwrap();

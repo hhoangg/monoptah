@@ -4,6 +4,29 @@ use serde_json::Value;
 /// instance: a new cloud instance takes the account, an existing one keeps its own.
 pub const ACCOUNT_EXISTING_INSTANCE: &str =
     "The account belongs to the instance; it cannot change for an existing one.";
+/// The most bytes of `command` or `text` a terminal call takes.
+pub const TERMINAL_INPUT_MAX: usize = 4096;
+/// The most terminals one `terminals.layout` arranges.
+pub const TERMINAL_LAYOUT_MAX: usize = 6;
+
+/// A character that draws nothing or changes how the text around it reads: a control, a
+/// format character (Unicode Cf: zero width, direction changing, soft hyphen, tags) or a
+/// filler (Hangul, Braille blank). Labels refuse these; accents (combining marks) are fine.
+pub fn is_format_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{ad}' | '\u{34f}' | '\u{61c}' | '\u{115f}' | '\u{1160}' | '\u{17b4}' | '\u{17b5}'
+                | '\u{180b}'..='\u{180f}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{2800}' | '\u{3164}' | '\u{feff}' | '\u{ffa0}'
+                | '\u{fff9}'..='\u{fffb}'
+                | '\u{e0000}'..='\u{e007f}'
+        )
+}
+
 /// Reject misspelled fields and ambiguous types before any app mutation.
 pub fn validate(action: &str, input: &Value) -> Result<(), String> {
     let cloud_fields;
@@ -27,6 +50,12 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         "sessions.archive"=>"sessionId project cloud backup",
         "sessions.delete"=>"sessionId project providerFiles removeWorktree cloud",
         "worktrees.create"=>"branch base existing project",
+        "terminals.list"=>"project",
+        "terminals.open"=>"label action command cwd place beside direction reveal project",
+        "terminals.send"=>"id text key project",
+        "terminals.read"=>"id lines project",
+        "terminals.stop"|"terminals.close"=>"id project",
+        "terminals.layout"=>"preset ids reveal project",
         "folders.move"=>"sessionId folderId newFolderName project",
         "notes.list"=>"limit offset","notes.read"=>"id","notes.write"=>"id title body tags",
         "artifacts.list"=>"kind limit offset","artifacts.read"=>"id","artifacts.write"=>"id kind title body summary",
@@ -88,7 +117,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         {
             return Err(format!("{key} must be true or false"));
         }
-        if ["limit", "offset", "maxChars", "number"].contains(&key.as_str())
+        if ["limit", "offset", "maxChars", "number", "lines"].contains(&key.as_str())
             && value.as_u64().is_none()
         {
             return Err(format!("{key} must be a non-negative integer"));
@@ -121,6 +150,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             "offset",
             "maxChars",
             "number",
+            "lines",
             "id",
             "sessionId",
             "session",
@@ -129,6 +159,8 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             "schedule",
             "tags",
             "options",
+            // terminals.layout; checked below.
+            "ids",
             "parentSessionId",
             // sessions.start target; checked by validate_target.
             "target",
@@ -159,6 +191,38 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         && input.get("cloud").is_some()
     {
         return Err("removeWorktree and cloud cannot be combined; choose one per call".into());
+    }
+    // What a Mono types into a terminal stays small.
+    if action == "terminals.layout" {
+        if !matches!(input["preset"].as_str(), Some("columns" | "rows" | "grid")) {
+            return Err("preset must be \"columns\", \"rows\" or \"grid\"".into());
+        }
+        let ids = input["ids"]
+            .as_array()
+            .filter(|ids| ids.iter().all(Value::is_string))
+            .ok_or("ids must be a list of terminal ids")?;
+        if ids.is_empty() || ids.len() > TERMINAL_LAYOUT_MAX {
+            return Err(format!("ids holds 1 to {TERMINAL_LAYOUT_MAX} terminal ids"));
+        }
+        let mut seen = std::collections::HashSet::new();
+        if !ids
+            .iter()
+            .filter_map(Value::as_str)
+            .all(|id| seen.insert(id))
+        {
+            return Err("ids must not repeat a terminal".into());
+        }
+    }
+    if action.starts_with("terminals.") {
+        for key in ["text", "command"] {
+            if input
+                .get(key)
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.len() > TERMINAL_INPUT_MAX)
+            {
+                return Err(format!("{key} is at most {TERMINAL_INPUT_MAX} bytes"));
+            }
+        }
     }
     if let Some(account) = input.get("account") {
         let account = account.as_str().unwrap_or_default();
@@ -262,6 +326,30 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn invisible_characters_are_told_from_visible_ones() {
+        for c in [
+            '\u{200b}',
+            '\u{202e}',
+            '\u{2066}',
+            '\u{feff}',
+            '\u{ad}',
+            '\u{3164}',
+            '\u{115f}',
+            '\u{ffa0}',
+            '\u{2800}',
+            '\u{e0041}',
+            '\u{7}',
+            '\u{85}',
+        ] {
+            assert!(is_format_char(c), "{:x}", c as u32);
+        }
+        // A label may carry an accent or an ideographic space.
+        assert!(!is_format_char('\u{301}') && !is_format_char('\u{3000}'));
+        for c in ['a', ' ', 'é', 'ệ', '日', '😀', '-', '\\', '·'] {
+            assert!(!is_format_char(c), "{c}");
+        }
+    }
     #[test]
     fn validates_before_mutation() {
         assert!(validate("sessions.start", &json!({"prompt":"x","draft":"false"})).is_err());
