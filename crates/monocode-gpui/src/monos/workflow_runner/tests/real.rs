@@ -17,6 +17,8 @@ use monocode_core::{
     provider::Kind,
 };
 
+mod cloud;
+
 fn request(s: &Setup) -> SessionRequest {
     SessionRequest {
         project: s.project.clone(),
@@ -29,6 +31,7 @@ fn request(s: &Setup) -> SessionRequest {
         parent_session_id: None,
         folder_id: None,
         folder_name: None,
+        target: None,
     }
 }
 

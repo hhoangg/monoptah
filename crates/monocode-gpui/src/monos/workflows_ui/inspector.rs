@@ -600,10 +600,17 @@ impl Monos {
                 reuse_session,
                 nest_under,
                 timeout_minutes,
+                target,
                 ..
             } => {
                 let project_row = self.board_project_row(mono, w, &id, cx);
                 let model = self.board_model_rows(node, cx);
+                // Read-only: the target is edited in the workflow's file or through the Mono.
+                let target_row = target.as_ref().map(|target| {
+                    property("Runs in", target.summary())
+                        .id("wf-target")
+                        .debug_selector(|| "wf-target".to_string())
+                });
                 let others = sessions_except(w, &id);
                 let mut worktrees = choices(&[("root", "Project folder"), ("newWorktree", "New worktree")]);
                 worktrees.extend(others.iter().map(|s| {
@@ -670,6 +677,7 @@ impl Monos {
                         props()
                             .child(project_row)
                             .children(model)
+                            .children(target_row)
                             .child(checkout_row)
                             .child(nest_row)
                             .child(limit),

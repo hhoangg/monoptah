@@ -3,7 +3,8 @@
 use super::condition::condition_syntax_problem;
 use super::model::{
     is_node_id, Checkout, Cwd, Handle, Node, NodeId, NodeKind, Requirement, RequirementKind,
-    Workflow, MAX_PARALLEL_LIMIT, MAX_ROUNDS_LIMIT, MAX_TIMEOUT_MINUTES, SWITCH_DEFAULT,
+    SessionTarget, TargetInstance, Workflow, MAX_PARALLEL_LIMIT, MAX_ROUNDS_LIMIT,
+    MAX_TIMEOUT_MINUTES, SWITCH_DEFAULT,
 };
 use super::parse::{is_map_key, is_name};
 use super::template::{js_space, js_trim, shell_template_problems, template_vars};
@@ -255,6 +256,17 @@ fn item_name(node: &Node) -> Option<String> {
     match &node.kind {
         NodeKind::ForEach { item, .. } => Some(item.clone().unwrap_or_else(|| "item".into())),
         _ => None,
+    }
+}
+
+/// Whether a string anywhere in `value` holds a `{{` template opener.
+fn json_has_template(value: &super::ordered::Json) -> bool {
+    use super::ordered::Json;
+    match value {
+        Json::String(s) => s.contains("{{"),
+        Json::Array(items) => items.iter().any(json_has_template),
+        Json::Object(map) => map.values().any(json_has_template),
+        _ => false,
     }
 }
 
@@ -595,6 +607,152 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Whether `id` is a session node with a cloud target.
+    fn runs_in_cloud(&self, id: &str) -> bool {
+        matches!(
+            self.g.by_id.get(id).map(|n| &n.kind),
+            Some(NodeKind::Session {
+                target: Some(_),
+                ..
+            })
+        )
+    }
+
+    /// A session node that runs in a codespace or sandbox: its checkout, harness and model
+    /// must fit a cloud session, and `sameAs` must name an earlier cloud step of the same kind.
+    fn check_target(
+        &mut self,
+        node: &Node,
+        target: &SessionTarget,
+        checkout: &Checkout,
+        harness: Option<&str>,
+        model: Option<&str>,
+    ) {
+        let at = Some(node.id.as_str());
+        if let Some(h) = harness.filter(|h| !h.is_empty() && *h != "claude") {
+            self.add(
+                format!("harness \"{h}\": a cloud session runs Claude only"),
+                at,
+            );
+        } else if let Some(owner) = model
+            .and_then(super::models::id_harness)
+            .filter(|h| *h != "claude")
+        {
+            self.add(
+                format!(
+                    "model: a cloud session runs Claude only, but the model belongs to \"{owner}\""
+                ),
+                at,
+            );
+        }
+        match checkout {
+            Checkout::Root => {}
+            Checkout::NewWorktree => self.add(
+                "A cloud session works in its instance's own checkout: use checkout \"root\" and target.branch instead of newWorktree",
+                at,
+            ),
+            Checkout::WorktreeOf(_) => self.add(
+                "A cloud session cannot use checkout worktreeOf: to share an instance use target.instance {\"sameAs\": \"<node id>\"}",
+                at,
+            ),
+        }
+        for (key, value) in target.options.iter() {
+            if json_has_template(value) {
+                self.add(
+                    format!("target.{key} is used as written: {{{{ }}}} templates are not filled in there"),
+                    at,
+                );
+            }
+        }
+        let mut raw = serde_json::Map::new();
+        raw.insert("kind".into(), json!(target.kind));
+        match &target.instance {
+            TargetInstance::New => {}
+            // Any session reference does: only the node it names is checked below.
+            TargetInstance::SameAs(_) => {
+                raw.insert("instance".into(), json!({ "session": 1 }));
+            }
+            TargetInstance::Invalid(_) => {}
+        }
+        for (key, value) in target.options.iter() {
+            raw.insert(key.clone(), value.to_value());
+        }
+        let invalid_instance = matches!(target.instance, TargetInstance::Invalid(_));
+        if invalid_instance {
+            // validate_target would judge the instance itself: report that in our own words.
+            raw.remove("instance");
+            self.add(
+                "target.instance must be \"new\" or {\"sameAs\": \"<session node id>\"}",
+                at,
+            );
+        }
+        if let Err(problem) = crate::mono::cloud_api::validate::validate_target(
+            &serde_json::Value::Object(raw),
+            &json!({ "harness": "claude" }),
+        ) {
+            // With an invalid instance only the kind and the options are judged: the instance
+            // was dropped, so a lone "only applies when creating" cannot be said about it.
+            if !(invalid_instance && problem.contains("only applies when creating")) {
+                self.add(format!("target: {problem}"), at);
+            }
+        }
+        if let TargetInstance::SameAs(other) = &target.instance {
+            self.check_same_as(node, target, other);
+        }
+    }
+
+    fn check_same_as(&mut self, node: &Node, target: &SessionTarget, other: &str) {
+        let at = Some(node.id.as_str());
+        let what = "target.instance sameAs";
+        let Some(found) = self.g.by_id.get(other).copied() else {
+            self.add(format!("{what} \"{other}\" does not exist"), at);
+            return;
+        };
+        let NodeKind::Session {
+            target: other_target,
+            project: other_project,
+            ..
+        } = &found.kind
+        else {
+            self.add(format!("{what} \"{other}\" must be a session node"), at);
+            return;
+        };
+        if other == node.id {
+            self.add(format!("{what} \"{other}\" cannot be the node itself"), at);
+            return;
+        }
+        match other_target {
+            None => self.add(
+                format!("{what} \"{other}\" must be a cloud session node (one with a target)"),
+                at,
+            ),
+            Some(t) if t.kind != target.kind => self.add(
+                format!(
+                    "{what} \"{other}\" must be the same kind: it is a {}, this node is a {}",
+                    t.kind, target.kind
+                ),
+                at,
+            ),
+            Some(_) => {}
+        }
+        if let NodeKind::Session { project, .. } = &node.kind {
+            if project != other_project {
+                self.add(
+                    format!(
+                        "{what} \"{other}\" must use the same project input: it uses {other_project}, this node uses {project}"
+                    ),
+                    at,
+                );
+            }
+        }
+        if !self.ancestors(&node.id).contains(other) {
+            self.add(
+                format!("{what} \"{other}\" must run before this node (upstream of it)"),
+                at,
+            );
+        }
+    }
+
     fn check_timeout(&mut self, node: &Node, timeout: Option<f64>) {
         let Some(t) = timeout else { return };
         // Parsed numbers are finite, so `<=` is the negation of `>` here.
@@ -635,8 +793,11 @@ impl<'a> Checker<'a> {
                 prompt,
                 checkout,
                 output,
+                harness,
+                model,
                 nest_under,
                 timeout_minutes,
+                target,
                 ..
             } => {
                 self.check_project(node, project);
@@ -649,8 +810,17 @@ impl<'a> Checker<'a> {
                         );
                     }
                 }
-                if let Checkout::WorktreeOf(target) = checkout {
-                    self.check_session_ref(target, "checkout worktreeOf", node);
+                if let Checkout::WorktreeOf(of) = checkout {
+                    self.check_session_ref(of, "checkout worktreeOf", node);
+                    if target.is_none() && self.runs_in_cloud(of) {
+                        self.add(
+                            format!("checkout worktreeOf \"{of}\": that node runs in the cloud and has no local worktree"),
+                            Some(&node.id),
+                        );
+                    }
+                }
+                if let Some(target) = target {
+                    self.check_target(node, target, checkout, harness.as_deref(), model.as_deref());
                 }
                 if let Some(target) = nest_under {
                     self.check_session_ref(target, "nestUnder", node);
@@ -671,6 +841,12 @@ impl<'a> Checker<'a> {
                 }
                 if let Some(Cwd::WorktreeOf(target)) = cwd {
                     self.check_session_ref(target, "cwd worktreeOf", node);
+                    if self.runs_in_cloud(target) {
+                        self.add(
+                            format!("cwd worktreeOf \"{target}\": that node runs in the cloud and has no local worktree"),
+                            Some(&node.id),
+                        );
+                    }
                 }
                 self.check_timeout(node, *timeout_minutes);
             }

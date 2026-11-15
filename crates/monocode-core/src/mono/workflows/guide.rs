@@ -298,6 +298,85 @@ const EXAMPLE_2: &str = r##"{
   ]
 }"##;
 
+const EXAMPLE_3: &str = r##"{
+  "name": "Build in the cloud, then check",
+  "description": "Run a build step in a new codespace, then a second step in the same codespace.",
+  "inputs": {
+    "project": {
+      "type": "project"
+    }
+  },
+  "inputValues": {
+    "project": "my-project"
+  },
+  "nodes": [
+    {
+      "id": "trigger",
+      "type": "manual"
+    },
+    {
+      "id": "build",
+      "type": "session",
+      "title": "Build",
+      "project": "{{inputs.project}}",
+      "model": "claude:sonnet-5",
+      "checkout": "root",
+      "target": {
+        "kind": "codespace",
+        "branch": "main",
+        "machine": "basicLinux32gb"
+      },
+      "prompt": "Build the project and run its tests. Report whether they pass.",
+      "output": {
+        "passed": {
+          "type": "boolean",
+          "description": "True when the build and the tests pass"
+        }
+      }
+    },
+    {
+      "id": "check",
+      "type": "session",
+      "title": "Check",
+      "project": "{{inputs.project}}",
+      "model": "claude:sonnet-5",
+      "checkout": "root",
+      "target": {
+        "kind": "codespace",
+        "instance": {
+          "sameAs": "build"
+        }
+      },
+      "prompt": "The build passed: {{build.passed}}. Look at the build output in this codespace and list anything surprising.",
+      "output": {
+        "notes": {
+          "type": "string",
+          "description": "What looked surprising"
+        }
+      }
+    },
+    {
+      "id": "report",
+      "type": "report",
+      "template": "Cloud build for run {{run.id}}\n\n{{check.notes}}"
+    }
+  ],
+  "edges": [
+    {
+      "from": "trigger",
+      "to": "build"
+    },
+    {
+      "from": "build",
+      "to": "check"
+    },
+    {
+      "from": "check",
+      "to": "report"
+    }
+  ]
+}"##;
+
 fn example(raw: &str) -> Json {
     Json::parse(raw).expect("a guide example is valid JSON")
 }
@@ -318,6 +397,11 @@ pub fn guide_examples() -> Vec<GuideExample> {
             name: r##"If on a session output, with a command first"##,
             why: r##"A command reads recent history, a session judges it and sets a boolean, and an If sends risky changes to a deeper review while safe ones go straight to the report. The report template skips the review text when that step did not run."##,
             workflow: example(EXAMPLE_2),
+        },
+        GuideExample {
+            name: r##"Cloud steps: a new codespace, then the same one"##,
+            why: r##"The first session runs in a new codespace and the second continues in that same codespace through `sameAs`. Both keep `checkout` as `root`, because a cloud session works in its instance's own checkout."##,
+            workflow: example(EXAMPLE_3),
         },
     ]
 }
@@ -345,6 +429,23 @@ fn examples_section() -> String {
         ]);
     }
     lines.join("\n")
+}
+
+/// The option keys of each cloud kind's target, from the provider specs (plus `kit`).
+fn option_lists() -> String {
+    crate::mono::cloud_api::specs()
+        .iter()
+        .map(|spec| {
+            let keys: Vec<String> = spec
+                .start_options()
+                .iter()
+                .chain([&crate::mono::cloud_api::validate::KIT_OPTION])
+                .map(|key| format!("`{key}`"))
+                .collect();
+            format!("for `{}` {}", spec.kind().api_name(), keys.join(", "))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// The authoring guide, as Markdown.
@@ -421,6 +522,7 @@ pub fn workflow_guide() -> String {
             r##"- `project` (required, `{{inputs.<name>}}`), `prompt` (required, a template), `checkout` (required): `"root"` (the project's own checkout), `"newWorktree"` (a fresh worktree) or `{"worktreeOf": "<session node id>"}` (continue in the worktree of an earlier session of the same branch; that node must be a session)."##,
             r##"- `output`: the fields the session reports back (see the output contract below). May be `{}`."##,
             r##"- `harness`, `model`, `effort` (optional): see Models."##,
+            r##"- `target` (optional): run this step in a cloud instance (a GitHub codespace or a Docker sandbox) instead of on this computer: `{"kind": "codespace" | "sandbox", "instance"?: "new" | {"sameAs": "<session node id>"}, ...options}`. See Cloud steps."##,
             format!(r##"- `reuseSession` (default true): in a loop, later rounds continue in the same session instead of starting a new one. `nestUnder` (optional): the id of another session node; this session is shown under it in the sidebar. `timeoutMinutes` (default {DEFAULT_SESSION_TIMEOUT_MINUTES}, above 0, at most {MAX_TIMEOUT_MINUTES})."##).as_str(),
             "",
             r##"`command`"##,
@@ -528,6 +630,23 @@ pub fn workflow_guide() -> String {
             r##"## Models"##,
             "",
             r##"Leave `harness`, `model` and `effort` out to run a session with your own model. To choose, run `app models.list` and copy the exact ids: `model` is a catalog id such as `claude:sonnet-5` or `claude:opus-5`, not a name like `sonnet`; `harness` is a provider id from the same list and, when given, the model must belong to it; `effort` is one of that model's listed values, and is only checked together with a `model`. An id the app does not know, or one whose provider is not installed, is reported as an issue and the workflow cannot run until it is fixed."##,
+        ],
+    );
+    add(
+        &mut sections,
+        &[
+            r##"## Cloud steps"##,
+            "",
+            r##"A session node with a `target` runs in a cloud instance, like `sessions.start` with a `target`. Without `target` it runs on this computer."##,
+            r##"- Shape: `"target": {"kind": "codespace" | "sandbox", "instance"?: "new" | {"sameAs": "<session node id>"}, ...options}`. Leaving `instance` out means `"new"`."##,
+            r##"- A cloud step runs Claude only. Leave `harness` out (or write `"claude"`) and name no model of another harness."##,
+            r##"- `checkout` must be `"root"`. A cloud session works in its instance's own checkout, so `newWorktree` and `worktreeOf` are refused; to start from a branch use `target.branch`, and to share an instance use `sameAs`."##,
+            format!(r##"- Options are written literally: a `{{{{...}}}}` template in an option is not filled in. They apply only to a new instance (not with `sameAs`) and are the same keys `sessions.start` takes in its target: {}."##, option_lists()).as_str(),
+            r##"- `{"sameAs": "<id>"}` shares the instance of an earlier cloud session node of the same kind (it must be upstream of this node, and not the node itself)."##,
+            r##"- Instances: in a loop with `reuseSession` true, later rounds continue the same session; with `reuseSession` false a later round starts a new session on the same instance as the node's previous round (an instance is never created per round). Each For each item gets its own instance for `"new"`."##,
+            r##"- Lifecycle: the app never stops or deletes an instance when a run ends, fails or is stopped. The run report lists the instances the run used (one that finishes starting after the run was stopped is named in a follow-up message), so the user can stop or delete them in Cloud workspaces. `workflows.stop` stops the running turns, and a session that is still starting, or whose step failed, does not send its prompt later. A resumed run goes on in the instance its interrupted step had; if the app restarted and that instance was ready before the run was resumed, the old first prompt may already have run there."##,
+            r##"- `timeoutMinutes` includes the time the instance takes to start."##,
+            r##"- A local session cannot use `checkout` `worktreeOf` a cloud node, and a command cannot use `cwd` `worktreeOf` one: the cloud node has no local worktree."##,
         ],
     );
     add(
@@ -755,7 +874,7 @@ mod tests {
     fn example_json_is_what_the_react_guide_prints() {
         for (example, raw) in guide_examples()
             .iter()
-            .zip([EXAMPLE_0, EXAMPLE_1, EXAMPLE_2])
+            .zip([EXAMPLE_0, EXAMPLE_1, EXAMPLE_2, EXAMPLE_3])
         {
             assert_eq!(example.workflow.stringify(true), raw, "{}", example.name);
         }
@@ -815,6 +934,40 @@ mod tests {
         }
         // A loop condition is true to go back for another round, so an approval loop uses !=.
         assert!(guide.contains(r#"{{review.verdict}} != "approve""#));
+    }
+
+    #[test]
+    fn guide_explains_cloud_steps_with_the_option_keys_of_each_kind() {
+        let guide = workflow_guide();
+        assert!(guide.contains("## Cloud steps"));
+        assert!(guide.contains("`target` (optional)"));
+        for point in [
+            "for `codespace` `branch`, `machine`, `kit`",
+            "for `sandbox` `branch`, `cpus`, `memory`, `ttl`, `template`, `image`, `kit`",
+            "never stops or deletes an instance",
+            "Cloud workspaces",
+            "`workflows.stop` stops the running turns",
+            "includes the time the instance takes to start",
+            "same instance as the node's previous round",
+            "Each For each item gets its own instance",
+            "no local worktree",
+        ] {
+            assert!(guide.contains(point), "{point}");
+        }
+        let cloud = guide_examples()
+            .iter()
+            .flat_map(|e| as_workflow(e).nodes)
+            .filter(|n| {
+                matches!(
+                    &n.kind,
+                    NodeKind::Session {
+                        target: Some(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(cloud, 2);
     }
 
     #[test]

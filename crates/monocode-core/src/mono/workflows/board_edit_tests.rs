@@ -1235,3 +1235,101 @@ mod requires {
         assert_eq!(from_flow(&w, &flow.nodes, &flow.edges).requires, w.requires);
     }
 }
+
+mod cloud_target {
+    use super::*;
+
+    fn target_of(flow: &Flow, id: &str) -> Option<SessionTarget> {
+        match &node(flow, id).data.node.kind {
+            NodeKind::Session { target, .. } => target.clone(),
+            _ => panic!("not a session"),
+        }
+    }
+
+    fn cloud_board() -> (Flow, Workflow) {
+        let mut w = ticket_workflow();
+        for (id, instance) in [
+            ("fetch", TargetInstance::New),
+            ("dev", TargetInstance::SameAs("fetch".into())),
+        ] {
+            let node = w.nodes.iter_mut().find(|n| n.id == id).unwrap();
+            let NodeKind::Session { target, .. } = &mut node.kind else {
+                panic!("a session")
+            };
+            let mut options = OrderedMap::new();
+            if instance == TargetInstance::New {
+                options.insert("branch", super::super::ordered::Json::String("main".into()));
+            }
+            *target = Some(SessionTarget {
+                kind: "codespace".into(),
+                instance,
+                options,
+            });
+        }
+        board(&w)
+    }
+
+    #[test]
+    fn editing_any_field_of_a_session_keeps_its_target() {
+        let (flow, _) = cloud_board();
+        let before = target_of(&flow, "dev");
+        assert!(before.is_some());
+        let mut edited = node(&flow, "dev").data.node.clone();
+        if let NodeKind::Session {
+            prompt,
+            harness,
+            model,
+            effort,
+            checkout,
+            reuse_session,
+            nest_under,
+            timeout_minutes,
+            output,
+            ..
+        } = &mut edited.kind
+        {
+            *prompt = "changed".into();
+            *harness = Some("claude".into());
+            *model = Some("claude:sonnet-5".into());
+            *effort = Some("high".into());
+            *checkout = Checkout::Root;
+            *reuse_session = Some(false);
+            *nest_under = None;
+            *timeout_minutes = Some(30.0);
+            *output = OrderedMap::new();
+        }
+        edited.title = Some("Renamed".into());
+        let out = update_node(&flow, &edited);
+        assert_eq!(target_of(&out, "dev"), before);
+        assert_eq!(target_of(&out, "fetch"), target_of(&flow, "fetch"));
+    }
+
+    #[test]
+    fn saving_the_board_keeps_every_target() {
+        let (flow, current) = cloud_board();
+        let saved = from_flow(&current, &flow.nodes, &flow.edges);
+        assert_eq!(saved.nodes, current.nodes);
+        assert_ne!(definition_key(&saved), definition_key(&ticket_workflow()));
+    }
+
+    #[test]
+    fn deleting_the_node_a_target_shares_leaves_the_reference_for_validation_to_report() {
+        let (flow, current) = cloud_board();
+        let out = delete_selected(&selected(&flow, "fetch"));
+        let target = target_of(&out, "dev").unwrap();
+        assert_eq!(target.kind, "codespace");
+        // Not turned into a new instance: that would quietly create (and bill) another one.
+        assert_eq!(target.instance, TargetInstance::SameAs("fetch".into()));
+        let w = from_flow(&current, &out.nodes, &out.edges);
+        let messages: Vec<String> = crate::mono::workflows::validate::validate_workflow(&w)
+            .into_iter()
+            .map(|i| i.message)
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("\"fetch\" does not exist")),
+            "{messages:?}"
+        );
+    }
+}

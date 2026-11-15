@@ -228,9 +228,69 @@ pub enum Decide {
     Mono,
 }
 
+/// Where a session node runs when it is not on this computer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionTarget {
+    /// As written: "codespace" or "sandbox"; anything else is kept so validation can report it.
+    pub kind: String,
+    pub instance: TargetInstance,
+    /// Every other key of the target object, in written order, passed verbatim to
+    /// `sessions.start`'s target (branch, machine, cpus, memory, ttl, template, image, kit).
+    pub options: OrderedMap<Json>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum TargetInstance {
+    /// Absent or "new": a new instance for this node.
+    New,
+    /// `{"sameAs": "<session node id>"}`: the instance the session of that node ran on.
+    SameAs(NodeId),
+    /// Any other value, kept verbatim so validation reports it and a round trip keeps it.
+    Invalid(Json),
+}
+
+impl SessionTarget {
+    /// A short line for the board and the review: "Codespace (new)", "Sandbox (same as build)".
+    /// A kind this app does not know is shown as written, and a bad instance as "invalid".
+    pub fn summary(&self) -> String {
+        let kind = match self.kind.as_str() {
+            "codespace" => "Codespace",
+            "sandbox" => "Sandbox",
+            other => other,
+        };
+        match &self.instance {
+            TargetInstance::New => format!("{kind} (new)"),
+            TargetInstance::SameAs(id) => format!("{kind} (same as {id})"),
+            TargetInstance::Invalid(_) => format!("{kind} (invalid instance)"),
+        }
+    }
+}
+
+impl Serialize for SessionTarget {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = s.serialize_map(None)?;
+        map.serialize_entry("kind", &self.kind)?;
+        match &self.instance {
+            TargetInstance::New => {}
+            TargetInstance::SameAs(id) => {
+                map.serialize_entry("instance", &serde_json::json!({ "sameAs": id }))?
+            }
+            TargetInstance::Invalid(raw) => map.serialize_entry("instance", raw)?,
+        }
+        for (key, value) in self.options.iter() {
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
+    }
+}
+
 /// What a node is. The `type` tag and the fields sit next to the base fields in the JSON.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
+// A session carries every optional field, so it is much larger than the other kinds. Nodes are
+// few and always held in a Vec, and boxing a field would change the public shape.
+#[allow(clippy::large_enum_variant)]
 pub enum NodeKind {
     Schedule {
         schedule: Schedule,
@@ -260,6 +320,9 @@ pub enum NodeKind {
             serialize_with = "serialize_opt_number"
         )]
         timeout_minutes: Option<f64>,
+        /// Run in a cloud instance instead of on this computer.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        target: Option<SessionTarget>,
     },
     #[serde(rename_all = "camelCase")]
     Command {
@@ -708,6 +771,11 @@ pub struct NodeRun {
     /// resumed run continues in it instead of opening a new session and worktree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reuse_session_id: Option<String>,
+    /// The sessions this node had when the run was interrupted and that a resumed run does not
+    /// continue (it starts a new one). Kept so a cloud step can go on in the instance of its
+    /// earlier session and the report can list that instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupted_sessions: Option<Vec<String>>,
     /// Key order is kept as written (a prompt shows it), so this is not a serde_json map.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<OrderedMap<Json>>,
@@ -735,6 +803,7 @@ impl NodeRun {
             round: 1,
             session_id: None,
             reuse_session_id: None,
+            interrupted_sessions: None,
             output: None,
             error: None,
             decision: None,

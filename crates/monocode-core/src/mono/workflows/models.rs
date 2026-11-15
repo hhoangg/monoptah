@@ -153,12 +153,19 @@ fn catalog_model(m: crate::catalog::Model) -> CatalogModel {
 pub fn harnesses_used(w: &Workflow) -> Vec<Kind> {
     let mut kinds = Vec::new();
     for node in &w.nodes {
-        let NodeKind::Session { harness, model, .. } = &node.kind else {
+        let NodeKind::Session {
+            harness,
+            model,
+            target,
+            ..
+        } = &node.kind
+        else {
             continue;
         };
         let named = harness.as_deref().filter(|h| !h.is_empty());
         let owner = match (named, model.as_deref().filter(|m| !m.is_empty())) {
             (Some(h), _) => Kind::parse(h),
+            (None, _) if target.is_some() => Some(Kind::Claude),
             (None, Some(m)) => id_harness(m).and_then(Kind::parse),
             (None, None) => None,
         };
@@ -236,7 +243,7 @@ enum Resolved<'a> {
 }
 
 /// The harness part of a stored model id (`claude` of `claude:sonnet-5`), when it is a harness.
-fn id_harness(value: &str) -> Option<&str> {
+pub(super) fn id_harness(value: &str) -> Option<&str> {
     let (harness, rest) = value.split_once(':')?;
     (Kind::parse(harness).is_some() && !rest.is_empty()).then_some(harness)
 }
@@ -307,6 +314,7 @@ pub fn session_node_problem(node: &Node, catalog: &ModelCatalog) -> Option<Strin
         harness,
         model,
         effort,
+        target,
         ..
     } = &node.kind
     else {
@@ -314,6 +322,25 @@ pub fn session_node_problem(node: &Node, catalog: &ModelCatalog) -> Option<Strin
     };
     let nonempty = |v: &Option<String>| v.clone().filter(|v| !v.is_empty());
     let harness = nonempty(harness);
+    let cloud = target.is_some();
+    // A cloud step runs Claude only (validation reports any other harness or model owner), so
+    // there is nothing else to judge for it here; with no harness named it is judged as Claude,
+    // not as whatever the Mono itself runs.
+    if cloud
+        && (harness.as_deref().is_some_and(|h| h != "claude")
+            || nonempty(model)
+                .as_deref()
+                .and_then(id_harness)
+                .is_some_and(|h| h != "claude"))
+    {
+        return None;
+    }
+    // Claude runs in the instance, so a missing local Claude CLI is not a problem for it, and
+    // without the local list there is nothing to judge its model against.
+    if cloud && !catalog.usable("claude") {
+        return None;
+    }
+    let harness = harness.or_else(|| cloud.then(|| "claude".to_string()));
     if let Some(name) = &harness {
         if Kind::parse(name).is_none() || !catalog.usable(name) {
             return Some(format!("Provider \"{name}\" is not available. {PICK}"));

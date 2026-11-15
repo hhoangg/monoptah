@@ -55,7 +55,13 @@ pub(in crate::monos) fn node_summary(node: &Node) -> String {
     match &node.kind {
         NodeKind::Schedule { schedule } => schedule.label(),
         NodeKind::Manual => "Starts when you run it".into(),
-        NodeKind::Session { prompt, .. } => or(prompt, "No prompt yet"),
+        NodeKind::Session { prompt, target, .. } => {
+            let prompt = or(prompt, "No prompt yet");
+            match target {
+                Some(target) => format!("{} \u{b7} {prompt}", target.summary()),
+                None => prompt,
+            }
+        }
         NodeKind::Command { command, .. } => or(command, "No command yet"),
         NodeKind::AskMono { question, .. } => or(question, "No question yet"),
         NodeKind::If {
@@ -938,5 +944,53 @@ impl Render for Tip {
             .line_height(px(16.))
             .text_color(content(0.85))
             .child(self.0.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use monocode_core::mono::workflows::{
+        model::{Checkout, SessionTarget, TargetInstance},
+        ordered::OrderedMap,
+    };
+
+    fn session(target: Option<SessionTarget>) -> Node {
+        Node::new(
+            "build",
+            NodeKind::Session {
+                project: "{{inputs.project}}".into(),
+                prompt: "Build it\nthen test".into(),
+                checkout: Checkout::Root,
+                output: OrderedMap::new(),
+                harness: None,
+                model: None,
+                effort: None,
+                reuse_session: None,
+                nest_under: None,
+                timeout_minutes: None,
+                target,
+            },
+        )
+    }
+
+    #[test]
+    fn a_cloud_step_card_says_where_it_runs_before_its_prompt() {
+        assert_eq!(node_summary(&session(None)), "Build it");
+        let target = |instance| SessionTarget {
+            kind: "codespace".into(),
+            instance,
+            options: OrderedMap::new(),
+        };
+        assert_eq!(
+            node_summary(&session(Some(target(TargetInstance::New)))),
+            "Codespace (new) \u{b7} Build it"
+        );
+        assert_eq!(
+            node_summary(&session(Some(target(TargetInstance::SameAs(
+                "setup".into()
+            ))))),
+            "Codespace (same as setup) \u{b7} Build it"
+        );
     }
 }

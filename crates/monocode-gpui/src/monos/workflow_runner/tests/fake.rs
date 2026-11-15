@@ -31,6 +31,10 @@ pub(super) struct World {
     executor: Option<gpui::BackgroundExecutor>,
     inflight: usize,
     start_calls: usize,
+    /// The instance each cloud session runs on, by session id.
+    clouds: std::collections::HashMap<String, CloudInstanceInfo>,
+    /// Cloud instances created so far, to name the next.
+    made: usize,
     pub(super) max_inflight: usize,
     pub(super) starts: Vec<SessionRequest>,
     pub(super) sends: Vec<(String, String)>,
@@ -86,6 +90,16 @@ impl FakeHost {
         let (hold, rx) = self.gate();
         self.0.borrow_mut().start_gate = Some((n, rx));
         hold
+    }
+    /// A session of an earlier execution of the run, on an instance the host knows.
+    pub(super) fn knows_cloud(&self, session: &str, kind: &str, name: &str) {
+        self.0.borrow_mut().clouds.insert(
+            session.into(),
+            CloudInstanceInfo {
+                kind: kind.into(),
+                name: Some(name.into()),
+            },
+        );
     }
     pub(super) fn answer(&self, reply: Result<String, String>) {
         self.0.borrow_mut().answers.push_back(Some(reply));
@@ -186,6 +200,24 @@ impl WorkflowHost for FakeHost {
             let id = {
                 let mut w = host.0.borrow_mut();
                 let id = format!("s{}", w.sessions.len() + 1);
+                if let Some(cloud) = &req.target {
+                    let info = match &cloud.instance {
+                        CloudInstance::New => {
+                            w.made += 1;
+                            CloudInstanceInfo {
+                                kind: cloud.kind.clone(),
+                                name: Some(format!("{}-{}", cloud.kind, w.made)),
+                            }
+                        }
+                        CloudInstance::OfSession(other) => {
+                            w.clouds.get(other).cloned().unwrap_or(CloudInstanceInfo {
+                                kind: cloud.kind.clone(),
+                                name: None,
+                            })
+                        }
+                    };
+                    w.clouds.insert(id.clone(), info);
+                }
                 w.sessions.push(Sess {
                     id: id.clone(),
                     cwd: req.project.clone(),
@@ -260,6 +292,10 @@ impl WorkflowHost for FakeHost {
                 harness: "claude".into(),
                 model: Some("claude:x".into()),
             })
+    }
+
+    fn cloud_instance(&self, session_id: &str) -> Option<CloudInstanceInfo> {
+        self.0.borrow().clouds.get(session_id).cloned()
     }
 
     fn run_command(

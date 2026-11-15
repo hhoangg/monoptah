@@ -15,6 +15,7 @@ use monocode_core::mono::workflows::{
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 
+mod cloud;
 mod fake;
 mod real;
 use fake::*;
@@ -165,6 +166,34 @@ fn a_session_not_seen_working_is_given_up_on_unless_it_failed_to_start() {
             .status,
         Status::Completed
     );
+}
+
+#[test]
+fn a_cloud_session_that_is_still_starting_is_waited_for_without_end() {
+    use crate::conversation::{TurnEnd, WorkflowTurn};
+    use host::{Seen, look};
+    let idle = || {
+        Seen::Over(WorkflowTurn {
+            end: TurnEnd::Completed,
+            reply: String::new(),
+        })
+    };
+    let (mut armed, mut unstarted) = (false, 0);
+    // Far more looks than the patience for a turn that never begins, all while the start runs.
+    for _ in 0..500 {
+        assert_eq!(look(Seen::Starting, &mut armed, &mut unstarted), None);
+    }
+    assert!(!armed, "a start is not a turn");
+    // Once it is over the usual patience for the turn to appear begins from nothing.
+    for _ in 0..10 {
+        assert_eq!(look(idle(), &mut armed, &mut unstarted), None);
+    }
+    // A start that comes round again (a retry) gives the patience back.
+    assert_eq!(look(Seen::Starting, &mut armed, &mut unstarted), None);
+    for _ in 0..10 {
+        assert_eq!(look(idle(), &mut armed, &mut unstarted), None);
+    }
+    assert!(look(idle(), &mut armed, &mut unstarted).is_some());
 }
 
 // --- the primitives -------------------------------------------------------------------------

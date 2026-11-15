@@ -1506,6 +1506,12 @@ pub fn mark_interrupted(run: &WorkflowRun) -> WorkflowRun {
         // From round 2 on the node continues the loop session; a first round starts fresh.
         let session = n.session_id.take();
         let reuse = n.reuse_session_id.take();
+        if let Some(id) = session.as_ref().filter(|id| !id.is_empty()) {
+            let kept = n.interrupted_sessions.get_or_insert_with(Vec::new);
+            if !kept.contains(id) {
+                kept.push(id.clone());
+            }
+        }
         n.started_at = None;
         n.reuse_session_id = if n.round > 1 { session.or(reuse) } else { None };
         n.status = NodeStatus::Pending;

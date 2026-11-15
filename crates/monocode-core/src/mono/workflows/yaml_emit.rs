@@ -15,6 +15,8 @@ pub enum Doc {
     Quoted(String),
     Num(f64),
     Bool(bool),
+    /// An explicit `null`, kept so a value that was written as null reads back as null.
+    Null,
     Map(Vec<(String, Doc)>),
     Seq(Vec<Doc>),
 }
@@ -26,6 +28,7 @@ impl Doc {
             Doc::Str(s) | Doc::Quoted(s) => Json::String(s.clone()),
             Doc::Num(n) => Json::Number(*n),
             Doc::Bool(b) => Json::Bool(*b),
+            Doc::Null => Json::Null,
             Doc::Seq(items) => Json::Array(items.iter().map(Doc::to_json).collect()),
             Doc::Map(entries) => {
                 let mut map = OrderedMap::new();
@@ -80,6 +83,7 @@ fn node(doc: &Doc, indent: &str) -> String {
         Doc::Quoted(s) => double_quoted(s, Ctx { indent, key: false }),
         Doc::Num(n) => number(*n),
         Doc::Bool(b) => b.to_string(),
+        Doc::Null => "null".into(),
     }
 }
 

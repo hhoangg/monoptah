@@ -80,6 +80,35 @@ pub(crate) struct SessionRequest {
     pub parent_session_id: Option<String>,
     pub folder_id: Option<String>,
     pub folder_name: Option<String>,
+    /// `Some` for a cloud step: the session runs in a codespace or sandbox instead of here.
+    pub target: Option<CloudRequest>,
+}
+
+/// The cloud instance a step asks for, with its instance already resolved by the run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CloudRequest {
+    /// `codespace` or `sandbox`.
+    pub kind: String,
+    pub instance: CloudInstance,
+    /// The other keys of the node's target (branch, machine, ...), passed on as written.
+    pub options: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CloudInstance {
+    /// Create one.
+    New,
+    /// The instance the session runs on, by persisted session id.
+    OfSession(String),
+}
+
+/// The cloud instance a session runs on, for the report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CloudInstanceInfo {
+    /// `codespace` or `sandbox`.
+    pub kind: String,
+    /// `None` while the instance is still being created and has no name yet.
+    pub name: Option<String>,
 }
 
 pub(crate) struct StartedSession {
@@ -146,6 +175,11 @@ pub(crate) trait WorkflowHost {
     /// The run is done with the session: whatever the host kept to watch it can go.
     fn release_session(&self, session_id: &str);
     fn session_info(&self, session_id: &str) -> Option<SessionInfo>;
+    /// The cloud instance the session runs on; `None` for a session on this computer. Reads the
+    /// store only: it never wakes, starts or asks the provider anything.
+    fn cloud_instance(&self, _session_id: &str) -> Option<CloudInstanceInfo> {
+        None
+    }
     /// Runs a shell command; `id` names it for `cancel_command` while it runs.
     fn run_command(
         &self,

@@ -86,6 +86,7 @@ pub(in crate::monos) fn session_detail(preview: &ImportPreview, node: &Node) -> 
         model,
         effort,
         checkout,
+        target,
         ..
     } = &node.kind
     else {
@@ -120,6 +121,9 @@ pub(in crate::monos) fn session_detail(preview: &ImportPreview, node: &Node) -> 
         parts.push(format!("Effort: {}", visible(effort)));
     }
     parts.push(format!("Checkout: {where_}"));
+    if let Some(target) = target {
+        parts.push(format!("Runs in: {}", visible(&target.summary())));
+    }
     Some(parts.join(" \u{b7} "))
 }
 
