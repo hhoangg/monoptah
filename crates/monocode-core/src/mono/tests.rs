@@ -615,15 +615,19 @@ fn terminal_actions_are_documented_validated_and_captioned() {
             "{action} has no caption"
         );
     }
-    assert!(bridge::HELP.contains("only after the user approves it"));
-    assert!(bridge::HELP.contains("The user declined this command"));
     assert!(bridge::HELP.contains("use key for control keys"));
+    assert!(!bridge::HELP.contains("Allow it for you"));
+    assert!(!bridge::HELP.contains("The user declined this command"));
+    assert!(bridge::HELP.contains("place:\"dock\"|\"tab\"|\"split\""));
+    assert!(bridge::HELP.contains("may only call terminals.list and terminals.read"));
     for (action, input) in [
         ("terminals.list", json!({"project": "/p"})),
         (
             "terminals.open",
             json!({"label": "BE", "action": "a1", "place": "split", "beside": "t-1", "direction": "down", "reveal": true, "cwd": "src", "project": "/p"}),
         ),
+        ("terminals.open", json!({"label": "BE", "place": "tab"})),
+        ("terminals.open", json!({"label": "BE", "place": "dock"})),
         ("terminals.send", json!({"id": "t-1", "key": "ctrl-c"})),
         ("terminals.read", json!({"id": "t-1", "lines": 50})),
         ("terminals.stop", json!({"id": "t-1"})),
@@ -655,14 +659,15 @@ fn terminal_actions_are_documented_validated_and_captioned() {
     assert!(crate::app_access::validate_operator("terminals.list", &json!({})).is_err());
     let rules = instructions(&Mono::default(), std::path::Path::new("/bin/app"));
     assert!(rules.contains("terminals.open") && rules.contains("agent CLI"));
-    // The approval is explained, and a saved action is the way that needs none.
-    assert!(rules.contains("Prefer a saved Project Action"));
-    assert!(rules.contains("that exact string, byte for byte"));
-    assert!(rules.contains("do not retry the same or a disguised command"));
+    // Free input has no approval; the scope rule and where it can be placed are said.
+    assert!(rules.contains("with no approval"));
+    assert!(rules.contains("inside the project or one of its git worktrees"));
+    assert!(rules.contains("place \"dock\""));
+    assert!(!rules.contains("Allow this command"));
 }
 
 #[test]
-fn terminal_input_is_capped_and_the_bridge_waits_for_the_user_not_longer() {
+fn terminal_input_is_capped() {
     use serde_json::json;
     let big = "x".repeat(api::TERMINAL_INPUT_MAX + 1);
     let fits = "x".repeat(api::TERMINAL_INPUT_MAX);
@@ -677,63 +682,18 @@ fn terminal_input_is_capped_and_the_bridge_waits_for_the_user_not_longer() {
         bad[field] = json!(big);
         assert!(api::validate(action, &bad).unwrap_err().contains("4096"));
     }
-    // The call waits on a person, so the bridge outlasts the approval and never gives up first.
-    for action in ["terminals.open", "terminals.send"] {
-        assert!(bridge::wait_for(action) > bridge::APPROVAL_WAIT, "{action}");
-    }
-    assert_eq!(bridge::wait_for("terminals.read").as_secs(), 60);
-    assert_eq!(bridge::wait_for("sessions.list").as_secs(), 60);
 }
 
 #[test]
-fn a_monos_terminal_allow_list_is_exact_per_project_and_kind_capped_and_persisted() {
-    const P: &str = "/work/app";
-    let mut mono = Mono::default();
-    assert!(!mono.allows_terminal(P, "command", "npm test"));
-    assert!(mono.allow_terminal(P, "command", "npm test"));
-    assert!(
-        !mono.allow_terminal(P, "command", "npm test"),
-        "no duplicates"
-    );
-    assert!(mono.allows_terminal(P, "command", "npm test"));
-    for near in ["npm test ", " npm test", "npm  test", "NPM test", "npm"] {
-        assert!(!mono.allows_terminal(P, "command", near), "{near:?}");
-    }
-    // A command is not text, another project is not this one, another Mono has its own list.
-    assert!(!mono.allows_terminal(P, "text", "npm test"));
-    assert!(!mono.allows_terminal("/work/other", "command", "npm test"));
-    assert!(!Mono::default().allows_terminal(P, "command", "npm test"));
-    // The project is compared by its path key: a trailing slash is the same project.
-    assert!(mono.allows_terminal("/work/app/", "command", "npm test"));
-    // Older rosters have no list; an empty one stays out of the file.
-    let empty: Mono = serde_json::from_str(r#"{"id":"a"}"#).unwrap();
-    assert!(empty.terminal_allow.is_empty());
-    assert!(!serde_json::to_string(&empty)
+fn a_roster_saved_with_a_terminal_allow_list_still_loads_and_drops_it() {
+    let old: Mono = serde_json::from_str(
+        r#"{"id":"a","name":"N","terminalAllow":["v2\u001f/work/app\u001fcommand\u001fnpm test"]}"#,
+    )
+    .unwrap();
+    assert_eq!((old.id.as_str(), old.name.as_str()), ("a", "N"));
+    assert!(!serde_json::to_string(&old)
         .unwrap()
         .contains("terminalAllow"));
-    let back: Mono = serde_json::from_str(&serde_json::to_string(&mono).unwrap()).unwrap();
-    assert!(back.allows_terminal(P, "command", "npm test"));
-    for n in 0..(TERMINAL_ALLOW_MAX + 5) {
-        mono.allow_terminal(P, "command", &format!("c{n}"));
-    }
-    assert_eq!(mono.terminal_allow.len(), TERMINAL_ALLOW_MAX);
-    assert!(
-        !mono.allows_terminal(P, "command", "npm test"),
-        "oldest first"
-    );
-    assert!(mono.allows_terminal(P, "command", &format!("c{}", TERMINAL_ALLOW_MAX + 4)));
-}
-
-#[test]
-fn an_allow_entry_saved_before_projects_were_part_of_the_key_matches_nothing_and_is_dropped() {
-    let mut old: Mono =
-        serde_json::from_str(r#"{"id":"a","terminalAllow":["command:npm test","text:y"]}"#)
-            .unwrap();
-    assert!(!old.allows_terminal("/work/app", "command", "npm test"));
-    assert!(!old.allows_terminal("", "command", "npm test"));
-    assert!(!old.allows_terminal("/work/app", "text", "y"));
-    assert!(old.allow_terminal("/work/app", "command", "ls"));
-    assert_eq!(old.terminal_allow.len(), 1, "old entries are dropped");
 }
 
 #[test]

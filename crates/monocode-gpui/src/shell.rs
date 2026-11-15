@@ -63,9 +63,7 @@ mod project_rail;
 mod project_removal;
 pub(crate) use project_removal::FilesOutcome;
 mod cloud_workspaces;
-mod mono_approval;
 mod mono_terminals;
-pub(crate) use mono_terminals::{MonoTerminalReply, Via as MonoTerminalVia};
 mod project_cloud;
 mod project_settings;
 mod provider_prompt;
@@ -1002,8 +1000,9 @@ pub(crate) struct Shell {
     terminal_pane_views: HashMap<i64, Entity<Terminal>>,
     /// Ids of the terminals a Mono may drive (`terminals.*`), over the dock and the panes.
     mono_registry: mono_terminals::Registry,
-    /// Free commands and typed text a Mono asked for, waiting for the user's answer.
-    mono_approvals: mono_approval::Approvals,
+    /// A `terminals.*` call selected another title tab: the keyboard must leave what that tab
+    /// hides (see `settle_mono_focus`).
+    mono_switched: bool,
     /// A project's dock sliding open (toward 1) or shut (toward 0).
     dock_slide: Option<(String, PaneSlide)>,
     dock_resize: Option<(f32, f32)>,
@@ -1479,7 +1478,7 @@ impl Shell {
             terminals: HashMap::new(),
             terminal_pane_views: HashMap::new(),
             mono_registry: Default::default(),
-            mono_approvals: Default::default(),
+            mono_switched: false,
             dock_slide: None,
             dock_resize: None,
             dock_hover: None,
@@ -3588,41 +3587,13 @@ impl Shell {
             .unwrap_or_else(|| self.working_copy().to_owned())
     }
     fn spawn_terminal(&mut self, cwd: String, cx: &mut Context<Self>) -> Entity<Terminal> {
-        self.spawn_terminal_as(cwd, false, cx)
-    }
-    /// A shell a Mono drives (`private`) keeps no command history (see `Terminal::new_private`).
-    fn spawn_terminal_as(
-        &mut self,
-        cwd: String,
-        private: bool,
-        cx: &mut Context<Self>,
-    ) -> Entity<Terminal> {
-        let terminal = cx.new(|cx| {
-            if private {
-                Terminal::new_private(cwd, cx)
-            } else {
-                Terminal::new(cwd, cx)
-            }
-        });
-        self.observations.push(cx.subscribe(
-            &terminal,
-            |this, terminal, event: &TerminalEvent, cx| {
-                if *event == TerminalEvent::RunAgain {
-                    this.run_again_clicked(&terminal, cx);
-                }
-                cx.notify();
-            },
-        ));
+        let terminal = cx.new(|cx| Terminal::new(cwd, cx));
+        self.observations
+            .push(cx.subscribe(&terminal, |_, _, _: &TerminalEvent, cx| cx.notify()));
         terminal
     }
     /// A restored dock reopens its tabs as fresh shells once it is shown.
     fn ensure_terminals(&mut self, project: &str, cx: &mut Context<Self>) {
-        self.ensure_terminals_through(project, usize::MAX, cx);
-    }
-    /// Spawns the saved dock shells up to and including tab `last`. The live shells are a
-    /// prefix of the dock's tabs (tab positions are shared), so a caller that needs only the
-    /// first few leaves the later ones unspawned until they are shown.
-    fn ensure_terminals_through(&mut self, project: &str, last: usize, cx: &mut Context<Self>) {
         if project.starts_with("remote://") {
             return;
         }
@@ -3630,22 +3601,9 @@ impl Shell {
             return;
         };
         let wanted = dock.terminals.clone();
-        let metas = dock.mono_terminals.clone();
         let have = self.terminals.get(project).map_or(0, Vec::len);
-        for (ix, cwd) in wanted.into_iter().enumerate().skip(have) {
-            if ix > last {
-                break;
-            }
-            let by_mono = matches!(metas.get(ix), Some(Some(_)));
-            let terminal = self.spawn_terminal_as(cwd, by_mono, cx);
-            if let Some(Some(meta)) = metas.get(ix) {
-                Self::restore_mono_terminal(
-                    &terminal,
-                    Some(meta.label.clone()),
-                    meta.run.clone(),
-                    cx,
-                );
-            }
+        for cwd in wanted.into_iter().skip(have) {
+            let terminal = self.spawn_terminal(cwd, cx);
             self.terminals
                 .entry(project.to_owned())
                 .or_default()
@@ -6136,23 +6094,6 @@ impl Shell {
                         .disabled(count < 2 && !closable)
                         .into(),
                 ];
-                if let TitleTab::Session(id) = &tab {
-                    let focus = self.workspace.tab_focus(*id);
-                    if let Some(view) = self
-                        .terminal_pane_views
-                        .get(&focus)
-                        .filter(|_| self.workspace.terminal_panes.contains_key(&focus))
-                        .filter(|view| Self::offers_mono_read(view.read(cx)))
-                    {
-                        items.splice(
-                            0..0,
-                            [
-                                Self::mono_read_item(view, view.read(cx).mono_read),
-                                MenuItem::Separator,
-                            ],
-                        );
-                    }
-                }
                 // Closing a tab keeps its session; archive also hides it from
                 // the active history while preserving everything on disk.
                 if let Some(id) = tab.session().filter(|id| {
@@ -6545,12 +6486,6 @@ impl Shell {
     ) {
         if let MenuTarget::Tab(id) = target {
             match action {
-                other if Self::mono_read_target(other).is_some() => {
-                    if let Some(entity) = Self::mono_read_target(other) {
-                        self.toggle_mono_read(entity, cx);
-                    }
-                    return;
-                }
                 "archive" => return self.toggle_archive(id, cx),
                 "delete" => return self.confirm_delete_session(id, window, cx),
                 _ => {}
@@ -9943,9 +9878,6 @@ impl Render for Shell {
                 if this.cancel_classic_sidebar_tab(cx) {
                     return;
                 }
-                if this.deny_front_mono_approval(window, cx) {
-                    return;
-                }
                 if this.dismiss_overlay(window, cx) {
                     return;
                 }
@@ -10251,7 +10183,6 @@ impl Render for Shell {
             .children(self.remote_project_modal(window, cx))
             .children(self.provider_prompt_modal(window, cx))
             .children(self.notice_modals(window, cx))
-            .children(self.mono_approval_modal(window, cx))
             .children(self.folder_picker_popover(window, cx))
             .children(crate::accounts::get(cx))
             .children(

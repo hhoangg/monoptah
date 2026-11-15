@@ -10,9 +10,8 @@ pub const TERMINAL_INPUT_MAX: usize = 4096;
 pub const TERMINAL_LAYOUT_MAX: usize = 6;
 
 /// A character that draws nothing or changes how the text around it reads: a control, a
-/// format character (Unicode Cf: zero width, direction changing, soft hyphen, tags), a
-/// filler (Hangul, Braille blank) or a variation-selector-like invisible. Labels refuse
-/// these; accents (combining marks) are fine there.
+/// format character (Unicode Cf: zero width, direction changing, soft hyphen, tags) or a
+/// filler (Hangul, Braille blank). Labels refuse these; accents (combining marks) are fine.
 pub fn is_format_char(c: char) -> bool {
     c.is_control()
         || matches!(
@@ -26,17 +25,6 @@ pub fn is_format_char(c: char) -> bool {
                 | '\u{fff9}'..='\u{fffb}'
                 | '\u{e0000}'..='\u{e007f}'
         )
-}
-
-/// A character a person reading a dialog cannot see as itself: everything `is_format_char`
-/// names, plus non-ASCII spaces, variation selectors and any zero-width mark (combining marks).
-pub fn is_hidden_char(c: char) -> bool {
-    use unicode_width::UnicodeWidthChar;
-    is_format_char(c)
-        || (!c.is_ascii()
-            && (c.is_whitespace()
-                || matches!(c, '\u{a0}' | '\u{fe00}'..='\u{fe0f}' | '\u{e0100}'..='\u{e01ef}')
-                || c.width() == Some(0)))
 }
 
 /// Reject misspelled fields and ambiguous types before any app mutation.
@@ -204,7 +192,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
     {
         return Err("removeWorktree and cloud cannot be combined; choose one per call".into());
     }
-    // What a Mono types into a terminal is shown to the user whole, so it stays small.
+    // What a Mono types into a terminal stays small.
     if action == "terminals.layout" {
         if !matches!(input["preset"].as_str(), Some("columns" | "rows" | "grid")) {
             return Err("preset must be \"columns\", \"rows\" or \"grid\"".into());
@@ -354,16 +342,12 @@ mod tests {
             '\u{7}',
             '\u{85}',
         ] {
-            assert!(is_format_char(c) && is_hidden_char(c), "{:x}", c as u32);
+            assert!(is_format_char(c), "{:x}", c as u32);
         }
-        // Combining marks, variation selectors and odd spaces are hidden in a dialog, but a
-        // label may carry an accent.
-        for c in ['\u{301}', '\u{fe0f}', '\u{a0}', '\u{2003}', '\u{3000}'] {
-            assert!(is_hidden_char(c), "{:x}", c as u32);
-        }
+        // A label may carry an accent or an ideographic space.
         assert!(!is_format_char('\u{301}') && !is_format_char('\u{3000}'));
         for c in ['a', ' ', 'é', 'ệ', '日', '😀', '-', '\\', '·'] {
-            assert!(!is_hidden_char(c) && !is_format_char(c), "{c}");
+            assert!(!is_format_char(c), "{c}");
         }
     }
     #[test]

@@ -14,21 +14,6 @@ use std::{
     time::Duration,
 };
 
-/// How long the user has to answer an approval dialog (`terminals.open command`,
-/// `terminals.send text`). The app answers the call with an error when it runs out, and the
-/// bridge waits a little longer than that ([`wait_for`]), so an approval can never be given
-/// after the Mono stopped waiting and then run late.
-pub const APPROVAL_WAIT: Duration = Duration::from_secs(90);
-
-/// How long the bridge waits for the app's answer to `action`.
-pub fn wait_for(action: &str) -> Duration {
-    if matches!(action, "terminals.open" | "terminals.send") {
-        APPROVAL_WAIT + Duration::from_secs(10)
-    } else {
-        Duration::from_secs(60)
-    }
-}
-
 pub const HELP: &str = r#"Monoptah app access
 Usage: monocode-gpui app ACTION --json '{...}' [--request-id ID]
 Pass --input FILE or --input - to read a JSON object instead.
@@ -73,12 +58,13 @@ sessions.delete removeWorktree: true also removes the session's own worktree (th
 sessions.delete providerFiles: true also removes the session's provider session files from disk (Claude Code and Codex only). It is irreversible; use it only for sessions the user clearly asked about. The call then waits and reports providerFiles "removed", "none" (nothing to remove, for example a harness with no cleanup) or "failed" with problems (a removal failed, or files were kept on purpose, such as a Codex thread another conversation continues from), in which case the session is deleted and some files may remain. Without it, the session's files stay and the result is {accepted:true}. Deleting a folder's last session removes the folder; an archived session keeps it.
 worktrees.list {project?}
 worktrees.create {branch,base?,existing?,project?}
-terminals.list {project?}: the project's terminals you may see: [{id,label,cwd,place:"dock"|"split"|"tab",running,exited,exitCode,owner:"mono"|"user"}]. Ids are opaque (like t-3fa9-1) and only valid until the app restarts. Mono only.
-terminals.open {label,action?,command?,cwd?,place?:"dock"|"split",beside?,direction?:"right"|"down",reveal?,project?}: opens a terminal named label (up to 40 characters) in the project and returns {id,reused}. action is the id of a Project Action the user saved; it runs there without asking. command is a free shell command (up to 4096 bytes, no control characters; give action or command, not both): it is typed into the terminal and Enter is pressed, but only after the user approves it in a dialog that shows the exact command, the terminal's label, the program in front and its directory. Approving RUNS it. The user may Run it once, Allow it for you (that exact string, byte for byte, then runs without asking), or Deny it (the call fails with "The user declined this command"). The call waits for that answer for up to 90 seconds, then fails and nothing runs; it never runs late. Prefer action. Without action or command it opens a plain shell. place defaults to the user's terminal setting; split puts it as a pane beside the terminal id in beside (else into your Logs tab of the project, else into a title tab of its own that becomes the Logs tab; the user's chat tabs are never split), direction right (default) or down, so BE and FE can sit side by side. An idle terminal of yours with the same label, standing in the folder you asked for (the project's by default), is reused (reused:true). A multi-line command is refused (a new terminal has not asked for bracketed paste). cwd must stay inside the project or one of its worktrees. beside must be one of your own terminals. Omitted, reveal shows the terminal only if that needs no navigation: a dock terminal opens the dock, a pane shows only when its tab is the one the user is looking at; a new Logs tab is added to the tab strip without being selected and the answer says revealed:false. reveal:true may select that tab (never another project) and then the keyboard goes to the app, not the terminal. The answer says revealed:false whenever it could not show it (another project, a tab left unselected, or a dock terminal while the user keeps terminals in the right panel). The answer is {id,reused,place} with place dock, tab or split.
-terminals.send {id,text?,key?,project?}: types into a terminal you opened (never one that runs an agent CLI); give text, key or both. key is one of ctrl-c, enter, up, down, q, tab, esc. ctrl-c and q need no approval and work anywhere. up, down, tab and esc always wait for the user's approval, whatever runs in the terminal (they recall history and complete lines, and a wrapper such as uv run python or docker exec -it hides a REPL): the dialog names the key, the terminal and its program, and shows the last lines on screen; it offers Run once or Deny only, never Allow for this Mono, so each press asks again. A call with text and one of these keys is approved in one dialog. enter is free only in front of a plain program (not a shell, remote shell, multiplexer or history-keeping REPL such as ssh, tmux, sudo, bash, zsh, python, node, psql); at a shell prompt it is accepted only together with approved text in the same call (text plus key enter), which is how a command is run there. text (up to 4096 bytes) is typed exactly as given and no Enter is added: follow it with key enter in the same call (the text is typed first, then the key) or in the next call to run it. text may contain \n but no other control character, tab included (use key for those; the call fails with "use key for control keys"). Text with a line break is sent as one bracketed paste when the program has turned that on, else it is refused (a line break would run each line as it arrives). The dialog names the program in front; if that, the folder or the paste mode changed after the dialog was shown, nothing is written. Only one request of yours may wait for an answer at a time: a second one is refused until the first is answered. Like command, text needs the user's approval (Run, Allow this text for you, Deny): typing at a shell and pressing Enter runs it. It waits up to 90 seconds, is cancelled if the user stops your turn, and never runs late.
-terminals.read {id,lines?,project?}: {text,truncated,running,exited,exitCode}, the last lines (default 200, at most 1000) of the terminal's output, secrets masked. A terminal the user opened can be read only if they turned on Let Mono read for it.
-terminals.layout {preset:"columns"|"rows"|"grid",ids,reveal?,project?}: arranges 1 to 6 of your terminals (ids from terminals.list or terminals.open, no repeats, all yours) into ONE title tab named "Logs <project>" and returns {tab,ids}. columns puts them side by side, rows stacks them, grid uses two columns filled left to right; every part gets the same size. Terminals in the dock leave it and become panes; panes from other tabs move in; an existing Logs tab of yours is reused and its other panes become tabs of their own. It never moves the keyboard focus; reveal follows the rules of terminals.open (omitted, it selects the tab only if it is already the visible one). Use it to show BE and FE side by side. After the app restarts your terminals come back stopped: terminals.list shows them and terminals.open with the same label reuses them (an action runs again; a free command asks the user again).
+terminals.list {project?}: the project's terminals: [{id,label,cwd,place:"dock"|"tab"|"split",running,exited,exitCode,owner:"mono"|"user"}], yours and the ones the user opened (never one that runs an agent CLI, a login or a cloud shell). Ids are opaque (like t-3fa9-1) and only valid until the app restarts; terminals are not saved, so after a restart they are gone. Mono only (a session may call terminals.list and terminals.read, see below).
+terminals.open {label,action?,command?,cwd?,place?:"dock"|"tab"|"split",beside?,direction?:"right"|"down",reveal?,project?}: opens a terminal named label (up to 40 characters) in the project and returns {id,reused,place}. action is the id of a Project Action the user saved. command is a free shell command (up to 4096 bytes, no control characters; give action or command, not both): it is typed into the terminal and Enter is pressed at once, with no approval; its only limit is that cwd stays inside the project or one of its git worktrees. Without action or command it opens a plain shell. place: dock is a tab of the project's terminal dock, tab is a title tab of its own, split is a pane beside the terminal in beside (else in your Logs tab of the project, else a title tab of its own that becomes the Logs tab; the user's chat tabs are never split) with direction right (default) or down, so BE and FE can sit side by side; omitted, it follows the user's terminal setting. An idle terminal of yours with the same label, standing in the folder you asked for (the project's by default), is reused (reused:true). A multi-line command is refused (a new terminal has not asked for bracketed paste). cwd must stay inside the project or one of its worktrees. beside must be one of your own terminals. Omitted, reveal shows the terminal only if that needs no navigation: a dock terminal opens the dock, a pane shows only when its tab is the one the user is looking at; a new tab is added to the tab strip without being selected and the answer says revealed:false. reveal:true may select that tab (never another project) and then the keyboard goes to the app, not the terminal. The answer says revealed:false whenever it could not show it (another project, a tab left unselected, or a dock terminal while the user keeps terminals in the right panel). The answer's place is dock, tab or split.
+terminals.send {id,text?,key?,project?}: types into a terminal you opened (never one that runs an agent CLI), at once and with no approval; give text, key or both. The terminal must be in the project or one of its git worktrees: the check uses the terminal's live folder when the system can tell it (a cd inside the shell counts), else the folder it started in, and a terminal outside is refused. key is one of ctrl-c, enter, up, down, q, tab, esc. text (up to 4096 bytes) is typed exactly as given and no Enter is added: follow it with key enter in the same call (the text is typed first, then the key) or in the next call to run it. text may contain \n but no other control character, tab included (use key for those; the call fails with "use key for control keys"). Text with a line break is sent as one bracketed paste when the program has turned that on, else it is refused (a line break would run each line as it arrives).
+terminals.read {id,lines?,project?}: {text,truncated,running,exited,exitCode}, the last lines (default 200, at most 1000, 32 KiB) of the terminal's output, secrets masked. It reads any terminal of the project, including ones the user opened.
+terminals.layout {preset:"columns"|"rows"|"grid",ids,reveal?,project?}: arranges 1 to 6 of your terminals (ids from terminals.list or terminals.open, no repeats, all yours, whether they are in the dock, in title tabs or in splits) into ONE title tab named "Logs <project>" and returns {tab,ids}. columns puts them side by side, rows stacks them, grid uses two columns filled left to right; every part gets the same size. Terminals in the dock leave it and become panes; panes from other tabs move in; an existing Logs tab of yours is reused and its other panes become tabs of their own. It never moves the keyboard focus; reveal follows the rules of terminals.open (omitted, it selects the tab only if it is already the visible one). Terminals are not saved: they are gone when the app restarts.
 terminals.stop {id,project?}: sends ctrl-c, then hangs up the foreground job after 3 seconds if it is still running; returns {stopping:true} at once. terminals.close {id,project?}: closes a terminal you opened.
+Sessions (ordinary coding sessions, with or without Operator) may only call terminals.list and terminals.read, read-only and limited to terminals in the session's own project and worktree; every other terminals.* action answers "Only a Mono can open or drive terminals".
 folders.list {project?}
 folders.move {sessionId,folderId?,newFolderName?,project?}
 notes.list {limit?,offset?}; notes.read {id}; notes.write {id?,title?,body?,tags?}
@@ -114,9 +100,6 @@ struct Wire {
     input: Value,
 }
 pub struct Call {
-    /// When the bridge received the call. A reply is only useful until `received + wait_for`,
-    /// and an approval must not run anything once its own wait ([`APPROVAL_WAIT`]) is over.
-    pub received: std::time::Instant,
     pub session: i64,
     pub request_id: String,
     pub action: String,
@@ -228,9 +211,7 @@ fn serve(
     }
     let (reply, result) = mpsc::channel();
     let request_id = wire.request_id;
-    let wait = wait_for(&wire.action);
     tx.send_blocking(Call {
-        received: std::time::Instant::now(),
         session: wire.session,
         request_id: request_id.clone(),
         action: wire.action,
@@ -238,7 +219,7 @@ fn serve(
         reply,
     })
     .map_err(|_| "App closed")?;
-    let response = match result.recv_timeout(wait) {
+    let response = match result.recv_timeout(Duration::from_secs(60)) {
         Ok(Ok(value)) => json!({"ok":true,"result":value,"requestId":request_id}),
         Ok(Err(error)) => json!({"ok":false,"error":error,"requestId":request_id}),
         Err(_) => {
@@ -317,7 +298,7 @@ fn call(action: String, input: Value, request_id: String) -> Result<Value, Strin
     let mut stream =
         TcpStream::connect_timeout(&endpoint, Duration::from_secs(3)).map_err(|e| e.to_string())?;
     stream
-        .set_read_timeout(Some(wait_for(&wire.action) + Duration::from_secs(5)))
+        .set_read_timeout(Some(Duration::from_secs(65)))
         .map_err(|e| e.to_string())?;
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
@@ -380,13 +361,6 @@ pub fn acp_server(
     Some(server)
 }
 
-/// How long a provider's MCP client waits for the app tool: longer than the slowest call the
-/// bridge waits for ([`wait_for`], an approval dialog), so the client never gives up on a call
-/// the user is still answering and the Mono retries it blindly.
-pub fn mcp_tool_timeout() -> Duration {
-    wait_for("terminals.send") + Duration::from_secs(20)
-}
-
 pub fn configure_codex(
     command: &mut std::process::Command,
     mono: Option<&crate::agent::MonoContext>,
@@ -403,9 +377,6 @@ pub fn configure_codex(
         // projects. Without this, Codex's auto-review spends a model call
         // (~3s) approving each one.
         ("default_tools_approval_mode", json!("approve")),
-        // Codex gives a tool 60 seconds unless told otherwise; an approval dialog can take
-        // longer than that.
-        ("tool_timeout_sec", json!(mcp_tool_timeout().as_secs())),
     ] {
         // JSON's strings and arrays are valid TOML literals for these values.
         command.args(["-c", &format!("mcp_servers.{MCP_SERVER}.{key}={value}")]);
@@ -553,15 +524,6 @@ mod capability_tests {
         assert!(args.contains(
             &r#"mcp_servers.monocode_app.default_tools_approval_mode="approve""#.to_string()
         ));
-        // The tool outlasts the longest wait for the user's answer.
-        let timeout = args
-            .iter()
-            .find_map(|a| a.strip_prefix("mcp_servers.monocode_app.tool_timeout_sec="))
-            .expect("a tool timeout is set")
-            .parse::<u64>()
-            .unwrap();
-        assert!(timeout > wait_for("terminals.open").as_secs());
-        assert!(timeout > APPROVAL_WAIT.as_secs());
         let acp = acp_server(Some(&mono), &environment).unwrap();
         assert_eq!(acp["name"], MCP_SERVER);
         assert_eq!(acp["env"].as_array().unwrap().len(), 3);

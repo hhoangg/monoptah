@@ -105,8 +105,6 @@ impl Dimensions for GridSize {
 pub(crate) enum TerminalEvent {
     /// Title, foreground process or running state changed.
     Changed,
-    /// The user pressed "Run again" (see `run_again`); the shell runs the stored command.
-    RunAgain,
     /// A launched program is running. Only `Terminal::launch` emits the rest,
     /// from the event task, so subscribe right after creating the entity.
     Started { at: Instant },
@@ -161,15 +159,9 @@ pub(crate) struct Terminal {
     /// A name a Mono gave the terminal. It takes precedence over `title` wherever the title is
     /// shown (see `display_title`); runtime only.
     pub label: Option<String>,
-    /// The user allowed Mono to read this terminal's output ("Let Mono read"); runtime only.
-    pub(crate) mono_read: bool,
-    /// A Mono opened this terminal (also after a restart); it wears the Mono mark. Runtime only:
-    /// the saved state in `TerminalPane` / `TerminalDock` is what survives.
+    /// A Mono opened this terminal; it wears the Mono mark. Runtime only: a Mono's terminals
+    /// are not saved.
     pub(crate) by_mono: bool,
-    /// A command a Mono terminal ran before the app was restarted. It is only offered, as a
-    /// "Run again" bar, and never runs by itself. Cleared once anything runs here or the user
-    /// types.
-    pub(crate) run_again: Option<crate::workspace::SavedRun>,
     /// How the shell ended, once it has (`None` while it runs or when a signal killed it).
     pub(crate) exit_code: Option<i32>,
     /// A command other than the shell holds the terminal.
@@ -263,29 +255,6 @@ impl Plan {
             drain: false,
             verify: None,
         }
-    }
-    /// The login shell with no command history: a Mono must not recall (and so re-run, or read)
-    /// what the user typed in their own shells. Best effort: a startup file that sets
-    /// `HISTFILE` itself wins, which is why `terminals.send` also refuses the keys that
-    /// recall a line while the shell holds the terminal: history-off is best effort and
-    /// those key rules are the real defense.
-    ///
-    /// Only `HISTFILE` is set. `HISTFILESIZE=0` or `SAVEHIST=0` would make bash or zsh
-    /// truncate a `HISTFILE` that the user's startup file set, destroying their history.
-    fn shell_private() -> Self {
-        Self::private(Self::shell())
-    }
-    fn private(mut plan: Self) -> Self {
-        plan.env
-            .push(("HISTFILE".to_owned(), "/dev/null".to_owned()));
-        let stem = Path::new(&plan.program)
-            .file_stem()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
-        if stem == "fish" && !plan.args.iter().any(|a| a == "--private") {
-            plan.args.push("--private".to_owned());
-        }
-        plan
     }
     fn launch(
         program: OsString,
@@ -500,68 +469,12 @@ pub(crate) enum Front {
     Unknown,
 }
 
-/// Whether a foreground program name is itself a line editor with history: a shell, a remote
-/// or multiplexed shell, a privilege shell, or an interpreter REPL. Up, tab and enter in front
-/// of one recall and run lines nobody was shown, so the key rules treat it like a shell.
-/// Matches the basename, ignoring a login `-` prefix, `.exe` and version suffixes
-/// (`python3.12`, `ksh93`).
-pub(crate) fn shell_like(name: &str) -> bool {
-    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
-    let base = base.trim_start_matches('-').to_ascii_lowercase();
-    let base = base.strip_suffix(".exe").unwrap_or(&base);
-    let base = base.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
-    matches!(
-        base,
-        "ssh"
-            | "mosh"
-            | "mosh-client"
-            | "tmux"
-            | "screen"
-            | "sudo"
-            | "su"
-            | "bash"
-            | "zsh"
-            | "fish"
-            | "sh"
-            | "dash"
-            | "ksh"
-            | "tcsh"
-            | "csh"
-            | "nu"
-            | "pwsh"
-            | "powershell"
-            | "cmd"
-            | "python"
-            | "node"
-            | "nodejs"
-            | "irb"
-            | "psql"
-            | "mysql"
-            | "sqlite"
-            | "redis-cli"
-            | "ipython"
-    )
-}
-
 impl Front {
-    /// A program that holds the terminal and is not a line editor with history (see
-    /// `shell_like`): the only front where enter alone is free. (Up, down, tab and esc always
-    /// need approval, see `MonoKey::needs_approval`.)
-    pub(crate) fn is_plain_program(&self) -> bool {
-        matches!(self, Self::Program(name) if !shell_like(name))
-    }
     /// The supported agent CLI this front is, if any.
     pub(crate) fn agent(&self) -> Option<&'static str> {
         match self {
             Self::Program(label) => agent_cli(label),
             _ => None,
-        }
-    }
-    /// The name the approval dialog shows.
-    pub(crate) fn name(&self) -> &str {
-        match self {
-            Self::Shell(name) | Self::Program(name) => name,
-            Self::Unknown => "unknown",
         }
     }
 }
@@ -604,13 +517,6 @@ impl MonoKey {
             _ => return None,
         })
     }
-    /// Keys that recall history, complete a line or start a meta-key recall in a shell or a
-    /// REPL, and so lead to a line nobody was shown: each press waits for the user, whatever
-    /// holds the terminal (the process name cannot tell a REPL behind a wrapper such as
-    /// `uv run python` or `docker exec -it`).
-    pub(crate) fn needs_approval(self) -> bool {
-        matches!(self, Self::Up | Self::Down | Self::Tab | Self::Esc)
-    }
     pub(crate) fn bytes(self) -> &'static [u8] {
         match self {
             Self::CtrlC => b"\x03",
@@ -642,20 +548,12 @@ const GRID: GridSize = GridSize {
 
 impl Terminal {
     pub(crate) fn new(cwd: String, cx: &mut Context<Self>) -> Self {
-        Self::with_plan(cwd, Plan::shell(), cx)
-    }
-    /// A shell a Mono drives: it keeps no command history (see `Plan::shell_private`).
-    pub(crate) fn new_private(cwd: String, cx: &mut Context<Self>) -> Self {
-        Self::with_plan(cwd, Plan::shell_private(), cx)
-    }
-    fn with_plan(cwd: String, plan: Plan, cx: &mut Context<Self>) -> Self {
         let spawned = if cfg!(test) {
             // GPUI's deterministic test scheduler rejects wakeups from the
             // PTY thread; UI tests run the dock without a shell behind it.
-            let _ = plan;
             detached(GRID)
         } else {
-            spawn(&cwd, GRID, cx.entity_id().as_u64(), plan)
+            spawn(&cwd, GRID, cx.entity_id().as_u64(), Plan::shell())
         };
         Self::build(cwd, spawned, false, cx)
     }
@@ -783,9 +681,7 @@ impl Terminal {
             focus: cx.focus_handle(),
             title: default_title(&cwd),
             label: None,
-            mono_read: false,
             by_mono: false,
-            run_again: None,
             exit_code: None,
             cwd,
             foreground: None,
@@ -1104,7 +1000,6 @@ impl Terminal {
     /// Typing returns a scrolled-back view to the prompt.
     fn input(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
         self.user_typed = true;
-        self.run_again = None;
         self.stop_selection();
         {
             let mut term = self.term.lock();
@@ -1113,55 +1008,6 @@ impl Terminal {
         }
         self.write(bytes);
         cx.notify();
-    }
-    /// The "Run again" bar's button: asks the shell to run the stored command. The shell
-    /// decides how (one function shared with every other run, see `run_mono_input`).
-    fn request_run_again(&mut self, cx: &mut Context<Self>) {
-        if self.run_again.is_some() {
-            cx.emit(TerminalEvent::RunAgain);
-        }
-    }
-    /// The bar over a restored Mono terminal that names what it ran before.
-    fn run_again_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let run = self.run_again.as_ref()?;
-        let command: SharedString = run
-            .text
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_owned()
-            .into();
-        Some(
-            div()
-                .id("terminal-run-again-bar")
-                .debug_selector(|| "terminal-run-again-bar".into())
-                .absolute()
-                .top_2()
-                .right_2()
-                .max_w(px(480.))
-                .h(px(32.))
-                .pl_3()
-                .pr_1()
-                .flex()
-                .items_center()
-                .gap_2()
-                .rounded(px(9.))
-                .border_1()
-                .border_color(content(0.1))
-                .bg(floating_fill())
-                .shadow_md()
-                .text_size(px(12.))
-                .text_color(content(0.6))
-                // The click is the user's answer, not a click on the terminal.
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(div().min_w_0().truncate().child(command))
-                .child(
-                    crate::modal::ghost_button("terminal-run-again", "Run again")
-                        .debug_selector(|| "terminal-run-again".into())
-                        .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _, cx| this.request_run_again(cx))),
-                ),
-        )
     }
     /// Types `command` at the prompt and runs it. The footer names it at
     /// once; the foreground poll corrects the label within a second.
@@ -1529,7 +1375,6 @@ impl Render for Terminal {
             .key_context("Terminal")
             .track_focus(&self.focus)
             .size_full()
-            .relative()
             .cursor(gpui::CursorStyle::IBeam)
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 if this.hover != Some(event.position) {
@@ -1567,7 +1412,6 @@ impl Render for Terminal {
                 terminal: cx.entity(),
                 focused,
             })
-            .children(self.run_again_bar(cx))
             .children(self.editing_menu(cx))
     }
 }
@@ -3607,91 +3451,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn shell_like_programs_are_told_by_basename_and_version() {
-        for name in [
-            "ssh",
-            "-zsh",
-            "/bin/bash",
-            "python3.12",
-            "python3",
-            "ksh93",
-            "tmux",
-            "sudo",
-            "su",
-            "mosh",
-            "screen",
-            "fish",
-            "dash",
-            "tcsh",
-            "nu",
-            "pwsh",
-            "powershell",
-            "cmd.exe",
-            "node",
-            "irb",
-            "psql",
-            "mysql",
-            "sqlite3",
-            "redis-cli",
-            "ipython",
-            "ipython3",
-        ] {
-            assert!(shell_like(name), "{name}");
-        }
-        for name in [
-            "vim",
-            "less",
-            "top",
-            "htop",
-            "vite",
-            "manage.py",
-            "sleep",
-            "claude",
-            "cargo",
-        ] {
-            assert!(!shell_like(name), "{name}");
-        }
-        assert!(Front::Program("vim".into()).is_plain_program());
-        assert!(!Front::Program("ssh".into()).is_plain_program());
-        assert!(!Front::Shell("zsh".into()).is_plain_program());
-        assert!(!Front::Unknown.is_plain_program());
-    }
-
-    #[test]
-    fn a_mono_shell_is_started_without_command_history() {
-        let zsh = Plan::private(plain("/bin/zsh", &["-l"]));
-        assert!(
-            zsh.env
-                .contains(&("HISTFILE".to_owned(), "/dev/null".to_owned()))
-        );
-        // These would truncate a history file the user's own startup file chose.
-        for key in ["SAVEHIST", "HISTSIZE", "HISTFILESIZE"] {
-            assert!(
-                zsh.env.iter().all(|(k, _)| k != key),
-                "{key} must be absent"
-            );
-        }
-        assert_eq!(zsh.args, ["-l"]);
-        // fish keeps no history in a private session.
-        let fish = Plan::private(plain("/usr/bin/fish", &["-l"]));
-        assert_eq!(fish.args, ["-l", "--private"]);
-        let again = Plan::private(fish);
-        assert_eq!(again.args, ["-l", "--private"], "never added twice");
-        // The user's own shells are untouched.
-        assert!(Plan::shell().env.iter().all(|(k, _)| k != "HISTFILE"));
-    }
-
     #[cfg(unix)]
     #[test]
-    fn a_private_shell_has_no_history_file_and_the_pty_tells_who_holds_it() {
+    fn the_pty_tells_who_holds_the_terminal_and_where() {
         let dir = std::env::temp_dir().to_string_lossy().into_owned();
         let size = GridSize {
             columns: 80,
             lines: 10,
         };
-        // `sh` reads no startup file that could set the variables again.
-        let spawned = spawn(&dir, size, 2, Plan::private(plain("/bin/sh", &[])));
+        let spawned = spawn(&dir, size, 2, plain("/bin/sh", &[]));
         let sender = spawned.sender.clone().expect("the shell started");
         let screen = || {
             let term = spawned.term.lock();
@@ -3714,12 +3482,8 @@ mod tests {
             }
             false
         };
-        let _ = sender.send(Msg::Input(Cow::Borrowed(b"echo hist=$HISTFILE=\r")));
-        assert!(
-            wait_for(&|| screen().contains("hist=/dev/null=")),
-            "{}",
-            screen()
-        );
+        let _ = sender.send(Msg::Input(Cow::Borrowed(b"echo ready=$((40+2))\r")));
+        assert!(wait_for(&|| screen().contains("ready=42")), "{}", screen());
         // At the prompt the shell holds the terminal and its folder is the one it started in.
         assert!(matches!(
             live_front_of(spawned.master_fd, spawned.shell_pid),

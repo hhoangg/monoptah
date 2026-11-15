@@ -340,8 +340,7 @@ impl Shell {
             self.toggle_running_terminal(ix, window, cx);
         }
     }
-    pub(super) fn terminal_tab_menu(&self, ix: usize, cx: &App) -> Vec<MenuItem> {
-        let terminal = self.live_terminals().get(ix).cloned();
+    pub(super) fn terminal_tab_menu(&self, ix: usize) -> Vec<MenuItem> {
         let count = self
             .workspace
             .docks
@@ -352,17 +351,7 @@ impl Shell {
             MenuAction::new("close-others", "Close Others")
                 .disabled(count < 2 || ix >= count)
                 .into(),
-            MenuItem::Separator,
         ]
-        .into_iter()
-        // The item names this terminal, not the tab position: the tabs can move before it is
-        // chosen.
-        .chain(
-            terminal
-                .filter(|t| Self::offers_mono_read(t.read(cx)))
-                .map(|t| Self::mono_read_item(&t, t.read(cx).mono_read)),
-        )
-        .collect()
     }
     pub(super) fn run_terminal_tab_menu(
         &mut self,
@@ -374,11 +363,7 @@ impl Shell {
         match action {
             "close" => self.close_terminal(ix, window, cx),
             "close-others" => self.close_other_terminals(ix, window, cx),
-            other => {
-                if let Some(entity) = Self::mono_read_target(other) {
-                    self.toggle_mono_read(entity, cx);
-                }
-            }
+            _ => {}
         }
     }
     /// confirmCloseTerminals: the terminals still running something ask first.
@@ -1198,7 +1183,7 @@ impl Shell {
         match target {
             MenuTarget::TerminalTab(ix) => Some((
                 "File tab actions".into(),
-                self.terminal_tab_menu(*ix, cx),
+                self.terminal_tab_menu(*ix),
                 160.,
                 MenuStyle::Explorer,
             )),

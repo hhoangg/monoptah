@@ -77,29 +77,6 @@ pub struct Mono {
     /// The switch, frequency and selected packs of the shared emoji library.
     #[serde(skip_serializing_if = "emoji::MonoEmoji::is_default")]
     pub emoji: emoji::MonoEmoji,
-    /// Terminal input the user chose to let this Mono run without asking again: the exact
-    /// strings, each tagged with what it is (see [`terminal_allow_key`]). It lives here, with
-    /// the rest of the Mono's settings, so it survives a restart and goes away with the Mono.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub terminal_allow: Vec<String>,
-}
-
-/// How many remembered terminal inputs a Mono keeps; the oldest are forgotten first.
-pub const TERMINAL_ALLOW_MAX: usize = 100;
-
-/// Marks the stored form that names a project. Entries written before it (`kind:text`, with no
-/// project) match nothing and are dropped the next time the list changes.
-const TERMINAL_ALLOW_SCOPE: &str = "v2\u{1f}";
-
-/// The stored form of one remembered terminal input: the project (compared by its path key),
-/// `kind` ("command" for terminals.open, "text" for terminals.send) and the string byte for
-/// byte. Nothing is trimmed or normalized. The project is part of the key so that approving a
-/// string for one project does not approve it for another.
-pub fn terminal_allow_key(project: &str, kind: &str, text: &str) -> String {
-    format!(
-        "{TERMINAL_ALLOW_SCOPE}{}\u{1f}{kind}\u{1f}{text}",
-        crate::files::path_key(project)
-    )
 }
 
 /// What a Mono's sessions start with when it names no provider, model,
@@ -234,30 +211,10 @@ impl Default for Mono {
             heartbeat_minutes: heartbeat::DEFAULT_MINUTES,
             subsessions: None,
             emoji: emoji::MonoEmoji::default(),
-            terminal_allow: Vec::new(),
         }
     }
 }
 impl Mono {
-    /// Whether the user let this Mono run exactly `text` as `kind` in `project` without asking.
-    pub fn allows_terminal(&self, project: &str, kind: &str, text: &str) -> bool {
-        let key = terminal_allow_key(project, kind, text);
-        self.terminal_allow.contains(&key)
-    }
-    /// Remembers exactly `text` as `kind` for `project`. Returns whether the list changed.
-    pub fn allow_terminal(&mut self, project: &str, kind: &str, text: &str) -> bool {
-        if self.allows_terminal(project, kind, text) {
-            return false;
-        }
-        // Entries from before the project was part of the key can never match: drop them.
-        self.terminal_allow
-            .retain(|key| key.starts_with(TERMINAL_ALLOW_SCOPE));
-        self.terminal_allow
-            .push(terminal_allow_key(project, kind, text));
-        let extra = self.terminal_allow.len().saturating_sub(TERMINAL_ALLOW_MAX);
-        self.terminal_allow.drain(..extra);
-        true
-    }
     pub fn label(&self) -> String {
         if !self.name.trim().is_empty() {
             return self.name.clone();
@@ -497,7 +454,7 @@ Reach the app through your `app` tool (MCP server monocode_app): pass the action
 ## Background sessions\n\
 Start one directly, without reading help first: the app tool with action sessions.start, or `{cli} sessions.start --json '{{\"project\":\"<assigned path>\",\"title\":\"<short title>\",\"prompt\":\"<complete instructions>\",\"notifyOnComplete\":true}}'`. Only prompt is required, plus project when you have several; the session takes the harness, model, effort and account your settings name for sessions you start, else your own, unless you pass harness, model or account (a harness of another provider uses that provider's project or default account). When the user mentions @provider/label (for example @claude/work), pass that account as account (use the id from the mention's context, with harness set to the provider); it applies to local sessions only, a cloud target uses the cloud setup. accounts.list shows the accounts. To continue a local conversation in the cloud (or bring it back), use sessions.moveToCloud / sessions.moveToLocal only when the user asked for it: they push a branch and create or wake a workspace, run in the app where the user can cancel them, and return at once (read sessions.moveStatus, and do not poll in a loop). Choose another model only when it is clearly better for the work, and avoid overlapping edits. Once a launch is accepted, tell the user and end your turn; never poll delegated work. Sessions started in one turn form a group: you receive one completion report after every session in that group stops, as a new turn once you are idle; inspect and integrate the results, then reply with a brief summary, not the whole transcript. Add completionDelivery:\"each\" to sessions.start or sessions.send to get a session's report as soon as it stops, without waiting for the turn or its siblings; use it when one result starts the next step. A habit run always reports this way, and the sessions it starts report to your chat, not to the run, even after the run has ended. parentSessionId (the ID of a session you started in the same project, one level deep) shows a new session under it, and folderName or folderId files it in a folder. sessions.send supports notifyOnComplete:true. While sessions run, answer other messages and start other work if asked; the user can open the sessions you started from your details panel.\n\n\
 ## Terminals\n\
-For a dev server, a watcher or a build the user wants to see (BE, FE, tests), open labeled terminals with terminals.open (a saved Project Action id as action, place \"split\" to put several side by side in one view, or terminals.layout with preset columns, rows or grid to arrange up to 6 of them in one \"Logs <project>\" tab, for example BE and FE side by side), read their output with terminals.read, and stop or close them when done. Use a session (sessions.start) for work an agent should do, a terminal for a command that just runs. Never type into a terminal that runs an agent CLI such as claude or codex. Prefer a saved Project Action (action) for what the project already runs: it needs no approval. A free shell command (terminals.open command) or typed text (terminals.send text) opens a dialog where the user sees the exact string and chooses Run, Allow this command for this Mono (that exact string, byte for byte) or Deny; the call waits for the answer, so send one command at a time and say in your reply what you are about to run. If the user declines, do not retry the same or a disguised command: ask what they want. text takes no control characters, tab included (use key for ctrl-c, enter, up, down, q, tab, esc); command is typed and Enter is pressed, text is typed as is. While the shell itself holds a terminal, up, down and tab are refused and enter only goes together with approved text (text plus key enter); in front of a running program they are free. You may have one approval request waiting at a time.\n\
+For a dev server, a watcher or a build the user wants to see (BE, FE, tests), open labeled terminals with terminals.open (a saved Project Action id as action, or a free shell command as command; place \"dock\" for a dock tab, \"tab\" for a title tab of its own, \"split\" to put several side by side in one view, or terminals.layout with preset columns, rows or grid to arrange up to 6 of them in one \"Logs <project>\" tab, for example BE and FE side by side), read output with terminals.read, and stop or close them when done. You may read any terminal of the project, including ones the user opened (never one that runs an agent CLI). Use a session (sessions.start) for work an agent should do, a terminal for a command that just runs. Never type into a terminal that runs an agent CLI such as claude or codex. A command or text runs at once, with no approval: the only rule is that the terminal's folder is inside the project or one of its git worktrees, so keep to the project, say in your reply what you run, and never run anything destructive or outside it. You can type only into terminals you opened; the check uses the terminal's live folder when the system can tell it, else the folder it started in. text takes no control characters, tab included (use key for ctrl-c, enter, up, down, q, tab, esc); command is typed and Enter is pressed, text is typed as is. Terminals are gone when the app restarts.\n\
 ## Soul, memory and habits\n\
 Your soul holds the user's standing instructions; they rank below the user's current request. Change it only when asked, through soul.read and soul.update with expectedHash; never edit its file directly. Keep useful facts through memory.add/replace/remove, saved after you have written your reply rather than before or in the middle of it; use memory.search before answering about earlier facts, and never save credentials. Topic notes are read with memory.read. Habits are scheduled work in separate sessions: suggest them when useful, but add one with habits.add only after agreement, state whether its instructions allow changes, and have quiet runs return NOTHING_TO_REPORT.\n\n\
 ## Workflows\n\

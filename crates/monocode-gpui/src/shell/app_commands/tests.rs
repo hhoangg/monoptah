@@ -1,5 +1,7 @@
 use super::*;
+use crate::shell::cloud::CloudMark;
 use gpui::{TestAppContext, WindowHandle};
+use monocode_core::cloud_sessions::CloudBackendKind;
 use monocode_core::store::Store;
 use std::sync::mpsc;
 
@@ -35,7 +37,6 @@ fn call(
         .update(cx, |shell, window, cx| {
             shell.handle_app_call(
                 Call {
-                    received: std::time::Instant::now(),
                     session: caller,
                     request_id: request.into(),
                     action: action.into(),
@@ -88,7 +89,6 @@ fn submitted_operator_access_survives_the_composer_reset(cx: &mut TestAppContext
             shell
                 .authorize_app_call(
                     &Call {
-                        received: std::time::Instant::now(),
                         session: caller,
                         request_id: "after-submit".into(),
                         action: "sessions.list".into(),
@@ -804,7 +804,6 @@ fn a_session_an_agent_starts_is_a_chat_whatever_the_preference(cx: &mut TestAppC
             let (reply, result) = std::sync::mpsc::channel();
             shell.handle_app_call(
                 Call {
-                    received: std::time::Instant::now(),
                     session: active,
                     request_id: "start".into(),
                     action: "sessions.start".into(),
@@ -2014,4 +2013,352 @@ fn operator_cannot_pick_an_account_but_can_list_them(cx: &mut TestAppContext) {
         )
         .is_err()
     );
+}
+
+const WORK: &str = "/work/monocode";
+
+/// A shell the user opened in `project`'s dock, standing in `folder`, with `output` on screen.
+fn user_shell(
+    window: WindowHandle<Shell>,
+    project: &str,
+    folder: &str,
+    output: &str,
+    cx: &mut TestAppContext,
+) -> Entity<crate::terminal::Terminal> {
+    window
+        .update(cx, |shell, _, cx| {
+            let terminal = shell.spawn_terminal(folder.into(), cx);
+            terminal.update(cx, |t, cx| {
+                t.fake.cwd = Some(folder.into());
+                t.fake_output(&format!("{output}\r\n"), cx);
+            });
+            shell
+                .terminals
+                .entry(project.into())
+                .or_default()
+                .push(terminal.clone());
+            shell
+                .workspace
+                .docks
+                .entry(project.into())
+                .or_default()
+                .add(folder.into());
+            terminal
+        })
+        .unwrap()
+}
+
+fn listed(
+    window: WindowHandle<Shell>,
+    caller: i64,
+    request: &str,
+    cx: &mut TestAppContext,
+) -> Vec<Value> {
+    call(window, caller, request, "terminals.list", json!({}), cx)
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+#[gpui::test]
+fn a_session_lists_and_reads_the_terminals_of_its_project_without_operator(
+    cx: &mut TestAppContext,
+) {
+    let (window, caller) = plain_session(cx);
+    let user = user_shell(window, WORK, WORK, "user output", cx);
+    // A Mono's terminal of the project, a terminal of another project, a launched program
+    // (an agent session, a login, a cloud shell) and a shell running an agent CLI.
+    window
+        .update(cx, |shell, _, cx| {
+            shell
+                .mono_terminals_call(
+                    "m1",
+                    WORK,
+                    "terminals.open",
+                    &json!({"label": "BE", "command": "npm run dev", "place": "dock", "reveal": false}),
+                    cx,
+                )
+                .unwrap();
+        })
+        .unwrap();
+    user_shell(
+        window,
+        "/work/another-project",
+        "/work/another-project",
+        "other",
+        cx,
+    );
+    let launched = user_shell(window, WORK, WORK, "launched", cx);
+    let agent = user_shell(window, WORK, WORK, "agent", cx);
+    window
+        .update(cx, |_, _, cx| {
+            launched.update(cx, |t, _| t.pretend_launched());
+            agent.update(cx, |t, _| t.foreground = Some("claude".into()));
+        })
+        .unwrap();
+    let rows = listed(window, caller, "list-1", cx);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let owners: Vec<_> = rows.iter().map(|r| r["owner"].as_str().unwrap()).collect();
+    assert_eq!(owners, ["user", "mono"]);
+    // Reading: the user's terminal and the Mono's, each by its id.
+    let id = rows[0]["id"].as_str().unwrap();
+    let read = call(
+        window,
+        caller,
+        "read-1",
+        "terminals.read",
+        json!({"id": id}),
+        cx,
+    )
+    .unwrap();
+    assert!(read["text"].as_str().unwrap().contains("user output"));
+    assert_eq!(read["exited"], false);
+    let mono_id = rows[1]["id"].as_str().unwrap();
+    assert!(
+        call(
+            window,
+            caller,
+            "read-2",
+            "terminals.read",
+            json!({"id": mono_id, "lines": 5}),
+            cx
+        )
+        .is_ok()
+    );
+    // What is hidden is not even registered: a guessed id names nothing.
+    let error = call(
+        window,
+        caller,
+        "read-3",
+        "terminals.read",
+        json!({"id": "t-0-9"}),
+        cx,
+    )
+    .unwrap_err();
+    assert!(error.contains("Unknown terminal"), "{error}");
+    // Secrets are masked and the answer is capped like a Mono's.
+    window
+        .update(cx, |_, _, cx| {
+            user.update(cx, |t, cx| {
+                t.fake_output(&format!("token ghp_{}\r\n", "a".repeat(30)), cx)
+            })
+        })
+        .unwrap();
+    let read = call(
+        window,
+        caller,
+        "read-4",
+        "terminals.read",
+        json!({"id": id}),
+        cx,
+    )
+    .unwrap();
+    assert!(read["text"].as_str().unwrap().contains("redacted"));
+    // The session can read although it is only a plain session: Operator is off.
+    assert!(
+        !window
+            .update(cx, |shell, _, cx| shell.sessions[&caller]
+                .read(cx)
+                .settings
+                .operator_enabled)
+            .unwrap()
+    );
+}
+
+#[gpui::test]
+fn a_session_in_a_worktree_sees_only_terminals_in_that_worktree_or_the_project(
+    cx: &mut TestAppContext,
+) {
+    let (window, caller) = plain_session(cx);
+    window
+        .update(cx, |shell, _, cx| {
+            shell.sessions[&caller].update(cx, |v, cx| {
+                v.install_transfer(
+                    Settings {
+                        worktree_cwd: Some("/work/monocode-worktrees/feature".into()),
+                        ..Default::default()
+                    },
+                    None,
+                    cx,
+                );
+            });
+        })
+        .unwrap();
+    cx.run_until_parked();
+    user_shell(window, WORK, WORK, "root", cx);
+    user_shell(window, WORK, "/work/monocode/packages/api", "api", cx);
+    user_shell(
+        window,
+        WORK,
+        "/work/monocode-worktrees/feature/src",
+        "mine",
+        cx,
+    );
+    user_shell(
+        window,
+        WORK,
+        "/work/monocode-worktrees/other/src",
+        "sibling worktree",
+        cx,
+    );
+    user_shell(window, WORK, "/tmp", "outside", cx);
+    let rows = listed(window, caller, "wt-1", cx);
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    let cwds: Vec<_> = rows.iter().map(|r| r["cwd"].as_str().unwrap()).collect();
+    assert!(
+        !cwds.contains(&"/tmp") && !cwds.iter().any(|c| c.contains("other")),
+        "{cwds:?}"
+    );
+    // A terminal outside the scope cannot be read by its id either, even when another
+    // caller (a Mono, which sees the whole project) gave it one.
+    let everything = window
+        .update(cx, |shell, _, cx| {
+            shell
+                .mono_terminals_call("m1", WORK, "terminals.list", &json!({}), cx)
+                .unwrap()
+        })
+        .unwrap();
+    assert_eq!(everything.as_array().unwrap().len(), 5);
+    let outside: Vec<_> = everything
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| !rows.iter().any(|seen| seen["id"] == r["id"]))
+        .collect();
+    assert_eq!(outside.len(), 2);
+    for row in outside {
+        let error = call(
+            window,
+            caller,
+            "wt-2",
+            "terminals.read",
+            json!({"id": row["id"]}),
+            cx,
+        )
+        .unwrap_err();
+        assert!(error.contains("Unknown terminal"), "{error}");
+    }
+}
+
+#[gpui::test]
+fn a_session_may_only_read_terminals_every_other_action_is_refused(cx: &mut TestAppContext) {
+    let (window, caller) = plain_session(cx);
+    user_shell(window, WORK, WORK, "mine", cx);
+    let rows = listed(window, caller, "ro-0", cx);
+    let id = rows[0]["id"].as_str().unwrap().to_owned();
+    for (n, (action, input)) in [
+        ("terminals.open", json!({"label": "X"})),
+        ("terminals.open", json!({"label": "X", "command": "ls"})),
+        (
+            "terminals.send",
+            json!({"id": id, "text": "ls", "key": "enter"}),
+        ),
+        ("terminals.stop", json!({"id": id})),
+        ("terminals.close", json!({"id": id})),
+        (
+            "terminals.layout",
+            json!({"preset": "columns", "ids": [id]}),
+        ),
+        ("terminals.unknown", json!({})),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let error = call(window, caller, &format!("ro-{n}"), action, input, cx).unwrap_err();
+        assert_eq!(error, "Only a Mono can open or drive terminals", "{action}");
+    }
+    // Nothing was typed, stopped or closed, and nothing was opened.
+    assert_eq!(listed(window, caller, "ro-after", cx).len(), 1);
+    assert!(
+        window
+            .update(cx, |shell, _, _| shell.workspace.terminal_panes.is_empty())
+            .unwrap()
+    );
+    // Another project's path and unknown fields are refused too.
+    let error = call(
+        window,
+        caller,
+        "ro-p",
+        "terminals.list",
+        json!({"project": "/work/another-project"}),
+        cx,
+    )
+    .unwrap_err();
+    assert!(error.contains("own project"), "{error}");
+    assert!(
+        call(
+            window,
+            caller,
+            "ro-f",
+            "terminals.read",
+            json!({"id": id, "bogus": 1}),
+            cx
+        )
+        .is_err()
+    );
+    // An Operator thread has the same read-only terminals, and no more.
+    let (window, _, operator) = setup(cx);
+    user_shell(window, WORK, WORK, "op", cx);
+    assert_eq!(listed(window, operator, "op-0", cx).len(), 1);
+    let error = call(
+        window,
+        operator,
+        "op-1",
+        "terminals.open",
+        json!({"label": "X"}),
+        cx,
+    )
+    .unwrap_err();
+    assert_eq!(error, "Only a Mono can open or drive terminals");
+}
+
+#[gpui::test]
+fn a_remote_or_cloud_session_gets_no_terminals(cx: &mut TestAppContext) {
+    let (window, caller) = plain_session(cx);
+    user_shell(window, WORK, WORK, "mine", cx);
+    assert_eq!(listed(window, caller, "rc-0", cx).len(), 1);
+    // A cloud session.
+    window
+        .update(cx, |shell, _, _| {
+            shell.cloud_marks.insert(
+                caller,
+                CloudMark {
+                    local_project: WORK.into(),
+                    codespace: "cs".into(),
+                    kind: CloudBackendKind::Codespaces,
+                },
+            );
+        })
+        .unwrap();
+    for (n, action) in ["terminals.list", "terminals.read"].into_iter().enumerate() {
+        let error = call(
+            window,
+            caller,
+            &format!("rc-c{n}"),
+            action,
+            json!({"id": "t-0-1"}),
+            cx,
+        )
+        .unwrap_err();
+        assert!(error.contains("remote or cloud"), "{error}");
+    }
+    window
+        .update(cx, |shell, _, _| shell.cloud_marks.remove(&caller))
+        .unwrap();
+    // A remote session.
+    window
+        .update(cx, |shell, _, cx| {
+            shell.sessions[&caller].update(cx, |view, _| {
+                view.summary.cwd = "remote://host/project".into();
+            });
+        })
+        .unwrap();
+    for (n, action) in ["terminals.list", "terminals.open"].into_iter().enumerate() {
+        let error = call(window, caller, &format!("rc-r{n}"), action, json!({}), cx).unwrap_err();
+        assert!(error.contains("remote"), "{error}");
+    }
+    // An unknown session.
+    let error = call(window, 987_654, "rc-u", "terminals.list", json!({}), cx).unwrap_err();
+    assert!(error.contains("Unknown session"), "{error}");
 }

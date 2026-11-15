@@ -88,15 +88,8 @@ impl Shell {
         if let Some(view) = self.terminal_pane_views.get(&pane) {
             return Some(view.clone());
         }
-        let state = self.workspace.terminal_panes.get(&pane)?;
-        let (cwd, label) = (state.cwd.clone(), state.label.clone());
-        let (by_mono, run) = (state.mono.is_some(), state.run.clone());
-        let view = self.spawn_terminal_as(cwd, by_mono, cx);
-        if by_mono {
-            Self::restore_mono_terminal(&view, label, run, cx);
-        } else {
-            view.update(cx, |t, _| t.label = label);
-        }
+        let cwd = self.workspace.terminal_panes.get(&pane)?.cwd.clone();
+        let view = self.spawn_terminal(cwd, cx);
         self.terminal_pane_views.insert(pane, view.clone());
         Some(view)
     }
@@ -141,8 +134,8 @@ impl Shell {
     }
 
     /// Takes dock tab `ix` of `project` out of the dock and makes its live shell a terminal
-    /// pane owned by session `owner`, in no tab yet (the caller places it). What a Mono
-    /// saved for the tab (label, Mono, last command) moves with it. Moves no keyboard focus
+    /// pane owned by session `owner`, in no tab yet (the caller places it). A Mono's
+    /// label and mark move with it. Moves no keyboard focus
     /// and, for a project that is not in view, leaves the dock's slide alone.
     pub(super) fn move_dock_terminal_to_pane(
         &mut self,
@@ -158,12 +151,6 @@ impl Shell {
             live.remove(ix);
         }
         self.dock_shifts.remove(&terminal.entity_id());
-        let meta = self
-            .workspace
-            .docks
-            .get(project)
-            .and_then(|dock| dock.mono_meta(ix))
-            .cloned();
         if let Some(dock) = self.workspace.docks.get_mut(project)
             && !dock.close(ix)
         {
@@ -180,10 +167,9 @@ impl Shell {
         let cwd = terminal.read(cx).cwd.clone();
         let pane = self.workspace.next_pane_id();
         let mut state = TerminalPane::new(owner, cwd);
-        if let Some(meta) = meta {
-            state.mono = Some(meta.mono);
-            state.label = Some(meta.label);
-            state.run = meta.run;
+        if let Some(mono) = self.mono_registry.mono_of(&terminal) {
+            state.mono = Some(mono);
+            state.label = terminal.read(cx).label.clone();
         }
         self.workspace.terminal_panes.insert(pane, state);
         self.terminal_pane_views.insert(pane, terminal);

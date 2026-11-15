@@ -88,7 +88,6 @@ fn the_caller_comes_from_the_session_and_a_heartbeat_is_not_a_habit(cx: &mut Tes
             let mono = m.roster.get(&s.id).unwrap().clone();
             let (reply, _rx) = std::sync::mpsc::channel();
             let call = Call {
-                received: std::time::Instant::now(),
                 session,
                 request_id: "x".into(),
                 action: "today.list".into(),

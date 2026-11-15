@@ -419,7 +419,6 @@ pub(super) fn call_from(
 ) -> mpsc::Receiver<Result<Value, String>> {
     let (reply, rx) = mpsc::channel();
     let call = mono::bridge::Call {
-        received: std::time::Instant::now(),
         session,
         request_id: request.into(),
         action: action.into(),
@@ -732,7 +731,6 @@ fn app_receipt_lookup_does_not_wait_for_storage_on_the_ui_thread(cx: &mut TestAp
     acquired.recv().unwrap();
     let (reply, response) = mpsc::channel();
     let call = mono::bridge::Call {
-        received: std::time::Instant::now(),
         session: s.session,
         request_id: "contended-lookup".into(),
         action: "sessions.list".into(),
@@ -5716,7 +5714,6 @@ fn a_move_racing_a_delete_cannot_bring_the_deleted_session_back(cx: &mut TestApp
     let send = |request: &str, action: &str, input: Value, cx: &mut TestAppContext| {
         let (reply, rx) = mpsc::channel();
         let call = mono::bridge::Call {
-            received: std::time::Instant::now(),
             session: s.session,
             request_id: request.into(),
             action: action.into(),
@@ -6037,24 +6034,17 @@ fn terminals_belong_to_the_monos_own_chat_and_not_to_habit_runs_or_heartbeats(
     )
     .unwrap();
     assert!(ask_habit(&s, "t-read", "terminals.read", json!({"id": id}), cx).is_ok());
-    // Typed text is not refused: it waits for the user, who declines it here.
-    let typed = call(
-        &s,
-        "t-text",
-        "terminals.send",
-        json!({"id": id, "text": "ls"}),
-        cx,
-    );
-    assert_eq!(typed.try_recv(), Err(mpsc::TryRecvError::Empty));
-    cx.update(|cx| {
-        s.window
-            .update(cx, |shell, w, cx| shell.deny_front_mono_approval(w, cx))
-            .unwrap()
-    });
-    cx.run_until_parked();
+    // Typed text is written at once: there is no dialog to wait for.
     assert_eq!(
-        typed.try_recv().unwrap(),
-        Err("The user declined this command".into())
+        ask_habit(
+            &s,
+            "t-text",
+            "terminals.send",
+            json!({"id": id, "text": "ls"}),
+            cx
+        )
+        .unwrap()["sent"],
+        "text"
     );
     // A control character is refused outright.
     assert!(
@@ -6099,47 +6089,6 @@ fn terminals_belong_to_the_monos_own_chat_and_not_to_habit_runs_or_heartbeats(
     // Nothing the refused calls asked for happened.
     let after = ask_habit(&s, "t-list2", "terminals.list", json!({}), cx).unwrap();
     assert_eq!(after.as_array().unwrap().len(), 1);
-}
-
-#[gpui::test]
-fn an_allowed_terminal_command_is_saved_with_the_mono_and_leaves_with_it(cx: &mut TestAppContext) {
-    let s = setup(cx);
-    s.manager.update(cx, |m, cx| {
-        m.allow_terminal(&s.id, "/work/app", "command", "npm test", cx)
-    });
-    cx.run_until_parked();
-    cx.update(|cx| {
-        let m = s.manager.read(cx);
-        assert!(m.terminal_allowed(&s.id, "/work/app", "command", "npm test"));
-        assert!(!m.terminal_allowed(&s.id, "/work/app", "command", "npm test "));
-        assert!(!m.terminal_allowed(&s.id, "/work/app", "text", "npm test"));
-        assert!(!m.terminal_allowed(&s.id, "/work/other", "command", "npm test"));
-        assert!(!m.terminal_allowed("another", "/work/app", "command", "npm test"));
-    });
-    // On disk, so a restart finds it.
-    let saved = Roster::load(&locked(&s.store).unwrap()).unwrap();
-    assert!(
-        saved
-            .get(&s.id)
-            .unwrap()
-            .allows_terminal("/work/app", "command", "npm test")
-    );
-    // Deleting the Mono forgets it.
-    s.manager.update(cx, |m, cx| m.remove_mono(&s.id, cx));
-    cx.run_until_parked();
-    cx.update(|cx| {
-        assert!(
-            !s.manager
-                .read(cx)
-                .terminal_allowed(&s.id, "/work/app", "command", "npm test")
-        )
-    });
-    assert!(
-        Roster::load(&locked(&s.store).unwrap())
-            .unwrap()
-            .get(&s.id)
-            .is_none()
-    );
 }
 
 #[gpui::test]

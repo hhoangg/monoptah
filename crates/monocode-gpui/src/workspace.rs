@@ -126,12 +126,14 @@ pub(crate) struct Workspace {
     /// Terminals pulled out of a dock into a split or onto the title strip,
     /// by their negative pane IDs. Like file panes, each borrows its owner
     /// session's project and worktree scope.
+    #[serde(serialize_with = "saved_panes")]
     pub terminal_panes: HashMap<i64, TerminalPane>,
     /// Split trees of tabs with more than one pane, by tab key.
     pub layouts: HashMap<i64, PaneNode>,
     /// The pane each split tab returns to when it is activated.
     pub focused: HashMap<i64, i64>,
     /// Each project's terminal dock (ProjectTerminalDock), by project path.
+    #[serde(serialize_with = "saved_docks")]
     pub docks: HashMap<String, TerminalDock>,
     /// Each project's saved commands, run from the footer's Actions button.
     pub actions: HashMap<String, Vec<ProjectAction>>,
@@ -223,29 +225,6 @@ impl DockSide {
         (min, (span * 0.7).floor().max(min))
     }
 }
-/// The command a Mono terminal last ran, kept so "Run again" can offer it after a restart.
-/// Never run on restore: only the user pressing the button runs it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct SavedRun {
-    /// "action" (a saved Project Action, `action` holds its id) or "command" (a free command
-    /// the user approved).
-    pub kind: String,
-    /// The shell command line as it was typed.
-    pub text: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub action: Option<String>,
-}
-
-/// What a dock tab keeps of a terminal a Mono opened. Pane terminals keep the same in
-/// `TerminalPane`. Origin is always Mono: a user's terminal has no entry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct MonoTerminalMeta {
-    pub mono: String,
-    pub label: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run: Option<SavedRun>,
-}
-
 /// A terminal living in the pane tree. Shells are not restored; the pane
 /// reopens a fresh shell in the same directory, as a dock tab does.
 ///
@@ -255,25 +234,25 @@ pub(crate) struct MonoTerminalMeta {
 /// session with terminal panes cannot be deleted. A Mono's own chat is a hidden session outside
 /// the project, so it is never the owner: a Mono pane borrows a real session of the Mono's
 /// project (`Shell::mono_pane_owner`), and falls back to the dock when the project has none.
-/// `mono`, `label`, `run` and `logs` are optional and `serde(default)`, so state saved before
-/// them still loads.
+///
+/// A terminal a Mono opened is not saved: `mono`, `label` and `logs` are runtime only, the
+/// workspace is saved without such panes (`saved_panes`) and a restart brings none of them
+/// back. `mono` is still read from state saved by an older version, only so that restore can
+/// drop that pane instead of reopening it as a user's terminal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TerminalPane {
     pub owner: i64,
     pub cwd: String,
-    /// The Mono that opened this terminal, if one did.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The Mono that opened this terminal, if one did. Never written.
+    #[serde(default, skip_serializing)]
     pub mono: Option<String>,
-    /// The name a Mono gave it; reapplied to the shell reopened after a restart.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The name a Mono gave it.
+    #[serde(skip)]
     pub label: Option<String>,
-    /// What it last ran, offered again as "Run again" after a restart.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run: Option<SavedRun>,
     /// The title ("Logs <project>") of the Logs tab this pane was arranged into
     /// (`terminals.layout`). A tab whose panes are all terminals and one of which has it shows
     /// that title.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip)]
     pub logs: Option<String>,
 }
 
@@ -284,10 +263,28 @@ impl TerminalPane {
             cwd,
             mono: None,
             label: None,
-            run: None,
             logs: None,
         }
     }
+}
+
+/// The panes that are saved: a Mono's are not.
+fn saved_panes<S: serde::Serializer>(
+    panes: &HashMap<i64, TerminalPane>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_map(panes.iter().filter(|(_, pane)| pane.mono.is_none()))
+}
+
+/// The docks that are saved, each without the tabs a Mono opened.
+fn saved_docks<S: serde::Serializer>(
+    docks: &HashMap<String, TerminalDock>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_map(docks.iter().filter_map(|(project, dock)| {
+        let kept = dock.without_mono_tabs();
+        (!kept.terminals.is_empty()).then_some((project, kept))
+    }))
 }
 
 /// A project's dock: its place, size and the terminals it holds. Shells are
@@ -300,15 +297,16 @@ pub(crate) struct TerminalDock {
     pub open: bool,
     /// Each terminal's working directory, in tab order.
     pub terminals: Vec<String>,
-    /// What a Mono opened, parallel to `terminals` (`None` for the user's). Saved only when
-    /// one exists and may be shorter than `terminals`, so state saved before it still loads;
-    /// every method keeps the two in step.
-    #[serde(skip_serializing_if = "no_mono_terminals")]
-    pub mono_terminals: Vec<Option<MonoTerminalMeta>>,
     pub active: usize,
-}
-fn no_mono_terminals(meta: &[Option<MonoTerminalMeta>]) -> bool {
-    meta.iter().all(Option::is_none)
+    /// The tabs a Mono opened, parallel to `terminals` (runtime only: they are not saved, see
+    /// `without_mono_tabs`). May be shorter than `terminals`; every method keeps the two in
+    /// step.
+    #[serde(skip)]
+    mono_tabs: Vec<bool>,
+    /// Read from state an older version saved (a list of what a Mono opened), only so that
+    /// restore can drop those tabs. Never written.
+    #[serde(default, rename = "mono_terminals", skip_serializing)]
+    legacy_mono_terminals: Vec<serde_json::Value>,
 }
 impl Default for TerminalDock {
     fn default() -> Self {
@@ -317,35 +315,73 @@ impl Default for TerminalDock {
             size: DockSide::Bottom.default_size(),
             open: true,
             terminals: Vec::new(),
-            mono_terminals: Vec::new(),
             active: 0,
+            mono_tabs: Vec::new(),
+            legacy_mono_terminals: Vec::new(),
         }
     }
 }
 impl TerminalDock {
-    /// Pads or trims `mono_terminals` to one entry per terminal.
-    fn fit_meta(&mut self) {
-        self.mono_terminals.resize(self.terminals.len(), None);
+    /// Pads or trims `mono_tabs` to one entry per terminal.
+    fn fit_marks(&mut self) {
+        self.mono_tabs.resize(self.terminals.len(), false);
     }
-    /// What a Mono opened as tab `ix`.
-    pub fn mono_meta(&self, ix: usize) -> Option<&MonoTerminalMeta> {
-        self.mono_terminals.get(ix)?.as_ref()
+    /// Whether a Mono opened tab `ix`.
+    pub fn is_mono(&self, ix: usize) -> bool {
+        self.mono_tabs.get(ix).copied().unwrap_or(false)
     }
-    pub fn set_mono_meta(&mut self, ix: usize, meta: Option<MonoTerminalMeta>) {
+    pub fn set_mono(&mut self, ix: usize, mono: bool) {
         if ix >= self.terminals.len() {
             return;
         }
-        self.fit_meta();
-        self.mono_terminals[ix] = meta;
-        if self.mono_terminals.iter().all(Option::is_none) {
-            self.mono_terminals.clear();
+        self.fit_marks();
+        self.mono_tabs[ix] = mono;
+        if !mono && self.mono_tabs.iter().all(|m| !m) {
+            self.mono_tabs.clear();
         }
+    }
+    /// Removes the tabs an older version saved as a Mono's (`legacy_mono_terminals`): a Mono's
+    /// terminals do not outlive the app.
+    fn drop_legacy_mono_tabs(&mut self) {
+        let legacy = std::mem::take(&mut self.legacy_mono_terminals);
+        let mono = |ix: usize| legacy.get(ix).is_some_and(|meta| !meta.is_null());
+        if !(0..self.terminals.len()).any(mono) {
+            return;
+        }
+        let active = (0..self.active.min(self.terminals.len()))
+            .filter(|ix| !mono(*ix))
+            .count();
+        let mut ix = 0;
+        self.terminals.retain(|_| {
+            ix += 1;
+            !mono(ix - 1)
+        });
+        self.active = active;
+    }
+    /// The dock as it is saved: without the tabs a Mono opened, and with the active tab the
+    /// same terminal (else the next one kept).
+    fn without_mono_tabs(&self) -> TerminalDock {
+        let mut kept = self.clone();
+        if self.mono_tabs.iter().any(|m| *m) {
+            kept.terminals = Vec::new();
+            for (ix, cwd) in self.terminals.iter().enumerate() {
+                if !self.is_mono(ix) {
+                    kept.terminals.push(cwd.clone());
+                }
+            }
+            let before = (0..self.active.min(self.terminals.len()))
+                .filter(|ix| !self.is_mono(*ix))
+                .count();
+            kept.active = before.min(kept.terminals.len().saturating_sub(1));
+        }
+        kept.mono_tabs.clear();
+        kept
     }
     /// addTerminalToDock: the new terminal is active and the dock opens.
     pub fn add(&mut self, cwd: String) -> usize {
-        self.fit_meta();
+        self.fit_marks();
         self.terminals.push(cwd);
-        self.mono_terminals.push(None);
+        self.mono_tabs.push(false);
         self.active = self.terminals.len() - 1;
         self.open = true;
         self.active
@@ -356,11 +392,11 @@ impl TerminalDock {
         if ix >= self.terminals.len() {
             return true;
         }
-        self.fit_meta();
+        self.fit_marks();
         self.terminals.remove(ix);
-        self.mono_terminals.remove(ix);
+        self.mono_tabs.remove(ix);
         if self.terminals.is_empty() {
-            self.mono_terminals.clear();
+            self.mono_tabs.clear();
             self.active = 0;
             return false;
         }
@@ -376,11 +412,11 @@ impl TerminalDock {
             return;
         }
         let active = self.active;
-        self.fit_meta();
+        self.fit_marks();
         let cwd = self.terminals.remove(from);
         self.terminals.insert(to, cwd);
-        let meta = self.mono_terminals.remove(from);
-        self.mono_terminals.insert(to, meta);
+        let mono = self.mono_tabs.remove(from);
+        self.mono_tabs.insert(to, mono);
         self.active = if active == from {
             to
         } else if from < active && active <= to {
@@ -394,8 +430,8 @@ impl TerminalDock {
     /// onCloseOtherProjectTerminals: `keep` is left, and active.
     pub fn keep_only(&mut self, keep: usize) {
         if keep < self.terminals.len() {
-            self.fit_meta();
-            self.mono_terminals = vec![self.mono_terminals.swap_remove(keep)];
+            self.fit_marks();
+            self.mono_tabs = vec![self.mono_tabs.swap_remove(keep)];
             self.terminals = vec![self.terminals.swap_remove(keep)];
             self.active = 0;
         }
@@ -590,8 +626,10 @@ impl Workspace {
         });
         known.extend(state.mono_panes.keys().copied());
         let (owners, monos) = (&state.review_owners, &state.mono_panes);
+        // A terminal a Mono opened is never brought back, not even as a user's.
         state.terminal_panes.retain(|id, pane| {
             *id < 0
+                && pane.mono.is_none()
                 && !owners.contains_key(id)
                 && !monos.contains_key(id)
                 && sessions.iter().any(|(known, _)| *known == pane.owner)
@@ -685,12 +723,11 @@ impl Workspace {
         state
             .reviews
             .retain(|id, review| known.contains(id) && !review.tabs.is_empty());
+        for dock in state.docks.values_mut() {
+            dock.drop_legacy_mono_tabs();
+        }
         state.docks.retain(|_, dock| !dock.terminals.is_empty());
         for dock in state.docks.values_mut() {
-            dock.fit_meta();
-            if no_mono_terminals(&dock.mono_terminals) {
-                dock.mono_terminals.clear();
-            }
             dock.active = dock.active.min(dock.terminals.len() - 1);
             dock.size = dock.side.clamp(dock.size, (4000., 4000.));
         }
@@ -1504,6 +1541,7 @@ mod tests {
     }
 
     use super::*;
+    use serde_json::{Value, json};
     #[test]
     fn navigation_prunes_closed_tabs_and_a_new_visit_discards_forward() {
         let mut h = VisitHistory::default();
@@ -1862,16 +1900,12 @@ mod tests {
         assert_eq!(restored.desktop_workspace_snapshot.as_ref(), Some(&source));
     }
 
-    fn mono_meta(label: &str, command: &str) -> MonoTerminalMeta {
-        MonoTerminalMeta {
-            mono: "m1".into(),
-            label: label.into(),
-            run: Some(SavedRun {
-                kind: "command".into(),
-                text: command.into(),
-                action: None,
-            }),
-        }
+    fn mono_pane(mono: &str) -> TerminalPane {
+        let mut pane = TerminalPane::new(1, "/w".into());
+        pane.mono = Some(mono.into());
+        pane.label = Some("BE".into());
+        pane.logs = Some("Logs w".into());
+        pane
     }
 
     #[test]
@@ -1880,73 +1914,152 @@ mod tests {
         let state = Workspace::restore(Some(old), &[], "/w");
         let dock = &state.docks["/w"];
         assert_eq!(dock.terminals, ["/w", "/w/api"]);
-        assert!(dock.mono_terminals.iter().all(Option::is_none));
+        assert!(!dock.is_mono(0) && !dock.is_mono(1));
         assert_eq!(dock.active, 1);
-        // Nothing of a Mono is written for a dock that has none.
+        // Nothing of a Mono is written.
         let text = serde_json::to_string(dock).unwrap();
-        assert!(!text.contains("mono_terminals"), "{text}");
-        // An old terminal pane has no Mono, run or logs.
+        assert!(!text.contains("mono"), "{text}");
+        // An old terminal pane has no Mono, and only its owner and folder are written.
         let pane: TerminalPane = serde_json::from_str(r#"{"owner":3,"cwd":"/w"}"#).unwrap();
         assert_eq!(pane, TerminalPane::new(3, "/w".into()));
-        assert!(!serde_json::to_string(&pane).unwrap().contains("logs"));
+        assert_eq!(
+            serde_json::to_string(&pane).unwrap(),
+            r#"{"owner":3,"cwd":"/w"}"#
+        );
     }
 
     #[test]
-    fn mono_terminals_stay_in_step_with_the_dock_and_survive_a_save() {
+    fn mono_tabs_stay_in_step_with_the_dock_but_are_never_saved() {
         let mut dock = TerminalDock::default();
         dock.add("/a".into());
         dock.add("/b".into());
         dock.add("/c".into());
-        dock.set_mono_meta(1, Some(mono_meta("BE", "npm run dev")));
-        dock.set_mono_meta(2, Some(mono_meta("FE", "npm run web")));
+        dock.set_mono(1, true);
+        dock.set_mono(2, true);
         dock.reorder(2, 0);
         assert_eq!(dock.terminals, ["/c", "/a", "/b"]);
-        assert_eq!(dock.mono_meta(0).unwrap().label, "FE");
-        assert!(dock.mono_meta(1).is_none());
-        assert_eq!(dock.mono_meta(2).unwrap().label, "BE");
-        let saved = serde_json::to_string(&dock).unwrap();
-        let restored: TerminalDock = serde_json::from_str(&saved).unwrap();
-        assert_eq!(restored, dock);
-        // Closing a user's tab shifts the rest; closing the Mono's drops its entry.
+        assert!(dock.is_mono(0) && !dock.is_mono(1) && dock.is_mono(2));
+        // Closing a user's tab shifts the rest; closing the Mono's drops its mark.
         assert!(dock.close(1));
         assert_eq!(dock.terminals, ["/c", "/b"]);
-        assert_eq!(dock.mono_meta(1).unwrap().label, "BE");
+        assert!(dock.is_mono(0) && dock.is_mono(1));
         assert!(dock.close(0));
-        assert_eq!(dock.mono_meta(0).unwrap().label, "BE");
+        assert!(dock.is_mono(0));
         dock.add("/d".into());
-        assert!(dock.mono_meta(1).is_none());
+        assert!(!dock.is_mono(1));
         dock.keep_only(0);
-        assert_eq!(dock.mono_meta(0).unwrap().label, "BE");
+        assert!(dock.is_mono(0));
         assert!(!dock.close(0));
-        assert!(dock.mono_terminals.is_empty());
-        // A saved list shorter or longer than the tabs is fitted on restore.
-        let skewed = r#"{"project":"/w","docks":{"/w":{"terminals":["/w"],"mono_terminals":[null,null,null]}}}"#;
-        let state = Workspace::restore(Some(skewed), &[], "/w");
-        assert_eq!(state.docks["/w"].mono_terminals.len(), 0);
+        assert!(!dock.is_mono(0));
     }
 
     #[test]
-    fn mono_panes_keep_their_label_run_and_logs_across_a_save() {
+    fn the_saved_dock_has_no_mono_tabs_and_keeps_the_same_active_tab() {
+        let mut dock = TerminalDock::default();
+        for cwd in ["/a", "/b", "/c", "/d"] {
+            dock.add(cwd.into());
+        }
+        dock.set_mono(0, true);
+        dock.set_mono(2, true);
+        dock.active = 3;
+        let mut state = Workspace {
+            project: "/w".into(),
+            ..Default::default()
+        };
+        state.docks.insert("/w".into(), dock.clone());
+        let saved: Value = serde_json::to_value(&state).unwrap();
+        assert_eq!(saved["docks"]["/w"]["terminals"], json!(["/b", "/d"]));
+        assert_eq!(saved["docks"]["/w"]["active"], 1);
+        // The dock in memory still has them.
+        assert_eq!(state.docks["/w"].terminals.len(), 4);
+        // A dock of only a Mono's tabs leaves nothing behind.
+        let mut only = TerminalDock::default();
+        only.add("/a".into());
+        only.set_mono(0, true);
+        state.docks.insert("/only".into(), only);
+        let saved: Value = serde_json::to_value(&state).unwrap();
+        assert!(saved["docks"].get("/only").is_none());
+        // The active tab being a Mono's moves to the next one kept.
+        let mut dock = TerminalDock::default();
+        for cwd in ["/a", "/b", "/c"] {
+            dock.add(cwd.into());
+        }
+        dock.set_mono(1, true);
+        dock.active = 1;
+        assert_eq!(dock.without_mono_tabs().active, 1);
+        assert_eq!(dock.without_mono_tabs().terminals, ["/a", "/c"]);
+    }
+
+    #[test]
+    fn mono_panes_are_not_saved_and_leave_their_tab_and_layout() {
         let mut state = Workspace {
             project: "/w".into(),
             ..Default::default()
         };
         state.open(1);
-        let mut pane = TerminalPane::new(1, "/w".into());
-        pane.mono = Some("m1".into());
-        pane.label = Some("BE".into());
-        pane.run = Some(SavedRun {
-            kind: "action".into(),
-            text: "npm run dev".into(),
-            action: Some("a1".into()),
-        });
-        pane.logs = Some("Logs w".into());
-        state.terminal_panes.insert(-1, pane.clone());
+        state.terminal_panes.insert(-1, mono_pane("m1"));
+        state
+            .terminal_panes
+            .insert(-2, TerminalPane::new(1, "/w".into()));
         state.open(-1);
+        state.open(-2);
         let saved = serde_json::to_string(&state).unwrap();
+        assert!(!saved.contains("m1") && !saved.contains("Logs"), "{saved}");
         let restored = Workspace::restore(Some(&saved), &[(1, "/w".into())], "/w");
-        assert_eq!(restored.terminal_panes[&-1], pane);
-        assert_eq!(restored.logs_title(-1), Some("Logs w"));
+        assert!(!restored.terminal_panes.contains_key(&-1));
+        assert_eq!(
+            restored.terminal_panes[&-2],
+            TerminalPane::new(1, "/w".into())
+        );
+        assert!(restored.tab_of(-1).is_none());
+        assert!(restored.tab_of(-2).is_some());
+        assert!(restored.tab_of(1).is_some());
+    }
+
+    #[test]
+    fn state_saved_by_an_older_version_with_mono_terminals_loads_without_them() {
+        let old = json!({
+            "project": "/w",
+            "tabs": [1, -1, -2],
+            "docks": {"/w": {
+                "side": "bottom", "size": 240, "open": true,
+                "terminals": ["/w", "/w/a", "/w/b"],
+                "mono_terminals": [null,
+                    {"mono": "m1", "label": "BE", "run": {"kind": "command", "text": "npm run dev"}},
+                    null],
+                "active": 2
+            }},
+            "terminal_panes": {
+                "-1": {"owner": 1, "cwd": "/w", "mono": "m1", "label": "FE",
+                       "run": {"kind": "action", "text": "npm run web", "action": "a1"},
+                       "logs": "Logs w"},
+                "-2": {"owner": 1, "cwd": "/w"}
+            }
+        })
+        .to_string();
+        let state = Workspace::restore(Some(&old), &[(1, "/w".into())], "/w");
+        // The Mono's dock tab is gone, the others stay, and the active one is the same one.
+        let dock = &state.docks["/w"];
+        assert_eq!(dock.terminals, ["/w", "/w/b"]);
+        assert_eq!(dock.active, 1);
+        assert!(!dock.is_mono(0) && !dock.is_mono(1));
+        // The Mono's pane does not come back as a user's terminal; the user's does.
+        assert!(!state.terminal_panes.contains_key(&-1));
+        assert!(state.tab_of(-1).is_none());
+        assert_eq!(state.terminal_panes[&-2], TerminalPane::new(1, "/w".into()));
+        // Saved again, none of the old fields is written back.
+        let text = serde_json::to_string(&state).unwrap();
+        for gone in [
+            "\"mono\"",
+            "mono_terminals",
+            "\"run\"",
+            "\"logs\"",
+            "\"label\"",
+            "BE",
+            "FE",
+        ] {
+            assert!(!text.contains(gone), "{gone}: {text}");
+        }
     }
 
     #[test]
