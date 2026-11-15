@@ -10,6 +10,7 @@
 //! Scheduling (which workflow runs when, requests in the workflow files, the startup sweep)
 //! is not here: it calls `WorkflowRunner::start`, `resume` and `stop`.
 use gpui::AsyncApp;
+use monocode_core::cloud_sessions::CloudBackendKind;
 use monocode_core::mono::workflows::{
     cli::Signals,
     engine::{
@@ -17,7 +18,7 @@ use monocode_core::mono::workflows::{
     },
     model::{
         Checkout, Cwd, DEFAULT_COMMAND_TIMEOUT_MINUTES, DEFAULT_SESSION_TIMEOUT_MINUTES, Node,
-        NodeKind, NodeRun, NodeStatus, RunStatus, WorkflowRun,
+        NodeKind, NodeRun, NodeStatus, RunStatus, SessionTarget, TargetInstance, WorkflowRun,
     },
     ordered::{Json, OrderedMap, js_number_text},
     output::{output_reask, parse_workflow_output},
@@ -39,6 +40,7 @@ use sync::{Either, Gate, Nudge, Signal, join_all, race};
 
 mod api;
 mod host;
+mod instances;
 mod sync;
 #[cfg(test)]
 mod tests;
@@ -261,6 +263,145 @@ impl Exec {
         self.host.project_path(&self.mono_id, &rendered)
     }
 
+    /// The instance a cloud step asks for, resolved against this run, or why it cannot be.
+    /// `sameAs` is the instance of that node's session in this branch; a `new` step in a later
+    /// loop round (a new session each round) goes on in the instance of its previous round.
+    /// Options only apply when an instance is created, so they are dropped for an existing one.
+    fn cloud_request(
+        &self,
+        node_id: &str,
+        branch: &str,
+        checkout: &Checkout,
+        target: &SessionTarget,
+    ) -> Result<CloudRequest, String> {
+        if *checkout != Checkout::Root {
+            return Err(
+                "A cloud step works in its instance's own checkout, so its checkout must be root"
+                    .into(),
+            );
+        }
+        let kind = CloudBackendKind::from_api_name(&target.kind)
+            .ok_or_else(|| {
+                format!(
+                    "\"{}\" is not a cloud kind a run can start (codespace or sandbox)",
+                    target.kind
+                )
+            })?
+            .api_name()
+            .to_string();
+        let instance = match &target.instance {
+            TargetInstance::New => match self.previous_round_session(node_id, branch) {
+                Some(previous) => CloudInstance::OfSession(previous),
+                None => CloudInstance::New,
+            },
+            TargetInstance::SameAs(source) => CloudInstance::OfSession(
+                self.session_of(source, branch)
+                    .ok_or_else(|| format!("No cloud instance is available from \"{source}\""))?,
+            ),
+            TargetInstance::Invalid(_) => {
+                return Err("The cloud instance of this step is not valid: use \"new\" or {\"sameAs\": \"<session node id>\"}".into());
+            }
+        };
+        let options = match instance {
+            CloudInstance::New => target
+                .options
+                .iter()
+                .map(|(key, value)| (key.clone(), value.to_value()))
+                .collect(),
+            CloudInstance::OfSession(_) => serde_json::Map::new(),
+        };
+        Ok(CloudRequest {
+            kind,
+            instance,
+            options,
+        })
+    }
+
+    /// An earlier session of this node in this branch (an earlier loop round, or one an
+    /// interrupted run left behind). They all run on one instance.
+    fn previous_round_session(&self, node_id: &str, branch: &str) -> Option<String> {
+        let state = self.state.borrow();
+        let node = state
+            .run
+            .nodes
+            .iter()
+            .find(|n| n.node_id == node_id && n.branch == branch)?;
+        node.session_id
+            .clone()
+            .filter(|id| !id.is_empty())
+            .or_else(|| {
+                node.history
+                    .iter()
+                    .flatten()
+                    .rev()
+                    .find_map(|round| round.session_id.clone())
+            })
+            .or_else(|| {
+                node.interrupted_sessions
+                    .iter()
+                    .flatten()
+                    .next_back()
+                    .cloned()
+            })
+    }
+
+    /// Sessions an interrupted run left on this node that this run replaces: a cloud one may
+    /// still hold its first prompt, which must not go out once its instance is ready.
+    fn interrupted_of(&self, node_id: &str, branch: &str) -> Vec<String> {
+        self.state
+            .borrow()
+            .run
+            .nodes
+            .iter()
+            .find(|n| n.node_id == node_id && n.branch == branch)
+            .and_then(|n| n.interrupted_sessions.clone())
+            .unwrap_or_default()
+    }
+
+    /// A start that lands after the run was stopped: its session is kept on the node (so the
+    /// report lists the instance), ended, and, when the report is already out, the instance is
+    /// announced in a short follow-up.
+    async fn settle_late_session(
+        self: &Rc<Self>,
+        node_id: &str,
+        branch: &str,
+        session_id: &str,
+        cloud: bool,
+    ) {
+        if cloud {
+            let session = session_id.to_string();
+            self.patch_node(node_id, branch, |n| {
+                let kept = n.interrupted_sessions.get_or_insert_with(Vec::new);
+                if !kept.contains(&session) {
+                    kept.push(session);
+                }
+            });
+        }
+        let _ = self.host.stop(session_id).await;
+        self.host.end_approvals(session_id);
+        if cloud {
+            let run = self.state.borrow().run.clone();
+            if run.report_posted_at.is_some()
+                && let Some(listing) =
+                    instances::report_section(&run, |id| self.host.cloud_instance(id))
+            {
+                self.host.post(Posted {
+                    mono_id: self.mono_id.clone(),
+                    workflow_id: run.workflow_id.clone(),
+                    workflow_name: run.definition.name.clone(),
+                    run_id: run.id.clone(),
+                    title: format!("{} \u{b7} cloud instance left running", run.definition.name),
+                    text: format!(
+                        "**{}**\n\nA cloud step was still starting when the run was stopped, and its instance came up afterwards.\n\n{listing}",
+                        run.definition.name
+                    ),
+                    launches: Vec::new(),
+                });
+            }
+        }
+        self.host.release_session(session_id);
+    }
+
     // --- waiting on a turn ------------------------------------------------------------------------
 
     /// Waits for a turn, showing any approval it asks for. Only time spent working counts toward
@@ -362,6 +503,7 @@ impl Exec {
                     effort,
                     nest_under,
                     timeout_minutes,
+                    target,
                     ..
                 },
             ..
@@ -383,6 +525,16 @@ impl Exec {
             let turn = self.host.send(&reuse, prompt);
             (reuse, turn)
         } else {
+            // A cloud step is resolved before anything is created: whatever cannot be resolved
+            // fails the node here, and a step that slips past validation never starts an instance.
+            let cloud = match target
+                .as_ref()
+                .map(|t| self.cloud_request(&node_id, &branch, &checkout, t))
+            {
+                None => None,
+                Some(Ok(request)) => Some(request),
+                Some(Err(error)) => return self.fail(&node_id, &branch, error),
+            };
             let mut worktree_cwd = None;
             if let Checkout::WorktreeOf(source_node) = &checkout {
                 worktree_cwd = self
@@ -410,6 +562,16 @@ impl Exec {
                     run_folder_name(&state.run.definition.name, state.run.started_at),
                 )
             };
+            let is_cloud = cloud.is_some();
+            // A cloud session an interrupted run left behind may still hold its first prompt:
+            // it is dropped so it does not run unattended next to this new session. The instance
+            // is left alone.
+            if cloud.is_some() {
+                for old in self.interrupted_of(&node_id, &branch) {
+                    let _ = self.host.stop(&old).await;
+                    self.host.end_approvals(&old);
+                }
+            }
             let request = SessionRequest {
                 project: project_path.clone(),
                 prompt,
@@ -421,6 +583,7 @@ impl Exec {
                 parent_session_id,
                 folder_id,
                 folder_name: Some(folder_name),
+                target: cloud,
             };
             // The start runs on its own so Stop does not wait for one that hangs.
             let (done, started) = async_channel::bounded(1);
@@ -444,12 +607,17 @@ impl Exec {
                 Either::Right(()) => {
                     // One that comes through later is ended.
                     let this = self.clone();
+                    let (node_id, branch) = (node_id.clone(), branch.clone());
                     self.cx
                         .spawn(async move |_| {
                             if let Ok(Ok(Some(late))) = started.recv().await {
-                                let _ = this.host.stop(&late.session_id).await;
-                                this.host.end_approvals(&late.session_id);
-                                this.host.release_session(&late.session_id);
+                                this.settle_late_session(
+                                    &node_id,
+                                    &branch,
+                                    &late.session_id,
+                                    is_cloud,
+                                )
+                                .await;
                             }
                         })
                         .detach();
@@ -470,9 +638,8 @@ impl Exec {
             }
             if !self.live() {
                 // Stopped while it was starting: nothing else knows this session yet.
-                let _ = self.host.stop(&started.session_id).await;
-                self.host.end_approvals(&started.session_id);
-                self.host.release_session(&started.session_id);
+                self.settle_late_session(&node_id, &branch, &started.session_id, is_cloud)
+                    .await;
                 return;
             }
             (started.session_id, started.settled)
@@ -491,6 +658,13 @@ impl Exec {
             return;
         }
         if outcome.status != Status::Completed {
+            // A cloud session that did not finish may still hold its first prompt (its start
+            // failed): drop it so a later Retry does not run the step outside the run. The
+            // instance is left alone.
+            if target.is_some() {
+                let _ = self.host.stop(&session_id).await;
+                self.host.end_approvals(&session_id);
+            }
             return self.fail(
                 &node_id,
                 &branch,
@@ -765,13 +939,20 @@ impl Exec {
 
     fn post_text(&self, finished: &WorkflowRun) {
         let report = compose_report(finished);
+        let mut text = report.text;
+        if let Some(listing) =
+            instances::report_section(finished, |id| self.host.cloud_instance(id))
+        {
+            text.push_str("\n\n");
+            text.push_str(&listing);
+        }
         self.host.post(Posted {
             mono_id: self.mono_id.clone(),
             workflow_id: finished.workflow_id.clone(),
             workflow_name: finished.definition.name.clone(),
             run_id: finished.id.clone(),
             title: report.title,
-            text: report.text,
+            text,
             launches: self.launches_of(finished),
         });
     }

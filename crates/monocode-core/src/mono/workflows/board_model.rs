@@ -710,6 +710,7 @@ pub fn new_node(ty: NodeType, w: &Workflow) -> Node {
             reuse_session: None,
             nest_under: None,
             timeout_minutes: None,
+            target: None,
         },
         NodeType::Command => NodeKind::Command {
             project: default_project(w),
@@ -1014,6 +1015,9 @@ fn without_refs(node: &Node, gone: &HashSet<&str>) -> Node {
             checkout,
             ..
         } => {
+            // A `sameAs` that names a removed node is left as it is: turning it into a new
+            // instance would silently make the run create (and pay for) one more instance. The
+            // validator reports the missing node.
             if nest_under.as_deref().is_some_and(|n| gone.contains(n)) {
                 *nest_under = None;
             }

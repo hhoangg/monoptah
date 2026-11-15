@@ -2,8 +2,8 @@
 //! hidden Ask-Mono sessions, the attention shelf and the report in the Mono's chat.
 use super::sync::race;
 use super::{
-    ApprovalAsk, Fut, Outcome, Posted, STOPPED_BY_USER, SessionInfo, SessionRequest,
-    StartedSession, WorkflowHost,
+    ApprovalAsk, CloudInstance, CloudInstanceInfo, Fut, Outcome, Posted, STOPPED_BY_USER,
+    SessionInfo, SessionRequest, StartedSession, WorkflowHost,
 };
 use crate::conversation::{TurnEnd, WorkflowTurn};
 use crate::monos::host::{Effect, StartContext, StartOptions};
@@ -13,7 +13,7 @@ use gpui::AsyncApp;
 use monocode_core::{
     mono::workflows::{
         command::{self, CommandResult},
-        model::{Checkout, Node, NodeKind, Workflow, WorkflowRun},
+        model::{Checkout, Node, NodeKind, SessionTarget, TargetInstance, Workflow, WorkflowRun},
         models::{ModelCatalog, Probe, harnesses_used, session_node_problem},
         ordered::OrderedMap,
         preflight::Preflight,
@@ -178,6 +178,9 @@ fn model_harness(model: &str) -> Option<&str> {
 
 pub(super) enum Seen {
     Working,
+    /// A cloud session whose instance is still being made ready, or whose first prompt waits
+    /// for it: there is no turn to see yet, and none to give up on.
+    Starting,
     Over(WorkflowTurn),
 }
 
@@ -188,6 +191,12 @@ pub(super) fn look(seen: Seen, armed: &mut bool, unstarted: &mut u32) -> Option<
     match seen {
         Seen::Working => {
             *armed = true;
+            None
+        }
+        // A start takes minutes and the node's own timeout covers it; the wait for a turn to
+        // appear begins once it is over.
+        Seen::Starting => {
+            *unstarted = 0;
             None
         }
         Seen::Over(turn) if *armed || matches!(turn.end, TurnEnd::Failed(_)) => {
@@ -229,10 +238,30 @@ impl Monos {
         if let Some(id) = self.workflow_live.ids.get(persisted) {
             return Some(*id);
         }
-        let id = locked(&self.store)
-            .ok()?
-            .resolve_session_id(persisted)
-            .ok()?;
+        let store = locked(&self.store).ok()?;
+        let id = match store.resolve_session_id(persisted) {
+            Ok(id) => id,
+            // A cloud session is not in the sessions table, so its persisted id (`remote:...`)
+            // is found among the remote sessions. The id a start was given while it was still
+            // being made ends in the local id, which stays the session's after the start.
+            Err(_) if persisted.starts_with("remote:") => {
+                let listed = store
+                    .sessions()
+                    .ok()?
+                    .into_iter()
+                    .map(|s| s.id)
+                    .filter(|id| *id < 0)
+                    .find(|id| store.persisted_session_id(*id).ok().as_deref() == Some(persisted));
+                let from_tail = || {
+                    let tail = persisted.rsplit(':').next()?.parse::<i64>().ok()?;
+                    (tail < 0 && store.remote_session(tail).ok().flatten().is_some())
+                        .then_some(tail)
+                };
+                listed.or_else(from_tail)?
+            }
+            Err(_) => return None,
+        };
+        drop(store);
         self.workflow_live.ids.insert(persisted.into(), id);
         Some(id)
     }
@@ -314,10 +343,37 @@ impl Monos {
             .upgrade()?
             .update(cx, |owner, cx| owner.mono_ensure_session(session, cx))?;
         let view = view.read(cx);
+        if view.is_cloud_session()
+            && let Some(wait) = self.workflow_cloud_wait(session, view)
+        {
+            return Some(wait);
+        }
         Some(match view.workflow_turn(cx) {
             Some(turn) => Seen::Over(turn),
             None => Seen::Working,
         })
+    }
+
+    /// What a cloud session still waits for before its first turn: the start the store keeps a
+    /// record of while the instance is created, connected or set up (the record is the truth,
+    /// whether or not the view has heard of it yet), or the first prompt waiting for the machine.
+    /// A start that failed ends the wait with its error.
+    fn workflow_cloud_wait(&self, session: i64, view: &Conversation) -> Option<Seen> {
+        let record = locked(&self.store)
+            .ok()
+            .and_then(|store| monocode_core::cloud_sessions::start_record(&store, session));
+        match record {
+            Some(record) => Some(match record.error {
+                Some(error) => Seen::Over(WorkflowTurn {
+                    end: TurnEnd::Failed(format!("The cloud instance could not start: {error}")),
+                    reply: String::new(),
+                }),
+                None => Seen::Starting,
+            }),
+            None => view
+                .workflow_first_prompt_waiting()
+                .then_some(Seen::Starting),
+        }
     }
 
     /// Starts a workflow node's session through the `sessions.start` path as the Mono: full
@@ -342,13 +398,18 @@ impl Monos {
         if !mono.works_on(&req.project) {
             return Err("Not one of your projects".into());
         }
-        // A model alone is started in its own harness, as the picker pins both.
-        let harness = req.harness.clone().or_else(|| {
-            req.model
-                .as_deref()
-                .and_then(model_harness)
-                .map(str::to_owned)
-        });
+        // A model alone is started in its own harness, as the picker pins both. A cloud step
+        // runs Claude.
+        let harness = req
+            .harness
+            .clone()
+            .or_else(|| {
+                req.model
+                    .as_deref()
+                    .and_then(model_harness)
+                    .map(str::to_owned)
+            })
+            .or_else(|| req.target.is_some().then(|| "claude".to_owned()));
         let mut input = json!({
             "project": req.project,
             "prompt": req.prompt,
@@ -369,11 +430,14 @@ impl Monos {
         if let Some(effort) = &req.effort {
             input["effort"] = json!(effort);
         }
-        if req.new_worktree {
-            input["workspaceMode"] = json!("worktree");
-        }
-        if let Some(cwd) = &req.worktree_cwd {
-            input["worktreeCwd"] = json!(cwd);
+        // A cloud session works in its instance's own checkout: never a worktree.
+        if req.target.is_none() {
+            if req.new_worktree {
+                input["workspaceMode"] = json!("worktree");
+            }
+            if let Some(cwd) = &req.worktree_cwd {
+                input["worktreeCwd"] = json!(cwd);
+            }
         }
         // Nesting is decoration: a parent the app does not know is just a top-level session.
         if let Some(parent) = req
@@ -388,6 +452,25 @@ impl Monos {
         }
         if let Some(name) = &req.folder_name {
             input["folderName"] = json!(name);
+        }
+        // The `sessions.start` target, with the instance of another session resolved. The Mono
+        // API checks it before a start; this path skips that, so it is checked here, before
+        // anything is created.
+        if let Some(cloud) = &req.target {
+            let instance = match &cloud.instance {
+                CloudInstance::New => json!("new"),
+                CloudInstance::OfSession(persisted) => {
+                    let local = self
+                        .workflow_local_id(persisted)
+                        .ok_or("The cloud instance to use is no longer available")?;
+                    json!({"session": local})
+                }
+            };
+            let mut target = cloud.options.clone();
+            target.insert("kind".into(), json!(cloud.kind));
+            target.insert("instance".into(), instance);
+            input["target"] = serde_json::Value::Object(target);
+            monocode_core::mono::cloud_api::validate::validate_target(&input["target"], &input)?;
         }
         let options = StartOptions {
             lenient_parent: true,
@@ -416,6 +499,13 @@ impl Monos {
                     reuse_session: None,
                     nest_under: None,
                     timeout_minutes: None,
+                    // Which cloud kind or instance does not matter to the model check; that it is
+                    // a cloud step does (Claude runs in the instance, not here).
+                    target: req.target.as_ref().map(|cloud| SessionTarget {
+                        kind: cloud.kind.clone(),
+                        instance: TargetInstance::New,
+                        options: OrderedMap::new(),
+                    }),
                 },
             )
         });
@@ -507,7 +597,12 @@ impl Monos {
             return Err("The session cannot be stopped from a workflow".into());
         }
         if let Some((_, view)) = self.workflow_view(persisted, cx) {
-            view.update(cx, |v, cx| v.mono_stop_turn(cx));
+            view.update(cx, |v, cx| {
+                v.mono_stop_turn(cx);
+                // A cloud session still starting must not send its first prompt once it is
+                // ready. The instance itself is never stopped or deleted here.
+                v.workflow_drop_first_prompt(cx);
+            });
         }
         Ok(())
     }
@@ -521,6 +616,27 @@ impl Monos {
             title: view.summary.title.clone(),
             harness: view.summary.provider.clone(),
             model: view.mono_model(),
+        })
+    }
+
+    /// The instance a cloud session runs on, from the store alone (nothing is woken or asked).
+    /// A session whose instance is not named yet is still starting: the start record names it
+    /// once it has one.
+    fn workflow_cloud_instance(&mut self, persisted: &str) -> Option<CloudInstanceInfo> {
+        let local = self.workflow_local_id(persisted)?;
+        let store = locked(&self.store).ok()?;
+        let cloud = store
+            .remote_session(local)
+            .ok()
+            .flatten()
+            .and_then(|remote| remote.project.cloud())
+            .or_else(|| {
+                monocode_core::cloud_sessions::start_record(&store, local)
+                    .and_then(|record| record.cloud())
+            })?;
+        Some(CloudInstanceInfo {
+            kind: cloud.kind.api_name().into(),
+            name: Some(cloud.name),
         })
     }
 
@@ -856,6 +972,11 @@ impl WorkflowHost for AppHost {
 
     fn session_info(&self, session_id: &str) -> Option<SessionInfo> {
         self.with(|m, cx| m.workflow_info(session_id, cx)).flatten()
+    }
+
+    fn cloud_instance(&self, session_id: &str) -> Option<CloudInstanceInfo> {
+        self.with(|m, _| m.workflow_cloud_instance(session_id))
+            .flatten()
     }
 
     fn run_command(

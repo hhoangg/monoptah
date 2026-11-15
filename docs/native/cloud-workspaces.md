@@ -206,6 +206,30 @@ item stays.
   backend lists nothing, the chip stays hidden when nothing runs, and there is no toast or error
   text. The dialog is where such a problem is explained.
 
+## Workflow cloud steps
+
+A workflow session node can run in a workspace: give it a `target`
+(`{"kind": "codespace" | "sandbox", "instance": "new" | {"sameAs": "<node id>"}, ...options}`), the
+same shape `sessions.start` takes. The rules, which `workflows.validate` checks:
+
+* A cloud step runs Claude only, and its `checkout` must be `root` (use `target.branch` to start
+  from a branch). Options are literal text (no `{{...}}` templates), apply only to a new instance and
+  are the options of that kind's `sessions.start` target.
+* `sameAs` shares the instance of an earlier cloud step of the same kind. In a loop, `reuseSession`
+  true continues the same session; false starts a new session on the same instance as the previous
+  round. Each For each item gets its own instance for `new`.
+* A local step cannot use `worktreeOf` a cloud step, and `timeoutMinutes` includes the instance start
+  time.
+* The app never stops or deletes an instance when a run ends, fails or is stopped. The run report
+  lists the instances the run used, so you can stop or delete them here. An instance that finishes
+  starting after the run was stopped is named in a short follow-up message. Stopping the run stops
+  the running turns, and a step still starting does not send its prompt later. A failed step does
+  not either.
+* After the app is closed during a run, a resumed run goes on in the instance its interrupted step
+  had (it does not create another) and drops that step's old first prompt. If the app restarted
+  and the instance became ready before the run was resumed, that old prompt may already have run
+  there.
+
 ## Cost numbers are estimates
 
 * Docker (USD per hour, from Docker's usage page): Micro 1 vCPU/2g $0.07, Small 2/4g $0.14, Medium

@@ -54,6 +54,57 @@ fn the_reuse_switch_shows_on_sessions_in_a_loop_body_only(cx: &mut TestAppContex
 }
 
 #[gpui::test]
+fn a_cloud_step_shows_where_it_runs_and_an_edit_keeps_its_target(cx: &mut TestAppContext) {
+    use monocode_core::mono::workflows::{
+        model::{SessionTarget, TargetInstance},
+        ordered::{Json, OrderedMap},
+    };
+    let s = setup(cx);
+    let mut w = ticket(json!({}));
+    let mut options = OrderedMap::new();
+    options.insert("branch", Json::String("trunk".into()));
+    let cloud = SessionTarget {
+        kind: "codespace".into(),
+        instance: TargetInstance::New,
+        options,
+    };
+    if let NodeKind::Session { target, .. } = &mut w.nodes[1].kind {
+        *target = Some(cloud.clone());
+    }
+    let mut visual = open_board(&s, &w, cx);
+    let visual = &mut visual;
+    event(&s, visual, GraphEvent::Click("fetch".into()));
+    assert!(visual.debug_bounds("wf-target").is_some());
+    // Edits in place (the prompt, the limit, the model) leave the target as it is.
+    type_in(
+        &s,
+        visual,
+        BoardField::Prompt("fetch".into()),
+        "List them all.",
+    );
+    type_in(&s, visual, BoardField::Limit("fetch".into()), "30");
+    let claude = monocode_core::provider::Kind::Claude;
+    do_with(&s, visual, |m, cx| {
+        m.board_model_picked("fetch", claude, Some("claude-opus-4-6".into()), cx)
+    });
+    let NodeKind::Session {
+        target,
+        prompt,
+        timeout_minutes,
+        ..
+    } = node_of(&s, visual, "fetch").kind
+    else {
+        panic!()
+    };
+    assert_eq!(prompt, "List them all.");
+    assert_eq!(timeout_minutes, Some(30.));
+    assert_eq!(target, Some(cloud));
+    // A step on this computer has no such row.
+    event(&s, visual, GraphEvent::Click("dev".into()));
+    assert!(visual.debug_bounds("wf-target").is_none());
+}
+
+#[gpui::test]
 fn picking_a_model_writes_its_harness_and_model_and_drops_the_effort(cx: &mut TestAppContext) {
     let s = setup(cx);
     let mut w = ticket(json!({}));

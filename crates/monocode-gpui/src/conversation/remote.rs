@@ -100,6 +100,34 @@ impl Conversation {
                 || self.remote_state.app_prompt_waiting
                 || self.remote_state.app_draft_launched)
     }
+    /// The first prompt of an app launch waits for the machine: the start is over, the prompt
+    /// has not gone out yet.
+    pub(crate) fn workflow_first_prompt_waiting(&self) -> bool {
+        self.remote_state.app_prompt_waiting
+            || self
+                .cloud_start
+                .as_ref()
+                .is_some_and(|s| s.phase == crate::cloud_start_view::StartPhase::Starting)
+    }
+    /// A workflow stops this session: the first prompt of its launch, still waiting for the
+    /// instance, is dropped so it is not sent once the instance is ready. A turn already running
+    /// is stopped separately, and nothing is done to the instance.
+    pub(crate) fn workflow_drop_first_prompt(&mut self, cx: &mut Context<Self>) {
+        if !self.is_cloud_session() {
+            return;
+        }
+        if matches!(self.stored_app_draft(), Ok(Some(draft)) if draft.id.starts_with("app-prompt-"))
+        {
+            self.drop_stored_app_draft();
+        }
+        self.remote_state.app_prompt_waiting = false;
+        // A follow-up parked while the history loads would be flushed by the next load.
+        self.mono_ui.external = None;
+        if self.cloud_queued.take().is_some() {
+            self.sync_cloud_chrome(cx);
+        }
+        cx.notify();
+    }
     /// Publishes the shell's view of the start. `None` forgets it.
     pub(crate) fn set_cloud_start(
         &mut self,
@@ -344,7 +372,7 @@ impl Conversation {
     }
     /// A remote session that lives in a codespace or a Docker sandbox: Claude only, so the
     /// model picker offers no other harness.
-    pub(super) fn is_cloud_session(&self) -> bool {
+    pub(crate) fn is_cloud_session(&self) -> bool {
         self.cloud_noun().is_some()
     }
     /// `codespace` or `sandbox` for a cloud session, `None` for any other.

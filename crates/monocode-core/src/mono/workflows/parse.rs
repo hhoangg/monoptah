@@ -2,8 +2,8 @@
 //! dropping it quietly would change what the workflow does, so the whole entry is left out.
 use super::model::{
     Checkout, Cwd, Decide, Edge, Handle, InputType, InputValue, LoopSpec, Node, NodeKind,
-    OutputField, OutputFieldType, Requirement, RequirementKind, Ui, Workflow, WorkflowInput,
-    NODE_TYPES,
+    OutputField, OutputFieldType, Requirement, RequirementKind, SessionTarget, TargetInstance, Ui,
+    Workflow, WorkflowInput, NODE_TYPES,
 };
 use super::ordered::{Json, OrderedMap};
 use crate::mono::habits::Schedule;
@@ -76,6 +76,37 @@ fn parse_checkout(raw: Option<&Json>) -> Option<Checkout> {
     }
 }
 
+/// `Some(None)` when there is no target, `None` when it is there but unreadable.
+fn parse_target(raw: Option<&Json>) -> Option<Option<SessionTarget>> {
+    let Some(raw) = raw else {
+        return Some(None);
+    };
+    let fields = raw.as_object()?;
+    let kind = str_of(raw, "kind")?;
+    let instance = match fields.get("instance") {
+        None => TargetInstance::New,
+        Some(Json::String(s)) if s == "new" => TargetInstance::New,
+        Some(other) => match other.as_object() {
+            Some(o) if o.len() == 1 => match o.get("sameAs") {
+                Some(Json::String(id)) if !id.is_empty() => TargetInstance::SameAs(id.clone()),
+                _ => TargetInstance::Invalid(other.clone()),
+            },
+            _ => TargetInstance::Invalid(other.clone()),
+        },
+    };
+    let mut options = OrderedMap::new();
+    for (key, value) in fields.iter() {
+        if key != "kind" && key != "instance" {
+            options.push_unique(key.clone(), value.clone());
+        }
+    }
+    Some(Some(SessionTarget {
+        kind,
+        instance,
+        options,
+    }))
+}
+
 fn parse_output(raw: Option<&Json>) -> Option<OrderedMap<OutputField>> {
     let Some(raw) = raw else {
         return Some(OrderedMap::new());
@@ -135,6 +166,7 @@ pub fn parse_node(raw: &Json) -> Option<Node> {
             reuse_session: bool_of(raw, "reuseSession"),
             nest_under: str_of(raw, "nestUnder"),
             timeout_minutes: num_of(raw, "timeoutMinutes"),
+            target: parse_target(raw.get("target"))?,
         },
         "command" => NodeKind::Command {
             project: str_of(raw, "project")?,

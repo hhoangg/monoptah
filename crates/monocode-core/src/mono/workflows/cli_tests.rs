@@ -2491,3 +2491,61 @@ fn the_store_host_refuses_a_run_value_project_outside_the_assigned_projects() {
         Some("/anywhere")
     );
 }
+
+// ---- cloud targets ------------------------------------------------------------------------
+
+fn cloud_definition(first: Value, second: Value) -> Value {
+    let mut nodes = definition_nodes();
+    let fetch = nodes.iter_mut().find(|n| n["id"] == "fetch").unwrap();
+    fetch["target"] = first;
+    nodes.insert(
+        2,
+        json!({
+            "id": "next", "type": "session", "project": "{{inputs.project}}",
+            "prompt": "go on", "checkout": "root", "output": {}, "target": second
+        }),
+    );
+    definition(json!({
+        "nodes": nodes,
+        "edges": [
+            {"from": "trigger", "to": "fetch"},
+            {"from": "fetch", "to": "next"},
+            {"from": "next", "to": "report"}
+        ]
+    }))
+}
+
+#[test]
+fn validate_add_and_update_report_cloud_target_issues() {
+    let mut f = Fx::new();
+    let good = cloud_definition(
+        json!({"kind": "codespace", "branch": "main"}),
+        json!({"kind": "codespace", "instance": {"sameAs": "fetch"}}),
+    );
+    let ok = f.ok("workflows.validate", json!({"workflow": good}));
+    assert_eq!(messages(&ok), Vec::<String>::new());
+    let bad = cloud_definition(
+        json!({"kind": "codespace"}),
+        json!({"kind": "sandbox", "instance": {"sameAs": "fetch"}}),
+    );
+    let validated = f.ok("workflows.validate", json!({"workflow": bad}));
+    assert!(joined(&validated).contains("must be the same kind"));
+    let added = f.add(bad.clone());
+    assert_eq!(validated.get("issues"), added.get("issues"));
+    let id = id_of(&added);
+    let updated = f.ok("workflows.update", json!({"id": id, "workflow": bad}));
+    assert_eq!(validated.get("issues"), updated.get("issues"));
+}
+
+#[test]
+fn a_target_that_is_not_an_object_names_the_node_in_the_error() {
+    let mut f = Fx::new();
+    for target in [json!("codespace"), json!({"instance": "new"})] {
+        let e = f.err(
+            "workflows.validate",
+            json!({"workflow": cloud_definition(target, json!({"kind": "codespace"}))}),
+        );
+        assert!(e.contains("nodes[1] (\"fetch\")"), "{e}");
+        assert!(e.contains("wrong type"), "{e}");
+    }
+}

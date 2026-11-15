@@ -7,7 +7,8 @@
 //! handed to someone else.
 use super::model::{
     new_workflow_id, Checkout, Cwd, Decide, Edge, InputValue, Node, NodeId, NodeKind, OutputField,
-    OutputFieldType, Requirement, Workflow, WorkflowId, WorkflowInput, NODE_TYPES,
+    OutputFieldType, Requirement, SessionTarget, TargetInstance, Workflow, WorkflowId,
+    WorkflowInput, NODE_TYPES,
 };
 use super::models::{workflow_issues, ModelCatalog};
 use super::ordered::{Json, OrderedMap};
@@ -96,6 +97,33 @@ fn worktree_of(id: &str) -> Doc {
     Doc::Map(vec![("worktreeOf".to_string(), text(id))])
 }
 
+fn doc_of(value: &Json) -> Doc {
+    match value {
+        Json::Null => Doc::Null,
+        Json::Bool(b) => Doc::Bool(*b),
+        Json::Number(n) => Doc::Num(*n),
+        Json::String(s) => text(s),
+        Json::Array(items) => Doc::Seq(items.iter().map(doc_of).collect()),
+        Json::Object(map) => Doc::Map(map.iter().map(|(k, v)| (k.clone(), doc_of(v))).collect()),
+    }
+}
+
+fn export_target(target: &SessionTarget) -> Doc {
+    let mut out = vec![("kind".to_string(), text(&target.kind))];
+    match &target.instance {
+        TargetInstance::New => {}
+        TargetInstance::SameAs(id) => out.push((
+            "instance".to_string(),
+            Doc::Map(vec![("sameAs".to_string(), text(id))]),
+        )),
+        TargetInstance::Invalid(raw) => out.push(("instance".to_string(), doc_of(raw))),
+    }
+    for (key, value) in target.options.iter() {
+        out.push((key.clone(), doc_of(value)));
+    }
+    Doc::Map(out)
+}
+
 fn export_node(node: &Node) -> Doc {
     let mut out = vec![
         ("id".to_string(), text(&node.id)),
@@ -125,6 +153,7 @@ fn export_node(node: &Node) -> Doc {
             reuse_session,
             nest_under,
             timeout_minutes,
+            target,
         } => {
             put(&mut out, "project", Some(text(project)));
             put(&mut out, "harness", harness.as_deref().map(text));
@@ -142,6 +171,7 @@ fn export_node(node: &Node) -> Doc {
             put(&mut out, "nestUnder", nest_under.as_deref().map(text));
             put(&mut out, "reuseSession", reuse_session.map(Doc::Bool));
             put(&mut out, "timeoutMinutes", timeout_minutes.map(number));
+            put(&mut out, "target", target.as_ref().map(export_target));
             put(&mut out, "prompt", Some(text(prompt)));
             put(&mut out, "output", Some(export_output(output)));
         }

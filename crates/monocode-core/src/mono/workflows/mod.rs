@@ -9,6 +9,8 @@ mod board_model_tests;
 pub mod cli;
 #[cfg(test)]
 mod cli_tests;
+#[cfg(test)]
+mod cloud_target_tests;
 pub mod command;
 pub mod condition;
 pub mod engine;
