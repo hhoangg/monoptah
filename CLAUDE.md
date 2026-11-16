@@ -11,7 +11,7 @@ Full rules and examples: [`docs/git-conventions.md`](docs/git-conventions.md).
 - Types (branch, commit, PR): `feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `build`, `ci`, `chore`, `revert`.
 - Branch: `<type>/<issue#>-<short-slug>` or `<type>/<short-slug>`, lowercase, about 40 chars. Rename an app-made `mc/...` branch with `git branch -m` before the first push.
 - Commit: `<type>(<scope>): <summary>` (imperative, at most 72 chars, no period), English. A body (why and what) is required for `feat` and `fix`; add `Refs: #N` or `Fixes: #N` when there is an issue. One buildable change per commit.
-- PR: title in the commit format; the body fills every section of `.github/pull_request_template.md`, keeping its headings. Merge with squash.
+- PR: title in the commit format; the body fills every section of `.github/pull_request_template.md`, keeping its headings. Merge with squash, except upstream-sync PRs, which use a merge commit.
 - Never commit to `main`, never force-push a branch with an open PR, never commit secrets or realistic-looking fake tokens.
 
 ## After every merge from upstream
