@@ -790,7 +790,8 @@ impl Shell {
                 d.child(self.right_panel_frame(panel, right_width, full, window, cx))
             })
     }
-    /// The usage chips with the terminal controls at the far end, and the cloud chip after them.
+    /// The usage chips with the terminal controls group at the far end; the cloud chip is that
+    /// group's last item.
     fn footer_row(&mut self, cx: &mut Context<Self>) -> gpui::Div {
         let height = if self.workspace.boxy_layout() {
             28.
@@ -825,11 +826,26 @@ impl Shell {
                                 .when(!self.workspace.boxy_layout(), |d| d.mb(px(2.))),
                         )
                     })
-                    .children(terminal)
+                    // The terminal controls group ends with the cloud chip. Without the group (an
+                    // app view, no project) the chip stands alone at the end of the row, with the
+                    // margins the group would have. Hidden, it adds nothing.
+                    .map(|d| match terminal {
+                        Some(group) => d.child(group),
+                        None => {
+                            d.children(self.cloud_chip_item(false, cx).into_iter().map(|chip| {
+                                div()
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .ml(px(super::terminal_dock::FOOTER_GAP))
+                                    .when(!self.workspace.boxy_layout(), |d| {
+                                        d.mr(px(6.)).pb(px(2.))
+                                    })
+                                    .child(chip)
+                            }))
+                        }
+                    })
             })
-            // The cloud chip is the outermost element on the right; it draws nothing (and takes
-            // no room) while the project has no cloud workspace.
-            .child(self.usage_footer.read(cx).cloud_chip().clone())
     }
     /// ResourcePressureNotice's chip, just before the terminal controls.
     fn pressure_chip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {

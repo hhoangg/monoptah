@@ -9467,6 +9467,17 @@ impl Render for Shell {
             self.window_active = window.is_window_active();
             self.sync_cloud_chip_window(cx);
             let chip = self.usage_footer.read(cx).cloud_chip().clone();
+            // The chip is an item of the footer's terminal controls group, which the shell lays
+            // out: showing or hiding it redraws the shell. Its other changes redraw only itself.
+            let mut chip_shown = chip.read(cx).visible();
+            self.observations
+                .push(cx.observe(&chip, move |_, chip, cx| {
+                    let shown = chip.read(cx).visible();
+                    if shown != chip_shown {
+                        chip_shown = shown;
+                        cx.notify();
+                    }
+                }));
             self.observations.push(cx.subscribe_in(
                 &chip,
                 window,

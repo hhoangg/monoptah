@@ -2,7 +2,7 @@
 
 Cost control for cloud sessions. A failed or forgotten codespace or Docker sandbox keeps drawing
 quota (Codespaces: the free dollar pool) or credit (Docker: per runtime second, billed to the card
-after the credit). The **cloud chip** at the right end of the footer (see "The footer chip")
+after the credit). The **cloud chip** in the footer, right of Terminal (see "The footer chip"),
 shows what the project has (running, stopping, stopped, failed, deleting or unknown) and is
 hidden when it has none; clicking it opens a side drawer, sliding in from the right and out
 again when it closes, that lists them all and lets you stop or delete them. The drawer is the
@@ -167,9 +167,12 @@ still lists.
 
 ## The footer chip
 
-The cost is visible without opening anything: a **cloud chip** sits at the far right of the footer,
-after the terminal controls, as the outermost element (cloud glyph and the counts: `2 running`,
-`1 stopping`, `1 stopped`, `1 failed`, `1 deleting`, `1 unknown` or several, such as
+The cost is visible without opening anything: a **cloud chip** sits in the footer as the last item
+of the terminal controls group (Actions, Terminal), directly right of the Terminal button, or of the
+running-terminals chip that replaces it, after the group's separator. It is the same footer button
+as Terminal, at the same text size and height. Where the footer has no terminal controls (an app
+view, no project) it stands alone at the end of the row. It shows the cloud glyph and the counts
+(`2 running`, `1 stopping`, `1 stopped`, `1 failed`, `1 deleting`, `1 unknown` or several, such as
 `2 running, 1 stopping`).
 It is one click or one Enter or Space (it is focusable like the usage chip) from the Cloud
 workspaces drawer. The project menu no longer has a Cloud workspaces item.
