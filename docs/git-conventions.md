@@ -87,6 +87,7 @@ Fixes: #151
 - Agents that create a PR with `gh pr create --body` must read the template and fill every
   section.
 - Merge with squash. The squash commit title is the PR title; GitHub appends the PR number.
+- Exception: a PR that merges upstream (`hardbeat920/monocode`) into this fork is merged with a merge commit (`gh pr merge --merge`), never squashed. Squashing drops upstream history, so the next upstream merge conflicts again.
 
 ## Issues
 
