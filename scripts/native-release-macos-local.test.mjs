@@ -40,9 +40,17 @@ const V = "0.40.5";
 const SHA = "a".repeat(40);
 
 test("arguments: a plain version, optional --dry-run, nothing else", () => {
-  assert.deepEqual(parseArgs([V]), { version: V, dryRun: false, recheck: false });
-  assert.deepEqual(parseArgs([V, "--dry-run"]), { version: V, dryRun: true, recheck: false });
-  assert.deepEqual(parseArgs(["--dry-run", V, "--recheck"]), { version: V, dryRun: true, recheck: true });
+  const base = { version: V, dryRun: false, recheck: false, since: undefined, notesFile: undefined };
+  assert.deepEqual(parseArgs([V]), base);
+  assert.deepEqual(parseArgs([V, "--dry-run"]), { ...base, dryRun: true });
+  assert.deepEqual(parseArgs(["--dry-run", V, "--recheck"]), { ...base, dryRun: true, recheck: true });
+  assert.deepEqual(parseArgs([V, "--since", "native-v0.40.0", "--notes=hl.md"]), {
+    ...base,
+    since: "native-v0.40.0",
+    notesFile: "hl.md",
+  });
+  assert.throws(() => parseArgs([V, "--since"]), /--since needs a value/);
+  assert.throws(() => parseArgs([V, "--notes", "--dry-run"]), /--notes needs a value/);
   assert.throws(() => parseArgs([]), /usage/);
   assert.throws(() => parseArgs(["--dry-run"]), /usage/);
   assert.throws(() => parseArgs(["0.40.5-preview.1"]), /plain native release version/);
@@ -114,7 +122,6 @@ const good = {
   head: SHA,
   originMain: SHA,
   dirty: "",
-  notesFirstLine: `# Monoptah Native ${V}`,
   localTag: false,
   remoteTag: false,
   remoteTagCheckFailed: null,
@@ -135,7 +142,6 @@ test("every precondition failure is reported with an actionable message", () => 
     [{ branch: "" }, /\(detached\)/],
     [{ head: "b".repeat(40) }, /not origin\/main.*git pull --ff-only/],
     [{ dirty: " M package.json" }, /tracked changes.*package\.json/s],
-    [{ notesFirstLine: "# Monoptah Native 0.40.4" }, /must be exactly "# Monoptah Native 0\.40\.5".*0\.40\.4/],
     [{ localTag: true }, /already exists locally.*git tag -d native-v0\.40\.5/],
     [{ remoteTag: true }, /already exists on origin/],
     [{ remoteTagCheckFailed: "denied" }, /Could not check the tag on origin: denied/],
@@ -166,6 +172,21 @@ function fakeRun(overrides = {}) {
     "gh auth status": { status: 0 },
     [`gh api repos/hhoangg/monoptah/releases/tags/native-v${V}`]: { status: 1, stderr: "gh: Not Found (HTTP 404)" },
     [`gh api ${ciRunsPath(SHA)} --jq .total_count`]: { status: 0, stdout: "1\n" },
+    "git tag --list native-v*": { status: 0, stdout: "native-v0.40.4\nnative-v0.40.5-preview.1\n" },
+    "git merge-base --is-ancestor native-v0.40.4 HEAD": { status: 0 },
+    "git log --first-parent --format=%H%x1f%s%x1f%b%x1e native-v0.40.4..HEAD": {
+      status: 0,
+      stdout:
+        "c1\x1ffeat(ui): new panel (#7)\x1f\x1e\nc2\x1fMerge pull request #8 from hhoangg/fix/y\x1ffix: y\x1f\x1e\n",
+    },
+    "gh api repos/hhoangg/monoptah/pulls/7 --jq {title: .title, labels: [.labels[].name]}": {
+      status: 0,
+      stdout: JSON.stringify({ title: "feat(ui): new panel", labels: [] }),
+    },
+    "gh api repos/hhoangg/monoptah/pulls/8 --jq {title: .title, labels: [.labels[].name]}": {
+      status: 0,
+      stdout: JSON.stringify({ title: "fix(core): y is fixed", labels: [] }),
+    },
     ...overrides,
   };
   return (command, args) => {
@@ -174,21 +195,20 @@ function fakeRun(overrides = {}) {
     return { stdout: "", stderr: "", ...table[key] };
   };
 }
-const notesText = `# Monoptah Native ${V}\n\nBody\n`;
+const docsNotes = `# Monoptah Native ${V}\n\nBody\n`;
 
 test("gatherState reads the repository state through the injected runner", () => {
-  const state = gatherState(fakeRun(), { version: V, notesText });
+  const state = gatherState(fakeRun(), { version: V });
   assert.deepEqual(evaluatePreconditions(state, V), []);
   assert.equal(state.release, "absent");
   assert.equal(state.ciRuns, 1);
-  assert.equal(state.notesFirstLine, `# Monoptah Native ${V}`);
 });
 
 test("gatherState: only HTTP 404 means no release, other gh errors fail", () => {
   const key = `gh api repos/hhoangg/monoptah/releases/tags/native-v${V}`;
-  const exists = gatherState(fakeRun({ [key]: { status: 0, stdout: "{}" } }), { version: V, notesText });
+  const exists = gatherState(fakeRun({ [key]: { status: 0, stdout: "{}" } }), { version: V });
   assert.equal(exists.release, "exists");
-  const broken = gatherState(fakeRun({ [key]: { status: 1, stderr: "gh: Bad credentials (HTTP 401)" } }), { version: V, notesText });
+  const broken = gatherState(fakeRun({ [key]: { status: 1, stderr: "gh: Bad credentials (HTTP 401)" } }), { version: V });
   assert.equal(broken.release, "error");
   assert.ok(evaluatePreconditions(broken, V).some((p) => /HTTP 401/.test(p)));
 });
@@ -200,7 +220,7 @@ test("gatherState: tags and CI are detected", () => {
       [`git ls-remote --tags origin refs/tags/native-v${V}`]: { status: 0, stdout: `${SHA}\trefs/tags/native-v${V}\n` },
       [`gh api ${ciRunsPath(SHA)} --jq .total_count`]: { status: 0, stdout: "0\n" },
     }),
-    { version: V, notesText },
+    { version: V },
   );
   assert.equal(state.localTag, true);
   assert.equal(state.remoteTag, true);
@@ -208,7 +228,7 @@ test("gatherState: tags and CI are detected", () => {
   assert.equal(evaluatePreconditions(state, V).length, 3);
   const failedGh = gatherState(
     fakeRun({ [`gh api ${ciRunsPath(SHA)} --jq .total_count`]: { status: 1, stderr: "boom" } }),
-    { version: V, notesText },
+    { version: V },
   );
   assert.equal(failedGh.ciCheckFailed, "boom");
 });
@@ -225,7 +245,13 @@ test("the CI query is the one the workflow gate uses", () => {
 });
 
 const names = assetNames(V);
-const params = { version: V, sha: SHA, dir: "/tmp/out", files: [names.updater, names.zip, names.sha256] };
+const params = {
+  version: V,
+  sha: SHA,
+  dir: "/tmp/out",
+  files: [names.updater, names.zip, names.sha256],
+  notesFile: "/tmp/out/release-notes.md",
+};
 
 test("publish commands: tag at the checked commit, push only that tag, release with the three files, dispatch", () => {
   const commands = publishCommands(params);
@@ -238,7 +264,7 @@ test("publish commands: tag at the checked commit, push only that tag, release w
   assert.deepEqual(release.slice(3, 6), params.files.map((n) => join("/tmp/out", n)));
   for (const flag of ["--verify-tag", "--latest=false"]) assert.ok(release.includes(flag));
   assert.equal(release[release.indexOf("--title") + 1], "Monoptah Native 0.40.5");
-  assert.equal(release[release.indexOf("--notes-file") + 1], NOTES_FILE);
+  assert.equal(release[release.indexOf("--notes-file") + 1], "/tmp/out/release-notes.md");
   assert.deepEqual(commands[3].args.slice(0, 3), ["workflow", "run", "native-release-monoptah.yml"]);
   assert.deepEqual(commands[3].args.slice(-4), ["--ref", "main", "-f", "tag=native-v0.40.5"]);
   assert.ok(!JSON.stringify(commands).includes("SIGNING"));
@@ -294,9 +320,11 @@ test("an interrupt message names the step and how to continue", () => {
 });
 
 // A fake io that records every command, so the tests can check the order.
-function fakeIo({ files = true, headAfter = SHA, dirtyAfter = "", stamp = null, failOn = null } = {}) {
+function fakeIo({ files = true, headAfter = SHA, dirtyAfter = "", stamp = null, failOn = null, docs = docsNotes } = {}) {
   const events = [];
   const written = [];
+  const logs = [];
+  const texts = {};
   let revParses = 0;
   let statuses = 0;
   const table = {
@@ -333,7 +361,7 @@ function fakeIo({ files = true, headAfter = SHA, dirtyAfter = "", stamp = null, 
         throw new Error(`${key} failed (exit 1)`);
       }
     },
-    readText: (path) => (path === NOTES_FILE ? notesText : read(path)),
+    readText: (path) => (path === NOTES_FILE ? docs : read(path)),
     exists: (path) => (path === STAMP_FILE ? stamp !== null : true),
     listDir: () => (files ? ["artifacts-macos-aarch64.json", names.updater, names.zip, names.sha256] : []),
     makeTempDir: () => "/tmp/out",
@@ -342,13 +370,17 @@ function fakeIo({ files = true, headAfter = SHA, dirtyAfter = "", stamp = null, 
       written.push(text);
       events.push("writeStamp");
     },
-    log: () => {},
+    writeText: (path, text) => {
+      texts[path] = text;
+      events.push(`writeText ${path}`);
+    },
+    log: (text) => logs.push(text),
   };
   if (stamp !== null) {
     const readText = io.readText;
     io.readText = (path) => (path === STAMP_FILE ? stamp : readText(path));
   }
-  return { io, events, written };
+  return { io, events, written, logs, texts };
 }
 const visible = (events) => events.filter((e) => e.startsWith("visible ")).map((e) => e.slice(8));
 
@@ -474,4 +506,48 @@ test("a child killed by a signal is an interrupt, a plain failure is not", () =>
   assert.equal(failed.interrupted, undefined);
   assert.match(failed.message, /git push failed \(exit 2\)/);
   assert.match(failureOf({ error: new Error("ENOENT") }, cmd).message, /Could not run git: ENOENT/);
+});
+
+test("runRelease generates the notes, prints them, writes them to the release dir and uses that file", async () => {
+  const { io, events, logs, texts } = fakeIo();
+  await runRelease([V], io);
+  const text = texts["/tmp/out/release-notes.md"];
+  assert.ok(text.startsWith(`# Monoptah Native ${V}\n\nBody\n\n## Changes since 0.40.4`));
+  assert.match(text, /### Features\n\n- New panel \(#7\)/);
+  assert.match(text, /### Fixes\n\n- Y is fixed \(#8\)/);
+  assert.ok(logs.join("\n").includes("- New panel (#7)"));
+  const release = visible(events).find((c) => c.startsWith("gh release create"));
+  assert.ok(release.endsWith("--notes-file /tmp/out/release-notes.md"));
+  assert.ok(events.indexOf("writeText /tmp/out/release-notes.md") < events.findIndex((e) => e.startsWith("visible git tag")));
+});
+
+test("runRelease --dry-run prints the notes and no longer needs a notes heading for this version", async () => {
+  const { io, logs, texts } = fakeIo({ docs: "# Monoptah Native 0.40.4\n\nOld notes\n" });
+  await runRelease([V, "--dry-run"], io);
+  const out = logs.join("\n");
+  assert.ok(out.includes(`# Monoptah Native ${V}`) && out.includes("- New panel (#7)"));
+  assert.match(out, /Ignoring docs\/native\/monoptah-release-notes\.md.*0\.40\.4/);
+  assert.ok(!texts["/tmp/out/release-notes.md"].includes("Old notes"));
+});
+
+test("runRelease --notes adds highlights and --since overrides the start", async () => {
+  const { io, texts } = fakeIo();
+  const readText = io.readText;
+  io.readText = (path) => (path === "hl.md" ? "# x\n\nHand written\n" : readText(path));
+  const capture = io.capture;
+  io.capture = (c, a) =>
+    a[0] === "rev-parse" && a[3] === "native-v0.40.4^{commit}"
+      ? { status: 0, stdout: "", stderr: "" }
+      : capture(c, a);
+  await runRelease([V, "--dry-run", "--notes", "hl.md", "--since", "native-v0.40.4"], io);
+  assert.match(texts["/tmp/out/release-notes.md"], /^# Monoptah Native 0\.40\.5\n\nHand written\n\n## Changes since 0\.40\.4/);
+});
+
+test("runRelease stops before the long checks when a PR cannot be read", async () => {
+  const { io, events } = fakeIo();
+  const capture = io.capture;
+  io.capture = (c, a) => (c === "gh" && a[1]?.includes("/pulls/7") ? { status: 1, stdout: "", stderr: "HTTP 401" } : capture(c, a));
+  await assert.rejects(runRelease([V], io), /Could not read pull request #7/);
+  assert.equal(visible(events).length, 0);
+  assert.ok(!events.some((e) => e.startsWith("capture xcrun")));
 });

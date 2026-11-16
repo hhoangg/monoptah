@@ -151,12 +151,6 @@ jobs:
             exit 1
           fi
           echo "MONOCODE_NATIVE_VERSION=$VERSION" >> "$GITHUB_ENV"
-          # The notes must be about this version; the sign step checks the heading
-          # again, but failing here saves a full build.
-          head -n 1 docs/native/monoptah-release-notes.md | grep -Fxq "# Monoptah Native $VERSION" || {
-            echo "docs/native/monoptah-release-notes.md must start with '# Monoptah Native $VERSION'" >&2
-            exit 1
-          }
 
       # Releases are cut from commits whose native.yml run on main succeeded. The
       # commit is the one checked out (the tag's), not the dispatching ref's.
@@ -432,6 +426,17 @@ jobs:
       - name: Describe the reused assets
         run: node scripts/native-release-monoptah.mjs records native-dist
 
+      # The release notes are the body of the release, written by the local script
+      # (generated from the merged PR titles). The feed carries the same text, so
+      # it is read from the release and not from the repository. The sign step
+      # checks that it starts with the heading of this version.
+      - name: Read the release notes from the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq .body > "$RUNNER_TEMP/release-notes.md"
+
       # Signs every updater package and the feed with the Tauri updater key. A
       # missing key, a missing platform or an unexpected file name fails the
       # step, so no unsigned or partial update can be published.
@@ -439,7 +444,7 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: node scripts/native-release-monoptah.mjs sign native-dist docs/native/monoptah-release-notes.md
+        run: node scripts/native-release-monoptah.mjs sign native-dist "$RUNNER_TEMP/release-notes.md"
 
       # Checks the feed and all five packages with the app's own verifier and the
       # public key compiled into the app. This stays on the native-dev profile:

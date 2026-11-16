@@ -7,10 +7,22 @@
 // the Homebrew cask.
 //
 // usage: npm run native:release:mac -- X.Y.Z [--dry-run] [--recheck]
-//   --dry-run runs every check, builds and packages, then prints the files and
-//   the commands it would run, without tagging, pushing or publishing.
+//          [--since REF] [--notes FILE]
+//   --dry-run runs every check, builds and packages, then prints the files, the
+//   generated release notes and the commands it would run, without tagging,
+//   pushing or publishing.
 //   --recheck runs npm run native:check even when a stamp says it already passed
 //   for this commit and this rustc (see checkStamp).
+//   --since REF starts the generated release notes at REF (a tag or commit)
+//   instead of the previous native-vX.Y.Z tag.
+//   --notes FILE adds the text of FILE (without a leading "# ..." line) as hand
+//   written highlights on top of the generated release notes.
+//
+// The release notes are generated from the titles of the pull requests merged
+// since the previous native tag (scripts/native-release-notes.mjs), so a
+// release needs no separate notes PR. If docs/native/monoptah-release-notes.md
+// starts with "# Monoptah Native X.Y.Z" for this version, its text is used as
+// highlights; a file for another version is ignored.
 //
 // The logic lives in exported pure functions and in runRelease, which takes its
 // side effects as an injected `io`, so the tests can run it without cargo, git
@@ -21,6 +33,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { REPOSITORY } from "./native-release-monoptah.mjs";
+import { generateNotes } from "./native-release-notes.mjs";
 import { PLATFORMS, releaseVersion } from "./package-native-monoptah.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
@@ -36,20 +49,37 @@ export function tagFor(version) {
   return `native-v${releaseVersion(version)}`;
 }
 
+export const USAGE =
+  "usage: npm run native:release:mac -- X.Y.Z [--dry-run] [--recheck] [--since REF] [--notes FILE]";
+
 export function parseArgs(argv) {
   let version;
   let dryRun = false;
   let recheck = false;
-  for (const arg of argv) {
-    if (arg === "--dry-run") dryRun = true;
+  let since;
+  let notesFile;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    // Options with a value: "--name VALUE" or "--name=VALUE".
+    const valued = /^(--since|--notes)(?:=(.*))?$/.exec(arg);
+    if (valued) {
+      let value = valued[2];
+      if (value === undefined) {
+        value = argv[i + 1];
+        i += 1;
+      }
+      if (value === undefined || value === "" || value.startsWith("--"))
+        throw new Error(`${valued[1]} needs a value. ${USAGE}`);
+      if (valued[1] === "--since") since = value;
+      else notesFile = value;
+    } else if (arg === "--dry-run") dryRun = true;
     else if (arg === "--recheck") recheck = true;
     else if (arg.startsWith("-")) throw new Error(`Unknown option: ${arg}`);
     else if (version === undefined) version = arg;
     else throw new Error(`Unexpected extra argument: ${arg}`);
   }
-  if (version === undefined)
-    throw new Error("usage: npm run native:release:mac -- X.Y.Z [--dry-run] [--recheck]");
-  return { version: releaseVersion(version), dryRun, recheck };
+  if (version === undefined) throw new Error(USAGE);
+  return { version: releaseVersion(version), dryRun, recheck, since, notesFile };
 }
 
 // The updater public key is the one the Tauri app trusts, from tauri.conf.json.
@@ -127,7 +157,7 @@ export function ciRunsPath(sha) {
 
 // Reads the state the preconditions look at. `run(command, args)` returns
 // { status, stdout, stderr } and never throws.
-export function gatherState(run, { version, notesText, tauriCli = true }) {
+export function gatherState(run, { version, tauriCli = true }) {
   const tag = tagFor(version);
   const out = (r) => (r.stdout ?? "").trim();
   const errorOf = (r) => (r.stderr || r.error?.message || "").trim();
@@ -139,7 +169,6 @@ export function gatherState(run, { version, notesText, tauriCli = true }) {
   state.head = out(run("git", ["rev-parse", "HEAD"]));
   state.originMain = out(run("git", ["rev-parse", "refs/remotes/origin/main"]));
   state.dirty = (run("git", ["status", "--porcelain", "--untracked-files=no"]).stdout ?? "").trimEnd();
-  state.notesFirstLine = notesText.split("\n", 1)[0];
   state.localTag = run("git", ["rev-parse", "-q", "--verify", `refs/tags/${tag}`]).status === 0;
   const remote = run("git", ["ls-remote", "--tags", "origin", `refs/tags/${tag}`]);
   state.remoteTagCheckFailed = remote.status !== 0 ? errorOf(remote) : null;
@@ -170,14 +199,10 @@ export function evaluatePreconditions(state, version) {
     problems.push(`The current branch is "${state.branch || "(detached)"}", not main. Run: git switch main`);
   if (!state.head || !state.originMain || state.head !== state.originMain)
     problems.push(
-      `HEAD (${(state.head ?? "").slice(0, 8)}) is not origin/main (${(state.originMain ?? "").slice(0, 8)}). Merge the release notes PR, then run: git pull --ff-only origin main (and push or drop any local commits).`,
+      `HEAD (${(state.head ?? "").slice(0, 8)}) is not origin/main (${(state.originMain ?? "").slice(0, 8)}). Merge the last PR, then run: git pull --ff-only origin main (and push or drop any local commits).`,
     );
   if (state.dirty)
     problems.push(`There are tracked changes. Commit, stash or discard them:\n${state.dirty}`);
-  if (state.notesFirstLine !== `# Monoptah Native ${version}`)
-    problems.push(
-      `The first line of ${NOTES_FILE} must be exactly "# Monoptah Native ${version}", found: "${state.notesFirstLine}". Edit the notes and merge them into main first.`,
-    );
   if (state.localTag)
     problems.push(`The tag ${tag} already exists locally. If it is a leftover, delete it: git tag -d ${tag}`);
   if (state.remoteTagCheckFailed !== null && state.remoteTagCheckFailed !== undefined)
@@ -204,7 +229,7 @@ export function evaluatePreconditions(state, version) {
 
 // The commands that publish, in order. `sha` pins the tag to the commit that
 // was checked.
-export function publishCommands({ version, sha, dir, files }) {
+export function publishCommands({ version, sha, dir, files, notesFile }) {
   const tag = tagFor(version);
   return [
     { step: "tag", command: "git", args: ["tag", tag, sha] },
@@ -224,7 +249,7 @@ export function publishCommands({ version, sha, dir, files }) {
         "--title",
         `Monoptah Native ${version}`,
         "--notes-file",
-        NOTES_FILE,
+        notesFile,
       ],
     },
     {
@@ -315,10 +340,11 @@ export class InterruptedError extends Error {
 //   io.visible(command, args, env)                            (throws on failure)
 //   io.readText(path), io.exists(path), io.listDir(dir)
 //   io.makeTempDir(version), io.removeDir(dir), io.writeStamp(text), io.log(text)
+//   io.writeText(path, text)
 // The order is: preconditions, toolchain checks, native:check (or its stamp),
 // build, package, the dry-run stop, a recheck of HEAD and the tree, then publish.
 export async function runRelease(argv, io) {
-  const { version, dryRun, recheck } = parseArgs(argv);
+  const { version, dryRun, recheck, since, notesFile } = parseArgs(argv);
   if (io.platform !== "darwin" || io.arch !== "arm64")
     throw new Error(
       "This builds the macOS arm64 app and must run on an Apple silicon Mac, not " + io.platform + "/" + io.arch + ".",
@@ -330,12 +356,23 @@ export async function runRelease(argv, io) {
   io.log("Checking preconditions for " + tag + "...");
   const state = gatherState(io.capture, {
     version,
-    notesText: io.readText(NOTES_FILE),
     tauriCli: io.exists("node_modules/@tauri-apps/cli"),
   });
   const problems = evaluatePreconditions(state, version);
   if (problems.length > 0) throw new Error("Cannot release " + tag + ":\n- " + problems.join("\n- "));
   const sha = state.head;
+
+  // Generated now so that a gh problem or a missing previous tag stops the
+  // release before the long checks and the build.
+  const notes = generateNotes({
+    run: io.capture,
+    version,
+    since,
+    docsText: io.exists(NOTES_FILE) ? io.readText(NOTES_FILE) : "",
+    notesFileText: notesFile === undefined ? undefined : io.readText(notesFile),
+  });
+  io.log(notes.note);
+  io.log("Release notes (" + notes.commits + " commits since " + notes.since + "):\n\n" + notes.text);
 
   // Fail fast, before the long checks.
   const sdk = io.capture("xcrun", ["--sdk", "macosx", "--show-sdk-version"]);
@@ -373,7 +410,9 @@ export async function runRelease(argv, io) {
   const pack = packageCommand(version, dir);
   io.visible(pack.command, pack.args, env);
   const files = macosReleaseFiles(version, io.listDir(dir));
-  const params = { version, sha, dir, files };
+  const notesPath = join(dir, "release-notes.md");
+  io.writeText(notesPath, notes.text);
+  const params = { version, sha, dir, files, notesFile: notesPath };
   const commands = publishCommands(params);
 
   io.log("\nmacOS release files:");
@@ -435,7 +474,7 @@ function readTreeState(capture) {
 }
 
 function realIo() {
-  const abs = (path) => join(root, path);
+  const abs = (path) => resolve(root, path);
   return {
     platform: process.platform,
     arch: process.arch,
@@ -450,6 +489,7 @@ function realIo() {
       if (failure) throw failure;
     },
     readText: (path) => readFileSync(abs(path), "utf8"),
+    writeText: (path, text) => writeFileSync(path, text),
     exists: (path) => existsSync(abs(path)),
     listDir: (dir) => readdirSync(dir),
     makeTempDir: (version) => mkdtempSync(join(tmpdir(), "monoptah-native-" + version + "-")),
