@@ -346,6 +346,37 @@ fn under_the_size_budget_ordinary_runs_go_before_one_that_names_instances() {
 }
 
 #[test]
+fn the_newest_run_is_kept_when_older_pinned_runs_alone_fill_the_budget() {
+    let root = temp_root();
+    let disk = dir(&root);
+    let mib = 1024 * 1024;
+    let pinned = |id: &str, instance: &str| {
+        let mut r = left_running(id, RunStatus::Interrupted, instance);
+        r.error = Some("y".repeat(mib));
+        r
+    };
+    // The newest run is ordinary and small; four older pinned runs of 1 MiB do not fit with it.
+    update_runs(&disk, ID, |_| {
+        Ok((
+            vec![
+                run("newest"),
+                pinned("p1", "a"),
+                pinned("p2", "b"),
+                pinned("p3", "c"),
+                pinned("p4", "d"),
+            ],
+            (),
+        ))
+    })
+    .unwrap();
+    let written = text(&disk, RUNS);
+    assert!(written.len() <= RUNS_FILE_BUDGET);
+    // The oldest pinned run went first; the newest stays.
+    assert_eq!(ids(&written), vec!["newest", "p1", "p2", "p3"]);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn update_runs_fails_loudly_when_one_run_passes_the_host_cap() {
     let root = temp_root();
     let disk = dir(&root);

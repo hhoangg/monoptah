@@ -516,6 +516,8 @@ fn an_account_that_cannot_be_used_is_refused_before_any_instance_is_created(
         "{error}"
     );
     assert!(!error.is_empty());
+    // The refusals so far never reached the machine host.
+    assert!(host.0.lock().unwrap().is_empty());
     // An existing instance keeps the account it started with.
     let first = crate::monos::cloud_tests::cloud_session(&s, cx);
     // What the machine host was asked so far (setting that session up): nothing below adds to it.

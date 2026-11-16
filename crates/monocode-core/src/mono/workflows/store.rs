@@ -506,11 +506,12 @@ fn serialize_runs(runs: &[Json], unreadable: &[Json]) -> String {
         )
     };
     while kept.len() > 1 && size(&kept) > RUNS_FILE_BUDGET {
-        // The oldest ordinary run first; a pinned one only when nothing else is left to drop.
-        let at = kept
+        // The oldest ordinary run first; a pinned one (the oldest) only when nothing else is left
+        // to drop. The newest run (index 0) is never dropped: it is the run just written.
+        let at = kept[1..]
             .iter()
             .rposition(|(_, pinned)| !pinned)
-            .unwrap_or(kept.len() - 1);
+            .map_or(kept.len() - 1, |at| at + 1);
         kept.remove(at);
     }
     let mut lines: Vec<String> = kept.into_iter().map(|(text, _)| text).collect();
