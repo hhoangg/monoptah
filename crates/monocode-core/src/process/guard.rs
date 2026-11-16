@@ -324,14 +324,13 @@ static RECORDS: OnceLock<std::path::PathBuf> = OnceLock::new();
 /// background thread. Without `init` no records are written.
 pub fn init(records_dir: &Path) {
     let dir = records_dir.to_path_buf();
-    if RECORDS.set(dir.clone()).is_err() {
-        return;
-    }
-    #[cfg(unix)]
-    {
-        let _ = std::thread::Builder::new()
-            .name("orphan-guard-sweep".into())
-            .spawn(move || sweep(&dir));
+    if RECORDS.set(dir.clone()).is_ok() {
+        #[cfg(unix)]
+        {
+            let _ = std::thread::Builder::new()
+                .name("orphan-guard-sweep".into())
+                .spawn(move || sweep(&dir));
+        }
     }
 }
 
