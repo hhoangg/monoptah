@@ -13,8 +13,8 @@ pub(crate) mod transfer;
 pub use identity::Identity;
 pub use login::arguments as login_arguments;
 pub use login::{
-    accepts_pasted_code, authenticate, authenticate_with, validate_code, AuthAction, AuthIo,
-    AuthProgress,
+    accepts_pasted_code, authenticate, authenticate_with, manual_sign_in_url, validate_code,
+    AuthAction, AuthIo, AuthProgress, SignInMode,
 };
 mod processes;
 #[cfg(test)]

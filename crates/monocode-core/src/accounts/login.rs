@@ -37,6 +37,65 @@ pub fn arguments(kind: Kind, action: AuthAction) -> Option<&'static [&'static st
 pub fn accepts_pasted_code(kind: Kind) -> bool {
     kind == Kind::Claude
 }
+/// How a browser sign-in reaches the user. `Browser` is the CLI's own flow: it
+/// opens the browser on a localhost callback. `Code` keeps the same CLI process
+/// but stops it opening anything: the app opens the CLI's hosted code page
+/// (see [`manual_sign_in_url`]) and the user pastes the code it shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SignInMode {
+    #[default]
+    Browser,
+    Code,
+}
+/// The hosted code page URL, or `None` when `raw` is anything else. The CLI
+/// prints two authorize URLs with the same state and PKCE challenge: this one
+/// redirects to an https page that shows a code, the other to a localhost
+/// callback that never shows one. Only the former may be offered or opened.
+pub fn manual_sign_in_url(raw: &str) -> Option<String> {
+    use url::{Host, Url};
+    let url = Url::parse(raw).ok()?;
+    if url.scheme() != "https" {
+        return None;
+    }
+    // The hosted code page is requested with `code=true`; exactly one redirect.
+    if !url.query_pairs().any(|(k, v)| k == "code" && v == "true") {
+        return None;
+    }
+    let mut redirects = url.query_pairs().filter(|(key, _)| key == "redirect_uri");
+    let (_, redirect) = redirects.next()?;
+    if redirects.next().is_some() {
+        return None;
+    }
+    let redirect = Url::parse(&redirect).ok()?;
+    if redirect.scheme() != "https" {
+        return None;
+    }
+    let local = match redirect.host()? {
+        Host::Domain(name) => {
+            let name = name.trim_end_matches('.').to_ascii_lowercase();
+            name == "localhost" || name.ends_with(".localhost")
+        }
+        Host::Ipv4(ip) => ip.is_loopback() || ip.is_unspecified(),
+        Host::Ipv6(ip) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| v4.is_loopback() || v4.is_unspecified())
+        }
+    };
+    (!local).then(|| raw.to_owned())
+}
+/// In code mode, stop the CLI from opening its own (localhost) browser page.
+/// The CLI opens pages by running `$BROWSER <url>` and ignores the result, so
+/// the no-op `true` makes that open do nothing. Only applied on unix: how the Windows CLI honours
+/// `BROWSER` is not verified, so there it may also open the localhost page,
+/// which is harmless because either path can finish the same sign-in.
+fn apply_mode(command: &mut Command, kind: Kind, mode: SignInMode) {
+    if cfg!(unix) && kind == Kind::Claude && mode == SignInMode::Code {
+        command.env("BROWSER", "true");
+    }
+}
 /// Longest pasted code accepted. Real codes are well under 200 bytes.
 const MAX_CODE_LEN: usize = 2048;
 /// Progress of a running sign-in that the UI may want to show. Values here are
@@ -223,7 +282,7 @@ pub fn authenticate(
     action: AuthAction,
     cancel: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    authenticate_with(kind, profile, action, cancel, None)
+    authenticate_with(kind, profile, action, cancel, None, SignInMode::Browser)
 }
 /// Like [`authenticate`], and for providers that accept one, also lets the user
 /// paste a verification code (see [`accepts_pasted_code`]).
@@ -233,7 +292,12 @@ pub fn authenticate_with(
     action: AuthAction,
     cancel: Arc<AtomicBool>,
     io: Option<AuthIo>,
+    mode: SignInMode,
 ) -> Result<(), String> {
+    // A cancelled attempt must never start (or touch the credentials of) anything.
+    if cancel.load(Ordering::Relaxed) {
+        return Err("Sign-in cancelled".into());
+    }
     if kind == Kind::Claude && profile.uses_claude_token()? {
         if action == AuthAction::SignOut {
             profile.remove_claude_token()?;
@@ -255,6 +319,11 @@ pub fn authenticate_with(
         command.current_dir(home);
     }
     let io = code_io(kind, action, io);
+    // Without the code channel nothing could finish the sign-in, so the CLI
+    // keeps its own browser flow.
+    if io.is_some() {
+        apply_mode(&mut command, kind, mode);
+    }
     let timeout = Duration::from_secs(if action == AuthAction::SignIn {
         600
     } else {
@@ -274,6 +343,9 @@ fn run(
     cancel: Arc<AtomicBool>,
     io: Option<AuthIo>,
 ) -> Result<(), String> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err("Sign-in cancelled".into());
+    }
     command.stderr(Stdio::piped());
     if io.is_some() {
         command.stdin(Stdio::piped()).stdout(Stdio::piped());
@@ -610,6 +682,46 @@ mod tests {
             "bad [code] then [code] and [code]"
         );
     }
+    const MANUAL: &str = "https://claude.com/cai/oauth/authorize?code=true&client_id=fake-client&response_type=code&redirect_uri=https%3A%2F%2Fplatform.example.test%2Foauth%2Fcode%2Fcallback&scope=fake&code_challenge=fake-challenge&code_challenge_method=S256&state=fake-state";
+    const AUTOMATIC: &str = "https://claude.com/cai/oauth/authorize?client_id=fake-client&response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A54321%2Fcallback&scope=fake&code_challenge=fake-challenge&code_challenge_method=S256&state=fake-state";
+    #[test]
+    fn the_manual_sign_in_url_is_accepted_and_nothing_else() {
+        assert_eq!(manual_sign_in_url(MANUAL), Some(MANUAL.to_owned()));
+        let with_redirect = |redirect: &str| {
+            format!("https://claude.com/cai/oauth/authorize?code=true&redirect_uri={redirect}&state=fake-state")
+        };
+        for bad in [
+            AUTOMATIC.to_owned(),
+            MANUAL.replacen("https://", "http://", 1),
+            // No `code=true`: not the hosted code page.
+            MANUAL.replace("code=true&", ""),
+            // Two redirects are ambiguous, whichever comes first.
+            format!("{MANUAL}&redirect_uri=http%3A%2F%2Flocalhost%3A1%2Fcallback"),
+            MANUAL.replace(
+                "redirect_uri=https%3A",
+                "redirect_uri=http%3A%2F%2Flocalhost%3A1%2Fcallback&redirect_uri=https%3A",
+            ),
+            "https://claude.com/cai/oauth/authorize?state=fake-state".to_owned(),
+            "not a url".to_owned(),
+            "ftp://claude.com/a?redirect_uri=https%3A%2F%2Fa.test%2Fb".to_owned(),
+            // Encoded and plain loopback redirects, over http and https.
+            with_redirect("http%3A%2F%2Flocalhost%3A1%2Fcallback"),
+            with_redirect("http://localhost:1/callback"),
+            with_redirect("https%3A%2F%2Flocalhost%3A1%2Fcallback"),
+            with_redirect("https%3A%2F%2FLOCALHOST.%2Fcallback"),
+            with_redirect("https%3A%2F%2Fapp.localhost%2Fcallback"),
+            with_redirect("https%3A%2F%2F127.0.0.1%3A1%2Fcallback"),
+            with_redirect("https://127.0.0.1:1/callback"),
+            with_redirect("https%3A%2F%2F127.5.6.7%2Fcallback"),
+            with_redirect("https%3A%2F%2F%5B%3A%3A1%5D%3A1%2Fcallback"),
+            with_redirect("https://[::1]:1/callback"),
+            with_redirect("https://[::ffff:127.0.0.1]/callback"),
+            with_redirect("https%3A%2F%2F0.0.0.0%2Fcallback"),
+            with_redirect("not-a-url"),
+        ] {
+            assert_eq!(manual_sign_in_url(&bad), None, "{bad}");
+        }
+    }
     #[cfg(unix)]
     mod process {
         use super::*;
@@ -721,6 +833,96 @@ done"#;
             .unwrap();
             assert_eq!(std::fs::read_to_string(&file).unwrap().trim(), "eof");
         }
+        /// Prints both URLs like the real CLI (manual on the "visit:" line),
+        /// then does what the CLI does with the browser: runs
+        /// `$BROWSER <automatic url>` if it is set, and records that.
+        fn two_url_cli(dir: &std::path::Path) -> String {
+            format!(
+                r#"printf 'Opening browser to sign in...\nIf the browser did not open, visit: %s\nPaste code here if prompted > ' '{MANUAL}'
+echo "${{BROWSER-unset}}" > '{0}/browser'
+if [ -n "$BROWSER" ]; then
+  "$BROWSER" '{AUTOMATIC}' && echo ran > '{0}/opened-by-cli'
+else
+  echo would-open-default > '{0}/opened-by-cli'
+fi
+while IFS= read -r line; do
+  case "$line" in
+    fake-code#fake-state) exit 0;;
+    *) exit 1;;
+  esac
+done"#,
+                dir.display()
+            )
+        }
+        fn run_two_url_cli(mode: SignInMode) -> (String, String, AuthProgress) {
+            let dir = tempfile::tempdir().unwrap();
+            let script = two_url_cli(dir.path());
+            let (progress, events) = events();
+            let (codes_tx, codes) = mpsc::channel();
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", &script]);
+            // Parent BROWSER must not leak into the comparison.
+            command.env_remove("BROWSER");
+            apply_mode(&mut command, Kind::Claude, mode);
+            let handle = thread::spawn(move || {
+                run(
+                    command,
+                    Kind::Claude,
+                    &Profile::default(),
+                    Duration::from_secs(30),
+                    Arc::default(),
+                    Some(AuthIo { codes, progress }),
+                )
+            });
+            let event = next(&events);
+            codes_tx.send("fake-code#fake-state".into()).unwrap();
+            assert_eq!(handle.join().unwrap(), Ok(()));
+            let read = |name: &str| {
+                std::fs::read_to_string(dir.path().join(name))
+                    .unwrap()
+                    .trim()
+                    .to_owned()
+            };
+            (read("browser"), read("opened-by-cli"), event)
+        }
+        #[test]
+        fn code_mode_stops_the_cli_opening_a_page_and_offers_the_manual_url() {
+            let (browser, opened, event) = run_two_url_cli(SignInMode::Code);
+            assert_eq!(browser, "true");
+            // `true` ran: it is a no-op, and the CLI never got a page of its own.
+            assert_eq!(opened, "ran");
+            let AuthProgress::CodePrompt { url } = event else {
+                panic!("expected the code prompt");
+            };
+            assert_eq!(url.as_deref(), Some(MANUAL));
+            assert_eq!(
+                manual_sign_in_url(url.as_deref().unwrap()).as_deref(),
+                url.as_deref()
+            );
+        }
+        #[test]
+        fn browser_mode_leaves_the_cli_browser_alone() {
+            let (browser, opened, event) = run_two_url_cli(SignInMode::Browser);
+            assert_eq!(browser, "unset", "no BROWSER is injected");
+            assert_eq!(opened, "would-open-default");
+            assert_eq!(
+                event,
+                AuthProgress::CodePrompt {
+                    url: Some(MANUAL.into())
+                }
+            );
+        }
+        #[test]
+        fn code_mode_only_changes_the_environment_for_claude() {
+            let env = |kind, mode| {
+                let mut command = Command::new("cli");
+                apply_mode(&mut command, kind, mode);
+                command.get_envs().count()
+            };
+            assert_eq!(env(Kind::Claude, SignInMode::Browser), 0);
+            assert_eq!(env(Kind::Codex, SignInMode::Code), 0);
+            assert_eq!(env(Kind::Claude, SignInMode::Code), 1);
+        }
         #[test]
         fn io_is_dropped_for_a_kind_or_action_without_code_support() {
             let io = || {
@@ -758,6 +960,17 @@ done"#;
                 cancel.store(true, Ordering::Relaxed);
             }
             (pid, handle.join().unwrap())
+        }
+        #[test]
+        fn a_sign_in_cancelled_beforehand_never_starts_the_cli() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("ran");
+            let script = format!("touch '{}'; sleep 5", marker.display());
+            let cancel = Arc::new(AtomicBool::new(true));
+            let (handle, _codes, _events) = start(&script, Duration::from_secs(30), cancel);
+            assert_eq!(handle.join().unwrap(), Err("Sign-in cancelled".into()));
+            thread::sleep(Duration::from_millis(300));
+            assert!(!marker.exists(), "the CLI must not be executed");
         }
         #[test]
         fn cancel_kills_a_cli_waiting_on_stdin() {

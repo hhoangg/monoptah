@@ -2,6 +2,20 @@ use super::*;
 use crate::theme::*;
 use gpui::{AnyElement, FontWeight, Role, SharedString, div, px};
 
+/// Shown in code mode when the CLI gave no usable code page link. Nothing was
+/// opened, and the CLI opens nothing in this mode.
+const NO_CODE_PAGE: &str = "The code page link is not available. Use browser sign-in or try again.";
+/// Code mode: the app, not the CLI, opens the hosted code page, once per attempt.
+fn open_once(mode: accounts::SignInMode, prompt: &mut CodePrompt, cx: &mut Context<Accounts>) {
+    if mode == accounts::SignInMode::Code
+        && !prompt.opened
+        && let Some(url) = &prompt.url
+    {
+        prompt.opened = true;
+        cx.open_url(url);
+    }
+}
+
 impl Accounts {
     /// The CLI reported progress on attempt `attempt`: show or update the code
     /// entry, or surface a code it refused. Events from an older attempt are ignored.
@@ -18,12 +32,16 @@ impl Accounts {
         if !Arc::ptr_eq(&signin.cancel, attempt) || signin.complete || signin.error.is_some() {
             return;
         }
+        let mode = signin.mode;
         match event {
             accounts::AuthProgress::CodePrompt { url } => match &mut signin.code {
                 Some(prompt) => {
-                    if url.is_some() {
-                        prompt.url = url;
+                    // The CLI prints two authorize URLs; only the hosted code
+                    // page may be kept or opened, never the localhost one.
+                    if let Some(url) = url.as_deref().and_then(accounts::manual_sign_in_url) {
+                        prompt.url = Some(url);
                     }
+                    open_once(mode, prompt, cx);
                 }
                 None => {
                     let input = cx.new(|cx| {
@@ -40,20 +58,33 @@ impl Accounts {
                     let submit = cx.subscribe(&input, |this, _, _: &input::Submitted, cx| {
                         this.submit_code(cx)
                     });
-                    signin.code = Some(CodePrompt {
+                    let changed = cx.subscribe(&input, |this, _, _: &input::Changed, _| {
+                        if let Some(prompt) = this.signin.as_mut().and_then(|s| s.code.as_mut()) {
+                            prompt.interactions += 1;
+                        }
+                    });
+                    let url = url.as_deref().and_then(accounts::manual_sign_in_url);
+                    let mut prompt = CodePrompt {
+                        error: (mode == accounts::SignInMode::Code && url.is_none())
+                            .then(|| NO_CODE_PAGE.into()),
                         url,
+                        opened: false,
+                        interactions: 0,
                         input,
                         sender,
                         checking: false,
-                        error: None,
                         focused: false,
                         _submit: submit,
-                    });
+                        _changed: changed,
+                    };
+                    open_once(mode, &mut prompt, cx);
+                    signin.code = Some(prompt);
                 }
             },
             accounts::AuthProgress::CodeRejected(message) => {
                 if let Some(prompt) = &mut signin.code {
                     prompt.checking = false;
+                    prompt.interactions += 1;
                     prompt.error = Some(message);
                 }
             }
@@ -69,6 +100,7 @@ impl Accounts {
         if prompt.checking || prompt.input.read(cx).is_composing() {
             return;
         }
+        prompt.interactions += 1;
         match prompt.input.update(cx, |input, cx| input.take(cx)) {
             None => prompt.error = Some("Paste the code shown in your browser.".into()),
             Some(value) => {
@@ -82,15 +114,23 @@ impl Accounts {
         }
         cx.notify();
     }
-    fn reopen_sign_in_page(&self, cx: &mut Context<Self>) {
+    /// A code-mode sign-in is running: the browser is not what it waits for.
+    pub(super) fn code_mode_running(&self) -> bool {
+        self.signin.as_ref().is_some_and(|s| {
+            s.mode == accounts::SignInMode::Code && !s.complete && s.error.is_none()
+        })
+    }
+    /// Open the hosted code page again. Checked once more here, so a localhost
+    /// callback URL can never be opened even if one were stored by mistake.
+    pub(super) fn reopen_sign_in_page(&self, cx: &mut Context<Self>) {
         if let Some(url) = self
             .signin
             .as_ref()
             .and_then(|s| s.code.as_ref())
             .and_then(|p| p.url.as_deref())
-            .filter(|url| url.starts_with("https://"))
+            .and_then(accounts::manual_sign_in_url)
         {
-            cx.open_url(url);
+            cx.open_url(&url);
         }
     }
     /// The code entry for a sign-in that is waiting on a pasted verification
@@ -106,6 +146,10 @@ impl Accounts {
         let id = |name: &str| SharedString::from(format!("{prefix}-code-{name}"));
         let checking = prompt.checking;
         let has_url = prompt.url.is_some();
+        let code_mode = self
+            .signin
+            .as_ref()
+            .is_some_and(|s| s.mode == accounts::SignInMode::Code);
         let link = |id: SharedString, label: &'static str| {
             div()
                 .id(id)
@@ -136,7 +180,11 @@ impl Accounts {
                         .text_size(px(11.))
                         .line_height(px(16.))
                         .text_color(content(0.55))
-                        .child("Browser showing a code? Paste it here to finish signing in."),
+                        .child(if code_mode {
+                            "Sign in in your browser, then paste the code it shows here."
+                        } else {
+                            "Browser showing a code? Paste it here to finish signing in."
+                        }),
                 )
                 .child(
                     div()
@@ -236,6 +284,7 @@ impl Accounts {
             kind: Kind::Codex,
             profile: Profile::default(),
             action: AuthAction::SignIn,
+            mode: accounts::SignInMode::Browser,
             surface: Surface::Settings,
             cancel: Arc::new(AtomicBool::new(false)),
             complete: false,
@@ -283,7 +332,11 @@ impl Accounts {
             .is_some_and(|s| !s.complete && s.error.is_none());
         let disabled = auth_running || complete || self.working;
         let label: SharedString = if running {
-            "Waiting for browser…".into()
+            if self.code_mode_running() {
+                "Waiting for code…".into()
+            } else {
+                "Waiting for browser…".into()
+            }
         } else if complete {
             "Signed in".into()
         } else {
@@ -405,6 +458,54 @@ impl Accounts {
                         }
                     })),
             )
+            .when(
+                super::token::offers_code_sign_in(kind)
+                    && !auth_running
+                    && !complete
+                    && !self.working,
+                |d| {
+                    let code_id = id.to_owned();
+                    let key_id = id.to_owned();
+                    d.child(
+                        div()
+                            .id("footer-provider-auth-with-code")
+                            .role(Role::Button)
+                            .aria_label("Sign in with code")
+                            .tab_index(0)
+                            .mt(px(8.))
+                            .px(px(8.))
+                            .py(px(2.))
+                            .rounded(px(4.))
+                            .text_size(px(11.))
+                            .line_height(px(16.))
+                            .text_color(content(0.5))
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(content(0.8)))
+                            .child("Sign in with code")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.begin_footer_auth_with(
+                                    kind,
+                                    &code_id,
+                                    accounts::SignInMode::Code,
+                                    cx,
+                                );
+                            }))
+                            .on_key_down(cx.listener(
+                                move |this, event: &gpui::KeyDownEvent, _, cx| {
+                                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                        this.begin_footer_auth_with(
+                                            kind,
+                                            &key_id,
+                                            accounts::SignInMode::Code,
+                                            cx,
+                                        );
+                                        cx.stop_propagation();
+                                    }
+                                },
+                            )),
+                    )
+                },
+            )
             .children(signin.and_then(|_| self.code_entry("footer-provider-signin", false, cx)))
             // The CLI cannot see a closed browser tab; let the user give up
             // on a waiting sign-in (from any surface) and start again.
@@ -459,6 +560,7 @@ mod tests {
                 kind: Kind::Codex,
                 profile: Profile::default(),
                 action: AuthAction::SignIn,
+                mode: accounts::SignInMode::Browser,
                 surface: Surface::InlineSettings,
                 cancel: Arc::new(AtomicBool::new(false)),
                 complete: false,
@@ -493,6 +595,7 @@ mod tests {
                     kind: Kind::Codex,
                     profile: Profile::default(),
                     action: AuthAction::SignIn,
+                    mode: accounts::SignInMode::Browser,
                     surface: Surface::Footer,
                     cancel: Arc::new(AtomicBool::new(false)),
                     complete: false,
@@ -558,6 +661,7 @@ mod tests {
             kind: Kind::Claude,
             profile: Profile::default(),
             action: AuthAction::SignIn,
+            mode: accounts::SignInMode::Browser,
             surface: Surface::Footer,
             cancel: Arc::new(AtomicBool::new(false)),
             complete,
@@ -602,6 +706,7 @@ mod tests {
             kind: Kind::Claude,
             profile: Profile::default(),
             action: AuthAction::SignIn,
+            mode: accounts::SignInMode::Browser,
             surface,
             cancel: cancel.clone(),
             complete: false,
@@ -611,6 +716,116 @@ mod tests {
             code: None,
         };
         (signin, cancel)
+    }
+    const MANUAL: &str = "https://claude.com/cai/oauth/authorize?code=true&client_id=fake-client&response_type=code&redirect_uri=https%3A%2F%2Fplatform.example.test%2Foauth%2Fcode%2Fcallback&code_challenge=fake-challenge&state=fake-state";
+    const MANUAL_OTHER: &str = "https://claude.com/cai/oauth/authorize?code=true&client_id=fake-client&response_type=code&redirect_uri=https%3A%2F%2Fplatform.example.test%2Foauth%2Fcode%2Fcallback&code_challenge=fake-challenge&state=other-state";
+    const AUTOMATIC: &str = "https://claude.com/cai/oauth/authorize?client_id=fake-client&response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A54321%2Fcallback&code_challenge=fake-challenge&state=fake-state";
+    /// A window whose sign-in (in `mode`) just received the CLI's code prompt
+    /// carrying `urls` one after another.
+    fn prompted(
+        cx: &mut gpui::TestAppContext,
+        mode: accounts::SignInMode,
+        urls: &[Option<&str>],
+    ) -> gpui::WindowHandle<Accounts> {
+        let window = code_window(cx);
+        let (sender, _received) = std::sync::mpsc::channel();
+        window
+            .update(cx, |accounts, _, cx| {
+                let (mut signin, cancel) = code_sign_in(Surface::Footer, None);
+                signin.mode = mode;
+                accounts.signin = Some(signin);
+                for url in urls {
+                    accounts.sign_in_progress(
+                        &cancel,
+                        sender.clone(),
+                        accounts::AuthProgress::CodePrompt {
+                            url: url.map(str::to_owned),
+                        },
+                        cx,
+                    );
+                }
+            })
+            .unwrap();
+        window
+    }
+    fn prompt_state(
+        window: &gpui::WindowHandle<Accounts>,
+        cx: &mut gpui::TestAppContext,
+    ) -> (Option<String>, bool, Option<String>) {
+        window
+            .update(cx, |accounts, _, _| {
+                let prompt = accounts.signin.as_ref().unwrap().code.as_ref().unwrap();
+                (prompt.url.clone(), prompt.opened, prompt.error.clone())
+            })
+            .unwrap()
+    }
+    #[gpui::test]
+    fn code_mode_opens_the_manual_url_once(cx: &mut gpui::TestAppContext) {
+        let window = prompted(cx, accounts::SignInMode::Code, &[Some(MANUAL)]);
+        assert_eq!(cx.opened_url().as_deref(), Some(MANUAL));
+        let (url, opened, error) = prompt_state(&window, cx);
+        assert_eq!((url.as_deref(), opened, error), (Some(MANUAL), true, None));
+        // A repeated prompt, even with another link, opens nothing more.
+        let (sender, _received) = std::sync::mpsc::channel();
+        window
+            .update(cx, |accounts, _, cx| {
+                let cancel = accounts.signin.as_ref().unwrap().cancel.clone();
+                accounts.sign_in_progress(
+                    &cancel,
+                    sender,
+                    accounts::AuthProgress::CodePrompt {
+                        url: Some(MANUAL_OTHER.into()),
+                    },
+                    cx,
+                );
+            })
+            .unwrap();
+        assert_eq!(cx.opened_url().as_deref(), Some(MANUAL));
+    }
+    #[gpui::test]
+    fn code_mode_never_opens_the_localhost_url(cx: &mut gpui::TestAppContext) {
+        for url in [Some(AUTOMATIC), None] {
+            let window = prompted(cx, accounts::SignInMode::Code, &[url]);
+            assert_eq!(cx.opened_url(), None);
+            let (url, opened, error) = prompt_state(&window, cx);
+            assert!(url.is_none() && !opened);
+            assert_eq!(error.as_deref(), Some(NO_CODE_PAGE));
+        }
+    }
+    #[gpui::test]
+    fn browser_mode_opens_nothing_from_the_app(cx: &mut gpui::TestAppContext) {
+        let window = prompted(cx, accounts::SignInMode::Browser, &[Some(MANUAL)]);
+        assert_eq!(cx.opened_url(), None);
+        let (url, opened, error) = prompt_state(&window, cx);
+        assert_eq!((url.as_deref(), opened, error), (Some(MANUAL), false, None));
+        // The localhost URL is dropped, not offered.
+        let window = prompted(cx, accounts::SignInMode::Browser, &[Some(AUTOMATIC)]);
+        assert_eq!(prompt_state(&window, cx).0, None);
+        assert_eq!(cx.opened_url(), None);
+    }
+    #[gpui::test]
+    fn open_sign_in_page_again_opens_the_manual_url_and_refuses_localhost(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        for mode in [accounts::SignInMode::Browser, accounts::SignInMode::Code] {
+            let window = prompted(cx, mode, &[Some(MANUAL)]);
+            window
+                .update(cx, |accounts, _, cx| {
+                    // Code mode already opened it: reopening shows it again.
+                    accounts.reopen_sign_in_page(cx);
+                })
+                .unwrap();
+            assert_eq!(cx.opened_url().as_deref(), Some(MANUAL));
+            // Even a stored localhost URL is refused at open time.
+            window
+                .update(cx, |accounts, _, cx| {
+                    let prompt = accounts.signin.as_mut().unwrap().code.as_mut().unwrap();
+                    prompt.url = Some(AUTOMATIC.into());
+                    accounts.reopen_sign_in_page(cx);
+                })
+                .unwrap();
+            assert_eq!(cx.opened_url().as_deref(), Some(MANUAL));
+        }
     }
     fn new_account() -> Account {
         Book::default().add(Kind::Claude, "Work").unwrap()
@@ -887,5 +1102,78 @@ mod tests {
             })
             .unwrap();
         cx.refresh().unwrap();
+    }
+
+    #[gpui::test]
+    fn a_rejected_code_keeps_the_sign_in_the_user_is_using(cx: &mut gpui::TestAppContext) {
+        let window = code_window(cx);
+        reactivate_with_prompt(&window, cx, false, false);
+        advance(cx, 60);
+        // The user submits and the CLI refuses: the field is empty and unfocused.
+        let (sender, _received) = std::sync::mpsc::channel();
+        window
+            .update(cx, |accounts, _, cx| {
+                let cancel = accounts.signin.as_ref().unwrap().cancel.clone();
+                accounts.sign_in_progress(
+                    &cancel,
+                    sender,
+                    accounts::AuthProgress::CodeRejected("Copy the whole code".into()),
+                    cx,
+                );
+            })
+            .unwrap();
+        // The timer started at the return to the app fires now.
+        advance(cx, 40);
+        assert!(has_signin(&window, cx), "an active sign-in is not reset");
+    }
+    /// The mode chosen in the UI is stored on the sign-in at once. Every attempt
+    /// is cancelled inside the same `update`, before any queued task can run,
+    /// and a cancelled attempt never starts the CLI (core checks the flag
+    /// first), so this never runs a real login.
+    #[gpui::test]
+    fn each_sign_in_choice_stores_its_mode(cx: &mut gpui::TestAppContext) {
+        use accounts::SignInMode::{Browser, Code};
+        let window = code_window(cx);
+        window
+            .update(cx, |accounts, window, cx| {
+                let mode = |accounts: &Accounts| accounts.signin.as_ref().map(|s| s.mode);
+                for (surface, code) in [(Surface::Footer, true), (Surface::Footer, false)] {
+                    accounts.start_edit(Kind::Claude, None, surface, window, cx);
+                    accounts
+                        .editor
+                        .as_ref()
+                        .unwrap()
+                        .input
+                        .update(cx, |input, cx| input.set_text("Work".into(), cx));
+                    accounts.submit_footer_editor(code, cx);
+                    assert_eq!(mode(accounts), Some(if code { Code } else { Browser }));
+                    accounts.cancel_auth(cx);
+                }
+                // The Settings editor follows the picked sign-in option.
+                for (method, expected) in [
+                    (AuthMethod::BrowserCode, Code),
+                    (AuthMethod::Browser, Browser),
+                ] {
+                    accounts.start_edit(Kind::Claude, None, Surface::Settings, window, cx);
+                    accounts
+                        .editor
+                        .as_ref()
+                        .unwrap()
+                        .input
+                        .update(cx, |input, cx| input.set_text("Work".into(), cx));
+                    accounts.pick_auth(method, window, cx);
+                    accounts.submit_editor(cx);
+                    assert_eq!(mode(accounts), Some(expected));
+                    accounts.cancel_auth(cx);
+                }
+                // Existing-account footer sign-in.
+                accounts.begin_footer_auth_with(Kind::Claude, accounts::DEFAULT, Code, cx);
+                assert_eq!(mode(accounts), Some(Code));
+                accounts.cancel_auth(cx);
+                accounts.begin_footer_auth(Kind::Claude, accounts::DEFAULT, cx);
+                assert_eq!(mode(accounts), Some(Browser));
+                accounts.cancel_auth(cx);
+            })
+            .unwrap();
     }
 }

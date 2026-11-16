@@ -190,6 +190,8 @@ fn read_credential(profile: &Profile) -> Option<CredentialState> {
 enum AuthMethod {
     Keep,
     Browser,
+    /// Browser sign-in finished by pasting the code the hosted page shows.
+    BrowserCode,
     SetupToken,
     ApiKey,
 }
@@ -213,6 +215,7 @@ struct SignIn {
     kind: Kind,
     profile: Profile,
     action: AuthAction,
+    mode: accounts::SignInMode,
     surface: Surface,
     cancel: Arc<AtomicBool>,
     complete: bool,
@@ -225,7 +228,14 @@ struct SignIn {
 /// The "paste the code from your browser" step of a running sign-in. The URL
 /// and the pasted text live only here, in memory: never logged, copied or saved.
 struct CodePrompt {
+    /// The hosted code page, only ever a URL that passed `manual_sign_in_url`.
     url: Option<String>,
+    /// The app already opened `url` for this attempt (code mode opens it once).
+    opened: bool,
+    /// Counts the user's actions on this prompt (submit, rejection, edits), so
+    /// a reset timer started before one of them does not cancel a sign-in
+    /// that is in use.
+    interactions: u64,
     input: Entity<Input>,
     sender: std::sync::mpsc::Sender<String>,
     /// A code was sent and the CLI has not answered yet.
@@ -233,6 +243,7 @@ struct CodePrompt {
     error: Option<String>,
     focused: bool,
     _submit: Subscription,
+    _changed: Subscription,
 }
 struct Picker {
     kind: Kind,
@@ -838,6 +849,7 @@ impl Accounts {
                     kind,
                     &account.id.clone(),
                     AuthAction::SignIn,
+                    accounts::SignInMode::Browser,
                     Some(account),
                     cx,
                 ),
@@ -853,6 +865,7 @@ impl Accounts {
         kind: Kind,
         id: &str,
         action: AuthAction,
+        mode: accounts::SignInMode,
         adding: Option<Account>,
         cx: &mut Context<Self>,
     ) {
@@ -869,20 +882,39 @@ impl Accounts {
             .as_ref()
             .filter(|_| adding.is_some())
             .map_or(Surface::Settings, |editor| editor.surface);
-        self.start_auth(kind, id, action, adding, surface, cx);
+        self.start_auth(kind, id, action, mode, adding, surface, cx);
     }
     pub(crate) fn begin_footer_auth(&mut self, kind: Kind, id: &str, cx: &mut Context<Self>) {
+        self.begin_footer_auth_with(kind, id, accounts::SignInMode::Browser, cx);
+    }
+    pub(crate) fn begin_footer_auth_with(
+        &mut self,
+        kind: Kind,
+        id: &str,
+        mode: accounts::SignInMode,
+        cx: &mut Context<Self>,
+    ) {
         if kind == Kind::Claude && self.uses_claude_token(id) {
             cx.emit(AccountEvent::Manage);
             return;
         }
-        self.start_auth(kind, id, AuthAction::SignIn, None, Surface::Footer, cx);
+        self.start_auth(
+            kind,
+            id,
+            AuthAction::SignIn,
+            mode,
+            None,
+            Surface::Footer,
+            cx,
+        );
     }
+    #[allow(clippy::too_many_arguments)]
     fn start_auth(
         &mut self,
         kind: Kind,
         id: &str,
         action: AuthAction,
+        mode: accounts::SignInMode,
         adding: Option<Account>,
         surface: Surface,
         cx: &mut Context<Self>,
@@ -917,6 +949,7 @@ impl Accounts {
             kind,
             profile: profile.clone(),
             action,
+            mode,
             surface,
             cancel: cancel.clone(),
             complete: false,
@@ -947,7 +980,7 @@ impl Accounts {
             if action == AuthAction::SignOut {
                 accounts::stop_processes(kind, &profile);
             }
-            let result = accounts::authenticate_with(kind, &profile, action, cancel, io);
+            let result = accounts::authenticate_with(kind, &profile, action, cancel, io, mode);
             monocode_core::catalog::invalidate(kind, &profile);
             result
         });
@@ -1124,6 +1157,7 @@ impl Accounts {
             Duration::from_secs(5)
         };
         let attempt = signin.cancel.clone();
+        let seen = signin.code.as_ref().map_or(0, |p| p.interactions);
         cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(grace).await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -1135,7 +1169,10 @@ impl Accounts {
                             && !s.complete
                             && s.error.is_none()
                             && s.code.as_ref().is_none_or(|p| {
-                                !p.checking && p.input.read(cx).content.is_empty() && !focused(p)
+                                !p.checking
+                                    && p.interactions == seen
+                                    && p.input.read(cx).content.is_empty()
+                                    && !focused(p)
                             })
                     });
                 if waiting {

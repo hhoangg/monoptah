@@ -18,7 +18,14 @@ impl AuthMethod {
         match self {
             Self::SetupToken => Some(ClaudeCredential::SetupToken),
             Self::ApiKey => Some(ClaudeCredential::ApiKey),
-            Self::Keep | Self::Browser => None,
+            Self::Keep | Self::Browser | Self::BrowserCode => None,
+        }
+    }
+    /// How a browser sign-in under this selection reaches the user.
+    pub(super) fn mode(self) -> accounts::SignInMode {
+        match self {
+            Self::BrowserCode => accounts::SignInMode::Code,
+            _ => accounts::SignInMode::Browser,
         }
     }
     fn placeholder(self) -> &'static str {
@@ -39,13 +46,40 @@ impl AuthMethod {
         match (adding, self) {
             (true, Self::SetupToken) => "Add with token",
             (true, Self::ApiKey) => "Add with API key",
+            (true, Self::BrowserCode) => "Sign in with code and add",
             (true, _) => "Sign in and add",
             (false, Self::Browser) => "Save and sign in",
+            (false, Self::BrowserCode) => "Save and sign in with code",
             (false, Self::SetupToken) => "Save token",
             (false, Self::ApiKey) => "Save API key",
             (false, Self::Keep) => "Save",
         }
     }
+}
+
+/// The sign-in options dropdown: browser, browser with a pasted code, token, key.
+fn auth_menu_items(existing: bool) -> Vec<(AuthMethod, &'static str)> {
+    let mut items = Vec::new();
+    if existing {
+        items.push((AuthMethod::Keep, "Keep current sign-in"));
+    }
+    items.push((AuthMethod::Browser, "Sign in with browser"));
+    if offers_code_sign_in(Kind::Claude) {
+        items.push((AuthMethod::BrowserCode, "Sign in with code"));
+    }
+    items.extend([
+        (AuthMethod::SetupToken, "Use setup-token"),
+        (AuthMethod::ApiKey, "Use API key"),
+    ]);
+    items
+}
+/// Only Claude Code is known to take a pasted code next to its browser flow,
+/// and code mode silences the CLI's own page through `BROWSER`, which is only
+/// done on unix. On Windows that is unverified, so code mode would open a
+/// localhost tab beside the code page: not offered there (browser mode still
+/// shows the code field and "Open sign-in page again").
+pub(super) fn offers_code_sign_in(kind: Kind) -> bool {
+    cfg!(unix) && accounts::accepts_pasted_code(kind)
 }
 
 impl Accounts {
@@ -96,6 +130,20 @@ impl Accounts {
             window.focus(&field.read(cx).focus_handle(cx), cx);
         }
     }
+    /// The footer add-account buttons: "Sign in and add account" and, for
+    /// Claude, "Sign in with code". The pick decides how the sign-in runs.
+    pub(super) fn submit_footer_editor(&mut self, code: bool, cx: &mut Context<Self>) {
+        if let Some(editor) = &mut self.editor
+            && editor.kind == Kind::Claude
+        {
+            editor.auth = if code {
+                AuthMethod::BrowserCode
+            } else {
+                AuthMethod::Browser
+            };
+        }
+        self.submit_editor(cx);
+    }
     pub(super) fn toggle_auth_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.working {
             return;
@@ -107,15 +155,7 @@ impl Accounts {
             cx.notify();
             return;
         }
-        let mut items = Vec::new();
-        if editor.id.is_some() {
-            items.push((AuthMethod::Keep, "Keep current sign-in"));
-        }
-        items.extend([
-            (AuthMethod::Browser, "Sign in with browser"),
-            (AuthMethod::SetupToken, "Use setup-token"),
-            (AuthMethod::ApiKey, "Use API key"),
-        ]);
+        let items = auth_menu_items(editor.id.is_some());
         let current = editor.auth;
         let actions = items
             .iter()
@@ -247,6 +287,7 @@ impl Accounts {
             return;
         }
         let credential = editor.auth.credential();
+        let mode = editor.auth.mode();
         let token_mode = credential.is_some();
         if token_mode && editor.token.read(cx).content.trim().is_empty() {
             return;
@@ -309,6 +350,7 @@ impl Accounts {
                 Kind::Claude,
                 &account.id.clone(),
                 AuthAction::SignIn,
+                mode,
                 Some(account),
                 cx,
             );
@@ -402,6 +444,7 @@ impl Accounts {
                                 Kind::Claude,
                                 &account.id,
                                 AuthAction::SignIn,
+                                mode,
                                 None,
                                 cx,
                             );
@@ -444,6 +487,11 @@ mod tests {
             adding,
             ["Sign in and add", "Add with token", "Add with API key"]
         );
+        assert_eq!(BrowserCode.button_label(true), "Sign in with code and add");
+        assert_eq!(
+            BrowserCode.button_label(false),
+            "Save and sign in with code"
+        );
         let editing: Vec<_> = [Keep, Browser, SetupToken, ApiKey]
             .map(|m| m.button_label(false))
             .into();
@@ -451,6 +499,34 @@ mod tests {
             editing,
             ["Save", "Save and sign in", "Save token", "Save API key"]
         );
+    }
+
+    #[test]
+    fn the_code_choice_is_offered_for_claude_only_and_selects_code_mode() {
+        use AuthMethod::*;
+        let labels = |existing| -> Vec<_> {
+            auth_menu_items(existing)
+                .into_iter()
+                .map(|(_, l)| l)
+                .collect()
+        };
+        let mut expected = vec!["Sign in with browser"];
+        if cfg!(unix) {
+            expected.push("Sign in with code");
+        }
+        expected.extend(["Use setup-token", "Use API key"]);
+        assert_eq!(labels(false), expected);
+        assert_eq!(labels(true)[0], "Keep current sign-in");
+        assert_eq!(labels(true).contains(&"Sign in with code"), cfg!(unix));
+        assert_eq!(offers_code_sign_in(Kind::Claude), cfg!(unix));
+        for kind in [Kind::Codex, Kind::Cursor, Kind::Grok, Kind::Fx, Kind::Devin] {
+            assert!(!offers_code_sign_in(kind));
+        }
+        for method in [Keep, Browser, SetupToken, ApiKey] {
+            assert_eq!(method.mode(), accounts::SignInMode::Browser);
+        }
+        assert_eq!(BrowserCode.mode(), accounts::SignInMode::Code);
+        assert!(BrowserCode.credential().is_none());
     }
 
     #[test]
@@ -557,6 +633,7 @@ mod tests {
                     kind: Kind::Claude,
                     profile: Profile::default(),
                     action: AuthAction::SignIn,
+                    mode: accounts::SignInMode::Browser,
                     surface: Surface::InlineSettings,
                     cancel: cancel.clone(),
                     complete: false,
@@ -599,6 +676,7 @@ mod tests {
                     kind: Kind::Claude,
                     profile: accounts.profile(&first.id),
                     action: AuthAction::SignIn,
+                    mode: accounts::SignInMode::Browser,
                     surface: Surface::InlineSettings,
                     cancel: cancel.clone(),
                     complete: false,
