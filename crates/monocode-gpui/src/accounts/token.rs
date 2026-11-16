@@ -564,6 +564,7 @@ mod tests {
                     // The sign-in of the account this editor is adding.
                     adding: Some(Book::default().add(Kind::Claude, "Adding").unwrap()),
                     started: Instant::now(),
+                    code: None,
                 });
                 accounts.working = true;
                 accounts.cancel_editor(window, cx);
@@ -604,6 +605,7 @@ mod tests {
                     error: None,
                     adding: None,
                     started: Instant::now(),
+                    code: None,
                 });
                 accounts.start_edit(
                     Kind::Claude,
