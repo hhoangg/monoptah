@@ -109,17 +109,22 @@ gpui-pre-windows = { path = "../../vendor/gpui-pre-windows" }
 # Plain `cargo build`/`cargo test` (the dev and test profiles): line tables only for the
 # workspace crates, so panic backtraces keep file and line, and no debuginfo for
 # dependencies. Full debuginfo roughly doubles compile and link time and target size.
-# `native-dev` below inherits these and sets `debug = 0` for everything.
+# `native-dev` below inherits these, sets `debug = 0` for dependencies and keeps line
+# tables for the two workspace crates.
 [profile.dev]
 debug = "line-tables-only"
-# One .dSYM per binary instead of one debuginfo .o per codegen unit left in target/.
-split-debuginfo = "packed"
 
 [profile.dev.package."*"]
 debug = false
 
 # Local test and dev builds. `debug = 0` keeps compile and link time low (no
-# debuginfo for any crate, and cargo then strips the std debuginfo too).
+# debuginfo for dependencies, and cargo then strips the std debuginfo too). The two
+# workspace crates below override it with line tables only, so panic backtraces keep
+# file:line for our code.
+#
+# Do not set `split-debuginfo` here or in [profile.dev]: `unpacked` is rejected by
+# rustc on windows-msvc, and `packed` makes macOS run dsymutil on every link
+# (measured +9s on the ~21s relink). The platform default (unpacked on macOS) is the fastest.
 # Incremental compilation only applies to local crates (the workspace members
 # and the vendor/gpui-pre* path patches), not to crates.io ones: after editing
 # one file of monocode-gpui, `cargo test --no-run` took about 17s instead of
@@ -135,7 +140,11 @@ incremental = true
 opt-level = 1
 
 # The app crate itself is built unoptimized (it is the one recompiled after every edit).
-# Dependencies stay at opt-level 1 above. Measured on a loaded Mac: incremental rebuild after a
-# one-line edit was the same (about 23-25s) at opt-level 0 and 1, so this mainly keeps the intent explicit.
+# Dependencies stay at opt-level 1 above. Measured with a real one-line edit: relink of the test
+# binary took about 21s at opt-level 0 and about 136s at opt-level 1.
 [profile.native-dev.package.monocode-gpui]
 opt-level = 0
+debug = "line-tables-only"
+
+[profile.native-dev.package.monocode-core]
+debug = "line-tables-only"

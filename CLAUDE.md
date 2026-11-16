@@ -123,6 +123,9 @@ relinks the large `monocode-gpui` test binary (median 1.4 min, p90 4.1 min).
   `cargo nclippy`, `cargo nrun`. From the repo root pass
   `--manifest-path crates/monocode-gpui/Cargo.toml --profile native-dev`, as the npm scripts do.
   In `native-dev` the `monocode-gpui` crate is `opt-level = 0` and dependencies are `opt-level = 1`.
+  The `monocode-gpui` and `monocode-core` crates keep `debug = "line-tables-only"`, so panic
+  backtraces show file and line. Do not add `split-debuginfo` to the profiles: `unpacked` is
+  rejected on windows-msvc and `packed` runs dsymutil on every macOS link (about +9s).
   `npm run worktrees:clean -- --prune-target` removes a leftover `target/debug` and stale
   incremental data (see the `cleanup-worktree` skill).
 - **Keep tests Linux-portable.** GPUI tests run on Ubuntu in CI. Use `secondary-...`
