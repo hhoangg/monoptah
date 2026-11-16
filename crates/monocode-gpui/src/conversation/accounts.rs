@@ -89,7 +89,14 @@ impl Conversation {
                     .on_click(cx.listener(move |_, _, _, cx| {
                         if let Some(center) = crate::accounts::get(cx) {
                             center.update(cx, |center, cx| {
-                                center.begin_auth(kind, &id, action, None, cx)
+                                center.begin_auth(
+                                    kind,
+                                    &id,
+                                    action,
+                                    monocode_core::accounts::SignInMode::Browser,
+                                    None,
+                                    cx,
+                                )
                             });
                         }
                     })),
