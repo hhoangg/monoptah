@@ -69,7 +69,6 @@ pub(crate) struct UsageFooter {
     /// The cloud status chip, see [`cloud_chip`]. This view owns it, but the shell's footer row
     /// renders it as the last element on the right (after the terminal controls).
     cloud: gpui::Entity<cloud_chip::CloudChip>,
-    _cloud_observation: gpui::Subscription,
     _clock: gpui::Task<()>,
 }
 impl UsageFooter {
@@ -122,11 +121,8 @@ impl UsageFooter {
             })
         });
         let cloud = cx.new(cloud_chip::CloudChip::new);
-        // The chip appearing or going away changes this row.
-        let cloud_observation = cx.observe(&cloud, |_, _, cx| cx.notify());
         let mut this = Self {
             cloud,
-            _cloud_observation: cloud_observation,
             _account_events: crate::accounts::get(cx).map(|center| {
                 cx.subscribe(
                     &center,

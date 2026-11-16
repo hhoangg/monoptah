@@ -2,9 +2,11 @@
 
 Cost control for cloud sessions. A failed or forgotten codespace or Docker sandbox keeps drawing
 quota (Codespaces: the free dollar pool) or credit (Docker: per runtime second, billed to the card
-after the credit). The **cloud chip** at the right end of the footer (see "The footer chip") shows what runs, or an
-idle "Cloud" when nothing does; clicking it opens a side drawer, sliding in from the right, that
-lists them all and lets you stop or delete them. The drawer is the only way in: the project menu has no Cloud workspaces item.
+after the credit). The **cloud chip** at the right end of the footer (see "The footer chip")
+shows what the project has (running, stopping, stopped, failed, deleting or unknown) and is
+hidden when it has none; clicking it opens a side drawer, sliding in from the right and out
+again when it closes, that lists them all and lets you stop or delete them. The drawer is the
+only way in: the project menu has no Cloud workspaces item.
 
 ## What a row shows
 
@@ -166,19 +168,21 @@ still lists.
 ## The footer chip
 
 The cost is visible without opening anything: a **cloud chip** sits at the far right of the footer,
-after the terminal controls, as the outermost element (cloud glyph and `2 running`, `1 stopping` or `2 running, 1 stopping`).
+after the terminal controls, as the outermost element (cloud glyph and the counts: `2 running`,
+`1 stopping`, `1 stopped`, `1 failed`, `1 deleting`, `1 unknown` or several, such as
+`2 running, 1 stopping`).
 It is one click or one Enter or Space (it is focusable like the usage chip) from the Cloud
 workspaces drawer. The project menu no longer has a Cloud workspaces item.
 
-* **Shown** for every project that uses cloud (a cloud session, or saved Cloud settings), even
-  when nothing runs: then it is a muted, neutral **idle** chip (cloud glyph and `Cloud`, tooltip
-  "Cloud workspaces: none running"), so a stopped or failed workspace can still be reached and
-  deleted from the drawer. A project that does not use cloud, and a remote project, shows no chip,
-  and `gh` and `sbx` are never started for it. With workspaces up it shows the count: while at
-  least one workspace of the open project is **Running or Starting**, and also
-  while one is **Stopping** (or hibernating, on its way to stopped): a stopping sandbox still bills
-  until it has stopped, and a Stop that gets stuck must not make the chip vanish. Once
-  every workspace is stopped or gone it falls back to the idle chip. A sandbox that is
+* **Shown** while the project has at least one cloud workspace in **any state** (running,
+  starting, stopping or hibernating, stopped, failed, being deleted, unknown), so a stopped or
+  failed one can still be reached and deleted from the drawer. A stopped-only project shows
+  `1 stopped` in the normal (not dimmed) style, and the tooltip lists each workspace. With
+  **no** workspace listed (or when `gh` and `sbx` fail and list nothing) the chip is hidden and
+  takes no room. A project that does not use cloud, and a remote project, shows no chip, and
+  `gh` and `sbx` are never started for it. A stopping sandbox still bills until it has stopped,
+  and a Stop that gets stuck must not make the chip vanish; it stays as `1 stopped` afterwards.
+  A sandbox that is
   being deleted does not count as stopping. It reports on **the window's project** on every tab: a
   session, the MonoCrab (Mono) tab, an app view (Today, Inbox, Notes, Contributors…), a terminal or a
   file pane, whatever folder that tab shows. Only a cloud session uses its own project, the local one

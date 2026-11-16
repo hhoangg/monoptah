@@ -828,7 +828,7 @@ impl Shell {
                     .children(terminal)
             })
             // The cloud chip is the outermost element on the right; it draws nothing (and takes
-            // no room) while the project does not use cloud.
+            // no room) while the project has no cloud workspace.
             .child(self.usage_footer.read(cx).cloud_chip().clone())
     }
     /// ResourcePressureNotice's chip, just before the terminal controls.

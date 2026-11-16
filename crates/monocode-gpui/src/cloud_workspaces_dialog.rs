@@ -328,6 +328,11 @@ impl CloudWorkspacesDialog {
         self.confirm.as_ref().is_some_and(|c| c.acknowledged)
     }
 
+    /// The project whose workspaces it lists.
+    pub(crate) fn project(&self) -> &str {
+        &self.project
+    }
+
     /// A stop or delete is running. The dialog stays open until it ends, so its result reaches
     /// the shell.
     pub(crate) fn working(&self) -> bool {

@@ -2,10 +2,12 @@
 //! (the only way in: the project menu no longer has an item for it), and what the shell does with
 //! its Stop and Delete: adds its busy view (a copy), and on a delete forgets the sessions of the
 //! deleted workspace in the window and the Sub-agents panel. The drawer (see [`crate::drawer`])
-//! slides in from the right; it stays open while a stop or delete runs, so the result always gets
-//! here.
+//! slides in from the right and out again when it closes (Escape, a click outside and Close all
+//! take the same animated path, [`Shell::close_cloud_workspaces`]); it stays open while a stop or
+//! delete runs, so the result always gets here.
 use super::*;
 use crate::cloud_workspaces_dialog::{self, CloudWorkspacesDialog};
+use crate::drawer::{Close, DrawerState};
 
 /// The drawer's width in points (it narrows in a small window, see [`crate::drawer::fit_width`]).
 const DRAWER_WIDTH: f32 = 560.;
@@ -14,6 +16,8 @@ const DRAWER_PRIORITY: usize = 60;
 
 pub(super) struct OpenCloudWorkspaces {
     pub(super) view: Entity<CloudWorkspacesDialog>,
+    /// Open, or sliding out until the shell drops this.
+    drawer: DrawerState,
     _events: Subscription,
 }
 
@@ -27,6 +31,17 @@ impl Shell {
     ) {
         self.close_menu(cx);
         self.close_preview(cx);
+        // A drawer for this project that is sliding out comes back in from where it is, with the
+        // state it had, instead of being replaced by a fresh one that jumps to the edge.
+        if let Some(open) = &mut self.cloud_workspaces
+            && open.drawer.is_closing()
+            && open.view.read(cx).project() == path
+        {
+            open.drawer.reopen(cx);
+            window.focus(&open.view.focus_handle(cx), cx);
+            cx.notify();
+            return;
+        }
         let name = self.project_label(&path);
         let view = cx.new(|cx| CloudWorkspacesDialog::new(path, name, env, cx));
         let dialog = view.clone();
@@ -64,6 +79,7 @@ impl Shell {
         window.focus(&view.focus_handle(cx), cx);
         self.cloud_workspaces = Some(OpenCloudWorkspaces {
             view,
+            drawer: DrawerState::open(cx),
             _events: events,
         });
         cx.notify();
@@ -75,16 +91,38 @@ impl Shell {
         chip.update(cx, |chip, cx| chip.changed(cx));
     }
 
-    /// Closes the dialog, unless a stop or delete is running: closing would drop the dialog and
-    /// the subscription that carries the result back here, and the window would keep sessions of
-    /// a workspace that is gone.
+    /// Closes the drawer: it slides out, then is dropped ([`Self::cloud_workspaces_gone`]). Not
+    /// while a stop or delete is running: closing would drop the dialog and the subscription that
+    /// carries the result back here, and the window would keep sessions of a workspace that is
+    /// gone. A close while it already slides out is ignored. Focus goes back to the workspace
+    /// at once, so the sliding drawer takes no keys either.
     pub(super) fn close_cloud_workspaces(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(open) = &self.cloud_workspaces {
-            if open.view.read(cx).working() {
-                return;
-            }
+        let Some(open) = &mut self.cloud_workspaces else {
+            return;
+        };
+        if open.view.read(cx).working() {
+            return;
+        }
+        match open
+            .drawer
+            .close(cx, |this, cx| this.cloud_workspaces_gone(cx))
+        {
+            Close::Ignored => return,
+            Close::Now => self.cloud_workspaces = None,
+            Close::Started => {}
+        }
+        self.focus_workspace(window, cx);
+        cx.notify();
+    }
+
+    /// The slide-out ended: drop the drawer, unless it was opened again meanwhile.
+    fn cloud_workspaces_gone(&mut self, cx: &mut Context<Self>) {
+        if self
+            .cloud_workspaces
+            .as_ref()
+            .is_some_and(|open| open.drawer.is_closing())
+        {
             self.cloud_workspaces = None;
-            self.focus_workspace(window, cx);
             cx.notify();
         }
     }
@@ -94,6 +132,9 @@ impl Shell {
         let Some(open) = &self.cloud_workspaces else {
             return;
         };
+        if !open.drawer.is_open() {
+            return;
+        }
         // A running stop or delete keeps the dialog open; `close_cloud_workspaces` checks that.
         if !open.view.update(cx, |dialog, cx| dialog.cancel_confirm(cx)) {
             self.close_cloud_workspaces(window, cx);
@@ -123,19 +164,22 @@ impl Shell {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let view = self.cloud_workspaces.as_ref()?.view.clone();
+        let open = self.cloud_workspaces.as_ref()?;
+        let view = open.view.clone();
         let weak = cx.weak_entity();
         Some(
             crate::drawer::drawer(
                 "cloud-workspaces-drawer",
                 DRAWER_WIDTH,
                 DRAWER_PRIORITY,
+                &open.drawer,
                 view,
                 // A press on the scrim acts like Escape: it leaves the delete confirmation first.
                 move |window, cx| {
                     let _ = weak.update(cx, |this, cx| this.cloud_workspaces_escape(window, cx));
                 },
                 window,
+                cx,
             )
             .into_any_element(),
         )
@@ -351,9 +395,111 @@ mod tests {
         window
             .update(&mut visual, |shell, window, cx| {
                 shell.cloud_workspaces_escape(window, cx);
-                assert!(shell.cloud_workspaces.is_none());
+                assert!(!shell.cloud_workspaces.as_ref().unwrap().drawer.is_open());
             })
             .unwrap();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(400));
+        cx.run_until_parked();
+        window
+            .read_with(cx, |shell, _| assert!(shell.cloud_workspaces.is_none()))
+            .unwrap();
+    }
+
+    /// With motion on, every way of closing slides the drawer out first: it stays rendered and
+    /// keeps blocking the window until the slide-out has run, then it is dropped.
+    #[gpui::test]
+    fn escape_the_scrim_and_close_each_slide_the_drawer_out_before_dropping_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let w = fixtures::world_in(window.read_with(cx, |s, _| s.store.clone()).unwrap());
+        let slide_out = std::time::Duration::from_millis(400);
+
+        for how in ["escape", "scrim", "close"] {
+            let mut visual = open_drawer(&window, &w, cx);
+            visual.executor().advance_clock(slide_out);
+            visual.run_until_parked();
+            match how {
+                "escape" => visual.simulate_keystrokes("escape"),
+                "scrim" => visual.simulate_click(
+                    gpui::point(gpui::px(30.), gpui::px(30.)),
+                    Default::default(),
+                ),
+                _ => {
+                    let close = visual
+                        .debug_bounds("cloud-ws-close")
+                        .expect("Close")
+                        .center();
+                    visual.simulate_click(close, Default::default());
+                }
+            }
+            visual.run_until_parked();
+            visual.refresh().unwrap();
+            assert!(drawer_open(&window, &visual), "{how}: still sliding out");
+            assert!(
+                visual.debug_bounds("cloud-workspaces-drawer").is_some(),
+                "{how}: still rendered"
+            );
+            // Another Escape or click while it leaves changes nothing.
+            visual.simulate_keystrokes("escape");
+            visual.simulate_click(
+                gpui::point(gpui::px(30.), gpui::px(30.)),
+                Default::default(),
+            );
+            visual.run_until_parked();
+            assert!(
+                drawer_open(&window, &visual),
+                "{how}: ignored while closing"
+            );
+
+            visual.executor().advance_clock(slide_out);
+            visual.run_until_parked();
+            visual.refresh().unwrap();
+            assert!(!drawer_open(&window, &visual), "{how}: dropped after");
+            assert!(visual.debug_bounds("cloud-workspaces-drawer").is_none());
+        }
+    }
+
+    #[gpui::test]
+    fn opening_again_while_it_slides_out_keeps_the_same_drawer(cx: &mut TestAppContext) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let w = fixtures::world_in(window.read_with(cx, |s, _| s.store.clone()).unwrap());
+        let env = Env {
+            api: Some(w.api.clone()),
+            store: w.store.clone(),
+        };
+        let mut visual = open_drawer(&window, &w, cx);
+        visual
+            .executor()
+            .advance_clock(std::time::Duration::from_millis(400));
+        visual.run_until_parked();
+        window
+            .update(&mut visual, |shell, window, cx| {
+                shell.close_cloud_workspaces(window, cx);
+                assert!(!shell.cloud_workspaces.as_ref().unwrap().drawer.is_open());
+            })
+            .unwrap();
+        let view = window
+            .read_with(&visual, |s, _| {
+                s.cloud_workspaces.as_ref().unwrap().view.clone()
+            })
+            .unwrap();
+        window
+            .update(&mut visual, |shell, window, cx| {
+                shell.open_cloud_workspaces_with(w.checkout.path(), env, window, cx);
+                let open = shell.cloud_workspaces.as_ref().unwrap();
+                assert!(open.drawer.is_open());
+                assert_eq!(open.view, view, "the same dialog, not a fresh one");
+            })
+            .unwrap();
+        visual
+            .executor()
+            .advance_clock(std::time::Duration::from_millis(400));
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        assert!(drawer_open(&window, &visual), "the removal was cancelled");
+        assert!(visual.debug_bounds("cloud-workspaces-drawer").is_some());
     }
 
     /// A window whose footer chip reads the fixtures' fake `gh` and `sbx` (never the real ones).
@@ -689,8 +835,14 @@ mod tests {
         window
             .update(cx, |shell, window, cx| {
                 shell.cloud_workspaces_escape(window, cx);
-                assert!(shell.cloud_workspaces.is_none());
+                assert!(!shell.cloud_workspaces.as_ref().unwrap().drawer.is_open());
             })
+            .unwrap();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(400));
+        cx.run_until_parked();
+        window
+            .read_with(cx, |shell, _| assert!(shell.cloud_workspaces.is_none()))
             .unwrap();
     }
 }
