@@ -122,16 +122,15 @@ Never re-run `native:release:mac` for an existing tag: it refuses.
 A run that GitHub leaves `queued` with no job for more than 10 minutes is stuck (a run
 `pending` behind its tag's group is only waiting and is not touched).
 
-- Before the tag: an early run that is stuck is cancelled and treated as "no early run"; a
-  fresh run is dispatched after the release is created.
 - The early run is also checked for health (`gh api .../actions/runs/ID/jobs`) after
   `native:check`, after the build, after the CI wait and once the release exists. A job that
   failed, was cancelled or timed out (even while the run still shows in progress, because
   await-release keeps waiting), or an await-release job that is no longer queued or running,
-  loses the run. Before the tag a stuck run is cancelled, confirmed and replaced by a new early
+  loses the run (a successful await-release is healthy). Before the tag a stuck run is cancelled, confirmed and replaced by a new early
   run, and a lost run is cancelled and a fresh run follows the release. After the release a lost
   run is cancelled, the cancel is confirmed, and only then a new run is dispatched (at most 2
-  replacements in total); an unconfirmed cancel dispatches nothing and prints the commands.
+  replacements in total); an unconfirmed cancel dispatches nothing and prints the commands. If the run or its jobs cannot be read after 3 tries, the run is kept and the
+  script warns "Could not verify the CI run; watch it: URL", again at the end.
 - After the release: the script polls the run every 30 seconds for up to 15 minutes until it has
   a job or is in progress. A stuck run is cancelled, confirmed with `gh run view --json status`
   and only then replaced by a fresh dispatch, at most 2 times. If the cancel cannot be

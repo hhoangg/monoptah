@@ -498,7 +498,9 @@ export function evaluateEarlyJobs(jobs) {
   const bad = jobs.find((job) => ["failure", "cancelled", "timed_out"].includes(job.conclusion));
   if (bad) return `its job "${bad.name}" ${bad.conclusion}`;
   const wait = jobs.find((job) => AWAIT_JOB.test(job.name));
-  if (wait && !ALIVE.has(wait.status)) return `its await-release job is ${wait.status}${wait.conclusion ? " (" + wait.conclusion + ")" : ""}`;
+  // A successful await-release is healthy: it may just have seen the release.
+  if (wait && !ALIVE.has(wait.status) && !(wait.status === "completed" && wait.conclusion === "success"))
+    return `its await-release job is ${wait.status}${wait.conclusion ? " (" + wait.conclusion + ")" : ""}`;
   return null;
 }
 
@@ -518,13 +520,23 @@ export function listJobs(io, id) {
 
 // { state: "ok" | "stuck" | "bad", reason, finished }. Unreadable state counts as ok:
 // churning runs on a flaky read is worse than keeping one.
-export function earlyRunHealth(io, run) {
-  const state = viewRun(io, run.id);
-  if (!state) return { state: "ok" };
-  if (state.status === "completed")
+export async function earlyRunHealth(io, run, { attempts = 1 } = {}) {
+  // Reads are retried (a short sleep between tries) when attempts > 1; if they
+  // stay unreadable the state is "unverified" with attempts > 1, else "ok".
+  let state = null;
+  let jobs = null;
+  for (let n = 1; n <= attempts; n++) {
+    state = viewRun(io, run.id);
+    jobs = state && state.status !== "completed" ? listJobs(io, run.id) : [];
+    if (state && jobs) break;
+    if (n < attempts) await io.sleep(5000);
+  }
+  if (!state || !jobs) return attempts > 1 ? { state: "unverified" } : { state: "ok" };
+  if (state.status === "completed") {
+    if (state.conclusion === "success") return { state: "ok" };
     return { state: "bad", finished: true, reason: `it already finished (${state.conclusion ?? "no conclusion"})` };
-  const jobs = listJobs(io, run.id);
-  const why = jobs ? evaluateEarlyJobs(jobs) : null;
+  }
+  const why = evaluateEarlyJobs(jobs);
   if (why) return { state: "bad", reason: why };
   const now = io.now();
   if (isStuck(state, jobsCount(io, run.id), run.dispatchedAt, now))
@@ -538,7 +550,7 @@ export function earlyRunHealth(io, run) {
 // release). If a cancel cannot be confirmed the script goes on without an early
 // run and says how to cancel it. Returns the early run to use, or null.
 export async function ensureEarlyRun(io, early, ctx, { version, sha }) {
-  const health = earlyRunHealth(io, early);
+  const health = await earlyRunHealth(io, early);
   if (health.state === "ok") return early;
   io.log(`\nThe early CI run ${early.url} is no use: ${health.reason}.`);
   if (!health.finished && !(await cancelAndConfirm(io, early))) {
@@ -728,6 +740,8 @@ export async function runRelease(argv, io) {
   const ctx = { redispatched: 0 };
   let tagPushed = false;
   let params;
+  let liveRun = null; // the run relied on after the release
+  const warnings = [];
   // Signals are handled only while this process waits with no child running
   // (a child killed by a signal already raises InterruptedError). Before the tag
   // was pushed the early run is cancelled; after it only the recovery is printed.
@@ -735,13 +749,16 @@ export async function runRelease(argv, io) {
     const act = interruptActions({ tagPushed, early });
     const lines = ["\nInterrupted (" + signal + ")."];
     if (act.cancel) lines.push(cancelRun(io, act.cancel));
+    const known = liveRun ?? early;
     lines.push(
-      act.recover
-        ? "The tag " + tag + " is on origin.\n" + recoveryMessage("dispatch", { ...params, early })
-        : "Nothing was tagged, pushed or published.",
+      !act.recover
+        ? "Nothing was tagged, pushed or published."
+        : known
+          ? "The tag " + tag + " is on origin. The workflow run " + known.url + " is probably still going; check it: gh run view " + known.id + " --repo " + REPOSITORY + ". Starting another run is safe (runs of one tag never overlap and nothing published is replaced): " + manualDispatch(version)
+          : "The tag " + tag + " is on origin.\n" + recoveryMessage("dispatch", { ...params, early }),
     );
     io.log(lines.join("\n"));
-    io.exit(130);
+    io.exit(signal === "SIGTERM" ? 143 : 130);
   };
   const guarded = async (fn) => {
     const off = io.onInterrupt(onSignal);
@@ -864,7 +881,13 @@ export async function runRelease(argv, io) {
   try {
     run = await guarded(async () => {
       if (early) {
-        const health = earlyRunHealth(io, early);
+        const health = await earlyRunHealth(io, early, { attempts: 3 });
+        if (health.state === "unverified") {
+          const warning = "Could not verify the CI run; watch it: " + early.url;
+          io.log("\nWarning: " + warning);
+          warnings.push(warning);
+          return early;
+        }
         if (health.state === "ok") {
           io.log("\nThe early CI run continues and now sees the tag and the release: " + early.url);
           return early;
@@ -889,12 +912,14 @@ export async function runRelease(argv, io) {
     error.message = error.message + "\n\n" + recoveryMessage("dispatch", { ...params, early });
     throw error;
   }
+  liveRun = run;
   // Make sure GitHub really starts the run: a queue that stays stuck is
   // cancelled and replaced (see watchRun).
   if (run) {
     try {
       const watched = await guarded(() => watchRun(io, run, { version, sha, ctx }));
       run = watched.run;
+      liveRun = run;
       if (run) io.log("Run: " + run.url + " (" + (watched.state?.status ?? "unknown") + ")");
       if (watched.state?.status === "completed" && watched.state.conclusion !== "success")
         io.log("Warning: the run finished right away with " + watched.state.conclusion + ": " + (run?.url ?? "") + "\nLook at its log. To start a new one: " + manualDispatch(version));
@@ -904,6 +929,7 @@ export async function runRelease(argv, io) {
     }
   }
   io.removeDir(dir);
+  for (const warning of warnings) io.log("\nWarning: " + warning);
   io.log("\nRelease: https://github.com/" + REPOSITORY + "/releases/tag/" + tag);
   io.log(
     "It holds only the macOS files until the workflow finishes; the in-app feed and the Homebrew cask change at the end.\n" +

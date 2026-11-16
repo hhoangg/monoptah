@@ -356,7 +356,7 @@ function fakeIo({ files = true, headAfter = SHA, dirtyAfter = "", stamp = null, 
   // view(id, call) and jobs(id, call) override the status and the job count of a run.
   // jobList(id, call) overrides the job list, advance maps a command prefix to the ms it takes,
   // signalAtSleep makes the n-th sleep deliver SIGINT to the active handlers.
-  let { dispatchFails = 0, findable = true, cancelFails = false, statusAfterRelease = "in_progress", view = null, jobs = null, jobList = null, advance = {}, signalAtSleep = 0 } = early;
+  let { dispatchFails = 0, findable = true, cancelFails = false, statusAfterRelease = "in_progress", view = null, jobs = null, jobList = null, advance = {}, signalAtSleep = 0, signalName = "SIGINT", viewFails = null } = early;
   const handlers = [];
   const exits = [];
   let sleeps = 0;
@@ -419,6 +419,7 @@ function fakeIo({ files = true, headAfter = SHA, dirtyAfter = "", stamp = null, 
       if (command === "gh" && args[0] === "run" && args[1] === "view") {
         const id = Number(args[2]);
         const n = countCall("view", id);
+        if (viewFails && viewFails(id, n)) return { status: 1, stdout: "", stderr: "HTTP 502" };
         let state;
         if (cancelled.has(id)) state = { status: "completed", conclusion: "cancelled" };
         else if (view) state = view(id, n);
@@ -486,7 +487,7 @@ function fakeIo({ files = true, headAfter = SHA, dirtyAfter = "", stamp = null, 
       clock += ms;
       events.push("sleep");
       sleeps += 1;
-      if (signalAtSleep && sleeps === signalAtSleep) for (const handler of [...handlers]) handler("SIGINT");
+      if (signalAtSleep && sleeps === signalAtSleep) for (const handler of [...handlers]) handler(signalName);
     },
     onInterrupt: (handler) => {
       handlers.push(handler);
@@ -974,8 +975,8 @@ test("evaluateEarlyJobs: a failed, cancelled or timed out job, or a finished awa
   for (const conclusion of ["failure", "cancelled", "timed_out"])
     assert.match(evaluateEarlyJobs([...healthyJobs, { name: "Package windows", status: "completed", conclusion }]), new RegExp(`Package windows" ${conclusion}`));
   assert.match(
-    evaluateEarlyJobs([{ name: "Wait for the macOS files and CI", status: "completed", conclusion: "success" }]),
-    /await-release job is completed/,
+    evaluateEarlyJobs([{ name: "Wait for the macOS files and CI", status: "completed", conclusion: "timed_out" }]),
+    /timed_out/,
   );
   assert.equal(evaluateEarlyJobs([{ name: "Wait for the macOS files and CI", status: "queued", conclusion: null }]), null);
 });
@@ -1094,4 +1095,41 @@ test("the interrupt handler is only installed around waits and always removed", 
     else if (e === "offInterrupt") active -= 1;
     else if (e.startsWith("visible ")) assert.equal(active, 0, e);
   }
+});
+
+test("after the release a successful await-release job and a successful finished run are healthy", async () => {
+  const jobList = (id, n) => (id === 4242 && n >= 4 ? [healthyJobs[0], { name: "Wait for the macOS files and CI", status: "completed", conclusion: "success" }] : healthyJobs);
+  const kept = fakeIo({ early: { jobList } });
+  await runRelease([V], kept.io);
+  assert.deepEqual(kept.dispatched, ["req-1"]);
+  assert.ok(!kept.events.some((e) => e.startsWith("capture gh run cancel")));
+  assert.ok(evaluateEarlyJobs([{ name: "Wait for the macOS files and CI", status: "completed", conclusion: "success" }]) === null);
+  assert.match(evaluateEarlyJobs([{ name: "Wait for the macOS files and CI", status: "completed", conclusion: "skipped" }]), /await-release job is completed \(skipped\)/);
+  const done = fakeIo({ early: { view: (id) => (id === 4242 ? { status: "completed", conclusion: "success" } : { status: "in_progress", conclusion: null }) } });
+  await runRelease([V], done.io);
+  assert.deepEqual(done.dispatched, ["req-1"]);
+});
+
+test("after the release an unreadable run is kept with an explicit warning, shown again at the end", async () => {
+  const { io, logs, dispatched, events } = fakeIo({ early: { viewFails: (id, n) => id === 4242 && n >= 4 } });
+  await runRelease([V], io);
+  const warning = "Could not verify the CI run; watch it: https://example.test/runs/4242";
+  assert.equal(logs.filter((l) => l.includes(warning)).length, 2);
+  assert.ok(logs.at(-2).includes(warning) || logs.at(-3).includes(warning));
+  assert.deepEqual(dispatched, ["req-1"]);
+  assert.ok(!events.some((e) => e.startsWith("capture gh run cancel")));
+  // Three reads were tried, two sleeps between them.
+  assert.equal(events.filter((e) => e.startsWith("capture gh run view 4242")).length >= 6, true);
+});
+
+test("SIGTERM exits 143, and after the tag the recovery names the known run instead of saying it did not start", async () => {
+  const { io, logs, exits, events } = fakeIo({
+    early: { view: (id) => (id === 4242 ? { status: "queued", conclusion: null } : { status: "in_progress", conclusion: null }), jobs: (id) => (id === 4242 ? 0 : 3), signalAtSleep: 1, signalName: "SIGTERM" },
+  });
+  await assert.rejects(runRelease([V], io), /exit 143/);
+  assert.deepEqual(exits, [143]);
+  assert.ok(!events.some((e) => e.startsWith("capture gh run cancel")));
+  const text = logs.join("\n");
+  assert.match(text, /Interrupted \(SIGTERM\)\..*The tag native-v0\.40\.5 is on origin\. The workflow run https:\/\/example\.test\/runs\/4242 is probably still going; check it: gh run view 4242 --repo hhoangg\/monoptah.*another run is safe.*gh workflow run/s);
+  assert.ok(!/did not start/.test(text));
 });

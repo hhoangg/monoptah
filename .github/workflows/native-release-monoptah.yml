@@ -504,10 +504,12 @@ jobs:
           export MONOCODE_NATIVE_VERSION="$VERSION"
           # Reads of the GitHub API are retried (3 tries, 10 seconds apart), so a
           # transient error does not fail a wait of up to two hours.
+          # Only the output of a successful attempt is printed: gh prints the
+          # error JSON to stdout on an HTTP error, which must not reach the caller.
           retry() {
-            local n
+            local n out
             for n in 1 2 3; do
-              if "$@"; then return 0; fi
+              if out=$("$@"); then printf '%s\n' "$out"; return 0; fi
               if (( n < 3 )); then sleep 10; fi
             done
             return 1
