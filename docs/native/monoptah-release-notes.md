@@ -4,7 +4,7 @@
 
 ### Fixes
 
-- The cloud chip at the right of the footer now uses the same text and icon size as the Actions and Terminal buttons, and lines up with them. Before, its label was larger than the other footer buttons.
+- The footer cloud chip now sits in the same group as the Actions and Terminal buttons, directly right of Terminal (or of the running-terminals chip that replaces it), and uses the same text and icon size. Before, it stood alone at the end of the footer and its label was larger than the other footer buttons. The running-terminals chip now uses the same button style as the rest of the group.
 
 ## Downloads and updates
 
