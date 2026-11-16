@@ -1,9 +1,9 @@
-# Fork-local release workflow (Monoptah Native). Run by hand (workflow_dispatch)
-# with the tag input, normally by `npm run native:release:mac -- X.Y.Z`, which
-# builds and packages the macOS app on the maintainer's Mac (GitHub-hosted macOS
-# runners are not used at all), pushes the tag native-vX.Y.Z, creates the release
-# with the three macOS files and dispatches this workflow. It then builds the
-# Linux x86_64 and Windows x86_64 apps on CI and publishes:
+# Fork-local release workflow (Monoptah Native). Run by hand (workflow_dispatch),
+# normally by `npm run native:release:mac -- X.Y.Z`. That script builds and
+# packages the macOS app on the maintainer's Mac (GitHub-hosted macOS runners are
+# not used at all), pushes the tag native-vX.Y.Z and creates the release with the
+# three macOS files. This workflow builds the Linux x86_64, Windows x86_64 and rpm
+# apps on CI and publishes:
 #   - a GitHub Release native-vX.Y.Z with, per platform, the updater package and
 #     its signature (what the in-app updater downloads):
 #       macOS arm64    MonoptahNative_X.Y.Z_aarch64.app.tar.gz (+ .sig), plus the
@@ -28,21 +28,38 @@
 # Until this workflow finishes the release holds only the macOS files. The in-app
 # feed and the Homebrew cask change only at the end (publish and homebrew).
 #
+# Two modes (inputs):
+#   - Early run (sha given, request_id for the run name): the local script
+#     dispatches it before native:check, so Linux, Windows and rpm build from the
+#     commit while the Mac checks and builds. The tag and the release do not exist
+#     yet. The await-release job waits (up to 120 minutes) for the tag, which must
+#     point at the same commit, for the release and for all three macOS files in
+#     state "uploaded", then requires a green native.yml push run on main for the
+#     commit, then plans again. publish runs only after that, so nothing is
+#     published before the local script has tagged. If the local script fails or
+#     stops before tagging it cancels this run; when Ctrl-C kills it, the run
+#     fails at the await limit and nothing was published.
+#   - Tag only (sha empty, the old manual path): the tag and its release with the
+#     macOS files must exist, and native.yml must be green for the tag's commit.
+#     Use it to re-run a release whose early run is gone:
+#       gh workflow run native-release-monoptah.yml --ref main -f tag=native-vX.Y.Z
+#
 # Why there is no push trigger: the tag is pushed before the macOS files are
-# uploaded, so a tag-triggered run would race the upload. The workflow is
-# dispatched after the upload instead.
+# uploaded, so a tag-triggered run would race the upload.
 #
-# Jobs: plan (validate the tag, require a green native.yml push run on main for
-# the tagged commit, require the release with all macOS files), package (Linux and
-# Windows matrix) and package-rpm build in parallel, publish (Ubuntu) signs every
-# updater package and the feed in one place, verifies them with the app's own
-# verifier and publishes, then homebrew bumps the macOS-only cask. Every
-# platform is required: if one package job fails nothing is published, and a
-# re-run reuses the platforms that already succeeded only once they are on the
-# release (see "Re-runs" below).
+# Jobs: plan (validate the inputs, resolve the commit, decide what to build),
+# package (Linux and Windows matrix) and package-rpm build in parallel from the
+# planned commit, await-release (in parallel with the builds, see above), then
+# publish (Ubuntu) checks that the tag is the built commit, signs every updater
+# package and the feed in one place, verifies them with the app's own verifier
+# and publishes, then homebrew bumps the macOS-only cask. Every platform is
+# required: if one package job fails nothing is published, and a re-run reuses
+# the platforms that already succeeded only once they are on the release (see
+# "Re-runs" below). The release notes are the body of the release (written by the
+# local script); the feed carries the same text.
 #
-# macOS is never built here. The plan job fails unless the release already has
-# the three macOS files, and tells the operator to run the local script.
+# macOS is never built here. The plan job leaves macOS out of the matrix when its
+# files are not on the release yet (early run) and fails in tag-only mode.
 #
 # Re-runs: published assets are never replaced. When the release already has all
 # files of a platform, that platform is not rebuilt and its published files are
@@ -50,7 +67,9 @@
 # A platform with only some of its files published fails the plan job: delete
 # its published assets by hand and re-run. The publish job also refuses to skip
 # a freshly built file that is already on the release. The feed is replaced only
-# by the same or a newer version.
+# by the same or a newer version. If a run fails after the release exists, the
+# local script is not needed again: dispatch with the tag only (above), or re-run
+# the failed jobs of the run.
 #
 # Only plain X.Y.Z tags are supported (no -preview.N): the cask, the checksum
 # asset and the feed all assume a final version, and the cask bump script
@@ -82,12 +101,25 @@
 # the upstream repository so it does not run (and fail) on this fork.
 name: Native release (Monoptah)
 
+# The local script finds its run by the request_id in the run name.
+run-name: Native release ${{ inputs.tag }} ${{ inputs.request_id }}
+
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing native-vX.Y.Z tag to release (pushed with its macOS files by npm run native:release:mac)
+        description: native-vX.Y.Z to release. With sha it may not exist yet (npm run native:release:mac pushes it later); without sha it must exist with its release
         required: true
+        type: string
+      sha:
+        description: Full 40-character commit to build (set by npm run native:release:mac so the build starts before the tag exists). Empty means the commit of the existing tag
+        required: false
+        default: ""
+        type: string
+      request_id:
+        description: Opaque id only used in the run name, so the local script can find the run it started
+        required: false
+        default: ""
         type: string
 
 # Only the publish job writes, so only it gets write access.
@@ -108,14 +140,17 @@ env:
   NATIVE_UPDATER_PUBKEY: dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDdDMjg4MkQ0N0E3MDA1QUYKUldTdkJYQjYxSUlvZks0RGFSU2dkQU91NnBZQitHMC9yVFNwb2swamVLbnpHU2kvVS9yNWRBZkIK
 
 jobs:
-  # Validates the tag, requires a green CI run for the tagged commit, and decides
-  # what to build. The release must already exist with its macOS files (uploaded
-  # by npm run native:release:mac), and macOS is never built here. A re-run after
-  # a partial failure (for example the feed step failing after the release was
-  # created) must not rebuild and replace published assets: the cask may already
-  # pin the zip, and the feed must describe the packages that are actually
-  # published. Only "not found" (HTTP 404) means the release does not exist; any
-  # other error fails the job.
+  # Validates the inputs and decides what to build. Two modes:
+  #   - sha given (early run, started by npm run native:release:mac before the
+  #     tag exists): the commit is built as is. The tag may not exist yet or the
+  #     release may be missing; macOS is then deferred to the await-release job.
+  #     If the tag already exists it must point at that commit.
+  #   - no sha (the old manual path): the tag and its release must exist, the
+  #     commit is the tag's, and a green native.yml run for it is required here.
+  # Only "not found" (HTTP 404) means the release does not exist; any other error
+  # fails the job. A re-run after a partial failure must not rebuild and replace
+  # published assets: the cask may already pin the zip, and the feed must describe
+  # the packages that are actually published.
   plan:
     name: Plan the release
     runs-on: ubuntu-latest
@@ -128,17 +163,12 @@ jobs:
       rpm: ${{ steps.plan.outputs.rpm }}
       build_any: ${{ steps.plan.outputs.build_any }}
       reuse: ${{ steps.plan.outputs.reuse }}
+      sha: ${{ steps.commit.outputs.sha }}
+    env:
+      INPUT_SHA: ${{ inputs.sha }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-          ref: ${{ format('refs/tags/{0}', inputs.tag) }}
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: Check the tag is a plain native release version
+      # Before the checkout, so a bad input never reaches it.
+      - name: Check the inputs
         run: |
           set -euo pipefail
           if [[ "$RELEASE_TAG" != native-v* ]]; then
@@ -150,16 +180,57 @@ jobs:
             echo "Tag $RELEASE_TAG must look like native-vX.Y.Z (pre-release tags are not supported)" >&2
             exit 1
           fi
+          if [[ -n "$INPUT_SHA" && ! "$INPUT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "sha must be a full 40-character lowercase hex commit, got: $INPUT_SHA" >&2
+            exit 1
+          fi
           echo "MONOCODE_NATIVE_VERSION=$VERSION" >> "$GITHUB_ENV"
 
-      # Releases are cut from commits whose native.yml run on main succeeded. The
-      # commit is the one checked out (the tag's), not the dispatching ref's.
-      - name: Require a successful native.yml run for the tagged commit
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.sha != '' && inputs.sha || format('refs/tags/{0}', inputs.tag) }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # The commit is the one checked out. If the tag already exists it must
+      # point at the same commit, whatever the mode.
+      - name: Resolve the commit and check the tag
+        id: commit
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           SHA=$(git rev-parse HEAD)
+          if [[ -n "$INPUT_SHA" && "$SHA" != "$INPUT_SHA" ]]; then
+            echo "Checked out $SHA but sha input is $INPUT_SHA" >&2
+            exit 1
+          fi
+          COUNT=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$RELEASE_TAG" --jq '[.[] | select(.ref == "refs/tags/'"$RELEASE_TAG"'")] | length')
+          if [[ "$COUNT" != 0 ]]; then
+            TAG_SHA=$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha)
+            if [[ "$TAG_SHA" != "$SHA" ]]; then
+              echo "Tag $RELEASE_TAG points at $TAG_SHA, not at $SHA. Nothing was built." >&2
+              exit 1
+            fi
+          elif [[ -z "$INPUT_SHA" ]]; then
+            echo "Tag $RELEASE_TAG does not exist. Without the sha input the tag must exist." >&2
+            exit 1
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      # Tag-only mode: releases are cut from commits whose native.yml run on main
+      # succeeded. In sha mode the await-release job checks this just before
+      # publishing, because CI may still be running when this run starts.
+      - name: Require a successful native.yml run for the tagged commit
+        if: inputs.sha == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          set -euo pipefail
           COUNT=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/native.yml/runs?head_sha=$SHA&event=push&branch=main&status=success&per_page=1" --jq .total_count)
           if [[ "$COUNT" -lt 1 ]]; then
             echo "native.yml has no successful push run on main for commit $SHA. Wait for it to pass, then release again." >&2
@@ -176,21 +247,27 @@ jobs:
             echo "::notice::Release $RELEASE_TAG exists; its published assets are reused and none is replaced."
             gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' > "$RUNNER_TEMP/published.txt"
           elif grep -q "HTTP 404" <<<"$out"; then
-            echo "Release $RELEASE_TAG does not exist. The macOS files are built on the maintainer's Mac: run 'npm run native:release:mac -- ${RELEASE_TAG#native-v}' from a clean main checkout." >&2
-            exit 1
+            if [[ -z "$INPUT_SHA" ]]; then
+              echo "Release $RELEASE_TAG does not exist. The macOS files are built on the maintainer's Mac: run 'npm run native:release:mac -- ${RELEASE_TAG#native-v}' from a clean main checkout." >&2
+              exit 1
+            fi
+            echo "::notice::Release $RELEASE_TAG does not exist yet; the local script creates it with the macOS files. Linux and Windows build meanwhile."
           else
             echo "$out" >&2
             exit 1
           fi
 
       # Prints matrix, rpm, build_any and reuse. A platform is built unless the
-      # release already has every one of its files. The command fails when macOS
-      # would have to be built.
+      # release already has every one of its files. In tag-only mode the command
+      # fails when macOS would have to be built; in sha mode macOS is left out
+      # until the await-release job sees its files.
       - name: Decide which platforms to build
         id: plan
         run: |
           set -euo pipefail
-          node scripts/native-release-monoptah.mjs plan "$RUNNER_TEMP/published.txt" | tee -a "$GITHUB_OUTPUT"
+          FLAGS=()
+          if [[ -n "$INPUT_SHA" ]]; then FLAGS+=(--defer-macos); fi
+          node scripts/native-release-monoptah.mjs plan "${FLAGS[@]}" "$RUNNER_TEMP/published.txt" | tee -a "$GITHUB_OUTPUT"
 
   # Linux x86_64 and Windows x86_64 (macOS is built locally, and the plan job
   # keeps it out of the matrix). No signing key here: these jobs only build and
@@ -209,7 +286,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-          ref: ${{ format('refs/tags/{0}', inputs.tag) }}
+          ref: ${{ needs.plan.outputs.sha }}
 
       - uses: actions/setup-node@v4
         with:
@@ -305,7 +382,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-          ref: ${{ format('refs/tags/{0}', inputs.tag) }}
+          ref: ${{ needs.plan.outputs.sha }}
 
       - name: Install native rpm build dependencies
         run: |
@@ -340,6 +417,99 @@ jobs:
             native-dist/monoptah-native*
           if-no-files-found: error
 
+  # Runs in parallel with the builds. It waits until the local script has pushed
+  # the tag and created the release with all three macOS files (state
+  # "uploaded"), then requires a successful native.yml push run on main for the
+  # commit, then plans again with the final list of published files. It has no
+  # secret but the workflow token and cannot write. It fails at once when the tag
+  # points at another commit, and after AWAIT_LIMIT_MINUTES when the tag, the
+  # release or the files never came: the local script stopped before tagging or
+  # failed, and nothing was published. A partial set of macOS files is waited for
+  # like an absent one. Only HTTP 404 means the release is absent.
+  await-release:
+    name: Wait for the macOS files and CI
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    permissions:
+      contents: read
+      actions: read
+    env:
+      AWAIT_LIMIT_MINUTES: "120"
+      PLAN_SHA: ${{ needs.plan.outputs.sha }}
+    outputs:
+      reuse: ${{ steps.final.outputs.reuse }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ needs.plan.outputs.sha }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Wait for the tag, the release and the macOS files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#native-v}"
+          echo "MONOCODE_NATIVE_VERSION=$VERSION" >> "$GITHUB_ENV"
+          export MONOCODE_NATIVE_VERSION="$VERSION"
+          DEADLINE=$(( $(date +%s) + AWAIT_LIMIT_MINUTES * 60 ))
+          while true; do
+            STATE="the tag $RELEASE_TAG does not exist yet"
+            COUNT=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$RELEASE_TAG" --jq '[.[] | select(.ref == "refs/tags/'"$RELEASE_TAG"'")] | length')
+            if [[ "$COUNT" != 0 ]]; then
+              TAG_SHA=$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha)
+              if [[ "$TAG_SHA" != "$PLAN_SHA" ]]; then
+                echo "Tag $RELEASE_TAG points at $TAG_SHA, not at $PLAN_SHA. Nothing was published." >&2
+                exit 1
+              fi
+              STATE="the release $RELEASE_TAG does not exist yet"
+              if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq .assets > "$RUNNER_TEMP/assets.json" 2> "$RUNNER_TEMP/release.err"; then
+                if [[ "$(node scripts/native-release-monoptah.mjs macos-ready "$RUNNER_TEMP/assets.json")" == true ]]; then
+                  echo "The tag and the release with all macOS files are there."
+                  break
+                fi
+                STATE="the release does not hold all three uploaded macOS files yet"
+              elif ! grep -q "HTTP 404" "$RUNNER_TEMP/release.err"; then
+                cat "$RUNNER_TEMP/release.err" >&2
+                exit 1
+              fi
+            fi
+            if (( $(date +%s) >= DEADLINE )); then
+              echo "Gave up after $AWAIT_LIMIT_MINUTES minutes: $STATE. The local script (npm run native:release:mac) probably stopped before tagging or failed; nothing was published. Run it again." >&2
+              exit 1
+            fi
+            echo "Waiting: $STATE."
+            sleep 30
+          done
+
+      - name: Require a successful native.yml run for the commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          COUNT=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/native.yml/runs?head_sha=$PLAN_SHA&event=push&branch=main&status=success&per_page=1" --jq .total_count)
+          if [[ "$COUNT" -lt 1 ]]; then
+            echo "native.yml has no successful push run on main for commit $PLAN_SHA. Nothing was published." >&2
+            exit 1
+          fi
+
+      # The macOS files are on the release now, so macOS must be reused. The
+      # result must build exactly what the plan job built.
+      - name: Plan again with the published files
+        id: final
+        env:
+          PLANNED_MATRIX: ${{ needs.plan.outputs.matrix }}
+          PLANNED_RPM: ${{ needs.plan.outputs.rpm }}
+        run: |
+          set -euo pipefail
+          jq -r '.[].name' "$RUNNER_TEMP/assets.json" > "$RUNNER_TEMP/published.txt"
+          node scripts/native-release-monoptah.mjs plan --check-planned "$RUNNER_TEMP/published.txt" | tee -a "$GITHUB_OUTPUT"
+
   # The only job with the signing key and write access. It runs on Ubuntu and
   # signs every updater package and the feed (macOS files included, taken from
   # the release), checks them with the app's own verifier, then publishes.
@@ -347,8 +517,8 @@ jobs:
   # published); a failed or cancelled one stops the release.
   publish:
     name: Sign and publish Monoptah Native
-    needs: [plan, package, package-rpm]
-    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    needs: [plan, package, package-rpm, await-release]
+    if: ${{ !cancelled() && needs.await-release.result == 'success' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     permissions:
@@ -358,6 +528,19 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ format('refs/tags/{0}', inputs.tag) }}
+
+      # The tag exists here (await-release saw it). It must still be the commit
+      # that was planned and built, or the build would not match the tag.
+      - name: Check the tag is the commit that was built
+        env:
+          PLAN_SHA: ${{ needs.plan.outputs.sha }}
+        run: |
+          set -euo pipefail
+          HEAD_SHA=$(git rev-parse HEAD)
+          if [[ "$HEAD_SHA" != "$PLAN_SHA" ]]; then
+            echo "Tag $RELEASE_TAG is at $HEAD_SHA but $PLAN_SHA was built. Nothing was signed or published." >&2
+            exit 1
+          fi
 
       - name: Configure version
         run: |
@@ -405,10 +588,10 @@ jobs:
       # these exact bytes. The macOS zip is checked against its published
       # checksum, which is what the cask pins.
       - name: Download the published assets of platforms that were not rebuilt
-        if: needs.plan.outputs.reuse != ''
+        if: needs.await-release.outputs.reuse != ''
         env:
           GH_TOKEN: ${{ github.token }}
-          REUSE: ${{ needs.plan.outputs.reuse }}
+          REUSE: ${{ needs.await-release.outputs.reuse }}
         run: |
           set -euo pipefail
           set -f
@@ -478,7 +661,7 @@ jobs:
       - name: Publish the versioned GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          REUSE: ${{ needs.plan.outputs.reuse }}
+          REUSE: ${{ needs.await-release.outputs.reuse }}
         run: |
           set -euo pipefail
           set -f
