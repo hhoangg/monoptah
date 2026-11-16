@@ -175,7 +175,7 @@ impl Shell {
                     .gap(px(6.))
                     .max_w(px(180.))
                     .min_w_0()
-                    .child(icon(action.icon(), 12.).text_color(content(0.55)))
+                    .child(icon(action.icon(), FOOTER_ICON_SIZE).text_color(content(0.55)))
                     .child(div().min_w_0().truncate().child(action.name.clone()))
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.run_action(&id, window, cx)),
@@ -185,7 +185,7 @@ impl Shell {
                 .aria_label("Add action")
                 .px(pad)
                 .gap(px(6.))
-                .child(icon("play", 12.).text_color(content(0.55)))
+                .child(icon("play", FOOTER_ICON_SIZE).text_color(content(0.55)))
                 .child("Actions")
                 .on_click(
                     cx.listener(|this, _, window, cx| this.open_action_dialog(None, window, cx)),

@@ -1033,7 +1033,7 @@ impl Shell {
             .items_center()
             .gap(px(FOOTER_GAP))
             .when(!classic, |d| d.mr(px(6.)).pb(px(2.)))
-            .text_size(px(11.))
+            .text_size(px(FOOTER_TEXT_SIZE))
             .children(actions);
         // The right panel's Terminal tab, or title bar terminal tabs, take
         // over the footer's terminal controls.
@@ -1057,7 +1057,7 @@ impl Shell {
                 group
                     .when(has_actions, |d| d.child(footer_separator()))
                     .child(
-                        div()
+                        footer_button(classic)
                             .id("footer-terminal")
                             .debug_selector(|| "footer-terminal".into())
                             .role(Role::Button)
@@ -1067,19 +1067,6 @@ impl Shell {
                             } else {
                                 gpui::Toggled::False
                             })
-                            .h(px(20.))
-                            .map(|d| {
-                                if classic {
-                                    d.px(px(6.)).rounded_md()
-                                } else {
-                                    d.px_2().rounded_full()
-                                }
-                            })
-                            .flex()
-                            .flex_shrink_0()
-                            .items_center()
-                            .gap(px(6.))
-                            .whitespace_nowrap()
                             .map(|d| {
                                 if open {
                                     d.text_color(accent_color()).hover(|s| s.bg(content(0.1)))
@@ -1089,7 +1076,11 @@ impl Shell {
                                 }
                             })
                             .child(icon("terminal", 14.))
-                            .child("Terminal")
+                            .child(
+                                div()
+                                    .debug_selector(|| "footer-terminal-label".into())
+                                    .child("Terminal"),
+                            )
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx)),
                             ),

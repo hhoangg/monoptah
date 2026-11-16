@@ -626,6 +626,29 @@ pub(crate) fn split_frame(
         .when(menu_open, |d| d.bg(content(0.06)))
         .hover(|s| s.bg(content(0.06)))
 }
+/// The text size of the footer's right-hand controls: Actions, Terminal and the cloud chip.
+pub(crate) const FOOTER_TEXT_SIZE: f32 = 11.;
+/// The icon size of the footer's Actions button and cloud chip.
+pub(crate) const FOOTER_ICON_SIZE: f32 = 12.;
+/// A single footer button (Terminal, the cloud chip): its height, padding, rounding, the gap
+/// between icon and label, and the footer's text size. Callers add the id, colours and children.
+pub(crate) fn footer_button(classic: bool) -> Div {
+    div()
+        .h(px(20.))
+        .map(|d| {
+            if classic {
+                d.px(px(6.)).rounded_md()
+            } else {
+                d.px_2().rounded_full()
+            }
+        })
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .gap(px(6.))
+        .whitespace_nowrap()
+        .text_size(px(FOOTER_TEXT_SIZE))
+}
 // `.primary-action` paints with literal white and black, not theme ink.
 pub(crate) fn white(alpha: f32) -> Hsla {
     gpui::hsla(0., 0., 1., alpha)

@@ -376,6 +376,32 @@ mod tests {
             window_width - chip_bounds.right() <= gpui::px(16.),
             "{window_width:?} {chip_bounds:?}"
         );
+        // It reads like the Terminal button beside it: the same text size (so the same line
+        // box), the same height and the same vertical centre.
+        let chip_label = visual
+            .debug_bounds("cloud-status-chip-label")
+            .expect("the chip's label");
+        let terminal_label = visual
+            .debug_bounds("footer-terminal-label")
+            .expect("the Terminal button's label");
+        assert_eq!(
+            chip_label.size.height, terminal_label.size.height,
+            "{chip_label:?} {terminal_label:?}"
+        );
+        assert_eq!(
+            chip_bounds.size.height, terminal.size.height,
+            "{chip_bounds:?} {terminal:?}"
+        );
+        assert_eq!(
+            chip_bounds.center().y,
+            terminal.center().y,
+            "{chip_bounds:?} {terminal:?}"
+        );
+        assert_eq!(
+            chip_label.center().y,
+            terminal_label.center().y,
+            "{chip_label:?} {terminal_label:?}"
+        );
         window
             .read_with(&visual, |shell, _| {
                 assert!(shell.cloud_workspaces.is_none())
