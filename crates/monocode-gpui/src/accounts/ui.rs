@@ -114,6 +114,7 @@ impl Accounts {
                     })
                     .on_click(cx.listener(|this, _, _, cx| this.submit_editor(cx))),
                 )
+                .children(self.inline_code_entry(cx))
                 .children(self.error.as_ref().map(|error| {
                     div()
                         .mt_2()
@@ -246,7 +247,11 @@ impl Accounts {
                     .child(submit),
             )
             .children(self.auth_menu_popover(cx));
-        div().child(row).children(secret).into_any_element()
+        div()
+            .child(row)
+            .children(secret)
+            .children(self.inline_code_entry(cx))
+            .into_any_element()
     }
 
     pub(crate) fn settings_rows(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -1025,6 +1030,14 @@ impl Render for Accounts {
                 .or_else(|| window.focused(cx));
             window.focus(&self.dialog_focus, cx);
         }
+        // Bring the code field forward once, so the user can paste right away.
+        if self.has_modal_auth()
+            && let Some(prompt) = self.signin.as_mut().and_then(|s| s.code.as_mut())
+            && !prompt.focused
+        {
+            prompt.focused = true;
+            window.focus(&prompt.input.read(cx).focus_handle(cx), cx);
+        }
         div()
             .absolute()
             .inset_0()
@@ -1122,6 +1135,7 @@ impl Render for Accounts {
                             },
                         )),
                     )
+                    .children(self.code_entry("provider-signin", true, cx))
                     .children(error.map(|error| {
                         div()
                             .id("provider-signin-error")
@@ -1145,7 +1159,7 @@ impl Accounts {
         self.close_auth(window, cx);
         true
     }
-    fn close_auth(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn close_auth(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.cancel_auth(cx);
         if let Some(focus) = self.previous_focus.take() {
             window.focus(&focus, cx);

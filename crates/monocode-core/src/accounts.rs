@@ -12,7 +12,10 @@ pub(crate) mod login;
 pub(crate) mod transfer;
 pub use identity::Identity;
 pub use login::arguments as login_arguments;
-pub use login::{authenticate, AuthAction};
+pub use login::{
+    accepts_pasted_code, authenticate, authenticate_with, validate_code, AuthAction, AuthIo,
+    AuthProgress,
+};
 mod processes;
 #[cfg(test)]
 mod tests;

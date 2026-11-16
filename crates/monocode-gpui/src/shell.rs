@@ -9523,11 +9523,14 @@ impl Render for Shell {
                 .push(cx.observe_window_activation(window, |this, window, cx| {
                     if !window.is_window_active() {
                         this.close_preview(cx);
+                        if let Some(center) = crate::accounts::get(cx) {
+                            center.update(cx, |center, _| center.app_deactivated());
+                        }
                     } else {
                         this.resume_git(cx);
                         this.check_github_star(true, cx);
                         if let Some(center) = crate::accounts::get(cx) {
-                            center.update(cx, |center, cx| center.app_reactivated(cx));
+                            center.update(cx, |center, cx| center.app_reactivated(window, cx));
                         }
                     }
                 }));
