@@ -288,6 +288,55 @@ fn removing_a_workflow_first_names_the_instances_its_interrupted_runs_left() {
     assert_eq!(actions::left_instances(&mut d.host, A), None);
 }
 
+#[gpui::test]
+fn removing_a_workflow_from_its_own_page_still_shows_the_instances_it_left(
+    cx: &mut TestAppContext,
+) {
+    use monocode_core::mono::workflows::model::{RunInstance, RunStatus, RunTrigger};
+    let s = setup(cx);
+    put(&s, vec![workflow(json!({}))]);
+    let mut run = monocode_core::mono::workflows::engine::start_run(
+        &workflow(json!({})),
+        RunTrigger::Manual,
+        1,
+        "run-1",
+    );
+    run.status = RunStatus::Interrupted;
+    run.cloud_instances = vec![RunInstance {
+        kind: "codespace".into(),
+        name: "octo-run".into(),
+        created: true,
+        nodes: vec!["build".into()],
+        sessions: vec!["remote:1".into()],
+    }];
+    update_runs(&MonoDir::new(&s.root, &s.id), A, |_| {
+        Ok((vec![run.clone()], ()))
+    })
+    .unwrap();
+    open_tab(&s, cx);
+    let visual = &mut VisualTestContext::from_window(s.window.into(), cx);
+    visual.run_until_parked();
+    s.manager.update(visual, |m, cx| {
+        m.open_workflow_route(Route::Workflow(A.into()), cx)
+    });
+    visual.run_until_parked();
+    settle(&s, visual);
+    // The page warns about them while the workflow exists.
+    assert!(visual.debug_bounds("mono-workflow-instances").is_some());
+    // The trash icon of the page: the page closes, and the list is what shows the notice.
+    s.manager
+        .update(visual, |m, cx| m.workflow_remove_clicked(A, true, cx));
+    visual.run_until_parked();
+    assert_eq!(route(&s, visual), None);
+    assert!(saved(&s).is_empty());
+    let shown = notice(&s, visual).expect("the list says what the removal left");
+    assert!(
+        shown.contains("left 1 cloud instance running: Codespace octo-run"),
+        "{shown}"
+    );
+    assert_eq!(page_notice(&s, visual), None);
+}
+
 #[test]
 fn remove_is_refused_while_a_run_is_going() {
     let mut d = disk(vec![workflow(json!({}))]);

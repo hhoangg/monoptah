@@ -944,3 +944,49 @@ fn the_report_names_an_instance_its_session_no_longer_tells_about() {
         "{listed}"
     );
 }
+
+#[gpui::test]
+fn a_start_that_fails_after_creating_its_instance_still_names_the_instance(
+    cx: &mut TestAppContext,
+) {
+    // The error of such a start says the instance was created and kept.
+    let rig = Rig::new(&[]);
+    rig.fake
+        .fail_starts(&monocode_core::cloud_sessions::created_note(
+            "octo-new",
+            "The setup failed",
+        ));
+    rig.start(cx, &build_then_check());
+    cx.run_until_parked();
+    let run = rig.last_run();
+    assert_eq!(run.status, RunStatus::Failed);
+    assert_eq!(node(&run, "build").status, NodeStatus::Failed);
+    assert_eq!(
+        run.cloud_instances,
+        vec![RunInstance {
+            kind: "codespace".into(),
+            name: "octo-new".into(),
+            created: true,
+            nodes: vec!["build".into()],
+            sessions: Vec::new(),
+        }]
+    );
+    {
+        let w = rig.fake.world();
+        let text = &w.posts[0].text;
+        assert!(
+            text.contains("Codespace octo-new: created by this run; step build"),
+            "{text}"
+        );
+        // Named, not touched.
+        assert!(w.stops.is_empty());
+    }
+    // A start that failed before creating anything leaves no instance behind.
+    let rig = Rig::new(&[]);
+    rig.fake.fail_starts("No capacity");
+    rig.start(cx, &build_then_check());
+    cx.run_until_parked();
+    let run = rig.last_run();
+    assert_eq!(node(&run, "build").status, NodeStatus::Failed);
+    assert!(run.cloud_instances.is_empty());
+}

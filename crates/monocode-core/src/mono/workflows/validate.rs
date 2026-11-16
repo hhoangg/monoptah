@@ -671,6 +671,23 @@ impl<'a> Checker<'a> {
                 (value, TEMPLATABLE_TARGET_OPTIONS.contains(&key.as_str()))
             {
                 self.check_text(text, node);
+                // A project input renders to a path on this computer, which means nothing in
+                // an instance and must not be sent to the provider.
+                for var in template_vars(text) {
+                    let mut path = var.split('.');
+                    let named = match (path.next(), path.next()) {
+                        (Some("inputs"), Some(name)) => self.w.inputs.get(name),
+                        _ => None,
+                    };
+                    if named.is_some_and(|input| input.ty == super::model::InputType::Project) {
+                        self.add(
+                            format!(
+                                "target.{key}: {{{{{var}}}}} is a project input, which fills in a path on this computer; use a text input"
+                            ),
+                            at,
+                        );
+                    }
+                }
             } else {
                 self.add(
                     format!(

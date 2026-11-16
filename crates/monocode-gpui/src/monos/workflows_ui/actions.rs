@@ -3,7 +3,7 @@
 //! (the Mono's files, or a test host), so the rules are the CLI's: the same refusals, the same
 //! review mark, the same issue check. They block (files, CLI probes): call them off the UI thread.
 use monocode_core::mono::workflows::{
-    cli::{WorkflowHost, checked_run_values},
+    cli::{WorkflowHost, account_issues, checked_run_values},
     model::{
         InputValue, NodeKind, Workflow, WorkflowInput, definition_fingerprint,
         interrupted_instances, left_instances_text, trigger_of, with_run_values,
@@ -59,7 +59,9 @@ pub(super) fn refusal(verb: &str, issues: &[WorkflowIssue]) -> String {
 /// Everything wrong with the workflow's graph and the models its sessions name.
 pub(super) fn issues_of(host: &mut impl WorkflowHost, w: &Workflow) -> Vec<WorkflowIssue> {
     let catalog = host.catalog(w);
-    workflow_issues(w, &catalog)
+    let mut issues = workflow_issues(w, &catalog);
+    issues.extend(account_issues(host, w));
+    issues
 }
 
 /// The workflow switched on, its next scheduled run counted from `now`.

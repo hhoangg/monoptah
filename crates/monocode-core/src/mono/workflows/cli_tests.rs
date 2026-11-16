@@ -59,6 +59,8 @@ struct Memory {
     preflights: Vec<Vec<String>>,
     /// The Mono's projects; None accepts a project value as given.
     projects: Option<Vec<String>>,
+    /// Account selectors the host judges unusable, with why (the app's accounts are not here).
+    bad_accounts: HashMap<String, String>,
 }
 
 impl WorkflowHost for Memory {
@@ -112,6 +114,9 @@ impl WorkflowHost for Memory {
             None => Some(input.to_string()),
             Some(projects) => crate::mono::resolve_project(projects, input).ok(),
         }
+    }
+    fn account_problem(&mut self, selector: &str) -> Option<String> {
+        self.bad_accounts.get(selector).cloned()
     }
 }
 
@@ -1620,6 +1625,46 @@ fn get_and_runs_list_the_cloud_instances_and_warn_for_an_interrupted_run() {
 }
 
 #[test]
+fn get_names_the_instances_of_every_interrupted_run_not_only_the_last_five() {
+    let mut f = Fx::new();
+    let id = id_of(&f.add(definition(json!({}))));
+    // Eight runs, newest first: the interrupted ones that left instances are 7th and 8th.
+    let mut runs: Vec<WorkflowRun> = (0..6)
+        .map(|i| run(&format!("run-{i}"), RunStatus::Done, &id))
+        .collect();
+    let mut old = run("run-6", RunStatus::Interrupted, &id);
+    old.cloud_instances = vec![used("codespace", "octo-run", true)];
+    let mut older = run("run-7", RunStatus::Interrupted, &id);
+    older.cloud_instances = vec![
+        used("codespace", "octo-run", false),
+        used("sandbox", "box", true),
+    ];
+    runs.push(old);
+    runs.push(older);
+    f.host.runs.insert(id.clone(), runs);
+    let got = f.ok("workflows.get", json!({"id": id}));
+    assert_eq!(list(&got, "runs").len(), 5);
+    let left = list(&got, "cloudInstancesLeft");
+    assert_eq!(
+        left.iter().map(|i| text(i, "name")).collect::<Vec<_>>(),
+        ["octo-run", "box"]
+    );
+    let note = text(&got, "cloudInstancesLeftNote");
+    assert!(
+        note.contains("left 2 cloud instances running: Codespace octo-run, Sandbox box"),
+        "{note}"
+    );
+    // Nothing interrupted, nothing to say.
+    f.host
+        .runs
+        .insert(id.clone(), vec![run("run-9", RunStatus::Done, &id)]);
+    assert!(f
+        .ok("workflows.get", json!({"id": id}))
+        .get("cloudInstancesLeft")
+        .is_none());
+}
+
+#[test]
 fn stop_and_remove_name_the_cloud_instances_and_touch_none() {
     let mut f = Fx::new();
     let id = id_of(&f.add(definition(json!({}))));
@@ -1670,6 +1715,67 @@ fn stop_and_remove_name_the_cloud_instances_and_touch_none() {
     assert!(note.contains("never stops or deletes"), "{note}");
     assert!(f.stored().is_empty());
     assert_eq!(f.host.cleared, [id]);
+}
+
+/// The small definition with its `fetch` step in a cloud instance as `account`.
+fn account_definition(account: &str, instance: Value) -> Value {
+    let mut def = definition(json!({}));
+    def["nodes"][1]["target"] = json!({"kind": "codespace", "instance": instance});
+    def["nodes"][1]["account"] = json!(account);
+    def
+}
+
+#[test]
+fn validate_add_and_update_report_an_account_the_host_cannot_use() {
+    let mut f = Fx::new();
+    f.host
+        .bad_accounts
+        .insert("Nobody".into(), "No Claude account is named Nobody.".into());
+    f.host.bad_accounts.insert(
+        "Bare".into(),
+        "A cloud session needs a Claude account with a setup token or API key.".into(),
+    );
+    for (account, phrase) in [
+        ("Nobody", "account: No Claude account is named Nobody."),
+        ("Bare", "account: A cloud session needs a Claude account"),
+    ] {
+        let def = account_definition(account, json!("new"));
+        let checked = f.ok("workflows.validate", json!({"workflow": def.clone()}));
+        assert!(
+            joined(&checked).contains(phrase),
+            "{account}: {}",
+            joined(&checked)
+        );
+        let issue = list(&checked, "issues")
+            .iter()
+            .find(|i| text(i, "message").starts_with("account:"))
+            .unwrap();
+        assert_eq!(text(issue, "nodeId"), "fetch");
+        // Saved paused with the issue, like any other problem.
+        let added = f.add(def.clone());
+        assert!(joined(&added).contains(phrase), "{account}");
+        let id = id_of(&added);
+        let updated = f.ok("workflows.update", json!({"id": id, "workflow": def}));
+        assert!(joined(&updated).contains(phrase), "{account}");
+    }
+    // A usable account, and no account, raise nothing.
+    let good = f.ok(
+        "workflows.validate",
+        json!({"workflow": account_definition("Work", json!("new"))}),
+    );
+    assert!(list(&good, "issues").is_empty(), "{}", joined(&good));
+    // A step that goes on in another instance takes no account: validation says so, and the
+    // host is not asked about it.
+    let same = f.ok(
+        "workflows.validate",
+        json!({"workflow": account_definition("Nobody", json!({"sameAs": "fetch"}))}),
+    );
+    let said = joined(&same);
+    assert!(
+        said.contains("The account belongs to the instance"),
+        "{said}"
+    );
+    assert!(!said.contains("No Claude account"), "{said}");
 }
 
 // ---- the store-backed host --------------------------------------------------------------

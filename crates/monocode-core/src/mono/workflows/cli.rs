@@ -67,6 +67,44 @@ pub trait WorkflowHost: Sized {
     fn preflight(&mut self, w: &Workflow) -> Preflight;
     /// The assigned project an input value names (a full path, or a folder name), if any.
     fn project_path(&self, input: &str) -> Option<String>;
+    /// Why a cloud step cannot run with the Claude account `selector` (it names no account, or
+    /// one without the setup token or API key an instance needs), if the host can tell. The
+    /// answer never holds a credential. A host without the account book says nothing and the
+    /// step is checked when it starts.
+    fn account_problem(&mut self, _selector: &str) -> Option<String> {
+        None
+    }
+}
+
+/// How the app judges an account selector for a cloud step: `None` when it can be used.
+pub type AccountCheck = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+/// A cloud step whose account the host can tell is unusable, as validation issues. Only a step
+/// that creates an instance takes an account (the others are reported by validation already).
+pub fn account_issues<H: WorkflowHost>(host: &mut H, w: &Workflow) -> Vec<WorkflowIssue> {
+    let mut issues = Vec::new();
+    for node in &w.nodes {
+        let NodeKind::Session {
+            target: Some(target),
+            account: Some(account),
+            ..
+        } = &node.kind
+        else {
+            continue;
+        };
+        if !matches!(target.instance, super::model::TargetInstance::New)
+            || account.trim().is_empty()
+        {
+            continue;
+        }
+        if let Some(problem) = host.account_problem(account) {
+            issues.push(WorkflowIssue {
+                node_id: Some(node.id.clone()),
+                message: format!("account: {problem}"),
+            });
+        }
+    }
+    issues
 }
 
 /// What the runner and the actions tell each other, shared as an `Arc`: the runner calls
@@ -124,6 +162,7 @@ pub struct StoreHost {
     preflight: fn(&Workflow) -> Preflight,
     /// The Mono's assigned projects; None accepts a project value as given.
     projects: Option<Vec<String>>,
+    accounts: Option<AccountCheck>,
 }
 
 impl StoreHost {
@@ -134,11 +173,17 @@ impl StoreHost {
             probe: native_probe,
             preflight: native_preflight,
             projects: None,
+            accounts: None,
         }
     }
     /// Replaces how requirements are checked (tests must never reach real CLIs or shells).
     pub fn with_preflight(mut self, preflight: fn(&Workflow) -> Preflight) -> Self {
         self.preflight = preflight;
+        self
+    }
+    /// How cloud step accounts are judged (the app's account book is not in this crate).
+    pub fn with_accounts(mut self, check: AccountCheck) -> Self {
+        self.accounts = Some(check);
         self
     }
     /// The projects assigned to the Mono, which a per-run `project` value must name.
@@ -190,6 +235,9 @@ impl WorkflowHost for StoreHost {
             None => Some(input.to_string()),
             Some(projects) => crate::mono::resolve_project(projects, input).ok(),
         }
+    }
+    fn account_problem(&mut self, selector: &str) -> Option<String> {
+        self.accounts.as_ref().and_then(|check| check(selector))
     }
 }
 
@@ -351,6 +399,7 @@ fn problems<H: WorkflowHost>(host: &mut H, w: &Workflow) -> Vec<WorkflowIssue> {
                 message,
             }),
     );
+    issues.extend(account_issues(host, w));
     issues
 }
 
@@ -818,6 +867,19 @@ fn get<H: WorkflowHost>(host: &mut H, input: &Json) -> Result<Json, String> {
         "runs",
         Json::Array(runs.iter().take(5).map(run_summary).collect()),
     ));
+    // Every interrupted run counts, not only the last five: such a run never reports, so its
+    // record is the only place that names the instances it left running.
+    let left = interrupted_instances(&runs);
+    if !left.is_empty() {
+        out.push(("cloudInstancesLeft", instances_json(&left)));
+        out.push((
+            "cloudInstancesLeftNote",
+            st(left_instances_text(
+                "The interrupted runs of this workflow",
+                &left,
+            )),
+        ));
+    }
     Ok(Json::Object(out.into_iter().collect()))
 }
 

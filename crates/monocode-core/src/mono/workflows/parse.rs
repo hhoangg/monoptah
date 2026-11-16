@@ -76,6 +76,17 @@ fn parse_checkout(raw: Option<&Json>) -> Option<Checkout> {
     }
 }
 
+/// `Some(None)` when there is no account, `None` when it is there but is not text: dropping it
+/// would run the step with the default account, which pays for the instance, so the whole
+/// entry is left out instead (like an unreadable `target`).
+fn parse_account(raw: Option<&Json>) -> Option<Option<String>> {
+    match raw {
+        None | Some(Json::Null) => Some(None),
+        Some(Json::String(text)) => Some(Some(text.clone())),
+        Some(_) => None,
+    }
+}
+
 /// `Some(None)` when there is no target, `None` when it is there but unreadable.
 fn parse_target(raw: Option<&Json>) -> Option<Option<SessionTarget>> {
     let Some(raw) = raw else {
@@ -167,7 +178,7 @@ pub fn parse_node(raw: &Json) -> Option<Node> {
             nest_under: str_of(raw, "nestUnder"),
             timeout_minutes: num_of(raw, "timeoutMinutes"),
             target: parse_target(raw.get("target"))?,
-            account: str_of(raw, "account"),
+            account: parse_account(raw.get("account"))?,
         },
         "command" => NodeKind::Command {
             project: str_of(raw, "project")?,

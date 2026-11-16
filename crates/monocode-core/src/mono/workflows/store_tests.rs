@@ -249,6 +249,102 @@ fn update_runs_drops_the_oldest_runs_when_the_file_grows_too_large() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+fn left_running(id: &str, status: RunStatus, instance: &str) -> WorkflowRun {
+    let mut r = run(id);
+    r.status = status;
+    r.cloud_instances = vec![RunInstance {
+        kind: "codespace".into(),
+        name: instance.into(),
+        created: true,
+        nodes: vec!["build".into()],
+        sessions: Vec::new(),
+    }];
+    r
+}
+
+#[test]
+fn an_interrupted_run_that_names_cloud_instances_is_not_trimmed_with_the_history() {
+    let root = temp_root();
+    let disk = dir(&root);
+    // The oldest run is interrupted and left an instance; 25 newer plain runs follow it.
+    let mut all: Vec<WorkflowRun> = (0..25).map(|i| run(&format!("new{i}"))).collect();
+    all.push(left_running(
+        "old-interrupted",
+        RunStatus::Interrupted,
+        "octo-run",
+    ));
+    // An old run that finished, and one interrupted without an instance, go as before.
+    all.push(left_running("old-done", RunStatus::Done, "reported"));
+    all.push({
+        let mut r = run("old-bare");
+        r.status = RunStatus::Interrupted;
+        r
+    });
+    update_runs(&disk, ID, |_| Ok((all.clone(), ()))).unwrap();
+    let kept = ids(&text(&disk, RUNS));
+    assert_eq!(kept.len(), 21);
+    assert_eq!(kept[0], "new0");
+    assert_eq!(kept[19], "new19");
+    assert_eq!(kept[20], "old-interrupted");
+    let loaded = load_runs(&disk, ID).unwrap();
+    assert_eq!(loaded[20].cloud_instances[0].name, "octo-run");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn the_runs_kept_for_their_instances_are_bounded() {
+    let root = temp_root();
+    let disk = dir(&root);
+    let mut all: Vec<WorkflowRun> = (0..20).map(|i| run(&format!("new{i}"))).collect();
+    all.extend((0..PINNED_RUNS_KEPT + 5).map(|i| {
+        left_running(
+            &format!("left{i}"),
+            RunStatus::Interrupted,
+            &format!("c{i}"),
+        )
+    }));
+    update_runs(&disk, ID, |_| Ok((all.clone(), ()))).unwrap();
+    let kept = ids(&text(&disk, RUNS));
+    assert_eq!(kept.len(), 20 + PINNED_RUNS_KEPT);
+    // The newest of them stay; the oldest beyond the bound go.
+    assert_eq!(
+        kept.last().unwrap(),
+        &format!("left{}", PINNED_RUNS_KEPT - 1)
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn under_the_size_budget_ordinary_runs_go_before_one_that_names_instances() {
+    let root = temp_root();
+    let disk = dir(&root);
+    let mib = 1024 * 1024;
+    let fat = |id: &str, bytes: usize| {
+        let mut r = run(id);
+        r.error = Some("x".repeat(bytes));
+        r
+    };
+    let mut pinned = left_running("left", RunStatus::Interrupted, "octo-run");
+    pinned.error = Some("y".repeat(mib));
+    update_runs(&disk, ID, |_| {
+        Ok((
+            vec![
+                fat("r1", mib),
+                fat("r2", mib),
+                fat("r3", mib),
+                pinned.clone(),
+            ],
+            (),
+        ))
+    })
+    .unwrap();
+    // Four runs of 1 MiB do not fit: the oldest ordinary one goes, not the pinned one.
+    let written = text(&disk, RUNS);
+    assert!(written.len() <= RUNS_FILE_BUDGET);
+    assert_eq!(ids(&written), vec!["r1", "r2", "left"]);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn update_runs_fails_loudly_when_one_run_passes_the_host_cap() {
     let root = temp_root();

@@ -388,17 +388,27 @@ impl Exec {
         let Some(name) = info.name else {
             return;
         };
+        self.record_named_instance(node_id, &info.kind, name, Some(session_id), created);
+    }
+
+    /// The same for an instance whose name is known without a session: one a start created
+    /// before it failed (its error says so), which is billable all the same.
+    fn record_named_instance(
+        self: &Rc<Self>,
+        node_id: &str,
+        kind: &str,
+        name: String,
+        session_id: Option<&str>,
+        created: bool,
+    ) {
         {
             let mut state = self.state.borrow_mut();
             let kept = &mut state.run.cloud_instances;
-            let at = match kept
-                .iter()
-                .position(|i| i.kind == info.kind && i.name == name)
-            {
+            let at = match kept.iter().position(|i| i.kind == kind && i.name == name) {
                 Some(at) => at,
                 None => {
                     kept.push(RunInstance {
-                        kind: info.kind.clone(),
+                        kind: kind.to_string(),
                         name,
                         created: false,
                         nodes: Vec::new(),
@@ -412,7 +422,9 @@ impl Exec {
             if !entry.nodes.iter().any(|n| n == node_id) {
                 entry.nodes.push(node_id.to_string());
             }
-            if !entry.sessions.iter().any(|s| s == session_id) {
+            if let Some(session_id) = session_id
+                && !entry.sessions.iter().any(|s| s == session_id)
+            {
                 entry.sessions.push(session_id.to_string());
             }
         }
@@ -733,7 +745,23 @@ impl Exec {
                     return;
                 }
                 Either::Left(Err(_)) | Either::Left(Ok(Ok(None))) => return,
-                Either::Left(Ok(Err(error))) => return self.fail(&node_id, &branch, error),
+                Either::Left(Ok(Err(error))) => {
+                    // A start can fail after it created the instance (its error says so, and
+                    // the instance is kept): it is billable all the same, so the run names it.
+                    if is_cloud
+                        && let Some((_, kind, name)) =
+                            monocode_core::cloud_sessions::split_created_note(&error)
+                    {
+                        self.record_named_instance(
+                            &node_id,
+                            kind.api_name(),
+                            name.to_string(),
+                            None,
+                            true,
+                        );
+                    }
+                    return self.fail(&node_id, &branch, error);
+                }
                 Either::Left(Ok(Ok(Some(started)))) => started,
             };
             if let Some(folder) = started.folder_id {

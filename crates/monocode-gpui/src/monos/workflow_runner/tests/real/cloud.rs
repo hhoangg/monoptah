@@ -486,7 +486,7 @@ fn an_account_that_cannot_be_used_is_refused_before_any_instance_is_created(
     cx: &mut TestAppContext,
 ) {
     let _clis = crate::shell::surface_tests::NoClis::new();
-    let (s, gh, _host, _guard) = cloud_setup(cx, "Failed");
+    let (s, gh, host, _guard) = cloud_setup(cx, "Failed");
     // One account with a setup token, one without.
     let _work = crate::monos::cloud_tests::claude_account(&s, "Work", Some(FAKE_TOKEN), cx);
     let _bare = crate::monos::cloud_tests::claude_account(&s, "Bare", None, cx);
@@ -518,6 +518,8 @@ fn an_account_that_cannot_be_used_is_refused_before_any_instance_is_created(
     assert!(!error.is_empty());
     // An existing instance keeps the account it started with.
     let first = crate::monos::cloud_tests::cloud_session(&s, cx);
+    // What the machine host was asked so far (setting that session up): nothing below adds to it.
+    let host_calls = host.0.lock().unwrap().len();
     let persisted = locked(&s.store)
         .unwrap()
         .persisted_session_id(first)
@@ -532,7 +534,11 @@ fn an_account_that_cannot_be_used_is_refused_before_any_instance_is_created(
     // Nothing was made for any of them.
     assert_eq!(session_count(&s), before);
     assert_eq!(creates(&gh), 0);
-    // (The existing session above talked to the machine host; only `gh` is judged.)
+    assert_eq!(
+        host.0.lock().unwrap().len(),
+        host_calls,
+        "no refused account reached the machine host"
+    );
     instance_untouched_gh(&gh);
 }
 

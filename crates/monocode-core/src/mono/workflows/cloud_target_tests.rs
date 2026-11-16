@@ -427,7 +427,9 @@ fn string_options_may_hold_templates_that_are_checked_like_a_prompt() {
     // Changed on purpose: templates in these options used to be refused ("templates are not
     // filled in"); a run now fills them in when the step starts.
     for (kind, key, value) in [
-        ("codespace", "branch", "{{inputs.project}}"),
+        // (`{{inputs.project}}` used to be accepted here; a project input fills in a local path,
+        // so it is refused now, see `a_project_input_cannot_fill_a_target_option`.)
+        ("codespace", "branch", "{{run.id}}"),
         ("codespace", "machine", "m-{{run.id}}"),
         ("sandbox", "branch", "x-{{run.id}}"),
         ("sandbox", "image", "img:{{run.id}}"),
@@ -442,6 +444,53 @@ fn string_options_may_hold_templates_that_are_checked_like_a_prompt() {
         session_json("a", value!({"output": {"branch": {"type": "string"}}})),
         cloud("b", value!({"kind": "codespace", "branch": "{{a.branch}}"})),
     ]));
+}
+
+#[test]
+fn a_project_input_cannot_fill_a_target_option() {
+    for (kind, key) in [
+        ("codespace", "branch"),
+        ("codespace", "machine"),
+        ("sandbox", "image"),
+        ("sandbox", "template"),
+    ] {
+        let w = chain(vec![cloud(
+            "a",
+            value!({"kind": kind, key: "x-{{inputs.project}}"}),
+        )]);
+        assert!(
+            has(&w, "{{inputs.project}} is a project input"),
+            "{kind} {key}: {:?}",
+            messages(&w)
+        );
+    }
+    // Other inputs and upstream outputs are fine.
+    let mut w = chain(vec![cloud(
+        "a",
+        value!({"kind": "codespace", "branch": "{{inputs.branch}}"}),
+    )]);
+    w.inputs
+        .insert("branch", WorkflowInput::new(InputType::String));
+    no_issues(&w);
+}
+
+#[test]
+fn an_account_that_is_not_text_makes_the_node_unreadable_instead_of_being_dropped() {
+    for account in [
+        value!(5),
+        value!(true),
+        value!(["Work"]),
+        value!({"id": "x"}),
+    ] {
+        let raw = cloud_with_account("a", value!({"kind": "codespace"}), account).to_string();
+        assert!(
+            super::parse::parse_node(&Json::parse(&raw).unwrap()).is_none(),
+            "{raw}"
+        );
+    }
+    // Absent and null both mean no account.
+    let raw = cloud_with_account("a", value!({"kind": "codespace"}), value!(null)).to_string();
+    assert_eq!(account_of(&node(&raw)), None);
 }
 
 #[test]

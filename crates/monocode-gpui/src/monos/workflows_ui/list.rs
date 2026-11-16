@@ -464,11 +464,14 @@ impl Monos {
                 (actions::remove(host, &id), left)
             },
             move |this, (notice, left), cx| {
+                let mut page = page;
                 if notice.is_none()
                     && matches!(&this.route, Some(Route::Workflow(open)) if *open == removed)
                 {
-                    // Once the workflow is gone, its page closes.
+                    // Once the workflow is gone, its page closes. A text for the user then
+                    // belongs to the list, which is what shows.
                     this.route = None;
+                    page = false;
                 }
                 // A refusal first; otherwise the cloud instances the removed history named.
                 this.workflow_said(notice.or(left), page, cx);
