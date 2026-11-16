@@ -36,12 +36,29 @@ body:
     validations:
       required: true
 
-  - type: input
+  - type: dropdown
     id: provider
     attributes:
-      label: Provider CLI and version
-      description: The CLI the session used and its version, or "Not provider-related".
-      placeholder: "Claude Code 2.1.0"
+      label: Provider CLI
+      options:
+        - Claude Code
+        - Codex
+        - Cursor
+        - Grok Build
+        - OpenCode
+        - Pi
+        - omp
+        - fx
+        - Multiple / not sure
+    validations:
+      required: true
+
+  - type: input
+    id: provider-version
+    attributes:
+      label: Provider CLI version
+      description: Output of the CLI's version command, or "Not provider-related".
+      placeholder: "2.1.0"
     validations:
       required: true
 
