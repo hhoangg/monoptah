@@ -53,6 +53,8 @@ BREAKING CHANGE: ... (if any)
   `mono`, `ui`, `core`, `release`, `scripts`, `ci`. Omit it when the change has no single
   module.
 - Body: required for `feat` and `fix` (the cause or the reason for the change).
+- Footer: `Refs: #N`, or `Fixes: #N` when the commit closes the issue; omit it when there is no
+  issue.
 - One complete, buildable change per commit. Do not mix a refactor and a fix.
 - Commits that address review comments say so, for example
   `fix(cloud): address review on drawer close`.
@@ -98,6 +100,8 @@ Open issues with one of the two forms in `.github/ISSUE_TEMPLATE/`:
 ## Releases
 
 - Native release tags are `native-vX.Y.Z` (semver).
+- Host release tags are `host-vX.Y.Z`. Bump `host/VERSION` through a PR, then tag main (see
+  "Releasing the Host" in `CLAUDE.md`).
 - Version bump from the merged changes: `feat` is minor, `fix` and `perf` are patch, any
   `BREAKING CHANGE` is major.
 - Release notes live in `docs/native/monoptah-release-notes.md`. Its first line must stay

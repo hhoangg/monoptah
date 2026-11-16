@@ -10,7 +10,7 @@ Full rules and examples: [`docs/git-conventions.md`](docs/git-conventions.md).
 
 - Types (branch, commit, PR): `feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `build`, `ci`, `chore`, `revert`.
 - Branch: `<type>/<issue#>-<short-slug>` or `<type>/<short-slug>`, lowercase, about 40 chars. Rename an app-made `mc/...` branch with `git branch -m` before the first push.
-- Commit: `<type>(<scope>): <summary>` (imperative, at most 72 chars, no period), English. A body (why and what) is required for `feat` and `fix`; add `Refs: #N` or `Fixes: #N`. One buildable change per commit.
+- Commit: `<type>(<scope>): <summary>` (imperative, at most 72 chars, no period), English. A body (why and what) is required for `feat` and `fix`; add `Refs: #N` or `Fixes: #N` when there is an issue. One buildable change per commit.
 - PR: title in the commit format; the body fills every section of `.github/pull_request_template.md`, keeping its headings. Merge with squash.
 - Never commit to `main`, never force-push a branch with an open PR, never commit secrets or realistic-looking fake tokens.
 
@@ -204,7 +204,10 @@ in `host/VERSION` as `X.Y.Z+monoptah` (semver build metadata marks the fork flav
 
 1. `npm run host:release -- X.Y.Z` (plain `X.Y.Z`): needs a clean tree, writes `host/VERSION`,
    commits "Release Monoptah Host X.Y.Z" and creates the tag `host-vX.Y.Z`. It never pushes; it
-   prints the push commands for you to review and run.
+   prints the push commands for you to review and run. To keep the git conventions (no commits
+   to main, squash merges), set `host/VERSION` to `X.Y.Z+monoptah` in a PR titled
+   `chore(release): Monoptah Host X.Y.Z` instead, then run the script on the up-to-date main:
+   with the version already recorded it only tags HEAD. Push only the tag, not HEAD.
 2. Pushing the tag starts `.github/workflows/host-release-monoptah.yml`. It checks the tag
    against `host/VERSION`, refuses when the release already exists, builds every target of
    `npm run host:package -- --all` (Linux and macOS `.tar.gz`, Windows `.zip`, asset names keep
