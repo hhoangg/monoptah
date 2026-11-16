@@ -14,7 +14,10 @@ import {
   STAMP_FILE,
   buildCommand,
   buildEnv,
+  CI_POLL_MS,
+  CI_RUNS_JQ,
   ciRunsPath,
+  ciVerdict,
   evaluatePreconditions,
   failureOf,
   formatCommand,
@@ -31,6 +34,7 @@ import {
   stampContent,
   stampMatches,
   tagFor,
+  waitForCi,
 } from "./native-release-macos-local.mjs";
 import { assetNames } from "./package-native-monoptah.mjs";
 
@@ -40,7 +44,7 @@ const V = "0.40.5";
 const SHA = "a".repeat(40);
 
 test("arguments: a plain version, optional --dry-run, nothing else", () => {
-  const base = { version: V, dryRun: false, recheck: false, since: undefined, notesFile: undefined };
+  const base = { version: V, dryRun: false, recheck: false, since: undefined, notesFile: undefined, ciTimeoutMinutes: 60 };
   assert.deepEqual(parseArgs([V]), base);
   assert.deepEqual(parseArgs([V, "--dry-run"]), { ...base, dryRun: true });
   assert.deepEqual(parseArgs(["--dry-run", V, "--recheck"]), { ...base, dryRun: true, recheck: true });
@@ -49,6 +53,10 @@ test("arguments: a plain version, optional --dry-run, nothing else", () => {
     since: "native-v0.40.0",
     notesFile: "hl.md",
   });
+  assert.equal(parseArgs([V, "--ci-timeout", "90"]).ciTimeoutMinutes, 90);
+  assert.equal(parseArgs([V, "--ci-timeout=0.5"]).ciTimeoutMinutes, 0.5);
+  assert.throws(() => parseArgs([V, "--ci-timeout", "0"]), /number of minutes above 0/);
+  assert.throws(() => parseArgs([V, "--ci-timeout", "abc"]), /number of minutes above 0/);
   assert.throws(() => parseArgs([V, "--since"]), /--since needs a value/);
   assert.throws(() => parseArgs([V, "--notes", "--dry-run"]), /--notes needs a value/);
   assert.throws(() => parseArgs([]), /usage/);
@@ -127,11 +135,9 @@ const good = {
   remoteTagCheckFailed: null,
   ghAuthed: true,
   release: "absent",
-  ciCheckFailed: null,
-  ciRuns: 1,
 };
 
-test("preconditions pass for a clean, current main with green CI", () => {
+test("preconditions pass for a clean, current main and do not look at CI", () => {
   assert.deepEqual(evaluatePreconditions(good, V), []);
 });
 
@@ -149,8 +155,6 @@ test("every precondition failure is reported with an actionable message", () => 
     [{ tauriCli: false }, /node_modules\/@tauri-apps\/cli is missing.*npm ci/],
     [{ release: "exists" }, /release native-v0\.40\.5 already exists/],
     [{ release: "error", releaseError: "HTTP 500" }, /only HTTP 404 means absent\): HTTP 500/],
-    [{ ciRuns: 0 }, /no successful push run on main for commit aaaaaaaaaaaa/],
-    [{ ciRuns: null, ciCheckFailed: "HTTP 403" }, /Could not read the native.yml runs: HTTP 403/],
   ];
   for (const [change, pattern] of cases) {
     const problems = evaluatePreconditions({ ...good, ...change }, V);
@@ -171,7 +175,6 @@ function fakeRun(overrides = {}) {
     [`git ls-remote --tags origin refs/tags/native-v${V}`]: { status: 0, stdout: "" },
     "gh auth status": { status: 0 },
     [`gh api repos/hhoangg/monoptah/releases/tags/native-v${V}`]: { status: 1, stderr: "gh: Not Found (HTTP 404)" },
-    [`gh api ${ciRunsPath(SHA)} --jq .total_count`]: { status: 0, stdout: "1\n" },
     "git tag --list native-v*": { status: 0, stdout: "native-v0.40.4\nnative-v0.40.5-preview.1\n" },
     "git merge-base --is-ancestor native-v0.40.4 HEAD": { status: 0 },
     "git log --first-parent --format=%H%x1f%s%x1f%b%x1e native-v0.40.4..HEAD": {
@@ -201,7 +204,6 @@ test("gatherState reads the repository state through the injected runner", () =>
   const state = gatherState(fakeRun(), { version: V });
   assert.deepEqual(evaluatePreconditions(state, V), []);
   assert.equal(state.release, "absent");
-  assert.equal(state.ciRuns, 1);
 });
 
 test("gatherState: only HTTP 404 means no release, other gh errors fail", () => {
@@ -213,35 +215,36 @@ test("gatherState: only HTTP 404 means no release, other gh errors fail", () => 
   assert.ok(evaluatePreconditions(broken, V).some((p) => /HTTP 401/.test(p)));
 });
 
-test("gatherState: tags and CI are detected", () => {
+test("gatherState: tags are detected", () => {
   const state = gatherState(
     fakeRun({
       [`git rev-parse -q --verify refs/tags/native-v${V}`]: { status: 0, stdout: SHA },
       [`git ls-remote --tags origin refs/tags/native-v${V}`]: { status: 0, stdout: `${SHA}\trefs/tags/native-v${V}\n` },
-      [`gh api ${ciRunsPath(SHA)} --jq .total_count`]: { status: 0, stdout: "0\n" },
     }),
     { version: V },
   );
   assert.equal(state.localTag, true);
   assert.equal(state.remoteTag, true);
-  assert.equal(state.ciRuns, 0);
-  assert.equal(evaluatePreconditions(state, V).length, 3);
-  const failedGh = gatherState(
-    fakeRun({ [`gh api ${ciRunsPath(SHA)} --jq .total_count`]: { status: 1, stderr: "boom" } }),
-    { version: V },
-  );
-  assert.equal(failedGh.ciCheckFailed, "boom");
+  assert.equal(evaluatePreconditions(state, V).length, 2);
 });
 
-test("the CI query is the one the workflow gate uses", () => {
-  const workflow = read(".github/workflows/native-release-monoptah.yml");
-  assert.ok(
-    workflow.includes("actions/workflows/native.yml/runs?head_sha=$SHA&event=push&branch=main&status=success&per_page=1"),
-  );
+test("the CI query lists the native.yml push runs on main for the commit, in any state", () => {
   assert.equal(
     ciRunsPath(SHA),
-    `repos/hhoangg/monoptah/actions/workflows/native.yml/runs?head_sha=${SHA}&event=push&branch=main&status=success&per_page=1`,
+    `repos/hhoangg/monoptah/actions/workflows/native.yml/runs?head_sha=${SHA}&event=push&branch=main&per_page=20`,
   );
+});
+
+const run = (status, conclusion = null, id = 1) => ({ id, status, conclusion, url: `https://example.test/runs/${id}` });
+
+test("ciVerdict: success wins, pending while unfinished or absent, failed when all finished without success", () => {
+  assert.equal(ciVerdict([run("completed", "success")]), "success");
+  assert.equal(ciVerdict([run("completed", "failure", 1), run("completed", "success", 2)]), "success");
+  assert.equal(ciVerdict([run("in_progress"), run("completed", "failure", 2)]), "pending");
+  assert.equal(ciVerdict([run("queued")]), "pending");
+  assert.equal(ciVerdict([]), "pending");
+  assert.equal(ciVerdict([run("completed", "failure")]), "failed");
+  assert.equal(ciVerdict([run("completed", "cancelled", 1), run("completed", "skipped", 2)]), "failed");
 });
 
 const names = assetNames(V);
@@ -320,11 +323,13 @@ test("an interrupt message names the step and how to continue", () => {
 });
 
 // A fake io that records every command, so the tests can check the order.
-function fakeIo({ files = true, headAfter = SHA, dirtyAfter = "", stamp = null, failOn = null, docs = docsNotes } = {}) {
+function fakeIo({ files = true, headAfter = SHA, dirtyAfter = "", stamp = null, failOn = null, docs = docsNotes, ciRuns = [[run("completed", "success")]] } = {}) {
   const events = [];
   const written = [];
   const logs = [];
   const texts = {};
+  let clock = 0;
+  let ciReads = 0;
   let revParses = 0;
   let statuses = 0;
   const table = {
@@ -351,6 +356,13 @@ function fakeIo({ files = true, headAfter = SHA, dirtyAfter = "", stamp = null, 
         statuses += 1;
         return { status: 0, stdout: statuses === 1 ? "" : dirtyAfter, stderr: "" };
       }
+      if (command === "gh" && args[0] === "api" && args[1] === ciRunsPath(SHA)) {
+        const answer = ciRuns[Math.min(ciReads, ciRuns.length - 1)];
+        ciReads += 1;
+        return answer.error !== undefined
+          ? { status: 1, stdout: "", stderr: answer.error }
+          : { status: 0, stdout: JSON.stringify(answer), stderr: "" };
+      }
       return base(command, args);
     },
     visible(command, args) {
@@ -373,6 +385,11 @@ function fakeIo({ files = true, headAfter = SHA, dirtyAfter = "", stamp = null, 
     writeText: (path, text) => {
       texts[path] = text;
       events.push(`writeText ${path}`);
+    },
+    now: () => clock,
+    sleep: async (ms) => {
+      clock += ms;
+      events.push("sleep");
     },
     log: (text) => logs.push(text),
   };
@@ -550,4 +567,61 @@ test("runRelease stops before the long checks when a PR cannot be read", async (
   await assert.rejects(runRelease([V], io), /Could not read pull request #7/);
   assert.equal(visible(events).length, 0);
   assert.ok(!events.some((e) => e.startsWith("capture xcrun")));
+});
+
+test("runRelease starts native:check and the build without waiting for CI, then waits right before tagging", async () => {
+  const { io, events, logs } = fakeIo({
+    ciRuns: [[], [run("queued")], [run("in_progress")], [run("completed", "success")]],
+  });
+  await runRelease([V], io);
+  const ciReads = events.map((e, i) => (e === `capture gh api ${ciRunsPath(SHA)} --jq ${CI_RUNS_JQ}` ? i : -1)).filter((i) => i >= 0);
+  assert.equal(ciReads.length, 4);
+  const at = (prefix) => events.findIndex((e) => e.startsWith(prefix));
+  assert.ok(Math.min(...ciReads) > at("visible " + process.execPath), "CI is read only after packaging");
+  assert.ok(Math.max(...ciReads) < at("visible git tag"));
+  assert.equal(events.filter((e) => e === "sleep").length, 3);
+  assert.ok(logs.some((l) => /CI: waiting for native\.yml, 0 min elapsed: no native\.yml run found yet/.test(l)));
+  assert.ok(logs.some((l) => /CI: waiting.*run 1 \(queued\) https:\/\/example\.test\/runs\/1/.test(l)));
+  assert.ok(logs.some((l) => /CI: native\.yml passed/.test(l)));
+});
+
+test("runRelease does not tag when native.yml failed and names the run", async () => {
+  const { io, events } = fakeIo({ ciRuns: [[run("completed", "failure", 77)]] });
+  await assert.rejects(runRelease([V], io), /native\.yml did not succeed.*run 77 \(failure\) https:\/\/example\.test\/runs\/77.*Nothing was tagged/s);
+  assert.ok(!visible(events).some((c) => /^(git tag|git push|gh )/.test(c)));
+});
+
+test("runRelease does not tag on a CI timeout and says how to continue", async () => {
+  const { io, events } = fakeIo({ ciRuns: [[run("in_progress")]] });
+  await assert.rejects(
+    runRelease([V, "--ci-timeout", "2"], io),
+    /did not finish within 2 minutes.*Nothing was tagged.*Run this script again.*stamp/s,
+  );
+  assert.ok(!visible(events).some((c) => /^(git tag|git push|gh )/.test(c)));
+  assert.equal(events.filter((e) => e === "sleep").length, 4); // 2 min at 30 s
+});
+
+test("waitForCi tolerates a few failed reads and gives up after five in a row", async () => {
+  const flaky = fakeIo({ ciRuns: [{ error: "HTTP 502" }, { error: "HTTP 502" }, [run("completed", "success")]] });
+  await waitForCi(flaky.io, SHA, 10);
+  assert.ok(flaky.logs.some((l) => /could not read the runs \(HTTP 502\)/.test(l)));
+  const broken = fakeIo({ ciRuns: [{ error: "HTTP 401" }] });
+  await assert.rejects(waitForCi(broken.io, SHA, 10), /five times in a row: HTTP 401.*Nothing was tagged/s);
+  assert.equal(CI_POLL_MS, 30_000);
+});
+
+test("runRelease --dry-run prints the CI state once and never waits", async () => {
+  const { io, events, logs } = fakeIo({ ciRuns: [[run("in_progress")]] });
+  await runRelease([V, "--dry-run"], io);
+  assert.equal(events.filter((e) => e === "sleep").length, 0);
+  assert.equal(events.filter((e) => e.startsWith("capture gh api") && e.includes("/workflows/native.yml/runs")).length, 1);
+  assert.ok(logs.some((l) => /CI state of native\.yml for aaaaaaaaaaaa: pending, run 1 \(in_progress\)/.test(l)));
+});
+
+test("runRelease --dry-run never tags, pushes, creates a release, dispatches or cancels a run", async () => {
+  const { io, events } = fakeIo();
+  await runRelease([V, "--dry-run"], io);
+  const all = events.filter((e) => e.startsWith("visible ") || e.startsWith("capture ")).map((e) => e.replace(/^\w+ /, ""));
+  for (const forbidden of [/^git tag (?!--list)/, /^git push/, /^gh release/, /^gh workflow/, /^gh run cancel/])
+    assert.ok(!all.some((c) => forbidden.test(c)), String(forbidden));
 });

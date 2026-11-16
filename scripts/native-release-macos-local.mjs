@@ -7,7 +7,7 @@
 // the Homebrew cask.
 //
 // usage: npm run native:release:mac -- X.Y.Z [--dry-run] [--recheck]
-//          [--since REF] [--notes FILE]
+//          [--since REF] [--notes FILE] [--ci-timeout MINUTES]
 //   --dry-run runs every check, builds and packages, then prints the files, the
 //   generated release notes and the commands it would run, without tagging,
 //   pushing or publishing.
@@ -17,6 +17,13 @@
 //   instead of the previous native-vX.Y.Z tag.
 //   --notes FILE adds the text of FILE (without a leading "# ..." line) as hand
 //   written highlights on top of the generated release notes.
+//   --ci-timeout MINUTES bounds the wait for native.yml (default 60).
+//
+// native:check and the build do not wait for native.yml. The script waits for a
+// successful native.yml push run on main for HEAD only after building and
+// packaging, right before it tags, so CI and the local work run in parallel. If
+// CI fails or times out, nothing was tagged and the script stops; run it again
+// (the native:check stamp makes that fast).
 //
 // The release notes are generated from the titles of the pull requests merged
 // since the previous native tag (scripts/native-release-notes.mjs), so a
@@ -50,7 +57,9 @@ export function tagFor(version) {
 }
 
 export const USAGE =
-  "usage: npm run native:release:mac -- X.Y.Z [--dry-run] [--recheck] [--since REF] [--notes FILE]";
+  "usage: npm run native:release:mac -- X.Y.Z [--dry-run] [--recheck] [--since REF] [--notes FILE] [--ci-timeout MINUTES]";
+export const DEFAULT_CI_TIMEOUT_MINUTES = 60;
+export const CI_POLL_MS = 30_000;
 
 export function parseArgs(argv) {
   let version;
@@ -58,10 +67,11 @@ export function parseArgs(argv) {
   let recheck = false;
   let since;
   let notesFile;
+  let ciTimeoutMinutes = DEFAULT_CI_TIMEOUT_MINUTES;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     // Options with a value: "--name VALUE" or "--name=VALUE".
-    const valued = /^(--since|--notes)(?:=(.*))?$/.exec(arg);
+    const valued = /^(--since|--notes|--ci-timeout)(?:=(.*))?$/.exec(arg);
     if (valued) {
       let value = valued[2];
       if (value === undefined) {
@@ -71,7 +81,12 @@ export function parseArgs(argv) {
       if (value === undefined || value === "" || value.startsWith("--"))
         throw new Error(`${valued[1]} needs a value. ${USAGE}`);
       if (valued[1] === "--since") since = value;
-      else notesFile = value;
+      else if (valued[1] === "--notes") notesFile = value;
+      else {
+        ciTimeoutMinutes = Number(value);
+        if (!(ciTimeoutMinutes > 0) || !Number.isFinite(ciTimeoutMinutes))
+          throw new Error(`--ci-timeout needs a number of minutes above 0, got: ${value}`);
+      }
     } else if (arg === "--dry-run") dryRun = true;
     else if (arg === "--recheck") recheck = true;
     else if (arg.startsWith("-")) throw new Error(`Unknown option: ${arg}`);
@@ -79,7 +94,7 @@ export function parseArgs(argv) {
     else throw new Error(`Unexpected extra argument: ${arg}`);
   }
   if (version === undefined) throw new Error(USAGE);
-  return { version: releaseVersion(version), dryRun, recheck, since, notesFile };
+  return { version: releaseVersion(version), dryRun, recheck, since, notesFile, ciTimeoutMinutes };
 }
 
 // The updater public key is the one the Tauri app trusts, from tauri.conf.json.
@@ -151,8 +166,72 @@ export function sdkProblem(sdkVersion) {
   return null;
 }
 
+// The native.yml push runs on main for a commit, in any state.
 export function ciRunsPath(sha) {
-  return `repos/${REPOSITORY}/actions/workflows/native.yml/runs?head_sha=${sha}&event=push&branch=main&status=success&per_page=1`;
+  return `repos/${REPOSITORY}/actions/workflows/native.yml/runs?head_sha=${sha}&event=push&branch=main&per_page=20`;
+}
+export const CI_RUNS_JQ = "[.workflow_runs[] | {id: .id, status: .status, conclusion: .conclusion, url: .html_url}]";
+
+// "success" when any run succeeded, "pending" while a run is not completed or
+// none exists yet (it may not have been created), "failed" when every run
+// completed and none succeeded.
+export function ciVerdict(runs) {
+  if (runs.some((run) => run.conclusion === "success")) return "success";
+  if (runs.length === 0 || runs.some((run) => run.status !== "completed")) return "pending";
+  return "failed";
+}
+
+const describeRun = (run) => `run ${run.id} (${run.status === "completed" ? run.conclusion : run.status}) ${run.url}`;
+export const describeCi = (runs) =>
+  runs.length === 0 ? "no native.yml run found yet" : runs.map(describeRun).join("; ");
+
+// Reads the runs through `capture`; { runs } or { error }.
+export function readCiRuns(capture, sha) {
+  const result = capture("gh", ["api", ciRunsPath(sha), "--jq", CI_RUNS_JQ]);
+  if (result.status !== 0) return { error: (result.stderr || result.error?.message || "gh failed").trim() };
+  try {
+    const runs = JSON.parse(result.stdout);
+    if (!Array.isArray(runs)) throw new Error("not a list");
+    return { runs };
+  } catch (error) {
+    return { error: `unreadable answer (${error.message})` };
+  }
+}
+
+// Waits until native.yml succeeded for `sha`. Throws, so that nothing is tagged,
+// when a run failed or the time ran out. A few failed reads in a row are
+// tolerated (a flaky network must not waste a finished build).
+export async function waitForCi(io, sha, timeoutMinutes) {
+  const started = io.now();
+  const limit = timeoutMinutes * 60_000;
+  let readErrors = 0;
+  const short = sha.slice(0, 12);
+  for (;;) {
+    const read = readCiRuns(io.capture, sha);
+    const elapsed = Math.round((io.now() - started) / 60_000);
+    if (read.error !== undefined) {
+      readErrors += 1;
+      if (readErrors >= 5) throw new Error(`Could not read the native.yml runs five times in a row: ${read.error}. Nothing was tagged. Run this script again.`);
+      io.log(`CI: could not read the runs (${read.error}), retrying.`);
+    } else {
+      readErrors = 0;
+      const verdict = ciVerdict(read.runs);
+      if (verdict === "success") {
+        io.log(`CI: native.yml passed for ${short} (${describeCi(read.runs.filter((r) => r.conclusion === "success"))}).`);
+        return;
+      }
+      if (verdict === "failed")
+        throw new Error(
+          `native.yml did not succeed for commit ${short}: ${describeCi(read.runs)}. Nothing was tagged. Fix CI (re-run the failed jobs, or merge a fix and start the release from the new main), then run this script again; the native:check stamp makes the rerun fast.`,
+        );
+      io.log(`CI: waiting for native.yml, ${elapsed} min elapsed: ${describeCi(read.runs)}`);
+    }
+    if (io.now() - started >= limit)
+      throw new Error(
+        `native.yml for commit ${short} did not finish within ${timeoutMinutes} minutes. Nothing was tagged. Run this script again when CI is done (the native:check stamp makes the rerun fast), or use --ci-timeout MINUTES to wait longer.`,
+      );
+    await io.sleep(CI_POLL_MS);
+  }
 }
 
 // Reads the state the preconditions look at. `run(command, args)` returns
@@ -183,9 +262,6 @@ export function gatherState(run, { version, tauriCli = true }) {
     state.release = "error";
     state.releaseError = errorOf(rel);
   }
-  const ci = run("gh", ["api", ciRunsPath(state.head), "--jq", ".total_count"]);
-  state.ciCheckFailed = ci.status !== 0 ? errorOf(ci) : null;
-  state.ciRuns = ci.status === 0 ? Number.parseInt(out(ci), 10) : null;
   return state;
 }
 
@@ -218,12 +294,6 @@ export function evaluatePreconditions(state, version) {
     problems.push(`A GitHub release ${tag} already exists. This script only starts new releases.`);
   else if (state.release === "error")
     problems.push(`Could not check for release ${tag} (only HTTP 404 means absent): ${state.releaseError ?? ""}`);
-  if (state.ciCheckFailed !== null && state.ciCheckFailed !== undefined)
-    problems.push(`Could not read the native.yml runs: ${state.ciCheckFailed}`);
-  else if (!(state.ciRuns >= 1))
-    problems.push(
-      `native.yml has no successful push run on main for commit ${(state.head ?? "").slice(0, 12)}. Wait for it to pass (gh run list --workflow native.yml --branch main), then run this again.`,
-    );
   return problems;
 }
 
@@ -340,11 +410,11 @@ export class InterruptedError extends Error {
 //   io.visible(command, args, env)                            (throws on failure)
 //   io.readText(path), io.exists(path), io.listDir(dir)
 //   io.makeTempDir(version), io.removeDir(dir), io.writeStamp(text), io.log(text)
-//   io.writeText(path, text)
+//   io.writeText(path, text), io.now() (ms), io.sleep(ms) (awaitable)
 // The order is: preconditions, toolchain checks, native:check (or its stamp),
 // build, package, the dry-run stop, a recheck of HEAD and the tree, then publish.
 export async function runRelease(argv, io) {
-  const { version, dryRun, recheck, since, notesFile } = parseArgs(argv);
+  const { version, dryRun, recheck, since, notesFile, ciTimeoutMinutes } = parseArgs(argv);
   if (io.platform !== "darwin" || io.arch !== "arm64")
     throw new Error(
       "This builds the macOS arm64 app and must run on an Apple silicon Mac, not " + io.platform + "/" + io.arch + ".",
@@ -418,6 +488,12 @@ export async function runRelease(argv, io) {
   io.log("\nmacOS release files:");
   for (const file of files) io.log("  " + join(dir, file));
   if (dryRun) {
+    const ci = readCiRuns(io.capture, sha);
+    io.log(
+      "\nCI state of native.yml for " + sha.slice(0, 12) + ": " +
+        (ci.error !== undefined ? "unknown (" + ci.error + ")" : ciVerdict(ci.runs) + ", " + describeCi(ci.runs)) +
+        ". A real run waits for it just before tagging.",
+    );
     io.log("\nDry run: nothing was tagged, pushed or published. Commit " + sha + " would be released with:");
     for (const c of commands) io.log("  " + formatCommand(c));
     io.log("\nThe files stay in " + dir + ".");
@@ -431,6 +507,11 @@ export async function runRelease(argv, io) {
     throw new Error("HEAD moved from " + sha.slice(0, 12) + " to " + now.head.slice(0, 12) + " during the build. Nothing was tagged. Run this again.");
   if (now.dirty !== "")
     throw new Error("The tree has tracked changes after the build; nothing was tagged. Commit, stash or discard them and run this again:\n" + now.dirty);
+
+  // CI ran in parallel with the check and the build; it must have passed before
+  // anything is tagged.
+  io.log("\nWaiting for native.yml on " + sha.slice(0, 12) + "...");
+  await waitForCi(io, sha, ciTimeoutMinutes);
 
   // Past this point the repository changes; every failure says what is left.
   for (const c of commands) {
@@ -498,6 +579,8 @@ function realIo() {
       mkdirSync(join(root, "crates/monocode-gpui/target"), { recursive: true });
       writeFileSync(abs(STAMP_FILE), text);
     },
+    now: () => Date.now(),
+    sleep: (ms) => new Promise((done) => setTimeout(done, ms)),
     log: (text) => console.log(text),
   };
 }
