@@ -28,6 +28,10 @@ pub(super) struct ProjectRailList {
     shifts: HashMap<String, TabShift>,
     settling: Option<String>,
     skip_click: bool,
+    /// The project the rail's scroll position was last matched to: the one
+    /// shown at the last render, or revealed since. `reveal_active_project_rail`
+    /// scrolls only when the active project differs from it.
+    aligned: Option<String>,
 }
 impl ProjectRailList {
     pub(super) fn new(cx: &mut Context<Shell>) -> Self {
@@ -55,7 +59,15 @@ impl ProjectRailList {
             shifts: HashMap::new(),
             settling: None,
             skip_click: false,
+            aligned: None,
         }
+    }
+    /// Whether row `ix` is measured and lies entirely inside the viewport.
+    fn row_in_view(&self, ix: usize) -> bool {
+        let view = self.state.viewport_bounds();
+        self.state
+            .bounds_for_item(ix)
+            .is_some_and(|row| row.top() >= view.top() && row.bottom() <= view.bottom())
     }
     fn update(&mut self, rows: Vec<ProjectRailRow>, compact: bool) {
         if compact != self.compact {
@@ -331,6 +343,8 @@ impl Shell {
             .into_any_element()
     }
     fn prepare_project_rail(&mut self, compact: bool) {
+        // What the rail paints now is what its scroll position is matched to.
+        self.project_rail_list.aligned = Some(self.workspace.project.clone());
         let mut rows = Vec::new();
         if self.workspace.preferences.monos {
             rows.push(ProjectRailRow::Monos);
@@ -1417,11 +1431,37 @@ impl Shell {
             row
         }
     }
-    pub(super) fn reveal_active_project_rail(&self) {
-        if let Some(ix) = self.project_rail_list.rows.iter().position(
-            |row| matches!(row,ProjectRailRow::Project {path,..} if path==&self.workspace.project),
-        ) {
-            self.project_rail_list.state.scroll_to_reveal_item(ix);
+    /// Brings the active project's row into view when the active project is not the one the
+    /// rail was last matched to (see `ProjectRailList::aligned`) and its row is not already
+    /// fully visible.
+    ///
+    /// Everything else that selects a tab (a Mono, a session or file of the same project, a
+    /// search) leaves the scroll alone: the project did not change, and the project row sits
+    /// below the whole Mono roster, so revealing it would throw the rail away from the row
+    /// that was just clicked. `ListState::scroll_to_reveal_item` also moves a row that is
+    /// already visible, hence the visibility check.
+    pub(super) fn reveal_active_project_rail(&mut self) {
+        let project = self.workspace.project.clone();
+        let list = &mut self.project_rail_list;
+        if list.aligned.as_deref() == Some(project.as_str()) {
+            return;
+        }
+        let Some(ix) = list.rows.iter().position(
+            |row| matches!(row, ProjectRailRow::Project { path, .. } if *path == project),
+        ) else {
+            return;
+        };
+        list.aligned = Some(project);
+        if list.state.bounds_for_item(ix).is_none() {
+            // A row that was never laid out (the Mono roster can be taller than the rail, so
+            // the projects below it are) counts as 0 px high, and revealing it would stop
+            // right above it. Put it at the top; the next layout measures it.
+            list.state.scroll_to(gpui::ListOffset {
+                item_ix: ix,
+                offset_in_item: px(0.),
+            });
+        } else if !list.row_in_view(ix) {
+            list.state.scroll_to_reveal_item(ix);
         }
     }
     pub(super) fn toggle_project_rail_pin(&mut self, path: &str, cx: &mut Context<Self>) {
@@ -1830,7 +1870,7 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{EntityInputHandler, TestAppContext, VisualTestContext, size};
+    use gpui::{EntityInputHandler, TestAppContext, VisualTestContext, WindowHandle, size};
 
     #[gpui::test]
     fn original_layout_keeps_project_icons_when_sessions_are_hidden(cx: &mut TestAppContext) {
@@ -2188,6 +2228,191 @@ mod tests {
                 shell.toggle_layout(cx);
                 assert!(!shell.workspace.classic_layout && shell.workspace.new_layout_boxy);
                 assert!(shell.sessions.contains_key(&active));
+            })
+            .unwrap();
+    }
+
+    /// The classic rail with enough Monos that the roster row is taller than the rail, so the
+    /// project rows sit below the fold. Returns the window, the sessions of the two projects
+    /// (`/work/another-project`, `/work/monocode`, the active one) and the Mono ids.
+    fn rail_with_many_monos(
+        cx: &mut TestAppContext,
+    ) -> (WindowHandle<Shell>, i64, i64, Vec<String>) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, other, active) = super::super::tests::window(cx);
+        cx.simulate_window_resize(window.into(), size(px(1500.), px(900.)));
+        let ids = window
+            .update(cx, |shell, w, cx| {
+                shell.workspace.classic_layout = true;
+                shell.workspace.new_layout_boxy = false;
+                shell.workspace.sidebar_visible = true;
+                shell.workspace.project_rail_open = true;
+                shell.workspace.project_rail_width = 220.;
+                shell.workspace.right_panel_open = false;
+                shell.open(active, w, cx);
+                shell.layout_changed(cx);
+                let project = shell.workspace.project.clone();
+                let ids = shell.mono_manager().update(cx, |monos, cx| {
+                    let ids: Vec<_> = (0..40)
+                        .map(|n| {
+                            let id = monos.roster.create(vec![project.clone()]).id.clone();
+                            monos.roster.get_mut(&id).unwrap().name = format!("Mono {n}");
+                            id
+                        })
+                        .collect();
+                    cx.notify();
+                    ids
+                });
+                shell.invalidate_chrome(cx);
+                ids
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        (window, other, active, ids)
+    }
+
+    fn rail_scroll(shell: &Shell) -> (usize, Pixels) {
+        let top = shell.project_rail_list.state.logical_scroll_top();
+        (top.item_ix, top.offset_in_item)
+    }
+
+    fn project_row_index(shell: &Shell, project: &str) -> usize {
+        shell
+            .project_rail_list
+            .rows
+            .iter()
+            .position(|row| matches!(row, ProjectRailRow::Project { path, .. } if path == project))
+            .unwrap()
+    }
+
+    #[gpui::test]
+    fn clicking_a_mono_in_the_classic_rail_does_not_scroll_the_rail(cx: &mut TestAppContext) {
+        let (window, _, _, ids) = rail_with_many_monos(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        // Put the middle of the roster on screen, as a user who scrolled down to it.
+        let (before, project) = window
+            .update(visual, |shell, _, _| {
+                let state = &shell.project_rail_list.state;
+                let monos = state.bounds_for_item(0).unwrap();
+                let view = state.viewport_bounds();
+                assert!(
+                    monos.size.height > view.size.height,
+                    "the Mono roster must be taller than the rail"
+                );
+                state.scroll_to(gpui::ListOffset {
+                    item_ix: 0,
+                    offset_in_item: px(300.),
+                });
+                (px(300.), shell.workspace.project.clone())
+            })
+            .unwrap();
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        window
+            .read_with(visual, |shell, _| {
+                assert_eq!(rail_scroll(shell), (0, before));
+                let ix = project_row_index(shell, &project);
+                assert!(
+                    !shell.project_rail_list.row_in_view(ix),
+                    "the project row must be below the fold"
+                );
+            })
+            .unwrap();
+        let clicked = &ids[12];
+        let selector: &'static str = Box::leak(format!("mono-rail-{clicked}").into_boxed_str());
+        let row = visual.debug_bounds(selector).unwrap();
+        window
+            .read_with(visual, |shell, _| {
+                let view = shell.project_rail_list.state.viewport_bounds();
+                assert!(row.top() >= view.top() && row.bottom() <= view.bottom());
+            })
+            .unwrap();
+        visual.simulate_click(row.center(), Default::default());
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        window
+            .read_with(visual, |shell, cx| {
+                assert_eq!(
+                    shell.mono_manager().read(cx).active.as_ref(),
+                    Some(clicked),
+                    "the click opened the Mono"
+                );
+                assert_eq!(shell.workspace.project, project);
+                assert_eq!(
+                    rail_scroll(shell),
+                    (0, before),
+                    "opening a Mono must not move the rail"
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn switching_project_still_reveals_its_row_in_the_classic_rail(cx: &mut TestAppContext) {
+        let (window, other, _, _) = rail_with_many_monos(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        window
+            .read_with(visual, |shell, _| {
+                assert_eq!(rail_scroll(shell), (0, px(0.)));
+                let ix = project_row_index(shell, "/work/another-project");
+                assert!(!shell.project_rail_list.row_in_view(ix));
+            })
+            .unwrap();
+        // What a tab click or a shortcut does: a session of another project becomes active.
+        window
+            .update(visual, |shell, w, cx| shell.open(other, w, cx))
+            .unwrap();
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        window
+            .read_with(visual, |shell, _| {
+                assert_eq!(shell.workspace.project, "/work/another-project");
+                assert_ne!(rail_scroll(shell), (0, px(0.)), "the rail must scroll");
+                let ix = project_row_index(shell, "/work/another-project");
+                assert!(
+                    shell.project_rail_list.row_in_view(ix),
+                    "the new project's row must be on screen"
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn switching_to_a_project_whose_row_is_visible_leaves_the_rail_alone(cx: &mut TestAppContext) {
+        let (window, other, _, _) = rail_with_many_monos(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        // Scroll until only the end of the roster and both project rows are on screen.
+        window
+            .update(visual, |shell, _, _| {
+                let state = &shell.project_rail_list.state;
+                let monos = state.bounds_for_item(0).unwrap().size.height;
+                state.scroll_to(gpui::ListOffset {
+                    item_ix: 0,
+                    offset_in_item: monos - px(40.),
+                });
+            })
+            .unwrap();
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        let before = window
+            .read_with(visual, |shell, _| {
+                for project in ["/work/another-project", "/work/monocode"] {
+                    let ix = project_row_index(shell, project);
+                    assert!(shell.project_rail_list.row_in_view(ix));
+                }
+                rail_scroll(shell)
+            })
+            .unwrap();
+        window
+            .update(visual, |shell, w, cx| shell.open(other, w, cx))
+            .unwrap();
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        window
+            .read_with(visual, |shell, _| {
+                assert_eq!(shell.workspace.project, "/work/another-project");
+                assert_eq!(rail_scroll(shell), before);
             })
             .unwrap();
     }

@@ -2147,7 +2147,7 @@ impl Shell {
             self.projects_frame.update(cx, |_, cx| cx.notify());
         }
     }
-    fn reveal_active_tab(&self, cx: &App) {
+    fn reveal_active_tab(&mut self, cx: &App) {
         if self.workspace.classic_layout {
             self.reveal_active_project_rail();
         }
