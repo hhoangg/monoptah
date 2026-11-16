@@ -22,6 +22,7 @@ import {
   CI_POLL_MS,
   CI_RUNS_JQ,
   ciRunsPath,
+  ciSuccessRunsPath,
   ciVerdict,
   evaluatePreconditions,
   failureOf,
@@ -910,4 +911,27 @@ test("the workflow and native.yml give every job a timeout, and release runs are
   const release = read(".github/workflows/native-release-monoptah.yml");
   assert.match(release, /^concurrency:\n  group: native-monoptah-release-\$\{\{ inputs\.tag \}\}\n  cancel-in-progress: false/m);
   assert.match(release, /  publish:[\s\S]*?\n    concurrency:\n      group: native-monoptah-publish\n      cancel-in-progress: false/);
+});
+
+test("the workflow's native.yml success queries equal the single path builder", () => {
+  const workflow = read(".github/workflows/native-release-monoptah.yml");
+  // The plan job (tag-only mode) uses SHA, await-release uses PLAN_SHA.
+  for (const variable of ["SHA", "PLAN_SHA"]) {
+    const query = ciSuccessRunsPath("$" + variable).replace("repos/hhoangg/monoptah/", "repos/$GITHUB_REPOSITORY/");
+    assert.ok(workflow.includes('"' + query + '"'), query);
+  }
+  assert.equal(
+    ciSuccessRunsPath(SHA),
+    `repos/hhoangg/monoptah/actions/workflows/native.yml/runs?head_sha=${SHA}&event=push&branch=main&status=success&per_page=1`,
+  );
+});
+
+test("the workflow runs its helper scripts from its own checkout and checks their exit status", () => {
+  const workflow = read(".github/workflows/native-release-monoptah.yml");
+  assert.ok(!/node scripts\/(native-release-monoptah|package-native-monoptah)\.mjs/.test(workflow));
+  assert.ok(workflow.includes("path: release-tools"));
+  assert.equal((workflow.match(/TOOLS: release-tools\/scripts/g) ?? []).length, 3);
+  // No helper call sits inside a bare condition where its failure would be swallowed.
+  assert.ok(!/\[\[ "\$\(node /.test(workflow));
+  assert.ok(!/done < <\(node /.test(workflow));
 });

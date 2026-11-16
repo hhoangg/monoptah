@@ -58,6 +58,13 @@
 # "Re-runs" below). The release notes are the body of the release (written by the
 # local script); the feed carries the same text.
 #
+# Tools versus the built commit: the helper scripts that plan, sign and describe
+# the release (native-release-monoptah.mjs, package-native-monoptah.mjs) run from
+# a second checkout of the ref this workflow was dispatched on (release-tools/),
+# not from the commit being released. So the tag-only dispatch also works for a
+# tag cut before these scripts gained --defer-macos or macos-ready. Building and
+# packaging (scripts/package-native.mjs) still use the planned commit.
+#
 # macOS is never built here. The plan job leaves macOS out of the matrix when its
 # files are not on the release yet (early run) and fails in tag-only mode.
 #
@@ -177,6 +184,7 @@ jobs:
       sha: ${{ steps.commit.outputs.sha }}
     env:
       INPUT_SHA: ${{ inputs.sha }}
+      TOOLS: release-tools/scripts
     steps:
       # Before the checkout, so a bad input never reaches it.
       - name: Check the inputs
@@ -201,6 +209,18 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.sha != '' && inputs.sha || format('refs/tags/{0}', inputs.tag) }}
+
+      # The helper scripts (planning, signing, the feed) come from the ref this
+      # workflow was dispatched on, not from the commit being released: a tag cut
+      # before a change to these scripts would not have the new commands, and the
+      # tools must not depend on what is being built. Checked out after the main
+      # checkout, which would otherwise clean it away. Building still uses the
+      # planned commit.
+      - name: Check out the release tools
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          path: release-tools
 
       - uses: actions/setup-node@v4
         with:
@@ -278,7 +298,8 @@ jobs:
           set -euo pipefail
           FLAGS=()
           if [[ -n "$INPUT_SHA" ]]; then FLAGS+=(--defer-macos); fi
-          node scripts/native-release-monoptah.mjs plan "${FLAGS[@]}" "$RUNNER_TEMP/published.txt" | tee -a "$GITHUB_OUTPUT"
+          # pipefail makes a failing plan fail the step.
+          node "$TOOLS/native-release-monoptah.mjs" plan "${FLAGS[@]}" "$RUNNER_TEMP/published.txt" | tee -a "$GITHUB_OUTPUT"
 
   # Linux x86_64 and Windows x86_64 (macOS is built locally, and the plan job
   # keeps it out of the matrix). No signing key here: these jobs only build and
@@ -448,6 +469,7 @@ jobs:
     env:
       AWAIT_LIMIT_MINUTES: "120"
       PLAN_SHA: ${{ needs.plan.outputs.sha }}
+      TOOLS: release-tools/scripts
     outputs:
       reuse: ${{ steps.final.outputs.reuse }}
     steps:
@@ -455,6 +477,18 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ needs.plan.outputs.sha }}
+
+      # The helper scripts (planning, signing, the feed) come from the ref this
+      # workflow was dispatched on, not from the commit being released: a tag cut
+      # before a change to these scripts would not have the new commands, and the
+      # tools must not depend on what is being built. Checked out after the main
+      # checkout, which would otherwise clean it away. Building still uses the
+      # planned commit.
+      - name: Check out the release tools
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          path: release-tools
 
       - uses: actions/setup-node@v4
         with:
@@ -468,24 +502,50 @@ jobs:
           VERSION="${RELEASE_TAG#native-v}"
           echo "MONOCODE_NATIVE_VERSION=$VERSION" >> "$GITHUB_ENV"
           export MONOCODE_NATIVE_VERSION="$VERSION"
+          # Reads of the GitHub API are retried (3 tries, 10 seconds apart), so a
+          # transient error does not fail a wait of up to two hours.
+          retry() {
+            local n
+            for n in 1 2 3; do
+              if "$@"; then return 0; fi
+              if (( n < 3 )); then sleep 10; fi
+            done
+            return 1
+          }
+          # Reads the assets of the release into assets.json. Returns 0 when it
+          # exists, 44 when it does not (only HTTP 404 means that, and it is never
+          # retried), 1 for any other error after the retries.
+          fetch_release() {
+            local n
+            for n in 1 2 3; do
+              if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq .assets > "$RUNNER_TEMP/assets.json" 2> "$RUNNER_TEMP/release.err"; then return 0; fi
+              if grep -q "HTTP 404" "$RUNNER_TEMP/release.err"; then return 44; fi
+              if (( n < 3 )); then sleep 10; fi
+            done
+            return 1
+          }
           DEADLINE=$(( $(date +%s) + AWAIT_LIMIT_MINUTES * 60 ))
           while true; do
             STATE="the tag $RELEASE_TAG does not exist yet"
-            COUNT=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$RELEASE_TAG" --jq '[.[] | select(.ref == "refs/tags/'"$RELEASE_TAG"'")] | length')
+            COUNT=$(retry gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$RELEASE_TAG" --jq '[.[] | select(.ref == "refs/tags/'"$RELEASE_TAG"'")] | length') || { echo "Could not read the tag $RELEASE_TAG from the GitHub API." >&2; exit 1; }
             if [[ "$COUNT" != 0 ]]; then
-              TAG_SHA=$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha)
+              TAG_SHA=$(retry gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha) || { echo "Could not resolve the tag $RELEASE_TAG." >&2; exit 1; }
               if [[ "$TAG_SHA" != "$PLAN_SHA" ]]; then
                 echo "Tag $RELEASE_TAG points at $TAG_SHA, not at $PLAN_SHA. Nothing was published." >&2
                 exit 1
               fi
               STATE="the release $RELEASE_TAG does not exist yet"
-              if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq .assets > "$RUNNER_TEMP/assets.json" 2> "$RUNNER_TEMP/release.err"; then
-                if [[ "$(node scripts/native-release-monoptah.mjs macos-ready "$RUNNER_TEMP/assets.json")" == true ]]; then
+              RC=0
+              fetch_release || RC=$?
+              if (( RC == 0 )); then
+                # A failing helper must fail the job, not read as "not ready".
+                READY=$(node "$TOOLS/native-release-monoptah.mjs" macos-ready "$RUNNER_TEMP/assets.json") || { echo "macos-ready failed" >&2; exit 1; }
+                if [[ "$READY" == true ]]; then
                   echo "The tag and the release with all macOS files are there."
                   break
                 fi
                 STATE="the release does not hold all three uploaded macOS files yet"
-              elif ! grep -q "HTTP 404" "$RUNNER_TEMP/release.err"; then
+              elif (( RC != 44 )); then
                 cat "$RUNNER_TEMP/release.err" >&2
                 exit 1
               fi
@@ -503,7 +563,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          COUNT=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/native.yml/runs?head_sha=$PLAN_SHA&event=push&branch=main&status=success&per_page=1" --jq .total_count)
+          COUNT=""
+          for n in 1 2 3; do
+            if COUNT=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/native.yml/runs?head_sha=$PLAN_SHA&event=push&branch=main&status=success&per_page=1" --jq .total_count); then break; fi
+            COUNT=""
+            if (( n < 3 )); then sleep 10; fi
+          done
+          if [[ -z "$COUNT" ]]; then
+            echo "Could not read the native.yml runs for commit $PLAN_SHA." >&2
+            exit 1
+          fi
           if [[ "$COUNT" -lt 1 ]]; then
             echo "native.yml has no successful push run on main for commit $PLAN_SHA. Nothing was published." >&2
             exit 1
@@ -519,7 +588,7 @@ jobs:
         run: |
           set -euo pipefail
           jq -r '.[].name' "$RUNNER_TEMP/assets.json" > "$RUNNER_TEMP/published.txt"
-          node scripts/native-release-monoptah.mjs plan --check-planned "$RUNNER_TEMP/published.txt" | tee -a "$GITHUB_OUTPUT"
+          node "$TOOLS/native-release-monoptah.mjs" plan --check-planned "$RUNNER_TEMP/published.txt" | tee -a "$GITHUB_OUTPUT"
 
   # The only job with the signing key and write access. It runs on Ubuntu and
   # signs every updater package and the feed (macOS files included, taken from
@@ -534,6 +603,8 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: write
+    env:
+      TOOLS: release-tools/scripts
     # Feed and release writes of different tags never overlap.
     concurrency:
       group: native-monoptah-publish
@@ -543,6 +614,18 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ format('refs/tags/{0}', inputs.tag) }}
+
+      # The helper scripts (planning, signing, the feed) come from the ref this
+      # workflow was dispatched on, not from the commit being released: a tag cut
+      # before a change to these scripts would not have the new commands, and the
+      # tools must not depend on what is being built. Checked out after the main
+      # checkout, which would otherwise clean it away. Building still uses the
+      # planned commit.
+      - name: Check out the release tools
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          path: release-tools
 
       # The tag exists here (await-release saw it). It must still be the commit
       # that was planned and built, or the build would not match the tag.
@@ -588,7 +671,12 @@ jobs:
       - run: npm ci
 
       - name: Test the release scripts
-        run: node --test scripts/package-native-monoptah.test.mjs scripts/native-release-monoptah.test.mjs
+        run: |
+          set -euo pipefail
+          # The tests of the tools that are used below; they look for node_modules
+          # (the Tauri CLI) next to the tools.
+          ln -sfn "$PWD/node_modules" release-tools/node_modules
+          node --test release-tools/scripts/package-native-monoptah.test.mjs release-tools/scripts/native-release-monoptah.test.mjs
 
       - name: Download the packages built by this run
         if: needs.plan.outputs.build_any == 'true'
@@ -622,7 +710,7 @@ jobs:
       # Metadata for the platforms taken from the release (the package jobs wrote
       # their own).
       - name: Describe the reused assets
-        run: node scripts/native-release-monoptah.mjs records native-dist
+        run: node "$TOOLS/native-release-monoptah.mjs" records native-dist
 
       # The release notes are the body of the release, written by the local script
       # (generated from the merged PR titles). The feed carries the same text, so
@@ -642,7 +730,7 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: node scripts/native-release-monoptah.mjs sign native-dist "$RUNNER_TEMP/release-notes.md"
+        run: node "$TOOLS/native-release-monoptah.mjs" sign native-dist "$RUNNER_TEMP/release-notes.md"
 
       # Checks the feed and all five packages with the app's own verifier and the
       # public key compiled into the app. This stays on the native-dev profile:
@@ -667,11 +755,11 @@ jobs:
           overwrite: true
 
       # Never replaces a published asset: the release always exists here (the
-      # local macOS script created it, and the plan job checks), and only assets
+      # local macOS script created it, and await-release checks), and only assets
       # that are missing from it are uploaded (no --clobber), so the zip a cask
       # pinned cannot change. The release is created by the local script with
       # --latest=false, which keeps it away from releases/latest (the Tauri
-      # feed). If it was deleted after the plan job, gh release view fails the
+      # feed). If it was deleted after await-release, gh release view fails the
       # step; nothing is created here.
       - name: Publish the versioned GitHub release
         env:
@@ -681,10 +769,11 @@ jobs:
           set -euo pipefail
           set -f
           FILES=()
+          LIST=$(node -e 'for (const f of JSON.parse(require("fs").readFileSync("native-dist/release-files.json", "utf8"))) console.log(f)') || { echo "Could not read release-files.json" >&2; exit 1; }
           while IFS= read -r file; do
             FILES+=("native-dist/$file")
-          done < <(node -e 'for (const f of JSON.parse(require("fs").readFileSync("native-dist/release-files.json", "utf8"))) console.log(f)')
-          EXPECTED=$(node scripts/native-release-monoptah.mjs file-count)
+          done <<<"$LIST"
+          EXPECTED=$(node "$TOOLS/native-release-monoptah.mjs" file-count) || { echo "file-count failed" >&2; exit 1; }
           if (( ${#FILES[@]} != EXPECTED )); then
             echo "Expected $EXPECTED release files, got ${#FILES[@]}" >&2
             exit 1
@@ -746,7 +835,7 @@ jobs:
             gh release download native-latest --repo "$GITHUB_REPOSITORY" --pattern latest.json --dir "$EXISTING"
           fi
           # A crash or empty output here must fail the step, not skip the feed.
-          RESULT=$(node scripts/native-release-monoptah.mjs feed-supersedes native-dist/latest.json "$EXISTING/latest.json")
+          RESULT=$(node "$TOOLS/native-release-monoptah.mjs" feed-supersedes native-dist/latest.json "$EXISTING/latest.json") || { echo "feed-supersedes failed" >&2; exit 1; }
           case "$RESULT" in
             true) ;;
             false)

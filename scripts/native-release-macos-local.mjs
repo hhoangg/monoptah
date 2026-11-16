@@ -180,6 +180,11 @@ export function sdkProblem(sdkVersion) {
 export function ciRunsPath(sha) {
   return `repos/${REPOSITORY}/actions/workflows/native.yml/runs?head_sha=${sha}&event=push&branch=main&per_page=20`;
 }
+// Only the successful runs, one is enough. The workflow asks the same question
+// in the plan job (tag-only mode) and in await-release (a test keeps them equal).
+export function ciSuccessRunsPath(sha) {
+  return `repos/${REPOSITORY}/actions/workflows/native.yml/runs?head_sha=${sha}&event=push&branch=main&status=success&per_page=1`;
+}
 export const CI_RUNS_JQ = "[.workflow_runs[] | {id: .id, status: .status, conclusion: .conclusion, url: .html_url}]";
 
 // "success" when any run succeeded, "pending" while a run is not completed or
