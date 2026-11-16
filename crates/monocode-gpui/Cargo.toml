@@ -112,6 +112,8 @@ gpui-pre-windows = { path = "../../vendor/gpui-pre-windows" }
 # `native-dev` below inherits these and sets `debug = 0` for everything.
 [profile.dev]
 debug = "line-tables-only"
+# One .dSYM per binary instead of one debuginfo .o per codegen unit left in target/.
+split-debuginfo = "packed"
 
 [profile.dev.package."*"]
 debug = false
@@ -132,5 +134,8 @@ incremental = true
 [profile.native-dev.package."*"]
 opt-level = 1
 
+# The app crate itself is built unoptimized (it is the one recompiled after every edit).
+# Dependencies stay at opt-level 1 above. Measured on a loaded Mac: incremental rebuild after a
+# one-line edit was the same (about 23-25s) at opt-level 0 and 1, so this mainly keeps the intent explicit.
 [profile.native-dev.package.monocode-gpui]
-opt-level = 1
+opt-level = 0

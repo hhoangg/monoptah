@@ -2,13 +2,13 @@
 // throwaway git repos. gh, lsof and ps are faked; git is real.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, realpathSync, utimesSync } from "node:fs";
+import { existsSync, realpathSync, symlinkSync, utimesSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test as nodeTest } from "node:test";
 import {
-  REGENERABLE_IGNORED, blockingProcesses, evaluateWorktree, parseArgs, parseLsof, parseWorktrees, run, runClean, staleLogDirs,
+  REGENERABLE_IGNORED, blockingProcesses, cargoPruneCandidates, evaluateWorktree, parseArgs, parseLsof, parseWorktrees, run, runClean, staleLogDirs,
 } from "./worktrees-clean.mjs";
 
 // Needs POSIX git/lsof behaviour; CI also runs native:test:dev on Windows.
@@ -62,7 +62,7 @@ test("parses porcelain output including detached and locked entries", () => {
 });
 
 test("parseArgs requires --merged or targets, not both", () => {
-  assert.deepEqual(parseArgs(["--merged", "--dry-run"]), { targets: [], merged: true, dryRun: true, yes: false });
+  assert.deepEqual(parseArgs(["--merged", "--dry-run"]), { targets: [], merged: true, dryRun: true, yes: false, pruneTarget: false, noPruneTarget: false });
   assert.deepEqual(parseArgs(["feat/x", "--yes"]).targets, ["feat/x"]);
   assert.throws(() => parseArgs([]));
   assert.throws(() => parseArgs(["--merged", "feat/x"]));
@@ -268,4 +268,134 @@ test("lsof: exit 1 with no output is no processes; stderr errors are unknown", a
   assert.match(await go({ status: 1, stdout: "", stderr: "lsof: WARNING: can't stat() fuse" }), /Cannot inspect running processes/);
   assert.match(await go({ status: 2, stdout: "", stderr: "" }), /Cannot inspect running processes/);
   assert.doesNotMatch(await go({ status: 1, stdout: "", stderr: "" }), /Cannot inspect/);
+});
+
+const DAY = 86400_000;
+const age = (path, days) => { const d = new Date(Date.now() - days * DAY); utimesSync(path, d, d); };
+
+// Builds <wt>/crates/monocode-gpui/target with a debug profile and a native-dev profile that has
+// one orphaned incremental dir, one live dir with a fresh and an old session, and a -working dir.
+async function cargoTarget(wt) {
+  const target = join(wt, "crates", "monocode-gpui", "target");
+  const inc = join(target, "native-dev", "incremental");
+  const mk = async (path) => { await mkdir(path, { recursive: true }); };
+  await mk(join(target, "debug", "deps"));
+  await writeFile(join(target, "debug", "deps", "x.o"), "x");
+  await mk(join(inc, "orphan-aaa", "s-1-a-xxx"));
+  await mk(join(inc, "live-bbb", "s-1-old-xxx"));
+  await writeFile(join(inc, "live-bbb", "s-1-old.lock"), "");
+  await mk(join(inc, "live-bbb", "s-2-new-yyy"));
+  await writeFile(join(inc, "live-bbb", "s-2-new.lock"), "");
+  await mk(join(inc, "live-bbb", "s-3-busy-working"));
+  age(join(inc, "live-bbb", "s-3-busy-working"), 5);
+  age(join(inc, "live-bbb", "s-1-old-xxx"), 3);
+  age(join(inc, "live-bbb", "s-2-new-yyy"), 2);
+  age(join(inc, "orphan-aaa", "s-1-a-xxx"), 30);
+  age(join(inc, "orphan-aaa"), 30);
+  age(join(inc, "live-bbb"), 0);
+  return { target, inc };
+}
+
+test("cargoPruneCandidates lists the debug profile, orphaned incremental dirs and old sessions only", async (t) => {
+  const root = realpathSync(await mkdtemp(join(tmpdir(), "wt-clean-cargo-")));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { target, inc } = await cargoTarget(root);
+  const paths = cargoPruneCandidates(root).map((c) => c.path).sort();
+  assert.deepEqual(paths, [
+    join(target, "debug"),
+    join(inc, "live-bbb", "s-1-old-xxx"),
+    join(inc, "live-bbb", "s-1-old.lock"),
+    join(inc, "orphan-aaa"),
+  ].sort());
+  // A seed worktree (release-main) only loses stale incremental data, never a profile dir.
+  const seed = cargoPruneCandidates(root, { seed: true }).map((c) => c.path);
+  assert.ok(!seed.includes(join(target, "debug")));
+  assert.ok(seed.includes(join(inc, "orphan-aaa")));
+  // The root workspace's target/debug is never removed as a profile.
+  await mkdir(join(root, "target", "debug", "incremental", "c-1", "s-1-a-x"), { recursive: true });
+  assert.ok(!cargoPruneCandidates(root).some((c) => c.path === join(root, "target", "debug")));
+});
+
+test("cargoPruneCandidates skips symlinks", async (t) => {
+  const root = realpathSync(await mkdtemp(join(tmpdir(), "wt-clean-cargo-")));
+  const outside = realpathSync(await mkdtemp(join(tmpdir(), "wt-clean-outside-")));
+  t.after(() => Promise.all([rm(root, { recursive: true, force: true }), rm(outside, { recursive: true, force: true })]));
+  await mkdir(join(outside, "debug"), { recursive: true });
+  await mkdir(join(root, "crates", "monocode-gpui", "target"), { recursive: true });
+  symlinkSync(outside, join(root, "crates", "monocode-gpui", "target", "debug"));
+  assert.deepEqual(cargoPruneCandidates(root), []);
+});
+
+test("runClean --prune-target is listed in dry-run, deleted with --yes, and skips busy worktrees and seeds' debug", async (t) => {
+  const f = await fixture(t);
+  const { path } = f.addWorktree("w13", "feat/thirteen");
+  const seed = f.addWorktree("release-main", "feat/seed").path;
+  const a = await cargoTarget(path);
+  const b = await cargoTarget(seed);
+  const idleDeps = { run: (cmd, args, opts) => {
+    if (cmd === "lsof") return { status: 0, stdout: "p1\ncinit\nn/\n", stderr: "" };
+    if (cmd === "ps") return { status: 0, stdout: "1 init\n", stderr: "" };
+    return noPrs.run(cmd, args, opts);
+  } };
+  const lines = [];
+  const ctx = { deps: idleDeps, log: (l) => lines.push(l), isTty: false, tmp: join(f.root, "empty"), cwd: f.main };
+  const dry = await runClean({ targets: [], merged: false, pruneTarget: true, dryRun: true, yes: false }, ctx);
+  assert.equal(dry.dryRun, true);
+  assert.ok(existsSync(join(a.target, "debug")));
+  assert.ok(lines.some((l) => l.startsWith("PRUNE ") && l.includes(join(a.target, "debug"))));
+  assert.ok(!lines.some((l) => l.startsWith("PRUNE ") && l.includes(join(b.target, "debug"))));
+  // A process inside w13 blocks pruning there but not in the seed.
+  const busyDeps = { run: (cmd, args, opts) => (cmd === "lsof" ? { status: 0, stdout: `p9\ncvim\nn${path}\n`, stderr: "" } : idleDeps.run(cmd, args, opts)) };
+  const real = await runClean({ targets: [], merged: false, pruneTarget: true, dryRun: false, yes: true }, { ...ctx, deps: busyDeps });
+  assert.equal(real.dryRun, false);
+  assert.ok(existsSync(join(a.target, "debug")));
+  assert.ok(existsSync(join(b.target, "debug")));
+  assert.equal(existsSync(join(b.inc, "orphan-aaa")), false);
+  assert.ok(existsSync(join(b.inc, "live-bbb", "s-2-new-yyy")));
+  await runClean({ targets: [], merged: false, pruneTarget: true, dryRun: false, yes: true }, ctx);
+  assert.equal(existsSync(join(a.target, "debug")), false);
+  assert.equal(existsSync(join(a.inc, "orphan-aaa")), false);
+  assert.equal(existsSync(join(a.inc, "live-bbb", "s-1-old-xxx")), false);
+  assert.ok(existsSync(join(a.inc, "live-bbb", "s-2-new-yyy")));
+  assert.ok(existsSync(join(a.inc, "live-bbb", "s-3-busy-working")));
+  assert.ok(existsSync(path));
+});
+
+test("parseArgs accepts --prune-target alone and rejects conflicting flags", () => {
+  assert.equal(parseArgs(["--prune-target"]).pruneTarget, true);
+  assert.throws(() => parseArgs(["--prune-target", "--no-prune-target"]));
+  assert.equal(parseArgs(["--merged", "--no-prune-target"]).noPruneTarget, true);
+});
+
+test("runClean prune re-checks processes after the confirmation prompt", async (t) => {
+  const f = await fixture(t);
+  const { path } = f.addWorktree("w14", "feat/fourteen");
+  const a = await cargoTarget(path);
+  let late = false;
+  const deps = { run: (cmd, args, opts) => {
+    if (cmd === "lsof") return { status: 0, stdout: late ? `p9\ncvim\nn${path}\n` : "p1\ncinit\nn/\n", stderr: "" };
+    if (cmd === "ps") return { status: 0, stdout: "1 init\n", stderr: "" };
+    return noPrs.run(cmd, args, opts);
+  } };
+  const lines = [];
+  const ask = async () => { late = true; return true; };
+  await runClean({ targets: [], merged: false, pruneTarget: true, dryRun: false, yes: false },
+    { deps, log: (l) => lines.push(l), isTty: true, ask, tmp: join(f.root, "empty"), cwd: f.main });
+  assert.ok(existsSync(join(a.target, "debug")));
+  assert.ok(existsSync(join(a.inc, "orphan-aaa")));
+  assert.ok(lines.some((l) => l.startsWith("NOPRUNE ") && l.includes(path)));
+  // Process list unavailable after the prompt: nothing is pruned either.
+  const f2 = await fixture(t);
+  const w = f2.addWorktree("w15", "feat/fifteen").path;
+  const b = await cargoTarget(w);
+  let broken = false;
+  const deps2 = { run: (cmd, args, opts) => {
+    if (cmd === "lsof" && broken) return { status: null, stdout: "", stderr: "", error: new Error("spawn lsof ENOENT") };
+    if (cmd === "lsof") return { status: 0, stdout: "p1\ncinit\nn/\n", stderr: "" };
+    if (cmd === "ps") return { status: 0, stdout: "1 init\n", stderr: "" };
+    return noPrs.run(cmd, args, opts);
+  } };
+  await runClean({ targets: [], merged: false, pruneTarget: true, dryRun: false, yes: false },
+    { deps: deps2, log: () => {}, isTty: true, ask: async () => { broken = true; return true; }, tmp: join(f2.root, "empty"), cwd: f2.main });
+  assert.ok(existsSync(join(b.target, "debug")));
 });

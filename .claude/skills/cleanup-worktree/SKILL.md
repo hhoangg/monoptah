@@ -6,7 +6,7 @@ description: Remove a merged git worktree and its leftovers (local/remote branch
 # Clean up worktrees
 
 Tool: `npm run worktrees:clean -- [<worktree path|branch>...] [--merged] [--dry-run] [--yes]`
-(`scripts/worktrees-clean.mjs`). It fetches with `--prune`, checks every worktree, and only
+(`scripts/worktrees-clean.mjs`). `--merged` and `--prune-target` also prune stale cargo build data (below). It fetches with `--prune`, checks every worktree, and only
 deletes the ones that pass all checks. Run it from the main checkout, not from inside the
 worktree being removed.
 
@@ -23,6 +23,21 @@ worktree being removed.
 3. Report what was removed and the `Freed ...` line.
 
 For a broad sweep the user asked for: `--merged --dry-run`, show the output, then `--merged --yes`.
+
+## Pruning cargo build data
+
+`--merged` (unless `--no-prune-target`) and `--prune-target` (alone, removes no worktree) list
+`PRUNE` lines for every worktree that stays, and delete them only after the usual confirmation
+(`--dry-run` lists only). A worktree with a process inside, or when processes cannot be listed,
+gets `NOPRUNE` and is left alone. Only paths inside a worktree of this repo, never symlinks.
+
+- `crates/monocode-gpui/target/debug`: the unused `dev` profile (the native workspace uses
+  `native-dev`). Not touched in the main checkout or in a worktree named `release-main`, which seed
+  other worktrees' build caches. The root workspace's `target/debug` (src-tauri) is never removed.
+- Incremental data under any `<target>/<profile>/incremental/` (also in `release-main` and the main
+  checkout): a `<crate>-<hash>` dir with nothing written for 14 days is removed whole; in the other
+  dirs every `s-*` session older than 1 day except the newest is removed with its `.lock`.
+  `-working` sessions are never touched.
 
 ## Merge rules to know
 
