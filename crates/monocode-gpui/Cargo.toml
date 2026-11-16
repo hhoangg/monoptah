@@ -120,7 +120,8 @@ debug = false
 # Local test and dev builds. `debug = 0` keeps compile and link time low (no
 # debuginfo for dependencies, and cargo then strips the std debuginfo too). The two
 # workspace crates below override it with line tables only, so panic backtraces keep
-# file:line for our code.
+# file:line for our code. Measured cost on macOS: the relink stays about 21s, a fresh
+# target/native-dev is about 1 GB larger (6.9 vs 5.9 GB) and the test binary 416 vs 378 MB.
 #
 # Do not set `split-debuginfo` here or in [profile.dev]: `unpacked` is rejected by
 # rustc on windows-msvc, and `packed` makes macOS run dsymutil on every link
