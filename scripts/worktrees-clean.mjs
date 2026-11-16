@@ -22,9 +22,10 @@ const ROOT_TARGET = "target";
 // The only profile the native workspace uses is native-dev, so its plain `debug` dir is leftover.
 // Only removed from the native target: the root workspace (src-tauri) legitimately builds into debug.
 const UNUSED_NATIVE_PROFILE = "debug";
-// Worktrees whose build artifacts are needed as the seed for new worktrees and for releases: only
-// stale incremental data is pruned there, never a profile dir.
-const SEED_WORKTREE_NAMES = new Set(["release-main"]);
+// Permanent worktrees, matched by directory name. They hold the build cache that new worktrees clone
+// and the release checkout, so this tool (1) never removes them, even when named explicitly, and
+// (2) prunes only stale incremental data there, never a profile dir.
+export const PERMANENT_WORKTREE_NAMES = new Set(["release-main"]);
 // An incremental dir (<crate>-<hash>) nobody wrote to for this long belongs to a hash that is no
 // longer built (changed path, flags or toolchain).
 const INCREMENTAL_ORPHAN_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
@@ -145,6 +146,14 @@ export function evaluateWorktree(wt, ctx) {
   if (wt.bare) { reasons.push("bare repository"); return verdict; }
   if (wt.locked) { reasons.push(`locked${typeof wt.locked === "string" ? ` (${wt.locked})` : ""}`); return verdict; }
   if (wt.branch && PROTECTED_BRANCHES.has(wt.branch)) { reasons.push(`protected branch ${wt.branch}`); return verdict; }
+  if (PERMANENT_WORKTREE_NAMES.has(basename(wt.path))) {
+    reasons.push(`${basename(wt.path)} is the permanent build-cache source and release checkout; never removed by this tool`);
+    return verdict;
+  }
+  if (!wt.branch && !explicit) {
+    reasons.push("detached HEAD: no branch to judge as merged; name it explicitly to remove it");
+    return verdict;
+  }
 
   let tip;
   guard("resolve HEAD", () => { tip = must(git(["rev-parse", "--verify", "HEAD"]), "git rev-parse HEAD"); });
@@ -327,7 +336,7 @@ export function cargoPruneCandidates(worktree, { now = Date.now(), seed = false 
 }
 
 export function isSeedWorktree(wt, main) {
-  return realPath(wt.path) === realPath(main) || SEED_WORKTREE_NAMES.has(basename(wt.path));
+  return realPath(wt.path) === realPath(main) || PERMANENT_WORKTREE_NAMES.has(basename(wt.path));
 }
 
 export function parseArgs(argv) {

@@ -41,6 +41,11 @@ gets `NOPRUNE` and is left alone. Only paths inside a worktree of this repo, nev
 
 ## Merge rules to know
 
+- A worktree directory named `release-main` (the build-cache source and release checkout) is
+  always kept, even when named explicitly. There is no override; remove it with git by hand only
+  if the user truly wants that.
+- A detached-HEAD worktree is kept in `--merged` scans (no branch to judge). Name it explicitly to
+  remove it; the other checks still apply.
 - A branch with no commits of its own (still equal to an ancestor of `origin/main`) counts as
   merged when you name it explicitly. In `--merged` scans such fresh branches are kept.
 - For squash merges, a merged PR whose head equals the local tip replaces the "no commits missing

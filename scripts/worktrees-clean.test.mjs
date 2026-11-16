@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test as nodeTest } from "node:test";
 import {
-  REGENERABLE_IGNORED, blockingProcesses, cargoPruneCandidates, evaluateWorktree, parseArgs, parseLsof, parseWorktrees, run, runClean, staleLogDirs,
+  REGENERABLE_IGNORED, PERMANENT_WORKTREE_NAMES, blockingProcesses, cargoPruneCandidates, evaluateWorktree, parseArgs, parseLsof, parseWorktrees, run, runClean, staleLogDirs,
 } from "./worktrees-clean.mjs";
 
 // Needs POSIX git/lsof behaviour; CI also runs native:test:dev on Windows.
@@ -398,4 +398,76 @@ test("runClean prune re-checks processes after the confirmation prompt", async (
   await runClean({ targets: [], merged: false, pruneTarget: true, dryRun: false, yes: false },
     { deps: deps2, log: () => {}, isTty: true, ask: async () => { broken = true; return true; }, tmp: join(f2.root, "empty"), cwd: f2.main });
   assert.ok(existsSync(join(b.target, "debug")));
+});
+
+const idleRunDeps = { run: (cmd, args, opts) => {
+  if (cmd === "lsof") return { status: 0, stdout: "p1\ncinit\nn/\n", stderr: "" };
+  if (cmd === "ps") return { status: 0, stdout: "1 init\n", stderr: "" };
+  return noPrs.run(cmd, args, opts);
+} };
+const cleanCtx = (f, lines, deps = idleRunDeps) => ({ deps, log: (l) => lines.push(l), isTty: false, tmp: join(f.root, "empty"), cwd: f.main });
+
+test("release-main (detached, merged) is KEEP under --merged and is never deleted, even with --yes", async (t) => {
+  const f = await fixture(t);
+  const path = join(f.root, "release-main");
+  git(f.main, "worktree", "add", "--detach", path, "origin/main");
+  assert.ok(PERMANENT_WORKTREE_NAMES.has("release-main"));
+  const lines = [];
+  const dry = await runClean({ targets: [], merged: true, dryRun: true, yes: false }, cleanCtx(f, lines));
+  assert.equal(dry.dryRun, true);
+  assert.ok(lines.some((l) => l.startsWith("KEEP") && l.includes(path) && /permanent build-cache source and release checkout/.test(l)), lines.join("\n"));
+  assert.ok(!lines.some((l) => l.startsWith("DELETE") && l.includes(path)));
+  const real = await runClean({ targets: [], merged: true, dryRun: false, yes: true }, cleanCtx(f, []));
+  assert.deepEqual(real.removed, []);
+  assert.ok(existsSync(path));
+});
+
+test("release-main named explicitly (by path or branch) is KEEP and survives --yes", async (t) => {
+  const f = await fixture(t);
+  const detached = join(f.root, "release-main");
+  git(f.main, "worktree", "add", "--detach", detached, "origin/main");
+  const lines = [];
+  const real = await runClean({ targets: [detached], merged: false, dryRun: false, yes: true }, cleanCtx(f, lines));
+  assert.deepEqual(real.removed, []);
+  assert.ok(existsSync(detached));
+  assert.ok(lines.some((l) => l.startsWith("KEEP") && /never removed by this tool/.test(l)));
+  // Same when release-main is on a branch.
+  const g = await fixture(t);
+  const onBranch = g.addWorktree("release-main", "feat/rm").path;
+  const v = evaluate(g, "release-main", "feat/rm", noPrs);
+  assert.equal(v.ok, false);
+  assert.match(v.reasons.join(), /permanent build-cache source/);
+  const again = await runClean({ targets: ["feat/rm"], merged: false, dryRun: false, yes: true }, cleanCtx(g, []));
+  assert.deepEqual(again.removed, []);
+  assert.ok(existsSync(onBranch));
+});
+
+test("other detached worktrees: KEEP under --merged, removable when named explicitly", async (t) => {
+  const f = await fixture(t);
+  const path = join(f.root, "scratch");
+  git(f.main, "worktree", "add", "--detach", path, "origin/main");
+  const lines = [];
+  await runClean({ targets: [], merged: true, dryRun: true, yes: false }, cleanCtx(f, lines));
+  assert.ok(lines.some((l) => l.startsWith("KEEP") && l.includes(path) && /detached HEAD: no branch to judge as merged; name it explicitly/.test(l)), lines.join("\n"));
+  assert.ok(!lines.some((l) => l.startsWith("DELETE") && l.includes(path)));
+  const merged = await runClean({ targets: [], merged: true, dryRun: false, yes: true }, cleanCtx(f, []));
+  assert.deepEqual(merged.removed, []);
+  assert.ok(existsSync(path));
+  const explicit = await runClean({ targets: [path], merged: false, dryRun: false, yes: true }, cleanCtx(f, []));
+  assert.deepEqual(explicit.removed, [path]);
+  assert.equal(existsSync(path), false);
+});
+
+test("the worktree a running Native Dev app was launched from is KEEP", async (t) => {
+  const f = await fixture(t);
+  const { path, branch } = f.addWorktree("w-native", "feat/native");
+  // dev-native.mjs spawns the packaged app with cwd = worktree root; the app never changes directory.
+  const app = "/Users/x/Applications/Monoptah Native Dev.app/Contents/MacOS/monocode-gpui";
+  const processes = { cwds: [{ pid: 4242, command: "monocode-gpui", cwd: path }], ps: [{ pid: 4242, command: app }] };
+  const v = evaluate(f, "w-native", branch, noPrs, { processes });
+  assert.equal(v.ok, false);
+  assert.match(v.reasons.join(), /Native Dev \(pid 4242\) runs from this worktree/);
+  // Even if the cwd is not visible, the process is detached and the worktree path appears in its command line.
+  const viaArgs = evaluate(f, "w-native", branch, noPrs, { processes: { cwds: [], ps: [{ pid: 4243, command: `${app} --cwd ${path}` }] } });
+  assert.match(viaArgs.reasons.join(), /Native Dev \(pid 4243\)/);
 });

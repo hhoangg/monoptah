@@ -150,7 +150,9 @@ relinks the large `monocode-gpui` test binary (median 1.4 min, p90 4.1 min).
 When a session created a PR and that PR is merged, the agent cleans up after itself: its
 worktree, local and remote branch, and any temp worktrees, using the `cleanup-worktree` skill
 (`npm run worktrees:clean`). It refuses anything unmerged, dirty, unpushed, running, or the
-worktree Native Dev runs from, and never forces. Do not delete worktrees by hand.
+worktree Native Dev runs from, and never forces. It never removes `release-main` (the
+build-cache source and release checkout), not even when named explicitly, and `--merged` keeps
+detached-HEAD worktrees (name one explicitly to remove it). Do not delete worktrees by hand.
 
 For the user: `npm run worktrees:clean -- --merged --dry-run` lists what would go and why the
 rest stays, then run it without `--dry-run` to delete (it asks first; non-TTY needs `--yes`).
