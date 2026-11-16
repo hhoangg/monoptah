@@ -36,6 +36,7 @@ mod conversation;
 mod dev_reload;
 mod diff_view;
 mod document_lightbox;
+mod drawer;
 mod editor_analysis;
 mod editor_scrollbar;
 mod editor_syntax;

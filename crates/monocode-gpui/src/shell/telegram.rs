@@ -1261,7 +1261,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn the_project_menu_offers_telegram_except_for_remote_projects(cx: &mut TestAppContext) {
+    fn the_project_menu_hides_telegram_for_now(cx: &mut TestAppContext) {
         let (window, _, _) = window(cx);
         window
             .update(cx, |shell, w, cx| {
@@ -1280,12 +1280,14 @@ mod tests {
                         .collect::<Vec<_>>()
                 };
                 let local = ids(shell, PROJECT, w, cx);
-                let at = local.iter().position(|(id, _)| id == "telegram").unwrap();
-                assert_eq!(local[at].1, "Telegram…");
-                assert_eq!(
-                    local[at - 1].0,
-                    "background",
-                    "right after the background item"
+                // The neighbours are still listed, so the absence below is not an empty menu.
+                assert!(local.iter().any(|(id, _)| id == "background"));
+                assert!(local.iter().any(|(id, _)| id == "cloud-settings"));
+                assert!(
+                    local
+                        .iter()
+                        .all(|(id, label)| id != "telegram" && label != "Telegram…"),
+                    "{local:?}"
                 );
                 let remote = ids(shell, "remote://box/work/monocode", w, cx);
                 assert!(remote.iter().all(|(id, _)| id != "telegram"));

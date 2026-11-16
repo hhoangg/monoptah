@@ -790,7 +790,7 @@ impl Shell {
                 d.child(self.right_panel_frame(panel, right_width, full, window, cx))
             })
     }
-    /// The usage chips with the terminal controls at the far end.
+    /// The usage chips with the terminal controls at the far end, and the cloud chip after them.
     fn footer_row(&mut self, cx: &mut Context<Self>) -> gpui::Div {
         let height = if self.workspace.boxy_layout() {
             28.
@@ -827,6 +827,9 @@ impl Shell {
                     })
                     .children(terminal)
             })
+            // The cloud chip is the outermost element on the right; it draws nothing (and takes
+            // no room) while the project does not use cloud.
+            .child(self.usage_footer.read(cx).cloud_chip().clone())
     }
     /// ResourcePressureNotice's chip, just before the terminal controls.
     fn pressure_chip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {

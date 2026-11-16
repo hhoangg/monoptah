@@ -2,8 +2,9 @@
 
 Cost control for cloud sessions. A failed or forgotten codespace or Docker sandbox keeps drawing
 quota (Codespaces: the free dollar pool) or credit (Docker: per runtime second, billed to the card
-after the credit). **Project menu > Cloud workspaces…** (the item right after "Cloud settings…")
-lists them all and lets you stop or delete them; a chip in the footer shows what runs (see "The footer chip").
+after the credit). The **cloud chip** at the right end of the footer (see "The footer chip") shows what runs, or an
+idle "Cloud" when nothing does; clicking it opens a side drawer, sliding in from the right, that
+lists them all and lets you stop or delete them. The drawer is the only way in: the project menu has no Cloud workspaces item.
 
 ## What a row shows
 
@@ -71,7 +72,7 @@ from it, a saved list of what a delete would lose, or a Docker account pin.
   was confirmed, so during the wait the protection is the woke check above. A sandbox in a state
   Monoptah does not recognise is neither stopped nor deleted (it could be running).
 
-  A **local session moved into the workspace** (its location is Cloud) blocks the delete from this dialog
+  A **local session moved into the workspace** (its location is Cloud) blocks the delete from this drawer
   outright, like the automatic cleanup after a return (the app API's `cloud.delete` is unchanged): bring the conversation back to this computer first
   (Reset to local), or the turns that were not synced back are lost.
 
@@ -81,7 +82,8 @@ from it, a saved list of what a delete would lose, or a Docker account pin.
   is retried.
 * **Open in browser** (codespaces): the address is read with `gh api`, which never starts it.
 
-The dialog **stays open while a stop or delete runs** (Escape and Close are ignored), so the result
+The drawer closes on Escape, on a click on the dimmed area outside it, and with its Close button. It
+**stays open while a stop or delete runs** (all three are ignored), so the result
 always reaches the window and it forgets the sessions of a workspace that is gone.
 
 ## What a Stop does and how it is verified
@@ -96,7 +98,7 @@ that when it polls a session's Host. Closing the tunnel ends the `ssh-connect` c
 An ssh that is *started* against a stopped sandbox does not resume it (`ssh-connect` refuses with
 "cannot issue an SSH certificate… the sandbox is not running"); `exec`, `attach` and `run` do. So
 Monoptah does two things around the call
-(`CloudSessions::stop_cloud`, the one path every Stop takes, the dialog, the app API, a Mono and the
+(`CloudSessions::stop_cloud`, the one path every Stop takes, the drawer, the app API, a Mono and the
 auto-stop alike):
 
 1. **It closes its own connection first.** A session of a sandbox holds an ssh tunnel
@@ -124,9 +126,9 @@ auto-stop alike):
    wake the sandbox again".
 2. **It verifies the result from read-only listings** (`sbx ls`, never `exec`, `ssh`, `attach` or
    `cp`, which would wake it) instead of trusting the call. The row's state comes from the listing
-   and a line under it tells what became of the Stop; while it is on its way the dialog reads the
+   and a line under it tells what became of the Stop; while it is on its way the drawer reads the
    listing again by itself (every 15 s, every 60 s once it is slow) and stops reading when it has
-   settled. Closing the dialog ends the polling; the footer chip goes on.
+   settled. Closing the drawer ends the polling; the footer chip goes on.
 
    | The line says | When |
    | --- | --- |
@@ -143,7 +145,7 @@ auto-stop alike):
    stopping. A sandbox that is being **deleted** is neither stopping nor followed.
 
    The follow tick reads only the sandbox listing (`sbx ls`, once per Docker account), merged into
-   the rows loaded last; Refresh and opening the dialog still read `gh` too.
+   the rows loaded last; Refresh and opening the drawer still read `gh` too.
 
    The memory of a Stop is **in this process only**. After an app restart the Stop line is gone
    and the chip's 15-minute timer restarts at the first listing that shows the sandbox stopping
@@ -156,22 +158,27 @@ auto-stop alike):
 ## Loading
 
 Read-only: `gh auth status`, `gh codespace list` and `sbx ls`, in the background, only when the
-dialog opens or Refresh is pressed; the result is reused for 30 seconds and forgotten by every stop
+drawer opens or Refresh is pressed; the result is reused for 30 seconds and forgotten by every stop
 or delete, whichever part of the app made it. Nothing starts a stopped workspace. If `gh` or `sbx`
-is missing or signed out, the dialog says so with the command that fixes it and the other backend
+is missing or signed out, the drawer says so with the command that fixes it and the other backend
 still lists.
 
 ## The footer chip
 
-The cost is also visible without opening the menu: a **cloud chip** sits in the footer next to the
-provider usage chip (cloud glyph and `2 running`, `1 stopping` or `2 running, 1 stopping`). It is one click or one Enter or Space (it is
-focusable like the usage chip) from the same Cloud workspaces dialog the menu item opens. The menu
-item stays.
+The cost is visible without opening anything: a **cloud chip** sits at the far right of the footer,
+after the terminal controls, as the outermost element (cloud glyph and `2 running`, `1 stopping` or `2 running, 1 stopping`).
+It is one click or one Enter or Space (it is focusable like the usage chip) from the Cloud
+workspaces drawer. The project menu no longer has a Cloud workspaces item.
 
-* **Shown** while at least one workspace of the open project is **Running or Starting**, and also
+* **Shown** for every project that uses cloud (a cloud session, or saved Cloud settings), even
+  when nothing runs: then it is a muted, neutral **idle** chip (cloud glyph and `Cloud`, tooltip
+  "Cloud workspaces: none running"), so a stopped or failed workspace can still be reached and
+  deleted from the drawer. A project that does not use cloud, and a remote project, shows no chip,
+  and `gh` and `sbx` are never started for it. With workspaces up it shows the count: while at
+  least one workspace of the open project is **Running or Starting**, and also
   while one is **Stopping** (or hibernating, on its way to stopped): a stopping sandbox still bills
-  until it has stopped, and a Stop that gets stuck must not make the chip vanish. It hides only when
-  every workspace is stopped or gone; then it is not drawn and takes no room. A sandbox that is
+  until it has stopped, and a Stop that gets stuck must not make the chip vanish. Once
+  every workspace is stopped or gone it falls back to the idle chip. A sandbox that is
   being deleted does not count as stopping. It reports on **the window's project** on every tab: a
   session, the MonoCrab (Mono) tab, an app view (Today, Inbox, Notes, Contributors…), a terminal or a
   file pane, whatever folder that tab shows. Only a cloud session uses its own project, the local one
@@ -188,7 +195,7 @@ item stays.
     `crates/monocode-core/src/cloud_sessions/stopping.rs`): a stopping workspace is neutral, and
     turns to the warning only when it has been stopping that long. The time counts from the Stop
     this app had accepted, else from the first listing that showed it stopping;
-  * **Running again after a stop**: a Stop was accepted and the listing says it runs (the dialog
+  * **Running again after a stop**: a Stop was accepted and the listing says it runs (the drawer
     says `Still running: …`);
   * **Running for hours with no session working**: up for at least `LONG_RUNNING` (6 hours,
     `crates/monocode-core/src/cloud_sessions/footer_status.rs`) and no session of it is busy. The age
@@ -201,10 +208,10 @@ item stays.
   workspace and spends no billable call. It asks at most about **once a minute**, **only while the
   window is active**, and **only for a project that uses cloud**: it has saved Cloud settings (either
   backend) or a cloud session. A plain GitHub project never starts `gh`. Coming back to the window,
-  switching project, or a stop or delete from the dialog read again at once (the core service still
+  switching project, or a stop or delete from the drawer read again at once (the core service still
   reuses an overview younger than 30 seconds). A missing or signed-out `gh` or `sbx` is **silent**: that
   backend lists nothing, the chip stays hidden when nothing runs, and there is no toast or error
-  text. The dialog is where such a problem is explained.
+  text. The drawer is where such a problem is explained.
 
 ## Workflow cloud steps
 

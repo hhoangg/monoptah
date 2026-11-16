@@ -66,8 +66,8 @@ pub(crate) struct UsageFooter {
     /// UsageFooter's `footer` variant: the classic layout's bordered strip.
     classic: bool,
     show_remaining: bool,
-    /// The cloud status chip beside the usage chip, see [`cloud_chip`]. It shows only while a
-    /// cloud workspace of the open project runs.
+    /// The cloud status chip, see [`cloud_chip`]. This view owns it, but the shell's footer row
+    /// renders it as the last element on the right (after the terminal controls).
     cloud: gpui::Entity<cloud_chip::CloudChip>,
     _cloud_observation: gpui::Subscription,
     _clock: gpui::Task<()>,
@@ -912,8 +912,6 @@ impl Render for UsageFooter {
             .and_then(|s| s.windows.iter().map(|w| w.used_percent).reduce(f64::max));
         let weak = cx.weak_entity();
         let classic = self.classic;
-        let cloud = self.cloud.clone();
-        let show_cloud = cloud.read(cx).visible();
         div()
             .id("usage-footer")
             .debug_selector(|| "usage-footer".into())
@@ -1005,7 +1003,6 @@ impl Render for UsageFooter {
                         cx.listener(|this, _: &RefreshUsage, _, cx| this.refresh_manual(cx)),
                     ),
             )
-            .when(show_cloud, |d| d.child(cloud))
             .when(self.open, |d| {
                 d.child(
                     popover("usage-details", Anchor::Slot(self.anchor.clone()))
