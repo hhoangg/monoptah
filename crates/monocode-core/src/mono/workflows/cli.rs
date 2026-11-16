@@ -14,9 +14,9 @@
 //! machine's time zone, where React printed `toLocaleString()`.
 use super::guide::workflow_guide;
 use super::model::{
-    new_workflow_id, trigger_of, with_run_values, Edge, InputValue, Node, NodeKind,
-    RequirementKind, Workflow, WorkflowRun, WORKFLOWS_MAX, WORKFLOW_DEFINITION_MAX_BYTES,
-    WORKFLOW_DESCRIPTION_MAX, WORKFLOW_NAME_MAX,
+    interrupted_instances, left_instances_text, new_workflow_id, trigger_of, with_run_values, Edge,
+    InputValue, Node, NodeKind, RequirementKind, RunInstance, RunStatus, Workflow, WorkflowRun,
+    WORKFLOWS_MAX, WORKFLOW_DEFINITION_MAX_BYTES, WORKFLOW_DESCRIPTION_MAX, WORKFLOW_NAME_MAX,
 };
 use super::models::{harnesses_used, native_probe, workflow_issues, ModelCatalog, Probe};
 use super::ordered::{js_number_text, Json, OrderedMap};
@@ -423,7 +423,33 @@ fn run_summary_fields(run: &WorkflowRun) -> Vec<(&'static str, Json)> {
     if let Some(error) = run.error.as_ref().filter(|e| !e.is_empty()) {
         fields.push(("error", st(error)));
     }
+    if !run.cloud_instances.is_empty() {
+        fields.push(("cloudInstances", instances_json(&run.cloud_instances)));
+    }
+    if let Some(warning) = run.left_instances_warning() {
+        fields.push(("cloudInstancesWarning", st(warning)));
+    }
     fields
+}
+
+/// The cloud instances of a run: what the Mono needs to find and stop or delete them.
+fn instances_json(instances: &[RunInstance]) -> Json {
+    Json::Array(
+        instances
+            .iter()
+            .map(|i| {
+                obj([
+                    ("kind", st(&i.kind)),
+                    ("name", st(&i.name)),
+                    ("createdByRun", Json::Bool(i.created)),
+                    (
+                        "steps",
+                        Json::Array(i.nodes.iter().map(|n| st(n.as_str())).collect()),
+                    ),
+                ])
+            })
+            .collect(),
+    )
 }
 
 fn run_summary(run: &WorkflowRun) -> Json {
@@ -1123,10 +1149,23 @@ fn stop<H: WorkflowHost>(host: &mut H, input: &Json) -> Result<Json, String> {
         Ok((list, ()))
     })?;
     host.request_check_now();
-    Ok(obj([
+    let mut result = vec![
         ("id", st(&current.id)),
         ("note", st("Stop requested; the run ends within seconds.")),
-    ]))
+    ];
+    // A stop never stops or deletes a cloud instance: say which ones the run leaves.
+    let running = host
+        .runs(&current.id)
+        .ok()
+        .and_then(|runs| runs.into_iter().find(|r| r.status == RunStatus::Running));
+    if let Some(run) = running.filter(|r| !r.cloud_instances.is_empty()) {
+        result.push(("cloudInstances", instances_json(&run.cloud_instances)));
+        result.push((
+            "cloudInstancesNote",
+            st(left_instances_text("This run", &run.cloud_instances)),
+        ));
+    }
+    Ok(Json::Object(result.into_iter().collect()))
 }
 
 fn pause<H: WorkflowHost>(host: &mut H, input: &Json) -> Result<Json, String> {
@@ -1221,9 +1260,23 @@ fn remove<H: WorkflowHost>(host: &mut H, input: &Json) -> Result<Json, String> {
             (),
         ))
     })?;
+    // An interrupted run never reported, so its history is the only place that names the cloud
+    // instances it left. They are not stopped or deleted: they are named in the answer.
+    let left = interrupted_instances(&host.runs(&current.id).unwrap_or_default());
     // The history of a workflow that is gone is of no use; losing the cleanup is harmless.
     host.clear_runs(&current.id);
-    Ok(obj([("removed", st(&current.name))]))
+    let mut result = vec![("removed", st(&current.name))];
+    if !left.is_empty() {
+        result.push(("cloudInstances", instances_json(&left)));
+        result.push((
+            "cloudInstancesNote",
+            st(left_instances_text(
+                "The interrupted runs of this workflow",
+                &left,
+            )),
+        ));
+    }
+    Ok(Json::Object(result.into_iter().collect()))
 }
 
 fn export<H: WorkflowHost>(host: &mut H, input: &Json) -> Result<Json, String> {

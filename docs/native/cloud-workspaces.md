@@ -213,8 +213,21 @@ A workflow session node can run in a workspace: give it a `target`
 same shape `sessions.start` takes. The rules, which `workflows.validate` checks:
 
 * A cloud step runs Claude only, and its `checkout` must be `root` (use `target.branch` to start
-  from a branch). Options are literal text (no `{{...}}` templates), apply only to a new instance and
-  are the options of that kind's `sessions.start` target.
+  from a branch). Options apply only to a new instance and are the options of that kind's
+  `sessions.start` target.
+* The string options (`branch`, `machine`, `memory`, `ttl`, `template`, `image`) may hold `{{...}}`
+  templates (inputs, upstream outputs, loop variables, like a prompt does), for example
+  `"branch": "{{inputs.branch}}"`. An unknown variable is a validation issue. The text is filled in
+  when the step starts and checked like a literal option; an invalid result (a bad branch or
+  machine name, a size) fails the step before any instance is created. `kind`, `instance`, `cpus`
+  and `kit` stay literal.
+* `account` on the node, next to `target` as in `sessions.start`, names the Claude account a new
+  instance runs with (`"default"`, an account id or a label). It needs a setup token or an API key
+  and is refused with `sameAs` and on a step without a `target`. Validation checks its shape; that
+  the account exists and has a setup token or API key is checked when the step starts, before an
+  instance is created (the step fails with the reason). A later loop round that goes on in the same
+  instance ignores it. The board inspector shows the account's name next to "Runs in", never a
+  secret.
 * `sameAs` shares the instance of an earlier cloud step of the same kind. In a loop, `reuseSession`
   true continues the same session; false starts a new session on the same instance as the previous
   round. Each For each item gets its own instance for `new`.
@@ -229,6 +242,11 @@ same shape `sessions.start` takes. The rules, which `workflows.validate` checks:
   had (it does not create another) and drops that step's old first prompt. If the app restarted
   and the instance became ready before the run was resumed, that old prompt may already have run
   there.
+* A run that was interrupted and is never resumed still names its instances: each run record keeps
+  the instances its steps used as they start. The run page shows "This run left N cloud instances
+  running: ..." for an interrupted run, `workflows.get` and `workflows.runs` list them
+  (`cloudInstances`), and `workflows.stop` and `workflows.remove` name them in their answers. The
+  app never stops or deletes them: do that here.
 
 ## Cost numbers are estimates
 

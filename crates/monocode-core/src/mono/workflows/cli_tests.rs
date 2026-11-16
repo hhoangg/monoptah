@@ -175,6 +175,7 @@ fn run(id: &str, status: RunStatus, workflow: &str) -> WorkflowRun {
         nodes: vec![fetch, dev],
         report_posted_at: None,
         error: None,
+        cloud_instances: Vec::new(),
     }
 }
 
@@ -1568,6 +1569,107 @@ fn a_run_summary_shows_its_end_time_and_error() {
     assert!(summary.get("endedAt").is_some());
     assert_eq!(text(summary, "trigger"), "manual");
     assert!(summary.get("nodes").is_none());
+}
+
+// ---- cloud instances a run used ---------------------------------------------------------
+
+fn used(kind: &str, name: &str, created: bool) -> RunInstance {
+    RunInstance {
+        kind: kind.into(),
+        name: name.into(),
+        created,
+        nodes: vec!["build".into()],
+        sessions: vec!["remote:1".into()],
+    }
+}
+
+#[test]
+fn get_and_runs_list_the_cloud_instances_and_warn_for_an_interrupted_run() {
+    let mut f = Fx::new();
+    let id = id_of(&f.add(definition(json!({}))));
+    let mut interrupted = run("run-2", RunStatus::Interrupted, &id);
+    interrupted.cloud_instances = vec![used("codespace", "octo-run", true)];
+    let mut done = run("run-1", RunStatus::Done, &id);
+    done.cloud_instances = vec![used("sandbox", "box", false)];
+    let plain = run("run-0", RunStatus::Done, &id);
+    f.host
+        .runs
+        .insert(id.clone(), vec![interrupted, done, plain]);
+
+    let got = f.ok("workflows.get", json!({"id": id}));
+    let runs = list(&got, "runs");
+    let first = list(&runs[0], "cloudInstances");
+    assert_eq!(text(&first[0], "kind"), "codespace");
+    assert_eq!(text(&first[0], "name"), "octo-run");
+    assert!(flag(&first[0], "createdByRun"));
+    assert_eq!(list(&first[0], "steps").len(), 1);
+    let warning = text(&runs[0], "cloudInstancesWarning");
+    assert!(
+        warning.starts_with("This run left 1 cloud instance running: Codespace octo-run."),
+        "{warning}"
+    );
+    // A finished run lists them too (the report named them) but has nothing to warn about.
+    assert_eq!(list(&runs[1], "cloudInstances").len(), 1);
+    assert!(runs[1].get("cloudInstancesWarning").is_none());
+    assert!(runs[2].get("cloudInstances").is_none());
+    // The session ids are the app's business, not the Mono's.
+    assert!(!got.stringify(false).contains("remote:1"));
+
+    let detail = f.ok("workflows.runs", json!({"id": id}));
+    assert_eq!(list(&list(&detail, "runs")[0], "cloudInstances").len(), 1);
+}
+
+#[test]
+fn stop_and_remove_name_the_cloud_instances_and_touch_none() {
+    let mut f = Fx::new();
+    let id = id_of(&f.add(definition(json!({}))));
+    let mut running = run("run-1", RunStatus::Running, &id);
+    running.cloud_instances = vec![used("codespace", "octo-run", true)];
+    f.host.runs.insert(id.clone(), vec![running]);
+    f.host.live.insert(id.clone());
+    let stopped = f.ok("workflows.stop", json!({"id": id}));
+    assert_eq!(list(&stopped, "cloudInstances").len(), 1);
+    assert!(
+        text(&stopped, "cloudInstancesNote")
+            .contains("left 1 cloud instance running: Codespace octo-run"),
+        "{}",
+        stopped.stringify(false)
+    );
+    // A run with no instance keeps the plain answer.
+    f.host
+        .runs
+        .insert(id.clone(), vec![run("run-2", RunStatus::Running, &id)]);
+    let plain = f.ok("workflows.stop", json!({"id": id}));
+    assert!(plain.get("cloudInstances").is_none());
+
+    // Removing the workflow forgets its interrupted runs: their instances are named once.
+    f.host.live.clear();
+    let mut first = run("run-3", RunStatus::Interrupted, &id);
+    first.cloud_instances = vec![used("codespace", "octo-run", true)];
+    let mut second = run("run-4", RunStatus::Interrupted, &id);
+    second.cloud_instances = vec![
+        used("codespace", "octo-run", false),
+        used("sandbox", "box", true),
+    ];
+    let mut finished = run("run-5", RunStatus::Done, &id);
+    finished.cloud_instances = vec![used("codespace", "reported-one", true)];
+    f.host
+        .runs
+        .insert(id.clone(), vec![first, second, finished]);
+    let removed = f.ok("workflows.remove", json!({"id": id}));
+    let named = list(&removed, "cloudInstances");
+    assert_eq!(
+        named.iter().map(|i| text(i, "name")).collect::<Vec<_>>(),
+        ["octo-run", "box"]
+    );
+    let note = text(&removed, "cloudInstancesNote");
+    assert!(
+        note.contains("left 2 cloud instances running: Codespace octo-run, Sandbox box"),
+        "{note}"
+    );
+    assert!(note.contains("never stops or deletes"), "{note}");
+    assert!(f.stored().is_empty());
+    assert_eq!(f.host.cleared, [id]);
 }
 
 // ---- the store-backed host --------------------------------------------------------------

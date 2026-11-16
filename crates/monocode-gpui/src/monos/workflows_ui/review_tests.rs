@@ -341,6 +341,39 @@ fn a_cloud_step_says_where_it_runs_in_the_review() {
     );
 }
 
+#[test]
+fn a_cloud_step_names_its_account_in_the_review() {
+    use monocode_core::mono::workflows::{
+        model::{SessionTarget, TargetInstance},
+        ordered::OrderedMap,
+    };
+    let mut w = flagged(json!({}));
+    let preview = |w: &Workflow| {
+        monocode_core::mono::workflows::yaml::review_of(
+            w,
+            &monocode_core::mono::workflows::models::ModelCatalog::unprobed(),
+        )
+    };
+    if let NodeKind::Session {
+        target, account, ..
+    } = &mut w.nodes[2].kind
+    {
+        *target = Some(SessionTarget {
+            kind: "codespace".into(),
+            instance: TargetInstance::New,
+            options: OrderedMap::new(),
+        });
+        *account = Some("Work".into());
+    }
+    let fix = w.nodes[2].clone();
+    assert_eq!(
+        super::review::session_detail(&preview(&w), &fix).as_deref(),
+        Some(
+            "Model: Mono default \u{b7} Checkout: Project folder \u{b7} Runs in: Codespace (new) \u{b7} Account: Work"
+        )
+    );
+}
+
 fn command_of(w: &mut Workflow, text: &str) {
     if let NodeKind::Command { command, .. } = &mut w.nodes[1].kind {
         *command = text.into();

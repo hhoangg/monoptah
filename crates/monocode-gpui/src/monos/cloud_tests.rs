@@ -571,7 +571,12 @@ fn a_mono_start_with_an_account_is_refused_before_any_cloud_call_unless_it_is_us
 }
 
 /// Adds a Claude account to the window's accounts and the store, with or without a setup token.
-fn claude_account(s: &Setup, label: &str, token: Option<&str>, cx: &mut TestAppContext) -> String {
+pub(in crate::monos) fn claude_account(
+    s: &Setup,
+    label: &str,
+    token: Option<&str>,
+    cx: &mut TestAppContext,
+) -> String {
     let store = s.store.clone();
     s.window
         .update(cx, |_, _, cx| {

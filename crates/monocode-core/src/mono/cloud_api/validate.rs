@@ -117,6 +117,18 @@ pub fn parse_session_ref(value: &Value) -> Option<i64> {
 /// chat in a codespace or sandbox of the project, so options that only make sense for a local
 /// checkout are refused here, before anything is created.
 pub fn validate_target(target: &Value, input: &Value) -> Result<(), String> {
+    validate_target_except(target, input, &[])
+}
+
+/// `validate_target` for a target some of whose option VALUES are not known yet (a workflow
+/// fills `{{...}}` templates in at run time): the keys in `unfilled` are still checked as
+/// options of the kind, for an existing instance and in combinations, but their values are not
+/// judged. The rendered target is checked again with `validate_target` before anything starts.
+pub fn validate_target_except(
+    target: &Value,
+    input: &Value,
+    unfilled: &[&str],
+) -> Result<(), String> {
     let target = target
         .as_object()
         .ok_or("target must be an object like {\"kind\":\"codespace\",\"instance\":\"new\"}")?;
@@ -148,6 +160,9 @@ pub fn validate_target(target: &Value, input: &Value) -> Result<(), String> {
                 "target.{key} only applies when creating a {} (instance \"new\")",
                 kind.noun()
             ));
+        }
+        if unfilled.contains(&key.as_str()) {
+            continue;
         }
         if key == KIT_OPTION {
             ApiKit::parse(value)?;

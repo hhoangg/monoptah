@@ -12,7 +12,13 @@ fn cloud_request(kind: &str, instance: CloudInstance, options: Value) -> CloudRe
             Value::Object(map) => map,
             _ => Map::new(),
         },
+        account: None,
     }
+}
+
+fn with_account(mut request: CloudRequest, account: &str) -> CloudRequest {
+    request.account = Some(account.into());
+    request
 }
 
 fn target_of(w: &fake::World, n: usize) -> Option<CloudRequest> {
@@ -508,5 +514,433 @@ fn a_resumed_run_goes_on_in_the_instance_of_the_session_it_was_interrupted_in(
     assert!(
         text.contains("Codespace codespace-9: created by this run; steps build, check"),
         "{text}"
+    );
+}
+
+// --- templates in target options ------------------------------------------------------------
+
+/// fetch (a local step that reports a branch) -> build (a cloud step with `target`, and the
+/// node fields in `extra`) -> report.
+fn branch_then_build(target: Value, extra: Value) -> Workflow {
+    let mut build = json!({ "target": target });
+    for (key, value) in extra.as_object().unwrap() {
+        build[key] = value.clone();
+    }
+    workflow(
+        vec![
+            trigger(),
+            session("fetch", json!({"branch": {"type": "string"}}), json!({})),
+            session("build", json!({}), build),
+            report(),
+        ],
+        vec![
+            edge("trigger", "fetch"),
+            edge("fetch", "build"),
+            edge("build", "report"),
+        ],
+    )
+}
+
+#[gpui::test]
+fn a_template_in_an_option_is_filled_in_from_the_run_before_the_start(cx: &mut TestAppContext) {
+    let def = branch_then_build(
+        json!({"kind": "codespace", "branch": "{{fetch.branch}}", "machine": "m-{{run.id}}"}),
+        json!({}),
+    );
+    let rig = Rig::new(&[&fenced(json!({"branch": "feature-x"})), "built"]);
+    assert!(rig.start(cx, &def));
+    cx.run_until_parked();
+    assert_eq!(rig.last_run().status, RunStatus::Done);
+    let w = rig.fake.world();
+    assert_eq!(w.starts.len(), 2, "fetch, then build");
+    // The start request carries the rendered text, never the template.
+    assert_eq!(
+        target_of(&w, 1),
+        Some(cloud_request(
+            "codespace",
+            CloudInstance::New,
+            json!({"branch": "feature-x", "machine": "m-run-1"})
+        ))
+    );
+    // The definition in the run record still holds the template.
+    let run = rig.last_run();
+    let NodeKind::Session {
+        target: Some(target),
+        ..
+    } = &run
+        .definition
+        .nodes
+        .iter()
+        .find(|n| n.id == "build")
+        .unwrap()
+        .kind
+    else {
+        panic!("a cloud step")
+    };
+    assert_eq!(
+        target.options.get("branch"),
+        Some(&Json::String("{{fetch.branch}}".into()))
+    );
+}
+
+#[gpui::test]
+fn a_rendered_option_that_is_not_valid_fails_the_step_before_anything_is_started(
+    cx: &mut TestAppContext,
+) {
+    for (target, branch, message) in [
+        (
+            json!({"kind": "codespace", "branch": "{{fetch.branch}}"}),
+            "two words",
+            "target.branch is not a valid branch name",
+        ),
+        (
+            json!({"kind": "codespace", "machine": "{{fetch.branch}}"}),
+            "not a machine",
+            "target.machine is not a valid machine name",
+        ),
+        (
+            json!({"kind": "sandbox", "memory": "{{fetch.branch}}"}),
+            "lots",
+            "target.memory",
+        ),
+    ] {
+        let def = branch_then_build(target, json!({}));
+        let rig = Rig::new(&[&fenced(json!({"branch": branch})), "never sent"]);
+        assert!(rig.start(cx, &def));
+        cx.run_until_parked();
+        let run = rig.last_run();
+        let build = node(&run, "build");
+        assert_eq!(build.status, NodeStatus::Failed, "{message}");
+        let error = build.error.as_deref().unwrap();
+        assert!(
+            error.starts_with("The cloud target is not valid: ") && error.contains(message),
+            "{error}"
+        );
+        let w = rig.fake.world();
+        // Only the local step started anything: no cloud start, no session, no stop.
+        assert_eq!(w.starts.len(), 1, "{message}");
+        assert!(w.starts.iter().all(|s| s.target.is_none()), "{message}");
+        assert!(w.stops.is_empty() && w.sends.is_empty(), "{message}");
+        assert!(
+            !w.posts[0].text.contains("Cloud instances"),
+            "nothing was created"
+        );
+    }
+}
+
+#[gpui::test]
+fn a_template_in_an_option_that_cannot_hold_one_fails_the_step_and_creates_nothing(
+    cx: &mut TestAppContext,
+) {
+    // Validation never lets these through: this is what a run does if one slips past.
+    for target in [
+        json!({"kind": "sandbox", "cpus": "{{run.id}}"}),
+        json!({"kind": "sandbox", "kit": "{{run.id}}"}),
+        json!({"kind": "codespace", "branch": ["{{run.id}}"]}),
+    ] {
+        let def = unchecked(
+            vec![
+                trigger(),
+                session("dev", json!({}), json!({"target": target})),
+                report(),
+            ],
+            vec![edge("trigger", "dev"), edge("dev", "report")],
+        );
+        let rig = Rig::new(&[]);
+        assert!(rig.start(cx, &def));
+        cx.run_until_parked();
+        let run = rig.last_run();
+        assert_eq!(node(&run, "dev").status, NodeStatus::Failed, "{target}");
+        assert!(
+            node(&run, "dev")
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("cannot hold a template"),
+            "{:?}",
+            node(&run, "dev").error
+        );
+        assert!(rig.fake.world().starts.is_empty(), "{target}");
+    }
+}
+
+#[gpui::test]
+fn a_later_round_on_the_same_instance_does_not_fill_in_the_options_again(cx: &mut TestAppContext) {
+    // Round 2 goes on in the instance round 1 made, so there is nothing to create and no option
+    // to fill in or judge.
+    let def = cloud_loop(
+        json!({"kind": "codespace", "branch": "{{run.id}}"}),
+        Some(false),
+    );
+    let rig = loop_replies();
+    rig.start(cx, &def);
+    cx.run_until_parked();
+    assert_eq!(rig.last_run().status, RunStatus::Done);
+    let w = rig.fake.world();
+    assert_eq!(
+        target_of(&w, 0),
+        Some(cloud_request(
+            "codespace",
+            CloudInstance::New,
+            json!({"branch": "run-1"})
+        ))
+    );
+    assert_eq!(
+        target_of(&w, 2),
+        Some(cloud_request(
+            "codespace",
+            CloudInstance::OfSession("s1".into()),
+            json!({})
+        ))
+    );
+}
+
+// --- the account of a cloud step ------------------------------------------------------------
+
+#[gpui::test]
+fn the_account_goes_to_the_start_of_a_new_instance_and_not_to_a_step_that_shares_one(
+    cx: &mut TestAppContext,
+) {
+    let mut def = build_then_check();
+    if let NodeKind::Session { account, .. } =
+        &mut def.nodes.iter_mut().find(|n| n.id == "build").unwrap().kind
+    {
+        *account = Some("Work".into());
+    }
+    let rig = Rig::new(&["one", "two"]);
+    rig.start(cx, &def);
+    cx.run_until_parked();
+    assert_eq!(rig.last_run().status, RunStatus::Done);
+    let w = rig.fake.world();
+    assert_eq!(
+        target_of(&w, 0),
+        Some(with_account(
+            cloud_request("codespace", CloudInstance::New, json!({"branch": "trunk"})),
+            "Work"
+        ))
+    );
+    // The account belongs to the instance: a step that goes on in it names none.
+    assert_eq!(target_of(&w, 1).unwrap().account, None);
+}
+
+#[gpui::test]
+fn a_later_round_on_the_same_instance_takes_no_account(cx: &mut TestAppContext) {
+    let mut def = cloud_loop(json!({"kind": "sandbox", "instance": "new"}), Some(false));
+    if let NodeKind::Session { account, .. } =
+        &mut def.nodes.iter_mut().find(|n| n.id == "dev").unwrap().kind
+    {
+        *account = Some("Work".into());
+    }
+    let rig = loop_replies();
+    rig.start(cx, &def);
+    cx.run_until_parked();
+    assert_eq!(rig.last_run().status, RunStatus::Done);
+    let w = rig.fake.world();
+    assert_eq!(target_of(&w, 0).unwrap().account.as_deref(), Some("Work"));
+    assert_eq!(target_of(&w, 2).unwrap().account, None);
+}
+
+#[gpui::test]
+fn an_account_that_slipped_past_validation_fails_the_step_and_creates_nothing(
+    cx: &mut TestAppContext,
+) {
+    let cases = [
+        (
+            json!({"kind": "codespace", "instance": {"sameAs": "build"}}),
+            "Work",
+            monocode_core::mono::api::ACCOUNT_EXISTING_INSTANCE,
+        ),
+        (
+            json!({"kind": "codespace", "instance": "my-codespace"}),
+            "Work",
+            monocode_core::mono::api::ACCOUNT_EXISTING_INSTANCE,
+        ),
+        (
+            json!({"kind": "codespace"}),
+            "",
+            "must be a non-empty text of at most 128 characters",
+        ),
+    ];
+    for (target, account, message) in cases {
+        let def = unchecked(
+            vec![
+                trigger(),
+                session(
+                    "dev",
+                    json!({}),
+                    json!({"target": target, "account": account}),
+                ),
+                report(),
+            ],
+            vec![edge("trigger", "dev"), edge("dev", "report")],
+        );
+        let rig = Rig::new(&[]);
+        assert!(rig.start(cx, &def));
+        cx.run_until_parked();
+        let run = rig.last_run();
+        assert_eq!(node(&run, "dev").status, NodeStatus::Failed, "{message}");
+        assert!(
+            node(&run, "dev")
+                .error
+                .as_deref()
+                .unwrap()
+                .contains(message),
+            "{:?}",
+            node(&run, "dev").error
+        );
+        assert!(rig.fake.world().starts.is_empty(), "{message}");
+    }
+}
+
+// --- the instances of a run that is interrupted ---------------------------------------------
+
+fn octo_run(sessions: &[&str]) -> RunInstance {
+    RunInstance {
+        kind: "codespace".into(),
+        name: "octo-run".into(),
+        created: true,
+        nodes: vec!["build".into()],
+        sessions: sessions.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+#[gpui::test]
+fn an_interrupted_run_keeps_the_instances_it_used_in_its_record(cx: &mut TestAppContext) {
+    use monocode_core::mono::workflows::engine::mark_interrupted;
+    let rig = Rig::new(&["one"]);
+    let hold = rig.fake.hold();
+    rig.start(cx, &build_then_check());
+    cx.run_until_parked();
+    // The app closes while `build` is working in its new codespace.
+    rig.runner.quit();
+    hold.close();
+    cx.run_until_parked();
+    let run = rig.last_run();
+    assert_eq!(run.status, RunStatus::Running);
+    assert_eq!(
+        run.cloud_instances,
+        vec![RunInstance {
+            kind: "codespace".into(),
+            name: "codespace-1".into(),
+            created: true,
+            nodes: vec!["build".into()],
+            sessions: vec!["s1".into()],
+        }]
+    );
+    // Next start: the run is interrupted and the record still names the instance, though no
+    // report will ever be written for it.
+    let interrupted = mark_interrupted(&run);
+    assert_eq!(interrupted.status, RunStatus::Interrupted);
+    assert_eq!(interrupted.cloud_instances, run.cloud_instances);
+    let warning = interrupted.left_instances_warning().unwrap();
+    assert!(
+        warning.starts_with("This run left 1 cloud instance running: Codespace codespace-1."),
+        "{warning}"
+    );
+    // Nothing was touched: not even the session was stopped.
+    assert!(rig.fake.world().stops.is_empty());
+}
+
+#[gpui::test]
+fn a_run_with_no_cloud_step_records_no_instance(cx: &mut TestAppContext) {
+    let rig = Rig::new(&["ok"]);
+    rig.start(cx, &simple(json!({})));
+    cx.run_until_parked();
+    assert!(rig.last_run().cloud_instances.is_empty());
+}
+
+#[gpui::test]
+fn a_resumed_run_that_is_stopped_names_the_instances_of_the_interrupted_one_and_stops_none(
+    cx: &mut TestAppContext,
+) {
+    use monocode_core::mono::workflows::engine::mark_interrupted;
+    let def = build_then_check();
+    let mut run = start_run(&def, RunTrigger::Manual, 1_000, "run-old");
+    run = apply_event(
+        &run,
+        &EngineEvent::NodeStarted {
+            node_id: "build".into(),
+            branch: String::new(),
+            session_id: Some("s9".into()),
+            at: 2_000,
+        },
+    );
+    run.nodes
+        .iter_mut()
+        .find(|n| n.node_id == "build")
+        .unwrap()
+        .session_id = Some("s9".into());
+    run.cloud_instances = vec![octo_run(&["s9"])];
+    let interrupted = mark_interrupted(&run);
+    assert!(interrupted.left_instances_warning().is_some());
+
+    let rig = Rig::new(&["one"]);
+    rig.fake.knows_cloud("s9", "codespace", "octo-run");
+    rig.fake.hold();
+    let host: Rc<dyn WorkflowHost> = Rc::new(rig.fake.clone());
+    assert!(
+        rig.runner
+            .resume(host, &cx.to_async(), "mono-1", &interrupted)
+    );
+    cx.run_until_parked();
+    assert!(rig.runner.stop(WF));
+    cx.run_until_parked();
+    let w = rig.fake.world();
+    // Only sessions were stopped (the old one's queued prompt, then the running turn): the fake
+    // host has no call that stops or deletes an instance, and none was asked.
+    assert!(
+        w.stops.iter().all(|id| id == "s9" || id == "s1"),
+        "{:?}",
+        w.stops
+    );
+    let text = &w.posts.last().unwrap().text;
+    assert_eq!(text.matches("octo-run").count(), 1, "{text}");
+    assert!(
+        text.contains("Codespace octo-run: created by this run; step build"),
+        "{text}"
+    );
+    assert!(text.contains("never stops or deletes"), "{text}");
+}
+
+#[test]
+fn the_report_names_an_instance_its_session_no_longer_tells_about() {
+    use monocode_core::mono::workflows::engine::mark_interrupted;
+    let def = build_then_check();
+    let mut run = start_run(&def, RunTrigger::Manual, 1_000, "run-1");
+    run = apply_event(
+        &run,
+        &EngineEvent::NodeStarted {
+            node_id: "build".into(),
+            branch: String::new(),
+            session_id: Some("s9".into()),
+            at: 2_000,
+        },
+    );
+    run.nodes
+        .iter_mut()
+        .find(|n| n.node_id == "build")
+        .unwrap()
+        .session_id = Some("s9".into());
+    let mut interrupted = mark_interrupted(&run);
+    // Without the record, a session the host does not know has no name to report.
+    let unnamed = instances::report_section(&interrupted, |_| None).unwrap();
+    assert!(unnamed.contains("name not known"), "{unnamed}");
+    interrupted.cloud_instances = vec![octo_run(&["s9"])];
+    let named = instances::report_section(&interrupted, |_| None).unwrap();
+    assert!(
+        named.contains("- Codespace octo-run: created by this run; step build"),
+        "{named}"
+    );
+    assert!(!named.contains("name not known"), "{named}");
+    assert_eq!(named.matches("octo-run").count(), 1, "{named}");
+    // An instance the nodes no longer point at is still listed from the record.
+    let mut orphan = interrupted.clone();
+    orphan.nodes.iter_mut().for_each(|n| {
+        n.interrupted_sessions = None;
+    });
+    let listed = instances::report_section(&orphan, |_| None).unwrap();
+    assert!(
+        listed.contains("- Codespace octo-run: created by this run; step build"),
+        "{listed}"
     );
 }

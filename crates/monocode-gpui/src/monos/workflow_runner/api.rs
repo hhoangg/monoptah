@@ -90,8 +90,13 @@ pub(crate) struct CloudRequest {
     /// `codespace` or `sandbox`.
     pub kind: String,
     pub instance: CloudInstance,
-    /// The other keys of the node's target (branch, machine, ...), passed on as written.
+    /// The other keys of the node's target (branch, machine, ...), with the templates of the
+    /// string options already filled in and checked.
     pub options: serde_json::Map<String, serde_json::Value>,
+    /// The Claude account a NEW instance runs with, as the node wrote it (`"default"`, an id or
+    /// a label); `None` for an existing instance or a node without one. Whether it exists and
+    /// carries a setup token or API key is decided by the start, before anything is created.
+    pub account: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

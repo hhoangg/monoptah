@@ -17,7 +17,15 @@ fn target(instance: CloudInstance, options: Value) -> Option<CloudRequest> {
         kind: "codespace".into(),
         instance,
         options,
+        account: None,
     })
+}
+
+fn with_account(mut request: SessionRequest, account: &str) -> SessionRequest {
+    if let Some(target) = request.target.as_mut() {
+        target.account = Some(account.into());
+    }
+    request
 }
 
 fn cloud_request(s: &Setup, instance: CloudInstance, options: Value) -> SessionRequest {
@@ -434,4 +442,121 @@ fn a_run_whose_instance_fails_to_start_fails_the_node_with_the_error(cx: &mut Te
             .any(|r| r.contains("Cloud instances this run used")),
         "{rows:?}"
     );
+}
+
+/// The shape the account dialog accepts, built in pieces and obviously fake.
+const FAKE_TOKEN: &str = concat!("sk-ant-", "oat01-", "fake-token-for-tests");
+
+// --- the account of a cloud step and the run record ------------------------------------------
+
+#[gpui::test]
+fn a_cloud_step_with_an_account_pins_it_to_its_new_codespace(cx: &mut TestAppContext) {
+    let _clis = crate::shell::surface_tests::NoClis::new();
+    let (s, gh, host, _guard) = cloud_setup(cx, "Failed");
+    let work = crate::monos::cloud_tests::claude_account(&s, "Work", Some(FAKE_TOKEN), cx);
+    let request = with_account(
+        cloud_request(&s, CloudInstance::New, json!({"branch": "trunk"})),
+        "Work",
+    );
+    let started = begin_cloud(&s, cx, request).unwrap();
+    assert_eq!(creates(&gh), 1, "one codespace is created");
+    // The same pin `sessions.start` with an account makes: the id of the account, never its
+    // token.
+    let name = host_of(&s, cx)
+        .cloud_instance(&started.session_id)
+        .and_then(|info| info.name)
+        .expect("the instance has a name");
+    let raw = locked(&s.store)
+        .unwrap()
+        .setting(&monocode_core::cloud_sessions::claude_pin::codespace_key(
+            &name,
+        ))
+        .unwrap()
+        .expect("the instance was pinned");
+    assert_eq!(
+        serde_json::from_str::<Value>(&raw).unwrap(),
+        json!({"account": work, "pinned": true})
+    );
+    assert!(!raw.contains(FAKE_TOKEN), "only the id is stored");
+    instance_untouched(&gh, &host);
+}
+
+#[gpui::test]
+fn an_account_that_cannot_be_used_is_refused_before_any_instance_is_created(
+    cx: &mut TestAppContext,
+) {
+    let _clis = crate::shell::surface_tests::NoClis::new();
+    let (s, gh, _host, _guard) = cloud_setup(cx, "Failed");
+    // One account with a setup token, one without.
+    let _work = crate::monos::cloud_tests::claude_account(&s, "Work", Some(FAKE_TOKEN), cx);
+    let _bare = crate::monos::cloud_tests::claude_account(&s, "Bare", None, cx);
+    let before = session_count(&s);
+    // No credential to deliver: the account without one, and the CLI login of this computer.
+    for account in ["Bare", "default"] {
+        let request = with_account(
+            cloud_request(&s, CloudInstance::New, json!({"branch": "trunk"})),
+            account,
+        );
+        let error = begin_cloud(&s, cx, request).err().unwrap();
+        assert_eq!(
+            error,
+            crate::monos::host::CLOUD_ACCOUNT_NEEDS_TOKEN,
+            "{account}"
+        );
+    }
+    // An account that does not exist.
+    let request = with_account(
+        cloud_request(&s, CloudInstance::New, json!({"branch": "trunk"})),
+        "Nobody",
+    );
+    let error = begin_cloud(&s, cx, request).err().unwrap();
+    assert_ne!(
+        error,
+        crate::monos::host::CLOUD_ACCOUNT_NEEDS_TOKEN,
+        "{error}"
+    );
+    assert!(!error.is_empty());
+    // An existing instance keeps the account it started with.
+    let first = crate::monos::cloud_tests::cloud_session(&s, cx);
+    let persisted = locked(&s.store)
+        .unwrap()
+        .persisted_session_id(first)
+        .unwrap();
+    let before = before + 1;
+    let request = with_account(
+        cloud_request(&s, CloudInstance::OfSession(persisted), json!({})),
+        "Work",
+    );
+    let error = begin_cloud(&s, cx, request).err().unwrap();
+    assert_eq!(error, monocode_core::mono::api::ACCOUNT_EXISTING_INSTANCE);
+    // Nothing was made for any of them.
+    assert_eq!(session_count(&s), before);
+    assert_eq!(creates(&gh), 0);
+    // (The existing session above talked to the machine host; only `gh` is judged.)
+    instance_untouched_gh(&gh);
+}
+
+#[gpui::test]
+fn the_run_record_names_the_instance_its_first_step_created(cx: &mut TestAppContext) {
+    use monocode_core::mono::workflows::engine::mark_interrupted;
+    let (s, gh, host, _guard) = cloud_setup(cx, "Failed");
+    start_cloud_run(&s, cx);
+    assert_eq!(creates(&gh), 1);
+    // Saved while the step is still working, so a run the app never gets to finish keeps it.
+    let run = stored_run(&s);
+    assert_eq!(run.status, RunStatus::Running);
+    let [instance] = run.cloud_instances.as_slice() else {
+        panic!("{:?}", run.cloud_instances)
+    };
+    assert_eq!(instance.kind, "codespace");
+    assert!(instance.created && !instance.name.is_empty());
+    assert_eq!(instance.nodes, ["build"]);
+    assert_eq!(instance.sessions.len(), 1);
+    // Interrupted and never resumed, the record still says what was left running.
+    let warning = mark_interrupted(&run).left_instances_warning().unwrap();
+    assert!(
+        warning.contains(&format!("Codespace {}", instance.name)),
+        "{warning}"
+    );
+    instance_untouched(&gh, &host);
 }

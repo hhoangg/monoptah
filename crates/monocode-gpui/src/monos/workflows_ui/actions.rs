@@ -5,8 +5,8 @@
 use monocode_core::mono::workflows::{
     cli::{WorkflowHost, checked_run_values},
     model::{
-        InputValue, NodeKind, Workflow, WorkflowInput, definition_fingerprint, trigger_of,
-        with_run_values,
+        InputValue, NodeKind, Workflow, WorkflowInput, definition_fingerprint,
+        interrupted_instances, left_instances_text, trigger_of, with_run_values,
     },
     models::workflow_issues,
     ordered::OrderedMap,
@@ -332,6 +332,13 @@ pub(super) fn remove(host: &mut impl WorkflowHost, id: &str) -> Option<String> {
         host.clear_runs(id);
     }
     notice
+}
+
+/// The cloud instances the interrupted runs of the workflow left running, named for the user
+/// before removing the workflow forgets them. Read only: nothing is stopped or deleted.
+pub(super) fn left_instances(host: &mut impl WorkflowHost, id: &str) -> Option<String> {
+    let left = interrupted_instances(&host.runs(id).unwrap_or_default());
+    (!left.is_empty()).then(|| left_instances_text("The interrupted runs of this workflow", &left))
 }
 
 /// What is wrong with the value an input would take, if anything: no value at all, or one that

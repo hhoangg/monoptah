@@ -601,6 +601,7 @@ impl Monos {
                 nest_under,
                 timeout_minutes,
                 target,
+                account,
                 ..
             } => {
                 let project_row = self.board_project_row(mono, w, &id, cx);
@@ -610,6 +611,13 @@ impl Monos {
                     property("Runs in", target.summary())
                         .id("wf-target")
                         .debug_selector(|| "wf-target".to_string())
+                });
+                // The account is shown as the node names it (a label, an id or "default"): the
+                // token or key of an account is never read here.
+                let account_row = account.as_ref().map(|account| {
+                    property("Account", account.clone())
+                        .id("wf-account")
+                        .debug_selector(|| "wf-account".to_string())
                 });
                 let others = sessions_except(w, &id);
                 let mut worktrees = choices(&[("root", "Project folder"), ("newWorktree", "New worktree")]);
@@ -678,6 +686,7 @@ impl Monos {
                             .child(project_row)
                             .children(model)
                             .children(target_row)
+                            .children(account_row)
                             .child(checkout_row)
                             .child(nest_row)
                             .child(limit),

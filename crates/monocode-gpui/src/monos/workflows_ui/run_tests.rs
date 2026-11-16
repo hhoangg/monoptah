@@ -528,6 +528,71 @@ fn an_interrupted_run_shows_resume_and_resume_continues_it(cx: &mut TestAppConte
     assert_eq!(page_notice(&s, visual), None);
 }
 
+fn octo_run() -> monocode_core::mono::workflows::model::RunInstance {
+    monocode_core::mono::workflows::model::RunInstance {
+        kind: "codespace".into(),
+        name: "octo-run".into(),
+        created: true,
+        nodes: vec!["build".into()],
+        sessions: vec!["remote:1".into()],
+    }
+}
+
+#[gpui::test]
+fn an_interrupted_run_that_left_cloud_instances_warns_on_its_page_and_stops_none(
+    cx: &mut TestAppContext,
+) {
+    let s = setup(cx);
+    let w = super::tests::workflow(json!({}));
+    let mut run = interrupted(&w);
+    run.cloud_instances = vec![octo_run()];
+    assert!(
+        run.left_instances_warning()
+            .unwrap()
+            .starts_with("This run left 1 cloud instance running: Codespace octo-run."),
+    );
+    saved_run(&s, &w, &run, cx);
+    let visual = &mut VisualTestContext::from_window(s.window.into(), cx);
+    visual.run_until_parked();
+    open_run(&s, visual);
+    assert!(visual.debug_bounds("wf-run-instances").is_some());
+    // The page only names them: the run is still interrupted, with the instance in its record.
+    let kept = history(&s, A);
+    assert_eq!(kept[0].status, RunStatus::Interrupted);
+    assert_eq!(kept[0].cloud_instances, vec![octo_run()]);
+}
+
+#[gpui::test]
+fn an_interrupted_run_that_used_no_instance_has_no_cloud_warning(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let w = super::tests::workflow(json!({}));
+    saved_run(&s, &w, &interrupted(&w), cx);
+    let visual = &mut VisualTestContext::from_window(s.window.into(), cx);
+    visual.run_until_parked();
+    open_run(&s, visual);
+    assert!(visual.debug_bounds("wf-run-meta").is_some());
+    assert!(visual.debug_bounds("wf-run-instances").is_none());
+}
+
+#[gpui::test]
+fn a_finished_run_names_its_instances_in_its_report_not_with_a_warning(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let mut finished = run_of(
+        &linear(),
+        "done",
+        json!({}),
+        json!([nr("trigger", "", "done", json!({}))]),
+    );
+    finished.ended_at = Some(finished.started_at + 1_000);
+    finished.cloud_instances = vec![octo_run()];
+    saved_run(&s, &linear(), &finished, cx);
+    let visual = &mut VisualTestContext::from_window(s.window.into(), cx);
+    visual.run_until_parked();
+    open_run(&s, visual);
+    assert!(visual.debug_bounds("wf-run-meta").is_some());
+    assert!(visual.debug_bounds("wf-run-instances").is_none());
+}
+
 #[gpui::test]
 fn resume_is_refused_while_another_run_of_the_workflow_is_going(cx: &mut TestAppContext) {
     let s = setup(cx);

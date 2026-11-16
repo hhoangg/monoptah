@@ -458,15 +458,20 @@ impl Monos {
         let id = id.to_string();
         let removed = id.clone();
         self.workflow_task(
-            move |host| actions::remove(host, &id),
-            move |this, notice, cx| {
+            move |host| {
+                // Read before the history goes: it is the only place that names them.
+                let left = actions::left_instances(host, &id);
+                (actions::remove(host, &id), left)
+            },
+            move |this, (notice, left), cx| {
                 if notice.is_none()
                     && matches!(&this.route, Some(Route::Workflow(open)) if *open == removed)
                 {
                     // Once the workflow is gone, its page closes.
                     this.route = None;
                 }
-                this.workflow_said(notice, page, cx);
+                // A refusal first; otherwise the cloud instances the removed history named.
+                this.workflow_said(notice.or(left), page, cx);
             },
             cx,
         );

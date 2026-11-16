@@ -105,6 +105,52 @@ fn a_cloud_step_shows_where_it_runs_and_an_edit_keeps_its_target(cx: &mut TestAp
 }
 
 #[gpui::test]
+fn a_cloud_step_shows_its_account_next_to_where_it_runs_and_an_edit_keeps_it(
+    cx: &mut TestAppContext,
+) {
+    use monocode_core::mono::workflows::{
+        model::{SessionTarget, TargetInstance},
+        ordered::OrderedMap,
+    };
+    let s = setup(cx);
+    let mut w = ticket(json!({}));
+    if let NodeKind::Session {
+        target, account, ..
+    } = &mut w.nodes[1].kind
+    {
+        *target = Some(SessionTarget {
+            kind: "sandbox".into(),
+            instance: TargetInstance::New,
+            options: OrderedMap::new(),
+        });
+        *account = Some("Work".into());
+    }
+    let mut visual = open_board(&s, &w, cx);
+    let visual = &mut visual;
+    event(&s, visual, GraphEvent::Click("fetch".into()));
+    assert!(visual.debug_bounds("wf-target").is_some());
+    assert!(visual.debug_bounds("wf-account").is_some());
+    // Edits in place leave the account as it is.
+    type_in(
+        &s,
+        visual,
+        BoardField::Prompt("fetch".into()),
+        "List them all.",
+    );
+    let NodeKind::Session {
+        account, prompt, ..
+    } = node_of(&s, visual, "fetch").kind
+    else {
+        panic!()
+    };
+    assert_eq!(prompt, "List them all.");
+    assert_eq!(account.as_deref(), Some("Work"));
+    // A step without one has no such row, and neither has a step on this computer.
+    event(&s, visual, GraphEvent::Click("dev".into()));
+    assert!(visual.debug_bounds("wf-account").is_none());
+}
+
+#[gpui::test]
 fn picking_a_model_writes_its_harness_and_model_and_drops_the_effort(cx: &mut TestAppContext) {
     let s = setup(cx);
     let mut w = ticket(json!({}));

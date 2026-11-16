@@ -4,7 +4,7 @@ use super::condition::condition_syntax_problem;
 use super::model::{
     is_node_id, Checkout, Cwd, Handle, Node, NodeId, NodeKind, Requirement, RequirementKind,
     SessionTarget, TargetInstance, Workflow, MAX_PARALLEL_LIMIT, MAX_ROUNDS_LIMIT,
-    MAX_TIMEOUT_MINUTES, SWITCH_DEFAULT,
+    MAX_TIMEOUT_MINUTES, SWITCH_DEFAULT, TEMPLATABLE_TARGET_OPTIONS,
 };
 use super::parse::{is_map_key, is_name};
 use super::template::{js_space, js_trim, shell_template_problems, template_vars};
@@ -627,6 +627,7 @@ impl<'a> Checker<'a> {
         checkout: &Checkout,
         harness: Option<&str>,
         model: Option<&str>,
+        account: Option<&str>,
     ) {
         let at = Some(node.id.as_str());
         if let Some(h) = harness.filter(|h| !h.is_empty() && *h != "claude") {
@@ -656,10 +657,52 @@ impl<'a> Checker<'a> {
                 at,
             ),
         }
+        // A string option may hold a template, filled in when the step starts (and judged then,
+        // before anything is created). Its value cannot be judged now, so it is left out of the
+        // value checks below; its key still counts (an existing instance takes no options, and
+        // `template` does not go with `image`). Any other template is refused.
+        let mut unfilled: Vec<&str> = Vec::new();
         for (key, value) in target.options.iter() {
-            if json_has_template(value) {
+            if !json_has_template(value) {
+                continue;
+            }
+            unfilled.push(key.as_str());
+            if let (super::ordered::Json::String(text), true) =
+                (value, TEMPLATABLE_TARGET_OPTIONS.contains(&key.as_str()))
+            {
+                self.check_text(text, node);
+            } else {
                 self.add(
-                    format!("target.{key} is used as written: {{{{ }}}} templates are not filled in there"),
+                    format!(
+                        "target.{key} is used as written: {{{{ }}}} templates are filled in only in {}",
+                        TEMPLATABLE_TARGET_OPTIONS
+                            .iter()
+                            .map(|k| format!("target.{k}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    at,
+                );
+            }
+        }
+        if let Some(account) = account {
+            if account.trim().is_empty() || account.chars().count() > 128 {
+                self.add(
+                    "account must be a non-empty text of at most 128 characters",
+                    at,
+                );
+            } else if account.contains("{{") {
+                self.add(
+                    "account is used as written: {{ }} templates are not filled in there",
+                    at,
+                );
+            }
+            if !matches!(target.instance, TargetInstance::New) {
+                self.add(
+                    format!(
+                        "account: {} Remove account, or use instance \"new\"",
+                        crate::mono::api::ACCOUNT_EXISTING_INSTANCE
+                    ),
                     at,
                 );
             }
@@ -686,9 +729,10 @@ impl<'a> Checker<'a> {
                 at,
             );
         }
-        if let Err(problem) = crate::mono::cloud_api::validate::validate_target(
+        if let Err(problem) = crate::mono::cloud_api::validate::validate_target_except(
             &serde_json::Value::Object(raw),
             &json!({ "harness": "claude" }),
+            &unfilled,
         ) {
             // With an invalid instance only the kind and the options are judged: the instance
             // was dropped, so a lone "only applies when creating" cannot be said about it.
@@ -798,6 +842,7 @@ impl<'a> Checker<'a> {
                 nest_under,
                 timeout_minutes,
                 target,
+                account,
                 ..
             } => {
                 self.check_project(node, project);
@@ -820,7 +865,22 @@ impl<'a> Checker<'a> {
                     }
                 }
                 if let Some(target) = target {
-                    self.check_target(node, target, checkout, harness.as_deref(), model.as_deref());
+                    self.check_target(
+                        node,
+                        target,
+                        checkout,
+                        harness.as_deref(),
+                        model.as_deref(),
+                        account.as_deref(),
+                    );
+                } else if account.is_some() {
+                    // `sessions.start` takes an account without a target (it picks the provider
+                    // account of a local session). A workflow step does not offer that: its
+                    // account is the one a new cloud instance runs with.
+                    self.add(
+                        "account only applies to a cloud step (one with a target); a local step runs with the Mono's own account",
+                        Some(&node.id),
+                    );
                 }
                 if let Some(target) = nest_under {
                     self.check_session_ref(target, "nestUnder", node);

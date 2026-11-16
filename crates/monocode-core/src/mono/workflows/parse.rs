@@ -167,6 +167,7 @@ pub fn parse_node(raw: &Json) -> Option<Node> {
             nest_under: str_of(raw, "nestUnder"),
             timeout_minutes: num_of(raw, "timeoutMinutes"),
             target: parse_target(raw.get("target"))?,
+            account: str_of(raw, "account"),
         },
         "command" => NodeKind::Command {
             project: str_of(raw, "project")?,
