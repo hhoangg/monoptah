@@ -49,7 +49,10 @@ import {
 import { assetNames } from "./package-native-monoptah.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
-const read = (path) => readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
+// Workflow and doc text is read with LF line ends, so a CRLF checkout (Windows) gives the same text.
+const read = (path) => readFileSync(new URL(`../${path}`, import.meta.url), "utf8").replace(/\r\n/g, "\n");
+// The release dir path as the script builds it (join uses backslashes on Windows).
+const NOTES_OUT = join("/tmp/out", "release-notes.md");
 const V = "0.40.5";
 const SHA = "a".repeat(40);
 
@@ -638,14 +641,14 @@ test("a child killed by a signal is an interrupt, a plain failure is not", () =>
 test("runRelease generates the notes, prints them, writes them to the release dir and uses that file", async () => {
   const { io, events, logs, texts } = fakeIo();
   await runRelease([V], io);
-  const text = texts["/tmp/out/release-notes.md"];
+  const text = texts[NOTES_OUT];
   assert.ok(text.startsWith(`# Monoptah Native ${V}\n\nBody\n\n## Changes since 0.40.4`));
   assert.match(text, /### Features\n\n- New panel \(#7\)/);
   assert.match(text, /### Fixes\n\n- Y is fixed \(#8\)/);
   assert.ok(logs.join("\n").includes("- New panel (#7)"));
   const release = visible(events).find((c) => c.startsWith("gh release create"));
-  assert.ok(release.endsWith("--notes-file /tmp/out/release-notes.md"));
-  assert.ok(events.indexOf("writeText /tmp/out/release-notes.md") < events.findIndex((e) => e.startsWith("visible git tag")));
+  assert.ok(release.endsWith(`--notes-file ${NOTES_OUT}`));
+  assert.ok(events.indexOf(`writeText ${NOTES_OUT}`) < events.findIndex((e) => e.startsWith("visible git tag")));
 });
 
 test("runRelease --dry-run prints the notes and no longer needs a notes heading for this version", async () => {
@@ -654,7 +657,7 @@ test("runRelease --dry-run prints the notes and no longer needs a notes heading 
   const out = logs.join("\n");
   assert.ok(out.includes(`# Monoptah Native ${V}`) && out.includes("- New panel (#7)"));
   assert.match(out, /Ignoring docs\/native\/monoptah-release-notes\.md.*0\.40\.4/);
-  assert.ok(!texts["/tmp/out/release-notes.md"].includes("Old notes"));
+  assert.ok(!texts[NOTES_OUT].includes("Old notes"));
 });
 
 test("runRelease --notes adds highlights and --since overrides the start", async () => {
@@ -667,7 +670,7 @@ test("runRelease --notes adds highlights and --since overrides the start", async
       ? { status: 0, stdout: "", stderr: "" }
       : capture(c, a);
   await runRelease([V, "--dry-run", "--notes", "hl.md", "--since", "native-v0.40.4"], io);
-  assert.match(texts["/tmp/out/release-notes.md"], /^# Monoptah Native 0\.40\.5\n\nHand written\n\n## Changes since 0\.40\.4/);
+  assert.match(texts[NOTES_OUT], /^# Monoptah Native 0\.40\.5\n\nHand written\n\n## Changes since 0\.40\.4/);
 });
 
 test("runRelease stops before the long checks when a PR cannot be read", async () => {
