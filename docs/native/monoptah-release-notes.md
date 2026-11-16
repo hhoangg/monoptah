@@ -1,10 +1,14 @@
-# Monoptah Native 0.53.3
+# Monoptah Native 0.53.4
 
-## Changes since 0.53.2
+## Changes since 0.53.3
 
 ### Fixes
 
-- The footer cloud chip now sits in the same group as the Actions and Terminal buttons, directly right of Terminal (or of the running-terminals chip that replaces it), and uses the same text and icon size. Before, it stood alone at the end of the footer and its label was larger than the other footer buttons. The running-terminals chip now uses the same button style as the rest of the group.
+- Provider sign-in no longer leaves a login process (such as `claude auth login`) running after Monoptah Native ends. The app now stops it when you quit, including a quit from the Dock or at logout, and also when the app is force-quit or crashes. On macOS and Linux, a login process left over from an earlier crash is also stopped at the next start. On Windows, a CLI started through a `.cmd` shim can still leave its `node.exe` behind after a crash. (#135)
+
+### Docs
+
+- The repository now documents its git conventions and has pull request and issue templates. (#136, #137)
 
 ## Downloads and updates
 
