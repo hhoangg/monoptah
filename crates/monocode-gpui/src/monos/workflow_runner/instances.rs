@@ -151,10 +151,57 @@ pub(super) fn text(listed: &[Listed]) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+/// Everything the run used: the sessions of its cloud steps, looked up in the host (the record
+/// of the run names an instance when its session is gone), plus the instances the record kept
+/// as they started, which cover a session the nodes no longer point at.
+pub(super) fn all(
+    run: &WorkflowRun,
+    lookup: impl Fn(&str) -> Option<CloudInstanceInfo>,
+) -> Vec<Listed> {
+    let kept = &run.cloud_instances;
+    let resolve = |session: &str| {
+        // An answer without a name (the instance is not named yet) says nothing the record
+        // does not.
+        lookup(session)
+            .filter(|info| info.name.is_some())
+            .or_else(|| {
+                kept.iter()
+                    .find(|i| i.sessions.iter().any(|s| s == session))
+                    .map(|i| CloudInstanceInfo {
+                        kind: i.kind.clone(),
+                        name: Some(i.name.clone()),
+                    })
+            })
+    };
+    let mut out = listed(&cloud_uses(run), resolve);
+    for instance in kept {
+        let found = out
+            .iter_mut()
+            .find(|l| l.kind == instance.kind && l.name.as_deref() == Some(instance.name.as_str()));
+        match found {
+            Some(listing) => {
+                listing.created |= instance.created;
+                for node in &instance.nodes {
+                    if !listing.nodes.contains(node) {
+                        listing.nodes.push(node.clone());
+                    }
+                }
+            }
+            None => out.push(Listed {
+                kind: instance.kind.clone(),
+                name: Some(instance.name.clone()),
+                created: instance.created,
+                nodes: instance.nodes.clone(),
+            }),
+        }
+    }
+    out
+}
+
 /// The report's section on cloud instances, `None` when the run used none.
 pub(super) fn report_section(
     run: &WorkflowRun,
     lookup: impl Fn(&str) -> Option<CloudInstanceInfo>,
 ) -> Option<String> {
-    text(&listed(&cloud_uses(run), lookup))
+    text(&all(run, lookup))
 }

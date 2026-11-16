@@ -571,7 +571,12 @@ fn a_mono_start_with_an_account_is_refused_before_any_cloud_call_unless_it_is_us
 }
 
 /// Adds a Claude account to the window's accounts and the store, with or without a setup token.
-fn claude_account(s: &Setup, label: &str, token: Option<&str>, cx: &mut TestAppContext) -> String {
+pub(in crate::monos) fn claude_account(
+    s: &Setup,
+    label: &str,
+    token: Option<&str>,
+    cx: &mut TestAppContext,
+) -> String {
     let store = s.store.clone();
     s.window
         .update(cx, |_, _, cx| {
@@ -1668,5 +1673,36 @@ fn a_mono_session_delete_without_cloud_leaves_the_instance_alone(cx: &mut TestAp
             .iter()
             .any(|c| c.contains("codespace stop") || c.contains("codespace delete")),
         "{calls:?}"
+    );
+}
+
+#[gpui::test]
+fn the_workflow_account_check_judges_an_account_the_way_a_start_does(cx: &mut TestAppContext) {
+    let _clis = crate::shell::surface_tests::NoClis::new();
+    let (s, _gh, _host, _guard) = cloud_setup(cx, "Failed");
+    // Built in pieces: an obviously fake token in the shape the dialog accepts.
+    let token = concat!("sk-ant-", "oat01-", "fake-token-for-tests");
+    claude_account(&s, "Work", Some(token), cx);
+    claude_account(&s, "Bare", None, cx);
+    let check = cx
+        .update(|cx| super::host::workflow_account_check(cx))
+        .expect("the accounts are available");
+    // By label, as `sessions.start` takes it.
+    assert_eq!(check("Work"), None);
+    assert_eq!(check("work"), None);
+    // No setup token or API key to deliver: the account without one and the CLI login.
+    for selector in ["Bare", "default"] {
+        assert_eq!(
+            check(selector).as_deref(),
+            Some(super::host::CLOUD_ACCOUNT_NEEDS_TOKEN),
+            "{selector}"
+        );
+    }
+    // No such account: the lookup's own refusal, which never carries a credential.
+    let unknown = check("Nobody").unwrap();
+    assert_ne!(unknown, super::host::CLOUD_ACCOUNT_NEEDS_TOKEN);
+    assert!(
+        !unknown.contains(token) && !unknown.contains("sk-ant"),
+        "{unknown}"
     );
 }

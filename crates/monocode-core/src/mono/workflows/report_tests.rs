@@ -101,6 +101,7 @@ fn run_of(definition: Workflow, nodes: Vec<NodeRun>) -> WorkflowRun {
         nodes,
         report_posted_at: None,
         error: None,
+        cloud_instances: Vec::new(),
     }
 }
 

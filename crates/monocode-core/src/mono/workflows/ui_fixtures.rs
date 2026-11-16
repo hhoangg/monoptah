@@ -42,5 +42,6 @@ pub fn run() -> WorkflowRun {
         nodes: Vec::new(),
         report_posted_at: None,
         error: None,
+        cloud_instances: Vec::new(),
     }
 }

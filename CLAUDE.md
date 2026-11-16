@@ -115,6 +115,19 @@ relinks the large `monocode-gpui` test binary (median 1.4 min, p90 4.1 min).
   ```
 
   Elsewhere use plain `cp -R` (a real copy).
+- **Always build the native workspace with the `native-dev` profile.** Plain `cargo test`,
+  `build`, `check` or `clippy` uses the `dev` profile and fills a second `target/debug` (several
+  GB) that nothing else reuses. Cargo has no setting for a default profile and ignores an alias
+  that shadows a built-in command, so use the aliases in `crates/monocode-gpui/.cargo/config.toml`
+  from inside `crates/monocode-gpui`: `cargo ntest`, `cargo nbuild`, `cargo ncheck`,
+  `cargo nclippy`, `cargo nrun`. From the repo root pass
+  `--manifest-path crates/monocode-gpui/Cargo.toml --profile native-dev`, as the npm scripts do.
+  In `native-dev` the `monocode-gpui` crate is `opt-level = 0` and dependencies are `opt-level = 1`.
+  The `monocode-gpui` and `monocode-core` crates keep `debug = "line-tables-only"`, so panic
+  backtraces show file and line. Do not add `split-debuginfo` to the profiles: `unpacked` is
+  rejected on windows-msvc and `packed` runs dsymutil on every macOS link (about +9s).
+  `npm run worktrees:clean -- --prune-target` removes a leftover `target/debug` and stale
+  incremental data (see the `cleanup-worktree` skill).
 - **Keep tests Linux-portable.** GPUI tests run on Ubuntu in CI. Use `secondary-...`
   keystrokes (cmd on macOS, ctrl elsewhere), never `cmd-...`. Do not assume macOS paths,
   Keychain, WKWebView, AVPlayer or Metal. A test that truly runs only on macOS gets
@@ -140,7 +153,9 @@ relinks the large `monocode-gpui` test binary (median 1.4 min, p90 4.1 min).
 When a session created a PR and that PR is merged, the agent cleans up after itself: its
 worktree, local and remote branch, and any temp worktrees, using the `cleanup-worktree` skill
 (`npm run worktrees:clean`). It refuses anything unmerged, dirty, unpushed, running, or the
-worktree Native Dev runs from, and never forces. Do not delete worktrees by hand.
+worktree Native Dev runs from, and never forces. It never removes `release-main` (the
+build-cache source and release checkout), not even when named explicitly, and `--merged` keeps
+detached-HEAD worktrees (name one explicitly to remove it). Do not delete worktrees by hand.
 
 For the user: `npm run worktrees:clean -- --merged --dry-run` lists what would go and why the
 rest stays, then run it without `--dry-run` to delete (it asks first; non-TTY needs `--yes`).

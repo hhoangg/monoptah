@@ -154,6 +154,7 @@ fn export_node(node: &Node) -> Doc {
             nest_under,
             timeout_minutes,
             target,
+            account,
         } => {
             put(&mut out, "project", Some(text(project)));
             put(&mut out, "harness", harness.as_deref().map(text));
@@ -172,6 +173,7 @@ fn export_node(node: &Node) -> Doc {
             put(&mut out, "reuseSession", reuse_session.map(Doc::Bool));
             put(&mut out, "timeoutMinutes", timeout_minutes.map(number));
             put(&mut out, "target", target.as_ref().map(export_target));
+            put(&mut out, "account", account.as_deref().map(text));
             put(&mut out, "prompt", Some(text(prompt)));
             put(&mut out, "output", Some(export_output(output)));
         }

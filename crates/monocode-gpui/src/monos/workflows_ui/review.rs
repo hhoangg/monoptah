@@ -87,6 +87,7 @@ pub(in crate::monos) fn session_detail(preview: &ImportPreview, node: &Node) -> 
         effort,
         checkout,
         target,
+        account,
         ..
     } = &node.kind
     else {
@@ -123,6 +124,10 @@ pub(in crate::monos) fn session_detail(preview: &ImportPreview, node: &Node) -> 
     parts.push(format!("Checkout: {where_}"));
     if let Some(target) = target {
         parts.push(format!("Runs in: {}", visible(&target.summary())));
+    }
+    // Which account a cloud instance runs with is part of what the user approves.
+    if let Some(account) = account.as_deref().filter(|a| !a.is_empty()) {
+        parts.push(format!("Account: {}", visible(account)));
     }
     Some(parts.join(" \u{b7} "))
 }

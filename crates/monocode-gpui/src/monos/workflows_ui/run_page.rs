@@ -410,6 +410,17 @@ impl Monos {
                         .pt_0()
                         .pb_3()
                 }))
+                // An interrupted run that is never resumed would otherwise forget the cloud
+                // instances it left running. Only named here: nothing is stopped or deleted.
+                .children(run.left_instances_warning().map(|warning| {
+                    alert(warning)
+                        .id("wf-run-instances")
+                        .debug_selector(|| "wf-run-instances".into())
+                        .flex_shrink_0()
+                        .px_4()
+                        .pt_0()
+                        .pb_3()
+                }))
                 .child(
                     div()
                         .relative()

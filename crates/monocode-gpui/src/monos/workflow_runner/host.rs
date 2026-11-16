@@ -470,6 +470,12 @@ impl Monos {
             target.insert("kind".into(), json!(cloud.kind));
             target.insert("instance".into(), instance);
             input["target"] = serde_json::Value::Object(target);
+            // Next to `target`, as in `sessions.start`: `prepare_start` resolves it against the
+            // accounts book (default, id or label), requires a setup token or API key and
+            // refuses an existing instance, all before `begin_start` creates anything.
+            if let Some(account) = &cloud.account {
+                input["account"] = json!(account);
+            }
             monocode_core::mono::cloud_api::validate::validate_target(&input["target"], &input)?;
         }
         let options = StartOptions {
@@ -499,6 +505,7 @@ impl Monos {
                     reuse_session: None,
                     nest_under: None,
                     timeout_minutes: None,
+                    account: None,
                     // Which cloud kind or instance does not matter to the model check; that it is
                     // a cloud step does (Claude runs in the instance, not here).
                     target: req.target.as_ref().map(|cloud| SessionTarget {

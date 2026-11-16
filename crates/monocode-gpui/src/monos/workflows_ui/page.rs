@@ -3,7 +3,7 @@ use super::super::*;
 use super::actions;
 use super::list::workflow_trigger_label;
 use super::requirements::missing_requirements_badge;
-use super::view::{needs_review_badge, notice_line, property, section};
+use super::view::{alert, needs_review_badge, notice_line, property, section};
 use super::{
     super::scheduler::{duration, habit_field, when},
     Pick,
@@ -11,7 +11,7 @@ use super::{
 use monocode_core::mono::workflows::{
     model::{
         InputType, InputValue, NodeKind, RunStatus, Workflow, WorkflowInput, WorkflowRun,
-        trigger_of,
+        interrupted_instances, left_instances_text, trigger_of,
     },
     ordered::js_number_text,
     yaml::{export_path_problem, export_workflow},
@@ -199,6 +199,19 @@ impl Monos {
             None => {}
         }
 
+        // Interrupted runs that are never resumed would forget the instances they left running.
+        let left = interrupted_instances(runs.as_deref().unwrap_or_default());
+        let left_warning = (!left.is_empty()).then(|| {
+            alert(left_instances_text(
+                "The interrupted runs of this workflow",
+                &left,
+            ))
+            .id("mono-workflow-instances")
+            .debug_selector(|| "mono-workflow-instances".into())
+            .flex_shrink_0()
+            .px_4()
+            .pb_2()
+        });
         let missing = self.missing_requirements_section(&w);
         let gate = self.run_gate_dialog(mono, window, cx);
         let (edit, export_w) = (w.id.clone(), w.clone());
@@ -239,6 +252,7 @@ impl Monos {
                         "mono-workflow-notice",
                         self.wf.page_notice.as_deref(),
                     ))
+                    .children(left_warning)
                     .child(info)
                     .children(missing)
                     .when_some(

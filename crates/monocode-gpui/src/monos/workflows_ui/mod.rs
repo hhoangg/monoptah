@@ -350,6 +350,9 @@ impl Monos {
             return;
         };
         let mut host = self.workflow_store(&mono);
+        if let Some(check) = super::host::workflow_account_check(cx) {
+            host = host.with_accounts(check);
+        }
         let task = cx
             .background_executor()
             .spawn(async move { work(&mut host) });

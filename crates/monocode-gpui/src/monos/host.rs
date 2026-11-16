@@ -75,6 +75,41 @@ pub(super) enum Folder {
 /// Refused for a cloud `sessions.start` whose `account` has no setup token or API key.
 pub(super) const CLOUD_ACCOUNT_NEEDS_TOKEN: &str = "A cloud session needs a Claude account with a setup token or API key. Run accounts.list and pick an account whose authKind is setupToken or apiKey.";
 
+/// Why a cloud step cannot run as the account `selector` (`None` when it can): it names no
+/// account, or one without a setup token or API key. The same lookup `prepare_start` makes for
+/// a `sessions.start` with an account and a new cloud instance, so a workflow is judged the way
+/// its step will be. The text never holds a credential.
+pub(super) fn cloud_account_problem(
+    book: &monocode_core::accounts::Book,
+    has_token: impl Fn(&str) -> bool,
+    selector: &str,
+) -> Option<String> {
+    match monocode_core::accounts::resolve(book, Kind::Claude, selector) {
+        Err(error) => Some(error.to_string()),
+        Ok(id) if !has_token(&id) => Some(CLOUD_ACCOUNT_NEEDS_TOKEN.into()),
+        Ok(_) => None,
+    }
+}
+
+/// A snapshot of the accounts as the workflow actions judge a cloud step's account (it is used
+/// off the UI thread, so it holds copies). `None` while the accounts are not available.
+pub(super) fn workflow_account_check(
+    cx: &gpui::App,
+) -> Option<monocode_core::mono::workflows::cli::AccountCheck> {
+    let center = crate::accounts::get(cx)?;
+    let center = center.read(cx);
+    let book = center.book.clone();
+    let with_token: std::collections::HashSet<String> = book
+        .list(Kind::Claude)
+        .into_iter()
+        .map(|account| account.id)
+        .filter(|id| center.uses_claude_token(id))
+        .collect();
+    Some(std::sync::Arc::new(move |selector: &str| {
+        cloud_account_problem(&book, |id| with_token.contains(id), selector)
+    }))
+}
+
 impl Folder {
     fn entry(&self) -> (&str, &str) {
         match self {
@@ -1551,6 +1586,9 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
                 .with_preflight(self.workflow_live.preflight());
                 if let Some(m) = self.roster.get(&target) {
                     host = host.with_projects(m.projects.clone());
+                }
+                if let Some(check) = workflow_account_check(cx) {
+                    host = host.with_accounts(check);
                 }
                 let name = action.clone();
                 self.call_work(

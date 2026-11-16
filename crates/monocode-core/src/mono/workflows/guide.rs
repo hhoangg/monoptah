@@ -5,8 +5,9 @@
 //! The text is the React app's `workflowGuide.ts`, word for word.
 use super::model::{
     DEFAULT_COMMAND_TIMEOUT_MINUTES, DEFAULT_MAX_PARALLEL, DEFAULT_SESSION_TIMEOUT_MINUTES,
-    MAX_PARALLEL_LIMIT, MAX_ROUNDS_LIMIT, MAX_TIMEOUT_MINUTES, WORKFLOWS_MAX,
-    WORKFLOW_DEFINITION_MAX_BYTES, WORKFLOW_DESCRIPTION_MAX, WORKFLOW_NAME_MAX, WORKFLOW_RUNS_KEPT,
+    MAX_PARALLEL_LIMIT, MAX_ROUNDS_LIMIT, MAX_TIMEOUT_MINUTES, TEMPLATABLE_TARGET_OPTIONS,
+    WORKFLOWS_MAX, WORKFLOW_DEFINITION_MAX_BYTES, WORKFLOW_DESCRIPTION_MAX, WORKFLOW_NAME_MAX,
+    WORKFLOW_RUNS_KEPT,
 };
 use super::ordered::Json;
 
@@ -522,7 +523,7 @@ pub fn workflow_guide() -> String {
             r##"- `project` (required, `{{inputs.<name>}}`), `prompt` (required, a template), `checkout` (required): `"root"` (the project's own checkout), `"newWorktree"` (a fresh worktree) or `{"worktreeOf": "<session node id>"}` (continue in the worktree of an earlier session of the same branch; that node must be a session)."##,
             r##"- `output`: the fields the session reports back (see the output contract below). May be `{}`."##,
             r##"- `harness`, `model`, `effort` (optional): see Models."##,
-            r##"- `target` (optional): run this step in a cloud instance (a GitHub codespace or a Docker sandbox) instead of on this computer: `{"kind": "codespace" | "sandbox", "instance"?: "new" | {"sameAs": "<session node id>"}, ...options}`. See Cloud steps."##,
+            r##"- `target` (optional): run this step in a cloud instance (a GitHub codespace or a Docker sandbox) instead of on this computer: `{"kind": "codespace" | "sandbox", "instance"?: "new" | {"sameAs": "<session node id>"}, ...options}`. `account` (optional, only with a `target`): the Claude account a new instance runs with. See Cloud steps."##,
             format!(r##"- `reuseSession` (default true): in a loop, later rounds continue in the same session instead of starting a new one. `nestUnder` (optional): the id of another session node; this session is shown under it in the sidebar. `timeoutMinutes` (default {DEFAULT_SESSION_TIMEOUT_MINUTES}, above 0, at most {MAX_TIMEOUT_MINUTES})."##).as_str(),
             "",
             r##"`command`"##,
@@ -641,10 +642,12 @@ pub fn workflow_guide() -> String {
             r##"- Shape: `"target": {"kind": "codespace" | "sandbox", "instance"?: "new" | {"sameAs": "<session node id>"}, ...options}`. Leaving `instance` out means `"new"`."##,
             r##"- A cloud step runs Claude only. Leave `harness` out (or write `"claude"`) and name no model of another harness."##,
             r##"- `checkout` must be `"root"`. A cloud session works in its instance's own checkout, so `newWorktree` and `worktreeOf` are refused; to start from a branch use `target.branch`, and to share an instance use `sameAs`."##,
-            format!(r##"- Options are written literally: a `{{{{...}}}}` template in an option is not filled in. They apply only to a new instance (not with `sameAs`) and are the same keys `sessions.start` takes in its target: {}."##, option_lists()).as_str(),
+            format!(r##"- Options apply only to a new instance (not with `sameAs`) and are the same keys `sessions.start` takes in its target: {}. Written literally they are checked when the workflow is validated."##, option_lists()).as_str(),
+            format!(r##"- Templates in options: the string options {} may hold `{{{{inputs.<name>}}}}`, an upstream output or a loop variable, like a prompt does (for example `"branch": "{{{{inputs.branch}}}}"`). An unknown variable is a validation issue. The text is filled in when the step starts and is then checked like a literal option; if it is not valid (a branch or machine name, a size), the step fails before any instance is created. `kind` and `instance` (and `cpus` and `kit`) are always literal."##, TEMPLATABLE_TARGET_OPTIONS.iter().map(|k| format!("`{k}`")).collect::<Vec<_>>().join(", ")).as_str(),
+            r##"- `account` (optional, a sibling of `target` on the node, as in `sessions.start`): the app Claude account a NEW instance runs with: `"default"`, an account id or its label (run `accounts.list`). It must be an account with a setup token or an API key (the login of this computer does not travel to an instance). It is refused with `sameAs` (the instance keeps the account it started with) and on a step without a `target`. It is written literally. `workflows.validate` checks its shape; whether the account exists and carries a setup token or API key is checked when the step starts, before an instance is created, and the step fails with that reason. Later loop rounds that go on in the same instance ignore it."##,
             r##"- `{"sameAs": "<id>"}` shares the instance of an earlier cloud session node of the same kind (it must be upstream of this node, and not the node itself)."##,
             r##"- Instances: in a loop with `reuseSession` true, later rounds continue the same session; with `reuseSession` false a later round starts a new session on the same instance as the node's previous round (an instance is never created per round). Each For each item gets its own instance for `"new"`."##,
-            r##"- Lifecycle: the app never stops or deletes an instance when a run ends, fails or is stopped. The run report lists the instances the run used (one that finishes starting after the run was stopped is named in a follow-up message), so the user can stop or delete them in Cloud workspaces. `workflows.stop` stops the running turns, and a session that is still starting, or whose step failed, does not send its prompt later. A resumed run goes on in the instance its interrupted step had; if the app restarted and that instance was ready before the run was resumed, the old first prompt may already have run there."##,
+            r##"- Lifecycle: the app never stops or deletes an instance when a run ends, fails or is stopped. The run report lists the instances the run used (one that finishes starting after the run was stopped is named in a follow-up message), so the user can stop or delete them in Cloud workspaces. Each run record keeps the instances its steps used as they start, so a run that was interrupted and is never resumed still names them: `workflows.get` and `workflows.runs` return them as `cloudInstances` (kind, name, whether the run created it, the steps) with a `cloudInstancesWarning` for an interrupted run, the board shows the same warning, and `workflows.stop` and `workflows.remove` name them in their answers (`cloudInstancesNote`). `workflows.stop` stops the running turns, and a session that is still starting, or whose step failed, does not send its prompt later. A resumed run goes on in the instance its interrupted step had; if the app restarted and that instance was ready before the run was resumed, the old first prompt may already have run there."##,
             r##"- `timeoutMinutes` includes the time the instance takes to start."##,
             r##"- A local session cannot use `checkout` `worktreeOf` a cloud node, and a command cannot use `cwd` `worktreeOf` one: the cloud node has no local worktree."##,
         ],
@@ -951,6 +954,11 @@ mod tests {
             "same instance as the node's previous round",
             "Each For each item gets its own instance",
             "no local worktree",
+            "Templates in options",
+            "`\"branch\": \"{{inputs.branch}}\"`",
+            "before any instance is created",
+            "`account` (optional, a sibling of `target`",
+            "`cloudInstancesWarning`",
         ] {
             assert!(guide.contains(point), "{point}");
         }

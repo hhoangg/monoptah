@@ -1,0 +1,12 @@
+# Cargo cannot change the default profile, and it ignores an alias that shadows a built-in
+# command (`test = ...` has no effect), so plain `cargo test` here still uses the `dev`
+# profile and writes to target/debug. These aliases pick native-dev for you. Use them from
+# inside crates/monocode-gpui (cargo reads this file by working directory); from the repo
+# root, pass `--manifest-path crates/monocode-gpui/Cargo.toml --profile native-dev` instead,
+# as the npm scripts do.
+[alias]
+nbuild = "build --locked --profile native-dev"
+ncheck = "check --locked --profile native-dev"
+nclippy = "clippy --locked --profile native-dev"
+nrun = "run --locked --profile native-dev"
+ntest = "test --locked --profile native-dev"

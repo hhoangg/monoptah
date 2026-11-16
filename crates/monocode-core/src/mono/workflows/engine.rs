@@ -1098,6 +1098,7 @@ pub fn start_run(def: &Workflow, trigger: RunTrigger, now: u64, id: &str) -> Wor
         nodes,
         report_posted_at: None,
         error: None,
+        cloud_instances: Vec::new(),
     };
     let mut d = draft_of(run, &definition, now);
     // A schedule trigger exposes when it fired; a manual one has nothing to expose.

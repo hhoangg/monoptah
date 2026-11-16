@@ -18,7 +18,8 @@ use monocode_core::mono::workflows::{
     },
     model::{
         Checkout, Cwd, DEFAULT_COMMAND_TIMEOUT_MINUTES, DEFAULT_SESSION_TIMEOUT_MINUTES, Node,
-        NodeKind, NodeRun, NodeStatus, RunStatus, SessionTarget, TargetInstance, WorkflowRun,
+        NodeKind, NodeRun, NodeStatus, RunInstance, RunStatus, SessionTarget,
+        TEMPLATABLE_TARGET_OPTIONS, TargetInstance, WorkflowRun,
     },
     ordered::{Json, OrderedMap, js_number_text},
     output::{output_reask, parse_workflow_output},
@@ -266,13 +267,18 @@ impl Exec {
     /// The instance a cloud step asks for, resolved against this run, or why it cannot be.
     /// `sameAs` is the instance of that node's session in this branch; a `new` step in a later
     /// loop round (a new session each round) goes on in the instance of its previous round.
-    /// Options only apply when an instance is created, so they are dropped for an existing one.
+    /// Options and the account only apply when an instance is created, so they are dropped for an
+    /// existing one. The string options are filled in from the run (like a prompt) and the
+    /// RENDERED target is judged again here, so a value that is not valid fails the step before
+    /// anything is created. The account is checked for shape here; whether it exists and carries
+    /// a setup token or API key is checked by the start itself, before an instance is created.
     fn cloud_request(
         &self,
         node_id: &str,
         branch: &str,
         checkout: &Checkout,
         target: &SessionTarget,
+        account: Option<&str>,
     ) -> Result<CloudRequest, String> {
         if *checkout != Checkout::Root {
             return Err(
@@ -289,6 +295,11 @@ impl Exec {
             })?
             .api_name()
             .to_string();
+        // The account belongs to the instance: a step that names an existing one (validation
+        // refuses it) never takes an account.
+        if account.is_some() && !matches!(target.instance, TargetInstance::New) {
+            return Err(monocode_core::mono::api::ACCOUNT_EXISTING_INSTANCE.into());
+        }
         let instance = match &target.instance {
             TargetInstance::New => match self.previous_round_session(node_id, branch) {
                 Some(previous) => CloudInstance::OfSession(previous),
@@ -302,19 +313,122 @@ impl Exec {
                 return Err("The cloud instance of this step is not valid: use \"new\" or {\"sameAs\": \"<session node id>\"}".into());
             }
         };
-        let options = match instance {
-            CloudInstance::New => target
-                .options
-                .iter()
-                .map(|(key, value)| (key.clone(), value.to_value()))
-                .collect(),
-            CloudInstance::OfSession(_) => serde_json::Map::new(),
+        let (options, account) = match instance {
+            CloudInstance::New => {
+                let options = self.rendered_options(node_id, branch, target)?;
+                let mut asked = options.clone();
+                asked.insert("kind".into(), serde_json::json!(kind));
+                asked.insert("instance".into(), serde_json::json!("new"));
+                monocode_core::mono::cloud_api::validate::validate_target(
+                    &serde_json::Value::Object(asked),
+                    &serde_json::json!({ "harness": "claude" }),
+                )
+                .map_err(|problem| format!("The cloud target is not valid: {problem}"))?;
+                if let Some(account) = account
+                    && (account.trim().is_empty() || account.chars().count() > 128)
+                {
+                    return Err(
+                        "The cloud account must be a non-empty text of at most 128 characters"
+                            .into(),
+                    );
+                }
+                (options, account.map(str::to_owned))
+            }
+            CloudInstance::OfSession(_) => (serde_json::Map::new(), None),
         };
         Ok(CloudRequest {
             kind,
             instance,
             options,
+            account,
         })
+    }
+
+    /// The options of a new instance with the `{{...}}` of the string options filled in from the
+    /// run (inputs, upstream outputs, the loop item), the way a prompt is. A template anywhere
+    /// else is refused: validation never lets one through, and an unfilled one is not a value.
+    fn rendered_options(
+        &self,
+        node_id: &str,
+        branch: &str,
+        target: &SessionTarget,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+        let scope = run_scope(&self.state.borrow().run, branch, Some(node_id));
+        let mut options = serde_json::Map::new();
+        for (key, value) in target.options.iter() {
+            let rendered = match value {
+                Json::String(text)
+                    if text.contains("{{")
+                        && TEMPLATABLE_TARGET_OPTIONS.contains(&key.as_str()) =>
+                {
+                    serde_json::Value::String(render_template(text, &scope, false))
+                }
+                other => {
+                    let plain = other.to_value();
+                    if plain.to_string().contains("{{") {
+                        return Err(format!(
+                            "target.{key} cannot hold a template: it is used as written"
+                        ));
+                    }
+                    plain
+                }
+            };
+            options.insert(key.clone(), rendered);
+        }
+        Ok(options)
+    }
+
+    /// Keeps the instance a cloud session runs on in the run record, as soon as it has a name,
+    /// so a run that is interrupted and never resumed still says what it left running. The
+    /// instance is only read from the host's store; nothing is woken, stopped or deleted.
+    fn record_instance(self: &Rc<Self>, node_id: &str, session_id: &str, created: bool) {
+        let Some(info) = self.host.cloud_instance(session_id) else {
+            return;
+        };
+        let Some(name) = info.name else {
+            return;
+        };
+        self.record_named_instance(node_id, &info.kind, name, Some(session_id), created);
+    }
+
+    /// The same for an instance whose name is known without a session: one a start created
+    /// before it failed (its error says so), which is billable all the same.
+    fn record_named_instance(
+        self: &Rc<Self>,
+        node_id: &str,
+        kind: &str,
+        name: String,
+        session_id: Option<&str>,
+        created: bool,
+    ) {
+        {
+            let mut state = self.state.borrow_mut();
+            let kept = &mut state.run.cloud_instances;
+            let at = match kept.iter().position(|i| i.kind == kind && i.name == name) {
+                Some(at) => at,
+                None => {
+                    kept.push(RunInstance {
+                        kind: kind.to_string(),
+                        name,
+                        created: false,
+                        nodes: Vec::new(),
+                        sessions: Vec::new(),
+                    });
+                    kept.len() - 1
+                }
+            };
+            let entry = &mut kept[at];
+            entry.created |= created;
+            if !entry.nodes.iter().any(|n| n == node_id) {
+                entry.nodes.push(node_id.to_string());
+            }
+            if let Some(session_id) = session_id
+                && !entry.sessions.iter().any(|s| s == session_id)
+            {
+                entry.sessions.push(session_id.to_string());
+            }
+        }
+        self.save();
     }
 
     /// An earlier session of this node in this branch (an earlier loop round, or one an
@@ -366,9 +480,9 @@ impl Exec {
         node_id: &str,
         branch: &str,
         session_id: &str,
-        cloud: bool,
+        cloud: Option<bool>,
     ) {
-        if cloud {
+        if let Some(created) = cloud {
             let session = session_id.to_string();
             self.patch_node(node_id, branch, |n| {
                 let kept = n.interrupted_sessions.get_or_insert_with(Vec::new);
@@ -376,10 +490,11 @@ impl Exec {
                     kept.push(session);
                 }
             });
+            self.record_instance(node_id, session_id, created);
         }
         let _ = self.host.stop(session_id).await;
         self.host.end_approvals(session_id);
-        if cloud {
+        if cloud.is_some() {
             let run = self.state.borrow().run.clone();
             if run.report_posted_at.is_some()
                 && let Some(listing) =
@@ -504,6 +619,7 @@ impl Exec {
                     nest_under,
                     timeout_minutes,
                     target,
+                    account,
                     ..
                 },
             ..
@@ -529,7 +645,7 @@ impl Exec {
             // fails the node here, and a step that slips past validation never starts an instance.
             let cloud = match target
                 .as_ref()
-                .map(|t| self.cloud_request(&node_id, &branch, &checkout, t))
+                .map(|t| self.cloud_request(&node_id, &branch, &checkout, t, account.as_deref()))
             {
                 None => None,
                 Some(Ok(request)) => Some(request),
@@ -563,6 +679,11 @@ impl Exec {
                 )
             };
             let is_cloud = cloud.is_some();
+            // Only a step that asks for a new instance creates one: a later round or a resumed
+            // step goes on in an instance that exists.
+            let creates = cloud
+                .as_ref()
+                .is_some_and(|c| c.instance == CloudInstance::New);
             // A cloud session an interrupted run left behind may still hold its first prompt:
             // it is dropped so it does not run unattended next to this new session. The instance
             // is left alone.
@@ -615,7 +736,7 @@ impl Exec {
                                     &node_id,
                                     &branch,
                                     &late.session_id,
-                                    is_cloud,
+                                    is_cloud.then_some(creates),
                                 )
                                 .await;
                             }
@@ -624,7 +745,23 @@ impl Exec {
                     return;
                 }
                 Either::Left(Err(_)) | Either::Left(Ok(Ok(None))) => return,
-                Either::Left(Ok(Err(error))) => return self.fail(&node_id, &branch, error),
+                Either::Left(Ok(Err(error))) => {
+                    // A start can fail after it created the instance (its error says so, and
+                    // the instance is kept): it is billable all the same, so the run names it.
+                    if is_cloud
+                        && let Some((_, kind, name)) =
+                            monocode_core::cloud_sessions::split_created_note(&error)
+                    {
+                        self.record_named_instance(
+                            &node_id,
+                            kind.api_name(),
+                            name.to_string(),
+                            None,
+                            true,
+                        );
+                    }
+                    return self.fail(&node_id, &branch, error);
+                }
                 Either::Left(Ok(Ok(Some(started)))) => started,
             };
             if let Some(folder) = started.folder_id {
@@ -638,9 +775,19 @@ impl Exec {
             }
             if !self.live() {
                 // Stopped while it was starting: nothing else knows this session yet.
-                self.settle_late_session(&node_id, &branch, &started.session_id, is_cloud)
-                    .await;
+                self.settle_late_session(
+                    &node_id,
+                    &branch,
+                    &started.session_id,
+                    is_cloud.then_some(creates),
+                )
+                .await;
                 return;
+            }
+            // Kept in the run record at once: an interrupted run that is never resumed still
+            // says what it left running.
+            if is_cloud {
+                self.record_instance(&node_id, &started.session_id, creates);
             }
             (started.session_id, started.settled)
         };

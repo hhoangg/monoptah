@@ -468,20 +468,55 @@ pub fn last_run_of(
     }
 }
 
-/// The newest runs that fit: at most 20 and under the size budget, never fewer than one. Entries
-/// that could not be read follow them, untouched.
+/// How many older interrupted runs that still name cloud instances are kept past the newest 20.
+/// Such a record is the only place that names the instances the run left running, so it is not
+/// trimmed with the ordinary history (beyond this many, the oldest go).
+pub const PINNED_RUNS_KEPT: usize = 20;
+
+/// An interrupted run that names cloud instances (read from its stored JSON).
+fn names_left_instances(run: &Json) -> bool {
+    run.get("status").and_then(Json::as_str) == Some("interrupted")
+        && run
+            .get("cloudInstances")
+            .and_then(Json::as_array)
+            .is_some_and(|list| !list.is_empty())
+}
+
+/// The newest runs that fit: at most 20 and under the size budget, never fewer than one, plus
+/// (up to `PINNED_RUNS_KEPT`) older interrupted runs that name cloud instances. Under the size
+/// budget the ordinary old runs go first. Entries that could not be read follow them, untouched.
 fn serialize_runs(runs: &[Json], unreadable: &[Json]) -> String {
-    let mut kept: Vec<String> = runs
-        .iter()
-        .take(WORKFLOW_RUNS_KEPT)
-        .map(list_entry)
-        .collect();
-    let rest: Vec<String> = unreadable.iter().map(list_entry).collect();
-    while kept.len() > 1 && list_len(kept.iter().chain(&rest).map(String::len)) > RUNS_FILE_BUDGET {
-        kept.pop();
+    let mut pinned_kept = 0;
+    let mut kept: Vec<(String, bool)> = Vec::new();
+    for (at, run) in runs.iter().enumerate() {
+        let pinned = names_left_instances(run);
+        if at < WORKFLOW_RUNS_KEPT {
+            kept.push((list_entry(run), pinned));
+        } else if pinned && pinned_kept < PINNED_RUNS_KEPT {
+            pinned_kept += 1;
+            kept.push((list_entry(run), true));
+        }
     }
-    kept.extend(rest);
-    pretty_list(&kept)
+    let rest: Vec<String> = unreadable.iter().map(list_entry).collect();
+    let size = |kept: &[(String, bool)]| {
+        list_len(
+            kept.iter()
+                .map(|(t, _)| t.len())
+                .chain(rest.iter().map(String::len)),
+        )
+    };
+    while kept.len() > 1 && size(&kept) > RUNS_FILE_BUDGET {
+        // The oldest ordinary run first; a pinned one (the oldest) only when nothing else is left
+        // to drop. The newest run (index 0) is never dropped: it is the run just written.
+        let at = kept[1..]
+            .iter()
+            .rposition(|(_, pinned)| !pinned)
+            .map_or(kept.len() - 1, |at| at + 1);
+        kept.remove(at);
+    }
+    let mut lines: Vec<String> = kept.into_iter().map(|(text, _)| text).collect();
+    lines.extend(rest);
+    pretty_list(&lines)
 }
 
 /// Change a workflow's run history the same way, keeping only the newest runs. `edit` gets the

@@ -249,6 +249,12 @@ pub enum TargetInstance {
     Invalid(Json),
 }
 
+/// The option keys of a target whose value may hold `{{...}}` templates: the string valued ones.
+/// `kind` and `instance` always stay literal (they decide whether an instance is made at all),
+/// and so do `cpus` (a number) and `kit` (a fixed choice).
+pub const TEMPLATABLE_TARGET_OPTIONS: [&str; 6] =
+    ["branch", "machine", "memory", "ttl", "template", "image"];
+
 impl SessionTarget {
     /// A short line for the board and the review: "Codespace (new)", "Sandbox (same as build)".
     /// A kind this app does not know is shown as written, and a bad instance as "invalid".
@@ -323,6 +329,11 @@ pub enum NodeKind {
         /// Run in a cloud instance instead of on this computer.
         #[serde(skip_serializing_if = "Option::is_none")]
         target: Option<SessionTarget>,
+        /// The app Claude account (`"default"`, an id or a label) a NEW cloud instance runs
+        /// with, as in `sessions.start`, where it sits next to `target`. Only a cloud step
+        /// with a new instance takes one (validation refuses the rest).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
     },
     #[serde(rename_all = "camelCase")]
     Command {
@@ -857,4 +868,78 @@ pub struct WorkflowRun {
     pub report_posted_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The cloud instances this run started or went on in, kept as they start so a run that is
+    /// interrupted and never resumed still says what it left running. Old records have none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cloud_instances: Vec<RunInstance>,
+}
+
+/// One cloud instance a run used. The app never stops or deletes it on its own.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunInstance {
+    /// `codespace` or `sandbox`.
+    pub kind: String,
+    pub name: String,
+    /// The run made this instance (and did not only go on in one that existed).
+    #[serde(default)]
+    pub created: bool,
+    /// The nodes that ran on it.
+    #[serde(default)]
+    pub nodes: Vec<NodeId>,
+    /// The persisted ids of the sessions that ran on it.
+    #[serde(default)]
+    pub sessions: Vec<String>,
+}
+
+impl RunInstance {
+    /// "Codespace octo-run" / "Sandbox claude-app".
+    pub fn label(&self) -> String {
+        let kind = match self.kind.as_str() {
+            "codespace" => "Codespace",
+            "sandbox" => "Sandbox",
+            other => other,
+        };
+        format!("{kind} {}", self.name)
+    }
+}
+
+impl WorkflowRun {
+    /// The instances an interrupted run left running, as one sentence for the board and the
+    /// answers of `workflows.get`, `workflows.stop` and `workflows.remove`. `None` unless the
+    /// run is interrupted and used an instance. Nothing here stops or deletes anything.
+    pub fn left_instances_warning(&self) -> Option<String> {
+        if self.status != RunStatus::Interrupted || self.cloud_instances.is_empty() {
+            return None;
+        }
+        Some(left_instances_text("This run", &self.cloud_instances))
+    }
+}
+
+/// The distinct instances (by kind and name) the interrupted runs among `runs` used. Their
+/// reports never came, so removing the workflow would make the app forget them.
+pub fn interrupted_instances(runs: &[WorkflowRun]) -> Vec<RunInstance> {
+    let mut out: Vec<RunInstance> = Vec::new();
+    for run in runs.iter().filter(|r| r.status == RunStatus::Interrupted) {
+        for instance in &run.cloud_instances {
+            if !out
+                .iter()
+                .any(|o| o.kind == instance.kind && o.name == instance.name)
+            {
+                out.push(instance.clone());
+            }
+        }
+    }
+    out
+}
+
+/// "This run left 2 cloud instances running: Codespace a, Sandbox b. ..." for `who`.
+pub fn left_instances_text(who: &str, instances: &[RunInstance]) -> String {
+    let labels: Vec<String> = instances.iter().map(RunInstance::label).collect();
+    format!(
+        "{who} left {} cloud instance{} running: {}. The app never stops or deletes them on its own: stop or delete them from Cloud workspaces.",
+        instances.len(),
+        if instances.len() == 1 { "" } else { "s" },
+        labels.join(", ")
+    )
 }

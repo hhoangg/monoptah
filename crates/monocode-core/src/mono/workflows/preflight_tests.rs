@@ -125,6 +125,7 @@ fn session_node(id: &str) -> Node {
             nest_under: None,
             timeout_minutes: None,
             target: None,
+            account: None,
         },
     )
 }

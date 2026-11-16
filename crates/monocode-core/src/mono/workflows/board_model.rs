@@ -711,6 +711,7 @@ pub fn new_node(ty: NodeType, w: &Workflow) -> Node {
             nest_under: None,
             timeout_minutes: None,
             target: None,
+            account: None,
         },
         NodeType::Command => NodeKind::Command {
             project: default_project(w),
