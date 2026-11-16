@@ -1,4 +1,5 @@
-//! The cloud status chip at the far right end of the footer, after the terminal controls: how many
+//! The cloud status chip in the footer, the last item of the terminal controls group (right of
+//! Terminal, or of the running-terminals chip that replaces it): how many
 //! cloud workspaces (codespaces and Docker sandboxes) of the open project there are and in which
 //! state (running, stopping, stopped, failed, deleting, unknown), so a forgotten one that keeps
 //! billing, or a Stop that is not finishing, is visible without opening anything. Clicking it (or
@@ -29,7 +30,7 @@ use crate::{
 };
 use gpui::{
     Context, EventEmitter, FocusHandle, Focusable, Render, Role, SharedString, Window, div,
-    prelude::*, px,
+    prelude::*,
 };
 use monocode_core::cloud_sessions::footer_status::{FooterEntry, FooterStatus};
 use std::time::Duration;
@@ -294,8 +295,8 @@ impl Render for CloudChip {
         } else {
             content(0.55)
         };
-        // The same button the footer's Terminal control is, so the chip reads at the footer's
-        // text size wherever it sits in the row.
+        // The same button the footer's Terminal control is: the shell places it as the last item
+        // of the terminal controls group, so it carries no margins of its own.
         footer_button(classic)
             .id("cloud-status-chip")
             .debug_selector(|| "cloud-status-chip".into())
@@ -308,10 +309,6 @@ impl Render for CloudChip {
             .track_focus(&self.focus)
             .key_context("CloudChip")
             .tab_index(0)
-            // Its place at the end of the shell's footer row: a gap from the terminal controls,
-            // and the margins the usage chip's own footer has.
-            .ml(px(4.))
-            .when(!classic, |d| d.mr(px(8.)).mb(px(2.)))
             .text_color(color)
             .when(warns, |d| d.bg(warning_color().opacity(0.14)))
             .cursor_pointer()
@@ -558,7 +555,7 @@ mod tests {
         visual.refresh().unwrap();
         visual.run_until_parked();
         let at = visual.debug_bounds("cloud-status-chip").expect("the chip");
-        assert!(at.size.width > px(20.), "{at:?}");
+        assert!(at.size.width > gpui::px(20.), "{at:?}");
         assert_eq!(label(&status_of(&window, cx)), "2 running, 1 stopped");
 
         // Only a stopped workspace: the chip stays, in its normal style, and opens the drawer.

@@ -1014,8 +1014,23 @@ impl Shell {
             })
             .into_any_element()
     }
-    /// UsageFooter's right side: the running-terminal chip, else the
-    /// Terminal button.
+    /// The cloud chip as the last item of the footer's terminal controls group, with the group's
+    /// separator before it when something precedes it. Nothing at all (no separator, no gap) while
+    /// the chip is hidden.
+    pub(super) fn cloud_chip_item(&self, lead: bool, cx: &App) -> Vec<AnyElement> {
+        let chip = self.usage_footer.read(cx).cloud_chip().clone();
+        if !chip.read(cx).visible() {
+            return Vec::new();
+        }
+        let mut items = Vec::with_capacity(2);
+        if lead {
+            items.push(footer_separator().into_any_element());
+        }
+        items.push(chip.into_any_element());
+        items
+    }
+    /// UsageFooter's right side: Actions, then the running-terminal chip, else the
+    /// Terminal button, then the cloud chip.
     pub(super) fn terminal_footer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.app_view_open() || self.workspace.project.is_empty() {
             self.live_mark = None;
@@ -1039,8 +1054,10 @@ impl Shell {
         // over the footer's terminal controls.
         if self.terminal_in_panel(cx) || self.terminal_in_title() {
             self.live_mark = None;
-            return Some(group.into_any_element());
+            let cloud = self.cloud_chip_item(has_actions, cx);
+            return Some(group.children(cloud).into_any_element());
         }
+        let cloud = self.cloud_chip_item(true, cx);
         if running.is_empty() {
             self.live_mark = None;
             let has_terminals = self
@@ -1085,6 +1102,7 @@ impl Shell {
                                 cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx)),
                             ),
                     )
+                    .children(cloud)
                     .into_any_element(),
             );
         }
@@ -1111,8 +1129,11 @@ impl Shell {
             group
                 .when(has_actions, |d| d.child(footer_separator()))
                 .child(
-                    div()
+                    // The same button as Terminal and the cloud chip, except that a long process
+                    // name may shrink it.
+                    footer_button(classic)
                         .id("footer-running-terminals")
+                        .debug_selector(|| "footer-running-terminals".into())
                         .role(Role::Button)
                         .aria_label(aria)
                         .aria_description(description)
@@ -1123,21 +1144,9 @@ impl Shell {
                             )
                         })
                         .relative()
-                        .map(|d| {
-                            // `-mx-1` pulls the hover wash to the footer's edge;
-                            // the left pull would close the gap after Actions.
-                            if classic {
-                                d.mr(px(-4.)).px(px(4.)).rounded_md()
-                            } else {
-                                d.h(px(20.)).px_2().rounded_full()
-                            }
-                        })
+                        .flex_shrink(1.)
                         .max_w(px(256.))
                         .min_w_0()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.))
-                        .whitespace_nowrap()
                         .text_color(content(0.55))
                         .hover(|s| s.bg(content(0.1)).text_color(content(1.)))
                         .child(anchor.probe())
@@ -1163,6 +1172,7 @@ impl Shell {
                             }
                         })),
                 )
+                .children(cloud)
                 .into_any_element(),
         )
     }
@@ -1190,10 +1200,10 @@ impl Shell {
 }
 
 /// The space between the footer's right-hand buttons: the resource chip,
-/// Actions, and Terminal or the running-terminals chip.
+/// Actions, Terminal or the running-terminals chip, and the cloud chip.
 pub(super) const FOOTER_GAP: f32 = 4.;
 
-/// A short hairline between footer controls: High usage, actions, Terminal.
+/// A short hairline between footer controls: High usage, actions, Terminal, the cloud chip.
 pub(super) fn footer_separator() -> gpui::Div {
     div()
         .debug_selector(|| "footer-separator".into())

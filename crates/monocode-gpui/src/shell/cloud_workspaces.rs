@@ -344,6 +344,17 @@ mod tests {
                 shell.update_usage_provider(cx);
             })
             .unwrap();
+        // Hidden (nothing listed yet), the chip adds nothing to the footer: no chip, and the
+        // Terminal button still ends the group, with no separator or gap left after it.
+        let hidden_terminal = {
+            let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+            visual.refresh().unwrap();
+            visual.run_until_parked();
+            assert!(visual.debug_bounds("cloud-status-chip").is_none());
+            visual
+                .debug_bounds("footer-terminal")
+                .expect("the terminal button is in the footer row")
+        };
         chip.update(cx, |chip, cx| {
             assert_eq!(chip.project(), w.checkout.path());
             chip.set_env(env, cx);
@@ -352,7 +363,8 @@ mod tests {
         cx.run_until_parked();
         assert!(chip.read_with(cx, |chip, _| chip.visible()));
 
-        // Clicking it opens the drawer, and it is the last thing at the right of the footer.
+        // Clicking it opens the drawer. It is the last item of the terminal controls group,
+        // right after the Terminal button.
         let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
         visual.refresh().unwrap();
         visual.run_until_parked();
@@ -360,21 +372,26 @@ mod tests {
             .debug_bounds("cloud-status-chip")
             .expect("the chip is in the footer")
             .center();
-        // The chip is the outermost element of the footer row: right of the usage footer and of
-        // the terminal controls, with only the row's small margin left to the window edge.
         let footer = visual.debug_bounds("usage-footer").expect("the footer");
         let terminal = visual
             .debug_bounds("footer-terminal")
             .expect("the terminal button is in the footer row");
         let chip_bounds = visual.debug_bounds("cloud-status-chip").unwrap();
-        let window_width = visual.update(|window, _| window.viewport_size().width);
         assert!(
-            chip_bounds.left() >= terminal.right() && chip_bounds.left() >= footer.right(),
-            "{footer:?} {terminal:?} {chip_bounds:?}"
+            chip_bounds.left() >= footer.right(),
+            "{footer:?} {chip_bounds:?}"
         );
-        assert!(
-            window_width - chip_bounds.right() <= gpui::px(16.),
-            "{window_width:?} {chip_bounds:?}"
+        // Directly right of Terminal: the group's gap, its separator, the gap again.
+        assert_eq!(
+            chip_bounds.left() - terminal.right(),
+            GROUP_STEP,
+            "{terminal:?} {chip_bounds:?}"
+        );
+        // The group did not move: the chip ends where Terminal ended while the chip was hidden.
+        assert_eq!(
+            chip_bounds.right(),
+            hidden_terminal.right(),
+            "{hidden_terminal:?} {chip_bounds:?}"
         );
         // It reads like the Terminal button beside it: the same text size (so the same line
         // box), the same height and the same vertical centre.
@@ -526,6 +543,68 @@ mod tests {
         visual.refresh().unwrap();
         assert!(drawer_open(&window, &visual), "the removal was cancelled");
         assert!(visual.debug_bounds("cloud-workspaces-drawer").is_some());
+    }
+
+    /// From the right edge of one footer group item to the left edge of the next: the group's gap,
+    /// the separator (its margins and hairline), the gap again.
+    const GROUP_STEP: gpui::Pixels =
+        gpui::px(2. * crate::shell::terminal_dock::FOOTER_GAP + 3. + 1. + 3.);
+
+    #[gpui::test]
+    fn the_footer_chip_follows_the_running_terminals_chip_in_both_layouts(cx: &mut TestAppContext) {
+        let (window, w, chip) = window_with_chip(cx);
+        let project = w.checkout.path();
+        window
+            .update(cx, |shell, window, cx| {
+                shell.workspace.add_project(&project);
+                shell.select_project(project.clone(), window, cx);
+            })
+            .unwrap();
+        chip_reports(&chip, &project, cx);
+        // A terminal of the project runs a process: its chip replaces the Terminal button.
+        window
+            .update(cx, |shell, window, cx| {
+                shell.new_terminal(window, cx);
+                for t in &shell.terminals[&project] {
+                    t.update(cx, |t, _| t.foreground = Some("sleep".into()));
+                }
+                cx.notify();
+            })
+            .unwrap();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        for boxy in [false, true] {
+            window
+                .update(&mut visual, |shell, _, cx| {
+                    shell.workspace.new_layout_boxy = boxy;
+                    cx.notify();
+                })
+                .unwrap();
+            visual.refresh().unwrap();
+            visual.run_until_parked();
+            visual.refresh().unwrap();
+            assert!(
+                visual.debug_bounds("footer-terminal").is_none(),
+                "boxy {boxy}: the running chip replaces Terminal"
+            );
+            let running = visual
+                .debug_bounds("footer-running-terminals")
+                .unwrap_or_else(|| panic!("boxy {boxy}: the running-terminals chip"));
+            let cloud = visual
+                .debug_bounds("cloud-status-chip")
+                .unwrap_or_else(|| panic!("boxy {boxy}: the cloud chip"));
+            assert_eq!(
+                cloud.left() - running.right(),
+                GROUP_STEP,
+                "boxy {boxy}: {running:?} {cloud:?}"
+            );
+            // The same footer button: the same height on the same line.
+            assert_eq!(
+                (cloud.size.height, cloud.center().y),
+                (running.size.height, running.center().y),
+                "boxy {boxy}: {running:?} {cloud:?}"
+            );
+            assert_eq!(cloud.size.height, gpui::px(20.), "boxy {boxy}");
+        }
     }
 
     /// A window whose footer chip reads the fixtures' fake `gh` and `sbx` (never the real ones).
