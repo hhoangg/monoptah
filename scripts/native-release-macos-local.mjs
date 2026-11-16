@@ -8,9 +8,13 @@
 //
 // usage: npm run native:release:mac -- X.Y.Z [--dry-run] [--recheck]
 //          [--since REF] [--notes FILE] [--ci-timeout MINUTES]
-//   --dry-run runs every check, builds and packages, then prints the files, the
-//   generated release notes and the commands it would run, without tagging,
-//   pushing or publishing.
+//   --dry-run is optional. A real run is safe on its own: every check, the
+//   native:check, the build, the package step and the wait for native.yml all
+//   happen before anything is tagged, so a failure leaves nothing behind. The
+//   dry run stays for testing changes to this script: it runs the checks, builds
+//   and packages, then prints the files, the generated release notes, the CI
+//   state and the commands it would run. It never dispatches an early CI run,
+//   waits for CI, tags, pushes or publishes.
 //   --recheck runs npm run native:check even when a stamp says it already passed
 //   for this commit and this rustc (see checkStamp).
 //   --since REF starts the generated release notes at REF (a tag or commit)
