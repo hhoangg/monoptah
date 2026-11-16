@@ -187,10 +187,10 @@ function fakeRun(overrides = {}) {
     [`gh api repos/hhoangg/monoptah/releases/tags/native-v${V}`]: { status: 1, stderr: "gh: Not Found (HTTP 404)" },
     "git tag --list native-v*": { status: 0, stdout: "native-v0.40.4\nnative-v0.40.5-preview.1\n" },
     "git merge-base --is-ancestor native-v0.40.4 HEAD": { status: 0 },
-    "git log --first-parent --format=%H%x1f%s%x1f%b%x1e native-v0.40.4..HEAD": {
+    "git log --first-parent -z --format=%H%n%s%n%b native-v0.40.4..HEAD": {
       status: 0,
       stdout:
-        "c1\x1ffeat(ui): new panel (#7)\x1f\x1e\nc2\x1fMerge pull request #8 from hhoangg/fix/y\x1ffix: y\x1f\x1e\n",
+        "c1\nfeat(ui): new panel (#7)\n\0c2\nMerge pull request #8 from hhoangg/fix/y\nfix: y\n\0",
     },
     "gh api repos/hhoangg/monoptah/pulls/7 --jq {title: .title, labels: [.labels[].name]}": {
       status: 0,

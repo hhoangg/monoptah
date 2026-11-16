@@ -23,19 +23,19 @@ export const GROUPS = [
   "Fixes",
   "Performance",
   "Reverts",
-  "Other user-visible changes",
   "Other changes",
 ];
-// Skipped unless the PR carries this label.
+// Skipped unless the PR carries this label (then listed under "Other changes").
 export const USER_VISIBLE_LABEL = "user-visible";
 const TYPE_GROUP = {
   feat: "Features",
   fix: "Fixes",
   perf: "Performance",
   revert: "Reverts",
-  refactor: "Other user-visible changes",
 };
-const SKIPPED_TYPES = new Set(["docs", "chore", "ci", "test", "build"]);
+const SKIPPED_TYPES = new Set(["docs", "chore", "ci", "test", "build", "refactor"]);
+// A footer in the commit body also marks a breaking change.
+export const BREAKING_FOOTER = /^BREAKING[ -]CHANGE:/m;
 
 const TAG_PATTERN = /^native-v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 
@@ -97,7 +97,7 @@ export function parseTitle(title) {
 
 const capitalize = (text) => text.charAt(0).toUpperCase() + text.slice(1);
 
-// Entries: { number: number | null, title: string, labels: string[] }.
+// Entries: { number: number | null, title: string, labels: string[], body?: string }.
 // Returns [{ group, lines: [string] }] in GROUPS order, without empty groups.
 export function classify(entries) {
   const seen = new Set();
@@ -109,16 +109,17 @@ export function classify(entries) {
     }
     const parsed = parseTitle(entry.title);
     const visible = (entry.labels ?? []).includes(USER_VISIBLE_LABEL);
+    const breakingFooter = BREAKING_FOOTER.test(entry.body ?? "");
     let group;
     let text;
     if (!parsed) {
-      group = "Other changes";
+      group = breakingFooter ? "Breaking changes" : "Other changes";
       text = entry.title.trim();
     } else {
       text = parsed.summary;
-      if (parsed.breaking) group = "Breaking changes";
+      if (parsed.breaking || breakingFooter) group = "Breaking changes";
       else if (TYPE_GROUP[parsed.type]) group = TYPE_GROUP[parsed.type];
-      else if (SKIPPED_TYPES.has(parsed.type)) group = visible ? "Other user-visible changes" : null;
+      else if (SKIPPED_TYPES.has(parsed.type)) group = visible ? "Other changes" : null;
       else {
         // An unknown type keeps its whole title, so the type stays visible.
         group = "Other changes";
@@ -172,17 +173,18 @@ export function renderNotes({ version, previous, groups, highlights }) {
 
 const errorOf = (r) => (r.stderr || r.error?.message || "").trim();
 
-// First-parent commits on HEAD after `since`: [{ sha, subject, body }].
+// First-parent commits on HEAD after `since`: [{ sha, subject, body }]. The log
+// is NUL-separated (-z) and each record is "sha NL subject NL body", so nothing a
+// commit message contains can break the split (a body cannot hold a NUL).
 export function firstParentCommits(run, since) {
-  const log = run("git", ["log", "--first-parent", "--format=%H%x1f%s%x1f%b%x1e", `${since}..HEAD`]);
+  const log = run("git", ["log", "--first-parent", "-z", "--format=%H%n%s%n%b", `${since}..HEAD`]);
   if (log.status !== 0) throw new Error(`git log ${since}..HEAD failed: ${errorOf(log)}`);
   return (log.stdout ?? "")
-    .split("\x1e")
-    .map((record) => record.replace(/^\n+/, ""))
+    .split("\0")
     .filter((record) => record.trim() !== "")
     .map((record) => {
-      const [sha, subject, body = ""] = record.split("\x1f");
-      return { sha, subject, body: body.trim() };
+      const [sha, subject = "", ...body] = record.replace(/^\n+/, "").split("\n");
+      return { sha, subject, body: body.join("\n").trim() };
     });
 }
 
@@ -226,8 +228,8 @@ export function generateNotes({ run, version, since, docsText = "", notesFileTex
   const start = resolveSince(run, version, since);
   const entries = firstParentCommits(run, start.ref).map((commit) => {
     const number = prNumberOf(commit.subject);
-    if (number === null) return { number: null, title: commit.subject, labels: [] };
-    return { number, ...fetchPullRequest(run, number) };
+    if (number === null) return { number: null, title: commit.subject, labels: [], body: commit.body };
+    return { number, ...fetchPullRequest(run, number), body: commit.body };
   });
   const groups = classify(entries);
   const { highlights, note } = chooseHighlights({ version, notesFileText, docsText });

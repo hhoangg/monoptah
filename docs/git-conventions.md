@@ -108,11 +108,15 @@ Open issues with one of the two forms in `.github/ISSUE_TEMPLATE/`:
 - Native release notes are generated, not written in a PR. `npm run native:release:mac`
   lists the PRs merged since the previous `native-v*` tag, takes each PR's title and labels
   from GitHub and groups them by the Conventional Commits type of the title: Breaking changes
-  (`!`), Features (`feat`), Fixes (`fix`), Performance (`perf`), Reverts (`revert`) and Other
-  user-visible changes (`refactor`). So **a PR title becomes a release note line**: write it
-  for a user, in the imperative, with the right type. `docs`, `chore`, `ci`, `test` and
-  `build` PRs are left out unless the PR has the label `user-visible`. A title that is not in
-  the commit format is listed under "Other changes" instead of being dropped.
+  (`!`), Features (`feat`), Fixes (`fix`), Performance (`perf`) and Reverts (`revert`),
+  and a `BREAKING CHANGE:` footer in the commit body also counts as breaking. So **a PR title
+  becomes a release note line**: write it for a user, in the imperative, with the right type.
+  `docs`, `chore`, `ci`, `test`, `build` and `refactor` PRs are left out unless the PR has the
+  label `user-visible` (then they are listed under "Other changes"; the label must exist in
+  the repository, create it first if it does not). A title that is not in the commit format is
+  listed under "Other changes" instead of being dropped.
+- Upstream sync PRs have a `chore` title, so they are skipped: describe the user-visible
+  upstream changes in the highlights, or label the sync PR `user-visible`.
 - Optional highlights: pass `--notes FILE`, or put them in
   `docs/native/monoptah-release-notes.md` with the first line exactly
   `# Monoptah Native X.Y.Z` for the version being released (a file for another version is

@@ -31,23 +31,34 @@ script early.
 - Start: the highest plain `native-vA.B.C` tag that is an ancestor of HEAD and lower than the
   version (pre-release tags are ignored), or `--since REF`. No such tag is an error asking for
   `--since REF`.
-- Commits: `git log --first-parent` since then. The PR number comes from a squash subject
+- Commits: `git log --first-parent -z` since then (NUL-separated, so no commit text can break
+  the parse). The PR number comes from a squash subject
   `title (#N)` or a merge subject `Merge pull request #N from ...`. The title and labels come
   from `gh api repos/hhoangg/monoptah/pulls/N`. There is no fallback to the commit subject (a
   squash subject can be edited at merge time, a merge subject has no title), so a gh failure
   is an error. A commit without a PR number uses its subject and has no number.
-- Sections by the Conventional Commits type of the title: Breaking changes (any `!`),
-  Features, Fixes, Performance, Reverts, Other user-visible changes (`refactor`). `docs`,
-  `chore`, `ci`, `test` and `build` are skipped unless the PR has the label `user-visible`.
-  Titles that do not parse, or have an unknown type, go under "Other changes". A PR number
-  that appears twice is listed once.
+- Sections by the Conventional Commits type of the title: Breaking changes (a `!` in the
+  title, or a `BREAKING CHANGE:` or `BREAKING-CHANGE:` footer in the commit body), Features,
+  Fixes, Performance, Reverts. `docs`, `chore`, `ci`, `test`, `build` and `refactor` are skipped
+  unless the PR has the label `user-visible`; then they are listed under "Other changes", the
+  same section that holds titles that do not parse or have an unknown type (those are never
+  dropped). A PR number that appears twice is listed once.
+- The label `user-visible` must exist in the repository for it to be used on a PR. It does not
+  exist yet; create it before relying on it (for example `gh label create user-visible`).
+- Upstream syncs: a merge PR from `hardbeat920/monocode` has a `chore` title, so it is skipped
+  and the upstream user-visible changes it brings are not listed. Describe them in the
+  highlights (`--notes FILE` or the docs file), or put the `user-visible` label on the sync PR
+  to list the PR title itself.
 - Highlights (optional): `--notes FILE`, otherwise `docs/native/monoptah-release-notes.md` when
   its first line is exactly `# Monoptah Native X.Y.Z` for this version. A file for another
   version is ignored (the script says so).
 - The notes are written to `release-notes.md` in the temp release dir, used for
   `gh release create --notes-file`, and printed. The publish job reads the release body back
   and signs the feed with exactly that text. `checkNotes` still requires the body to start with
-  the version heading.
+  the version heading. If the release body is emptied or its first line is edited afterwards,
+  `publish` fails at `checkNotes` before anything is published. Restore the body (first line
+  `# Monoptah Native X.Y.Z`) with `gh release edit native-vX.Y.Z --notes-file FILE`, then re-run
+  the failed jobs.
 
 ## The early run and await-release
 
@@ -65,6 +76,15 @@ The workflow has two modes.
 - Tag only (`gh workflow run native-release-monoptah.yml --ref main -f tag=native-vX.Y.Z`): the
   old path. The tag and the release with the macOS files must exist, and native.yml must be
   green for the tag's commit. Use it to start a release again after the early run is gone.
+
+Tools versus the built commit: the helper scripts (`native-release-monoptah.mjs`,
+`package-native-monoptah.mjs`) used by `plan`, `await-release` and `publish` come from a second
+checkout (`release-tools/`) of the ref the workflow was dispatched on, not from the commit being
+released. So the tag-only dispatch also works for a tag cut before those scripts gained
+`--defer-macos`, `--check-planned` or `macos-ready` (for example `native-v0.53.4`). The "Test
+the release scripts" step tests these tools. Building and packaging still use the planned
+commit. Every call of a helper checks its exit status, and the polling reads of the wait loop
+are retried 3 times, 10 seconds apart (an HTTP 404 for the release is an answer, not an error).
 
 ## Concurrency and timeouts
 
@@ -91,6 +111,7 @@ version (a feed never goes back to an older version).
 | `gh release create` | Tag on origin, release missing or partial | Create the release or upload the missing files (never replace an uploaded file). The early run continues. |
 | Dispatch after the release | Tag and release exist, no running workflow | `gh workflow run native-release-monoptah.yml --repo hhoangg/monoptah --ref main -f tag=native-vX.Y.Z` (safe to repeat). |
 | A CI package job fails | Release holds only the macOS files | Re-run the failed jobs, or dispatch with the tag only. Nothing more is published until all platforms are in. |
+| Ctrl-C or SIGTERM while the script waits (CI wait, run watching) | Before the tag the early run is cancelled and "Nothing was tagged" is printed; after the push the recovery is printed. Exit 130 | Run the script again (before the tag) or follow the printed commands. |
 | Ctrl-C between two child processes | Nothing is cleaned up | Before the tag: the early run fails by itself at its 120 minute wait and nothing is published; cancel it to save the minutes. After the tag: check `gh release view native-vX.Y.Z` and continue as above. |
 | A platform has only some of its files published | The plan job fails | Delete that platform's published assets (files and `.sig`) by hand, then re-run. |
 
@@ -103,6 +124,14 @@ A run that GitHub leaves `queued` with no job for more than 10 minutes is stuck 
 
 - Before the tag: an early run that is stuck is cancelled and treated as "no early run"; a
   fresh run is dispatched after the release is created.
+- The early run is also checked for health (`gh api .../actions/runs/ID/jobs`) after
+  `native:check`, after the build, after the CI wait and once the release exists. A job that
+  failed, was cancelled or timed out (even while the run still shows in progress, because
+  await-release keeps waiting), or an await-release job that is no longer queued or running,
+  loses the run. Before the tag a stuck run is cancelled, confirmed and replaced by a new early
+  run, and a lost run is cancelled and a fresh run follows the release. After the release a lost
+  run is cancelled, the cancel is confirmed, and only then a new run is dispatched (at most 2
+  replacements in total); an unconfirmed cancel dispatches nothing and prints the commands.
 - After the release: the script polls the run every 30 seconds for up to 15 minutes until it has
   a job or is in progress. A stuck run is cancelled, confirmed with `gh run view --json status`
   and only then replaced by a fresh dispatch, at most 2 times. If the cancel cannot be

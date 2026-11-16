@@ -69,21 +69,23 @@ test("classification groups, orders and capitalizes", () => {
     entry(2, "feat(terminals): split view"),
     entry(3, "perf(rail): open large projects faster"),
     entry(4, "revert: remove the split view"),
-    entry(5, "refactor(core): simplify sessions"),
+    entry(5, "refactor(core): simplify sessions", ["user-visible"]),
     entry(6, "feat(api)!: rename the host protocol"),
     entry(7, "improve things"),
   ]);
   assert.deepEqual(
     groups.map((g) => g.group),
-    ["Breaking changes", "Features", "Fixes", "Performance", "Reverts", "Other user-visible changes", "Other changes"],
+    ["Breaking changes", "Features", "Fixes", "Performance", "Reverts", "Other changes"],
   );
   assert.deepEqual(groups[0].lines, ["- Rename the host protocol (#6)"]);
   assert.deepEqual(groups[1].lines, ["- Split view (#2)"]);
-  assert.deepEqual(groups[6].lines, ["- Improve things (#7)"]);
+  // Opted-in refactors and unparsable titles share "Other changes".
+  assert.deepEqual(groups[5].lines, ["- Simplify sessions (#5)", "- Improve things (#7)"]);
 });
 
-test("docs, chore, ci, test and build are skipped unless the PR is labeled user-visible", () => {
+test("docs, chore, ci, test, build and refactor are skipped unless the PR is labeled user-visible", () => {
   const skipped = classify([
+    entry(6, "refactor(core): tidy"),
     entry(1, "docs: git conventions"),
     entry(2, "chore(deps): bump"),
     entry(3, "ci: faster"),
@@ -97,8 +99,35 @@ test("docs, chore, ci, test and build are skipped unless the PR is labeled user-
     entry(3, "chore: bump", ["bug"]),
   ]);
   assert.deepEqual(labeled, [
-    { group: "Other user-visible changes", lines: ["- New setup guide (#1)", "- Faster releases (#2)"] },
+    { group: "Other changes", lines: ["- New setup guide (#1)", "- Faster releases (#2)"] },
   ]);
+});
+
+test("a BREAKING CHANGE footer in the commit body makes the entry a breaking change", () => {
+  const body = "Some text\n\nBREAKING CHANGE: the host protocol changed";
+  const groups = classify([{ number: 3, title: "feat(host): new protocol", labels: [], body }, entry(4, "fix: other")]);
+  assert.deepEqual(groups.map((g) => g.group), ["Breaking changes", "Fixes"]);
+  assert.deepEqual(groups[0].lines, ["- New protocol (#3)"]);
+  const hyphen = classify([{ number: 5, title: "fix: x", labels: [], body: "BREAKING-CHANGE: y" }]);
+  assert.equal(hyphen[0].group, "Breaking changes");
+  // The words in the middle of a line are not a footer.
+  assert.equal(classify([{ number: 6, title: "fix: z", labels: [], body: "this is not a BREAKING CHANGE: footer" }])[0].group, "Fixes");
+  // An unparsable title with a footer is still breaking.
+  assert.equal(classify([{ number: 7, title: "Rework it", labels: [], body }])[0].group, "Breaking changes");
+});
+
+test("the commit log is NUL-separated, so a body holding the old delimiters is read correctly", () => {
+  const body = "line one \x1e with \x1f old delimiters\n\nBREAKING CHANGE: yes";
+  const { run } = runnerFor({
+    "git log --first-parent -z --format=%H%n%s%n%b v0..HEAD": {
+      status: 0,
+      stdout: `a1\nfix: first (#1)\n${body}\0a2\nfeat: second (#2)\n\0`,
+    },
+  });
+  const commits = firstParentCommits(run, "v0");
+  assert.equal(commits.length, 2);
+  assert.deepEqual(commits[0], { sha: "a1", subject: "fix: first (#1)", body });
+  assert.deepEqual(commits[1], { sha: "a2", subject: "feat: second (#2)", body: "" });
 });
 
 test("unparsable titles are kept under Other changes, not dropped", () => {
@@ -158,8 +187,8 @@ function runnerFor(table) {
   };
   return { run, calls };
 }
-const LOG = "git log --first-parent --format=%H%x1f%s%x1f%b%x1e native-v0.53.3..HEAD";
-const record = (sha, subject, body = "") => `${sha}\x1f${subject}\x1f${body}\x1e\n`;
+const LOG = "git log --first-parent -z --format=%H%n%s%n%b native-v0.53.3..HEAD";
+const record = (sha, subject, body = "") => `${sha}\n${subject}\n${body}\0`;
 const pull = (n) => `gh api repos/hhoangg/monoptah/pulls/${n} --jq {title: .title, labels: [.labels[].name]}`;
 
 test("generateNotes reads commits, squash and merge PR numbers, and PR titles and labels", () => {
@@ -184,15 +213,14 @@ test("generateNotes reads commits, squash and merge PR numbers, and PR titles an
   assert.match(result.text, /^# Monoptah Native 0\.54\.0\n\nHighlight text\n\n## Changes since 0\.53\.3/);
   assert.match(result.text, /### Features\n\n- New panel \(#141\)/);
   assert.match(result.text, /### Fixes\n\n- Keep the interrupt notice \(#140\)/);
-  assert.match(result.text, /### Other user-visible changes\n\n- Guide \(#142\)/);
-  assert.match(result.text, /### Other changes\n\n- Direct commit without a PR\n/);
+  assert.match(result.text, /### Other changes\n\n- Direct commit without a PR\n- Guide \(#142\)/);
   assert.equal(calls.filter((c) => c.startsWith("gh api")).length, 3);
 });
 
 test("generateNotes with --since uses that ref and labels it", () => {
   const { run } = runnerFor({
     "git rev-parse -q --verify native-v0.50.0^{commit}": { status: 0 },
-    "git log --first-parent --format=%H%x1f%s%x1f%b%x1e native-v0.50.0..HEAD": { status: 0, stdout: "" },
+    "git log --first-parent -z --format=%H%n%s%n%b native-v0.50.0..HEAD": { status: 0, stdout: "" },
   });
   const result = generateNotes({ run, version: "0.54.0", since: "native-v0.50.0" });
   assert.match(result.text, /## Changes since 0\.50\.0\n\nNo user-visible changes since 0\.50\.0\./);
@@ -207,7 +235,7 @@ test("a gh or git failure is a clear error, never a silent fallback", () => {
   assert.throws(() => fetchPullRequest(gh.run, 7), /Could not read pull request #7.*HTTP 401.*run again/s);
   const bad = runnerFor({ [pull(7)]: { status: 0, stdout: "not json" } });
   assert.throws(() => fetchPullRequest(bad.run, 7), /Unexpected answer for pull request #7/);
-  const log = runnerFor({ "git log --first-parent --format=%H%x1f%s%x1f%b%x1e v1..HEAD": { status: 128, stderr: "bad revision" } });
+  const log = runnerFor({ "git log --first-parent -z --format=%H%n%s%n%b v1..HEAD": { status: 128, stderr: "bad revision" } });
   assert.throws(() => firstParentCommits(log.run, "v1"), /git log v1\.\.HEAD failed: bad revision/);
   const noTags = runnerFor({ "git tag --list native-v*": { status: 0, stdout: "" } });
   assert.throws(() => generateNotes({ run: noTags.run, version: "0.54.0" }), /--since REF/);

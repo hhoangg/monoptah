@@ -11,6 +11,7 @@ Full rules and examples: [`docs/git-conventions.md`](docs/git-conventions.md).
 - Types (branch, commit, PR): `feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `build`, `ci`, `chore`, `revert`.
 - Branch: `<type>/<issue#>-<short-slug>` or `<type>/<short-slug>`, lowercase, about 40 chars. Rename an app-made `mc/...` branch with `git branch -m` before the first push.
 - Commit: `<type>(<scope>): <summary>` (imperative, at most 72 chars, no period), English. A body (why and what) is required for `feat` and `fix`; add `Refs: #N` or `Fixes: #N` when there is an issue. One buildable change per commit.
+- PR titles become native release-note lines (`feat`, `fix`, `perf` are listed; label a PR `user-visible` to include `docs`, `chore`, `ci`, `test`, `build`, `refactor`), so write them for users.
 - PR: title in the commit format; the body fills every section of `.github/pull_request_template.md`, keeping its headings. Merge with squash, except upstream-sync PRs, which use a merge commit.
 - Never commit to `main`, never force-push a branch with an open PR, never commit secrets or realistic-looking fake tokens.
 
@@ -244,47 +245,33 @@ code or tests gated to macOS, also run the tests you touched on macOS. `npm run 
 before every release. How often to run which check while developing is in "Developing the
 native app".
 
-How to release (the full flow, recovery and stuck runs are in
-[`docs/native/release-flow.md`](docs/native/release-flow.md)):
+How to release (timeline, notes rules, recovery and stuck runs: [`docs/native/release-flow.md`](docs/native/release-flow.md)):
 
-1. **No notes PR.** The release notes are generated from the titles of the PRs merged since
-   the previous `native-v*` tag, so PR titles matter (see `docs/git-conventions.md`, "Releases").
-   Label a `docs`, `chore`, `ci`, `test` or `build` PR `user-visible` to list it. Optional
-   hand-written highlights: `--notes FILE`, or `docs/native/monoptah-release-notes.md` whose
-   first line is exactly `# Monoptah Native X.Y.Z` for this version (a file for another version
-   is ignored). Pick X.Y.Z by semver: `feat` is minor, `fix` and `perf` are patch, a
-   `BREAKING CHANGE` is major.
-2. **One command**, from an up-to-date `main` on the Mac, as soon as the last PR is merged:
+1. **No notes PR.** Release notes are generated from the titles of the PRs merged since the
+   previous `native-v*` tag (see `docs/git-conventions.md`, "Releases"). Optional highlights:
+   `--notes FILE`, or `docs/native/monoptah-release-notes.md` with first line
+   `# Monoptah Native X.Y.Z` for this version. Pick X.Y.Z by semver: `feat` is minor, `fix` and
+   `perf` are patch, a `BREAKING CHANGE` is major.
+2. **One command**, from an up-to-date `main` on the Mac, right after the last PR merges:
    `npm run native:release:mac -- X.Y.Z` (plain `X.Y.Z`; options `--since REF`, `--notes FILE`,
-   `--recheck`, `--ci-timeout MINUTES`). The script checks that you are on an up-to-date main
-   with no tracked changes, that the tag and release do not exist, gh auth, macOS SDK 26 and the
-   Metal compiler, and generates and prints the notes (a gh problem stops it here).
-3. **What runs in parallel.** The script dispatches `native-release-monoptah.yml` for the commit
-   (the early run), so Linux, Windows and rpm build on CI while the Mac runs `npm run
-   native:check` (about 20 minutes, remembered per commit and `rustc -V` in
-   `crates/monocode-gpui/target/.native-check-stamp.json`), builds and packages. native.yml is
-   not waited for at the start: right before tagging the script waits (up to `--ci-timeout`,
-   default 60 minutes) for a successful `native.yml` push run on main for HEAD. If CI fails or
-   times out, or anything else fails before the tag, nothing is tagged or published, the early
-   run is cancelled, and you run the script again (the check stamp makes that fast).
-4. **Publishing.** The script tags, pushes `native-vX.Y.Z`, creates the release with the three
-   macOS files and the generated notes as its body, and the early run (or a fresh one) picks the
-   release up. The workflow signs every updater package in one `publish` job on Ubuntu with
-   `TAURI_SIGNING_PRIVATE_KEY`, verifies them with the app's own verifier, publishes, and bumps
-   the cask. The signing key exists on CI only; the local script never reads it. The feed notes
-   are the release body.
-5. **`--dry-run` is optional.** A real run is safe on its own because every check, including
-   the native.yml wait, happens before the tag. Use `--dry-run` to test changes to the script:
-   it does everything except starting the early run, waiting for CI, tagging, pushing and
-   publishing, and it prints the notes and the CI state.
-6. **If something fails.** The script prints what is left behind and the exact commands
-   (`gh run cancel ID`, and the manual re-dispatch
-   `gh workflow run native-release-monoptah.yml --ref main -f tag=native-vX.Y.Z`). Do not
-   re-run `native:release:mac` for an existing tag: it refuses. A run that GitHub leaves queued
-   with no job for 10 minutes is cancelled and replaced by the script (see the doc); if it
-   cannot confirm the cancel it stops and tells you what to do. A Ctrl-C between two children
-   kills the script without cleanup: an early run then fails by itself at its 120 minute wait,
-   and nothing is published.
+   `--recheck`, `--ci-timeout MINUTES`). Preconditions and the notes are checked first.
+3. **In parallel.** The script dispatches `native-release-monoptah.yml` for the commit (the
+   early run), so Linux, Windows and rpm build while the Mac runs `npm run native:check` (about
+   20 minutes, remembered per commit and `rustc -V` in
+   `crates/monocode-gpui/target/.native-check-stamp.json`), builds and packages. It waits for a
+   green `native.yml` on main for HEAD only right before tagging (default 60 minutes). Any
+   failure before the tag leaves nothing tagged or published and cancels the early run: fix it
+   and run the script again.
+4. **Publishing.** The script tags, pushes `native-vX.Y.Z` and creates the release with the three
+   macOS files and the notes as body. The early run (or a fresh one) then signs every updater
+   package in one `publish` job on Ubuntu (the signing key exists on CI only, the local script
+   never reads it), verifies, publishes, and bumps the cask.
+5. **`--dry-run` is optional**: a real run is safe on its own because every check happens before
+   the tag. Use it to test changes to the script.
+6. **If something fails** the script prints the exact commands (`gh run cancel ID`, and
+   `gh workflow run native-release-monoptah.yml --ref main -f tag=native-vX.Y.Z`). Never re-run
+   `native:release:mac` for an existing tag: it refuses. A run queued with no job for 10 minutes
+   is cancelled and replaced by the script.
 
 The release page and the macOS zip are public as soon as the script creates the release, and
 they stay macOS-only if the workflow fails. The in-app feed and the cask change only at the
@@ -333,4 +320,5 @@ Things to keep true after merging from upstream or changing repo settings:
 - `native-release-monoptah.yml` keeps its per-tag concurrency group (`native-monoptah-release-<tag>`)
   and the `native-monoptah-publish` group on the `publish` job. Do not turn on `cancel-in-progress`
   there, and do not go back to one global group: the early run waits up to 2 hours for the tag.
+- The workflow runs its helper scripts from the `release-tools/` checkout of the dispatched ref, not from the built commit, so the tag-only recovery works for older tags.
 - Only the `publish` job may see the signing key or have `contents: write`.
