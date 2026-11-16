@@ -126,10 +126,21 @@ on:
 permissions:
   contents: read
 
-# Runs are serialized so the rolling feed and the cask cannot be written by two
-# tags at once.
+# Concurrency. Runs of one tag never overlap (group per tag, nothing is
+# cancelled): the early run and a later re-dispatch of the same tag take turns,
+# and a duplicate run only sees everything published and changes nothing.
+# GitHub keeps at most one running and one pending run per group: a newer
+# pending run replaces (cancels) an older pending one, which is the wanted result
+# for a repeated dispatch of one tag. Different tags run side by side, so the
+# publish job (the only writer of the rolling feed) has its own group below to
+# keep feed writes serialized across tags. The same rule applies there: if three
+# publish jobs queue up, the middle one is cancelled and its tag is released
+# again by dispatching it with the tag only. The homebrew job keeps the
+# homebrew-tap group it shares with release.yml. Every job has a timeout so a
+# hung job cannot hold a group for long (a run stuck in the queue is cancelled
+# by the local script).
 concurrency:
-  group: native-monoptah-release
+  group: native-monoptah-release-${{ inputs.tag }}
   cancel-in-progress: false
 
 env:
@@ -523,6 +534,10 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: write
+    # Feed and release writes of different tags never overlap.
+    concurrency:
+      group: native-monoptah-publish
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
         with:

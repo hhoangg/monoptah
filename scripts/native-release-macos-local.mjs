@@ -398,6 +398,88 @@ export function viewRun(io, id) {
   }
 }
 
+// ---- Stuck queue protection ---------------------------------------------
+// GitHub sometimes leaves a dispatched run "queued" with no job for a long time.
+// A run that stays queued with 0 jobs for more than 10 minutes is treated as
+// stuck: it is cancelled and, only once the cancel is confirmed, replaced.
+export const STUCK_LIMIT_MS = 10 * 60_000;
+export const WATCH_POLL_MS = 30_000;
+export const WATCH_WINDOW_MS = 15 * 60_000;
+export const MAX_REDISPATCH = 2;
+
+// `run` is { status }, `queuedSinceMs` and `nowMs` are timestamps in ms. An
+// unknown job count (null) never counts as stuck. Only "queued" counts: a run
+// "pending" behind another one of its tag's concurrency group is only waiting.
+export function isStuck(run, jobsCount, queuedSinceMs, nowMs, limitMs = STUCK_LIMIT_MS) {
+  return run?.status === "queued" && jobsCount === 0 && nowMs - queuedSinceMs > limitMs;
+}
+
+// The number of jobs of a run, or null when it cannot be read.
+export function jobsCount(io, id) {
+  const result = io.capture("gh", ["api", `repos/${REPOSITORY}/actions/runs/${id}/jobs`, "--jq", ".total_count"]);
+  const count = Number.parseInt((result.stdout ?? "").trim(), 10);
+  return result.status === 0 && Number.isInteger(count) ? count : null;
+}
+
+// Cancels a run and confirms through gh run view that it is no longer going.
+// Only a confirmed cancel allows another dispatch.
+export async function cancelAndConfirm(io, run) {
+  const cancel = io.capture("gh", ["run", "cancel", String(run.id), "--repo", REPOSITORY]);
+  const cancelled = cancel.status === 0;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const state = viewRun(io, run.id);
+    if (state && state.status === "completed") return true;
+    if (!cancelled && attempt >= 1) break;
+    await io.sleep(5000);
+  }
+  return false;
+}
+
+const stuckReport = (run, minutes) =>
+  `GitHub Actions has kept the run ${run.url} queued with no job for ${minutes} minutes (a stuck queue).`;
+
+// Waits for a freshly dispatched (or kept) run to start. Returns { run, state }.
+// A stuck run is cancelled, confirmed and replaced by a new dispatch, at most
+// MAX_REDISPATCH times. Throws, with the commands to continue, when a stuck run
+// cannot be confirmed cancelled (no new dispatch then, so two runs never race)
+// or when runs keep getting stuck.
+export async function watchRun(io, run, { version, sha }) {
+  let current = run;
+  let redispatched = 0;
+  for (;;) {
+    const state = viewRun(io, current.id);
+    const jobs = jobsCount(io, current.id);
+    if (state && (state.status === "in_progress" || state.status === "completed" || (jobs ?? 0) >= 1)) return { run: current, state };
+    const now = io.now();
+    if (isStuck(state, jobs, current.dispatchedAt, now)) {
+      const minutes = Math.round((now - current.dispatchedAt) / 60_000);
+      io.log("\n" + stuckReport(current, minutes) + " Cancelling it.");
+      if (!(await cancelAndConfirm(io, current)))
+        throw new Error(
+          `${stuckReport(current, minutes)} The cancel could not be confirmed (gh run view ${current.id} --repo ${REPOSITORY} --json status), so no new run was dispatched: two runs must not race. ` +
+            `Cancel it by hand: ${cancelCommand(current.id)}. When gh run view shows it completed, start a new run: ${manualDispatch(version)}`,
+        );
+      if (redispatched >= MAX_REDISPATCH)
+        throw new Error(
+          `${stuckReport(current, minutes)} It was cancelled, but ${MAX_REDISPATCH} new runs were already stuck too, so the script stops. The tag and the release exist. Check https://www.githubstatus.com, then start the workflow again: ${manualDispatch(version)}`,
+        );
+      redispatched += 1;
+      const fresh = await dispatchWorkflow(io, { version, sha });
+      if (!fresh.dispatched) throw new Error("Could not dispatch " + WORKFLOW_FILE + ": " + fresh.error);
+      if (!fresh.run) {
+        io.log("The new run was dispatched but could not be found in the run list, so it is not watched.");
+        return { run: null, state: null };
+      }
+      io.log("New run " + redispatched + " of " + MAX_REDISPATCH + ": " + fresh.run.url);
+      current = fresh.run;
+      continue;
+    }
+    if (now - current.dispatchedAt >= WATCH_WINDOW_MS) return { run: current, state };
+    io.log("Waiting for the run to start: " + current.url + " (" + (state?.status ?? "unknown") + ", " + (jobs ?? "unknown") + " jobs)");
+    await io.sleep(WATCH_POLL_MS);
+  }
+}
+
 // Cancels the early run, best effort. Returns the sentence to append to an error.
 export function cancelRun(io, run) {
   const result = io.capture("gh", ["run", "cancel", String(run.id), "--repo", REPOSITORY]);
@@ -623,6 +705,18 @@ export async function runRelease(argv, io) {
     // before anything is tagged.
     io.log("\nWaiting for native.yml on " + sha.slice(0, 12) + "...");
     await waitForCi(io, sha, ciTimeoutMinutes);
+
+    // A run that GitHub never started is no use: drop it, and a fresh one is
+    // dispatched once the release exists.
+    if (early) {
+      const state = viewRun(io, early.id);
+      const now2 = io.now();
+      if (isStuck(state, state ? jobsCount(io, early.id) : null, early.dispatchedAt, now2)) {
+        io.log("\n" + stuckReport(early, Math.round((now2 - early.dispatchedAt) / 60_000)) + " Cancelling it; a new run is dispatched after the release is created.");
+        io.log(cancelRun(io, early));
+        early = null;
+      }
+    }
   } catch (error) {
     if (early) error.message = error.message + "\n\n" + cancelRun(io, early);
     throw error;
@@ -662,6 +756,19 @@ export async function runRelease(argv, io) {
   } catch (error) {
     error.message = error.message + "\n\n" + recoveryMessage("dispatch", recoveryParams);
     throw error;
+  }
+  // Make sure GitHub really starts the run: a queue that stays stuck is
+  // cancelled and replaced (see watchRun).
+  if (run) {
+    try {
+      const watched = await watchRun(io, run, { version, sha });
+      run = watched.run;
+      if (watched.state?.status === "completed" && watched.state.conclusion !== "success")
+        io.log("Warning: the run finished right away with " + watched.state.conclusion + ": " + (run?.url ?? "") + "\nLook at its log. To start a new one: " + manualDispatch(version));
+    } catch (error) {
+      error.message = error.message + "\n\nThe tag " + tag + " and its release exist. " + recoveryMessage("dispatch", recoveryParams);
+      throw error;
+    }
   }
   io.removeDir(dir);
   io.log("\nRelease: https://github.com/" + REPOSITORY + "/releases/tag/" + tag);

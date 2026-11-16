@@ -25,6 +25,7 @@ import {
   ciVerdict,
   evaluatePreconditions,
   failureOf,
+  isStuck,
   formatCommand,
   gatherState,
   interruptedMessage,
@@ -348,8 +349,12 @@ test("an interrupt message names the step and how to continue", () => {
 // A fake io that records every command, so the tests can check the order.
 function fakeIo({ files = true, headAfter = SHA, dirtyAfter = "", stamp = null, failOn = null, docs = docsNotes, ciRuns = [[run("completed", "success")]], early = {} } = {}) {
   // Options of the early workflow run: dispatchFails, findable, cancelFails, statusAfterRelease.
-  let { dispatchFails = 0, findable = true, cancelFails = false, statusAfterRelease = "in_progress" } = early;
+  // view(id, call) and jobs(id, call) override the status and the job count of a run.
+  let { dispatchFails = 0, findable = true, cancelFails = false, statusAfterRelease = "in_progress", view = null, jobs = null } = early;
   const dispatched = [];
+  const cancelled = new Set();
+  const calls = {};
+  const countCall = (name, id) => (calls[`${name}${id}`] = (calls[`${name}${id}`] ?? 0) + 1);
   let ids = 0;
   const events = [];
   const written = [];
@@ -402,10 +407,27 @@ function fakeIo({ files = true, headAfter = SHA, dirtyAfter = "", stamp = null, 
           : [];
         return { status: 0, stdout: JSON.stringify(list), stderr: "" };
       }
-      if (command === "gh" && args[0] === "run" && args[1] === "view")
-        return { status: 0, stdout: JSON.stringify({ status: statusAfterRelease, conclusion: statusAfterRelease === "completed" ? "failure" : null }), stderr: "" };
-      if (command === "gh" && args[0] === "run" && args[1] === "cancel")
-        return cancelFails ? { status: 1, stdout: "", stderr: "HTTP 403" } : { status: 0, stdout: "", stderr: "" };
+      if (command === "gh" && args[0] === "run" && args[1] === "view") {
+        const id = Number(args[2]);
+        const n = countCall("view", id);
+        let state;
+        if (cancelled.has(id)) state = { status: "completed", conclusion: "cancelled" };
+        else if (view) state = view(id, n);
+        else {
+          const status = id === 4242 ? statusAfterRelease : "in_progress";
+          state = { status, conclusion: status === "completed" ? "failure" : null };
+        }
+        return { status: 0, stdout: JSON.stringify(state), stderr: "" };
+      }
+      if (command === "gh" && args[0] === "api" && /\/actions\/runs\/\d+\/jobs$/.test(args[1])) {
+        const id = Number(/runs\/(\d+)\/jobs/.exec(args[1])[1]);
+        return { status: 0, stdout: `${jobs ? jobs(id, countCall("jobs", id)) : 3}\n`, stderr: "" };
+      }
+      if (command === "gh" && args[0] === "run" && args[1] === "cancel") {
+        if (cancelFails) return { status: 1, stdout: "", stderr: "HTTP 403" };
+        cancelled.add(Number(args[2]));
+        return { status: 0, stdout: "", stderr: "" };
+      }
       if (command === "gh" && args[0] === "api" && args[1] === ciRunsPath(SHA)) {
         const answer = ciRuns[Math.min(ciReads, ciRuns.length - 1)];
         ciReads += 1;
@@ -694,7 +716,7 @@ test("after the release is created a running early run continues and no second r
   const { io, events, dispatched } = fakeIo({ early: { statusAfterRelease: "queued" } });
   await runRelease([V], io);
   assert.deepEqual(dispatched, ["req-1"]);
-  assert.ok(indexOf(events, "capture gh run view 4242") > indexOf(events, "visible gh release create"));
+  assert.ok(events.findLastIndex((e) => e.startsWith("capture gh run view 4242")) > indexOf(events, "visible gh release create"));
   assert.ok(!cmds(events).some((c) => c.startsWith("gh run cancel")));
 });
 
@@ -711,7 +733,6 @@ test("without an early run (dispatch refused or run not found) the workflow is d
   const refused = fakeIo({ early: { dispatchFails: 1 } });
   await runRelease([V], refused.io);
   assert.ok(refused.logs.some((l) => /could not start the early CI run \(HTTP 422/.test(l)));
-  assert.ok(refused.events.every((e) => !e.startsWith("capture gh run view")));
   assert.deepEqual(refused.dispatched, ["req-2"]);
   // A refusal of the fresh dispatch too is an error with the manual command.
   const always = fakeIo({ early: { dispatchFails: 2 } });
@@ -783,4 +804,110 @@ test("the workflow builds from the planned commit and publishes only after await
   // Only publish sees the signing key.
   for (const name of ["plan", "package", "package-rpm", "await-release", "homebrew"]) assert.ok(!job(name).includes("TAURI_SIGNING"), name);
   assert.ok(!job("await-release").includes("contents: write"));
+});
+
+const MIN = 60_000;
+
+test("isStuck: queued with 0 jobs for more than the limit, nothing else", () => {
+  const queued = { status: "queued" };
+  assert.equal(isStuck(queued, 0, 0, 10 * MIN + 1), true);
+  assert.equal(isStuck(queued, 0, 0, 10 * MIN), false); // not "more than"
+  assert.equal(isStuck(queued, 0, 0, 5 * MIN), false);
+  assert.equal(isStuck(queued, 1, 0, 60 * MIN), false); // has a job
+  assert.equal(isStuck(queued, null, 0, 60 * MIN), false); // unknown count
+  assert.equal(isStuck({ status: "in_progress" }, 0, 0, 60 * MIN), false);
+  assert.equal(isStuck({ status: "pending" }, 0, 0, 60 * MIN), false); // waits for its concurrency group
+  assert.equal(isStuck({ status: "completed" }, 0, 0, 60 * MIN), false);
+  assert.equal(isStuck(null, 0, 0, 60 * MIN), false);
+  assert.equal(isStuck(queued, 0, 0, 3 * MIN, 2 * MIN), true); // custom limit
+});
+
+
+test("a stuck early run is reported, cancelled and replaced after the release is created", async () => {
+  // The early run stays queued with 0 jobs; CI takes long enough for it to be stuck by the tag.
+  const { io, events, logs, dispatched } = fakeIo({
+    ciRuns: [...Array(30).fill([run("in_progress")]), [run("completed", "success")]],
+    early: { view: (id) => (id === 4242 ? { status: "queued", conclusion: null } : { status: "in_progress", conclusion: null }), jobs: (id) => (id === 4242 ? 0 : 3) },
+  });
+  await runRelease([V], io);
+  assert.ok(logs.some((l) => /queued with no job for \d+ minutes \(a stuck queue\).*Cancelling it; a new run is dispatched after the release/s.test(l)));
+  const cancelAt = events.indexOf("capture gh run cancel 4242 --repo hhoangg/monoptah");
+  assert.ok(cancelAt >= 0 && cancelAt < indexOf(events, "visible git tag"));
+  assert.deepEqual(dispatched, ["req-1", "req-2"]);
+  assert.ok(events.findLastIndex((e) => e.startsWith("capture gh workflow run")) > indexOf(events, "visible gh release create"));
+});
+
+test("a run that stays stuck after the release is cancelled, confirmed and only then replaced", async () => {
+  const { io, events, logs, dispatched } = fakeIo({
+    early: {
+      statusAfterRelease: "completed",
+      // The first fresh run (id 4243) is stuck, the second (4244) starts.
+      view: (id, n) => (id === 4242 ? { status: "completed", conclusion: "failure" } : id === 4243 ? { status: "queued", conclusion: null } : { status: "in_progress", conclusion: null }),
+      jobs: (id) => (id === 4243 ? 0 : 3),
+    },
+  });
+  // Re-dispatches 4242 is the early run (completed), 4243 the stuck fresh one.
+  await runRelease([V], io);
+  assert.deepEqual(dispatched, ["req-1", "req-2", "req-3"]);
+  const cancel = events.indexOf("capture gh run cancel 4243 --repo hhoangg/monoptah");
+  const confirm = events.findIndex((e, i) => i > cancel && e.startsWith("capture gh run view 4243"));
+  const redispatch = events.findLastIndex((e) => e.startsWith("capture gh workflow run"));
+  assert.ok(cancel > 0 && confirm > cancel && redispatch > confirm);
+  assert.ok(logs.some((l) => /New run 1 of 2: https:\/\/example\.test\/runs\/4244/.test(l)));
+  assert.ok(events.filter((e) => e === "sleep").length >= 20); // 10 min at 30 s before it is called stuck
+});
+
+test("an unconfirmed cancel of a stuck run never dispatches another run and prints how to continue", async () => {
+  const { io, dispatched } = fakeIo({
+    early: {
+      statusAfterRelease: "completed",
+      view: (id) => (id === 4242 ? { status: "completed", conclusion: "failure" } : { status: "queued", conclusion: null }),
+      jobs: (id) => (id === 4242 ? 3 : 0),
+      cancelFails: true,
+    },
+  });
+  await assert.rejects(
+    runRelease([V], io),
+    /cancel could not be confirmed.*no new run was dispatched.*gh run cancel 4243 --repo hhoangg\/monoptah.*gh workflow run native-release-monoptah\.yml.*tag=native-v0\.40\.5/s,
+  );
+  assert.deepEqual(dispatched, ["req-1", "req-2"]);
+});
+
+test("after two replacements that are stuck too the script stops and says what to do", async () => {
+  const { io, dispatched } = fakeIo({
+    early: {
+      statusAfterRelease: "completed",
+      view: (id) => (id === 4242 ? { status: "completed", conclusion: "failure" } : { status: "queued", conclusion: null }),
+      jobs: (id) => (id === 4242 ? 3 : 0),
+    },
+  });
+  // Every fresh run is cancelled for real by the fake, so the confirmation works.
+  const capture = io.capture;
+  const cancelled = new Set();
+  io.capture = (c, a) => {
+    if (c === "gh" && a[0] === "run" && a[1] === "cancel") cancelled.add(Number(a[2]));
+    if (c === "gh" && a[0] === "run" && a[1] === "view" && cancelled.has(Number(a[2])))
+      return { status: 0, stdout: JSON.stringify({ status: "completed", conclusion: "cancelled" }), stderr: "" };
+    return capture(c, a);
+  };
+  await assert.rejects(runRelease([V], io), /2 new runs were already stuck too.*githubstatus.*gh workflow run native-release-monoptah\.yml/s);
+  assert.equal(dispatched.length, 4); // early + fresh + 2 replacements
+});
+
+test("the workflow and native.yml give every job a timeout, and release runs are grouped per tag", () => {
+  for (const file of ["native-release-monoptah.yml", "native.yml"]) {
+    const text = read(`.github/workflows/${file}`);
+    const jobsAt = text.indexOf("\njobs:\n");
+    const names = [...text.slice(jobsAt).matchAll(/^  ([a-z][a-z0-9-]*):\s*$/gm)].map((m) => m[1]);
+    assert.ok(names.length >= 6, file);
+    for (const name of names) {
+      const start = text.indexOf(`\n  ${name}:\n`, jobsAt);
+      const next = text.slice(start + 1).search(/\n  [a-z][a-z0-9-]*:\s*\n/);
+      const body = text.slice(start, next < 0 ? undefined : start + 1 + next);
+      assert.match(body, /\n    timeout-minutes: \d+/, `${file}: ${name}`);
+    }
+  }
+  const release = read(".github/workflows/native-release-monoptah.yml");
+  assert.match(release, /^concurrency:\n  group: native-monoptah-release-\$\{\{ inputs\.tag \}\}\n  cancel-in-progress: false/m);
+  assert.match(release, /  publish:[\s\S]*?\n    concurrency:\n      group: native-monoptah-publish\n      cancel-in-progress: false/);
 });
