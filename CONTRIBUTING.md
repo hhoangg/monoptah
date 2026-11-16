@@ -72,7 +72,7 @@ When the pause lifts, this section goes away.
 
 ## Pull requests
 
-Keep a PR to one thing, and say what changed and why. The [PR template](.github/pull_request_template.md) covers the rest. If it changes the UI, a before/after screenshot helps a lot.
+Keep a PR to one thing, and say what changed and why. The [PR template](.github/pull_request_template.md) covers the rest. Branch names, commit messages and PR titles follow [the git conventions](docs/git-conventions.md). If it changes the UI, a before/after screenshot helps a lot.
 
 For anything that moves product direction - a new surface, new provider behavior, a refactor that changes the shape of the app - open an issue first. That’s not gatekeeping, I’d just rather you hear “I’m already halfway through that” before you write it than after. New providers are the exception: don’t send the adapter, even from an issue, until the pause above is gone.
 

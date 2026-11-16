@@ -4,6 +4,16 @@ This repository is a fork of [`hardbeat920/monocode`](https://github.com/hardbea
 renamed **Monoptah**. It tracks upstream and merges from it regularly, while carrying
 fork-local changes that are never offered back upstream.
 
+## Git conventions
+
+Full rules and examples: [`docs/git-conventions.md`](docs/git-conventions.md).
+
+- Types (branch, commit, PR): `feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `build`, `ci`, `chore`, `revert`.
+- Branch: `<type>/<issue#>-<short-slug>` or `<type>/<short-slug>`, lowercase, about 40 chars. Rename an app-made `mc/...` branch with `git branch -m` before the first push.
+- Commit: `<type>(<scope>): <summary>` (imperative, at most 72 chars, no period), English. A body (why and what) is required for `feat` and `fix`; add `Refs: #N` or `Fixes: #N`. One buildable change per commit.
+- PR: title in the commit format; the body fills every section of `.github/pull_request_template.md`, keeping its headings. Merge with squash.
+- Never commit to `main`, never force-push a branch with an open PR, never commit secrets or realistic-looking fake tokens.
+
 ## After every merge from upstream
 
 Upstream keeps adding links, menu items, dialog copy and docs that say "MonoCode" and
@@ -167,7 +177,8 @@ Releases are native only for now, see "Releasing the native app". The Tauri work
 so pushes, pull requests and `v*` tags start nothing. Keep that when merging from upstream.
 
 To cut a Tauri release anyway: `npm run set-version -- X.Y.Z`, add a `CHANGELOG.md` section,
-commit as `Release vX.Y.Z`, push the tag, then run `gh workflow run release.yml --ref vX.Y.Z`.
+merge that through a PR titled `chore(release): vX.Y.Z`, tag the merged commit `vX.Y.Z` and push
+the tag, then run `gh workflow run release.yml --ref vX.Y.Z`.
 That workflow builds macOS, Linux and Windows, signs the updater bundles with the
 `TAURI_SIGNING_PRIVATE_KEY` secret, and publishes a GitHub Release with `latest.json`.
 
@@ -231,7 +242,10 @@ before every release. How often to run which check while developing is in "Devel
 native app".
 
 1. Edit `docs/native/monoptah-release-notes.md` (its first line must be
-   `# Monoptah Native X.Y.Z`) and merge it into main through a PR.
+   `# Monoptah Native X.Y.Z`; group the changes by type, each line with its PR number, see
+   `docs/git-conventions.md`) and merge it into main through a PR titled
+   `docs(release): notes for Monoptah Native X.Y.Z`. Pick X.Y.Z by semver: `feat` is minor,
+   `fix` and `perf` are patch, a `BREAKING CHANGE` is major.
 2. Wait for `native.yml` on main to pass (Linux and Windows only now). Its `release-cache` job
    seeds the Linux and Windows build caches that the release reads (a miss is only slower).
 3. From a clean checkout of main on the Mac, run `npm run native:release:mac -- X.Y.Z`

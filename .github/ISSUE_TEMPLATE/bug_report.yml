@@ -1,17 +1,19 @@
 name: Bug report
-description: Report a problem in MonoCode
+description: Report a problem in Monoptah
+title: "[Bug] "
 labels: [bug]
 body:
   - type: markdown
     attributes:
       value: |
-        MonoCode supports macOS, Linux, and Windows.
+        Monoptah supports macOS, Linux, and Windows. Search existing issues first.
 
   - type: input
     id: version
     attributes:
-      label: MonoCode version
-      placeholder: "0.1.0"
+      label: Monoptah version
+      description: Shown in the About dialog or the release you installed.
+      placeholder: "Monoptah Native 0.53.3"
     validations:
       required: true
 
@@ -30,32 +32,16 @@ body:
     id: os-version
     attributes:
       label: OS version
-      placeholder: "Windows 11, Ubuntu 24.04, macOS 15.5"
+      placeholder: "macOS 15.5, Ubuntu 24.04, Windows 11"
     validations:
       required: true
 
-  - type: dropdown
+  - type: input
     id: provider
     attributes:
-      label: Provider CLI
-      options:
-        - Claude Code
-        - Codex
-        - Cursor
-        - Grok Build
-        - OpenCode
-        - Pi
-        - omp
-        - fx
-        - Multiple / not sure
-    validations:
-      required: true
-
-  - type: textarea
-    id: what-happened
-    attributes:
-      label: What happened
-      description: What did you expect, and what did you get instead?
+      label: Provider CLI and version
+      description: The CLI the session used and its version, or "Not provider-related".
+      placeholder: "Claude Code 2.1.0"
     validations:
       required: true
 
@@ -69,3 +55,24 @@ body:
         3.
     validations:
       required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and screenshots
+      description: Remove tokens, API keys and other secrets before pasting.
+      render: text
