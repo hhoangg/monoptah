@@ -27,6 +27,9 @@ import {
   evaluatePreconditions,
   failureOf,
   isStuck,
+  evaluateEarlyJobs,
+  awaitLimitWarning,
+  interruptActions,
   formatCommand,
   gatherState,
   interruptedMessage,
@@ -351,7 +354,12 @@ test("an interrupt message names the step and how to continue", () => {
 function fakeIo({ files = true, headAfter = SHA, dirtyAfter = "", stamp = null, failOn = null, docs = docsNotes, ciRuns = [[run("completed", "success")]], early = {} } = {}) {
   // Options of the early workflow run: dispatchFails, findable, cancelFails, statusAfterRelease.
   // view(id, call) and jobs(id, call) override the status and the job count of a run.
-  let { dispatchFails = 0, findable = true, cancelFails = false, statusAfterRelease = "in_progress", view = null, jobs = null } = early;
+  // jobList(id, call) overrides the job list, advance maps a command prefix to the ms it takes,
+  // signalAtSleep makes the n-th sleep deliver SIGINT to the active handlers.
+  let { dispatchFails = 0, findable = true, cancelFails = false, statusAfterRelease = "in_progress", view = null, jobs = null, jobList = null, advance = {}, signalAtSleep = 0 } = early;
+  const handlers = [];
+  const exits = [];
+  let sleeps = 0;
   const dispatched = [];
   const cancelled = new Set();
   const calls = {};
@@ -422,7 +430,19 @@ function fakeIo({ files = true, headAfter = SHA, dirtyAfter = "", stamp = null, 
       }
       if (command === "gh" && args[0] === "api" && /\/actions\/runs\/\d+\/jobs$/.test(args[1])) {
         const id = Number(/runs\/(\d+)\/jobs/.exec(args[1])[1]);
-        return { status: 0, stdout: `${jobs ? jobs(id, countCall("jobs", id)) : 3}\n`, stderr: "" };
+        const count = jobs ? jobs(id, countCall("jobs", id)) : 3;
+        if (args[3].includes("name:")) {
+          const list = jobList
+            ? jobList(id, countCall("jobList", id))
+            : count === 0
+              ? []
+              : [
+                  { name: "Plan the release", status: "completed", conclusion: "success" },
+                  { name: "Wait for the macOS files and CI", status: "in_progress", conclusion: null },
+                ];
+          return { status: 0, stdout: JSON.stringify(list), stderr: "" };
+        }
+        return { status: 0, stdout: `${count}\n`, stderr: "" };
       }
       if (command === "gh" && args[0] === "run" && args[1] === "cancel") {
         if (cancelFails) return { status: 1, stdout: "", stderr: "HTTP 403" };
@@ -441,6 +461,7 @@ function fakeIo({ files = true, headAfter = SHA, dirtyAfter = "", stamp = null, 
     visible(command, args) {
       const key = [command, ...args].join(" ");
       events.push(`visible ${key}`);
+      for (const [prefix, ms] of Object.entries(advance)) if (key.startsWith(prefix)) clock += ms;
       if (failOn && key.startsWith(failOn)) {
         if (failOn === "interrupt") throw new InterruptedError("SIGINT");
         throw new Error(`${key} failed (exit 1)`);
@@ -464,6 +485,20 @@ function fakeIo({ files = true, headAfter = SHA, dirtyAfter = "", stamp = null, 
     sleep: async (ms) => {
       clock += ms;
       events.push("sleep");
+      sleeps += 1;
+      if (signalAtSleep && sleeps === signalAtSleep) for (const handler of [...handlers]) handler("SIGINT");
+    },
+    onInterrupt: (handler) => {
+      handlers.push(handler);
+      events.push("onInterrupt");
+      return () => {
+        handlers.splice(handlers.indexOf(handler), 1);
+        events.push("offInterrupt");
+      };
+    },
+    exit: (code) => {
+      exits.push(code);
+      throw new Error(`exit ${code}`);
     },
     log: (text) => logs.push(text),
   };
@@ -471,7 +506,7 @@ function fakeIo({ files = true, headAfter = SHA, dirtyAfter = "", stamp = null, 
     const readText = io.readText;
     io.readText = (path) => (path === STAMP_FILE ? stamp : readText(path));
   }
-  return { io, events, written, logs, texts, dispatched };
+  return { io, events, written, logs, texts, dispatched, handlers, exits };
 }
 const visible = (events) => events.filter((e) => e.startsWith("visible ")).map((e) => e.slice(8));
 
@@ -824,20 +859,6 @@ test("isStuck: queued with 0 jobs for more than the limit, nothing else", () => 
 });
 
 
-test("a stuck early run is reported, cancelled and replaced after the release is created", async () => {
-  // The early run stays queued with 0 jobs; CI takes long enough for it to be stuck by the tag.
-  const { io, events, logs, dispatched } = fakeIo({
-    ciRuns: [...Array(30).fill([run("in_progress")]), [run("completed", "success")]],
-    early: { view: (id) => (id === 4242 ? { status: "queued", conclusion: null } : { status: "in_progress", conclusion: null }), jobs: (id) => (id === 4242 ? 0 : 3) },
-  });
-  await runRelease([V], io);
-  assert.ok(logs.some((l) => /queued with no job for \d+ minutes \(a stuck queue\).*Cancelling it; a new run is dispatched after the release/s.test(l)));
-  const cancelAt = events.indexOf("capture gh run cancel 4242 --repo hhoangg/monoptah");
-  assert.ok(cancelAt >= 0 && cancelAt < indexOf(events, "visible git tag"));
-  assert.deepEqual(dispatched, ["req-1", "req-2"]);
-  assert.ok(events.findLastIndex((e) => e.startsWith("capture gh workflow run")) > indexOf(events, "visible gh release create"));
-});
-
 test("a run that stays stuck after the release is cancelled, confirmed and only then replaced", async () => {
   const { io, events, logs, dispatched } = fakeIo({
     early: {
@@ -934,4 +955,143 @@ test("the workflow runs its helper scripts from its own checkout and checks thei
   // No helper call sits inside a bare condition where its failure would be swallowed.
   assert.ok(!/\[\[ "\$\(node /.test(workflow));
   assert.ok(!/done < <\(node /.test(workflow));
+});
+
+const healthyJobs = [
+  { name: "Plan the release", status: "completed", conclusion: "success" },
+  { name: "Package linux", status: "in_progress", conclusion: null },
+  { name: "Wait for the macOS files and CI", status: "in_progress", conclusion: null },
+];
+const stuckEarly = {
+  view: (id) => (id === 4242 ? { status: "queued", conclusion: null } : { status: "in_progress", conclusion: null }),
+  jobs: (id) => (id === 4242 ? 0 : 3),
+};
+const indexAfter = (events, from, prefix) => events.findIndex((e, i) => i > from && e.startsWith(prefix));
+
+test("evaluateEarlyJobs: a failed, cancelled or timed out job, or a finished await-release, loses the run", () => {
+  assert.equal(evaluateEarlyJobs(healthyJobs), null);
+  assert.equal(evaluateEarlyJobs([]), null);
+  for (const conclusion of ["failure", "cancelled", "timed_out"])
+    assert.match(evaluateEarlyJobs([...healthyJobs, { name: "Package windows", status: "completed", conclusion }]), new RegExp(`Package windows" ${conclusion}`));
+  assert.match(
+    evaluateEarlyJobs([{ name: "Wait for the macOS files and CI", status: "completed", conclusion: "success" }]),
+    /await-release job is completed/,
+  );
+  assert.equal(evaluateEarlyJobs([{ name: "Wait for the macOS files and CI", status: "queued", conclusion: null }]), null);
+});
+
+test("awaitLimitWarning and interruptActions are plain decisions", () => {
+  assert.equal(awaitLimitWarning(10 * MIN, 60), null);
+  assert.match(awaitLimitWarning(70 * MIN, 60), /at most 120 minutes.*70 minutes have passed.*--ci-timeout 60/);
+  const early = { id: 4242 };
+  assert.deepEqual(interruptActions({ tagPushed: false, early }), { cancel: early, recover: false });
+  assert.deepEqual(interruptActions({ tagPushed: false, early: null }), { cancel: null, recover: false });
+  assert.deepEqual(interruptActions({ tagPushed: true, early }), { cancel: null, recover: true });
+});
+
+test("a stuck early run is checked after native:check, cancelled, confirmed and replaced before the tag", async () => {
+  const { io, events, dispatched, logs } = fakeIo({ early: { ...stuckEarly, advance: { "npm run native:check": 15 * MIN } } });
+  await runRelease([V], io);
+  const check = indexOf(events, "visible npm run native:check");
+  const cancel = indexAfter(events, check, "capture gh run cancel 4242");
+  assert.ok(cancel > check && cancel < indexOf(events, "visible cargo build"));
+  assert.ok(indexAfter(events, cancel, "capture gh run view 4242") > cancel, "the cancel is confirmed");
+  assert.deepEqual(dispatched, ["req-1", "req-2"]);
+  assert.ok(events.findLastIndex((e) => e.startsWith("capture gh workflow run")) < indexOf(events, "visible git tag"));
+  assert.ok(logs.some((l) => /New early CI run: https:\/\/example\.test\/runs\/4243/.test(l)));
+});
+
+test("a stuck early run is also caught after the build", async () => {
+  const { io, events, dispatched } = fakeIo({ early: { ...stuckEarly, advance: { "cargo build": 15 * MIN } } });
+  await runRelease([V], io);
+  const build = indexOf(events, "visible cargo build");
+  assert.ok(indexAfter(events, build, "capture gh run cancel 4242") > build);
+  assert.deepEqual(dispatched, ["req-1", "req-2"]);
+});
+
+test("when the stuck early run cannot be confirmed cancelled the script goes on without it and prints the command", async () => {
+  const { io, logs, dispatched } = fakeIo({ early: { ...stuckEarly, cancelFails: true, advance: { "npm run native:check": 15 * MIN } } });
+  await runRelease([V], io);
+  assert.ok(logs.some((l) => /Could not confirm that it was cancelled\. Continuing without an early run.*gh run cancel 4242 --repo hhoangg\/monoptah/s.test(l)));
+  // No replacement before the tag; the fresh run comes after the release.
+  assert.deepEqual(dispatched, ["req-1", "req-2"]);
+});
+
+test("an early run with a failed job is cancelled before the tag and not replaced early", async () => {
+  const failed = (id) => [...healthyJobs.slice(0, 1), { name: "Package windows", status: "completed", conclusion: "failure" }, healthyJobs[2]];
+  const { io, events, dispatched, logs } = fakeIo({ early: { jobList: failed } });
+  await runRelease([V], io);
+  assert.ok(logs.some((l) => /is no use: its job "Package windows" failure/.test(l)));
+  assert.ok(events.some((e) => e.startsWith("capture gh run cancel 4242")));
+  assert.deepEqual(dispatched, ["req-1", "req-2"]);
+  assert.ok(events.findLastIndex((e) => e.startsWith("capture gh workflow run")) > indexOf(events, "visible gh release create"));
+});
+
+test("after the release an early run that is in progress but has a failed job is cancelled, confirmed and replaced", async () => {
+  // Healthy for the three checks before the tag, a failed Windows job by the time the release exists.
+  const jobList = (id, n) => (id === 4242 && n >= 4 ? [healthyJobs[0], { name: "Package windows", status: "completed", conclusion: "failure" }, healthyJobs[2]] : healthyJobs);
+  const { io, events, dispatched, logs } = fakeIo({ early: { jobList } });
+  await runRelease([V], io);
+  const release = indexOf(events, "visible gh release create");
+  const cancel = indexAfter(events, release, "capture gh run cancel 4242");
+  assert.ok(cancel > release);
+  assert.ok(indexAfter(events, cancel, "capture gh run view 4242") > cancel);
+  assert.deepEqual(dispatched, ["req-1", "req-2"]);
+  assert.ok(events.findLastIndex((e) => e.startsWith("capture gh workflow run")) > cancel);
+  assert.ok(logs.some((l) => /cannot be kept: its job "Package windows" failure/.test(l)));
+  assert.ok(logs.some((l) => /^Run: https:\/\/example\.test\/runs\/4243 \(in_progress\)/.test(l)));
+});
+
+test("after the release a finished await-release job also replaces the early run", async () => {
+  const jobList = (id, n) => (id === 4242 && n >= 4 ? [healthyJobs[0], { name: "Wait for the macOS files and CI", status: "completed", conclusion: "failure" }] : healthyJobs);
+  const { io, dispatched } = fakeIo({ early: { jobList } });
+  await runRelease([V], io);
+  assert.deepEqual(dispatched, ["req-1", "req-2"]);
+});
+
+test("after the release an unconfirmed cancel of a lost early run dispatches nothing and says what to do", async () => {
+  const jobList = (id, n) => (id === 4242 && n >= 4 ? [healthyJobs[0], { name: "Package windows", status: "completed", conclusion: "failure" }] : healthyJobs);
+  const { io, dispatched } = fakeIo({ early: { jobList, cancelFails: true } });
+  await assert.rejects(
+    runRelease([V], io),
+    /cannot be kept \(its job "Package windows" failure\) and its cancel could not be confirmed.*no new run was dispatched.*gh run cancel 4242 --repo hhoangg\/monoptah.*gh workflow run native-release-monoptah\.yml/s,
+  );
+  assert.deepEqual(dispatched, ["req-1"]);
+});
+
+test("a long CI timeout warns that the early run may give up before the tag", async () => {
+  const { io, logs } = fakeIo();
+  await runRelease([V, "--ci-timeout", "130"], io);
+  assert.ok(logs.some((l) => /Warning: the early run waits for the tag for at most 120 minutes.*--ci-timeout 130/s.test(l)));
+});
+
+test("Ctrl-C during the CI wait before the tag cancels the early run, prints it and exits 130", async () => {
+  const { io, events, logs, exits } = fakeIo({ ciRuns: [[run("queued")]], early: { signalAtSleep: 1 } });
+  await assert.rejects(runRelease([V], io), /exit 130/);
+  assert.deepEqual(exits, [130]);
+  assert.ok(events.includes("capture gh run cancel 4242 --repo hhoangg/monoptah"));
+  assert.ok(logs.some((l) => /Interrupted \(SIGINT\)\..*was cancelled.*Nothing was tagged, pushed or published/s.test(l)));
+  assert.ok(!events.some((e) => /^visible (git tag|git push|gh release)/.test(e)));
+});
+
+test("Ctrl-C after the tag was pushed only prints the recovery and never cancels", async () => {
+  // No early run is found, so the fresh dispatch after the release polls and sleeps: the 11th sleep.
+  const { io, events, logs, exits } = fakeIo({ early: { findable: false, signalAtSleep: 11 } });
+  await assert.rejects(runRelease([V], io), /exit 130/);
+  assert.deepEqual(exits, [130]);
+  assert.ok(!events.some((e) => e.startsWith("capture gh run cancel")));
+  assert.ok(logs.some((l) => /Interrupted \(SIGINT\)\..*The tag native-v0\.40\.5 is on origin.*gh workflow run native-release-monoptah\.yml/s.test(l)));
+});
+
+test("the interrupt handler is only installed around waits and always removed", async () => {
+  const { io, events } = fakeIo({ ciRuns: [[run("queued")], [run("completed", "success")]] });
+  await runRelease([V], io);
+  assert.equal(events.filter((e) => e === "onInterrupt").length, events.filter((e) => e === "offInterrupt").length);
+  // Never active while a child process runs: every visible command sits between an off and the next on.
+  let active = 0;
+  for (const e of events) {
+    if (e === "onInterrupt") active += 1;
+    else if (e === "offInterrupt") active -= 1;
+    else if (e.startsWith("visible ")) assert.equal(active, 0, e);
+  }
 });

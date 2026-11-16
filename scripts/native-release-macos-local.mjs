@@ -448,9 +448,8 @@ const stuckReport = (run, minutes) =>
 // MAX_REDISPATCH times. Throws, with the commands to continue, when a stuck run
 // cannot be confirmed cancelled (no new dispatch then, so two runs never race)
 // or when runs keep getting stuck.
-export async function watchRun(io, run, { version, sha }) {
+export async function watchRun(io, run, { version, sha, ctx = { redispatched: 0 } }) {
   let current = run;
-  let redispatched = 0;
   for (;;) {
     const state = viewRun(io, current.id);
     const jobs = jobsCount(io, current.id);
@@ -464,18 +463,18 @@ export async function watchRun(io, run, { version, sha }) {
           `${stuckReport(current, minutes)} The cancel could not be confirmed (gh run view ${current.id} --repo ${REPOSITORY} --json status), so no new run was dispatched: two runs must not race. ` +
             `Cancel it by hand: ${cancelCommand(current.id)}. When gh run view shows it completed, start a new run: ${manualDispatch(version)}`,
         );
-      if (redispatched >= MAX_REDISPATCH)
+      if (ctx.redispatched >= MAX_REDISPATCH)
         throw new Error(
           `${stuckReport(current, minutes)} It was cancelled, but ${MAX_REDISPATCH} new runs were already stuck too, so the script stops. The tag and the release exist. Check https://www.githubstatus.com, then start the workflow again: ${manualDispatch(version)}`,
         );
-      redispatched += 1;
+      ctx.redispatched += 1;
       const fresh = await dispatchWorkflow(io, { version, sha });
       if (!fresh.dispatched) throw new Error("Could not dispatch " + WORKFLOW_FILE + ": " + fresh.error);
       if (!fresh.run) {
         io.log("The new run was dispatched but could not be found in the run list, so it is not watched.");
         return { run: null, state: null };
       }
-      io.log("New run " + redispatched + " of " + MAX_REDISPATCH + ": " + fresh.run.url);
+      io.log("New run " + ctx.redispatched + " of " + MAX_REDISPATCH + ": " + fresh.run.url);
       current = fresh.run;
       continue;
     }
@@ -483,6 +482,93 @@ export async function watchRun(io, run, { version, sha }) {
     io.log("Waiting for the run to start: " + current.url + " (" + (state?.status ?? "unknown") + ", " + (jobs ?? "unknown") + " jobs)");
     await io.sleep(WATCH_POLL_MS);
   }
+}
+
+// ---- Is the early run still worth keeping? -------------------------------
+export const AWAIT_LIMIT_MINUTES = 120; // the await-release job's limit
+const AWAIT_JOB = /Wait for the macOS files/;
+const ALIVE = new Set(["queued", "in_progress", "waiting", "pending", "requested"]);
+
+// jobs: [{ name, status, conclusion }]. Returns why the run is lost, or null.
+// A job that failed, was cancelled or timed out means the release can never be
+// published by this run (publish needs every build), even while the run still
+// shows in_progress because await-release keeps waiting. The await-release job
+// itself must still be queued or running.
+export function evaluateEarlyJobs(jobs) {
+  const bad = jobs.find((job) => ["failure", "cancelled", "timed_out"].includes(job.conclusion));
+  if (bad) return `its job "${bad.name}" ${bad.conclusion}`;
+  const wait = jobs.find((job) => AWAIT_JOB.test(job.name));
+  if (wait && !ALIVE.has(wait.status)) return `its await-release job is ${wait.status}${wait.conclusion ? " (" + wait.conclusion + ")" : ""}`;
+  return null;
+}
+
+// The jobs of a run, or null when unreadable.
+export function listJobs(io, id) {
+  const result = io.capture("gh", [
+    "api", `repos/${REPOSITORY}/actions/runs/${id}/jobs`, "--jq", "[.jobs[] | {name: .name, status: .status, conclusion: .conclusion}]",
+  ]);
+  if (result.status !== 0) return null;
+  try {
+    const jobs = JSON.parse(result.stdout);
+    return Array.isArray(jobs) ? jobs : null;
+  } catch {
+    return null;
+  }
+}
+
+// { state: "ok" | "stuck" | "bad", reason, finished }. Unreadable state counts as ok:
+// churning runs on a flaky read is worse than keeping one.
+export function earlyRunHealth(io, run) {
+  const state = viewRun(io, run.id);
+  if (!state) return { state: "ok" };
+  if (state.status === "completed")
+    return { state: "bad", finished: true, reason: `it already finished (${state.conclusion ?? "no conclusion"})` };
+  const jobs = listJobs(io, run.id);
+  const why = jobs ? evaluateEarlyJobs(jobs) : null;
+  if (why) return { state: "bad", reason: why };
+  const now = io.now();
+  if (isStuck(state, jobsCount(io, run.id), run.dispatchedAt, now))
+    return { state: "stuck", reason: stuckReport(run, Math.round((now - run.dispatchedAt) / 60_000)) };
+  return { state: "ok" };
+}
+
+// Before the tag: keeps a healthy early run. A stuck one is cancelled, confirmed
+// and replaced by a new early run (it only waits for the tag, so this is safe);
+// a lost one is cancelled and not replaced (a fresh run is dispatched after the
+// release). If a cancel cannot be confirmed the script goes on without an early
+// run and says how to cancel it. Returns the early run to use, or null.
+export async function ensureEarlyRun(io, early, ctx, { version, sha }) {
+  const health = earlyRunHealth(io, early);
+  if (health.state === "ok") return early;
+  io.log(`\nThe early CI run ${early.url} is no use: ${health.reason}.`);
+  if (!health.finished && !(await cancelAndConfirm(io, early))) {
+    io.log(`Could not confirm that it was cancelled. Continuing without an early run; a fresh run is dispatched after the release is created. Cancel the old one by hand: ${cancelCommand(early.id)}`);
+    return null;
+  }
+  io.log("It is not running any more.");
+  if (health.state !== "stuck" || ctx.redispatched >= MAX_REDISPATCH) return null;
+  ctx.redispatched += 1;
+  const fresh = await dispatchWorkflow(io, { version, sha });
+  if (!fresh.dispatched || !fresh.run) {
+    io.log("Could not start a replacement early run" + (fresh.error ? " (" + fresh.error + ")" : "") + "; a fresh run is dispatched after the release is created.");
+    return null;
+  }
+  io.log("New early CI run: " + fresh.run.url);
+  return fresh.run;
+}
+
+// A warning when the CI wait could outlast the await-release limit of the early
+// run (it then fails, and a fresh run is dispatched after the release).
+export function awaitLimitWarning(elapsedMs, ciTimeoutMinutes) {
+  const total = elapsedMs / 60_000 + ciTimeoutMinutes;
+  if (total <= AWAIT_LIMIT_MINUTES) return null;
+  return `Warning: the early run waits for the tag for at most ${AWAIT_LIMIT_MINUTES} minutes and ${Math.round(elapsedMs / 60_000)} minutes have passed; with --ci-timeout ${ciTimeoutMinutes} it may give up before the tag. If it does, a fresh run is dispatched after the release is created.`;
+}
+
+// What to do on SIGINT/SIGTERM during an async wait. Before the tag was pushed
+// the early run is cancelled; after it only the recovery text is printed.
+export function interruptActions({ tagPushed, early }) {
+  return { cancel: !tagPushed && early ? early : null, recover: tagPushed };
 }
 
 // Cancels the early run, best effort. Returns the sentence to append to an error.
@@ -569,13 +655,14 @@ export class InterruptedError extends Error {
   }
 }
 
-// Interrupts: no SIGINT handler is installed. A child killed by a signal raises
-// InterruptedError (recovery text for the publish step, exit 130; before the tag
-// the early run is cancelled). Ctrl-C landing between two children kills this
-// process with the default action instead, and prints nothing: if that happens
-// while publishing, check the tag and release state with gh release view. If it
-// happens before the tag, the early run is not cancelled: it fails by itself
-// after its 120 minute wait for the release, and nothing is published.
+// Interrupts: a child killed by a signal raises InterruptedError (recovery text
+// for the publish step, exit 130). While the script waits with no child running
+// (CI wait, run watching, early run checks) a SIGINT/SIGTERM handler cancels the
+// early run before the tag, prints the recovery after it, and exits 130. Ctrl-C
+// landing between two children, outside those waits, kills this process with
+// the default action and prints nothing: before the tag the early run is then
+// not cancelled and fails by itself after its 120 minute wait (nothing is
+// published); while publishing, check gh release view.
 //
 // The whole flow with its side effects injected:
 //   io.platform, io.arch, io.env
@@ -585,6 +672,8 @@ export class InterruptedError extends Error {
 //   io.makeTempDir(version), io.removeDir(dir), io.writeStamp(text), io.log(text)
 //   io.writeText(path, text), io.now() (ms), io.sleep(ms) (awaitable)
 //   io.randomId() -> a short unique string for the workflow run name
+//   io.onInterrupt(handler) -> a function that removes the handler again;
+//   io.exit(code)
 // The order is: preconditions, toolchain checks, native:check (or its stamp),
 // build, package, the dry-run stop, a recheck of HEAD and the tree, then publish.
 export async function runRelease(argv, io) {
@@ -636,8 +725,38 @@ export async function runRelease(argv, io) {
   // builds. Without it (dispatch refused, run not found) a run is dispatched
   // after the release is created, as before.
   let early = null;
+  const ctx = { redispatched: 0 };
+  let tagPushed = false;
+  let params;
+  // Signals are handled only while this process waits with no child running
+  // (a child killed by a signal already raises InterruptedError). Before the tag
+  // was pushed the early run is cancelled; after it only the recovery is printed.
+  const onSignal = (signal) => {
+    const act = interruptActions({ tagPushed, early });
+    const lines = ["\nInterrupted (" + signal + ")."];
+    if (act.cancel) lines.push(cancelRun(io, act.cancel));
+    lines.push(
+      act.recover
+        ? "The tag " + tag + " is on origin.\n" + recoveryMessage("dispatch", { ...params, early })
+        : "Nothing was tagged, pushed or published.",
+    );
+    io.log(lines.join("\n"));
+    io.exit(130);
+  };
+  const guarded = async (fn) => {
+    const off = io.onInterrupt(onSignal);
+    try {
+      return await fn();
+    } finally {
+      off();
+    }
+  };
+  // Keeps, replaces or drops the early run (see ensureEarlyRun).
+  const refreshEarly = async () => {
+    if (early) early = await guarded(() => ensureEarlyRun(io, early, ctx, { version, sha }));
+  };
   if (!dryRun) {
-    const started = await dispatchWorkflow(io, { version, sha });
+    const started = await guarded(() => dispatchWorkflow(io, { version, sha }));
     if (!started.dispatched)
       io.log("Warning: could not start the early CI run (" + started.error + "). The workflow is dispatched after the release is created instead.");
     else if (started.run === null)
@@ -652,7 +771,6 @@ export async function runRelease(argv, io) {
   // early run, which is cancelled (best effort) before the error goes on.
   let dir;
   let files;
-  let params;
   let commands;
   try {
     let stamp = "";
@@ -667,6 +785,7 @@ export async function runRelease(argv, io) {
       if (after.head === sha && after.dirty === "") io.writeStamp(stampContent(sha, rustcVersion));
       else io.log("Not recording the check: the tree changed while it ran.");
     }
+    await refreshEarly();
 
     io.log("Building " + version + " for " + TARGET + "...");
     const build = buildCommand();
@@ -681,6 +800,7 @@ export async function runRelease(argv, io) {
     io.writeText(notesPath, notes.text);
     params = { version, sha, dir, files, notesFile: notesPath };
     commands = publishCommands(params);
+    await refreshEarly();
 
     io.log("\nmacOS release files:");
     for (const file of files) io.log("  " + join(dir, file));
@@ -708,20 +828,14 @@ export async function runRelease(argv, io) {
 
     // CI ran in parallel with the check and the build; it must have passed
     // before anything is tagged.
-    io.log("\nWaiting for native.yml on " + sha.slice(0, 12) + "...");
-    await waitForCi(io, sha, ciTimeoutMinutes);
-
-    // A run that GitHub never started is no use: drop it, and a fresh one is
-    // dispatched once the release exists.
     if (early) {
-      const state = viewRun(io, early.id);
-      const now2 = io.now();
-      if (isStuck(state, state ? jobsCount(io, early.id) : null, early.dispatchedAt, now2)) {
-        io.log("\n" + stuckReport(early, Math.round((now2 - early.dispatchedAt) / 60_000)) + " Cancelling it; a new run is dispatched after the release is created.");
-        io.log(cancelRun(io, early));
-        early = null;
-      }
+      const warning = awaitLimitWarning(io.now() - early.dispatchedAt, ciTimeoutMinutes);
+      if (warning) io.log("\n" + warning);
     }
+    io.log("\nWaiting for native.yml on " + sha.slice(0, 12) + "...");
+    await guarded(() => waitForCi(io, sha, ciTimeoutMinutes));
+    // Still alive and started? (It may have failed or got stuck while we waited.)
+    await refreshEarly();
   } catch (error) {
     if (early) error.message = error.message + "\n\n" + cancelRun(io, early);
     throw error;
@@ -741,37 +855,51 @@ export async function runRelease(argv, io) {
     }
   }
 
-  // The release now has the macOS files. A running early run picks them up by
-  // itself; a finished one (or none) needs a new run.
+  tagPushed = true;
+  // The release now has the macOS files. A healthy early run picks them up by
+  // itself. One that has finished, has a failed job (it can never publish, even
+  // while await-release keeps it in progress) or is stuck is cancelled, the
+  // cancel is confirmed, and only then a new run is dispatched.
   let run = early;
   try {
-    const status = early ? viewRun(io, early.id) : null;
-    if (early && status && status.status !== "completed") {
-      io.log("\nThe early CI run continues and now sees the tag and the release: " + early.url);
-    } else {
-      io.log(
-        early
-          ? "\nThe early CI run is " + (status ? "finished (" + (status.conclusion ?? "no conclusion") + ")" : "not readable") + "; dispatching a new run."
-          : "\nNo early CI run; dispatching the workflow.",
-      );
+    run = await guarded(async () => {
+      if (early) {
+        const health = earlyRunHealth(io, early);
+        if (health.state === "ok") {
+          io.log("\nThe early CI run continues and now sees the tag and the release: " + early.url);
+          return early;
+        }
+        io.log("\nThe early CI run " + early.url + " cannot be kept: " + health.reason + ".");
+        if (!health.finished && !(await cancelAndConfirm(io, early)))
+          throw new Error(
+            "The early CI run " + early.url + " cannot be kept (" + health.reason + ") and its cancel could not be confirmed, so no new run was dispatched: two runs must not race. Cancel it by hand: " + cancelCommand(early.id) + ". When gh run view shows it completed, start a new run: " + manualDispatch(version),
+          );
+        if (ctx.redispatched >= MAX_REDISPATCH)
+          throw new Error(
+            "The early CI run cannot be kept (" + health.reason + ") but " + MAX_REDISPATCH + " runs were already replaced, so the script stops. Start the workflow again once the cause is fixed: " + manualDispatch(version),
+          );
+        ctx.redispatched += 1;
+        io.log("Dispatching a new run.");
+      } else io.log("\nNo early CI run; dispatching the workflow.");
       const fresh = await dispatchWorkflow(io, { version, sha });
       if (!fresh.dispatched) throw new Error("Could not dispatch " + WORKFLOW_FILE + ": " + fresh.error);
-      run = fresh.run;
-    }
+      return fresh.run;
+    });
   } catch (error) {
-    error.message = error.message + "\n\n" + recoveryMessage("dispatch", recoveryParams);
+    error.message = error.message + "\n\n" + recoveryMessage("dispatch", { ...params, early });
     throw error;
   }
   // Make sure GitHub really starts the run: a queue that stays stuck is
   // cancelled and replaced (see watchRun).
   if (run) {
     try {
-      const watched = await watchRun(io, run, { version, sha });
+      const watched = await guarded(() => watchRun(io, run, { version, sha, ctx }));
       run = watched.run;
+      if (run) io.log("Run: " + run.url + " (" + (watched.state?.status ?? "unknown") + ")");
       if (watched.state?.status === "completed" && watched.state.conclusion !== "success")
         io.log("Warning: the run finished right away with " + watched.state.conclusion + ": " + (run?.url ?? "") + "\nLook at its log. To start a new one: " + manualDispatch(version));
     } catch (error) {
-      error.message = error.message + "\n\nThe tag " + tag + " and its release exist. " + recoveryMessage("dispatch", recoveryParams);
+      error.message = error.message + "\n\nThe tag " + tag + " and its release exist. " + recoveryMessage("dispatch", { ...params, early });
       throw error;
     }
   }
@@ -834,6 +962,16 @@ function realIo() {
       writeFileSync(abs(STAMP_FILE), text);
     },
     randomId: () => randomBytes(6).toString("hex"),
+    onInterrupt(handler) {
+      const listener = (signal) => handler(signal);
+      process.on("SIGINT", listener);
+      process.on("SIGTERM", listener);
+      return () => {
+        process.off("SIGINT", listener);
+        process.off("SIGTERM", listener);
+      };
+    },
+    exit: (code) => process.exit(code),
     now: () => Date.now(),
     sleep: (ms) => new Promise((done) => setTimeout(done, ms)),
     log: (text) => console.log(text),
