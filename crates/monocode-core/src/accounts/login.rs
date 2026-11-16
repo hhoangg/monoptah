@@ -358,6 +358,9 @@ fn run(
         .map_err(|e| format!("Could not start {} sign-in: {e}", kind.label()))?;
     let _registration = process::register(child.id());
     let _account_process = super::track(child.id(), kind, profile);
+    // Declared after the registrations so it is released first on every exit,
+    // including an early return or a panic.
+    let guard = process::guard::arm(&child, &command);
     let mut stderr = child.stderr.take().unwrap();
     let (tx, rx) = mpsc::sync_channel(1);
     let progress = io.as_ref().map(|io| io.progress.clone());
@@ -461,7 +464,7 @@ fn run(
         }
     };
     drop(stdin);
-    process::terminate(&mut child);
+    guard.finish_with(&mut child);
     drop(rx);
     // A detached grandchild may keep a pipe open: never wait on it for long.
     // Late progress is ignored by the UI, which matches events to the attempt.
@@ -960,6 +963,160 @@ done"#,
                 cancel.store(true, Ordering::Relaxed);
             }
             (pid, handle.join().unwrap())
+        }
+        use crate::process::guard::testutil::{gone, read_pid, wait_gone, KillOnDrop};
+
+        const HELPER_DIR: &str = "MONOPTAH_GUARD_HELPER_DIR";
+        /// Records its pid and a grandchild's, shows the code prompt, then ignores EOF
+        /// on stdin and keeps running, like a CLI that waits on its browser callback.
+        const STUBBORN: &str = r#"echo $$ > "$MG_DIR/cli.tmp"; mv "$MG_DIR/cli.tmp" "$MG_DIR/cli"
+sleep 300 &
+echo $! > "$MG_DIR/grand.tmp"; mv "$MG_DIR/grand.tmp" "$MG_DIR/grand"
+printf 'Paste code here if prompted > '
+trap '' HUP
+while :; do sleep 1; done"#;
+
+        /// Runs as the app in a re-executed copy of this test binary.
+        fn helper_main(dir: std::path::PathBuf) {
+            // The prompt is read by threads that start after `arm`, so seeing it
+            // proves the watchdog exists.
+            let ready = dir.join("ready");
+            let progress: Arc<dyn Fn(AuthProgress) + Send + Sync> = Arc::new(move |event| {
+                if matches!(event, AuthProgress::CodePrompt { .. }) {
+                    let _ = std::fs::write(&ready, "ready");
+                }
+            });
+            let (_codes_tx, codes) = mpsc::channel();
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", STUBBORN]).env("MG_DIR", &dir);
+            let _ = run(
+                command,
+                Kind::Claude,
+                &Profile::default(),
+                Duration::from_secs(600),
+                Arc::default(),
+                Some(AuthIo { codes, progress }),
+            );
+        }
+
+        #[test]
+        fn the_login_group_dies_with_an_app_that_is_killed_abruptly() {
+            if let Some(dir) = std::env::var_os(HELPER_DIR) {
+                return helper_main(dir.into());
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let test = format!(
+                "{}::the_login_group_dies_with_an_app_that_is_killed_abruptly",
+                module_path!().split_once("::").unwrap().1
+            );
+            let mut app = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test, "--nocapture", "--test-threads=1"])
+                .env(HELPER_DIR, dir.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut cleanup = KillOnDrop(vec![app.id() as i32]);
+            let cli = read_pid(&dir.path().join("cli"));
+            cleanup.0.push(cli);
+            let grand = read_pid(&dir.path().join("grand"));
+            cleanup.0.push(grand);
+            read_pid_wait(&dir.path().join("ready"));
+            assert!(!gone(cli) && !gone(grand));
+            unsafe { libc::kill(app.id() as i32, libc::SIGKILL) };
+            app.wait().unwrap();
+            assert!(wait_gone(cli), "the login CLI must not outlive the app");
+            assert!(wait_gone(grand), "its grandchild must not outlive the app");
+        }
+
+        fn read_pid_wait(path: &std::path::Path) {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !path.exists() {
+                assert!(Instant::now() < deadline, "no {}", path.display());
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        enum Ending {
+            Cancel,
+            Timeout,
+            WrongCode,
+        }
+        /// The CLI leaves a `sleep 300` grandchild; `read` waits for a pasted code.
+        const WITH_GRANDCHILD: &str = r#"echo $$ > "$MG_DIR/cli"
+sleep 300 &
+echo $! > "$MG_DIR/grand"
+printf 'Paste code here if prompted > '
+read -r line
+echo "Login failed" >&2
+exit 1"#;
+
+        /// Ends a sign-in as `ending` says; returns the result, the CLI, the
+        /// grandchild and the watchdog pids.
+        fn end_sign_in(ending: Ending) -> (Result<(), String>, i32, i32, u32) {
+            let dir = tempfile::tempdir().unwrap();
+            let (progress, events) = events();
+            let (codes_tx, codes) = mpsc::channel();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let timeout = match ending {
+                Ending::Timeout => Duration::from_secs(2),
+                _ => Duration::from_secs(60),
+            };
+            let mut command = Command::new("/bin/sh");
+            command
+                .args(["-c", WITH_GRANDCHILD])
+                .env("MG_DIR", dir.path());
+            let flag = cancel.clone();
+            let handle = thread::spawn(move || {
+                let result = run(
+                    command,
+                    Kind::Claude,
+                    &Profile::default(),
+                    timeout,
+                    flag,
+                    Some(AuthIo { codes, progress }),
+                );
+                let watchdog = crate::process::guard::last_watchdog_pid();
+                (result, watchdog)
+            });
+            let mut cleanup = KillOnDrop::default();
+            let cli = read_pid(&dir.path().join("cli"));
+            cleanup.0.push(cli);
+            let grand = read_pid(&dir.path().join("grand"));
+            cleanup.0.push(grand);
+            next(&events);
+            match ending {
+                Ending::Cancel => cancel.store(true, Ordering::Relaxed),
+                Ending::WrongCode => codes_tx.send("wrong-code#wrong-state".into()).unwrap(),
+                Ending::Timeout => {}
+            }
+            let (result, watchdog) = handle.join().unwrap();
+            (result, cli, grand, watchdog.expect("a watchdog"))
+        }
+        fn assert_all_gone(cli: i32, grand: i32, watchdog: u32) {
+            let _cleanup = KillOnDrop(vec![cli, grand, watchdog as i32]);
+            assert!(wait_gone(cli), "the CLI is still running");
+            assert!(wait_gone(grand), "the CLI's grandchild is still running");
+            // Reaped, not a zombie child of this process: the pid is not there at all.
+            assert_ne!(unsafe { libc::kill(watchdog as i32, 0) }, 0);
+        }
+        #[test]
+        fn cancel_leaves_no_grandchild_and_no_watchdog() {
+            let (result, cli, grand, watchdog) = end_sign_in(Ending::Cancel);
+            assert_eq!(result, Err("Sign-in cancelled".into()));
+            assert_all_gone(cli, grand, watchdog);
+        }
+        #[test]
+        fn timeout_leaves_no_grandchild_and_no_watchdog() {
+            let (result, cli, grand, watchdog) = end_sign_in(Ending::Timeout);
+            assert!(result.unwrap_err().contains("timed out"));
+            assert_all_gone(cli, grand, watchdog);
+        }
+        #[test]
+        fn a_wrong_code_leaves_no_grandchild_and_no_watchdog() {
+            let (result, cli, grand, watchdog) = end_sign_in(Ending::WrongCode);
+            assert!(result.unwrap_err().starts_with(NOT_ACCEPTED));
+            assert_all_gone(cli, grand, watchdog);
         }
         #[test]
         fn a_sign_in_cancelled_beforehand_never_starts_the_cli() {

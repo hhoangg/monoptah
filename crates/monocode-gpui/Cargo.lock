@@ -3847,6 +3847,7 @@ dependencies = [
  "url",
  "uuid",
  "webpki-roots 0.26.11",
+ "windows-sys 0.61.2",
  "yaml-rust2",
  "zeroize",
  "zip",
