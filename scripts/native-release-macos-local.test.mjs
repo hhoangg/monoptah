@@ -12,11 +12,24 @@ import {
   InterruptedError,
   NOTES_FILE,
   STAMP_FILE,
+  WORKFLOW_FILE,
   buildCommand,
   buildEnv,
+  cancelCommand,
+  dispatchArgs,
+  manualDispatch,
+  pickRun,
+  CI_POLL_MS,
+  CI_RUNS_JQ,
   ciRunsPath,
+  ciSuccessRunsPath,
+  ciVerdict,
   evaluatePreconditions,
   failureOf,
+  isStuck,
+  evaluateEarlyJobs,
+  awaitLimitWarning,
+  interruptActions,
   formatCommand,
   gatherState,
   interruptedMessage,
@@ -31,18 +44,34 @@ import {
   stampContent,
   stampMatches,
   tagFor,
+  waitForCi,
 } from "./native-release-macos-local.mjs";
 import { assetNames } from "./package-native-monoptah.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
-const read = (path) => readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
+// Workflow and doc text is read with LF line ends, so a CRLF checkout (Windows) gives the same text.
+const read = (path) => readFileSync(new URL(`../${path}`, import.meta.url), "utf8").replace(/\r\n/g, "\n");
+// The release dir path as the script builds it (join uses backslashes on Windows).
+const NOTES_OUT = join("/tmp/out", "release-notes.md");
 const V = "0.40.5";
 const SHA = "a".repeat(40);
 
 test("arguments: a plain version, optional --dry-run, nothing else", () => {
-  assert.deepEqual(parseArgs([V]), { version: V, dryRun: false, recheck: false });
-  assert.deepEqual(parseArgs([V, "--dry-run"]), { version: V, dryRun: true, recheck: false });
-  assert.deepEqual(parseArgs(["--dry-run", V, "--recheck"]), { version: V, dryRun: true, recheck: true });
+  const base = { version: V, dryRun: false, recheck: false, since: undefined, notesFile: undefined, ciTimeoutMinutes: 60 };
+  assert.deepEqual(parseArgs([V]), base);
+  assert.deepEqual(parseArgs([V, "--dry-run"]), { ...base, dryRun: true });
+  assert.deepEqual(parseArgs(["--dry-run", V, "--recheck"]), { ...base, dryRun: true, recheck: true });
+  assert.deepEqual(parseArgs([V, "--since", "native-v0.40.0", "--notes=hl.md"]), {
+    ...base,
+    since: "native-v0.40.0",
+    notesFile: "hl.md",
+  });
+  assert.equal(parseArgs([V, "--ci-timeout", "90"]).ciTimeoutMinutes, 90);
+  assert.equal(parseArgs([V, "--ci-timeout=0.5"]).ciTimeoutMinutes, 0.5);
+  assert.throws(() => parseArgs([V, "--ci-timeout", "0"]), /number of minutes above 0/);
+  assert.throws(() => parseArgs([V, "--ci-timeout", "abc"]), /number of minutes above 0/);
+  assert.throws(() => parseArgs([V, "--since"]), /--since needs a value/);
+  assert.throws(() => parseArgs([V, "--notes", "--dry-run"]), /--notes needs a value/);
   assert.throws(() => parseArgs([]), /usage/);
   assert.throws(() => parseArgs(["--dry-run"]), /usage/);
   assert.throws(() => parseArgs(["0.40.5-preview.1"]), /plain native release version/);
@@ -114,17 +143,14 @@ const good = {
   head: SHA,
   originMain: SHA,
   dirty: "",
-  notesFirstLine: `# Monoptah Native ${V}`,
   localTag: false,
   remoteTag: false,
   remoteTagCheckFailed: null,
   ghAuthed: true,
   release: "absent",
-  ciCheckFailed: null,
-  ciRuns: 1,
 };
 
-test("preconditions pass for a clean, current main with green CI", () => {
+test("preconditions pass for a clean, current main and do not look at CI", () => {
   assert.deepEqual(evaluatePreconditions(good, V), []);
 });
 
@@ -135,7 +161,6 @@ test("every precondition failure is reported with an actionable message", () => 
     [{ branch: "" }, /\(detached\)/],
     [{ head: "b".repeat(40) }, /not origin\/main.*git pull --ff-only/],
     [{ dirty: " M package.json" }, /tracked changes.*package\.json/s],
-    [{ notesFirstLine: "# Monoptah Native 0.40.4" }, /must be exactly "# Monoptah Native 0\.40\.5".*0\.40\.4/],
     [{ localTag: true }, /already exists locally.*git tag -d native-v0\.40\.5/],
     [{ remoteTag: true }, /already exists on origin/],
     [{ remoteTagCheckFailed: "denied" }, /Could not check the tag on origin: denied/],
@@ -143,8 +168,6 @@ test("every precondition failure is reported with an actionable message", () => 
     [{ tauriCli: false }, /node_modules\/@tauri-apps\/cli is missing.*npm ci/],
     [{ release: "exists" }, /release native-v0\.40\.5 already exists/],
     [{ release: "error", releaseError: "HTTP 500" }, /only HTTP 404 means absent\): HTTP 500/],
-    [{ ciRuns: 0 }, /no successful push run on main for commit aaaaaaaaaaaa/],
-    [{ ciRuns: null, ciCheckFailed: "HTTP 403" }, /Could not read the native.yml runs: HTTP 403/],
   ];
   for (const [change, pattern] of cases) {
     const problems = evaluatePreconditions({ ...good, ...change }, V);
@@ -165,7 +188,21 @@ function fakeRun(overrides = {}) {
     [`git ls-remote --tags origin refs/tags/native-v${V}`]: { status: 0, stdout: "" },
     "gh auth status": { status: 0 },
     [`gh api repos/hhoangg/monoptah/releases/tags/native-v${V}`]: { status: 1, stderr: "gh: Not Found (HTTP 404)" },
-    [`gh api ${ciRunsPath(SHA)} --jq .total_count`]: { status: 0, stdout: "1\n" },
+    "git tag --list native-v*": { status: 0, stdout: "native-v0.40.4\nnative-v0.40.5-preview.1\n" },
+    "git merge-base --is-ancestor native-v0.40.4 HEAD": { status: 0 },
+    "git log --first-parent -z --format=%H%n%s%n%b native-v0.40.4..HEAD": {
+      status: 0,
+      stdout:
+        "c1\nfeat(ui): new panel (#7)\n\0c2\nMerge pull request #8 from hhoangg/fix/y\nfix: y\n\0",
+    },
+    "gh api repos/hhoangg/monoptah/pulls/7 --jq {title: .title, labels: [.labels[].name]}": {
+      status: 0,
+      stdout: JSON.stringify({ title: "feat(ui): new panel", labels: [] }),
+    },
+    "gh api repos/hhoangg/monoptah/pulls/8 --jq {title: .title, labels: [.labels[].name]}": {
+      status: 0,
+      stdout: JSON.stringify({ title: "fix(core): y is fixed", labels: [] }),
+    },
     ...overrides,
   };
   return (command, args) => {
@@ -174,62 +211,67 @@ function fakeRun(overrides = {}) {
     return { stdout: "", stderr: "", ...table[key] };
   };
 }
-const notesText = `# Monoptah Native ${V}\n\nBody\n`;
+const docsNotes = `# Monoptah Native ${V}\n\nBody\n`;
 
 test("gatherState reads the repository state through the injected runner", () => {
-  const state = gatherState(fakeRun(), { version: V, notesText });
+  const state = gatherState(fakeRun(), { version: V });
   assert.deepEqual(evaluatePreconditions(state, V), []);
   assert.equal(state.release, "absent");
-  assert.equal(state.ciRuns, 1);
-  assert.equal(state.notesFirstLine, `# Monoptah Native ${V}`);
 });
 
 test("gatherState: only HTTP 404 means no release, other gh errors fail", () => {
   const key = `gh api repos/hhoangg/monoptah/releases/tags/native-v${V}`;
-  const exists = gatherState(fakeRun({ [key]: { status: 0, stdout: "{}" } }), { version: V, notesText });
+  const exists = gatherState(fakeRun({ [key]: { status: 0, stdout: "{}" } }), { version: V });
   assert.equal(exists.release, "exists");
-  const broken = gatherState(fakeRun({ [key]: { status: 1, stderr: "gh: Bad credentials (HTTP 401)" } }), { version: V, notesText });
+  const broken = gatherState(fakeRun({ [key]: { status: 1, stderr: "gh: Bad credentials (HTTP 401)" } }), { version: V });
   assert.equal(broken.release, "error");
   assert.ok(evaluatePreconditions(broken, V).some((p) => /HTTP 401/.test(p)));
 });
 
-test("gatherState: tags and CI are detected", () => {
+test("gatherState: tags are detected", () => {
   const state = gatherState(
     fakeRun({
       [`git rev-parse -q --verify refs/tags/native-v${V}`]: { status: 0, stdout: SHA },
       [`git ls-remote --tags origin refs/tags/native-v${V}`]: { status: 0, stdout: `${SHA}\trefs/tags/native-v${V}\n` },
-      [`gh api ${ciRunsPath(SHA)} --jq .total_count`]: { status: 0, stdout: "0\n" },
     }),
-    { version: V, notesText },
+    { version: V },
   );
   assert.equal(state.localTag, true);
   assert.equal(state.remoteTag, true);
-  assert.equal(state.ciRuns, 0);
-  assert.equal(evaluatePreconditions(state, V).length, 3);
-  const failedGh = gatherState(
-    fakeRun({ [`gh api ${ciRunsPath(SHA)} --jq .total_count`]: { status: 1, stderr: "boom" } }),
-    { version: V, notesText },
-  );
-  assert.equal(failedGh.ciCheckFailed, "boom");
+  assert.equal(evaluatePreconditions(state, V).length, 2);
 });
 
-test("the CI query is the one the workflow gate uses", () => {
-  const workflow = read(".github/workflows/native-release-monoptah.yml");
-  assert.ok(
-    workflow.includes("actions/workflows/native.yml/runs?head_sha=$SHA&event=push&branch=main&status=success&per_page=1"),
-  );
+test("the CI query lists the native.yml push runs on main for the commit, in any state", () => {
   assert.equal(
     ciRunsPath(SHA),
-    `repos/hhoangg/monoptah/actions/workflows/native.yml/runs?head_sha=${SHA}&event=push&branch=main&status=success&per_page=1`,
+    `repos/hhoangg/monoptah/actions/workflows/native.yml/runs?head_sha=${SHA}&event=push&branch=main&per_page=20`,
   );
+});
+
+const run = (status, conclusion = null, id = 1) => ({ id, status, conclusion, url: `https://example.test/runs/${id}` });
+
+test("ciVerdict: success wins, pending while unfinished or absent, failed when all finished without success", () => {
+  assert.equal(ciVerdict([run("completed", "success")]), "success");
+  assert.equal(ciVerdict([run("completed", "failure", 1), run("completed", "success", 2)]), "success");
+  assert.equal(ciVerdict([run("in_progress"), run("completed", "failure", 2)]), "pending");
+  assert.equal(ciVerdict([run("queued")]), "pending");
+  assert.equal(ciVerdict([]), "pending");
+  assert.equal(ciVerdict([run("completed", "failure")]), "failed");
+  assert.equal(ciVerdict([run("completed", "cancelled", 1), run("completed", "skipped", 2)]), "failed");
 });
 
 const names = assetNames(V);
-const params = { version: V, sha: SHA, dir: "/tmp/out", files: [names.updater, names.zip, names.sha256] };
+const params = {
+  version: V,
+  sha: SHA,
+  dir: "/tmp/out",
+  files: [names.updater, names.zip, names.sha256],
+  notesFile: "/tmp/out/release-notes.md",
+};
 
-test("publish commands: tag at the checked commit, push only that tag, release with the three files, dispatch", () => {
+test("publish commands: tag at the checked commit, push only that tag, release with the three files", () => {
   const commands = publishCommands(params);
-  assert.deepEqual(commands.map((c) => c.step), ["tag", "push-tag", "release", "dispatch"]);
+  assert.deepEqual(commands.map((c) => c.step), ["tag", "push-tag", "release"]);
   assert.deepEqual(commands[0].args, ["tag", "native-v0.40.5", SHA]);
   assert.deepEqual(commands[1].args, ["push", "origin", "refs/tags/native-v0.40.5"]);
   const release = commands[2].args;
@@ -238,17 +280,27 @@ test("publish commands: tag at the checked commit, push only that tag, release w
   assert.deepEqual(release.slice(3, 6), params.files.map((n) => join("/tmp/out", n)));
   for (const flag of ["--verify-tag", "--latest=false"]) assert.ok(release.includes(flag));
   assert.equal(release[release.indexOf("--title") + 1], "Monoptah Native 0.40.5");
-  assert.equal(release[release.indexOf("--notes-file") + 1], NOTES_FILE);
-  assert.deepEqual(commands[3].args.slice(0, 3), ["workflow", "run", "native-release-monoptah.yml"]);
-  assert.deepEqual(commands[3].args.slice(-4), ["--ref", "main", "-f", "tag=native-v0.40.5"]);
+  assert.equal(release[release.indexOf("--notes-file") + 1], "/tmp/out/release-notes.md");
   assert.ok(!JSON.stringify(commands).includes("SIGNING"));
 });
 
-test("the workflow is dispatched by a file name that exists and accepts the tag input", () => {
-  const dispatch = publishCommands(params)[3].args[2];
-  const workflow = read(`.github/workflows/${dispatch}`);
+test("the workflow is dispatched by a file name that exists and accepts the tag, sha and request_id inputs", () => {
+  const workflow = read(`.github/workflows/${WORKFLOW_FILE}`);
   assert.ok(workflow.includes("workflow_dispatch"));
-  assert.match(workflow, /inputs:\r?\n\s+tag:/);
+  for (const input of ["tag", "sha", "request_id"]) assert.match(workflow, new RegExp(`inputs:[\\s\\S]*\\n      ${input}:`));
+  // The run is found again by the request id in its name.
+  assert.match(workflow, /^run-name: .*inputs\.tag.*inputs\.request_id/m);
+  const args = dispatchArgs({ version: V, sha: SHA, requestId: "abc123" });
+  assert.deepEqual(args.slice(0, 3), ["workflow", "run", "native-release-monoptah.yml"]);
+  assert.deepEqual(args.slice(-6), ["-f", "tag=native-v0.40.5", "-f", `sha=${SHA}`, "-f", "request_id=abc123"]);
+  assert.equal(manualDispatch(V), "gh workflow run native-release-monoptah.yml --repo hhoangg/monoptah --ref main -f tag=native-v0.40.5");
+  assert.equal(cancelCommand(4242), "gh run cancel 4242 --repo hhoangg/monoptah");
+  const runs = [
+    { databaseId: 1, displayTitle: "Native release native-v0.40.5 other", url: "u1" },
+    { databaseId: 2, displayTitle: "Native release native-v0.40.5 abc123", url: "u2" },
+  ];
+  assert.equal(pickRun(runs, "abc123").databaseId, 2);
+  assert.equal(pickRun(runs, "zzz"), null);
 });
 
 test("each failed publish step prints the state left behind and a recovery", () => {
@@ -263,6 +315,14 @@ test("each failed publish step prints the state left behind and a recovery", () 
   const dispatch = recoveryMessage("dispatch", params);
   assert.match(dispatch, /gh workflow run native-release-monoptah\.yml .*tag=native-v0\.40\.5/);
   assert.match(dispatch, /safe to repeat/);
+  // With an early run every step names it and the exact commands.
+  const withEarly = { ...params, early: { id: 4242, url: "https://example.test/runs/4242" } };
+  assert.match(recoveryMessage("tag", withEarly), /gh run cancel 4242 --repo hhoangg\/monoptah/);
+  const pushE = recoveryMessage("push-tag", withEarly);
+  assert.match(pushE, /cancel the early run: gh run cancel 4242/);
+  assert.match(pushE, /early CI run https:\/\/example\.test\/runs\/4242 is still waiting.*120 minutes.*gh workflow run native-release-monoptah\.yml --repo hhoangg\/monoptah --ref main -f tag=native-v0\.40\.5/s);
+  assert.match(recoveryMessage("release", withEarly), /still waiting for the release and the macOS files/);
+  assert.match(recoveryMessage("dispatch", withEarly), /early run .*4242.*gh run cancel 4242/s);
   assert.equal(formatCommand({ command: "gh", args: ["a b", "c"] }), 'gh "a b" c');
 });
 
@@ -294,9 +354,26 @@ test("an interrupt message names the step and how to continue", () => {
 });
 
 // A fake io that records every command, so the tests can check the order.
-function fakeIo({ files = true, headAfter = SHA, dirtyAfter = "", stamp = null, failOn = null } = {}) {
+function fakeIo({ files = true, headAfter = SHA, dirtyAfter = "", stamp = null, failOn = null, docs = docsNotes, ciRuns = [[run("completed", "success")]], early = {} } = {}) {
+  // Options of the early workflow run: dispatchFails, findable, cancelFails, statusAfterRelease.
+  // view(id, call) and jobs(id, call) override the status and the job count of a run.
+  // jobList(id, call) overrides the job list, advance maps a command prefix to the ms it takes,
+  // signalAtSleep makes the n-th sleep deliver SIGINT to the active handlers.
+  let { dispatchFails = 0, findable = true, cancelFails = false, statusAfterRelease = "in_progress", view = null, jobs = null, jobList = null, advance = {}, signalAtSleep = 0, signalName = "SIGINT", viewFails = null } = early;
+  const handlers = [];
+  const exits = [];
+  let sleeps = 0;
+  const dispatched = [];
+  const cancelled = new Set();
+  const calls = {};
+  const countCall = (name, id) => (calls[`${name}${id}`] = (calls[`${name}${id}`] ?? 0) + 1);
+  let ids = 0;
   const events = [];
   const written = [];
+  const logs = [];
+  const texts = {};
+  let clock = 0;
+  let ciReads = 0;
   let revParses = 0;
   let statuses = 0;
   const table = {
@@ -323,17 +400,78 @@ function fakeIo({ files = true, headAfter = SHA, dirtyAfter = "", stamp = null, 
         statuses += 1;
         return { status: 0, stdout: statuses === 1 ? "" : dirtyAfter, stderr: "" };
       }
+      if (command === "gh" && args[0] === "workflow") {
+        if (dispatchFails > 0) {
+          dispatchFails -= 1;
+          return { status: 1, stdout: "", stderr: "HTTP 422 workflow not found" };
+        }
+        dispatched.push(args.find((a) => a.startsWith("request_id=")).slice("request_id=".length));
+        return { status: 0, stdout: "", stderr: "" };
+      }
+      if (command === "gh" && args[0] === "run" && args[1] === "list") {
+        const list = findable
+          ? dispatched.map((id, i) => ({
+              databaseId: 4242 + i,
+              displayTitle: `Native release native-v${V} ${id}`,
+              status: "queued",
+              url: `https://example.test/runs/${4242 + i}`,
+            }))
+          : [];
+        return { status: 0, stdout: JSON.stringify(list), stderr: "" };
+      }
+      if (command === "gh" && args[0] === "run" && args[1] === "view") {
+        const id = Number(args[2]);
+        const n = countCall("view", id);
+        if (viewFails && viewFails(id, n)) return { status: 1, stdout: "", stderr: "HTTP 502" };
+        let state;
+        if (cancelled.has(id)) state = { status: "completed", conclusion: "cancelled" };
+        else if (view) state = view(id, n);
+        else {
+          const status = id === 4242 ? statusAfterRelease : "in_progress";
+          state = { status, conclusion: status === "completed" ? "failure" : null };
+        }
+        return { status: 0, stdout: JSON.stringify(state), stderr: "" };
+      }
+      if (command === "gh" && args[0] === "api" && /\/actions\/runs\/\d+\/jobs$/.test(args[1])) {
+        const id = Number(/runs\/(\d+)\/jobs/.exec(args[1])[1]);
+        const count = jobs ? jobs(id, countCall("jobs", id)) : 3;
+        if (args[3].includes("name:")) {
+          const list = jobList
+            ? jobList(id, countCall("jobList", id))
+            : count === 0
+              ? []
+              : [
+                  { name: "Plan the release", status: "completed", conclusion: "success" },
+                  { name: "Wait for the macOS files and CI", status: "in_progress", conclusion: null },
+                ];
+          return { status: 0, stdout: JSON.stringify(list), stderr: "" };
+        }
+        return { status: 0, stdout: `${count}\n`, stderr: "" };
+      }
+      if (command === "gh" && args[0] === "run" && args[1] === "cancel") {
+        if (cancelFails) return { status: 1, stdout: "", stderr: "HTTP 403" };
+        cancelled.add(Number(args[2]));
+        return { status: 0, stdout: "", stderr: "" };
+      }
+      if (command === "gh" && args[0] === "api" && args[1] === ciRunsPath(SHA)) {
+        const answer = ciRuns[Math.min(ciReads, ciRuns.length - 1)];
+        ciReads += 1;
+        return answer.error !== undefined
+          ? { status: 1, stdout: "", stderr: answer.error }
+          : { status: 0, stdout: JSON.stringify(answer), stderr: "" };
+      }
       return base(command, args);
     },
     visible(command, args) {
       const key = [command, ...args].join(" ");
       events.push(`visible ${key}`);
+      for (const [prefix, ms] of Object.entries(advance)) if (key.startsWith(prefix)) clock += ms;
       if (failOn && key.startsWith(failOn)) {
         if (failOn === "interrupt") throw new InterruptedError("SIGINT");
         throw new Error(`${key} failed (exit 1)`);
       }
     },
-    readText: (path) => (path === NOTES_FILE ? notesText : read(path)),
+    readText: (path) => (path === NOTES_FILE ? docs : read(path)),
     exists: (path) => (path === STAMP_FILE ? stamp !== null : true),
     listDir: () => (files ? ["artifacts-macos-aarch64.json", names.updater, names.zip, names.sha256] : []),
     makeTempDir: () => "/tmp/out",
@@ -342,13 +480,37 @@ function fakeIo({ files = true, headAfter = SHA, dirtyAfter = "", stamp = null, 
       written.push(text);
       events.push("writeStamp");
     },
-    log: () => {},
+    writeText: (path, text) => {
+      texts[path] = text;
+      events.push(`writeText ${path}`);
+    },
+    randomId: () => `req-${++ids}`,
+    now: () => clock,
+    sleep: async (ms) => {
+      clock += ms;
+      events.push("sleep");
+      sleeps += 1;
+      if (signalAtSleep && sleeps === signalAtSleep) for (const handler of [...handlers]) handler(signalName);
+    },
+    onInterrupt: (handler) => {
+      handlers.push(handler);
+      events.push("onInterrupt");
+      return () => {
+        handlers.splice(handlers.indexOf(handler), 1);
+        events.push("offInterrupt");
+      };
+    },
+    exit: (code) => {
+      exits.push(code);
+      throw new Error(`exit ${code}`);
+    },
+    log: (text) => logs.push(text),
   };
   if (stamp !== null) {
     const readText = io.readText;
     io.readText = (path) => (path === STAMP_FILE ? stamp : readText(path));
   }
-  return { io, events, written };
+  return { io, events, written, logs, texts, dispatched, handlers, exits };
 }
 const visible = (events) => events.filter((e) => e.startsWith("visible ")).map((e) => e.slice(8));
 
@@ -371,8 +533,8 @@ test("runRelease: preconditions, toolchain, check, build, package, recheck, then
   assert.deepEqual([...order].sort((a, b) => a - b), order);
   // After packaging: a fresh HEAD and tree read, then the four publish commands.
   const packaged = at("visible " + process.execPath);
-  const publish = visible(events).slice(-4);
-  assert.deepEqual(publish.map((c) => c.split(" ").slice(0, 2).join(" ")), ["git tag", "git push", "gh release", "gh workflow"]);
+  const publish = visible(events).slice(-3);
+  assert.deepEqual(publish.map((c) => c.split(" ").slice(0, 2).join(" ")), ["git tag", "git push", "gh release"]);
   const tagAt = at("visible git tag");
   const lastHeadRead = events.map((e, i) => (e === "capture git rev-parse HEAD" ? i : -1)).filter((i) => i >= 0).pop();
   assert.ok(packaged < lastHeadRead && lastHeadRead < tagAt);
@@ -381,7 +543,7 @@ test("runRelease: preconditions, toolchain, check, build, package, recheck, then
   assert.equal(written.length, 1);
   assert.ok(events.includes("remove /tmp/out"));
   // Nothing before the check ran a publishing command.
-  assert.ok(!visible(events).slice(0, -4).some((c) => /^(git tag|git push|gh )/.test(c)));
+  assert.ok(!visible(events).slice(0, -3).some((c) => /^(git tag|git push|gh )/.test(c)));
 });
 
 test("runRelease --dry-run performs no publish command and leaves the files", async () => {
@@ -474,4 +636,503 @@ test("a child killed by a signal is an interrupt, a plain failure is not", () =>
   assert.equal(failed.interrupted, undefined);
   assert.match(failed.message, /git push failed \(exit 2\)/);
   assert.match(failureOf({ error: new Error("ENOENT") }, cmd).message, /Could not run git: ENOENT/);
+});
+
+test("runRelease generates the notes, prints them, writes them to the release dir and uses that file", async () => {
+  const { io, events, logs, texts } = fakeIo();
+  await runRelease([V], io);
+  const text = texts[NOTES_OUT];
+  assert.ok(text.startsWith(`# Monoptah Native ${V}\n\nBody\n\n## Changes since 0.40.4`));
+  assert.match(text, /### Features\n\n- New panel \(#7\)/);
+  assert.match(text, /### Fixes\n\n- Y is fixed \(#8\)/);
+  assert.ok(logs.join("\n").includes("- New panel (#7)"));
+  const release = visible(events).find((c) => c.startsWith("gh release create"));
+  assert.ok(release.endsWith(`--notes-file ${NOTES_OUT}`));
+  assert.ok(events.indexOf(`writeText ${NOTES_OUT}`) < events.findIndex((e) => e.startsWith("visible git tag")));
+});
+
+test("runRelease --dry-run prints the notes and no longer needs a notes heading for this version", async () => {
+  const { io, logs, texts } = fakeIo({ docs: "# Monoptah Native 0.40.4\n\nOld notes\n" });
+  await runRelease([V, "--dry-run"], io);
+  const out = logs.join("\n");
+  assert.ok(out.includes(`# Monoptah Native ${V}`) && out.includes("- New panel (#7)"));
+  assert.match(out, /Ignoring docs\/native\/monoptah-release-notes\.md.*0\.40\.4/);
+  assert.ok(!texts[NOTES_OUT].includes("Old notes"));
+});
+
+test("runRelease --notes adds highlights and --since overrides the start", async () => {
+  const { io, texts } = fakeIo();
+  const readText = io.readText;
+  io.readText = (path) => (path === "hl.md" ? "# x\n\nHand written\n" : readText(path));
+  const capture = io.capture;
+  io.capture = (c, a) =>
+    a[0] === "rev-parse" && a[3] === "native-v0.40.4^{commit}"
+      ? { status: 0, stdout: "", stderr: "" }
+      : capture(c, a);
+  await runRelease([V, "--dry-run", "--notes", "hl.md", "--since", "native-v0.40.4"], io);
+  assert.match(texts[NOTES_OUT], /^# Monoptah Native 0\.40\.5\n\nHand written\n\n## Changes since 0\.40\.4/);
+});
+
+test("runRelease stops before the long checks when a PR cannot be read", async () => {
+  const { io, events } = fakeIo();
+  const capture = io.capture;
+  io.capture = (c, a) => (c === "gh" && a[1]?.includes("/pulls/7") ? { status: 1, stdout: "", stderr: "HTTP 401" } : capture(c, a));
+  await assert.rejects(runRelease([V], io), /Could not read pull request #7/);
+  assert.equal(visible(events).length, 0);
+  assert.ok(!events.some((e) => e.startsWith("capture xcrun")));
+});
+
+test("runRelease starts native:check and the build without waiting for CI, then waits right before tagging", async () => {
+  const { io, events, logs } = fakeIo({
+    ciRuns: [[], [run("queued")], [run("in_progress")], [run("completed", "success")]],
+  });
+  await runRelease([V], io);
+  const ciReads = events.map((e, i) => (e === `capture gh api ${ciRunsPath(SHA)} --jq ${CI_RUNS_JQ}` ? i : -1)).filter((i) => i >= 0);
+  assert.equal(ciReads.length, 4);
+  const at = (prefix) => events.findIndex((e) => e.startsWith(prefix));
+  assert.ok(Math.min(...ciReads) > at("visible " + process.execPath), "CI is read only after packaging");
+  assert.ok(Math.max(...ciReads) < at("visible git tag"));
+  assert.equal(events.filter((e) => e === "sleep").length, 3);
+  assert.ok(logs.some((l) => /CI: waiting for native\.yml, 0 min elapsed: no native\.yml run found yet/.test(l)));
+  assert.ok(logs.some((l) => /CI: waiting.*run 1 \(queued\) https:\/\/example\.test\/runs\/1/.test(l)));
+  assert.ok(logs.some((l) => /CI: native\.yml passed/.test(l)));
+});
+
+test("runRelease does not tag when native.yml failed and names the run", async () => {
+  const { io, events } = fakeIo({ ciRuns: [[run("completed", "failure", 77)]] });
+  await assert.rejects(runRelease([V], io), /native\.yml did not succeed.*run 77 \(failure\) https:\/\/example\.test\/runs\/77.*Nothing was tagged/s);
+  assert.ok(!visible(events).some((c) => /^(git tag|git push|gh )/.test(c)));
+});
+
+test("runRelease does not tag on a CI timeout and says how to continue", async () => {
+  const { io, events } = fakeIo({ ciRuns: [[run("in_progress")]] });
+  await assert.rejects(
+    runRelease([V, "--ci-timeout", "2"], io),
+    /did not finish within 2 minutes.*Nothing was tagged.*Run this script again.*stamp/s,
+  );
+  assert.ok(!visible(events).some((c) => /^(git tag|git push|gh )/.test(c)));
+  assert.equal(events.filter((e) => e === "sleep").length, 4); // 2 min at 30 s
+});
+
+test("waitForCi tolerates a few failed reads and gives up after five in a row", async () => {
+  const flaky = fakeIo({ ciRuns: [{ error: "HTTP 502" }, { error: "HTTP 502" }, [run("completed", "success")]] });
+  await waitForCi(flaky.io, SHA, 10);
+  assert.ok(flaky.logs.some((l) => /could not read the runs \(HTTP 502\)/.test(l)));
+  const broken = fakeIo({ ciRuns: [{ error: "HTTP 401" }] });
+  await assert.rejects(waitForCi(broken.io, SHA, 10), /five times in a row: HTTP 401.*Nothing was tagged/s);
+  assert.equal(CI_POLL_MS, 30_000);
+});
+
+test("runRelease --dry-run prints the CI state once and never waits", async () => {
+  const { io, events, logs } = fakeIo({ ciRuns: [[run("in_progress")]] });
+  await runRelease([V, "--dry-run"], io);
+  assert.equal(events.filter((e) => e === "sleep").length, 0);
+  assert.equal(events.filter((e) => e.startsWith("capture gh api") && e.includes("/workflows/native.yml/runs")).length, 1);
+  assert.ok(logs.some((l) => /CI state of native\.yml for aaaaaaaaaaaa: pending, run 1 \(in_progress\)/.test(l)));
+});
+
+test("runRelease --dry-run never tags, pushes, creates a release, dispatches or cancels a run", async () => {
+  const { io, events } = fakeIo();
+  await runRelease([V, "--dry-run"], io);
+  const all = events.filter((e) => e.startsWith("visible ") || e.startsWith("capture ")).map((e) => e.replace(/^\w+ /, ""));
+  for (const forbidden of [/^git tag (?!--list)/, /^git push/, /^gh release/, /^gh workflow/, /^gh run cancel/])
+    assert.ok(!all.some((c) => forbidden.test(c)), String(forbidden));
+});
+
+const indexOf = (events, prefix) => events.findIndex((e) => e.startsWith(prefix));
+const cmds = (events) => events.filter((e) => e.startsWith("capture gh ") || e.startsWith("visible ")).map((e) => e.replace(/^\w+ /, ""));
+
+test("the early run is dispatched after the toolchain checks and before native:check, with the commit and a request id", async () => {
+  const { io, events, logs, dispatched } = fakeIo();
+  await runRelease([V], io);
+  const dispatch = indexOf(events, "capture gh workflow run");
+  assert.ok(indexOf(events, "capture rustc -V") < dispatch && dispatch < indexOf(events, "visible npm run native:check"));
+  assert.ok(events[dispatch].endsWith(`-f tag=native-v${V} -f sha=${SHA} -f request_id=req-1`));
+  assert.deepEqual(dispatched, ["req-1"]);
+  assert.ok(logs.some((l) => l.includes("Early CI run") && l.includes("https://example.test/runs/4242")));
+});
+
+test("after the release is created a running early run continues and no second run is dispatched", async () => {
+  const { io, events, dispatched } = fakeIo({ early: { statusAfterRelease: "queued" } });
+  await runRelease([V], io);
+  assert.deepEqual(dispatched, ["req-1"]);
+  assert.ok(events.findLastIndex((e) => e.startsWith("capture gh run view 4242")) > indexOf(events, "visible gh release create"));
+  assert.ok(!cmds(events).some((c) => c.startsWith("gh run cancel")));
+});
+
+test("a finished early run is replaced by a fresh dispatch after the release is created", async () => {
+  const { io, events, dispatched } = fakeIo({ early: { statusAfterRelease: "completed" } });
+  await runRelease([V], io);
+  assert.deepEqual(dispatched, ["req-1", "req-2"]);
+  const fresh = events.findLastIndex((e) => e.startsWith("capture gh workflow run"));
+  assert.ok(fresh > indexOf(events, "visible gh release create"));
+  assert.ok(events[fresh].endsWith(`-f tag=native-v${V} -f sha=${SHA} -f request_id=req-2`));
+});
+
+test("without an early run (dispatch refused or run not found) the workflow is dispatched after the release", async () => {
+  const refused = fakeIo({ early: { dispatchFails: 1 } });
+  await runRelease([V], refused.io);
+  assert.ok(refused.logs.some((l) => /could not start the early CI run \(HTTP 422/.test(l)));
+  assert.deepEqual(refused.dispatched, ["req-2"]);
+  // A refusal of the fresh dispatch too is an error with the manual command.
+  const always = fakeIo({ early: { dispatchFails: 2 } });
+  const err = await runRelease([V], always.io).catch((e) => e);
+  assert.match(err.message, /Could not dispatch native-release-monoptah\.yml: HTTP 422.*safe to repeat.*gh workflow run native-release-monoptah\.yml --repo hhoangg\/monoptah --ref main -f tag=native-v0\.40\.5/s);
+  assert.match(err.message, /safe to repeat/);
+  const lost = fakeIo({ early: { findable: false } });
+  await runRelease([V], lost.io);
+  assert.ok(lost.logs.some((l) => /could not be found in the run list/.test(l)));
+  assert.equal(lost.dispatched.length, 2); // early (not found) and the fresh one
+});
+
+test("a failure before the tag cancels the early run and says so", async () => {
+  const failed = fakeIo({ failOn: "npm run native:check" });
+  await assert.rejects(runRelease([V], failed.io), /native:check failed.*early CI run https:\/\/example\.test\/runs\/4242 was cancelled/s);
+  assert.ok(cmds(failed.events).includes("gh run cancel 4242 --repo hhoangg/monoptah"));
+  const build = fakeIo({ failOn: "cargo build" });
+  await assert.rejects(runRelease([V], build.io), /was cancelled/);
+  const moved = fakeIo({ headAfter: "d".repeat(40) });
+  await assert.rejects(runRelease([V], moved.io), /HEAD moved.*was cancelled/s);
+  const ci = fakeIo({ ciRuns: [[run("completed", "failure", 9)]] });
+  await assert.rejects(runRelease([V], ci.io), /native\.yml did not succeed.*was cancelled/s);
+  const timeout = fakeIo({ ciRuns: [[run("queued")]] });
+  await assert.rejects(runRelease([V, "--ci-timeout", "1"], timeout.io), /did not finish.*was cancelled/s);
+  for (const f of [build, moved, ci, timeout]) assert.ok(cmds(f.events).includes("gh run cancel 4242 --repo hhoangg/monoptah"));
+  assert.ok(!cmds(failed.events).some((c) => /^(git tag|git push|gh release)/.test(c)));
+});
+
+test("when the early run cannot be cancelled the exact command is printed", async () => {
+  const { io } = fakeIo({ failOn: "npm run native:check", early: { cancelFails: true } });
+  await assert.rejects(runRelease([V], io), /could not be cancelled \(HTTP 403\)\. Cancel it: gh run cancel 4242 --repo hhoangg\/monoptah.*120 minute wait/s);
+});
+
+test("a failed git tag cancels the early run, a failed push keeps it and says how to continue", async () => {
+  const tagFail = fakeIo({ failOn: "git tag" });
+  await assert.rejects(runRelease([V], tagFail.io), /was cancelled.*Nothing was pushed/s);
+  assert.ok(cmds(tagFail.events).includes("gh run cancel 4242 --repo hhoangg/monoptah"));
+  const pushFail = fakeIo({ failOn: "git push" });
+  await assert.rejects(
+    runRelease([V], pushFail.io),
+    /git tag -d native-v0\.40\.5.*cancel the early run: gh run cancel 4242.*still waiting.*gh workflow run native-release-monoptah\.yml/s,
+  );
+  assert.ok(!cmds(pushFail.events).some((c) => c.startsWith("gh run cancel")));
+});
+
+test("no step before the tag ever runs a publishing command or cancels in a successful run", async () => {
+  const { io, events } = fakeIo({ early: { statusAfterRelease: "queued" } });
+  await runRelease([V], io);
+  const tagAt = indexOf(events, "visible git tag");
+  assert.ok(!events.slice(0, tagAt).some((e) => /^(visible|capture) (git push|gh release|gh run cancel)/.test(e)));
+});
+
+test("the workflow builds from the planned commit and publishes only after await-release", () => {
+  const workflow = read(`.github/workflows/${WORKFLOW_FILE}`);
+  const job = (name) => {
+    const start = workflow.indexOf(`\n  ${name}:\n`);
+    assert.ok(start >= 0, name);
+    const next = /\n  [a-z-]+:\n/.exec(workflow.slice(start + 1));
+    return workflow.slice(start, next ? start + 1 + next.index : undefined);
+  };
+  for (const name of ["package", "package-rpm", "await-release"])
+    assert.ok(job(name).includes("ref: ${{ needs.plan.outputs.sha }}"), name);
+  const publish = job("publish");
+  assert.match(publish, /needs: \[plan, package, package-rpm, await-release\]/);
+  assert.match(publish, /needs\.await-release\.result == 'success'/);
+  assert.ok(publish.includes("needs.await-release.outputs.reuse"));
+  assert.ok(!publish.includes("needs.plan.outputs.reuse"));
+  assert.match(publish, /git rev-parse HEAD[\s\S]*PLAN_SHA/);
+  // Only publish sees the signing key.
+  for (const name of ["plan", "package", "package-rpm", "await-release", "homebrew"]) assert.ok(!job(name).includes("TAURI_SIGNING"), name);
+  assert.ok(!job("await-release").includes("contents: write"));
+});
+
+const MIN = 60_000;
+
+test("isStuck: queued with 0 jobs for more than the limit, nothing else", () => {
+  const queued = { status: "queued" };
+  assert.equal(isStuck(queued, 0, 0, 10 * MIN + 1), true);
+  assert.equal(isStuck(queued, 0, 0, 10 * MIN), false); // not "more than"
+  assert.equal(isStuck(queued, 0, 0, 5 * MIN), false);
+  assert.equal(isStuck(queued, 1, 0, 60 * MIN), false); // has a job
+  assert.equal(isStuck(queued, null, 0, 60 * MIN), false); // unknown count
+  assert.equal(isStuck({ status: "in_progress" }, 0, 0, 60 * MIN), false);
+  assert.equal(isStuck({ status: "pending" }, 0, 0, 60 * MIN), false); // waits for its concurrency group
+  assert.equal(isStuck({ status: "completed" }, 0, 0, 60 * MIN), false);
+  assert.equal(isStuck(null, 0, 0, 60 * MIN), false);
+  assert.equal(isStuck(queued, 0, 0, 3 * MIN, 2 * MIN), true); // custom limit
+});
+
+
+test("a run that stays stuck after the release is cancelled, confirmed and only then replaced", async () => {
+  const { io, events, logs, dispatched } = fakeIo({
+    early: {
+      statusAfterRelease: "completed",
+      // The first fresh run (id 4243) is stuck, the second (4244) starts.
+      view: (id, n) => (id === 4242 ? { status: "completed", conclusion: "failure" } : id === 4243 ? { status: "queued", conclusion: null } : { status: "in_progress", conclusion: null }),
+      jobs: (id) => (id === 4243 ? 0 : 3),
+    },
+  });
+  // Re-dispatches 4242 is the early run (completed), 4243 the stuck fresh one.
+  await runRelease([V], io);
+  assert.deepEqual(dispatched, ["req-1", "req-2", "req-3"]);
+  const cancel = events.indexOf("capture gh run cancel 4243 --repo hhoangg/monoptah");
+  const confirm = events.findIndex((e, i) => i > cancel && e.startsWith("capture gh run view 4243"));
+  const redispatch = events.findLastIndex((e) => e.startsWith("capture gh workflow run"));
+  assert.ok(cancel > 0 && confirm > cancel && redispatch > confirm);
+  assert.ok(logs.some((l) => /New run 1 of 2: https:\/\/example\.test\/runs\/4244/.test(l)));
+  assert.ok(events.filter((e) => e === "sleep").length >= 20); // 10 min at 30 s before it is called stuck
+});
+
+test("an unconfirmed cancel of a stuck run never dispatches another run and prints how to continue", async () => {
+  const { io, dispatched } = fakeIo({
+    early: {
+      statusAfterRelease: "completed",
+      view: (id) => (id === 4242 ? { status: "completed", conclusion: "failure" } : { status: "queued", conclusion: null }),
+      jobs: (id) => (id === 4242 ? 3 : 0),
+      cancelFails: true,
+    },
+  });
+  await assert.rejects(
+    runRelease([V], io),
+    /cancel could not be confirmed.*no new run was dispatched.*gh run cancel 4243 --repo hhoangg\/monoptah.*gh workflow run native-release-monoptah\.yml.*tag=native-v0\.40\.5/s,
+  );
+  assert.deepEqual(dispatched, ["req-1", "req-2"]);
+});
+
+test("after two replacements that are stuck too the script stops and says what to do", async () => {
+  const { io, dispatched } = fakeIo({
+    early: {
+      statusAfterRelease: "completed",
+      view: (id) => (id === 4242 ? { status: "completed", conclusion: "failure" } : { status: "queued", conclusion: null }),
+      jobs: (id) => (id === 4242 ? 3 : 0),
+    },
+  });
+  // Every fresh run is cancelled for real by the fake, so the confirmation works.
+  const capture = io.capture;
+  const cancelled = new Set();
+  io.capture = (c, a) => {
+    if (c === "gh" && a[0] === "run" && a[1] === "cancel") cancelled.add(Number(a[2]));
+    if (c === "gh" && a[0] === "run" && a[1] === "view" && cancelled.has(Number(a[2])))
+      return { status: 0, stdout: JSON.stringify({ status: "completed", conclusion: "cancelled" }), stderr: "" };
+    return capture(c, a);
+  };
+  await assert.rejects(runRelease([V], io), /2 new runs were already stuck too.*githubstatus.*gh workflow run native-release-monoptah\.yml/s);
+  assert.equal(dispatched.length, 4); // early + fresh + 2 replacements
+});
+
+test("the workflow and native.yml give every job a timeout, and release runs are grouped per tag", () => {
+  for (const file of ["native-release-monoptah.yml", "native.yml"]) {
+    const text = read(`.github/workflows/${file}`);
+    const jobsAt = text.indexOf("\njobs:\n");
+    const names = [...text.slice(jobsAt).matchAll(/^  ([a-z][a-z0-9-]*):\s*$/gm)].map((m) => m[1]);
+    assert.ok(names.length >= 6, file);
+    for (const name of names) {
+      const start = text.indexOf(`\n  ${name}:\n`, jobsAt);
+      const next = text.slice(start + 1).search(/\n  [a-z][a-z0-9-]*:\s*\n/);
+      const body = text.slice(start, next < 0 ? undefined : start + 1 + next);
+      assert.match(body, /\n    timeout-minutes: \d+/, `${file}: ${name}`);
+    }
+  }
+  const release = read(".github/workflows/native-release-monoptah.yml");
+  assert.match(release, /^concurrency:\n  group: native-monoptah-release-\$\{\{ inputs\.tag \}\}\n  cancel-in-progress: false/m);
+  assert.match(release, /  publish:[\s\S]*?\n    concurrency:\n      group: native-monoptah-publish\n      cancel-in-progress: false/);
+});
+
+test("the workflow's native.yml success queries equal the single path builder", () => {
+  const workflow = read(".github/workflows/native-release-monoptah.yml");
+  // The plan job (tag-only mode) uses SHA, await-release uses PLAN_SHA.
+  for (const variable of ["SHA", "PLAN_SHA"]) {
+    const query = ciSuccessRunsPath("$" + variable).replace("repos/hhoangg/monoptah/", "repos/$GITHUB_REPOSITORY/");
+    assert.ok(workflow.includes('"' + query + '"'), query);
+  }
+  assert.equal(
+    ciSuccessRunsPath(SHA),
+    `repos/hhoangg/monoptah/actions/workflows/native.yml/runs?head_sha=${SHA}&event=push&branch=main&status=success&per_page=1`,
+  );
+});
+
+test("the workflow runs its helper scripts from its own checkout and checks their exit status", () => {
+  const workflow = read(".github/workflows/native-release-monoptah.yml");
+  assert.ok(!/node scripts\/(native-release-monoptah|package-native-monoptah)\.mjs/.test(workflow));
+  assert.ok(workflow.includes("path: release-tools"));
+  assert.equal((workflow.match(/TOOLS: release-tools\/scripts/g) ?? []).length, 3);
+  // No helper call sits inside a bare condition where its failure would be swallowed.
+  assert.ok(!/\[\[ "\$\(node /.test(workflow));
+  assert.ok(!/done < <\(node /.test(workflow));
+});
+
+const healthyJobs = [
+  { name: "Plan the release", status: "completed", conclusion: "success" },
+  { name: "Package linux", status: "in_progress", conclusion: null },
+  { name: "Wait for the macOS files and CI", status: "in_progress", conclusion: null },
+];
+const stuckEarly = {
+  view: (id) => (id === 4242 ? { status: "queued", conclusion: null } : { status: "in_progress", conclusion: null }),
+  jobs: (id) => (id === 4242 ? 0 : 3),
+};
+const indexAfter = (events, from, prefix) => events.findIndex((e, i) => i > from && e.startsWith(prefix));
+
+test("evaluateEarlyJobs: a failed, cancelled or timed out job, or a finished await-release, loses the run", () => {
+  assert.equal(evaluateEarlyJobs(healthyJobs), null);
+  assert.equal(evaluateEarlyJobs([]), null);
+  for (const conclusion of ["failure", "cancelled", "timed_out"])
+    assert.match(evaluateEarlyJobs([...healthyJobs, { name: "Package windows", status: "completed", conclusion }]), new RegExp(`Package windows" ${conclusion}`));
+  assert.match(
+    evaluateEarlyJobs([{ name: "Wait for the macOS files and CI", status: "completed", conclusion: "timed_out" }]),
+    /timed_out/,
+  );
+  assert.equal(evaluateEarlyJobs([{ name: "Wait for the macOS files and CI", status: "queued", conclusion: null }]), null);
+});
+
+test("awaitLimitWarning and interruptActions are plain decisions", () => {
+  assert.equal(awaitLimitWarning(10 * MIN, 60), null);
+  assert.match(awaitLimitWarning(70 * MIN, 60), /at most 120 minutes.*70 minutes have passed.*--ci-timeout 60/);
+  const early = { id: 4242 };
+  assert.deepEqual(interruptActions({ tagPushed: false, early }), { cancel: early, recover: false });
+  assert.deepEqual(interruptActions({ tagPushed: false, early: null }), { cancel: null, recover: false });
+  assert.deepEqual(interruptActions({ tagPushed: true, early }), { cancel: null, recover: true });
+});
+
+test("a stuck early run is checked after native:check, cancelled, confirmed and replaced before the tag", async () => {
+  const { io, events, dispatched, logs } = fakeIo({ early: { ...stuckEarly, advance: { "npm run native:check": 15 * MIN } } });
+  await runRelease([V], io);
+  const check = indexOf(events, "visible npm run native:check");
+  const cancel = indexAfter(events, check, "capture gh run cancel 4242");
+  assert.ok(cancel > check && cancel < indexOf(events, "visible cargo build"));
+  assert.ok(indexAfter(events, cancel, "capture gh run view 4242") > cancel, "the cancel is confirmed");
+  assert.deepEqual(dispatched, ["req-1", "req-2"]);
+  assert.ok(events.findLastIndex((e) => e.startsWith("capture gh workflow run")) < indexOf(events, "visible git tag"));
+  assert.ok(logs.some((l) => /New early CI run: https:\/\/example\.test\/runs\/4243/.test(l)));
+});
+
+test("a stuck early run is also caught after the build", async () => {
+  const { io, events, dispatched } = fakeIo({ early: { ...stuckEarly, advance: { "cargo build": 15 * MIN } } });
+  await runRelease([V], io);
+  const build = indexOf(events, "visible cargo build");
+  assert.ok(indexAfter(events, build, "capture gh run cancel 4242") > build);
+  assert.deepEqual(dispatched, ["req-1", "req-2"]);
+});
+
+test("when the stuck early run cannot be confirmed cancelled the script goes on without it and prints the command", async () => {
+  const { io, logs, dispatched } = fakeIo({ early: { ...stuckEarly, cancelFails: true, advance: { "npm run native:check": 15 * MIN } } });
+  await runRelease([V], io);
+  assert.ok(logs.some((l) => /Could not confirm that it was cancelled\. Continuing without an early run.*gh run cancel 4242 --repo hhoangg\/monoptah/s.test(l)));
+  // No replacement before the tag; the fresh run comes after the release.
+  assert.deepEqual(dispatched, ["req-1", "req-2"]);
+});
+
+test("an early run with a failed job is cancelled before the tag and not replaced early", async () => {
+  const failed = (id) => [...healthyJobs.slice(0, 1), { name: "Package windows", status: "completed", conclusion: "failure" }, healthyJobs[2]];
+  const { io, events, dispatched, logs } = fakeIo({ early: { jobList: failed } });
+  await runRelease([V], io);
+  assert.ok(logs.some((l) => /is no use: its job "Package windows" failure/.test(l)));
+  assert.ok(events.some((e) => e.startsWith("capture gh run cancel 4242")));
+  assert.deepEqual(dispatched, ["req-1", "req-2"]);
+  assert.ok(events.findLastIndex((e) => e.startsWith("capture gh workflow run")) > indexOf(events, "visible gh release create"));
+});
+
+test("after the release an early run that is in progress but has a failed job is cancelled, confirmed and replaced", async () => {
+  // Healthy for the three checks before the tag, a failed Windows job by the time the release exists.
+  const jobList = (id, n) => (id === 4242 && n >= 4 ? [healthyJobs[0], { name: "Package windows", status: "completed", conclusion: "failure" }, healthyJobs[2]] : healthyJobs);
+  const { io, events, dispatched, logs } = fakeIo({ early: { jobList } });
+  await runRelease([V], io);
+  const release = indexOf(events, "visible gh release create");
+  const cancel = indexAfter(events, release, "capture gh run cancel 4242");
+  assert.ok(cancel > release);
+  assert.ok(indexAfter(events, cancel, "capture gh run view 4242") > cancel);
+  assert.deepEqual(dispatched, ["req-1", "req-2"]);
+  assert.ok(events.findLastIndex((e) => e.startsWith("capture gh workflow run")) > cancel);
+  assert.ok(logs.some((l) => /cannot be kept: its job "Package windows" failure/.test(l)));
+  assert.ok(logs.some((l) => /^Run: https:\/\/example\.test\/runs\/4243 \(in_progress\)/.test(l)));
+});
+
+test("after the release a finished await-release job also replaces the early run", async () => {
+  const jobList = (id, n) => (id === 4242 && n >= 4 ? [healthyJobs[0], { name: "Wait for the macOS files and CI", status: "completed", conclusion: "failure" }] : healthyJobs);
+  const { io, dispatched } = fakeIo({ early: { jobList } });
+  await runRelease([V], io);
+  assert.deepEqual(dispatched, ["req-1", "req-2"]);
+});
+
+test("after the release an unconfirmed cancel of a lost early run dispatches nothing and says what to do", async () => {
+  const jobList = (id, n) => (id === 4242 && n >= 4 ? [healthyJobs[0], { name: "Package windows", status: "completed", conclusion: "failure" }] : healthyJobs);
+  const { io, dispatched } = fakeIo({ early: { jobList, cancelFails: true } });
+  await assert.rejects(
+    runRelease([V], io),
+    /cannot be kept \(its job "Package windows" failure\) and its cancel could not be confirmed.*no new run was dispatched.*gh run cancel 4242 --repo hhoangg\/monoptah.*gh workflow run native-release-monoptah\.yml/s,
+  );
+  assert.deepEqual(dispatched, ["req-1"]);
+});
+
+test("a long CI timeout warns that the early run may give up before the tag", async () => {
+  const { io, logs } = fakeIo();
+  await runRelease([V, "--ci-timeout", "130"], io);
+  assert.ok(logs.some((l) => /Warning: the early run waits for the tag for at most 120 minutes.*--ci-timeout 130/s.test(l)));
+});
+
+test("Ctrl-C during the CI wait before the tag cancels the early run, prints it and exits 130", async () => {
+  const { io, events, logs, exits } = fakeIo({ ciRuns: [[run("queued")]], early: { signalAtSleep: 1 } });
+  await assert.rejects(runRelease([V], io), /exit 130/);
+  assert.deepEqual(exits, [130]);
+  assert.ok(events.includes("capture gh run cancel 4242 --repo hhoangg/monoptah"));
+  assert.ok(logs.some((l) => /Interrupted \(SIGINT\)\..*was cancelled.*Nothing was tagged, pushed or published/s.test(l)));
+  assert.ok(!events.some((e) => /^visible (git tag|git push|gh release)/.test(e)));
+});
+
+test("Ctrl-C after the tag was pushed only prints the recovery and never cancels", async () => {
+  // No early run is found, so the fresh dispatch after the release polls and sleeps: the 11th sleep.
+  const { io, events, logs, exits } = fakeIo({ early: { findable: false, signalAtSleep: 11 } });
+  await assert.rejects(runRelease([V], io), /exit 130/);
+  assert.deepEqual(exits, [130]);
+  assert.ok(!events.some((e) => e.startsWith("capture gh run cancel")));
+  assert.ok(logs.some((l) => /Interrupted \(SIGINT\)\..*The tag native-v0\.40\.5 is on origin.*gh workflow run native-release-monoptah\.yml/s.test(l)));
+});
+
+test("the interrupt handler is only installed around waits and always removed", async () => {
+  const { io, events } = fakeIo({ ciRuns: [[run("queued")], [run("completed", "success")]] });
+  await runRelease([V], io);
+  assert.equal(events.filter((e) => e === "onInterrupt").length, events.filter((e) => e === "offInterrupt").length);
+  // Never active while a child process runs: every visible command sits between an off and the next on.
+  let active = 0;
+  for (const e of events) {
+    if (e === "onInterrupt") active += 1;
+    else if (e === "offInterrupt") active -= 1;
+    else if (e.startsWith("visible ")) assert.equal(active, 0, e);
+  }
+});
+
+test("after the release a successful await-release job and a successful finished run are healthy", async () => {
+  const jobList = (id, n) => (id === 4242 && n >= 4 ? [healthyJobs[0], { name: "Wait for the macOS files and CI", status: "completed", conclusion: "success" }] : healthyJobs);
+  const kept = fakeIo({ early: { jobList } });
+  await runRelease([V], kept.io);
+  assert.deepEqual(kept.dispatched, ["req-1"]);
+  assert.ok(!kept.events.some((e) => e.startsWith("capture gh run cancel")));
+  assert.ok(evaluateEarlyJobs([{ name: "Wait for the macOS files and CI", status: "completed", conclusion: "success" }]) === null);
+  assert.match(evaluateEarlyJobs([{ name: "Wait for the macOS files and CI", status: "completed", conclusion: "skipped" }]), /await-release job is completed \(skipped\)/);
+  const done = fakeIo({ early: { view: (id) => (id === 4242 ? { status: "completed", conclusion: "success" } : { status: "in_progress", conclusion: null }) } });
+  await runRelease([V], done.io);
+  assert.deepEqual(done.dispatched, ["req-1"]);
+});
+
+test("after the release an unreadable run is kept with an explicit warning, shown again at the end", async () => {
+  const { io, logs, dispatched, events } = fakeIo({ early: { viewFails: (id, n) => id === 4242 && n >= 4 } });
+  await runRelease([V], io);
+  const warning = "Could not verify the CI run; watch it: https://example.test/runs/4242";
+  assert.equal(logs.filter((l) => l.includes(warning)).length, 2);
+  assert.ok(logs.at(-2).includes(warning) || logs.at(-3).includes(warning));
+  assert.deepEqual(dispatched, ["req-1"]);
+  assert.ok(!events.some((e) => e.startsWith("capture gh run cancel")));
+  // Three reads were tried, two sleeps between them.
+  assert.equal(events.filter((e) => e.startsWith("capture gh run view 4242")).length >= 6, true);
+});
+
+test("SIGTERM exits 143, and after the tag the recovery names the known run instead of saying it did not start", async () => {
+  const { io, logs, exits, events } = fakeIo({
+    early: { view: (id) => (id === 4242 ? { status: "queued", conclusion: null } : { status: "in_progress", conclusion: null }), jobs: (id) => (id === 4242 ? 0 : 3), signalAtSleep: 1, signalName: "SIGTERM" },
+  });
+  await assert.rejects(runRelease([V], io), /exit 143/);
+  assert.deepEqual(exits, [143]);
+  assert.ok(!events.some((e) => e.startsWith("capture gh run cancel")));
+  const text = logs.join("\n");
+  assert.match(text, /Interrupted \(SIGTERM\)\..*The tag native-v0\.40\.5 is on origin\. The workflow run https:\/\/example\.test\/runs\/4242 is probably still going; check it: gh run view 4242 --repo hhoangg\/monoptah.*another run is safe.*gh workflow run/s);
+  assert.ok(!/did not start/.test(text));
 });

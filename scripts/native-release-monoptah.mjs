@@ -7,13 +7,21 @@
 // {"payload": base64(manifest JSON), "signature": <tauri signer signature>}.
 //
 // usage (MONOCODE_NATIVE_VERSION must be set for all but feed-supersedes):
-//   node scripts/native-release-monoptah.mjs plan [published-names-file]
+//   node scripts/native-release-monoptah.mjs plan [--defer-macos] [--check-planned] [published-names-file]
 //       prints step output lines: matrix (JSON, the platforms still to build
 //       except rpm), rpm (true/false), build_any (true/false) and reuse (the
 //       published filenames to download instead of building, space separated).
 //       Fails when macOS would have to be built: its files are built on the
 //       maintainer's Mac (npm run native:release:mac) and must already be on
 //       the release.
+//       --defer-macos is for a run that starts before the release exists: the
+//       macOS files are not all published yet, so macOS is left out of the
+//       matrix without failing (the await-release job waits for them).
+//       --check-planned (env PLANNED_MATRIX, PLANNED_RPM) compares the result
+//       with an earlier plan and fails when they build different platforms.
+//   node scripts/native-release-monoptah.mjs macos-ready <assets-json-file>
+//       prints "true" when the release assets (the JSON list from the GitHub
+//       API) hold all macOS files in state "uploaded", else "false"
 //   node scripts/native-release-monoptah.mjs records <dir>
 //       writes artifacts-<kind>-<arch>.json for every platform whose assets are
 //       in <dir> but that has no metadata file yet (used when a re-run signs the
@@ -187,7 +195,7 @@ export async function prepareMonoptahRelease(
 // one of its files is already on the release; those files are reused (never
 // rebuilt or replaced) so the cask pin and the feed keep describing published
 // bytes. A platform with only some of its files published is an error. `published` is the list of asset names on the existing release.
-export function planBuilds(version, published = []) {
+export function planBuilds(version, published = [], { deferMacos = false } = {}) {
   releaseVersion(version);
   const matrix = [];
   let rpm = false;
@@ -200,6 +208,9 @@ export function planBuilds(version, published = []) {
       reuse.push(...found.flat());
       continue;
     }
+    // The macOS files come from the maintainer's Mac while the run is already
+    // going; they are not built here and the await-release job waits for them.
+    if (deferMacos && platform.kind === "macos") continue;
     // Some files published, some not: rebuilding would produce bytes that differ
     // from the published ones, and only missing names are uploaded, so the feed
     // and the cask checksum would describe files the release does not serve.
@@ -221,6 +232,28 @@ export function planBuilds(version, published = []) {
       });
   }
   return { matrix, rpm, buildAny: matrix.length > 0 || rpm, reuse };
+}
+
+// True when the release carries every macOS file, each one fully uploaded.
+// `assets` is the list from the GitHub API: [{ name, state }].
+export function macosFilesReady(version, assets) {
+  const platform = PLATFORMS.find((p) => p.kind === "macos");
+  return platform.assets(version).every(({ pattern }) => {
+    const found = assets.filter((asset) => pattern.test(asset.name));
+    return found.length === 1 && found[0].state === "uploaded";
+  });
+}
+
+// The await-release job plans again after the macOS files arrived. It must
+// build exactly what the first plan built: a platform that became published in
+// between (another run) would be built here and also downloaded, and one that
+// is newly missing would never be built.
+export function checkPlanned(planned, now) {
+  const kinds = (plan) => [...plan.matrix.map((e) => e.kind), ...(plan.rpm ? ["rpm"] : [])].sort().join(",");
+  if (kinds(planned) !== kinds(now))
+    throw new Error(
+      `The platforms to build changed since the plan job ran (planned: ${kinds(planned) || "none"}, now: ${kinds(now) || "none"}). Another run probably published a platform. Nothing was published; check the release assets and start the workflow again.`,
+    );
 }
 
 // The workflow never builds macOS: the release must already carry its files.
@@ -290,19 +323,28 @@ if (
   const [command, first, second] = process.argv.slice(2);
   if (command === "sign" && first && second) {
     await prepareMonoptahRelease(first, second);
+  } else if (command === "macos-ready" && first) {
+    const assets = JSON.parse(await readFile(first, "utf8"));
+    console.log(String(macosFilesReady(process.env.MONOCODE_NATIVE_VERSION, assets)));
   } else if (command === "plan") {
+    const flags = process.argv.slice(3).filter((arg) => arg.startsWith("--"));
+    const file = process.argv.slice(3).find((arg) => !arg.startsWith("--"));
+    const version = process.env.MONOCODE_NATIVE_VERSION;
     const published =
-      first && existsSync(first)
-        ? (await readFile(first, "utf8"))
+      file && existsSync(file)
+        ? (await readFile(file, "utf8"))
             .split("\n")
             .map((line) => line.trim())
             .filter(Boolean)
         : [];
-    const plan = requireReused(
-      planBuilds(process.env.MONOCODE_NATIVE_VERSION, published),
-      "macos",
-      process.env.MONOCODE_NATIVE_VERSION,
-    );
+    const deferMacos = flags.includes("--defer-macos");
+    const planned = planBuilds(version, published, { deferMacos });
+    const plan = deferMacos ? planned : requireReused(planned, "macos", version);
+    if (flags.includes("--check-planned"))
+      checkPlanned(
+        { matrix: JSON.parse(process.env.PLANNED_MATRIX ?? "[]"), rpm: process.env.PLANNED_RPM === "true" },
+        plan,
+      );
     console.log(`matrix=${JSON.stringify(plan.matrix)}`);
     console.log(`rpm=${plan.rpm}`);
     console.log(`build_any=${plan.buildAny}`);
@@ -317,7 +359,7 @@ if (
     console.log(String(feedSupersedes(await readFile(first, "utf8"), existing)));
   } else {
     console.error(
-      "usage: native-release-monoptah.mjs plan [published-file] | records <dir> | sign <dir> <notes-file> | file-count | feed-supersedes <new> [existing]",
+      "usage: native-release-monoptah.mjs plan [--defer-macos] [--check-planned] [published-file] | macos-ready <assets-json> | records <dir> | sign <dir> <notes-file> | file-count | feed-supersedes <new> [existing]",
     );
     process.exit(2);
   }

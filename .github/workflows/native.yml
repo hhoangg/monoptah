@@ -44,6 +44,7 @@ jobs:
   changes:
     name: Detect native changes
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
       pull-requests: read
@@ -88,6 +89,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.native == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -391,6 +393,7 @@ jobs:
     name: Seed the release build cache (${{ matrix.kind }})
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     continue-on-error: true
     strategy:
       fail-fast: false
@@ -444,6 +447,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     container: almalinux:10
+    timeout-minutes: 90
     continue-on-error: true
     steps:
       - run: dnf install -y git
@@ -481,6 +485,7 @@ jobs:
       - release-cache
       - release-cache-rpm
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Check the results of all jobs
         shell: bash

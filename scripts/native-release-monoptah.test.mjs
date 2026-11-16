@@ -11,9 +11,11 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   checkNotes,
+  checkPlanned,
   downloadBase,
   feedSupersedes,
   feedVersion,
+  macosFilesReady,
   monoptahManifest,
   planBuilds,
   prepareMonoptahRelease,
@@ -466,4 +468,105 @@ test("requireReused refuses a plan that would build the platform", () => {
   assert.equal(requireReused(macPublished, "macos", "0.34.0"), macPublished);
   // Other platforms may still be built.
   assert.ok(macPublished.buildAny);
+});
+
+const MAC_FILES = () => assetFiles().filter((n) => n.startsWith("MonoptahNative_0.34.0_aarch64"));
+
+test("a run that starts before the release exists defers macOS instead of failing", () => {
+  const kinds = (plan) => plan.matrix.map((e) => e.kind);
+  const early = planBuilds("0.34.0", [], { deferMacos: true });
+  assert.deepEqual(kinds(early), ["linux", "windows"]);
+  assert.equal(early.rpm, true);
+  assert.deepEqual(early.reuse, []);
+  // Some macOS files uploaded so far: still deferred, never built, never reused.
+  const partial = planBuilds("0.34.0", ["MonoptahNative_0.34.0_aarch64.zip"], { deferMacos: true });
+  assert.deepEqual(kinds(partial), ["linux", "windows"]);
+  assert.deepEqual(partial.reuse, []);
+  // All macOS files present: reused as in the normal mode.
+  const ready = planBuilds("0.34.0", MAC_FILES(), { deferMacos: true });
+  assert.deepEqual(ready.reuse, MAC_FILES());
+  // The default mode still builds macOS, which requireReused then refuses.
+  assert.deepEqual(kinds(planBuilds("0.34.0", [])), ["macos", "linux", "windows"]);
+  // A partially published non-macOS platform still fails.
+  assert.throws(
+    () => planBuilds("0.34.0", ["MonoptahNative_0.34.0_amd64.AppImage"], { deferMacos: true }),
+    /linux files on release native-v0\.34\.0 are incomplete/,
+  );
+});
+
+test("macOS files count as ready only when all three are fully uploaded", () => {
+  const assets = (state = "uploaded") => MAC_FILES().map((name) => ({ name, state }));
+  assert.equal(macosFilesReady("0.34.0", assets()), true);
+  assert.equal(macosFilesReady("0.34.0", []), false);
+  assert.equal(macosFilesReady("0.34.0", assets().slice(0, 2)), false);
+  assert.equal(macosFilesReady("0.34.0", [...assets().slice(0, 2), { ...assets()[2], state: "starter" }]), false);
+  assert.equal(macosFilesReady("0.34.1", assets()), false);
+  // Other platforms' files do not matter.
+  assert.equal(macosFilesReady("0.34.0", [...assets(), { name: RPM, state: "uploaded" }]), true);
+});
+
+test("the recomputed plan must build exactly what the first plan built", () => {
+  const first = planBuilds("0.34.0", [], { deferMacos: true });
+  assert.doesNotThrow(() => checkPlanned(first, planBuilds("0.34.0", MAC_FILES())));
+  // Linux got published in between: this run built it too, so refuse.
+  const published = [...MAC_FILES(), "MonoptahNative_0.34.0_amd64.AppImage", "monoptah-native_0.34.0_amd64.deb"];
+  assert.throws(() => checkPlanned(first, planBuilds("0.34.0", published)), /changed since the plan job.*planned: linux,rpm,windows, now: rpm,windows/s);
+  // Something that was not planned would have to be built now: macOS missing.
+  assert.throws(() => checkPlanned(first, planBuilds("0.34.0", [])), /planned: .*now: linux,macos,rpm,windows/);
+});
+
+test("a second run over a fully published release builds and uploads nothing", () => {
+  const all = [...assetFiles(), "MonoptahNative_0.34.0_aarch64.app.tar.gz.sig"];
+  const plan = planBuilds("0.34.0", all);
+  assert.equal(plan.buildAny, false);
+  assert.deepEqual(plan.matrix, []);
+  assert.equal(plan.rpm, false);
+  // Everything is taken from the release: the 5 updater packages, the zip and the checksum.
+  assert.deepEqual([...plan.reuse].sort(), assetFiles().sort());
+  // The deferred and the final plan agree, and the recheck passes.
+  assert.doesNotThrow(() => checkPlanned(plan, planBuilds("0.34.0", all, { deferMacos: true })));
+  // The same version replaces its own feed, an older one never replaces a newer one.
+  const feed = (v) => JSON.stringify({ payload: Buffer.from(JSON.stringify({ version: v })).toString("base64") });
+  assert.equal(feedSupersedes(feed("0.34.0"), feed("0.34.0")), true);
+  assert.equal(feedSupersedes(feed("0.33.0"), feed("0.34.0")), false);
+});
+
+test("the plan command: --defer-macos, --check-planned and macos-ready", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "monoptah-native-defer-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const script = join(root, "scripts/native-release-monoptah.mjs");
+  const run = (args, env = {}) =>
+    spawnSync(process.execPath, [script, ...args], {
+      encoding: "utf8",
+      env: { ...process.env, MONOCODE_NATIVE_VERSION: "0.34.0", ...env },
+    });
+  const lines = (out) =>
+    Object.fromEntries(out.trim().split("\n").map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)]));
+  const none = join(directory, "none.txt");
+  // No release yet: the default mode fails, the deferred one plans the rest.
+  assert.notEqual(run(["plan", none]).status, 0);
+  const early = run(["plan", "--defer-macos", none]);
+  assert.equal(early.status, 0, early.stderr);
+  const first = lines(early.stdout);
+  assert.deepEqual(JSON.parse(first.matrix).map((e) => e.kind), ["linux", "windows"]);
+  assert.equal(first.rpm, "true");
+  // Later, with the macOS files published, the check against the first plan passes.
+  const published = join(directory, "published.txt");
+  await writeFile(published, `${MAC_FILES().join("\n")}\n`);
+  const planned = { PLANNED_MATRIX: first.matrix, PLANNED_RPM: first.rpm };
+  const later = run(["plan", "--check-planned", published], planned);
+  assert.equal(later.status, 0, later.stderr);
+  assert.equal(lines(later.stdout).reuse, MAC_FILES().join(" "));
+  // The macOS files still missing: fails (never builds macOS).
+  assert.notEqual(run(["plan", "--check-planned", none], planned).status, 0);
+  // A different set of platforms is refused.
+  const changed = run(["plan", "--check-planned", published], { PLANNED_MATRIX: "[]", PLANNED_RPM: "true" });
+  assert.notEqual(changed.status, 0);
+  assert.match(changed.stderr, /changed since the plan job/);
+  // macos-ready reads the API's asset list.
+  const assets = join(directory, "assets.json");
+  await writeFile(assets, JSON.stringify(MAC_FILES().map((name) => ({ name, state: "uploaded" }))));
+  assert.equal(run(["macos-ready", assets]).stdout.trim(), "true");
+  await writeFile(assets, JSON.stringify(MAC_FILES().slice(1).map((name) => ({ name, state: "uploaded" }))));
+  assert.equal(run(["macos-ready", assets]).stdout.trim(), "false");
 });

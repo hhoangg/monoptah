@@ -105,28 +105,46 @@ Open issues with one of the two forms in `.github/ISSUE_TEMPLATE/`:
   "Releasing the Host" in `CLAUDE.md`).
 - Version bump from the merged changes: `feat` is minor, `fix` and `perf` are patch, any
   `BREAKING CHANGE` is major.
-- Release notes live in `docs/native/monoptah-release-notes.md`. Its first line must stay
-  exactly `# Monoptah Native X.Y.Z`: `npm run native:release:mac` and the release workflow
-  refuse anything else. Group the changes by type and end each line with its PR number.
-  Keep the "Downloads and updates" and "Known limits" sections that follow.
-  See "Releasing the native app" in `CLAUDE.md` for the release steps.
+- Native release notes are generated, not written in a PR. `npm run native:release:mac`
+  lists the PRs merged since the previous `native-v*` tag, takes each PR's title and labels
+  from GitHub and groups them by the Conventional Commits type of the title: Breaking changes
+  (`!`), Features (`feat`), Fixes (`fix`), Performance (`perf`) and Reverts (`revert`),
+  and a `BREAKING CHANGE:` footer in the commit body also counts as breaking. So **a PR title
+  becomes a release note line**: write it for a user, in the imperative, with the right type.
+  `docs`, `chore`, `ci`, `test`, `build` and `refactor` PRs are left out unless the PR has the
+  label `user-visible` (then they are listed under "Other changes"; the label must exist in
+  the repository, create it first if it does not). A title that is not in the commit format is
+  listed under "Other changes" instead of being dropped.
+- Upstream sync PRs have a `chore` title, so they are skipped: describe the user-visible
+  upstream changes in the highlights, or label the sync PR `user-visible`.
+- Optional highlights: pass `--notes FILE`, or put them in
+  `docs/native/monoptah-release-notes.md` with the first line exactly
+  `# Monoptah Native X.Y.Z` for the version being released (a file for another version is
+  ignored). The text after the heading is added above the generated sections.
+  See "Releasing the native app" in `CLAUDE.md` and `docs/native/release-flow.md` for the steps.
 
-Example:
+Example of the generated notes (the highlights paragraph is optional):
 
 ```markdown
 # Monoptah Native 0.54.0
+
+Mono terminals can now be split side by side.
 
 ## Changes since 0.53.3
 
 ### Features
 
-- Mono terminals can be split side by side. (#142)
+- Split Mono terminals side by side (#142)
 
 ### Fixes
 
-- The cloud drawer closes when its instance stops. (#151)
+- Close the cloud drawer when its instance stops (#151)
 
 ### Performance
 
-- The project rail opens large projects faster. (#155)
+- Open large projects faster in the project rail (#155)
+
+## Downloads and updates
+
+...
 ```
