@@ -61,17 +61,33 @@ fn status(rows: Vec<WorkspaceRow>) -> FooterStatus {
 }
 
 #[test]
-fn nothing_running_or_stopping_hides_the_chip_whatever_else_is_listed() {
+fn the_chip_hides_only_when_the_project_has_no_workspace_at_all() {
     let none = status(vec![]);
     assert!(!none.visible() && !none.warns());
-    // Stopped, failed and unknown workspaces are neither running nor stopping: the chip hides.
+    // Stopped, failed and unknown workspaces are neither running nor stopping, but they exist:
+    // the chip shows, so they can still be reached and deleted.
     let idle = status(vec![
         row("a", WorkspaceState::Stopped, 1),
         row("c", WorkspaceState::Failed, 1),
         row("d", WorkspaceState::Unknown, 1),
     ]);
     assert_eq!((idle.running, idle.stopping), (0, 0));
-    assert!(!idle.visible());
+    assert_eq!(
+        (idle.stopped, idle.failed, idle.unknown, idle.deleting),
+        (1, 1, 1, 0)
+    );
+    assert!(idle.visible());
+    assert_eq!(idle.entries.len(), 3);
+    assert!(status(vec![row("a", WorkspaceState::Stopped, 1)]).visible());
+}
+
+#[test]
+fn a_deleting_sandbox_is_counted_as_deleting_not_stopped_or_stopping() {
+    let mut deleting = row("gone", WorkspaceState::Stopping, 1);
+    deleting.raw_state = "deleting".into();
+    let s = status(vec![deleting]);
+    assert!(s.visible());
+    assert_eq!((s.stopping, s.stopped, s.deleting, s.unknown), (0, 0, 1, 0));
 }
 
 /// A workspace that has been stopping since `minutes` before [`NOW`].
@@ -102,9 +118,10 @@ fn a_stopping_workspace_keeps_the_chip_on_screen_in_the_neutral_colour() {
     ]);
     assert_eq!((s.running, s.stopping), (1, 1));
     assert_eq!(s.entries.len(), 2);
-    // Only when it has stopped does the chip go.
+    // Once it has stopped the chip stays, as a stopped workspace.
     let s = status(vec![row("down", WorkspaceState::Stopped, 1)]);
-    assert!(!s.visible());
+    assert!(s.visible());
+    assert_eq!((s.running, s.stopping, s.stopped), (0, 0, 1));
 }
 
 #[test]
@@ -152,7 +169,7 @@ fn running_and_starting_workspaces_are_counted_and_named() {
     assert!(s.visible());
     assert_eq!(s.running, 2);
     let names: Vec<_> = s.entries.iter().map(|e| e.name.as_str()).collect();
-    assert_eq!(names, ["a", "sbx"], "a stopped workspace is not named");
+    assert_eq!(names, ["a", "sbx", "b"], "a stopped workspace is named too");
     assert_eq!(s.entries[1].backend, CloudBackendKind::DockerSandbox);
     assert!(!s.warns(), "a used, young workspace is normal");
 }
@@ -175,12 +192,12 @@ fn an_orphan_that_is_up_warns_but_a_stopped_one_or_a_foreign_one_does_not() {
     assert_eq!(s.entries[1].concern, None);
     assert!(!s.warns());
 
-    // Stopped: no cost, no flag, not named.
+    // Stopped: no cost, no flag (but it is listed).
     let mut stopped = orphan.clone();
     stopped.state = WorkspaceState::Stopped;
     let s = status(vec![row("up", WorkspaceState::Running, 1), stopped]);
     assert!(!s.warns());
-    assert_eq!(s.entries.len(), 1);
+    assert_eq!(s.entries.len(), 2);
 
     // Not this app's: another app or a person may be using it, so it is never an orphan.
     let mut foreign = orphan;

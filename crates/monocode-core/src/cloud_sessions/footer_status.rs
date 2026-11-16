@@ -4,11 +4,10 @@
 //! [`CloudSessions::workspaces_overview`], which only lists and never wakes anything), so asking
 //! for it costs no CLI call beyond that load.
 //!
-//! * The chip is visible while something is [`WorkspaceState::Running`] or
-//!   [`WorkspaceState::Starting`], and also while something is [`WorkspaceState::Stopping`]
-//!   (or hibernating, on its way to stopped): a workspace that is stopping still bills until
-//!   it has stopped, and a Stop that gets stuck must not make the chip vanish
-//!   ([`FooterStatus::visible`]). It hides only when every workspace is stopped or gone.
+//! * The chip is visible while the project has at least one workspace in any state: running,
+//!   starting, stopping (or hibernating), stopped or failed ([`FooterStatus::visible`]). A
+//!   stopped one still has to be reachable (to start it again or delete it), and a Stop that
+//!   gets stuck must not make the chip vanish. It hides only when there are none.
 //! * It turns to a warning when a workspace carries a [`Concern`] ([`FooterStatus::warns`]). A
 //!   stopping workspace is neutral until it has been stopping for [`STOPPING_WARN`].
 //! * [`CloudSessions::project_uses_cloud`] says whether a project is worth asking about at all.
@@ -53,8 +52,7 @@ impl Concern {
     }
 }
 
-/// One workspace the chip names: every running or starting one, and any other that has a
-/// [`Concern`].
+/// One workspace the chip names: every workspace of the project, in the overview's order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FooterEntry {
     pub name: String,
@@ -69,7 +67,15 @@ pub struct FooterStatus {
     pub running: usize,
     /// Workspaces that are stopping (or hibernating, on their way to stopped).
     pub stopping: usize,
-    /// What the chip names, running ones first (the overview's order).
+    /// Workspaces that are stopped.
+    pub stopped: usize,
+    /// Workspaces that failed.
+    pub failed: usize,
+    /// Sandboxes that are being deleted (not counted as stopping).
+    pub deleting: usize,
+    /// Workspaces in a state the listing does not name: they may still bill.
+    pub unknown: usize,
+    /// What the chip names: every workspace, in the overview's order.
     pub entries: Vec<FooterEntry>,
 }
 
@@ -115,21 +121,28 @@ impl FooterStatus {
             let concern = concern_of(row, now_ms);
             status.running += usize::from(up);
             status.stopping += usize::from(going_down);
-            if up || going_down || concern.is_some() {
-                status.entries.push(FooterEntry {
-                    name: row.display_name.clone(),
-                    backend: row.cloud.kind,
-                    state: row.state,
-                    concern,
-                });
+            if row.state == WorkspaceState::Failed {
+                status.failed += 1;
+            } else if row.is_deleting() {
+                status.deleting += 1;
+            } else if row.state == WorkspaceState::Stopped {
+                status.stopped += 1;
+            } else if row.state == WorkspaceState::Unknown {
+                status.unknown += 1;
             }
+            status.entries.push(FooterEntry {
+                name: row.display_name.clone(),
+                backend: row.cloud.kind,
+                state: row.state,
+                concern,
+            });
         }
         status
     }
 
-    /// The chip shows: something runs, starts or is stopping.
+    /// The chip shows: the project has a workspace in any state.
     pub fn visible(&self) -> bool {
-        self.running > 0 || self.stopping > 0
+        self.running + self.stopping + self.stopped + self.failed + self.deleting + self.unknown > 0
     }
 
     /// The chip takes the warning colour.

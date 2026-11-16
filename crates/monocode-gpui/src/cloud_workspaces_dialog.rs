@@ -1,7 +1,8 @@
-//! The project menu's Cloud workspaces dialog (Cloud setup > Cloud workspaces): every codespace
-//! of the project's repository and every Monoptah Docker sandbox, with its state, age, the
-//! sessions that use it and an estimated cost, so a failed or forgotten workspace that keeps
-//! drawing quota or credit can be stopped or deleted. `model` holds what it says and decides.
+//! The Cloud workspaces view, shown in a side drawer (see [`crate::drawer`]) opened from the
+//! footer's cloud chip: every codespace of the project's repository and every Monoptah Docker
+//! sandbox, with its state, age, the sessions that use it and an estimated cost, so a failed or
+//! forgotten workspace that keeps drawing quota or credit can be stopped or deleted. `model` holds
+//! what it says and decides.
 //!
 //! Loading is cheap and safe: the list comes from `gh codespace list` and `sbx ls` on the
 //! background executor, only when the dialog opens or Refresh is pressed, and the core service
@@ -325,6 +326,11 @@ impl CloudWorkspacesDialog {
     #[cfg(test)]
     pub(crate) fn acknowledged(&self) -> bool {
         self.confirm.as_ref().is_some_and(|c| c.acknowledged)
+    }
+
+    /// The project whose workspaces it lists.
+    pub(crate) fn project(&self) -> &str {
+        &self.project
     }
 
     /// A stop or delete is running. The dialog stays open until it ends, so its result reaches
@@ -1045,9 +1051,8 @@ impl CloudWorkspacesDialog {
 }
 
 impl Render for CloudWorkspacesDialog {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = self.body(cx);
-        let height = window.viewport_size().height.as_f32() - 34.;
         let subtitle = match self.view.as_ref() {
             Some(view) => {
                 let ago = now_ms().saturating_sub(view.loaded_ms) / 1000;
@@ -1065,8 +1070,8 @@ impl Render for CloudWorkspacesDialog {
             .aria_label("Cloud workspaces")
             .track_focus(&self.focus)
             .relative()
+            .size_full()
             .min_h_0()
-            .max_h(px(height))
             .flex()
             .flex_col()
             .text_color(content(1.))
@@ -1106,6 +1111,7 @@ impl Render for CloudWorkspacesDialog {
                     )
                     .child(
                         icon_button("cloud-ws-close", "Close Cloud workspaces", "close")
+                            .debug_selector(|| "cloud-ws-close".into())
                             .size(px(28.))
                             .when(working, |b| b.opacity(0.4))
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -1118,6 +1124,7 @@ impl Render for CloudWorkspacesDialog {
             .child(
                 div()
                     .id("cloud-workspaces-body")
+                    .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
                     .flex()

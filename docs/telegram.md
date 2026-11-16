@@ -6,7 +6,8 @@ Everything else stays in the app.
 
 ## Setup
 
-Telegram is set up per project. Right-click a project and choose **Telegram…**.
+Telegram is set up per project. The project menu item **Telegram…** is hidden for now (the code stays; it comes back when
+Telegram is in use), so the setup dialog cannot be opened from the app yet.
 
 1. **Create a bot.** Open [@BotFather](https://t.me/BotFather) in Telegram, send
    `/newbot`, and follow the prompts. Copy the bot token it gives you.
@@ -96,8 +97,8 @@ it. Only add people you trust to the group.
 - **Questions only.** Permission or tool approvals and plans are not forwarded and
   cannot be answered from Telegram.
 - **Not forwarded:** remote (SSH) projects, TUI sessions, Mono chats, and
-  orchestration workers (their lead answers them). The project menu hides
-  **Telegram…** for remote projects.
+  orchestration workers (their lead answers them). Remote projects never
+  show **Telegram…** in the project menu (it is hidden for every project for now).
 - Topic names are cut to Telegram's 128 character limit.
 
 ## Do not run two apps on one bot

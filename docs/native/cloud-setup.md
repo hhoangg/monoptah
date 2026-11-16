@@ -56,8 +56,9 @@ Project settings dialog. It replaces the Codespaces setup and Docker Sandbox set
 
 Entry points:
 - Project menu: the "Cloud setup" submenu becomes one item, "Cloud settings...". It opens on
-  the project's default backend. Right after it, "Cloud workspaces..." opens the overview of the
-  running codespaces and sandboxes (see `cloud-workspaces.md`).
+  the project's default backend. The overview of the running codespaces and sandboxes is a side
+  drawer opened from the cloud chip at the right end of the footer (see `cloud-workspaces.md`);
+  the project menu has no item for it.
 - Composer Workspace menu: new item "Cloud settings for this project...".
 - Composer Workspace menu "Docker Sandbox" while the project has no sandbox config (the
   conversation emits `OpenDockerSetup`, which the shell now answers by opening the dialog on
