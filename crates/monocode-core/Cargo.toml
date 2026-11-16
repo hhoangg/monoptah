@@ -52,6 +52,7 @@ keyring = { version = "3.6", default-features = false, features = ["apple-native
 keyring = { version = "3.6", default-features = false, features = ["windows-native"] }
 rusty-leveldb = "1"
 tempfile = "3"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 # Exercise WebView2 storage fixtures on Linux and macOS too.
 [target.'cfg(not(windows))'.dev-dependencies]

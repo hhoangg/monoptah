@@ -465,6 +465,8 @@ fn main() {
     // Elsewhere there is no watchdog log; keep upstream's file logger.
     #[cfg(not(target_os = "macos"))]
     app_log::init();
+    // Kills login CLIs an earlier crashed run left behind and starts recording new ones.
+    monocode_core::process::guard::init(&database.with_file_name("orphan-guard"));
     let platform = gpui_platform::current_platform(false);
     let title_raster = particle_text::GlyphRaster(platform.text_system());
     gpui::Application::with_platform(platform)
@@ -487,6 +489,12 @@ fn main() {
             file_editor::bind(cx);
             popover::bind(cx);
             cx.set_prompt_builder(modal::prompt_builder);
+            // A quit that macOS starts (Dock, logout) never reaches `quit`.
+            cx.on_app_quit(|_| {
+                monocode_core::process::guard::kill_all();
+                async {}
+            })
+            .detach();
             explorer::bind(cx);
             history::bind(cx);
             diff_view::bind(cx);

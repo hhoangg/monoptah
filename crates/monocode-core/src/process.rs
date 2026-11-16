@@ -1,6 +1,8 @@
 //! Child policy extracted from src-tauri/src/background_work.rs.
 use std::process::Command;
 
+pub mod guard;
+
 /// Give the child the ordinary process mask. A GUI executor's worker may block
 /// signals and exec preserves that mask; Tokio-based children then never receive
 /// SIGCHLD and their command sessions never finish.
