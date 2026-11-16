@@ -1,16 +1,18 @@
-# Monoptah Native 0.53.1
+# Monoptah Native 0.53.2
 
-## Changes since 0.53.0
+## Changes since 0.53.1
 
 ### New
 
-- A Mono can open labeled terminals of its project and work with them. It places them as dock tabs, title tabs of their own or split panes (never splitting your chat tab), arranges them into one "Logs <project>" split tab in columns, rows or a grid, runs commands and presses keys in them, reads their output, stops them and closes them. A label replaces the automatic title and a small "Mono" mark shows on the tab and pane header. The Mono never takes the keyboard and, by default, does not switch tabs or projects. Input goes only to terminals the Mono opened whose processes stay inside the project or one of its git worktrees; commands run with your rights.
-- Agent sessions can read the terminals of their project or worktree (list and read only), and a Mono can read every plain terminal of its project. Output is limited in size and secrets are masked. Agent sessions, terminals with secret environment variables, cloud terminals and any terminal that ever ran an agent CLI are never listed or read. On Windows only the Mono's own terminals are readable. Mono terminals are not saved and nothing is run again after a restart.
-- Workflow session steps can run in a GitHub codespace or Docker sandbox through a `target`, with a new instance or the instance of an earlier step (`sameAs`). Loop rounds, resumed steps and For each items follow clear reuse rules, the board card, inspector and review show where a step runs, and the run report lists every instance used. Cloud steps use Claude, and their instances are never stopped or deleted automatically. Stopping a workflow, a timeout or a failed step drops the queued first prompt of a step that is still starting.
+- Cloud workspaces now opens in a drawer that slides in from the right, from the cloud chip at the far right of the footer. Esc, a click outside it or Close slides it out. The chip shows while the project has any workspace (running, stopping, stopped, failed or deleting) and hides when there is none. "Cloud workspaces..." is no longer in the project menu, and the Telegram menu item is hidden.
+- Claude sign-in has a new "Sign in with code" choice (in the Claude sign-in options menu, the add-account editor in the footer and the footer sign-in panel). The app opens the sign-in page, which shows a code, and you paste that code into the app. Available on macOS and Linux for now.
+- Workflow cloud steps: the text options of a `target` (branch, machine, memory, ttl, template, image) can use templates, checked again before the step starts, so a bad value fails the step and creates nothing. A step that creates a new instance can name its `account`, which must have a setup token or API key. A run that was interrupted keeps the list of cloud instances it created: the run page, the workflow page and removing a workflow name them, and they are kept out of history trimming. Nothing is stopped or deleted automatically.
 
 ### Fixes
 
-- Stopping a Docker sandbox in Cloud workspaces now sticks. Before, the app's own connection could wake the sandbox again a few minutes later and the row went back to "Running" with no message. A Stop now closes the app's connection first (sessions stay disconnected until you press Reconnect), then checks the real state and says Stopped, Still running with the reason, Taking longer than expected, or the error. The footer chip shows "N stopping" while a Stop is in progress and warns if it gets stuck or is undone. Codespaces are unchanged.
+- Claude browser sign-in now shows the sign-in link and accepts a pasted verification code when the browser shows a code instead of returning to the app. A rejected or expired code says so clearly. Coming back to the app to paste the code no longer resets the sign-in.
+- Clicking a Mono or switching tabs within the same project no longer makes the project rail jump to the project's row.
+- Faster native development and test builds; `worktrees:clean` never removes the release worktree (developers only).
 
 ## Downloads and updates
 
