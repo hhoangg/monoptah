@@ -1,18 +1,10 @@
-# Monoptah Native 0.53.2
+# Monoptah Native 0.53.3
 
-## Changes since 0.53.1
-
-### New
-
-- Cloud workspaces now opens in a drawer that slides in from the right, from the cloud chip at the far right of the footer. Esc, a click outside it or Close slides it out. The chip shows while the project has any workspace (running, stopping, stopped, failed or deleting) and hides when there is none. "Cloud workspaces..." is no longer in the project menu, and the Telegram menu item is hidden.
-- Claude sign-in has a new "Sign in with code" choice (in the Claude sign-in options menu, the add-account editor in the footer and the footer sign-in panel). The app opens the sign-in page, which shows a code, and you paste that code into the app. Available on macOS and Linux for now.
-- Workflow cloud steps: the text options of a `target` (branch, machine, memory, ttl, template, image) can use templates, checked again before the step starts, so a bad value fails the step and creates nothing. A step that creates a new instance can name its `account`, which must have a setup token or API key. A run that was interrupted keeps the list of cloud instances it created: the run page, the workflow page and removing a workflow name them, and they are kept out of history trimming. Nothing is stopped or deleted automatically.
+## Changes since 0.53.2
 
 ### Fixes
 
-- Claude browser sign-in now shows the sign-in link and accepts a pasted verification code when the browser shows a code instead of returning to the app. A rejected or expired code says so clearly. Coming back to the app to paste the code no longer resets the sign-in.
-- Clicking a Mono or switching tabs within the same project no longer makes the project rail jump to the project's row.
-- Faster native development and test builds; `worktrees:clean` never removes the release worktree (developers only).
+- The cloud chip at the right of the footer now uses the same text and icon size as the Actions and Terminal buttons, and lines up with them. Before, its label was larger than the other footer buttons.
 
 ## Downloads and updates
 
