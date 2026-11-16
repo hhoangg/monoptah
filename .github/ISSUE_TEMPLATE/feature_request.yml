@@ -1,27 +1,26 @@
 name: Feature request
-description: Suggest an idea or improvement for MonoCode
-title: "[Feature]: "
+description: Suggest an idea or improvement for Monoptah
+title: "[Feature] "
 labels: [enhancement]
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for helping improve MonoCode.
+        Thanks for helping improve Monoptah. Search existing issues first.
 
   - type: textarea
     id: problem
     attributes:
-      label: Problem
-      description: What problem would this feature solve?
-      placeholder: Describe the limitation or frustration you are experiencing.
+      label: Problem or need
+      description: What problem would this feature solve, and for whom?
     validations:
       required: true
 
   - type: textarea
-    id: solution
+    id: proposal
     attributes:
-      label: Proposed solution
-      description: What would you like MonoCode to do?
+      label: Proposal
+      description: What should Monoptah do?
     validations:
       required: true
 
@@ -29,10 +28,15 @@ body:
     id: alternatives
     attributes:
       label: Alternatives considered
-      description: Describe any alternative solutions or workarounds you have tried.
+      description: Other solutions or workarounds you have tried.
 
   - type: textarea
-    id: context
+    id: acceptance
     attributes:
-      label: Additional context
-      description: Add screenshots, examples, or any other useful context.
+      label: Acceptance criteria
+      description: How do we know it is done?
+      placeholder: |
+        - [ ]
+        - [ ]
+    validations:
+      required: true
