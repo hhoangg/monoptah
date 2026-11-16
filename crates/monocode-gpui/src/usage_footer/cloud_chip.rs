@@ -294,7 +294,9 @@ impl Render for CloudChip {
         } else {
             content(0.55)
         };
-        div()
+        // The same button the footer's Terminal control is, so the chip reads at the footer's
+        // text size wherever it sits in the row.
+        footer_button(classic)
             .id("cloud-status-chip")
             .debug_selector(|| "cloud-status-chip".into())
             .role(Role::Button)
@@ -306,22 +308,10 @@ impl Render for CloudChip {
             .track_focus(&self.focus)
             .key_context("CloudChip")
             .tab_index(0)
-            .h(px(20.))
-            .map(|d| {
-                if classic {
-                    d.px(px(4.)).rounded_md()
-                } else {
-                    d.px(px(8.)).rounded_full()
-                }
-            })
-            .flex_shrink_0()
             // Its place at the end of the shell's footer row: a gap from the terminal controls,
             // and the margins the usage chip's own footer has.
             .ml(px(4.))
             .when(!classic, |d| d.mr(px(8.)).mb(px(2.)))
-            .flex()
-            .items_center()
-            .gap(px(5.))
             .text_color(color)
             .when(warns, |d| d.bg(warning_color().opacity(0.14)))
             .cursor_pointer()
@@ -332,8 +322,12 @@ impl Render for CloudChip {
                     content(0.1)
                 })
             })
-            .child(icon("cloud", 12.).text_color(color))
-            .child(label)
+            .child(icon("cloud", FOOTER_ICON_SIZE).text_color(color))
+            .child(
+                div()
+                    .debug_selector(|| "cloud-status-chip-label".into())
+                    .child(label),
+            )
             .tooltip(move |_, cx| cx.new(|_| CloudTip(tip.clone())).into())
             .on_click(cx.listener(|this, _, _, cx| this.open(cx)))
             .on_action(cx.listener(|this, _: &OpenCloudStatus, _, cx| this.open(cx)))
