@@ -44,7 +44,10 @@ export function ResponsiveOverlay({ open, onOpenChange, title, description, chil
           <DrawerTitle>{title}</DrawerTitle>
           {description ? <DrawerDescription>{description}</DrawerDescription> : null}
         </DrawerHeader>
-        <div className="min-h-0 flex-1 overflow-y-auto px-6 py-3">{children}</div>
+        <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
+          {/* 4 + 16 = 20px, the same inset as the header and footer, with room for the focus ring. */}
+          <div className="px-1">{children}</div>
+        </div>
         {footer ? <div className="flex flex-col-reverse gap-2 px-5 pt-2">{footer}</div> : null}
       </DrawerContent>
     </Drawer>

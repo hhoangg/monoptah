@@ -2,7 +2,7 @@ import { useMemo } from "react";
 import { Icon, type IconName } from "@/ui/Icon";
 import { PageHeader } from "@/ui/PageHeader";
 import { Notice } from "@/ui/Notice";
-import { SettingsCard } from "@/ui/SettingsCard";
+import { SettingsCard, SettingsRow } from "@/ui/SettingsCard";
 import { SettingsLayout } from "./SettingsLayout";
 import { detectPlatform, useStandalone, type InstallPlatform } from "./standalone";
 
@@ -95,6 +95,10 @@ export function InstallGuide() {
       ) : (
         guides.map((guide) => <GuideCard key={guide.platform} guide={guide} current={guide.platform === detected} />)
       )}
+      {/* An installed app has no browser Back button: always offer a way into the app. */}
+      <SettingsCard>
+        <SettingsRow icon="computer" title="Back to Monoptah" to="/" />
+      </SettingsCard>
     </SettingsLayout>
   );
 }

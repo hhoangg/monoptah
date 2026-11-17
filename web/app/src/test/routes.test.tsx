@@ -151,8 +151,8 @@ describe("route stubs", () => {
     for (const [key, value] of Object.entries(params)) expect(last?.params).toHaveProperty(key, value);
     if (SCREENS[route]) {
       expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
-      // Signed-out visitors of the public family see no app navigation.
-      if (isPublicPath(new URL(url, "http://x").pathname)) expect(screen.queryByRole("navigation", { name: "Main" })).toBeNull();
+      // The sign-in family shows no app navigation; /install keeps it and offers a way back.
+      if (["/login", "/register", "/recover"].includes(new URL(url, "http://x").pathname)) expect(screen.queryByRole("navigation", { name: "Main" })).toBeNull();
       else expect(screen.getByRole("navigation", { name: "Main" })).toBeInTheDocument();
       return;
     }
@@ -164,6 +164,26 @@ describe("route stubs", () => {
     }
     // The shared shell wraps every stub.
     expect(screen.getByRole("navigation", { name: "Main" })).toBeInTheDocument();
+  });
+
+  it("keeps the brand a link home everywhere, and /install offers a way back into the app", async () => {
+    await renderAt("/install");
+    expect(screen.getByRole("link", { name: "Monoptah" })).toHaveAttribute("href", "/");
+    expect(screen.getByRole("link", { name: /Back to Monoptah/ })).toHaveAttribute("href", "/");
+  });
+
+  it("sends a signed-in visitor of /login on to the redirect target", async () => {
+    restoreTransport?.();
+    restoreTransport = setApiTransport(createMockServer({ signedIn: true }).transport);
+    const queryClient = createQueryClient();
+    const router = createAppRouter({ history: createMemoryHistory({ initialEntries: ["/login?redirect=/settings"] }), queryClient });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <RouterProvider router={router} />
+      </QueryClientProvider>,
+    );
+    await screen.findByRole("heading", { level: 1, name: "Settings" });
+    expect(router.state.location.pathname).toBe("/settings");
   });
 
   it("covers every route file of the generated route tree", async () => {

@@ -240,6 +240,16 @@ test("paths assembled from literal pieces (best effort)", () => {
   expectViolation({ "web/app/vite.config.ts": 'import path from "node:path";\nconst repoRoot = "/x";\nexport default { root: path.join(repoRoot, "src-tauri") };\n' }, "legacy-reference", "join root-ish");
 });
 
+test("legit paths assembled from pieces inside web/ pass", () => {
+  const { status, out } = run(
+    tree({
+      "web/app/vite.config.ts":
+        'import path from "node:path";\nconst repoRoot = "/x";\nexport default { a: path.resolve(__dirname, "..", "protocol", "src"), b: path.join(repoRoot, "web", "app", "src"), c: path.join(__dirname, "src") };\n',
+    }),
+  );
+  assert.equal(status, 0, out);
+});
+
 test("branding scan covers the manifest and the other source types", () => {
   expectViolation({ "web/app/public/manifest.webmanifest": '{"name": "MonoCode", "short_name": "MonoCode"}\n' }, "branding", "webmanifest");
   expectViolation({ "web/worker/wrangler.jsonc": '{ "name": "MonoCode API" }\n' }, "branding", "jsonc");

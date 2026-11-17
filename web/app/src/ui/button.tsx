@@ -8,7 +8,7 @@ import { cn } from "@/lib/utils";
 // (bg primary = inverseSurface, text inverse), never accent-colored. No shadows, radii from the
 // scale, >= 44px on touch and 36px on pointer: fine, visible focus comes from the global outline.
 export const buttonVariants = cva(
-  "inline-flex shrink-0 items-center justify-center gap-2 whitespace-nowrap text-small font-semibold outline-offset-2 transition-[opacity,background-color] duration-150 select-none active:opacity-60 disabled:pointer-events-none disabled:opacity-40 [&_svg]:pointer-events-none [&_svg]:shrink-0",
+  "inline-flex shrink-0 items-center justify-center gap-2 text-center text-small font-semibold outline-offset-2 transition-[opacity,background-color] duration-150 select-none active:opacity-60 disabled:pointer-events-none disabled:opacity-40 [&_svg]:pointer-events-none [&_svg]:shrink-0",
   {
     variants: {
       variant: {
@@ -25,7 +25,7 @@ export const buttonVariants = cva(
         default: "min-h-11 px-4 py-2 pointer-fine:min-h-9 rounded-row",
         sm: "min-h-11 px-3 pointer-fine:min-h-9 rounded-row",
         /** Big call to action: radius 32. */
-        lg: "min-h-14 px-6 py-2 text-body whitespace-normal rounded-sheet",
+        lg: "min-h-14 px-6 py-2 text-body rounded-sheet",
         /** Send button and other pills: radius 999. */
         pill: "min-h-11 px-5 pointer-fine:min-h-9 rounded-pill",
         /** Circle button 44, 36 in the composer and on pointer: fine. */

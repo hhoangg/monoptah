@@ -90,16 +90,13 @@ export async function withFreshAuth<T>(fn: () => Promise<T>, reauthFn: typeof re
 
 // --- Auth flows ---
 
-/** Query keys that belong to the desktop link, not to the signed-in account (W-05). */
-const ACCOUNT_INDEPENDENT_KEYS: ReadonlySet<unknown> = new Set(["link"]);
-
 /**
- * Drops every account-scoped cached value (`me`, passkeys, sessions, invites, desktops, ...). Run
- * on sign-in, register, recover and when a call answers 401, so one account never sees another's
- * cached data in the same tab (security review L2). Desktop link data is not account data.
+ * Drops every cached value (`me`, passkeys, sessions, invites, desktops and the desktop link data).
+ * Run on sign-in, register, recover and when a call answers 401, so one account never sees another's
+ * cached data in the same tab (security review L2, N5).
  */
 export function clearAccountCache(queryClient: QueryClient): void {
-  queryClient.removeQueries({ predicate: (query) => !ACCOUNT_INDEPENDENT_KEYS.has(query.queryKey[0]) });
+  queryClient.clear();
 }
 
 export interface RegisterInput {

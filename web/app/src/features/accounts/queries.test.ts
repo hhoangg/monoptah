@@ -120,14 +120,14 @@ describe("account cache on a change of session (L2)", () => {
     queryClient.setQueryData(["link", "d1", "workspace.list"], { keep: true });
   }
 
-  it("sign-in drops every account query and keeps the desktop link data", async () => {
+  it("sign-in drops every account query and the desktop link data", async () => {
     useMock({ signedIn: false });
     await seed();
     await signIn(queryClient);
     expect(queryClient.getQueryData(["passkeys"])).toBeUndefined();
     expect(queryClient.getQueryData(["sessions"])).toBeUndefined();
     expect(queryClient.getQueryData(["me"])).toBeUndefined();
-    expect(queryClient.getQueryData(["link", "d1", "workspace.list"])).toEqual({ keep: true });
+    expect(queryClient.getQueryData(["link", "d1", "workspace.list"])).toBeUndefined();
   });
 
   it("register drops the previous account's cache", async () => {
@@ -137,10 +137,10 @@ describe("account cache on a change of session (L2)", () => {
     expect(queryClient.getQueryData(["passkeys"])).toBeUndefined();
   });
 
-  it("clearAccountCache removes only account-scoped keys", async () => {
+  it("clearAccountCache drops everything, link data included", async () => {
     await seed();
     clearAccountCache(queryClient);
     expect(queryClient.getQueryData(["me"])).toBeUndefined();
-    expect(queryClient.getQueryData(["link", "d1", "workspace.list"])).toBeDefined();
+    expect(queryClient.getQueryData(["link", "d1", "workspace.list"])).toBeUndefined();
   });
 });

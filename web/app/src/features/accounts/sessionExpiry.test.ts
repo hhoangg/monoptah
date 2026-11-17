@@ -3,10 +3,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "./api";
 import { installSessionExpiryHandler, type ExpiryRouter } from "./sessionExpiry";
 
-function setup(location: { pathname: string; searchStr: string }, isLoading = false) {
+function setup(location: { pathname: string; searchStr: string; hash?: string }, isLoading = false) {
   const queryClient = new QueryClient();
   const navigate = vi.fn();
-  const router: ExpiryRouter = { state: { isLoading, location }, navigate };
+  const router: ExpiryRouter = { state: { isLoading, location: { hash: "", ...location } }, navigate };
   const off = installSessionExpiryHandler(queryClient, router);
   return { queryClient, navigate, off };
 }
@@ -29,7 +29,19 @@ describe("session expiry handler", () => {
     await failWith(ctx.queryClient, ["sessions"], unauthorized());
     expect(ctx.navigate).toHaveBeenCalledWith({ to: "/login", search: { redirect: "/settings?tab=1" }, replace: true });
     expect(ctx.queryClient.getQueryData(["passkeys"])).toBeUndefined();
-    expect(ctx.queryClient.getQueryData(["link", "d1"])).toEqual({ keep: true });
+    // Desktop link data goes too: nothing of the old account stays readable.
+    expect(ctx.queryClient.getQueryData(["link", "d1"])).toBeUndefined();
+  });
+
+  it("parks #fp before the redirect and also reacts to a 401 from a mutation", async () => {
+    sessionStorage.clear();
+    const fp = "ab".repeat(32);
+    const ctx = setup({ pathname: "/pair/c0de", searchStr: "", hash: `#fp=${fp}` });
+    off = ctx.off;
+    await ctx.queryClient.getMutationCache().build(ctx.queryClient, { mutationFn: () => Promise.reject(unauthorized()) }).execute(undefined).catch(() => undefined);
+    await Promise.resolve();
+    expect(ctx.navigate).toHaveBeenCalledWith({ to: "/login", search: { redirect: "/pair/c0de" }, replace: true });
+    expect(sessionStorage.getItem("monoptah.fp")).toContain(fp);
   });
 
   it("ignores other failures, public pages and a navigation the guard is already handling", async () => {

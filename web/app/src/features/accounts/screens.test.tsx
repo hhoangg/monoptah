@@ -224,6 +224,27 @@ describe("recover", () => {
     expect(state.recoveryOnly).toBe(true);
   });
 
+  it("offers Sign out (not a skip) when the server keeps the session recovery-only after the passkey", async () => {
+    const state = install({ signedIn: false });
+    const batch = newRecoveryBatch(state);
+    for (const spent of batch.slice(2)) state.recoveryCodes.delete(normalizeRecoveryCode(spent));
+    const user = userEvent.setup();
+    mount("/recover");
+    await screen.findByLabelText("Handle");
+    await user.type(screen.getByLabelText("Handle"), "dev-user");
+    await user.type(screen.getByLabelText("Recovery code"), batch[0]!);
+    await user.click(screen.getByRole("button", { name: "Recover account" }));
+    await user.click(await screen.findByRole("button", { name: "Add a passkey" }));
+    await screen.findByRole("heading", { level: 1, name: "Get new recovery codes" });
+    expect(screen.queryByRole("button", { name: "Sign out" })).toBeNull();
+    // The server keeps the session recovery-only: regenerate is refused with 403 recovery_only.
+    state.recoveryOnly = true;
+    await user.click(screen.getByRole("button", { name: /Generate new codes/ }));
+    await user.click(await screen.findByRole("button", { name: "Sign out" }));
+    await screen.findByRole("heading", { level: 1, name: "Sign in to Monoptah" });
+    // The registry refuses logout for a recovery-only session; the user still lands on /login.
+  });
+
   it("answers every failure with the same generic message", async () => {
     install({ signedIn: false });
     const user = userEvent.setup();

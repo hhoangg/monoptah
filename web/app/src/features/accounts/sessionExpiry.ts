@@ -6,24 +6,24 @@ import type { QueryClient } from "@tanstack/react-query";
 import { ApiError } from "./api";
 import { isPublicPath } from "./authGuard";
 import { clearAccountCache } from "./queries";
-import { loginRedirectTarget } from "./redirect";
+import { loginRedirectTarget, saveFingerprintFragment } from "./redirect";
 
 /** The few router members this module needs; the real `router` satisfies it. */
 export interface ExpiryRouter {
-  state: { isLoading: boolean; location: { pathname: string; searchStr: string } };
+  state: { isLoading: boolean; location: { pathname: string; searchStr: string; hash: string } };
   navigate: (options: { to: "/login"; search: { redirect: string }; replace: true }) => unknown;
 }
 
-/** Returns an unsubscribe function. */
+/** Watches the query cache and the mutation cache; returns one unsubscribe function. */
 export function installSessionExpiryHandler(queryClient: QueryClient, router: ExpiryRouter): () => void {
   let leaving = false;
-  return queryClient.getQueryCache().subscribe((event) => {
-    if (event.type !== "updated" || event.action.type !== "error") return;
-    const error: unknown = event.action.error;
+  function onUnauthorized(error: unknown): void {
     if (!(error instanceof ApiError) || error.status !== 401) return;
-    const { pathname, searchStr } = router.state.location;
+    const { pathname, searchStr, hash } = router.state.location;
     if (leaving || router.state.isLoading || isPublicPath(pathname)) return;
     leaving = true;
+    // Same as the guard: a `#fp` on /pair or /verify survives the sign-in.
+    saveFingerprintFragment(pathname, hash);
     // Clear after the cache finishes notifying about this failure.
     queueMicrotask(() => {
       clearAccountCache(queryClient);
@@ -31,5 +31,15 @@ export function installSessionExpiryHandler(queryClient: QueryClient, router: Ex
         leaving = false;
       });
     });
+  }
+  const offQueries = queryClient.getQueryCache().subscribe((event) => {
+    if (event.type === "updated" && event.action.type === "error") onUnauthorized(event.action.error);
   });
+  const offMutations = queryClient.getMutationCache().subscribe((event) => {
+    if (event.type === "updated" && event.action.type === "error") onUnauthorized(event.action.error);
+  });
+  return () => {
+    offQueries();
+    offMutations();
+  };
 }

@@ -10,7 +10,7 @@ import { PageHeader } from "@/ui/PageHeader";
 import { AddPasskeyStep } from "./AddPasskeyStep";
 import { passkeyErrorMessage, recoverErrorMessage } from "./authCopy";
 import { ApiError } from "./api";
-import { meQuery, ReauthCancelledError, recoverAccount, regenerateRecoveryCodes } from "./queries";
+import { meQuery, ReauthCancelledError, recoverAccount, regenerateRecoveryCodes, signOut } from "./queries";
 import { RecoveryCodes } from "./RecoveryCodes";
 import { normalizeRecoveryCode } from "./recoveryCodesFile";
 import { postSignInTarget } from "./redirect";
@@ -34,6 +34,7 @@ export function RecoverScreen() {
   const [codesLeft, setCodesLeft] = useState<number | null>(null);
   const [accountHandle, setAccountHandle] = useState("");
   const [newCodes, setNewCodes] = useState<string[]>([]);
+  const [stuck, setStuck] = useState(false);
 
   // The registry lets a recovery-only session call neither GET /api/me nor logout, so its `me` is
   // a 403 `recovery_only`: that alone says "add the passkey now". The handle is then unknown.
@@ -74,6 +75,18 @@ export function RecoverScreen() {
     else finish();
   }
 
+  /** Ends a session the server still treats as recovery-only; the cache is cleared even if logout is refused. */
+  async function leave() {
+    setBusy(true);
+    try {
+      await signOut(queryClient);
+    } catch {
+      // The local state is cleared in signOut's finally block either way.
+    }
+    setBusy(false);
+    void router.navigate({ to: "/login" });
+  }
+
   async function regenerate() {
     setBusy(true);
     setError(null);
@@ -81,6 +94,7 @@ export function RecoverScreen() {
       setNewCodes(await regenerateRecoveryCodes(queryClient));
       setLocalStep("codes");
     } catch (caught) {
+      if (caught instanceof ApiError && caught.code === "recovery_only") setStuck(true);
       setError(caught instanceof ReauthCancelledError ? "The passkey prompt was closed. Try again when you are ready." : passkeyErrorMessage(caught));
     } finally {
       setBusy(false);
@@ -110,11 +124,22 @@ export function RecoverScreen() {
       <AuthLayout>
         <PageHeader title="Get new recovery codes" description="Only a few of your recovery codes are left. Create a new set and save it to finish." />
         {error ? <Notice variant="error">{error}</Notice> : null}
+        {stuck ? (
+          <Notice variant="info">
+            This recovery session cannot create codes. Sign out, then sign in with the passkey you just added and create new codes from Settings.
+          </Notice>
+        ) : null}
         <div className="flex flex-col gap-2">
           <Button type="button" size="lg" className="w-full" disabled={busy} aria-busy={busy} onClick={() => void regenerate()}>
             Generate new codes
             {busy ? <DelayedSpinner label="Generating codes" /> : null}
           </Button>
+          {/* Never a skip for a normal session; only a way out when the server keeps the session recovery-only. */}
+          {stuck ? (
+            <Button type="button" variant="outline" className="w-full" disabled={busy} onClick={() => void leave()}>
+              Sign out
+            </Button>
+          ) : null}
         </div>
       </AuthLayout>
     );

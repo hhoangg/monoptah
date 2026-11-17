@@ -55,7 +55,7 @@ export function SegmentedControl<T extends string>({ label, options, value, onCh
   }
 
   return (
-    <div role="radiogroup" aria-label={label} className={cn("flex min-h-13 w-full gap-1 rounded-pill bg-fill p-1 pointer-fine:min-h-11", className)}>
+    <div role="radiogroup" aria-label={label} className={cn("flex min-h-13 w-full gap-1 rounded-pill bg-fill p-1 pointer-fine:min-h-11 max-[19.9rem]:flex-col max-[19.9rem]:rounded-card", className)}>
       {options.map((option, index) => {
         const selected = option.value === value;
         return (
@@ -70,7 +70,7 @@ export function SegmentedControl<T extends string>({ label, options, value, onCh
             tabIndex={selected ? 0 : -1}
             onClick={() => select(index)}
             onKeyDown={(event) => onKeyDown(event, index)}
-            className="relative isolate inline-flex min-h-11 flex-1 pointer-fine:min-h-9 items-center justify-center gap-1.5 rounded-[18px] px-3 text-small font-semibold text-content outline-offset-2"
+            className="relative isolate inline-flex min-h-11 min-w-0 flex-1 pointer-fine:min-h-9 items-center justify-center gap-1.5 rounded-[18px] px-2 min-[24rem]:px-3 text-small font-semibold text-content outline-offset-2"
           >
             {selected ? (
               <motion.span
@@ -81,7 +81,7 @@ export function SegmentedControl<T extends string>({ label, options, value, onCh
               />
             ) : null}
             {option.icon ? <Icon name={option.icon} size={18} className={cn("hidden min-[24rem]:inline-flex", selected ? undefined : "opacity-50")} /> : null}
-            <span className="min-w-0 truncate">{option.label}</span>
+            <span className={cn("min-w-0 truncate", selected ? undefined : "text-content-a72")}>{option.label}</span>
           </button>
         );
       })}

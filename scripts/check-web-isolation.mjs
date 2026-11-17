@@ -11,9 +11,10 @@
 // import of the root package `monocode-desktop` (M2).
 //
 // Known limit (M4): a path assembled from pieces at run time (`path.join(root, name)` with `name`
-// computed) cannot be seen. Only the literal forms `join(..., "..", "src")` and
-// `join(<root-ish identifier>, "src")` are matched, best effort. The isolated build in the CI
-// workflow (src/ and src-tauri/ deleted) is the real backstop for that.
+// computed) cannot be seen. Only `join|resolve(<base>, "a", "b", ...)` with a base of `__dirname`,
+// `import.meta.dirname` or `repoRoot` and string-literal pieces is resolved for real (legit paths
+// inside web/ pass). The isolated build in the CI workflow (src/ and src-tauri/ deleted) is the
+// real backstop for everything else.
 //
 // Usage: node scripts/check-web-isolation.mjs [repoRoot]   (default: the repo this file is in)
 // Output: one `path:line: rule: detail` per violation. Exit 1 on any, 0 when clean.
@@ -199,14 +200,18 @@ export function check(root) {
     for (const m of text.matchAll(/(?:from\s*|import\s*\(\s*|require\s*\(\s*|import\s+)(["'`])monocode-desktop(?:\/[^"'`\n]*)?\1/g)) {
       add(file, lineOf(text, m.index), "legacy-reference", "import of the root package `monocode-desktop`");
     }
-    // Best effort for paths built from literal pieces (see the header).
+    // Best effort for paths built from literal pieces: `join|resolve(<known base>, "a", "..", "b")`
+    // is resolved for real, so only a path that lands in src/ or src-tauri/ is reported.
     for (const m of text.matchAll(/\b(?:join|resolve)\(([^)\n]*)\)/g)) {
-      const args = m[1];
-      const dotdot = /["'`]\.\.["'`]/.test(args) || /["'`]\.\.\//.test(args);
-      const rootish = /\b(?:repo[_]?root|REPO_ROOT)\b/i.test(args);
-      if (/["'`](?:\.\.\/)*src(?:-tauri)?(?:\/[^"'`]*)?["'`]/.test(args) && (dotdot || rootish) && !/import\.meta\.dirname\s*,\s*["'`]src["'`]/.test(args)) {
-        add(file, lineOf(text, m.index), "legacy-reference", "path assembled from pieces points at `src` or `src-tauri`");
-      }
+      const [base, ...pieces] = m[1].split(",").map((part) => part.trim());
+      const literals = pieces.map((piece) => /^(["'`])([^"'`$]*)\1$/.exec(piece)?.[2]);
+      if (pieces.length === 0 || literals.some((piece) => piece === undefined)) continue;
+      let from = null;
+      if (base === "__dirname" || base === "import.meta.dirname") from = dir;
+      else if (/^(?:repo[_]?root|REPO_ROOT)$/i.test(base)) from = root;
+      if (from === null) continue;
+      const hit = intoLegacy(path.resolve(from, ...literals), root);
+      if (hit) add(file, lineOf(text, m.index), "legacy-reference", `path assembled from pieces resolves into repo-root ${hit}/`);
     }
 
     for (const m of text.matchAll(/src-tauri/g)) {

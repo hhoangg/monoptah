@@ -2,6 +2,7 @@
 @media print {
   body * { visibility: hidden; }
   [data-print-area], [data-print-area] * { visibility: visible; }
-  [data-print-area] { position: absolute; inset-inline: 0; top: 0; padding: 1rem; background: #fff; color: #000; }
-  [data-print-area] [data-print-hide] { display: none; }
+  /* Paper is white: drop the theme colors (dark mode text is near white) on every descendant. */
+  [data-print-area] { position: absolute; inset-inline: 0; top: 0; padding: 1rem; background: white; color: black; }
+  [data-print-area] * { color: inherit; background: transparent; }
 }
