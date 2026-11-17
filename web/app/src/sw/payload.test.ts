@@ -1,6 +1,6 @@
 import { PushPayloadSchema } from "@monoptah/protocol";
 import { describe, expect, it } from "vitest";
-import { GENERIC_BODY, GENERIC_TITLE, notificationFor, parsePushPayload, readPushData } from "./payload";
+import { GENERIC_BODY, GENERIC_TITLE, NOTIFICATION_BADGE, NOTIFICATION_ICON, notificationFor, parsePushPayload, readPushData } from "./payload";
 
 const valid = { v: 1, t: "Studio Mac", b: "api: Finished", url: "/d/dk1/s/s9", tag: "s9" };
 
@@ -34,11 +34,11 @@ describe("parsePushPayload", () => {
 
 describe("notificationFor", () => {
   it("uses the payload text verbatim, the tag and the URL", () => {
-    expect(notificationFor(parsePushPayload(valid))).toEqual({ title: "Studio Mac", options: { body: "api: Finished", tag: "s9", data: { url: "/d/dk1/s/s9" } } });
+    expect(notificationFor(parsePushPayload(valid))).toEqual({ title: "Studio Mac", options: { body: "api: Finished", icon: NOTIFICATION_ICON, badge: NOTIFICATION_BADGE, tag: "s9", data: { url: "/d/dk1/s/s9" } } });
   });
 
   it("shows a generic notice for an invalid payload", () => {
-    expect(notificationFor(null)).toEqual({ title: GENERIC_TITLE, options: { body: GENERIC_BODY, data: { url: "/" } } });
+    expect(notificationFor(null)).toEqual({ title: GENERIC_TITLE, options: { body: GENERIC_BODY, icon: NOTIFICATION_ICON, badge: NOTIFICATION_BADGE, data: { url: "/" } } });
     expect(GENERIC_TITLE).toBe("Monoptah");
   });
 

@@ -46,7 +46,7 @@ describe("push", () => {
     const { event, settle } = pushEvent({ v: 1, t: "Studio Mac", b: "api: Needs your input", url: "/d/dk1/s/s9", tag: "s9" });
     handlers.push(event);
     await settle();
-    expect(shown).toEqual([{ title: "Studio Mac", options: { body: "api: Needs your input", tag: "s9", data: { url: "/d/dk1/s/s9" } } }]);
+    expect(shown).toEqual([{ title: "Studio Mac", options: { body: "api: Needs your input", icon: "/icons/icon-192.png", badge: "/icons/badge-96.png", tag: "s9", data: { url: "/d/dk1/s/s9" } } }]);
   });
 
   it("carries the Mono chat URL of a Mono message", async () => {

@@ -22,6 +22,9 @@ export function parsePushPayload(raw: unknown): ParsedPushPayload | null {
 }
 
 export const GENERIC_TITLE = "Monoptah";
+/** Same-origin precached images: the app icon and a monochrome badge for the Android status bar. */
+export const NOTIFICATION_ICON = "/icons/icon-192.png";
+export const NOTIFICATION_BADGE = "/icons/badge-96.png";
 export const GENERIC_BODY = "Open Monoptah to see what happened.";
 /** The `data` of every notification: only the click target. */
 export interface NotificationData {
@@ -35,10 +38,10 @@ export interface NotificationSpec {
 
 /** The notification for a payload. Text comes from `t` and `b` verbatim; nothing else is shown. */
 export function notificationFor(payload: ParsedPushPayload | null): NotificationSpec {
-  if (!payload) return { title: GENERIC_TITLE, options: { body: GENERIC_BODY, data: { url: FALLBACK_URL } } };
+  if (!payload) return { title: GENERIC_TITLE, options: { body: GENERIC_BODY, icon: NOTIFICATION_ICON, badge: NOTIFICATION_BADGE, data: { url: FALLBACK_URL } } };
   // An unusable URL still shows the notice, and a click opens the root.
   const url = safeNotificationUrl(payload.url) ?? FALLBACK_URL;
-  const options: NotificationSpec["options"] = { body: payload.b, data: { url } };
+  const options: NotificationSpec["options"] = { body: payload.b, icon: NOTIFICATION_ICON, badge: NOTIFICATION_BADGE, data: { url } };
   // One notification per session: a newer one replaces the older (the Worker also sends a Topic header).
   if (payload.tag !== "") options.tag = payload.tag;
   return { title: payload.t, options };
