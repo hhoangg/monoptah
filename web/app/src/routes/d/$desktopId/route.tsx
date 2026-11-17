@@ -1,6 +1,7 @@
 // Layout of /d/:desktopId: mounts the LinkProvider and the Wave 0 slots. Owner: WS-L.
 import { createFileRoute, Outlet, useNavigate, useRouterState } from "@tanstack/react-router";
 import { useEffect, useRef } from "react";
+import { useLinkDataSync } from "@/data/sync";
 import { LinkProvider, useLinkState } from "@/link/LinkProvider";
 import { Slot } from "@/ui/slots";
 import { LinkBlockedScreen, isVersionBlocked } from "@/version/LinkBlockedScreen";
@@ -20,6 +21,8 @@ function DesktopLayout() {
 
 /** Link-level guards: login redirect and the W-22 version screen. The slots below are Wave 0 and unchanged. */
 function LinkGuards() {
+  // Catalog polling, resync and the clear-on-revoked run for as long as the layout is mounted (ref counted).
+  useLinkDataSync();
   const blocked = useLinkState((state) => state.blocked);
   const navigate = useNavigate();
   const href = useRouterState({ select: (state) => state.location.href });

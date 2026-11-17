@@ -30,3 +30,4 @@ export {
   type PersistAdapter,
 } from "./persist.ts";
 export { applyFrames, type AppliedFrames, type WatchFrameInput } from "./watchUpdates.ts";
+export { registerLastPlaceResolver, resolveLastPlace, type LastPlaceResolver } from "./lastPlace.ts";
