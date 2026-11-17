@@ -1,12 +1,12 @@
-// Route stub of /d/:desktopId/settings. Owner: WS-S (workstreams.md 3.1).
+// Per-desktop settings /d/:desktopId/settings (W-11, F-86). Owner: WS-S (workstreams.md 3.1).
 import { createFileRoute } from "@tanstack/react-router";
-import { RouteStub } from "@/ui/RouteStub";
+import { DesktopSettingsScreen } from "@/features/settings/DesktopSettingsScreen";
 
 export const Route = createFileRoute("/d/$desktopId/settings/")({
   component: Page,
 });
 
 function Page() {
-  const params = Route.useParams();
-  return <RouteStub route="/d/:desktopId/settings" purpose="Per-desktop settings: model defaults, project selection, notification categories, Reconnect." params={params} />;
+  const { desktopId } = Route.useParams();
+  return <DesktopSettingsScreen desktopId={desktopId} />;
 }

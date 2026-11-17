@@ -11,15 +11,18 @@
     "routes:gen": "tsr generate",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "eslint .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "guard:web": "node ../../scripts/check-web-isolation.mjs",
+    "guard:web:test": "node --test ../../scripts/check-web-isolation.test.mjs"
   },
   "dependencies": {
-    "@monoptah/protocol": "workspace:*",
     "@noble/ciphers": "^2.4.0",
     "@noble/curves": "^2.4.0",
     "@noble/hashes": "^2.4.0",
     "@hugeicons/core-free-icons": "^4.4.0",
     "@hugeicons/react": "^1.1.10",
+    "@monoptah/protocol": "workspace:*",
+    "@simplewebauthn/browser": "^14.0.0",
     "@tanstack/react-query": "^5.107.1",
     "@tanstack/react-router": "^1.170.46",
     "class-variance-authority": "^0.7.1",

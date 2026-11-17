@@ -1,7 +1,11 @@
 import { QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, RouterProvider } from "@tanstack/react-router";
 import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import userEvent from "@testing-library/user-event";
+import { afterEach, describe, expect, it } from "vitest";
+import { setApiTransport } from "@/features/accounts/api";
+import { isPublicPath } from "@/features/accounts/authGuard";
+import { createMockServer } from "@/features/accounts/mock/transport";
 import { createQueryClient } from "@/lib/queryClient";
 import { createAppRouter } from "@/router";
 
@@ -9,7 +13,8 @@ import { createAppRouter } from "@/router";
 // the concrete URL, the route shown by the stub, and the params the stub must render as text.
 const CASES: ReadonlyArray<{ url: string; route: string; params: Record<string, string>; fullPath: string }> = [
   // `/` redirects (F-14, W-06): with no last place registered it lands on /desktops.
-  { url: "/", route: "/desktops", params: {}, fullPath: "/" },
+  // The matched route after the redirect is /desktops, so that is its full path.
+  { url: "/", route: "/desktops", params: {}, fullPath: "/desktops/" },
   { url: "/login", route: "/login", params: {}, fullPath: "/login" },
   { url: "/register#invite=ABC", route: "/register", params: {}, fullPath: "/register" },
   { url: "/recover", route: "/recover", params: {}, fullPath: "/recover" },
@@ -104,20 +109,56 @@ const CASES: ReadonlyArray<{ url: string; route: string; params: Record<string, 
   { url: "/admin/invites", route: "/admin/invites", params: {}, fullPath: "/admin/invites" },
 ];
 
+// The auth guard asks `/api/me` for every non-public route: answer it with a signed-in mock account.
+// The public sign-in family is tested as a signed-out visitor (a signed-in one is sent on).
+let restoreTransport: (() => void) | undefined;
+afterEach(() => restoreTransport?.());
+
+function installAccount(url: string) {
+  restoreTransport?.();
+  restoreTransport = setApiTransport(createMockServer({ signedIn: !isPublicPath(new URL(url, "http://x").pathname) }).transport);
+}
+
+// Routes whose stub was replaced by a real screen (W-02, W-11): they render one h1 instead of the stub.
+const SCREENS: Record<string, string> = {
+  "/login": "Sign in to Monoptah",
+  "/register": "Create your account",
+  "/recover": "Recover your account",
+  "/settings": "Settings",
+  "/install": "Install Monoptah",
+  "/d/dk1/settings": "Desktop settings",
+  "/d/:desktopId/settings": "Desktop settings",
+};
+
 async function renderAt(url: string) {
-  const router = createAppRouter({ history: createMemoryHistory({ initialEntries: [url] }) });
+  installAccount(url);
+  const queryClient = createQueryClient();
+  const router = createAppRouter({ history: createMemoryHistory({ initialEntries: [url] }), queryClient });
   render(
-    <QueryClientProvider client={createQueryClient()}>
+    <QueryClientProvider client={queryClient}>
       <RouterProvider router={router} />
     </QueryClientProvider>,
   );
-  await screen.findByTestId("route-stub");
+  const screenTitle = SCREENS[new URL(url, "http://x").pathname];
+  if (screenTitle) await screen.findByRole("heading", { level: 1, name: screenTitle });
+  else await screen.findByTestId("route-stub");
   return router;
 }
 
 describe("route stubs", () => {
-  it.each(CASES)("renders $route for $url", async ({ url, route, params }) => {
-    await renderAt(url);
+  it.each(CASES)("renders $route for $url", async ({ url, route, params, fullPath }) => {
+    const router = await renderAt(url);
+    // Every route keeps its identity: the last match is this route with these params.
+    const last = router.state.matches.at(-1);
+    expect(last?.fullPath).toBe(fullPath);
+    for (const [key, value] of Object.entries(params)) expect(last?.params).toHaveProperty(key, value);
+    if (SCREENS[route]) {
+      expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
+      // The sign-in family shows no app navigation; /install keeps it and offers a way back.
+      if (["/login", "/register", "/recover"].includes(new URL(url, "http://x").pathname)) expect(screen.queryByRole("navigation", { name: "Main" })).toBeNull();
+      else expect(screen.getByRole("navigation", { name: "Main" })).toBeInTheDocument();
+      return;
+    }
     const stub = screen.getByTestId("route-stub");
     expect(stub).toHaveAttribute("data-route", route);
     expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent(route);
@@ -126,6 +167,44 @@ describe("route stubs", () => {
     }
     // The shared shell wraps every stub.
     expect(screen.getByRole("navigation", { name: "Main" })).toBeInTheDocument();
+  });
+
+  it("keeps the brand a link home everywhere, and /install offers a way back into the app", async () => {
+    await renderAt("/install");
+    expect(screen.getByRole("link", { name: "Monoptah" })).toHaveAttribute("href", "/");
+    expect(screen.getByRole("link", { name: /Back to Monoptah/ })).toHaveAttribute("href", "/");
+  });
+
+  it("shows who is signed in on /login and continues to the redirect target on request", async () => {
+    restoreTransport?.();
+    restoreTransport = setApiTransport(createMockServer({ signedIn: true }).transport);
+    const queryClient = createQueryClient();
+    const router = createAppRouter({ history: createMemoryHistory({ initialEntries: ["/login?redirect=/settings"] }), queryClient });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <RouterProvider router={router} />
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByText(/Signed in as .* \(@dev-user\)/)).toBeInTheDocument();
+    expect(router.state.location.pathname).toBe("/login");
+    await userEvent.click(screen.getByRole("button", { name: "Continue" }));
+    await screen.findByRole("heading", { level: 1, name: "Settings" });
+    expect(router.state.location.pathname).toBe("/settings");
+  });
+
+  it("offers a different passkey on /login: signs out and shows the sign-in button", async () => {
+    restoreTransport?.();
+    restoreTransport = setApiTransport(createMockServer({ signedIn: true }).transport);
+    const queryClient = createQueryClient();
+    const router = createAppRouter({ history: createMemoryHistory({ initialEntries: ["/login"] }), queryClient });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <RouterProvider router={router} />
+      </QueryClientProvider>,
+    );
+    await userEvent.click(await screen.findByRole("button", { name: "Sign in with a different passkey" }));
+    expect(await screen.findByRole("button", { name: /Sign in with passkey/ })).toBeInTheDocument();
+    expect(router.state.location.pathname).toBe("/login");
   });
 
   it("covers every route file of the generated route tree", async () => {

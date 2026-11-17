@@ -41,6 +41,8 @@ export interface SlotBaseProps {
  */
 export interface SlotPropsMap extends Record<SlotName, SlotBaseProps> {
   "new-session-target": SlotBaseProps & { value?: unknown; onChange?: (target: unknown) => void };
+  /** The U-07 default-model row of WS-T renders inside the per-desktop settings of this desktop. */
+  "desktop-settings-sections": SlotBaseProps & { desktopId: string };
 }
 
 const registry = new Map<SlotName, ComponentType<never>>();
