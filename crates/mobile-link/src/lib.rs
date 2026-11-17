@@ -19,6 +19,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+pub use duplex::{serve_stream, Duplex, ServeOptions};
 pub use transport::{
     exchange, read_frame, serve, server_endpoint, watch, write_frame, Watch, WatchSink,
 };

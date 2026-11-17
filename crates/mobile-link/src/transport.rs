@@ -1,9 +1,11 @@
+use crate::duplex::{accept, Accepted, Duplex, ServeOptions};
 use crate::{tls, Address, Gate, Identity, LinkResult, REQUEST_LIMIT, RESPONSE_LIMIT};
 use serde_json::Value;
 use std::{
     collections::HashMap,
     future::Future,
     net::SocketAddr,
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, OnceLock,
@@ -121,129 +123,66 @@ where
                 return;
             };
             let key = crate::fingerprint(cert.as_ref());
-            while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+            while let Ok((send, recv)) = connection.accept_bi().await {
                 if !gate.admits(&key) {
                     connection.close(1_u32.into(), b"Device revoked");
                     break;
                 }
-                // Long enough for a message's attachments over a slow network.
-                let request = timeout(REQUEST_UPLOAD, read_frame(&mut recv, REQUEST_LIMIT))
-                    .await
-                    .unwrap_or_else(|_| Err("Desktop request timed out".into()))
-                    .and_then(|request| {
-                        if gate.admits(&key) {
-                            Ok(request)
-                        } else {
-                            Err("Device revoked".into())
-                        }
-                    });
-                if let Some(request) = request
-                    .as_ref()
-                    .ok()
-                    .filter(|request| request["watch"] == true)
-                {
-                    // A watch runs beside the connection's requests, not in front of them.
-                    let (sink, updates) = mpsc::channel(64);
-                    let watching = watcher(key.clone(), request.clone(), sink);
-                    tokio::spawn(stream_watch(
-                        send,
-                        recv,
-                        updates,
-                        watching,
-                        gate.clone(),
-                        key.clone(),
-                    ));
-                    continue;
-                }
-                // Sequential per connection bounds work and preserves command ordering.
-                let response = match request {
-                    Ok(request) => timeout(Duration::from_secs(30), handler(key.clone(), request))
-                        .await
-                        .unwrap_or_else(|_| Err("Desktop request timed out".into())),
-                    Err(error) => Err(error),
+                let admits = {
+                    let gate = gate.clone();
+                    move |key: &str| gate.admits(key)
                 };
-                let response = match response {
-                    Ok(result) => serde_json::json!({"ok":true,"result":result}),
-                    Err(error) => serde_json::json!({"ok":false,"error":error}),
+                let stream = QuicStream {
+                    send,
+                    recv: Some(recv),
                 };
-                let _ = timeout(
-                    Duration::from_secs(10),
-                    write_frame(&mut send, &response, RESPONSE_LIMIT),
+                // Sequential per connection bounds work and preserves command
+                // ordering; a watch runs beside the connection's requests.
+                let accepted = accept(
+                    stream,
+                    &key,
+                    admits,
+                    &*handler,
+                    &*watcher,
+                    ServeOptions::QUIC,
                 )
                 .await;
+                if let Accepted::Watch(run) = accepted {
+                    tokio::spawn(run.run());
+                }
             }
         });
     }
 }
-async fn stream_watch(
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
-    mut updates: mpsc::Receiver<Value>,
-    watching: impl Future<Output = LinkResult<()>>,
-    gate: Gate,
-    key: String,
-) {
-    let frame = |result: LinkResult<Value>| match result {
-        Ok(value) => serde_json::json!({"ok":true,"result":value}),
-        Err(error) => serde_json::json!({"ok":false,"error":error}),
-    };
-    // The watcher answers first, as a request would: refused, or watching.
-    if let Err(error) = timeout(Duration::from_secs(30), watching)
-        .await
-        .unwrap_or_else(|_| Err("Desktop request timed out".into()))
-    {
-        let _ = timeout(
-            Duration::from_secs(10),
-            write_frame(&mut send, &frame(Err(error)), RESPONSE_LIMIT),
-        )
-        .await;
-        return;
+
+/// One QUIC bidirectional stream: length-prefixed JSON frames.
+struct QuicStream {
+    send: quinn::SendStream,
+    /// Taken by `closed`.
+    recv: Option<quinn::RecvStream>,
+}
+impl Duplex for QuicStream {
+    async fn read_request(&mut self, limit: usize) -> LinkResult<Value> {
+        let recv = self.recv.as_mut().ok_or("Request already read")?;
+        // Long enough for a message's attachments over a slow network.
+        timeout(REQUEST_UPLOAD, read_frame(recv, limit))
+            .await
+            .unwrap_or_else(|_| Err("Desktop request timed out".into()))
     }
-    if write_message(
-        &mut send,
-        &serde_json::json!({"ok":true,"watching":true}),
-        RESPONSE_LIMIT,
-    )
-    .await
-    .is_err()
-    {
-        return;
+    async fn write(&mut self, value: &Value, limit: usize) -> LinkResult<()> {
+        write_message(&mut self.send, value, limit).await
     }
-    // The phone closes its side to stop watching.
-    let mut closed =
-        Box::pin(
-            async move { while recv.read_chunk(1024, true).await.is_ok_and(|c| c.is_some()) {} },
-        );
-    let mut heartbeat = tokio::time::interval(WATCH_HEARTBEAT);
-    heartbeat.tick().await;
-    loop {
-        let value = tokio::select! {
-            update = updates.recv() => match update {
-                Some(value) => frame(Ok(value)),
-                None => break,
-            },
-            _ = heartbeat.tick() => serde_json::json!({"ok":true,"heartbeat":true}),
-            _ = &mut closed => return,
-        };
-        if !gate.admits(&key) {
-            let _ = write_frame(
-                &mut send,
-                &frame(Err("Device revoked".into())),
-                RESPONSE_LIMIT,
-            )
-            .await;
-            return;
-        }
-        let written = timeout(
-            Duration::from_secs(10),
-            write_message(&mut send, &value, RESPONSE_LIMIT),
-        )
-        .await;
-        if !matches!(written, Ok(Ok(()))) {
-            return;
-        }
+    fn finish(&mut self) -> LinkResult<()> {
+        self.send.finish().map_err(|e| e.to_string())
     }
-    let _ = send.finish();
+    fn closed(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let recv = self.recv.take();
+        Box::pin(async move {
+            if let Some(mut recv) = recv {
+                while recv.read_chunk(1024, true).await.is_ok_and(|c| c.is_some()) {}
+            }
+        })
+    }
 }
 
 async fn connect(
