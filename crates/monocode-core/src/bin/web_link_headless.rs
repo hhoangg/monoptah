@@ -16,7 +16,7 @@
 //! `/api/pair/poll` until a signed-in user approves the user code) and stores the result in
 //! `<data-dir>/web-pairing.json`. It prints JSON lines on stdout and never the token.
 //!
-//! `serve` is NOT wired yet: the host API a binary needs is not `pub` in monocode-core. TODO(E-01:WS-D1 R-05b):
+//! `serve` is NOT wired yet: the web identity save, grant confirm and grant sync a binary needs are not `pub` in monocode-core. TODO(E-01:WS-D1 R-05, R-15):
 //! see `SERVE_NOT_WIRED` below for the exact items. `capabilities` keeps `"serve": false` until then.
 use monocode_core::mobile::web_link::frame::{
     split_message, Frame, FrameType, Plaintext, MAX_REQUEST_BYTES,
@@ -36,11 +36,11 @@ const USAGE: &str = "usage:
 
   --confirm-pending is for the E2E harness only: it confirms every pending grant on its own. It is never a default.";
 
-const CAPABILITIES_LINE: &str = r#"{"version":1,"serve":false,"pair":true,"reason":"serve needs pub host APIs from WS-D1 (R-05b)","checkVectors":true}"#;
-const SERVE_NOT_WIRED: &str = "web_link serve not wired yet: TODO(E-01:WS-D1 R-05b). A binary cannot reach: \
-accounts::register_database (pub(crate)), MobileHost::save_web_identity and mobile::identity_store::WebIdentity \
-(pub(crate)), a pub way to confirm a pending grant (host.rs has only the cfg(test) add_device_for_test and the \
-pub(crate) web_link().pending()), and a pub catalog source for the host (Event::Request answers).";
+const CAPABILITIES_LINE: &str = r#"{"version":1,"serve":false,"pair":true,"reason":"serve needs a pub web identity save, grant confirm and grant sync from WS-D1 (R-05, R-15)","checkVectors":true}"#;
+const SERVE_NOT_WIRED: &str = "web_link serve not wired yet: TODO(E-01:WS-D1 R-05, R-15). Public today and enough for the rest of serve: \
+store::Store::open (registers the database), MobileHost::open, MobileHost::publish (the catalog), set_web_enabled, \
+web_link::start and web_status. Still crate-private: MobileHost::save_web_identity with mobile::identity_store::WebIdentity \
+(a binary cannot seal the pairing result), a way to confirm a pending grant, and the R-15 grant sync that fills pending grants.";
 const PAIRING_FILE: &str = "web-pairing.json";
 const DEFAULT_MACHINE_NAME: &str = "e2e-headless";
 const DEFAULT_TIMEOUT_SECS: u64 = 600;
@@ -909,7 +909,7 @@ mod tests {
         let value: Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(
             value,
-            json!({"version": 1, "serve": false, "pair": true, "reason": "serve needs pub host APIs from WS-D1 (R-05b)", "checkVectors": true})
+            json!({"version": 1, "serve": false, "pair": true, "reason": "serve needs a pub web identity save, grant confirm and grant sync from WS-D1 (R-05, R-15)", "checkVectors": true})
         );
     }
 
@@ -978,7 +978,7 @@ mod tests {
         .unwrap();
         let (code, out, err) = run_capture(&["serve", "--data-dir", data]);
         assert_eq!(code, 3);
-        assert!(err.contains("TODO(E-01:WS-D1 R-05b)"));
+        assert!(err.contains("TODO(E-01:WS-D1 R-05, R-15)"));
         assert!(!out.contains("obviously-fake") && !err.contains("obviously-fake"));
     }
 

@@ -114,7 +114,7 @@ export function decidePairProbe(binExists: boolean, caps: HeadlessCapabilities |
 export function decideHeadlessProbe(binExists: boolean, caps: HeadlessCapabilities | null): Probe {
   if (!binExists) return { run: false, reason: "TODO(E-01:WS-D1 R-05) headless binary not built (set E2E_HEADLESS_BIN or build web_link_headless)" };
   if (caps === null) return { run: false, reason: "TODO(E-01:WS-D1 R-05) headless binary did not answer `capabilities` with the expected JSON line" };
-  if (!caps.serve) return { run: false, reason: `TODO(E-01:WS-D1 R-05b) headless binary reports serve=false (${caps.reason ?? "no reason given"})` };
+  if (!caps.serve) return { run: false, reason: `TODO(E-01:WS-D1 R-05, R-15) headless binary reports serve=false (${caps.reason ?? "no reason given"})` };
   return { run: true, reason: "headless binary reports serve=true" };
 }
 

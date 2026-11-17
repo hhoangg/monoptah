@@ -112,7 +112,7 @@ describe("probe decisions", () => {
     expect(decideHeadlessProbe(true, { ...caps, serve: false, reason: "later" }).reason).toContain("later");
     expect(decideHeadlessProbe(true, caps).run).toBe(true);
     expect(decideHeadlessProbe(false, null).reason).toContain("TODO(E-01:WS-D1 R-05)");
-    expect(decideHeadlessProbe(true, { ...caps, serve: false }).reason).toContain("R-05b");
+    expect(decideHeadlessProbe(true, { ...caps, serve: false }).reason).toContain("R-05, R-15");
   });
   it("pair: needs the binary and pair=true, independent of serve", () => {
     const caps = { version: 1, serve: false, pair: true, reason: "later", checkVectors: true };

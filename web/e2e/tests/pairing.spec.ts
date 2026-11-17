@@ -6,7 +6,7 @@
 // Test 2 needs `web_link_headless serve`; it skips with its TODO marker until the binary reports `serve: true`.
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { E2E_CATALOG } from "../lib/catalog.ts";
@@ -24,12 +24,18 @@ interface Headless {
   /** Resolves with the exit code. */
   exited: Promise<number | null>;
   stderr: () => string;
+  /** Raw stdout text, for leak checks. */
+  stdoutText: () => string;
 }
 
 /** Spawns the headless binary. Its stdout is JSON lines (never the token); stderr is kept for failure messages. */
 function runHeadless(args: string[]): Headless {
   const child = spawn(headlessBin(), args, { stdio: ["ignore", "pipe", "pipe"] });
   const events: Record<string, unknown>[] = [];
+  let outText = "";
+  child.stdout!.on("data", (chunk: Buffer) => {
+    outText += chunk.toString();
+  });
   createInterface({ input: child.stdout! }).on("line", (line) => {
     try {
       events.push(JSON.parse(line) as Record<string, unknown>);
@@ -42,7 +48,7 @@ function runHeadless(args: string[]): Headless {
     errText = (errText + chunk.toString()).slice(-2000);
   });
   const exited = new Promise<number | null>((resolve) => child.on("exit", (code) => resolve(code)));
-  return { child, events, exited, stderr: () => errText };
+  return { child, events, exited, stderr: () => errText, stdoutText: () => outText };
 }
 
 const eventOf = (headless: Headless, name: string) => headless.events.find((e) => e["event"] === name);
@@ -73,7 +79,14 @@ test.describe.serial("pair the headless desktop (E-01)", () => {
     // Desktop side: `pair` starts the device authorization, prints the user code and polls until it is approved.
     const pair = runHeadless(["pair", "--server", origin(), "--data-dir", join(dataDir, "data"), "--machine-name", "e2e-headless"]);
     try {
-      await expect.poll(() => eventOf(pair, "pairing") !== undefined, { timeout: 15_000, message: pair.stderr() }).toBe(true);
+      await expect
+        .poll(() => {
+          if (eventOf(pair, "pairing") === undefined && pair.child.exitCode !== null) {
+            throw new Error(`pair exited with ${pair.child.exitCode} before printing a user code: ${pair.stderr()}`);
+          }
+          return eventOf(pair, "pairing") !== undefined;
+        }, { timeout: 15_000 })
+        .toBe(true);
       const started = eventOf(pair, "pairing") as { userCode: string; confirmationCode: string; fingerprint: string };
       expect(started.userCode).toMatch(/^[A-Z0-9]{4}-[A-Z0-9]{4}$/);
 
@@ -90,8 +103,15 @@ test.describe.serial("pair the headless desktop (E-01)", () => {
       const paired = eventOf(pair, "paired") as { desktopId: string; account: string; fingerprint: string };
       expect(paired).toMatchObject({ desktopId: approved.json["desktopId"], account: "e2epair", fingerprint: started.fingerprint });
       desktopId = paired.desktopId;
-      // The token is minted by the poll and never printed.
+      // The token is minted by the poll and never printed: its value (read from the private file) appears in neither
+      // stream, and the file is not readable by group or others.
+      const file = join(dataDir, "data", "web-pairing.json");
+      const token = (JSON.parse(readFileSync(file, "utf8")) as { desktopToken: string }).desktopToken;
+      expect(token.length).toBeGreaterThan(8);
+      expect(pair.stdoutText()).not.toContain(token);
+      expect(pair.stderr()).not.toContain(token);
       expect(JSON.stringify(pair.events)).not.toMatch(/desktopToken|deviceCode|verifier/);
+      if (process.platform !== "win32") expect(statSync(file).mode & 0o077).toBe(0);
     } finally {
       pair.child.kill("SIGTERM");
     }
@@ -105,7 +125,7 @@ test.describe.serial("pair the headless desktop (E-01)", () => {
     expect(directory.json["fingerprint"]).toBe((eventOf(pair, "paired") as { fingerprint: string }).fingerprint);
   });
 
-  test("TODO(E-01:WS-D1 R-05b) serve, confirm a device, read the catalog", async () => {
+  test("TODO(E-01:WS-D1 R-05, R-15) serve, confirm a device, read the catalog", async () => {
     const headless = probeHeadless();
     if (!headless.run) console.log(`skip reason: ${headless.reason}`);
     test.skip(!headless.run, headless.reason);
@@ -114,10 +134,10 @@ test.describe.serial("pair the headless desktop (E-01)", () => {
     // The desktop: loads its pairing, dials the relay and confirms pending grants by itself (E2E-only flag).
     serving = runHeadless(["serve", "--data-dir", join(dataDir, "data"), "--confirm-pending", "read-only"]);
     await expect
-      .poll(async () => ((await owner.call("GET", "/api/desktops")).json["desktops"] as { id: string; online: boolean }[]).some((d) => d.id === desktopId && d.online), {
-        timeout: 30_000,
-        message: serving.stderr(),
-      })
+      .poll(async () => {
+        if (serving!.child.exitCode !== null) throw new Error(`serve exited with ${serving!.child.exitCode}: ${serving!.stderr()}`);
+        return ((await owner.call("GET", "/api/desktops")).json["desktops"] as { id: string; online: boolean }[]).some((d) => d.id === desktopId && d.online);
+      }, { timeout: 30_000 })
       .toBe(true);
 
     // The browser device: register its key and ask for access to the desktop.
