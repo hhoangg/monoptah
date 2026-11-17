@@ -1030,3 +1030,40 @@ fn a_watch_frame_that_is_too_large_ends_the_watch() {
         .await;
     });
 }
+
+// After a too large frame ends a watch, the frames queued behind it for the
+// same rid are dropped, not sent after the error.
+#[test]
+fn nothing_follows_the_error_of_a_watch_ended_for_a_too_large_frame() {
+    let rt = runtime();
+    let stub = rt.block_on(Stub::bind(0));
+    let (mut env, events) = env_with_events(stub.port());
+    env.host.set_web_enabled_with(true, fast()).unwrap();
+    rt.block_on(async {
+        let mut conn = stub.accept().await;
+        env.peer.handshake(&mut conn, 1).await;
+        let watch = json!({"version":1,"rid":9,"id":"w","method":"conversation.watch","watch":true,
+            "params":{"conversationId":"conv"}});
+        env.peer.write(&mut conn, &watch).await;
+        let Event::Watch(start) = within(events.recv()).await.unwrap() else {
+            panic!("expected a watch");
+        };
+        let id = start.id.clone();
+        start.accept(Ok(()));
+        env.peer.read(&mut conn).await;
+        // The first update goes out at once; the next two are held for one
+        // flush and cannot merge (snapshot turns against patches).
+        env.host.push(&id, json!({"n": 0})).unwrap();
+        assert_eq!(env.peer.read(&mut conn).await["result"], json!({"n": 0}));
+        let huge = json!({"turns":[{"id":"a","pad":"x".repeat(9 * 1024 * 1024)}]});
+        let small = json!({"turns":[],"patches":[{"id":"a","edits":[]}]});
+        env.host.push(&id, huge).unwrap();
+        env.host.push(&id, small).unwrap();
+        assert_eq!(
+            env.peer.read(&mut conn).await,
+            json!({"rid":9,"ok":false,"error":"Response too large"})
+        );
+        let more = tokio::time::timeout(Duration::from_millis(900), conn.frame()).await;
+        assert!(more.is_err(), "a frame followed the error");
+    });
+}

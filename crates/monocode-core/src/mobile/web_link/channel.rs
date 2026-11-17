@@ -217,6 +217,9 @@ pub(super) struct Requests {
     /// Running concurrent jobs; the flag marks a plain read (not a watch).
     concurrent: HashMap<Key, (JoinHandle<()>, bool)>,
     queues: HashMap<SessionKey, Queue>,
+    /// Requests ended by `cancel` from the relay side: frames still queued for
+    /// them are dropped.
+    ended: std::collections::HashSet<Key>,
 }
 
 impl Drop for Requests {
@@ -238,7 +241,13 @@ impl Requests {
             live: Live::default(),
             concurrent: HashMap::new(),
             queues: HashMap::new(),
+            ended: std::collections::HashSet::new(),
         }
+    }
+
+    /// Whether `rid` of a session was ended by [`Requests::cancel`].
+    pub(super) fn is_ended(&self, key: SessionKey, rid: &Value) -> bool {
+        self.ended.contains(&(key, rid.to_string()))
     }
 
     /// The requests and watches of a session end with it.
@@ -256,12 +265,14 @@ impl Requests {
         if let Ok(mut live) = self.live.lock() {
             live.retain(|(owner, _), _| *owner != key);
         }
+        self.ended.retain(|(owner, _)| *owner != key);
     }
 
     /// Ends the request `rid` of a session, as a browser's cancel does. A
     /// watch stops and drops its sink; for a request that ended already it
     /// does nothing.
-    pub(super) fn cancel(&self, key: SessionKey, rid: &Value) {
+    pub(super) fn cancel(&mut self, key: SessionKey, rid: &Value) {
+        self.ended.insert((key, rid.to_string()));
         let notify = self
             .live
             .lock()
@@ -292,6 +303,8 @@ impl Requests {
             }
             return;
         }
+        // A new request under an id that was ended starts clean.
+        self.ended.remove(&(key, id.clone()));
         self.concurrent.retain(|_, (task, _)| !task.is_finished());
         // A watch only reads. Anything the policy table does not know counts
         // as control, so it keeps its place in the queue.

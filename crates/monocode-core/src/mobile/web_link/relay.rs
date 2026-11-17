@@ -357,9 +357,10 @@ async fn serve_socket(
     let mut last_read = Instant::now();
     let end = loop {
         tokio::select! {
-            // Nothing at all from the relay, not even a `pong`: the path is
-            // dead (a sleeping laptop, a dropped NAT mapping).
-            _ = tokio::time::sleep_until(last_read + timing.read_deadline) => break End::Lost,
+            // An inbound message that is ready wins over the deadline, so a
+            // long outbound flush with pongs buffered is not taken for a
+            // dead link.
+            biased;
             message = stream.next() => match message {
                 None | Some(Err(_)) => break End::Lost,
                 Some(Ok(Message::Close(frame))) => {
@@ -373,6 +374,9 @@ async fn serve_socket(
                 // but they prove the relay is there.
                 Some(Ok(_)) => last_read = Instant::now(),
             },
+            // Nothing at all from the relay, not even a `pong`: the path is
+            // dead (a sleeping laptop, a dropped NAT mapping).
+            _ = tokio::time::sleep_until(last_read + timing.read_deadline) => break End::Lost,
             Some(out) = out_rx.recv() => {
                 reply(&mut table, &mut requests, out, now_ms(), &mut frames);
             }
@@ -489,6 +493,10 @@ fn reply(
     now: u64,
     frames: &mut Vec<Frame>,
 ) {
+    // A watch ended for a frame that was too large sends nothing more.
+    if requests.is_ended(out.key, &out.value["rid"]) {
+        return;
+    }
     match table.send(out.key, &out.value, now) {
         Ok(sent) => frames.extend(sent),
         Err(SendError::Encrypt) => {

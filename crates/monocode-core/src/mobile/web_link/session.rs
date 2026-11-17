@@ -309,8 +309,18 @@ impl SessionTable {
         if on_device >= MAX_CHANNELS_PER_DEVICE || total >= MAX_SESSIONS {
             return vec![Action::Send(bye(key))];
         }
-        self.handshake(key, body, now)
-            .unwrap_or_else(|| vec![Action::Send(bye(key))])
+        let live = self.sessions.contains_key(&key);
+        self.handshake(key, body, now).unwrap_or_else(|| {
+            // BYE answers an unknown pair. A pair with a live session sends
+            // nothing on a failed HS1: whoever sent it (the relay, or a thief
+            // of the device id) must not be able to end that session, on the
+            // desktop or, through the BYE, in the browser.
+            if live {
+                Vec::new()
+            } else {
+                vec![Action::Send(bye(key))]
+            }
+        })
     }
 
     /// Runs the responder and the directory check. `None` means BYE with no
@@ -1423,7 +1433,8 @@ mod tests {
         let a = h
             .table
             .on_frame(hs1_for(&stranger, &h, 1, br#"{"name":"x"}"#), 5);
-        assert!(is_single_bye(&a, key), "{a:?}");
+        // Nothing at all goes out: a BYE would end the live tab's session.
+        assert!(a.is_empty(), "{a:?}");
         assert_eq!(h.table.len(), 1);
         let a = h
             .table
