@@ -13,7 +13,8 @@
     "test:scripts": "node --test scripts/*.test.mjs",
     "typecheck": "pnpm -r run typecheck",
     "lint": "pnpm -r run lint",
-    "test": "pnpm -r run test"
+    "test": "pnpm -r run test",
+    "smoke:dev": "node scripts/api-smoke.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
