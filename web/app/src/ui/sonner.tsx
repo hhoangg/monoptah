@@ -1,4 +1,7 @@
 import type { CSSProperties } from "react";
+// Sonner injects its stylesheet with a <style> element at runtime, which the production CSP (style-src 'self')
+// blocks, leaving toasts unstyled. The same file is bundled here as a normal stylesheet instead.
+import "sonner/dist/styles.css";
 import { Toaster as Sonner, type ToasterProps } from "sonner";
 import { useAppearance } from "@/lib/appearance";
 
