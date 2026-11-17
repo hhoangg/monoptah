@@ -60,6 +60,7 @@ import { INSERT_INVITE_SQL, INVITE_BY_ID_SQL, LIST_INVITES_SQL, REVOKE_INVITE_SQ
 import { CONSUME_CHALLENGE_SQL, INSERT_CHALLENGE_SQL } from "../src/modules/passkeys/challenges.ts";
 import { INVITES_USED_SQL, ME_ROW_SQL, PATCH_DISPLAY_NAME_SQL } from "../src/modules/me/handlers.ts";
 import { CONSUME_SQL } from "../src/modules/ratelimit/limiter.ts";
+import { OUTSTANDING_PAIRINGS_SQL } from "../src/modules/ratelimit/pairings.ts";
 import { LIST_USER_SESSIONS_SQL } from "../src/modules/sessions/handlers.ts";
 import {
   DELETE_ALL_SESSIONS_EXCEPT_SQL,
@@ -100,7 +101,8 @@ interface PlanCase {
 }
 
 const CASES: PlanCase[] = [
-  { name: "rate limit consume", sql: CONSUME_SQL, bind: ["k", 0] },
+  { name: "rate limit consume", sql: CONSUME_SQL, bind: ["k", 0, 1] },
+  { name: "outstanding pairing requests of an IP", sql: OUTSTANDING_PAIRINGS_SQL, bind: ["h", 1] },
   { name: "session lookup (join users)", sql: SESSION_LOOKUP_SQL, bind: ["h"] },
   { name: "session touch", sql: SESSION_TOUCH_SQL, bind: [1, 2, "h", 0] },
   { name: "list own sessions", sql: LIST_USER_SESSIONS_SQL, bind: ["u", 1, 1] },
@@ -200,6 +202,11 @@ describe("query plans", () => {
     }
     if (c.branchCte) expect(details, details.join(" | ")).toContain("SEARCH u USING INDEX users_invited_by_idx (invited_by=?)");
     if (!isInsert && !c.usersCountScan && !c.usersListScan && !c.limitedIndexScan) expect(details.some((d) => /^SEARCH .* USING (COVERING )?INDEX/.test(d)), details.join(" | ")).toBe(true);
+  });
+
+  it("the outstanding pairing count is answered by the (ip_hash, status, expires_at) index", async () => {
+    const { results } = await env.DB.prepare(`EXPLAIN QUERY PLAN ${OUTSTANDING_PAIRINGS_SQL}`).bind("h", 1).all<{ detail: string }>();
+    expect(results.map((r) => r.detail).join(" | ")).toContain("SEARCH pairing_requests USING COVERING INDEX pairing_requests_ip_status_expires_idx (ip_hash=? AND status=? AND expires_at>?)");
   });
 
   it("the audit paging queries use the (actor_user_id, ts, id) index", async () => {

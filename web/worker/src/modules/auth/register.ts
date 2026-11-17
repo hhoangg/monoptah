@@ -13,7 +13,7 @@ import { gateParams, GATE_SQL, registrationOpen } from "../invites/gate.ts";
 import { hashInviteCode } from "../invites/code.ts";
 import { consumeChallenge, storeChallenge } from "../passkeys/challenges.ts";
 import { buildRegistrationOptions, verifyRegistration } from "../passkeys/webauthn.ts";
-import { limitInviteAttempts } from "../ratelimit/index.ts";
+import { limitInviteAttempts, limitInviteAttemptsByHash } from "../ratelimit/index.ts";
 import { generateRecoveryCodes } from "../recovery/codes.ts";
 import { createSession } from "../sessions/session.ts";
 
@@ -92,6 +92,10 @@ export const registerVerify: Handler<AppEnv> = async (c) => {
   const payload = RegisterPayload.safeParse(challenge.payload);
   if (!payload.success) return apiError(c, 400, "invalid", "Challenge expired or already used");
   const { inviteId, inviteCodeHash, handle, displayName, userId } = payload.data;
+
+  // The same 5 per hour per invite code as register/options, so a code cannot be tried more often by skipping options.
+  const limited = await limitInviteAttemptsByHash(c, inviteCodeHash);
+  if (limited) return limited;
 
   const credential = await verifyRegistration(c.env, body.data.response, challenge.challenge);
   if (!credential) return apiError(c, 400, "invalid", "Registration could not be verified");

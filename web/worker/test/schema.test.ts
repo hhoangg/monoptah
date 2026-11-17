@@ -58,6 +58,9 @@ const MIGRATION_0003_INDEXES: [string, string[]][] = [
   ["audit_log", ["ts", "id"]],
 ];
 
+// "3 outstanding per IP" (migration 0004): replaces the (ip_hash) index, which this one serves as a prefix.
+const MIGRATION_0004_INDEXES: [string, string[]][] = [["pairing_requests", ["ip_hash", "status", "expires_at"]]];
+
 interface TableInfoRow {
   name: string;
   type: string;
@@ -145,7 +148,7 @@ describe("D1 schema = architecture.md 4.3", () => {
   });
 
   it("has every index of the spec and the cleanup indexes", async () => {
-    for (const [table, columns] of [...SPEC_INDEXES, ...CLEANUP_INDEXES, ...MIGRATION_0003_INDEXES]) {
+    for (const [table, columns] of [...SPEC_INDEXES, ...CLEANUP_INDEXES, ...MIGRATION_0003_INDEXES, ...MIGRATION_0004_INDEXES]) {
       const found = await indexes(table);
       expect(found.some((i) => i.columns.join() === columns.join()), `${table}(${columns.join()})`).toBe(true);
     }

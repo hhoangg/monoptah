@@ -14,9 +14,11 @@ import { clientIp, identifierHash, ipHash } from "../../lib/ip.ts";
 import type { RATE_LIMIT_AUDIT_GROUPS } from "../audit/actions.ts";
 import { auditStatement } from "../audit/audit.ts";
 import { consume, rateLimitKey } from "./limiter.ts";
+import { consumeIp } from "./memory.ts";
 
 export { consume, rateLimitKey, type ConsumeResult } from "./limiter.ts";
-export { consumeSession, resetSessionLimits, SESSION_LIMIT, SESSION_WINDOW_SECONDS } from "./memory.ts";
+export { consumeSession, resetIpLimits, resetSessionLimits, SESSION_LIMIT, SESSION_WINDOW_SECONDS } from "./memory.ts";
+export { limitOutstandingPairings, MAX_OUTSTANDING_PAIRINGS } from "./pairings.ts";
 
 type Group = (typeof RATE_LIMIT_AUDIT_GROUPS)[number];
 
@@ -33,7 +35,7 @@ export const LIMITS = {
   login: { limit: 30, windowSeconds: 600 },
   /** `auth/recover`: per IP. The per-handle limit is `handle`. */
   recover: { limit: 20, windowSeconds: 3600 },
-  /** `pair/start`: per IP. "3 outstanding per IP" is pairing logic (WS-R, R-04), not a rate limit. */
+  /** `pair/start`: per IP. "3 outstanding per IP" is `limitOutstandingPairings` (pairings.ts), called by the pair/start handler. */
   "pair-start": { limit: 5, windowSeconds: 600 },
   /** `pair/poll`: one call per `interval` (3 s) per device code. */
   "pair-poll": { limit: 1, windowSeconds: 3 },
@@ -47,6 +49,20 @@ export const LIMITS = {
   /** Recovery attempts per handle ("5 per handle per hour"); the handle is hashed in the key. */
   handle: { limit: 5, windowSeconds: 3600 },
 } as const satisfies Record<string, LimitSpec>;
+
+/**
+ * The per-IP limit applied to every group routed by IP, checked first. For `pair-poll` and `push-notify` the
+ * per-code and per-token keys are chosen by the caller (a device code, a bearer token), so an attacker could
+ * mint endless keys; this bound is per source address and cannot be dodged that way (WS-A addition to the table).
+ */
+export const IP_LIMITS = {
+  register: LIMITS.register,
+  login: LIMITS.login,
+  recover: LIMITS.recover,
+  "pair-start": LIMITS["pair-start"],
+  "pair-poll": { limit: 120, windowSeconds: 60 },
+  "push-notify": { limit: 120, windowSeconds: 60 },
+} as const satisfies Partial<Record<keyof typeof LIMITS, LimitSpec>>;
 
 /** `Retry-After` 429 for a refused call. */
 function tooMany(c: AppContext, retryAfter: number): Response {
@@ -102,10 +118,11 @@ function bearerOf(c: AppContext): string | null {
 /**
  * Rate limit hook, one per route. Routes without `route.rateLimit` pass through (the general session limit runs
  * in the auth resolver, after the session is known). Keys hold hashes only:
- * - `register`, `login`, `recover`, `pair-start`: `group:ip:<HMAC of the IP>`.
- * - `pair-poll`: `pair-poll:device:<SHA-256 of the deviceCode>`. A body without a `deviceCode` is left to the
- *   handler (400); nothing is consumed.
- * - `push-notify`: `push-notify:token:<SHA-256 of the bearer token>`; without a bearer token the IP is used.
+ * - Every group: `group:ip:<HMAC of the IP>` with `IP_LIMITS`, behind an in-memory pre-filter (memory.ts).
+ * - `pair-poll`, after the IP bound: `pair-poll:device:<SHA-256 of the deviceCode>`. A body without a
+ *   `deviceCode` is left to the handler (400); no per-code key is consumed.
+ * - `push-notify`, after the IP bound: `push-notify:token:<SHA-256 of the bearer token>`; without a bearer
+ *   token only the IP bound applies.
  */
 export function rateLimit(route: ApiRoute): MiddlewareHandler<AppEnv> {
   const group = route.rateLimit;
@@ -115,18 +132,27 @@ export function rateLimit(route: ApiRoute): MiddlewareHandler<AppEnv> {
     };
   }
   return async (c, next) => {
-    let key: string | null;
+    const spec = IP_LIMITS[group as keyof typeof IP_LIMITS];
+    const hash = await ipHash(c.env, clientIp(c.req.raw));
+    const ipKey = rateLimitKey(group, "ip", hash);
+    // Best-effort pre-filter with the same limit as the D1 per-IP key. A call it refuses never reaches D1; the
+    // call that first exceeds the limit does, so the breach is still audited once.
+    const local = consumeIp(ipKey, spec.limit, spec.windowSeconds);
+    if (!local.ok && !local.firstBreach) return tooMany(c, local.retryAfter);
+    const limited = await enforce(c, group, ipKey, spec);
+    if (limited) return limited;
+
+    let key: string | null = null;
     if (group === "pair-poll") {
       const deviceCode = await deviceCodeOf(c);
       key = deviceCode === null ? null : rateLimitKey(group, "device", await sha256Hex(deviceCode));
-    } else if (group === "push-notify" && bearerOf(c) !== null) {
-      key = rateLimitKey(group, "token", await sha256Hex(bearerOf(c) ?? ""));
-    } else {
-      key = rateLimitKey(group, "ip", await ipHash(c.env, clientIp(c.req.raw)));
+    } else if (group === "push-notify") {
+      const token = bearerOf(c);
+      key = token === null ? null : rateLimitKey(group, "token", await sha256Hex(token));
     }
     if (key !== null) {
-      const limited = await enforce(c, group, key);
-      if (limited) return limited;
+      const refused = await enforce(c, group, key);
+      if (refused) return refused;
     }
     return next();
   };
@@ -137,7 +163,15 @@ export function rateLimit(route: ApiRoute): MiddlewareHandler<AppEnv> {
  * code from the request, before looking the code up. Returns the 429 response to return, or null.
  */
 export async function limitInviteAttempts(c: AppContext, inviteCode: string): Promise<Response | null> {
-  return enforce(c, "invite", rateLimitKey("invite", "code", await identifierHash(c.env, "invite", inviteCode)));
+  return limitInviteAttemptsByHash(c, await sha256Hex(inviteCode));
+}
+
+/**
+ * Per invite code by its SHA-256 (`invites.code_hash`): `register/verify` has only that hash, from the challenge
+ * payload, and counts against the same key as `register/options`, so both routes draw from one 5 per hour budget.
+ */
+export async function limitInviteAttemptsByHash(c: AppContext, inviteCodeHash: string): Promise<Response | null> {
+  return enforce(c, "invite", rateLimitKey("invite", "code", await identifierHash(c.env, "invite", inviteCodeHash)));
 }
 
 /**

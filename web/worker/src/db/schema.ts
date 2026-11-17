@@ -363,7 +363,7 @@ export const pairingRequests = sqliteTable(
     check("pairing_requests_status_check", oneOf("status", PAIRING_STATUSES)),
     index("pairing_requests_expires_at_idx").on(t.expiresAt),
     // Not in architecture.md 4.3: "3 outstanding per IP" (security.md 3.5).
-    index("pairing_requests_ip_hash_idx").on(t.ipHash),
+    index("pairing_requests_ip_status_expires_idx").on(t.ipHash, t.status, t.expiresAt),
     // Foreign key indexes (migration 0003).
     index("pairing_requests_user_id_idx").on(t.userId),
     index("pairing_requests_desktop_id_idx").on(t.desktopId),

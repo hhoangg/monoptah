@@ -1,4 +1,5 @@
-// The general authenticated limit of security.md 3.5: 120 calls per session per minute, counted in memory.
+// In-memory limits of security.md 3.5: the general authenticated limit (120 calls per session per minute) and the
+// per-isolate pre-filter in front of the D1 per-IP limits.
 // Best effort: every isolate has its own counters, so the effective limit can be higher when requests are
 // spread over isolates, and a counter is lost when the isolate is recycled. In exchange it writes nothing
 // to D1 (the free plan has 100,000 writes per day).
@@ -8,57 +9,102 @@ export const SESSION_LIMIT = 120;
 export const SESSION_WINDOW_SECONDS = 60;
 /** Upper bound of tracked sessions per isolate; the table is purged and then trimmed beyond it. */
 export const MAX_TRACKED_SESSIONS = 5000;
+/** Upper bound of tracked (group, IP) keys per isolate, with the same purge and trim. */
+export const MAX_TRACKED_IPS = 5000;
 
 interface Counter {
   windowStart: number;
   count: number;
 }
 
-const counters = new Map<string, Counter>();
-
 export interface MemoryLimitResult {
   ok: boolean;
   retryAfter: number;
-  /** True once per session and window, on the call that first exceeds the limit. */
+  /** True once per key and window, on the call that first exceeds the limit. */
   firstBreach: boolean;
 }
 
-/** Counts one call of the session `idHash` (fixed window of 60 s, in memory). */
-export function consumeSession(idHash: string, now: number = nowSeconds()): MemoryLimitResult {
-  const windowStart = now - (now % SESSION_WINDOW_SECONDS);
-  let counter = counters.get(idHash);
-  if (!counter || counter.windowStart !== windowStart) {
-    if (!counter && counters.size >= MAX_TRACKED_SESSIONS) makeRoom(windowStart);
-    counter = { windowStart, count: 0 };
-    counters.set(idHash, counter);
+/** A bounded table of fixed-window counters, one per key. */
+class MemoryCounters {
+  private readonly counters = new Map<string, Counter>();
+
+  private readonly maxTracked: number;
+
+  constructor(maxTracked: number) {
+    this.maxTracked = maxTracked;
   }
-  counter.count += 1;
-  return {
-    ok: counter.count <= SESSION_LIMIT,
-    retryAfter: Math.max(1, windowStart + SESSION_WINDOW_SECONDS - now),
-    firstBreach: counter.count === SESSION_LIMIT + 1,
-  };
+
+  consume(key: string, limit: number, windowSeconds: number, now: number): MemoryLimitResult {
+    const windowStart = now - (now % windowSeconds);
+    let counter = this.counters.get(key);
+    if (!counter || counter.windowStart !== windowStart) {
+      if (!counter && this.counters.size >= this.maxTracked) this.makeRoom(windowStart);
+      counter = { windowStart, count: 0 };
+      this.counters.set(key, counter);
+    }
+    counter.count += 1;
+    return {
+      ok: counter.count <= limit,
+      retryAfter: Math.max(1, windowStart + windowSeconds - now),
+      firstBreach: counter.count === limit + 1,
+    };
+  }
+
+  /** Drops counters of past windows, then the oldest entries, so the map never exceeds its bound. */
+  private makeRoom(currentWindow: number): void {
+    for (const [key, counter] of this.counters) {
+      if (counter.windowStart < currentWindow) this.counters.delete(key);
+    }
+    // Map iterates in insertion order: the first keys are the oldest.
+    while (this.counters.size >= this.maxTracked) {
+      const oldest = this.counters.keys().next();
+      if (oldest.done) break;
+      this.counters.delete(oldest.value);
+    }
+  }
+
+  get size(): number {
+    return this.counters.size;
+  }
+
+  clear(): void {
+    this.counters.clear();
+  }
 }
 
-/** Drops counters of past windows, then the oldest entries, so the map never exceeds its bound. */
-function makeRoom(currentWindow: number): void {
-  for (const [key, counter] of counters) {
-    if (counter.windowStart < currentWindow) counters.delete(key);
-  }
-  // Map iterates in insertion order: the first keys are the oldest.
-  while (counters.size >= MAX_TRACKED_SESSIONS) {
-    const oldest = counters.keys().next();
-    if (oldest.done) break;
-    counters.delete(oldest.value);
-  }
+const sessions = new MemoryCounters(MAX_TRACKED_SESSIONS);
+const ips = new MemoryCounters(MAX_TRACKED_IPS);
+
+/** Counts one call of the session `idHash` (fixed window of 60 s, in memory). */
+export function consumeSession(idHash: string, now: number = nowSeconds()): MemoryLimitResult {
+  return sessions.consume(idHash, SESSION_LIMIT, SESSION_WINDOW_SECONDS, now);
+}
+
+/**
+ * Pre-filter in front of the D1 per-IP limits: counts one call under `key` (`group:ip:<IP hash>`) with the same
+ * limit and window as the D1 limit. Best effort like the session limit: per isolate, lost on recycle, and the
+ * table is bounded. A refusal here lets the caller answer 429 without touching D1.
+ */
+export function consumeIp(key: string, limit: number, windowSeconds: number, now: number = nowSeconds()): MemoryLimitResult {
+  return ips.consume(key, limit, windowSeconds, now);
 }
 
 /** Number of tracked sessions (tests). */
 export function trackedSessions(): number {
-  return counters.size;
+  return sessions.size;
 }
 
-/** Forgets every counter (tests). */
+/** Number of tracked IP keys (tests). */
+export function trackedIps(): number {
+  return ips.size;
+}
+
+/** Forgets every session counter (tests). */
 export function resetSessionLimits(): void {
-  counters.clear();
+  sessions.clear();
+}
+
+/** Forgets every IP pre-filter counter (tests). */
+export function resetIpLimits(): void {
+  ips.clear();
 }

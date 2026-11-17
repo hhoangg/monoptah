@@ -3,11 +3,14 @@ import { Hono } from "hono";
 import { describe, expect, it } from "vitest";
 import { ApiErrorSchema, API_ROUTES } from "@monoptah/protocol";
 import type { AppEnv } from "../src/http.ts";
+import { sha256Hex } from "../src/lib/crypto.ts";
 import { ipHash } from "../src/lib/ip.ts";
-import { consume } from "../src/modules/ratelimit/limiter.ts";
-import { consumeSession, MAX_TRACKED_SESSIONS, resetSessionLimits, SESSION_LIMIT, trackedSessions } from "../src/modules/ratelimit/memory.ts";
-import { LIMITS, limitHandleAttempts, limitInviteAttempts } from "../src/modules/ratelimit/index.ts";
+import { consume, CONSUME_SQL } from "../src/modules/ratelimit/limiter.ts";
+import { consumeIp, consumeSession, MAX_TRACKED_IPS, MAX_TRACKED_SESSIONS, resetIpLimits, resetSessionLimits, SESSION_LIMIT, trackedIps, trackedSessions } from "../src/modules/ratelimit/memory.ts";
+import { IP_LIMITS, LIMITS, limitHandleAttempts, limitOutstandingPairings } from "../src/modules/ratelimit/index.ts";
 import { BROWSER_HEADERS, call } from "./helpers.ts";
+import { createTestInvite, postJson, registerOptions } from "./support/accounts.ts";
+import { VirtualAuthenticator } from "./support/authenticator.ts";
 
 let counter = 0;
 /** A fresh fake client address per test, so tests never share a rate limit key. */
@@ -74,6 +77,32 @@ describe("consume (D1 fixed window)", () => {
     expect(next).toMatchObject({ ok: true, count: 1 });
   });
 
+  it("a refused call writes nothing: the first one writes count = limit + 1, later ones write no row", async () => {
+    const key = `test:norefusedwrite:${freshIp()}`;
+    const windowStart = 1_900_000_000 - (1_900_000_000 % 600);
+    const run = async () => {
+      const result = await env.DB.prepare(CONSUME_SQL).bind(key, windowStart, 3).run<{ count: number }>();
+      return { rows: result.results.length, written: result.meta.rows_written };
+    };
+    for (let i = 0; i < 3; i += 1) expect((await run()).written).toBeGreaterThan(0);
+    const first = await run(); // count 3 -> 4: the audited breach, one write
+    expect(first.rows).toBe(1);
+    expect(first.written).toBeGreaterThan(0);
+    for (let i = 0; i < 5; i += 1) expect(await run(), `refused call ${i + 1}`).toEqual({ rows: 0, written: 0 });
+    const { results } = await env.DB.prepare("SELECT count FROM rate_limits WHERE key = ?").bind(key).all<{ count: number }>();
+    expect(results).toEqual([{ count: 4 }]);
+  });
+
+  it("consume keeps answering 'limited' (count = limit + 1, no second firstBreach) after the counter stops moving", async () => {
+    const key = `test:stilllimited:${freshIp()}`;
+    const now = 1_900_000_000 - (1_900_000_000 % 600) + 10;
+    for (let i = 0; i < 2; i += 1) await consume(env, key, 2, 600, now);
+    expect(await consume(env, key, 2, 600, now)).toMatchObject({ ok: false, count: 3, firstBreach: true });
+    for (let i = 0; i < 3; i += 1) expect(await consume(env, key, 2, 600, now)).toMatchObject({ ok: false, count: 3, firstBreach: false });
+    const { results } = await env.DB.prepare("SELECT count FROM rate_limits WHERE key = ?").bind(key).all<{ count: number }>();
+    expect(results).toEqual([{ count: 3 }]);
+  });
+
   it("keeps keys independent", async () => {
     const a = `test:a:${freshIp()}`;
     const b = `test:b:${freshIp()}`;
@@ -114,6 +143,7 @@ describe("IP keyed groups", () => {
 
     // A new window: move the counter row back by one window.
     await env.DB.prepare("UPDATE rate_limits SET window_start = window_start - ? WHERE key = ?").bind(windowSeconds, `${group}:ip:${hash}`).run();
+    resetIpLimits(); // the in-memory pre-filter has its own window
     expectPassed(await post(path, ip), path);
   });
 
@@ -193,23 +223,135 @@ describe("push/notify: 30 per desktop token per minute", () => {
   });
 });
 
+describe("the in-memory pre-filter in front of the D1 per-IP limits", () => {
+  it("answers 429 without touching D1 once the isolate has seen the IP over its limit", async () => {
+    const ip = freshIp();
+    const hash = await ipHash(env, ip);
+    const key = `pair-start:ip:${hash}`;
+    for (let i = 0; i < 5; i += 1) expectPassed(await post("/api/pair/start", ip), "/api/pair/start");
+    await expectLimited(await post("/api/pair/start", ip), 600); // the breach call reaches D1 (audited once)
+    // Forget D1 completely: a refusal that still comes back is the in-memory pre-filter, and D1 stays untouched.
+    await env.DB.prepare("DELETE FROM rate_limits WHERE key = ?").bind(key).run();
+    await expectLimited(await post("/api/pair/start", ip), 600);
+    await expectLimited(await post("/api/pair/start", ip), 600);
+    const rows = await env.DB.prepare("SELECT count FROM rate_limits WHERE key = ?").bind(key).all();
+    expect(rows.results).toEqual([]);
+    expect(await breachRows(hash, "pair-start")).toHaveLength(1);
+  });
+
+  it("uses the limit and window of the D1 per-IP limit, per group and per IP", () => {
+    resetIpLimits();
+    const now = 1_900_000_000 - (1_900_000_000 % 60) + 5;
+    for (let i = 0; i < 120; i += 1) expect(consumeIp("pair-poll:ip:h1", 120, 60, now).ok).toBe(true);
+    expect(consumeIp("pair-poll:ip:h1", 120, 60, now)).toEqual({ ok: false, retryAfter: 55, firstBreach: true });
+    expect(consumeIp("pair-poll:ip:h1", 120, 60, now)).toMatchObject({ ok: false, firstBreach: false });
+    expect(consumeIp("pair-poll:ip:h2", 120, 60, now).ok).toBe(true);
+    expect(consumeIp("push-notify:ip:h1", 120, 60, now).ok).toBe(true);
+    expect(consumeIp("pair-poll:ip:h1", 120, 60, now + 55).ok).toBe(true);
+    resetIpLimits();
+  });
+
+  it("stays bounded", () => {
+    resetIpLimits();
+    const now = 1_900_000_000;
+    for (let i = 0; i < MAX_TRACKED_IPS + 50; i += 1) consumeIp(`register:ip:bound-${i}`, 10, 3600, now);
+    expect(trackedIps()).toBeLessThanOrEqual(MAX_TRACKED_IPS);
+    resetIpLimits();
+  });
+});
+
+describe("per-IP bound of pair/poll and push/notify (attacker-chosen keys)", () => {
+  it("has the documented numbers", () => {
+    expect(IP_LIMITS["pair-poll"]).toEqual({ limit: 120, windowSeconds: 60 });
+    expect(IP_LIMITS["push-notify"]).toEqual({ limit: 120, windowSeconds: 60 });
+  });
+
+  it("pair/poll: 120 calls per IP per minute whatever the device codes, checked before the per-code key", async () => {
+    const ip = freshIp();
+    for (let i = 0; i < 120; i += 1) expect((await post("/api/pair/poll", ip, { deviceCode: `dc-${ip}-${i}` })).status, `call ${i + 1}`).toBe(501);
+    await expectLimited(await post("/api/pair/poll", ip, { deviceCode: `dc-${ip}-fresh` }), 60);
+    // The per-code key of the refused call was never consumed.
+    const fresh = await env.DB.prepare("SELECT 1 FROM rate_limits WHERE key = ?").bind(`pair-poll:device:${await sha256Hex(`dc-${ip}-fresh`)}`).first();
+    expect(fresh).toBeNull();
+    expect((await post("/api/pair/poll", freshIp(), { deviceCode: `dc-other-${ip}` })).status).toBe(501);
+  });
+
+  it("push/notify: 120 calls per IP per minute whatever the tokens, also without a token", async () => {
+    const ip = freshIp();
+    for (let i = 0; i < 120; i += 1) expect((await post("/api/push/notify", ip, {}, { Authorization: `Bearer tok-${ip}-${i}` })).status, `call ${i + 1}`).toBe(501);
+    await expectLimited(await post("/api/push/notify", ip, {}, { Authorization: `Bearer tok-${ip}-fresh` }), 60);
+    await expectLimited(await post("/api/push/notify", ip, {}), 60);
+    const fresh = await env.DB.prepare("SELECT 1 FROM rate_limits WHERE key = ?").bind(`push-notify:token:${await sha256Hex(`tok-${ip}-fresh`)}`).first();
+    expect(fresh).toBeNull();
+  });
+});
+
+describe("IPv6 clients are limited per /64", () => {
+  it("two addresses of one /64 share the counter, another /64 does not", async () => {
+    const prefix = `2001:db8:${(counter += 1).toString(16)}:7`;
+    for (let i = 0; i < 5; i += 1) expectPassed(await post("/api/pair/start", `${prefix}::${i + 1}`), "/api/pair/start");
+    await expectLimited(await post("/api/pair/start", `${prefix}:aaaa:bbbb:cccc:dddd`.toUpperCase()), 600);
+    expectPassed(await post("/api/pair/start", `2001:db8:${(counter += 1).toString(16)}:7::1`), "/api/pair/start");
+  });
+});
+
+describe("limitOutstandingPairings (3 outstanding per IP)", () => {
+  const app = () => {
+    const a = new Hono<AppEnv>();
+    a.post("/start", async (c) => (await limitOutstandingPairings(c, 1_000)) ?? c.json({ ok: true }));
+    return a;
+  };
+  const start = (ip: string) => app().request("/start", { method: "POST", headers: { "CF-Connecting-IP": ip } }, env);
+  let n = 0;
+  const insert = async (hash: string, status: string, expiresAt: number) => {
+    n += 1;
+    await env.DB.prepare(
+      "INSERT INTO pairing_requests (id, user_code, device_code_hash, challenge, desktop_public_key, machine_name, confirmation_code, status, created_at, expires_at, ip_hash) VALUES (?, ?, ?, 'c', 'k', 'm', '000000', ?, 1, ?, ?)",
+    ).bind(`po-${hash}-${n}`, `PO${hash.slice(0, 6)}${n}`, `po-dc-${hash}-${n}`, status, expiresAt, hash).run();
+  };
+
+  it("allows up to 2 outstanding requests and refuses at 3 with Retry-After", async () => {
+    const ip = freshIp();
+    const hash = await ipHash(env, ip);
+    expect((await start(ip)).status).toBe(200);
+    await insert(hash, "pending", 2_000);
+    await insert(hash, "pending", 2_000);
+    expect((await start(ip)).status).toBe(200);
+    await insert(hash, "pending", 2_000);
+    const res = await start(ip);
+    expect(res.status).toBe(429);
+    expect(ApiErrorSchema.parse(await res.json()).code).toBe("rate_limited");
+    expect(Number(res.headers.get("Retry-After"))).toBeGreaterThanOrEqual(1);
+  });
+
+  it("does not count expired, approved, denied, consumed or other IPs' requests", async () => {
+    const ip = freshIp();
+    const hash = await ipHash(env, ip);
+    await insert(hash, "pending", 1_000); // expires_at = now: not outstanding
+    await insert(hash, "pending", 500);
+    await insert(hash, "approved", 2_000);
+    await insert(hash, "denied", 2_000);
+    await insert(hash, "consumed", 2_000);
+    await insert(hash, "expired", 2_000);
+    await insert(await ipHash(env, freshIp()), "pending", 2_000);
+    expect((await start(ip)).status).toBe(200);
+  });
+
+  it("counts an IPv6 client by its /64", async () => {
+    const prefix = `2001:db8:${(counter += 1).toString(16)}:9`;
+    const hash = await ipHash(env, `${prefix}::1`);
+    for (let i = 0; i < 3; i += 1) await insert(hash, "pending", 2_000);
+    expect((await start(`${prefix}:1:2:3:4`)).status).toBe(429);
+  });
+});
+
 describe("limits that handlers call", () => {
   function app() {
     const a = new Hono<AppEnv>();
-    a.post("/invite", async (c) => (await limitInviteAttempts(c, c.req.query("v") ?? "")) ?? c.json({ ok: true }));
-    a.post("/handle", async (c) => (await limitHandleAttempts(c, c.req.query("v") ?? "")) ?? c.json({ ok: true }));
+        a.post("/handle", async (c) => (await limitHandleAttempts(c, c.req.query("v") ?? "")) ?? c.json({ ok: true }));
     return a;
   }
   const send = (path: string, value: string, ip: string) => app().request(`${path}?v=${encodeURIComponent(value)}`, { method: "POST", headers: { "CF-Connecting-IP": ip } }, env);
-
-  it("invite code: 5 attempts per hour, hashed in the key", async () => {
-    const code = `invite-code-${freshIp()}`;
-    for (let i = 0; i < 5; i += 1) expect((await send("/invite", code, freshIp())).status).toBe(200);
-    await expectLimited(await send("/invite", code, freshIp()), 3600);
-    expect((await send("/invite", `${code}-b`, freshIp())).status).toBe(200);
-    const keys = await env.DB.prepare("SELECT key FROM rate_limits WHERE key LIKE '%' || ? || '%'").bind(code).all();
-    expect(keys.results).toEqual([]);
-  });
 
   it("handle: 5 per hour, case-insensitive, hashed in the key", async () => {
     const handle = `someone${freshIp().replaceAll(".", "")}`;
@@ -217,6 +359,30 @@ describe("limits that handlers call", () => {
     await expectLimited(await send("/handle", handle, freshIp()), 3600);
     const keys = await env.DB.prepare("SELECT key FROM rate_limits WHERE key LIKE '%' || ? || '%'").bind(handle).all();
     expect(keys.results).toEqual([]);
+  });
+});
+
+describe("the per-invite-code limit on both registration routes", () => {
+  it("5 attempts per hour over register/options and register/verify together, hashed in the key; the 6th is 429 on either route", async () => {
+    const invite = await createTestInvite(env);
+    const key = await VirtualAuthenticator.generate();
+    const attempts = [];
+    for (let i = 0; i < 3; i += 1) {
+      const attempt = await registerOptions(invite.code, `inv-${crypto.randomUUID().slice(0, 8)}`); // attempts 1 to 3
+      attempts.push({ challengeId: attempt.challengeId, response: await key.create(attempt.options, { origin: env.RP_ORIGIN, rpId: env.RP_ID }) });
+    }
+    // Attempts 4 and 5 are verify calls (the first registers, the second finds the invite used): both count.
+    expect((await postJson("/api/auth/register/verify", attempts[0])).status).toBe(200);
+    expect((await postJson("/api/auth/register/verify", attempts[1])).status).toBe(400);
+    const keys = await env.DB.prepare("SELECT key, count FROM rate_limits WHERE key LIKE 'invite:code:%' AND count = 5").all<{ key: string }>();
+    expect(keys.results).toHaveLength(1);
+    expect(keys.results[0]?.key).not.toContain(invite.code);
+    // Attempt 6: the same 429 on verify and on options.
+    await expectLimited(await postJson("/api/auth/register/verify", attempts[2]), 3600);
+    await expectLimited(await postJson("/api/auth/register/options", { invite: invite.code, handle: "someone-else", displayName: "X" }), 3600);
+    // Another code is unaffected.
+    const other = await createTestInvite(env);
+    expect((await postJson("/api/auth/register/options", { invite: other.code, handle: `inv-${crypto.randomUUID().slice(0, 8)}`, displayName: "X" })).status).toBe(200);
   });
 });
 
