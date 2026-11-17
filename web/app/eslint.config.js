@@ -19,7 +19,7 @@ export default [
     languageOptions: { sourceType: "script", globals: { ...globals.browser } },
   },
   {
-    files: ["vite.config.ts", "vitest.config.ts", "eslint.config.js", "build/**", "scripts/**", "src/**/*.test.{ts,tsx}", "src/test/**"],
+    files: ["vite.config.ts", "vitest.config.ts", "eslint.config.js", "vite-plugins/**", "scripts/**", "src/**/*.test.{ts,tsx}", "src/test/**"],
     languageOptions: { globals: { ...globals.node } },
   },
 ];

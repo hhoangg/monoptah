@@ -4,7 +4,7 @@ import tailwindcss from "@tailwindcss/vite";
 import { tanstackRouter } from "@tanstack/router-plugin/vite";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
-import { headersPlugin } from "./build/headers.ts";
+import { headersPlugin } from "./vite-plugins/headers.ts";
 
 // `vite dev` runs the SPA, the Worker, the Durable Objects and local D1 together through
 // @cloudflare/vite-plugin, which reads the Worker config one level up (web/wrangler.jsonc).

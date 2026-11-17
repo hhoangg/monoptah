@@ -7,6 +7,12 @@
 // JSON is camelCase. Times are unix seconds unless a name says otherwise. A failed
 // call answers `ApiErrorSchema` (`{error, code}`, errors.ts). Secrets (tokens,
 // recovery codes, invite codes) appear in a response only where the comment says so.
+//
+// Browser rules (security.md 3.4): every non-GET cookie-authenticated route (session, fresh, admin
+// and the public `/api/auth/*` routes) needs `Origin` equal to RP_ORIGIN, `X-Monoptah-CSRF: 1` and
+// `Content-Type: application/json`, even when the request has no body (a bodiless POST or DELETE
+// still sends the header); otherwise 403 `bad_origin`, 403 `csrf` or 415 `unsupported_media_type`.
+// A WebSocket upgrade GET checks `Origin` only. Token and pairing routes are exempt.
 import { z } from "zod";
 
 // --- Shared ---

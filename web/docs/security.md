@@ -225,7 +225,7 @@ Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'
 
 `HOST` is substituted with the request host by the Worker (some browsers do not match `'self'` to `wss:` on the same host). `style-src-attr 'unsafe-inline'` is needed only for `style` attributes written by motion and vaul; scripts stay strict. `worker-src 'self'` also covers the same-origin module workers the app starts from `/assets/*.js` (shiki tokenizing, the dither effect), not only `/sw.js`. Nonces are not used: the Vite build emits no inline scripts, and the theme is applied before first paint by a blocking same-origin `/theme-init.js` loaded in `<head>` (no inline theme script). Companion headers:
 
-For static assets the same policy is written to `app/dist/client/_headers` at build time (`web/app/build/headers.ts`, using the Worker's `buildCsp`), with `HOST` set to the host of `RP_ORIGIN` from `wrangler.jsonc` `vars` (`zptah.app` by default; self-hosters can override it with `MONOPTAH_RP_ORIGIN`).
+For static assets the same policy is written to `app/dist/client/_headers` at build time (`web/app/vite-plugins/headers.ts`, using the Worker's `buildCsp`), with `HOST` set to the host of `RP_ORIGIN` from `wrangler.jsonc` `vars` (`zptah.app` by default; self-hosters can override it with `MONOPTAH_RP_ORIGIN`).
 
 ```
 Strict-Transport-Security: max-age=63072000; includeSubDomains; preload
@@ -237,7 +237,7 @@ Cross-Origin-Resource-Policy: same-origin
 Cache-Control: no-store            (on /api/* and /relay/*)
 ```
 
-Headers for static assets are set from `app/dist/client/_headers`, which the app build generates (`web/app/build/headers.ts`) with the CSP of 8.1 and the host of `RP_ORIGIN` for `connect-src` (override for self-hosters: `MONOPTAH_RP_ORIGIN`); API headers by Hono middleware.
+Headers for static assets are set from `app/dist/client/_headers`, which the app build generates (`web/app/vite-plugins/headers.ts`) with the CSP of 8.1 and the host of `RP_ORIGIN` for `connect-src` (override for self-hosters: `MONOPTAH_RP_ORIGIN`); API headers by Hono middleware.
 
 ### 8.2 Trusted Types
 

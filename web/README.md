@@ -52,6 +52,14 @@ pnpm 12 needs `run` for script names. Replace `<pkg>` with `protocol`, `worker`,
 
 The app and worker tests need a placeholder `app/dist/client/index.html`; `pretest` and `predev` create it when absent.
 
+## API calls from the browser
+
+Every non-GET call to a cookie-authenticated route (session, fresh and admin routes, and the public
+`/api/auth/*` routes) must send `Origin` equal to `RP_ORIGIN`, `X-Monoptah-CSRF: 1` and
+`Content-Type: application/json`, bodiless POST and DELETE included. A missing or different Content-Type is
+answered `415` with code `unsupported_media_type`. WebSocket upgrades (`/relay/device/...`) check `Origin` only.
+Token and pairing routes are exempt (security.md 3.4).
+
 ## Build output and security headers
 
 `wrangler.jsonc` serves `app/dist/client` as the assets directory. The Vite build also writes the Worker bundle
@@ -59,7 +67,7 @@ and its sourcemap to `app/dist/monoptah_web`; that directory must never be serve
 directory is `client` and not `dist`. `app/scripts/check-dist.mjs` runs at the end of `build` and fails when
 `_headers` is missing or when a Worker bundle or sourcemap sits in the assets directory.
 
-`app/dist/client/_headers` is generated at build time (`app/build/headers.ts`) with the CSP from the Worker's
+`app/dist/client/_headers` is generated at build time (`app/vite-plugins/headers.ts`) with the CSP from the Worker's
 `buildCsp` (`worker/src/csp.ts`), so the policy exists once. `connect-src` gets `wss://<host>`, where the host
 is that of `RP_ORIGIN` in `wrangler.jsonc` `vars` (`https://zptah.app` by default). A self-hoster who serves the
 app from another origin builds with `MONOPTAH_RP_ORIGIN=https://web.example.org pnpm --filter @monoptah/app run build`

@@ -12,7 +12,7 @@ function isNoStorePath(pathname: string): boolean {
 /**
  * First middleware. Sets the companion headers, `Cache-Control: no-store` on `/api/*` and `/relay/*`,
  * and the CSP on any HTML response the Worker itself returns (HTML served from the assets binding
- * gets its headers from `app/dist/_headers`; the Worker only sees HTML when it falls through to ASSETS).
+ * gets its headers from `app/dist/client/_headers`; the Worker only sees HTML when it falls through to ASSETS).
  * A WebSocket upgrade response (101) is left untouched: its headers are immutable.
  */
 export const securityHeaders: MiddlewareHandler<AppEnv> = async (c, next) => {

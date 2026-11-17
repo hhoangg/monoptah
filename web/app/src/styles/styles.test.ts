@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { renderHeaders, resolveRpOrigin } from "../../build/headers";
+import { renderHeaders, resolveRpOrigin } from "../../vite-plugins/headers";
 
 const src = path.resolve(import.meta.dirname, "..");
 
@@ -75,7 +75,7 @@ describe("design tokens", () => {
   });
 });
 
-describe("static asset headers (generated at build time, see build/headers.ts)", () => {
+describe("static asset headers (generated at build time, see vite-plugins/headers.ts)", () => {
   const headers = renderHeaders(resolveRpOrigin(path.resolve(src, "../../wrangler.jsonc"), {}));
   const csp = headers.match(/^\s+Content-Security-Policy: (.*)$/m)?.[1] ?? "";
 
