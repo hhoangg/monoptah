@@ -9,7 +9,7 @@
 //! TRANSPORT message each (contract gap: the wire protocol has no batch shape,
 //! see [`pack`]).
 use super::{channel::Out, session::SessionKey};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -47,6 +47,11 @@ pub(super) enum Msg {
 /// order they were produced. Returns false, leaving `earlier` as it was, when
 /// the merge would not be exact.
 ///
+/// `question` is not state but a stream of transitions (`watch.rs` sends it
+/// with the first frame, again whenever it changes, and null once answered),
+/// and the client applies each one in order. Two frames that both carry it
+/// never merge, so an answered-then-new question reaches the client as both.
+///
 /// A frame holds only what changed since the one before it, so a key in the
 /// later frame replaces the same key in the earlier one, and a key it leaves
 /// out is unchanged. `turns` are whole snapshots keyed by id, so a later
@@ -67,6 +72,9 @@ pub(super) fn merge(earlier: &mut Value, later: &Value) -> bool {
     let patches = nonempty(a, "patches") || nonempty(b, "patches");
     let turns = nonempty(a, "turns") || nonempty(b, "turns");
     if patches && turns {
+        return false;
+    }
+    if a.contains_key("question") && b.contains_key("question") {
         return false;
     }
     let id_of = |turn: &Value| turn["id"].as_str().map(str::to_owned);
@@ -164,6 +172,11 @@ fn envelope(template: &Value, frame: Value) -> Value {
 /// so ending that task (session closed) ends this too.
 pub(super) struct Pacer {
     pub(super) key: SessionKey,
+    /// The request id of the watch, for the frame that tells the browser the
+    /// desktop ended it.
+    pub(super) rid: Value,
+    /// Whether the device may still receive; asked before every flush.
+    pub(super) admit: Arc<dyn Fn() -> bool + Send + Sync>,
     pub(super) input: mpsc::Receiver<Msg>,
     /// Set by the channel when the watch ends cleanly: held updates still go
     /// out at the next slot. A channel dropped without it was cancelled or
@@ -174,19 +187,42 @@ pub(super) struct Pacer {
     pub(super) heartbeat: Duration,
 }
 
+/// What the browser reads when the desktop ends a watch with no final frame of
+/// its own. The wire protocol has no end-of-watch shape yet (contract gap for
+/// WS-K), so it is the existing error envelope: the browser reopens with `from`.
+pub(super) const WATCH_ENDED: &str = "Watch ended";
+
 impl Pacer {
+    /// Replaces the admission check (the default admits everything).
+    pub(super) fn admitting(mut self, admit: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        self.admit = Arc::new(admit);
+        self
+    }
+
     pub(super) async fn run(mut self) {
         let mut last_flush: Option<Instant> = None;
+        // The last time anything went out; silence is measured from it.
         let mut last_data = Instant::now();
+        // A heartbeat the watch asked for while data had just gone out: it is
+        // sent once the silence reaches the heartbeat period, so a watch is
+        // never quiet for longer than that.
+        let mut deferred: Option<Value> = None;
+        let mut errored = false;
         // Held envelopes: the first carries the rid and ok fields for the rest.
         let mut held: Vec<Value> = Vec::new();
         let mut open = true;
         loop {
             if !open && held.is_empty() {
+                // The watch ended cleanly with no final frame of its own.
+                if !errored {
+                    let ended = json!({"rid": self.rid, "ok": false, "error": WATCH_ENDED});
+                    self.send(ended).await;
+                }
                 return;
             }
             let slot = last_flush.map_or_else(Instant::now, |at| at + self.interval);
             let waiting = !held.is_empty();
+            let beat_at = last_data + self.heartbeat;
             tokio::select! {
                 message = self.input.recv(), if open && held.len() < MAX_HELD => match message {
                     // Dropped without a clean finish: cancelled or closed.
@@ -201,19 +237,43 @@ impl Pacer {
                         }
                     }
                     Some(Msg::Heartbeat(value)) => {
-                        if last_data.elapsed() >= self.heartbeat && !self.send(value).await {
-                            return;
+                        if last_data.elapsed() >= self.heartbeat {
+                            if !self.send(value).await {
+                                return;
+                            }
+                            last_data = Instant::now();
+                            deferred = None;
+                        } else {
+                            deferred = Some(value);
                         }
                     }
                     Some(Msg::Control(value)) => {
-                        if !self.flush(&mut held, &mut last_flush, &mut last_data).await
-                            || !self.send(value).await
+                        if value["ok"] == false {
+                            // An error ends the watch: what it still held is
+                            // stale (the device may have been revoked).
+                            held.clear();
+                            errored = true;
+                        } else if !self
+                            .flush(&mut held, &mut last_flush, &mut last_data)
+                            .await
                         {
+                            return;
+                        }
+                        if !self.send(value).await {
+                            return;
+                        }
+                        last_data = Instant::now();
+                        deferred = None;
+                    }
+                },
+                _ = sleep_until(beat_at), if deferred.is_some() => {
+                    if let Some(value) = deferred.take() {
+                        if !self.send(value).await {
                             return;
                         }
                         last_data = Instant::now();
                     }
-                },
+                }
                 _ = sleep_until(slot), if waiting => {
                     if !self.flush(&mut held, &mut last_flush, &mut last_data).await {
                         return;
@@ -241,6 +301,11 @@ impl Pacer {
         last_data: &mut Instant,
     ) -> bool {
         if held.is_empty() {
+            return true;
+        }
+        if !(self.admit)() {
+            // The device is no longer admitted: nothing held goes out.
+            held.clear();
             return true;
         }
         for value in held.drain(..) {
@@ -365,6 +430,16 @@ mod tests {
 
     /// A watch on a paced channel whose watcher hands its sink to the test.
     fn start(rid: u32) -> Rig {
+        start_gated(
+            rid,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+        )
+    }
+
+    /// `start`, with the admission of the device switchable apart for the
+    /// serve (checked before each frame) and for the pacer (before a flush).
+    fn start_gated(rid: u32, serve_admits: Arc<AtomicBool>, pacer_admits: Arc<AtomicBool>) -> Rig {
         let (out, frames) = mpsc::channel::<Out>(1024);
         let cancel = Arc::new(Notify::new());
         let key = SessionKey {
@@ -374,12 +449,13 @@ mod tests {
         let channel =
             Channel::for_test(key, json!(rid), json!({"watch": true}), out, cancel.clone());
         let (channel, pacer) = channel.paced(WATCH_INTERVAL, ServeOptions::WEB.heartbeat);
+        let pacer = pacer.admitting(move || pacer_admits.load(Ordering::SeqCst));
         let (sink_tx, sinks) = mpsc::channel(1);
         let job = tokio::spawn(async move {
             let serve = serve_stream(
                 channel,
                 "peer",
-                |_| true,
+                move |_| serve_admits.load(Ordering::SeqCst),
                 |_, _| async { Ok(Value::Null) },
                 move |_, _, sink| {
                     let sink_tx = sink_tx.clone();
@@ -502,6 +578,12 @@ mod tests {
             );
             drop(sink);
             rig.job.await.unwrap();
+            // The desktop ended the watch: the browser is told (see
+            // `a_watch_the_desktop_ends_cleanly_tells_the_browser`).
+            assert_eq!(
+                rig.frames.try_recv().unwrap().value,
+                json!({"rid":4,"ok":false,"error":WATCH_ENDED})
+            );
             assert!(rig.frames.try_recv().is_err());
         });
     }
@@ -588,6 +670,163 @@ mod tests {
                 "{:?}",
                 started.elapsed()
             );
+            rig.job.abort();
+        });
+    }
+
+    #[test]
+    fn a_question_transition_is_never_merged_away() {
+        // Answered (null), then a new question with the same request id.
+        let q = |value: Value| {
+            let mut f = json!({"usageLimit":null,"busy":true,"older":false,"order":[],"turns":[]});
+            f["question"] = value;
+            f
+        };
+        let mut held = q(Value::Null);
+        let before = held.clone();
+        assert!(!merge(&mut held, &q(json!({"requestId":"r1"}))));
+        assert_eq!(held, before);
+        let mut held = q(json!({"requestId":"r1"}));
+        assert!(!merge(&mut held, &q(json!({"requestId":"r2"}))));
+        // A frame with no question still merges into one that has it.
+        let mut quiet = frame("t1", "a");
+        quiet["question"] = json!({"requestId":"r1"});
+        assert!(merge(&mut quiet, &frame("t1", "ab")));
+        assert_eq!(quiet["question"], json!({"requestId":"r1"}));
+    }
+
+    #[test]
+    fn an_answered_then_new_question_within_a_slot_arrives_as_two_frames_in_order() {
+        paused().block_on(async {
+            let mut rig = start(10);
+            rig.frames.recv().await.unwrap();
+            let sink = rig.sinks.recv().await.unwrap();
+            sink.send(frame("t1", "a")).await.unwrap();
+            rig.frames.recv().await.unwrap();
+            let t0 = Instant::now();
+            let mut answered = frame("t1", "a");
+            answered["question"] = Value::Null;
+            let mut asked = frame("t1", "a");
+            asked["question"] = json!({"requestId":"r1"});
+            sink.send(answered).await.unwrap();
+            sink.send(asked).await.unwrap();
+            let first = rig.frames.recv().await.unwrap();
+            let second = rig.frames.recv().await.unwrap();
+            assert_eq!(t0.elapsed(), WATCH_INTERVAL);
+            assert_eq!(first.value["result"]["question"], Value::Null);
+            assert_eq!(
+                second.value["result"]["question"],
+                json!({"requestId":"r1"})
+            );
+            rig.job.abort();
+        });
+    }
+
+    #[test]
+    fn a_watch_the_desktop_ends_cleanly_tells_the_browser() {
+        paused().block_on(async {
+            let mut rig = start(11);
+            rig.frames.recv().await.unwrap();
+            let sink = rig.sinks.recv().await.unwrap();
+            sink.send(frame("t1", "a")).await.unwrap();
+            rig.frames.recv().await.unwrap();
+            // An update is still held when the host ends the watch: it goes
+            // out first, then the end.
+            sink.send(frame("t1", "ab")).await.unwrap();
+            drop(sink);
+            rig.job.await.unwrap();
+            let held = rig.frames.recv().await.unwrap();
+            assert_eq!(held.value["result"]["turns"][0]["text"], "ab");
+            let ended = rig.frames.recv().await.unwrap();
+            assert_eq!(
+                ended.value,
+                json!({"rid":11,"ok":false,"error":"Watch ended"})
+            );
+            assert!(rig.frames.recv().await.is_none());
+        });
+    }
+
+    #[test]
+    fn a_watch_that_ended_with_an_error_sends_no_second_ending() {
+        paused().block_on(async {
+            let serve = Arc::new(AtomicBool::new(true));
+            let mut rig = start_gated(12, serve.clone(), Arc::new(AtomicBool::new(true)));
+            rig.frames.recv().await.unwrap();
+            let sink = rig.sinks.recv().await.unwrap();
+            sink.send(frame("t1", "a")).await.unwrap();
+            rig.frames.recv().await.unwrap();
+            // Revoked: the next update is answered with the error and the watch ends.
+            serve.store(false, Ordering::SeqCst);
+            sink.send(frame("t1", "ab")).await.unwrap();
+            rig.job.await.unwrap();
+            assert_eq!(
+                rig.frames.recv().await.unwrap().value,
+                json!({"rid":12,"ok":false,"error":"Device revoked"})
+            );
+            assert!(rig.frames.recv().await.is_none());
+        });
+    }
+
+    #[test]
+    fn updates_held_before_a_revoke_are_dropped_not_flushed_after_it() {
+        paused().block_on(async {
+            let serve = Arc::new(AtomicBool::new(true));
+            let mut rig = start_gated(13, serve.clone(), Arc::new(AtomicBool::new(true)));
+            rig.frames.recv().await.unwrap();
+            let sink = rig.sinks.recv().await.unwrap();
+            sink.send(frame("t1", "a")).await.unwrap();
+            rig.frames.recv().await.unwrap();
+            // Held (not yet flushed), then the device is revoked.
+            sink.send(frame("t1", "ab")).await.unwrap();
+            tokio::task::yield_now().await;
+            serve.store(false, Ordering::SeqCst);
+            sink.send(frame("t1", "abc")).await.unwrap();
+            let error = rig.frames.recv().await.unwrap();
+            assert_eq!(error.value["error"], "Device revoked");
+            rig.job.await.unwrap();
+            // Nothing held was flushed behind the error.
+            assert!(rig.frames.recv().await.is_none());
+        });
+    }
+
+    #[test]
+    fn a_flush_for_a_device_that_is_no_longer_admitted_sends_nothing() {
+        paused().block_on(async {
+            let pacer = Arc::new(AtomicBool::new(true));
+            let mut rig = start_gated(14, Arc::new(AtomicBool::new(true)), pacer.clone());
+            rig.frames.recv().await.unwrap();
+            let sink = rig.sinks.recv().await.unwrap();
+            sink.send(frame("t1", "a")).await.unwrap();
+            rig.frames.recv().await.unwrap();
+            sink.send(frame("t1", "ab")).await.unwrap();
+            tokio::task::yield_now().await;
+            pacer.store(false, Ordering::SeqCst);
+            tokio::time::sleep(WATCH_INTERVAL * 2).await;
+            assert!(rig.frames.try_recv().is_err(), "a held update was flushed");
+            rig.job.abort();
+        });
+    }
+
+    #[test]
+    fn silence_on_a_watch_never_exceeds_the_heartbeat_period() {
+        paused().block_on(async {
+            let mut rig = start(15);
+            rig.frames.recv().await.unwrap();
+            let sink = rig.sinks.recv().await.unwrap();
+            let started = Instant::now();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            sink.send(frame("t1", "a")).await.unwrap();
+            let data = rig.frames.recv().await.unwrap();
+            assert_eq!(data.value["result"]["turns"][0]["text"], "a");
+            // The heartbeat tick at 25 s sees data from 1 s ago and holds back,
+            // so the beat goes out 25 s after the data, not at 50 s.
+            let beat = rig.frames.recv().await.unwrap();
+            assert_eq!(beat.value["heartbeat"], true);
+            assert_eq!(started.elapsed(), Duration::from_secs(26));
+            // And it goes on: the next beat is 25 s after this one at most.
+            let next = rig.frames.recv().await.unwrap();
+            assert_eq!(next.value["heartbeat"], true);
+            assert!(started.elapsed() <= Duration::from_secs(51));
             rig.job.abort();
         });
     }

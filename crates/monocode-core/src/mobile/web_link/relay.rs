@@ -42,6 +42,9 @@ pub(crate) struct Timing {
     pub tick: Duration,
     /// A connection this old resets the backoff and the one-shot retries.
     pub stable: Duration,
+    /// No inbound message at all (the relay answers `ping` with `pong`) for
+    /// this long means the path is dead: the connection counts as lost.
+    pub read_deadline: Duration,
 }
 
 impl Default for Timing {
@@ -53,6 +56,7 @@ impl Default for Timing {
             ping: Duration::from_secs(30),
             tick: Duration::from_secs(5),
             stable: Duration::from_secs(30),
+            read_deadline: Duration::from_secs(90),
         }
     }
 }
@@ -242,6 +246,9 @@ pub(crate) async fn run(host: MobileHost, link: WebLink, identity: WebIdentity, 
         }
     };
     let token = Zeroizing::new(identity.desktop_token.clone());
+    // Our own copy of the desktop key, wiped when the client ends. snow keeps
+    // further copies it does not wipe (see `SessionTable`).
+    let static_private = Zeroizing::new(identity.static_private);
     let mut attempt = 0u32;
     let mut budget = Budget::new();
     loop {
@@ -254,7 +261,7 @@ pub(crate) async fn run(host: MobileHost, link: WebLink, identity: WebIdentity, 
                 let end = serve_socket(
                     socket,
                     &host,
-                    identity.static_private,
+                    &static_private,
                     *desktop_uuid.as_bytes(),
                     &timing,
                 )
@@ -297,7 +304,10 @@ type Socket =
 
 async fn connect(url: &str, token: &str) -> Result<Socket, End> {
     let mut request = url.into_client_request().map_err(|_| End::Lost)?;
-    let mut bearer = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| End::Lost)?;
+    // The header text is wiped once the value is built. The `HeaderValue`'s
+    // own bytes (and the request that carries them) are not wipeable.
+    let header = Zeroizing::new(format!("Bearer {token}"));
+    let mut bearer = HeaderValue::from_str(&header).map_err(|_| End::Lost)?;
     bearer.set_sensitive(true);
     request.headers_mut().insert(AUTHORIZATION, bearer);
     let config = WebSocketConfig::default()
@@ -320,7 +330,7 @@ async fn connect(url: &str, token: &str) -> Result<Socket, End> {
 async fn serve_socket(
     socket: Socket,
     host: &MobileHost,
-    static_private: [u8; 32],
+    static_private: &Zeroizing<[u8; 32]>,
     desktop_id: [u8; 16],
     timing: &Timing,
 ) -> End {
@@ -329,7 +339,7 @@ async fn serve_socket(
     let directory: Directory =
         Box::new(move |fingerprint, _relay_id| directory_host.web_lookup(fingerprint));
     let mut table = SessionTable::new(
-        static_private,
+        static_private.clone(),
         desktop_id,
         desktop_name(),
         env!("CARGO_PKG_VERSION"),
@@ -344,18 +354,24 @@ async fn serve_socket(
     let mut tick = tokio::time::interval_at(started + timing.tick, timing.tick);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut frames: Vec<Frame> = Vec::new();
+    let mut last_read = Instant::now();
     let end = loop {
         tokio::select! {
+            // Nothing at all from the relay, not even a `pong`: the path is
+            // dead (a sleeping laptop, a dropped NAT mapping).
+            _ = tokio::time::sleep_until(last_read + timing.read_deadline) => break End::Lost,
             message = stream.next() => match message {
                 None | Some(Err(_)) => break End::Lost,
                 Some(Ok(Message::Close(frame))) => {
                     break End::Closed(frame.map(|frame| u16::from(frame.code)));
                 }
                 Some(Ok(Message::Binary(bytes))) => {
+                    last_read = Instant::now();
                     on_binary(&bytes, &mut table, &mut requests, now_ms(), &mut frames);
                 }
-                // Text other than `pong`, and control frames, carry nothing.
-                Some(Ok(_)) => {}
+                // Text other than `pong`, and control frames, carry nothing
+                // but they prove the relay is there.
+                Some(Ok(_)) => last_read = Instant::now(),
             },
             Some(out) = out_rx.recv() => {
                 reply(&mut table, &mut requests, out, now_ms(), &mut frames);
@@ -485,6 +501,9 @@ fn reply(
             if let Ok(sent) = table.send(out.key, &error, now) {
                 frames.extend(sent);
             }
+            // A watch whose frame cannot be sent ends: the frames only grow.
+            // The error above tells the browser, which reopens with `from`.
+            requests.cancel(out.key, &rid);
         }
         Err(SendError::UnknownSession | SendError::NotReady) => {}
     }

@@ -32,6 +32,7 @@ fn fast() -> Timing {
         ping: Duration::from_millis(60),
         tick: Duration::from_millis(100),
         stable: Duration::from_secs(30),
+        read_deadline: Duration::from_secs(30),
     }
 }
 
@@ -820,10 +821,18 @@ fn requests_and_watches_carry_the_web_rows_device_context() {
 fn more_than_16_pending_requests_host_wide_are_refused_and_64_per_connection() {
     let rt = runtime();
     let mut s = serving(256);
+    // One session may run only 4 reads and hold 16 requests, so the host-wide
+    // and per-connection limits are reached over several sessions.
+    let session = |n: u64, per: u64| SessionKey {
+        device_id: [7; 16],
+        channel: (n / per) as u16,
+    };
     rt.block_on(async {
         // Reads run concurrently, so they pile up at the app like QUIC streams.
         for n in 0..17u64 {
-            s.deliver(call(n, &format!("u{n}"), "accounts.usage"));
+            let peer = s.env.peer.fingerprint();
+            let envelope = call(n, &format!("u{n}"), "accounts.usage");
+            s.requests.deliver(session(n, 4), peer, envelope);
         }
         let refused = s.reply().await;
         assert_eq!(refused["ok"], false);
@@ -846,11 +855,67 @@ fn more_than_16_pending_requests_host_wide_are_refused_and_64_per_connection() {
         }
         // One connection holds at most 64 requests in flight, queued or not.
         for n in 100..165u64 {
-            s.deliver(call(n, &format!("q{n}"), "conversation.send"));
+            let peer = s.env.peer.fingerprint();
+            let envelope = call(n, &format!("q{n}"), "conversation.send");
+            s.requests.deliver(session(n - 100, 13), peer, envelope);
         }
         let busy = s.reply().await;
         assert_eq!(busy["rid"], 164);
         assert_eq!(busy["error"], "Desktop is busy; try again");
+    });
+}
+
+#[test]
+fn one_session_runs_at_most_4_reads_and_holds_at_most_16_requests() {
+    let rt = runtime();
+    let mut s = serving(256);
+    rt.block_on(async {
+        // Five reads on one session: the fifth is refused at once with the
+        // stable `busy` code, the other four reach the app.
+        for n in 0..5u64 {
+            s.deliver(call(n, &format!("u{n}"), "accounts.usage"));
+        }
+        let refused = s.reply().await;
+        assert_eq!(
+            refused,
+            json!({"rid":4,"ok":false,"error":"Desktop is busy; try again","code":"busy"})
+        );
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(s.request().await);
+        }
+        s.quiet().await;
+        // The session's slots free up when the reads end.
+        for request in held {
+            request.reply(Ok(Value::Null));
+        }
+        for _ in 0..4 {
+            assert_eq!(s.reply().await["ok"], true);
+        }
+        s.deliver(call(5, "again", "accounts.usage"));
+        s.request().await.reply(Ok(Value::Null));
+        assert_eq!(s.reply().await["rid"], 5);
+        // Seventeen queued commands: the 17th is over the session's 16.
+        for n in 10..27u64 {
+            s.deliver(call(n, &format!("q{n}"), "conversation.send"));
+        }
+        let busy = s.reply().await;
+        assert_eq!(busy["rid"], 26);
+        assert_eq!(busy["code"], "busy");
+    });
+}
+
+#[test]
+fn an_unsupported_answer_carries_its_stable_code_on_the_web_channel() {
+    let rt = runtime();
+    let mut s = serving(64);
+    rt.block_on(async {
+        s.deliver(call(1, "p", "device.push"));
+        let reply = s.reply().await;
+        assert_eq!(
+            reply,
+            json!({"rid":1,"ok":false,"error":"Unsupported mobile operation","code":"unsupported"})
+        );
     });
 }
 
@@ -891,6 +956,75 @@ fn a_watch_whose_updates_are_not_drained_reports_busy_and_cancel_ends_it() {
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
                 while s.out.try_recv().is_ok() {}
+            }
+        })
+        .await;
+    });
+}
+
+// --- Fix wave: liveness and oversized frames -------------------------------
+
+// A relay that goes silent (no pong, nothing) is treated as lost after the
+// read deadline, and the desktop dials again.
+#[test]
+fn a_silent_relay_is_treated_as_lost_after_the_read_deadline() {
+    let rt = runtime();
+    let stub = rt.block_on(Stub::bind(0));
+    let env = env(stub.port());
+    let timing = Timing {
+        read_deadline: Duration::from_millis(300),
+        ..fast()
+    };
+    env.host.set_web_enabled_with(true, timing).unwrap();
+    rt.block_on(async {
+        // Accepted, then never read from or answered: no pong ever comes.
+        let silent = stub.accept().await;
+        status_is(&env.host, WebState::Connected).await;
+        let started = std::time::Instant::now();
+        status_is(&env.host, WebState::Offline).await;
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        let second = within(stub.accept()).await;
+        assert_eq!(second.path, format!("/relay/desktop/{DESKTOP_UUID}"));
+        drop(silent);
+    });
+}
+
+// A watch frame too large to send gets the error frame and then the watch
+// ends: the host's sink is dropped, so the app is told Gone.
+#[test]
+fn a_watch_frame_that_is_too_large_ends_the_watch() {
+    let rt = runtime();
+    let stub = rt.block_on(Stub::bind(0));
+    let (mut env, events) = env_with_events(stub.port());
+    env.host.set_web_enabled_with(true, fast()).unwrap();
+    rt.block_on(async {
+        let mut conn = stub.accept().await;
+        env.peer.handshake(&mut conn, 1).await;
+        let watch = json!({"version":1,"rid":9,"id":"w","method":"conversation.watch","watch":true,
+            "params":{"conversationId":"conv"}});
+        env.peer.write(&mut conn, &watch).await;
+        let Event::Watch(start) = within(events.recv()).await.unwrap() else {
+            panic!("expected a watch");
+        };
+        let id = start.id.clone();
+        start.accept(Ok(()));
+        assert_eq!(
+            env.peer.read(&mut conn).await,
+            json!({"rid":9,"ok":true,"watching":true})
+        );
+        let huge = json!({ "pad": "x".repeat(9 * 1024 * 1024) });
+        env.host.push(&id, huge).unwrap();
+        let error = env.peer.read(&mut conn).await;
+        assert_eq!(
+            error,
+            json!({"rid":9,"ok":false,"error":"Response too large"})
+        );
+        within(async {
+            loop {
+                if env.host.push(&id, json!({})) == Err(Push::Gone) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await;

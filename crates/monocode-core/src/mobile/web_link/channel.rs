@@ -30,6 +30,31 @@ use tokio::{
 
 /// Requests and watches in flight on one relay connection.
 pub(super) const MAX_IN_FLIGHT: usize = 64;
+/// Requests and watches in flight on one session, so one browser cannot use
+/// up the connection's budget.
+pub(super) const MAX_IN_FLIGHT_PER_SESSION: usize = 16;
+/// Read requests running at once on one session (watches are limited by the
+/// host, per device).
+pub(super) const MAX_READS_PER_SESSION: usize = 4;
+
+const BUSY: &str = "Desktop is busy; try again";
+const UNSUPPORTED: &str = "Unsupported mobile operation";
+
+/// The stable `code` of an error the host words in plain text. The host's
+/// error path carries text only, so the web channel adds the code the browser
+/// keys on (additive: the text stays, and QUIC is unchanged).
+fn code_of(error: &str) -> Option<&'static str> {
+    match error {
+        BUSY => Some("busy"),
+        UNSUPPORTED => Some("unsupported"),
+        _ => None,
+    }
+}
+
+/// The answer that refuses a request because the desktop or the session is busy.
+fn busy(rid: Value) -> Value {
+    json!({"rid": rid, "ok": false, "error": BUSY, "code": "busy"})
+}
 
 /// A reply to send on a session, from a request task.
 pub(super) struct Out {
@@ -74,6 +99,8 @@ impl Channel {
         let (pace, input) = mpsc::channel(QUEUE);
         let pacer = Pacer {
             key: self.key,
+            rid: self.rid.clone(),
+            admit: Arc::new(|| true),
             input,
             finished: self.finished.clone(),
             out: self.out.clone(),
@@ -90,6 +117,15 @@ impl Channel {
         if let Some(fields) = value.as_object() {
             for (name, field) in fields {
                 wrapped.insert(name.clone(), field.clone());
+            }
+        }
+        if wrapped.get("ok") == Some(&Value::Bool(false)) && !wrapped.contains_key("code") {
+            if let Some(code) = wrapped
+                .get("error")
+                .and_then(Value::as_str)
+                .and_then(code_of)
+            {
+                wrapped.insert("code".into(), code.into());
             }
         }
         Value::Object(wrapped)
@@ -178,13 +214,14 @@ pub(super) struct Requests {
     host: MobileHost,
     out: mpsc::Sender<Out>,
     live: Live,
-    concurrent: HashMap<Key, JoinHandle<()>>,
+    /// Running concurrent jobs; the flag marks a plain read (not a watch).
+    concurrent: HashMap<Key, (JoinHandle<()>, bool)>,
     queues: HashMap<SessionKey, Queue>,
 }
 
 impl Drop for Requests {
     fn drop(&mut self) {
-        for task in self.concurrent.values() {
+        for (task, _) in self.concurrent.values() {
             task.abort();
         }
         for queue in self.queues.values() {
@@ -206,7 +243,7 @@ impl Requests {
 
     /// The requests and watches of a session end with it.
     pub(super) fn closed(&mut self, key: SessionKey) {
-        self.concurrent.retain(|(owner, _), task| {
+        self.concurrent.retain(|(owner, _), (task, _)| {
             let keep = *owner != key;
             if !keep {
                 task.abort();
@@ -218,6 +255,20 @@ impl Requests {
         }
         if let Ok(mut live) = self.live.lock() {
             live.retain(|(owner, _), _| *owner != key);
+        }
+    }
+
+    /// Ends the request `rid` of a session, as a browser's cancel does. A
+    /// watch stops and drops its sink; for a request that ended already it
+    /// does nothing.
+    pub(super) fn cancel(&self, key: SessionKey, rid: &Value) {
+        let notify = self
+            .live
+            .lock()
+            .ok()
+            .and_then(|live| live.get(&(key, rid.to_string())).cloned());
+        if let Some(notify) = notify {
+            notify.notify_one();
         }
     }
 
@@ -241,7 +292,19 @@ impl Requests {
             }
             return;
         }
-        self.concurrent.retain(|_, task| !task.is_finished());
+        self.concurrent.retain(|_, (task, _)| !task.is_finished());
+        // A watch only reads. Anything the policy table does not know counts
+        // as control, so it keeps its place in the queue.
+        let watch = envelope["watch"] == true;
+        let read = !watch
+            && matches!(
+                policy::classify(
+                    envelope["method"].as_str().unwrap_or(""),
+                    &envelope["params"]
+                ),
+                Some(Access::Read)
+            );
+        let concurrent = watch || read;
         let notify = Arc::new(Notify::new());
         {
             let Ok(mut live) = self.live.lock() else {
@@ -251,10 +314,21 @@ impl Requests {
             if live.contains_key(&(key, id.clone())) {
                 return;
             }
-            if live.len() >= MAX_IN_FLIGHT {
+            let on_session = live.keys().filter(|(owner, _)| *owner == key).count();
+            let reads = self
+                .concurrent
+                .iter()
+                .filter(|(k, (_, is_read))| k.0 == key && *is_read && live.contains_key(*k))
+                .count();
+            if live.len() >= MAX_IN_FLIGHT
+                || on_session >= MAX_IN_FLIGHT_PER_SESSION
+                || (read && reads >= MAX_READS_PER_SESSION)
+            {
                 drop(live);
-                let busy = json!({"rid": rid, "ok": false, "error": "Desktop is busy; try again"});
-                let _ = self.out.try_send(Out { key, value: busy });
+                let _ = self.out.try_send(Out {
+                    key,
+                    value: busy(rid),
+                });
                 return;
             }
             live.insert((key, id.clone()), notify.clone());
@@ -263,17 +337,6 @@ impl Requests {
             live: self.live.clone(),
             key: (key, id.clone()),
         };
-        // A watch only reads. Anything the policy table does not know counts
-        // as control, so it keeps its place in the queue.
-        let concurrent = envelope["watch"] == true
-            || matches!(
-                policy::classify(
-                    envelope["method"].as_str().unwrap_or(""),
-                    &envelope["params"]
-                ),
-                Some(Access::Read)
-            );
-        let watch = envelope["watch"] == true;
         let channel = Channel {
             key,
             rid,
@@ -286,6 +349,9 @@ impl Requests {
         let host = self.host.clone();
         let job: Job = if watch {
             let (channel, pacer) = channel.paced(WATCH_INTERVAL, ServeOptions::WEB.heartbeat);
+            let admits = self.host.clone();
+            let owner = peer.clone();
+            let pacer = pacer.admitting(move || admits.web_admits(&owner));
             Box::pin(async move {
                 let _in_flight = in_flight;
                 // One task: ending it (session closed) ends the pacer with the
@@ -299,7 +365,7 @@ impl Requests {
             })
         };
         if concurrent {
-            self.concurrent.insert((key, id), tokio::spawn(job));
+            self.concurrent.insert((key, id), (tokio::spawn(job), read));
         } else {
             self.enqueue(key, job);
         }
