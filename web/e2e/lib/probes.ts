@@ -7,6 +7,7 @@ import type { Actor } from "./actor.ts";
 import {
   decideDevicesProbe,
   decideHeadlessProbe,
+  decidePairProbe,
   decidePairingProbe,
   decideUiProbe,
   parseCapabilities,
@@ -61,6 +62,10 @@ export function headlessCapabilities(): HeadlessCapabilities | null {
   if (!existsSync(bin)) return null;
   const r = spawnSync(bin, ["capabilities"], { encoding: "utf8", timeout: 20_000 });
   return r.status === 0 ? parseCapabilities(r.stdout) : null;
+}
+
+export function probePair(): Probe {
+  return decidePairProbe(existsSync(headlessBin()), headlessCapabilities());
 }
 
 export function probeHeadless(): Probe {

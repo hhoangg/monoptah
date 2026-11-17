@@ -10,13 +10,16 @@ export function parseInviteCode(output: string): string | null {
 export interface HeadlessCapabilities {
   version: number;
   serve: boolean;
+  /** The `pair` subcommand works (absent in older binaries: false). */
+  pair: boolean;
   reason: string | null;
   checkVectors: boolean;
 }
 
 /**
  * Parses the output of `web_link_headless capabilities`: one JSON line
- * `{"version":1,"serve":<bool>,"reason":<string|null>,"checkVectors":true}`. Other lines (logs) are ignored.
+ * `{"version":1,"serve":<bool>,"pair":<bool, optional>,"reason":<string|null>,"checkVectors":true}`. Other lines
+ * (logs) are ignored.
  * Returns null when no line has the expected shape.
  */
 export function parseCapabilities(stdout: string): HeadlessCapabilities | null {
@@ -34,7 +37,7 @@ export function parseCapabilities(stdout: string): HeadlessCapabilities | null {
     if (typeof v["version"] !== "number" || typeof v["serve"] !== "boolean" || typeof v["checkVectors"] !== "boolean") continue;
     const reason = v["reason"];
     if (reason !== null && typeof reason !== "string") continue;
-    return { version: v["version"], serve: v["serve"], reason, checkVectors: v["checkVectors"] };
+    return { version: v["version"], serve: v["serve"], pair: v["pair"] === true, reason, checkVectors: v["checkVectors"] };
   }
   return null;
 }
@@ -99,11 +102,19 @@ export function decideDevicesProbe(answer: ProbeAnswer | null): Probe {
   return decideRouteProbe("device", "TODO(E-01:WS-R R-04)", "POST /api/devices", answer);
 }
 
+/** The headless desktop can pair only when the binary exists and reports `"pair": true`. */
+export function decidePairProbe(binExists: boolean, caps: HeadlessCapabilities | null): Probe {
+  if (!binExists) return { run: false, reason: "TODO(E-01:WS-D1 R-05) headless binary not built (set E2E_HEADLESS_BIN or build web_link_headless)" };
+  if (caps === null) return { run: false, reason: "TODO(E-01:WS-D1 R-05) headless binary did not answer `capabilities` with the expected JSON line" };
+  if (!caps.pair) return { run: false, reason: "TODO(E-01:WS-D1 R-05) headless binary reports pair=false" };
+  return { run: true, reason: "headless binary reports pair=true" };
+}
+
 /** The headless desktop can serve only when the binary exists and reports `"serve": true`. */
 export function decideHeadlessProbe(binExists: boolean, caps: HeadlessCapabilities | null): Probe {
   if (!binExists) return { run: false, reason: "TODO(E-01:WS-D1 R-05) headless binary not built (set E2E_HEADLESS_BIN or build web_link_headless)" };
   if (caps === null) return { run: false, reason: "TODO(E-01:WS-D1 R-05) headless binary did not answer `capabilities` with the expected JSON line" };
-  if (!caps.serve) return { run: false, reason: `TODO(E-01:WS-D1 R-05) headless binary reports serve=false (${caps.reason ?? "no reason given"})` };
+  if (!caps.serve) return { run: false, reason: `TODO(E-01:WS-D1 R-05b) headless binary reports serve=false (${caps.reason ?? "no reason given"})` };
   return { run: true, reason: "headless binary reports serve=true" };
 }
 

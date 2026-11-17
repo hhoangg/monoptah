@@ -5,6 +5,7 @@ import {
   decideDevicesProbe,
   decideRouteProbe,
   decideHeadlessProbe,
+  decidePairProbe,
   decidePairingProbe,
   decideUiProbe,
   parseCapabilities,
@@ -28,7 +29,8 @@ describe("parseInviteCode", () => {
 describe("parseCapabilities", () => {
   it("parses the capabilities line, ignoring log lines", () => {
     const out = 'starting\n{"version":1,"serve":false,"reason":"not implemented","checkVectors":true}\n';
-    expect(parseCapabilities(out)).toEqual({ version: 1, serve: false, reason: "not implemented", checkVectors: true });
+    expect(parseCapabilities(out)).toEqual({ version: 1, serve: false, pair: false, reason: "not implemented", checkVectors: true });
+    expect(parseCapabilities('{"version":1,"serve":false,"pair":true,"reason":null,"checkVectors":true}')?.pair).toBe(true);
   });
   it("accepts a null reason", () => {
     expect(parseCapabilities('{"version":1,"serve":true,"reason":null,"checkVectors":true}')?.serve).toBe(true);
@@ -104,12 +106,20 @@ describe("probe decisions", () => {
     expect(() => decideDevicesProbe(null)).toThrow(/no answer/);
   });
   it("headless: needs the binary and serve=true", () => {
-    const caps = { version: 1, serve: true, reason: null, checkVectors: true };
+    const caps = { version: 1, serve: true, pair: true, reason: null, checkVectors: true };
     expect(decideHeadlessProbe(false, null).run).toBe(false);
     expect(decideHeadlessProbe(true, null).run).toBe(false);
     expect(decideHeadlessProbe(true, { ...caps, serve: false, reason: "later" }).reason).toContain("later");
     expect(decideHeadlessProbe(true, caps).run).toBe(true);
     expect(decideHeadlessProbe(false, null).reason).toContain("TODO(E-01:WS-D1 R-05)");
+    expect(decideHeadlessProbe(true, { ...caps, serve: false }).reason).toContain("R-05b");
+  });
+  it("pair: needs the binary and pair=true, independent of serve", () => {
+    const caps = { version: 1, serve: false, pair: true, reason: "later", checkVectors: true };
+    expect(decidePairProbe(false, null).run).toBe(false);
+    expect(decidePairProbe(true, null).run).toBe(false);
+    expect(decidePairProbe(true, { ...caps, pair: false }).run).toBe(false);
+    expect(decidePairProbe(true, caps).run).toBe(true);
   });
   const page = { isPlaceholder: false, hasRoot: true, hasRouteStub: false, rootHasContent: true, pageErrors: [] as string[] };
   it("ui: RouteStub and the placeholder skip, a rendered app runs", () => {
