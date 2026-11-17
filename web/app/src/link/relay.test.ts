@@ -118,6 +118,19 @@ describe("RelayConnection backlog (M4)", () => {
     expect(channels).toEqual([1, 2, 3, 4]);
   });
 
+  it("discardStaleBacklog drops BYE, HS2 and TRANSPORT but keeps CTRL and ERROR (N2)", async () => {
+    const socket = new FakeSocket();
+    const relay = new RelayConnection(socket);
+    for (const type of [FrameType.BYE, FrameType.CTRL, FrameType.HS2, FrameType.TRANSPORT, FrameType.ERROR]) {
+      socket.onmessage?.(encodeFrame({ type, channel: 1, deviceId: DEVICE }));
+    }
+    relay.discardStaleBacklog();
+    const types: number[] = [];
+    relay.onFrame = (f) => types.push(f.type);
+    await Promise.resolve();
+    expect(types).toEqual([FrameType.CTRL, FrameType.ERROR]);
+  });
+
   it("drops frames after the consumer left", () => {
     const socket = new FakeSocket();
     const relay = new RelayConnection(socket);

@@ -89,6 +89,48 @@ describe("ensureDevice", () => {
   });
 });
 
+describe("registration timeout (N1)", () => {
+  it("a hung POST /api/devices is aborted after 15 s and does not hold the device key lock", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const queue: { chain: Promise<unknown> } = { chain: Promise.resolve() };
+    Object.defineProperty(navigator, "locks", {
+      value: { request: <R,>(_name: string, cb: () => Promise<R>): Promise<R> => (queue.chain = queue.chain.then(cb, cb)) as Promise<R> },
+      configurable: true,
+    });
+    try {
+      const { ensureDevice, DeviceRegistrationError } = await freshModule();
+      const { getDeviceKeyPair } = await import("./keys.ts");
+      let signal: AbortSignal | undefined;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((_url: string, init: RequestInit) => {
+          signal = init.signal ?? undefined;
+          return new Promise<Response>((_resolve, reject) => {
+            signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+          });
+        }),
+      );
+      const result = ensureDevice().then(
+        () => null,
+        (error: unknown) => error,
+      );
+      // IndexedDB runs on real timers: wait (really) until the POST started.
+      for (const t0 = Date.now(); !signal && Date.now() - t0 < 10_000; ) await new Promise((r) => setImmediate(r));
+      expect(signal).toBeDefined();
+      await vi.advanceTimersByTimeAsync(14_000);
+      expect(signal?.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(1_500);
+      expect(signal?.aborted).toBe(true);
+      expect(await result).toBeInstanceOf(DeviceRegistrationError);
+      // The lock is free again: another caller gets the key pair.
+      await expect(getDeviceKeyPair()).resolves.toBeTruthy();
+    } finally {
+      Reflect.deleteProperty(navigator, "locks");
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("registration failures (M10, L8)", () => {
   afterEach(() => {
     vi.doUnmock("./keys.ts");

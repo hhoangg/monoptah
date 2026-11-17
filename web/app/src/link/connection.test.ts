@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { CLOSE_CODES, CloseCodes, PROTOCOL_VERSION } from "@monoptah/protocol";
+import { CLOSE_CODES, CloseCodes, FrameType, PROTOCOL_VERSION, encodeFrame } from "@monoptah/protocol";
 import { InMemoryRelay, MockDesktop, fingerprint, generateKeyPair, type KeyPair } from "@monoptah/mock-desktop";
 import { base64UrlEncode } from "./base64url.ts";
 import {
@@ -712,6 +712,30 @@ describe("review fixes: lifecycle", () => {
     const r = rig({ directoryOnline: false });
     await settle();
     expect(r.state()).toMatchObject({ status: "ready", presence: "online" });
+  });
+
+  it("a BYE of an earlier session buffered before this handshake does not end it (N2)", async () => {
+    const holder: { relay?: InMemoryRelay } = {};
+    let first = true;
+    const r = rig({
+      start: false,
+      deps: {
+        openRelay: async (_desktopId, deviceId) => {
+          const socket = holder.relay!.connectDevice(deviceId);
+          const conn = new RelayConnection(socket);
+          if (first) {
+            first = false;
+            socket.onmessage?.(encodeFrame({ type: FrameType.BYE, channel: 7, deviceId }));
+          }
+          return conn;
+        },
+      },
+    });
+    holder.relay = r.relay;
+    r.connection.start();
+    await settle(5000);
+    expect(r.state().status).toBe("ready");
+    expect(r.state().blocked).toBeNull();
   });
 
   it("a pending session is not re-handshaken by the 75 s visible check (M14)", async () => {

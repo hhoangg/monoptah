@@ -5,7 +5,7 @@
 // shape). It validates incoming binary frames, sends the text keepalive `ping` and
 // swallows `pong`. It knows nothing about Noise or channels. One connection serves one
 // consumer: `onFrame` is a single callback.
-import { PING_INTERVAL_MS, ROOM_QUOTAS, decodeFrame, encodeFrame, type Frame } from "@monoptah/protocol";
+import { PING_INTERVAL_MS, ROOM_QUOTAS, decodeFrame, encodeFrame, FrameType, type Frame } from "@monoptah/protocol";
 
 /** One end of a relay connection. Compatible with the `FrameSocket` of @monoptah/mock-desktop. */
 export interface RelaySocket {
@@ -90,6 +90,15 @@ export class RelayConnection {
     this.#stopTimer();
     if (this.#closed) return;
     this.#socket.close(code);
+  }
+
+  /**
+   * Drops the buffered frames that cannot belong to a session that has not sent its HS1 yet (`BYE`, `HS2`,
+   * `TRANSPORT`: they answer or end an earlier session on the same channel). `CTRL` and `ERROR` stay.
+   */
+  discardStaleBacklog(): void {
+    const keep = this.#backlog.filter((frame) => frame.type === FrameType.CTRL || frame.type === FrameType.ERROR);
+    this.#backlog.splice(0, this.#backlog.length, ...keep);
   }
 
   #ping(): void {

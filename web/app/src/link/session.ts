@@ -270,6 +270,8 @@ export class LinkSession {
       this.#readyResolve = resolve;
       this.#readyReject = reject;
     });
+    // Frames buffered before this session's HS1 (a late BYE of an earlier session on this channel) are not ours.
+    this.#relay.discardStaleBacklog();
     this.#relay.onFrame = (frame) => this.#onFrame(frame);
     this.#relay.onClose = (code, reason) => this.#finish("relay_closed", { closeCode: code, closeReason: reason }, false);
     this.#readyTimer = setTimeout(() => this.#finish("handshake_timeout", {}, true), options.readyTimeoutMs ?? 30_000);

@@ -61,18 +61,31 @@ export function deviceNameFromUserAgent(userAgent: string = globalThis.navigator
   return (os ? `${browser} on ${os}` : browser).slice(0, MAX_DEVICE_NAME);
 }
 
+/** The registration POST runs under the cross-tab device-key lock, so it must not wait forever. */
+export const REGISTRATION_TIMEOUT_MS = 15_000;
+
 export const defaultDeviceRegistrar: DeviceRegistrar = async ({ name, publicKey }) => {
   const body = RegisterDeviceBody.parse({ name, publicKey: base64UrlEncode(publicKey) });
-  const response = await fetch("/api/devices", {
-    method: "POST",
-    credentials: "same-origin",
-    headers: { "Content-Type": "application/json", "X-Monoptah-CSRF": "1" },
-    body: JSON.stringify(body),
-  });
-  if (!response.ok) throw new DeviceRegistrationError(`device registration failed (${response.status})`, response.status);
-  const parsed = RegisterDeviceResponse.safeParse(await response.json().catch(() => null));
-  if (!parsed.success) throw new DeviceRegistrationError("device registration returned an unexpected body", undefined, true);
-  return parsed.data.deviceId;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REGISTRATION_TIMEOUT_MS);
+  try {
+    const response = await fetch("/api/devices", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", "X-Monoptah-CSRF": "1" },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new DeviceRegistrationError(`device registration failed (${response.status})`, response.status);
+    const parsed = RegisterDeviceResponse.safeParse(await response.json().catch(() => null));
+    if (!parsed.success) throw new DeviceRegistrationError("device registration returned an unexpected body", undefined, true);
+    return parsed.data.deviceId;
+  } catch (error) {
+    if (controller.signal.aborted) throw new DeviceRegistrationError("device registration timed out");
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 };
 
 let registrar: DeviceRegistrar = defaultDeviceRegistrar;
