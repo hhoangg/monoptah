@@ -24,11 +24,22 @@ export type AuditEvent = {
 export const INSERT_AUDIT_SQL =
   "INSERT INTO audit_log (id, ts, actor_user_id, actor_kind, action, target_type, target_id, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
 
+/** A SQL condition (and its bound values) that makes an INSERT write its row only when it holds. */
+export interface StatementCondition {
+  sql: string;
+  params: unknown[];
+}
+
+const CONDITIONAL_INSERT_AUDIT_SQL = (condition: string): string =>
+  `INSERT INTO audit_log (id, ts, actor_user_id, actor_kind, action, target_type, target_id, meta) SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE ${condition}`;
+
 /**
- * Builds the INSERT of one audit event, for use in a `D1Database.batch`. Throws on an unknown action, an
+ * Builds the INSERT of one audit event, for use in a `D1Database.batch`. With `when`, the row is written only
+ * if the condition holds (`INSERT ... SELECT ... WHERE <when>`), so a batch can drop its audit rows when its
+ * first statement changed nothing. Throws on an unknown action, an
  * actor kind the action does not allow, or meta that does not match the action's strict schema.
  */
-export function auditStatement(env: Pick<Env, "DB">, event: AuditEvent): D1PreparedStatement {
+export function auditStatement(env: Pick<Env, "DB">, event: AuditEvent, when?: StatementCondition): D1PreparedStatement {
   const entry = AUDIT_ACTIONS[event.action];
   if (!entry) throw new Error(`Unknown audit action: ${String(event.action)}`);
   const actorKind = event.actorKind ?? entry.actorKinds[0];
@@ -39,7 +50,7 @@ export function auditStatement(env: Pick<Env, "DB">, event: AuditEvent): D1Prepa
     const paths = parsed.error.issues.map((issue) => `${issue.code}:${issue.path.join(".")}`).join(", ");
     throw new Error(`Invalid meta for audit action ${event.action}: ${paths}`);
   }
-  return env.DB.prepare(INSERT_AUDIT_SQL).bind(
+  const values = [
     crypto.randomUUID(),
     event.ts ?? nowSeconds(),
     event.actorUserId ?? null,
@@ -48,7 +59,9 @@ export function auditStatement(env: Pick<Env, "DB">, event: AuditEvent): D1Prepa
     event.targetType ?? null,
     event.targetId ?? null,
     JSON.stringify(parsed.data),
-  );
+  ];
+  if (!when) return env.DB.prepare(INSERT_AUDIT_SQL).bind(...values);
+  return env.DB.prepare(CONDITIONAL_INSERT_AUDIT_SQL(when.sql)).bind(...values, ...when.params);
 }
 
 /** Writes one audit event now. Prefer `auditStatement` inside the batch of the change being recorded. */

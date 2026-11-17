@@ -16,6 +16,16 @@ const freshIp = () => `203.0.113.${(counter += 1)}`;
 const post = (path: string, ip: string, body: unknown = {}, extra: Record<string, string> = {}) =>
   call(path, { method: "POST", headers: { ...BROWSER_HEADERS, "CF-Connecting-IP": ip, ...extra }, body: JSON.stringify(body) });
 
+/** Passes the limiter: a stub answers 501, an implemented route answers with its own status (never 429 or 403). */
+const IMPLEMENTED_PATHS = new Set(["/api/auth/register/options", "/api/auth/register/verify", "/api/auth/login/options", "/api/auth/login/verify"]);
+function expectPassed(res: Response, path: string, message?: string) {
+  if (IMPLEMENTED_PATHS.has(path)) {
+    expect([429, 403, 501], message).not.toContain(res.status);
+  } else {
+    expect(res.status, message).toBe(501);
+  }
+}
+
 async function expectLimited(res: Response, windowSeconds: number) {
   expect(res.status).toBe(429);
   expect(ApiErrorSchema.parse(await res.json()).code).toBe("rate_limited");
@@ -90,10 +100,10 @@ describe("IP keyed groups", () => {
     ["pair-start", "/api/pair/start", 5, 600],
   ] as const)("%s: call %i+1 is 429 with Retry-After, other IPs are unaffected, a new window resets", async (group, path, limit, windowSeconds) => {
     const ip = freshIp();
-    for (let i = 0; i < limit; i += 1) expect((await post(path, ip)).status, `call ${i + 1}`).toBe(501);
+    for (let i = 0; i < limit; i += 1) expectPassed(await post(path, ip), path, `call ${i + 1}`);
     await expectLimited(await post(path, ip), windowSeconds);
     await expectLimited(await post(path, ip), windowSeconds);
-    expect((await post(path, freshIp())).status).toBe(501);
+    expectPassed(await post(path, freshIp()), path);
 
     // Breach audited once per window (two refused calls above, one audit row), with the salted IP hash.
     const hash = await ipHash(env, ip);
@@ -104,14 +114,14 @@ describe("IP keyed groups", () => {
 
     // A new window: move the counter row back by one window.
     await env.DB.prepare("UPDATE rate_limits SET window_start = window_start - ? WHERE key = ?").bind(windowSeconds, `${group}:ip:${hash}`).run();
-    expect((await post(path, ip)).status).toBe(501);
+    expectPassed(await post(path, ip), path);
   });
 
   it("register and login: both routes of a group share one counter", async () => {
     const ip = freshIp();
     for (let i = 0; i < 5; i += 1) {
-      expect((await post("/api/auth/register/options", ip)).status).toBe(501);
-      expect((await post("/api/auth/register/verify", ip)).status).toBe(501);
+      expectPassed(await post("/api/auth/register/options", ip), "/api/auth/register/options");
+      expectPassed(await post("/api/auth/register/verify", ip), "/api/auth/register/verify");
     }
     await expectLimited(await post("/api/auth/register/verify", ip), 3600);
   });

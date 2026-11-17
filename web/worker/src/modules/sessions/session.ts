@@ -36,6 +36,8 @@ export interface CreateSessionInput {
   reauthAt?: number | null;
   /** Unix seconds; defaults to now. */
   now?: number;
+  /** Write the row only if this SQL condition holds (registration: only when the user row was created). */
+  when?: { sql: string; params: unknown[] };
 }
 
 export interface CreatedSession {
@@ -55,6 +57,9 @@ export interface CreatedSession {
 export const INSERT_SESSION_SQL =
   "INSERT INTO sessions (id_hash, user_id, created_at, last_seen_at, idle_expires_at, expires_at, reauth_at, amr, recovery_only, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
+const INSERT_SESSION_WHEN_SQL = (condition: string): string =>
+  `INSERT INTO sessions (id_hash, user_id, created_at, last_seen_at, idle_expires_at, expires_at, reauth_at, amr, recovery_only, user_agent) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${condition}`;
+
 /**
  * Builds a new session: a random token, its hash, and the INSERT statement (not run). Idle expiry is 7 days and
  * absolute expiry 30 days; a `recoveryOnly` session expires after 30 minutes in both.
@@ -67,7 +72,7 @@ export async function createSession(env: Pick<Env, "DB">, input: CreateSessionIn
   const expiresAt = now + (recoveryOnly ? RECOVERY_ONLY_SECONDS : ABSOLUTE_SECONDS);
   const idleExpiresAt = Math.min(now + IDLE_SECONDS, expiresAt);
   const maxAge = expiresAt - now;
-  const statement = env.DB.prepare(INSERT_SESSION_SQL).bind(
+  const values = [
     idHash,
     input.userId,
     now,
@@ -78,7 +83,10 @@ export async function createSession(env: Pick<Env, "DB">, input: CreateSessionIn
     input.amr,
     recoveryOnly ? 1 : 0,
     input.userAgent ? input.userAgent.slice(0, USER_AGENT_MAX_LENGTH) : null,
-  );
+  ];
+  const statement = input.when
+    ? env.DB.prepare(INSERT_SESSION_WHEN_SQL(input.when.sql)).bind(...values, ...input.when.params)
+    : env.DB.prepare(INSERT_SESSION_SQL).bind(...values);
   return { token, idHash, maxAge, expiresAt, statement, cookie: sessionCookie(token, maxAge) };
 }
 

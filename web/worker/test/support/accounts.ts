@@ -6,8 +6,11 @@
 //   const res = await authedCall(session, "/api/me");                       // GET
 //   const res = await authedCall(session, "/api/me", { method: "PATCH", body: JSON.stringify({ displayName: "A" }) });
 import { env } from "cloudflare:workers";
+import type { PublicKeyCredentialCreationOptionsJSON, PublicKeyCredentialRequestOptionsJSON } from "@simplewebauthn/server";
+import { hashInviteCode, INVITE_TTL_SECONDS, newInviteCode } from "../../src/modules/invites/code.ts";
 import { createSession, SESSION_COOKIE } from "../../src/modules/sessions/session.ts";
 import { BROWSER_HEADERS, call, callWithEnv } from "../helpers.ts";
+import { VirtualAuthenticator } from "./authenticator.ts";
 
 type TestEnv = typeof env;
 
@@ -139,4 +142,119 @@ export function withRoom(testEnv: TestEnv, fake: { namespace: TestEnv["ROOM"] })
 /** All `Set-Cookie` values of a response. */
 export function setCookies(res: Response): string[] {
   return res.headers.getSetCookie();
+}
+
+// --- Invites and passkey ceremonies (A-03, A-06) ---
+
+export interface CreateTestInviteOptions {
+  /** The inviter; defaults to a new user for a `user` invite. Ignored for `bootstrap` (created_by NULL). */
+  createdBy?: string;
+  kind?: "user" | "bootstrap";
+  /** Unix seconds; defaults to now + 7 days. */
+  expiresAt?: number;
+  usedBy?: string;
+  revoked?: boolean;
+}
+
+export interface TestInvite {
+  /** The plain code, as a user would paste it. D1 holds only its SHA-256. */
+  code: string;
+  id: string;
+  createdBy: string | null;
+}
+
+/** Inserts an invite row (hash only) and returns the plain code. Same hashing as scripts/bootstrap.mjs. */
+export async function createTestInvite(testEnv: TestEnv, options: CreateTestInviteOptions = {}): Promise<TestInvite> {
+  const kind = options.kind ?? "user";
+  const createdBy = kind === "bootstrap" ? null : (options.createdBy ?? (await createTestUser(testEnv)).id);
+  const code = newInviteCode();
+  const id = crypto.randomUUID();
+  const now = Math.floor(Date.now() / 1000);
+  await testEnv.DB.prepare(
+    "INSERT INTO invites (id, code_hash, created_by, kind, expires_at, used_by, used_at, revoked_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  )
+    .bind(
+      id,
+      await hashInviteCode(code),
+      createdBy,
+      kind,
+      options.expiresAt ?? now + INVITE_TTL_SECONDS,
+      options.usedBy ?? null,
+      options.usedBy ? now : null,
+      options.revoked ? now : null,
+      now,
+    )
+    .run();
+  return { code, id, createdBy };
+}
+
+/** The test environment with vars replaced, for example `withVars(env, { MAX_USERS: "2" })`. */
+export function withVars(testEnv: TestEnv, vars: Partial<Record<"MAX_USERS" | "RP_ID" | "RP_ORIGIN", string>>): TestEnv {
+  return Object.assign(Object.create(testEnv) as TestEnv, vars);
+}
+
+let ipCounter = 0;
+/** A fresh fake client address, so a test never shares an IP rate limit window with another one. */
+export function freshIp(): string {
+  ipCounter += 1;
+  return `10.${(ipCounter >> 16) & 255}.${(ipCounter >> 8) & 255}.${ipCounter & 255}`;
+}
+
+/** POST JSON through the Worker with the browser headers and a fresh client address. */
+export function postJson(path: string, body: unknown, init: { cookie?: string; testEnv?: TestEnv; ip?: string } = {}): Promise<Response> {
+  const headers: Record<string, string> = { "CF-Connecting-IP": init.ip ?? freshIp() };
+  if (init.cookie) headers.Cookie = init.cookie;
+  const request = { method: "POST", headers: { ...BROWSER_HEADERS, ...headers }, body: JSON.stringify(body) };
+  return init.testEnv ? callWithEnv(init.testEnv, path, request) : call(path, request);
+}
+
+export interface RegistrationAttempt {
+  options: PublicKeyCredentialCreationOptionsJSON;
+  challengeId: string;
+}
+
+/** `register/options`; throws when it does not answer 200. */
+export async function registerOptions(code: string, handle: string, init: { testEnv?: TestEnv; displayName?: string } = {}): Promise<RegistrationAttempt> {
+  const res = await postJson("/api/auth/register/options", { invite: code, handle, displayName: init.displayName ?? "Test Person" }, init);
+  if (res.status !== 200) throw new Error(`register/options answered ${res.status}: ${await res.text()}`);
+  const body = (await res.json()) as { challengeId: string; options: PublicKeyCredentialCreationOptionsJSON };
+  return body;
+}
+
+export interface RegisteredUser {
+  userId: string;
+  handle: string;
+  key: VirtualAuthenticator;
+  cookie: string;
+  recoveryCodes: string[];
+  role: string;
+}
+
+/** Registers a user through the real routes with a virtual authenticator. Throws when it does not succeed. */
+export async function registerUser(
+  code: string,
+  options: { handle?: string; testEnv?: TestEnv; key?: VirtualAuthenticator } = {},
+): Promise<RegisteredUser> {
+  const handle = options.handle ?? `reg-${crypto.randomUUID().slice(0, 8)}`;
+  const key = options.key ?? (await VirtualAuthenticator.generate());
+  const attempt = await registerOptions(code, handle, options);
+  const response = await key.create(attempt.options, { origin: env.RP_ORIGIN, rpId: env.RP_ID });
+  const res = await postJson("/api/auth/register/verify", { challengeId: attempt.challengeId, response }, options);
+  if (res.status !== 200) throw new Error(`register/verify answered ${res.status}: ${await res.text()}`);
+  const body = (await res.json()) as { user: { id: string; role: string }; recoveryCodes: string[] };
+  const cookie = setCookies(res)[0]?.split(";")[0] ?? "";
+  return { userId: body.user.id, handle, key, cookie, recoveryCodes: body.recoveryCodes, role: body.user.role };
+}
+
+/** Signs in with `key` through the real routes; returns the response and the cookie (empty when none). */
+export async function loginWith(
+  key: VirtualAuthenticator,
+  ceremony: Partial<Parameters<VirtualAuthenticator["get"]>[1]> = {},
+  testEnv?: TestEnv,
+): Promise<{ res: Response; cookie: string }> {
+  const optionsRes = await postJson("/api/auth/login/options", {}, { testEnv });
+  const { challengeId, options } = (await optionsRes.json()) as { challengeId: string; options: PublicKeyCredentialRequestOptionsJSON };
+  const response = await key.get(options, { origin: env.RP_ORIGIN, rpId: env.RP_ID, ...ceremony });
+  const res = await postJson("/api/auth/login/verify", { challengeId, response }, { testEnv });
+  return { res, cookie: setCookies(res)[0]?.split(";")[0] ?? "" };
 }

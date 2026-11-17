@@ -9,7 +9,16 @@ import { BROWSER_HEADERS, call, ORIGIN } from "./helpers.ts";
 import { createTestUser, loginAs, type TestSession } from "./support/accounts.ts";
 
 /** Routes with a real handler: with a valid session they no longer answer 501 (their own tests cover them). */
-const IMPLEMENTED = new Set(["GET /api/me", "PATCH /api/me", "GET /api/audit", "GET /api/sessions", "DELETE /api/sessions/:id", "POST /api/auth/logout"]);
+const IMPLEMENTED = new Set(["GET /api/me", "PATCH /api/me", "GET /api/audit", "GET /api/sessions", "DELETE /api/sessions/:id", "POST /api/auth/logout", "POST /api/auth/register/options", "POST /api/auth/register/verify", "POST /api/auth/login/options", "POST /api/auth/login/verify", "POST /api/auth/reauth/options", "POST /api/auth/reauth/verify"]);
+
+/**
+ * What a public route answers to a request that passes the browser checks but has an empty body: 501 while it is a
+ * stub, and the route's own answer once implemented (400 for a bad body, 200 for the body-less login options).
+ */
+const passedStatus = (route: ApiRoute): number => {
+  if (!IMPLEMENTED.has(`${route.method} ${route.path}`)) return 501;
+  return route.path === "/api/auth/login/options" ? 200 : 400;
+};
 
 const concrete = (route: ApiRoute) => route.path.replace(/:[A-Za-z]+/g, "x");
 const nonGet = (route: ApiRoute) => route.method !== "GET";
@@ -65,7 +74,7 @@ describe("Origin and X-Monoptah-CSRF on cookie routes", () => {
 
     // Passing the browser checks: the request reaches the auth resolver (401 without a session)...
     const ok = await send({ ...BROWSER_HEADERS });
-    expect(ok.status).toBe(route.auth === "public" ? 501 : 401);
+    expect(ok.status).toBe(route.auth === "public" ? passedStatus(route) : 401);
     // ...and with a valid session the handler (501 while unimplemented).
     if (route.auth !== "public" && !IMPLEMENTED.has(`${route.method} ${route.path}`)) {
       const authed = await send({ ...BROWSER_HEADERS, Cookie: admin.cookie });
@@ -90,7 +99,7 @@ describe("Origin and X-Monoptah-CSRF on cookie routes", () => {
       expect(ApiErrorSchema.parse(await res.json()).code).toBe("unsupported_media_type");
     }
     const withCharset = await call(concrete(route), { method: route.method, headers: { ...BROWSER_HEADERS, "Content-Type": "application/json; charset=utf-8" } });
-    expect(withCharset.status).toBe(route.auth === "public" ? 501 : 401);
+    expect(withCharset.status).toBe(route.auth === "public" ? passedStatus(route) : 401);
   });
 
   it("checks Origin on a WebSocket upgrade GET (no CSRF header there)", async () => {
