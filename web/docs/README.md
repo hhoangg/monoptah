@@ -100,7 +100,7 @@ The old Tauri React app (`src/`) may be reused, but its source will be deleted l
 | Auth | `@simplewebauthn` (passkeys only), recovery codes (HMAC-SHA-256 with pepper), cookie sessions `__Host-mc_session` |
 | E2E crypto | Noise IK: `@noble/curves`, `@noble/ciphers`, `@noble/hashes` on web, `snow` on desktop |
 | Push | Web Push with VAPID, WebCrypto sender in the Worker (no Node `web-push`) |
-| Dev and deploy | `@cloudflare/vite-plugin`, pnpm workspace, `wrangler deploy` from CI only on the official host |
+| Dev and deploy | `@cloudflare/vite-plugin`, pnpm workspace, the official host is deployed only by the maintainer running `pnpm deploy:official` (wraps `wrangler deploy`) from their own Mac; CI builds and tests but never deploys and holds no Cloudflare deploy token; agents and sandboxes use only local `wrangler dev` / Miniflare and never hold Cloudflare credentials (security.md section 9) |
 | Desktop | Existing `MobileHost` reused behind a new WebSocket transport; QUIC kept for phones |
 
 ## 5. Glossary
@@ -143,8 +143,9 @@ The old Tauri React app (`src/`) may be reused, but its source will be deleted l
 | [design-system.md](design-system.md) | Tokens, themes, accents, glass, motion, Tailwind v4 theme, shadcn mapping, responsive layouts, accessibility, new-feature checklist |
 | [architecture.md](architecture.md) | Routes, state and data layer, key storage, service worker, Worker routes, D1 schema, DO relay, frames, Noise, desktop changes, pairing, Web Push, self-host guide |
 | [security.md](security.md) | Threat model (T1 to T16), auth, invites and admin, E2E, device trust, desktop hardening, XSS rules, CSP, Trusted Types, deploy security, logging |
-| [capacity.md](capacity.md) | Cloudflare free tier limits, usage model, how many users fit, mitigations, paid tier threshold, monitoring |
+| [capacity.md](capacity.md) | Cloudflare free tier limits, usage model, how many users fit, mitigations, free-tier cap (paid tier out of scope), monitoring |
 | [tauri-reuse.md](tauri-reuse.md) | Rule and inventory for copying code from the Tauri React app (`src/`) into `web/`: candidates, adaptations, targets, not-reused list, license and branding notes |
+| [workstreams.md](workstreams.md) | Parallel workstreams: contracts, ticket groups, dependencies, file ownership, done criteria, test strategy |
 | [roadmap.md](roadmap.md) | Phased tickets with acceptance criteria, dependencies, risk, release gates, open questions |
 
 ## 7. Documentation conventions
