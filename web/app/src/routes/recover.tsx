@@ -1,12 +1,7 @@
-// Route stub of /recover. Owner: WS-S (workstreams.md 3.1).
+// Route of /recover. Owner: WS-S (workstreams.md 3.1). Also the forced "add a passkey" step of a recoveryOnly session.
 import { createFileRoute } from "@tanstack/react-router";
-import { RouteStub } from "@/ui/RouteStub";
+import { RecoverScreen } from "@/features/accounts/RecoverScreen";
 
 export const Route = createFileRoute("/recover")({
-  component: Page,
+  component: RecoverScreen,
 });
-
-function Page() {
-  const params = Route.useParams();
-  return <RouteStub route="/recover" purpose="Handle and recovery code, then a forced new passkey." params={params} />;
-}

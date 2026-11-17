@@ -112,6 +112,13 @@ beforeEach(() => {
 });
 afterEach(() => restoreTransport?.());
 
+// Routes whose stub was replaced by a real screen (W-02): they render one h1 instead of the stub.
+const SCREENS: Record<string, string> = {
+  "/login": "Sign in to Monoptah",
+  "/register": "Create your account",
+  "/recover": "Recover your account",
+};
+
 async function renderAt(url: string) {
   const queryClient = createQueryClient();
   const router = createAppRouter({ history: createMemoryHistory({ initialEntries: [url] }), queryClient });
@@ -120,13 +127,20 @@ async function renderAt(url: string) {
       <RouterProvider router={router} />
     </QueryClientProvider>,
   );
-  await screen.findByTestId("route-stub");
+  const screenTitle = SCREENS[new URL(url, "http://x").pathname];
+  if (screenTitle) await screen.findByRole("heading", { level: 1, name: screenTitle });
+  else await screen.findByTestId("route-stub");
   return router;
 }
 
 describe("route stubs", () => {
   it.each(CASES)("renders $route for $url", async ({ url, route, params }) => {
     await renderAt(url);
+    if (SCREENS[route]) {
+      expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
+      expect(screen.getByRole("navigation", { name: "Main" })).toBeInTheDocument();
+      return;
+    }
     const stub = screen.getByTestId("route-stub");
     expect(stub).toHaveAttribute("data-route", route);
     expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent(route);

@@ -1,12 +1,7 @@
-// Route stub of /register. Owner: WS-S (workstreams.md 3.1).
+// Route of /register. Owner: WS-S (workstreams.md 3.1). The invite code arrives in the URL fragment.
 import { createFileRoute } from "@tanstack/react-router";
-import { RouteStub } from "@/ui/RouteStub";
+import { RegisterScreen } from "@/features/accounts/RegisterScreen";
 
 export const Route = createFileRoute("/register")({
-  component: Page,
+  component: RegisterScreen,
 });
-
-function Page() {
-  const params = Route.useParams();
-  return <RouteStub route="/register" purpose="Invite code, handle, display name, passkey creation and the one-time recovery codes." params={params} />;
-}
