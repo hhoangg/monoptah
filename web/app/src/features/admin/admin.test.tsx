@@ -268,6 +268,26 @@ describe("/admin/users", () => {
     expect(await screen.findByText("Blocked 4 users in the branch of @ada.")).toBeInTheDocument();
   });
 
+  it("a branch block warns about other admins in the branch and leaves the acting admin out of the count", async () => {
+    const { state } = install();
+    const user = userEvent.setup();
+    const ben = state.adminUsers.find((u) => u.id === "usr-ben");
+    if (ben) ben.role = "admin";
+    // The acting admin sits inside ada's branch (and invited ada's other relatives): they must not be counted.
+    const cleo = state.adminUsers.find((u) => u.id === "usr-cleo");
+    if (cleo) state.adminUsers.push({ ...cleo, id: "user-dev-1", handle: "dev", displayName: "Dev User", role: "admin", invitedBy: "usr-dmitri" });
+    mount("/admin/users?user=usr-ada");
+    await user.click(await screen.findByRole("button", { name: "Block @ada" }));
+    const dialog = await screen.findByRole("dialog", { name: "Block @ada?" });
+    await user.click(within(dialog).getByRole("radio", { name: /This user and everyone they invited/ }));
+    expect(within(dialog).getByText("This also blocks 1 admin")).toBeInTheDocument();
+    expect(within(dialog).getByText(/@ben is an admin in this branch/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/You are in this branch\. You stay signed in/)).toBeInTheDocument();
+    // The count never includes the acting admin.
+    expect(within(dialog).getByText(/Also blocks 5 people they invited/)).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "Block 6 users" })).toBeInTheDocument();
+  });
+
   it("limits the reason to 500 characters", async () => {
     install();
     mount("/admin/users?user=usr-ada");

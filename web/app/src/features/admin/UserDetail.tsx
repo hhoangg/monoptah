@@ -17,6 +17,8 @@ export interface UserDetailProps {
   user: AdminUser;
   users: readonly AdminUser[];
   isSelf: boolean;
+  /** The id of the acting admin: never part of a branch block (the server skips them). */
+  selfId: string;
   /** Mobile: leaves the detail and returns to the list. */
   onBack?: () => void;
 }
@@ -35,13 +37,15 @@ export function statusText(user: AdminUser, users: readonly AdminUser[]): string
 }
 
 /** The detail panel of one user: facts, Block, Unblock and Grant invites. */
-export function UserDetail({ user, users, isSelf, onBack }: UserDetailProps) {
+export function UserDetail({ user, users, isSelf, selfId, onBack }: UserDetailProps) {
   const queryClient = useQueryClient();
   const [blocking, setBlocking] = useState(false);
   const [unblocking, setUnblocking] = useState(false);
   const [result, setResult] = useState<string | null>(null);
   const unblock = useAction((error) => adminErrorMessage(error, UNBLOCK_CONFLICT));
-  const branch = descendantsOf(users, user.id).filter((member) => member.status === "active" && member.id !== user.id);
+  const activeBelow = descendantsOf(users, user.id).filter((member) => member.status === "active" && member.id !== user.id);
+  const selfInBranch = activeBelow.some((member) => member.id === selfId);
+  const branch = activeBelow.filter((member) => member.id !== selfId);
   const invitedCount = users.filter((member) => member.invitedBy === user.id).length;
   const reachable = descendantsOf(users, user.id).length;
 
@@ -104,6 +108,7 @@ export function UserDetail({ user, users, isSelf, onBack }: UserDetailProps) {
       <BlockDialog
         user={user}
         branch={branch}
+        selfInBranch={selfInBranch}
         open={blocking}
         onOpenChange={setBlocking}
         onBlocked={(count, cascade) => setResult(cascade ? `Blocked ${count} ${count === 1 ? "user" : "users"} in the branch of @${user.handle}.` : `Blocked @${user.handle}.`)}

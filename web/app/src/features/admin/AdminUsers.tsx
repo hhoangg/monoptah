@@ -10,8 +10,8 @@ import { AdminLayout } from "./AdminLayout";
 import { UserDetail } from "./UserDetail";
 import { handleOf } from "./tree";
 
-/** From 768px the list and the detail panel sit side by side; below it the screens are full-screen routes. */
-export const TWO_PANE_QUERY = "(min-width: 768px)";
+/** From 640px (the start of the tablet range, design-system.md 11) the list and the detail panel sit side by side; below it the screens are full-screen routes. */
+export const TWO_PANE_QUERY = "(min-width: 640px)";
 
 export interface AdminUsersProps {
   selfId: string;
@@ -33,16 +33,16 @@ export function AdminUsers({ selfId, selectedId, onSelect }: AdminUsersProps) {
           const selected = list.find((user) => user.id === selectedId);
           if (!twoPane) {
             return selected ? (
-              <UserDetail key={selected.id} user={selected} users={list} isSelf={selected.id === selfId} onBack={() => onSelect(undefined)} />
+              <UserDetail key={selected.id} user={selected} users={list} isSelf={selected.id === selfId} selfId={selfId} onBack={() => onSelect(undefined)} />
             ) : (
               <UserList users={list} selectedId={undefined} onSelect={onSelect} />
             );
           }
           return (
-            <div className="grid items-start gap-5 md:grid-cols-[minmax(0,2fr)_minmax(0,3fr)] lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
+            <div className="grid items-start gap-5 min-[40rem]:grid-cols-[minmax(0,2fr)_minmax(0,3fr)] lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
               <UserList users={list} selectedId={selected?.id} onSelect={onSelect} />
               {selected ? (
-                <UserDetail key={selected.id} user={selected} users={list} isSelf={selected.id === selfId} />
+                <UserDetail key={selected.id} user={selected} users={list} isSelf={selected.id === selfId} selfId={selfId} />
               ) : (
                 <p className="rounded-card bg-surface p-5 text-small text-muted-text">Select a user to see their details, block them or grant invites.</p>
               )}
