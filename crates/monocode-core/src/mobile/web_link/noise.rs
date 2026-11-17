@@ -65,6 +65,50 @@ pub fn fingerprint(public_key: &[u8]) -> String {
     out
 }
 
+/// The u-coordinates (little endian) of the points of small order on
+/// Curve25519, after the top bit is cleared and the value reduced mod p:
+/// 0, 1, the two points of order 8, and p - 1.
+const LOW_ORDER: [[u8; 32]; 7] = [
+    [0; 32],
+    {
+        let mut one = [0u8; 32];
+        one[0] = 1;
+        one
+    },
+    [
+        0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f, 0xc4,
+        0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16, 0x5f, 0x49,
+        0xb8, 0x00,
+    ],
+    [
+        0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83, 0xef,
+        0x5b, 0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd, 0xd0, 0x9f,
+        0x11, 0x57,
+    ],
+    // p - 1, p and p + 1: the last two are the non-canonical forms of 0 and 1.
+    p_plus(-1),
+    p_plus(0),
+    p_plus(1),
+];
+
+/// `p + delta` for p = 2^255 - 19, as 32 little-endian bytes.
+const fn p_plus(delta: i8) -> [u8; 32] {
+    let mut bytes = [0xff; 32];
+    bytes[31] = 0x7f;
+    bytes[0] = (0xed_i16 + delta as i16) as u8;
+    bytes
+}
+
+/// Whether `key` is an X25519 point of small order, in any encoding: such a
+/// "public key" makes every Diffie-Hellman result a constant that anyone can
+/// compute, so a handshake under it would prove nothing. The top bit is
+/// ignored, as X25519 ignores it.
+pub fn is_low_order(key: &[u8; 32]) -> bool {
+    let mut masked = *key;
+    masked[31] &= 0x7f;
+    LOW_ORDER.contains(&masked)
+}
+
 /// A fresh X25519 static key pair: `(private, public)`.
 pub fn generate_static() -> Result<([u8; 32], [u8; 32]), String> {
     let params = PROTOCOL
@@ -537,5 +581,35 @@ mod tests {
         let mut bad = ct.clone();
         bad[0] ^= 1;
         assert_eq!(rt.decrypt(&bad), Err(NoiseError::Decrypt));
+    }
+
+    #[test]
+    fn known_small_order_points_are_low_order_in_every_encoding() {
+        let hex = |h: &str| -> [u8; 32] { unhex(h).try_into().unwrap() };
+        let known = [
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "0100000000000000000000000000000000000000000000000000000000000000",
+            "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+            "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
+            "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+            "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+            "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        ];
+        for point in known {
+            let key = hex(point);
+            assert!(is_low_order(&key), "{point}");
+            // The top bit is ignored by X25519, so the high-bit twin is too.
+            let mut twin = key;
+            twin[31] |= 0x80;
+            assert!(is_low_order(&twin), "{point} with the top bit set");
+        }
+        // Real keys are not low order.
+        for _ in 0..8 {
+            let (_, public) = generate_static().unwrap();
+            assert!(!is_low_order(&public));
+        }
+        let mut near = hex(known[1]);
+        near[0] = 2;
+        assert!(!is_low_order(&near));
     }
 }

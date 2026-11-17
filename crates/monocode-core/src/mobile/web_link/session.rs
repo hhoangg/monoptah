@@ -12,12 +12,12 @@
 use std::collections::HashMap;
 
 use serde_json::{json, Value};
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use super::frame::{
     split_message, Frame, FrameType, Plaintext, Pushed, Reassembler, MAX_REQUEST_BYTES,
 };
-use super::noise::{fingerprint, Responder, Transport};
+use super::noise::{fingerprint, is_low_order, Responder, Transport};
 use crate::mobile::host::Device;
 use crate::mobile::policy::{self, DeviceKind, PolicyFlags};
 
@@ -25,6 +25,12 @@ use crate::mobile::policy::{self, DeviceKind, PolicyFlags};
 pub const MAX_CHANNELS_PER_DEVICE: usize = 4;
 /// Sessions held at once across all devices.
 pub const MAX_SESSIONS: usize = 64;
+/// Pending (unconfirmed) sessions one device key may hold at once.
+pub const MAX_PENDING_PER_FINGERPRINT: usize = 4;
+/// Pending sessions held at once across all device keys.
+pub const MAX_PENDING_TOTAL: usize = 16;
+/// The name shown for a device whose name is empty once cleaned.
+pub const UNNAMED_DEVICE: &str = "Unnamed device";
 /// A pending session is closed after this long without confirmation.
 pub const PENDING_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 /// A session with no frame in either direction for this long is closed.
@@ -124,8 +130,15 @@ struct Session {
     next_msg_id: u32,
 }
 
+/// The sessions of one relay connection.
+///
+/// The desktop static private key is held in a [`Zeroizing`] wrapper and wiped
+/// on drop. Residual: snow 0.10 copies the key into its own state for every
+/// handshake and does not zeroize its internal key copies (nor the transport
+/// cipher keys) when they are freed, so those copies outlive our wrapper until
+/// the memory is reused.
 pub struct SessionTable {
-    static_private: [u8; 32],
+    static_private: Zeroizing<[u8; 32]>,
     desktop_id: [u8; 16],
     desktop_name: String,
     desktop_version: String,
@@ -134,9 +147,23 @@ pub struct SessionTable {
     rekey_after_messages: u64,
 }
 
-impl Drop for SessionTable {
-    fn drop(&mut self) {
-        self.static_private.zeroize();
+/// Cleans the untrusted name of a device for display: control characters, bidi
+/// controls and zero-width characters go, whitespace collapses, and at most
+/// [`MAX_NAME_CHARS`] characters stay. An empty result is [`UNNAMED_DEVICE`].
+pub fn clean_name(raw: &str) -> String {
+    let visible = |c: &char| {
+        !(c.is_control()
+            || matches!(*c,
+                '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}'))
+    };
+    let kept: String = raw.chars().filter(visible).collect();
+    let collapsed = kept.split_whitespace().collect::<Vec<_>>().join(" ");
+    let capped: String = collapsed.chars().take(MAX_NAME_CHARS).collect();
+    let name = capped.trim();
+    if name.is_empty() {
+        UNNAMED_DEVICE.to_owned()
+    } else {
+        name.to_owned()
     }
 }
 
@@ -200,14 +227,14 @@ fn encrypt_envelope(
 
 impl SessionTable {
     pub fn new(
-        static_private: [u8; 32],
+        static_private: impl Into<Zeroizing<[u8; 32]>>,
         desktop_id: [u8; 16],
         desktop_name: impl Into<String>,
         desktop_version: impl Into<String>,
         directory: Directory,
     ) -> Self {
         Self {
-            static_private,
+            static_private: static_private.into(),
             desktop_id,
             desktop_name: desktop_name.into(),
             desktop_version: desktop_version.into(),
@@ -270,25 +297,20 @@ impl SessionTable {
     }
 
     fn on_hs1(&mut self, key: SessionKey, body: &[u8], now: u64) -> Vec<Action> {
-        let mut out = Vec::new();
-        // A new handshake replaces the old session for the key.
-        if self.sessions.remove(&key).is_some() {
-            out.push(Action::Closed { key });
-        }
+        // The session this key already has is not counted: a new handshake
+        // replaces it, but only once that handshake succeeded, so an HS1 that
+        // fails leaves the live session as it was.
         let on_device = self
             .sessions
             .keys()
-            .filter(|k| k.device_id == key.device_id)
+            .filter(|k| k.device_id == key.device_id && **k != key)
             .count();
-        if on_device >= MAX_CHANNELS_PER_DEVICE || self.sessions.len() >= MAX_SESSIONS {
-            out.push(Action::Send(bye(key)));
-            return out;
+        let total = self.sessions.len() - usize::from(self.sessions.contains_key(&key));
+        if on_device >= MAX_CHANNELS_PER_DEVICE || total >= MAX_SESSIONS {
+            return vec![Action::Send(bye(key))];
         }
-        match self.handshake(key, body, now) {
-            Some(actions) => out.extend(actions),
-            None => out.push(Action::Send(bye(key))),
-        }
-        out
+        self.handshake(key, body, now)
+            .unwrap_or_else(|| vec![Action::Send(bye(key))])
     }
 
     /// Runs the responder and the directory check. `None` means BYE with no
@@ -302,27 +324,42 @@ impl SessionTable {
         )
         .ok()?;
         let (payload, remote) = responder.read_hs1(body).ok()?;
+        // A small-order "key" makes the shared secrets a constant anyone can
+        // compute, so no handshake under it may complete.
+        if is_low_order(&remote) {
+            return None;
+        }
         let hello: Value = serde_json::from_slice(&payload).ok()?;
-        let name: String = hello
-            .get("name")?
-            .as_str()?
-            .chars()
-            .take(MAX_NAME_CHARS)
-            .collect();
+        let name = clean_name(hello.get("name")?.as_str()?);
         let fp = fingerprint(&remote);
         let relay_id = relay_device_id(&key.device_id);
         let mode = match (self.directory)(&fp, &relay_id) {
             Lookup::Confirmed { device } => {
-                let id_matches = device
-                    .server_device_id
-                    .as_deref()
-                    .is_none_or(|id| id == relay_id);
+                // A web row must name the relay device id it was confirmed
+                // under; a row without one is not reachable at all.
+                let id_matches = device.server_device_id.as_deref() == Some(relay_id.as_str());
                 if device.kind != DeviceKind::Web || !id_matches {
                     return None;
                 }
                 Mode::Ready(Box::new(device))
             }
-            Lookup::Pending => Mode::Pending { since: now },
+            Lookup::Pending => {
+                // Other keys' sessions only: this key's own old session is
+                // replaced if the handshake succeeds.
+                let pending = |(k, s): &(&SessionKey, &Session)| {
+                    **k != key && matches!(s.mode, Mode::Pending { .. })
+                };
+                let total = self.sessions.iter().filter(pending).count();
+                let own = self
+                    .sessions
+                    .iter()
+                    .filter(|entry| pending(entry) && entry.1.fingerprint == fp)
+                    .count();
+                if total >= MAX_PENDING_TOTAL || own >= MAX_PENDING_PER_FINGERPRINT {
+                    return None;
+                }
+                Mode::Pending { since: now }
+            }
             Lookup::Unknown => return None,
         };
         let hs2_payload = serde_json::to_vec(&json!({ "proto": PROTO })).ok()?;
@@ -354,7 +391,10 @@ impl SessionTable {
                 name,
             });
         }
-        self.sessions.insert(key, session);
+        if self.sessions.insert(key, session).is_some() {
+            // The old session for the key ends with the new one's start.
+            out.insert(0, Action::Closed { key });
+        }
         Some(out)
     }
 
@@ -394,6 +434,19 @@ impl SessionTable {
             return self.drop_with_bye(key);
         };
         session.last_activity = now;
+        if matches!(session.mode, Mode::Pending { .. }) {
+            // The plaintext was decrypted to keep the nonces in step, and is
+            // dropped: an unconfirmed device buffers nothing and sends nothing
+            // the desktop acts on. Only a rekey has an effect.
+            return match Plaintext::decode(&plain) {
+                Ok(Plaintext::Rekey) => {
+                    session.transport.rekey_incoming();
+                    Vec::new()
+                }
+                Ok(_) => Vec::new(),
+                Err(_) => self.drop_with_bye(key),
+            };
+        }
         match session.reassembler.push(&plain, now) {
             Err(_) => self.drop_with_bye(key),
             Ok(Pushed::Rekey) => {
@@ -1244,5 +1297,168 @@ mod tests {
         let env = json!({"pad": "z".repeat(MAX_REQUEST_BYTES + 1)});
         assert_eq!(h.table.send(key, &env, 0), Err(SendError::TooLarge));
         assert_eq!(h.table.len(), 1);
+    }
+
+    fn hs1_for(dev: &Dev, h: &H, channel: u16, payload: &[u8]) -> Frame {
+        let mut init =
+            Initiator::new(&dev.private, &h.desktop_pub, &DESKTOP, &dev.id, channel).unwrap();
+        frame(
+            FrameType::Hs1,
+            dev.key(channel),
+            init.write_hs1(payload).unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_pending_session_buffers_nothing_and_still_follows_rekeys() {
+        let mut h = h();
+        let dev = Dev::new(1);
+        h.allow(&dev, Lookup::Pending);
+        let key = dev.key(2);
+        let mut init = Initiator::new(&dev.private, &h.desktop_pub, &DESKTOP, &dev.id, 2).unwrap();
+        let hs1 = init.write_hs1(br#"{"name":"x"}"#).unwrap();
+        let actions = h.table.on_frame(frame(FrameType::Hs1, key, hs1), 0);
+        let (_, mut it) = init.read_hs2(&sent(&actions)[0].body).unwrap();
+        let _ = it.decrypt(&sent(&actions)[1].body).unwrap();
+        // Four messages opened with non-final chunks, then a fifth: a confirmed
+        // session would hold four and close on the fifth. Pending holds none.
+        for id in 0..5 {
+            let a = h
+                .table
+                .on_frame(chunk_frame(&mut it, key, id, 0, false, &[b'a'; 4096]), 1);
+            assert!(a.is_empty(), "{a:?}");
+            assert_eq!(h.table.sessions[&key].reassembler.in_flight(), 0);
+        }
+        // A rekey still keeps the nonces and keys in step.
+        let rekey = Plaintext::Rekey.encode().unwrap();
+        let f = frame(FrameType::Transport, key, it.encrypt(&rekey).unwrap());
+        it.rekey_outgoing();
+        assert!(h.table.on_frame(f, 2).is_empty());
+        let a = h
+            .table
+            .on_frame(msg_frame(&mut it, key, &json!({"rid": 1})), 3);
+        assert!(a.is_empty(), "{a:?}");
+        assert_eq!(h.table.len(), 1);
+        // Garbage that is no plaintext at all still closes the session.
+        let f = frame(FrameType::Transport, key, it.encrypt(&[9, 9, 9]).unwrap());
+        assert_closed_with_bye(&h.table.on_frame(f, 4), key);
+    }
+
+    /// A device that shares `like`'s key but connects under another relay id.
+    fn same_key_other_id(like: &Dev, id: u8) -> Dev {
+        Dev {
+            private: like.private,
+            public: like.public,
+            id: [id; 16],
+        }
+    }
+
+    #[test]
+    fn pending_sessions_are_capped_per_key_and_in_total() {
+        let mut h = h();
+        let first = Dev::new(1);
+        h.allow(&first, Lookup::Pending);
+        for id in 1..=MAX_PENDING_PER_FINGERPRINT as u8 {
+            let dev = same_key_other_id(&first, id);
+            let a = h
+                .table
+                .on_frame(hs1_for(&dev, &h, 0, br#"{"name":"x"}"#), 0);
+            assert_eq!(sent(&a)[0].kind, FrameType::Hs2, "{a:?}");
+        }
+        let extra = same_key_other_id(&first, 200);
+        let a = h
+            .table
+            .on_frame(hs1_for(&extra, &h, 0, br#"{"name":"x"}"#), 0);
+        assert!(is_single_bye(&a, extra.key(0)), "{a:?}");
+        assert_eq!(h.table.len(), MAX_PENDING_PER_FINGERPRINT);
+        // Other keys fill the rest of the total, and the next key is refused.
+        let mut next = 10u8;
+        while h.table.len() < MAX_PENDING_TOTAL {
+            let dev = Dev::new(next);
+            next += 1;
+            h.allow(&dev, Lookup::Pending);
+            let a = h
+                .table
+                .on_frame(hs1_for(&dev, &h, 0, br#"{"name":"x"}"#), 0);
+            assert_eq!(sent(&a)[0].kind, FrameType::Hs2, "{a:?}");
+        }
+        let over = Dev::new(250);
+        h.allow(&over, Lookup::Pending);
+        let a = h
+            .table
+            .on_frame(hs1_for(&over, &h, 0, br#"{"name":"x"}"#), 0);
+        assert!(is_single_bye(&a, over.key(0)), "{a:?}");
+        // A confirmed device is not held back by pending ones.
+        let confirmed = Dev::new(251);
+        h.confirmed(&confirmed);
+        let _ = h.connect(&confirmed, 0, 0);
+    }
+
+    #[test]
+    fn a_web_row_without_a_server_device_id_gets_bye() {
+        let mut h = h();
+        let dev = Dev::new(1);
+        h.allow(
+            &dev,
+            Lookup::Confirmed {
+                device: device_row(&dev.fp(), DeviceKind::Web, None),
+            },
+        );
+        let a = h
+            .table
+            .on_frame(hs1_for(&dev, &h, 1, br#"{"name":"x"}"#), 0);
+        assert!(is_single_bye(&a, dev.key(1)), "{a:?}");
+        assert!(h.table.is_empty());
+    }
+
+    #[test]
+    fn a_failed_hs1_leaves_the_live_session_intact() {
+        let mut h = h();
+        let dev = Dev::new(1);
+        h.confirmed(&dev);
+        let key = dev.key(1);
+        let (mut it, _, _) = h.connect(&dev, 1, 0);
+        // A device with an unknown key tries the same relay id and channel.
+        let stranger = same_key_other_id(&Dev::new(1), 1);
+        let a = h
+            .table
+            .on_frame(hs1_for(&stranger, &h, 1, br#"{"name":"x"}"#), 5);
+        assert!(is_single_bye(&a, key), "{a:?}");
+        assert_eq!(h.table.len(), 1);
+        let a = h
+            .table
+            .on_frame(msg_frame(&mut it, key, &json!({"rid": 1})), 6);
+        assert!(matches!(a.as_slice(), [Action::Deliver { .. }]), "{a:?}");
+    }
+
+    #[test]
+    fn untrusted_names_are_cleaned_for_display() {
+        assert_eq!(clean_name("  My \t Laptop \n"), "My Laptop");
+        assert_eq!(
+            clean_name("a\u{202E}b\u{200B}c\u{FEFF}d\u{2066}e\u{2069}f"),
+            "abcdef"
+        );
+        assert_eq!(clean_name("x\u{0}y\u{7f}z\u{85}"), "xyz");
+        assert_eq!(clean_name("a    b"), "a b");
+        assert_eq!(clean_name(""), UNNAMED_DEVICE);
+        assert_eq!(clean_name(" \u{202E}\u{200B} \n "), UNNAMED_DEVICE);
+        let long = format!("{} tail", "n".repeat(MAX_NAME_CHARS - 1));
+        assert_eq!(clean_name(&long), "n".repeat(MAX_NAME_CHARS - 1));
+        assert_eq!(clean_name(&"n".repeat(300)).chars().count(), MAX_NAME_CHARS);
+        // And the cleaned name is the one the prompt gets.
+        let mut h = h();
+        let dev = Dev::new(1);
+        h.allow(&dev, Lookup::Pending);
+        let hs1 = hs1_for(
+            &dev,
+            &h,
+            1,
+            json!({"name": "A\u{202E}B\n"}).to_string().as_bytes(),
+        );
+        let actions = h.table.on_frame(hs1, 0);
+        let Some(Action::Pending { name, .. }) = actions.last() else {
+            panic!("{actions:?}");
+        };
+        assert_eq!(name, "AB");
     }
 }
