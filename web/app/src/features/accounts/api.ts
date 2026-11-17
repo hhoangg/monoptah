@@ -124,6 +124,21 @@ async function toApiError(response: Response): Promise<ApiError> {
   return new ApiError({ status: response.status, code, message, retryAfter });
 }
 
+type UnauthorizedListener = (error: ApiError) => void;
+const unauthorizedListeners = new Set<UnauthorizedListener>();
+
+/**
+ * Listens for a 401 from any route that needs a session (not the public `/api/auth/*` routes, where
+ * a 401 is a normal failure such as a wrong recovery code). Queries and actions all go through
+ * `apiFetch`, so this is the one place that sees an expired session. Returns the unsubscribe function.
+ */
+export function onSessionExpired(listener: UnauthorizedListener): () => void {
+  unauthorizedListeners.add(listener);
+  return () => {
+    unauthorizedListeners.delete(listener);
+  };
+}
+
 /** Calls one registry route. Throws `ApiError` for every failure. */
 export async function apiFetch<Res, Body = undefined>(
   ep: Endpoint<Res, Body>,
@@ -149,7 +164,11 @@ export async function apiFetch<Res, Body = undefined>(
     if (error instanceof DOMException && error.name === "AbortError") throw error;
     throw new ApiError({ status: 0, code: "network", message: "Could not reach the server" });
   }
-  if (!response.ok) throw await toApiError(response);
+  if (!response.ok) {
+    const error = await toApiError(response);
+    if (error.status === 401 && route.auth !== "public") for (const listener of [...unauthorizedListeners]) listener(error);
+    throw error;
+  }
 
   let json: unknown;
   try {
