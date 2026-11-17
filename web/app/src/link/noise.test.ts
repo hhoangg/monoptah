@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { chacha20poly1305 } from "@noble/ciphers/chacha.js";
 import { hexToBytes, bytesToHex } from "@noble/hashes/utils.js";
@@ -12,7 +13,7 @@ import {
   hkdf,
   prologue,
   type KeyPair,
-} from "../src/noise.ts";
+} from "./noise.ts";
 import vectorFile from "./fixtures/noise-ik-chachapoly-sha256-vectors.json" with { type: "json" };
 
 interface NoiseVector {
