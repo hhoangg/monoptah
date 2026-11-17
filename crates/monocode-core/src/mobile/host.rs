@@ -1,8 +1,10 @@
 //! A paired phone controls the workspace through the app that owns it. The
 //! host pairs devices, serves the link and checks every request; the app
 //! answers them from its own state. No arbitrary app commands are exposed.
+use super::audit::{self, AuditEvent, Outcome, Transport};
 use super::catalog::{recent_sessions, session_page};
 use super::identity_store::{self, IdentityKeychain, SystemKeychain};
+use super::policy::{self, DeviceContext};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use monocode_mobile_link::{now, Address, Gate, Identity, WatchSink, PORT, VERSION};
 use serde::{Deserialize, Serialize};
@@ -19,7 +21,7 @@ use std::{
 use tokio::sync::oneshot;
 
 /// Methods the app answers. Pairing, leaving and the catalog are the host's.
-const APP_METHODS: &[&str] = &[
+pub(super) const APP_METHODS: &[&str] = &[
     "conversation.read",
     "conversation.older",
     "models.list",
@@ -51,6 +53,16 @@ const APP_METHODS: &[&str] = &[
     "mono.create",
     "mono.file",
     "mono.saveFile",
+    "session.answerApproval",
+    "cloud.instances",
+    "cloud.stop",
+    "cloud.resume",
+    "cloud.startOptions",
+    "cloud.retryStart",
+    "cloud.keepRunning",
+    "cloud.moveToCloud",
+    "cloud.moveToLocal",
+    "cloud.cancelMove",
 ];
 /// Under the phone's own wait, so it hears why rather than timing out.
 const REPLY_WAIT: Duration = Duration::from_secs(25);
@@ -127,6 +139,8 @@ pub struct Request {
     pub command_id: String,
     pub method: String,
     pub params: Value,
+    /// Who asked, for the app to check what it alone can resolve.
+    pub device: DeviceContext,
     reply: oneshot::Sender<Result<Value, String>>,
 }
 impl Request {
@@ -147,6 +161,8 @@ pub struct WatchStart {
     pub from: Option<String>,
     /// The phone takes field edits and text suffixes.
     pub incremental: bool,
+    /// Who asked, for the app to check what it alone can resolve.
+    pub device: DeviceContext,
     accept: oneshot::Sender<Result<(), String>>,
 }
 impl WatchStart {
@@ -410,7 +426,7 @@ impl MobileHost {
         if let Some(device) = config.devices.iter().find(|v| v.id == device_id) {
             self.gate.remove(&device.fingerprint);
             let peer = device.fingerprint.clone();
-            inner.watches.retain(|_, watch| watch.peer != peer);
+            close_device_watches(&mut inner, &peer);
         }
         config.devices.retain(|device| device.id != device_id);
         self.save(&config)?;
@@ -661,23 +677,40 @@ impl MobileHost {
                 .find(|device| device.fingerprint == peer)
                 .ok_or("Device revoked or not paired")?
                 .clone();
+            let context = DeviceContext::phone(&device);
+            policy::authorize(&context, method, &params).map_err(|denial| denial.error)?;
+            audit::record(&context, &audit_event(&device, method, &request));
             match method {
+                "device.selection" => {
+                    let answer = policy::device_selection(&context, &params)?;
+                    if answer.narrowed.is_some() {
+                        // The persisted selection lands with the Device fields;
+                        // the open watches end so they reopen under it.
+                        close_device_watches(&mut inner, peer);
+                    }
+                    return Ok(answer.reply);
+                }
                 "device.leave" => {
                     let mut config = inner.config.clone();
                     config.devices.retain(|v| v.id != device.id);
                     self.save(&config)?;
                     inner.config = config;
                     self.gate.remove(peer);
-                    inner.watches.retain(|_, watch| watch.peer != peer);
+                    close_device_watches(&mut inner, peer);
                     return Ok(Value::Null);
                 }
                 "workspace.list" => {
                     let mut catalog = inner.catalog.clone();
                     catalog["sessions"] = json!(recent_sessions(&catalog["sessions"]));
                     catalog["addresses"] = json!(addresses(&inner));
+                    policy::filter_reply(&context, method, &mut catalog);
                     return Ok(catalog);
                 }
-                "sessions.list" => return Ok(session_page(&inner.catalog["sessions"], &params)),
+                "sessions.list" => {
+                    let mut page = session_page(&inner.catalog["sessions"], &params);
+                    policy::filter_reply(&context, method, &mut page);
+                    return Ok(page);
+                }
                 "device.push" => {
                     let push = push_registration(&params)?;
                     let mut config = inner.config.clone();
@@ -693,7 +726,7 @@ impl MobileHost {
             if !APP_METHODS.contains(&method) {
                 return Err("Unsupported mobile operation".into());
             }
-            device
+            context
         };
         let command_id = request["id"]
             .as_str()
@@ -710,6 +743,7 @@ impl MobileHost {
                 command_id: format!("{}:{command_id}", device.id),
                 method: method.into(),
                 params,
+                device,
                 reply,
             }))
             .is_ok();
@@ -745,19 +779,25 @@ impl MobileHost {
             .ok_or("Missing workspace item")?
             .to_string();
         let id = uuid::Uuid::new_v4().to_string();
-        {
+        let context = {
             let mut inner = self.inner.lock().map_err(unavailable)?;
             if !inner.config.enabled {
                 return Err("Mobile access disabled".into());
             }
-            if !inner
+            let device = inner
                 .config
                 .devices
                 .iter()
-                .any(|device| device.fingerprint == peer)
-            {
-                return Err("Device revoked or not paired".into());
-            }
+                .find(|device| device.fingerprint == peer)
+                .ok_or("Device revoked or not paired")?
+                .clone();
+            let context = DeviceContext::phone(&device);
+            policy::authorize(&context, "conversation.watch", params)
+                .map_err(|denial| denial.error)?;
+            audit::record(
+                &context,
+                &audit_event(&device, "conversation.watch", &request),
+            );
             inner.watches.retain(|_, watch| !watch.sink.is_closed());
             if inner
                 .watches
@@ -775,7 +815,8 @@ impl MobileHost {
                     sink: sink.clone(),
                 },
             );
-        }
+            context
+        };
         let (accept, accepted) = oneshot::channel();
         let start = Event::Watch(WatchStart {
             id: id.clone(),
@@ -786,6 +827,7 @@ impl MobileHost {
                 .filter(|from| from.len() <= 256)
                 .map(Into::into),
             incremental: params["incremental"] == true,
+            device: context,
             accept,
         });
         let accepted = if self.events.try_send(start).is_ok() {
@@ -842,6 +884,26 @@ impl MobileHost {
     }
     pub(super) fn is_shut_down(&self) -> bool {
         self.shut_down.load(Ordering::SeqCst)
+    }
+}
+
+/// Ends every open watch of the device behind `peer`, as its selection,
+/// permission or pairing changed. The phone reopens, and the app checks the
+/// new access again.
+fn close_device_watches(inner: &mut Inner, peer: &str) {
+    inner.watches.retain(|_, watch| watch.peer != peer);
+}
+
+/// What the audit log records of a call: who, how and which method, never the
+/// parameters.
+fn audit_event(device: &Device, method: &str, request: &Value) -> AuditEvent {
+    AuditEvent {
+        fingerprint_prefix: device.fingerprint.chars().take(8).collect(),
+        transport: Transport::Quic,
+        method: method.into(),
+        project_id: request["params"]["projectId"].as_str().map(Into::into),
+        outcome: Outcome::Ok,
+        command_id: request["id"].as_str().map(Into::into),
     }
 }
 
@@ -1063,6 +1125,68 @@ mod tests {
             )
             .await
             .is_err());
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn requests_carry_the_phone_context_and_new_methods_reach_the_app() {
+        let (host, events, peer) = paired();
+        let device = host.inner.lock().unwrap().config.devices[0].clone();
+        let answering = tokio::spawn(async move {
+            for method in ["session.answerApproval", "cloud.stop"] {
+                let Ok(Event::Request(request)) = events.recv().await else {
+                    panic!("expected a request");
+                };
+                assert_eq!(request.method, method);
+                assert_eq!(request.device, DeviceContext::phone(&device));
+                request.reply(Err("Unsupported mobile operation".into()));
+            }
+        });
+        for method in ["session.answerApproval", "cloud.stop"] {
+            let error = host
+                .handle(
+                    &peer,
+                    json!({"version":VERSION,"id":method,"method":method,"params":{}}),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error, "Unsupported mobile operation");
+        }
+        answering.await.unwrap();
+        // device.selection is the host's and answers as an unknown method did.
+        let error = host
+            .handle(
+                &peer,
+                json!({"version":VERSION,"id":"s","method":"device.selection","params":{}}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, "Unsupported mobile operation");
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn closing_a_devices_watches_leaves_other_devices_alone() {
+        let (host, _events, peer) = paired();
+        {
+            let mut inner = host.inner.lock().unwrap();
+            for (id, owner) in [
+                ("w1", peer.as_str()),
+                ("w2", peer.as_str()),
+                ("w3", "other"),
+            ] {
+                let (sink, _receiver) = tokio::sync::mpsc::channel::<Value>(1);
+                inner.watches.insert(
+                    id.into(),
+                    Watcher {
+                        peer: owner.into(),
+                        sink,
+                    },
+                );
+            }
+            close_device_watches(&mut inner, &peer);
+            assert_eq!(inner.watches.keys().collect::<Vec<_>>(), ["w3"]);
+        }
         std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
     }
 

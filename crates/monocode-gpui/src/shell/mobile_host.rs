@@ -4,17 +4,19 @@
 use super::*;
 use crate::{
     accounts::Tone,
-    mobile::{catalog as mobile_catalog, project, transcript as turns},
+    mobile::{approvals, catalog as mobile_catalog, cloud, project, transcript as turns},
     notifications::delivery,
     pickers,
 };
 use gpui::{EntityId, Task};
 use monocode_core::{
     agent::{AccessMode, Settings, TurnInfo},
-    mobile::{Event, Invite, MobileHost, Push, Request, Status, WatchStart, notify, watch},
+    mobile::{
+        Event, Invite, MobileHost, Push, Request, Status, WatchStart, notify, watch, web_link,
+    },
     transcript::Row,
 };
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
@@ -225,6 +227,7 @@ impl Shell {
                 return;
             }
         };
+        web_link::start(&host);
         self.mobile.host = Some(host);
         // Close the link and release the router mapping with the app.
         cx.on_app_quit(|this, _| {
@@ -413,7 +416,9 @@ impl Shell {
                 let key = monocode_core::files::path_key(&summary.cwd);
                 let project = paths
                     .iter()
-                    .find(|path| monocode_core::files::path_key(path) == key)?;
+                    .find(|path| monocode_core::files::path_key(path) == key)
+                    .map(|path| project_id(path))
+                    .or_else(|| cloud::catalog_project_of(summary))?;
                 let live = self.sessions.get(&id).map(|view| {
                     let view = view.read(cx);
                     mobile_catalog::LiveSession {
@@ -435,7 +440,7 @@ impl Shell {
                 });
                 Some(CatalogEntry {
                     id,
-                    project: project_id(project),
+                    project,
                     summary: summary.clone(),
                     live,
                 })
@@ -741,6 +746,10 @@ impl Shell {
                 request.reply(Ok(project::file_highlight(&job, from)));
             }
             "project.gitAction" => self.mobile_git_action(request, cx),
+            "cloud.instances" | "cloud.startOptions" => {
+                let result = cloud::dispatch(self, &method, &request.params, cx);
+                request.reply(result);
+            }
             method if method.starts_with("project.") => self.mobile_project(request, cx),
             _ => self.mobile_command(request, window, cx),
         }
@@ -897,8 +906,13 @@ impl Shell {
                 "question": snapshot.question,
             })))
         };
+        let fields = if older {
+            Map::new()
+        } else {
+            self.mobile_read_fields(&target, cx)
+        };
         match self.with_live_snapshot(&target, cx, &page) {
-            Some(Ok(Read::Done(value))) => request.reply(Ok(value)),
+            Some(Ok(Read::Done(value))) => request.reply(Ok(merge_fields(value, fields))),
             Some(Ok(Read::Page(cursor))) => {
                 self.mobile_older_page(request, &target, cursor, None, limit, cx)
             }
@@ -907,7 +921,7 @@ impl Shell {
                 let load = self.load_saved(&target, cx);
                 cx.spawn(async move |this, cx| {
                     match load.await.and_then(|saved| page(&saved_snapshot(&saved))) {
-                        Ok(Read::Done(value)) => request.reply(Ok(value)),
+                        Ok(Read::Done(value)) => request.reply(Ok(merge_fields(value, fields))),
                         Ok(Read::Page(cursor)) => {
                             let _ = this.update(cx, |this, cx| {
                                 this.mobile_older_page(request, &target, cursor, None, limit, cx)
@@ -919,6 +933,26 @@ impl Shell {
                 .detach();
             }
         }
+    }
+
+    /// The cloud and approval fields a conversation read adds for a session.
+    fn mobile_read_fields(&self, target: &Target, cx: &App) -> Map<String, Value> {
+        let Target::Session(id) = target else {
+            return Map::new();
+        };
+        let mut fields = cloud::read_fields(*id, cx);
+        fields.extend(approvals::read_fields(*id, cx));
+        fields
+    }
+
+    /// The cloud and approval fields a watch frame adds for a session.
+    fn mobile_frame_fields(&self, target: &Target, cx: &App) -> Value {
+        let Target::Session(id) = target else {
+            return Value::Null;
+        };
+        let mut fields = cloud::frame_fields(*id, cx);
+        fields.extend(approvals::frame_fields(*id, cx));
+        Value::Object(fields)
     }
 
     /// Turns from the store page at `cursor`, above the loaded rows: before
@@ -1186,6 +1220,10 @@ impl Shell {
             };
             let (from, older, built, busy, question, usage_limit) = built;
             watch.from = from;
+            let extra = self.mobile_frame_fields(&target, cx);
+            let Some(watch) = self.mobile.watches.get_mut(&id) else {
+                continue;
+            };
             let Some((update, baseline)) = watch::update(
                 watch.baseline.as_ref(),
                 busy,
@@ -1194,6 +1232,7 @@ impl Shell {
                 &built,
                 incremental,
                 &usage_limit,
+                &extra,
             ) else {
                 continue;
             };
@@ -1324,6 +1363,14 @@ impl Shell {
             "mono.reset" => self.mobile_mono_reset(request, finish, cx),
             "session.start" => self.mobile_start(request, finish, cx),
             "conversation.send" => self.mobile_send(request, finish, cx),
+            "session.answerApproval" => {
+                let result = approvals::dispatch(self, &request.method, &request.params, cx);
+                finish(self, request, result);
+            }
+            method if method.starts_with("cloud.") => {
+                let result = cloud::dispatch(self, method, &request.params, cx);
+                finish(self, request, result);
+            }
             _ => {
                 let result =
                     self.mobile_session_command(&request.method, &request.params, window, cx);
@@ -1432,11 +1479,13 @@ impl Shell {
             }
             ("session.archive", Target::Session(id)) => {
                 if !self.session_metadata(*id, cx).summary.archived {
+                    cloud::before_archive(self, *id, params, cx)?;
                     self.toggle_archive_now(*id, cx);
                 }
                 Ok(reply)
             }
             ("session.delete", Target::Session(id)) => {
+                cloud::before_delete(self, *id, cx)?;
                 self.delete_session(*id, window, cx);
                 Ok(reply)
             }
@@ -1475,6 +1524,9 @@ impl Shell {
         finish: impl FnOnce(&mut Shell, Request, Result<Value, String>) + 'static,
         cx: &mut Context<Self>,
     ) {
+        if let Err(error) = cloud::before_send(self, &request.params, cx) {
+            return finish(self, request, Err(error));
+        }
         let conversation = string(&request.params, "conversationId").unwrap_or_default();
         let staged = (|| {
             let target = self.mobile_target(&conversation, cx)?;
@@ -1533,6 +1585,7 @@ impl Shell {
         let params = request.params.clone();
         let prepared = (|| {
             let text = message_text(&params)?;
+            cloud::start_target(self, &params, cx)?;
             let cwd =
                 self.mobile_project_path(&string(&params, "projectId").unwrap_or_default(), cx)?;
             let (default_kind, default_model, default_access) = self.mobile_defaults(&cwd, cx);
@@ -1707,6 +1760,14 @@ impl Shell {
         } else {
             category
         };
+        let session_id = self.mobile_session_id(id);
+        let (project, _) = self.mobile_notice_project(summary, cx);
+        notify::notify_web(&notify::WebNotice {
+            category,
+            session_id: &session_id,
+            mono_id: None,
+            project: &project,
+        });
         self.send_mobile_notice(category, notice, cx);
     }
 
@@ -2292,6 +2353,16 @@ impl Shell {
     }
 }
 
+/// Adds `fields` to a read result, leaving every field it already has.
+fn merge_fields(mut value: Value, fields: Map<String, Value>) -> Value {
+    if let Value::Object(object) = &mut value {
+        for (key, field) in fields {
+            object.entry(key).or_insert(field);
+        }
+    }
+    value
+}
+
 fn tone_id(tone: Tone) -> &'static str {
     match tone {
         Tone::Ready => "ready",
@@ -2575,6 +2646,59 @@ mod tests {
                     vec![blank],
                     "a real conversation with a default title is still history"
                 );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn the_cloud_and_approval_hooks_leave_what_a_phone_sees_unchanged(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, id, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                let target = Target::Session(id);
+                // A read result gains no field.
+                assert!(shell.mobile_read_fields(&target, cx).is_empty());
+                let read = json!({"id": "c", "turns": [], "busy": false});
+                assert_eq!(merge_fields(read.clone(), Map::new()), read);
+                // A watch frame with the stub fields equals one with none.
+                let extra = shell.mobile_frame_fields(&target, cx);
+                assert_eq!(extra, json!({}));
+                let none = Value::Null;
+                let turns = [json!({"id": "1", "items": []})];
+                let plain = watch::update(None, true, false, &none, &turns, false, &none, &none);
+                let hooked = watch::update(None, true, false, &none, &turns, false, &none, &extra);
+                assert_eq!(plain.unwrap().0, hooked.unwrap().0);
+                // The new methods answer as an unknown method did.
+                for method in [
+                    "cloud.instances",
+                    "cloud.startOptions",
+                    "cloud.stop",
+                    "cloud.resume",
+                    "cloud.retryStart",
+                    "cloud.keepRunning",
+                    "cloud.moveToCloud",
+                    "cloud.moveToLocal",
+                    "cloud.cancelMove",
+                ] {
+                    assert_eq!(
+                        cloud::dispatch(shell, method, &json!({}), cx),
+                        Err("Unsupported mobile operation".into()),
+                        "{method}"
+                    );
+                }
+                assert_eq!(
+                    approvals::dispatch(shell, "session.answerApproval", &json!({}), cx),
+                    Err("Unsupported mobile operation".into())
+                );
+                // Archive, delete, send and start are never refused by the stubs.
+                assert_eq!(cloud::before_archive(shell, id, &json!({}), cx), Ok(()));
+                assert_eq!(cloud::before_delete(shell, id, cx), Ok(()));
+                assert_eq!(cloud::before_send(shell, &json!({}), cx), Ok(()));
+                assert_eq!(cloud::start_target(shell, &json!({}), cx), Ok(()));
+                let summary = shell.session_metadata(id, cx).summary;
+                assert_eq!(cloud::catalog_project_of(summary), None);
             })
             .unwrap();
     }

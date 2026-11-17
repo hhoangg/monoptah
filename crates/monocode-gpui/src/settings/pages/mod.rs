@@ -16,6 +16,8 @@ mod monos;
 mod providers;
 mod skills;
 mod ticket_scoring;
+mod web_activity;
+mod web_app;
 mod worktrees;
 
 pub(super) use appearance::parse_hex;
