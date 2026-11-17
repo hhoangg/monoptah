@@ -237,7 +237,7 @@ describe("forced regenerate", () => {
     expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
     await user.click(screen.getByLabelText("I saved these codes"));
     await user.click(screen.getByRole("button", { name: "Continue" }));
-    await waitFor(() => expect(screen.getByTestId("route-stub")).toBeInTheDocument());
+    await screen.findByRole("heading", { level: 1, name: "Settings" });
   });
 });
 

@@ -112,11 +112,13 @@ beforeEach(() => {
 });
 afterEach(() => restoreTransport?.());
 
-// Routes whose stub was replaced by a real screen (W-02): they render one h1 instead of the stub.
+// Routes whose stub was replaced by a real screen (W-02, W-11): they render one h1 instead of the stub.
 const SCREENS: Record<string, string> = {
   "/login": "Sign in to Monoptah",
   "/register": "Create your account",
   "/recover": "Recover your account",
+  "/settings": "Settings",
+  "/install": "Install Monoptah",
 };
 
 async function renderAt(url: string) {

@@ -1,6 +1,7 @@
 import { HugeiconsIcon, type IconSvgElement } from "@hugeicons/react";
 import {
   Add01Icon,
+  AddSquareIcon,
   AlertCircleIcon,
   Archive01Icon,
   ArrowDown01Icon,
@@ -10,6 +11,7 @@ import {
   BubbleChatIcon,
   Cancel01Icon,
   ChartBreakoutSquareIcon,
+  CheckmarkCircle02Icon,
   CircleIcon,
   ComputerIcon,
   ComputerRemoveIcon,
@@ -30,6 +32,7 @@ import {
   InformationCircleIcon,
   Key01Icon,
   Layers01Icon,
+  LaptopIcon,
   LayoutAlignRightIcon,
   LeftToRightListBulletIcon,
   Link01Icon,
@@ -41,6 +44,7 @@ import {
   MinusSignIcon,
   Moon02Icon,
   MoreHorizontalIcon,
+  MoreVerticalIcon,
   Note01Icon,
   Notification01Icon,
   PencilEdit01Icon,
@@ -50,6 +54,8 @@ import {
   Robot01Icon,
   Search01Icon,
   Settings01Icon,
+  Share01Icon,
+  SmartPhone01Icon,
   Shield01Icon,
   SourceCodeIcon,
   SparklesIcon,
@@ -130,6 +136,12 @@ export const ICONS = {
   alert: AlertCircleIcon,
   fingerprint: FingerPrintIcon,
   spinner: Loading03Icon,
+  share: Share01Icon,
+  addSquare: AddSquareIcon,
+  moreVertical: MoreVerticalIcon,
+  smartphone: SmartPhone01Icon,
+  laptop: LaptopIcon,
+  success: CheckmarkCircle02Icon,
 } as const satisfies Record<string, IconSvgElement>;
 
 export type IconName = keyof typeof ICONS;
