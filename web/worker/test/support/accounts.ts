@@ -134,9 +134,19 @@ export function fakeRoomNamespace(): { namespace: TestEnv["ROOM"]; calls: RoomRe
   return { namespace: namespace as unknown as TestEnv["ROOM"], calls };
 }
 
+/**
+ * An environment that reads `values` and falls back to `testEnv`. The values are own properties of a new object:
+ * assigning through `Object.create(testEnv)` would call the setter of the real `env` and change it for every later
+ * test of the file.
+ */
+function overlay(testEnv: TestEnv, values: Record<string, unknown>): TestEnv {
+  const own = Object.fromEntries(Object.entries(values).map(([key, value]) => [key, { value, enumerable: true, writable: true, configurable: true }]));
+  return Object.create(testEnv, own) as TestEnv;
+}
+
 /** The test environment with `ROOM` replaced by a double. */
 export function withRoom(testEnv: TestEnv, fake: { namespace: TestEnv["ROOM"] }): TestEnv {
-  return Object.assign(Object.create(testEnv) as TestEnv, { ROOM: fake.namespace });
+  return overlay(testEnv, { ROOM: fake.namespace });
 }
 
 /** All `Set-Cookie` values of a response. */
@@ -190,7 +200,7 @@ export async function createTestInvite(testEnv: TestEnv, options: CreateTestInvi
 
 /** The test environment with vars replaced, for example `withVars(env, { MAX_USERS: "2" })`. */
 export function withVars(testEnv: TestEnv, vars: Partial<Record<"MAX_USERS" | "RP_ID" | "RP_ORIGIN", string>>): TestEnv {
-  return Object.assign(Object.create(testEnv) as TestEnv, vars);
+  return overlay(testEnv, vars);
 }
 
 let ipCounter = 0;
