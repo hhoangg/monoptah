@@ -4,7 +4,7 @@
 use super::audit::{self, AuditEvent, Outcome, Transport};
 use super::catalog::{recent_sessions, session_page};
 use super::identity_store::{self, IdentityKeychain, SystemKeychain};
-use super::policy::{self, DeviceContext, DeviceKind};
+use super::policy::{self, DeviceContext, DeviceKind, Permission};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use monocode_mobile_link::{now, Address, Gate, Identity, WatchSink, PORT, VERSION};
 use serde::{Deserialize, Serialize};
@@ -78,6 +78,51 @@ pub struct Device {
     /// Where the phone is notified while its app is closed, once it asks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub push: Option<PushRegistration>,
+    /// A QUIC phone (every row an earlier version wrote) or a web device.
+    #[serde(default = "phone_kind", skip_serializing_if = "is_phone_kind")]
+    pub kind: DeviceKind,
+    #[serde(default = "control_permission", skip_serializing_if = "is_control")]
+    pub permission: Permission,
+    /// The projects the device may see; `None` means all of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projects: Option<Vec<String>>,
+    /// The Monos the device may see; `None` means all of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monos: Option<Vec<String>>,
+    /// The relay's id for a web device. Phones have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_device_id: Option<String>,
+    /// Unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<u64>,
+    /// Unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<u64>,
+}
+
+fn phone_kind() -> DeviceKind {
+    DeviceKind::Phone
+}
+fn is_phone_kind(kind: &DeviceKind) -> bool {
+    *kind == DeviceKind::Phone
+}
+fn control_permission() -> Permission {
+    Permission::Control
+}
+fn is_control(permission: &Permission) -> bool {
+    *permission == Permission::Control
+}
+
+/// The context of a request from the stored device. For a phone row an earlier
+/// version wrote, this equals `DeviceContext::phone`.
+fn device_context(device: &Device) -> DeviceContext {
+    DeviceContext {
+        id: device.id.clone(),
+        kind: device.kind,
+        permission: device.permission,
+        projects: device.projects.clone(),
+        monos: device.monos.clone(),
+    }
 }
 
 /// A phone's Expo push token and the notification categories it turned off.
@@ -637,6 +682,13 @@ impl MobileHost {
             name,
             fingerprint: fingerprint.clone(),
             push: None,
+            kind: DeviceKind::Phone,
+            permission: Permission::Control,
+            projects: None,
+            monos: None,
+            server_device_id: None,
+            created_at: None,
+            last_seen: None,
         });
         self.save(&config)?;
         inner.config = config;
@@ -701,7 +753,7 @@ impl MobileHost {
                 .find(|device| device.fingerprint == peer)
                 .ok_or("Device revoked or not paired")?
                 .clone();
-            let context = DeviceContext::phone(&device);
+            let context = device_context(&device);
             *audited = Some((context.clone(), audit_event(&device, method, request)));
             if let Err(denial) = policy::authorize(&context, method, &params) {
                 mark_denied(audited, &denial);
@@ -710,7 +762,7 @@ impl MobileHost {
             match method {
                 "device.selection" => {
                     let answer = policy::device_selection(&context, &params)?;
-                    return answer_selection(&mut inner, peer, answer);
+                    return self.answer_selection(&mut inner, peer, answer);
                 }
                 "device.leave" => {
                     let mut config = inner.config.clone();
@@ -831,7 +883,7 @@ impl MobileHost {
                 .find(|device| device.fingerprint == peer)
                 .ok_or("Device revoked or not paired")?
                 .clone();
-            let context = DeviceContext::phone(&device);
+            let context = device_context(&device);
             *audited = Some((
                 context.clone(),
                 audit_event(&device, "conversation.watch", request),
@@ -941,7 +993,10 @@ fn close_device_watches(inner: &mut Inner, peer: &str) {
 fn audit_event(device: &Device, method: &str, request: &Value) -> AuditEvent {
     AuditEvent {
         fingerprint_prefix: device.fingerprint.chars().take(8).collect(),
-        transport: Transport::Quic,
+        transport: match device.kind {
+            DeviceKind::Phone => Transport::Quic,
+            DeviceKind::Web => Transport::Web,
+        },
         method: method.into(),
         project_id: request["params"]["projectId"].as_str().map(Into::into),
         outcome: Outcome::Ok,
@@ -949,31 +1004,68 @@ fn audit_event(device: &Device, method: &str, request: &Value) -> AuditEvent {
     }
 }
 
-/// The reply to `device.selection`. Fails closed: nothing can persist a
-/// narrower selection until `Device` has selection fields, so claiming success
-/// would leave the device with full access. R-07 / H-02 replace this with the
-/// host's `save`.
-fn selection_reply(answer: policy::SelectionAnswer) -> Result<Value, String> {
-    if answer.narrowed.is_some() {
-        return Err("Unsupported mobile operation".into());
+impl MobileHost {
+    /// Answers `device.selection`. A narrower selection is written into the
+    /// device's row first; the device's watches end only once it is saved. A
+    /// save failure leaves the config and the watches as they were.
+    fn answer_selection(
+        &self,
+        inner: &mut Inner,
+        peer: &str,
+        answer: policy::SelectionAnswer,
+    ) -> Result<Value, String> {
+        if let Some(selection) = answer.narrowed {
+            let mut config = inner.config.clone();
+            let device = config
+                .devices
+                .iter_mut()
+                .find(|device| device.fingerprint == peer)
+                .ok_or("Device revoked or not paired")?;
+            device.projects = selection.projects;
+            device.monos = selection.monos;
+            self.save(&config)?;
+            inner.config = config;
+            close_device_watches(inner, peer);
+        }
+        Ok(answer.reply)
     }
-    Ok(answer.reply)
-}
 
-/// Answers `device.selection`. The device's watches end only when a change is
-/// actually applied, never for a refused one.
-fn answer_selection(
-    inner: &mut Inner,
-    peer: &str,
-    answer: policy::SelectionAnswer,
-) -> Result<Value, String> {
-    let narrowed = answer.narrowed.is_some();
-    let reply = selection_reply(answer)?;
-    if narrowed {
-        // Reached once the selection is saved (R-07 / H-02).
-        close_device_watches(inner, peer);
+    fn web_database(&self) -> Result<PathBuf, String> {
+        self.path
+            .parent()
+            .and_then(crate::accounts::database_for)
+            .ok_or_else(|| identity_store::UNAVAILABLE.to_owned())
     }
-    Ok(reply)
+
+    /// The web link's sealed identity. `Ok(None)` means none was saved.
+    #[allow(dead_code)] // Used by the web link session once it lands.
+    pub(crate) fn load_web_identity(&self) -> Result<Option<identity_store::WebIdentity>, String> {
+        identity_store::load_web(
+            &self.web_database()?,
+            &identity_store::web_account_for(&self.path),
+        )
+    }
+
+    /// Seals the web identity. Its token never goes to `mobile-access.json`.
+    #[allow(dead_code)] // Used by the web link pairing once it lands.
+    pub(crate) fn save_web_identity(
+        &self,
+        identity: &identity_store::WebIdentity,
+    ) -> Result<(), String> {
+        identity_store::save_web(
+            &self.web_database()?,
+            &identity_store::web_account_for(&self.path),
+            identity,
+        )
+    }
+
+    /// Unpairs the web link by wiping its sealed identity. Safe to repeat.
+    pub fn web_unpair(&self) -> Result<(), String> {
+        identity_store::wipe_web(
+            &self.web_database()?,
+            &identity_store::web_account_for(&self.path),
+        )
+    }
 }
 
 /// The outcome to record once a call ended: a call that was admitted and then
@@ -1037,6 +1129,141 @@ fn name() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn phone_row() -> Device {
+        Device {
+            id: "d".into(),
+            name: "Phone".into(),
+            fingerprint: "abcdef0123456789".into(),
+            push: None,
+            kind: DeviceKind::Phone,
+            permission: Permission::Control,
+            projects: None,
+            monos: None,
+            server_device_id: None,
+            created_at: None,
+            last_seen: None,
+        }
+    }
+
+    /// `mobile-access.json` exactly as the code before the web link wrote it.
+    const OLD_CONFIG: &str = r#"{"enabled":true,"openRouter":false,"remoteAddress":"203.0.113.5:4433","devices":[{"id":"d1","name":"iPhone","fingerprint":"aaaa1111bbbb2222","push":{"token":"ExponentPushToken[abc]","disabled":["agentFinished"]}},{"id":"d2","name":"Pixel","fingerprint":"cccc3333dddd4444"}]}"#;
+
+    fn host_in(dir: &std::path::Path) -> MobileHost {
+        MobileHost::open(dir.join("mobile-access.json")).unwrap().0
+    }
+
+    #[test]
+    fn an_old_config_loads_every_device_as_a_controlling_phone_and_saves_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mobile-access.json"), OLD_CONFIG).unwrap();
+        let host = host_in(dir.path());
+        let config = host.inner.lock().unwrap().config.clone();
+        assert_eq!(config.devices.len(), 2);
+        for device in &config.devices {
+            assert_eq!(device.kind, DeviceKind::Phone);
+            assert_eq!(device.permission, Permission::Control);
+            assert_eq!((&device.projects, &device.monos), (&None, &None));
+            assert!(device.server_device_id.is_none());
+            assert!(device.created_at.is_none() && device.last_seen.is_none());
+            assert_eq!(device_context(device), DeviceContext::phone(device));
+        }
+        assert_eq!(
+            config.devices[0].push.as_ref().unwrap().disabled,
+            ["agentFinished"]
+        );
+        host.save(&config).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("mobile-access.json")).unwrap(),
+            OLD_CONFIG
+        );
+    }
+
+    #[test]
+    fn a_web_device_row_round_trips_with_every_new_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host_in(dir.path());
+        let web = Device {
+            id: "w1".into(),
+            name: "Browser".into(),
+            fingerprint: "eeee5555ffff6666".into(),
+            push: None,
+            kind: DeviceKind::Web,
+            permission: Permission::Read,
+            projects: Some(vec!["p1".into()]),
+            monos: Some(vec![]),
+            server_device_id: Some("srv-1".into()),
+            created_at: Some(1_700_000_000),
+            last_seen: Some(1_700_000_500),
+        };
+        let mut config = host.inner.lock().unwrap().config.clone();
+        config.devices.push(web.clone());
+        host.save(&config).unwrap();
+        let text = std::fs::read_to_string(dir.path().join("mobile-access.json")).unwrap();
+        assert!(text.contains("\"serverDeviceId\":\"srv-1\""), "{text}");
+        let reopened = host_in(dir.path());
+        let loaded = reopened.inner.lock().unwrap().config.devices[0].clone();
+        assert_eq!(loaded, web);
+        let context = device_context(&loaded);
+        assert_eq!(context.kind, DeviceKind::Web);
+        assert_eq!(context.permission, Permission::Read);
+        assert_eq!(context.projects, Some(vec!["p1".to_owned()]));
+        assert_eq!(context.monos, Some(vec![]));
+        assert_eq!(
+            audit_event(&loaded, "workspace.list", &json!({})).transport,
+            Transport::Web
+        );
+        assert_eq!(
+            audit_event(&phone_row(), "workspace.list", &json!({})).transport,
+            Transport::Quic
+        );
+    }
+
+    fn host_with_store() -> (tempfile::TempDir, MobileHost) {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("store.db");
+        rusqlite::Connection::open(&database).unwrap();
+        crate::accounts::register_database(dir.path(), &database);
+        let host = host_in(dir.path());
+        (dir, host)
+    }
+
+    fn web_identity() -> identity_store::WebIdentity {
+        identity_store::WebIdentity {
+            static_private: [3; 32],
+            static_public: [4; 32],
+            desktop_id: "desktop-9".into(),
+            desktop_token: "test-token-not-real".into(),
+            relay_url: "wss://relay.example.test/ws".into(),
+        }
+    }
+
+    #[test]
+    fn the_web_token_never_reaches_the_settings_file_and_unpair_wipes_it() {
+        let (dir, host) = host_with_store();
+        assert_eq!(host.load_web_identity(), Ok(None));
+        host.save_web_identity(&web_identity()).unwrap();
+        assert_eq!(host.load_web_identity(), Ok(Some(web_identity())));
+        let mut config = host.inner.lock().unwrap().config.clone();
+        config.enabled = true;
+        host.save(&config).unwrap();
+        let bytes = std::fs::read(dir.path().join("mobile-access.json")).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("test-token-not-real"));
+        assert!(!text.contains("relay.example.test"));
+        host.web_unpair().unwrap();
+        assert_eq!(host.load_web_identity(), Ok(None));
+        host.web_unpair().unwrap();
+    }
+
+    #[test]
+    fn the_web_identity_needs_a_registered_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host_in(dir.path());
+        assert!(host.load_web_identity().is_err());
+        assert!(host.save_web_identity(&web_identity()).is_err());
+        assert!(host.web_unpair().is_err());
+    }
 
     fn fixture() -> (
         MobileHost,
@@ -1256,26 +1483,6 @@ mod tests {
     }
 
     #[test]
-    fn a_narrower_selection_that_cannot_be_saved_is_refused() {
-        let narrowed = policy::SelectionAnswer {
-            reply: json!({"ok": true}),
-            narrowed: Some(policy::Selection {
-                projects: Some(vec!["p".into()]),
-                monos: None,
-            }),
-        };
-        assert_eq!(
-            selection_reply(narrowed),
-            Err("Unsupported mobile operation".into())
-        );
-        let plain = policy::SelectionAnswer {
-            reply: json!({"ok": true}),
-            narrowed: None,
-        };
-        assert_eq!(selection_reply(plain), Ok(json!({"ok": true})));
-    }
-
-    #[test]
     fn the_recorded_outcome_follows_the_call() {
         assert_eq!(final_outcome(Outcome::Ok, false), Outcome::Ok);
         assert_eq!(final_outcome(Outcome::Ok, true), Outcome::Error);
@@ -1286,6 +1493,7 @@ mod tests {
             name: "Phone".into(),
             fingerprint: "abcdef0123456789".into(),
             push: None,
+            ..phone_row()
         };
         let request = json!({"id": "c", "params": {}});
         let mut audited = Some((
@@ -1305,28 +1513,110 @@ mod tests {
         );
     }
 
+    fn narrowed(
+        projects: Option<Vec<String>>,
+        monos: Option<Vec<String>>,
+    ) -> policy::SelectionAnswer {
+        policy::SelectionAnswer {
+            reply: json!({"ok": true}),
+            narrowed: Some(policy::Selection { projects, monos }),
+        }
+    }
+
+    fn watch(inner: &mut Inner, id: &str, peer: &str) {
+        let (sink, _receiver) = tokio::sync::mpsc::channel::<Value>(1);
+        inner.watches.insert(
+            id.into(),
+            Watcher {
+                peer: peer.into(),
+                sink,
+            },
+        );
+    }
+
+    #[test]
+    fn a_narrower_selection_is_saved_and_closes_the_devices_watches() {
+        let (host, _events, peer) = paired();
+        {
+            let mut inner = host.inner.lock().unwrap();
+            watch(&mut inner, "w", &peer);
+            watch(&mut inner, "other", "someone-else");
+            let reply = host
+                .answer_selection(
+                    &mut inner,
+                    &peer,
+                    narrowed(Some(vec!["p".into()]), Some(vec![])),
+                )
+                .unwrap();
+            assert_eq!(reply, json!({"ok": true}));
+            assert_eq!(inner.watches.keys().collect::<Vec<_>>(), ["other"]);
+            let device = &inner.config.devices[0];
+            assert_eq!(device.projects, Some(vec!["p".to_owned()]));
+            assert_eq!(device.monos, Some(vec![]));
+        }
+        let saved: Config = serde_json::from_slice(&std::fs::read(&host.path).unwrap()).unwrap();
+        assert_eq!(saved.devices[0].projects, Some(vec!["p".to_owned()]));
+        assert_eq!(saved.devices[0].monos, Some(vec![]));
+        // The stored selection is what the next request is scoped to.
+        let context = device_context(&saved.devices[0]);
+        assert_eq!(context.projects, Some(vec!["p".to_owned()]));
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn an_answer_without_a_narrower_selection_changes_nothing() {
+        let (host, _events, peer) = paired();
+        let mut inner = host.inner.lock().unwrap();
+        watch(&mut inner, "w", &peer);
+        let answer = policy::SelectionAnswer {
+            reply: json!({"ok": true}),
+            narrowed: None,
+        };
+        assert_eq!(
+            host.answer_selection(&mut inner, &peer, answer),
+            Ok(json!({"ok": true}))
+        );
+        assert!(inner.watches.contains_key("w"));
+        assert_eq!(inner.config.devices[0].projects, None);
+        drop(inner);
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_selection_that_cannot_be_saved_is_refused_and_keeps_the_watches() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(
+            &blocker,
+            b"a file, so the settings directory cannot be made",
+        )
+        .unwrap();
+        let (host, _events) = MobileHost::open(blocker.join("mobile-access.json")).unwrap();
+        let mut inner = host.inner.lock().unwrap();
+        inner.config.devices.push(Device {
+            fingerprint: "fp".into(),
+            ..phone_row()
+        });
+        watch(&mut inner, "w", "fp");
+        assert!(host
+            .answer_selection(&mut inner, "fp", narrowed(Some(vec![]), None))
+            .is_err());
+        assert!(inner.watches.contains_key("w"));
+        assert_eq!(inner.config.devices[0].projects, None);
+    }
+
     #[test]
     fn a_refused_selection_change_leaves_the_watches_open() {
         let (host, _events, peer) = paired();
         {
             let mut inner = host.inner.lock().unwrap();
-            let (sink, _receiver) = tokio::sync::mpsc::channel::<Value>(1);
-            inner.watches.insert(
-                "w".into(),
-                Watcher {
-                    peer: peer.clone(),
-                    sink,
-                },
-            );
-            let narrowed = policy::SelectionAnswer {
-                reply: json!({}),
-                narrowed: Some(policy::Selection {
-                    projects: Some(vec![]),
-                    monos: None,
-                }),
-            };
-            assert!(answer_selection(&mut inner, &peer, narrowed).is_err());
+            watch(&mut inner, "w", &peer);
+            // No such device: the change is refused.
+            assert!(host
+                .answer_selection(&mut inner, "stranger", narrowed(Some(vec![]), None))
+                .is_err());
             assert!(inner.watches.contains_key("w"));
+            assert_eq!(inner.config.devices[0].projects, None);
         }
         std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
     }
