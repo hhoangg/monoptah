@@ -1,0 +1,83 @@
+{
+  "$comment": "Noise IK cross-implementation vectors generated from web/mock-desktop/src/noise.ts. Regenerate with: node --experimental-strip-types crates/monocode-core/src/mobile/web_link/testdata/gen-noise-vectors.ts > crates/monocode-core/src/mobile/web_link/testdata/noise_ik_vectors.json. Never edit by hand. All keys are fake test patterns. Both directions are covered: the Rust responder and initiator must reproduce these bytes.",
+  "protocol": "Noise_IK_25519_ChaChaPoly_SHA256",
+  "inputs": {
+    "desktop_id": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+    "device_id": "b0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+    "channel": 7,
+    "prologue": "6d6f6e6f707461682d7765622f31a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf0007",
+    "initiator_static_private": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+    "initiator_static_public": "07a37cbc142093c8b755dc1b10e86cb426374ad16aa853ed0bdfc0b2b86d1c7c",
+    "initiator_ephemeral_private": "2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40",
+    "responder_static_private": "4142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f60",
+    "responder_static_public": "64b101b1d0be5a8704bd078f9895001fc03e8e9f9522f188dd128d9846d48466",
+    "responder_ephemeral_private": "6162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80",
+    "hs1_payload": "7b226e616d65223a22546573742042726f77736572222c227561223a2274657374227d",
+    "hs2_payload": "7b2270726f746f223a317d"
+  },
+  "outputs": {
+    "hs1": "5869aff450549732cbaaed5e5df9b30a6da31cb0e5742bad5ad4a1a768f1a67b46a29af5ec4483a759c3537de9d8be0e9de3f950dcde27a868221e1ede553a6984999776e15db70891cac2c9539733f4c1b72fc13b6fabdc7441d54a4746319d8681d9326e279d8366dbf8619ce03dd2c1f1102e5b08938fb76af03487927b0581599c",
+    "hs2": "244fe3b963e899dd295baffce248d3530f3a9a7479ba063002680ebfe7adad495c31a5c307657c4bba0e6691e994905ca48b1fccedf1b300074029",
+    "handshake_hash": "73b97f6d1e3d0e6c1fa612cb58f25e1099d930b31cc737224c6788224bb630f9",
+    "initiator_fingerprint": "aaa8fff703b50b2297f4f6e13508f72420d96fd01ebb84cb074449caaef64041",
+    "responder_fingerprint": "bc841db8fea3efd84555a7f8eeb925033c90c9d5034b1a4c48a6c87de3c0ebde"
+  },
+  "transport": {
+    "i2r_before_rekey": [
+      {
+        "plaintext": "693272206d6573736167652030",
+        "ciphertext": "eae57bd792157be0e24c068c0c0624d60abe1c6546fe538b923c896849"
+      },
+      {
+        "plaintext": "693272206d6573736167652031",
+        "ciphertext": "32d78c5e140fa5d00fbd585ad17c7b6abc4b76192b6f8adb013889283e"
+      },
+      {
+        "plaintext": "693272206d6573736167652032",
+        "ciphertext": "36bac65dff6918c589bd858ae264e7cdc3912f17855290ee32c8a8181f"
+      }
+    ],
+    "r2i_before_rekey": [
+      {
+        "plaintext": "723269206d6573736167652030",
+        "ciphertext": "aa222e26d09afefdf6c13e66421ca588c8fa27b5cbcbfd8c04ea619ab2"
+      },
+      {
+        "plaintext": "723269206d6573736167652031",
+        "ciphertext": "e6ee6a639966948680388fec82e66860895e06bbdc1fe44f5e213721e4"
+      },
+      {
+        "plaintext": "723269206d6573736167652032",
+        "ciphertext": "f6147ec8bb0865ee4817f803649ba30566eaf792fa21944d90e6a56ebf"
+      }
+    ],
+    "i2r_after_rekey": [
+      {
+        "plaintext": "6932722061667465722072656b65792030",
+        "ciphertext": "1d00054a9300266a218aff53ca0bae64738769d1e28e98fdfbf5eed0b96c68da67"
+      },
+      {
+        "plaintext": "6932722061667465722072656b65792031",
+        "ciphertext": "0ed26eb871c3247527f9766713c36676cb154d9214071427457f634d8eb56fe395"
+      }
+    ],
+    "r2i_after_rekey": [
+      {
+        "plaintext": "7232692061667465722072656b65792030",
+        "ciphertext": "652ae1c72e7e56f6d1d2e5e72da48bb3047633f4d0f425d4d9d656a8b759447c91"
+      },
+      {
+        "plaintext": "7232692061667465722072656b65792031",
+        "ciphertext": "5757cfa137a176de03ed92ce859ec4390309f0c21739d06821f6f1c038f083ce28"
+      }
+    ]
+  },
+  "wrong_prologue": {
+    "prologue": "6d6f6e6f707461682d7765622f31a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf0008",
+    "hs1": "5869aff450549732cbaaed5e5df9b30a6da31cb0e5742bad5ad4a1a768f1a67b46a29af5ec4483a759c3537de9d8be0e9de3f950dcde27a868221e1ede553a69da3a1dba0105823f283f91050740d96ac1b72fc13b6fabdc7441d54a4746319d8681d9326e279d8366dbf8619ce03dd2c1f11027e63eca84587c47168387459d49607c"
+  },
+  "wrong_responder_static": {
+    "responder_static_public": "883186b800b41d5cf0429695da9b3cc4f328ebcd184a6e482fa578c103f06c77",
+    "hs1": "5869aff450549732cbaaed5e5df9b30a6da31cb0e5742bad5ad4a1a768f1a67b5a7063b64360adb3d1f5a95555bce71607bb43be7e6b6315774476d23f753a73b95c84d8680fc4d15da80aeff04c3178c50a3647f36f253aff117026b2bac2b0e0c281a06733297408e31339706b94eeb7bbff949a808ba6236b300907e21e9171b5ad"
+  }
+}
