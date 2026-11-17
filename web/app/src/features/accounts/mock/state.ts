@@ -13,6 +13,18 @@ export interface MockPrefs {
   categories: { agentFinished: boolean; agentInput: boolean; monoMessages: boolean };
 }
 
+/** A desktop pairing request, as the Worker's `pairing_requests` row (R-03). */
+export interface MockPairing {
+  machineName: string;
+  os: string;
+  /** Full lowercase hex SHA-256 of the desktop public key. */
+  fingerprint: string;
+  confirmationCode: string;
+  /** Unix seconds; null renews the code to 10 minutes ahead on every read (dev convenience). */
+  expiresAt: number | null;
+  status: "pending" | "approved" | "denied";
+}
+
 export interface MockChallenge {
   purpose: "register" | "login" | "reauth" | "add-passkey";
   expiresAt: number;
@@ -39,6 +51,8 @@ export interface MockState {
   registrationCodes: Set<string>;
   invitesGranted: number;
   desktops: MockDesktop[];
+  /** Pairing requests by normalised user code (no dash, upper case). */
+  pairings: Map<string, MockPairing>;
   prefs: Map<string, MockPrefs>;
   /** Normalised valid recovery codes. */
   recoveryCodes: Set<string>;
@@ -51,6 +65,17 @@ export interface MockState {
 export const SEED_INVITE_CODE = "DEV-INVITE-0001";
 export const SEED_HANDLE = "dev-user";
 export const FRESH_WINDOW_SECONDS = 300;
+export const PAIRING_TTL_SECONDS = 600;
+/** Max desktops per account (Worker `MAX_DESKTOPS_PER_USER`, default 5). */
+export const MAX_DESKTOPS = 5;
+
+/** Dev pairing codes: open `/pair/<code>#fp=<MOCK_PAIR_FINGERPRINT>` to see each state. */
+export const MOCK_PAIR_CODE = "WXYZ-4829";
+export const MOCK_PAIR_LONG_NAME_CODE = "NAME-2345";
+export const MOCK_PAIR_EXPIRED_CODE = "EXPR-2345";
+/** Obviously fake: a repeating pattern, not the hash of any key. */
+export const MOCK_PAIR_FINGERPRINT = "0123456789abcdef".repeat(4);
+export const MOCK_PAIR_CONFIRMATION = "482916";
 
 const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
@@ -79,6 +104,11 @@ export function generateRecoveryCode(): string {
   return [0, 4, 8, 12].map((i) => chars.slice(i, i + 4).join("")).join("-");
 }
 
+/** Same rule as the Worker: case-insensitive, dashes optional. */
+export function normalizeUserCode(code: string): string {
+  return code.toUpperCase().replaceAll("-", "");
+}
+
 export function normalizeRecoveryCode(code: string): string {
   return code.replace(/[\s-]/g, "").toUpperCase().replace(/O/g, "0").replace(/[IL]/g, "1");
 }
@@ -87,6 +117,19 @@ export function newRecoveryBatch(state: MockState): string[] {
   const codes = Array.from({ length: 10 }, generateRecoveryCode);
   state.recoveryCodes = new Set(codes.map(normalizeRecoveryCode));
   return codes;
+}
+
+function seedPairings(): Map<string, MockPairing> {
+  const now = nowSeconds();
+  const base = { os: "macOS 15", fingerprint: MOCK_PAIR_FINGERPRINT, confirmationCode: MOCK_PAIR_CONFIRMATION, status: "pending" } as const;
+  return new Map<string, MockPairing>([
+    [normalizeUserCode(MOCK_PAIR_CODE), { ...base, machineName: "Ada's MacBook Pro", expiresAt: null }],
+    [
+      normalizeUserCode(MOCK_PAIR_LONG_NAME_CODE),
+      { ...base, machineName: `<b>Fake</b>\u202E exe.txt ${"very-long-machine-name-".repeat(3)}`.slice(0, 64), expiresAt: null },
+    ],
+    [normalizeUserCode(MOCK_PAIR_EXPIRED_CODE), { ...base, machineName: "Old desktop", expiresAt: now - 60 }],
+  ]);
 }
 
 function seedPasskeys(count: number): MockPasskey[] {
@@ -99,12 +142,25 @@ function seedPasskeys(count: number): MockPasskey[] {
   return all.slice(0, count);
 }
 
+function seedDesktops(count: number, now: number): MockDesktop[] {
+  const all: MockDesktop[] = [
+    { id: "desktop-dev-1", name: "Fake Studio Mac", color: "#6d8cff", online: true, pendingCount: 0, os: "macos", appVersion: "0.0.0-mock", lastSeenAt: now },
+    { id: "desktop-dev-2", name: "Fake Linux box", color: null, online: false, pendingCount: 1, os: "linux", appVersion: "0.0.0-mock", lastSeenAt: now - 2 * 86400 },
+    { id: "desktop-dev-3", name: "Fake Windows PC", color: null, online: false, pendingCount: 0, os: "windows", appVersion: "0.0.0-mock", lastSeenAt: now - 5 * 86400 },
+    { id: "desktop-dev-4", name: "Fake Mac mini", color: null, online: false, pendingCount: 0, os: "macos", appVersion: "0.0.0-mock", lastSeenAt: now - 6 * 86400 },
+    { id: "desktop-dev-5", name: "Fake Raspberry Pi", color: null, online: false, pendingCount: 0, os: "linux", appVersion: "0.0.0-mock", lastSeenAt: now - 9 * 86400 },
+  ];
+  return all.slice(0, count);
+}
+
 export interface SeedOptions {
   signedIn?: boolean;
   recoveryOnly?: boolean;
   recoveryAckAt?: "now" | null;
   invitesPaused?: boolean;
   passkeyCount?: number;
+  /** 0 gives an account with no desktops, 5 one at the desktop limit. Default 2. */
+  desktopCount?: number;
 }
 
 /** A fresh state: one existing account, three sessions, two desktops, the seed invite code. */
@@ -127,10 +183,8 @@ export function createMockState(options: SeedOptions = {}): MockState {
     inviteCodes: new Map(),
     registrationCodes: new Set([SEED_INVITE_CODE]),
     invitesGranted: 3,
-    desktops: [
-      { id: "desktop-dev-1", name: "Fake Studio Mac", color: "#6d8cff", online: true, pendingCount: 0, os: "macos", appVersion: "0.0.0-mock", lastSeenAt: now },
-      { id: "desktop-dev-2", name: "Fake Linux box", color: null, online: false, pendingCount: 1, os: "linux", appVersion: "0.0.0-mock", lastSeenAt: now - 2 * 86400 },
-    ],
+    desktops: seedDesktops(options.desktopCount ?? 2, now),
+    pairings: seedPairings(),
     prefs: new Map(),
     recoveryCodes: new Set(),
     challenges: new Map(),

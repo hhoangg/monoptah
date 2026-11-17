@@ -6,7 +6,12 @@
 //  - `window.__monoptahMock` with `reset(options)`, `set(patch)`, `snapshot()` and `recoveryCodes()`.
 //  - A `?mock=` query on the first page load picks a starting state, comma separated:
 //    `signedin`, `signedout`, `recoveryonly`, `noack` (recoveryAckAt null), `paused` (invites
-//    paused), `onepasskey`, `threepasskeys`. Example: `/settings?mock=signedin,noack`.
+//    paused), `onepasskey`, `threepasskeys`, `nodesktops`, `fivedesktops` (at the desktop limit).
+//    Example: `/settings?mock=signedin,noack`.
+//  - Pairing codes for /pair/:code (state.ts): `WXYZ-4829` (valid, renews itself), `NAME-2345` (hostile
+//    machine name), `EXPR-2345` (expired); any other code is unknown. The matching fingerprint for the
+//    link is `MOCK_PAIR_FINGERPRINT`: `/pair/WXYZ-4829#fp=0123456789abcdef` repeated 4 times; a different
+//    `#fp` is the mismatch state, no `#fp` the missing one.
 //  - sessionStorage key `monoptah.mock.signedIn` ("1") keeps the mock session across reloads.
 import { setApiTransport } from "../api";
 import { createMockServer } from "./transport";
@@ -66,6 +71,8 @@ export function seedFromQuery(search: string, storedSignedIn: boolean): SeedOpti
   if (flags.has("paused")) options.invitesPaused = true;
   if (flags.has("onepasskey")) options.passkeyCount = 1;
   if (flags.has("threepasskeys")) options.passkeyCount = 3;
+  if (flags.has("nodesktops")) options.desktopCount = 0;
+  if (flags.has("fivedesktops")) options.desktopCount = 5;
   return options;
 }
 
@@ -121,8 +128,8 @@ export function installMockApi(): void {
       syncSession();
     },
     snapshot() {
-      const { user, signedIn, recoveryOnly, recoveryAckAt, invitesPaused, reauthAt, passkeys, sessions, invites, desktops } = server.state;
-      const visible = { user, signedIn, recoveryOnly, recoveryAckAt, invitesPaused, reauthAt, passkeys, sessions, invites, desktops };
+      const { user, signedIn, recoveryOnly, recoveryAckAt, invitesPaused, reauthAt, passkeys, sessions, invites, desktops, pairings } = server.state;
+      const visible = { user, signedIn, recoveryOnly, recoveryAckAt, invitesPaused, reauthAt, passkeys, sessions, invites, desktops, pairings: Object.fromEntries(pairings) };
       return JSON.parse(JSON.stringify(visible)) as Record<string, unknown>;
     },
     recoveryCodes() {

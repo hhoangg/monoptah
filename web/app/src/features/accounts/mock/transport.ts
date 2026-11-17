@@ -1,20 +1,25 @@
 // Dev-only client-side stand-in for the Worker `/api/*` routes WS-S calls (A-03..A-08 contracts).
 // It does not verify WebAuthn signatures: any well-formed response is accepted. The Worker rules it
 // does imitate: Origin-free CSRF and content-type checks, session and fresh gates, `recovery_only`
-// confinement, invite quota and pause, the last-passkey rule and the generic invalid-invite error.
-import { findRoute, type ApiErrorCode } from "@monoptah/protocol";
+// confinement, invite quota and pause, the last-passkey rule, the generic invalid-invite error and the
+// pairing approval routes (`GET /api/pair/:userCode`, `approve` with `replaces`, `deny`).
+import { findRoute, USER_CODE_ALPHABET, USER_CODE_LENGTH, type ApiErrorCode } from "@monoptah/protocol";
 import type { ApiTransport } from "../api";
 import {
   base64url,
   createMockState,
   defaultPrefs,
   FRESH_WINDOW_SECONDS,
+  MAX_DESKTOPS,
   newRecoveryBatch,
+  normalizeUserCode,
   normalizeRecoveryCode,
   nowSeconds,
+  PAIRING_TTL_SECONDS,
   randomBytes,
   randomId,
   type MockChallenge,
+  type MockPairing,
   type MockState,
   type SeedOptions,
 } from "./state";
@@ -147,6 +152,21 @@ function findPasskey(state: MockState, id: string) {
   if (!passkey) throw new MockHttpError(404, "not_found", "Passkey not found");
   return passkey;
 }
+
+/**
+ * The request behind a typed user code, only while pending and unexpired (the Worker's `pendingRequest`);
+ * a malformed code, an unknown one, an expired one and a used one all read the same: 404 `not_found`.
+ */
+function pendingPairing(state: MockState, raw: string | undefined): MockPairing | null {
+  const code = normalizeUserCode(raw ?? "");
+  if (code.length !== USER_CODE_LENGTH || [...code].some((char) => !USER_CODE_ALPHABET.includes(char))) return null;
+  const pairing = state.pairings.get(code);
+  if (!pairing || pairing.status !== "pending") return null;
+  if (pairing.expiresAt === null) return { ...pairing, expiresAt: nowSeconds() + PAIRING_TTL_SECONDS };
+  return pairing.expiresAt > nowSeconds() ? pairing : null;
+}
+
+const pairingNotFound = () => new MockHttpError(404, "not_found", "Pairing code not found or expired");
 
 // --- Handlers ---
 
@@ -298,6 +318,51 @@ const handlers: Record<string, Handler> = {
   },
 
   "GET /api/desktops": ({ state }) => ({ desktops: state.desktops }),
+  "GET /api/pair/:userCode": ({ state, params }) => {
+    const pairing = pendingPairing(state, params.userCode);
+    if (!pairing) throw pairingNotFound();
+    return {
+      machineName: pairing.machineName,
+      os: pairing.os,
+      fingerprint: pairing.fingerprint,
+      confirmationCode: pairing.confirmationCode,
+      expiresAt: pairing.expiresAt,
+    };
+  },
+  // Fresh gate and quota as the Worker: a new desktop is refused with 409 `quota_exceeded` at the limit
+  // and the request stays pending; `replaces` needs one of the account's own desktops (404 otherwise).
+  "POST /api/pair/:userCode/approve": ({ state, params, body }) => {
+    const pairing = pendingPairing(state, params.userCode);
+    const stored = state.pairings.get(normalizeUserCode(params.userCode ?? ""));
+    if (!pairing || !stored) {
+      if (stored?.status === "approved") throw new MockHttpError(409, "conflict", "Pairing request already approved");
+      throw pairingNotFound();
+    }
+    const replaces = typeof body.replaces === "string" ? body.replaces : undefined;
+    let result: { desktopId: string; name: string };
+    if (replaces !== undefined) {
+      const target = state.desktops.find((desktop) => desktop.id === replaces);
+      if (!target) throw new MockHttpError(404, "not_found", "Desktop not found");
+      target.os = pairing.os;
+      target.pendingCount = 0;
+      result = { desktopId: target.id, name: target.name };
+    } else {
+      if (state.desktops.length >= MAX_DESKTOPS) throw new MockHttpError(409, "quota_exceeded", "Desktop limit reached");
+      const desktop = { id: randomId("desktop"), name: pairing.machineName, color: null, online: false, pendingCount: 0, os: pairing.os, appVersion: null, lastSeenAt: null };
+      state.desktops.push(desktop);
+      result = { desktopId: desktop.id, name: desktop.name };
+    }
+    stored.status = "approved";
+    return result;
+  },
+  "POST /api/pair/:userCode/deny": ({ state, params }) => {
+    const pairing = pendingPairing(state, params.userCode);
+    const stored = state.pairings.get(normalizeUserCode(params.userCode ?? ""));
+    if (!pairing || !stored) throw pairingNotFound();
+    stored.status = "denied";
+    return { ok: true };
+  },
+
   "PUT /api/push/prefs/:desktopId": ({ state, params, body }) => {
     const id = params.desktopId ?? "";
     if (!state.desktops.some((desktop) => desktop.id === id)) throw new MockHttpError(404, "not_found", "Desktop not found");
