@@ -479,6 +479,7 @@ fn main() {
             #[cfg(target_os = "macos")]
             memory_log::start(cx);
             frame_log::start(cx);
+            pulse::start_stats(cx);
             gpu_trim::start(cx);
             #[cfg(target_os = "macos")]
             hang_watchdog::start(database.with_file_name("gpui-hangs"), cx);

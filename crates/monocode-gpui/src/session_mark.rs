@@ -12,6 +12,7 @@ pub(crate) const SPINNER_PERIOD: Duration = Duration::from_millis(1_200);
 pub(crate) const SPINNER_ROWS: [u32; 3] = [0x6f84a3, 0xe8b583, 0xe47fa6];
 
 /// The working spinner turning on the shared clock at `rate`.
+#[track_caller]
 pub(crate) fn spinner(id: impl Into<ElementId>, rate: Rate) -> pulse::Looping {
     pulse::looping(id, SPINNER_PERIOD, rate, spinner_at)
 }
