@@ -18,6 +18,7 @@ import "./features/cloud/register";
 import "./features/desktops/register";
 import "./features/layout/register";
 import "./features/offline/register";
+import "./features/push/register";
 import "./features/settings/register";
 
 startAppearanceSync();

@@ -86,6 +86,8 @@ export interface MockState {
   /** Pairing requests by normalised user code (no dash, upper case). */
   pairings: Map<string, MockPairing>;
   prefs: Map<string, MockPrefs>;
+  /** Push subscriptions by id (P-04), each with its endpoint; the Worker keys them by endpoint. */
+  pushSubscriptions: Map<string, { endpoint: string; deviceId: string }>;
   /** Normalised valid recovery codes. */
   recoveryCodes: Set<string>;
   challenges: Map<string, MockChallenge>;
@@ -286,6 +288,7 @@ export function createMockState(options: SeedOptions = {}): MockState {
     desktops: seedDesktops(options.desktopCount ?? 2, now),
     pairings: seedPairings(),
     prefs: new Map(),
+    pushSubscriptions: new Map(),
     recoveryCodes: new Set(),
     challenges: new Map(),
     counter: 0,

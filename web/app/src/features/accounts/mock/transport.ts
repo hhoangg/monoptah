@@ -55,6 +55,9 @@ const CHALLENGE_TTL_SECONDS = 300;
 const INVITE_TTL_SECONDS = 7 * 86400;
 const MAX_RECOVER_FAILURES = 5;
 const RECOVERY_ONLY_ALLOWLIST: ReadonlySet<string> = new Set(["GET /api/me", "POST /api/auth/logout"]);
+/** A well-formed 65 byte uncompressed P-256 point (first byte 4), base64url, for `applicationServerKey`. */
+export const MOCK_VAPID_PUBLIC_KEY = "BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+export const MOCK_VAPID_KEY_ID = "mock-vapid-1";
 const INVALID_INVITE = "That invite is not valid";
 
 function expectString(value: unknown): string {
@@ -366,6 +369,26 @@ const handlers: Record<string, Handler> = {
     const stored = state.pairings.get(normalizeUserCode(params.userCode ?? ""));
     if (!pairing || !stored) throw pairingNotFound();
     stored.status = "denied";
+    return { ok: true };
+  },
+
+  // Push (P-01 contract): the key id changes only through `window.__monoptahMock` in a test.
+  "GET /api/push/vapid-key": () => ({ publicKey: MOCK_VAPID_PUBLIC_KEY, keyId: MOCK_VAPID_KEY_ID }),
+  "POST /api/push/subscriptions": ({ state, body }) => {
+    const endpoint = expectString(body.endpoint);
+    const deviceId = expectString(body.deviceId);
+    if (body.vapidKeyId !== MOCK_VAPID_KEY_ID) throw new MockHttpError(400, "invalid", "Stale VAPID key: subscribe again with the current key");
+    // The Worker upserts by endpoint: the same endpoint keeps one row.
+    for (const [id, row] of state.pushSubscriptions) if (row.endpoint === endpoint) return { id };
+    if ([...state.pushSubscriptions.values()].filter((row) => row.deviceId === deviceId).length >= 4) {
+      throw new MockHttpError(409, "quota_exceeded", "Too many subscriptions on this device");
+    }
+    const id = randomId("push");
+    state.pushSubscriptions.set(id, { endpoint, deviceId });
+    return { id };
+  },
+  "DELETE /api/push/subscriptions/:id": ({ state, params }) => {
+    if (!state.pushSubscriptions.delete(params.id ?? "")) throw new MockHttpError(404, "not_found", "Subscription not found");
     return { ok: true };
   },
 

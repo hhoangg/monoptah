@@ -4,5 +4,5 @@
     "lib": ["ES2023", "WebWorker"],
     "types": []
   },
-  "include": ["src/sw.ts", "src/sw/routing.ts"]
+  "include": ["src/sw.ts", "src/sw/routing.ts", "src/sw/pushHandlers.ts", "src/sw/payload.ts", "src/sw/safeUrl.ts", "src/sw/pushState.ts", "src/sw/resubscribe.ts", "src/sw/base64url.ts"]
 }
