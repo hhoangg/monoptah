@@ -1,7 +1,9 @@
 // Global connection banner (F-07, N-17; the composer and transcript use `useConnectivity` for F-42):
 // "You are offline", "Desktop offline" with the last time the desktop was heard from, "Reconnecting...".
 // A polite live region that is always mounted, so a change is announced. Glass surface, tokens only.
+import { useQuery } from "@tanstack/react-query";
 import { useRouterState } from "@tanstack/react-router";
+import { desktopsQuery } from "@/features/accounts/queries";
 import { getLinkConnection, useLink } from "@/link";
 import { Button } from "@/ui/button";
 import { Glass } from "@/ui/Glass";
@@ -34,7 +36,10 @@ export function useDesktopConnectivity(desktopId: string | null): Connectivity {
   const presence = useLink(desktopId ?? "", (state) => state.presence);
   const blocked = useLink(desktopId ?? "", (state) => state.blocked);
   const lastFrameAt = useLink(desktopId ?? "", (state) => state.lastFrameAt);
-  return describeConnectivity(online, desktopId === null ? null : { status, presence, blocked, lastFrameAt });
+  // The directory knows when the desktop was last seen, which this tab cannot when the desktop was offline at open.
+  const directory = useQuery({ ...desktopsQuery, enabled: desktopId !== null && online && presence === "offline" && lastFrameAt === null });
+  const directoryLastSeenAt = directory.data?.desktops.find((desktop) => desktop.id === desktopId)?.lastSeenAt ?? null;
+  return describeConnectivity(online, desktopId === null ? null : { status, presence, blocked, lastFrameAt }, directoryLastSeenAt);
 }
 
 export function OfflineBanner() {

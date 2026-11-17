@@ -22,6 +22,24 @@ describe("describeConnectivity", () => {
     expect(describeConnectivity(true, { ...ready, presence: "offline", lastFrameAt: 1000 })).toMatchObject({ kind: "desktop_offline", label: "Desktop offline", lastSeenAt: 1000 });
   });
 
+  it("says Desktop offline when the desktop was offline at open, before the link ever became ready", () => {
+    for (const status of ["connecting", "handshaking", "reconnecting", "closed"] as const) {
+      expect(describeConnectivity(true, { ...ready, status, presence: "offline" })).toMatchObject({ kind: "desktop_offline", label: "Desktop offline", blocksSending: true });
+    }
+  });
+
+  it("uses the directory last seen when this tab has not heard from the desktop", () => {
+    expect(describeConnectivity(true, { ...ready, status: "reconnecting", presence: "offline", lastFrameAt: null }, 5000)).toMatchObject({ lastSeenAt: 5000 });
+    expect(describeConnectivity(true, { ...ready, presence: "offline", lastFrameAt: 1000 }, 5000)).toMatchObject({ lastSeenAt: 1000 });
+  });
+
+  it("blocks sending in every link state but ready, without a banner for the quiet ones", () => {
+    for (const status of ["idle", "connecting", "handshaking", "pending", "closed"] as const) {
+      expect(describeConnectivity(true, { ...ready, status, presence: null })).toMatchObject({ kind: "online", label: null, blocksSending: true });
+    }
+    expect(describeConnectivity(true, ready).blocksSending).toBe(false);
+  });
+
   it("stays quiet for a blocked link: its own screen explains it", () => {
     expect(describeConnectivity(true, { ...ready, status: "reconnecting", blocked: "revoked" }).kind).toBe("online");
   });

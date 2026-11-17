@@ -11,7 +11,7 @@ export interface Connectivity {
   label: string | null;
   /** Epoch ms the desktop was last heard from, when `kind` is `desktop_offline`. */
   lastSeenAt: number | null;
-  /** Mutations are refused in every state but `online` (they are never queued, architecture.md 3.6). */
+  /** Mutations are refused unless the link is ready (or there is no desktop in play) and the browser is online; never queued (architecture.md 3.6). */
   blocksSending: boolean;
 }
 
@@ -33,15 +33,23 @@ type LinkSlice = Pick<LinkState, "status" | "presence" | "blocked" | "lastFrameA
 
 /**
  * Pure mapping. `link` is null outside a desktop route. A blocked link (revoked, key changed, login
- * required) is not a connectivity problem: its own screen explains it, so the banner stays quiet.
+ * required) is not a connectivity problem: its own screen explains it, so the banner stays quiet and
+ * sending is left to that screen. `directoryLastSeenAt` is the desktop's `lastSeenAt` from the directory,
+ * used when this tab has not heard from the desktop yet (the desktop was offline when the page opened).
+ *
+ * Sending is blocked in every state but a ready link of an online desktop (architecture.md 3.6: mutations
+ * are not queued), including the quiet ones (connecting, handshaking, pending, closed, idle).
  */
-export function describeConnectivity(online: boolean, link: LinkSlice | null): Connectivity {
+export function describeConnectivity(online: boolean, link: LinkSlice | null, directoryLastSeenAt: number | null = null): Connectivity {
   if (!online) return { kind: "offline", label: "You are offline", lastSeenAt: null, blocksSending: true };
   if (link && link.blocked === null) {
-    if (link.status === "reconnecting") return { kind: "reconnecting", label: "Reconnecting...", lastSeenAt: null, blocksSending: true };
-    if (link.status === "ready" && link.presence === "offline") {
-      return { kind: "desktop_offline", label: "Desktop offline", lastSeenAt: link.lastFrameAt, blocksSending: true };
+    // The relay's answer comes first: a desktop that is offline when the page opens never reaches `ready`
+    // and keeps cycling through handshaking and reconnecting.
+    if (link.presence === "offline" && link.status !== "idle") {
+      return { kind: "desktop_offline", label: "Desktop offline", lastSeenAt: link.lastFrameAt ?? directoryLastSeenAt, blocksSending: true };
     }
+    if (link.status === "reconnecting") return { kind: "reconnecting", label: "Reconnecting...", lastSeenAt: null, blocksSending: true };
+    if (link.status !== "ready") return { kind: "online", label: null, lastSeenAt: null, blocksSending: true };
   }
   return { kind: "online", label: null, lastSeenAt: null, blocksSending: false };
 }
