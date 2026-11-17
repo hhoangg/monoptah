@@ -5,6 +5,7 @@ import { queryOptions, type QueryClient } from "@tanstack/react-query";
 import type { MeResponse, PushPrefsResponse, User } from "@monoptah/protocol";
 import { ApiError, apiFetch } from "./api";
 import { endpoints } from "./endpoints";
+import { clearLowCodes } from "./lowCodes";
 import { createPasskey, getPasskey } from "./webauthn";
 
 type Me = ReturnType<typeof MeResponse.parse>;
@@ -136,7 +137,9 @@ export async function recoverAccount(queryClient: QueryClient, input: { handle: 
 }
 
 /** Ends the session and drops every cached account value. */
-export async function signOut(queryClient: QueryClient): Promise<void> {
+export async function signOut(queryClient: QueryClient, options: { keepLowCodes?: boolean } = {}): Promise<void> {
+  // The reminder belongs to the account that recovered; it survives only the recover flow's own sign-out.
+  if (!options.keepLowCodes) clearLowCodes();
   try {
     await apiFetch(endpoints.logout);
   } finally {
@@ -190,6 +193,7 @@ export async function deletePasskey(queryClient: QueryClient, id: string): Promi
 /** New recovery codes, shown once; every older code stops working. Sets `recoveryAckAt` in `me`. */
 export async function regenerateRecoveryCodes(queryClient: QueryClient): Promise<string[]> {
   const { recoveryCodes } = await withFreshAuth(() => apiFetch(endpoints.regenerateRecoveryCodes));
+  clearLowCodes();
   await queryClient.invalidateQueries({ queryKey: ME_KEY });
   return recoveryCodes;
 }

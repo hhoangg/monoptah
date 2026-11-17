@@ -52,6 +52,14 @@ describe("authGuard", () => {
     expect(await run("/recover", { signedIn: true, recoveryOnly: true })).toBeNull();
   });
 
+  it("sends a signed-in user to /settings while the low-codes flag is set, and lets /settings through", async () => {
+    sessionStorage.setItem("monoptah.lowCodes", "1");
+    expect(await run("/desktops", { signedIn: true })).toMatchObject({ to: "/settings" });
+    expect(await run("/settings", { signedIn: true })).toBeNull();
+    // A recovery-only session is still confined to /recover first.
+    expect(await run("/settings", { signedIn: true, recoveryOnly: true })).toMatchObject({ to: "/recover" });
+  });
+
   it("treats a 403 recovery_only from GET /api/me as a recovery session (defensive: the Worker allows /api/me there today)", async () => {
     restore = setApiTransport(async () => new Response(JSON.stringify({ error: "recovery only", code: "recovery_only" }), { status: 403, headers: { "Content-Type": "application/json" } }));
     const queryClient = new QueryClient();

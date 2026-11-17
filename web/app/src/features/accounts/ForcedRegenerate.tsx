@@ -8,6 +8,7 @@ import { PageHeader } from "@/ui/PageHeader";
 import { apiFetch } from "./api";
 import { passkeyErrorMessage } from "./authCopy";
 import { endpoints } from "./endpoints";
+import { clearLowCodes } from "./lowCodes";
 import { ME_KEY, ReauthCancelledError, withFreshAuth } from "./queries";
 import { RecoveryCodes } from "./RecoveryCodes";
 
@@ -32,6 +33,7 @@ export function ForcedRegenerate({ handle }: { handle: string }) {
     setCancelled(false);
     try {
       const result = await withFreshAuth(() => apiFetch(endpoints.regenerateRecoveryCodes));
+      clearLowCodes();
       setCodes(result.recoveryCodes);
     } catch (caught) {
       if (caught instanceof ReauthCancelledError) setCancelled(true);
@@ -57,7 +59,7 @@ export function ForcedRegenerate({ handle }: { handle: string }) {
 
   return (
     <AuthLayout>
-      <PageHeader title="Get new recovery codes" description="You signed in with a recovery code, or have not confirmed your codes yet. Create a new set and save it before you continue." />
+      <PageHeader title="Get new recovery codes" description="You signed in with a recovery code, or have not confirmed your codes yet, so only a few may be left. Create a new set and save it before you continue." />
       {error ? <Notice variant="error">{error}</Notice> : null}
       {cancelled ? <Notice variant="info">The passkey prompt was closed. Press the button when you are ready.</Notice> : null}
       <Button type="button" size="lg" className="w-full" disabled={busy} aria-busy={busy} onClick={() => void generate()}>

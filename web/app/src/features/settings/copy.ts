@@ -11,5 +11,6 @@ export function settingsErrorMessage(error: unknown): string {
   if (isApiError(error, "last_passkey")) return "You cannot remove your only passkey. Add another one first.";
   if (isApiError(error, "invites_paused")) return "Invites are paused right now.";
   if (isApiError(error, "quota_exceeded")) return "You have no invites left.";
+  if (isApiError(error, "conflict")) return "This invite was already used or revoked.";
   return GENERIC_ERROR;
 }

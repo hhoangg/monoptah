@@ -8,6 +8,7 @@ import { Icon } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
 import { PageHeader } from "@/ui/PageHeader";
 import { SettingsCard, SettingsRow } from "@/ui/SettingsCard";
+import { isApiError } from "./api";
 import { signInErrorMessage, UNSUPPORTED_ERROR } from "./authCopy";
 import { postSignInTarget } from "./redirect";
 import { meQuery, signIn, signOut } from "./queries";
@@ -22,19 +23,23 @@ export function LoginScreen({ redirect }: { redirect?: string }) {
   const supported = passkeysSupported();
   // /login never redirects on its own: a visitor with a session (possibly a stale one, when the
   // desktop link asked for a sign-in) chooses to continue or to sign in with another passkey.
-  const me = useQuery({ ...meQuery, retry: false });
+  const me = useQuery({ ...meQuery, retry: false, refetchOnMount: "always" });
   const [differentPasskey, setDifferentPasskey] = useState(false);
   const account = me.data && !me.data.recoveryOnly && !differentPasskey ? me.data.user : null;
 
   async function switchPasskey() {
     setBusy(true);
+    setError(null);
     try {
       await signOut(queryClient);
-    } catch {
-      // The local state is cleared in signOut's finally block either way.
+      setDifferentPasskey(true);
+    } catch (caught) {
+      // 401 means the session was already gone; anything else keeps the panel so the user can retry.
+      if (isApiError(caught, "unauthorized")) setDifferentPasskey(true);
+      else setError(signInErrorMessage(caught));
+    } finally {
+      setBusy(false);
     }
-    setDifferentPasskey(true);
-    setBusy(false);
   }
 
   async function submit() {
@@ -59,6 +64,7 @@ export function LoginScreen({ redirect }: { redirect?: string }) {
     return (
       <AuthLayout>
         <PageHeader size="display" title="Sign in to Monoptah" description={`Signed in as ${account.displayName} (@${account.handle})`} />
+        {error ? <Notice variant="error">{error}</Notice> : null}
         <div className="flex flex-col gap-2">
           <Button type="button" size="lg" className="w-full" disabled={busy} onClick={() => void router.navigate({ href: postSignInTarget(redirect) })}>
             Continue

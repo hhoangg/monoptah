@@ -4,7 +4,8 @@
 //  - a 401 redirects to `/login?redirect=<path>` (same-origin relative paths only, redirect.ts);
 //  - a `recoveryOnly` session is confined to `/recover` (the add-passkey step);
 //  - `recoveryAckAt === null` confines the session to `/settings`, which must show the forced
-//    recovery-codes regenerate screen before anything else.
+//    recovery-codes regenerate screen before anything else. A `monoptah.lowCodes` flag (set by a
+//    recover with 2 or fewer codes left, lowCodes.ts) does the same until new codes were created.
 //
 // Fragments (read in the route components, never sent to the server): `#invite=CODE` on /register,
 // and `#fp=<hex>` on /pair/:code and /desktops/:id/verify. `#fp` is saved to sessionStorage before
@@ -12,6 +13,7 @@
 import type { QueryClient } from "@tanstack/react-query";
 import { redirect, type ParsedLocation } from "@tanstack/react-router";
 import { ApiError } from "./api";
+import { hasLowCodes } from "./lowCodes";
 import { meQuery } from "./queries";
 import { loginRedirectTarget, saveFingerprintFragment } from "./redirect";
 
@@ -62,7 +64,7 @@ export const authGuard: AuthGuard = async ({ location, context }) => {
   if (me.recoveryOnly) {
     throw redirect({ to: RECOVERY_ADD_PASSKEY_PATH, replace: true });
   }
-  if (me.recoveryAckAt === null && pathname !== RECOVERY_REGENERATE_PATH) {
+  if ((me.recoveryAckAt === null || hasLowCodes()) && pathname !== RECOVERY_REGENERATE_PATH) {
     throw redirect({ to: RECOVERY_REGENERATE_PATH, replace: true });
   }
 };

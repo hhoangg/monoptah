@@ -3,8 +3,9 @@
 //
 // Registered once at startup by register.ts. In dev with VITE_MOCK_API=1 main.tsx installs the mock
 // desktop link afterwards, which replaces this provider.
+import type { QueryClient } from "@tanstack/react-query";
 import type { MethodName, ParamsOf, ResultOf } from "@monoptah/protocol";
-import { clearPersistedCache } from "@/data/persist";
+import { clearPersistedCache } from "@/data";
 import { getLinkConnection, LinkRequestError, type LinkConnection, type LinkState } from "@/link";
 import { DesktopLinkError, onForgetDesktop, provideDesktopLink, type DesktopLink, type DesktopLinkStatus } from "./desktopLink";
 
@@ -22,6 +23,7 @@ export function toDesktopLinkStatus(state: Pick<LinkState, "status" | "blocked" 
     case "reconnecting":
       return "reconnecting";
     case "closed":
+    case "idle":
       return "offline";
     default:
       return "connecting";
@@ -93,12 +95,14 @@ export function createRealDesktopLink(connection: SettingsLinkConnection, waitMs
 }
 
 /** Wires the real link into the registry and the forget hook. */
-export function installRealDesktopLink(): void {
+export function installRealDesktopLink(queryClient?: QueryClient): void {
   provideDesktopLink((desktopId) => createRealDesktopLink(getLinkConnection(desktopId)));
   onForgetDesktop(async (desktopId) => {
     // Stops the socket for good; the next visit builds on a fresh start().
     const connection = getLinkConnection(desktopId);
     connection.stop();
     await clearPersistedCache(desktopId);
+    // The in-memory link queries of the desktop must not outlive the forget (they would be kept for 10 minutes).
+    queryClient?.removeQueries({ queryKey: ["link", desktopId] });
   });
 }

@@ -23,7 +23,7 @@ export function registerErrorMessage(error: unknown): string {
   if (isApiError(error)) {
     // Every invite failure reads the same: invalid, expired, used, paused, or the generic code.
     if (error.code === "invalid_invite" || error.code === "invites_paused" || error.code === "quota_exceeded") return INVITE_ERROR;
-    if (error.code === "conflict") return "That handle is already taken. Pick another one.";
+    if (error.code === "conflict") return "That handle or passkey is already registered. Pick another handle, or sign in if this is your account.";
     if (error.code === "invalid") return "Check the handle and name, then try again.";
   }
   return common(error);

@@ -186,6 +186,21 @@ describe("login", () => {
     await screen.findByRole("heading", { level: 1, name: "Sign in to Monoptah" });
   });
 
+  it("keeps the signed-in panel and shows an error when sign-out fails", async () => {
+    install({ signedIn: true });
+    const inner = createMockServer({ state: createMockState({ signedIn: true }) });
+    restore?.();
+    restore = setApiTransport((url, init) =>
+      url.endsWith("/api/auth/logout") ? Promise.resolve(Response.json({ error: "x", code: "internal" }, { status: 500 })) : inner.transport(url, init),
+    );
+    const user = userEvent.setup();
+    mount("/login");
+    await user.click(await screen.findByRole("button", { name: "Sign in with a different passkey" }));
+    // The cache is cleared by signOut, so `me` reloads; the panel returns with the error.
+    expect(await screen.findByRole("button", { name: "Continue" })).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+  });
+
   it("links to recover and install and follows the redirect after sign-in", async () => {
     install({ signedIn: false });
     const user = userEvent.setup();
@@ -236,6 +251,55 @@ describe("recover", () => {
     await screen.findByRole("heading", { level: 1, name: "Sign in to Monoptah" });
     expect(router.state.location.pathname).toBe("/login");
     expect(state.signedIn).toBe(false);
+  });
+
+  it("offers Cancel and sign out on the add-passkey step, also after a cancelled prompt", async () => {
+    const state = install({ signedIn: true, recoveryOnly: true });
+    lib.startRegistration.mockRejectedValue(Object.assign(new Error("x"), { name: "NotAllowedError" }));
+    const user = userEvent.setup();
+    mount("/recover");
+    await user.click(await screen.findByRole("button", { name: "Add a passkey" }));
+    await screen.findByText(/prompt was closed/);
+    await user.click(screen.getByRole("button", { name: "Cancel and sign out" }));
+    await screen.findByRole("heading", { level: 1, name: "Sign in to Monoptah" });
+    expect(state.signedIn).toBe(false);
+  });
+
+  it("with 2 or fewer codes left: flag after recover, forced regenerate after the next sign-in, flag cleared after regenerate", async () => {
+    const state = install({ signedIn: false });
+    const batch = newRecoveryBatch(state);
+    for (const spent of batch.slice(2)) state.recoveryCodes.delete(normalizeRecoveryCode(spent));
+    const user = userEvent.setup();
+    const { router } = mount("/recover");
+    await screen.findByLabelText("Handle");
+    await user.type(screen.getByLabelText("Handle"), "dev-user");
+    await user.type(screen.getByLabelText("Recovery code"), batch[0]!);
+    await user.click(screen.getByRole("button", { name: "Recover account" }));
+    await user.click(await screen.findByRole("button", { name: "Add a passkey" }));
+    await screen.findByRole("heading", { level: 1, name: "Sign in to Monoptah" });
+    // Not a secret: just a boolean.
+    expect(sessionStorage.getItem("monoptah.lowCodes")).toBe("1");
+    state.recoveryOnly = false;
+    await user.click(screen.getByRole("button", { name: /Sign in with passkey/ }));
+    await screen.findByRole("heading", { level: 1, name: "Get new recovery codes" });
+    expect(router.state.location.pathname).toBe("/settings");
+    expect(screen.queryByRole("button", { name: /skip|not now/i })).toBeNull();
+    await user.click(screen.getByRole("button", { name: /Generate recovery codes/ }));
+    await screen.findByRole("heading", { level: 1, name: "Save your new recovery codes" });
+    expect(sessionStorage.getItem("monoptah.lowCodes")).toBeNull();
+  });
+
+  it("does not set the flag when more than 2 codes are left", async () => {
+    const state = install({ signedIn: false });
+    const code = newRecoveryBatch(state)[0]!;
+    const user = userEvent.setup();
+    mount("/recover");
+    await screen.findByLabelText("Handle");
+    await user.type(screen.getByLabelText("Handle"), "dev-user");
+    await user.type(screen.getByLabelText("Recovery code"), code);
+    await user.click(screen.getByRole("button", { name: "Recover account" }));
+    await screen.findByRole("heading", { level: 1, name: "Add a new passkey" });
+    expect(sessionStorage.getItem("monoptah.lowCodes")).toBeNull();
   });
 
   it("answers every failure with the same generic message", async () => {

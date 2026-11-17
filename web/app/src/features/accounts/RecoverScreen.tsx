@@ -9,6 +9,7 @@ import { Notice } from "@/ui/Notice";
 import { PageHeader } from "@/ui/PageHeader";
 import { AddPasskeyStep } from "./AddPasskeyStep";
 import { recoverErrorMessage } from "./authCopy";
+import { LOW_CODES_THRESHOLD, setLowCodes } from "./lowCodes";
 import { ApiError } from "./api";
 import { meQuery, recoverAccount, signOut } from "./queries";
 import { normalizeRecoveryCode } from "./recoveryCodesFile";
@@ -42,7 +43,8 @@ export function RecoverScreen() {
     }
     setBusy(true);
     try {
-      await recoverAccount(queryClient, { handle: cleanHandle, code: normalized });
+      const result = await recoverAccount(queryClient, { handle: cleanHandle, code: normalized });
+      if (result.codesLeft <= LOW_CODES_THRESHOLD) setLowCodes();
       setCode("");
       setLocalStep("passkey");
     } catch (caught) {
@@ -56,12 +58,14 @@ export function RecoverScreen() {
    * The server keeps a recovery session recovery-only even after it holds a passkey, so the user
    * signs out here and signs in with the new passkey. The cache is cleared even if logout fails.
    */
-  async function afterPasskey() {
+  async function leave() {
+    setBusy(true);
     try {
-      await signOut(queryClient);
+      await signOut(queryClient, { keepLowCodes: true });
     } catch {
       // The local state is cleared in signOut's finally block either way.
     }
+    setBusy(false);
     void router.navigate({ to: "/login" });
   }
 
@@ -78,7 +82,11 @@ export function RecoverScreen() {
     return (
       <AuthLayout>
         <PageHeader title="Add a new passkey" description="Your recovery code worked. Add a passkey on this device, then sign in with it." />
-        <AddPasskeyStep label="Add a passkey" onDone={() => void afterPasskey()} />
+        <AddPasskeyStep label="Add a passkey" onDone={() => void leave()} />
+        {/* A recovery session lasts 30 minutes and can add a passkey without a re-auth: never leave it open on a shared browser. */}
+        <Button type="button" variant="ghost" className="w-full" disabled={busy} onClick={() => void leave()}>
+          Cancel and sign out
+        </Button>
       </AuthLayout>
     );
   }
