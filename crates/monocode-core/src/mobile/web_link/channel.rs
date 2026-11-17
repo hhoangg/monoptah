@@ -7,6 +7,7 @@
 //! keep their order. Read-class requests and watches run concurrently. A
 //! `{"rid":N,"cancel":true}` envelope resolves the `closed` future of that
 //! stream, which ends a watch.
+use super::pacer::{Msg, Pacer, QUEUE, WATCH_INTERVAL};
 use super::session::SessionKey;
 use crate::mobile::host::MobileHost;
 use crate::mobile::policy::{self, Access};
@@ -16,11 +17,15 @@ use std::{
     collections::HashMap,
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 use tokio::{
     sync::{mpsc, Notify},
     task::JoinHandle,
+    time::Duration,
 };
 
 /// Requests and watches in flight on one relay connection.
@@ -39,9 +44,46 @@ pub(crate) struct Channel {
     request: Option<Value>,
     out: mpsc::Sender<Out>,
     cancel: Arc<Notify>,
+    /// Set for a watch: its frames go through the pacer (R-11), not straight out.
+    pacer: Option<mpsc::Sender<Msg>>,
+    finished: Arc<AtomicBool>,
 }
 
 impl Channel {
+    #[cfg(test)]
+    pub(super) fn for_test(
+        key: SessionKey,
+        rid: Value,
+        request: Value,
+        out: mpsc::Sender<Out>,
+        cancel: Arc<Notify>,
+    ) -> Self {
+        Self {
+            key,
+            rid,
+            request: Some(request),
+            out,
+            cancel,
+            pacer: None,
+            finished: Arc::default(),
+        }
+    }
+
+    /// A channel for a watch, and the pacer that must run next to its serve.
+    pub(super) fn paced(mut self, interval: Duration, heartbeat: Duration) -> (Self, Pacer) {
+        let (pace, input) = mpsc::channel(QUEUE);
+        let pacer = Pacer {
+            key: self.key,
+            input,
+            finished: self.finished.clone(),
+            out: self.out.clone(),
+            interval,
+            heartbeat,
+        };
+        self.pacer = Some(pace);
+        (self, pacer)
+    }
+
     fn wrap(&self, value: &Value) -> Value {
         let mut wrapped = Map::new();
         wrapped.insert("rid".into(), self.rid.clone());
@@ -65,6 +107,19 @@ impl Duplex for Channel {
         // The session table enforces the frame size and answers an oversized
         // reply with "Response too large".
         let value = self.wrap(value);
+        if let Some(pacer) = &self.pacer {
+            let message = if value["heartbeat"] == true {
+                Msg::Heartbeat(value)
+            } else if value["ok"] == true && value.get("result").is_some() {
+                Msg::Update(value)
+            } else {
+                Msg::Control(value)
+            };
+            return pacer
+                .send(message)
+                .await
+                .map_err(|_| "Web link closed".to_string());
+        }
         self.out
             .send(Out {
                 key: self.key,
@@ -74,7 +129,9 @@ impl Duplex for Channel {
             .map_err(|_| "Web link closed".to_string())
     }
     fn finish(&mut self) -> Result<(), String> {
-        // The final frame ends the request on the web side.
+        // The final frame ends the request on the web side. A watch lets the
+        // pacer send what it still holds.
+        self.finished.store(true, Ordering::SeqCst);
         Ok(())
     }
     fn closed(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send>> {
@@ -216,18 +273,31 @@ impl Requests {
                 ),
                 Some(Access::Read)
             );
+        let watch = envelope["watch"] == true;
         let channel = Channel {
             key,
             rid,
             request: Some(envelope),
             out: self.out.clone(),
             cancel: notify,
+            pacer: None,
+            finished: Arc::default(),
         };
         let host = self.host.clone();
-        let job: Job = Box::pin(async move {
-            let _in_flight = in_flight;
-            serve_request(host, peer, channel).await;
-        });
+        let job: Job = if watch {
+            let (channel, pacer) = channel.paced(WATCH_INTERVAL, ServeOptions::WEB.heartbeat);
+            Box::pin(async move {
+                let _in_flight = in_flight;
+                // One task: ending it (session closed) ends the pacer with the
+                // watch, and the pacer ends when the watch drops its channel.
+                tokio::join!(serve_request(host, peer, channel), pacer.run());
+            })
+        } else {
+            Box::pin(async move {
+                let _in_flight = in_flight;
+                serve_request(host, peer, channel).await;
+            })
+        };
         if concurrent {
             self.concurrent.insert((key, id), tokio::spawn(job));
         } else {
@@ -291,6 +361,8 @@ mod tests {
                 request: Some(json!({"watch": true})),
                 out,
                 cancel: Arc::new(Notify::new()),
+                pacer: None,
+                finished: Arc::default(),
             };
             let task = tokio::spawn(serve_stream(
                 channel,
