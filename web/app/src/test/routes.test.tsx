@@ -119,6 +119,8 @@ const SCREENS: Record<string, string> = {
   "/recover": "Recover your account",
   "/settings": "Settings",
   "/install": "Install Monoptah",
+  "/d/dk1/settings": "Desktop settings",
+  "/d/:desktopId/settings": "Desktop settings",
 };
 
 async function renderAt(url: string) {

@@ -20,9 +20,9 @@ if (!existsSync(headers)) {
   if (!text.includes("Content-Security-Policy:")) problems.push("dist/client/_headers has no Content-Security-Policy");
 }
 
-// The dev mock API must never ship: its unique marker (features/accounts/mock/index.ts) may not
-// appear in any served file.
-const MOCK_MARKER = "__MONOPTAH_MOCK_API__";
+// The dev mocks must never ship: their unique markers (features/accounts/mock/index.ts and
+// features/settings/mockDesktopLink.ts, the mock desktop adapter) may not appear in any served file.
+const MOCK_MARKERS = ["__MONOPTAH_MOCK_API__", "__MONOPTAH_MOCK_DESKTOP__"];
 
 for (const entry of readdirSync(client, { recursive: true, withFileTypes: true })) {
   if (!entry.isFile()) continue;
@@ -30,8 +30,11 @@ for (const entry of readdirSync(client, { recursive: true, withFileTypes: true }
   const dir = entry.parentPath.slice(client.length);
   if (name.endsWith(".map")) problems.push(`sourcemap in the assets directory: ${join(dir, name)}`);
   const file = join(entry.parentPath, name);
-  if (/\.(js|mjs|css|html|json|map)$/.test(name) && readFileSync(file, "utf8").includes(MOCK_MARKER)) {
-    problems.push(`mock API marker ${MOCK_MARKER} found in ${join(dir, name)}`);
+  if (/\.(js|mjs|css|html|json|map)$/.test(name)) {
+    const text = readFileSync(file, "utf8");
+    for (const marker of MOCK_MARKERS) {
+      if (text.includes(marker)) problems.push(`mock marker ${marker} found in ${join(dir, name)}`);
+    }
   }
   if (name === "wrangler.json" || name === "index.js") problems.push(`Worker bundle file in the assets directory: ${join(dir, name)}`);
 }

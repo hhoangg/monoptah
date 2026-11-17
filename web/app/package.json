@@ -35,6 +35,7 @@
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "^1.69.1",
+    "@monoptah/mock-desktop": "workspace:*",
     "@tailwindcss/vite": "^4.3.5",
     "@tanstack/router-cli": "^1.168.0",
     "@tanstack/router-plugin": "^1.169.0",

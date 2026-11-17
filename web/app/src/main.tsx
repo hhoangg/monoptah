@@ -16,6 +16,7 @@ import "./styles/index.css";
 import "./features/cloud/register";
 import "./features/desktops/register";
 import "./features/layout/register";
+import "./features/settings/register";
 
 startAppearanceSync();
 
@@ -25,6 +26,8 @@ async function start() {
   if (import.meta.env.DEV && import.meta.env.VITE_MOCK_API === "1") {
     const { installMockApi } = await import("./features/accounts/mock");
     installMockApi();
+    const { installMockDesktopLink } = await import("./features/settings/mockDesktopLink");
+    installMockDesktopLink();
   }
 
   const container = document.getElementById("root");
