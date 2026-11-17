@@ -6764,3 +6764,154 @@ fn a_press_outside_the_settings_and_its_model_list_still_closes_the_settings(
     let (open, picker, _) = modal_state(&s, visual);
     assert!(!open && !picker);
 }
+
+/// A habit run whose launched sub-agent is a live session, as the approval
+/// shelf and the sessions list read it.
+fn launched_child(s: &Setup, cx: &mut TestAppContext) -> Entity<Conversation> {
+    let run = fake_run(s, cx);
+    let start = call(
+        s,
+        "child",
+        "sessions.start",
+        json!({"project":s.project,"prompt":"Review the project","title":"Review","draft":true}),
+        cx,
+    )
+    .try_recv()
+    .unwrap()
+    .unwrap();
+    let child = start["sessionId"].as_i64().unwrap();
+    // Launched beneath the run, not the Mono's own chat.
+    edit_mono(s, cx, |m| {
+        for launch in m.launches.iter_mut().filter(|l| l.session_id == child) {
+            launch.origin_turn = (run as u64) << 32;
+            launch.notify_on_complete = false;
+        }
+    });
+    let owner = cx.update(|cx| s.manager.read(cx).owner.upgrade().unwrap());
+    cx.update(|cx| owner.read(cx).mono_session_entity(child))
+        .expect("the launched session is live")
+}
+fn monos_renders(s: &Setup, cx: &mut gpui::VisualTestContext) -> usize {
+    s.manager.read_with(cx, |m, _| m.renders)
+}
+
+#[gpui::test]
+fn the_cached_monos_view_ignores_shell_redraws_but_follows_its_own_state(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let visual = &mut gpui::VisualTestContext::from_window(s.window.into(), cx);
+    visual.run_until_parked();
+    assert!(
+        !s.manager
+            .read_with(visual, |m, cx| m.native_detail_content(cx))
+    );
+    let drawn = monos_renders(&s, visual);
+    assert!(drawn > 0);
+
+    s.window.update(visual, |_, _, cx| cx.notify()).unwrap();
+    visual.run_until_parked();
+    assert_eq!(
+        monos_renders(&s, visual),
+        drawn,
+        "a redraw of the shell alone reuses the cached Monos view"
+    );
+
+    let handle: gpui::AnyWindowHandle = s.window.into();
+    handle
+        .update(visual, |_, w, cx| {
+            s.manager.update(cx, |m, cx| m.request_reset(&s.id, w, cx))
+        })
+        .unwrap();
+    visual.run_until_parked();
+    assert!(monos_renders(&s, visual) > drawn, "Monos state redraws it");
+    assert!(visual.debug_bounds("mono-reset-dialog").is_some());
+}
+
+#[gpui::test]
+fn a_launched_sessions_approval_reaches_the_cached_monos_view(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let child = launched_child(&s, cx);
+    let visual = &mut gpui::VisualTestContext::from_window(s.window.into(), cx);
+    visual.run_until_parked();
+    assert!(visual.debug_bounds("approval-shelf").is_none());
+    let drawn = monos_renders(&s, visual);
+
+    child.update(visual, |child, cx| {
+        child.test_ask_approval("run-1", true, cx)
+    });
+    visual.run_until_parked();
+    assert!(monos_renders(&s, visual) > drawn);
+    assert!(
+        visual.debug_bounds("approval-shelf").is_some(),
+        "the sub-agent's approval shows without waiting for a tick"
+    );
+}
+
+#[gpui::test]
+fn open_mono_settings_redraw_when_the_accounts_change(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let visual = &mut gpui::VisualTestContext::from_window(s.window.into(), cx);
+    visual.run_until_parked();
+    let notify_accounts = |visual: &mut gpui::VisualTestContext| {
+        visual.update(|_, cx| {
+            crate::accounts::get(cx)
+                .unwrap()
+                .update(cx, |_, cx| cx.notify())
+        });
+        visual.run_until_parked();
+    };
+    visual.update(|_, cx| {
+        s.manager.update(cx, |m, cx| {
+            m.settings = Some(SettingsSection::General);
+            cx.notify();
+        })
+    });
+    visual.run_until_parked();
+    let open = monos_renders(&s, visual);
+    notify_accounts(visual);
+    assert!(
+        monos_renders(&s, visual) > open,
+        "the open modal shows accounts and models, which the cache cannot see change"
+    );
+}
+
+#[gpui::test]
+fn a_tick_that_finds_nothing_new_does_not_wake_the_view(cx: &mut TestAppContext) {
+    use std::{cell::Cell, rc::Rc};
+    let s = setup(cx);
+    let child = launched_child(&s, cx);
+    let woken = Rc::new(Cell::new(0));
+    let _subscription = cx.update(|cx| {
+        let woken = woken.clone();
+        cx.observe(&s.manager, move |_, _| woken.set(woken.get() + 1))
+    });
+    let now = 10 * 60_000;
+    let tick = |at: u64, cx: &mut TestAppContext| {
+        cx.update(|cx| s.manager.update(cx, |m, cx| m.tick_at(at, cx)));
+        cx.run_until_parked();
+    };
+    // The first pass creates every habits file and may claim work.
+    tick(now, cx);
+    tick(now, cx);
+    let before = woken.get();
+    tick(now + 10_000, cx);
+    tick(now + 20_000, cx);
+    assert_eq!(woken.get(), before, "idle ticks leave the view alone");
+
+    // The minute rolling over refreshes times shown on screen, even backwards.
+    tick(now + 60_000, cx);
+    assert_eq!(woken.get(), before + 1, "a new minute wakes the view");
+    tick(now, cx);
+    assert_eq!(woken.get(), before + 2, "so does the clock moving back");
+    let before = woken.get();
+
+    // A launched session changing without telling Monos shows at the next tick.
+    child.update(cx, |child, cx| child.test_ask_approval("run-2", false, cx));
+    tick(now, cx);
+    assert_eq!(
+        woken.get(),
+        before + 1,
+        "a shown sub-agent's change wakes it"
+    );
+    tick(now, cx);
+    assert_eq!(woken.get(), before + 1, "and only once");
+}

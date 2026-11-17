@@ -162,6 +162,7 @@ pub(crate) fn icon_action(
 }
 
 /// The `animate-spin` Loader.
+#[track_caller]
 pub(crate) fn spinner(id: impl Into<gpui::ElementId>, path: &'static str, side: f32) -> AnyElement {
     use gpui::{Transformation, percentage};
     crate::pulse::looping(

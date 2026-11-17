@@ -531,6 +531,16 @@ pub fn update<T>(
     id: &str,
     change: impl Fn(&mut Vec<Habit>) -> Result<T, String>,
 ) -> Result<T, String> {
+    update_checked(root, id, change).map(|(result, _)| result)
+}
+/// Like [`update`], also saying whether the file changed. The scheduler polls
+/// every Mono every few seconds, and a poll that finds nothing to do must
+/// neither rewrite `habits.json` nor wake the UI.
+pub fn update_checked<T>(
+    root: &Path,
+    id: &str,
+    change: impl Fn(&mut Vec<Habit>) -> Result<T, String>,
+) -> Result<(T, bool), String> {
     for _ in 0..5 {
         let file = files::read(root, id, None, "habits.json")?;
         let Parsed {
@@ -544,8 +554,11 @@ pub fn update<T>(
         let text = serde_json::to_string_pretty(&merge(entries, &habits)?)
             .map_err(|e| e.to_string())?
             + "\n";
+        if file.text.as_deref() == Some(text.as_str()) {
+            return Ok((result, false));
+        }
         match files::save(root, id, None, "habits.json", &text, Some(&file.hash)) {
-            Ok(_) => return Ok(result),
+            Ok(_) => return Ok((result, true)),
             Err(e) if e == files::CONFLICT => continue,
             Err(e) => return Err(e),
         }
@@ -1023,5 +1036,53 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn an_update_that_changes_nothing_does_not_rewrite_the_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let (root, id) = (temp.path(), "quiet-mono");
+        let now = at(5, 8, 0);
+        let schedule = Schedule::from_cli(&json!({"kind":"daily","time":"09:00"})).unwrap();
+        let habit = Habit::new("Digest".into(), "Read the news.".into(), schedule, now).unwrap();
+        let ((), changed) = update_checked(root, id, |all| {
+            all.push(habit.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert!(changed, "a new habit is written");
+
+        // Park the file in the past: a rewrite would move its mtime to now.
+        let path = root.join(id).join("habits.json");
+        let past = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let mtime = |path: &Path| std::fs::metadata(path).unwrap().modified().unwrap();
+        assert_eq!(mtime(&path), past);
+
+        let (seen, changed) = update_checked(root, id, |all| Ok(all.len())).unwrap();
+        assert_eq!(seen, 1);
+        assert!(!changed, "reading changes nothing");
+        // The scheduler's poll: a pass that leaves every habit as it was.
+        update(root, id, |_| Ok(())).unwrap();
+        assert_eq!(
+            mtime(&path),
+            past,
+            "an unchanged update leaves the file alone"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        let ((), changed) = update_checked(root, id, |all| {
+            all[0].name = "Evening digest".into();
+            Ok(())
+        })
+        .unwrap();
+        assert!(changed);
+        assert_ne!(mtime(&path), past, "a real change is saved");
+        assert_eq!(load(root, id).unwrap()[0].name, "Evening digest");
     }
 }
