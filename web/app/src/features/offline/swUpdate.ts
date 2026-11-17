@@ -1,10 +1,11 @@
 // Update flow of the service worker (N-22, architecture.md 3.5): when a new version is waiting, a toast
-// "A new version of Monoptah is ready" offers Reload. Nothing reloads by itself, and a tap while a send
+// "Update available" (the N-22 wording) offers Reload. Nothing reloads by itself, and a tap while a send
 // is in progress waits until the send has ended (the page reload would drop the message).
 import { toast } from "@/ui/sonner";
 
 export const UPDATE_TOAST_ID = "sw-update";
-export const UPDATE_TOAST_TITLE = "A new version of Monoptah is ready";
+export const UPDATE_TOAST_TITLE = "Update available";
+export const UPDATE_READY_COPY = "A new version of Monoptah is ready.";
 export const UPDATE_WAITING_COPY = "Reloading as soon as the message is sent.";
 /** How often a pending reload looks again at the send check. */
 export const SEND_POLL_MS = 500;
@@ -50,6 +51,7 @@ export function applyWhenNoSend(apply: () => void, pollMs: number = SEND_POLL_MS
 export function showUpdateToast(onReload: () => void): void {
   toast(UPDATE_TOAST_TITLE, {
     id: UPDATE_TOAST_ID,
+    description: UPDATE_READY_COPY,
     duration: Infinity,
     action: {
       label: "Reload",

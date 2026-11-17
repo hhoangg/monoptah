@@ -13,6 +13,9 @@ export function Toaster(props: ToasterProps) {
     <Sonner
       theme={scheme}
       position="top-center"
+      // Below the header pill, which the default offset would cover on phones.
+      offset={{ top: "4.5rem" }}
+      mobileOffset={{ top: "4.5rem" }}
       style={
         {
           "--normal-bg": "color-mix(in srgb, var(--surface) 92%, transparent)",
