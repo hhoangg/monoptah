@@ -8,7 +8,8 @@ import { createAppRouter } from "@/router";
 // One entry per route of architecture.md 3.1 (and the file names of workstreams.md 3.1):
 // the concrete URL, the route shown by the stub, and the params the stub must render as text.
 const CASES: ReadonlyArray<{ url: string; route: string; params: Record<string, string>; fullPath: string }> = [
-  { url: "/", route: "/", params: {}, fullPath: "/" },
+  // `/` redirects (F-14, W-06): with no last place registered it lands on /desktops.
+  { url: "/", route: "/desktops", params: {}, fullPath: "/" },
   { url: "/login", route: "/login", params: {}, fullPath: "/login" },
   { url: "/register#invite=ABC", route: "/register", params: {}, fullPath: "/register" },
   { url: "/recover", route: "/recover", params: {}, fullPath: "/recover" },

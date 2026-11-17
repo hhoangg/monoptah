@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { chacha20poly1305 } from "@noble/ciphers/chacha.js";
 import { hexToBytes, bytesToHex } from "@noble/hashes/utils.js";
@@ -12,7 +13,7 @@ import {
   hkdf,
   prologue,
   type KeyPair,
-} from "../src/noise.ts";
+} from "./noise.ts";
 import vectorFile from "./fixtures/noise-ik-chachapoly-sha256-vectors.json" with { type: "json" };
 
 interface NoiseVector {
@@ -304,5 +305,22 @@ describe("Monoptah helpers", () => {
     expect(fingerprint(new Uint8Array(32))).toBe("66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925");
     const key: KeyPair = generateKeyPair();
     expect(fingerprint(key.publicKey)).toMatch(/^[0-9a-f]{64}$/);
+  });
+});
+
+describe("CipherState.destroy (L7)", () => {
+  it("zeroes the key and refuses to pass data through afterwards", () => {
+    const state = new CipherState(new Uint8Array(32).fill(7));
+    state.destroy();
+    expect(state.hasKey()).toBe(false);
+    expect(() => state.encryptWithAd(new Uint8Array(), new Uint8Array([1]))).toThrow(NoiseError);
+    expect(() => state.decryptWithAd(new Uint8Array(), new Uint8Array([1]))).toThrow(NoiseError);
+    expect(() => state.rekey()).toThrow(NoiseError);
+  });
+
+  it("generateKeyPair does not touch a caller's seed", () => {
+    const seed = new Uint8Array(32).fill(9);
+    generateKeyPair(seed);
+    expect(seed.every((byte) => byte === 9)).toBe(true);
   });
 });
