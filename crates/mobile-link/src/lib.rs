@@ -1,4 +1,5 @@
 //! Direct, mutually authenticated QUIC used by desktop and the Expo native module.
+mod duplex;
 mod ffi;
 mod tls;
 mod transcript;

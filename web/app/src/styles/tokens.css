@@ -1,0 +1,173 @@
+/* Design tokens of design-system.md section 5.2 (palette per scheme, theme and accent).
+   Generated once from the section 1 tables; edit by hand from here on and keep
+   theme-init.js and themes.ts in step (a test compares the background values). */
+
+:root,
+:root[data-scheme="light"] {
+  color-scheme: light;
+  --background: #f7f7f7;  --drawer: #f7f7f7;  --sheet: #ffffff;
+  --surface: #ededed;     --surface-raised: #e3e3e3;
+  --stroke: rgba(46, 46, 46, 0.10);  --selection: rgba(46, 46, 46, 0.06);
+  --content: #2e2e2e;  --muted: #737373;  --faint: #a6a6a6;
+  --accent-color: #1f7ae0;
+  --additions: #047857;  --deletions: #be123c;  --caution: #b45309;  --file-ref: #6d28d9;
+  --inverse: #fafafa;  --inverse-surface: #262626;
+  --fill: rgba(46, 46, 46, 0.09);  --thumb: rgba(46, 46, 46, 0.10);  --mark: #2e2e2e;
+  --rail: #dadada;  --bubble: #e9e9e9;  --list-card: #ffffff;  --list-divider: #e6e6e6;
+  --scrim: rgba(0, 0, 0, 0.4);
+}
+
+:root[data-scheme="dark"] {
+  color-scheme: dark;
+  --background: #131313;  --drawer: #131313;  --sheet: #181818;
+  --surface: #202020;     --surface-raised: #2a2a2a;
+  --stroke: rgba(235, 235, 235, 0.08);  --selection: rgba(235, 235, 235, 0.10);
+  --content: #ebebeb;  --muted: #8c8c8c;  --faint: #5c5c5c;
+  --accent-color: #4c9ef5;
+  --additions: #6ee7b7;  --deletions: #f87171;  --caution: #fbbf24;  --file-ref: #c4b5fd;
+  --inverse: #0c0c0c;  --inverse-surface: #f2f2f2;
+  --fill: rgba(255, 255, 255, 0.08);  --thumb: rgba(255, 255, 255, 0.14);  --mark: #ffffff;
+  --rail: #323232;  --bubble: #292929;  --list-card: #1e1e1e;  --list-divider: #2f2f2f;
+}
+
+/* Tinted themes (design-system.md 1.2). "mono" is the default and needs no block.
+   Light themes inherit sheet and listCard (#ffffff) from Classic. */
+:root[data-theme="ocean"][data-scheme="dark"] {
+  --background: #0e1216; --drawer: #0e1216; --sheet: #12171c; --surface: #1b2025;
+  --surface-raised: #242a30; --rail: #2b3036; --bubble: #22282f;
+  --list-card: #171c21; --list-divider: #272d34; --accent-color: #5aa9f7;
+}
+:root[data-theme="ocean"][data-scheme="light"] {
+  --background: #f3f6f9; --drawer: #f3f6f9; --surface: #e8ecf0; --surface-raised: #dce1e7;
+  --rail: #d3d8df; --bubble: #e3e8ed; --list-divider: #e0e4e9; --accent-color: #1f6fc4;
+}
+:root[data-theme="grove"][data-scheme="dark"] {
+  --background: #0e1612; --drawer: #0e1612; --sheet: #121c17; --surface: #1b2520;
+  --surface-raised: #24302a; --rail: #2b3630; --bubble: #222f29;
+  --list-card: #17211c; --list-divider: #27342e; --accent-color: #4cc38a;
+}
+:root[data-theme="grove"][data-scheme="light"] {
+  --background: #f3f9f6; --drawer: #f3f9f6; --surface: #e8f0ec; --surface-raised: #dce7e2;
+  --rail: #d3dfd9; --bubble: #e3ede8; --list-divider: #e0e9e4; --accent-color: #13804f;
+}
+:root[data-theme="ember"][data-scheme="dark"] {
+  --background: #16110e; --drawer: #16110e; --sheet: #1c1612; --surface: #251f1b;
+  --surface-raised: #302924; --rail: #362f2b; --bubble: #2f2722;
+  --list-card: #211b17; --list-divider: #342c27; --accent-color: #f0884a;
+}
+:root[data-theme="ember"][data-scheme="light"] {
+  --background: #f9f5f3; --drawer: #f9f5f3; --surface: #f0ebe8; --surface-raised: #e7e0dc;
+  --rail: #dfd7d3; --bubble: #ede7e3; --list-divider: #e9e3e0; --accent-color: #c2531a;
+}
+:root[data-theme="iris"][data-scheme="dark"] {
+  --background: #110e16; --drawer: #110e16; --sheet: #16121c; --surface: #1f1b25;
+  --surface-raised: #292430; --rail: #2f2b36; --bubble: #27222f;
+  --list-card: #1b1721; --list-divider: #2c2734; --accent-color: #9d87f5;
+}
+:root[data-theme="iris"][data-scheme="light"] {
+  --background: #f5f3f9; --drawer: #f5f3f9; --surface: #ebe8f0; --surface-raised: #e0dce7;
+  --rail: #d7d3df; --bubble: #e7e3ed; --list-divider: #e3e0e9; --accent-color: #6a4fd6;
+}
+:root[data-theme="rose"][data-scheme="dark"] {
+  --background: #160e11; --drawer: #160e11; --sheet: #1c1216; --surface: #251b1f;
+  --surface-raised: #302429; --rail: #362b2f; --bubble: #2f2227;
+  --list-card: #21171b; --list-divider: #34272c; --accent-color: #ec6fa3;
+}
+:root[data-theme="rose"][data-scheme="light"] {
+  --background: #f9f3f5; --drawer: #f9f3f5; --surface: #f0e8eb; --surface-raised: #e7dce0;
+  --rail: #dfd3d7; --bubble: #ede3e7; --list-divider: #e9e0e3; --accent-color: #c42a6c;
+}
+
+/* Accent over a theme (design-system.md 1.3): wins by source order, same specificity. */
+:root[data-accent="blue"][data-scheme="dark"] { --accent-color: #4c9ef5; }
+:root[data-accent="blue"][data-scheme="light"] { --accent-color: #1f7ae0; }
+:root[data-accent="teal"][data-scheme="dark"] { --accent-color: #3cc4c4; }
+:root[data-accent="teal"][data-scheme="light"] { --accent-color: #0f7f86; }
+:root[data-accent="green"][data-scheme="dark"] { --accent-color: #4cc38a; }
+:root[data-accent="green"][data-scheme="light"] { --accent-color: #13804f; }
+:root[data-accent="orange"][data-scheme="dark"] { --accent-color: #f0884a; }
+:root[data-accent="orange"][data-scheme="light"] { --accent-color: #c2531a; }
+:root[data-accent="red"][data-scheme="dark"] { --accent-color: #f06a6a; }
+:root[data-accent="red"][data-scheme="light"] { --accent-color: #c9302c; }
+:root[data-accent="pink"][data-scheme="dark"] { --accent-color: #ec6fa3; }
+:root[data-accent="pink"][data-scheme="light"] { --accent-color: #c42a6c; }
+:root[data-accent="violet"][data-scheme="dark"] { --accent-color: #9d87f5; }
+:root[data-accent="violet"][data-scheme="light"] { --accent-color: #6a4fd6; }
+
+/* Derived tokens, declared once */
+:root {
+  --accent-text: var(--accent-color); /* light override below (section 9) */
+  --content-a04: color-mix(in srgb, var(--content) 4%, transparent);
+  --content-a05: color-mix(in srgb, var(--content) 5%, transparent);
+  --content-a07: color-mix(in srgb, var(--content) 7%, transparent);
+  --content-a08: color-mix(in srgb, var(--content) 8%, transparent);
+  --content-a25: color-mix(in srgb, var(--content) 25%, transparent);
+  --content-a35: color-mix(in srgb, var(--content) 35%, transparent);
+  --content-a40: color-mix(in srgb, var(--content) 40%, transparent);
+  --content-a45: color-mix(in srgb, var(--content) 45%, transparent);
+  --content-a50: color-mix(in srgb, var(--content) 50%, transparent);
+  --content-a55: color-mix(in srgb, var(--content) 55%, transparent);
+  --content-a60: color-mix(in srgb, var(--content) 60%, transparent);
+  --content-a65: color-mix(in srgb, var(--content) 65%, transparent);
+  --content-a72: color-mix(in srgb, var(--content) 72%, transparent);
+  --content-a75: color-mix(in srgb, var(--content) 75%, transparent);
+  --content-a85: color-mix(in srgb, var(--content) 85%, transparent);
+
+  /* shadcn contract. Note: --accent is shadcn's hover surface, NOT the brand accent. */
+  --foreground: var(--content);
+  --card: var(--surface);            --card-foreground: var(--content);
+  --popover: var(--sheet);           --popover-foreground: var(--content);
+  --primary: var(--inverse-surface); --primary-foreground: var(--inverse);
+  --secondary: var(--fill);          --secondary-foreground: var(--content);
+  --muted-foreground: var(--muted);
+  --accent: var(--selection);        --accent-foreground: var(--content);
+  --destructive: var(--deletions);
+  --border: var(--stroke);           --input: var(--stroke);
+  --ring: var(--accent-color);
+  --radius: 12px;
+}
+
+/* Accessibility overrides (design-system.md section 9) */
+:root[data-scheme="light"] {
+  --muted: #666666;
+  --accent-text: color-mix(in srgb, var(--accent-color) 85%, black);
+  --content-a35: var(--content-a72);
+  --content-a40: var(--content-a72);
+  --content-a45: var(--content-a72);
+  --content-a50: var(--content-a72);
+  --content-a55: var(--content-a72);
+  --content-a60: var(--content-a72);
+  --content-a65: var(--content-a72);
+}
+:root[data-scheme="dark"] {
+  --content-a35: var(--content-a50);
+  --content-a40: var(--content-a50);
+  --content-a45: var(--content-a50);
+}
+@media (prefers-contrast: more) {
+  :root {
+    --stroke: color-mix(in srgb, var(--content) 30%, transparent);
+    --content-a35: var(--content);
+    --content-a40: var(--content);
+    --content-a45: var(--content);
+    --content-a50: var(--content);
+    --content-a55: var(--content);
+    --content-a60: var(--content);
+    --content-a65: var(--content);
+    --content-a72: var(--content);
+    --content-a75: var(--content);
+    --content-a85: var(--content);
+  }
+}
+
+/* Motion durations and easings (design-system.md 6.2) */
+:root {
+  --dur-morph: 280ms;
+  --dur-fade: 180ms;
+  --dur-switch: 240ms;
+  --dur-height: 180ms;
+  --dur-header: 300ms;
+  --dur-sheet-backdrop: 180ms;
+  --dur-sheet: 280ms;
+  --dur-spinner-delay: 250ms;
+}

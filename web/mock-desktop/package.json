@@ -1,0 +1,28 @@
+{
+  "name": "@monoptah/mock-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "TypeScript mock desktop for tests: Noise IK responder over relay frames with canned data, plus the Noise IK implementation it uses",
+  "exports": {
+    ".": "./src/index.ts",
+    "./noise": "./src/noise.ts",
+    "./test-client": "./src/client.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "start": "tsx src/cli.ts"
+  },
+  "devDependencies": {
+    "tsx": "^4.23.15"
+  },
+  "dependencies": {
+    "@noble/ciphers": "^2.4.0",
+    "@noble/curves": "^2.4.0",
+    "@noble/hashes": "^2.4.0",
+    "zod": "^4.6.7",
+    "@monoptah/protocol": "workspace:*"
+  }
+}

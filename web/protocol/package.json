@@ -1,0 +1,21 @@
+{
+  "name": "@monoptah/protocol",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Wire contracts of the Monoptah web app: relay frames, chunking, close and error codes, desktop methods, /api types",
+  "exports": {
+    ".": "./src/index.ts",
+    "./vectors.json": "./vectors.json",
+    "./methods.json": "./methods.json"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "vectors:gen": "node scripts/gen-vectors.ts"
+  },
+  "dependencies": {
+    "zod": "^4.6.7"
+  }
+}

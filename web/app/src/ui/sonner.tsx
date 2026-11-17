@@ -1,0 +1,26 @@
+import type { CSSProperties } from "react";
+import { Toaster as Sonner, type ToasterProps } from "sonner";
+import { useAppearance } from "@/lib/appearance";
+
+// Toasts (design-system.md section 8): glass-like surface, radius 16, 1px stroke, no shadow
+// (the shadow of sonner's own stylesheet is removed in styles/overlays.css).
+export function Toaster(props: ToasterProps) {
+  const scheme = useAppearance((state) => state.scheme);
+  return (
+    <Sonner
+      theme={scheme}
+      position="top-center"
+      style={
+        {
+          "--normal-bg": "color-mix(in srgb, var(--surface) 92%, transparent)",
+          "--normal-text": "var(--content)",
+          "--normal-border": "var(--stroke)",
+          "--border-radius": "16px",
+        } as CSSProperties
+      }
+      {...props}
+    />
+  );
+}
+
+export { toast } from "sonner";

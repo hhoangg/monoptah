@@ -20,6 +20,22 @@ pub struct Notice {
     pub data: Value,
 }
 
+/// What a web notice says, with no title or text: only enough for the browser
+/// to build its own line (architecture.md section 8).
+pub struct WebNotice<'a> {
+    /// `agentFinished`, `agentInput` or `monoMessages`.
+    pub category: &'a str,
+    /// None for a Mono's own chat, which has no session.
+    pub session_id: Option<&'a str>,
+    pub mono_id: Option<&'a str>,
+    /// The project's display name, or the Mono's name for a Mono notice.
+    pub project: &'a str,
+}
+
+/// Tells the paired web devices that take `notice.category` about it. A no-op
+/// until the web push path exists: no web device is paired.
+pub fn notify_web(_notice: &WebNotice) {}
+
 /// Sends `notice` to each token. Returns the tokens Expo says no longer reach
 /// a phone, to forget.
 pub fn send(tokens: &[String], notice: &Notice) -> Result<Vec<String>, String> {

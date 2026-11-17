@@ -96,6 +96,7 @@ mod title_tabs;
 mod today_sessions;
 mod tui_busy;
 mod tui_sessions;
+mod web_link;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod window_chrome;
 mod worktrees;

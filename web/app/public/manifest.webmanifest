@@ -1,0 +1,11 @@
+{
+  "id": "/",
+  "name": "Monoptah",
+  "short_name": "Monoptah",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "theme_color": "#131313",
+  "background_color": "#131313"
+}

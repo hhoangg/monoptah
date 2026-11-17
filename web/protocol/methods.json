@@ -1,0 +1,245 @@
+{
+  "version": 1,
+  "methods": [
+    {
+      "name": "accounts.usage",
+      "class": "param",
+      "transport": "app"
+    },
+    {
+      "name": "cloud.cancelMove",
+      "class": "control",
+      "transport": "app"
+    },
+    {
+      "name": "cloud.instances",
+      "class": "read",
+      "transport": "app"
+    },
+    {
+      "name": "cloud.keepRunning",
+      "class": "control",
+      "transport": "app"
+    },
+    {
+      "name": "cloud.moveToCloud",
+      "class": "control",
+      "transport": "app"
+    },
+    {
+      "name": "cloud.moveToLocal",
+      "class": "control",
+      "transport": "app"
+    },
+    {
+      "name": "cloud.resume",
+      "class": "control",
+      "transport": "app"
+    },
+    {
+      "name": "cloud.retryStart",
+      "class": "control",
+      "transport": "app"
+    },
+    {
+      "name": "cloud.startOptions",
+      "class": "read",
+      "transport": "app"
+    },
+    {
+      "name": "cloud.stop",
+      "class": "control",
+      "transport": "app"
+    },
+    {
+      "name": "conversation.older",
+      "class": "read",
+      "transport": "app"
+    },
+    {
+      "name": "conversation.read",
+      "class": "read",
+      "transport": "app"
+    },
+    {
+      "name": "conversation.send",
+      "class": "control",
+      "transport": "app"
+    },
+    {
+      "name": "conversation.watch",
+      "class": "read",
+      "transport": "host"
+    },
+    {
+      "name": "device.enroll",
+      "class": "denied",
+      "transport": "host"
+    },
+    {
+      "name": "device.leave",
+      "class": "read",
+      "transport": "host"
+    },
+    {
+      "name": "device.push",
+      "class": "unsupportedWeb",
+      "transport": "host"
+    },
+    {
+      "name": "device.selection",
+      "class": "param",
+      "transport": "host"
+    },
+    {
+      "name": "models.list",
+      "class": "read",
+      "transport": "app"
+    },
+    {
+      "name": "mono.create",
+      "class": "control",
+      "transport": "app"
+    },
+    {
+      "name": "mono.delete",
+      "class": "denied",
+      "transport": "app"
+    },
+    {
+      "name": "mono.document",
+      "class": "read",
+      "transport": "app"
+    },
+    {
+      "name": "mono.file",
+      "class": "read",
+      "transport": "app"
+    },
+    {
+      "name": "mono.profile",
+      "class": "read",
+      "transport": "app"
+    },
+    {
+      "name": "mono.reset",
+      "class": "denied",
+      "transport": "app"
+    },
+    {
+      "name": "mono.saveFile",
+      "class": "denied",
+      "transport": "app"
+    },
+    {
+      "name": "mono.update",
+      "class": "control",
+      "transport": "app"
+    },
+    {
+      "name": "project.changes",
+      "class": "read",
+      "transport": "app"
+    },
+    {
+      "name": "project.file",
+      "class": "read",
+      "transport": "app"
+    },
+    {
+      "name": "project.fileHighlight",
+      "class": "unsupportedWeb",
+      "transport": "app"
+    },
+    {
+      "name": "project.files",
+      "class": "read",
+      "transport": "app"
+    },
+    {
+      "name": "project.git",
+      "class": "read",
+      "transport": "app"
+    },
+    {
+      "name": "project.gitAction",
+      "class": "param",
+      "transport": "app"
+    },
+    {
+      "name": "project.search",
+      "class": "read",
+      "transport": "app"
+    },
+    {
+      "name": "project.worktrees",
+      "class": "read",
+      "transport": "app"
+    },
+    {
+      "name": "session.answerApproval",
+      "class": "control",
+      "transport": "app"
+    },
+    {
+      "name": "session.answerQuestion",
+      "class": "control",
+      "transport": "app"
+    },
+    {
+      "name": "session.archive",
+      "class": "control",
+      "transport": "app"
+    },
+    {
+      "name": "session.cancel",
+      "class": "control",
+      "transport": "app"
+    },
+    {
+      "name": "session.configure",
+      "class": "control",
+      "transport": "app"
+    },
+    {
+      "name": "session.delete",
+      "class": "control",
+      "transport": "app"
+    },
+    {
+      "name": "session.keepQuestionOpen",
+      "class": "control",
+      "transport": "app"
+    },
+    {
+      "name": "session.rename",
+      "class": "control",
+      "transport": "app"
+    },
+    {
+      "name": "session.resumeUsage",
+      "class": "control",
+      "transport": "app"
+    },
+    {
+      "name": "session.resumeUsageAtReset",
+      "class": "control",
+      "transport": "app"
+    },
+    {
+      "name": "session.start",
+      "class": "param",
+      "transport": "app"
+    },
+    {
+      "name": "sessions.list",
+      "class": "read",
+      "transport": "host"
+    },
+    {
+      "name": "workspace.list",
+      "class": "read",
+      "transport": "host"
+    }
+  ]
+}
