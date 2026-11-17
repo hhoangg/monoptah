@@ -7,7 +7,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
-import { defaultRun, main, parseArgs } from "./deploy-official.mjs";
+import { AUDIT_ACTIONS } from "../worker/src/modules/audit/actions.ts";
+import { buildPlan, COMMIT_RE, defaultRun, main, parseArgs, VERSION_RE } from "./deploy-official.mjs";
 
 const GIT_ENV = {
   ...process.env,
@@ -155,7 +156,7 @@ test("refuses when the branding check fails", () => {
 test("dry-run on a clean main equal to origin/main prints a plan with migrations before deploy and runs no remote command", () => {
   const r = go(["--dry-run"]);
   assert.equal(r.code, 0, r.err);
-  assert.deepEqual(r.calls, ["pnpm check", "branding"]);
+  assert.deepEqual(r.calls, ["pnpm install", "pnpm check", "branding"]);
   const mig = r.out.indexOf("migrations apply");
   const dep = r.out.indexOf("deploy -c");
   assert.ok(mig > 0 && dep > mig, r.out);
@@ -166,7 +167,7 @@ test("dry-run on a clean main equal to origin/main prints a plan with migrations
 test("a real run builds, migrates, deploys, then records the audit row, and prints the runbook line", () => {
   const r = go([], { platform: "darwin" });
   assert.equal(r.code, 0, r.err);
-  assert.deepEqual(r.calls, ["pnpm check", "branding", "pnpm --filter", "wrangler d1 migrations", "wrangler deploy", "wrangler d1 execute", "whoami undefined"]);
+  assert.deepEqual(r.calls, ["pnpm install", "pnpm check", "branding", "pnpm --filter", "wrangler d1 migrations", "wrangler deploy", "wrangler d1 execute", "whoami undefined"]);
   const sha = sh(work, "rev-parse", "HEAD").trim();
   assert.match(r.out, new RegExp(`\\| \\d{4}-\\d{2}-\\d{2} \\| ${sha} \\| 1\\.2\\.3 \\| tester \\|`));
 });
@@ -174,5 +175,57 @@ test("a real run builds, migrates, deploys, then records the audit row, and prin
 test("a failed migration stops before the deploy", () => {
   const r = go([], { platform: "darwin", fail: ["wrangler d1"] });
   assert.equal(r.code, 1);
+  assert.ok(!r.calls.includes("wrangler deploy"));
+});
+
+test("refuses when pnpm install --frozen-lockfile fails, before pnpm check", () => {
+  const r = go(["--dry-run"], { fail: ["pnpm install"] });
+  assert.equal(r.code, 1);
+  assert.match(r.err, /frozen-lockfile` failed/);
+  assert.ok(!r.calls.includes("pnpm check"));
+});
+
+const GOOD_COMMIT = "0123456789abcdef0123456789abcdef01234567";
+
+test("the audit INSERT uses the registry action and its meta passes the registry schema", () => {
+  const plan = buildPlan({ webDir: "/w", commit: GOOD_COMMIT, version: "1.2.3+abc", now: 1700000000, id: "id-1" });
+  const sql = plan.find((s) => s.name === "audit").args.at(-1);
+  const m = /VALUES \('id-1', 1700000000, NULL, '(\w+)', '([\w.]+)', NULL, NULL, '(.*)'\);$/.exec(sql);
+  assert.ok(m, sql);
+  const [, kind, action, metaJson] = m;
+  assert.equal(kind, "system");
+  assert.equal(action, "system.deploy");
+  const spec = AUDIT_ACTIONS[action];
+  assert.ok(spec.actorKinds.includes(kind));
+  assert.deepEqual(spec.meta.parse(JSON.parse(metaJson)), { commit: GOOD_COMMIT, version: "1.2.3+abc" });
+});
+
+test("the script patterns match the registry schema", () => {
+  const meta = AUDIT_ACTIONS["system.deploy"].meta;
+  const cases = [
+    [GOOD_COMMIT, "1.2.3"],
+    [GOOD_COMMIT.toUpperCase(), "1.2.3"],
+    [GOOD_COMMIT.slice(1), "1.2.3"],
+    [GOOD_COMMIT, "1'; DROP TABLE audit_log; --"],
+    [GOOD_COMMIT, "a".repeat(33)],
+    [GOOD_COMMIT, "a".repeat(32)],
+    [GOOD_COMMIT, ""],
+  ];
+  for (const [commit, version] of cases)
+    assert.equal(COMMIT_RE.test(commit) && VERSION_RE.test(version), meta.safeParse({ commit, version }).success, `${commit} ${version}`);
+});
+
+test("buildPlan refuses a commit or version that is not validated, so nothing is interpolated into SQL", () => {
+  assert.throws(() => buildPlan({ webDir: "/w", commit: "x' OR 1=1 --", version: "1.2.3" }), /40-character/);
+  assert.throws(() => buildPlan({ webDir: "/w", commit: GOOD_COMMIT, version: "1'); DROP TABLE audit_log; --" }), /does not match/);
+});
+
+test("a real run with an invalid app version refuses before any remote step", () => {
+  writeFileSync(join(work, "web", "app", "package.json"), '{ "version": "1.2.3 bad" }\n');
+  sh(work, "commit", "-qam", "bad version");
+  sh(work, "push", "-q", "origin", "main");
+  const r = go([], { platform: "darwin" });
+  assert.equal(r.code, 1);
+  assert.match(r.err, /does not match/);
   assert.ok(!r.calls.includes("wrangler deploy"));
 });

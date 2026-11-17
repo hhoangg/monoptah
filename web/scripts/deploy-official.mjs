@@ -7,7 +7,8 @@
 //   1. CI is not set (never from CI)           2. macOS (a real run only; --dry-run works anywhere)
 //   3. clean tree (untracked files count)      4. branch is main
 //   5. main equals origin/main (after fetch)   6. wrangler.jsonc has no placeholder database_id or VAPID key
-//   7. `pnpm check` passes in web/             8. scripts/check-fork-branding.sh passes
+//   7. `pnpm install --frozen-lockfile` and `pnpm check` pass in web/ (installed deps match the lockfile)
+//   8. scripts/check-fork-branding.sh passes
 // Then: build the app, apply D1 migrations (FIRST), wrangler deploy, record the deploy in audit_log, and print
 // the line to append to the deploy log of the runbook. --dry-run runs every preflight check for real (git and
 // checks) and prints the plan instead of running any remote command.
@@ -23,6 +24,10 @@ const here = dirname(fileURLToPath(import.meta.url));
 export const DATABASE_NAME = "monoptah";
 
 export class Refusal extends Error {}
+
+// Same patterns as the `system.deploy` entry of worker/src/modules/audit/actions.ts (a test keeps them equal).
+export const COMMIT_RE = /^[0-9a-f]{40}$/;
+export const VERSION_RE = /^[0-9A-Za-z.+-]{1,32}$/;
 
 /** Default command runner. `stream` shows the output live (long steps); otherwise it is captured. */
 export function defaultRun(cmd, args, { cwd, stream = false } = {}) {
@@ -71,6 +76,10 @@ export function preflight({ root, env, platform, dryRun, run, log = () => {} }) 
     throw new Refusal("web/wrangler.jsonc still has the placeholder database_id (all zeros)");
   if (/REPLACE_WITH/.test(cfg)) throw new Refusal("web/wrangler.jsonc still has a REPLACE_WITH placeholder (VAPID_PUBLIC_KEY)");
 
+  log("preflight: running pnpm install --frozen-lockfile in web/ ...");
+  if (run("pnpm", ["install", "--frozen-lockfile"], { cwd: webDir, stream: true }).status !== 0)
+    throw new Refusal("`pnpm install --frozen-lockfile` failed (the lockfile is out of date or the install broke)");
+
   log("preflight: running pnpm check in web/ ...");
   if (run("pnpm", ["check"], { cwd: webDir, stream: true }).status !== 0) throw new Refusal("`pnpm check` failed");
 
@@ -85,10 +94,13 @@ export function preflight({ root, env, platform, dryRun, run, log = () => {} }) 
 export function buildPlan({ webDir, commit, version, now = Math.floor(Date.now() / 1000), id = randomUUID() }) {
   const wrangler = join(webDir, "worker", "node_modules", ".bin", "wrangler");
   const cfg = join(webDir, "wrangler.jsonc");
+  if (!COMMIT_RE.test(commit)) throw new Refusal("commit is not a 40-character lowercase hex sha");
+  if (!VERSION_RE.test(version)) throw new Refusal(`app version "${version}" does not match ${VERSION_RE}`);
+  if (!/^[0-9A-Za-z-]+$/.test(id) || !Number.isInteger(now)) throw new Refusal("invalid audit row id or timestamp");
   const meta = JSON.stringify({ commit, version });
   const sql =
     "INSERT INTO audit_log (id, ts, actor_user_id, actor_kind, action, target_type, target_id, meta) " +
-    `VALUES ('${id}', ${now}, NULL, 'system', 'deploy', NULL, NULL, '${meta}');`;
+    `VALUES ('${id}', ${now}, NULL, 'system', 'system.deploy', NULL, NULL, '${meta}');`;
   return [
     { name: "build", cmd: "pnpm", args: ["--filter", "@monoptah/app", "build"] },
     { name: "migrate", cmd: wrangler, args: ["d1", "migrations", "apply", DATABASE_NAME, "--remote", "-c", cfg] },
@@ -120,7 +132,14 @@ export function main(argv, { root = join(here, "..", ".."), env = process.env, p
 
   const webDir = join(root, "web");
   const version = JSON.parse(readFileSync(join(webDir, "app", "package.json"), "utf8")).version;
-  const plan = buildPlan({ webDir, commit, version });
+  let plan;
+  try {
+    plan = buildPlan({ webDir, commit, version });
+  } catch (e) {
+    if (!(e instanceof Refusal)) throw e;
+    console.error(`deploy:official: refused: ${e.message}`);
+    return 1;
+  }
 
   if (opts.dryRun) {
     log("deploy:official: preflight passed. Dry run: nothing is executed. Plan, in this order:");

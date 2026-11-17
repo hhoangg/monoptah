@@ -34,7 +34,7 @@ const SAMPLES: { [A in AuditAction]: Record<string, unknown> } = {
   "session.logout": {},
   "session.revoke": { all: true, count: 3 },
   "ratelimit.breach": { group: "login", limit: 30, windowSeconds: 600, ipHash: HASH },
-  "system.deploy": { version: "1.2.3+abc" },
+  "system.deploy": { version: "1.2.3+abc", commit: "0123456789abcdef0123456789abcdef01234567" },
 };
 
 const SECURITY_MD_10_EVENTS = [
