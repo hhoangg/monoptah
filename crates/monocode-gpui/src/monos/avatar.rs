@@ -40,35 +40,27 @@ fn material(name: &str, x: usize, y: usize, base: Hsla) -> Hsla {
         _ => base,
     }
 }
-pub(crate) fn avatar(name: &str, color: u32, status: &str, side: f32, still: bool) -> AnyElement {
+/// Only a working Mono moves. An idle one rests: it holds no lease on the
+/// shared clock, so a roster of idle avatars costs no frames. `_still` is kept
+/// for callers that already say so.
+pub(crate) fn avatar(name: &str, color: u32, status: &str, side: f32, _still: bool) -> AnyElement {
     let index = SPRITES.iter().position(|m| m.name == name).unwrap_or(1);
     let status = status.to_string();
     canvas(
         |_, _, _| {},
         move |bounds, _, window, cx| {
-            // "needs-you" holds still, so it must not keep the clock running.
+            // Only "working" animates; idle and "needs-you" hold still, so they
+            // must not keep the clock running.
             let working = status == "working";
-            let moves = working || (!still && status != "needs-you");
-            // Pixel art reads fine at a low frame rate; a working hop is faster.
-            let rate = if working {
-                crate::pulse::Rate::Half
-            } else {
-                crate::pulse::Rate::Low
-            };
-            let animate = moves && crate::pulse::request(rate, window, cx);
+            // Pixel art reads fine at a low frame rate.
+            let animate = working && crate::pulse::request(crate::pulse::Rate::Half, window, cx);
             let t = crate::pulse::elapsed(cx).as_secs_f32();
             let talk = animate && status == "working" && (t * 3.).floor() as u64 % 2 == 1;
             let sprite = &SPRITES[index];
             let rows = if talk { &sprite.talk } else { &sprite.rest };
             let unit = bounds.size.width / 16.;
             let hop = if animate {
-                if status == "working" {
-                    -(t * 9.).sin().abs() * 0.9
-                } else if status == "needs-you" {
-                    0.
-                } else {
-                    (t * 2.5).sin() * 0.25
-                }
+                -(t * 9.).sin().abs() * 0.9
             } else {
                 0.
             };
@@ -192,4 +184,40 @@ pub(crate) fn avatar(name: &str, color: u32, status: &str, side: f32, still: boo
     .size(px(side))
     .flex_shrink_0()
     .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{Context, Render, TestAppContext, Window, div};
+
+    struct Roster(&'static str);
+    impl Render for Roster {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            // Not `still`: the old idle bob only ran for avatars like this one.
+            div().child(avatar("cat", 0x6f84a3, self.0, 48., false))
+        }
+    }
+
+    fn holds_lease(status: &'static str, cx: &mut TestAppContext) -> bool {
+        cx.update(|cx| cx.set_reduce_motion(false));
+        let (_view, cx) = cx.add_window_view(|_, _| Roster(status));
+        cx.run_until_parked();
+        cx.update(|_, cx| crate::pulse::running(cx))
+    }
+
+    #[gpui::test]
+    fn an_idle_avatar_holds_no_lease(cx: &mut TestAppContext) {
+        assert!(!holds_lease("idle", cx));
+    }
+
+    #[gpui::test]
+    fn a_needs_you_avatar_holds_no_lease(cx: &mut TestAppContext) {
+        assert!(!holds_lease("needs-you", cx));
+    }
+
+    #[gpui::test]
+    fn a_working_avatar_leases_the_clock(cx: &mut TestAppContext) {
+        assert!(holds_lease("working", cx));
+    }
 }
