@@ -16,6 +16,17 @@ import {
   USER_ROLE_SQL,
 } from "../src/modules/auth/register.ts";
 import { INVITES_PAUSED_SQL, USER_COUNT_SQL } from "../src/modules/invites/gate.ts";
+import {
+  ADD_PASSKEY_EXCLUDE_SQL,
+  COUNT_PASSKEYS_SQL,
+  DELETE_PASSKEY_CONDITION_SQL,
+  DELETE_PASSKEY_SQL,
+  GET_PASSKEY_SQL,
+  INSERT_ADDED_PASSKEY_SQL,
+  LIST_PASSKEYS_SQL,
+  PASSKEY_EXISTS_SQL,
+  RENAME_PASSKEY_SQL,
+} from "../src/modules/passkeys/manage.ts";
 import { CONSUME_CHALLENGE_SQL, INSERT_CHALLENGE_SQL } from "../src/modules/passkeys/challenges.ts";
 import { INVITES_USED_SQL, ME_ROW_SQL, PATCH_DISPLAY_NAME_SQL } from "../src/modules/me/handlers.ts";
 import { CONSUME_SQL } from "../src/modules/ratelimit/limiter.ts";
@@ -79,6 +90,15 @@ const CASES: PlanCase[] = [
   { name: "set reauth_at", sql: SET_REAUTH_SQL, bind: [1, "h"] },
   { name: "audit first page", sql: AUDIT_PAGE_SQL, bind: ["u", 51], noTempSort: true },
   { name: "audit next page", sql: AUDIT_PAGE_AFTER_SQL, bind: ["u", 1, "id", 51], noTempSort: true },
+  { name: "passkeys: list own", sql: LIST_PASSKEYS_SQL, bind: ["u"] },
+  { name: "passkeys: get own by id", sql: GET_PASSKEY_SQL, bind: ["c", "u"] },
+  { name: "passkeys: exclude list", sql: ADD_PASSKEY_EXCLUDE_SQL, bind: ["u"] },
+  { name: "passkeys: insert added", sql: INSERT_ADDED_PASSKEY_SQL, bind: ["c", "u", "k", 0, "[]", "d", 0, null, "u", 1] },
+  { name: "passkeys: rename", sql: RENAME_PASSKEY_SQL, bind: ["n", "c", "u"] },
+  { name: "passkeys: exists condition", sql: `SELECT 1 WHERE ${PASSKEY_EXISTS_SQL}`, bind: ["c", "u"] },
+  { name: "passkeys: count", sql: COUNT_PASSKEYS_SQL, bind: ["u"] },
+  { name: "passkeys: delete condition", sql: `SELECT 1 WHERE ${DELETE_PASSKEY_CONDITION_SQL}`, bind: ["c", "u", "u"] },
+  { name: "passkeys: delete", sql: DELETE_PASSKEY_SQL, bind: ["c", "u", "u"] },
 ];
 
 describe("query plans", () => {
@@ -91,6 +111,8 @@ describe("query plans", () => {
     for (const detail of details) {
       if (c.usersCountScan && /^SCAN users USING COVERING INDEX /.test(detail)) continue;
       if (c.fkChildScans?.some((table) => detail === `SCAN ${table}`)) continue;
+      // `INSERT ... SELECT ... WHERE <condition>` reads one constant row, not a table.
+      if (detail === "SCAN CONSTANT ROW") continue;
       expect(detail, detail).not.toMatch(/^SCAN /);
       if (c.noTempSort) expect(detail, detail).not.toMatch(/TEMP B-TREE/);
     }
