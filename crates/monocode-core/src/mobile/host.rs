@@ -143,6 +143,13 @@ struct Config {
     remote_address: String,
     #[serde(default)]
     devices: Vec<Device>,
+    /// The web link runs independently of QUIC `enabled`. Left out of the file
+    /// while off, so a phone-only file is unchanged.
+    #[serde(default, skip_serializing_if = "is_false")]
+    web_enabled: bool,
+}
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 impl Default for Config {
     fn default() -> Self {
@@ -151,6 +158,7 @@ impl Default for Config {
             open_router: true,
             remote_address: String::new(),
             devices: Vec::new(),
+            web_enabled: false,
         }
     }
 }
@@ -263,6 +271,8 @@ pub struct MobileHost {
     keychain: Arc<dyn IdentityKeychain>,
     pending: Arc<AtomicUsize>,
     shut_down: Arc<AtomicBool>,
+    /// The web link's client task, status and pending grants.
+    web: super::web_link::WebLink,
 }
 
 fn unavailable<T>(_: T) -> String {
@@ -346,6 +356,7 @@ impl MobileHost {
             keychain,
             pending: Arc::default(),
             shut_down: Arc::default(),
+            web: super::web_link::WebLink::default(),
         };
         // Loading the identity reads the database (and, once, the legacy
         // keychain entry, which can wait on an access prompt), and the app opens
@@ -406,6 +417,7 @@ impl MobileHost {
                 open_router,
                 remote_address: remote_address.into(),
                 devices: inner.config.devices.clone(),
+                web_enabled: inner.config.web_enabled,
             };
             self.save(&config)?;
             inner.config = config;
@@ -549,6 +561,7 @@ impl MobileHost {
     /// Stops serving and releases the router mapping; for app shutdown.
     pub fn shutdown(&self) {
         self.shut_down.store(true, Ordering::SeqCst);
+        self.web.stop();
         if let Ok(mut inner) = self.inner.lock() {
             if let Some(endpoint) = inner.endpoint.take() {
                 endpoint.close(0_u32.into(), b"Desktop closed");
@@ -557,7 +570,7 @@ impl MobileHost {
         }
     }
 
-    fn runtime(&self) -> Result<&tokio::runtime::Runtime, String> {
+    pub(super) fn runtime(&self) -> Result<&tokio::runtime::Runtime, String> {
         if let Some(runtime) = self.runtime.get() {
             return Ok(runtime);
         }
@@ -705,9 +718,25 @@ impl MobileHost {
         )
     }
 
-    async fn handle(&self, peer: &str, request: Value) -> Result<Value, String> {
+    /// A QUIC phone's request.
+    pub(super) async fn handle(&self, peer: &str, request: Value) -> Result<Value, String> {
+        self.handle_from(DeviceKind::Phone, peer, request).await
+    }
+
+    /// A web device's request, delivered by the web link. Needs `web_enabled`
+    /// and a web row; a phone row is never served here.
+    pub(super) async fn handle_web(&self, peer: &str, request: Value) -> Result<Value, String> {
+        self.handle_from(DeviceKind::Web, peer, request).await
+    }
+
+    async fn handle_from(
+        &self,
+        via: DeviceKind,
+        peer: &str,
+        request: Value,
+    ) -> Result<Value, String> {
         let mut audited = None;
-        let result = self.handle_call(peer, &request, &mut audited).await;
+        let result = self.call_from(via, peer, &request, &mut audited).await;
         // Recorded with no lock held: the log may write a file.
         if let Some((context, mut event)) = audited {
             event.outcome = final_outcome(event.outcome, result.is_err());
@@ -719,8 +748,21 @@ impl MobileHost {
     /// `handle` without the audit record: it leaves the event of an
     /// identified device in `audited` for `handle` to record once the call
     /// has an outcome.
+    #[cfg(test)] // QUIC phone call, kept for the audit tests
     async fn handle_call(
         &self,
+        peer: &str,
+        request: &Value,
+        audited: &mut Option<(DeviceContext, AuditEvent)>,
+    ) -> Result<Value, String> {
+        self.call_from(DeviceKind::Phone, peer, request, audited)
+            .await
+    }
+
+    /// `handle_call` for the transport `via`.
+    async fn call_from(
+        &self,
+        via: DeviceKind,
         peer: &str,
         request: &Value,
         audited: &mut Option<(DeviceContext, AuditEvent)>,
@@ -735,24 +777,16 @@ impl MobileHost {
         }
         let device = {
             let mut inner = self.inner.lock().map_err(unavailable)?;
-            if !inner.config.enabled {
-                return Err("Mobile access disabled".into());
-            }
+            check_enabled(&inner, via)?;
             // Pairing is the QUIC phones' own flow. The web transport pairs
             // through the relay, so a web context must never enrol here.
             if method == "device.enroll" {
-                if !enroll_allowed(DeviceKind::Phone) {
+                if !enroll_allowed(via) {
                     return Err("Unsupported mobile operation".into());
                 }
                 return self.enroll(&mut inner, peer, &params);
             }
-            let device = inner
-                .config
-                .devices
-                .iter()
-                .find(|device| device.fingerprint == peer)
-                .ok_or("Device revoked or not paired")?
-                .clone();
+            let device = find_device(&inner, via, peer)?;
             let context = device_context(&device);
             *audited = Some((context.clone(), audit_event(&device, method, request)));
             if let Err(denial) = policy::authorize(&context, method, &params) {
@@ -831,7 +865,14 @@ impl MobileHost {
         };
         self.pending.fetch_sub(1, Ordering::SeqCst);
         let response = response?;
-        if !self.gate.admits(peer) {
+        let admitted = match via {
+            DeviceKind::Phone => self.gate.admits(peer),
+            DeviceKind::Web => self
+                .inner
+                .lock()
+                .is_ok_and(|inner| find_device(&inner, via, peer).is_ok()),
+        };
+        if !admitted {
             return Err("Device revoked".into());
         }
         response
@@ -839,9 +880,37 @@ impl MobileHost {
 
     /// A phone starts watching a conversation. The app sends its state, then
     /// every change, until the phone goes or the watch is stopped.
-    async fn watch(&self, peer: &str, request: Value, sink: WatchSink) -> Result<(), String> {
+    pub(super) async fn watch(
+        &self,
+        peer: &str,
+        request: Value,
+        sink: WatchSink,
+    ) -> Result<(), String> {
+        self.watch_from(DeviceKind::Phone, peer, request, sink)
+            .await
+    }
+
+    /// `watch` for a web device, as `handle_web` is to `handle`.
+    pub(super) async fn watch_web(
+        &self,
+        peer: &str,
+        request: Value,
+        sink: WatchSink,
+    ) -> Result<(), String> {
+        self.watch_from(DeviceKind::Web, peer, request, sink).await
+    }
+
+    async fn watch_from(
+        &self,
+        via: DeviceKind,
+        peer: &str,
+        request: Value,
+        sink: WatchSink,
+    ) -> Result<(), String> {
         let mut audited = None;
-        let result = self.watch_call(peer, &request, sink, &mut audited).await;
+        let result = self
+            .watch_call_from(via, peer, &request, sink, &mut audited)
+            .await;
         // Recorded with no lock held: the log may write a file.
         if let Some((context, mut event)) = audited {
             event.outcome = final_outcome(event.outcome, result.is_err());
@@ -851,8 +920,9 @@ impl MobileHost {
     }
 
     /// `watch` without the audit record, as `handle_call` is to `handle`.
-    async fn watch_call(
+    async fn watch_call_from(
         &self,
+        via: DeviceKind,
         peer: &str,
         request: &Value,
         sink: WatchSink,
@@ -873,16 +943,8 @@ impl MobileHost {
         let id = uuid::Uuid::new_v4().to_string();
         let context = {
             let mut inner = self.inner.lock().map_err(unavailable)?;
-            if !inner.config.enabled {
-                return Err("Mobile access disabled".into());
-            }
-            let device = inner
-                .config
-                .devices
-                .iter()
-                .find(|device| device.fingerprint == peer)
-                .ok_or("Device revoked or not paired")?
-                .clone();
+            check_enabled(&inner, via)?;
+            let device = find_device(&inner, via, peer)?;
             let context = device_context(&device);
             *audited = Some((
                 context.clone(),
@@ -981,6 +1043,28 @@ impl MobileHost {
     }
 }
 
+/// Whether the transport `via` is switched on: QUIC phones need `enabled`, web
+/// devices need `web_enabled`, and neither depends on the other.
+fn check_enabled(inner: &Inner, via: DeviceKind) -> Result<(), String> {
+    match via {
+        DeviceKind::Phone if !inner.config.enabled => Err("Mobile access disabled".into()),
+        DeviceKind::Web if !inner.config.web_enabled => Err("Web access disabled".into()),
+        _ => Ok(()),
+    }
+}
+
+/// The paired device with this fingerprint that belongs to the transport: a
+/// QUIC phone is never found through the web path, nor a web device through QUIC.
+fn find_device(inner: &Inner, via: DeviceKind, peer: &str) -> Result<Device, String> {
+    inner
+        .config
+        .devices
+        .iter()
+        .find(|device| device.fingerprint == peer && device.kind == via)
+        .cloned()
+        .ok_or_else(|| "Device revoked or not paired".to_string())
+}
+
 /// Ends every open watch of the device behind `peer`, as its selection,
 /// permission or pairing changed. The phone reopens, and the app checks the
 /// new access again.
@@ -1038,7 +1122,6 @@ impl MobileHost {
     }
 
     /// The web link's sealed identity. `Ok(None)` means none was saved.
-    #[allow(dead_code)] // Used by the web link session once it lands.
     pub(crate) fn load_web_identity(&self) -> Result<Option<identity_store::WebIdentity>, String> {
         identity_store::load_web(
             &self.web_database()?,
@@ -1061,10 +1144,98 @@ impl MobileHost {
 
     /// Unpairs the web link by wiping its sealed identity. Safe to repeat.
     pub fn web_unpair(&self) -> Result<(), String> {
+        self.web.stop();
         identity_store::wipe_web(
             &self.web_database()?,
             &identity_store::web_account_for(&self.path),
         )
+    }
+}
+
+impl MobileHost {
+    /// Whether the web link is switched on (independent of QUIC access).
+    pub fn web_enabled(&self) -> bool {
+        self.inner
+            .lock()
+            .is_ok_and(|inner| inner.config.web_enabled)
+    }
+
+    /// Switches the web link on or off, saves the choice and starts or stops
+    /// the relay client. It never binds a socket and never touches the router.
+    pub fn set_web_enabled(&self, enabled: bool) -> Result<(), String> {
+        self.set_web_enabled_with(enabled, super::web_link::relay::Timing::default())
+    }
+
+    pub(super) fn set_web_enabled_with(
+        &self,
+        enabled: bool,
+        timing: super::web_link::relay::Timing,
+    ) -> Result<(), String> {
+        {
+            let mut inner = self.inner.lock().map_err(unavailable)?;
+            let mut config = inner.config.clone();
+            config.web_enabled = enabled;
+            self.save(&config)?;
+            inner.config = config;
+        }
+        super::web_link::sync_with(self, timing);
+        Ok(())
+    }
+
+    /// What Settings shows about the web link.
+    pub fn web_status(&self) -> super::web_link::WebStatus {
+        let enabled = self.web_enabled();
+        self.web.status(enabled)
+    }
+
+    pub(super) fn web_link(&self) -> &super::web_link::WebLink {
+        &self.web
+    }
+
+    /// What the web link knows of a device fingerprint, for a handshake.
+    /// Never blocks: one short lock, no I/O.
+    pub(super) fn web_lookup(&self, fingerprint: &str) -> super::web_link::session::Lookup {
+        use super::web_link::session::Lookup;
+        if let Ok(inner) = self.inner.lock() {
+            if let Some(device) = inner
+                .config
+                .devices
+                .iter()
+                .find(|device| device.fingerprint == fingerprint)
+            {
+                return if device.kind == DeviceKind::Web {
+                    Lookup::Confirmed {
+                        device: device.clone(),
+                    }
+                } else {
+                    Lookup::Unknown
+                };
+            }
+        }
+        if self.web.pending().contains(fingerprint) {
+            Lookup::Pending
+        } else {
+            Lookup::Unknown
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn router_started(&self) -> bool {
+        self.inner.lock().is_ok_and(|inner| inner.router_started)
+    }
+
+    /// Sets the saved flags in memory only, so a running client keeps running.
+    #[cfg(test)]
+    pub(super) fn set_flags_for_test(&self, enabled: bool, web_enabled: bool) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.config.enabled = enabled;
+        inner.config.web_enabled = web_enabled;
+    }
+
+    #[cfg(test)]
+    pub(super) fn add_device_for_test(&self, device: Device) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.config.devices.push(device);
     }
 }
 
@@ -1119,7 +1290,7 @@ fn addresses(inner: &Inner) -> Vec<Address> {
     result
 }
 
-fn name() -> String {
+pub(super) fn name() -> String {
     hostname::get()
         .unwrap_or_default()
         .to_string_lossy()

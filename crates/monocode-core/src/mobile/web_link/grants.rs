@@ -9,6 +9,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+/// Re-syncs the grants with the web server after the relay says they changed
+/// (ticket R-15). Nothing to do yet.
+pub fn resync() {}
+
 /// What is known about one pending grant. `name` is untrusted text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Grant {

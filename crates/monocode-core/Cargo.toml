@@ -30,7 +30,9 @@ similar = "2"
 unicode-width = "0.2"
 monocode-mobile-link = { path = "../mobile-link" }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "sync", "time", "macros", "net"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 uuid = { version = "1", features = ["v4"] }
 if-addrs = "0.15"
 hostname = "0.4"
