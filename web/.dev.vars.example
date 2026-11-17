@@ -1,0 +1,4 @@
+# Copy to web/.dev.vars (git-ignored) for `wrangler dev`. Fake values only: never put a real secret here.
+VAPID_PRIVATE_KEY=fake-vapid-private-key-for-local-dev-only
+RECOVERY_PEPPER=fake-recovery-pepper-for-local-dev-only
+AUDIT_IP_SALT=fake-audit-ip-salt-for-local-dev-only

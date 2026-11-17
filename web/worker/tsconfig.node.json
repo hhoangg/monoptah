@@ -1,0 +1,5 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": { "types": ["node"], "allowJs": true, "checkJs": true },
+  "include": ["vitest.config.ts", "drizzle.config.ts", "eslint.config.js", "scripts"]
+}
