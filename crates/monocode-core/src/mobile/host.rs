@@ -1219,6 +1219,16 @@ impl MobileHost {
         }
     }
 
+    /// Whether `peer` is still a paired web device. The shared serve asks
+    /// before every request and watch frame; the flag `web_enabled` is checked
+    /// by `handle_web` and `watch_web` themselves (and turning it off stops the
+    /// whole link), so a refused request keeps its "Web access disabled" text.
+    pub(super) fn web_admits(&self, peer: &str) -> bool {
+        self.inner
+            .lock()
+            .is_ok_and(|inner| find_device(&inner, DeviceKind::Web, peer).is_ok())
+    }
+
     #[cfg(test)]
     pub(super) fn router_started(&self) -> bool {
         self.inner.lock().is_ok_and(|inner| inner.router_started)

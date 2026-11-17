@@ -1,12 +1,13 @@
 //! Tests of the relay client against a local stub relay: a tokio-tungstenite
 //! server on 127.0.0.1 plays the relay, and the Noise `Initiator` plays the
 //! browser. Nothing leaves localhost.
+use super::channel::{Out, Requests};
 use super::frame::{Frame, FrameType, Plaintext};
 use super::noise::{fingerprint, generate_static, Initiator, Transport};
 use super::relay::{backoff_ceiling, react, relay_url, Budget, End, Step, Timing, REVOKED_TEXT};
-use super::session::{Lookup, SessionTable};
+use super::session::{Lookup, SessionKey, SessionTable};
 use super::{WebState, WebStatus};
-use crate::mobile::host::{Device, MobileHost};
+use crate::mobile::host::{Device, Event, MobileHost, Push};
 use crate::mobile::identity_store::WebIdentity;
 use crate::mobile::policy::{DeviceKind, Permission};
 use futures_util::{SinkExt, StreamExt};
@@ -264,13 +265,16 @@ fn web_row(peer: &Peer) -> Device {
 /// A host with a sealed web identity pointing at `http://127.0.0.1:<port>`
 /// and one paired web device. Nothing is switched on yet.
 fn env(port: u16) -> Env {
+    env_with_events(port).0
+}
+
+/// `env`, with the app's side of the host: the events a request or watch raises.
+fn env_with_events(port: u16) -> (Env, async_channel::Receiver<Event>) {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("store.db");
     rusqlite::Connection::open(&database).unwrap();
     crate::accounts::register_database(dir.path(), &database);
-    let host = MobileHost::open(dir.path().join("mobile-access.json"))
-        .unwrap()
-        .0;
+    let (host, events) = MobileHost::open(dir.path().join("mobile-access.json")).unwrap();
     let (private, public) = generate_static().unwrap();
     host.save_web_identity(&WebIdentity {
         static_private: private,
@@ -282,11 +286,14 @@ fn env(port: u16) -> Env {
     .unwrap();
     let peer = Peer::new(7, public);
     host.add_device_for_test(web_row(&peer));
-    Env {
-        host,
-        peer,
-        _dir: dir,
-    }
+    (
+        Env {
+            host,
+            peer,
+            _dir: dir,
+        },
+        events,
+    )
 }
 
 async fn status_is(host: &MobileHost, state: WebState) -> WebStatus {
@@ -666,5 +673,226 @@ fn unpair_stops_the_client_and_no_identity_means_off() {
         let status = status_is(&env.host, WebState::Off).await;
         assert_eq!(status.error, None);
         assert!(status.enabled);
+    });
+}
+
+// --- The shared serve on the web path (R-06) --------------------------------
+
+const KEY: SessionKey = SessionKey {
+    device_id: [7; 16],
+    channel: 1,
+};
+
+/// `Requests` over a host whose web flag is on, with the app's events.
+struct Serving {
+    env: Env,
+    requests: Requests,
+    out: tokio::sync::mpsc::Receiver<Out>,
+    events: async_channel::Receiver<Event>,
+}
+
+fn serving(capacity: usize) -> Serving {
+    let (env, events) = env_with_events(0);
+    env.host.set_flags_for_test(false, true);
+    let (tx, out) = tokio::sync::mpsc::channel(capacity);
+    let requests = Requests::new(env.host.clone(), tx);
+    Serving {
+        env,
+        requests,
+        out,
+        events,
+    }
+}
+
+impl Serving {
+    fn deliver(&mut self, envelope: Value) {
+        let peer = self.env.peer.fingerprint();
+        self.requests.deliver(KEY, peer, envelope);
+    }
+    async fn reply(&mut self) -> Value {
+        within(self.out.recv()).await.expect("a reply").value
+    }
+    async fn request(&self) -> crate::mobile::host::Request {
+        match within(self.events.recv()).await.unwrap() {
+            Event::Request(request) => request,
+            _ => panic!("expected a request"),
+        }
+    }
+    async fn quiet(&self) {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(self.events.try_recv().is_err(), "the app got a request");
+    }
+}
+
+fn call(rid: u64, id: &str, method: &str) -> Value {
+    json!({"version":1,"rid":rid,"id":id,"method":method,"params":{}})
+}
+
+#[test]
+fn control_requests_keep_their_order_while_a_read_passes() {
+    let rt = runtime();
+    let mut s = serving(64);
+    rt.block_on(async {
+        s.deliver(call(1, "c1", "conversation.send"));
+        s.deliver(call(2, "c2", "conversation.send"));
+        s.deliver(call(3, "r3", "workspace.list"));
+        // The first command is held by the app; the read answers meanwhile.
+        let first = s.request().await;
+        assert!(first.command_id.ends_with(":c1"));
+        let read = s.reply().await;
+        assert_eq!(read["rid"], 3);
+        assert_eq!(read["ok"], true, "{read}");
+        // The second command waits for the first.
+        s.quiet().await;
+        first.reply(Ok(json!("one")));
+        assert_eq!(s.reply().await, json!({"rid":1,"ok":true,"result":"one"}));
+        let second = s.request().await;
+        assert!(second.command_id.ends_with(":c2"));
+        second.reply(Err("nope".into()));
+        assert_eq!(s.reply().await, json!({"rid":2,"ok":false,"error":"nope"}));
+    });
+}
+
+#[test]
+fn an_unknown_method_waits_in_the_control_queue() {
+    let rt = runtime();
+    let mut s = serving(64);
+    rt.block_on(async {
+        s.deliver(call(1, "c1", "conversation.send"));
+        let first = s.request().await;
+        s.deliver(call(2, "x", "no.such.method"));
+        // Unknown means control: it does not overtake the held command.
+        s.quiet().await;
+        assert!(s.out.try_recv().is_err());
+        first.reply(Ok(Value::Null));
+        assert_eq!(s.reply().await["rid"], 1);
+        let refused = s.reply().await;
+        assert_eq!(refused["rid"], 2);
+        assert_eq!(refused["ok"], false);
+    });
+}
+
+#[test]
+fn the_same_command_id_reaches_the_app_under_one_key_and_both_get_the_answer() {
+    let rt = runtime();
+    let mut s = serving(64);
+    rt.block_on(async {
+        s.deliver(call(1, "dup", "conversation.send"));
+        s.deliver(call(2, "dup", "conversation.send"));
+        let first = s.request().await;
+        let key = first.command_id.clone();
+        // The app deduplicates on this key, as it does for a QUIC retry.
+        assert_eq!(key, "web-1:dup");
+        first.reply(Ok(json!("done")));
+        let second = s.request().await;
+        assert_eq!(second.command_id, key);
+        second.reply(Ok(json!("done")));
+        assert_eq!(s.reply().await, json!({"rid":1,"ok":true,"result":"done"}));
+        assert_eq!(s.reply().await, json!({"rid":2,"ok":true,"result":"done"}));
+    });
+}
+
+#[test]
+fn requests_and_watches_carry_the_web_rows_device_context() {
+    let rt = runtime();
+    let mut s = serving(64);
+    rt.block_on(async {
+        s.deliver(call(1, "c1", "conversation.send"));
+        let request = s.request().await;
+        assert_eq!(request.device.kind, DeviceKind::Web);
+        assert_eq!(request.device.id, "web-1");
+        assert_eq!(request.device.permission, Permission::Control);
+        request.reply(Ok(Value::Null));
+        s.deliver(
+            json!({"version":1,"rid":2,"id":"w","method":"conversation.watch","watch":true,
+            "params":{"conversationId":"conv"}}),
+        );
+        let Event::Watch(start) = within(s.events.recv()).await.unwrap() else {
+            panic!("expected a watch");
+        };
+        assert_eq!(start.device.kind, DeviceKind::Web);
+        assert_eq!(start.device.permission, Permission::Control);
+        start.accept(Ok(()));
+    });
+}
+
+#[test]
+fn more_than_16_pending_requests_host_wide_are_refused_and_64_per_connection() {
+    let rt = runtime();
+    let mut s = serving(256);
+    rt.block_on(async {
+        // Reads run concurrently, so they pile up at the app like QUIC streams.
+        for n in 0..17u64 {
+            s.deliver(call(n, &format!("u{n}"), "accounts.usage"));
+        }
+        let refused = s.reply().await;
+        assert_eq!(refused["ok"], false);
+        assert_eq!(refused["error"], "Desktop is busy; try again");
+        let mut held = Vec::new();
+        while let Ok(Event::Request(request)) =
+            tokio::time::timeout(Duration::from_millis(100), s.events.recv())
+                .await
+                .map_err(|_| ())
+                .and_then(|event| event.map_err(|_| ()))
+        {
+            held.push(request);
+        }
+        assert_eq!(held.len(), 16);
+        for request in held {
+            request.reply(Ok(Value::Null));
+        }
+        for _ in 0..16 {
+            assert_eq!(s.reply().await["ok"], true);
+        }
+        // One connection holds at most 64 requests in flight, queued or not.
+        for n in 100..165u64 {
+            s.deliver(call(n, &format!("q{n}"), "conversation.send"));
+        }
+        let busy = s.reply().await;
+        assert_eq!(busy["rid"], 164);
+        assert_eq!(busy["error"], "Desktop is busy; try again");
+    });
+}
+
+#[test]
+fn a_watch_whose_updates_are_not_drained_reports_busy_and_cancel_ends_it() {
+    let rt = runtime();
+    // Room for the accept frame only: the reader never drains the rest.
+    let mut s = serving(1);
+    rt.block_on(async {
+        s.deliver(
+            json!({"version":1,"rid":9,"id":"w","method":"conversation.watch","watch":true,
+            "params":{"conversationId":"conv"}}),
+        );
+        let Event::Watch(start) = within(s.events.recv()).await.unwrap() else {
+            panic!("expected a watch");
+        };
+        let id = start.id.clone();
+        start.accept(Ok(()));
+        let mut busy = false;
+        for n in 0..2000 {
+            match s.env.host.push(&id, json!({ "n": n })) {
+                Err(Push::Busy) => {
+                    busy = true;
+                    break;
+                }
+                Ok(()) | Err(Push::Gone) => {}
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(busy, "the sink never reported Busy");
+        // Drain, then stop the watch from the browser.
+        assert_eq!(s.reply().await, json!({"rid":9,"ok":true,"watching":true}));
+        s.deliver(json!({"rid":9,"cancel":true}));
+        within(async {
+            loop {
+                if s.env.host.push(&id, json!({})) == Err(Push::Gone) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                while s.out.try_recv().is_ok() {}
+            }
+        })
+        .await;
     });
 }

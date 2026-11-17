@@ -4,15 +4,16 @@
 //! keeps the socket alive with a text `ping`, feeds binary frames to the
 //! session table, and reconnects with exponential backoff and full jitter. It
 //! binds no port. Nothing here logs frame bytes, plaintext or the token.
+use super::channel::{Out, Requests};
 use super::frame::{CloseCode, Frame, FrameType, RELAY_ERROR_CODES};
-use super::session::{Action, Directory, SendError, SessionKey, SessionTable};
+use super::session::{Action, Directory, SendError, SessionTable};
 use super::{grants, WebLink, WebState};
 use crate::mobile::host::{name as desktop_name, MobileHost};
 use crate::mobile::identity_store::WebIdentity;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use std::{collections::HashMap, time::Duration};
-use tokio::{sync::mpsc, task::JoinHandle, time::Instant};
+use std::time::Duration;
+use tokio::{sync::mpsc, time::Instant};
 use tokio_tungstenite::tungstenite::{
     client::IntoClientRequest,
     http::{header::AUTHORIZATION, HeaderValue},
@@ -25,8 +26,6 @@ use zeroize::Zeroizing;
 pub const REVOKED_TEXT: &str = "Web app: access revoked, pair again";
 /// Longest wait for the relay to accept the WebSocket upgrade.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-/// Requests and watches in flight on one connection.
-const MAX_IN_FLIGHT: usize = 64;
 
 /// Every duration the client uses, injectable so tests need not wait.
 #[derive(Clone, Copy, Debug)]
@@ -318,12 +317,6 @@ async fn connect(url: &str, token: &str) -> Result<Socket, End> {
     }
 }
 
-/// A reply to send on a session, from a request task.
-struct Out {
-    key: SessionKey,
-    value: Value,
-}
-
 async fn serve_socket(
     socket: Socket,
     host: &MobileHost,
@@ -494,107 +487,5 @@ fn reply(
             }
         }
         Err(SendError::UnknownSession | SendError::NotReady) => {}
-    }
-}
-
-// --- Request plumbing -------------------------------------------------------
-// Minimal per-`rid` serving of the envelopes a session delivers. A shared
-// generic serve replaces this section; the host entry points it calls
-// (`MobileHost::handle_web` and `watch_web`) stay.
-
-struct Requests {
-    host: MobileHost,
-    out: mpsc::Sender<Out>,
-    tasks: HashMap<(SessionKey, String), JoinHandle<()>>,
-}
-
-impl Drop for Requests {
-    fn drop(&mut self) {
-        for task in self.tasks.values() {
-            task.abort();
-        }
-    }
-}
-
-impl Requests {
-    fn new(host: MobileHost, out: mpsc::Sender<Out>) -> Self {
-        Self {
-            host,
-            out,
-            tasks: HashMap::new(),
-        }
-    }
-
-    /// The watches and requests of a session end with it.
-    fn closed(&mut self, key: SessionKey) {
-        self.tasks.retain(|(owner, _), task| {
-            let keep = *owner != key;
-            if !keep {
-                task.abort();
-            }
-            keep
-        });
-    }
-
-    fn deliver(&mut self, key: SessionKey, peer: String, mut envelope: Value) {
-        let Some(object) = envelope.as_object_mut() else {
-            return;
-        };
-        let Some(rid) = object.remove("rid") else {
-            return;
-        };
-        let id = rid.to_string();
-        let cancel = object.remove("cancel").is_some_and(|v| v == true);
-        self.tasks.retain(|_, task| !task.is_finished());
-        if cancel {
-            if let Some(task) = self.tasks.remove(&(key, id)) {
-                task.abort();
-            }
-            return;
-        }
-        let out = self.out.clone();
-        if self.tasks.len() >= MAX_IN_FLIGHT {
-            let busy = json!({"rid": rid, "ok": false, "error": "Desktop is busy; try again"});
-            let _ = out.try_send(Out { key, value: busy });
-            return;
-        }
-        let watch = envelope["watch"] == true;
-        let host = self.host.clone();
-        let task = tokio::spawn(async move {
-            if watch {
-                serve_watch(host, peer, envelope, key, rid, out).await;
-            } else {
-                let value = match host.handle_web(&peer, envelope).await {
-                    Ok(result) => json!({"rid": rid, "ok": true, "result": result}),
-                    Err(error) => json!({"rid": rid, "ok": false, "error": error}),
-                };
-                let _ = out.send(Out { key, value }).await;
-            }
-        });
-        if let Some(old) = self.tasks.insert((key, id), task) {
-            old.abort();
-        }
-    }
-}
-
-async fn serve_watch(
-    host: MobileHost,
-    peer: String,
-    request: Value,
-    key: SessionKey,
-    rid: Value,
-    out: mpsc::Sender<Out>,
-) {
-    let (sink, mut updates) = mpsc::channel::<Value>(32);
-    if let Err(error) = host.watch_web(&peer, request, sink).await {
-        let value = json!({"rid": rid, "ok": false, "error": error});
-        let _ = out.send(Out { key, value }).await;
-        return;
-    }
-    while let Some(update) = updates.recv().await {
-        let value = json!({"rid": rid, "ok": true, "result": update});
-        if out.send(Out { key, value }).await.is_err() {
-            break;
-        }
     }
 }

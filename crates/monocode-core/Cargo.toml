@@ -73,3 +73,5 @@ test-support = []
 
 [dev-dependencies]
 tempfile = "3"
+# `tokio::time::pause` for the web heartbeat test
+tokio = { version = "1.54.1", features = ["test-util"] }

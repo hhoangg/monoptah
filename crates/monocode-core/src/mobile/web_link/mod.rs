@@ -1,6 +1,7 @@
 //! The web link: an outbound relay client that serves paired browsers through
 //! the same host as the QUIC phones. It dials the relay, binds no port and
 //! never starts the port-mapping router.
+pub(crate) mod channel;
 pub mod frame;
 pub mod grants;
 pub mod noise;
