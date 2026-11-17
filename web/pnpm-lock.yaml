@@ -364,6 +364,9 @@ importers:
       '@cloudflare/workers-types':
         specifier: 5.20261116.1
         version: 5.20261116.1
+      '@monoptah/mock-desktop':
+        specifier: workspace:*
+        version: link:../mock-desktop
       drizzle-kit:
         specifier: ^0.31.11
         version: 0.31.11
