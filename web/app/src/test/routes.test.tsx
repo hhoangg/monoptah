@@ -1,7 +1,9 @@
 import { QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, RouterProvider } from "@tanstack/react-router";
 import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { setApiTransport } from "@/features/accounts/api";
+import { createMockServer } from "@/features/accounts/mock/transport";
 import { createQueryClient } from "@/lib/queryClient";
 import { createAppRouter } from "@/router";
 
@@ -103,10 +105,18 @@ const CASES: ReadonlyArray<{ url: string; route: string; params: Record<string, 
   { url: "/admin/invites", route: "/admin/invites", params: {}, fullPath: "/admin/invites" },
 ];
 
+// The auth guard asks `/api/me` for every non-public route: answer it with a signed-in mock account.
+let restoreTransport: (() => void) | undefined;
+beforeEach(() => {
+  restoreTransport = setApiTransport(createMockServer({ signedIn: true }).transport);
+});
+afterEach(() => restoreTransport?.());
+
 async function renderAt(url: string) {
-  const router = createAppRouter({ history: createMemoryHistory({ initialEntries: [url] }) });
+  const queryClient = createQueryClient();
+  const router = createAppRouter({ history: createMemoryHistory({ initialEntries: [url] }), queryClient });
   render(
-    <QueryClientProvider client={createQueryClient()}>
+    <QueryClientProvider client={queryClient}>
       <RouterProvider router={router} />
     </QueryClientProvider>,
   );
