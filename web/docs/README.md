@@ -4,17 +4,17 @@ Status: specification, researched 2026-11-17. No application code exists yet. Th
 
 ## 1. What it is
 
-A multi-user, installable web app (PWA) that remotely controls Monoptah Native desktops: list sessions, read live transcripts, send prompts, answer questions, stop agents and receive push notifications. It replaces the iOS (Expo) app as the way to reach a desktop from a phone, and also works on tablets and computers.
+A multi-user, installable web app (PWA) that remotely controls Monoptah Native desktops: list sessions, read live transcripts, send prompts, answer questions, stop agents and receive push notifications. It is meant to replace the iOS (Expo) app for remote control and also works on tablets and computers. During this program both clients coexist: the iOS app keeps working unchanged.
 
 | Question | Answer |
 |---|---|
 | Who is it for | Monoptah Native users who want to drive their desktop agents from a phone, tablet or another computer, without a VPN or an open port |
-| Official host | A Worker run by the Monoptah maintainers. Registration is invite-only (each user can invite 3). Users of this host trust its operator not to ship malicious JavaScript (security.md T2) |
+| Official host | A Worker run by the Monoptah maintainers at the root domain `https://zptah.app` (owned, on Cloudflare, nothing else hosted there; passkey RP ID `zptah.app`). Registration is invite-only (each user can invite 3). Users of this host trust its operator not to ship malicious JavaScript (security.md T2) |
 | Self-host | `wrangler deploy` on the user's own Cloudflare account. The owner is the operator (architecture.md section 9). Docker is out of scope for now |
 | What the server stores | Metadata only: users, passkeys, desktop and device public keys, push subscriptions, invites, audit. Never conversation content |
 | Accounts | Passkeys only. 10 one-time recovery codes. No email, no password |
 | Trust model | The account is a directory, not the trust root. Every new device must be confirmed on the desktop by name and fingerprint |
-| What replaces the iOS app | The web app, installed to the Home Screen. Differences: no haptics, no native transcript view, no in-app QR scanner, push needs Add to Home Screen (features.md section 1.3). When to retire the iOS app and its QUIC path is an open question (roadmap.md) |
+| Relation to the iOS app | The web app, installed to the Home Screen, is the intended replacement. Differences: no haptics, no native transcript view, no in-app QR scanner, push needs Add to Home Screen (features.md section 1.3). Decision: the iOS app and the QUIC path are not removed in this program and keep working unchanged; removing them is decided later, outside this program. Desktop hardening that applies to all remote devices (project selection, full-access ban) still reaches phones |
 | Look and feel | Identical in style to the mobile app, derived into a design system (design-system.md) |
 
 ## 2. Architecture
@@ -82,6 +82,11 @@ Desktop-side changes (same program, Rust):
 | `crates/monocode-gpui/src/settings/pages/web_app.rs` | New: Settings > Connections > "Web app" section |
 | `crates/monocode-gpui/src/shell/mobile_host.rs` | Full-access denial, selection checks, notify hook |
 | `crates/monocode-gpui/src/mobile/project.rs` | File deny-list applied to file, files, search, changes |
+| `crates/monocode-gpui/src/mobile/catalog.rs`, `crates/monocode-gpui/src/shell/mobile_host.rs` | Cloud sessions (codespace, Docker sandbox) included in the catalog with `target`, `cloudState`, `startup`; new `cloud.*` methods (architecture.md 6.6) |
+
+### Reuse of the Tauri React app (decided)
+
+The old Tauri React app (`src/`) may be reused, but its source will be deleted later. Anything reused is **copied** into `web/app` or `web/protocol` and adapted there, never imported from `src/` or `src-tauri/`. Nothing under `web/` (vite config, tsconfig paths and references, eslint, vitest, Tailwind `@source` globs, pnpm workspace) may reference `src/` or `src-tauri/`; a CI guard enforces it (roadmap.md W-20). Copied files keep any license header, carry the comment `Copied from src/<path> at <commit>`, follow the fork-branding rule (Monoptah in user-visible text; no `monocode.*` keys or `open-monocode` ids; new keys use `monoptah.`). Inventory and per-file decisions: [tauri-reuse.md](tauri-reuse.md).
 
 ## 4. Tech stack (decided)
 
@@ -134,11 +139,12 @@ Desktop-side changes (same program, Rust):
 | File | Content |
 |---|---|
 | [README.md](README.md) | This overview |
-| [features.md](features.md) | Inventory of every mobile feature (F-xx), requested but missing features (X-xx), new web features (N-xx), desktop method matrix, priorities |
+| [features.md](features.md) | Inventory of every mobile feature (F-xx), requested but missing features (X-xx, including cloud sessions), new web features (N-xx), desktop method matrix, priorities |
 | [design-system.md](design-system.md) | Tokens, themes, accents, glass, motion, Tailwind v4 theme, shadcn mapping, responsive layouts, accessibility, new-feature checklist |
 | [architecture.md](architecture.md) | Routes, state and data layer, key storage, service worker, Worker routes, D1 schema, DO relay, frames, Noise, desktop changes, pairing, Web Push, self-host guide |
-| [security.md](security.md) | Threat model (T1 to T15), auth, invites and admin, E2E, device trust, desktop hardening, XSS rules, CSP, Trusted Types, deploy security, logging |
+| [security.md](security.md) | Threat model (T1 to T16), auth, invites and admin, E2E, device trust, desktop hardening, XSS rules, CSP, Trusted Types, deploy security, logging |
 | [capacity.md](capacity.md) | Cloudflare free tier limits, usage model, how many users fit, mitigations, paid tier threshold, monitoring |
+| [tauri-reuse.md](tauri-reuse.md) | Rule and inventory for copying code from the Tauri React app (`src/`) into `web/`: candidates, adaptations, targets, not-reused list, license and branding notes |
 | [roadmap.md](roadmap.md) | Phased tickets with acceptance criteria, dependencies, risk, release gates, open questions |
 
 ## 7. Documentation conventions

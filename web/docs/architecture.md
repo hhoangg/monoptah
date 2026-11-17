@@ -32,6 +32,8 @@ web/
   pnpm-workspace.yaml
 ```
 
+Reuse rule: code taken from the old Tauri React app (`src/`) is copied into `web/app` or `web/protocol` (provenance comment, license header kept, branding fixed, Tauri APIs removed) and never imported from `src/` or `src-tauri/`; no `web/` config may reference those directories (CI guard, roadmap.md W-20). Inventory: [tauri-reuse.md](tauri-reuse.md).
+
 `web/protocol` is the single source for frame constants; the Rust side mirrors them in `crates/monocode-core/src/mobile/web_link/frame.rs` and a shared test-vector file (`web/protocol/vectors.json`) is read by both test suites.
 
 ## 3. Frontend
@@ -100,6 +102,10 @@ Resync and reconnect:
 - Close codes (section 4.5) decide behaviour: `4003` or `4011` stop reconnecting and show "Access revoked" (sets `revoked`); `4009` replaced (another tab or reconnect) retries once; `4010`/`4008` back off 60 s.
 - Handshake failure after reconnect always starts a fresh Noise session; Noise sessions are never resumed.
 
+### 3.3a Reusing the Tauri React code
+
+Frontend code from `src/` is copied, not imported (rule above and tauri-reuse.md section 1). Consequences for the frontend: the markdown renderer is the AST port of `mobile/src/features/sessions/markdownParser.ts` (security.md section 8), not the streamdown stack; transcript projection is not copied because the desktop sends projected turns; copied code blocks render shiki `codeToTokens` output as React elements; `web/app` ESLint and `tsconfig` never list `../src`; new localStorage keys use the `monoptah.` prefix.
+
 ### 3.4 Key storage
 
 - The device static X25519 keypair is generated with `@noble/curves` (raw 32-byte keys). WebCrypto X25519 is not used: Safari support is unverified and a non-extractable X25519 `CryptoKey` read back as null from IndexedDB on Safari 26.4 (https://bugs.webkit.org/show_bug.cgi?id=312279, read 2026-11).
@@ -153,7 +159,7 @@ One Worker: `worker/src/index.ts` exports `default { fetch }` (Hono app) and the
   "durable_objects": { "bindings": [{ "name": "ROOM", "class_name": "DesktopRoom" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["DesktopRoom"] }],
   "d1_databases": [{ "binding": "DB", "database_name": "monoptah", "database_id": "<id>", "migrations_dir": "worker/migrations" }],
-  "vars": { "RP_ID": "app.example.com", "RP_ORIGIN": "https://app.example.com", "VAPID_PUBLIC_KEY": "<b64url>", "VAPID_SUBJECT": "mailto:admin@example.com" }
+  "vars": { "RP_ID": "zptah.app", "RP_ORIGIN": "https://zptah.app", "VAPID_PUBLIC_KEY": "<b64url>", "VAPID_SUBJECT": "mailto:admin@zptah.app" }
 }
 ```
 
@@ -272,6 +278,16 @@ Per-room quotas (constants in `web/protocol/limits.ts`):
 | Desktop outbound rate | 200 msg/s, 4 MiB/s | same |
 | Text frames | only exactly `ping` (auto-response) | other text closes `4012` |
 
+Per-account quotas (enforced by the Worker at pairing and device registration; violation returns `quota_exceeded`):
+
+| Quota | Default | Config var |
+|---|---|---|
+| Desktops per user | 5 | `MAX_DESKTOPS_PER_USER=5` |
+| Devices per user | 10 | `MAX_DEVICES_PER_USER=10` |
+| Invites per user | 3 | `invites_granted` (admin can grant more) |
+
+Self-hosters may change the first two in `vars`. The official host `zptah.app` uses the defaults. Domain rule: `RP_ID` is `zptah.app` and must never change (every passkey would break); nothing else may be hosted on `zptah.app` or its subdomains.
+
 Hibernation: no timers or alarms in the DO, so idle rooms are evicted while sockets stay open. `ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping','pong'))` answers keepalives without waking the object. Because the object may be reconstructed on every message, the constructor does no work beyond reading bindings.
 
 Revocation path: Worker handlers (`DELETE /api/desktops/:id`, `PUT .../grants/:deviceId` with `revoked`, `DELETE /api/devices/:id`, admin block) call an internal DO method `room.revoke({deviceId?}|{all:true}, code)` that closes the matching sockets with `4003` or `4011`.
@@ -367,7 +383,7 @@ The plaintext inside `MSG` reuses the existing shapes verbatim (`crates/mobile-l
 { "type": "state", "state": "pending|confirmed|revoked", "permission": "read|control", "proto": 1, "desktop": { "name": "...", "version": "..." } }
 ```
 
-The `error` string stays; the optional additive `code` (`busy`, `forbidden`, `read_only`, `not_selected`, `path_denied`, `revoked`, `disabled`, `too_large`) gives the web client a stable key (gap G14, security.md section 7). `watch` frame semantics, `from`/`append` UTF-16 offsets and idempotency receipts are unchanged (`crates/monocode-core/src/mobile/watch.rs:65-158`). Rules: `id` required for app methods and at most 128 chars (`host.rs:698-701`); at most 16 pending requests host-wide and 4 watches per device (`host.rs:57-58`); heartbeat period for web is 25 s instead of 10 s to keep DO message billing low (capacity.md).
+The `error` string stays; the optional additive `code` (`busy`, `forbidden`, `read_only`, `not_selected`, `path_denied`, `revoked`, `disabled`, `too_large`, `unsupported_target`) gives the web client a stable key (gap G14, security.md section 7). `watch` frame semantics, `from`/`append` UTF-16 offsets and idempotency receipts are unchanged (`crates/monocode-core/src/mobile/watch.rs:65-158`). Rules: `id` required for app methods and at most 128 chars (`host.rs:698-701`); at most 16 pending requests host-wide and 4 watches per device (`host.rs:57-58`); heartbeat period for web is 25 s instead of 10 s to keep DO message billing low (capacity.md).
 
 ### 5.6 Versioning
 
@@ -391,7 +407,7 @@ A new card below "Your phones" (section header at `crates/monocode-gpui/src/sett
 
 ```
 Web app                                            [Beta]
-  Host URL  [ https://app.monoptah.example        ]   (default: official host)
+  Host URL  [ https://zptah.app                    ]   (default: https://zptah.app)
   Status: Connected to account "alice" (relay online)        [ Unpair ]
   [ Pair ]    -> modal: QR (384 px) + "Copy link" + "Open in browser" + user code + confirmation code
   Devices
@@ -453,15 +469,51 @@ Device-to-desktop confirmation (first connection of a browser):
 
 Where `notify_mobile` posts to Expo today (`crates/monocode-core/src/mobile/notify.rs:7`, called from `mobile_host.rs:1635-1711`), the web path adds `POST /api/push/notify` with the desktop token and minimal metadata (section 8). Expo remains for phones. Per-device category preferences move to the account (`push_prefs`), not to the desktop. The desktop sends nothing when no web account is paired or the relay path is disabled.
 
+### 6.6 Cloud sessions (Docker sandbox, GitHub Codespace, remote machines)
+
+Today the mobile host knows nothing about cloud sessions (`crates/monocode-core/src/mobile/host.rs:22-54` has no `cloud.*` method; the catalog in `crates/monocode-gpui/src/shell/mobile_host.rs:414-417` keeps a session only if `path_key(summary.cwd)` equals a rail project path, so a cloud session with cwd `remote://<env>/...` is most likely dropped from `workspace.list` and `sessions.list`; inferred from code, to be confirmed by H-09). The desktop already has the projection for them in the app API (`crates/monocode-core/src/mono/cloud_api.rs:128-157` `target_json`, `annotate`; `CloudApi::session_targets` `:972`).
+
+**Catalog.** `mobile_catalog_sessions` groups a session by its local twin project (`Shell::project_of`, `crates/monocode-gpui/src/shell/cloud.rs:1017`) instead of the raw cwd, so codespace and sandbox sessions appear under the project the user sees in the sidebar. Project selection (H-02) applies to that project. A session on a remote machine (`monocode-host`, no cloud binding) is grouped under its own remote project: `Shell::project_of` gives a non-cloud remote session its own cwd as its project, so there is no local twin. It is listed with the new kind `remote` when that remote project is selected; `project.*` calls on any non-local session answer `code: unsupported_target` (`crates/monocode-gpui/src/mobile/project.rs:365` says the native app has no remote projects), and the web hides Files, Changes and Git for them.
+
+**Transport scope.** Cloud and remote-machine sessions in `workspace.list` and `sessions.list`, the `target`, `cloudState`, `startup` and `cloud` fields, and the asynchronous wake reply are served only to devices on the web transport (Noise relay), or to clients that announce a capability in the handshake. QUIC phones keep today's lists and send semantics: they never see cloud or remote sessions and a phone send can never wake billable compute without a cost notice (H-09, H-10 regression test).
+
+**Fields** (read, additive, absent for old clients). `target_json` and `annotate` in `cloud_api.rs` emit only `local`, `codespace` and `sandbox` (`crates/monocode-core/src/cloud_sessions/backend.rs:88-93` names the backends); `remote` is a new kind added by H-09:
+
+| Where | Field | Content |
+|---|---|---|
+| `workspace.list` and `sessions.list` session card | `target` | `{kind: "local" or "remote" or "codespace" or "sandbox", instance?, state?}` (`instance` is the codespace or sandbox name, metadata only) |
+| same | `cloudState` | `available`, `starting`, `stopping`, `stopped`, `unavailable`, `unknown` (`state_id`, `cloud_api.rs:123`; enum at `crates/monocode-core/src/cloud_sessions.rs:465`) |
+| same | `startup` | `{step, error?}` while the instance starts or its start failed |
+| `conversation.read` result and watch frames (sent on change only) | `cloud` | `{kind, instance, state, startup?: {steps: [{id, status, startedAt, finishedAt}], current, error?}}`. The 9 step ids are `create`, `provision`, `buildContainer`, `blockingCommands`, `configureCodespace`, `connect`, `openProject`, `claudeSetup`, `lifecycleCommands`; status is `pending`, `running`, `done`, `failed`, `skipped` (`crates/monocode-core/src/cloud_sessions/startup.rs:96,202`) |
+
+Reads use cached state only (`STATE_TTL` 30 s, `cloud_sessions.rs:95`) and never wake an instance. `cloudState` `unknown` is shown as "Not connected" like the desktop (`crates/monocode-gpui/src/cloud_mark.rs:31-43`). A conversation whose instance has no live connection may read empty or stale; the web shows the state, not an error.
+
+**Methods** (classification in 7.1):
+
+| Method | Maps to | Notes |
+|---|---|---|
+| `cloud.instances` (read) | `CloudApi::list` (`cloud_api.rs:571`) | `{instances: [{kind, instance, displayName, state, rawState, lastUsedAt, sessions: [{sessionId, title, busy}], costEstimatePerHour?}], backends}`. Cached or read-only data, never wakes. Filtered to instances used by sessions of selected projects (a sandbox has no repository name, so only such a link makes it relevant). The cost estimate comes from cached overview rows only (`cloud_sessions/workspaces.rs:274`), no new `gh` or `sbx` call |
+| `cloud.stop {sessionId}` or `{kind, instance}` (control) | `CloudApi::stop` (`:681`) | Recoverable. Returns the desktop's `warning` naming interrupted busy sessions. The web shows the sessions sharing the instance before sending (`plan_instance_action`, `cloud_sessions/instance_action.rs`) |
+| `cloud.resume {sessionId}` (control) | `CloudApi::resume` (`:728`) | Blocks for minutes, so it runs on a worker thread and answers at once with `{accepted: true}`; progress arrives as `cloud` fields in the watch frame of that session |
+| `session.start` with `target` (control, P2) | `CloudApi::begin_start` (`:948`) | `target {kind, instance: "new" or name}`; creates billable infrastructure. Rejected with `code: disabled` unless the desktop toggle "Remote cloud start" is on (default off), like "Remote push in Git" |
+| Retry of a failed start (control, P2) | `run_start` (`startup.rs`) | Same cost caveat as resume |
+| `cloud.delete`, `cloud.create`, `pullEvidence` | n/a | Never exposed. The Operator already cannot delete (`crates/monocode-core/src/app_access.rs:45`) |
+
+**Wake on send.** `conversation.send` to a stopped cloud session already wakes the instance on the desktop (`crates/monocode-gpui/src/conversation/remote.rs:432` `reconnect_cloud`, `crates/monocode-gpui/src/cloud_wake.rs:65`; the send reaches it through `mobile_submit`, `mobile_host.rs:1497`). The host's reply wait is 25 s (`host.rs:56`) and a wake takes minutes, so the reply is asynchronous: the desktop answers the request at once with `{ok: true, wake: true}` when it started a wake, and the progress and the final delivery are visible only through the `cloud` field of the watch frame (state `starting`, then `available`, then the user turn appears). A send to a session that is still starting is queued by the desktop (`startup.rs:759` `queue_start_message`) or refused with the desktop's text (`startup.rs:740`); a failed start says to retry. Sends are idempotent by command id as today.
+
+**What never goes into frames**: GitHub, Docker or account tokens, codespace or sandbox credentials, environment variables, the Claude kit or pinned account data, `web_url`, SSH targets and host pairing tokens (`Machine.ssh`), `remote_cwd`, `gh_state`, `StartRecord.log_tail`, `StartEvent::Log` lines and step `detail` text (they may hold paths, repositories and commands). `startup.error` is sanitized (no command lines or paths) and capped at a tunable length (default 200 characters, H-10 picks the final value). The core states "Secret values never pass through this module" (`cloud_api.rs:32`); the mobile projection follows that rule and a test asserts that no frame contains these fields. Instance names ride only inside the Noise tunnel: never in push payloads, and the Worker audit table stores at most the kind.
+
+**Permissions and audit.** Read methods need `read`; stop, resume, start and retry need `control`; every call is written to the desktop audit log (H-05) with device id, method, instance kind and outcome (the instance name is allowed there because the log is local). `cloud.resume` and start are rate limited per device (security.md T16). Details: security.md section 7.
+
 ## 7. Desktop link: gates and permissions (reference)
 
 ### 7.1 Permission classification
 
 | Class | Methods |
 |---|---|
-| read | `conversation.read`, `conversation.older`, `conversation.watch`, `models.list`, `accounts.usage` (cached usage, no `refresh`), `device.selection` (get), `workspace.list`, `sessions.list`, `project.changes`, `project.worktrees`, `project.files`, `project.file`, `project.search`, `project.fileHighlight`, `project.git`, `mono.document`, `mono.profile`, `mono.file`, `device.leave` |
-| control | `session.configure`, `session.start`, `conversation.send`, `session.resumeUsage`, `session.resumeUsageAtReset`, `session.answerQuestion`, `session.keepQuestionOpen`, `session.cancel`, `session.rename`, `session.archive`, `session.delete`, `accounts.usage` with `refresh: true`, `project.gitAction` with `stage`, `unstage`, `generate` or a `commit` that does not push, `device.selection` (set; may only narrow, widening needs desktop confirmation), `mono.create`, `mono.update` |
-| denied for web in v1 | `mono.saveFile`, `mono.reset`, `mono.delete`; `project.gitAction` `sync`, `pr`, and `commit` with `push: true` or `createPr: true` (the only ways the desktop pushes, `crates/monocode-gpui/src/mobile/project.rs:435-457`), unless the desktop toggle "Remote push in Git" is on (default off); `runtimeMode: "full-access"` in `session.configure`/`session.start` (denied for every remote device, phones included) |
+| read | `conversation.read`, `conversation.older`, `conversation.watch`, `models.list`, `accounts.usage` (cached usage, no `refresh`), `device.selection` (get), `workspace.list`, `sessions.list`, `project.changes`, `project.worktrees`, `project.files`, `project.file`, `project.search`, `project.fileHighlight`, `project.git`, `mono.document`, `mono.profile`, `mono.file`, `device.leave`, `cloud.instances` |
+| control | `session.configure`, `session.start`, `conversation.send`, `session.resumeUsage`, `session.resumeUsageAtReset`, `session.answerQuestion`, `session.keepQuestionOpen`, `session.cancel`, `session.rename`, `session.archive`, `session.delete`, `accounts.usage` with `refresh: true`, `project.gitAction` with `stage`, `unstage`, `generate` or a `commit` that does not push, `device.selection` (set; may only narrow, widening needs desktop confirmation), `mono.create`, `mono.update`, `cloud.stop`, `cloud.resume`, retry of a failed cloud start, `session.start` with `target` (only while the desktop toggle "Remote cloud start" is on) |
+| denied for web in v1 | `mono.saveFile`, `mono.reset`, `mono.delete`; `project.gitAction` `sync`, `pr`, and `commit` with `push: true` or `createPr: true` (the only ways the desktop pushes, `crates/monocode-gpui/src/mobile/project.rs:435-457`), unless the desktop toggle "Remote push in Git" is on (default off); `runtimeMode: "full-access"` in `session.configure`/`session.start` (denied for every remote device, phones included); `cloud.delete`, `cloud.create`, `pullEvidence` (never exposed) |
 
 `read` devices get `{ok:false, code:"read_only"}` for control methods. Details and rationale in security.md section 7.
 
@@ -503,7 +555,7 @@ The desktop is the authority for `state` and `permission`. The server mirrors th
 5. `pnpm --filter worker db:migrate:remote` (runs `wrangler d1 migrations apply monoptah --remote`).
 6. Generate VAPID keys: `pnpm --filter worker vapid:generate` prints a public key and a private key (P-256, base64url). Put the public key and `VAPID_SUBJECT` in `vars`; `wrangler secret put VAPID_PRIVATE_KEY`.
 7. `wrangler secret put RECOVERY_PEPPER` (32 random bytes, base64; losing it invalidates stored recovery codes, so back it up) and `wrangler secret put AUDIT_IP_SALT` (32 random bytes, base64).
-8. Set `RP_ID` and `RP_ORIGIN` to the final hostname (passkeys are bound to `RP_ID`; changing it breaks every passkey).
+8. Set `RP_ID` and `RP_ORIGIN` to your own final hostname (the official host uses `zptah.app` and `https://zptah.app`). Passkeys are bound to `RP_ID`: it must never change after the first user registers, because changing it breaks every passkey. Host nothing else on that hostname or its subdomains (cookie and CSP isolation, security.md section 3.3).
 9. Custom domain: add a `routes` entry with `custom_domain: true`, or attach in the dashboard; HTTPS is mandatory.
 10. `pnpm build && wrangler deploy`.
 11. First admin: `pnpm --filter worker bootstrap -- --remote` creates a `bootstrap` invite (24 h, one use, grants `role = admin`) and prints the code once; open `/register?invite=CODE`, create a passkey, save the recovery codes.

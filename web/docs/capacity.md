@@ -64,6 +64,7 @@ Unit: one daily active user (DAU) with one or more desktops. One room (one DO) p
 |---|---|---|---|
 | Desktops per user (rooms) | 1 | 1 | 2 |
 | Devices (browsers/phones) | 1 | 2 | 3 |
+| Account caps (hard limits, architecture.md 4.4): desktops / devices per user | 5 / 10 | 5 / 10 | 5 / 10 |
 | Minutes per day a device watches an agent that is actively producing output ("streaming minutes", summed over rooms) | 10 | 30 | 120 |
 | Watch frames per streaming minute (desktop, after coalescing to 2 frames/s) | 120 | 120 | 120 |
 | Device requests per streaming minute (send, read older, file view) | 10 | 10 | 10 |
