@@ -256,6 +256,8 @@ export const PutGrantBody = z.object({ requestedPermission: Permission.optional(
 export const DesktopMeResponse = z.object({ desktopId: Id, name: z.string(), account: z.object({ handle: Handle }) });
 export const DesktopGrantSchema = z.object({
   deviceId: Id,
+  /** Device name as registered (untrusted text), so the desktop can list a pending grant while the device is offline (R-15). */
+  deviceName: z.string(),
   /** Device X25519 public key, base64url. */
   publicKey: Base64Url,
   fingerprint: z.string(),

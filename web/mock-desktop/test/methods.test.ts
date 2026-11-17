@@ -136,7 +136,7 @@ describe("device selection", () => {
 
 describe("fixture hygiene", () => {
   it("source and fixtures contain no real-looking secrets, no em or en dashes and no MonoCode branding", () => {
-    for (const file of ["../src/fixtures.ts", "../src/desktop.ts", "../src/noise.ts", "../src/client.ts", "../src/transport.ts"]) {
+    for (const file of ["../../app/src/link/noise.ts", "../../app/src/link/secure-channel.ts", "../src/fixtures.ts", "../src/desktop.ts", "../src/client.ts", "../src/transport.ts"]) {
       const text = readFileSync(new URL(file, import.meta.url), "utf8");
       expect(text, file).not.toMatch(/[\u2013\u2014]/);
       expect(text, file).not.toMatch(/ghp_|github_pat_|sk-[a-z0-9]{10}|dckr_pat/i);

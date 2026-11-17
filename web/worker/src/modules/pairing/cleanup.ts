@@ -1,7 +1,12 @@
-import { noCleanup } from "../cleanup.ts";
+import { DAY, runCleanupQueries, type Cleanup, type CleanupQuery } from "../cleanup.ts";
 
-/**
- * STUB (WS-R, R-03, Wave 1): delete `pairing_requests` 24 hours after they resolved or expired.
- * The index `pairing_requests_expires_at_idx` already exists.
- */
-export const cleanup = noCleanup;
+/** `pairing_requests` are deleted 24 hours after they expired (resolved ones expire at most 10 minutes after creation). */
+export const CLEANUP_QUERIES: readonly CleanupQuery[] = [
+  {
+    name: "pairing_requests",
+    sql: "DELETE FROM pairing_requests WHERE expires_at < ?1",
+    bind: (now) => [now - DAY],
+  },
+];
+
+export const cleanup: Cleanup = (env, now) => runCleanupQueries(env.DB, CLEANUP_QUERIES, now);

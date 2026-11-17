@@ -4,13 +4,18 @@
   "type": "module",
   "packageManager": "pnpm@12.21.0",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.18"
   },
   "scripts": {
-    "check": "pnpm -r --workspace-concurrency=1 run typecheck && pnpm -r --workspace-concurrency=1 run lint && pnpm -r --workspace-concurrency=1 run test",
+    "check": "pnpm -r --workspace-concurrency=1 run typecheck && pnpm -r --workspace-concurrency=1 run lint && pnpm -r --workspace-concurrency=1 run test && pnpm run test:scripts",
+    "bootstrap": "node scripts/bootstrap.mjs",
+    "deploy:official": "node scripts/deploy-official.mjs",
+    "test:scripts": "node --test scripts/*.test.mjs",
     "typecheck": "pnpm -r run typecheck",
     "lint": "pnpm -r run lint",
-    "test": "pnpm -r run test"
+    "test": "pnpm -r run test",
+    "smoke:dev": "node scripts/api-smoke.mjs",
+    "vapid:generate": "node scripts/vapid-generate.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

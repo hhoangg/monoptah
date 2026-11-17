@@ -1,10 +1,18 @@
+import { env } from "cloudflare:workers";
 import { Hono } from "hono";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { API_ROUTES, ApiErrorSchema, type ApiRoute } from "@monoptah/protocol";
 import { buildCsp, COMPANION_HEADERS } from "../src/middleware/security.ts";
 import { ignoreCookies, isCookieAuthenticated } from "../src/middleware/browser.ts";
 import type { AppEnv } from "../src/http.ts";
-import { BROWSER_HEADERS, call, ORIGIN } from "./helpers.ts";
+import { BROWSER_HEADERS, call, callWithEnv, ORIGIN } from "./helpers.ts";
+import { createTestUser, loginAs } from "./support/accounts.ts";
+
+/**
+ * What a public cookie-less route answers to a request that passes the browser checks but has an empty body: the
+ * route's own answer (400 for a bad body, 200 for the body-less login options), never a 401, 403, 415 or 429.
+ */
+const passedStatus = (route: ApiRoute): number => (route.path === "/api/auth/login/options" ? 200 : 400);
 
 const concrete = (route: ApiRoute) => route.path.replace(/:[A-Za-z]+/g, "x");
 const nonGet = (route: ApiRoute) => route.method !== "GET";
@@ -53,13 +61,27 @@ describe("Origin and X-Monoptah-CSRF on cookie routes", () => {
     expect(badCsrf.status).toBe(403);
     expect(ApiErrorSchema.parse(await badCsrf.json()).code).toBe("csrf");
 
+    // Passing the browser checks: the request reaches the auth resolver (401 without a session)...
     const ok = await send({ ...BROWSER_HEADERS });
-    expect(ok.status).toBe(501);
+    expect(ok.status).toBe(route.auth === "public" ? passedStatus(route) : 401);
+    // ...and with a valid session the handler: whatever it answers to an empty body, it is not a refusal by the
+    // middleware (401, 403, 415, 429) and not the old 501 stub.
+    if (route.auth !== "public") {
+      // A session of its own per route: an earlier route (logout, delete account) may end a shared one.
+      const own = await loginAs((await createTestUser(env, { role: "admin" })).id, { fresh: true });
+      const authed = await send({ ...BROWSER_HEADERS, Cookie: own.cookie });
+      const key = `${route.method} ${route.path}`;
+      // Account deletion (ticket U-11) is the one route that is still the 501 stub.
+      if (key === "DELETE /api/me") expect(authed.status, key).toBe(501);
+      else expect([401, 403, 415, 429, 501], key).not.toContain(authed.status);
+    }
   });
 
   it("does not check Origin or CSRF on GET", async () => {
+    // No Origin and no CSRF header: the answer is the resolver's 401, not a 403 bad_origin or csrf.
     const res = await call("/api/me");
-    expect(res.status).toBe(501);
+    expect(res.status).toBe(401);
+    expect(ApiErrorSchema.parse(await res.json()).code).toBe("unauthorized");
   });
 
   it("rejects a non-GET cookie route whose Content-Type is not application/json (415)", async () => {
@@ -72,7 +94,7 @@ describe("Origin and X-Monoptah-CSRF on cookie routes", () => {
       expect(ApiErrorSchema.parse(await res.json()).code).toBe("unsupported_media_type");
     }
     const withCharset = await call(concrete(route), { method: route.method, headers: { ...BROWSER_HEADERS, "Content-Type": "application/json; charset=utf-8" } });
-    expect(withCharset.status).toBe(501);
+    expect(withCharset.status).toBe(route.auth === "public" ? passedStatus(route) : 401);
   });
 
   it("checks Origin on a WebSocket upgrade GET (no CSRF header there)", async () => {
@@ -83,17 +105,23 @@ describe("Origin and X-Monoptah-CSRF on cookie routes", () => {
     expect(ApiErrorSchema.parse(await none.json()).code).toBe("bad_origin");
     const wrong = await call(path, { headers: { ...upgrade, Origin: "https://evil.example" } });
     expect(wrong.status).toBe(403);
+    // Right Origin: past the Origin check, the session resolver answers (no cookie: 401).
     const ok = await call(path, { headers: { ...upgrade, Origin: ORIGIN } });
-    expect(ok.status).toBe(501);
+    expect(ok.status).toBe(401);
   });
 });
 
 describe("token and pairing routes", () => {
   it.each(tokenOrPairingRoutes.map((r) => [`${r.method} ${r.path}`, r] as const))("%s needs no Origin and no CSRF header, and ignores a cookie", async (_name, route) => {
+    // Past the browser checks (none apply) the handler answers: pairing validates its body (400 invalid), token routes
+    // want a desktop token (401 unauthorized). A cookie changes neither answer.
+    const expected = route.path.startsWith("/api/pair/") ? { status: 400, code: "invalid" } : { status: 401, code: "unauthorized" };
     const plain = await call(concrete(route), { method: route.method });
-    expect(plain.status).toBe(501);
+    expect(plain.status).toBe(expected.status);
+    expect(ApiErrorSchema.parse(await plain.json()).code).toBe(expected.code);
     const withCookie = await call(concrete(route), { method: route.method, headers: { Cookie: "__Host-mc_session=fake-session-token" } });
-    expect(withCookie.status).toBe(501);
+    expect(withCookie.status).toBe(expected.status);
+    expect(ApiErrorSchema.parse(await withCookie.json()).code).toBe(expected.code);
   });
 
   it("ignoreCookies removes the Cookie header before a handler can read it", async () => {
@@ -105,7 +133,7 @@ describe("token and pairing routes", () => {
 });
 
 describe("response headers", () => {
-  it("sets Cache-Control: no-store on /api/* and /relay/* (success, 404 and 501)", async () => {
+  it("sets Cache-Control: no-store on /api/* and /relay/* (success, 404 and handler errors)", async () => {
     for (const path of ["/api/health", "/api/nope", "/api/me", "/relay/desktop/x", "/relay/nope"]) {
       const res = await call(path);
       expect(res.headers.get("Cache-Control"), path).toBe("no-store");
@@ -156,5 +184,28 @@ describe("buildCsp", () => {
 
   it("keeps a port in the host", () => {
     expect(buildCsp("localhost:8787")).toContain("connect-src 'self' wss://localhost:8787;");
+  });
+});
+
+describe("the 500 log line", () => {
+  it("holds the route pattern, never a path parameter such as a pairing code", async () => {
+    const broken = Object.create(env) as typeof env;
+    Object.defineProperty(broken, "DB", {
+      value: {
+        prepare: () => {
+          throw new Error("boom with PAIRSECRET1 inside");
+        },
+      } as unknown as D1Database,
+    });
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const res = await callWithEnv(broken, "/api/pair/PAIRSECRET1", { headers: { Cookie: "__Host-mc_session=whatever" } });
+      expect(res.status).toBe(500);
+      const logged = errors.mock.calls.map((args) => String(args[0]));
+      expect(logged).toEqual(["unhandled error: route=GET /api/pair/:userCode error=Error"]);
+      expect(logged.join(" ")).not.toContain("PAIRSECRET1");
+    } finally {
+      errors.mockRestore();
+    }
   });
 });
