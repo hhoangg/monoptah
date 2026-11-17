@@ -2,6 +2,7 @@
 // signed for real and no app is launched.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { existsSync, lstatSync, symlinkSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
@@ -9,7 +10,10 @@ import { test } from "node:test";
 import {
   PLATFORMS,
   TARGETS,
+  assertOutsideBundle,
+  markNeverIndex,
   packageMonoptahNative,
+  removeBuiltAppBundle,
   recordsFileName,
 } from "./package-native-monoptah.mjs";
 import { packageNative } from "./package-native.mjs";
@@ -23,7 +27,10 @@ fs.appendFileSync(process.env.FAKE_TOOL_LOG, JSON.stringify([name, ...args]) + '
 if (name === 'uname') console.log('Darwin');
 if (name === 'lipo') console.log(process.env.FAKE_ARCH || 'arm64');
 if (name === 'ditto') fs.writeFileSync(args.at(-1), 'zip bytes');
-if (name === 'tar') fs.writeFileSync(args[1], 'archive bytes');
+if (name === 'tar') {
+  const plist = path.join(args[3], args[4], 'Contents/Info.plist');
+  fs.writeFileSync(args[1], fs.existsSync(plist) ? fs.readFileSync(plist) : 'archive bytes');
+}
 if (name === 'codesign' && args[0] === '-dv') {
   process.stderr.write(process.env.FAKE_SIGNATURE || 'Signature=adhoc\\n');
 }
@@ -91,9 +98,14 @@ test(
     const tar = made.find(([n]) => n === "tar");
     assert.equal(tar.at(-1), "Monoptah Native.app");
     assert.ok(made.some(([n, ...a]) => n === "ditto" && a.includes("--keepParent")));
-    const plist = await readFile(join(binary, "../Monoptah Native.app/Contents/Info.plist"), "utf8");
+    // The fake tar copies Info.plist into the archive, so the bundle content is checked there.
+    const plist = await readFile(join(out, "MonoptahNative_0.34.0_aarch64.app.tar.gz"), "utf8");
     assert.match(plist, /<string>com\.monoptah\.native<\/string>/);
     assert.match(plist, /<key>MonocodeNativeVersion<\/key><string>0\.34\.0<\/string>/);
+    // The built bundle is removed after packaging; the binary and the marker stay.
+    assert.ok(!existsSync(join(binary, "../Monoptah Native.app")));
+    assert.ok(existsSync(binary));
+    assert.ok(existsSync(join(binary, "../.metadata_never_index")));
   },
 );
 
@@ -121,6 +133,7 @@ test(
       packageMonoptahNative({ binary, out, version: "0.34.0" }),
       /not ad-hoc signed/,
     );
+    assert.ok(!existsSync(join(binary, "../Monoptah Native.app")), "bundle removed after failure");
   },
 );
 
@@ -210,4 +223,63 @@ test("PLATFORMS names every package job once", () => {
     PLATFORMS.flatMap((p) => p.assets("1.2.3").map((a) => a.target)).filter(Boolean),
     TARGETS,
   );
+});
+
+async function releaseDir(t) {
+  const directory = await mkdtemp(join(tmpdir(), "monoptah-bundle-removal-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const release = join(directory, "target/aarch64-apple-darwin/release");
+  await mkdir(join(release, "deps"), { recursive: true });
+  await writeFile(join(release, "monocode-gpui"), "bin");
+  return { directory, release };
+}
+
+test("removeBuiltAppBundle removes only the bundle and logs it", async (t) => {
+  const { release } = await releaseDir(t);
+  const app = join(release, "Monoptah Native.app");
+  await mkdir(join(app, "Contents"), { recursive: true });
+  const logs = [];
+  assert.equal(removeBuiltAppBundle(app, (l) => logs.push(l)), true);
+  assert.ok(!existsSync(app));
+  assert.ok(existsSync(join(release, "monocode-gpui")) && existsSync(join(release, "deps")));
+  assert.deepEqual(logs, [`Removed built app bundle: ${app}`]);
+  assert.equal(removeBuiltAppBundle(app, (l) => logs.push(l)), false);
+  assert.equal(logs.length, 1);
+});
+
+test("removeBuiltAppBundle refuses other names, other parents and symlinks", async (t) => {
+  const { directory, release } = await releaseDir(t);
+  const other = join(release, "Other.app");
+  await mkdir(other);
+  assert.throws(() => removeBuiltAppBundle(other, () => {}), /not named/);
+  assert.ok(existsSync(other));
+  const wrongParent = join(directory, "target/debug/Monoptah Native.app");
+  await mkdir(wrongParent, { recursive: true });
+  assert.throws(() => removeBuiltAppBundle(wrongParent, () => {}), /release directory/);
+  assert.ok(existsSync(wrongParent));
+  const precious = join(directory, "precious");
+  await mkdir(precious);
+  await writeFile(join(precious, "keep"), "x");
+  const link = join(release, "Monoptah Native.app");
+  symlinkSync(precious, link);
+  assert.throws(() => removeBuiltAppBundle(link, () => {}), /not a real directory/);
+  assert.ok(lstatSync(link).isSymbolicLink());
+  assert.ok(existsSync(join(precious, "keep")));
+});
+
+test("markNeverIndex creates the marker once and is idempotent", async (t) => {
+  const { release } = await releaseDir(t);
+  const dir = join(release, "fresh");
+  markNeverIndex(dir);
+  markNeverIndex(dir);
+  assert.equal(await readFile(join(dir, ".metadata_never_index"), "utf8"), "");
+});
+
+test("the output directory may not be inside the built bundle", () => {
+  const binary = "/x/target/aarch64-apple-darwin/release/monocode-gpui";
+  const app = "/x/target/aarch64-apple-darwin/release/Monoptah Native.app";
+  assert.throws(() => assertOutsideBundle(app, binary), /must not be inside/);
+  assert.throws(() => assertOutsideBundle(`${app}/Contents/out`, binary), /must not be inside/);
+  assert.doesNotThrow(() => assertOutsideBundle(`${app}-out`, binary));
+  assert.doesNotThrow(() => assertOutsideBundle("/tmp/out", binary));
 });

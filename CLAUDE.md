@@ -306,6 +306,8 @@ asset. The fork scripts are `scripts/native-release-macos-local.mjs`,
 `scripts/native-release-notes.mjs`, `scripts/package-native-monoptah.mjs` (also the asset table
 for every platform) and `scripts/native-release-monoptah.mjs`.
 
+The release script removes the built `Monoptah Native.app` from `target/.../release` after packaging (also on failure and in `--dry-run`) and marks that directory `.metadata_never_index`. Agents must not leave built `.app` bundles behind: remove any you build outside the release flow when done (Native Dev's `~/Applications/Monoptah Native Dev.app` is the exception).
+
 Things to keep true after merging from upstream or changing repo settings:
 
 - Upstream's `native-release.yml` is gated with `if: github.repository == 'hardbeat920/monocode'`

@@ -354,7 +354,7 @@ test("an interrupt message names the step and how to continue", () => {
 });
 
 // A fake io that records every command, so the tests can check the order.
-function fakeIo({ files = true, headAfter = SHA, dirtyAfter = "", stamp = null, failOn = null, docs = docsNotes, ciRuns = [[run("completed", "success")]], early = {} } = {}) {
+function fakeIo({ files = true, headAfter = SHA, dirtyAfter = "", stamp = null, failOn = null, cleanupFails = false, docs = docsNotes, ciRuns = [[run("completed", "success")]], early = {} } = {}) {
   // Options of the early workflow run: dispatchFails, findable, cancelFails, statusAfterRelease.
   // view(id, call) and jobs(id, call) override the status and the job count of a run.
   // jobList(id, call) overrides the job list, advance maps a command prefix to the ms it takes,
@@ -476,6 +476,10 @@ function fakeIo({ files = true, headAfter = SHA, dirtyAfter = "", stamp = null, 
     listDir: () => (files ? ["artifacts-macos-aarch64.json", names.updater, names.zip, names.sha256] : []),
     makeTempDir: () => "/tmp/out",
     removeDir: (dir) => events.push(`remove ${dir}`),
+    removeBuiltApp: () => {
+      events.push("removeBuiltApp");
+      if (cleanupFails) throw new Error("EBUSY");
+    },
     writeStamp: (text) => {
       written.push(text);
       events.push("writeStamp");
@@ -1091,12 +1095,16 @@ test("the interrupt handler is only installed around waits and always removed", 
   const { io, events } = fakeIo({ ciRuns: [[run("queued")], [run("completed", "success")]] });
   await runRelease([V], io);
   assert.equal(events.filter((e) => e === "onInterrupt").length, events.filter((e) => e === "offInterrupt").length);
-  // Never active while a child process runs: every visible command sits between an off and the next on.
+  // Never active while a child process runs, except packaging: there the listener keeps
+  // this process alive on Ctrl-C so the finally can remove the built bundle.
   let active = 0;
   for (const e of events) {
     if (e === "onInterrupt") active += 1;
     else if (e === "offInterrupt") active -= 1;
-    else if (e.startsWith("visible ")) assert.equal(active, 0, e);
+    else if (e.startsWith("visible ")) {
+      if (e.includes(" scripts/package-native-monoptah.mjs ")) assert.equal(active, 1, e);
+      else assert.equal(active, 0, e);
+    }
   }
 });
 
@@ -1135,4 +1143,34 @@ test("SIGTERM exits 143, and after the tag the recovery names the known run inst
   const text = logs.join("\n");
   assert.match(text, /Interrupted \(SIGTERM\)\..*The tag native-v0\.40\.5 is on origin\. The workflow run https:\/\/example\.test\/runs\/4242 is probably still going; check it: gh run view 4242 --repo hhoangg\/monoptah.*another run is safe.*gh workflow run/s);
   assert.ok(!/did not start/.test(text));
+});
+
+test("the built app bundle is removed right after packaging: success, failure and dry run", async () => {
+  const packAt = (events) => events.findIndex((e) => e.startsWith("visible ") && e.includes(" scripts/package-native-monoptah.mjs "));
+  for (const argv of [[V], [V, "--dry-run"]]) {
+    const { io, events } = fakeIo();
+    await runRelease(argv, io);
+    const at = events.indexOf("removeBuiltApp");
+    assert.ok(at > packAt(events) && packAt(events) >= 0, argv.join(" "));
+    assert.equal(events.filter((e) => e === "removeBuiltApp").length, 1);
+    assert.ok(!events.slice(0, at).some((e) => e.startsWith("remove /tmp/out")), "the package dir stays");
+  }
+  const failed = fakeIo({ failOn: packageCommand(V, "/tmp/out").command });
+  await assert.rejects(runRelease([V], failed.io), /package-native-monoptah/);
+  assert.ok(failed.events.includes("removeBuiltApp"));
+});
+
+test("a failing cleanup never hides the packaging error and only warns after a good package step", async () => {
+  const failed = fakeIo({ failOn: packageCommand(V, "/tmp/out").command, cleanupFails: true });
+  await assert.rejects(runRelease([V], failed.io), (e) => /failed \(exit 1\)/.test(e.message) && /could not remove the built app bundle: EBUSY/.test(e.message));
+  const sig = fakeIo({ failOn: "interrupt", cleanupFails: true });
+  sig.io.visible = ((orig) => (c, a, env) => {
+    if (c === packageCommand(V, "/tmp/out").command) throw new InterruptedError("SIGINT");
+    return orig(c, a, env);
+  })(sig.io.visible);
+  await assert.rejects(runRelease([V], sig.io), (e) => e.interrupted === true && /could not remove/.test(e.message));
+  const ok = fakeIo({ cleanupFails: true });
+  const result = await runRelease([V, "--dry-run"], ok.io);
+  assert.equal(result.dryRun, true);
+  assert.ok(ok.logs.some((l) => /Warning: could not remove the built app bundle: EBUSY/.test(l)));
 });

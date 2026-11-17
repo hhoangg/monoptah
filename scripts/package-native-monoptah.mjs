@@ -9,12 +9,15 @@
 // brands its files Monoptah; their names are only described here so the release
 // script and the workflow can plan, sign and verify them.
 //
+// The built bundle is deleted after packaging; the returned `app` path no longer exists.
+//
 // usage: node scripts/package-native-monoptah.mjs <binary> <out-dir> [version]
 // The version defaults to MONOCODE_NATIVE_VERSION.
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { lstatSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
@@ -157,66 +160,135 @@ function capture(command, args, options = {}) {
   }).stdout.trim();
 }
 
+// Deletes a built bundle, and only that: the path must be a real directory named
+// exactly "Monoptah Native.app" directly inside a "release" directory. A symlink
+// is refused, never followed. Nothing else in target (the build cache) is touched.
+// Returns true when something was removed, false when there was nothing to remove.
+export function removeBuiltAppBundle(app, log = console.log) {
+  const path = resolve(app);
+  if (basename(path) !== APP_NAME)
+    throw new Error(`Refusing to remove ${path}: not named ${APP_NAME}`);
+  if (basename(dirname(path)) !== "release")
+    throw new Error(`Refusing to remove ${path}: not inside a release directory`);
+  let stat;
+  try {
+    stat = lstatSync(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+  if (stat.isSymbolicLink() || !stat.isDirectory())
+    throw new Error(`Refusing to remove ${path}: not a real directory`);
+  rmSync(path, { recursive: true, force: true });
+  log(`Removed built app bundle: ${path}`);
+  return true;
+}
+
+// Tells Spotlight not to index a build directory, so a bundle left there never
+// shows up as an app. An empty marker file; harmless off macOS.
+export function markNeverIndex(dir) {
+  mkdirSync(dir, { recursive: true });
+  const marker = join(dir, ".metadata_never_index");
+  try {
+    lstatSync(marker);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+    writeFileSync(marker, "");
+  }
+}
+
+// The artifacts must never live in the bundle that is deleted after packaging.
+export function assertOutsideBundle(out, binary) {
+  const app = join(dirname(resolve(binary)), APP_NAME);
+  const dir = resolve(out);
+  if (dir === app || dir.startsWith(app + sep))
+    throw new Error(`The output directory must not be inside ${app}`);
+}
+
 export async function packageMonoptahNative({ binary, out, version }) {
   releaseVersion(version);
   binary = resolve(binary);
   out = resolve(out);
+  assertOutsideBundle(out, binary);
   const embedded = capture(binary, ["--version"]);
   if (embedded !== `Monoptah Native ${version}`)
     throw new Error(`Native executable version does not match ${version}`);
   const arch = capture("lipo", ["-archs", binary]);
   if (arch !== "arm64") throw new Error(`Expected arm64, found ${arch}`);
 
-  // bundle-native-macos.sh writes the app next to the binary's profile directory
-  // (<target>/release/Monoptah Native.app). An empty signing identity makes it
-  // sign ad-hoc (`codesign --sign -`).
-  run(
-    "bash",
-    [
-      "scripts/bundle-native-macos.sh",
-      "release",
-      dirname(dirname(binary)),
-      version,
-      "monocode-data",
-    ],
-    { env: { ...process.env, MONOCODE_NATIVE_SIGNING_IDENTITY: "" } },
-  );
+  // Spotlight must not index anything under the release directory.
+  markNeverIndex(dirname(binary));
   const app = join(dirname(binary), APP_NAME);
-  run("codesign", ["--verify", "--deep", "--strict", "--verbose=2", app]);
-  // codesign -dv writes to stderr.
-  const details = spawnSync("codesign", ["-dv", app], { encoding: "utf8" });
-  if (!/^Signature=adhoc$/m.test(details.stderr ?? ""))
-    throw new Error("The packaged app is not ad-hoc signed");
+  // The built bundle is removed afterwards (also on failure): only the archives
+  // in `out` are kept, and they are written completely before the removal.
+  let result;
+  try {
+    // bundle-native-macos.sh writes the app next to the binary's profile directory
+    // (<target>/release/Monoptah Native.app). An empty signing identity makes it
+    // sign ad-hoc (`codesign --sign -`).
+    run(
+      "bash",
+      [
+        "scripts/bundle-native-macos.sh",
+        "release",
+        dirname(dirname(binary)),
+        version,
+        "monocode-data",
+      ],
+      { env: { ...process.env, MONOCODE_NATIVE_SIGNING_IDENTITY: "" } },
+    );
+    run("codesign", ["--verify", "--deep", "--strict", "--verbose=2", app]);
+    // codesign -dv writes to stderr.
+    const details = spawnSync("codesign", ["-dv", app], { encoding: "utf8" });
+    if (!/^Signature=adhoc$/m.test(details.stderr ?? ""))
+      throw new Error("The packaged app is not ad-hoc signed");
 
-  await mkdir(out, { recursive: true });
-  const names = assetNames(version);
-  // The updater archive must hold only files and directories under
-  // "Monoptah Native.app/": the client refuses links and other roots.
-  // COPYFILE_DISABLE keeps AppleDouble (._*) entries out of it.
-  run("tar", ["-czf", join(out, names.updater), "-C", dirname(app), APP_NAME], {
-    env: { ...process.env, COPYFILE_DISABLE: "1" },
-  });
-  // ditto keeps symlinks and extended attributes that plain zip can break
-  // inside an .app bundle. The sha256 file is what the cask pins.
-  run("ditto", [
-    "-c",
-    "-k",
-    "--sequesterRsrc",
-    "--keepParent",
-    app,
-    join(out, names.zip),
-  ]);
-  const digest = createHash("sha256")
-    .update(await readFile(join(out, names.zip)))
-    .digest("hex");
-  await writeFile(join(out, names.sha256), `${digest}  ${names.zip}\n`);
-  // Same metadata shape as upstream's artifacts-*.json.
-  const artifacts = artifactRecords(version);
-  await writeFile(
-    join(out, "artifacts-macos-aarch64.json"),
-    JSON.stringify(artifacts, null, 2),
-  );
-  return { app, artifacts, sha256: digest };
+    await mkdir(out, { recursive: true });
+    const names = assetNames(version);
+    // The updater archive must hold only files and directories under
+    // "Monoptah Native.app/": the client refuses links and other roots.
+    // COPYFILE_DISABLE keeps AppleDouble (._*) entries out of it.
+    run("tar", ["-czf", join(out, names.updater), "-C", dirname(app), APP_NAME], {
+      env: { ...process.env, COPYFILE_DISABLE: "1" },
+    });
+    // ditto keeps symlinks and extended attributes that plain zip can break
+    // inside an .app bundle. The sha256 file is what the cask pins.
+    run("ditto", [
+      "-c",
+      "-k",
+      "--sequesterRsrc",
+      "--keepParent",
+      app,
+      join(out, names.zip),
+    ]);
+    const digest = createHash("sha256")
+      .update(await readFile(join(out, names.zip)))
+      .digest("hex");
+    await writeFile(join(out, names.sha256), `${digest}  ${names.zip}\n`);
+    // Same metadata shape as upstream's artifacts-*.json.
+    const artifacts = artifactRecords(version);
+    await writeFile(
+      join(out, "artifacts-macos-aarch64.json"),
+      JSON.stringify(artifacts, null, 2),
+    );
+    result = { app, artifacts, sha256: digest };
+  } catch (error) {
+    // A cleanup problem must never hide the error that stopped the packaging.
+    try {
+      removeBuiltAppBundle(app);
+    } catch (cleanup) {
+      if (error instanceof Error)
+        error.message += `\n(could not remove the built app bundle: ${cleanup.message})`;
+    }
+    throw error;
+  }
+  try {
+    removeBuiltAppBundle(app);
+  } catch (cleanup) {
+    // The archives are complete and valid; only warn.
+    console.warn(`Warning: could not remove the built app bundle: ${cleanup.message}`);
+  }
+  return result;
 }
 
 if (

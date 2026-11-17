@@ -193,3 +193,11 @@ test("a release run leaves an unrelated existing release bundle contents alone e
   await access(legacyLike);
   await access(join(f.target, "release/Monoptah Native.app/Contents/Info.plist"));
 });
+
+test("release bundling marks the release directory as never indexed, dev bundling does not", { skip: process.platform === "win32" }, async (t) => {
+  const f = await setup(t);
+  assert.equal(f.run("release").status, 0);
+  await access(join(f.target, "release/.metadata_never_index"));
+  assert.equal(f.run("native-dev").status, 0);
+  await assert.rejects(access(join(f.target, "native-dev/.metadata_never_index")));
+});

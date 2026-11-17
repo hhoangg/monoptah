@@ -20,6 +20,10 @@ watch that the run started                     publish: sign, verify, upload, fe
                                                homebrew: bump the cask
 ```
 
+The script deletes the built `Monoptah Native.app` from `target/aarch64-apple-darwin/release`
+once packaging ends (on success, on failure and in `--dry-run`), so Spotlight and Launchpad do not
+list stale copies. Only the archives in the temp release dir are kept.
+
 native.yml runs on the push of the last merge, in parallel with all of this. The script waits
 for it only right before it tags.
 
