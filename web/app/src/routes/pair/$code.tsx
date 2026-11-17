@@ -9,5 +9,6 @@ export const Route = createFileRoute("/pair/$code")({
 
 function Page() {
   const { code } = Route.useParams();
-  return <PairScreen code={code} />;
+  // `key`: nothing of one request (checkbox, replace choice, outcome) may carry over to another code.
+  return <PairScreen key={code} code={code} />;
 }

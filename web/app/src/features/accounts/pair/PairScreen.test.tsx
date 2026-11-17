@@ -95,11 +95,36 @@ describe("pairing page: details and fingerprint check", () => {
     expect(screen.queryByRole("link", { name: /Approve/ })).toBeNull();
     expect(screen.queryByRole("checkbox")).toBeNull();
     expect(screen.queryByRole("radio")).toBeNull();
-    expect(screen.getByRole("link", { name: "Cancel" })).toHaveAttribute("href", "/desktops");
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeEnabled();
     await user.click(screen.getByRole("button", { name: "Deny" }));
     await screen.findByRole("heading", { level: 1, name: "Request denied" });
     expect(approveCalls()).toHaveLength(0);
     expect(state.pairings.get(normalizeUserCode(MOCK_PAIR_CODE))?.status).toBe("denied");
+  });
+
+  it("Cancel on a mismatch denies the request first (no passkey), then leaves for /desktops", async () => {
+    const state = install();
+    const user = userEvent.setup();
+    const { router } = mount(`/pair/${MOCK_PAIR_CODE}${OTHER}`);
+    await screen.findByRole("heading", { level: 1, name: "Do not approve this desktop" });
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/desktops"));
+    expect(urlsOf(sent).filter((call) => call.includes("/deny"))).toHaveLength(1);
+    expect(state.pairings.get(normalizeUserCode(MOCK_PAIR_CODE))?.status).toBe("denied");
+    expect(lib.startAuthentication).not.toHaveBeenCalled();
+  });
+
+  it("stays on the page when the denial fails, so the user can try again", async () => {
+    install();
+    const user = userEvent.setup();
+    const { router } = mount(`/pair/${MOCK_PAIR_CODE}${OTHER}`);
+    await screen.findByRole("heading", { level: 1, name: "Do not approve this desktop" });
+    const path = router.state.location.pathname;
+    restore?.();
+    restore = setApiTransport(() => Promise.reject(new TypeError("offline")));
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" })).toBeEnabled());
+    expect(router.state.location.pathname).toBe(path);
   });
 
   it("treats a truncated fragment as a mismatch", async () => {
@@ -287,6 +312,17 @@ describe("pairing page: signed-out round trip", () => {
     await screen.findByText("The fingerprint matches your link");
     expect(screen.queryByText("This link has no fingerprint")).toBeNull();
     await waitFor(() => expect(window.sessionStorage.getItem("monoptah.fp")).toBeNull());
+  });
+
+  it("keeps a malformed #fp through sign-in (as a flag, not raw text) and still blocks", async () => {
+    install({ signedIn: false });
+    const user = userEvent.setup();
+    mount(`/pair/${MOCK_PAIR_CODE}#fp=not-hex-at-all`);
+    await screen.findByRole("heading", { level: 1, name: "Sign in to Monoptah" });
+    expect(window.sessionStorage.getItem("monoptah.fp")).not.toContain("not-hex");
+    await user.click(screen.getByRole("button", { name: /Sign in with passkey/ }));
+    await screen.findByRole("heading", { level: 1, name: "Do not approve this desktop" });
+    expect(screen.queryByRole("button", { name: /Approve/ })).toBeNull();
   });
 
   it("keeps a mismatching #fp through sign-in and still blocks", async () => {

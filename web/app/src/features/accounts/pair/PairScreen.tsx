@@ -2,7 +2,7 @@
 //
 // What protects the user here is the comparison, so the screen is built around it:
 //  - `#fp` (full fingerprint from the desktop's link or QR) is compared with the server's value. A
-//    mismatch blocks: there is no Approve control at all, only Deny and Cancel.
+//    mismatch blocks: there is no Approve control at all, only Deny and Cancel (Cancel denies, then leaves).
 //  - A link without `#fp` (a code typed or pasted bare) still works, but shows a warning and asks the
 //    user to confirm that the code and fingerprint match the desktop screen. Decision: approval stays
 //    possible because the QR and the links the desktop shows always carry `#fp`, and refusing every bare
@@ -10,7 +10,7 @@
 //  - Approve needs a fresh passkey (`withFreshAuth`); Deny needs only the session.
 //  - Machine name and OS are untrusted text: shown as text, stripped of hidden characters, truncated.
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, useRouterState } from "@tanstack/react-router";
+import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import { useEffect, useState, type ReactNode } from "react";
 import { AuthLayout } from "@/ui/AuthLayout";
 import { Button } from "@/ui/button";
@@ -19,6 +19,7 @@ import { DelayedSpinner } from "@/ui/DelayedSpinner";
 import { Icon } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
 import { PageHeader } from "@/ui/PageHeader";
+import { Radio } from "@/ui/Radio";
 import { apiFetch, isApiError } from "../api";
 import { GENERIC_ERROR, NETWORK_ERROR } from "../authCopy";
 import { endpoints } from "../endpoints";
@@ -68,6 +69,7 @@ function Detail({ label, children }: { label: string; children: ReactNode }) {
 
 export function PairScreen({ code }: { code: string }) {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
   const hash = useRouterState({ select: (state) => state.location.hash });
   const [outcome, setOutcome] = useState<Outcome | null>(null);
   const [busy, setBusy] = useState<"approve" | "deny" | null>(null);
@@ -89,12 +91,14 @@ export function PairScreen({ code }: { code: string }) {
   const desktops = useQuery({ ...desktopsQuery, enabled: info.isSuccess, retry: false });
   const expiresAt = info.data?.expiresAt;
 
-  // The code stops working at `expiresAt`: show the expired screen instead of a button that would fail.
+  // The code stops working at `expiresAt`. This device's clock can be wrong, so reaching that time only asks the
+  // server again: its 404 or 400 shows the expired screen, and a still valid code stays approvable.
+  const refetchInfo = info.refetch;
   useEffect(() => {
     if (expiresAt === undefined) return;
-    const timer = window.setTimeout(() => setOutcome((current) => current ?? { kind: "gone" }), Math.min(MAX_TIMER_MS, Math.max(0, expiresAt * 1000 - Date.now())));
+    const timer = window.setTimeout(() => void refetchInfo(), Math.min(MAX_TIMER_MS, Math.max(0, expiresAt * 1000 - Date.now())));
     return () => window.clearTimeout(timer);
-  }, [expiresAt]);
+  }, [expiresAt, refetchInfo]);
 
   const gone = outcome?.kind === "gone" || (info.isError && isGone(info.error));
 
@@ -206,6 +210,23 @@ export function PairScreen({ code }: { code: string }) {
     }
   }
 
+  /** Cancel on a mismatch: the request is denied first (always safe, no passkey), then the page is left. */
+  async function cancelMismatch() {
+    setBusy("deny");
+    setError(null);
+    try {
+      await apiFetch(endpoints.pairDeny, { params: { userCode: code } });
+    } catch (caught) {
+      // A code that is already gone needs no denial; anything else keeps the page so the user can try again.
+      if (!isGone(caught)) {
+        setError(pairErrorMessage(caught));
+        setBusy(null);
+        return;
+      }
+    }
+    await navigate({ to: "/desktops" });
+  }
+
   return (
     <AuthLayout>
       <PageHeader
@@ -293,7 +314,11 @@ export function PairScreen({ code }: { code: string }) {
           Deny
           {busy === "deny" ? <DelayedSpinner label="Denying" /> : null}
         </Button>
-        {check === "mismatch" ? <BackToDesktops variant="outline">Cancel</BackToDesktops> : null}
+        {check === "mismatch" ? (
+          <Button type="button" size="lg" variant="outline" className="w-full" disabled={busy !== null} onClick={() => void cancelMismatch()}>
+            Cancel
+          </Button>
+        ) : null}
       </div>
     </AuthLayout>
   );
@@ -302,14 +327,7 @@ export function PairScreen({ code }: { code: string }) {
 function ChoiceRow({ name, value, checked, onSelect, label }: { name: string; value: string; checked: boolean; onSelect: (value: string) => void; label: string }) {
   return (
     <label className="flex min-h-11 cursor-pointer items-center gap-3 rounded-row px-2 text-body text-content has-checked:bg-selection">
-      <input
-        type="radio"
-        name={name}
-        value={value}
-        checked={checked}
-        onChange={() => onSelect(value)}
-        className="size-[18px] shrink-0 cursor-pointer appearance-none rounded-pill border-[1.5px] border-faint bg-transparent checked:border-[5px] checked:border-content"
-      />
+      <Radio name={name} value={value} checked={checked} onChange={() => onSelect(value)} />
       <span className="min-w-0 flex-1 wrap-anywhere">{label}</span>
     </label>
   );
