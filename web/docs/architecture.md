@@ -579,17 +579,17 @@ The desktop is the authority for `state` and `permission`. The server mirrors th
 ## 9. Self-host guide (outline)
 
 1. Prerequisites: Cloudflare account, Node 22, pnpm, `wrangler` (4.36 or later), a domain on Cloudflare.
-2. `git clone` the repo, `cd web && pnpm install`.
-3. `wrangler login`.
+2. `git clone` the repo, `cd web && pnpm install --frozen-lockfile`. Every command below runs in `web/` (where `wrangler.jsonc` lives; the `wrangler` commands pass `-c wrangler.jsonc`, the `pnpm --filter @monoptah/worker` scripts pass `-c ../wrangler.jsonc` themselves).
+3. `pnpm --filter @monoptah/worker exec wrangler login` (wrangler is a dependency of the worker package; it is not installed globally by the repo). The same prefix applies to every `wrangler` command below.
 4. `wrangler d1 create monoptah`, copy the `database_id` into `wrangler.jsonc`.
-5. `pnpm --filter worker db:migrate:remote` (runs `wrangler d1 migrations apply monoptah --remote`).
-6. Generate VAPID keys: `pnpm --filter worker vapid:generate` prints a public key and a private key (P-256, base64url). Put the public key and `VAPID_SUBJECT` in `vars`; `wrangler secret put VAPID_PRIVATE_KEY`.
-7. `wrangler secret put RECOVERY_PEPPER` (32 random bytes, base64; losing it invalidates stored recovery codes, so back it up) and `wrangler secret put AUDIT_IP_SALT` (32 random bytes, base64).
+5. `pnpm --filter @monoptah/worker db:migrate:remote` (runs `wrangler d1 migrations apply monoptah --remote -c ../wrangler.jsonc`).
+6. Generate VAPID keys: the `vapid:generate` script is added by P-01 and does not exist yet; it will print a public key and a private key (P-256, base64url). Put the public key (replacing the `REPLACE_WITH_VAPID_PUBLIC_KEY_BASE64URL` placeholder) and `VAPID_SUBJECT` in `vars`; `wrangler secret put VAPID_PRIVATE_KEY`.
+7. The three secrets, and only these, are Worker secrets (`web/.dev.vars.example` and the comment in `wrangler.jsonc` list the same three; locally they come from the git-ignored `web/.dev.vars`): `VAPID_PRIVATE_KEY` (step 6), `wrangler secret put RECOVERY_PEPPER` (32 random bytes, base64; losing it invalidates stored recovery codes, so back it up) and `wrangler secret put AUDIT_IP_SALT` (32 random bytes, base64).
 8. Set `RP_ID` and `RP_ORIGIN` to your own final hostname (the official host uses `zptah.app` and `https://zptah.app`). Passkeys are bound to `RP_ID`: it must never change after the first user registers, because changing it breaks every passkey. Host nothing else on that hostname or its subdomains (cookie and CSP isolation, security.md section 3.3).
 9. Custom domain: add a `routes` entry with `custom_domain: true`, or attach in the dashboard; HTTPS is mandatory.
-10. `pnpm build && wrangler deploy`. (The official host is not deployed this way: only the maintainer runs `pnpm deploy:official` from their Mac, security.md section 9.)
-11. First admin: `pnpm --filter worker bootstrap -- --remote` creates a `bootstrap` invite (24 h, one use, grants `role = admin`) and prints the code once; open `/register#invite=CODE`, choose a handle, create a passkey, save the recovery codes.
+10. `pnpm --filter @monoptah/app build`, then `wrangler deploy -c wrangler.jsonc`. (There is no root `build` script. The official host is not deployed this way: only the maintainer runs `pnpm deploy:official` from their Mac, security.md section 9 and [deploy-runbook.md](deploy-runbook.md).)
+11. First admin: `pnpm bootstrap -- --remote` (or `pnpm --filter @monoptah/worker bootstrap -- --remote`; `--local` targets the local dev database and `--persist-to DIR` picks its directory; one of the two flags is required and `--remote` is refused when `CI` is set) creates a `bootstrap` invite (24 h, one use, grants `role = admin`) and prints the link `<RP_ORIGIN>/register#invite=CODE` once (only the SHA-256 hash of the code is stored, and the code is never written to a file or log; `--origin URL` overrides the origin read from `wrangler.jsonc`); open `/register#invite=CODE`, choose a handle, create a passkey, save the recovery codes.
 12. In Monoptah Native set the Host URL (Settings > Connections > Web app) and Pair.
-13. Update: `git pull`, `pnpm install`, apply new migrations (`db:migrate:remote`), `pnpm build && wrangler deploy`. Every deploy disconnects all relay sockets; clients reconnect with backoff (section 3.3). Migrations are forward-only and backward compatible for one release so a rollback of the Worker works.
+13. Update: `git pull`, `pnpm install --frozen-lockfile`, apply new migrations (`db:migrate:remote`) first, then build and `wrangler deploy -c wrangler.jsonc` as in step 10. Every deploy disconnects all relay sockets; clients reconnect with backoff (section 3.3). Migrations are forward-only and backward compatible for one release so a rollback of the Worker works.
 14. Backups: D1 Time Travel is on by default; export with `wrangler d1 export` before risky migrations.
 15. Docker is out of scope.
