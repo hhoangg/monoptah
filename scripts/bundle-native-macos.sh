@@ -54,6 +54,10 @@ if [ "$native_profile" != release ]; then
   trap 'rm -rf "$native_staging"' EXIT
   rm -rf "$native_bundle"
 fi
+if [ "$native_profile" = release ]; then
+  # Keep Spotlight and Launchpad from indexing release bundles left in target.
+  touch "$native_target/.metadata_never_index"
+fi
 mkdir -p "$native_bundle/Contents/MacOS" "$native_bundle/Contents/Resources"
 # Replace the inode atomically so macOS does not reuse an older signature cache.
 cp "$native_binary" "$native_bundle/Contents/MacOS/monocode-gpui.next"

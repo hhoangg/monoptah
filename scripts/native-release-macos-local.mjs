@@ -47,11 +47,11 @@ import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { CI_RUNS_JQ, REPOSITORY, ciRunsPath, ciVerdict, describeCi, readCiRuns } from "./native-release-monoptah.mjs";
 import { generateNotes } from "./native-release-notes.mjs";
-import { PLATFORMS, releaseVersion } from "./package-native-monoptah.mjs";
+import { PLATFORMS, releaseVersion, removeBuiltAppBundle } from "./package-native-monoptah.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 
@@ -648,6 +648,7 @@ export class InterruptedError extends Error {
 //   io.capture(command, args) -> { status, stdout, stderr }   (never throws)
 //   io.visible(command, args, env)                            (throws on failure)
 //   io.readText(path), io.exists(path), io.listDir(dir)
+//   io.removeBuiltApp() (deletes the built Monoptah Native.app from target),
 //   io.makeTempDir(version), io.removeDir(dir), io.writeStamp(text), io.log(text)
 //   io.writeText(path, text), io.now() (ms), io.sleep(ms) (awaitable)
 //   io.randomId() -> a short unique string for the workflow run name
@@ -778,7 +779,25 @@ export async function runRelease(argv, io) {
     dir = io.makeTempDir(version);
     io.log("Packaging into " + dir + "...");
     const pack = packageCommand(version, dir);
-    io.visible(pack.command, pack.args, env);
+    // The packaging child removes the bundle itself. This covers it being killed
+    // by a signal (Ctrl-C reaches it through the guard below, which keeps this
+    // process alive until the child is gone) and any other failure. A cleanup
+    // problem never hides the original error.
+    let packError = null;
+    try {
+      await guarded(async () => io.visible(pack.command, pack.args, env));
+    } catch (error) {
+      packError = error;
+      throw error;
+    } finally {
+      try {
+        io.removeBuiltApp();
+      } catch (cleanup) {
+        if (packError instanceof Error)
+          packError.message += "\n(could not remove the built app bundle: " + cleanup.message + ")";
+        else io.log("Warning: could not remove the built app bundle: " + cleanup.message);
+      }
+    }
     files = macosReleaseFiles(version, io.listDir(dir));
     const notesPath = join(dir, "release-notes.md");
     io.writeText(notesPath, notes.text);
@@ -950,6 +969,7 @@ function realIo() {
     listDir: (dir) => readdirSync(dir),
     makeTempDir: (version) => mkdtempSync(join(tmpdir(), "monoptah-native-" + version + "-")),
     removeDir: (dir) => rmSync(dir, { recursive: true, force: true }),
+    removeBuiltApp: () => removeBuiltAppBundle(abs(join(dirname(BINARY), "Monoptah Native.app")), (text) => console.log(text)),
     writeStamp(text) {
       mkdirSync(join(root, "crates/monocode-gpui/target"), { recursive: true });
       writeFileSync(abs(STAMP_FILE), text);
