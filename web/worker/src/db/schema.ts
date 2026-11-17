@@ -383,8 +383,8 @@ export const auditLog = sqliteTable(
     check("audit_log_actor_kind_check", oneOf("actor_kind", AUDIT_ACTOR_KINDS)),
     // Retention cleanup and the admin view (newest first).
     index("audit_log_ts_idx").on(t.ts),
-    // Not in architecture.md 4.3: `GET /api/audit` pages one user's events.
-    index("audit_log_actor_user_id_ts_idx").on(t.actorUserId, t.ts),
+    // Not in architecture.md 4.3: `GET /api/audit` pages one user's events by the cursor (ts, id) (migration 0002).
+    index("audit_log_actor_user_id_ts_id_idx").on(t.actorUserId, t.ts, t.id),
   ],
 );
 

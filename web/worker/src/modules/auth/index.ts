@@ -1,4 +1,7 @@
 import { defineModule } from "../define.ts";
+import { logout } from "../sessions/handlers.ts";
 
-/** Routes of the `auth` module in the protocol registry. All answer 501 until their ticket lands. */
-export const routes = defineModule("auth");
+/** Routes of the `auth` module. `POST /api/auth/logout` is A-04; the passkey routes answer 501 until A-03. */
+export const routes = defineModule("auth", {
+  "POST /api/auth/logout": logout,
+});

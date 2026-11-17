@@ -3,11 +3,12 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { type ApiError, type ApiErrorCode } from "@monoptah/protocol";
 import type { z } from "zod";
 import type { Env } from "./env.ts";
+import type { Principal } from "./middleware/auth.ts";
 
-/** Hono environment of every route. `Variables` is where the auth resolver (A-04) puts the principal. */
+/** Hono environment of every route. `Variables.auth` is the principal the auth resolver (A-04) sets on session routes. */
 export interface AppEnv {
   Bindings: Env;
-  Variables: Record<string, never>;
+  Variables: { auth?: Principal };
 }
 
 export type AppContext = Context<AppEnv>;

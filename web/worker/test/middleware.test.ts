@@ -1,10 +1,15 @@
+import { env } from "cloudflare:workers";
 import { Hono } from "hono";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import { API_ROUTES, ApiErrorSchema, type ApiRoute } from "@monoptah/protocol";
 import { buildCsp, COMPANION_HEADERS } from "../src/middleware/security.ts";
 import { ignoreCookies, isCookieAuthenticated } from "../src/middleware/browser.ts";
 import type { AppEnv } from "../src/http.ts";
 import { BROWSER_HEADERS, call, ORIGIN } from "./helpers.ts";
+import { createTestUser, loginAs, type TestSession } from "./support/accounts.ts";
+
+/** Routes with a real handler: with a valid session they no longer answer 501 (their own tests cover them). */
+const IMPLEMENTED = new Set(["GET /api/me", "PATCH /api/me", "GET /api/audit", "GET /api/sessions", "DELETE /api/sessions/:id", "POST /api/auth/logout"]);
 
 const concrete = (route: ApiRoute) => route.path.replace(/:[A-Za-z]+/g, "x");
 const nonGet = (route: ApiRoute) => route.method !== "GET";
@@ -33,6 +38,11 @@ describe("route classification", () => {
 });
 
 describe("Origin and X-Monoptah-CSRF on cookie routes", () => {
+  let admin: TestSession;
+  beforeAll(async () => {
+    admin = await loginAs((await createTestUser(env, { role: "admin" })).id, { fresh: true });
+  });
+
   it.each(cookieRoutes.map((r) => [`${r.method} ${r.path}`, r] as const))("%s", async (_name, route) => {
     const path = concrete(route);
     const send = (headers: Record<string, string>) => call(path, { method: route.method, headers });
@@ -53,13 +63,21 @@ describe("Origin and X-Monoptah-CSRF on cookie routes", () => {
     expect(badCsrf.status).toBe(403);
     expect(ApiErrorSchema.parse(await badCsrf.json()).code).toBe("csrf");
 
+    // Passing the browser checks: the request reaches the auth resolver (401 without a session)...
     const ok = await send({ ...BROWSER_HEADERS });
-    expect(ok.status).toBe(501);
+    expect(ok.status).toBe(route.auth === "public" ? 501 : 401);
+    // ...and with a valid session the handler (501 while unimplemented).
+    if (route.auth !== "public" && !IMPLEMENTED.has(`${route.method} ${route.path}`)) {
+      const authed = await send({ ...BROWSER_HEADERS, Cookie: admin.cookie });
+      expect(authed.status).toBe(501);
+    }
   });
 
   it("does not check Origin or CSRF on GET", async () => {
+    // No Origin and no CSRF header: the answer is the resolver's 401, not a 403 bad_origin or csrf.
     const res = await call("/api/me");
-    expect(res.status).toBe(501);
+    expect(res.status).toBe(401);
+    expect(ApiErrorSchema.parse(await res.json()).code).toBe("unauthorized");
   });
 
   it("rejects a non-GET cookie route whose Content-Type is not application/json (415)", async () => {
@@ -72,7 +90,7 @@ describe("Origin and X-Monoptah-CSRF on cookie routes", () => {
       expect(ApiErrorSchema.parse(await res.json()).code).toBe("unsupported_media_type");
     }
     const withCharset = await call(concrete(route), { method: route.method, headers: { ...BROWSER_HEADERS, "Content-Type": "application/json; charset=utf-8" } });
-    expect(withCharset.status).toBe(501);
+    expect(withCharset.status).toBe(route.auth === "public" ? 501 : 401);
   });
 
   it("checks Origin on a WebSocket upgrade GET (no CSRF header there)", async () => {
@@ -83,8 +101,9 @@ describe("Origin and X-Monoptah-CSRF on cookie routes", () => {
     expect(ApiErrorSchema.parse(await none.json()).code).toBe("bad_origin");
     const wrong = await call(path, { headers: { ...upgrade, Origin: "https://evil.example" } });
     expect(wrong.status).toBe(403);
+    // Right Origin: past the Origin check, the session resolver answers (no cookie: 401).
     const ok = await call(path, { headers: { ...upgrade, Origin: ORIGIN } });
-    expect(ok.status).toBe(501);
+    expect(ok.status).toBe(401);
   });
 });
 
