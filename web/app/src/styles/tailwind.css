@@ -1,0 +1,105 @@
+/* Tailwind v4 theme of design-system.md section 5.3. */
+@import "tailwindcss";
+@custom-variant dark (&:where([data-scheme="dark"], [data-scheme="dark"] *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--content);
+  --color-drawer: var(--drawer);
+  --color-sheet: var(--sheet);
+  --color-surface: var(--surface);
+  --color-surface-raised: var(--surface-raised);
+  --color-stroke: var(--stroke);
+  --color-selection: var(--selection);
+  --color-content: var(--content);
+  --color-muted-text: var(--muted);          /* text-muted-text */
+  --color-faint: var(--faint);
+  --color-brand: var(--accent-color);        /* bg-brand, text-brand */
+  --color-brand-text: var(--accent-text);
+  --color-additions: var(--additions);
+  --color-deletions: var(--deletions);
+  --color-caution: var(--caution);
+  --color-file-ref: var(--file-ref);
+  --color-inverse: var(--inverse);
+  --color-inverse-surface: var(--inverse-surface);
+  --color-fill: var(--fill);
+  --color-thumb: var(--thumb);
+  --color-rail: var(--rail);
+  --color-bubble: var(--bubble);
+  --color-list-card: var(--list-card);
+  --color-list-divider: var(--list-divider);
+
+  /* shadcn */
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--surface);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  --radius-pill: 999px;
+  --radius-card: 22px;
+  --radius-row: 12px;
+  --radius-sheet: 32px;
+  --radius-menu-card: 26px;
+  --radius-dialog: 20px;
+  --radius-sm: 6px;  --radius-md: 10px;  --radius-lg: 12px;  --radius-xl: 22px;
+
+  --text-display: 2.125rem;   --text-display--line-height: 2.5rem;
+  --text-headline: 1.375rem;  --text-headline--line-height: 1.75rem;
+  --text-title: 1.25rem;      --text-title--line-height: 1.625rem;
+  --text-h: 1.125rem;         --text-h--line-height: 1.625rem;
+  --text-row: 1.0625rem;      --text-row--line-height: 1.375rem;
+  --text-body: 1rem;          --text-body--line-height: 1.5rem;
+  --text-label: 0.9375rem;    --text-label--line-height: 1.25rem;
+  --text-small: 0.875rem;     --text-small--line-height: 1.25rem;
+  --text-meta: 0.8125rem;     --text-meta--line-height: 1.125rem;
+  --text-caption: 0.75rem;    --text-caption--line-height: 1rem;
+  --text-micro: 0.6875rem;    --text-micro--line-height: 0.875rem;
+
+  --shadow-*: initial;        /* no shadows: removes every shadow utility */
+  --drop-shadow-*: initial;
+
+  --ease-out-cubic: cubic-bezier(0.215, 0.61, 0.355, 1);
+  --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-word: cubic-bezier(0.33, 0.53, 0.67, 1);
+  --breakpoint-sm: 40rem;     /* 640 */
+  --breakpoint-lg: 64rem;     /* 1024 */
+}
+
+@layer base {
+  html { font-family: var(--font-sans); color: var(--content); background: var(--background); -webkit-text-size-adjust: 100%; }
+  body { margin: 0; min-height: 100dvh; overscroll-behavior: none; -webkit-tap-highlight-color: transparent; }
+  * { border-color: var(--stroke); }
+  :focus-visible { outline: 2px solid var(--accent-color); outline-offset: 2px; }
+  button, [role="button"], a { touch-action: manipulation; }
+  .tabular { font-variant-numeric: tabular-nums; }
+}
+
+/* Reduced motion (design-system.md 6.3): no transforms or long transitions. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Squircle corners as progressive enhancement (design-system.md 3.2). */
+@supports (corner-shape: squircle) {
+  .rounded-card, .rounded-sheet, .rounded-dialog, .rounded-menu-card { corner-shape: squircle; }
+}
