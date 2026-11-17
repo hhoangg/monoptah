@@ -5,8 +5,8 @@ import { Icon, ICONS, type IconName } from "./Icon";
 describe("Icon", () => {
   const names = Object.keys(ICONS) as IconName[];
 
-  it("maps the 50 mobile names and the 9 web-only names of design-system.md section 7", () => {
-    expect(names).toHaveLength(59);
+  it("maps the mobile names and the web-only names of design-system.md section 7", () => {
+    expect(names).toHaveLength(69);
   });
 
   it.each(names)("renders %s as an svg with the default size and stroke", (name) => {

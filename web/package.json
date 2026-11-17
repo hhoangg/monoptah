@@ -14,7 +14,8 @@
     "typecheck": "pnpm -r run typecheck",
     "lint": "pnpm -r run lint",
     "test": "pnpm -r run test",
-    "smoke:dev": "node scripts/api-smoke.mjs"
+    "smoke:dev": "node scripts/api-smoke.mjs",
+    "vapid:generate": "node scripts/vapid-generate.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

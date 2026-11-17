@@ -6,6 +6,7 @@ import { RouterProvider } from "@tanstack/react-router";
 import { MotionConfig } from "motion/react";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
+import { installSessionExpiryHandler } from "@/features/accounts/sessionExpiry";
 import { startAppearanceSync } from "@/lib/appearance";
 import { queryClient } from "@/lib/queryClient";
 import { Toaster } from "@/ui/sonner";
@@ -16,19 +17,34 @@ import "./styles/index.css";
 import "./features/cloud/register";
 import "./features/desktops/register";
 import "./features/layout/register";
+import "./features/settings/register";
 
 startAppearanceSync();
+installSessionExpiryHandler(queryClient, router);
 
-const container = document.getElementById("root");
-if (!container) throw new Error("Missing #root element");
+async function start() {
+  // Dev only: the mock API replaces the network. The condition is a build-time constant, so the
+  // dynamic import (and the whole mock) is removed from production builds.
+  if (import.meta.env.DEV && import.meta.env.VITE_MOCK_API === "1") {
+    const { installMockApi } = await import("./features/accounts/mock");
+    installMockApi();
+    const { installMockDesktopLink } = await import("./features/settings/mockDesktopLink");
+    installMockDesktopLink();
+  }
 
-createRoot(container).render(
-  <StrictMode>
-    <MotionConfig reducedMotion="user">
-      <QueryClientProvider client={queryClient}>
-        <RouterProvider router={router} />
-        <Toaster />
-      </QueryClientProvider>
-    </MotionConfig>
-  </StrictMode>,
-);
+  const container = document.getElementById("root");
+  if (!container) throw new Error("Missing #root element");
+
+  createRoot(container).render(
+    <StrictMode>
+      <MotionConfig reducedMotion="user">
+        <QueryClientProvider client={queryClient}>
+          <RouterProvider router={router} />
+          <Toaster />
+        </QueryClientProvider>
+      </MotionConfig>
+    </StrictMode>,
+  );
+}
+
+void start();

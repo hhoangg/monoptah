@@ -4,7 +4,7 @@
 use super::audit::{self, AuditEvent, Outcome, Transport};
 use super::catalog::{recent_sessions, session_page};
 use super::identity_store::{self, IdentityKeychain, SystemKeychain};
-use super::policy::{self, DeviceContext, DeviceKind};
+use super::policy::{self, DeviceContext, DeviceKind, Permission};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use monocode_mobile_link::{now, Address, Gate, Identity, WatchSink, PORT, VERSION};
 use serde::{Deserialize, Serialize};
@@ -78,6 +78,51 @@ pub struct Device {
     /// Where the phone is notified while its app is closed, once it asks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub push: Option<PushRegistration>,
+    /// A QUIC phone (every row an earlier version wrote) or a web device.
+    #[serde(default = "phone_kind", skip_serializing_if = "is_phone_kind")]
+    pub kind: DeviceKind,
+    #[serde(default = "control_permission", skip_serializing_if = "is_control")]
+    pub permission: Permission,
+    /// The projects the device may see; `None` means all of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projects: Option<Vec<String>>,
+    /// The Monos the device may see; `None` means all of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monos: Option<Vec<String>>,
+    /// The relay's id for a web device. Phones have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_device_id: Option<String>,
+    /// Unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<u64>,
+    /// Unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<u64>,
+}
+
+fn phone_kind() -> DeviceKind {
+    DeviceKind::Phone
+}
+fn is_phone_kind(kind: &DeviceKind) -> bool {
+    *kind == DeviceKind::Phone
+}
+fn control_permission() -> Permission {
+    Permission::Control
+}
+fn is_control(permission: &Permission) -> bool {
+    *permission == Permission::Control
+}
+
+/// The context of a request from the stored device. For a phone row an earlier
+/// version wrote, this equals `DeviceContext::phone`.
+fn device_context(device: &Device) -> DeviceContext {
+    DeviceContext {
+        id: device.id.clone(),
+        kind: device.kind,
+        permission: device.permission,
+        projects: device.projects.clone(),
+        monos: device.monos.clone(),
+    }
 }
 
 /// A phone's Expo push token and the notification categories it turned off.
@@ -98,6 +143,13 @@ struct Config {
     remote_address: String,
     #[serde(default)]
     devices: Vec<Device>,
+    /// The web link runs independently of QUIC `enabled`. Left out of the file
+    /// while off, so a phone-only file is unchanged.
+    #[serde(default, skip_serializing_if = "is_false")]
+    web_enabled: bool,
+}
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 impl Default for Config {
     fn default() -> Self {
@@ -106,6 +158,7 @@ impl Default for Config {
             open_router: true,
             remote_address: String::new(),
             devices: Vec::new(),
+            web_enabled: false,
         }
     }
 }
@@ -190,7 +243,28 @@ struct Invitation {
 }
 struct Watcher {
     peer: String,
+    /// The transport the watch runs over, so turning one transport off ends
+    /// only its own watches.
+    via: DeviceKind,
     sink: WatchSink,
+}
+
+/// The host's runtime. Dropping a tokio runtime from async code panics, and the
+/// last clone of the host can be dropped by a task running on this very
+/// runtime, so it is shut down in the background instead of joined.
+struct HostRuntime(Option<tokio::runtime::Runtime>);
+impl std::ops::Deref for HostRuntime {
+    type Target = tokio::runtime::Runtime;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("runtime is taken only on drop")
+    }
+}
+impl Drop for HostRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            runtime.shutdown_background();
+        }
+    }
 }
 struct Inner {
     config: Config,
@@ -211,13 +285,15 @@ pub struct MobileHost {
     gate: Gate,
     path: PathBuf,
     events: async_channel::Sender<Event>,
-    runtime: Arc<OnceLock<tokio::runtime::Runtime>>,
+    runtime: Arc<OnceLock<HostRuntime>>,
     /// Serializes identity loading without holding `inner`, which the UI reads.
     identity_load: Arc<Mutex<()>>,
     /// Only read to migrate an identity an earlier version saved in the keychain.
     keychain: Arc<dyn IdentityKeychain>,
     pending: Arc<AtomicUsize>,
     shut_down: Arc<AtomicBool>,
+    /// The web link's client task, status and pending grants.
+    web: super::web_link::WebLink,
 }
 
 fn unavailable<T>(_: T) -> String {
@@ -275,7 +351,12 @@ impl MobileHost {
             Config::default()
         };
         let gate = Gate::default();
-        for device in &config.devices {
+        // The QUIC gate lists phones only: a web device never connects over QUIC.
+        for device in config
+            .devices
+            .iter()
+            .filter(|device| device.kind == DeviceKind::Phone)
+        {
             gate.allow(device.fingerprint.clone(), None);
         }
         let enabled = config.enabled;
@@ -301,6 +382,7 @@ impl MobileHost {
             keychain,
             pending: Arc::default(),
             shut_down: Arc::default(),
+            web: super::web_link::WebLink::default(),
         };
         // Loading the identity reads the database (and, once, the legacy
         // keychain entry, which can wait on an access prompt), and the app opens
@@ -339,9 +421,13 @@ impl MobileHost {
         }
     }
 
-    /// Whether the app should keep its catalog published.
+    /// Whether the app should keep its catalog published: while phones
+    /// (QUIC) or web devices can ask for it. Settings reads
+    /// [`Status::enabled`] for the QUIC switch alone.
     pub fn enabled(&self) -> bool {
-        self.inner.lock().is_ok_and(|inner| inner.config.enabled)
+        self.inner
+            .lock()
+            .is_ok_and(|inner| inner.config.enabled || inner.config.web_enabled)
     }
 
     pub fn configure(
@@ -361,6 +447,7 @@ impl MobileHost {
                 open_router,
                 remote_address: remote_address.into(),
                 devices: inner.config.devices.clone(),
+                web_enabled: inner.config.web_enabled,
             };
             self.save(&config)?;
             inner.config = config;
@@ -373,7 +460,10 @@ impl MobileHost {
                     self.gate.remove(key);
                 }
                 inner.invitations.clear();
-                inner.watches.clear();
+                // Web devices keep their watches: their transport is separate.
+                inner
+                    .watches
+                    .retain(|_, watch| watch.via != DeviceKind::Phone);
             }
         }
         if enabled {
@@ -423,12 +513,24 @@ impl MobileHost {
     pub fn revoke(&self, device_id: &str) -> Result<(), String> {
         let mut inner = self.inner.lock().map_err(unavailable)?;
         let mut config = inner.config.clone();
-        if let Some(device) = config.devices.iter().find(|v| v.id == device_id) {
-            self.gate.remove(&device.fingerprint);
-            let peer = device.fingerprint.clone();
-            close_device_watches(&mut inner, &peer);
+        let removed = config
+            .devices
+            .iter()
+            .find(|v| v.id == device_id)
+            .map(|device| (device.kind, device.fingerprint.clone()));
+        if let Some((kind, peer)) = &removed {
+            if *kind == DeviceKind::Phone {
+                self.gate.remove(peer);
+            }
+            close_device_watches(&mut inner, peer);
         }
-        config.devices.retain(|device| device.id != device_id);
+        // Only the row of the kind found goes: ids of different kinds are
+        // unrelated.
+        if let Some((kind, _)) = removed {
+            config
+                .devices
+                .retain(|device| !(device.id == device_id && device.kind == kind));
+        }
         self.save(&config)?;
         inner.config = config;
         Ok(())
@@ -458,6 +560,7 @@ impl MobileHost {
             .config
             .devices
             .iter()
+            .filter(|device| device.kind == DeviceKind::Phone)
             .filter_map(|device| device.push.as_ref())
             .filter(|push| !push.disabled.iter().any(|off| off == category))
             .map(|push| push.token.clone())
@@ -504,6 +607,7 @@ impl MobileHost {
     /// Stops serving and releases the router mapping; for app shutdown.
     pub fn shutdown(&self) {
         self.shut_down.store(true, Ordering::SeqCst);
+        self.web.stop();
         if let Ok(mut inner) = self.inner.lock() {
             if let Some(endpoint) = inner.endpoint.take() {
                 endpoint.close(0_u32.into(), b"Desktop closed");
@@ -512,9 +616,9 @@ impl MobileHost {
         }
     }
 
-    fn runtime(&self) -> Result<&tokio::runtime::Runtime, String> {
+    pub(super) fn runtime(&self) -> Result<&tokio::runtime::Runtime, String> {
         if let Some(runtime) = self.runtime.get() {
-            return Ok(runtime);
+            return Ok(&**runtime);
         }
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -522,7 +626,7 @@ impl MobileHost {
             .enable_all()
             .build()
             .map_err(|e| format!("Mobile service could not start: {e}"))?;
-        Ok(self.runtime.get_or_init(|| runtime))
+        Ok(&**self.runtime.get_or_init(|| HostRuntime(Some(runtime))))
     }
 
     fn start(&self) -> Result<(), String> {
@@ -637,6 +741,13 @@ impl MobileHost {
             name,
             fingerprint: fingerprint.clone(),
             push: None,
+            kind: DeviceKind::Phone,
+            permission: Permission::Control,
+            projects: None,
+            monos: None,
+            server_device_id: None,
+            created_at: None,
+            last_seen: None,
         });
         self.save(&config)?;
         inner.config = config;
@@ -653,9 +764,25 @@ impl MobileHost {
         )
     }
 
-    async fn handle(&self, peer: &str, request: Value) -> Result<Value, String> {
+    /// A QUIC phone's request.
+    pub(super) async fn handle(&self, peer: &str, request: Value) -> Result<Value, String> {
+        self.handle_from(DeviceKind::Phone, peer, request).await
+    }
+
+    /// A web device's request, delivered by the web link. Needs `web_enabled`
+    /// and a web row; a phone row is never served here.
+    pub(super) async fn handle_web(&self, peer: &str, request: Value) -> Result<Value, String> {
+        self.handle_from(DeviceKind::Web, peer, request).await
+    }
+
+    async fn handle_from(
+        &self,
+        via: DeviceKind,
+        peer: &str,
+        request: Value,
+    ) -> Result<Value, String> {
         let mut audited = None;
-        let result = self.handle_call(peer, &request, &mut audited).await;
+        let result = self.call_from(via, peer, &request, &mut audited).await;
         // Recorded with no lock held: the log may write a file.
         if let Some((context, mut event)) = audited {
             event.outcome = final_outcome(event.outcome, result.is_err());
@@ -667,8 +794,21 @@ impl MobileHost {
     /// `handle` without the audit record: it leaves the event of an
     /// identified device in `audited` for `handle` to record once the call
     /// has an outcome.
+    #[cfg(test)] // QUIC phone call, kept for the audit tests
     async fn handle_call(
         &self,
+        peer: &str,
+        request: &Value,
+        audited: &mut Option<(DeviceContext, AuditEvent)>,
+    ) -> Result<Value, String> {
+        self.call_from(DeviceKind::Phone, peer, request, audited)
+            .await
+    }
+
+    /// `handle_call` for the transport `via`.
+    async fn call_from(
+        &self,
+        via: DeviceKind,
         peer: &str,
         request: &Value,
         audited: &mut Option<(DeviceContext, AuditEvent)>,
@@ -683,25 +823,17 @@ impl MobileHost {
         }
         let device = {
             let mut inner = self.inner.lock().map_err(unavailable)?;
-            if !inner.config.enabled {
-                return Err("Mobile access disabled".into());
-            }
+            check_enabled(&inner, via)?;
             // Pairing is the QUIC phones' own flow. The web transport pairs
             // through the relay, so a web context must never enrol here.
             if method == "device.enroll" {
-                if !enroll_allowed(DeviceKind::Phone) {
+                if !enroll_allowed(via) {
                     return Err("Unsupported mobile operation".into());
                 }
                 return self.enroll(&mut inner, peer, &params);
             }
-            let device = inner
-                .config
-                .devices
-                .iter()
-                .find(|device| device.fingerprint == peer)
-                .ok_or("Device revoked or not paired")?
-                .clone();
-            let context = DeviceContext::phone(&device);
+            let device = find_device(&inner, via, peer)?;
+            let context = device_context(&device);
             *audited = Some((context.clone(), audit_event(&device, method, request)));
             if let Err(denial) = policy::authorize(&context, method, &params) {
                 mark_denied(audited, &denial);
@@ -710,21 +842,29 @@ impl MobileHost {
             match method {
                 "device.selection" => {
                     let answer = policy::device_selection(&context, &params)?;
-                    return answer_selection(&mut inner, peer, answer);
+                    return self.answer_selection(&mut inner, peer, answer);
                 }
                 "device.leave" => {
                     let mut config = inner.config.clone();
-                    config.devices.retain(|v| v.id != device.id);
+                    config
+                        .devices
+                        .retain(|v| !(v.id == device.id && v.kind == device.kind));
                     self.save(&config)?;
                     inner.config = config;
-                    self.gate.remove(peer);
+                    if via == DeviceKind::Phone {
+                        self.gate.remove(peer);
+                    }
                     close_device_watches(&mut inner, peer);
                     return Ok(Value::Null);
                 }
                 "workspace.list" => {
                     let mut catalog = inner.catalog.clone();
                     catalog["sessions"] = json!(recent_sessions(&catalog["sessions"]));
-                    catalog["addresses"] = json!(addresses(&inner));
+                    // The desktop's network addresses are for phones; a browser
+                    // reaches it through the relay and never needs them.
+                    if context.kind != DeviceKind::Web {
+                        catalog["addresses"] = json!(addresses(&inner));
+                    }
                     policy::filter_reply(&context, method, &mut catalog);
                     return Ok(catalog);
                 }
@@ -732,6 +872,11 @@ impl MobileHost {
                     let mut page = session_page(&inner.catalog["sessions"], &params);
                     policy::filter_reply(&context, method, &mut page);
                     return Ok(page);
+                }
+                // Push tokens are for the phones' Expo path; the web transport
+                // answers `unsupported` (the code is added on the web channel).
+                "device.push" if via == DeviceKind::Web => {
+                    return Err("Unsupported mobile operation".into());
                 }
                 "device.push" => {
                     let push = push_registration(&params)?;
@@ -779,7 +924,14 @@ impl MobileHost {
         };
         self.pending.fetch_sub(1, Ordering::SeqCst);
         let response = response?;
-        if !self.gate.admits(peer) {
+        let admitted = match via {
+            DeviceKind::Phone => self.gate.admits(peer),
+            DeviceKind::Web => self
+                .inner
+                .lock()
+                .is_ok_and(|inner| find_device(&inner, via, peer).is_ok()),
+        };
+        if !admitted {
             return Err("Device revoked".into());
         }
         response
@@ -787,9 +939,37 @@ impl MobileHost {
 
     /// A phone starts watching a conversation. The app sends its state, then
     /// every change, until the phone goes or the watch is stopped.
-    async fn watch(&self, peer: &str, request: Value, sink: WatchSink) -> Result<(), String> {
+    pub(super) async fn watch(
+        &self,
+        peer: &str,
+        request: Value,
+        sink: WatchSink,
+    ) -> Result<(), String> {
+        self.watch_from(DeviceKind::Phone, peer, request, sink)
+            .await
+    }
+
+    /// `watch` for a web device, as `handle_web` is to `handle`.
+    pub(super) async fn watch_web(
+        &self,
+        peer: &str,
+        request: Value,
+        sink: WatchSink,
+    ) -> Result<(), String> {
+        self.watch_from(DeviceKind::Web, peer, request, sink).await
+    }
+
+    async fn watch_from(
+        &self,
+        via: DeviceKind,
+        peer: &str,
+        request: Value,
+        sink: WatchSink,
+    ) -> Result<(), String> {
         let mut audited = None;
-        let result = self.watch_call(peer, &request, sink, &mut audited).await;
+        let result = self
+            .watch_call_from(via, peer, &request, sink, &mut audited)
+            .await;
         // Recorded with no lock held: the log may write a file.
         if let Some((context, mut event)) = audited {
             event.outcome = final_outcome(event.outcome, result.is_err());
@@ -799,8 +979,9 @@ impl MobileHost {
     }
 
     /// `watch` without the audit record, as `handle_call` is to `handle`.
-    async fn watch_call(
+    async fn watch_call_from(
         &self,
+        via: DeviceKind,
         peer: &str,
         request: &Value,
         sink: WatchSink,
@@ -821,17 +1002,9 @@ impl MobileHost {
         let id = uuid::Uuid::new_v4().to_string();
         let context = {
             let mut inner = self.inner.lock().map_err(unavailable)?;
-            if !inner.config.enabled {
-                return Err("Mobile access disabled".into());
-            }
-            let device = inner
-                .config
-                .devices
-                .iter()
-                .find(|device| device.fingerprint == peer)
-                .ok_or("Device revoked or not paired")?
-                .clone();
-            let context = DeviceContext::phone(&device);
+            check_enabled(&inner, via)?;
+            let device = find_device(&inner, via, peer)?;
+            let context = device_context(&device);
             *audited = Some((
                 context.clone(),
                 audit_event(&device, "conversation.watch", request),
@@ -854,6 +1027,7 @@ impl MobileHost {
                 id.clone(),
                 Watcher {
                     peer: peer.into(),
+                    via,
                     sink: sink.clone(),
                 },
             );
@@ -929,6 +1103,28 @@ impl MobileHost {
     }
 }
 
+/// Whether the transport `via` is switched on: QUIC phones need `enabled`, web
+/// devices need `web_enabled`, and neither depends on the other.
+fn check_enabled(inner: &Inner, via: DeviceKind) -> Result<(), String> {
+    match via {
+        DeviceKind::Phone if !inner.config.enabled => Err("Mobile access disabled".into()),
+        DeviceKind::Web if !inner.config.web_enabled => Err("Web access disabled".into()),
+        _ => Ok(()),
+    }
+}
+
+/// The paired device with this fingerprint that belongs to the transport: a
+/// QUIC phone is never found through the web path, nor a web device through QUIC.
+fn find_device(inner: &Inner, via: DeviceKind, peer: &str) -> Result<Device, String> {
+    inner
+        .config
+        .devices
+        .iter()
+        .find(|device| device.fingerprint == peer && device.kind == via)
+        .cloned()
+        .ok_or_else(|| "Device revoked or not paired".to_string())
+}
+
 /// Ends every open watch of the device behind `peer`, as its selection,
 /// permission or pairing changed. The phone reopens, and the app checks the
 /// new access again.
@@ -941,7 +1137,10 @@ fn close_device_watches(inner: &mut Inner, peer: &str) {
 fn audit_event(device: &Device, method: &str, request: &Value) -> AuditEvent {
     AuditEvent {
         fingerprint_prefix: device.fingerprint.chars().take(8).collect(),
-        transport: Transport::Quic,
+        transport: match device.kind {
+            DeviceKind::Phone => Transport::Quic,
+            DeviceKind::Web => Transport::Web,
+        },
         method: method.into(),
         project_id: request["params"]["projectId"].as_str().map(Into::into),
         outcome: Outcome::Ok,
@@ -949,31 +1148,171 @@ fn audit_event(device: &Device, method: &str, request: &Value) -> AuditEvent {
     }
 }
 
-/// The reply to `device.selection`. Fails closed: nothing can persist a
-/// narrower selection until `Device` has selection fields, so claiming success
-/// would leave the device with full access. R-07 / H-02 replace this with the
-/// host's `save`.
-fn selection_reply(answer: policy::SelectionAnswer) -> Result<Value, String> {
-    if answer.narrowed.is_some() {
-        return Err("Unsupported mobile operation".into());
+impl MobileHost {
+    /// Answers `device.selection`. A narrower selection is written into the
+    /// device's row first; the device's watches end only once it is saved. A
+    /// save failure leaves the config and the watches as they were.
+    fn answer_selection(
+        &self,
+        inner: &mut Inner,
+        peer: &str,
+        answer: policy::SelectionAnswer,
+    ) -> Result<Value, String> {
+        if let Some(selection) = answer.narrowed {
+            let mut config = inner.config.clone();
+            let device = config
+                .devices
+                .iter_mut()
+                .find(|device| device.fingerprint == peer)
+                .ok_or("Device revoked or not paired")?;
+            device.projects = selection.projects;
+            device.monos = selection.monos;
+            self.save(&config)?;
+            inner.config = config;
+            close_device_watches(inner, peer);
+        }
+        Ok(answer.reply)
     }
-    Ok(answer.reply)
+
+    fn web_database(&self) -> Result<PathBuf, String> {
+        self.path
+            .parent()
+            .and_then(crate::accounts::database_for)
+            .ok_or_else(|| identity_store::UNAVAILABLE.to_owned())
+    }
+
+    /// The web link's sealed identity. `Ok(None)` means none was saved.
+    pub(crate) fn load_web_identity(&self) -> Result<Option<identity_store::WebIdentity>, String> {
+        identity_store::load_web(
+            &self.web_database()?,
+            &identity_store::web_account_for(&self.path),
+        )
+    }
+
+    /// Seals the web identity. Its token never goes to `mobile-access.json`.
+    #[allow(dead_code)] // Used by the web link pairing once it lands.
+    pub(crate) fn save_web_identity(
+        &self,
+        identity: &identity_store::WebIdentity,
+    ) -> Result<(), String> {
+        identity_store::save_web(
+            &self.web_database()?,
+            &identity_store::web_account_for(&self.path),
+            identity,
+        )
+    }
+
+    /// Unpairs the web link by wiping its sealed identity. Safe to repeat.
+    pub fn web_unpair(&self) -> Result<(), String> {
+        self.web.stop();
+        identity_store::wipe_web(
+            &self.web_database()?,
+            &identity_store::web_account_for(&self.path),
+        )
+    }
 }
 
-/// Answers `device.selection`. The device's watches end only when a change is
-/// actually applied, never for a refused one.
-fn answer_selection(
-    inner: &mut Inner,
-    peer: &str,
-    answer: policy::SelectionAnswer,
-) -> Result<Value, String> {
-    let narrowed = answer.narrowed.is_some();
-    let reply = selection_reply(answer)?;
-    if narrowed {
-        // Reached once the selection is saved (R-07 / H-02).
-        close_device_watches(inner, peer);
+impl MobileHost {
+    /// Whether the web link is switched on (independent of QUIC access).
+    pub fn web_enabled(&self) -> bool {
+        self.inner
+            .lock()
+            .is_ok_and(|inner| inner.config.web_enabled)
     }
-    Ok(reply)
+
+    /// Switches the web link on or off, saves the choice and starts or stops
+    /// the relay client. It never binds a socket and never touches the router.
+    pub fn set_web_enabled(&self, enabled: bool) -> Result<(), String> {
+        self.set_web_enabled_with(enabled, super::web_link::relay::Timing::default())
+    }
+
+    pub(super) fn set_web_enabled_with(
+        &self,
+        enabled: bool,
+        timing: super::web_link::relay::Timing,
+    ) -> Result<(), String> {
+        {
+            let mut inner = self.inner.lock().map_err(unavailable)?;
+            let mut config = inner.config.clone();
+            config.web_enabled = enabled;
+            self.save(&config)?;
+            inner.config = config;
+            if !enabled {
+                // Only the web watches end: phones are served over QUIC.
+                inner
+                    .watches
+                    .retain(|_, watch| watch.via != DeviceKind::Web);
+            }
+        }
+        super::web_link::sync_with(self, timing);
+        Ok(())
+    }
+
+    /// What Settings shows about the web link.
+    pub fn web_status(&self) -> super::web_link::WebStatus {
+        let enabled = self.web_enabled();
+        self.web.status(enabled)
+    }
+
+    pub(super) fn web_link(&self) -> &super::web_link::WebLink {
+        &self.web
+    }
+
+    /// What the web link knows of a device fingerprint, for a handshake.
+    /// Never blocks: one short lock, no I/O.
+    pub(super) fn web_lookup(&self, fingerprint: &str) -> super::web_link::session::Lookup {
+        use super::web_link::session::Lookup;
+        if let Ok(inner) = self.inner.lock() {
+            if let Some(device) = inner
+                .config
+                .devices
+                .iter()
+                .find(|device| device.fingerprint == fingerprint)
+            {
+                return if device.kind == DeviceKind::Web {
+                    Lookup::Confirmed {
+                        device: device.clone(),
+                    }
+                } else {
+                    Lookup::Unknown
+                };
+            }
+        }
+        if self.web.pending().contains(fingerprint) {
+            Lookup::Pending
+        } else {
+            Lookup::Unknown
+        }
+    }
+
+    /// Whether `peer` is still a paired web device. The shared serve asks
+    /// before every request and watch frame; the flag `web_enabled` is checked
+    /// by `handle_web` and `watch_web` themselves (and turning it off stops the
+    /// whole link), so a refused request keeps its "Web access disabled" text.
+    pub(super) fn web_admits(&self, peer: &str) -> bool {
+        self.inner
+            .lock()
+            .is_ok_and(|inner| find_device(&inner, DeviceKind::Web, peer).is_ok())
+    }
+
+    #[cfg(test)]
+    pub(super) fn router_started(&self) -> bool {
+        self.inner.lock().is_ok_and(|inner| inner.router_started)
+    }
+
+    /// Sets the saved flags in memory only, so a running client keeps running.
+    #[cfg(test)]
+    pub(super) fn set_flags_for_test(&self, enabled: bool, web_enabled: bool) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.config.enabled = enabled;
+        inner.config.web_enabled = web_enabled;
+    }
+
+    #[cfg(test)]
+    pub(super) fn add_device_for_test(&self, device: Device) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.config.devices.push(device);
+    }
 }
 
 /// The outcome to record once a call ended: a call that was admitted and then
@@ -1027,7 +1366,7 @@ fn addresses(inner: &Inner) -> Vec<Address> {
     result
 }
 
-fn name() -> String {
+pub(super) fn name() -> String {
     hostname::get()
         .unwrap_or_default()
         .to_string_lossy()
@@ -1037,6 +1376,141 @@ fn name() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn phone_row() -> Device {
+        Device {
+            id: "d".into(),
+            name: "Phone".into(),
+            fingerprint: "abcdef0123456789".into(),
+            push: None,
+            kind: DeviceKind::Phone,
+            permission: Permission::Control,
+            projects: None,
+            monos: None,
+            server_device_id: None,
+            created_at: None,
+            last_seen: None,
+        }
+    }
+
+    /// `mobile-access.json` exactly as the code before the web link wrote it.
+    const OLD_CONFIG: &str = r#"{"enabled":true,"openRouter":false,"remoteAddress":"203.0.113.5:4433","devices":[{"id":"d1","name":"iPhone","fingerprint":"aaaa1111bbbb2222","push":{"token":"ExponentPushToken[abc]","disabled":["agentFinished"]}},{"id":"d2","name":"Pixel","fingerprint":"cccc3333dddd4444"}]}"#;
+
+    fn host_in(dir: &std::path::Path) -> MobileHost {
+        MobileHost::open(dir.join("mobile-access.json")).unwrap().0
+    }
+
+    #[test]
+    fn an_old_config_loads_every_device_as_a_controlling_phone_and_saves_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mobile-access.json"), OLD_CONFIG).unwrap();
+        let host = host_in(dir.path());
+        let config = host.inner.lock().unwrap().config.clone();
+        assert_eq!(config.devices.len(), 2);
+        for device in &config.devices {
+            assert_eq!(device.kind, DeviceKind::Phone);
+            assert_eq!(device.permission, Permission::Control);
+            assert_eq!((&device.projects, &device.monos), (&None, &None));
+            assert!(device.server_device_id.is_none());
+            assert!(device.created_at.is_none() && device.last_seen.is_none());
+            assert_eq!(device_context(device), DeviceContext::phone(device));
+        }
+        assert_eq!(
+            config.devices[0].push.as_ref().unwrap().disabled,
+            ["agentFinished"]
+        );
+        host.save(&config).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("mobile-access.json")).unwrap(),
+            OLD_CONFIG
+        );
+    }
+
+    #[test]
+    fn a_web_device_row_round_trips_with_every_new_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host_in(dir.path());
+        let web = Device {
+            id: "w1".into(),
+            name: "Browser".into(),
+            fingerprint: "eeee5555ffff6666".into(),
+            push: None,
+            kind: DeviceKind::Web,
+            permission: Permission::Read,
+            projects: Some(vec!["p1".into()]),
+            monos: Some(vec![]),
+            server_device_id: Some("srv-1".into()),
+            created_at: Some(1_700_000_000),
+            last_seen: Some(1_700_000_500),
+        };
+        let mut config = host.inner.lock().unwrap().config.clone();
+        config.devices.push(web.clone());
+        host.save(&config).unwrap();
+        let text = std::fs::read_to_string(dir.path().join("mobile-access.json")).unwrap();
+        assert!(text.contains("\"serverDeviceId\":\"srv-1\""), "{text}");
+        let reopened = host_in(dir.path());
+        let loaded = reopened.inner.lock().unwrap().config.devices[0].clone();
+        assert_eq!(loaded, web);
+        let context = device_context(&loaded);
+        assert_eq!(context.kind, DeviceKind::Web);
+        assert_eq!(context.permission, Permission::Read);
+        assert_eq!(context.projects, Some(vec!["p1".to_owned()]));
+        assert_eq!(context.monos, Some(vec![]));
+        assert_eq!(
+            audit_event(&loaded, "workspace.list", &json!({})).transport,
+            Transport::Web
+        );
+        assert_eq!(
+            audit_event(&phone_row(), "workspace.list", &json!({})).transport,
+            Transport::Quic
+        );
+    }
+
+    fn host_with_store() -> (tempfile::TempDir, MobileHost) {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("store.db");
+        rusqlite::Connection::open(&database).unwrap();
+        crate::accounts::register_database(dir.path(), &database);
+        let host = host_in(dir.path());
+        (dir, host)
+    }
+
+    fn web_identity() -> identity_store::WebIdentity {
+        identity_store::WebIdentity {
+            static_private: [3; 32],
+            static_public: [4; 32],
+            desktop_id: "desktop-9".into(),
+            desktop_token: "test-token-not-real".into(),
+            relay_url: "wss://relay.example.test/ws".into(),
+        }
+    }
+
+    #[test]
+    fn the_web_token_never_reaches_the_settings_file_and_unpair_wipes_it() {
+        let (dir, host) = host_with_store();
+        assert_eq!(host.load_web_identity(), Ok(None));
+        host.save_web_identity(&web_identity()).unwrap();
+        assert_eq!(host.load_web_identity(), Ok(Some(web_identity())));
+        let mut config = host.inner.lock().unwrap().config.clone();
+        config.enabled = true;
+        host.save(&config).unwrap();
+        let bytes = std::fs::read(dir.path().join("mobile-access.json")).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("test-token-not-real"));
+        assert!(!text.contains("relay.example.test"));
+        host.web_unpair().unwrap();
+        assert_eq!(host.load_web_identity(), Ok(None));
+        host.web_unpair().unwrap();
+    }
+
+    #[test]
+    fn the_web_identity_needs_a_registered_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host_in(dir.path());
+        assert!(host.load_web_identity().is_err());
+        assert!(host.save_web_identity(&web_identity()).is_err());
+        assert!(host.web_unpair().is_err());
+    }
 
     fn fixture() -> (
         MobileHost,
@@ -1256,26 +1730,6 @@ mod tests {
     }
 
     #[test]
-    fn a_narrower_selection_that_cannot_be_saved_is_refused() {
-        let narrowed = policy::SelectionAnswer {
-            reply: json!({"ok": true}),
-            narrowed: Some(policy::Selection {
-                projects: Some(vec!["p".into()]),
-                monos: None,
-            }),
-        };
-        assert_eq!(
-            selection_reply(narrowed),
-            Err("Unsupported mobile operation".into())
-        );
-        let plain = policy::SelectionAnswer {
-            reply: json!({"ok": true}),
-            narrowed: None,
-        };
-        assert_eq!(selection_reply(plain), Ok(json!({"ok": true})));
-    }
-
-    #[test]
     fn the_recorded_outcome_follows_the_call() {
         assert_eq!(final_outcome(Outcome::Ok, false), Outcome::Ok);
         assert_eq!(final_outcome(Outcome::Ok, true), Outcome::Error);
@@ -1286,6 +1740,7 @@ mod tests {
             name: "Phone".into(),
             fingerprint: "abcdef0123456789".into(),
             push: None,
+            ..phone_row()
         };
         let request = json!({"id": "c", "params": {}});
         let mut audited = Some((
@@ -1305,28 +1760,111 @@ mod tests {
         );
     }
 
+    fn narrowed(
+        projects: Option<Vec<String>>,
+        monos: Option<Vec<String>>,
+    ) -> policy::SelectionAnswer {
+        policy::SelectionAnswer {
+            reply: json!({"ok": true}),
+            narrowed: Some(policy::Selection { projects, monos }),
+        }
+    }
+
+    fn watch(inner: &mut Inner, id: &str, peer: &str) {
+        let (sink, _receiver) = tokio::sync::mpsc::channel::<Value>(1);
+        inner.watches.insert(
+            id.into(),
+            Watcher {
+                peer: peer.into(),
+                via: DeviceKind::Phone,
+                sink,
+            },
+        );
+    }
+
+    #[test]
+    fn a_narrower_selection_is_saved_and_closes_the_devices_watches() {
+        let (host, _events, peer) = paired();
+        {
+            let mut inner = host.inner.lock().unwrap();
+            watch(&mut inner, "w", &peer);
+            watch(&mut inner, "other", "someone-else");
+            let reply = host
+                .answer_selection(
+                    &mut inner,
+                    &peer,
+                    narrowed(Some(vec!["p".into()]), Some(vec![])),
+                )
+                .unwrap();
+            assert_eq!(reply, json!({"ok": true}));
+            assert_eq!(inner.watches.keys().collect::<Vec<_>>(), ["other"]);
+            let device = &inner.config.devices[0];
+            assert_eq!(device.projects, Some(vec!["p".to_owned()]));
+            assert_eq!(device.monos, Some(vec![]));
+        }
+        let saved: Config = serde_json::from_slice(&std::fs::read(&host.path).unwrap()).unwrap();
+        assert_eq!(saved.devices[0].projects, Some(vec!["p".to_owned()]));
+        assert_eq!(saved.devices[0].monos, Some(vec![]));
+        // The stored selection is what the next request is scoped to.
+        let context = device_context(&saved.devices[0]);
+        assert_eq!(context.projects, Some(vec!["p".to_owned()]));
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn an_answer_without_a_narrower_selection_changes_nothing() {
+        let (host, _events, peer) = paired();
+        let mut inner = host.inner.lock().unwrap();
+        watch(&mut inner, "w", &peer);
+        let answer = policy::SelectionAnswer {
+            reply: json!({"ok": true}),
+            narrowed: None,
+        };
+        assert_eq!(
+            host.answer_selection(&mut inner, &peer, answer),
+            Ok(json!({"ok": true}))
+        );
+        assert!(inner.watches.contains_key("w"));
+        assert_eq!(inner.config.devices[0].projects, None);
+        drop(inner);
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_selection_that_cannot_be_saved_is_refused_and_keeps_the_watches() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(
+            &blocker,
+            b"a file, so the settings directory cannot be made",
+        )
+        .unwrap();
+        let (host, _events) = MobileHost::open(blocker.join("mobile-access.json")).unwrap();
+        let mut inner = host.inner.lock().unwrap();
+        inner.config.devices.push(Device {
+            fingerprint: "fp".into(),
+            ..phone_row()
+        });
+        watch(&mut inner, "w", "fp");
+        assert!(host
+            .answer_selection(&mut inner, "fp", narrowed(Some(vec![]), None))
+            .is_err());
+        assert!(inner.watches.contains_key("w"));
+        assert_eq!(inner.config.devices[0].projects, None);
+    }
+
     #[test]
     fn a_refused_selection_change_leaves_the_watches_open() {
         let (host, _events, peer) = paired();
         {
             let mut inner = host.inner.lock().unwrap();
-            let (sink, _receiver) = tokio::sync::mpsc::channel::<Value>(1);
-            inner.watches.insert(
-                "w".into(),
-                Watcher {
-                    peer: peer.clone(),
-                    sink,
-                },
-            );
-            let narrowed = policy::SelectionAnswer {
-                reply: json!({}),
-                narrowed: Some(policy::Selection {
-                    projects: Some(vec![]),
-                    monos: None,
-                }),
-            };
-            assert!(answer_selection(&mut inner, &peer, narrowed).is_err());
+            watch(&mut inner, "w", &peer);
+            // No such device: the change is refused.
+            assert!(host
+                .answer_selection(&mut inner, "stranger", narrowed(Some(vec![]), None))
+                .is_err());
             assert!(inner.watches.contains_key("w"));
+            assert_eq!(inner.config.devices[0].projects, None);
         }
         std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
     }
@@ -1370,6 +1908,7 @@ mod tests {
                     id.into(),
                     Watcher {
                         peer: owner.into(),
+                        via: DeviceKind::Phone,
                         sink,
                     },
                 );
@@ -1422,6 +1961,174 @@ mod tests {
         host.forget_push_tokens(&["ExponentPushToken[abc]".into()])
             .unwrap();
         assert!(host.push_tokens("agentInput").is_empty());
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    fn web_row(id: &str, fingerprint: &str) -> Device {
+        Device {
+            id: id.into(),
+            name: "Laptop".into(),
+            fingerprint: fingerprint.into(),
+            kind: DeviceKind::Web,
+            permission: Permission::Read,
+            server_device_id: Some("srv-1".into()),
+            ..phone_row()
+        }
+    }
+
+    fn watch_via(inner: &mut Inner, id: &str, peer: &str, via: DeviceKind) {
+        let (sink, _receiver) = tokio::sync::mpsc::channel::<Value>(1);
+        inner.watches.insert(
+            id.into(),
+            Watcher {
+                peer: peer.into(),
+                via,
+                sink,
+            },
+        );
+    }
+
+    #[test]
+    fn the_catalog_stays_published_while_either_transport_is_on() {
+        let (host, _events, _peer) = paired();
+        host.set_flags_for_test(false, false);
+        assert!(!host.enabled());
+        host.set_flags_for_test(true, false);
+        assert!(host.enabled());
+        // Web only: the app still publishes, but Settings' QUIC switch is off.
+        host.set_flags_for_test(false, true);
+        assert!(host.enabled());
+        assert!(!host.status().enabled);
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_web_transport_gets_no_push_registration_and_no_push_tokens() {
+        let (host, _events, phone) = paired();
+        host.set_flags_for_test(true, true);
+        host.add_device_for_test(web_row("w", "web-fingerprint"));
+        let error = host
+            .handle_web(
+                "web-fingerprint",
+                json!({"version":VERSION,"id":"p","method":"device.push","params":{"token":"ExponentPushToken[web]"}}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, "Unsupported mobile operation");
+        assert!(host
+            .inner
+            .lock()
+            .unwrap()
+            .config
+            .devices
+            .iter()
+            .all(|device| device.kind != DeviceKind::Web || device.push.is_none()));
+        // A web row that somehow carries a token is still never notified.
+        {
+            let mut inner = host.inner.lock().unwrap();
+            let web = inner
+                .config
+                .devices
+                .iter_mut()
+                .find(|device| device.kind == DeviceKind::Web)
+                .unwrap();
+            web.push = Some(PushRegistration {
+                token: "ExponentPushToken[web]".into(),
+                disabled: Vec::new(),
+            });
+        }
+        assert!(host.push_tokens("agentInput").is_empty());
+        host.handle(
+            &phone,
+            json!({"version":VERSION,"id":"p","method":"device.push","params":{"token":"ExponentPushToken[phone]"}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(host.push_tokens("agentInput"), ["ExponentPushToken[phone]"]);
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_list_gives_a_web_device_no_addresses_and_a_phone_its_addresses() {
+        let (host, _events, phone) = paired();
+        host.set_flags_for_test(true, true);
+        host.add_device_for_test(web_row("w", "web-fingerprint"));
+        let list = json!({"version":VERSION,"id":"c","method":"workspace.list","params":{}});
+        let web = host
+            .handle_web("web-fingerprint", list.clone())
+            .await
+            .unwrap();
+        assert!(web.get("addresses").is_none(), "{web}");
+        assert!(web["projects"].is_array());
+        let phone = host.handle(&phone, list).await.unwrap();
+        assert!(phone["addresses"].is_array());
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn turning_one_transport_off_ends_only_its_own_watches() {
+        let (host, _events, phone) = paired();
+        host.set_flags_for_test(true, true);
+        host.add_device_for_test(web_row("w", "web-fingerprint"));
+        let open = |host: &MobileHost| {
+            let mut inner = host.inner.lock().unwrap();
+            inner.watches.clear();
+            watch_via(&mut inner, "phone", &phone, DeviceKind::Phone);
+            watch_via(&mut inner, "web", "web-fingerprint", DeviceKind::Web);
+        };
+        let keys = |host: &MobileHost| {
+            let mut keys: Vec<String> =
+                host.inner.lock().unwrap().watches.keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        open(&host);
+        host.configure(false, false, "").unwrap();
+        assert_eq!(keys(&host), ["web"]);
+        open(&host);
+        host.set_web_enabled(false).unwrap();
+        assert_eq!(keys(&host), ["phone"]);
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn only_phone_rows_reach_the_quic_gate_when_the_host_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("mobile-access.json"),
+            r#"{"enabled":false,"devices":[{"id":"p","name":"Phone","fingerprint":"phone-fingerprint"},{"id":"w","name":"Laptop","fingerprint":"web-fingerprint","kind":"web","serverDeviceId":"srv-1"}]}"#,
+        )
+        .unwrap();
+        let host = host_in(dir.path());
+        assert!(host.gate.admits("phone-fingerprint"));
+        assert!(!host.gate.admits("web-fingerprint"));
+    }
+
+    #[tokio::test]
+    async fn revoking_and_leaving_remove_only_the_row_of_their_own_kind() {
+        let (host, _events, phone) = paired();
+        host.set_flags_for_test(true, true);
+        let phone_id = host.inner.lock().unwrap().config.devices[0].id.clone();
+        // A web row with the same id as the phone's.
+        host.add_device_for_test(web_row(&phone_id, "web-fingerprint"));
+        let leave = json!({"version":VERSION,"id":"l","method":"device.leave","params":{}});
+        host.handle_web("web-fingerprint", leave).await.unwrap();
+        {
+            let inner = host.inner.lock().unwrap();
+            let kinds: Vec<_> = inner.config.devices.iter().map(|d| d.kind).collect();
+            assert_eq!(kinds, [DeviceKind::Phone]);
+        }
+        assert!(host.gate.admits(&phone), "the phone stays admitted");
+        // And the other way: revoking by the shared id removes one row, and
+        // never touches the QUIC gate for a web row.
+        host.add_device_for_test(web_row(&phone_id, "web-fingerprint"));
+        host.revoke(&phone_id).unwrap();
+        {
+            let inner = host.inner.lock().unwrap();
+            let kinds: Vec<_> = inner.config.devices.iter().map(|d| d.kind).collect();
+            assert_eq!(kinds, [DeviceKind::Web]);
+        }
+        assert!(!host.gate.admits(&phone));
         std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
     }
 }

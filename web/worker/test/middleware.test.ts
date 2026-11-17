@@ -1,24 +1,18 @@
 import { env } from "cloudflare:workers";
 import { Hono } from "hono";
-import { beforeAll, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { API_ROUTES, ApiErrorSchema, type ApiRoute } from "@monoptah/protocol";
 import { buildCsp, COMPANION_HEADERS } from "../src/middleware/security.ts";
 import { ignoreCookies, isCookieAuthenticated } from "../src/middleware/browser.ts";
 import type { AppEnv } from "../src/http.ts";
 import { BROWSER_HEADERS, call, callWithEnv, ORIGIN } from "./helpers.ts";
-import { createTestUser, loginAs, type TestSession } from "./support/accounts.ts";
-
-/** Routes with a real handler: with a valid session they no longer answer 501 (their own tests cover them). */
-const IMPLEMENTED = new Set(["GET /api/me", "PATCH /api/me", "GET /api/audit", "GET /api/sessions", "DELETE /api/sessions/:id", "POST /api/auth/logout", "POST /api/auth/register/options", "POST /api/auth/register/verify", "POST /api/auth/login/options", "POST /api/auth/login/verify", "POST /api/auth/reauth/options", "POST /api/auth/reauth/verify", "POST /api/auth/recover", "POST /api/recovery-codes/regenerate", "GET /api/passkeys", "POST /api/passkeys/options", "POST /api/passkeys/verify", "PATCH /api/passkeys/:id", "DELETE /api/passkeys/:id", "GET /api/invites", "POST /api/invites", "DELETE /api/invites/:id", "GET /api/admin/users", "POST /api/admin/users/:id/block", "POST /api/admin/users/:id/unblock", "POST /api/admin/users/:id/invites", "GET /api/admin/settings", "PUT /api/admin/settings", "GET /api/admin/audit"]);
+import { createTestUser, loginAs } from "./support/accounts.ts";
 
 /**
- * What a public route answers to a request that passes the browser checks but has an empty body: 501 while it is a
- * stub, and the route's own answer once implemented (400 for a bad body, 200 for the body-less login options).
+ * What a public cookie-less route answers to a request that passes the browser checks but has an empty body: the
+ * route's own answer (400 for a bad body, 200 for the body-less login options), never a 401, 403, 415 or 429.
  */
-const passedStatus = (route: ApiRoute): number => {
-  if (!IMPLEMENTED.has(`${route.method} ${route.path}`)) return 501;
-  return route.path === "/api/auth/login/options" ? 200 : 400;
-};
+const passedStatus = (route: ApiRoute): number => (route.path === "/api/auth/login/options" ? 200 : 400);
 
 const concrete = (route: ApiRoute) => route.path.replace(/:[A-Za-z]+/g, "x");
 const nonGet = (route: ApiRoute) => route.method !== "GET";
@@ -47,11 +41,6 @@ describe("route classification", () => {
 });
 
 describe("Origin and X-Monoptah-CSRF on cookie routes", () => {
-  let admin: TestSession;
-  beforeAll(async () => {
-    admin = await loginAs((await createTestUser(env, { role: "admin" })).id, { fresh: true });
-  });
-
   it.each(cookieRoutes.map((r) => [`${r.method} ${r.path}`, r] as const))("%s", async (_name, route) => {
     const path = concrete(route);
     const send = (headers: Record<string, string>) => call(path, { method: route.method, headers });
@@ -75,10 +64,16 @@ describe("Origin and X-Monoptah-CSRF on cookie routes", () => {
     // Passing the browser checks: the request reaches the auth resolver (401 without a session)...
     const ok = await send({ ...BROWSER_HEADERS });
     expect(ok.status).toBe(route.auth === "public" ? passedStatus(route) : 401);
-    // ...and with a valid session the handler (501 while unimplemented).
-    if (route.auth !== "public" && !IMPLEMENTED.has(`${route.method} ${route.path}`)) {
-      const authed = await send({ ...BROWSER_HEADERS, Cookie: admin.cookie });
-      expect(authed.status).toBe(501);
+    // ...and with a valid session the handler: whatever it answers to an empty body, it is not a refusal by the
+    // middleware (401, 403, 415, 429) and not the old 501 stub.
+    if (route.auth !== "public") {
+      // A session of its own per route: an earlier route (logout, delete account) may end a shared one.
+      const own = await loginAs((await createTestUser(env, { role: "admin" })).id, { fresh: true });
+      const authed = await send({ ...BROWSER_HEADERS, Cookie: own.cookie });
+      const key = `${route.method} ${route.path}`;
+      // Account deletion (ticket U-11) is the one route that is still the 501 stub.
+      if (key === "DELETE /api/me") expect(authed.status, key).toBe(501);
+      else expect([401, 403, 415, 429, 501], key).not.toContain(authed.status);
     }
   });
 
@@ -118,10 +113,15 @@ describe("Origin and X-Monoptah-CSRF on cookie routes", () => {
 
 describe("token and pairing routes", () => {
   it.each(tokenOrPairingRoutes.map((r) => [`${r.method} ${r.path}`, r] as const))("%s needs no Origin and no CSRF header, and ignores a cookie", async (_name, route) => {
+    // Past the browser checks (none apply) the handler answers: pairing validates its body (400 invalid), token routes
+    // want a desktop token (401 unauthorized). A cookie changes neither answer.
+    const expected = route.path.startsWith("/api/pair/") ? { status: 400, code: "invalid" } : { status: 401, code: "unauthorized" };
     const plain = await call(concrete(route), { method: route.method });
-    expect(plain.status).toBe(501);
+    expect(plain.status).toBe(expected.status);
+    expect(ApiErrorSchema.parse(await plain.json()).code).toBe(expected.code);
     const withCookie = await call(concrete(route), { method: route.method, headers: { Cookie: "__Host-mc_session=fake-session-token" } });
-    expect(withCookie.status).toBe(501);
+    expect(withCookie.status).toBe(expected.status);
+    expect(ApiErrorSchema.parse(await withCookie.json()).code).toBe(expected.code);
   });
 
   it("ignoreCookies removes the Cookie header before a handler can read it", async () => {
@@ -133,7 +133,7 @@ describe("token and pairing routes", () => {
 });
 
 describe("response headers", () => {
-  it("sets Cache-Control: no-store on /api/* and /relay/* (success, 404 and 501)", async () => {
+  it("sets Cache-Control: no-store on /api/* and /relay/* (success, 404 and handler errors)", async () => {
     for (const path of ["/api/health", "/api/nope", "/api/me", "/relay/desktop/x", "/relay/nope"]) {
       const res = await call(path);
       expect(res.headers.get("Cache-Control"), path).toBe("no-store");

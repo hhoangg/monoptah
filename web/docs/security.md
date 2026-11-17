@@ -151,6 +151,7 @@ Exceeded limits return `429` with `Retry-After`; repeated breaches are written t
 - Every new device is `pending` on the desktop until a human confirms its name and fingerprint in Settings > Connections > Web app (architecture.md 6.3). This closes gap G6 (section 7; today pairing has no desktop confirmation, `host.rs:594-638`). Until confirmed the Noise session can only show the pending state; no method is served.
 - The desktop checks the device static key from `HS1` against its own confirmed list (`Gate`-style map, `crates/mobile-link/src/lib.rs:160-177`), not against the server directory, so a hostile server cannot add a device by editing D1.
 - Revocation exists on both sides: (a) server: `PUT /api/desktops/:id/grants/:deviceId state=revoked`, `DELETE /api/devices/:id`, `DELETE /api/desktops/:id`, admin block: relay join blocked at once and sockets closed `4003`/`4011`; (b) desktop: "Revoke" removes the fingerprint from the Gate, drops its watches and rewrites `mobile-access.json` (existing `revoke`, `host.rs:407-419`), then reports state to the server. Either side alone is sufficient; revocation on the desktop does not depend on the server being reachable. In-flight requests finish (gap G12, accepted; the desktop rechecks admission before replying, `host.rs:726-728`).
+- Server grant rules (R-04): only the desktop token route `POST /api/desktop/grants/:deviceId/state` writes `permission` or `confirmed`; the web side writes `requested_permission` and `revoked` only. A server `revoked` is final (the desktop gets `409` if it reports `confirmed` or `pending`). Pairing tokens are minted by the winning `pair/poll` and stored as SHA-256 only; `DELETE /api/desktop/me` (Unpair) and `DELETE /api/desktops/:id` revoke every token of the desktop, and a re-pair with `replaces` revokes the old tokens, swaps the key and resets every non-revoked grant to `pending`; each closes the room's sockets with `4003`.
 - Per-device `permission` (`read`/`control`) is authoritative on the desktop. The server's `requested_permission` can only lower privilege without desktop action.
 - New devices default to `read`. Re-registration (new browser profile, reinstall) creates a new device and requires a new confirmation. Every device needs one confirmation per desktop.
 - `Device` stores `server_device_id`; the desktop rejects a session whose relay `deviceId` header does not match the id stored for that fingerprint.
@@ -283,6 +284,24 @@ Official host:
 - Incident procedure: block a branch, revoke tokens and sessions, rotate secrets, publish a notice (the log has no content to leak, section 10).
 
 Self-host: the owner is the operator and carries all of the above responsibilities. The guide (architecture.md section 9) sets safe defaults (secrets, custom domain, bootstrap invite expiry), but backups, 2FA on the Cloudflare account and update cadence are the self-hoster's.
+
+### 9.1 VAPID rotation runbook
+
+Why: a suspected leak of `VAPID_PRIVATE_KEY`, or a planned change of the key. Push subscriptions are bound to the application server key they were created with (`push_subscriptions.vapid_key_id`), so a new key means every browser has to subscribe again. The Worker supports two keys during the changeover (P-06).
+
+Who: the maintainer only, from the Mac, with the wrangler login that exists only there (deploy-runbook.md). Agents and CI prepare code and docs; they never generate production keys, never run `wrangler secret put` or `wrangler deploy`, and never see a private key.
+
+Steps:
+
+1. Generate the new pair: `pnpm vapid:generate` (in `web/`). Store the private key in the sealed operator vault; do not paste it into chat, a ticket or a file in the repo. Pick a new id, for example `v2` for the key that is `v1` now.
+2. Move the old key to the previous slot. In `wrangler.jsonc` `vars`: `VAPID_PREVIOUS_PUBLIC_KEY` = the old public key, `VAPID_PREVIOUS_KEY_ID` = the old id; `wrangler secret put VAPID_PREVIOUS_PRIVATE_KEY` with the old private key. Then set `VAPID_PUBLIC_KEY` and `VAPID_KEY_ID` to the new pair and `wrangler secret put VAPID_PRIVATE_KEY` with the new private key. After this step the Worker signs each push with the key whose id equals the subscription's `vapid_key_id`; a subscription on neither id is skipped (not deleted). If the old key leaked, skip the previous slot: old subscriptions stop receiving at once and the leaked key can no longer be used through this Worker, at the price of notices until each client re-subscribes.
+3. Deploy (`pnpm deploy:official`, deploy-runbook.md). Every deploy disconnects relay sockets, which reconnect (architecture.md section 3.3).
+4. Clients re-subscribe on their next open: the app compares `keyId` of `GET /api/push/vapid-key` with the key id its subscription was made with, and when they differ calls `pushManager.subscribe` with the new `applicationServerKey` and `POST /api/push/subscriptions` (the new subscription replaces the old one for the same endpoint). `POST /api/push/subscriptions` refuses any other `vapidKeyId` than the current one (400), so no new row is created on the old key.
+5. Watch the old key drain, from the Mac: `wrangler d1 execute monoptah --remote --command "SELECT vapid_key_id, count(*) FROM push_subscriptions GROUP BY vapid_key_id"` (read only; the table is small). Keep the previous key until the count on the old id is near zero or the period you chose ends (two to four weeks is reasonable: a subscription that never reopens the app never re-subscribes).
+6. Remove the previous key: delete the three `VAPID_PREVIOUS_*` entries (the two vars and `wrangler secret delete VAPID_PREVIOUS_PRIVATE_KEY`) and deploy. Rows still on the old id are skipped from then on; delete them with `DELETE FROM push_subscriptions WHERE vapid_key_id = '<old id>'` once the period is over (their owners get a new subscription on the next open).
+7. Record the rotation date and the new key id in the operator log.
+
+Staging drill (P-06 acceptance, done by the maintainer, not by agents): on a staging host, subscribe two browsers with key `v1`, run steps 1 to 3, send a notice (both still receive, one signed with each key id), reopen one browser (it re-subscribes with `v2`), confirm the count per `vapid_key_id` changed from 2 on `v1` to 1 and 1, run step 6, confirm the re-subscribed browser still receives and the other one no longer does. Nothing in this drill needs production data.
 
 ## 10. Logging and privacy
 

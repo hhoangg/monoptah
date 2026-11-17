@@ -308,7 +308,7 @@ class WebSocketFrameSocket implements FrameSocket {
  * browser authenticates with its cookie. Rejects if the socket closes before opening.
  */
 export function connectRelay(url: string, headers: Record<string, string> = {}, options: ConnectRelayOptions = {}): Promise<FrameSocket> {
-  const Ctor = options.WebSocket ?? (globalThis as { WebSocket?: WebSocketConstructor }).WebSocket;
+  const Ctor = options.WebSocket ?? (globalThis as unknown as { WebSocket?: WebSocketConstructor }).WebSocket;
   if (!Ctor) return Promise.reject(new Error("no global WebSocket in this runtime"));
   return new Promise((resolve, reject) => {
     const ws = new Ctor(url, { headers });

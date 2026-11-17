@@ -1,7 +1,14 @@
-import { noCleanup } from "../cleanup.ts";
+import { DAY, runCleanupQueries, type Cleanup, type CleanupQuery } from "../cleanup.ts";
 
-/**
- * STUB (WS-R, Wave 1): delete `pending` `device_grants` older than 7 days.
- * The index `device_grants_state_updated_at_idx` already exists.
- */
-export const cleanup = noCleanup;
+/** A grant that stayed `pending` for 7 days expires (R-15). Uses `device_grants_state_updated_at_idx`. */
+export const PENDING_GRANT_TTL_SECONDS = 7 * DAY;
+
+export const CLEANUP_QUERIES: readonly CleanupQuery[] = [
+  {
+    name: "pending device_grants",
+    sql: "DELETE FROM device_grants WHERE state = 'pending' AND updated_at < ?1",
+    bind: (now) => [now - PENDING_GRANT_TTL_SECONDS],
+  },
+];
+
+export const cleanup: Cleanup = (env, now) => runCleanupQueries(env.DB, CLEANUP_QUERIES, now);

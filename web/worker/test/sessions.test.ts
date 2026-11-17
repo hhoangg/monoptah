@@ -269,9 +269,11 @@ describe("fresh and admin", () => {
     const plain = await loginAs(user.id);
     await expectError(await approve(plain.cookie), 403, "fresh_required");
     const fresh = await loginAs(user.id, { fresh: true });
-    expect((await approve(fresh.cookie)).status).toBe(501);
+    // Past the freshness gate the handler answers: no such pairing code.
+    await expectError(await approve(fresh.cookie), 404, "not_found");
     await env.DB.prepare("UPDATE sessions SET reauth_at = ? WHERE id_hash = ?").bind(now() - 299, fresh.idHash).run();
-    expect((await approve(fresh.cookie)).status).toBe(501);
+    // Past the freshness gate the handler answers: no such pairing code.
+    await expectError(await approve(fresh.cookie), 404, "not_found");
     await env.DB.prepare("UPDATE sessions SET reauth_at = ? WHERE id_hash = ?").bind(now() - 301, fresh.idHash).run();
     await expectError(await approve(fresh.cookie), 403, "fresh_required");
   });
@@ -284,10 +286,17 @@ describe("fresh and admin", () => {
     expect((await authedCall(await loginAs(admin.id, { fresh: true }), "/api/admin/users")).status).toBe(200);
   });
 
-  it("session+grant routes resolve the session only (the grant is WS-R)", async () => {
+  it("session+grant routes resolve the session first, then the handler checks the upgrade", async () => {
     const session = await loginAs((await createTestUser(env)).id);
     const res = await call("/relay/device/x?device=y", { headers: { Upgrade: "websocket", Origin: env.RP_ORIGIN, Cookie: session.cookie } });
-    expect(res.status).toBe(501);
+    // The session passed; the device has no grant, so the handler accepts the socket and closes it with 4003.
+    expect(res.status).toBe(101);
+    const socket = res.webSocket as WebSocket;
+    const closed = new Promise<number>((resolve) => socket.addEventListener("close", (event) => resolve(event.code)));
+    socket.accept();
+    expect(await closed).toBe(4003);
+    // Without the Upgrade header the handler answers 426.
+    await expectError(await call("/relay/device/x?device=y", { headers: { Origin: env.RP_ORIGIN, Cookie: session.cookie } }), 426, "invalid");
     await expectError(await call("/relay/device/x?device=y", { headers: { Upgrade: "websocket", Origin: env.RP_ORIGIN } }), 401, "unauthorized");
     const recovery = await loginAs((await createTestUser(env)).id, { recoveryOnly: true });
     await expectError(await call("/relay/device/x?device=y", { headers: { Upgrade: "websocket", Origin: env.RP_ORIGIN, Cookie: recovery.cookie } }), 403, "recovery_only");
@@ -295,8 +304,8 @@ describe("fresh and admin", () => {
 
   it("token routes ignore the session cookie entirely", async () => {
     const session = await loginAs((await createTestUser(env)).id, { fresh: true });
-    const res = await call("/api/desktop/me", { headers: { Cookie: session.cookie } });
-    expect(res.status).toBe(501);
+    // A valid session cookie is no desktop token: the handler asks for the bearer token.
+    await expectError(await call("/api/desktop/me", { headers: { Cookie: session.cookie } }), 401, "unauthorized");
   });
 
   it("requireFresh lets a handler demand freshness for part of a route (freshWhen)", async () => {
