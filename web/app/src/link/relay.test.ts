@@ -99,6 +99,37 @@ describe("RelayConnection", () => {
   });
 });
 
+describe("RelayConnection backlog (M4)", () => {
+  const bye = (channel: number) => encodeFrame({ type: FrameType.BYE, channel, deviceId: DEVICE });
+
+  it("delivers frames that arrived before a consumer attached, in order, then follows live frames", async () => {
+    const socket = new FakeSocket();
+    const relay = new RelayConnection(socket);
+    socket.onmessage?.(bye(1));
+    socket.onmessage?.(bye(2));
+    const channels: number[] = [];
+    relay.onFrame = (f) => channels.push(f.channel);
+    // A frame that arrives right after attaching still comes after the backlog.
+    socket.onmessage?.(bye(3));
+    expect(channels).toEqual([]);
+    await Promise.resolve();
+    expect(channels).toEqual([1, 2, 3]);
+    socket.onmessage?.(bye(4));
+    expect(channels).toEqual([1, 2, 3, 4]);
+  });
+
+  it("drops frames after the consumer left", () => {
+    const socket = new FakeSocket();
+    const relay = new RelayConnection(socket);
+    const channels: number[] = [];
+    relay.onFrame = (f) => channels.push(f.channel);
+    relay.onFrame = null;
+    socket.onmessage?.(bye(1));
+    relay.onFrame = (f) => channels.push(f.channel);
+    expect(channels).toEqual([]);
+  });
+});
+
 describe("relayUrl", () => {
   it("uses wss for https pages and ws for http://localhost", () => {
     const https = { protocol: "https:", host: "app.example.test", hostname: "app.example.test" };
@@ -167,5 +198,32 @@ describe("openRelay", () => {
     FakeWebSocket.last?.onclose?.({ code: 1006 });
     await expect(promise).rejects.toBeInstanceOf(RelayConnectError);
     await expect(promise).rejects.toMatchObject({ closeCode: 1006 });
+  });
+
+  it("rejects and closes the socket when the upgrade does not complete in time (M3, L9)", async () => {
+    vi.useFakeTimers();
+    const promise = openRelay({ desktopId: DESKTOP, deviceId: DEVICE, WebSocket: FakeWebSocket, location, openTimeoutMs: 1000 });
+    const outcome = promise.then(
+      () => "opened",
+      (error: unknown) => error,
+    );
+    const ws = FakeWebSocket.last as FakeWebSocket;
+    await vi.advanceTimersByTimeAsync(999);
+    expect(ws.closedWith).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await outcome).toBeInstanceOf(RelayConnectError);
+    expect(ws.closedWith).toBe(1000);
+  });
+
+  it("defaults the open timeout to the 30 s handshake timeout", async () => {
+    vi.useFakeTimers();
+    const outcome = openRelay({ desktopId: DESKTOP, deviceId: DEVICE, WebSocket: FakeWebSocket, location }).then(
+      () => "opened",
+      () => "rejected",
+    );
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(FakeWebSocket.last?.closedWith).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await outcome).toBe("rejected");
   });
 });

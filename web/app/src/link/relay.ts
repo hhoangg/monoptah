@@ -20,20 +20,44 @@ export interface RelaySocket {
   readonly closed: boolean;
 }
 
+/** Frames kept for a consumer that has not attached yet. */
+const MAX_BACKLOG = 16;
+
 export interface RelayConnectionOptions {
   /** Text `ping` period (default `PING_INTERVAL_MS`, 30 s). */
   pingIntervalMs?: number;
 }
 
 export class RelayConnection {
-  /** Called with every valid binary frame. Frames that fail `decodeFrame` are dropped. */
-  onFrame: ((frame: Frame) => void) | null = null;
+  /**
+   * Called with every valid binary frame. Frames that fail `decodeFrame` are dropped. Frames that arrive
+   * before the first consumer attaches (the join-time `presence` CTRL frame, 4.4) are kept, up to
+   * `MAX_BACKLOG`, and delivered in order right after it does; once a consumer has attached and left
+   * (`onFrame = null`), frames are dropped.
+   */
+  get onFrame(): ((frame: Frame) => void) | null {
+    return this.#handler;
+  }
+  set onFrame(handler: ((frame: Frame) => void) | null) {
+    this.#handler = handler;
+    if (handler && !this.#attached) {
+      this.#attached = true;
+      if (this.#backlog.length > 0) {
+        this.#flushing = true;
+        queueMicrotask(() => this.#flush());
+      }
+    }
+  }
   /** Called once when the socket closes (by either side). */
   onClose: ((code: number, reason: string) => void) | null = null;
   /** Count of binary messages dropped because `decodeFrame` rejected them. */
   invalidFrames = 0;
 
   readonly #socket: RelaySocket;
+  #handler: ((frame: Frame) => void) | null = null;
+  #attached = false;
+  #flushing = false;
+  readonly #backlog: Frame[] = [];
   #closed = false;
   #timer: ReturnType<typeof setInterval> | null = null;
 
@@ -86,7 +110,17 @@ export class RelayConnection {
       this.invalidFrames += 1;
       return;
     }
-    this.onFrame?.(frame);
+    if (!this.#attached || this.#flushing) {
+      if (this.#backlog.length < MAX_BACKLOG) this.#backlog.push(frame);
+      return;
+    }
+    this.#handler?.(frame);
+  }
+
+  #flush(): void {
+    const frames = this.#backlog.splice(0);
+    this.#flushing = false;
+    for (const frame of frames) this.#handler?.(frame);
   }
 
   #onClose(code: number, reason: string): void {
@@ -182,7 +216,12 @@ export interface OpenRelayOptions {
   /** Default: the global `location`. */
   location?: LocationLike;
   pingIntervalMs?: number;
+  /** The upgrade must complete within this time (default `OPEN_TIMEOUT_MS`); then the socket is closed and the open rejects. */
+  openTimeoutMs?: number;
 }
+
+/** Same as the Noise handshake timeout of `LinkSession` (30 s). */
+export const OPEN_TIMEOUT_MS = 30_000;
 
 /** Opens the relay WebSocket and resolves once it is open. Rejects with `RelayConnectError` if it closes or fails first. */
 export function openRelay(options: OpenRelayOptions): Promise<RelayConnection> {
@@ -198,11 +237,25 @@ export function openRelay(options: OpenRelayOptions): Promise<RelayConnection> {
       return;
     }
     ws.binaryType = "arraybuffer";
+    const timer = setTimeout(() => {
+      ws.onopen = null;
+      ws.onclose = null;
+      try {
+        ws.close(1000);
+      } catch {
+        // Already closed.
+      }
+      reject(new RelayConnectError("relay did not open in time"));
+    }, options.openTimeoutMs ?? OPEN_TIMEOUT_MS);
     ws.onopen = () => {
+      clearTimeout(timer);
       const socket = new WebSocketRelaySocket(ws);
       resolve(new RelayConnection(socket, options.pingIntervalMs === undefined ? {} : { pingIntervalMs: options.pingIntervalMs }));
     };
     ws.onerror = () => undefined;
-    ws.onclose = (event) => reject(new RelayConnectError(`relay closed with code ${event.code} before opening`, event.code));
+    ws.onclose = (event) => {
+      clearTimeout(timer);
+      reject(new RelayConnectError(`relay closed with code ${event.code} before opening`, event.code));
+    };
   });
 }

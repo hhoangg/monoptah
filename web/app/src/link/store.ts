@@ -12,8 +12,12 @@ export const LINK_BLOCKED_REASONS = [
   "key_changed",
   "login_required",
   "policy",
-  "proto_desktop_newer",
-  "proto_desktop_older",
+  /** The desktop speaks a newer protocol, or refused an older web prologue: "Reload to update the web app". */
+  "web_outdated",
+  /** The desktop speaks an older protocol than this web app: "Update Monoptah on your desktop". */
+  "desktop_outdated",
+  /** BYE before any `state`: unauthenticated, so not proof of a revocation. Copy for WS-M: "This desktop did not accept this device". */
+  "desktop_refused",
 ] as const;
 export type LinkBlockedReason = (typeof LINK_BLOCKED_REASONS)[number];
 
@@ -38,12 +42,12 @@ export interface LinkState {
   capabilities: string[];
   /** The relay's view of the desktop socket; null until known. */
   presence: "online" | "offline" | null;
-  /** Epoch ms of the last frame from the relay, null before the first. */
+  /** Epoch ms of the last frame on this tab's channel, refreshed at most every 5 s (`connection.lastFrameAt` is exact). */
   lastFrameAt: number | null;
   watches: LinkWatchInfo[];
   revoked: boolean;
   blocked: LinkBlockedReason | null;
-  /** Public fingerprints (lowercase hex) for the "Confirm this device on the desktop" screen. */
+  /** Public fingerprints (lowercase hex) for the "Confirm this device on the desktop" screen; the desktop one is the PINNED key's. */
   deviceFingerprint: string | null;
   desktopFingerprint: string | null;
   lastError: LinkErrorInfo | null;

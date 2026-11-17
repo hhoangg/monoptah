@@ -4,7 +4,7 @@
 import { RegisterDeviceBody, RegisterDeviceResponse } from "@monoptah/protocol";
 import { base64UrlEncode } from "./base64url.ts";
 import { fingerprint } from "./fingerprint.ts";
-import { bindDeviceId, loadOrCreateDeviceKey } from "./keys.ts";
+import { DeviceKeyError, bindDeviceId, loadOrCreateDeviceKeyHeld, withDeviceKeyLock } from "./keys.ts";
 
 export interface DeviceIdentity {
   /** Server device id (UUID). */
@@ -23,14 +23,22 @@ export interface DeviceRegistration {
 /** Registers the public key with the server and returns the server device id. */
 export type DeviceRegistrar = (registration: DeviceRegistration) => Promise<string>;
 
+/** HTTP statuses of a 4xx that is worth retrying: 401 is a login block, 408 and 429 are transient. */
+const TRANSIENT_CLIENT_ERRORS = new Set([401, 408, 429]);
+
 export class DeviceRegistrationError extends Error {
   readonly status: number | undefined;
-  constructor(message: string, status?: number) {
+  /** The server will not accept this registration however often it is retried (a 4xx such as `quota_exceeded`, a malformed answer). */
+  readonly terminal: boolean;
+  constructor(message: string, status?: number, terminal?: boolean) {
     super(message);
     this.name = "DeviceRegistrationError";
     this.status = status;
+    this.terminal = terminal ?? (status !== undefined && status >= 400 && status < 500 && !TRANSIENT_CLIENT_ERRORS.has(status));
   }
 }
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const MAX_DEVICE_NAME = 64;
 
@@ -63,7 +71,7 @@ export const defaultDeviceRegistrar: DeviceRegistrar = async ({ name, publicKey 
   });
   if (!response.ok) throw new DeviceRegistrationError(`device registration failed (${response.status})`, response.status);
   const parsed = RegisterDeviceResponse.safeParse(await response.json().catch(() => null));
-  if (!parsed.success) throw new DeviceRegistrationError("device registration returned an unexpected body");
+  if (!parsed.success) throw new DeviceRegistrationError("device registration returned an unexpected body", undefined, true);
   return parsed.data.deviceId;
 };
 
@@ -86,12 +94,37 @@ export function ensureDevice(): Promise<DeviceIdentity> {
   return inFlight;
 }
 
-async function register(): Promise<DeviceIdentity> {
-  const info = await loadOrCreateDeviceKey();
-  let deviceId = info.deviceId;
-  if (deviceId === undefined) {
-    deviceId = await registrar({ name: deviceNameFromUserAgent(), publicKey: info.publicKey });
-    await bindDeviceId(deviceId);
-  }
-  return { deviceId, publicKey: info.publicKey, fingerprint: fingerprint(info.publicKey) };
+/** A registration whose POST succeeded but whose bind failed: the next run binds it again instead of registering a second device. */
+let unbound: { deviceId: string; publicKey: Uint8Array } | null = null;
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  return a.length === b.length && a.every((byte, i) => byte === b[i]);
+}
+
+/** Key creation and registration run under one cross-tab lock (keys.ts `withDeviceKeyLock`). */
+function register(): Promise<DeviceIdentity> {
+  return withDeviceKeyLock(async () => {
+    const info = await loadOrCreateDeviceKeyHeld();
+    let deviceId = info.deviceId;
+    if (deviceId === undefined) {
+      if (unbound && sameBytes(unbound.publicKey, info.publicKey)) {
+        deviceId = unbound.deviceId;
+      } else {
+        unbound = null;
+        deviceId = await registrar({ name: deviceNameFromUserAgent(), publicKey: info.publicKey });
+        // A malformed id would be stored for good and break every later handshake.
+        if (!UUID.test(deviceId)) throw new DeviceRegistrationError("device registration returned a malformed device id", undefined, true);
+        unbound = { deviceId, publicKey: info.publicKey.slice() };
+      }
+      try {
+        await bindDeviceId(deviceId, info.publicKey);
+        unbound = null;
+      } catch (error) {
+        // The stored key is not the registered one any more: that registration is void.
+        if (error instanceof DeviceKeyError) unbound = null;
+        throw error;
+      }
+    }
+    return { deviceId, publicKey: info.publicKey, fingerprint: fingerprint(info.publicKey) };
+  });
 }

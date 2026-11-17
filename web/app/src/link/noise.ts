@@ -55,9 +55,15 @@ export interface KeyPair {
 }
 
 /** GENERATE_KEYPAIR (spec 4.1). With `privateKey` the pair is derived, which is how tests inject keys. */
-export function generateKeyPair(privateKey: Uint8Array = randomBytes(32)): KeyPair {
-  if (privateKey.length !== DHLEN) throw new NoiseError("bad_key", `a private key is ${DHLEN} bytes, got ${privateKey.length}`);
-  return { privateKey: privateKey.slice(), publicKey: x25519.getPublicKey(privateKey) };
+export function generateKeyPair(privateKey?: Uint8Array): KeyPair {
+  const seed = privateKey ?? randomBytes(32);
+  try {
+    if (seed.length !== DHLEN) throw new NoiseError("bad_key", `a private key is ${DHLEN} bytes, got ${seed.length}`);
+    return { privateKey: seed.slice(), publicKey: x25519.getPublicKey(seed) };
+  } finally {
+    // The random seed is ours: do not leave a second copy of the key behind. A caller's buffer is theirs.
+    if (privateKey === undefined) seed.fill(0);
+  }
 }
 
 /** DH (spec 4.1). @noble rejects the all-zero shared secret (low-order points), which surfaces as `bad_dh`. */
@@ -101,6 +107,7 @@ function decrypt(k: Uint8Array, n: bigint, ad: Uint8Array, ciphertext: Uint8Arra
 export class CipherState {
   #k: Uint8Array | null;
   #n = 0n;
+  #destroyed = false;
 
   /** Without a key the state passes data through unchanged (a handshake before the first DH). */
   constructor(key: Uint8Array | null = null) {
@@ -119,6 +126,17 @@ export class CipherState {
     return this.#k !== null;
   }
 
+  /** Zeroes the key. The state is unusable afterwards (it throws instead of passing data through). */
+  destroy(): void {
+    this.#k?.fill(0);
+    this.#k = null;
+    this.#destroyed = true;
+  }
+
+  #assertUsable(): void {
+    if (this.#destroyed) throw new NoiseError("bad_state", "the cipher state was destroyed");
+  }
+
   /** The nonce the next message uses. Rekey does not reset it (spec 4.2). */
   get nonce(): bigint {
     return this.#n;
@@ -131,6 +149,7 @@ export class CipherState {
   }
 
   encryptWithAd(ad: Uint8Array, plaintext: Uint8Array): Uint8Array {
+    this.#assertUsable();
     if (this.#k === null) return plaintext;
     if (this.#n === MAX_NONCE) throw new NoiseError("nonce_exhausted", "nonce 2^64-1 is reserved; rekey or end the session");
     const out = encrypt(this.#k, this.#n, ad, plaintext);
@@ -140,6 +159,7 @@ export class CipherState {
 
   /** The nonce advances only when the message authenticates (spec 5.1). */
   decryptWithAd(ad: Uint8Array, ciphertext: Uint8Array): Uint8Array {
+    this.#assertUsable();
     if (this.#k === null) return ciphertext;
     if (this.#n === MAX_NONCE) throw new NoiseError("nonce_exhausted", "nonce 2^64-1 is reserved; rekey or end the session");
     let out: Uint8Array;
@@ -154,6 +174,7 @@ export class CipherState {
 
   /** Rekey (spec 4.2): k = first 32 bytes of ENCRYPT(k, 2^64-1, empty, 32 zero bytes). The nonce is kept. */
   rekey(): void {
+    this.#assertUsable();
     if (this.#k === null) throw new NoiseError("bad_state", "cannot rekey a CipherState without a key");
     this.#k = encrypt(this.#k, MAX_NONCE, EMPTY, new Uint8Array(32)).slice(0, 32);
   }
@@ -385,6 +406,8 @@ export class HandshakeState {
     if (this.#split === null) {
       const [c1, c2] = this.#symmetric.split();
       this.#split = this.#initiator ? { send: c1, recv: c2 } : { send: c2, recv: c1 };
+      // The ephemeral private key was only needed for the DH tokens.
+      this.#e?.privateKey.fill(0);
     }
     return this.#split;
   }

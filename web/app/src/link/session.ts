@@ -65,6 +65,8 @@ export type LinkEndReason =
   | "protocol_error"
   /** The desktop `proto` is higher than this build knows (architecture.md 5.6): show "Reload to update the web app". */
   | "unsupported_proto"
+  /** The desktop `proto` (HS2 payload) is lower than this build speaks: show "Update Monoptah on your desktop". */
+  | "desktop_proto_older"
   /** The relay socket closed; `detail.closeCode` and `closeReason` say how. */
   | "relay_closed"
   /** `close()` was called. */
@@ -101,12 +103,18 @@ export interface LinkSessionOptions {
   channel?: number;
   /** The pinned desktop static public key. */
   desktopPublicKey: Uint8Array;
-  /** The device static key pair; only used for the handshake. */
+  /**
+   * The device static key pair, only used for the handshake. The session TAKES OWNERSHIP of
+   * `deviceKey.privateKey`: it zeroes that buffer when the handshake is over (or the session ends first),
+   * so pass a copy and never the module buffer of keys.ts.
+   */
   deviceKey: KeyPair;
   /** Sent encrypted in HS1 (shown on the desktop as untrusted text). */
   deviceName: string;
   /** Short user agent for HS1 (default: `navigator.userAgent`, cut to 160 characters). */
   userAgent?: string;
+  /** Called for every frame on this session's channel (not CTRL), for the liveness display of the app. */
+  onActivity?: () => void;
   /** Called for every `state` message, the first one included. */
   onState?: (state: StateMessage) => void;
   /** Called once when the session ends after it became ready. */
@@ -184,14 +192,15 @@ export class LinkSession {
   readonly channel: number;
   /** The latest `state` message (always set once `connect` resolved). */
   state: StateMessage;
-  /** `now()` at the last frame received from the relay (any type); the app uses it for liveness. */
+  /** `now()` at the last frame on this session's channel (CTRL frames and other tabs' channels do not count); the app uses it for liveness. */
   lastFrameAt: number;
   onState: ((state: StateMessage) => void) | null;
   onEnd: ((reason: LinkEndReason, detail: LinkEndDetail) => void) | null;
   onRelayError: ((code: string) => void) | null;
   onPresence: ((desktop: "online" | "offline") => void) | null;
 
-  readonly #options: LinkSessionOptions;
+  readonly #options: Omit<LinkSessionOptions, "deviceKey">;
+  #deviceKey: KeyPair | null;
   readonly #relay: RelayConnection;
   readonly #now: () => number;
   readonly #requestTimeoutMs: number;
@@ -209,7 +218,9 @@ export class LinkSession {
   #reassemblyTimer: ReturnType<typeof setInterval> | null = null;
 
   private constructor(options: LinkSessionOptions, initialState: StateMessage) {
-    this.#options = options;
+    const { deviceKey, ...rest } = options;
+    this.#options = rest;
+    this.#deviceKey = deviceKey;
     this.#relay = options.relay;
     this.desktopId = options.desktopId;
     this.deviceId = options.deviceId;
@@ -236,14 +247,25 @@ export class LinkSession {
     return session.#start();
   }
 
+  /** Zeroes the device private key this session owns. */
+  #wipeDeviceKey(): void {
+    this.#deviceKey?.privateKey.fill(0);
+    this.#deviceKey = null;
+  }
+
   #start(): Promise<LinkSession> {
     const options = this.#options;
-    this.#handshake = new HandshakeState({
-      initiator: true,
-      prologue: prologue(this.desktopId, this.deviceId, this.channel),
-      s: options.deviceKey,
-      rs: options.desktopPublicKey,
-    });
+    try {
+      this.#handshake = new HandshakeState({
+        initiator: true,
+        prologue: prologue(this.desktopId, this.deviceId, this.channel),
+        s: this.#deviceKey as KeyPair,
+        rs: options.desktopPublicKey,
+      });
+    } catch (error) {
+      this.#wipeDeviceKey();
+      throw error;
+    }
     const ready = new Promise<LinkSession>((resolve, reject) => {
       this.#readyResolve = resolve;
       this.#readyReject = reject;
@@ -419,9 +441,10 @@ export class LinkSession {
 
   #onFrame(frame: Frame): void {
     if (this.#ended) return;
-    this.lastFrameAt = this.#now();
     if (frame.type === FrameType.CTRL) return this.#onCtrl(frame);
     if (frame.channel !== this.channel) return; // another tab's channel on a shared socket
+    this.lastFrameAt = this.#now();
+    this.#options.onActivity?.();
     switch (frame.type) {
       case FrameType.ERROR:
         return this.#onRelayError(frame);
@@ -469,8 +492,10 @@ export class LinkSession {
       const proto = (JSON.parse(new TextDecoder().decode(payload)) as { proto?: unknown } | null)?.proto;
       if (typeof proto !== "number" || !Number.isInteger(proto) || proto < 1) throw new Error("bad proto");
       if (proto > PROTOCOL_VERSION) return this.#finish("unsupported_proto", {}, true);
+      if (proto < PROTOCOL_VERSION) return this.#finish("desktop_proto_older", {}, true);
       const { send, recv } = handshake.split();
       this.#handshake = null;
+      this.#wipeDeviceKey();
       // The crypto must exist before the next frame (the state message) is delivered.
       this.#crypto = new SecureChannel({
         send,
@@ -605,6 +630,7 @@ export class LinkSession {
     this.#reassemblyTimer = null;
     this.#crypto?.reset();
     this.#handshake = null;
+    this.#wipeDeviceKey();
 
     const ended = new LinkRequestError("The session has ended", "session_ended");
     for (const pending of this.#pending.values()) {

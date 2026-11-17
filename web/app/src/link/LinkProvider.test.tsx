@@ -1,7 +1,11 @@
 import { QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, RouterProvider } from "@tanstack/react-router";
 import { act, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { StrictMode } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { InMemoryRelay, MockDesktop, fingerprint, generateKeyPair } from "@monoptah/mock-desktop";
+import { base64UrlEncode } from "./base64url.ts";
+import { RelayConnection } from "./relay.ts";
 import { createQueryClient } from "@/lib/queryClient";
 import { createAppRouter } from "@/router";
 import { getLinkConnection, resetLinkConnections } from "./connection.ts";
@@ -64,6 +68,56 @@ describe("LinkProvider", () => {
   });
 });
 
+describe("StrictMode double mount (C1)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("reaches ready although React runs retain, release, retain at once", async () => {
+    const relay = new InMemoryRelay();
+    const deviceKey = generateKeyPair();
+    const desktop = new MockDesktop({ desktopId: "11111111-1111-4111-8111-111111111111" });
+    desktop.setDevice(fingerprint(deviceKey.publicKey), { status: "confirmed", permission: "control" });
+    desktop.attach(relay.connectDesktop());
+    const directory = {
+      id: "11111111-1111-4111-8111-111111111111",
+      name: "Example Desktop",
+      color: null,
+      online: true,
+      pendingCount: 0,
+      os: null,
+      appVersion: null,
+      lastSeenAt: null,
+      publicKey: base64UrlEncode(desktop.publicKey),
+      fingerprint: fingerprint(desktop.publicKey),
+    };
+    getLinkConnection("11111111-1111-4111-8111-111111111111", {
+      ensureDevice: async () => ({ deviceId: "22222222-2222-4222-8222-222222222222", publicKey: deviceKey.publicKey, fingerprint: fingerprint(deviceKey.publicKey) }),
+      getDeviceKeyPair: async () => deviceKey,
+      fetch: (async () => new Response(JSON.stringify(directory), { status: 200, headers: { "Content-Type": "application/json" } })) as typeof fetch,
+      checkPin: async () => "match",
+      channel: 7,
+      openRelay: async (_desktopId, deviceId) => new RelayConnection(relay.connectDevice(deviceId)),
+    });
+    render(
+      <StrictMode>
+        <LinkProvider desktopId="11111111-1111-4111-8111-111111111111">
+          <Probe />
+        </LinkProvider>
+      </StrictMode>,
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+      await relay.settled();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByTestId("probe")).toHaveTextContent("11111111-1111-4111-8111-111111111111:ready:11111111-1111-4111-8111-111111111111");
+  });
+});
+
 describe("/d/$desktopId route guards", () => {
   function renderRoute(url: string) {
     const router = createAppRouter({ history: createMemoryHistory({ initialEntries: [url] }) });
@@ -79,11 +133,11 @@ describe("/d/$desktopId route guards", () => {
     getLinkConnection("dk3", { fetch: pending });
     renderRoute("/d/dk3");
     await screen.findByTestId("route-stub");
-    act(() => getLinkStore("dk3").setState({ blocked: "proto_desktop_newer", status: "closed" }));
+    act(() => getLinkStore("dk3").setState({ blocked: "web_outdated", status: "closed" }));
     expect(await screen.findByText("Reload to update the web app")).toBeInTheDocument();
-    act(() => getLinkStore("dk3").setState({ blocked: "proto_desktop_older" }));
+    act(() => getLinkStore("dk3").setState({ blocked: "desktop_outdated" }));
     expect(await screen.findByText("Update Monoptah on your desktop")).toBeInTheDocument();
-    expect(screen.getByTestId("link-blocked-screen")).toHaveAttribute("data-reason", "proto_desktop_older");
+    expect(screen.getByTestId("link-blocked-screen")).toHaveAttribute("data-reason", "desktop_outdated");
   });
 
   it("navigates to /login with the current path when login is required", async () => {

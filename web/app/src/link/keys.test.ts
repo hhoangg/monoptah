@@ -1,8 +1,8 @@
 import { IDBFactory } from "fake-indexeddb";
 import { bytesToHex } from "@noble/hashes/utils.js";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as Keys from "./keys.ts";
-import { KEYS_STORE, LINK_DB_NAME, PINS_STORE, idbGet, idbPut } from "./idb.ts";
+import { KEYS_STORE, LINK_DB_NAME, PINS_STORE, idbAddAll, idbGet, idbPut } from "./idb.ts";
 
 
 
@@ -80,7 +80,7 @@ describe("device key storage", () => {
     const keys = await freshModule();
     const pair = await keys.getDeviceKeyPair();
     const secret = pair.privateKey.slice();
-    await keys.bindDeviceId("0123456789abcdef0123456789abcdef");
+    await keys.bindDeviceId("0123456789abcdef0123456789abcdef", pair.publicKey);
     await keys.getDeviceKeyPair();
 
     const { records, stores } = await walkDatabase();
@@ -130,7 +130,7 @@ describe("device key storage", () => {
     const keys = await freshModule();
     const created = await keys.loadOrCreateDeviceKey();
     expect(created.deviceId).toBeUndefined();
-    await keys.bindDeviceId("abcdefabcdefabcdefabcdefabcdefab");
+    await keys.bindDeviceId("abcdefabcdefabcdefabcdefabcdefab", created.publicKey);
     keys.lockDeviceKey();
     const loaded = await keys.loadOrCreateDeviceKey();
     expect(loaded.deviceId).toBe("abcdefabcdefabcdefabcdefabcdefab");
@@ -165,5 +165,120 @@ describe("device key storage", () => {
     expect(await keys.requestPersistentStorage()).toBe(false);
     if (original) Object.defineProperty(navigator, "storage", original);
     else Reflect.deleteProperty(navigator, "storage");
+  });
+});
+
+/** A Web Locks stand-in: one holder at a time per name, in request order. */
+function installFakeLocks(): { names: string[]; maxActive: () => number } {
+  const names: string[] = [];
+  let active = 0;
+  let max = 0;
+  let chain: Promise<unknown> = Promise.resolve();
+  const locks = {
+    request: <R,>(name: string, callback: () => Promise<R>): Promise<R> => {
+      names.push(name);
+      const run = chain.then(async () => {
+        active += 1;
+        max = Math.max(max, active);
+        try {
+          return await callback();
+        } finally {
+          active -= 1;
+        }
+      });
+      chain = run.catch(() => undefined);
+      return run;
+    },
+  };
+  Object.defineProperty(navigator, "locks", { value: locks, configurable: true });
+  return { names, maxActive: () => max };
+}
+
+describe("two tabs share one IndexedDB (M1, M2)", () => {
+  afterEach(() => {
+    Reflect.deleteProperty(navigator, "locks");
+    vi.restoreAllMocks();
+  });
+
+  async function twoTabs(): Promise<[typeof Keys, typeof Keys]> {
+    const a = await freshModule();
+    const b = await freshModule();
+    return [a, b];
+  }
+
+  it("without Web Locks, two first uses converge on one stored key that survives a reload", async () => {
+    // Tab A's AES-GCM encrypt is slow, as on a busy thread pool: the old code let tab B's wrapping key win and brick A's record.
+    const real = crypto.subtle.encrypt.bind(crypto.subtle);
+    let calls = 0;
+    vi.spyOn(crypto.subtle, "encrypt").mockImplementation(async (...args: Parameters<SubtleCrypto["encrypt"]>) => {
+      const slow = calls++ === 0;
+      const out = await real(...args);
+      if (slow) await new Promise((resolve) => setTimeout(resolve, 50));
+      return out;
+    });
+    const [a, b] = await twoTabs();
+    const [pa, pb] = await Promise.all([a.getDeviceKeyPair(), b.getDeviceKeyPair()]);
+    expect(bytesToHex(pa.publicKey)).toBe(bytesToHex(pb.publicKey));
+    const reloaded = await freshModule();
+    const again = await reloaded.getDeviceKeyPair();
+    expect(bytesToHex(again.publicKey)).toBe(bytesToHex(pa.publicKey));
+    expect(bytesToHex(again.privateKey)).toBe(bytesToHex(pa.privateKey));
+  });
+
+  it("with Web Locks, creation is serialised under the monoptah-device-key lock", async () => {
+    const locks = installFakeLocks();
+    const [a, b] = await twoTabs();
+    const [pa, pb] = await Promise.all([a.getDeviceKeyPair(), b.getDeviceKeyPair()]);
+    expect(bytesToHex(pa.publicKey)).toBe(bytesToHex(pb.publicKey));
+    expect(locks.names).toEqual(["monoptah-device-key", "monoptah-device-key"]);
+    expect(locks.maxActive()).toBe(1);
+  });
+
+  it("idbAddAll writes every entry or none", async () => {
+    await idbPut(KEYS_STORE, "b", 2);
+    expect(await idbAddAll(KEYS_STORE, [["a", 1], ["b", 3]])).toBe(false);
+    expect(await idbGet(KEYS_STORE, "a")).toBeUndefined();
+    expect(await idbGet(KEYS_STORE, "b")).toBe(2);
+    expect(await idbAddAll(KEYS_STORE, [["a", 1], ["c", 3]])).toBe(true);
+    expect(await idbGet(KEYS_STORE, "c")).toBe(3);
+  });
+
+  it("bindDeviceId refuses a key that is not the stored one and leaves the record alone", async () => {
+    const keys = await freshModule();
+    const stored = await keys.loadOrCreateDeviceKey();
+    const other = new Uint8Array(32).fill(5);
+    await expect(keys.bindDeviceId("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", other)).rejects.toMatchObject({ name: "DeviceKeyError", code: "mismatch" });
+    expect((await keys.getDeviceKeyInfo())?.deviceId).toBeUndefined();
+    await keys.bindDeviceId("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", stored.publicKey);
+    expect((await keys.getDeviceKeyInfo())?.deviceId).toBe("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+  });
+});
+
+describe("pagehide while the key loads (L6)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("a lock before the first read wins over the load", async () => {
+    const keys = await freshModule();
+    const load = keys.getDeviceKeyPair();
+    keys.lockDeviceKey();
+    await expect(load).rejects.toMatchObject({ name: "DeviceKeyError", code: "locked" });
+    await expect(keys.getDeviceKeyPair()).resolves.toMatchObject({ publicKey: expect.any(Uint8Array) });
+  });
+
+  it("a pagehide during the unwrap does not leave the key in memory", async () => {
+    const keys = await freshModule();
+    const first = await keys.getDeviceKeyPair();
+    const expected = bytesToHex(first.publicKey);
+    keys.lockDeviceKey();
+    const real = crypto.subtle.decrypt.bind(crypto.subtle);
+    vi.spyOn(crypto.subtle, "decrypt").mockImplementationOnce(async (...args: Parameters<SubtleCrypto["decrypt"]>) => {
+      window.dispatchEvent(new Event("pagehide"));
+      return real(...args);
+    });
+    await expect(keys.getDeviceKeyPair()).rejects.toMatchObject({ code: "locked" });
+    // The next use unwraps again and gets the same key.
+    expect(bytesToHex((await keys.getDeviceKeyPair()).publicKey)).toBe(expected);
   });
 });

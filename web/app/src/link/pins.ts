@@ -2,7 +2,7 @@
 // pinned; a different key later is "changed" and the link must block ("Desktop key changed").
 // The only way to replace a pin is repinFromVerify with a fingerprint that came from the desktop
 // itself (the `/desktops/:id/verify#fp=` page). There is deliberately no "trust new key" call.
-import { PINS_STORE, idbClear, idbGet, idbUpdate } from "./idb.ts";
+import { PINS_STORE, idbAddAll, idbClear, idbGet, idbUpdate } from "./idb.ts";
 import { fingerprint, normalizeFingerprint } from "./fingerprint.ts";
 
 export interface PinRecord {
@@ -43,6 +43,30 @@ export function checkPin(desktopId: string, directoryPublicKey: Uint8Array): Pro
     }
     return { result: sameKey(current.publicKey, directoryPublicKey) ? "match" : "changed" };
   });
+}
+
+export interface PinInspection {
+  status: "new" | "match" | "changed";
+  /** Fingerprint of the stored pin; null when there is none. */
+  pinnedFingerprint: string | null;
+}
+
+/** Reads the pin without writing: a first-use key is not pinned until a handshake with it succeeded (`commitPin`). */
+export async function inspectPin(desktopId: string, directoryPublicKey: Uint8Array): Promise<PinInspection> {
+  const current = await getPin(desktopId);
+  if (!current) return { status: "new", pinnedFingerprint: null };
+  return { status: sameKey(current.publicKey, directoryPublicKey) ? "match" : "changed", pinnedFingerprint: current.fingerprint };
+}
+
+/**
+ * Pins a first-use key after the handshake with it succeeded. Atomic (`add`): when a pin appeared
+ * meanwhile, the stored one wins and the result says whether it equals `publicKey`.
+ */
+export async function commitPin(desktopId: string, publicKey: Uint8Array): Promise<"pinned-now" | "match" | "changed"> {
+  const record: PinRecord = { v: 1, desktopId, publicKey: publicKey.slice(), fingerprint: fingerprint(publicKey), pinnedAt: Date.now() };
+  if (await idbAddAll(PINS_STORE, [[desktopId, record]])) return "pinned-now";
+  const current = await getPin(desktopId);
+  return current && sameKey(current.publicKey, publicKey) ? "match" : "changed";
 }
 
 /**

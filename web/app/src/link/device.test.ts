@@ -1,6 +1,7 @@
 import { IDBFactory } from "fake-indexeddb";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as Device from "./device.ts";
+import type * as Keys from "./keys.ts";
 
 async function freshModule(): Promise<typeof Device> {
   vi.resetModules();
@@ -85,5 +86,72 @@ describe("ensureDevice", () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status: 401 })));
     await expect(ensureDevice()).rejects.toBeInstanceOf(DeviceRegistrationError);
     await expect(ensureDevice()).rejects.toMatchObject({ status: 401 });
+  });
+});
+
+describe("registration failures (M10, L8)", () => {
+  afterEach(() => {
+    vi.doUnmock("./keys.ts");
+    Reflect.deleteProperty(navigator, "locks");
+  });
+
+  it("marks a 4xx as terminal, except 401, 408 and 429", async () => {
+    const { DeviceRegistrationError } = await freshModule();
+    expect(new DeviceRegistrationError("x", 403).terminal).toBe(true);
+    expect(new DeviceRegistrationError("x", 400).terminal).toBe(true);
+    expect(new DeviceRegistrationError("x", 401).terminal).toBe(false);
+    expect(new DeviceRegistrationError("x", 429).terminal).toBe(false);
+    expect(new DeviceRegistrationError("x", 500).terminal).toBe(false);
+    expect(new DeviceRegistrationError("x").terminal).toBe(false);
+  });
+
+  it("a malformed server device id is terminal and is never stored", async () => {
+    const { ensureDevice, setDeviceRegistrar } = await freshModule();
+    const keys = await import("./keys.ts");
+    setDeviceRegistrar(async () => "not-a-uuid");
+    await expect(ensureDevice()).rejects.toMatchObject({ name: "DeviceRegistrationError", terminal: true });
+    expect((await keys.getDeviceKeyInfo())?.deviceId).toBeUndefined();
+  });
+
+  it("when the bind fails after a successful POST, the next run binds the same id instead of registering again", async () => {
+    vi.resetModules();
+    let failBind = true;
+    vi.doMock("./keys.ts", async (importOriginal) => {
+      const real = await importOriginal<typeof Keys>();
+      return {
+        ...real,
+        bindDeviceId: async (deviceId: string, publicKey: Uint8Array) => {
+          if (failBind) {
+            failBind = false;
+            throw new Error("storage hiccup");
+          }
+          return real.bindDeviceId(deviceId, publicKey);
+        },
+      };
+    });
+    const { ensureDevice, setDeviceRegistrar } = await import("./device.ts");
+    const registrar = vi.fn(async () => "77777777-7777-4777-8777-777777777777");
+    setDeviceRegistrar(registrar);
+    await expect(ensureDevice()).rejects.toThrow("storage hiccup");
+    await expect(ensureDevice()).resolves.toMatchObject({ deviceId: "77777777-7777-4777-8777-777777777777" });
+    expect(registrar).toHaveBeenCalledTimes(1);
+  });
+
+  it("two tabs registering at once register one device under the Web Lock", async () => {
+    const queue: { chain: Promise<unknown> } = { chain: Promise.resolve() };
+    Object.defineProperty(navigator, "locks", {
+      value: { request: <R,>(_name: string, cb: () => Promise<R>): Promise<R> => (queue.chain = queue.chain.then(cb, cb)) as Promise<R> },
+      configurable: true,
+    });
+    const a = await freshModule();
+    const b = await freshModule();
+    let n = 0;
+    const registrar = vi.fn(async () => `88888888-8888-4888-8888-88888888888${++n}`);
+    a.setDeviceRegistrar(registrar);
+    b.setDeviceRegistrar(registrar);
+    const [ia, ib] = await Promise.all([a.ensureDevice(), b.ensureDevice()]);
+    expect(registrar).toHaveBeenCalledTimes(1);
+    expect(ib.deviceId).toBe(ia.deviceId);
+    expect(ib.fingerprint).toBe(ia.fingerprint);
   });
 });

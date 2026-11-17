@@ -4,14 +4,14 @@ import type { LinkBlockedReason } from "@/link/store";
 import { Button } from "@/ui/button";
 import { Card, CardDescription, CardTitle } from "@/ui/card";
 
-export type VersionBlockedReason = Extract<LinkBlockedReason, "proto_desktop_newer" | "proto_desktop_older">;
+export type VersionBlockedReason = Extract<LinkBlockedReason, "web_outdated" | "desktop_outdated">;
 
 export function isVersionBlocked(reason: LinkBlockedReason | null): reason is VersionBlockedReason {
-  return reason === "proto_desktop_newer" || reason === "proto_desktop_older";
+  return reason === "web_outdated" || reason === "desktop_outdated";
 }
 
 export function LinkBlockedScreen({ reason }: { reason: VersionBlockedReason }) {
-  const newer = reason === "proto_desktop_newer";
+  const newer = reason === "web_outdated";
   return (
     <div role="alert" data-testid="link-blocked-screen" data-reason={reason} className="mx-auto flex w-full max-w-[480px] flex-col gap-4 px-5 py-10">
       <Card className="flex flex-col gap-3 p-5">

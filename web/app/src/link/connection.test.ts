@@ -10,7 +10,8 @@ import {
   planForClose,
   type LinkConnectionDeps,
 } from "./connection.ts";
-import type { DeviceIdentity } from "./device.ts";
+import { DeviceRegistrationError, type DeviceIdentity } from "./device.ts";
+import { DeviceKeyError } from "./keys.ts";
 import { RelayConnectError, RelayConnection } from "./relay.ts";
 import { LinkSession, LinkSessionError } from "./session.ts";
 import { clearLinkStores, type LinkState, type LinkStatus } from "./store.ts";
@@ -71,6 +72,12 @@ interface RigOptions {
   random?: () => number;
   deps?: Partial<LinkConnectionDeps>;
   pinFn?: LinkConnectionDeps["checkPin"];
+  /** Use the real two-phase pin step (inspect before, commit after the handshake) over an in-memory map. */
+  twoPhasePins?: boolean;
+  /** What the directory says about presence (default online). */
+  directoryOnline?: boolean;
+  /** The public key the directory serves (default: the desktop's). */
+  directoryKey?: Uint8Array;
   start?: boolean;
 }
 
@@ -89,14 +96,43 @@ function rig(options: RigOptions = {}): Rig {
     id: DESKTOP_ID,
     name: "Example Desktop",
     color: null,
-    online: true,
+    online: options.directoryOnline ?? true,
     pendingCount: 0,
     os: null,
     appVersion: null,
     lastSeenAt: null,
-    publicKey: base64UrlEncode(desktop.publicKey),
-    fingerprint: fingerprint(desktop.publicKey),
+    publicKey: base64UrlEncode(options.directoryKey ?? desktop.publicKey),
+    fingerprint: fingerprint(options.directoryKey ?? desktop.publicKey),
   };
+  const sameKey = (a: Uint8Array, b: Uint8Array) => base64UrlEncode(a) === base64UrlEncode(b);
+  const pinDeps: Partial<LinkConnectionDeps> = options.twoPhasePins
+    ? {
+        inspectPin: async (id, key) => {
+          const pinned = pins.get(id);
+          if (!pinned) return { status: "new", pinnedFingerprint: null };
+          return { status: sameKey(pinned, key) ? "match" : "changed", pinnedFingerprint: fingerprint(pinned) };
+        },
+        commitPin: async (id, key) => {
+          const pinned = pins.get(id);
+          if (!pinned) {
+            pins.set(id, key);
+            return "pinned-now";
+          }
+          return sameKey(pinned, key) ? "match" : "changed";
+        },
+      }
+    : {
+        checkPin:
+          options.pinFn ??
+          (async (id, key) => {
+            const pinned = pins.get(id);
+            if (!pinned) {
+              pins.set(id, key);
+              return "pinned-now";
+            }
+            return sameKey(pinned, key) ? "match" : "changed";
+          }),
+      };
   const connection = new LinkConnection(DESKTOP_ID, {
     ensureDevice: async () => identity,
     getDeviceKeyPair: async () => deviceKey,
@@ -104,16 +140,7 @@ function rig(options: RigOptions = {}): Rig {
       fetches += 1;
       return new Response(JSON.stringify(directory), { status: 200, headers: { "Content-Type": "application/json" } });
     }) as typeof fetch,
-    checkPin:
-      options.pinFn ??
-      (async (id, key) => {
-        const pinned = pins.get(id);
-        if (!pinned) {
-          pins.set(id, key);
-          return "pinned-now";
-        }
-        return base64UrlEncode(pinned) === base64UrlEncode(key) ? "match" : "changed";
-      }),
+    ...pinDeps,
     openRelay: async (_desktopId, deviceId) => {
       opens += 1;
       return new RelayConnection(relay.connectDevice(deviceId));
@@ -222,26 +249,43 @@ describe("connect sequence", () => {
     expect(r.state().status).toBe("ready");
   });
 
-  it("BYE before any state blocks as revoked and does not retry", async () => {
+  it("BYE before any state blocks as desktop_refused (not revoked) and does not retry", async () => {
     const r = rig({ device: "revoked" });
     await settle();
-    expect(r.state()).toMatchObject({ status: "closed", blocked: "revoked", revoked: true });
+    expect(r.state()).toMatchObject({ status: "closed", blocked: "desktop_refused", revoked: false, lastError: { code: "bye" } });
     await settle(120_000);
     expect(r.opens()).toBe(1);
   });
 
-  it("a relay unsupported_version blocks as proto_desktop_older", async () => {
+  it("a relay unsupported_version means the desktop refused an older web prologue: web_outdated", async () => {
     const r = rig({
       deps: { connectSession: async () => Promise.reject(new LinkSessionError("relay_error", { relayCode: "unsupported_version" })) },
     });
     await settle();
-    expect(r.state()).toMatchObject({ status: "closed", blocked: "proto_desktop_older" });
+    expect(r.state()).toMatchObject({ status: "closed", blocked: "web_outdated", revoked: false });
   });
 
-  it("a desktop proto above ours blocks as proto_desktop_newer, at connect and in a later state", async () => {
+  it("a desktop proto below ours blocks as desktop_outdated, at connect and in a later state", async () => {
+    const at = rig({ deps: { connectSession: async () => Promise.reject(new LinkSessionError("desktop_proto_older")) } });
+    await settle();
+    expect(at.state()).toMatchObject({ status: "closed", blocked: "desktop_outdated" });
+
+    const later = rig({
+      deps: {
+        connectSession: async (options) => {
+          options.onState?.({ type: "state", state: "confirmed", permission: "control", proto: PROTOCOL_VERSION - 1, capabilities: [] });
+          return { state: { type: "state", state: "confirmed" }, lastFrameAt: 0, ready: true, ended: false, close() {} } as unknown as LinkSession;
+        },
+      },
+    });
+    await settle();
+    expect(later.state()).toMatchObject({ status: "closed", blocked: "desktop_outdated", proto: PROTOCOL_VERSION - 1 });
+  });
+
+  it("a desktop proto above ours blocks as web_outdated, at connect and in a later state", async () => {
     const at = rig({ deps: { connectSession: async () => Promise.reject(new LinkSessionError("unsupported_proto")) } });
     await settle();
-    expect(at.state()).toMatchObject({ status: "closed", blocked: "proto_desktop_newer" });
+    expect(at.state()).toMatchObject({ status: "closed", blocked: "web_outdated" });
 
     const later = rig({
       deps: {
@@ -252,7 +296,7 @@ describe("connect sequence", () => {
       },
     });
     await settle();
-    expect(later.state()).toMatchObject({ status: "closed", blocked: "proto_desktop_newer", proto: PROTOCOL_VERSION + 1 });
+    expect(later.state()).toMatchObject({ status: "closed", blocked: "web_outdated", proto: PROTOCOL_VERSION + 1 });
   });
 
   it("a state revoked blocks as revoked", async () => {
@@ -362,12 +406,12 @@ describe("close codes", () => {
     });
   }
 
-  it("a BYE after ready reconnects, and a BYE before any state then blocks as revoked", async () => {
+  it("a BYE after ready reconnects, and a BYE before any state then blocks as desktop_refused", async () => {
     const r = await ready();
     r.desktop.revokeDevice(fingerprint(r.deviceKey.publicKey));
     await settle(2000);
     expect(r.opens()).toBe(2);
-    expect(r.state()).toMatchObject({ status: "closed", blocked: "revoked", revoked: true });
+    expect(r.state()).toMatchObject({ status: "closed", blocked: "desktop_refused", revoked: false });
   });
 });
 
@@ -623,5 +667,227 @@ describe("pending, requests and reconnects", () => {
     expect(r.state().status).toBe("ready");
     r.connection.release();
     expect(r.state().status).toBe("idle");
+  });
+});
+
+describe("review fixes: lifecycle", () => {
+  it("retain, release, retain during an attempt still connects (C1)", async () => {
+    const r = rig({ start: false });
+    r.connection.retain();
+    r.connection.release();
+    r.connection.retain();
+    await settle();
+    expect(r.state().status).toBe("ready");
+    expect(r.opens()).toBe(1);
+  });
+
+  it("a pin-storage failure of a stale attempt leaves the newer attempt alone (M2)", async () => {
+    let calls = 0;
+    let rejectFirst: () => void = () => undefined;
+    const r = rig({
+      start: false,
+      twoPhasePins: true,
+      deps: {
+        inspectPin: async () => {
+          calls += 1;
+          if (calls === 1) return new Promise((_resolve, reject) => void (rejectFirst = () => reject(new Error("storage"))));
+          return { status: "new", pinnedFingerprint: null };
+        },
+      },
+    });
+    r.connection.retain();
+    await settle();
+    r.connection.release();
+    r.connection.retain();
+    await settle();
+    expect(r.state().status).toBe("ready");
+    rejectFirst();
+    await settle(5000);
+    expect(r.state().status).toBe("ready");
+    expect(r.opens()).toBe(1);
+    await expect(r.connection.request("workspace.list")).resolves.toBeTruthy();
+  });
+
+  it("the join presence CTRL is not lost while the device key loads (M4)", async () => {
+    const r = rig({ directoryOnline: false });
+    await settle();
+    expect(r.state()).toMatchObject({ status: "ready", presence: "online" });
+  });
+
+  it("a pending session is not re-handshaken by the 75 s visible check (M14)", async () => {
+    const r = rig({ device: "pending" });
+    await settle();
+    expect(r.state().status).toBe("pending");
+    r.clock.now += 80_000;
+    setHidden(true);
+    setHidden(false);
+    await settle();
+    expect(r.opens()).toBe(1);
+    expect(r.state().status).toBe("pending");
+  });
+
+  it("store.lastFrameAt follows the traffic at most once every 5 s (M13)", async () => {
+    const r = await ready();
+    const first = r.state().lastFrameAt;
+    expect(first).toBe(r.clock.now);
+    r.clock.now += 1000;
+    await r.connection.request("workspace.list");
+    expect(r.state().lastFrameAt).toBe(first);
+    expect(r.connection.lastFrameAt).toBe(r.clock.now);
+    r.clock.now += 5000;
+    await r.connection.request("workspace.list");
+    expect(r.state().lastFrameAt).toBe(r.clock.now);
+  });
+
+  it("a state re-send with new capabilities reaches the store without a reconnect (M7)", async () => {
+    const r = await ready();
+    expect(r.state().capabilities).toEqual(expect.arrayContaining(["cloud", "approvals"]));
+    r.desktop.setCapabilities(["approvals"]);
+    await settle();
+    expect(r.state().capabilities).toEqual(["approvals"]);
+    expect(r.state().status).toBe("ready");
+    expect(r.opens()).toBe(1);
+  });
+});
+
+describe("review fixes: desktop_refused", () => {
+  it("a user reconnect and the next visible transition each try once more", async () => {
+    const r = rig({ device: "revoked" });
+    await settle();
+    expect(r.state()).toMatchObject({ blocked: "desktop_refused", revoked: false });
+    expect(r.opens()).toBe(1);
+    setHidden(true);
+    setHidden(false);
+    await settle();
+    expect(r.opens()).toBe(2);
+    expect(r.state()).toMatchObject({ status: "closed", blocked: "desktop_refused", revoked: false });
+    setHidden(true);
+    setHidden(false);
+    await settle();
+    expect(r.opens()).toBe(2);
+    r.desktop.confirmDevice(fingerprint(r.deviceKey.publicKey), "control");
+    r.connection.reconnect();
+    await settle();
+    expect(r.opens()).toBe(3);
+    expect(r.state()).toMatchObject({ status: "ready", blocked: null });
+  });
+
+  it("only an encrypted revoked state or a 4003 close sets revoked", async () => {
+    const viaClose = await ready();
+    viaClose.relay.revokeDevice(DEVICE_ID, CloseCodes.REVOKED);
+    await settle();
+    expect(viaClose.state()).toMatchObject({ blocked: "revoked", revoked: true });
+  });
+});
+
+describe("review fixes: pin and keys", () => {
+  it("a first-use key that fails the handshake is not pinned, and one that succeeds is (L2)", async () => {
+    const wrong = generateKeyPair();
+    const bad = rig({ twoPhasePins: true, directoryKey: wrong.publicKey });
+    await settle();
+    expect(bad.state()).toMatchObject({ status: "closed", blocked: "desktop_refused" });
+    expect(bad.pins.size).toBe(0);
+    expect(bad.state().desktopFingerprint).toBeNull();
+
+    const good = await ready({ twoPhasePins: true });
+    expect(good.pins.get(DESKTOP_ID)).toEqual(good.desktop.publicKey);
+    expect(good.state().desktopFingerprint).toBe(fingerprint(good.desktop.publicKey));
+  });
+
+  it("a key that is already pinned and changed shows the pinned fingerprint, not the directory's (L3)", async () => {
+    const pinned = "ab".repeat(32);
+    const r = rig({ twoPhasePins: true, deps: { inspectPin: async () => ({ status: "changed", pinnedFingerprint: pinned }) } });
+    await settle();
+    expect(r.opens()).toBe(0);
+    expect(r.state()).toMatchObject({ blocked: "key_changed", desktopFingerprint: pinned });
+  });
+
+  it("the handshake gets a copy of the device key and it is zeroed afterwards (L5, L7)", async () => {
+    let given: Uint8Array | null = null;
+    const r = rig({
+      deps: {
+        connectSession: async (options) => {
+          given = options.deviceKey.privateKey;
+          expect(given).not.toBe(r.deviceKey.privateKey);
+          return LinkSession.connect(options);
+        },
+      },
+    });
+    const original = r.deviceKey.privateKey.slice();
+    await settle();
+    expect(r.state().status).toBe("ready");
+    expect((given as unknown as Uint8Array).every((byte) => byte === 0)).toBe(true);
+    expect(r.deviceKey.privateKey).toEqual(original);
+  });
+});
+
+describe("review fixes: device registration", () => {
+  const rejecting = (error: unknown) => {
+    let calls = 0;
+    return {
+      calls: () => calls,
+      ensureDevice: async (): Promise<DeviceIdentity> => {
+        calls += 1;
+        throw error;
+      },
+    };
+  };
+
+  it("a 4xx from registration blocks with a visible error and no retry (M10)", async () => {
+    const device = rejecting(new DeviceRegistrationError("device registration failed (403)", 403));
+    const r = rig({ deps: { ensureDevice: device.ensureDevice } });
+    await settle(120_000);
+    expect(device.calls()).toBe(1);
+    expect(r.state()).toMatchObject({ status: "closed", lastError: { code: "device_registration_rejected" } });
+  });
+
+  it("a 429 or a network error from registration retries with backoff", async () => {
+    const limited = rejecting(new DeviceRegistrationError("device registration failed (429)", 429));
+    rig({ deps: { ensureDevice: limited.ensureDevice } });
+    await settle(10_000);
+    expect(limited.calls()).toBeGreaterThan(1);
+    const offline = rejecting(new TypeError("network"));
+    rig({ deps: { ensureDevice: offline.ensureDevice } });
+    await settle(10_000);
+    expect(offline.calls()).toBeGreaterThan(1);
+  });
+
+  it("a device key that cannot be unlocked blocks with a visible error and no retry (L8)", async () => {
+    const device = rejecting(new DeviceKeyError("the device key cannot be unlocked"));
+    const r = rig({ deps: { ensureDevice: device.ensureDevice } });
+    await settle(120_000);
+    expect(device.calls()).toBe(1);
+    expect(r.state()).toMatchObject({ status: "closed", lastError: { code: "device_key_unreadable" } });
+  });
+});
+
+describe("review fixes: watches on pending", () => {
+  it("a confirmed to pending state stops the open watches and reopens one per slot on confirm (M6, L4)", async () => {
+    const original = LinkSession.prototype.watch;
+    let stops = 0;
+    let opened = 0;
+    vi.spyOn(LinkSession.prototype, "watch").mockImplementation(async function (this: LinkSession, ...args: Parameters<LinkSession["watch"]>) {
+      opened += 1;
+      const handle = await original.apply(this, args);
+      const stop = handle.stop;
+      (handle as { stop: () => void }).stop = () => {
+        stops += 1;
+        stop();
+      };
+      return handle;
+    });
+    const r = await ready();
+    r.connection.registerWatch({ method: "conversation.watch", reopenParams: () => ({ conversationId: "sess-local-approval" }), onFrame: () => undefined });
+    await settle();
+    expect(opened).toBe(1);
+    r.desktop.setDevice(fingerprint(r.deviceKey.publicKey), { status: "pending" });
+    await settle();
+    expect(r.state().status).toBe("pending");
+    expect(stops).toBe(1);
+    r.desktop.confirmDevice(fingerprint(r.deviceKey.publicKey), "control");
+    await settle();
+    expect(r.state().status).toBe("ready");
+    expect(opened).toBe(2);
+    expect(stops).toBe(1);
   });
 });

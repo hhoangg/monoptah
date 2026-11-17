@@ -76,3 +76,31 @@ export function idbUpdate<T, R>(store: LinkStore, key: string, fn: (current: T |
     return result;
   });
 }
+
+/**
+ * Adds every entry in ONE readwrite transaction with `add` (never overwrites). Resolves true when all
+ * were written, false when any key already existed (nothing is written then).
+ */
+export async function idbAddAll(store: LinkStore, entries: ReadonlyArray<readonly [string, unknown]>): Promise<boolean> {
+  const db = await openLinkDb();
+  try {
+    return await new Promise<boolean>((resolve, reject) => {
+      const tx = db.transaction([store], "readwrite");
+      let conflict = false;
+      tx.oncomplete = () => resolve(true);
+      tx.onabort = () => (conflict ? resolve(false) : reject(tx.error ?? new Error("IndexedDB transaction aborted")));
+      const os = tx.objectStore(store);
+      for (const [key, value] of entries) {
+        const req = os.add(value, key);
+        req.onerror = (event) => {
+          if (req.error?.name !== "ConstraintError") return;
+          conflict = true;
+          event.preventDefault();
+          tx.abort();
+        };
+      }
+    });
+  } finally {
+    db.close();
+  }
+}

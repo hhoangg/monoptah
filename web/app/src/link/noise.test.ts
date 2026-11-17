@@ -307,3 +307,20 @@ describe("Monoptah helpers", () => {
     expect(fingerprint(key.publicKey)).toMatch(/^[0-9a-f]{64}$/);
   });
 });
+
+describe("CipherState.destroy (L7)", () => {
+  it("zeroes the key and refuses to pass data through afterwards", () => {
+    const state = new CipherState(new Uint8Array(32).fill(7));
+    state.destroy();
+    expect(state.hasKey()).toBe(false);
+    expect(() => state.encryptWithAd(new Uint8Array(), new Uint8Array([1]))).toThrow(NoiseError);
+    expect(() => state.decryptWithAd(new Uint8Array(), new Uint8Array([1]))).toThrow(NoiseError);
+    expect(() => state.rekey()).toThrow(NoiseError);
+  });
+
+  it("generateKeyPair does not touch a caller's seed", () => {
+    const seed = new Uint8Array(32).fill(9);
+    generateKeyPair(seed);
+    expect(seed.every((byte) => byte === 9)).toBe(true);
+  });
+});

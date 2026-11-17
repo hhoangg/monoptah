@@ -442,4 +442,42 @@ describe("relay signals", () => {
     expect(r.s.lastFrameAt).toBe(5_000);
     expect(first).toBeLessThanOrEqual(1_000);
   });
+
+  it("lastFrameAt ignores CTRL frames and other channels, and onActivity follows the accepted frames (M1, L10)", async () => {
+    let clock = 1_000;
+    let activity = 0;
+    const r = await connected({ session: { now: () => clock, onActivity: () => void (activity += 1) } });
+    const base = activity;
+    // Another tab's channel on the same socket.
+    clock = 9_000;
+    r.socket.onmessage?.(encodeFrame({ type: FrameType.BYE, channel: 99, deviceId: DEVICE_ID }));
+    expect(r.s.lastFrameAt).toBeLessThanOrEqual(1_000);
+    // A presence CTRL frame.
+    r.desktop.close();
+    await r.relay.settled();
+    expect(r.presence).toContain("offline");
+    expect(r.s.lastFrameAt).toBeLessThanOrEqual(1_000);
+    expect(activity).toBe(base);
+  });
+
+  it("the session owns and zeroes the device private key once the handshake is over (L5)", async () => {
+    const key = generateKeyPair();
+    const copy = { privateKey: key.privateKey.slice(), publicKey: key.publicKey.slice() };
+    const relay = new InMemoryRelay();
+    const desktop = new MockDesktop({ desktopId: DESKTOP_ID });
+    desktop.setDevice(fingerprint(key.publicKey), { status: "confirmed", permission: "control" });
+    desktop.attach(relay.connectDesktop());
+    const session = await LinkSession.connect({
+      relay: new RelayConnection(relay.connectDevice(DEVICE_ID)),
+      desktopId: DESKTOP_ID,
+      deviceId: DEVICE_ID,
+      desktopPublicKey: desktop.publicKey,
+      deviceKey: copy,
+      deviceName: "Test browser",
+      userAgent: "vitest",
+    });
+    expect(session.ready).toBe(true);
+    expect(copy.privateKey.every((byte) => byte === 0)).toBe(true);
+    expect((await session.request("workspace.list")).projects).toHaveLength(2);
+  });
 });

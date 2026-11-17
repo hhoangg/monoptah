@@ -100,9 +100,11 @@ export class SecureChannel {
     return result;
   }
 
-  /** Drops partial messages (session ended). */
+  /** Drops partial messages and zeroes the cipher keys (session ended; the channel is unusable afterwards). */
   reset(): void {
     this.#reassembler.reset();
+    this.#send.destroy();
+    this.#recv.destroy();
   }
 
   #rekeyDue(): boolean {

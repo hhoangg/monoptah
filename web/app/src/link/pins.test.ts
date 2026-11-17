@@ -1,7 +1,7 @@
 import { IDBFactory } from "fake-indexeddb";
 import { beforeEach, describe, expect, it } from "vitest";
 import { displayFingerprint, fingerprint, normalizeFingerprint } from "./fingerprint.ts";
-import { checkPin, forgetPins, getPin, repinFromVerify } from "./pins.ts";
+import { checkPin, commitPin, forgetPins, getPin, inspectPin, repinFromVerify } from "./pins.ts";
 
 const keyA = new Uint8Array(32).fill(1);
 const keyB = new Uint8Array(32).fill(2);
@@ -72,5 +72,17 @@ describe("fingerprint display", () => {
     expect(normalizeFingerprint(hex.toUpperCase())).toBe(hex);
     expect(normalizeFingerprint(hex.slice(0, 32))).toBeNull();
     expect(normalizeFingerprint("z".repeat(64))).toBeNull();
+  });
+
+  it("inspectPin never writes, and commitPin pins a first-use key atomically (L2)", async () => {
+    expect(await inspectPin(DESKTOP, keyA)).toEqual({ status: "new", pinnedFingerprint: null });
+    expect(await getPin(DESKTOP)).toBeUndefined();
+    expect(await commitPin(DESKTOP, keyA)).toBe("pinned-now");
+    expect(await inspectPin(DESKTOP, keyA)).toMatchObject({ status: "match", pinnedFingerprint: (await getPin(DESKTOP))?.fingerprint });
+    expect(await inspectPin(DESKTOP, keyB)).toMatchObject({ status: "changed" });
+    // A pin that appeared meanwhile wins and is never replaced.
+    expect(await commitPin(DESKTOP, keyA)).toBe("match");
+    expect(await commitPin(DESKTOP, keyB)).toBe("changed");
+    expect(Array.from((await getPin(DESKTOP))?.publicKey ?? [])).toEqual(Array.from(keyA));
   });
 });

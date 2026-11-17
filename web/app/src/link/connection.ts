@@ -5,7 +5,10 @@
 //
 // Rules kept here: a request never queues and is never re-sent after a reconnect (it rejects with
 // `not_ready` or `session_ended`); every reconnect is a fresh Noise session; the device private key is
-// read at handshake time only and never stored; the store gets public information only.
+// copied for the handshake and zeroed right after, never stored; the store gets public information only.
+// A BYE or relay ERROR before any `state` is unauthenticated: it blocks with `desktop_refused`, it never
+// sets `revoked` (which also wipes the persisted cache). Only an encrypted `state: "revoked"` and the
+// close code 4003 do.
 import {
   CloseCodes,
   DEAD_AFTER_MS,
@@ -23,9 +26,9 @@ import { randomBytes } from "@noble/hashes/utils.js";
 import { base64UrlDecode } from "./base64url.ts";
 import { DeviceRegistrationError, deviceNameFromUserAgent, ensureDevice, type DeviceIdentity } from "./device.ts";
 import { fingerprint } from "./fingerprint.ts";
-import { getDeviceKeyPair } from "./keys.ts";
+import { DeviceKeyError, getDeviceKeyPair } from "./keys.ts";
 import type { KeyPair } from "./noise.ts";
-import { checkPin } from "./pins.ts";
+import { commitPin, inspectPin, type PinCheck, type PinInspection } from "./pins.ts";
 import { RelayConnectError, openRelay, type RelayConnection } from "./relay.ts";
 import {
   LinkRequestError,
@@ -46,6 +49,8 @@ export const BACKOFF_MAX_MS = 30_000;
 export const BACKOFF_RESET_AFTER_READY_MS = 10_000;
 /** Wait for the close codes whose reaction is `backoff_60s`. */
 export const BACKOFF_LONG_MS = 60_000;
+/** `store.lastFrameAt` is refreshed at most this often (`connection.lastFrameAt` is exact). */
+export const FRAME_STORE_THROTTLE_MS = 5_000;
 
 /** `min(30 s, 0.5 s * 2^n) * random(0.5..1)`. */
 export function backoffDelay(attempt: number, random: () => number = Math.random): number {
@@ -88,7 +93,12 @@ export interface LinkConnectionDeps {
   openRelay?: (desktopId: string, deviceId: string) => Promise<RelayConnection>;
   ensureDevice?: () => Promise<DeviceIdentity>;
   getDeviceKeyPair?: () => Promise<KeyPair>;
-  checkPin?: typeof checkPin;
+  /** Replaces the whole pin step (tests). It must pin by itself: the connection does not commit after it. */
+  checkPin?: (desktopId: string, directoryPublicKey: Uint8Array) => Promise<PinCheck>;
+  /** Reads the pin without writing (default `inspectPin`). */
+  inspectPin?: typeof inspectPin;
+  /** Pins a first-use key after the handshake with it succeeded (default `commitPin`). */
+  commitPin?: typeof commitPin;
   connectSession?: (options: LinkSessionOptions) => Promise<LinkSession>;
   now?: () => number;
   random?: () => number;
@@ -136,6 +146,8 @@ interface WatchSlot {
   registration: WatchRegistration;
   handle: WatchHandle | null;
   opening: boolean;
+  /** Bumped on every open and every drop: an ack of an older open is stopped, not kept. */
+  token: number;
 }
 
 export class LinkConnection {
@@ -160,6 +172,9 @@ export class LinkConnection {
   #waiting = false;
   #failures = 0;
   #quickUsed = false;
+  /** One automatic retry of `desktop_refused` on the next visible transition. */
+  #refusedRetried = false;
+  #lastStoredFrameAt = 0;
   #retrying = false;
   #sessionCount = 0;
   #needsResync = false;
@@ -225,7 +240,7 @@ export class LinkConnection {
   /** Registers a watch: opened now when `ready`, and reopened after every reconnect. */
   registerWatch(registration: WatchRegistration): WatchRegistrationHandle {
     const id = this.#nextWatchId++;
-    this.#watches.set(id, { registration, handle: null, opening: false });
+    this.#watches.set(id, { registration, handle: null, opening: false, token: 0 });
     this.#syncWatchInfo();
     if (this.status === "ready") this.#openWatch(id);
     return {
@@ -254,6 +269,7 @@ export class LinkConnection {
     this.#stopped = false;
     this.#failures = 0;
     this.#quickUsed = false;
+    this.#refusedRetried = false;
     this.store.setState({ blocked: null, revoked: false, lastError: null });
     this.#reconnectNow();
   }
@@ -264,6 +280,8 @@ export class LinkConnection {
     this.#stopped = false;
     this.#failures = 0;
     this.#quickUsed = false;
+    this.#refusedRetried = false;
+    this.#lastStoredFrameAt = 0;
     this.#retrying = false;
     this.#sessionCount = 0;
     this.#needsResync = false;
@@ -280,6 +298,10 @@ export class LinkConnection {
     globalThis.removeEventListener?.("online", this.#onOnline);
     this.#clearTimers();
     this.#teardown();
+    // An attempt that is still awaiting must not block the next `start()`: its callbacks are stale (the
+    // generation moved) and its `finally` must not clear the flag of the new attempt (the token moved).
+    this.#attempting = false;
+    this.#attemptToken += 1;
     this.#waiting = false;
     this.store.setState({ status: "idle", nextAttemptAt: null });
   }
@@ -322,7 +344,12 @@ export class LinkConnection {
       device = await (this.#deps.ensureDevice ?? ensureDevice)();
     } catch (error) {
       if (this.#isStale(gen)) return;
-      if (error instanceof DeviceRegistrationError && error.status === 401) return this.#block("login_required");
+      if (error instanceof DeviceRegistrationError) {
+        if (error.status === 401) return this.#block("login_required");
+        // A 4xx such as quota_exceeded, or an answer that cannot be used: retrying cannot help.
+        if (error.terminal) return this.#terminal({ code: "device_registration_rejected" });
+      }
+      if (error instanceof DeviceKeyError && error.code === "unreadable") return this.#terminal({ code: "device_key_unreadable" });
       return this.#fail({ code: "device_registration" }, { kind: "retry", delay: "backoff" });
     }
     if (this.#isStale(gen)) return;
@@ -340,20 +367,27 @@ export class LinkConnection {
     }
     if (this.#isStale(gen)) return;
 
-    let pin: Awaited<ReturnType<typeof checkPin>>;
+    let pin: PinInspection;
     try {
-      pin = await (this.#deps.checkPin ?? checkPin)(this.desktopId, directory.publicKey);
+      pin = await this.#inspectPin(directory);
     } catch {
+      if (this.#isStale(gen)) return;
       return this.#fail({ code: "pin_storage" }, { kind: "retry", delay: "backoff" });
     }
     if (this.#isStale(gen)) return;
-    this.store.setState({ desktopFingerprint: directory.fingerprint, desktopName: directory.name, presence: directory.online ? "online" : "offline" });
+    // The fingerprint shown as "this desktop" is the PINNED key's. A first-use key is shown once it is pinned.
+    this.store.setState({
+      desktopName: directory.name,
+      presence: directory.online ? "online" : "offline",
+      ...(pin.pinnedFingerprint === null ? {} : { desktopFingerprint: pin.pinnedFingerprint }),
+    });
     // A changed key never reaches a socket.
-    if (pin === "changed") return this.#block("key_changed");
+    if (pin.status === "changed") return this.#block("key_changed");
 
     let relay: RelayConnection;
     try {
-      relay = await (this.#deps.openRelay ?? ((desktopId, deviceId) => openRelay({ desktopId, deviceId })))(this.desktopId, device.deviceId);
+      const open = this.#deps.openRelay ?? ((desktopId, deviceId) => openRelay({ desktopId, deviceId, openTimeoutMs: this.#deps.sessionOptions?.readyTimeoutMs }));
+      relay = await open(this.desktopId, device.deviceId);
     } catch (error) {
       if (this.#isStale(gen)) return;
       const closeCode = error instanceof RelayConnectError ? error.closeCode : undefined;
@@ -366,9 +400,11 @@ export class LinkConnection {
 
     this.store.setState({ status: this.#retrying ? "reconnecting" : "handshaking" });
     let session: LinkSession;
+    let deviceKey: KeyPair | null = null;
     try {
-      // The key is used for the handshake only and is not kept anywhere.
-      const deviceKey = await (this.#deps.getDeviceKeyPair ?? getDeviceKeyPair)();
+      // A copy for the handshake only: the session zeroes it, and so does the `finally` below.
+      const stored = await (this.#deps.getDeviceKeyPair ?? getDeviceKeyPair)();
+      deviceKey = { privateKey: stored.privateKey.slice(), publicKey: stored.publicKey.slice() };
       session = await (this.#deps.connectSession ?? LinkSession.connect)({
         relay,
         desktopId: this.desktopId,
@@ -379,6 +415,7 @@ export class LinkConnection {
         deviceName: deviceNameFromUserAgent(),
         now: this.#deps.now,
         ...this.#deps.sessionOptions,
+        onActivity: () => this.#noteFrame(gen),
         onState: (state) => this.#onState(gen, state),
         onEnd: (reason, detail) => this.#onEnd(gen, reason, detail),
         onPresence: (presence) => {
@@ -391,17 +428,55 @@ export class LinkConnection {
     } catch (error) {
       relay.close();
       if (this.#isStale(gen)) return;
+      if (error instanceof DeviceKeyError && error.code === "unreadable") return this.#terminal({ code: "device_key_unreadable" });
       if (error instanceof LinkSessionError) return this.#failFromSession(error.reason, error.detail, false);
       return this.#fail({ code: "handshake_failed" }, { kind: "retry", delay: "backoff" });
+    } finally {
+      deviceKey?.privateKey.fill(0);
     }
     if (this.#isStale(gen)) {
       session.close();
       return;
     }
+    // The handshake with this key succeeded, so a first-use key is pinned now (not before).
+    if (pin.status === "new" && !this.#deps.checkPin) {
+      let committed: Awaited<ReturnType<typeof commitPin>>;
+      try {
+        committed = await (this.#deps.commitPin ?? commitPin)(this.desktopId, directory.publicKey);
+      } catch {
+        return this.#dropNewSession(gen, session, () => this.#fail({ code: "pin_storage" }, { kind: "retry", delay: "backoff" }));
+      }
+      if (committed === "changed") return this.#dropNewSession(gen, session, () => this.#block("key_changed"));
+      if (this.#isStale(gen)) {
+        session.close();
+        return;
+      }
+    }
+    this.store.setState({ desktopFingerprint: directory.fingerprint });
     this.#session = session;
     this.#sessionCount += 1;
     if (this.#sessionCount > 1) this.#needsResync = true;
     this.#reactToState();
+  }
+
+  /** The pin step: read-only unless a test replaces it with `checkPin`. */
+  async #inspectPin(directory: Directory): Promise<PinInspection> {
+    if (this.#deps.checkPin) {
+      const check = await this.#deps.checkPin(this.desktopId, directory.publicKey);
+      return { status: check === "changed" ? "changed" : "match", pinnedFingerprint: check === "changed" ? null : directory.fingerprint };
+    }
+    return (this.#deps.inspectPin ?? inspectPin)(this.desktopId, directory.publicKey);
+  }
+
+  /** Ends a session that was never adopted (its callbacks must not run), then applies the outcome. */
+  #dropNewSession(gen: number, session: LinkSession, outcome: () => void): void {
+    if (this.#isStale(gen)) {
+      session.close();
+      return;
+    }
+    this.#gen += 1;
+    session.close();
+    outcome();
   }
 
   async #fetchDirectory(): Promise<Directory> {
@@ -430,6 +505,14 @@ export class LinkConnection {
 
   // --- Session callbacks ---
 
+  #noteFrame(gen: number): void {
+    if (gen !== this.#gen) return;
+    const now = this.#deps.now();
+    if (now - this.#lastStoredFrameAt < FRAME_STORE_THROTTLE_MS) return;
+    this.#lastStoredFrameAt = now;
+    this.store.setState({ lastFrameAt: now });
+  }
+
   #onState(gen: number, state: StateMessage): void {
     if (gen !== this.#gen) return;
     this.#latestState = state;
@@ -449,18 +532,22 @@ export class LinkConnection {
       proto: state.proto ?? this.store.getState().proto,
       lastFrameAt: session.lastFrameAt,
     });
-    if (state.proto !== undefined && state.proto > PROTOCOL_VERSION) return this.#block("proto_desktop_newer");
+    this.#lastStoredFrameAt = session.lastFrameAt;
+    if (state.proto !== undefined && state.proto > PROTOCOL_VERSION) return this.#block("web_outdated");
+    if (state.proto !== undefined && state.proto < PROTOCOL_VERSION) return this.#block("desktop_outdated");
     if (state.state === "revoked") return this.#block("revoked", { revoked: true });
     if (state.state === "pending") {
       // A pending state is shown as it comes; it is never cached as confirmed.
       this.#clearReadyTimer();
-      this.#dropWatchHandles();
+      // The desktop keeps a watch until it is told to stop (cap per device): cancel them before dropping.
+      this.#dropWatchHandles(true);
       this.store.setState({ status: "pending", lastError: null });
       return;
     }
     if (this.status === "ready") return;
     this.store.setState({ status: "ready", lastError: null });
     this.#retrying = false;
+    this.#refusedRetried = false;
     this.#clearReadyTimer();
     this.#readyTimer = setTimeout(() => {
       this.#readyTimer = null;
@@ -490,14 +577,18 @@ export class LinkConnection {
   #failFromSession(reason: LinkEndReason, detail: LinkEndDetail, afterReady = false): void {
     switch (reason) {
       case "bye":
-        // BYE before any state: the desktop refuses this device (3.3, 6.3 "Revoked: BYE immediately").
-        // After ready it is a desktop restart: reconnect, and the next BYE-before-state blocks.
+        // After ready it is a desktop restart: reconnect. Before any `state` the BYE is unauthenticated
+        // (a wrong key, a stale channel, a revoked device all look the same): it blocks as `desktop_refused`,
+        // never as revoked, and wipes nothing. A user reconnect or the next visible transition tries once more.
         if (afterReady) return this.#fail({ code: "bye" }, { kind: "retry", delay: "backoff" });
-        return this.#block("revoked", { revoked: true });
+        return this.#block("desktop_refused", { error: { code: "bye" } });
       case "unsupported_proto":
-        return this.#block("proto_desktop_newer");
+        return this.#block("web_outdated");
+      case "desktop_proto_older":
+        return this.#block("desktop_outdated");
       case "relay_error":
-        if (detail.relayCode === "unsupported_version") return this.#block("proto_desktop_older");
+        // errors.ts: the desktop refuses an OLDER web prologue, so the web app is the outdated side.
+        if (detail.relayCode === "unsupported_version") return this.#block("web_outdated");
         if (detail.relayCode === "desktop_offline") this.store.setState({ presence: "offline" });
         return this.#fail({ code: detail.relayCode ?? "relay_error" }, { kind: "retry", delay: "backoff" });
       case "relay_closed":
@@ -560,7 +651,16 @@ export class LinkConnection {
   // --- Reconnect triggers ---
 
   readonly #onVisibility = (): void => {
-    if (!this.#running || this.#stopped || globalThis.document?.hidden === true) return;
+    if (!this.#running || globalThis.document?.hidden === true) return;
+    if (this.#stopped) {
+      if (this.store.getState().blocked === "desktop_refused" && !this.#refusedRetried) {
+        this.#refusedRetried = true;
+        this.#stopped = false;
+        this.store.setState({ blocked: null, lastError: null });
+        this.#reconnectNow();
+      }
+      return;
+    }
     if (this.#waiting || (this.#timer !== null && !this.#longWait)) {
       this.#clearTimer();
       void this.#attempt();
@@ -578,6 +678,8 @@ export class LinkConnection {
   #isDead(): boolean {
     const session = this.#session;
     if (!session || session.ended) return true;
+    // A pending session has no traffic at all (no requests, no watches): silence proves nothing.
+    if (this.status === "pending") return false;
     return this.#deps.now() - session.lastFrameAt > this.#deps.staleAfterMs;
   }
 
@@ -607,6 +709,7 @@ export class LinkConnection {
     const registration = slot.registration;
     slot.opening = true;
     const gen = this.#gen;
+    const token = ++slot.token;
     const params = registration.reopenParams();
     session
       .watch(registration.method, params, registration.onFrame, {
@@ -619,16 +722,16 @@ export class LinkConnection {
         },
       })
       .then((handle) => {
-        slot.opening = false;
-        if (gen !== this.#gen || this.#watches.get(id) !== slot) {
+        if (slot.token === token) slot.opening = false;
+        if (gen !== this.#gen || this.#watches.get(id) !== slot || slot.token !== token) {
           handle.stop();
           return;
         }
         slot.handle = handle;
       })
       .catch((error: unknown) => {
-        slot.opening = false;
-        if (gen !== this.#gen) return;
+        if (slot.token === token) slot.opening = false;
+        if (gen !== this.#gen || slot.token !== token) return;
         registration.onError?.(error instanceof LinkRequestError ? error : new LinkRequestError("The watch could not be opened", "session_ended"));
       });
   }
@@ -646,10 +749,13 @@ export class LinkConnection {
     this.#openWatch(id);
   }
 
-  #dropWatchHandles(): void {
+  /** Forgets the open watches (`stop` first cancels them on the desktop) and invalidates opens in flight. */
+  #dropWatchHandles(stop = false): void {
     for (const slot of this.#watches.values()) {
+      if (stop) slot.handle?.stop();
       slot.handle = null;
       slot.opening = false;
+      slot.token += 1;
     }
   }
 
