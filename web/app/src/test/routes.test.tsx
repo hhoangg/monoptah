@@ -1,6 +1,7 @@
 import { QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, RouterProvider } from "@tanstack/react-router";
 import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it } from "vitest";
 import { setApiTransport } from "@/features/accounts/api";
 import { isPublicPath } from "@/features/accounts/authGuard";
@@ -174,7 +175,7 @@ describe("route stubs", () => {
     expect(screen.getByRole("link", { name: /Back to Monoptah/ })).toHaveAttribute("href", "/");
   });
 
-  it("sends a signed-in visitor of /login on to the redirect target", async () => {
+  it("shows who is signed in on /login and continues to the redirect target on request", async () => {
     restoreTransport?.();
     restoreTransport = setApiTransport(createMockServer({ signedIn: true }).transport);
     const queryClient = createQueryClient();
@@ -184,8 +185,26 @@ describe("route stubs", () => {
         <RouterProvider router={router} />
       </QueryClientProvider>,
     );
+    expect(await screen.findByText(/Signed in as .* \(@dev-user\)/)).toBeInTheDocument();
+    expect(router.state.location.pathname).toBe("/login");
+    await userEvent.click(screen.getByRole("button", { name: "Continue" }));
     await screen.findByRole("heading", { level: 1, name: "Settings" });
     expect(router.state.location.pathname).toBe("/settings");
+  });
+
+  it("offers a different passkey on /login: signs out and shows the sign-in button", async () => {
+    restoreTransport?.();
+    restoreTransport = setApiTransport(createMockServer({ signedIn: true }).transport);
+    const queryClient = createQueryClient();
+    const router = createAppRouter({ history: createMemoryHistory({ initialEntries: ["/login"] }), queryClient });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <RouterProvider router={router} />
+      </QueryClientProvider>,
+    );
+    await userEvent.click(await screen.findByRole("button", { name: "Sign in with a different passkey" }));
+    expect(await screen.findByRole("button", { name: /Sign in with passkey/ })).toBeInTheDocument();
+    expect(router.state.location.pathname).toBe("/login");
   });
 
   it("covers every route file of the generated route tree", async () => {

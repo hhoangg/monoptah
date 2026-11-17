@@ -1,4 +1,4 @@
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "@tanstack/react-router";
 import { useState } from "react";
 import { AuthLayout } from "@/ui/AuthLayout";
@@ -10,7 +10,7 @@ import { PageHeader } from "@/ui/PageHeader";
 import { SettingsCard, SettingsRow } from "@/ui/SettingsCard";
 import { signInErrorMessage, UNSUPPORTED_ERROR } from "./authCopy";
 import { postSignInTarget } from "./redirect";
-import { signIn } from "./queries";
+import { meQuery, signIn, signOut } from "./queries";
 import { passkeysSupported } from "./webauthn";
 
 export function LoginScreen({ redirect }: { redirect?: string }) {
@@ -20,6 +20,22 @@ export function LoginScreen({ redirect }: { redirect?: string }) {
   const [error, setError] = useState<string | null>(null);
   const [cancelled, setCancelled] = useState(false);
   const supported = passkeysSupported();
+  // /login never redirects on its own: a visitor with a session (possibly a stale one, when the
+  // desktop link asked for a sign-in) chooses to continue or to sign in with another passkey.
+  const me = useQuery({ ...meQuery, retry: false });
+  const [differentPasskey, setDifferentPasskey] = useState(false);
+  const account = me.data && !me.data.recoveryOnly && !differentPasskey ? me.data.user : null;
+
+  async function switchPasskey() {
+    setBusy(true);
+    try {
+      await signOut(queryClient);
+    } catch {
+      // The local state is cleared in signOut's finally block either way.
+    }
+    setDifferentPasskey(true);
+    setBusy(false);
+  }
 
   async function submit() {
     setBusy(true);
@@ -37,6 +53,23 @@ export function LoginScreen({ redirect }: { redirect?: string }) {
     } finally {
       setBusy(false);
     }
+  }
+
+  if (account) {
+    return (
+      <AuthLayout>
+        <PageHeader size="display" title="Sign in to Monoptah" description={`Signed in as ${account.displayName} (@${account.handle})`} />
+        <div className="flex flex-col gap-2">
+          <Button type="button" size="lg" className="w-full" disabled={busy} onClick={() => void router.navigate({ href: postSignInTarget(redirect) })}>
+            Continue
+          </Button>
+          <Button type="button" variant="outline" size="lg" className="w-full" disabled={busy} aria-busy={busy} onClick={() => void switchPasskey()}>
+            Sign in with a different passkey
+            {busy ? <DelayedSpinner label="Signing out" /> : null}
+          </Button>
+        </div>
+      </AuthLayout>
+    );
   }
 
   return (
