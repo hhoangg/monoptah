@@ -69,7 +69,7 @@ Out of scope: a compromised desktop OS, a compromised user browser or OS, Cloudf
 ### 3.2 Recovery codes
 
 - 10 codes, each 16 characters of Crockford base32 (80 bits of entropy) shown as `xxxx-xxxx-xxxx-xxxx`. Shown once at registration (and on regenerate), with a "I saved these" gate and a copy/download action.
-- **Hash: HMAC-SHA-256 with a server-side pepper (`RECOVERY_PEPPER` secret), stored as hex in `recovery_codes.code_hash`.** Justification: the codes are high entropy (80 bits), so offline guessing after a database leak is infeasible even with a fast hash; a slow KDF buys nothing. Argon2 is not available in Workers without shipping WASM that would exceed the 10 ms free-plan CPU limit; PBKDF2 is available but would also strain that limit for no benefit. The pepper means a D1 leak alone cannot even be used to test guesses. Comparison is constant time.
+- **Hash: HMAC-SHA-256 with a server-side pepper (`RECOVERY_PEPPER` secret), stored as hex in `recovery_codes.code_hash`.** Justification: the codes are high entropy (80 bits), so offline guessing after a database leak is infeasible even with a fast hash; a slow KDF buys nothing. Argon2 is not available in Workers without shipping WASM that would exceed the 10 ms free-plan CPU limit; PBKDF2 is available but would also strain that limit for no benefit. The pepper means a D1 leak alone cannot even be used to test guesses. Recovery looks the code up by equality on the keyed hash in an indexed query (`recovery_codes.code_hash` joined to the handle's user), not with a byte-by-byte compare, so timing reveals nothing usable without the pepper: an attacker who cannot compute the HMAC cannot choose inputs whose lookup time leaks a stored hash.
 - One-time: a used code gets `used_at`; `POST /api/auth/recover {handle, code}` consumes it and creates a `sessions` row with `recovery_only = 1`. That session can only add a passkey (`POST /api/passkeys/options|verify`) and view recovery status; all other sessions of the user are revoked, an `audit_log` entry is written, and the user is told how many codes remain.
 - Regenerate: `POST /api/recovery-codes/regenerate` requires a fresh passkey assertion; it invalidates all old codes in one transaction (new `batch`) and returns 10 new ones once.
 - Rate limits: 5 recovery attempts per hour per handle and 20 per hour per IP; failures are uniform (same response time and message for unknown handle and wrong code).
@@ -94,13 +94,23 @@ The groups below the last row use the D1 `rate_limits` table (fixed windows; low
 
 | Endpoint group | Limit |
 |---|---|
-| `register/options`, `register/verify` | 10 per IP per hour; per invite code 5 attempts |
+| `register/options`, `register/verify` | 10 per IP per hour; per invite code 5 attempts per hour, counted over both routes together |
 | `login/options`, `login/verify` | 30 per IP per 10 min |
 | `auth/recover` | 5 per handle per hour, 20 per IP per hour |
-| `pair/start` | 5 per IP per 10 min, 3 outstanding per IP |
-| `pair/poll` | 1 per `interval` (3 s) per `deviceCode` |
-| `push/notify` | 30 per desktop token per minute |
+| `pair/start` | 5 per IP per 10 min, 3 outstanding per IP (pending and unexpired requests, `limitOutstandingPairings`) |
+| `pair/poll` | 1 per `interval` (3 s) per `deviceCode`; WS-A addition: 120 per IP per minute, checked first |
+| `push/notify` | 30 per desktop token per minute; WS-A addition: 120 per IP per minute, checked first |
 | Everything else authenticated | 120 per session per minute (in memory, per isolate, best effort) |
+
+How the D1 limiter spends writes (WS-A):
+
+- A refused call does not write. The counter update is conditional on `count <= limit`: the first refused call of a window writes once (count = limit + 1, and that call writes the `ratelimit.breach` audit row), every later refused call in the window writes nothing. A flood against one key therefore costs the writes of the allowed calls plus one counter write and one audit row for the breach in the window, not one write per request.
+- `pair/poll` and `push/notify` are keyed by values the caller chooses (a `deviceCode`, a bearer token), so a single address could mint unlimited keys. The per-IP bound (120 per minute, the WS-A addition in the table) is counted before the per-code and per-token key, and the per-code or per-token key is not touched once the IP bound refuses.
+- Every D1 per-IP group has an in-memory pre-filter in front of it (per isolate, bounded table of 5,000 keys, same limit and window as the D1 limit, best effort like the session limit). When it already refuses, the answer is `429` without any D1 call; the call that first exceeds the limit still reaches D1 so the breach is audited once.
+- IPv4 clients are keyed by the full address. IPv6 clients are keyed by their /64 prefix (the text is normalized first: lowercase, `::` expanded, zone id dropped; an IPv4-mapped `::ffff:a.b.c.d` is the IPv4 address), because one subscriber normally holds a whole /64 and could otherwise mint endless keys. The audit `ipHash` and `pairing_requests.ip_hash` use the same key.
+- The recovery per-handle limit is a known lockout vector: anyone who knows a handle can spend its 5 attempts per hour and keep the owner from using a recovery code for that hour. Accepted: recovery is rare, the attempts do not touch the account itself, and the UI tells the user to try again later.
+
+Remaining risk: counting in D1 cannot protect the global 100,000 writes per day of the free plan against a distributed attacker. Many addresses each get their own first-window writes (the limits above bound each address, not the total), so enough sources can still exhaust the daily budget and stop every write, including sign-in. The maintainer may add a Cloudflare WAF rate limiting rule on `/api/auth/*`, `/api/pair/*` and `/api/push/notify`, which blocks at the edge before the Worker runs and so costs no D1 write. Whether such a rule is available on the free plan is unverified (https://developers.cloudflare.com/waf/rate-limiting-rules/, not read for plan limits); this document does not claim it is free. Until then the response is the pause switch (section 4) and the 70% rule of capacity.md section 4.
 
 Exceeded limits return `429` with `Retry-After`; repeated breaches are written to `audit_log`.
 
@@ -121,7 +131,7 @@ Exceeded limits return `429` with `Retry-After`; repeated breaches are written t
 - Quota: each user has `invites_granted` (default 3) minus invites created; revoked-unused invites free a slot, used ones do not. Admin can grant more (`POST /api/admin/users/:id/invites`).
 - Invite tree: `users.invited_by` and `users.invite_id` record who invited whom. The first admin comes from a `bootstrap` invite created by the self-host or ops script (architecture.md section 9).
 - **Block semantics**: `POST /api/admin/users/:id/block` with `cascade: true` blocks the user and every descendant in the invite tree (recursive CTE over `invited_by`), setting `status = 'blocked'`, `blocked_via` = the root user id. Effects, applied in one batch: delete all their sessions, revoke all desktop tokens and device grants, delete push subscriptions, close their relay sockets (`4011`), revoke their unused invites, write `audit_log`. Data is kept for the audit trail. `cascade: false` blocks one user and leaves descendants untouched. Unblock is per user; unblocking the root does not unblock descendants (`blocked_via` lets the admin UI offer "unblock branch" as an explicit second action). Blocked users cannot log in, recover, or hold relay sockets. Implementation notes (A-09): the root of a cascade also gets `blocked_via` = its own id (a non-cascade block leaves it null); a member that is already blocked keeps its own reason and `blocked_via`; the acting admin is never blocked, even inside the branch; blocking yourself is `409 conflict`; the audit event is one `user.block` row for the root with `{cascade, count}` and never the reason text; `room.revoke({all: true}, 4011)` runs after the commit on at most 40 live desktops of the branch, and the relay re-checks the user `status` on join (WS-R). `POST /api/invites` answers `409 invites_paused` (gate) or `409 quota_exceeded` (no slot), and `POST /api/admin/users/:id/invites` stops at 1000 granted invites per user (`409 conflict`).
-- Admin page (`/admin`): list users with status and tree position, block (single or branch), grant invites, audit view. Admin routes need `role = 'admin'` and a fresh session. There is no admin access to content, because the server has none.
+- Admin page (`/admin`): list users with status and tree position, block (single or branch), grant invites, audit view. Admin routes need `role = 'admin'` and a fresh session. There is no admin access to content, because the server has none. Decision recorded for the maintainer, unchanged: an admin can block another admin (only blocking yourself is refused), so one admin can lock out the others; the cascade also skips only the acting admin.
 
 ## 5. End-to-end encryption
 

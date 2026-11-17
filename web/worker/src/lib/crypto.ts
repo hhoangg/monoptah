@@ -32,19 +32,3 @@ export async function hmacSha256Hex(key: string, data: string): Promise<string> 
   const cryptoKey = await crypto.subtle.importKey("raw", encoder.encode(key), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   return toHex(new Uint8Array(await crypto.subtle.sign("HMAC", cryptoKey, encoder.encode(data))));
 }
-
-/**
- * Constant-time equality of two byte arrays. The comparison time depends only on the length of the
- * longer input, never on where the first difference is. Different lengths are unequal.
- */
-export function timingSafeEqualBytes(a: Uint8Array, b: Uint8Array): boolean {
-  const length = Math.max(a.length, b.length);
-  let diff = a.length ^ b.length;
-  for (let i = 0; i < length; i += 1) diff |= (a[i] ?? 0) ^ (b[i] ?? 0);
-  return diff === 0;
-}
-
-/** Constant-time equality of two strings (for example two hex hashes), compared as UTF-8. */
-export function timingSafeEqualStrings(a: string, b: string): boolean {
-  return timingSafeEqualBytes(encoder.encode(a), encoder.encode(b));
-}

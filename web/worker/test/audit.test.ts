@@ -4,7 +4,7 @@ import { z } from "zod";
 import { AUDIT_ACTION_NAMES, AUDIT_ACTIONS, assertSafeMetaKeys, FORBIDDEN_META_KEYS, type AuditAction } from "../src/modules/audit/actions.ts";
 import { auditStatement, writeAudit, type AuditEvent } from "../src/modules/audit/audit.ts";
 import { clientIp, identifierHash, ipHash } from "../src/lib/ip.ts";
-import { hmacSha256Hex, randomToken, sha256Hex, timingSafeEqualBytes, timingSafeEqualStrings } from "../src/lib/crypto.ts";
+import { hmacSha256Hex, randomToken, sha256Hex } from "../src/lib/crypto.ts";
 
 const HASH = "a".repeat(64);
 
@@ -173,15 +173,6 @@ describe("lib helpers", () => {
     expect(await sha256Hex("abc")).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     // RFC 4231 test case 2.
     expect(await hmacSha256Hex("Jefe", "what do ya want for nothing?")).toBe("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
-  });
-
-  it("constant-time comparisons", () => {
-    expect(timingSafeEqualStrings("abc", "abc")).toBe(true);
-    expect(timingSafeEqualStrings("abc", "abd")).toBe(false);
-    expect(timingSafeEqualStrings("abc", "abcd")).toBe(false);
-    expect(timingSafeEqualBytes(new Uint8Array([1, 2]), new Uint8Array([1, 2]))).toBe(true);
-    expect(timingSafeEqualBytes(new Uint8Array([1, 2]), new Uint8Array([1, 3]))).toBe(false);
-    expect(timingSafeEqualBytes(new Uint8Array([]), new Uint8Array([]))).toBe(true);
   });
 
   it("clientIp reads CF-Connecting-IP and falls back to unknown", () => {
