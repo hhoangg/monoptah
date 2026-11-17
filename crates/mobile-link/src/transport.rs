@@ -833,6 +833,20 @@ mod tests {
         bytes
     }
 
+    /// An error answer as serde_json writes it. The key order of a JSON object
+    /// depends on whether `preserve_order` is unified into this build (the gpui
+    /// workspace does, the root workspace does not), so each mode is pinned
+    /// to its own exact literal, chosen by probing the active mode.
+    fn error_json(message: &str) -> String {
+        let insertion_ordered =
+            serde_json::to_string(&json!({"b":0,"a":0})).unwrap() == r#"{"b":0,"a":0}"#;
+        if insertion_ordered {
+            format!(r#"{{"ok":false,"error":"{message}"}}"#)
+        } else {
+            format!(r#"{{"error":"{message}","ok":false}}"#)
+        }
+    }
+
     async fn raw_frame(recv: &mut quinn::RecvStream) -> Vec<u8> {
         let length = recv.read_u32().await.unwrap();
         let mut body = vec![0; length as usize];
@@ -859,7 +873,7 @@ mod tests {
                 if request["method"] == "fail" {
                     Err("boom".into())
                 } else {
-                    Ok(json!({"b":1,"a":[2,"x"]}))
+                    Ok(json!({"a":[2,"x"],"b":1}))
                 }
             },
             move |_, request: Value, sink: WatchSink| {
@@ -896,23 +910,23 @@ mod tests {
         for (request, expected) in [
             (
                 json!({"method":"ok"}),
-                r#"{"ok":true,"result":{"b":1,"a":[2,"x"]}}"#,
+                r#"{"ok":true,"result":{"a":[2,"x"],"b":1}}"#.to_string(),
             ),
-            (json!({"method":"fail"}), r#"{"ok":false,"error":"boom"}"#),
+            (json!({"method":"fail"}), error_json("boom")),
         ] {
             let (mut send, mut recv) = connection.open_bi().await.unwrap();
             write_frame(&mut send, &request, REQUEST_LIMIT)
                 .await
                 .unwrap();
             let bytes = recv.read_to_end(1024).await.unwrap();
-            assert_eq!(bytes, framed(expected));
+            assert_eq!(bytes, framed(&expected));
         }
         let (mut send, mut recv) = connection.open_bi().await.unwrap();
         send.write_u32((REQUEST_LIMIT + 1) as u32).await.unwrap();
         send.finish().unwrap();
         assert_eq!(
             recv.read_to_end(1024).await.unwrap(),
-            framed(r#"{"ok":false,"error":"Message exceeds the connection limit"}"#)
+            framed(&error_json("Message exceeds the connection limit"))
         );
         // A refused watch answers like a request and ends.
         let (mut send, mut recv) = connection.open_bi().await.unwrap();
@@ -925,7 +939,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             recv.read_to_end(1024).await.unwrap(),
-            framed(r#"{"ok":false,"error":"Unsupported mobile operation"}"#)
+            framed(&error_json("Unsupported mobile operation"))
         );
         // An accepted watch: accept frame, two updates, then the end of the stream.
         let (mut send, mut recv) = connection.open_bi().await.unwrap();
@@ -964,7 +978,7 @@ mod tests {
         sink.send(json!({"n":9})).await.unwrap();
         assert_eq!(
             recv.read_to_end(1024).await.unwrap(),
-            framed(r#"{"ok":false,"error":"Device revoked"}"#)
+            framed(&error_json("Device revoked"))
         );
         drop(send);
         client.close(0_u32.into(), b"Test complete");
