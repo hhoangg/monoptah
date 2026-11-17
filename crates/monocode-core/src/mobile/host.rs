@@ -4,7 +4,7 @@
 use super::audit::{self, AuditEvent, Outcome, Transport};
 use super::catalog::{recent_sessions, session_page};
 use super::identity_store::{self, IdentityKeychain, SystemKeychain};
-use super::policy::{self, DeviceContext};
+use super::policy::{self, DeviceContext, DeviceKind};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use monocode_mobile_link::{now, Address, Gate, Identity, WatchSink, PORT, VERSION};
 use serde::{Deserialize, Serialize};
@@ -654,6 +654,27 @@ impl MobileHost {
     }
 
     async fn handle(&self, peer: &str, request: Value) -> Result<Value, String> {
+        let mut audited = None;
+        let result = self.handle_call(peer, &request, &mut audited).await;
+        // Recorded with no lock held: the log may write a file.
+        if let Some((context, mut event)) = audited {
+            if event.outcome == Outcome::Ok && result.is_err() {
+                event.outcome = Outcome::Error;
+            }
+            audit::record(&context, &event);
+        }
+        result
+    }
+
+    /// `handle` without the audit record: it leaves the event of an
+    /// identified device in `audited` for `handle` to record once the call
+    /// has an outcome.
+    async fn handle_call(
+        &self,
+        peer: &str,
+        request: &Value,
+        audited: &mut Option<(DeviceContext, AuditEvent)>,
+    ) -> Result<Value, String> {
         if request["version"] != VERSION {
             return Err("Update Monoptah on both devices".into());
         }
@@ -667,7 +688,12 @@ impl MobileHost {
             if !inner.config.enabled {
                 return Err("Mobile access disabled".into());
             }
+            // Pairing is the QUIC phones' own flow. The web transport pairs
+            // through the relay, so a web context must never enrol here.
             if method == "device.enroll" {
+                if !enroll_allowed(DeviceKind::Phone) {
+                    return Err("Unsupported mobile operation".into());
+                }
                 return self.enroll(&mut inner, peer, &params);
             }
             let device = inner
@@ -678,17 +704,20 @@ impl MobileHost {
                 .ok_or("Device revoked or not paired")?
                 .clone();
             let context = DeviceContext::phone(&device);
-            policy::authorize(&context, method, &params).map_err(|denial| denial.error)?;
-            audit::record(&context, &audit_event(&device, method, &request));
+            *audited = Some((context.clone(), audit_event(&device, method, request)));
+            if let Err(denial) = policy::authorize(&context, method, &params) {
+                if let Some((_, event)) = audited {
+                    event.outcome = Outcome::Denied(denial.code);
+                }
+                return Err(denial.error);
+            }
             match method {
                 "device.selection" => {
                     let answer = policy::device_selection(&context, &params)?;
                     if answer.narrowed.is_some() {
-                        // The persisted selection lands with the Device fields;
-                        // the open watches end so they reopen under it.
                         close_device_watches(&mut inner, peer);
                     }
-                    return Ok(answer.reply);
+                    return selection_reply(answer);
                 }
                 "device.leave" => {
                     let mut config = inner.config.clone();
@@ -766,6 +795,26 @@ impl MobileHost {
     /// A phone starts watching a conversation. The app sends its state, then
     /// every change, until the phone goes or the watch is stopped.
     async fn watch(&self, peer: &str, request: Value, sink: WatchSink) -> Result<(), String> {
+        let mut audited = None;
+        let result = self.watch_call(peer, &request, sink, &mut audited).await;
+        // Recorded with no lock held: the log may write a file.
+        if let Some((context, mut event)) = audited {
+            if event.outcome == Outcome::Ok && result.is_err() {
+                event.outcome = Outcome::Error;
+            }
+            audit::record(&context, &event);
+        }
+        result
+    }
+
+    /// `watch` without the audit record, as `handle_call` is to `handle`.
+    async fn watch_call(
+        &self,
+        peer: &str,
+        request: &Value,
+        sink: WatchSink,
+        audited: &mut Option<(DeviceContext, AuditEvent)>,
+    ) -> Result<(), String> {
         if request["version"] != VERSION {
             return Err("Update Monoptah on both devices".into());
         }
@@ -792,12 +841,16 @@ impl MobileHost {
                 .ok_or("Device revoked or not paired")?
                 .clone();
             let context = DeviceContext::phone(&device);
-            policy::authorize(&context, "conversation.watch", params)
-                .map_err(|denial| denial.error)?;
-            audit::record(
-                &context,
-                &audit_event(&device, "conversation.watch", &request),
-            );
+            *audited = Some((
+                context.clone(),
+                audit_event(&device, "conversation.watch", request),
+            ));
+            if let Err(denial) = policy::authorize(&context, "conversation.watch", params) {
+                if let Some((_, event)) = audited {
+                    event.outcome = Outcome::Denied(denial.code);
+                }
+                return Err(denial.error);
+            }
             inner.watches.retain(|_, watch| !watch.sink.is_closed());
             if inner
                 .watches
@@ -905,6 +958,22 @@ fn audit_event(device: &Device, method: &str, request: &Value) -> AuditEvent {
         outcome: Outcome::Ok,
         command_id: request["id"].as_str().map(Into::into),
     }
+}
+
+/// The reply to `device.selection`. Fails closed: nothing can persist a
+/// narrower selection until `Device` has selection fields, so claiming success
+/// would leave the device with full access. R-07 / H-02 replace this with the
+/// host's `save`.
+fn selection_reply(answer: policy::SelectionAnswer) -> Result<Value, String> {
+    if answer.narrowed.is_some() {
+        return Err("Unsupported mobile operation".into());
+    }
+    Ok(answer.reply)
+}
+
+/// Whether a device of `kind` may enrol through `handle`. Only QUIC phones do.
+fn enroll_allowed(kind: DeviceKind) -> bool {
+    kind == DeviceKind::Phone
 }
 
 fn addresses(inner: &Inner) -> Vec<Address> {
@@ -1162,6 +1231,48 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error, "Unsupported mobile operation");
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_narrower_selection_that_cannot_be_saved_is_refused() {
+        let narrowed = policy::SelectionAnswer {
+            reply: json!({"ok": true}),
+            narrowed: Some(policy::Selection {
+                projects: Some(vec!["p".into()]),
+                monos: None,
+            }),
+        };
+        assert_eq!(
+            selection_reply(narrowed),
+            Err("Unsupported mobile operation".into())
+        );
+        let plain = policy::SelectionAnswer {
+            reply: json!({"ok": true}),
+            narrowed: None,
+        };
+        assert_eq!(selection_reply(plain), Ok(json!({"ok": true})));
+    }
+
+    #[test]
+    fn only_quic_phones_enrol_through_the_host() {
+        assert!(enroll_allowed(DeviceKind::Phone));
+        assert!(!enroll_allowed(DeviceKind::Web));
+    }
+
+    #[tokio::test]
+    async fn the_audit_event_is_left_for_after_the_call_with_its_outcome() {
+        let (host, events, peer) = paired();
+        drop(events);
+        let mut audited = None;
+        let request = json!({"version":VERSION,"id":"c","method":"session.cancel","params":{"projectId":"p"}});
+        let result = host.handle_call(&peer, &request, &mut audited).await;
+        assert!(result.is_err());
+        let (context, event) = audited.unwrap();
+        assert_eq!(context.kind, DeviceKind::Phone);
+        assert_eq!(event.method, "session.cancel");
+        assert_eq!(event.project_id.as_deref(), Some("p"));
+        assert_eq!(event.command_id.as_deref(), Some("c"));
         std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
     }
 

@@ -292,7 +292,11 @@ pub fn classify(method: &str, params: &Value) -> Option<Access> {
                 Some("commit") if params["push"] == true || params["createPr"] == true => {
                     Access::DeniedForWebUnless(Toggle::RemoteGitPush)
                 }
-                _ => Access::Control,
+                Some("commit" | "stage" | "unstage" | "stageAll" | "unstageAll" | "generate") => {
+                    Access::Control
+                }
+                // A missing or unknown action is refused, not assumed safe.
+                _ => Access::DeniedForWeb,
             },
             _ => Access::Control,
         },
@@ -400,7 +404,7 @@ mod tests {
             c("accounts.usage", json!({"refresh": true})),
             Access::Control
         );
-        for action in ["stage", "unstage", "generate"] {
+        for action in ["stage", "unstage", "stageAll", "unstageAll", "generate"] {
             assert_eq!(
                 c("project.gitAction", json!({"action": action})),
                 Access::Control
@@ -419,6 +423,11 @@ mod tests {
         ] {
             assert_eq!(c("project.gitAction", params), push);
         }
+        assert_eq!(c("project.gitAction", json!({})), Access::DeniedForWeb);
+        assert_eq!(
+            c("project.gitAction", json!({"action": "rebase"})),
+            Access::DeniedForWeb
+        );
         assert_eq!(c("device.selection", json!({})), Access::Read);
         assert_eq!(
             c("device.selection", json!({"projects": []})),
@@ -463,6 +472,28 @@ mod tests {
         for (code, name) in all {
             assert_eq!(code.as_str(), name);
         }
+    }
+
+    #[test]
+    fn error_codes_equal_the_web_link_list() {
+        let all = [
+            Code::ReadOnly,
+            Code::Forbidden,
+            Code::NotSelected,
+            Code::PathDenied,
+            Code::Revoked,
+            Code::Disabled,
+            Code::TooLarge,
+            Code::Unsupported,
+            Code::UnsupportedTarget,
+            Code::Busy,
+            Code::Starting,
+            Code::AutoStopping,
+            Code::InstanceBusy,
+        ];
+        let mut ours: Vec<&str> = all.iter().map(|c| c.as_str()).collect();
+        ours.sort_unstable();
+        assert_eq!(ours, super::super::web_link::frame::DESKTOP_ERROR_CODES);
     }
 
     #[test]

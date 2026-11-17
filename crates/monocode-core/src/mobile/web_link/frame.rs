@@ -495,6 +495,18 @@ pub const DESKTOP_ERROR_CODES: [&str; 13] = [
     "unsupported_target",
 ];
 
+/// Capability names a desktop may advertise in the `state` message
+/// (`web/protocol` `KNOWN_CAPABILITIES`).
+pub const KNOWN_CAPABILITIES: &[&str] = &[
+    "approvals",
+    "cloud",
+    "cloudStart",
+    "cloudMove",
+    "gitPush",
+    "monoTools",
+    "monoFiles",
+];
+
 /// Codes in the ERROR relay frame body.
 pub const RELAY_ERROR_CODES: [&str; 2] = ["desktop_offline", "unsupported_version"];
 
@@ -721,6 +733,18 @@ mod tests {
             Reassembler::default().push(&[], 0),
             Err(ReassemblyError::Plaintext(PlaintextError::Empty))
         );
+    }
+
+    #[test]
+    fn capability_names_equal_the_contract() {
+        let v = vectors();
+        let theirs: Vec<&str> = v["state"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap())
+            .collect();
+        assert_eq!(theirs, KNOWN_CAPABILITIES);
     }
 
     #[test]

@@ -3,6 +3,17 @@
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 
+/// The frame's own fields, which an extra field may not use.
+const RESERVED: [&str; 7] = [
+    "usageLimit",
+    "busy",
+    "older",
+    "order",
+    "question",
+    "turns",
+    "patches",
+];
+
 /// What the phone last received for a watch, to send only what changed since.
 #[derive(Clone, Debug, Default)]
 pub struct Baseline {
@@ -84,6 +95,10 @@ pub fn update(
     let mut extra_changed = Map::new();
     if let Value::Object(fields) = extra {
         for (key, value) in fields {
+            // Never a phone field: it is not sent, so it is not remembered.
+            if RESERVED.contains(&key.as_str()) {
+                continue;
+            }
             if sent.get(key) != Some(value) {
                 extra_changed.insert(key.clone(), value.clone());
                 sent.insert(key.clone(), value.clone());
@@ -150,8 +165,7 @@ pub fn update(
         frame.insert("patches".into(), Value::Array(patches));
     }
     for (key, value) in extra_changed {
-        // The fields above are the phone's; extras never replace them.
-        frame.entry(key).or_insert(value);
+        frame.insert(key, value);
     }
     Some((
         Value::Object(frame),
@@ -498,5 +512,28 @@ mod tests {
             keys,
             ["busy", "older", "order", "question", "turns", "usageLimit"]
         );
+    }
+
+    #[test]
+    fn an_extra_named_like_a_phone_field_is_ignored_and_not_remembered() {
+        let turns = [turn("1", "hi")];
+        let none = Value::Null;
+        let clash = json!({"busy": "extra", "cloud": 1});
+        let (first, baseline) =
+            update(None, true, false, &none, &turns, false, &none, &clash).unwrap();
+        assert_eq!(first["busy"], true);
+        assert_eq!(first["cloud"], 1);
+        // Nothing changed: the ignored key does not keep forcing frames.
+        assert!(update(
+            Some(&baseline),
+            true,
+            false,
+            &none,
+            &turns,
+            false,
+            &none,
+            &clash
+        )
+        .is_none());
     }
 }

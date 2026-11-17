@@ -25,7 +25,8 @@ pub struct Notice {
 pub struct WebNotice<'a> {
     /// `agentFinished`, `agentInput` or `monoMessages`.
     pub category: &'a str,
-    pub session_id: &'a str,
+    /// None for a Mono's own chat, which has no session.
+    pub session_id: Option<&'a str>,
     pub mono_id: Option<&'a str>,
     /// The project's display name, or the Mono's name for a Mono notice.
     pub project: &'a str,
