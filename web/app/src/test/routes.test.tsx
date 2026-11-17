@@ -12,7 +12,8 @@ import { createAppRouter } from "@/router";
 // the concrete URL, the route shown by the stub, and the params the stub must render as text.
 const CASES: ReadonlyArray<{ url: string; route: string; params: Record<string, string>; fullPath: string }> = [
   // `/` redirects (F-14, W-06): with no last place registered it lands on /desktops.
-  { url: "/", route: "/desktops", params: {}, fullPath: "/" },
+  // The matched route after the redirect is /desktops, so that is its full path.
+  { url: "/", route: "/desktops", params: {}, fullPath: "/desktops/" },
   { url: "/login", route: "/login", params: {}, fullPath: "/login" },
   { url: "/register#invite=ABC", route: "/register", params: {}, fullPath: "/register" },
   { url: "/recover", route: "/recover", params: {}, fullPath: "/recover" },
