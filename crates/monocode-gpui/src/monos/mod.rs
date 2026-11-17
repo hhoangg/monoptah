@@ -178,6 +178,8 @@ pub(crate) struct Monos {
     /// The wall-clock minute of the last tick that woke the view, so on-screen
     /// times still move on while nothing else changes.
     last_tick_minute: u64,
+    /// What the view shows from other entities as of the last tick.
+    last_fingerprint: u64,
     /// Native visuals the Mono published in its chat, opened as documents.
     visual_documents: HashMap<String, Entity<crate::visuals::VisualView>>,
     project_changes: changes::ProjectChanges,
@@ -498,6 +500,7 @@ impl Monos {
             #[cfg(test)]
             renders: 0,
             last_tick_minute: 0,
+            last_fingerprint: 0,
             visual_documents: HashMap::new(),
             project_changes: Default::default(),
             review: None,

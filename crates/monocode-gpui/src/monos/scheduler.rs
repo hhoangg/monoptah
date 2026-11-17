@@ -1455,10 +1455,61 @@ impl Monos {
             .detach();
     }
     pub(super) fn tick(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.check_habits(cx);
-        cx.notify();
+        self.tick_at(now_ms(), cx);
     }
-    fn check_habits(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn tick_at(&mut self, now: u64, cx: &mut Context<Self>) {
+        let changed = self.check_habits(cx);
+        // Nothing changed means nothing to draw. Times on screen still advance
+        // once a minute, which is as fine as they are shown.
+        let minute = now / 60_000;
+        let rolled = minute != self.last_tick_minute;
+        self.last_tick_minute = minute;
+        // What the cached view reads from sessions it does not observe.
+        let shown = self.shown_fingerprint(now, cx);
+        let moved = shown != std::mem::replace(&mut self.last_fingerprint, shown);
+        if changed || rolled || moved {
+            cx.notify();
+        }
+    }
+    /// A cheap digest of what the active Mono and its details show from other
+    /// entities: its launched sessions (state, title) and the sessions waiting
+    /// for approval. A tick wakes the view only when it changes.
+    fn shown_fingerprint(&self, now: u64, cx: &App) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let Some(mono) = self.current() else {
+            return 0;
+        };
+        if let Some(owner) = self.owner.upgrade() {
+            let sessions = owner.read(cx).mono_session_views(cx);
+            for launch in &mono.launches {
+                (launch.session_id, launch.completed, launch.dismissed).hash(&mut hasher);
+                if let Some(s) = sessions.iter().find(|s| s.id == launch.session_id) {
+                    (
+                        s.busy,
+                        s.needs_input,
+                        s.start_failed,
+                        s.has_messages,
+                        s.archived,
+                        &s.title,
+                    )
+                        .hash(&mut hasher);
+                }
+            }
+        }
+        for view in self.attention_views(&mono.id, cx) {
+            view.entity_id().hash(&mut hasher);
+        }
+        // The changes badge polls files while a turn runs, which no entity
+        // announces: keep waking at the tick's own pace until it ends.
+        if self.chat().is_some_and(|chat| chat.read(cx).busy) {
+            (now / 10_000).hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+    /// Runs the periodic checks. Returns whether Monos' own state changed in a
+    /// way the view must show; work that finishes later notifies on its own.
+    fn check_habits(&mut self, cx: &mut Context<Self>) -> bool {
         let now = now_ms();
         if let Some(id) = self.active.clone() {
             self.refresh_work(&id, cx);
@@ -1470,6 +1521,7 @@ impl Monos {
             .filter(|(_, r)| r.stop.is_some())
             .map(|(&id, _)| id)
             .collect();
+        let asked_any = !asked.is_empty();
         for id in asked {
             self.enforce_stop(id, cx);
         }
@@ -1495,6 +1547,7 @@ impl Monos {
                 }
             })
             .collect();
+        let changed = asked_any || !timed_out.is_empty();
         for id in timed_out {
             if let Some(run) = self.running.get_mut(&id) {
                 run.failure = Some("Habit timed out while waiting for work or an answer".into());
@@ -1505,7 +1558,7 @@ impl Monos {
         }
         self.check_completions(cx);
         if self.scheduling || self.active_run.is_some() {
-            return;
+            return changed;
         }
         self.scheduling = true;
         let root = self.root.clone();
@@ -1513,8 +1566,11 @@ impl Monos {
         let beats = self.heartbeat_candidates(cx);
         let store = self.store.clone();
         let work = cx.background_executor().spawn(async move {
+            // Whether a habits file was rewritten without claiming a run, such as
+            // a recovered interrupted run or a skipped missed slot.
+            let mut rewritten = false;
             for id in ids {
-                let claimed = habits::update(&root, &id, |all| {
+                let (claimed, wrote) = habits::update_checked(&root, &id, |all| {
                     // A process restart cannot resume an old provider turn.
                     // Record the interruption instead of leaving it claimed forever.
                     for h in all.iter_mut() {
@@ -1544,25 +1600,32 @@ impl Monos {
                     }
                     Ok(None)
                 })?;
+                rewritten |= wrote;
                 if let Some(h) = claimed {
-                    return Ok::<_, String>(Some((id, Claimed::Habit(Box::new(h)))));
+                    return Ok::<_, String>((Some((id, Claimed::Habit(Box::new(h)))), rewritten));
                 }
             }
             for beat in beats {
                 if let Some(text) = prepare_heartbeat(&store, &root, &beat, now, fetch_inbox)? {
-                    return Ok(Some((beat.mono.id.clone(), Claimed::Heartbeat(text))));
+                    return Ok((
+                        Some((beat.mono.id.clone(), Claimed::Heartbeat(text))),
+                        rewritten,
+                    ));
                 }
             }
-            Ok(None)
+            Ok((None, rewritten))
         });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
                 this.scheduling = false;
                 match result {
-                    Ok(Some((id, Claimed::Habit(habit)))) => this.start_habit(&id, *habit, cx),
-                    Ok(Some((id, Claimed::Heartbeat(text)))) => this.start_heartbeat(&id, text, cx),
-                    Ok(None) => (),
+                    Ok((Some((id, Claimed::Habit(habit))), _)) => this.start_habit(&id, *habit, cx),
+                    Ok((Some((id, Claimed::Heartbeat(text))), _)) => {
+                        this.start_heartbeat(&id, text, cx)
+                    }
+                    Ok((None, true)) => cx.notify(),
+                    Ok((None, false)) => (),
                     Err(e) => {
                         this.error = Some(e);
                         cx.notify();
@@ -1571,6 +1634,7 @@ impl Monos {
             });
         })
         .detach();
+        changed
     }
     fn start_habit(&mut self, id: &str, habit: Habit, cx: &mut Context<Self>) {
         let text = habit_prompt(&habit.name, &habit.instructions);
