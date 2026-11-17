@@ -9,6 +9,7 @@
   "scripts": {
     "check": "pnpm -r --workspace-concurrency=1 run typecheck && pnpm -r --workspace-concurrency=1 run lint && pnpm -r --workspace-concurrency=1 run test && pnpm run test:scripts",
     "bootstrap": "node scripts/bootstrap.mjs",
+    "deploy:official": "node scripts/deploy-official.mjs",
     "test:scripts": "node --test scripts/*.test.mjs",
     "typecheck": "pnpm -r run typecheck",
     "lint": "pnpm -r run lint",
