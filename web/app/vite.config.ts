@@ -4,6 +4,7 @@ import tailwindcss from "@tailwindcss/vite";
 import { tanstackRouter } from "@tanstack/router-plugin/vite";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
+import { VitePWA } from "vite-plugin-pwa";
 import { headersPlugin } from "./vite-plugins/headers.ts";
 
 // `vite dev` runs the SPA, the Worker, the Durable Objects and local D1 together through
@@ -23,6 +24,23 @@ export default defineConfig({
     tailwindcss(),
     cloudflare({ configPath: "../wrangler.jsonc" }),
     headersPlugin("../wrangler.jsonc"),
+    // Workbox injectManifest: src/sw.ts is compiled to /sw.js with the precache list injected. The
+    // manifest stays public/manifest.webmanifest and registration is src/features/offline/registerSw.ts
+    // (Trusted Types aware), so the plugin only builds the worker.
+    VitePWA({
+      strategies: "injectManifest",
+      srcDir: "src",
+      filename: "sw.ts",
+      registerType: "prompt",
+      injectRegister: false,
+      manifest: false,
+      injectManifest: {
+        globPatterns: ["**/*.{js,css,html,woff2,svg,png,ico,webmanifest}"],
+        // The shell is a few hundred kB per chunk; a chunk over 2 MiB is a regression, not something to precache.
+        maximumFileSizeToCacheInBytes: 2 * 1024 * 1024,
+      },
+      devOptions: { enabled: false },
+    }),
   ],
   resolve: { alias: { "@": path.resolve(import.meta.dirname, "src") } },
 });

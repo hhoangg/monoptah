@@ -1,6 +1,6 @@
 // Run after `vite build` (see the `build` script). Fails when the Worker assets directory
 // (app/dist/client, the `assets.directory` of web/wrangler.jsonc) lacks `_headers` or the default
-// CSP, or holds a Worker bundle, a sourcemap or the dev mock API marker that would be served to the public.
+// CSP, lacks a sound sw.js, or holds a Worker bundle, a sourcemap or the dev mock API marker that would be served to the public.
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -37,6 +37,19 @@ for (const entry of readdirSync(client, { recursive: true, withFileTypes: true }
     }
   }
   if (name === "wrangler.json" || name === "index.js") problems.push(`Worker bundle file in the assets directory: ${join(dir, name)}`);
+}
+
+// The service worker (W-12): it must exist, keep the navigation denylist for /api and /relay, and precache nothing under /api or /relay.
+const sw = join(client, "sw.js");
+if (!existsSync(sw)) {
+  problems.push("dist/client/sw.js is missing");
+} else {
+  const text = readFileSync(sw, "utf8");
+  if (!text.includes("workbox:precaching")) problems.push("sw.js does not use Workbox precaching");
+  if (!text.includes("/^\\/api\\//") || !text.includes("/^\\/relay\\//")) problems.push("sw.js lacks the navigation denylist for /api and /relay");
+  if (/url:\s*[`"']\/?(api|relay)\//.test(text) || /["'`]\/?(api|relay)\/[^"'`]*["'`]\s*,\s*revision/.test(text)) {
+    problems.push("sw.js precaches a path under /api or /relay");
+  }
 }
 
 if (problems.length > 0) {
