@@ -27,8 +27,9 @@ export function createApp(): Hono<AppEnv> {
   app.all("*", (c) => c.env.ASSETS.fetch(c.req.raw));
 
   app.onError((err, c) => {
-    // Metadata only: no message (it may echo input), no stack.
-    console.error(`unhandled error: route=${c.req.method} ${new URL(c.req.url).pathname} error=${err.name}`);
+    // Metadata only: no message (it may echo input), no stack, and the route pattern (`/api/pair/:userCode`), never
+    // the path, which can hold a pairing code or another secret.
+    console.error(`unhandled error: route=${c.req.method} ${c.req.routePath} error=${err.name}`);
     return apiError(c, 500, "internal", "Internal error");
   });
   return app;

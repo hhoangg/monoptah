@@ -20,6 +20,9 @@ export default defineConfig(async () => {
           bindings: {
             // Applied by test/setup.ts.
             TEST_MIGRATIONS: migrations,
+            // The tests run on localhost; wrangler.jsonc keeps the production zptah.app values.
+            RP_ID: "localhost",
+            RP_ORIGIN: "http://localhost:8787",
             // Secrets are not in wrangler.jsonc; obviously fake values for the tests.
             VAPID_PRIVATE_KEY: "test-vapid-private-key",
             RECOVERY_PEPPER: "test-recovery-pepper",

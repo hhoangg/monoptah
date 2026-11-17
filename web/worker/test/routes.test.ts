@@ -1,7 +1,13 @@
-import { describe, expect, it } from "vitest";
+import { env } from "cloudflare:workers";
+import { beforeAll, describe, expect, it } from "vitest";
 import { API_MODULES, API_ROUTES, ApiErrorSchema, HealthResponse } from "@monoptah/protocol";
 import { MODULES } from "../src/modules/index.ts";
 import { BROWSER_HEADERS, call } from "./helpers.ts";
+import { createTestUser, loginAs, type TestSession } from "./support/accounts.ts";
+
+/** Routes that have a handler now. Their behaviour is tested in their own files (sessions, me, audit tests). */
+const IMPLEMENTED = new Set(["GET /api/me", "PATCH /api/me", "GET /api/audit", "GET /api/sessions", "DELETE /api/sessions/:id", "POST /api/auth/logout", "POST /api/auth/register/options", "POST /api/auth/register/verify", "POST /api/auth/login/options", "POST /api/auth/login/verify", "POST /api/auth/reauth/options", "POST /api/auth/reauth/verify", "POST /api/auth/recover", "POST /api/recovery-codes/regenerate", "GET /api/passkeys", "POST /api/passkeys/options", "POST /api/passkeys/verify", "PATCH /api/passkeys/:id", "DELETE /api/passkeys/:id", "GET /api/invites", "POST /api/invites", "DELETE /api/invites/:id", "GET /api/admin/users", "POST /api/admin/users/:id/block", "POST /api/admin/users/:id/unblock", "POST /api/admin/users/:id/invites", "GET /api/admin/settings", "PUT /api/admin/settings", "GET /api/admin/audit"]);
+const needsCookie = (route: { auth: string }) => ["session", "fresh", "admin", "session+grant"].includes(route.auth);
 
 /** `/api/desktops/:id/grants/:deviceId` -> `/api/desktops/x/grants/y`. */
 function concretePath(path: string): string {
@@ -31,22 +37,45 @@ describe("GET /api/health", () => {
 
 describe("every registry route", () => {
   const stubs = API_ROUTES.filter((route) => !(route.method === "GET" && route.path === "/api/health"));
+  const unimplemented = stubs.filter((route) => !IMPLEMENTED.has(`${route.method} ${route.path}`));
+  let admin: TestSession;
+
+  beforeAll(async () => {
+    // An admin with a fresh session passes every session, fresh, admin and session+grant gate.
+    admin = await loginAs((await createTestUser(env, { role: "admin" })).id, { fresh: true });
+  });
+
+  const send = (route: (typeof stubs)[number], cookie?: string) => {
+    const hasBody = route.method !== "GET" && route.method !== "DELETE";
+    return call(concretePath(route.path), {
+      method: route.method,
+      headers: { ...BROWSER_HEADERS, ...(cookie ? { Cookie: cookie } : {}) },
+      body: hasBody ? "{}" : undefined,
+    });
+  };
 
   it("covers the whole registry", () => {
     expect(stubs.length).toBe(API_ROUTES.length - 1);
     expect(stubs.length).toBeGreaterThan(50);
+    expect(unimplemented.length).toBe(stubs.length - IMPLEMENTED.size);
   });
 
-  it.each(stubs.map((route) => [`${route.method} ${route.path}`, route] as const))("%s answers 501 unsupported", async (_name, route) => {
-    const hasBody = route.method !== "GET" && route.method !== "DELETE";
-    const res = await call(concretePath(route.path), {
-      method: route.method,
-      headers: { ...BROWSER_HEADERS, ...(hasBody ? { "Content-Type": "application/json" } : {}) },
-      body: hasBody ? "{}" : undefined,
-    });
+  it.each(unimplemented.map((route) => [`${route.method} ${route.path}`, route] as const))("%s answers 501 unsupported with a valid session", async (_name, route) => {
+    const res = await send(route, needsCookie(route) ? admin.cookie : undefined);
     expect(res.status).toBe(501);
-    const parsed = ApiErrorSchema.parse(await res.json());
-    expect(parsed.code).toBe("unsupported");
+    expect(ApiErrorSchema.parse(await res.json()).code).toBe("unsupported");
+  });
+
+  it.each(stubs.map((route) => [`${route.method} ${route.path}`, route] as const))("%s without a session: 401 on cookie routes, 501 on public and token routes", async (_name, route) => {
+    const res = await send(route);
+    if (needsCookie(route)) {
+      expect(res.status).toBe(401);
+      expect(ApiErrorSchema.parse(await res.json()).code).toBe("unauthorized");
+    } else if (IMPLEMENTED.has(`${route.method} ${route.path}`)) {
+      expect(res.status).not.toBe(501);
+    } else {
+      expect(res.status).toBe(501);
+    }
   });
 });
 

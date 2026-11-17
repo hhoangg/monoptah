@@ -74,6 +74,10 @@ export const users = sqliteTable(
     check("users_role_check", oneOf("role", USER_ROLES)),
     check("users_status_check", oneOf("status", USER_STATUSES)),
     index("users_invited_by_idx").on(t.invitedBy),
+    // Not in architecture.md 4.3: `GET /api/admin/users` lists users by creation time (migration 0003).
+    // Foreign key index (migration 0003): deleting an invite sets `users.invite_id` to null.
+    index("users_invite_id_idx").on(t.inviteId),
+    index("users_created_at_idx").on(t.createdAt, t.id),
   ],
 );
 
@@ -112,6 +116,8 @@ export const challenges = sqliteTable(
   (t) => [
     check("challenges_purpose_check", oneOf("purpose", CHALLENGE_PURPOSES)),
     index("challenges_expires_at_idx").on(t.expiresAt),
+    // Foreign key index (migration 0003).
+    index("challenges_user_id_idx").on(t.userId),
   ],
 );
 
@@ -180,6 +186,8 @@ export const invites = sqliteTable(
     check("invites_kind_check", oneOf("kind", INVITE_KINDS)),
     check("invites_creator_check", sql`${t.kind} = 'bootstrap' OR ${t.createdBy} IS NOT NULL`),
     index("invites_created_by_idx").on(t.createdBy),
+    // Foreign key index (migration 0003).
+    index("invites_used_by_idx").on(t.usedBy),
   ],
 );
 
@@ -318,7 +326,11 @@ export const pushPrefs = sqliteTable(
     /** JSON: `{agentFinished, agentInput, monoMessages}` booleans. */
     categories: json<Record<string, boolean>>("categories").notNull().default(sql`'{}'`),
   },
-  (t) => [primaryKey({ columns: [t.userId, t.desktopId] })],
+  (t) => [
+    primaryKey({ columns: [t.userId, t.desktopId] }),
+    // Foreign key index (migration 0003): deleting a desktop deletes its prefs.
+    index("push_prefs_desktop_id_idx").on(t.desktopId),
+  ],
 );
 
 // --- Pairing ---
@@ -351,19 +363,27 @@ export const pairingRequests = sqliteTable(
     check("pairing_requests_status_check", oneOf("status", PAIRING_STATUSES)),
     index("pairing_requests_expires_at_idx").on(t.expiresAt),
     // Not in architecture.md 4.3: "3 outstanding per IP" (security.md 3.5).
-    index("pairing_requests_ip_hash_idx").on(t.ipHash),
+    index("pairing_requests_ip_status_expires_idx").on(t.ipHash, t.status, t.expiresAt),
+    // Foreign key indexes (migration 0003).
+    index("pairing_requests_user_id_idx").on(t.userId),
+    index("pairing_requests_desktop_id_idx").on(t.desktopId),
   ],
 );
 
 // --- Instance state ---
 
-export const settings = sqliteTable("settings", {
-  key: text("key").primaryKey(),
-  /** Row `invites_paused` is `0` or `1`; absent means `0`. Written only by `PUT /api/admin/settings`. */
-  value: text("value").notNull(),
-  updatedAt: integer("updated_at").notNull(),
-  updatedBy: text("updated_by").references(() => users.id, { onDelete: "set null" }),
-});
+export const settings = sqliteTable(
+  "settings",
+  {
+    key: text("key").primaryKey(),
+    /** Row `invites_paused` is `0` or `1`; absent means `0`. Written only by `PUT /api/admin/settings`. */
+    value: text("value").notNull(),
+    updatedAt: integer("updated_at").notNull(),
+    updatedBy: text("updated_by").references(() => users.id, { onDelete: "set null" }),
+  },
+  // Foreign key index (migration 0003).
+  (t) => [index("settings_updated_by_idx").on(t.updatedBy)],
+);
 
 export const auditLog = sqliteTable(
   "audit_log",
@@ -381,10 +401,11 @@ export const auditLog = sqliteTable(
   },
   (t) => [
     check("audit_log_actor_kind_check", oneOf("actor_kind", AUDIT_ACTOR_KINDS)),
-    // Retention cleanup and the admin view (newest first).
-    index("audit_log_ts_idx").on(t.ts),
-    // Not in architecture.md 4.3: `GET /api/audit` pages one user's events.
-    index("audit_log_actor_user_id_ts_idx").on(t.actorUserId, t.ts),
+    // Retention cleanup (`ts < ?`) and the admin view `GET /api/admin/audit` (newest first, cursor (ts, id)); migration 0003
+    // replaced the (ts) index with this one.
+    index("audit_log_ts_id_idx").on(t.ts, t.id),
+    // Not in architecture.md 4.3: `GET /api/audit` pages one user's events by the cursor (ts, id) (migration 0002).
+    index("audit_log_actor_user_id_ts_id_idx").on(t.actorUserId, t.ts, t.id),
   ],
 );
 

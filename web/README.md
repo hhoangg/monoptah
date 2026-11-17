@@ -17,7 +17,7 @@ The spec is in [`docs/README.md`](docs/README.md) (architecture, security, desig
 
 ## Develop locally
 
-Prerequisites: Node 22 or newer, pnpm 12.21.0 (`packageManager` in `package.json`, e.g. `corepack enable`).
+Prerequisites: Node 22.18 or newer, pnpm 12.21.0 (`packageManager` in `package.json`, e.g. `corepack enable`).
 
 ```bash
 cd web
