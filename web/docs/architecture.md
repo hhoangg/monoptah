@@ -44,11 +44,12 @@ Reuse rule: code taken from the old Tauri React app (`src/`) is copied into `web
 |---|---|---|
 | `/` | session | Restores the last place (last used desktop, project, session) and redirects there, else `/desktops` |
 | `/login` | public | Passkey sign-in (discoverable credential, hybrid QR offered by the browser), link to `/recover` |
-| `/register?invite=CODE` | public | Invite code, handle, create passkey, then one-time recovery codes screen |
+| `/register#invite=CODE` | public | Invite code (read from the URL fragment, so it stays out of logs and history), immutable handle, display name, create passkey, one-time recovery codes screen with "I saved these", then a prompt to add a second passkey |
 | `/recover` | public | Handle + recovery code, then forced "add a new passkey" |
-| `/pair/:code` | session (login redirect keeps the code) | Approve a desktop: machine name, fingerprint, confirmation code (section 6.4). The `#fp` fragment is saved to `sessionStorage` before any redirect to `/login?redirect=` and restored after sign-in; without a `#fp` the page shows a warning that the desktop key cannot be checked |
+| `/pair/:code` | session (login redirect keeps the code) | Approve a desktop: machine name, fingerprint, confirmation code (section 6.4); if the account already has desktops, an option "This replaces <desktop>" (fresh re-auth). The `#fp` fragment is saved to `sessionStorage` before any redirect to `/login?redirect=` and restored after sign-in; without a `#fp` the page shows a warning that the desktop key cannot be checked |
 | `/desktops` | session | List: online status, rename, color, pending confirmations badge |
-| `/desktops/:id` | session | Manage one desktop: rename, color, devices and grants, per-device permission, revoke desktop |
+| `/desktops/:id` | session | Manage one desktop: rename, color, devices and grants, per-device permission (lower now, request raise), revoke device, "add another device" link, revoke desktop |
+| `/desktops/:id/verify#fp=<full hex>` | session | Re-pin after "Desktop key changed": compares the directory key of `GET /api/desktops/:id` with `#fp` (the link or QR shown in desktop Settings > Web app > "Verify on another device"); on match it replaces the pin, on mismatch it blocks. There is no "trust new key" button |
 | `/d/:desktopId` | session + link | Home for one desktop: projects and recent sessions (catalog) |
 | `/d/:desktopId/p/:projectId` | session + link | Project: sessions list (`sessions.list` paging) |
 | `/d/:desktopId/p/:projectId/files/$` | session + link | File browser and viewer (splat path) |
@@ -58,7 +59,8 @@ Reuse rule: code taken from the old Tauri React app (`src/`) is copied into `web
 | `/d/:desktopId/s/:sessionId` | session + link | Transcript and composer. Project is resolved from the catalog, so push links need only desktop and session |
 | `/d/:desktopId/monos/:monoId` | session + link | Mono chat |
 | `/d/:desktopId/monos/:monoId/profile` | session + link | Mono profile; children: `/edit`, `/habit/:id`, `/documents`, `/file/:name` |
-| `/d/:desktopId/settings` | session + link | Per-desktop: model defaults, project selection view, notification categories |
+| `/d/:desktopId/cloud` | session + link | Cloud instance list: state, sessions per instance, Stop and Resume (U-17) |
+| `/d/:desktopId/settings` | session + link | Per-desktop: model defaults, project selection view, notification categories, Reconnect row |
 | `/settings` | session | Account: passkeys, recovery codes, active sessions, notifications, theme, install |
 | `/admin`, `/admin/users`, `/admin/invites` | session, role admin, fresh | Minimal admin (security.md section 4) |
 | `/install` | public | Add to Home Screen guide, push enable button |
@@ -90,7 +92,7 @@ Connect sequence:
 1. `GET /api/desktops/:id` returns `{publicKey, fingerprint, name}` (the directory). The device pins `publicKey` in IndexedDB on first success; a later change blocks the link with a "desktop key changed" screen.
 2. Open `wss://HOST/relay/device/:desktopId?device=<deviceId>` (cookie authenticates; section 4.4).
 3. Handshake: send relay frame `HS1` with Noise message 1; receive `HS2`; both sides now hold transport CipherStates (section 5.3).
-4. First encrypted message from the desktop is `{"type":"state","state":"pending"|"confirmed","permission":"read"|"control","proto":1,"desktop":{"name","version"}}`. In `pending` the store shows "Confirm this device on the desktop" with the device fingerprint and the pinned desktop fingerprint (the user compares both with the desktop dialog, section 6.3); requests are not sent. `confirmed` moves to `ready`.
+4. First encrypted message from the desktop is `{"type":"state","state":"pending"|"confirmed"|"revoked","permission":"read"|"control","proto":1,"capabilities":[...],"desktop":{"name","version"}}`. `capabilities` is a string list (for example `approvals`, `cloud`, `cloudStart`, `cloudMove`, `gitPush`, `monoTools`, `monoFiles`): the web hides what is not advertised and shows "Update Monoptah on your desktop to use <feature>"; a `proto` mismatch shows a blocking screen (features.md N-23). A permission or selection change sends a new `state` message to every live channel of that device, and so does a change of a desktop toggle that maps to a capability ("Remote cloud start" to `cloudStart`, "Remote push in Git" to `gitPush`, and `cloudMove`, which needs both): the new `capabilities` go to every live channel of every device. In `pending` the store shows "Confirm this device on the desktop" with the device fingerprint and the pinned desktop fingerprint (the user compares both with the desktop dialog, section 6.3); requests are not sent. `confirmed` moves to `ready`.
 5. Requests: allocate `rid` (u32, per session), send JSON envelope, resolve on matching `rid` response, timeout 35 s (desktop handler 30 s, `crates/mobile-link/src/transport.rs:160`). Watches: send with `"watch":true`, expect `{rid, ok:true, watching:true}`, then frames; `{rid, ok:true, heartbeat:true}` every 25 s; the client treats 75 s of silence as dead.
 6. Keepalive: client sends WebSocket text `ping` every 30 s; the DO auto-responds `pong` without waking (section 4.4). It also keeps proxies from idling the socket out.
 
@@ -101,6 +103,8 @@ Resync and reconnect:
 - Socket close: backoff `min(30 s, 0.5 s * 2^n) * random(0.5..1)`, reset after 10 s of `ready`. While `document.hidden` no reconnect is attempted; it happens on the next `visible`. `navigator.onLine === false` pauses attempts until the `online` event.
 - Close codes (section 4.5) decide behaviour: `4003` or `4011` stop reconnecting and show "Access revoked" (sets `revoked`); `4009` replaced (another tab or reconnect) retries once; `4010`/`4008` back off 60 s.
 - Handshake failure after reconnect always starts a fresh Noise session; Noise sessions are never resumed.
+- A desktop restart ends every session with `BYE`: devices re-handshake and reopen their watches. The client never auto-resends a mutation after a reconnect: it re-reads state (`conversation.read`), and the optimistic turn reconciles or shows "Not sent, retry".
+- The pending screen of a device survives reconnects (the grant is server state, section 7.2).
 
 ### 3.3a Reusing the Tauri React code
 
@@ -159,7 +163,7 @@ One Worker: `worker/src/index.ts` exports `default { fetch }` (Hono app) and the
   "durable_objects": { "bindings": [{ "name": "ROOM", "class_name": "DesktopRoom" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["DesktopRoom"] }],
   "d1_databases": [{ "binding": "DB", "database_name": "monoptah", "database_id": "<id>", "migrations_dir": "worker/migrations" }],
-  "vars": { "RP_ID": "zptah.app", "RP_ORIGIN": "https://zptah.app", "VAPID_PUBLIC_KEY": "<b64url>", "VAPID_SUBJECT": "mailto:admin@zptah.app" }
+  "vars": { "RP_ID": "zptah.app", "RP_ORIGIN": "https://zptah.app", "VAPID_PUBLIC_KEY": "<b64url>", "VAPID_SUBJECT": "mailto:admin@zptah.app", "MAX_USERS": "150" }
 }
 ```
 
@@ -174,14 +178,14 @@ Auth legend: **public**; **session** (valid cookie session); **fresh** (session 
 | Method and path | Auth | Purpose |
 |---|---|---|
 | `GET /api/health` | public | Liveness probe for monitoring (`{ok: true}`, no D1 read) |
-| `POST /api/auth/register/options` | public, rate-limited | Validate invite, handle; return WebAuthn creation options (`userVerification: required`, `residentKey: required`) |
-| `POST /api/auth/register/verify` | public | Verify attestation, create user, passkey, 10 recovery codes (returned once), session |
+| `POST /api/auth/register/options` | public, rate-limited | Validate invite, handle (immutable) and displayName; return WebAuthn creation options (`userVerification: required`, `residentKey: required`). Fails with the same generic error as a bad invite while `invites_paused` is set or the user count has reached `MAX_USERS` (section 4.4) |
+| `POST /api/auth/register/verify` | public | Verify attestation, create user, passkey, 10 recovery codes (returned once), session. Re-checks the pause flag and `MAX_USERS` in the same batch that consumes the invite (generic error on failure) |
 | `POST /api/auth/login/options` | public, rate-limited | Discoverable-credential request options |
 | `POST /api/auth/login/verify` | public | Verify assertion, check counter, create session |
 | `POST /api/auth/reauth/options`, `POST /api/auth/reauth/verify` | session | Fresh assertion for sensitive actions |
-| `POST /api/auth/recover` | public, rate-limited | `{handle, code}`; creates a `recovery_only` session |
-| `POST /api/auth/logout` | session | Delete current session row |
-| `GET /api/me` | session | User, role, invites left, whether `recovery_only` |
+| `POST /api/auth/recover` | public, rate-limited | `{handle, code}`; creates a `recovery_only` session; consumes the code; device keys, desktops, grants and invite count are unchanged |
+| `POST /api/auth/logout` | session | Delete current session row and call `room.revoke` for that session's sockets (section 4.4) |
+| `GET /api/me` | session | User, role, invites left, whether `recovery_only`, `recoveryAckAt` (null forces a regenerate at sign-in) |
 | `PATCH /api/me` | session | Change display name |
 | `DELETE /api/me` | fresh | Delete the account and all its rows (security.md section 10) |
 | `GET /api/audit` | session | Own audit events (paged), for the account activity view |
@@ -190,11 +194,11 @@ Auth legend: **public**; **session** (valid cookie session); **fresh** (session 
 | `POST /api/passkeys/options`, `POST /api/passkeys/verify` | fresh (or `recovery_only`) | Add a passkey |
 | `PATCH /api/passkeys/:id`, `DELETE /api/passkeys/:id` | fresh | Rename; delete (never the last one) |
 | `POST /api/recovery-codes/regenerate` | fresh | Replace all codes, return 10 new ones once |
-| `GET /api/invites`, `POST /api/invites`, `DELETE /api/invites/:id` | session | List own; create (quota); revoke unused |
+| `GET /api/invites`, `POST /api/invites`, `DELETE /api/invites/:id` | session | List own; create (quota; `code: invites_paused` while paused or at `MAX_USERS`); revoke unused |
 | `POST /api/pair/start` | public, rate-limited per IP | Desktop starts device authorization (section 6.4) |
 | `POST /api/pair/poll` | public (secret `device_code` + `verifier`) | Desktop polls; on approval receives its token once |
 | `GET /api/pair/:userCode` | session | Show machine name, fingerprint, confirmation code |
-| `POST /api/pair/:userCode/approve` | fresh | Bind desktop key to the user, mint token |
+| `POST /api/pair/:userCode/approve` | fresh | Bind desktop key to the user, mint token. Optional `{replaces: desktopId}` re-pairs an existing desktop (section 6.7) |
 | `POST /api/pair/:userCode/deny` | session | Deny |
 | `GET /api/desktops` | session | List with `online` (DO presence), name, color, pending count |
 | `GET /api/desktops/:id` | session (owner) | Directory entry incl. `publicKey`, `fingerprint` |
@@ -206,17 +210,19 @@ Auth legend: **public**; **session** (valid cookie session); **fresh** (session 
 | `GET /api/desktops/:id/grants` | session (owner) | Grants with state, fingerprint, permission |
 | `PUT /api/desktops/:id/grants/:deviceId` | session (owner); fresh to revoke | Set `requestedPermission`, or `state: "revoked"` (server blocks the relay join at once) |
 | `GET /api/desktop/me` | token `relay` | Desktop identity and account handle |
+| `DELETE /api/desktop/me` | token `relay` | Unpair: the desktop revokes its own token and the room closes its sockets (section 6.7) |
 | `GET /api/desktop/grants` | token `grants` | Grants plus device public keys for this desktop (desktop applies them, section 7.5) |
-| `POST /api/desktop/grants/:deviceId/state` | token `grants` | Desktop reports `confirmed`, `pending`, `revoked`, and the permission it applied |
+| `POST /api/desktop/grants/:deviceId/state` | token `grants` | Desktop reports `confirmed`, `pending`, `revoked`, and the permission it applied; `revoked` calls `room.revoke` for that device |
 | `GET /api/push/vapid-key` | public | VAPID public key |
 | `POST /api/push/subscriptions` | session | Store `{endpoint, keys, deviceId, vapidKeyId}` |
 | `DELETE /api/push/subscriptions/:id` | session | Remove |
 | `PUT /api/push/prefs/:desktopId` | session (owner) | Enable and categories per desktop |
-| `POST /api/push/notify` | token `push` | Desktop asks the Worker to push (section 8) |
+| `POST /api/push/notify` | token `push` | Desktop asks the Worker to push to the listed devices (section 8) |
 | `GET /api/admin/users` | admin | Users, status, invite tree position, desktop counts |
 | `POST /api/admin/users/:id/block` | admin | `{cascade: boolean, reason}` |
 | `POST /api/admin/users/:id/unblock` | admin | Unblock one user (never cascades) |
 | `POST /api/admin/users/:id/invites` | admin | Grant extra invites |
+| `GET /api/admin/settings`, `PUT /api/admin/settings` | admin | `{invitesPaused, maxUsers, userCount}`; `PUT {invitesPaused: boolean}` is the "Pause invites" switch (audited) |
 | `GET /api/admin/audit` | admin | Paged audit log |
 | `GET /relay/desktop/:desktopId` | token `relay` | WebSocket upgrade for the desktop (section 4.4) |
 | `GET /relay/device/:desktopId?device=ID` | session + device grant | WebSocket upgrade for a device |
@@ -227,7 +233,7 @@ All ids are random UUIDv4 text unless noted. Times are unix seconds (integer). S
 
 | Table | Key columns |
 |---|---|
-| `users` | `id` PK; `handle` UNIQUE (3-32 chars, lowercase); `display_name`; `role` (`user`/`admin`); `status` (`active`/`blocked`); `invited_by` FK users (null for the bootstrap admin); `invite_id` FK invites; `invites_granted` int (default 3); `blocked_at`; `blocked_reason`; `blocked_via` (user id of the branch root that cascaded, or null); `created_at` |
+| `users` | `id` PK; `handle` UNIQUE (3-32 chars, lowercase); `display_name`; `role` (`user`/`admin`); `status` (`active`/`blocked`); `invited_by` FK users (null for the bootstrap admin); `invite_id` FK invites; `invites_granted` int (default 3); `blocked_at`; `blocked_reason`; `blocked_via` (user id of the branch root that cascaded, or null); `recovery_ack_at` (set when the user confirms "I saved these"; null at the next sign-in forces a regenerate); `created_at` |
 | `passkeys` | `id` PK (credential id, base64url); `user_id` FK; `public_key` BLOB; `counter` int; `transports` JSON; `device_type`; `backed_up` bool; `name`; `created_at`; `last_used_at` |
 | `challenges` | `id` PK; `purpose` (`register`/`login`/`reauth`/`addpasskey`); `user_id` nullable; `challenge`; `payload` JSON (invite, handle); `expires_at` (5 min); consumed on use |
 | `recovery_codes` | `id` PK; `user_id` FK; `code_hash` (HMAC-SHA-256 with `RECOVERY_PEPPER`, hex); `batch` int; `used_at`; `created_at` |
@@ -240,10 +246,11 @@ All ids are random UUIDv4 text unless noted. Times are unix seconds (integer). S
 | `push_subscriptions` | `id` PK; `user_id`; `device_id`; `endpoint` UNIQUE; `p256dh`; `auth`; `vapid_key_id` (which VAPID public key the subscription was created with, for rotation); `ua`; `created_at`; `last_success_at`; `failures` int |
 | `push_prefs` | PK (`user_id`, `desktop_id`); `enabled` bool; `categories` JSON (`agentFinished`, `agentInput`, `monoMessages`) |
 | `pairing_requests` | `id` PK; `user_code` UNIQUE (8 chars, ambiguity-free alphabet); `device_code_hash`; `challenge` (SHA-256 of the desktop's verifier); `desktop_public_key`; `machine_name`; `os`; `confirmation_code`; `status` (`pending`/`approved`/`denied`/`expired`/`consumed`); `user_id`; `desktop_id`; `created_at`; `expires_at` (10 min); `last_polled_at`; `ip_hash` |
+| `settings` | `key` PK; `value` (text); `updated_at`; `updated_by` FK users. Row `invites_paused` (`0`/`1`, absent = `0`) is the "Pause invites" switch; written only by `PUT /api/admin/settings` |
 | `audit_log` | `id` PK; `ts`; `actor_user_id`; `actor_kind` (`user`/`desktop`/`admin`/`system`); `action`; `target_type`; `target_id`; `meta` JSON (no secrets, no content) |
 | `rate_limits` | PK (`key`, `window_start`); `count`. Used for auth, pairing and notify only; relay limits live in the DO and the general per-session API limit is in memory per isolate |
 
-Indexes: `passkeys(user_id)`, `sessions(user_id)`, `sessions(idle_expires_at)`, `invites(created_by)`, `users(invited_by)` (branch walks), `desktops(user_id)`, `devices(user_id)`, `device_grants(desktop_id)`, `push_subscriptions(user_id)`. A daily cron trigger deletes expired `challenges`, `sessions`, `pairing_requests`, `rate_limits` rows and audit rows older than the retention (security.md section 10).
+Indexes: `passkeys(user_id)`, `sessions(user_id)`, `sessions(idle_expires_at)`, `invites(created_by)`, `users(invited_by)` (branch walks), `desktops(user_id)`, `devices(user_id)`, `device_grants(desktop_id)`, `push_subscriptions(user_id)`. A daily cron trigger deletes expired `challenges`, `sessions`, `pairing_requests`, `rate_limits` rows, `pending` `device_grants` older than 7 days, and audit rows older than the retention (security.md section 10).
 
 ### 4.4 Durable Object relay: `DesktopRoom`
 
@@ -256,7 +263,7 @@ Who may join (checked in the Worker before forwarding the upgrade; the DO has no
 | `desktop` | `Authorization: Bearer <desktop token>` on the upgrade request | `desktop_tokens` hash lookup, not revoked, scope `relay`, desktop not revoked, owner not blocked, token's `desktop_id` equals the path id |
 | `device` | Session cookie, `Origin` equals `RP_ORIGIN`, query `device=<deviceId>` | Valid unrevoked session (not `recovery_only`), `devices.user_id` equals session user, device not revoked, `desktops.user_id` equals session user, `device_grants` row exists and `state != 'revoked'` (a `pending` grant may join so it can handshake and be confirmed on the desktop) |
 
-The Worker forwards the upgrade to the DO with internal headers `x-role`, `x-device-id`, `x-user-id` (client-supplied copies are stripped). The DO calls `ctx.acceptWebSocket(ws, [tag])` with tag `desktop` or `device:<deviceId>` and `ws.serializeAttachment({role, deviceId, userId, joinedAt})` (well under the 16 KiB limit). Nothing else is kept in memory; any state needed after hibernation is in the attachment or DO storage.
+The Worker forwards the upgrade to the DO with internal headers `x-role`, `x-device-id`, `x-user-id` (client-supplied copies are stripped). The DO calls `ctx.acceptWebSocket(ws, [tag])` with tag `desktop` or `device:<deviceId>` and `ws.serializeAttachment({role, deviceId, userId, sessionIdHash, joinedAt})` (well under the 16 KiB limit). Nothing else is kept in memory; any state needed after hibernation is in the attachment or DO storage.
 
 Routing of opaque frames (frame layout in section 5.1):
 
@@ -265,7 +272,7 @@ Routing of opaque frames (frame layout in section 5.1):
 - Relay-originated control frames (type `CTRL`, JSON body, metadata only): to devices `{"t":"presence","desktop":"online"|"offline"}`; to the desktop `{"t":"device","id","event":"joined"|"left"}` and `{"t":"grants"}` (re-sync grants, section 7.5).
 - The DO never parses ciphertext and never logs frame bytes.
 
-Presence: online means a live `desktop` socket exists. `GET /api/desktops` asks each DO (`room.presence()` RPC, parallel; users hold few desktops) and merges the answer; D1 `desktops.last_seen_at` is written only when the desktop socket closes (not per heartbeat) to spare the 100,000 writes/day free budget. Devices get a `presence` control frame when the state changes.
+Presence: online means a live `desktop` socket exists and its last keepalive `ping` arrived within 90 s (read through the auto-response timestamp of the socket, `ctx.getWebSocketAutoResponseTimestamp`). `GET /api/desktops` asks each DO (`room.presence()` RPC, parallel; users hold few desktops) and merges the answer; D1 `desktops.last_seen_at` is written only when the desktop socket closes (not per heartbeat) to spare the 100,000 writes/day free budget. A device gets a `presence` CTRL frame when it joins and whenever the state changes.
 
 Per-room quotas (constants in `web/protocol/limits.ts`):
 
@@ -285,12 +292,13 @@ Per-account quotas (enforced by the Worker at pairing and device registration; v
 | Desktops per user | 5 | `MAX_DESKTOPS_PER_USER=5` |
 | Devices per user | 10 | `MAX_DEVICES_PER_USER=10` |
 | Invites per user | 3 | `invites_granted` (admin can grant more) |
+| Registered users (whole instance) | official host 150; self-host 0 (off, unlimited) | `MAX_USERS` (a count of `users` rows incl. blocked) |
 
-Self-hosters may change the first two in `vars`. The official host `zptah.app` uses the defaults. Domain rule: `RP_ID` is `zptah.app` and must never change (every passkey would break); nothing else may be hosted on `zptah.app` or its subdomains.
+Self-hosters may change the first two and `MAX_USERS` in `vars`. Capacity control (capacity.md section 4, security.md section 4): when `settings.invites_paused` is `1`, or `MAX_USERS` is above 0 and the `users` count has reached it, `POST /api/invites` answers `code: invites_paused` and registration fails with the generic invalid-invite error (the check runs in the registration batch, so two parallel registrations cannot pass the cap together). Existing users, invites already issued and sign-in are unaffected. The official host `zptah.app` uses the defaults. Domain rule: `RP_ID` is `zptah.app` and must never change (every passkey would break); nothing else may be hosted on `zptah.app` or its subdomains.
 
 Hibernation: no timers or alarms in the DO, so idle rooms are evicted while sockets stay open. `ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping','pong'))` answers keepalives without waking the object. Because the object may be reconstructed on every message, the constructor does no work beyond reading bindings.
 
-Revocation path: Worker handlers (`DELETE /api/desktops/:id`, `PUT .../grants/:deviceId` with `revoked`, `DELETE /api/devices/:id`, admin block) call an internal DO method `room.revoke({deviceId?}|{all:true}, code)` that closes the matching sockets with `4003` or `4011`.
+Revocation path: Worker handlers (`DELETE /api/desktops/:id`, `PUT .../grants/:deviceId` with `revoked`, `DELETE /api/devices/:id`, admin block) call an internal DO method `room.revoke({deviceId?}|{sessionIdHash?}|{all:true}, code)` that closes the matching sockets with `4003`, `4011` or (for a revoked session) `4001`. The desktop-side revoke (`POST /api/desktop/grants/:deviceId/state` with `revoked`) calls it too. Logout, "sign out everywhere", recovery and block call `room.revoke({sessionIdHash})` for the sockets of the revoked sessions on each of the user's desktops (at most 5 DO calls).
 
 ### 4.5 Close codes
 
@@ -300,12 +308,12 @@ Revocation path: Worker handlers (`DELETE /api/desktops/:id`, `PUT .../grants/:d
 | 1001 | going away (deploy) | reconnect immediately once |
 | 1008 | policy | no retry, show error |
 | 1009 | message too big | bug; no retry |
-| 4001 | unauthorized (cookie or token invalid) | device: go to `/login`; desktop: report "token invalid" |
-| 4003 | revoked (grant, device, desktop or token) | stop; show "Access revoked" |
+| 4001 | unauthorized (cookie or token invalid) | device: go to `/login`; desktop: stop reconnecting and show "Web app: access revoked, pair again" |
+| 4003 | revoked (grant, device, desktop or token) | device: stop; show "Access revoked"; desktop: stop reconnecting and show "Web app: access revoked, pair again" |
 | 4008 | rate limited | back off 60 s |
 | 4009 | replaced by a newer connection | retry once |
 | 4010 | room quota exceeded | back off 60 s |
-| 4011 | account blocked | stop; show blocked screen |
+| 4011 | account blocked | device: stop; show blocked screen; desktop: stop reconnecting and show "Web app: access revoked, pair again" |
 | 4012 | protocol error | reconnect, new handshake |
 
 ## 5. Protocol (`web/protocol`)
@@ -380,25 +388,28 @@ The plaintext inside `MSG` reuses the existing shapes verbatim (`crates/mobile-l
 { "rid": 8, "ok": true, "result": { /* frame: usageLimit, busy, older, order, question, turns, patches */ } }
 { "rid": 8, "ok": true, "heartbeat": true }
 // session state (desktop -> device, no rid)
-{ "type": "state", "state": "pending|confirmed|revoked", "permission": "read|control", "proto": 1, "desktop": { "name": "...", "version": "..." } }
+{ "type": "state", "state": "pending|confirmed|revoked", "permission": "read|control", "proto": 1, "capabilities": ["cloud"], "desktop": { "name": "...", "version": "..." } }
 ```
 
-The `error` string stays; the optional additive `code` (`busy`, `forbidden`, `read_only`, `not_selected`, `path_denied`, `revoked`, `disabled`, `too_large`, `unsupported_target`) gives the web client a stable key (gap G14, security.md section 7). `watch` frame semantics, `from`/`append` UTF-16 offsets and idempotency receipts are unchanged (`crates/monocode-core/src/mobile/watch.rs:65-158`). Rules: `id` required for app methods and at most 128 chars (`host.rs:698-701`); at most 16 pending requests host-wide and 4 watches per device (`host.rs:57-58`); heartbeat period for web is 25 s instead of 10 s to keep DO message billing low (capacity.md).
+The `state` message is re-sent on a permission or selection change and on a capability toggle change (3.3 step 4), so a toggle flipped on the desktop shows or hides the web feature without a reconnect.
+
+The `error` string stays; the optional additive `code` (`busy`, `forbidden`, `read_only`, `not_selected`, `path_denied`, `revoked`, `disabled`, `too_large`, `unsupported`, `unsupported_target`, `starting`, `auto_stopping`, `instance_busy`) gives the web client a stable key (gap G14, security.md section 7). `watch` frame semantics, `from`/`append` UTF-16 offsets and idempotency receipts are unchanged (`crates/monocode-core/src/mobile/watch.rs:65-158`). Rules: `id` required for app methods and at most 128 chars (`host.rs:698-701`); at most 16 pending requests host-wide and 4 watches per device (`host.rs:57-58`); heartbeat period for web is 25 s instead of 10 s to keep DO message billing low (capacity.md).
 
 ### 5.6 Versioning
 
-Three independent counters: relay frame `version` (byte 0), Noise prologue string `monoptah-web/N`, and the JSON `"version": 1` already enforced by the host (`host.rs:641`). The `state` message carries `proto`; the client refuses a desktop whose `proto` is higher than it knows and shows "Update the web app" (the SW update prompt), and a desktop refuses an older `HS1` prologue with `ERROR`/`BYE` and a visible "Update Monoptah" message. Method set discovery is by error (`Unsupported mobile operation`), as today.
+Three independent counters: relay frame `version` (byte 0), Noise prologue string `monoptah-web/N`, and the JSON `"version": 1` already enforced by the host (`host.rs:641`). The `state` message carries `proto`; the client refuses a desktop whose `proto` is higher than it knows and shows the blocking screen "Reload to update the web app" (the SW update prompt), and a desktop refuses an older `HS1` prologue with `ERROR`/`BYE` and a visible "Update Monoptah on your desktop" message. Method set discovery is by `capabilities` (N-23), with the error `Unsupported mobile operation` as the fallback, as today.
 
 ## 6. Desktop changes (Monoptah Native)
 
 ### 6.1 Transport beside QUIC
 
-- New module `crates/monocode-core/src/mobile/web_link/` (`mod.rs`, `relay.rs` outbound WebSocket client with reconnect, `noise.rs` using `snow`, `session.rs` per-device sessions, `frame.rs`). It runs as a task started in `MobileHost::start` next to the QUIC `server_endpoint` (`host.rs:512-557`); QUIC for phones is unchanged and may be on or off independently.
-- **The seam**: `serve` receives two closures bound to `MobileHost::handle` (`host.rs:640`) and `MobileHost::watch` (`host.rs:734`) (`host.rs:543-554`, signature at `transport.rs:91-97`). The web transport calls the same two closures with `peer = fingerprint hex of the device's Noise static key`, so allowlist, dedup (`mobile_command`), backpressure and `WatchSink` work as is.
+- New module `crates/monocode-core/src/mobile/web_link/` (`mod.rs`, `relay.rs` outbound WebSocket client with reconnect, `noise.rs` using `snow`, `session.rs` per-device sessions, `frame.rs`). It runs as a task that starts independently of the QUIC bind: today `MobileHost::handle` and `watch` reject everything when the QUIC `config.enabled` is false (`crates/monocode-core/src/mobile/host.rs:651`) and `start` is tied to the QUIC bind (`host.rs:512-537`). The spec adds a separate `web_enabled` flag, gates per transport, and the port-mapping router does not run when only the web path is on. QUIC for phones is unchanged and may be on or off independently.
+- **The seam**: `serve` receives two closures bound to `MobileHost::handle` (`host.rs:640`) and `MobileHost::watch` (`host.rs:734`) (`host.rs:543-554`, signature at `transport.rs:91-97`). The web transport calls the same two closures with `peer = fingerprint hex of the device's Noise static key`, so allowlist, dedup (`mobile_command`), backpressure and `WatchSink` work as is. **Device identity in core**: `Request` (`host.rs:125`) and `WatchStart` (`host.rs:141`) carry no device identity today. Both gain `device: DeviceContext {id, kind, permission, projects, monos}`; the permission class and the web-only denials are checked in core (`handle` and `watch`); selection by `projectId` or `monoId` is checked in core; `conversationId` to project resolution happens in the app (`mobile_target`, `crates/monocode-gpui/src/shell/mobile_host.rs:632`) using the `DeviceContext`. **Ordering**: on the web channel mutations are processed in order per channel (QUIC serves one request at a time, `crates/mobile-link/src/transport.rs:158`); reads may run concurrently. **Web-only answers**: `workspace.list` strips `addresses` (`host.rs:677`) for web devices; `device.push` and `project.fileHighlight` answer `code: unsupported`; the desktop "Your phones" list and the Expo `push_tokens` filter by `kind: phone`.
+- **Core-answered methods**: `workspace.list`, `sessions.list`, `device.leave` and `device.push` are answered inside `MobileHost::handle` from `inner.catalog` and `inner.config` (`host.rs:640-700`) and never reach the app, so the pre-call `policy::authorize` cannot filter their replies. `handle` therefore also applies a reply filter to the two catalog replies (selection, then the cloud scope: cloud and remote sessions and the new fields are stripped for QUIC phones, which keep today's lists), answers `device.selection` through the policy module (the host persists the validated narrower selection), and closes every open watch of a device when its config changes (selection, permission, revoke); the client reopens with `from` and the app-side check runs again (the core `Watcher` holds only `peer` and `sink`). Seam names: workstreams.md 3.2.
 - **Refactor**: extract the post-handshake logic of `serve` (response wrapping `transport.rs:165-168`, watch accept frame `:202-211`, heartbeat `:217-225`, Gate recheck before each request and frame `:124-139, 228-236`, 30 s handler timeout `:160`) into a generic over a small duplex trait, with one impl for a QUIC bidi stream and one for a Noise channel. Heartbeat period becomes a parameter (10 s QUIC, 25 s web).
 - The desktop is an **outbound** client: no inbound port, router mapping or `remote_address` is needed for the web path. `inner.endpoint` (`host.rs:182`) is generalized into a transport-neutral status so Settings shows "Web app: connected/connecting/offline".
 - Identity: `identity_store.rs` gains a second sealed row `web_identity` (X25519 static key, desktop id, desktop token, relay URL) using the same `credentials.key` sealing (`crates/monocode-core/src/mobile/identity_store.rs:1-15`, `accounts/sealed.rs`). The token is never written to `mobile-access.json`.
-- `Device` (`host.rs:62-69`) gains `kind` (`phone`/`web`), `permission`, `projects`/`monos` selection, `created_at`, `last_seen`; all `#[serde(default)]` so existing `mobile-access.json` files stay valid (`host.rs:60-99`). Existing phones default to `permission: control` and `kind: phone` and are not subject to web-only denials. **Project and Mono selection is enforced in `MobileHost::handle` for every device, phones included** (security.md section 7, G1): a phone's selection is stored on its row under desktop Settings "Your phones" (default: all projects), replacing the phone-only filter in `mobile/src/features/connection/selection.ts`.
+- `Device` (`host.rs:62-69`) gains `kind` (`phone`/`web`), `permission`, `projects`/`monos` selection, `created_at`, `last_seen`; all `#[serde(default)]` so existing `mobile-access.json` files stay valid (`host.rs:60-99`). `Device` also stores `server_device_id`: the session is rejected if the relay `deviceId` header does not match the id stored for that fingerprint. Existing phones default to `permission: control` and `kind: phone` and are not subject to web-only denials. **Project and Mono selection is enforced in `MobileHost::handle` for every device, phones included** (security.md section 7, G1): a phone's selection is stored on its row under desktop Settings "Your phones" (default: all projects), replacing the phone-only filter in `mobile/src/features/connection/selection.ts`.
 - Hardening hooks live where security.md section 7 places them: `MobileHost::handle` (`host.rs:640-730`) for permission, selection and audit; `mobile_session_command` and `mobile_start` (`mobile_host.rs:1400-1405, 1548-1553`) and `models.list` (`mobile_host.rs:1864`) for `runtimeMode`; `project.rs` `inside_root` and the file functions (`crates/monocode-gpui/src/mobile/project.rs:79-170`) for the deny-list.
 
 ### 6.2 Settings > Connections > "Web app"
@@ -409,19 +420,22 @@ A new card below "Your phones" (section header at `crates/monocode-gpui/src/sett
 Web app                                            [Beta]
   Host URL  [ https://zptah.app                    ]   (default: https://zptah.app)
   Status: Connected to account "alice" (relay online)        [ Unpair ]
-  [ Pair ]    -> modal: QR (384 px) + "Copy link" + "Open in browser" + user code + confirmation code
+  [ Pair ]    (disabled while paired; Re-pair = Unpair, then Pair)
+              -> modal: QR (384 px) + "Copy link" + "Open in browser" + user code + confirmation code
+  [ Verify on another device ]  -> link and QR https://HOST/desktops/:id/verify#fp=<full hex>
   Devices
    MacBook Safari   fp a1b2 c3d4 e5f6 ...   Control v   last seen 2m   [ Revoke ]
    iPhone PWA       fp 99aa 10bc ...        Read-only v last seen 1h   [ Revoke ]
    Pending: "Pixel Chrome"  fp 5c6d ...     Projects: [x] api [x] web   [ Confirm ] [ Deny ]
+   Requested: Control  "iPhone PWA"  (raise from Read-only)          [ Approve ] [ Deny ]
   Remote push in Git: [off]   Activity log: [ Open ]
 ```
 
-States: unpaired (host URL + Pair), pairing (modal with countdown 10 min), paired (account, devices), error banner (token invalid, host unreachable). New `SettingsEvent::WebPair`, `WebCancelPair`, `WebUnpair`, `WebConfirmDevice`, `WebDenyDevice`, `WebSetPermission`, `WebRevokeDevice` next to the Mobile events (`settings/mod.rs:145-155`) with a `web::Status` snapshot in core like `mobile::Status` (`host.rs:102-115`). The page keeps the existing 1 s refresh pattern (`pages/mobile.rs:118-148`). A pending device also raises a desktop notification and a badge on the Connections section, because the request can arrive while Settings is closed.
+States: unpaired (host URL + Pair), pairing (modal with countdown 10 min), paired (account, devices), error banner (token invalid, host unreachable, "Web app: access revoked, pair again" after close `4001`, `4003` or `4011`). New `SettingsEvent::WebPair`, `WebCancelPair`, `WebUnpair`, `WebConfirmDevice`, `WebDenyDevice`, `WebSetPermission`, `WebRevokeDevice` next to the Mobile events (`settings/mod.rs:145-155`) with a `web::Status` snapshot in core like `mobile::Status` (`host.rs:102-115`). The page keeps the existing 1 s refresh pattern (`pages/mobile.rs:118-148`). A raise or widening requested from the web shows as the "Requested: Control" row. A pending device also raises a desktop notification and a badge on the Connections section, because the request can arrive while Settings is closed.
 
 ### 6.3 Device confirmation
 
-A confirmation dialog (modal.rs) shows: device name (as sent, untrusted), the device fingerprint **and this desktop's own fingerprint**, each as the first 32 hex characters (128 bits) in 8 groups of 4, account handle, desktop-side project selection checkboxes (default: all rail projects checked, Monos unchecked), permission choice (default Read-only), and "Confirm" / "Deny". The web app shows the device fingerprint under the device (`/desktops/:id`) and, on the pending screen, both the device fingerprint and the pinned desktop fingerprint, so the user compares both pairs with the dialog; a mismatch of the desktop fingerprint means the directory returned a substituted key (security.md T3). Confirm writes the device into `config.devices` (`mobile-access.json`), adds the fingerprint to the Gate, reports `POST /api/desktop/grants/:deviceId/state` and sends the encrypted `state: confirmed` message.
+A confirmation dialog (modal.rs) shows: device name (as sent, untrusted), the device fingerprint **and this desktop's own fingerprint**, each as the first 32 hex characters (128 bits) in 8 groups of 4, account handle, desktop-side project selection checkboxes (default: all rail projects checked, Monos unchecked), permission choice (default Read-only), and "Confirm" / "Deny". The web app shows the device fingerprint under the device (`/desktops/:id`) and, on the pending screen, both the device fingerprint and the pinned desktop fingerprint, so the user compares both pairs with the dialog; a mismatch of the desktop fingerprint means the directory returned a substituted key (security.md T3). Confirm writes the device into `config.devices` (`mobile-access.json`), adds the fingerprint to the Gate, reports `POST /api/desktop/grants/:deviceId/state` and sends the encrypted `state: confirmed` message. The desktop persists the pending grants it reads from `GET /api/desktop/grants` (device public key and name), so Settings and a desktop notification list them even when the device is offline and the user can confirm offline against the grant's fingerprint; on the first `HS1` the static key must match the grant's key or the session gets `BYE`. The 5 min timeout drops only the pending Noise session, never the request; pending requests expire after 7 days (cron, section 4.3). A revoked device has no tombstone on the desktop: it reappears only as a new pending request, which the server-side revoked grant already blocks at relay join.
 
 ### 6.4 Pairing flow (device authorization style)
 
@@ -467,24 +481,25 @@ Device-to-desktop confirmation (first connection of a browser):
 
 ### 6.5 Push hook
 
-Where `notify_mobile` posts to Expo today (`crates/monocode-core/src/mobile/notify.rs:7`, called from `mobile_host.rs:1635-1711`), the web path adds `POST /api/push/notify` with the desktop token and minimal metadata (section 8). Expo remains for phones. Per-device category preferences move to the account (`push_prefs`), not to the desktop. The desktop sends nothing when no web account is paired or the relay path is disabled.
+Where `notify_mobile` posts to Expo today (`crates/monocode-core/src/mobile/notify.rs:7`, called from `mobile_host.rs:1635-1711`), the web path adds `POST /api/push/notify` with the desktop token and minimal metadata (section 8). Expo remains for phones. Per-device category preferences move to the account (`push_prefs`), not to the desktop. The desktop sends nothing when no web account is paired or the relay path is disabled, and nothing for reminders. Sender policy: a background thread, 10 s timeout, one retry, dropped (not queued) when offline. The request lists `deviceIds` (section 8).
 
 ### 6.6 Cloud sessions (Docker sandbox, GitHub Codespace, remote machines)
 
-Today the mobile host knows nothing about cloud sessions (`crates/monocode-core/src/mobile/host.rs:22-54` has no `cloud.*` method; the catalog in `crates/monocode-gpui/src/shell/mobile_host.rs:414-417` keeps a session only if `path_key(summary.cwd)` equals a rail project path, so a cloud session with cwd `remote://<env>/...` is most likely dropped from `workspace.list` and `sessions.list`; inferred from code, to be confirmed by H-09). The desktop already has the projection for them in the app API (`crates/monocode-core/src/mono/cloud_api.rs:128-157` `target_json`, `annotate`; `CloudApi::session_targets` `:972`).
+Today the mobile host knows nothing about cloud sessions (`crates/monocode-core/src/mobile/host.rs:22-54` has no `cloud.*` method; the catalog in `crates/monocode-gpui/src/shell/mobile_host.rs:414-417` keeps a session only if `path_key(summary.cwd)` equals a rail project path, so a cloud session with cwd `remote://<env>/...` is most likely dropped from `workspace.list` and `sessions.list`; inferred from code, to be confirmed by H-09). The desktop already has the projection for them in the app API (`crates/monocode-core/src/mono/cloud_api.rs:128-157` `target_json`, `annotate`; `CloudApi::session_targets` `:972`). Moved sessions keep their local row and cwd (`crates/monocode-core/src/cloud_sessions/continue_local.rs:4-7`), so they already reach phones as local sessions: H-09 detects them with `cloud_api::is_cloud_session_of` and gives them their cloud `target` on the web transport; QUIC phones keep today's behaviour (listed as local), recorded with a regression test.
 
 **Catalog.** `mobile_catalog_sessions` groups a session by its local twin project (`Shell::project_of`, `crates/monocode-gpui/src/shell/cloud.rs:1017`) instead of the raw cwd, so codespace and sandbox sessions appear under the project the user sees in the sidebar. Project selection (H-02) applies to that project. A session on a remote machine (`monocode-host`, no cloud binding) is grouped under its own remote project: `Shell::project_of` gives a non-cloud remote session its own cwd as its project, so there is no local twin. It is listed with the new kind `remote` when that remote project is selected; `project.*` calls on any non-local session answer `code: unsupported_target` (`crates/monocode-gpui/src/mobile/project.rs:365` says the native app has no remote projects), and the web hides Files, Changes and Git for them.
 
 **Transport scope.** Cloud and remote-machine sessions in `workspace.list` and `sessions.list`, the `target`, `cloudState`, `startup` and `cloud` fields, and the asynchronous wake reply are served only to devices on the web transport (Noise relay), or to clients that announce a capability in the handshake. QUIC phones keep today's lists and send semantics: they never see cloud or remote sessions and a phone send can never wake billable compute without a cost notice (H-09, H-10 regression test).
 
-**Fields** (read, additive, absent for old clients). `target_json` and `annotate` in `cloud_api.rs` emit only `local`, `codespace` and `sandbox` (`crates/monocode-core/src/cloud_sessions/backend.rs:88-93` names the backends); `remote` is a new kind added by H-09:
+**Fields** (the catalog fields, plus the `cloud` and `approvals` fields of `conversation.read` results and watch frames; read, additive, absent for old clients). `target_json` and `annotate` in `cloud_api.rs` emit only `local`, `codespace` and `sandbox` (`crates/monocode-core/src/cloud_sessions/backend.rs:88-93` names the backends); `remote` is a new kind added by H-09:
 
 | Where | Field | Content |
 |---|---|---|
 | `workspace.list` and `sessions.list` session card | `target` | `{kind: "local" or "remote" or "codespace" or "sandbox", instance?, state?}` (`instance` is the codespace or sandbox name, metadata only) |
 | same | `cloudState` | `available`, `starting`, `stopping`, `stopped`, `unavailable`, `unknown` (`state_id`, `cloud_api.rs:123`; enum at `crates/monocode-core/src/cloud_sessions.rs:465`) |
 | same | `startup` | `{step, error?}` while the instance starts or its start failed |
-| `conversation.read` result and watch frames (sent on change only) | `cloud` | `{kind, instance, state, startup?: {steps: [{id, status, startedAt, finishedAt}], current, error?}}`. The 9 step ids are `create`, `provision`, `buildContainer`, `blockingCommands`, `configureCodespace`, `connect`, `openProject`, `claudeSetup`, `lifecycleCommands`; status is `pending`, `running`, `done`, `failed`, `skipped` (`crates/monocode-core/src/cloud_sessions/startup.rs:96,202`) |
+| `conversation.read` result and watch frames (sent on change only) | `cloud` | `{kind, instance, state, startup?: {steps: [{id, status, startedAt, finishedAt}], current, error?}, kept?: true, autoStop?: {at, reason}, move?: {step, status}}`. The 9 step ids are `create`, `provision`, `buildContainer`, `blockingCommands`, `configureCodespace`, `connect`, `openProject`, `claudeSetup`, `lifecycleCommands`; status is `pending`, `running`, `done`, `failed`, `skipped` (`crates/monocode-core/src/cloud_sessions/startup.rs:96,202`). `kept: true` means a failed start left a billable instance (Stop is allowed on it). `autoStop` announces an auto-stop. `move.step` is one of 7 ids (`snapshot`, `push`, `workspace`, `upload`, `restoreCode`, `restoreConversation`, `flip`, `crates/monocode-core/src/cloud_sessions/move.rs:164-176`) |
+| `conversation.read` result and watch frames (sent on change only; an empty array clears) | `approvals` | `[{requestId, label, detail}]`: the pending tool approvals of the conversation (X-01, H-08). `label` is `Approval.title` and `detail` is `Approval.detail` (`crates/monocode-core/src/agent.rs:220-225`; provider text, untrusted, `detail` capped in length, rendered by the safe renderer). No risk field in v1. Present only when the desktop advertises `approvals` |
 
 Reads use cached state only (`STATE_TTL` 30 s, `cloud_sessions.rs:95`) and never wake an instance. `cloudState` `unknown` is shown as "Not connected" like the desktop (`crates/monocode-gpui/src/cloud_mark.rs:31-43`). A conversation whose instance has no live connection may read empty or stale; the web shows the state, not an error.
 
@@ -492,18 +507,33 @@ Reads use cached state only (`STATE_TTL` 30 s, `cloud_sessions.rs:95`) and never
 
 | Method | Maps to | Notes |
 |---|---|---|
-| `cloud.instances` (read) | `CloudApi::list` (`cloud_api.rs:571`) | `{instances: [{kind, instance, displayName, state, rawState, lastUsedAt, sessions: [{sessionId, title, busy}], costEstimatePerHour?}], backends}`. Cached or read-only data, never wakes. Filtered to instances used by sessions of selected projects (a sandbox has no repository name, so only such a link makes it relevant). The cost estimate comes from cached overview rows only (`cloud_sessions/workspaces.rs:274`), no new `gh` or `sbx` call |
-| `cloud.stop {sessionId}` or `{kind, instance}` (control) | `CloudApi::stop` (`:681`) | Recoverable. Returns the desktop's `warning` naming interrupted busy sessions. The web shows the sessions sharing the instance before sending (`plan_instance_action`, `cloud_sessions/instance_action.rs`) |
+| `cloud.instances` (read) | `CloudApi::list` (`cloud_api.rs:571`) | `{instances: [{kind, instance, displayName, state, rawState, lastUsedAt, sessions: [{sessionId, title, busy}], costEstimatePerHour?, stopReport?}], backends, otherCount?}`. Built from the cached `workspaces_overview` (30 s TTL, `crates/monocode-core/src/cloud_sessions/workspaces.rs`) with cost estimates from `WorkspaceRow`, never a fresh `gh` or `sbx` call per request; rate limited; never wakes. Filtered to instances used by sessions of selected projects. Failed and orphan instances that bill (`crates/monocode-core/src/cloud_sessions/footer_status.rs:28-41`) are listed with names only to devices whose selection is all projects; other devices get `otherCount` ("2 other instances on this desktop"). `stopReport` is `stopping`, `takingLong` or `stillRunning` (`crates/monocode-core/src/cloud_sessions/stopping.rs:54-62`) |
+| `cloud.stop {sessionId}` or `{kind, instance}` (control) | `CloudApi::stop` (`:681`) | Recoverable. `stopped: true` only means requested; progress is `stopReport`. Returns the desktop's `warning` naming interrupted busy sessions. Refused with `code: instance_busy` while the desktop archives or converts on that instance. Allowed on a `kept` instance. The web shows the sessions sharing the instance before sending (`plan_instance_action`, `cloud_sessions/instance_action.rs`) |
 | `cloud.resume {sessionId}` (control) | `CloudApi::resume` (`:728`) | Blocks for minutes, so it runs on a worker thread and answers at once with `{accepted: true}`; progress arrives as `cloud` fields in the watch frame of that session |
-| `session.start` with `target` (control, P2) | `CloudApi::begin_start` (`:948`) | `target {kind, instance: "new" or name}`; creates billable infrastructure. Rejected with `code: disabled` unless the desktop toggle "Remote cloud start" is on (default off), like "Remote push in Git" |
-| Retry of a failed start (control, P2) | `run_start` (`startup.rs`) | Same cost caveat as resume |
-| `cloud.delete`, `cloud.create`, `pullEvidence` | n/a | Never exposed. The Operator already cannot delete (`crates/monocode-core/src/app_access.rs:45`) |
+| `cloud.startOptions {projectId}` (read, P2) | `CloudApi` readiness, branch and preset lists | `{backends: [{kind, ready}], branches, machines (codespace, allowed list), sizes (sandbox presets)}`. Cached or read-only, never creates anything |
+| `session.start` with `target` (control, P2) | `CloudApi::begin_start` (`:948`) | `target` accepts only `kind`, `instance` (`"new"` or a name from `cloud.instances`), `branch`, `machine` (codespace, from `cloud.startOptions`) or `size` (sandbox preset). The Claude kit follows the desktop's saved preference (`cloud_sessions/kit_prefs.rs`); the client can never set `kit`, `template`, `image`, `cpus`, `memory` or a `ttl` (rejected `code: forbidden`). Claude only, no draft, no worktree. Rejected with `code: disabled` unless the desktop toggle "Remote cloud start" is on (default off), like "Remote push in Git" |
+| `cloud.retryStart {sessionId}` (control, P1) | `run_start` (`startup.rs`) | Retry of a failed start; cost notice, rate limited. Rebuild, open in browser and delete codespace stay desktop-only (denied) |
+| `cloud.keepRunning {sessionId}` (control, P2) | auto-stop module (`crates/monocode-gpui/src/conversation/auto_stop.rs`) | Cancels a pending auto-stop. A send during an auto-stop answers `code: auto_stopping`; a web send counts as user activity, watching does not |
+| `cloud.moveToCloud`, `cloud.moveToLocal`, `cloud.cancelMove` (control, P2) | app API `sessions.moveToCloud`, `sessions.moveToLocal`, `sessions.cancelMove` (`crates/monocode-core/src/mono/move_api.rs:1-17`) | Allowed only while both desktop toggles "Remote cloud start" and "Remote push in Git" are on (a move pushes a branch, `move.rs:28-30`); cost notice; progress is the `cloud.move` field; a cancel never deletes a workspace |
+| `session.archive` with `cloud: "keep"` or `"stop"` (control) | `crates/monocode-gpui/src/shell/cloud_app_archive.rs:27-35` | Required for cloud sessions, like the app API; the web shows a cost notice because conversion may wake the instance. Today the mobile host calls `toggle_archive_now` (`mobile_host.rs:1433-1437`) and skips the keep/stop question and the local-copy conversion |
+| `session.delete` on a cloud session | n/a | Answers `code: unsupported_target` (delete on the desktop); the web hides Delete for cloud sessions |
+| `cloud.delete`, `cloud.create`, `cloud.rebuild`, open in browser, delete codespace, `pullEvidence` | n/a | Never exposed. The Operator already cannot delete (`crates/monocode-core/src/app_access.rs:45`) |
 
-**Wake on send.** `conversation.send` to a stopped cloud session already wakes the instance on the desktop (`crates/monocode-gpui/src/conversation/remote.rs:432` `reconnect_cloud`, `crates/monocode-gpui/src/cloud_wake.rs:65`; the send reaches it through `mobile_submit`, `mobile_host.rs:1497`). The host's reply wait is 25 s (`host.rs:56`) and a wake takes minutes, so the reply is asynchronous: the desktop answers the request at once with `{ok: true, wake: true}` when it started a wake, and the progress and the final delivery are visible only through the `cloud` field of the watch frame (state `starting`, then `available`, then the user turn appears). A send to a session that is still starting is queued by the desktop (`startup.rs:759` `queue_start_message`) or refused with the desktop's text (`startup.rs:740`); a failed start says to retry. Sends are idempotent by command id as today.
+**Wake on send.** Today the mobile path does not wake: `mobile_submit` defers when the history is not ready (`crates/monocode-gpui/src/conversation/mobile.rs:113-118`) and background loads never wake (`crates/monocode-gpui/src/cloud_wake.rs:5-7`), while the Operator path calls `wake_for_send` (defined at `crates/monocode-gpui/src/cloud_wake.rs:24`, called at `shell/app_commands.rs:842`) and refuses with "Retry in a minute". The host's reply wait is 25 s (`host.rs:56`) and a wake takes minutes, so on the web transport only (H-10): `conversation.send` to a cloud session whose instance is not connected calls `wake_for_send`, relies on the existing deferral (`defer_history_action`; the reload after a wake flushes queued sends) and replies `{ok: true, wake: true, queued: true}` at once; a second send while one is pending gets `code: busy`. H-10 adds only the `wake_for_send` call, the busy rule and the reply, with a test, not a new queue. Progress and the final delivery are visible through the `cloud` field of the watch frame (state `starting`, then `available`, then the user turn appears). A send while the instance is starting is refused with `code: starting` carrying the desktop's `starting_refusal` text (`crates/monocode-core/src/cloud_sessions/startup.rs:740`); the web disables Send while `cloudState` is `starting` and shows the steps. (`queue_start_message`, `startup.rs:759`, is used only for the first prompt at creation, `shell/cloud_create.rs:147`.) Sends are idempotent by command id as today.
 
 **What never goes into frames**: GitHub, Docker or account tokens, codespace or sandbox credentials, environment variables, the Claude kit or pinned account data, `web_url`, SSH targets and host pairing tokens (`Machine.ssh`), `remote_cwd`, `gh_state`, `StartRecord.log_tail`, `StartEvent::Log` lines and step `detail` text (they may hold paths, repositories and commands). `startup.error` is sanitized (no command lines or paths) and capped at a tunable length (default 200 characters, H-10 picks the final value). The core states "Secret values never pass through this module" (`cloud_api.rs:32`); the mobile projection follows that rule and a test asserts that no frame contains these fields. Instance names ride only inside the Noise tunnel: never in push payloads, and the Worker audit table stores at most the kind.
 
-**Permissions and audit.** Read methods need `read`; stop, resume, start and retry need `control`; every call is written to the desktop audit log (H-05) with device id, method, instance kind and outcome (the instance name is allowed there because the log is local). `cloud.resume` and start are rate limited per device (security.md T16). Details: security.md section 7.
+**Permissions, billing and audit.** Read methods need `read`; stop, resume, retry, start, move, keep running and archive need `control`; every call is written to the desktop audit log (H-05) with device id, method, instance kind and outcome (the instance name is allowed there because the log is local). Billing rule: control plus a cost notice for send-to-stopped, resume, retry, start, move, archive-with-conversion and continue locally; Stop is control without a cost notice; delete, create and rebuild stay denied. Wake-causing calls are rate limited per device (security.md T16). Details: security.md section 7.
+
+### 6.7 Desktop key lifecycle
+
+| Event | Behaviour |
+|---|---|
+| Unpair | The desktop calls `DELETE /api/desktop/me` (token scope `relay`) to revoke its own token and close the room, then wipes `web_identity` |
+| Pair while paired | Pair is disabled; "Re-pair" is Unpair then Pair |
+| Re-pair onto an existing desktop | On `/pair/:code`, if the account already has desktops the user may choose "This replaces <desktop>" (fresh re-auth, `POST /api/pair/:userCode/approve` with `replaces`). The desktop id, name and color are kept, the public key is swapped, old tokens are revoked and all its grants reset to `pending` (each device is re-confirmed), so no orphan row counts against the quota |
+| Unreadable `credentials.key` (identity_store `UNREADABLE`) | Treated as a reinstall: new key, new pairing, "This replaces <desktop>" |
+| A device pinned the old key | It shows "Desktop key changed" and can re-pin only by opening the verify link or QR from desktop Settings > Web app > "Verify on another device" (`https://HOST/desktops/:id/verify#fp=<full hex>`, section 3.1); never a "trust new key" button |
 
 ## 7. Desktop link: gates and permissions (reference)
 
@@ -511,40 +541,40 @@ Reads use cached state only (`STATE_TTL` 30 s, `cloud_sessions.rs:95`) and never
 
 | Class | Methods |
 |---|---|
-| read | `conversation.read`, `conversation.older`, `conversation.watch`, `models.list`, `accounts.usage` (cached usage, no `refresh`), `device.selection` (get), `workspace.list`, `sessions.list`, `project.changes`, `project.worktrees`, `project.files`, `project.file`, `project.search`, `project.fileHighlight`, `project.git`, `mono.document`, `mono.profile`, `mono.file`, `device.leave`, `cloud.instances` |
-| control | `session.configure`, `session.start`, `conversation.send`, `session.resumeUsage`, `session.resumeUsageAtReset`, `session.answerQuestion`, `session.keepQuestionOpen`, `session.cancel`, `session.rename`, `session.archive`, `session.delete`, `accounts.usage` with `refresh: true`, `project.gitAction` with `stage`, `unstage`, `generate` or a `commit` that does not push, `device.selection` (set; may only narrow, widening needs desktop confirmation), `mono.create`, `mono.update`, `cloud.stop`, `cloud.resume`, retry of a failed cloud start, `session.start` with `target` (only while the desktop toggle "Remote cloud start" is on) |
-| denied for web in v1 | `mono.saveFile`, `mono.reset`, `mono.delete`; `project.gitAction` `sync`, `pr`, and `commit` with `push: true` or `createPr: true` (the only ways the desktop pushes, `crates/monocode-gpui/src/mobile/project.rs:435-457`), unless the desktop toggle "Remote push in Git" is on (default off); `runtimeMode: "full-access"` in `session.configure`/`session.start` (denied for every remote device, phones included); `cloud.delete`, `cloud.create`, `pullEvidence` (never exposed) |
+| read | `conversation.read`, `conversation.older`, `conversation.watch`, `models.list`, `accounts.usage` (cached usage, no `refresh`), `device.selection` (get), `workspace.list`, `sessions.list`, `project.changes`, `project.worktrees`, `project.files`, `project.file`, `project.search`, `project.fileHighlight` (phones only, `unsupported` on web), `project.git`, `mono.document`, `mono.profile`, `mono.file`, `device.leave`, `cloud.instances`, `cloud.startOptions` |
+| control | `session.configure`, `session.start`, `conversation.send`, `session.answerApproval`, `session.resumeUsage`, `session.resumeUsageAtReset`, `session.answerQuestion`, `session.keepQuestionOpen`, `session.cancel`, `session.rename`, `session.archive` (a cloud session needs `cloud: "keep"` or `"stop"`), `session.delete` (not for cloud sessions: `unsupported_target`), `accounts.usage` with `refresh: true`, `project.gitAction` with `stage`, `unstage`, `generate` or a `commit` that does not push, `device.selection` (set; may only narrow, widening needs desktop confirmation), `mono.create`, `mono.update`, `cloud.stop`, `cloud.resume`, `cloud.retryStart`, `cloud.keepRunning`, `cloud.moveToCloud`, `cloud.moveToLocal`, `cloud.cancelMove` (only while "Remote cloud start" and "Remote push in Git" are on), `session.start` with `target` (only while the desktop toggle "Remote cloud start" is on) |
+| denied for web in v1 | `mono.saveFile`, `mono.reset`, `mono.delete`; `project.gitAction` `sync`, `pr`, and `commit` with `push: true` or `createPr: true` (the only ways the desktop pushes, `crates/monocode-gpui/src/mobile/project.rs:435-457`), unless the desktop toggle "Remote push in Git" is on (default off); `runtimeMode: "full-access"` in `session.configure`/`session.start` (denied for every remote device, phones included); `cloud.delete`, `cloud.create`, `cloud.rebuild`, open in browser, delete codespace, `pullEvidence` (never exposed); answered `code: unsupported` on the web transport: `device.push` (Expo tokens) and `project.fileHighlight` |
 
 `read` devices get `{ok:false, code:"read_only"}` for control methods. Details and rationale in security.md section 7.
 
 ### 7.2 Grants sync
 
-The desktop is the authority for `state` and `permission`. The server mirrors them in `device_grants` for the UI. A server-side revoke blocks the relay join immediately and sends `CTRL {"t":"grants"}`; the desktop re-reads `GET /api/desktop/grants` and removes the device from its Gate. A permission change in the web UI sets `requested_permission`; the desktop applies a lowering automatically and a raise only after local confirmation.
+The desktop is the authority for `state` and `permission`. The server mirrors them in `device_grants` for the UI. A server-side revoke blocks the relay join immediately and sends `CTRL {"t":"grants"}`; the desktop re-reads `GET /api/desktop/grants` and removes the device from its Gate. The desktop also re-syncs grants on every relay connect, not only on CTRL `grants`. A permission change in the web UI sets `requested_permission`; the desktop applies a lowering automatically and a raise or widening only after local confirmation (shown as the "Requested: Control" row, section 6.2). Every device needs one confirmation per desktop; it requests its grant on a desktop when the user first opens `/d/:desktopId` or taps "Request access" in the switcher, never automatically for all desktops. A desktop-side revoke sends `state: revoked` plus `BYE` on the live channels and posts `POST /api/desktop/grants/:deviceId/state` with `revoked`, which calls `room.revoke`; `device.leave` reports `revoked`. A permission or selection change sends a new `state` message to every live channel of that device.
 
 ## 8. Web Push flow
 
 ```
  Desktop                Worker                           Push service            PWA service worker
-   | POST /api/push/notify (Bearer token)  {category, project, status, sessionId}
+   | POST /api/push/notify (Bearer token)  {category, project, status, sessionId, monoId?, habitRun?}
    |----------------------->| check token scope push, rate limit 30/min
    |                        | owner = desktops.user_id; push_prefs enabled for category
-   |                        | for each push_subscriptions row of owner:
+   |                        | for each push_subscriptions row of the listed deviceIds (confirmed grant):
    |                        |   encrypt (RFC 8291 aes128gcm) + VAPID JWT (ES256, RFC 8292)
    |                        |-- POST endpoint (TTL 86400, Urgency high|normal, Topic) -->|
    |                        |<-- 201 / 404 / 410 (delete row) / 429 (backoff) ---------|
    |                        |                                                          |-- push event
    |                        |                                                          | showNotification(...)
-   |                                                                                  click -> open /d/:desktopId/s/:sessionId
+   |                                                                                  click -> open url (rule below)
 ```
 
 - **Subscribe**: after install, on a button click, the app calls `Notification.requestPermission()`, then `registration.pushManager.subscribe({userVisibleOnly: true, applicationServerKey: VAPID_PUBLIC_KEY})` and `POST /api/push/subscriptions`. Never on page load. iOS requires a Home Screen web app and a user gesture (https://firt.dev/notes/pwa-ios/ and https://pushpad.xyz/blog/ios-special-requirements-for-web-push-notifications, read 2026-11); minimum iOS 16.4 (secondary sources).
-- **Notify request** (`POST /api/push/notify`): `{category: "agentFinished"|"agentInput"|"monoMessages", project: "<display name>", status: "finished"|"needs_input"|"message", sessionId, desktopName?}`. No title, no assistant text, no transcript: this closes gap G8 (security.md section 7) for the web path.
-- **Sent payload** (JSON, under 1 KiB, encrypted end to end to the browser): `{"v":1,"t":"<desktop name>","b":"<project>: Finished" | "<project>: Needs your input" | "<project>: New message","url":"/d/<desktopId>/s/<sessionId>","tag":"<sessionId>"}`. Headers: `TTL: 86400`, `Urgency: high` for `agentInput` and `normal` otherwise, `Topic`: first 32 url-safe base64 chars of SHA-256(sessionId) so repeated notices for one session collapse.
+- **Notify request** (`POST /api/push/notify`): `{category: "agentFinished"|"agentInput"|"monoMessages", project: "<display name>", status: "finished"|"needs_input"|"message", sessionId, monoId?, habitRun?: true, deviceIds: [...], desktopName?}`. `habitRun: true` is set when the notice is for a Mono's habit run: the desktop sends `monoId`, `projectId` and `sessionId` together for it (`crates/monocode-gpui/src/shell/mobile_host.rs:1671-1676`) and mobile opens the session when all three are set (`mobile/src/features/notifications/SessionNotifications.tsx:211-217`). `deviceIds` are the server ids of confirmed web devices whose desktop-side selection includes the session's project or Mono; the Worker sends only to subscriptions of those devices that also hold a `confirmed` grant on that desktop. `project` is the Mono name for Mono notices. No title, no assistant text, no transcript: this closes gap G8 (security.md section 7) for the web path.
+- **Sent payload** (JSON, under 1 KiB, encrypted end to end to the browser): `{"v":1,"t":"<desktop name>","b":"<project>: Finished" | "<project>: Needs your input" | "<project>: New message","url":<URL rule>,"tag":"<sessionId>"}`. **URL rule** (built by the Worker, the only place it exists): `/d/<desktopId>/s/<sessionId>`, unless `monoId` is set and `habitRun` is not, in which case `/d/<desktopId>/monos/<monoId>`. A habit run therefore opens its session, a Mono message opens the chat. Headers: `TTL: 86400`, `Urgency: high` for `agentInput` and `normal` otherwise, `Topic`: first 32 url-safe base64 chars of SHA-256(sessionId) so repeated notices for one session collapse.
 - **When** the desktop sends mirrors the mobile rules (`mobile_host.rs:1643-1655`: only for sessions a remote device started, not while the desktop window shows that session). Account-level preferences are applied by the Worker.
 - **Sender**: WebCrypto only (ECDH P-256, HKDF-SHA-256, AES-128-GCM, ES256 JWT), an in-house sender of about 150 lines in `worker/src/push/`; `web-push` (Node) does not run on Workers (https://github.com/web-push-libs/web-push/issues/718, read 2026-11). Cross-check against a test vector and a real Chrome and Safari endpoint in the spike.
-- **Cleanup**: `404` and `410` delete the subscription; `failures` increments on other errors and the row is dropped after 5 consecutive failures; `429` honours `Retry-After`.
+- **Cleanup**: subscriptions are deleted on device revoke, forget and sign out. `404` and `410` delete the subscription; `failures` increments on other errors and the row is dropped after 5 consecutive failures; `429` honours `Retry-After`.
 - **iOS**: every push must display a notification (silent pushes get the subscription revoked); badge and sound rely on the OS. Declarative Web Push (iOS 18.4+) is a later optimization, not used in v1. Because background WebSockets are dropped, push is the only background channel; opening the notification triggers the resync of section 3.3.
-- **Click**: the SW opens `/d/:desktopId/s/:sessionId`; the link handshake then loads the transcript. If the session no longer exists the app shows the project list.
+- **Click**: the SW opens the `url` of the payload (a session, including a habit run's, or the Mono chat for a plain Mono message); the link handshake then loads the transcript. If the session no longer exists the app shows the project list.
 
 ## 9. Self-host guide (outline)
 
@@ -557,8 +587,8 @@ The desktop is the authority for `state` and `permission`. The server mirrors th
 7. `wrangler secret put RECOVERY_PEPPER` (32 random bytes, base64; losing it invalidates stored recovery codes, so back it up) and `wrangler secret put AUDIT_IP_SALT` (32 random bytes, base64).
 8. Set `RP_ID` and `RP_ORIGIN` to your own final hostname (the official host uses `zptah.app` and `https://zptah.app`). Passkeys are bound to `RP_ID`: it must never change after the first user registers, because changing it breaks every passkey. Host nothing else on that hostname or its subdomains (cookie and CSP isolation, security.md section 3.3).
 9. Custom domain: add a `routes` entry with `custom_domain: true`, or attach in the dashboard; HTTPS is mandatory.
-10. `pnpm build && wrangler deploy`.
-11. First admin: `pnpm --filter worker bootstrap -- --remote` creates a `bootstrap` invite (24 h, one use, grants `role = admin`) and prints the code once; open `/register?invite=CODE`, create a passkey, save the recovery codes.
+10. `pnpm build && wrangler deploy`. (The official host is not deployed this way: only the maintainer runs `pnpm deploy:official` from their Mac, security.md section 9.)
+11. First admin: `pnpm --filter worker bootstrap -- --remote` creates a `bootstrap` invite (24 h, one use, grants `role = admin`) and prints the code once; open `/register#invite=CODE`, choose a handle, create a passkey, save the recovery codes.
 12. In Monoptah Native set the Host URL (Settings > Connections > Web app) and Pair.
 13. Update: `git pull`, `pnpm install`, apply new migrations (`db:migrate:remote`), `pnpm build && wrangler deploy`. Every deploy disconnects all relay sockets; clients reconnect with backoff (section 3.3). Migrations are forward-only and backward compatible for one release so a rollback of the Worker works.
 14. Backups: D1 Time Travel is on by default; export with `wrangler d1 export` before risky migrations.

@@ -137,7 +137,7 @@ The binding limit is Durable Object duration (GB-s/day), then DO requests. Worke
 | Heavy | 11 | 63 | duration | about 11 |
 | Mix 70% light, 25% typical, 5% heavy (average 200 GB-s/day) | 65 | about 250 | duration | **about 60 DAU** |
 
-Headline: on the free tier expect **about 40 to 60 daily active users (about 50 desktops)** before the relay stops mid-day. At a DAU/registered ratio of 30%, that is roughly 150 to 200 registered invite-only users. Plan for upgrading earlier because a hit limit takes the whole relay down until 00:00 UTC.
+Headline: on the free tier expect **about 40 to 60 daily active users (about 50 desktops)** before the relay stops mid-day. At a DAU/registered ratio of 30%, that is roughly 150 to 200 registered invite-only users. The invite-only cap keeps the official host under these free limits: invites are the user-count control, and a hit limit takes the whole relay down until 00:00 UTC, so the admin pauses invites at 70% (section 4) and the Worker var `MAX_USERS` (official host 150, matching this headline) is the hard stop on registered users (architecture.md 4.4).
 
 Sensitivity: the result scales with watched streaming minutes, not with the number of users. One user streaming 2 hours a day uses as much as 10 light users. The 1.3 factor and the 120 frames/minute are assumptions: if the object stays awake between frames even when the agent is quiet (for example a 10 s hibernation delay after each burst), duration can be 1.5 to 2 times higher. Measure in the spike (section 5).
 
@@ -161,9 +161,9 @@ Sensitivity: the result scales with watched streaming minutes, not with the numb
 | Static assets served by the asset binding with long-lived hashed filenames; no Workers Caching | Unbilled asset requests | Worker config |
 | Single DO class, one room per desktop, shard nothing else; no global DO (a global counter DO would be woken by every request) | Keeps duration proportional to real use | architecture |
 
-## 4. Paid tier
+## 4. Paid tier (out of scope)
 
-Workers Paid is $5/month per account and includes:
+The program never moves the official host to a paid Cloudflare plan. The numbers below are reference only (for example for a self-hoster). Workers Paid is $5/month per account and includes:
 
 | Resource | Included per month | Overage | Typical user per month | 100 typical users |
 |---|---|---|---|---|
@@ -176,7 +176,7 @@ Workers Paid is $5/month per account and includes:
 
 Paid limits are monthly pools, so one bursty day no longer takes the relay down. Overage cost per extra typical user is about $0.11/month, per heavy user about $0.44/month.
 
-Threshold: move to Workers Paid when the plan shows about 70% of the free duration limit on a normal day, which is about 30 typical DAU (30 x 293 = 8,790 of 13,000 GB-s), or earlier if heavy users are present. In practice: before inviting beyond about 40 active users, or on the first day the relay returns limit errors. Self-hosters run in their own account; a single-user self-host fits comfortably on the free tier.
+Free-tier response (replaces a paid-plan threshold): when the dashboard shows about 70% of any daily free limit on a normal day (for example about 30 typical DAU, 30 x 293 = 8,790 of 13,000 GB-s), the admin turns on "Pause invites" (`PUT /api/admin/settings`, architecture.md 4.2; `POST /api/invites` then answers `invites_paused` and registration fails, security.md section 4) and the relay mitigations of section 3 are tightened (lower coalescing rate, longer ping interval). The user count is capped by `MAX_USERS` (150 on the official host) and the pause switch, so the official host stays under the free limits. A self-hoster may choose a paid plan on their own account; the official host does not.
 
 ## 5. Monitoring
 
