@@ -42,6 +42,17 @@ Order, enforced by the script (`web/scripts/deploy-official.mjs`):
 6. The script prints one line. Append it to the deploy log below in the same commit that records the deploy
    (a PR titled `docs(web): record deploy <sha>` or the next change).
 
+### Post-deploy check (first internal deploy)
+
+Batches rely on SQLite `changes()` carrying from one statement to the next inside a D1 batch (security.md 3.5), which
+the Cloudflare D1 docs do not state. On the first internal deploy, check on the real D1 that:
+
+1. One passkey login succeeds and leaves one session row and one `account.login` audit row.
+2. One session revoke (`DELETE /api/sessions/:id` of another session) deletes that row and leaves one
+   `session.revoke` audit row.
+
+If either row is missing or doubled, treat the deploy as bad and roll back.
+
 ## Rollback
 
 Migrations are forward-only and backward compatible for one release (architecture.md section 9), so the previous

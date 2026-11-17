@@ -14,6 +14,8 @@ export const MAX_TRACKED_IPS = 5000;
 
 interface Counter {
   windowStart: number;
+  /** First second after the window; the counter is stale from then on. */
+  windowEnd: number;
   count: number;
 }
 
@@ -38,8 +40,8 @@ class MemoryCounters {
     const windowStart = now - (now % windowSeconds);
     let counter = this.counters.get(key);
     if (!counter || counter.windowStart !== windowStart) {
-      if (!counter && this.counters.size >= this.maxTracked) this.makeRoom(windowStart);
-      counter = { windowStart, count: 0 };
+      if (!counter && this.counters.size >= this.maxTracked) this.makeRoom(now);
+      counter = { windowStart, windowEnd: windowStart + windowSeconds, count: 0 };
       this.counters.set(key, counter);
     }
     counter.count += 1;
@@ -50,10 +52,15 @@ class MemoryCounters {
     };
   }
 
-  /** Drops counters of past windows, then the oldest entries, so the map never exceeds its bound. */
-  private makeRoom(currentWindow: number): void {
+  /**
+   * Drops counters whose own window has ended (`windowEnd <= now`), whatever the window of the key being inserted,
+   * so a short-window key never evicts a live long-window counter. If the table is still full after that, every
+   * entry is live: the oldest inserted ones are dropped (losing a live counter, which only makes the best-effort
+   * limit looser) so the map never exceeds its bound.
+   */
+  private makeRoom(now: number): void {
     for (const [key, counter] of this.counters) {
-      if (counter.windowStart < currentWindow) this.counters.delete(key);
+      if (counter.windowEnd <= now) this.counters.delete(key);
     }
     // Map iterates in insertion order: the first keys are the oldest.
     while (this.counters.size >= this.maxTracked) {

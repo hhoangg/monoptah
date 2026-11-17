@@ -251,6 +251,30 @@ describe("the in-memory pre-filter in front of the D1 per-IP limits", () => {
     resetIpLimits();
   });
 
+  it("keeps live long-window counters when a short-window key is inserted into a full table", () => {
+    resetIpLimits();
+    const now = 1_900_000_000 - (1_900_000_000 % 3600) + 5;
+    for (let i = 0; i < MAX_TRACKED_IPS; i += 1) consumeIp(`register:ip:long-${i}`, 10, 3600, now);
+    expect(trackedIps()).toBe(MAX_TRACKED_IPS);
+    // A 60 s key in a later minute of the same hour: the 3600 s windows are still live and must not be purged.
+    consumeIp("pair-poll:ip:short", 120, 60, now + 120);
+    // The live counters survive (the table is full of live entries, so only the oldest one is trimmed): the newest
+    // long key still carries its first call, so the 10th call is the last allowed.
+    for (let i = 0; i < 9; i += 1) consumeIp(`register:ip:long-${MAX_TRACKED_IPS - 1}`, 10, 3600, now + 120);
+    expect(consumeIp(`register:ip:long-${MAX_TRACKED_IPS - 1}`, 10, 3600, now + 120)).toMatchObject({ ok: false });
+    expect(trackedIps()).toBeLessThanOrEqual(MAX_TRACKED_IPS);
+    resetIpLimits();
+  });
+
+  it("purges counters whose own window has ended when the table is full", () => {
+    resetIpLimits();
+    const now = 1_900_000_000 - (1_900_000_000 % 3600) + 5;
+    for (let i = 0; i < MAX_TRACKED_IPS; i += 1) consumeIp(`pair-poll:ip:old-${i}`, 120, 60, now);
+    consumeIp("register:ip:new", 10, 3600, now + 120);
+    expect(trackedIps()).toBe(1);
+    resetIpLimits();
+  });
+
   it("stays bounded", () => {
     resetIpLimits();
     const now = 1_900_000_000;

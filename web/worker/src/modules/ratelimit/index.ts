@@ -7,7 +7,7 @@
 // Exceeded: `429 {error, code: "rate_limited"}` with `Retry-After`; the breach is written to `audit_log` once
 // per key per window, when the count first exceeds the limit, so a flood cannot turn into a D1 write flood.
 import type { MiddlewareHandler } from "hono";
-import type { ApiRoute } from "@monoptah/protocol";
+import type { ApiRoute, RateLimitGroup } from "@monoptah/protocol";
 import { apiError, type AppContext, type AppEnv } from "../../http.ts";
 import { sha256Hex } from "../../lib/crypto.ts";
 import { clientIp, identifierHash, ipHash } from "../../lib/ip.ts";
@@ -51,7 +51,8 @@ export const LIMITS = {
 } as const satisfies Record<string, LimitSpec>;
 
 /**
- * The per-IP limit applied to every group routed by IP, checked first. For `pair-poll` and `push-notify` the
+ * The per-IP limit applied to every group routed by IP, checked first. It is a total record over `RateLimitGroup`
+ * (`null` = no per-IP limit), so a new protocol group without an entry fails typecheck. For `pair-poll` and `push-notify` the
  * per-code and per-token keys are chosen by the caller (a device code, a bearer token), so an attacker could
  * mint endless keys; this bound is per source address and cannot be dodged that way (WS-A addition to the table).
  */
@@ -62,7 +63,7 @@ export const IP_LIMITS = {
   "pair-start": LIMITS["pair-start"],
   "pair-poll": { limit: 120, windowSeconds: 60 },
   "push-notify": { limit: 120, windowSeconds: 60 },
-} as const satisfies Partial<Record<keyof typeof LIMITS, LimitSpec>>;
+} as const satisfies Record<RateLimitGroup, LimitSpec | null>;
 
 /** `Retry-After` 429 for a refused call. */
 function tooMany(c: AppContext, retryAfter: number): Response {
@@ -132,7 +133,8 @@ export function rateLimit(route: ApiRoute): MiddlewareHandler<AppEnv> {
     };
   }
   return async (c, next) => {
-    const spec = IP_LIMITS[group as keyof typeof IP_LIMITS];
+    const spec: LimitSpec | null = IP_LIMITS[group];
+    if (!spec) return next();
     const hash = await ipHash(c.env, clientIp(c.req.raw));
     const ipKey = rateLimitKey(group, "ip", hash);
     // Best-effort pre-filter with the same limit as the D1 per-IP key. A call it refuses never reaches D1; the

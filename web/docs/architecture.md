@@ -578,7 +578,7 @@ The desktop is the authority for `state` and `permission`. The server mirrors th
 
 ## 9. Self-host guide (outline)
 
-1. Prerequisites: Cloudflare account, Node 22, pnpm, `wrangler` (4.36 or later), a domain on Cloudflare.
+1. Prerequisites: Cloudflare account, Node 22.18 or newer, pnpm, `wrangler` (4.36 or later), a domain on Cloudflare.
 2. `git clone` the repo, `cd web && pnpm install --frozen-lockfile`. Every command below runs in `web/` (where `wrangler.jsonc` lives; the `wrangler` commands pass `-c wrangler.jsonc`, the `pnpm --filter @monoptah/worker` scripts pass `-c ../wrangler.jsonc` themselves).
 3. `pnpm --filter @monoptah/worker exec wrangler login` (wrangler is a dependency of the worker package; it is not installed globally by the repo). The same prefix applies to every `wrangler` command below.
 4. `wrangler d1 create monoptah`, copy the `database_id` into `wrangler.jsonc`.

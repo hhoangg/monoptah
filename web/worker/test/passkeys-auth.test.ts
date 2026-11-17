@@ -243,6 +243,33 @@ describe("signature counter", () => {
     expect((await loginWith(user.key, { counter: 6 })).res.status).toBe(200);
   });
 
+  it("answers the same 401 without a counter-refusal audit when the passkey row vanished before the batch", async () => {
+    const user = await newUser();
+    const sessionsBefore = await sessionCount(user.userId);
+    // A DB double whose batch first deletes the passkey: a passkey delete between the lookup and the batch.
+    const realDb = env.DB;
+    const vanishing = new Proxy(realDb, {
+      get(target, prop) {
+        if (prop === "batch") {
+          return async (statements: D1PreparedStatement[]) => {
+            await target.prepare("DELETE FROM passkeys WHERE id = ?").bind(user.key.credentialId).run();
+            return target.batch(statements);
+          };
+        }
+        const value = Reflect.get(target, prop, target) as unknown;
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const testEnv = Object.create(env, { DB: { value: vanishing, enumerable: true } }) as typeof env;
+    const { res, cookie } = await loginWith(user.key, { counter: 5 }, testEnv);
+    expect(res.status).toBe(401);
+    expect(cookie).toBe("");
+    expect(await env.DB.prepare("SELECT count(*) AS n FROM passkeys WHERE id = ?").bind(user.key.credentialId).first<{ n: number }>()).toEqual({ n: 0 });
+    expect(await refusals(user.userId)).toHaveLength(0);
+    expect(await logins(user.userId)).toBe(0);
+    expect(await sessionCount(user.userId)).toBe(sessionsBefore);
+  });
+
   it("accepts an authenticator that keeps the counter at 0", async () => {
     const user = await newUser();
     expect((await loginWith(user.key, { counter: 0 })).res.status).toBe(200);

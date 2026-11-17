@@ -134,6 +134,11 @@ export const loginVerify: Handler<AppEnv> = async (c) => {
     ),
   ]);
   if ((results[0]?.meta.changes ?? 0) === 0) {
+    // The update matches nothing in two cases: the counter did not increase (a lost race) or the passkey row was
+    // deleted after the lookup. Only the first is a counter refusal; the second is answered the same 401 and not
+    // audited as one (the delete itself wrote its own `passkey.delete` row).
+    const stillThere = await c.env.DB.prepare("SELECT 1 AS present FROM passkeys WHERE id = ?").bind(passkey.id).first();
+    if (!stillThere) return unauthorized(c);
     await auditCounterRefused(c, { passkeyId: passkey.id, userId: passkey.user_id, ipHash: ip, now });
     return unauthorized(c);
   }
