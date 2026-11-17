@@ -49,7 +49,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { REPOSITORY } from "./native-release-monoptah.mjs";
+import { CI_RUNS_JQ, REPOSITORY, ciRunsPath, ciVerdict, describeCi, readCiRuns } from "./native-release-monoptah.mjs";
 import { generateNotes } from "./native-release-notes.mjs";
 import { PLATFORMS, releaseVersion } from "./package-native-monoptah.mjs";
 
@@ -176,46 +176,13 @@ export function sdkProblem(sdkVersion) {
   return null;
 }
 
-// The native.yml push runs on main for a commit, in any state.
-export function ciRunsPath(sha) {
-  return `repos/${REPOSITORY}/actions/workflows/native.yml/runs?head_sha=${sha}&event=push&branch=main&per_page=20`;
-}
-// Only the successful runs, one is enough. The workflow asks the same question
-// in the plan job (tag-only mode) and in await-release (a test keeps them equal).
-export function ciSuccessRunsPath(sha) {
-  return `repos/${REPOSITORY}/actions/workflows/native.yml/runs?head_sha=${sha}&event=push&branch=main&status=success&per_page=1`;
-}
-export const CI_RUNS_JQ = "[.workflow_runs[] | {id: .id, status: .status, conclusion: .conclusion, url: .html_url}]";
-
-// "success" when any run succeeded, "pending" while a run is not completed or
-// none exists yet (it may not have been created), "failed" when every run
-// completed and none succeeded.
-export function ciVerdict(runs) {
-  if (runs.some((run) => run.conclusion === "success")) return "success";
-  if (runs.length === 0 || runs.some((run) => run.status !== "completed")) return "pending";
-  return "failed";
-}
-
-const describeRun = (run) => `run ${run.id} (${run.status === "completed" ? run.conclusion : run.status}) ${run.url}`;
-export const describeCi = (runs) =>
-  runs.length === 0 ? "no native.yml run found yet" : runs.map(describeRun).join("; ");
-
-// Reads the runs through `capture`; { runs } or { error }.
-export function readCiRuns(capture, sha) {
-  const result = capture("gh", ["api", ciRunsPath(sha), "--jq", CI_RUNS_JQ]);
-  if (result.status !== 0) return { error: (result.stderr || result.error?.message || "gh failed").trim() };
-  try {
-    const runs = JSON.parse(result.stdout);
-    if (!Array.isArray(runs)) throw new Error("not a list");
-    return { runs };
-  } catch (error) {
-    return { error: `unreadable answer (${error.message})` };
-  }
-}
+// The CI gate logic is shared with the workflow (native-release-monoptah.mjs ci-gate).
+export { CI_RUNS_JQ, ciRunsPath, ciVerdict, describeCi, readCiRuns };
 
 // Waits until native.yml succeeded for `sha`. Throws, so that nothing is tagged,
 // when a run failed or the time ran out. A few failed reads in a row are
-// tolerated (a flaky network must not waste a finished build).
+// tolerated (a flaky network must not waste a finished build); a truncated run
+// list counts as a failed read.
 export async function waitForCi(io, sha, timeoutMinutes) {
   const started = io.now();
   const limit = timeoutMinutes * 60_000;

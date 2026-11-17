@@ -22,7 +22,6 @@ import {
   CI_POLL_MS,
   CI_RUNS_JQ,
   ciRunsPath,
-  ciSuccessRunsPath,
   ciVerdict,
   evaluatePreconditions,
   failureOf,
@@ -244,7 +243,7 @@ test("gatherState: tags are detected", () => {
 test("the CI query lists the native.yml push runs on main for the commit, in any state", () => {
   assert.equal(
     ciRunsPath(SHA),
-    `repos/hhoangg/monoptah/actions/workflows/native.yml/runs?head_sha=${SHA}&event=push&branch=main&per_page=20`,
+    `repos/hhoangg/monoptah/actions/workflows/native.yml/runs?head_sha=${SHA}&event=push&branch=main&per_page=100`,
   );
 });
 
@@ -458,7 +457,7 @@ function fakeIo({ files = true, headAfter = SHA, dirtyAfter = "", stamp = null, 
         ciReads += 1;
         return answer.error !== undefined
           ? { status: 1, stdout: "", stderr: answer.error }
-          : { status: 0, stdout: JSON.stringify(answer), stderr: "" };
+          : { status: 0, stdout: JSON.stringify(Array.isArray(answer) ? { total: answer.length, runs: answer } : answer), stderr: "" };
       }
       return base(command, args);
     },
@@ -938,17 +937,16 @@ test("the workflow and native.yml give every job a timeout, and release runs are
   assert.match(release, /  publish:[\s\S]*?\n    concurrency:\n      group: native-monoptah-publish\n      cancel-in-progress: false/);
 });
 
-test("the workflow's native.yml success queries equal the single path builder", () => {
+test("the workflow gates on native.yml through ci-gate and never filters by status=success", () => {
   const workflow = read(".github/workflows/native-release-monoptah.yml");
-  // The plan job (tag-only mode) uses SHA, await-release uses PLAN_SHA.
-  for (const variable of ["SHA", "PLAN_SHA"]) {
-    const query = ciSuccessRunsPath("$" + variable).replace("repos/hhoangg/monoptah/", "repos/$GITHUB_REPOSITORY/");
-    assert.ok(workflow.includes('"' + query + '"'), query);
-  }
-  assert.equal(
-    ciSuccessRunsPath(SHA),
-    `repos/hhoangg/monoptah/actions/workflows/native.yml/runs?head_sha=${SHA}&event=push&branch=main&status=success&per_page=1`,
-  );
+  assert.ok(!workflow.includes("status=success"));
+  assert.ok(!workflow.includes("workflows/native.yml/runs"));
+  const plan = workflow.slice(workflow.indexOf("\n  plan:\n"), workflow.indexOf("\n  package:\n"));
+  const await_ = workflow.slice(workflow.indexOf("\n  await-release:\n"), workflow.indexOf("\n  publish:\n"));
+  assert.ok(plan.includes('node "$TOOLS/native-release-monoptah.mjs" ci-gate "$SHA"'));
+  assert.ok(await_.includes('node "$TOOLS/native-release-monoptah.mjs" ci-gate "$PLAN_SHA"'));
+  assert.ok(!ciRunsPath(SHA).includes("status="));
+  assert.ok(ciRunsPath(SHA).endsWith("&per_page=100"));
 });
 
 test("the workflow runs its helper scripts from its own checkout and checks their exit status", () => {

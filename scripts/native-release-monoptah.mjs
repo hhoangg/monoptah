@@ -32,6 +32,12 @@
 //       prints how many files release-files.json must list
 //   node scripts/native-release-monoptah.mjs feed-supersedes <new> [existing]
 //       prints "true" when <new> should replace <existing> as the rolling feed
+//   node scripts/native-release-monoptah.mjs ci-gate <sha>
+//       env: GH_TOKEN, GITHUB_REPOSITORY (MONOCODE_NATIVE_VERSION is not needed)
+//       requires a native.yml push run on main with conclusion "success" for
+//       <sha>. Reads the unfiltered run list (never status=success: GitHub's
+//       filtered index can miss successful runs for hours) and retries up to 6
+//       reads, 20 s apart, while nothing is visible yet or a run is pending.
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readFile, readdir, writeFile } from "node:fs/promises";
@@ -316,6 +322,80 @@ export function feedSupersedes(newFeed, existingFeed = null) {
   return compare(feedVersion(newFeed), existing) >= 0;
 }
 
+// ---- native.yml gate (shared by the workflow and native-release-macos-local.mjs) ----
+
+// The native.yml push runs on main for a commit, in any state. No status filter:
+// GitHub's `status=success` filtered index returned no runs for a run that had
+// succeeded, for hours. The conclusion is judged from the unfiltered list.
+export function ciRunsPath(sha, repository = REPOSITORY) {
+  return `repos/${repository}/actions/workflows/native.yml/runs?head_sha=${sha}&event=push&branch=main&per_page=100`;
+}
+export const CI_RUNS_JQ =
+  "{total: .total_count, runs: [.workflow_runs[] | {id: .id, status: .status, conclusion: .conclusion, url: .html_url}]}";
+
+// "success" when any run succeeded, "pending" while a run is not completed or
+// none exists yet (it may not have been created), "failed" when every run
+// completed and none succeeded. The runs API returns each run's latest attempt:
+// a rerun that failed after an earlier success reads as a failure, and a rerun
+// in progress reads as pending.
+export function ciVerdict(runs) {
+  if (runs.some((run) => run.conclusion === "success")) return "success";
+  if (runs.length === 0 || runs.some((run) => run.status !== "completed")) return "pending";
+  return "failed";
+}
+
+const describeRun = (run) => `run ${run.id} (${run.status === "completed" ? run.conclusion : run.status}) ${run.url}`;
+export const describeCi = (runs) =>
+  runs.length === 0 ? "no native.yml run found yet" : runs.map(describeRun).join("; ");
+
+// Reads the runs through `capture`; { runs } or { error }. A list that holds
+// fewer runs than the total is an error, never judged, unless it already holds
+// a successful run (enough to decide, whatever the missing runs are).
+export function readCiRuns(capture, sha, repository = REPOSITORY) {
+  const result = capture("gh", ["api", ciRunsPath(sha, repository), "--jq", CI_RUNS_JQ]);
+  if (result.status !== 0) return { error: (result.stderr || result.error?.message || "gh failed").trim() };
+  try {
+    const answer = JSON.parse(result.stdout);
+    if (!Array.isArray(answer?.runs) || !Number.isInteger(answer.total)) throw new Error("not a run list");
+    if (answer.total > answer.runs.length && !answer.runs.some((run) => run.conclusion === "success"))
+      throw new Error(`truncated list: ${answer.runs.length} of ${answer.total} runs`);
+    return { runs: answer.runs };
+  } catch (error) {
+    return { error: `unreadable answer (${error.message})` };
+  }
+}
+
+export const CI_GATE_ATTEMPTS = 6;
+export const CI_GATE_SLEEP_MS = 20_000;
+
+// Requires a successful native.yml run for `sha`. Retries read errors and
+// pending states (including no run yet) so that a short lag does not fail a
+// release; fails at once when every run finished without success. io:
+// { capture, sleep, log }.
+export async function ciGate(io, sha, { repository = REPOSITORY, attempts = CI_GATE_ATTEMPTS, sleepMs = CI_GATE_SLEEP_MS } = {}) {
+  let last = "no read made";
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const read = readCiRuns(io.capture, sha, repository);
+    if (read.error !== undefined) {
+      last = `could not read the native.yml runs (${read.error})`;
+    } else {
+      const verdict = ciVerdict(read.runs);
+      if (verdict === "success") {
+        io.log(`native.yml passed for ${sha}: ${describeCi(read.runs.filter((r) => r.conclusion === "success"))}`);
+        return;
+      }
+      if (verdict === "failed")
+        throw new Error(`native.yml has no successful push run on main for commit ${sha}: ${describeCi(read.runs)}`);
+      last = `native.yml has no successful push run on main for commit ${sha} yet: ${describeCi(read.runs)}`;
+    }
+    if (attempt < attempts) {
+      io.log(`${last}; retrying in ${sleepMs / 1000} s (${attempt}/${attempts}).`);
+      await io.sleep(sleepMs);
+    }
+  }
+  throw new Error(`${last} (after ${attempts} reads)`);
+}
+
 if (
   process.argv[1] &&
   import.meta.url === pathToFileURL(resolve(process.argv[1])).href
@@ -357,9 +437,24 @@ if (
     const existing =
       second && existsSync(second) ? await readFile(second, "utf8") : null;
     console.log(String(feedSupersedes(await readFile(first, "utf8"), existing)));
+  } else if (command === "ci-gate" && first) {
+    try {
+      await ciGate(
+        {
+          capture: (cmd, args) => spawnSync(cmd, args, { encoding: "utf8" }),
+          sleep: (ms) => new Promise((done) => setTimeout(done, ms)),
+          log: (line) => console.log(line),
+        },
+        first,
+        { repository: process.env.GITHUB_REPOSITORY || REPOSITORY },
+      );
+    } catch (error) {
+      console.error(error.message);
+      process.exit(1);
+    }
   } else {
     console.error(
-      "usage: native-release-monoptah.mjs plan [--defer-macos] [--check-planned] [published-file] | macos-ready <assets-json> | records <dir> | sign <dir> <notes-file> | file-count | feed-supersedes <new> [existing]",
+      "usage: native-release-monoptah.mjs plan [--defer-macos] [--check-planned] [published-file] | macos-ready <assets-json> | records <dir> | sign <dir> <notes-file> | file-count | feed-supersedes <new> [existing] | ci-gate <sha>",
     );
     process.exit(2);
   }

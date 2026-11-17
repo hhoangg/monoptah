@@ -262,9 +262,8 @@ jobs:
           SHA: ${{ steps.commit.outputs.sha }}
         run: |
           set -euo pipefail
-          COUNT=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/native.yml/runs?head_sha=$SHA&event=push&branch=main&status=success&per_page=1" --jq .total_count)
-          if [[ "$COUNT" -lt 1 ]]; then
-            echo "native.yml has no successful push run on main for commit $SHA. Wait for it to pass, then release again." >&2
+          if ! node "$TOOLS/native-release-monoptah.mjs" ci-gate "$SHA"; then
+            echo "The native.yml check for commit $SHA failed (see above). Wait for native.yml to pass, then release again." >&2
             exit 1
           fi
 
@@ -565,18 +564,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          COUNT=""
-          for n in 1 2 3; do
-            if COUNT=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/native.yml/runs?head_sha=$PLAN_SHA&event=push&branch=main&status=success&per_page=1" --jq .total_count); then break; fi
-            COUNT=""
-            if (( n < 3 )); then sleep 10; fi
-          done
-          if [[ -z "$COUNT" ]]; then
-            echo "Could not read the native.yml runs for commit $PLAN_SHA." >&2
-            exit 1
-          fi
-          if [[ "$COUNT" -lt 1 ]]; then
-            echo "native.yml has no successful push run on main for commit $PLAN_SHA. Nothing was published." >&2
+          if ! node "$TOOLS/native-release-monoptah.mjs" ci-gate "$PLAN_SHA"; then
+            echo "The native.yml check for commit $PLAN_SHA failed (see above). Nothing was published." >&2
             exit 1
           fi
 
