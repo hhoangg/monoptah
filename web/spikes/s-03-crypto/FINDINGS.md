@@ -2,7 +2,7 @@
 
 Status: DONE for desktop engines (Chromium 159.0.8154.6, Firefox 159.0, Playwright WebKit 27.2, Linux arm64, headless); iPhone results are PENDING-DEVICE.
 These are local Linux desktop engines, not iPhones; numbers are not iPhone numbers.
-Evidence: `/tmp/evidence/ws-q/browser/run.log` (96 passed across S-03 and S-08), JSON in `/tmp/evidence/ws-q/browser/s03/`.
+Evidence: `/tmp/evidence/ws-q/browser/run.log` (111 passed across S-03 and S-08), JSON in `/tmp/evidence/ws-q/browser/s03/`.
 Run: from `web/`, `pnpm --filter @monoptah/spikes run browser`.
 
 ## What was built

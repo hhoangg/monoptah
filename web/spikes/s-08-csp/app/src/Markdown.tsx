@@ -1,6 +1,6 @@
 // Stand-in for the in-house markdown renderer of security.md 8 item 1: an AST rendered as React
 // elements, no HTML string anywhere, any HTML in the input stays literal text, links follow the URL
-// allowlist. The real renderer is a port of mobile/src/features/sessions/markdownParser.ts (WS-W);
+// allowlist. The real renderer is a port of mobile/src/features/sessions/markdownParser.ts (ticket W-07, WS-T);
 // this stub only proves that this shape needs no HTML sink under the CSP and Trusted Types policy.
 import type { ReactNode } from "react";
 

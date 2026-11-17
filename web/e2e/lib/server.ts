@@ -107,7 +107,11 @@ export async function startServer(logFile: string): Promise<RunningServer> {
     return stopped;
   };
   try {
-    runSync(process.execPath, [join(webDir, "worker", "scripts", "ensure-assets.mjs")], "ensure-assets");
+    // E2E_ASSETS_DIR (a build outside the repo, see scripts/e2e-web.sh) replaces the assets directory of
+    // wrangler.jsonc. Otherwise the placeholder is ensured, as for the other local runs.
+    const assetsDir = process.env["E2E_ASSETS_DIR"];
+    if (!assetsDir) runSync(process.execPath, [join(webDir, "worker", "scripts", "ensure-assets.mjs")], "ensure-assets");
+    else if (!existsSync(join(assetsDir, "index.html"))) throw new Error(`E2E_ASSETS_DIR has no index.html: ${assetsDir}`);
     runSync(wranglerBin, ["d1", "migrations", "apply", "monoptah", "--local", "--persist-to", persist, "-c", wranglerConfig], "d1 migrations apply");
     const bootstrap = (): string => {
       const printed = runSync(process.execPath, [join(webDir, "scripts", "bootstrap.mjs"), "--local", "--persist-to", persist, "--origin", "http://localhost"], "bootstrap");
@@ -136,6 +140,7 @@ export async function startServer(logFile: string): Promise<RunningServer> {
       const args = [
         "dev", "--local", "--persist-to", persist, "--port", String(port), "--ip", "127.0.0.1", "-c", wranglerConfig,
         "--show-interactive-dev-session=false",
+        ...(assetsDir ? ["--assets", assetsDir] : []),
         "--var", `RP_ID:${RP_ID}`, "--var", `RP_ORIGIN:${origin}`,
         ...Object.entries(fake).flatMap(([name, value]) => ["--var", `${name}:${value}`]),
       ];

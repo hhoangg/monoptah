@@ -1,12 +1,12 @@
 # S-08 CSP and Trusted Types with the chosen libraries
 
 Status: DONE for Chromium 159, Firefox 159 and Playwright WebKit 27.2 (a WPE/GTK build, not Safari); real Safari 26 and iOS 18/26 are PENDING-MAC / PENDING-DEVICE.
-Evidence: `/tmp/evidence/ws-q/browser/run.log` (96 passed), per-library JSON in `/tmp/evidence/ws-q/browser/s08/` (not committed).
+Evidence: `/tmp/evidence/ws-q/browser/run.log` (111 passed), per-library JSON in `/tmp/evidence/ws-q/browser/s08/` (not committed).
 Run: from `web/`, `pnpm --filter @monoptah/spikes run browser`.
 
 ## What was built
 
-- Markdown renderer scope: security.md 8 item 1 says the renderer is an in-house AST port (mobile `markdownParser.ts`) that produces React elements, with no third-party markdown library. So no library is tested here; `app/src/Markdown.tsx` is a small stand-in that renders an AST as React elements (literal `<img onerror>` stays text, `javascript:` link rendered as text, https link allowed) and a test shows it causes no violation and no HTML element. The real renderer is covered by WS-W tests.
+- Markdown renderer scope: security.md 8 item 1 says the renderer is an in-house AST port (mobile `markdownParser.ts`) that produces React elements, with no third-party markdown library. So no library is tested here; `app/src/Markdown.tsx` is a small stand-in that renders an AST as React elements (literal `<img onerror>` stays text, `javascript:` link rendered as text, https link allowed) and a test shows it causes no violation and no HTML element. The real renderer is covered by WS-T tests (ticket W-07).
 - `app/`: Vite 8 + React 19 stub. Shiki (JS regex engine, `codeToTokens`, React spans), vaul Drawer (open, close, drag), motion, Sonner, TanStack Router (route change) and Query (fetch of `/api/hello`), Workbox (`workbox-window` registering `/sw.js`, built with `workbox-precaching`). `src/main.tsx` imports `web/app/src/trusted-types-init.ts` by relative path first, so the app's real throwing `default` policy is what runs.
 - `server.ts`: Node static server that sends `buildCsp(host)` from `web/worker/src/csp.ts` and `COMPANION_HEADERS` on every response (HTML and `sw.js` included). `serve-all.ts` builds and starts all variants on fixed ports.
 - `browser/libs.browser.spec.ts`: a `securitypolicyviolation` listener (init script) plus console CSP/TT messages are collected for every library.
