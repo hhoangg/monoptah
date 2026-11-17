@@ -18,9 +18,6 @@ export function branchCte(cascade: boolean): string {
 /** The members of the branch except the acting admin, who is never blocked. One `?`, the admin id. */
 export const MEMBERS = "(SELECT id FROM branch WHERE id <> ?)";
 
-/** Members that are active now: the users this block will change. Binds root, admin. */
-export const countActiveSql = (cascade: boolean): string => `${branchCte(cascade)} SELECT count(*) AS n FROM users WHERE status = 'active' AND id IN ${MEMBERS}`;
-
 /** Live desktops of the members, for `room.revoke`, at most `MAX_REVOKE_CALLS` (the subrequest cap). Binds root, admin. */
 export const listDesktopsSql = (cascade: boolean): string =>
   `${branchCte(cascade)} SELECT id FROM desktops WHERE revoked_at IS NULL AND user_id IN ${MEMBERS} LIMIT ${MAX_REVOKE_CALLS}`;

@@ -10,7 +10,7 @@ import { clientIp, ipHash } from "../../lib/ip.ts";
 import { nowSeconds } from "../../lib/time.ts";
 import { auditStatement } from "../audit/audit.ts";
 import { limitHandleAttempts } from "../ratelimit/index.ts";
-import { closeSessionSockets, createSession, listSessionIdHashes } from "../sessions/session.ts";
+import { closeSessionSockets, createSession, listSessionIdHashes, SESSION_CREATED_SQL } from "../sessions/session.ts";
 import { hashRecoveryCode } from "./codes.ts";
 
 /**
@@ -23,8 +23,7 @@ export const RECOVER_LOOKUP_SQL = `SELECT u.id, u.handle, u.display_name, u.role
   FROM users u JOIN recovery_codes rc ON rc.user_id = u.id AND rc.code_hash = ? AND rc.used_at IS NULL
   WHERE u.handle = ? AND u.status = 'active'`;
 export const MARK_CODE_USED_SQL = "UPDATE recovery_codes SET used_at = ? WHERE id = ? AND used_at IS NULL";
-/** The new session row is the proof that the code was unused when the batch ran, so later statements key on it. */
-export const SESSION_CREATED_SQL = "EXISTS (SELECT 1 FROM sessions WHERE id_hash = ?)";
+export { SESSION_CREATED_SQL };
 export const DELETE_OTHER_SESSIONS_SQL = `DELETE FROM sessions WHERE user_id = ? AND id_hash <> ? AND ${SESSION_CREATED_SQL}`;
 export const CODE_UNUSED_SQL = "EXISTS (SELECT 1 FROM recovery_codes WHERE id = ? AND user_id = ? AND used_at IS NULL)";
 

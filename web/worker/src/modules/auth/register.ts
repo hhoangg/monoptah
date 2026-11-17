@@ -15,7 +15,7 @@ import { consumeChallenge, storeChallenge } from "../passkeys/challenges.ts";
 import { buildRegistrationOptions, verifyRegistration } from "../passkeys/webauthn.ts";
 import { limitInviteAttempts, limitInviteAttemptsByHash } from "../ratelimit/index.ts";
 import { generateRecoveryCodes } from "../recovery/codes.ts";
-import { createSession } from "../sessions/session.ts";
+import { closeSessionSockets, createSession, currentSessionHash, deleteSessionStatement, SESSION_CREATED_SQL } from "../sessions/session.ts";
 
 /** A valid invite: it exists, is unused, not revoked and not expired. */
 export const INVITE_LOOKUP_SQL = "SELECT id FROM invites WHERE code_hash = ? AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?";
@@ -111,6 +111,8 @@ export const registerVerify: Handler<AppEnv> = async (c) => {
     now,
     when: exists,
   });
+  // An existing session cookie is replaced, not orphaned: its row goes in the batch that makes the new one.
+  const previous = await currentSessionHash(c.env, c.req.raw);
   const ip = await ipHash(c.env, clientIp(c.req.raw));
   const publicKey = credential.publicKey.slice().buffer;
 
@@ -132,6 +134,7 @@ export const registerVerify: Handler<AppEnv> = async (c) => {
     ),
     ...recovery.hashes.map((hash) => c.env.DB.prepare(INSERT_RECOVERY_CODE_SQL).bind(crypto.randomUUID(), userId, hash, now, userId, inviteId)),
     session.statement,
+    ...(previous ? [deleteSessionStatement(c.env, previous.userId, previous.idHash, { sql: SESSION_CREATED_SQL, params: [session.idHash] })] : []),
     auditStatement(
       c.env,
       { action: "account.register", meta: { inviteId, ipHash: ip }, actorUserId: userId, targetType: "user", targetId: userId, ts: now },
@@ -150,6 +153,7 @@ export const registerVerify: Handler<AppEnv> = async (c) => {
   }
   if ((results[0]?.meta.changes ?? 0) === 0) return invalidInvite(c);
 
+  if (previous) await closeSessionSockets(c.env, previous.userId, [previous.idHash]);
   c.header("Set-Cookie", session.cookie, { append: true });
   return respond(c, RegisterVerifyResponse, {
     user: { id: userId, handle, displayName, role: await roleOf(c, userId) },

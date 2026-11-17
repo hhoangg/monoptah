@@ -16,12 +16,11 @@ import type { Env } from "../../env.ts";
 import { apiError, respond, type AppEnv } from "../../http.ts";
 import { nowSeconds } from "../../lib/time.ts";
 import { requireAuth } from "../../middleware/auth.ts";
-import { auditStatement } from "../audit/audit.ts";
+import { auditStatement, auditStatementCounted, PREVIOUS_CHANGED } from "../audit/audit.ts";
 import { decodeCursor, DEFAULT_PAGE_SIZE, encodeCursor } from "../audit/handlers.ts";
 import { INVITES_PAUSED_SQL, maxUsers, USER_COUNT_SQL } from "../invites/gate.ts";
 import {
   blockUsersSql,
-  countActiveSql,
   deletePushSubscriptionsSql,
   deleteSessionsSql,
   listDesktopsSql,
@@ -86,7 +85,7 @@ export const listUsers: Handler<AppEnv> = async (c) => {
  * plus every descendant of the invite tree with `cascade`), deletes the sessions of the members, revokes their desktop
  * tokens and the grants on their desktops and of their devices, deletes their push subscriptions, revokes their
  * unused invites (used ones keep their row), and writes one `user.block` audit event for the root
- * (`{cascade, count}`; the free-text reason lives only in `users.blocked_reason`, security.md 10).
+ * (`{cascade, count}`, written only if the block changed a row, `count` computed in the batch; the free-text reason lives only in `users.blocked_reason`, security.md 10).
  *
  * `blocked_via`: with `cascade`, the root id on every member including the root (the admin UI finds "the branch of X"
  * by it, and unblocking the root clears only the root's own value); without `cascade`, NULL. A member that is already
@@ -110,20 +109,19 @@ export const blockUser: Handler<AppEnv> = async (c) => {
 
   const { cascade, reason } = body.data;
   const db = c.env.DB;
-  const [active, desktops] = await Promise.all([
-    db.prepare(countActiveSql(cascade)).bind(targetId, admin.id).first<{ n: number }>(),
-    db.prepare(listDesktopsSql(cascade)).bind(targetId, admin.id).all<{ id: string }>(),
-  ]);
+  const desktops = await db.prepare(listDesktopsSql(cascade)).bind(targetId, admin.id).all<{ id: string }>();
   const now = nowSeconds();
   const results = await db.batch([
     db.prepare(blockUsersSql(cascade)).bind(targetId, now, reason, cascade ? targetId : null, admin.id),
+    // Right after the block: written only if the block changed a row (a parallel block that lost the race leaves
+    // no event), with `count` = the rows it changed.
+    auditStatementCounted(c.env, { action: "user.block", actorUserId: admin.id, targetType: "user", targetId, meta: { cascade, count: 0 } }),
     db.prepare(deleteSessionsSql(cascade)).bind(targetId, admin.id),
     db.prepare(revokeTokensSql(cascade)).bind(targetId, now, admin.id),
     db.prepare(revokeDesktopGrantsSql(cascade)).bind(targetId, now, admin.id),
     db.prepare(revokeDeviceGrantsSql(cascade)).bind(targetId, now, admin.id),
     db.prepare(deletePushSubscriptionsSql(cascade)).bind(targetId, admin.id),
     db.prepare(revokeInvitesSql(cascade)).bind(targetId, now, admin.id),
-    auditStatement(c.env, { action: "user.block", actorUserId: admin.id, targetType: "user", targetId, meta: { cascade, count: active?.n ?? 0 } }),
   ]);
 
   const calls = desktops.results.map((desktop) => c.env.ROOM.get(c.env.ROOM.idFromName(desktop.id)).revoke({ all: true }, CloseCodes.BLOCKED));
@@ -147,7 +145,7 @@ export const unblockUser: Handler<AppEnv> = async (c) => {
   if (target.status !== "blocked") return apiError(c, 409, "conflict", "User is not blocked");
   const [updated] = await c.env.DB.batch([
     c.env.DB.prepare(UNBLOCK_SQL).bind(targetId),
-    auditStatement(c.env, { action: "user.unblock", actorUserId: admin.id, targetType: "user", targetId, meta: { cascade: false } }),
+    auditStatement(c.env, { action: "user.unblock", actorUserId: admin.id, targetType: "user", targetId, meta: { cascade: false } }, PREVIOUS_CHANGED),
   ]);
   if ((updated?.meta.changes ?? 0) === 0) return apiError(c, 409, "conflict", "User is not blocked");
   return c.json({ ok: true as const });

@@ -4,7 +4,7 @@ import { SessionsResponse } from "@monoptah/protocol";
 import { apiError, respond, type AppEnv } from "../../http.ts";
 import { requireAuth } from "../../middleware/auth.ts";
 import { nowSeconds } from "../../lib/time.ts";
-import { auditStatement } from "../audit/audit.ts";
+import { auditStatement, PREVIOUS_CHANGED } from "../audit/audit.ts";
 import { clearSessionCookie, publicSessionId, revokeSessions } from "./session.ts";
 
 /** Live sessions of a user: not revoked, before both expiries. Uses `sessions_user_id_idx`. */
@@ -52,9 +52,12 @@ export const revokeSession: Handler<AppEnv> = async (c) => {
     if ((await publicSessionId(row.id_hash)) === id) target = row;
   }
   if (!target) return apiError(c, 404, "not_found", "Session not found");
-  await revokeSessions(c.env, user.id, [target.id_hash], [
-    auditStatement(c.env, { action: "session.revoke", actorUserId: user.id, targetType: "session", targetId: id, meta: { all: false, count: 1 } }),
+  // The audit row follows the one DELETE and is written only if that DELETE removed a row: a parallel revoke of the
+  // same session that lost the race changes nothing and answers 404, like an unknown id.
+  const revoked = await revokeSessions(c.env, user.id, [target.id_hash], [
+    auditStatement(c.env, { action: "session.revoke", actorUserId: user.id, targetType: "session", targetId: id, meta: { all: false, count: 1 } }, PREVIOUS_CHANGED),
   ]);
+  if (revoked === 0) return apiError(c, 404, "not_found", "Session not found");
   if (target.id_hash === session.idHash) c.header("Set-Cookie", clearSessionCookie(), { append: true });
   return c.json({ ok: true as const });
 };
@@ -62,7 +65,8 @@ export const revokeSession: Handler<AppEnv> = async (c) => {
 /** Deletes the current session row, closes its sockets and clears the cookie. */
 export const logout: Handler<AppEnv> = async (c) => {
   const { user, session } = requireAuth(c);
-  await revokeSessions(c.env, user.id, [session.idHash], [auditStatement(c.env, { action: "session.logout", actorUserId: user.id, meta: {} })]);
+  // Idempotent: a logout that finds its session already deleted (a parallel one) still clears the cookie, without an event.
+  await revokeSessions(c.env, user.id, [session.idHash], [auditStatement(c.env, { action: "session.logout", actorUserId: user.id, meta: {} }, PREVIOUS_CHANGED)]);
   c.header("Set-Cookie", clearSessionCookie(), { append: true });
   return c.json({ ok: true as const });
 };

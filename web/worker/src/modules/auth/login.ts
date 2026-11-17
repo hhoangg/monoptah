@@ -9,11 +9,40 @@ import { nowSeconds } from "../../lib/time.ts";
 import { auditStatement } from "../audit/audit.ts";
 import { consumeChallenge, storeChallenge } from "../passkeys/challenges.ts";
 import { buildAuthenticationOptions, verifyAuthentication } from "../passkeys/webauthn.ts";
-import { createSession } from "../sessions/session.ts";
+import { closeSessionSockets, createSession, currentSessionHash, deleteSessionStatement, SESSION_CREATED_SQL } from "../sessions/session.ts";
 
 export const PASSKEY_LOGIN_SQL =
   "SELECT p.id, p.user_id, p.public_key, p.counter, p.transports, u.handle, u.display_name, u.role, u.status FROM passkeys p JOIN users u ON u.id = p.user_id WHERE p.id = ?";
-export const UPDATE_PASSKEY_USE_SQL = "UPDATE passkeys SET counter = ?, backed_up = ?, last_used_at = ? WHERE id = ?";
+/**
+ * Records a passkey use. The counter rule is part of the statement (`counterDecreased` in webauthn.ts, as SQL), so
+ * two parallel assertions with the same counter cannot both apply: the second finds the counter already at the
+ * reported value and changes nothing. Binds: new counter, backed up, now, id, new counter, new counter.
+ */
+export const UPDATE_PASSKEY_USE_SQL =
+  "UPDATE passkeys SET counter = ?, backed_up = ?, last_used_at = ? WHERE id = ? AND (counter < ? OR (counter = 0 AND ? = 0))";
+/**
+ * Condition for the statements that follow `UPDATE_PASSKEY_USE_SQL` in the same batch: true only when that update
+ * changed a row. The statement right after the update must carry it (`changes()` is that of the previous statement).
+ */
+export const PASSKEY_USE_APPLIED_SQL = "changes() > 0";
+
+/** Bind values of `UPDATE_PASSKEY_USE_SQL`. */
+export function passkeyUseParams(newCounter: number, backedUp: boolean, now: number, id: string): unknown[] {
+  return [newCounter, backedUp ? 1 : 0, now, id, newCounter, newCounter];
+}
+
+/** Audits a refused counter (a decrease or a lost race): the stored counter stays and no session is made. */
+export function auditCounterRefused(c: AppContext, input: { passkeyId: string; userId: string; ipHash: string; now: number }): Promise<D1Result> {
+  return auditStatement(c.env, {
+    action: "account.login_refused_counter",
+    meta: { passkeyId: input.passkeyId, ipHash: input.ipHash },
+    actorKind: "user",
+    actorUserId: input.userId,
+    targetType: "passkey",
+    targetId: input.passkeyId,
+    ts: input.now,
+  }).run();
+}
 
 export interface PasskeyRow {
   id: string;
@@ -76,32 +105,39 @@ export const loginVerify: Handler<AppEnv> = async (c) => {
   const ip = await ipHash(c.env, clientIp(c.req.raw));
   if (!result.ok) {
     // Counter did not increase: the stored counter stays, the event is audited, no session.
-    await auditStatement(c.env, {
-      action: "account.login_refused_counter",
-      meta: { passkeyId: passkey.id, ipHash: ip },
-      actorKind: "user",
-      actorUserId: passkey.user_id,
-      targetType: "passkey",
-      targetId: passkey.id,
-      ts: now,
-    }).run();
+    await auditCounterRefused(c, { passkeyId: passkey.id, userId: passkey.user_id, ipHash: ip, now });
     return unauthorized(c);
   }
   if (passkey.status === "blocked") return apiError(c, 403, "blocked", "Account blocked");
 
-  const session = await createSession(c.env, { userId: passkey.user_id, amr: "passkey", userAgent: c.req.header("User-Agent"), reauthAt: now, now });
-  await c.env.DB.batch([
-    c.env.DB.prepare(UPDATE_PASSKEY_USE_SQL).bind(result.newCounter, result.backedUp ? 1 : 0, now, passkey.id),
+  // An existing session cookie is replaced, not orphaned: its row is deleted in the batch that makes the new one.
+  const previous = await currentSessionHash(c.env, c.req.raw);
+  // The session and the audit row exist only when the counter update changed a row: of two parallel assertions
+  // with the same counter, exactly one signs in.
+  const session = await createSession(c.env, {
+    userId: passkey.user_id,
+    amr: "passkey",
+    userAgent: c.req.header("User-Agent"),
+    reauthAt: now,
+    now,
+    when: { sql: PASSKEY_USE_APPLIED_SQL, params: [] },
+  });
+  const created = { sql: SESSION_CREATED_SQL, params: [session.idHash] };
+  const results = await c.env.DB.batch([
+    c.env.DB.prepare(UPDATE_PASSKEY_USE_SQL).bind(...passkeyUseParams(result.newCounter, result.backedUp, now, passkey.id)),
     session.statement,
-    auditStatement(c.env, {
-      action: "account.login",
-      meta: { passkeyId: passkey.id, ipHash: ip },
-      actorUserId: passkey.user_id,
-      targetType: "user",
-      targetId: passkey.user_id,
-      ts: now,
-    }),
+    ...(previous ? [deleteSessionStatement(c.env, previous.userId, previous.idHash, created)] : []),
+    auditStatement(
+      c.env,
+      { action: "account.login", meta: { passkeyId: passkey.id, ipHash: ip }, actorUserId: passkey.user_id, targetType: "user", targetId: passkey.user_id, ts: now },
+      created,
+    ),
   ]);
+  if ((results[0]?.meta.changes ?? 0) === 0) {
+    await auditCounterRefused(c, { passkeyId: passkey.id, userId: passkey.user_id, ipHash: ip, now });
+    return unauthorized(c);
+  }
+  if (previous) await closeSessionSockets(c.env, previous.userId, [previous.idHash]);
   c.header("Set-Cookie", session.cookie, { append: true });
   return respond(c, LoginVerifyResponse, { user: { id: passkey.user_id, handle: passkey.handle, displayName: passkey.display_name, role: passkey.role } });
 };

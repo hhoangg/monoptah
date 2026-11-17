@@ -137,9 +137,30 @@ export const LIST_SESSION_HASHES_SQL = "SELECT id_hash FROM sessions WHERE user_
 export const LIST_SESSION_HASHES_EXCEPT_SQL = "SELECT id_hash FROM sessions WHERE user_id = ? AND id_hash <> ?";
 export const LIST_DESKTOP_IDS_SQL = "SELECT id FROM desktops WHERE user_id = ? AND revoked_at IS NULL LIMIT ?";
 
-/** DELETE of one session of a user, for a batch. The `user_id` condition makes it harmless for a foreign hash. */
-export function deleteSessionStatement(env: Pick<Env, "DB">, userId: string, idHash: string): D1PreparedStatement {
-  return env.DB.prepare(DELETE_SESSION_SQL).bind(userId, idHash);
+/** The new session row is the proof that a conditional batch (login, registration, recovery) went through. */
+export const SESSION_CREATED_SQL = "EXISTS (SELECT 1 FROM sessions WHERE id_hash = ?)";
+export const SESSION_BY_HASH_SQL = "SELECT user_id FROM sessions WHERE id_hash = ?";
+
+/**
+ * DELETE of one session of a user, for a batch. The `user_id` condition makes it harmless for a foreign hash.
+ * With `when` the row is deleted only if that SQL condition holds (for example: the new session was created).
+ */
+export function deleteSessionStatement(env: Pick<Env, "DB">, userId: string, idHash: string, when?: { sql: string; params: unknown[] }): D1PreparedStatement {
+  if (!when) return env.DB.prepare(DELETE_SESSION_SQL).bind(userId, idHash);
+  return env.DB.prepare(`${DELETE_SESSION_SQL} AND ${when.sql}`).bind(userId, idHash, ...when.params);
+}
+
+/**
+ * The session row the request's cookie resolves to (any state: expired rows count, they are still rows), or
+ * null. Login and registration delete it in the batch that creates the new session, so a browser that signs in
+ * again does not leave an orphan row behind (it would sit in "Sessions" until it expires).
+ */
+export async function currentSessionHash(env: Pick<Env, "DB">, request: Request): Promise<{ userId: string; idHash: string } | null> {
+  const token = readSessionToken(request);
+  if (token === null) return null;
+  const idHash = await sha256Hex(token);
+  const row = await env.DB.prepare(SESSION_BY_HASH_SQL).bind(idHash).first<{ user_id: string }>();
+  return row ? { userId: row.user_id, idHash } : null;
 }
 
 /** DELETE of every session of a user (except one, when given), for a batch such as the admin block. */
@@ -168,23 +189,28 @@ function maxDesktops(env: Pick<Env, "MAX_DESKTOPS_PER_USER">): number {
 }
 
 /**
- * Closes the open sockets of revoked sessions: for each non-revoked desktop of the user (at most
- * `MAX_DESKTOPS_PER_USER`) and each hash, `room.revoke({sessionIdHash}, 4001)` (architecture.md 4.4). Best
- * effort: the session rows are already gone, so a failing room is logged (no ids) and skipped. At most
- * `MAX_REVOKE_CALLS` calls are made; sessions beyond that keep an open socket until the relay re-checks them
- * (WS-R re-validates the cookie session on join). The room is a no-op stub until R-02.
+ * Closes the open sockets of revoked sessions: for each hash and each non-revoked desktop of the user (at most
+ * `MAX_DESKTOPS_PER_USER`), `room.revoke({sessionIdHash}, 4001)` (architecture.md 4.4). Best effort: the session
+ * rows are already gone, so a failing room is logged (no ids) and skipped. At most `MAX_REVOKE_CALLS` calls are
+ * made, spent round-robin: session 0 on every desktop, then session 1 on every desktop, and so on, so a cut
+ * never leaves one desktop without a call (recovery after a compromise must reach every desktop). A cut is
+ * logged with counts only; the sessions beyond it keep an open socket until the relay re-checks them (WS-R
+ * re-validates the cookie session on join). Pending WS-R contract change: `RevokeTarget` takes
+ * `{ sessionIdHashes: string[] }`, which makes it one call per desktop and the cap moot.
  */
 export async function closeSessionSockets(env: Pick<Env, "DB" | "ROOM" | "MAX_DESKTOPS_PER_USER">, userId: string, idHashes: readonly string[]): Promise<void> {
   if (idHashes.length === 0) return;
   const { results } = await env.DB.prepare(LIST_DESKTOP_IDS_SQL).bind(userId, maxDesktops(env)).all<{ id: string }>();
+  const rooms = results.map((desktop) => env.ROOM.get(env.ROOM.idFromName(desktop.id)));
+  const wanted = rooms.length * idHashes.length;
   const calls: Promise<void>[] = [];
-  for (const desktop of results) {
-    const room = env.ROOM.get(env.ROOM.idFromName(desktop.id));
-    for (const sessionIdHash of idHashes) {
+  for (const sessionIdHash of idHashes) {
+    for (const room of rooms) {
       if (calls.length >= MAX_REVOKE_CALLS) break;
       calls.push(room.revoke({ sessionIdHash }, CloseCodes.UNAUTHORIZED));
     }
   }
+  if (wanted > calls.length) console.error(`room.revoke truncated: wanted=${wanted} calls=${calls.length} desktops=${rooms.length} sessions=${idHashes.length}`);
   const settled = await Promise.allSettled(calls);
   const failed = settled.filter((r) => r.status === "rejected").length;
   if (failed > 0) console.error(`room.revoke failed: calls=${calls.length} failed=${failed}`);
@@ -192,7 +218,8 @@ export async function closeSessionSockets(env: Pick<Env, "DB" | "ROOM" | "MAX_DE
 
 /**
  * Deletes the given sessions of a user (one batch, with `extra` statements such as an audit INSERT) and closes
- * their sockets. Returns the number of rows deleted. Used by logout and `DELETE /api/sessions/:id`.
+ * their sockets. Returns the number of rows deleted. Used by logout and `DELETE /api/sessions/:id`. `extra` runs
+ * right after the last DELETE, so an audit row conditioned on `PREVIOUS_CHANGED` depends on it (use it with one hash).
  */
 export async function revokeSessions(
   env: Pick<Env, "DB" | "ROOM" | "MAX_DESKTOPS_PER_USER">,

@@ -1,6 +1,6 @@
 import { env } from "cloudflare:workers";
 import { Hono } from "hono";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiErrorSchema, findRoute, SessionsResponse, type ApiRoute } from "@monoptah/protocol";
 import type { AppEnv } from "../src/http.ts";
 import { sha256Hex } from "../src/lib/crypto.ts";
@@ -477,13 +477,37 @@ describe("revoke helpers (sign out everywhere, recovery, block)", () => {
     expect(await sessionRow(foreign.idHash)).not.toBeNull();
   });
 
-  it("calls room.revoke for the user's desktops at most MAX_REVOKE_CALLS times and survives a failing room", async () => {
+  it("calls room.revoke at most MAX_REVOKE_CALLS times, round-robin across desktops, and logs a cut with counts only", async () => {
     const user = await createTestUser(env);
-    for (let i = 0; i < 5; i += 1) await createTestDesktop(env, user.id);
+    const desktops = [];
+    for (let i = 0; i < 5; i += 1) desktops.push(await createTestDesktop(env, user.id));
     const hashes = Array.from({ length: 30 }, (_, i) => `hash-${i}`);
     const room = fakeRoomNamespace();
-    await closeSessionSockets(withRoom(env, room), user.id, hashes);
-    expect(room.calls).toHaveLength(MAX_REVOKE_CALLS);
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await closeSessionSockets(withRoom(env, room), user.id, hashes);
+      expect(room.calls).toHaveLength(MAX_REVOKE_CALLS);
+      // Every desktop gets a call, and session i is revoked on every desktop before session i + 1.
+      expect(new Set(room.calls.map((call) => call.desktopId))).toEqual(new Set(desktops));
+      const perDesktop = desktops.map((id) => room.calls.filter((call) => call.desktopId === id).map((call) => (call.target as { sessionIdHash: string }).sessionIdHash));
+      for (const seen of perDesktop) expect(seen).toEqual(hashes.slice(0, MAX_REVOKE_CALLS / 5));
+      const order = room.calls.map((call) => (call.target as { sessionIdHash: string }).sessionIdHash);
+      expect(order.slice(0, 5)).toEqual(Array(5).fill("hash-0"));
+      expect(room.calls.every((call) => call.code === 4001)).toBe(true);
+      const logged = errors.mock.calls.map((args) => String(args[0]));
+      expect(logged).toEqual([`room.revoke truncated: wanted=150 calls=${MAX_REVOKE_CALLS} desktops=5 sessions=30`]);
+      expect(logged.join(" ")).not.toContain("hash-");
+    } finally {
+      errors.mockRestore();
+    }
+
+    // Within the cap nothing is logged.
+    const quiet = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const small = fakeRoomNamespace();
+    await closeSessionSockets(withRoom(env, small), user.id, ["a", "b"]);
+    expect(small.calls).toHaveLength(10);
+    expect(quiet).not.toHaveBeenCalled();
+    quiet.mockRestore();
 
     const failing = withRoom(env, { namespace: { idFromName: (n: string) => ({ n }), get: () => ({ revoke: () => Promise.reject(new Error("boom")) }) } as unknown as typeof env.ROOM });
     await expect(closeSessionSockets(failing, user.id, ["h"])).resolves.toBeUndefined();

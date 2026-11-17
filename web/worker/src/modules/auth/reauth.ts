@@ -7,13 +7,13 @@ import { apiError, respond, type AppEnv } from "../../http.ts";
 import { clientIp, ipHash } from "../../lib/ip.ts";
 import { nowSeconds } from "../../lib/time.ts";
 import { requireAuth } from "../../middleware/auth.ts";
-import { auditStatement } from "../audit/audit.ts";
 import { consumeChallenge, storeChallenge } from "../passkeys/challenges.ts";
 import { buildAuthenticationOptions, verifyAuthentication } from "../passkeys/webauthn.ts";
-import { findPasskey, parseTransports, publicKeyBytes, UPDATE_PASSKEY_USE_SQL } from "./login.ts";
+import { auditCounterRefused, findPasskey, parseTransports, PASSKEY_USE_APPLIED_SQL, passkeyUseParams, publicKeyBytes, UPDATE_PASSKEY_USE_SQL } from "./login.ts";
 
 export const USER_PASSKEYS_SQL = "SELECT id, transports FROM passkeys WHERE user_id = ?";
-export const SET_REAUTH_SQL = "UPDATE sessions SET reauth_at = ? WHERE id_hash = ?";
+/** Runs right after `UPDATE_PASSKEY_USE_SQL` in the batch and only when that update changed a row. */
+export const SET_REAUTH_SQL = `UPDATE sessions SET reauth_at = ? WHERE id_hash = ? AND ${PASSKEY_USE_APPLIED_SQL}`;
 
 export const reauthOptions: Handler<AppEnv> = async (c) => {
   const { user } = requireAuth(c);
@@ -45,23 +45,19 @@ export const reauthVerify: Handler<AppEnv> = async (c) => {
   );
   const now = nowSeconds();
   if (!result.ok) {
-    if (result.reason === "counter") {
-      await auditStatement(c.env, {
-        action: "account.login_refused_counter",
-        meta: { passkeyId: passkey.id, ipHash: await ipHash(c.env, clientIp(c.req.raw)) },
-        actorKind: "user",
-        actorUserId: user.id,
-        targetType: "passkey",
-        targetId: passkey.id,
-        ts: now,
-      }).run();
-    }
+    if (result.reason === "counter") await auditCounterRefused(c, { passkeyId: passkey.id, userId: user.id, ipHash: await ipHash(c.env, clientIp(c.req.raw)), now });
     return failed;
   }
 
-  await c.env.DB.batch([
-    c.env.DB.prepare(UPDATE_PASSKEY_USE_SQL).bind(result.newCounter, result.backedUp ? 1 : 0, now, passkey.id),
+  // The session is marked fresh only when the counter update changed a row (a parallel assertion with the same
+  // counter would not), otherwise it is answered like a counter decrease.
+  const results = await c.env.DB.batch([
+    c.env.DB.prepare(UPDATE_PASSKEY_USE_SQL).bind(...passkeyUseParams(result.newCounter, result.backedUp, now, passkey.id)),
     c.env.DB.prepare(SET_REAUTH_SQL).bind(now, session.idHash),
   ]);
+  if ((results[0]?.meta.changes ?? 0) === 0) {
+    await auditCounterRefused(c, { passkeyId: passkey.id, userId: user.id, ipHash: await ipHash(c.env, clientIp(c.req.raw)), now });
+    return failed;
+  }
   return respond(c, ReauthVerifyResponse, { ok: true, reauthAt: now });
 };

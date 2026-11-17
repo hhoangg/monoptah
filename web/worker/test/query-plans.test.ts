@@ -47,7 +47,6 @@ import {
 } from "../src/modules/admin/handlers.ts";
 import {
   blockUsersSql,
-  countActiveSql,
   deletePushSubscriptionsSql,
   deleteSessionsSql,
   listDesktopsSql,
@@ -69,6 +68,7 @@ import {
   LIST_DESKTOP_IDS_SQL,
   LIST_SESSION_HASHES_EXCEPT_SQL,
   LIST_SESSION_HASHES_SQL,
+  SESSION_BY_HASH_SQL,
 } from "../src/modules/sessions/session.ts";
 
 interface PlanCase {
@@ -109,6 +109,7 @@ const CASES: PlanCase[] = [
   { name: "delete one session", sql: DELETE_SESSION_SQL, bind: ["u", "h"] },
   { name: "delete all sessions", sql: DELETE_ALL_SESSIONS_SQL, bind: ["u"] },
   { name: "delete all sessions except one", sql: DELETE_ALL_SESSIONS_EXCEPT_SQL, bind: ["u", "h"] },
+  { name: "session row of the request cookie", sql: SESSION_BY_HASH_SQL, bind: ["h"] },
   { name: "list session hashes", sql: LIST_SESSION_HASHES_SQL, bind: ["u"] },
   { name: "list session hashes except one", sql: LIST_SESSION_HASHES_EXCEPT_SQL, bind: ["u", "h"] },
   { name: "list desktops of a user", sql: LIST_DESKTOP_IDS_SQL, bind: ["u", 5] },
@@ -127,7 +128,7 @@ const CASES: PlanCase[] = [
   { name: "insert challenge", sql: INSERT_CHALLENGE_SQL, bind: ["i", "login", null, "c", null, 1] },
   { name: "consume challenge", sql: CONSUME_CHALLENGE_SQL, bind: ["i", "login", null, 1] },
   { name: "passkey by credential id (join users)", sql: PASSKEY_LOGIN_SQL, bind: ["c"] },
-  { name: "passkey use update", sql: UPDATE_PASSKEY_USE_SQL, bind: [1, 0, 1, "c"] },
+  { name: "passkey use update", sql: UPDATE_PASSKEY_USE_SQL, bind: [1, 0, 1, "c", 1, 1] },
   { name: "passkeys of a user", sql: USER_PASSKEYS_SQL, bind: ["u"] },
   { name: "set reauth_at", sql: SET_REAUTH_SQL, bind: [1, "h"] },
   { name: "list own invites", sql: LIST_INVITES_SQL, bind: ["u"] },
@@ -141,7 +142,6 @@ const CASES: PlanCase[] = [
   { name: "admin: upsert setting", sql: UPSERT_SETTING_SQL, bind: ["1", 1, "u"] },
   { name: "admin: audit first page", sql: ADMIN_AUDIT_PAGE_SQL, bind: [51], noTempSort: true, limitedIndexScan: { table: "audit_log", index: "audit_log_ts_id_idx" } },
   { name: "admin: audit next page", sql: ADMIN_AUDIT_PAGE_AFTER_SQL, bind: [1, "id", 51], noTempSort: true },
-  { name: "block (cascade): count active members", sql: countActiveSql(true), bind: ["r", "a"], branchCte: true },
   { name: "block (cascade): list desktops", sql: listDesktopsSql(true), bind: ["r", "a"], branchCte: true },
   { name: "block (cascade): mark users blocked", sql: blockUsersSql(true), bind: ["r", 1, "x", "r", "a"], branchCte: true },
   { name: "block (cascade): delete sessions", sql: deleteSessionsSql(true), bind: ["r", "a"], branchCte: true },
@@ -150,7 +150,6 @@ const CASES: PlanCase[] = [
   { name: "block (cascade): revoke grants of devices", sql: revokeDeviceGrantsSql(true), bind: ["r", 1, "a"], branchCte: true },
   { name: "block (cascade): delete push subscriptions", sql: deletePushSubscriptionsSql(true), bind: ["r", "a"], branchCte: true },
   { name: "block (cascade): revoke invites", sql: revokeInvitesSql(true), bind: ["r", 1, "a"], branchCte: true },
-  { name: "block (single): count active members", sql: countActiveSql(false), bind: ["r", "a"] },
   { name: "block (single): list desktops", sql: listDesktopsSql(false), bind: ["r", "a"] },
   { name: "block (single): mark users blocked", sql: blockUsersSql(false), bind: ["r", 1, "x", "r", "a"] },
   { name: "block (single): delete sessions", sql: deleteSessionsSql(false), bind: ["r", "a"] },

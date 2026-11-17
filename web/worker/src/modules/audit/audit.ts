@@ -40,6 +40,13 @@ const CONDITIONAL_INSERT_AUDIT_SQL = (condition: string): string =>
  * actor kind the action does not allow, or meta that does not match the action's strict schema.
  */
 export function auditStatement(env: Pick<Env, "DB">, event: AuditEvent, when?: StatementCondition): D1PreparedStatement {
+  const values = auditValues(event);
+  if (!when) return env.DB.prepare(INSERT_AUDIT_SQL).bind(...values);
+  return env.DB.prepare(CONDITIONAL_INSERT_AUDIT_SQL(when.sql)).bind(...values, ...when.params);
+}
+
+/** Validates the event and returns the eight column values of the audit INSERT. */
+function auditValues(event: AuditEvent): unknown[] {
   const entry = AUDIT_ACTIONS[event.action];
   if (!entry) throw new Error(`Unknown audit action: ${String(event.action)}`);
   const actorKind = event.actorKind ?? entry.actorKinds[0];
@@ -50,7 +57,7 @@ export function auditStatement(env: Pick<Env, "DB">, event: AuditEvent, when?: S
     const paths = parsed.error.issues.map((issue) => `${issue.code}:${issue.path.join(".")}`).join(", ");
     throw new Error(`Invalid meta for audit action ${event.action}: ${paths}`);
   }
-  const values = [
+  return [
     crypto.randomUUID(),
     event.ts ?? nowSeconds(),
     event.actorUserId ?? null,
@@ -60,8 +67,25 @@ export function auditStatement(env: Pick<Env, "DB">, event: AuditEvent, when?: S
     event.targetId ?? null,
     JSON.stringify(parsed.data),
   ];
-  if (!when) return env.DB.prepare(INSERT_AUDIT_SQL).bind(...values);
-  return env.DB.prepare(CONDITIONAL_INSERT_AUDIT_SQL(when.sql)).bind(...values, ...when.params);
+}
+
+/**
+ * Condition for an audit INSERT that directly follows the write it records in the same batch: true only when that
+ * write changed a row (`changes()` is the count of the previous statement). A lost race (the parallel call wrote
+ * first, so this write changed nothing) then leaves no audit row.
+ */
+export const PREVIOUS_CHANGED: StatementCondition = { sql: "changes() > 0", params: [] };
+
+const COUNTED_INSERT_AUDIT_SQL =
+  "INSERT INTO audit_log (id, ts, actor_user_id, actor_kind, action, target_type, target_id, meta) SELECT ?, ?, ?, ?, ?, ?, ?, json_set(?, '$.count', changes()) WHERE changes() > 0";
+
+/**
+ * Like `auditStatement` with `PREVIOUS_CHANGED`, and `meta.count` is the number of rows the previous statement
+ * changed, computed in the batch instead of read before it. The event needs a `count` in its meta; the value given
+ * is a placeholder that only the schema check sees.
+ */
+export function auditStatementCounted(env: Pick<Env, "DB">, event: Extract<AuditEvent, { meta: { count: number } }>): D1PreparedStatement {
+  return env.DB.prepare(COUNTED_INSERT_AUDIT_SQL).bind(...auditValues(event));
 }
 
 /** Writes one audit event now. Prefer `auditStatement` inside the batch of the change being recorded. */

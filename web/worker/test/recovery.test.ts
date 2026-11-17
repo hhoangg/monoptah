@@ -6,7 +6,8 @@ import { API_ROUTES } from "@monoptah/protocol";
 import { RECOVERY_ONLY_ALLOWLIST } from "../src/middleware/auth.ts";
 import { ackRecoveryCodes } from "../src/modules/recovery/regenerate.ts";
 import { hashRecoveryCode, normalizeRecoveryCode } from "../src/modules/recovery/codes.ts";
-import { authedCall, createTestDesktop, createTestInvite, createTestUser, loginAs, postJson, registerUser, setCookies, type RegisteredUser } from "./support/accounts.ts";
+import { sha256Hex } from "../src/lib/crypto.ts";
+import { authedCall, createTestDesktop, createTestInvite, createTestUser, loginAs, postJson, registerUser, setCookies, withRoom, fakeRoomNamespace, type RegisteredUser } from "./support/accounts.ts";
 
 const errorCode = async (res: Response) => ((await res.json()) as { code: string }).code;
 const recover = (handle: string, code: string, init: Parameters<typeof postJson>[2] = {}) => postJson("/api/auth/recover", { handle, code }, init);
@@ -60,6 +61,25 @@ describe("POST /api/auth/recover", () => {
     const audit = await env.DB.prepare("SELECT actor_user_id, meta FROM audit_log WHERE action = 'recovery.use' AND actor_user_id = ?").bind(user.userId).all<{ meta: string }>();
     expect(audit.results).toHaveLength(1);
     expect(JSON.parse(audit.results[0]?.meta ?? "{}")).toMatchObject({ codesLeft: 9, revokedSessions: 2 });
+  });
+
+  it("calls room.revoke({sessionIdHash}, 4001) for every old session on each of the user's desktops", async () => {
+    const user = await newUser();
+    const second = await loginAs(user.userId, { fresh: true });
+    const desktops = [await createTestDesktop(env, user.userId), await createTestDesktop(env, user.userId), await createTestDesktop(env, user.userId)];
+    const oldHashes = [await sha256Hex(user.cookie.split("=")[1] ?? ""), second.idHash];
+    const room = fakeRoomNamespace();
+    const res = await recover(user.handle, user.recoveryCodes[0] ?? "", { testEnv: withRoom(env, room) });
+    expect(res.status).toBe(200);
+    expect(room.calls).toHaveLength(desktops.length * oldHashes.length);
+    for (const desktopId of desktops) {
+      const forDesktop = room.calls.filter((call) => call.desktopId === desktopId);
+      expect(forDesktop.map((call) => (call.target as { sessionIdHash: string }).sessionIdHash).sort()).toEqual([...oldHashes].sort());
+      expect(forDesktop.every((call) => call.code === 4001)).toBe(true);
+    }
+    // The new recovery session is not revoked.
+    const newHash = await sha256Hex(cookieOf(res).split("=")[1] ?? "");
+    expect(room.calls.some((call) => (call.target as { sessionIdHash: string }).sessionIdHash === newHash)).toBe(false);
   });
 
   it("a code works once", async () => {

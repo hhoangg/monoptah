@@ -5,7 +5,7 @@ import { CreateInviteResponse, InvitesResponse } from "@monoptah/protocol";
 import { apiError, respond, type AppEnv } from "../../http.ts";
 import { nowSeconds } from "../../lib/time.ts";
 import { requireAuth } from "../../middleware/auth.ts";
-import { auditStatement } from "../audit/audit.ts";
+import { auditStatement, PREVIOUS_CHANGED } from "../audit/audit.ts";
 import { INVITES_USED_SQL, ME_ROW_SQL } from "../me/handlers.ts";
 import { hashInviteCode, INVITE_TTL_SECONDS, newInviteCode } from "./code.ts";
 import { GATE_SQL, gateParams, registrationOpen } from "./gate.ts";
@@ -30,7 +30,6 @@ export const INVITE_BY_ID_SQL = "SELECT id, created_by, kind, used_at, revoked_a
 export const REVOKE_INVITE_SQL = "UPDATE invites SET revoked_at = ? WHERE id = ? AND created_by = ? AND used_at IS NULL AND revoked_at IS NULL";
 /** True only for the invite that the same batch just wrote (primary key lookup): conditions the audit row. */
 export const INVITE_EXISTS_SQL = "EXISTS (SELECT 1 FROM invites WHERE id = ?)";
-export const INVITE_REVOKED_NOW_SQL = "EXISTS (SELECT 1 FROM invites WHERE id = ? AND revoked_at = ?)";
 
 interface InviteRow {
   id: string;
@@ -100,7 +99,7 @@ export const revokeInvite: Handler<AppEnv> = async (c) => {
   const now = nowSeconds();
   const [updated] = await c.env.DB.batch([
     c.env.DB.prepare(REVOKE_INVITE_SQL).bind(now, id, user.id),
-    auditStatement(c.env, { action: "invite.revoke", actorUserId: user.id, targetType: "invite", targetId: id, meta: { inviteId: id } }, { sql: INVITE_REVOKED_NOW_SQL, params: [id, now] }),
+    auditStatement(c.env, { action: "invite.revoke", actorUserId: user.id, targetType: "invite", targetId: id, meta: { inviteId: id } }, PREVIOUS_CHANGED),
   ]);
   if ((updated?.meta.changes ?? 0) === 0) return apiError(c, 409, "conflict", "Invite already used or revoked");
   return c.json({ ok: true as const });

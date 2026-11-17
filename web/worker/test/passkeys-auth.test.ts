@@ -256,14 +256,55 @@ describe("signature counter", () => {
     expect((await loginWith(user.key, { counter: 0 })).res.status).toBe(401);
   });
 
-  it("re-auth applies the same rule", async () => {
+  const refusals = async (userId: string) =>
+    (await env.DB.prepare("SELECT meta FROM audit_log WHERE action = 'account.login_refused_counter' AND actor_user_id = ?").bind(userId).all<{ meta: string }>()).results;
+  const logins = async (userId: string) => (await env.DB.prepare("SELECT count(*) AS n FROM audit_log WHERE action = 'account.login' AND actor_user_id = ?").bind(userId).first<{ n: number }>())?.n;
+  const sessionCount = async (userId: string) => (await env.DB.prepare("SELECT count(*) AS n FROM sessions WHERE user_id = ?").bind(userId).first<{ n: number }>())?.n;
+  const reauthWith = async (user: Awaited<ReturnType<typeof newUser>>, counter: number) => {
+    const { challengeId, options } = await reauthOptions(user.cookie);
+    const response = await user.key.get(options, { ...good, counter });
+    return authedCall({ cookie: user.cookie }, "/api/auth/reauth/verify", { method: "POST", body: JSON.stringify({ challengeId, response }) });
+  };
+
+  it("re-auth applies the same rule, keeps reauth_at and audits the refusal", async () => {
     const user = await newUser();
     expect((await loginWith(user.key, { counter: 4 })).res.status).toBe(200);
-    const { challengeId, options } = await reauthOptions(user.cookie);
-    const response = await user.key.get(options, { ...good, counter: 2 });
-    const res = await authedCall({ cookie: user.cookie }, "/api/auth/reauth/verify", { method: "POST", body: JSON.stringify({ challengeId, response }) });
+    const stale = Math.floor(Date.now() / 1000) - 600;
+    await env.DB.prepare("UPDATE sessions SET reauth_at = ? WHERE user_id = ?").bind(stale, user.userId).run();
+    const before = (await refusals(user.userId)).length;
+    const res = await reauthWith(user, 2);
     expect(res.status).toBe(403);
     expect(await storedCounter(user.key.credentialId)).toBe(4);
+    const rows = await refusals(user.userId);
+    expect(rows).toHaveLength(before + 1);
+    expect(JSON.parse(rows[rows.length - 1]?.meta ?? "{}").passkeyId).toBe(user.key.credentialId);
+    const fresh = await env.DB.prepare("SELECT count(*) AS n FROM sessions WHERE user_id = ? AND reauth_at = ?").bind(user.userId, stale).first<{ n: number }>();
+    expect(fresh?.n).toBe(await sessionCount(user.userId));
+  });
+
+  it("two parallel logins with the same counter make exactly one session and one login event", async () => {
+    const user = await newUser();
+    const sessionsBefore = (await sessionCount(user.userId)) ?? 0;
+    const loginsBefore = (await logins(user.userId)) ?? 0;
+    const [a, b] = await Promise.all([loginWith(user.key, { counter: 7 }), loginWith(user.key, { counter: 7 })]);
+    expect([a.res.status, b.res.status].sort()).toEqual([200, 401]);
+    expect([a.cookie, b.cookie].filter((cookie) => cookie !== "")).toHaveLength(1);
+    expect(await storedCounter(user.key.credentialId)).toBe(7);
+    expect(await sessionCount(user.userId)).toBe(sessionsBefore + 1);
+    expect(await logins(user.userId)).toBe(loginsBefore + 1);
+    // The loser is audited like a counter decrease.
+    expect(await refusals(user.userId)).toHaveLength(1);
+  });
+
+  it("two parallel re-auths with the same counter mark the session fresh once and audit the other", async () => {
+    const user = await newUser();
+    expect((await loginWith(user.key, { counter: 3 })).res.status).toBe(200);
+    const stale = Math.floor(Date.now() / 1000) - 600;
+    await env.DB.prepare("UPDATE sessions SET reauth_at = ? WHERE user_id = ?").bind(stale, user.userId).run();
+    const [a, b] = await Promise.all([reauthWith(user, 9), reauthWith(user, 9)]);
+    expect([a.status, b.status].sort()).toEqual([200, 403]);
+    expect(await storedCounter(user.key.credentialId)).toBe(9);
+    expect(await refusals(user.userId)).toHaveLength(1);
   });
 });
 
