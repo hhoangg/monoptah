@@ -19,14 +19,14 @@ const freshIp = () => `203.0.113.${(counter += 1)}`;
 const post = (path: string, ip: string, body: unknown = {}, extra: Record<string, string> = {}) =>
   call(path, { method: "POST", headers: { ...BROWSER_HEADERS, "CF-Connecting-IP": ip, ...extra }, body: JSON.stringify(body) });
 
-/** Passes the limiter: a stub answers 501, an implemented route answers with its own status (never 429 or 403). */
-const IMPLEMENTED_PATHS = new Set(["/api/auth/register/options", "/api/auth/register/verify", "/api/auth/login/options", "/api/auth/login/verify", "/api/auth/recover"]);
+/**
+ * Passes the limiter: the route answers with its own status, never 429 (limited), 403 (browser checks) or 501.
+ * The pairing routes reached with an empty body answer their own validation error: 400 invalid.
+ */
+const PAIRING_PATHS = new Set(["/api/pair/start", "/api/pair/poll"]);
 function expectPassed(res: Response, path: string, message?: string) {
-  if (IMPLEMENTED_PATHS.has(path)) {
-    expect([429, 403, 501], message).not.toContain(res.status);
-  } else {
-    expect(res.status, message).toBe(501);
-  }
+  expect([429, 403, 501], message).not.toContain(res.status);
+  if (PAIRING_PATHS.has(path)) expect(res.status, message).toBe(400);
 }
 
 async function expectLimited(res: Response, windowSeconds: number) {
@@ -184,10 +184,10 @@ describe("pair/poll: 1 per 3 s per deviceCode", () => {
   it("limits per device code, hashed in the key, at the middleware level", async () => {
     const ip = freshIp();
     const deviceCode = `device-code-${ip}`;
-    expect((await post("/api/pair/poll", ip, { deviceCode })).status).toBe(501);
+    expect((await post("/api/pair/poll", ip, { deviceCode })).status).toBe(400);
     await expectLimited(await post("/api/pair/poll", ip, { deviceCode }), 3);
     // Same IP, other device code: independent. Other IP, same device code: still limited (keyed by code).
-    expect((await post("/api/pair/poll", ip, { deviceCode: `${deviceCode}-2` })).status).toBe(501);
+    expect((await post("/api/pair/poll", ip, { deviceCode: `${deviceCode}-2` })).status).toBe(400);
     await expectLimited(await post("/api/pair/poll", freshIp(), { deviceCode }), 3);
     const keys = await env.DB.prepare("SELECT key FROM rate_limits WHERE key LIKE '%' || ? || '%'").bind(deviceCode).all();
     expect(keys.results).toEqual([]);
@@ -199,14 +199,14 @@ describe("pair/poll: 1 per 3 s per deviceCode", () => {
     await post("/api/pair/poll", ip, { deviceCode });
     expect((await post("/api/pair/poll", ip, { deviceCode })).status).toBe(429);
     await env.DB.prepare("UPDATE rate_limits SET window_start = window_start - 3 WHERE key LIKE 'pair-poll:device:%'").run();
-    expect((await post("/api/pair/poll", ip, { deviceCode })).status).toBe(501);
+    expect((await post("/api/pair/poll", ip, { deviceCode })).status).toBe(400);
   });
 
   it("leaves a body without a deviceCode to the handler", async () => {
     const ip = freshIp();
-    for (let i = 0; i < 3; i += 1) expect((await post("/api/pair/poll", ip, {})).status).toBe(501);
+    for (let i = 0; i < 3; i += 1) expect((await post("/api/pair/poll", ip, {})).status).toBe(400);
     const bad = await call("/api/pair/poll", { method: "POST", headers: { ...BROWSER_HEADERS, "CF-Connecting-IP": ip }, body: "not json" });
-    expect(bad.status).toBe(501);
+    expect(bad.status).toBe(400);
   });
 });
 
@@ -215,9 +215,9 @@ describe("push/notify: 30 per desktop token per minute", () => {
     const ip = freshIp();
     const token = `desktop-token-${ip}`;
     const send = (t: string, from = ip) => post("/api/push/notify", from, {}, { Authorization: `Bearer ${t}` });
-    for (let i = 0; i < 30; i += 1) expect((await send(token)).status, `call ${i + 1}`).toBe(501);
+    for (let i = 0; i < 30; i += 1) expect((await send(token)).status, `call ${i + 1}`).toBe(401);
     await expectLimited(await send(token, freshIp()), 60);
-    expect((await send(`${token}-other`)).status).toBe(501);
+    expect((await send(`${token}-other`)).status).toBe(401);
     const keys = await env.DB.prepare("SELECT key FROM rate_limits WHERE key LIKE '%' || ? || '%'").bind(token).all();
     expect(keys.results).toEqual([]);
   });
@@ -292,17 +292,17 @@ describe("per-IP bound of pair/poll and push/notify (attacker-chosen keys)", () 
 
   it("pair/poll: 120 calls per IP per minute whatever the device codes, checked before the per-code key", async () => {
     const ip = freshIp();
-    for (let i = 0; i < 120; i += 1) expect((await post("/api/pair/poll", ip, { deviceCode: `dc-${ip}-${i}` })).status, `call ${i + 1}`).toBe(501);
+    for (let i = 0; i < 120; i += 1) expect((await post("/api/pair/poll", ip, { deviceCode: `dc-${ip}-${i}` })).status, `call ${i + 1}`).toBe(400);
     await expectLimited(await post("/api/pair/poll", ip, { deviceCode: `dc-${ip}-fresh` }), 60);
     // The per-code key of the refused call was never consumed.
     const fresh = await env.DB.prepare("SELECT 1 FROM rate_limits WHERE key = ?").bind(`pair-poll:device:${await sha256Hex(`dc-${ip}-fresh`)}`).first();
     expect(fresh).toBeNull();
-    expect((await post("/api/pair/poll", freshIp(), { deviceCode: `dc-other-${ip}` })).status).toBe(501);
+    expect((await post("/api/pair/poll", freshIp(), { deviceCode: `dc-other-${ip}` })).status).toBe(400);
   });
 
   it("push/notify: 120 calls per IP per minute whatever the tokens, also without a token", async () => {
     const ip = freshIp();
-    for (let i = 0; i < 120; i += 1) expect((await post("/api/push/notify", ip, {}, { Authorization: `Bearer tok-${ip}-${i}` })).status, `call ${i + 1}`).toBe(501);
+    for (let i = 0; i < 120; i += 1) expect((await post("/api/push/notify", ip, {}, { Authorization: `Bearer tok-${ip}-${i}` })).status, `call ${i + 1}`).toBe(401);
     await expectLimited(await post("/api/push/notify", ip, {}, { Authorization: `Bearer tok-${ip}-fresh` }), 60);
     await expectLimited(await post("/api/push/notify", ip, {}), 60);
     const fresh = await env.DB.prepare("SELECT 1 FROM rate_limits WHERE key = ?").bind(`push-notify:token:${await sha256Hex(`tok-${ip}-fresh`)}`).first();
