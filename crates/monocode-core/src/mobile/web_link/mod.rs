@@ -4,6 +4,8 @@
 pub(crate) mod channel;
 pub mod frame;
 pub mod grants;
+#[cfg(test)]
+mod live_tests;
 pub mod noise;
 mod pacer;
 pub mod relay;
