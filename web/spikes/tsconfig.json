@@ -1,0 +1,6 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": { "types": ["node"], "lib": ["ES2023", "DOM", "DOM.Iterable"], "jsx": "react-jsx" },
+  "include": ["s-*/**/*.ts", "s-*/**/*.tsx", "*.config.ts", "eslint.config.js"],
+  "exclude": ["**/node_modules/**", "**/target/**", "**/dist/**", "s-*/worker/**", "s-*/**/*.workers.test.ts", "s-*/vitest.workers.config.ts"]
+}

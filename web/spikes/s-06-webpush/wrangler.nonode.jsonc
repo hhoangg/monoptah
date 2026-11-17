@@ -1,0 +1,10 @@
+// S-06 spike control: compatibility date 2026-09-01 (where nodejs_compat is on by default) with Node compatibility switched off
+// explicitly. Used with `wrangler dev --local -c` only (the vitest pool forces nodejs_compat itself).
+{
+  "name": "monoptah-spike-s06-nonode",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["no_nodejs_compat", "no_nodejs_compat_v2"],
+  // Workers Logs: invocation logs with CPU time, for the PENDING-MAC measurement in FINDINGS.md.
+  "observability": { "enabled": true }
+}

@@ -1,0 +1,9 @@
+// S-06 spike: minimal Worker config for the workers-pool tests. Same compatibility_date as web/wrangler.jsonc and
+// deliberately NO compatibility_flags: the point is to prove the WebCrypto-only sender needs none.
+{
+  "name": "monoptah-spike-s06",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-09-01",
+  // Workers Logs: invocation logs with CPU time, for the PENDING-MAC measurement in FINDINGS.md.
+  "observability": { "enabled": true }
+}

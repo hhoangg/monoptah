@@ -1,0 +1,128 @@
+// Starts the Worker on a local `wrangler dev --local` (Miniflare: local D1 and Durable Objects) in a temp dir,
+// the same approach as web/scripts/api-smoke.mjs. No Cloudflare account, no network beyond localhost.
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { createWriteStream, existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { createServer } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { parseInviteCode } from "./pure.ts";
+import { webDir, wranglerBin, wranglerConfig } from "./paths.ts";
+
+export const RP_ID = "localhost";
+
+export interface RunningServer {
+  origin: string;
+  /** The one-use bootstrap invite. Never print it. */
+  invite: string;
+  /** A second bootstrap invite, for specs that need their own account. Never print it. */
+  extraInvite: string;
+  stop(): void;
+}
+
+function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      const port = typeof address === "object" && address !== null ? address.port : 0;
+      server.close(() => resolve(port));
+    });
+  });
+}
+
+function runSync(cmd: string, args: string[], label: string): string {
+  const r = spawnSync(cmd, args, { cwd: webDir, encoding: "utf8", env: { ...process.env, WRANGLER_SEND_METRICS: "false" } });
+  if (r.status !== 0) throw new Error(`${label} failed (exit ${r.status}): ${(r.stderr || "").slice(-600)}`);
+  return r.stdout;
+}
+
+function killTree(child: ChildProcess | null): void {
+  if (!child || child.exitCode !== null || child.pid === undefined) return;
+  try {
+    process.kill(-child.pid, "SIGTERM");
+  } catch {
+    child.kill("SIGTERM");
+  }
+}
+
+async function waitForHealth(origin: string, wrangler: ChildProcess): Promise<void> {
+  const deadline = Date.now() + 120_000;
+  while (Date.now() < deadline) {
+    if (wrangler.exitCode !== null) throw new Error(`wrangler dev exited early with code ${wrangler.exitCode}`);
+    try {
+      const res = await fetch(`${origin}/api/health`, { signal: AbortSignal.timeout(2000) });
+      if (res.status === 200) return;
+    } catch {
+      // not up yet
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error("wrangler dev did not answer /api/health within 120 s");
+}
+
+/** `logFile`: where wrangler's stdout and stderr go (it holds no secret; the fake secrets are never printed). */
+export async function startServer(logFile: string): Promise<RunningServer> {
+  if (!existsSync(wranglerBin)) throw new Error("wrangler not found in web/e2e/node_modules/.bin: run `pnpm install` in web/ first");
+  const tmp = mkdtempSync(join(tmpdir(), "monoptah-e2e-"));
+  const persist = join(tmp, "state");
+  let wrangler: ChildProcess | null = null;
+  let stopped = false;
+  const stop = (): void => {
+    if (stopped) return;
+    stopped = true;
+    killTree(wrangler);
+    rmSync(tmp, { recursive: true, force: true });
+  };
+  try {
+    const port = await freePort();
+    const origin = `http://localhost:${port}`;
+    runSync(process.execPath, [join(webDir, "worker", "scripts", "ensure-assets.mjs")], "ensure-assets");
+    runSync(wranglerBin, ["d1", "migrations", "apply", "monoptah", "--local", "--persist-to", persist, "-c", wranglerConfig], "d1 migrations apply");
+    const bootstrap = (): string => {
+      const printed = runSync(process.execPath, [join(webDir, "scripts", "bootstrap.mjs"), "--local", "--persist-to", persist, "--origin", origin], "bootstrap");
+      const code = parseInviteCode(printed);
+      if (code === null) throw new Error("bootstrap printed no invite link");
+      return code;
+    };
+    const invite = bootstrap();
+    const extraInvite = bootstrap();
+
+    // Obviously fake secrets, passed with --var so a developer's web/.dev.vars is never read.
+    const fake = {
+      VAPID_PRIVATE_KEY: `e2e-fake-vapid-${randomBytes(12).toString("hex")}`,
+      RECOVERY_PEPPER: `e2e-fake-pepper-${randomBytes(12).toString("hex")}`,
+      AUDIT_IP_SALT: `e2e-fake-salt-${randomBytes(12).toString("hex")}`,
+    };
+    const args = [
+      "dev", "--local", "--persist-to", persist, "--port", String(port), "--ip", "127.0.0.1", "-c", wranglerConfig,
+      "--show-interactive-dev-session=false",
+      "--var", `RP_ID:${RP_ID}`, "--var", `RP_ORIGIN:${origin}`,
+      ...Object.entries(fake).flatMap(([name, value]) => ["--var", `${name}:${value}`]),
+    ];
+    mkdirSync(join(logFile, ".."), { recursive: true });
+    const log = createWriteStream(logFile);
+    wrangler = spawn(wranglerBin, args, {
+      cwd: webDir,
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, WRANGLER_SEND_METRICS: "false", WRANGLER_LOG_PATH: join(tmp, "wrangler-logs"), NO_COLOR: "1" },
+    });
+    wrangler.stdout?.pipe(log, { end: false });
+    wrangler.stderr?.pipe(log, { end: false });
+    wrangler.once("exit", () => log.end());
+    await waitForHealth(origin, wrangler);
+
+    const onSignal = (code: number) => (): void => {
+      stop();
+      process.exit(code);
+    };
+    process.once("SIGINT", onSignal(130));
+    process.once("SIGTERM", onSignal(143));
+    return { origin, invite, extraInvite, stop };
+  } catch (err) {
+    stop();
+    throw err;
+  }
+}
