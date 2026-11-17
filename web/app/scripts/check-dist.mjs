@@ -52,6 +52,15 @@ if (!existsSync(sw)) {
   }
 }
 
+// vaul and Sonner insert their CSS with a <style> element at runtime, which style-src 'self' blocks. Their stylesheets
+// must be bundled into a served .css file instead (ui/drawer.tsx, ui/sonner.tsx).
+const cssText = readdirSync(client, { recursive: true, withFileTypes: true })
+  .filter((entry) => entry.isFile() && entry.name.endsWith(".css"))
+  .map((entry) => readFileSync(join(entry.parentPath, entry.name), "utf8"))
+  .join("\n");
+if (!cssText.includes("data-vaul-drawer")) problems.push("the vaul stylesheet is not bundled into a served .css file");
+if (!cssText.includes("data-sonner-toaster")) problems.push("the Sonner stylesheet is not bundled into a served .css file");
+
 if (problems.length > 0) {
   console.error(problems.map((problem) => `check-dist: ${problem}`).join("\n"));
   process.exit(1);
