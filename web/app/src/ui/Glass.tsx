@@ -1,6 +1,6 @@
 import { motion, type HTMLMotionProps } from "motion/react";
 import { haptic } from "@/lib/haptics";
-import { cn } from "@/lib/utils";
+import { cn } from "./cn";
 import { springs } from "./motion";
 
 export interface GlassProps extends HTMLMotionProps<"div"> {

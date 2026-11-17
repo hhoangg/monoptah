@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { cn } from "@/lib/utils";
+import { cn } from "./cn";
 import { Glass } from "./Glass";
 
 /**
@@ -9,7 +9,7 @@ import { Glass } from "./Glass";
 export function AuthLayout({ children, className }: { children: ReactNode; className?: string }) {
   return (
     <div className="mx-auto flex w-full max-w-[420px] flex-col px-[max(1.25rem,env(safe-area-inset-left))] pt-6 pr-[max(1.25rem,env(safe-area-inset-right))] sm:pt-12">
-      <Glass className={cn("flex flex-col gap-5 rounded-card p-5", className)}>{children}</Glass>
+      <Glass className={cn("flex flex-col gap-5 rounded-card! p-5", className)}>{children}</Glass>
     </div>
   );
 }

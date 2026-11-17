@@ -1,6 +1,6 @@
 import { Link, type LinkProps } from "@tanstack/react-router";
 import type { ComponentProps, ReactNode } from "react";
-import { cn } from "@/lib/utils";
+import { cn } from "./cn";
 import { Icon, type IconName } from "./Icon";
 
 export interface SettingsCardProps extends Omit<ComponentProps<"section">, "title"> {

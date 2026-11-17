@@ -2,7 +2,7 @@ import { cva, type VariantProps } from "class-variance-authority";
 import { Slot as SlotPrimitive } from "radix-ui";
 import type { ComponentProps } from "react";
 import { haptic } from "@/lib/haptics";
-import { cn } from "@/lib/utils";
+import { cn } from "./cn";
 
 // shadcn Button restyled to design-system.md section 8: the primary action is the inverse pair
 // (bg primary = inverseSurface, text inverse), never accent-colored. No shadows, radii from the

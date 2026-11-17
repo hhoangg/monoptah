@@ -1,6 +1,6 @@
 import { Switch as SwitchPrimitive } from "radix-ui";
 import type { ComponentProps } from "react";
-import { cn } from "@/lib/utils";
+import { cn } from "./cn";
 
 // Switch (design-system.md section 8): the track is `brand` when on, `fill` when off. No shadow.
 export function Switch({ className, ...props }: ComponentProps<typeof SwitchPrimitive.Root>) {

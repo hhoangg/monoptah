@@ -1,5 +1,5 @@
 import type { ComponentProps } from "react";
-import { cn } from "@/lib/utils";
+import { cn } from "./cn";
 
 // Text input (design-system.md section 8): bg fill, radius 12, 17px text (no iOS zoom), 1px stroke,
 // focus is the global 2px accent outline, never a ring shadow.

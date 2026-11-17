@@ -46,7 +46,7 @@ export function RecoveryCodes({ handle, codes, onContinue, continueLabel = "Cont
       <Notice variant="info" title="Shown only once">
         Each code signs you in once if you lose your passkeys. Save them now; Monoptah cannot show them again.
       </Notice>
-      <ol aria-label="Recovery codes" className="grid list-none grid-cols-2 gap-2 rounded-row bg-fill p-3">
+      <ol aria-label="Recovery codes" className="grid list-none grid-cols-1 gap-2 min-[28rem]:grid-cols-2 rounded-row bg-fill p-3">
         {codes.map((code, index) => (
           <li key={code} className="flex items-baseline gap-2 font-mono text-label tabular-nums text-content">
             <span aria-hidden="true" className="w-5 shrink-0 text-right text-caption text-muted-text">

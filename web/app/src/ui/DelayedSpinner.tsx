@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { cn } from "@/lib/utils";
+import { cn } from "./cn";
 import { Icon } from "./Icon";
 
 /** True once `active` has been true for `delayMs` (design-system.md 12.18: loading shows after 250 ms). */
