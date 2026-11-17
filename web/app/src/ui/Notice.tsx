@@ -22,7 +22,7 @@ export function Notice({ variant = "info", title, children, className }: NoticeP
       <Icon name={isError ? "alert" : "info"} size={18} className={cn("mt-0.5 shrink-0", isError ? "text-deletions" : "text-muted-text")} />
       <div className="min-w-0 flex-1">
         {title ? <p className="font-semibold">{title}</p> : null}
-        <div className={title ? "text-muted-text" : undefined}>{children}</div>
+        <div>{children}</div>
       </div>
     </div>
   );

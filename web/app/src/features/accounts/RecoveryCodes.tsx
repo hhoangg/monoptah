@@ -49,7 +49,7 @@ export function RecoveryCodes({ handle, codes, onContinue, continueLabel = "Cont
       <div data-print-area className="flex flex-col gap-2">
         <p className="hidden text-body font-semibold print:block">{`Monoptah recovery codes for ${handle}`}</p>
         {/* One column: a code is 19 characters and must never wrap in the middle. */}
-        <ol aria-label="Recovery codes" className="grid list-none grid-cols-1 gap-2 rounded-row bg-fill p-3">
+        <ol aria-label="Recovery codes" className="grid list-none grid-cols-1 gap-2 overflow-x-auto rounded-row bg-fill p-3">
           {codes.map((code, index) => (
             <li key={code} className="flex items-baseline gap-2 font-mono text-label tabular-nums whitespace-nowrap text-content">
               <span aria-hidden="true" className="w-5 shrink-0 text-right text-caption text-muted-text">

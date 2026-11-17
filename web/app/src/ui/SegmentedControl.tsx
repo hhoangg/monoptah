@@ -80,8 +80,8 @@ export function SegmentedControl<T extends string>({ label, options, value, onCh
                 transition={reduceMotion ? { duration: 0 } : { duration: 0.24, ease: [0.215, 0.61, 0.355, 1] }}
               />
             ) : null}
-            {option.icon ? <Icon name={option.icon} size={18} className={selected ? undefined : "opacity-50"} /> : null}
-            <span className={selected ? undefined : "text-muted-text"}>{option.label}</span>
+            {option.icon ? <Icon name={option.icon} size={18} className={cn("hidden min-[24rem]:inline-flex", selected ? undefined : "opacity-50")} /> : null}
+            <span className="min-w-0 truncate">{option.label}</span>
           </button>
         );
       })}

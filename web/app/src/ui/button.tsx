@@ -25,7 +25,7 @@ export const buttonVariants = cva(
         default: "min-h-11 px-4 py-2 pointer-fine:min-h-9 rounded-row",
         sm: "min-h-11 px-3 pointer-fine:min-h-9 rounded-row",
         /** Big call to action: radius 32. */
-        lg: "min-h-14 px-6 text-body rounded-sheet",
+        lg: "min-h-14 px-6 py-2 text-body whitespace-normal rounded-sheet",
         /** Send button and other pills: radius 999. */
         pill: "min-h-11 px-5 pointer-fine:min-h-9 rounded-pill",
         /** Circle button 44, 36 in the composer and on pointer: fine. */
