@@ -25,6 +25,32 @@ export interface MockPairing {
   status: "pending" | "approved" | "denied";
 }
 
+/** A row of `GET /api/admin/users` (AdminUserSchema). The signed-in account is added by the handler. */
+export interface MockAdminUser {
+  id: string;
+  handle: string;
+  displayName: string;
+  role: "user" | "admin";
+  status: "active" | "blocked";
+  invitedBy: string | null;
+  blockedVia: string | null;
+  invitesGranted: number;
+  desktopCount: number;
+  createdAt: number;
+}
+
+/** A row of `GET /api/admin/audit`. */
+export interface MockAuditEvent {
+  id: string;
+  ts: number;
+  action: string;
+  targetType: string | null;
+  targetId: string | null;
+  meta: Record<string, unknown>;
+  actorUserId: string | null;
+  actorKind: "user" | "desktop" | "admin" | "system";
+}
+
 export interface MockChallenge {
   purpose: "register" | "login" | "reauth" | "add-passkey";
   expiresAt: number;
@@ -40,6 +66,12 @@ export interface MockState {
   /** null forces the recovery-codes regenerate screen. */
   recoveryAckAt: number | null;
   invitesPaused: boolean;
+  /** `MAX_USERS` of the Worker: 0 means no cap. */
+  maxUsers: number;
+  /** The other accounts of the instance (the signed-in one is `user`). */
+  adminUsers: MockAdminUser[];
+  /** Newest first. */
+  audit: MockAuditEvent[];
   /** Unix seconds of the last passkey re-auth, or null. */
   reauthAt: number | null;
   passkeys: MockPasskey[];
@@ -64,6 +96,9 @@ export interface MockState {
 
 export const SEED_INVITE_CODE = "DEV-INVITE-0001";
 export const SEED_HANDLE = "dev-user";
+export const SEED_USER_ID = "user-dev-1";
+/** Total invites one user can be granted (Worker `MAX_INVITES_GRANTED`). */
+export const MAX_INVITES_GRANTED = 1000;
 export const FRESH_WINDOW_SECONDS = 300;
 export const PAIRING_TTL_SECONDS = 600;
 /** Max desktops per account (Worker `MAX_DESKTOPS_PER_USER`, default 5). */
@@ -153,7 +188,69 @@ function seedDesktops(count: number, now: number): MockDesktop[] {
   return all.slice(0, count);
 }
 
+const DAY = 86400;
+
+function seedAdminUsers(now: number): MockAdminUser[] {
+  const user = (id: string, handle: string, displayName: string, invitedBy: string, daysAgo: number, desktopCount: number, extra: Partial<MockAdminUser> = {}): MockAdminUser => ({
+    id,
+    handle,
+    displayName,
+    role: "user",
+    status: "active",
+    invitedBy,
+    blockedVia: null,
+    invitesGranted: 3,
+    desktopCount,
+    createdAt: now - daysAgo * DAY,
+    ...extra,
+  });
+  return [
+    user("usr-ada", "ada", "Ada Lovelace", SEED_USER_ID, 40, 2),
+    user("usr-ben", "ben", "Ben Carter", "usr-ada", 20, 1),
+    user("usr-cleo", "cleo", "Cleo Park", "usr-ada", 12, 0),
+    user("usr-dmitri", "dmitri", "Dmitri Volkov", "usr-cleo", 6, 1),
+    user("usr-eve", "eve", "Eve Alvarez", SEED_USER_ID, 25, 3),
+    user("usr-mallory", "mallory", "Mallory Quinn", "usr-eve", 9, 1, { status: "blocked", blockedVia: "usr-mallory" }),
+    user("usr-trent", "trent", "Trent Okafor", "usr-mallory", 7, 0, { status: "blocked", blockedVia: "usr-mallory" }),
+    user("usr-wendy", "wendy", "Wendy Lin", "usr-mallory", 5, 2),
+  ];
+}
+
+function seedAudit(now: number): MockAuditEvent[] {
+  const event = (index: number, minutesAgo: number, action: string, actorUserId: string, targetId: string | null, targetType: string | null, meta: Record<string, unknown> = {}): MockAuditEvent => ({
+    id: `aud-seed-${index}`,
+    ts: now - minutesAgo * 60,
+    action,
+    targetType,
+    targetId,
+    meta,
+    actorUserId,
+    actorKind: "user",
+  });
+  const rows: Array<[number, string, string, string | null, string | null, Record<string, unknown>?]> = [
+    [20, "user.block", SEED_USER_ID, "usr-mallory", "user", { cascade: true, count: 2 }],
+    [95, "admin.invites_grant", SEED_USER_ID, "usr-ada", "user", { count: 5 }],
+    [300, "invite.create", "usr-ada", null, "invite"],
+    [420, "user.register", "usr-wendy", "usr-wendy", "user"],
+    [900, "passkey.add", "usr-eve", null, "passkey"],
+    [1500, "admin.settings_change", SEED_USER_ID, "invites_paused", "setting", { invitesPaused: false }],
+    [2200, "user.register", "usr-dmitri", "usr-dmitri", "user"],
+    [3000, "invite.use", "usr-dmitri", null, "invite"],
+    [4100, "recovery.regenerate", "usr-ben", null, null],
+    [5200, "user.register", "usr-cleo", "usr-cleo", "user"],
+    [7000, "invite.create", "usr-ada", null, "invite"],
+    [9000, "pairing.approve", "usr-eve", null, "desktop"],
+    [12000, "user.register", "usr-ben", "usr-ben", "user"],
+    [20000, "login", "usr-ada", null, null],
+  ];
+  return rows.map(([minutes, action, actor, target, type, meta], index) => event(index, minutes, action, actor, target, type, meta));
+}
+
 export interface SeedOptions {
+  /** `admin` makes the signed-in account an administrator (default a plain user). */
+  role?: "user" | "admin";
+  /** `MAX_USERS` (default 150); 0 means no cap, "full" sets the cap to the current user count. */
+  maxUsers?: number | "full";
   signedIn?: boolean;
   recoveryOnly?: boolean;
   recoveryAckAt?: "now" | null;
@@ -167,11 +264,14 @@ export interface SeedOptions {
 export function createMockState(options: SeedOptions = {}): MockState {
   const now = nowSeconds();
   const state: MockState = {
-    user: { id: "user-dev-1", handle: SEED_HANDLE, displayName: "Dev User", role: "user" },
+    user: { id: SEED_USER_ID, handle: SEED_HANDLE, displayName: "Dev User", role: options.role ?? "user" },
     signedIn: options.signedIn ?? false,
     recoveryOnly: options.recoveryOnly ?? false,
     recoveryAckAt: options.recoveryAckAt === null ? null : now - 86400,
     invitesPaused: options.invitesPaused ?? false,
+    maxUsers: 0,
+    adminUsers: seedAdminUsers(now),
+    audit: seedAudit(now),
     reauthAt: null,
     passkeys: seedPasskeys(options.passkeyCount ?? 2),
     sessions: [
@@ -191,8 +291,19 @@ export function createMockState(options: SeedOptions = {}): MockState {
     counter: 0,
     recoverFailures: 0,
   };
+  state.maxUsers = options.maxUsers === "full" ? userCount(state) : (options.maxUsers ?? 150);
   newRecoveryBatch(state);
   return state;
+}
+
+/** Every account of the instance, blocked ones included (Worker `USER_COUNT_SQL`). */
+export function userCount(state: MockState): number {
+  return 1 + state.adminUsers.length;
+}
+
+/** True while registration and invite creation are refused: paused by the admin or `MAX_USERS` reached. */
+export function invitesClosed(state: MockState): boolean {
+  return state.invitesPaused || (state.maxUsers > 0 && userCount(state) >= state.maxUsers);
 }
 
 export function defaultPrefs(): MockPrefs {

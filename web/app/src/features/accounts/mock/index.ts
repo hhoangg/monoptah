@@ -6,7 +6,10 @@
 //  - `window.__monoptahMock` with `reset(options)`, `set(patch)`, `snapshot()` and `recoveryCodes()`.
 //  - A `?mock=` query on the first page load picks a starting state, comma separated:
 //    `signedin`, `signedout`, `recoveryonly`, `noack` (recoveryAckAt null), `paused` (invites
-//    paused), `onepasskey`, `threepasskeys`, `nodesktops`, `fivedesktops` (at the desktop limit).
+//    paused), `onepasskey`, `threepasskeys`, `nodesktops`, `fivedesktops` (at the desktop limit),
+//    `admin` (the account is an administrator: /admin, /admin/users, /admin/invites; without it the
+//    admin routes answer 403 `forbidden`), `nocap` (MAX_USERS 0), `atcap` (MAX_USERS reached).
+//    Admin example: `/admin?mock=signedin,admin`. Admin routes need a fresh session (`reauthAgeSeconds`).
 //    Example: `/settings?mock=signedin,noack`.
 //  - Pairing codes for /pair/:code (state.ts): `WXYZ-4829` (valid, renews itself), `NAME-2345` (hostile
 //    machine name), `EXPR-2345` (expired); any other code is unknown. The matching fingerprint for the
@@ -27,6 +30,8 @@ export interface MockPatch {
   recoveryOnly?: boolean;
   recoveryAckAt?: number | null;
   invitesPaused?: boolean;
+  role?: "user" | "admin";
+  maxUsers?: number;
   passkeyCount?: number;
   /** Seconds since the last re-auth; null clears the fresh window. */
   reauthAgeSeconds?: number | null;
@@ -73,6 +78,9 @@ export function seedFromQuery(search: string, storedSignedIn: boolean): SeedOpti
   if (flags.has("threepasskeys")) options.passkeyCount = 3;
   if (flags.has("nodesktops")) options.desktopCount = 0;
   if (flags.has("fivedesktops")) options.desktopCount = 5;
+  if (flags.has("admin")) options.role = "admin";
+  if (flags.has("nocap")) options.maxUsers = 0;
+  if (flags.has("atcap")) options.maxUsers = "full";
   return options;
 }
 
@@ -121,6 +129,8 @@ export function installMockApi(): void {
       }
       if (patch.recoveryAckAt !== undefined) state.recoveryAckAt = patch.recoveryAckAt;
       if (patch.invitesPaused !== undefined) state.invitesPaused = patch.invitesPaused;
+      if (patch.role !== undefined) state.user = { ...state.user, role: patch.role };
+      if (patch.maxUsers !== undefined) state.maxUsers = patch.maxUsers;
       if (patch.passkeyCount !== undefined) state.passkeys = createMockState({ passkeyCount: patch.passkeyCount }).passkeys;
       if (patch.reauthAgeSeconds !== undefined) {
         state.reauthAt = patch.reauthAgeSeconds === null ? null : nowSeconds() - patch.reauthAgeSeconds;

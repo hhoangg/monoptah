@@ -131,6 +131,10 @@ const SCREENS: Record<string, string> = {
   "/pair/:code": "Code expired",
   "/d/dk1/settings": "Desktop settings",
   "/d/:desktopId/settings": "Desktop settings",
+  // The default test account is a member, so the admin routes show their guard screen (U-04).
+  "/admin": "Not available",
+  "/admin/users": "Not available",
+  "/admin/invites": "Not available",
 };
 
 async function renderAt(url: string) {

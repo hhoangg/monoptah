@@ -18,6 +18,11 @@ import {
   PAIRING_TTL_SECONDS,
   randomBytes,
   randomId,
+  userCount,
+  invitesClosed,
+  MAX_INVITES_GRANTED,
+  type MockAdminUser,
+  type MockAuditEvent,
   type MockChallenge,
   type MockPairing,
   type MockState,
@@ -41,6 +46,7 @@ interface Ctx {
   state: MockState;
   params: Record<string, string>;
   body: Record<string, unknown>;
+  query: URLSearchParams;
 }
 
 type Handler = (ctx: Ctx) => unknown;
@@ -126,7 +132,7 @@ function isFresh(state: MockState): boolean {
 }
 
 function checkInvite(state: MockState, invite: string): void {
-  if (state.invitesPaused || !state.registrationCodes.has(invite)) throw new MockHttpError(400, "invalid_invite", INVALID_INVITE);
+  if (invitesClosed(state) || !state.registrationCodes.has(invite)) throw new MockHttpError(400, "invalid_invite", INVALID_INVITE);
 }
 
 function addPasskey(state: MockState, name: string | undefined): ReturnType<typeof newPasskey> {
@@ -298,7 +304,7 @@ const handlers: Record<string, Handler> = {
   "GET /api/invites": ({ state }) => ({ invites: state.invites, granted: state.invitesGranted, remaining: invitesRemaining(state) }),
   "POST /api/invites": ({ state }) => {
     // The real server answers 409: the user can do nothing about a paused gate, so it is a state conflict.
-    if (state.invitesPaused) throw new MockHttpError(409, "invites_paused", "Invites are paused");
+    if (invitesClosed(state)) throw new MockHttpError(409, "invites_paused", "Invites are paused");
     if (invitesRemaining(state) <= 0) throw new MockHttpError(409, "quota_exceeded", "No invites left");
     const now = nowSeconds();
     const invite = { id: randomId("inv"), createdAt: now, expiresAt: now + INVITE_TTL_SECONDS, usedAt: null, revokedAt: null, usedBy: null };
@@ -372,6 +378,116 @@ const handlers: Record<string, Handler> = {
   },
 };
 
+
+// --- Admin (A-09): the semantics of web/worker/src/modules/admin ---
+
+const ADMIN_PAGE_SIZE = 50;
+
+/** Every account including the signed-in one, oldest first (Worker `LIST_USERS_SQL`). */
+function allAdminUsers(state: MockState): MockAdminUser[] {
+  const self: MockAdminUser = {
+    id: state.user.id,
+    handle: state.user.handle,
+    displayName: state.user.displayName,
+    role: state.user.role,
+    status: "active",
+    invitedBy: null,
+    blockedVia: null,
+    invitesGranted: state.invitesGranted,
+    desktopCount: state.desktops.length,
+    createdAt: nowSeconds() - 90 * 86400,
+  };
+  return [self, ...state.adminUsers].sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
+}
+
+function findAdminUser(state: MockState, id: string | undefined): MockAdminUser {
+  const found = allAdminUsers(state).find((user) => user.id === id);
+  if (!found) throw new MockHttpError(404, "not_found", "User not found");
+  return found;
+}
+
+/** The user plus every descendant of the invite tree (the Worker's recursive CTE). */
+function branchOf(state: MockState, rootId: string): MockAdminUser[] {
+  const users = allAdminUsers(state);
+  const out: MockAdminUser[] = [];
+  const seen = new Set<string>();
+  const queue = [rootId];
+  while (queue.length > 0) {
+    const id = queue.shift() as string;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const user = users.find((item) => item.id === id);
+    if (user) out.push(user);
+    for (const child of users) if (child.invitedBy === id) queue.push(child.id);
+  }
+  return out;
+}
+
+function addAudit(state: MockState, event: Pick<MockAuditEvent, "action" | "targetType" | "targetId" | "meta">): void {
+  state.audit.unshift({ id: randomId("aud"), ts: nowSeconds(), actorUserId: state.user.id, actorKind: "user", ...event });
+}
+
+/** Writes through to the signed-in account (kept in `state.user` and friends) or to a stored user. */
+function stored(state: MockState, user: MockAdminUser): MockAdminUser | null {
+  return state.adminUsers.find((item) => item.id === user.id) ?? null;
+}
+
+const adminHandlers: Record<string, Handler> = {
+  "GET /api/admin/users": ({ state }) => ({ users: allAdminUsers(state) }),
+  "POST /api/admin/users/:id/block": ({ state, params, body }) => {
+    if (params.id === state.user.id) throw new MockHttpError(409, "conflict", "You cannot block yourself");
+    const target = findAdminUser(state, params.id);
+    const cascade = body.cascade === true;
+    // The acting admin is never a member; a member already blocked is left as it was.
+    const members = (cascade ? branchOf(state, target.id) : [target]).filter((user) => user.id !== state.user.id && user.status === "active");
+    for (const member of members) {
+      const row = stored(state, member);
+      if (!row) continue;
+      row.status = "blocked";
+      row.blockedVia = cascade ? target.id : null;
+    }
+    if (members.length > 0) addAudit(state, { action: "user.block", targetType: "user", targetId: target.id, meta: { cascade, count: members.length } });
+    return { blocked: members.length };
+  },
+  // Restores sign-in only: descendants stay blocked, revoked tokens and grants stay revoked.
+  "POST /api/admin/users/:id/unblock": ({ state, params }) => {
+    const target = findAdminUser(state, params.id);
+    const row = stored(state, target);
+    if (!row || row.status !== "blocked") throw new MockHttpError(409, "conflict", "User is not blocked");
+    row.status = "active";
+    row.blockedVia = null;
+    addAudit(state, { action: "user.unblock", targetType: "user", targetId: target.id, meta: { cascade: false } });
+    return { ok: true };
+  },
+  "POST /api/admin/users/:id/invites": ({ state, params, body }) => {
+    const target = findAdminUser(state, params.id);
+    const count = typeof body.count === "number" ? body.count : 0;
+    const row = stored(state, target);
+    const granted = row ? row.invitesGranted : state.invitesGranted;
+    if (granted + count > MAX_INVITES_GRANTED) throw new MockHttpError(409, "conflict", `A user can hold at most ${MAX_INVITES_GRANTED} invites`);
+    if (row) row.invitesGranted += count;
+    else state.invitesGranted += count;
+    addAudit(state, { action: "admin.invites_grant", targetType: "user", targetId: target.id, meta: { count } });
+    return { ok: true };
+  },
+  "GET /api/admin/settings": ({ state }) => ({ invitesPaused: state.invitesPaused, maxUsers: state.maxUsers, userCount: userCount(state) }),
+  "PUT /api/admin/settings": ({ state, body }) => {
+    state.invitesPaused = body.invitesPaused === true;
+    addAudit(state, { action: "admin.settings_change", targetType: "setting", targetId: "invites_paused", meta: { invitesPaused: state.invitesPaused } });
+    return { invitesPaused: state.invitesPaused, maxUsers: state.maxUsers, userCount: userCount(state) };
+  },
+  // Newest first; the cursor is an offset here (the Worker's is an opaque `(ts, id)` pair).
+  "GET /api/admin/audit": ({ state, query }) => {
+    const limit = Number(query.get("limit") ?? ADMIN_PAGE_SIZE);
+    const offset = Number(query.get("cursor") ?? 0);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100 || !Number.isInteger(offset) || offset < 0) throw new MockHttpError(400, "invalid", "Invalid page query");
+    const events = state.audit.slice(offset, offset + limit);
+    return { events, nextCursor: offset + limit < state.audit.length ? String(offset + limit) : null };
+  },
+};
+
+Object.assign(handlers, adminHandlers);
+
 const compiled = Object.keys(handlers).map((key) => {
   const [method, path] = key.split(" ") as [string, string];
   const regex = new RegExp(`^${path.replace(/:([A-Za-z0-9_]+)/g, "(?<$1>[^/]+)")}$`);
@@ -441,7 +557,9 @@ export function createMockServer(options: MockTransportOptions = {}): MockTransp
         if (state.recoveryOnly) {
           // The Worker also lets a recovery-only session read GET /api/me and sign out.
           if (!route.allowRecoveryOnly && !RECOVERY_ONLY_ALLOWLIST.has(`${route.method} ${route.path}`)) throw new MockHttpError(403, "recovery_only", "This session can only add a passkey");
-        } else if (route.auth === "fresh" && !isFresh(state)) {
+        } else if (route.auth === "admin" && state.user.role !== "admin") {
+          throw new MockHttpError(403, "forbidden", "Not allowed");
+        } else if ((route.auth === "fresh" || route.auth === "admin") && !isFresh(state)) {
           throw new MockHttpError(403, "fresh_required", "Confirm with your passkey first");
         }
       }
@@ -453,7 +571,7 @@ export function createMockServer(options: MockTransportOptions = {}): MockTransp
       }
       const params = { ...(match.result.groups ?? {}) } as Record<string, string>;
       for (const key of Object.keys(params)) params[key] = decodeURIComponent(params[key] ?? "");
-      const result = handlers[entry.key]?.({ state, params, body: (rawBody ?? {}) as Record<string, unknown> });
+      const result = handlers[entry.key]?.({ state, params, body: (rawBody ?? {}) as Record<string, unknown>, query: parsed.searchParams });
       state.counter += 1;
       return json(200, result);
     } catch (error) {
