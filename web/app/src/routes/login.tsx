@@ -12,7 +12,9 @@ export const Route = createFileRoute("/login")({
   beforeLoad: async ({ context, search }) => {
     let signedIn = false;
     try {
-      signedIn = Boolean(await context.queryClient.ensureQueryData({ ...meQuery, retry: false }));
+      // A recovery-only session (still so after it added a passkey) is not a sign-in: the user must
+      // be able to reach this screen to sign in with the new passkey.
+      signedIn = (await context.queryClient.ensureQueryData({ ...meQuery, retry: false })).recoveryOnly === false;
     } catch {
       // 401 (signed out), 403 recovery_only or a network error: stay on the sign-in screen.
     }

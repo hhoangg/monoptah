@@ -8,17 +8,12 @@ import { Field } from "@/ui/Field";
 import { Notice } from "@/ui/Notice";
 import { PageHeader } from "@/ui/PageHeader";
 import { AddPasskeyStep } from "./AddPasskeyStep";
-import { passkeyErrorMessage, recoverErrorMessage } from "./authCopy";
+import { recoverErrorMessage } from "./authCopy";
 import { ApiError } from "./api";
-import { meQuery, ReauthCancelledError, recoverAccount, regenerateRecoveryCodes, signOut } from "./queries";
-import { RecoveryCodes } from "./RecoveryCodes";
+import { meQuery, recoverAccount, signOut } from "./queries";
 import { normalizeRecoveryCode } from "./recoveryCodesFile";
-import { postSignInTarget } from "./redirect";
 
-type Step = "form" | "passkey" | "regenerate" | "codes";
-
-/** The server asks for new codes when this many or fewer are left. */
-export const LOW_CODES_THRESHOLD = 2;
+type Step = "form" | "passkey";
 
 export function RecoverScreen() {
   const queryClient = useQueryClient();
@@ -31,21 +26,10 @@ export function RecoverScreen() {
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [codesLeft, setCodesLeft] = useState<number | null>(null);
-  const [accountHandle, setAccountHandle] = useState("");
-  const [newCodes, setNewCodes] = useState<string[]>([]);
-  const [stuck, setStuck] = useState(false);
-
-  // The registry lets a recovery-only session call neither GET /api/me nor logout, so its `me` is
-  // a 403 `recovery_only`: that alone says "add the passkey now". The handle is then unknown.
+  // The server lets a recovery-only session call GET /api/me and logout, and nothing else but
+  // adding a passkey. A 403 `recovery_only` from `me` (an older server) means the same thing.
   const recoverySession = me.data?.recoveryOnly === true || (me.error instanceof ApiError && me.error.code === "recovery_only");
   const step: Step = localStep ?? (recoverySession ? "passkey" : "form");
-  const resolvedHandle = accountHandle || me.data?.user.handle || handle.trim().toLowerCase();
-
-  function finish() {
-    setNewCodes([]);
-    void router.navigate({ href: postSignInTarget(undefined) });
-  }
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -58,9 +42,7 @@ export function RecoverScreen() {
     }
     setBusy(true);
     try {
-      const result = await recoverAccount(queryClient, { handle: cleanHandle, code: normalized });
-      setAccountHandle(result.user.handle);
-      setCodesLeft(result.codesLeft);
+      await recoverAccount(queryClient, { handle: cleanHandle, code: normalized });
       setCode("");
       setLocalStep("passkey");
     } catch (caught) {
@@ -70,35 +52,17 @@ export function RecoverScreen() {
     }
   }
 
-  function afterPasskey() {
-    if (codesLeft !== null && codesLeft <= LOW_CODES_THRESHOLD) setLocalStep("regenerate");
-    else finish();
-  }
-
-  /** Ends a session the server still treats as recovery-only; the cache is cleared even if logout is refused. */
-  async function leave() {
-    setBusy(true);
+  /**
+   * The server keeps a recovery session recovery-only even after it holds a passkey, so the user
+   * signs out here and signs in with the new passkey. The cache is cleared even if logout fails.
+   */
+  async function afterPasskey() {
     try {
       await signOut(queryClient);
     } catch {
       // The local state is cleared in signOut's finally block either way.
     }
-    setBusy(false);
     void router.navigate({ to: "/login" });
-  }
-
-  async function regenerate() {
-    setBusy(true);
-    setError(null);
-    try {
-      setNewCodes(await regenerateRecoveryCodes(queryClient));
-      setLocalStep("codes");
-    } catch (caught) {
-      if (caught instanceof ApiError && caught.code === "recovery_only") setStuck(true);
-      setError(caught instanceof ReauthCancelledError ? "The passkey prompt was closed. Try again when you are ready." : passkeyErrorMessage(caught));
-    } finally {
-      setBusy(false);
-    }
   }
 
   if (!localStep && me.isPending) {
@@ -113,43 +77,8 @@ export function RecoverScreen() {
   if (step === "passkey") {
     return (
       <AuthLayout>
-        <PageHeader title="Add a new passkey" description="Your recovery code worked. Add a passkey on this device to finish signing in." />
-        <AddPasskeyStep label="Add a passkey" onDone={afterPasskey} />
-      </AuthLayout>
-    );
-  }
-
-  if (step === "regenerate") {
-    return (
-      <AuthLayout>
-        <PageHeader title="Get new recovery codes" description="Only a few of your recovery codes are left. Create a new set and save it to finish." />
-        {error ? <Notice variant="error">{error}</Notice> : null}
-        {stuck ? (
-          <Notice variant="info">
-            This recovery session cannot create codes. Sign out, then sign in with the passkey you just added and create new codes from Settings.
-          </Notice>
-        ) : null}
-        <div className="flex flex-col gap-2">
-          <Button type="button" size="lg" className="w-full" disabled={busy} aria-busy={busy} onClick={() => void regenerate()}>
-            Generate new codes
-            {busy ? <DelayedSpinner label="Generating codes" /> : null}
-          </Button>
-          {/* Never a skip for a normal session; only a way out when the server keeps the session recovery-only. */}
-          {stuck ? (
-            <Button type="button" variant="outline" className="w-full" disabled={busy} onClick={() => void leave()}>
-              Sign out
-            </Button>
-          ) : null}
-        </div>
-      </AuthLayout>
-    );
-  }
-
-  if (step === "codes") {
-    return (
-      <AuthLayout>
-        <PageHeader title="Save your new recovery codes" description="Older codes no longer work." />
-        <RecoveryCodes handle={resolvedHandle} codes={newCodes} onContinue={finish} />
+        <PageHeader title="Add a new passkey" description="Your recovery code worked. Add a passkey on this device, then sign in with it." />
+        <AddPasskeyStep label="Add a passkey" onDone={() => void afterPasskey()} />
       </AuthLayout>
     );
   }

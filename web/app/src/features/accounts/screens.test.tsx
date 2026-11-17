@@ -180,6 +180,12 @@ describe("login", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
+  it("stays on the sign-in screen for a recovery-only session so the new passkey can be used", async () => {
+    install({ signedIn: true, recoveryOnly: true });
+    mount("/login");
+    await screen.findByRole("heading", { level: 1, name: "Sign in to Monoptah" });
+  });
+
   it("links to recover and install and follows the redirect after sign-in", async () => {
     install({ signedIn: false });
     const user = userEvent.setup();
@@ -217,32 +223,19 @@ describe("recover", () => {
     expect(await screen.findByRole("heading", { level: 1, name: "Add a new passkey" })).toBeInTheDocument();
   });
 
-  it("sends the user on to the passkey step when the session is recovery-only and /api/me answers 403", async () => {
-    const state = install({ signedIn: true, recoveryOnly: true });
-    mount("/recover");
-    await screen.findByRole("heading", { level: 1, name: "Add a new passkey" });
-    expect(state.recoveryOnly).toBe(true);
-  });
-
-  it("offers Sign out (not a skip) when the server keeps the session recovery-only after the passkey", async () => {
+  it("signs out and goes to /login after the passkey, because the server keeps the session recovery-only", async () => {
     const state = install({ signedIn: false });
-    const batch = newRecoveryBatch(state);
-    for (const spent of batch.slice(2)) state.recoveryCodes.delete(normalizeRecoveryCode(spent));
+    const code = newRecoveryBatch(state)[0]!;
     const user = userEvent.setup();
-    mount("/recover");
+    const { router } = mount("/recover");
     await screen.findByLabelText("Handle");
     await user.type(screen.getByLabelText("Handle"), "dev-user");
-    await user.type(screen.getByLabelText("Recovery code"), batch[0]!);
+    await user.type(screen.getByLabelText("Recovery code"), code);
     await user.click(screen.getByRole("button", { name: "Recover account" }));
     await user.click(await screen.findByRole("button", { name: "Add a passkey" }));
-    await screen.findByRole("heading", { level: 1, name: "Get new recovery codes" });
-    expect(screen.queryByRole("button", { name: "Sign out" })).toBeNull();
-    // The server keeps the session recovery-only: regenerate is refused with 403 recovery_only.
-    state.recoveryOnly = true;
-    await user.click(screen.getByRole("button", { name: /Generate new codes/ }));
-    await user.click(await screen.findByRole("button", { name: "Sign out" }));
     await screen.findByRole("heading", { level: 1, name: "Sign in to Monoptah" });
-    // The registry refuses logout for a recovery-only session; the user still lands on /login.
+    expect(router.state.location.pathname).toBe("/login");
+    expect(state.signedIn).toBe(false);
   });
 
   it("answers every failure with the same generic message", async () => {
@@ -254,26 +247,6 @@ describe("recover", () => {
     await user.type(screen.getByLabelText("Recovery code"), "AAAA-BBBB");
     await user.click(screen.getByRole("button", { name: "Recover account" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("That handle or recovery code is not valid.");
-  });
-
-  it("offers new codes when 2 or fewer are left", async () => {
-    const state = install({ signedIn: false });
-    const batch = newRecoveryBatch(state);
-    for (const spent of batch.slice(2)) state.recoveryCodes.delete(normalizeRecoveryCode(spent));
-    const user = userEvent.setup();
-    mount("/recover");
-    await screen.findByLabelText("Handle");
-    await user.type(screen.getByLabelText("Handle"), "dev-user");
-    await user.type(screen.getByLabelText("Recovery code"), batch[0]!);
-    await user.click(screen.getByRole("button", { name: "Recover account" }));
-    await screen.findByRole("heading", { level: 1, name: "Add a new passkey" });
-    await user.click(screen.getByRole("button", { name: "Add a passkey" }));
-    await screen.findByRole("heading", { level: 1, name: "Get new recovery codes" });
-    // Forced: no way to skip the regenerate step.
-    expect(screen.queryByRole("button", { name: /not now|skip/i })).toBeNull();
-    await user.click(screen.getByRole("button", { name: /Generate new codes/ }));
-    await screen.findByRole("heading", { level: 1, name: "Save your new recovery codes" });
-    expect(within(screen.getByRole("list", { name: "Recovery codes" })).getAllByRole("listitem")).toHaveLength(10);
   });
 });
 

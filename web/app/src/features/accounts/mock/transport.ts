@@ -43,6 +43,7 @@ type Handler = (ctx: Ctx) => unknown;
 const CHALLENGE_TTL_SECONDS = 300;
 const INVITE_TTL_SECONDS = 7 * 86400;
 const MAX_RECOVER_FAILURES = 5;
+const RECOVERY_ONLY_ALLOWLIST: ReadonlySet<string> = new Set(["GET /api/me", "POST /api/auth/logout"]);
 const INVALID_INVITE = "That invite is not valid";
 
 function expectString(value: unknown): string {
@@ -86,7 +87,7 @@ function takeChallenge(state: MockState, id: unknown, purpose: MockChallenge["pu
   const challenge = typeof id === "string" ? state.challenges.get(id) : undefined;
   if (typeof id === "string") state.challenges.delete(id);
   if (!challenge || challenge.purpose !== purpose) throw new MockHttpError(400, "invalid", "Unknown or reused challenge");
-  if (challenge.expiresAt < nowSeconds()) throw new MockHttpError(400, "expired", "The challenge expired");
+  if (challenge.expiresAt < nowSeconds()) throw new MockHttpError(400, "invalid", "Challenge expired or already used");
   return challenge;
 }
 
@@ -179,7 +180,8 @@ const handlers: Record<string, Handler> = {
     state.inviteCodes = new Map();
     startSession(state, "passkey");
     const recoveryCodes = newRecoveryBatch(state);
-    // The codes are shown once on the screen the response feeds; the mock counts that as the gate.
+    // KNOWN DIVERGENCE: the Worker leaves `recovery_ack_at` NULL here and has no ack route, which
+    // would force the regenerate screen forever. The mock acks so the dev flow stays usable.
     state.recoveryAckAt = now;
     return { user: state.user, recoveryCodes };
   },
@@ -250,12 +252,8 @@ const handlers: Record<string, Handler> = {
   "POST /api/passkeys/verify": ({ state, body }) => {
     takeChallenge(state, body.challengeId, "add-passkey");
     const passkey = addPasskey(state, typeof body.name === "string" ? body.name : undefined);
-    // A recovery session that added its passkey becomes a normal session.
-    if (state.recoveryOnly) {
-      state.recoveryOnly = false;
-      const current = state.sessions.find((item) => item.current);
-      if (current) current.amr = "passkey";
-    }
+    // The Worker keeps a recovery session recovery-only after it added its passkey: the client
+    // signs out and signs in with the new passkey.
     return { passkey };
   },
   "PATCH /api/passkeys/:id": ({ state, params, body }) => {
@@ -272,13 +270,15 @@ const handlers: Record<string, Handler> = {
 
   "POST /api/recovery-codes/regenerate": ({ state }) => {
     const recoveryCodes = newRecoveryBatch(state);
+    // KNOWN DIVERGENCE: the Worker CLEARS `recovery_ack_at` here and has no route to set it again.
     state.recoveryAckAt = nowSeconds();
     return { recoveryCodes };
   },
 
   "GET /api/invites": ({ state }) => ({ invites: state.invites, granted: state.invitesGranted, remaining: invitesRemaining(state) }),
   "POST /api/invites": ({ state }) => {
-    if (state.invitesPaused) throw new MockHttpError(403, "invites_paused", "Invites are paused");
+    // The real server answers 409: the user can do nothing about a paused gate, so it is a state conflict.
+    if (state.invitesPaused) throw new MockHttpError(409, "invites_paused", "Invites are paused");
     if (invitesRemaining(state) <= 0) throw new MockHttpError(409, "quota_exceeded", "No invites left");
     const now = nowSeconds();
     const invite = { id: randomId("inv"), createdAt: now, expiresAt: now + INVITE_TTL_SECONDS, usedAt: null, revokedAt: null, usedBy: null };
@@ -374,7 +374,8 @@ export function createMockServer(options: MockTransportOptions = {}): MockTransp
       if (route.auth !== "public") {
         if (!state.signedIn) throw new MockHttpError(401, "unauthorized", "Sign in first");
         if (state.recoveryOnly) {
-          if (!route.allowRecoveryOnly) throw new MockHttpError(403, "recovery_only", "This session can only add a passkey");
+          // The Worker also lets a recovery-only session read GET /api/me and sign out.
+          if (!route.allowRecoveryOnly && !RECOVERY_ONLY_ALLOWLIST.has(`${route.method} ${route.path}`)) throw new MockHttpError(403, "recovery_only", "This session can only add a passkey");
         } else if (route.auth === "fresh" && !isFresh(state)) {
           throw new MockHttpError(403, "fresh_required", "Confirm with your passkey first");
         }

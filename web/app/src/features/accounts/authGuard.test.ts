@@ -52,7 +52,7 @@ describe("authGuard", () => {
     expect(await run("/recover", { signedIn: true, recoveryOnly: true })).toBeNull();
   });
 
-  it("treats a 403 recovery_only from GET /api/me as a recovery session (the registry does not allow /api/me there)", async () => {
+  it("treats a 403 recovery_only from GET /api/me as a recovery session (defensive: the Worker allows /api/me there today)", async () => {
     restore = setApiTransport(async () => new Response(JSON.stringify({ error: "recovery only", code: "recovery_only" }), { status: 403, headers: { "Content-Type": "application/json" } }));
     const queryClient = new QueryClient();
     let error: unknown = null;

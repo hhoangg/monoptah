@@ -85,9 +85,9 @@ describe("mock server: registration and invites", () => {
     expect(await register(codes[1]!, "again").catch((e: unknown) => e)).toMatchObject({ code: "invalid_invite" });
   });
 
-  it("answers invites_paused when creating while paused", async () => {
+  it("answers 409 invites_paused when creating while paused", async () => {
     setup({ signedIn: true, invitesPaused: true });
-    await expect(apiFetch(endpoints.createInvite)).rejects.toMatchObject({ code: "invites_paused" });
+    await expect(apiFetch(endpoints.createInvite)).rejects.toMatchObject({ status: 409, code: "invites_paused" });
   });
 });
 
@@ -150,9 +150,13 @@ describe("mock server: sessions, recovery, gates", () => {
     const recovered = await apiFetch(endpoints.recover, { body: { handle: SEED_HANDLE, code: code!.toLowerCase() } });
     expect(recovered).toMatchObject({ recoveryOnly: true, codesLeft: 9 });
     await expect(apiFetch(endpoints.sessions)).rejects.toMatchObject({ code: "recovery_only" });
+    // The Worker allows GET /api/me for a recovery-only session.
+    expect((await apiFetch(endpoints.me)).recoveryOnly).toBe(true);
     const { challengeId } = await apiFetch(endpoints.addPasskeyOptions);
     await apiFetch(endpoints.addPasskeyVerify, { body: { challengeId, response: RESPONSE } });
-    expect((await apiFetch(endpoints.me)).recoveryOnly).toBe(false);
+    // Like the Worker, the session stays recovery-only after the passkey: the client signs out and signs in again.
+    expect((await apiFetch(endpoints.me)).recoveryOnly).toBe(true);
+    await expect(apiFetch(endpoints.regenerateRecoveryCodes)).rejects.toMatchObject({ status: 403, code: "recovery_only" });
     await apiFetch(endpoints.logout);
     await expect(apiFetch(endpoints.recover, { body: { handle: SEED_HANDLE, code: code! } })).rejects.toMatchObject({ status: 401 });
   });
