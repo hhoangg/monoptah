@@ -10,7 +10,7 @@ import { PageHeader } from "@/ui/PageHeader";
 import { AddPasskeyStep } from "./AddPasskeyStep";
 import { recoverErrorMessage } from "./authCopy";
 import { LOW_CODES_THRESHOLD, setLowCodes } from "./lowCodes";
-import { ApiError } from "./api";
+import { ApiError, isApiError } from "./api";
 import { meQuery, recoverAccount, signOut } from "./queries";
 import { normalizeRecoveryCode } from "./recoveryCodesFile";
 
@@ -44,7 +44,7 @@ export function RecoverScreen() {
     setBusy(true);
     try {
       const result = await recoverAccount(queryClient, { handle: cleanHandle, code: normalized });
-      if (result.codesLeft <= LOW_CODES_THRESHOLD) setLowCodes();
+      if (result.codesLeft <= LOW_CODES_THRESHOLD) setLowCodes(result.user.handle);
       setCode("");
       setLocalStep("passkey");
     } catch (caught) {
@@ -60,10 +60,17 @@ export function RecoverScreen() {
    */
   async function leave() {
     setBusy(true);
+    setError(null);
     try {
       await signOut(queryClient, { keepLowCodes: true });
-    } catch {
-      // The local state is cleared in signOut's finally block either way.
+    } catch (caught) {
+      setBusy(false);
+      // 401 means the session was already gone. Anything else keeps the user here: the recovery session
+      // is still alive on the server and must be ended, so offer a retry.
+      if (!isApiError(caught, "unauthorized")) {
+        setError("Could not sign out. Check your connection and try again.");
+        return;
+      }
     }
     setBusy(false);
     void router.navigate({ to: "/login" });
@@ -82,6 +89,7 @@ export function RecoverScreen() {
     return (
       <AuthLayout>
         <PageHeader title="Add a new passkey" description="Your recovery code worked. Add a passkey on this device, then sign in with it." />
+        {error ? <Notice variant="error">{error}</Notice> : null}
         <AddPasskeyStep label="Add a passkey" onDone={() => void leave()} />
         {/* A recovery session lasts 30 minutes and can add a passkey without a re-auth: never leave it open on a shared browser. */}
         <Button type="button" variant="ghost" className="w-full" disabled={busy} onClick={() => void leave()}>

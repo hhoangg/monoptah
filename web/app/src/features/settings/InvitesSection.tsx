@@ -28,6 +28,11 @@ function stateOf(invite: Invite, now: number): InviteState {
   return "unused";
 }
 
+/** Only the revoke action: a 409 here means the invite was used or revoked in the meantime. */
+function revokeErrorMessage(error: unknown): string | null {
+  return isApiError(error, "conflict") ? "This invite was already used or revoked." : null;
+}
+
 /** Invites (N-06): quota, create (code shown once), copy link, revoke, who joined. */
 export function InvitesSection() {
   const query = useQuery(invitesQuery);
@@ -42,7 +47,7 @@ export function InvitesSection() {
 
 function InviteList({ data }: { data: ReturnType<typeof InvitesResponse.parse> }) {
   const queryClient = useQueryClient();
-  const revoke = useAction();
+  const revoke = useAction(revokeErrorMessage);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const [paused, setPaused] = useState(false);
@@ -162,7 +167,11 @@ function InviteList({ data }: { data: ReturnType<typeof InvitesResponse.parse> }
                         size="sm"
                         disabled={revoke.busy}
                         aria-label={`Revoke the invite created ${formatDate(invite.createdAt)}`}
-                        onClick={() => void revoke.run(() => revokeInvite(queryClient, invite.id))}
+                        onClick={() => void revoke.run(() => revokeInvite(queryClient, invite.id).catch(async (caught: unknown) => {
+                          // The list is stale: show the real state next to the message.
+                          if (isApiError(caught, "conflict")) await queryClient.invalidateQueries({ queryKey: invitesQuery.queryKey });
+                          throw caught;
+                        }))}
                       >
                         Revoke
                       </Button>

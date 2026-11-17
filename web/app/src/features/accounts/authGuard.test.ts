@@ -53,7 +53,7 @@ describe("authGuard", () => {
   });
 
   it("sends a signed-in user to /settings while the low-codes flag is set, and lets /settings through", async () => {
-    sessionStorage.setItem("monoptah.lowCodes", "1");
+    sessionStorage.setItem("monoptah.lowCodes", "dev-user");
     expect(await run("/desktops", { signedIn: true })).toMatchObject({ to: "/settings" });
     expect(await run("/settings", { signedIn: true })).toBeNull();
     // A recovery-only session is still confined to /recover first.

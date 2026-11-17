@@ -12,6 +12,8 @@ const lib = vi.hoisted(() => ({
 vi.mock("@simplewebauthn/browser", () => lib);
 
 import { setApiTransport, type ApiTransport } from "@/features/accounts/api";
+import { ApiError } from "@/features/accounts/api";
+import { settingsErrorMessage } from "./copy";
 import { createMockServer } from "@/features/accounts/mock/transport";
 import { createMockState, type SeedOptions } from "@/features/accounts/mock/state";
 import { useAppearance } from "@/lib/appearance";
@@ -270,6 +272,20 @@ describe("invites", () => {
     await screen.findByText("Revoked invite");
     expect(calls.some((c) => c.method === "DELETE" && c.url.startsWith("/api/invites/"))).toBe(true);
     expect(screen.queryByRole("button", { name: /^Revoke the invite/ })).toBeNull();
+  });
+
+  it("explains a revoke conflict as used or revoked, and keeps other conflicts generic", async () => {
+    const state = install();
+    const user = userEvent.setup();
+    mount("/settings");
+    await screen.findByText("3 of 3 available");
+    await user.click(screen.getByRole("button", { name: "Create invite" }));
+    await screen.findByText("2 of 3 available");
+    // Someone used the invite in the meantime.
+    for (const invite of state.invites) invite.usedAt = 1;
+    await user.click(await screen.findByRole("button", { name: /^Revoke the invite/ }));
+    expect(await screen.findByText("This invite was already used or revoked.")).toBeInTheDocument();
+    expect(settingsErrorMessage(new ApiError({ status: 409, code: "conflict", message: "x" }))).toBe("Something went wrong. Try again.");
   });
 
   it("disables create when no invites are left", async () => {

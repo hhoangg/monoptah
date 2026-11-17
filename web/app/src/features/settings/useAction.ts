@@ -15,7 +15,7 @@ export interface ActionState {
  * `run` resolves to true when the action finished. Results (codes, invite codes) must be kept by
  * the caller in its own state: nothing here stores them.
  */
-export function useAction() {
+export function useAction(describe?: (error: unknown) => string | null) {
   const [state, setState] = useState<ActionState>({ busy: false, error: null, notice: null });
   const running = useRef(false);
 
@@ -29,12 +29,12 @@ export function useAction() {
       return true;
     } catch (caught) {
       if (caught instanceof ReauthCancelledError) setState({ busy: false, error: null, notice: REAUTH_CANCELLED });
-      else setState({ busy: false, error: settingsErrorMessage(caught), notice: null });
+      else setState({ busy: false, error: describe?.(caught) ?? settingsErrorMessage(caught), notice: null });
       return false;
     } finally {
       running.current = false;
     }
-  }, []);
+  }, [describe]);
 
   const reset = useCallback(() => setState({ busy: false, error: null, notice: null }), []);
   return { ...state, run, reset };

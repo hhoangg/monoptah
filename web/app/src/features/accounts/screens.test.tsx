@@ -278,7 +278,7 @@ describe("recover", () => {
     await user.click(await screen.findByRole("button", { name: "Add a passkey" }));
     await screen.findByRole("heading", { level: 1, name: "Sign in to Monoptah" });
     // Not a secret: just a boolean.
-    expect(sessionStorage.getItem("monoptah.lowCodes")).toBe("1");
+    expect(sessionStorage.getItem("monoptah.lowCodes")).toBe("dev-user");
     state.recoveryOnly = false;
     await user.click(screen.getByRole("button", { name: /Sign in with passkey/ }));
     await screen.findByRole("heading", { level: 1, name: "Get new recovery codes" });
@@ -286,7 +286,34 @@ describe("recover", () => {
     expect(screen.queryByRole("button", { name: /skip|not now/i })).toBeNull();
     await user.click(screen.getByRole("button", { name: /Generate recovery codes/ }));
     await screen.findByRole("heading", { level: 1, name: "Save your new recovery codes" });
+    // The codes stay on screen and the flag stays until the user confirms and presses Continue.
+    expect(sessionStorage.getItem("monoptah.lowCodes")).toBe("dev-user");
+    expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
+    await user.click(screen.getByLabelText("I saved these codes"));
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    await screen.findByRole("heading", { level: 1, name: "Settings" });
     expect(sessionStorage.getItem("monoptah.lowCodes")).toBeNull();
+  });
+
+  it("ignores and clears a low-codes flag that belongs to another account", async () => {
+    install({ signedIn: true });
+    sessionStorage.setItem("monoptah.lowCodes", "someone-else");
+    mount("/settings");
+    await screen.findByRole("heading", { level: 1, name: "Settings" });
+    expect(sessionStorage.getItem("monoptah.lowCodes")).toBeNull();
+  });
+
+  it("keeps the add-passkey step with an error when Cancel and sign out fails", async () => {
+    const inner = createMockServer({ state: createMockState({ signedIn: true, recoveryOnly: true }) });
+    restore = setApiTransport((url, init) =>
+      url.endsWith("/api/auth/logout") ? Promise.resolve(Response.json({ error: "x", code: "internal" }, { status: 500 })) : inner.transport(url, init),
+    );
+    const user = userEvent.setup();
+    mount("/recover");
+    await user.click(await screen.findByRole("button", { name: "Cancel and sign out" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(/Could not sign out/);
+    expect(screen.getByRole("heading", { level: 1, name: "Add a new passkey" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Cancel and sign out" })).toBeEnabled();
   });
 
   it("does not set the flag when more than 2 codes are left", async () => {

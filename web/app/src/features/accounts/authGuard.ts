@@ -64,7 +64,7 @@ export const authGuard: AuthGuard = async ({ location, context }) => {
   if (me.recoveryOnly) {
     throw redirect({ to: RECOVERY_ADD_PASSKEY_PATH, replace: true });
   }
-  if ((me.recoveryAckAt === null || hasLowCodes()) && pathname !== RECOVERY_REGENERATE_PATH) {
+  if ((me.recoveryAckAt === null || hasLowCodes(me.user.handle)) && pathname !== RECOVERY_REGENERATE_PATH) {
     throw redirect({ to: RECOVERY_REGENERATE_PATH, replace: true });
   }
 };

@@ -33,7 +33,6 @@ export function ForcedRegenerate({ handle }: { handle: string }) {
     setCancelled(false);
     try {
       const result = await withFreshAuth(() => apiFetch(endpoints.regenerateRecoveryCodes));
-      clearLowCodes();
       setCodes(result.recoveryCodes);
     } catch (caught) {
       if (caught instanceof ReauthCancelledError) setCancelled(true);
@@ -44,6 +43,8 @@ export function ForcedRegenerate({ handle }: { handle: string }) {
   }
 
   async function done() {
+    // Cleared on Continue only: until then the codes stay on screen and nothing may unmount this component.
+    clearLowCodes();
     setCodes(null);
     await queryClient.invalidateQueries({ queryKey: ME_KEY });
   }
