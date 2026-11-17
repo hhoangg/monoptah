@@ -11,6 +11,11 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   checkNotes,
+  ciGate,
+  ciRunsPath,
+  ciVerdict,
+  readCiRuns,
+  CI_RUNS_JQ,
   checkPlanned,
   downloadBase,
   feedSupersedes,
@@ -569,4 +574,85 @@ test("the plan command: --defer-macos, --check-planned and macos-ready", async (
   assert.equal(run(["macos-ready", assets]).stdout.trim(), "true");
   await writeFile(assets, JSON.stringify(MAC_FILES().slice(1).map((name) => ({ name, state: "uploaded" }))));
   assert.equal(run(["macos-ready", assets]).stdout.trim(), "false");
+});
+
+// ---- ci-gate ----
+const SHA40 = "a".repeat(40);
+const ciRun = (status, conclusion = null, id = 1) => ({ id, status, conclusion, url: `https://example.test/runs/${id}` });
+const answer = (runs, total = runs.length) => ({ status: 0, stdout: JSON.stringify({ total, runs }), stderr: "" });
+function gateIo(answers) {
+  const calls = { reads: [], sleeps: 0, logs: [] };
+  const io = {
+    capture: (command, args) => {
+      calls.reads.push([command, ...args]);
+      return answers[Math.min(calls.reads.length - 1, answers.length - 1)];
+    },
+    sleep: async () => {
+      calls.sleeps += 1;
+    },
+    log: (line) => calls.logs.push(line),
+  };
+  return { io, calls };
+}
+
+test("the runs path has no status filter and asks for 100 runs", () => {
+  const path = ciRunsPath(SHA40);
+  assert.equal(path, `repos/hhoangg/monoptah/actions/workflows/native.yml/runs?head_sha=${SHA40}&event=push&branch=main&per_page=100`);
+  assert.ok(!path.includes("status="));
+  assert.ok(ciRunsPath(SHA40, "o/r").startsWith("repos/o/r/"));
+});
+
+test("ciVerdict covers a failed rerun next to a success and an in-progress rerun", () => {
+  assert.equal(ciVerdict([ciRun("completed", "success")]), "success");
+  // The API returns the latest attempt of each run: a rerun that failed reads as failed...
+  assert.equal(ciVerdict([ciRun("completed", "failure", 1)]), "failed");
+  // ...but another run of the same commit that succeeded still passes the gate.
+  assert.equal(ciVerdict([ciRun("completed", "failure", 1), ciRun("completed", "success", 2)]), "success");
+  assert.equal(ciVerdict([ciRun("in_progress", null, 1)]), "pending");
+  assert.equal(ciVerdict([]), "pending");
+});
+
+test("readCiRuns reads { total, runs } and rejects a truncated list without a success", () => {
+  assert.deepEqual(readCiRuns(() => answer([ciRun("completed", "success")]), SHA40), { runs: [ciRun("completed", "success")] });
+  assert.match(readCiRuns(() => answer([ciRun("completed", "failure")], 101), SHA40).error, /truncated list: 1 of 101/);
+  // A visible success decides, even when the total says more runs exist.
+  assert.deepEqual(readCiRuns(() => answer([ciRun("completed", "success")], 101), SHA40), { runs: [ciRun("completed", "success")] });
+  assert.match(readCiRuns(() => ({ status: 0, stdout: "[]", stderr: "" }), SHA40).error, /unreadable answer/);
+  assert.equal(readCiRuns(() => ({ status: 1, stdout: "", stderr: "HTTP 502\n" }), SHA40).error, "HTTP 502");
+  const { io, calls } = gateIo([answer([])]);
+  readCiRuns(io.capture, SHA40, "o/r");
+  assert.deepEqual(calls.reads[0], ["gh", "api", ciRunsPath(SHA40, "o/r"), "--jq", CI_RUNS_JQ]);
+});
+
+test("ciGate passes on the first read", async () => {
+  const { io, calls } = gateIo([answer([ciRun("completed", "success", 5)])]);
+  await ciGate(io, SHA40, { attempts: 6, sleepMs: 1 });
+  assert.equal(calls.reads.length, 1);
+  assert.equal(calls.sleeps, 0);
+  assert.ok(calls.logs.some((l) => /run 5 \(success\)/.test(l)));
+});
+
+test("ciGate retries on no run yet, on a read error and on a truncated list", async () => {
+  for (const first of [answer([]), { status: 1, stdout: "", stderr: "HTTP 502" }, answer([ciRun("queued")], 150), answer([ciRun("in_progress")])]) {
+    const { io, calls } = gateIo([first, answer([ciRun("completed", "success")])]);
+    await ciGate(io, SHA40, { attempts: 6, sleepMs: 1 });
+    assert.equal(calls.reads.length, 2);
+    assert.equal(calls.sleeps, 1);
+  }
+});
+
+test("ciGate fails after the last attempt with the last state, sleeping attempts-1 times", async () => {
+  const { io, calls } = gateIo([answer([ciRun("in_progress", null, 9)])]);
+  await assert.rejects(ciGate(io, SHA40, { attempts: 4, sleepMs: 1 }), /no successful push run.*run 9 \(in_progress\).*after 4 reads/s);
+  assert.equal(calls.reads.length, 4);
+  assert.equal(calls.sleeps, 3);
+  const none = gateIo([answer([])]);
+  await assert.rejects(ciGate(none.io, SHA40, { attempts: 2, sleepMs: 1 }), /no native\.yml run found yet/);
+});
+
+test("ciGate fails at once, naming the runs, when every run finished without success", async () => {
+  const { io, calls } = gateIo([answer([ciRun("completed", "failure", 7)])]);
+  await assert.rejects(ciGate(io, SHA40, { attempts: 6, sleepMs: 1 }), /run 7 \(failure\) https:\/\/example\.test\/runs\/7/);
+  assert.equal(calls.reads.length, 1);
+  assert.equal(calls.sleeps, 0);
 });

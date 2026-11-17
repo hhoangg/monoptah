@@ -69,13 +69,24 @@ The workflow has two modes.
   and leaves macOS out of the matrix (`plan --defer-macos`). `await-release` polls every 30
   seconds, up to 120 minutes, until the tag exists and points at the sha (another commit fails
   at once), the release exists (only HTTP 404 means absent) and has all three macOS files in
-  state `uploaded` (a partial set is waited for). Then it requires a green native.yml push run
-  on main for the sha, plans again with the published files and fails if that plan builds
-  different platforms than the first one. `publish` needs it, checks that the tag is the built
+  state `uploaded` (a partial set is waited for). Then it requires a successful native.yml push
+  run on main for the sha (see "The native.yml check" below), plans again with the published
+  files and fails if that plan builds different platforms than the first one. `publish` needs it, checks that the tag is the built
   commit before signing, and takes the reuse list from it.
 - Tag only (`gh workflow run native-release-monoptah.yml --ref main -f tag=native-vX.Y.Z`): the
   old path. The tag and the release with the macOS files must exist, and native.yml must be
-  green for the tag's commit. Use it to start a release again after the early run is gone.
+  green for the tag's commit (the same check). Use it to start a release again after the early
+  run is gone.
+
+The native.yml check: `node scripts/native-release-monoptah.mjs ci-gate <sha>` (plan in tag-only
+mode, await-release in the early run) reads the unfiltered list of native.yml push runs on main
+for the sha and judges each run's `conclusion`. It retries up to 6 reads, 20 seconds apart (about
+2 minutes), while no successful run is visible yet; it fails at once when every run finished
+without success. The `status=success` filter is not used: GitHub's filtered index can miss
+successful runs for hours. A list with fewer runs than its total and no successful run in it is
+treated as a read error. The runs API returns the latest attempt of each run, so a rerun that
+failed after an earlier success reads as a failure, and a rerun still in progress reads as
+pending: wait for it to finish, then dispatch again.
 
 Tools versus the built commit: the helper scripts (`native-release-monoptah.mjs`,
 `package-native-monoptah.mjs`) used by `plan`, `await-release` and `publish` come from a second
@@ -113,6 +124,7 @@ version (a feed never goes back to an older version).
 | A CI package job fails | Release holds only the macOS files | Re-run the failed jobs, or dispatch with the tag only. Nothing more is published until all platforms are in. |
 | Ctrl-C or SIGTERM while the script waits (CI wait, run watching) | Before the tag the early run is cancelled and "Nothing was tagged" is printed; after the push the recovery is printed. Exit 130 | Run the script again (before the tag) or follow the printed commands. |
 | Ctrl-C between two child processes | Nothing is cleaned up | Before the tag: the early run fails by itself at its 120 minute wait and nothing is published; cancel it to save the minutes. After the tag: check `gh release view native-vX.Y.Z` and continue as above. |
+| `plan` or `await-release` fails with "The native.yml check ... failed" while native.yml is green (or a rerun of it has finished) | Nothing published | Dispatch again: `gh workflow run native-release-monoptah.yml --ref main -f tag=native-vX.Y.Z` (safe to repeat). |
 | A platform has only some of its files published | The plan job fails | Delete that platform's published assets (files and `.sig`) by hand, then re-run. |
 
 Never re-run `native:release:mac` for an existing tag: it refuses.
