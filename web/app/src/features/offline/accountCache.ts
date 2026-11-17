@@ -7,6 +7,7 @@
 // that could pass for a session.
 import type { QueryClient } from "@tanstack/react-query";
 import { DesktopsResponse, MeResponse } from "@monoptah/protocol";
+import { bindDeviceToUser } from "@/features/accounts/deviceBinding";
 import { desktopsQuery, meQuery } from "@/features/accounts/queries";
 import { ACCOUNT_DESKTOPS_KEY, ACCOUNT_ME_KEY, loadSnapshot, saveSnapshot } from "./snapshots";
 import { requestPersistentStorage } from "./storage";
@@ -37,6 +38,8 @@ export function startAccountPersistence(queryClient: QueryClient): () => void {
     const data = event.query.state.data;
     if (head === meQuery.queryKey[0] && event.query.queryKey.length === 1) {
       if (!MeResponse.safeParse(data).success || (data as Me).recoveryOnly) return;
+      // First: a different account wipes the cache here, before this account's snapshot is written.
+      void bindDeviceToUser((data as Me).user.id);
       void saveSnapshot(ACCOUNT_ME_KEY, data);
       void requestPersistentStorage();
     } else if (head === desktopsQuery.queryKey[0] && event.query.queryKey.length === 1) {

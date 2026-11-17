@@ -6,6 +6,7 @@ import type { MeResponse, PushPrefsResponse, User } from "@monoptah/protocol";
 import { forgetAccountSnapshots } from "@/features/offline/snapshots";
 import { ApiError, apiFetch } from "./api";
 import { endpoints } from "./endpoints";
+import { releaseDevice } from "./deviceBinding";
 import { clearLowCodes } from "./lowCodes";
 import { unsubscribeFromPush } from "@/features/push/subscribe";
 import { createPasskey, getPasskey } from "./webauthn";
@@ -151,6 +152,8 @@ export async function signOut(queryClient: QueryClient, options: { keepLowCodes?
     await apiFetch(endpoints.logout);
   } finally {
     queryClient.clear();
+    // The encrypted content cache, the snapshots and any push subscription left behind go with the session.
+    await releaseDevice();
   }
 }
 

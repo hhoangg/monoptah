@@ -29,10 +29,11 @@ function sameKey(a: ArrayBuffer | null, b: Uint8Array): boolean {
 
 /**
  * Subscribes this browser and registers the subscription with the Worker for `deviceId` (the server device id
- * of the browser, `ensureDevice().deviceId`). Returns the server subscription id. A subscription made with
+ * of the browser, `ensureDevice().deviceId`) and remembers `userId` as its owner, so a later session of another
+ * account (or none) can remove it (`forgetPushLocally`). Returns the server subscription id. A subscription made with
  * an older VAPID key is replaced (the key id check of `POST /api/push/subscriptions`).
  */
-export async function subscribeToPush(deviceId: string): Promise<string> {
+export async function subscribeToPush(deviceId: string, userId: string): Promise<string> {
   if (!isPushSupported()) throw new PushUnavailableError("unsupported");
   if (Notification.permission !== "granted") throw new PushUnavailableError("permission");
 
@@ -53,25 +54,61 @@ export async function subscribeToPush(deviceId: string): Promise<string> {
   const { id } = await apiFetch(pushEndpoints.subscribe, {
     body: { endpoint: subscription.endpoint, keys: { p256dh: toBase64Url(p256dh), auth: toBase64Url(auth) }, deviceId, vapidKeyId: vapid.keyId },
   });
-  await savePushState({ deviceId, subscriptionId: id });
+  await savePushState({ deviceId, subscriptionId: id, userId });
   return id;
 }
 
-/** Removes this browser's subscription: the browser side first, then the Worker row. Safe when not subscribed. */
-export async function unsubscribeFromPush(): Promise<void> {
-  const state = await loadPushState();
-  if (isPushSupported()) {
+/** Removes the browser-side subscription of the service worker registration. Never throws. */
+async function unsubscribeInBrowser(): Promise<void> {
+  try {
+    if (!isPushSupported()) return;
     const registration = await navigator.serviceWorker.getRegistration();
     const subscription = await registration?.pushManager.getSubscription();
     await subscription?.unsubscribe();
+  } catch {
+    // The browser keeps it at worst; the server row dies with the first push the push service refuses.
   }
-  if (state) {
-    // A 404 means the row is already gone (revoked device, cleaned up): that is the goal.
-    await apiFetch(pushEndpoints.unsubscribe, { params: { id: state.subscriptionId } }).catch((error: unknown) => {
-      if (!(error instanceof Error && "status" in error && error.status === 404)) throw error;
-    });
+}
+
+/**
+ * Removes this browser's subscription: the browser side first, then the Worker row. Safe when not subscribed.
+ * The saved state is cleared even when the Worker call fails: the browser subscription is gone by then, and a
+ * stale state would make the next page load subscribe again without being asked. The error still propagates.
+ */
+export async function unsubscribeFromPush(): Promise<void> {
+  const state = await loadPushState();
+  await unsubscribeInBrowser();
+  try {
+    if (state) {
+      // A 404 means the row is already gone (revoked device, cleaned up): that is the goal.
+      await apiFetch(pushEndpoints.unsubscribe, { params: { id: state.subscriptionId } }).catch((error: unknown) => {
+        if (!(error instanceof Error && "status" in error && error.status === 404)) throw error;
+      });
+    }
+  } finally {
+    await clearPushState().catch(() => undefined);
   }
-  await clearPushState();
+}
+
+/**
+ * For a session that ended without "Sign out" (401, another account signing in): there is no session left to
+ * call the Worker with, so only the browser side goes and the saved state is cleared. The server row is dropped
+ * on the next send, when the push service answers 404 or 410 (architecture.md 8). Never throws.
+ */
+export async function forgetPushLocally(): Promise<void> {
+  await unsubscribeInBrowser();
+  await clearPushState().catch(() => undefined);
+}
+
+/** True when the browser itself holds a push subscription (the saved state alone could be stale). */
+export async function hasBrowserSubscription(): Promise<boolean> {
+  try {
+    if (!isPushSupported()) return false;
+    const registration = await navigator.serviceWorker.getRegistration();
+    return (await registration?.pushManager.getSubscription()) != null;
+  } catch {
+    return false;
+  }
 }
 
 /** The saved subscription of this browser (server ids), or null; for the settings toggle of Task 10. */

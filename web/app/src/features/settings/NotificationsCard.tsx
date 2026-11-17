@@ -4,8 +4,23 @@ import { Button } from "@/ui/button";
 import { Notice } from "@/ui/Notice";
 import { SettingsCard, SettingsRow } from "@/ui/SettingsCard";
 import { PushOnboarding, CATEGORY_EXPLAINERS } from "./PushOnboarding";
-import { setEnabledEverywhere, type BulkResult } from "./pushPrefs";
+import { loadPauseRecord } from "@/features/push/pauseRecord";
+import { pauseAll, resumeAll, type BulkResult } from "./pushPrefs";
 import { useAction } from "./useAction";
+
+function plural(count: number): string {
+  return `${count} ${count === 1 ? "desktop" : "desktops"}`;
+}
+
+function bulkMessage(enabled: boolean, { changed, skipped }: BulkResult): string {
+  if (changed === 0) {
+    return enabled
+      ? "Nothing to resume: Pause all has not turned any desktop off from this browser."
+      : "Nothing was paused. This browser cannot read the saved settings of your desktops until you save them in each desktop's notification settings.";
+  }
+  const done = enabled ? `Notifications are back on for ${plural(changed)}.` : `Notifications are paused for ${plural(changed)}.`;
+  return !enabled && skipped > 0 ? `${done} ${plural(skipped)} left as they are, because this browser cannot read their settings.` : done;
+}
 
 /** Account level notifications (P-05): enable in this browser, what the three categories mean, Pause all. */
 export function NotificationsCard() {
@@ -13,10 +28,14 @@ export function NotificationsCard() {
   const bulk = useAction();
   const [last, setLast] = useState<{ enabled: boolean; result: BulkResult } | null>(null);
 
+  // Desktops that Pause all turned off and Resume all can turn back on (read again after every action).
+  const [pausedCount, setPausedCount] = useState(() => Object.keys(loadPauseRecord()).length);
+
   async function apply(enabled: boolean) {
     await bulk.run(async () => {
-      const result = await setEnabledEverywhere(queryClient, enabled);
+      const result = enabled ? await resumeAll(queryClient) : await pauseAll(queryClient);
       setLast({ enabled, result });
+      setPausedCount(Object.keys(loadPauseRecord()).length);
     });
   }
 
@@ -25,7 +44,7 @@ export function NotificationsCard() {
     <SettingsCard
       title="Notifications"
       aria-label="Notifications"
-      footnote="Choose which categories each desktop sends in that desktop's settings. Pause all changes every desktop at once."
+      footnote="Choose which categories each desktop sends in that desktop's settings. Pause all and Resume all only touch desktops whose settings this browser knows."
     >
       <PushOnboarding />
       <ul className="m-0 flex list-none flex-col p-0" aria-label="Notification categories">
@@ -36,13 +55,13 @@ export function NotificationsCard() {
       <SettingsRow
         icon="notifications"
         title="Pause all"
-        description="Turn notifications off for every desktop, or back on. Category choices are kept for desktops you changed in this session; others come back with every category on."
+        description="Turn notifications off for the desktops whose settings this browser knows, and back on later with the same choices. Other desktops are left as they are."
         trailing={
           <span className="flex gap-2">
             <Button type="button" variant="outline" size="sm" disabled={bulk.busy} aria-busy={bulk.busy} onClick={() => void apply(false)}>
               Pause all
             </Button>
-            <Button type="button" variant="outline" size="sm" disabled={bulk.busy} aria-busy={bulk.busy} onClick={() => void apply(true)}>
+            <Button type="button" variant="outline" size="sm" disabled={bulk.busy || pausedCount === 0} aria-busy={bulk.busy} onClick={() => void apply(true)}>
               Resume all
             </Button>
           </span>
@@ -50,11 +69,7 @@ export function NotificationsCard() {
       />
       {last && !partial ? (
         <Notice variant="info" className="my-1.5">
-          {last.result.total === 0
-            ? "No desktops yet, so there was nothing to change."
-            : last.enabled
-              ? `Notifications are on for ${last.result.total} ${last.result.total === 1 ? "desktop" : "desktops"}.`
-              : `Notifications are paused for ${last.result.total} ${last.result.total === 1 ? "desktop" : "desktops"}.`}
+          {bulkMessage(last.enabled, last.result)}
         </Notice>
       ) : null}
       {partial ? (

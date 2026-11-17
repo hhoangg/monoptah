@@ -1,8 +1,10 @@
 // State machine of "Enable notifications" (P-05, N-14). Permission is requested only from `enable()`, which a
 // click handler calls: nothing here prompts on mount, on render or on focus.
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useState } from "react";
 import { isApiError } from "@/features/accounts/api";
-import { getSavedPushSubscription, isPushSupported, PushUnavailableError, subscribeToPush, unsubscribeFromPush } from "@/features/push";
+import { meQuery } from "@/features/accounts/queries";
+import { getSavedPushSubscription, hasBrowserSubscription, isPushSupported, PushUnavailableError, subscribeToPush, unsubscribeFromPush } from "@/features/push";
 import { ensureDevice } from "@/link";
 import { settingsErrorMessage } from "./copy";
 import { useStandalone } from "./standalone";
@@ -13,6 +15,8 @@ export type PushOnboardingState =
   | "not-installed"
   /** Installed, but this browser has no Push API. */
   | "unsupported"
+  /** Installed and supported, but nobody is signed in (on public /install): a sign-in link instead of a button that would waste the OS prompt. */
+  | "signed-out"
   /** Installed and supported: the Enable button is shown (permission default, or granted without a subscription). */
   | "ready"
   | "denied"
@@ -21,6 +25,11 @@ export type PushOnboardingState =
 // VAPID rotation (security.md push, step 4): once per page load, an existing subscription is re-sent. `subscribeToPush`
 // compares the key with the Worker's current one, replaces the browser subscription when it differs, and upserts by endpoint.
 let rotationChecked = false;
+
+/** Test helper: allow the once-per-load rotation check to run again. */
+export function resetPushRotationCheck(): void {
+  rotationChecked = false;
+}
 
 export const SIGN_IN_FIRST = "Sign in first, then turn on notifications.";
 
@@ -37,6 +46,10 @@ function describe(error: unknown): string {
 
 export function usePushOnboarding() {
   const standalone = useStandalone();
+  const queryClient = useQueryClient();
+  // Only for an installed app: it decides between the Enable button and a sign-in link without a wasted OS prompt.
+  const me = useQuery({ ...meQuery, enabled: standalone, retry: false });
+  const signedOut = me.isError && isApiError(me.error) && me.error.status === 401;
   const [subscribed, setSubscribed] = useState<boolean | null>(null);
   const [permission, setPermission] = useState<NotificationPermission | null>(() => (typeof Notification === "undefined" ? null : Notification.permission));
   const [busy, setBusy] = useState(false);
@@ -48,13 +61,18 @@ export function usePushOnboarding() {
     const refresh = (): void => {
       void getSavedPushSubscription()
         .catch(() => null)
-        .then((saved) => {
+        .then(async (saved) => {
           if (!live) return;
           setPermission(typeof Notification === "undefined" ? null : Notification.permission);
-          setSubscribed(saved !== null);
-          if (saved && !rotationChecked && typeof Notification !== "undefined" && Notification.permission === "granted") {
+          // A subscription saved for another account is not this account's "on" (it is removed when `me` loads).
+          const userId = queryClient.getQueryData(meQuery.queryKey)?.user.id ?? null;
+          const owned = saved !== null && (userId === null || saved.userId === userId);
+          setSubscribed(owned);
+          // Rotation re-send: only for a signed-in user, for the subscription that user made, with the browser
+          // subscription still there. Never silently subscribe again after a removal or a sign-out.
+          if (saved && owned && userId !== null && !rotationChecked && typeof Notification !== "undefined" && Notification.permission === "granted") {
             rotationChecked = true;
-            void subscribeToPush(saved.deviceId).catch(() => undefined);
+            if (await hasBrowserSubscription()) void subscribeToPush(saved.deviceId, userId).catch(() => undefined);
           }
         });
     };
@@ -68,7 +86,7 @@ export function usePushOnboarding() {
       live = false;
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, []);
+  }, [queryClient]);
 
   let state: PushOnboardingState;
   if (!standalone) state = "not-installed";
@@ -76,6 +94,7 @@ export function usePushOnboarding() {
   else if (permission === "denied") state = "denied";
   else if (subscribed === null) state = "checking";
   else if (permission === "granted" && subscribed) state = "on";
+  else if (signedOut) state = "signed-out";
   else state = "ready";
 
   const enable = useCallback(async () => {
@@ -91,8 +110,10 @@ export function usePushOnboarding() {
         return;
       }
       if (result === "granted") {
+        const userId = queryClient.getQueryData(meQuery.queryKey)?.user.id;
+        if (!userId) throw Object.assign(new Error("Signed out"), { status: 401 });
         const { deviceId } = await ensureDevice();
-        await subscribeToPush(deviceId);
+        await subscribeToPush(deviceId, userId);
         setSubscribed(true);
       }
     } catch (caught) {
@@ -100,7 +121,7 @@ export function usePushOnboarding() {
     } finally {
       setBusy(false);
     }
-  }, [busy]);
+  }, [busy, queryClient]);
 
   const disable = useCallback(async () => {
     if (busy) return;
@@ -111,6 +132,8 @@ export function usePushOnboarding() {
       await unsubscribeFromPush();
       setSubscribed(false);
     } catch (caught) {
+      // The browser side and the saved state are gone even when the Worker call failed: this browser is off.
+      setSubscribed(false);
       setError(describe(caught));
     } finally {
       setBusy(false);

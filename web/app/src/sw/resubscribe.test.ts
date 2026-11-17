@@ -36,7 +36,7 @@ describe("resubscribe", () => {
   });
 
   it("subscribes with the current key, posts it with CSRF, and deletes the old row", async () => {
-    await savePushState({ deviceId: "dev-1", subscriptionId: "sub-old" });
+    await savePushState({ deviceId: "dev-1", subscriptionId: "sub-old", userId: "usr-1" });
     const subscribe = vi.fn(() => Promise.resolve(subscription()));
     const fetch = fetcher();
     expect(await resubscribe({ pushManager: { subscribe }, fetch })).toBe(true);
@@ -51,18 +51,18 @@ describe("resubscribe", () => {
 
     const del = fetch.mock.calls.find(([url]) => url === "/api/push/subscriptions/sub-old")!;
     expect(del[1]).toMatchObject({ method: "DELETE", headers: { "X-Monoptah-CSRF": "1" } });
-    expect(await loadPushState()).toEqual({ deviceId: "dev-1", subscriptionId: "sub-new" });
+    expect(await loadPushState()).toEqual({ deviceId: "dev-1", subscriptionId: "sub-new", userId: "usr-1" });
   });
 
   it("keeps the row when the endpoint is unchanged (same id)", async () => {
-    await savePushState({ deviceId: "dev-1", subscriptionId: "same" });
+    await savePushState({ deviceId: "dev-1", subscriptionId: "same", userId: "usr-1" });
     const fetch = fetcher({ id: "same" });
     await resubscribe({ pushManager: { subscribe: () => Promise.resolve(subscription()) }, fetch });
     expect(fetch.mock.calls.some(([, init]) => init?.method === "DELETE")).toBe(false);
   });
 
   it("forgets the saved state when the session is gone", async () => {
-    await savePushState({ deviceId: "dev-1", subscriptionId: "sub-old" });
+    await savePushState({ deviceId: "dev-1", subscriptionId: "sub-old", userId: "usr-1" });
     await expect(resubscribe({ pushManager: { subscribe: () => Promise.resolve(subscription()) }, fetch: fetcher(401) })).rejects.toThrow("401");
     expect(await loadPushState()).toBeNull();
   });

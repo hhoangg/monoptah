@@ -1,5 +1,6 @@
 import { Link } from "@tanstack/react-router";
 import { Button } from "@/ui/button";
+import { DelayedSpinner } from "@/ui/DelayedSpinner";
 import { Icon } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
 import { SettingsRow } from "@/ui/SettingsCard";
@@ -25,7 +26,7 @@ export function PushOnboarding() {
   const { state } = push;
   return (
     <div className="flex flex-col gap-2 py-1.5">
-      {state === "checking" ? <p className="px-1.5 text-meta text-muted-text">Checking notification status</p> : null}
+      {state === "checking" ? <DelayedSpinner label="Checking notification status" className="px-1.5" /> : null}
       {state === "not-installed" ? (
         <SettingsRow
           icon="download"
@@ -38,6 +39,9 @@ export function PushOnboarding() {
         <Notice variant="info" title="Notifications are not available here">
           This browser cannot receive push notifications. Use a recent Chrome, Edge, Firefox or Safari 16.4 or newer.
         </Notice>
+      ) : null}
+      {state === "signed-out" ? (
+        <SettingsRow icon="notifications" title="Sign in to turn on notifications" description="Notifications belong to your account." to="/login" />
       ) : null}
       {state === "ready" ? (
         <div className="px-1.5">

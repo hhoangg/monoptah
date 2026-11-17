@@ -12,9 +12,9 @@
 // a redirect to /login and restored by `postSignInTarget` after sign-in.
 import type { QueryClient } from "@tanstack/react-query";
 import { redirect, type ParsedLocation } from "@tanstack/react-router";
-import { forgetAccountSnapshots } from "@/features/offline/snapshots";
 import { restoreAccountSnapshots } from "@/features/offline/accountCache";
 import { ApiError } from "./api";
+import { releaseDevice } from "./deviceBinding";
 import { hasLowCodes } from "./lowCodes";
 import { meQuery } from "./queries";
 import { loginRedirectTarget, saveFingerprintFragment } from "./redirect";
@@ -48,7 +48,8 @@ export const authGuard: AuthGuard = async ({ location, context }) => {
     me = await context.queryClient.ensureQueryData(meQuery);
   } catch (error) {
     if (error instanceof ApiError && error.status === 401) {
-      void forgetAccountSnapshots();
+      // The session is over: the encrypted cache, the snapshots and the push subscription go with it.
+      void releaseDevice();
       saveFingerprintFragment(pathname, location.hash);
       throw redirect({
         to: "/login",

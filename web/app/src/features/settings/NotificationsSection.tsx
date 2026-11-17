@@ -1,6 +1,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { PUSH_CATEGORIES } from "@monoptah/protocol";
+import { forgetPaused } from "@/features/push/pauseRecord";
 import { savePushPrefs, type PushPrefs } from "@/features/accounts/queries";
 import { Button } from "@/ui/button";
 import { Notice } from "@/ui/Notice";
@@ -51,6 +52,8 @@ export function NotificationsSection({ desktopId }: { desktopId: string }) {
     try {
       const result = await savePushPrefs(desktopId, next);
       queryClient.setQueryData(pushPrefsKey(desktopId), result);
+      // An explicit choice here replaces what Pause all recorded, so Resume all must not overwrite it.
+      forgetPaused(desktopId);
     } catch (caught) {
       setError(settingsErrorMessage(caught));
     } finally {

@@ -1,5 +1,5 @@
-// What the service worker needs to re-subscribe on its own (`pushsubscriptionchange`): the server device id
-// and the id of the stored subscription. A worker has no localStorage, so this lives in a tiny IndexedDB
+// What the service worker needs to re-subscribe on its own (`pushsubscriptionchange`): the server device id,
+// the id of the stored subscription and the account it belongs to. A worker has no localStorage, so this lives in a tiny IndexedDB
 // database shared with the page (features/push). Neither value is a secret.
 const DB_NAME = "monoptah-push";
 const STORE = "state";
@@ -9,6 +9,11 @@ export interface PushState {
   deviceId: string;
   /** Server id from `POST /api/push/subscriptions`, used to delete the old row. */
   subscriptionId: string;
+  /**
+   * The account the subscription was made for (not a secret). Null for a state saved before this field existed:
+   * it never matches a signed-in user, so it is dropped the first time the app sees one.
+   */
+  userId: string | null;
 }
 
 function openDb(): Promise<IDBDatabase> {
@@ -41,8 +46,8 @@ async function run<T>(mode: IDBTransactionMode, body: (store: IDBObjectStore) =>
 export async function loadPushState(): Promise<PushState | null> {
   const value: unknown = await run("readonly", (store) => store.get(KEY));
   if (typeof value !== "object" || value === null) return null;
-  const { deviceId, subscriptionId } = value as Record<string, unknown>;
-  return typeof deviceId === "string" && typeof subscriptionId === "string" ? { deviceId, subscriptionId } : null;
+  const { deviceId, subscriptionId, userId } = value as Record<string, unknown>;
+  return typeof deviceId === "string" && typeof subscriptionId === "string" ? { deviceId, subscriptionId, userId: typeof userId === "string" ? userId : null } : null;
 }
 
 export async function savePushState(state: PushState): Promise<void> {

@@ -51,6 +51,6 @@ export async function resubscribe(deps: ResubscribeDeps): Promise<boolean> {
   if (created.id !== state.subscriptionId) {
     await deps.fetch(`/api/push/subscriptions/${encodeURIComponent(state.subscriptionId)}`, { method: "DELETE", credentials: "same-origin", headers: JSON_HEADERS }).catch(() => undefined);
   }
-  await savePushState({ deviceId: state.deviceId, subscriptionId: created.id });
+  await savePushState({ deviceId: state.deviceId, subscriptionId: created.id, userId: state.userId });
   return true;
 }

@@ -5,9 +5,11 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const push = vi.hoisted(() => ({
-  subscribeToPush: vi.fn(async (_deviceId: string) => "sub_1"),
+  subscribeToPush: vi.fn(async (_deviceId: string, _userId: string) => "sub_1"),
+  hasBrowserSubscription: vi.fn(async () => true),
+  forgetPushLocally: vi.fn(async () => undefined),
   unsubscribeFromPush: vi.fn(async () => undefined),
-  getSavedPushSubscription: vi.fn(async (): Promise<{ deviceId: string; subscriptionId: string } | null> => null),
+  getSavedPushSubscription: vi.fn(async (): Promise<{ deviceId: string; subscriptionId: string; userId: string | null } | null> => null),
   isPushSupported: vi.fn(() => true),
 }));
 vi.mock("@/features/push/subscribe", async (importOriginal) => ({ ...(await importOriginal<object>()), ...push }));
@@ -16,9 +18,11 @@ vi.mock("@/link", async (importOriginal) => ({ ...(await importOriginal<object>(
 import { setApiTransport, type ApiTransport } from "@/features/accounts/api";
 import { signOut } from "@/features/accounts/queries";
 import { createMockServer } from "@/features/accounts/mock/transport";
-import { createMockState } from "@/features/accounts/mock/state";
+import { createMockState, SEED_USER_ID } from "@/features/accounts/mock/state";
 import { createQueryClient } from "@/lib/queryClient";
 import { createAppRouter } from "@/router";
+import { pushPrefsKey } from "./pushPrefs";
+import { resetPushRotationCheck } from "./usePushOnboarding";
 import { deniedHelp } from "./PushOnboarding";
 import { clearSlots } from "@/ui/slots";
 
@@ -74,6 +78,7 @@ function mount(url: string) {
 }
 
 beforeEach(() => {
+  resetPushRotationCheck();
   requests = [];
   window.localStorage.clear();
   push.getSavedPushSubscription.mockResolvedValue(null);
@@ -119,7 +124,7 @@ describe("push onboarding (P-05)", () => {
     await userEvent.click(await screen.findByRole("button", { name: "Enable notifications" }));
     await screen.findByText("Notifications on");
     expect(requestPermission).toHaveBeenCalledTimes(1);
-    expect(push.subscribeToPush).toHaveBeenCalledWith("dev_9");
+    expect(push.subscribeToPush).toHaveBeenCalledWith("dev_9", SEED_USER_ID);
     expect(screen.getByRole("button", { name: "Turn off" })).toBeInTheDocument();
   });
 
@@ -152,7 +157,7 @@ describe("push onboarding (P-05)", () => {
 
   it("turn off unsubscribes", async () => {
     stubEnvironment({ standalone: true, permission: "granted" });
-    push.getSavedPushSubscription.mockResolvedValue({ deviceId: "dev_9", subscriptionId: "sub_1" });
+    push.getSavedPushSubscription.mockResolvedValue({ deviceId: "dev_9", subscriptionId: "sub_1", userId: SEED_USER_ID });
     mount("/settings");
     await userEvent.click(await screen.findByRole("button", { name: "Turn off" }));
     await waitFor(() => expect(push.unsubscribeFromPush).toHaveBeenCalledTimes(1));
@@ -166,25 +171,90 @@ describe("push onboarding (P-05)", () => {
     expect(requests.some((r) => r.method === "POST" && r.url === "/api/auth/logout")).toBe(true);
   });
 
-  it("Pause all PUTs enabled false for every desktop and keeps the categories", async () => {
+  const CATS = { agentFinished: false, agentInput: true, monoMessages: true };
+  const known = (queryClient: ReturnType<typeof createQueryClient>, id: string, prefs: { enabled: boolean; categories: typeof CATS }) => queryClient.setQueryData(pushPrefsKey(id), prefs);
+
+  it("Pause all with no known prefs changes nothing and says so", async () => {
     stubEnvironment({ standalone: false, permission: "default" });
     mount("/settings");
     await userEvent.click(await screen.findByRole("button", { name: "Pause all" }));
-    await screen.findByText(/Notifications are paused for/);
-    const puts = requests.filter((r) => r.method === "PUT" && r.url.startsWith("/api/push/prefs/"));
-    expect(desktopIds.length).toBeGreaterThan(1);
-    expect(puts.map((p) => p.url).sort()).toEqual(desktopIds.map((id) => `/api/push/prefs/${id}`).sort());
-    for (const put of puts) expect(put.body).toMatchObject({ enabled: false });
+    await screen.findByText(/Nothing was paused/);
+    expect(requests.filter((r) => r.method === "PUT")).toEqual([]);
   });
 
-  it("Resume all turns every desktop back on", async () => {
+  it("Pause all turns off only known, enabled desktops (not an already off one) and keeps their categories; Resume all restores exactly those", async () => {
+    stubEnvironment({ standalone: false, permission: "default" });
+    const { queryClient } = mount("/settings");
+    expect(desktopIds.length).toBeGreaterThan(1);
+    const [a, b] = desktopIds as [string, string];
+    known(queryClient, a, { enabled: true, categories: CATS });
+    known(queryClient, b, { enabled: false, categories: CATS });
+    await userEvent.click(await screen.findByRole("button", { name: "Pause all" }));
+    await screen.findByText(/Notifications are paused for 1 desktop\./);
+    let puts = requests.filter((r) => r.method === "PUT");
+    expect(puts.map((p) => p.url)).toEqual([`/api/push/prefs/${a}`]);
+    expect(puts[0]?.body).toEqual({ enabled: false, categories: CATS });
+    expect(JSON.parse(window.localStorage.getItem("monoptah.pushPaused") ?? "{}")).toEqual({ [a]: CATS });
+
+    requests = [];
+    await userEvent.click(screen.getByRole("button", { name: "Resume all" }));
+    await screen.findByText(/Notifications are back on for 1 desktop\./);
+    puts = requests.filter((r) => r.method === "PUT");
+    expect(puts.map((p) => p.url)).toEqual([`/api/push/prefs/${a}`]);
+    expect(puts[0]?.body).toEqual({ enabled: true, categories: CATS });
+    expect(window.localStorage.getItem("monoptah.pushPaused")).toBeNull();
+  });
+
+  it("Resume all is disabled when Pause all turned nothing off, so it never turns a desktop on by itself", async () => {
     stubEnvironment({ standalone: false, permission: "default" });
     mount("/settings");
+    expect(await screen.findByRole("button", { name: "Resume all" })).toBeDisabled();
+    expect(requests.filter((r) => r.method === "PUT")).toEqual([]);
+  });
+
+  it("a Resume all after a reload still restores what Pause all recorded", async () => {
+    stubEnvironment({ standalone: false, permission: "default" });
+    window.localStorage.setItem("monoptah.pushPaused", JSON.stringify({ [desktopIds[0] as string]: CATS }));
+    mount("/settings");
     await userEvent.click(await screen.findByRole("button", { name: "Resume all" }));
-    await screen.findByText(/Notifications are on for/);
-    const puts = requests.filter((r) => r.method === "PUT");
-    expect(puts).toHaveLength(desktopIds.length);
-    for (const put of puts) expect(put.body).toMatchObject({ enabled: true });
+    await screen.findByText(/Notifications are back on for 1 desktop\./);
+    expect(requests.filter((r) => r.method === "PUT").map((p) => p.body)).toEqual([{ enabled: true, categories: CATS }]);
+  });
+
+  it("does not subscribe again on load for a subscription of another account", async () => {
+    stubEnvironment({ standalone: true, permission: "granted" });
+    push.getSavedPushSubscription.mockResolvedValue({ deviceId: "dev_9", subscriptionId: "sub_1", userId: "someone-else" });
+    mount("/settings");
+    expect(await screen.findByRole("button", { name: "Enable notifications" })).toBeInTheDocument();
+    expect(push.subscribeToPush).not.toHaveBeenCalled();
+  });
+
+  it("re-sends the subscription of the signed-in user once, only while the browser still holds it", async () => {
+    stubEnvironment({ standalone: true, permission: "granted" });
+    push.getSavedPushSubscription.mockResolvedValue({ deviceId: "dev_9", subscriptionId: "sub_1", userId: SEED_USER_ID });
+    push.hasBrowserSubscription.mockResolvedValue(false);
+    mount("/settings");
+    await screen.findByText("Notifications on");
+    await waitFor(() => expect(push.hasBrowserSubscription).toHaveBeenCalled());
+    expect(push.subscribeToPush).not.toHaveBeenCalled();
+  });
+
+  it("re-sends the subscription of the signed-in user when the browser still holds it", async () => {
+    stubEnvironment({ standalone: true, permission: "granted" });
+    push.getSavedPushSubscription.mockResolvedValue({ deviceId: "dev_9", subscriptionId: "sub_1", userId: SEED_USER_ID });
+    push.hasBrowserSubscription.mockResolvedValue(true);
+    mount("/settings");
+    await waitFor(() => expect(push.subscribeToPush).toHaveBeenCalledWith("dev_9", SEED_USER_ID));
+  });
+
+  it("shows a sign-in link instead of the Enable button when nobody is signed in on /install", async () => {
+    stubEnvironment({ standalone: true, permission: "default" });
+    restore?.();
+    restore = setApiTransport(createMockServer({ signedIn: false }).transport);
+    mount("/install");
+    expect(await screen.findByRole("link", { name: /Sign in to turn on notifications/ })).toHaveAttribute("href", "/login");
+    expect(screen.queryByRole("button", { name: "Enable notifications" })).toBeNull();
+    expect(requestPermission).not.toHaveBeenCalled();
   });
 
   it("the per-desktop categories still save with PUT", async () => {
