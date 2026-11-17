@@ -95,8 +95,8 @@ describe("register, login, re-auth", () => {
     expect(body.ok).toBe(true);
     const row = await env.DB.prepare("SELECT reauth_at FROM sessions WHERE id_hash = ?").bind(sessionHash).first<{ reauth_at: number }>();
     expect(row?.reauth_at).toBe(body.reauthAt);
-    // Fresh now: the fresh route passes the resolver and reaches its (still unimplemented) handler, not 403.
-    expect((await authedCall({ cookie: user.cookie }, "/api/passkeys/options", { method: "POST" })).status).not.toBe(403);
+    // Fresh now: the fresh route passes the resolver and its handler answers the ceremony options.
+    expect((await authedCall({ cookie: user.cookie }, "/api/passkeys/options", { method: "POST" })).status).toBe(200);
 
     // Six minutes later the window is closed again.
     await env.DB.prepare("UPDATE sessions SET reauth_at = ? WHERE id_hash = ?").bind(stale, sessionHash).run();

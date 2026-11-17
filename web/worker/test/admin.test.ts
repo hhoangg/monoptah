@@ -2,6 +2,7 @@
 import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, it } from "vitest";
 import { AdminAuditResponse, AdminBlockResponse, AdminSettingsSchema, AdminUsersResponse, ApiErrorSchema, CreateInviteResponse } from "@monoptah/protocol";
+import { VirtualAuthenticator } from "./support/authenticator.ts";
 import {
   authedCall,
   createTestDesktop,
@@ -12,6 +13,7 @@ import {
   loginWith,
   postJson,
   registerOptions,
+  recordingEnv,
   registerUser,
   withRoom,
   withVars,
@@ -183,6 +185,25 @@ describe("POST /api/admin/users/:id/block", () => {
     // The sockets: room.revoke({all: true}, 4011) on each desktop of the branch, none on the unrelated one.
     expect(fake.calls.map((c) => c.desktopId).sort()).toEqual([root.desktopId, child.desktopId, grandchild.desktopId].sort());
     for (const call of fake.calls) expect(call).toMatchObject({ target: { all: true }, code: 4011 });
+  });
+
+  it("is one batch: when it fails nothing is written and no socket is closed", async () => {
+    const { session, root, child, grandchild, unrelated } = await tree();
+    const fake = fakeRoomNamespace();
+    const failing = recordingEnv({ failBatch: true });
+    Object.defineProperty(failing.testEnv, "ROOM", { value: fake.namespace });
+    const res = await block(session, root.id, { cascade: true, reason: "Spam ring" }, failing.testEnv);
+    expect(res.status).toBe(500);
+    for (const member of [root, child, grandchild, unrelated]) {
+      expect(await userRow(member.id), member.id).toMatchObject({ status: "active", blocked_at: null, blocked_reason: null, blocked_via: null });
+      expect(await count("SELECT count(*) AS n FROM sessions WHERE user_id = ?", member.id), "sessions").toBe(1);
+      expect(await first("SELECT 1 FROM desktop_tokens WHERE id = ? AND revoked_at IS NULL", member.tokenId), "token").not.toBeNull();
+      expect(await first("SELECT 1 FROM device_grants WHERE device_id = ? AND state = 'confirmed'", member.deviceId), "grants").not.toBeNull();
+      expect(await count("SELECT count(*) AS n FROM push_subscriptions WHERE user_id = ?", member.id)).toBe(1);
+      expect(await first("SELECT 1 FROM invites WHERE id = ? AND revoked_at IS NULL", member.unusedInvite)).not.toBeNull();
+    }
+    expect(await audits("user.block")).toHaveLength(0);
+    expect(fake.calls).toEqual([]);
   });
 
   it("the next request of a blocked user is refused, and so is a session made after the block", async () => {
@@ -363,6 +384,11 @@ describe("GET and PUT /api/admin/settings", () => {
     expect(issuedRes.status).toBe(201);
     const issued = CreateInviteResponse.parse(await issuedRes.json());
 
+    // A registration that was started while the gate was open.
+    const started = await registerOptions((await createTestInvite(env, { createdBy: inviter.id })).code, `mid-${crypto.randomUUID().slice(0, 6)}`);
+    const midKey = await VirtualAuthenticator.generate();
+    const midResponse = await midKey.create(started.options, { origin: env.RP_ORIGIN, rpId: env.RP_ID });
+
     const paused = await put(session, { invitesPaused: true });
     expect(paused.status).toBe(200);
     expect(AdminSettingsSchema.parse(await paused.json())).toMatchObject({ invitesPaused: true, maxUsers: Number(env.MAX_USERS) });
@@ -375,6 +401,11 @@ describe("GET and PUT /api/admin/settings", () => {
     const options = await postJson("/api/auth/register/options", { invite: issued.code, handle: `late-${crypto.randomUUID().slice(0, 6)}`, displayName: "X" });
     expect(options.status).toBe(400);
     expect(await errorCode(options)).toBe("invalid_invite");
+    // register/verify fails the same way while paused, and nothing is written.
+    const verifyPaused = await postJson("/api/auth/register/verify", { challengeId: started.challengeId, response: midResponse });
+    expect(verifyPaused.status).toBe(400);
+    expect(await errorCode(verifyPaused)).toBe("invalid_invite");
+    expect(await first("SELECT 1 FROM passkeys WHERE id = ?", midKey.credentialId)).toBeNull();
     expect((await loginWith(existing.key)).res.status).toBe(200);
     expect((await get(session)).invitesPaused).toBe(true);
 

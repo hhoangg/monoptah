@@ -3,7 +3,7 @@ import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, it } from "vitest";
 import { ApiErrorSchema, CreateInviteResponse, InvitesResponse, MeResponse } from "@monoptah/protocol";
 import { hashInviteCode } from "../src/modules/invites/code.ts";
-import { authedCall, createTestInvite, createTestUser, loginAs, registerOptions, withVars } from "./support/accounts.ts";
+import { authedCall, createTestInvite, createTestUser, loginAs, recordingEnv, registerOptions, withVars } from "./support/accounts.ts";
 
 beforeEach(async () => {
   await env.DB.prepare("DELETE FROM users").run();
@@ -122,6 +122,20 @@ describe("POST /api/invites", () => {
   it("requires a session", async () => {
     const res = await authedCall({ cookie: "" }, "/api/invites", { method: "POST" });
     expect(res.status).toBe(401);
+  });
+});
+
+describe("POST /api/invites is one batch", () => {
+  it("when the batch fails no invite and no audit row is written, and the slot is kept", async () => {
+    const user = await createTestUser(env);
+    const session = await loginAs(user.id);
+    const failing = recordingEnv({ failBatch: true });
+    const res = await create(session, failing.testEnv);
+    expect(res.status).toBe(500);
+    expect((await env.DB.prepare("SELECT count(*) AS n FROM invites WHERE created_by = ?").bind(user.id).first<{ n: number }>())?.n).toBe(0);
+    expect(await audits("invite.create")).toHaveLength(0);
+    expect((await create(session)).status).toBe(201);
+    expect(await audits("invite.create")).toHaveLength(1);
   });
 });
 
