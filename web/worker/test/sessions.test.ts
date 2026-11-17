@@ -239,10 +239,10 @@ describe("recovery_only sessions", () => {
     expect(me.status).toBe(200);
     expect(((await me.json()) as { recoveryOnly: boolean }).recoveryOnly).toBe(true);
 
-    // allowRecoveryOnly routes are `fresh` routes: a recovery session satisfies fresh, so the stub answers 501.
-    for (const path of ["/api/passkeys/options", "/api/passkeys/verify"]) {
-      expect((await authedCall(session, path, { method: "POST", body: "{}" })).status, path).toBe(501);
-    }
+    // allowRecoveryOnly routes are `fresh` routes: a recovery session satisfies fresh, so the handler runs
+    // (options answers 200, verify answers 400 for the empty body).
+    expect((await authedCall(session, "/api/passkeys/options", { method: "POST", body: "{}" })).status).toBe(200);
+    expect((await authedCall(session, "/api/passkeys/verify", { method: "POST", body: "{}" })).status).toBe(400);
     // Everything else is refused, whatever the auth kind.
     for (const [method, path] of [
       ["GET", "/api/sessions"],

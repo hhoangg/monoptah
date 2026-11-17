@@ -17,7 +17,7 @@ const post = (path: string, ip: string, body: unknown = {}, extra: Record<string
   call(path, { method: "POST", headers: { ...BROWSER_HEADERS, "CF-Connecting-IP": ip, ...extra }, body: JSON.stringify(body) });
 
 /** Passes the limiter: a stub answers 501, an implemented route answers with its own status (never 429 or 403). */
-const IMPLEMENTED_PATHS = new Set(["/api/auth/register/options", "/api/auth/register/verify", "/api/auth/login/options", "/api/auth/login/verify"]);
+const IMPLEMENTED_PATHS = new Set(["/api/auth/register/options", "/api/auth/register/verify", "/api/auth/login/options", "/api/auth/login/verify", "/api/auth/recover"]);
 function expectPassed(res: Response, path: string, message?: string) {
   if (IMPLEMENTED_PATHS.has(path)) {
     expect([429, 403, 501], message).not.toContain(res.status);

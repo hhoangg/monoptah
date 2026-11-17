@@ -16,6 +16,26 @@ import {
   USER_ROLE_SQL,
 } from "../src/modules/auth/register.ts";
 import { INVITES_PAUSED_SQL, USER_COUNT_SQL } from "../src/modules/invites/gate.ts";
+import {
+  ADD_PASSKEY_EXCLUDE_SQL,
+  COUNT_PASSKEYS_SQL,
+  DELETE_PASSKEY_CONDITION_SQL,
+  DELETE_PASSKEY_SQL,
+  GET_PASSKEY_SQL,
+  INSERT_ADDED_PASSKEY_SQL,
+  LIST_PASSKEYS_SQL,
+  PASSKEY_EXISTS_SQL,
+  RENAME_PASSKEY_SQL,
+} from "../src/modules/passkeys/manage.ts";
+import { CODE_UNUSED_SQL, DELETE_OTHER_SESSIONS_SQL, MARK_CODE_USED_SQL, RECOVER_LOOKUP_SQL, SESSION_CREATED_SQL } from "../src/modules/recovery/recover.ts";
+import {
+  CLEAR_ACK_SQL,
+  DELETE_OLD_CODES_SQL,
+  INSERT_FIRST_CODE_SQL,
+  INSERT_NEXT_CODE_SQL,
+  MAX_BATCH_SQL,
+  SET_ACK_SQL,
+} from "../src/modules/recovery/regenerate.ts";
 import { CONSUME_CHALLENGE_SQL, INSERT_CHALLENGE_SQL } from "../src/modules/passkeys/challenges.ts";
 import { INVITES_USED_SQL, ME_ROW_SQL, PATCH_DISPLAY_NAME_SQL } from "../src/modules/me/handlers.ts";
 import { CONSUME_SQL } from "../src/modules/ratelimit/limiter.ts";
@@ -79,6 +99,26 @@ const CASES: PlanCase[] = [
   { name: "set reauth_at", sql: SET_REAUTH_SQL, bind: [1, "h"] },
   { name: "audit first page", sql: AUDIT_PAGE_SQL, bind: ["u", 51], noTempSort: true },
   { name: "audit next page", sql: AUDIT_PAGE_AFTER_SQL, bind: ["u", 1, "id", 51], noTempSort: true },
+  { name: "recover: lookup by handle and code hash", sql: RECOVER_LOOKUP_SQL, bind: ["h", "handle"] },
+  { name: "recover: mark code used", sql: MARK_CODE_USED_SQL, bind: [1, "c"] },
+  { name: "recover: delete other sessions", sql: DELETE_OTHER_SESSIONS_SQL, bind: ["u", "h", "h"] },
+  { name: "recover: session created condition", sql: `SELECT 1 WHERE ${SESSION_CREATED_SQL}`, bind: ["h"] },
+  { name: "recover: code unused condition", sql: `SELECT 1 WHERE ${CODE_UNUSED_SQL}`, bind: ["c", "u"] },
+  { name: "regenerate: max batch", sql: MAX_BATCH_SQL, bind: ["u"] },
+  { name: "regenerate: first code", sql: INSERT_FIRST_CODE_SQL, bind: ["i", "u", "h", 2, 1, "u", 1] },
+  { name: "regenerate: next code", sql: INSERT_NEXT_CODE_SQL, bind: ["i", "u", "h", 2, 1, "i"] },
+  { name: "regenerate: delete old codes", sql: DELETE_OLD_CODES_SQL, bind: ["u", 1, "i"] },
+  { name: "regenerate: clear ack", sql: CLEAR_ACK_SQL, bind: ["u", "i"] },
+  { name: "recovery ack", sql: SET_ACK_SQL, bind: [1, "u"] },
+  { name: "passkeys: list own", sql: LIST_PASSKEYS_SQL, bind: ["u"] },
+  { name: "passkeys: get own by id", sql: GET_PASSKEY_SQL, bind: ["c", "u"] },
+  { name: "passkeys: exclude list", sql: ADD_PASSKEY_EXCLUDE_SQL, bind: ["u"] },
+  { name: "passkeys: insert added", sql: INSERT_ADDED_PASSKEY_SQL, bind: ["c", "u", "k", 0, "[]", "d", 0, null, "u", 1] },
+  { name: "passkeys: rename", sql: RENAME_PASSKEY_SQL, bind: ["n", "c", "u"] },
+  { name: "passkeys: exists condition", sql: `SELECT 1 WHERE ${PASSKEY_EXISTS_SQL}`, bind: ["c", "u"] },
+  { name: "passkeys: count", sql: COUNT_PASSKEYS_SQL, bind: ["u"] },
+  { name: "passkeys: delete condition", sql: `SELECT 1 WHERE ${DELETE_PASSKEY_CONDITION_SQL}`, bind: ["c", "u", "u"] },
+  { name: "passkeys: delete", sql: DELETE_PASSKEY_SQL, bind: ["c", "u", "u"] },
 ];
 
 describe("query plans", () => {
@@ -91,6 +131,8 @@ describe("query plans", () => {
     for (const detail of details) {
       if (c.usersCountScan && /^SCAN users USING COVERING INDEX /.test(detail)) continue;
       if (c.fkChildScans?.some((table) => detail === `SCAN ${table}`)) continue;
+      // `INSERT ... SELECT ... WHERE <condition>` reads one constant row, not a table.
+      if (detail === "SCAN CONSTANT ROW") continue;
       expect(detail, detail).not.toMatch(/^SCAN /);
       if (c.noTempSort) expect(detail, detail).not.toMatch(/TEMP B-TREE/);
     }
