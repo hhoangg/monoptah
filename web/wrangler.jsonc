@@ -45,7 +45,7 @@
     // RP_ID must never change after the first user registers: every passkey would break.
     "RP_ID": "zptah.app",
     "RP_ORIGIN": "https://zptah.app",
-    // Public half of the VAPID key pair (P-256, base64url). Placeholder until `pnpm vapid:generate` exists.
+    // Public half of the VAPID key pair (P-256, base64url). Placeholder until the `vapid:generate` script of P-01 exists.
     "VAPID_PUBLIC_KEY": "REPLACE_WITH_VAPID_PUBLIC_KEY_BASE64URL",
     // Which VAPID key the public key above is (stored in push_subscriptions.vapid_key_id, for rotation).
     "VAPID_KEY_ID": "v1",
