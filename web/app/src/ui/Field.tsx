@@ -1,5 +1,5 @@
 import { useId, type ComponentProps, type ReactNode } from "react";
-import { cn } from "./cn";
+import { cn } from "@/lib/utils";
 import { Input } from "./input";
 
 export interface FieldProps extends Omit<ComponentProps<"input">, "id"> {

@@ -1,6 +1,6 @@
 import { Dialog as DialogPrimitive } from "radix-ui";
 import type { ComponentProps } from "react";
-import { cn } from "./cn";
+import { cn } from "@/lib/utils";
 import { Icon } from "./Icon";
 
 // Dialog (design-system.md section 8): bg sheet, radius 20, padding 20, gap 16, scrim .4, no shadow.

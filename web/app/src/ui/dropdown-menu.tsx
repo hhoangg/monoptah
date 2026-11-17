@@ -1,6 +1,6 @@
 import { DropdownMenu as DropdownMenuPrimitive } from "radix-ui";
 import type { ComponentProps } from "react";
-import { cn } from "./cn";
+import { cn } from "@/lib/utils";
 
 // Dropdown menu for `pointer: fine` (design-system.md section 8): bg sheet, menu-card radius,
 // rows min 44 (36 on pointer: fine), highlight = selection, destructive = deletions, no shadow.

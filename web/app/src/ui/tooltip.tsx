@@ -1,6 +1,6 @@
 import { Tooltip as TooltipPrimitive } from "radix-ui";
 import type { ComponentProps } from "react";
-import { cn } from "./cn";
+import { cn } from "@/lib/utils";
 
 // Tooltip (web only, design-system.md section 8): bg sheet, 1px stroke, radius 8, 13px. Pair it
 // with `pointer: fine` at the call site; touch devices have no hover.

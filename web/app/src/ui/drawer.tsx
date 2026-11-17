@@ -1,6 +1,6 @@
 import type { ComponentProps } from "react";
 import { Drawer as DrawerPrimitive } from "vaul";
-import { cn } from "./cn";
+import { cn } from "@/lib/utils";
 
 // Sheet (design-system.md section 8 maps ModalSheet and the touch ChoiceMenu to vaul Drawer):
 // bg sheet, top radius 32, scrim .4, grabber 36x5 radius 2.5 in `faint`, max height 92dvh,

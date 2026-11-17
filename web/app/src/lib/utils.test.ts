@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cn } from "./cn";
+import { cn } from "./utils";
 
 describe("cn", () => {
   it("keeps the color and the font size when both come from the design tokens", () => {

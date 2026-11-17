@@ -1,5 +1,5 @@
 import type { ComponentProps } from "react";
-import { cn } from "./cn";
+import { cn } from "@/lib/utils";
 
 // Card (design-system.md section 8): bg surface, radius 22, padding 14, no shadow and no border.
 export function Card({ className, ...props }: ComponentProps<"div">) {
