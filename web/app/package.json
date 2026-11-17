@@ -11,7 +11,9 @@
     "routes:gen": "tsr generate",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "eslint .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "guard:web": "node ../../scripts/check-web-isolation.mjs",
+    "guard:web:test": "node --test ../../scripts/check-web-isolation.test.mjs"
   },
   "dependencies": {
     "@monoptah/protocol": "workspace:*",

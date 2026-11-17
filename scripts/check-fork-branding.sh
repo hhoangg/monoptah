@@ -5,7 +5,8 @@
 # so it can gate a merge.
 set -uo pipefail
 
-cd "$(dirname "$0")/.."
+# BRANDING_ROOT lets scripts/check-web-isolation.mjs run this check against a test tree.
+cd "${BRANDING_ROOT:-$(dirname "$0")/..}"
 
 # Only string literals and links. A bare `MonoCode` inside an identifier
 # (MonoCodeMark, MonoCodeToolCall, MonoCodeDockMenuTarget) is a symbol name, not
@@ -39,6 +40,18 @@ hits=$(grep -rnE "$PATTERN" \
   | grep -v '\.test\.' \
   | grep -vE "^[^:]+: *(//|///|//!|\*)" \
   | grep -vE "^($allow_re):")
+
+# The web app (web/): same pattern, same string-literal rule. Docs, dependencies, build
+# output and the lockfile are not product copy. Tests are dropped below like everywhere else.
+web_hits=$(grep -rnE "$PATTERN" web/ \
+  --include="*.ts" --include="*.tsx" --include="*.js" --include="*.mjs" \
+  --include="*.html" --include="*.css" --include="*.json" \
+  --exclude-dir=docs --exclude-dir=node_modules --exclude-dir=dist --exclude-dir=.wrangler \
+  --exclude=pnpm-lock.yaml 2>/dev/null \
+  | grep -v '\.test\.' \
+  | grep -vE "^[^:]+: *(//|///|//!|\*)" \
+  | grep -vE "^($allow_re):")
+hits=$(printf '%s\n%s\n' "$hits" "$web_hits")
 
 # Test fixtures inside src-tauri/src/fs.rs (its `mod tests`). They feed the GitHub repo
 # parsers (parse_github_repositories, github_pr_head_filter, split_github_repo) sample
