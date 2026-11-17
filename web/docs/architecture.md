@@ -85,7 +85,7 @@ Adapters:
 
 ### 3.3 Data layer over the E2E link
 
-`web/app/src/link/` contains: `relay.ts` (WebSocket), `noise.ts` (Noise IK on @noble), `session.ts` (request/response, watches, chunking), `store.ts` (Zustand).
+`web/app/src/link/` contains: `relay.ts` (WebSocket), `noise.ts` (Noise IK on @noble, moved here from the protocol package), `session.ts` (request/response, watches, chunking), `connection.ts` (connect sequence, reconnects, one per desktop), `keys.ts` and `pins.ts` (key storage, section 3.4), `store.ts` (Zustand). `web/app/src/data/` holds the TanStack Query layer over it and `web/app/src/version/` the capability and version handling.
 
 Connect sequence:
 
@@ -100,6 +100,7 @@ Resync and reconnect:
 
 - `visibilitychange` to `hidden`: do nothing (iOS may kill the socket; do not fight it).
 - To `visible`: if the socket is not open or `lastFrameAt` is older than 75 s, reconnect immediately and reopen every watch that was open (each with `from`); then invalidate the catalog query and refetch the current conversation with `conversation.read` as the fallback the mobile app uses (`WorkspaceProvider.tsx:391-394`).
+- A browser cannot read the HTTP status of a refused WebSocket upgrade, so a relay join without a grant surfaces as close `1006` and is retried with backoff like a network error, not as a block. A `BYE` before any `state` is treated as revoked; a relay `unsupported_version` error means the desktop is older and blocks the link.
 - Socket close: backoff `min(30 s, 0.5 s * 2^n) * random(0.5..1)`, reset after 10 s of `ready`. While `document.hidden` no reconnect is attempted; it happens on the next `visible`. `navigator.onLine === false` pauses attempts until the `online` event.
 - Close codes (section 4.5) decide behaviour: `4003` or `4011` stop reconnecting and show "Access revoked" (sets `revoked`); `4009` replaced (another tab or reconnect) retries once; `4010`/`4008` back off 60 s.
 - Handshake failure after reconnect always starts a fresh Noise session; Noise sessions are never resumed.
@@ -113,7 +114,7 @@ Frontend code from `src/` is copied, not imported (rule above and tauri-reuse.md
 ### 3.4 Key storage
 
 - The device static X25519 keypair is generated with `@noble/curves` (raw 32-byte keys). WebCrypto X25519 is not used: Safari support is unverified and a non-extractable X25519 `CryptoKey` read back as null from IndexedDB on Safari 26.4 (https://bugs.webkit.org/show_bug.cgi?id=312279, read 2026-11).
-- Because noble needs raw bytes, the private key cannot be a non-extractable `CryptoKey`. Instead: a random **AES-GCM-256 `CryptoKey` created with `extractable: false`** is stored in IndexedDB (AES keys survive structured clone), and the X25519 private key is stored only as AES-GCM ciphertext (random 96-bit IV, AAD = `deviceId`) in the same database. At runtime the key is unwrapped once into a module-scoped `Uint8Array` and zeroed on `pagehide`.
+- Because noble needs raw bytes, the private key cannot be a non-extractable `CryptoKey`. Instead: a random **AES-GCM-256 `CryptoKey` created with `extractable: false`** is stored in IndexedDB (AES keys survive structured clone), and the X25519 private key is stored only as AES-GCM ciphertext (random 96-bit IV, AAD = a local `keyId` generated with the key, because the key is created before the server assigns the `deviceId`, which is stored beside it once known) in the same database. At runtime the key is unwrapped once into a module-scoped `Uint8Array` and zeroed on `pagehide`.
 - Effect: a copy of the profile files or an IndexedDB dump does not yield the private key (the AES key cannot be exported); an XSS that runs inside the origin can still call the unwrap path. That is why XSS is the top risk (security.md section 2) and why CSP and Trusted Types are mandatory.
 - `navigator.storage.persist()` is requested after sign-in so Safari's 7-day eviction of script-writable storage is avoided for installed PWAs; if the key is evicted the device simply re-registers and must be re-confirmed on each desktop.
 - "Sign out" keeps the device key. "Forget this device" deletes the key, the cache and calls `DELETE /api/devices/:id`.
