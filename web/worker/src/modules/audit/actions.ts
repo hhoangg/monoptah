@@ -54,8 +54,10 @@ const Count = z.number().int().min(0).max(1_000_000);
 const IpHash = z.string().regex(/^[0-9a-f]{64}$/);
 const Permission = z.enum(["read", "control"]);
 const GrantState = z.enum(["pending", "confirmed", "revoked"]);
-/** A release label such as `1.4.0` or `abc1234`. */
-const Version = z.string().min(1).max(40).regex(/^[A-Za-z0-9._+-]+$/);
+/** A release label such as `1.4.0` or `1.4.0+x`; the same pattern as `scripts/deploy-official.mjs`. */
+const Version = z.string().regex(/^[0-9A-Za-z.+-]{1,32}$/);
+/** A full commit sha, lowercase hex. */
+const Commit = z.string().regex(/^[0-9a-f]{40}$/);
 /** The rate limit groups of security.md 3.5, plus the ones that need data only a handler has. */
 export const RATE_LIMIT_AUDIT_GROUPS = [
   "register",
@@ -126,7 +128,11 @@ export const AUDIT_ACTIONS = {
     windowSeconds: Count,
     ipHash: IpHash.optional(),
   }),
-  "system.deploy": spec(["system"], { version: Version }),
+  /** Written by `scripts/deploy-official.mjs`, which validates both values against the same two patterns. */
+  "system.deploy": spec(["system"], {
+    version: Version,
+    commit: Commit,
+  }),
 } as const satisfies Record<string, ActionSpec>;
 
 export type AuditAction = keyof typeof AUDIT_ACTIONS;

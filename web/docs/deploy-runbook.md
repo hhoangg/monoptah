@@ -31,13 +31,14 @@ Order, enforced by the script (`web/scripts/deploy-official.mjs`):
 
 1. Preflight, stopping at the first failure: `CI` not set; macOS (real run only); tree clean (untracked files
    count); branch is `main`; `main` equals `origin/main` after `git fetch origin main`; `wrangler.jsonc` has no
-   placeholder `database_id` or VAPID key; `pnpm check` passes; `scripts/check-fork-branding.sh` passes.
+   placeholder `database_id` or VAPID key; `pnpm install --frozen-lockfile` passes (the installed dependencies
+   match the lockfile); `pnpm check` passes; `scripts/check-fork-branding.sh` passes.
 2. Build the app: `pnpm --filter @monoptah/app build`.
 3. Migrations FIRST: `wrangler d1 migrations apply monoptah --remote -c wrangler.jsonc`. A failure stops the run
    before the deploy.
 4. Deploy: `wrangler deploy -c wrangler.jsonc`. Every deploy disconnects all relay sockets; clients reconnect.
-5. Audit: one `audit_log` row (`actor_kind` `system`, action `deploy`, meta with only the commit sha and the app
-   version). If this step fails the deploy has already happened: insert the row by hand.
+5. Audit: one `audit_log` row (`actor_kind` `system`, action `system.deploy`, meta with only the 40-character commit sha
+   and the app version, both validated before the SQL is built). If this step fails the deploy has already happened: insert the row by hand.
 6. The script prints one line. Append it to the deploy log below in the same commit that records the deploy
    (a PR titled `docs(web): record deploy <sha>` or the next change).
 
