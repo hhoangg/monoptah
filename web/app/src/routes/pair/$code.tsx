@@ -1,12 +1,13 @@
-// Route stub of /pair/:code. Owner: WS-S (workstreams.md 3.1).
+// Route of /pair/:code. Owner: WS-S (workstreams.md 3.1). The root guard sends a signed-out visitor to
+// /login and keeps the code (path) and `#fp` (sessionStorage); see features/accounts/redirect.ts.
 import { createFileRoute } from "@tanstack/react-router";
-import { RouteStub } from "@/ui/RouteStub";
+import { PairScreen } from "@/features/accounts/pair/PairScreen";
 
 export const Route = createFileRoute("/pair/$code")({
   component: Page,
 });
 
 function Page() {
-  const params = Route.useParams();
-  return <RouteStub route="/pair/:code" purpose="Approve a desktop: machine name, fingerprint and confirmation code." params={params} />;
+  const { code } = Route.useParams();
+  return <PairScreen code={code} />;
 }

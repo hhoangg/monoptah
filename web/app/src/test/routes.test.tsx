@@ -126,6 +126,9 @@ const SCREENS: Record<string, string> = {
   "/recover": "Recover your account",
   "/settings": "Settings",
   "/install": "Install Monoptah",
+  // An unknown code (the mock knows only its own pairing codes) shows the expired screen.
+  "/pair/c0de": "Code expired",
+  "/pair/:code": "Code expired",
   "/d/dk1/settings": "Desktop settings",
   "/d/:desktopId/settings": "Desktop settings",
 };
