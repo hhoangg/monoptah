@@ -1,41 +1,9 @@
 // Security headers (security.md 8.1) and the CSP builder.
 import type { MiddlewareHandler } from "hono";
 import type { AppEnv } from "../http.ts";
+import { buildCsp, COMPANION_HEADERS } from "../csp.ts";
 
-/**
- * The Content-Security-Policy of security.md 8.1, verbatim, with `HOST` substituted: some browsers do
- * not match `'self'` to `wss:` on the same host. `host` must be a bare `host[:port]` (a URL host).
- */
-export function buildCsp(host: string): string {
-  return [
-    "default-src 'none'",
-    "script-src 'self'",
-    "style-src 'self'",
-    "style-src-attr 'unsafe-inline'",
-    "img-src 'self' data: blob:",
-    "font-src 'self'",
-    `connect-src 'self' wss://${host}`,
-    "worker-src 'self'",
-    "manifest-src 'self'",
-    "frame-ancestors 'none'",
-    "base-uri 'none'",
-    "form-action 'self'",
-    "object-src 'none'",
-    "require-trusted-types-for 'script'",
-    "trusted-types default",
-    "upgrade-insecure-requests",
-  ].join("; ");
-}
-
-/** Companion headers of security.md 8.1, on every response of the Worker. */
-export const COMPANION_HEADERS: Readonly<Record<string, string>> = {
-  "Strict-Transport-Security": "max-age=63072000; includeSubDomains; preload",
-  "X-Content-Type-Options": "nosniff",
-  "Referrer-Policy": "no-referrer",
-  "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
-  "Cross-Origin-Opener-Policy": "same-origin",
-  "Cross-Origin-Resource-Policy": "same-origin",
-};
+export { buildCsp, COMPANION_HEADERS };
 
 function isNoStorePath(pathname: string): boolean {
   return pathname.startsWith("/api/") || pathname === "/api" || pathname.startsWith("/relay/") || pathname === "/relay";

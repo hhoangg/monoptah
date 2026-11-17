@@ -9,6 +9,7 @@ import {
   FRAME_HEADER_SIZE,
   FRAME_VERSION,
   FrameType,
+  KNOWN_CAPABILITIES,
   MAX_CHUNK_DATA,
   MAX_FRAME_BODY,
   MAX_FRAME_SIZE,
@@ -206,6 +207,7 @@ export function buildVectors() {
       "plaintext.invalid[]: {name, error, plaintext}. error is one of empty, unknown_kind, too_short, too_long, rekey_not_empty.",
       "plaintext.split[]: splitting `messageLength` bytes of `messageFill` with `msgId` yields plaintexts of `partLengths` bytes (one part is a MSG, more are CHUNKs from index 0, `last` on the final one).",
       "close[]: relay close codes with the reaction of each side (architecture.md 4.5). errors: the `code` lists. constants: values both sides must agree on.",
+      "state: {capabilities, messages[]}. capabilities is the list of names a desktop advertises today; messages are example `state` messages (pending, confirmed, revoked) that must parse with the state schema.",
       "Noise handshake vectors are not part of this file yet (spike S-04): the `noise` key is absent on purpose.",
     ].join("\n"),
     version: 1,
@@ -230,6 +232,21 @@ export function buildVectors() {
     frames: buildFrameVectors(),
     plaintext: buildPlaintextVectors(),
     close: CLOSE_CODES,
+    state: {
+      capabilities: [...KNOWN_CAPABILITIES],
+      messages: [
+        { type: "state", state: "pending" },
+        {
+          type: "state",
+          state: "confirmed",
+          permission: "control",
+          proto: PROTOCOL_VERSION,
+          capabilities: [...KNOWN_CAPABILITIES],
+          desktop: { name: "Example Desktop", version: "1.2.3" },
+        },
+        { type: "state", state: "revoked" },
+      ],
+    },
     errors: {
       desktop: sortedUnique(DESKTOP_ERROR_CODES),
       relay: sortedUnique(RELAY_ERROR_CODES),

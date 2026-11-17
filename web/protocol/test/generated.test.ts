@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildMethodsJson, buildVectors, serialize } from "../scripts/vectors-lib.ts";
-import { METHOD_LIST } from "../src/index.ts";
+import { KNOWN_CAPABILITIES, METHOD_LIST, StateMessageSchema } from "../src/index.ts";
 import { readText } from "./helpers.ts";
 
 describe("generated files are fresh", () => {
@@ -14,6 +14,17 @@ describe("generated files are fresh", () => {
 
   it("has no Noise vectors yet", () => {
     expect("noise" in JSON.parse(readText("../vectors.json"))).toBe(false);
+  });
+
+  it("vectors.json has a state key whose messages parse with the state schema", () => {
+    const state = JSON.parse(readText("../vectors.json")).state as { capabilities: string[]; messages: unknown[] };
+    expect(state.capabilities).toEqual([...KNOWN_CAPABILITIES]);
+    const parsed = state.messages.map((message) => StateMessageSchema.parse(message));
+    expect(parsed.map((message) => message.state)).toEqual(["pending", "confirmed", "revoked"]);
+    expect(parsed[1]?.capabilities).toEqual([...KNOWN_CAPABILITIES]);
+    expect(parsed[1]?.permission).toBeDefined();
+    expect(parsed[1]?.proto).toBeDefined();
+    expect(parsed[1]?.desktop).toBeDefined();
   });
 
   it("methods.json has the shape the Rust test reads, sorted by name", () => {

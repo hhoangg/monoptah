@@ -369,6 +369,14 @@ export interface RouteRequest {
   body?: z.ZodType;
 }
 
+/**
+ * Rate limit groups of security.md 3.5, named after its table rows. A route without a group is
+ * either unlimited (health, public GETs) or falls under the general authenticated limit
+ * (120 per session per minute, in memory), which needs no per-route flag.
+ */
+export const RATE_LIMIT_GROUPS = ["register", "login", "recover", "pair-start", "pair-poll", "push-notify"] as const;
+export type RateLimitGroup = (typeof RATE_LIMIT_GROUPS)[number];
+
 export interface ApiRoute {
   method: ApiMethod;
   /** Hono style, for example `/api/desktops/:id`. */
@@ -378,8 +386,8 @@ export interface ApiRoute {
   request: RouteRequest;
   /** Success body. A WebSocket upgrade route has `upgrade: true` and `response: z.null()`. */
   response: z.ZodType;
-  /** Public route with a rate limit (security.md 3.5). */
-  rateLimited?: boolean;
+  /** The security.md 3.5 group whose D1 window limits this route. */
+  rateLimit?: RateLimitGroup;
   /** `recovery_only` sessions may call it (add a passkey). */
   allowRecoveryOnly?: boolean;
   /** Needs a fresh re-auth only for some requests (for example revoking a grant). */
@@ -403,13 +411,13 @@ function r(route: ApiRoute): ApiRoute {
 export const API_ROUTES: readonly ApiRoute[] = [
   r({ method: "GET", path: "/api/health", auth: "public", module: "health", request: {}, response: HealthResponse }),
 
-  r({ method: "POST", path: "/api/auth/register/options", auth: "public", module: "auth", rateLimited: true, request: { body: RegisterOptionsBody }, response: RegisterOptionsResponse }),
-  r({ method: "POST", path: "/api/auth/register/verify", auth: "public", module: "auth", request: { body: RegisterVerifyBody }, response: RegisterVerifyResponse }),
-  r({ method: "POST", path: "/api/auth/login/options", auth: "public", module: "auth", rateLimited: true, request: { body: LoginOptionsBody }, response: LoginOptionsResponse }),
-  r({ method: "POST", path: "/api/auth/login/verify", auth: "public", module: "auth", request: { body: LoginVerifyBody }, response: LoginVerifyResponse }),
+  r({ method: "POST", path: "/api/auth/register/options", rateLimit: "register", auth: "public", module: "auth", request: { body: RegisterOptionsBody }, response: RegisterOptionsResponse }),
+  r({ method: "POST", path: "/api/auth/register/verify", rateLimit: "register", auth: "public", module: "auth", request: { body: RegisterVerifyBody }, response: RegisterVerifyResponse }),
+  r({ method: "POST", path: "/api/auth/login/options", rateLimit: "login", auth: "public", module: "auth", request: { body: LoginOptionsBody }, response: LoginOptionsResponse }),
+  r({ method: "POST", path: "/api/auth/login/verify", rateLimit: "login", auth: "public", module: "auth", request: { body: LoginVerifyBody }, response: LoginVerifyResponse }),
   r({ method: "POST", path: "/api/auth/reauth/options", auth: "session", module: "auth", request: {}, response: ReauthOptionsResponse }),
   r({ method: "POST", path: "/api/auth/reauth/verify", auth: "session", module: "auth", request: { body: ReauthVerifyBody }, response: ReauthVerifyResponse }),
-  r({ method: "POST", path: "/api/auth/recover", auth: "public", module: "auth", rateLimited: true, request: { body: RecoverBody }, response: RecoverResponse }),
+  r({ method: "POST", path: "/api/auth/recover", rateLimit: "recover", auth: "public", module: "auth", request: { body: RecoverBody }, response: RecoverResponse }),
   r({ method: "POST", path: "/api/auth/logout", auth: "session", module: "auth", request: {}, response: Ok }),
 
   r({ method: "GET", path: "/api/me", auth: "session", module: "me", request: {}, response: MeResponse }),
@@ -433,8 +441,8 @@ export const API_ROUTES: readonly ApiRoute[] = [
   r({ method: "POST", path: "/api/invites", auth: "session", module: "invites", request: {}, response: CreateInviteResponse }),
   r({ method: "DELETE", path: "/api/invites/:id", auth: "session", module: "invites", request: { params: idParam }, response: Ok }),
 
-  r({ method: "POST", path: "/api/pair/start", auth: "public", module: "pairing", rateLimited: true, request: { body: PairStartBody }, response: PairStartResponse }),
-  r({ method: "POST", path: "/api/pair/poll", auth: "public", module: "pairing", request: { body: PairPollBody }, response: PairPollResponse }),
+  r({ method: "POST", path: "/api/pair/start", rateLimit: "pair-start", auth: "public", module: "pairing", request: { body: PairStartBody }, response: PairStartResponse }),
+  r({ method: "POST", path: "/api/pair/poll", rateLimit: "pair-poll", auth: "public", module: "pairing", request: { body: PairPollBody }, response: PairPollResponse }),
   r({ method: "GET", path: "/api/pair/:userCode", auth: "session", module: "pairing", request: { params: userCodeParam }, response: PairInfoResponse }),
   r({ method: "POST", path: "/api/pair/:userCode/approve", auth: "fresh", module: "pairing", request: { params: userCodeParam, body: PairApproveBody }, response: PairApproveResponse }),
   r({ method: "POST", path: "/api/pair/:userCode/deny", auth: "session", module: "pairing", request: { params: userCodeParam }, response: Ok }),
@@ -462,7 +470,7 @@ export const API_ROUTES: readonly ApiRoute[] = [
   r({ method: "POST", path: "/api/push/subscriptions", auth: "session", module: "push", request: { body: PushSubscriptionBody }, response: PushSubscriptionResponse }),
   r({ method: "DELETE", path: "/api/push/subscriptions/:id", auth: "session", module: "push", request: { params: idParam }, response: Ok }),
   r({ method: "PUT", path: "/api/push/prefs/:desktopId", auth: "session", module: "push", owner: true, request: { params: z.object({ desktopId: Id }), body: PushPrefsBody }, response: PushPrefsResponse }),
-  r({ method: "POST", path: "/api/push/notify", auth: "token:push", module: "push", request: { body: PushNotifyBody }, response: PushNotifyResponse }),
+  r({ method: "POST", path: "/api/push/notify", rateLimit: "push-notify", auth: "token:push", module: "push", request: { body: PushNotifyBody }, response: PushNotifyResponse }),
 
   r({ method: "GET", path: "/api/admin/users", auth: "admin", module: "admin", request: {}, response: AdminUsersResponse }),
   r({ method: "POST", path: "/api/admin/users/:id/block", auth: "admin", module: "admin", request: { params: idParam, body: AdminBlockBody }, response: AdminBlockResponse }),

@@ -13,10 +13,8 @@ describe("slots registry", () => {
         "session-header-chip",
         "session-menu-items",
         "archive-dialog",
-        "send-guard",
         "new-session-target",
         "desktop-nav-items",
-        "session-capabilities",
         "desktop-settings-sections",
         "desktop-switcher",
         "link-state-screens",
@@ -58,12 +56,23 @@ describe("slots registry", () => {
     expect(screen.getByTestId("custom-shell")).toContainElement(screen.getByText("content"));
   });
 
-  it("a second registration replaces the first", () => {
+  it("a second registration of the same name throws and keeps the first", () => {
     registerSlot("link-state-screens", () => <span>first</span>);
-    registerSlot("link-state-screens", () => <span>second</span>);
+    expect(() => registerSlot("link-state-screens", () => <span>second</span>)).toThrow(/already registered/);
     render(<Slot name="link-state-screens" />);
-    expect(screen.queryByText("first")).toBeNull();
-    expect(screen.getByText("second")).toBeInTheDocument();
+    expect(screen.getByText("first")).toBeInTheDocument();
+    expect(screen.queryByText("second")).toBeNull();
+  });
+
+  it("clearSlots allows a name to be registered again", () => {
+    registerSlot("link-state-screens", () => <span>first</span>);
+    clearSlots();
+    expect(() => registerSlot("link-state-screens", () => <span>again</span>)).not.toThrow();
+  });
+
+  it("send-guard and session-capabilities are not component slots", () => {
+    expect(SLOT_NAMES).not.toContain("send-guard");
+    expect(SLOT_NAMES).not.toContain("session-capabilities");
   });
 
   it("new-session-target is a controlled slot with value and onChange", () => {

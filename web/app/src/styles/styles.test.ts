@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { renderHeaders, resolveRpOrigin } from "../../build/headers";
 
 const src = path.resolve(import.meta.dirname, "..");
 
@@ -74,17 +75,17 @@ describe("design tokens", () => {
   });
 });
 
-describe("static asset headers", () => {
-  const headers = readFileSync(path.resolve(src, "../public/_headers"), "utf8");
+describe("static asset headers (generated at build time, see build/headers.ts)", () => {
+  const headers = renderHeaders(resolveRpOrigin(path.resolve(src, "../../wrangler.jsonc"), {}));
   const csp = headers.match(/^\s+Content-Security-Policy: (.*)$/m)?.[1] ?? "";
 
-  it("carries the CSP of security.md 8.1 with connect-src 'self'", () => {
+  it("carries the CSP of security.md 8.1 with connect-src 'self' wss://HOST", () => {
     for (const directive of [
       "default-src 'none'",
       "script-src 'self'",
       "style-src 'self'",
       "style-src-attr 'unsafe-inline'",
-      "connect-src 'self';",
+      "connect-src 'self' wss://zptah.app;",
       "worker-src 'self'",
       "frame-ancestors 'none'",
       "require-trusted-types-for 'script'",
@@ -92,7 +93,6 @@ describe("static asset headers", () => {
     ]) {
       expect(csp).toContain(directive);
     }
-    expect(csp).not.toContain("wss://");
     expect(csp).not.toMatch(/script-src[^;]*unsafe-inline/);
   });
 

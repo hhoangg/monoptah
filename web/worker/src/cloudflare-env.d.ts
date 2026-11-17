@@ -24,10 +24,3 @@ declare namespace Cloudflare {
     AUDIT_IP_SALT: string;
   }
 }
-
-// `@cloudflare/workers-types` declares both TextDecoder options as required, while the standard (and
-// `@monoptah/protocol`, which is typed against Node) passes `{fatal: true}` alone. Same runtime.
-interface TextDecoderConstructorOptions {
-  fatal?: boolean;
-  ignoreBOM?: boolean;
-}

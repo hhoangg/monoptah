@@ -254,6 +254,8 @@ export class HandshakeState {
   readonly #ephemeralPrivateKey: Uint8Array | undefined;
   #messageIndex = 0;
   #split: SplitResult | null = null;
+  /** Set by the first error thrown from a handshake call (spec 5.3: a failed handshake must be abandoned). */
+  #poisoned: NoiseError | null = null;
 
   constructor(options: HandshakeOptions) {
     this.#initiator = options.initiator;
@@ -292,8 +294,26 @@ export class HandshakeState {
     return this.#initiator === (this.#messageIndex % 2 === 0);
   }
 
+  /**
+   * Runs one step. After any thrown error the state is unusable: symmetric state may be half updated,
+   * so every later call throws instead of continuing from a corrupt transcript.
+   */
+  #guard<T>(step: () => T): T {
+    if (this.#poisoned !== null) throw new NoiseError("bad_state", `the handshake failed earlier (${this.#poisoned.kind}) and must be abandoned`);
+    try {
+      return step();
+    } catch (error) {
+      this.#poisoned = error instanceof NoiseError ? error : new NoiseError("bad_state", error instanceof Error ? error.message : String(error));
+      throw error;
+    }
+  }
+
   /** WriteMessage: produces the next handshake message carrying `payload`. */
   writeMessage(payload: Uint8Array = EMPTY): Uint8Array {
+    return this.#guard(() => this.#write(payload));
+  }
+
+  #write(payload: Uint8Array): Uint8Array {
     if (this.isComplete) throw new NoiseError("bad_state", "the handshake is complete");
     if (!this.#myTurn()) throw new NoiseError("bad_state", "it is not this side's turn to write");
     const parts: Uint8Array[] = [];
@@ -320,6 +340,10 @@ export class HandshakeState {
 
   /** ReadMessage: consumes the next handshake message and returns its payload. Throws on any failure. */
   readMessage(message: Uint8Array): Uint8Array {
+    return this.#guard(() => this.#read(message));
+  }
+
+  #read(message: Uint8Array): Uint8Array {
     if (this.isComplete) throw new NoiseError("bad_state", "the handshake is complete");
     if (this.#myTurn()) throw new NoiseError("bad_state", "it is not this side's turn to read");
     if (message.length > MAX_NOISE_MESSAGE) throw new NoiseError("message_too_large", `handshake message of ${message.length} bytes`);
@@ -353,6 +377,10 @@ export class HandshakeState {
 
   /** Split (spec 5.2): valid once the handshake is complete. */
   split(): SplitResult {
+    return this.#guard(() => this.#splitNow());
+  }
+
+  #splitNow(): SplitResult {
     if (!this.isComplete) throw new NoiseError("bad_state", "the handshake is not complete");
     if (this.#split === null) {
       const [c1, c2] = this.#symmetric.split();

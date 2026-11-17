@@ -26,6 +26,10 @@ cp .dev.vars.example .dev.vars   # fake values only, git-ignored
 pnpm check
 ```
 
+`.dev.vars.example` also sets `RP_ID=localhost` and `RP_ORIGIN=http://localhost:5173` (the `vite dev` port),
+overriding the official `zptah.app` values of `wrangler.jsonc`, so passkeys and the Origin checks work locally.
+With `wrangler dev` (port 8787) use `RP_ORIGIN=http://localhost:8787` instead.
+
 `pnpm check` runs, in order and stopping at the first failure: `typecheck`, `lint`, `test` over every package
 (`pnpm -r`, one at a time). Read its exit status directly, not through a pipe.
 
@@ -42,11 +46,24 @@ pnpm 12 needs `run` for script names. Replace `<pkg>` with `protocol`, `worker`,
 | `pnpm --filter @monoptah/worker run db:generate` | Generate SQL from `schema.ts` (copy it to the next `migrations/NNNN_name.sql`) |
 | `pnpm --filter @monoptah/worker run dev` | `wrangler dev` on `http://localhost:8787` (`/api/health` returns `{"ok":true}`) |
 | `pnpm --filter @monoptah/app run dev` | `vite dev`: SPA, Worker, Durable Object and local D1 together |
-| `pnpm --filter @monoptah/app run build` | Typecheck, then `vite build` |
+| `pnpm --filter @monoptah/app run build` | Typecheck, `vite build`, then `scripts/check-dist.mjs` (see below) |
 | `pnpm --filter @monoptah/app run preview` | Serve the built app |
 | `pnpm --filter @monoptah/mock-desktop run start` | CLI: needs `--relay <url> --token <t>`; see `mock-desktop/src/cli.ts` |
 
-The app and worker tests need a placeholder `app/dist/index.html`; `pretest` and `predev` create it when absent.
+The app and worker tests need a placeholder `app/dist/client/index.html`; `pretest` and `predev` create it when absent.
+
+## Build output and security headers
+
+`wrangler.jsonc` serves `app/dist/client` as the assets directory. The Vite build also writes the Worker bundle
+and its sourcemap to `app/dist/monoptah_web`; that directory must never be served, which is why the assets
+directory is `client` and not `dist`. `app/scripts/check-dist.mjs` runs at the end of `build` and fails when
+`_headers` is missing or when a Worker bundle or sourcemap sits in the assets directory.
+
+`app/dist/client/_headers` is generated at build time (`app/build/headers.ts`) with the CSP from the Worker's
+`buildCsp` (`worker/src/csp.ts`), so the policy exists once. `connect-src` gets `wss://<host>`, where the host
+is that of `RP_ORIGIN` in `wrangler.jsonc` `vars` (`https://zptah.app` by default). A self-hoster who serves the
+app from another origin builds with `MONOPTAH_RP_ORIGIN=https://web.example.org pnpm --filter @monoptah/app run build`
+(and changes `RP_ORIGIN` and `RP_ID` in `wrangler.jsonc`).
 
 ## Never deploy from here
 

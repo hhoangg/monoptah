@@ -236,7 +236,6 @@ CREATE TABLE `users` (
   `blocked_via` text,
   `recovery_ack_at` integer,
   `created_at` integer NOT NULL,
-  FOREIGN KEY (`invited_by`) REFERENCES `users`(`id`) ON UPDATE no action ON DELETE set null,
   FOREIGN KEY (`invite_id`) REFERENCES `invites`(`id`) ON UPDATE no action ON DELETE set null,
   CONSTRAINT "users_handle_check" CHECK(length("users"."handle") BETWEEN 3 AND 32 AND "users"."handle" = lower("users"."handle")),
   CONSTRAINT "users_role_check" CHECK(role IN ('user', 'admin')),

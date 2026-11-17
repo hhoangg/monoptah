@@ -54,8 +54,11 @@ export const users = sqliteTable(
     displayName: text("display_name").notNull(),
     role: text("role", { enum: USER_ROLES }).notNull().default("user"),
     status: text("status", { enum: USER_STATUSES }).notNull().default("active"),
-    /** Null for the bootstrap admin. */
-    invitedBy: text("invited_by").references((): AnySQLiteColumn => users.id, { onDelete: "set null" }),
+    /**
+     * The inviter's user id, null for the bootstrap admin. Plain text, no FK action (like `blockedVia`):
+     * account deletion keeps it, so the invite tree survives the removal of a row.
+     */
+    invitedBy: text("invited_by"),
     inviteId: text("invite_id").references((): AnySQLiteColumn => invites.id, { onDelete: "set null" }),
     invitesGranted: integer("invites_granted").notNull().default(3),
     blockedAt: integer("blocked_at"),

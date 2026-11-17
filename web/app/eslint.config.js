@@ -10,6 +10,8 @@ export default [
   {
     files: ["src/**/*.{ts,tsx}"],
     languageOptions: { globals: { ...globals.browser } },
+    // An inline `eslint-disable` must not switch off the security.md 8.1 bans in application code.
+    linterOptions: { noInlineConfig: true },
   },
   {
     // public/theme-init.js is a classic script loaded from <head>, not a module.
@@ -17,7 +19,7 @@ export default [
     languageOptions: { sourceType: "script", globals: { ...globals.browser } },
   },
   {
-    files: ["vite.config.ts", "vitest.config.ts", "eslint.config.js", "src/**/*.test.{ts,tsx}", "src/test/**"],
+    files: ["vite.config.ts", "vitest.config.ts", "eslint.config.js", "build/**", "scripts/**", "src/**/*.test.{ts,tsx}", "src/test/**"],
     languageOptions: { globals: { ...globals.node } },
   },
 ];

@@ -7,4 +7,5 @@ afterEach(() => {
 });
 
 // jsdom does not implement scrolling; the router calls it for scroll restoration.
-window.scrollTo = () => {};
+// (Skipped in the node-environment tests of build/.)
+if (typeof window !== "undefined") window.scrollTo = () => {};

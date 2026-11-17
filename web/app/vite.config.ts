@@ -4,10 +4,12 @@ import tailwindcss from "@tailwindcss/vite";
 import { tanstackRouter } from "@tanstack/router-plugin/vite";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
+import { headersPlugin } from "./build/headers.ts";
 
 // `vite dev` runs the SPA, the Worker, the Durable Objects and local D1 together through
 // @cloudflare/vite-plugin, which reads the Worker config one level up (web/wrangler.jsonc).
-// `vite build` writes the SPA to web/app/dist, the Worker assets directory.
+// `vite build` writes the SPA to web/app/dist/client, the Worker assets directory (web/wrangler.jsonc),
+// and the Worker bundle to web/app/dist/monoptah_web (never served). headersPlugin writes the `_headers`.
 export default defineConfig({
   plugins: [
     // Must come before the React plugin. Generates src/routeTree.gen.ts (committed).
@@ -20,6 +22,7 @@ export default defineConfig({
     react(),
     tailwindcss(),
     cloudflare({ configPath: "../wrangler.jsonc" }),
+    headersPlugin("../wrangler.jsonc"),
   ],
   resolve: { alias: { "@": path.resolve(import.meta.dirname, "src") } },
 });

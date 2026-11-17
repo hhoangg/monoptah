@@ -7,7 +7,7 @@ Scope: frontend, Worker, relay, protocol, Web Push, desktop changes, self-hostin
 ```
  Browser (PWA, React CSR)                 Cloudflare (ONE Worker)                    Monoptah Native (desktop)
  +----------------------+      HTTPS     +--------------------------------+          +-------------------------+
- | app shell (SW cache) |--------------->| Assets binding (app/dist, SPA) |          |  MobileHost (unchanged) |
+ | app shell (SW cache) |--------------->| Assets (app/dist/client, SPA)  |          |  MobileHost (unchanged) |
  | TanStack Router/Query|   /api/* JSON  | Hono /api/*  --> D1 (Drizzle)  |          |   ^ handle()/watch()    |
  | Zustand link store   |--------------->|                                |          |   | peer = key fingerprint |
  | Noise IK (noble)     |                |                                |  WSS     |  +-------------------+  |
@@ -155,7 +155,7 @@ One Worker: `worker/src/index.ts` exports `default { fetch }` (Hono app) and the
   "main": "worker/src/index.ts",
   "compatibility_date": "2026-09-01",          // nodejs_compat is default from 2026-08-04
   "assets": {
-    "directory": "app/dist",
+    "directory": "app/dist/client",
     "binding": "ASSETS",
     "not_found_handling": "single-page-application",
     "run_worker_first": ["/api/*", "/relay/*"]

@@ -23,7 +23,15 @@ function isNonGet(method: string): boolean {
   return method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
 }
 
-/** Rejects a non-GET request whose `Origin` is not `RP_ORIGIN` (missing counts as wrong) or without `X-Monoptah-CSRF: 1`. */
+/** True when the request has `Content-Type: application/json` (parameters such as charset are allowed). */
+function isJsonContentType(value: string | undefined): boolean {
+  return value !== undefined && value.split(";")[0]?.trim().toLowerCase() === "application/json";
+}
+
+/**
+ * Rejects a non-GET request whose `Origin` is not `RP_ORIGIN` (missing counts as wrong), without
+ * `X-Monoptah-CSRF: 1`, or whose `Content-Type` is not `application/json` (security.md 3.4).
+ */
 export const originAndCsrf: MiddlewareHandler<AppEnv> = async (c, next) => {
   if (isNonGet(c.req.method)) {
     if (c.req.header("Origin") !== c.env.RP_ORIGIN) {
@@ -32,6 +40,17 @@ export const originAndCsrf: MiddlewareHandler<AppEnv> = async (c, next) => {
     if (c.req.header(CSRF_HEADER) !== "1") {
       return apiError(c, 403, "csrf", "Missing CSRF header");
     }
+    if (!isJsonContentType(c.req.header("Content-Type"))) {
+      return apiError(c, 415, "unsupported_media_type", "Content-Type must be application/json");
+    }
+  }
+  return next();
+};
+
+/** Rejects a WebSocket upgrade whose `Origin` is not `RP_ORIGIN`. A GET carries no CSRF header, so the Origin is the check. */
+export const originForUpgrade: MiddlewareHandler<AppEnv> = async (c, next) => {
+  if (c.req.header("Origin") !== c.env.RP_ORIGIN) {
+    return apiError(c, 403, "bad_origin", "Origin not allowed");
   }
   return next();
 };
@@ -50,6 +69,8 @@ export const ignoreCookies: MiddlewareHandler<AppEnv> = async (c, next) => {
 };
 
 /** The browser checks that apply to `route` (none for token and pairing routes). */
-export function browserChecks(route: Pick<ApiRoute, "auth" | "path">): MiddlewareHandler<AppEnv> {
-  return isCookieAuthenticated(route) ? originAndCsrf : ignoreCookies;
+export function browserChecks(route: Pick<ApiRoute, "auth" | "path"> & { upgrade?: boolean }): MiddlewareHandler<AppEnv> {
+  if (!isCookieAuthenticated(route)) return ignoreCookies;
+  if (route.upgrade) return originForUpgrade;
+  return originAndCsrf;
 }

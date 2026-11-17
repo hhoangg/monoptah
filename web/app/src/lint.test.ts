@@ -27,6 +27,18 @@ describe("ESLint security bans", () => {
     expect(found.some((m) => m.severity === 2)).toBe(true);
   });
 
+  it("cannot be silenced by an inline eslint-disable in src", async () => {
+    for (const directive of [
+      "/* eslint-disable no-restricted-properties */",
+      "/* eslint-disable */",
+      "// eslint-disable-next-line no-restricted-properties",
+    ]) {
+      const code = `${directive}\nexport function f(el: HTMLElement, h: string) { el.innerHTML = h; }\n`;
+      const found = await messages(code);
+      expect(found.some((m) => m.severity === 2 && m.message.includes("innerHTML")), directive).toBe(true);
+    }
+  });
+
   it("accepts ordinary React code", async () => {
     const found = await messages("export const A = ({ t }: { t: string }) => <p>{t}</p>;");
     expect(found).toEqual([]);

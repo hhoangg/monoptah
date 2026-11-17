@@ -59,6 +59,8 @@ export const API_ERROR_CODES = [
   "csrf",
   /** `Origin` header missing or not RP_ORIGIN (403, security.md 3.4). */
   "bad_origin",
+  /** A non-GET cookie route got a Content-Type other than `application/json` (415, security.md 3.4). */
+  "unsupported_media_type",
   /** 429, with Retry-After (security.md 3.5). */
   "rate_limited",
   /** 404. */

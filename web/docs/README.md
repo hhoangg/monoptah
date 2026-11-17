@@ -22,7 +22,7 @@ A multi-user, installable web app (PWA) that remotely controls Monoptah Native d
 ```
  Browser (PWA, installed or tab)            Cloudflare: ONE Worker                      Desktop: Monoptah Native
  +-------------------------------+        +----------------------------------+        +---------------------------------+
- | React 19 SPA (CSR)            | HTTPS  | Static assets binding (app/dist, |        | MobileHost (existing)           |
+ | React 19 SPA (CSR)            | HTTPS  | Assets binding (app/dist/client, |        | MobileHost (existing)           |
  |  TanStack Router + Query      |------->|   SPA fallback)                  |        |   handle() / watch()            |
  |  Zustand link store           | /api/* | Hono  /api/*  ---------> D1      |        |        ^                        |
  | Service worker (Workbox +     |        |   (Drizzle: users, passkeys,     |        |        | same two closures      |

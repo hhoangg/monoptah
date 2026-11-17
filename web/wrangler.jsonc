@@ -9,9 +9,11 @@
   "compatibility_date": "2026-09-01",
 
   "assets": {
-    // Built by web/app (`pnpm --filter @monoptah/app build`). For `wrangler dev` and the tests
-    // worker/scripts/ensure-assets.mjs creates a git-ignored placeholder when it is absent.
-    "directory": "app/dist",
+    // The client output of web/app (`pnpm --filter @monoptah/app build`). It holds `_headers` and no Worker
+    // bundle: the Vite build also writes app/dist/monoptah_web (a Worker bundle and its sourcemap), which
+    // must never be served as an asset, so this is app/dist/client and not app/dist. For `wrangler dev` and
+    // the tests worker/scripts/ensure-assets.mjs creates a git-ignored placeholder when it is absent.
+    "directory": "app/dist/client",
     "binding": "ASSETS",
     "not_found_handling": "single-page-application",
     // Only the API and the relay run the Worker first; everything else is a free asset request.

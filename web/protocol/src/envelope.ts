@@ -79,7 +79,7 @@ export function knownErrorCode(response: ErrorResponse): z.infer<typeof DesktopE
 // --- JSON <-> bytes ---
 
 const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder("utf-8", { fatal: true });
+const textDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
 
 export function encodeEnvelope(message: DeviceMessage | DesktopMessage): Uint8Array {
   return textEncoder.encode(JSON.stringify(message));

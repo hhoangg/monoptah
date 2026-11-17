@@ -110,6 +110,22 @@ function complete() {
 }
 
 describe("handshake failures", () => {
+  it("is poisoned after a thrown error: every later call throws", () => {
+    const p = pair({ prologueA: new TextEncoder().encode("prologue A"), prologueB: new TextEncoder().encode("prologue B") });
+    const message = p.initiator.writeMessage();
+    expect(() => p.responder.readMessage(message)).toThrow(/authenticate/);
+    // The same valid message cannot be retried, a reply cannot be written, and nothing can be split.
+    expect(() => p.responder.readMessage(message)).toThrow(/failed earlier/);
+    expect(() => p.responder.writeMessage()).toThrow(/failed earlier/);
+    expect(() => p.responder.split()).toThrow(/failed earlier/);
+  });
+
+  it("is poisoned after an out-of-turn call", () => {
+    const p = pair();
+    expect(() => p.responder.writeMessage()).toThrow(NoiseError);
+    expect(() => p.responder.readMessage(p.initiator.writeMessage())).toThrow(/failed earlier/);
+  });
+
   it("a different prologue fails at message 1", () => {
     const p = pair({ prologueA: new TextEncoder().encode("prologue A"), prologueB: new TextEncoder().encode("prologue B") });
     const message = p.initiator.writeMessage(new Uint8Array(0));
@@ -165,7 +181,8 @@ describe("handshake failures", () => {
     const p = pair();
     expect(() => p.responder.writeMessage()).toThrow(/turn/);
     expect(() => p.initiator.readMessage(new Uint8Array(80))).toThrow(/turn/);
-    expect(() => p.initiator.split()).toThrow(/not complete/);
+    // Each error poisons its own state (next test), so completion is checked on fresh ones.
+    expect(() => pair().initiator.split()).toThrow(/not complete/);
   });
 
   it("the initiator needs the responder key", () => {

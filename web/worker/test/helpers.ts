@@ -12,4 +12,4 @@ export function call(path: string, init: RequestInit = {}): Promise<Response> {
 }
 
 /** Headers a legitimate browser call carries on a non-GET cookie route. */
-export const BROWSER_HEADERS = { Origin: ORIGIN, "X-Monoptah-CSRF": "1" } as const;
+export const BROWSER_HEADERS = { Origin: ORIGIN, "X-Monoptah-CSRF": "1", "Content-Type": "application/json" } as const;

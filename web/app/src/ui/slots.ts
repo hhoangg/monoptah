@@ -6,7 +6,9 @@
 // once at startup (main.tsx imports every register.ts), before the first render, so the registry
 // is a plain map and not reactive.
 //
-// One component per slot name: registering a name twice replaces the earlier registration.
+// One component per slot name: registering a name twice throws, so two workstreams cannot silently
+// override each other. `send-guard` (async hook) and `session-capabilities` (predicate) are not
+// components; their typed registries are in `./hooks.ts`.
 import { createElement, Fragment, type ComponentType, type ReactElement, type ReactNode } from "react";
 
 export const SLOT_NAMES = [
@@ -15,10 +17,8 @@ export const SLOT_NAMES = [
   "session-header-chip",
   "session-menu-items",
   "archive-dialog",
-  "send-guard",
   "new-session-target",
   "desktop-nav-items",
-  "session-capabilities",
   "desktop-settings-sections",
   "desktop-switcher",
   "link-state-screens",
@@ -46,6 +46,7 @@ export interface SlotPropsMap extends Record<SlotName, SlotBaseProps> {
 const registry = new Map<SlotName, ComponentType<never>>();
 
 export function registerSlot<N extends SlotName>(name: N, component: ComponentType<SlotPropsMap[N]>): void {
+  if (registry.has(name)) throw new Error(`Slot "${name}" is already registered`);
   registry.set(name, component as ComponentType<never>);
 }
 

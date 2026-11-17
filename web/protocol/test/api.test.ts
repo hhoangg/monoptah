@@ -161,3 +161,19 @@ describe("schemas", () => {
     expect(PushPayloadSchema.parse(payload)).toEqual(payload);
   });
 });
+
+describe("rate limit groups (security.md 3.5)", () => {
+  it("names the group of every limited route as the 3.5 table does", () => {
+    const groups = Object.fromEntries(API_ROUTES.filter((route) => route.rateLimit).map((route) => [`${route.method} ${route.path}`, route.rateLimit]));
+    expect(groups).toEqual({
+      "POST /api/auth/register/options": "register",
+      "POST /api/auth/register/verify": "register",
+      "POST /api/auth/login/options": "login",
+      "POST /api/auth/login/verify": "login",
+      "POST /api/auth/recover": "recover",
+      "POST /api/pair/start": "pair-start",
+      "POST /api/pair/poll": "pair-poll",
+      "POST /api/push/notify": "push-notify",
+    });
+  });
+});

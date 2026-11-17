@@ -14,15 +14,3 @@ packages:
 allowBuilds:
   esbuild: true # downloads the platform binary; used by vite and wrangler
   workerd: true # Miniflare and wrangler runtime binary (the worker package)
-
-minimumReleaseAgeExclude:
-  - '@cloudflare/workerd-darwin-64@1.20261117.1'
-  - '@cloudflare/workerd-darwin-arm64@1.20261117.1'
-  - '@cloudflare/workerd-linux-64@1.20261117.1'
-  - '@cloudflare/workerd-linux-arm64@1.20261117.1'
-  - '@cloudflare/workerd-windows-64@1.20261117.1'
-  - '@cloudflare/workers-types@5.20261117.1'
-  - miniflare@5.20261117.0-beta
-  - workerd@1.20261117.1
-  - wrangler@4.164.0
-  - '@cloudflare/vitest-plugin@1.8.4'

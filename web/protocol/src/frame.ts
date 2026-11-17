@@ -166,7 +166,7 @@ export const ErrorBodySchema = z.object({ code: z.string() });
 export type ErrorBody = z.infer<typeof ErrorBodySchema>;
 
 const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder("utf-8", { fatal: true });
+const textDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
 
 export function encodeCtrlBody(message: CtrlMessage): Uint8Array {
   return textEncoder.encode(JSON.stringify(CtrlMessageSchema.parse(message)));

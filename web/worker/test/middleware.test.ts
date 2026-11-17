@@ -61,6 +61,31 @@ describe("Origin and X-Monoptah-CSRF on cookie routes", () => {
     const res = await call("/api/me");
     expect(res.status).toBe(501);
   });
+
+  it("rejects a non-GET cookie route whose Content-Type is not application/json (415)", async () => {
+    const route = cookieRoutes[0] as ApiRoute;
+    for (const contentType of [undefined, "text/plain", "application/x-www-form-urlencoded", "multipart/form-data; boundary=x", "application/jsonx"]) {
+      const headers: Record<string, string> = { Origin: ORIGIN, "X-Monoptah-CSRF": "1" };
+      if (contentType) headers["Content-Type"] = contentType;
+      const res = await call(concrete(route), { method: route.method, headers });
+      expect(res.status, String(contentType)).toBe(415);
+      expect(ApiErrorSchema.parse(await res.json()).code).toBe("unsupported_media_type");
+    }
+    const withCharset = await call(concrete(route), { method: route.method, headers: { ...BROWSER_HEADERS, "Content-Type": "application/json; charset=utf-8" } });
+    expect(withCharset.status).toBe(501);
+  });
+
+  it("checks Origin on a WebSocket upgrade GET (no CSRF header there)", async () => {
+    const path = "/relay/device/x?device=d";
+    const upgrade = { Upgrade: "websocket" };
+    const none = await call(path, { headers: upgrade });
+    expect(none.status).toBe(403);
+    expect(ApiErrorSchema.parse(await none.json()).code).toBe("bad_origin");
+    const wrong = await call(path, { headers: { ...upgrade, Origin: "https://evil.example" } });
+    expect(wrong.status).toBe(403);
+    const ok = await call(path, { headers: { ...upgrade, Origin: ORIGIN } });
+    expect(ok.status).toBe(501);
+  });
 });
 
 describe("token and pairing routes", () => {
