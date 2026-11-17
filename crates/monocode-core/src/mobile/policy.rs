@@ -58,43 +58,44 @@ pub struct PolicyFlags {
     pub remote_cloud_start: bool,
 }
 
-/// Stable error keys for the web client (architecture.md 5.5). The error text
-/// the QUIC transport sends is unchanged.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Code {
-    ReadOnly,
-    Forbidden,
-    NotSelected,
-    PathDenied,
-    Revoked,
-    Disabled,
-    TooLarge,
-    Unsupported,
-    UnsupportedTarget,
-    Busy,
-    Starting,
-    AutoStopping,
-    InstanceBusy,
+/// Declares `Code` with its wire names and the list of all variants in one
+/// place, so a new variant cannot be left out of either.
+macro_rules! codes {
+    ($($variant:ident => $name:literal),* $(,)?) => {
+        /// Stable error keys for the web client (architecture.md 5.5). The error
+        /// text the QUIC transport sends is unchanged.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum Code {
+            $($variant),*
+        }
+
+        impl Code {
+            /// Every code.
+            pub const ALL: &'static [Code] = &[$(Code::$variant),*];
+
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(Code::$variant => $name),*
+                }
+            }
+        }
+    };
 }
 
-impl Code {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Code::ReadOnly => "read_only",
-            Code::Forbidden => "forbidden",
-            Code::NotSelected => "not_selected",
-            Code::PathDenied => "path_denied",
-            Code::Revoked => "revoked",
-            Code::Disabled => "disabled",
-            Code::TooLarge => "too_large",
-            Code::Unsupported => "unsupported",
-            Code::UnsupportedTarget => "unsupported_target",
-            Code::Busy => "busy",
-            Code::Starting => "starting",
-            Code::AutoStopping => "auto_stopping",
-            Code::InstanceBusy => "instance_busy",
-        }
-    }
+codes! {
+    ReadOnly => "read_only",
+    Forbidden => "forbidden",
+    NotSelected => "not_selected",
+    PathDenied => "path_denied",
+    Revoked => "revoked",
+    Disabled => "disabled",
+    TooLarge => "too_large",
+    Unsupported => "unsupported",
+    UnsupportedTarget => "unsupported_target",
+    Busy => "busy",
+    Starting => "starting",
+    AutoStopping => "auto_stopping",
+    InstanceBusy => "instance_busy",
 }
 
 /// A refused call: the stable key and the text the transport reports.
@@ -453,47 +454,12 @@ mod tests {
     }
 
     #[test]
-    fn error_codes_keep_their_wire_names() {
-        let all = [
-            (Code::ReadOnly, "read_only"),
-            (Code::Forbidden, "forbidden"),
-            (Code::NotSelected, "not_selected"),
-            (Code::PathDenied, "path_denied"),
-            (Code::Revoked, "revoked"),
-            (Code::Disabled, "disabled"),
-            (Code::TooLarge, "too_large"),
-            (Code::Unsupported, "unsupported"),
-            (Code::UnsupportedTarget, "unsupported_target"),
-            (Code::Busy, "busy"),
-            (Code::Starting, "starting"),
-            (Code::AutoStopping, "auto_stopping"),
-            (Code::InstanceBusy, "instance_busy"),
-        ];
-        for (code, name) in all {
-            assert_eq!(code.as_str(), name);
-        }
-    }
-
-    #[test]
     fn error_codes_equal_the_web_link_list() {
-        let all = [
-            Code::ReadOnly,
-            Code::Forbidden,
-            Code::NotSelected,
-            Code::PathDenied,
-            Code::Revoked,
-            Code::Disabled,
-            Code::TooLarge,
-            Code::Unsupported,
-            Code::UnsupportedTarget,
-            Code::Busy,
-            Code::Starting,
-            Code::AutoStopping,
-            Code::InstanceBusy,
-        ];
-        let mut ours: Vec<&str> = all.iter().map(|c| c.as_str()).collect();
+        let mut ours: Vec<&str> = Code::ALL.iter().map(|c| c.as_str()).collect();
         ours.sort_unstable();
         assert_eq!(ours, super::super::web_link::frame::DESKTOP_ERROR_CODES);
+        assert_eq!(Code::ReadOnly.as_str(), "read_only");
+        assert_eq!(Code::InstanceBusy.as_str(), "instance_busy");
     }
 
     #[test]

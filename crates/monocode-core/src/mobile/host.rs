@@ -658,9 +658,7 @@ impl MobileHost {
         let result = self.handle_call(peer, &request, &mut audited).await;
         // Recorded with no lock held: the log may write a file.
         if let Some((context, mut event)) = audited {
-            if event.outcome == Outcome::Ok && result.is_err() {
-                event.outcome = Outcome::Error;
-            }
+            event.outcome = final_outcome(event.outcome, result.is_err());
             audit::record(&context, &event);
         }
         result
@@ -706,18 +704,13 @@ impl MobileHost {
             let context = DeviceContext::phone(&device);
             *audited = Some((context.clone(), audit_event(&device, method, request)));
             if let Err(denial) = policy::authorize(&context, method, &params) {
-                if let Some((_, event)) = audited {
-                    event.outcome = Outcome::Denied(denial.code);
-                }
+                mark_denied(audited, &denial);
                 return Err(denial.error);
             }
             match method {
                 "device.selection" => {
                     let answer = policy::device_selection(&context, &params)?;
-                    if answer.narrowed.is_some() {
-                        close_device_watches(&mut inner, peer);
-                    }
-                    return selection_reply(answer);
+                    return answer_selection(&mut inner, peer, answer);
                 }
                 "device.leave" => {
                     let mut config = inner.config.clone();
@@ -799,9 +792,7 @@ impl MobileHost {
         let result = self.watch_call(peer, &request, sink, &mut audited).await;
         // Recorded with no lock held: the log may write a file.
         if let Some((context, mut event)) = audited {
-            if event.outcome == Outcome::Ok && result.is_err() {
-                event.outcome = Outcome::Error;
-            }
+            event.outcome = final_outcome(event.outcome, result.is_err());
             audit::record(&context, &event);
         }
         result
@@ -846,9 +837,7 @@ impl MobileHost {
                 audit_event(&device, "conversation.watch", request),
             ));
             if let Err(denial) = policy::authorize(&context, "conversation.watch", params) {
-                if let Some((_, event)) = audited {
-                    event.outcome = Outcome::Denied(denial.code);
-                }
+                mark_denied(audited, &denial);
                 return Err(denial.error);
             }
             inner.watches.retain(|_, watch| !watch.sink.is_closed());
@@ -969,6 +958,38 @@ fn selection_reply(answer: policy::SelectionAnswer) -> Result<Value, String> {
         return Err("Unsupported mobile operation".into());
     }
     Ok(answer.reply)
+}
+
+/// Answers `device.selection`. The device's watches end only when a change is
+/// actually applied, never for a refused one.
+fn answer_selection(
+    inner: &mut Inner,
+    peer: &str,
+    answer: policy::SelectionAnswer,
+) -> Result<Value, String> {
+    let narrowed = answer.narrowed.is_some();
+    let reply = selection_reply(answer)?;
+    if narrowed {
+        // Reached once the selection is saved (R-07 / H-02).
+        close_device_watches(inner, peer);
+    }
+    Ok(reply)
+}
+
+/// The outcome to record once a call ended: a call that was admitted and then
+/// failed is an error; a denial stays the denial.
+fn final_outcome(recorded: Outcome, failed: bool) -> Outcome {
+    match recorded {
+        Outcome::Ok if failed => Outcome::Error,
+        other => other,
+    }
+}
+
+/// Marks the audited call of the device as denied with `denial`'s code.
+fn mark_denied(audited: &mut Option<(DeviceContext, AuditEvent)>, denial: &policy::Denial) {
+    if let Some((_, event)) = audited {
+        event.outcome = Outcome::Denied(denial.code);
+    }
 }
 
 /// Whether a device of `kind` may enrol through `handle`. Only QUIC phones do.
@@ -1255,6 +1276,62 @@ mod tests {
     }
 
     #[test]
+    fn the_recorded_outcome_follows_the_call() {
+        assert_eq!(final_outcome(Outcome::Ok, false), Outcome::Ok);
+        assert_eq!(final_outcome(Outcome::Ok, true), Outcome::Error);
+        let denied = Outcome::Denied(policy::Code::ReadOnly);
+        assert_eq!(final_outcome(denied, true), denied);
+        let device = Device {
+            id: "d".into(),
+            name: "Phone".into(),
+            fingerprint: "abcdef0123456789".into(),
+            push: None,
+        };
+        let request = json!({"id": "c", "params": {}});
+        let mut audited = Some((
+            DeviceContext::phone(&device),
+            audit_event(&device, "mono.delete", &request),
+        ));
+        mark_denied(
+            &mut audited,
+            &policy::Denial {
+                code: policy::Code::Forbidden,
+                error: "no".into(),
+            },
+        );
+        assert_eq!(
+            audited.unwrap().1.outcome,
+            Outcome::Denied(policy::Code::Forbidden)
+        );
+    }
+
+    #[test]
+    fn a_refused_selection_change_leaves_the_watches_open() {
+        let (host, _events, peer) = paired();
+        {
+            let mut inner = host.inner.lock().unwrap();
+            let (sink, _receiver) = tokio::sync::mpsc::channel::<Value>(1);
+            inner.watches.insert(
+                "w".into(),
+                Watcher {
+                    peer: peer.clone(),
+                    sink,
+                },
+            );
+            let narrowed = policy::SelectionAnswer {
+                reply: json!({}),
+                narrowed: Some(policy::Selection {
+                    projects: Some(vec![]),
+                    monos: None,
+                }),
+            };
+            assert!(answer_selection(&mut inner, &peer, narrowed).is_err());
+            assert!(inner.watches.contains_key("w"));
+        }
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn only_quic_phones_enrol_through_the_host() {
         assert!(enroll_allowed(DeviceKind::Phone));
         assert!(!enroll_allowed(DeviceKind::Web));
@@ -1273,6 +1350,8 @@ mod tests {
         assert_eq!(event.method, "session.cancel");
         assert_eq!(event.project_id.as_deref(), Some("p"));
         assert_eq!(event.command_id.as_deref(), Some("c"));
+        // Admitted, so Ok until the call has ended.
+        assert_eq!(event.outcome, Outcome::Ok);
         std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
     }
 
