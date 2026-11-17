@@ -7,6 +7,7 @@ import { Notice } from "@/ui/Notice";
 import { SettingsCard, SettingsRow } from "@/ui/SettingsCard";
 import { Switch } from "@/ui/switch";
 import { settingsErrorMessage } from "./copy";
+import { pushPrefsKey } from "./pushPrefs";
 
 type Category = (typeof PUSH_CATEGORIES)[number];
 
@@ -19,7 +20,6 @@ export const CATEGORY_LABELS: Record<Category, { title: string; description: str
 /** The starting point of the draft shown before anything is known. It is never sent without an explicit Save. */
 export const DRAFT_PREFS: PushPrefs = { enabled: true, categories: { agentFinished: true, agentInput: true, monoMessages: true } };
 
-export const pushPrefsKey = (desktopId: string) => ["settings", "push-prefs", desktopId] as const;
 
 /**
  * Notification categories of one desktop (N-15). The contract has no GET for prefs (a gap reported

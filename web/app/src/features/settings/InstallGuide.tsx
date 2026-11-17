@@ -3,6 +3,7 @@ import { Icon, type IconName } from "@/ui/Icon";
 import { PageHeader } from "@/ui/PageHeader";
 import { Notice } from "@/ui/Notice";
 import { SettingsCard, SettingsRow } from "@/ui/SettingsCard";
+import { PushOnboarding } from "./PushOnboarding";
 import { SettingsLayout } from "./SettingsLayout";
 import { detectPlatform, useStandalone, type InstallPlatform } from "./standalone";
 
@@ -90,11 +91,16 @@ export function InstallGuide() {
       <PageHeader title="Install Monoptah" description="Open Monoptah like any other app, full screen and one tap away." />
       {standalone ? (
         <Notice variant="info" title="Installed">
-          You are using Monoptah as an installed app. Nothing more to do here.
+          You are using Monoptah as an installed app. You can turn on notifications below.
         </Notice>
       ) : (
         guides.map((guide) => <GuideCard key={guide.platform} guide={guide} current={guide.platform === detected} />)
       )}
+      {standalone ? (
+        <SettingsCard title="Notifications" aria-label="Notifications" footnote="Permission is asked only when you press the button.">
+          <PushOnboarding />
+        </SettingsCard>
+      ) : null}
       {/* An installed app has no browser Back button: always offer a way into the app. */}
       <SettingsCard>
         <SettingsRow icon="computer" title="Back to Monoptah" to="/" />

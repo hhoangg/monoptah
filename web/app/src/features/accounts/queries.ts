@@ -7,6 +7,7 @@ import { forgetAccountSnapshots } from "@/features/offline/snapshots";
 import { ApiError, apiFetch } from "./api";
 import { endpoints } from "./endpoints";
 import { clearLowCodes } from "./lowCodes";
+import { unsubscribeFromPush } from "@/features/push/subscribe";
 import { createPasskey, getPasskey } from "./webauthn";
 
 type Me = ReturnType<typeof MeResponse.parse>;
@@ -143,6 +144,9 @@ export async function recoverAccount(queryClient: QueryClient, input: { handle: 
 export async function signOut(queryClient: QueryClient, options: { keepLowCodes?: boolean } = {}): Promise<void> {
   // The reminder belongs to the account that recovered; it survives only the recover flow's own sign-out.
   if (!options.keepLowCodes) clearLowCodes();
+  // The subscription belongs to this browser and this account: remove it while the session still works.
+  // A failure here must not keep the user signed in.
+  await unsubscribeFromPush().catch(() => undefined);
   try {
     await apiFetch(endpoints.logout);
   } finally {

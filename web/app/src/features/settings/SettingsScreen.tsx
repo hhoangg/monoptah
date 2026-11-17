@@ -9,6 +9,7 @@ import { SettingsCard, SettingsRow } from "@/ui/SettingsCard";
 import { Slot } from "@/ui/slots";
 import { AccountSection } from "./AccountSection";
 import { AppearanceSection } from "./AppearanceSection";
+import { NotificationsCard } from "./NotificationsCard";
 import { InvitesSection } from "./InvitesSection";
 import { PasskeysSection } from "./PasskeysSection";
 import { RecoveryCodesSection } from "./RecoveryCodesSection";
@@ -44,6 +45,7 @@ export function SettingsScreen({ handle, displayName, role }: SettingsScreenProp
       <PasskeysSection />
       <RecoveryCodesSection handle={handle} />
       <SessionsSection />
+      <NotificationsCard />
       <InvitesSection />
       <AppearanceSection />
       <Slot name="settings-sections" />
