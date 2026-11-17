@@ -16,6 +16,7 @@ import {
   USER_ROLE_SQL,
 } from "../src/modules/auth/register.ts";
 import { INVITES_PAUSED_SQL, USER_COUNT_SQL } from "../src/modules/invites/gate.ts";
+import { INSERT_INVITE_SQL, INVITE_BY_ID_SQL, LIST_INVITES_SQL, REVOKE_INVITE_SQL } from "../src/modules/invites/handlers.ts";
 import { CONSUME_CHALLENGE_SQL, INSERT_CHALLENGE_SQL } from "../src/modules/passkeys/challenges.ts";
 import { INVITES_USED_SQL, ME_ROW_SQL, PATCH_DISPLAY_NAME_SQL } from "../src/modules/me/handlers.ts";
 import { CONSUME_SQL } from "../src/modules/ratelimit/limiter.ts";
@@ -40,12 +41,6 @@ interface PlanCase {
    * covering index of `users` (never the table itself) and nothing else.
    */
   usersCountScan?: boolean;
-  /**
-   * An INSERT into `users` also lists the foreign key checks SQLite compiles for the child tables of `users`.
-   * They run only when a `users` row is deleted (account deletion, A-09), not on this INSERT, and four of those
-   * child columns have no index (see the report of A-03). Only these exact tables may show a SCAN, only here.
-   */
-  fkChildScans?: string[];
 }
 
 const CASES: PlanCase[] = [
@@ -66,7 +61,7 @@ const CASES: PlanCase[] = [
   { name: "handle taken", sql: HANDLE_TAKEN_SQL, bind: ["h"] },
   { name: "invites_paused setting", sql: INVITES_PAUSED_SQL, bind: [] },
   { name: "user count (cap)", sql: USER_COUNT_SQL, bind: [], usersCountScan: true },
-  { name: "registration: insert user", sql: INSERT_USER_SQL, bind: ["u", "h", "n", 1, "i", "h", 1, 0, 0], usersCountScan: true, fkChildScans: ["settings", "pairing_requests", "invites", "challenges"] },
+  { name: "registration: insert user", sql: INSERT_USER_SQL, bind: ["u", "h", "n", 1, "i", "h", 1, 0, 0], usersCountScan: true },
   { name: "registration: use invite", sql: USE_INVITE_SQL, bind: ["u", 1, "i", "u", "i"] },
   { name: "registration: insert passkey", sql: INSERT_PASSKEY_SQL, bind: ["c", "u", "k", 0, "[]", "d", 0, "n", 1, "u", "i"] },
   { name: "registration: insert recovery code", sql: INSERT_RECOVERY_CODE_SQL, bind: ["i", "u", "h", 1, "u", "i"] },
@@ -77,6 +72,10 @@ const CASES: PlanCase[] = [
   { name: "passkey use update", sql: UPDATE_PASSKEY_USE_SQL, bind: [1, 0, 1, "c"] },
   { name: "passkeys of a user", sql: USER_PASSKEYS_SQL, bind: ["u"] },
   { name: "set reauth_at", sql: SET_REAUTH_SQL, bind: [1, "h"] },
+  { name: "list own invites", sql: LIST_INVITES_SQL, bind: ["u"] },
+  { name: "create invite (quota and gate)", sql: INSERT_INVITE_SQL, bind: ["i", "h", 1, 1, "u", 0, 0], usersCountScan: true },
+  { name: "invite by id", sql: INVITE_BY_ID_SQL, bind: ["i"] },
+  { name: "revoke invite", sql: REVOKE_INVITE_SQL, bind: [1, "i", "u"] },
   { name: "audit first page", sql: AUDIT_PAGE_SQL, bind: ["u", 51], noTempSort: true },
   { name: "audit next page", sql: AUDIT_PAGE_AFTER_SQL, bind: ["u", 1, "id", 51], noTempSort: true },
 ];
@@ -90,7 +89,6 @@ describe("query plans", () => {
     if (!isInsert) expect(details.length).toBeGreaterThan(0);
     for (const detail of details) {
       if (c.usersCountScan && /^SCAN users USING COVERING INDEX /.test(detail)) continue;
-      if (c.fkChildScans?.some((table) => detail === `SCAN ${table}`)) continue;
       expect(detail, detail).not.toMatch(/^SCAN /);
       if (c.noTempSort) expect(detail, detail).not.toMatch(/TEMP B-TREE/);
     }

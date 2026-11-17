@@ -40,9 +40,22 @@ const SPEC_INDEXES: [string, string[]][] = [
 const CLEANUP_INDEXES: [string, string[]][] = [
   ["challenges", ["expires_at"]],
   ["sessions", ["expires_at"]],
-  ["audit_log", ["ts"]],
+  ["audit_log", ["ts", "id"]],
   ["rate_limits", ["window_start"]],
   ["pairing_requests", ["expires_at"]],
+];
+
+// Foreign key columns need an index (migration 0003), and the admin lists have theirs.
+const MIGRATION_0003_INDEXES: [string, string[]][] = [
+  ["settings", ["updated_by"]],
+  ["pairing_requests", ["user_id"]],
+  ["pairing_requests", ["desktop_id"]],
+  ["invites", ["used_by"]],
+  ["challenges", ["user_id"]],
+  ["push_prefs", ["desktop_id"]],
+  ["users", ["invite_id"]],
+  ["users", ["created_at", "id"]],
+  ["audit_log", ["ts", "id"]],
 ];
 
 interface TableInfoRow {
@@ -132,9 +145,22 @@ describe("D1 schema = architecture.md 4.3", () => {
   });
 
   it("has every index of the spec and the cleanup indexes", async () => {
-    for (const [table, columns] of [...SPEC_INDEXES, ...CLEANUP_INDEXES]) {
+    for (const [table, columns] of [...SPEC_INDEXES, ...CLEANUP_INDEXES, ...MIGRATION_0003_INDEXES]) {
       const found = await indexes(table);
       expect(found.some((i) => i.columns.join() === columns.join()), `${table}(${columns.join()})`).toBe(true);
+    }
+  });
+
+  it("every foreign key column has an index that starts with it", async () => {
+    for (const table of Object.values(TABLES)) {
+      const config = getTableConfig(table as SQLiteTable);
+      const found = await indexes(config.name);
+      const primaryKey = (await tableInfo(config.name)).filter((c) => c.pk > 0).sort((a, b) => a.pk - b.pk).map((c) => c.name);
+      for (const fk of config.foreignKeys) {
+        const column = fk.reference().columns[0]?.name ?? "?";
+        const indexed = found.some((i) => i.columns[0] === column) || primaryKey[0] === column;
+        expect(indexed, `${config.name}.${column} is indexed`).toBe(true);
+      }
     }
   });
 
