@@ -5,7 +5,7 @@ import { setApiTransport } from "@/features/accounts/api";
 import { createMockServer, MOCK_VAPID_KEY_ID, MOCK_VAPID_PUBLIC_KEY } from "@/features/accounts/mock/transport";
 import { fromBase64Url, toBase64Url } from "@/sw/base64url";
 import { loadPushState } from "@/sw/pushState";
-import { PushUnavailableError, forgetPushLocally, getSavedPushSubscription, hasBrowserSubscription, subscribeToPush, unsubscribeFromPush } from "./subscribe";
+import { PushUnavailableError, forgetPushLocally, getSavedPushSubscription, hasBrowserSubscription, subscribeToPush, SW_READY_TIMEOUT_MS, unsubscribeFromPush } from "./subscribe";
 
 const keyBytes = fromBase64Url(MOCK_VAPID_PUBLIC_KEY);
 
@@ -48,6 +48,20 @@ describe("subscribeToPush", () => {
     install(null, "default");
     await expect(subscribeToPush("dev-1", "usr-1")).rejects.toMatchObject({ reason: "permission" });
     await expect(subscribeToPush("dev-1", "usr-1")).rejects.toBeInstanceOf(PushUnavailableError);
+  });
+
+  it("gives up with `unsupported` when no service worker ever becomes ready", async () => {
+    vi.useFakeTimers();
+    try {
+      install(null);
+      Object.defineProperty(navigator, "serviceWorker", { configurable: true, value: { ready: new Promise(() => undefined) } });
+      const result = subscribeToPush("dev-1", "usr-1");
+      const settled = expect(result).rejects.toMatchObject({ reason: "unsupported" });
+      await vi.advanceTimersByTimeAsync(SW_READY_TIMEOUT_MS + 1);
+      await settled;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("refuses when push is unsupported", async () => {

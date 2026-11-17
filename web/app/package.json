@@ -6,14 +6,15 @@
   "description": "Monoptah web app: Vite + React 19 single page app (client-side rendered)",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.sw.json && vite build && node scripts/check-dist.mjs",
+    "build": "node scripts/check-lockfile.mjs && tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.sw.json && vite build && node scripts/check-dist.mjs",
     "preview": "vite preview",
     "routes:gen": "tsr generate",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.sw.json",
     "lint": "eslint .",
     "test": "vitest run",
     "guard:web": "node ../../scripts/check-web-isolation.mjs",
-    "guard:web:test": "node --test ../../scripts/check-web-isolation.test.mjs"
+    "guard:web:test": "node --test ../../scripts/check-web-isolation.test.mjs",
+    "check:lockfile": "node scripts/check-lockfile.mjs"
   },
   "dependencies": {
     "@hugeicons/core-free-icons": "^4.4.0",
@@ -34,6 +35,7 @@
     "sonner": "^2.0.8",
     "tailwind-merge": "^3.7.0",
     "vaul": "^1.1.2",
+    "workbox-window": "^7.4.1",
     "zustand": "^5.1.0"
   },
   "devDependencies": {
@@ -60,7 +62,6 @@
     "workbox-core": "^7.4.1",
     "workbox-precaching": "^7.4.1",
     "workbox-routing": "^7.4.1",
-    "workbox-window": "^7.4.1",
     "wrangler": "4.163.0"
   }
 }

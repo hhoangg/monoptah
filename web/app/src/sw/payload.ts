@@ -41,10 +41,11 @@ export function notificationFor(payload: ParsedPushPayload | null): Notification
   if (!payload) return { title: GENERIC_TITLE, options: { body: GENERIC_BODY, icon: NOTIFICATION_ICON, badge: NOTIFICATION_BADGE, data: { url: FALLBACK_URL } } };
   // An unusable URL still shows the notice, and a click opens the root.
   const url = safeNotificationUrl(payload.url) ?? FALLBACK_URL;
-  const options: NotificationSpec["options"] = { body: payload.b, icon: NOTIFICATION_ICON, badge: NOTIFICATION_BADGE, data: { url } };
+  // An empty title or body would show a blank notification, which iOS counts against "visible notification".
+  const options: NotificationSpec["options"] = { body: payload.b === "" ? GENERIC_BODY : payload.b, icon: NOTIFICATION_ICON, badge: NOTIFICATION_BADGE, data: { url } };
   // One notification per session: a newer one replaces the older (the Worker also sends a Topic header).
   if (payload.tag !== "") options.tag = payload.tag;
-  return { title: payload.t, options };
+  return { title: payload.t === "" ? GENERIC_TITLE : payload.t, options };
 }
 
 /** Reads the push data as JSON; anything unreadable is null (the generic notification). */

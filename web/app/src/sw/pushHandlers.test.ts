@@ -49,7 +49,7 @@ describe("push", () => {
     expect(shown).toEqual([{ title: "Studio Mac", options: { body: "api: Needs your input", icon: "/icons/icon-192.png", badge: "/icons/badge-96.png", tag: "s9", data: { url: "/d/dk1/s/s9" } } }]);
   });
 
-  it("carries the Mono chat URL of a Mono message", async () => {
+  it("passes the Mono chat URL of a Mono message through (the URL rule lives in the Worker)", async () => {
     const { handlers, shown } = setup();
     const { event, settle } = pushEvent({ v: 1, t: "Studio Mac", b: "Atlas: New message", url: "/d/dk1/monos/m7", tag: "s9" });
     handlers.push(event);
@@ -57,7 +57,7 @@ describe("push", () => {
     expect(shown[0]?.options.data).toEqual({ url: "/d/dk1/monos/m7" });
   });
 
-  it("carries the session URL of a habit run", async () => {
+  it("passes the session URL of a habit run through (the URL rule lives in the Worker)", async () => {
     const { handlers, shown } = setup();
     const { event, settle } = pushEvent({ v: 1, t: "Studio Mac", b: "Atlas: Finished", url: "/d/dk1/s/s9", tag: "s9" });
     handlers.push(event);

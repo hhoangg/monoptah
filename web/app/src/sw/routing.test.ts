@@ -23,8 +23,9 @@ describe("service worker routing config", () => {
     expect(isNeverCached(pathname)).toBe(true);
   });
 
-  it("has no runtime caching route, and none could match /api or /relay", () => {
+  it("has no runtime caching route; if one is ever added, none may match /api or /relay", () => {
     expect(RUNTIME_CACHE_ROUTES).toEqual([]);
+    // Guard for a future route: today the list is empty and this loop checks nothing.
     for (const route of RUNTIME_CACHE_ROUTES) {
       expect(route.pattern.test("/api/me")).toBe(false);
       expect(route.pattern.test("/relay/room")).toBe(false);

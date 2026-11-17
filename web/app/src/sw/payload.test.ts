@@ -37,6 +37,13 @@ describe("notificationFor", () => {
     expect(notificationFor(parsePushPayload(valid))).toEqual({ title: "Studio Mac", options: { body: "api: Finished", icon: NOTIFICATION_ICON, badge: NOTIFICATION_BADGE, tag: "s9", data: { url: "/d/dk1/s/s9" } } });
   });
 
+  it("falls back to the generic text for an empty title or body, so the notification is never blank", () => {
+    const spec = notificationFor({ v: 1, t: "", b: "", url: "/d/dk1/s/s9", tag: "s9" });
+    expect(spec.title).toBe(GENERIC_TITLE);
+    expect(spec.options.body).toBe(GENERIC_BODY);
+    expect(spec.options.data.url).toBe("/d/dk1/s/s9");
+  });
+
   it("shows a generic notice for an invalid payload", () => {
     expect(notificationFor(null)).toEqual({ title: GENERIC_TITLE, options: { body: GENERIC_BODY, icon: NOTIFICATION_ICON, badge: NOTIFICATION_BADGE, data: { url: "/" } } });
     expect(GENERIC_TITLE).toBe("Monoptah");

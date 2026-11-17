@@ -21,6 +21,21 @@ export function isPushSupported(): boolean {
   return typeof navigator !== "undefined" && "serviceWorker" in navigator && typeof PushManager !== "undefined" && typeof Notification !== "undefined";
 }
 
+/** How long to wait for a service worker before saying push is unavailable (registration failed or is blocked). */
+export const SW_READY_TIMEOUT_MS = 8000;
+
+async function serviceWorkerReady(timeoutMs: number = SW_READY_TIMEOUT_MS): Promise<ServiceWorkerRegistration> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new PushUnavailableError("unsupported")), timeoutMs);
+  });
+  try {
+    return await Promise.race([navigator.serviceWorker.ready, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function sameKey(a: ArrayBuffer | null, b: Uint8Array): boolean {
   if (!a) return false;
   const left = new Uint8Array(a);
@@ -37,7 +52,7 @@ export async function subscribeToPush(deviceId: string, userId: string): Promise
   if (!isPushSupported()) throw new PushUnavailableError("unsupported");
   if (Notification.permission !== "granted") throw new PushUnavailableError("permission");
 
-  const registration = await navigator.serviceWorker.ready;
+  const registration = await serviceWorkerReady();
   const vapid = await apiFetch(pushEndpoints.vapidKey);
   const applicationServerKey = fromBase64Url(vapid.publicKey);
 

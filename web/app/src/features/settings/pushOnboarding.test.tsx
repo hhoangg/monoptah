@@ -28,6 +28,7 @@ import { clearSlots } from "@/ui/slots";
 
 let restore: (() => void) | undefined;
 let requests: Array<{ method: string; url: string; body: unknown }> = [];
+let events: string[] = [];
 let requestPermission: ReturnType<typeof vi.fn<() => Promise<NotificationPermission>>>;
 
 let desktopIds: string[] = [];
@@ -37,6 +38,7 @@ function installApi() {
   desktopIds = state.desktops.map((desktop) => desktop.id);
   const server = createMockServer({ state });
   const transport: ApiTransport = (url, init) => {
+    events.push(`${init.method ?? "GET"} ${url}`);
     requests.push({ method: init.method ?? "GET", url, body: typeof init.body === "string" ? (JSON.parse(init.body) as unknown) : undefined });
     return server.transport(url, init);
   };
@@ -80,6 +82,7 @@ function mount(url: string) {
 beforeEach(() => {
   resetPushRotationCheck();
   requests = [];
+  events = [];
   window.localStorage.clear();
   push.getSavedPushSubscription.mockResolvedValue(null);
   push.isPushSupported.mockReturnValue(true);
@@ -166,9 +169,14 @@ describe("push onboarding (P-05)", () => {
 
   it("sign out unsubscribes before the session ends", async () => {
     const queryClient = createQueryClient();
+    push.unsubscribeFromPush.mockImplementationOnce(async () => {
+      events.push("unsubscribe");
+    });
     await signOut(queryClient);
     expect(push.unsubscribeFromPush).toHaveBeenCalledTimes(1);
-    expect(requests.some((r) => r.method === "POST" && r.url === "/api/auth/logout")).toBe(true);
+    // The subscription is removed while the session still works: before the logout request goes out.
+    expect(events.indexOf("unsubscribe")).toBeGreaterThanOrEqual(0);
+    expect(events.indexOf("unsubscribe")).toBeLessThan(events.indexOf("POST /api/auth/logout"));
   });
 
   const CATS = { agentFinished: false, agentInput: true, monoMessages: true };
