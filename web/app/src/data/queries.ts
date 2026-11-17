@@ -65,6 +65,8 @@ export function useLinkQuery<M extends MethodName>(
   options: Omit<UseQueryOptions<ResultOf<M>, LinkRequestError, ResultOf<M>, QueryKey>, "queryKey" | "queryFn"> = {},
 ) {
   const desktopId = useLinkDesktopId();
+  // The sync refetches this query when the link becomes `ready` after it failed with `not_ready`.
+  useLinkDataSync();
   return useQuery({ ...linkQueryOptions(desktopId, method, params), ...options });
 }
 

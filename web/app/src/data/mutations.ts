@@ -4,7 +4,8 @@
 // A mutation is NEVER re-sent by this layer: not after a reconnect, not by TanStack Query (`retry: 0`).
 import { useMutation } from "@tanstack/react-query";
 import type { MethodName, ParamsOf, ResultOf } from "@monoptah/protocol";
-import { randomBytes } from "@noble/hashes/utils.js";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex, randomBytes, utf8ToBytes } from "@noble/hashes/utils.js";
 import { useLinkConnection, type LinkRequestError } from "@/link";
 import type { LinkClient } from "./client.ts";
 
@@ -26,6 +27,14 @@ export function commandSignature(method: string, params: unknown): string {
   return stableStringify([method, params ?? {}]);
 }
 
+/**
+ * The key of the id table: SHA-256 (hex) of the signature. A `conversation.send` signature holds its base64
+ * attachments (up to 8 MiB each), so the table keeps 64 characters per entry, not the whole call.
+ */
+export function commandKey(method: string, params: unknown): string {
+  return bytesToHex(sha256(utf8ToBytes(commandSignature(method, params))));
+}
+
 /** A random command id: 32 lowercase hex characters (the desktop accepts at most 128). */
 export function makeCommandId(): string {
   return Array.from(randomBytes(16), (byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -41,9 +50,14 @@ export class Mutator {
     this.#makeId = makeId;
   }
 
+  /** The keys of the held ids (hashes, never the params). */
+  pendingKeys(): string[] {
+    return [...this.#ids.keys()];
+  }
+
   /** The command id currently held for this call, if a failure left one. */
   pendingId(method: string, params: unknown): string | undefined {
-    return this.#ids.get(commandSignature(method, params));
+    return this.#ids.get(commandKey(method, params));
   }
 
   /**
@@ -51,7 +65,7 @@ export class Mutator {
    * success and kept on failure, for a retry that the user starts.
    */
   async mutate<M extends MethodName>(method: M, params: ParamsOf<M>): Promise<ResultOf<M>> {
-    const signature = commandSignature(method, params);
+    const signature = commandKey(method, params);
     let id = this.#ids.get(signature);
     if (!id) {
       id = this.#makeId();

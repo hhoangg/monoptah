@@ -4,7 +4,7 @@
 //   to visible;
 // - after a reconnect (`resynced`) the catalog is invalidated and each open conversation is read again with
 //   `conversation.read` (the fallback of WorkspaceProvider.tsx:391-394); a mutation is never re-sent;
-// - the catalog is written through the persist adapter, and a `revoked` link clears the persisted cache.
+// - the catalog is written through the persist adapter, and a `revoked` link clears the persisted cache of that desktop only.
 import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
 import { useLinkConnection } from "@/link";
@@ -45,13 +45,33 @@ export function startLinkDataSync(client: LinkClient, queryClient: QueryClient, 
   });
 
   const clearForRevoked = (): void => {
-    void clearPersistedCache();
+    void clearPersistedCache(desktopId);
     queryClient.removeQueries({ queryKey: desktopKey(desktopId) });
   };
   if (client.store.getState().revoked) clearForRevoked();
 
+  // Link queries that mounted before the link was `ready` failed with `not_ready` (or never ran): fetch
+  // them now. Disabled queries (the conversation entries) are not "active" and are left alone; a fetch
+  // already in flight is not cancelled.
+  const refetchWaiting = (): void => {
+    void queryClient.refetchQueries(
+      {
+        type: "active",
+        predicate: (query) =>
+          query.queryKey[0] === "link" &&
+          query.queryKey[1] === desktopId &&
+          query.queryKey[2] !== "conversation" &&
+          (query.state.status === "error" || (query.state.status === "pending" && query.state.fetchStatus === "idle")),
+      },
+      { cancelRefetch: false, throwOnError: false },
+    );
+  };
+
   const unsubscribeStore = client.store.subscribe((state, previous) => {
-    if (state.status === "ready" && previous.status !== "ready") refreshCatalog();
+    if (state.status === "ready" && previous.status !== "ready") {
+      refreshCatalog();
+      refetchWaiting();
+    }
     if (state.revoked && !previous.revoked) clearForRevoked();
   });
 
@@ -68,9 +88,10 @@ export function startLinkDataSync(client: LinkClient, queryClient: QueryClient, 
     if (stopped) return;
     void queryClient.invalidateQueries({
       predicate: (query) => query.queryKey[0] === "link" && query.queryKey[1] === desktopId && CATALOG_METHODS.has(String(query.queryKey[2])),
-      refetchType: "none",
+      refetchType: "active",
     });
     refreshCatalog();
+    refetchWaiting();
     for (const watcher of openConversationWatchers(queryClient, desktopId)) watcher.read().catch(() => undefined);
   });
 
@@ -82,7 +103,10 @@ export function startLinkDataSync(client: LinkClient, queryClient: QueryClient, 
     }
   });
 
-  if (isReady()) refreshCatalog();
+  if (isReady()) {
+    refreshCatalog();
+    refetchWaiting();
+  }
 
   return () => {
     stopped = true;

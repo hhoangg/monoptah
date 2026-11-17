@@ -11,7 +11,7 @@ import { clearLinkStores } from "@/link/store.ts";
 import { RelayConnection } from "@/link/relay.ts";
 import { createQueryClient } from "@/lib/queryClient";
 import { useApprovals, useCloud, useConversation, type UseConversationResult } from "./conversation.ts";
-import { useCatalog } from "./queries.ts";
+import { useCatalog, useLinkQuery } from "./queries.ts";
 import { MemoryPersistAdapter, registerPersistAdapter, type PersistAdapter } from "./persist.ts";
 
 const DESKTOP_ID = "11111111-1111-4111-8111-111111111111";
@@ -32,10 +32,13 @@ function Screen({ id }: { id: string }) {
     conversation = current;
   });
   const catalog = useCatalog();
+  // Mounted while the link is still connecting: its first fetch fails with `not_ready` (I3).
+  const sessions = useLinkQuery("sessions.list", { projectId: "proj-alpha" });
   return (
     <div>
       <p data-testid="cloud">{cloud ? `${cloud.kind}:${cloud.state}:${cloud.startup?.current ?? ""}` : "none"}</p>
       <p data-testid="approvals">{approvals.map((a) => a.label).join("|") || "none"}</p>
+      <p data-testid="late">{sessions.status}</p>
       <p data-testid="sessions">{catalog.data ? String(catalog.data.sessions.length) : "no catalog"}</p>
     </div>
   );
@@ -107,6 +110,15 @@ afterEach(() => {
 });
 
 describe("typed hooks over the mock desktop", () => {
+  it("a useLinkQuery mounted before the link is ready fetches when it becomes ready (I3)", async () => {
+    const view = mount("sess-local-approval");
+    // The first fetch runs at mount, before the handshake is done, and fails with not_ready.
+    await settle();
+    await settle();
+    expect(getLinkConnection(DESKTOP_ID).status).toBe("ready");
+    expect(view.getByTestId("late")).toHaveTextContent("success");
+  });
+
   it("useApprovals shows the pending approval from the first frame and an empty array clears it; the catalog loads", async () => {
     const view = mount("sess-local-approval");
     await settle();
@@ -132,8 +144,16 @@ describe("typed hooks over the mock desktop", () => {
     expect(view.getByTestId("cloud")).toHaveTextContent("codespace:starting:buildContainer");
     while (desktop.advance("sess-codespace-starting")) await settle();
     expect(view.getByTestId("cloud")).toHaveTextContent("codespace:available:");
-    // A catalog refetch (no cloud field in a frame) does not touch it.
+    // A catalog refetch does not touch it.
     await settle(5_000);
+    expect(view.getByTestId("cloud")).toHaveTextContent("codespace:available:");
+    // A real watch frame without a `cloud` field (a new turn) keeps it too.
+    const turnsBefore = conversation!.state!.turns.length;
+    await act(async () => {
+      await getLinkConnection(DESKTOP_ID).request("conversation.send", { conversationId: "sess-codespace-starting", text: "a frame without cloud" });
+    });
+    await settle();
+    expect(conversation!.state!.turns.length).toBeGreaterThan(turnsBefore);
     expect(view.getByTestId("cloud")).toHaveTextContent("codespace:available:");
   });
 

@@ -51,4 +51,12 @@ describe("/ redirect", () => {
     await waitFor(() => expect(router.state.location.pathname).toBe("/d/dk1/s/s9"));
     expect((await screen.findByTestId("route-stub")).getAttribute("data-route")).toBe("/d/:desktopId/s/:sessionId");
   });
+
+  it("keeps the search and the hash of the last place (M9)", async () => {
+    registerLastPlaceResolver(() => "/d/dk1/s/s9?tab=files#top");
+    const router = renderAt("/");
+    await waitFor(() => expect(router.state.location.pathname).toBe("/d/dk1/s/s9"));
+    expect(router.state.location.searchStr).toBe("?tab=files");
+    expect(router.state.location.hash).toBe("top");
+  });
 });

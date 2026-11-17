@@ -6,6 +6,7 @@ import {
   PERSISTED_TURN_LIMIT,
   clearPersistedCache,
   getPersistAdapter,
+  keyBelongsToDesktop,
   loadPersistedCatalog,
   loadPersistedTurns,
   persistCatalog,
@@ -80,5 +81,21 @@ describe("persist adapter", () => {
       },
     });
     await expect(clearPersistedCache()).resolves.toBeUndefined();
+  });
+
+  it("clearPersistedCache(desktopId) removes only that desktop (M5)", async () => {
+    original = getPersistAdapter();
+    registerPersistAdapter(new MemoryPersistAdapter());
+    for (const id of ["dk1", "dk2"]) {
+      await persistCatalog(id, { projects: [id] });
+      await persistTurns(id, "s1", turns(2));
+    }
+    await clearPersistedCache("dk1");
+    expect(await loadPersistedCatalog("dk1")).toBeUndefined();
+    expect(await loadPersistedTurns("dk1", "s1")).toBeUndefined();
+    expect(await loadPersistedCatalog("dk2")).toEqual({ projects: ["dk2"] });
+    expect(await loadPersistedTurns("dk2", "s1")).toHaveLength(2);
+    expect(keyBelongsToDesktop("turns:dk1:s1", "dk1")).toBe(true);
+    expect(keyBelongsToDesktop("turns:dk10:s1", "dk1")).toBe(false);
   });
 });

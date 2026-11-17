@@ -58,11 +58,40 @@ export function countUserItems(turns: Turn[]): number {
   return count;
 }
 
-/** Drops optimistic turns whose message the transcript now holds. */
+/** Error codes that leave it unknown whether the desktop got the message (the reply may have been lost). */
+const AMBIGUOUS_ERRORS = new Set(["timeout", "session_ended"]);
+
+function userTexts(turns: Turn[]): string[] {
+  const texts: string[] = [];
+  for (const turn of turns) for (const item of turn.items) if (item.type === "user") texts.push(typeof item.text === "string" ? item.text.trim() : "");
+  return texts;
+}
+
+/**
+ * Drops optimistic turns whose message the transcript now holds.
+ * - `sending` and `sent`: confirmed once the transcript holds more user items than their baseline.
+ * - `not_sent`: never dropped by a later message. Only when the failure was ambiguous (`timeout`,
+ *   `session_ended`) and a user item after its baseline carries the same text (each transcript item
+ *   confirms one turn). A `not_sent` turn with an error that proves non-delivery (`not_ready`, `busy`, a
+ *   desktop error code) stays until the user retries it (and it succeeds) or dismisses it.
+ */
 export function reconcile(state: ConversationState): ConversationState {
   if (state.optimistic.length === 0) return state;
   const count = countUserItems(state.turns);
-  const kept = state.optimistic.filter((turn) => count <= turn.baseline);
+  const texts = userTexts(state.turns);
+  const used = new Set<number>();
+  const kept = state.optimistic.filter((turn) => {
+    if (turn.status !== "not_sent") return count <= turn.baseline;
+    if (!AMBIGUOUS_ERRORS.has(turn.error ?? "")) return true;
+    const wanted = turn.text.trim();
+    for (let index = Math.max(0, turn.baseline); index < texts.length; index += 1) {
+      if (!used.has(index) && texts[index] === wanted) {
+        used.add(index);
+        return false;
+      }
+    }
+    return true;
+  });
   return kept.length === state.optimistic.length ? state : { ...state, optimistic: kept };
 }
 

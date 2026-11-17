@@ -7,8 +7,21 @@ import type { Turn } from "@monoptah/protocol";
 export interface PersistAdapter {
   get(key: string): Promise<unknown | undefined>;
   set(key: string, value: unknown): Promise<void>;
-  /** Removes everything this adapter holds (all desktops). */
-  clear(): Promise<void>;
+  /**
+   * Removes what this adapter holds: with a `desktopId` only the entries of that desktop (a revoke of one
+   * desktop must not wipe the others), without it everything ("Forget this device").
+   *
+   * Contract for W-12: an entry belongs to a desktop when `keyBelongsToDesktop(key, desktopId)` is true,
+   * that is the second `:` separated segment of its key (`catalog:<id>`, `recent:<id>`,
+   * `turns:<id>:<conversation>`). An encrypted store keeps that segment readable (or indexes on it) so it
+   * can delete by desktop without decrypting.
+   */
+  clear(desktopId?: string): Promise<void>;
+}
+
+/** True when the persist key (`catalog:<id>`, `recent:<id>`, `turns:<id>:<conversation>`) belongs to the desktop. */
+export function keyBelongsToDesktop(key: string, desktopId: string): boolean {
+  return key.split(":")[1] === desktopId;
 }
 
 export class MemoryPersistAdapter implements PersistAdapter {
@@ -22,8 +35,12 @@ export class MemoryPersistAdapter implements PersistAdapter {
     this.#map.set(key, structuredClone(value));
   }
 
-  async clear(): Promise<void> {
-    this.#map.clear();
+  async clear(desktopId?: string): Promise<void> {
+    if (desktopId === undefined) {
+      this.#map.clear();
+      return;
+    }
+    for (const key of [...this.#map.keys()]) if (keyBelongsToDesktop(key, desktopId)) this.#map.delete(key);
   }
 }
 
@@ -40,10 +57,13 @@ export function getPersistAdapter(): PersistAdapter {
   return adapter;
 }
 
-/** "Forget this device" and the `revoked` state call this. Never throws: a failing store must not block them. */
-export async function clearPersistedCache(): Promise<void> {
+/**
+ * "Forget this device" (no argument: every desktop) and the `revoked` state of one desktop (with its id)
+ * call this. Never throws: a failing store must not block them.
+ */
+export async function clearPersistedCache(desktopId?: string): Promise<void> {
   try {
-    await adapter.clear();
+    await (desktopId === undefined ? adapter.clear() : adapter.clear(desktopId));
   } catch {
     // Nothing more to do; the caller is already leaving the desktop.
   }

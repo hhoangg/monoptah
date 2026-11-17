@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { FakeClient, requestError } from "./testing.ts";
-import { MAX_PENDING_COMMAND_IDS, Mutator, commandSignature, getMutator, stableStringify } from "./mutations.ts";
+import { MAX_PENDING_COMMAND_IDS, Mutator, commandKey, commandSignature, getMutator, stableStringify } from "./mutations.ts";
 
 function ids(): () => string {
   let n = 0;
@@ -53,5 +53,21 @@ describe("command ids per signature", () => {
     client.reconnect();
     client.setStatus("ready");
     expect(client.request).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("command id table keys (M12)", () => {
+  it("holds a SHA-256 of the signature, not the params with their attachments", async () => {
+    const client = new FakeClient();
+    const mutator = new Mutator(client.asClient(), ids());
+    const big = "A".repeat(1_000_000);
+    client.request.mockRejectedValueOnce(requestError("session_ended"));
+    const params = { conversationId: "c", text: "hi", attachments: [{ name: "a.png", mediaType: "image/png", data: big }] };
+    await expect(mutator.mutate("conversation.send", params as never)).rejects.toMatchObject({ code: "session_ended" });
+    const keys = mutator.pendingKeys();
+    expect(keys).toEqual([commandKey("conversation.send", params)]);
+    expect(keys[0]).toMatch(/^[0-9a-f]{64}$/);
+    expect(mutator.pendingId("conversation.send", params)).toBe("id1");
+    expect(commandKey("conversation.send", params)).not.toBe(commandKey("conversation.send", { ...params, text: "other" }));
   });
 });

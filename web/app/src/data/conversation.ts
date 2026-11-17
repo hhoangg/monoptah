@@ -113,6 +113,8 @@ export class ConversationWatcher {
 
   #save(): void {
     const state = this.state;
+    // A revoked desktop's data was wiped; never write it back (the adapter may be durable, W-12).
+    if (this.#client.store.getState().revoked) return;
     if (state && !state.cachedOnly && state.turns.length > 0) void persistTurns(this.#client.desktopId, this.conversationId, state.turns);
   }
 

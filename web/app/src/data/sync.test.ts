@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { QueryObserver } from "@tanstack/react-query";
 import { createQueryClient } from "@/lib/queryClient";
 import { catalogKey, conversationKey, desktopKey } from "./queries.ts";
 import { CATALOG_POLL_MS, acquireLinkDataSync, startLinkDataSync } from "./sync.ts";
 import { openConversation } from "./conversation.ts";
-import { MemoryPersistAdapter, loadPersistedCatalog, persistCatalog, registerPersistAdapter, type PersistAdapter } from "./persist.ts";
-import { FakeClient, flush } from "./testing.ts";
+import { MemoryPersistAdapter, loadPersistedCatalog, loadPersistedTurns, persistTurns, persistCatalog, registerPersistAdapter, type PersistAdapter } from "./persist.ts";
+import { FakeClient, flush, requestError } from "./testing.ts";
+import { linkQueryOptions } from "./queries.ts";
 
 let client: FakeClient;
 let queryClient: ReturnType<typeof createQueryClient>;
@@ -154,5 +156,50 @@ describe("persistence and revoked", () => {
     stop = startLinkDataSync(client.asClient(), queryClient);
     await flush();
     expect(await loadPersistedCatalog("dk1")).toBeUndefined();
+  });
+});
+
+describe("review fixes", () => {
+  it("a revoke wipes only the persisted data of that desktop (M5)", async () => {
+    await persistCatalog("dk1", catalog);
+    await persistCatalog("dk2", catalog);
+    await persistTurns("dk2", "s1", [{ id: "t", items: [] }]);
+    stop = startLinkDataSync(client.asClient(), queryClient);
+    client.store.setState({ revoked: true });
+    await flush();
+    expect(await loadPersistedCatalog("dk1")).toBeUndefined();
+    expect(await loadPersistedCatalog("dk2")).toEqual(catalog);
+    expect(await loadPersistedTurns("dk2", "s1")).toHaveLength(1);
+  });
+
+  it("a link query that failed with not_ready is fetched when the link becomes ready (I3)", async () => {
+    client.setStatus("connecting");
+    client.request.mockImplementation(async (method: string) => {
+      if (client.store.getState().status !== "ready") throw requestError("not_ready");
+      return method === "workspace.list" ? catalog : { sessions: [] };
+    });
+    stop = startLinkDataSync(client.asClient(), queryClient);
+    const options = linkQueryOptions("dk1", "sessions.list", { projectId: "p1" }, { connection: client.asClient() });
+    const observer = new QueryObserver(queryClient, options as never);
+    const unsubscribe = observer.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(observer.getCurrentResult().status).toBe("error");
+    client.setStatus("ready");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(observer.getCurrentResult().status).toBe("success");
+    unsubscribe();
+  });
+
+  it("after a resync the active catalog queries are refetched (M11)", async () => {
+    stop = startLinkDataSync(client.asClient(), queryClient);
+    const options = linkQueryOptions("dk1", "sessions.list", { projectId: "p1" }, { connection: client.asClient() });
+    const unsubscribe = new QueryObserver(queryClient, options as never).subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(0);
+    const calls = () => client.request.mock.calls.filter((call) => call[0] === "sessions.list").length;
+    expect(calls()).toBe(1);
+    client.reconnect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls()).toBe(2);
+    unsubscribe();
   });
 });

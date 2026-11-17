@@ -178,6 +178,44 @@ describe("optimistic turns", () => {
     expect(state().optimistic).toEqual([]);
   });
 
+  it("a later message landing does not drop a turn marked not_sent (I2)", async () => {
+    const w = watcher();
+    client.request.mockRejectedValueOnce(requestError("busy"));
+    await w.send("A");
+    expect(state().optimistic[0]).toMatchObject({ id: "pending:1", status: "not_sent", error: "busy" });
+    expect(await w.send("B")).toEqual({ sent: true });
+    client.frame({ order: ["u1"], turns: [user("u1", "B")] });
+    expect(state().optimistic).toMatchObject([{ id: "pending:1", text: "A", status: "not_sent" }]);
+    // A desktop message typed elsewhere does not drop it either.
+    client.frame({ order: ["u1", "u2"], turns: [user("u1", "B"), user("u2", "typed on the desktop")] });
+    expect(state().optimistic).toMatchObject([{ id: "pending:1", text: "A", status: "not_sent" }]);
+    // The user retries it and it lands.
+    expect(await w.retry("pending:1")).toEqual({ sent: true });
+    client.frame({ order: ["u1", "u2", "u3"], turns: [user("u1", "B"), user("u2", "typed on the desktop"), user("u3", "A")] });
+    expect(state().optimistic).toEqual([]);
+  });
+
+  it("an ambiguous not_sent turn is dropped only by a user item with its own text", async () => {
+    const w = watcher();
+    client.request.mockRejectedValueOnce(requestError("timeout"));
+    await w.send("maybe arrived");
+    client.frame({ order: ["u1"], turns: [user("u1", "something else")] });
+    expect(state().optimistic).toHaveLength(1);
+    client.frame({ order: ["u1", "u2"], turns: [user("u1", "something else"), user("u2", "maybe arrived")] });
+    expect(state().optimistic).toEqual([]);
+  });
+
+  it("stop writes nothing for a revoked desktop (L11)", async () => {
+    const adapter = new MemoryPersistAdapter();
+    registerPersistAdapter(adapter);
+    const w = watcher();
+    client.frame({ order: ["a"], turns: [text("a", "one")] });
+    client.store.setState({ revoked: true });
+    w.stop();
+    await flush();
+    expect(await loadPersistedTurns("dk1", "c1")).toBeUndefined();
+  });
+
   it("retry only works for a not_sent turn", async () => {
     const w = watcher();
     expect(await w.retry("pending:9")).toEqual({ sent: false, error: "nothing_to_retry" });
