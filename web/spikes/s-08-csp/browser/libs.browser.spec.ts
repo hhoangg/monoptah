@@ -1,9 +1,10 @@
 // S-08: each library of the stub app under the exact CSP and Trusted Types policy. Every test records
 // the violations it saw (evidence under /tmp/evidence/ws-q/browser/s08) so the FINDINGS table is data.
 import { expect, test, type Page } from "@playwright/test";
+import { readdirSync, readFileSync } from "node:fs";
 import { collect, record, summarize, server } from "./helpers";
 
-type Lib = "shiki" | "query" | "motion" | "sonner" | "vaul" | "router" | "workbox";
+type Lib = "markdown" | "shiki" | "query" | "motion" | "sonner" | "vaul" | "router" | "workbox";
 
 async function drive(page: Page, lib: Lib): Promise<Record<string, unknown>> {
   const facts: Record<string, unknown> = {};
@@ -12,7 +13,17 @@ async function drive(page: Page, lib: Lib): Promise<Record<string, unknown>> {
       await expect(page.getByTestId("shiki").locator("span").first()).toBeVisible();
       facts["spans"] = await page.getByTestId("shiki").locator("span").count();
       facts["firstSpanColor"] = await page.getByTestId("shiki").locator("span").first().evaluate((e) => getComputedStyle(e).color);
+      expect(facts["firstSpanColor"]).toMatch(/^rgb\(\d+, \d+, \d+\)$/);
+      expect(facts["firstSpanColor"]).not.toBe(await page.getByTestId("shiki").evaluate((e) => getComputedStyle(e).color));
       break;
+    case "markdown": {
+      const md = page.getByTestId("markdown");
+      await expect(md).toContainText("<img src=x onerror=alert(1)>");
+      expect(await md.locator("img, b").count()).toBe(0);
+      expect(await md.locator("a").count()).toBe(1);
+      expect(await md.locator("a").getAttribute("href")).toBe("https://example.com/");
+      break;
+    }
     case "query":
       await expect(page.getByTestId("query")).toHaveText("query:world");
       break;
@@ -73,7 +84,7 @@ async function drive(page: Page, lib: Lib): Promise<Record<string, unknown>> {
   return facts;
 }
 
-const LIBS: Lib[] = ["shiki", "query", "motion", "sonner", "vaul", "router", "workbox"];
+const LIBS: Lib[] = ["markdown", "shiki", "query", "motion", "sonner", "vaul", "workbox", "router"];
 
 for (const lib of LIBS) {
   test(`patched build, exact CSP: ${lib} has no violation`, async ({ page, browserName }, info) => {
@@ -90,27 +101,89 @@ for (const lib of LIBS) {
 test("patched build, exact CSP: every library in one session, no violation", async ({ page, browserName }, info) => {
   const get = await collect(page);
   await page.goto(`${server(browserName, "exact")}/`);
-  for (const lib of ["shiki", "query", "motion", "sonner", "vaul", "workbox", "router"] as const) await drive(page, lib);
+  for (const lib of LIBS) await drive(page, lib);
   const c = await get();
   record(info, "exact-all", c);
   expect(summarize(c)).toEqual([]);
   expect(c.console).toEqual([]);
 });
 
-// Variants: observation only. The recorded JSON feeds FINDINGS.md.
-for (const [variant, key] of [["no-style-attr", "noStyleAttr"], ["raw-unpatched", "raw"]] as const) {
-  for (const lib of LIBS) {
-    test(`${variant}: ${lib} (recorded)`, async ({ page, browserName }, info) => {
-      const get = await collect(page);
-      await page.goto(`${server(browserName, key)}/`);
-      let outcome = "functional";
-      let facts: Record<string, unknown> = {};
-      try { facts = await drive(page, lib); } catch (e) { outcome = `assertion failed: ${(e as Error).message.split("\n")[0]}`; }
-      const c = await get();
-      record(info, `${variant}-${lib}`, { lib, variant, outcome, facts, violations: summarize(c), console: c.console });
-    });
-  }
+// Variant without style-src-attr: the served header is asserted, every library is driven with zero
+// violations, and the positive control below proves the directive is what would block style attributes.
+for (const lib of LIBS) {
+  test(`no style-src-attr variant: ${lib} works with zero violations`, async ({ page, browserName }, info) => {
+    const get = await collect(page);
+    const resp = await page.goto(`${server(browserName, "noStyleAttr")}/`);
+    const csp = resp!.headers()["content-security-policy"]!;
+    expect(csp).not.toContain("style-src-attr");
+    expect(csp).not.toContain("unsafe-inline");
+    expect(csp).toContain("style-src 'self'");
+    const facts = await drive(page, lib);
+    const c = await get();
+    record(info, `no-style-attr-${lib}`, { lib, facts, ...c });
+    expect(summarize(c)).toEqual([]);
+    expect(c.console).toEqual([]);
+  });
 }
+
+test("positive control: HTML and script-set style attributes are blocked without style-src-attr and allowed with it", async ({ page, browserName }, info) => {
+  const red = "rgb(255, 0, 0)";
+  const outcome: Record<string, unknown> = {};
+  for (const variant of ["exact", "noStyleAttr"] as const) {
+    const fresh = await page.context().newPage();
+    const get = await collect(fresh);
+    const resp = await fresh.goto(`${server(browserName, variant)}/__probe-style.html`);
+    expect(resp!.headers()["content-security-policy"]!.includes("style-src-attr 'unsafe-inline'")).toBe(variant === "exact");
+    await fresh.waitForTimeout(300);
+    const colors = await fresh.evaluate(() => ({
+      parsed: getComputedStyle(document.getElementById("parsed")!).color,
+      scripted: getComputedStyle(document.getElementById("scripted")!).color,
+    }));
+    const c = await get();
+    outcome[variant] = { colors, violations: summarize(c) };
+    if (variant === "exact") {
+      expect(colors).toEqual({ parsed: red, scripted: red });
+      expect(c.violations).toEqual([]);
+    } else {
+      expect(colors.parsed).not.toBe(red);
+      expect(colors.scripted).not.toBe(red);
+      expect(c.violations.length).toBeGreaterThanOrEqual(2);
+      expect(c.violations.every((v) => v.directive.startsWith("style-src"))).toBe(true);
+    }
+    await fresh.close();
+  }
+  record(info, "style-attr-control", outcome);
+});
+
+// Unpatched build: the patches are necessary (violation at load, library visibly broken).
+for (const lib of LIBS) {
+  test(`raw unpatched build: ${lib} page has the runtime <style> violation`, async ({ page, browserName }, info) => {
+    const get = await collect(page);
+    await page.goto(`${server(browserName, "raw")}/`);
+    if (lib === "sonner") {
+      await page.getByTestId("toast-btn").click();
+      await expect(page.getByText("Hello toast")).toBeVisible();
+      expect(await page.locator("[data-sonner-toaster]").evaluate((e) => getComputedStyle(e).position)).toBe("static");
+    }
+    if (lib === "vaul") {
+      await page.getByTestId("drawer-open").click();
+      await expect(page.getByTestId("drawer")).toBeVisible();
+      expect(await page.getByTestId("drawer").evaluate((e) => getComputedStyle(e).touchAction)).toBe("auto");
+    }
+    const c = await get();
+    record(info, `raw-unpatched-${lib}`, { lib, violations: summarize(c), console: c.console });
+    expect(c.violations.some((v) => v.directive === "style-src-elem" && v.blocked === "inline")).toBe(true);
+  });
+}
+
+test("build output: patched assets never inject a <style> element at runtime, the raw build does", () => {
+  const scan = (dir: string) => readdirSync(dir).filter((f) => f.endsWith(".js")).map((f) => readFileSync(`${dir}/${f}`, "utf8"));
+  const root = new URL("../app/dist/", import.meta.url).pathname;
+  // Same pattern as RUNTIME_STYLE in app/vite.config.ts (library-style runtime injection; React DOM's unused path excluded).
+  const re = /createElement\(["'`]style["'`]\)\s*[;,]\s*\w+\.type\s*=\s*["'`]text\/css/;
+  expect(scan(`${root}patched/assets`).some((s) => re.test(s))).toBe(false);
+  expect(scan(`${root}raw/assets`).some((s) => re.test(s))).toBe(true);
+});
 
 test("Trusted Types default policy refuses HTML and script sinks", async ({ page, browserName }, info) => {
   const get = await collect(page);
@@ -126,11 +199,10 @@ test("Trusted Types default policy refuses HTML and script sinks", async ({ page
   });
   const c = await get();
   record(info, "tt-sinks", { r, ...c });
-  if (r["trustedTypesApi"] === "true") {
-    expect(r["setHTMLUnsafe"]).toContain("HTML sinks are disabled");
-    expect(r["scriptSrcOffOrigin"]).toContain("Blocked script URL");
-    expect(r["scriptSrcAppAsset"]).toBe("allowed");
-  }
+  expect(r["trustedTypesApi"]).toBe("true");
+  expect(r["setHTMLUnsafe"]).toContain("HTML sinks are disabled");
+  expect(r["scriptSrcOffOrigin"]).toContain("Blocked script URL");
+  expect(r["scriptSrcAppAsset"]).toBe("allowed");
 });
 
 test("code-string sinks (eval, new Function, setTimeout string) are refused for page scripts", async ({ page, browserName }, info) => {
@@ -139,9 +211,10 @@ test("code-string sinks (eval, new Function, setTimeout string) are refused for 
   const probe = await page.evaluate(() => (window as unknown as { __probe: Record<string, string> }).__probe);
   const c = await get();
   record(info, "code-string-sinks", { probe, ...c });
-  expect(probe["eval"]).not.toBe("allowed");
-  expect(probe["new Function"]).not.toBe("allowed");
-  expect(probe["setTimeout string"]).not.toBe("allowed");
+  const sinks = ["eval", "new Function", "setTimeout string", "innerHTML", "insertAdjacentHTML", "createContextualFragment",
+    "DOMParser.parseFromString", "script.textContent", "script.src offsite", "iframe.srcdoc", "new Worker offsite"];
+  expect(Object.keys(probe).sort()).toEqual([...sinks].sort());
+  for (const s of sinks) expect(probe[s], s).not.toBe("allowed");
 });
 
 test("upgrade-insecure-requests on http://localhost (recorded)", async ({ page, browserName }, info) => {
@@ -164,7 +237,7 @@ test.describe("exact CSP over https (self-signed, the production shape)", () => 
   test("every library except the service worker, upgrade-insecure-requests active, no violation", async ({ page, browserName }, info) => {
     const get = await collect(page);
     await page.goto("https://localhost:4186/");
-    for (const lib of ["shiki", "query", "motion", "sonner", "vaul", "router"] as const) await drive(page, lib);
+    for (const lib of LIBS.filter((l) => l !== "workbox")) await drive(page, lib);
     const c = await get();
     record(info, "https-exact-all", { ...c, browserName });
     expect(summarize(c)).toEqual([]);
@@ -175,7 +248,7 @@ test.describe("exact CSP over https (self-signed, the production shape)", () => 
 test("control: no CSP at all, every library works (isolates browser quirks from CSP effects)", async ({ page }, info) => {
   const get = await collect(page);
   await page.goto("http://localhost:4187/");
-  for (const lib of ["shiki", "query", "motion", "sonner", "vaul", "router"] as const) await drive(page, lib);
+  for (const lib of LIBS.filter((l) => l !== "workbox")) await drive(page, lib);
   const c = await get();
   record(info, "control-no-csp", c);
   expect(c.violations).toEqual([]);

@@ -41,8 +41,8 @@ test("WebCrypto availability matrix", async ({ page, browser, browserName }, inf
   const m = await api(page).matrix();
   save(info.project.name, "matrix", { browser: `${browser.browserType().name()} ${browser.version()}`, ...m });
   expect(m["secureContext"]).toBe("true");
-  expect(m["AES-GCM encrypt/decrypt"]).toBe("ok");
-  expect(m["ECDH P-256 deriveBits"]).toBe("ok");
+  // Every row reported in FINDINGS.md: all four are available on all three desktop engines.
+  for (const row of ["X25519 deriveBits", "Ed25519 sign/verify", "AES-GCM encrypt/decrypt", "ECDH P-256 deriveBits"]) expect(m[row], row).toBe("ok");
 });
 
 test("wrapped X25519 key: round trip, reload, never stored in clear, AES key not exportable", async ({ page, browserName }, info) => {

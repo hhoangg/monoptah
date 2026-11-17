@@ -3,6 +3,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import type { Page } from "@playwright/test";
+import type { Actor } from "./actor.ts";
 import {
   decideDevicesProbe,
   decideHeadlessProbe,
@@ -13,10 +14,17 @@ import {
   type HeadlessCapabilities,
   type PageSnapshot,
   type Probe,
+  type ProbeAnswer,
 } from "./pure.ts";
 import { repoDir } from "./paths.ts";
 
-async function statusOf(origin: string, path: string, ip: string): Promise<number | null> {
+function answerOf(status: number, body: unknown): ProbeAnswer {
+  const code = typeof body === "object" && body !== null && typeof (body as { code?: unknown }).code === "string" ? (body as { code: string }).code : null;
+  return { status, code };
+}
+
+/** Public desktop route: no Origin, no cookie, as the desktop app calls it. */
+async function publicAnswer(origin: string, path: string, ip: string): Promise<ProbeAnswer | null> {
   try {
     const res = await fetch(`${origin}${path}`, {
       method: "POST",
@@ -24,18 +32,26 @@ async function statusOf(origin: string, path: string, ip: string): Promise<numbe
       body: "{}",
       signal: AbortSignal.timeout(10_000),
     });
-    return res.status;
+    return answerOf(res.status, await res.json().catch(() => null));
   } catch {
     return null;
   }
 }
 
+/** Throws (fails the test) when the Worker does not answer; skips only on a real "not implemented". */
 export async function probePairing(origin: string): Promise<Probe> {
-  return decidePairingProbe(await statusOf(origin, "/api/pair/start", "198.51.100.240"));
+  return decidePairingProbe(await publicAnswer(origin, "/api/pair/start", "198.51.100.240"));
 }
 
-export async function probeDevices(origin: string): Promise<Probe> {
-  return decideDevicesProbe(await statusOf(origin, "/api/devices", "198.51.100.241"));
+/** `/api/devices` is a session route: the probe goes through an actor with a session (page Origin, CSRF, cookie). */
+export async function probeDevices(actor: Actor): Promise<Probe> {
+  try {
+    const res = await actor.call("POST", "/api/devices", { body: {} });
+    return decideDevicesProbe(answerOf(res.status, res.json));
+  } catch (err) {
+    if (err instanceof Error && err.message.startsWith("device probe")) throw err;
+    return decideDevicesProbe(null);
+  }
 }
 
 export const headlessBin = (): string => resolveHeadlessBin(repoDir);
@@ -53,15 +69,26 @@ export function probeHeadless(): Probe {
 
 /** Looks at one route of the served app. The page must already be on the worker origin. */
 export async function probeUi(page: Page, route: string): Promise<Probe> {
+  const pageErrors: string[] = [];
+  page.on("pageerror", (err) => pageErrors.push(err.message));
   await page.goto(route, { waitUntil: "load" });
-  const snapshot: PageSnapshot = await page
-    .waitForSelector("[data-testid=route-stub]", { timeout: 3000 })
-    .then(() => true, () => false)
-    .then((hasRouteStub) =>
-      page.evaluate((hasRouteStub) => {
-        const root = document.getElementById("root");
-        return { hasRoot: root !== null, hasRouteStub, rootHasContent: root !== null && root.childElementCount > 0 };
-      }, hasRouteStub),
-    );
+  // Wait for the app to render something, the stub, or the placeholder; a boot crash shows none of them.
+  await page
+    .waitForFunction(
+      () => document.querySelector("#root > *") !== null || (document.body.textContent ?? "").includes("web placeholder"),
+      undefined,
+      { timeout: 10_000 },
+    )
+    .catch(() => undefined);
+  const snapshot: PageSnapshot = await page.evaluate((pageErrors) => {
+    const root = document.getElementById("root");
+    return {
+      isPlaceholder: root === null && (document.body.textContent ?? "").includes("web placeholder"),
+      hasRoot: root !== null,
+      hasRouteStub: document.querySelector("[data-testid=route-stub]") !== null,
+      rootHasContent: root !== null && root.childElementCount > 0,
+      pageErrors,
+    };
+  }, pageErrors);
   return decideUiProbe(snapshot);
 }

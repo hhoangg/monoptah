@@ -181,7 +181,7 @@ export function defineWebPushSuite(runtime: string, now: () => number): void {
       expect(retryDelaySeconds(1, 600)).toBe(600);
     });
 
-    it("measures the time of one send (encrypt + sign) in this runtime", async () => {
+    it("measure: one send (encrypt + sign) in this runtime stays far under the 10 ms free cap", async () => {
       const ua = (await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"])) as CryptoKeyPair;
       const subscription = {
         endpoint: "https://fcm.googleapis.com/fcm/send/obviously-fake-id",
@@ -208,7 +208,10 @@ export function defineWebPushSuite(runtime: string, now: () => number): void {
       samples.sort((a, b) => a - b);
       const mean = samples.reduce((s, v) => s + v, 0) / n;
       console.log(`S06-TIMING ${runtime} ${JSON.stringify({ n, meanMs: mean, p95Ms: samples[Math.floor(n * 0.95)], maxMs: samples[n - 1], batchMeanMs: batchMean })}`);
-      expect(samples.length).toBe(n);
+      // A sanity bound against the 10 ms free CPU cap (local, not production); the numbers go to FINDINGS.md.
+      expect(mean).toBeGreaterThanOrEqual(0);
+      expect(mean).toBeLessThan(10);
+      expect(batchMean).toBeLessThan(10);
     });
   });
 }

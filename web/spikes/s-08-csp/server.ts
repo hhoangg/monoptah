@@ -36,11 +36,18 @@ for (const [name, fn] of [
   try { fn(); window.__probe[name] = "allowed"; } catch (e) { window.__probe[name] = e.name + ": " + e.message.slice(0, 80); }
 }`;
 
+/** `replace` that throws when nothing changed, so a reformatted `buildCsp` cannot turn a variant into a no-op. */
+function mustChange(csp: string, from: string, to: string): string {
+  const out = csp.replace(from, to);
+  if (out === csp) throw new Error(`CSP variant: "${from}" not found in buildCsp output`);
+  return out;
+}
+
 /** The CSP for a request host, with the variant tweaks the spike needs. */
 export function cspFor(host: string, v: string): string {
   let csp = buildCsp(host);
-  if (v.includes("no-style-attr")) csp = csp.replace("style-src-attr 'unsafe-inline'; ", "");
-  if (v.endsWith("no-uir")) csp = csp.replace("; upgrade-insecure-requests", "");
+  if (v.includes("no-style-attr")) csp = mustChange(csp, "style-src-attr 'unsafe-inline'; ", "");
+  if (v.endsWith("no-uir")) csp = mustChange(csp, "; upgrade-insecure-requests", "");
   return csp;
 }
 
@@ -59,6 +66,17 @@ export function startServer(dirArg: string, port: number, variant: string, tls?:
   if (url.pathname === "/__probe.html") {
     res.writeHead(200, { ...headers, "Content-Type": MIME[".html"]! });
     res.end('<!doctype html><title>probe</title><script src="/__probe.js"></script>');
+    return;
+  }
+  if (url.pathname === "/__probe-style.html") {
+    // Positive control for style-src-attr: an HTML style attribute and a script-set style attribute.
+    res.writeHead(200, { ...headers, "Content-Type": MIME[".html"]! });
+    res.end('<!doctype html><title>probe</title><div id="parsed" style="color: rgb(255, 0, 0)">parsed</div><div id="scripted">scripted</div><script src="/__probe-style.js"></script>');
+    return;
+  }
+  if (url.pathname === "/__probe-style.js") {
+    res.writeHead(200, { ...headers, "Content-Type": MIME[".js"]! });
+    res.end('document.getElementById("scripted").setAttribute("style", "color: rgb(255, 0, 0)");');
     return;
   }
   if (url.pathname === "/__probe.js") {

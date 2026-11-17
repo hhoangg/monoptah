@@ -3,6 +3,7 @@ import {
   base64urlDecode,
   base64urlEncode,
   decideDevicesProbe,
+  decideRouteProbe,
   decideHeadlessProbe,
   decidePairingProbe,
   decideUiProbe,
@@ -79,19 +80,28 @@ describe("outputDir", () => {
 });
 
 describe("probe decisions", () => {
-  it("pairing: 501, 404 and no answer skip; anything else runs", () => {
-    for (const status of [501, 404, null]) {
-      const probe = decidePairingProbe(status);
+  const unsupported = { status: 501, code: "unsupported" };
+  it("pairing: only 501 unsupported and 404 skip; validation and success run", () => {
+    for (const answer of [unsupported, { status: 404, code: null }]) {
+      const probe = decidePairingProbe(answer);
       expect(probe.run).toBe(false);
       expect(probe.reason).toContain("TODO(E-01:WS-R R-03)");
     }
-    expect(decidePairingProbe(400).run).toBe(true);
-    expect(decidePairingProbe(200).run).toBe(true);
+    expect(decidePairingProbe({ status: 400, code: "invalid" }).run).toBe(true);
+    expect(decidePairingProbe({ status: 200, code: null }).run).toBe(true);
   });
-  it("devices: same rule with the R-04 marker", () => {
-    expect(decideDevicesProbe(501)).toMatchObject({ run: false });
-    expect(decideDevicesProbe(501).reason).toContain("TODO(E-01:WS-R R-04)");
-    expect(decideDevicesProbe(401).run).toBe(true);
+  it("devices: same rule with the R-04 marker; 403 bad_origin is never 'present'", () => {
+    expect(decideDevicesProbe(unsupported)).toMatchObject({ run: false });
+    expect(decideDevicesProbe(unsupported).reason).toContain("TODO(E-01:WS-R R-04)");
+    expect(() => decideDevicesProbe({ status: 403, code: "bad_origin" })).toThrow(/unexpected answer/);
+    expect(decideDevicesProbe({ status: 400, code: "invalid" }).run).toBe(true);
+  });
+  it("a 501 without the unsupported code, a 5xx, a 429 and no answer all fail the probe", () => {
+    expect(() => decideRouteProbe("x", "TODO", "POST /x", { status: 501, code: "other" })).toThrow();
+    expect(() => decideRouteProbe("x", "TODO", "POST /x", { status: 500, code: null })).toThrow();
+    expect(() => decideRouteProbe("x", "TODO", "POST /x", { status: 429, code: "rate_limited" })).toThrow();
+    expect(() => decidePairingProbe(null)).toThrow(/no answer/);
+    expect(() => decideDevicesProbe(null)).toThrow(/no answer/);
   });
   it("headless: needs the binary and serve=true", () => {
     const caps = { version: 1, serve: true, reason: null, checkVectors: true };
@@ -101,11 +111,15 @@ describe("probe decisions", () => {
     expect(decideHeadlessProbe(true, caps).run).toBe(true);
     expect(decideHeadlessProbe(false, null).reason).toContain("TODO(E-01:WS-D1 R-05)");
   });
-  it("ui: stub or placeholder skips, a rendered app runs", () => {
-    expect(decideUiProbe({ hasRoot: true, hasRouteStub: true, rootHasContent: true }).run).toBe(false);
-    expect(decideUiProbe({ hasRoot: false, hasRouteStub: false, rootHasContent: false }).run).toBe(false);
-    expect(decideUiProbe({ hasRoot: true, hasRouteStub: false, rootHasContent: false }).run).toBe(false);
-    expect(decideUiProbe({ hasRoot: true, hasRouteStub: false, rootHasContent: true }).run).toBe(true);
-    expect(decideUiProbe({ hasRoot: true, hasRouteStub: true, rootHasContent: true }).reason).toContain("TODO(E-01:WS-S W-02)");
+  const page = { isPlaceholder: false, hasRoot: true, hasRouteStub: false, rootHasContent: true, pageErrors: [] as string[] };
+  it("ui: RouteStub and the placeholder skip, a rendered app runs", () => {
+    expect(decideUiProbe({ ...page, hasRouteStub: true }).run).toBe(false);
+    expect(decideUiProbe({ ...page, hasRouteStub: true }).reason).toContain("TODO(E-01:WS-S W-02)");
+    expect(decideUiProbe({ ...page, isPlaceholder: true, hasRoot: false, rootHasContent: false }).run).toBe(false);
+    expect(decideUiProbe(page).run).toBe(true);
+  });
+  it("ui: a served app that renders nothing fails with the page errors", () => {
+    expect(() => decideUiProbe({ ...page, rootHasContent: false, pageErrors: ["boom"] })).toThrow(/boom/);
+    expect(() => decideUiProbe({ ...page, hasRoot: false, rootHasContent: false })).toThrow(/neither RouteStub/);
   });
 });

@@ -5,9 +5,11 @@
 //
 // Usage (Node 24):
 //   node replay.ts [--url ws://host:port] [--rate 2] [--duration-s 1800] [--ping-s 30] [--devices 2]
-//                  [--device-req-per-min 10] [--seed 1] [--out result.json]
+//                  [--device-req-per-min 10] [--seed 1] [--trace trace.json] [--out result.json]
+// --trace replays a RECORDED stream instead of the synthetic one: a JSON array of {"atMs": number, "size": number}
+// (frame offset from the start in ms, outer frame bytes). See FINDINGS.md "Synthetic stream" for how to record one.
 // Without --url it starts `wrangler dev --local` for the S-07 spike on a free port and stops it at the end.
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildFrame } from "../s-07-hibernation/src/frame.ts";
@@ -29,6 +31,7 @@ const reqPerMin = Number(opt("device-req-per-min", "10"));
 const seed = Number(opt("seed", "1"));
 const outFile = opt("out", "");
 const urlArg = opt("url", "");
+const traceFile = opt("trace", "");
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -88,7 +91,8 @@ async function main(): Promise<void> {
     // Event list: watch frames (desktop to every device), device requests, pings (every socket).
     type Ev = { atMs: number; run: () => void };
     const events: Ev[] = [];
-    for (const f of buildSchedule(rate, durationS, seed)) {
+    const schedule = traceFile ? (JSON.parse(readFileSync(traceFile, "utf8")) as { atMs: number; size: number }[]) : buildSchedule(rate, durationS, seed);
+    for (const f of schedule) {
       events.push({
         atMs: f.atMs,
         run: () => {
@@ -142,7 +146,7 @@ async function main(): Promise<void> {
       m.reduce((acc, c) => ({ frames: acc.frames + c.total().frames, bytes: acc.bytes + c.total().bytes, messages: acc.messages + c.total().messages }), { frames: 0, bytes: 0, messages: 0 });
     const incomingAtDo = desktopSent.total().frames + totals(deviceSent).frames;
     const result = {
-      params: { rate, durationS, pingS, nDevices, reqPerMin, seed },
+      params: { rate, durationS, pingS, nDevices, reqPerMin, seed, trace: traceFile || null, synthetic: !traceFile },
       desktopSent: desktopSent.total(),
       desktopRecv: desktopRecv.total(),
       devicesSent: totals(deviceSent),

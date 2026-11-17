@@ -1,6 +1,6 @@
 // The accounts flows through the UI pages. Skipped while the routes render RouteStub (WS-S W-02); the probe turns
 // each test on when the real page is served. The bodies drive the pages by role and label, as the UI spec names them.
-import { bootstrapInvite } from "../lib/env.ts";
+import { namedInvite } from "../lib/env.ts";
 import { test, expect } from "../lib/fixtures.ts";
 import { probeUi } from "../lib/probes.ts";
 
@@ -15,7 +15,13 @@ test.describe("UI pages (E-01)", () => {
       test.skip(!probe.run, probe.reason);
 
       if (route === "/register") {
-        await actor.page.goto(`/register#invite=${bootstrapInvite()}`);
+        // The bootstrap invites are spent by the API specs: an admin of its own (API-registered with its own
+        // bootstrap invite) creates the invite this page registers with.
+        const admin = await newActor();
+        expect((await admin.register(namedInvite("ui"), "e2euiowner")).status).toBe(200);
+        const invite = await admin.call("POST", "/api/invites", { body: {} });
+        expect(invite.status).toBe(201);
+        await actor.page.goto(`/register#invite=${invite.json["code"]}`);
         await actor.page.getByLabel(/handle/i).fill("e2euiadmin");
         await actor.page.getByRole("button", { name: /create|register|passkey/i }).click();
         await expect(actor.page.getByText(/recovery/i).first()).toBeVisible();

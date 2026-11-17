@@ -6,7 +6,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { origin, pairingInvite } from "../lib/env.ts";
+import { namedInvite, origin } from "../lib/env.ts";
 import { test, expect } from "../lib/fixtures.ts";
 import { headlessBin, probeDevices, probeHeadless, probePairing } from "../lib/probes.ts";
 import { base64urlEncode } from "../lib/pure.ts";
@@ -21,7 +21,7 @@ test.describe.serial("pair the headless desktop (E-01)", () => {
 
     // Own account from the second bootstrap invite (the first one is used by accounts.spec.ts).
     const owner = await newActor();
-    const verify = await owner.register(pairingInvite(), "e2epair");
+    const verify = await owner.register(namedInvite("pairing"), "e2epair");
     expect(verify.status).toBe(200);
 
     // Desktop side (device authorization, architecture.md 6.4), played from Node: start, then poll after approval.
@@ -66,12 +66,14 @@ test.describe.serial("pair the headless desktop (E-01)", () => {
   });
 
   test("TODO(E-01:WS-R R-04, WS-S W-02) confirm a device and read a catalog", async ({ newActor }) => {
-    const devices = await probeDevices(origin());
     const headless = probeHeadless();
+    // `/api/devices` needs a session, so the probe runs as a registered account of its own.
+    const actor = await newActor();
+    expect((await actor.register(namedInvite("devices"), "e2edevices")).status).toBe(200);
+    const devices = await probeDevices(actor);
     const reason = [devices, headless].filter((p) => !p.run).map((p) => p.reason).join("; ");
     if (reason) console.log(`skip reason: ${reason}`);
     test.skip(reason !== "", reason);
-    await newActor();
     // The device half needs the browser link client (device key, Noise handshake over /relay, workspace.list) of the
     // built app. Fill this in with the link client's entry point when WS-S ships it; until then fail loudly instead
     // of passing without reading a catalog.

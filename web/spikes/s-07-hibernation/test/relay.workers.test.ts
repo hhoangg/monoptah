@@ -36,6 +36,7 @@ function inbox(ws: WebSocket) {
   const queue: (string | ArrayBuffer)[] = [];
   const waiters: ((v: string | ArrayBuffer) => void)[] = [];
   let closed: { code: number } | null = null;
+  const closeWaiters: ((c: { code: number }) => void)[] = [];
   ws.addEventListener("message", (e) => {
     const w = waiters.shift();
     if (w) w(e.data as string | ArrayBuffer);
@@ -43,6 +44,7 @@ function inbox(ws: WebSocket) {
   });
   ws.addEventListener("close", (e) => {
     closed = { code: e.code };
+    for (const w of closeWaiters.splice(0)) w(closed);
   });
   return {
     next: (ms = 3000) =>
@@ -57,6 +59,16 @@ function inbox(ws: WebSocket) {
       }),
     pending: () => queue.length,
     closed: () => closed,
+    /** Resolves with the close event's code; generous timeout, no timing assumption about the server. */
+    whenClosed: (ms = 15_000) =>
+      new Promise<{ code: number }>((resolve, reject) => {
+        if (closed) return resolve(closed);
+        const t = setTimeout(() => reject(new Error("timeout waiting for close")), ms);
+        closeWaiters.push((c) => {
+          clearTimeout(t);
+          resolve(c);
+        });
+      }),
   };
 }
 
@@ -118,8 +130,7 @@ describe("S-07 relay prototype in workerd", () => {
 
     const dbox = inbox(desk);
     desk.send(buildFrame(MAX_FRAME + 1, "d1"));
-    await sleep(300);
-    expect(dbox.closed()?.code).toBe(1009);
+    expect((await dbox.whenClosed()).code).toBe(1009);
     dev.close();
   });
 
@@ -127,20 +138,19 @@ describe("S-07 relay prototype in workerd", () => {
     const dev = await connect("/device?device=d1", "q");
     const box = inbox(dev);
     dev.send("hello");
-    await sleep(200);
-    expect(box.closed()?.code).toBe(4012);
+    expect((await box.whenClosed()).code).toBe(4012);
 
     const flood = await connect("/device?device=d9", "q2");
     const fbox = inbox(flood);
     for (let i = 0; i < 150; i++) flood.send(buildFrame(20, "d9"));
-    await sleep(500);
-    expect(fbox.closed()?.code).toBe(4008);
+    expect((await fbox.whenClosed()).code).toBe(4008);
   });
 
   it("evicts the object: constructor re-runs, attachment survives, bucket is rebuilt, ping needs no wake", async () => {
     const room = "ev";
     const desk = await connect("/desktop", room);
-    const dev = await connect("/device?device=d1", room);
+    // refill=0: the bucket never refills, so the token counts below do not depend on the wall clock.
+    const dev = await connect("/device?device=d1&refill=0", room);
     const box = inbox(dev);
     // Consume 30 tokens of the device bucket so the persisted bucket is not full.
     for (let i = 0; i < 30; i++) dev.send(buildFrame(20, "d1"));
@@ -169,14 +179,12 @@ describe("S-07 relay prototype in workerd", () => {
     expect(s2.ctor).toBe(before.ctor + 1);
     expect(s2.sockets).toBe(2);
     // Device socket rebuilt its bucket only when the device sends (stats does not touch it).
-    dev.send(buildFrame(20, "d1"));
-    await sleep(200);
+    dev.send(buildFrame(20, "d1")); // the stats frame below is processed after it (same socket, in order)
     const s3 = await stats(dev, box);
-    // New instance: the device bucket was built again, from the attachment (about 70 tokens used + refill
-    // over the few hundred ms), not as a fresh full bucket of 100.
+    // New instance: the device bucket was built again from the attachment (100 - 30 = 70 tokens, no refill
+    // because refill=0), not as a fresh full bucket of 100.
     expect(s3.builtBuckets).toBe(2); // desktop (routed above) and device
-    expect(s3.lastBuiltTokens).toBeLessThan(100);
-    expect(s3.lastBuiltTokens).toBeGreaterThan(60);
+    expect(s3.lastBuiltTokens).toBe(70);
     expect(box.closed()).toBeNull();
     desk.close();
     dev.close();

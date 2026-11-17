@@ -11,9 +11,11 @@ export function bootstrapInvite(): string {
   return value;
 }
 
-/** A second bootstrap invite (own account for the pairing spec). Never print it. */
-export function pairingInvite(): string {
-  const value = process.env["E2E_INVITE_PAIR"];
-  if (!value) throw new Error("E2E_INVITE_PAIR is not set: the global setup did not run");
+/** Named bootstrap invites minted by the global setup: one per spec that needs its own account. Never print them. */
+export type InviteName = "pairing" | "devices" | "ui";
+
+export function namedInvite(name: InviteName): string {
+  const value = process.env[`E2E_INVITE_${name.toUpperCase()}`];
+  if (!value) throw new Error(`E2E_INVITE_${name.toUpperCase()} is not set: the global setup did not run`);
   return value;
 }

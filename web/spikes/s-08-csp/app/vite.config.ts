@@ -3,6 +3,9 @@ import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import { fileURLToPath } from "node:url";
 
+// Runtime style injection as the libraries write it: createElement(style) followed by `.type = text/css`
+// (any quote style, minified or not). React DOM's own unused `<style precedence>` path has no `.type` and is not matched.
+const RUNTIME_STYLE = /createElement\(["'`]style["'`]\)\s*[;,]\s*\w+\.type\s*=\s*["'`]text\/css/;
 const raw = process.env["SPIKE_RAW"] === "1";
 const root = fileURLToPath(new URL(".", import.meta.url));
 
@@ -37,6 +40,20 @@ function staticLibraryCss(): Plugin {
       const text = (JSON.parse(hit[1]!) as string).replace(/@media \(pointer:fine\)\{\[data-vaul-handle-hitarea\]:\{[^}]*\}\}/, "");
       css.set(name, text);
       return code.replace(re, `import "\0static-css:${name}";`);
+    },
+    buildStart() {
+      css.clear();
+    },
+    generateBundle(_o, bundle) {
+      // The patch must have run on both libraries, and no emitted chunk may still create a <style>.
+      for (const lib of ["sonner.css", "vaul.css"]) {
+        if (!css.has(lib)) throw new Error(`static-library-css: ${lib} was never extracted (library not transformed)`);
+      }
+      for (const [file, chunk] of Object.entries(bundle)) {
+        if (chunk.type === "chunk" && RUNTIME_STYLE.test(chunk.code)) {
+          throw new Error(`static-library-css: ${file} still injects a <style> element at runtime`);
+        }
+      }
     },
   };
 }

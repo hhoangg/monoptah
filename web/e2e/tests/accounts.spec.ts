@@ -111,8 +111,8 @@ test.describe.serial("accounts (E-01)", () => {
 
     // The used code is rejected the second time.
     const again = await (await newActor()).call("POST", "/api/auth/recover", { body: { handle: HANDLE, code } });
-    expect(again.status).toBeGreaterThanOrEqual(400);
-    expect(again.status).toBeLessThan(500);
+    // recover.ts answers every failure with the same 401 `unauthorized`; a 429 here would not prove single use.
+    expectError(again, 401, "unauthorized");
   });
 
   test("d. admin: invites, second user, list, pause, block with reauth, unblock", async ({ newActor }) => {

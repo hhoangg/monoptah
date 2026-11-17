@@ -17,11 +17,15 @@ describe("@simplewebauthn/server in workerd without compatibility flags", () => 
     console.log(`S05-WORKERD ${alg} ${JSON.stringify(r)}`);
   });
 
-  it("records verify timing in workerd (timers only advance on I/O, so this may read 0)", async () => {
+  it("measure: verify time in workerd stays far under the 10 ms free cap (timer is whole-ms, so a sanity bound only)", async () => {
     const out: Record<string, unknown> = {};
-    for (const alg of ALGORITHMS) out[alg] = await timeVerify(alg, 30, () => performance.now());
-    out["dateNow"] = Date.now();
+    for (const alg of ALGORITHMS) {
+      const t = await timeVerify(alg, 30, () => performance.now());
+      out[alg] = t;
+      expect(Number.isFinite(t.meanMs)).toBe(true);
+      expect(t.meanMs).toBeGreaterThanOrEqual(0);
+      expect(t.meanMs).toBeLessThan(10);
+    }
     console.log(`S05-WORKERD-TIMING ${JSON.stringify(out)}`);
-    expect(Object.keys(out).length).toBeGreaterThan(0);
   });
 });

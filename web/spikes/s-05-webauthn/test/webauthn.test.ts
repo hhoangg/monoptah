@@ -18,10 +18,14 @@ describe("@simplewebauthn/server in Node", () => {
     expect(r.zeroCounterAccepted).toBe(true);
   });
 
-  it("measures verify time locally (Node, not production CPU)", async () => {
+  it("measure: verify time locally (Node, not production CPU) stays far under the 10 ms free cap", async () => {
     const out: Record<string, unknown> = {};
-    for (const alg of ALGORITHMS) out[alg] = await timeVerify(alg, 200, () => performance.now());
+    for (const alg of ALGORITHMS) {
+      const t = await timeVerify(alg, 200, () => performance.now());
+      out[alg] = t;
+      expect(t.meanMs).toBeGreaterThan(0);
+      expect(t.meanMs).toBeLessThan(10);
+    }
     console.log(`S05-NODE-TIMING ${JSON.stringify(out)}`);
-    expect(Object.keys(out)).toHaveLength(3);
   });
 });

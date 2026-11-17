@@ -20,6 +20,8 @@ interface Attachment {
   deviceId: string;
   joinedAt: number;
   bucket: BucketState;
+  /** Refill rate of this socket's bucket (tokens/s); a query param so tests can make it clock independent. */
+  refill: number;
 }
 
 const BUCKET_CAPACITY = 100;
@@ -42,6 +44,7 @@ export default {
     const headers = new Headers(request.headers);
     headers.set("x-role", role);
     headers.set("x-device-id", role === "device" ? (url.searchParams.get("device") ?? "dev") : "");
+    headers.set("x-refill", url.searchParams.get("refill") ?? String(BUCKET_REFILL_PER_SEC));
     return room.fetch(new Request(request, { headers }));
   },
 } satisfies ExportedHandler<Env>;
@@ -74,11 +77,13 @@ export class SpikeRoom extends DurableObject<Env> {
       for (const old of this.ctx.getWebSockets("desktop")) old.close(4009, "replaced");
     }
     this.ctx.acceptWebSocket(server, tags);
+    const refill = Number(request.headers.get("x-refill") ?? BUCKET_REFILL_PER_SEC);
     const attachment: Attachment = {
+      refill: Number.isFinite(refill) && refill >= 0 ? refill : BUCKET_REFILL_PER_SEC,
       role,
       deviceId,
       joinedAt: Date.now(),
-      bucket: new TokenBucket(BUCKET_CAPACITY, BUCKET_REFILL_PER_SEC, Date.now()).snapshot(),
+      bucket: new TokenBucket(BUCKET_CAPACITY, refill, Date.now()).snapshot(),
     };
     server.serializeAttachment(attachment);
     return new Response(null, { status: 101, webSocket: client });
@@ -98,7 +103,7 @@ export class SpikeRoom extends DurableObject<Env> {
   private bucketFor(ws: WebSocket, att: Attachment): TokenBucket {
     let bucket = this.buckets.get(ws);
     if (!bucket) {
-      bucket = new TokenBucket(BUCKET_CAPACITY, BUCKET_REFILL_PER_SEC, Date.now(), att.bucket);
+      bucket = new TokenBucket(BUCKET_CAPACITY, att.refill, Date.now(), att.bucket);
       this.buckets.set(ws, bucket);
       this.built++;
       this.lastBuiltTokens = bucket.snapshot().tokens;

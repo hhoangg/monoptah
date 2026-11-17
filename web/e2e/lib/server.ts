@@ -5,7 +5,7 @@ import { randomBytes } from "node:crypto";
 import { createWriteStream, existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { parseInviteCode } from "./pure.ts";
 import { webDir, wranglerBin, wranglerConfig } from "./paths.ts";
 
@@ -15,10 +15,13 @@ export interface RunningServer {
   origin: string;
   /** The one-use bootstrap invite. Never print it. */
   invite: string;
-  /** A second bootstrap invite, for specs that need their own account. Never print it. */
-  extraInvite: string;
-  stop(): void;
+  /** More bootstrap invites, one per spec that needs its own account. Never print them. */
+  extraInvites: { pairing: string; devices: string; ui: string };
+  /** Stops wrangler and removes the temp dir. Waits for exit, escalates to SIGKILL, never throws. */
+  stop(): Promise<void>;
 }
+
+const START_ATTEMPTS = 3;
 
 function freePort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -38,12 +41,35 @@ function runSync(cmd: string, args: string[], label: string): string {
   return r.stdout;
 }
 
-function killTree(child: ChildProcess | null): void {
-  if (!child || child.exitCode !== null || child.pid === undefined) return;
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+function signalGroup(child: ChildProcess, signal: NodeJS.Signals): void {
+  if (child.pid === undefined) return;
   try {
-    process.kill(-child.pid, "SIGTERM");
+    process.kill(-child.pid, signal);
   } catch {
-    child.kill("SIGTERM");
+    try {
+      child.kill(signal);
+    } catch {
+      // already gone
+    }
+  }
+}
+
+/** SIGTERM the process group, wait for the parent to exit (10 s), then SIGKILL the whole group. Never throws. */
+async function killTree(child: ChildProcess | null): Promise<void> {
+  if (!child) return;
+  try {
+    const exited = new Promise<void>((resolve) => {
+      if (child.exitCode !== null || child.signalCode !== null) resolve();
+      else child.once("exit", () => resolve());
+    });
+    signalGroup(child, "SIGTERM");
+    await Promise.race([exited, sleep(10_000)]);
+    signalGroup(child, "SIGKILL"); // workerd children may outlive the parent; ESRCH is ignored
+    await sleep(200);
+  } catch {
+    // teardown must not fail the run
   }
 }
 
@@ -57,7 +83,7 @@ async function waitForHealth(origin: string, wrangler: ChildProcess): Promise<vo
     } catch {
       // not up yet
     }
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await sleep(500);
   }
   throw new Error("wrangler dev did not answer /api/health within 120 s");
 }
@@ -68,26 +94,29 @@ export async function startServer(logFile: string): Promise<RunningServer> {
   const tmp = mkdtempSync(join(tmpdir(), "monoptah-e2e-"));
   const persist = join(tmp, "state");
   let wrangler: ChildProcess | null = null;
-  let stopped = false;
-  const stop = (): void => {
-    if (stopped) return;
-    stopped = true;
-    killTree(wrangler);
-    rmSync(tmp, { recursive: true, force: true });
+  let stopped: Promise<void> | null = null;
+  const stop = (): Promise<void> => {
+    stopped ??= (async () => {
+      await killTree(wrangler);
+      try {
+        rmSync(tmp, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+      } catch {
+        // a leftover temp dir is not worth failing the run
+      }
+    })();
+    return stopped;
   };
   try {
-    const port = await freePort();
-    const origin = `http://localhost:${port}`;
     runSync(process.execPath, [join(webDir, "worker", "scripts", "ensure-assets.mjs")], "ensure-assets");
     runSync(wranglerBin, ["d1", "migrations", "apply", "monoptah", "--local", "--persist-to", persist, "-c", wranglerConfig], "d1 migrations apply");
     const bootstrap = (): string => {
-      const printed = runSync(process.execPath, [join(webDir, "scripts", "bootstrap.mjs"), "--local", "--persist-to", persist, "--origin", origin], "bootstrap");
+      const printed = runSync(process.execPath, [join(webDir, "scripts", "bootstrap.mjs"), "--local", "--persist-to", persist, "--origin", "http://localhost"], "bootstrap");
       const code = parseInviteCode(printed);
       if (code === null) throw new Error("bootstrap printed no invite link");
       return code;
     };
     const invite = bootstrap();
-    const extraInvite = bootstrap();
+    const extraInvites = { pairing: bootstrap(), devices: bootstrap(), ui: bootstrap() };
 
     // Obviously fake secrets, passed with --var so a developer's web/.dev.vars is never read.
     const fake = {
@@ -95,34 +124,50 @@ export async function startServer(logFile: string): Promise<RunningServer> {
       RECOVERY_PEPPER: `e2e-fake-pepper-${randomBytes(12).toString("hex")}`,
       AUDIT_IP_SALT: `e2e-fake-salt-${randomBytes(12).toString("hex")}`,
     };
-    const args = [
-      "dev", "--local", "--persist-to", persist, "--port", String(port), "--ip", "127.0.0.1", "-c", wranglerConfig,
-      "--show-interactive-dev-session=false",
-      "--var", `RP_ID:${RP_ID}`, "--var", `RP_ORIGIN:${origin}`,
-      ...Object.entries(fake).flatMap(([name, value]) => ["--var", `${name}:${value}`]),
-    ];
-    mkdirSync(join(logFile, ".."), { recursive: true });
+    mkdirSync(dirname(logFile), { recursive: true });
     const log = createWriteStream(logFile);
-    wrangler = spawn(wranglerBin, args, {
-      cwd: webDir,
-      detached: true,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, WRANGLER_SEND_METRICS: "false", WRANGLER_LOG_PATH: join(tmp, "wrangler-logs"), NO_COLOR: "1" },
-    });
-    wrangler.stdout?.pipe(log, { end: false });
-    wrangler.stderr?.pipe(log, { end: false });
-    wrangler.once("exit", () => log.end());
-    await waitForHealth(origin, wrangler);
+
+    // The free port can be taken between the probe and wrangler's bind: retry with a new port.
+    let origin = "";
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= START_ATTEMPTS; attempt++) {
+      const port = await freePort();
+      origin = `http://localhost:${port}`;
+      const args = [
+        "dev", "--local", "--persist-to", persist, "--port", String(port), "--ip", "127.0.0.1", "-c", wranglerConfig,
+        "--show-interactive-dev-session=false",
+        "--var", `RP_ID:${RP_ID}`, "--var", `RP_ORIGIN:${origin}`,
+        ...Object.entries(fake).flatMap(([name, value]) => ["--var", `${name}:${value}`]),
+      ];
+      const child = spawn(wranglerBin, args, {
+        cwd: webDir,
+        detached: true,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, WRANGLER_SEND_METRICS: "false", WRANGLER_LOG_PATH: join(tmp, "wrangler-logs"), NO_COLOR: "1" },
+      });
+      wrangler = child;
+      child.stdout?.pipe(log, { end: false });
+      child.stderr?.pipe(log, { end: false });
+      try {
+        await waitForHealth(origin, child);
+        lastError = undefined;
+        break;
+      } catch (err) {
+        lastError = err;
+        await killTree(child);
+        wrangler = null;
+      }
+    }
+    if (lastError !== undefined) throw lastError;
 
     const onSignal = (code: number) => (): void => {
-      stop();
-      process.exit(code);
+      void stop().then(() => process.exit(code));
     };
     process.once("SIGINT", onSignal(130));
     process.once("SIGTERM", onSignal(143));
-    return { origin, invite, extraInvite, stop };
+    return { origin, invite, extraInvites, stop };
   } catch (err) {
-    stop();
+    await stop();
     throw err;
   }
 }

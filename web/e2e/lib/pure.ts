@@ -68,20 +68,35 @@ export interface Probe {
   reason: string;
 }
 
-/** Pairing routes answer 501 `unsupported` until WS-R lands them; 404 or no answer also means not landed. */
-export function decidePairingProbe(status: number | null): Probe {
-  if (status === null || status === 404 || status === 501) {
-    return { run: false, reason: `TODO(E-01:WS-R R-03) pairing routes not landed (POST /api/pair/start answered ${status ?? "nothing"})` };
-  }
-  return { run: true, reason: `pairing routes present (POST /api/pair/start answered ${status})` };
+/** What a probe request answered: the HTTP status and the `code` of the JSON error body, if any. */
+export interface ProbeAnswer {
+  status: number;
+  code: string | null;
 }
 
-/** Device registration is a WS-L/WS-R route that also answers 501 until it lands. */
-export function decideDevicesProbe(status: number | null): Probe {
-  if (status === null || status === 404 || status === 501) {
-    return { run: false, reason: `TODO(E-01:WS-R R-04) device routes not landed (POST /api/devices answered ${status ?? "nothing"})` };
+/** Statuses a landed route answers to the probe body `{}`: validation error, conflict, or success. */
+const PRESENT_STATUSES: readonly number[] = [200, 201, 400, 409, 422];
+
+/**
+ * Decides one route probe. Only a real "route not implemented" answer (501 `unsupported`, or 404) means the
+ * dependency has not landed. No answer at all (dead server) and any other unexpected status THROW, so a broken
+ * server or a wrong probe request can never look like "not landed" and can never look like "present".
+ */
+export function decideRouteProbe(label: string, marker: string, path: string, answer: ProbeAnswer | null): Probe {
+  if (answer === null) throw new Error(`${label} probe: ${path} gave no answer (is the Worker running?)`);
+  if (answer.status === 404 || (answer.status === 501 && answer.code === "unsupported")) {
+    return { run: false, reason: `${marker} ${label} routes not landed (${path} answered ${answer.status} ${answer.code ?? ""})`.trimEnd() };
   }
-  return { run: true, reason: `device routes present (POST /api/devices answered ${status})` };
+  if (PRESENT_STATUSES.includes(answer.status)) return { run: true, reason: `${label} routes present (${path} answered ${answer.status})` };
+  throw new Error(`${label} probe: unexpected answer from ${path}: ${answer.status} ${answer.code ?? ""}`.trimEnd());
+}
+
+export function decidePairingProbe(answer: ProbeAnswer | null): Probe {
+  return decideRouteProbe("pairing", "TODO(E-01:WS-R R-03)", "POST /api/pair/start", answer);
+}
+
+export function decideDevicesProbe(answer: ProbeAnswer | null): Probe {
+  return decideRouteProbe("device", "TODO(E-01:WS-R R-04)", "POST /api/devices", answer);
 }
 
 /** The headless desktop can serve only when the binary exists and reports `"serve": true`. */
@@ -94,19 +109,29 @@ export function decideHeadlessProbe(binExists: boolean, caps: HeadlessCapabiliti
 
 /** What the page at a route shows, as far as the probe can tell. */
 export interface PageSnapshot {
-  /** An element `#root` exists (the real SPA shell; the placeholder asset page has none). */
+  /** The page is the placeholder `ensure-assets.mjs` writes when web/app is not built. */
+  isPlaceholder: boolean;
+  /** An element `#root` exists. */
   hasRoot: boolean;
   /** An element `[data-testid=route-stub]` exists (the WS-S Wave 0 placeholder, web/app/src/ui/RouteStub.tsx). */
   hasRouteStub: boolean;
   /** `#root` has rendered children. */
   rootHasContent: boolean;
+  /** Uncaught page errors seen while loading (messages only). */
+  pageErrors: string[];
 }
 
-/** UI flows turn on once the real app is served: `#root` renders content and no RouteStub is left. */
+/**
+ * UI flows skip only for the placeholder asset page and for a visible RouteStub. They run when `#root` renders
+ * something else. A served app that renders neither (empty `#root`, no `#root`, boot crash) THROWS: that is the
+ * failure a UI E2E exists to catch.
+ */
 export function decideUiProbe(snapshot: PageSnapshot): Probe {
   if (snapshot.hasRouteStub) return { run: false, reason: "TODO(E-01:WS-S W-02) the page still renders RouteStub" };
+  if (snapshot.isPlaceholder) return { run: false, reason: "TODO(E-01:WS-S W-02) web/app is not built (placeholder asset page)" };
   if (!snapshot.hasRoot || !snapshot.rootHasContent) {
-    return { run: false, reason: "TODO(E-01:WS-S W-02) the app is not built or served (placeholder page, no rendered #root)" };
+    const errors = snapshot.pageErrors.length > 0 ? ` Page errors: ${snapshot.pageErrors.join(" | ")}` : "";
+    throw new Error(`the served app renders neither RouteStub nor a real page (root present: ${snapshot.hasRoot}, root has content: ${snapshot.rootHasContent}).${errors}`);
   }
   return { run: true, reason: "the page renders the real app" };
 }

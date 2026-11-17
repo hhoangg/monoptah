@@ -14,6 +14,7 @@ export default defineConfig({
   timeout: 60_000,
   expect: { timeout: 10_000 },
   reporter: [["list"], ["html", { outputFolder: `${out}/report`, open: "never" }]],
-  use: { trace: "on", screenshot: "on" },
+  // Traces hold request bodies (invite and recovery codes of the throwaway local run): keep them only for failures.
+  use: { trace: "retain-on-failure", screenshot: "on" },
   projects: [{ name: "chromium", use: { browserName: "chromium" } }],
 });

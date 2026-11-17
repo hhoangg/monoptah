@@ -2,6 +2,12 @@
 
 Local = local workerd (wrangler 4.163.0), not production. Production numbers are PENDING-MAC.
 
+## Synthetic stream (read this first)
+
+The ticket asks for a RECORDED 30 minute transcript stream. The stream replayed here is SYNTHETIC: `src/schedule.ts` emits evenly spaced frames at 2/s with sizes drawn from a seeded mixture. Why: the repo has no recorded transcript stream (the desktop side of the web link that would produce one, WS-D1, is not merged yet, and the existing mobile host path sends QUIC frames in another layout), so there is nothing real to replay. What it affects: frame COUNT, message COUNT and therefore request numbers do not depend on content or sizes; byte totals and any CPU estimate do. Real streams are also bursty (idle gaps, bursts of tool output) while this one is uniform, which matters for how long the object stays awake between frames, i.e. exactly the duration factor S-02 wants. So treat the local numbers as plumbing proof and the 1.3 replacement as unmeasured until a real trace is replayed.
+
+PENDING-MAC step to record a real stream (do it once the desktop web link exists, or with the existing desktop host as a stand-in): (1) run a real agent session on the maintainer's desktop that streams for 30 minutes with one watching device; (2) on the desktop log, for every watch frame handed to the relay socket, `{atMs: ms since the first frame, size: outer frame bytes}` (counts and sizes only, never content), into a JSON array `trace.json`; (3) replay with `node s-02-capacity/replay.ts --trace trace.json --duration-s 1800 --ping-s 30 ...`; the output JSON then has `params.synthetic: false`. Use that trace for the production runs below; keep the synthetic runs as the baseline for comparison.
+
 ## What was built
 
 - `replay.ts` (Node 24, `node s-02-capacity/replay.ts [--url ws://host:port] [--rate 2] [--duration-s 1800] [--ping-s 30|60|0] [--devices 2] [--device-req-per-min 10] [--seed 1] [--out file.json]`). Without `--url` it starts `wrangler dev --local` for the S-07 spike on a free port (own state dir) and stops it. Fake desktop + N devices against the S-07 relay. Counts frames, bytes and messages per minute per side, pings and pongs, closes (with time), and the room's own `webSocketMessage` run counter via `/stats`.

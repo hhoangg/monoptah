@@ -8,6 +8,7 @@ import {
 } from "@tanstack/react-router";
 import { Workbox } from "workbox-window";
 import { tokenize, type Tok } from "./shiki";
+import { Markdown } from "./Markdown";
 
 const SAMPLE = "const answer: number = 42;\nexport function add(a: number, b: number) { return a + b; }\n";
 
@@ -40,6 +41,7 @@ function Home() {
     <main>
       <h1>S-08 stub</h1>
       <Code />
+      <Markdown />
       <Fetcher />
       <motion.div
         data-testid="motion"

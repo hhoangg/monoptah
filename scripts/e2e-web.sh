@@ -6,6 +6,7 @@
 # Environment:
 #   CI=true                     add `--with-deps` to the Playwright browser install
 #   E2E_SKIP_HEADLESS_BUILD=1   do not build web_link_headless (use the binary that is already there)
+#   E2E_SKIP_APP_BUILD=1        do not build web/app (the UI tests then stay skipped on the placeholder page)
 #   E2E_HEADLESS_BIN            path of the headless binary (default crates/monocode-gpui/target/native-dev/web_link_headless)
 #   E2E_OUTPUT_DIR              where artifacts, report, traces and run.log go (default /tmp/evidence/ws-q/e2e)
 # The exit code is the one of Playwright. At test time nothing leaves localhost and no credentials are needed.
@@ -18,6 +19,12 @@ mkdir -p "$out"
 
 cd "$repo/web"
 pnpm install --frozen-lockfile
+
+# wrangler serves web/app/dist/client (web/wrangler.jsonc assets); without a build it serves a placeholder and the UI
+# tests skip, so build the app to let them turn on by themselves once WS-S lands.
+if [ "${E2E_SKIP_APP_BUILD:-}" != "1" ]; then
+  pnpm --filter @monoptah/app run build
+fi
 
 install_args=(chromium)
 if [ "${CI:-}" = "true" ]; then install_args+=(--with-deps); fi
