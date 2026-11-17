@@ -885,6 +885,154 @@ mod tests {
         task.await.unwrap();
     }
 
+    /// The bytes a phone reads for each kind of answer, pinned so the QUIC wire
+    /// format cannot drift: a 4-byte big-endian length, then the JSON object
+    /// with its keys in the order serde_json writes them.
+    fn framed(json: &str) -> Vec<u8> {
+        let mut bytes = (json.len() as u32).to_be_bytes().to_vec();
+        bytes.extend_from_slice(json.as_bytes());
+        bytes
+    }
+
+    async fn raw_frame(recv: &mut quinn::RecvStream) -> Vec<u8> {
+        let length = recv.read_u32().await.unwrap();
+        let mut body = vec![0; length as usize];
+        recv.read_exact(&mut body).await.unwrap();
+        let mut bytes = length.to_be_bytes().to_vec();
+        bytes.extend(body);
+        bytes
+    }
+
+    #[tokio::test]
+    async fn golden_quic_bytes_for_requests_watches_and_revocation() {
+        let desktop = Identity::generate().unwrap();
+        let phone = Identity::generate().unwrap();
+        let gate = Gate::default();
+        let key = phone.fingerprint().unwrap();
+        gate.allow(key.clone(), None);
+        let server =
+            server_endpoint(&desktop, gate.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let (sinks, mut opened) = mpsc::channel(1);
+        let task = tokio::spawn(serve(
+            server.clone(),
+            gate.clone(),
+            |_, request| async move {
+                if request["method"] == "fail" {
+                    Err("boom".into())
+                } else {
+                    Ok(json!({"b":1,"a":[2,"x"]}))
+                }
+            },
+            move |_, request: Value, sink: WatchSink| {
+                let sinks = sinks.clone();
+                async move {
+                    match request["method"].as_str() {
+                        Some("refuse") => Err("Unsupported mobile operation".into()),
+                        Some("hold") => {
+                            sinks.send(sink).await.unwrap();
+                            Ok(())
+                        }
+                        _ => {
+                            tokio::spawn(async move {
+                                for n in 0..2 {
+                                    sink.send(json!({ "n": n })).await.unwrap();
+                                }
+                            });
+                            Ok(())
+                        }
+                    }
+                }
+            },
+        ));
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(
+            tls::client(&phone, &desktop.fingerprint().unwrap()).unwrap(),
+        );
+        let connection = client
+            .connect(server.local_addr().unwrap(), "monocode.local")
+            .unwrap()
+            .await
+            .unwrap();
+        // A request answered, then one failed, then one over the size limit.
+        for (request, expected) in [
+            (
+                json!({"method":"ok"}),
+                r#"{"ok":true,"result":{"b":1,"a":[2,"x"]}}"#,
+            ),
+            (json!({"method":"fail"}), r#"{"ok":false,"error":"boom"}"#),
+        ] {
+            let (mut send, mut recv) = connection.open_bi().await.unwrap();
+            write_frame(&mut send, &request, REQUEST_LIMIT)
+                .await
+                .unwrap();
+            let bytes = recv.read_to_end(1024).await.unwrap();
+            assert_eq!(bytes, framed(expected));
+        }
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        send.write_u32((REQUEST_LIMIT + 1) as u32).await.unwrap();
+        send.finish().unwrap();
+        assert_eq!(
+            recv.read_to_end(1024).await.unwrap(),
+            framed(r#"{"ok":false,"error":"Message exceeds the connection limit"}"#)
+        );
+        // A refused watch answers like a request and ends.
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        write_message(
+            &mut send,
+            &json!({"watch":true,"method":"refuse"}),
+            REQUEST_LIMIT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recv.read_to_end(1024).await.unwrap(),
+            framed(r#"{"ok":false,"error":"Unsupported mobile operation"}"#)
+        );
+        // An accepted watch: accept frame, two updates, then the end of the stream.
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        write_message(&mut send, &json!({"watch":true}), REQUEST_LIMIT)
+            .await
+            .unwrap();
+        assert_eq!(
+            raw_frame(&mut recv).await,
+            framed(r#"{"ok":true,"watching":true}"#)
+        );
+        assert_eq!(
+            raw_frame(&mut recv).await,
+            framed(r#"{"ok":true,"result":{"n":0}}"#)
+        );
+        assert_eq!(
+            raw_frame(&mut recv).await,
+            framed(r#"{"ok":true,"result":{"n":1}}"#)
+        );
+        assert!(recv.read_to_end(1024).await.unwrap().is_empty());
+        drop(send);
+        // Revocation while watching: the next frame is replaced by an error frame.
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        write_message(
+            &mut send,
+            &json!({"watch":true,"method":"hold"}),
+            REQUEST_LIMIT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            raw_frame(&mut recv).await,
+            framed(r#"{"ok":true,"watching":true}"#)
+        );
+        let sink = opened.recv().await.unwrap();
+        gate.remove(&key);
+        sink.send(json!({"n":9})).await.unwrap();
+        assert_eq!(
+            recv.read_to_end(1024).await.unwrap(),
+            framed(r#"{"ok":false,"error":"Device revoked"}"#)
+        );
+        drop(send);
+        client.close(0_u32.into(), b"Test complete");
+        server.close(0_u32.into(), b"Test complete");
+        task.await.unwrap();
+    }
+
     #[tokio::test]
     async fn revocation_applies_to_an_existing_connection_and_large_frames_are_rejected() {
         let desktop = Identity::generate().unwrap();
