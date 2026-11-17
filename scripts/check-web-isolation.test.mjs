@@ -3,7 +3,7 @@
 // package does not.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
@@ -195,5 +195,62 @@ test("user-visible MonoCode text", () => {
 
 test("identifiers containing MonoCode do not trip branding", () => {
   const { status, out } = run(tree({ "web/app/src/t.ts": "export const MonoCodeMark = 1;\n" }));
+  assert.equal(status, 0, out);
+});
+
+// --- Wave 1 fixes (review I6, M1, M2, M3, M4, M5) ---
+
+test("symlink into repo-root src is reported", () => {
+  const root = tree({ "src/x.ts": "export const x = 1;\n" });
+  symlinkSync(path.join(root, "src"), path.join(root, "web/app/src/legacy"));
+  const { status, out } = run(root);
+  assert.equal(status, 1, out);
+  assert.match(out, /^web\/app\/src\/legacy:\d+: legacy-reference: symlink points into repo-root src\//m);
+});
+
+test("a symlink that stays inside web/ passes", () => {
+  const root = tree();
+  symlinkSync(path.join(root, "web/protocol/src"), path.join(root, "web/app/src/shared"));
+  const { status, out } = run(root);
+  assert.equal(status, 0, out);
+});
+
+test("file: dependency on the repo root or src", () => {
+  expectViolation({ "web/app/package.json": '{"dependencies":{"monocode-desktop":"file:../.."}}\n' }, "legacy-reference", "file root");
+  expectViolation({ "web/app/package.json": '{"devDependencies":{"old":"link:../../src"}}\n' }, "legacy-reference", "link src");
+  const { status, out } = run(tree({ "web/app/package.json": '{"dependencies":{"@monoptah/protocol":"workspace:*","local":"file:../protocol"}}\n' }));
+  assert.equal(status, 0, out);
+});
+
+test("import of the root package monocode-desktop", () => {
+  expectViolation({ "web/app/src/p.ts": 'import { x } from "monocode-desktop/src/x";\nexport { x };\n' }, "legacy-reference");
+});
+
+test("vitest config seeds", () => {
+  expectViolation({ "web/app/vitest.config.ts": 'export default { test: { root: "../../src" } };\n' }, "legacy-reference", "root");
+  expectViolation({ "web/app/vitest.config.ts": 'export default { test: { include: ["../../src/**/*.test.ts"] } };\n' }, "legacy-reference", "include");
+});
+
+test("tsconfig references that resolve exactly into src", () => {
+  expectViolation({ "web/app/tsconfig.json": '{"references":[{"path":"../../src"}]}\n' }, "legacy-reference", "references src");
+});
+
+test("paths assembled from literal pieces (best effort)", () => {
+  expectViolation({ "web/app/vite.config.ts": 'import path from "node:path";\nexport default { root: path.join(__dirname, "..", "..", "src") };\n' }, "legacy-reference", "join with ..");
+  expectViolation({ "web/app/vite.config.ts": 'import path from "node:path";\nconst repoRoot = "/x";\nexport default { root: path.join(repoRoot, "src-tauri") };\n' }, "legacy-reference", "join root-ish");
+});
+
+test("branding scan covers the manifest and the other source types", () => {
+  expectViolation({ "web/app/public/manifest.webmanifest": '{"name": "MonoCode", "short_name": "MonoCode"}\n' }, "branding", "webmanifest");
+  expectViolation({ "web/worker/wrangler.jsonc": '{ "name": "MonoCode API" }\n' }, "branding", "jsonc");
+  expectViolation({ "web/app/src/a.cjs": 'module.exports = "Welcome to MonoCode";\n' }, "branding", "cjs");
+  expectViolation({ "web/app/src/a.jsx": 'export const A = () => "Welcome to MonoCode";\n' }, "branding", "jsx");
+  expectViolation({ "web/app/ci.yml": 'name: "MonoCode build"\n' }, "branding", "yml");
+  expectViolation({ "web/app/public/logo.svg": '<svg><title>"MonoCode"</title></svg>\n' }, "branding", "svg");
+});
+
+test("branding: only web/docs is excluded, not a docs folder deeper down", () => {
+  expectViolation({ "web/app/src/features/docs/t.ts": 'export const T = "Welcome to MonoCode";\n' }, "branding", "nested docs");
+  const { status, out } = run(tree({ "web/docs/t.ts": 'export const T = "Welcome to MonoCode";\n' }));
   assert.equal(status, 0, out);
 });

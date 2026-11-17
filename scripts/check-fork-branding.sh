@@ -6,7 +6,7 @@
 set -uo pipefail
 
 # BRANDING_ROOT lets scripts/check-web-isolation.mjs run this check against a test tree.
-cd "${BRANDING_ROOT:-$(dirname "$0")/..}"
+cd "${BRANDING_ROOT:-$(dirname "$0")/..}" || { echo "check-fork-branding: cannot enter the repo root" >&2; exit 2; }
 
 # Only string literals and links. A bare `MonoCode` inside an identifier
 # (MonoCodeMark, MonoCodeToolCall, MonoCodeDockMenuTarget) is a symbol name, not
@@ -43,11 +43,16 @@ hits=$(grep -rnE "$PATTERN" \
 
 # The web app (web/): same pattern, same string-literal rule. Docs, dependencies, build
 # output and the lockfile are not product copy. Tests are dropped below like everywhere else.
+# `docs` is excluded only at web/docs (a source folder named docs deeper down is scanned). The PWA
+# manifest, JSON with comments, CommonJS, JSX, YAML and SVG carry user-visible names too.
 web_hits=$(grep -rnE "$PATTERN" web/ \
-  --include="*.ts" --include="*.tsx" --include="*.js" --include="*.mjs" \
-  --include="*.html" --include="*.css" --include="*.json" \
-  --exclude-dir=docs --exclude-dir=node_modules --exclude-dir=dist --exclude-dir=.wrangler \
-  --exclude=pnpm-lock.yaml 2>/dev/null \
+  --include="*.ts" --include="*.tsx" --include="*.js" --include="*.mjs" --include="*.cjs" \
+  --include="*.jsx" --include="*.mts" --include="*.cts" \
+  --include="*.html" --include="*.css" --include="*.json" --include="*.jsonc" \
+  --include="*.webmanifest" --include="*.yaml" --include="*.yml" --include="*.svg" \
+  --exclude-dir=node_modules --exclude-dir=dist --exclude-dir=.wrangler \
+  --exclude=pnpm-lock.yaml --exclude=package-lock.json --exclude=yarn.lock 2>/dev/null \
+  | grep -vE '^web/docs/' \
   | grep -v '\.test\.' \
   | grep -vE "^[^:]+: *(//|///|//!|\*)" \
   | grep -vE "^($allow_re):")

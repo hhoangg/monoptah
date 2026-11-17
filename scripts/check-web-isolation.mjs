@@ -6,11 +6,20 @@
 // provenance comment, copies a block from `src/` without one, or reintroduces upstream
 // identity (`monocode.` storage keys, `open-monocode`, user-visible "MonoCode").
 //
+// Also fails on: a symlink under web/ whose target is in `src/` or `src-tauri/` (M1), a `file:`,
+// `link:` or `portal:` dependency that resolves to the repo root, `src/` or `src-tauri/` and any
+// import of the root package `monocode-desktop` (M2).
+//
+// Known limit (M4): a path assembled from pieces at run time (`path.join(root, name)` with `name`
+// computed) cannot be seen. Only the literal forms `join(..., "..", "src")` and
+// `join(<root-ish identifier>, "src")` are matched, best effort. The isolated build in the CI
+// workflow (src/ and src-tauri/ deleted) is the real backstop for that.
+//
 // Usage: node scripts/check-web-isolation.mjs [repoRoot]   (default: the repo this file is in)
 // Output: one `path:line: rule: detail` per violation. Exit 1 on any, 0 when clean.
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -25,11 +34,14 @@ const JS_PROVENANCE = /^\/\/ Copied from src\/[^ ]+ at [0-9a-f]{7,40}$/;
 const CSS_PROVENANCE = /^\/\* Copied from src\/[^ ]+ at [0-9a-f]{7,40} \*\/$/;
 const SINKS = /dangerouslySetInnerHTML|\.innerHTML|outerHTML|insertAdjacentHTML/;
 
-function walk(dir, skipTop, out = []) {
+function walk(dir, skipTop, out = [], links = null) {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    if (entry.isDirectory()) {
+    if (entry.isSymbolicLink()) {
+      // Never followed (no loops); the caller checks where it points.
+      links?.push(path.join(dir, entry.name));
+    } else if (entry.isDirectory()) {
       if (SKIP_DIRS.has(entry.name) || skipTop?.has(entry.name)) continue;
-      walk(path.join(dir, entry.name), null, out);
+      walk(path.join(dir, entry.name), null, out, links);
     } else if (entry.isFile() && !SKIP_FILES.has(entry.name)) {
       out.push(path.join(dir, entry.name));
     }
@@ -81,6 +93,27 @@ function intoLegacy(resolved, root) {
     if (resolved === base || resolved.startsWith(base + path.sep)) return name;
   }
   return null;
+}
+
+/** `file:`, `link:` and `portal:` specifiers in package.json that resolve to the repo root or src dirs. */
+function checkPackageJson(file, text, dir, root, add) {
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    return;
+  }
+  for (const field of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]) {
+    for (const [name, spec] of Object.entries(json[field] ?? {})) {
+      const m = /^(?:file|link|portal):(.*)$/.exec(String(spec));
+      if (!m) continue;
+      const resolved = path.resolve(dir, m[1]);
+      const hit = intoLegacy(resolved, root);
+      if (resolved === root || hit) {
+        add(file, lineOf(text, text.indexOf(`"${name}"`)), "legacy-reference", `dependency \`${name}\` (${spec}) resolves to the repo root${hit ? ` ${hit}/` : ""}`);
+      }
+    }
+  }
 }
 
 function significantLines(text) {
@@ -141,11 +174,40 @@ export function check(root) {
   const srcIndex = existsSync(srcDir) && statSync(srcDir).isDirectory() ? buildSrcIndex(srcDir) : null;
   if (!srcIndex) notes.push("src/ not present, similarity check skipped");
 
-  for (const file of walk(webDir, new Set(["docs"]))) {
+  const symlinks = [];
+  const webFiles = walk(webDir, new Set(["docs"]), [], symlinks);
+  for (const link of symlinks) {
+    let target;
+    try {
+      target = realpathSync(link);
+    } catch {
+      add(link, 1, "legacy-reference", "dangling symlink, cannot prove it stays inside web/");
+      continue;
+    }
+    const hit = intoLegacy(target, root);
+    if (hit) add(link, 1, "legacy-reference", `symlink points into repo-root ${hit}/`);
+  }
+
+  for (const file of webFiles) {
     const text = readText(file);
     if (text === null) continue;
     const ext = path.extname(file);
     const dir = path.dirname(file);
+
+    if (path.basename(file) === "package.json") checkPackageJson(file, text, dir, root, add);
+
+    for (const m of text.matchAll(/(?:from\s*|import\s*\(\s*|require\s*\(\s*|import\s+)(["'`])monocode-desktop(?:\/[^"'`\n]*)?\1/g)) {
+      add(file, lineOf(text, m.index), "legacy-reference", "import of the root package `monocode-desktop`");
+    }
+    // Best effort for paths built from literal pieces (see the header).
+    for (const m of text.matchAll(/\b(?:join|resolve)\(([^)\n]*)\)/g)) {
+      const args = m[1];
+      const dotdot = /["'`]\.\.["'`]/.test(args) || /["'`]\.\.\//.test(args);
+      const rootish = /\b(?:repo[_]?root|REPO_ROOT)\b/i.test(args);
+      if (/["'`](?:\.\.\/)*src(?:-tauri)?(?:\/[^"'`]*)?["'`]/.test(args) && (dotdot || rootish) && !/import\.meta\.dirname\s*,\s*["'`]src["'`]/.test(args)) {
+        add(file, lineOf(text, m.index), "legacy-reference", "path assembled from pieces points at `src` or `src-tauri`");
+      }
+    }
 
     for (const m of text.matchAll(/src-tauri/g)) {
       add(file, lineOf(text, m.index), "legacy-reference", "literal `src-tauri`");
