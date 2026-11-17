@@ -9,7 +9,7 @@ import { BROWSER_HEADERS, call, ORIGIN } from "./helpers.ts";
 import { createTestUser, loginAs, type TestSession } from "./support/accounts.ts";
 
 /** Routes with a real handler: with a valid session they no longer answer 501 (their own tests cover them). */
-const IMPLEMENTED = new Set(["GET /api/me", "PATCH /api/me", "GET /api/audit", "GET /api/sessions", "DELETE /api/sessions/:id", "POST /api/auth/logout", "POST /api/auth/register/options", "POST /api/auth/register/verify", "POST /api/auth/login/options", "POST /api/auth/login/verify", "POST /api/auth/reauth/options", "POST /api/auth/reauth/verify", "GET /api/passkeys", "POST /api/passkeys/options", "POST /api/passkeys/verify", "PATCH /api/passkeys/:id", "DELETE /api/passkeys/:id"]);
+const IMPLEMENTED = new Set(["GET /api/me", "PATCH /api/me", "GET /api/audit", "GET /api/sessions", "DELETE /api/sessions/:id", "POST /api/auth/logout", "POST /api/auth/register/options", "POST /api/auth/register/verify", "POST /api/auth/login/options", "POST /api/auth/login/verify", "POST /api/auth/reauth/options", "POST /api/auth/reauth/verify", "POST /api/auth/recover", "POST /api/recovery-codes/regenerate", "GET /api/passkeys", "POST /api/passkeys/options", "POST /api/passkeys/verify", "PATCH /api/passkeys/:id", "DELETE /api/passkeys/:id"]);
 
 /**
  * What a public route answers to a request that passes the browser checks but has an empty body: 501 while it is a
