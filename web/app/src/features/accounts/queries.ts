@@ -3,6 +3,7 @@
 // `cancelled` result when the user dismisses the browser prompt instead of throwing.
 import { queryOptions, type QueryClient } from "@tanstack/react-query";
 import type { MeResponse, PushPrefsResponse, User } from "@monoptah/protocol";
+import { forgetAccountSnapshots } from "@/features/offline/snapshots";
 import { ApiError, apiFetch } from "./api";
 import { endpoints } from "./endpoints";
 import { clearLowCodes } from "./lowCodes";
@@ -98,6 +99,8 @@ export async function withFreshAuth<T>(fn: () => Promise<T>, reauthFn: typeof re
  */
 export function clearAccountCache(queryClient: QueryClient): void {
   queryClient.clear();
+  // The offline snapshots of the previous session must not outlive it (features/offline/accountCache.ts).
+  void forgetAccountSnapshots();
 }
 
 export interface RegisterInput {

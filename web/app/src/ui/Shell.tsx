@@ -1,3 +1,4 @@
+import { OfflineBanner } from "@/features/offline";
 import { Link, Outlet, useRouterState } from "@tanstack/react-router";
 import { Glass } from "./Glass";
 import { Icon, type IconName } from "./Icon";
@@ -38,6 +39,7 @@ export function Shell() {
           )}
         </Glass>
       </header>
+      <OfflineBanner />
       <main className="flex-1 pb-[calc(env(safe-area-inset-bottom)+2.5rem)]">
         <Outlet />
       </main>
