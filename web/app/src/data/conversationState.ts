@@ -1,0 +1,147 @@
+// The value stored at `['link', desktopId, 'conversation', conversationId]` and the pure functions that
+// change it. Decision (architecture.md 3.2 and 6.6): the `cloud` and `approvals` fields live in this
+// TanStack Query entry, next to the turns, not in a second store, so a read, a watch frame and the
+// persisted cache all write one place and `useCloud` / `useApprovals` are selectors over it.
+import type { Approval, Attachment, CloudField, QuestionPrompt, Turn, UsageLimit } from "@monoptah/protocol";
+import type { AppliedFrames } from "./watchUpdates.ts";
+
+/** A message the user sent that the desktop transcript does not hold yet (F-09, F-06). */
+export interface OptimisticTurn {
+  /** `pending:<n>`: local only, never used as a watch cursor. */
+  id: string;
+  text: string;
+  at: number;
+  attachments: number;
+  /** `sending`: in flight. `sent`: the desktop accepted it, its turn is not in the transcript yet. `not_sent`: shows "Not sent, retry". */
+  status: "sending" | "sent" | "not_sent";
+  /** Count of user items in the desktop transcript when it was sent; the turn is confirmed once the count is higher. */
+  baseline: number;
+  /** Why it was not sent: a link or desktop error code, or the message. */
+  error?: string;
+}
+
+export interface ConversationState {
+  turns: Turn[];
+  busy: boolean;
+  older: boolean;
+  question: QuestionPrompt | null;
+  usageLimit: UsageLimit | null;
+  /** The last watch error, shown until the next good frame. */
+  error: string | null;
+  cloud: CloudField | undefined;
+  approvals: Approval[];
+  optimistic: OptimisticTurn[];
+  /** The turns come from the persisted cache only; the desktop has not confirmed them yet. */
+  cachedOnly: boolean;
+}
+
+export const NO_APPROVALS: Approval[] = [];
+
+export function emptyConversation(): ConversationState {
+  return {
+    turns: [],
+    busy: false,
+    older: false,
+    question: null,
+    usageLimit: null,
+    error: null,
+    cloud: undefined,
+    approvals: NO_APPROVALS,
+    optimistic: [],
+    cachedOnly: false,
+  };
+}
+
+export function countUserItems(turns: Turn[]): number {
+  let count = 0;
+  for (const turn of turns) for (const item of turn.items) if (item.type === "user") count += 1;
+  return count;
+}
+
+/** Drops optimistic turns whose message the transcript now holds. */
+export function reconcile(state: ConversationState): ConversationState {
+  if (state.optimistic.length === 0) return state;
+  const count = countUserItems(state.turns);
+  const kept = state.optimistic.filter((turn) => count <= turn.baseline);
+  return kept.length === state.optimistic.length ? state : { ...state, optimistic: kept };
+}
+
+/** Folds the frames the watch delivered into the state. */
+export function withFrames(state: ConversationState, applied: AppliedFrames): ConversationState {
+  const lastQuestion = applied.questions.length > 0 ? applied.questions[applied.questions.length - 1] : undefined;
+  return reconcile({
+    ...state,
+    turns: applied.turns,
+    busy: applied.busy ?? state.busy,
+    older: applied.older ?? state.older,
+    question: lastQuestion !== undefined ? lastQuestion : state.question,
+    usageLimit: applied.usageLimit !== undefined ? applied.usageLimit : state.usageLimit,
+    error: applied.error ?? null,
+    // A field a frame does not carry is unchanged; `approvals: []` clears.
+    cloud: applied.cloud !== undefined ? applied.cloud : state.cloud,
+    approvals: applied.approvals !== undefined ? applied.approvals : state.approvals,
+    cachedOnly: false,
+  });
+}
+
+/** A `conversation.read` result is the whole conversation: it replaces the fields, even to clear them. */
+export function withRead(
+  state: ConversationState,
+  result: {
+    turns: Turn[];
+    busy?: boolean | undefined;
+    older: boolean;
+    usageLimit?: UsageLimit | null | undefined;
+    question?: QuestionPrompt | null | undefined;
+    cloud?: CloudField | undefined;
+    approvals?: Approval[] | undefined;
+  },
+): ConversationState {
+  return reconcile({
+    ...state,
+    turns: keepUnchanged(state.turns, result.turns),
+    busy: result.busy ?? false,
+    older: result.older,
+    question: result.question ?? null,
+    usageLimit: result.usageLimit ?? null,
+    error: null,
+    cloud: result.cloud,
+    approvals: result.approvals ?? NO_APPROVALS,
+    cachedOnly: false,
+  });
+}
+
+/** The received turns, reusing the previous object of a turn that did not change. */
+function keepUnchanged(previous: Turn[], received: Turn[]): Turn[] {
+  const known = new Map(previous.map((turn) => [turn.id, turn]));
+  const next = received.map((turn) => {
+    const old = known.get(turn.id);
+    return old && JSON.stringify(old) === JSON.stringify(turn) ? old : turn;
+  });
+  return next.length === previous.length && next.every((turn, index) => turn === previous[index]) ? previous : next;
+}
+
+export function withOptimistic(state: ConversationState, turn: OptimisticTurn): ConversationState {
+  return { ...state, optimistic: [...state.optimistic.filter((other) => other.id !== turn.id), turn] };
+}
+
+export function withOptimisticStatus(
+  state: ConversationState,
+  id: string,
+  patch: Pick<OptimisticTurn, "status"> & { error?: string | undefined },
+): ConversationState {
+  return {
+    ...state,
+    optimistic: state.optimistic.map((turn) => {
+      if (turn.id !== id) return turn;
+      const { error, ...rest } = turn;
+      void error;
+      return { ...rest, status: patch.status, ...(patch.error !== undefined ? { error: patch.error } : {}) };
+    }),
+  };
+}
+
+/** Wire attachments count for the optimistic turn. */
+export function attachmentCount(attachments: Attachment[] | undefined): number {
+  return attachments?.length ?? 0;
+}
