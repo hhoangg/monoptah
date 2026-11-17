@@ -147,6 +147,21 @@ impl Conversation {
             }
         }
     }
+    /// A tool asking to run, as a provider update would add it; `announce`
+    /// also tells the shell, as a real update does.
+    #[cfg(test)]
+    pub(crate) fn test_ask_approval(&mut self, id: &str, announce: bool, cx: &mut Context<Self>) {
+        self.approvals.push_back(Approval {
+            id: id.into(),
+            title: "Run a command?".into(),
+            detail: "git status --short".into(),
+            can_remember: true,
+        });
+        if announce {
+            cx.emit(SessionChanged);
+            cx.notify();
+        }
+    }
     pub(crate) fn mono_attention(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         div()
             .child(self.approval_shelf(window, cx))

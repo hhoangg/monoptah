@@ -1906,6 +1906,13 @@ impl Shell {
                 this.update_usage_provider(cx);
                 this.update_chat_visibility(cx);
                 this.invalidate_chrome(cx);
+                // The cached Monos view shows its launched sessions' approvals
+                // and states, which it reads without observing them.
+                if let Some(monos) = this.monos.as_ref()
+                    && monos.read(cx).lists_session(id)
+                {
+                    monos.update(cx, |_, cx| cx.notify());
+                }
                 cx.notify();
             }));
         self.observations.push(cx.subscribe(

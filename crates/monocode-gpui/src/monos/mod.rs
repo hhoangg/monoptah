@@ -169,6 +169,15 @@ pub(crate) struct Monos {
     /// Set while an app-level modal sits above the Mono page: a native web
     /// view would draw over it, so HTML documents stay hidden.
     suppress_html: bool,
+    /// Watches the accounts while Mono settings are open: the modal lists
+    /// accounts and models the cached view does not otherwise observe.
+    accounts_watch: Option<Subscription>,
+    /// Times the view rendered, to tell a cached reuse from a redraw.
+    #[cfg(test)]
+    renders: usize,
+    /// The wall-clock minute of the last tick that woke the view, so on-screen
+    /// times still move on while nothing else changes.
+    last_tick_minute: u64,
     /// Native visuals the Mono published in its chat, opened as documents.
     visual_documents: HashMap<String, Entity<crate::visuals::VisualView>>,
     project_changes: changes::ProjectChanges,
@@ -328,7 +337,29 @@ impl Monos {
         }
     }
     pub(crate) fn set_suppress_html(&mut self, suppress: bool) {
+        // Set from the shell's render, where a notify could not schedule a
+        // frame. It only matters while an HTML document shows, and then Monos
+        // is not cached (see `native_detail_content`), so it redraws anyway.
         self.suppress_html = suppress;
+    }
+    /// While settings are open, redraws when the accounts change (sign-in,
+    /// sign-out, a refreshed model catalog); otherwise watches nothing.
+    fn watch_accounts(&mut self, cx: &mut Context<Self>) {
+        if self.settings.is_none() {
+            self.accounts_watch = None;
+        } else if self.accounts_watch.is_none()
+            && let Some(accounts) = crate::accounts::get(cx)
+        {
+            self.accounts_watch = Some(cx.observe(&accounts, |_, _, cx| cx.notify()));
+        }
+    }
+    /// Whether a Mono lists the session among its launches, so changes to it
+    /// can reach the view.
+    pub(crate) fn lists_session(&self, id: i64) -> bool {
+        self.roster
+            .monos
+            .iter()
+            .any(|m| m.launches.iter().any(|l| l.session_id == id))
     }
     pub(crate) fn hide_html(&self, cx: &App) {
         for view in self.html_documents.values() {
@@ -463,6 +494,10 @@ impl Monos {
             documents: HashMap::new(),
             html_documents: HashMap::new(),
             suppress_html: false,
+            accounts_watch: None,
+            #[cfg(test)]
+            renders: 0,
+            last_tick_minute: 0,
             visual_documents: HashMap::new(),
             project_changes: Default::default(),
             review: None,
@@ -1800,6 +1835,11 @@ impl Monos {
 }
 impl gpui::Render for Monos {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        {
+            self.renders += 1;
+        }
+        self.watch_accounts(cx);
         self.hide_html(cx);
         let Some(mono) = self.current().cloned() else {
             return div().into_any_element();

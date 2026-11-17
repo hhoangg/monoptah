@@ -760,6 +760,17 @@ impl Shell {
                             {
                                 let session = monos.read(cx).active_notification_session(cx);
                                 let linked = session.and_then(|id| self.linked_notice(id, cx));
+                                // Native artifact views must update their frames and
+                                // clipping on every paint, so they keep the view
+                                // uncached, as the right panel does. Otherwise Monos
+                                // repaints only when it or something it reads notifies.
+                                let monos = if monos.read(cx).native_detail_content(cx) {
+                                    monos.into_any_element()
+                                } else {
+                                    monos
+                                        .cached(StyleRefinement::default().size_full())
+                                        .into_any_element()
+                                };
                                 let body = div()
                                     .relative()
                                     .size_full()
