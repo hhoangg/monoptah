@@ -1,4 +1,5 @@
-import { Link, Outlet } from "@tanstack/react-router";
+import { Link, Outlet, useRouterState } from "@tanstack/react-router";
+import { isPublicPath } from "@/features/accounts/authGuard";
 import { Glass } from "./Glass";
 import { Icon, type IconName } from "./Icon";
 
@@ -10,13 +11,20 @@ const NAV: ReadonlyArray<{ to: string; label: string; icon: IconName }> = [
 
 /** Shared Wave 0 shell: 44px header on a glass pill, safe-area padding, one scrolling main. */
 export function Shell() {
+  // Signed-out visitors (sign-in family, install guide) get the brand only, no app navigation.
+  const publicPage = useRouterState({ select: (state) => isPublicPath(state.location.pathname) });
   return (
     <div className="flex min-h-dvh flex-col bg-background text-content">
       <header className="sticky top-0 z-10 flex min-h-11 items-center gap-2 px-5 pt-[env(safe-area-inset-top)]">
         <Glass className="flex min-h-11 flex-1 items-center gap-1 px-2">
-          <Link to="/" className="rounded-pill px-3 py-2 text-small font-semibold">
-            Monoptah
-          </Link>
+          {publicPage ? (
+            <span className="px-3 py-2 text-small font-semibold">Monoptah</span>
+          ) : (
+            <Link to="/" className="rounded-pill px-3 py-2 text-small font-semibold">
+              Monoptah
+            </Link>
+          )}
+          {publicPage ? null : (
           <nav aria-label="Main" className="ml-auto flex items-center gap-1">
             {NAV.map((item) => (
               <Link
@@ -29,6 +37,7 @@ export function Shell() {
               </Link>
             ))}
           </nav>
+          )}
         </Glass>
       </header>
       <main className="flex-1 pb-[calc(env(safe-area-inset-bottom)+2.5rem)]">

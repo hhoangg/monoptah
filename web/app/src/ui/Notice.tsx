@@ -17,7 +17,7 @@ export function Notice({ variant = "info", title, children, className }: NoticeP
     <div
       role={isError ? "alert" : "status"}
       data-variant={variant}
-      className={cn("flex items-start gap-2.5 rounded-[16px] border border-stroke bg-fill p-3.5 text-small text-content", className)}
+      className={cn("flex items-start gap-2.5 rounded-[16px] border border-stroke bg-content-a04 p-3.5 text-small text-content", className)}
     >
       <Icon name={isError ? "alert" : "info"} size={18} className={cn("mt-0.5 shrink-0", isError ? "text-deletions" : "text-muted-text")} />
       <div className="min-w-0 flex-1">

@@ -20,7 +20,7 @@ export interface SegmentedControlProps<T extends string> {
 }
 
 /**
- * Segmented switch (design-system.md section 8): track 44px high with a 4px inset, thumb radius 18
+ * Segmented switch (design-system.md section 8): track 44px high (52 on touch, so options stay 44) with a 4px inset, thumb radius 18
  * that slides in 240ms. It is a single choice, so it is a `radiogroup` with a roving tabindex and
  * Left/Right/Home/End keys, not a tablist (there are no panels to switch).
  */
@@ -55,7 +55,7 @@ export function SegmentedControl<T extends string>({ label, options, value, onCh
   }
 
   return (
-    <div role="radiogroup" aria-label={label} className={cn("flex min-h-11 w-full gap-1 rounded-pill bg-fill p-1", className)}>
+    <div role="radiogroup" aria-label={label} className={cn("flex min-h-13 w-full gap-1 rounded-pill bg-fill p-1 pointer-fine:min-h-11", className)}>
       {options.map((option, index) => {
         const selected = option.value === value;
         return (
@@ -70,7 +70,7 @@ export function SegmentedControl<T extends string>({ label, options, value, onCh
             tabIndex={selected ? 0 : -1}
             onClick={() => select(index)}
             onKeyDown={(event) => onKeyDown(event, index)}
-            className="relative isolate inline-flex min-h-9 flex-1 items-center justify-center gap-1.5 rounded-[18px] px-3 text-small font-semibold text-content outline-offset-2"
+            className="relative isolate inline-flex min-h-11 flex-1 pointer-fine:min-h-9 items-center justify-center gap-1.5 rounded-[18px] px-3 text-small font-semibold text-content outline-offset-2"
           >
             {selected ? (
               <motion.span

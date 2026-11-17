@@ -1,8 +1,9 @@
 import { QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, RouterProvider } from "@tanstack/react-router";
 import { render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { setApiTransport } from "@/features/accounts/api";
+import { isPublicPath } from "@/features/accounts/authGuard";
 import { createMockServer } from "@/features/accounts/mock/transport";
 import { createQueryClient } from "@/lib/queryClient";
 import { createAppRouter } from "@/router";
@@ -106,11 +107,14 @@ const CASES: ReadonlyArray<{ url: string; route: string; params: Record<string, 
 ];
 
 // The auth guard asks `/api/me` for every non-public route: answer it with a signed-in mock account.
+// The public sign-in family is tested as a signed-out visitor (a signed-in one is sent on).
 let restoreTransport: (() => void) | undefined;
-beforeEach(() => {
-  restoreTransport = setApiTransport(createMockServer({ signedIn: true }).transport);
-});
 afterEach(() => restoreTransport?.());
+
+function installAccount(url: string) {
+  restoreTransport?.();
+  restoreTransport = setApiTransport(createMockServer({ signedIn: !isPublicPath(new URL(url, "http://x").pathname) }).transport);
+}
 
 // Routes whose stub was replaced by a real screen (W-02, W-11): they render one h1 instead of the stub.
 const SCREENS: Record<string, string> = {
@@ -124,6 +128,7 @@ const SCREENS: Record<string, string> = {
 };
 
 async function renderAt(url: string) {
+  installAccount(url);
   const queryClient = createQueryClient();
   const router = createAppRouter({ history: createMemoryHistory({ initialEntries: [url] }), queryClient });
   render(
@@ -138,11 +143,17 @@ async function renderAt(url: string) {
 }
 
 describe("route stubs", () => {
-  it.each(CASES)("renders $route for $url", async ({ url, route, params }) => {
-    await renderAt(url);
+  it.each(CASES)("renders $route for $url", async ({ url, route, params, fullPath }) => {
+    const router = await renderAt(url);
+    // Every route keeps its identity: the last match is this route with these params.
+    const last = router.state.matches.at(-1);
+    expect(last?.fullPath).toBe(fullPath);
+    for (const [key, value] of Object.entries(params)) expect(last?.params).toHaveProperty(key, value);
     if (SCREENS[route]) {
       expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
-      expect(screen.getByRole("navigation", { name: "Main" })).toBeInTheDocument();
+      // Signed-out visitors of the public family see no app navigation.
+      if (isPublicPath(new URL(url, "http://x").pathname)) expect(screen.queryByRole("navigation", { name: "Main" })).toBeNull();
+      else expect(screen.getByRole("navigation", { name: "Main" })).toBeInTheDocument();
       return;
     }
     const stub = screen.getByTestId("route-stub");

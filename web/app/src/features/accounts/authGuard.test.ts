@@ -52,6 +52,18 @@ describe("authGuard", () => {
     expect(await run("/recover", { signedIn: true, recoveryOnly: true })).toBeNull();
   });
 
+  it("treats a 403 recovery_only from GET /api/me as a recovery session (the registry does not allow /api/me there)", async () => {
+    restore = setApiTransport(async () => new Response(JSON.stringify({ error: "recovery only", code: "recovery_only" }), { status: 403, headers: { "Content-Type": "application/json" } }));
+    const queryClient = new QueryClient();
+    let error: unknown = null;
+    try {
+      await authGuard({ location: location("/settings"), context: { queryClient } });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(isRedirect(error) && error.options).toMatchObject({ to: "/recover" });
+  });
+
   it("forces the regenerate screen while recoveryAckAt is null", async () => {
     expect(await run("/desktops", { signedIn: true, recoveryAckAt: null })).toMatchObject({ to: "/settings" });
     expect(await run("/d/dk1", { signedIn: true, recoveryAckAt: null })).toMatchObject({ to: "/settings" });

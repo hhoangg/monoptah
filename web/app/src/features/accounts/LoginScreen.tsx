@@ -41,7 +41,7 @@ export function LoginScreen({ redirect }: { redirect?: string }) {
 
   return (
     <AuthLayout>
-      <PageHeader title="Sign in to Monoptah" description="Use the passkey saved on this device." />
+      <PageHeader size="display" title="Sign in to Monoptah" description="Use the passkey saved on this device." />
       {!supported ? <Notice variant="error">{UNSUPPORTED_ERROR}</Notice> : null}
       {error ? <Notice variant="error">{error}</Notice> : null}
       {cancelled ? <Notice variant="info">Sign-in was cancelled. Try again when you are ready.</Notice> : null}
@@ -51,7 +51,7 @@ export function LoginScreen({ redirect }: { redirect?: string }) {
           Sign in with passkey
           {busy ? <DelayedSpinner label="Waiting for your passkey" /> : null}
         </Button>
-        <p className="text-center text-meta text-muted-text">Use a phone or another device: your browser offers it in the passkey prompt.</p>
+        <p className="text-center text-meta text-muted-text">If your browser offers it, you can also use a passkey from your phone.</p>
       </div>
       <SettingsCard>
         <SettingsRow icon="key" title="Lost your passkey?" description="Use a recovery code" to="/recover" />

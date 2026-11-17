@@ -9,6 +9,7 @@ import { Notice } from "@/ui/Notice";
 import { PageHeader } from "@/ui/PageHeader";
 import { AddPasskeyStep } from "./AddPasskeyStep";
 import { passkeyErrorMessage, recoverErrorMessage } from "./authCopy";
+import { ApiError } from "./api";
 import { meQuery, ReauthCancelledError, recoverAccount, regenerateRecoveryCodes } from "./queries";
 import { RecoveryCodes } from "./RecoveryCodes";
 import { normalizeRecoveryCode } from "./recoveryCodesFile";
@@ -34,7 +35,10 @@ export function RecoverScreen() {
   const [accountHandle, setAccountHandle] = useState("");
   const [newCodes, setNewCodes] = useState<string[]>([]);
 
-  const step: Step = localStep ?? (me.data?.recoveryOnly ? "passkey" : "form");
+  // The registry lets a recovery-only session call neither GET /api/me nor logout, so its `me` is
+  // a 403 `recovery_only`: that alone says "add the passkey now". The handle is then unknown.
+  const recoverySession = me.data?.recoveryOnly === true || (me.error instanceof ApiError && me.error.code === "recovery_only");
+  const step: Step = localStep ?? (recoverySession ? "passkey" : "form");
   const resolvedHandle = accountHandle || me.data?.user.handle || handle.trim().toLowerCase();
 
   function finish() {
@@ -104,15 +108,12 @@ export function RecoverScreen() {
   if (step === "regenerate") {
     return (
       <AuthLayout>
-        <PageHeader title="Get new recovery codes" description="Only a few of your recovery codes are left." />
+        <PageHeader title="Get new recovery codes" description="Only a few of your recovery codes are left. Create a new set and save it to finish." />
         {error ? <Notice variant="error">{error}</Notice> : null}
         <div className="flex flex-col gap-2">
           <Button type="button" size="lg" className="w-full" disabled={busy} aria-busy={busy} onClick={() => void regenerate()}>
             Generate new codes
             {busy ? <DelayedSpinner label="Generating codes" /> : null}
-          </Button>
-          <Button type="button" variant="ghost" className="w-full" disabled={busy} onClick={finish}>
-            Not now
           </Button>
         </div>
       </AuthLayout>

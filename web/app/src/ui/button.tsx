@@ -19,21 +19,20 @@ export const buttonVariants = cva(
         link: "bg-transparent text-brand-text hover:underline",
         destructive: "bg-destructive text-inverse",
         /** Round icon button over content: bg fill, icon turns brand when `data-on`. */
-        circle: "rounded-pill bg-fill text-content hover:bg-selection data-[on=true]:text-brand",
+        circle: "bg-fill text-content hover:bg-selection data-[on=true]:text-brand",
       },
       size: {
         default: "min-h-11 px-4 py-2 pointer-fine:min-h-9 rounded-row",
-        sm: "min-h-9 px-3 rounded-row",
+        sm: "min-h-11 px-3 pointer-fine:min-h-9 rounded-row",
         /** Big call to action: radius 32. */
         lg: "min-h-14 px-6 text-body rounded-sheet",
         /** Send button and other pills: radius 999. */
         pill: "min-h-11 px-5 pointer-fine:min-h-9 rounded-pill",
         /** Circle button 44, 36 in the composer and on pointer: fine. */
-        circle: "size-11 pointer-fine:size-9 p-0",
-        "circle-sm": "size-9 p-0",
+        circle: "size-11 pointer-fine:size-9 p-0 rounded-pill",
+        "circle-sm": "size-9 p-0 rounded-pill",
       },
     },
-    compoundVariants: [{ variant: "circle", class: "rounded-pill" }],
     defaultVariants: { variant: "default", size: "default" },
   },
 );

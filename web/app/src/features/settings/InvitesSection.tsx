@@ -148,8 +148,9 @@ function InviteList({ data }: { data: ReturnType<typeof InvitesResponse.parse> }
                   ? `Created ${formatDate(invite.createdAt)}, expires ${formatDate(invite.expiresAt)}`
                   : `Created ${formatDate(invite.createdAt)}`;
             return (
-              <li key={invite.id}>
-                <SettingsRow
+              <SettingsRow
+                  as="li"
+                  key={invite.id}
                   icon={state === "joined" ? "success" : "link"}
                   title={title}
                   description={description}
@@ -168,7 +169,6 @@ function InviteList({ data }: { data: ReturnType<typeof InvitesResponse.parse> }
                     ) : null
                   }
                 />
-              </li>
             );
           })}
         </ul>

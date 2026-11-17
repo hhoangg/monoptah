@@ -77,10 +77,19 @@ export function onForgetDesktop(handler: ForgetHandler): () => void {
   };
 }
 
-/** Runs every registered handler; with none registered this does nothing. Always drops the cached link. */
+/** localStorage flag per desktop: the first-run picker was shown once. Holds "1" only, nothing sensitive. */
+export const pickerSeenKey = (desktopId: string): string => `monoptah.pickerSeen.${desktopId}`;
+
+/** Runs every registered handler; with none registered this does nothing. Always drops the cached link and the "picker seen" flag. */
 export async function forgetDesktopLocally(desktopId: string): Promise<void> {
   for (const handler of [...forgetHandlers]) await handler(desktopId);
   dropDesktopLink(desktopId);
+  // Pairing the same desktop again starts with the first-run picker again.
+  try {
+    window.localStorage.removeItem(pickerSeenKey(desktopId));
+  } catch {
+    // Storage unavailable: nothing to clear.
+  }
 }
 
 /** Drops the provider, the cached links and every forget handler. For tests. */

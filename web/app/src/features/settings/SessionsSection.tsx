@@ -56,8 +56,9 @@ function SessionList({ sessions }: { sessions: Session[] }) {
     <>
       <ul className="m-0 list-none p-0">
         {sessions.map((session) => (
-          <li key={session.id}>
-            <SettingsRow
+          <SettingsRow
+              as="li"
+              key={session.id}
               icon="computer"
               title={
                 <span className="flex flex-wrap items-center gap-2">
@@ -81,7 +82,6 @@ function SessionList({ sessions }: { sessions: Session[] }) {
                 )
               }
             />
-          </li>
         ))}
       </ul>
       <div className="flex flex-col gap-3 px-1.5 py-2">

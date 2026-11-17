@@ -1,10 +1,9 @@
 import { useState } from "react";
 import { useLinkDesktopId } from "@/link/LinkProvider";
-import { useDesktopLink } from "./desktopLink";
+import { pickerSeenKey, useDesktopLink } from "./desktopLink";
 import { ProjectsPicker } from "./ProjectsPicker";
 
-/** localStorage flag per desktop: the picker was shown once. Holds "1" only, nothing sensitive. */
-export const pickerSeenKey = (desktopId: string): string => `monoptah.pickerSeen.${desktopId}`;
+export { pickerSeenKey };
 
 export function hasSeenPicker(desktopId: string): boolean {
   try {
@@ -29,6 +28,11 @@ function markPickerSeen(desktopId: string): void {
  */
 export function FirstRunPicker() {
   const desktopId = useLinkDesktopId();
+  // Keyed by desktop: the layout is not remounted when the param changes, so each desktop gets its own "seen" state.
+  return <FirstRunPickerFor key={desktopId} desktopId={desktopId} />;
+}
+
+function FirstRunPickerFor({ desktopId }: { desktopId: string }) {
   const { link, status } = useDesktopLink(desktopId);
   const [seen, setSeen] = useState(() => hasSeenPicker(desktopId));
   if (!link || seen || status !== "connected") return null;

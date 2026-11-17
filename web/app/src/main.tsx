@@ -6,6 +6,7 @@ import { RouterProvider } from "@tanstack/react-router";
 import { MotionConfig } from "motion/react";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
+import { installSessionExpiryHandler } from "@/features/accounts/sessionExpiry";
 import { startAppearanceSync } from "@/lib/appearance";
 import { queryClient } from "@/lib/queryClient";
 import { Toaster } from "@/ui/sonner";
@@ -19,6 +20,7 @@ import "./features/layout/register";
 import "./features/settings/register";
 
 startAppearanceSync();
+installSessionExpiryHandler(queryClient, router);
 
 async function start() {
   // Dev only: the mock API replaces the network. The condition is a build-time constant, so the

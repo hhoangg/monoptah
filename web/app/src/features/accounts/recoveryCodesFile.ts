@@ -25,7 +25,9 @@ export function recoveryCodesText(handle: string, codes: readonly string[]): str
   ].join("\n");
 }
 
-/** Saves text as a file through a Blob and an object URL that is revoked right after the click. */
+const REVOKE_DELAY_MS = 30_000;
+
+/** Saves text as a file through a Blob and an object URL that is revoked a little after the click. */
 export function downloadTextFile(fileName: string, text: string): void {
   const url = URL.createObjectURL(new Blob([text], { type: "text/plain;charset=utf-8" }));
   try {
@@ -37,6 +39,7 @@ export function downloadTextFile(fileName: string, text: string): void {
     link.click();
     link.remove();
   } finally {
-    URL.revokeObjectURL(url);
+    // Some WebKit builds start the download after the click task; revoking at once can fail it.
+    setTimeout(() => URL.revokeObjectURL(url), REVOKE_DELAY_MS);
   }
 }

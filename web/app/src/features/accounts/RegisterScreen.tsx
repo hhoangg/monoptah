@@ -1,7 +1,7 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { Link, useRouter } from "@tanstack/react-router";
 import { RegisterOptionsBody } from "@monoptah/protocol";
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { AuthLayout } from "@/ui/AuthLayout";
 import { Button } from "@/ui/button";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
@@ -18,14 +18,17 @@ import { passkeysSupported } from "./webauthn";
 
 type Step = "form" | "codes" | "passkey";
 
-/** Reads `#invite=CODE` and removes the fragment from the address bar and history entry. */
-export function takeInviteFromFragment(): string {
+/** Reads `#invite=CODE` from the address bar. Pure: safe to run again if React retries a render. */
+export function readInviteFromFragment(): string {
   const hash = window.location.hash;
   if (!hash) return "";
-  const invite = new URLSearchParams(hash.slice(1)).get("invite")?.trim() ?? "";
-  // Keep the router's history state; only the fragment goes away.
+  return new URLSearchParams(hash.slice(1)).get("invite")?.trim() ?? "";
+}
+
+/** Removes the fragment from the address bar and history entry, keeping the router's history state. */
+export function scrubInviteFragment(): void {
+  if (!window.location.hash) return;
   window.history.replaceState(window.history.state, "", window.location.pathname + window.location.search);
-  return invite;
 }
 
 interface FormErrors {
@@ -51,7 +54,9 @@ function validate(values: { invite: string; handle: string; displayName: string 
 export function RegisterScreen() {
   const queryClient = useQueryClient();
   const router = useRouter();
-  const [invite, setInvite] = useState(takeInviteFromFragment);
+  const [invite, setInvite] = useState(readInviteFromFragment);
+  // After commit, so a discarded or retried render still finds the fragment (idempotent).
+  useEffect(scrubInviteFragment, []);
   const [handle, setHandle] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [errors, setErrors] = useState<FormErrors>({});

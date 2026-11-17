@@ -307,9 +307,6 @@ const handlers: Record<string, Handler> = {
   },
 };
 
-/** Routes a `recovery_only` session may call (A-04, A-05, A-08). */
-const RECOVERY_ONLY_ALLOWED = new Set(["GET /api/me", "POST /api/auth/logout", "GET /api/passkeys", "POST /api/passkeys/options", "POST /api/passkeys/verify"]);
-
 const compiled = Object.keys(handlers).map((key) => {
   const [method, path] = key.split(" ") as [string, string];
   const regex = new RegExp(`^${path.replace(/:([A-Za-z0-9_]+)/g, "(?<$1>[^/]+)")}$`);
@@ -377,7 +374,7 @@ export function createMockServer(options: MockTransportOptions = {}): MockTransp
       if (route.auth !== "public") {
         if (!state.signedIn) throw new MockHttpError(401, "unauthorized", "Sign in first");
         if (state.recoveryOnly) {
-          if (!RECOVERY_ONLY_ALLOWED.has(entry.key)) throw new MockHttpError(403, "recovery_only", "This session can only add a passkey");
+          if (!route.allowRecoveryOnly) throw new MockHttpError(403, "recovery_only", "This session can only add a passkey");
         } else if (route.auth === "fresh" && !isFresh(state)) {
           throw new MockHttpError(403, "fresh_required", "Confirm with your passkey first");
         }

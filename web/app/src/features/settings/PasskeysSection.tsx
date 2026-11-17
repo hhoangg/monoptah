@@ -72,8 +72,9 @@ function PasskeyList({ passkeys }: { passkeys: Passkey[] }) {
     <>
       <ul className="m-0 list-none p-0">
         {passkeys.map((passkey) => (
-          <li key={passkey.id}>
-            <SettingsRow
+          <SettingsRow
+              as="li"
+              key={passkey.id}
               icon="fingerprint"
               title={passkey.name}
               description={details(passkey)}
@@ -109,7 +110,6 @@ function PasskeyList({ passkeys }: { passkeys: Passkey[] }) {
                 </span>
               }
             />
-          </li>
         ))}
       </ul>
       {last ? (

@@ -19,7 +19,7 @@ export interface RecoveryCodesProps {
 
 /**
  * Shared recovery codes view (register, regenerate in settings, forced regenerate): shown once,
- * Copy, Download, and a Continue that stays disabled until the "I saved these codes" box is ticked.
+ * Copy, Download, Print, and a Continue that stays disabled until the "I saved these codes" box is ticked.
  * The server records the acknowledgement itself when it issues the codes (register or regenerate),
  * so the gate here is client-side only: the contract has no route to say "I saved these".
  */
@@ -46,16 +46,20 @@ export function RecoveryCodes({ handle, codes, onContinue, continueLabel = "Cont
       <Notice variant="info" title="Shown only once">
         Each code signs you in once if you lose your passkeys. Save them now; Monoptah cannot show them again.
       </Notice>
-      <ol aria-label="Recovery codes" className="grid list-none grid-cols-1 gap-2 min-[28rem]:grid-cols-2 rounded-row bg-fill p-3">
-        {codes.map((code, index) => (
-          <li key={code} className="flex items-baseline gap-2 font-mono text-label tabular-nums text-content">
-            <span aria-hidden="true" className="w-5 shrink-0 text-right text-caption text-muted-text">
-              {index + 1}
-            </span>
-            <span className="min-w-0 break-all">{code}</span>
-          </li>
-        ))}
-      </ol>
+      <div data-print-area className="flex flex-col gap-2">
+        <p className="hidden text-body font-semibold print:block">{`Monoptah recovery codes for ${handle}`}</p>
+        {/* One column: a code is 19 characters and must never wrap in the middle. */}
+        <ol aria-label="Recovery codes" className="grid list-none grid-cols-1 gap-2 rounded-row bg-fill p-3">
+          {codes.map((code, index) => (
+            <li key={code} className="flex items-baseline gap-2 font-mono text-label tabular-nums whitespace-nowrap text-content">
+              <span aria-hidden="true" className="w-5 shrink-0 text-right text-caption text-muted-text">
+                {index + 1}
+              </span>
+              <span>{code}</span>
+            </li>
+          ))}
+        </ol>
+      </div>
       <div className="flex flex-wrap gap-2">
         <Button type="button" variant="outline" className="flex-1" onClick={() => void copy()}>
           <Icon name={copyState === "copied" ? "check" : "copy"} size={18} />
@@ -64,6 +68,10 @@ export function RecoveryCodes({ handle, codes, onContinue, continueLabel = "Cont
         <Button type="button" variant="outline" className="flex-1" onClick={() => downloadTextFile(recoveryCodesFileName(handle), recoveryCodesText(handle, codes))}>
           <Icon name="download" size={18} />
           Download
+        </Button>
+        <Button type="button" variant="outline" className="flex-1" onClick={() => window.print()}>
+          <Icon name="print" size={18} />
+          Print
         </Button>
       </div>
       <p role="status" className="min-h-5 text-meta text-muted-text">

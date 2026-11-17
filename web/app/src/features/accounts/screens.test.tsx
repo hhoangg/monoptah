@@ -18,6 +18,7 @@ import { createMockServer } from "./mock/transport";
 import { createMockState, newRecoveryBatch, SEED_INVITE_CODE, type SeedOptions } from "./mock/state";
 import { normalizeRecoveryCode, recoveryCodesFileName, recoveryCodesText } from "./recoveryCodesFile";
 import { RecoveryCodes } from "./RecoveryCodes";
+import { readInviteFromFragment, scrubInviteFragment } from "./RegisterScreen";
 
 const CREDENTIAL = { id: "cred", rawId: "cred", type: "public-key", response: {}, clientExtensionResults: {} };
 
@@ -63,6 +64,18 @@ afterEach(() => {
 function storedText(): string {
   return JSON.stringify([...Object.entries(localStorage), ...Object.entries(sessionStorage)]);
 }
+
+describe("invite fragment", () => {
+  it("is read without a side effect, so a retried render finds it again, and scrubbed separately", () => {
+    window.history.replaceState({ key: "k1" }, "", "/register#invite=ABC");
+    expect(readInviteFromFragment()).toBe("ABC");
+    expect(readInviteFromFragment()).toBe("ABC");
+    expect(window.location.hash).toBe("#invite=ABC");
+    scrubInviteFragment();
+    expect(window.location.hash).toBe("");
+    expect(window.history.state).toEqual({ key: "k1" });
+  });
+});
 
 describe("register", () => {
   it("runs the happy path: invite from the fragment, codes, gate, second passkey prompt", async () => {
@@ -147,6 +160,14 @@ describe("register", () => {
 });
 
 describe("login", () => {
+  it("does not promise cross-device sign-in", async () => {
+    install({ signedIn: false });
+    mount("/login");
+    await screen.findByRole("heading", { level: 1, name: "Sign in to Monoptah" });
+    expect(screen.getByText(/If your browser offers it/)).toBeInTheDocument();
+    expect(screen.queryByText(/another device/)).toBeNull();
+  });
+
   it("shows a soft notice, not an error, when the prompt is cancelled", async () => {
     install({ signedIn: false });
     lib.startAuthentication.mockRejectedValue(Object.assign(new Error("x"), { name: "NotAllowedError" }));
@@ -196,6 +217,13 @@ describe("recover", () => {
     expect(await screen.findByRole("heading", { level: 1, name: "Add a new passkey" })).toBeInTheDocument();
   });
 
+  it("sends the user on to the passkey step when the session is recovery-only and /api/me answers 403", async () => {
+    const state = install({ signedIn: true, recoveryOnly: true });
+    mount("/recover");
+    await screen.findByRole("heading", { level: 1, name: "Add a new passkey" });
+    expect(state.recoveryOnly).toBe(true);
+  });
+
   it("answers every failure with the same generic message", async () => {
     install({ signedIn: false });
     const user = userEvent.setup();
@@ -220,6 +248,8 @@ describe("recover", () => {
     await screen.findByRole("heading", { level: 1, name: "Add a new passkey" });
     await user.click(screen.getByRole("button", { name: "Add a passkey" }));
     await screen.findByRole("heading", { level: 1, name: "Get new recovery codes" });
+    // Forced: no way to skip the regenerate step.
+    expect(screen.queryByRole("button", { name: /not now|skip/i })).toBeNull();
     await user.click(screen.getByRole("button", { name: /Generate new codes/ }));
     await screen.findByRole("heading", { level: 1, name: "Save your new recovery codes" });
     expect(within(screen.getByRole("list", { name: "Recovery codes" })).getAllByRole("listitem")).toHaveLength(10);
@@ -245,6 +275,7 @@ describe("RecoveryCodes", () => {
   const codes = Array.from({ length: 10 }, (_, i) => `CODE${i}-ABCDE`);
 
   it("downloads a text file named with the handle through a revoked object URL", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     const create = vi.fn(() => "blob:test");
     const revoke = vi.fn();
     Object.assign(URL, { createObjectURL: create, revokeObjectURL: revoke });
@@ -256,8 +287,24 @@ describe("RecoveryCodes", () => {
     await user.click(screen.getByRole("button", { name: "Download" }));
     expect(click).toHaveBeenCalledOnce();
     expect(create).toHaveBeenCalledOnce();
+    // Not revoked in the click task (WebKit may start the download later), but after a delay.
+    expect(revoke).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(30_000);
     expect(revoke).toHaveBeenCalledWith("blob:test");
     click.mockRestore();
+    vi.useRealTimers();
+  });
+
+  it("prints through window.print and keeps one marked print area", async () => {
+    const print = vi.spyOn(window, "print").mockImplementation(() => undefined);
+    const user = userEvent.setup();
+    const { container } = render(<RecoveryCodes handle="ada" codes={codes} onContinue={() => {}} />);
+    await user.click(screen.getByRole("button", { name: "Print" }));
+    expect(print).toHaveBeenCalledOnce();
+    const area = container.querySelector("[data-print-area]");
+    expect(area).not.toBeNull();
+    expect(area?.querySelectorAll("li")).toHaveLength(10);
+    print.mockRestore();
   });
 
   it("copies the handle and the codes", async () => {

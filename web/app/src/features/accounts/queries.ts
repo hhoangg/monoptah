@@ -1,7 +1,7 @@
 // Query options and call helpers for the account API (architecture.md 3.2). Screens use the
 // query options with `useQuery` and the functions in mutations; every ceremony function returns a
 // `cancelled` result when the user dismisses the browser prompt instead of throwing.
-import { queryOptions, useMutation, useQueryClient, type QueryClient } from "@tanstack/react-query";
+import { queryOptions, type QueryClient } from "@tanstack/react-query";
 import type { MeResponse, PushPrefsResponse, User } from "@monoptah/protocol";
 import { ApiError, apiFetch } from "./api";
 import { endpoints } from "./endpoints";
@@ -90,6 +90,18 @@ export async function withFreshAuth<T>(fn: () => Promise<T>, reauthFn: typeof re
 
 // --- Auth flows ---
 
+/** Query keys that belong to the desktop link, not to the signed-in account (W-05). */
+const ACCOUNT_INDEPENDENT_KEYS: ReadonlySet<unknown> = new Set(["link"]);
+
+/**
+ * Drops every account-scoped cached value (`me`, passkeys, sessions, invites, desktops, ...). Run
+ * on sign-in, register, recover and when a call answers 401, so one account never sees another's
+ * cached data in the same tab (security review L2). Desktop link data is not account data.
+ */
+export function clearAccountCache(queryClient: QueryClient): void {
+  queryClient.removeQueries({ predicate: (query) => !ACCOUNT_INDEPENDENT_KEYS.has(query.queryKey[0]) });
+}
+
 export interface RegisterInput {
   invite: string;
   handle: string;
@@ -105,7 +117,7 @@ export async function registerAccount(
   const result = await createPasskey(options);
   if (result.status === "cancelled") return result;
   const verified = await apiFetch(endpoints.registerVerify, { body: { challengeId, response: wireResponse(result.response) } });
-  await queryClient.invalidateQueries({ queryKey: ME_KEY });
+  clearAccountCache(queryClient);
   return { status: "ok", user: verified.user, recoveryCodes: verified.recoveryCodes };
 }
 
@@ -115,14 +127,14 @@ export async function signIn(queryClient: QueryClient): Promise<{ status: "ok"; 
   const result = await getPasskey(options);
   if (result.status === "cancelled") return result;
   const verified = await apiFetch(endpoints.loginVerify, { body: { challengeId, response: wireResponse(result.response) } });
-  await queryClient.invalidateQueries({ queryKey: ME_KEY });
+  clearAccountCache(queryClient);
   return { status: "ok", user: verified.user };
 }
 
 /** Consumes a recovery code. The session that follows is `recoveryOnly` (adds a passkey only). */
 export async function recoverAccount(queryClient: QueryClient, input: { handle: string; code: string }) {
   const result = await apiFetch(endpoints.recover, { body: input });
-  await queryClient.invalidateQueries({ queryKey: ME_KEY });
+  clearAccountCache(queryClient);
   return result;
 }
 
@@ -204,31 +216,4 @@ export type PushPrefs = ReturnType<typeof PushPrefsResponse.parse>;
 /** Per-desktop notification preferences (W-11). The contract has no GET: keep the PUT result. */
 export function savePushPrefs(desktopId: string, prefs: PushPrefs): Promise<PushPrefs> {
   return apiFetch(endpoints.putPushPrefs, { params: { desktopId }, body: prefs });
-}
-
-// --- Hooks ---
-
-/** Mutation hooks bind the helpers above to the provider's query client. */
-export function useSignIn() {
-  const queryClient = useQueryClient();
-  return useMutation({ mutationFn: () => signIn(queryClient) });
-}
-
-export function useRegisterAccount() {
-  const queryClient = useQueryClient();
-  return useMutation({ mutationFn: (input: RegisterInput) => registerAccount(queryClient, input) });
-}
-
-export function useRecoverAccount() {
-  const queryClient = useQueryClient();
-  return useMutation({ mutationFn: (input: { handle: string; code: string }) => recoverAccount(queryClient, input) });
-}
-
-export function useSignOut() {
-  const queryClient = useQueryClient();
-  return useMutation({ mutationFn: () => signOut(queryClient) });
-}
-
-export function useReauth() {
-  return useMutation({ mutationFn: () => reauth() });
 }

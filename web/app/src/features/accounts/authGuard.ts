@@ -51,6 +51,11 @@ export const authGuard: AuthGuard = async ({ location, context }) => {
         replace: true,
       });
     }
+    // The registry does not let a recovery-only session call GET /api/me: 403 `recovery_only`
+    // means exactly that session, so it is confined like `me.recoveryOnly` below.
+    if (error instanceof ApiError && error.status === 403 && error.code === "recovery_only") {
+      throw redirect({ to: RECOVERY_ADD_PASSKEY_PATH, replace: true });
+    }
     throw error;
   }
 

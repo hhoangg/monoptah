@@ -1,0 +1,7 @@
+/* Print (recovery codes, W-02): only the element marked data-print-area reaches the page. */
+@media print {
+  body * { visibility: hidden; }
+  [data-print-area], [data-print-area] * { visibility: visible; }
+  [data-print-area] { position: absolute; inset-inline: 0; top: 0; padding: 1rem; background: #fff; color: #000; }
+  [data-print-area] [data-print-hide] { display: none; }
+}

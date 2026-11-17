@@ -10,7 +10,7 @@ const webauthn = vi.hoisted(() => ({
 }));
 vi.mock("./webauthn", () => webauthn);
 
-import { addPasskey, deletePasskey, meQuery, regenerateRecoveryCodes, ReauthCancelledError, registerAccount, signIn, withFreshAuth } from "./queries";
+import { addPasskey, clearAccountCache, deletePasskey, meQuery, regenerateRecoveryCodes, ReauthCancelledError, registerAccount, signIn, withFreshAuth } from "./queries";
 
 const ASSERTION = { status: "ok", response: { id: "cred", rawId: "cred", type: "public-key", response: {}, clientExtensionResults: {} } };
 let restore: (() => void) | undefined;
@@ -109,5 +109,38 @@ describe("flows against the mock", () => {
     expect(retry(0, new ApiError({ status: 401, code: "unauthorized", message: "no" }))).toBe(false);
     expect(retry(0, new ApiError({ status: 0, code: "network", message: "no" }))).toBe(true);
     await expect(queryClient.fetchQuery(meQuery)).rejects.toMatchObject({ status: 401 });
+  });
+});
+
+describe("account cache on a change of session (L2)", () => {
+  async function seed() {
+    queryClient.setQueryData(["passkeys"], { passkeys: [{ id: "old" }] });
+    queryClient.setQueryData(["sessions"], { sessions: [] });
+    queryClient.setQueryData(["me"], { stale: true });
+    queryClient.setQueryData(["link", "d1", "workspace.list"], { keep: true });
+  }
+
+  it("sign-in drops every account query and keeps the desktop link data", async () => {
+    useMock({ signedIn: false });
+    await seed();
+    await signIn(queryClient);
+    expect(queryClient.getQueryData(["passkeys"])).toBeUndefined();
+    expect(queryClient.getQueryData(["sessions"])).toBeUndefined();
+    expect(queryClient.getQueryData(["me"])).toBeUndefined();
+    expect(queryClient.getQueryData(["link", "d1", "workspace.list"])).toEqual({ keep: true });
+  });
+
+  it("register drops the previous account's cache", async () => {
+    useMock({ signedIn: false });
+    await seed();
+    await registerAccount(queryClient, { invite: SEED_INVITE_CODE, handle: "ada", displayName: "Ada" });
+    expect(queryClient.getQueryData(["passkeys"])).toBeUndefined();
+  });
+
+  it("clearAccountCache removes only account-scoped keys", async () => {
+    await seed();
+    clearAccountCache(queryClient);
+    expect(queryClient.getQueryData(["me"])).toBeUndefined();
+    expect(queryClient.getQueryData(["link", "d1", "workspace.list"])).toBeDefined();
   });
 });

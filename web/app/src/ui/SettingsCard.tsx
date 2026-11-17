@@ -34,6 +34,10 @@ export interface SettingsRowProps {
   /** Renders a router link row with a chevron; use for in-app targets. */
   to?: LinkProps["to"];
   className?: string;
+  /** With `onClick`: keeps the button (and keyboard focus) but ignores clicks, announced as disabled. */
+  disabled?: boolean;
+  /** Renders a static row as a list item, so the divider logic sees its siblings (rows in a `<ul>`). */
+  as?: "li";
 }
 
 const ROW_BASE =
@@ -43,7 +47,7 @@ const ROW_BASE =
  * One row: min height 52, radius 12, 36px icon slot, dividers 1px inset 40 with an icon (16 without).
  * Pass `to` or `onClick` to make the whole row interactive.
  */
-export function SettingsRow({ icon, title, description, trailing, onClick, to, className }: SettingsRowProps) {
+export function SettingsRow({ icon, title, description, trailing, onClick, to, className, as, disabled }: SettingsRowProps) {
   const interactive = Boolean(onClick || to);
   const classes = cn(ROW_BASE, icon ? "before:left-10" : "before:left-4", interactive && "hover:bg-selection active:opacity-60", className);
   const body = (
@@ -70,10 +74,11 @@ export function SettingsRow({ icon, title, description, trailing, onClick, to, c
   }
   if (onClick) {
     return (
-      <button type="button" onClick={onClick} className={classes}>
+      <button type="button" onClick={disabled ? undefined : onClick} aria-disabled={disabled || undefined} className={cn(classes, disabled && "opacity-40")}>
         {body}
       </button>
     );
   }
+  if (as === "li") return <li className={classes}>{body}</li>;
   return <div className={classes}>{body}</div>;
 }

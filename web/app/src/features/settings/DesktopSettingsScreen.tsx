@@ -69,9 +69,11 @@ function DesktopSettings({ desktopId, name, accountOnline, lastSeenAt }: { deskt
   const reconnect = useAction();
   const remove = useAction();
   const [reconnected, setReconnected] = useState(false);
+  // True after `device.leave` failed for a reason other than "offline": the user may forget locally.
+  const [leaveFailed, setLeaveFailed] = useState(false);
 
   const stateLabel = !accountOnline ? "Desktop offline" : status ? LINK_LABELS[status] : NOT_CONNECTED;
-  const offline = !accountOnline || status === "offline";
+  const offline = !accountOnline || status === "offline" || status === "failed";
 
   async function onReconnect(): Promise<void> {
     if (!link) return;
@@ -84,14 +86,19 @@ function DesktopSettings({ desktopId, name, accountOnline, lastSeenAt }: { deskt
     setReconnected(ok);
   }
 
-  async function onRemove(): Promise<void> {
+  /** `forceLocal` skips the desktop call: the user chose to forget this desktop on this device only. */
+  async function onRemove(forceLocal = false): Promise<void> {
     const ok = await remove.run(async () => {
-      if (link && !offline) {
+      if (link && !offline && !forceLocal) {
         try {
           await link.call("device.leave", {});
         } catch (caught) {
-          // An unreachable desktop must not trap the browser: forget locally and say so.
-          if (!(caught instanceof DesktopLinkError) || caught.code !== "desktop_offline") throw caught;
+          // An unreachable desktop must not trap the browser: forget locally and say so. Any other
+          // failure stops here and offers "Remove from this device anyway" instead.
+          if (!(caught instanceof DesktopLinkError) || caught.code !== "desktop_offline") {
+            setLeaveFailed(true);
+            throw caught;
+          }
         }
       }
       await forgetDesktopLocally(desktopId);
@@ -133,7 +140,8 @@ function DesktopSettings({ desktopId, name, accountOnline, lastSeenAt }: { deskt
           icon="refresh"
           title="Reconnect"
           description={reconnect.busy ? "Reconnecting..." : "Run the handshake again and refresh the project list"}
-          onClick={link && !reconnect.busy ? () => void onReconnect() : undefined}
+          onClick={link ? () => void onReconnect() : undefined}
+          disabled={reconnect.busy}
         />
         {reconnect.error ? (
           <Notice variant="error" className="my-1.5">
@@ -153,6 +161,7 @@ function DesktopSettings({ desktopId, name, accountOnline, lastSeenAt }: { deskt
           description="Forget this desktop in this browser"
           onClick={() => {
             remove.reset();
+            setLeaveFailed(false);
             setConfirmOpen(true);
           }}
         />
@@ -163,7 +172,9 @@ function DesktopSettings({ desktopId, name, accountOnline, lastSeenAt }: { deskt
         onOpenChange={setConfirmOpen}
         title="Remove this desktop from this device?"
         description={
-          offline || !link
+          leaveFailed
+            ? `${name} could not be told to forget this browser. You can still remove it from this device only; it may keep listing this browser until you revoke access in Desktops.`
+            : offline || !link
             ? `${name} is offline or not connected, so it will only be forgotten in this browser. To revoke this device's access on your account, use Desktops.`
             : `${name} will forget this browser and this browser will forget ${name}. You can pair again later.`
         }
@@ -172,6 +183,7 @@ function DesktopSettings({ desktopId, name, accountOnline, lastSeenAt }: { deskt
         busy={remove.busy}
         error={remove.error}
         onConfirm={() => void onRemove()}
+        secondary={leaveFailed ? { label: "Remove from this device anyway", onClick: () => void onRemove(true) } : undefined}
       />
     </>
   );

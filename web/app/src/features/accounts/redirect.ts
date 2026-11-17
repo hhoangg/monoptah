@@ -26,6 +26,9 @@ export function safeRedirectTarget(raw: unknown): string | null {
     return null;
   }
   if (url.origin !== BASE) return null;
+  // Dot segments collapse during parsing: "/..//evil.example" becomes "//evil.example", which a
+  // consumer that does not normalise again would read as a protocol-relative URL.
+  if (url.pathname.startsWith("//")) return null;
   return `${url.pathname}${url.search}${url.hash}`;
 }
 

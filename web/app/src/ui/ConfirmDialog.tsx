@@ -19,13 +19,15 @@ export interface ConfirmDialogProps {
   /** A soft, non-error message (for example a closed passkey prompt). */
   notice?: string | null;
   onConfirm: () => void;
+  /** An extra action between Cancel and the confirm button (for example "Remove anyway"). */
+  secondary?: { label: string; onClick: () => void };
 }
 
 /**
  * Confirmation (design-system.md section 11: confirmations are a centered `Dialog`, radius 20, on
  * every breakpoint). The dialog cannot be dismissed while `busy`. The caller closes it on success.
  */
-export function ConfirmDialog({ open, onOpenChange, title, description, confirmLabel, destructive = false, busy = false, error, notice, onConfirm }: ConfirmDialogProps) {
+export function ConfirmDialog({ open, onOpenChange, title, description, confirmLabel, destructive = false, busy = false, error, notice, onConfirm, secondary }: ConfirmDialogProps) {
   return (
     <Dialog open={open} onOpenChange={(next) => (busy ? undefined : onOpenChange(next))}>
       <DialogContent showClose={false} onEscapeKeyDown={(event) => busy && event.preventDefault()} onInteractOutside={(event) => busy && event.preventDefault()}>
@@ -39,6 +41,11 @@ export function ConfirmDialog({ open, onOpenChange, title, description, confirmL
           <Button type="button" variant="ghost" disabled={busy} onClick={() => onOpenChange(false)}>
             Cancel
           </Button>
+          {secondary ? (
+            <Button type="button" variant="outline" disabled={busy} onClick={secondary.onClick}>
+              {secondary.label}
+            </Button>
+          ) : null}
           <Button type="button" variant={destructive ? "destructive" : "default"} disabled={busy} aria-busy={busy} onClick={onConfirm}>
             {confirmLabel}
             {busy ? <DelayedSpinner label="Working" /> : null}

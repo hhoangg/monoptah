@@ -9,7 +9,7 @@ import { createMockState } from "@/features/accounts/mock/state";
 import { createQueryClient } from "@/lib/queryClient";
 import { createAppRouter } from "@/router";
 import { clearSlots, registerSlot } from "@/ui/slots";
-import { forgetDesktopLocally, onForgetDesktop, provideDesktopLink, resetDesktopLinks } from "./desktopLink";
+import { DesktopLinkError, forgetDesktopLocally, onForgetDesktop, provideDesktopLink, resetDesktopLinks } from "./desktopLink";
 import { FirstRunPicker, pickerSeenKey } from "./FirstRunPicker";
 import { createMockDesktopLink, type MockDesktopLink } from "./mockDesktopLink";
 
@@ -125,19 +125,24 @@ describe("/d/:desktopId/settings", () => {
 });
 
 describe("notifications", () => {
-  it("saves the categories with PUT /api/push/prefs/:desktopId and keeps the saved result", async () => {
+  it("shows the switches as not loaded, sends nothing on a flip, and saves all values on an explicit Save", async () => {
     const user = userEvent.setup();
     provideMockLink();
     mount(SETTINGS);
     const toggle = await screen.findByRole("switch", { name: "Agent finished" });
-    expect(toggle).toBeChecked();
+    expect(screen.getByText("Current settings not loaded")).toBeInTheDocument();
     await user.click(toggle);
-    await waitFor(() => expect(screen.getByRole("switch", { name: "Agent finished" })).not.toBeChecked());
+    expect(screen.getByRole("switch", { name: "Agent finished" })).not.toBeChecked();
+    expect(requests.filter((request) => request.method === "PUT")).toHaveLength(0);
+
+    await user.click(screen.getByRole("button", { name: "Save these settings" }));
+    await waitFor(() => expect(screen.queryByText("Current settings not loaded")).toBeNull());
     const put = requests.filter((request) => request.method === "PUT");
     expect(put).toHaveLength(1);
     expect(put[0]?.url).toBe(`/api/push/prefs/${DESKTOP}`);
     expect(put[0]?.body).toEqual({ enabled: true, categories: { agentFinished: false, agentInput: true, monoMessages: true } });
 
+    // Known now: a flip saves at once, from the last saved result.
     await user.click(screen.getByRole("switch", { name: "Notifications from this desktop" }));
     await waitFor(() => expect(screen.getByRole("switch", { name: "Agent finished" })).toBeDisabled());
     expect(requests.filter((request) => request.method === "PUT")[1]?.body).toEqual({ enabled: false, categories: { agentFinished: false, agentInput: true, monoMessages: true } });
@@ -270,19 +275,38 @@ describe("remove this desktop", () => {
     expect(forgotten).toHaveBeenCalledWith(DESKTOP);
   });
 
-  it("keeps the dialog open and does not forget when device.leave fails", async () => {
+  it("does not forget when device.leave fails, but offers to remove from this device anyway", async () => {
     const user = userEvent.setup();
     const link = provideMockLink();
     const forgotten = vi.fn();
     onForgetDesktop(forgotten);
-    vi.spyOn(link, "call").mockRejectedValue(new Error("boom"));
+    window.localStorage.setItem(pickerSeenKey(DESKTOP), "1");
+    vi.spyOn(link, "call").mockRejectedValue(new DesktopLinkError("closed", "closed"));
     const { router } = mount(SETTINGS);
     await user.click(await screen.findByRole("button", { name: /Remove this desktop from this device/ }));
     const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).queryByRole("button", { name: "Remove from this device anyway" })).toBeNull();
     await user.click(within(dialog).getByRole("button", { name: "Remove" }));
     await within(dialog).findByRole("alert");
     expect(forgotten).not.toHaveBeenCalled();
     expect(router.state.location.pathname).toBe(SETTINGS);
+
+    // Never trapped: the local forget works without the desktop and clears the picker flag (M11).
+    await user.click(within(dialog).getByRole("button", { name: "Remove from this device anyway" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/desktops"));
+    expect(forgotten).toHaveBeenCalledWith(DESKTOP);
+    expect(window.localStorage.getItem(pickerSeenKey(DESKTOP))).toBeNull();
+  });
+
+  it("keeps keyboard focus on the Reconnect button while it runs", async () => {
+    const user = userEvent.setup();
+    const link = provideMockLink();
+    mount(SETTINGS);
+    await connected(link);
+    const row = await screen.findByRole("button", { name: /Reconnect/ });
+    await user.click(row);
+    expect(screen.getByRole("button", { name: /Reconnect/ })).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: /Reconnect/ })).not.toHaveAttribute("aria-disabled"));
   });
 });
 
