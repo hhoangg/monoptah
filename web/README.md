@@ -1,0 +1,65 @@
+# Monoptah web
+
+The browser client for Monoptah: a React SPA served by a Cloudflare Worker, with a Durable Object relay
+and D1 storage, talking to the user's desktop app over an end-to-end encrypted channel.
+The spec is in [`docs/README.md`](docs/README.md) (architecture, security, design system, workstreams, roadmap).
+
+## Layout
+
+| Path | Package | What it is |
+|---|---|---|
+| `protocol/` | `@monoptah/protocol` | Wire contracts, zod schemas, test vectors (`vectors.json`, `methods.json`) |
+| `worker/` | `@monoptah/worker` | Worker, `DesktopRoom` Durable Object, D1 schema and migrations |
+| `app/` | `@monoptah/app` | Vite + React SPA, design tokens, TanStack Router routes |
+| `mock-desktop/` | `@monoptah/mock-desktop` | Scripted fake desktop for tests and manual runs (never talks to a real host) |
+| `wrangler.jsonc` | - | Worker config shared by `worker` and `app` (bindings, assets, cron, vars) |
+| `.dev.vars.example` | - | Fake local secrets; copy to `.dev.vars` |
+
+## Develop locally
+
+Prerequisites: Node 22 or newer, pnpm 12.21.0 (`packageManager` in `package.json`, e.g. `corepack enable`).
+
+```bash
+cd web
+pnpm install
+cp .dev.vars.example .dev.vars   # fake values only, git-ignored
+pnpm check
+```
+
+`pnpm check` runs, in order and stopping at the first failure: `typecheck`, `lint`, `test` over every package
+(`pnpm -r`, one at a time). Read its exit status directly, not through a pipe.
+
+pnpm 12 needs `run` for script names. Replace `<pkg>` with `protocol`, `worker`, `app` or `mock-desktop`.
+
+| Command (from `web/`) | Does |
+|---|---|
+| `pnpm --filter @monoptah/<pkg> run typecheck` | `tsc --noEmit` (worker also checks its config and scripts) |
+| `pnpm --filter @monoptah/<pkg> run lint` | ESLint |
+| `pnpm --filter @monoptah/<pkg> run test` | Vitest; the worker tests run in the Workers pool (Miniflare) |
+| `pnpm --filter @monoptah/protocol run vectors:gen` | Regenerate `vectors.json` and `methods.json` |
+| `pnpm --filter @monoptah/app run routes:gen` | Regenerate the TanStack route tree |
+| `pnpm --filter @monoptah/worker run db:migrate:local` | Apply D1 migrations to the local database |
+| `pnpm --filter @monoptah/worker run db:generate` | Generate SQL from `schema.ts` (copy it to the next `migrations/NNNN_name.sql`) |
+| `pnpm --filter @monoptah/worker run dev` | `wrangler dev` on `http://localhost:8787` (`/api/health` returns `{"ok":true}`) |
+| `pnpm --filter @monoptah/app run dev` | `vite dev`: SPA, Worker, Durable Object and local D1 together |
+| `pnpm --filter @monoptah/app run build` | Typecheck, then `vite build` |
+| `pnpm --filter @monoptah/app run preview` | Serve the built app |
+| `pnpm --filter @monoptah/mock-desktop run start` | CLI: needs `--relay <url> --token <t>`; see `mock-desktop/src/cli.ts` |
+
+The app and worker tests need a placeholder `app/dist/index.html`; `pretest` and `predev` create it when absent.
+
+## Never deploy from here
+
+Sandboxes and CI never deploy and never hold Cloudflare credentials. Only the maintainer deploys, by hand
+(`db:migrate:remote` included). See [`docs/architecture.md`](docs/architecture.md) section 9 and
+[`docs/security.md`](docs/security.md) section 9.
+
+## Desktop seams
+
+The desktop side of the web link lives in `crates/monocode-core/src/mobile/`. Its tests run from
+`crates/monocode-gpui` (the `native-dev` profile alias, see the repo `CLAUDE.md`):
+
+```bash
+cd crates/monocode-gpui
+cargo ntest -p monocode-core mobile::
+```
