@@ -1,0 +1,79 @@
+import { Link, type LinkProps } from "@tanstack/react-router";
+import type { ComponentProps, ReactNode } from "react";
+import { cn } from "@/lib/utils";
+import { Icon, type IconName } from "./Icon";
+
+export interface SettingsCardProps extends Omit<ComponentProps<"section">, "title"> {
+  /** Group heading above the card (muted 15). */
+  title?: string;
+  /** Footnote under the card (muted 13/18). */
+  footnote?: ReactNode;
+}
+
+/** Settings card (design-system.md section 8): bg surface, radius 22, padding 10/6, rows inside. */
+export function SettingsCard({ title, footnote, className, children, ...props }: SettingsCardProps) {
+  return (
+    <section className={cn("flex flex-col gap-1.5", className)} {...props}>
+      {title ? <h2 className="px-1 text-label font-medium text-muted-text">{title}</h2> : null}
+      <div data-slot="settings-card" className="rounded-card bg-surface px-2.5 py-1.5">
+        {children}
+      </div>
+      {footnote ? <p className="px-1 text-meta text-muted-text">{footnote}</p> : null}
+    </section>
+  );
+}
+
+export interface SettingsRowProps {
+  icon?: IconName;
+  title: ReactNode;
+  description?: ReactNode;
+  /** Right side content (a switch, a value, a button). */
+  trailing?: ReactNode;
+  /** Renders a button row with a chevron. */
+  onClick?: () => void;
+  /** Renders a router link row with a chevron; use for in-app targets. */
+  to?: LinkProps["to"];
+  className?: string;
+}
+
+const ROW_BASE =
+  "relative flex min-h-13 w-full items-center gap-3 rounded-row px-1.5 py-2 text-left text-row text-content before:absolute before:top-0 before:right-0 before:h-px before:bg-stroke first:before:hidden";
+
+/**
+ * One row: min height 52, radius 12, 36px icon slot, dividers 1px inset 40 with an icon (16 without).
+ * Pass `to` or `onClick` to make the whole row interactive.
+ */
+export function SettingsRow({ icon, title, description, trailing, onClick, to, className }: SettingsRowProps) {
+  const interactive = Boolean(onClick || to);
+  const classes = cn(ROW_BASE, icon ? "before:left-10" : "before:left-4", interactive && "hover:bg-selection active:opacity-60", className);
+  const body = (
+    <>
+      {icon ? (
+        <span className="inline-flex size-9 shrink-0 items-center justify-center text-muted-text">
+          <Icon name={icon} size={18} />
+        </span>
+      ) : null}
+      <span className="min-w-0 flex-1">
+        <span className="block">{title}</span>
+        {description ? <span className="block text-meta text-muted-text">{description}</span> : null}
+      </span>
+      {trailing ? <span className="shrink-0 text-label text-muted-text">{trailing}</span> : null}
+      {interactive ? <Icon name="chevronRight" size={18} className="shrink-0 text-faint" /> : null}
+    </>
+  );
+  if (to) {
+    return (
+      <Link to={to} className={classes}>
+        {body}
+      </Link>
+    );
+  }
+  if (onClick) {
+    return (
+      <button type="button" onClick={onClick} className={classes}>
+        {body}
+      </button>
+    );
+  }
+  return <div className={classes}>{body}</div>;
+}

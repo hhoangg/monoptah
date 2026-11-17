@@ -1,6 +1,7 @@
 import { HugeiconsIcon, type IconSvgElement } from "@hugeicons/react";
 import {
   Add01Icon,
+  AlertCircleIcon,
   Archive01Icon,
   ArrowDown01Icon,
   ArrowRight01Icon,
@@ -20,6 +21,7 @@ import {
   File01Icon,
   FileScriptIcon,
   FilterHorizontalIcon,
+  FingerPrintIcon,
   FlashIcon,
   Folder01Icon,
   GitBranchIcon,
@@ -32,6 +34,7 @@ import {
   LeftToRightListBulletIcon,
   Link01Icon,
   LinkSquare01Icon,
+  Loading03Icon,
   LockIcon,
   Logout01Icon,
   Mic01Icon,
@@ -124,6 +127,9 @@ export const ICONS = {
   link: Link01Icon,
   admin: UserShield01Icon,
   externalLink: LinkSquare01Icon,
+  alert: AlertCircleIcon,
+  fingerprint: FingerPrintIcon,
+  spinner: Loading03Icon,
 } as const satisfies Record<string, IconSvgElement>;
 
 export type IconName = keyof typeof ICONS;
