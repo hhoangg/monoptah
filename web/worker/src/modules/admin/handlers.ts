@@ -174,7 +174,8 @@ async function readSettings(env: Pick<Env, "DB" | "MAX_USERS">) {
     env.DB.prepare(INVITES_PAUSED_SQL).first<{ value: string }>(),
     env.DB.prepare(USER_COUNT_SQL).first<{ n: number }>(),
   ]);
-  return { invitesPaused: paused?.value === "1", maxUsers: maxUsers(env), userCount: count?.n ?? 0 };
+  const userCount = count?.n ?? 0;
+  return { invitesPaused: paused?.value === "1", maxUsers: maxUsers(env, userCount), userCount };
 }
 
 /** `GET /api/admin/settings`: the pause switch, `MAX_USERS` (0 = no cap) and the user count (blocked ones included). */

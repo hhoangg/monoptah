@@ -7,34 +7,13 @@ import { RECOVERY_ONLY_ALLOWLIST } from "../src/middleware/auth.ts";
 import { ackRecoveryCodes } from "../src/modules/recovery/regenerate.ts";
 import { hashRecoveryCode, normalizeRecoveryCode } from "../src/modules/recovery/codes.ts";
 import { sha256Hex } from "../src/lib/crypto.ts";
-import { authedCall, createTestDesktop, createTestInvite, createTestUser, loginAs, postJson, registerUser, setCookies, withRoom, fakeRoomNamespace, type RegisteredUser } from "./support/accounts.ts";
+import { authedCall, createTestDesktop, createTestInvite, createTestUser, loginAs, postJson, registerUser, setCookies, withRoom, fakeRoomNamespace, recordingEnv, type RegisteredUser } from "./support/accounts.ts";
 
 const errorCode = async (res: Response) => ((await res.json()) as { code: string }).code;
 const recover = (handle: string, code: string, init: Parameters<typeof postJson>[2] = {}) => postJson("/api/auth/recover", { handle, code }, init);
 const regenerate = (cookie: string) => authedCall({ cookie }, "/api/recovery-codes/regenerate", { method: "POST" });
 const newUser = async (): Promise<RegisteredUser> => registerUser((await createTestInvite(env)).code);
 const cookieOf = (res: Response) => setCookies(res)[0]?.split(";")[0] ?? "";
-
-/** The test environment with `DB` replaced by a proxy that records every statement and batch. */
-function recordingEnv(options: { failBatch?: boolean } = {}) {
-  const statements: string[] = [];
-  let batches = 0;
-  const real = env.DB;
-  const db = {
-    prepare: (sql: string) => {
-      statements.push(sql);
-      return real.prepare(sql);
-    },
-    batch: (list: D1PreparedStatement[]) => {
-      batches += 1;
-      statements.push("BATCH");
-      return real.batch(options.failBatch ? [...list, real.prepare("INSERT INTO no_such_table VALUES (1)")] : list);
-    },
-  };
-  const testEnv = Object.create(env) as typeof env;
-  Object.defineProperty(testEnv, "DB", { value: db as unknown as D1Database });
-  return { testEnv, statements, batches: () => batches };
-}
 
 describe("POST /api/auth/recover", () => {
   it("signs in with a code (any case, no hyphens), makes a recovery-only session and revokes the others", async () => {

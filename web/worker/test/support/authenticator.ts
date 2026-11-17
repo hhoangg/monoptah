@@ -106,10 +106,11 @@ export class VirtualAuthenticator {
     this.credentialId = b64u(credentialId);
   }
 
-  static async generate(): Promise<VirtualAuthenticator> {
+  /** `credentialIdBytes`: length of the random credential id (default 32; WebAuthn allows up to 1023). */
+  static async generate(credentialIdBytes = 32): Promise<VirtualAuthenticator> {
     const keys = (await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"])) as CryptoKeyPair;
     const publicRaw = new Uint8Array((await crypto.subtle.exportKey("raw", keys.publicKey)) as ArrayBuffer);
-    return new VirtualAuthenticator(keys, publicRaw, crypto.getRandomValues(new Uint8Array(32)));
+    return new VirtualAuthenticator(keys, publicRaw, crypto.getRandomValues(new Uint8Array(credentialIdBytes)));
   }
 
   private flags(options: CeremonyOptions, extra = 0): number {

@@ -15,24 +15,51 @@ export const USER_COUNT_SQL = "SELECT count(*) AS n FROM users";
 export const GATE_SQL =
   "COALESCE((SELECT value FROM settings WHERE key = 'invites_paused'), '0') != '1' AND (? = 0 OR (SELECT count(*) FROM users) < ?)";
 
-/** `MAX_USERS` as a number; anything that is not a non-negative integer counts as 0 (no cap). */
-export function maxUsers(env: Pick<Env, "MAX_USERS">): number {
-  const value = Number(env.MAX_USERS);
-  return Number.isInteger(value) && value > 0 ? value : 0;
+let invalidCapLogged = false;
+
+/**
+ * `MAX_USERS` as the cap: 0 means no cap, a positive integer is the cap, and `null` means the value is invalid
+ * (anything that is not a non-negative integer string, such as `""`, `"abc"`, `"-1"` or `"1.5"`). An invalid
+ * value fails closed, see `gateParams` and `registrationOpen`: a typo must not turn a capped instance into an
+ * unlimited one. Logs one metadata-only error line per isolate.
+ */
+export function userCap(env: Pick<Env, "MAX_USERS">): number | null {
+  const text = String(env.MAX_USERS);
+  if (/^\d{1,9}$/.test(text)) return Number(text);
+  if (!invalidCapLogged) {
+    invalidCapLogged = true;
+    console.error(`MAX_USERS is not a non-negative integer (length ${text.length}): registration and invites are closed`);
+  }
+  return null;
 }
 
+/** Lets a test see the error line of `userCap` again. */
+export function resetInvalidCapLog(): void {
+  invalidCapLogged = false;
+}
+
+/**
+ * The cap as shown to an admin. With an invalid `MAX_USERS` (the gate is closed) it is the current user count, at
+ * least 1: "n of n users", never 0, which would read as "no cap".
+ */
+export function maxUsers(env: Pick<Env, "MAX_USERS">, userCount = 0): number {
+  return userCap(env) ?? Math.max(1, userCount);
+}
+
+/** Bind values of `GATE_SQL`. An invalid cap binds (1, 0): `? = 0` is false and `count < 0` is false, so the gate is shut. */
 export function gateParams(env: Pick<Env, "MAX_USERS">): [number, number] {
-  const max = maxUsers(env);
-  return [max, max];
+  const cap = userCap(env);
+  return cap === null ? [1, 0] : [cap, cap];
 }
 
-/** True when invites may currently be used to register: not paused and below the user cap. */
+/** True when invites may currently be used to register: not paused and below the user cap. An invalid cap is closed. */
 export async function registrationOpen(env: Pick<Env, "DB" | "MAX_USERS">): Promise<boolean> {
-  const max = maxUsers(env);
+  const cap = userCap(env);
+  if (cap === null) return false;
   const [paused, count] = await Promise.all([
     env.DB.prepare(INVITES_PAUSED_SQL).first<{ value: string }>(),
-    max > 0 ? env.DB.prepare(USER_COUNT_SQL).first<{ n: number }>() : Promise.resolve(null),
+    cap > 0 ? env.DB.prepare(USER_COUNT_SQL).first<{ n: number }>() : Promise.resolve(null),
   ]);
   if (paused?.value === "1") return false;
-  return max === 0 || (count?.n ?? 0) < max;
+  return cap === 0 || (count?.n ?? 0) < cap;
 }

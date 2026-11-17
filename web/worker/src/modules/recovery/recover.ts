@@ -36,6 +36,9 @@ interface LookupRow {
   unused: number;
 }
 
+/** Longest recovery code accepted (a code is 19 characters with its hyphens, or 16 without). */
+export const MAX_CODE_LENGTH = 64;
+
 /** The one answer for every failure. */
 const failed = (c: AppContext): Response => apiError(c, 401, "unauthorized", "Recovery failed");
 
@@ -43,6 +46,9 @@ export const recover: Handler<AppEnv> = async (c) => {
   const body = RecoverBody.safeParse(await c.req.json().catch(() => null));
   if (!body.success) return apiError(c, 400, "invalid", "Invalid recovery request");
   const { handle, code } = body.data;
+  // A real code is 16 characters. Anything longer is refused before it is hashed (an unbounded string would make
+  // the HMAC cost the attacker's choice) and without spending the handle's attempts: the same uniform 401.
+  if (code.length > MAX_CODE_LENGTH) return failed(c);
 
   const limited = await limitHandleAttempts(c, handle);
   if (limited) return limited;

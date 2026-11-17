@@ -48,6 +48,9 @@ const RegisterPayload = z.object({
   userId: z.string(),
 });
 
+/** Longest invite code accepted. */
+export const MAX_INVITE_LENGTH = 128;
+
 /** The one answer for every invite or gate failure: a bad code must not reveal why it is bad. */
 function invalidInvite(c: AppContext): Response {
   return apiError(c, 400, "invalid_invite", "This invitation is not valid");
@@ -57,6 +60,8 @@ export const registerOptions: Handler<AppEnv> = async (c) => {
   const body = RegisterOptionsBody.safeParse(await c.req.json().catch(() => null));
   if (!body.success) return apiError(c, 400, "invalid", "Invalid registration request");
   const { invite, handle, displayName } = body.data;
+  // A real code is 22 characters. A longer string is refused before it is hashed, with the generic invite error.
+  if (invite.length > MAX_INVITE_LENGTH) return invalidInvite(c);
 
   const limited = await limitInviteAttempts(c, invite);
   if (limited) return limited;
@@ -79,8 +84,12 @@ export const registerOptions: Handler<AppEnv> = async (c) => {
   return respond(c, RegisterOptionsResponse, { challengeId, options: { ...options } });
 };
 
-function isUniqueViolation(error: unknown): boolean {
-  return error instanceof Error && /UNIQUE constraint failed/i.test(error.message);
+/** Which UNIQUE constraint a failed batch broke: the passkey primary key, the handle, or something else (null). */
+function uniqueViolationOf(error: unknown): "passkey" | "handle" | null {
+  if (!(error instanceof Error)) return null;
+  if (/UNIQUE constraint failed: passkeys\.id\b/i.test(error.message)) return "passkey";
+  if (/UNIQUE constraint failed: users\.handle\b/i.test(error.message)) return "handle";
+  return null;
 }
 
 export const registerVerify: Handler<AppEnv> = async (c) => {
@@ -147,8 +156,11 @@ export const registerVerify: Handler<AppEnv> = async (c) => {
   try {
     results = await c.env.DB.batch(statements);
   } catch (error) {
-    // The handle (or the credential id) was taken between options and verify; the batch rolled back.
-    if (isUniqueViolation(error)) return apiError(c, 409, "conflict", "Handle already taken");
+    // The batch rolled back. Tell the two causes apart: this authenticator is already registered (on another
+    // account), or the handle was taken between options and verify.
+    const violation = uniqueViolationOf(error);
+    if (violation === "passkey") return apiError(c, 409, "conflict", "Passkey already registered");
+    if (violation === "handle") return apiError(c, 409, "conflict", "Handle already taken");
     throw error;
   }
   if ((results[0]?.meta.changes ?? 0) === 0) return invalidInvite(c);

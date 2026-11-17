@@ -50,6 +50,12 @@ export function assertSafeMetaKeys(action: string, schema: z.ZodObject): void {
 
 /** An opaque id (UUID, credential id, derived session id): url-safe characters only, at most 128 chars. */
 const Id = z.string().min(1).max(128).regex(/^[A-Za-z0-9_.-]+$/);
+/**
+ * A passkey credential id: base64url, up to 1023 bytes (WebAuthn) which is 1364 characters. Authenticators choose
+ * the length (security keys use 64 bytes or more), so `Id` (128) would make login and add-passkey throw. The id is
+ * stored as is; the registration refuses anything above 1023 bytes (`MAX_CREDENTIAL_ID_BYTES`).
+ */
+const PasskeyId = z.string().min(1).max(1400).regex(/^[A-Za-z0-9_-]+$/);
 const Count = z.number().int().min(0).max(1_000_000);
 const IpHash = z.string().regex(/^[0-9a-f]{64}$/);
 const Permission = z.enum(["read", "control"]);
@@ -83,13 +89,13 @@ function spec<S extends z.ZodRawShape>(actorKinds: ActionSpec["actorKinds"], sha
 export const AUDIT_ACTIONS = {
   // Accounts
   "account.register": spec(["user"], { inviteId: Id.optional(), ipHash: IpHash.optional() }),
-  "account.login": spec(["user"], { passkeyId: Id, ipHash: IpHash.optional() }),
+  "account.login": spec(["user"], { passkeyId: PasskeyId, ipHash: IpHash.optional() }),
   /** A signature counter that did not increase: the login is refused (security.md 3.1). */
-  "account.login_refused_counter": spec(["system", "user"], { passkeyId: Id, ipHash: IpHash.optional() }),
+  "account.login_refused_counter": spec(["system", "user"], { passkeyId: PasskeyId, ipHash: IpHash.optional() }),
   // Passkeys
-  "passkey.add": spec(["user"], { passkeyId: Id, count: Count.optional() }),
-  "passkey.rename": spec(["user"], { passkeyId: Id }),
-  "passkey.delete": spec(["user"], { passkeyId: Id, remaining: Count }),
+  "passkey.add": spec(["user"], { passkeyId: PasskeyId, count: Count.optional() }),
+  "passkey.rename": spec(["user"], { passkeyId: PasskeyId }),
+  "passkey.delete": spec(["user"], { passkeyId: PasskeyId, remaining: Count }),
   // Recovery
   "recovery.use": spec(["user"], { codesLeft: Count, revokedSessions: Count.optional(), ipHash: IpHash.optional() }),
   "recovery.regenerate": spec(["user"], { batch: Count }),

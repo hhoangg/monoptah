@@ -1,11 +1,11 @@
 import { env } from "cloudflare:workers";
 import { Hono } from "hono";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { API_ROUTES, ApiErrorSchema, type ApiRoute } from "@monoptah/protocol";
 import { buildCsp, COMPANION_HEADERS } from "../src/middleware/security.ts";
 import { ignoreCookies, isCookieAuthenticated } from "../src/middleware/browser.ts";
 import type { AppEnv } from "../src/http.ts";
-import { BROWSER_HEADERS, call, ORIGIN } from "./helpers.ts";
+import { BROWSER_HEADERS, call, callWithEnv, ORIGIN } from "./helpers.ts";
 import { createTestUser, loginAs, type TestSession } from "./support/accounts.ts";
 
 /** Routes with a real handler: with a valid session they no longer answer 501 (their own tests cover them). */
@@ -184,5 +184,28 @@ describe("buildCsp", () => {
 
   it("keeps a port in the host", () => {
     expect(buildCsp("localhost:8787")).toContain("connect-src 'self' wss://localhost:8787;");
+  });
+});
+
+describe("the 500 log line", () => {
+  it("holds the route pattern, never a path parameter such as a pairing code", async () => {
+    const broken = Object.create(env) as typeof env;
+    Object.defineProperty(broken, "DB", {
+      value: {
+        prepare: () => {
+          throw new Error("boom with PAIRSECRET1 inside");
+        },
+      } as unknown as D1Database,
+    });
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const res = await callWithEnv(broken, "/api/pair/PAIRSECRET1", { headers: { Cookie: "__Host-mc_session=whatever" } });
+      expect(res.status).toBe(500);
+      const logged = errors.mock.calls.map((args) => String(args[0]));
+      expect(logged).toEqual(["unhandled error: route=GET /api/pair/:userCode error=Error"]);
+      expect(logged.join(" ")).not.toContain("PAIRSECRET1");
+    } finally {
+      errors.mockRestore();
+    }
   });
 });

@@ -1,9 +1,10 @@
 // A-06 registration part: the invite is consumed atomically, every invite or gate failure gives one generic
 // error, and the pause switch and MAX_USERS cap are re-checked inside the batch that creates the user.
 import { env } from "cloudflare:workers";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { resetInvalidCapLog } from "../src/modules/invites/gate.ts";
 import { VirtualAuthenticator } from "./support/authenticator.ts";
-import { createTestInvite, createTestUser, loginWith, postJson, registerOptions, registerUser, withVars } from "./support/accounts.ts";
+import { authedCall, createTestInvite, createTestUser, loginAs, loginWith, postJson, registerOptions, registerUser, withVars } from "./support/accounts.ts";
 
 const good = { origin: env.RP_ORIGIN, rpId: env.RP_ID };
 const handleOf = (tag: string) => `${tag}-${crypto.randomUUID().slice(0, 8)}`;
@@ -170,6 +171,43 @@ describe("free-tier cap and pause switch", () => {
     const results = await Promise.all([verify(a.body, capped), verify(b.body, capped)]);
     expect(results.map((r) => r.status).sort()).toEqual([200, 400]);
     expect(await userCount()).toBe(3);
+  });
+
+  it.each(["", "abc", "-1", "1.5", " 3", "1e3", "0x10"])("an invalid MAX_USERS (%j) fails closed: options, verify and invite creation stop, one error line is logged", async (value) => {
+    const [u1] = await seedUsers(1);
+    const good = await createTestInvite(env, { createdBy: u1?.id });
+    const attempt = await prepare(good.code, handleOf("pre")); // options while the gate is open
+    const broken = withVars(env, { MAX_USERS: value });
+    resetInvalidCapLog();
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const res = await postJson("/api/auth/register/options", { invite: good.code, handle: handleOf("closed"), displayName: "X" }, { testEnv: broken });
+      expect(await optionsBody(res)).toEqual({ status: 400, body: { error: "This invitation is not valid", code: "invalid_invite" } });
+      const verified = await verify(attempt.body, broken);
+      expect(await optionsBody(verified)).toEqual({ status: 400, body: { error: "This invitation is not valid", code: "invalid_invite" } });
+      expect(await userCount()).toBe(1);
+      const session = await loginAs(u1?.id ?? "", { fresh: true });
+      const created = await authedCall(session, "/api/invites", { method: "POST" }, broken);
+      expect(created.status).toBe(409);
+      expect(((await created.json()) as { code: string }).code).toBe("invites_paused");
+      const logged = errors.mock.calls.map((args) => String(args[0]));
+      expect(logged).toHaveLength(1);
+      expect(logged[0]).toMatch(/^MAX_USERS is not a non-negative integer/);
+      if (value.length > 2) expect(logged[0]).not.toContain(value);
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
+  it("the admin settings show a closed gate as a cap that is reached, never 0 (no cap)", async () => {
+    await seedUsers(2);
+    const admin = await createTestUser(env, { role: "admin" });
+    const session = await loginAs(admin.id, { fresh: true });
+    const res = await authedCall(session, "/api/admin/settings", {}, withVars(env, { MAX_USERS: "oops" }));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { maxUsers: number; userCount: number };
+    expect(body.maxUsers).toBe(body.userCount);
+    expect(body.maxUsers).toBeGreaterThan(0);
   });
 
   it("MAX_USERS=0 means no cap", async () => {

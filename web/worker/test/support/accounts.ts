@@ -268,3 +268,24 @@ export async function loginWith(
   const res = await postJson("/api/auth/login/verify", { challengeId, response }, { testEnv });
   return { res, cookie: setCookies(res)[0]?.split(";")[0] ?? "" };
 }
+
+/** The test environment with `DB` replaced by a proxy that records every statement and batch. */
+export function recordingEnv(options: { failBatch?: boolean } = {}) {
+  const statements: string[] = [];
+  let batches = 0;
+  const real = env.DB;
+  const db = {
+    prepare: (sql: string) => {
+      statements.push(sql);
+      return real.prepare(sql);
+    },
+    batch: (list: D1PreparedStatement[]) => {
+      batches += 1;
+      statements.push("BATCH");
+      return real.batch(options.failBatch ? [...list, real.prepare("INSERT INTO no_such_table VALUES (1)")] : list);
+    },
+  };
+  const testEnv = Object.create(env) as typeof env;
+  Object.defineProperty(testEnv, "DB", { value: db as unknown as D1Database });
+  return { testEnv, statements, batches: () => batches };
+}

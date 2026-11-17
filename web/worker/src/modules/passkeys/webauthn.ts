@@ -68,6 +68,26 @@ export interface VerifiedRegistration {
   backedUp: boolean;
 }
 
+/** The longest credential id WebAuthn allows (Credential ID, 1023 bytes). */
+export const MAX_CREDENTIAL_ID_BYTES = 1023;
+/** At most this many transports are kept per passkey, each at most `MAX_TRANSPORT_LENGTH` characters. */
+export const MAX_TRANSPORTS = 8;
+export const MAX_TRANSPORT_LENGTH = 32;
+
+/** The decoded length of a base64url string, without decoding it. */
+export function base64urlByteLength(text: string): number {
+  const length = text.replace(/=+$/, "").length;
+  return Math.floor((length * 3) / 4);
+}
+
+/** The transports an authenticator reports, bounded: at most 8 entries of at most 32 characters (the rest is dropped). */
+export function boundedTransports(values: readonly unknown[]): string[] {
+  return values
+    .map(String)
+    .filter((value) => value.length > 0 && value.length <= MAX_TRANSPORT_LENGTH)
+    .slice(0, MAX_TRANSPORTS);
+}
+
 /** Verifies an attestation against the stored challenge. Returns null for anything that does not verify. */
 export async function verifyRegistration(env: WebAuthnEnv, response: unknown, expectedChallenge: string): Promise<VerifiedRegistration | null> {
   try {
@@ -81,11 +101,13 @@ export async function verifyRegistration(env: WebAuthnEnv, response: unknown, ex
     });
     if (!verified.verified) return null;
     const { credential, credentialDeviceType, credentialBackedUp } = verified.registrationInfo;
+    // Refused before any write: a longer id is not valid WebAuthn and would only bloat the row and the audit meta.
+    if (base64urlByteLength(credential.id) > MAX_CREDENTIAL_ID_BYTES) return null;
     return {
       credentialId: credential.id,
       publicKey: credential.publicKey,
       counter: credential.counter,
-      transports: (response as RegistrationResponseJSON).response.transports?.map(String) ?? credential.transports ?? [],
+      transports: boundedTransports((response as RegistrationResponseJSON).response.transports ?? credential.transports ?? []),
       deviceType: credentialDeviceType,
       backedUp: credentialBackedUp,
     };
