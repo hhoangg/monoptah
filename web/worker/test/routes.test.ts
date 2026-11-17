@@ -6,7 +6,7 @@ import { BROWSER_HEADERS, call } from "./helpers.ts";
 import { createTestUser, loginAs, type TestSession } from "./support/accounts.ts";
 
 /** Routes that have a handler now. Their behaviour is tested in their own files (sessions, me, audit tests). */
-const IMPLEMENTED = new Set(["GET /api/me", "PATCH /api/me", "GET /api/audit", "GET /api/sessions", "DELETE /api/sessions/:id", "POST /api/auth/logout", "POST /api/auth/register/options", "POST /api/auth/register/verify", "POST /api/auth/login/options", "POST /api/auth/login/verify", "POST /api/auth/reauth/options", "POST /api/auth/reauth/verify", "GET /api/invites", "POST /api/invites", "DELETE /api/invites/:id"]);
+const IMPLEMENTED = new Set(["GET /api/me", "PATCH /api/me", "GET /api/audit", "GET /api/sessions", "DELETE /api/sessions/:id", "POST /api/auth/logout", "POST /api/auth/register/options", "POST /api/auth/register/verify", "POST /api/auth/login/options", "POST /api/auth/login/verify", "POST /api/auth/reauth/options", "POST /api/auth/reauth/verify", "GET /api/invites", "POST /api/invites", "DELETE /api/invites/:id", "GET /api/admin/users", "POST /api/admin/users/:id/block", "POST /api/admin/users/:id/unblock", "POST /api/admin/users/:id/invites", "GET /api/admin/settings", "PUT /api/admin/settings", "GET /api/admin/audit"]);
 const needsCookie = (route: { auth: string }) => ["session", "fresh", "admin", "session+grant"].includes(route.auth);
 
 /** `/api/desktops/:id/grants/:deviceId` -> `/api/desktops/x/grants/y`. */

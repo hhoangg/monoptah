@@ -16,6 +16,26 @@ import {
   USER_ROLE_SQL,
 } from "../src/modules/auth/register.ts";
 import { INVITES_PAUSED_SQL, USER_COUNT_SQL } from "../src/modules/invites/gate.ts";
+import {
+  ADMIN_AUDIT_PAGE_AFTER_SQL,
+  ADMIN_AUDIT_PAGE_SQL,
+  GRANT_INVITES_SQL,
+  LIST_USERS_SQL,
+  UNBLOCK_SQL,
+  UPSERT_SETTING_SQL,
+  USER_STATUS_SQL,
+} from "../src/modules/admin/handlers.ts";
+import {
+  blockUsersSql,
+  countActiveSql,
+  deletePushSubscriptionsSql,
+  deleteSessionsSql,
+  listDesktopsSql,
+  revokeDesktopGrantsSql,
+  revokeDeviceGrantsSql,
+  revokeInvitesSql,
+  revokeTokensSql,
+} from "../src/modules/admin/branch.ts";
 import { INSERT_INVITE_SQL, INVITE_BY_ID_SQL, LIST_INVITES_SQL, REVOKE_INVITE_SQL } from "../src/modules/invites/handlers.ts";
 import { CONSUME_CHALLENGE_SQL, INSERT_CHALLENGE_SQL } from "../src/modules/passkeys/challenges.ts";
 import { INVITES_USED_SQL, ME_ROW_SQL, PATCH_DISPLAY_NAME_SQL } from "../src/modules/me/handlers.ts";
@@ -41,6 +61,22 @@ interface PlanCase {
    * covering index of `users` (never the table itself) and nothing else.
    */
   usersCountScan?: boolean;
+  /**
+   * The query lists every row of `users` (`GET /api/admin/users`, bounded by the user cap). It may walk the table in
+   * the order of `users_created_at_idx` (no temporary sort) and nothing else may scan.
+   */
+  usersListScan?: boolean;
+  /**
+   * The query walks the invite tree with the recursive CTE of `branch.ts`. SQLite shows the queue of the recursion
+   * (`SCAN b`) and the materialized, small result (`SCAN branch`) as scans; the step itself must search
+   * `users_invited_by_idx`, which is checked. Nothing else may scan.
+   */
+  branchCte?: boolean;
+  /**
+   * The first page of a paged query that has no `WHERE`: it reads `LIMIT` rows in the order of this index and stops
+   * (the SQL must contain `LIMIT`). The next pages are real searches and take no allowance.
+   */
+  limitedIndexScan?: { table: string; index: string };
 }
 
 const CASES: PlanCase[] = [
@@ -76,6 +112,31 @@ const CASES: PlanCase[] = [
   { name: "create invite (quota and gate)", sql: INSERT_INVITE_SQL, bind: ["i", "h", 1, 1, "u", 0, 0], usersCountScan: true },
   { name: "invite by id", sql: INVITE_BY_ID_SQL, bind: ["i"] },
   { name: "revoke invite", sql: REVOKE_INVITE_SQL, bind: [1, "i", "u"] },
+  { name: "admin: list users", sql: LIST_USERS_SQL, bind: [], usersListScan: true },
+  { name: "admin: user status", sql: USER_STATUS_SQL, bind: ["u"] },
+  { name: "admin: unblock", sql: UNBLOCK_SQL, bind: ["u"] },
+  { name: "admin: grant invites", sql: GRANT_INVITES_SQL, bind: [1, "u", 1, 1000] },
+  { name: "admin: upsert setting", sql: UPSERT_SETTING_SQL, bind: ["1", 1, "u"] },
+  { name: "admin: audit first page", sql: ADMIN_AUDIT_PAGE_SQL, bind: [51], noTempSort: true, limitedIndexScan: { table: "audit_log", index: "audit_log_ts_id_idx" } },
+  { name: "admin: audit next page", sql: ADMIN_AUDIT_PAGE_AFTER_SQL, bind: [1, "id", 51], noTempSort: true },
+  { name: "block (cascade): count active members", sql: countActiveSql(true), bind: ["r", "a"], branchCte: true },
+  { name: "block (cascade): list desktops", sql: listDesktopsSql(true), bind: ["r", "a"], branchCte: true },
+  { name: "block (cascade): mark users blocked", sql: blockUsersSql(true), bind: ["r", 1, "x", "r", "a"], branchCte: true },
+  { name: "block (cascade): delete sessions", sql: deleteSessionsSql(true), bind: ["r", "a"], branchCte: true },
+  { name: "block (cascade): revoke tokens", sql: revokeTokensSql(true), bind: ["r", 1, "a"], branchCte: true },
+  { name: "block (cascade): revoke grants of desktops", sql: revokeDesktopGrantsSql(true), bind: ["r", 1, "a"], branchCte: true },
+  { name: "block (cascade): revoke grants of devices", sql: revokeDeviceGrantsSql(true), bind: ["r", 1, "a"], branchCte: true },
+  { name: "block (cascade): delete push subscriptions", sql: deletePushSubscriptionsSql(true), bind: ["r", "a"], branchCte: true },
+  { name: "block (cascade): revoke invites", sql: revokeInvitesSql(true), bind: ["r", 1, "a"], branchCte: true },
+  { name: "block (single): count active members", sql: countActiveSql(false), bind: ["r", "a"] },
+  { name: "block (single): list desktops", sql: listDesktopsSql(false), bind: ["r", "a"] },
+  { name: "block (single): mark users blocked", sql: blockUsersSql(false), bind: ["r", 1, "x", "r", "a"] },
+  { name: "block (single): delete sessions", sql: deleteSessionsSql(false), bind: ["r", "a"] },
+  { name: "block (single): revoke tokens", sql: revokeTokensSql(false), bind: ["r", 1, "a"] },
+  { name: "block (single): revoke grants of desktops", sql: revokeDesktopGrantsSql(false), bind: ["r", 1, "a"] },
+  { name: "block (single): revoke grants of devices", sql: revokeDeviceGrantsSql(false), bind: ["r", 1, "a"] },
+  { name: "block (single): delete push subscriptions", sql: deletePushSubscriptionsSql(false), bind: ["r", "a"] },
+  { name: "block (single): revoke invites", sql: revokeInvitesSql(false), bind: ["r", 1, "a"] },
   { name: "audit first page", sql: AUDIT_PAGE_SQL, bind: ["u", 51], noTempSort: true },
   { name: "audit next page", sql: AUDIT_PAGE_AFTER_SQL, bind: ["u", 1, "id", 51], noTempSort: true },
 ];
@@ -89,10 +150,14 @@ describe("query plans", () => {
     if (!isInsert) expect(details.length).toBeGreaterThan(0);
     for (const detail of details) {
       if (c.usersCountScan && /^SCAN users USING COVERING INDEX /.test(detail)) continue;
+      if (c.branchCte && (detail === "SCAN b" || detail === "SCAN branch")) continue;
+      if (c.limitedIndexScan && /\bLIMIT\b/.test(c.sql) && detail === `SCAN ${c.limitedIndexScan.table} USING INDEX ${c.limitedIndexScan.index}`) continue;
+      if (c.usersListScan && /^SCAN u USING INDEX users_created_at_idx$/.test(detail)) continue;
       expect(detail, detail).not.toMatch(/^SCAN /);
       if (c.noTempSort) expect(detail, detail).not.toMatch(/TEMP B-TREE/);
     }
-    if (!isInsert && !c.usersCountScan) expect(details.some((d) => /^SEARCH .* USING (COVERING )?INDEX/.test(d)), details.join(" | ")).toBe(true);
+    if (c.branchCte) expect(details, details.join(" | ")).toContain("SEARCH u USING INDEX users_invited_by_idx (invited_by=?)");
+    if (!isInsert && !c.usersCountScan && !c.usersListScan && !c.limitedIndexScan) expect(details.some((d) => /^SEARCH .* USING (COVERING )?INDEX/.test(d)), details.join(" | ")).toBe(true);
   });
 
   it("the audit paging queries use the (actor_user_id, ts, id) index", async () => {

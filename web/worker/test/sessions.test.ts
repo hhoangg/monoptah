@@ -281,7 +281,7 @@ describe("fresh and admin", () => {
     const admin = await createTestUser(env, { role: "admin" });
     await expectError(await authedCall(await loginAs(user.id, { fresh: true }), "/api/admin/users"), 403, "forbidden");
     await expectError(await authedCall(await loginAs(admin.id), "/api/admin/users"), 403, "fresh_required");
-    expect((await authedCall(await loginAs(admin.id, { fresh: true }), "/api/admin/users")).status).toBe(501);
+    expect((await authedCall(await loginAs(admin.id, { fresh: true }), "/api/admin/users")).status).toBe(200);
   });
 
   it("session+grant routes resolve the session only (the grant is WS-R)", async () => {
