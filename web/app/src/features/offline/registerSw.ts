@@ -33,7 +33,9 @@ export function registerServiceWorker(): Workbox | undefined {
   });
   // Registered up front: it also fires when ANOTHER tab applied the update, which this tab never asked for.
   // Then the tap only reloads (skip waiting would be a no-op), and the reload still waits for a send to end.
-  workbox.addEventListener("controlling", () => {
+  workbox.addEventListener("controlling", (event) => {
+    // The first install also takes control (clientsClaim); that is not an update, so nothing is shown.
+    if (!event.isUpdate) return;
     if (requested) reload();
     else showUpdateToast(() => reload());
   });

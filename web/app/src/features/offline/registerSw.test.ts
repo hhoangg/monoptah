@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-type Listener = () => void;
+type Listener = (event?: { isUpdate?: boolean }) => void;
 const wb = vi.hoisted(() => ({ listeners: new Map<string, Listener>(), skip: vi.fn() }));
 vi.mock("workbox-window", () => ({
   Workbox: class {
@@ -61,14 +61,21 @@ describe("update prompt wiring", () => {
     tap();
     expect(wb.skip).toHaveBeenCalledTimes(1);
     expect(reload).not.toHaveBeenCalled();
-    wb.listeners.get("controlling")?.();
+    wb.listeners.get("controlling")?.({ isUpdate: true });
     expect(reload).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows nothing and does not reload when the worker takes control on the first install", () => {
+    register();
+    wb.listeners.get("controlling")?.({ isUpdate: false });
+    expect(toastMock).not.toHaveBeenCalled();
+    expect(reload).not.toHaveBeenCalled();
   });
 
   it("does not reload by itself when another tab applied the update, and a tap then only reloads", () => {
     register();
     wb.listeners.get("waiting")?.();
-    wb.listeners.get("controlling")?.();
+    wb.listeners.get("controlling")?.({ isUpdate: true });
     expect(reload).not.toHaveBeenCalled();
     tap();
     expect(wb.skip).not.toHaveBeenCalled();
@@ -83,7 +90,7 @@ describe("update prompt wiring", () => {
     wb.listeners.get("waiting")?.();
     tap();
     sending = true;
-    wb.listeners.get("controlling")?.();
+    wb.listeners.get("controlling")?.({ isUpdate: true });
     expect(reload).not.toHaveBeenCalled();
     sending = false;
     vi.advanceTimersByTime(600);
