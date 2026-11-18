@@ -72,7 +72,7 @@ export function SearchResults({ projectId, query, onOpenFile }: { projectId: str
             className="flex min-h-11 w-full items-center gap-2 rounded-row px-2 text-left text-label hover:bg-selection pointer-fine:min-h-8"
           >
             <FileTypeIcon name={hit.name} isDir={false} />
-            <span className="min-w-0 flex-1 truncate">
+            <span className="min-w-0 flex-1 truncate [unicode-bidi:isolate]">
               <MatchText text={hit.path} positions={hit.positions} active />
             </span>
           </button>

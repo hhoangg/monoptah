@@ -24,6 +24,10 @@ export const restrictedSyntax = [
     message: `new Function is banned. ${BAN}`,
   },
   {
+    selector: "NewExpression[callee.object.name=/^(window|globalThis|self)$/][callee.property.name='Function']",
+    message: `new globalThis.Function is banned. ${BAN}`,
+  },
+  {
     selector: "CallExpression[callee.name='Function']",
     message: `Function() is banned. ${BAN}`,
   },
@@ -42,13 +46,23 @@ const S09 = "Banned by security.md section 8 (S-09): no HTML parsing sinks, scri
 /** S-09 bans on parsing and script sinks. Part of every package's `no-restricted-syntax`. */
 export const sinkSyntax = [
   { selector: "NewExpression[callee.name='DOMParser']", message: `DOMParser is banned. ${S09}` },
+  { selector: "NewExpression[callee.object.name=/^(window|globalThis|self)$/][callee.property.name='DOMParser']", message: `DOMParser is banned. ${S09}` },
   { selector: "JSXAttribute[name.name=/^srcdoc$/i]", message: `The srcdoc attribute is banned. ${S09}` },
   {
-    selector: "CallExpression[callee.property.name=/^setAttribute(NS)?$/][arguments.0.value=/^(style|srcdoc|on.*)$/i]",
+    selector: "CallExpression[callee.property.name='setAttribute'][arguments.0.value=/^(style|srcdoc|on.*)$/i]",
     message: `setAttribute with "style", "srcdoc" or an on* name is banned. ${S09}`,
   },
   {
-    selector: "CallExpression[callee.property.name=/^createElement(NS)?$/][arguments.0.value=/^script$/i]",
+    // The namespace is argument 0; the attribute name is argument 1.
+    selector: "CallExpression[callee.property.name='setAttributeNS'][arguments.1.value=/^(style|srcdoc|on.*)$/i]",
+    message: `setAttributeNS with "style", "srcdoc" or an on* name is banned. ${S09}`,
+  },
+  {
+    selector: "CallExpression[callee.property.name='createElement'][arguments.0.value=/^script$/i]",
+    message: `Creating a script element is banned. ${S09}`,
+  },
+  {
+    selector: "CallExpression[callee.property.name='createElementNS'][arguments.1.value=/^script$/i]",
     message: `Creating a script element is banned. ${S09}`,
   },
   { selector: "JSXOpeningElement[name.name='script']", message: `A script element is banned. ${S09}` },
@@ -61,6 +75,7 @@ export const sinkSyntax = [
 
 /** `new Worker` and `new SharedWorker`: banned except in the modules a package allowlists (see its eslint config). */
 export const workerSyntax = [
+  { selector: "NewExpression[callee.object.name=/^(window|globalThis|self)$/][callee.property.name=/^(Worker|SharedWorker)$/]", message: `new window.Worker is banned outside the allowlisted worker modules. ${S09}` },
   { selector: "NewExpression[callee.name=/^(Worker|SharedWorker)$/]", message: `new Worker and new SharedWorker are banned outside the allowlisted worker modules. ${S09}` },
 ];
 

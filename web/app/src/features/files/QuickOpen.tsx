@@ -85,7 +85,7 @@ function QuickOpenBody({ desktopId, projectId }: { desktopId: string; projectId:
             className={cn("flex min-h-11 cursor-pointer items-center gap-2 rounded-row px-2 text-label pointer-fine:min-h-9", index === active && "bg-selection")}
           >
             <FileTypeIcon name={hit.name} isDir={false} />
-            <span className="min-w-0 flex-1 truncate">
+            <span className="min-w-0 flex-1 truncate [unicode-bidi:isolate]">
               <MatchText text={hit.path} positions={hit.positions} active />
             </span>
           </li>
