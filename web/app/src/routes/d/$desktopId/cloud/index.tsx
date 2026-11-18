@@ -13,7 +13,7 @@ function Page() {
   return (
     <WorkspaceFrame desktopId={desktopId} title="Cloud" subtitle="Instances your sessions run on" testId="cloud-screen">
       <RequireCapability name="cloud" fallback="notice">
-        <InstancesScreen desktopId={desktopId} />
+        <InstancesScreen key={desktopId} desktopId={desktopId} />
       </RequireCapability>
     </WorkspaceFrame>
   );

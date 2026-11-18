@@ -18,9 +18,21 @@ export interface ShownDetail {
   total: number;
 }
 
-// 3+ blank lines in a row, 40+ spaces in a row, then any control, format or line separator character
-// except newline and tab.
-const HIDING = /(\n[ \t]*(?:\n[ \t]*){3,})|( {40,})|((?![\n\t])[\p{Cc}\p{Cf}\p{Zl}\p{Zp}])/gu;
+// Characters that draw nothing yet are not spaces to a reader: Unicode space separators (NBSP, ideographic
+// space, the U+2000 block), tab, and the blank-glyph characters (Hangul fillers U+115F, U+1160, U+3164, U+FFA0
+// and the Braille blank U+2800). A line made of only these counts as blank, so padding cannot push a command
+// out of view (security re-review N-1).
+const BLANK = String.raw`[\p{Zs}\t\u115F\u1160\u3164\uFFA0\u2800]`;
+// Default-ignorable marks that render as nothing: combining grapheme joiner, Khmer inherent vowels,
+// Mongolian free variation selectors, variation selectors and their supplement. Written as alternatives
+// (not one character class) because they are combining characters.
+const IGNORABLE = String.raw`\u034F|\u17B4|\u17B5|\u180B|\u180C|\u180D|\u180F|[\uFE00-\uFE0F]|\u{E0100}|[\u{E0101}-\u{E01EF}]`;
+// 3+ blank lines in a row, 40+ blank characters in a row, then any control, format, separator or invisible
+// character except newline, tab and the plain space.
+const HIDING = new RegExp(
+  `(\\n${BLANK}*(?:\\n${BLANK}*){3,})|(${BLANK}{40,})|((?![\\n\\t ])(?:[\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}\\p{Zs}\\u115F\\u1160\\u3164\\uFFA0\\u2800]|${IGNORABLE}))`,
+  "gu",
+);
 
 function codePointMarker(char: string): string {
   return `<U+${char.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}>`;
@@ -36,8 +48,10 @@ function cut(text: string, max: number): string {
 }
 
 export function showDetail(raw: string, max: number): ShownDetail {
-  const total = raw.length;
-  const text = cut(raw.replace(/\r\n/g, "\n"), max);
+  // Length and truncation are measured on the normalized text, so CRLF line ends do not count as cut text.
+  const normalized = raw.replace(/\r\n/g, "\n");
+  const total = normalized.length;
+  const text = cut(normalized, max);
   const segments: TextSegment[] = [];
   let from = 0;
   const push = (value: string, marker = false) => {

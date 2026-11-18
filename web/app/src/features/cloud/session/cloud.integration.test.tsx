@@ -4,7 +4,7 @@ import { createMemoryHistory, RouterProvider } from "@tanstack/react-router";
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { FIXTURE_HANDLERS, type MockDesktop } from "@monoptah/mock-desktop";
+import { FIXTURE_HANDLERS, FixtureError, type MockDesktop } from "@monoptah/mock-desktop";
 import type { CloudField } from "@monoptah/protocol";
 import { MemoryPersistAdapter, registerPersistAdapter, type PersistAdapter } from "@/data";
 import { DESKTOP_ID, connectMockDesktop, seedWorkspace, type MockLink, type MockLinkOptions } from "@/features/sessions/dev/mockLink";
@@ -18,7 +18,7 @@ import { createAppRouter } from "@/router";
 import { clearHooks, registerSendGuard, registerSessionCapabilities } from "@/ui/hooks";
 import { clearSlots, registerSlot } from "@/ui/slots";
 import { cloudSendGuard, cloudSessionCapabilities } from "./guard";
-import { clearLiveCloudStates } from "./liveState";
+import { clearLivePlacements } from "./liveState";
 import { ArchiveDialogCloud, CardBadgeCloud, ComposerTopCloud, HeaderChipCloud, NavItemsCloud } from "./slotComponents";
 
 beforeAll(() => {
@@ -61,7 +61,7 @@ afterEach(() => {
   resetSessionActivity();
   clearSlots();
   clearHooks();
-  clearLiveCloudStates();
+  clearLivePlacements();
   localStorage.clear();
 });
 
@@ -181,10 +181,34 @@ describe("composer-top states", () => {
     await user.click(within(dialog).getByRole("button", { name: "Retry start" }));
     await waitFor(() => expect(retried).toHaveBeenCalledWith({ sessionId: "sess-sandbox-stopped" }));
 
+    // BILL I-5: the Stop confirm names the sessions that share the instance before anything is sent.
     await user.click(await within(region).findByRole("button", { name: "Stop instance" }));
-    await user.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Stop instance" }));
-    await waitFor(() => expect(stopped).toHaveBeenCalledWith({ sessionId: "sess-sandbox-stopped" }));
+    const stopDialog = await screen.findByRole("dialog");
+    await waitFor(() => expect(stopDialog).toHaveTextContent(/"Stopped sandbox work"/));
+    expect(stopDialog).toHaveTextContent("Stop Docker sandbox?");
+    expect(stopped).not.toHaveBeenCalled();
+    await user.click(within(stopDialog).getByRole("button", { name: "Stop instance" }));
+    await waitFor(() => expect(stopped).toHaveBeenCalledWith({ kind: "sandbox", instance: "fake-sandbox-one" }));
     expect(await screen.findByText("Interrupted 1 busy session(s)")).toBeInTheDocument();
+  });
+
+  it("falls back to the generic Stop confirm when the instance list cannot be read", async () => {
+    const user = userEvent.setup();
+    const stopped = vi.fn();
+    FIXTURE_HANDLERS["cloud.instances"] = () => {
+      throw new FixtureError("no list", "busy");
+    };
+    FIXTURE_HANDLERS["cloud.stop"] = (params) => {
+      stopped(params);
+      return { stopped: true };
+    };
+    mount("/s/sess-sandbox-stopped", { seed: withCloud("sess-sandbox-stopped", { state: "unavailable", kept: true }) });
+    const region = await top();
+    await user.click(await within(region).findByRole("button", { name: "Stop instance" }));
+    const dialog = await screen.findByRole("dialog");
+    await waitFor(() => expect(dialog).toHaveTextContent("The desktop tells you what was interrupted"));
+    await user.click(within(dialog).getByRole("button", { name: "Stop instance" }));
+    await waitFor(() => expect(stopped).toHaveBeenCalledWith({ sessionId: "sess-sandbox-stopped" }));
   });
 
   it("stopped: says that sending wakes the instance and that it is billable", async () => {
@@ -290,6 +314,155 @@ describe("archive dialog", () => {
     // The header menu hides Archive for read-only devices; the dialog itself is disabled as well.
     await user.click(await screen.findByRole("button", { name: "Session actions" }));
     expect(screen.queryByRole("menuitem", { name: "Archive" })).toBeNull();
+  });
+});
+
+describe("composer-top: more states (SPEC M-4, M-5, X-10, BILL M-1, M-9)", () => {
+  it("stopping: says the instance is stopping and that a send wakes it again", async () => {
+    mount("/s/sess-codespace-1", { seed: withCloud("sess-codespace-1", { state: "stopping" }) });
+    const region = await top();
+    expect(region).toHaveTextContent("This instance is stopping.");
+    expect(region).toHaveTextContent("billable");
+  });
+
+  it("unavailable without kept: says so, offers neither Retry nor Stop", async () => {
+    mount("/s/sess-codespace-1", { seed: withCloud("sess-codespace-1", { state: "unavailable" }) });
+    const region = await top();
+    expect(region).toHaveTextContent("This instance is unavailable right now.");
+    expect(within(region).queryByRole("button", { name: "Stop instance" })).toBeNull();
+    expect(within(region).queryByRole("button", { name: "Retry" })).toBeNull();
+  });
+
+  it("failed start without kept: Retry behind a cost notice, and no Stop", async () => {
+    mount("/s/sess-sandbox-stopped", {
+      seed: withCloud("sess-sandbox-stopped", {
+        state: "unavailable",
+        startup: { steps: [{ id: "create", status: "failed" }], current: "create", error: "Could not create it" },
+      }),
+    });
+    const region = await top();
+    expect(await within(region).findByRole("alert")).toHaveTextContent("Could not create it");
+    expect(within(region).getByRole("button", { name: "Retry" })).toBeEnabled();
+    expect(within(region).queryByRole("button", { name: "Stop instance" })).toBeNull();
+    expect(region).not.toHaveTextContent("still bills");
+  });
+
+  it("untrusted desktop text is capped and loses hidden characters (startup error, auto-stop reason)", async () => {
+    mount("/s/sess-codespace-1", {
+      seed: withCloud("sess-codespace-1", {
+        state: "unavailable",
+        startup: { steps: [{ id: "create", status: "failed" }], current: "create", error: `Failed ‮ gnp.exe ${"x".repeat(900)}` },
+        autoStop: { at: Date.now() + 600_000, reason: `⁦Idle⁩ ${"y".repeat(900)}` },
+      }),
+    });
+    const region = await top();
+    const alert = await within(region).findByRole("alert");
+    expect(alert.textContent).not.toMatch(/[‮⁦⁩]/);
+    expect(alert.textContent!.length).toBeLessThanOrEqual(200);
+    expect(region.textContent).not.toMatch(/[‮⁦⁩]/);
+    expect(region.textContent).not.toContain("y".repeat(300));
+  });
+
+  it("the startup list shows durations of finished steps and highlights the current step", async () => {
+    const at = Date.now();
+    mount("/s/sess-codespace-starting", {
+      seed: withCloud("sess-codespace-starting", {
+        state: "starting",
+        startup: {
+          steps: [
+            { id: "create", status: "done", startedAt: at - 20_000, finishedAt: at - 12_000 },
+            { id: "provision", status: "running", startedAt: at - 12_000 },
+          ],
+          current: "provision",
+        },
+      }),
+    });
+    const region = await top();
+    const steps = within(await within(region).findByRole("list", { name: "Startup steps" })).getAllByRole("listitem");
+    expect(steps[0]).toHaveTextContent("Done - 8 s");
+    expect(steps[1]).toHaveAttribute("aria-current", "step");
+    expect(steps[1]).toHaveTextContent(/Running - \d+ s/);
+    expect(steps[0]).not.toHaveAttribute("aria-current");
+  });
+
+  it("Keep running carries a billing note", async () => {
+    mount("/s/sess-codespace-1", { seed: withCloud("sess-codespace-1", { autoStop: { at: Date.now() + 600_000, reason: "Idle" } }) });
+    expect(await top()).toHaveTextContent("Keeping it running keeps billing until it stops.");
+  });
+
+  it("the header chip announces a state change in a live region", async () => {
+    mount("/s/sess-codespace-starting");
+    const announce = async (text: string) => await waitFor(() => expect(screen.getAllByRole("status").some((node) => node.textContent === text && node.className.includes("sr-only"))).toBe(true));
+    await announce("GitHub codespace: Starting");
+    for (let i = 0; i < 9; i += 1) await act(async () => void link.desktop.advance("sess-codespace-starting"));
+    await announce("GitHub codespace: Available");
+  });
+
+  it("the waking note appears only after this device sent, not when another device resumes the instance", async () => {
+    mount("/s/sess-sandbox-stopped");
+    await screen.findByText("This instance is stopped. Sending wakes it (billable).");
+    await act(async () => void link.desktop.world.resume("sess-sandbox-stopped"));
+    expect(await screen.findByRole("list", { name: "Startup steps" })).toBeInTheDocument();
+    expect(screen.queryByText(/Waking the instance/)).toBeNull();
+  });
+});
+
+describe("send guard with the live conversation state (BILL I-1, SPEC I-1)", () => {
+  it("asks before sending when the conversation says stopped although the catalog card says available", async () => {
+    const user = userEvent.setup();
+    mount("/s/sess-codespace-1", { seed: withCloud("sess-codespace-1", { state: "stopped" }) });
+    await screen.findByText("This instance is stopped. Sending wakes it (billable).");
+    await user.type(await field(), "hello{Enter}");
+    expect(await screen.findByRole("dialog")).toHaveTextContent("billable");
+  });
+
+  it("asks before sending to an instance that is not connected", async () => {
+    const user = userEvent.setup();
+    mount("/s/sess-codespace-1", { seed: withCloud("sess-codespace-1", { state: "unknown" }) });
+    await screen.findByText(/Not connected\. The desktop cannot reach/);
+    await user.type(await field(), "hello{Enter}");
+    expect(await screen.findByRole("dialog")).toHaveTextContent("cannot reach this instance");
+  });
+
+  it("asks before sending to a stopping instance", async () => {
+    const user = userEvent.setup();
+    mount("/s/sess-codespace-1", { seed: withCloud("sess-codespace-1", { state: "stopping" }) });
+    await screen.findByText(/This instance is stopping\./);
+    await user.type(await field(), "hello{Enter}");
+    expect(await screen.findByRole("dialog")).toHaveTextContent("stopping");
+  });
+
+  it("refuses a send to an unavailable instance", async () => {
+    const user = userEvent.setup();
+    const sent = vi.fn();
+    FIXTURE_HANDLERS["conversation.send"] = (params) => {
+      sent(params);
+      return { sessionId: "sess-codespace-1" };
+    };
+    mount("/s/sess-codespace-1", { seed: withCloud("sess-codespace-1", { state: "unavailable" }) });
+    await screen.findByText(/This instance is unavailable right now\./);
+    await user.type(await field(), "hello{Enter}");
+    expect(await screen.findByText("This instance is unavailable right now. Check it on your desktop, then send again.")).toBeInTheDocument();
+    expect(sent).not.toHaveBeenCalled();
+  });
+});
+
+describe("archive of a remote session (SPEC M-1)", () => {
+  it("gets the plain confirmation and sends no cloud choice", async () => {
+    const user = userEvent.setup();
+    const archived = vi.fn();
+    FIXTURE_HANDLERS["session.archive"] = (params, context) => {
+      archived(params);
+      return (original["session.archive"] as never as (p: unknown, c: unknown) => never)(params, context);
+    };
+    mount("/s/sess-remote-1");
+    await user.click(await screen.findByRole("button", { name: "Session actions" }));
+    await user.click(screen.getByRole("menuitem", { name: "Archive" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).queryByRole("radio")).toBeNull();
+    expect(dialog).not.toHaveTextContent("billing");
+    await user.click(within(dialog).getByRole("button", { name: "Archive" }));
+    await waitFor(() => expect(archived).toHaveBeenCalledWith({ conversationId: "sess-remote-1" }));
   });
 });
 

@@ -1,14 +1,15 @@
 // The controls of the target picker, shared by the New session page (U-18) and the "Move to cloud" dialog
 // (U-19): kind, instance, branch, and machine (codespace) or size (sandbox), all from `cloud.startOptions`
 // and `cloud.instances`. There is deliberately no kit, template, image, cpu, memory or ttl control.
-import { useId, type ComponentProps } from "react";
+import { useEffect, useId, type ComponentProps } from "react";
 import type { SessionStartTarget } from "@monoptah/protocol";
 import { cn } from "@/lib/utils";
 import { SegmentedControl } from "@/ui/SegmentedControl";
 import { CLAUDE_ONLY_NOTE } from "../copy";
 import { useCloudInstances } from "../instances/useCloudInstances";
 import { kindLabel, stateLabel, type BillableKind } from "../model";
-import { NEW_INSTANCE, buildTarget, choicesOf, readyKinds, type StartOptions } from "./target";
+import { safeName } from "../safe";
+import { NEW_INSTANCE, buildTarget, choicesOf, readyKinds, sanitizeTarget, type StartOptions } from "./target";
 
 const NONE = "none";
 
@@ -45,6 +46,15 @@ export function TargetControls({ options, value, onChange, noneLabel, disabled =
   const machines = choicesOf(options.machines);
   const sizes = choicesOf(options.sizes);
 
+  // A choice that left the desktop's options (the picked instance stopped existing, the backend is no longer
+  // ready, another project has other branches) is dropped instead of being sent with the start.
+  const known = instances.data === undefined ? undefined : instances.data.instances.map((candidate) => ({ kind: candidate.kind, instance: candidate.instance }));
+  const sanitized = sanitizeTarget(value, options, known);
+  const sanitizedKey = JSON.stringify(sanitized);
+  useEffect(() => {
+    if (sanitizedKey !== JSON.stringify(value)) onChange(sanitized);
+  }, [sanitizedKey, sanitized, value, onChange]);
+
   const update = (patch: Partial<{ instance: string; branch: string; machine: string; size: string }>) => {
     if (!kind) return;
     onChange(buildTarget({ kind, instance: instanceValue, branch: value?.branch, machine: value?.machine, size: value?.size, ...patch }));
@@ -65,18 +75,26 @@ export function TargetControls({ options, value, onChange, noneLabel, disabled =
           <p className="text-small text-muted-text">{CLAUDE_ONLY_NOTE}</p>
           <SelectField label="Instance" value={instanceValue} onChange={(event) => update({ instance: event.target.value })}>
             <option value={NEW_INSTANCE}>New instance</option>
-            {existing.map((candidate) => (
-              <option key={candidate.instance} value={candidate.instance}>
-                {candidate.displayName} ({stateLabel(candidate.state)})
-              </option>
-            ))}
+            {existing.map((candidate) =>
+              // The protocol reads the instance "new" as "create a new one", so an existing instance with that
+              // name cannot be addressed; it is listed but not pickable.
+              candidate.instance === NEW_INSTANCE ? (
+                <option key={candidate.instance} value="" disabled>
+                  {safeName(candidate.displayName)} ({stateLabel(candidate.state)}) - cannot be picked
+                </option>
+              ) : (
+                <option key={candidate.instance} value={candidate.instance}>
+                  {safeName(candidate.displayName)} ({stateLabel(candidate.state)})
+                </option>
+              ),
+            )}
           </SelectField>
           {branches.length > 0 ? (
             <SelectField label="Branch" value={value?.branch ?? ""} onChange={(event) => update({ branch: event.target.value })}>
               <option value="">Default branch</option>
               {branches.map((branch) => (
                 <option key={branch} value={branch}>
-                  {branch}
+                  {safeName(branch)}
                 </option>
               ))}
             </SelectField>
@@ -86,7 +104,7 @@ export function TargetControls({ options, value, onChange, noneLabel, disabled =
               <option value="">Default machine</option>
               {machines.map((machine) => (
                 <option key={machine.id} value={machine.id}>
-                  {machine.name}
+                  {safeName(machine.name)}
                 </option>
               ))}
             </SelectField>
@@ -96,7 +114,7 @@ export function TargetControls({ options, value, onChange, noneLabel, disabled =
               <option value="">Default size</option>
               {sizes.map((size) => (
                 <option key={size.id} value={size.id}>
-                  {size.name}
+                  {safeName(size.name)}
                 </option>
               ))}
             </SelectField>

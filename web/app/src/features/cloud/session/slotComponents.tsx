@@ -34,7 +34,7 @@ export function CardBadgeCloud({ desktopId, session }: SlotBaseProps) {
 export function HeaderChipCloud({ desktopId, session }: SlotBaseProps) {
   return (
     <>
-      <SessionHeaderChip session={session as SessionCard} />
+      <SessionHeaderChip desktopId={String(desktopId)} session={session as SessionCard} />
       <MoveDialogHost desktopId={String(desktopId)} session={session as SessionCard} />
     </>
   );
@@ -44,8 +44,8 @@ export function MenuItemsCloud({ desktopId, session }: SlotBaseProps) {
   return <MoveMenuItems desktopId={String(desktopId)} session={session as SessionCard} />;
 }
 
-export function NewSessionTargetCloud({ projectId, value, onChange }: SlotBaseProps & { value?: unknown; onChange?: (target: unknown) => void }) {
-  return <NewSessionTarget projectId={String(projectId)} value={value} onChange={onChange} />;
+export function NewSessionTargetCloud({ desktopId, projectId, value, onChange }: SlotBaseProps & { value?: unknown; onChange?: (target: unknown) => void }) {
+  return <NewSessionTarget desktopId={String(desktopId)} projectId={String(projectId)} value={value} onChange={onChange} />;
 }
 
 export function ArchiveDialogCloud({ desktopId, session, open, onOpenChange }: SlotBaseProps) {

@@ -1,9 +1,11 @@
 import { Link } from "@tanstack/react-router";
-import { useState } from "react";
+import { useId, useState } from "react";
+import { useCatalog } from "@/data";
 import { Badge } from "@/ui/badge";
 import { Button } from "@/ui/button";
 import { Icon } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
+import { safeMessage, safeName } from "../safe";
 import { costLabel, kindLabel, lastUsedLabel, READ_ONLY_NOTE, STATE_LABELS, STOP_REPORT_LABELS } from "./copy";
 import { ResumeInstanceDialog, StopInstanceDialog } from "./InstanceDialogs";
 import type { CloudInstance } from "./useCloudInstances";
@@ -18,28 +20,44 @@ export function canResume(instance: CloudInstance): boolean {
   return instance.state === "stopped" && instance.sessions.length > 0;
 }
 
+/**
+ * The session `cloud.resume` names: one that is not busy and that the catalog still lists, else any that is not
+ * busy, else the first. `cloud.resume` takes a session, and the desktop wakes the instance the session runs on.
+ */
+export function pickResumeSession(instance: CloudInstance, catalogIds: ReadonlySet<string> | undefined): string | undefined {
+  const idle = instance.sessions.filter((session) => !session.busy);
+  const listed = catalogIds ? idle.filter((session) => catalogIds.has(session.sessionId)) : [];
+  return (listed[0] ?? idle[0] ?? instance.sessions[0])?.sessionId;
+}
+
 export interface InstanceRowProps {
   desktopId: string;
   instance: CloudInstance;
   readOnly: boolean;
+  /** This device's own Stop or Resume was sent and the list has not shown its effect yet: the row's actions wait. */
+  pending?: boolean;
   /** The `warning` the desktop returned for the last stop of this instance. */
   warning?: string | undefined;
   onStopped: (instance: CloudInstance, warning: string | undefined) => void;
-  onChanged: () => void;
+  onResumed: (instance: CloudInstance) => void;
   nowMs: number;
 }
 
-export function InstanceRow({ desktopId, instance, readOnly, warning, onStopped, onChanged, nowMs }: InstanceRowProps) {
+export function InstanceRow({ desktopId, instance, readOnly, pending = false, warning, onStopped, onResumed, nowMs }: InstanceRowProps) {
   const [dialog, setDialog] = useState<"stop" | "resume" | null>(null);
+  // The session of a Resume is chosen when the dialog opens, so a refetch cannot change it under the user.
+  const [resumeSession, setResumeSession] = useState<string | undefined>(undefined);
+  const catalog = useCatalog().data?.sessions;
   const stop = canStop(instance);
   const resume = canResume(instance);
-  const noteId = `cloud-readonly-${instance.instance}`;
-  const first = instance.sessions[0];
+  const noteId = useId();
+  const name = safeName(instance.displayName);
+  const disabled = readOnly || pending;
   return (
     <li data-testid="cloud-instance" data-instance={instance.instance} data-state={instance.state} className="flex flex-col gap-3 rounded-card bg-surface p-4">
       <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-2">
         <div className="min-w-0">
-          <h2 className="wrap-anywhere text-body font-semibold text-content">{instance.displayName}</h2>
+          <h2 className="wrap-anywhere text-body font-semibold text-content">{name}</h2>
           <p className="text-meta text-muted-text">
             {kindLabel(instance.kind)} - {lastUsedLabel(instance.lastUsedAt, nowMs)}
           </p>
@@ -58,7 +76,7 @@ export function InstanceRow({ desktopId, instance, readOnly, warning, onStopped,
         </p>
       ) : null}
 
-      {warning ? <Notice variant="info">{warning}</Notice> : null}
+      {warning ? <Notice variant="info">{safeMessage(warning)}</Notice> : null}
 
       <div>
         <h3 className="text-label font-medium text-muted-text">Sessions</h3>
@@ -69,7 +87,7 @@ export function InstanceRow({ desktopId, instance, readOnly, warning, onStopped,
             {instance.sessions.map((session) => (
               <li key={session.sessionId} className="flex min-h-11 items-center justify-between gap-2">
                 <Link to="/d/$desktopId/s/$sessionId" params={{ desktopId, sessionId: session.sessionId }} className="min-w-0 flex-1 truncate text-small text-brand-text hover:underline">
-                  {session.title}
+                  {safeName(session.title)}
                 </Link>
                 {session.busy ? <Badge variant="outline">Busy</Badge> : null}
               </li>
@@ -78,23 +96,36 @@ export function InstanceRow({ desktopId, instance, readOnly, warning, onStopped,
         )}
       </div>
 
-      {stop || resume ? (
+      {stop || resume || pending ? (
         <div className="flex flex-wrap items-center gap-2">
           {stop ? (
-            <Button type="button" variant="outline" size="sm" disabled={readOnly} aria-describedby={readOnly ? noteId : undefined} onClick={() => setDialog("stop")}>
+            <Button type="button" variant="outline" size="sm" disabled={disabled} aria-describedby={disabled ? noteId : undefined} onClick={() => setDialog("stop")}>
               Stop
-              <span className="sr-only"> {instance.displayName}</span>
+              <span className="sr-only"> {name}</span>
             </Button>
           ) : null}
           {resume ? (
-            <Button type="button" size="sm" disabled={readOnly} aria-describedby={readOnly ? noteId : undefined} onClick={() => setDialog("resume")}>
+            <Button
+              type="button"
+              size="sm"
+              disabled={disabled}
+              aria-describedby={disabled ? noteId : undefined}
+              onClick={() => {
+                setResumeSession(pickResumeSession(instance, catalog ? new Set(catalog.map((session) => session.id)) : undefined));
+                setDialog("resume");
+              }}
+            >
               Resume
-              <span className="sr-only"> {instance.displayName}</span>
+              <span className="sr-only"> {name}</span>
             </Button>
           ) : null}
           {readOnly ? (
             <p id={noteId} className="text-meta text-muted-text">
               {READ_ONLY_NOTE}
+            </p>
+          ) : pending ? (
+            <p id={noteId} role="status" data-testid="own-action-note" className="text-meta text-muted-text">
+              Waiting for the desktop to report the change.
             </p>
           ) : null}
         </div>
@@ -104,14 +135,11 @@ export function InstanceRow({ desktopId, instance, readOnly, warning, onStopped,
         <StopInstanceDialog
           instance={instance}
           onOpenChange={(open) => !open && setDialog(null)}
-          onStopped={(next) => {
-            onStopped(instance, next);
-            onChanged();
-          }}
+          onStopped={(next) => onStopped(instance, next)}
         />
       ) : null}
-      {dialog === "resume" && first ? (
-        <ResumeInstanceDialog instance={instance} sessionId={first.sessionId} onOpenChange={(open) => !open && setDialog(null)} onResumed={onChanged} />
+      {dialog === "resume" && resumeSession ? (
+        <ResumeInstanceDialog instance={instance} sessionId={resumeSession} onOpenChange={(open) => !open && setDialog(null)} onResumed={() => onResumed(instance)} />
       ) : null}
     </li>
   );

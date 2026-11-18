@@ -2,7 +2,7 @@
 // card), their cost notices and confirms, and the move progress in composer-top.
 import { QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, RouterProvider } from "@tanstack/react-router";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { FIXTURE_HANDLERS, FixtureError, type MockDesktop } from "@monoptah/mock-desktop";
@@ -18,10 +18,10 @@ import { createQueryClient } from "@/lib/queryClient";
 import { createAppRouter } from "@/router";
 import { clearHooks, registerSendGuard, registerSessionCapabilities } from "@/ui/hooks";
 import { clearSlots, registerSlot } from "@/ui/slots";
-import { clearLiveCloudStates } from "../session/liveState";
+import { clearLivePlacements } from "../session/liveState";
 import { cloudSendGuard, cloudSessionCapabilities } from "../session/guard";
 import { CardBadgeCloud, ComposerTopCloud, HeaderChipCloud, MenuItemsCloud } from "../session/slotComponents";
-import { resetMoveStore } from "./moveStore";
+import { openMove, resetMoveStore } from "./moveStore";
 
 beforeAll(() => {
   window.matchMedia = ((query: string) => ({
@@ -62,7 +62,7 @@ afterEach(() => {
   resetMoveStore();
   clearSlots();
   clearHooks();
-  clearLiveCloudStates();
+  clearLivePlacements();
   localStorage.clear();
 });
 
@@ -82,6 +82,7 @@ function mount(path: string, options: MockLinkOptions = {}) {
       <RouterProvider router={router} />
     </QueryClientProvider>,
   );
+  return { router, queryClient };
 }
 
 const moving = (id: string) => (desktop: MockDesktop) => {
@@ -215,5 +216,85 @@ describe("Cancel move", () => {
     await user.click(within(dialog).getByRole("button", { name: "Cancel move" }));
     await waitFor(() => expect(spy).toHaveBeenCalledWith({ sessionId: "sess-codespace-1" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+});
+
+describe("a dialog opened from a list card (BILL I-4, SPEC I-3)", () => {
+  const openFromCard = async (user: ReturnType<typeof userEvent.setup>) => {
+    await user.click(await screen.findByRole("button", { name: "Actions for Fix the example parser" }));
+    await user.click(await screen.findByRole("menuitem", { name: "Move to cloud" }));
+    return screen.findByRole("dialog");
+  };
+
+  it("Cancel does not navigate to the session", async () => {
+    const user = userEvent.setup();
+    const { router } = mount("/p/proj-alpha");
+    const before = router.state.location.pathname;
+    const dialog = await openFromCard(user);
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(router.state.location.pathname).toBe(before);
+  });
+
+  it("no click inside the dialog navigates (text, target choice, confirm)", async () => {
+    const user = userEvent.setup();
+    const spy = spyOn("cloud.moveToCloud");
+    const { router } = mount("/p/proj-alpha");
+    const before = router.state.location.pathname;
+    const dialog = await openFromCard(user);
+    await user.click(within(dialog).getByText("Move this session to the cloud?"));
+    await user.click(await within(dialog).findByRole("radio", { name: "Docker sandbox" }));
+    expect(router.state.location.pathname).toBe(before);
+    await user.click(within(dialog).getByRole("button", { name: "Move and start billing" }));
+    await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+    expect(router.state.location.pathname).toBe(before);
+  });
+
+  it("a request does not survive its host and does not reappear on the session screen", async () => {
+    const user = userEvent.setup();
+    const { router } = mount("/p/proj-alpha");
+    await openFromCard(user);
+    await act(async () => void (await router.navigate({ to: "/d/$desktopId/s/$sessionId", params: { desktopId: DESKTOP_ID, sessionId: "sess-local-1" } })));
+    await screen.findByRole("button", { name: "Session actions" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.queryByText("Move this session to the cloud?")).toBeNull();
+  });
+
+  it("a request for a desktop with no mounted host opens nothing", () => {
+    mount("/p/proj-alpha");
+    const session = { id: "sess-local-1", projectId: "proj-alpha", title: "x" } as never;
+    expect(openMove({ kind: "toCloud", desktopId: "some-other-desktop", session })).toBe(false);
+  });
+
+  it("a dialog whose device lost control shows the note and cannot confirm", async () => {
+    const user = userEvent.setup();
+    const spy = spyOn("cloud.moveToCloud");
+    mount("/p/proj-alpha", { permission: "read" });
+    await screen.findByText("Fix the example parser");
+    const session = { id: "sess-local-1", projectId: "proj-alpha", title: "x" } as never;
+    act(() => void openMove({ kind: "toCloud", desktopId: DESKTOP_ID, session }));
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toHaveTextContent("read-only access");
+    const confirm = within(dialog).getByRole("button", { name: "Move and start billing" });
+    expect(confirm).toBeDisabled();
+    await user.click(confirm);
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["Continue locally", "toLocal", "Continue locally"],
+    ["Cancel move", "cancel", "Cancel move"],
+  ] as const)("the %s confirm is off without control", async (_name, kind, label) => {
+    const user = userEvent.setup();
+    const spy = spyOn(kind === "toLocal" ? "cloud.moveToLocal" : "cloud.cancelMove");
+    mount("/p/proj-alpha", { permission: "read" });
+    await screen.findByText("Fix the example parser");
+    const session = { id: "sess-local-1", projectId: "proj-alpha", title: "x" } as never;
+    act(() => void openMove({ kind, desktopId: DESKTOP_ID, session }));
+    const dialog = await screen.findByRole("dialog");
+    const confirm = within(dialog).getByRole("button", { name: label });
+    expect(confirm).toBeDisabled();
+    await user.click(confirm);
+    expect(spy).not.toHaveBeenCalled();
   });
 });

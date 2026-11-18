@@ -10,7 +10,7 @@
 // One decision per request: an id stays locked from the click until it leaves the list (a later frame), whatever
 // else arrives meanwhile. A request that just appeared is armed only after ARM_DELAY_MS, and a press that began
 // on another request is ignored, so a tap meant for one request never decides the next.
-import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type PointerEvent, type ReactNode } from "react";
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type PointerEvent, type ReactNode } from "react";
 import type { Approval } from "@monoptah/protocol";
 import { useApprovals, useLinkMutation } from "@/data";
 import { useLinkState } from "@/link";
@@ -24,6 +24,7 @@ import { showDetail, showLabel, type TextSegment } from "./text";
 
 export const APPROVAL_READ_ONLY_REASON = "Approvals need a device with control access.";
 export const APPROVAL_CONNECTING_REASON = "Connecting. Approvals unlock once the link is ready.";
+export const APPROVAL_LINK_NOT_READY_REASON = "The link to your desktop is not ready. Approvals unlock once it is back.";
 export const APPROVAL_UNCONFIRMED = "Could not confirm the answer; it may have reached the desktop. Wait for the desktop to update.";
 export const APPROVAL_TRUNCATED_NOTICE = "Review the full request on the desktop. Allow once is off because the whole request cannot be shown here.";
 /** Longest label and detail shown; the desktop text is capped again here so a huge payload cannot flood the DOM. */
@@ -37,7 +38,11 @@ const MAX_ERROR_CHARS = 120;
 
 export type ApprovalDecision = "allow" | "deny";
 
+// The label is a short title: isolate keeps it from reordering what is around it. The detail is a command
+// preview, so it is shown in code point order: `bidi-override` with `direction: ltr` stops real Hebrew or
+// Arabic letters from reordering the digits and punctuation next to them (security re-review N-2).
 const isolate = { unicodeBidi: "isolate" } as const;
+const codeOrder = { unicodeBidi: "bidi-override", direction: "ltr" } as const;
 
 function Segments({ segments }: { segments: TextSegment[] }): ReactNode {
   return segments.map((segment, index) =>
@@ -70,6 +75,8 @@ export interface ApprovalCardViewProps {
 export function ApprovalCardView({ approvals, onAnswer, disabledReason, className }: ApprovalCardViewProps) {
   const current = approvals[0];
   const currentId = current ? String(current.requestId) : null;
+  // Arming and presses follow the content too: a frame that changes the text of the same id disarms the buttons.
+  const armKey = current ? `${currentId}\u0000${current.label}\u0000${current.detail ?? ""}` : null;
   const [answered, setAnswered] = useState<ReadonlySet<string>>(() => new Set());
   const [errors, setErrors] = useState<ReadonlyMap<string, string>>(() => new Map());
   const [armedFor, setArmedFor] = useState<string | null>(null);
@@ -77,6 +84,8 @@ export function ApprovalCardView({ approvals, onAnswer, disabledReason, classNam
   const locked = useRef(new Set<string>());
   // The request a press (pointer down or key down) began on; a click only counts for that same request.
   const pressedOn = useRef<string | null>(null);
+  // True while keyboard focus is inside the card, so a swap that disables the focused button cannot drop it to the page.
+  const focusInside = useRef(false);
   const section = useRef<HTMLElement>(null);
   const reasonId = useId();
   const titleId = useId();
@@ -98,24 +107,38 @@ export function ApprovalCardView({ approvals, onAnswer, disabledReason, classNam
     for (const id of [...locked.current]) if (!live.has(id)) locked.current.delete(id);
   }, [signature]);
 
-  // Arm the buttons only a moment after a request appears; keep focus on the card if it was inside it.
+  // Arm the buttons only a moment after a request (or its text) appears.
   useEffect(() => {
-    if (currentId === null) return;
-    const active = document.activeElement;
-    if (section.current && active && section.current.contains(active)) section.current.focus();
-    const timer = setTimeout(() => setArmedFor(currentId), ARM_DELAY_MS);
+    if (armKey === null) return;
+    const timer = setTimeout(() => setArmedFor(armKey), ARM_DELAY_MS);
     return () => {
       clearTimeout(timer);
       setArmedFor(null);
     };
-  }, [currentId]);
+  }, [armKey]);
+
+  // Keep focus on the card when it was inside it: the focused button may turn disabled on a swap, and a browser
+  // would then move focus to the page body. Layout effect: runs before the browser's focus fixup.
+  useLayoutEffect(() => {
+    const node = section.current;
+    if (!node || !focusInside.current) return;
+    const active = document.activeElement;
+    if (active === null || active === document.body || node.contains(active)) node.focus();
+  }, [armKey, answered]);
+  useEffect(() => {
+    const leave = (event: Event) => {
+      if (!section.current?.contains(event.target as Node)) focusInside.current = false;
+    };
+    document.addEventListener("pointerdown", leave, true);
+    return () => document.removeEventListener("pointerdown", leave, true);
+  }, []);
 
   const label = useMemo(() => showLabel(current?.label ?? "", MAX_LABEL_CHARS), [current?.label]);
   const detail = useMemo(() => showDetail(current?.detail ?? "", MAX_DETAIL_CHARS), [current?.detail]);
 
-  if (!current || currentId === null) return null;
+  if (!current || currentId === null || armKey === null) return null;
   const done = answered.has(currentId);
-  const armed = armedFor === currentId;
+  const armed = armedFor === armKey;
   const error = errors.get(currentId);
   const busy = readOnly || done || !armed;
   const labelText = label.map((segment) => segment.text).join("");
@@ -123,7 +146,7 @@ export function ApprovalCardView({ approvals, onAnswer, disabledReason, classNam
   const decide = async (decision: ApprovalDecision) => {
     const pressed = pressedOn.current;
     pressedOn.current = null;
-    if (pressed !== null && pressed !== currentId) return;
+    if (pressed !== null && pressed !== armKey) return;
     if (readOnly || !armed || locked.current.has(currentId) || answered.has(currentId)) return;
     if (decision === "allow" && detail.truncated) return;
     const id = currentId;
@@ -135,6 +158,7 @@ export function ApprovalCardView({ approvals, onAnswer, disabledReason, classNam
       return next;
     });
     // The pressed button turns disabled; keep keyboard focus on the card rather than lose it to the page.
+    focusInside.current = true;
     section.current?.focus();
     try {
       await onAnswer(current.requestId, decision);
@@ -149,7 +173,7 @@ export function ApprovalCardView({ approvals, onAnswer, disabledReason, classNam
 
   const press = (event: PointerEvent<HTMLButtonElement> | KeyboardEvent<HTMLButtonElement>) => {
     if ("key" in event && event.key !== "Enter" && event.key !== " ") return;
-    pressedOn.current = currentId;
+    pressedOn.current = armKey;
   };
   const overflows = detail.lines > SCROLL_CUE_LINES;
   const announcement = done ? "Answer sent. Waiting for the desktop." : `New approval request: ${labelText}`;
@@ -161,7 +185,8 @@ export function ApprovalCardView({ approvals, onAnswer, disabledReason, classNam
       aria-labelledby={titleId}
       aria-describedby={readOnly ? reasonId : undefined}
       data-approval-card
-      className={cn("px-3 pb-2 outline-none", className)}
+      onFocus={() => (focusInside.current = true)}
+      className={cn("px-3 pb-2 focus-visible:outline-2 focus-visible:outline-brand", className)}
     >
       <Glass className="rounded-card">
         <div className="flex flex-col gap-2 px-4 py-3">
@@ -188,7 +213,7 @@ export function ApprovalCardView({ approvals, onAnswer, disabledReason, classNam
               <>
                 <pre
                   dir="ltr"
-                  style={isolate}
+                  style={codeOrder}
                   tabIndex={0}
                   aria-label="Request details"
                   data-approval-detail
@@ -242,10 +267,13 @@ export function ApprovalCard({ sessionId, className }: { sessionId: string; clas
   const supported = useCapability("approvals");
   const approvals = useApprovals(sessionId);
   const permission = useLinkState((state) => state.permission);
+  const status = useLinkState((state) => state.status);
   const answer = useLinkMutation("session.answerApproval");
   if (!isApprovalCardEnabled() || !supported || approvals.length === 0) return null;
   // Fail closed: nothing but an explicit `control` enables the buttons. `null` is a link that is still connecting.
-  const reason = permission === "control" ? undefined : permission === null ? APPROVAL_CONNECTING_REASON : APPROVAL_READ_ONLY_REASON;
+  // The list is a frame from the last good link: while the link is not ready it may be stale, so answering waits.
+  const reason =
+    permission !== "control" ? (permission === null ? APPROVAL_CONNECTING_REASON : APPROVAL_READ_ONLY_REASON) : status !== "ready" ? APPROVAL_LINK_NOT_READY_REASON : undefined;
   return (
     <ApprovalCardView
       key={sessionId}

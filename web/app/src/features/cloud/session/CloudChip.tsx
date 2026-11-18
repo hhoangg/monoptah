@@ -6,8 +6,8 @@ import { useCloud } from "@/data";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/ui/badge";
 import { useCapability } from "@/version";
-import { isNonLocalKind, kindLabel, placementOf, stateLabel, type Placement } from "../model";
-import { useLiveCloudState } from "./liveState";
+import { isNonLocalKind, kindLabel, placementOf, placementSources, stateLabel, type Placement } from "../model";
+import { useLivePlacement } from "./liveState";
 
 /** Pure view: "GitHub codespace" and "Available" as text. Local or unknown placements render nothing. */
 export function CloudChip({ placement, className }: { placement: Placement | null; className?: string }) {
@@ -30,11 +30,22 @@ export function SessionCardBadge({ session }: { session: SessionCard }) {
 }
 
 /** `session-header-chip` slot: live state from the conversation's `cloud` field. */
-export function SessionHeaderChip({ session }: { session: SessionCard }) {
+export function SessionHeaderChip({ desktopId, session }: { desktopId: string; session: SessionCard }) {
   const enabled = useCapability("cloud");
   const cloud = useCloud(session.id);
   const placement = placementOf(session, cloud);
-  useLiveCloudState(session.id, placement?.state);
+  useLivePlacement(desktopId, session.id, placementSources(session, cloud));
   if (!enabled) return null;
-  return <CloudChip placement={placement} />;
+  const visible = placement !== null && isNonLocalKind(placement.kind);
+  return (
+    <>
+      <CloudChip placement={placement} />
+      {/* A state change (Starting to Available) is announced, not only repainted. */}
+      {visible ? (
+        <span role="status" aria-live="polite" className="sr-only">
+          {placement.state ? `${kindLabel(placement.kind)}: ${stateLabel(placement.state)}` : kindLabel(placement.kind)}
+        </span>
+      ) : null}
+    </>
+  );
 }

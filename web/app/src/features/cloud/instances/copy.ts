@@ -1,20 +1,7 @@
-// Copy of the cloud instance list (U-17). Kept local to this folder on purpose: the session
-// screens have their own labels, and the two sets are deduplicated later.
-import type { CloudState } from "@monoptah/protocol";
-
-export const KIND_LABELS: Record<string, string> = {
-  codespace: "GitHub codespace",
-  sandbox: "Docker sandbox",
-};
-
-export const STATE_LABELS: Record<CloudState, string> = {
-  available: "Available",
-  starting: "Starting",
-  stopping: "Stopping",
-  stopped: "Stopped",
-  unavailable: "Unavailable",
-  unknown: "Not connected",
-};
+// Labels and the read-only note come from the shared vocabulary (`../model`, `../copy`), so the session
+// screens and the instance list cannot drift apart.
+export { KIND_LABELS, STATE_LABELS, kindLabel } from "../model";
+export { READ_ONLY_NOTE } from "../copy";
 
 export const STOP_REPORT_LABELS = {
   stopping: "Stopping",
@@ -22,11 +9,7 @@ export const STOP_REPORT_LABELS = {
   stillRunning: "The instance is still running",
 } as const;
 
-export const READ_ONLY_NOTE = "Stop and Resume need a device with control access.";
-
 export const INSTANCE_BUSY_MESSAGE = "The desktop is archiving or converting a session on this instance. Try again in a moment.";
-
-export const kindLabel = (kind: string): string => KIND_LABELS[kind] ?? kind;
 
 export const costLabel = (perHour: number): string => `about $${perHour.toFixed(2)}/hour (estimate)`;
 

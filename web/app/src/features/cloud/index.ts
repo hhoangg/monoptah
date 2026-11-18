@@ -4,5 +4,5 @@
 export { CloudComposerTop, type CloudComposerTopProps } from "./session/CloudComposerTop";
 export { CloudChip } from "./session/CloudChip";
 export { StepList, currentStepText, moveItems, startupItems, startupItemsFromCard, type StepItem } from "./StepList";
-export { COST_NOTICES, KEPT_NOTE, NOT_CONNECTED_NOTE, READ_ONLY_NOTE, STARTING_REFUSAL, STOPPED_NOTE, STOPPING_REFUSAL, STOP_CONFIRM, WAKING_NOTE } from "./copy";
+export { COST_NOTICES, KEPT_NOTE, NOT_CONNECTED_NOTE, READ_ONLY_NOTE, STARTING_REFUSAL, STOPPED_NOTE, UNAVAILABLE_REFUSAL, STOP_CONFIRM, WAKING_NOTE } from "./copy";
 export { KIND_LABELS, MOVE_STEP_LABELS, STARTUP_STEP_LABELS, STATE_LABELS, STEP_STATUS_LABELS, isBillableKind, isNonLocalKind, kindLabel, placementOf, stateLabel, useCanControl, type Placement } from "./model";

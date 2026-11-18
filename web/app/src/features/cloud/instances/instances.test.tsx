@@ -1,7 +1,7 @@
 // U-17: the cloud instance list over the mock desktop (rows, stop, resume, read-only, forbidden controls).
 import { QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, RouterProvider } from "@tanstack/react-router";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { FIXTURE_HANDLERS, FixtureError } from "@monoptah/mock-desktop";
@@ -15,7 +15,16 @@ import { clearHooks } from "@/ui/hooks";
 import { clearSlots } from "@/ui/slots";
 import { resetSessionActivity } from "@/features/sessions/activityStore";
 import { DESKTOP_ID, connectMockDesktop, seedWorkspace, type MockLinkOptions } from "@/features/sessions/dev/mockLink";
-import { INSTANCES_POLL_MS, instancesRefetchInterval, type CloudInstancesResult } from "./useCloudInstances";
+import { pickResumeSession } from "./InstanceRow";
+import {
+  INSTANCES_FAST_WINDOW_MS,
+  INSTANCES_POLL_CAP_MS,
+  INSTANCES_POLL_MS,
+  INSTANCES_SLOW_POLL_MS,
+  OWN_ACTION_WATCH_MS,
+  instancesRefetchInterval,
+  type CloudInstancesResult,
+} from "./useCloudInstances";
 import { lastUsedLabel } from "./copy";
 
 beforeAll(() => {
@@ -272,7 +281,7 @@ describe("read-only device", () => {
     const stopped = await rowOf("Fake sandbox one");
     expect(available.getByRole("button", { name: /Stop/ })).toBeDisabled();
     expect(stopped.getByRole("button", { name: /Resume/ })).toBeDisabled();
-    expect(stopped.getByText("Stop and Resume need a device with control access.")).toBeInTheDocument();
+    expect(stopped.getByText("This device has read-only access. Cloud actions need a device with control access.")).toBeInTheDocument();
   });
 });
 
@@ -294,5 +303,126 @@ describe("forbidden controls", () => {
     await user.click((await rowOf("Fake codespace one")).getByRole("button", { name: /Stop/ }));
     await screen.findByRole("dialog");
     check();
+  });
+});
+
+describe("polling window and backoff (SPEC I-4, BILL M-8)", () => {
+  const moving = { instances: [{ kind: "codespace", instance: "a", displayName: "A", sessions: [], state: "starting" }] } as never;
+  const idle = { instances: [{ kind: "codespace", instance: "a", displayName: "A", sessions: [], state: "stopped" }] } as never;
+
+  it("polls an idle-looking list while this device's own action is watched", () => {
+    expect(instancesRefetchInterval(idle)).toBe(false);
+    expect(instancesRefetchInterval(idle, { watching: true })).toBe(INSTANCES_POLL_MS);
+  });
+
+  it("backs off after the fast window and stops at the cap", () => {
+    expect(instancesRefetchInterval(moving, { elapsedMs: 0 })).toBe(INSTANCES_POLL_MS);
+    expect(instancesRefetchInterval(moving, { elapsedMs: INSTANCES_FAST_WINDOW_MS - 1 })).toBe(INSTANCES_POLL_MS);
+    expect(instancesRefetchInterval(moving, { elapsedMs: INSTANCES_FAST_WINDOW_MS })).toBe(INSTANCES_SLOW_POLL_MS);
+    expect(instancesRefetchInterval(moving, { elapsedMs: INSTANCES_POLL_CAP_MS })).toBe(false);
+    expect(OWN_ACTION_WATCH_MS).toBeGreaterThanOrEqual(120_000);
+    expect(OWN_ACTION_WATCH_MS).toBeLessThanOrEqual(180_000);
+  });
+});
+
+describe("pickResumeSession (SPEC I-4)", () => {
+  const instance = (sessions: { sessionId: string; busy: boolean }[]) => ({ kind: "sandbox", instance: "i", displayName: "I", state: "stopped", sessions: sessions.map((s) => ({ ...s, title: s.sessionId })) }) as never;
+
+  it("prefers an idle session that the catalog still lists", () => {
+    const picked = pickResumeSession(instance([{ sessionId: "gone", busy: false }, { sessionId: "busy", busy: true }, { sessionId: "listed", busy: false }]), new Set(["busy", "listed"]));
+    expect(picked).toBe("listed");
+  });
+
+  it("falls back to an idle session, then to the first", () => {
+    expect(pickResumeSession(instance([{ sessionId: "busy", busy: true }, { sessionId: "idle", busy: false }]), undefined)).toBe("idle");
+    expect(pickResumeSession(instance([{ sessionId: "a", busy: true }, { sessionId: "b", busy: true }]), new Set())).toBe("a");
+    expect(pickResumeSession(instance([]), undefined)).toBeUndefined();
+  });
+});
+
+describe("rows: labels, untrusted text, resume session and own actions", () => {
+  it("titles the Stop dialog with the human label", async () => {
+    const user = userEvent.setup();
+    mount();
+    const row = await rowOf("Fake codespace one");
+    await user.click(row.getByRole("button", { name: /Stop/ }));
+    expect(await screen.findByRole("dialog", { name: "Stop GitHub codespace?" })).toBeInTheDocument();
+  });
+
+  it("caps names and removes bidi controls in the row, the session links and the dialog", async () => {
+    const user = userEvent.setup();
+    const evil = `prod‮${"z".repeat(300)}`;
+    override([{ kind: "codespace", instance: "e", displayName: evil, state: "available", sessions: [{ sessionId: "s1", title: `‮title ${"q".repeat(300)}`, busy: false }] }]);
+    mount();
+    const heading = await screen.findByRole("heading", { level: 2 });
+    expect(heading.textContent).not.toContain("‮");
+    expect(heading.textContent!.length).toBeLessThanOrEqual(64);
+    const row = within(heading.closest("li") as HTMLElement);
+    expect(row.getByRole("link").textContent!.length).toBeLessThanOrEqual(64);
+    await user.click(row.getByRole("button", { name: /Stop/ }));
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog.textContent).not.toContain("‮");
+    expect(dialog.textContent).not.toContain("z".repeat(100));
+  });
+
+  it("resumes with an idle session, not blindly the first", async () => {
+    const user = userEvent.setup();
+    const calls: unknown[] = [];
+    FIXTURE_HANDLERS["cloud.resume"] = ((p: unknown) => {
+      calls.push(p);
+      return { accepted: true };
+    }) as never;
+    override([
+      {
+        kind: "sandbox",
+        instance: "r",
+        displayName: "Resumable",
+        state: "stopped",
+        sessions: [
+          { sessionId: "first-busy", title: "A", busy: true },
+          { sessionId: "second-idle", title: "B", busy: false },
+        ],
+      },
+    ]);
+    mount();
+    const row = await rowOf("Resumable");
+    await user.click(row.getByRole("button", { name: /Resume/ }));
+    await user.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Resume and start billing" }));
+    await waitFor(() => expect(calls).toEqual([{ sessionId: "second-idle" }]));
+  });
+
+  it("after its own Resume the row waits, polls on, and the action stays off until the list shows the change", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const user = userEvent.setup({ advanceTimers: (ms) => vi.advanceTimersByTime(ms) });
+      let resumed = false;
+      let readsAfter = 0;
+      const resumeCalls = vi.fn();
+      FIXTURE_HANDLERS["cloud.resume"] = (() => {
+        resumed = true;
+        resumeCalls();
+        return { accepted: true };
+      }) as never;
+      FIXTURE_HANDLERS["cloud.instances"] = (() => {
+        if (resumed) readsAfter += 1;
+        const state = resumed && readsAfter > 2 ? "starting" : "stopped";
+        return { instances: [{ kind: "sandbox", instance: "r", displayName: "Resumable", state, sessions: [{ sessionId: "s1", title: "S", busy: false }] }] };
+      }) as never;
+      mount();
+      const row = await rowOf("Resumable");
+      await user.click(row.getByRole("button", { name: /Resume/ }));
+      await user.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Resume and start billing" }));
+      await waitFor(() => expect(resumeCalls).toHaveBeenCalledTimes(1));
+      // The refetch right after the action still says stopped: Resume is off and the row says it is waiting.
+      await waitFor(async () => expect((await rowOf("Resumable")).getByTestId("own-action-note")).toBeInTheDocument());
+      expect((await rowOf("Resumable")).getByRole("button", { name: /Resume/ })).toBeDisabled();
+      // The poll keeps going until the list shows the change.
+      await act(async () => void (await vi.advanceTimersByTimeAsync(INSTANCES_POLL_MS * 3 + 500)));
+      await waitFor(async () => expect((await rowOf("Resumable")).getByText("Starting")).toBeInTheDocument());
+      expect((await rowOf("Resumable")).queryByTestId("own-action-note")).toBeNull();
+      expect(resumeCalls).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

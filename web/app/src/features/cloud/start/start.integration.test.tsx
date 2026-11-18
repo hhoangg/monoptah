@@ -2,7 +2,7 @@
 // cloud slots and the send-guard registered as main.tsx does through `features/cloud/register.ts`.
 import { QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, RouterProvider } from "@tanstack/react-router";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { FIXTURE_HANDLERS, FixtureError } from "@monoptah/mock-desktop";
@@ -20,7 +20,7 @@ import { clearHooks, registerSendGuard, registerSessionCapabilities } from "@/ui
 import { clearSlots, registerSlot } from "@/ui/slots";
 import { cloudSendGuard, cloudSessionCapabilities } from "../session/guard";
 import { NewSessionTargetCloud } from "../session/slotComponents";
-import { buildTarget, parseTarget } from "./target";
+import { buildTarget, parseTarget, sanitizeTarget } from "./target";
 
 beforeAll(() => {
   window.matchMedia = ((query: string) => ({
@@ -238,5 +238,77 @@ describe("new-session-target", () => {
   it("a read-only device sees the chip disabled", async () => {
     mount({ permission: "read" });
     expect(await screen.findByTestId("target-chip")).toBeDisabled();
+  });
+});
+
+describe("sanitizeTarget (BILL M-4)", () => {
+  const options = { backends: [{ kind: "sandbox", ready: true }], branches: ["main"], machines: [], sizes: [{ id: "small", name: "Small" }] } as never;
+
+  it("keeps a target the options still offer, as the same object", () => {
+    const target = buildTarget({ kind: "sandbox", branch: "main", size: "small" });
+    expect(sanitizeTarget(target, options, [])).toBe(target);
+  });
+
+  it("drops what the options no longer offer", () => {
+    expect(sanitizeTarget(buildTarget({ kind: "sandbox", branch: "gone", size: "huge" }), options, [])).toEqual({ kind: "sandbox", instance: "new" });
+    expect(sanitizeTarget(buildTarget({ kind: "sandbox", instance: "vanished" }), options, [{ kind: "sandbox", instance: "other" }])).toEqual({ kind: "sandbox", instance: "new" });
+  });
+
+  it("keeps a picked instance while the instance list is not loaded", () => {
+    const target = buildTarget({ kind: "sandbox", instance: "mine" });
+    expect(sanitizeTarget(target, options, undefined)).toBe(target);
+  });
+
+  it("goes back to local when the backend is no longer ready", () => {
+    expect(sanitizeTarget(buildTarget({ kind: "codespace" }), options, [])).toBeNull();
+  });
+});
+
+describe("an existing instance named like the new-instance value (BILL M-5)", () => {
+  it("is listed but cannot be picked, so it never creates a new instance by accident", async () => {
+    const user = userEvent.setup();
+    FIXTURE_HANDLERS["cloud.instances"] = (() => ({
+      instances: [
+        { kind: "sandbox", instance: "new", displayName: "Sandbox called new", state: "available", sessions: [] },
+        { kind: "sandbox", instance: "real-one", displayName: "Real one", state: "available", sessions: [] },
+      ],
+    })) as never;
+    mount();
+    const dialog = await openPicker(user);
+    await user.click(await within(dialog).findByRole("radio", { name: "Docker sandbox" }));
+    const select = await within(dialog).findByLabelText("Instance");
+    await waitFor(() => expect(within(select).getByRole("option", { name: /Real one/ })).toBeInTheDocument());
+    expect(within(select).getByRole("option", { name: /Sandbox called new.*cannot be picked/ })).toBeDisabled();
+    expect(within(select).getByRole("option", { name: "New instance" })).toBeEnabled();
+  });
+});
+
+describe("the target resets with the project (BILL M-4)", () => {
+  it("falls back to Local after the project changes", async () => {
+    const user = userEvent.setup();
+    const { router } = mount();
+    const dialog = await openPicker(user);
+    await user.click(await within(dialog).findByRole("radio", { name: "Docker sandbox" }));
+    await done(user, dialog);
+    expect(screen.getByTestId("target-chip")).toHaveTextContent("Docker sandbox");
+    await act(async () => void (await router.navigate({ to: "/d/$desktopId/p/$projectId/new", params: { desktopId: DESKTOP_ID, projectId: "proj-beta" } })));
+    await waitFor(() => expect(screen.getByTestId("target-chip")).toHaveTextContent("Local"));
+  });
+});
+
+describe("untrusted names in the picker (BILL M-1)", () => {
+  it("shows instance, branch and size names capped and without bidi controls", async () => {
+    const user = userEvent.setup();
+    FIXTURE_HANDLERS["cloud.instances"] = (() => ({
+      instances: [{ kind: "sandbox", instance: "evil", displayName: `prod‮${"z".repeat(300)}`, state: "available", sessions: [] }],
+    })) as never;
+    mount();
+    const dialog = await openPicker(user);
+    await user.click(await within(dialog).findByRole("radio", { name: "Docker sandbox" }));
+    const select = await within(dialog).findByLabelText("Instance");
+    await waitFor(() => expect(select.querySelectorAll("option").length).toBeGreaterThan(1));
+    const text = select.textContent ?? "";
+    expect(text).not.toContain("‮");
+    expect(text).not.toContain("z".repeat(100));
   });
 });

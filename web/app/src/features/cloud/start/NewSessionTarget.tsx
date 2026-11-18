@@ -2,7 +2,7 @@
 // (Local by default) and opens the picker. Shown only when the desktop advertises `cloud` and `cloudStart`.
 // Controlled: `value` and `onChange(target | null)`, null means local. The start cost notice is not a gate
 // here: the confirm comes from the send-guard (an empty session id with a cloud kind).
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { SessionStartTarget } from "@monoptah/protocol";
 import { useLinkQuery } from "@/data";
 import { Icon } from "@/ui/Icon";
@@ -12,22 +12,35 @@ import { Button } from "@/ui/button";
 import { useCapability } from "@/version";
 import { COST_NOTICES, READ_ONLY_NOTE, START_DISABLED_NOTE } from "../copy";
 import { kindLabel, useCanControl } from "../model";
+import { safeMessage } from "../safe";
 import { TargetControls } from "./TargetControls";
 import { parseTarget, readyKinds } from "./target";
 
 export interface NewSessionTargetProps {
+  desktopId?: string;
   projectId: string;
   value?: unknown;
   onChange?: (target: unknown) => void;
 }
 
-export function NewSessionTarget({ projectId, value, onChange }: NewSessionTargetProps) {
+export function NewSessionTarget({ desktopId = "", projectId, value, onChange }: NewSessionTargetProps) {
   const cloud = useCapability("cloud");
   const cloudStart = useCapability("cloudStart");
   const enabled = cloud && cloudStart;
   const canControl = useCanControl();
   const options = useLinkQuery("cloud.startOptions", { projectId }, { enabled });
   const [open, setOpen] = useState(false);
+
+  // The target belongs to one desktop and project: a different one, or a capability that went off, resets it to
+  // local. Otherwise a codespace picked for project A would ride along with a start in project B.
+  const scope = `${desktopId}\u0000${projectId}`;
+  const lastScope = useRef(scope);
+  const held = value !== null && value !== undefined;
+  useEffect(() => {
+    const scopeChanged = lastScope.current !== scope;
+    lastScope.current = scope;
+    if (held && (scopeChanged || !enabled)) onChange?.(null);
+  }, [scope, enabled, held, onChange]);
   if (!enabled) return null;
 
   const target = parseTarget(value);
@@ -63,7 +76,7 @@ export function NewSessionTarget({ projectId, value, onChange }: NewSessionTarge
         <div className="flex flex-col gap-3">
           {!canControl ? <Notice>{READ_ONLY_NOTE}</Notice> : null}
           {disabledByDesktop ? <Notice>{START_DISABLED_NOTE}</Notice> : null}
-          {options.isError && !disabledByDesktop ? <Notice variant="error">{options.error.message.trim() || "Could not load the cloud options."}</Notice> : null}
+          {options.isError && !disabledByDesktop ? <Notice variant="error">{safeMessage(options.error.message, "Could not load the cloud options.")}</Notice> : null}
           {noKinds ? <Notice>No cloud backend is ready on your desktop. Sessions start locally.</Notice> : null}
           {options.data ? <TargetControls options={options.data} value={target} onChange={emit} noneLabel="Local" disabled={!canControl || noKinds} /> : null}
           {target ? <Notice>{COST_NOTICES.start}</Notice> : null}

@@ -2,14 +2,14 @@
 import { render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { MOVE_STEP_IDS, STARTUP_STEP_IDS, STEP_STATUSES, type CloudState, type StepStatus } from "@monoptah/protocol";
-import { COST_NOTICES, STARTING_REFUSAL, STOPPING_REFUSAL } from "./copy";
+import { COST_NOTICES, STARTING_REFUSAL, UNAVAILABLE_REFUSAL } from "./copy";
 import { KIND_LABELS, STATE_LABELS, placementOf } from "./model";
 import { CloudChip } from "./session/CloudChip";
 import { cloudSendGuard } from "./session/guard";
-import { clearLiveCloudStates, setLiveCloudState } from "./session/liveState";
+import { clearLivePlacements, publishPlacement } from "./session/liveState";
 import { StepList, currentStepText, moveItems, startupItems, startupItemsFromCard } from "./StepList";
 
-afterEach(clearLiveCloudStates);
+afterEach(clearLivePlacements);
 
 describe("StepList", () => {
   it.each(STEP_STATUSES)("says the %s status in words", (status: StepStatus) => {
@@ -85,16 +85,24 @@ describe("cloudSendGuard", () => {
     expect(await send("local", undefined)).toEqual({ kind: "allow" });
     expect(await send("remote", "stopped")).toEqual({ kind: "allow" });
     expect(await send("sandbox", "available")).toEqual({ kind: "allow" });
-    expect(await send("codespace", "unavailable")).toEqual({ kind: "allow" });
   });
 
-  it("refuses starting and stopping with the explanation", async () => {
+  it("refuses starting and unavailable with an explanation", async () => {
     expect(await send("sandbox", "starting")).toEqual({ kind: "refuse", reason: STARTING_REFUSAL });
-    expect(await send("codespace", "stopping")).toEqual({ kind: "refuse", reason: STOPPING_REFUSAL });
+    expect(await send("codespace", "unavailable")).toEqual({ kind: "refuse", reason: UNAVAILABLE_REFUSAL });
   });
 
-  it("confirms the wake cost for a stopped instance", async () => {
-    expect(await send("sandbox", "stopped")).toEqual({ kind: "confirm", notice: COST_NOTICES.wake });
+  // X-11: stopped, stopping and unknown ask before the send can wake a billable instance.
+  it.each([
+    ["stopped", COST_NOTICES.wake],
+    ["stopping", COST_NOTICES.wakeStopping],
+    ["unknown", COST_NOTICES.wakeUnknown],
+  ] as const)("confirms the wake cost for a %s instance", async (state, notice) => {
+    expect(await send("sandbox", state)).toEqual({ kind: "confirm", notice });
+  });
+
+  it("confirms a billable session whose state is not known at all", async () => {
+    expect(await send("codespace", undefined)).toEqual({ kind: "confirm", notice: COST_NOTICES.wakeUnknown });
   });
 
   it("confirms the start cost for a cloud start from the New session page (empty session id)", async () => {
@@ -102,8 +110,42 @@ describe("cloudSendGuard", () => {
     expect(await send("local", undefined, "")).toEqual({ kind: "allow" });
   });
 
-  it("prefers the live state over a stale catalog card", async () => {
-    setLiveCloudState("s1", "starting");
-    expect(await send("sandbox", "stopped")).toEqual({ kind: "refuse", reason: STARTING_REFUSAL });
+  describe("live sources", () => {
+    it("uses the live state when the catalog card is missing", async () => {
+      publishPlacement("d", "s1", "w1", { kinds: ["sandbox"], states: ["stopped"] });
+      expect(await send(null, undefined)).toEqual({ kind: "confirm", notice: COST_NOTICES.wake });
+    });
+
+    it("uses the card cloudState published next to the target (a card with only cloudState)", async () => {
+      publishPlacement("d", "s1", "w1", { kinds: ["codespace"], states: ["stopped"] });
+      expect(await send("codespace", undefined)).toEqual({ kind: "confirm", notice: COST_NOTICES.wake });
+    });
+
+    it("takes the most cautious answer when the sources disagree", async () => {
+      publishPlacement("d", "s1", "w1", { kinds: ["sandbox"], states: ["available"] });
+      expect(await send("sandbox", "stopped")).toEqual({ kind: "confirm", notice: COST_NOTICES.wake });
+      publishPlacement("d", "s1", "w2", { kinds: ["sandbox"], states: ["starting"] });
+      expect(await send("sandbox", "stopped")).toEqual({ kind: "refuse", reason: STARTING_REFUSAL });
+    });
+
+    it("treats a session that moved to the cloud as billable although the card still says local", async () => {
+      publishPlacement("d", "s1", "w1", { kinds: ["sandbox"], states: ["stopped"] });
+      expect(await send("local", undefined)).toEqual({ kind: "confirm", notice: COST_NOTICES.wake });
+    });
+
+    it("keys the live state by desktop and session", async () => {
+      publishPlacement("other-desktop", "s1", "w1", { kinds: ["sandbox"], states: ["stopped"] });
+      publishPlacement("d", "s2", "w1", { kinds: ["sandbox"], states: ["stopped"] });
+      expect(await send(null, undefined)).toEqual({ kind: "allow" });
+    });
+
+    it("keeps another writer's entry when one writer is removed (reference counted)", async () => {
+      publishPlacement("d", "s1", "chip", { kinds: ["sandbox"], states: ["stopped"] });
+      publishPlacement("d", "s1", "top", { kinds: ["sandbox"], states: ["stopped"] });
+      publishPlacement("d", "s1", "chip", undefined);
+      expect(await send(null, undefined)).toEqual({ kind: "confirm", notice: COST_NOTICES.wake });
+      publishPlacement("d", "s1", "top", undefined);
+      expect(await send(null, undefined)).toEqual({ kind: "allow" });
+    });
   });
 });

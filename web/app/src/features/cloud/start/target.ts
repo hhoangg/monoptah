@@ -47,3 +47,27 @@ export function buildTarget(fields: { kind: BillableKind; instance?: string | un
   if (fields.kind === "sandbox" && target.instance === NEW_INSTANCE && fields.size) target.size = fields.size;
   return target;
 }
+
+/**
+ * Drops what the current options no longer offer: a backend that is not ready (the whole target goes back to
+ * local), an instance that no longer exists, a branch, machine or size that is not in the lists. `instances`
+ * is undefined while the instance list is not loaded, and then an instance is kept. Returns the same object
+ * when nothing changed.
+ */
+export function sanitizeTarget(
+  value: SessionStartTarget | null,
+  options: StartOptions,
+  instances: ReadonlyArray<{ kind: string; instance: string }> | undefined,
+): SessionStartTarget | null {
+  if (!value) return value;
+  const kind = value.kind;
+  if (kind !== "codespace" && kind !== "sandbox") return null;
+  if (!readyKinds(options).includes(kind)) return null;
+  let instance = value.instance;
+  if (instance && instance !== NEW_INSTANCE && instances && !instances.some((candidate) => candidate.kind === kind && candidate.instance === instance)) instance = NEW_INSTANCE;
+  const branch = value.branch !== undefined && (options.branches ?? []).includes(value.branch) ? value.branch : undefined;
+  const machine = value.machine !== undefined && choicesOf(options.machines).some((choice) => choice.id === value.machine) ? value.machine : undefined;
+  const size = value.size !== undefined && choicesOf(options.sizes).some((choice) => choice.id === value.size) ? value.size : undefined;
+  const next = buildTarget({ kind, instance, branch, machine, size });
+  return JSON.stringify(next) === JSON.stringify(value) ? value : next;
+}

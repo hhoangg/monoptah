@@ -78,6 +78,13 @@ export function placementOf(session: Pick<SessionCard, "target" | "cloudState"> 
   return { kind, state: cloud?.state ?? session?.target?.state ?? session?.cloudState };
 }
 
+/** Every kind and state the live `cloud` field and the catalog card report; the send guard checks all of them. */
+export function placementSources(session: Pick<SessionCard, "target" | "cloudState"> | undefined, cloud?: CloudField): { kinds: string[]; states: CloudState[] } {
+  const kinds = [cloud?.kind, session?.target?.kind].filter((kind): kind is NonNullable<typeof kind> => !!kind);
+  const states = [cloud?.state, session?.target?.state, session?.cloudState].filter((state): state is CloudState => !!state);
+  return { kinds: [...new Set<string>(kinds)], states: [...new Set(states)] };
+}
+
 /** True when the device may change things (link permission `control`). Other devices see controls disabled. */
 export function useCanControl(): boolean {
   return useLinkState((state) => state.permission === "control");

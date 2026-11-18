@@ -1,19 +1,48 @@
 // U-17: the cloud instance list of one desktop. Read-only data (`cloud.instances` never wakes an
 // instance); Stop and Resume are the only actions, both control and both confirmed.
-import { useState } from "react";
+//
+// After this device's own Stop or Resume the list keeps polling for a bounded window (OWN_ACTION_WATCH_MS) and
+// that row's actions wait, because the desktop's overview is cached and can still show the old state for a while.
+// A second tap would otherwise send a second billable request.
+import { useEffect, useState } from "react";
+import type { CloudState } from "@monoptah/protocol";
 import { useLinkState } from "@/link/LinkProvider";
 import { Button } from "@/ui/button";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
 import { Notice } from "@/ui/Notice";
 import { otherLabel } from "./copy";
 import { InstanceRow } from "./InstanceRow";
-import { useCloudInstances, type CloudInstance } from "./useCloudInstances";
+import { OWN_ACTION_WATCH_MS, useCloudInstances, type CloudInstance } from "./useCloudInstances";
+
+const keyOf = (instance: Pick<CloudInstance, "kind" | "instance">) => `${instance.kind}:${instance.instance}`;
+
+/** What the row looked like when this device acted: the action is settled once the list shows something else. */
+interface OwnAction {
+  state: CloudState;
+  stopReport: CloudInstance["stopReport"];
+  until: number;
+}
 
 export function InstancesScreen({ desktopId }: { desktopId: string }) {
-  const query = useCloudInstances();
   const readOnly = useLinkState((state) => state.permission !== "control");
+  const [own, setOwn] = useState<Record<string, OwnAction>>({});
+  const [epoch, setEpoch] = useState(0);
+  // The own action of a row is pending while the list still shows the row as it was and the window has not ended.
+  const isPending = (instance: CloudInstance) => {
+    const action = own[keyOf(instance)];
+    return !!action && action.state === instance.state && action.stopReport === instance.stopReport;
+  };
+  const query = useCloudInstances({ watching: (data) => data?.instances.some(isPending) ?? false, epoch });
   // The `warning` of the last stop per instance, shown on its row until the user leaves the screen.
   const [warnings, setWarnings] = useState<Record<string, string>>({});
+
+  // Forget an own action when its window ends.
+  useEffect(() => {
+    const untils = Object.values(own).map((action) => action.until);
+    if (untils.length === 0) return;
+    const timer = setTimeout(() => setOwn((current) => Object.fromEntries(Object.entries(current).filter(([, action]) => action.until > Date.now()))), Math.max(0, Math.min(...untils) - Date.now()) + 5);
+    return () => clearTimeout(timer);
+  }, [own]);
 
   if (query.data === undefined) {
     if (query.isError) {
@@ -36,14 +65,20 @@ export function InstancesScreen({ desktopId }: { desktopId: string }) {
   }
 
   const { instances, otherCount } = query.data;
-  const onStopped = (instance: CloudInstance, warning: string | undefined) =>
+  const watch = (instance: CloudInstance) => {
+    setOwn((current) => ({ ...current, [keyOf(instance)]: { state: instance.state, stopReport: instance.stopReport, until: Date.now() + OWN_ACTION_WATCH_MS } }));
+    setEpoch((current) => current + 1);
+    void query.refetch();
+  };
+  const onStopped = (instance: CloudInstance, warning: string | undefined) => {
     setWarnings((current) => {
       const next = { ...current };
-      if (warning) next[instance.instance] = warning;
-      else delete next[instance.instance];
+      if (warning) next[keyOf(instance)] = warning;
+      else delete next[keyOf(instance)];
       return next;
     });
-
+    watch(instance);
+  };
   return (
     <div className="flex flex-col gap-4">
       {query.isError ? <Notice variant="error">Could not refresh the list. Showing the last result.</Notice> : null}
@@ -55,13 +90,14 @@ export function InstancesScreen({ desktopId }: { desktopId: string }) {
         <ul aria-label="Cloud instances" className="flex flex-col gap-3">
           {instances.map((instance) => (
             <InstanceRow
-              key={`${instance.kind}:${instance.instance}`}
+              key={keyOf(instance)}
               desktopId={desktopId}
               instance={instance}
               readOnly={readOnly}
-              warning={warnings[instance.instance]}
+              pending={isPending(instance)}
+              warning={warnings[keyOf(instance)]}
               onStopped={onStopped}
-              onChanged={() => void query.refetch()}
+              onResumed={watch}
               nowMs={query.dataUpdatedAt}
             />
           ))}

