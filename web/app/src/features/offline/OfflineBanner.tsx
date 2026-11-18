@@ -38,7 +38,9 @@ export function useDesktopConnectivity(desktopId: string | null): Connectivity {
   const lastFrameAt = useLink(desktopId ?? "", (state) => state.lastFrameAt);
   // The directory knows when the desktop was last seen, which this tab cannot when the desktop was offline at open.
   const directory = useQuery({ ...desktopsQuery, enabled: desktopId !== null && online && presence === "offline" && lastFrameAt === null });
-  const directoryLastSeenAt = directory.data?.desktops.find((desktop) => desktop.id === desktopId)?.lastSeenAt ?? null;
+  // The directory counts seconds (the Worker's `last_seen_at`); the link and the banner use milliseconds.
+  const directorySeconds = directory.data?.desktops.find((desktop) => desktop.id === desktopId)?.lastSeenAt ?? null;
+  const directoryLastSeenAt = directorySeconds === null ? null : directorySeconds * 1000;
   return describeConnectivity(online, desktopId === null ? null : { status, presence, blocked, lastFrameAt }, directoryLastSeenAt);
 }
 

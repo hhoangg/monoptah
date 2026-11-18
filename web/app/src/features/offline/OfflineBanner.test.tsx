@@ -70,7 +70,7 @@ describe("OfflineBanner", () => {
   });
 
   it("shows Desktop offline with the directory last seen when the desktop was offline at page open", async () => {
-    const desktop = { id: "dk1", name: "Mac", color: null, online: false, pendingCount: 0, os: null, appVersion: null, lastSeenAt: Date.now() - 2 * 3_600_000 };
+    const desktop = { id: "dk1", name: "Mac", color: null, online: false, pendingCount: 0, os: null, appVersion: null, lastSeenAt: Math.floor(Date.now() / 1000) - 2 * 3600 };
     const mock = createMockServer({ signedIn: true });
     const restore = setApiTransport(async (url, init) =>
       url === "/api/desktops" ? new Response(JSON.stringify({ desktops: [desktop] }), { status: 200, headers: { "Content-Type": "application/json" } }) : mock.transport(url, init),
