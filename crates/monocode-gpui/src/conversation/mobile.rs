@@ -10,6 +10,28 @@ const CUSTOM_OPTION_ID: &str = "__custom__";
 /// The longest typed answer a phone may send.
 const MAX_CUSTOM_ANSWER: usize = 10_000;
 
+/// The longest approval detail a phone is sent, in characters.
+pub(crate) const APPROVAL_DETAIL_MAX: usize = 2000;
+/// The longest approval label a phone is sent, in characters.
+pub(crate) const APPROVAL_LABEL_MAX: usize = 200;
+
+/// An approval waiting on the desktop, as a remote device shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MobileApproval {
+    pub request_id: String,
+    pub label: String,
+    pub detail: String,
+}
+
+/// `text` cut to `max` characters, with an ellipsis when it was longer. Cuts
+/// on a character boundary.
+fn capped(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((end, _)) => format!("{}\u{2026}", &text[..end]),
+        None => text.to_owned(),
+    }
+}
+
 /// What a chat waits on the user for, so the phone can say so.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Waiting {
@@ -223,6 +245,46 @@ impl Conversation {
             .collect()
     }
 
+    /// The approvals waiting on the desktop, with text capped for a remote
+    /// device. Questions are not approvals and are left out.
+    pub(crate) fn mobile_approvals(&self, _cx: &gpui::App) -> Vec<MobileApproval> {
+        self.approvals
+            .iter()
+            .map(|approval| MobileApproval {
+                request_id: approval.id.clone(),
+                label: capped(&approval.title, APPROVAL_LABEL_MAX),
+                detail: capped(&approval.detail, APPROVAL_DETAIL_MAX),
+            })
+            .collect()
+    }
+
+    /// Whether this chat runs with full access, which a remote device never
+    /// acts on.
+    pub(crate) fn mobile_is_full_access(&self) -> bool {
+        self.settings.access == AccessMode::FullAccess
+    }
+
+    /// A remote device's answer to one pending approval: allow once or deny
+    /// once, through the desktop approval card's own path. Never "always
+    /// allow". Refused when the request is not pending (stale or answered).
+    pub(crate) fn mobile_decide_approval(
+        &mut self,
+        request_id: &str,
+        allow: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let decision = if allow {
+            Decision::Allow
+        } else {
+            Decision::Deny
+        };
+        if self.decide_notification_request(request_id, decision, cx) {
+            Ok(())
+        } else {
+            Err("Approval is no longer pending".into())
+        }
+    }
+
     /// The question the agent waits on, as the phone's `QuestionPrompt`; null
     /// for none. Only the first: the desktop answers its questions in order.
     pub(crate) fn mobile_question(&self, cx: &gpui::App) -> Value {
@@ -265,6 +327,31 @@ impl Conversation {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+impl Conversation {
+    /// Makes this chat wait on approvals `(id, title, detail)` and returns
+    /// what the desktop approval card would send to the provider.
+    pub(crate) fn mobile_test_wait_on(
+        &mut self,
+        approvals: &[(&str, &str, &str)],
+        access: AccessMode,
+    ) -> std::sync::mpsc::Receiver<Control> {
+        let (send, receive) = std::sync::mpsc::channel();
+        self.controls = Some(send);
+        self.settings.access = access;
+        self.approvals = approvals
+            .iter()
+            .map(|(id, title, detail)| Approval {
+                id: (*id).into(),
+                title: (*title).into(),
+                detail: (*detail).into(),
+                can_remember: true,
+            })
+            .collect();
+        receive
     }
 }
 

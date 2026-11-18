@@ -499,6 +499,38 @@ mod tests {
     }
 
     #[test]
+    fn an_extra_cleared_to_an_empty_array_is_sent_once() {
+        let turns = [turn("1", "hi")];
+        let none = Value::Null;
+        let full = json!({"approvals": [{"requestId": "r1"}]});
+        let empty = json!({"approvals": []});
+        let (_, baseline) = update(None, true, false, &none, &turns, false, &none, &full).unwrap();
+        let (frame, baseline) = update(
+            Some(&baseline),
+            true,
+            false,
+            &none,
+            &turns,
+            false,
+            &none,
+            &empty,
+        )
+        .unwrap();
+        assert_eq!(frame["approvals"], json!([]));
+        assert!(update(
+            Some(&baseline),
+            true,
+            false,
+            &none,
+            &turns,
+            false,
+            &none,
+            &empty
+        )
+        .is_none());
+    }
+
+    #[test]
     fn an_empty_extra_leaves_frames_exactly_as_before() {
         let turns = [turn("1", "hi")];
         let none = Value::Null;

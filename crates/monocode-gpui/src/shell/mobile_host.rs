@@ -711,6 +711,25 @@ impl Shell {
 
     // MARK: requests
 
+    /// The session a remote device names, for the approvals module: selection
+    /// applies as for any request, and a Mono's own chat is not a session.
+    pub(crate) fn mobile_approval_session(
+        &self,
+        id: &str,
+        device: &DeviceContext,
+        cx: &App,
+    ) -> Result<i64, String> {
+        match self.mobile_target(id, device, cx)? {
+            Target::Session(id) => Ok(id),
+            Target::Mono(_) => Err(policy::Code::UnsupportedTarget.message().to_owned()),
+        }
+    }
+
+    /// The open conversation of a session, for the approvals module.
+    pub(crate) fn mobile_session_view(&self, id: i64) -> Option<Entity<Conversation>> {
+        self.sessions.get(&id).cloned()
+    }
+
     fn mobile_target(&self, id: &str, device: &DeviceContext, cx: &App) -> Result<Target, String> {
         if let Some(mono) = id.strip_prefix("mono:") {
             if !in_selection(&device.monos, mono) {
@@ -1078,7 +1097,7 @@ impl Shell {
             return Map::new();
         };
         let mut fields = cloud::read_fields(*id, device, cx);
-        fields.extend(approvals::read_fields(*id, device, cx));
+        fields.extend(approvals::read_fields(self, *id, device, cx));
         fields
     }
 
@@ -1088,7 +1107,7 @@ impl Shell {
             return Value::Null;
         };
         let mut fields = cloud::frame_fields(*id, device, cx);
-        fields.extend(approvals::frame_fields(*id, device, cx));
+        fields.extend(approvals::frame_fields(self, *id, device, cx));
         Value::Object(fields)
     }
 
@@ -2977,6 +2996,171 @@ mod tests {
     }
 
     #[gpui::test]
+    fn remote_approval_answers_follow_the_flag_and_the_checks(cx: &mut gpui::TestAppContext) {
+        use monocode_core::agent::{AccessMode, Decision};
+        let (window, id, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                let conversation = shell.mobile_session_id(id);
+                let view = shell.sessions[&id].clone();
+                let ask = |shell: &mut Shell, device: &DeviceContext, params: Value, cx: &mut Context<Shell>| {
+                    approvals::dispatch_with(shell, device, &params, true, cx)
+                };
+                let params = |request: &str, decision: &str| {
+                    json!({"conversationId": conversation, "requestId": request, "decision": decision})
+                };
+                let pending = |cx: &mut Context<Shell>| view.read(cx).mobile_approvals(cx).len();
+
+                // Flag off: the canonical text, and no fields.
+                let receive = view.update(cx, |v, _| {
+                    v.mobile_test_wait_on(&[("r1", "Run ls", "ls -la")], AccessMode::Supervised)
+                });
+                assert_eq!(
+                    approvals::dispatch_with(shell, &phone(), &params("r1", "allow"), false, cx),
+                    Err(policy::Code::Disabled.message().to_owned())
+                );
+                assert_eq!(pending(cx), 1);
+                const { assert!(!policy::REMOTE_APPROVALS_ENABLED) };
+                assert!(approvals::read_fields(shell, id, &phone(), cx).is_empty());
+                assert!(approvals::frame_fields(shell, id, &phone(), cx).is_empty());
+
+                // A read device is refused by core policy for this method.
+                let mut reader = phone();
+                reader.permission = Permission::Read;
+                assert_eq!(
+                    policy::authorize_with(
+                        &reader,
+                        "session.answerApproval",
+                        &params("r1", "allow"),
+                        &policy::PolicyFlags::default(),
+                        true
+                    )
+                    .err()
+                    .map(|d| d.code),
+                    Some(policy::Code::ReadOnly)
+                );
+
+                // Unselected project.
+                let narrowed = web(Some(vec!["not-this-project".into()]), None);
+                assert_eq!(
+                    ask(shell, &narrowed, params("r1", "allow"), cx),
+                    Err(not_selected())
+                );
+                // Extra keys are forbidden, a bad decision is invalid.
+                let forbidden = Err(policy::Code::Forbidden.message().to_owned());
+                for key in ["scope", "always", "remember", "other"] {
+                    let mut extra = params("r1", "allow");
+                    extra[key] = json!(true);
+                    assert_eq!(ask(shell, &phone(), extra, cx), forbidden, "{key}");
+                }
+                for decision in ["session", "always", "ALLOW", ""] {
+                    assert_eq!(
+                        ask(shell, &phone(), params("r1", decision), cx),
+                        Err("Invalid mobile parameters".into()),
+                        "{decision}"
+                    );
+                }
+                assert_eq!(
+                    ask(shell, &phone(), json!({"conversationId": conversation, "decision": "allow"}), cx),
+                    Err("Invalid mobile parameters".into())
+                );
+                assert_eq!(pending(cx), 1);
+                assert!(receive.try_recv().is_err());
+
+                // A stale request is refused.
+                let stale = Err("Approval is no longer pending".to_string());
+                assert_eq!(ask(shell, &phone(), params("nope", "allow"), cx), stale);
+
+                // Allow resolves once; a second answer is refused.
+                assert_eq!(ask(shell, &phone(), params("r1", "allow"), cx), Ok(json!({})));
+                assert!(matches!(receive.try_recv().unwrap().decision, Decision::Allow));
+                assert_eq!(pending(cx), 0);
+                assert_eq!(ask(shell, &phone(), params("r1", "deny"), cx), stale);
+                assert!(receive.try_recv().is_err());
+
+                // Deny resolves once too.
+                let receive = view.update(cx, |v, _| {
+                    v.mobile_test_wait_on(&[("r2", "Edit", "x")], AccessMode::Supervised)
+                });
+                assert_eq!(ask(shell, &phone(), params("r2", "deny"), cx), Ok(json!({})));
+                assert!(matches!(receive.try_recv().unwrap().decision, Decision::Deny));
+                assert!(receive.try_recv().is_err());
+
+                // A full-access session is never answered remotely.
+                let receive = view.update(cx, |v, _| {
+                    v.mobile_test_wait_on(&[("r3", "Run", "rm")], AccessMode::FullAccess)
+                });
+                assert_eq!(ask(shell, &phone(), params("r3", "allow"), cx), forbidden);
+                assert_eq!(pending(cx), 1);
+                assert!(receive.try_recv().is_err());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn approval_fields_are_sent_when_enabled_and_clear_with_an_empty_array(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use monocode_core::agent::AccessMode;
+        let (window, id, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                let view = shell.sessions[&id].clone();
+                let long = "d".repeat(5000);
+                let _rx = view.update(cx, |v, _| {
+                    v.mobile_test_wait_on(&[("r1", "Run ls", &long)], AccessMode::Supervised)
+                });
+                let fields = approvals::fields_with(shell, id, true, cx);
+                let list = fields["approvals"].as_array().unwrap();
+                assert_eq!(list.len(), 1);
+                assert_eq!(list[0]["requestId"], "r1");
+                assert_eq!(list[0]["label"], "Run ls");
+                assert_eq!(list[0]["detail"].as_str().unwrap().chars().count(), 2001);
+                assert!(list[0]["detail"].as_str().unwrap().ends_with('\u{2026}'));
+                let none = Value::Null;
+                let turns = [json!({"id": "1", "items": []})];
+                let first = Value::Object(fields);
+                let (frame, baseline) =
+                    watch::update(None, true, false, &none, &turns, false, &none, &first).unwrap();
+                assert_eq!(frame["approvals"].as_array().unwrap().len(), 1);
+                // Answered: the cleared list is sent once, then not repeated.
+                view.update(cx, |v, cx| {
+                    assert!(v.mobile_decide_approval("r1", true, cx).is_ok());
+                });
+                let cleared = Value::Object(approvals::fields_with(shell, id, true, cx));
+                assert_eq!(cleared["approvals"], json!([]));
+                let (frame, baseline) = watch::update(
+                    Some(&baseline),
+                    true,
+                    false,
+                    &none,
+                    &turns,
+                    false,
+                    &none,
+                    &cleared,
+                )
+                .unwrap();
+                assert_eq!(frame["approvals"], json!([]));
+                assert!(
+                    watch::update(
+                        Some(&baseline),
+                        true,
+                        false,
+                        &none,
+                        &turns,
+                        false,
+                        &none,
+                        &cleared
+                    )
+                    .is_none()
+                );
+                // Disabled: no fields at all.
+                assert!(approvals::fields_with(shell, id, false, cx).is_empty());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn the_cloud_and_approval_hooks_leave_what_a_phone_sees_unchanged(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -3016,7 +3200,7 @@ mod tests {
                 }
                 assert_eq!(
                     approvals::dispatch(shell, &phone(), "session.answerApproval", &json!({}), cx),
-                    Err("Unsupported mobile operation".into())
+                    Err(policy::Code::Disabled.message().to_owned())
                 );
                 // Archive, delete, send and start are never refused by the stubs.
                 assert_eq!(
