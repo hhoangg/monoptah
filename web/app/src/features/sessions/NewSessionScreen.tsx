@@ -40,7 +40,11 @@ function targetKind(target: unknown): { kind: string } | null {
   return null;
 }
 
-export function NewSessionScreen({ desktopId, projectId }: { desktopId: string; projectId: string }) {
+/**
+ * `embedded` is the wide layout of F-18: the page sits beside the sessions list inside the project screen, so it
+ * has no header (the project screen owns the only h1 and the way back) and fills its pane instead of the viewport.
+ */
+export function NewSessionScreen({ desktopId, projectId, embedded = false }: { desktopId: string; projectId: string; embedded?: boolean }) {
   useRememberPlace();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -136,9 +140,15 @@ export function NewSessionScreen({ desktopId, projectId }: { desktopId: string; 
   return (
     <div
       data-testid="new-session-screen"
-      className={`${BACKGROUND_CONTAINER_CLASS} -mb-[calc(env(safe-area-inset-bottom)+2.5rem)] flex h-[calc(100dvh-2.75rem-env(safe-area-inset-top))] flex-col`}
+      data-embedded={embedded ? "true" : undefined}
+      className={`${BACKGROUND_CONTAINER_CLASS} flex flex-col ${
+        embedded
+          ? "h-[calc(100dvh-9rem)] min-h-[28rem] overflow-hidden rounded-[22px] border border-stroke"
+          : "-mb-[calc(env(safe-area-inset-bottom)+2.5rem)] h-[calc(100dvh-2.75rem-env(safe-area-inset-top))]"
+      }`}
     >
       <EmptySessionBackground projectId={projectId} />
+      {embedded ? null : (
       <header className="mx-auto flex w-full max-w-[768px] shrink-0 items-center gap-2 px-2 py-2 min-[24rem]:px-5">
         <Link
           to="/d/$desktopId/p/$projectId"
@@ -150,6 +160,7 @@ export function NewSessionScreen({ desktopId, projectId }: { desktopId: string; 
         </Link>
         <h1 className="min-w-0 flex-1 truncate text-h font-semibold">New session</h1>
       </header>
+      )}
 
       <div className="mx-auto flex min-h-0 w-full max-w-[768px] flex-1 flex-col items-center justify-center gap-3 px-5 text-center">
         {project ? <ProjectMascot project={project.path} name={project.mascot} color={accentFor(project.name, project.color)} size={64} className="opacity-40" /> : null}

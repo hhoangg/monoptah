@@ -5,6 +5,7 @@ import { useCatalog } from "@/data";
 import { Button } from "@/ui/button";
 import { Icon } from "@/ui/Icon";
 import { Input } from "@/ui/input";
+import { useMediaQuery } from "@/ui/useMediaQuery";
 import { Notice } from "@/ui/Notice";
 import { NowWorking } from "./NowWorking";
 import { SessionCard } from "./SessionCard";
@@ -15,6 +16,7 @@ import { harnessesInSessions } from "./sessionFilters";
 import { useSessionFilter, type Worktree } from "./sessionListFilter";
 import { WorkspaceMenu } from "./WorkspaceMenu";
 import { MonoRow, ProjectRow } from "./WorkspaceNav";
+import { NewSessionScreen } from "./NewSessionScreen";
 import { MonoHome } from "@/features/monos/MonoHome";
 import { useMonoPrefs } from "@/features/monos/monoPrefs";
 import { WorkspaceFrame, useReadOnly } from "./WorkspaceFrame";
@@ -93,8 +95,21 @@ export function HomeScreen({ desktopId }: { desktopId: string }) {
   );
 }
 
+/** F-18: from 1024 px (design-system.md section 11, `--breakpoint-lg`) the sessions list and the New session page share the screen. */
+export const SPLIT_QUERY = "(min-width: 64rem)";
+
+/**
+ * The two project routes, `/p/:projectId` (sessions) and `/p/:projectId/new` (New session). Below 1024 px each is
+ * its own page; from 1024 px both show side by side (list left, New session right) on either URL.
+ */
+export function ProjectRoute({ desktopId, projectId, page }: { desktopId: string; projectId: string; page: "sessions" | "new" }) {
+  const split = useMediaQuery(SPLIT_QUERY);
+  if (page === "new" && !split) return <NewSessionScreen desktopId={desktopId} projectId={projectId} />;
+  return <ProjectScreen desktopId={desktopId} projectId={projectId} split={split} />;
+}
+
 /** `/d/:desktopId/p/:projectId`: the project's sessions list with search and the now-working pill. */
-export function ProjectScreen({ desktopId, projectId }: { desktopId: string; projectId: string }) {
+export function ProjectScreen({ desktopId, projectId, split = false }: { desktopId: string; projectId: string; split?: boolean }) {
   const catalog = useCatalog();
   const readOnly = useReadOnly();
   const [text, setText] = useState("");
@@ -105,7 +120,8 @@ export function ProjectScreen({ desktopId, projectId }: { desktopId: string; pro
   const missing = !!catalog.data && !project;
   const sessions = useProjectSessions(projectId, query, worktree);
 
-  const newSession = readOnly ? (
+  // With the New session page beside the list, the header button would only point at what is already open.
+  const newSession = split ? null : readOnly ? (
     <Button type="button" size="pill" disabled title="This device is read-only">
       <Icon name="compose" size={18} />
       New session
@@ -132,7 +148,8 @@ export function ProjectScreen({ desktopId, projectId }: { desktopId: string; pro
           </Button>
         </section>
       ) : (
-        <>
+        <div className={split ? "grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] items-start gap-6" : undefined} data-testid={split ? "project-split" : undefined}>
+          <div className="min-w-0">
           {project ? (
             <div className="pb-2">
               <WorkspaceMenu
@@ -152,7 +169,13 @@ export function ProjectScreen({ desktopId, projectId }: { desktopId: string; pro
           </div>
           <SessionsList desktopId={desktopId} data={sessions} filter={filter} worktree={worktree} readOnly={readOnly} />
           <NowWorking desktopId={desktopId} projectId={projectId} readOnly={readOnly} />
-        </>
+          </div>
+          {split ? (
+            <section aria-label="New session" data-testid="project-split-detail" className="min-w-0">
+              <NewSessionScreen desktopId={desktopId} projectId={projectId} embedded />
+            </section>
+          ) : null}
+        </div>
       )}
     </WorkspaceFrame>
   );

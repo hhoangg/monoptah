@@ -326,3 +326,60 @@ describe("read-only device", () => {
     expect(screen.queryByTestId("read-only-chip")).toBeNull();
   });
 });
+
+/** A matchMedia stub that matches only the given queries, by exact string (F-18 uses "(min-width: 64rem)"). */
+function stubQueries(matching: string[]) {
+  window.matchMedia = ((query: string) => ({
+    matches: matching.includes(query),
+    media: query,
+    onchange: null,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    addListener: () => {},
+    removeListener: () => {},
+    dispatchEvent: () => false,
+  })) as unknown as typeof window.matchMedia;
+}
+
+describe("project screen wide layout (F-18, design-system.md section 11)", () => {
+  it("below 1024 px the list and New session stay separate pages (tablet and phone)", async () => {
+    stubQueries(["(min-width: 640px)"]);
+    mount("/p/proj-alpha");
+    await screen.findByRole("heading", { level: 1, name: "Example Alpha" });
+    expect(screen.queryByTestId("project-split")).toBeNull();
+    expect(screen.queryByTestId("new-session-screen")).toBeNull();
+    expect(screen.getByRole("link", { name: "New session" })).toHaveAttribute("href", `/d/${DESKTOP_ID}/p/proj-alpha/new`);
+  });
+
+  it("below 1024 px /new is the full page with its own header", async () => {
+    stubQueries(["(min-width: 640px)"]);
+    mount("/p/proj-alpha/new");
+    expect(await screen.findByTestId("new-session-screen")).not.toHaveAttribute("data-embedded");
+    // Let the catalog arrive before the test ends, so the link is not torn down mid-handshake.
+    await screen.findByText("Example Alpha");
+    expect(screen.getByRole("heading", { level: 1, name: "New session" })).toBeInTheDocument();
+    expect(screen.queryByTestId("project-split")).toBeNull();
+  });
+
+  it("from 1024 px the sessions list and the New session page are both visible on the project URL", async () => {
+    stubQueries(["(min-width: 640px)", "(min-width: 64rem)"]);
+    mount("/p/proj-alpha");
+    expect(await screen.findByRole("heading", { level: 1, name: "Example Alpha" })).toBeInTheDocument();
+    const split = await screen.findByTestId("project-split");
+    expect(await within(split).findByTestId("sessions-list")).toBeInTheDocument();
+    const detail = within(split).getByTestId("project-split-detail");
+    expect(within(detail).getByTestId("new-session-screen")).toHaveAttribute("data-embedded", "true");
+    expect(within(detail).getByRole("heading", { level: 2, name: "What should we work on?" })).toBeInTheDocument();
+    // One h1 only, and no button that points at the page already open.
+    expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
+    expect(screen.queryByRole("link", { name: "New session" })).toBeNull();
+  });
+
+  it("from 1024 px the /new URL shows the same split, so a bookmark or a link still lands on both panes", async () => {
+    stubQueries(["(min-width: 640px)", "(min-width: 64rem)"]);
+    mount("/p/proj-alpha/new");
+    const split = await screen.findByTestId("project-split");
+    expect(await within(split).findByTestId("sessions-list")).toBeInTheDocument();
+    expect(within(split).getByTestId("new-session-screen")).toHaveAttribute("data-embedded", "true");
+  });
+});
