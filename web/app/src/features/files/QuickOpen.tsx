@@ -104,7 +104,7 @@ export function QuickOpen({ owner, desktopId, projectId }: { owner: boolean; des
   const target = useQuickOpen((state) => state.target);
   const shown = owner && target?.desktopId === desktopId && target.projectId === projectId;
   return (
-    <ResponsiveOverlay open={!!shown} onOpenChange={(open) => (open ? undefined : closeQuickOpen())} title="Quick open">
+    <ResponsiveOverlay open={!!shown} onOpenChange={(open) => (open ? undefined : closeQuickOpen())} title="Quick open" fullHeight>
       {shown ? <QuickOpenBody desktopId={desktopId} projectId={projectId} /> : null}
     </ResponsiveOverlay>
   );
