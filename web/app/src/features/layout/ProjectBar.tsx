@@ -1,7 +1,6 @@
 // The project controls from 640px, never above the screen (WS-T screens have a fixed height, so a bar in the page
-// flow would push their composer off the screen). Where the shell draws the sidebar they sit in its foot (icons
-// only on the collapsed rail); on the screens that draw their own sidebar (home, project, cloud: they scroll with
-// the page) they sit above the page. They: toggle the Files, Changes and Git panels and open
+// flow would push their composer off the screen). They sit in the foot of the shell's sidebar (icons
+// only on the collapsed rail). They: toggle the Files, Changes and Git panels and open
 // the background picker for the project of the current screen. Each panel button is hidden when the
 // session-capabilities predicate refuses it. Below 640px the command palette carries the same actions.
 import { Icon, type IconName } from "@/ui/Icon";

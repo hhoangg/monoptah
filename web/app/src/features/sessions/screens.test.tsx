@@ -87,6 +87,15 @@ describe("catalog home", () => {
     expect(within(screen.getByRole("region", { name: "Recent sessions" })).getAllByTestId("session-card").length).toBe(8);
   });
 
+  it("draws no sidebar of its own at 640px and up: the app shell owns it (U-02)", async () => {
+    stubMatchMedia(true);
+    mount("");
+    await screen.findByRole("heading", { level: 1, name: "Workspace" });
+    expect(screen.queryByRole("complementary")).toBeNull();
+    expect(screen.queryByRole("navigation", { name: "Workspace" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Open workspace list/ })).toBeNull();
+  });
+
   it("shows 'Make yourself at home' with a Choose projects link when nothing is shared (F-14)", async () => {
     mount("", { empty: true });
     expect(await screen.findByText("Make yourself at home.")).toBeInTheDocument();
@@ -99,6 +108,14 @@ describe("catalog home", () => {
     await screen.findByRole("heading", { level: 1, name: "Example Alpha" });
     await waitFor(() => expect(localStorage.getItem(lastPlaceKey(DESKTOP_ID))).toBe(`/d/${DESKTOP_ID}/p/proj-alpha`));
     expect(localStorage.getItem("monoptah.lastDesktop")).toBe(DESKTOP_ID);
+  });
+});
+
+describe("last used desktop (N-12)", () => {
+  it("is remembered from a screen that is no workspace place, so `/` can bring the user back", async () => {
+    mount("/settings");
+    await waitFor(() => expect(localStorage.getItem("monoptah.lastDesktop")).toBe(DESKTOP_ID));
+    expect(localStorage.getItem(lastPlaceKey(DESKTOP_ID))).toBeNull();
   });
 });
 
@@ -120,14 +137,15 @@ describe("workspace drawer (F-12)", () => {
     expect(names.findIndex((t) => t.includes("Research Mono"))).toBeLessThan(names.findIndex((t) => t.includes("Example Alpha")));
   });
 
-  it("hides New Mono even when the desktop advertises monoTools, until the mono.create UI ships", async () => {
+  it("offers New Mono when the desktop advertises monoTools, and it opens the create dialog on the Mono list", async () => {
     const user = userEvent.setup();
-    mount("");
-    expect(getLinkConnection(DESKTOP_ID)).toBeDefined();
+    const { router } = mount("");
     const nav = await openDrawer(user);
     await within(nav).findByText("Example Alpha");
     await waitFor(() => expect(link.desktop.capabilities).toContain("monoTools"));
-    expect(within(nav).queryByRole("button", { name: "New Mono" })).toBeNull();
+    await user.click(await within(nav).findByRole("button", { name: "New Mono" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe(`/d/${DESKTOP_ID}/monos`));
+    expect(await screen.findByTestId("create-mono")).toBeInTheDocument();
   });
 
   it("narrows by search and the Working now filter, and keeps the filter after a reload", async () => {
@@ -158,14 +176,6 @@ describe("workspace drawer (F-12)", () => {
     expect(within(nav).queryByText("Research Mono")).toBeNull();
     expect(within(nav).queryByRole("region", { name: "Projects" })).toBeNull();
     expect(within(nav).getByRole("button", { name: "Filter, on" })).toBeInTheDocument();
-  });
-
-  it("is a persistent sidebar from 640 px up, with no drawer button", async () => {
-    stubMatchMedia(true);
-    mount("");
-    const nav = await screen.findByRole("navigation", { name: "Workspace" });
-    await within(nav).findByText("Example Alpha");
-    expect(screen.queryByRole("button", { name: /^Open workspace list/ })).toBeNull();
   });
 
   it("renders the desktop-nav-items slot", async () => {

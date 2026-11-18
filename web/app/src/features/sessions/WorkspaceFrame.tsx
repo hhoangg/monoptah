@@ -1,5 +1,5 @@
-// The frame of the WS-T screens (home and project): the workspace list as a persistent sidebar from
-// 640 px up and as a vaul drawer opened from the header below that, a header with the screen's only h1,
+// The frame of the WS-T screens (home and project): the workspace list as a vaul drawer opened from the header
+// below 640 px (from 640 px the app shell's sidebar carries it), a header with the screen's only h1,
 // and the shared effects of a workspace screen (remember the place, track the working sessions).
 import { useEffect, useState, type ReactNode } from "react";
 import { Drawer as DrawerPrimitive } from "vaul";
@@ -52,11 +52,6 @@ export function WorkspaceFrame({ desktopId, title, subtitle, actions, children, 
 
   return (
     <div className="mx-auto flex w-full max-w-[1280px]" data-testid={testId}>
-      {wide ? (
-        <aside className="sticky top-[calc(2.75rem+env(safe-area-inset-top))] h-[calc(100dvh-2.75rem-env(safe-area-inset-top))] w-80 shrink-0 border-r border-stroke">
-          <WorkspaceNav desktopId={desktopId} />
-        </aside>
-      ) : null}
       <div className="min-w-0 flex-1 px-4 pt-2 pb-40 min-[24rem]:px-5">
         <header className="flex items-start gap-3 pb-3">
           {wide ? null : (
