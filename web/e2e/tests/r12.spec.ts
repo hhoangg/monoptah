@@ -253,9 +253,8 @@ test("R-12: pair to revoke, key change, relay restart, token reuse, replay, over
       serveA.command({ cmd: "revoke", deviceId: device2.deviceId });
       await serveA.waitFor("revoked", { scope: "device", deviceId: device2.deviceId });
       await expect.poll(() => client2.byeReceived, { timeout: 10_000 }).toBe(true);
-      // The desktop ends the session with BYE only: session.rs `close_device` sends no `state: revoked` frame (the
-      // value exists in the protocol, architecture.md 6.1 step 4, but nothing sends it). Reported, not asserted.
-      expect(client2.states.map((s) => s.state)).toEqual(["pending", "confirmed"]);
+      // The desktop sends an encrypted `state: revoked` before its BYE (architecture.md 6.1 step 4, relay.rs revoke).
+      expect(client2.states.map((s) => s.state)).toEqual(["pending", "confirmed", "revoked"]);
       await expect.poll(async () => (await grantOf(desktopA, device2.deviceId))?.state, { timeout: 15_000 }).toBe("revoked");
       // The desktop's report reaches the server, whose room closes the live socket of that device with 4003
       // (architecture.md 4.4, security.md 6 (:153)).
