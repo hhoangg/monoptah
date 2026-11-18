@@ -128,6 +128,11 @@ const SCREENS: Record<string, string> = {
   "/install": "Install Monoptah",
   "/d/dk1/settings": "Desktop settings",
   "/d/:desktopId/settings": "Desktop settings",
+  // W-06 (WS-T): the catalog home and the project screen. Without a connected desktop they show their loading state.
+  "/d/dk1": "Workspace",
+  "/d/:desktopId": "Workspace",
+  "/d/dk1/p/proj%201": "Project",
+  "/d/:desktopId/p/:projectId": "Project",
 };
 
 async function renderAt(url: string) {
