@@ -225,7 +225,11 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, off
         initial={false}
         animate={{ borderRadius: card ? CARD_RADIUS_PX : PILL_RADIUS_PX }}
         transition={reducedMotion ? { duration: 0 } : MORPH_TRANSITION}
-        onFocus={() => setFocusWithin(true)}
+        onFocus={(event) => {
+          // Only the field opens the card. A pointer press on a button (Stop, add) focuses it on pointerdown, and
+          // morphing the layout then moves the button from under the pointer, so the click never lands on it.
+          if (event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLInputElement) setFocusWithin(true);
+        }}
         onBlur={(event) => {
           if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setFocusWithin(false);
         }}

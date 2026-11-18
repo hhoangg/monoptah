@@ -101,6 +101,17 @@ describe("send", () => {
     await waitFor(() => expect(onSubmit).toHaveBeenCalledWith("also this", []));
   });
 
+  it("keeps its layout when Stop takes focus, so the press is not moved from under the pointer", () => {
+    const { field } = setup({ busy: true, onStop: () => Promise.resolve() });
+    const shape = () => field.closest("[data-shape]");
+    expect(shape()).toHaveAttribute("data-shape", "pill");
+    // A pointer press focuses the button on pointerdown; a layout change there would swallow the click.
+    act(() => screen.getByRole("button", { name: "Stop" }).focus());
+    expect(shape()).toHaveAttribute("data-shape", "pill");
+    act(() => field.focus());
+    expect(shape()).toHaveAttribute("data-shape", "card");
+  });
+
   it("shows why Stop failed", async () => {
     const user = userEvent.setup();
     setup({ busy: true, onStop: () => Promise.reject(new Error("timeout")) });
