@@ -409,5 +409,12 @@ fn session_fields(
     let mut extras = Extras::default();
     lifecycle::extras(shell, session, cx, &mut extras);
     moves::extras(shell, session, &mut extras);
-    view.fields(&extras)
+    let mut fields = view.fields(&extras);
+    // A local session says so explicitly (`cloud: null`), so a web that kept an old cloud
+    // state (a watch that was down while the session moved back) drops it. Until the marks
+    // are loaded the field is left out and the web keeps what it has.
+    if !fields.contains_key("cloud") && shell.mobile_cloud_marks_loaded() {
+        fields.insert("cloud".into(), Value::Null);
+    }
+    fields
 }

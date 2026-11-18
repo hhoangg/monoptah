@@ -1020,6 +1020,11 @@ impl Shell {
             .map_or(cwd, |mark| mark.local_project.as_str())
     }
 
+    /// Whether the cloud marks are known, so a session without one is local for sure.
+    pub(crate) fn mobile_cloud_marks_loaded(&self) -> bool {
+        self.cloud_marks_loaded
+    }
+
     /// What the mobile host may say about where a session runs, from cached state only: the
     /// binding and cached state of a cloud session, its pending start, and whether it is a
     /// remote-machine session. Never calls out and never wakes anything.
@@ -1181,6 +1186,7 @@ impl Shell {
             self.forget_cloud_menus(cx);
         }
         self.cloud_marks = snapshot.marks;
+        self.cloud_marks_loaded = true;
         self.cloud_states = snapshot.states;
         self.sync_cloud_stopped(cx);
         self.sync_auto_stopping(cx);

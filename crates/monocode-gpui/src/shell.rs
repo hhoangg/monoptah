@@ -751,6 +751,9 @@ pub(crate) struct Shell {
     move_labels: HashMap<i64, Option<String>>,
     /// Sessions that live in a codespace, by id, and the cached state of each codespace.
     cloud_marks: HashMap<i64, cloud::CloudMark>,
+    /// Whether a cloud snapshot has filled `cloud_marks` at least once. Until then a session
+    /// that is missing from it may still be a cloud one, so the mobile host says nothing of it.
+    cloud_marks_loaded: bool,
     /// The Claude setup block of each workspace, by `CloudRef::key`; see [`claude_setup`].
     claude_setups: claude_setup::Setups,
     /// Which side of a cloud session its Files and Changes panels show. In memory only; a
@@ -1301,6 +1304,7 @@ impl Shell {
             gh,
             codespaces_usage: Default::default(),
             cloud_marks: HashMap::new(),
+            cloud_marks_loaded: false,
             claude_setups: Default::default(),
             panel_modes: HashMap::new(),
             cloud_view: None,

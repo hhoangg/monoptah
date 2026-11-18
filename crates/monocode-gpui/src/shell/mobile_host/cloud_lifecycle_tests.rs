@@ -1851,6 +1851,34 @@ fn an_auto_stop_is_announced_near_its_time_cancelled_by_keep_running_and_refuses
     assert_eq!(code_of(&refused), Some("unsupported_target"));
 }
 
+/// L5: `cloud.keepRunning` counts in the stop budget of its device, so a control device cannot
+/// keep a billable instance alive without limit.
+#[gpui::test]
+fn keep_running_is_rate_limited_like_a_stop(cx: &mut TestAppContext) {
+    let fx = fixture(cx, "Available", CloudState::Available);
+    let cs = fx.cs;
+    let id = persisted(&fx, cx, cs);
+    for _ in 0..cloud_policy::STOP_LIMIT_PER_MINUTE {
+        call(
+            &fx,
+            cx,
+            &fx.web(),
+            "cloud.keepRunning",
+            json!({"sessionId": id}),
+        )
+        .unwrap();
+    }
+    let refused = call(
+        &fx,
+        cx,
+        &fx.web(),
+        "cloud.keepRunning",
+        json!({"sessionId": id}),
+    )
+    .unwrap_err();
+    assert_eq!(code_of(&refused), Some("busy"));
+}
+
 /// S8: `autoStop.at` is a fixed deadline. Two frames a second apart carry the same value, so
 /// the watch (which sends the field when it changed) is not woken every second.
 #[gpui::test]

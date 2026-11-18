@@ -360,3 +360,17 @@ fn stops_are_limited_per_device_and_minute() {
     let later = start + Duration::from_secs(61);
     assert_eq!(limiter.allow_stop("d", later), Ok(()));
 }
+
+/// L2: a device that was revoked or left starts with a clean budget on the
+/// process-wide limiter (its counters do not outlive its grant).
+#[test]
+fn forgetting_a_device_clears_its_counters_on_the_shared_limiter() {
+    let device = "forget-device-test";
+    for _ in 0..STOP_LIMIT_PER_MINUTE {
+        allow_stop(device).unwrap();
+    }
+    assert!(allow_stop(device).is_err());
+    forget_device(device);
+    assert!(allow_stop(device).is_ok());
+    forget_device(device);
+}

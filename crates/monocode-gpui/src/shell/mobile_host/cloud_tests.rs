@@ -433,6 +433,71 @@ fn a_phone_is_refused_every_web_only_session_but_keeps_a_moved_one(cx: &mut Test
         .unwrap();
 }
 
+/// M2: no phone push for a session only web devices see (its project id would carry the
+/// `remote://` path, and during a start the instance name); everything a phone lists keeps it.
+#[gpui::test]
+fn no_phone_push_is_sent_for_a_web_only_session(cx: &mut TestAppContext) {
+    let (window, w) = world(cx);
+    window
+        .update(cx, |shell, _, cx| {
+            for id in [w.codespace, w.sandbox, w.stopped, w.remote] {
+                assert!(!shell.mobile_phone_push_allowed(id, cx), "{id}");
+            }
+            for id in [w.moved, w.local, w.other] {
+                assert!(shell.mobile_phone_push_allowed(id, cx), "{id}");
+            }
+        })
+        .unwrap();
+}
+
+/// A7: a web device is told a session is local with an explicit `cloud: null` and no approvals
+/// with `approvals: []`, in reads and in the fields of a (re)opened watch's first frame; the keys
+/// are left out only while the cloud marks are not loaded, and a phone never gets them.
+#[gpui::test]
+fn a_local_session_says_cloud_null_once_the_marks_are_loaded(cx: &mut TestAppContext) {
+    let (window, w) = world(cx);
+    window
+        .update(cx, |shell, _, cx| {
+            let web = device(DeviceKind::Web, None);
+            let phone = device(DeviceKind::Phone, None);
+            // Marks not loaded yet: a missing mark proves nothing, so nothing is said.
+            shell.cloud_marks_loaded = false;
+            assert!(!cloud::read_fields(shell, w.local, &web, cx).contains_key("cloud"));
+            assert!(!cloud::frame_fields(shell, w.local, &web, cx).contains_key("cloud"));
+            // A session with a mark still carries its field before the load.
+            assert!(cloud::read_fields(shell, w.codespace, &web, cx)["cloud"].is_object());
+            shell.cloud_marks_loaded = true;
+            for id in [w.local, w.other] {
+                for fields in [
+                    cloud::read_fields(shell, id, &web, cx),
+                    cloud::frame_fields(shell, id, &web, cx),
+                ] {
+                    assert_eq!(fields.get("cloud"), Some(&Value::Null), "{id}");
+                }
+            }
+            for id in [w.codespace, w.sandbox, w.stopped, w.remote] {
+                assert!(
+                    cloud::read_fields(shell, id, &web, cx)["cloud"].is_object(),
+                    "{id}"
+                );
+            }
+            // A phone never gets the field.
+            assert!(cloud::read_fields(shell, w.local, &phone, cx).is_empty());
+            assert!(cloud::frame_fields(shell, w.local, &phone, cx).is_empty());
+            // Approvals: off for the desktop, a web device is told `[]`; a phone nothing.
+            assert_eq!(
+                crate::mobile::approvals::read_fields(shell, w.local, &web, cx).get("approvals"),
+                Some(&json!([]))
+            );
+            assert_eq!(
+                crate::mobile::approvals::frame_fields(shell, w.local, &web, cx).get("approvals"),
+                Some(&json!([]))
+            );
+            assert!(crate::mobile::approvals::read_fields(shell, w.local, &phone, cx).is_empty());
+        })
+        .unwrap();
+}
+
 /// L2: a web delete is refused for anything bound to an instance or on a remote machine,
 /// also when the shell's marks do not know it (a binding or start record in the store, or a
 /// `remote://` cwd alone).
@@ -575,7 +640,11 @@ fn reads_and_frames_carry_the_cloud_field_for_web_only_and_never_call_out(cx: &m
                 assert!(cloud::frame_fields(shell, id, &phone, cx).is_empty());
             }
             for local in [w.local, w.other] {
-                assert!(cloud::read_fields(shell, local, &web, cx).is_empty());
+                // A local session says so explicitly once the marks are loaded.
+                assert_eq!(
+                    cloud::read_fields(shell, local, &web, cx),
+                    *json!({"cloud": null}).as_object().unwrap()
+                );
             }
             // The merged read and frame fields of the host.
             let read = shell.mobile_read_fields(&Target::Session(w.stopped), &web, cx);

@@ -360,6 +360,8 @@ pub(super) fn keep_running(
             crate::conversation::AUTO_STOPPING,
         ));
     }
+    // Counts like a stop: it keeps a billable instance alive.
+    cloud_policy::allow_stop(&device.id)?;
     shell.mobile_keep_running(&cloud);
     cx.notify();
     Ok(json!({"keepRunning": true}))

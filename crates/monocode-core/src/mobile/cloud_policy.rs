@@ -315,6 +315,11 @@ pub fn allow_stop(device: &str) -> Result<(), Failure> {
         .map_err(Code::failure)
 }
 
+/// Forgets a device that was revoked or left, on the process-wide limiter.
+pub fn forget_device(device: &str) {
+    limiter().forget(device);
+}
+
 /// Empties the process-wide limiter. Tests that share it call this first.
 pub fn reset_limiter() {
     *limiter() = WakeLimiter::new();

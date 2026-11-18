@@ -1041,6 +1041,7 @@ impl MobileHost {
                     if via == DeviceKind::Phone {
                         self.gate.remove(peer);
                     }
+                    cloud_policy::forget_device(&device.id);
                     close_device_watches(&mut inner, peer);
                     drop(inner);
                     if via == DeviceKind::Web {
@@ -1862,6 +1863,7 @@ impl MobileHost {
             removed
         };
         audit_device(audit::Lifecycle::Revoke, &removed, None);
+        cloud_policy::forget_device(device_id);
         self.web.drop_request(device_id);
         self.web.command(LinkCommand::Revoke {
             fingerprint: removed.fingerprint,

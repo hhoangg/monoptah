@@ -78,7 +78,8 @@ fn edits_between(before: &Value, after: &Value, path: &mut Vec<Value>, out: &mut
 /// `extra` is a JSON object of field to value that the baseline remembers: a
 /// key joins the frame only when its value differs from the baseline's (an
 /// empty array clears one; a key left out is unchanged). Null or an empty
-/// object adds nothing.
+/// object adds nothing. A key sent before that is missing from an object
+/// `extra` is cleared once (`[]` for a list, null otherwise).
 #[allow(clippy::too_many_arguments)]
 pub fn update(
     baseline: Option<&Baseline>,
@@ -102,6 +103,25 @@ pub fn update(
             if sent.get(key) != Some(value) {
                 extra_changed.insert(key.clone(), value.clone());
                 sent.insert(key.clone(), value.clone());
+            }
+        }
+        // A key sent before and gone now is cleared once: an empty array for
+        // a list, null for anything else. (A null `extra` is "no fields",
+        // not "clear them all": the caller has no opinion then.)
+        let gone: Vec<String> = sent
+            .keys()
+            .filter(|key| !fields.contains_key(*key))
+            .cloned()
+            .collect();
+        for key in gone {
+            let clear = if sent[&key].is_array() {
+                json!([])
+            } else {
+                Value::Null
+            };
+            if sent[&key] != clear {
+                extra_changed.insert(key.clone(), clear.clone());
+                sent.insert(key, clear);
             }
         }
     }
@@ -456,7 +476,7 @@ mod tests {
         )
         .unwrap();
         assert!(idle.get("cloud").is_none() && idle.get("approvals").is_none());
-        // One changed key travels alone; an absent key is unchanged.
+        // One changed key travels with the clear of the key that is gone.
         let next = json!({"approvals": [{"id": "r1"}]});
         let (changed, baseline) = update(
             Some(&baseline),
@@ -470,7 +490,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(changed["approvals"], json!([{"id": "r1"}]));
-        assert!(changed.get("cloud").is_none());
+        assert_eq!(changed["cloud"], Value::Null);
         assert!(update(
             Some(&baseline),
             false,
@@ -479,7 +499,7 @@ mod tests {
             &turns,
             false,
             &none,
-            &json!({})
+            &next
         )
         .is_none());
         // An empty array clears.
@@ -528,6 +548,106 @@ mod tests {
             &empty
         )
         .is_none());
+    }
+
+    /// A key that disappears is cleared once: `[]` for a list, null for an
+    /// object; a null `extra` clears nothing.
+    #[test]
+    fn a_key_that_disappears_is_cleared_once() {
+        let turns = [turn("1", "hi")];
+        let none = Value::Null;
+        let both = json!({"approvals": [{"requestId": "r1"}], "cloud": {"state": "running"}});
+        let (_, baseline) = update(None, true, false, &none, &turns, false, &none, &both).unwrap();
+        // Null `extra` is no opinion.
+        assert!(update(
+            Some(&baseline),
+            true,
+            false,
+            &none,
+            &turns,
+            false,
+            &none,
+            &Value::Null
+        )
+        .is_none());
+        let (frame, baseline) = update(
+            Some(&baseline),
+            true,
+            false,
+            &none,
+            &turns,
+            false,
+            &none,
+            &json!({}),
+        )
+        .unwrap();
+        assert_eq!(frame["approvals"], json!([]));
+        assert_eq!(frame["cloud"], Value::Null);
+        assert!(frame.as_object().unwrap().contains_key("cloud"));
+        // Cleared once, and a key that comes back is sent again.
+        assert!(update(
+            Some(&baseline),
+            true,
+            false,
+            &none,
+            &turns,
+            false,
+            &none,
+            &json!({})
+        )
+        .is_none());
+        let (frame, _) = update(
+            Some(&baseline),
+            true,
+            false,
+            &none,
+            &turns,
+            false,
+            &none,
+            &json!({"approvals": [{"requestId": "r2"}]}),
+        )
+        .unwrap();
+        assert_eq!(frame["approvals"], json!([{"requestId": "r2"}]));
+        assert!(frame.get("cloud").is_none());
+    }
+
+    /// The first frame of a (re)opened watch carries an explicit `cloud: null`
+    /// and `approvals: []`, so a web that kept old state drops it.
+    #[test]
+    fn the_first_frame_carries_explicit_clears() {
+        let turns = [turn("1", "hi")];
+        let none = Value::Null;
+        let extra = json!({"cloud": null, "approvals": []});
+        let (first, baseline) =
+            update(None, true, false, &none, &turns, false, &none, &extra).unwrap();
+        assert!(first.as_object().unwrap().contains_key("cloud"));
+        assert_eq!(first["cloud"], Value::Null);
+        assert_eq!(first["approvals"], json!([]));
+        // Said once.
+        assert!(update(
+            Some(&baseline),
+            true,
+            false,
+            &none,
+            &turns,
+            false,
+            &none,
+            &extra
+        )
+        .is_none());
+        // While the marks are not loaded the key is left out and the first frame has no `cloud`.
+        let (unknown, _) = update(
+            None,
+            true,
+            false,
+            &none,
+            &turns,
+            false,
+            &none,
+            &json!({"approvals": []}),
+        )
+        .unwrap();
+        assert!(!unknown.as_object().unwrap().contains_key("cloud"));
     }
 
     #[test]
