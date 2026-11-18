@@ -21,7 +21,7 @@ import { clearHooks, registerSessionCapabilities } from "@/ui/hooks";
 import { clearSlots, registerSlot } from "@/ui/slots";
 import { WRAP_KEY, reloadFilePrefs } from "./filePrefs";
 import { FilesPanel } from "./FilesPanel";
-import { closeQuickOpen, currentProject, startQuickOpen, useQuickOpen } from "./quickOpen";
+import { closeQuickOpen, currentProject, startQuickOpen, useQuickOpen } from "./quickOpenStore";
 
 function stubViewport(width: number) {
   window.matchMedia = ((query: string) => {

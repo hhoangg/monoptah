@@ -8,7 +8,7 @@ import { FileTree } from "./FileTree";
 import { FileViewer } from "./FileViewer";
 import { parentPath } from "./filePaths";
 import { QuickOpen } from "./QuickOpen";
-import { useQuickOpenHost } from "./quickOpen";
+import { useQuickOpenHost } from "./quickOpenStore";
 
 export interface FilesBrowserProps {
   desktopId: string;

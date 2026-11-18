@@ -3,7 +3,7 @@
 // `openPanel(kind, target, context)` (panels.ts) and the route itself.
 import { registerPanel } from "@/features/layout/panels";
 import { FilesPanel } from "./FilesPanel";
-import { registerQuickOpen } from "./quickOpen";
+import { registerQuickOpen } from "./quickOpenStore";
 
 registerPanel("files", { title: "Files", component: FilesPanel });
 registerQuickOpen();

@@ -9,7 +9,7 @@ import { MatchText } from "@/ui/MatchText";
 import { ResponsiveOverlay } from "@/ui/ResponsiveOverlay";
 import { FileTypeIcon } from "./FileTypeIcon";
 import { useFileSearch } from "./FileSearch";
-import { closeQuickOpen, useQuickOpen } from "./quickOpen";
+import { closeQuickOpen, useQuickOpen } from "./quickOpenStore";
 
 function QuickOpenBody({ desktopId, projectId }: { desktopId: string; projectId: string }) {
   const navigate = useNavigate();
