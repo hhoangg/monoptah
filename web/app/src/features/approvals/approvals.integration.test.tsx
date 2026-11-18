@@ -124,8 +124,8 @@ describe("approval card over the mock desktop (U-08)", () => {
     expect(calls).toHaveLength(0);
   });
 
-  it("renders nothing while the flag is off", async () => {
-    vi.stubEnv("VITE_WEB_APPROVALS", "");
+  it("renders nothing while the kill switch is set", async () => {
+    vi.stubEnv("VITE_WEB_APPROVALS", "off");
     mount();
     await screen.findByText("Run the example checks");
     expect(screen.queryByRole("region", { name: "Needs your approval" })).toBeNull();

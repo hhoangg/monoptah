@@ -382,12 +382,14 @@ describe("content changes and focus (re-review N-4, M-8)", () => {
 });
 
 describe("isApprovalCardEnabled", () => {
-  it("is off by default and on only for VITE_WEB_APPROVALS=on", () => {
-    expect(isApprovalCardEnabled()).toBe(false);
+  it("is on by default and off only for the VITE_WEB_APPROVALS=off kill switch", () => {
+    expect(isApprovalCardEnabled()).toBe(true);
     vi.stubEnv("VITE_WEB_APPROVALS", "on");
     expect(isApprovalCardEnabled()).toBe(true);
-    vi.stubEnv("VITE_WEB_APPROVALS", "true");
+    vi.stubEnv("VITE_WEB_APPROVALS", "off");
     expect(isApprovalCardEnabled()).toBe(false);
+    vi.stubEnv("VITE_WEB_APPROVALS", "false");
+    expect(isApprovalCardEnabled()).toBe(true);
     vi.unstubAllEnvs();
   });
 });

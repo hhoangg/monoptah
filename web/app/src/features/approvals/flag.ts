@@ -1,7 +1,7 @@
-// Feature flag of the web approval card (U-08). It is OFF by default: remote approval turns an XSS into
-// direct command execution on the desktop, so it ships only after the U-13 security review gate passes.
-// Flipping the default (or setting VITE_WEB_APPROVALS=on in a release build) requires U-13 to be recorded
-// as passed in the PR. Until then the card renders nothing and the desktop notice stays the only path.
+// Feature flag of the web approval card (U-08). It is ON by default since the U-13 security review gate
+// passed (2026-11-18). The card still renders only when the desktop advertises the `approvals` capability,
+// which it does only while its own "Remote approvals" toggle is on (default off). VITE_WEB_APPROVALS=off
+// stays as a kill switch for a build: the card then renders nothing and the desktop notice is the only path.
 export function isApprovalCardEnabled(): boolean {
-  return import.meta.env.VITE_WEB_APPROVALS === "on";
+  return import.meta.env.VITE_WEB_APPROVALS !== "off";
 }
