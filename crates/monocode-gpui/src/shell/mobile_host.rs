@@ -226,8 +226,86 @@ fn in_selection(selection: &Option<Vec<String>>, id: &str) -> bool {
         .is_none_or(|list| list.iter().any(|entry| entry == id))
 }
 
+/// What the audit line of a file read needs, kept until the read ended.
+struct FileRead {
+    device: DeviceContext,
+    fingerprint: String,
+    project: Option<String>,
+    path: String,
+    command_id: String,
+}
+
+impl FileRead {
+    fn record(&self, result: &Result<Value, Failure>) {
+        let outcome = match result {
+            Ok(_) => audit::Outcome::Ok,
+            Err(error) => {
+                policy::code_of_failure(error).map_or(audit::Outcome::Error, audit::Outcome::Denied)
+            }
+        };
+        audit::record_file_read_with(
+            &self.device,
+            &audit::FileRead {
+                fingerprint: &self.fingerprint,
+                project_id: self.project.as_deref(),
+                path: &self.path,
+                command_id: Some(&self.command_id),
+                transport: self.device.kind.into(),
+                outcome,
+            },
+        );
+    }
+}
+
 fn not_selected() -> Failure {
     policy::Code::NotSelected.failure()
+}
+
+/// The WS-D4 hook: a cloud or remote project has no local project methods.
+fn refuse_non_local(project_id: &str) -> Result<(), Failure> {
+    if monocode_core::mobile::cloud_policy::is_non_local_project(project_id) {
+        return Err(policy::Code::UnsupportedTarget.failure());
+    }
+    Ok(())
+}
+
+/// `mono.update` fields a remote device may send. Paths, habits, workflows
+/// and every access field are the desktop's alone (H-03, G4): `addPath` and
+/// `removePaths` are the host's own fields, never the device's.
+const MONO_UPDATE_KEYS: [&str; 7] = [
+    "monoId",
+    "name",
+    "mascot",
+    "color",
+    "subsessions",
+    "addProject",
+    "removeProject",
+];
+const SUBSESSION_KEYS: [&str; 4] = ["harness", "model", "effort", "account"];
+
+/// Refuses a `mono.create` or `mono.update` that names anything beyond a
+/// Mono's look, model and project list, so a remote device cannot enable or
+/// raise full-access abilities of a Mono through them (security finding H1).
+fn check_mono_fields(method: &str, params: &Value) -> Result<(), Failure> {
+    let forbidden = || policy::Code::Forbidden.failure();
+    let allowed: &[&str] = if method == "mono.create" {
+        &[]
+    } else {
+        &MONO_UPDATE_KEYS
+    };
+    if let Some(map) = params.as_object() {
+        if map.keys().any(|key| !allowed.contains(&key.as_str())) {
+            return Err(forbidden());
+        }
+        if let Some(sub) = map.get("subsessions").and_then(Value::as_object)
+            && sub
+                .keys()
+                .any(|key| !SUBSESSION_KEYS.contains(&key.as_str()))
+        {
+            return Err(forbidden());
+        }
+    }
+    Ok(())
 }
 
 /// The access mode a remote device asked for, if any. Full access is never
@@ -386,6 +464,22 @@ impl Shell {
         }
         self.mobile.invite = None;
         self.sync_settings(cx);
+    }
+
+    /// The key fingerprint of a paired device, for the audit lines the app
+    /// writes itself. Empty for a device the host no longer lists.
+    fn mobile_fingerprint(&self, device_id: &str) -> String {
+        self.mobile
+            .host
+            .as_ref()
+            .and_then(|host| {
+                host.status()
+                    .devices
+                    .into_iter()
+                    .find(|device| device.id == device_id)
+            })
+            .map(|device| device.fingerprint)
+            .unwrap_or_default()
     }
 
     pub(super) fn mobile_revoke(&mut self, device_id: &str, cx: &mut Context<Self>) {
@@ -777,6 +871,37 @@ impl Shell {
             .or_else(|| locked(&self.store).ok()?.resolve_existing_session_id(id))
             .filter(|id| self.session_summaries.contains_key(id))
             .ok_or("Session is no longer available")?;
+        // A Mono's own chat, habit and workflow sessions belong to that Mono
+        // and are served only to a device that selected it (H-02).
+        if device.monos.is_some()
+            && let Some(monos) = self.monos.as_ref()
+        {
+            let monos = monos.read(cx);
+            let owner = monos
+                .roster
+                .of_session(session)
+                .or_else(|| {
+                    monos
+                        .roster
+                        .monos
+                        .iter()
+                        .find(|m| m.habit_sessions.contains(&session))
+                })
+                .map(|mono| Some(mono.id.as_str()));
+            // A session hidden for a Mono workflow has no single owner here.
+            let owner = owner.or_else(|| {
+                monos
+                    .roster
+                    .hidden_sessions
+                    .contains(&session)
+                    .then_some(None)
+            });
+            if let Some(owner) = owner
+                && !owner.is_some_and(|mono| in_selection(&device.monos, mono))
+            {
+                return Err(not_selected());
+            }
+        }
         if device.projects.is_some() {
             // A session that maps to no project is refused for a narrowed device.
             let project = self.session_summaries.get(&session).and_then(|summary| {
@@ -797,7 +922,12 @@ impl Shell {
     /// The sessions a Mono started, as the cards in its chat show them on the
     /// phone: the phone's IDs for each and the project it runs in, its title
     /// and how it stands. None for a session's own conversation.
-    fn mobile_launches(&self, target: &Target, cx: &App) -> HashMap<i64, Value> {
+    fn mobile_launches(
+        &self,
+        target: &Target,
+        device: &DeviceContext,
+        cx: &App,
+    ) -> HashMap<i64, Value> {
         let Target::Mono(mono) = target else {
             return HashMap::new();
         };
@@ -811,7 +941,7 @@ impl Shell {
         let projects = self.mobile_projects(cx);
         crate::monos::cards::launch_views(&mono, self, cx)
             .into_iter()
-            .map(|(id, view)| {
+            .filter_map(|(id, view)| {
                 // A worktree's session belongs to the project it was made from.
                 let cwd = view.cwd.as_str();
                 let project = projects
@@ -831,6 +961,12 @@ impl Shell {
                         .map(|name| name.to_string_lossy().into_owned())
                         .unwrap_or_default(),
                 };
+                let card_project = project_id(project.map_or(cwd, String::as_str));
+                // A card names the project's path, title and state: only for
+                // projects this device selected (H-02).
+                if !in_selection(&device.projects, &card_project) {
+                    return None;
+                }
                 let phone_id = self.mobile.ids.get(&id).cloned().unwrap_or_else(|| {
                     locked(&self.store)
                         .ok()
@@ -839,14 +975,14 @@ impl Shell {
                 });
                 let card = json!({
                     "id": phone_id,
-                    "projectId": project_id(project.map_or(cwd, String::as_str)),
+                    "projectId": card_project,
                     "project": name,
                     "title": monocode_core::session_title::display_title(&view.title, &view.harness),
                     "harness": view.harness,
                     // One the desktop can't find any more reads as done.
                     "state": if view.state == "unavailable" { "done" } else { view.state },
                 });
-                (id, card)
+                Some((id, card))
             })
             .collect()
     }
@@ -882,7 +1018,8 @@ impl Shell {
             "project.fileHighlight" => {
                 let job = string(&request.params, "job").unwrap_or_default();
                 let from = request.params["from"].as_u64().unwrap_or(0) as usize;
-                request.reply(Ok(project::file_highlight(&job, from)));
+                let answer = project::file_highlight(&job, from, &request.device);
+                request.reply(answer);
             }
             "project.gitAction" => self.mobile_git_action(request, cx),
             "cloud.instances" | "cloud.startOptions" => {
@@ -897,23 +1034,32 @@ impl Shell {
     /// Project reads run on the background executor against a checked root.
     fn mobile_project(&mut self, request: Request, cx: &mut Context<Self>) {
         let params = request.params.clone();
-        let cwd = match self.mobile_project_path(
-            &string(&params, "projectId").unwrap_or_default(),
-            &request.device,
-            cx,
-        ) {
-            Ok(cwd) => cwd,
-            Err(error) => return request.reply(Err(error)),
-        };
         let method = request.method.clone();
-        let file_read = (method == "project.file").then(|| {
-            (
-                request.device.clone(),
-                string(&params, "projectId"),
-                string(&params, "path").unwrap_or_default(),
-                request.command_id.clone(),
-            )
+        // A file read writes one audit line, here, with the path and however
+        // it ended: a refusal before the read counts too.
+        let file_read = (method == "project.file").then(|| FileRead {
+            device: request.device.clone(),
+            fingerprint: self.mobile_fingerprint(&request.device.id),
+            project: string(&params, "projectId"),
+            path: string(&params, "path").unwrap_or_default(),
+            command_id: request.command_id.clone(),
         });
+        let project = string(&params, "projectId").unwrap_or_default();
+        let cwd = refuse_non_local(&project)
+            .and_then(|()| self.mobile_project_path(&project, &request.device, cx));
+        let cwd = match cwd {
+            Ok(cwd) => cwd,
+            Err(error) => {
+                if let Some(read) = file_read {
+                    read.record(&Err(error.clone()));
+                }
+                return request.reply(Err(error));
+            }
+        };
+        let owner = project::JobOwner {
+            device: request.device.id.clone(),
+            project,
+        };
         let work = cx.background_executor().spawn(async move {
             let cwd = PathBuf::from(cwd);
             let worktree = params["worktreePath"].as_str();
@@ -928,9 +1074,12 @@ impl Shell {
                 "project.files" => {
                     project::files(&project::resolve_root(&cwd, worktree)?, &path, &deny)
                 }
-                "project.file" => {
-                    project::file(&project::resolve_root(&cwd, worktree)?, &path, &deny)
-                }
+                "project.file" => project::file(
+                    &project::resolve_root(&cwd, worktree)?,
+                    &path,
+                    &deny,
+                    &owner,
+                ),
                 "project.search" => project::search(
                     &project::resolve_root(&cwd, worktree)?,
                     params["query"].as_str().unwrap_or_default(),
@@ -943,20 +1092,8 @@ impl Shell {
         cx.spawn(async move |_, _| {
             let result = work.await;
             // The deny-list has answered by now: record the path with its outcome.
-            if let Some((device, project, path, command_id)) = file_read {
-                let outcome = match &result {
-                    Ok(_) => audit::Outcome::Ok,
-                    Err(error) => policy::code_of_failure(error)
-                        .map_or(audit::Outcome::Error, audit::Outcome::Denied),
-                };
-                audit::record_file_read_with(
-                    &device,
-                    project.as_deref(),
-                    &path,
-                    Some(&command_id),
-                    device.kind.into(),
-                    outcome,
-                );
+            if let Some(read) = file_read {
+                read.record(&result);
             }
             request.reply(result)
         })
@@ -976,6 +1113,11 @@ impl Shell {
             }
             Some(job) => job.result.clone(),
             None => {
+                if let Err(error) =
+                    refuse_non_local(&string(&request.params, "projectId").unwrap_or_default())
+                {
+                    return request.reply(Err(error));
+                }
                 let cwd = match self.mobile_project_path(
                     &string(&request.params, "projectId").unwrap_or_default(),
                     &request.device,
@@ -992,9 +1134,10 @@ impl Shell {
                     .and_then(|p| p.background_text_model());
                 cx.background_executor()
                     .spawn(async move {
+                        let deny = DenyList::for_project(&cwd);
                         let cwd = PathBuf::from(cwd);
                         let outcome = project::resolve_root(&cwd, params["worktreePath"].as_str())
-                            .and_then(|root| project::git_action(&root, &params, chosen));
+                            .and_then(|root| project::git_action(&root, &params, chosen, &deny));
                         if let Ok(mut slot) = slot.lock() {
                             *slot = Some(outcome);
                         }
@@ -1088,14 +1231,14 @@ impl Shell {
         } else {
             self.mobile_read_fields(&target, &request.device, cx)
         };
-        match self.with_live_snapshot(&target, cx, &page) {
+        match self.with_live_snapshot(&target, &request.device, cx, &page) {
             Some(Ok(Read::Done(value))) => request.reply(Ok(merge_fields(value, fields))),
             Some(Ok(Read::Page(cursor))) => {
                 self.mobile_older_page(request, &target, cursor, None, limit, cx)
             }
             Some(Err(error)) => request.reply(Err(error.into())),
             None => {
-                let load = self.load_saved(&target, cx);
+                let load = self.load_saved(&target, &request.device, cx);
                 cx.spawn(async move |this, cx| {
                     match load.await.and_then(|saved| page(&saved_snapshot(&saved))) {
                         Ok(Read::Done(value)) => request.reply(Ok(merge_fields(value, fields))),
@@ -1149,6 +1292,8 @@ impl Shell {
         limit: usize,
         cx: &mut Context<Self>,
     ) {
+        let device = request.device.clone();
+        let device = &device;
         let (session, name) = match target {
             Target::Session(id) => (Some(*id), None),
             Target::Mono(mono) => {
@@ -1164,7 +1309,7 @@ impl Shell {
         };
         // Drawn as the loaded turns are, from the open chat or the summary.
         let look = self
-            .with_live_snapshot(target, cx, |s| PageLook {
+            .with_live_snapshot(target, device, cx, |s| PageLook {
                 mono: s.mono.clone(),
                 launches: s.launches.clone(),
                 cwd: s.cwd.to_owned(),
@@ -1175,7 +1320,7 @@ impl Shell {
                 let summary = self.session_summaries.get(&session);
                 PageLook {
                     mono: name,
-                    launches: self.mobile_launches(target, cx),
+                    launches: self.mobile_launches(target, device, cx),
                     cwd: summary.map(|s| s.cwd.clone()).unwrap_or_default(),
                     harness: summary.map(|s| s.provider.clone()).unwrap_or_default(),
                     model: None,
@@ -1194,6 +1339,7 @@ impl Shell {
     fn with_live_snapshot<T>(
         &self,
         target: &Target,
+        device: &DeviceContext,
         cx: &App,
         f: impl FnOnce(&Snapshot) -> T,
     ) -> Option<T> {
@@ -1210,7 +1356,7 @@ impl Shell {
             return None;
         }
         // Built for every streamed frame, so only once there's history to show.
-        let launches = self.mobile_launches(target, cx);
+        let launches = self.mobile_launches(target, device, cx);
         let waiting = match chat.mobile_waiting(cx) {
             Some(crate::conversation::MobileWaiting::Approval) => Some("Waiting for approval"),
             Some(crate::conversation::MobileWaiting::Question) => Some("Waiting for answers"),
@@ -1237,6 +1383,7 @@ impl Shell {
     fn load_saved(
         &self,
         target: &Target,
+        device: &DeviceContext,
         cx: &mut Context<Self>,
     ) -> Task<Result<Arc<Saved>, String>> {
         let (id, mono) = match target {
@@ -1248,7 +1395,7 @@ impl Shell {
             }
         };
         let summary = id.and_then(|id| self.session_summaries.get(&id).cloned());
-        let launches = self.mobile_launches(target, cx);
+        let launches = self.mobile_launches(target, device, cx);
         let store = self.store.clone();
         cx.background_executor().spawn(async move {
             let Some(id) = id else {
@@ -1389,7 +1536,7 @@ impl Shell {
                     snapshot.usage_limit.clone(),
                 )
             };
-            let built = match self.with_live_snapshot(&target, cx, frame) {
+            let built = match self.with_live_snapshot(&target, &device, cx, frame) {
                 Some(built) => built,
                 None => match watch.saved.clone() {
                     Some(saved) => frame(&saved_snapshot(&saved)),
@@ -1444,7 +1591,8 @@ impl Shell {
         }
         watch.loading = true;
         let target = watch.target.clone();
-        let load = self.load_saved(&target, cx);
+        let device = watch.device.clone();
+        let load = self.load_saved(&target, &device, cx);
         let id = id.to_owned();
         cx.spawn(async move |this, cx| {
             let result = load.await;
@@ -2364,6 +2512,11 @@ impl Shell {
         if request.method != "mono.create" && !in_selection(&request.device.monos, &id) {
             return request.reply(Err(not_selected()));
         }
+        if matches!(request.method.as_str(), "mono.create" | "mono.update")
+            && let Err(error) = check_mono_fields(&request.method, &request.params)
+        {
+            return request.reply(Err(error));
+        }
         let Some(monos) = self.monos.clone() else {
             return request.reply(Err("Mono is no longer available".into()));
         };
@@ -2390,6 +2543,9 @@ impl Shell {
                 }
             }
             if let Some(remove) = string(&request.params, "removeProject") {
+                if !in_selection(&request.device.projects, &remove) {
+                    return request.reply(Err(not_selected()));
+                }
                 let paths: Vec<String> = monos
                     .read(cx)
                     .roster
@@ -2411,7 +2567,20 @@ impl Shell {
             }
             result
         } else {
-            let views = self.mono_session_views(cx);
+            // Status lines and counts only from the projects this device selected.
+            let mut views = self.mono_session_views(cx);
+            if request.device.projects.is_some() {
+                let projects = self.mobile_projects(cx);
+                views.retain(|view| {
+                    let key = monocode_core::files::path_key(&view.cwd);
+                    let project = projects
+                        .iter()
+                        .find(|path| monocode_core::files::path_key(path) == key)
+                        .map(|path| project_id(path))
+                        .unwrap_or_else(|| project_id(&view.cwd));
+                    in_selection(&request.device.projects, &project)
+                });
+            }
             monos.update(cx, |monos, cx| monos.mobile_profile(&id, &views, cx))
         };
         request.reply(result.map_err(Failure::from));
@@ -2468,6 +2637,18 @@ impl Shell {
         let id = string(&request.params, "monoId").unwrap_or_default();
         if !in_selection(&request.device.monos, &id) {
             return request.reply(Err(not_selected()));
+        }
+        // Only `mono.saveFile` writes. A `text` or `expectedHash` on a read is
+        // a save in disguise: refused for web and read devices, and audited by
+        // the core as the save it is (security finding C1).
+        let writes = !request.params["text"].is_null() || !request.params["expectedHash"].is_null();
+        if writes && request.method == "mono.file" {
+            if request.device.kind == policy::DeviceKind::Web {
+                return request.reply(Err(policy::Code::Forbidden.failure()));
+            }
+            if request.device.permission != policy::Permission::Control {
+                return request.reply(Err(policy::Code::ReadOnly.failure()));
+            }
         }
         let Some(monos) = self.monos.clone() else {
             return request.reply(Err("Mono is no longer available".into()));
@@ -2919,6 +3100,263 @@ mod tests {
             .unwrap();
     }
 
+    /// Sends a request through the app's own routing and returns its answer
+    /// when the handler gave one at once (every refusal does).
+    fn ask(
+        shell: &mut Shell,
+        window: &mut Window,
+        cx: &mut Context<Shell>,
+        device: &DeviceContext,
+        method: &str,
+        params: Value,
+    ) -> Option<Result<Value, Failure>> {
+        let (request, mut answer) =
+            Request::with_receiver(&format!("c-{method}"), method, params, device.clone());
+        shell.handle_mobile_request(request, window, cx);
+        answer.try_recv().ok()
+    }
+
+    #[gpui::test]
+    fn every_method_that_names_a_project_session_or_mono_checks_the_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, id, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                let session = shell.session_summaries.get(&id).unwrap().clone();
+                let key = monocode_core::files::path_key(&session.cwd);
+                let own = shell
+                    .mobile_projects(cx)
+                    .iter()
+                    .find(|p| monocode_core::files::path_key(p) == key)
+                    .map(|p| project_id(p))
+                    .expect("the session lives in a rail project");
+                let conversation = shell.mobile_session_id(id);
+                let denied = Some(Err(policy::Code::NotSelected.failure()));
+                let by_session = json!({"conversationId": conversation, "title": "t", "text": "hi",
+                    "requestId": "r", "decision": "allow", "token": "t", "enabled": true,
+                    "before": "", "answers": [], "archived": true});
+                let by_project = json!({"projectId": own, "path": "a.txt", "query": "a",
+                    "action": "stageAll", "text": "hi"});
+                let by_mono = json!({"monoId": "m1", "file": "soul"});
+                let session_methods = [
+                    "conversation.read",
+                    "conversation.older",
+                    "conversation.send",
+                    "session.configure",
+                    "session.rename",
+                    "session.archive",
+                    "session.delete",
+                    "session.cancel",
+                    "session.answerQuestion",
+                    "session.keepQuestionOpen",
+                    "session.resumeUsage",
+                    "session.resumeUsageAtReset",
+                    "models.list",
+                ];
+                let project_methods = [
+                    "session.start",
+                    "project.worktrees",
+                    "project.changes",
+                    "project.files",
+                    "project.file",
+                    "project.search",
+                    "project.git",
+                    "project.gitAction",
+                ];
+                let mono_methods = [
+                    "mono.profile",
+                    "mono.update",
+                    "mono.delete",
+                    "mono.reset",
+                    "mono.file",
+                    "mono.saveFile",
+                ];
+                // Neither the project nor the Mono is selected, or nothing is.
+                for device in [
+                    web(Some(vec!["other".into()]), Some(vec!["other".into()])),
+                    web(Some(vec![]), Some(vec![])),
+                ] {
+                    for method in session_methods {
+                        let answer = ask(shell, window, cx, &device, method, by_session.clone());
+                        assert_eq!(answer, denied, "{method}");
+                    }
+                    for method in project_methods {
+                        let answer = ask(shell, window, cx, &device, method, by_project.clone());
+                        assert_eq!(answer, denied, "{method}");
+                    }
+                    for method in mono_methods {
+                        let answer = ask(shell, window, cx, &device, method, by_mono.clone());
+                        assert_eq!(answer, denied, "{method}");
+                    }
+                    // A model list for a project, and a watch on the session.
+                    let answer = ask(shell, window, cx, &device, "models.list", by_project.clone());
+                    assert_eq!(answer, denied, "models.list by project");
+                    let (start, mut accepted) =
+                        WatchStart::with_receiver(&conversation, device.clone());
+                    shell.start_mobile_watch(start, cx);
+                    assert_eq!(accepted.try_recv().ok(), Some(Err(policy::Code::NotSelected.failure())));
+                    assert!(shell.mobile.watches.is_empty());
+                    // A Mono document of an unselected Mono is not offered.
+                    let answer = ask(shell, window, cx, &device, "mono.document", json!({"documentId": "d"}));
+                    assert!(matches!(answer, Some(Err(_))));
+                    // The approval answer, with the remote flag forced on.
+                    let params = json!({"conversationId": conversation, "requestId": "r", "decision": "allow"});
+                    assert_eq!(
+                        approvals::dispatch_with(shell, &device, &params, true, cx),
+                        Err(policy::Code::NotSelected.failure())
+                    );
+                }
+                // The selected project and session still resolve for a narrowed device.
+                let own_only = web(Some(vec![own.clone()]), None);
+                let answer = ask(shell, window, cx, &own_only, "project.worktrees", by_project.clone());
+                assert_ne!(answer, denied);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_monos_own_sessions_follow_the_monos_selection(cx: &mut gpui::TestAppContext) {
+        let (window, id, other) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                let monos = shell.monos.clone().unwrap();
+                let (chat_mono, habit_mono) = monos.update(cx, |monos, _| {
+                    let chat = monos.roster.create(Vec::new()).id.clone();
+                    monos.roster.get_mut(&chat).unwrap().session_id = Some(id);
+                    let habit = monos.roster.create(Vec::new()).id.clone();
+                    monos
+                        .roster
+                        .get_mut(&habit)
+                        .unwrap()
+                        .habit_sessions
+                        .push(other);
+                    (chat, habit)
+                });
+                let denied = Some(policy::Code::NotSelected.failure());
+                for (session, owner) in [(id, &chat_mono), (other, &habit_mono)] {
+                    let conversation = shell.mobile_session_id(session);
+                    // Selecting only some other Mono hides this Mono's session.
+                    let narrowed = web(None, Some(vec!["other".into()]));
+                    assert_eq!(
+                        shell.mobile_target(&conversation, &narrowed, cx).err(),
+                        denied
+                    );
+                    assert_eq!(
+                        shell
+                            .mobile_target(&conversation, &web(None, Some(vec![])), cx)
+                            .err(),
+                        denied
+                    );
+                    // The owner selected, no selection, and a phone all still reach it.
+                    for device in [
+                        web(None, Some(vec![owner.clone()])),
+                        web(None, None),
+                        phone(),
+                    ] {
+                        assert!(matches!(
+                            shell.mobile_target(&conversation, &device, cx),
+                            Ok(Target::Session(found)) if found == session
+                        ));
+                    }
+                }
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_remote_mono_edit_cannot_reach_beyond_a_monos_look_and_projects(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, _, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                let forbidden = Some(Err(policy::Code::Forbidden.failure()));
+                let device = web(None, None);
+                // Fields that are not the Mono's look, model or project list.
+                for params in [
+                    json!({"monoId": "m1", "addPath": "/etc"}),
+                    json!({"monoId": "m1", "removePaths": ["/x"]}),
+                    json!({"monoId": "m1", "habits": [{"name": "h"}]}),
+                    json!({"monoId": "m1", "runtimeMode": "full-access"}),
+                    json!({"monoId": "m1", "terminals": [{"command": "ls"}]}),
+                    json!({"monoId": "m1", "subsessions": {"model": "m", "access": "full-access"}}),
+                ] {
+                    assert_eq!(
+                        ask(shell, window, cx, &device, "mono.update", params.clone()),
+                        forbidden,
+                        "{params}"
+                    );
+                }
+                assert_eq!(
+                    ask(shell, window, cx, &device, "mono.create", json!({"habits": []})),
+                    forbidden
+                );
+                // The fields the phone sends pass this check (and fail later,
+                // as this Mono does not exist).
+                for params in [
+                    json!({"monoId": "m1", "name": "n", "mascot": "x", "color": "#112233"}),
+                    json!({"monoId": "m1", "subsessions": {"harness": "claude", "model": "m", "effort": "high"}}),
+                ] {
+                    assert!(check_mono_fields("mono.update", &params).is_ok(), "{params}");
+                }
+                assert!(check_mono_fields("mono.create", &json!({})).is_ok());
+                assert!(check_mono_fields("mono.create", &Value::Null).is_ok());
+                // A device narrowed to p1 cannot remove or add the unselected p2.
+                let narrowed = web(Some(vec!["p1".into()]), None);
+                for params in [
+                    json!({"monoId": "m1", "removeProject": "p2"}),
+                    json!({"monoId": "m1", "addProject": "p2"}),
+                ] {
+                    assert_eq!(
+                        ask(shell, window, cx, &narrowed, "mono.update", params),
+                        Some(Err(policy::Code::NotSelected.failure()))
+                    );
+                }
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn mono_file_writes_only_through_save_file_for_a_control_phone(cx: &mut gpui::TestAppContext) {
+        let (window, _, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                let write = json!({"monoId": "m1", "file": "soul", "text": "injected"});
+                let web_control = web(None, None);
+                assert_eq!(
+                    ask(shell, window, cx, &web_control, "mono.file", write.clone()),
+                    Some(Err(policy::Code::Forbidden.failure()))
+                );
+                let mut read_only = phone();
+                read_only.permission = Permission::Read;
+                assert_eq!(
+                    ask(shell, window, cx, &read_only, "mono.file", write.clone()),
+                    Some(Err(policy::Code::ReadOnly.failure()))
+                );
+                let hash = json!({"monoId": "m1", "file": "soul", "expectedHash": "h"});
+                assert_eq!(
+                    ask(shell, window, cx, &web_control, "mono.file", hash),
+                    Some(Err(policy::Code::Forbidden.failure()))
+                );
+                // A control phone is not refused for it (this Mono does not exist).
+                let answer = ask(shell, window, cx, &phone(), "mono.file", write);
+                assert_ne!(answer, Some(Err(policy::Code::Forbidden.failure())));
+                assert_ne!(answer, Some(Err(policy::Code::ReadOnly.failure())));
+                // A plain read is not refused for a web device.
+                let read = json!({"monoId": "m1", "file": "soul"});
+                let answer = ask(shell, window, cx, &web_control, "mono.file", read);
+                assert_ne!(answer, Some(Err(policy::Code::Forbidden.failure())));
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn project_methods_refuse_a_non_local_project_hook_but_not_a_local_one() {
+        // The WS-D4 predicate is a stub that answers false today.
+        assert!(refuse_non_local("anything").is_ok());
+    }
+
     #[gpui::test]
     fn full_access_is_refused_remotely_and_never_a_default(cx: &mut gpui::TestAppContext) {
         let (window, id, _) = super::super::tests::window(cx);
@@ -3305,7 +3743,7 @@ mod tests {
             let saved = Saved { id, settings: store.agent_settings(id).unwrap().unwrap(), rows: store.load(id).unwrap().rows, harness: summary.provider, cwd: summary.cwd, history: None, mono: None, launches: HashMap::new() };
             drop(store);
             let from_disk = saved_snapshot(&saved).usage_limit;
-            let live = shell.with_live_snapshot(&Target::Session(id), cx, |s| s.usage_limit.clone()).unwrap();
+            let live = shell.with_live_snapshot(&Target::Session(id), &phone(), cx, |s| s.usage_limit.clone()).unwrap();
             assert_eq!(from_disk["token"], live["token"]);
             let params = json!({"conversationId":conversation, "token":from_disk["token"], "enabled":false});
             shell.mobile_session_command(&phone(), "session.resumeUsageAtReset", &params, window, cx).unwrap();

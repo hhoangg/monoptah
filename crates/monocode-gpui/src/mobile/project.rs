@@ -22,7 +22,7 @@ use monocode_core::{
     git,
     mobile::{
         denylist::DenyList,
-        policy::{Code, Failure},
+        policy::{Code, DeviceContext, Failure},
     },
     provider::Kind,
     scm,
@@ -155,7 +155,12 @@ const MOBILE_FILE_BYTES: usize = 1024 * 1024;
 /// Denied files are refused before anything is read or highlighted, so no
 /// highlight job ever exists for one (a job holds colours of a file that
 /// passed this check, and carries no path).
-pub(crate) fn file(root: &Path, relative: &str, deny: &DenyList) -> Result<Value, Failure> {
+pub(crate) fn file(
+    root: &Path,
+    relative: &str,
+    deny: &DenyList,
+    owner: &JobOwner,
+) -> Result<Value, Failure> {
     let read = |relative: &str| {
         // Checked as written first, so a denied name answers the same whether
         // or not it exists, then as resolved.
@@ -186,7 +191,7 @@ pub(crate) fn file(root: &Path, relative: &str, deny: &DenyList) -> Result<Value
     if let Some(highlighted) = highlight_file(&path, text) {
         reply["highlighted"] = highlighted.to_json();
     } else if text.len() > MAX_HIGHLIGHT_BYTES
-        && let Some(job) = highlight_in_background(&path, text.to_string())
+        && let Some(job) = highlight_in_background(&path, text.to_string(), owner)
     {
         reply["highlightJob"] = json!(job);
     }
@@ -427,8 +432,77 @@ pub(crate) fn git_action(
     root: &Path,
     params: &Value,
     chosen: Option<(Kind, Option<String>)>,
+    deny: &DenyList,
 ) -> Result<Value, Failure> {
-    Ok(git_action_inner(root, params, chosen).map_err(phone_error)?)
+    git_action_inner(root, params, chosen, deny).map_err(|error| {
+        // The one refusal this module words itself keeps its code.
+        match monocode_core::mobile::policy::code_of_error(&error) {
+            Some(code) => code.failure(),
+            None => phone_error(error).into(),
+        }
+    })
+}
+
+/// The staged context without the files the deny-list hides, so a commit
+/// message written for a remote device never reads or quotes them. Refused
+/// with `path_denied` when nothing else is left.
+fn without_denied(
+    context: scm::StagedContext,
+    deny: &DenyList,
+) -> Result<scm::StagedContext, String> {
+    let hidden = |path: &str| {
+        let path = path.trim().trim_matches('"');
+        // A rename shows as `a => b`, or `dir/{a => b}`: judge each side.
+        let sides = path
+            .split(" => ")
+            .map(|side| side.trim_matches(['{', '}', ' ']));
+        deny.is_denied_rel(path) || sides.into_iter().any(|side| deny.is_denied_rel(side))
+    };
+    let mut patch = String::new();
+    let mut keep = true;
+    for line in context.patch.split_inclusive('\n') {
+        if let Some(header) = line.strip_prefix("diff --git ") {
+            let header = header.trim_end();
+            // `a/<old> b/<new>`: a path may hold " b/", so try every split.
+            let denied = header.match_indices(" b/").any(|(at, _)| {
+                hidden(header[..at].trim_start_matches("a/")) || hidden(&header[at + 3..])
+            }) || hidden(header.trim_start_matches("a/"));
+            keep = !denied;
+        }
+        if keep {
+            patch.push_str(line);
+        }
+    }
+    let mut summary = Vec::new();
+    let (mut kept, mut dropped) = (0, 0);
+    for line in context.summary.lines() {
+        // Stat lines read ` path | 3 ++-`; untracked names stand alone.
+        match line.split_once(" | ") {
+            Some((path, _)) if hidden(path) => dropped += 1,
+            None if line != "Untracked files:" && !line.contains(" changed") && hidden(line) => {
+                dropped += 1
+            }
+            _ => {
+                if line.contains(" | ") {
+                    kept += 1;
+                }
+                summary.push(line);
+            }
+        }
+    }
+    if dropped > 0 && kept == 0 && patch.trim().is_empty() {
+        return Err(Code::PathDenied.message().into());
+    }
+    Ok(scm::StagedContext {
+        branch: context.branch,
+        // The "N files changed" total would count the files left out.
+        summary: summary
+            .into_iter()
+            .filter(|line| dropped == 0 || !line.contains(" changed"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        patch,
+    })
 }
 
 /// The phone has no ahead/behind re-check, so the desktop's "Checking..." would be a lie.
@@ -444,6 +518,7 @@ fn git_action_inner(
     root: &Path,
     params: &Value,
     chosen: Option<(Kind, Option<String>)>,
+    deny: &DenyList,
 ) -> Result<Value, String> {
     // The harness picked in the phone's composer writes the commit message and
     // pull request, as the desktop's panel uses its session's.
@@ -476,10 +551,11 @@ fn git_action_inner(
         "generate" => {
             let harness =
                 harness().ok_or("No provider CLI is installed to write a commit message.")?;
-            let message = crate::changes::generate_commit_message(
+            let message = crate::changes::generate_commit_message_with(
                 harness,
                 root.to_path_buf(),
                 Arc::new(AtomicBool::new(false)),
+                |context| without_denied(context, deny),
             )?;
             Ok(json!({ "message": message }))
         }
@@ -757,8 +833,18 @@ fn highlight_diff(
     Some((palette, runs))
 }
 
+/// Who a highlight job belongs to: the device that read the file and the
+/// project it is in. Another device, or a device that no longer selects the
+/// project, cannot collect the colours of its text (security finding M3).
+#[derive(Clone, Default)]
+pub(crate) struct JobOwner {
+    pub device: String,
+    pub project: String,
+}
+
 #[derive(Default)]
 struct Job {
+    owner: JobOwner,
     palette: Vec<String>,
     lines: Vec<Runs>,
     done: bool,
@@ -780,7 +866,7 @@ fn jobs() -> std::sync::MutexGuard<'static, Jobs> {
 /// Starts highlighting a file too large to highlight at once on its own
 /// thread, a chunk at a time, for the phone to collect with `file_highlight`.
 /// None for a file without colours (judged by its first lines).
-fn highlight_in_background(path: &str, text: String) -> Option<String> {
+fn highlight_in_background(path: &str, text: String, owner: &JobOwner) -> Option<String> {
     let language = language_for(path)?;
     let mut probe = Palette::default();
     let head: Vec<&str> = text.split('\n').take(PROBE_LINES).collect();
@@ -796,7 +882,13 @@ fn highlight_in_background(path: &str, text: String) -> Option<String> {
         let mut jobs = jobs();
         jobs.next += 1;
         let id = jobs.next.to_string();
-        jobs.jobs.insert(id.clone(), Job::default());
+        jobs.jobs.insert(
+            id.clone(),
+            Job {
+                owner: owner.clone(),
+                ..Job::default()
+            },
+        );
         jobs.order.push_back(id.clone());
         while jobs.order.len() > MAX_JOBS {
             if let Some(oldest) = jobs.order.pop_front() {
@@ -853,13 +945,26 @@ fn highlight_in_background(path: &str, text: String) -> Option<String> {
 }
 
 /// A background highlight's palette and the lines finished from `from` on.
-pub(crate) fn file_highlight(job: &str, from: usize) -> Value {
+/// Only the device that opened the file, while it still selects the file's
+/// project, may collect it; any other caller gets `not_selected`.
+pub(crate) fn file_highlight(
+    job: &str,
+    from: usize,
+    device: &DeviceContext,
+) -> Result<Value, Failure> {
     let jobs = jobs();
     let Some(job) = jobs.jobs.get(job) else {
-        return json!({ "palette": [], "lines": [], "done": true });
+        return Ok(json!({ "palette": [], "lines": [], "done": true }));
     };
+    let selected = device
+        .projects
+        .as_ref()
+        .is_none_or(|list| list.contains(&job.owner.project));
+    if job.owner.device != device.id || !selected {
+        return Err(Code::NotSelected.failure());
+    }
     let lines: Vec<Value> = job.lines.iter().skip(from).map(runs_json).collect();
-    json!({ "palette": job.palette, "lines": lines, "done": job.done })
+    Ok(json!({ "palette": job.palette, "lines": lines, "done": job.done }))
 }
 
 #[cfg(test)]
@@ -935,7 +1040,15 @@ mod tests {
         assert!(inside_root(&project, &dir.0.join("secret").to_string_lossy()).is_err());
         #[cfg(unix)]
         assert!(inside_root(&project, "link").is_err());
-        assert!(file(&project, "../secret", &DenyList::default()).is_err());
+        assert!(
+            file(
+                &project,
+                "../secret",
+                &DenyList::default(),
+                &JobOwner::default()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1028,11 +1141,17 @@ mod tests {
             assert_eq!(spelled, line["text"].as_str().unwrap());
         }
 
-        let read = file(root, "app.rs:2", &DenyList::default()).unwrap();
+        let read = file(root, "app.rs:2", &DenyList::default(), &JobOwner::default()).unwrap();
         assert_eq!(read["path"], "src/app.rs");
         assert_eq!(read["truncated"], false);
         assert!(read["highlighted"]["lines"].is_array());
-        let plain = file(root, "notes.txt", &DenyList::default()).unwrap();
+        let plain = file(
+            root,
+            "notes.txt",
+            &DenyList::default(),
+            &JobOwner::default(),
+        )
+        .unwrap();
         assert!(plain.get("highlighted").is_none() && plain.get("highlightJob").is_none());
 
         let found = search(root, "app", &DenyList::default()).unwrap();
@@ -1048,12 +1167,26 @@ mod tests {
         assert_eq!(status["remote"], false);
         assert_eq!(status["canGenerate"], true);
 
-        git_action(root, &json!({ "action": "stageAll" }), None).unwrap();
+        git_action(
+            root,
+            &json!({ "action": "stageAll" }),
+            None,
+            &DenyList::default(),
+        )
+        .unwrap();
         assert_eq!(
             changes(root, None, &DenyList::default()).unwrap()["files"][0]["staged"],
             true
         );
-        assert!(git_action(root, &json!({ "action": "nope" }), None).is_err());
+        assert!(
+            git_action(
+                root,
+                &json!({ "action": "nope" }),
+                None,
+                &DenyList::default()
+            )
+            .is_err()
+        );
         assert!(resolve_root(root, Some("/not/a/worktree")).is_err());
         assert_eq!(worktrees(root).unwrap()["worktrees"], json!([]));
     }
@@ -1109,12 +1242,14 @@ mod tests {
     fn large_files_highlight_in_the_background() {
         let text = "fn main() { let s = \"x\"; }\n".repeat(8_000);
         assert!(text.len() > MAX_HIGHLIGHT_BYTES);
-        let job = highlight_in_background("big.rs", text.clone()).unwrap();
+        let owner = job_owner("d1", "p1");
+        let me = device_of("d1", None);
+        let job = highlight_in_background("big.rs", text.clone(), &owner).unwrap();
         let started = std::time::Instant::now();
-        let mut progress = file_highlight(&job, 0);
+        let mut progress = file_highlight(&job, 0, &me).unwrap();
         while progress["done"] != true && started.elapsed().as_secs() < 60 {
             std::thread::sleep(std::time::Duration::from_millis(20));
-            progress = file_highlight(&job, 0);
+            progress = file_highlight(&job, 0, &me).unwrap();
         }
         assert_eq!(progress["done"], true);
         let lines = progress["lines"].as_array().unwrap();
@@ -1126,8 +1261,87 @@ mod tests {
             .map(|run| run[0].as_str().unwrap())
             .collect();
         assert_eq!(first, "fn main() { let s = \"x\"; }");
-        assert_eq!(file_highlight(&job, lines.len())["lines"], json!([]));
-        assert_eq!(file_highlight("missing", 0)["done"], true);
+        assert_eq!(
+            file_highlight(&job, lines.len(), &me).unwrap()["lines"],
+            json!([])
+        );
+        assert_eq!(file_highlight("missing", 0, &me).unwrap()["done"], true);
+    }
+
+    #[test]
+    fn generate_never_feeds_denied_files_to_the_provider() {
+        let deny = DenyList::default();
+        let context = scm::StagedContext {
+            branch: Some("main".into()),
+            summary: " .env | 1 +\n src/lib.rs | 2 +-\n 2 files changed, 2 insertions(+), 1 deletion(-)"
+                .into(),
+            patch: "diff --git a/.env b/.env\n+TOKEN=hunter2\ndiff --git a/src/lib.rs b/src/lib.rs\n+let a = 1;\n"
+                .into(),
+        };
+        let trimmed = without_denied(context, &deny).unwrap();
+        assert!(!trimmed.patch.contains("hunter2") && !trimmed.patch.contains(".env"));
+        assert!(trimmed.patch.contains("let a = 1;"));
+        assert!(!trimmed.summary.contains(".env") && !trimmed.summary.contains("2 files changed"));
+        assert!(trimmed.summary.contains("src/lib.rs"));
+        // Only a denied file staged: refused with the path_denied text.
+        let only = scm::StagedContext {
+            branch: None,
+            summary: " .env | 1 +\n 1 file changed, 1 insertion(+)".into(),
+            patch: "diff --git a/.env b/.env\n+TOKEN=hunter2\n".into(),
+        };
+        let error = without_denied(only, &deny).unwrap_err();
+        assert_eq!(
+            monocode_core::mobile::policy::code_of_error(&error),
+            Some(Code::PathDenied)
+        );
+        // Nothing denied: untouched.
+        let plain = scm::StagedContext {
+            branch: None,
+            summary: " a.rs | 1 +\n 1 file changed, 1 insertion(+)".into(),
+            patch: "diff --git a/a.rs b/a.rs\n+x\n".into(),
+        };
+        let same = without_denied(plain, &deny).unwrap();
+        assert!(same.patch.contains("+x") && same.summary.contains("1 file changed"));
+    }
+
+    fn job_owner(device: &str, project: &str) -> JobOwner {
+        JobOwner {
+            device: device.into(),
+            project: project.into(),
+        }
+    }
+
+    fn device_of(id: &str, projects: Option<Vec<String>>) -> DeviceContext {
+        DeviceContext {
+            id: id.into(),
+            kind: monocode_core::mobile::policy::DeviceKind::Phone,
+            permission: monocode_core::mobile::policy::Permission::Control,
+            projects,
+            monos: None,
+        }
+    }
+
+    #[test]
+    fn a_highlight_job_answers_only_its_own_device_and_project() {
+        let text = "fn main() { let s = \"x\"; }\n".repeat(8_000);
+        let job = highlight_in_background("big.rs", text, &job_owner("d1", "p1")).unwrap();
+        assert!(file_highlight(&job, 0, &device_of("d1", None)).is_ok());
+        assert!(file_highlight(&job, 0, &device_of("d1", Some(vec!["p1".into()]))).is_ok());
+        // Another device, with or without a selection.
+        for other in [
+            device_of("d2", None),
+            device_of("d2", Some(vec!["p1".into()])),
+        ] {
+            assert_eq!(
+                file_highlight(&job, 0, &other).unwrap_err(),
+                Code::NotSelected.failure()
+            );
+        }
+        // The same device after narrowing away the job's project.
+        assert_eq!(
+            file_highlight(&job, 0, &device_of("d1", Some(vec!["p2".into()]))).unwrap_err(),
+            Code::NotSelected.failure()
+        );
     }
 
     #[test]
@@ -1168,14 +1382,24 @@ mod tests {
             ".git/config",
             "src/../.env",
         ] {
-            assert_eq!(file(root, path, &deny).unwrap_err(), hidden, "{path}");
+            assert_eq!(
+                file(root, path, &deny, &JobOwner::default()).unwrap_err(),
+                hidden,
+                "{path}"
+            );
         }
         // Not rescued by the transcript-style lookup either.
-        assert_eq!(file(root, "x/.env:3", &deny).unwrap_err(), hidden);
-        assert!(file(root, ".env.example", &deny).is_ok());
-        assert!(file(root, "notes.txt", &deny).is_ok());
+        assert_eq!(
+            file(root, "x/.env:3", &deny, &JobOwner::default()).unwrap_err(),
+            hidden
+        );
+        assert!(file(root, ".env.example", &deny, &JobOwner::default()).is_ok());
+        assert!(file(root, "notes.txt", &deny, &JobOwner::default()).is_ok());
         let extra = DenyList::new(&["notes.*".to_string()]);
-        assert_eq!(file(root, "notes.txt", &extra).unwrap_err(), hidden);
+        assert_eq!(
+            file(root, "notes.txt", &extra, &JobOwner::default()).unwrap_err(),
+            hidden
+        );
     }
 
     #[cfg(unix)]
@@ -1190,7 +1414,7 @@ mod tests {
         let deny = DenyList::default();
         for path in ["plain.txt", "link.txt"] {
             assert_eq!(
-                file(root, path, &deny).unwrap_err(),
+                file(root, path, &deny, &JobOwner::default()).unwrap_err(),
                 Code::PathDenied.failure()
             );
         }
@@ -1286,10 +1510,10 @@ mod tests {
         std::fs::write(dir.0.join("big.rs"), &text).unwrap();
         let deny = DenyList::default();
         assert_eq!(
-            file(&dir.0, "secrets.rs", &deny).unwrap_err(),
+            file(&dir.0, "secrets.rs", &deny, &JobOwner::default()).unwrap_err(),
             Code::PathDenied.failure()
         );
-        let allowed = file(&dir.0, "big.rs", &deny).unwrap();
+        let allowed = file(&dir.0, "big.rs", &deny, &JobOwner::default()).unwrap();
         assert!(allowed.get("highlightJob").is_some() || allowed.get("highlighted").is_some());
     }
 }

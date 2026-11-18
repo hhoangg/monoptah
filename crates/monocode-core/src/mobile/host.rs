@@ -217,6 +217,25 @@ pub struct Request {
     reply: oneshot::Sender<Result<Value, Failure>>,
 }
 impl Request {
+    /// A request and the receiver of its answer, for driving the app's own
+    /// request routing in-process (the app's tests, never the transports).
+    pub fn with_receiver(
+        command_id: &str,
+        method: &str,
+        params: Value,
+        device: DeviceContext,
+    ) -> (Self, oneshot::Receiver<Result<Value, Failure>>) {
+        let (reply, receive) = oneshot::channel();
+        let request = Self {
+            command_id: command_id.into(),
+            method: method.into(),
+            params,
+            device,
+            reply,
+        };
+        (request, receive)
+    }
+
     /// Answers the request. A [`Failure`] with a code reaches a web device as
     /// its `code`; a plain `String` error reaches it as text only.
     pub fn reply(self, result: Result<Value, Failure>) {
@@ -241,6 +260,25 @@ pub struct WatchStart {
     accept: oneshot::Sender<Result<(), Failure>>,
 }
 impl WatchStart {
+    /// A watch start and the receiver of its answer, as
+    /// [`Request::with_receiver`] is for requests.
+    pub fn with_receiver(
+        conversation_id: &str,
+        device: DeviceContext,
+    ) -> (Self, oneshot::Receiver<Result<(), Failure>>) {
+        let (accept, accepted) = oneshot::channel();
+        let start = Self {
+            id: "watch".into(),
+            conversation_id: conversation_id.into(),
+            tail: None,
+            from: None,
+            incremental: false,
+            device,
+            accept,
+        };
+        (start, accepted)
+    }
+
     pub fn accept(self, result: Result<(), Failure>) {
         let _ = self.accept.send(result);
     }
@@ -830,7 +868,7 @@ impl MobileHost {
         let result = self.call_from(via, peer, &request, &mut audited).await;
         // Recorded with no lock held: the log may write a file.
         if let Some((context, mut event)) = audited {
-            event.outcome = final_outcome(event.outcome, result.is_err());
+            event.outcome = outcome_of(event.outcome, &result);
             audit::record(&context, &event);
         }
         result
@@ -1019,7 +1057,7 @@ impl MobileHost {
             .await;
         // Recorded with no lock held: the log may write a file.
         if let Some((context, mut event)) = audited {
-            event.outcome = final_outcome(event.outcome, result.is_err());
+            event.outcome = outcome_of(event.outcome, &result);
             audit::record(&context, &event);
         }
         result
@@ -1198,17 +1236,15 @@ fn close_device_watches(inner: &mut Inner, peer: &str) {
 /// What the audit log records of a call: who, how and which method, never the
 /// parameters.
 fn audit_event(device: &Device, method: &str, request: &Value) -> AuditEvent {
-    AuditEvent {
-        fingerprint_prefix: device.fingerprint.chars().take(8).collect(),
-        transport: match device.kind {
+    AuditEvent::for_call(
+        &device.fingerprint,
+        match device.kind {
             DeviceKind::Phone => Transport::Quic,
             DeviceKind::Web => Transport::Web,
         },
-        method: method.into(),
-        project_id: request["params"]["projectId"].as_str().map(Into::into),
-        outcome: Outcome::Ok,
-        command_id: request["id"].as_str().map(Into::into),
-    }
+        method,
+        request,
+    )
 }
 
 impl MobileHost {
@@ -2055,6 +2091,18 @@ fn final_outcome(recorded: Outcome, failed: bool) -> Outcome {
     }
 }
 
+/// [`final_outcome`] for a call's result: a failure that carries a code (an
+/// app refusal such as `not_selected` or `path_denied`) is a denial with that
+/// code, not an error.
+fn outcome_of<T>(recorded: Outcome, result: &Result<T, Failure>) -> Outcome {
+    match (final_outcome(recorded, result.is_err()), result) {
+        (Outcome::Error, Err(failure)) => {
+            policy::code_of_failure(failure).map_or(Outcome::Error, Outcome::Denied)
+        }
+        (outcome, _) => outcome,
+    }
+}
+
 /// Marks the audited call of the device as denied with `denial`'s code.
 fn mark_denied(audited: &mut Option<(DeviceContext, AuditEvent)>, denial: &policy::Denial) {
     if let Some((_, event)) = audited {
@@ -2473,6 +2521,21 @@ mod tests {
             .unwrap();
         assert_eq!(answer, json!({"projects":null,"monos":null}));
         std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_coded_refusal_is_recorded_as_a_denial() {
+        let coded: Result<(), Failure> = Err(policy::Code::NotSelected.failure());
+        assert_eq!(
+            outcome_of(Outcome::Ok, &coded),
+            Outcome::Denied(policy::Code::NotSelected)
+        );
+        let plain: Result<(), Failure> = Err("Session is no longer available".into());
+        assert_eq!(outcome_of(Outcome::Ok, &plain), Outcome::Error);
+        let fine: Result<(), Failure> = Ok(());
+        assert_eq!(outcome_of(Outcome::Ok, &fine), Outcome::Ok);
+        let denied = Outcome::Denied(policy::Code::ReadOnly);
+        assert_eq!(outcome_of(denied, &coded), denied);
     }
 
     #[test]

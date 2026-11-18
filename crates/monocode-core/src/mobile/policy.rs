@@ -414,6 +414,11 @@ fn full_access(params: &Value) -> bool {
 /// Parameter-dependent rules follow architecture.md 7.1.
 pub fn classify(method: &str, params: &Value) -> Option<Access> {
     let entry = entry(method)?;
+    // `mono.file` saves when it carries `text` (or a save hash), so such a call
+    // is exactly `mono.saveFile`, whatever the table class says for a read.
+    if method == "mono.file" && (!params["text"].is_null() || !params["expectedHash"].is_null()) {
+        return Some(Access::DeniedForWeb);
+    }
     Some(match entry.class {
         Class::Read => Access::Read,
         Class::Denied => Access::DeniedForWeb,
@@ -809,6 +814,16 @@ mod tests {
         for method in ["mono.saveFile", "mono.reset", "mono.delete"] {
             assert_eq!(c(method, json!({})), Access::DeniedForWeb);
         }
+        // A plain read stays a read; a write through mono.file is a save.
+        assert_eq!(c("mono.file", json!({"file": "soul"})), Access::Read);
+        assert_eq!(
+            c("mono.file", json!({"file": "soul", "text": "x"})),
+            Access::DeniedForWeb
+        );
+        assert_eq!(
+            c("mono.file", json!({"file": "soul", "expectedHash": "h"})),
+            Access::DeniedForWeb
+        );
         for method in ["device.push", "project.fileHighlight"] {
             assert_eq!(c(method, json!({})), Access::UnsupportedWeb);
         }
@@ -985,6 +1000,29 @@ mod tests {
         // Unknown methods are the host's to refuse.
         let web = ctx(DeviceKind::Web, Permission::Read);
         assert_eq!(call(&web, "cloud.delete", json!({}), &off), None);
+    }
+
+    #[test]
+    fn mono_file_with_text_is_a_save_for_every_device() {
+        let write = json!({"monoId": "m1", "file": "soul", "text": "x"});
+        let read = json!({"monoId": "m1", "file": "soul"});
+        for permission in [Permission::Read, Permission::Control] {
+            let web = ctx(DeviceKind::Web, permission);
+            assert_eq!(
+                call(&web, "mono.file", write.clone(), &ON),
+                Some(Code::Forbidden)
+            );
+            assert_eq!(call(&web, "mono.file", read.clone(), &ON), None);
+        }
+        let read_phone = ctx(DeviceKind::Phone, Permission::Read);
+        assert_eq!(
+            call(&read_phone, "mono.file", write.clone(), &ON),
+            Some(Code::ReadOnly)
+        );
+        assert_eq!(call(&read_phone, "mono.file", read.clone(), &ON), None);
+        let phone = ctx(DeviceKind::Phone, Permission::Control);
+        assert_eq!(call(&phone, "mono.file", write, &ON), None);
+        assert_eq!(call(&phone, "mono.file", read, &ON), None);
     }
 
     #[test]
