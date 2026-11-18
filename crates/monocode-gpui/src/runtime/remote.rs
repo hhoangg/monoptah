@@ -465,7 +465,9 @@ pub(crate) fn approvals(snapshot: &Value) -> Vec<Approval> {
                     .unwrap_or("")
                     .into(),
                 can_remember: false,
-                can_allow_once: true,
+                // The host snapshot does not list the request's options, and its Cursor, Grok and
+                // Antigravity harnesses fall back to allow-always. A one-time allow cannot be promised.
+                can_allow_once: false,
             })
         })
         .collect()

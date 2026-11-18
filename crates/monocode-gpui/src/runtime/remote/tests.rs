@@ -314,6 +314,7 @@ fn question_labels_map_to_host_ids_and_resolved_approvals_disappear() {
     assert_eq!(approvals.len(), 1);
     assert_eq!(approvals[0].id, "2");
     assert_eq!(approvals[0].detail, "/repo/file");
+    assert!(!approvals[0].can_allow_once);
 }
 
 #[test]

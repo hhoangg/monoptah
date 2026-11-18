@@ -3633,6 +3633,20 @@ mod tests {
                 assert!(receive.try_recv().is_err());
                 assert_eq!(ask(shell, &o1, "deny", cx), Ok(json!({})));
                 assert!(matches!(receive.try_recv().unwrap().decision, Decision::Deny));
+                // N-1: an approval of a remote runtime never offers a one-time allow.
+                let receive = view.update(cx, |v, _| {
+                    let rx = v.mobile_test_wait_on(&[("2", "Write file", "/repo/file")], AccessMode::Supervised);
+                    let snapshot = json!({"session": {"blocks": [{"text": "Write file",
+                        "tool": {"title": "Write file", "preview": {"title": "/repo/file"}},
+                        "approval": {"requestId": 2}}]}});
+                    v.mobile_test_use_approvals(crate::runtime::remote::approvals(&snapshot));
+                    rx
+                });
+                let r2 = shown(&view, cx)[0].request_id.clone();
+                assert_eq!(ask(shell, &r2, "allow", cx), needs_desktop);
+                assert!(receive.try_recv().is_err());
+                assert_eq!(ask(shell, &r2, "deny", cx), Ok(json!({})));
+                assert!(matches!(receive.try_recv().unwrap().decision, Decision::Deny));
             })
             .unwrap();
     }

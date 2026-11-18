@@ -432,6 +432,11 @@ impl Conversation {
         receive
     }
 
+    /// Replaces the pending approvals, e.g. with those a remote runtime built.
+    pub(crate) fn mobile_test_use_approvals(&mut self, approvals: Vec<Approval>) {
+        self.approvals = approvals.into();
+    }
+
     /// Makes every pending approval one the provider can only allow "always".
     pub(crate) fn mobile_test_without_allow_once(&mut self) {
         for approval in &mut self.approvals {
