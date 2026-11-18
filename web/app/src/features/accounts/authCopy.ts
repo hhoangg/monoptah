@@ -49,3 +49,16 @@ export function passkeyErrorMessage(error: unknown): string {
   if (isApiError(error, "conflict")) return "This device already has a passkey for your account.";
   return common(error);
 }
+
+// One-shot hand-off from the recovery flow to the sign-in screen (in memory, gone on reload).
+let recoveredPending = false;
+export const RECOVERED_NOTICE = "Passkey added. Sign in with it now.";
+export function markRecovered(): void {
+  recoveredPending = true;
+}
+export function peekRecovered(): boolean {
+  return recoveredPending;
+}
+export function clearRecovered(): void {
+  recoveredPending = false;
+}

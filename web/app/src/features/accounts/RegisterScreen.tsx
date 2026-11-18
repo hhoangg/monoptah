@@ -31,6 +31,12 @@ export function scrubInviteFragment(): void {
   window.history.replaceState(window.history.state, "", window.location.pathname + window.location.search);
 }
 
+/** A pasted invite link (`...#invite=CODE`) is reduced to its code; anything else is kept as typed. */
+export function parseInviteInput(text: string): string {
+  const match = /[#?&]invite=([^&#\s]+)/.exec(text);
+  return match?.[1] ? decodeURIComponent(match[1]) : text;
+}
+
 interface FormErrors {
   invite?: string;
   handle?: string;
@@ -74,14 +80,19 @@ export function RegisterScreen() {
     void router.navigate({ href: postSignInTarget(undefined) });
   }
 
-  async function submit(event: FormEvent) {
+  async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    const form = event.currentTarget;
     const values = { invite: invite.trim(), handle: handle.trim().toLowerCase(), displayName: displayName.trim() };
     const found = validate(values);
     setErrors(found);
     setFormError(null);
     setCancelled(false);
-    if (Object.keys(found).length > 0) return;
+    const firstInvalid = (["invite", "handle", "displayName"] as const).find((key) => found[key]);
+    if (firstInvalid) {
+      (form.elements.namedItem(firstInvalid) as HTMLInputElement | null)?.focus();
+      return;
+    }
     setBusy(true);
     try {
       const result = await registerAccount(queryClient, values);
@@ -129,8 +140,12 @@ export function RegisterScreen() {
           label="Invite code"
           name="invite"
           value={invite}
-          onChange={(event) => setInvite(event.target.value)}
+          onChange={(event) => {
+            setInvite(parseInviteInput(event.target.value));
+            setErrors((current) => ({ ...current, invite: undefined }));
+          }}
           error={errors.invite}
+          hint="Paste the invite link or its code."
           autoComplete="off"
           autoCapitalize="characters"
           spellCheck={false}
@@ -140,9 +155,12 @@ export function RegisterScreen() {
           label="Handle"
           name="handle"
           value={handle}
-          onChange={(event) => setHandle(event.target.value)}
+          onChange={(event) => {
+            setHandle(event.target.value);
+            setErrors((current) => ({ ...current, handle: undefined }));
+          }}
           error={errors.handle}
-          hint="Your handle cannot be changed later."
+          hint="3 to 32 lowercase letters, digits, - or _. You cannot change it later."
           autoComplete="username"
           autoCapitalize="none"
           autoCorrect="off"
@@ -152,7 +170,10 @@ export function RegisterScreen() {
           label="Display name"
           name="displayName"
           value={displayName}
-          onChange={(event) => setDisplayName(event.target.value)}
+          onChange={(event) => {
+            setDisplayName(event.target.value);
+            setErrors((current) => ({ ...current, displayName: undefined }));
+          }}
           error={errors.displayName}
           autoComplete="name"
         />

@@ -85,29 +85,30 @@ describe("pairing page: details and fingerprint check", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
-  it("blocks a mismatch: a warning, no Approve control at all, only Deny and Cancel", async () => {
+  it("blocks a mismatch: a warning, no Approve control at all, only Deny and go back", async () => {
     const state = install();
     const user = userEvent.setup();
-    mount(`/pair/${MOCK_PAIR_CODE}${OTHER}`);
+    const { router } = mount(`/pair/${MOCK_PAIR_CODE}${OTHER}`);
     await screen.findByRole("heading", { level: 1, name: "Do not approve this desktop" });
     expect(screen.getByRole("alert")).toHaveTextContent("The fingerprint does not match");
     expect(screen.queryByRole("button", { name: /Approve/ })).toBeNull();
     expect(screen.queryByRole("link", { name: /Approve/ })).toBeNull();
     expect(screen.queryByRole("checkbox")).toBeNull();
     expect(screen.queryByRole("radio")).toBeNull();
-    expect(screen.getByRole("button", { name: "Cancel" })).toBeEnabled();
-    await user.click(screen.getByRole("button", { name: "Deny" }));
-    await screen.findByRole("heading", { level: 1, name: "Request denied" });
+    expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Deny" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Deny and go back" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/desktops"));
     expect(approveCalls()).toHaveLength(0);
     expect(state.pairings.get(normalizeUserCode(MOCK_PAIR_CODE))?.status).toBe("denied");
   });
 
-  it("Cancel on a mismatch denies the request first (no passkey), then leaves for /desktops", async () => {
+  it("Deny and go back on a mismatch denies the request first (no passkey), then leaves for /desktops", async () => {
     const state = install();
     const user = userEvent.setup();
     const { router } = mount(`/pair/${MOCK_PAIR_CODE}${OTHER}`);
     await screen.findByRole("heading", { level: 1, name: "Do not approve this desktop" });
-    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    await user.click(screen.getByRole("button", { name: "Deny and go back" }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/desktops"));
     expect(urlsOf(sent).filter((call) => call.includes("/deny"))).toHaveLength(1);
     expect(state.pairings.get(normalizeUserCode(MOCK_PAIR_CODE))?.status).toBe("denied");
@@ -122,8 +123,8 @@ describe("pairing page: details and fingerprint check", () => {
     const path = router.state.location.pathname;
     restore?.();
     restore = setApiTransport(() => Promise.reject(new TypeError("offline")));
-    await user.click(screen.getByRole("button", { name: "Cancel" }));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "Deny and go back" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Deny and go back" })).toBeEnabled());
     expect(router.state.location.pathname).toBe(path);
   });
 
@@ -194,7 +195,7 @@ describe("pairing page: approve and deny", () => {
     const user = userEvent.setup();
     mount(`/pair/${MOCK_PAIR_CODE}${MATCH}`);
     await screen.findByRole("heading", { level: 1, name: "Approve this desktop?" });
-    await user.click(screen.getByRole("radio", { name: "This replaces Fake Linux box" }));
+    await user.click(screen.getByRole("radio", { name: "A replacement for Fake Linux box" }));
     expect(screen.getByText(/old key stops working/)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: /Approve/ }));
     await screen.findByRole("heading", { level: 1, name: "Desktop approved" });
@@ -231,7 +232,7 @@ describe("pairing page: approve and deny", () => {
     await screen.findByRole("heading", { level: 1, name: "Approve this desktop?" });
     await user.click(screen.getByRole("button", { name: /Approve/ }));
     expect(await screen.findByRole("alert")).toHaveTextContent(PAIR_QUOTA_MESSAGE);
-    expect(screen.getByRole("radio", { name: "This replaces Fake Raspberry Pi" })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: "A replacement for Fake Raspberry Pi" })).toBeInTheDocument();
   });
 
   it("denies without a passkey prompt and shows the confirmation", async () => {
@@ -288,6 +289,7 @@ describe("pairing page: codes that cannot be used", () => {
     mount(`/pair/${MOCK_PAIR_CODE}${MATCH}`);
     expect(await screen.findByRole("alert")).toHaveTextContent("Cannot reach Monoptah");
     expect(screen.getByRole("button", { name: "Try again" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Go to my desktops" })).toBeInTheDocument();
     expect(screen.queryByText(PAIR_EXPIRED_MESSAGE)).toBeNull();
   });
 });

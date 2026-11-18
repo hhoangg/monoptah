@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useRouter } from "@tanstack/react-router";
-import { useState } from "react";
+import { Link, useRouter } from "@tanstack/react-router";
+import { useEffect, useState } from "react";
 import { AuthLayout } from "@/ui/AuthLayout";
 import { Button } from "@/ui/button";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
@@ -9,7 +9,7 @@ import { Notice } from "@/ui/Notice";
 import { PageHeader } from "@/ui/PageHeader";
 import { SettingsCard, SettingsRow } from "@/ui/SettingsCard";
 import { isApiError } from "./api";
-import { signInErrorMessage, UNSUPPORTED_ERROR } from "./authCopy";
+import { clearRecovered, peekRecovered, RECOVERED_NOTICE, signInErrorMessage, UNSUPPORTED_ERROR } from "./authCopy";
 import { postSignInTarget } from "./redirect";
 import { meQuery, signIn, signOut } from "./queries";
 import { passkeysSupported } from "./webauthn";
@@ -21,6 +21,9 @@ export function LoginScreen({ redirect }: { redirect?: string }) {
   const [error, setError] = useState<string | null>(null);
   const [cancelled, setCancelled] = useState(false);
   const supported = passkeysSupported();
+  // Set by the recovery flow right before it sends the user here.
+  const [recovered] = useState(peekRecovered);
+  useEffect(clearRecovered, []);
   // /login never redirects on its own: a visitor with a session (possibly a stale one, when the
   // desktop link asked for a sign-in) chooses to continue or to sign in with another passkey.
   const me = useQuery({ ...meQuery, retry: false, refetchOnMount: "always" });
@@ -63,7 +66,7 @@ export function LoginScreen({ redirect }: { redirect?: string }) {
   if (account) {
     return (
       <AuthLayout>
-        <PageHeader size="display" title="Sign in to Monoptah" description={`Signed in as ${account.displayName} (@${account.handle})`} />
+        <PageHeader size="display" title={`Continue as @${account.handle}`} description={`Signed in as ${account.displayName}`} />
         {error ? <Notice variant="error">{error}</Notice> : null}
         <div className="flex flex-col gap-2">
           <Button type="button" size="lg" className="w-full" disabled={busy} onClick={() => void router.navigate({ href: postSignInTarget(redirect) })}>
@@ -81,6 +84,7 @@ export function LoginScreen({ redirect }: { redirect?: string }) {
   return (
     <AuthLayout>
       <PageHeader size="display" title="Sign in to Monoptah" description="Use the passkey saved on this device." />
+      {recovered ? <Notice variant="success">{RECOVERED_NOTICE}</Notice> : null}
       {!supported ? <Notice variant="error">{UNSUPPORTED_ERROR}</Notice> : null}
       {error ? <Notice variant="error">{error}</Notice> : null}
       {cancelled ? <Notice variant="info">Sign-in was cancelled. Try again when you are ready.</Notice> : null}
@@ -91,6 +95,12 @@ export function LoginScreen({ redirect }: { redirect?: string }) {
           {busy ? <DelayedSpinner label="Waiting for your passkey" /> : null}
         </Button>
         <p className="text-center text-meta text-muted-text">If your browser offers it, you can also use a passkey from your phone.</p>
+        <p className="text-center text-small text-muted-text">
+          Have an invite?{" "}
+          <Link to="/register" className="font-semibold text-brand-text hover:underline">
+            Create your account
+          </Link>
+        </p>
       </div>
       <SettingsCard>
         <SettingsRow icon="key" title="Lost your passkey?" description="Use a recovery code" to="/recover" />

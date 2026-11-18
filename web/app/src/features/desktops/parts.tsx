@@ -3,12 +3,17 @@ import { Badge } from "@/ui/badge";
 import { cn } from "@/lib/utils";
 import { displayFingerprint } from "@/link/fingerprint";
 import { isApiError } from "@/features/accounts/api";
+import { fingerprintLines } from "@/features/accounts/pair/fingerprint";
 import { settingsErrorMessage } from "@/features/settings/copy";
 import { resolveDesktopColor } from "./colors";
 import { presenceLabel } from "./format";
 
-/** A round color marker. The style only ever gets a palette hex (colors.ts), never the stored string. */
+/**
+ * A round color marker. The style only ever gets a palette hex (colors.ts), never the stored string.
+ * Without a chosen color it is a hollow ring, so it never reads as a grey "offline" dot next to the presence badge.
+ */
 export function ColorDot({ color, className }: { color: string | null; className?: string }) {
+  if (color === null) return <span aria-hidden="true" className={cn("inline-block size-3 shrink-0 rounded-pill border border-faint", className)} />;
   return <span aria-hidden="true" className={cn("inline-block size-3 shrink-0 rounded-pill", className)} style={{ backgroundColor: resolveDesktopColor(color).value }} />;
 }
 
@@ -23,7 +28,18 @@ export function PresenceBadge({ online }: { online: boolean }) {
 
 /** A fingerprint in its display form (8 groups of 4), as text only. */
 export function Fingerprint({ hex, className }: { hex: string; className?: string }) {
-  return <span className={cn("font-mono text-meta break-words text-muted-text", className)}>{displayFingerprint(hex)}</span>;
+  return <span className={cn("font-mono text-meta break-words text-content", className)}>{displayFingerprint(hex)}</span>;
+}
+
+/** The one presentation of a fingerprint to compare: two lines of four groups, mono, never wrapped inside a line. */
+export function FingerprintLines({ hex, className }: { hex: string; className?: string }) {
+  const [lineOne, lineTwo] = fingerprintLines(hex);
+  return (
+    <span className={cn("block font-mono text-label whitespace-nowrap text-content tabular-nums", className)}>
+      <span className="block">{lineOne} </span>
+      <span className="block">{lineTwo}</span>
+    </span>
+  );
 }
 
 /** One line for a failed desktop call. */

@@ -244,7 +244,8 @@ describe("route stubs", () => {
         <RouterProvider router={router} />
       </QueryClientProvider>,
     );
-    expect(await screen.findByText(/Signed in as .* \(@dev-user\)/)).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { level: 1, name: "Continue as @dev-user" })).toBeInTheDocument();
+    expect(screen.getByText(/^Signed in as .+/)).toBeInTheDocument();
     expect(router.state.location.pathname).toBe("/login");
     await userEvent.click(screen.getByRole("button", { name: "Continue" }));
     await screen.findByRole("heading", { level: 1, name: "Settings" });

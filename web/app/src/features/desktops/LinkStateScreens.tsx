@@ -9,14 +9,16 @@
 import { Link } from "@tanstack/react-router";
 import { useEffect, type ReactNode } from "react";
 import { useLinkConnection, useLinkDesktopId, useLinkState } from "@/link";
+import { AuthLayout } from "@/ui/AuthLayout";
 import { Button, buttonVariants } from "@/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/ui/dialog";
 import { useDelayed } from "@/ui/DelayedSpinner";
+import { Icon } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
 import { setBlockingLayerShown } from "./blockingLayer";
 import { blockingScreen, type BlockingScreen } from "./linkStateModel";
 import { safeName } from "./format";
-import { Fingerprint } from "./parts";
+import { FingerprintLines } from "./parts";
 import { useLazyGrant } from "./useLazyGrant";
 
 /** Remounts per desktop so the grant bookkeeping of one desktop never leaks into the next. */
@@ -73,7 +75,12 @@ function BlockingLayer({ screen, desktopId, onRetryGrant }: { screen: BlockingSc
           </p>
           <FingerprintBlock label="Desktop fingerprint" hex={desktopFingerprint} />
           <FingerprintBlock label="This device's fingerprint" hex={deviceFingerprint} />
-          <Notice>Waiting for confirmation on {name}. Keep Monoptah open on the desktop.</Notice>
+          <Notice>
+            <span className="flex items-center gap-2">
+              <Icon name="spinner" size={16} className="shrink-0 animate-spin motion-reduce:animate-none" />
+              <span>Waiting for confirmation on {name}. Keep Monoptah open on the desktop.</span>
+            </span>
+          </Notice>
         </>
       );
       break;
@@ -151,16 +158,17 @@ function BlockingLayer({ screen, desktopId, onRetryGrant }: { screen: BlockingSc
         onPointerDownOutside={(event) => event.preventDefault()}
         onInteractOutside={(event) => event.preventDefault()}
         data-screen={screen}
-        className="top-0 left-0 h-dvh w-full max-w-none translate-x-0 translate-y-0 content-start overflow-y-auto rounded-none border-0 bg-background p-0 data-[state=open]:animate-[fade-in_180ms_var(--ease-out-cubic)]"
+        className="top-0 left-0 h-dvh max-h-none w-full max-w-none translate-x-0 translate-y-0 content-start overflow-y-auto rounded-none border-0 bg-background p-0 pb-[calc(env(safe-area-inset-bottom)+2rem)] data-[state=open]:animate-[fade-in_180ms_var(--ease-out-cubic)]"
       >
-        <div className="mx-auto flex w-full max-w-md flex-col gap-5 px-[max(1.25rem,env(safe-area-inset-left))] pt-[max(2.5rem,env(safe-area-inset-top))] pr-[max(1.25rem,env(safe-area-inset-right))] pb-[calc(env(safe-area-inset-bottom)+2rem)]">
+        {/* The same column and card as the sign-in and pair screens that lead here (AuthLayout). */}
+        <AuthLayout>
           <p className="text-label font-semibold text-content">Monoptah</p>
           <DialogTitle className="text-headline font-semibold wrap-anywhere">{title}</DialogTitle>
           <DialogDescription asChild>
             <div className="flex flex-col gap-4 text-body text-muted-text">{body}</div>
           </DialogDescription>
           {actions ? <div className="flex flex-col gap-2">{actions}</div> : null}
-        </div>
+        </AuthLayout>
       </DialogContent>
     </Dialog>
   );
@@ -168,9 +176,9 @@ function BlockingLayer({ screen, desktopId, onRetryGrant }: { screen: BlockingSc
 
 function FingerprintBlock({ label, hex }: { label: string; hex: string | null }) {
   return (
-    <div className="flex flex-col gap-1 rounded-row border border-stroke bg-surface p-3">
+    <div className="flex flex-col gap-1 rounded-card bg-surface p-4">
       <span className="text-meta font-semibold text-content">{label}</span>
-      {hex ? <Fingerprint hex={hex} className="text-body" /> : <span className="text-small text-muted-text">Not known yet</span>}
+      {hex ? <FingerprintLines hex={hex} /> : <span className="text-small text-muted-text">Not known yet</span>}
     </div>
   );
 }

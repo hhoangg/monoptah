@@ -2,7 +2,7 @@
 //
 // What protects the user here is the comparison, so the screen is built around it:
 //  - `#fp` (full fingerprint from the desktop's link or QR) is compared with the server's value. A
-//    mismatch blocks: there is no Approve control at all, only Deny and Cancel (Cancel denies, then leaves).
+//    mismatch blocks: there is no Approve control at all, only "Deny and go back" (it denies, then leaves).
 //  - A link without `#fp` (a code typed or pasted bare) still works, but shows a warning and asks the
 //    user to confirm that the code and fingerprint match the desktop screen. Decision: approval stays
 //    possible because the QR and the links the desktop shows always carry `#fp`, and refusing every bare
@@ -24,7 +24,8 @@ import { apiFetch, isApiError } from "../api";
 import { GENERIC_ERROR, NETWORK_ERROR } from "../authCopy";
 import { endpoints } from "../endpoints";
 import { desktopsQuery, ReauthCancelledError, withFreshAuth } from "../queries";
-import { checkFingerprint, fingerprintLines, type FingerprintCheck } from "./fingerprint";
+import { checkFingerprint, type FingerprintCheck } from "./fingerprint";
+import { FingerprintLines } from "@/features/desktops/parts";
 import { safeLabel } from "./untrusted";
 
 /** The F-03 copy, shown for every code that cannot be used: expired, unknown, used or malformed. */
@@ -149,6 +150,7 @@ export function PairScreen({ code }: { code: string }) {
         <Button type="button" size="lg" className="w-full" onClick={() => void info.refetch()}>
           Try again
         </Button>
+        <BackToDesktops variant="outline">Go to my desktops</BackToDesktops>
       </AuthLayout>
     );
   }
@@ -157,14 +159,13 @@ export function PairScreen({ code }: { code: string }) {
     return (
       <AuthLayout>
         <PageHeader title="Approve this desktop" />
-        <DelayedSpinner label="Loading the pairing request" />
+        <DelayedSpinner label="Loading the pairing request" className="text-muted-text" />
       </AuthLayout>
     );
   }
 
   const pairing = info.data;
   const check: FingerprintCheck = checkFingerprint(hash, pairing.fingerprint);
-  const [lineOne, lineTwo] = fingerprintLines(pairing.fingerprint);
   const existing = desktops.data?.desktops ?? [];
   const canApprove = check === "match" || (check === "missing" && comparedByEye);
 
@@ -210,7 +211,7 @@ export function PairScreen({ code }: { code: string }) {
     }
   }
 
-  /** Cancel on a mismatch: the request is denied first (always safe, no passkey), then the page is left. */
+  /** "Deny and go back" on a mismatch: the request is denied first (always safe, no passkey), then the page is left. */
   async function cancelMismatch() {
     setBusy("deny");
     setError(null);
@@ -247,7 +248,7 @@ export function PairScreen({ code }: { code: string }) {
         </Notice>
       ) : null}
       {check === "match" ? (
-        <Notice title="The fingerprint matches your link">Still check that the confirmation code below is the one on your desktop.</Notice>
+        <Notice variant="success" title="The fingerprint matches your link">Still check that the confirmation code below is the one on your desktop.</Notice>
       ) : null}
 
       <dl className="flex flex-col gap-4 rounded-card bg-surface p-4">
@@ -257,8 +258,7 @@ export function PairScreen({ code }: { code: string }) {
         <Detail label="Machine name">{safeLabel(pairing.machineName, 64, "Unnamed desktop")}</Detail>
         <Detail label="System">{safeLabel(pairing.os, 32, "Unknown")}</Detail>
         <Detail label="Fingerprint">
-          <span className="block font-mono text-label tabular-nums">{lineOne}</span>
-          <span className="block font-mono text-label tabular-nums">{lineTwo}</span>
+          <FingerprintLines hex={pairing.fingerprint} />
         </Detail>
       </dl>
 
@@ -273,7 +273,7 @@ export function PairScreen({ code }: { code: string }) {
               value={desktop.id}
               checked={choice === desktop.id}
               onSelect={setChoice}
-              label={`This replaces ${safeLabel(desktop.name, 64, "Unnamed desktop")}`}
+              label={`A replacement for ${safeLabel(desktop.name, 64, "Unnamed desktop")}`}
             />
           ))}
           {choice !== NEW_DESKTOP ? (
@@ -309,16 +309,11 @@ export function PairScreen({ code }: { code: string }) {
           className="w-full"
           disabled={busy !== null}
           aria-busy={busy === "deny"}
-          onClick={() => void deny()}
+          onClick={() => void (check === "mismatch" ? cancelMismatch() : deny())}
         >
-          Deny
+          {check === "mismatch" ? "Deny and go back" : "Deny"}
           {busy === "deny" ? <DelayedSpinner label="Denying" /> : null}
         </Button>
-        {check === "mismatch" ? (
-          <Button type="button" size="lg" variant="outline" className="w-full" disabled={busy !== null} onClick={() => void cancelMismatch()}>
-            Cancel
-          </Button>
-        ) : null}
       </div>
     </AuthLayout>
   );
