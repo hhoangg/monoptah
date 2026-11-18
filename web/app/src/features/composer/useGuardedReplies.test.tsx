@@ -42,6 +42,15 @@ describe("useGuardedReplies", () => {
     expect(retry).not.toHaveBeenCalled();
   });
 
+  it("clearError drops a refusal that a later successful send has made stale", async () => {
+    registerSendGuard(() => Promise.resolve({ kind: "refuse" as const, reason: "Instance stopped" }));
+    const { view } = setup();
+    act(() => view.result.current.onRetry("pending:1"));
+    await waitFor(() => expect(view.result.current.error).toBe("Instance stopped"));
+    act(() => view.result.current.clearError());
+    expect(view.result.current.error).toBeNull();
+  });
+
   it("onRetry retries when the guard allows", async () => {
     const { retry, view } = setup();
     act(() => view.result.current.onRetry("pending:1"));

@@ -28,7 +28,12 @@ describe("pre-connect grant hook", () => {
     expect(grant.requestOnce).not.toHaveBeenCalled();
   });
 
-  it("denies a revoked grant or an unknown device", async () => {
+  it("lets a desktop or device the server does not know go on, so the link ends quietly as before", async () => {
+    grant.requestOnce.mockResolvedValue("missing");
+    expect(await hook({ desktopId: "d1", deviceId: "dev1" })).toBe("ok");
+  });
+
+  it("denies a revoked grant", async () => {
     grant.requestOnce.mockResolvedValue("revoked");
     expect(await hook({ desktopId: "d1", deviceId: "dev1" })).toBe("denied");
   });

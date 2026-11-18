@@ -87,7 +87,7 @@ const fixtures: Record<MethodName, { params: unknown; result: unknown }> = {
   "project.fileHighlight": { params: { job: "j1", from: 0 }, result: { palette: ["#fff"], lines: [], done: true } },
   "project.git": {
     params: { projectId: "p1" },
-    result: { branch: "main", files: 2, remote: true, upstream: true, defaultBranch: "main", ahead: 1, behind: 0, aheadOfDefault: 1, pr: { number: 5, url: "https://example.com/pr/5" } },
+    result: { branch: "main", files: 2, remote: true, remoteName: "origin", upstream: true, defaultBranch: "main", ahead: 1, behind: 0, aheadOfDefault: 1, pr: { number: 5, url: "https://example.com/pr/5" } },
   },
   "project.gitAction": { params: { projectId: "p1", action: "commit", message: "fix", paths: ["a.ts"] }, result: { message: "ok" } },
   "mono.document": { params: { documentId: "d1" }, result: { id: "d1", title: "Doc" } },
@@ -293,5 +293,16 @@ describe("classify (architecture.md 7.1)", () => {
     for (const { name, def } of METHOD_LIST) {
       if (def.class === "param") expect(["read", "control", "denied"]).toContain(classify(name, {}));
     }
+  });
+});
+
+describe("project.git remoteName", () => {
+  const status = { branch: "main", files: 0, remote: true, upstream: true, defaultBranch: "main", ahead: 0, behind: 0 };
+  it("is an optional string, empty when there is no remote", () => {
+    const result = METHODS["project.git"].result;
+    expect(result.safeParse(status).success).toBe(true);
+    expect(result.safeParse({ ...status, remoteName: "origin" }).success).toBe(true);
+    expect(result.safeParse({ ...status, remote: false, remoteName: "" }).success).toBe(true);
+    expect(result.safeParse({ ...status, remoteName: 3 }).success).toBe(false);
   });
 });

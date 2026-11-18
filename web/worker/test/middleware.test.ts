@@ -149,7 +149,7 @@ describe("response headers", () => {
       "Strict-Transport-Security": "max-age=63072000; includeSubDomains; preload",
       "X-Content-Type-Options": "nosniff",
       "Referrer-Policy": "no-referrer",
-      "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+      "Permissions-Policy": "camera=(), microphone=(self), geolocation=(), payment=(), usb=()",
       "Cross-Origin-Opener-Policy": "same-origin",
       "Cross-Origin-Resource-Policy": "same-origin",
     });

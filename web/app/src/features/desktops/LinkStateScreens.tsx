@@ -29,7 +29,7 @@ function LinkStateLayer({ desktopId }: { desktopId: string }) {
   const grant = useLazyGrant(desktopId);
   const status = useLinkState((state) => state.status);
   const blocked = useLinkState((state) => state.blocked);
-  const screen = blockingScreen({ status, blocked }, grant.phase, grant.reconnected, grant.raceOpen);
+  const screen = blockingScreen({ status, blocked }, grant.phase, grant.raceOpen);
   // "Requesting access..." only shows when the request takes longer than 250 ms (no flash on a fast answer).
   const requestingShown = useDelayed(screen === "requesting");
   const visible = screen !== null && (screen !== "requesting" || requestingShown);

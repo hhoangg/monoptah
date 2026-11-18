@@ -483,6 +483,8 @@ export const METHODS = {
       branch: z.string(),
       files: z.number(),
       remote: z.boolean(),
+      /** Name of the git remote the desktop uses (for example `origin`); an empty string when there is no remote. */
+      remoteName: z.string().optional(),
       upstream: z.boolean(),
       defaultBranch: z.string(),
       ahead: z.number(),

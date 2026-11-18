@@ -246,11 +246,13 @@ Sonner and vaul append a runtime `<style>` at import time and Radix scroll lock 
 Strict-Transport-Security: max-age=63072000; includeSubDomains; preload
 X-Content-Type-Options: nosniff
 Referrer-Policy: no-referrer
-Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=()
+Permissions-Policy: camera=(), microphone=(self), geolocation=(), payment=(), usb=()
 Cross-Origin-Opener-Policy: same-origin
 Cross-Origin-Resource-Policy: same-origin
 Cache-Control: no-store            (on /api/* and /relay/*)
 ```
+
+`microphone=(self)` and not `microphone=()`: the composer dictation button uses the Web Speech API, which Chromium gates on the `microphone` permission policy, so an empty allowlist would make dictation end at once with `not-allowed`. Only the app's own origin may ask; the browser still prompts the user, and embedded frames (there are none, `frame-ancestors 'none'`) get nothing. Camera, geolocation, payment and USB stay off.
 
 Headers for static assets are set from `app/dist/client/_headers`, which the app build generates (`web/app/vite-plugins/headers.ts`) with the CSP of 8.1 and the host of `RP_ORIGIN` for `connect-src` (override for self-hosters: `MONOPTAH_RP_ORIGIN`); API headers by Hono middleware.
 

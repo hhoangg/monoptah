@@ -92,6 +92,7 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
     const wire = toWire(attachments);
     const quoted = replyTo ? `${quote(replyTo.text)}\n\n${text}` : text;
     setReplyTo(null);
+    replies.clearError();
     void send(quoted, wire.length > 0 ? wire : undefined);
   };
 

@@ -136,7 +136,10 @@ export function SessionScreen({ desktopId, sessionId }: { desktopId: string; ses
           session={session}
           busy={state?.busy ?? false}
           readOnly={readOnly}
-          send={send}
+          send={(text, attachments) => {
+            replies.clearError();
+            return send(text, attachments);
+          }}
           notice={error && errorKey !== dismissedError ? { text: error.text, dismiss: () => setDismissedError(errorKey) } : null}
         />
       </ComposerRegion>

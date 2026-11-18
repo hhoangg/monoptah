@@ -2,6 +2,7 @@
 // signature header ("Thinking..." while it works), the cards of the sessions it launched, its suggested
 // reply chips and the documents it wrote. Ported from mobile MonoCards.tsx, LaunchedSessionCard.tsx and
 // the MonoHeader of TranscriptTurn.tsx.
+import { SendCancelled } from "@/features/composer/useSendGuard";
 import { useState } from "react";
 import { cn } from "@/lib/utils";
 import { safeHexColor } from "@/lib/color";
@@ -75,6 +76,8 @@ export function MonoChoices({ options, chosen }: { options: string[]; chosen?: s
               setFailed(null);
               onChoose(option).catch((reason: unknown) => {
                 setSent(null);
+                // The user said no to the send-guard: nothing went wrong, so nothing to show.
+                if (reason instanceof SendCancelled) return;
                 setFailed(reason instanceof Error ? reason.message : String(reason));
               });
             }}

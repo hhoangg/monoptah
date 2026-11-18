@@ -65,7 +65,8 @@ export interface GuardedRepliesOptions {
 /**
  * The two sends that do not start in the composer, "Not sent, retry" and a tapped answer choice, run through the
  * same `send-guard` as a typed message: it may confirm (the dialog), refuse with a reason (`error`) or allow.
- * `dialog` and `error` must be rendered by the caller.
+ * `dialog` and `error` must be rendered by the caller; call `clearError` when a later send goes out. A user cancel of the
+ * confirm rejects `onChoose` with `SendCancelled`, which the choice cards treat as silent.
  */
 export function useGuardedReplies({ desktopId, sessionId, target, send, retry }: GuardedRepliesOptions) {
   const guard = useSendGuard();
@@ -97,5 +98,6 @@ export function useGuardedReplies({ desktopId, sessionId, target, send, retry }:
     [check, desktopId, sessionId, target, retry],
   );
 
-  return { onChoose, onRetry, dialog: guard.dialog, error };
+  const clearError = useCallback(() => setError(null), []);
+  return { onChoose, onRetry, dialog: guard.dialog, error, clearError };
 }

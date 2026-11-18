@@ -1,7 +1,8 @@
 // F-43 and F-72.
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
+import { SendCancelled } from "@/features/composer/useSendGuard";
 import { TranscriptActionsContext, type TranscriptActions } from "./context";
 import { DocumentCard, LaunchedSessions, MonoChoices, MonoHeader } from "./MonoCards";
 import type { LaunchedSession } from "./turnItems";
@@ -52,6 +53,17 @@ describe("MonoChoices (F-72)", () => {
     wrap({ onChoose: vi.fn() }, <MonoChoices options={["Yes", "No"]} chosen=" No " />);
     expect(screen.getByRole("button", { name: "No" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByRole("button", { name: "Yes" })).toBeDisabled();
+  });
+
+  it("says nothing when the user cancels the send-guard confirm, and lets the reader choose again", async () => {
+    const onChoose = vi.fn().mockRejectedValueOnce(new SendCancelled("Send cancelled")).mockResolvedValue(undefined);
+    const user = userEvent.setup();
+    wrap({ onChoose }, <MonoChoices options={["Yes"]} />);
+    await user.click(screen.getByRole("button", { name: "Yes" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Yes" })).toHaveAttribute("aria-pressed", "false"));
+    expect(screen.queryByRole("alert")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Yes" }));
+    expect(onChoose).toHaveBeenCalledTimes(2);
   });
 
   it("tells a send that failed and lets the reader try again", async () => {

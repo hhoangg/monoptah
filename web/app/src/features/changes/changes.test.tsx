@@ -452,6 +452,12 @@ describe("git status (F-67)", () => {
     expect(view).toHaveTextContent("Tracking a remote branch");
     expect(within(view).getByRole("button", { name: "PR #12" })).toBeInTheDocument();
   });
+
+  it("names the git remote", async () => {
+    status = { ...status, remoteName: "origin" };
+    mount("git");
+    expect(await within(await screen.findByTestId("git-status")).findByText("origin")).toBeInTheDocument();
+  });
 });
 
 /** Holds every `project.gitAction` answer until the test releases it, and records what was sent and under which id. */
