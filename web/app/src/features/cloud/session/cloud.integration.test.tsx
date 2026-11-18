@@ -495,7 +495,7 @@ describe("navigation", () => {
     const user = userEvent.setup();
     mount("/p/proj-alpha", { capabilities: ["approvals"] });
     await user.click(await screen.findByRole("button", { name: "Open workspace list" }));
-    await screen.findByRole("link", { name: "Settings" });
+    await screen.findByRole("link", { name: "Desktop settings" });
     expect(screen.queryByRole("link", { name: "Cloud" })).toBeNull();
   });
 });

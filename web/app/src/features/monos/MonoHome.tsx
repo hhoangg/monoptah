@@ -14,7 +14,8 @@ import { Button } from "@/ui/button";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
 import { Icon } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
-import { useReadOnly } from "@/features/sessions/WorkspaceFrame";
+import { WorkspaceFrame, useReadOnly } from "@/features/sessions/WorkspaceFrame";
+import { EmptyState } from "@/ui/EmptyState";
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from "./contextMenu";
 import { CreateMonoDialog } from "./CreateMonoDialog";
 import { clearCreateMonoRequest, useCreateMonoRequest } from "./createRequest";
@@ -44,23 +45,38 @@ export function MonoHome({ desktopId, titleAs: Title = "h2" }: { desktopId: stri
   const shown = sorted.filter((mono) => !hidden.has(mono.id));
   const hiddenMonos = sorted.filter((mono) => hidden.has(mono.id));
 
-  return (
-    <section data-testid="mono-home" aria-label="Monos" className="mx-auto flex w-full max-w-[768px] flex-col gap-2 px-3 py-3">
-      <div className="flex items-center gap-2 px-2">
-        <Title className="flex-1 text-headline font-semibold">Monos</Title>
-        {canCreate ? (
-          <Button type="button" size="sm" variant="outline" onClick={() => setCreating(true)}>
-            <Icon name="add" size={16} />
-            New Mono
-          </Button>
-        ) : null}
-      </div>
+  const newMono = canCreate ? (
+    <Button type="button" size="sm" variant="outline" onClick={() => setCreating(true)}>
+      <Icon name="add" size={16} />
+      New Mono
+    </Button>
+  ) : null;
+  // A device that cannot create says why, instead of hiding the button without a word.
+  const cannotCreate = !catalog.data ? null : readOnly ? "This device is read-only, so it cannot create Monos." : catalog.data.monoTools !== true ? "This desktop does not offer creating Monos from the web." : null;
+  // As a page of its own (`titleAs="h1"`) the list sits in the workspace frame: drawer button, back to the list, New Mono in the header.
+  const framed = Title === "h1";
+
+  const body = (
+    <section data-testid="mono-home" aria-label="Monos" className={cn("mx-auto flex w-full max-w-[768px] flex-col gap-2", framed ? "" : "px-3 py-3")}>
+      {framed ? null : (
+        <div className="flex items-center gap-2 px-2">
+          <Title className="flex-1 text-headline font-semibold">Monos</Title>
+          {newMono}
+        </div>
+      )}
       {!monos ? (
         catalog.isError ? <Notice variant="error">Could not load your Monos.</Notice> : <DelayedSpinner label="Loading Monos" className="m-6" />
       ) : shown.length === 0 ? (
-        <p className="px-2 py-6 text-body text-muted-text" data-testid="mono-home-empty">
-          {hiddenMonos.length > 0 ? "All your Monos are hidden." : "No Monos yet."}
-        </p>
+        <EmptyState
+          data-testid="mono-home-empty"
+          icon="bot"
+          title={hiddenMonos.length > 0 ? "All your Monos are hidden." : "No Monos yet."}
+          description={
+            hiddenMonos.length > 0
+              ? "Show one again from the Hidden list below."
+              : `A Mono is a personal agent you chat with, like a contact that remembers you across sessions. ${cannotCreate ?? "Create one with New Mono."}`
+          }
+        />
       ) : (
         <ul className="flex flex-col">
           {shown.map((mono) => (
@@ -70,6 +86,7 @@ export function MonoHome({ desktopId, titleAs: Title = "h2" }: { desktopId: stri
           ))}
         </ul>
       )}
+      {cannotCreate && shown.length > 0 ? <p className="px-2 text-small text-muted-text">{cannotCreate}</p> : null}
       {hiddenMonos.length > 0 ? (
         <div className="px-2">
           <button type="button" className="inline-flex min-h-11 items-center text-small text-muted-text underline-offset-2 hover:underline pointer-fine:min-h-9" aria-expanded={showHidden} onClick={() => setShowHidden(!showHidden)}>
@@ -98,6 +115,13 @@ export function MonoHome({ desktopId, titleAs: Title = "h2" }: { desktopId: stri
           }}
         /> : null}
     </section>
+  );
+  return framed ? (
+    <WorkspaceFrame desktopId={desktopId} title="Monos" actions={newMono} testId="monos-screen" narrow>
+      {body}
+    </WorkspaceFrame>
+  ) : (
+    body
   );
 }
 

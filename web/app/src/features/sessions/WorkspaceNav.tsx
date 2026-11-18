@@ -65,7 +65,7 @@ export function ProjectRow({ desktopId, project, active, onNavigate }: { desktop
       <span className="flex w-10 shrink-0 justify-center">
         <ProjectMascot project={project.path} name={project.mascot} color={accentFor(project.name, project.color)} size={24} active={!!project.busy} />
       </span>
-      <span className="min-w-0 flex-1 truncate text-row font-semibold">{project.name}</span>
+      <span className="min-w-0 flex-1 truncate text-row font-semibold" title={project.name}>{project.name}</span>
       {project.busy ? <span aria-label="Working" className="size-2 shrink-0 rounded-pill bg-brand" /> : null}
     </Link>
   );
@@ -104,7 +104,7 @@ export function MonoRow({
       </span>
       <span className="flex min-w-0 flex-1 flex-col gap-0.5">
         <span className="flex items-center gap-2">
-          <span className="min-w-0 flex-1 truncate text-row font-semibold">{mono.name}</span>
+          <span className="min-w-0 flex-1 truncate text-row font-semibold" title={mono.name}>{mono.name}</span>
           {mono.lastActiveAt ? <span className={cn("shrink-0 text-small tabular text-muted-text", unread && "text-brand-text")}>{chatListTime(mono.lastActiveAt)}</span> : null}
         </span>
         <span className="flex items-center gap-2">
@@ -175,6 +175,7 @@ export function WorkspaceNav({ desktopId, onNavigate, onNewMono }: WorkspaceNavP
   const catalog = useCatalog();
   const monoTools = useCapability("monoTools");
   const readOnly = useLinkState((state) => state.permission === "read");
+  const desktopName = useLinkState((state) => state.desktopName);
   const navigate = useNavigate();
   const newMono = () => {
     if (onNewMono) {
@@ -203,7 +204,7 @@ export function WorkspaceNav({ desktopId, onNavigate, onNewMono }: WorkspaceNavP
   return (
     <nav aria-label="Workspace" data-testid="workspace-nav" className="flex h-full min-h-0 flex-col bg-drawer">
       <div className="flex items-center gap-2.5 px-4 pt-3 pb-2">
-        <span className="flex-1 text-title font-semibold">Monoptah</span>
+        <span className="min-w-0 flex-1 truncate text-title font-semibold" title={desktopName ?? undefined}>{desktopName ?? "Monoptah"}</span>
         <FilterMenu filter={filter} show={show} onChange={update} />
         {canCreateMono(monoTools) && !readOnly ? (
           <button type="button" aria-label="New Mono" onClick={newMono} className="inline-flex size-11 items-center justify-center rounded-pill bg-fill hover:bg-selection pointer-fine:size-9">
@@ -212,7 +213,7 @@ export function WorkspaceNav({ desktopId, onNavigate, onNewMono }: WorkspaceNavP
         ) : null}
       </div>
       <div className="px-4 pb-2">
-        <Input type="search" aria-label="Search" placeholder="Search" autoComplete="off" value={query} onChange={(event) => setQuery(event.target.value)} />
+        <Input type="search" aria-label="Filter projects" placeholder="Filter projects" autoComplete="off" value={query} onChange={(event) => setQuery(event.target.value)} />
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-1.5 pb-3">
         {monos.length > 0 ? (
@@ -235,7 +236,12 @@ export function WorkspaceNav({ desktopId, onNavigate, onNewMono }: WorkspaceNavP
           <p className="px-4 pt-3 text-label text-muted-text">{narrowed ? "Nothing matches." : "No Monos or projects on this desktop yet."}</p>
         ) : null}
         {!data && catalog.isPending ? <p className="px-4 pt-3 text-label text-muted-text">Loading…</p> : null}
-        {!data && catalog.isError ? <p className="px-4 pt-3 text-label text-muted-text">Could not load the workspace.</p> : null}
+        {!data && catalog.isError ? <div className="flex items-center gap-2 px-4 pt-3 text-label text-muted-text">
+            <span className="min-w-0 flex-1">Could not load the workspace.</span>
+            <button type="button" onClick={() => void catalog.refetch()} className="inline-flex min-h-11 items-center rounded-pill px-3 text-brand-text hover:bg-content-a04 pointer-fine:min-h-9">
+              Retry
+            </button>
+          </div> : null}
       </div>
       <div className="flex flex-col gap-0.5 border-t border-stroke p-1.5">
         <Slot name="desktop-nav-items" desktopId={desktopId} />
@@ -246,9 +252,9 @@ export function WorkspaceNav({ desktopId, onNavigate, onNewMono }: WorkspaceNavP
           className="flex min-h-11 items-center gap-3 rounded-row px-2.5 text-row hover:bg-content-a04 [&.active]:bg-selection"
         >
           <Icon name="settings" size={20} />
-          Settings
+          Desktop settings
         </Link>
-        <Link to="/desktops" onClick={onNavigate} className="flex min-h-11 items-center gap-3 rounded-row px-2.5 text-row text-muted-text hover:bg-content-a04">
+        <Link to="/desktops" onClick={onNavigate} className="flex min-h-11 items-center gap-3 rounded-row px-2.5 text-row hover:bg-content-a04">
           <Icon name="computer" size={20} />
           All desktops
         </Link>

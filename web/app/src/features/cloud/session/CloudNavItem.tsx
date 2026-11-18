@@ -9,7 +9,7 @@ export function CloudNavItem({ desktopId }: { desktopId: string }) {
   if (!enabled) return null;
   return (
     <Link to="/d/$desktopId/cloud" params={{ desktopId }} className="flex min-h-11 items-center gap-3 rounded-row px-2.5 text-row hover:bg-content-a04 [&.active]:bg-selection">
-      <Icon name="computer" size={20} />
+      <Icon name="cloud" size={20} />
       {CLOUD_NAV_LABEL}
     </Link>
   );

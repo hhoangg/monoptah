@@ -11,7 +11,7 @@ export const Route = createFileRoute("/d/$desktopId/cloud/")({
 function Page() {
   const { desktopId } = Route.useParams();
   return (
-    <WorkspaceFrame desktopId={desktopId} title="Cloud" subtitle="Instances your sessions run on" testId="cloud-screen">
+    <WorkspaceFrame desktopId={desktopId} title="Cloud" subtitle="Instances your sessions run on" testId="cloud-screen" narrow>
       <RequireCapability name="cloud" fallback="notice">
         <InstancesScreen key={desktopId} desktopId={desktopId} />
       </RequireCapability>

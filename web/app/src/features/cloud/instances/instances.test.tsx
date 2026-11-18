@@ -149,7 +149,9 @@ describe("instance rows", () => {
   it("shows the empty state", async () => {
     override([]);
     mount();
-    expect(await screen.findByTestId("cloud-empty")).toBeInTheDocument();
+    const empty = await screen.findByTestId("cloud-empty");
+    expect(empty).toHaveTextContent("No cloud instances yet");
+    expect(empty).toHaveTextContent("Start a session with the Cloud target to create one.");
   });
 
   it("shows an error with a retry for the read", async () => {
